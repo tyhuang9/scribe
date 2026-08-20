@@ -24,6 +24,14 @@ const MAX_DOWNLOAD_REDIRECTS: usize = 5;
 const MAX_REMOVAL_DISCOVERY_DEPTH: usize = 12;
 const MAX_REMOVAL_DISCOVERY_ENTRIES: usize = 8_192;
 
+#[cfg(test)]
+static FILE_HASH_COUNTS: std::sync::OnceLock<std::sync::Mutex<HashMap<PathBuf, usize>>> =
+    std::sync::OnceLock::new();
+#[cfg(test)]
+static FILE_HASH_CANCELLATIONS: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<PathBuf, (u64, InstallCancellation)>>,
+> = std::sync::OnceLock::new();
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum InstallStage {
     Downloading,
@@ -139,6 +147,43 @@ pub(crate) struct PinnedArtifact {
     pub(crate) destination: PathBuf,
 }
 
+#[derive(Debug)]
+pub(crate) struct PinnedArtifactInspectionPlan {
+    artifact: PinnedArtifact,
+    target_identity: CanonicalTargetIdentity,
+    state: PinnedArtifactInspectionState,
+}
+
+#[derive(Debug)]
+enum PinnedArtifactInspectionState {
+    VerifiedDestination(OpenedFileIdentity),
+    RequiresDownload(u64),
+}
+
+impl PinnedArtifactInspectionPlan {
+    pub(crate) fn required_download_bytes(&self) -> u64 {
+        match self.state {
+            PinnedArtifactInspectionState::VerifiedDestination(_) => 0,
+            PinnedArtifactInspectionState::RequiresDownload(bytes) => bytes,
+        }
+    }
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OpenedFileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OpenedFileIdentity {
+    volume_serial: u32,
+    file_index_high: u32,
+    file_index_low: u32,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct DownloadedArtifact {
     pub(crate) id: String,
@@ -168,6 +213,22 @@ pub(crate) struct RuntimeArchiveSpec {
     pub(crate) artifact: PinnedArtifact,
     pub(crate) manifest_json: String,
     pub(crate) files: Vec<RuntimeFileSpec>,
+}
+
+/// One already downloaded, exact file copied into a freshly assembled bundle.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BundleAssemblyFile {
+    pub(crate) source_path: PathBuf,
+    pub(crate) install_path: PathBuf,
+    pub(crate) size_bytes: u64,
+    pub(crate) sha256: String,
+}
+
+/// One deterministic metadata file generated while assembling a bundle.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GeneratedBundleFile {
+    pub(crate) install_path: PathBuf,
+    pub(crate) bytes: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -950,19 +1011,62 @@ pub(crate) fn download_pinned_artifact(
     }
     let expected_target_identity = disk_space::canonical_target_identity(&artifact.destination)
         .map_err(InstallError::Failed)?;
-    download_pinned_artifact_for_target(artifact, &expected_target_identity, cancellation, progress)
+    download_pinned_artifact_for_target(
+        artifact,
+        &expected_target_identity,
+        None,
+        cancellation,
+        progress,
+    )
 }
 
 pub(crate) fn download_pinned_artifact_for_target(
     artifact: &PinnedArtifact,
     expected_target_identity: &CanonicalTargetIdentity,
+    inspection: Option<PinnedArtifactInspectionPlan>,
     cancellation: &InstallCancellation,
     progress: &dyn Fn(InstallProgress),
 ) -> Result<DownloadedArtifact, InstallError> {
+    if let Some(inspection) = inspection {
+        validate_artifact_inspection(artifact, expected_target_identity, &inspection)?;
+        match inspection.state {
+            PinnedArtifactInspectionState::VerifiedDestination(expected_file_identity) => {
+                if cancellation.is_cancelled() {
+                    return Err(cancelled_before_artifact_inspection(artifact)?);
+                }
+                revalidate_artifact_target(&artifact.destination, expected_target_identity)?;
+                let (file, metadata) = open_regular_file_no_follow(&artifact.destination)?;
+                if metadata.len() != artifact.size_bytes
+                    || opened_file_identity(&file)? != expected_file_identity
+                {
+                    return Err(failed(format!(
+                        "verified artifact changed after inspection: {}",
+                        artifact.destination.display()
+                    )));
+                }
+                return Ok(downloaded_candidate(
+                    artifact,
+                    artifact.destination.clone(),
+                    expected_target_identity,
+                ));
+            }
+            PinnedArtifactInspectionState::RequiresDownload(_) => {
+                return download_pinned_artifact_with_target(
+                    &UreqHttpSource,
+                    artifact,
+                    expected_target_identity,
+                    false,
+                    cancellation,
+                    progress,
+                );
+            }
+        }
+    }
     download_pinned_artifact_with_target(
         &UreqHttpSource,
         artifact,
         expected_target_identity,
+        true,
         cancellation,
         progress,
     )
@@ -992,6 +1096,82 @@ pub(crate) fn pinned_artifact_retained_partial(
             bytes: metadata.len(),
         }),
     )
+}
+
+/// Computes the bytes that a new request must reserve before touching the
+/// network. Exact completed destinations need no download capacity. Only a
+/// regular, strictly short partial is treated as resumable; full, corrupt, or
+/// oversized partials conservatively reserve a complete replacement.
+pub(crate) fn inspect_pinned_artifact_for_target(
+    artifact: &PinnedArtifact,
+    expected_target_identity: &CanonicalTargetIdentity,
+    cancellation: &InstallCancellation,
+) -> Result<PinnedArtifactInspectionPlan, InstallError> {
+    if cancellation.is_cancelled() {
+        return Err(cancelled_before_artifact_inspection(artifact)?);
+    }
+    validate_artifact_spec(artifact)?;
+    revalidate_artifact_target(&artifact.destination, expected_target_identity)?;
+    if artifact_destination_is_regular(&artifact.destination)? {
+        let (mut file, metadata) = open_regular_file_no_follow(&artifact.destination)?;
+        let identity = opened_file_identity(&file)?;
+        match verify_opened_file_cancellable(
+            &mut file,
+            &metadata,
+            &artifact.destination,
+            artifact.size_bytes,
+            &artifact.sha256,
+            cancellation,
+        ) {
+            Ok(()) => {
+                return Ok(PinnedArtifactInspectionPlan {
+                    artifact: artifact.clone(),
+                    target_identity: expected_target_identity.clone(),
+                    state: PinnedArtifactInspectionState::VerifiedDestination(identity),
+                });
+            }
+            Err(error @ InstallError::Cancelled { .. }) => return Err(error),
+            Err(_) => {}
+        }
+    }
+    if cancellation.is_cancelled() {
+        return Err(cancelled_before_artifact_inspection(artifact)?);
+    }
+    let partial = partial_path(&artifact.destination)?;
+    let required = match partial_file_metadata(&partial)? {
+        Some(metadata) if metadata.len() < artifact.size_bytes => {
+            artifact.size_bytes - metadata.len()
+        }
+        Some(_) | None => artifact.size_bytes,
+    };
+    Ok(PinnedArtifactInspectionPlan {
+        artifact: artifact.clone(),
+        target_identity: expected_target_identity.clone(),
+        state: PinnedArtifactInspectionState::RequiresDownload(required),
+    })
+}
+
+#[cfg(test)]
+fn pinned_artifact_required_download_bytes(artifact: &PinnedArtifact) -> Result<u64, InstallError> {
+    let identity = disk_space::canonical_target_identity(&artifact.destination)
+        .map_err(InstallError::Failed)?;
+    Ok(
+        inspect_pinned_artifact_for_target(artifact, &identity, &InstallCancellation::default())?
+            .required_download_bytes(),
+    )
+}
+
+fn validate_artifact_inspection(
+    artifact: &PinnedArtifact,
+    expected_target_identity: &CanonicalTargetIdentity,
+    inspection: &PinnedArtifactInspectionPlan,
+) -> Result<(), InstallError> {
+    if inspection.artifact != *artifact || inspection.target_identity != *expected_target_identity {
+        return Err(failed(
+            "pinned artifact inspection does not match the requested artifact and target",
+        ));
+    }
+    Ok(())
 }
 
 /// Removes only the resumable sidecar derived from a validated artifact.
@@ -1043,7 +1223,6 @@ fn partial_file_metadata(partial: &Path) -> Result<Option<fs::Metadata>, Install
     }
 }
 
-#[cfg(test)]
 fn cancelled_before_artifact_inspection(
     artifact: &PinnedArtifact,
 ) -> Result<InstallError, InstallError> {
@@ -1155,6 +1334,45 @@ fn open_regular_file_no_follow(path: &Path) -> Result<(File, fs::Metadata), Inst
     Ok((file, metadata))
 }
 
+#[cfg(unix)]
+fn opened_file_identity(file: &File) -> Result<OpenedFileIdentity, InstallError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = file
+        .metadata()
+        .map_err(|error| failed(format!("failed to inspect open artifact: {error}")))?;
+    Ok(OpenedFileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(windows)]
+fn opened_file_identity(file: &File) -> Result<OpenedFileIdentity, InstallError> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    // SAFETY: the all-zero representation is valid for this plain C output
+    // structure, and the OS initializes every field on success.
+    let mut information = unsafe { std::mem::zeroed::<BY_HANDLE_FILE_INFORMATION>() };
+    // SAFETY: `file` owns a valid handle for the duration of this call and
+    // `information` points to writable storage of the required type.
+    let succeeded = unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) };
+    if succeeded == 0 {
+        return Err(failed(format!(
+            "failed to identify open artifact: {}",
+            io::Error::last_os_error()
+        )));
+    }
+    Ok(OpenedFileIdentity {
+        volume_serial: information.dwVolumeSerialNumber,
+        file_index_high: information.nFileIndexHigh,
+        file_index_low: information.nFileIndexLow,
+    })
+}
+
 fn additional_download_bytes(
     artifact_size_bytes: u64,
     partial_bytes: u64,
@@ -1205,6 +1423,7 @@ fn download_pinned_artifact_with(
         source,
         artifact,
         &expected_target_identity,
+        true,
         cancellation,
         progress,
     )
@@ -1214,6 +1433,7 @@ fn download_pinned_artifact_with_target(
     source: &dyn HttpSource,
     artifact: &PinnedArtifact,
     expected_target_identity: &CanonicalTargetIdentity,
+    verify_existing_destination: bool,
     cancellation: &InstallCancellation,
     progress: &dyn Fn(InstallProgress),
 ) -> Result<DownloadedArtifact, InstallError> {
@@ -1227,7 +1447,8 @@ fn download_pinned_artifact_with_target(
     }
     revalidate_artifact_target(&artifact.destination, expected_target_identity)?;
     let partial_exists = partial_file_exists(&partial)?;
-    if artifact_destination_is_regular(&artifact.destination)?
+    if verify_existing_destination
+        && artifact_destination_is_regular(&artifact.destination)?
         && verify_file(&artifact.destination, artifact.size_bytes, &artifact.sha256).is_ok()
     {
         return Ok(DownloadedArtifact {
@@ -1543,6 +1764,7 @@ pub(crate) fn stage_runtime_archive_for_target(
     let archive = download_pinned_artifact_for_target(
         &spec.artifact,
         expected_archive_target_identity,
+        None,
         cancellation,
         progress,
     )?;
@@ -1580,6 +1802,268 @@ pub(crate) fn stage_runtime_archive_for_target(
         root: stage_root,
         target_root: target_root.to_path_buf(),
     })
+}
+
+/// Assembles exact, individually verified files into a fresh same-volume
+/// staging directory. A prior crash can leave only the reserved staging path;
+/// the next explicit installation safely replaces that path before doing any
+/// assembly. Installed and retained-previous directories are never touched.
+pub(crate) fn stage_file_bundle_for_target(
+    files: &[BundleAssemblyFile],
+    generated_files: &[GeneratedBundleFile],
+    target_root: &Path,
+    cancellation: &InstallCancellation,
+    progress: &dyn Fn(InstallProgress),
+) -> Result<StagedRuntime, InstallError> {
+    if files.is_empty() {
+        return Err(failed("file bundle has no downloaded files"));
+    }
+    let stage_root = stable_staging_path(target_root)?;
+    validate_non_overlapping_paths(&stage_root, target_root)?;
+    reject_link_or_reparse_ancestors(target_root)?;
+    remove_path_if_exists(&stage_root)?;
+    fs::create_dir(&stage_root).map_err(|error| {
+        failed(format!(
+            "failed to create fresh bundle staging directory {}: {error}",
+            stage_root.display()
+        ))
+    })?;
+    let preparation = (|| {
+        let total_bytes = files.iter().try_fold(0_u64, |total, file| {
+            total
+                .checked_add(file.size_bytes)
+                .ok_or_else(|| failed("bundle assembly size overflow"))
+        })?;
+        let mut completed_bytes = 0_u64;
+        for file in files {
+            if cancellation.is_cancelled() {
+                return Err(InstallError::Cancelled {
+                    partial_path: file.source_path.clone(),
+                    downloaded_bytes: completed_bytes,
+                });
+            }
+            validate_relative_path(&file.install_path)?;
+            validate_sha256(&file.sha256)?;
+            copy_regular_file_to_stage(
+                &file.source_path,
+                &stage_root,
+                &file.install_path,
+                file.size_bytes,
+                &file.sha256,
+                cancellation,
+            )?;
+            completed_bytes = completed_bytes
+                .checked_add(file.size_bytes)
+                .ok_or_else(|| failed("bundle assembly size overflow"))?;
+            progress(InstallProgress {
+                stage: InstallStage::Extracting,
+                completed_bytes,
+                total_bytes,
+                bytes_per_second: None,
+            });
+        }
+        for file in generated_files {
+            validate_relative_path(&file.install_path)?;
+            write_new_bundle_file(&stage_root, &file.install_path, &file.bytes)?;
+        }
+        let mut exact_files = files
+            .iter()
+            .map(|file| RuntimeFileSpec {
+                archive_path: file.install_path.clone(),
+                install_path: file.install_path.clone(),
+                size_bytes: file.size_bytes,
+                sha256: file.sha256.clone(),
+            })
+            .collect::<Vec<_>>();
+        exact_files.extend(generated_files.iter().map(|file| RuntimeFileSpec {
+            archive_path: file.install_path.clone(),
+            install_path: file.install_path.clone(),
+            size_bytes: file.bytes.len() as u64,
+            sha256: format!("{:x}", Sha256::digest(&file.bytes)),
+        }));
+        verify_runtime_tree_cancellable(&stage_root, &exact_files, cancellation)
+    })();
+    if let Err(error) = preparation {
+        let _ = remove_path_if_exists(&stage_root);
+        return Err(error);
+    }
+    Ok(StagedRuntime {
+        root: stage_root,
+        target_root: target_root.to_path_buf(),
+    })
+}
+
+fn stable_staging_path(target_root: &Path) -> Result<PathBuf, InstallError> {
+    let name = target_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| failed(format!("{} has no safe filename", target_root.display())))?;
+    Ok(target_root.with_file_name(format!(".{name}.installing")))
+}
+
+pub(crate) fn directory_activation_rollback_root(target_root: &Path) -> PathBuf {
+    directory_rollback_path(target_root)
+}
+
+pub(crate) fn path_entry_exists_no_follow(path: &Path) -> Result<bool, InstallError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(failed(format!(
+            "failed to inspect filesystem entry {}: {error}",
+            path.display()
+        ))),
+    }
+}
+
+pub(crate) fn discard_file_bundle_staging(target_root: &Path) -> Result<bool, InstallError> {
+    let staging = stable_staging_path(target_root)?;
+    if !path_entry_exists_no_follow(&staging)? {
+        return Ok(false);
+    }
+    remove_path_if_exists(&staging)?;
+    Ok(true)
+}
+
+pub(crate) fn restore_interrupted_directory_replacement(
+    target_root: &Path,
+) -> Result<(), InstallError> {
+    let rollback = directory_rollback_path(target_root);
+    if path_entry_exists_no_follow(target_root)? {
+        return Err(InstallError::RecoveryRequired(format!(
+            "cannot restore interrupted directory replacement because target still exists: {}",
+            target_root.display()
+        )));
+    }
+    if !path_entry_exists_no_follow(&rollback)? {
+        return Err(InstallError::RecoveryRequired(format!(
+            "cannot restore interrupted directory replacement without rollback: {}",
+            rollback.display()
+        )));
+    }
+    restore_directory_replacement(target_root, true)
+}
+
+pub(crate) fn retain_interrupted_directory_replacement(
+    target_root: &Path,
+) -> Result<(), InstallError> {
+    if !path_entry_exists_no_follow(target_root)? {
+        return Err(InstallError::RecoveryRequired(format!(
+            "cannot retain an interrupted directory replacement without an active target: {}",
+            target_root.display()
+        )));
+    }
+    let rollback = directory_rollback_path(target_root);
+    if !path_entry_exists_no_follow(&rollback)? {
+        return Err(InstallError::RecoveryRequired(format!(
+            "cannot retain an interrupted directory replacement without rollback: {}",
+            rollback.display()
+        )));
+    }
+    finalize_directory_replacement(target_root, true)
+}
+
+fn copy_regular_file_to_stage(
+    source: &Path,
+    stage_root: &Path,
+    relative: &Path,
+    expected_size: u64,
+    expected_sha256: &str,
+    cancellation: &InstallCancellation,
+) -> Result<(), InstallError> {
+    validate_sha256(expected_sha256)?;
+    ensure_no_symlink_components(stage_root, relative)?;
+    let output = stage_root.join(relative);
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| failed(format!("failed to create {}: {error}", parent.display())))?;
+        ensure_no_symlink_components(stage_root, relative)?;
+    }
+    let (mut input, metadata) = open_regular_file_no_follow(source)?;
+    if metadata.len() != expected_size {
+        return Err(failed(format!(
+            "bundle source changed size before assembly: {}",
+            source.display()
+        )));
+    }
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    configure_no_follow(&mut options);
+    let mut destination = options
+        .open(&output)
+        .map_err(|error| failed(format!("failed to create {}: {error}", output.display())))?;
+    validate_opened_regular_file(&destination, &output)?;
+    let mut copied = 0_u64;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; BUFFER_BYTES];
+    loop {
+        if cancellation.is_cancelled() {
+            return Err(InstallError::Cancelled {
+                partial_path: source.to_path_buf(),
+                downloaded_bytes: copied,
+            });
+        }
+        let count = input
+            .read(&mut buffer)
+            .map_err(|error| failed(format!("failed to read {}: {error}", source.display())))?;
+        if count == 0 {
+            break;
+        }
+        copied = copied
+            .checked_add(count as u64)
+            .ok_or_else(|| failed("bundle copy size overflow"))?;
+        if copied > expected_size {
+            return Err(failed(format!(
+                "bundle source exceeded its pinned size: {}",
+                source.display()
+            )));
+        }
+        hasher.update(&buffer[..count]);
+        destination
+            .write_all(&buffer[..count])
+            .map_err(|error| failed(format!("failed to write {}: {error}", output.display())))?;
+    }
+    if copied != expected_size {
+        return Err(failed(format!(
+            "bundle source length changed during assembly: {}",
+            source.display()
+        )));
+    }
+    let actual_sha256 = format!("{:x}", hasher.finalize());
+    if !actual_sha256.eq_ignore_ascii_case(expected_sha256) {
+        return Err(failed(format!(
+            "bundle source checksum mismatch while copying {}: expected {expected_sha256}, got {actual_sha256}",
+            source.display()
+        )));
+    }
+    destination
+        .sync_all()
+        .map_err(|error| failed(format!("failed to sync {}: {error}", output.display())))
+}
+
+fn write_new_bundle_file(
+    stage_root: &Path,
+    relative: &Path,
+    bytes: &[u8],
+) -> Result<(), InstallError> {
+    ensure_no_symlink_components(stage_root, relative)?;
+    let output = stage_root.join(relative);
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| failed(format!("failed to create {}: {error}", parent.display())))?;
+        ensure_no_symlink_components(stage_root, relative)?;
+    }
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    configure_no_follow(&mut options);
+    let mut file = options
+        .open(&output)
+        .map_err(|error| failed(format!("failed to create {}: {error}", output.display())))?;
+    validate_opened_regular_file(&file, &output)?;
+    file.write_all(bytes)
+        .map_err(|error| failed(format!("failed to write {}: {error}", output.display())))?;
+    file.sync_all()
+        .map_err(|error| failed(format!("failed to sync {}: {error}", output.display())))
 }
 
 fn extract_runtime_archive(
@@ -1735,6 +2219,11 @@ pub(crate) fn verify_runtime_tree(
     root: &Path,
     files: &[RuntimeFileSpec],
 ) -> Result<(), InstallError> {
+    verify_runtime_tree_cancellable(root, files, &InstallCancellation::default())
+}
+
+pub(crate) fn verify_regular_directory_root(root: &Path) -> Result<(), InstallError> {
+    reject_link_or_reparse_ancestors(root)?;
     let root_metadata = fs::symlink_metadata(root)
         .map_err(|error| failed(format!("failed to inspect {}: {error}", root.display())))?;
     if runtime_metadata_is_link_or_reparse(&root_metadata) || !root_metadata.is_dir() {
@@ -1743,6 +2232,15 @@ pub(crate) fn verify_runtime_tree(
             root.display()
         )));
     }
+    Ok(())
+}
+
+pub(crate) fn verify_runtime_tree_cancellable(
+    root: &Path,
+    files: &[RuntimeFileSpec],
+    cancellation: &InstallCancellation,
+) -> Result<(), InstallError> {
+    verify_regular_directory_root(root)?;
     let mut allowed_files = HashSet::new();
     let mut allowed_directories = HashSet::new();
     for file in files {
@@ -1762,20 +2260,33 @@ pub(crate) fn verify_runtime_tree(
             parent = directory.parent();
         }
         ensure_no_symlink_components(root, &file.install_path)?;
-        verify_file(
+        verify_file_cancellable(
             &root.join(&file.install_path),
             file.size_bytes,
             &file.sha256,
+            cancellation,
         )?;
     }
     let mut pending = vec![root.to_path_buf()];
     while let Some(directory) = pending.pop() {
+        if cancellation.is_cancelled() {
+            return Err(InstallError::Cancelled {
+                partial_path: root.to_path_buf(),
+                downloaded_bytes: 0,
+            });
+        }
         for entry in fs::read_dir(&directory).map_err(|error| {
             failed(format!(
                 "failed to enumerate {}: {error}",
                 directory.display()
             ))
         })? {
+            if cancellation.is_cancelled() {
+                return Err(InstallError::Cancelled {
+                    partial_path: root.to_path_buf(),
+                    downloaded_bytes: 0,
+                });
+            }
             let entry = entry.map_err(|error| {
                 failed(format!(
                     "failed to enumerate {}: {error}",
@@ -1829,6 +2340,19 @@ pub(crate) fn activate_directory(
     target_root: &Path,
 ) -> Result<DirectoryReplacement, InstallError> {
     validate_non_overlapping_paths(stage_root, target_root)?;
+    let stage_metadata = fs::symlink_metadata(stage_root).map_err(|error| {
+        failed(format!(
+            "failed to inspect staged directory {}: {error}",
+            stage_root.display()
+        ))
+    })?;
+    if !stage_metadata.is_dir() || runtime_metadata_is_link_or_reparse(&stage_metadata) {
+        return Err(failed(format!(
+            "staged bundle is not a regular non-link directory: {}",
+            stage_root.display()
+        )));
+    }
+    reject_link_or_reparse_ancestors(target_root)?;
     let parent = target_root
         .parent()
         .ok_or_else(|| failed(format!("{} has no parent", target_root.display())))?;
@@ -1836,7 +2360,25 @@ pub(crate) fn activate_directory(
         .map_err(|error| failed(format!("failed to create {}: {error}", parent.display())))?;
     let rollback = directory_rollback_path(target_root);
     remove_path_if_exists(&rollback)?;
-    let previous = if target_root.exists() {
+    let target_exists = match fs::symlink_metadata(target_root) {
+        Ok(metadata) if metadata.is_dir() && !runtime_metadata_is_link_or_reparse(&metadata) => {
+            true
+        }
+        Ok(_) => {
+            return Err(failed(format!(
+                "directory activation target is a link, reparse point, or non-directory: {}",
+                target_root.display()
+            )));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => {
+            return Err(failed(format!(
+                "failed to inspect directory activation target {}: {error}",
+                target_root.display()
+            )));
+        }
+    };
+    let previous = if target_exists {
         durable_rename(target_root, &rollback).map_err(|error| {
             failed(format!(
                 "failed to preserve existing runtime {}: {error}",
@@ -1930,6 +2472,33 @@ pub(crate) fn verify_file(
         expected_sha256,
         &InstallCancellation::default(),
     )
+}
+
+/// Reads a small regular metadata file without following a final symbolic
+/// link or Windows reparse point. Large model artifacts must use streaming
+/// verification instead.
+pub(crate) fn read_regular_file_no_follow(
+    path: &Path,
+    maximum_bytes: u64,
+) -> Result<Vec<u8>, InstallError> {
+    let (mut file, metadata) = open_regular_file_no_follow(path)?;
+    if metadata.len() > maximum_bytes {
+        return Err(failed(format!(
+            "metadata file {} exceeds the {}-byte safety limit",
+            path.display(),
+            maximum_bytes
+        )));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.read_to_end(&mut bytes)
+        .map_err(|error| failed(format!("failed to read {}: {error}", path.display())))?;
+    if bytes.len() as u64 != metadata.len() {
+        return Err(failed(format!(
+            "metadata file changed while it was read: {}",
+            path.display()
+        )));
+    }
+    Ok(bytes)
 }
 
 /// Streams a regular, non-link file through SHA-256 without buffering its
@@ -2043,6 +2612,31 @@ pub(crate) fn verify_file_cancellable(
         });
     }
     let (mut file, metadata) = open_regular_file_no_follow(path)?;
+    verify_opened_file_cancellable(
+        &mut file,
+        &metadata,
+        path,
+        expected_size,
+        expected_sha256,
+        cancellation,
+    )
+}
+
+fn verify_opened_file_cancellable(
+    file: &mut File,
+    metadata: &fs::Metadata,
+    path: &Path,
+    expected_size: u64,
+    expected_sha256: &str,
+    cancellation: &InstallCancellation,
+) -> Result<(), InstallError> {
+    validate_sha256(expected_sha256)?;
+    if cancellation.is_cancelled() {
+        return Err(InstallError::Cancelled {
+            partial_path: path.to_path_buf(),
+            downloaded_bytes: 0,
+        });
+    }
     if !metadata.is_file() || metadata.len() != expected_size {
         return Err(failed(format!(
             "artifact size mismatch for {}: expected {expected_size} bytes, got {}",
@@ -2050,8 +2644,18 @@ pub(crate) fn verify_file_cancellable(
             metadata.len()
         )));
     }
+    #[cfg(test)]
+    {
+        let mut counts = FILE_HASH_COUNTS
+            .get_or_init(Default::default)
+            .lock()
+            .expect("file hash count lock poisoned");
+        *counts.entry(path.to_path_buf()).or_default() += 1;
+    }
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; BUFFER_BYTES];
+    #[cfg(test)]
+    let mut hashed_bytes = 0_u64;
     loop {
         if cancellation.is_cancelled() {
             return Err(InstallError::Cancelled {
@@ -2066,6 +2670,11 @@ pub(crate) fn verify_file_cancellable(
             break;
         }
         hasher.update(&buffer[..count]);
+        #[cfg(test)]
+        {
+            hashed_bytes = hashed_bytes.saturating_add(count as u64);
+            cancel_file_hash_at_test_threshold(path, hashed_bytes);
+        }
     }
     let actual = format!("{:x}", hasher.finalize());
     if !actual.eq_ignore_ascii_case(expected_sha256) {
@@ -2075,6 +2684,60 @@ pub(crate) fn verify_file_cancellable(
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn reset_file_hash_count(path: &Path) {
+    FILE_HASH_COUNTS
+        .get_or_init(Default::default)
+        .lock()
+        .expect("file hash count lock poisoned")
+        .remove(path);
+}
+
+#[cfg(test)]
+pub(crate) fn file_hash_count(path: &Path) -> usize {
+    FILE_HASH_COUNTS
+        .get_or_init(Default::default)
+        .lock()
+        .expect("file hash count lock poisoned")
+        .get(path)
+        .copied()
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+fn cancel_file_hash_at_test_threshold(path: &Path, hashed_bytes: u64) {
+    let cancellation = {
+        let mut hooks = FILE_HASH_CANCELLATIONS
+            .get_or_init(Default::default)
+            .lock()
+            .expect("file hash cancellation lock poisoned");
+        if hooks
+            .get(path)
+            .is_some_and(|(threshold, _)| hashed_bytes >= *threshold)
+        {
+            hooks.remove(path).map(|(_, cancellation)| cancellation)
+        } else {
+            None
+        }
+    };
+    if let Some(cancellation) = cancellation {
+        cancellation.cancel();
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn cancel_file_hash_after(
+    path: &Path,
+    threshold: u64,
+    cancellation: InstallCancellation,
+) {
+    FILE_HASH_CANCELLATIONS
+        .get_or_init(Default::default)
+        .lock()
+        .expect("file hash cancellation lock poisoned")
+        .insert(path.to_path_buf(), (threshold, cancellation));
 }
 
 fn ensure_no_symlink_components(root: &Path, relative: &Path) -> Result<(), InstallError> {
@@ -2387,12 +3050,22 @@ fn transaction_path(target: &Path, phase: &str) -> Result<PathBuf, InstallError>
 }
 
 fn remove_path_if_exists(path: &Path) -> Result<(), InstallError> {
-    if path.as_os_str().is_empty() || !path.exists() {
+    if path.as_os_str().is_empty() {
         return Ok(());
     }
-    let metadata = fs::symlink_metadata(path)
-        .map_err(|error| failed(format!("failed to inspect {}: {error}", path.display())))?;
-    let result = if metadata.is_dir() && !metadata.file_type().is_symlink() {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(failed(format!(
+                "failed to inspect {}: {error}",
+                path.display()
+            )));
+        }
+    };
+    let result = if runtime_metadata_is_link_or_reparse(&metadata) && metadata.is_dir() {
+        fs::remove_dir(path)
+    } else if metadata.is_dir() {
         fs::remove_dir_all(path)
     } else {
         fs::remove_file(path)
@@ -2404,6 +3077,34 @@ fn remove_path_if_exists(path: &Path) -> Result<(), InstallError> {
             path.display()
         ))
     })
+}
+
+fn reject_link_or_reparse_ancestors(path: &Path) -> Result<(), InstallError> {
+    let mut current = path.parent();
+    while let Some(ancestor) = current {
+        if ancestor.as_os_str().is_empty() {
+            break;
+        }
+        match fs::symlink_metadata(ancestor) {
+            Ok(metadata)
+                if metadata.is_dir() && !runtime_metadata_is_link_or_reparse(&metadata) => {}
+            Ok(_) => {
+                return Err(failed(format!(
+                    "bundle target crosses a symbolic link, reparse point, or non-directory ancestor: {}",
+                    ancestor.display()
+                )));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(failed(format!(
+                    "failed to inspect bundle target ancestor {}: {error}",
+                    ancestor.display()
+                )));
+            }
+        }
+        current = ancestor.parent();
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -2847,6 +3548,197 @@ mod tests {
         assert_eq!(additional_download_bytes(100, 40).unwrap(), 60);
         assert_eq!(additional_download_bytes(100, 100).unwrap(), 0);
         assert_eq!(additional_download_bytes(100, 101).unwrap(), 100);
+    }
+
+    #[test]
+    fn bundle_download_accounting_distinguishes_cache_partial_and_replacement() {
+        let root = unique_root("bundle-accounting");
+        fs::create_dir_all(&root).unwrap();
+        let bytes = b"complete artifact";
+        let spec = artifact(&root, bytes);
+
+        assert_eq!(
+            pinned_artifact_required_download_bytes(&spec).unwrap(),
+            bytes.len() as u64
+        );
+        fs::write(partial_path(&spec.destination).unwrap(), &bytes[..5]).unwrap();
+        assert_eq!(
+            pinned_artifact_required_download_bytes(&spec).unwrap(),
+            (bytes.len() - 5) as u64
+        );
+        fs::write(partial_path(&spec.destination).unwrap(), bytes).unwrap();
+        assert_eq!(
+            pinned_artifact_required_download_bytes(&spec).unwrap(),
+            bytes.len() as u64,
+            "a full partial reserves a clean replacement"
+        );
+        fs::write(
+            partial_path(&spec.destination).unwrap(),
+            b"oversized invalid partial",
+        )
+        .unwrap();
+        assert_eq!(
+            pinned_artifact_required_download_bytes(&spec).unwrap(),
+            bytes.len() as u64
+        );
+        fs::write(&spec.destination, bytes).unwrap();
+        assert_eq!(pinned_artifact_required_download_bytes(&spec).unwrap(), 0);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn verified_destination_inspection_is_consumed_without_a_second_hash() {
+        let root = unique_root("verified-cache-single-hash");
+        fs::create_dir_all(&root).unwrap();
+        let bytes = b"complete artifact";
+        let spec = artifact(&root, bytes);
+        fs::write(&spec.destination, bytes).unwrap();
+        let identity = disk_space::canonical_target_identity(&spec.destination).unwrap();
+        reset_file_hash_count(&spec.destination);
+
+        let inspection =
+            inspect_pinned_artifact_for_target(&spec, &identity, &InstallCancellation::default())
+                .unwrap();
+        assert_eq!(inspection.required_download_bytes(), 0);
+        assert_eq!(file_hash_count(&spec.destination), 1);
+
+        let downloaded = download_pinned_artifact_for_target(
+            &spec,
+            &identity,
+            Some(inspection),
+            &InstallCancellation::default(),
+            &|_| {},
+        )
+        .unwrap();
+        assert_eq!(downloaded.path, spec.destination);
+        assert_eq!(file_hash_count(&downloaded.path), 1);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn verified_destination_replacement_after_inspection_fails_closed() {
+        let root = unique_root("verified-cache-replaced");
+        fs::create_dir_all(&root).unwrap();
+        let bytes = b"complete artifact";
+        let spec = artifact(&root, bytes);
+        fs::write(&spec.destination, bytes).unwrap();
+        let identity = disk_space::canonical_target_identity(&spec.destination).unwrap();
+        reset_file_hash_count(&spec.destination);
+        let inspection =
+            inspect_pinned_artifact_for_target(&spec, &identity, &InstallCancellation::default())
+                .unwrap();
+        fs::rename(&spec.destination, root.join("original.bin")).unwrap();
+        fs::write(&spec.destination, bytes).unwrap();
+
+        let error = download_pinned_artifact_for_target(
+            &spec,
+            &identity,
+            Some(inspection),
+            &InstallCancellation::default(),
+            &|_| {},
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("changed after inspection"));
+        assert_eq!(file_hash_count(&spec.destination), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pinned_inspection_honors_pre_cancel_without_touching_artifact_paths() {
+        let root = unique_root("inspection-pre-cancel");
+        fs::create_dir_all(&root).unwrap();
+        let spec = artifact(&root, b"complete artifact");
+        let identity = disk_space::canonical_target_identity(&spec.destination).unwrap();
+        let cancellation = InstallCancellation::default();
+        cancellation.cancel();
+
+        let error =
+            inspect_pinned_artifact_for_target(&spec, &identity, &cancellation).unwrap_err();
+
+        assert!(error.is_cancelled());
+        assert!(!spec.destination.exists());
+        assert!(!partial_path(&spec.destination).unwrap().exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pinned_inspection_cancellation_interrupts_cache_hash_without_mutation() {
+        let root = unique_root("inspection-hash-cancel");
+        fs::create_dir_all(&root).unwrap();
+        let bytes = vec![0x5a; BUFFER_BYTES * 3];
+        let spec = artifact(&root, &bytes);
+        fs::write(&spec.destination, &bytes).unwrap();
+        let identity = disk_space::canonical_target_identity(&spec.destination).unwrap();
+        let cancellation = InstallCancellation::default();
+        cancel_file_hash_after(&spec.destination, BUFFER_BYTES as u64, cancellation.clone());
+
+        let error =
+            inspect_pinned_artifact_for_target(&spec, &identity, &cancellation).unwrap_err();
+
+        assert!(error.is_cancelled());
+        assert_eq!(fs::read(&spec.destination).unwrap(), bytes);
+        assert!(!partial_path(&spec.destination).unwrap().exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn same_inode_cache_mutation_fails_during_hashing_copy_without_activation() {
+        let root = unique_root("verified-cache-same-inode-mutation");
+        fs::create_dir_all(&root).unwrap();
+        let expected = b"complete artifact";
+        let mutated = b"mutated artifact!";
+        assert_eq!(expected.len(), mutated.len());
+        let spec = artifact(&root, expected);
+        fs::write(&spec.destination, expected).unwrap();
+        let identity = disk_space::canonical_target_identity(&spec.destination).unwrap();
+        reset_file_hash_count(&spec.destination);
+        let inspection =
+            inspect_pinned_artifact_for_target(&spec, &identity, &InstallCancellation::default())
+                .unwrap();
+        let mut same_file = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&spec.destination)
+            .unwrap();
+        same_file.write_all(mutated).unwrap();
+        same_file.sync_all().unwrap();
+        drop(same_file);
+
+        let downloaded = download_pinned_artifact_for_target(
+            &spec,
+            &identity,
+            Some(inspection),
+            &InstallCancellation::default(),
+            &|_| {},
+        )
+        .unwrap();
+        assert_eq!(file_hash_count(&spec.destination), 1);
+        let target = root.join("assembled");
+        let error = stage_file_bundle_for_target(
+            &[BundleAssemblyFile {
+                source_path: downloaded.path,
+                install_path: PathBuf::from("model.bin"),
+                size_bytes: spec.size_bytes,
+                sha256: spec.sha256,
+            }],
+            &[],
+            &target,
+            &InstallCancellation::default(),
+            &|_| {},
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("checksum mismatch while copying")
+        );
+        assert!(!target.exists());
+        assert!(!stable_staging_path(&target).unwrap().exists());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -4319,6 +5211,34 @@ mod tests {
         let error = verify_runtime_tree(&linked, &files).unwrap_err();
 
         assert!(error.to_string().contains("symbolic link/reparse point"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn runtime_tree_rejects_a_linked_or_reparse_ancestor() {
+        let root = unique_root("runtime-ancestor-link");
+        let external = root.join("external");
+        let linked_parent = root.join("linked-parent");
+        let package = external.join("runtime");
+        fs::create_dir_all(&package).unwrap();
+        fs::write(package.join("runtime.dll"), b"runtime").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&external, &linked_parent).unwrap();
+        #[cfg(windows)]
+        if std::os::windows::fs::symlink_dir(&external, &linked_parent).is_err() {
+            fs::remove_dir_all(root).unwrap();
+            return;
+        }
+        let files = [RuntimeFileSpec {
+            archive_path: PathBuf::from("runtime.dll"),
+            install_path: PathBuf::from("runtime.dll"),
+            size_bytes: 7,
+            sha256: format!("{:x}", Sha256::digest(b"runtime")),
+        }];
+
+        let error = verify_runtime_tree(&linked_parent.join("runtime"), &files).unwrap_err();
+
+        assert!(error.to_string().contains("symbolic link, reparse point"));
         fs::remove_dir_all(root).unwrap();
     }
 

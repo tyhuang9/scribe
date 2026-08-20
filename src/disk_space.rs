@@ -12,6 +12,11 @@ use std::path::{Path, PathBuf};
 /// Space retained after all newly required artifact bytes have been reserved.
 pub(crate) const SAFETY_HEADROOM_BYTES: u64 = 1024 * 1024 * 1024;
 
+#[cfg(all(windows, test))]
+const WINDOWS_DRIVE_FIXED: u32 = 3;
+#[cfg(windows)]
+const WINDOWS_DRIVE_REMOTE: u32 = 4;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct DiskSpacePreflight {
     pub(crate) volume: String,
@@ -30,6 +35,19 @@ impl DiskSpacePreflight {
 pub(crate) struct DiskSpaceAvailability {
     pub(crate) volume: String,
     pub(crate) available_bytes: u64,
+    reservation_identity: PhysicalVolumeIdentity,
+}
+
+/// Stable reservation identity for the physical filesystem backing a target.
+/// This is deliberately separate from the user-facing mount/volume label,
+/// which can have multiple aliases for the same capacity pool.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct PhysicalVolumeIdentity(String);
+
+impl PhysicalVolumeIdentity {
+    pub(crate) fn key_material(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
 }
 
 #[cfg(windows)]
@@ -71,6 +89,12 @@ pub(crate) fn preflight_download_destination(
     additional_bytes: u64,
 ) -> Result<DiskSpacePreflight, String> {
     preflight_with(&SystemSpaceProbe, destination, additional_bytes)
+}
+
+pub(crate) fn physical_volume_identity(
+    destination: &Path,
+) -> Result<PhysicalVolumeIdentity, String> {
+    Ok(availability_with(&SystemSpaceProbe, destination)?.reservation_identity)
 }
 
 fn preflight_with(
@@ -212,7 +236,9 @@ fn nearest_existing_directory(destination: &Path) -> Result<PathBuf, String> {
 #[cfg(target_os = "windows")]
 fn probe_system_volume(existing_directory: &Path) -> Result<DiskSpaceAvailability, String> {
     use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::{GetDiskFreeSpaceExW, GetVolumePathNameW};
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetDiskFreeSpaceExW, GetDriveTypeW, GetVolumeNameForVolumeMountPointW, GetVolumePathNameW,
+    };
 
     let directory = existing_directory
         .as_os_str()
@@ -239,6 +265,32 @@ fn probe_system_volume(existing_directory: &Path) -> Result<DiskSpaceAvailabilit
         .unwrap_or(volume_path.len());
     let volume = String::from_utf16(&volume_path[..nul])
         .map_err(|_| "Windows volume path was not valid UTF-16".to_owned())?;
+    let drive_type = unsafe { GetDriveTypeW(volume_path.as_ptr()) };
+    let mut volume_name = vec![0_u16; 261];
+    let named = unsafe {
+        GetVolumeNameForVolumeMountPointW(
+            volume_path.as_ptr(),
+            volume_name.as_mut_ptr(),
+            volume_name.len() as u32,
+        )
+    };
+    let reservation_identity = if named != 0 {
+        let name_nul = volume_name
+            .iter()
+            .position(|character| *character == 0)
+            .unwrap_or(volume_name.len());
+        let name = String::from_utf16(&volume_name[..name_nul])
+            .map_err(|_| "Windows volume GUID was not valid UTF-16".to_owned())?;
+        windows_physical_volume_identity(drive_type, Some(&name))?
+    } else {
+        windows_physical_volume_identity(drive_type, None).map_err(|message| {
+            format!(
+                "{message} for {}: {}",
+                existing_directory.display(),
+                std::io::Error::last_os_error()
+            )
+        })?
+    };
     let mut available_bytes = 0_u64;
     let queried = unsafe {
         GetDiskFreeSpaceExW(
@@ -256,7 +308,28 @@ fn probe_system_volume(existing_directory: &Path) -> Result<DiskSpaceAvailabilit
     Ok(DiskSpaceAvailability {
         volume,
         available_bytes,
+        reservation_identity,
     })
+}
+
+#[cfg(windows)]
+fn windows_physical_volume_identity(
+    drive_type: u32,
+    volume_guid: Option<&str>,
+) -> Result<PhysicalVolumeIdentity, String> {
+    if let Some(volume_guid) = volume_guid.filter(|value| !value.is_empty()) {
+        return Ok(PhysicalVolumeIdentity(format!(
+            "windows-volume-guid:{}",
+            volume_guid.to_ascii_lowercase()
+        )));
+    }
+    if drive_type == WINDOWS_DRIVE_REMOTE {
+        // Some network redirectors expose no volume GUID. All such paths use
+        // one user-scoped bucket: this can over-coordinate unrelated shares,
+        // but never under-reserves a share reachable through multiple aliases.
+        return Ok(PhysicalVolumeIdentity("windows-network-global".to_owned()));
+    }
+    Err("could not obtain a stable GUID for local Windows volume".to_owned())
 }
 
 #[cfg(unix)]
@@ -290,6 +363,7 @@ fn probe_system_volume(existing_directory: &Path) -> Result<DiskSpaceAvailabilit
     Ok(DiskSpaceAvailability {
         volume: format!("device:{}", metadata.st_dev),
         available_bytes,
+        reservation_identity: PhysicalVolumeIdentity(format!("unix-device:{}", metadata.st_dev)),
     })
 }
 
@@ -324,6 +398,7 @@ mod tests {
             result: Ok(DiskSpaceAvailability {
                 volume: "test-volume".to_owned(),
                 available_bytes: SAFETY_HEADROOM_BYTES + 100,
+                reservation_identity: PhysicalVolumeIdentity("test-device".to_owned()),
             }),
         };
         let preflight = preflight_with(&probe, &existing_destination(), 100).unwrap();
@@ -340,6 +415,7 @@ mod tests {
             result: Ok(DiskSpaceAvailability {
                 volume: "test-volume".to_owned(),
                 available_bytes: SAFETY_HEADROOM_BYTES + 99,
+                reservation_identity: PhysicalVolumeIdentity("test-device".to_owned()),
             }),
         };
         let preflight = preflight_with(&probe, &existing_destination(), 100).unwrap();
@@ -386,6 +462,30 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn physical_volume_identity_is_shared_by_distinct_targets_and_path_aliases() {
+        let root = std::env::temp_dir().join(format!(
+            "scribe-physical-volume-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let canonical_root = fs::canonicalize(&root).unwrap();
+
+        let first = physical_volume_identity(&root.join("first").join("model.bin")).unwrap();
+        let second = physical_volume_identity(
+            &canonical_root
+                .join("alias")
+                .join("..")
+                .join("second")
+                .join("model.bin"),
+        )
+        .unwrap();
+
+        assert_eq!(first, second);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_target_identity_normalization_is_lossless_and_alias_aware() {
@@ -402,6 +502,28 @@ mod tests {
             normalize_windows_identity(&first),
             normalize_windows_identity(&second)
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_physical_identity_prefers_guid_and_fails_safe_for_networks() {
+        assert_eq!(
+            windows_physical_volume_identity(
+                WINDOWS_DRIVE_FIXED,
+                Some(r"\\?\Volume{AABBCCDD-0000-1111-2222-333344445555}\")
+            )
+            .unwrap(),
+            windows_physical_volume_identity(
+                WINDOWS_DRIVE_REMOTE,
+                Some(r"\\?\volume{aabbccdd-0000-1111-2222-333344445555}\")
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            windows_physical_volume_identity(WINDOWS_DRIVE_REMOTE, None).unwrap(),
+            PhysicalVolumeIdentity("windows-network-global".to_owned())
+        );
+        assert!(windows_physical_volume_identity(WINDOWS_DRIVE_FIXED, None).is_err());
     }
 
     #[cfg(unix)]

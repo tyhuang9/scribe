@@ -12,18 +12,15 @@ use super::super::{
 };
 use crate::transcription::AccelerationPreference;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+pub const CURRENT_SCHEMA_VERSION: u32 = 2;
 pub const DEFAULT_SPEECH_CONFIRMATION_MS: u32 = 150;
 pub const DEFAULT_INTERNAL_PAUSE_MS: u32 = 450;
 pub const DEFAULT_ENDPOINT_SILENCE_MS: u32 = 900;
 pub const DEFAULT_PRE_ROLL_MS: u32 = 250;
 pub const DEFAULT_POST_ROLL_MS: u32 = 200;
-/// Persisted input-energy gate used by the sensitivity slider (approximately -42 dBFS).
-pub const DEFAULT_MANUAL_ACTIVATION_RMS: f32 = 0.007_943_282;
-/// Lower edge of the slider's internal meter range (approximately -72 dBFS).
-pub const MIN_MANUAL_ACTIVATION_RMS: f32 = 0.000_251_188_64;
-/// Upper edge of the slider's internal meter range (0 dBFS).
-pub const MAX_MANUAL_ACTIVATION_RMS: f32 = 1.0;
+pub const DEFAULT_SPEECH_PROBABILITY_THRESHOLD: f32 = 0.5;
+pub const MIN_SPEECH_PROBABILITY_THRESHOLD: f32 = 0.2;
+pub const MAX_SPEECH_PROBABILITY_THRESHOLD: f32 = 0.8;
 pub type UnknownFields = BTreeMap<String, Value>;
 
 #[derive(Clone, Debug, Serialize)]
@@ -68,7 +65,7 @@ pub struct RecordingSettings {
     pub audio_input_device_name: Option<String>,
     pub max_recording_seconds: u32,
     pub vad_enabled: bool,
-    pub manual_activation_rms: f32,
+    pub speech_probability_threshold: f32,
     pub speech_confirmation_ms: u32,
     pub internal_pause_ms: u32,
     pub endpoint_silence_ms: u32,
@@ -286,7 +283,7 @@ impl Default for RecordingSettings {
             audio_input_device_name: None,
             max_recording_seconds: 30,
             vad_enabled: true,
-            manual_activation_rms: DEFAULT_MANUAL_ACTIVATION_RMS,
+            speech_probability_threshold: DEFAULT_SPEECH_PROBABILITY_THRESHOLD,
             speech_confirmation_ms: DEFAULT_SPEECH_CONFIRMATION_MS,
             internal_pause_ms: DEFAULT_INTERNAL_PAUSE_MS,
             endpoint_silence_ms: DEFAULT_ENDPOINT_SILENCE_MS,

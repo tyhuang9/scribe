@@ -69,6 +69,8 @@ const RESTORE_CLIPBOARD_DESCRIPTION: &str =
 const STOP_AFTER_SPEECH_SWITCH_ID: &str = "stop-after-speech-ends-switch";
 const STOP_AFTER_SPEECH_DESCRIPTION: &str =
     "In Press once mode, stop recording after the configured silence. Hold mode is unaffected.";
+const SPEECH_DETECTION_SENSITIVITY_HELP_ID: &str = "speech-detection-sensitivity-help";
+const SPEECH_DETECTION_SENSITIVITY_DESCRIPTION: &str = "More sensitive settings lower the speech-probability threshold, so quieter or less certain speech is more likely to be detected.";
 const VOICE_DETECTION_LOCKED_DESCRIPTION: &str =
     "Finish recording before changing voice detection settings.";
 const LIMIT_TRANSCRIPT_AGE_SWITCH_ID: &str = "limit-transcript-age-switch";
@@ -304,7 +306,7 @@ pub(crate) struct RecordingSettingsView {
     pub selected_audio_device: Option<String>,
     pub audio_devices: Vec<String>,
     pub device_label: String,
-    pub input_sensitivity_percent: u8,
+    pub speech_detection_sensitivity_percent: u8,
     pub input_level_percent: u8,
     pub microphone_error: Option<String>,
     pub auto_insert_transcript: bool,
@@ -354,7 +356,7 @@ impl Default for RecordingSettingsView {
             selected_audio_device: None,
             audio_devices: Vec::new(),
             device_label: "OS default".into(),
-            input_sensitivity_percent: 50,
+            speech_detection_sensitivity_percent: 50,
             input_level_percent: 0,
             microphone_error: None,
             auto_insert_transcript: false,
@@ -469,7 +471,7 @@ pub(crate) enum ScreenAction {
     SetDurationSeconds(u32),
     ToggleProvisionalFeedback,
     SetAudioDevice(Option<String>),
-    SetInputSensitivity(u8),
+    SetSpeechDetectionSensitivity(u8),
     RefreshDevices,
     ChangeShortcut,
     SetAutoInsertTranscript(bool),
@@ -6052,13 +6054,7 @@ fn recording_settings_panel(
                     egui::FontId::proportional(18.0),
                     colors.muted_text,
                 );
-                let mut percent = settings.input_sensitivity_percent;
-                let sensitivity =
-                    input_sensitivity_meter_slider(ui, settings.input_level_percent, &mut percent)
-                        .labelled_by(label_id);
-                if sensitivity.changed() {
-                    *action = ScreenAction::SetInputSensitivity(percent);
-                }
+                input_level_meter(ui, settings.input_level_percent).labelled_by(label_id);
             });
         });
         if let Some(error) = settings.microphone_error.as_deref() {
@@ -6149,6 +6145,33 @@ fn voice_detection_settings_section(
                 builder.set_live_atomic();
             });
         }
+        let _ = SettingsRow::show_with_help(
+            ui,
+            "Speech detection sensitivity",
+            SPEECH_DETECTION_SENSITIVITY_HELP_ID,
+            SPEECH_DETECTION_SENSITIVITY_DESCRIPTION,
+            false,
+            |ui, label_id| {
+                let mut percent = settings.speech_detection_sensitivity_percent;
+                let response = ui
+                    .add_enabled_ui(!recording_locked, |ui| {
+                        speech_detection_sensitivity_slider(ui, &mut percent)
+                    })
+                    .inner
+                    .labelled_by(label_id);
+                if recording_locked {
+                    ui.ctx().accesskit_node_builder(response.id, |builder| {
+                        builder.set_disabled();
+                        builder.set_description(format!(
+                            "{SPEECH_DETECTION_SENSITIVITY_DESCRIPTION} {VOICE_DETECTION_LOCKED_DESCRIPTION}"
+                        ));
+                    });
+                }
+                if response.changed() {
+                    *action = ScreenAction::SetSpeechDetectionSensitivity(percent);
+                }
+            },
+        );
         let mut vad_enabled = settings.vad_enabled;
         let _ = SettingsRow::show_with_help(
             ui,
@@ -6686,17 +6709,16 @@ fn describe_history_lock(
     }
 }
 
-fn input_sensitivity_meter_slider(
+fn speech_detection_sensitivity_slider(
     ui: &mut egui::Ui,
-    live_level_percent: u8,
-    threshold_percent: &mut u8,
+    sensitivity_percent: &mut u8,
 ) -> egui::Response {
     use egui::accesskit::{Action, ActionData};
 
     let desired = Vec2::new(320.0, 44.0);
     let (rect, mut response) = ui.allocate_exact_size(desired, Sense::click_and_drag());
-    let previous = *threshold_percent;
-    let mut value = f32::from(*threshold_percent).clamp(0.0, 100.0);
+    let previous = *sensitivity_percent;
+    let mut value = f32::from(*sensitivity_percent).clamp(0.0, 100.0);
 
     if response.enabled() && response.clicked() {
         response.request_focus();
@@ -6743,35 +6765,33 @@ fn input_sensitivity_meter_slider(
         });
     }
     value = (value + increment as f32 - decrement as f32).clamp(0.0, 100.0);
-    *threshold_percent = value.round() as u8;
-    if *threshold_percent != previous {
+    *sensitivity_percent = value.round() as u8;
+    if *sensitivity_percent != previous {
         response.mark_changed();
     }
 
-    let live_state = if live_level_percent == 0 {
-        "No input detected."
-    } else if live_level_percent >= *threshold_percent {
-        "Input detected above sensitivity."
-    } else {
-        "Input below sensitivity."
-    };
+    let threshold = 0.8 - (f32::from(*sensitivity_percent) / 100.0) * 0.6;
     let description = format!(
-        "{live_state} Minimum microphone level treated as speech. The colored fill shows the current input level without changing focus or announcing each update. Use Left and Right arrow keys to adjust."
+        "More sensitive settings lower the speech-probability threshold. {} percent sensitivity uses a {threshold:.2} speech probability threshold. Use Left and Right arrow keys to adjust.",
+        *sensitivity_percent
     );
     response.widget_info(|| {
-        egui::WidgetInfo::slider(f64::from(*threshold_percent), "Input level sensitivity")
+        egui::WidgetInfo::slider(
+            f64::from(*sensitivity_percent),
+            "Speech detection sensitivity",
+        )
     });
     ui.ctx().accesskit_node_builder(response.id, |builder| {
-        builder.set_name("Input level sensitivity");
+        builder.set_name("Speech detection sensitivity");
         builder.set_description(description);
         builder.set_min_numeric_value(0.0);
         builder.set_max_numeric_value(100.0);
         builder.set_numeric_value_step(1.0);
         builder.add_action(Action::SetValue);
-        if *threshold_percent < 100 {
+        if *sensitivity_percent < 100 {
             builder.add_action(Action::Increment);
         }
-        if *threshold_percent > 0 {
+        if *sensitivity_percent > 0 {
             builder.add_action(Action::Decrement);
         }
     });
@@ -6781,41 +6801,25 @@ fn input_sensitivity_meter_slider(
     let rounding = Rounding::same(5.0);
     ui.painter()
         .rect_filled(track, rounding, colors.slider_remainder_fill);
-    let threshold_position = f32::from(*threshold_percent) / 100.0;
-    let threshold_x = track.left() + track.width() * threshold_position;
-    let threshold_region = egui::Rect::from_min_max(
+    let sensitivity_position = f32::from(*sensitivity_percent) / 100.0;
+    let sensitivity_x = track.left() + track.width() * sensitivity_position;
+    let sensitivity_region = egui::Rect::from_min_max(
         track.min,
         egui::pos2(
-            threshold_x.clamp(track.left(), track.right()),
+            sensitivity_x.clamp(track.left(), track.right()),
             track.bottom(),
         ),
     );
-    if threshold_region.width() > 0.0 {
+    if sensitivity_region.width() > 0.0 {
         ui.painter()
-            .rect_filled(threshold_region, rounding, colors.slider_threshold_fill);
+            .rect_filled(sensitivity_region, rounding, colors.slider_threshold_fill);
     }
     ui.painter().rect_stroke(
         track,
         rounding,
         Stroke::new(1.0, colors.slider_track_border),
     );
-    let live_position = f32::from(live_level_percent.min(100)) / 100.0;
-    let live_width = track.width() * live_position;
-    if live_width > 0.0 {
-        let live_rect = egui::Rect::from_min_size(
-            egui::pos2(track.left(), track.center().y - 3.0),
-            Vec2::new(live_width, 6.0),
-        );
-        let fill = if live_position >= threshold_position {
-            colors.slider_live_above
-        } else {
-            colors.slider_live_below
-        };
-        ui.painter()
-            .rect_filled(live_rect, Rounding::same(3.0), fill);
-    }
-
-    let thumb_center = egui::pos2(threshold_x, track.center().y);
+    let thumb_center = egui::pos2(sensitivity_x, track.center().y);
     let thumb_radius = if response.dragged() { 9.0 } else { 8.0 };
     ui.painter()
         .circle_filled(thumb_center, thumb_radius, colors.card_bg);
@@ -6825,6 +6829,30 @@ fn input_sensitivity_meter_slider(
         Stroke::new(if response.has_focus() { 3.0 } else { 2.0 }, colors.primary),
     );
     paint_focus_ring(ui, &response, Rounding::same(5.0));
+    response
+}
+
+fn input_level_meter(ui: &mut egui::Ui, live_level_percent: u8) -> egui::Response {
+    let desired = Vec2::new(320.0, 44.0);
+    let (rect, response) = ui.allocate_exact_size(desired, Sense::hover());
+    let colors = ui_palette(ui);
+    let track = egui::Rect::from_center_size(rect.center(), Vec2::new(rect.width(), 10.0));
+    let rounding = Rounding::same(5.0);
+    ui.painter()
+        .rect_filled(track, rounding, colors.slider_remainder_fill);
+    let live_width = track.width() * (f32::from(live_level_percent.min(100)) / 100.0);
+    if live_width > 0.0 {
+        ui.painter().rect_filled(
+            egui::Rect::from_min_size(track.min, Vec2::new(live_width, track.height())),
+            rounding,
+            colors.primary,
+        );
+    }
+    ui.painter().rect_stroke(
+        track,
+        rounding,
+        Stroke::new(1.0, colors.slider_track_border),
+    );
     response
 }
 
@@ -11313,11 +11341,11 @@ mod tests {
     }
 
     #[test]
-    fn recording_settings_keeps_live_level_paint_inside_one_sensitivity_slider() {
+    fn live_input_meter_and_speech_sensitivity_are_separate_accessible_controls() {
         use egui::accesskit::Role;
 
         let settings_view = RecordingSettingsView {
-            input_sensitivity_percent: 42,
+            speech_detection_sensitivity_percent: 42,
             input_level_percent: 72,
             ..Default::default()
         };
@@ -11327,7 +11355,7 @@ mod tests {
             egui::CentralPanel::default().show(ctx, |ui| {
                 let _ = settings(
                     ui,
-                    SettingsTab::Recording,
+                    SettingsTab::Advanced,
                     &TranscriptionState::default(),
                     &settings_view,
                 );
@@ -11337,7 +11365,7 @@ mod tests {
         let sliders = nodes
             .iter()
             .filter(|(_, node)| {
-                node.role() == Role::Slider && node.name() == Some("Input level sensitivity")
+                node.role() == Role::Slider && node.name() == Some("Speech detection sensitivity")
             })
             .collect::<Vec<_>>();
         assert_eq!(sliders.len(), 1);
@@ -11348,22 +11376,35 @@ mod tests {
         assert!(
             slider
                 .description()
-                .is_some_and(|description| description.contains("colored fill"))
+                .is_some_and(|description| description.contains("speech probability threshold"))
         );
         assert!(
             slider
                 .description()
-                .is_some_and(|description| description.contains("Input detected"))
+                .is_some_and(|description| !description.contains("Input detected"))
         );
+        let recording_ctx = egui::Context::default();
+        recording_ctx.enable_accesskit();
+        let recording = recording_ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = settings(
+                    ui,
+                    SettingsTab::Recording,
+                    &TranscriptionState::default(),
+                    &settings_view,
+                );
+            });
+        });
+        let recording_nodes = &recording.platform_output.accesskit_update.unwrap().nodes;
         assert!(
-            nodes
+            recording_nodes
                 .iter()
                 .any(|(_, node)| node.name() == Some("Recording input"))
         );
         assert!(
-            !nodes
+            !recording_nodes
                 .iter()
-                .any(|(_, node)| node.role() == Role::ProgressIndicator)
+                .any(|(_, node)| node.role() == Role::Slider)
         );
     }
 
@@ -11792,11 +11833,14 @@ mod tests {
                     SettingsTab::Recording => &[
                         ("Duration limit", egui::accesskit::Role::ComboBox),
                         ("Device", egui::accesskit::Role::ComboBox),
-                        ("Input level", egui::accesskit::Role::Slider),
                         ("Streaming mode", egui::accesskit::Role::ComboBox),
                         ("Transcription device", egui::accesskit::Role::ComboBox),
                     ],
                     SettingsTab::Advanced => &[
+                        (
+                            "Speech detection sensitivity",
+                            egui::accesskit::Role::Slider,
+                        ),
                         ("Speech confirmation ms", egui::accesskit::Role::SpinButton),
                         ("History storage", egui::accesskit::Role::ComboBox),
                         (
@@ -11813,7 +11857,8 @@ mod tests {
                             (node.name() == Some(*label)).then(|| {
                                 nodes.iter().find_map(|(_, control)| {
                                     (control.role() == *role
-                                        && control.labelled_by().contains(label_id))
+                                        && (control.labelled_by().contains(label_id)
+                                            || control.name() == Some(*label)))
                                     .then(|| control.bounds())
                                     .flatten()
                                 })

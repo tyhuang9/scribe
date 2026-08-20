@@ -21,10 +21,14 @@ use crate::embedded_runtime::{EmbeddedRuntime, TRANSCRIBE_CPP_VERSION};
 use crate::model_catalog::{
     ArtifactFormat, RuntimeRequirement, RuntimeVersion, runtime_model_manifest,
 };
+use crate::onnx_worker::{
+    OnnxModelFamily, OnnxModelSpec, OnnxWorkerSupervisor, resolve_cpu_only_acceleration,
+};
 use crate::prepared_audio::{PREPARED_SAMPLE_RATE, PreparedAudio};
 use crate::transcription::{
     AccelerationPreference, ComputeDevice, ModelId, ResolvedAcceleration, RuntimeCapabilities,
-    SpeechEngine, Transcript, TranscriptSegment, TranscriptionOptions,
+    SpeechEngine, SpeechStream, StreamUpdate, StreamingSpeechEngine, Transcript, TranscriptSegment,
+    TranscriptionOptions,
 };
 
 pub(crate) const WARM_MODEL_TTL: Duration = Duration::from_secs(5 * 60);
@@ -91,6 +95,36 @@ pub(crate) struct RuntimeModel {
     pub package_root: Option<PathBuf>,
     pub expected_size_bytes: u64,
     pub expected_sha256: String,
+}
+
+/// Internal, typed runtime input. Public model resolution still produces the
+/// existing `RuntimeModel`; conversion at the service boundary keeps concrete
+/// handler selection confined to this router.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeArtifact {
+    Gguf(RuntimeModel),
+    LegacyCompatibility(RuntimeModel),
+    #[allow(dead_code)]
+    OnnxBundle(OnnxModelSpec),
+}
+
+impl From<RuntimeModel> for RuntimeArtifact {
+    fn from(model: RuntimeModel) -> Self {
+        if is_gguf_model(&model) {
+            Self::Gguf(model)
+        } else {
+            Self::LegacyCompatibility(model)
+        }
+    }
+}
+
+impl RuntimeArtifact {
+    fn model_id(&self) -> ModelId {
+        match self {
+            Self::Gguf(model) | Self::LegacyCompatibility(model) => model.id.clone(),
+            Self::OnnxBundle(model) => ModelId::new(model.id.clone()),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -187,16 +221,19 @@ pub(crate) enum RuntimeError {
     UnsupportedModel(ModelId),
     #[error("dedicated native runtime worker is unavailable: {0}")]
     WorkerUnavailable(String),
+    #[error("isolated ONNX speech runtime is unavailable: {0}")]
+    OnnxUnavailable(String),
     #[error(
         "legacy GGML model {model_id} at {path} requires a verified whisper.cpp package root; install or repair the compatibility runtime before loading it"
     )]
     MissingLegacyPackageRoot { model_id: ModelId, path: PathBuf },
 }
 
-/// Deliberately private: the only Phase 2 selection has one variant.
+/// Deliberately private: concrete runtime selection never crosses the router.
 #[derive(Clone, Copy, Debug)]
 enum RuntimeKind {
     TranscribeCpp,
+    OnnxSpeech,
 }
 
 const TRANSCRIBE_CPP_RUNTIME_VERSION: RuntimeVersion = RuntimeVersion {
@@ -226,16 +263,330 @@ fn is_gguf_model(model: &RuntimeModel) -> bool {
 /// router deliberately keys the safe embedded route on the concrete GGUF
 /// artifact rather than on a display/catalog ID, so dynamic catalog entries
 /// use the same in-process engine as the bundled default.
+#[cfg(test)]
 fn runtime_kind_for_runtime_model(model: &RuntimeModel) -> Option<RuntimeKind> {
     is_gguf_model(model)
         .then_some(RuntimeKind::TranscribeCpp)
         .or_else(|| runtime_kind_for_model(&model.id))
 }
 
+fn runtime_kind_for_artifact(artifact: &RuntimeArtifact) -> Option<RuntimeKind> {
+    match artifact {
+        RuntimeArtifact::Gguf(_) => Some(RuntimeKind::TranscribeCpp),
+        RuntimeArtifact::LegacyCompatibility(model) => runtime_kind_for_model(&model.id),
+        RuntimeArtifact::OnnxBundle(_) => Some(RuntimeKind::OnnxSpeech),
+    }
+}
+
+fn heavy_owner_for_artifact(artifact: &RuntimeArtifact) -> HeavyRuntimeOwner {
+    match artifact {
+        RuntimeArtifact::Gguf(_) => HeavyRuntimeOwner::EmbeddedGguf,
+        RuntimeArtifact::LegacyCompatibility(_) => HeavyRuntimeOwner::LegacyCompatibility,
+        RuntimeArtifact::OnnxBundle(_) => HeavyRuntimeOwner::OnnxSpeech,
+    }
+}
+
 fn embedded_runtime_location() -> PathBuf {
     PathBuf::from(format!(
         "<statically linked transcribe-cpp {TRANSCRIBE_CPP_VERSION}>"
     ))
+}
+
+fn onnx_runtime_location() -> PathBuf {
+    PathBuf::from("<isolated sherpa-onnx worker>")
+}
+
+pub(crate) trait OnnxSupervisorControl: Send + Sync {
+    fn load(&self, session_id: u64, request_id: u64, model: OnnxModelSpec) -> anyhow::Result<bool>;
+    fn transcribe(
+        &self,
+        session_id: u64,
+        request_id: u64,
+        samples: &[f32],
+    ) -> anyhow::Result<String>;
+    fn start_stream(&self, session_id: u64, request_id: u64) -> anyhow::Result<()>;
+    fn audio_chunk(
+        &self,
+        session_id: u64,
+        request_id: u64,
+        samples: &[f32],
+    ) -> anyhow::Result<String>;
+    fn end_stream(&self, session_id: u64, request_id: u64) -> anyhow::Result<String>;
+    fn cancel_stream(&self, session_id: u64, request_id: u64) -> anyhow::Result<()>;
+    fn health(&self, session_id: u64, request_id: u64) -> anyhow::Result<()>;
+    fn unload(&self) -> anyhow::Result<()>;
+    fn cancel_active(&self) -> anyhow::Result<()>;
+    fn abandon_stream(&self, session_id: u64);
+    fn terminate_current(&self) -> anyhow::Result<()>;
+}
+
+impl OnnxSupervisorControl for OnnxWorkerSupervisor {
+    fn load(&self, session_id: u64, request_id: u64, model: OnnxModelSpec) -> anyhow::Result<bool> {
+        OnnxWorkerSupervisor::load(self, session_id, request_id, model)
+    }
+
+    fn transcribe(
+        &self,
+        session_id: u64,
+        request_id: u64,
+        samples: &[f32],
+    ) -> anyhow::Result<String> {
+        OnnxWorkerSupervisor::transcribe(self, session_id, request_id, samples)
+    }
+
+    fn start_stream(&self, session_id: u64, request_id: u64) -> anyhow::Result<()> {
+        OnnxWorkerSupervisor::start_stream(self, session_id, request_id)
+    }
+
+    fn audio_chunk(
+        &self,
+        session_id: u64,
+        request_id: u64,
+        samples: &[f32],
+    ) -> anyhow::Result<String> {
+        OnnxWorkerSupervisor::audio_chunk(self, session_id, request_id, samples)
+    }
+
+    fn end_stream(&self, session_id: u64, request_id: u64) -> anyhow::Result<String> {
+        OnnxWorkerSupervisor::end_stream(self, session_id, request_id)
+    }
+
+    fn cancel_stream(&self, session_id: u64, request_id: u64) -> anyhow::Result<()> {
+        OnnxWorkerSupervisor::cancel_stream(self, session_id, request_id)
+    }
+
+    fn health(&self, session_id: u64, request_id: u64) -> anyhow::Result<()> {
+        OnnxWorkerSupervisor::health(self, session_id, request_id)
+    }
+
+    fn unload(&self) -> anyhow::Result<()> {
+        OnnxWorkerSupervisor::unload(self)
+    }
+
+    fn cancel_active(&self) -> anyhow::Result<()> {
+        OnnxWorkerSupervisor::cancel_active(self)
+    }
+
+    fn abandon_stream(&self, session_id: u64) {
+        OnnxWorkerSupervisor::abandon_stream(self, session_id)
+    }
+
+    fn terminate_current(&self) -> anyhow::Result<()> {
+        OnnxWorkerSupervisor::terminate_current(self)
+    }
+}
+
+type OnnxSupervisorFactory =
+    dyn Fn() -> Result<Arc<dyn OnnxSupervisorControl>, RuntimeError> + Send + Sync;
+
+fn production_onnx_supervisor() -> Result<Arc<dyn OnnxSupervisorControl>, RuntimeError> {
+    OnnxWorkerSupervisor::spawn()
+        .map(|supervisor| Arc::new(supervisor) as Arc<dyn OnnxSupervisorControl>)
+        .map_err(|error| RuntimeError::OnnxUnavailable(error.to_string()))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HeavyRuntimeOwner {
+    EmbeddedGguf,
+    LegacyCompatibility,
+    OnnxSpeech,
+}
+
+#[derive(Default)]
+struct HeavyRuntimeOwnership {
+    current: Option<HeavyRuntimeOwner>,
+}
+
+impl HeavyRuntimeOwnership {
+    fn transition(
+        &mut self,
+        requested: HeavyRuntimeOwner,
+        unload: impl FnOnce(HeavyRuntimeOwner) -> Result<(), RuntimeError>,
+    ) -> Result<(), RuntimeError> {
+        let Some(current) = self.current.filter(|current| *current != requested) else {
+            return Ok(());
+        };
+        unload(current)?;
+        self.current = None;
+        Ok(())
+    }
+
+    fn activate(&mut self, owner: HeavyRuntimeOwner) {
+        self.current = Some(owner);
+    }
+
+    fn clear(&mut self, owner: HeavyRuntimeOwner) {
+        if self.current == Some(owner) {
+            self.current = None;
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct RuntimeActivity {
+    inner: Arc<Mutex<RuntimeActivityState>>,
+}
+
+struct RuntimeActivityState {
+    active_streams: usize,
+    active_requests: usize,
+    generation: u64,
+    idle_since: Instant,
+}
+
+impl Default for RuntimeActivity {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(RuntimeActivityState {
+                active_streams: 0,
+                active_requests: 0,
+                generation: 0,
+                idle_since: Instant::now(),
+            })),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum IdleTimeoutAction {
+    Unload,
+    Defer(Duration),
+}
+
+impl RuntimeActivity {
+    fn acquire_stream(&self) -> Result<RuntimeActivityLease, RuntimeError> {
+        let mut state = self.inner.lock().map_err(|_| RuntimeError::Poisoned)?;
+        state.active_streams = state.active_streams.saturating_add(1);
+        Ok(RuntimeActivityLease {
+            activity: self.clone(),
+            generation: state.generation,
+            kind: RuntimeActivityKind::Stream,
+            refresh_idle_on_release: true,
+            released: false,
+        })
+    }
+
+    pub(crate) fn acquire_request(&self) -> Result<RuntimeActivityLease, RuntimeError> {
+        let mut state = self.inner.lock().map_err(|_| RuntimeError::Poisoned)?;
+        state.active_requests = state.active_requests.saturating_add(1);
+        Ok(RuntimeActivityLease {
+            activity: self.clone(),
+            generation: state.generation,
+            kind: RuntimeActivityKind::Request,
+            refresh_idle_on_release: false,
+            released: false,
+        })
+    }
+
+    pub(crate) fn mark_command_complete(&self) {
+        self.mark_command_complete_at(Instant::now());
+    }
+
+    fn mark_command_complete_at(&self, now: Instant) {
+        if let Ok(mut state) = self.inner.lock()
+            && state.active_streams == 0
+            && state.active_requests == 0
+        {
+            state.idle_since = now;
+        }
+    }
+
+    pub(crate) fn timeout_action(&self, ttl: Duration) -> IdleTimeoutAction {
+        self.timeout_action_at(Instant::now(), ttl)
+    }
+
+    fn timeout_action_at(&self, now: Instant, ttl: Duration) -> IdleTimeoutAction {
+        let Ok(state) = self.inner.lock() else {
+            return IdleTimeoutAction::Defer(ttl);
+        };
+        if state.active_streams != 0 || state.active_requests != 0 {
+            return IdleTimeoutAction::Defer(ttl);
+        }
+        let idle_for = now.saturating_duration_since(state.idle_since);
+        if idle_for >= ttl {
+            IdleTimeoutAction::Unload
+        } else {
+            IdleTimeoutAction::Defer(ttl - idle_for)
+        }
+    }
+
+    fn force_release_streams(&self) {
+        self.force_release_streams_at(Instant::now());
+    }
+
+    fn force_release_streams_at(&self, now: Instant) {
+        if let Ok(mut state) = self.inner.lock() {
+            state.active_streams = 0;
+            state.active_requests = 0;
+            state.generation = state.generation.wrapping_add(1);
+            state.idle_since = now;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_streams(&self) -> usize {
+        self.inner.lock().unwrap().active_streams
+    }
+}
+
+pub(crate) struct RuntimeActivityLease {
+    activity: RuntimeActivity,
+    generation: u64,
+    kind: RuntimeActivityKind,
+    refresh_idle_on_release: bool,
+    released: bool,
+}
+
+#[derive(Clone, Copy)]
+enum RuntimeActivityKind {
+    Stream,
+    Request,
+}
+
+impl RuntimeActivityLease {
+    pub(crate) fn complete_successfully(&mut self) {
+        self.complete_successfully_at(Instant::now());
+    }
+
+    fn complete_successfully_at(&mut self, now: Instant) {
+        self.refresh_idle_on_release = true;
+        self.release_at(now);
+    }
+
+    fn release(&mut self) {
+        self.release_at(Instant::now());
+    }
+
+    fn release_at(&mut self, now: Instant) {
+        if self.released {
+            return;
+        }
+        if let Ok(mut state) = self.activity.inner.lock()
+            && state.generation == self.generation
+        {
+            match self.kind {
+                RuntimeActivityKind::Stream => {
+                    state.active_streams = state.active_streams.saturating_sub(1);
+                }
+                RuntimeActivityKind::Request => {
+                    state.active_requests = state.active_requests.saturating_sub(1);
+                }
+            }
+            if self.refresh_idle_on_release
+                && state.active_streams == 0
+                && state.active_requests == 0
+            {
+                state.idle_since = now;
+            }
+        }
+        self.released = true;
+    }
+}
+
+impl Drop for RuntimeActivityLease {
+    fn drop(&mut self) {
+        self.release();
+    }
 }
 
 /// The sole application-level runtime router. Clones share one serialized
@@ -246,6 +597,10 @@ pub(crate) struct RuntimeRouter {
     inner: Arc<Mutex<RouterState>>,
     cancel_generation: Arc<AtomicU64>,
     embedded_cancellation: Arc<Mutex<Option<CancelToken>>>,
+    onnx_cancellation: Arc<Mutex<Option<Arc<dyn OnnxSupervisorControl>>>>,
+    onnx_factory: Arc<OnnxSupervisorFactory>,
+    next_onnx_correlation: Arc<AtomicU64>,
+    runtime_activity: RuntimeActivity,
 }
 
 struct EmbeddedCancellationContext {
@@ -256,11 +611,39 @@ struct EmbeddedCancellationContext {
 
 impl RuntimeRouter {
     pub(crate) fn new() -> Self {
+        Self::with_onnx_factory(Arc::new(production_onnx_supervisor))
+    }
+
+    fn with_onnx_factory(onnx_factory: Arc<OnnxSupervisorFactory>) -> Self {
         Self {
             inner: Arc::new(Mutex::new(RouterState::default())),
             cancel_generation: Arc::new(AtomicU64::new(0)),
             embedded_cancellation: Arc::new(Mutex::new(None)),
+            onnx_cancellation: Arc::new(Mutex::new(None)),
+            onnx_factory,
+            next_onnx_correlation: Arc::new(AtomicU64::new(0)),
+            runtime_activity: RuntimeActivity::default(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_onnx_factory(
+        factory: impl Fn() -> Result<Arc<dyn OnnxSupervisorControl>, RuntimeError>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        Self::with_onnx_factory(Arc::new(factory))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn onnx_state_for_test(&self) -> (bool, bool, bool) {
+        let state = self.inner.lock().unwrap();
+        (
+            state.onnx.is_some(),
+            self.onnx_cancellation.lock().unwrap().is_some(),
+            state.heavy_ownership.current == Some(HeavyRuntimeOwner::OnnxSpeech),
+        )
     }
 
     pub(crate) fn handles_model(&self, model_id: &ModelId) -> bool {
@@ -275,12 +658,14 @@ impl RuntimeRouter {
         }
         runtime_kind_for_model(model_id).map(|kind| match kind {
             RuntimeKind::TranscribeCpp => "whisper_cpp",
+            RuntimeKind::OnnxSpeech => unreachable!("catalog models never select private ONNX"),
         })
     }
 
     pub(crate) fn capabilities(&self, model_id: &ModelId) -> Option<RuntimeCapabilities> {
         runtime_kind_for_model(model_id).map(|kind| match kind {
             RuntimeKind::TranscribeCpp => TranscribeCppRuntime::runtime_capabilities(),
+            RuntimeKind::OnnxSpeech => unreachable!("catalog models never select private ONNX"),
         })
     }
 
@@ -290,7 +675,7 @@ impl RuntimeRouter {
 
     pub(crate) fn transcribe(
         &self,
-        model: RuntimeModel,
+        artifact: RuntimeArtifact,
         preference: AccelerationPreference,
         audio: &PreparedAudio,
         options: &TranscriptionOptions,
@@ -309,73 +694,199 @@ impl RuntimeRouter {
             });
         }
 
-        let kind = runtime_kind_for_runtime_model(&model)
-            .ok_or_else(|| RuntimeError::UnsupportedModel(model.id.clone()))?;
+        let kind = runtime_kind_for_artifact(&artifact)
+            .ok_or_else(|| RuntimeError::UnsupportedModel(artifact.model_id()))?;
+        let owner = heavy_owner_for_artifact(&artifact);
+        if let RuntimeArtifact::OnnxBundle(model) = &artifact {
+            model
+                .validate()
+                .map_err(|error| RuntimeError::OnnxUnavailable(error.to_string()))?;
+            resolve_cpu_only_acceleration(preference)
+                .map_err(|error| RuntimeError::OnnxUnavailable(error.to_string()))?;
+        }
         let mut state = self.inner.lock().map_err(|_| RuntimeError::Poisoned)?;
-        match kind {
-            RuntimeKind::TranscribeCpp if is_gguf_model(&model) => state.transcribe_embedded(
+        state.prepare_heavy_runtime(
+            owner,
+            &self.embedded_cancellation,
+            &self.onnx_cancellation,
+            &self.runtime_activity,
+        )?;
+        match (kind, artifact) {
+            (RuntimeKind::TranscribeCpp, RuntimeArtifact::Gguf(model)) => state
+                .transcribe_embedded(
+                    model,
+                    preference,
+                    audio,
+                    options,
+                    EmbeddedCancellationContext {
+                        token: Arc::clone(&self.embedded_cancellation),
+                        generation: Arc::clone(&self.cancel_generation),
+                        snapshot: cancellation_snapshot,
+                    },
+                ),
+            (RuntimeKind::TranscribeCpp, RuntimeArtifact::LegacyCompatibility(model)) => state
+                .transcribe_cpp(
+                    model,
+                    preference,
+                    audio,
+                    options,
+                    Arc::clone(&self.cancel_generation),
+                    cancellation_snapshot,
+                ),
+            (RuntimeKind::OnnxSpeech, RuntimeArtifact::OnnxBundle(model)) => state.transcribe_onnx(
                 model,
                 preference,
                 audio,
                 options,
-                EmbeddedCancellationContext {
-                    token: Arc::clone(&self.embedded_cancellation),
-                    generation: Arc::clone(&self.cancel_generation),
-                    snapshot: cancellation_snapshot,
-                },
+                Arc::clone(&self.onnx_factory),
+                Arc::clone(&self.onnx_cancellation),
+                Arc::clone(&self.next_onnx_correlation),
+                self.runtime_activity.clone(),
             ),
-            RuntimeKind::TranscribeCpp => state.transcribe_cpp(
-                model,
-                preference,
-                audio,
-                options,
-                Arc::clone(&self.cancel_generation),
-                cancellation_snapshot,
-            ),
+            _ => unreachable!("runtime kind and typed artifact must agree"),
         }
     }
 
     pub(crate) fn load(
         &self,
-        model: RuntimeModel,
+        artifact: RuntimeArtifact,
         preference: AccelerationPreference,
     ) -> Result<RuntimeLoadExecution, RuntimeError> {
-        let kind = runtime_kind_for_runtime_model(&model)
-            .ok_or_else(|| RuntimeError::UnsupportedModel(model.id.clone()))?;
+        let kind = runtime_kind_for_artifact(&artifact)
+            .ok_or_else(|| RuntimeError::UnsupportedModel(artifact.model_id()))?;
+        let owner = heavy_owner_for_artifact(&artifact);
+        if let RuntimeArtifact::OnnxBundle(model) = &artifact {
+            model
+                .validate()
+                .map_err(|error| RuntimeError::OnnxUnavailable(error.to_string()))?;
+            resolve_cpu_only_acceleration(preference)
+                .map_err(|error| RuntimeError::OnnxUnavailable(error.to_string()))?;
+        }
         let mut state = self.inner.lock().map_err(|_| RuntimeError::Poisoned)?;
-        match kind {
-            RuntimeKind::TranscribeCpp if is_gguf_model(&model) => {
+        state.prepare_heavy_runtime(
+            owner,
+            &self.embedded_cancellation,
+            &self.onnx_cancellation,
+            &self.runtime_activity,
+        )?;
+        match (kind, artifact) {
+            (RuntimeKind::TranscribeCpp, RuntimeArtifact::Gguf(model)) => {
                 state.load_embedded(model, preference, Arc::clone(&self.embedded_cancellation))
             }
-            RuntimeKind::TranscribeCpp => {
+            (RuntimeKind::TranscribeCpp, RuntimeArtifact::LegacyCompatibility(model)) => {
                 state.load_transcribe_cpp(model, preference, Arc::clone(&self.cancel_generation))
             }
+            (RuntimeKind::OnnxSpeech, RuntimeArtifact::OnnxBundle(model)) => state.load_onnx(
+                model,
+                preference,
+                Arc::clone(&self.onnx_factory),
+                Arc::clone(&self.onnx_cancellation),
+                Arc::clone(&self.next_onnx_correlation),
+                self.runtime_activity.clone(),
+            ),
+            _ => unreachable!("runtime kind and typed artifact must agree"),
         }
     }
 
     pub(crate) fn health_check(
         &self,
-        model: RuntimeModel,
+        artifact: RuntimeArtifact,
         preference: AccelerationPreference,
     ) -> Result<(), RuntimeError> {
-        let kind = runtime_kind_for_runtime_model(&model)
-            .ok_or_else(|| RuntimeError::UnsupportedModel(model.id.clone()))?;
+        let kind = runtime_kind_for_artifact(&artifact)
+            .ok_or_else(|| RuntimeError::UnsupportedModel(artifact.model_id()))?;
+        let owner = heavy_owner_for_artifact(&artifact);
+        if let RuntimeArtifact::OnnxBundle(model) = &artifact {
+            model
+                .validate()
+                .map_err(|error| RuntimeError::OnnxUnavailable(error.to_string()))?;
+            resolve_cpu_only_acceleration(preference)
+                .map_err(|error| RuntimeError::OnnxUnavailable(error.to_string()))?;
+        }
         let mut state = self.inner.lock().map_err(|_| RuntimeError::Poisoned)?;
-        match kind {
-            RuntimeKind::TranscribeCpp if is_gguf_model(&model) => state.health_check_embedded(
-                model,
-                preference,
-                Arc::clone(&self.embedded_cancellation),
-            ),
-            RuntimeKind::TranscribeCpp => {
-                let runtime = state.transcribe_cpp_runtime(
+        state.prepare_heavy_runtime(
+            owner,
+            &self.embedded_cancellation,
+            &self.onnx_cancellation,
+            &self.runtime_activity,
+        )?;
+        match (kind, artifact) {
+            (RuntimeKind::TranscribeCpp, RuntimeArtifact::Gguf(model)) => state
+                .health_check_embedded(model, preference, Arc::clone(&self.embedded_cancellation)),
+            (RuntimeKind::TranscribeCpp, RuntimeArtifact::LegacyCompatibility(model)) => state
+                .health_check_transcribe_cpp(
                     model,
                     preference,
                     Arc::clone(&self.cancel_generation),
-                )?;
-                SpeechEngine::health_check(runtime)
-                    .map_err(|error| RuntimeError::Engine(format!("{error:#}")))
-            }
+                ),
+            (RuntimeKind::OnnxSpeech, RuntimeArtifact::OnnxBundle(model)) => state.health_onnx(
+                model,
+                preference,
+                Arc::clone(&self.onnx_factory),
+                Arc::clone(&self.onnx_cancellation),
+                Arc::clone(&self.next_onnx_correlation),
+                self.runtime_activity.clone(),
+            ),
+            _ => unreachable!("runtime kind and typed artifact must agree"),
+        }
+    }
+
+    pub(crate) fn start_stream(
+        &self,
+        artifact: RuntimeArtifact,
+        preference: AccelerationPreference,
+        options: &TranscriptionOptions,
+    ) -> Result<Box<dyn SpeechStream>, RuntimeError> {
+        let RuntimeArtifact::OnnxBundle(model) = artifact else {
+            return Err(RuntimeError::OnnxUnavailable(
+                "incremental streaming is available only for a private ONNX bundle".to_owned(),
+            ));
+        };
+        model
+            .validate()
+            .map_err(|error| RuntimeError::OnnxUnavailable(error.to_string()))?;
+        resolve_cpu_only_acceleration(preference)
+            .map_err(|error| RuntimeError::OnnxUnavailable(error.to_string()))?;
+        let mut state = self.inner.lock().map_err(|_| RuntimeError::Poisoned)?;
+        state.prepare_heavy_runtime(
+            HeavyRuntimeOwner::OnnxSpeech,
+            &self.embedded_cancellation,
+            &self.onnx_cancellation,
+            &self.runtime_activity,
+        )?;
+        let loaded = {
+            let runtime = state.onnx_runtime(
+                Arc::clone(&self.onnx_factory),
+                Arc::clone(&self.onnx_cancellation),
+                Arc::clone(&self.next_onnx_correlation),
+                self.runtime_activity.clone(),
+            )?;
+            runtime.load_model(model, preference)
+        };
+        if let Err(error) = loaded {
+            return Err(state.fail_onnx_runtime(
+                &self.onnx_cancellation,
+                &self.runtime_activity,
+                error,
+            ));
+        }
+        state
+            .heavy_ownership
+            .activate(HeavyRuntimeOwner::OnnxSpeech);
+        let started = StreamingSpeechEngine::start_stream(
+            state
+                .onnx
+                .as_mut()
+                .expect("successful ONNX load retains its runtime"),
+            options,
+        );
+        match started {
+            Ok(stream) => Ok(stream),
+            Err(error) => Err(state.fail_onnx_runtime(
+                &self.onnx_cancellation,
+                &self.runtime_activity,
+                RuntimeError::Engine(format!("{error:#}")),
+            )),
         }
     }
 
@@ -389,30 +900,66 @@ impl RuntimeRouter {
         {
             token.cancel();
         }
+        if let Ok(active) = self.onnx_cancellation.lock()
+            && let Some(supervisor) = active.as_ref()
+        {
+            let _ = supervisor.cancel_active();
+        }
     }
 
     pub(crate) fn cancellation_snapshot(&self) -> u64 {
         self.cancel_generation.load(Ordering::Acquire)
     }
 
+    pub(crate) fn runtime_activity(&self) -> RuntimeActivity {
+        self.runtime_activity.clone()
+    }
+
     pub(crate) fn unload_all(&self) -> Result<(), RuntimeError> {
         let mut state = self.inner.lock().map_err(|_| RuntimeError::Poisoned)?;
-        if let Some(runtime) = state.transcribe_cpp.as_mut() {
-            SpeechEngine::unload(runtime)
-                .map_err(|error| RuntimeError::Engine(format!("{error:#}")))?;
+        let mut first_error = None;
+        if let Some(runtime) = state.transcribe_cpp.as_mut()
+            && let Err(error) = SpeechEngine::unload(runtime)
+        {
+            first_error = Some(RuntimeError::Engine(format!("{error:#}")));
         }
         state.transcribe_cpp = None;
-        if let Some(runtime) = state.embedded.as_mut() {
-            SpeechEngine::unload(runtime)
-                .map_err(|error| RuntimeError::Engine(format!("{error:#}")))?;
+        if let Some(runtime) = state.embedded.as_mut()
+            && let Err(error) = SpeechEngine::unload(runtime)
+            && first_error.is_none()
+        {
+            first_error = Some(RuntimeError::Engine(format!("{error:#}")));
         }
         state.embedded = None;
         state.embedded_model = None;
-        *self
-            .embedded_cancellation
-            .lock()
-            .map_err(|_| RuntimeError::Poisoned)? = None;
-        Ok(())
+        if let Some(runtime) = state.onnx.as_mut()
+            && let Err(error) = SpeechEngine::unload(runtime)
+            && first_error.is_none()
+        {
+            first_error = Some(RuntimeError::Engine(format!("{error:#}")));
+        }
+        state.onnx = None;
+        match self.embedded_cancellation.lock() {
+            Ok(mut cancellation) => *cancellation = None,
+            Err(poisoned) => {
+                *poisoned.into_inner() = None;
+                if first_error.is_none() {
+                    first_error = Some(RuntimeError::Poisoned);
+                }
+            }
+        }
+        match self.onnx_cancellation.lock() {
+            Ok(mut cancellation) => *cancellation = None,
+            Err(poisoned) => {
+                *poisoned.into_inner() = None;
+                if first_error.is_none() {
+                    first_error = Some(RuntimeError::Poisoned);
+                }
+            }
+        }
+        state.heavy_ownership = HeavyRuntimeOwnership::default();
+        self.runtime_activity.force_release_streams();
+        first_error.map_or(Ok(()), Err)
     }
 }
 
@@ -426,9 +973,11 @@ impl std::fmt::Debug for RuntimeRouter {
 
 #[derive(Default)]
 struct RouterState {
+    heavy_ownership: HeavyRuntimeOwnership,
     transcribe_cpp: Option<TranscribeCppRuntime>,
     embedded: Option<EmbeddedRuntime>,
     embedded_model: Option<RuntimeModel>,
+    onnx: Option<OnnxSpeechRuntime>,
 }
 
 fn embedded_request_is_warm(
@@ -444,6 +993,301 @@ fn embedded_request_is_warm(
 }
 
 impl RouterState {
+    fn discard_onnx_runtime(
+        &mut self,
+        cancellation: &Arc<Mutex<Option<Arc<dyn OnnxSupervisorControl>>>>,
+        runtime_activity: &RuntimeActivity,
+    ) {
+        self.onnx = None;
+        match cancellation.lock() {
+            Ok(mut active) => *active = None,
+            Err(poisoned) => *poisoned.into_inner() = None,
+        }
+        self.heavy_ownership.clear(HeavyRuntimeOwner::OnnxSpeech);
+        runtime_activity.force_release_streams();
+    }
+
+    fn fail_onnx_runtime(
+        &mut self,
+        cancellation: &Arc<Mutex<Option<Arc<dyn OnnxSupervisorControl>>>>,
+        runtime_activity: &RuntimeActivity,
+        failure: RuntimeError,
+    ) -> RuntimeError {
+        let unload_error = self
+            .onnx
+            .as_mut()
+            .and_then(|runtime| SpeechEngine::unload(runtime).err());
+        if let Some(runtime) = self.onnx.as_ref()
+            && let Some(unload_error) = unload_error
+            && let Err(termination_error) = runtime.supervisor.terminate_current()
+        {
+            // A failed unload and termination can still leave a heavy native
+            // owner. Keep that ownership visible to later work.
+            self.heavy_ownership.activate(HeavyRuntimeOwner::OnnxSpeech);
+            return RuntimeError::Engine(format!(
+                "{failure}; failed to unload the ONNX worker after the error: {unload_error:#}; forced retirement also failed: {termination_error:#}"
+            ));
+        }
+        self.discard_onnx_runtime(cancellation, runtime_activity);
+        failure
+    }
+
+    fn discard_embedded_runtime(&mut self, cancellation: &Arc<Mutex<Option<CancelToken>>>) {
+        self.embedded = None;
+        self.embedded_model = None;
+        match cancellation.lock() {
+            Ok(mut active) => *active = None,
+            Err(poisoned) => *poisoned.into_inner() = None,
+        }
+        self.heavy_ownership.clear(HeavyRuntimeOwner::EmbeddedGguf);
+    }
+
+    fn prepare_heavy_runtime(
+        &mut self,
+        requested: HeavyRuntimeOwner,
+        embedded_cancellation: &Arc<Mutex<Option<CancelToken>>>,
+        onnx_cancellation: &Arc<Mutex<Option<Arc<dyn OnnxSupervisorControl>>>>,
+        runtime_activity: &RuntimeActivity,
+    ) -> Result<(), RuntimeError> {
+        let mut ownership = std::mem::take(&mut self.heavy_ownership);
+        let result = ownership.transition(requested, |current| {
+            self.unload_heavy_runtime(
+                current,
+                embedded_cancellation,
+                onnx_cancellation,
+                runtime_activity,
+            )
+        });
+        self.heavy_ownership = ownership;
+        result
+    }
+
+    fn unload_heavy_runtime(
+        &mut self,
+        owner: HeavyRuntimeOwner,
+        embedded_cancellation: &Arc<Mutex<Option<CancelToken>>>,
+        onnx_cancellation: &Arc<Mutex<Option<Arc<dyn OnnxSupervisorControl>>>>,
+        runtime_activity: &RuntimeActivity,
+    ) -> Result<(), RuntimeError> {
+        match owner {
+            HeavyRuntimeOwner::EmbeddedGguf => {
+                if let Some(runtime) = self.embedded.as_mut() {
+                    SpeechEngine::unload(runtime)
+                        .map_err(|error| RuntimeError::Engine(format!("{error:#}")))?;
+                }
+                self.discard_embedded_runtime(embedded_cancellation);
+            }
+            HeavyRuntimeOwner::LegacyCompatibility => {
+                if let Some(runtime) = self.transcribe_cpp.as_mut() {
+                    SpeechEngine::unload(runtime)
+                        .map_err(|error| RuntimeError::Engine(format!("{error:#}")))?;
+                }
+                self.transcribe_cpp = None;
+            }
+            HeavyRuntimeOwner::OnnxSpeech => {
+                if let Some(runtime) = self.onnx.as_mut() {
+                    SpeechEngine::unload(runtime)
+                        .map_err(|error| RuntimeError::Engine(format!("{error:#}")))?;
+                }
+                self.onnx = None;
+                match onnx_cancellation.lock() {
+                    Ok(mut cancellation) => *cancellation = None,
+                    Err(poisoned) => *poisoned.into_inner() = None,
+                }
+                runtime_activity.force_release_streams();
+            }
+        }
+        Ok(())
+    }
+
+    fn onnx_runtime(
+        &mut self,
+        factory: Arc<OnnxSupervisorFactory>,
+        cancellation: Arc<Mutex<Option<Arc<dyn OnnxSupervisorControl>>>>,
+        next_correlation: Arc<AtomicU64>,
+        runtime_activity: RuntimeActivity,
+    ) -> Result<&mut OnnxSpeechRuntime, RuntimeError> {
+        if self.onnx.is_none() {
+            let supervisor = factory()?;
+            *cancellation.lock().map_err(|_| RuntimeError::Poisoned)? =
+                Some(Arc::clone(&supervisor));
+            self.onnx = Some(OnnxSpeechRuntime::new(
+                supervisor,
+                next_correlation,
+                runtime_activity,
+            ));
+        }
+        Ok(self
+            .onnx
+            .as_mut()
+            .expect("the ONNX runtime was initialized"))
+    }
+
+    fn load_onnx(
+        &mut self,
+        model: OnnxModelSpec,
+        preference: AccelerationPreference,
+        factory: Arc<OnnxSupervisorFactory>,
+        cancellation: Arc<Mutex<Option<Arc<dyn OnnxSupervisorControl>>>>,
+        next_correlation: Arc<AtomicU64>,
+        runtime_activity: RuntimeActivity,
+    ) -> Result<RuntimeLoadExecution, RuntimeError> {
+        let load_started = Instant::now();
+        let loaded = {
+            let runtime = self.onnx_runtime(
+                factory,
+                Arc::clone(&cancellation),
+                next_correlation,
+                runtime_activity.clone(),
+            )?;
+            runtime.load_model(model, preference).map(|warm_reused| {
+                (
+                    warm_reused,
+                    runtime
+                        .resolved_acceleration()
+                        .expect("successful ONNX load resolves acceleration")
+                        .clone(),
+                    runtime
+                        .detected_architecture()
+                        .expect("successful ONNX load retains its model family"),
+                    SpeechEngine::capabilities(runtime),
+                )
+            })
+        };
+        let (warm_reused, resolved_acceleration, detected_architecture, capabilities) = match loaded
+        {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                return Err(self.fail_onnx_runtime(&cancellation, &runtime_activity, error));
+            }
+        };
+        self.heavy_ownership.activate(HeavyRuntimeOwner::OnnxSpeech);
+        let model_load_duration_ms = if warm_reused {
+            0
+        } else {
+            load_started.elapsed().as_millis()
+        };
+        Ok(RuntimeLoadExecution {
+            diagnostics: NativeRuntimeDiagnostics {
+                resolved_acceleration,
+                native_library_path: onnx_runtime_location(),
+                warm_reused,
+                model_load_duration_ms,
+            },
+            detected_architecture,
+            capabilities,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn transcribe_onnx(
+        &mut self,
+        model: OnnxModelSpec,
+        preference: AccelerationPreference,
+        audio: &PreparedAudio,
+        options: &TranscriptionOptions,
+        factory: Arc<OnnxSupervisorFactory>,
+        cancellation: Arc<Mutex<Option<Arc<dyn OnnxSupervisorControl>>>>,
+        next_correlation: Arc<AtomicU64>,
+        runtime_activity: RuntimeActivity,
+    ) -> Result<RuntimeExecution, RuntimeError> {
+        let load_started = Instant::now();
+        let loaded = {
+            let runtime = self.onnx_runtime(
+                factory,
+                Arc::clone(&cancellation),
+                next_correlation,
+                runtime_activity.clone(),
+            )?;
+            runtime.load_model(model, preference).map(|warm_reused| {
+                (
+                    warm_reused,
+                    runtime
+                        .resolved_acceleration()
+                        .expect("successful ONNX load resolves acceleration")
+                        .clone(),
+                )
+            })
+        };
+        let (warm_reused, resolved_acceleration) = match loaded {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                return Err(self.fail_onnx_runtime(&cancellation, &runtime_activity, error));
+            }
+        };
+        self.heavy_ownership.activate(HeavyRuntimeOwner::OnnxSpeech);
+        let model_load_duration_ms = if warm_reused {
+            0
+        } else {
+            load_started.elapsed().as_millis()
+        };
+        let processing_started = Instant::now();
+        let transcript = SpeechEngine::transcribe(
+            self.onnx
+                .as_mut()
+                .expect("successful ONNX load retains its runtime"),
+            audio,
+            options,
+        );
+        let transcript = match transcript {
+            Ok(transcript) => transcript,
+            Err(error) => {
+                return Err(self.fail_onnx_runtime(
+                    &cancellation,
+                    &runtime_activity,
+                    RuntimeError::Engine(format!("{error:#}")),
+                ));
+            }
+        };
+        Ok(RuntimeExecution {
+            transcript,
+            diagnostics: NativeRuntimeDiagnostics {
+                resolved_acceleration,
+                native_library_path: onnx_runtime_location(),
+                warm_reused,
+                model_load_duration_ms,
+            },
+            processing_duration_ms: processing_started.elapsed().as_millis(),
+        })
+    }
+
+    fn health_onnx(
+        &mut self,
+        model: OnnxModelSpec,
+        preference: AccelerationPreference,
+        factory: Arc<OnnxSupervisorFactory>,
+        cancellation: Arc<Mutex<Option<Arc<dyn OnnxSupervisorControl>>>>,
+        next_correlation: Arc<AtomicU64>,
+        runtime_activity: RuntimeActivity,
+    ) -> Result<(), RuntimeError> {
+        let loaded = {
+            let runtime = self.onnx_runtime(
+                factory,
+                Arc::clone(&cancellation),
+                next_correlation,
+                runtime_activity.clone(),
+            )?;
+            runtime.load_model(model, preference)
+        };
+        if let Err(error) = loaded {
+            return Err(self.fail_onnx_runtime(&cancellation, &runtime_activity, error));
+        }
+        self.heavy_ownership.activate(HeavyRuntimeOwner::OnnxSpeech);
+        let health = SpeechEngine::health_check(
+            self.onnx
+                .as_mut()
+                .expect("successful ONNX load retains its runtime"),
+        );
+        match health {
+            Ok(()) => Ok(()),
+            Err(error) => Err(self.fail_onnx_runtime(
+                &cancellation,
+                &runtime_activity,
+                RuntimeError::Engine(format!("{error:#}")),
+            )),
+        }
+    }
+
     fn embedded_is_warm(&self, model: &RuntimeModel, preference: AccelerationPreference) -> bool {
         embedded_request_is_warm(
             self.embedded_model.as_ref(),
@@ -470,6 +1314,11 @@ impl RouterState {
                 runtime.model_path() == model.path && runtime.preference() == preference
             });
         if !reusable {
+            if let Some(runtime) = self.embedded.as_mut() {
+                SpeechEngine::unload(runtime)
+                    .map_err(|error| RuntimeError::Engine(format!("{error:#}")))?;
+            }
+            self.discard_embedded_runtime(&cancellation);
             self.embedded = Some(EmbeddedRuntime::new(model.path.clone(), preference));
             self.embedded_model = Some(model.clone());
             let token = self
@@ -477,7 +1326,14 @@ impl RouterState {
                 .as_ref()
                 .expect("the embedded runtime was initialized")
                 .cancellation_handle();
-            *cancellation.lock().map_err(|_| RuntimeError::Poisoned)? = Some(token);
+            match cancellation.lock() {
+                Ok(mut active) => *active = Some(token),
+                Err(poisoned) => {
+                    *poisoned.into_inner() = None;
+                    self.discard_embedded_runtime(&cancellation);
+                    return Err(RuntimeError::Poisoned);
+                }
+            }
         }
         Ok(self
             .embedded
@@ -493,13 +1349,31 @@ impl RouterState {
     ) -> Result<RuntimeLoadExecution, RuntimeError> {
         let warm_reused = self.embedded_is_warm(&model, preference);
         verify_embedded_runtime_model(&model, warm_reused)?;
-        let runtime = self.embedded_runtime(&model, preference, cancellation)?;
         let load_started = Instant::now();
-        SpeechEngine::load(runtime).map_err(|error| RuntimeError::Engine(format!("{error:#}")))?;
-        let resolved_acceleration = runtime
-            .resolved_acceleration()
-            .cloned()
-            .expect("a successfully loaded embedded runtime resolves acceleration");
+        let loaded = {
+            let runtime = self.embedded_runtime(&model, preference, Arc::clone(&cancellation))?;
+            SpeechEngine::load(runtime).map(|()| {
+                (
+                    runtime
+                        .resolved_acceleration()
+                        .cloned()
+                        .expect("a successfully loaded embedded runtime resolves acceleration"),
+                    runtime
+                        .detected_architecture()
+                        .expect("a successfully loaded embedded runtime reports its architecture"),
+                    SpeechEngine::capabilities(runtime),
+                )
+            })
+        };
+        let (resolved_acceleration, detected_architecture, capabilities) = match loaded {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                self.discard_embedded_runtime(&cancellation);
+                return Err(RuntimeError::Engine(format!("{error:#}")));
+            }
+        };
+        self.heavy_ownership
+            .activate(HeavyRuntimeOwner::EmbeddedGguf);
         Ok(RuntimeLoadExecution {
             diagnostics: NativeRuntimeDiagnostics {
                 resolved_acceleration,
@@ -511,10 +1385,8 @@ impl RouterState {
                     load_started.elapsed().as_millis()
                 },
             },
-            detected_architecture: runtime
-                .detected_architecture()
-                .expect("a successfully loaded embedded runtime reports its architecture"),
-            capabilities: SpeechEngine::capabilities(runtime),
+            detected_architecture,
+            capabilities,
         })
     }
 
@@ -537,17 +1409,32 @@ impl RouterState {
         cancellation: EmbeddedCancellationContext,
     ) -> Result<RuntimeExecution, RuntimeError> {
         let warm_reused = self.embedded_is_warm(&model, preference);
+        let cancellation_token = Arc::clone(&cancellation.token);
         verify_embedded_runtime_model(&model, warm_reused)?;
-        let (result, diagnostics) = {
+        let load_started = Instant::now();
+        let load_result = {
             let runtime = self.embedded_runtime(&model, preference, cancellation.token)?;
-            let load_started = Instant::now();
             SpeechEngine::load(runtime)
-                .map_err(|error| RuntimeError::Engine(format!("{error:#}")))?;
-            let model_load_duration_ms = if warm_reused {
-                0
-            } else {
-                load_started.elapsed().as_millis()
-            };
+        };
+        if let Err(error) = load_result {
+            if let Some(runtime) = self.embedded.as_mut() {
+                let _ = SpeechEngine::unload(runtime);
+            }
+            self.discard_embedded_runtime(&cancellation_token);
+            return Err(RuntimeError::Engine(format!("{error:#}")));
+        }
+        self.heavy_ownership
+            .activate(HeavyRuntimeOwner::EmbeddedGguf);
+        let model_load_duration_ms = if warm_reused {
+            0
+        } else {
+            load_started.elapsed().as_millis()
+        };
+        let (result, diagnostics) = {
+            let runtime = self
+                .embedded
+                .as_mut()
+                .expect("successful embedded load retains its runtime");
             let processing_started = Instant::now();
             let result = runtime.transcribe_with_cancellation(
                 audio,
@@ -573,8 +1460,7 @@ impl RouterState {
                 // A native decode error or cancellation must not leave a
                 // partial session active. The next request starts from a known
                 // model/session state rather than pretending it was warm.
-                self.embedded = None;
-                self.embedded_model = None;
+                self.discard_embedded_runtime(&cancellation_token);
                 return Err(RuntimeError::Engine(format!("{error:#}")));
             }
         };
@@ -608,6 +1494,13 @@ impl RouterState {
             .as_ref()
             .is_some_and(|runtime| runtime.model == model && runtime.acceleration == acceleration);
         if !reusable {
+            if let Some(runtime) = self.transcribe_cpp.as_mut() {
+                SpeechEngine::unload(runtime)
+                    .map_err(|error| RuntimeError::Engine(format!("{error:#}")))?;
+            }
+            self.transcribe_cpp = None;
+            self.heavy_ownership
+                .clear(HeavyRuntimeOwner::LegacyCompatibility);
             self.transcribe_cpp = Some(TranscribeCppRuntime::new(
                 model,
                 acceleration,
@@ -626,19 +1519,39 @@ impl RouterState {
         preference: AccelerationPreference,
         cancel_generation: Arc<AtomicU64>,
     ) -> Result<RuntimeLoadExecution, RuntimeError> {
-        let runtime = self.transcribe_cpp_runtime(model, preference, cancel_generation)?;
         let load_started = Instant::now();
-        let warm_reused = runtime.ensure_loaded()?;
+        let loaded = {
+            let runtime = self.transcribe_cpp_runtime(model, preference, cancel_generation)?;
+            runtime.ensure_loaded().map(|warm_reused| {
+                runtime.last_used_at = Some(Instant::now());
+                (
+                    warm_reused,
+                    runtime.acceleration.clone(),
+                    runtime.package.native_library_path(),
+                    SpeechEngine::capabilities(runtime),
+                )
+            })
+        };
+        let (warm_reused, acceleration, native_library_path, capabilities) = match loaded {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                self.transcribe_cpp = None;
+                self.heavy_ownership
+                    .clear(HeavyRuntimeOwner::LegacyCompatibility);
+                return Err(error.into());
+            }
+        };
+        self.heavy_ownership
+            .activate(HeavyRuntimeOwner::LegacyCompatibility);
         let model_load_duration_ms = if warm_reused {
             0
         } else {
             load_started.elapsed().as_millis()
         };
-        runtime.last_used_at = Some(Instant::now());
         Ok(RuntimeLoadExecution {
             diagnostics: NativeRuntimeDiagnostics {
-                resolved_acceleration: runtime.acceleration.clone(),
-                native_library_path: runtime.package.native_library_path(),
+                resolved_acceleration: acceleration,
+                native_library_path,
                 warm_reused,
                 model_load_duration_ms,
             },
@@ -647,7 +1560,7 @@ impl RouterState {
             // keep their known adapter identity explicit rather than claiming
             // filename-derived evidence.
             detected_architecture: "whisper".to_owned(),
-            capabilities: SpeechEngine::capabilities(runtime),
+            capabilities,
         })
     }
 
@@ -660,9 +1573,28 @@ impl RouterState {
         cancel_generation: Arc<AtomicU64>,
         cancellation_snapshot: u64,
     ) -> Result<RuntimeExecution, RuntimeError> {
-        let runtime = self.transcribe_cpp_runtime(model, preference, cancel_generation)?;
         let load_started = Instant::now();
-        let warm_reused = runtime.ensure_loaded()?;
+        let loaded = {
+            let runtime = self.transcribe_cpp_runtime(model, preference, cancel_generation)?;
+            runtime.ensure_loaded().map(|warm_reused| {
+                (
+                    warm_reused,
+                    runtime.acceleration.clone(),
+                    runtime.package.native_library_path(),
+                )
+            })
+        };
+        let (warm_reused, acceleration, native_library_path) = match loaded {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                self.transcribe_cpp = None;
+                self.heavy_ownership
+                    .clear(HeavyRuntimeOwner::LegacyCompatibility);
+                return Err(error.into());
+            }
+        };
+        self.heavy_ownership
+            .activate(HeavyRuntimeOwner::LegacyCompatibility);
         let model_load_duration_ms = if warm_reused {
             0
         } else {
@@ -671,6 +1603,10 @@ impl RouterState {
         let processing_started = Instant::now();
         // Invoke the selected concrete handler through the common engine
         // contract. RuntimeRouter remains the only code that selects it.
+        let runtime = self
+            .transcribe_cpp
+            .as_mut()
+            .expect("successful compatibility load retains its runtime");
         runtime.request_cancel_snapshot = Some(cancellation_snapshot);
         let transcript = match SpeechEngine::transcribe(runtime, audio, options) {
             Ok(transcript) => transcript,
@@ -679,6 +1615,9 @@ impl RouterState {
                 // ambiguous. Discard it so the next request performs a clean
                 // load and cannot be misreported as a warm reuse.
                 let _ = SpeechEngine::unload(runtime);
+                self.transcribe_cpp = None;
+                self.heavy_ownership
+                    .clear(HeavyRuntimeOwner::LegacyCompatibility);
                 return Err(RuntimeError::Engine(format!("{error:#}")));
             }
         };
@@ -688,13 +1627,276 @@ impl RouterState {
         Ok(RuntimeExecution {
             transcript,
             diagnostics: NativeRuntimeDiagnostics {
-                resolved_acceleration: runtime.acceleration.clone(),
-                native_library_path: runtime.package.native_library_path(),
+                resolved_acceleration: acceleration,
+                native_library_path,
                 warm_reused,
                 model_load_duration_ms,
             },
             processing_duration_ms,
         })
+    }
+
+    fn health_check_transcribe_cpp(
+        &mut self,
+        model: RuntimeModel,
+        preference: AccelerationPreference,
+        cancel_generation: Arc<AtomicU64>,
+    ) -> Result<(), RuntimeError> {
+        self.load_transcribe_cpp(model, preference, cancel_generation)?;
+        let health = SpeechEngine::health_check(
+            self.transcribe_cpp
+                .as_mut()
+                .expect("successful compatibility load retains its runtime"),
+        );
+        match health {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.transcribe_cpp = None;
+                self.heavy_ownership
+                    .clear(HeavyRuntimeOwner::LegacyCompatibility);
+                Err(RuntimeError::Engine(format!("{error:#}")))
+            }
+        }
+    }
+}
+
+/// Private adapter from the process-isolated ONNX control protocol to the
+/// runtime-neutral speech contracts.
+struct OnnxSpeechRuntime {
+    model: Option<OnnxModelSpec>,
+    acceleration: Option<ResolvedAcceleration>,
+    supervisor: Arc<dyn OnnxSupervisorControl>,
+    next_correlation: Arc<AtomicU64>,
+    runtime_activity: RuntimeActivity,
+}
+
+impl OnnxSpeechRuntime {
+    fn new(
+        supervisor: Arc<dyn OnnxSupervisorControl>,
+        next_correlation: Arc<AtomicU64>,
+        runtime_activity: RuntimeActivity,
+    ) -> Self {
+        Self {
+            model: None,
+            acceleration: None,
+            supervisor,
+            next_correlation,
+            runtime_activity,
+        }
+    }
+
+    fn next_id(&self) -> u64 {
+        self.next_correlation
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1)
+    }
+
+    fn load_model(
+        &mut self,
+        model: OnnxModelSpec,
+        preference: AccelerationPreference,
+    ) -> Result<bool, RuntimeError> {
+        let acceleration = resolve_cpu_only_acceleration(preference)
+            .map_err(|error| RuntimeError::OnnxUnavailable(error.to_string()))?;
+        let correlation = self.next_id();
+        let warm_reused = self
+            .supervisor
+            .load(correlation, correlation, model.clone())
+            .map_err(|error| RuntimeError::Engine(format!("{error:#}")))?;
+        self.model = Some(model);
+        self.acceleration = Some(acceleration);
+        Ok(warm_reused)
+    }
+
+    fn resolved_acceleration(&self) -> Option<&ResolvedAcceleration> {
+        self.acceleration.as_ref()
+    }
+
+    fn detected_architecture(&self) -> Option<String> {
+        self.model.as_ref().map(|model| match model.family {
+            OnnxModelFamily::Moonshine => "moonshine".to_owned(),
+            OnnxModelFamily::NemoCtc => "nemo-ctc".to_owned(),
+            OnnxModelFamily::Canary => "canary".to_owned(),
+            OnnxModelFamily::OfflineTransducer => "offline-transducer".to_owned(),
+            OnnxModelFamily::OnlineTransducer => "online-transducer".to_owned(),
+        })
+    }
+
+    fn runtime_capabilities(family: OnnxModelFamily) -> RuntimeCapabilities {
+        RuntimeCapabilities {
+            streaming: family == OnnxModelFamily::OnlineTransducer,
+            cancellation: true,
+            ..RuntimeCapabilities::default()
+        }
+    }
+}
+
+impl SpeechEngine for OnnxSpeechRuntime {
+    fn load(&mut self) -> anyhow::Result<()> {
+        let model = self
+            .model
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("no ONNX model is selected"))?;
+        let preference = self
+            .acceleration
+            .as_ref()
+            .map(|acceleration| acceleration.requested)
+            .unwrap_or(AccelerationPreference::Auto);
+        self.load_model(model, preference)?;
+        Ok(())
+    }
+
+    fn transcribe(
+        &mut self,
+        audio: &PreparedAudio,
+        options: &TranscriptionOptions,
+    ) -> anyhow::Result<Transcript> {
+        if *options != TranscriptionOptions::default() {
+            return Err(anyhow::anyhow!(
+                "the isolated ONNX adapter currently accepts only default transcription options"
+            ));
+        }
+        if self.model.is_none() {
+            return Err(anyhow::anyhow!("no ONNX model is loaded"));
+        }
+        let correlation = self.next_id();
+        let text = self
+            .supervisor
+            .transcribe(correlation, correlation, &audio.samples)?;
+        Ok(text_only_transcript(text))
+    }
+
+    fn capabilities(&self) -> RuntimeCapabilities {
+        self.model
+            .as_ref()
+            .map(|model| Self::runtime_capabilities(model.family))
+            .unwrap_or_else(|| RuntimeCapabilities {
+                cancellation: true,
+                ..RuntimeCapabilities::default()
+            })
+    }
+
+    fn health_check(&mut self) -> anyhow::Result<()> {
+        let correlation = self.next_id();
+        self.supervisor.health(correlation, correlation)
+    }
+
+    fn cancel(&mut self) -> anyhow::Result<()> {
+        self.supervisor.cancel_active()
+    }
+
+    fn unload(&mut self) -> anyhow::Result<()> {
+        self.supervisor.unload()?;
+        self.model = None;
+        self.acceleration = None;
+        Ok(())
+    }
+}
+
+impl StreamingSpeechEngine for OnnxSpeechRuntime {
+    fn start_stream(
+        &mut self,
+        options: &TranscriptionOptions,
+    ) -> anyhow::Result<Box<dyn SpeechStream>> {
+        if *options != TranscriptionOptions::default() {
+            return Err(anyhow::anyhow!(
+                "the isolated ONNX adapter currently accepts only default transcription options"
+            ));
+        }
+        let model = self
+            .model
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no ONNX model is loaded"))?;
+        if model.family != OnnxModelFamily::OnlineTransducer {
+            return Err(anyhow::anyhow!(
+                "incremental streaming requires an online ONNX transducer"
+            ));
+        }
+        let session_id = self.next_id();
+        let request_id = self.next_id();
+        let activity_lease = self.runtime_activity.acquire_stream()?;
+        self.supervisor.start_stream(session_id, request_id)?;
+        Ok(Box::new(OnnxSpeechStream {
+            supervisor: Arc::clone(&self.supervisor),
+            next_correlation: Arc::clone(&self.next_correlation),
+            session_id,
+            active: true,
+            activity_lease: Some(activity_lease),
+        }))
+    }
+}
+
+struct OnnxSpeechStream {
+    supervisor: Arc<dyn OnnxSupervisorControl>,
+    next_correlation: Arc<AtomicU64>,
+    session_id: u64,
+    active: bool,
+    activity_lease: Option<RuntimeActivityLease>,
+}
+
+impl OnnxSpeechStream {
+    fn next_request_id(&self) -> u64 {
+        self.next_correlation
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1)
+    }
+}
+
+impl SpeechStream for OnnxSpeechStream {
+    fn push_audio(&mut self, samples: &[f32]) -> anyhow::Result<StreamUpdate> {
+        if !self.active {
+            return Err(anyhow::anyhow!("the ONNX stream is no longer active"));
+        }
+        let request_id = self.next_request_id();
+        let tentative = self
+            .supervisor
+            .audio_chunk(self.session_id, request_id, samples)?;
+        Ok(StreamUpdate {
+            committed: String::new(),
+            tentative,
+        })
+    }
+
+    fn finalize(mut self: Box<Self>) -> anyhow::Result<Transcript> {
+        let request_id = self.next_request_id();
+        let result = self
+            .supervisor
+            .end_stream(self.session_id, request_id)
+            .map(text_only_transcript);
+        if result.is_ok() {
+            self.active = false;
+            self.activity_lease.take();
+        }
+        result
+    }
+
+    fn cancel(mut self: Box<Self>) -> anyhow::Result<()> {
+        let request_id = self.next_request_id();
+        let result = self.supervisor.cancel_stream(self.session_id, request_id);
+        if result.is_ok() {
+            self.active = false;
+            self.activity_lease.take();
+        }
+        result
+    }
+}
+
+impl Drop for OnnxSpeechStream {
+    fn drop(&mut self) {
+        if self.active {
+            self.supervisor.abandon_stream(self.session_id);
+            self.active = false;
+        }
+        self.activity_lease.take();
+    }
+}
+
+fn text_only_transcript(text: String) -> Transcript {
+    Transcript {
+        text,
+        segments: Vec::new(),
+        detected_language: None,
+        duration_ms: None,
     }
 }
 
@@ -1280,6 +2482,314 @@ fn take_native_string(value: *mut c_char) -> Option<String> {
 mod tests {
     use super::*;
 
+    struct TestOnnxControl {
+        loads: AtomicU64,
+        unloads: AtomicU64,
+        fail_unload: bool,
+        events: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl OnnxSupervisorControl for TestOnnxControl {
+        fn load(
+            &self,
+            _session_id: u64,
+            _request_id: u64,
+            _model: OnnxModelSpec,
+        ) -> anyhow::Result<bool> {
+            self.loads.fetch_add(1, Ordering::AcqRel);
+            self.events.lock().unwrap().push("load:onnx");
+            Ok(false)
+        }
+
+        fn transcribe(
+            &self,
+            _session_id: u64,
+            _request_id: u64,
+            _samples: &[f32],
+        ) -> anyhow::Result<String> {
+            unreachable!("the cleanup test does not transcribe")
+        }
+
+        fn start_stream(&self, _session_id: u64, _request_id: u64) -> anyhow::Result<()> {
+            unreachable!("the cleanup test does not start a native stream")
+        }
+
+        fn audio_chunk(
+            &self,
+            _session_id: u64,
+            _request_id: u64,
+            _samples: &[f32],
+        ) -> anyhow::Result<String> {
+            unreachable!("the cleanup test does not send native audio")
+        }
+
+        fn end_stream(&self, _session_id: u64, _request_id: u64) -> anyhow::Result<String> {
+            unreachable!("the cleanup test does not finalize a native stream")
+        }
+
+        fn cancel_stream(&self, _session_id: u64, _request_id: u64) -> anyhow::Result<()> {
+            unreachable!("the cleanup test invalidates leases directly")
+        }
+
+        fn health(&self, _session_id: u64, _request_id: u64) -> anyhow::Result<()> {
+            unreachable!("the cleanup test does not run health")
+        }
+
+        fn unload(&self) -> anyhow::Result<()> {
+            self.unloads.fetch_add(1, Ordering::AcqRel);
+            self.events.lock().unwrap().push("unload:onnx");
+            if self.fail_unload {
+                anyhow::bail!("deterministic unload failure");
+            }
+            Ok(())
+        }
+
+        fn cancel_active(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn abandon_stream(&self, _session_id: u64) {}
+
+        fn terminate_current(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct FailingStreamState {
+        active_session: Option<u64>,
+        started_sessions: Vec<u64>,
+        abandon_calls: usize,
+        end_calls: usize,
+        cancel_calls: usize,
+        fail_next_end: bool,
+        fail_next_cancel: bool,
+    }
+
+    #[derive(Default)]
+    struct FailingStreamControl {
+        state: Mutex<FailingStreamState>,
+    }
+
+    impl FailingStreamControl {
+        fn fail_next_end(&self) {
+            self.state.lock().unwrap().fail_next_end = true;
+        }
+
+        fn fail_next_cancel(&self) {
+            self.state.lock().unwrap().fail_next_cancel = true;
+        }
+
+        fn snapshot(&self) -> (Option<u64>, Vec<u64>, usize, usize, usize) {
+            let state = self.state.lock().unwrap();
+            (
+                state.active_session,
+                state.started_sessions.clone(),
+                state.abandon_calls,
+                state.end_calls,
+                state.cancel_calls,
+            )
+        }
+    }
+
+    impl OnnxSupervisorControl for FailingStreamControl {
+        fn load(
+            &self,
+            _session_id: u64,
+            _request_id: u64,
+            _model: OnnxModelSpec,
+        ) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        fn transcribe(
+            &self,
+            _session_id: u64,
+            _request_id: u64,
+            _samples: &[f32],
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("stream-only fake does not transcribe")
+        }
+
+        fn start_stream(&self, session_id: u64, _request_id: u64) -> anyhow::Result<()> {
+            let mut state = self.state.lock().unwrap();
+            if state.active_session.is_some() {
+                anyhow::bail!("fake stream already active")
+            }
+            state.active_session = Some(session_id);
+            state.started_sessions.push(session_id);
+            Ok(())
+        }
+
+        fn audio_chunk(
+            &self,
+            _session_id: u64,
+            _request_id: u64,
+            _samples: &[f32],
+        ) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+
+        fn end_stream(&self, session_id: u64, _request_id: u64) -> anyhow::Result<String> {
+            let mut state = self.state.lock().unwrap();
+            state.end_calls += 1;
+            if state.active_session != Some(session_id) {
+                anyhow::bail!("fake stream session mismatch")
+            }
+            if std::mem::take(&mut state.fail_next_end) {
+                anyhow::bail!("deterministic end-stream failure")
+            }
+            state.active_session = None;
+            Ok("final".to_owned())
+        }
+
+        fn cancel_stream(&self, session_id: u64, _request_id: u64) -> anyhow::Result<()> {
+            let mut state = self.state.lock().unwrap();
+            state.cancel_calls += 1;
+            if state.active_session != Some(session_id) {
+                anyhow::bail!("fake stream session mismatch")
+            }
+            if std::mem::take(&mut state.fail_next_cancel) {
+                anyhow::bail!("deterministic cancel-stream failure")
+            }
+            state.active_session = None;
+            Ok(())
+        }
+
+        fn health(&self, _session_id: u64, _request_id: u64) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn unload(&self) -> anyhow::Result<()> {
+            self.state.lock().unwrap().active_session = None;
+            Ok(())
+        }
+
+        fn cancel_active(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn abandon_stream(&self, session_id: u64) {
+            let mut state = self.state.lock().unwrap();
+            state.abandon_calls += 1;
+            if state.active_session == Some(session_id) {
+                state.active_session = None;
+            }
+        }
+
+        fn terminate_current(&self) -> anyhow::Result<()> {
+            self.state.lock().unwrap().active_session = None;
+            Ok(())
+        }
+    }
+
+    fn online_stream_runtime(
+        supervisor: Arc<dyn OnnxSupervisorControl>,
+        runtime_activity: RuntimeActivity,
+    ) -> OnnxSpeechRuntime {
+        let mut runtime =
+            OnnxSpeechRuntime::new(supervisor, Arc::new(AtomicU64::new(0)), runtime_activity);
+        runtime
+            .load_model(
+                OnnxModelSpec {
+                    id: "stream-test".to_owned(),
+                    root: PathBuf::from("."),
+                    family: OnnxModelFamily::OnlineTransducer,
+                    files: std::collections::BTreeMap::new(),
+                    num_threads: 1,
+                },
+                AccelerationPreference::Cpu,
+            )
+            .unwrap();
+        runtime
+    }
+
+    #[test]
+    fn failed_stream_finalize_abandons_once_releases_lease_and_allows_recovery() {
+        let control = Arc::new(FailingStreamControl::default());
+        control.fail_next_end();
+        let activity = RuntimeActivity::default();
+        let mut runtime = online_stream_runtime(
+            Arc::clone(&control) as Arc<dyn OnnxSupervisorControl>,
+            activity.clone(),
+        );
+
+        let stream =
+            StreamingSpeechEngine::start_stream(&mut runtime, &TranscriptionOptions::default())
+                .unwrap();
+        let error = stream.finalize().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("deterministic end-stream failure")
+        );
+        let (active_session, started_sessions, abandon_calls, end_calls, cancel_calls) =
+            control.snapshot();
+        assert_eq!(active_session, None);
+        assert_eq!(started_sessions.len(), 1);
+        assert_eq!(abandon_calls, 1);
+        assert_eq!(end_calls, 1);
+        assert_eq!(cancel_calls, 0);
+        assert_eq!(activity.active_streams(), 0);
+
+        let recovered =
+            StreamingSpeechEngine::start_stream(&mut runtime, &TranscriptionOptions::default())
+                .unwrap();
+        assert_eq!(recovered.finalize().unwrap().text, "final");
+        let (active_session, started_sessions, abandon_calls, end_calls, cancel_calls) =
+            control.snapshot();
+        assert_eq!(active_session, None);
+        assert_eq!(started_sessions.len(), 2);
+        assert_ne!(started_sessions[0], started_sessions[1]);
+        assert_eq!(abandon_calls, 1);
+        assert_eq!(end_calls, 2);
+        assert_eq!(cancel_calls, 0);
+        assert_eq!(activity.active_streams(), 0);
+    }
+
+    #[test]
+    fn failed_stream_cancel_abandons_once_releases_lease_and_allows_recovery() {
+        let control = Arc::new(FailingStreamControl::default());
+        control.fail_next_cancel();
+        let activity = RuntimeActivity::default();
+        let mut runtime = online_stream_runtime(
+            Arc::clone(&control) as Arc<dyn OnnxSupervisorControl>,
+            activity.clone(),
+        );
+
+        let stream =
+            StreamingSpeechEngine::start_stream(&mut runtime, &TranscriptionOptions::default())
+                .unwrap();
+        let error = stream.cancel().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("deterministic cancel-stream failure")
+        );
+        let (active_session, started_sessions, abandon_calls, end_calls, cancel_calls) =
+            control.snapshot();
+        assert_eq!(active_session, None);
+        assert_eq!(started_sessions.len(), 1);
+        assert_eq!(abandon_calls, 1);
+        assert_eq!(end_calls, 0);
+        assert_eq!(cancel_calls, 1);
+        assert_eq!(activity.active_streams(), 0);
+
+        let recovered =
+            StreamingSpeechEngine::start_stream(&mut runtime, &TranscriptionOptions::default())
+                .unwrap();
+        recovered.cancel().unwrap();
+        let (active_session, started_sessions, abandon_calls, end_calls, cancel_calls) =
+            control.snapshot();
+        assert_eq!(active_session, None);
+        assert_eq!(started_sessions.len(), 2);
+        assert_ne!(started_sessions[0], started_sessions[1]);
+        assert_eq!(abandon_calls, 1);
+        assert_eq!(end_calls, 0);
+        assert_eq!(cancel_calls, 2);
+        assert_eq!(activity.active_streams(), 0);
+    }
+
     fn collect_rust_sources(root: &Path, output: &mut Vec<(PathBuf, String)>) {
         for entry in std::fs::read_dir(root).unwrap() {
             let path = entry.unwrap().path();
@@ -1289,6 +2799,384 @@ mod tests {
                 output.push((path.clone(), std::fs::read_to_string(path).unwrap()));
             }
         }
+    }
+
+    #[test]
+    fn heavy_runtime_ownership_orders_bidirectional_switches_and_never_exceeds_one() {
+        let mut ownership = HeavyRuntimeOwnership::default();
+        let mut heavy_count = 1_usize;
+        let mut maximum_heavy_count = heavy_count;
+        let mut events = Vec::new();
+        ownership.activate(HeavyRuntimeOwner::EmbeddedGguf);
+
+        for requested in [
+            HeavyRuntimeOwner::OnnxSpeech,
+            HeavyRuntimeOwner::LegacyCompatibility,
+            HeavyRuntimeOwner::OnnxSpeech,
+            HeavyRuntimeOwner::EmbeddedGguf,
+        ] {
+            ownership
+                .transition(requested, |current| {
+                    assert_eq!(heavy_count, 1);
+                    events.push(format!("unload:{current:?}"));
+                    heavy_count -= 1;
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(heavy_count, 0, "the previous runtime must unload first");
+            events.push(format!("load:{requested:?}"));
+            heavy_count += 1;
+            maximum_heavy_count = maximum_heavy_count.max(heavy_count);
+            ownership.activate(requested);
+        }
+
+        ownership
+            .transition(HeavyRuntimeOwner::EmbeddedGguf, |_| {
+                panic!("same-runtime warm reuse must not unload")
+            })
+            .unwrap();
+        assert_eq!(maximum_heavy_count, 1);
+        assert_eq!(heavy_count, 1);
+        assert_eq!(
+            events,
+            [
+                "unload:EmbeddedGguf",
+                "load:OnnxSpeech",
+                "unload:OnnxSpeech",
+                "load:LegacyCompatibility",
+                "unload:LegacyCompatibility",
+                "load:OnnxSpeech",
+                "unload:OnnxSpeech",
+                "load:EmbeddedGguf",
+            ]
+        );
+    }
+
+    #[test]
+    fn failed_heavy_runtime_unload_blocks_next_load_and_preserves_owner() {
+        let mut ownership = HeavyRuntimeOwnership::default();
+        ownership.activate(HeavyRuntimeOwner::OnnxSpeech);
+
+        let error = ownership
+            .transition(HeavyRuntimeOwner::EmbeddedGguf, |current| {
+                assert_eq!(current, HeavyRuntimeOwner::OnnxSpeech);
+                Err(RuntimeError::Engine(
+                    "deterministic unload failure".to_owned(),
+                ))
+            })
+            .unwrap_err();
+
+        assert!(error.to_string().contains("deterministic unload failure"));
+        assert_eq!(ownership.current, Some(HeavyRuntimeOwner::OnnxSpeech));
+    }
+
+    #[test]
+    fn router_state_switches_gguf_onnx_gguf_and_clears_independent_cancel_handles() {
+        let embedded_cancellation = Arc::new(Mutex::new(None));
+        let onnx_cancellation = Arc::new(Mutex::new(None));
+        let activity = RuntimeActivity::default();
+        let events = Arc::new(Mutex::new(vec!["load:gguf"]));
+        let control = Arc::new(TestOnnxControl {
+            loads: AtomicU64::new(0),
+            unloads: AtomicU64::new(0),
+            fail_unload: false,
+            events: Arc::clone(&events),
+        });
+        let factory: Arc<OnnxSupervisorFactory> = {
+            let control = Arc::clone(&control);
+            Arc::new(move || Ok(Arc::clone(&control) as Arc<dyn OnnxSupervisorControl>))
+        };
+        let model = RuntimeModel {
+            id: ModelId::new("test-gguf"),
+            path: PathBuf::from("test.gguf"),
+            format: ArtifactFormat::Gguf,
+            package_root: None,
+            expected_size_bytes: 1,
+            expected_sha256: "0".repeat(64),
+        };
+        let mut state = RouterState::default();
+        let embedded = EmbeddedRuntime::new(model.path.clone(), AccelerationPreference::Cpu);
+        *embedded_cancellation.lock().unwrap() = Some(embedded.cancellation_handle());
+        state.embedded = Some(embedded);
+        state.embedded_model = Some(model.clone());
+        state
+            .heavy_ownership
+            .activate(HeavyRuntimeOwner::EmbeddedGguf);
+
+        state
+            .prepare_heavy_runtime(
+                HeavyRuntimeOwner::OnnxSpeech,
+                &embedded_cancellation,
+                &onnx_cancellation,
+                &activity,
+            )
+            .unwrap();
+        assert!(state.embedded.is_none());
+        assert!(embedded_cancellation.lock().unwrap().is_none());
+        assert_eq!(state.heavy_ownership.current, None);
+        events.lock().unwrap().push("unload:gguf");
+        let spec = OnnxModelSpec {
+            id: "test-onnx".to_owned(),
+            root: PathBuf::from("."),
+            family: OnnxModelFamily::NemoCtc,
+            files: std::collections::BTreeMap::new(),
+            num_threads: 1,
+        };
+        state
+            .load_onnx(
+                spec,
+                AccelerationPreference::Cpu,
+                factory,
+                Arc::clone(&onnx_cancellation),
+                Arc::new(AtomicU64::new(0)),
+                activity.clone(),
+            )
+            .unwrap();
+        assert!(state.onnx.is_some());
+        assert!(onnx_cancellation.lock().unwrap().is_some());
+        assert_eq!(
+            state.heavy_ownership.current,
+            Some(HeavyRuntimeOwner::OnnxSpeech)
+        );
+        assert_eq!(
+            usize::from(state.embedded.is_some())
+                + usize::from(state.transcribe_cpp.is_some())
+                + usize::from(state.onnx.is_some()),
+            1
+        );
+
+        state
+            .prepare_heavy_runtime(
+                HeavyRuntimeOwner::EmbeddedGguf,
+                &embedded_cancellation,
+                &onnx_cancellation,
+                &activity,
+            )
+            .unwrap();
+        assert!(state.onnx.is_none());
+        assert!(onnx_cancellation.lock().unwrap().is_none());
+        assert_eq!(control.loads.load(Ordering::Acquire), 1);
+        assert_eq!(control.unloads.load(Ordering::Acquire), 1);
+        assert_eq!(state.heavy_ownership.current, None);
+
+        let embedded = EmbeddedRuntime::new(model.path.clone(), AccelerationPreference::Cpu);
+        *embedded_cancellation.lock().unwrap() = Some(embedded.cancellation_handle());
+        state.embedded = Some(embedded);
+        state.embedded_model = Some(model);
+        state
+            .heavy_ownership
+            .activate(HeavyRuntimeOwner::EmbeddedGguf);
+        events.lock().unwrap().push("load:gguf");
+        assert_eq!(
+            usize::from(state.embedded.is_some())
+                + usize::from(state.transcribe_cpp.is_some())
+                + usize::from(state.onnx.is_some()),
+            1
+        );
+        assert_eq!(
+            *events.lock().unwrap(),
+            [
+                "load:gguf",
+                "unload:gguf",
+                "load:onnx",
+                "unload:onnx",
+                "load:gguf",
+            ]
+        );
+    }
+
+    #[test]
+    fn poisoned_onnx_cancellation_does_not_strand_lease_or_heavy_owner() {
+        let control = Arc::new(TestOnnxControl {
+            loads: AtomicU64::new(0),
+            unloads: AtomicU64::new(0),
+            fail_unload: false,
+            events: Arc::new(Mutex::new(Vec::new())),
+        });
+        let router = RuntimeRouter::with_test_onnx_factory({
+            let control = Arc::clone(&control);
+            move || Ok(Arc::clone(&control) as Arc<dyn OnnxSupervisorControl>)
+        });
+        let supervisor = Arc::clone(&control) as Arc<dyn OnnxSupervisorControl>;
+        {
+            let mut state = router.inner.lock().unwrap();
+            state.onnx = Some(OnnxSpeechRuntime::new(
+                Arc::clone(&supervisor),
+                Arc::new(AtomicU64::new(0)),
+                router.runtime_activity(),
+            ));
+            state
+                .heavy_ownership
+                .activate(HeavyRuntimeOwner::OnnxSpeech);
+        }
+        *router.onnx_cancellation.lock().unwrap() = Some(supervisor);
+        let stale_stream_lease = router.runtime_activity.acquire_stream().unwrap();
+
+        let cancellation = Arc::clone(&router.onnx_cancellation);
+        std::thread::spawn(move || {
+            let _guard = cancellation.lock().unwrap();
+            panic!("poison the deterministic ONNX cancellation lock");
+        })
+        .join()
+        .expect_err("the poisoner thread must panic");
+
+        {
+            let mut state = router.inner.lock().unwrap();
+            state
+                .prepare_heavy_runtime(
+                    HeavyRuntimeOwner::EmbeddedGguf,
+                    &router.embedded_cancellation,
+                    &router.onnx_cancellation,
+                    &router.runtime_activity,
+                )
+                .unwrap();
+
+            assert!(state.onnx.is_none());
+            assert_eq!(state.heavy_ownership.current, None);
+
+            state
+                .heavy_ownership
+                .activate(HeavyRuntimeOwner::EmbeddedGguf);
+            state
+                .prepare_heavy_runtime(
+                    HeavyRuntimeOwner::OnnxSpeech,
+                    &router.embedded_cancellation,
+                    &router.onnx_cancellation,
+                    &router.runtime_activity,
+                )
+                .unwrap();
+            assert_eq!(state.heavy_ownership.current, None);
+            assert!(state.onnx.is_none());
+            assert!(state.embedded.is_none());
+        }
+
+        assert_eq!(router.runtime_activity.active_streams(), 0);
+        assert!(
+            router
+                .onnx_cancellation
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_none()
+        );
+        drop(stale_stream_lease);
+        assert_eq!(router.runtime_activity.active_streams(), 0);
+    }
+
+    #[test]
+    fn idle_timeout_uses_last_successful_activity_and_unloads_only_when_expired() {
+        let activity = RuntimeActivity::default();
+        let base = Instant::now();
+        activity.force_release_streams_at(base);
+        assert_eq!(WARM_MODEL_TTL, Duration::from_secs(5 * 60));
+
+        let mut failed_request = activity.acquire_request().unwrap();
+        assert_eq!(
+            activity.timeout_action_at(
+                base + WARM_MODEL_TTL - Duration::from_secs(1),
+                WARM_MODEL_TTL,
+            ),
+            IdleTimeoutAction::Defer(WARM_MODEL_TTL)
+        );
+        failed_request.release_at(base + WARM_MODEL_TTL - Duration::from_secs(1));
+        assert_eq!(
+            activity.timeout_action_at(
+                base + WARM_MODEL_TTL - Duration::from_secs(1),
+                WARM_MODEL_TTL,
+            ),
+            IdleTimeoutAction::Defer(Duration::from_secs(1)),
+            "a failed request must retain the original remaining idle deadline"
+        );
+        assert_eq!(
+            activity.timeout_action_at(base + WARM_MODEL_TTL, WARM_MODEL_TTL),
+            IdleTimeoutAction::Unload,
+            "the next timeout must expire from the last successful use"
+        );
+
+        let success_at = base + WARM_MODEL_TTL * 3;
+        let mut successful_request = activity.acquire_request().unwrap();
+        successful_request.complete_successfully_at(success_at);
+        assert_eq!(
+            activity.timeout_action_at(
+                success_at + WARM_MODEL_TTL - Duration::from_millis(1),
+                WARM_MODEL_TTL,
+            ),
+            IdleTimeoutAction::Defer(Duration::from_millis(1))
+        );
+        assert_eq!(
+            activity.timeout_action_at(success_at + WARM_MODEL_TTL, WARM_MODEL_TTL),
+            IdleTimeoutAction::Unload
+        );
+    }
+
+    #[test]
+    fn active_stream_and_request_defer_idle_unload_until_full_idle_interval() {
+        let activity = RuntimeActivity::default();
+        let base = Instant::now();
+        activity.force_release_streams_at(base);
+        let mut stream = activity.acquire_stream().unwrap();
+        let mut request = activity.acquire_request().unwrap();
+        let long_after_expiry = base + WARM_MODEL_TTL * 4;
+
+        assert_eq!(
+            activity.timeout_action_at(long_after_expiry, WARM_MODEL_TTL),
+            IdleTimeoutAction::Defer(WARM_MODEL_TTL)
+        );
+        request.release_at(long_after_expiry);
+        assert_eq!(
+            activity.timeout_action_at(long_after_expiry, WARM_MODEL_TTL),
+            IdleTimeoutAction::Defer(WARM_MODEL_TTL)
+        );
+        stream.release_at(long_after_expiry);
+        assert_eq!(
+            activity.timeout_action_at(
+                long_after_expiry + WARM_MODEL_TTL - Duration::from_millis(1),
+                WARM_MODEL_TTL,
+            ),
+            IdleTimeoutAction::Defer(Duration::from_millis(1))
+        );
+        assert_eq!(
+            activity.timeout_action_at(long_after_expiry + WARM_MODEL_TTL, WARM_MODEL_TTL),
+            IdleTimeoutAction::Unload
+        );
+    }
+
+    #[test]
+    fn unload_all_cleans_every_onnx_handle_and_lease_while_preserving_first_error() {
+        let control = Arc::new(TestOnnxControl {
+            loads: AtomicU64::new(0),
+            unloads: AtomicU64::new(0),
+            fail_unload: true,
+            events: Arc::new(Mutex::new(Vec::new())),
+        });
+        let router = RuntimeRouter::with_test_onnx_factory({
+            let control = Arc::clone(&control);
+            move || Ok(Arc::clone(&control) as Arc<dyn OnnxSupervisorControl>)
+        });
+        let supervisor = Arc::clone(&control) as Arc<dyn OnnxSupervisorControl>;
+        {
+            let mut state = router.inner.lock().unwrap();
+            state.onnx = Some(OnnxSpeechRuntime::new(
+                Arc::clone(&supervisor),
+                Arc::new(AtomicU64::new(0)),
+                router.runtime_activity(),
+            ));
+            state
+                .heavy_ownership
+                .activate(HeavyRuntimeOwner::OnnxSpeech);
+        }
+        *router.onnx_cancellation.lock().unwrap() = Some(supervisor);
+        let stale_stream_lease = router.runtime_activity.acquire_stream().unwrap();
+
+        let error = router.unload_all().unwrap_err();
+
+        assert!(error.to_string().contains("deterministic unload failure"));
+        assert_eq!(control.unloads.load(Ordering::Acquire), 1);
+        assert!(router.inner.lock().unwrap().onnx.is_none());
+        assert_eq!(router.inner.lock().unwrap().heavy_ownership.current, None);
+        assert!(router.onnx_cancellation.lock().unwrap().is_none());
+        assert_eq!(router.runtime_activity.active_streams(), 0);
+        drop(stale_stream_lease);
+        assert_eq!(router.runtime_activity.active_streams(), 0);
     }
 
     #[test]
@@ -1438,6 +3326,66 @@ mod tests {
     }
 
     #[test]
+    fn embedded_preload_verification_failure_preserves_only_the_prior_identity() {
+        let missing = std::env::temp_dir().join(format!(
+            "scribe-missing-changed-gguf-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let prior = RuntimeModel {
+            id: ModelId::new("prior-gguf"),
+            path: PathBuf::from("prior.gguf"),
+            format: ArtifactFormat::Gguf,
+            package_root: None,
+            expected_size_bytes: 1,
+            expected_sha256: "0".repeat(64),
+        };
+        let changed = RuntimeModel {
+            id: ModelId::new("changed-gguf"),
+            path: missing,
+            format: ArtifactFormat::Gguf,
+            package_root: None,
+            expected_size_bytes: 1,
+            expected_sha256: "1".repeat(64),
+        };
+        let cancellation = Arc::new(Mutex::new(None));
+        let mut state = RouterState::default();
+        let embedded = EmbeddedRuntime::new(prior.path.clone(), AccelerationPreference::Cpu);
+        *cancellation.lock().unwrap() = Some(embedded.cancellation_handle());
+        state.embedded = Some(embedded);
+        state.embedded_model = Some(prior.clone());
+        state
+            .heavy_ownership
+            .activate(HeavyRuntimeOwner::EmbeddedGguf);
+
+        let error = state
+            .load_embedded(
+                changed,
+                AccelerationPreference::Cpu,
+                Arc::clone(&cancellation),
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            RuntimeError::Bootstrap(NativeBootstrapFailure::ModelIntegrity { .. })
+        ));
+        assert_eq!(state.embedded_model.as_ref(), Some(&prior));
+        assert_eq!(
+            state.embedded.as_ref().map(EmbeddedRuntime::model_path),
+            Some(prior.path.as_path())
+        );
+        assert_eq!(
+            state.heavy_ownership.current,
+            Some(HeavyRuntimeOwner::EmbeddedGguf)
+        );
+        assert!(cancellation.lock().unwrap().is_some());
+    }
+
+    #[test]
     fn trusted_gguf_format_routes_staged_and_final_paths_to_the_embedded_runtime() {
         for path in [
             "whisper-base.en-Q8_0.gguf.partial",
@@ -1458,6 +3406,35 @@ mod tests {
                 Some(RuntimeKind::TranscribeCpp)
             ));
         }
+    }
+
+    #[test]
+    fn existing_runtime_models_convert_to_the_same_typed_routes() {
+        let gguf = RuntimeModel {
+            id: ModelId::new("trusted-gguf"),
+            path: PathBuf::from("model.gguf"),
+            format: ArtifactFormat::Gguf,
+            package_root: None,
+            expected_size_bytes: 1,
+            expected_sha256: "0".repeat(64),
+        };
+        let legacy = RuntimeModel {
+            id: ModelId::new("whisper_cpp_base_en"),
+            path: PathBuf::from("ggml-base.en.bin"),
+            format: ArtifactFormat::LegacyGgml,
+            package_root: Some(PathBuf::from("runtime")),
+            expected_size_bytes: 1,
+            expected_sha256: "0".repeat(64),
+        };
+
+        assert!(matches!(
+            RuntimeArtifact::from(gguf),
+            RuntimeArtifact::Gguf(_)
+        ));
+        assert!(matches!(
+            RuntimeArtifact::from(legacy),
+            RuntimeArtifact::LegacyCompatibility(_)
+        ));
     }
 
     #[test]

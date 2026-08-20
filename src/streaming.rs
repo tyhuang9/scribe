@@ -4,7 +4,7 @@
 //! preview worker plus the data and deterministic rules shared by its callers.
 
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -53,14 +53,20 @@ pub(crate) struct PreviewAudioPublisher {
     identity: StreamIdentity,
     next_sequence: Arc<AtomicU64>,
     mailbox: ReplaceLatestMailbox<PreviewSnapshot>,
+    valid: Arc<AtomicBool>,
 }
 
 impl PreviewAudioPublisher {
-    fn new(identity: StreamIdentity, mailbox: ReplaceLatestMailbox<PreviewSnapshot>) -> Self {
+    fn new(
+        identity: StreamIdentity,
+        mailbox: ReplaceLatestMailbox<PreviewSnapshot>,
+        valid: Arc<AtomicBool>,
+    ) -> Self {
         Self {
             identity,
             next_sequence: Arc::new(AtomicU64::new(1)),
             mailbox,
+            valid,
         }
     }
 
@@ -72,6 +78,31 @@ impl PreviewAudioPublisher {
         window_start_frame: u64,
         samples: Vec<f32>,
     ) -> Result<bool, SnapshotError> {
+        self.publish(window_start_frame, samples, false)
+    }
+
+    pub(crate) fn publish_terminal_window(
+        &self,
+        window_start_frame: u64,
+        samples: Vec<f32>,
+    ) -> Result<bool, SnapshotError> {
+        self.publish(window_start_frame, samples, true)
+    }
+
+    pub(crate) fn invalidate(&self) {
+        self.valid.store(false, Ordering::Release);
+        self.mailbox.abort();
+    }
+
+    fn publish(
+        &self,
+        window_start_frame: u64,
+        samples: Vec<f32>,
+        terminal: bool,
+    ) -> Result<bool, SnapshotError> {
+        if !self.valid.load(Ordering::Acquire) {
+            return Ok(false);
+        }
         let window_end_frame = window_start_frame.saturating_add(samples.len() as u64);
         let sequence = self.next_sequence.fetch_add(1, Ordering::Relaxed);
         let mut identity = self.identity.clone();
@@ -82,7 +113,11 @@ impl PreviewAudioPublisher {
                 .map_err(|_| SnapshotError::InvalidPreparedAudio)?,
         );
         let snapshot = PreviewSnapshot::new(identity, window_start_frame, window_end_frame, audio)?;
-        Ok(self.mailbox.publish(snapshot))
+        Ok(if terminal {
+            self.mailbox.publish_and_close(snapshot)
+        } else {
+            self.mailbox.publish(snapshot)
+        })
     }
 }
 
@@ -238,6 +273,17 @@ impl<T> ReplaceLatestMailbox<T> {
         true
     }
 
+    fn publish_and_close(&self, item: T) -> bool {
+        let mut inner = self.state.inner.lock().expect("mailbox lock poisoned");
+        if inner.closed {
+            return false;
+        }
+        inner.pending = Some(item);
+        inner.closed = true;
+        self.state.wake.notify_all();
+        true
+    }
+
     /// Claims the newest pending item only when no other item is active.
     pub fn try_claim(&self) -> Option<ActiveMailboxItem<T>> {
         let mut inner = self.state.inner.lock().expect("mailbox lock poisoned");
@@ -273,9 +319,21 @@ impl<T> ReplaceLatestMailbox<T> {
         }
     }
 
-    /// Closes the mailbox and drops pending work. A currently claimed item is
-    /// left to its consumer, which can finish or observe its own cancellation.
+    /// Closes an ordinary mailbox and drops ordinary pending work. A terminal
+    /// item that already sealed the mailbox is preserved for its one consumer.
     pub fn close(&self) {
+        let mut inner = self.state.inner.lock().expect("mailbox lock poisoned");
+        if inner.closed {
+            return;
+        }
+        inner.closed = true;
+        inner.pending = None;
+        self.state.wake.notify_all();
+    }
+
+    /// Invalidates graceful terminal delivery and always discards pending work,
+    /// including a terminal item that already sealed the mailbox.
+    fn abort(&self) {
         let mut inner = self.state.inner.lock().expect("mailbox lock poisoned");
         inner.closed = true;
         inner.pending = None;
@@ -360,6 +418,7 @@ pub struct RollingPreviewSession<E> {
     updates: ReplaceLatestMailbox<PreviewEvent<E>>,
     worker: Option<JoinHandle<()>>,
     cancel_active: Option<Box<dyn FnOnce() + Send + 'static>>,
+    valid: Arc<AtomicBool>,
 }
 
 impl<E: Send + 'static> RollingPreviewSession<E> {
@@ -380,6 +439,8 @@ impl<E: Send + 'static> RollingPreviewSession<E> {
         let worker_mailbox = mailbox.clone();
         let updates: ReplaceLatestMailbox<PreviewEvent<E>> = ReplaceLatestMailbox::new();
         let worker_updates = updates.clone();
+        let valid = Arc::new(AtomicBool::new(true));
+        let worker_valid = Arc::clone(&valid);
         let worker = thread::Builder::new()
             .name("scribe-rolling-preview".to_owned())
             .spawn(move || {
@@ -392,7 +453,9 @@ impl<E: Send + 'static> RollingPreviewSession<E> {
                     };
                     // A slow presentation consumer must not stall decoding or retain an obsolete
                     // partial; the result mailbox replaces it with this result.
-                    let _ = worker_updates.publish(event);
+                    if worker_valid.load(Ordering::Acquire) {
+                        let _ = worker_updates.publish(event);
+                    }
                 }
             })?;
         Ok(Self {
@@ -400,6 +463,7 @@ impl<E: Send + 'static> RollingPreviewSession<E> {
             updates,
             worker: Some(worker),
             cancel_active: Some(Box::new(cancel_active)),
+            valid,
         })
     }
 
@@ -423,6 +487,7 @@ impl<E: Send + 'static> RollingPreviewSession<E> {
                 sequence: 0,
             },
             self.mailbox.clone(),
+            Arc::clone(&self.valid),
         )
     }
 
@@ -432,8 +497,17 @@ impl<E: Send + 'static> RollingPreviewSession<E> {
         self.mailbox.close();
     }
 
+    pub(crate) fn invalidate(&self) {
+        self.valid.store(false, Ordering::Release);
+        self.mailbox.abort();
+        self.updates.abort();
+    }
+
     /// Returns at most one text-only preview event and never blocks.
     pub fn try_next(&self) -> Option<PreviewEvent<E>> {
+        if !self.valid.load(Ordering::Acquire) {
+            return None;
+        }
         self.updates.try_claim().map(ActiveMailboxItem::finish)
     }
 
@@ -468,6 +542,7 @@ impl<E: Send + 'static> RollingPreviewSession<E> {
 
 impl<E> Drop for RollingPreviewSession<E> {
     fn drop(&mut self) {
+        self.valid.store(false, Ordering::Release);
         if self
             .worker
             .as_ref()
@@ -976,6 +1051,84 @@ mod tests {
         assert!(mailbox.is_closed());
         assert!(!mailbox.publish(5));
         assert!(mailbox.try_claim().is_none());
+    }
+
+    #[test]
+    fn graceful_terminal_close_preserves_one_pending_item_but_abort_discards_it() {
+        let graceful = ReplaceLatestMailbox::new();
+        assert!(graceful.publish_and_close(7));
+        graceful.close();
+        assert_eq!(graceful.claim().unwrap().finish(), 7);
+        assert!(graceful.claim().is_none());
+
+        let aborted = ReplaceLatestMailbox::new();
+        assert!(aborted.publish_and_close(9));
+        aborted.abort();
+        assert!(aborted.claim().is_none());
+    }
+
+    #[test]
+    fn terminal_tail_decodes_once_while_invalidation_drops_pending_decode_and_output() {
+        let graceful_calls = Arc::new(AtomicU64::new(0));
+        let worker_calls = Arc::clone(&graceful_calls);
+        let mut graceful = RollingPreviewSession::<()>::new(move |_| {
+            worker_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(StreamUpdate::default())
+        })
+        .unwrap();
+        let publisher =
+            graceful.audio_publisher(SessionId(7), RequestId(11), ModelId::new("preview-model"));
+        assert!(
+            publisher
+                .publish_terminal_window(0, vec![0.1; 512])
+                .unwrap()
+        );
+        graceful.close();
+        assert!(graceful.stop_and_join(Duration::from_secs(1)));
+        assert_eq!(graceful_calls.load(Ordering::Relaxed), 1);
+        assert!(matches!(
+            graceful.try_next(),
+            Some(PreviewEvent::Update { .. })
+        ));
+
+        let invalidated_calls = Arc::new(AtomicU64::new(0));
+        let worker_calls = Arc::clone(&invalidated_calls);
+        let (started_tx, started_rx) = mpsc::channel();
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let worker_release = Arc::clone(&release);
+        let mut invalidated = RollingPreviewSession::<()>::new(move |_| {
+            worker_calls.fetch_add(1, Ordering::Relaxed);
+            started_tx.send(()).unwrap();
+            let (lock, wake) = &*worker_release;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = wake.wait(released).unwrap();
+            }
+            Ok(StreamUpdate::default())
+        })
+        .unwrap();
+        let publisher =
+            invalidated.audio_publisher(SessionId(8), RequestId(12), ModelId::new("preview-model"));
+        assert!(publisher.publish_window(0, vec![0.1; 512]).unwrap());
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(
+            publisher
+                .publish_terminal_window(512, vec![0.1; 512])
+                .unwrap()
+        );
+        publisher.invalidate();
+        {
+            let (lock, wake) = &*release;
+            *lock.lock().unwrap() = true;
+            wake.notify_all();
+        }
+        assert!(invalidated.stop_and_join(Duration::from_secs(1)));
+        assert_eq!(
+            invalidated_calls.load(Ordering::Relaxed),
+            1,
+            "the pending terminal tail must not start a later heavy decode"
+        );
+        assert!(invalidated.try_next().is_none());
     }
 
     #[test]

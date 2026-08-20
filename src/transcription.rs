@@ -38,10 +38,11 @@ pub use crate::model_catalog::{
     CompatibilityStatus, ModelCapabilities, ModelDescriptor, ModelRole,
 };
 use crate::models::{SttModelInfo, TranscriptResult as LegacyTranscriptResult};
+use crate::onnx_worker::OnnxModelSpec;
 use crate::prepared_audio::{PREPARED_SAMPLE_RATE, PreparedAudio};
 use crate::runtime_router::{
-    NativeBootstrapFailure, RuntimeError, RuntimeExecution, RuntimeLoadExecution, RuntimeModel,
-    RuntimeRouter, WARM_MODEL_TTL, verify_compatibility_cli,
+    IdleTimeoutAction, NativeBootstrapFailure, RuntimeArtifact, RuntimeError, RuntimeExecution,
+    RuntimeLoadExecution, RuntimeModel, RuntimeRouter, WARM_MODEL_TTL, verify_compatibility_cli,
 };
 use crate::streaming::{
     HypothesisWord, PreviewAudioPublisher, PreviewEvent, RollingPreviewSession, StreamIdentity,
@@ -54,6 +55,14 @@ const INSTALL_SMOKE_HELPER_FLAG: &str = "--scribe-install-smoke";
 const INSTALL_SMOKE_PARENT_FLAG: &str = "--scribe-install-smoke-parent";
 const DROP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(1);
+
+fn preserve_primary_smoke_error<T>(primary: Result<T>, cleanup: Result<()>) -> Result<T> {
+    match (primary, cleanup) {
+        (Err(primary), _) => Err(primary),
+        (Ok(_), Err(cleanup)) => Err(cleanup),
+        (Ok(value), Ok(())) => Ok(value),
+    }
+}
 
 /// Identifies one user dictation session.
 ///
@@ -342,6 +351,36 @@ pub(crate) struct InstallSmoke {
     pub(crate) reload_duration_ms: u128,
 }
 
+/// Unforgeable outside this module: only the real `TranscriptionService`
+/// smoke path can create the witness consumed by `StagedOnnxBundle`.
+pub(crate) struct VerifiedOnnxBundleSmoke {
+    root: PathBuf,
+    receipt: crate::onnx_model_bundles::OnnxBundleReceipt,
+    spec: OnnxModelSpec,
+    cancellation: InstallCancellation,
+    smoke: InstallSmoke,
+}
+
+impl VerifiedOnnxBundleSmoke {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        PathBuf,
+        crate::onnx_model_bundles::OnnxBundleReceipt,
+        OnnxModelSpec,
+        InstallCancellation,
+        InstallSmoke,
+    ) {
+        (
+            self.root,
+            self.receipt,
+            self.spec,
+            self.cancellation,
+            self.smoke,
+        )
+    }
+}
+
 /// Single-use installation evidence sealed by the isolated verifier and bound
 /// to the exact staged artifact and cancellation handle it checked.
 pub(crate) struct VerifiedInstallationCandidate {
@@ -580,6 +619,10 @@ impl RollingPreviewHandle {
         self.session.close();
     }
 
+    pub(crate) fn invalidate(&self) {
+        self.session.invalidate();
+    }
+
     pub(crate) fn is_finished(&self) -> bool {
         self.session.is_finished()
     }
@@ -610,7 +653,7 @@ impl RollingPreviewHandle {
 
 enum RuntimeCommand {
     Transcribe {
-        model: RuntimeModel,
+        artifact: RuntimeArtifact,
         preference: AccelerationPreference,
         audio: Arc<PreparedAudio>,
         options: TranscriptionOptions,
@@ -618,14 +661,20 @@ enum RuntimeCommand {
         reply: SyncSender<Result<RuntimeExecution, RuntimeError>>,
     },
     Load {
-        model: RuntimeModel,
+        artifact: RuntimeArtifact,
         preference: AccelerationPreference,
         reply: SyncSender<Result<RuntimeLoadExecution, RuntimeError>>,
     },
     Health {
-        model: RuntimeModel,
+        artifact: RuntimeArtifact,
         preference: AccelerationPreference,
         reply: SyncSender<Result<(), RuntimeError>>,
+    },
+    StartStream {
+        artifact: RuntimeArtifact,
+        preference: AccelerationPreference,
+        options: TranscriptionOptions,
+        reply: SyncSender<Result<Box<dyn SpeechStream>, RuntimeError>>,
     },
     Unload {
         reply: SyncSender<Result<(), RuntimeError>>,
@@ -671,7 +720,7 @@ impl RuntimeWorker {
 
     fn transcribe(
         &self,
-        model: RuntimeModel,
+        artifact: impl Into<RuntimeArtifact>,
         preference: AccelerationPreference,
         audio: Arc<PreparedAudio>,
         options: TranscriptionOptions,
@@ -681,7 +730,7 @@ impl RuntimeWorker {
         self.inner
             .commands
             .send(RuntimeCommand::Transcribe {
-                model,
+                artifact: artifact.into(),
                 preference,
                 audio,
                 options,
@@ -696,14 +745,14 @@ impl RuntimeWorker {
 
     fn load(
         &self,
-        model: RuntimeModel,
+        artifact: impl Into<RuntimeArtifact>,
         preference: AccelerationPreference,
     ) -> Result<RuntimeLoadExecution, RuntimeError> {
         let (reply, response) = sync_channel(1);
         self.inner
             .commands
             .send(RuntimeCommand::Load {
-                model,
+                artifact: artifact.into(),
                 preference,
                 reply,
             })
@@ -715,15 +764,36 @@ impl RuntimeWorker {
 
     fn health_check(
         &self,
-        model: RuntimeModel,
+        artifact: impl Into<RuntimeArtifact>,
         preference: AccelerationPreference,
     ) -> Result<(), RuntimeError> {
         let (reply, response) = sync_channel(1);
         self.inner
             .commands
             .send(RuntimeCommand::Health {
-                model,
+                artifact: artifact.into(),
                 preference,
+                reply,
+            })
+            .map_err(|error| RuntimeError::WorkerUnavailable(error.to_string()))?;
+        response
+            .recv()
+            .map_err(|error| RuntimeError::WorkerUnavailable(error.to_string()))?
+    }
+
+    fn start_stream(
+        &self,
+        artifact: impl Into<RuntimeArtifact>,
+        preference: AccelerationPreference,
+        options: TranscriptionOptions,
+    ) -> Result<Box<dyn SpeechStream>, RuntimeError> {
+        let (reply, response) = sync_channel(1);
+        self.inner
+            .commands
+            .send(RuntimeCommand::StartStream {
+                artifact: artifact.into(),
+                preference,
+                options,
                 reply,
             })
             .map_err(|error| RuntimeError::WorkerUnavailable(error.to_string()))?;
@@ -838,40 +908,70 @@ impl fmt::Debug for RuntimeWorker {
 }
 
 fn runtime_worker_loop(router: RuntimeRouter, commands: Receiver<RuntimeCommand>) {
+    let activity = router.runtime_activity();
+    let mut idle_wait = WARM_MODEL_TTL;
     loop {
-        match commands.recv_timeout(WARM_MODEL_TTL) {
+        let (succeeded, mut request_activity) = match commands.recv_timeout(idle_wait) {
             Ok(RuntimeCommand::Transcribe {
-                model,
+                artifact,
                 preference,
                 audio,
                 options,
                 cancellation_snapshot,
                 reply,
             }) => {
-                let _ = reply.send(router.transcribe(
-                    model,
+                let request_activity = activity.acquire_request().ok();
+                let result = router.transcribe(
+                    artifact,
                     preference,
                     &audio,
                     &options,
                     cancellation_snapshot,
-                ));
+                );
+                let succeeded = result.is_ok();
+                let _ = reply.send(result);
+                (succeeded, request_activity)
             }
             Ok(RuntimeCommand::Load {
-                model,
+                artifact,
                 preference,
                 reply,
             }) => {
-                let _ = reply.send(router.load(model, preference));
+                let request_activity = activity.acquire_request().ok();
+                let result = router.load(artifact, preference);
+                let succeeded = result.is_ok();
+                let _ = reply.send(result);
+                (succeeded, request_activity)
             }
             Ok(RuntimeCommand::Health {
-                model,
+                artifact,
                 preference,
                 reply,
             }) => {
-                let _ = reply.send(router.health_check(model, preference));
+                let request_activity = activity.acquire_request().ok();
+                let result = router.health_check(artifact, preference);
+                let succeeded = result.is_ok();
+                let _ = reply.send(result);
+                (succeeded, request_activity)
+            }
+            Ok(RuntimeCommand::StartStream {
+                artifact,
+                preference,
+                options,
+                reply,
+            }) => {
+                let request_activity = activity.acquire_request().ok();
+                let result = router.start_stream(artifact, preference, &options);
+                let succeeded = result.is_ok();
+                let _ = reply.send(result);
+                (succeeded, request_activity)
             }
             Ok(RuntimeCommand::Unload { reply }) => {
-                let _ = reply.send(router.unload_all());
+                let request_activity = activity.acquire_request().ok();
+                let result = router.unload_all();
+                let succeeded = result.is_ok();
+                let _ = reply.send(result);
+                (succeeded, request_activity)
             }
             Ok(RuntimeCommand::Shutdown { reply }) => {
                 let result = router.unload_all();
@@ -879,13 +979,36 @@ fn runtime_worker_loop(router: RuntimeRouter, commands: Receiver<RuntimeCommand>
                 break;
             }
             Err(RecvTimeoutError::Timeout) => {
-                let _ = router.unload_all();
+                match activity.timeout_action(WARM_MODEL_TTL) {
+                    IdleTimeoutAction::Unload => {
+                        if router.unload_all().is_ok() {
+                            activity.mark_command_complete();
+                        }
+                        idle_wait = WARM_MODEL_TTL;
+                    }
+                    IdleTimeoutAction::Defer(remaining) => {
+                        idle_wait = remaining;
+                    }
+                }
+                continue;
             }
             Err(RecvTimeoutError::Disconnected) => {
                 let _ = router.unload_all();
                 break;
             }
+        };
+        if succeeded {
+            if let Some(request_activity) = request_activity.as_mut() {
+                request_activity.complete_successfully();
+            } else {
+                activity.mark_command_complete();
+            }
         }
+        drop(request_activity);
+        idle_wait = match activity.timeout_action(WARM_MODEL_TTL) {
+            IdleTimeoutAction::Unload => Duration::ZERO,
+            IdleTimeoutAction::Defer(remaining) => remaining,
+        };
     }
 }
 
@@ -915,6 +1038,204 @@ impl TranscriptionService {
             router: self.router.clone(),
             worker: self.worker.clone(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_runtime_router(config: AppConfig, router: RuntimeRouter) -> Self {
+        Self {
+            config,
+            worker: RuntimeWorker::new(router.clone()),
+            router,
+        }
+    }
+
+    pub(crate) fn preload_runtime_artifact(
+        &self,
+        artifact: RuntimeArtifact,
+    ) -> Result<RuntimeLoadExecution> {
+        self.worker
+            .load(artifact, self.config.performance.acceleration_preference)
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn transcribe_runtime_artifact(
+        &self,
+        artifact: RuntimeArtifact,
+        audio: Arc<PreparedAudio>,
+        options: TranscriptionOptions,
+    ) -> Result<RuntimeExecution> {
+        self.worker
+            .transcribe(
+                artifact,
+                self.config.performance.acceleration_preference,
+                audio,
+                options,
+                self.router.cancellation_snapshot(),
+            )
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn health_check_runtime_artifact(&self, artifact: RuntimeArtifact) -> Result<()> {
+        self.worker
+            .health_check(artifact, self.config.performance.acceleration_preference)
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn start_runtime_stream(
+        &self,
+        artifact: RuntimeArtifact,
+        options: TranscriptionOptions,
+    ) -> Result<Box<dyn SpeechStream>> {
+        self.worker
+            .start_stream(
+                artifact,
+                self.config.performance.acceleration_preference,
+                options,
+            )
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn unload_runtime_artifacts(&self) -> Result<()> {
+        self.worker.unload().map_err(Into::into)
+    }
+
+    /// Resolves a private installed ONNX bundle from its durable exact receipt
+    /// only when that receipt still equals a currently embedded available
+    /// manifest. This path is local-only and never grants a self-authored or
+    /// retired receipt executable trust.
+    fn onnx_artifact_from_receipt(&self, root: &Path) -> Result<RuntimeArtifact> {
+        let (_, spec) = crate::onnx_model_bundles::current_executable_receipt_at(root)
+            .map_err(|error| anyhow!("installed ONNX bundle verification failed: {error}"))?;
+        Ok(RuntimeArtifact::OnnxBundle(spec))
+    }
+
+    pub(crate) fn preload_onnx_bundle_from_receipt(
+        &self,
+        root: &Path,
+    ) -> Result<RuntimeLoadExecution> {
+        self.preload_runtime_artifact(self.onnx_artifact_from_receipt(root)?)
+    }
+
+    pub(crate) fn transcribe_onnx_bundle_from_receipt(
+        &self,
+        root: &Path,
+        audio: Arc<PreparedAudio>,
+        options: TranscriptionOptions,
+    ) -> Result<RuntimeExecution> {
+        self.transcribe_runtime_artifact(self.onnx_artifact_from_receipt(root)?, audio, options)
+    }
+
+    /// Runs the staged bundle through the process-isolated ONNX worker before
+    /// activation. CPU is fixed here because the delivery unit carries no GPU
+    /// support or evidence.
+    pub(crate) fn verify_onnx_bundle_for_installation(
+        &self,
+        staged: crate::onnx_model_bundles::StagedOnnxBundle,
+        cancellation: &InstallCancellation,
+    ) -> Result<crate::onnx_model_bundles::VerifiedStagedOnnxBundle> {
+        ensure_install_not_cancelled(cancellation)?;
+        let root = staged.root().to_path_buf();
+        let (receipt, spec) = crate::onnx_model_bundles::current_executable_receipt_at(&root)
+            .map_err(|error| anyhow!("staged ONNX bundle verification failed: {error}"))?;
+        if staged.receipt() != &receipt || staged.spec() != &spec {
+            return Err(anyhow!(
+                "staged ONNX bundle changed before service smoke verification"
+            ));
+        }
+        let artifact = RuntimeArtifact::OnnxBundle(spec.clone());
+        let smoke = self.verify_onnx_artifact_smoke(artifact, cancellation)?;
+        ensure_install_not_cancelled(cancellation)?;
+        staged
+            .bind_verified(VerifiedOnnxBundleSmoke {
+                root,
+                receipt,
+                spec,
+                cancellation: cancellation.clone(),
+                smoke,
+            })
+            .map_err(Into::into)
+    }
+
+    fn verify_onnx_artifact_smoke(
+        &self,
+        artifact: RuntimeArtifact,
+        cancellation: &InstallCancellation,
+    ) -> Result<InstallSmoke> {
+        let preference = AccelerationPreference::Cpu;
+
+        let health_started = Instant::now();
+        let health_result = (|| {
+            self.worker
+                .health_check(artifact.clone(), preference)
+                .map_err(|error| anyhow!("staged ONNX bundle health check failed: {error}"))?;
+            let duration = health_started.elapsed().as_millis();
+            ensure_install_not_cancelled(cancellation)?;
+            Ok(duration)
+        })();
+        let health_unload = self
+            .worker
+            .unload()
+            .map_err(|error| anyhow!("staged ONNX bundle health unload failed: {error}"));
+        let health_duration_ms = preserve_primary_smoke_error(health_result, health_unload)?;
+
+        let load_started = Instant::now();
+        let load_decode_result = (|| {
+            let load = self
+                .worker
+                .load(artifact.clone(), preference)
+                .map_err(|error| anyhow!("staged ONNX bundle load failed: {error}"))?;
+            let load_duration_ms = load_started.elapsed().as_millis();
+            ensure_install_not_cancelled(cancellation)?;
+            let audio = Arc::new(PreparedAudio::from_captured_mono(
+                vec![0.0; PREPARED_SAMPLE_RATE as usize],
+                PREPARED_SAMPLE_RATE,
+                1,
+                PREPARED_SAMPLE_RATE as usize,
+            )?);
+            let decode_started = Instant::now();
+            self.worker
+                .transcribe(
+                    artifact.clone(),
+                    preference,
+                    audio,
+                    TranscriptionOptions::default(),
+                    self.router.cancellation_snapshot(),
+                )
+                .map_err(|error| anyhow!("staged ONNX bundle decode smoke failed: {error}"))?;
+            ensure_install_not_cancelled(cancellation)?;
+            Ok((load, load_duration_ms, decode_started.elapsed().as_millis()))
+        })();
+        let unload_result = self
+            .worker
+            .unload()
+            .map_err(|error| anyhow!("staged ONNX bundle unload failed: {error}"));
+        let (load, load_duration_ms, decode_duration_ms) =
+            preserve_primary_smoke_error(load_decode_result, unload_result)?;
+
+        let reload_started = Instant::now();
+        let reload_result = (|| {
+            self.worker
+                .load(artifact, preference)
+                .map_err(|error| anyhow!("staged ONNX bundle reload failed: {error}"))?;
+            let duration = reload_started.elapsed().as_millis();
+            ensure_install_not_cancelled(cancellation)?;
+            Ok(duration)
+        })();
+        let unload_result = self
+            .worker
+            .unload()
+            .map_err(|error| anyhow!("staged ONNX bundle final unload failed: {error}"));
+        let reload_duration_ms = preserve_primary_smoke_error(reload_result, unload_result)?;
+
+        Ok(InstallSmoke {
+            resolved_acceleration: load.diagnostics.resolved_acceleration,
+            detected_architecture: load.detected_architecture,
+            capabilities: load.capabilities,
+            health_duration_ms,
+            load_duration_ms,
+            decode_duration_ms,
+            reload_duration_ms,
+        })
     }
 
     #[cfg(test)]
@@ -2437,7 +2758,320 @@ fn intersect_capabilities(
 mod tests {
     use super::*;
     use crate::models::TranscriptSegment as LegacyTranscriptSegment;
+    use crate::onnx_worker::{OnnxFileRole, OnnxModelFamily, OnnxModelSpec};
+    use crate::runtime_router::{OnnxSupervisorControl, RuntimeArtifact};
     use sha2::{Digest, Sha256};
+    use std::collections::BTreeMap;
+    use std::io::Cursor;
+    use std::sync::Condvar;
+
+    const MAX_DIAGNOSTIC_ONNX_WAV_BYTES: u64 = 256 * 1024 * 1024;
+
+    #[derive(Default)]
+    struct FakeOnnxState {
+        loaded: Option<OnnxModelSpec>,
+        load_calls: usize,
+        maximum_loaded_models: usize,
+        events: Vec<String>,
+        fail_next_load: bool,
+        fail_load_call: Option<usize>,
+        fail_transcribe: bool,
+        fail_health: bool,
+        fail_start_stream: bool,
+        transcribe_calls: usize,
+        health_calls: usize,
+        unload_calls: usize,
+        unloaded_active_streams: usize,
+        cancel_active_calls: usize,
+        termination_calls: usize,
+        stream: Option<(u64, usize)>,
+        stream_cancels: usize,
+        batch_started: bool,
+        block_batch: bool,
+        batch_cancelled: bool,
+        cancel_install_on_transcribe: Option<InstallCancellation>,
+        cancel_install_on_health: Option<InstallCancellation>,
+        cancel_install_on_load_call: Option<(usize, InstallCancellation)>,
+    }
+
+    #[derive(Default)]
+    struct FakeOnnxControl {
+        state: Mutex<FakeOnnxState>,
+        changed: Condvar,
+    }
+
+    impl FakeOnnxControl {
+        fn set_block_batch(&self) {
+            self.state.lock().unwrap().block_batch = true;
+        }
+
+        fn wait_for_batch(&self) {
+            let mut state = self.state.lock().unwrap();
+            while !state.batch_started {
+                state = self.changed.wait(state).unwrap();
+            }
+        }
+
+        fn fail_next_load(&self) {
+            self.state.lock().unwrap().fail_next_load = true;
+        }
+
+        fn fail_load_call(&self, call: usize) {
+            self.state.lock().unwrap().fail_load_call = Some(call);
+        }
+
+        fn fail_transcribe(&self) {
+            self.state.lock().unwrap().fail_transcribe = true;
+        }
+
+        fn cancel_install_on_transcribe(&self, cancellation: InstallCancellation) {
+            self.state.lock().unwrap().cancel_install_on_transcribe = Some(cancellation);
+        }
+
+        fn cancel_install_on_health(&self, cancellation: InstallCancellation) {
+            self.state.lock().unwrap().cancel_install_on_health = Some(cancellation);
+        }
+
+        fn cancel_install_on_load_call(&self, call: usize, cancellation: InstallCancellation) {
+            self.state.lock().unwrap().cancel_install_on_load_call = Some((call, cancellation));
+        }
+    }
+
+    impl OnnxSupervisorControl for FakeOnnxControl {
+        fn load(
+            &self,
+            _session_id: u64,
+            _request_id: u64,
+            model: OnnxModelSpec,
+        ) -> anyhow::Result<bool> {
+            let mut state = self.state.lock().unwrap();
+            state.load_calls += 1;
+            if state
+                .cancel_install_on_load_call
+                .as_ref()
+                .is_some_and(|(call, _)| *call == state.load_calls)
+                && let Some((_, cancellation)) = state.cancel_install_on_load_call.take()
+            {
+                cancellation.cancel();
+            }
+            let warm = state.loaded.as_ref() == Some(&model);
+            if !warm {
+                if let Some(previous) = state.loaded.take() {
+                    state.events.push(format!("evict:{}", previous.id));
+                }
+                state.events.push(format!("load:{}", model.id));
+            }
+            if state.fail_load_call == Some(state.load_calls) {
+                state.fail_load_call = None;
+                state.loaded = Some(model);
+                state.maximum_loaded_models = state.maximum_loaded_models.max(1);
+                anyhow::bail!("deterministic ONNX load failure on call");
+            }
+            if std::mem::take(&mut state.fail_next_load) {
+                anyhow::bail!("deterministic ONNX load failure");
+            }
+            state.loaded = Some(model);
+            state.maximum_loaded_models = state.maximum_loaded_models.max(1);
+            Ok(warm)
+        }
+
+        fn transcribe(
+            &self,
+            _session_id: u64,
+            _request_id: u64,
+            _samples: &[f32],
+        ) -> anyhow::Result<String> {
+            let mut state = self.state.lock().unwrap();
+            state.transcribe_calls += 1;
+            if let Some(cancellation) = state.cancel_install_on_transcribe.take() {
+                cancellation.cancel();
+            }
+            if state.fail_transcribe {
+                state.loaded = None;
+                anyhow::bail!("deterministic ONNX transcribe failure");
+            }
+            state.batch_started = true;
+            self.changed.notify_all();
+            while state.block_batch && !state.batch_cancelled {
+                state = self.changed.wait(state).unwrap();
+            }
+            if state.batch_cancelled {
+                anyhow::bail!("fake ONNX batch cancelled");
+            }
+            Ok("neutral fake transcript".to_owned())
+        }
+
+        fn start_stream(&self, session_id: u64, _request_id: u64) -> anyhow::Result<()> {
+            let mut state = self.state.lock().unwrap();
+            if state.fail_start_stream {
+                state.loaded = None;
+                anyhow::bail!("deterministic ONNX start-stream failure");
+            }
+            if state.stream.is_some() {
+                anyhow::bail!("fake ONNX stream already active");
+            }
+            state.stream = Some((session_id, 0));
+            Ok(())
+        }
+
+        fn audio_chunk(
+            &self,
+            session_id: u64,
+            _request_id: u64,
+            _samples: &[f32],
+        ) -> anyhow::Result<String> {
+            let mut state = self.state.lock().unwrap();
+            let stream = state
+                .stream
+                .as_mut()
+                .filter(|stream| stream.0 == session_id)
+                .ok_or_else(|| anyhow!("no matching fake ONNX stream"))?;
+            stream.1 += 1;
+            Ok(format!("partial-{}", stream.1))
+        }
+
+        fn end_stream(&self, session_id: u64, _request_id: u64) -> anyhow::Result<String> {
+            let mut state = self.state.lock().unwrap();
+            let (_, chunks) = state
+                .stream
+                .take()
+                .filter(|stream| stream.0 == session_id)
+                .ok_or_else(|| anyhow!("no matching fake ONNX stream"))?;
+            Ok(format!("final-{chunks}"))
+        }
+
+        fn cancel_stream(&self, session_id: u64, _request_id: u64) -> anyhow::Result<()> {
+            let mut state = self.state.lock().unwrap();
+            if state
+                .stream
+                .is_none_or(|(active_session, _)| active_session != session_id)
+            {
+                anyhow::bail!("no matching fake ONNX stream");
+            }
+            state.stream = None;
+            state.stream_cancels += 1;
+            Ok(())
+        }
+
+        fn health(&self, _session_id: u64, _request_id: u64) -> anyhow::Result<()> {
+            let mut state = self.state.lock().unwrap();
+            state.health_calls += 1;
+            if let Some(cancellation) = state.cancel_install_on_health.take() {
+                cancellation.cancel();
+            }
+            if state.fail_health {
+                state.loaded = None;
+                anyhow::bail!("deterministic ONNX health failure");
+            }
+            Ok(())
+        }
+
+        fn unload(&self) -> anyhow::Result<()> {
+            let mut state = self.state.lock().unwrap();
+            state.unload_calls += 1;
+            if state.stream.is_some() {
+                state.unloaded_active_streams += 1;
+            }
+            state.stream = None;
+            state.loaded = None;
+            Ok(())
+        }
+
+        fn cancel_active(&self) -> anyhow::Result<()> {
+            let mut state = self.state.lock().unwrap();
+            state.cancel_active_calls += 1;
+            state.batch_cancelled = true;
+            self.changed.notify_all();
+            Ok(())
+        }
+
+        fn abandon_stream(&self, session_id: u64) {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if state
+                .stream
+                .is_some_and(|(active_session, _)| active_session == session_id)
+            {
+                state.stream = None;
+                state.stream_cancels += 1;
+            }
+        }
+
+        fn terminate_current(&self) -> anyhow::Result<()> {
+            let mut state = self.state.lock().unwrap();
+            state.termination_calls += 1;
+            state.events.push("terminate:onnx".to_owned());
+            state.stream = None;
+            state.loaded = None;
+            state.batch_cancelled = true;
+            self.changed.notify_all();
+            Ok(())
+        }
+    }
+
+    fn onnx_spec(label: &str, family: OnnxModelFamily) -> (PathBuf, OnnxModelSpec) {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "scribe-router-onnx-{label}-{}-{suffix}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let roles = match family {
+            OnnxModelFamily::OnlineTransducer | OnnxModelFamily::OfflineTransducer => vec![
+                OnnxFileRole::Encoder,
+                OnnxFileRole::Decoder,
+                OnnxFileRole::Joiner,
+                OnnxFileRole::Tokens,
+            ],
+            OnnxModelFamily::NemoCtc => vec![OnnxFileRole::Model, OnnxFileRole::Tokens],
+            other => panic!("test helper does not define a fixture for {other:?}"),
+        };
+        let files = roles
+            .into_iter()
+            .map(|role| {
+                let relative = PathBuf::from(format!("{role:?}.fixture").to_ascii_lowercase());
+                fs::write(root.join(&relative), format!("{label}-{role:?}")).unwrap();
+                (role, relative)
+            })
+            .collect::<BTreeMap<_, _>>();
+        let spec = OnnxModelSpec {
+            id: format!("private-{label}"),
+            root: root.clone(),
+            family,
+            files,
+            num_threads: 1,
+        };
+        (root, spec)
+    }
+
+    fn onnx_test_service(
+        preference: AccelerationPreference,
+    ) -> (
+        TranscriptionService,
+        Arc<FakeOnnxControl>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let control = Arc::new(FakeOnnxControl::default());
+        let spawn_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let factory_control = Arc::clone(&control);
+        let factory_spawn_count = Arc::clone(&spawn_count);
+        let router = RuntimeRouter::with_test_onnx_factory(move || {
+            factory_spawn_count.fetch_add(1, Ordering::AcqRel);
+            Ok(Arc::clone(&factory_control) as Arc<dyn OnnxSupervisorControl>)
+        });
+        let mut config = AppConfig::default();
+        config.performance.acceleration_preference = preference;
+        (
+            TranscriptionService::with_runtime_router(config, router),
+            control,
+            spawn_count,
+        )
+    }
 
     fn prepared_audio() -> Arc<PreparedAudio> {
         Arc::new(PreparedAudio {
@@ -2447,6 +3081,737 @@ mod tests {
             source_channels: 1,
             source_frames: 160,
         })
+    }
+
+    fn normalize_fixture_transcript(value: &str) -> String {
+        value
+            .chars()
+            .map(|character| {
+                if character.is_alphanumeric() {
+                    character.to_ascii_lowercase()
+                } else {
+                    ' '
+                }
+            })
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn decode_digest_pinned_diagnostic_wav_with_hook(
+        path: &Path,
+        expected_sha256: &str,
+        after_verified_read: impl FnOnce(),
+    ) -> Result<PreparedAudio> {
+        anyhow::ensure!(
+            expected_sha256.len() == 64
+                && expected_sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+            "diagnostic WAV SHA-256 must be exactly 64 lowercase hexadecimal characters"
+        );
+        let bytes =
+            crate::installations::read_regular_file_no_follow(path, MAX_DIAGNOSTIC_ONNX_WAV_BYTES)?;
+        anyhow::ensure!(!bytes.is_empty(), "diagnostic WAV fixture is empty");
+        let actual_sha256 = format!("{:x}", Sha256::digest(&bytes));
+        anyhow::ensure!(
+            actual_sha256 == expected_sha256,
+            "diagnostic WAV fixture checksum mismatch: expected {expected_sha256}, got {actual_sha256}"
+        );
+        after_verified_read();
+        PreparedAudio::from_wav_reader(Cursor::new(bytes))
+    }
+
+    fn diagnostic_wav_bytes(samples: &[i16]) -> Vec<u8> {
+        let mut cursor = Cursor::new(Vec::new());
+        {
+            let mut writer = hound::WavWriter::new(
+                &mut cursor,
+                hound::WavSpec {
+                    channels: 1,
+                    sample_rate: PREPARED_SAMPLE_RATE,
+                    bits_per_sample: 16,
+                    sample_format: hound::SampleFormat::Int,
+                },
+            )
+            .unwrap();
+            for sample in samples {
+                writer.write_sample(*sample).unwrap();
+            }
+            writer.finalize().unwrap();
+        }
+        cursor.into_inner()
+    }
+
+    #[test]
+    fn private_runtime_artifact_routes_onnx_load_health_and_transcribe_through_worker() {
+        let (root, spec) = onnx_spec("online-service", OnnxModelFamily::OnlineTransducer);
+        let artifact = RuntimeArtifact::OnnxBundle(spec);
+        let (service, control, spawn_count) = onnx_test_service(AccelerationPreference::Cpu);
+
+        let cold = service.preload_runtime_artifact(artifact.clone()).unwrap();
+        let warm = service.preload_runtime_artifact(artifact.clone()).unwrap();
+        service
+            .health_check_runtime_artifact(artifact.clone())
+            .unwrap();
+        let execution = service
+            .transcribe_runtime_artifact(
+                artifact,
+                prepared_audio(),
+                TranscriptionOptions::default(),
+            )
+            .unwrap();
+
+        assert!(!cold.diagnostics.warm_reused);
+        assert!(warm.diagnostics.warm_reused);
+        assert_eq!(
+            cold.diagnostics.resolved_acceleration.requested,
+            AccelerationPreference::Cpu
+        );
+        assert_eq!(
+            cold.diagnostics.resolved_acceleration.resolved,
+            ComputeDevice::Cpu
+        );
+        assert!(cold.capabilities.cancellation);
+        assert!(cold.capabilities.streaming);
+        assert!(!cold.capabilities.timestamps);
+        assert!(!cold.capabilities.language_detection);
+        assert_eq!(cold.detected_architecture, "online-transducer");
+        assert_eq!(execution.transcript.text, "neutral fake transcript");
+        assert!(execution.transcript.segments.is_empty());
+        assert_eq!(execution.transcript.detected_language, None);
+        assert_eq!(execution.transcript.duration_ms, None);
+        assert!(execution.diagnostics.warm_reused);
+        assert_eq!(spawn_count.load(Ordering::Acquire), 1);
+        let state = control.state.lock().unwrap();
+        assert_eq!(state.health_calls, 1);
+        assert_eq!(state.transcribe_calls, 1);
+        drop(state);
+        service.unload_runtime_artifacts().unwrap();
+        assert_eq!(control.state.lock().unwrap().unload_calls, 1);
+
+        drop(service);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn receipt_backed_onnx_bundle_routes_below_transcription_service() {
+        let (root, spec) = onnx_spec("receipt-service", OnnxModelFamily::OnlineTransducer);
+        crate::onnx_model_bundles::write_test_receipt_for_spec(&spec).unwrap();
+        let (service, control, _) = onnx_test_service(AccelerationPreference::Cpu);
+
+        assert!(service.preload_onnx_bundle_from_receipt(&root).is_err());
+        assert!(
+            service
+                .transcribe_onnx_bundle_from_receipt(
+                    &root,
+                    prepared_audio(),
+                    TranscriptionOptions::default(),
+                )
+                .is_err()
+        );
+        assert_eq!(control.state.lock().unwrap().transcribe_calls, 0);
+
+        fs::write(root.join("unexpected.onnx"), b"unexpected").unwrap();
+        assert!(service.preload_onnx_bundle_from_receipt(&root).is_err());
+        service.unload_runtime_artifacts().unwrap();
+        drop(service);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn staged_receipt_smoke_uses_fixed_cpu_and_observed_worker_evidence() {
+        let (root, spec) = onnx_spec("receipt-smoke", OnnxModelFamily::OnlineTransducer);
+        crate::onnx_model_bundles::write_test_receipt_for_spec(&spec).unwrap();
+        let (service, control, _) = onnx_test_service(AccelerationPreference::Gpu);
+        let smoke = service
+            .verify_onnx_artifact_smoke(
+                RuntimeArtifact::OnnxBundle(spec),
+                &InstallCancellation::default(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            smoke.resolved_acceleration.requested,
+            AccelerationPreference::Cpu
+        );
+        assert_eq!(smoke.resolved_acceleration.resolved, ComputeDevice::Cpu);
+        assert_eq!(smoke.detected_architecture, "online-transducer");
+        assert!(smoke.capabilities.streaming);
+        let state = control.state.lock().unwrap();
+        assert_eq!(state.health_calls, 1);
+        assert_eq!(state.transcribe_calls, 1);
+        assert_eq!(state.load_calls, 4);
+        assert_eq!(state.unload_calls, 3);
+        assert!(state.loaded.is_none());
+        drop(state);
+        drop(service);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn staged_onnx_smoke_unloads_after_decode_failure_and_preserves_primary_error() {
+        let (root, spec) = onnx_spec("smoke-decode-failure", OnnxModelFamily::OnlineTransducer);
+        let (service, control, _) = onnx_test_service(AccelerationPreference::Cpu);
+        control.fail_transcribe();
+
+        let error = service
+            .verify_onnx_artifact_smoke(
+                RuntimeArtifact::OnnxBundle(spec),
+                &InstallCancellation::default(),
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("decode smoke failed"));
+        let state = control.state.lock().unwrap();
+        assert_eq!(state.unload_calls, 2);
+        assert!(state.loaded.is_none());
+        drop(state);
+        assert_eq!(service.router.onnx_state_for_test(), (false, false, false));
+        drop(service);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn staged_onnx_smoke_unloads_when_install_is_cancelled_during_decode() {
+        let (root, spec) = onnx_spec("smoke-cancel", OnnxModelFamily::OnlineTransducer);
+        let (service, control, _) = onnx_test_service(AccelerationPreference::Cpu);
+        let cancellation = InstallCancellation::default();
+        control.cancel_install_on_transcribe(cancellation.clone());
+
+        let error = service
+            .verify_onnx_artifact_smoke(RuntimeArtifact::OnnxBundle(spec), &cancellation)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("cancelled"));
+        let state = control.state.lock().unwrap();
+        assert_eq!(state.unload_calls, 2);
+        assert!(state.loaded.is_none());
+        drop(state);
+        assert_eq!(service.router.onnx_state_for_test(), (false, false, false));
+        drop(service);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn staged_onnx_smoke_unloads_when_cancelled_after_health() {
+        let (root, spec) = onnx_spec("smoke-cancel-health", OnnxModelFamily::OnlineTransducer);
+        let (service, control, _) = onnx_test_service(AccelerationPreference::Cpu);
+        let cancellation = InstallCancellation::default();
+        control.cancel_install_on_health(cancellation.clone());
+
+        let error = service
+            .verify_onnx_artifact_smoke(RuntimeArtifact::OnnxBundle(spec), &cancellation)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("cancelled"));
+        let state = control.state.lock().unwrap();
+        assert_eq!(state.health_calls, 1);
+        assert_eq!(state.unload_calls, 1);
+        assert!(state.loaded.is_none());
+        drop(state);
+        assert_eq!(service.router.onnx_state_for_test(), (false, false, false));
+        drop(service);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn staged_onnx_smoke_unloads_when_cancelled_immediately_after_load() {
+        let (root, spec) = onnx_spec("smoke-cancel-load", OnnxModelFamily::OnlineTransducer);
+        let (service, control, _) = onnx_test_service(AccelerationPreference::Cpu);
+        let cancellation = InstallCancellation::default();
+        control.cancel_install_on_load_call(2, cancellation.clone());
+
+        let error = service
+            .verify_onnx_artifact_smoke(RuntimeArtifact::OnnxBundle(spec), &cancellation)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("cancelled"));
+        let state = control.state.lock().unwrap();
+        assert_eq!(state.health_calls, 1);
+        assert_eq!(state.load_calls, 2);
+        assert_eq!(state.unload_calls, 2);
+        assert!(state.loaded.is_none());
+        drop(state);
+        assert_eq!(service.router.onnx_state_for_test(), (false, false, false));
+        drop(service);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn staged_onnx_smoke_unloads_after_reload_load_failure() {
+        let (root, spec) = onnx_spec("smoke-reload-failure", OnnxModelFamily::OnlineTransducer);
+        let (service, control, _) = onnx_test_service(AccelerationPreference::Cpu);
+        control.fail_load_call(4);
+
+        let error = service
+            .verify_onnx_artifact_smoke(
+                RuntimeArtifact::OnnxBundle(spec),
+                &InstallCancellation::default(),
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("reload failed"));
+        let state = control.state.lock().unwrap();
+        assert_eq!(state.load_calls, 4);
+        assert_eq!(state.unload_calls, 3);
+        assert!(state.loaded.is_none());
+        drop(state);
+        assert_eq!(service.router.onnx_state_for_test(), (false, false, false));
+        drop(service);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn diagnostic_wav_decode_is_bound_to_verified_bytes_not_a_reopened_path() {
+        let root = std::env::temp_dir().join(format!(
+            "scribe-diagnostic-wav-binding-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("fixture.wav");
+        let original = diagnostic_wav_bytes(&[i16::MAX / 2, i16::MAX / 4]);
+        let replacement = diagnostic_wav_bytes(&[-i16::MAX / 2, -i16::MAX / 4]);
+        fs::write(&path, &original).unwrap();
+        let expected_sha256 = format!("{:x}", Sha256::digest(&original));
+        let moved = root.join("verified-original.wav");
+
+        let audio = decode_digest_pinned_diagnostic_wav_with_hook(&path, &expected_sha256, {
+            let path = path.clone();
+            let moved = moved.clone();
+            let replacement = replacement.clone();
+            move || {
+                fs::rename(&path, &moved).unwrap();
+                fs::write(&path, replacement).unwrap();
+            }
+        })
+        .unwrap();
+
+        assert!(audio.samples[0] > 0.0);
+        assert_eq!(fs::read(&path).unwrap(), replacement);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // Developer diagnostic only. It is deliberately non-promotional and
+    // cannot support a compatibility claim unless a canonical WAV digest and
+    // normalized transcript later become versioned repository evidence.
+    #[test]
+    #[ignore = "non-promotional diagnostic: downloads an exact pinned Hugging Face bundle and requires a digest-pinned spoken WAV fixture"]
+    fn diagnostic_real_hugging_face_bundle_install_load_and_decode() {
+        if std::env::var("SCRIBE_ONNX_BUNDLE_TEST").as_deref() != Ok("1") {
+            return;
+        }
+        let model_id = std::env::var("SCRIBE_ONNX_BUNDLE_MODEL_ID")
+            .unwrap_or_else(|_| "moonshine-tiny-en-int8-onnx".to_owned());
+        let storage = PathBuf::from(
+            std::env::var_os("SCRIBE_ONNX_BUNDLE_STORAGE_DIR")
+                .expect("set SCRIBE_ONNX_BUNDLE_STORAGE_DIR to a dedicated test directory"),
+        );
+        let audio_path = PathBuf::from(
+            std::env::var_os("SCRIBE_ONNX_BUNDLE_WAV")
+                .expect("set SCRIBE_ONNX_BUNDLE_WAV to a known spoken PCM WAV"),
+        );
+        let expected_wav_sha256 = std::env::var("SCRIBE_ONNX_BUNDLE_WAV_SHA256")
+            .expect("set SCRIBE_ONNX_BUNDLE_WAV_SHA256 to the exact lowercase WAV SHA-256");
+        let expected_text = std::env::var("SCRIBE_ONNX_BUNDLE_EXPECTED_TRANSCRIPT")
+            .expect("set SCRIBE_ONNX_BUNDLE_EXPECTED_TRANSCRIPT to the required spoken text");
+        assert!(
+            !normalize_fixture_transcript(&expected_text).is_empty(),
+            "the required expected transcript must contain letters or numbers"
+        );
+        let cancellation = InstallCancellation::default();
+        let audio = Arc::new(
+            decode_digest_pinned_diagnostic_wav_with_hook(&audio_path, &expected_wav_sha256, || {})
+                .expect(
+                    "the configured WAV fixture must match its digest and decode from exact bytes",
+                ),
+        );
+        fs::create_dir_all(&storage).unwrap();
+        let staged = crate::onnx_model_bundles::stage_onnx_bundle_install(
+            &model_id,
+            &storage,
+            &cancellation,
+            &|_| {},
+        )
+        .unwrap();
+        let mut config = AppConfig::default();
+        config.performance.acceleration_preference = AccelerationPreference::Cpu;
+        let service = TranscriptionService::new(config);
+        let verified = service
+            .verify_onnx_bundle_for_installation(staged, &cancellation)
+            .unwrap();
+        assert_eq!(
+            verified.smoke().resolved_acceleration.resolved,
+            ComputeDevice::Cpu
+        );
+        let execution_result = service.transcribe_onnx_bundle_from_receipt(
+            verified.root(),
+            audio,
+            TranscriptionOptions::default(),
+        );
+        let unload_result = service.unload_runtime_artifacts();
+        let execution = match (execution_result, unload_result) {
+            (Ok(execution), Ok(())) => execution,
+            (Err(error), _) => {
+                let _ = verified.discard();
+                panic!("pre-activation fixture decode failed: {error:#}");
+            }
+            (Ok(_), Err(error)) => {
+                let _ = verified.discard();
+                panic!("pre-activation fixture unload failed: {error:#}");
+            }
+        };
+        let actual = normalize_fixture_transcript(&execution.transcript.text);
+        let expected = normalize_fixture_transcript(&expected_text);
+        if actual != expected {
+            let _ = verified.discard();
+            panic!(
+                "fixture transcript must equal the required normalized expected text before activation: expected {expected:?}, got {actual:?}"
+            );
+        }
+        let activated = verified.activate().unwrap();
+        activated.commit().unwrap();
+    }
+
+    #[test]
+    fn onnx_same_model_reuses_warm_and_changed_model_evicts_first() {
+        let (first_root, first) = onnx_spec("same-model-first", OnnxModelFamily::NemoCtc);
+        let (second_root, second) = onnx_spec("same-model-second", OnnxModelFamily::NemoCtc);
+        let (service, control, spawn_count) = onnx_test_service(AccelerationPreference::Cpu);
+
+        let cold = service
+            .preload_runtime_artifact(RuntimeArtifact::OnnxBundle(first.clone()))
+            .unwrap();
+        let warm = service
+            .preload_runtime_artifact(RuntimeArtifact::OnnxBundle(first))
+            .unwrap();
+        let replacement = service
+            .preload_runtime_artifact(RuntimeArtifact::OnnxBundle(second))
+            .unwrap();
+
+        assert!(!cold.diagnostics.warm_reused);
+        assert!(warm.diagnostics.warm_reused);
+        assert!(!replacement.diagnostics.warm_reused);
+        assert_eq!(spawn_count.load(Ordering::Acquire), 1);
+        let state = control.state.lock().unwrap();
+        assert_eq!(state.maximum_loaded_models, 1);
+        assert_eq!(
+            state.events,
+            [
+                "load:private-same-model-first",
+                "evict:private-same-model-first",
+                "load:private-same-model-second",
+            ]
+        );
+        drop(state);
+
+        service.unload_runtime_artifacts().unwrap();
+        drop(service);
+        fs::remove_dir_all(first_root).unwrap();
+        fs::remove_dir_all(second_root).unwrap();
+    }
+
+    #[test]
+    fn failed_onnx_load_discards_adapter_owner_and_cancellation_then_recovers_cold() {
+        let (first_root, first) = onnx_spec("failed-load-first", OnnxModelFamily::NemoCtc);
+        let (second_root, second) = onnx_spec("failed-load-second", OnnxModelFamily::NemoCtc);
+        let (service, control, spawn_count) = onnx_test_service(AccelerationPreference::Cpu);
+        service
+            .preload_runtime_artifact(RuntimeArtifact::OnnxBundle(first.clone()))
+            .unwrap();
+        control.fail_next_load();
+
+        let error = service
+            .preload_runtime_artifact(RuntimeArtifact::OnnxBundle(second))
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("deterministic ONNX load failure")
+        );
+        assert_eq!(service.router.onnx_state_for_test(), (false, false, false));
+        assert_eq!(service.router.runtime_activity().active_streams(), 0);
+        assert!(control.state.lock().unwrap().loaded.is_none());
+        let recovered = service
+            .preload_runtime_artifact(RuntimeArtifact::OnnxBundle(first))
+            .unwrap();
+        assert!(!recovered.diagnostics.warm_reused);
+        assert_eq!(spawn_count.load(Ordering::Acquire), 2);
+
+        service.unload_runtime_artifacts().unwrap();
+        drop(service);
+        fs::remove_dir_all(first_root).unwrap();
+        fs::remove_dir_all(second_root).unwrap();
+    }
+
+    #[test]
+    fn failed_model_replacement_during_stream_unloads_before_discard_and_recovers() {
+        let (first_root, first) = onnx_spec(
+            "stream-replacement-first",
+            OnnxModelFamily::OnlineTransducer,
+        );
+        let (second_root, second) = onnx_spec(
+            "stream-replacement-second",
+            OnnxModelFamily::OnlineTransducer,
+        );
+        let (service, control, spawn_count) = onnx_test_service(AccelerationPreference::Cpu);
+        let mut stream = service
+            .start_runtime_stream(
+                RuntimeArtifact::OnnxBundle(first.clone()),
+                TranscriptionOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(service.router.runtime_activity().active_streams(), 1);
+        control.fail_next_load();
+
+        let error = service
+            .preload_runtime_artifact(RuntimeArtifact::OnnxBundle(second))
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("deterministic ONNX load failure")
+        );
+        {
+            let state = control.state.lock().unwrap();
+            assert_eq!(state.unload_calls, 1);
+            assert_eq!(state.termination_calls, 0);
+            assert!(state.loaded.is_none());
+            assert!(state.stream.is_none());
+            assert_eq!(state.maximum_loaded_models, 1);
+        }
+        assert_eq!(service.router.onnx_state_for_test(), (false, false, false));
+        assert_eq!(service.router.runtime_activity().active_streams(), 0);
+        assert!(stream.push_audio(&[0.1]).is_err());
+        assert_eq!(spawn_count.load(Ordering::Acquire), 1);
+
+        let recovered = service
+            .preload_runtime_artifact(RuntimeArtifact::OnnxBundle(first))
+            .unwrap();
+        assert!(!recovered.diagnostics.warm_reused);
+        assert_eq!(spawn_count.load(Ordering::Acquire), 2);
+        drop(stream);
+
+        service.unload_runtime_artifacts().unwrap();
+        drop(service);
+        fs::remove_dir_all(first_root).unwrap();
+        fs::remove_dir_all(second_root).unwrap();
+    }
+
+    #[test]
+    fn failed_onnx_transcribe_discards_adapter_owner_and_cancellation() {
+        let (root, spec) = onnx_spec("failed-transcribe", OnnxModelFamily::NemoCtc);
+        let artifact = RuntimeArtifact::OnnxBundle(spec);
+        let (service, control, spawn_count) = onnx_test_service(AccelerationPreference::Cpu);
+        service.preload_runtime_artifact(artifact.clone()).unwrap();
+        control.fail_transcribe();
+
+        let error = service
+            .transcribe_runtime_artifact(
+                artifact.clone(),
+                prepared_audio(),
+                TranscriptionOptions::default(),
+            )
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("deterministic ONNX transcribe failure")
+        );
+        assert_eq!(service.router.onnx_state_for_test(), (false, false, false));
+        assert_eq!(service.router.runtime_activity().active_streams(), 0);
+        let recovered = service.preload_runtime_artifact(artifact).unwrap();
+        assert!(!recovered.diagnostics.warm_reused);
+        assert_eq!(spawn_count.load(Ordering::Acquire), 2);
+
+        service.unload_runtime_artifacts().unwrap();
+        drop(service);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_onnx_health_and_stream_start_discard_adapter_state() {
+        let (health_root, health_spec) = onnx_spec("failed-health", OnnxModelFamily::NemoCtc);
+        let (health_service, health_control, _) = onnx_test_service(AccelerationPreference::Cpu);
+        health_service
+            .preload_runtime_artifact(RuntimeArtifact::OnnxBundle(health_spec.clone()))
+            .unwrap();
+        health_control.state.lock().unwrap().fail_health = true;
+        assert!(
+            health_service
+                .health_check_runtime_artifact(RuntimeArtifact::OnnxBundle(health_spec))
+                .is_err()
+        );
+        assert_eq!(
+            health_service.router.onnx_state_for_test(),
+            (false, false, false)
+        );
+
+        let (stream_root, stream_spec) =
+            onnx_spec("failed-start", OnnxModelFamily::OnlineTransducer);
+        let (stream_service, stream_control, _) = onnx_test_service(AccelerationPreference::Cpu);
+        stream_control.state.lock().unwrap().fail_start_stream = true;
+        assert!(
+            stream_service
+                .start_runtime_stream(
+                    RuntimeArtifact::OnnxBundle(stream_spec),
+                    TranscriptionOptions::default(),
+                )
+                .is_err()
+        );
+        assert_eq!(
+            stream_service.router.onnx_state_for_test(),
+            (false, false, false)
+        );
+        assert_eq!(stream_service.router.runtime_activity().active_streams(), 0);
+
+        drop(health_service);
+        drop(stream_service);
+        fs::remove_dir_all(health_root).unwrap();
+        fs::remove_dir_all(stream_root).unwrap();
+    }
+
+    #[test]
+    fn private_onnx_gpu_request_fails_before_supervisor_spawn() {
+        let (root, spec) = onnx_spec("gpu-rejected", OnnxModelFamily::NemoCtc);
+        let (service, _control, spawn_count) = onnx_test_service(AccelerationPreference::Gpu);
+
+        let error = service
+            .preload_runtime_artifact(RuntimeArtifact::OnnxBundle(spec))
+            .unwrap_err();
+
+        assert!(error.to_string().contains("CPU-only"));
+        assert!(error.to_string().contains("Auto or CPU only"));
+        assert_eq!(spawn_count.load(Ordering::Acquire), 0);
+        drop(service);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn private_onnx_stream_maps_partial_final_cancel_and_rejects_offline_bundle() {
+        let (online_root, online) = onnx_spec("online-stream", OnnxModelFamily::OnlineTransducer);
+        let (offline_root, offline) = onnx_spec("offline-stream", OnnxModelFamily::NemoCtc);
+        let (service, control, _spawn_count) = onnx_test_service(AccelerationPreference::Auto);
+
+        let mut stream = service
+            .start_runtime_stream(
+                RuntimeArtifact::OnnxBundle(online.clone()),
+                TranscriptionOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(service.router.runtime_activity().active_streams(), 1);
+        assert_eq!(
+            stream.push_audio(&[0.1]).unwrap(),
+            StreamUpdate {
+                committed: String::new(),
+                tentative: "partial-1".to_owned(),
+            }
+        );
+        assert_eq!(stream.push_audio(&[-0.1]).unwrap().tentative, "partial-2");
+        let final_transcript = stream.finalize().unwrap();
+        assert_eq!(service.router.runtime_activity().active_streams(), 0);
+        assert_eq!(final_transcript.text, "final-2");
+        assert!(final_transcript.segments.is_empty());
+        assert_eq!(final_transcript.detected_language, None);
+
+        let stream = service
+            .start_runtime_stream(
+                RuntimeArtifact::OnnxBundle(online.clone()),
+                TranscriptionOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(service.router.runtime_activity().active_streams(), 1);
+        stream.cancel().unwrap();
+        assert_eq!(service.router.runtime_activity().active_streams(), 0);
+        assert_eq!(control.state.lock().unwrap().stream_cancels, 1);
+
+        let stream = service
+            .start_runtime_stream(
+                RuntimeArtifact::OnnxBundle(online.clone()),
+                TranscriptionOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(service.router.runtime_activity().active_streams(), 1);
+        drop(stream);
+        assert_eq!(service.router.runtime_activity().active_streams(), 0);
+        assert_eq!(control.state.lock().unwrap().stream_cancels, 2);
+
+        let error = service
+            .start_runtime_stream(
+                RuntimeArtifact::OnnxBundle(offline),
+                TranscriptionOptions::default(),
+            )
+            .err()
+            .expect("offline ONNX bundles must not return a stream handle");
+        assert!(error.to_string().contains("online ONNX transducer"));
+
+        drop(service);
+        fs::remove_dir_all(online_root).unwrap();
+        fs::remove_dir_all(offline_root).unwrap();
+    }
+
+    #[test]
+    fn explicit_unload_clears_active_stream_lease_and_native_stream() {
+        let (root, spec) = onnx_spec("explicit-stream-unload", OnnxModelFamily::OnlineTransducer);
+        let (service, control, _) = onnx_test_service(AccelerationPreference::Cpu);
+        let stream = service
+            .start_runtime_stream(
+                RuntimeArtifact::OnnxBundle(spec),
+                TranscriptionOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(service.router.runtime_activity().active_streams(), 1);
+
+        service.unload_runtime_artifacts().unwrap();
+
+        assert_eq!(service.router.runtime_activity().active_streams(), 0);
+        assert_eq!(control.state.lock().unwrap().unloaded_active_streams, 1);
+        assert_eq!(service.router.onnx_state_for_test(), (false, false, false));
+        drop(stream);
+        assert_eq!(service.router.runtime_activity().active_streams(), 0);
+
+        drop(service);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn active_onnx_batch_cancel_does_not_wait_for_router_state_lock() {
+        let (root, spec) = onnx_spec("batch-cancel", OnnxModelFamily::NemoCtc);
+        let artifact = RuntimeArtifact::OnnxBundle(spec);
+        let (service, control, _spawn_count) = onnx_test_service(AccelerationPreference::Cpu);
+        service.preload_runtime_artifact(artifact.clone()).unwrap();
+        control.set_block_batch();
+
+        let worker_service = service.clone();
+        let batch = std::thread::spawn(move || {
+            worker_service.transcribe_runtime_artifact(
+                artifact,
+                prepared_audio(),
+                TranscriptionOptions::default(),
+            )
+        });
+        control.wait_for_batch();
+        let cancel_started = Instant::now();
+        service.cancel_active();
+        let error = batch.join().unwrap().unwrap_err();
+
+        assert!(
+            cancel_started.elapsed() <= Duration::from_millis(250),
+            "ONNX cancellation waited for the router state mutex"
+        );
+        assert!(error.to_string().contains("cancelled"));
+        assert_eq!(control.state.lock().unwrap().cancel_active_calls, 1);
+
+        drop(service);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

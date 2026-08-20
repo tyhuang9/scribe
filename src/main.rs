@@ -16,12 +16,19 @@ mod installed_manifest;
 mod managed_downloads;
 mod model_catalog;
 mod models;
+// This delivery unit intentionally exposes only private service hooks; a later
+// coordinator branch may call its install APIs without widening product types.
+#[allow(dead_code)]
+mod onnx_model_bundles;
+mod onnx_worker;
 mod overlay;
 mod prepared_audio;
 mod runtime_catalog;
 mod runtime_router;
+mod silero_vad_native;
 mod streaming;
 mod stt;
+mod support_assets;
 mod text_output;
 mod transcription;
 mod tray;
@@ -41,11 +48,17 @@ enum LinuxDisplayBackend {
 }
 
 fn main() -> eframe::Result<()> {
+    if let Some(exit_code) = onnx_worker::maybe_run_worker() {
+        std::process::exit(exit_code);
+    }
     if let Some(exit_code) = transcription::maybe_run_installation_smoke_helper() {
         std::process::exit(exit_code);
     }
     if let Some(exit_code) = benchmark::maybe_run_local_command() {
         std::process::exit(exit_code);
+    }
+    if let Err(error) = support_assets::materialize_bundled_support_assets() {
+        eprintln!("Scribe support assets are unavailable: {error:#}");
     }
     configure_graphics_environment();
 
