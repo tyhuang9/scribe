@@ -11,7 +11,7 @@ use super::{
     about_page,
     controls::{
         ButtonTone, Icon, button, card, focus_tooltip, icon_glyph, keycap, keycap_width,
-        paint_focus_ring,
+        paint_focus_ring, search_field,
     },
     state::{
         ComparisonPhase, ComparisonResultPhase, ModelCardKey, ModelComparisonState, ModelDialog,
@@ -4232,15 +4232,19 @@ fn models(
     );
     ui.add_space(18.0);
     let mut query = remote_catalog.query.clone();
-    let search = ui.add_sized(
-        [ui.available_width(), 44.0],
-        egui::TextEdit::singleline(&mut query)
-            .id_source("models-search")
-            .hint_text("Search models by name, language, or variant"),
+    let search = search_field(
+        ui,
+        "models-search",
+        &mut query,
+        "Search models",
+        "Search models by name, language, or variant",
+        "Filters installed and available models as you type.",
     );
-    ui.ctx().accesskit_node_builder(search.id, |builder| builder.set_name("Search models"));
-    if search.changed() {
+    if search.changed {
         action = ScreenAction::SetRemoteCatalogQuery(query);
+    }
+    if search.clear_requested {
+        action = ScreenAction::SetRemoteCatalogQuery(String::new());
     }
     ui.add_space(8.0);
     ui.horizontal(|ui| {
@@ -4283,18 +4287,23 @@ fn models(
         });
     });
     ui.add_space(8.0);
-    let status = ui.label(RichText::new(&remote_catalog.status.message).color(
-        match remote_catalog.status.kind {
-            RemoteCatalogStatusKind::Error => colors.error,
-            RemoteCatalogStatusKind::Offline => colors.warning,
-            _ => colors.muted_text,
-        },
-    ));
-    ui.ctx().accesskit_node_builder(status.id, |builder| {
-        builder.set_role(egui::accesskit::Role::Status);
-        builder.set_live(egui::accesskit::Live::Polite);
-        builder.set_live_atomic();
-    });
+    if matches!(
+        remote_catalog.status.kind,
+        RemoteCatalogStatusKind::Loading | RemoteCatalogStatusKind::Error | RemoteCatalogStatusKind::Idle
+    ) {
+        let status = ui.label(RichText::new(&remote_catalog.status.message).color(
+            match remote_catalog.status.kind {
+                RemoteCatalogStatusKind::Error => colors.error,
+                RemoteCatalogStatusKind::Offline => colors.warning,
+                _ => colors.muted_text,
+            },
+        ));
+        ui.ctx().accesskit_node_builder(status.id, |builder| {
+            builder.set_role(egui::accesskit::Role::Status);
+            builder.set_live(egui::accesskit::Live::Polite);
+            builder.set_live_atomic();
+        });
+    }
     if let Some(summary) = management.install_status_summary.as_deref() {
         ui.add_space(6.0);
         let aggregate_status = ui
@@ -4340,19 +4349,16 @@ fn models(
     } else {
         MODEL_COMPARISON_COLLAPSED_HEIGHT
     };
-    let result_count = ui.label(
-        RichText::new(format!(
-            "{} model results: {} installed, {} available.",
-            installed_cards.len() + available_cards.len(),
-            installed_cards.len(),
-            available_cards.len()
-        ))
-        .small()
-        .color(colors.muted_text),
-    );
+    let result_count = ui.allocate_response(egui::Vec2::ZERO, Sense::hover());
     ui.ctx()
         .accesskit_node_builder(result_count.id, |builder| {
             builder.set_role(egui::accesskit::Role::Status);
+            builder.set_name(format!(
+                "{} model results: {} installed, {} available.",
+                installed_cards.len() + available_cards.len(),
+                installed_cards.len(),
+                available_cards.len()
+            ));
             builder.set_live(egui::accesskit::Live::Polite);
             builder.set_live_atomic();
         });

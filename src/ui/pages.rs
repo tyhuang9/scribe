@@ -5,6 +5,8 @@ use eframe::egui::{self, RichText};
 
 use crate::history::{HistoryRecord, HistoryStatus};
 
+use super::controls::{ButtonTone, button, search_field};
+
 fn semantic_heading(ui: &mut egui::Ui, text: RichText) -> egui::Response {
     let response = ui.label(text);
     ui.ctx().accesskit_node_builder(response.id, |builder| {
@@ -37,6 +39,7 @@ fn set_collapsing_header_accessibility<R>(
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum HistoryPageAction {
     ApplySearch,
+    ClearSearch,
     Refresh,
     LoadMore,
     Copy { text: String, label: &'static str },
@@ -86,29 +89,27 @@ pub(crate) fn history_page(
     } = state;
     let mut action = None;
     ui.horizontal(|ui| {
-        let label = ui.label("Search history");
-        let search_response = ui.add_sized(
-            [(ui.available_width() - 188.0).max(120.0), 44.0],
-            egui::TextEdit::singleline(search).hint_text("Search transcript, model, or app"),
+        let search_response = search_field(
+            ui,
+            "history-search",
+            search,
+            "Search history",
+            "Search transcript, model, or app",
+            "Enter a query, then choose Search or press Enter to filter saved history.",
         );
-        search_response.clone().labelled_by(label.id);
         if focus_search {
-            search_response.request_focus();
+            search_response.input.request_focus();
         }
-        let enter =
-            search_response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
-        if ui
-            .add_sized([86.0, 44.0], egui::Button::new("Search"))
-            .clicked()
-            || enter
-        {
+        let enter = search_response.input.has_focus()
+            && ui.input(|input| input.key_pressed(egui::Key::Enter));
+        if button(ui, "Search", ButtonTone::Secondary).clicked() || enter {
             action = Some(HistoryPageAction::ApplySearch);
         }
-        if ui
-            .add_sized([86.0, 44.0], egui::Button::new("Refresh"))
-            .clicked()
-        {
+        if button(ui, "Refresh", ButtonTone::Secondary).clicked() {
             action = Some(HistoryPageAction::Refresh);
+        }
+        if search_response.clear_requested {
+            action = Some(HistoryPageAction::ClearSearch);
         }
     });
 

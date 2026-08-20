@@ -5767,6 +5767,13 @@ impl LocalTranscriberApp {
                 self.history_next = None;
                 self.request_history_page(false);
             }
+            HistoryPageAction::ClearSearch => {
+                self.history_search.clear();
+                self.history_applied_search.clear();
+                self.history_records.clear();
+                self.history_next = None;
+                self.request_history_page(false);
+            }
             HistoryPageAction::Refresh => self.request_history_page(false),
             HistoryPageAction::LoadMore => self.request_history_page(true),
             HistoryPageAction::Copy { text, label } => self.copy_text_to_clipboard(&text, label),
@@ -14557,9 +14564,15 @@ mod layout_tests {
                     .name()
                     .is_some_and(|name| name.contains("trusted catalog models only"))
         }));
+        assert!(!update.nodes.iter().any(|(_, node)| {
+            node.name()
+                .is_some_and(|name| name.contains("trusted catalog") && name.contains("Showing"))
+        }));
         assert!(update.nodes.iter().any(|(_, node)| {
             node.role() == egui::accesskit::Role::Status
-                && node.name() == Some("Bundled trusted catalog · Showing 1 of 1 models.")
+                && node
+                    .name()
+                    .is_some_and(|name| name.contains("model results:"))
                 && node.live() == Some(egui::accesskit::Live::Polite)
                 && node.is_live_atomic()
         }));
@@ -16960,6 +16973,88 @@ mod layout_tests {
         }
         assert_eq!(app.history_records.len(), 1);
         assert_eq!(app.history_records[0].id, record.id);
+        drop(app);
+        drop(store);
+        let _ = std::fs::remove_dir_all(history_root);
+    }
+
+    #[test]
+    fn clearing_history_search_immediately_loads_an_unfiltered_first_page() {
+        let mut app = test_app();
+        let history_root = std::env::temp_dir().join(format!(
+            "scribe-history-clear-search-{}-{}",
+            std::process::id(),
+            NEXT_TEST_SESSION.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&history_root);
+        let store = HistoryStore::open(&history_root, HistoryRetentionPolicy::default()).unwrap();
+        for text in ["matching transcript", "other transcript"] {
+            let record = store
+                .create_pending(
+                    NewHistoryEntry {
+                        raw_text: text.into(),
+                        model_id: "model".into(),
+                        source_app: None,
+                        metrics: HistoryMetrics::default(),
+                    },
+                    None,
+                )
+                .unwrap();
+            store
+                .complete(
+                    record.id,
+                    CompletedHistoryEntry {
+                        raw_text: text.into(),
+                        final_text: text.into(),
+                        metrics: HistoryMetrics::default(),
+                    },
+                )
+                .unwrap();
+        }
+        app.history_store = Some(store.clone());
+        app.history_search = "matching".into();
+        app.history_applied_search = "matching".into();
+        app.history_records = store
+            .search(HistoryQuery {
+                text: Some("matching".into()),
+                limit: 20,
+                ..HistoryQuery::default()
+            })
+            .unwrap()
+            .records;
+        assert_eq!(app.history_records.len(), 1);
+
+        app.apply_history_action(HistoryPageAction::ClearSearch);
+
+        assert!(app.history_search.is_empty());
+        assert!(app.history_applied_search.is_empty());
+        assert!(app.history_records.is_empty());
+        assert!(
+            app.history_loading,
+            "clear must start the page-one reload directly"
+        );
+        assert_eq!(app.history_next, None);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while app.history_loading {
+            app.poll_events();
+            assert!(
+                Instant::now() < deadline,
+                "unfiltered history query did not finish"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(app.history_records.len(), 2);
+        assert!(
+            app.history_records
+                .iter()
+                .any(|record| record.raw_text == "matching transcript")
+        );
+        assert!(
+            app.history_records
+                .iter()
+                .any(|record| record.raw_text == "other transcript")
+        );
         drop(app);
         drop(store);
         let _ = std::fs::remove_dir_all(history_root);
