@@ -496,20 +496,6 @@ fn render_live_status_row(ui: &mut egui::Ui, state: &OverlayViewState, colors: O
                 .color(colors.muted_text),
         );
         render_divider(ui, colors);
-        if let Some(marker_text) = live_estimate_marker(state) {
-            let marker = ui.label(
-                RichText::new(marker_text)
-                    .size(11.0)
-                    .strong()
-                    .color(colors.tentative_text),
-            );
-            ui.ctx().accesskit_node_builder(marker.id, |builder| {
-                builder.set_role(egui::accesskit::Role::StaticText);
-                builder.set_name("Live estimate");
-                builder.set_description("The following words may change until recording ends.");
-            });
-            ui.add_space(4.0);
-        }
         let response = ui.label(live_preview_layout(ui, state, colors, ui.available_width()));
         ui.ctx().accesskit_node_builder(response.id, |builder| {
             builder.set_name(live_accessible_text(state));
@@ -526,11 +512,6 @@ fn render_live_status_row(ui: &mut egui::Ui, state: &OverlayViewState, colors: O
             });
         }
     });
-}
-
-pub(super) fn live_estimate_marker(state: &OverlayViewState) -> Option<&'static str> {
-    (state.error.is_none() && state.notice.is_none() && !state.transcript.tentative.is_empty())
-        .then_some("Estimate")
 }
 
 pub(super) fn live_overlay_announcement(state: &OverlayViewState) -> Option<&str> {
@@ -1178,7 +1159,7 @@ mod tests {
     }
 
     #[test]
-    fn constrained_live_overlay_keeps_estimate_marker_separate_in_both_themes() {
+    fn constrained_live_overlay_keeps_estimate_semantics_on_the_transcript_in_both_themes() {
         for visuals in [egui::Visuals::light(), egui::Visuals::dark()] {
             let context = egui::Context::default();
             context.set_visuals(visuals);
@@ -1205,10 +1186,6 @@ mod tests {
                 |context| render_overlay(context, &state),
             );
             let nodes = output.platform_output.accesskit_update.unwrap().nodes;
-            let marker = nodes
-                .iter()
-                .find_map(|(_, node)| (node.name() == Some("Live estimate")).then_some(node))
-                .expect("constrained overlay must retain a separate estimate marker");
             let preview = nodes
                 .iter()
                 .find_map(|(_, node)| {
@@ -1217,18 +1194,19 @@ mod tests {
                         .then_some(node)
                 })
                 .expect("constrained overlay must retain transcript content");
-            let marker_bounds = marker.bounds().expect("estimate marker bounds");
             let preview_bounds = preview.bounds().expect("preview bounds");
             let boundary = f64::from(width - reserved_control_width());
 
-            assert_eq!(marker.role(), egui::accesskit::Role::StaticText);
-            assert!(marker.live().is_none());
-            assert_eq!(
-                marker.description(),
-                Some("The following words may change until recording ends.")
+            assert!(
+                preview
+                    .name()
+                    .is_some_and(|name| name.contains("Live estimate, may change:"))
             );
-            assert!(marker_bounds.x1 <= preview_bounds.x0);
-            assert!(marker_bounds.x0 >= 0.0 && marker_bounds.x1 <= boundary);
+            assert!(
+                nodes
+                    .iter()
+                    .all(|(_, node)| node.name() != Some("Live estimate"))
+            );
             assert!(preview_bounds.x0 >= 0.0 && preview_bounds.x1 <= boundary);
         }
     }

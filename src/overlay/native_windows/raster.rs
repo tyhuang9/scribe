@@ -24,10 +24,7 @@ use super::{
     super::{
         controller::{OverlayMode, OverlayPhase, OverlayRecovery, OverlayViewState},
         platform::OverlayWindowBounds,
-        view::{
-            CONTROL_SIZE, LIVE_HEIGHT, LIVE_WIDTH, MINIMAL_HEIGHT, MINIMAL_WIDTH,
-            live_estimate_marker,
-        },
+        view::{CONTROL_SIZE, LIVE_HEIGHT, LIVE_WIDTH, MINIMAL_HEIGHT, MINIMAL_WIDTH},
     },
     layout::DisplayLayout,
 };
@@ -373,28 +370,7 @@ fn draw_live(
     )?;
 
     let preview = layout.preview.expect("live layout includes preview bounds");
-    let mut text_x = preview.x0;
-    let mut max_width = preview.width();
-    if let Some(marker) = live_estimate_marker(state) {
-        let marker_font_size = 11.0 * scale;
-        let marker_width = canvas
-            .measure_text(marker, marker_font_size, TextStyle::Bold)?
-            .min(max_width);
-        canvas.draw_text(
-            marker,
-            text_x,
-            preview.y0,
-            marker_width,
-            preview.height(),
-            marker_font_size,
-            TextStyle::Bold,
-            colors.tentative_text,
-        )?;
-        let marker_gap = 6.0 * scale;
-        let marker_reservation = (marker_width + marker_gap).min(max_width);
-        text_x += marker_reservation;
-        max_width -= marker_reservation;
-    }
+    let max_width = preview.width();
     let line = live_line(state, colors);
     let line = if state.error.is_some() || state.notice.is_some() {
         fit_head(
@@ -415,7 +391,7 @@ fn draw_live(
     };
     canvas.draw_styled_line(
         &line,
-        text_x,
+        preview.x0,
         preview.y0,
         max_width,
         preview.height(),
@@ -1392,6 +1368,54 @@ mod tests {
             .filter(|pixel| pixel[3] > 0)
             .count();
         assert!(painted < 44 * 44 / 3);
+    }
+
+    #[test]
+    fn pr50_native_overlay_raster_golden_frames_are_pixel_identical() {
+        let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata")
+            .join("overlay-pr50");
+        let scales = [(1, 1, "96"), (5, 4, "120"), (3, 2, "144"), (2, 1, "192")];
+
+        with_rasterizer(|rasterizer| {
+            for (numerator, denominator, dpi) in scales {
+                for (dark, theme) in [(false, "light"), (true, "dark")] {
+                    for (mode, name, logical_width, logical_height) in [
+                        (OverlayMode::Live, "live", 600, 62),
+                        (OverlayMode::Minimal, "compact", 320, 52),
+                    ] {
+                        let frame = rasterizer
+                            .render_display(
+                                &state(mode),
+                                dark,
+                                logical_width * numerator / denominator,
+                                logical_height * numerator / denominator,
+                            )
+                            .expect("render overlay fixture frame");
+                        assert_eq!(
+                            frame.pixels,
+                            std::fs::read(fixture_root.join(format!("{name}-{theme}-{dpi}.bgra")))
+                                .expect("read immutable PR50 overlay fixture"),
+                            "{name} {theme} at {dpi} DPI diverged from PR50"
+                        );
+                    }
+
+                    let control = rasterizer
+                        .render_control(
+                            dark,
+                            44 * numerator / denominator,
+                            44 * numerator / denominator,
+                        )
+                        .expect("render cancel-control fixture frame");
+                    assert_eq!(
+                        control.pixels,
+                        std::fs::read(fixture_root.join(format!("cancel-{theme}-{dpi}.bgra")))
+                            .expect("read immutable PR50 cancel-control fixture"),
+                        "cancel control {theme} at {dpi} DPI diverged from PR50"
+                    );
+                }
+            }
+        });
     }
 
     #[test]
