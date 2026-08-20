@@ -375,7 +375,9 @@ mod tests {
         assert!(tree.nodes.iter().any(|(id, node)| {
             *id == DISPLAY_PREVIEW_ID
                 && node.name()
-                    == Some("Committed transcript: committed. Tentative transcript:  tentative")
+                    == Some(
+                        "Committed transcript: committed. Live estimate, may change:  tentative",
+                    )
         }));
         assert!(tree.nodes.iter().any(|(id, node)| {
             *id == DISPLAY_ELAPSED_ID

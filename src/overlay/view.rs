@@ -690,7 +690,7 @@ pub(super) fn live_accessible_text(state: &OverlayViewState) -> String {
         format!("Committed transcript: {}", state.transcript.committed)
     } else {
         format!(
-            "Committed transcript: {}. Tentative transcript: {}",
+            "Committed transcript: {}. Live estimate, may change: {}",
             state.transcript.committed, state.transcript.tentative
         )
     }
@@ -1145,7 +1145,7 @@ mod tests {
         for name in [
             "Microphone input level",
             "00:05",
-            "Committed transcript: committed text. Tentative transcript: tentative text",
+            "Committed transcript: committed text. Live estimate, may change: tentative text",
         ] {
             let bounds = nodes
                 .iter()
@@ -1404,13 +1404,14 @@ mod tests {
         );
         assert!(update.nodes.iter().any(|(_, node)| {
             node.live().is_none()
-                && node.name() == Some("Committed transcript: hello. Tentative transcript: world")
+                && node.name()
+                    == Some("Committed transcript: hello. Live estimate, may change: world")
         }));
         assert!(update.nodes.iter().all(|(_, node)| {
             node.live() != Some(egui::accesskit::Live::Polite)
                 || !node
                     .name()
-                    .is_some_and(|name| name.contains("Tentative transcript"))
+                    .is_some_and(|name| name.contains("Live estimate"))
         }));
         assert!(update.nodes.iter().any(|(_, node)| {
             node.role() == egui::accesskit::Role::ProgressIndicator
