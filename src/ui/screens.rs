@@ -840,19 +840,6 @@ fn selector_row(
             );
             response
                 .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, action_label));
-            ui.ctx().accesskit_node_builder(response.id, |builder| {
-                builder.set_role(egui::accesskit::Role::Button);
-                builder.set_name(action_label);
-                builder.set_bounds(egui::accesskit::Rect {
-                    x0: action_rect.min.x.into(),
-                    y0: action_rect.min.y.into(),
-                    x1: action_rect.max.x.into(),
-                    y1: action_rect.max.y.into(),
-                });
-                if !response.enabled() {
-                    builder.set_disabled();
-                }
-            });
             paint_focus_ring(ui, &response, Rounding::same(5.0));
             if let Some(reason) = model_disabled_reason {
                 ui.ctx().accesskit_node_builder(response.id, |builder| {
@@ -877,11 +864,32 @@ fn selector_row(
                     });
                 }
             }
+            let picker_open =
+                ui.memory(|memory| memory.is_popup_open(egui::Id::new("quick-model-picker")));
+            ui.ctx().accesskit_node_builder(response.id, |builder| {
+                builder.set_role(egui::accesskit::Role::Button);
+                builder.set_name(action_label);
+                builder.set_description("Opens the installed ready-model picker.");
+                builder.set_expanded(picker_open);
+                builder.set_bounds(egui::accesskit::Rect {
+                    x0: action_rect.min.x.into(),
+                    y0: action_rect.min.y.into(),
+                    x1: action_rect.max.x.into(),
+                    y1: action_rect.max.y.into(),
+                });
+                if !response.enabled() {
+                    builder.set_disabled();
+                }
+            });
             if !no_model
                 && let Some(picker_action) = quick_model_picker(ui, &response, state, quick_models)
             {
                 action = picker_action;
             }
+            let picker_open =
+                ui.memory(|memory| memory.is_popup_open(egui::Id::new("quick-model-picker")));
+            ui.ctx()
+                .accesskit_node_builder(response.id, |builder| builder.set_expanded(picker_open));
             ui.ctx().accesskit_node_builder(model_card_id, |builder| {
                 builder.set_role(egui::accesskit::Role::Group);
                 builder.set_name("Selected model");
@@ -1075,6 +1083,12 @@ fn quick_model_picker(
 ) -> Option<ScreenAction> {
     let popup_id = egui::Id::new("quick-model-picker");
     let mut action = None;
+    if ui.memory(|memory| memory.is_popup_open(popup_id))
+        && ui.input(|input| input.key_pressed(egui::Key::Escape))
+    {
+        ui.memory_mut(|memory| memory.close_popup());
+        return None;
+    }
     egui::popup::popup_below_widget(ui, popup_id, anchor, |ui| {
         ui.set_min_width(anchor.rect.width().max(260.0));
         ui.label(RichText::new("Ready models").strong());
@@ -1121,17 +1135,16 @@ fn quick_model_picker(
                     egui::FontId::proportional(13.0),
                     visuals.text_color(),
                 );
+                let accessible_name = if current {
+                    format!("{}, current model", model.display_name)
+                } else {
+                    format!("Select {}", model.display_name)
+                };
                 response.widget_info(|| {
-                    egui::WidgetInfo::labeled(
-                        egui::WidgetType::Button,
-                        if current {
-                            "Current selected model"
-                        } else {
-                            "Select installed model"
-                        },
-                    )
+                    egui::WidgetInfo::labeled(egui::WidgetType::Button, accessible_name.clone())
                 });
                 ui.ctx().accesskit_node_builder(response.id, |builder| {
+                    builder.set_name(accessible_name.clone());
                     builder.set_selected(current);
                     if current {
                         builder.set_description("Current selected model");
@@ -8916,6 +8929,26 @@ mod tests {
                 .expect("Change action");
             let bounds = change.bounds().expect("Change bounds");
             assert!(bounds.width() >= 44.0 && bounds.height() >= 44.0);
+            assert_eq!(change.is_expanded(), Some(true));
+
+            let (closed, action) = render_selector_with_key(
+                &ctx,
+                &state,
+                &models,
+                egui::Id::new("selected-model-action"),
+                egui::Key::Escape,
+                false,
+            );
+            assert_eq!(action, ScreenAction::None);
+            let closed_change = closed
+                .platform_output
+                .accesskit_update
+                .unwrap()
+                .nodes
+                .into_iter()
+                .find_map(|(_, node)| (node.name() == Some("Change")).then_some(node))
+                .expect("closed Change action");
+            assert_eq!(closed_change.is_expanded(), Some(false));
 
             let _ = render_selector_with_key(
                 &ctx,
@@ -8936,13 +8969,12 @@ mod tests {
             assert_eq!(action, ScreenAction::SelectQuickModel("tiny.en".into()));
             let nodes = picker.platform_output.accesskit_update.unwrap().nodes;
             assert!(nodes.iter().any(|(_, node)| {
-                node.name() == Some("Current selected model") && node.is_selected() == Some(true)
+                node.name() == Some("Whisper Base, current model")
+                    && node.is_selected() == Some(true)
             }));
-            assert!(
-                nodes
-                    .iter()
-                    .any(|(_, node)| node.name() == Some("Select installed model"))
-            );
+            assert!(nodes.iter().any(|(_, node)| {
+                node.name() == Some("Select Whisper Tiny") && node.is_selected() == Some(false)
+            }));
             assert!(
                 !nodes
                     .iter()

@@ -9572,18 +9572,29 @@ impl LocalTranscriberApp {
             | ScreenAction::ChangeModel
             | ScreenAction::OpenModelSettings => self.current_tab = Tab::Models,
             ScreenAction::SelectQuickModel(id) => {
-                let selected_is_ready = self
-                    .remote_catalog
-                    .local_models
-                    .iter()
-                    .any(|model| model.id == id && model.installed && model.ready);
-                if selected_is_ready
-                    && let Some(model) = config::configured_models(&self.config)
-                        .into_iter()
-                        .find(|model| model.id == id)
+                let Some(model) = config::configured_models(&self.config)
+                    .into_iter()
+                    .find(|model| model.id == id)
+                else {
+                    self.status_message =
+                        "That model is no longer available. Refresh Models and choose a ready model."
+                            .to_owned();
+                    return;
+                };
+                if !self.effective_install_status(&model).is_runnable()
+                    || runtime_status_for_model(&self.config, &model) != ModelRuntimeStatus::Ready
                 {
-                    self.select_model_as_default(&model);
+                    self.status_message = format!(
+                        "{} is no longer ready. Repair it or choose another ready model in Models.",
+                        model.name
+                    );
+                    return;
                 }
+                if let Some(reason) = self.artifact_mutation_block_reason() {
+                    self.status_message = reason;
+                    return;
+                }
+                self.select_model_as_default(&model);
             }
             ScreenAction::StartHotkeyCapture => self.start_hotkey_capture(),
             ScreenAction::CancelHotkeyCapture => self.cancel_hotkey_capture(),
@@ -21393,6 +21404,31 @@ mod layout_tests {
         assert!(!app.capturing_hotkey);
         assert_eq!(app.hotkey_input, original);
         assert_eq!(app.status_message, "Hotkey capture cancelled.");
+    }
+
+    #[test]
+    fn quick_model_selection_revalidates_a_stale_ready_catalog_entry() {
+        let mut app = test_app();
+        let previous = app.config.general.selected_default_model.clone();
+        let mut cached_models = app.remote_catalog.local_models.to_vec();
+        cached_models.push(ModelViewModel {
+            id: "stale-ready-model".into(),
+            display_name: "Stale ready model".into(),
+            installed: true,
+            ready: true,
+            ..Default::default()
+        });
+        app.remote_catalog.local_models = cached_models.into();
+
+        app.apply_transcribe_screen_action(ScreenAction::SelectQuickModel(
+            "stale-ready-model".into(),
+        ));
+
+        assert_eq!(app.config.general.selected_default_model, previous);
+        assert_eq!(
+            app.status_message,
+            "That model is no longer available. Refresh Models and choose a ready model."
+        );
     }
 
     #[test]
