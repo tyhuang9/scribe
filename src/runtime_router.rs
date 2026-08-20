@@ -1997,9 +1997,16 @@ impl SpeechEngine for TranscribeCppRuntime {
         audio: &PreparedAudio,
         options: &TranscriptionOptions,
     ) -> anyhow::Result<Transcript> {
-        if *options != TranscriptionOptions::default() {
+        // The retained native shim always returns segment timing. Accept the
+        // preview-only request flag even though no additional native switch is
+        // necessary; final service requests remain default-only.
+        let supported_options = TranscriptionOptions {
+            enable_timestamps: options.enable_timestamps,
+            ..TranscriptionOptions::default()
+        };
+        if *options != supported_options {
             return Err(anyhow::anyhow!(
-                "the verified native whisper.cpp adapter currently accepts only default transcription options"
+                "the verified native whisper.cpp adapter currently accepts only default transcription options and preview timestamps"
             ));
         }
         if audio.sample_rate != PREPARED_SAMPLE_RATE

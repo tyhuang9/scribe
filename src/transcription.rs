@@ -266,19 +266,25 @@ pub struct TranscriptionOptions {
     pub initial_prompt: Option<String>,
 }
 
-/// Internal rolling-preview policy. Native runtimes that expose segment
-/// timing already return it with their ordinary decode result, so preview can
-/// opt into using that metadata without changing the caller-facing final
-/// transcription options or sending an unsupported decoder option.
+/// Internal rolling-preview policy. It is converted to decoder options only
+/// inside the preview worker, leaving caller-facing final transcription
+/// options and their default behavior unchanged.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct PreviewDecodeOptions {
     use_segment_timestamps: bool,
 }
 
 impl PreviewDecodeOptions {
-    fn for_capabilities(capabilities: &RuntimeCapabilities) -> Self {
+    pub(crate) fn for_capabilities(capabilities: &RuntimeCapabilities) -> Self {
         Self {
             use_segment_timestamps: capabilities.timestamps,
+        }
+    }
+
+    pub(crate) fn transcription_options(self) -> TranscriptionOptions {
+        TranscriptionOptions {
+            enable_timestamps: self.use_segment_timestamps,
+            ..TranscriptionOptions::default()
         }
     }
 }
@@ -1849,7 +1855,7 @@ impl TranscriptionService {
                     decode_model_id.clone(),
                 );
                 request.model_path = model_path.clone();
-                request.options = TranscriptionOptions::default();
+                request.options = preview_options.transcription_options();
                 let outcome = service.transcribe_preview(request)?;
                 let hypothesis = transcript_hypothesis(
                     hypothesis_identity,
@@ -1897,7 +1903,7 @@ impl TranscriptionService {
                 "rolling preview is unavailable for this model's verified native runtime"
             ));
         }
-        validate_default_options(&request.options)?;
+        validate_preview_options(&request.options)?;
         let model = self.resolve_model(&request.model_id, request.model_path.clone())?;
         let runtime_model = self.resolve_runtime_model(model.clone())?;
         let execution = self
@@ -2736,6 +2742,14 @@ fn validate_default_options(options: &TranscriptionOptions) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn validate_preview_options(options: &TranscriptionOptions) -> Result<()> {
+    let options_without_timestamps = TranscriptionOptions {
+        enable_timestamps: false,
+        ..options.clone()
+    };
+    validate_default_options(&options_without_timestamps)
 }
 
 fn capabilities_for_legacy_model(model: &SttModelInfo) -> RuntimeCapabilities {
@@ -4018,6 +4032,10 @@ mod tests {
         let disabled = PreviewDecodeOptions::for_capabilities(&RuntimeCapabilities::default());
         assert!(enabled.use_segment_timestamps);
         assert!(!disabled.use_segment_timestamps);
+        assert!(enabled.transcription_options().enable_timestamps);
+        assert!(!disabled.transcription_options().enable_timestamps);
+        assert!(validate_preview_options(&enabled.transcription_options()).is_ok());
+        assert!(validate_default_options(&enabled.transcription_options()).is_err());
 
         let transcript = Transcript {
             text: "fallback words".to_owned(),
