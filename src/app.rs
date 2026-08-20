@@ -809,6 +809,7 @@ impl LatencyTrace {
             compute_backend: self.compute_backend.clone(),
             streaming_mode: self.streaming_mode.clone(),
             cold_or_warm: self.cold_or_warm.clone(),
+            output_outcome: None,
             metrics: DiagnosticSessionMetrics {
                 hotkey_to_overlay_visible_ms: millis(
                     Some(self.activation_at),
@@ -4556,6 +4557,21 @@ impl LocalTranscriberApp {
             .record(latency.diagnostic_snapshot(session_id, outcome, failure_stage));
     }
 
+    fn record_output_session_diagnostic(
+        &mut self,
+        session_id: SessionId,
+        latency: &LatencyTrace,
+        outcome: DiagnosticSessionOutcome,
+        failure_stage: Option<DiagnosticFailureStage>,
+        output_result: &text_output::TextOutputResult,
+    ) {
+        let mut latency = latency.clone();
+        self.merge_overlay_presentation(session_id, &mut latency);
+        let mut diagnostic = latency.diagnostic_snapshot(session_id, outcome, failure_stage);
+        diagnostic.output_outcome = Some(output_result.diagnostic_label().to_owned());
+        self.diagnostics.record(diagnostic);
+    }
+
     fn poll_pending_output(&mut self) {
         self.poll_pending_output_with(text_output::write_to_captured_target);
     }
@@ -4606,7 +4622,13 @@ impl LocalTranscriberApp {
                 } else {
                     (DiagnosticSessionOutcome::Completed, None)
                 };
-            self.record_session_diagnostic(pending.session_id, latency, outcome, failure_stage);
+            self.record_output_session_diagnostic(
+                pending.session_id,
+                latency,
+                outcome,
+                failure_stage,
+                &result,
+            );
         }
         self.status_message = format!("{}. {}", pending.completion_message, output_message);
         self.latest_latency = self.merged_overlay_latency(pending.session_id, pending.latency);
@@ -4619,7 +4641,8 @@ impl LocalTranscriberApp {
             self.finish_overlay_error(pending.session_id, &output_message);
         } else if matches!(
             result,
-            text_output::TextOutputResult::InsertedClipboardRestoreFailed(_)
+            text_output::TextOutputResult::InsertedClipboardRestoreSkipped
+                | text_output::TextOutputResult::InsertedClipboardRestoreFailed(_)
         ) {
             self.status = TranscriptionStatus::Idle;
             if self.overlay_controller.show_error(
@@ -6158,33 +6181,7 @@ impl LocalTranscriberApp {
         history_id: i64,
         result: &text_output::TextOutputResult,
     ) {
-        let outcome = match result {
-            text_output::TextOutputResult::Inserted => "inserted",
-            text_output::TextOutputResult::InsertedClipboardRestoreFailed(_) => {
-                "inserted_clipboard_restore_failed"
-            }
-            text_output::TextOutputResult::CopiedOnly(
-                text_output::CopyOnlyReason::TargetUnavailable,
-            ) => "copied_only_target_unavailable",
-            text_output::TextOutputResult::CopiedOnly(
-                text_output::CopyOnlyReason::AutomationUnavailable,
-            ) => "copied_only_automation_unavailable",
-            text_output::TextOutputResult::CopiedOnly(text_output::CopyOnlyReason::PasteFailed) => {
-                "copied_only_paste_failed"
-            }
-            text_output::TextOutputResult::CopiedOnly(
-                text_output::CopyOnlyReason::ClipboardSnapshotUnavailable,
-            ) => "copied_only_clipboard_snapshot_unavailable",
-            text_output::TextOutputResult::CopiedOnly(
-                text_output::CopyOnlyReason::ClipboardSnapshotUnsupported,
-            ) => "copied_only_clipboard_snapshot_unsupported",
-            text_output::TextOutputResult::CopiedOnly(
-                text_output::CopyOnlyReason::ClipboardSnapshotError,
-            ) => "copied_only_clipboard_snapshot_error",
-            text_output::TextOutputResult::NotInserted(_) => "not_inserted_clipboard_changed",
-            text_output::TextOutputResult::Failed(_) => "failed",
-        }
-        .to_owned();
+        let outcome = result.diagnostic_label().to_owned();
         self.record_history_output_label(history_id, outcome);
     }
 
@@ -17213,6 +17210,19 @@ mod layout_tests {
             app.session_coordinator.last_terminal().unwrap().outcome,
             crate::core::TerminalOutcome::Completed
         );
+        let diagnostics_root = std::env::temp_dir().join(format!(
+            "scribe-output-outcome-diagnostics-{}-{}",
+            std::process::id(),
+            NEXT_TEST_SESSION.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&diagnostics_root);
+        let report = diagnostics::export_redacted(&diagnostics_root, &app.diagnostics).unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&fs::read(report).unwrap()).unwrap();
+        assert_eq!(
+            report["sessions"][0]["output_outcome"],
+            "inserted_clipboard_restore_failed"
+        );
+        let _ = fs::remove_dir_all(diagnostics_root);
     }
 
     #[test]
