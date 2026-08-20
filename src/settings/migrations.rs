@@ -887,6 +887,8 @@ mod tests {
         }));
 
         assert_eq!(config.general.selected_default_model, "whisper_cpp_base_en");
+        assert_eq!(config.recording.hotkey, "Ctrl+Space");
+        assert_eq!(config.recording.hotkey_mode, HotkeyMode::HoldToTalk);
         assert_eq!(config.recording.max_recording_seconds, 30);
         assert!(config.recording.vad_enabled);
         assert_eq!(config.recording.speech_confirmation_ms, 150);
@@ -937,6 +939,21 @@ mod tests {
             serde_json::to_value(config).unwrap()["recording"]["future_microphone_option"],
             json!({"kept": true})
         );
+    }
+
+    #[test]
+    fn explicit_hotkey_and_mode_are_preserved_without_a_schema_migration() {
+        let config = parse_settings_value(json!({
+            "schema_version": CURRENT_SCHEMA_VERSION,
+            "recording": {
+                "hotkey": "Alt+Shift+R",
+                "hotkey_mode": "toggle"
+            }
+        }));
+
+        assert_eq!(config.schema_version, CURRENT_SCHEMA_VERSION);
+        assert_eq!(config.recording.hotkey, "Alt+Shift+R");
+        assert_eq!(config.recording.hotkey_mode, HotkeyMode::Toggle);
     }
 
     #[test]
@@ -1102,7 +1119,7 @@ mod tests {
         assert!(config.general.model_paths.contains_key("valid"));
         assert!(!config.general.model_paths.contains_key("invalid"));
         assert_eq!(config.recording.hotkey, "Ctrl+Alt+R");
-        assert_eq!(config.recording.hotkey_mode, HotkeyMode::Toggle);
+        assert_eq!(config.recording.hotkey_mode, HotkeyMode::HoldToTalk);
         assert_eq!(config.recording.max_recording_seconds, 30);
         assert!(config.recording.vad_enabled);
         assert_eq!(config.recording.speech_confirmation_ms, 150);
