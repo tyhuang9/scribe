@@ -3414,6 +3414,10 @@ fn render_unified_model_card(
         ModelCard::Remote(entry, variant) => remote_variant_accessible_name(entry, variant),
     };
     let lifecycle = model_lifecycle_controls(card, can_replace_active);
+    let show_collapsed_remote_provenance = !expanded
+        && matches!(card, ModelCard::Remote(_, _))
+        && lifecycle.primary.enabled
+        && matches!(lifecycle.primary.label.as_str(), "Install" | "Resume");
     let title_selects_model =
         matches!(card, ModelCard::Local(model) if model.installed && model.ready && !model.active);
     let activation_id = ui.make_persistent_id(("select-model-card", card_key.clone()));
@@ -3569,6 +3573,17 @@ fn render_unified_model_card(
                 lifecycle_response
             }
         };
+        let render_collapsed_remote_provenance = |ui: &mut egui::Ui| {
+            if show_collapsed_remote_provenance && let ModelCard::Remote(entry, variant) = card {
+                render_model_layout_gap(ui, name, "install provenance gap", 8.0);
+                let heading = detail_heading(ui, "DOWNLOAD PROVENANCE", colors);
+                ui.ctx().accesskit_node_builder(heading.id, |builder| {
+                    builder.set_name("Download provenance");
+                });
+                render_model_layout_gap(ui, name, "install provenance content gap", 4.0);
+                render_remote_model_provenance_rows(ui, entry, variant);
+            }
+        };
         if compact {
             let identity_width = card_content_width;
             let identity = render_model_identity(ui, name, active, false, identity_width);
@@ -3615,6 +3630,7 @@ fn render_unified_model_card(
                 );
                 activation_exclusions.push(render_details(ui, &mut action, &mut focus_within).rect);
             });
+            render_collapsed_remote_provenance(ui);
         } else {
             let identity_width = card_content_width * 0.50;
             let metrics_width = card_content_width * 0.24;
@@ -3816,6 +3832,7 @@ fn render_unified_model_card(
                     }
                 });
             });
+            render_collapsed_remote_provenance(ui);
         }
         // The summary establishes the card width. Keep the divider and inline
         // details inside that measured width instead of letting expansion
@@ -4054,31 +4071,39 @@ fn render_inline_model_details(
                         builder.set_name("Model provenance");
                     });
                 render_model_layout_gap(ui, model_name, "provenance heading content gap", 6.0);
-                let publisher = ui.label(format!("{} · {}", entry.trust_label, entry.repository));
-                ui.ctx().accesskit_node_builder(publisher.id, |builder| {
-                    builder.set_name(format!(
-                        "Trusted source: {} from {}",
-                        entry.trust_label, entry.repository
-                    ));
-                });
-                let compatibility =
-                    ui.label(format!("Compatibility: {}", entry.compatibility_detail));
-                ui.ctx()
-                    .accesskit_node_builder(compatibility.id, |builder| {
-                        builder.set_name(format!("Compatibility: {}", entry.compatibility_detail));
-                    });
-                let revision = ui.label(format!("Pinned revision: {}", entry.pinned_revision));
-                ui.ctx().accesskit_node_builder(revision.id, |builder| {
-                    builder.set_name(format!("Pinned revision: {}", entry.pinned_revision));
-                });
-                let artifact = ui.label(format!("Artifact: {}", variant.filename));
-                ui.ctx().accesskit_node_builder(artifact.id, |builder| {
-                    builder.set_name(format!("Verified artifact: {}", variant.filename));
-                });
+                render_remote_model_provenance_rows(ui, entry, variant);
             }
         }
     });
     restored_remove_focus
+}
+
+fn render_remote_model_provenance_rows(
+    ui: &mut egui::Ui,
+    entry: &RemoteCatalogEntryView,
+    variant: &RemoteCatalogVariantView,
+) {
+    let trust = ui.label(format!("Trust: {}", entry.trust_label));
+    ui.ctx().accesskit_node_builder(trust.id, |builder| {
+        builder.set_name(format!("Trust: {}", entry.trust_label));
+    });
+    let repository = ui.label(format!("Repository: {}", entry.repository));
+    ui.ctx().accesskit_node_builder(repository.id, |builder| {
+        builder.set_name(format!("Repository: {}", entry.repository));
+    });
+    let compatibility = ui.label(format!("Compatibility: {}", entry.compatibility_detail));
+    ui.ctx()
+        .accesskit_node_builder(compatibility.id, |builder| {
+            builder.set_name(format!("Compatibility: {}", entry.compatibility_detail));
+        });
+    let revision = ui.label(format!("Pinned revision: {}", entry.pinned_revision));
+    ui.ctx().accesskit_node_builder(revision.id, |builder| {
+        builder.set_name(format!("Pinned revision: {}", entry.pinned_revision));
+    });
+    let artifact = ui.label(format!("Artifact: {}", variant.filename));
+    ui.ctx().accesskit_node_builder(artifact.id, |builder| {
+        builder.set_name(format!("Artifact: {}", variant.filename));
+    });
 }
 
 fn detail_heading(
@@ -8336,7 +8361,8 @@ mod tests {
             },
         );
         let expected = [
-            "Trusted publisher · trusted/compact",
+            "Trust: Trusted publisher",
+            "Repository: trusted/compact",
             "Compatibility: Validated for this device.",
             "Pinned revision: 1111111111111111111111111111111111111111",
             "Artifact: compact-q5.gguf",
@@ -8353,14 +8379,107 @@ mod tests {
         }
         let nodes = &output.platform_output.accesskit_update.unwrap().nodes;
         for value in [
-            "Trusted source: Trusted publisher from trusted/compact",
+            "Trust: Trusted publisher",
+            "Repository: trusted/compact",
             "Compatibility: Validated for this device.",
             "Pinned revision: 1111111111111111111111111111111111111111",
-            "Verified artifact: compact-q5.gguf",
+            "Artifact: compact-q5.gguf",
         ] {
             assert!(
                 nodes.iter().any(|(_, node)| node.name() == Some(value)),
                 "missing accessible provenance: {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn collapsed_actionable_remote_card_shows_complete_install_provenance() {
+        fn collect_text(shape: &egui::epaint::Shape, text: &mut Vec<String>) {
+            match shape {
+                egui::epaint::Shape::Text(text_shape) => {
+                    text.push(text_shape.galley.text().to_owned())
+                }
+                egui::epaint::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        collect_text(shape, text);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let entry = RemoteCatalogEntryView {
+            id: "trusted/actionable".into(),
+            display_name: "Actionable English".into(),
+            trust_label: "Trusted publisher".into(),
+            repository: "trusted/actionable".into(),
+            pinned_revision: "2222222222222222222222222222222222222222".into(),
+            compatibility_detail: "Validated for this device.".into(),
+            ..Default::default()
+        };
+        let variant = RemoteCatalogVariantView {
+            id: "actionable-q5".into(),
+            filename: "actionable-q5.gguf".into(),
+            actions: vec![RemoteCatalogActionView {
+                label: "Install".into(),
+                kind: RemoteCatalogActionKind::Install {
+                    remote_model_id: entry.id.clone(),
+                    variant_id: "actionable-q5".into(),
+                },
+                enabled: true,
+                disabled_reason: None,
+            }],
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        crate::ui::controls::configure_accessible_style(&ctx);
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(960.0, 900.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    render_unified_model_card(
+                        ui,
+                        ModelCard::Remote(&entry, &variant),
+                        false,
+                        false,
+                        false,
+                    );
+                });
+            },
+        );
+        let provenance = [
+            "Trust: Trusted publisher",
+            "Repository: trusted/actionable",
+            "Compatibility: Validated for this device.",
+            "Pinned revision: 2222222222222222222222222222222222222222",
+            "Artifact: actionable-q5.gguf",
+        ];
+        let mut painted = Vec::new();
+        for shape in &output.shapes {
+            collect_text(&shape.shape, &mut painted);
+        }
+        for value in provenance {
+            assert!(
+                painted.iter().any(|text| text == value),
+                "missing collapsed visible provenance: {value}; painted={painted:?}"
+            );
+        }
+        let nodes = &output.platform_output.accesskit_update.unwrap().nodes;
+        assert!(nodes.iter().any(|(_, node)| {
+            node.name() == Some("Install Actionable English (actionable-q5.gguf)")
+                && !node.is_disabled()
+        }));
+        for value in provenance {
+            assert!(
+                nodes.iter().any(|(_, node)| node.name() == Some(value)),
+                "missing collapsed accessible provenance: {value}"
             );
         }
     }

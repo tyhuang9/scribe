@@ -168,6 +168,8 @@ pub(crate) struct SearchFieldResponse {
     pub input: Response,
     #[cfg(test)]
     pub clear: Response,
+    #[cfg(test)]
+    pub surface: egui::Rect,
     pub changed: bool,
     pub clear_requested: bool,
 }
@@ -202,31 +204,50 @@ pub(crate) fn search_field(
         colors.card_bg,
         Stroke::new(1.0, colors.border_strong),
     );
-    let inset = 10.0;
+    // On a compact surface the clear target takes the trailing 44px without
+    // an inset and the decorative glyph yields first. This keeps both the
+    // clear target and a positive text-edit rect contained instead of
+    // allowing either child to extend outside a narrow parent.
+    let standard_layout = surface_rect.width() >= 160.0;
+    let trailing_inset = if standard_layout { 10.0 } else { 0.0 };
+    let minimum_input_width = 1.0;
+    let clear_width =
+        PRIMARY_TARGET_HEIGHT.min((surface_rect.width() - minimum_input_width).max(0.0));
     let clear_rect = egui::Rect::from_min_size(
         egui::pos2(
-            surface_rect.right() - inset - PRIMARY_TARGET_HEIGHT,
+            surface_rect.right() - trailing_inset - clear_width,
             surface_rect.top(),
         ),
-        Vec2::splat(PRIMARY_TARGET_HEIGHT),
+        Vec2::new(clear_width, PRIMARY_TARGET_HEIGHT),
     );
-    let icon_rect = egui::Rect::from_min_size(
-        egui::pos2(surface_rect.left() + inset, surface_rect.top()),
-        Vec2::new(20.0, PRIMARY_TARGET_HEIGHT),
-    );
+    let icon_width = if standard_layout { 20.0 } else { 0.0 };
+    let input_left = surface_rect.left() + if standard_layout { 38.0 } else { 0.0 };
+    let input_right = (clear_rect.left() - if standard_layout { 8.0 } else { 0.0 })
+        .max(input_left + minimum_input_width)
+        .min(surface_rect.right());
     let input_rect = egui::Rect::from_min_max(
-        egui::pos2(icon_rect.right() + 8.0, surface_rect.top()),
-        egui::pos2(clear_rect.left() - 8.0, surface_rect.bottom()),
+        egui::pos2(
+            input_left.min(input_right - minimum_input_width),
+            surface_rect.top(),
+        ),
+        egui::pos2(input_right, surface_rect.bottom()),
     );
     // Paint the leading glyph directly so it remains decorative: the text
-    // input is the sole semantic, focusable search control.
-    ui.painter().text(
-        icon_rect.center(),
-        egui::Align2::CENTER_CENTER,
-        icon_glyph(Icon::Search),
-        FontId::proportional(18.0),
-        colors.muted_text,
-    );
+    // input is the sole semantic, focusable search control. It deliberately
+    // disappears before it can crowd the usable text field on a compact row.
+    if icon_width > 0.0 {
+        let icon_rect = egui::Rect::from_min_size(
+            egui::pos2(surface_rect.left() + 10.0, surface_rect.top()),
+            Vec2::new(icon_width, PRIMARY_TARGET_HEIGHT),
+        );
+        ui.painter().text(
+            icon_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            icon_glyph(Icon::Search),
+            FontId::proportional(18.0),
+            colors.muted_text,
+        );
+    }
     let mut input_ui = ui.child_ui(input_rect, Layout::left_to_right(Align::Center));
     let input = input_ui.add_sized(
         input_rect.size(),
@@ -266,6 +287,8 @@ pub(crate) fn search_field(
         input,
         #[cfg(test)]
         clear,
+        #[cfg(test)]
+        surface: surface_rect,
         changed,
         clear_requested,
     }
@@ -674,6 +697,58 @@ mod tests {
                 .all(|(_, node)| node.name() != Some(icon_glyph(Icon::Search))),
             "the search glyph is decorative, not a focusable/accessibility node"
         );
+    }
+
+    #[test]
+    fn search_field_keeps_its_input_and_clear_target_contained_when_compact() {
+        for width in [45.0, 53.0, 54.0, 80.0, 100.0] {
+            let ctx = egui::Context::default();
+            let mut query = "base".to_owned();
+            let mut surface = egui::Rect::NOTHING;
+            let mut input = egui::Rect::NOTHING;
+            let mut clear = egui::Rect::NOTHING;
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        Vec2::new(320.0, 120.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let response = search_field(
+                            ui,
+                            width,
+                            ("compact-search-field", width.to_bits()),
+                            &mut query,
+                            "Search models",
+                            "Search models",
+                            "Filters models as you type.",
+                        );
+                        surface = response.surface;
+                        input = response.input.rect;
+                        clear = response.clear.rect;
+                    });
+                },
+            );
+            assert!(
+                input.width() > 0.0 && input.height() > 0.0,
+                "search input must remain positive at width {width}: {input:?}"
+            );
+            assert!(
+                surface.contains_rect(input),
+                "input must remain inside the surface at width {width}: surface={surface:?}, input={input:?}"
+            );
+            assert!(
+                surface.contains_rect(clear),
+                "clear action must remain inside the surface at width {width}: surface={surface:?}, clear={clear:?}"
+            );
+            assert!(
+                clear.width() >= PRIMARY_TARGET_HEIGHT && clear.height() >= PRIMARY_TARGET_HEIGHT,
+                "clear action must retain its 44px target at width {width}: {clear:?}"
+            );
+        }
     }
 
     #[test]

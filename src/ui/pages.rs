@@ -88,42 +88,97 @@ pub(crate) fn history_page(
         focus_delete_confirmation,
     } = state;
     let mut action = None;
-    ui.horizontal(|ui| {
-        const HISTORY_ACTION_WIDTH: f32 = 86.0;
-        let search_width =
-            (ui.available_width() - HISTORY_ACTION_WIDTH * 2.0 - ui.spacing().item_spacing.x * 2.0)
-                .max(44.0);
-        let search_response = search_field(
-            ui,
-            search_width,
-            "history-search",
-            search,
-            "Search history",
-            "Search transcript, model, or app",
-            "Enter a query, then choose Search or press Enter to filter saved history.",
-        );
-        if focus_search {
-            search_response.input.request_focus();
-        }
-        let enter = search_response.input.lost_focus()
-            && ui.input(|input| input.key_pressed(egui::Key::Enter));
-        if ui
-            .add_sized([HISTORY_ACTION_WIDTH, 44.0], egui::Button::new("Search"))
-            .clicked()
-            || enter
-        {
-            action = Some(HistoryPageAction::ApplySearch);
-        }
-        if ui
-            .add_sized([HISTORY_ACTION_WIDTH, 44.0], egui::Button::new("Refresh"))
-            .clicked()
-        {
-            action = Some(HistoryPageAction::Refresh);
-        }
-        if search_response.clear_requested {
-            action = Some(HistoryPageAction::ClearSearch);
+    const HISTORY_ACTION_WIDTH: f32 = 86.0;
+    const HISTORY_CONTROL_HEIGHT: f32 = 44.0;
+    let row_spacing = ui.spacing().item_spacing.x;
+    let single_row_minimum =
+        HISTORY_CONTROL_HEIGHT + HISTORY_ACTION_WIDTH * 2.0 + row_spacing * 2.0;
+    let single_row = ui.available_width() >= single_row_minimum;
+    let mut search_response = None;
+    ui.vertical(|ui| {
+        if single_row {
+            ui.horizontal(|ui| {
+                let search_width = ui.available_width()
+                    - HISTORY_ACTION_WIDTH * 2.0
+                    - ui.spacing().item_spacing.x * 2.0;
+                search_response = Some(search_field(
+                    ui,
+                    search_width,
+                    "history-search",
+                    search,
+                    "Search history",
+                    "Search transcript, model, or app",
+                    "Enter a query, then choose Search or press Enter to filter saved history.",
+                ));
+                let search_clicked = ui
+                    .add_sized(
+                        [HISTORY_ACTION_WIDTH, HISTORY_CONTROL_HEIGHT],
+                        egui::Button::new("Search"),
+                    )
+                    .clicked();
+                let refresh_clicked = ui
+                    .add_sized(
+                        [HISTORY_ACTION_WIDTH, HISTORY_CONTROL_HEIGHT],
+                        egui::Button::new("Refresh"),
+                    )
+                    .clicked();
+                if search_clicked {
+                    action = Some(HistoryPageAction::ApplySearch);
+                }
+                if refresh_clicked {
+                    action = Some(HistoryPageAction::Refresh);
+                }
+            });
+        } else {
+            search_response = Some(search_field(
+                ui,
+                ui.available_width(),
+                "history-search",
+                search,
+                "Search history",
+                "Search transcript, model, or app",
+                "Enter a query, then choose Search or press Enter to filter saved history.",
+            ));
+            ui.add_space(ui.spacing().item_spacing.y);
+            // Keep the actions on a second row before they can force the
+            // search field below its usable width. On very narrow routes the
+            // wrapped layout gives each 86x44 control its own contained row.
+            let action_width =
+                HISTORY_ACTION_WIDTH.min(ui.available_width().max(HISTORY_CONTROL_HEIGHT));
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .add_sized(
+                        [action_width, HISTORY_CONTROL_HEIGHT],
+                        egui::Button::new("Search"),
+                    )
+                    .clicked()
+                {
+                    action = Some(HistoryPageAction::ApplySearch);
+                }
+                if ui
+                    .add_sized(
+                        [action_width, HISTORY_CONTROL_HEIGHT],
+                        egui::Button::new("Refresh"),
+                    )
+                    .clicked()
+                {
+                    action = Some(HistoryPageAction::Refresh);
+                }
+            });
         }
     });
+    let search_response = search_response.expect("history search field is always rendered");
+    if focus_search {
+        search_response.input.request_focus();
+    }
+    let enter =
+        search_response.input.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+    if enter {
+        action = Some(HistoryPageAction::ApplySearch);
+    }
+    if search_response.clear_requested {
+        action = Some(HistoryPageAction::ClearSearch);
+    }
 
     let history_status = if loading {
         "Loading local history".to_owned()
@@ -585,5 +640,54 @@ mod tests {
         );
         assert_eq!(search, "meeting");
         assert_eq!(action, Some(HistoryPageAction::ApplySearch));
+    }
+
+    #[test]
+    fn history_search_actions_wrap_without_escaping_a_narrow_route() {
+        for width in [120.0, 220.0] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            configure_accessible_style(&ctx);
+            let mut search = "meeting".to_owned();
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(width, 320.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        assert_eq!(history_page(ui, state(&mut search, false)), None);
+                    });
+                },
+            );
+            let nodes = &output
+                .platform_output
+                .accesskit_update
+                .expect("history controls should update AccessKit")
+                .nodes;
+            for name in ["Search history", "Search", "Refresh"] {
+                let node = nodes
+                    .iter()
+                    .find_map(|(_, node)| (node.name() == Some(name)).then_some(node))
+                    .unwrap_or_else(|| panic!("missing narrow history control: {name}"));
+                let bounds = node
+                    .bounds()
+                    .unwrap_or_else(|| panic!("{name} needs accessibility bounds"));
+                assert!(
+                    bounds.x0 >= 0.0
+                        && bounds.x1 <= f64::from(width)
+                        && bounds.y0 >= 0.0
+                        && bounds.y1 <= 320.0,
+                    "{name} must remain inside the narrow route at width {width}: {bounds:?}"
+                );
+                assert!(
+                    bounds.width() >= 44.0 && bounds.height() >= 44.0,
+                    "{name} must retain a 44px target at width {width}: {bounds:?}"
+                );
+            }
+        }
     }
 }
