@@ -1667,8 +1667,10 @@ mod tests {
         Elapsed,
         Divider,
         Preview,
+        CompactStatusIndicator,
         CompactStatus,
         CompactMeter,
+        CompactElapsed,
     }
 
     /// Paints exactly one content layer on a canvas that is larger than its
@@ -1691,11 +1693,17 @@ mod tests {
             IsolatedComponent::Elapsed => draw_live_elapsed(&mut canvas, state, layout, colors),
             IsolatedComponent::Divider => draw_live_divider(&mut canvas, layout, colors),
             IsolatedComponent::Preview => draw_live_preview(&mut canvas, state, layout, colors),
+            IsolatedComponent::CompactStatusIndicator => {
+                draw_compact_status_indicator(&mut canvas, state, layout)
+            }
             IsolatedComponent::CompactStatus => {
                 draw_compact_status_text(&mut canvas, state, layout, colors)
             }
             IsolatedComponent::CompactMeter => {
                 draw_compact_meter(&mut canvas, state, layout, colors)
+            }
+            IsolatedComponent::CompactElapsed => {
+                draw_compact_elapsed(&mut canvas, state, layout, colors)
             }
         }
         .unwrap();
@@ -1749,6 +1757,7 @@ mod tests {
         rect: PhysicalRect,
         center_y: f32,
         visual_center_tolerance: f32,
+        requires_vertical_edge_margin: bool,
     ) -> InkBounds {
         let ink =
             component_ink_bounds(content).unwrap_or_else(|| panic!("{component} painted no ink"));
@@ -1764,6 +1773,12 @@ mod tests {
                 && ink.y1 as f32 + 0.5 <= rect.y1 + 0.5,
             "{component} ink escaped its assigned rectangle: {ink:?} vs {rect:?}"
         );
+        if requires_vertical_edge_margin {
+            assert!(
+                ink.y0 as f32 + 0.5 > rect.y0 && ink.y1 as f32 + 0.5 < rect.y1,
+                "{component} ink touched an assigned vertical edge and may be clipped: {ink:?} vs {rect:?}"
+            );
+        }
         ink
     }
 
@@ -1849,6 +1864,13 @@ mod tests {
         let line = live_line(&live, NativeColors::for_theme(true));
         assert!(line.sections.iter().any(|section| section.text == " "));
         with_rasterizer(|rasterizer| {
+            let mut pixels = vec![0; 128 * 64 * 4];
+            let mut canvas = Canvas::new(rasterizer, &mut pixels, 128, 64).unwrap();
+            assert!(
+                canvas.measure_text(" ", 13.0, TextStyle::Regular).unwrap() > 0.0,
+                "the standalone separator must retain a measurable advance"
+            );
+            drop(canvas);
             let frame = rasterizer.render_display(&live, true, 600, 62).unwrap();
             assert!(frame.pixels.chunks_exact(4).any(|pixel| pixel[3] > 0));
             assert_eq!(
@@ -1883,6 +1905,7 @@ mod tests {
                                     layout.recording_mark,
                                     layout.content_center_y,
                                     0.5,
+                                    false,
                                 );
                                 let elapsed_frame = isolated_component_frame(
                                     rasterizer,
@@ -1897,6 +1920,7 @@ mod tests {
                                     layout.elapsed,
                                     layout.content_center_y,
                                     2.5,
+                                    true,
                                 );
                                 let divider_frame = isolated_component_frame(
                                     rasterizer,
@@ -1911,6 +1935,7 @@ mod tests {
                                     layout.divider.unwrap(),
                                     layout.content_center_y,
                                     0.5,
+                                    true,
                                 );
                                 let preview_frame = isolated_component_frame(
                                     rasterizer,
@@ -1925,6 +1950,7 @@ mod tests {
                                     layout.preview.unwrap(),
                                     layout.content_center_y,
                                     2.5,
+                                    true,
                                 );
                                 assert_no_adjacent_ink_overlap(&[
                                     ("waveform", waveform),
@@ -1934,6 +1960,21 @@ mod tests {
                                 ]);
                             }
                             OverlayMode::Minimal | OverlayMode::Off => {
+                                let indicator_frame = isolated_component_frame(
+                                    rasterizer,
+                                    &state,
+                                    &layout,
+                                    dark_mode,
+                                    IsolatedComponent::CompactStatusIndicator,
+                                );
+                                let indicator = assert_component_is_contained_and_centered(
+                                    "compact status indicator",
+                                    &indicator_frame,
+                                    layout.recording_mark,
+                                    layout.content_center_y,
+                                    0.5,
+                                    false,
+                                );
                                 let status_frame = isolated_component_frame(
                                     rasterizer,
                                     &state,
@@ -1947,6 +1988,7 @@ mod tests {
                                     layout.status_text.unwrap(),
                                     layout.content_center_y,
                                     2.5,
+                                    true,
                                 );
                                 let meter_frame = isolated_component_frame(
                                     rasterizer,
@@ -1961,10 +2003,28 @@ mod tests {
                                     layout.meter,
                                     layout.content_center_y,
                                     0.5,
+                                    false,
+                                );
+                                let compact_elapsed_frame = isolated_component_frame(
+                                    rasterizer,
+                                    &state,
+                                    &layout,
+                                    dark_mode,
+                                    IsolatedComponent::CompactElapsed,
+                                );
+                                let compact_elapsed = assert_component_is_contained_and_centered(
+                                    "compact elapsed time",
+                                    &compact_elapsed_frame,
+                                    layout.elapsed,
+                                    layout.content_center_y,
+                                    2.5,
+                                    true,
                                 );
                                 assert_no_adjacent_ink_overlap(&[
+                                    ("compact status indicator", indicator),
                                     ("compact status", status),
                                     ("compact meter", meter),
+                                    ("compact elapsed time", compact_elapsed),
                                 ]);
                             }
                         }

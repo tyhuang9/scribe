@@ -86,11 +86,15 @@ impl DisplayLayout {
                 let recording_mark = centered_rect(16.0, 30.0, 30.0, content_center_y, scale);
                 let divider_line = centered_rect(110.5, 1.0, 24.0, content_center_y, scale);
                 let divider_stroke_radius = scale.max(1.0) / 2.0;
+                // Preserve a physical-pixel guard around GDI+'s antialiased
+                // line footprint. The line itself remains centered; this is
+                // the shared paint/UIA allocation rather than a visual shift.
+                let divider_safety_margin = 1.0;
                 let divider = PhysicalRect::new(
-                    divider_line.x0 - divider_stroke_radius,
-                    divider_line.y0 - divider_stroke_radius,
-                    divider_line.x1 + divider_stroke_radius,
-                    divider_line.y1 + divider_stroke_radius,
+                    divider_line.x0 - divider_stroke_radius - divider_safety_margin,
+                    divider_line.y0 - divider_stroke_radius - divider_safety_margin,
+                    divider_line.x1 + divider_stroke_radius + divider_safety_margin,
+                    divider_line.y1 + divider_stroke_radius + divider_safety_margin,
                 );
                 Self {
                     scale,
