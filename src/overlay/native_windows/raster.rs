@@ -1,4 +1,4 @@
-use std::{borrow::Cow, ffi::c_void, mem::zeroed, ptr::null_mut, time::Duration};
+use std::{borrow::Cow, ffi::c_void, mem::zeroed, ptr::null_mut, sync::Mutex, time::Duration};
 
 use eframe::egui::Color32;
 use unicode_segmentation::UnicodeSegmentation;
@@ -33,6 +33,7 @@ use crate::ui::ThemePalette;
 const PIXEL_FORMAT_32BPP_PARGB: i32 = 0x000E_200B;
 const MAX_PREVIEW_GRAPHEMES: usize = 512;
 const MAX_MESSAGE_GRAPHEMES: usize = 256;
+const BASELINE_METRIC_CAPACITY: usize = 16;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Argb(u32);
@@ -156,6 +157,17 @@ enum TextStyle {
     Phosphor,
 }
 
+/// Representative ascender/descender runs used only to establish stable font
+/// baselines. They are deliberately fixed: transcript text is never retained
+/// in the native rasterizer cache.
+fn baseline_sample(style: TextStyle) -> &'static str {
+    match style {
+        TextStyle::Regular | TextStyle::Bold | TextStyle::Italic => "Agjpqy",
+        TextStyle::Monospace => "00:12",
+        TextStyle::Phosphor => egui_phosphor::regular::WAVEFORM,
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct StyledSection {
     text: String,
@@ -203,7 +215,64 @@ impl StyledLine {
 pub(super) struct NativeRasterizer {
     // Fields drop in declaration order: release the private family before GDI+ shutdown.
     phosphor: PrivateFont,
+    baseline_metrics: Mutex<BaselineMetricCache>,
+    #[cfg(test)]
+    baseline_probe_count: std::sync::atomic::AtomicUsize,
     _gdiplus: GdiPlusSession,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BaselineMetric {
+    style: TextStyle,
+    font_size_bits: u32,
+    ink_center_y: f32,
+}
+
+#[derive(Debug)]
+struct BaselineMetricCache {
+    entries: [Option<BaselineMetric>; BASELINE_METRIC_CAPACITY],
+    next_eviction: usize,
+}
+
+impl Default for BaselineMetricCache {
+    fn default() -> Self {
+        Self {
+            entries: [None; BASELINE_METRIC_CAPACITY],
+            next_eviction: 0,
+        }
+    }
+}
+
+impl BaselineMetricCache {
+    fn get(&self, style: TextStyle, font_size: f32) -> Option<f32> {
+        self.entries
+            .iter()
+            .flatten()
+            .find(|metric| metric.style == style && metric.font_size_bits == font_size.to_bits())
+            .map(|metric| metric.ink_center_y)
+    }
+
+    fn insert(&mut self, style: TextStyle, font_size: f32, ink_center_y: f32) {
+        if let Some(slot) = self.entries.iter_mut().find(|entry| entry.is_none()) {
+            *slot = Some(BaselineMetric {
+                style,
+                font_size_bits: font_size.to_bits(),
+                ink_center_y,
+            });
+            return;
+        }
+        self.entries[self.next_eviction] = Some(BaselineMetric {
+            style,
+            font_size_bits: font_size.to_bits(),
+            ink_center_y,
+        });
+        self.next_eviction = (self.next_eviction + 1) % BASELINE_METRIC_CAPACITY;
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.iter().flatten().count()
+    }
 }
 
 impl NativeRasterizer {
@@ -212,8 +281,80 @@ impl NativeRasterizer {
         let phosphor = PrivateFont::phosphor_regular()?;
         Ok(Self {
             phosphor,
+            baseline_metrics: Mutex::new(BaselineMetricCache::default()),
+            #[cfg(test)]
+            baseline_probe_count: std::sync::atomic::AtomicUsize::new(0),
             _gdiplus: gdiplus,
         })
+    }
+
+    fn baseline_ink_center_y(&self, font_size: f32, style: TextStyle) -> Result<f32, RasterError> {
+        if let Some(center) = self
+            .baseline_metrics
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(style, font_size)
+        {
+            return Ok(center);
+        }
+
+        let center = self.measure_baseline_ink_center_y(font_size, style)?;
+        #[cfg(test)]
+        self.baseline_probe_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut metrics = self
+            .baseline_metrics
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Ok(metrics.get(style, font_size).unwrap_or_else(|| {
+            metrics.insert(style, font_size, center);
+            center
+        }))
+    }
+
+    fn measure_baseline_ink_center_y(
+        &self,
+        font_size: f32,
+        style: TextStyle,
+    ) -> Result<f32, RasterError> {
+        let sample = baseline_sample(style);
+        let width = (font_size * 16.0).ceil().clamp(1.0, 32_768.0) as i32;
+        let height = (font_size * 4.0).ceil().max(1.0) as i32;
+        let mut probe = LayeredFrame::transparent(width, height)?;
+        let mut canvas = Canvas::new(self, &mut probe.pixels, width, height)?;
+        canvas.draw_text(
+            sample,
+            0.0,
+            0.0,
+            width as f32,
+            height as f32,
+            font_size,
+            style,
+            Argb::new(255, 255, 255, 255),
+        )?;
+        drop(canvas);
+        let mut first = None;
+        let mut last = None;
+        for y in 0..height {
+            if (0..width).any(|x| probe.pixels[((y * width + x) * 4 + 3) as usize] > 0) {
+                first.get_or_insert(y);
+                last = Some(y);
+            }
+        }
+        let (first, last) = first.zip(last).ok_or(RasterError::TextTooLong)?;
+        Ok((first + last + 1) as f32 / 2.0)
+    }
+
+    #[cfg(test)]
+    fn baseline_cache_stats(&self) -> (usize, usize) {
+        (
+            self.baseline_metrics
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            self.baseline_probe_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
     }
 
     pub(super) fn render_display(
@@ -320,6 +461,18 @@ fn draw_live(
     layout: &DisplayLayout,
     colors: NativeColors,
 ) -> Result<(), RasterError> {
+    draw_live_waveform(canvas, state, layout, colors)?;
+    draw_live_elapsed(canvas, state, layout, colors)?;
+    draw_live_divider(canvas, layout, colors)?;
+    draw_live_preview(canvas, state, layout, colors)
+}
+
+fn draw_live_waveform(
+    canvas: &mut Canvas<'_>,
+    state: &OverlayViewState,
+    layout: &DisplayLayout,
+    colors: NativeColors,
+) -> Result<(), RasterError> {
     let scale = layout.scale;
     let center_y = layout.recording_mark.center_y();
     let level = normalized_level(state);
@@ -343,8 +496,16 @@ fn draw_live(
         27.0 * scale,
         TextStyle::Phosphor,
         colors.waveform,
-    )?;
+    )
+}
 
+fn draw_live_elapsed(
+    canvas: &mut Canvas<'_>,
+    state: &OverlayViewState,
+    layout: &DisplayLayout,
+    colors: NativeColors,
+) -> Result<(), RasterError> {
+    let scale = layout.scale;
     let elapsed = state
         .elapsed
         .map(format_elapsed)
@@ -358,7 +519,18 @@ fn draw_live(
         TextStyle::Monospace,
         colors.muted_text,
     )?;
-    let divider = layout.divider.expect("live layout includes divider bounds");
+    Ok(())
+}
+
+fn draw_live_divider(
+    canvas: &mut Canvas<'_>,
+    layout: &DisplayLayout,
+    colors: NativeColors,
+) -> Result<(), RasterError> {
+    let scale = layout.scale;
+    let divider = layout
+        .divider_line
+        .expect("live layout includes divider line bounds");
     canvas.draw_line(
         divider.center_x(),
         divider.y0,
@@ -366,8 +538,16 @@ fn draw_live(
         divider.y1,
         scale.max(1.0),
         colors.border,
-    )?;
+    )
+}
 
+fn draw_live_preview(
+    canvas: &mut Canvas<'_>,
+    state: &OverlayViewState,
+    layout: &DisplayLayout,
+    colors: NativeColors,
+) -> Result<(), RasterError> {
+    let scale = layout.scale;
     let preview = layout.preview.expect("live layout includes preview bounds");
     let max_width = preview.width();
     let line = live_line(state, colors);
@@ -388,8 +568,7 @@ fn draw_live(
             MAX_PREVIEW_GRAPHEMES,
         )?
     };
-    canvas.draw_styled_line(&line, preview.x0, max_width, preview, 13.0 * scale)?;
-    Ok(())
+    canvas.draw_styled_line(&line, preview.x0, max_width, preview, 13.0 * scale)
 }
 
 fn draw_compact(
@@ -398,8 +577,17 @@ fn draw_compact(
     layout: &DisplayLayout,
     colors: NativeColors,
 ) -> Result<(), RasterError> {
-    let scale = layout.scale;
-    let center_y = layout.recording_mark.center_y();
+    draw_compact_status_indicator(canvas, state, layout)?;
+    draw_compact_status_text(canvas, state, layout, colors)?;
+    draw_compact_meter(canvas, state, layout, colors)?;
+    draw_compact_elapsed(canvas, state, layout, colors)
+}
+
+fn draw_compact_status_indicator(
+    canvas: &mut Canvas<'_>,
+    state: &OverlayViewState,
+    layout: &DisplayLayout,
+) -> Result<(), RasterError> {
     let phase = phase_color(state.phase);
     canvas.fill_ellipse(
         layout.recording_mark.x0,
@@ -407,7 +595,16 @@ fn draw_compact(
         layout.recording_mark.width(),
         layout.recording_mark.height(),
         phase,
-    )?;
+    )
+}
+
+fn draw_compact_status_text(
+    canvas: &mut Canvas<'_>,
+    state: &OverlayViewState,
+    layout: &DisplayLayout,
+    colors: NativeColors,
+) -> Result<(), RasterError> {
+    let scale = layout.scale;
     let label = if state.phase == OverlayPhase::Listening {
         "Scribe is recording"
     } else {
@@ -425,7 +622,17 @@ fn draw_compact(
         TextStyle::Bold,
         colors.text,
     )?;
+    Ok(())
+}
 
+fn draw_compact_meter(
+    canvas: &mut Canvas<'_>,
+    state: &OverlayViewState,
+    layout: &DisplayLayout,
+    colors: NativeColors,
+) -> Result<(), RasterError> {
+    let scale = layout.scale;
+    let center_y = layout.recording_mark.center_y();
     let level = normalized_level(state);
     for index in 0..4 {
         let threshold = (index + 1) as f32 / 4.0;
@@ -446,6 +653,16 @@ fn draw_compact(
             },
         )?;
     }
+    Ok(())
+}
+
+fn draw_compact_elapsed(
+    canvas: &mut Canvas<'_>,
+    state: &OverlayViewState,
+    layout: &DisplayLayout,
+    colors: NativeColors,
+) -> Result<(), RasterError> {
+    let scale = layout.scale;
     if let Some(elapsed) = state.elapsed {
         canvas.draw_text_centered_in_rect(
             &format_elapsed(elapsed),
@@ -835,45 +1052,11 @@ impl<'a> Canvas<'a> {
         style: TextStyle,
         color: Argb,
     ) -> Result<f32, RasterError> {
-        // GDI+ lays glyph ink within its em box. Measure the same rasterized
-        // glyph run used for painting, then align that measured ink center to
-        // the physical layout centerline instead of assuming a font ascent.
-        let y = rect.center_y() - self.measure_text_ink_center_y(text, width, font_size, style)?;
+        // Font/style/scale baseline metrics are bounded and reused by the
+        // rasterizer, avoiding text-dependent allocation or transcript
+        // retention on every meter repaint.
+        let y = rect.center_y() - self.rasterizer.baseline_ink_center_y(font_size, style)?;
         self.draw_text(text, x, y, width, rect.height(), font_size, style, color)
-    }
-
-    fn measure_text_ink_center_y(
-        &mut self,
-        text: &str,
-        width: f32,
-        font_size: f32,
-        style: TextStyle,
-    ) -> Result<f32, RasterError> {
-        let width = width.ceil().clamp(1.0, 32_768.0) as i32;
-        let height = (font_size * 4.0).ceil().max(1.0) as i32;
-        let mut probe = LayeredFrame::transparent(width, height)?;
-        let mut probe_canvas = Canvas::new(self.rasterizer, &mut probe.pixels, width, height)?;
-        probe_canvas.draw_text(
-            text,
-            0.0,
-            0.0,
-            width as f32,
-            height as f32,
-            font_size,
-            style,
-            Argb::new(255, 255, 255, 255),
-        )?;
-        drop(probe_canvas);
-        let mut first = None;
-        let mut last = None;
-        for y in 0..height {
-            if (0..width).any(|x| probe.pixels[((y * width + x) * 4 + 3) as usize] > 0) {
-                first.get_or_insert(y);
-                last = Some(y);
-            }
-        }
-        let (first, last) = first.zip(last).ok_or(RasterError::TextTooLong)?;
-        Ok((first + last + 1) as f32 / 2.0)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1434,37 +1617,49 @@ mod tests {
         )
     }
 
-    fn capsule_only_frame(
+    #[derive(Clone, Copy)]
+    enum IsolatedComponent {
+        Waveform,
+        Elapsed,
+        Divider,
+        Preview,
+        CompactStatus,
+        CompactMeter,
+    }
+
+    /// Paints exactly one content layer on a canvas that is larger than its
+    /// production viewport. This makes edge clipping and neighbor overlap
+    /// observable without relying on the capsule background.
+    fn isolated_component_frame(
         rasterizer: &NativeRasterizer,
-        mode: OverlayMode,
+        state: &OverlayViewState,
+        layout: &DisplayLayout,
         dark_mode: bool,
-        width: i32,
-        height: i32,
+        component: IsolatedComponent,
     ) -> LayeredFrame {
+        let width = layout.root.width() as i32 + 4;
+        let height = layout.root.height() as i32 + 4;
         let mut frame = LayeredFrame::transparent(width, height).unwrap();
-        let layout = DisplayLayout::from_bounds(
-            mode,
-            OverlayWindowBounds {
-                x: 0,
-                y: 0,
-                width,
-                height,
-            },
-        )
-        .unwrap();
         let mut canvas = Canvas::new(rasterizer, &mut frame.pixels, width, height).unwrap();
-        draw_capsule(
-            &mut canvas,
-            mode,
-            layout.scale,
-            NativeColors::for_theme(dark_mode),
-        )
+        let colors = NativeColors::for_theme(dark_mode);
+        match component {
+            IsolatedComponent::Waveform => draw_live_waveform(&mut canvas, state, layout, colors),
+            IsolatedComponent::Elapsed => draw_live_elapsed(&mut canvas, state, layout, colors),
+            IsolatedComponent::Divider => draw_live_divider(&mut canvas, layout, colors),
+            IsolatedComponent::Preview => draw_live_preview(&mut canvas, state, layout, colors),
+            IsolatedComponent::CompactStatus => {
+                draw_compact_status_text(&mut canvas, state, layout, colors)
+            }
+            IsolatedComponent::CompactMeter => {
+                draw_compact_meter(&mut canvas, state, layout, colors)
+            }
+        }
         .unwrap();
         drop(canvas);
         frame
     }
 
-    #[derive(Debug)]
+    #[derive(Clone, Copy, Debug)]
     struct InkBounds {
         x0: i32,
         y0: i32,
@@ -1476,26 +1671,18 @@ mod tests {
         fn center_y(&self) -> f32 {
             (self.y0 + self.y1 + 1) as f32 / 2.0
         }
+
+        fn intersects(self, other: Self) -> bool {
+            self.x0 <= other.x1 && other.x0 <= self.x1 && self.y0 <= other.y1 && other.y0 <= self.y1
+        }
     }
 
-    fn component_ink_bounds(
-        content: &LayeredFrame,
-        capsule_only: &LayeredFrame,
-        rect: PhysicalRect,
-    ) -> Option<InkBounds> {
-        assert_eq!(
-            (content.width, content.height),
-            (capsule_only.width, capsule_only.height)
-        );
-        let x0 = rect.x0.floor().max(0.0) as i32;
-        let y0 = rect.y0.floor().max(0.0) as i32;
-        let x1 = rect.x1.ceil().min(content.width as f32) as i32;
-        let y1 = rect.y1.ceil().min(content.height as f32) as i32;
+    fn component_ink_bounds(content: &LayeredFrame) -> Option<InkBounds> {
         let mut result: Option<InkBounds> = None;
-        for y in y0..y1 {
-            for x in x0..x1 {
+        for y in 0..content.height {
+            for x in 0..content.width {
                 let offset = ((y * content.width + x) * 4) as usize;
-                if content.pixels[offset..offset + 4] != capsule_only.pixels[offset..offset + 4] {
+                if content.pixels[offset + 3] > 0 {
                     let bounds = result.get_or_insert(InkBounds {
                         x0: x,
                         y0: y,
@@ -1512,24 +1699,39 @@ mod tests {
         result
     }
 
-    fn assert_component_is_centered_and_unclipped(
+    fn assert_component_is_contained_and_centered(
         component: &str,
         content: &LayeredFrame,
-        capsule_only: &LayeredFrame,
         rect: PhysicalRect,
         center_y: f32,
-    ) {
-        let ink = component_ink_bounds(content, capsule_only, rect)
-            .unwrap_or_else(|| panic!("{component} painted no ink beyond the capsule"));
+        visual_center_tolerance: f32,
+    ) -> InkBounds {
+        let ink =
+            component_ink_bounds(content).unwrap_or_else(|| panic!("{component} painted no ink"));
         assert!(
-            (ink.center_y() - center_y).abs() <= 0.5,
+            (ink.center_y() - center_y).abs() <= visual_center_tolerance,
             "{component} ink center {} drifted from physical centerline {center_y}: {ink:?}",
             ink.center_y(),
         );
         assert!(
-            ink.x0 > 0 && ink.y0 > 0 && ink.x1 < content.width - 1 && ink.y1 < content.height - 1,
-            "{component} ink touched the frame edge and may be clipped: {ink:?}"
+            ink.x0 as f32 + 0.5 >= rect.x0 - 0.5
+                && ink.y0 as f32 + 0.5 >= rect.y0 - 0.5
+                && ink.x1 as f32 + 0.5 <= rect.x1 + 0.5
+                && ink.y1 as f32 + 0.5 <= rect.y1 + 0.5,
+            "{component} ink escaped its assigned rectangle: {ink:?} vs {rect:?}"
         );
+        ink
+    }
+
+    fn assert_no_adjacent_ink_overlap(components: &[(&str, InkBounds)]) {
+        for (index, (name, bounds)) in components.iter().enumerate() {
+            for (other_name, other_bounds) in components.iter().skip(index + 1) {
+                assert!(
+                    !bounds.intersects(*other_bounds),
+                    "{name} ink {bounds:?} overlapped {other_name} ink {other_bounds:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1557,6 +1759,63 @@ mod tests {
     }
 
     #[test]
+    fn cached_font_baselines_are_bounded_reused_and_release_evicted_probe_scopes() {
+        with_rasterizer(|rasterizer| {
+            let live = state(OverlayMode::Live);
+            rasterizer.render_display(&live, true, 600, 62).unwrap();
+            let first = rasterizer.baseline_cache_stats();
+            assert_eq!(first, (4, 4), "one metric per Live font/style pair");
+
+            rasterizer.render_display(&live, false, 600, 62).unwrap();
+            assert_eq!(
+                rasterizer.baseline_cache_stats(),
+                first,
+                "theme changes and repeated live frames must reuse cached baselines"
+            );
+
+            for index in 0..BASELINE_METRIC_CAPACITY + 3 {
+                rasterizer
+                    .baseline_ink_center_y(8.0 + index as f32, TextStyle::Regular)
+                    .unwrap();
+            }
+            let (entries, probes) = rasterizer.baseline_cache_stats();
+            assert_eq!(entries, BASELINE_METRIC_CAPACITY);
+            assert_eq!(
+                probes,
+                first.1 + BASELINE_METRIC_CAPACITY + 2,
+                "only the pre-existing 13 px Regular metric may be reused during eviction"
+            );
+
+            // Each evicted probe owned a bitmap, graphics context, and font
+            // only for its measurement scope. A normal frame must still
+            // render after fixed-capacity churn, exercising their RAII drops.
+            rasterizer.render_display(&live, true, 600, 62).unwrap();
+            assert_eq!(
+                rasterizer.baseline_cache_stats().0,
+                BASELINE_METRIC_CAPACITY
+            );
+        });
+    }
+
+    #[test]
+    fn standalone_preview_separator_renders_without_a_text_ink_probe() {
+        let mut live = state(OverlayMode::Live);
+        live.transcript.committed = "Hello".to_owned();
+        live.transcript.tentative = "world".to_owned();
+        let line = live_line(&live, NativeColors::for_theme(true));
+        assert!(line.sections.iter().any(|section| section.text == " "));
+        with_rasterizer(|rasterizer| {
+            let frame = rasterizer.render_display(&live, true, 600, 62).unwrap();
+            assert!(frame.pixels.chunks_exact(4).any(|pixel| pixel[3] > 0));
+            assert_eq!(
+                rasterizer.baseline_cache_stats().0,
+                4,
+                "the separator must reuse the Regular baseline instead of probing its zero-ink glyph"
+            );
+        });
+    }
+
+    #[test]
     fn every_rastered_content_element_uses_the_production_centerline_at_supported_dpi() {
         with_rasterizer(|rasterizer| {
             for mode in [OverlayMode::Live, OverlayMode::Minimal] {
@@ -1564,63 +1823,105 @@ mod tests {
                     let bounds = production_bounds(mode, dpi);
                     let layout = DisplayLayout::from_bounds(mode, bounds).unwrap();
                     for dark_mode in [false, true] {
-                        let frame = rasterizer
-                            .render_display(&state(mode), dark_mode, bounds.width, bounds.height)
-                            .unwrap();
-                        let capsule_only = capsule_only_frame(
-                            rasterizer,
-                            mode,
-                            dark_mode,
-                            bounds.width,
-                            bounds.height,
-                        );
-                        assert_eq!((frame.width, frame.height), (bounds.width, bounds.height));
+                        let state = state(mode);
                         match mode {
                             OverlayMode::Live => {
-                                assert_component_is_centered_and_unclipped(
+                                let waveform_frame = isolated_component_frame(
+                                    rasterizer,
+                                    &state,
+                                    &layout,
+                                    dark_mode,
+                                    IsolatedComponent::Waveform,
+                                );
+                                let waveform = assert_component_is_contained_and_centered(
                                     "waveform",
-                                    &frame,
-                                    &capsule_only,
+                                    &waveform_frame,
                                     layout.recording_mark,
                                     layout.content_center_y,
+                                    0.5,
                                 );
-                                assert_component_is_centered_and_unclipped(
+                                let elapsed_frame = isolated_component_frame(
+                                    rasterizer,
+                                    &state,
+                                    &layout,
+                                    dark_mode,
+                                    IsolatedComponent::Elapsed,
+                                );
+                                let elapsed = assert_component_is_contained_and_centered(
                                     "elapsed time",
-                                    &frame,
-                                    &capsule_only,
+                                    &elapsed_frame,
                                     layout.elapsed,
                                     layout.content_center_y,
+                                    2.5,
                                 );
-                                assert_component_is_centered_and_unclipped(
+                                let divider_frame = isolated_component_frame(
+                                    rasterizer,
+                                    &state,
+                                    &layout,
+                                    dark_mode,
+                                    IsolatedComponent::Divider,
+                                );
+                                let divider = assert_component_is_contained_and_centered(
                                     "divider",
-                                    &frame,
-                                    &capsule_only,
+                                    &divider_frame,
                                     layout.divider.unwrap(),
                                     layout.content_center_y,
+                                    0.5,
                                 );
-                                assert_component_is_centered_and_unclipped(
+                                let preview_frame = isolated_component_frame(
+                                    rasterizer,
+                                    &state,
+                                    &layout,
+                                    dark_mode,
+                                    IsolatedComponent::Preview,
+                                );
+                                let preview = assert_component_is_contained_and_centered(
                                     "preview",
-                                    &frame,
-                                    &capsule_only,
+                                    &preview_frame,
                                     layout.preview.unwrap(),
                                     layout.content_center_y,
+                                    2.5,
                                 );
+                                assert_no_adjacent_ink_overlap(&[
+                                    ("waveform", waveform),
+                                    ("elapsed time", elapsed),
+                                    ("divider", divider),
+                                    ("preview", preview),
+                                ]);
                             }
                             OverlayMode::Minimal | OverlayMode::Off => {
-                                assert_component_is_centered_and_unclipped(
+                                let status_frame = isolated_component_frame(
+                                    rasterizer,
+                                    &state,
+                                    &layout,
+                                    dark_mode,
+                                    IsolatedComponent::CompactStatus,
+                                );
+                                let status = assert_component_is_contained_and_centered(
                                     "compact status",
-                                    &frame,
-                                    &capsule_only,
+                                    &status_frame,
                                     layout.status_text.unwrap(),
                                     layout.content_center_y,
+                                    2.5,
                                 );
-                                assert_component_is_centered_and_unclipped(
+                                let meter_frame = isolated_component_frame(
+                                    rasterizer,
+                                    &state,
+                                    &layout,
+                                    dark_mode,
+                                    IsolatedComponent::CompactMeter,
+                                );
+                                let meter = assert_component_is_contained_and_centered(
                                     "compact meter",
-                                    &frame,
-                                    &capsule_only,
+                                    &meter_frame,
                                     layout.meter,
                                     layout.content_center_y,
+                                    0.5,
                                 );
+                                assert_no_adjacent_ink_overlap(&[
+                                    ("compact status", status),
+                                    ("compact meter", meter),
+                                ]);
                             }
                         }
                     }
