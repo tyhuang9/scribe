@@ -19383,6 +19383,7 @@ mod layout_tests {
             load_duration_ms: 0,
             decode_duration_ms: 0,
             reload_duration_ms: 0,
+            cancellation_verified: false,
         }
     }
 
@@ -19402,6 +19403,8 @@ mod layout_tests {
             .general
             .model_paths
             .insert("whisper_cpp_tiny_en".to_owned(), fixture.clone());
+        config.general.selected_default_model = "whisper_cpp_tiny_en".to_owned();
+        config.general.playground_selected_models = vec!["whisper_cpp_tiny_en".to_owned()];
         config::normalize_config(&mut config);
         let (tx, rx) = unbounded();
 
@@ -23009,6 +23012,7 @@ mod layout_tests {
     #[test]
     fn playground_membership_adds_once_and_uninstall_cleanup_removes_model() {
         let mut config = AppConfig::default();
+        config.general.playground_selected_models.clear();
         set_model_selected(&mut config, "whisper_cpp_tiny_en", true);
         set_model_selected(&mut config, "whisper_cpp_tiny_en", true);
         assert_eq!(

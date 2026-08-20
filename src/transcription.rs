@@ -349,6 +349,10 @@ pub(crate) struct InstallSmoke {
     pub(crate) load_duration_ms: u128,
     pub(crate) decode_duration_ms: u128,
     pub(crate) reload_duration_ms: u128,
+    /// The isolated native smoke rejected a request carrying a stale
+    /// cancellation generation before final unload/reload verification.
+    #[serde(default)]
+    pub(crate) cancellation_verified: bool,
 }
 
 /// Unforgeable outside this module: only the real `TranscriptionService`
@@ -1235,6 +1239,7 @@ impl TranscriptionService {
             load_duration_ms,
             decode_duration_ms,
             reload_duration_ms,
+            cancellation_verified: false,
         })
     }
 
@@ -1746,12 +1751,35 @@ impl TranscriptionService {
             .transcribe(
                 runtime_model.clone(),
                 preference,
-                audio,
+                Arc::clone(&audio),
                 TranscriptionOptions::default(),
                 router.cancellation_snapshot(),
             )
             .map_err(|error| anyhow!("staged transcription smoke failed: {error}"))?;
         let decode_duration_ms = decode_started.elapsed().as_millis();
+        ensure_install_not_cancelled(cancellation)?;
+
+        let stale_generation = router.cancellation_snapshot();
+        router.cancel_active();
+        let cancellation_error = worker
+            .transcribe(
+                runtime_model.clone(),
+                preference,
+                audio,
+                TranscriptionOptions::default(),
+                stale_generation,
+            )
+            .err()
+            .ok_or_else(|| anyhow!("staged cancellation smoke unexpectedly accepted stale work"))?;
+        if !cancellation_error
+            .to_string()
+            .to_ascii_lowercase()
+            .contains("cancel")
+        {
+            return Err(anyhow!(
+                "staged cancellation smoke returned an unexpected error: {cancellation_error}"
+            ));
+        }
         ensure_install_not_cancelled(cancellation)?;
 
         worker
@@ -1774,6 +1802,7 @@ impl TranscriptionService {
             load_duration_ms,
             decode_duration_ms,
             reload_duration_ms,
+            cancellation_verified: true,
         })
     }
 
@@ -2766,6 +2795,32 @@ mod tests {
     use std::sync::Condvar;
 
     const MAX_DIAGNOSTIC_ONNX_WAV_BYTES: u64 = 256 * 1024 * 1024;
+
+    #[test]
+    fn legacy_install_smoke_diagnostics_default_cancellation_evidence_to_false() {
+        let smoke = InstallSmoke {
+            resolved_acceleration: ResolvedAcceleration {
+                requested: AccelerationPreference::Cpu,
+                resolved: ComputeDevice::Cpu,
+                diagnostic: None,
+            },
+            detected_architecture: "whisper".to_owned(),
+            capabilities: RuntimeCapabilities::default(),
+            health_duration_ms: 1,
+            load_duration_ms: 2,
+            decode_duration_ms: 3,
+            reload_duration_ms: 4,
+            cancellation_verified: true,
+        };
+        let mut serialized = serde_json::to_value(smoke).unwrap();
+        serialized
+            .as_object_mut()
+            .unwrap()
+            .remove("cancellation_verified");
+
+        let legacy: InstallSmoke = serde_json::from_value(serialized).unwrap();
+        assert!(!legacy.cancellation_verified);
+    }
 
     #[derive(Default)]
     struct FakeOnnxState {

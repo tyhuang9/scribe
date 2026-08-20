@@ -401,3 +401,84 @@ fn production_native_path_does_not_force_harness_light_visuals() {
         "harness-only theme initialization must not leak into production"
     );
 }
+
+#[test]
+fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest_path = repository
+        .join("runtime-manifests")
+        .join("whisper-base-en-q8_0-windows-x64.json");
+    let manifest: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(&manifest_path).expect("bundled model manifest must be readable"),
+    )
+    .expect("bundled model manifest must be valid JSON");
+    let catalog = crate::model_catalog::runtime_model_manifest(
+        &crate::transcription::ModelId::new(crate::model_catalog::BUNDLED_BASE_MODEL_ID),
+    )
+    .expect("bundled base model remains in the normalized catalog");
+
+    assert_eq!(manifest["schema_version"], 1);
+    assert_eq!(manifest["model_id"], catalog.id);
+    assert_eq!(manifest["repository"], catalog.artifact_repository);
+    assert_eq!(manifest["revision"], catalog.artifact_revision);
+    assert_eq!(manifest["artifact_filename"], catalog.artifact_filename);
+    assert_eq!(manifest["size_bytes"], catalog.artifact_size_bytes);
+    assert_eq!(manifest["sha256"], catalog.artifact_sha256);
+    assert_eq!(manifest["platform_triple"], "x86_64-pc-windows-msvc");
+    assert_eq!(
+        manifest["attribution_files"],
+        serde_json::json!([
+            "resources/licenses/Apache-2.0.txt",
+            "resources/licenses/OpenAI-Whisper-MIT.txt",
+            "resources/licenses/Whisper-Base-En-NOTICE.txt"
+        ])
+    );
+
+    let bundler = fs::read_to_string(repository.join("scripts").join("bundle-base-model.ps1"))
+        .expect("bundled model packaging script must be readable");
+    for required in [
+        "Get-FileHash",
+        "--scribe-install-smoke-parent",
+        "HF_HUB_OFFLINE",
+        "TRANSFORMERS_OFFLINE",
+        "cancellation_verified",
+        "capabilities.cancellation",
+    ] {
+        assert!(
+            bundler.contains(required),
+            "bundled model packaging must retain {required}"
+        );
+    }
+    for forbidden in ["Invoke-WebRequest", "Start-BitsTransfer", "curl.exe"] {
+        assert!(
+            !bundler.contains(forbidden),
+            "release packaging must not download the bundled model via {forbidden}"
+        );
+    }
+
+    let release = fs::read_to_string(repository.join("scripts").join("build-windows-release.ps1"))
+        .expect("Windows release script must be readable");
+    assert!(release.contains("bundle-whisper-runtime.ps1"));
+    assert!(release.contains("bundle-base-model.ps1"));
+
+    let notice = fs::read_to_string(
+        repository
+            .join("resources")
+            .join("licenses")
+            .join("Whisper-Base-En-NOTICE.txt"),
+    )
+    .expect("bundled model notice must be readable");
+    assert!(notice.contains(catalog.artifact_repository));
+    assert!(notice.contains(catalog.artifact_revision));
+    assert!(notice.contains(catalog.artifact_sha256));
+    assert!(notice.contains("Apache-2.0.txt"));
+    assert!(notice.contains("OpenAI-Whisper-MIT.txt"));
+    let upstream_mit = fs::read_to_string(
+        repository
+            .join("resources")
+            .join("licenses")
+            .join("OpenAI-Whisper-MIT.txt"),
+    )
+    .expect("OpenAI Whisper MIT notice must be readable");
+    assert!(upstream_mit.contains("Copyright (c) 2022 OpenAI"));
+}

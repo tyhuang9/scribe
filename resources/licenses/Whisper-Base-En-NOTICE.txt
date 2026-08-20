@@ -1,0 +1,22 @@
+Scribe bundled Whisper base.en model provenance
+================================================
+
+Scribe's Windows x64 release bundle includes this exact model artifact:
+
+Model ID: whisper_cpp_base_en
+Conversion repository: handy-computer/whisper-base.en-gguf
+Revision: cf0804db15fb341d00c9274b90da9cbb4fe2e5c6
+File: whisper-base.en-Q8_0.gguf
+Size: 84,886,208 bytes
+SHA-256: 3b46ca40bccbf7609c68d88a36d96077a04ca7c87f2060ede06f129fac3e7652
+
+The conversion repository identifies its distribution as Apache-2.0. The
+Apache License 2.0 text is included as Apache-2.0.txt.
+
+The upstream OpenAI Whisper project and model distribution identify the
+OpenAI Whisper code and model weights under the MIT License, with copyright
+(c) 2022 OpenAI. That notice is included as OpenAI-Whisper-MIT.txt.
+
+Scribe includes both notices as conservative redistribution attribution. This
+provenance notice does not state a legal conclusion and does not state that
+either notice supersedes the other.
