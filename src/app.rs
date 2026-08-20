@@ -17226,6 +17226,129 @@ mod layout_tests {
     }
 
     #[test]
+    fn restore_skipped_completes_once_and_records_history_and_diagnostics() {
+        use std::cell::Cell;
+
+        let mut app = test_app();
+        let history_root = std::env::temp_dir().join(format!(
+            "scribe-restore-skipped-history-{}-{}",
+            std::process::id(),
+            NEXT_TEST_SESSION.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&history_root);
+        let history_store =
+            HistoryStore::open(&history_root, HistoryRetentionPolicy::default()).unwrap();
+        let history_record = history_store
+            .create_pending(
+                NewHistoryEntry {
+                    raw_text: "once".to_owned(),
+                    model_id: "whisper_cpp_base_en".to_owned(),
+                    source_app: None,
+                    metrics: HistoryMetrics::default(),
+                },
+                None,
+            )
+            .unwrap();
+        history_store
+            .complete(
+                history_record.id,
+                CompletedHistoryEntry {
+                    raw_text: "once".to_owned(),
+                    final_text: "once".to_owned(),
+                    metrics: HistoryMetrics::default(),
+                },
+            )
+            .unwrap();
+        app.history_store = Some(history_store.clone());
+
+        let session_id = SessionId(114);
+        let request_id = RequestId(115);
+        let model_id = ModelId::new("whisper_cpp_base_en");
+        seed_test_request(
+            &mut app,
+            RecordingSource::Transcribe,
+            session_id,
+            request_id,
+            model_id.as_str(),
+        );
+        app.session_coordinator
+            .complete_request(session_id, request_id, &model_id)
+            .unwrap();
+        app.session_coordinator.begin_output(session_id).unwrap();
+        app.overlay_controller
+            .begin_session(session_id, NativeOverlayMode::Live);
+        app.pending_output = Some(PendingOutput {
+            session_id,
+            history_id: Some(history_record.id),
+            transcript: "once".to_owned(),
+            completion_message: "Complete".to_owned(),
+            config: app.config.clone(),
+            latency: Some(LatencyTrace::started_at(
+                Instant::now(),
+                TriggerObservation::AppAction,
+            )),
+        });
+        let paste_calls = Cell::new(0_u32);
+
+        app.poll_pending_output_with(|_, _, _| {
+            paste_calls.set(paste_calls.get() + 1);
+            text_output::TextOutputResult::InsertedClipboardRestoreSkipped
+        });
+        app.poll_pending_output_with(|_, _, _| {
+            paste_calls.set(paste_calls.get() + 1);
+            text_output::TextOutputResult::InsertedClipboardRestoreSkipped
+        });
+
+        assert_eq!(paste_calls.get(), 1);
+        assert_eq!(
+            app.session_coordinator.last_terminal().unwrap().outcome,
+            crate::core::TerminalOutcome::Completed
+        );
+        assert_eq!(
+            app.overlay_controller
+                .state()
+                .error
+                .as_ref()
+                .unwrap()
+                .recovery,
+            OverlayRecovery::None
+        );
+        assert!(app.status_message.contains("newer clipboard contents"));
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let output_outcome = loop {
+            let page = history_store.search(HistoryQuery::default()).unwrap();
+            if let Some(outcome) = page.records[0].output_outcome.clone() {
+                break outcome;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "history outcome was not recorded"
+            );
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(output_outcome, "inserted_clipboard_restore_skipped");
+
+        let diagnostics_root = std::env::temp_dir().join(format!(
+            "scribe-restore-skipped-diagnostics-{}-{}",
+            std::process::id(),
+            NEXT_TEST_SESSION.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&diagnostics_root);
+        let report = diagnostics::export_redacted(&diagnostics_root, &app.diagnostics).unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&fs::read(report).unwrap()).unwrap();
+        assert_eq!(
+            report["sessions"][0]["output_outcome"],
+            "inserted_clipboard_restore_skipped"
+        );
+
+        drop(app);
+        drop(history_store);
+        let _ = fs::remove_dir_all(history_root);
+        let _ = fs::remove_dir_all(diagnostics_root);
+    }
+
+    #[test]
     fn blocked_preview_timeout_fails_without_final_pass_or_paste_and_reaps_worker() {
         use std::cell::Cell;
         use std::sync::{Condvar, Mutex, mpsc};

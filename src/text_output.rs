@@ -245,6 +245,71 @@ impl ClipboardLease {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClipboardLeaseFormatObservation {
+    UnicodeText,
+    LeaseMarker,
+    SynthesizedText,
+    RichFormat,
+    CustomFormat,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ClipboardLeaseObservation {
+    sequence: Option<u64>,
+    owner: Option<isize>,
+    unicode_text: String,
+    marker: [u8; CLIPBOARD_LEASE_MARKER_BYTES],
+    formats: Vec<ClipboardLeaseFormatObservation>,
+}
+
+fn clipboard_lease_observation_matches(
+    lease: &ClipboardLease,
+    observation: Result<&ClipboardLeaseObservation, ()>,
+) -> bool {
+    let Ok(observation) = observation else {
+        return false;
+    };
+    let (Some(sequence), Some(expected_marker), Some(expected_owner)) =
+        (observation.sequence, lease.marker, lease.owner)
+    else {
+        return false;
+    };
+    if observation.owner != Some(expected_owner)
+        || observation.unicode_text != lease.expected_text
+        || observation.marker != expected_marker
+    {
+        return false;
+    }
+    if sequence == lease.sequence {
+        return true;
+    }
+
+    let mut saw_unicode = false;
+    let mut saw_marker = false;
+    for format in &observation.formats {
+        match format {
+            ClipboardLeaseFormatObservation::UnicodeText => saw_unicode = true,
+            ClipboardLeaseFormatObservation::LeaseMarker => saw_marker = true,
+            ClipboardLeaseFormatObservation::SynthesizedText => {}
+            ClipboardLeaseFormatObservation::RichFormat
+            | ClipboardLeaseFormatObservation::CustomFormat => return false,
+        }
+    }
+    saw_unicode && saw_marker
+}
+
+fn guarded_clipboard_restore(
+    lease_matches: bool,
+    restore: impl FnOnce() -> Result<()>,
+) -> Result<ConditionalClipboardRestore> {
+    if !lease_matches {
+        return Ok(ConditionalClipboardRestore::Changed);
+    }
+    restore()?;
+    Ok(ConditionalClipboardRestore::Restored)
+}
+
 const MAX_CLIPBOARD_IMAGE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_CLIPBOARD_TEXT_BYTES: usize = 16 * 1024 * 1024;
 const DIBV5_HEADER_BYTES: usize = 124;
@@ -1046,13 +1111,14 @@ fn new_windows_clipboard_marker(
 }
 
 #[cfg(target_os = "windows")]
-fn open_windows_clipboard_formats_are_safe(lease_format: u32) -> Result<bool> {
+fn observe_open_windows_clipboard_formats(
+    lease_format: u32,
+) -> Result<Vec<ClipboardLeaseFormatObservation>> {
     use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
     use windows_sys::Win32::System::DataExchange::EnumClipboardFormats;
 
     let mut current = 0;
-    let mut saw_unicode = false;
-    let mut saw_marker = false;
+    let mut formats = Vec::new();
     loop {
         unsafe { SetLastError(0) };
         let next = unsafe { EnumClipboardFormats(current) };
@@ -1064,52 +1130,67 @@ fn open_windows_clipboard_formats_are_safe(lease_format: u32) -> Result<bool> {
             }
             break;
         }
-        if next == CF_UNICODETEXT {
-            saw_unicode = true;
+        let observed = if next == CF_UNICODETEXT {
+            ClipboardLeaseFormatObservation::UnicodeText
         } else if next == lease_format {
-            saw_marker = true;
-        } else if !matches!(next, CF_TEXT | CF_OEMTEXT | CF_LOCALE) {
-            return Ok(false);
-        }
+            ClipboardLeaseFormatObservation::LeaseMarker
+        } else if matches!(next, CF_TEXT | CF_OEMTEXT | CF_LOCALE) {
+            ClipboardLeaseFormatObservation::SynthesizedText
+        } else if next < 0xC000 {
+            ClipboardLeaseFormatObservation::RichFormat
+        } else {
+            ClipboardLeaseFormatObservation::CustomFormat
+        };
+        formats.push(observed);
         current = next;
     }
-    Ok(saw_unicode && saw_marker)
+    Ok(formats)
 }
 
 #[cfg(target_os = "windows")]
-fn open_windows_clipboard_matches_lease(lease: &ClipboardLease) -> Result<bool> {
+fn observe_open_windows_clipboard() -> Result<ClipboardLeaseObservation> {
     use windows_sys::Win32::System::DataExchange::GetClipboardOwner;
-
-    let (Some(marker), Some(expected_owner)) = (lease.marker, lease.owner) else {
-        return Ok(false);
-    };
-    let current_sequence = windows_clipboard_token_open();
-    if current_sequence.is_none()
-        || unsafe { GetClipboardOwner() } as isize != expected_owner
-        || !read_open_windows_unicode_text().is_ok_and(|text| text == lease.expected_text)
-    {
-        return Ok(false);
-    }
 
     let lease_format = windows_clipboard_lease_format()?;
     let stored_marker =
         read_open_windows_format(lease_format, windows_png_format()?, lease_format)?;
-    if stored_marker.as_slice() != marker {
-        return Ok(false);
-    }
+    let marker = stored_marker
+        .try_into()
+        .map_err(|_| anyhow!("Windows clipboard lease marker has an invalid length"))?;
+    let owner = unsafe { GetClipboardOwner() };
 
-    // A clipboard listener may advance the generation without replacing the
-    // contents. Accept that churn only while the owner, nonce, exact Unicode
-    // text, and complete format allowlist still prove this is Scribe's write.
-    if current_sequence == Some(lease.sequence) {
-        return Ok(true);
-    }
-    open_windows_clipboard_formats_are_safe(lease_format)
+    Ok(ClipboardLeaseObservation {
+        sequence: windows_clipboard_token_open(),
+        owner: (!owner.is_null()).then_some(owner as isize),
+        unicode_text: read_open_windows_unicode_text()?,
+        marker,
+        formats: observe_open_windows_clipboard_formats(lease_format)?,
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn open_windows_clipboard_matches_lease(lease: &ClipboardLease) -> bool {
+    let observation = observe_open_windows_clipboard();
+    clipboard_lease_observation_matches(lease, observation.as_ref().map_err(|_| ()))
 }
 
 #[cfg(target_os = "windows")]
 fn windows_clipboard_matches_lease(lease: &ClipboardLease) -> bool {
-    with_open_windows_clipboard(|| open_windows_clipboard_matches_lease(lease)).unwrap_or(false)
+    with_open_windows_clipboard(|| Ok(open_windows_clipboard_matches_lease(lease))).unwrap_or(false)
+}
+
+fn establish_windows_clipboard_lease(
+    post_close_sequence: Option<u64>,
+    expected_text: &str,
+    marker: [u8; CLIPBOARD_LEASE_MARKER_BYTES],
+    owner: isize,
+) -> Option<ClipboardLease> {
+    Some(ClipboardLease {
+        sequence: post_close_sequence?,
+        expected_text: expected_text.to_owned(),
+        marker: Some(marker),
+        owner: Some(owner),
+    })
 }
 
 #[cfg(target_os = "windows")]
@@ -1144,14 +1225,13 @@ fn set_windows_text_if_token(
 
     // GetClipboardSequenceNumber is authoritative only after CloseClipboard;
     // querying it inside the write transaction can return the pre-write value.
-    let Some(sequence) = system_clipboard_change_token() else {
+    let Some(lease) = establish_windows_clipboard_lease(
+        system_clipboard_change_token(),
+        text,
+        marker,
+        owner as isize,
+    ) else {
         return Ok(ConditionalClipboardWrite::Written(None));
-    };
-    let lease = ClipboardLease {
-        sequence,
-        expected_text: text.to_owned(),
-        marker: Some(marker),
-        owner: Some(owner as isize),
     };
     if !windows_clipboard_matches_lease(&lease) {
         return Ok(ConditionalClipboardWrite::Changed);
@@ -1165,27 +1245,29 @@ fn restore_windows_clipboard_if_lease(
     snapshot: ClipboardSnapshot,
 ) -> Result<ConditionalClipboardRestore> {
     with_open_windows_clipboard(|| {
-        if !open_windows_clipboard_matches_lease(lease)? {
-            return Ok(ConditionalClipboardRestore::Changed);
-        }
-        match snapshot {
-            ClipboardSnapshot::Empty => replace_open_windows_clipboard(&[])?,
-            ClipboardSnapshot::WindowsFormats(formats) => replace_open_windows_clipboard(&formats)?,
-            ClipboardSnapshot::Text(text) => {
-                replace_open_windows_clipboard(&[WindowsClipboardFormat {
-                    format: CF_UNICODETEXT,
-                    bytes: encode_windows_unicode_text(&text),
-                }])?
+        let lease_matches = open_windows_clipboard_matches_lease(lease);
+        guarded_clipboard_restore(lease_matches, || {
+            match snapshot {
+                ClipboardSnapshot::Empty => replace_open_windows_clipboard(&[])?,
+                ClipboardSnapshot::WindowsFormats(formats) => {
+                    replace_open_windows_clipboard(&formats)?
+                }
+                ClipboardSnapshot::Text(text) => {
+                    replace_open_windows_clipboard(&[WindowsClipboardFormat {
+                        format: CF_UNICODETEXT,
+                        bytes: encode_windows_unicode_text(&text),
+                    }])?
+                }
+                ClipboardSnapshot::Image(_)
+                | ClipboardSnapshot::Unsupported
+                | ClipboardSnapshot::Unavailable => {
+                    return Err(anyhow!(
+                        "clipboard snapshot is not a native Windows transaction"
+                    ));
+                }
             }
-            ClipboardSnapshot::Image(_)
-            | ClipboardSnapshot::Unsupported
-            | ClipboardSnapshot::Unavailable => {
-                return Err(anyhow!(
-                    "clipboard snapshot is not a native Windows transaction"
-                ));
-            }
-        }
-        Ok(ConditionalClipboardRestore::Restored)
+            Ok(())
+        })
     })
 }
 
@@ -1478,6 +1560,140 @@ mod tests {
         header[4..8].copy_from_slice(&width.to_le_bytes());
         header[8..12].copy_from_slice(&height.to_le_bytes());
         header
+    }
+
+    fn test_clipboard_lease() -> ClipboardLease {
+        ClipboardLease {
+            sequence: 41,
+            expected_text: "hello".to_owned(),
+            marker: Some([7; CLIPBOARD_LEASE_MARKER_BYTES]),
+            owner: Some(73),
+        }
+    }
+
+    fn matching_lease_observation() -> ClipboardLeaseObservation {
+        ClipboardLeaseObservation {
+            sequence: Some(41),
+            owner: Some(73),
+            unicode_text: "hello".to_owned(),
+            marker: [7; CLIPBOARD_LEASE_MARKER_BYTES],
+            formats: vec![
+                ClipboardLeaseFormatObservation::UnicodeText,
+                ClipboardLeaseFormatObservation::LeaseMarker,
+            ],
+        }
+    }
+
+    #[test]
+    fn lease_observation_rejects_owner_marker_and_text_mismatches() {
+        let lease = test_clipboard_lease();
+        let mut observation = matching_lease_observation();
+        observation.owner = Some(74);
+        assert!(!clipboard_lease_observation_matches(
+            &lease,
+            Ok(&observation)
+        ));
+
+        observation = matching_lease_observation();
+        observation.marker[0] ^= 1;
+        assert!(!clipboard_lease_observation_matches(
+            &lease,
+            Ok(&observation)
+        ));
+
+        observation = matching_lease_observation();
+        observation.unicode_text = "changed".to_owned();
+        assert!(!clipboard_lease_observation_matches(
+            &lease,
+            Ok(&observation)
+        ));
+    }
+
+    #[test]
+    fn unavailable_sequence_and_observation_error_fail_closed() {
+        let lease = test_clipboard_lease();
+        let mut observation = matching_lease_observation();
+        observation.sequence = None;
+
+        assert!(!clipboard_lease_observation_matches(
+            &lease,
+            Ok(&observation)
+        ));
+        assert!(!clipboard_lease_observation_matches(&lease, Err(())));
+    }
+
+    #[test]
+    fn sequence_churn_requires_only_unicode_marker_and_safe_synthesized_formats() {
+        let lease = test_clipboard_lease();
+        let mut observation = matching_lease_observation();
+        observation.sequence = Some(42);
+        observation
+            .formats
+            .push(ClipboardLeaseFormatObservation::SynthesizedText);
+        assert!(clipboard_lease_observation_matches(
+            &lease,
+            Ok(&observation)
+        ));
+
+        for rejected in [
+            ClipboardLeaseFormatObservation::RichFormat,
+            ClipboardLeaseFormatObservation::CustomFormat,
+        ] {
+            let mut observation = observation.clone();
+            observation.formats.push(rejected);
+            assert!(!clipboard_lease_observation_matches(
+                &lease,
+                Ok(&observation)
+            ));
+        }
+
+        for required in [
+            ClipboardLeaseFormatObservation::UnicodeText,
+            ClipboardLeaseFormatObservation::LeaseMarker,
+        ] {
+            let mut observation = observation.clone();
+            observation.formats.retain(|format| *format != required);
+            assert!(!clipboard_lease_observation_matches(
+                &lease,
+                Ok(&observation)
+            ));
+        }
+    }
+
+    #[test]
+    fn guarded_restore_mismatch_never_replaces_clipboard() {
+        use std::cell::Cell;
+
+        let lease = test_clipboard_lease();
+        let mut observation = matching_lease_observation();
+        observation.owner = Some(74);
+        let lease_matches = clipboard_lease_observation_matches(&lease, Ok(&observation));
+        let replacements = Cell::new(0);
+        let result = guarded_clipboard_restore(lease_matches, || {
+            replacements.set(replacements.get() + 1);
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(result, ConditionalClipboardRestore::Changed);
+        assert_eq!(replacements.get(), 0);
+    }
+
+    #[test]
+    fn post_write_lease_establishment_uses_post_close_sequence() {
+        let pre_close_sequence = 41;
+        let post_close_sequence = 42;
+        let lease = establish_windows_clipboard_lease(
+            Some(post_close_sequence),
+            "hello",
+            [7; CLIPBOARD_LEASE_MARKER_BYTES],
+            73,
+        )
+        .unwrap();
+
+        assert_eq!(lease.sequence, post_close_sequence);
+        assert_ne!(lease.sequence, pre_close_sequence);
+        assert!(establish_windows_clipboard_lease(None, "hello", [7; 32], 73).is_none());
     }
 
     #[test]
