@@ -907,12 +907,7 @@ fn remove_committed_overlap(
         .find(|&count| {
             let committed_tail = &committed[committed.len() - count..];
             let current_prefix = &current[..count];
-            let timestamped = timestamps_are_trustworthy(committed_tail)
-                && timestamps_are_trustworthy(current_prefix);
-            committed_tail
-                .iter()
-                .zip(current_prefix)
-                .all(|(left, right)| words_match(left, right, timestamped))
+            word_sequences_match(committed_tail, current_prefix)
         })
         .unwrap_or_default();
     if overlap > 0 {
@@ -926,17 +921,59 @@ fn has_full_committed_prefix(committed: &[HypothesisWord], current: &[Hypothesis
         return false;
     }
     let current_prefix = &current[..committed.len()];
-    let timestamped =
-        timestamps_are_trustworthy(committed) && timestamps_are_trustworthy(current_prefix);
-    committed
-        .iter()
-        .zip(current_prefix)
-        .all(|(left, right)| words_match(left, right, timestamped))
+    word_sequences_match(committed, current_prefix)
 }
 
-fn words_match(left: &HypothesisWord, right: &HypothesisWord, timestamped: bool) -> bool {
-    normalized(&left.display) == normalized(&right.display)
-        && (!timestamped || timestamps_match(left, right))
+fn word_sequences_match(left: &[HypothesisWord], right: &[HypothesisWord]) -> bool {
+    if left.len() != right.len()
+        || !left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| normalized(&left.display) == normalized(&right.display))
+    {
+        return false;
+    }
+    let timestamped = timestamps_are_trustworthy(left) && timestamps_are_trustworthy(right);
+    if !timestamped {
+        return true;
+    }
+    if left
+        .iter()
+        .zip(right)
+        .all(|(left, right)| timestamps_match(left, right))
+    {
+        return true;
+    }
+
+    // Native decoders expose segment timing, not word timing. Preview mapping
+    // therefore divides each segment evenly across its words, and the same
+    // spoken clause can move by more than the per-word drift allowance when a
+    // pause changes segment boundaries in the next rolling window. A
+    // multi-word sequence whose aggregate audio spans substantially overlap is
+    // still the same audio. Disjoint repeated speech remains new text.
+    left.len() > 1 && timestamp_spans_substantially_overlap(left, right)
+}
+
+fn timestamp_spans_substantially_overlap(
+    left: &[HypothesisWord],
+    right: &[HypothesisWord],
+) -> bool {
+    let (Some(left_start), Some(left_end), Some(right_start), Some(right_end)) = (
+        left.first().and_then(|word| word.start_frame),
+        left.last().and_then(|word| word.end_frame),
+        right.first().and_then(|word| word.start_frame),
+        right.last().and_then(|word| word.end_frame),
+    ) else {
+        return false;
+    };
+    let overlap_start = left_start.max(right_start);
+    let overlap_end = left_end.min(right_end);
+    if overlap_end <= overlap_start {
+        return false;
+    }
+    let overlap = overlap_end - overlap_start;
+    let shorter_span = (left_end - left_start).min(right_end - right_start);
+    overlap.saturating_mul(2) >= shorter_span
 }
 
 fn normalized(display: &str) -> String {
@@ -1522,6 +1559,100 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn timestamped_pause_rollover_deduplicates_a_committed_clause_when_word_estimates_drift() {
+        let mut stabilizer =
+            TranscriptStabilizer::new(SessionId(7), RequestId(11), ModelId::new("preview-model"));
+        let opening = |sequence, window_end_frame| TranscriptHypothesis {
+            identity: identity(sequence),
+            window_start_frame: 0,
+            window_end_frame,
+            words: vec![
+                HypothesisWord::new("This").at_absolute_frames(0, 2_000),
+                HypothesisWord::new("is").at_absolute_frames(2_000, 4_000),
+                HypothesisWord::new("a").at_absolute_frames(4_000, 6_000),
+                HypothesisWord::new("model").at_absolute_frames(6_000, 10_000),
+                HypothesisWord::new("preview.").at_absolute_frames(10_000, 16_000),
+                HypothesisWord::new("And").at_absolute_frames(18_000, 21_000),
+                HypothesisWord::new("what").at_absolute_frames(21_000, 24_000),
+                HypothesisWord::new("is").at_absolute_frames(24_000, 27_000),
+                HypothesisWord::new("going").at_absolute_frames(27_000, 31_000),
+                HypothesisWord::new("on").at_absolute_frames(31_000, 34_000),
+                HypothesisWord::new("here?").at_absolute_frames(34_000, 38_000),
+            ],
+        };
+        let mut previous_committed = String::new();
+        for update in [opening(1, 48_000), opening(2, 48_000), opening(3, 56_000)] {
+            let state = stabilizer.push(update).unwrap();
+            assert!(state.committed.starts_with(&previous_committed));
+            previous_committed = state.committed;
+        }
+        assert_eq!(
+            previous_committed,
+            "This is a model preview. And what is going on here?"
+        );
+
+        let rolled = TranscriptHypothesis {
+            identity: identity(4),
+            window_start_frame: 16_000,
+            window_end_frame: 64_000,
+            words: vec![
+                HypothesisWord::new("And").at_absolute_frames(24_000, 27_000),
+                HypothesisWord::new("what").at_absolute_frames(27_000, 30_000),
+                HypothesisWord::new("is").at_absolute_frames(30_000, 33_000),
+                HypothesisWord::new("going").at_absolute_frames(33_000, 37_000),
+                HypothesisWord::new("on").at_absolute_frames(37_000, 40_000),
+                HypothesisWord::new("here?").at_absolute_frames(40_000, 44_000),
+            ],
+        };
+
+        let state = stabilizer.push(rolled).unwrap();
+
+        assert_eq!(
+            state.committed,
+            "This is a model preview. And what is going on here?"
+        );
+        assert!(
+            state.tentative.is_empty(),
+            "the rolled window must not repeat a clause whose audio span overlaps committed text"
+        );
+    }
+
+    #[test]
+    fn timestamped_disjoint_repeated_clause_remains_new_tentative_text() {
+        let mut stabilizer =
+            TranscriptStabilizer::new(SessionId(7), RequestId(11), ModelId::new("preview-model"));
+        stabilizer.committed = vec![
+            HypothesisWord::new("And").at_absolute_frames(18_000, 21_000),
+            HypothesisWord::new("what").at_absolute_frames(21_000, 24_000),
+            HypothesisWord::new("is").at_absolute_frames(24_000, 27_000),
+            HypothesisWord::new("going").at_absolute_frames(27_000, 31_000),
+            HypothesisWord::new("on").at_absolute_frames(31_000, 34_000),
+            HypothesisWord::new("here?").at_absolute_frames(34_000, 38_000),
+        ];
+        stabilizer.state.committed = render_words(&stabilizer.committed);
+        stabilizer.previous = Some(Vec::new());
+
+        let repeated_later = TranscriptHypothesis {
+            identity: identity(1),
+            window_start_frame: 32_000,
+            window_end_frame: 80_000,
+            words: vec![
+                HypothesisWord::new("And").at_absolute_frames(45_000, 48_000),
+                HypothesisWord::new("what").at_absolute_frames(48_000, 51_000),
+                HypothesisWord::new("is").at_absolute_frames(51_000, 54_000),
+                HypothesisWord::new("going").at_absolute_frames(54_000, 58_000),
+                HypothesisWord::new("on").at_absolute_frames(58_000, 61_000),
+                HypothesisWord::new("here?").at_absolute_frames(61_000, 65_000),
+            ],
+        };
+
+        let state = stabilizer.push(repeated_later).unwrap();
+
+        assert_eq!(state.committed, "And what is going on here?");
+        assert_eq!(state.tentative, "And what is going on here?");
     }
 
     #[test]
