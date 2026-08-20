@@ -17,15 +17,6 @@ impl PhysicalRect {
         Self { x0, y0, x1, y1 }
     }
 
-    fn scaled(self, scale: f32) -> Self {
-        Self::new(
-            self.x0 * scale,
-            self.y0 * scale,
-            self.x1 * scale,
-            self.y1 * scale,
-        )
-    }
-
     pub fn width(self) -> f32 {
         self.x1 - self.x0
     }
@@ -54,11 +45,16 @@ impl PhysicalRect {
 pub(super) struct DisplayLayout {
     pub scale: f32,
     pub root: PhysicalRect,
+    /// The vertical center shared by every visible content element.  Keeping
+    /// this in physical coordinates prevents a logical-pixel rounding drift
+    /// from separating the raster and UI Automation geometry at higher DPI.
+    pub content_center_y: f32,
     pub status: PhysicalRect,
     pub recording_mark: PhysicalRect,
     pub status_text: Option<PhysicalRect>,
     pub meter: PhysicalRect,
     pub elapsed: PhysicalRect,
+    pub divider: Option<PhysicalRect>,
     pub preview: Option<PhysicalRect>,
 }
 
@@ -79,30 +75,62 @@ impl DisplayLayout {
         let root = PhysicalRect::new(0.0, 0.0, bounds.width as f32, bounds.height as f32);
         Some(match mode {
             OverlayMode::Live => {
-                let recording_mark = PhysicalRect::new(16.0, 15.0, 46.0, 45.0).scaled(scale);
+                // The window can round one axis differently than the other
+                // at fractional DPI.  The physical root is the canonical
+                // capsule viewport, so its center—not a rederived logical
+                // height—is authoritative for painting and UIA.
+                let content_center_y = root.center_y();
+                let recording_mark = centered_rect(16.0, 30.0, 30.0, content_center_y, scale);
                 Self {
                     scale,
                     root,
+                    content_center_y,
                     status: recording_mark,
                     recording_mark,
                     status_text: None,
                     meter: recording_mark,
-                    elapsed: PhysicalRect::new(56.0, 20.5, 104.0, 43.5).scaled(scale),
-                    preview: Some(PhysicalRect::new(123.0, 20.5, 549.0, 43.5).scaled(scale)),
+                    elapsed: centered_rect(56.0, 48.0, 23.0, content_center_y, scale),
+                    divider: Some(centered_rect(110.5, 1.0, 24.0, content_center_y, scale)),
+                    preview: Some(centered_rect(123.0, 426.0, 23.0, content_center_y, scale)),
                 }
             }
-            OverlayMode::Minimal | OverlayMode::Off => Self {
-                scale,
-                root,
-                status: PhysicalRect::new(20.0, 16.0, 160.0, 38.0).scaled(scale),
-                recording_mark: PhysicalRect::new(20.0, 22.0, 28.0, 30.0).scaled(scale),
-                status_text: Some(PhysicalRect::new(34.0, 16.0, 160.0, 38.0).scaled(scale)),
-                meter: PhysicalRect::new(164.0, 16.0, 198.0, 36.0).scaled(scale),
-                elapsed: PhysicalRect::new(207.0, 16.5, 260.0, 37.5).scaled(scale),
-                preview: None,
-            },
+            OverlayMode::Minimal | OverlayMode::Off => {
+                let content_center_y = root.center_y();
+                Self {
+                    scale,
+                    root,
+                    content_center_y,
+                    status: centered_rect(20.0, 140.0, 22.0, content_center_y, scale),
+                    recording_mark: centered_rect(20.0, 8.0, 8.0, content_center_y, scale),
+                    status_text: Some(centered_rect(34.0, 126.0, 22.0, content_center_y, scale)),
+                    meter: centered_rect(164.0, 34.0, 20.0, content_center_y, scale),
+                    elapsed: centered_rect(207.0, 53.0, 21.0, content_center_y, scale),
+                    divider: None,
+                    preview: None,
+                }
+            }
         })
     }
+}
+
+/// Builds a physical rectangle from a logical horizontal span and one shared
+/// physical centerline.  The vertical dimensions are scaled after the
+/// centerline is chosen, so every component remains centered at fractional
+/// Windows DPI scales as well.
+fn centered_rect(
+    logical_x: f32,
+    logical_width: f32,
+    logical_height: f32,
+    physical_center_y: f32,
+    scale: f32,
+) -> PhysicalRect {
+    let physical_height = logical_height * scale;
+    PhysicalRect::new(
+        logical_x * scale,
+        physical_center_y - physical_height / 2.0,
+        (logical_x + logical_width) * scale,
+        physical_center_y + physical_height / 2.0,
+    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -152,14 +180,51 @@ mod tests {
         let layout = DisplayLayout::from_bounds(OverlayMode::Live, bounds).unwrap();
         assert_eq!(layout.scale, 1.25);
         assert_eq!(layout.root, PhysicalRect::new(0.0, 0.0, 750.0, 78.0));
+        assert_eq!(layout.content_center_y, 39.0);
         assert_eq!(
             layout.elapsed.translated(bounds.x, bounds.y),
-            PhysicalRect::new(-1050.0, 1144.625, -990.0, 1173.375)
+            PhysicalRect::new(-1050.0, 1143.625, -990.0, 1172.375)
         );
         assert_eq!(
             layout.preview.unwrap().translated(bounds.x, bounds.y),
-            PhysicalRect::new(-966.25, 1144.625, -433.75, 1173.375)
+            PhysicalRect::new(-966.25, 1143.625, -433.75, 1172.375)
         );
+    }
+
+    #[test]
+    fn every_visible_content_rect_shares_the_physical_capsule_centerline_at_supported_dpi() {
+        for (mode, logical_width, logical_height) in [
+            (OverlayMode::Live, LIVE_WIDTH, LIVE_HEIGHT),
+            (OverlayMode::Minimal, MINIMAL_WIDTH, MINIMAL_HEIGHT),
+        ] {
+            for scale in [1.0, 1.25, 1.5, 2.0] {
+                let bounds = OverlayWindowBounds {
+                    x: -960,
+                    y: 480,
+                    width: (logical_width * scale) as i32,
+                    height: (logical_height * scale) as i32,
+                };
+                let layout = DisplayLayout::from_bounds(mode, bounds).unwrap();
+                let expected_center = layout.root.center_y();
+                assert_eq!(layout.content_center_y, expected_center);
+                let elements = [
+                    Some(layout.status),
+                    Some(layout.recording_mark),
+                    layout.status_text,
+                    Some(layout.meter),
+                    Some(layout.elapsed),
+                    layout.divider,
+                    layout.preview,
+                ];
+                for rect in elements.into_iter().flatten() {
+                    assert!(
+                        (rect.center_y() - expected_center).abs() <= 0.5,
+                        "{mode:?} at {scale}x: {:?} drifted from {expected_center}",
+                        rect
+                    );
+                }
+            }
+        }
     }
 
     #[test]
