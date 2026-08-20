@@ -151,11 +151,11 @@ const MAX_HISTORY_ENTRIES_HELP: SettingsHelp = SettingsHelp::new(
 );
 const TRANSCRIPT_RETENTION_DAYS_HELP: SettingsHelp = SettingsHelp::new(
     "transcript-retention-days-help",
-    "Choose how many days an unpinned transcript or retained-audio entry can remain before Scribe removes it.",
+    "Remove the entire unpinned history entry, including any retained audio, after this many days. Pinned entries are kept.",
 );
 const AUDIO_RETENTION_DAYS_HELP: SettingsHelp = SettingsHelp::new(
     "audio-retention-days-help",
-    "Choose how many days an unpinned transcript or retained-audio entry can remain before Scribe removes it.",
+    "Remove only retained audio from unpinned entries after this many days; the transcript entry remains. Pinned entries are kept.",
 );
 const SPEECH_CONFIRMATION_HELP: SettingsHelp = SettingsHelp::new(
     "speech-confirmation-ms-help",
@@ -6045,6 +6045,7 @@ fn recording_settings_panel(
             ctx.accesskit_node_builder(radio_group_id, |builder| {
                 builder.set_role(egui::accesskit::Role::RadioGroup);
                 builder.set_name("Recording mode");
+                builder.set_description(RECORDING_MODE_HELP.description);
             });
             ctx.with_accessibility_parent(radio_group_id, || {
                 compact_setting_row(ui, "Mode", true, |ui, _| {
@@ -6123,6 +6124,7 @@ fn recording_settings_panel(
                         let capture = button(ui, capture_name, ButtonTone::Secondary);
                         ui.ctx().accesskit_node_builder(capture.id, |builder| {
                             builder.set_name(capture_name);
+                            builder.set_description(GLOBAL_RECORD_HOTKEY_HELP.description);
                             builder.set_selected(settings.hotkey_capture_active);
                         });
                         if capture.clicked() {
@@ -10308,11 +10310,16 @@ mod tests {
                 .iter()
                 .any(|(_, node)| node.role() == egui::accesskit::Role::TabList)
         );
-        assert!(
-            nodes
-                .iter()
-                .any(|(_, node)| node.role() == egui::accesskit::Role::RadioGroup)
-        );
+        assert!(nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::RadioGroup
+                && node.name() == Some("Recording mode")
+                && node.description() == Some(RECORDING_MODE_HELP.description)
+        }));
+        assert!(nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::Button
+                && node.name() == Some("Change shortcut")
+                && node.description() == Some(GLOBAL_RECORD_HOTKEY_HELP.description)
+        }));
         let selected_tab = nodes
             .iter()
             .find(|(_, node)| {
@@ -10492,6 +10499,14 @@ mod tests {
 
     #[test]
     fn non_obvious_settings_expose_contextual_help_with_accessible_descriptions() {
+        assert_eq!(
+            TRANSCRIPT_RETENTION_DAYS_HELP.description,
+            "Remove the entire unpinned history entry, including any retained audio, after this many days. Pinned entries are kept."
+        );
+        assert_eq!(
+            AUDIO_RETENTION_DAYS_HELP.description,
+            "Remove only retained audio from unpinned entries after this many days; the transcript entry remains. Pinned entries are kept."
+        );
         let settings_view = RecordingSettingsView {
             auto_insert_transcript: true,
             show_restore_clipboard: true,
@@ -11678,7 +11693,9 @@ mod tests {
             let nodes = &output.platform_output.accesskit_update.unwrap().nodes;
             if tab == SettingsTab::Recording {
                 assert!(nodes.iter().any(|(_, node)| {
-                    node.name() == Some("Cancel hotkey capture") && node.is_selected() == Some(true)
+                    node.name() == Some("Cancel hotkey capture")
+                        && node.is_selected() == Some(true)
+                        && node.description() == Some(GLOBAL_RECORD_HOTKEY_HELP.description)
                 }));
             } else {
                 let history_storage_description = format!(
