@@ -10,8 +10,9 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use crate::model_catalog::BUNDLED_BASE_MODEL_ID;
 use crate::model_catalog::runtime_model_manifest;
-use crate::models::{ModelInstallStatus, SttModelInfo, default_model_catalog};
+use crate::models::{ModelArtifactOrigin, ModelInstallStatus, SttModelInfo, default_model_catalog};
 use crate::runtime_catalog;
 #[cfg(test)]
 use crate::transcription::AccelerationPreference;
@@ -356,9 +357,19 @@ pub fn save_config(config: &AppConfig) -> Result<()> {
 }
 
 pub fn configured_models(config: &AppConfig) -> Vec<SttModelInfo> {
+    configured_models_with_bundled_path(config, bundled_model_path())
+}
+
+fn configured_models_with_bundled_path(
+    config: &AppConfig,
+    bundled_base_path: Option<PathBuf>,
+) -> Vec<SttModelInfo> {
     let mut models = default_model_catalog()
         .into_iter()
         .map(|mut model| {
+            let bundled_path = (model.id == BUNDLED_BASE_MODEL_ID)
+                .then(|| bundled_base_path.clone())
+                .flatten();
             let configured_path = config.general.model_paths.get(&model.id).cloned();
             let managed_path = managed_model_path(config, &model);
             let downloaded_path = downloaded_model_path(config, &model);
@@ -368,11 +379,31 @@ pub fn configured_models(config: &AppConfig) -> Vec<SttModelInfo> {
             let mut candidate_paths = built_in_model_candidate_paths(
                 config,
                 &model,
-                downloaded_path,
-                managed_path,
-                configured_path,
+                downloaded_path.clone(),
+                managed_path.clone(),
+                configured_path.clone(),
                 legacy_downloaded_path,
             );
+            if let Some(path) = bundled_path.as_ref() {
+                let verified_managed_primary = config
+                    .general
+                    .managed_models
+                    .get(&model.id)
+                    .is_some_and(|install| {
+                        managed_path.as_ref() == Some(&install.path)
+                            && install.source.as_deref() == Some("verified-manifest-download")
+                            && runtime_model_manifest(&ModelId::new(&model.id)).is_some_and(
+                                |manifest| {
+                                    install.sha256.as_deref().is_some_and(|sha256| {
+                                        sha256.eq_ignore_ascii_case(manifest.artifact_sha256)
+                                    })
+                                },
+                            )
+                    });
+                if !verified_managed_primary {
+                    candidate_paths.insert(0, path.clone());
+                }
+            }
             dedup_paths_preserving_order(&mut candidate_paths);
 
             let installed_path = first_valid_model_path(&model, candidate_paths.iter().cloned());
@@ -380,7 +411,19 @@ pub fn configured_models(config: &AppConfig) -> Vec<SttModelInfo> {
             model.local_path = installed_path
                 .clone()
                 .or(existing_invalid_path)
-                .or(explicit_path);
+                .or(explicit_path)
+                .or_else(|| bundled_path.clone());
+            model.artifact_origin = match model.local_path.as_ref() {
+                Some(path) if bundled_path.as_ref() == Some(path) => ModelArtifactOrigin::Bundled,
+                Some(path)
+                    if managed_path.as_ref() == Some(path)
+                        || downloaded_path.as_ref() == Some(path) =>
+                {
+                    ModelArtifactOrigin::Managed
+                }
+                Some(_) => ModelArtifactOrigin::External,
+                None => ModelArtifactOrigin::Catalog,
+            };
             model.install_status = if installed_path.is_some() {
                 ModelInstallStatus::Installed
             } else if model.local_path.is_some() {
@@ -585,6 +628,7 @@ fn remote_model_info(id: &str, install: &ManagedRemoteModelInstall) -> SttModelI
         accuracy_tier: "Runtime-validated".to_owned(),
         speed_tier: "Not measured".to_owned(),
         local_path: Some(install.path.clone()),
+        artifact_origin: ModelArtifactOrigin::Managed,
         install_status: if file_matches {
             ModelInstallStatus::Installed
         } else {
@@ -604,6 +648,7 @@ fn imported_gguf_model_info(id: &str, install: &ImportedGgufModelInstall) -> Stt
         accuracy_tier: "Runtime-validated local import".to_owned(),
         speed_tier: "Not measured".to_owned(),
         local_path: Some(install.path.clone()),
+        artifact_origin: ModelArtifactOrigin::Imported,
         install_status: ModelInstallStatus::Installed,
         download_model: None,
     }
@@ -643,6 +688,28 @@ pub fn model_storage_dir(config: &AppConfig) -> PathBuf {
     } else {
         config.general.model_storage_dir.clone()
     }
+}
+
+/// Resolves the release-bundled base model directly beside the executable.
+/// The path is never persisted or copied into writable application storage.
+pub(crate) fn bundled_model_path() -> Option<PathBuf> {
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    {
+        std::env::current_exe()
+            .ok()
+            .and_then(|executable| bundled_model_path_for_executable(&executable))
+    }
+    #[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
+    {
+        None
+    }
+}
+
+fn bundled_model_path_for_executable(executable: &Path) -> Option<PathBuf> {
+    let manifest = runtime_model_manifest(&ModelId::new(BUNDLED_BASE_MODEL_ID))?;
+    executable
+        .parent()
+        .map(|directory| directory.join(manifest.artifact_filename))
 }
 
 pub fn runtime_storage_dir() -> PathBuf {
@@ -864,7 +931,7 @@ pub fn normalize_config(config: &mut AppConfig) {
             .iter()
             .any(|model| model.id == config.general.selected_default_model)
     {
-        config.general.selected_default_model = "whisper_cpp_tiny_en".to_owned();
+        config.general.selected_default_model = BUNDLED_BASE_MODEL_ID.to_owned();
     }
 
     config
@@ -1281,6 +1348,149 @@ fn first_non_empty_path(paths: impl IntoIterator<Item = Option<PathBuf>>) -> Opt
 mod tests {
     use super::*;
 
+    fn unique_bundled_root(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "scribe-bundled-{label}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn bundled_base_model_resolves_as_an_immutable_executable_sibling() {
+        let executable = Path::new("release").join("local-transcriber.exe");
+
+        assert_eq!(
+            bundled_model_path_for_executable(&executable).as_deref(),
+            Some(
+                Path::new("release")
+                    .join("whisper-base.en-Q8_0.gguf")
+                    .as_path()
+            )
+        );
+    }
+
+    #[test]
+    fn fresh_profile_projects_present_or_missing_bundled_base_without_persisting_it() {
+        let root = unique_bundled_root("projection");
+        fs::create_dir_all(&root).unwrap();
+        let bundle = root.join("whisper-base.en-Q8_0.gguf");
+        let mut config = AppConfig::default();
+        config.general.model_storage_dir = root.join("storage");
+        assert!(
+            !config
+                .general
+                .model_paths
+                .contains_key(BUNDLED_BASE_MODEL_ID)
+        );
+
+        let missing = configured_models_with_bundled_path(&config, Some(bundle.clone()))
+            .into_iter()
+            .find(|model| model.id == BUNDLED_BASE_MODEL_ID)
+            .unwrap();
+        assert_eq!(missing.local_path.as_deref(), Some(bundle.as_path()));
+        assert_eq!(missing.artifact_origin, ModelArtifactOrigin::Bundled);
+        assert_eq!(missing.install_status, ModelInstallStatus::Missing);
+
+        fs::write(&bundle, b"packaged model fixture").unwrap();
+        let included = configured_models_with_bundled_path(&config, Some(bundle.clone()))
+            .into_iter()
+            .find(|model| model.id == BUNDLED_BASE_MODEL_ID)
+            .unwrap();
+        assert_eq!(included.local_path.as_deref(), Some(bundle.as_path()));
+        assert_eq!(included.artifact_origin, ModelArtifactOrigin::Bundled);
+        assert_eq!(included.install_status, ModelInstallStatus::Installed);
+        assert!(
+            !config
+                .general
+                .model_paths
+                .contains_key(BUNDLED_BASE_MODEL_ID)
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bundled_projection_does_not_mutate_existing_managed_base_configuration() {
+        let root = unique_bundled_root("managed-preservation");
+        fs::create_dir_all(&root).unwrap();
+        let bundle = root.join("whisper-base.en-Q8_0.gguf");
+        let managed = root.join("managed").join("whisper-base.en-Q8_0.gguf");
+        fs::create_dir_all(managed.parent().unwrap()).unwrap();
+        fs::write(&bundle, b"packaged fixture").unwrap();
+        fs::write(&managed, b"managed fixture").unwrap();
+        let mut config = AppConfig::default();
+        config.general.model_storage_dir = root.join("storage");
+        config
+            .general
+            .model_paths
+            .insert(BUNDLED_BASE_MODEL_ID.to_owned(), managed.clone());
+        config.general.managed_models.insert(
+            BUNDLED_BASE_MODEL_ID.to_owned(),
+            ManagedModelInstall::app_managed(managed.clone(), "legacy-model-path"),
+        );
+        let before = serde_json::to_value(&config).unwrap();
+
+        let projected = configured_models_with_bundled_path(&config, Some(bundle.clone()))
+            .into_iter()
+            .find(|model| model.id == BUNDLED_BASE_MODEL_ID)
+            .unwrap();
+
+        assert_eq!(projected.local_path.as_deref(), Some(bundle.as_path()));
+        assert_eq!(projected.artifact_origin, ModelArtifactOrigin::Bundled);
+        assert_eq!(serde_json::to_value(&config).unwrap(), before);
+        assert!(managed.is_file());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn verified_user_triggered_repair_supersedes_a_corrupt_bundled_artifact() {
+        let root = unique_bundled_root("verified-repair");
+        fs::create_dir_all(&root).unwrap();
+        let bundle = root.join("whisper-base.en-Q8_0.gguf");
+        let managed = root.join("managed").join("whisper-base.en-Q8_0.gguf");
+        fs::create_dir_all(managed.parent().unwrap()).unwrap();
+        fs::write(&bundle, b"corrupt packaged fixture").unwrap();
+        fs::write(&managed, b"verified managed fixture").unwrap();
+        let manifest = runtime_model_manifest(&ModelId::new(BUNDLED_BASE_MODEL_ID)).unwrap();
+        let mut config = AppConfig::default();
+        config.general.model_storage_dir = root.join("storage");
+        let mut receipt =
+            ManagedModelInstall::app_managed(managed.clone(), "verified-manifest-download");
+        receipt.sha256 = Some(manifest.artifact_sha256.to_owned());
+        config
+            .general
+            .managed_models
+            .insert(BUNDLED_BASE_MODEL_ID.to_owned(), receipt);
+
+        let projected = configured_models_with_bundled_path(&config, Some(bundle))
+            .into_iter()
+            .find(|model| model.id == BUNDLED_BASE_MODEL_ID)
+            .unwrap();
+
+        assert_eq!(projected.local_path.as_deref(), Some(managed.as_path()));
+        assert_eq!(projected.artifact_origin, ModelArtifactOrigin::Managed);
+        assert!(managed.is_file());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn fresh_default_is_base_and_normalization_preserves_an_explicit_existing_selection() {
+        let fresh = AppConfig::default();
+        assert_eq!(fresh.general.selected_default_model, BUNDLED_BASE_MODEL_ID);
+
+        let mut existing = AppConfig::default();
+        existing.general.selected_default_model = "whisper_cpp_small_en".to_owned();
+        normalize_config(&mut existing);
+        assert_eq!(
+            existing.general.selected_default_model,
+            "whisper_cpp_small_en"
+        );
+    }
+
     #[test]
     fn old_config_without_playground_order_normalizes() {
         let old_config = r#"{
@@ -1520,7 +1730,7 @@ mod tests {
         normalize_config(&mut config);
 
         assert!(config.general.playground_selected_models.is_empty());
-        assert_eq!(config.general.selected_default_model, "whisper_cpp_tiny_en");
+        assert_eq!(config.general.selected_default_model, BUNDLED_BASE_MODEL_ID);
     }
 
     #[test]

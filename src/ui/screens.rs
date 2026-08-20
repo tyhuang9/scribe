@@ -7,6 +7,9 @@ use eframe::egui::{
     Sense, Stroke, Vec2,
 };
 
+#[cfg(test)]
+use crate::model_catalog::BUNDLED_BASE_MODEL_ID;
+
 use super::{
     about_page,
     controls::{
@@ -2330,6 +2333,19 @@ fn model_lifecycle_presentation<'a>(
                 tone: ModelLifecycleTone::Standard,
             }
         }
+        ModelCard::Local(model) if model.included => ModelLifecyclePresentation {
+            action: ScreenAction::None,
+            icon: Icon::CheckCircle,
+            label: "Included".into(),
+            accessible_name: format!("{} is included with Scribe", model.display_name),
+            enabled: false,
+            disabled_reason: Some(
+                "This verified model is included with Scribe and cannot be removed.",
+            ),
+            visible_status: None,
+            compact_size: None,
+            tone: ModelLifecycleTone::Standard,
+        },
         ModelCard::Local(model) if model.installed => {
             if model.primary_action_installs_upgrade || model.primary_action_repairs_runtime {
                 let upgrade = model.primary_action_installs_upgrade;
@@ -2377,7 +2393,9 @@ fn model_lifecycle_presentation<'a>(
             }
         }
         ModelCard::Local(model) => {
-            let (action, label) = if model.primary_action_installs_upgrade {
+            let (action, label) = if model.bundled {
+                (ScreenAction::InstallModel(model.id.clone()), "Repair")
+            } else if model.primary_action_installs_upgrade {
                 (ScreenAction::UpgradeModel(model.id.clone()), "Upgrade")
             } else {
                 (
@@ -7575,6 +7593,50 @@ mod tests {
             let presentation = model_lifecycle_presentation(ModelCard::Local(&model), true);
             assert_eq!(presentation.tone, ModelLifecycleTone::InverseFilled);
         }
+    }
+
+    #[test]
+    fn bundled_model_lifecycle_is_included_or_user_triggered_repair() {
+        let included = ModelViewModel {
+            id: BUNDLED_BASE_MODEL_ID.into(),
+            display_name: "Whisper Base — English".into(),
+            bundled: true,
+            included: true,
+            installed: true,
+            ready: true,
+            removal_supported: false,
+            download_state: ModelDownloadState::Installed,
+            ..Default::default()
+        };
+        let presentation = model_lifecycle_presentation(ModelCard::Local(&included), true);
+        assert_eq!(presentation.action, ScreenAction::None);
+        assert_eq!(presentation.label, "Included");
+        assert_eq!(presentation.icon, Icon::CheckCircle);
+        assert!(!presentation.enabled);
+        assert_eq!(
+            presentation.disabled_reason,
+            Some("This verified model is included with Scribe and cannot be removed.")
+        );
+
+        let repair = ModelViewModel {
+            id: BUNDLED_BASE_MODEL_ID.into(),
+            display_name: "Whisper Base — English".into(),
+            bundled: true,
+            install_supported: true,
+            install_action_enabled: true,
+            download_state: ModelDownloadState::Failed,
+            primary_action_disabled_reason: Some(
+                "Repair downloads the exact pinned model after you choose it.".into(),
+            ),
+            ..Default::default()
+        };
+        let presentation = model_lifecycle_presentation(ModelCard::Local(&repair), true);
+        assert_eq!(
+            presentation.action,
+            ScreenAction::InstallModel(BUNDLED_BASE_MODEL_ID.into())
+        );
+        assert_eq!(presentation.label, "Repair");
+        assert!(presentation.enabled);
     }
 
     #[test]

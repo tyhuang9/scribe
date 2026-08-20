@@ -10,6 +10,7 @@ use crate::transcription::ModelId;
 const WHISPER_CPP_REVISION: &str = "5359861c739e955e79d9a303bcbc70fb988958b1";
 const HANDY_COMPUTER_TINY_EN_REVISION: &str = "becb8bcb804405dc97b380a523d9975888820986";
 const COMPATIBILITY_EVIDENCE_DOCUMENT: &str = "docs/SCRIBE_REVAMP.md";
+pub(crate) const BUNDLED_BASE_MODEL_ID: &str = "whisper_cpp_base_en";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum RuntimeRequirement {
@@ -286,7 +287,7 @@ const PHASE_TWO_BASE_SMOKE: CompatibilityEvidence = CompatibilityEvidence {
 const MODELS: &[ModelManifest] = &[
     handy_computer_tiny_en_manifest(),
     whisper_manifest(
-        "whisper_cpp_base_en",
+        BUNDLED_BASE_MODEL_ID,
         "Whisper Base — English",
         "base.en",
         ModelGuidance {

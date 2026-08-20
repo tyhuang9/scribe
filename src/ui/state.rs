@@ -279,6 +279,10 @@ pub(crate) struct ModelViewModel {
     pub artifact_revision: Option<String>,
     pub artifact_filename: Option<String>,
     pub artifact_path: Option<String>,
+    /// The immutable Windows x64 release asset expected beside Scribe.
+    pub bundled: bool,
+    /// A verified bundled asset whose embedded runtime is ready.
+    pub included: bool,
     pub installed: bool,
     /// A canonical app-owned GGML artifact retained for explicit migration or removal.
     pub legacy_cleanup_pending: bool,
