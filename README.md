@@ -256,13 +256,15 @@ with:
   -ModelSource C:\path\to\whisper-base.en-Q8_0.gguf
 ```
 
-The bundler stages the compatibility package under
-`target/release/runtimes/whisper_cpp` and the exact pinned base.en GGUF beside
-`local-transcriber.exe`. It checks the model's 84,886,208-byte size and
-SHA-256 before and after staging, includes its redistribution notices, and
-runs an offline load/decode/cancel/unload smoke. The scripts do not download
-the model. The app validates the exact artifact again before use; packaging
-variants do not create additional logical runtime kinds.
+The bundler performs a locked, offline build for `x86_64-pc-windows-msvc`,
+then stages an explicit artifact allowlist in a unique transaction directory.
+Only after the compatibility runtime, executable architecture, exact pinned
+base.en GGUF, redistribution notices, offline load/decode/cancel/unload smoke,
+and generated hash inventory all validate is the directory atomically renamed
+to `artifacts/Scribe-windows-x64`. Cargo's `target` tree remains build input and
+is never used or mutated as the distributable bundle. The scripts do not
+download the model. The app validates the exact artifact again before use;
+packaging variants do not create additional logical runtime kinds.
 
 The repository retains separate faster-whisper, Vosk, sherpa-onnx, Moonshine,
 Parakeet, and CUDA scripts solely for bounded development investigation and

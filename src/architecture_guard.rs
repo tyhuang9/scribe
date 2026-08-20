@@ -443,6 +443,10 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
         "TRANSFORMERS_OFFLINE",
         "cancellation_verified",
         "capabilities.cancellation",
+        "exact executable name local-transcriber.exe",
+        "canonical executable parent must equal",
+        "Assert-NoReparseAncestors",
+        "Assert-TreeHasNoReparsePoints",
     ] {
         assert!(
             bundler.contains(required),
@@ -458,8 +462,53 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
 
     let release = fs::read_to_string(repository.join("scripts").join("build-windows-release.ps1"))
         .expect("Windows release script must be readable");
-    assert!(release.contains("bundle-whisper-runtime.ps1"));
-    assert!(release.contains("bundle-base-model.ps1"));
+    for required in [
+        "cargo build --locked --offline --release --all-features --target $targetTriple",
+        "x86_64-pc-windows-msvc",
+        r#"target\$targetTriple\release"#,
+        "Assert-Amd64Pe",
+        "0x8664",
+        "Assert-SafeStagingPath",
+        "Remove-ValidatedStaging",
+        "Assert-ExactAllowlist",
+        "bundle-inventory.json",
+        "Move-Item -LiteralPath $stagingBundle -Destination $finalBundle",
+        r#"artifacts\Scribe-windows-x64"#,
+        "Final release bundle already exists",
+        "A stale release staging sibling exists",
+    ] {
+        assert!(
+            release.contains(required),
+            "Windows release packaging must retain {required}"
+        );
+    }
+    assert!(
+        !release.contains(r#"target\release"#),
+        "the unqualified Cargo release directory must not be used as a bundle"
+    );
+
+    let packaging_tests = fs::read_to_string(
+        repository
+            .join("scripts")
+            .join("test-windows-release-packaging.ps1"),
+    )
+    .expect("Windows release fail-closed tests must be readable");
+    for required in [
+        "PE Machine mismatch",
+        "Validated staging cleanup",
+        "Out-of-bounds cleanup",
+        "outside the explicit allowlist",
+        "Cargo-target bundle path",
+        "Existing final bundle",
+        "Stale staging refusal",
+        "exact executable name",
+        "canonical executable parent",
+    ] {
+        assert!(
+            packaging_tests.contains(required),
+            "Windows release fail-closed tests must cover {required}"
+        );
+    }
 
     let notice = fs::read_to_string(
         repository
@@ -473,6 +522,11 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
     assert!(notice.contains(catalog.artifact_sha256));
     assert!(notice.contains("Apache-2.0.txt"));
     assert!(notice.contains("OpenAI-Whisper-MIT.txt"));
+    assert!(notice.contains("official OpenAI Whisper model distribution metadata"));
+    assert!(notice.contains("artifacts as Apache-2.0"));
+    assert!(notice.contains("source-code repository includes an MIT License"));
+    assert!(notice.contains("not presented here as the license for the"));
+    assert!(notice.contains("does not state a legal conclusion"));
     let upstream_mit = fs::read_to_string(
         repository
             .join("resources")

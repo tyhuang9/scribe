@@ -108,7 +108,7 @@ The distinction below is deliberate and must remain explicit in later reports.
 
 | Target | Current package behavior | Current status |
 | --- | --- | --- |
-| Windows x86_64 | One pinned whisper.cpp v1.9.1 CPU compatibility package plus the pinned base.en Q8_0 GGUF beside the executable. `Auto` and `Cpu` resolve to CPU; `Gpu` returns a structured unsupported-GPU error. `build-windows-release.ps1` stages both from local sources and runs the GGUF smoke offline. | **Source/manifests and packaging enforcement are implemented; physical packaged desktop acceptance remains required.** |
+| Windows x86_64 | One pinned whisper.cpp v1.9.1 CPU compatibility package plus the pinned base.en Q8_0 GGUF beside the executable. `Auto` and `Cpu` resolve to CPU; `Gpu` returns a structured unsupported-GPU error. `build-windows-release.ps1` performs a locked, offline target-triple build, validates AMD64 PE inputs, stages an explicit allowlist in a unique sibling transaction directory, runs the GGUF smoke offline, writes a hash inventory, and only then atomically publishes `artifacts/Scribe-windows-x64`. | **Source/manifests and packaging enforcement are implemented; physical packaged desktop acceptance remains required.** |
 | macOS | No pinned primary package in the checked-in manifest. No Metal package is verified. | **Unavailable / unverified; do not claim CPU or Metal release support.** |
 | Linux | No pinned primary package in the checked-in manifest. No Vulkan or other GPU package is verified. | **Unavailable / unverified; do not claim CPU or GPU release support.** |
 

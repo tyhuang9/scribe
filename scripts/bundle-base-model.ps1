@@ -13,6 +13,71 @@ $repositoryRoot = Split-Path -Parent $PSScriptRoot
 $manifestPath = Join-Path $repositoryRoot "runtime-manifests\whisper-base-en-q8_0-windows-x64.json"
 $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
 
+function Get-NormalizedFullPath([string]$Path) {
+    $full = [System.IO.Path]::GetFullPath($Path)
+    $root = [System.IO.Path]::GetPathRoot($full)
+    if ([string]::Equals($full, $root, [System.StringComparison]::OrdinalIgnoreCase)) {
+        return $root
+    }
+    return $full.TrimEnd([char[]]@('\', '/'))
+}
+
+function Assert-NoReparseAncestors([string]$Path) {
+    $current = Get-NormalizedFullPath $Path
+    while (-not (Test-Path -LiteralPath $current)) {
+        $parent = Split-Path -Parent $current
+        if (-not $parent -or $parent -eq $current) {
+            throw "Could not resolve an existing ancestor for bundled-model output: $Path"
+        }
+        $current = $parent
+    }
+    while ($current) {
+        $item = Get-Item -LiteralPath $current -Force
+        if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Bundled-model output cannot cross a symbolic link or reparse point: $current"
+        }
+        $parent = Split-Path -Parent $current
+        if (-not $parent -or $parent -eq $current) {
+            break
+        }
+        $current = $parent
+    }
+}
+
+function Assert-RegularFile([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "Required bundled-model file is missing: $Path"
+    }
+    $item = Get-Item -LiteralPath $Path -Force
+    if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "Bundled-model files cannot be symbolic links or reparse points: $Path"
+    }
+    return $item
+}
+
+function Assert-SafeStagingPath([string]$StagingPath, [string]$DestinationPath) {
+    $staging = Get-NormalizedFullPath $StagingPath
+    $destination = Get-NormalizedFullPath $DestinationPath
+    if (-not [string]::Equals((Split-Path -Parent $staging), $destination, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Bundled-model staging must be a direct child of the destination."
+    }
+    if ((Split-Path -Leaf $staging) -cnotmatch '^\.scribe-base-model-staging-[0-9]+-[0-9a-f]{32}$') {
+        throw "Bundled-model staging path does not match the bounded transaction name."
+    }
+}
+
+function Assert-TreeHasNoReparsePoints([string]$Root) {
+    $rootItem = Get-Item -LiteralPath $Root -Force
+    if (($rootItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "Bundled-model staging root cannot be a reparse point: $Root"
+    }
+    foreach ($item in Get-ChildItem -LiteralPath $Root -Recurse -Force) {
+        if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Bundled-model staging cannot contain a reparse point: $($item.FullName)"
+        }
+    }
+}
+
 if (-not [Environment]::Is64BitOperatingSystem -or
     [Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
     throw "The bundled base model is release-qualified only for Windows x64."
@@ -21,21 +86,30 @@ if (-not $Destination) {
     $Destination = Join-Path $repositoryRoot "target\$Profile"
 }
 
-$sourcePath = [System.IO.Path]::GetFullPath($Source)
-$destinationRoot = [System.IO.Path]::GetFullPath($Destination)
+$sourcePath = Get-NormalizedFullPath $Source
+$destinationRoot = Get-NormalizedFullPath $Destination
 if (-not $Executable) {
     $Executable = Join-Path $destinationRoot "local-transcriber.exe"
 }
-$executablePath = [System.IO.Path]::GetFullPath($Executable)
+$executablePath = Get-NormalizedFullPath $Executable
 $destinationModel = Join-Path $destinationRoot $manifest.artifact_filename
 
+if (-not (Test-Path -LiteralPath $destinationRoot -PathType Container)) {
+    throw "Bundled-model destination must already exist: $destinationRoot"
+}
+if ((Split-Path -Leaf $executablePath) -cne "local-transcriber.exe") {
+    throw "Bundled-model smoke requires the exact executable name local-transcriber.exe."
+}
+$executableParent = Get-NormalizedFullPath (Split-Path -Parent $executablePath)
+if (-not [string]::Equals($executableParent, $destinationRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+    throw "The canonical executable parent must equal the bundled-model destination."
+}
+Assert-NoReparseAncestors $destinationRoot
+Assert-NoReparseAncestors $executablePath
 if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) {
     throw "Pinned model source does not exist: $sourcePath"
 }
-$sourceItem = Get-Item -LiteralPath $sourcePath -Force
-if (($sourceItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
-    throw "Pinned model source cannot be a symbolic link or reparse point: $sourcePath"
-}
+$sourceItem = Assert-RegularFile $sourcePath
 if ($sourceItem.Length -ne [int64]$manifest.size_bytes) {
     throw "Pinned model size mismatch for $sourcePath"
 }
@@ -43,15 +117,13 @@ $sourceHash = (Get-FileHash -LiteralPath $sourcePath -Algorithm SHA256).Hash.ToL
 if ($sourceHash -ne $manifest.sha256) {
     throw "Pinned model hash mismatch for $sourcePath"
 }
-if (-not (Test-Path -LiteralPath $executablePath -PathType Leaf)) {
-    throw "Release executable does not exist: $executablePath"
-}
+$null = Assert-RegularFile $executablePath
 if (Test-Path -LiteralPath $destinationModel) {
     throw "Bundled model destination already exists; remove or archive it explicitly first: $destinationModel"
 }
 
-New-Item -ItemType Directory -Path $destinationRoot -Force | Out-Null
-$stagingRoot = Join-Path $destinationRoot ".scribe-base-model-staging-$PID"
+$stagingRoot = Join-Path $destinationRoot ".scribe-base-model-staging-$PID-$([guid]::NewGuid().ToString('N'))"
+Assert-SafeStagingPath $stagingRoot $destinationRoot
 if (Test-Path -LiteralPath $stagingRoot) {
     throw "Bundled model staging directory already exists: $stagingRoot"
 }
@@ -80,8 +152,12 @@ try {
         Copy-Item -LiteralPath $licenseSource -Destination $stagedLicenses
     }
 
+    Assert-NoReparseAncestors $destinationRoot
+    Assert-SafeStagingPath $stagingRoot $destinationRoot
+    Assert-TreeHasNoReparsePoints $stagingRoot
+
     Move-Item -LiteralPath $stagedModel -Destination $destinationModel
-    $createdPaths.Add($destinationModel)
+    $null = $createdPaths.Add($destinationModel)
     if (-not (Test-Path -LiteralPath $licenseDestination)) {
         New-Item -ItemType Directory -Path $licenseDestination | Out-Null
         $createdLicenseDirectory = $true
@@ -99,8 +175,15 @@ try {
         }
         else {
             Move-Item -LiteralPath $stagedLicense -Destination $destinationLicense
-            $createdPaths.Add($destinationLicense)
+            $null = $createdPaths.Add($destinationLicense)
         }
+    }
+
+    Assert-NoReparseAncestors $destinationRoot
+    $null = Assert-RegularFile $executablePath
+    $null = Assert-RegularFile $destinationModel
+    foreach ($relativePath in $manifest.attribution_files) {
+        $null = Assert-RegularFile (Join-Path $licenseDestination (Split-Path -Leaf $relativePath))
     }
 
     $previousHubOffline = $env:HF_HUB_OFFLINE
@@ -136,6 +219,7 @@ try {
     Write-Output "Bundled and offline-smoke-verified $($manifest.model_id) at $destinationModel"
 }
 catch {
+    Assert-NoReparseAncestors $destinationRoot
     foreach ($createdPath in $createdPaths) {
         if (Test-Path -LiteralPath $createdPath -PathType Leaf) {
             Remove-Item -LiteralPath $createdPath -Force
@@ -148,6 +232,9 @@ catch {
 }
 finally {
     if (Test-Path -LiteralPath $stagingRoot) {
+        Assert-SafeStagingPath $stagingRoot $destinationRoot
+        Assert-NoReparseAncestors $stagingRoot
+        Assert-TreeHasNoReparsePoints $stagingRoot
         Remove-Item -LiteralPath $stagingRoot -Recurse -Force
     }
 }
