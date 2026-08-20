@@ -15231,7 +15231,7 @@ mod layout_tests {
             max_duration_seconds: 30,
             latency: LatencyTrace::started_at(Instant::now(), TriggerObservation::HotkeyPoll),
             capture_diagnostics: CaptureDiagnosticContext::default(),
-            abandon: Arc::new(AtomicBool::new(false)),
+            cancellation: CaptureCancellation::new(),
         });
 
         app.tx
