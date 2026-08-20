@@ -286,7 +286,25 @@ fn control_tree(visible: bool, bounds: Option<OverlayWindowBounds>) -> TreeUpdat
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::overlay::controller::OverlayTranscript;
+    use crate::overlay::{
+        controller::OverlayTranscript,
+        platform::{OverlayPosition, PhysicalWorkArea, calculate_window_bounds},
+        view::window_spec,
+    };
+
+    fn production_bounds(mode: OverlayMode, dpi: u32) -> OverlayWindowBounds {
+        calculate_window_bounds(
+            PhysicalWorkArea {
+                left: -2_000,
+                top: 100,
+                right: 2_000,
+                bottom: 2_000,
+            },
+            dpi,
+            window_spec(mode),
+            OverlayPosition::BottomCenter,
+        )
+    }
 
     fn display_bounds(mode: OverlayMode) -> OverlayWindowBounds {
         match mode {
@@ -485,17 +503,9 @@ mod tests {
 
     #[test]
     fn visible_uia_bounds_are_the_shared_layout_outputs_at_every_supported_dpi() {
-        for (mode, logical_width, logical_height) in [
-            (OverlayMode::Live, 600.0, 62.0),
-            (OverlayMode::Minimal, 320.0, 52.0),
-        ] {
-            for scale in [1.0, 1.25, 1.5, 2.0] {
-                let bounds = OverlayWindowBounds {
-                    x: -480,
-                    y: 320,
-                    width: (logical_width * scale) as i32,
-                    height: (logical_height * scale) as i32,
-                };
+        for mode in [OverlayMode::Live, OverlayMode::Minimal] {
+            for dpi in [96, 120, 144, 192] {
+                let bounds = production_bounds(mode, dpi);
                 let state = OverlayViewState {
                     mode,
                     phase: OverlayPhase::Listening,

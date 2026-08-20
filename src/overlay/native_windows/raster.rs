@@ -835,13 +835,45 @@ impl<'a> Canvas<'a> {
         style: TextStyle,
         color: Argb,
     ) -> Result<f32, RasterError> {
-        let bounds = self.measure_text_bounds(text, font_size, style)?;
-        // GDI+ positions glyphs relative to the layout rectangle rather than
-        // at a baseline supplied by us.  Center the measured glyph bounds on
-        // the shared physical centerline so ascenders/descenders cannot
-        // introduce a DPI-dependent visual drift from the UIA rectangle.
-        let y = rect.center_y() - bounds.Y - bounds.Height / 2.0;
+        // GDI+ lays glyph ink within its em box. Measure the same rasterized
+        // glyph run used for painting, then align that measured ink center to
+        // the physical layout centerline instead of assuming a font ascent.
+        let y = rect.center_y() - self.measure_text_ink_center_y(text, width, font_size, style)?;
         self.draw_text(text, x, y, width, rect.height(), font_size, style, color)
+    }
+
+    fn measure_text_ink_center_y(
+        &mut self,
+        text: &str,
+        width: f32,
+        font_size: f32,
+        style: TextStyle,
+    ) -> Result<f32, RasterError> {
+        let width = width.ceil().clamp(1.0, 32_768.0) as i32;
+        let height = (font_size * 4.0).ceil().max(1.0) as i32;
+        let mut probe = LayeredFrame::transparent(width, height)?;
+        let mut probe_canvas = Canvas::new(self.rasterizer, &mut probe.pixels, width, height)?;
+        probe_canvas.draw_text(
+            text,
+            0.0,
+            0.0,
+            width as f32,
+            height as f32,
+            font_size,
+            style,
+            Argb::new(255, 255, 255, 255),
+        )?;
+        drop(probe_canvas);
+        let mut first = None;
+        let mut last = None;
+        for y in 0..height {
+            if (0..width).any(|x| probe.pixels[((y * width + x) * 4 + 3) as usize] > 0) {
+                first.get_or_insert(y);
+                last = Some(y);
+            }
+        }
+        let (first, last) = first.zip(last).ok_or(RasterError::TextTooLong)?;
+        Ok((first + last + 1) as f32 / 2.0)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1351,8 +1383,16 @@ pub(super) enum RasterError {
 mod tests {
     use std::{cell::Cell, sync::Mutex};
 
+    use super::super::layout::PhysicalRect;
     use super::*;
-    use crate::{overlay::controller::OverlayAudioLevel, transcription::SessionId};
+    use crate::{
+        overlay::{
+            controller::OverlayAudioLevel,
+            platform::{OverlayPosition, PhysicalWorkArea, calculate_window_bounds},
+            view::window_spec,
+        },
+        transcription::SessionId,
+    };
 
     static RASTER_TEST_MUTEX: Mutex<()> = Mutex::new(());
 
@@ -1380,6 +1420,118 @@ mod tests {
         }
     }
 
+    fn production_bounds(mode: OverlayMode, dpi: u32) -> OverlayWindowBounds {
+        calculate_window_bounds(
+            PhysicalWorkArea {
+                left: -2_000,
+                top: 100,
+                right: 2_000,
+                bottom: 2_000,
+            },
+            dpi,
+            window_spec(mode),
+            OverlayPosition::BottomCenter,
+        )
+    }
+
+    fn capsule_only_frame(
+        rasterizer: &NativeRasterizer,
+        mode: OverlayMode,
+        dark_mode: bool,
+        width: i32,
+        height: i32,
+    ) -> LayeredFrame {
+        let mut frame = LayeredFrame::transparent(width, height).unwrap();
+        let layout = DisplayLayout::from_bounds(
+            mode,
+            OverlayWindowBounds {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            },
+        )
+        .unwrap();
+        let mut canvas = Canvas::new(rasterizer, &mut frame.pixels, width, height).unwrap();
+        draw_capsule(
+            &mut canvas,
+            mode,
+            layout.scale,
+            NativeColors::for_theme(dark_mode),
+        )
+        .unwrap();
+        drop(canvas);
+        frame
+    }
+
+    #[derive(Debug)]
+    struct InkBounds {
+        x0: i32,
+        y0: i32,
+        x1: i32,
+        y1: i32,
+    }
+
+    impl InkBounds {
+        fn center_y(&self) -> f32 {
+            (self.y0 + self.y1 + 1) as f32 / 2.0
+        }
+    }
+
+    fn component_ink_bounds(
+        content: &LayeredFrame,
+        capsule_only: &LayeredFrame,
+        rect: PhysicalRect,
+    ) -> Option<InkBounds> {
+        assert_eq!(
+            (content.width, content.height),
+            (capsule_only.width, capsule_only.height)
+        );
+        let x0 = rect.x0.floor().max(0.0) as i32;
+        let y0 = rect.y0.floor().max(0.0) as i32;
+        let x1 = rect.x1.ceil().min(content.width as f32) as i32;
+        let y1 = rect.y1.ceil().min(content.height as f32) as i32;
+        let mut result: Option<InkBounds> = None;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let offset = ((y * content.width + x) * 4) as usize;
+                if content.pixels[offset..offset + 4] != capsule_only.pixels[offset..offset + 4] {
+                    let bounds = result.get_or_insert(InkBounds {
+                        x0: x,
+                        y0: y,
+                        x1: x,
+                        y1: y,
+                    });
+                    bounds.x0 = bounds.x0.min(x);
+                    bounds.y0 = bounds.y0.min(y);
+                    bounds.x1 = bounds.x1.max(x);
+                    bounds.y1 = bounds.y1.max(y);
+                }
+            }
+        }
+        result
+    }
+
+    fn assert_component_is_centered_and_unclipped(
+        component: &str,
+        content: &LayeredFrame,
+        capsule_only: &LayeredFrame,
+        rect: PhysicalRect,
+        center_y: f32,
+    ) {
+        let ink = component_ink_bounds(content, capsule_only, rect)
+            .unwrap_or_else(|| panic!("{component} painted no ink beyond the capsule"));
+        assert!(
+            (ink.center_y() - center_y).abs() <= 0.5,
+            "{component} ink center {} drifted from physical centerline {center_y}: {ink:?}",
+            ink.center_y(),
+        );
+        assert!(
+            ink.x0 > 0 && ink.y0 > 0 && ink.x1 < content.width - 1 && ink.y1 < content.height - 1,
+            "{component} ink touched the frame edge and may be clipped: {ink:?}"
+        );
+    }
+
     #[test]
     fn live_frame_has_transparent_corners_and_a_painted_capsule() {
         let frame = with_rasterizer(|rasterizer| {
@@ -1405,25 +1557,72 @@ mod tests {
     }
 
     #[test]
-    fn light_and_dark_capsules_paint_at_the_shared_centerline_for_supported_dpi() {
+    fn every_rastered_content_element_uses_the_production_centerline_at_supported_dpi() {
         with_rasterizer(|rasterizer| {
-            for (mode, logical_width, logical_height) in [
-                (OverlayMode::Live, 600.0, 62.0),
-                (OverlayMode::Minimal, 320.0, 52.0),
-            ] {
-                for scale in [1.0, 1.25, 1.5, 2.0] {
-                    let width = (logical_width * scale) as i32;
-                    let height = (logical_height * scale) as i32;
+            for mode in [OverlayMode::Live, OverlayMode::Minimal] {
+                for dpi in [96, 120, 144, 192] {
+                    let bounds = production_bounds(mode, dpi);
+                    let layout = DisplayLayout::from_bounds(mode, bounds).unwrap();
                     for dark_mode in [false, true] {
                         let frame = rasterizer
-                            .render_display(&state(mode), dark_mode, width, height)
+                            .render_display(&state(mode), dark_mode, bounds.width, bounds.height)
                             .unwrap();
-                        assert_eq!((frame.width, frame.height), (width, height));
-                        let center_y = height / 2;
-                        assert!(
-                            frame.alpha_at(width / 2, center_y) > 0,
-                            "{mode:?} at {scale}x ({dark_mode:?}) did not paint its centerline"
+                        let capsule_only = capsule_only_frame(
+                            rasterizer,
+                            mode,
+                            dark_mode,
+                            bounds.width,
+                            bounds.height,
                         );
+                        assert_eq!((frame.width, frame.height), (bounds.width, bounds.height));
+                        match mode {
+                            OverlayMode::Live => {
+                                assert_component_is_centered_and_unclipped(
+                                    "waveform",
+                                    &frame,
+                                    &capsule_only,
+                                    layout.recording_mark,
+                                    layout.content_center_y,
+                                );
+                                assert_component_is_centered_and_unclipped(
+                                    "elapsed time",
+                                    &frame,
+                                    &capsule_only,
+                                    layout.elapsed,
+                                    layout.content_center_y,
+                                );
+                                assert_component_is_centered_and_unclipped(
+                                    "divider",
+                                    &frame,
+                                    &capsule_only,
+                                    layout.divider.unwrap(),
+                                    layout.content_center_y,
+                                );
+                                assert_component_is_centered_and_unclipped(
+                                    "preview",
+                                    &frame,
+                                    &capsule_only,
+                                    layout.preview.unwrap(),
+                                    layout.content_center_y,
+                                );
+                            }
+                            OverlayMode::Minimal | OverlayMode::Off => {
+                                assert_component_is_centered_and_unclipped(
+                                    "compact status",
+                                    &frame,
+                                    &capsule_only,
+                                    layout.status_text.unwrap(),
+                                    layout.content_center_y,
+                                );
+                                assert_component_is_centered_and_unclipped(
+                                    "compact meter",
+                                    &frame,
+                                    &capsule_only,
+                                    layout.meter,
+                                    layout.content_center_y,
+                                );
+                            }
+                        }
                     }
                 }
             }
