@@ -558,7 +558,7 @@ impl eframe::App for UiHarnessApp {
         if clear_after_removal_focus {
             self.data.model_management.restore_after_removal_focus = false;
         }
-        apply_action(&mut self.data, &mut self.page, action);
+        apply_harness_action(ctx, &mut self.data, &mut self.page, action);
         ctx.request_repaint_after(std::time::Duration::from_secs(60));
     }
 }
@@ -1005,6 +1005,27 @@ fn apply_action(data: &mut FixtureData, page: &mut AppPage, action: ScreenAction
     }
 }
 
+fn apply_harness_action(
+    ctx: &egui::Context,
+    data: &mut FixtureData,
+    page: &mut AppPage,
+    action: ScreenAction,
+) {
+    let requested_dark_mode = match &action {
+        ScreenAction::SetTheme(value) if value == "Dark" => Some(true),
+        ScreenAction::SetTheme(value) if value == "Light" => Some(false),
+        ScreenAction::SetTheme(value) if value == "System" => Some(ctx.style().visuals.dark_mode),
+        ScreenAction::ToggleResolvedTheme(ResolvedTheme::Dark) => Some(false),
+        ScreenAction::ToggleResolvedTheme(ResolvedTheme::Light) => Some(true),
+        _ => None,
+    };
+    apply_action(data, page, action);
+    if let Some(dark_mode) = requested_dark_mode {
+        configure_harness_style(ctx, dark_mode);
+        ctx.request_repaint();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1025,6 +1046,78 @@ mod tests {
             style.text_styles[&egui::TextStyle::Body],
             egui::FontId::new(14.0, egui::FontFamily::Proportional)
         );
+    }
+
+    #[test]
+    fn harness_theme_toggle_updates_visuals_and_resolves_the_next_frame() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_harness_style(&ctx, false);
+        let mut data = Fixture::TranscribeReady.data();
+        let mut page = AppPage::Transcribe;
+
+        for (button_name, expected_dark, expected_label) in [
+            ("Switch to dark theme", true, "Dark"),
+            ("Switch to light theme", false, "Light"),
+        ] {
+            let (initial, initial_action) =
+                render_with_input(&ctx, &mut data, &mut page, 960.0, 680.0, Vec::new());
+            assert_eq!(initial_action, ScreenAction::None);
+            let target = named_node_id(&initial, button_name);
+            let (_, action) = render_with_input(
+                &ctx,
+                &mut data,
+                &mut page,
+                960.0,
+                680.0,
+                vec![egui::Event::AccessKitActionRequest(
+                    egui::accesskit::ActionRequest {
+                        action: egui::accesskit::Action::Default,
+                        target,
+                        data: None,
+                    },
+                )],
+            );
+            apply_harness_action(&ctx, &mut data, &mut page, action);
+
+            assert_eq!(ctx.style().visuals.dark_mode, expected_dark);
+            assert_eq!(data.settings.theme_label, expected_label);
+        }
+    }
+
+    #[test]
+    fn harness_settings_theme_actions_keep_system_and_explicit_visuals_coherent() {
+        let ctx = egui::Context::default();
+        configure_harness_style(&ctx, false);
+        let mut data = Fixture::SettingsRecording.data();
+        let mut page = AppPage::General;
+
+        apply_harness_action(
+            &ctx,
+            &mut data,
+            &mut page,
+            ScreenAction::SetTheme("Dark".into()),
+        );
+        assert!(ctx.style().visuals.dark_mode);
+        assert_eq!(data.settings.theme_label, "Dark");
+
+        apply_harness_action(
+            &ctx,
+            &mut data,
+            &mut page,
+            ScreenAction::SetTheme("System".into()),
+        );
+        assert!(ctx.style().visuals.dark_mode);
+        assert_eq!(data.settings.theme_label, "System");
+
+        apply_harness_action(
+            &ctx,
+            &mut data,
+            &mut page,
+            ScreenAction::SetTheme("Light".into()),
+        );
+        assert!(!ctx.style().visuals.dark_mode);
+        assert_eq!(data.settings.theme_label, "Light");
     }
 
     #[test]
