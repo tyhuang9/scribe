@@ -21,8 +21,8 @@ use super::{
         ModelDownloadState, ModelLanguageFilter, ModelManagementState, ModelSizeTier,
         ModelSpeedTier, ModelViewModel, RemoteCatalogActionKind, RemoteCatalogActionView,
         RemoteCatalogEntryView, RemoteCatalogStatusKind, RemoteCatalogStatusView,
-        RemoteCatalogVariantView, RemoteCatalogView, SettingsTab, TranscriptionPhase,
-        TranscriptionState, UiRoute,
+        RemoteCatalogVariantView, RemoteCatalogView, ResolvedTheme, SettingsTab,
+        TranscriptionPhase, TranscriptionState, UiRoute,
     },
     theme_palette,
 };
@@ -652,7 +652,16 @@ fn render_settings_playground_fixture(ui: &mut egui::Ui) -> ScreenAction {
 }
 
 fn show_harness(ctx: &egui::Context, data: &mut FixtureData, page: &mut AppPage) -> ScreenAction {
-    show_navigation(ctx, page, false);
+    let navigation_action = show_navigation(
+        ctx,
+        page,
+        false,
+        if ctx.style().visuals.dark_mode {
+            ResolvedTheme::Dark
+        } else {
+            ResolvedTheme::Light
+        },
+    );
     if *page != AppPage::General || !matches!(data.route, UiRoute::Settings(_)) {
         data.settings_playground_open = false;
     }
@@ -667,7 +676,7 @@ fn show_harness(ctx: &egui::Context, data: &mut FixtureData, page: &mut AppPage)
         remote_catalog: &data.remote_catalog,
         recording_settings: &data.settings,
     };
-    CentralPanel::default()
+    let screen_action = CentralPanel::default()
         .frame(Frame::none().fill(theme_palette(ctx).content_bg))
         .show(ctx, |ui| {
             show_route_scroll(ui, view.route, |ui| {
@@ -678,7 +687,12 @@ fn show_harness(ctx: &egui::Context, data: &mut FixtureData, page: &mut AppPage)
                 }
             })
         })
-        .inner
+        .inner;
+    if navigation_action == ScreenAction::None {
+        screen_action
+    } else {
+        navigation_action
+    }
 }
 
 fn apply_action(data: &mut FixtureData, page: &mut AppPage, action: ScreenAction) {
@@ -929,6 +943,13 @@ fn apply_action(data: &mut FixtureData, page: &mut AppPage, action: ScreenAction
         ScreenAction::SetCloseToTray(value) => data.settings.close_to_tray = value,
         ScreenAction::OpenModelSettings => *page = AppPage::Models,
         ScreenAction::SetTheme(value) => data.settings.theme_label = value,
+        ScreenAction::ToggleResolvedTheme(resolved_theme) => {
+            data.settings.theme_label = match resolved_theme {
+                ResolvedTheme::Dark => "Light",
+                ResolvedTheme::Light => "Dark",
+            }
+            .into()
+        }
         ScreenAction::SetOverlayMode(value) => data.settings.overlay_label = value,
         ScreenAction::SetRecordingMode(mode) => data.transcription.recording_mode = mode,
         ScreenAction::SetDurationSeconds(seconds) => {

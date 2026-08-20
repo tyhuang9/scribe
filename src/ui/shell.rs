@@ -2,6 +2,8 @@ use eframe::egui::{self, Color32, Frame, Margin, Rounding, Sense, Stroke, Vec2};
 
 use super::{
     controls::{Icon, focus_tooltip, icon_glyph, paint_focus_ring},
+    screens::ScreenAction,
+    state::ResolvedTheme,
     theme_palette,
 };
 
@@ -76,7 +78,12 @@ pub(crate) fn navigation_mode(width: f32) -> NavigationMode {
     }
 }
 
-pub(crate) fn show_navigation(ctx: &egui::Context, current: &mut AppPage, debug_enabled: bool) {
+pub(crate) fn show_navigation(
+    ctx: &egui::Context,
+    current: &mut AppPage,
+    debug_enabled: bool,
+    resolved_theme: ResolvedTheme,
+) -> ScreenAction {
     if !current.visible(debug_enabled) {
         *current = AppPage::Transcribe;
     }
@@ -86,6 +93,7 @@ pub(crate) fn show_navigation(ctx: &egui::Context, current: &mut AppPage, debug_
         NavigationMode::Full => (FULL_SIDEBAR_HORIZONTAL_MARGIN, FULL_SIDEBAR_CONTENT_WIDTH),
         NavigationMode::Compact => (COMPACT_RAIL_HORIZONTAL_MARGIN, COMPACT_RAIL_CONTENT_WIDTH),
     };
+    let mut action = ScreenAction::None;
     let navigation = egui::SidePanel::left("navigation")
         .frame(
             Frame::none()
@@ -137,11 +145,67 @@ pub(crate) fn show_navigation(ctx: &egui::Context, current: &mut AppPage, debug_
                 colors.text,
                 colors.muted_text,
             );
+            ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+                let (icon, label, accessible_name) = match resolved_theme {
+                    ResolvedTheme::Dark => (Icon::Sun, "Light theme", "Switch to light theme"),
+                    ResolvedTheme::Light => (Icon::Moon, "Dark theme", "Switch to dark theme"),
+                };
+                let response = match mode {
+                    NavigationMode::Full => theme_full_button(
+                        ui,
+                        icon,
+                        label,
+                        accessible_name,
+                        colors.active_card_bg,
+                        colors.text,
+                        colors.muted_text,
+                    ),
+                    NavigationMode::Compact => nav_icon_button(
+                        ui,
+                        icon,
+                        accessible_name,
+                        false,
+                        colors.active_card_bg,
+                        colors.text,
+                        colors.muted_text,
+                    ),
+                };
+                response.widget_info(|| {
+                    egui::WidgetInfo::labeled(egui::WidgetType::Button, accessible_name)
+                });
+                ui.ctx().accesskit_node_builder(response.id, |builder| {
+                    builder.set_role(egui::accesskit::Role::Button);
+                    builder.set_name(accessible_name);
+                    builder.set_description(format!(
+                        "Current appearance is {}. Activating saves {} as the theme.",
+                        if resolved_theme == ResolvedTheme::Dark {
+                            "dark"
+                        } else {
+                            "light"
+                        },
+                        if resolved_theme == ResolvedTheme::Dark {
+                            "Light"
+                        } else {
+                            "Dark"
+                        }
+                    ));
+                });
+                if response.clicked()
+                    || (response.has_focus()
+                        && ui.input(|input| {
+                            input.key_pressed(egui::Key::Enter)
+                                || input.key_pressed(egui::Key::Space)
+                        }))
+                {
+                    action = ScreenAction::ToggleResolvedTheme(resolved_theme);
+                }
+            });
         });
     ctx.accesskit_node_builder(navigation.response.id, |builder| {
         builder.set_role(egui::accesskit::Role::Navigation);
         builder.set_name("Main navigation");
     });
+    action
 }
 
 fn brand(ui: &mut egui::Ui, mode: NavigationMode, text: Color32, muted: Color32) {
@@ -240,6 +304,41 @@ fn nav_full_button(
     response
 }
 
+fn theme_full_button(
+    ui: &mut egui::Ui,
+    icon: Icon,
+    label: &str,
+    accessible_name: &str,
+    hover_fill: Color32,
+    text: Color32,
+    muted: Color32,
+) -> egui::Response {
+    let width = ui.available_width();
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 44.0), Sense::click());
+    let fill = if response.hovered() {
+        hover_fill.gamma_multiply(0.45)
+    } else {
+        Color32::TRANSPARENT
+    };
+    ui.painter().rect_filled(rect, Rounding::same(5.0), fill);
+    ui.painter().text(
+        rect.min + Vec2::new(23.0, 21.0),
+        egui::Align2::CENTER_CENTER,
+        icon_glyph(icon),
+        egui::FontId::proportional(22.0),
+        if response.hovered() { text } else { muted },
+    );
+    ui.painter().text(
+        rect.min + Vec2::new(46.0, 21.0),
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::FontId::proportional(15.0),
+        if response.hovered() { text } else { muted },
+    );
+    paint_focus_ring(ui, &response, Rounding::same(5.0));
+    response.on_hover_text(accessible_name)
+}
+
 fn nav_icon_button(
     ui: &mut egui::Ui,
     icon: Icon,
@@ -279,12 +378,50 @@ fn nav_icon_button(
 mod tests {
     use super::*;
 
+    fn render_navigation(
+        ctx: &egui::Context,
+        width: f32,
+        resolved_theme: ResolvedTheme,
+        events: Vec<egui::Event>,
+    ) -> (egui::FullOutput, ScreenAction) {
+        let mut page = AppPage::Transcribe;
+        let mut action = ScreenAction::None;
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(width, 680.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ctx| action = show_navigation(ctx, &mut page, false, resolved_theme),
+        );
+        (output, action)
+    }
+
+    fn named_node<'a>(
+        output: &'a egui::FullOutput,
+        name: &str,
+    ) -> (egui::accesskit::NodeId, &'a egui::accesskit::Node) {
+        output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .expect("navigation should expose an AccessKit update")
+            .nodes
+            .iter()
+            .find(|(_, node)| node.name() == Some(name))
+            .map(|(id, node)| (*id, node))
+            .unwrap_or_else(|| panic!("missing AccessKit node {name}"))
+    }
+
     #[test]
     fn debug_page_is_fail_closed_when_disabled() {
         let ctx = egui::Context::default();
         let mut page = AppPage::Debug;
         let _ = ctx.run(Default::default(), |ctx| {
-            show_navigation(ctx, &mut page, false)
+            let _ = show_navigation(ctx, &mut page, false, ResolvedTheme::Light);
         });
         assert_eq!(page, AppPage::Transcribe);
     }
@@ -382,7 +519,9 @@ mod tests {
                     )),
                     ..Default::default()
                 },
-                |ctx| show_navigation(ctx, &mut page, false),
+                |ctx| {
+                    let _ = show_navigation(ctx, &mut page, false, ResolvedTheme::Light);
+                },
             );
             let update = output.platform_output.accesskit_update.unwrap();
             for expected in ["Transcribe", "Models", "History", "Settings"] {
@@ -410,7 +549,9 @@ mod tests {
                 )),
                 ..Default::default()
             },
-            |ctx| show_navigation(ctx, &mut page, false),
+            |ctx| {
+                let _ = show_navigation(ctx, &mut page, false, ResolvedTheme::Light);
+            },
         );
         let update = output.platform_output.accesskit_update.unwrap();
         let names = update
@@ -427,5 +568,165 @@ mod tests {
         assert!(!names.contains(&Some("About")));
         assert!(!names.contains(&Some("Advanced")));
         assert!(!names.contains(&Some("Debug")));
+    }
+
+    #[test]
+    fn full_and_compact_navigation_expose_bottom_theme_targets() {
+        for (width, resolved_theme, name, description) in [
+            (
+                1_180.0,
+                ResolvedTheme::Light,
+                "Switch to dark theme",
+                "Current appearance is light. Activating saves Dark as the theme.",
+            ),
+            (
+                960.0,
+                ResolvedTheme::Dark,
+                "Switch to light theme",
+                "Current appearance is dark. Activating saves Light as the theme.",
+            ),
+        ] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            let (output, action) = render_navigation(&ctx, width, resolved_theme, Vec::new());
+            assert_eq!(action, ScreenAction::None);
+            let (_, node) = named_node(&output, name);
+            assert_eq!(node.role(), egui::accesskit::Role::Button);
+            assert_eq!(node.description(), Some(description));
+            let bounds = node.bounds().expect("theme target bounds");
+            assert!(bounds.x1 - bounds.x0 >= 44.0);
+            assert!(bounds.y1 - bounds.y0 >= 44.0);
+            assert!(bounds.y1 <= 680.0);
+            assert!(
+                bounds.y0 >= 620.0,
+                "theme control should remain in the footer"
+            );
+        }
+    }
+
+    #[test]
+    fn full_navigation_paints_the_theme_label() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let (output, _) = render_navigation(&ctx, 1_180.0, ResolvedTheme::Light, Vec::new());
+        assert!(output.shapes.iter().any(|shape| {
+            matches!(
+                &shape.shape,
+                egui::epaint::Shape::Text(text) if text.galley.text() == "Dark theme"
+            )
+        }));
+    }
+
+    #[test]
+    fn focused_theme_target_accepts_enter_and_space() {
+        for key in [egui::Key::Enter, egui::Key::Space] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            let (initial, initial_action) =
+                render_navigation(&ctx, 960.0, ResolvedTheme::Light, Vec::new());
+            assert_eq!(initial_action, ScreenAction::None);
+            let (target, _) = named_node(&initial, "Switch to dark theme");
+            let (_, focus_action) = render_navigation(
+                &ctx,
+                960.0,
+                ResolvedTheme::Light,
+                vec![egui::Event::AccessKitActionRequest(
+                    egui::accesskit::ActionRequest {
+                        action: egui::accesskit::Action::Focus,
+                        target,
+                        data: None,
+                    },
+                )],
+            );
+            assert_eq!(focus_action, ScreenAction::None);
+            let (_, action) = render_navigation(
+                &ctx,
+                960.0,
+                ResolvedTheme::Light,
+                vec![egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+            assert_eq!(
+                action,
+                ScreenAction::ToggleResolvedTheme(ResolvedTheme::Light)
+            );
+        }
+    }
+
+    #[test]
+    fn full_and_compact_theme_targets_accept_pointer_activation() {
+        for width in [1_180.0, 960.0] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            let (initial, _) = render_navigation(&ctx, width, ResolvedTheme::Light, Vec::new());
+            let (_, node) = named_node(&initial, "Switch to dark theme");
+            let bounds = node.bounds().expect("theme target bounds");
+            let point = egui::pos2(
+                ((bounds.x0 + bounds.x1) / 2.0) as f32,
+                ((bounds.y0 + bounds.y1) / 2.0) as f32,
+            );
+            let (_, pressed) = render_navigation(
+                &ctx,
+                width,
+                ResolvedTheme::Light,
+                vec![
+                    egui::Event::PointerMoved(point),
+                    egui::Event::PointerButton {
+                        pos: point,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+            assert_eq!(pressed, ScreenAction::None);
+            let (_, released) = render_navigation(
+                &ctx,
+                width,
+                ResolvedTheme::Light,
+                vec![
+                    egui::Event::PointerMoved(point),
+                    egui::Event::PointerButton {
+                        pos: point,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+            assert_eq!(
+                released,
+                ScreenAction::ToggleResolvedTheme(ResolvedTheme::Light)
+            );
+        }
+    }
+
+    #[test]
+    fn compact_theme_target_accepts_accesskit_default_action() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let (initial, _) = render_navigation(&ctx, 960.0, ResolvedTheme::Dark, Vec::new());
+        let (target, _) = named_node(&initial, "Switch to light theme");
+        let (_, action) = render_navigation(
+            &ctx,
+            960.0,
+            ResolvedTheme::Dark,
+            vec![egui::Event::AccessKitActionRequest(
+                egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Default,
+                    target,
+                    data: None,
+                },
+            )],
+        );
+        assert_eq!(
+            action,
+            ScreenAction::ToggleResolvedTheme(ResolvedTheme::Dark)
+        );
     }
 }

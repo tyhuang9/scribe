@@ -77,11 +77,11 @@ use crate::ui::{
     ModelReadiness, ModelSizeTier, ModelSpeedTier, ModelViewModel, RecordingMode,
     RecordingSettingsView, RemoteCatalogActionKind, RemoteCatalogActionView,
     RemoteCatalogEntryView, RemoteCatalogFilters, RemoteCatalogSort, RemoteCatalogStatusKind,
-    RemoteCatalogStatusView, RemoteCatalogVariantView, RemoteCatalogView, ScreenAction, ScreenView,
-    SettingsTab, ThemePalette, UiRoute, configure_accessible_style, history_page,
-    minimum_primary_target_height, recording_mode, render_screen, scroll_focused_control_into_view,
-    settings_save_state, show_navigation, show_route_scroll, theme_palette, transcription_state,
-    ui_palette,
+    RemoteCatalogStatusView, RemoteCatalogVariantView, RemoteCatalogView, ResolvedTheme,
+    ScreenAction, ScreenView, SettingsTab, ThemePalette, UiRoute, configure_accessible_style,
+    history_page, minimum_primary_target_height, recording_mode, render_screen,
+    scroll_focused_control_into_view, settings_save_state, show_navigation, show_route_scroll,
+    theme_palette, transcription_state, ui_palette,
 };
 
 #[cfg(test)]
@@ -9346,7 +9346,21 @@ impl eframe::App for LocalTranscriberApp {
             }
             _ => {}
         }
-        show_navigation(ctx, &mut self.current_tab, self.config.developer.debug_mode);
+        let resolved_theme =
+            match resolve_theme_mode(self.config.general.theme_mode, frame.info().system_theme) {
+                ThemeMode::Dark => ResolvedTheme::Dark,
+                ThemeMode::Light | ThemeMode::System => ResolvedTheme::Light,
+            };
+        let navigation_action = show_navigation(
+            ctx,
+            &mut self.current_tab,
+            self.config.developer.debug_mode,
+            resolved_theme,
+        );
+        if navigation_action != ScreenAction::None {
+            self.apply_settings_screen_action(navigation_action);
+            ctx.request_repaint();
+        }
         self.sync_settings_playground_route();
         self.sync_passive_microphone_monitor();
         egui::CentralPanel::default()
@@ -9590,6 +9604,7 @@ impl LocalTranscriberApp {
             | ScreenAction::SetPasteDelayMs(_)
             | ScreenAction::OpenModelSettings
             | ScreenAction::SetTheme(_)
+            | ScreenAction::ToggleResolvedTheme(_)
             | ScreenAction::SetOverlayMode(_)
             | ScreenAction::SetVadEnabled(_)
             | ScreenAction::SetSpeechConfirmationMs(_)
@@ -12079,6 +12094,13 @@ impl LocalTranscriberApp {
                     "Dark" => ThemeMode::Dark,
                     "System" => ThemeMode::System,
                     _ => return,
+                };
+                self.save_config();
+            }
+            ScreenAction::ToggleResolvedTheme(resolved_theme) => {
+                self.config.general.theme_mode = match resolved_theme {
+                    ResolvedTheme::Dark => ThemeMode::Light,
+                    ResolvedTheme::Light => ThemeMode::Dark,
                 };
                 self.save_config();
             }
@@ -14832,6 +14854,24 @@ mod layout_tests {
             resolve_theme_mode(ThemeMode::Dark, Some(eframe::Theme::Light)),
             ThemeMode::Dark
         );
+    }
+
+    #[test]
+    fn shell_theme_toggle_saves_the_opposite_resolved_appearance() {
+        for (configured, resolved_theme, expected) in [
+            (ThemeMode::System, ResolvedTheme::Dark, ThemeMode::Light),
+            (ThemeMode::System, ResolvedTheme::Light, ThemeMode::Dark),
+            (ThemeMode::Dark, ResolvedTheme::Dark, ThemeMode::Light),
+            (ThemeMode::Light, ResolvedTheme::Light, ThemeMode::Dark),
+        ] {
+            let mut app = test_app();
+            app.config.general.theme_mode = configured;
+
+            app.apply_settings_screen_action(ScreenAction::ToggleResolvedTheme(resolved_theme));
+
+            assert_eq!(app.config.general.theme_mode, expected);
+            assert_eq!(app.status_message, "Settings saved");
+        }
     }
 
     #[test]
@@ -19152,7 +19192,7 @@ mod layout_tests {
     }
 
     fn show_test_navigation(ctx: &egui::Context, current_tab: &mut Tab) {
-        show_navigation(ctx, current_tab, true);
+        let _ = show_navigation(ctx, current_tab, true, ResolvedTheme::Light);
     }
 
     fn max_visible_painted_x(output: &egui::FullOutput) -> f32 {

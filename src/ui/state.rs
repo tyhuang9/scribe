@@ -77,6 +77,12 @@ pub(crate) enum RecordingMode {
     Hold,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ResolvedTheme {
+    Light,
+    Dark,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[allow(dead_code)]
 pub(crate) enum TranscriptionEvent {
