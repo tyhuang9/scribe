@@ -167,6 +167,7 @@ pub(crate) fn paint_focus_ring(ui: &Ui, response: &Response, rounding: Rounding)
 /// need an explicit submit action.
 pub(crate) struct SearchFieldResponse {
     pub input: Response,
+    #[allow(dead_code)]
     pub clear: Response,
     pub changed: bool,
     pub clear_requested: bool,
@@ -189,47 +190,57 @@ pub(crate) fn search_field(
     // TextEdit surrenders focus for Escape, so preserve its pre-edit focus
     // state to let the route handle the intended clear action.
     let had_input_focus = ui.memory(|memory| memory.has_focus(field_id));
-    let mut input_response = None;
-    let mut clear_response = None;
-
-    let surface = Frame::none()
-        .fill(colors.card_bg)
-        .stroke(Stroke::new(1.0, colors.border_strong))
-        .rounding(Rounding::same(5.0))
-        .inner_margin(Margin::symmetric(10.0, 4.0))
-        .show(ui, |ui| {
-            ui.set_min_height(PRIMARY_TARGET_HEIGHT);
-            ui.horizontal_centered(|ui| {
-                // Paint the leading glyph directly so it remains decorative:
-                // the text input is the sole semantic, focusable search control.
-                let (icon_rect, _) =
-                    ui.allocate_exact_size(Vec2::new(20.0, COMPACT_BUTTON_HEIGHT), Sense::hover());
-                ui.painter().text(
-                    icon_rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    icon_glyph(Icon::Search),
-                    FontId::proportional(18.0),
-                    colors.muted_text,
-                );
-                let input = ui.add_sized(
-                    [
-                        (ui.available_width() - PRIMARY_TARGET_HEIGHT).max(72.0),
-                        COMPACT_BUTTON_HEIGHT,
-                    ],
-                    egui::TextEdit::singleline(value)
-                        .id(field_id)
-                        .hint_text(hint_text)
-                        .frame(false),
-                );
-                input_response = Some(input);
-                let clear = ui.add_enabled_ui(!value.is_empty(), |ui| {
-                    icon_button(ui, Icon::Close, &format!("Clear {accessible_name}"))
-                });
-                clear_response = Some(clear.inner);
-            });
-        });
-    let input = input_response.expect("search field must allocate an input");
-    let clear = clear_response.expect("search field must allocate a clear action");
+    // Allocate one fixed surface before adding child controls. This exactly
+    // preserves the old full-width 44px edit geometry at every route width.
+    let (surface_rect, _) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), PRIMARY_TARGET_HEIGHT),
+        Sense::hover(),
+    );
+    ui.painter().rect(
+        surface_rect,
+        Rounding::same(5.0),
+        colors.card_bg,
+        Stroke::new(1.0, colors.border_strong),
+    );
+    let inset = 10.0;
+    let clear_rect = egui::Rect::from_min_size(
+        egui::pos2(
+            surface_rect.right() - inset - PRIMARY_TARGET_HEIGHT,
+            surface_rect.top(),
+        ),
+        Vec2::splat(PRIMARY_TARGET_HEIGHT),
+    );
+    let icon_rect = egui::Rect::from_min_size(
+        egui::pos2(surface_rect.left() + inset, surface_rect.top()),
+        Vec2::new(20.0, PRIMARY_TARGET_HEIGHT),
+    );
+    let input_rect = egui::Rect::from_min_max(
+        egui::pos2(icon_rect.right() + 8.0, surface_rect.top()),
+        egui::pos2(clear_rect.left() - 8.0, surface_rect.bottom()),
+    );
+    // Paint the leading glyph directly so it remains decorative: the text
+    // input is the sole semantic, focusable search control.
+    ui.painter().text(
+        icon_rect.center(),
+        egui::Align2::CENTER_CENTER,
+        icon_glyph(Icon::Search),
+        FontId::proportional(18.0),
+        colors.muted_text,
+    );
+    let mut input_ui = ui.child_ui(input_rect, Layout::left_to_right(Align::Center));
+    let input = input_ui.add_sized(
+        input_rect.size(),
+        egui::TextEdit::singleline(value)
+            .id(field_id)
+            .hint_text(hint_text)
+            .frame(false),
+    );
+    let mut clear_ui = ui.child_ui(clear_rect, Layout::left_to_right(Align::Center));
+    let clear = clear_ui
+        .add_enabled_ui(!value.is_empty(), |ui| {
+            icon_button(ui, Icon::Close, &format!("Clear {accessible_name}"))
+        })
+        .inner;
     let clear_requested = !value.is_empty()
         && (clear.clicked()
             || (clear.has_focus() && clear_key_pressed)
@@ -244,7 +255,7 @@ pub(crate) fn search_field(
     });
     if input.has_focus() {
         ui.painter().rect_stroke(
-            surface.response.rect.shrink(1.0),
+            surface_rect.shrink(1.0),
             Rounding::same(5.0),
             Stroke::new(2.0, colors.accent),
         );
