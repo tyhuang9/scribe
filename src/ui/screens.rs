@@ -869,7 +869,9 @@ fn selector_row(
             ui.ctx().accesskit_node_builder(response.id, |builder| {
                 builder.set_role(egui::accesskit::Role::Button);
                 builder.set_name(action_label);
-                builder.set_description("Opens the installed ready-model picker.");
+                builder.set_description(
+                    model_disabled_reason.unwrap_or("Opens the installed ready-model picker."),
+                );
                 builder.set_expanded(picker_open);
                 builder.set_bounds(egui::accesskit::Rect {
                     x0: action_rect.min.x.into(),
