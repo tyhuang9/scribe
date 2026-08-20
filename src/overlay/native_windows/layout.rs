@@ -54,7 +54,10 @@ pub(super) struct DisplayLayout {
     pub status_text: Option<PhysicalRect>,
     pub meter: PhysicalRect,
     pub elapsed: PhysicalRect,
+    /// Allocation including the antialiased stroke footprint.
     pub divider: Option<PhysicalRect>,
+    /// The GDI+ centerline submitted to `GdipDrawLine`.
+    pub divider_line: Option<PhysicalRect>,
     pub preview: Option<PhysicalRect>,
 }
 
@@ -81,6 +84,14 @@ impl DisplayLayout {
                 // height—is authoritative for painting and UIA.
                 let content_center_y = root.center_y();
                 let recording_mark = centered_rect(16.0, 30.0, 30.0, content_center_y, scale);
+                let divider_line = centered_rect(110.5, 1.0, 24.0, content_center_y, scale);
+                let divider_stroke_radius = scale.max(1.0) / 2.0;
+                let divider = PhysicalRect::new(
+                    divider_line.x0 - divider_stroke_radius,
+                    divider_line.y0 - divider_stroke_radius,
+                    divider_line.x1 + divider_stroke_radius,
+                    divider_line.y1 + divider_stroke_radius,
+                );
                 Self {
                     scale,
                     root,
@@ -90,7 +101,8 @@ impl DisplayLayout {
                     status_text: None,
                     meter: recording_mark,
                     elapsed: centered_rect(56.0, 48.0, 23.0, content_center_y, scale),
-                    divider: Some(centered_rect(110.5, 1.0, 24.0, content_center_y, scale)),
+                    divider: Some(divider),
+                    divider_line: Some(divider_line),
                     preview: Some(centered_rect(123.0, 426.0, 23.0, content_center_y, scale)),
                 }
             }
@@ -106,6 +118,7 @@ impl DisplayLayout {
                     meter: centered_rect(164.0, 34.0, 20.0, content_center_y, scale),
                     elapsed: centered_rect(207.0, 53.0, 21.0, content_center_y, scale),
                     divider: None,
+                    divider_line: None,
                     preview: None,
                 }
             }
@@ -233,6 +246,7 @@ mod tests {
                     Some(layout.meter),
                     Some(layout.elapsed),
                     layout.divider,
+                    layout.divider_line,
                     layout.preview,
                 ];
                 for rect in elements.into_iter().flatten() {
