@@ -102,6 +102,7 @@ pub(crate) fn button(
 #[allow(dead_code)]
 pub(crate) fn icon_button(ui: &mut Ui, icon: Icon, accessible_name: &str) -> Response {
     let colors = ui_palette(ui);
+    let enabled = ui.is_enabled();
     let (target_rect, response) =
         ui.allocate_exact_size(Vec2::splat(PRIMARY_TARGET_HEIGHT), Sense::click());
     let visual_rect =
@@ -127,6 +128,9 @@ pub(crate) fn icon_button(ui: &mut Ui, icon: Icon, accessible_name: &str) -> Res
     ui.ctx().accesskit_node_builder(response.id, |builder| {
         builder.set_role(egui::accesskit::Role::Button);
         builder.set_name(accessible_name);
+        if !enabled {
+            builder.set_disabled();
+        }
     });
     paint_focus_ring(ui, &response, Rounding::same(5.0));
     focus_tooltip(ui, &response, accessible_name);
@@ -153,6 +157,99 @@ pub(crate) fn paint_focus_ring(ui: &Ui, response: &Response, rounding: Rounding)
             rounding,
             Stroke::new(2.0, ui_palette(ui).accent),
         );
+    }
+}
+
+/// A consistent search affordance for routes that filter local UI content.
+///
+/// The clear target is always reserved so adding or removing text never shifts
+/// neighbouring controls. Callers decide whether query changes filter live or
+/// need an explicit submit action.
+pub(crate) struct SearchFieldResponse {
+    pub input: Response,
+    pub changed: bool,
+    pub clear_requested: bool,
+}
+
+pub(crate) fn search_field(
+    ui: &mut Ui,
+    id_source: impl std::hash::Hash,
+    value: &mut String,
+    accessible_name: &str,
+    hint_text: &str,
+    description: &str,
+) -> SearchFieldResponse {
+    let colors = ui_palette(ui);
+    let field_id = ui.make_persistent_id(id_source);
+    // Read Escape before TextEdit can consume its editing/navigation event.
+    let escape_pressed = ui.input(|input| input.key_pressed(egui::Key::Escape));
+    // TextEdit surrenders focus for Escape, so preserve its pre-edit focus
+    // state to let the route handle the intended clear action.
+    let had_input_focus = ui.memory(|memory| memory.has_focus(field_id));
+    let mut input_response = None;
+    let mut clear_response = None;
+
+    let surface = Frame::none()
+        .fill(colors.card_bg)
+        .stroke(Stroke::new(1.0, colors.border_strong))
+        .rounding(Rounding::same(5.0))
+        .inner_margin(Margin::symmetric(10.0, 4.0))
+        .show(ui, |ui| {
+            ui.set_min_height(PRIMARY_TARGET_HEIGHT);
+            ui.horizontal_centered(|ui| {
+                // Paint the leading glyph directly so it remains decorative:
+                // the text input is the sole semantic, focusable search control.
+                let (icon_rect, _) =
+                    ui.allocate_exact_size(Vec2::new(20.0, COMPACT_BUTTON_HEIGHT), Sense::hover());
+                ui.painter().text(
+                    icon_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    icon_glyph(Icon::Search),
+                    FontId::proportional(18.0),
+                    colors.muted_text,
+                );
+                let input = ui.add_sized(
+                    [
+                        (ui.available_width() - PRIMARY_TARGET_HEIGHT).max(72.0),
+                        COMPACT_BUTTON_HEIGHT,
+                    ],
+                    egui::TextEdit::singleline(value)
+                        .id(field_id)
+                        .hint_text(hint_text)
+                        .frame(false),
+                );
+                input_response = Some(input);
+                let clear = ui.add_enabled_ui(!value.is_empty(), |ui| {
+                    icon_button(ui, Icon::Close, &format!("Clear {accessible_name}"))
+                });
+                clear_response = Some(clear.inner);
+            });
+        });
+    let input = input_response.expect("search field must allocate an input");
+    let clear = clear_response.expect("search field must allocate a clear action");
+    let clear_requested =
+        !value.is_empty() && (clear.clicked() || (had_input_focus && escape_pressed));
+
+    ui.ctx().accesskit_node_builder(input.id, |builder| {
+        builder.set_name(accessible_name);
+        builder.set_description(description);
+    });
+    ui.ctx().accesskit_node_builder(clear.id, |builder| {
+        builder.set_description(format!("Clears the current {accessible_name} query."));
+    });
+    if input.has_focus() {
+        ui.painter().rect_stroke(
+            surface.response.rect.shrink(1.0),
+            Rounding::same(5.0),
+            Stroke::new(2.0, colors.accent),
+        );
+    }
+
+    let changed = input.changed();
+    SearchFieldResponse {
+        input,
+        changed,
+        clear_requested,
     }
 }
 
@@ -275,6 +372,7 @@ pub(crate) enum Icon {
     Warning,
     Trash,
     Close,
+    Search,
     ChevronRight,
     Spinner,
     Streaming,
@@ -316,6 +414,7 @@ pub(crate) fn icon_glyph(icon: Icon) -> &'static str {
         Icon::Warning => regular::WARNING,
         Icon::Trash => regular::TRASH,
         Icon::Close => regular::X,
+        Icon::Search => regular::MAGNIFYING_GLASS,
         Icon::ChevronRight => regular::CARET_RIGHT,
         Icon::Spinner => regular::CIRCLE_NOTCH,
         Icon::Streaming => regular::WAVEFORM,
@@ -453,5 +552,148 @@ mod tests {
             shape.shape,
             egui::epaint::Shape::Rect(rect) if rect.stroke.width == 2.0
         )));
+    }
+
+    #[test]
+    fn search_field_exposes_a_labelled_full_size_clear_action_without_layout_shift() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut query = "base".to_owned();
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(320.0, 120.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let response = search_field(
+                        ui,
+                        "search-field-contract",
+                        &mut query,
+                        "Search models",
+                        "Search models",
+                        "Filters models as you type.",
+                    );
+                    assert!(!response.clear_requested);
+                });
+            },
+        );
+        let nodes = &output
+            .platform_output
+            .accesskit_update
+            .expect("search field should update AccessKit")
+            .nodes;
+        let search = nodes
+            .iter()
+            .find_map(|(_, node)| (node.name() == Some("Search models")).then_some(node))
+            .expect("search input should have an accessible name");
+        assert_eq!(search.description(), Some("Filters models as you type."));
+        let clear = nodes
+            .iter()
+            .find_map(|(_, node)| (node.name() == Some("Clear Search models")).then_some(node))
+            .expect("clear action should have an accessible name");
+        assert!(
+            clear.bounds().expect("clear action needs bounds").height() >= 44.0,
+            "clear action must retain a 44px pointer target"
+        );
+
+        let empty_ctx = egui::Context::default();
+        empty_ctx.enable_accesskit();
+        configure_accessible_style(&empty_ctx);
+        let mut empty_query = String::new();
+        let empty_output = empty_ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(320.0, 120.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let response = search_field(
+                        ui,
+                        "empty-search-field-contract",
+                        &mut empty_query,
+                        "Search models",
+                        "Search models",
+                        "Filters models as you type.",
+                    );
+                    assert!(!response.clear_requested);
+                });
+            },
+        );
+        let empty_nodes = &empty_output
+            .platform_output
+            .accesskit_update
+            .expect("empty search field should update AccessKit")
+            .nodes;
+        let disabled_clear = empty_nodes
+            .iter()
+            .find_map(|(_, node)| (node.name() == Some("Clear Search models")).then_some(node))
+            .expect("empty search still reserves its clear target");
+        assert!(disabled_clear.is_disabled());
+        assert_eq!(
+            disabled_clear
+                .bounds()
+                .expect("disabled clear action needs bounds")
+                .height(),
+            clear
+                .bounds()
+                .expect("enabled clear action needs bounds")
+                .height(),
+            "empty and populated search fields must reserve identical clear geometry"
+        );
+        assert!(
+            empty_nodes
+                .iter()
+                .all(|(_, node)| node.name() != Some(icon_glyph(Icon::Search))),
+            "the search glyph is decorative, not a focusable/accessibility node"
+        );
+    }
+
+    #[test]
+    fn search_field_escape_requests_a_clear_only_when_its_input_has_focus() {
+        let ctx = egui::Context::default();
+        configure_accessible_style(&ctx);
+        let mut query = "base".to_owned();
+        let mut clear_requested = false;
+        let _ = ctx.run(
+            egui::RawInput {
+                focused: true,
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(320.0, 120.0),
+                )),
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let id = ui.make_persistent_id("search-field-escape");
+                    ui.memory_mut(|memory| memory.request_focus(id));
+                    let response = search_field(
+                        ui,
+                        "search-field-escape",
+                        &mut query,
+                        "Search models",
+                        "Search models",
+                        "Filters models as you type.",
+                    );
+                    clear_requested = response.clear_requested;
+                });
+            },
+        );
+        assert!(clear_requested);
     }
 }
