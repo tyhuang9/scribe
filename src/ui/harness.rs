@@ -741,6 +741,9 @@ fn apply_action(data: &mut FixtureData, page: &mut AppPage, action: ScreenAction
             }
             data.model_management.dialog = None;
         }
+        ScreenAction::SelectQuickModel(id) => {
+            data.transcription.selected_model_id = Some(id);
+        }
         ScreenAction::AddModel => {
             data.model_management.dialog = Some(ModelDialog::Add);
             data.model_management.focus_dialog_initial = true;
@@ -779,6 +782,8 @@ fn apply_action(data: &mut FixtureData, page: &mut AppPage, action: ScreenAction
             data.transcription.selected_model_id = Some("base.en".into());
             data.transcription.phase = TranscriptionPhase::Ready;
         }
+        ScreenAction::StartHotkeyCapture => data.transcription.hotkey_capture_active = true,
+        ScreenAction::CancelHotkeyCapture => data.transcription.hotkey_capture_active = false,
         ScreenAction::StartRecording => data.transcription.phase = TranscriptionPhase::Listening,
         ScreenAction::StopRecording => data.transcription.phase = TranscriptionPhase::Finalizing,
         ScreenAction::AbandonRecording => {
@@ -1830,7 +1835,7 @@ mod tests {
                 height,
                 "Change",
             ),
-            ScreenAction::ChangeModel,
+            ScreenAction::None,
         );
 
         let listening = render(Fixture::TranscribeListening, width, height);

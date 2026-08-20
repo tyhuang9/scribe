@@ -8035,10 +8035,41 @@ impl LocalTranscriberApp {
                 self.status_message = format!("Registered hotkey {}", self.config.recording.hotkey);
             }
             Err(err) => {
+                self.capturing_hotkey = false;
+                self.hotkey_input = self.config.recording.hotkey.clone();
                 self.status = TranscriptionStatus::Error;
-                self.status_message = format!("Failed to register hotkey: {err}");
+                self.status_message = format!(
+                    "Failed to register hotkey: {err}. The previous shortcut is still active."
+                );
             }
         }
+    }
+
+    fn quick_hotkey_change_block_reason(&self) -> Option<String> {
+        if self.capture_is_active() || self.pending_recording.is_some() {
+            Some("Stop the active recording before changing the recording shortcut.".to_owned())
+        } else if self.effective_status() == TranscriptionStatus::Transcribing
+            || self.pending_output.is_some()
+        {
+            Some("Wait for transcription and output to finish before changing the recording shortcut.".to_owned())
+        } else {
+            None
+        }
+    }
+
+    fn start_hotkey_capture(&mut self) {
+        if let Some(reason) = self.quick_hotkey_change_block_reason() {
+            self.status_message = reason;
+            return;
+        }
+        self.capturing_hotkey = true;
+        self.status_message = "Press the new hotkey combination. Press Escape or the recording shortcut card again to cancel.".to_owned();
+    }
+
+    fn cancel_hotkey_capture(&mut self) {
+        self.capturing_hotkey = false;
+        self.hotkey_input = self.config.recording.hotkey.clone();
+        self.status_message = "Hotkey capture cancelled.".to_owned();
     }
 
     fn apply_theme(&self, ctx: &egui::Context, frame: &eframe::Frame) {
@@ -8050,6 +8081,11 @@ impl LocalTranscriberApp {
 
     fn poll_hotkey_capture(&mut self, ctx: &egui::Context) {
         if !self.capturing_hotkey {
+            return;
+        }
+
+        if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+            self.cancel_hotkey_capture();
             return;
         }
 
@@ -9403,6 +9439,7 @@ impl eframe::App for LocalTranscriberApp {
 impl LocalTranscriberApp {
     fn ui_transcribe(&mut self, ui: &mut Ui) {
         let models = self.transcribe_screen_models();
+        let quick_models = Arc::clone(&self.remote_catalog.local_models);
         let (selected_model_id, model_readiness) = self.selected_model_screen_state();
         let microphone_permission = self.microphone_permission();
         let no_speech = self.status_message == "No speech detected; nothing was pasted.";
@@ -9439,6 +9476,9 @@ impl LocalTranscriberApp {
             self.overlay_presented,
             self.overlay_controller.state().mode,
         );
+        state.hotkey_capture_active = self.capturing_hotkey;
+        state.hotkey_change_disabled_reason = self.quick_hotkey_change_block_reason();
+        state.model_change_disabled_reason = self.artifact_mutation_block_reason();
         let settings = RecordingSettingsView {
             duration_label: format!("{} seconds", self.config.recording.max_recording_seconds),
             provisional_feedback: self.config.streaming.mode != StreamingMode::FinalOnly,
@@ -9463,7 +9503,7 @@ impl LocalTranscriberApp {
                 route: UiRoute::Transcribe,
                 transcription: &state,
                 models: &models,
-                model_catalog: &[],
+                model_catalog: &quick_models,
                 comparison: &Default::default(),
                 model_management: &Default::default(),
                 model_language_filter: ModelLanguageFilter::default(),
@@ -9528,7 +9568,25 @@ impl LocalTranscriberApp {
 
     fn apply_transcribe_screen_action(&mut self, action: ScreenAction) {
         match action {
-            ScreenAction::AddModel | ScreenAction::ChangeModel => self.current_tab = Tab::Models,
+            ScreenAction::AddModel
+            | ScreenAction::ChangeModel
+            | ScreenAction::OpenModelSettings => self.current_tab = Tab::Models,
+            ScreenAction::SelectQuickModel(id) => {
+                let selected_is_ready = self
+                    .remote_catalog
+                    .local_models
+                    .iter()
+                    .any(|model| model.id == id && model.installed && model.ready);
+                if selected_is_ready
+                    && let Some(model) = config::configured_models(&self.config)
+                        .into_iter()
+                        .find(|model| model.id == id)
+                {
+                    self.select_model_as_default(&model);
+                }
+            }
+            ScreenAction::StartHotkeyCapture => self.start_hotkey_capture(),
+            ScreenAction::CancelHotkeyCapture => self.cancel_hotkey_capture(),
             ScreenAction::StartRecording | ScreenAction::RetryMicrophone => {
                 self.start_recording(RecordingSource::Transcribe)
             }
@@ -9588,7 +9646,6 @@ impl LocalTranscriberApp {
             | ScreenAction::SetAutoInsertTranscript(_)
             | ScreenAction::SetRestoreClipboardAfterInsert(_)
             | ScreenAction::SetPasteDelayMs(_)
-            | ScreenAction::OpenModelSettings
             | ScreenAction::SetTheme(_)
             | ScreenAction::SetOverlayMode(_)
             | ScreenAction::SetVadEnabled(_)
@@ -12291,6 +12348,7 @@ impl LocalTranscriberApp {
             ScreenAction::None
             | ScreenAction::AcknowledgeModelRemovalFocus
             | ScreenAction::SelectModel(_)
+            | ScreenAction::SelectQuickModel(_)
             | ScreenAction::InstallModel(_)
             | ScreenAction::UpgradeModel(_)
             | ScreenAction::CancelModelInstall(_)
@@ -12301,6 +12359,8 @@ impl LocalTranscriberApp {
             | ScreenAction::CloseModelDialog
             | ScreenAction::AddModel
             | ScreenAction::ChangeModel
+            | ScreenAction::StartHotkeyCapture
+            | ScreenAction::CancelHotkeyCapture
             | ScreenAction::StartRecording
             | ScreenAction::StopRecording
             | ScreenAction::AbandonRecording
@@ -21314,6 +21374,25 @@ mod layout_tests {
         assert_eq!(app.current_tab, Tab::General);
         assert_eq!(app.settings_tab, SettingsTab::Advanced);
         assert!(!app.settings_playground_open);
+    }
+
+    #[test]
+    fn transcribe_hotkey_capture_actions_are_in_place_and_cancellable() {
+        let mut app = test_app();
+        let original = app.config.recording.hotkey.clone();
+
+        app.apply_transcribe_screen_action(ScreenAction::StartHotkeyCapture);
+        assert!(app.capturing_hotkey);
+        assert!(
+            app.status_message
+                .contains("Press the new hotkey combination")
+        );
+
+        app.hotkey_input = "Ctrl+Alt+K".to_owned();
+        app.apply_transcribe_screen_action(ScreenAction::CancelHotkeyCapture);
+        assert!(!app.capturing_hotkey);
+        assert_eq!(app.hotkey_input, original);
+        assert_eq!(app.status_message, "Hotkey capture cancelled.");
     }
 
     #[test]

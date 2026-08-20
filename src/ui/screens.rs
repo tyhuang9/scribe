@@ -415,6 +415,9 @@ pub(crate) enum ScreenAction {
     None,
     AddModel,
     ChangeModel,
+    SelectQuickModel(String),
+    StartHotkeyCapture,
+    CancelHotkeyCapture,
     StartRecording,
     StopRecording,
     AbandonRecording,
@@ -498,7 +501,7 @@ pub(crate) enum ScreenAction {
 
 pub(crate) fn render_screen(ui: &mut egui::Ui, view: &ScreenView<'_>) -> ScreenAction {
     match view.route {
-        UiRoute::Transcribe => transcribe(ui, view.transcription, view.models),
+        UiRoute::Transcribe => transcribe(ui, view.transcription, view.models, view.model_catalog),
         UiRoute::Models => models(
             ui,
             view.models,
@@ -682,10 +685,15 @@ fn selector_row(
     ui: &mut egui::Ui,
     state: &TranscriptionState,
     models: &[ModelViewModel],
+    quick_models: &[ModelViewModel],
 ) -> ScreenAction {
     let name = selected_model_name(state, models);
     let no_model = state.phase == TranscriptionPhase::NoModel;
-    let disabled_reason = model_selector_disabled_reason(state.phase);
+    let model_disabled_reason = state
+        .model_change_disabled_reason
+        .as_deref()
+        .or_else(|| model_selector_disabled_reason(state.phase));
+    let hotkey_disabled_reason = state.hotkey_change_disabled_reason.as_deref();
     let mut action = ScreenAction::None;
     let available_width = current_content_width(ui);
     let gap = ui.spacing().item_spacing.x;
@@ -792,7 +800,7 @@ fn selector_row(
             }
             let action_label = if no_model { "Select" } else { "Change" };
             let was_enabled = ui.is_enabled();
-            ui.set_enabled(was_enabled && disabled_reason.is_none());
+            ui.set_enabled(was_enabled && model_disabled_reason.is_none());
             let response = ui.interact(
                 action_rect,
                 ui.make_persistent_id("selected-model-action"),
@@ -846,7 +854,7 @@ fn selector_row(
                 }
             });
             paint_focus_ring(ui, &response, Rounding::same(5.0));
-            if let Some(reason) = disabled_reason {
+            if let Some(reason) = model_disabled_reason {
                 ui.ctx().accesskit_node_builder(response.id, |builder| {
                     builder.set_description(reason);
                 });
@@ -857,8 +865,18 @@ fn selector_row(
                 action = if no_model {
                     ScreenAction::AddModel
                 } else {
-                    ScreenAction::ChangeModel
+                    ScreenAction::None
                 };
+                if !no_model {
+                    ui.memory_mut(|memory| {
+                        memory.toggle_popup(ui.make_persistent_id("quick-model-picker"));
+                    });
+                }
+            }
+            if !no_model
+                && let Some(picker_action) = quick_model_picker(ui, &response, state, quick_models)
+            {
+                action = picker_action;
             }
             ui.ctx().accesskit_node_builder(model_card_id, |builder| {
                 builder.set_role(egui::accesskit::Role::Group);
@@ -894,16 +912,19 @@ fn selector_row(
             let hotkey_card_height =
                 hotkey_visual_height + (SELECTOR_CONTROL_HEIGHT - SELECTOR_VISUAL_HEIGHT);
             let hotkey_card_id = ui.make_persistent_id("recording-hotkey-card");
-            let (hotkey_card_rect, _) = ui.allocate_exact_size(
+            let was_enabled = ui.is_enabled();
+            ui.set_enabled(was_enabled && hotkey_disabled_reason.is_none());
+            let (hotkey_card_rect, hotkey_response) = ui.allocate_exact_size(
                 Vec2::new(hotkey_width, hotkey_card_height),
-                egui::Sense::hover(),
+                egui::Sense::click(),
             );
+            ui.set_enabled(was_enabled);
             let hotkey_card_visual_rect = egui::Rect::from_center_size(
                 hotkey_card_rect.center(),
                 Vec2::new(hotkey_card_rect.width(), hotkey_visual_height),
             );
             let hotkey_card_frame = Frame::none()
-                .fill(if no_model {
+                .fill(if !hotkey_response.enabled() {
                     ui_palette(ui).disabled_bg
                 } else {
                     ui_palette(ui).card_bg
@@ -928,7 +949,15 @@ fn selector_row(
                         .size(18.0)
                         .color(ui_palette(ui).muted_text),
                 );
-                ui.label("Hotkey:");
+                ui.label(if state.hotkey_capture_active {
+                    "Recording shortcut:"
+                } else {
+                    "Hotkey:"
+                });
+                if state.hotkey_capture_active {
+                    ui.label(RichText::new("Press a key or Escape to cancel").weak());
+                    return;
+                }
                 let mut keys = state
                     .hotkey
                     .split('+')
@@ -950,13 +979,35 @@ fn selector_row(
                     Layout::left_to_right(Align::Center)
                 },
             );
-            hotkey_content_ui.add_enabled_ui(!no_model, |ui| {
+            hotkey_content_ui.add_enabled_ui(hotkey_response.enabled(), |ui| {
                 if wraps_hotkey {
                     ui.horizontal_wrapped(|ui| render_wrapped_hotkey(ui, &state.hotkey));
                 } else {
                     render_hotkey(ui);
                 }
             });
+            let hotkey_action_name = if state.hotkey_capture_active {
+                "Cancel recording shortcut capture"
+            } else {
+                "Change recording shortcut"
+            };
+            hotkey_response.widget_info(|| {
+                egui::WidgetInfo::labeled(egui::WidgetType::Button, hotkey_action_name)
+            });
+            ui.ctx()
+                .accesskit_node_builder(hotkey_response.id, |builder| {
+                    builder.set_role(egui::accesskit::Role::Button);
+                    builder.set_name(hotkey_action_name);
+                    builder.set_bounds(egui::accesskit::Rect {
+                        x0: hotkey_card_rect.min.x.into(),
+                        y0: hotkey_card_rect.min.y.into(),
+                        x1: hotkey_card_rect.max.x.into(),
+                        y1: hotkey_card_rect.max.y.into(),
+                    });
+                    if !hotkey_response.enabled() {
+                        builder.set_disabled();
+                    }
+                });
             ui.ctx().accesskit_node_builder(hotkey_card_id, |builder| {
                 builder.set_role(egui::accesskit::Role::Group);
                 builder.set_name("Recording hotkey");
@@ -967,6 +1018,24 @@ fn selector_row(
                     y1: hotkey_card_rect.max.y.into(),
                 });
             });
+            paint_focus_ring(ui, &hotkey_response, Rounding::same(5.0));
+            if let Some(reason) = hotkey_disabled_reason {
+                ui.ctx()
+                    .accesskit_node_builder(hotkey_response.id, |builder| {
+                        builder.set_description(reason);
+                    });
+                focus_tooltip(ui, &hotkey_response, reason);
+                hotkey_response.clone().on_hover_text(reason);
+            } else {
+                focus_tooltip(ui, &hotkey_response, hotkey_action_name);
+            }
+            if hotkey_response.clicked() {
+                action = if state.hotkey_capture_active {
+                    ScreenAction::CancelHotkeyCapture
+                } else {
+                    ScreenAction::StartHotkeyCapture
+                };
+            }
         },
     );
     action
@@ -983,6 +1052,64 @@ fn model_selector_disabled_reason(phase: TranscriptionPhase) -> Option<&'static 
         }
         _ => None,
     }
+}
+
+fn quick_model_picker(
+    ui: &mut egui::Ui,
+    anchor: &egui::Response,
+    state: &TranscriptionState,
+    models: &[ModelViewModel],
+) -> Option<ScreenAction> {
+    let popup_id = ui.make_persistent_id("quick-model-picker");
+    let mut action = None;
+    egui::popup::popup_below_widget(ui, popup_id, anchor, |ui| {
+        ui.set_min_width(anchor.rect.width().max(260.0));
+        ui.label(RichText::new("Ready models").strong());
+        ui.add_space(4.0);
+
+        let ready_models = models
+            .iter()
+            .filter(|model| model.installed && model.ready)
+            .collect::<Vec<_>>();
+        if ready_models.is_empty() {
+            ui.label(RichText::new("No installed models are ready to use.").weak());
+        } else {
+            for model in ready_models {
+                let current = state.selected_model_id.as_deref() == Some(model.id.as_str());
+                let label = if current {
+                    format!("{}  (Current)", model.display_name)
+                } else {
+                    model.display_name.clone()
+                };
+                let response = ui.add_sized(
+                    Vec2::new(ui.available_width(), SELECTOR_CONTROL_HEIGHT),
+                    egui::Button::new(label),
+                );
+                response.widget_info(|| {
+                    egui::WidgetInfo::labeled(
+                        egui::WidgetType::Button,
+                        if current {
+                            "Current selected model"
+                        } else {
+                            "Select installed model"
+                        },
+                    )
+                });
+                paint_focus_ring(ui, &response, Rounding::same(5.0));
+                if response.clicked() && !current {
+                    action = Some(ScreenAction::SelectQuickModel(model.id.clone()));
+                    ui.memory_mut(|memory| memory.close_popup());
+                }
+            }
+        }
+
+        ui.separator();
+        if button(ui, "Manage models…", ButtonTone::Text).clicked() {
+            action = Some(ScreenAction::OpenModelSettings);
+            ui.memory_mut(|memory| memory.close_popup());
+        }
+    });
+    action
 }
 
 fn recording_square_button(
@@ -1675,9 +1802,19 @@ fn transcribe(
     ui: &mut egui::Ui,
     state: &TranscriptionState,
     models: &[ModelViewModel],
+    quick_models: &[ModelViewModel],
 ) -> ScreenAction {
     header(ui, "Transcribe", "Audio stays on this device.");
-    let action = selector_row(ui, state, models);
+    let action = selector_row(
+        ui,
+        state,
+        models,
+        if quick_models.is_empty() {
+            models
+        } else {
+            quick_models
+        },
+    );
     ui.add_space(12.0);
     let panel_action = transcript_frame(ui, state, transcript_panel_height(ui));
     ui.add_space(14.0);
@@ -8581,9 +8718,16 @@ mod tests {
                 "missing visible Transcribe label {name}"
             );
         }
-        assert!(nodes.iter().any(|(_, node)| {
-            node.role() == egui::accesskit::Role::Group && node.name() == Some("Recording hotkey")
-        }));
+        let hotkey = nodes
+            .iter()
+            .find_map(|(_, node)| {
+                (node.role() == egui::accesskit::Role::Button
+                    && node.name() == Some("Change recording shortcut"))
+                .then_some(node)
+            })
+            .expect("recording shortcut button");
+        let bounds = hotkey.bounds().expect("recording shortcut bounds");
+        assert!(bounds.width() >= 44.0 && bounds.height() >= 44.0);
     }
 
     #[test]
@@ -8645,7 +8789,7 @@ mod tests {
                             Vec2::new(width, 0.0),
                             Layout::top_down(Align::LEFT),
                             |ui| {
-                                selector_row(ui, &state, &models);
+                                selector_row(ui, &state, &models, &models);
                             },
                         );
                     });
