@@ -152,7 +152,24 @@ impl ControlLayout {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::overlay::view::{CONTROL_SIZE, window_spec};
+    use crate::overlay::{
+        platform::{OverlayPosition, PhysicalWorkArea, calculate_window_bounds},
+        view::{CONTROL_SIZE, window_spec},
+    };
+
+    fn production_bounds(mode: OverlayMode, dpi: u32) -> OverlayWindowBounds {
+        calculate_window_bounds(
+            PhysicalWorkArea {
+                left: -2_000,
+                top: 100,
+                right: 2_000,
+                bottom: 2_000,
+            },
+            dpi,
+            window_spec(mode),
+            OverlayPosition::BottomCenter,
+        )
+    }
 
     #[test]
     fn native_sizes_share_the_public_overlay_contract() {
@@ -192,18 +209,20 @@ mod tests {
     }
 
     #[test]
-    fn every_visible_content_rect_shares_the_physical_capsule_centerline_at_supported_dpi() {
-        for (mode, logical_width, logical_height) in [
-            (OverlayMode::Live, LIVE_WIDTH, LIVE_HEIGHT),
-            (OverlayMode::Minimal, MINIMAL_WIDTH, MINIMAL_HEIGHT),
+    fn production_rounded_bounds_keep_every_content_rect_on_the_physical_centerline() {
+        for (mode, expected_sizes) in [
+            (
+                OverlayMode::Live,
+                [(600, 62), (750, 78), (900, 93), (1_200, 124)],
+            ),
+            (
+                OverlayMode::Minimal,
+                [(320, 52), (400, 65), (480, 78), (640, 104)],
+            ),
         ] {
-            for scale in [1.0, 1.25, 1.5, 2.0] {
-                let bounds = OverlayWindowBounds {
-                    x: -960,
-                    y: 480,
-                    width: (logical_width * scale) as i32,
-                    height: (logical_height * scale) as i32,
-                };
+            for (dpi, expected_size) in [96, 120, 144, 192].into_iter().zip(expected_sizes) {
+                let bounds = production_bounds(mode, dpi);
+                assert_eq!((bounds.width, bounds.height), expected_size);
                 let layout = DisplayLayout::from_bounds(mode, bounds).unwrap();
                 let expected_center = layout.root.center_y();
                 assert_eq!(layout.content_center_y, expected_center);
@@ -219,7 +238,7 @@ mod tests {
                 for rect in elements.into_iter().flatten() {
                     assert!(
                         (rect.center_y() - expected_center).abs() <= 0.5,
-                        "{mode:?} at {scale}x: {:?} drifted from {expected_center}",
+                        "{mode:?} at {dpi} DPI: {:?} drifted from {expected_center}",
                         rect
                     );
                 }
