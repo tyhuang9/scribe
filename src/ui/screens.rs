@@ -4060,8 +4060,13 @@ fn render_inline_model_details(
                         "Trusted source: {} from {}",
                         entry.trust_label, entry.repository
                     ));
-                    builder.set_description(entry.compatibility_detail.as_str());
                 });
+                let compatibility =
+                    ui.label(format!("Compatibility: {}", entry.compatibility_detail));
+                ui.ctx()
+                    .accesskit_node_builder(compatibility.id, |builder| {
+                        builder.set_name(format!("Compatibility: {}", entry.compatibility_detail));
+                    });
                 let revision = ui.label(format!("Pinned revision: {}", entry.pinned_revision));
                 ui.ctx().accesskit_node_builder(revision.id, |builder| {
                     builder.set_name(format!("Pinned revision: {}", entry.pinned_revision));
@@ -8275,6 +8280,89 @@ mod tests {
             disabled_node.description(),
             Some("The download is unavailable.")
         );
+    }
+
+    #[test]
+    fn expanded_remote_card_keeps_install_provenance_visible_and_accessible() {
+        fn collect_text(shape: &egui::epaint::Shape, text: &mut Vec<String>) {
+            match shape {
+                egui::epaint::Shape::Text(text_shape) => {
+                    text.push(text_shape.galley.text().to_owned())
+                }
+                egui::epaint::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        collect_text(shape, text);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let entry = RemoteCatalogEntryView {
+            id: "trusted/compact".into(),
+            display_name: "Compact English".into(),
+            trust_label: "Trusted publisher".into(),
+            repository: "trusted/compact".into(),
+            pinned_revision: "1111111111111111111111111111111111111111".into(),
+            compatibility_detail: "Validated for this device.".into(),
+            ..Default::default()
+        };
+        let variant = RemoteCatalogVariantView {
+            id: "compact-q5".into(),
+            filename: "compact-q5.gguf".into(),
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        crate::ui::controls::configure_accessible_style(&ctx);
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(960.0, 900.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    render_unified_model_card(
+                        ui,
+                        ModelCard::Remote(&entry, &variant),
+                        true,
+                        false,
+                        false,
+                    );
+                });
+            },
+        );
+        let expected = [
+            "Trusted publisher · trusted/compact",
+            "Compatibility: Validated for this device.",
+            "Pinned revision: 1111111111111111111111111111111111111111",
+            "Artifact: compact-q5.gguf",
+        ];
+        let mut painted = Vec::new();
+        for shape in &output.shapes {
+            collect_text(&shape.shape, &mut painted);
+        }
+        for value in expected {
+            assert!(
+                painted.iter().any(|text| text == value),
+                "missing visible provenance: {value}; painted={painted:?}"
+            );
+        }
+        let nodes = &output.platform_output.accesskit_update.unwrap().nodes;
+        for value in [
+            "Trusted source: Trusted publisher from trusted/compact",
+            "Compatibility: Validated for this device.",
+            "Pinned revision: 1111111111111111111111111111111111111111",
+            "Verified artifact: compact-q5.gguf",
+        ] {
+            assert!(
+                nodes.iter().any(|(_, node)| node.name() == Some(value)),
+                "missing accessible provenance: {value}"
+            );
+        }
     }
 
     #[test]

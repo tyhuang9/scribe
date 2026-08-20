@@ -99,7 +99,6 @@ pub(crate) fn button(
     response
 }
 
-#[allow(dead_code)]
 pub(crate) fn icon_button(ui: &mut Ui, icon: Icon, accessible_name: &str) -> Response {
     let colors = ui_palette(ui);
     let enabled = ui.is_enabled();
