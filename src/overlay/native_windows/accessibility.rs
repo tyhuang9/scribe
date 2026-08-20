@@ -434,7 +434,7 @@ mod tests {
         );
         assert_eq!(
             node(DISPLAY_STATUS_ID).bounds(),
-            Some(Rect::new(20.0, 18.75, 57.5, 56.25))
+            Some(Rect::new(20.0, 20.25, 57.5, 57.75))
         );
         assert_eq!(
             node(DISPLAY_METER_ID).bounds(),
@@ -443,11 +443,11 @@ mod tests {
         assert_eq!(node(DISPLAY_ELAPSED_ID).name(), Some("Elapsed time 00:12"));
         assert_eq!(
             node(DISPLAY_ELAPSED_ID).bounds(),
-            Some(Rect::new(70.0, 25.625, 130.0, 54.375))
+            Some(Rect::new(70.0, 24.625, 130.0, 53.375))
         );
         assert_eq!(
             node(DISPLAY_PREVIEW_ID).bounds(),
-            Some(Rect::new(153.75, 25.625, 686.25, 54.375))
+            Some(Rect::new(153.75, 24.625, 686.25, 53.375))
         );
         assert_eq!(
             node(DISPLAY_ANNOUNCEMENT_ID).bounds(),
@@ -480,8 +480,65 @@ mod tests {
         assert_eq!(elapsed.name(), Some("Elapsed time 01:05"));
         assert_eq!(
             elapsed.bounds(),
-            Some(Rect::new(258.75, 20.625, 325.0, 46.875))
+            Some(Rect::new(258.75, 19.375, 325.0, 45.625))
         );
         assert!(tree.nodes.iter().all(|(_, node)| node.live().is_none()));
+    }
+
+    #[test]
+    fn visible_uia_bounds_are_the_shared_layout_outputs_at_every_supported_dpi() {
+        for (mode, logical_width, logical_height) in [
+            (OverlayMode::Live, 600.0, 62.0),
+            (OverlayMode::Minimal, 320.0, 52.0),
+        ] {
+            for scale in [1.0, 1.25, 1.5, 2.0] {
+                let bounds = OverlayWindowBounds {
+                    x: -480,
+                    y: 320,
+                    width: (logical_width * scale) as i32,
+                    height: (logical_height * scale) as i32,
+                };
+                let state = OverlayViewState {
+                    mode,
+                    phase: OverlayPhase::Listening,
+                    elapsed: Some(std::time::Duration::from_secs(12)),
+                    ..OverlayViewState::default()
+                };
+                let layout = DisplayLayout::from_bounds(mode, bounds).unwrap();
+                let tree = display_tree(&state, true, Some(bounds));
+                let node = |id| {
+                    tree.nodes
+                        .iter()
+                        .find(|(node_id, _)| *node_id == id)
+                        .map(|(_, node)| node)
+                        .expect("expected visible accessibility node")
+                };
+                assert_eq!(
+                    node(DISPLAY_STATUS_ID).bounds(),
+                    Some(accesskit_rect(layout.status))
+                );
+                assert_eq!(
+                    node(DISPLAY_METER_ID).bounds(),
+                    Some(accesskit_rect(layout.meter))
+                );
+                assert_eq!(
+                    node(DISPLAY_ELAPSED_ID).bounds(),
+                    Some(accesskit_rect(layout.elapsed))
+                );
+                match layout.preview {
+                    Some(preview) => {
+                        assert_eq!(
+                            node(DISPLAY_PREVIEW_ID).bounds(),
+                            Some(accesskit_rect(preview))
+                        );
+                    }
+                    None => assert!(
+                        tree.nodes
+                            .iter()
+                            .all(|(node_id, _)| *node_id != DISPLAY_PREVIEW_ID)
+                    ),
+                }
+            }
+        }
     }
 }

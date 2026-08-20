@@ -97,11 +97,14 @@ node rather than a live region: Live always exposes its visible timer, while
 Compact exposes one only when it is painted.
 
 AccessKit node bounds and GDI+ paint placement share the same physical layout
-derived from the actual `OverlayWindowBounds`. AccessKit supplies physical
-client coordinates and its Windows adapter translates them through the HWND
-origin to UIA desktop `BoundingRectangle` values. Thus the 44 x 44 logical
-cancel target is 55 x 55 physical pixels on a 120-DPI monitor without using a
-stale fixed rectangle.
+derived from the actual `OverlayWindowBounds`. Waveform/status, timer, divider,
+preview, and Compact status geometry use one physical capsule centerline; the
+deterministic native tests assert at 100%, 125%, 150%, and 200% DPI that no
+visible content rectangle drifts by more than 0.5 physical pixel. AccessKit
+supplies physical client coordinates and its Windows adapter translates them
+through the HWND origin to UIA desktop `BoundingRectangle` values. Thus the 44
+x 44 logical cancel target is 55 x 55 physical pixels on a 120-DPI monitor
+without using a stale fixed rectangle.
 
 The surface is deliberately painted translucent glass, not a native backdrop
 blur. This keeps light/dark output deterministic and fail-soft on Windows

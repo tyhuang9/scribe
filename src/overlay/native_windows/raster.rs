@@ -335,12 +335,11 @@ fn draw_live(
         halo_radius * 2.0,
         Argb((waveform_rgb & 0x00FF_FFFF) | ((waveform_alpha as u32) << 24)),
     )?;
-    canvas.draw_centered_text(
+    canvas.draw_centered_text_in_rect(
         egui_phosphor::regular::WAVEFORM,
         center_x,
-        layout.recording_mark.y0,
         layout.recording_mark.width(),
-        layout.recording_mark.height(),
+        layout.recording_mark,
         27.0 * scale,
         TextStyle::Phosphor,
         colors.waveform,
@@ -350,21 +349,21 @@ fn draw_live(
         .elapsed
         .map(format_elapsed)
         .unwrap_or_else(|| "00:00".to_owned());
-    canvas.draw_text(
+    canvas.draw_text_centered_in_rect(
         &elapsed,
         layout.elapsed.x0,
-        layout.elapsed.y0,
         layout.elapsed.width(),
-        layout.elapsed.height(),
+        layout.elapsed,
         13.0 * scale,
         TextStyle::Monospace,
         colors.muted_text,
     )?;
+    let divider = layout.divider.expect("live layout includes divider bounds");
     canvas.draw_line(
-        111.0 * scale,
-        19.0 * scale,
-        111.0 * scale,
-        43.0 * scale,
+        divider.center_x(),
+        divider.y0,
+        divider.center_x(),
+        divider.y1,
         scale.max(1.0),
         colors.border,
     )?;
@@ -389,14 +388,7 @@ fn draw_live(
             MAX_PREVIEW_GRAPHEMES,
         )?
     };
-    canvas.draw_styled_line(
-        &line,
-        preview.x0,
-        preview.y0,
-        max_width,
-        preview.height(),
-        13.0 * scale,
-    )?;
+    canvas.draw_styled_line(&line, preview.x0, max_width, preview, 13.0 * scale)?;
     Ok(())
 }
 
@@ -424,12 +416,11 @@ fn draw_compact(
     let status_text = layout
         .status_text
         .expect("compact layout includes status text bounds");
-    canvas.draw_text(
+    canvas.draw_text_centered_in_rect(
         label,
         status_text.x0,
-        status_text.y0,
         status_text.width(),
-        status_text.height(),
+        status_text,
         13.0 * scale,
         TextStyle::Bold,
         colors.text,
@@ -456,12 +447,11 @@ fn draw_compact(
         )?;
     }
     if let Some(elapsed) = state.elapsed {
-        canvas.draw_text(
+        canvas.draw_text_centered_in_rect(
             &format_elapsed(elapsed),
             layout.elapsed.x0,
-            layout.elapsed.y0,
             layout.elapsed.width(),
-            layout.elapsed.height(),
+            layout.elapsed,
             12.0 * scale,
             TextStyle::Monospace,
             colors.muted_text,
@@ -782,6 +772,33 @@ impl<'a> Canvas<'a> {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn draw_centered_text_in_rect(
+        &mut self,
+        text: &str,
+        center_x: f32,
+        width: f32,
+        rect: super::layout::PhysicalRect,
+        font_size: f32,
+        style: TextStyle,
+        color: Argb,
+    ) -> Result<(), RasterError> {
+        let measured = self.measure_text(text, font_size, style)?;
+        self.draw_text_centered_in_rect(
+            text,
+            center_x - measured.min(width) / 2.0,
+            width,
+            rect,
+            font_size,
+            style,
+            color,
+        )?;
+        Ok(())
+    }
+
+    /// The cancel control has independent hit-target geometry and intentionally
+    /// retains its established glyph placement. Overlay content uses the
+    /// centerline-aware variant above.
+    #[allow(clippy::too_many_arguments)]
     fn draw_centered_text(
         &mut self,
         text: &str,
@@ -805,6 +822,26 @@ impl<'a> Canvas<'a> {
             color,
         )?;
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_text_centered_in_rect(
+        &mut self,
+        text: &str,
+        x: f32,
+        width: f32,
+        rect: super::layout::PhysicalRect,
+        font_size: f32,
+        style: TextStyle,
+        color: Argb,
+    ) -> Result<f32, RasterError> {
+        let bounds = self.measure_text_bounds(text, font_size, style)?;
+        // GDI+ positions glyphs relative to the layout rectangle rather than
+        // at a baseline supplied by us.  Center the measured glyph bounds on
+        // the shared physical centerline so ascenders/descenders cannot
+        // introduce a DPI-dependent visual drift from the UIA rectangle.
+        let y = rect.center_y() - bounds.Y - bounds.Height / 2.0;
+        self.draw_text(text, x, y, width, rect.height(), font_size, style, color)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -871,6 +908,18 @@ impl<'a> Canvas<'a> {
         font_size: f32,
         style: TextStyle,
     ) -> Result<f32, RasterError> {
+        Ok(self
+            .measure_text_bounds(text, font_size, style)?
+            .Width
+            .max(0.0))
+    }
+
+    fn measure_text_bounds(
+        &mut self,
+        text: &str,
+        font_size: f32,
+        style: TextStyle,
+    ) -> Result<RectF, RasterError> {
         let font = Font::new(self.rasterizer, style, font_size)?;
         let format = StringFormat::new()?;
         let wide: Vec<u16> = text.encode_utf16().collect();
@@ -898,7 +947,7 @@ impl<'a> Canvas<'a> {
             },
             "measure text",
         )?;
-        Ok(measured.Width.max(0.0))
+        Ok(measured)
     }
 
     fn measure_styled_line(
@@ -916,9 +965,8 @@ impl<'a> Canvas<'a> {
         &mut self,
         line: &StyledLine,
         x: f32,
-        y: f32,
         width: f32,
-        height: f32,
+        rect: super::layout::PhysicalRect,
         font_size: f32,
     ) -> Result<(), RasterError> {
         let mut cursor = x;
@@ -927,12 +975,11 @@ impl<'a> Canvas<'a> {
             if cursor >= right {
                 break;
             }
-            let measured = self.draw_text(
+            let measured = self.draw_text_centered_in_rect(
                 &section.text,
                 cursor,
-                y,
                 right - cursor,
-                height,
+                rect,
                 font_size,
                 section.style,
                 section.color,
@@ -1399,6 +1446,32 @@ mod tests {
         assert_eq!(frame.alpha_at(0, 0), 0);
         assert!(frame.alpha_at(160, 26) > 0);
         assert!(frame.pixels.chunks_exact(4).any(|pixel| pixel[3] > 0));
+    }
+
+    #[test]
+    fn light_and_dark_capsules_paint_at_the_shared_centerline_for_supported_dpi() {
+        with_rasterizer(|rasterizer| {
+            for (mode, logical_width, logical_height) in [
+                (OverlayMode::Live, 600.0, 62.0),
+                (OverlayMode::Minimal, 320.0, 52.0),
+            ] {
+                for scale in [1.0, 1.25, 1.5, 2.0] {
+                    let width = (logical_width * scale) as i32;
+                    let height = (logical_height * scale) as i32;
+                    for dark_mode in [false, true] {
+                        let frame = rasterizer
+                            .render_display(&state(mode), dark_mode, width, height)
+                            .unwrap();
+                        assert_eq!((frame.width, frame.height), (width, height));
+                        let center_y = height / 2;
+                        assert!(
+                            frame.alpha_at(width / 2, center_y) > 0,
+                            "{mode:?} at {scale}x ({dark_mode:?}) did not paint its centerline"
+                        );
+                    }
+                }
+            }
+        });
     }
 
     #[test]
