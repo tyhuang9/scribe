@@ -1283,6 +1283,30 @@ enum AppEvent {
     },
 }
 
+/// Delivers background work back to the UI and wakes eframe after the event is
+/// safely queued. Install byte progress is already throttled at its producer;
+/// terminal events are neither coalesced nor dropped while the receiver lives.
+#[derive(Clone)]
+struct AppEventSink {
+    tx: Sender<AppEvent>,
+    repaint: egui::Context,
+}
+
+#[derive(Debug)]
+struct AppEventSendError;
+
+impl AppEventSink {
+    fn new(tx: Sender<AppEvent>, repaint: egui::Context) -> Self {
+        Self { tx, repaint }
+    }
+
+    fn send(&self, event: AppEvent) -> Result<(), AppEventSendError> {
+        self.tx.send(event).map_err(|_| AppEventSendError)?;
+        self.repaint.request_repaint();
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 struct VerifiedInstallResult {
     model: FileReplacement,
@@ -1359,7 +1383,7 @@ impl From<InstallError> for InstallJobFailure {
 }
 
 fn send_install_progress(
-    tx: &Sender<AppEvent>,
+    tx: &AppEventSink,
     job_id: u64,
     model_id: &str,
     progress: InstallProgress,
@@ -1372,7 +1396,7 @@ fn send_install_progress(
 }
 
 fn send_verified_install_result(
-    tx: &Sender<AppEvent>,
+    tx: &AppEventSink,
     job_id: u64,
     model_id: String,
     result: Result<VerifiedInstallResult, InstallJobFailure>,
@@ -1397,7 +1421,7 @@ fn send_verified_install_result(
 }
 
 fn send_verified_install_preparation(
-    tx: &Sender<AppEvent>,
+    tx: &AppEventSink,
     job_id: u64,
     model_id: String,
     result: Result<PreparedVerifiedInstall, InstallJobFailure>,
@@ -3265,7 +3289,7 @@ pub struct LocalTranscriberApp {
     rolling_preview: Option<RollingPreviewHandle>,
     pending_preview_drain: Option<PendingPreviewDrain>,
     transcription_service: TranscriptionService,
-    tx: Sender<AppEvent>,
+    tx: AppEventSink,
     rx: Receiver<AppEvent>,
     playground_cards: Vec<PlaygroundCardState>,
     playground_selector_draft: Option<Vec<String>>,
@@ -3313,6 +3337,7 @@ impl LocalTranscriberApp {
         )));
 
         let (tx, rx) = unbounded();
+        let tx = AppEventSink::new(tx, cc.egui_ctx.clone());
         let transcription_service = TranscriptionService::new(config.clone());
         let playground_cards = cards_from_config(&config, &transcription_service);
         let history_root = config::history_storage_dir().map_err(|error| error.to_string());
@@ -14478,6 +14503,91 @@ mod layout_tests {
 
     static NEXT_TEST_SESSION: AtomicU64 = AtomicU64::new(1);
 
+    fn waking_event_channel() -> (AppEventSink, Receiver<AppEvent>, Receiver<Duration>) {
+        let ctx = egui::Context::default();
+        let (wake_tx, wake_rx) = bounded(1);
+        ctx.set_request_repaint_callback(move |request| {
+            let _ = wake_tx.try_send(request.delay);
+        });
+        let (event_tx, event_rx) = unbounded();
+        (AppEventSink::new(event_tx, ctx), event_rx, wake_rx)
+    }
+
+    #[test]
+    fn background_download_progress_requests_an_immediate_repaint() {
+        let (sink, event_rx, wake_rx) = waking_event_channel();
+
+        let worker = thread::spawn(move || {
+            sink.send(AppEvent::ModelDownloadProgress {
+                job_id: 41,
+                model_id: "wake-fixture".to_owned(),
+                progress: InstallProgress {
+                    stage: InstallStage::Downloading,
+                    completed_bytes: 512,
+                    total_bytes: 1_024,
+                    bytes_per_second: Some(256),
+                },
+            })
+        });
+
+        assert_eq!(
+            wake_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(Duration::ZERO),
+            "a worker event should wake eframe instead of waiting for periodic repaint"
+        );
+        assert!(worker.join().expect("progress worker panicked").is_ok());
+        assert!(matches!(
+            event_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(AppEvent::ModelDownloadProgress {
+                job_id: 41,
+                progress: InstallProgress {
+                    completed_bytes: 512,
+                    ..
+                },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn terminal_install_event_wakes_and_advances_the_coordinator() {
+        let (sink, event_rx, wake_rx) = waking_event_channel();
+        let mut app = test_app();
+        app.tx = sink;
+        app.rx = event_rx;
+        app.artifact_installations.insert(
+            "wake-fixture".to_owned(),
+            (73, InstallCancellation::default()),
+        );
+
+        let sink = app.tx.clone();
+        let worker = thread::spawn(move || {
+            sink.send(AppEvent::VerifiedInstallFailed {
+                job_id: 73,
+                model_id: "wake-fixture".to_owned(),
+                message: "fixture failure".to_owned(),
+                recovery_required: false,
+            })
+        });
+
+        assert_eq!(
+            wake_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(Duration::ZERO),
+            "terminal worker events should wake eframe without focus or a timer tick"
+        );
+        assert!(worker.join().expect("terminal worker panicked").is_ok());
+        assert!(app.artifact_installations.contains_key("wake-fixture"));
+
+        app.poll_events();
+
+        assert!(!app.artifact_installations.contains_key("wake-fixture"));
+        assert_eq!(
+            app.model_downloads.get("wake-fixture"),
+            Some(&ModelInstallStatus::Error("fixture failure".to_owned()))
+        );
+        assert_eq!(app.status, TranscriptionStatus::Error);
+    }
+
     #[test]
     fn start_tab_env_parser_accepts_known_tabs() {
         assert_eq!(tab_from_env_value("models"), Some(Tab::Models));
@@ -19236,6 +19346,7 @@ mod layout_tests {
             .insert("whisper_cpp_tiny_en".to_owned(), fixture.clone());
         config::normalize_config(&mut config);
         let (tx, rx) = unbounded();
+        let tx = AppEventSink::new(tx, egui::Context::default());
 
         let transcription_service = TranscriptionService::new(config.clone());
         let playground_cards = cards_from_config(&config, &transcription_service);
