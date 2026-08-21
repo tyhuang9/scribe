@@ -74,14 +74,15 @@ use crate::ui::{
     AppPage, ComparisonPhase, ComparisonResult, ComparisonResultPhase, HistoryPageAction,
     HistoryPageState, MicrophonePermission, ModelCapabilities, ModelCardKey, ModelComparisonState,
     ModelCompatibility, ModelDialog, ModelDownloadState, ModelLanguageFilter, ModelManagementState,
-    ModelReadiness, ModelSizeTier, ModelSpeedTier, ModelViewModel, RecordingMode,
-    RecordingSettingsView, RemoteCatalogActionKind, RemoteCatalogActionView,
+    ModelReadiness, ModelSizeTier, ModelSpeedTier, ModelViewModel, ReadyModelPickerAction,
+    RecordingMode, RecordingSettingsView, RemoteCatalogActionKind, RemoteCatalogActionView,
     RemoteCatalogEntryView, RemoteCatalogFilters, RemoteCatalogSort, RemoteCatalogStatusKind,
     RemoteCatalogStatusView, RemoteCatalogVariantView, RemoteCatalogView, ResolvedTheme,
-    ScreenAction, ScreenView, SettingsTab, ThemePalette, UiRoute, configure_accessible_style,
-    history_page, minimum_primary_target_height, recording_mode, render_screen,
-    scroll_focused_control_into_view, settings_save_state, show_navigation, show_route_scroll,
-    theme_palette, transcription_state, ui_palette,
+    ScreenAction, ScreenView, SettingsTab, SidebarModelView, ThemePalette, UiRoute,
+    configure_accessible_style, history_page, minimum_primary_target_height, recording_mode,
+    render_screen, request_models_route_heading_focus, scroll_focused_control_into_view,
+    settings_save_state, show_navigation, show_route_scroll, theme_palette, transcription_state,
+    ui_palette,
 };
 
 #[cfg(test)]
@@ -809,6 +810,7 @@ impl LatencyTrace {
             compute_backend: self.compute_backend.clone(),
             streaming_mode: self.streaming_mode.clone(),
             cold_or_warm: self.cold_or_warm.clone(),
+            output_outcome: None,
             metrics: DiagnosticSessionMetrics {
                 hotkey_to_overlay_visible_ms: millis(
                     Some(self.activation_at),
@@ -950,8 +952,12 @@ fn effective_native_overlay_mode(mode: OverlayMode) -> NativeOverlayMode {
     }
 }
 
-fn live_overlay_owns_announcements(presented: bool, mode: NativeOverlayMode) -> bool {
-    presented && mode == NativeOverlayMode::Live
+fn live_overlay_owns_announcements(
+    presented: bool,
+    mode: NativeOverlayMode,
+    live_preview_available: bool,
+) -> bool {
+    presented && mode == NativeOverlayMode::Live && live_preview_available
 }
 
 fn rolling_preview_enabled(source: RecordingSource, mode: StreamingMode) -> bool {
@@ -1283,6 +1289,30 @@ enum AppEvent {
     },
 }
 
+/// Delivers background work back to the UI and wakes eframe after the event is
+/// safely queued. Install byte progress is already throttled at its producer;
+/// terminal events are neither coalesced nor dropped while the receiver lives.
+#[derive(Clone)]
+struct AppEventSink {
+    tx: Sender<AppEvent>,
+    repaint: egui::Context,
+}
+
+#[derive(Debug)]
+struct AppEventSendError;
+
+impl AppEventSink {
+    fn new(tx: Sender<AppEvent>, repaint: egui::Context) -> Self {
+        Self { tx, repaint }
+    }
+
+    fn send(&self, event: AppEvent) -> Result<(), AppEventSendError> {
+        self.tx.send(event).map_err(|_| AppEventSendError)?;
+        self.repaint.request_repaint();
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 struct VerifiedInstallResult {
     model: FileReplacement,
@@ -1359,7 +1389,7 @@ impl From<InstallError> for InstallJobFailure {
 }
 
 fn send_install_progress(
-    tx: &Sender<AppEvent>,
+    tx: &AppEventSink,
     job_id: u64,
     model_id: &str,
     progress: InstallProgress,
@@ -1372,7 +1402,7 @@ fn send_install_progress(
 }
 
 fn send_verified_install_result(
-    tx: &Sender<AppEvent>,
+    tx: &AppEventSink,
     job_id: u64,
     model_id: String,
     result: Result<VerifiedInstallResult, InstallJobFailure>,
@@ -1397,7 +1427,7 @@ fn send_verified_install_result(
 }
 
 fn send_verified_install_preparation(
-    tx: &Sender<AppEvent>,
+    tx: &AppEventSink,
     job_id: u64,
     model_id: String,
     result: Result<PreparedVerifiedInstall, InstallJobFailure>,
@@ -3207,6 +3237,7 @@ pub struct LocalTranscriberApp {
     #[cfg(test)]
     comparison_output_replacement_count: usize,
     model_management: ModelManagementState,
+    models_route_focus_pending: bool,
     status: TranscriptionStatus,
     transcript: String,
     raw_transcript: String,
@@ -3266,7 +3297,7 @@ pub struct LocalTranscriberApp {
     rolling_preview: Option<RollingPreviewHandle>,
     pending_preview_drain: Option<PendingPreviewDrain>,
     transcription_service: TranscriptionService,
-    tx: Sender<AppEvent>,
+    tx: AppEventSink,
     rx: Receiver<AppEvent>,
     playground_cards: Vec<PlaygroundCardState>,
     playground_selector_draft: Option<Vec<String>>,
@@ -3314,6 +3345,7 @@ impl LocalTranscriberApp {
         )));
 
         let (tx, rx) = unbounded();
+        let tx = AppEventSink::new(tx, cc.egui_ctx.clone());
         let transcription_service = TranscriptionService::new(config.clone());
         let playground_cards = cards_from_config(&config, &transcription_service);
         let history_root = config::history_storage_dir().map_err(|error| error.to_string());
@@ -3399,6 +3431,7 @@ impl LocalTranscriberApp {
             #[cfg(test)]
             comparison_output_replacement_count: 0,
             model_management: ModelManagementState::default(),
+            models_route_focus_pending: false,
             status: TranscriptionStatus::Idle,
             transcript: String::new(),
             raw_transcript: String::new(),
@@ -3443,7 +3476,7 @@ impl LocalTranscriberApp {
             #[cfg(test)]
             test_gguf_fixture: None,
             captured_targets: HashMap::new(),
-            overlay_controller: OverlayController::new(overlay::reduced_motion_preferred()),
+            overlay_controller: OverlayController::new(),
             overlay_hide_at: None,
             overlay_presented: false,
             overlay_first_presented_at: HashMap::new(),
@@ -4558,6 +4591,21 @@ impl LocalTranscriberApp {
             .record(latency.diagnostic_snapshot(session_id, outcome, failure_stage));
     }
 
+    fn record_output_session_diagnostic(
+        &mut self,
+        session_id: SessionId,
+        latency: &LatencyTrace,
+        outcome: DiagnosticSessionOutcome,
+        failure_stage: Option<DiagnosticFailureStage>,
+        output_result: &text_output::TextOutputResult,
+    ) {
+        let mut latency = latency.clone();
+        self.merge_overlay_presentation(session_id, &mut latency);
+        let mut diagnostic = latency.diagnostic_snapshot(session_id, outcome, failure_stage);
+        diagnostic.output_outcome = Some(output_result.diagnostic_label().to_owned());
+        self.diagnostics.record(diagnostic);
+    }
+
     fn poll_pending_output(&mut self) {
         self.poll_pending_output_with(text_output::write_to_captured_target);
     }
@@ -4608,7 +4656,13 @@ impl LocalTranscriberApp {
                 } else {
                     (DiagnosticSessionOutcome::Completed, None)
                 };
-            self.record_session_diagnostic(pending.session_id, latency, outcome, failure_stage);
+            self.record_output_session_diagnostic(
+                pending.session_id,
+                latency,
+                outcome,
+                failure_stage,
+                &result,
+            );
         }
         self.status_message = format!("{}. {}", pending.completion_message, output_message);
         self.latest_latency = self.merged_overlay_latency(pending.session_id, pending.latency);
@@ -4621,7 +4675,8 @@ impl LocalTranscriberApp {
             self.finish_overlay_error(pending.session_id, &output_message);
         } else if matches!(
             result,
-            text_output::TextOutputResult::InsertedClipboardRestoreFailed(_)
+            text_output::TextOutputResult::InsertedClipboardRestoreSkipped
+                | text_output::TextOutputResult::InsertedClipboardRestoreFailed(_)
         ) {
             self.status = TranscriptionStatus::Idle;
             if self.overlay_controller.show_error(
@@ -4990,6 +5045,9 @@ impl LocalTranscriberApp {
                     Ok((publisher, handle)) => {
                         preview_publisher = Some(publisher);
                         self.rolling_preview = Some(handle);
+                        let _ = self
+                            .overlay_controller
+                            .set_live_preview_available(session_id, true);
                     }
                     Err(error) => {
                         let _ = self
@@ -6160,33 +6218,7 @@ impl LocalTranscriberApp {
         history_id: i64,
         result: &text_output::TextOutputResult,
     ) {
-        let outcome = match result {
-            text_output::TextOutputResult::Inserted => "inserted",
-            text_output::TextOutputResult::InsertedClipboardRestoreFailed(_) => {
-                "inserted_clipboard_restore_failed"
-            }
-            text_output::TextOutputResult::CopiedOnly(
-                text_output::CopyOnlyReason::TargetUnavailable,
-            ) => "copied_only_target_unavailable",
-            text_output::TextOutputResult::CopiedOnly(
-                text_output::CopyOnlyReason::AutomationUnavailable,
-            ) => "copied_only_automation_unavailable",
-            text_output::TextOutputResult::CopiedOnly(text_output::CopyOnlyReason::PasteFailed) => {
-                "copied_only_paste_failed"
-            }
-            text_output::TextOutputResult::CopiedOnly(
-                text_output::CopyOnlyReason::ClipboardSnapshotUnavailable,
-            ) => "copied_only_clipboard_snapshot_unavailable",
-            text_output::TextOutputResult::CopiedOnly(
-                text_output::CopyOnlyReason::ClipboardSnapshotUnsupported,
-            ) => "copied_only_clipboard_snapshot_unsupported",
-            text_output::TextOutputResult::CopiedOnly(
-                text_output::CopyOnlyReason::ClipboardSnapshotError,
-            ) => "copied_only_clipboard_snapshot_error",
-            text_output::TextOutputResult::NotInserted(_) => "not_inserted_clipboard_changed",
-            text_output::TextOutputResult::Failed(_) => "failed",
-        }
-        .to_owned();
+        let outcome = result.diagnostic_label().to_owned();
         self.record_history_output_label(history_id, outcome);
     }
 
@@ -8037,10 +8069,41 @@ impl LocalTranscriberApp {
                 self.status_message = format!("Registered hotkey {}", self.config.recording.hotkey);
             }
             Err(err) => {
+                self.capturing_hotkey = false;
+                self.hotkey_input = self.config.recording.hotkey.clone();
                 self.status = TranscriptionStatus::Error;
-                self.status_message = format!("Failed to register hotkey: {err}");
+                self.status_message = format!(
+                    "Failed to register hotkey: {err}. The previous shortcut is still active."
+                );
             }
         }
+    }
+
+    fn quick_hotkey_change_block_reason(&self) -> Option<String> {
+        if self.capture_is_active() || self.pending_recording.is_some() {
+            Some("Stop the active recording before changing the recording shortcut.".to_owned())
+        } else if self.effective_status() == TranscriptionStatus::Transcribing
+            || self.pending_output.is_some()
+        {
+            Some("Wait for transcription and output to finish before changing the recording shortcut.".to_owned())
+        } else {
+            None
+        }
+    }
+
+    fn start_hotkey_capture(&mut self) {
+        if let Some(reason) = self.quick_hotkey_change_block_reason() {
+            self.status_message = reason;
+            return;
+        }
+        self.capturing_hotkey = true;
+        self.status_message = "Press the new hotkey combination. Press Escape or the recording shortcut card again to cancel.".to_owned();
+    }
+
+    fn cancel_hotkey_capture(&mut self) {
+        self.capturing_hotkey = false;
+        self.hotkey_input = self.config.recording.hotkey.clone();
+        self.status_message = "Hotkey capture cancelled.".to_owned();
     }
 
     fn apply_theme(&self, ctx: &egui::Context, frame: &eframe::Frame) {
@@ -8052,6 +8115,11 @@ impl LocalTranscriberApp {
 
     fn poll_hotkey_capture(&mut self, ctx: &egui::Context) {
         if !self.capturing_hotkey {
+            return;
+        }
+
+        if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+            self.cancel_hotkey_capture();
             return;
         }
 
@@ -8090,6 +8158,44 @@ impl LocalTranscriberApp {
         self.save_config();
         self.remote_catalog.invalidate_local_models();
         true
+    }
+
+    fn select_ready_model_from_picker(&mut self, model_id: &str) -> bool {
+        let Some(model) = config::configured_models(&self.config)
+            .into_iter()
+            .find(|model| model.id == model_id)
+        else {
+            self.status_message =
+                "That model is no longer available. Refresh Models and choose a ready model."
+                    .to_owned();
+            return false;
+        };
+        if !self.effective_install_status(&model).is_runnable()
+            || runtime_status_for_model(&self.config, &model) != ModelRuntimeStatus::Ready
+        {
+            self.status_message = format!(
+                "{} is no longer ready. Repair it or choose another ready model in Models.",
+                model.name
+            );
+            return false;
+        }
+        if let Some(reason) = self.artifact_mutation_block_reason() {
+            self.status_message = reason;
+            return false;
+        }
+        self.select_model_as_default(&model)
+    }
+
+    fn apply_ready_model_picker_action(&mut self, action: ReadyModelPickerAction) {
+        match action {
+            ReadyModelPickerAction::Select(id) => {
+                self.select_ready_model_from_picker(&id);
+            }
+            ReadyModelPickerAction::ManageModels => {
+                self.current_tab = Tab::Models;
+                self.models_route_focus_pending = true;
+            }
+        }
     }
 
     fn active_model_removal_replacement(&self, removed_id: &str) -> Option<SttModelInfo> {
@@ -9284,6 +9390,10 @@ impl eframe::App for LocalTranscriberApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // Consume only focus requests carried into this frame. Navigation may
+        // queue a new request below, which intentionally waits for the next
+        // frame so the Models route and its accessibility tree are stable.
+        let focus_models_route_heading = std::mem::take(&mut self.models_route_focus_pending);
         self.apply_theme(ctx, frame);
         paint_viewport_background(ctx);
         self.handle_close_request(ctx);
@@ -9348,20 +9458,31 @@ impl eframe::App for LocalTranscriberApp {
             }
             _ => {}
         }
+        let sidebar_models = Arc::clone(&self.remote_catalog.local_models);
+        let sidebar_selected_model_id = self.config.general.selected_default_model.clone();
+        let sidebar_disabled_reason = self.artifact_mutation_block_reason();
         let resolved_theme =
             match resolve_theme_mode(self.config.general.theme_mode, frame.info().system_theme) {
                 ThemeMode::Dark => ResolvedTheme::Dark,
                 ThemeMode::Light | ThemeMode::System => ResolvedTheme::Light,
             };
-        let navigation_action = show_navigation(
+        let (theme_action, model_action) = show_navigation(
             ctx,
             &mut self.current_tab,
             self.config.developer.debug_mode,
             resolved_theme,
+            SidebarModelView {
+                selected_model_id: Some(&sidebar_selected_model_id),
+                models: &sidebar_models,
+                disabled_reason: sidebar_disabled_reason.as_deref(),
+            },
         );
-        if navigation_action != ScreenAction::None {
-            self.apply_settings_screen_action(navigation_action);
+        if theme_action != ScreenAction::None {
+            self.apply_settings_screen_action(theme_action);
             ctx.request_repaint();
+        }
+        if let Some(action) = model_action {
+            self.apply_ready_model_picker_action(action);
         }
         if let Some(message) = self.theme_announcement.take() {
             paint_theme_change_status(ctx, &message);
@@ -9381,7 +9502,12 @@ impl eframe::App for LocalTranscriberApp {
                         self.ui_general_settings(ui);
                     }
                 }),
-                Tab::Models => show_route_scroll(ui, UiRoute::Models, |ui| self.ui_models(ui)),
+                Tab::Models => show_route_scroll(ui, UiRoute::Models, |ui| {
+                    if focus_models_route_heading {
+                        request_models_route_heading_focus(ui.ctx());
+                    }
+                    self.ui_models(ui)
+                }),
                 Tab::History => show_route_scroll(ui, UiRoute::History, |ui| self.ui_history(ui)),
                 Tab::Advanced => unreachable!("advanced navigation is routed to Settings"),
                 Tab::About => unreachable!("about navigation is routed to Settings"),
@@ -9422,6 +9548,7 @@ impl eframe::App for LocalTranscriberApp {
 impl LocalTranscriberApp {
     fn ui_transcribe(&mut self, ui: &mut Ui) {
         let models = self.transcribe_screen_models();
+        let quick_models = Arc::clone(&self.remote_catalog.local_models);
         let (selected_model_id, model_readiness) = self.selected_model_screen_state();
         let microphone_permission = self.microphone_permission();
         let no_speech = self.status_message == "No speech detected; nothing was pasted.";
@@ -9457,7 +9584,11 @@ impl LocalTranscriberApp {
         state.suppress_live_announcements = live_overlay_owns_announcements(
             self.overlay_presented,
             self.overlay_controller.state().mode,
+            self.overlay_controller.state().live_preview_available,
         );
+        state.hotkey_capture_active = self.capturing_hotkey;
+        state.hotkey_change_disabled_reason = self.quick_hotkey_change_block_reason();
+        state.model_change_disabled_reason = self.artifact_mutation_block_reason();
         let settings = RecordingSettingsView {
             duration_label: format!("{} seconds", self.config.recording.max_recording_seconds),
             provisional_feedback: self.config.streaming.mode != StreamingMode::FinalOnly,
@@ -9482,7 +9613,7 @@ impl LocalTranscriberApp {
                 route: UiRoute::Transcribe,
                 transcription: &state,
                 models: &models,
-                model_catalog: &[],
+                model_catalog: &quick_models,
                 comparison: &Default::default(),
                 model_management: &Default::default(),
                 model_language_filter: ModelLanguageFilter::default(),
@@ -9548,6 +9679,15 @@ impl LocalTranscriberApp {
     fn apply_transcribe_screen_action(&mut self, action: ScreenAction) {
         match action {
             ScreenAction::AddModel | ScreenAction::ChangeModel => self.current_tab = Tab::Models,
+            ScreenAction::OpenModelSettings => {
+                self.current_tab = Tab::Models;
+                self.models_route_focus_pending = true;
+            }
+            ScreenAction::SelectQuickModel(id) => {
+                self.select_ready_model_from_picker(&id);
+            }
+            ScreenAction::StartHotkeyCapture => self.start_hotkey_capture(),
+            ScreenAction::CancelHotkeyCapture => self.cancel_hotkey_capture(),
             ScreenAction::StartRecording | ScreenAction::RetryMicrophone => {
                 self.start_recording(RecordingSource::Transcribe)
             }
@@ -9607,7 +9747,6 @@ impl LocalTranscriberApp {
             | ScreenAction::SetAutoInsertTranscript(_)
             | ScreenAction::SetRestoreClipboardAfterInsert(_)
             | ScreenAction::SetPasteDelayMs(_)
-            | ScreenAction::OpenModelSettings
             | ScreenAction::SetTheme(_)
             | ScreenAction::ToggleResolvedTheme(_)
             | ScreenAction::SetOverlayMode(_)
@@ -11966,6 +12105,7 @@ impl LocalTranscriberApp {
         state.suppress_live_announcements = live_overlay_owns_announcements(
             self.overlay_presented,
             self.overlay_controller.state().mode,
+            self.overlay_controller.state().live_preview_available,
         );
         let settings = RecordingSettingsView {
             close_to_tray: self.config.general.close_to_tray,
@@ -12321,6 +12461,7 @@ impl LocalTranscriberApp {
             ScreenAction::None
             | ScreenAction::AcknowledgeModelRemovalFocus
             | ScreenAction::SelectModel(_)
+            | ScreenAction::SelectQuickModel(_)
             | ScreenAction::InstallModel(_)
             | ScreenAction::UpgradeModel(_)
             | ScreenAction::CancelModelInstall(_)
@@ -12331,6 +12472,8 @@ impl LocalTranscriberApp {
             | ScreenAction::CloseModelDialog
             | ScreenAction::AddModel
             | ScreenAction::ChangeModel
+            | ScreenAction::StartHotkeyCapture
+            | ScreenAction::CancelHotkeyCapture
             | ScreenAction::StartRecording
             | ScreenAction::StopRecording
             | ScreenAction::AbandonRecording
@@ -12424,22 +12567,6 @@ fn paint_viewport_background(ctx: &egui::Context) {
     );
 }
 
-fn paint_theme_change_status(ctx: &egui::Context, message: &str) {
-    let screen_rect = ctx.screen_rect();
-    egui::Area::new(egui::Id::new("theme-change-live-status"))
-        .order(egui::Order::Foreground)
-        .fixed_pos(egui::pos2(screen_rect.max.x + 1.0, screen_rect.max.y + 1.0))
-        .show(ctx, |ui| {
-            let response = ui.label(message);
-            ui.ctx().accesskit_node_builder(response.id, |builder| {
-                builder.set_role(egui::accesskit::Role::Status);
-                builder.set_name(message);
-                builder.set_live(egui::accesskit::Live::Polite);
-                builder.set_live_atomic();
-            });
-        });
-}
-
 fn page(
     ui: &mut Ui,
     title: &str,
@@ -12496,6 +12623,22 @@ fn page(
 fn content_panel_frame(ctx: &egui::Context) -> Frame {
     let colors = theme_palette(ctx);
     Frame::none().fill(colors.content_bg)
+}
+
+fn paint_theme_change_status(ctx: &egui::Context, message: &str) {
+    let screen_rect = ctx.screen_rect();
+    egui::Area::new(egui::Id::new("theme-change-live-status"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(egui::pos2(screen_rect.max.x + 1.0, screen_rect.max.y + 1.0))
+        .show(ctx, |ui| {
+            let response = ui.label(message);
+            ui.ctx().accesskit_node_builder(response.id, |builder| {
+                builder.set_role(egui::accesskit::Role::Status);
+                builder.set_name(message);
+                builder.set_live(egui::accesskit::Live::Polite);
+                builder.set_live_atomic();
+            });
+        });
 }
 
 fn card(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)) {
@@ -14524,6 +14667,91 @@ mod layout_tests {
 
     static NEXT_TEST_SESSION: AtomicU64 = AtomicU64::new(1);
 
+    fn waking_event_channel() -> (AppEventSink, Receiver<AppEvent>, Receiver<Duration>) {
+        let ctx = egui::Context::default();
+        let (wake_tx, wake_rx) = bounded(1);
+        ctx.set_request_repaint_callback(move |request| {
+            let _ = wake_tx.try_send(request.delay);
+        });
+        let (event_tx, event_rx) = unbounded();
+        (AppEventSink::new(event_tx, ctx), event_rx, wake_rx)
+    }
+
+    #[test]
+    fn background_download_progress_requests_an_immediate_repaint() {
+        let (sink, event_rx, wake_rx) = waking_event_channel();
+
+        let worker = thread::spawn(move || {
+            sink.send(AppEvent::ModelDownloadProgress {
+                job_id: 41,
+                model_id: "wake-fixture".to_owned(),
+                progress: InstallProgress {
+                    stage: InstallStage::Downloading,
+                    completed_bytes: 512,
+                    total_bytes: 1_024,
+                    bytes_per_second: Some(256),
+                },
+            })
+        });
+
+        assert_eq!(
+            wake_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(Duration::ZERO),
+            "a worker event should wake eframe instead of waiting for periodic repaint"
+        );
+        assert!(worker.join().expect("progress worker panicked").is_ok());
+        assert!(matches!(
+            event_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(AppEvent::ModelDownloadProgress {
+                job_id: 41,
+                progress: InstallProgress {
+                    completed_bytes: 512,
+                    ..
+                },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn terminal_install_event_wakes_and_advances_the_coordinator() {
+        let (sink, event_rx, wake_rx) = waking_event_channel();
+        let mut app = test_app();
+        app.tx = sink;
+        app.rx = event_rx;
+        app.artifact_installations.insert(
+            "wake-fixture".to_owned(),
+            (73, InstallCancellation::default()),
+        );
+
+        let sink = app.tx.clone();
+        let worker = thread::spawn(move || {
+            sink.send(AppEvent::VerifiedInstallFailed {
+                job_id: 73,
+                model_id: "wake-fixture".to_owned(),
+                message: "fixture failure".to_owned(),
+                recovery_required: false,
+            })
+        });
+
+        assert_eq!(
+            wake_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(Duration::ZERO),
+            "terminal worker events should wake eframe without focus or a timer tick"
+        );
+        assert!(worker.join().expect("terminal worker panicked").is_ok());
+        assert!(app.artifact_installations.contains_key("wake-fixture"));
+
+        app.poll_events();
+
+        assert!(!app.artifact_installations.contains_key("wake-fixture"));
+        assert_eq!(
+            app.model_downloads.get("wake-fixture"),
+            Some(&ModelInstallStatus::Error("fixture failure".to_owned()))
+        );
+        assert_eq!(app.status, TranscriptionStatus::Error);
+    }
+
     #[test]
     fn start_tab_env_parser_accepts_known_tabs() {
         assert_eq!(tab_from_env_value("models"), Some(Tab::Models));
@@ -14662,6 +14890,99 @@ mod layout_tests {
                 (bounds.y0 - 28.0).abs() <= 6.0,
                 "{title} heading should share the route top inset, got {bounds:?}"
             );
+        }
+    }
+
+    #[test]
+    fn manage_models_keyboard_navigation_focuses_the_models_heading_next_frame() {
+        for sidebar_entry in [true, false] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            configure_stitch_style(&ctx);
+            let mut app = test_app();
+            let installed_fixture = install_test_catalog_model(&mut app, "whisper_cpp_base_en");
+            app.current_tab = if sidebar_entry {
+                Tab::History
+            } else {
+                Tab::Transcribe
+            };
+            let trigger_id = egui::Id::new(if sidebar_entry {
+                "active-model-trigger"
+            } else {
+                "selected-model-action"
+            });
+            let popup_id = egui::Id::new(if sidebar_entry {
+                "sidebar-ready-model-picker"
+            } else {
+                "quick-model-picker"
+            });
+            ctx.memory_mut(|memory| memory.request_focus(trigger_id));
+
+            let opened =
+                render_app_navigation_frame(&ctx, &mut app, vec![pressed_key(egui::Key::Enter)]);
+            assert!(ctx.memory(|memory| memory.is_popup_open(popup_id)));
+            let manage_id = opened
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .unwrap()
+                .nodes
+                .iter()
+                .find_map(|(id, node)| {
+                    node.name()
+                        .is_some_and(|name| name.starts_with("Manage models"))
+                        .then_some(*id)
+                })
+                .expect("ready-model picker should expose Manage models");
+
+            let focused_menu = render_app_navigation_frame(
+                &ctx,
+                &mut app,
+                vec![egui::Event::AccessKitActionRequest(
+                    egui::accesskit::ActionRequest {
+                        action: egui::accesskit::Action::Focus,
+                        target: manage_id,
+                        data: None,
+                    },
+                )],
+            );
+            assert_eq!(
+                focused_menu
+                    .platform_output
+                    .accesskit_update
+                    .as_ref()
+                    .unwrap()
+                    .focus,
+                manage_id
+            );
+
+            let navigated =
+                render_app_navigation_frame(&ctx, &mut app, vec![pressed_key(egui::Key::Enter)]);
+            assert_eq!(app.current_tab, Tab::Models);
+            assert!(app.models_route_focus_pending);
+            assert!(!ctx.memory(|memory| memory.is_popup_open(popup_id)));
+            assert_ne!(ctx.memory(|memory| memory.focused()), Some(trigger_id));
+            let navigated_update = navigated.platform_output.accesskit_update.as_ref().unwrap();
+            assert!(!navigated_update.nodes.iter().any(|(id, node)| {
+                *id == navigated_update.focus
+                    && node.role() == egui::accesskit::Role::Heading
+                    && node.name() == Some("Models")
+            }));
+
+            let settled = render_app_navigation_frame(&ctx, &mut app, Vec::new());
+            assert!(!app.models_route_focus_pending);
+            let update = settled.platform_output.accesskit_update.as_ref().unwrap();
+            let focused = update
+                .nodes
+                .iter()
+                .find(|(id, _)| *id == update.focus)
+                .map(|(_, node)| node)
+                .expect("focused Models destination should remain in the accessibility tree");
+            assert_eq!(focused.role(), egui::accesskit::Role::Heading);
+            assert_eq!(focused.name(), Some("Models"));
+            assert_ne!(ctx.memory(|memory| memory.focused()), Some(trigger_id));
+
+            let _ = fs::remove_file(installed_fixture);
         }
     }
 
@@ -14878,73 +15199,6 @@ mod layout_tests {
             resolve_theme_mode(ThemeMode::Dark, Some(eframe::Theme::Light)),
             ThemeMode::Dark
         );
-    }
-
-    #[test]
-    fn shell_theme_toggle_saves_the_opposite_resolved_appearance() {
-        for (configured, resolved_theme, expected) in [
-            (ThemeMode::System, ResolvedTheme::Dark, ThemeMode::Light),
-            (ThemeMode::System, ResolvedTheme::Light, ThemeMode::Dark),
-            (ThemeMode::Dark, ResolvedTheme::Dark, ThemeMode::Light),
-            (ThemeMode::Light, ResolvedTheme::Light, ThemeMode::Dark),
-        ] {
-            let mut app = test_app();
-            app.config.general.theme_mode = configured;
-
-            app.apply_settings_screen_action(ScreenAction::ToggleResolvedTheme(resolved_theme));
-
-            assert_eq!(app.config.general.theme_mode, expected);
-            assert_eq!(
-                app.status_message,
-                format!("Theme changed to {}.", expected.label())
-            );
-        }
-    }
-
-    #[test]
-    fn shell_theme_toggle_announces_the_resulting_theme_politely() {
-        let ctx = egui::Context::default();
-        ctx.enable_accesskit();
-        configure_stitch_style(&ctx);
-        ctx.set_visuals(stitch_visuals(ThemeMode::Light));
-        let mut app = test_app();
-        app.current_tab = Tab::Transcribe;
-        app.apply_settings_screen_action(ScreenAction::ToggleResolvedTheme(ResolvedTheme::Light));
-        let message = app
-            .theme_announcement
-            .take()
-            .expect("theme toggle should queue an accessibility announcement");
-
-        let output = ctx.run(
-            egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    egui::vec2(960.0, 680.0),
-                )),
-                ..Default::default()
-            },
-            |ctx| {
-                paint_theme_change_status(ctx, &message);
-                egui::CentralPanel::default()
-                    .frame(content_panel_frame(ctx))
-                    .show(ctx, |ui| {
-                        show_route_scroll(ui, UiRoute::Transcribe, |ui| app.ui_transcribe(ui));
-                    });
-            },
-        );
-        let notice = output
-            .platform_output
-            .accesskit_update
-            .as_ref()
-            .unwrap()
-            .nodes
-            .iter()
-            .map(|(_, node)| node)
-            .find(|node| node.name() == Some("Theme changed to Dark."))
-            .expect("theme change result should be exposed to accessibility");
-        assert_eq!(notice.role(), egui::accesskit::Role::Status);
-        assert_eq!(notice.live(), Some(egui::accesskit::Live::Polite));
-        assert!(notice.is_live_atomic());
     }
 
     #[test]
@@ -17326,6 +17580,142 @@ mod layout_tests {
             app.session_coordinator.last_terminal().unwrap().outcome,
             crate::core::TerminalOutcome::Completed
         );
+        let diagnostics_root = std::env::temp_dir().join(format!(
+            "scribe-output-outcome-diagnostics-{}-{}",
+            std::process::id(),
+            NEXT_TEST_SESSION.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&diagnostics_root);
+        let report = diagnostics::export_redacted(&diagnostics_root, &app.diagnostics).unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&fs::read(report).unwrap()).unwrap();
+        assert_eq!(
+            report["sessions"][0]["output_outcome"],
+            "inserted_clipboard_restore_failed"
+        );
+        let _ = fs::remove_dir_all(diagnostics_root);
+    }
+
+    #[test]
+    fn restore_skipped_completes_once_and_records_history_and_diagnostics() {
+        use std::cell::Cell;
+
+        let mut app = test_app();
+        let history_root = std::env::temp_dir().join(format!(
+            "scribe-restore-skipped-history-{}-{}",
+            std::process::id(),
+            NEXT_TEST_SESSION.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&history_root);
+        let history_store =
+            HistoryStore::open(&history_root, HistoryRetentionPolicy::default()).unwrap();
+        let history_record = history_store
+            .create_pending(
+                NewHistoryEntry {
+                    raw_text: "once".to_owned(),
+                    model_id: "whisper_cpp_base_en".to_owned(),
+                    source_app: None,
+                    metrics: HistoryMetrics::default(),
+                },
+                None,
+            )
+            .unwrap();
+        history_store
+            .complete(
+                history_record.id,
+                CompletedHistoryEntry {
+                    raw_text: "once".to_owned(),
+                    final_text: "once".to_owned(),
+                    metrics: HistoryMetrics::default(),
+                },
+            )
+            .unwrap();
+        app.history_store = Some(history_store.clone());
+
+        let session_id = SessionId(114);
+        let request_id = RequestId(115);
+        let model_id = ModelId::new("whisper_cpp_base_en");
+        seed_test_request(
+            &mut app,
+            RecordingSource::Transcribe,
+            session_id,
+            request_id,
+            model_id.as_str(),
+        );
+        app.session_coordinator
+            .complete_request(session_id, request_id, &model_id)
+            .unwrap();
+        app.session_coordinator.begin_output(session_id).unwrap();
+        app.overlay_controller
+            .begin_session(session_id, NativeOverlayMode::Live);
+        app.pending_output = Some(PendingOutput {
+            session_id,
+            history_id: Some(history_record.id),
+            transcript: "once".to_owned(),
+            completion_message: "Complete".to_owned(),
+            config: app.config.clone(),
+            latency: Some(LatencyTrace::started_at(
+                Instant::now(),
+                TriggerObservation::AppAction,
+            )),
+        });
+        let paste_calls = Cell::new(0_u32);
+
+        app.poll_pending_output_with(|_, _, _| {
+            paste_calls.set(paste_calls.get() + 1);
+            text_output::TextOutputResult::InsertedClipboardRestoreSkipped
+        });
+        app.poll_pending_output_with(|_, _, _| {
+            paste_calls.set(paste_calls.get() + 1);
+            text_output::TextOutputResult::InsertedClipboardRestoreSkipped
+        });
+
+        assert_eq!(paste_calls.get(), 1);
+        assert_eq!(
+            app.session_coordinator.last_terminal().unwrap().outcome,
+            crate::core::TerminalOutcome::Completed
+        );
+        assert_eq!(
+            app.overlay_controller
+                .state()
+                .error
+                .as_ref()
+                .unwrap()
+                .recovery,
+            OverlayRecovery::None
+        );
+        assert!(app.status_message.contains("newer clipboard contents"));
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let output_outcome = loop {
+            let page = history_store.search(HistoryQuery::default()).unwrap();
+            if let Some(outcome) = page.records[0].output_outcome.clone() {
+                break outcome;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "history outcome was not recorded"
+            );
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(output_outcome, "inserted_clipboard_restore_skipped");
+
+        let diagnostics_root = std::env::temp_dir().join(format!(
+            "scribe-restore-skipped-diagnostics-{}-{}",
+            std::process::id(),
+            NEXT_TEST_SESSION.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&diagnostics_root);
+        let report = diagnostics::export_redacted(&diagnostics_root, &app.diagnostics).unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&fs::read(report).unwrap()).unwrap();
+        assert_eq!(
+            report["sessions"][0]["output_outcome"],
+            "inserted_clipboard_restore_skipped"
+        );
+
+        drop(app);
+        drop(history_store);
+        let _ = fs::remove_dir_all(history_root);
+        let _ = fs::remove_dir_all(diagnostics_root);
     }
 
     #[test]
@@ -19116,6 +19506,70 @@ mod layout_tests {
         })
     }
 
+    fn render_app_navigation_frame(
+        ctx: &egui::Context,
+        app: &mut LocalTranscriberApp,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        let focus_models_route_heading = std::mem::take(&mut app.models_route_focus_pending);
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1_180.0, 815.0),
+                )),
+                focused: true,
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                let sidebar_models = Arc::clone(&app.remote_catalog.local_models);
+                let selected_model_id = app.config.general.selected_default_model.clone();
+                let (_, model_action) = show_navigation(
+                    ctx,
+                    &mut app.current_tab,
+                    false,
+                    ResolvedTheme::Light,
+                    SidebarModelView {
+                        selected_model_id: Some(&selected_model_id),
+                        models: &sidebar_models,
+                        disabled_reason: None,
+                    },
+                );
+                if let Some(action) = model_action {
+                    app.apply_ready_model_picker_action(action);
+                }
+                egui::CentralPanel::default()
+                    .frame(content_panel_frame(ctx))
+                    .show(ctx, |ui| match app.current_tab {
+                        Tab::Transcribe => {
+                            show_route_scroll(ui, UiRoute::Transcribe, |ui| app.ui_transcribe(ui))
+                        }
+                        Tab::Models => show_route_scroll(ui, UiRoute::Models, |ui| {
+                            if focus_models_route_heading {
+                                request_models_route_heading_focus(ui.ctx());
+                            }
+                            app.ui_models(ui)
+                        }),
+                        Tab::History => {
+                            show_route_scroll(ui, UiRoute::History, |ui| app.ui_history(ui))
+                        }
+                        _ => unreachable!("focus-route test uses primary non-settings pages"),
+                    });
+            },
+        )
+    }
+
+    fn pressed_key(key: egui::Key) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
     fn render_debug_route_with_input(
         ctx: &egui::Context,
         app: &mut LocalTranscriberApp,
@@ -19265,7 +19719,13 @@ mod layout_tests {
     }
 
     fn show_test_navigation(ctx: &egui::Context, current_tab: &mut Tab) {
-        let _ = show_navigation(ctx, current_tab, true, ResolvedTheme::Light);
+        show_navigation(
+            ctx,
+            current_tab,
+            true,
+            ResolvedTheme::Light,
+            SidebarModelView::default(),
+        );
     }
 
     fn max_visible_painted_x(output: &egui::FullOutput) -> f32 {
@@ -19349,6 +19809,7 @@ mod layout_tests {
             .insert("whisper_cpp_tiny_en".to_owned(), fixture.clone());
         config::normalize_config(&mut config);
         let (tx, rx) = unbounded();
+        let tx = AppEventSink::new(tx, egui::Context::default());
 
         let transcription_service = TranscriptionService::new(config.clone());
         let playground_cards = cards_from_config(&config, &transcription_service);
@@ -19404,6 +19865,7 @@ mod layout_tests {
             comparison_wer_compute_count: 0,
             comparison_output_replacement_count: 0,
             model_management: ModelManagementState::default(),
+            models_route_focus_pending: false,
             status: TranscriptionStatus::Idle,
             transcript: String::new(),
             raw_transcript: String::new(),
@@ -19447,7 +19909,7 @@ mod layout_tests {
             diagnostics: DiagnosticsStore::default(),
             test_gguf_fixture: Some(fixture),
             captured_targets: HashMap::new(),
-            overlay_controller: OverlayController::new(false),
+            overlay_controller: OverlayController::new(),
             overlay_hide_at: None,
             overlay_presented: false,
             overlay_first_presented_at: HashMap::new(),
@@ -21428,6 +21890,82 @@ mod layout_tests {
         assert_eq!(app.current_tab, Tab::General);
         assert_eq!(app.settings_tab, SettingsTab::Advanced);
         assert!(!app.settings_playground_open);
+    }
+
+    #[test]
+    fn transcribe_hotkey_capture_actions_are_in_place_and_cancellable() {
+        let mut app = test_app();
+        let original = app.config.recording.hotkey.clone();
+
+        app.apply_transcribe_screen_action(ScreenAction::StartHotkeyCapture);
+        assert!(app.capturing_hotkey);
+        assert!(
+            app.status_message
+                .contains("Press the new hotkey combination")
+        );
+
+        app.hotkey_input = "Ctrl+Alt+K".to_owned();
+        app.apply_transcribe_screen_action(ScreenAction::CancelHotkeyCapture);
+        assert!(!app.capturing_hotkey);
+        assert_eq!(app.hotkey_input, original);
+        assert_eq!(app.status_message, "Hotkey capture cancelled.");
+    }
+
+    #[test]
+    fn both_quick_model_entry_points_revalidate_a_stale_ready_catalog_entry() {
+        let mut app = test_app();
+        let previous = app.config.general.selected_default_model.clone();
+        let mut cached_models = app.remote_catalog.local_models.to_vec();
+        cached_models.push(ModelViewModel {
+            id: "stale-ready-model".into(),
+            display_name: "Stale ready model".into(),
+            installed: true,
+            ready: true,
+            ..Default::default()
+        });
+        app.remote_catalog.local_models = cached_models.into();
+
+        for sidebar in [false, true] {
+            if sidebar {
+                app.apply_ready_model_picker_action(ReadyModelPickerAction::Select(
+                    "stale-ready-model".into(),
+                ));
+            } else {
+                app.apply_transcribe_screen_action(ScreenAction::SelectQuickModel(
+                    "stale-ready-model".into(),
+                ));
+            }
+            assert_eq!(app.config.general.selected_default_model, previous);
+            assert_eq!(
+                app.status_message,
+                "That model is no longer available. Refresh Models and choose a ready model."
+            );
+        }
+    }
+
+    #[test]
+    fn ready_model_picker_helper_preserves_selection_while_artifact_mutation_is_busy() {
+        let mut app = test_app();
+        install_test_catalog_model(&mut app, "whisper_cpp_base_en");
+        let previous = app.config.general.selected_default_model.clone();
+        app.playground_pending = 1;
+
+        for sidebar in [false, true] {
+            if sidebar {
+                app.apply_ready_model_picker_action(ReadyModelPickerAction::Select(
+                    "whisper_cpp_base_en".into(),
+                ));
+            } else {
+                app.apply_transcribe_screen_action(ScreenAction::SelectQuickModel(
+                    "whisper_cpp_base_en".into(),
+                ));
+            }
+            assert_eq!(app.config.general.selected_default_model, previous);
+            assert_eq!(
+                app.status_message,
+                "Wait for Playground jobs to finish before changing speech artifacts."
+            );
+        }
     }
 
     #[test]
@@ -24971,6 +25509,10 @@ mod layout_tests {
             .unwrap();
         app.overlay_controller
             .begin_session(session_id, NativeOverlayMode::Live);
+        assert!(
+            app.overlay_controller
+                .set_live_preview_available(session_id, true)
+        );
 
         let event =
             |sequence, model_id: ModelId, committed: &str, tentative: &str| PreviewEvent::Update {
@@ -25017,6 +25559,10 @@ mod layout_tests {
             .unwrap();
         app.overlay_controller
             .begin_session(session_id, NativeOverlayMode::Live);
+        assert!(
+            app.overlay_controller
+                .set_live_preview_available(session_id, true)
+        );
         app.apply_rolling_preview_event(PreviewEvent::Update {
             identity: StreamIdentity {
                 session_id,
@@ -25103,19 +25649,28 @@ mod layout_tests {
     fn only_a_presented_live_overlay_owns_live_announcements() {
         assert!(live_overlay_owns_announcements(
             true,
-            NativeOverlayMode::Live
+            NativeOverlayMode::Live,
+            true,
         ));
         assert!(!live_overlay_owns_announcements(
             true,
-            NativeOverlayMode::Minimal
+            NativeOverlayMode::Minimal,
+            true,
         ));
         assert!(!live_overlay_owns_announcements(
             false,
-            NativeOverlayMode::Live
+            NativeOverlayMode::Live,
+            true,
         ));
         assert!(!live_overlay_owns_announcements(
             true,
-            NativeOverlayMode::Off
+            NativeOverlayMode::Off,
+            true,
+        ));
+        assert!(!live_overlay_owns_announcements(
+            true,
+            NativeOverlayMode::Live,
+            false,
         ));
     }
 

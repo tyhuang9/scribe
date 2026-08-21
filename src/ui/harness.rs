@@ -14,8 +14,9 @@ use crate::{
 
 use super::{
     ThemePalette, configure_accessible_style,
+    model_picker::ReadyModelPickerAction,
     screens::{RecordingSettingsView, ScreenAction, ScreenView, render_screen, show_route_scroll},
-    shell::{AppPage, show_navigation},
+    shell::{AppPage, SidebarModelView, show_navigation},
     state::{
         ComparisonPhase, ModelCapabilities, ModelCardKey, ModelComparisonState, ModelDialog,
         ModelDownloadState, ModelLanguageFilter, ModelManagementState, ModelSizeTier,
@@ -120,13 +121,14 @@ impl Fixture {
                 session_id: Some(SessionId(42)),
                 mode,
                 phase: OverlayPhase::Listening,
+                live_preview_available: mode == OverlayMode::Live,
                 audio_level: OverlayAudioLevel::new(0.58, 0.78),
                 transcript: OverlayTranscript {
-                    committed: "Clicking the settings icon in the top".to_owned(),
-                    tentative: "right opens recording preferences.".to_owned(),
+                    committed: "Alright, What is going on? Why is there a line on".to_owned(),
+                    tentative: "That's pretty cool. These newest words stay visible.".to_owned(),
                     revision: 1,
                 },
-                elapsed: Some(Duration::from_secs(12)),
+                elapsed: Some(Duration::from_secs(10)),
                 ..OverlayViewState::default()
             },
         })
@@ -321,6 +323,7 @@ impl Fixture {
         FixtureData {
             route,
             transcription,
+            theme_announcement: None,
             models,
             comparison,
             model_management: if self == Self::ModelsCardExpanded {
@@ -336,7 +339,6 @@ impl Fixture {
             remote_catalog: remote_catalog_fixture(),
             settings,
             settings_playground_open: false,
-            theme_announcement: None,
         }
     }
 }
@@ -560,7 +562,7 @@ impl eframe::App for UiHarnessApp {
         if clear_after_removal_focus {
             self.data.model_management.restore_after_removal_focus = false;
         }
-        apply_harness_action(ctx, &mut self.data, &mut self.page, action);
+        apply_action(&mut self.data, &mut self.page, action);
         ctx.request_repaint_after(std::time::Duration::from_secs(60));
     }
 }
@@ -654,16 +656,26 @@ fn render_settings_playground_fixture(ui: &mut egui::Ui) -> ScreenAction {
 }
 
 fn show_harness(ctx: &egui::Context, data: &mut FixtureData, page: &mut AppPage) -> ScreenAction {
-    let navigation_action = show_navigation(
+    let resolved_theme = if ctx.style().visuals.dark_mode {
+        ResolvedTheme::Dark
+    } else {
+        ResolvedTheme::Light
+    };
+    let (theme_action, model_action) = show_navigation(
         ctx,
         page,
         false,
-        if ctx.style().visuals.dark_mode {
-            ResolvedTheme::Dark
-        } else {
-            ResolvedTheme::Light
+        resolved_theme,
+        SidebarModelView {
+            selected_model_id: data.transcription.selected_model_id.as_deref(),
+            models: &data.model_catalog,
+            disabled_reason: data.transcription.model_change_disabled_reason.as_deref(),
         },
     );
+    let navigation_action = model_action.map(|action| match action {
+        ReadyModelPickerAction::Select(id) => ScreenAction::SelectQuickModel(id),
+        ReadyModelPickerAction::ManageModels => ScreenAction::OpenModelSettings,
+    });
     if let Some(message) = data.theme_announcement.take() {
         paint_theme_change_status(ctx, &message);
     }
@@ -693,10 +705,10 @@ fn show_harness(ctx: &egui::Context, data: &mut FixtureData, page: &mut AppPage)
             })
         })
         .inner;
-    if navigation_action == ScreenAction::None {
-        screen_action
+    if theme_action != ScreenAction::None {
+        theme_action
     } else {
-        navigation_action
+        navigation_action.unwrap_or(screen_action)
     }
 }
 
@@ -776,6 +788,9 @@ fn apply_action(data: &mut FixtureData, page: &mut AppPage, action: ScreenAction
             }
             data.model_management.dialog = None;
         }
+        ScreenAction::SelectQuickModel(id) => {
+            data.transcription.selected_model_id = Some(id);
+        }
         ScreenAction::AddModel => {
             data.model_management.dialog = Some(ModelDialog::Add);
             data.model_management.focus_dialog_initial = true;
@@ -814,6 +829,8 @@ fn apply_action(data: &mut FixtureData, page: &mut AppPage, action: ScreenAction
             data.transcription.selected_model_id = Some("base.en".into());
             data.transcription.phase = TranscriptionPhase::Ready;
         }
+        ScreenAction::StartHotkeyCapture => data.transcription.hotkey_capture_active = true,
+        ScreenAction::CancelHotkeyCapture => data.transcription.hotkey_capture_active = false,
         ScreenAction::StartRecording => data.transcription.phase = TranscriptionPhase::Listening,
         ScreenAction::StopRecording => data.transcription.phase = TranscriptionPhase::Finalizing,
         ScreenAction::AbandonRecording => {
@@ -1027,27 +1044,6 @@ fn apply_action(data: &mut FixtureData, page: &mut AppPage, action: ScreenAction
     }
 }
 
-fn apply_harness_action(
-    ctx: &egui::Context,
-    data: &mut FixtureData,
-    page: &mut AppPage,
-    action: ScreenAction,
-) {
-    let requested_dark_mode = match &action {
-        ScreenAction::SetTheme(value) if value == "Dark" => Some(true),
-        ScreenAction::SetTheme(value) if value == "Light" => Some(false),
-        ScreenAction::SetTheme(value) if value == "System" => Some(ctx.style().visuals.dark_mode),
-        ScreenAction::ToggleResolvedTheme(ResolvedTheme::Dark) => Some(false),
-        ScreenAction::ToggleResolvedTheme(ResolvedTheme::Light) => Some(true),
-        _ => None,
-    };
-    apply_action(data, page, action);
-    if let Some(dark_mode) = requested_dark_mode {
-        configure_harness_style(ctx, dark_mode);
-        ctx.request_repaint();
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1068,138 +1064,6 @@ mod tests {
             style.text_styles[&egui::TextStyle::Body],
             egui::FontId::new(14.0, egui::FontFamily::Proportional)
         );
-    }
-
-    #[test]
-    fn harness_theme_toggle_updates_visuals_and_resolves_the_next_frame() {
-        let ctx = egui::Context::default();
-        ctx.enable_accesskit();
-        configure_harness_style(&ctx, false);
-        let mut data = Fixture::TranscribeReady.data();
-        let mut page = AppPage::Transcribe;
-
-        for (button_name, expected_dark, expected_label) in [
-            ("Switch to dark theme", true, "Dark"),
-            ("Switch to light theme", false, "Light"),
-        ] {
-            let (initial, initial_action) =
-                render_with_input(&ctx, &mut data, &mut page, 960.0, 680.0, Vec::new());
-            assert_eq!(initial_action, ScreenAction::None);
-            let target = named_node_id(&initial, button_name);
-            let (_, action) = render_with_input(
-                &ctx,
-                &mut data,
-                &mut page,
-                960.0,
-                680.0,
-                vec![egui::Event::AccessKitActionRequest(
-                    egui::accesskit::ActionRequest {
-                        action: egui::accesskit::Action::Default,
-                        target,
-                        data: None,
-                    },
-                )],
-            );
-            apply_harness_action(&ctx, &mut data, &mut page, action);
-            let output = render_with_input(&ctx, &mut data, &mut page, 960.0, 680.0, Vec::new()).0;
-            let expected_notice = format!("Theme changed to {expected_label}.");
-
-            assert_eq!(ctx.style().visuals.dark_mode, expected_dark);
-            assert_eq!(data.settings.theme_label, expected_label);
-            assert_eq!(theme_status_count(&output, &expected_notice), 1);
-            let next = render_with_input(&ctx, &mut data, &mut page, 960.0, 680.0, Vec::new()).0;
-            assert_eq!(theme_status_count(&next, &expected_notice), 0);
-        }
-    }
-
-    #[test]
-    fn harness_theme_toggle_status_is_one_shot_across_primary_routes() {
-        for fixture in [
-            Fixture::TranscribeReady,
-            Fixture::ModelsInstalled,
-            Fixture::History,
-            Fixture::SettingsRecording,
-        ] {
-            let ctx = egui::Context::default();
-            ctx.enable_accesskit();
-            configure_harness_style(&ctx, false);
-            let mut data = fixture.data();
-            let mut page = fixture.page();
-            let (initial, initial_action) =
-                render_with_input(&ctx, &mut data, &mut page, 960.0, 680.0, Vec::new());
-            assert_eq!(initial_action, ScreenAction::None, "{fixture:?}");
-            let target = named_node_id(&initial, "Switch to dark theme");
-            let (_, action) = render_with_input(
-                &ctx,
-                &mut data,
-                &mut page,
-                960.0,
-                680.0,
-                vec![egui::Event::AccessKitActionRequest(
-                    egui::accesskit::ActionRequest {
-                        action: egui::accesskit::Action::Default,
-                        target,
-                        data: None,
-                    },
-                )],
-            );
-            assert_eq!(
-                action,
-                ScreenAction::ToggleResolvedTheme(ResolvedTheme::Light),
-                "{fixture:?}"
-            );
-            apply_harness_action(&ctx, &mut data, &mut page, action);
-            let expected_notice = "Theme changed to Dark.";
-            let activation =
-                render_with_input(&ctx, &mut data, &mut page, 960.0, 680.0, Vec::new()).0;
-            assert_eq!(
-                theme_status_count(&activation, expected_notice),
-                1,
-                "{fixture:?} should announce once on activation frame"
-            );
-            assert_ne!(data.transcription.notice.as_deref(), Some(expected_notice));
-            let next = render_with_input(&ctx, &mut data, &mut page, 960.0, 680.0, Vec::new()).0;
-            assert_eq!(
-                theme_status_count(&next, expected_notice),
-                0,
-                "{fixture:?} should not repeat the announcement"
-            );
-        }
-    }
-
-    #[test]
-    fn harness_settings_theme_actions_keep_system_and_explicit_visuals_coherent() {
-        let ctx = egui::Context::default();
-        configure_harness_style(&ctx, false);
-        let mut data = Fixture::SettingsRecording.data();
-        let mut page = AppPage::General;
-
-        apply_harness_action(
-            &ctx,
-            &mut data,
-            &mut page,
-            ScreenAction::SetTheme("Dark".into()),
-        );
-        assert!(ctx.style().visuals.dark_mode);
-        assert_eq!(data.settings.theme_label, "Dark");
-
-        apply_harness_action(
-            &ctx,
-            &mut data,
-            &mut page,
-            ScreenAction::SetTheme("System".into()),
-        );
-        assert!(ctx.style().visuals.dark_mode);
-        assert_eq!(data.settings.theme_label, "System");
-
-        apply_harness_action(
-            &ctx,
-            &mut data,
-            &mut page,
-            ScreenAction::SetTheme("Light".into()),
-        );
-        assert!(!ctx.style().visuals.dark_mode);
-        assert_eq!(data.settings.theme_label, "Light");
     }
 
     #[test]
@@ -1241,10 +1105,16 @@ mod tests {
                 overlay.state.audio_level,
                 OverlayAudioLevel::new(0.58, 0.78)
             );
-            assert_eq!(overlay.state.elapsed, Some(Duration::from_secs(12)));
+            assert_eq!(overlay.state.elapsed, Some(Duration::from_secs(10)));
             assert_eq!(overlay.state.transcript.revision, 1);
-            assert!(!overlay.state.transcript.committed.is_empty());
-            assert!(!overlay.state.transcript.tentative.is_empty());
+            assert_eq!(
+                overlay.state.transcript.committed,
+                "Alright, What is going on? Why is there a line on"
+            );
+            assert_eq!(
+                overlay.state.transcript.tentative,
+                "That's pretty cool. These newest words stay visible."
+            );
             assert!(overlay.state.transcript_announcement.is_none());
             assert!(overlay.state.notice.is_none());
             assert!(overlay.state.error.is_none());
@@ -1392,6 +1262,29 @@ mod tests {
             .unwrap_or_else(|| panic!("missing AccessKit node for {name}"))
     }
 
+    fn quick_model_card_bounds(output: &egui::FullOutput) -> egui::accesskit::Rect {
+        node_matching(output, |node| {
+            node.role() == egui::accesskit::Role::Button
+                && node.name().is_some_and(|name| {
+                    name.starts_with("Choose active model:") || name == "Add a model"
+                })
+        })
+        .bounds()
+        .expect("quick model card must expose bounds")
+    }
+
+    fn quick_hotkey_card_bounds(output: &egui::FullOutput) -> egui::accesskit::Rect {
+        node_matching(output, |node| {
+            node.role() == egui::accesskit::Role::Button
+                && node.name().is_some_and(|name| {
+                    name == "Change recording shortcut"
+                        || name == "Cancel recording shortcut capture"
+                })
+        })
+        .bounds()
+        .expect("quick hotkey card must expose bounds")
+    }
+
     fn click_named_control(
         ctx: &egui::Context,
         data: &mut FixtureData,
@@ -1489,23 +1382,6 @@ mod tests {
                         && node.is_live_atomic()
                 })
         );
-    }
-
-    fn theme_status_count(output: &egui::FullOutput, expected: &str) -> usize {
-        output
-            .platform_output
-            .accesskit_update
-            .as_ref()
-            .unwrap()
-            .nodes
-            .iter()
-            .filter(|(_, node)| {
-                node.role() == egui::accesskit::Role::Status
-                    && node.name() == Some(expected)
-                    && node.live() == Some(egui::accesskit::Live::Polite)
-                    && node.is_live_atomic()
-            })
-            .count()
     }
 
     fn assert_near(actual: f64, expected: f64, label: &str) {
@@ -1617,8 +1493,8 @@ mod tests {
                 y1: height.into(),
             };
             let panel = named_node_bounds(&output, "Transcript panel");
-            let model = named_node_bounds(&output, "Selected model");
-            let hotkey = named_node_bounds(&output, "Recording hotkey");
+            let model = quick_model_card_bounds(&output);
+            let hotkey = quick_hotkey_card_bounds(&output);
             assert!(
                 panel.x0 >= viewport.x0 - LAYOUT_TOLERANCE
                     && panel.x1 <= viewport.x1 + LAYOUT_TOLERANCE,
@@ -1646,7 +1522,10 @@ mod tests {
             assert_within_tolerance(hotkey.y0, 118.0, 3.0, "wide hotkey row start");
             assert_within_tolerance(panel.y0, 185.0, 6.0, "wide transcript panel top");
 
-            let bounds = node_matching(&output, |node| node.name() == Some(committed.as_str()))
+            let committed_node =
+                node_matching(&output, |node| node.name() == Some(committed.as_str()));
+            assert_eq!(committed_node.live(), Some(egui::accesskit::Live::Polite));
+            let bounds = committed_node
                 .bounds()
                 .expect("inline transcript label should expose bounds");
             assert_bounds_within(bounds, panel, "wrapped inline transcript text");
@@ -1654,11 +1533,24 @@ mod tests {
                 bounds.y1 - bounds.y0 > 32.0,
                 "inline transcript label did not wrap: {bounds:?}"
             );
+            let estimate_name = format!("Live estimate, may change: {provisional}");
+            let estimate =
+                node_matching(&output, |node| node.name() == Some(estimate_name.as_str()));
+            assert_eq!(estimate.role(), egui::accesskit::Role::StaticText);
+            assert!(estimate.live().is_none());
             assert!(
-                !node_names(&output)
+                output
+                    .platform_output
+                    .accesskit_update
+                    .as_ref()
+                    .unwrap()
+                    .nodes
                     .iter()
-                    .any(|name| name.contains(&provisional)),
-                "provisional text should remain visual-only and outside live accessibility names"
+                    .filter(|(_, node)| node.live() == Some(egui::accesskit::Live::Polite))
+                    .all(|(_, node)| {
+                        !node.name().is_some_and(|name| name.contains(&provisional))
+                    }),
+                "provisional text must remain outside polite live regions"
             );
             for name in ["Clear", "Copy"] {
                 let bounds = node_matching(&output, |node| {
@@ -1734,29 +1626,19 @@ mod tests {
                 render_with_input(&ctx, &mut data, &mut page, width, 815.0, Vec::new());
             assert_eq!(action, ScreenAction::None);
 
-            let model = named_node_bounds(&output, "Selected model");
-            let hotkey = named_node_bounds(&output, "Recording hotkey");
-            let change = node_matching(&output, |node| node.name() == Some("Change"))
-                .bounds()
-                .expect("Change action should remain exposed");
+            let model = quick_model_card_bounds(&output);
+            let hotkey = quick_hotkey_card_bounds(&output);
+            let change = node_matching(&output, |node| {
+                node.name()
+                    .is_some_and(|name| name.starts_with("Choose active model:"))
+            })
+            .bounds()
+            .expect("model card action should remain exposed");
             assert_bounds_within(change, model, "Change action");
-            assert_within_tolerance(change.y1 - change.y0, 44.0, 3.0, "Change target height");
-            assert_bounds_within(
-                node_matching(&output, |node| node.name() == Some(long_model_name))
-                    .bounds()
-                    .expect("long selected model name should remain visible"),
-                model,
-                "long selected model name",
-            );
-            for key in ["Ctrl", "Shift", "Alt", "Space"] {
-                assert_bounds_within(
-                    node_matching(&output, |node| node.name() == Some(key))
-                        .bounds()
-                        .unwrap_or_else(|| panic!("missing {key} hotkey keycap")),
-                    hotkey,
-                    "hotkey keycap",
-                );
-            }
+            assert_eq!(change, model, "the entire model card must be interactive");
+            assert!(change.y1 - change.y0 >= 44.0);
+            assert!(model.x1 - model.x0 <= 360.0 + LAYOUT_TOLERANCE);
+            assert!(hotkey.x1 - hotkey.x0 <= 300.0 + LAYOUT_TOLERANCE);
             if should_stack {
                 assert!(
                     model.y1 <= hotkey.y0 + LAYOUT_TOLERANCE,
@@ -1774,13 +1656,9 @@ mod tests {
     #[test]
     fn narrow_selector_wraps_hotkey_contents_inside_the_second_row_card() {
         let long_model_name = "Whisper Large v3 Turbo English — high accuracy dictation";
-        for (hotkey_value, model_name, should_reflow) in [
-            ("Ctrl + Space", None, false),
-            (
-                "Ctrl + Shift + Alt + Super + Space",
-                Some(long_model_name),
-                true,
-            ),
+        for (hotkey_value, model_name) in [
+            ("Ctrl + Space", None),
+            ("Ctrl + Shift + Alt + Super + Space", Some(long_model_name)),
         ] {
             let ctx = egui::Context::default();
             ctx.enable_accesskit();
@@ -1802,90 +1680,25 @@ mod tests {
                 x1: 375.0,
                 y1: 815.0,
             };
-            let model = named_node_bounds(&output, "Selected model");
-            let hotkey = named_node_bounds(&output, "Recording hotkey");
+            let model = quick_model_card_bounds(&output);
+            let hotkey = quick_hotkey_card_bounds(&output);
             assert!(model.y1 <= hotkey.y0 + LAYOUT_TOLERANCE);
             assert_bounds_within(model, viewport, "narrow selected model card");
             assert_bounds_within(hotkey, viewport, "narrow hotkey card");
-            let change = node_matching(&output, |node| node.name() == Some("Change"))
-                .bounds()
-                .expect("narrow Change target should expose bounds");
+            let change = node_matching(&output, |node| {
+                node.name()
+                    .is_some_and(|name| name.starts_with("Choose active model:"))
+            })
+            .bounds()
+            .expect("narrow model card target should expose bounds");
             assert_bounds_within(change, model, "narrow Change target");
-            assert_within_tolerance(change.x1 - change.x0, 72.0, 1.0, "Change target width");
-            assert_within_tolerance(change.y1 - change.y0, 44.0, 1.0, "Change target height");
-            if let Some(model_name) = model_name {
-                let model_label = node_matching(&output, |node| node.name() == Some(model_name))
-                    .bounds()
-                    .expect("long selected model name should remain visible");
-                assert_bounds_within(model_label, model, "long selected model name");
-                assert_bounds_within(model_label, viewport, "long selected model name");
-            }
-            assert_bounds_within(
-                node_matching(&output, |node| node.name() == Some("Hotkey:"))
-                    .bounds()
-                    .expect("Hotkey label should remain visible"),
-                hotkey,
-                "Hotkey label",
-            );
-            for key in hotkey_value.split('+').map(str::trim) {
-                assert_bounds_within(
-                    node_matching(&output, |node| node.name() == Some(key))
-                        .bounds()
-                        .unwrap_or_else(|| panic!("missing {key} hotkey keycap")),
-                    hotkey,
-                    "narrow hotkey keycap",
-                );
-            }
-            let separators = output
-                .platform_output
-                .accesskit_update
-                .as_ref()
-                .unwrap()
-                .nodes
-                .iter()
-                .filter_map(|(_, node)| (node.name() == Some("+")).then(|| node.bounds()).flatten())
-                .collect::<Vec<_>>();
             assert_eq!(
-                separators.len(),
-                hotkey_value.matches('+').count(),
-                "every chord separator should remain exposed"
+                change, model,
+                "the narrow model card must be interactive edge to edge"
             );
-            let following_key_bounds = hotkey_value
-                .split('+')
-                .map(str::trim)
-                .skip(1)
-                .map(|key| {
-                    node_matching(&output, |node| node.name().is_some_and(|name| name == key))
-                        .bounds()
-                        .unwrap_or_else(|| panic!("missing {key} hotkey keycap"))
-                })
-                .collect::<Vec<_>>();
-            for separator in separators {
-                assert_bounds_within(separator, hotkey, "hotkey separator");
-                assert!(
-                    following_key_bounds
-                        .iter()
-                        .any(|key| separator.y0 < key.y1 && key.y0 < separator.y1),
-                    "separator must remain on the same row as its following key: {separator:?}"
-                );
-            }
-            if should_reflow {
-                assert!(
-                    model.y1 - model.y0 > 44.0 + LAYOUT_TOLERANCE,
-                    "below-intrinsic model card should grow for wrapped identity: {model:?}"
-                );
-                assert!(
-                    hotkey.y1 - hotkey.y0 > 44.0 + LAYOUT_TOLERANCE,
-                    "below-intrinsic hotkey card should grow for wrapped content: {hotkey:?}"
-                );
-            } else {
-                assert_within_tolerance(
-                    hotkey.y1 - hotkey.y0,
-                    44.0,
-                    3.0,
-                    "single-line narrow hotkey card height",
-                );
-            }
+            assert!(change.y1 - change.y0 >= 44.0);
+            assert_within_tolerance(model.y1 - model.y0, 44.0, 1.0, "fixed model card height");
+            assert_within_tolerance(hotkey.y1 - hotkey.y0, 44.0, 1.0, "fixed hotkey card height");
         }
     }
 
@@ -1908,12 +1721,12 @@ mod tests {
                 y1: height.into(),
             };
             let panel = named_node_bounds(&output, "Transcript panel");
-            let selector = named_node_bounds(&output, "Selected model");
-            let hotkey = named_node_bounds(&output, "Recording hotkey");
+            let selector = quick_model_card_bounds(&output);
+            let hotkey = quick_hotkey_card_bounds(&output);
             let empty_state = named_node_bounds(&output, "Model required empty state");
-            let select = node_matching(&output, |node| node.name() == Some("Select"))
+            let select = node_matching(&output, |node| node.name() == Some("Add a model"))
                 .bounds()
-                .expect("Select should expose bounds");
+                .expect("Add a model should expose bounds");
             assert_bounds_within(panel, viewport, "transcript panel");
             assert_bounds_within(selector, viewport, "selected model card");
             assert_bounds_within(hotkey, viewport, "hotkey card");
@@ -1953,7 +1766,10 @@ mod tests {
             .bounds()
             .expect("Silence helper should expose bounds");
             assert_bounds_within(helper, viewport, "Silence helper");
-            assert_within_tolerance(selector.x1 - select.x1, 16.0, 1.0, "Select right inset");
+            assert_eq!(
+                select, selector,
+                "the no-model card must be interactive edge to edge"
+            );
 
             let panel_midpoint = (panel.y0 + panel.y1) / 2.0;
             let empty_midpoint = (empty_state.y0 + empty_state.y1) / 2.0;
@@ -1973,7 +1789,7 @@ mod tests {
     }
 
     #[test]
-    fn selector_actions_use_fixed_trailing_accessible_targets() {
+    fn selector_actions_use_the_entire_card_as_the_accessible_target() {
         let (width, height) = (1180.0, 815.0);
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
@@ -1990,36 +1806,18 @@ mod tests {
             Vec::new(),
         );
         assert_eq!(no_model_action, ScreenAction::None);
-        let card = named_node_bounds(&no_model_output, "Selected model");
+        let card = quick_model_card_bounds(&no_model_output);
         let select = node_matching(&no_model_output, |node| {
-            node.role() == egui::accesskit::Role::Button && node.name() == Some("Select")
+            node.role() == egui::accesskit::Role::Button && node.name() == Some("Add a model")
         });
         let select_bounds = select.bounds().expect("Select should expose bounds");
         assert!(!select.is_disabled());
-        assert_within_tolerance(
-            card.x1,
-            889.2,
-            1.0,
-            "Selected model card right edge at the 1180px reference width",
+        assert!(
+            card.x1 - card.x0 <= 360.0 + LAYOUT_TOLERANCE,
+            "model card should remain bounded instead of filling the route"
         );
-        assert_within_tolerance(
-            select_bounds.x1 - select_bounds.x0,
-            72.0,
-            1.0,
-            "Select target width",
-        );
-        assert_within_tolerance(
-            select_bounds.y1 - select_bounds.y0,
-            44.0,
-            1.0,
-            "Select target height",
-        );
-        assert_within_tolerance(
-            card.x1 - select_bounds.x1,
-            16.0,
-            1.0,
-            "Select right inset from visible model card",
-        );
+        assert_eq!(select_bounds, card);
+        assert!(select_bounds.y1 - select_bounds.y0 >= 44.0);
         assert_eq!(
             click_named_control(
                 &ctx,
@@ -2027,7 +1825,7 @@ mod tests {
                 &mut no_model_page,
                 width,
                 height,
-                "Select",
+                "Add a model",
             ),
             ScreenAction::AddModel,
         );
@@ -2041,14 +1839,15 @@ mod tests {
                 &mut ready_page,
                 width,
                 height,
-                "Change",
+                "Choose active model: whisper.cpp base.en",
             ),
-            ScreenAction::ChangeModel,
+            ScreenAction::None,
         );
 
         let listening = render(Fixture::TranscribeListening, width, height);
         let disabled_change = node_matching(&listening, |node| {
-            node.role() == egui::accesskit::Role::Button && node.name() == Some("Change")
+            node.role() == egui::accesskit::Role::Button
+                && node.name() == Some("Choose active model: whisper.cpp base.en")
         });
         assert!(disabled_change.is_disabled());
         assert_eq!(
@@ -2082,7 +1881,11 @@ mod tests {
             .bounds()
             .expect("model chip should expose bounds");
 
-        for name in ["whisper.cpp base.en", "+", "2 MINS AGO", "BASE.EN"] {
+        for name in [
+            "Choose active model: whisper.cpp base.en",
+            "2 MINS AGO",
+            "BASE.EN",
+        ] {
             assert!(
                 node_names(&ready).iter().any(|actual| actual == name),
                 "ready fixture missing polished reference content {name}"
@@ -2210,8 +2013,119 @@ mod tests {
         assert!(
             node_names(&output)
                 .iter()
-                .any(|name| name == "whisper.cpp tiny.en")
+                .any(|name| name == "Choose active model: whisper.cpp tiny.en")
         );
+    }
+
+    #[test]
+    fn sidebar_model_picker_is_available_from_all_four_primary_routes() {
+        for starting_page in [
+            AppPage::Transcribe,
+            AppPage::Models,
+            AppPage::History,
+            AppPage::General,
+        ] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            configure_accessible_style(&ctx);
+            let mut data = Fixture::TranscribeReady.data();
+            data.model_catalog = vec![
+                ModelViewModel {
+                    id: "base.en".into(),
+                    display_name: "Whisper Base".into(),
+                    installed: true,
+                    ready: true,
+                    ..Default::default()
+                },
+                ModelViewModel {
+                    id: "tiny.en".into(),
+                    display_name: "Whisper Tiny".into(),
+                    installed: true,
+                    ready: true,
+                    ..Default::default()
+                },
+                ModelViewModel {
+                    id: "broken.en".into(),
+                    display_name: "Broken model".into(),
+                    installed: true,
+                    ready: false,
+                    ..Default::default()
+                },
+            ];
+            data.transcription.selected_model_id = Some("base.en".into());
+            let mut page = starting_page;
+
+            assert_eq!(
+                click_named_control(
+                    &ctx,
+                    &mut data,
+                    &mut page,
+                    1_180.0,
+                    815.0,
+                    "Change active model: Whisper Base",
+                ),
+                ScreenAction::None
+            );
+            let picker =
+                render_with_input(&ctx, &mut data, &mut page, 1_180.0, 815.0, Vec::new()).0;
+            let names = node_names(&picker);
+            assert!(
+                names
+                    .iter()
+                    .any(|name| name == "Whisper Base, current model")
+            );
+            assert!(names.iter().any(|name| name == "Select Whisper Tiny"));
+            assert!(!names.iter().any(|name| name == "Broken model"));
+
+            let action = click_named_control(
+                &ctx,
+                &mut data,
+                &mut page,
+                1_180.0,
+                815.0,
+                "Select Whisper Tiny",
+            );
+            assert_eq!(action, ScreenAction::SelectQuickModel("tiny.en".into()));
+            apply_action(&mut data, &mut page, action);
+            assert_eq!(
+                data.transcription.selected_model_id.as_deref(),
+                Some("tiny.en")
+            );
+            assert_eq!(page, starting_page);
+        }
+    }
+
+    #[test]
+    fn sidebar_picker_manage_models_action_keeps_models_as_management() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::TranscribeReady.data();
+        data.model_catalog = vec![ModelViewModel {
+            id: "base.en".into(),
+            display_name: "Whisper Base".into(),
+            installed: true,
+            ready: true,
+            ..Default::default()
+        }];
+        data.transcription.selected_model_id = Some("base.en".into());
+        let mut page = AppPage::History;
+        assert_eq!(
+            click_named_control(
+                &ctx,
+                &mut data,
+                &mut page,
+                1_180.0,
+                815.0,
+                "Change active model: Whisper Base",
+            ),
+            ScreenAction::None
+        );
+        let action =
+            click_named_control(&ctx, &mut data, &mut page, 1_180.0, 815.0, "Manage models…");
+        assert_eq!(action, ScreenAction::OpenModelSettings);
+        apply_action(&mut data, &mut page, action);
+        assert_eq!(page, AppPage::Models);
     }
 
     #[test]
