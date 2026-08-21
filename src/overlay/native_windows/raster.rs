@@ -1460,6 +1460,10 @@ mod tests {
         overlay::{
             controller::OverlayAudioLevel,
             platform::{OverlayPosition, PhysicalWorkArea, calculate_window_bounds},
+            preview_parity::{
+                HorizontalAnchor, PARITY_GRAPHEMES, PREVIEW_PARITY_CASES, PreviewInput,
+                assert_text_contract, long_message,
+            },
             view::window_spec,
         },
         transcription::SessionId,
@@ -2444,6 +2448,125 @@ mod tests {
                     (later_ink.x1 - first_overflow_ink.x1).abs() <= right_tolerance,
                     "overflowing tails must keep a fixed right edge at {dpi} DPI: {first_overflow_ink:?} -> {later_ink:?}"
                 );
+            }
+        });
+    }
+
+    #[test]
+    fn native_preview_matches_the_shared_cross_renderer_parity_contract() {
+        with_rasterizer(|rasterizer| {
+            let mut pixels = vec![0; 512 * 64 * 4];
+            let mut canvas = Canvas::new(rasterizer, &mut pixels, 512, 64).unwrap();
+            let colors = NativeColors::for_theme(true);
+            let exact_text = "W".repeat(24);
+            let exact_line = StyledLine::plain(&exact_text, colors.muted_text);
+            let exact_width = canvas.measure_styled_line(&exact_line, 13.0).unwrap();
+
+            for case in PREVIEW_PARITY_CASES {
+                let (original, line, max_width) = match case.input {
+                    PreviewInput::Message => {
+                        let original = long_message(case.input);
+                        let line = StyledLine::plain(&original, colors.muted_text);
+                        (original, line, 96.0)
+                    }
+                    PreviewInput::Error => {
+                        let original = long_message(case.input);
+                        let state = OverlayViewState {
+                            error: Some(super::super::super::controller::OverlayError {
+                                message: original.clone(),
+                                recovery: OverlayRecovery::None,
+                            }),
+                            ..OverlayViewState::default()
+                        };
+                        (original, live_line(&state, colors), 96.0)
+                    }
+                    PreviewInput::Notice => {
+                        let original = long_message(case.input);
+                        let state = OverlayViewState {
+                            notice: Some(original.clone()),
+                            ..OverlayViewState::default()
+                        };
+                        (original, live_line(&state, colors), 96.0)
+                    }
+                    PreviewInput::TranscriptShort => {
+                        let original = PARITY_GRAPHEMES.to_owned();
+                        let state = OverlayViewState {
+                            transcript: super::super::super::controller::OverlayTranscript {
+                                committed: original.clone(),
+                                ..Default::default()
+                            },
+                            ..OverlayViewState::default()
+                        };
+                        (original, live_line(&state, colors), exact_width)
+                    }
+                    PreviewInput::TranscriptExactFit => {
+                        (exact_text.clone(), exact_line.clone(), exact_width)
+                    }
+                    PreviewInput::TranscriptOverflow => {
+                        let original = format!("{exact_text}{PARITY_GRAPHEMES}");
+                        let state = OverlayViewState {
+                            transcript: super::super::super::controller::OverlayTranscript {
+                                committed: original.clone(),
+                                ..Default::default()
+                            },
+                            ..OverlayViewState::default()
+                        };
+                        (original, live_line(&state, colors), exact_width)
+                    }
+                };
+
+                let message_case = matches!(
+                    case.input,
+                    PreviewInput::Message | PreviewInput::Error | PreviewInput::Notice
+                );
+                let actual_anchor = if !message_case
+                    && (line.grapheme_count() > MAX_PREVIEW_GRAPHEMES
+                        || canvas.measure_styled_line(&line, 13.0).unwrap() > max_width)
+                {
+                    HorizontalAnchor::Right
+                } else {
+                    HorizontalAnchor::Left
+                };
+                assert_eq!(actual_anchor, case.anchor, "{} anchor", case.name);
+
+                let rendered = if message_case {
+                    fit_head(&mut canvas, &line, max_width, 13.0, MAX_MESSAGE_GRAPHEMES).unwrap()
+                } else {
+                    match actual_anchor {
+                        HorizontalAnchor::Left => {
+                            assert!(
+                                canvas.measure_styled_line(&line, 13.0).unwrap() <= max_width,
+                                "{} must fit before clipping",
+                                case.name
+                            );
+                            line
+                        }
+                        HorizontalAnchor::Right => {
+                            fit_tail(&mut canvas, &line, max_width, 13.0, MAX_PREVIEW_GRAPHEMES)
+                                .unwrap()
+                        }
+                    }
+                };
+                let rendered_text = rendered.text();
+                assert_text_contract(case, &original, &rendered_text);
+
+                let width = canvas.measure_styled_line(&rendered, 13.0).unwrap();
+                let preview_x0 = 100.0;
+                let preview_x1 = preview_x0 + max_width;
+                let painted_x = match actual_anchor {
+                    HorizontalAnchor::Left => preview_x0,
+                    HorizontalAnchor::Right => preview_x1 - width,
+                };
+                match actual_anchor {
+                    HorizontalAnchor::Left => {
+                        assert_eq!(painted_x, preview_x0, "{} left anchor", case.name)
+                    }
+                    HorizontalAnchor::Right => assert!(
+                        (painted_x + width - preview_x1).abs() <= f32::EPSILON,
+                        "{} right anchor",
+                        case.name
+                    ),
+                }
             }
         });
     }

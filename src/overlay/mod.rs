@@ -2,6 +2,8 @@ mod controller;
 #[cfg(target_os = "windows")]
 mod native_windows;
 pub mod platform;
+#[cfg(test)]
+mod preview_parity;
 mod view;
 
 // Keep one facade for future runtime-neutral event wiring even though Phase 5

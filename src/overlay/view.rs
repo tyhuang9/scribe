@@ -760,6 +760,10 @@ fn format_elapsed(elapsed: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::overlay::preview_parity::{
+        HorizontalAnchor, PARITY_GRAPHEMES, PREVIEW_PARITY_CASES, PreviewInput,
+        assert_text_contract, long_message,
+    };
 
     #[test]
     fn hidden_overlay_builder_is_precreatable_and_non_interactive() {
@@ -1318,6 +1322,108 @@ mod tests {
         let preview_x1 = 500.0;
         assert!(preview_x1 - later_width < preview_x1 - first_width);
         assert_eq!(later.halign, egui::Align::RIGHT);
+    }
+
+    #[test]
+    fn egui_preview_matches_the_shared_cross_renderer_parity_contract() {
+        let context = egui::Context::default();
+        let mut checked = Vec::new();
+        let _ = context.run(egui::RawInput::default(), |context| {
+            egui::CentralPanel::default().show(context, |ui| {
+                let colors = overlay_colors(context);
+                let exact_text = "W".repeat(24);
+                let exact_width = ui.fonts(|fonts| {
+                    fonts
+                        .layout_job(transcript_layout(&exact_text, "", f32::INFINITY, colors))
+                        .size()
+                        .x
+                });
+
+                for case in PREVIEW_PARITY_CASES {
+                    let (original, layout) = match case.input {
+                        PreviewInput::Message => {
+                            let original = long_message(case.input);
+                            let layout = message_layout_for_rows(
+                                ui,
+                                &original,
+                                colors.muted_text,
+                                96.0,
+                                LIVE_PREVIEW_ROWS,
+                            );
+                            (original, layout)
+                        }
+                        PreviewInput::Error => {
+                            let original = long_message(case.input);
+                            let state = OverlayViewState {
+                                error: Some(super::super::controller::OverlayError {
+                                    message: original.clone(),
+                                    recovery: OverlayRecovery::None,
+                                }),
+                                ..OverlayViewState::default()
+                            };
+                            let layout = live_preview_layout(ui, &state, colors, 96.0);
+                            (original, layout)
+                        }
+                        PreviewInput::Notice => {
+                            let original = long_message(case.input);
+                            let state = OverlayViewState {
+                                notice: Some(original.clone()),
+                                ..OverlayViewState::default()
+                            };
+                            let layout = live_preview_layout(ui, &state, colors, 96.0);
+                            (original, layout)
+                        }
+                        PreviewInput::TranscriptShort => {
+                            let original = PARITY_GRAPHEMES.to_owned();
+                            let layout = transcript_layout_for_rows(
+                                ui,
+                                &original,
+                                "",
+                                exact_width,
+                                LIVE_PREVIEW_ROWS,
+                                colors,
+                            );
+                            (original, layout)
+                        }
+                        PreviewInput::TranscriptExactFit => {
+                            let layout = transcript_layout_for_rows(
+                                ui,
+                                &exact_text,
+                                "",
+                                exact_width,
+                                LIVE_PREVIEW_ROWS,
+                                colors,
+                            );
+                            (exact_text.clone(), layout)
+                        }
+                        PreviewInput::TranscriptOverflow => {
+                            let original = format!("{exact_text}{PARITY_GRAPHEMES}");
+                            let layout = transcript_layout_for_rows(
+                                ui,
+                                &original,
+                                "",
+                                exact_width,
+                                LIVE_PREVIEW_ROWS,
+                                colors,
+                            );
+                            (original, layout)
+                        }
+                    };
+
+                    let anchor = if layout.halign == egui::Align::RIGHT {
+                        HorizontalAnchor::Right
+                    } else {
+                        HorizontalAnchor::Left
+                    };
+                    assert_eq!(anchor, case.anchor, "{} anchor", case.name);
+                    assert_text_contract(case, &original, &layout.text);
+                    let rows = ui.fonts(|fonts| fonts.layout_job(layout).rows.len());
+                    assert!(rows <= LIVE_PREVIEW_ROWS, "{} row limit", case.name);
+                    checked.push(case.name);
+                }
+            });
+        });
+        assert_eq!(checked.len(), PREVIEW_PARITY_CASES.len());
     }
 
     #[test]
