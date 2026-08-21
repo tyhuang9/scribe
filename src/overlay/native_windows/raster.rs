@@ -3,19 +3,18 @@ use std::{borrow::Cow, ffi::c_void, mem::zeroed, ptr::null_mut, sync::Mutex, tim
 use eframe::egui::Color32;
 use unicode_segmentation::UnicodeSegmentation;
 use windows_sys::Win32::Graphics::GdiPlus::{
-    FillModeAlternate, FontStyleBold, FontStyleRegular, GdipAddPathArc, GdipCloneFontFamily,
-    GdipClosePathFigure, GdipCreateBitmapFromScan0, GdipCreateFont, GdipCreateFontFamilyFromName,
-    GdipCreatePath, GdipCreatePen1, GdipCreateSolidFill, GdipDeleteBrush, GdipDeleteFont,
-    GdipDeleteFontFamily, GdipDeleteGraphics, GdipDeletePath, GdipDeletePen,
-    GdipDeletePrivateFontCollection, GdipDeleteStringFormat, GdipDisposeImage, GdipDrawLine,
-    GdipDrawPath, GdipDrawString, GdipFillEllipse, GdipFillPath, GdipGetFontCollectionFamilyCount,
-    GdipGetFontCollectionFamilyList, GdipGetGenericFontFamilySansSerif,
-    GdipGetImageGraphicsContext, GdipGraphicsClear, GdipMeasureString,
-    GdipNewPrivateFontCollection, GdipPrivateAddMemoryFont, GdipSetSmoothingMode,
-    GdipSetStringFormatFlags, GdipSetTextRenderingHint, GdipStringFormatGetGenericTypographic,
-    GdiplusShutdown, GdiplusStartup, GdiplusStartupInput, GpBitmap, GpBrush, GpFont,
-    GpFontCollection, GpFontFamily, GpGraphics, GpImage, GpPath, GpPen, GpSolidFill,
-    GpStringFormat, Ok as GDI_PLUS_OK, RectF, SmoothingModeAntiAlias8x8,
+    FillModeAlternate, FontStyleRegular, GdipAddPathArc, GdipCloneFontFamily, GdipClosePathFigure,
+    GdipCreateBitmapFromScan0, GdipCreateFont, GdipCreateFontFamilyFromName, GdipCreatePath,
+    GdipCreatePen1, GdipCreateSolidFill, GdipDeleteBrush, GdipDeleteFont, GdipDeleteFontFamily,
+    GdipDeleteGraphics, GdipDeletePath, GdipDeletePen, GdipDeletePrivateFontCollection,
+    GdipDeleteStringFormat, GdipDisposeImage, GdipDrawLine, GdipDrawPath, GdipDrawString,
+    GdipFillPath, GdipGetFontCollectionFamilyCount, GdipGetFontCollectionFamilyList,
+    GdipGetGenericFontFamilySansSerif, GdipGetImageGraphicsContext, GdipGraphicsClear,
+    GdipMeasureString, GdipNewPrivateFontCollection, GdipPrivateAddMemoryFont,
+    GdipSetSmoothingMode, GdipSetStringFormatFlags, GdipSetTextRenderingHint,
+    GdipStringFormatGetGenericTypographic, GdiplusShutdown, GdiplusStartup, GdiplusStartupInput,
+    GpBitmap, GpBrush, GpFont, GpFontCollection, GpFontFamily, GpGraphics, GpImage, GpPath, GpPen,
+    GpSolidFill, GpStringFormat, Ok as GDI_PLUS_OK, RectF, SmoothingModeAntiAlias8x8,
     StringFormatFlagsMeasureTrailingSpaces, StringFormatFlagsNoWrap,
     TextRenderingHintAntiAliasGridFit, UnitPixel,
 };
@@ -24,7 +23,7 @@ use super::{
     super::{
         controller::{OverlayMode, OverlayPhase, OverlayRecovery, OverlayViewState},
         platform::OverlayWindowBounds,
-        view::{CONTROL_SIZE, LIVE_HEIGHT, LIVE_WIDTH, MINIMAL_HEIGHT, MINIMAL_WIDTH},
+        view::{CONTROL_SIZE, LIVE_HEIGHT, LIVE_WIDTH, MINIMAL_WIDTH},
     },
     layout::DisplayLayout,
 };
@@ -57,8 +56,6 @@ struct NativeColors {
     text: Argb,
     muted_text: Argb,
     waveform: Argb,
-    meter_active: Argb,
-    meter_inactive: Argb,
     error: Argb,
     warning: Argb,
     shadow: Argb,
@@ -79,8 +76,6 @@ impl NativeColors {
                 muted_text: Argb::new(255, 210, 210, 216),
                 // Overlay-specific accessible variant of the reference purple.
                 waveform: Argb::new(255, 178, 162, 255),
-                meter_active: Argb::from_color(palette.success),
-                meter_inactive: Argb::new(255, 180, 180, 188),
                 error: Argb::new(255, 255, 200, 200),
                 warning: Argb::new(255, 255, 222, 170),
                 shadow: Argb::new(96, 0, 0, 0),
@@ -92,8 +87,6 @@ impl NativeColors {
                 text: Argb::from_color(palette.text),
                 muted_text: Argb::new(255, 65, 75, 90),
                 waveform: Argb::from_color(palette.recording_waveform),
-                meter_active: Argb::from_color(palette.success_text),
-                meter_inactive: Argb::new(255, 100, 112, 132),
                 error: Argb::from_color(palette.error_text),
                 warning: Argb::from_color(palette.warning),
                 shadow: Argb::new(54, 0, 0, 0),
@@ -146,8 +139,6 @@ impl LayeredFrame {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TextStyle {
     Regular,
-    Bold,
-    Monospace,
     Phosphor,
 }
 
@@ -156,8 +147,7 @@ enum TextStyle {
 /// in the native rasterizer cache.
 fn baseline_sample(style: TextStyle) -> &'static str {
     match style {
-        TextStyle::Regular | TextStyle::Bold => "Agjpqy",
-        TextStyle::Monospace => "00:12",
+        TextStyle::Regular => "Agjpqy",
         TextStyle::Phosphor => egui_phosphor::regular::WAVEFORM,
     }
 }
@@ -411,10 +401,14 @@ fn draw_capsule(
     scale: f32,
     colors: NativeColors,
 ) -> Result<(), RasterError> {
-    let (logical_width, logical_height, vertical_inset, shadow_extent, shadow_offset) = match mode {
-        OverlayMode::Live => (LIVE_WIDTH, LIVE_HEIGHT, 8.0, 5.0, 2.0),
-        OverlayMode::Minimal | OverlayMode::Off => (MINIMAL_WIDTH, MINIMAL_HEIGHT, 4.0, 2.0, 1.0),
+    let logical_width = match mode {
+        OverlayMode::Live => LIVE_WIDTH,
+        OverlayMode::Minimal | OverlayMode::Off => MINIMAL_WIDTH,
     };
+    let logical_height = LIVE_HEIGHT;
+    let vertical_inset = 8.0;
+    let shadow_extent = 5.0;
+    let shadow_offset = 2.0;
     let x = 8.0 * scale;
     let y = vertical_inset * scale;
     let width = (logical_width - 16.0) * scale;
@@ -547,112 +541,37 @@ fn draw_compact(
     layout: &DisplayLayout,
     colors: NativeColors,
 ) -> Result<(), RasterError> {
-    draw_compact_status_indicator(canvas, state, layout)?;
-    draw_compact_status_text(canvas, state, layout, colors)?;
-    draw_compact_meter(canvas, state, layout, colors)?;
-    draw_compact_elapsed(canvas, state, layout, colors)
+    draw_live_brand_mark(canvas, layout, colors)?;
+    draw_compact_status(canvas, state, layout, colors)
 }
 
-fn draw_compact_status_indicator(
-    canvas: &mut Canvas<'_>,
-    state: &OverlayViewState,
-    layout: &DisplayLayout,
-) -> Result<(), RasterError> {
-    let phase = phase_color(state.phase);
-    canvas.fill_ellipse(
-        layout.recording_mark.x0,
-        layout.recording_mark.y0,
-        layout.recording_mark.width(),
-        layout.recording_mark.height(),
-        phase,
-    )
-}
-
-fn draw_compact_status_text(
+fn draw_compact_status(
     canvas: &mut Canvas<'_>,
     state: &OverlayViewState,
     layout: &DisplayLayout,
     colors: NativeColors,
 ) -> Result<(), RasterError> {
     let scale = layout.scale;
-    let label = if state.phase == OverlayPhase::Listening {
-        "Scribe is recording"
+    let (label, color) = if state.error.is_some() || state.phase == OverlayPhase::Error {
+        ("Error".to_owned(), colors.error)
+    } else if state.notice.is_some() {
+        ("Notice".to_owned(), colors.warning)
     } else {
-        state.phase.label()
+        (
+            format_elapsed(state.elapsed.unwrap_or_default()),
+            colors.muted_text,
+        )
     };
-    let status_text = layout
-        .status_text
-        .expect("compact layout includes status text bounds");
     canvas.draw_text_centered_in_rect(
-        label,
-        status_text.x0,
-        status_text.width(),
-        status_text,
+        &label,
+        layout.elapsed.x0,
+        layout.elapsed.width(),
+        layout.elapsed,
         13.0 * scale,
-        TextStyle::Bold,
-        colors.text,
+        TextStyle::Regular,
+        color,
     )?;
     Ok(())
-}
-
-fn draw_compact_meter(
-    canvas: &mut Canvas<'_>,
-    state: &OverlayViewState,
-    layout: &DisplayLayout,
-    colors: NativeColors,
-) -> Result<(), RasterError> {
-    let scale = layout.scale;
-    let center_y = layout.recording_mark.center_y();
-    let level = normalized_level(state);
-    for index in 0..4 {
-        let threshold = (index + 1) as f32 / 4.0;
-        let active = level >= threshold * 0.78;
-        let normalized_height = if active { threshold } else { 0.22 };
-        let height = (layout.meter.height() * normalized_height).max(4.0 * scale);
-        let x = layout.meter.x0 + index as f32 * 9.0 * scale;
-        canvas.fill_rounded_rect(
-            x,
-            center_y - height / 2.0,
-            7.0 * scale,
-            height,
-            2.0 * scale,
-            if active {
-                colors.meter_active
-            } else {
-                colors.meter_inactive
-            },
-        )?;
-    }
-    Ok(())
-}
-
-fn draw_compact_elapsed(
-    canvas: &mut Canvas<'_>,
-    state: &OverlayViewState,
-    layout: &DisplayLayout,
-    colors: NativeColors,
-) -> Result<(), RasterError> {
-    let scale = layout.scale;
-    if let Some(elapsed) = state.elapsed {
-        canvas.draw_text_centered_in_rect(
-            &format_elapsed(elapsed),
-            layout.elapsed.x0,
-            layout.elapsed.width(),
-            layout.elapsed,
-            12.0 * scale,
-            TextStyle::Monospace,
-            colors.muted_text,
-        )?;
-    }
-    Ok(())
-}
-
-fn normalized_level(state: &OverlayViewState) -> f32 {
-    state
-        .audio_level
-        .rms
-        .max(state.audio_level.peak * 0.7)
-        .clamp(0.0, 1.0)
 }
 
 fn live_line(state: &OverlayViewState, colors: NativeColors) -> StyledLine {
@@ -798,15 +717,6 @@ fn is_left_binding_punctuation(character: char) -> bool {
     )
 }
 
-fn phase_color(phase: OverlayPhase) -> Argb {
-    match phase {
-        OverlayPhase::Error => Argb::new(255, 239, 108, 104),
-        OverlayPhase::Success => Argb::new(255, 91, 201, 158),
-        OverlayPhase::Hidden => Argb::TRANSPARENT,
-        _ => Argb::new(255, 105, 169, 255),
-    }
-}
-
 pub(super) fn format_elapsed(elapsed: Duration) -> String {
     let seconds = elapsed.as_secs();
     format!("{:02}:{:02}", seconds / 60, seconds % 60)
@@ -910,22 +820,6 @@ impl<'a> Canvas<'a> {
             status(
                 unsafe { GdipDrawPath(self.graphics, pen, path.0) },
                 "stroke rounded rectangle",
-            )
-        })
-    }
-
-    fn fill_ellipse(
-        &mut self,
-        x: f32,
-        y: f32,
-        width: f32,
-        height: f32,
-        color: Argb,
-    ) -> Result<(), RasterError> {
-        with_brush(color, |brush| {
-            status(
-                unsafe { GdipFillEllipse(self.graphics, brush, x, y, width, height) },
-                "fill ellipse",
             )
         })
     }
@@ -1225,13 +1119,11 @@ impl Font {
             return Self::from_borrowed_family(rasterizer.phosphor.family, FontStyleRegular, size);
         }
         let family_name = match style {
-            TextStyle::Monospace => "Consolas",
-            TextStyle::Regular | TextStyle::Bold => "Segoe UI",
+            TextStyle::Regular => "Segoe UI",
             TextStyle::Phosphor => unreachable!("Phosphor is handled above"),
         };
         let font_style = match style {
-            TextStyle::Bold => FontStyleBold,
-            TextStyle::Regular | TextStyle::Monospace => FontStyleRegular,
+            TextStyle::Regular => FontStyleRegular,
             TextStyle::Phosphor => unreachable!("Phosphor is handled above"),
         };
         Self::from_named_family(&wide_null(family_name), font_style, size)
@@ -1599,8 +1491,8 @@ mod tests {
                     phase: OverlayPhase::Finalizing,
                     ..OverlayViewState::default()
                 },
-                320,
-                52,
+                MINIMAL_WIDTH as i32,
+                LIVE_HEIGHT as i32,
             ),
             (
                 "live-error",
@@ -1641,10 +1533,7 @@ mod tests {
         Elapsed,
         Divider,
         Preview,
-        CompactStatusIndicator,
         CompactStatus,
-        CompactMeter,
-        CompactElapsed,
     }
 
     /// Paints exactly one content layer on a canvas that is larger than its
@@ -1667,17 +1556,8 @@ mod tests {
             IsolatedComponent::Elapsed => draw_live_elapsed(&mut canvas, state, layout, colors),
             IsolatedComponent::Divider => draw_live_divider(&mut canvas, layout, colors),
             IsolatedComponent::Preview => draw_live_preview(&mut canvas, state, layout, colors),
-            IsolatedComponent::CompactStatusIndicator => {
-                draw_compact_status_indicator(&mut canvas, state, layout)
-            }
             IsolatedComponent::CompactStatus => {
-                draw_compact_status_text(&mut canvas, state, layout, colors)
-            }
-            IsolatedComponent::CompactMeter => {
-                draw_compact_meter(&mut canvas, state, layout, colors)
-            }
-            IsolatedComponent::CompactElapsed => {
-                draw_compact_elapsed(&mut canvas, state, layout, colors)
+                draw_compact_status(&mut canvas, state, layout, colors)
             }
         }
         .unwrap();
@@ -1801,12 +1681,57 @@ mod tests {
     fn compact_frame_has_transparent_corners_and_a_painted_capsule() {
         let frame = with_rasterizer(|rasterizer| {
             rasterizer
-                .render_display(&state(OverlayMode::Minimal), true, 320, 52)
+                .render_display(
+                    &state(OverlayMode::Minimal),
+                    true,
+                    MINIMAL_WIDTH as i32,
+                    LIVE_HEIGHT as i32,
+                )
                 .unwrap()
         });
         assert_eq!(frame.alpha_at(0, 0), 0);
-        assert!(frame.alpha_at(160, 26) > 0);
+        assert!(frame.alpha_at(100, 31) > 0);
         assert!(frame.pixels.chunks_exact(4).any(|pixel| pixel[3] > 0));
+    }
+
+    #[test]
+    fn compact_shell_ignores_audio_and_transcript_but_visibly_replaces_timer_on_error() {
+        let normal = state(OverlayMode::Minimal);
+        let mut changed_hidden_state = normal.clone();
+        changed_hidden_state.audio_level = OverlayAudioLevel::new(0.0, 1.0);
+        changed_hidden_state.transcript.committed = "must stay out of compact".to_owned();
+        changed_hidden_state.transcript.tentative = "including estimates".to_owned();
+        let mut failed = normal.clone();
+        failed.phase = OverlayPhase::Error;
+        failed.error = Some(super::super::super::controller::OverlayError {
+            message: "Microphone unavailable".to_owned(),
+            recovery: OverlayRecovery::Retry,
+        });
+
+        with_rasterizer(|rasterizer| {
+            let normal = rasterizer
+                .render_display(&normal, true, MINIMAL_WIDTH as i32, LIVE_HEIGHT as i32)
+                .unwrap();
+            assert_eq!(
+                normal,
+                rasterizer
+                    .render_display(
+                        &changed_hidden_state,
+                        true,
+                        MINIMAL_WIDTH as i32,
+                        LIVE_HEIGHT as i32,
+                    )
+                    .unwrap(),
+                "compact must not paint the old input meter or transcript content"
+            );
+            assert_ne!(
+                normal,
+                rasterizer
+                    .render_display(&failed, true, MINIMAL_WIDTH as i32, LIVE_HEIGHT as i32,)
+                    .unwrap(),
+                "compact failures must visibly replace the timer with an error state"
+            );
+        });
     }
 
     #[test]
@@ -1952,16 +1877,16 @@ mod tests {
                                 ]);
                             }
                             OverlayMode::Minimal | OverlayMode::Off => {
-                                let indicator_frame = isolated_component_frame(
+                                let brand_frame = isolated_component_frame(
                                     rasterizer,
                                     &state,
                                     &layout,
                                     dark_mode,
-                                    IsolatedComponent::CompactStatusIndicator,
+                                    IsolatedComponent::BrandMark,
                                 );
-                                let indicator = assert_component_is_contained_and_centered(
-                                    "compact status indicator",
-                                    &indicator_frame,
+                                let brand = assert_component_is_contained_and_centered(
+                                    "compact Scribe brand mark",
+                                    &brand_frame,
                                     layout.recording_mark,
                                     layout.content_center_y,
                                     0.5,
@@ -1975,48 +1900,16 @@ mod tests {
                                     IsolatedComponent::CompactStatus,
                                 );
                                 let status = assert_component_is_contained_and_centered(
-                                    "compact status",
-                                    &status_frame,
-                                    layout.status_text.unwrap(),
-                                    layout.content_center_y,
-                                    2.5,
-                                    true,
-                                );
-                                let meter_frame = isolated_component_frame(
-                                    rasterizer,
-                                    &state,
-                                    &layout,
-                                    dark_mode,
-                                    IsolatedComponent::CompactMeter,
-                                );
-                                let meter = assert_component_is_contained_and_centered(
-                                    "compact meter",
-                                    &meter_frame,
-                                    layout.meter,
-                                    layout.content_center_y,
-                                    0.5,
-                                    false,
-                                );
-                                let compact_elapsed_frame = isolated_component_frame(
-                                    rasterizer,
-                                    &state,
-                                    &layout,
-                                    dark_mode,
-                                    IsolatedComponent::CompactElapsed,
-                                );
-                                let compact_elapsed = assert_component_is_contained_and_centered(
                                     "compact elapsed time",
-                                    &compact_elapsed_frame,
+                                    &status_frame,
                                     layout.elapsed,
                                     layout.content_center_y,
                                     2.5,
                                     true,
                                 );
                                 assert_no_adjacent_ink_overlap(&[
-                                    ("compact status indicator", indicator),
-                                    ("compact status", status),
-                                    ("compact meter", meter),
-                                    ("compact elapsed time", compact_elapsed),
+                                    ("compact Scribe brand mark", brand),
+                                    ("compact elapsed time", status),
                                 ]);
                             }
                         }
@@ -2205,7 +2098,12 @@ mod tests {
                 for (dark, theme) in [(false, "light"), (true, "dark")] {
                     for (mode, name, logical_width, logical_height) in [
                         (OverlayMode::Live, "live", 600, 62),
-                        (OverlayMode::Minimal, "compact", 320, 52),
+                        (
+                            OverlayMode::Minimal,
+                            "compact",
+                            MINIMAL_WIDTH as i32,
+                            LIVE_HEIGHT as i32,
+                        ),
                     ] {
                         let frame = rasterizer
                             .render_display(
@@ -2296,7 +2194,12 @@ mod tests {
                 for (dark, theme) in [(false, "light"), (true, "dark")] {
                     for (mode, name, logical_width, logical_height) in [
                         (OverlayMode::Live, "live", 600, 62),
-                        (OverlayMode::Minimal, "compact", 320, 52),
+                        (
+                            OverlayMode::Minimal,
+                            "compact",
+                            MINIMAL_WIDTH as i32,
+                            LIVE_HEIGHT as i32,
+                        ),
                     ] {
                         let frame = rasterizer
                             .render_display(

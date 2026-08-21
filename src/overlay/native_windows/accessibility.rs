@@ -17,12 +17,11 @@ use super::{
 use crate::overlay::{
     controller::{OverlayMode, OverlayPhase, OverlayViewState},
     platform::OverlayWindowBounds,
-    view::{live_accessible_text, live_overlay_announcement},
+    view::{compact_accessible_text, live_accessible_text, live_overlay_announcement},
 };
 
 const DISPLAY_ROOT_ID: NodeId = NodeId(0xD100);
 const DISPLAY_STATUS_ID: NodeId = NodeId(0xD101);
-const DISPLAY_METER_ID: NodeId = NodeId(0xD102);
 const DISPLAY_PREVIEW_ID: NodeId = NodeId(0xD103);
 const DISPLAY_ANNOUNCEMENT_ID: NodeId = NodeId(0xD104);
 const DISPLAY_ELAPSED_ID: NodeId = NodeId(0xD105);
@@ -171,14 +170,7 @@ fn display_tree(
     let mut classes = NodeClassSet::new();
     let live_mode = state.mode == OverlayMode::Live;
     let preview_visible = live_mode && (state.live_preview_available || state.error.is_some());
-    let elapsed_visible = live_mode || state.elapsed.is_some();
-    let mut children = vec![DISPLAY_STATUS_ID];
-    if !live_mode {
-        children.push(DISPLAY_METER_ID);
-    }
-    if elapsed_visible {
-        children.push(DISPLAY_ELAPSED_ID);
-    }
+    let mut children = vec![DISPLAY_STATUS_ID, DISPLAY_ELAPSED_ID];
     if preview_visible {
         children.push(DISPLAY_PREVIEW_ID);
     }
@@ -197,44 +189,29 @@ fn display_tree(
     } else {
         state.phase.label()
     };
-    let mut status = NodeBuilder::new(if live_mode {
-        Role::Image
-    } else {
-        Role::StaticText
-    });
-    if live_mode {
-        status.set_name("Scribe");
-        status.set_description(status_name);
-    } else {
-        status.set_name(status_name);
-    }
+    let mut status = NodeBuilder::new(Role::Image);
+    status.set_name("Scribe");
+    status.set_description(status_name);
     status.set_bounds(accesskit_rect(layout.status));
 
     let mut nodes = vec![
         (DISPLAY_ROOT_ID, root.build(&mut classes)),
         (DISPLAY_STATUS_ID, status.build(&mut classes)),
     ];
-    if !live_mode {
-        let level = state
-            .audio_level
-            .rms
-            .max(state.audio_level.peak * 0.7)
-            .clamp(0.0, 1.0);
-        let mut meter = NodeBuilder::new(Role::ProgressIndicator);
-        meter.set_name("Microphone input level");
-        meter.set_description(status_name);
-        meter.set_numeric_value((level * 100.0).round() as f64);
-        meter.set_min_numeric_value(0.0);
-        meter.set_max_numeric_value(100.0);
-        meter.set_bounds(accesskit_rect(layout.meter));
-        nodes.push((DISPLAY_METER_ID, meter.build(&mut classes)));
-    }
-    if elapsed_visible {
+    {
         let mut elapsed = NodeBuilder::new(Role::StaticText);
-        elapsed.set_name(format!(
-            "Elapsed time {}",
-            format_elapsed(state.elapsed.unwrap_or_default())
-        ));
+        if live_mode {
+            elapsed.set_name(format!(
+                "Elapsed time {}",
+                format_elapsed(state.elapsed.unwrap_or_default())
+            ));
+        } else {
+            elapsed.set_name(compact_accessible_text(state));
+            if state.error.is_some() || state.notice.is_some() || state.phase == OverlayPhase::Error
+            {
+                elapsed.set_live(Live::Polite);
+            }
+        }
         elapsed.set_bounds(accesskit_rect(layout.elapsed));
         nodes.push((DISPLAY_ELAPSED_ID, elapsed.build(&mut classes)));
     }
@@ -331,8 +308,8 @@ mod tests {
             OverlayMode::Minimal | OverlayMode::Off => OverlayWindowBounds {
                 x: 905,
                 y: 1272,
-                width: 400,
-                height: 65,
+                width: 250,
+                height: 78,
             },
         }
     }
@@ -420,7 +397,6 @@ mod tests {
         assert!(tree.nodes.iter().any(|(id, node)| {
             *id == DISPLAY_STATUS_ID && node.role() == Role::Image && node.name() == Some("Scribe")
         }));
-        assert!(tree.nodes.iter().all(|(id, _)| *id != DISPLAY_METER_ID));
     }
 
     #[test]
@@ -453,7 +429,6 @@ mod tests {
                 && node.name() == Some("Scribe")
                 && node.description() == Some("Scribe is recording")
         }));
-        assert!(tree.nodes.iter().all(|(id, _)| *id != DISPLAY_METER_ID));
         assert!(tree.nodes.iter().all(|(id, node)| {
             *id != DISPLAY_PREVIEW_ID && *id != DISPLAY_ANNOUNCEMENT_ID && node.live().is_none()
         }));
@@ -508,7 +483,15 @@ mod tests {
                 .iter()
                 .all(|(id, _)| *id != DISPLAY_PREVIEW_ID && *id != DISPLAY_ANNOUNCEMENT_ID)
         );
-        assert!(tree.nodes.iter().all(|(id, _)| *id != DISPLAY_ELAPSED_ID));
+        assert!(tree.nodes.iter().any(|(id, node)| {
+            *id == DISPLAY_STATUS_ID
+                && node.role() == Role::Image
+                && node.name() == Some("Scribe")
+                && node.description() == Some("Scribe is recording")
+        }));
+        assert!(tree.nodes.iter().any(|(id, node)| {
+            *id == DISPLAY_ELAPSED_ID && node.name() == Some("Elapsed time 00:00")
+        }));
     }
 
     #[test]
@@ -539,7 +522,6 @@ mod tests {
         );
         assert_eq!(node(DISPLAY_STATUS_ID).role(), Role::Image);
         assert_eq!(node(DISPLAY_STATUS_ID).name(), Some("Scribe"));
-        assert!(tree.nodes.iter().all(|(id, _)| *id != DISPLAY_METER_ID));
         assert_eq!(node(DISPLAY_ELAPSED_ID).name(), Some("Elapsed time 00:12"));
         assert_eq!(
             node(DISPLAY_ELAPSED_ID).bounds(),
@@ -580,9 +562,56 @@ mod tests {
         assert_eq!(elapsed.name(), Some("Elapsed time 01:05"));
         assert_eq!(
             elapsed.bounds(),
-            Some(Rect::new(258.75, 19.375, 325.0, 45.625))
+            Some(Rect::new(90.0, 24.625, 150.0, 53.375))
         );
         assert!(tree.nodes.iter().all(|(_, node)| node.live().is_none()));
+    }
+
+    #[test]
+    fn compact_error_and_notice_use_the_timer_bounds_as_the_only_polite_status() {
+        let cases = [
+            (
+                OverlayViewState {
+                    mode: OverlayMode::Minimal,
+                    phase: OverlayPhase::Error,
+                    error: Some(super::super::super::controller::OverlayError {
+                        message: "Microphone unavailable".to_owned(),
+                        recovery: super::super::super::controller::OverlayRecovery::Retry,
+                    }),
+                    ..OverlayViewState::default()
+                },
+                "Microphone unavailable You can retry.",
+            ),
+            (
+                OverlayViewState {
+                    mode: OverlayMode::Minimal,
+                    phase: OverlayPhase::Listening,
+                    notice: Some("Preview paused while final transcription continues.".to_owned()),
+                    ..OverlayViewState::default()
+                },
+                "Preview paused while final transcription continues.",
+            ),
+        ];
+
+        for (state, expected) in cases {
+            let bounds = display_bounds(OverlayMode::Minimal);
+            let layout = DisplayLayout::from_bounds(OverlayMode::Minimal, bounds).unwrap();
+            let tree = display_tree(&state, true, Some(bounds));
+            let live = tree
+                .nodes
+                .iter()
+                .filter(|(_, node)| node.live() == Some(Live::Polite))
+                .collect::<Vec<_>>();
+            assert_eq!(live.len(), 1);
+            assert_eq!(live[0].0, DISPLAY_ELAPSED_ID);
+            assert_eq!(live[0].1.name(), Some(expected));
+            assert_eq!(live[0].1.bounds(), Some(accesskit_rect(layout.elapsed)));
+            assert!(
+                tree.nodes
+                    .iter()
+                    .all(|(id, _)| { *id != DISPLAY_PREVIEW_ID && *id != DISPLAY_ANNOUNCEMENT_ID })
+            );
+        }
     }
 
     #[test]
@@ -610,14 +639,6 @@ mod tests {
                     node(DISPLAY_STATUS_ID).bounds(),
                     Some(accesskit_rect(layout.status))
                 );
-                if mode == OverlayMode::Live {
-                    assert!(tree.nodes.iter().all(|(id, _)| *id != DISPLAY_METER_ID));
-                } else {
-                    assert_eq!(
-                        node(DISPLAY_METER_ID).bounds(),
-                        Some(accesskit_rect(layout.meter))
-                    );
-                }
                 assert_eq!(
                     node(DISPLAY_ELAPSED_ID).bounds(),
                     Some(accesskit_rect(layout.elapsed))

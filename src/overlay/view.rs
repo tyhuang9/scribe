@@ -20,20 +20,16 @@ const CANCEL_RECORDING_LABEL: &str = "Cancel recording and discard it";
 
 pub(super) const LIVE_WIDTH: f32 = 600.0;
 pub(super) const LIVE_HEIGHT: f32 = 62.0;
-pub(super) const MINIMAL_WIDTH: f32 = 320.0;
-pub(super) const MINIMAL_HEIGHT: f32 = 52.0;
+pub(super) const MINIMAL_WIDTH: f32 = 200.0;
+pub(super) const MINIMAL_HEIGHT: f32 = LIVE_HEIGHT;
 const WINDOW_MARGIN: f32 = 24.0;
 pub(super) const CONTROL_SIZE: f32 = 44.0;
 const CONTROL_CONTENT_GAP: f32 = 8.0;
 const CAPSULE_HORIZONTAL_INSET: f32 = 8.0;
-const LIVE_CONTROL_HORIZONTAL_INSET: f32 = 16.0;
-const LIVE_CAPSULE_VERTICAL_INSET: f32 = 8.0;
-const COMPACT_CAPSULE_VERTICAL_INSET: f32 = 4.0;
-const LIVE_CAPSULE_SHADOW_BLUR: f32 = 6.0;
-const COMPACT_CAPSULE_SHADOW_BLUR: f32 = 2.0;
-const LIVE_CAPSULE_SHADOW_OFFSET_Y: f32 = 2.0;
-const COMPACT_CAPSULE_SHADOW_OFFSET_Y: f32 = 1.0;
-const COMPACT_METER_WIDTH: f32 = 38.0;
+const CONTROL_HORIZONTAL_INSET: f32 = 16.0;
+const CAPSULE_VERTICAL_INSET: f32 = 8.0;
+const CAPSULE_SHADOW_BLUR: f32 = 6.0;
+const CAPSULE_SHADOW_OFFSET_Y: f32 = 2.0;
 const LIVE_WAVEFORM_SIZE: f32 = 30.0;
 const MAX_PREVIEW_GRAPHEMES: usize = 512;
 const MAX_MESSAGE_GRAPHEMES: usize = 256;
@@ -184,12 +180,7 @@ pub(super) fn control_window_bounds(
 ) -> OverlayWindowBounds {
     let scale = display.width as f32 / display_spec.width_points;
     let size = (CONTROL_SIZE * scale).round() as i32;
-    let control_inset = if display_spec.width_points == LIVE_WIDTH {
-        LIVE_CONTROL_HORIZONTAL_INSET
-    } else {
-        CAPSULE_HORIZONTAL_INSET
-    };
-    let horizontal_inset = (control_inset * scale).round() as i32;
+    let horizontal_inset = (CONTROL_HORIZONTAL_INSET * scale).round() as i32;
     OverlayWindowBounds {
         x: display.x + display.width - horizontal_inset - size,
         y: display.y + (display.height - size) / 2,
@@ -260,8 +251,6 @@ struct OverlayColors {
     text: Color32,
     muted_text: Color32,
     waveform: Color32,
-    meter_active: Color32,
-    meter_inactive: Color32,
     error: Color32,
     warning: Color32,
     shadow: Color32,
@@ -285,8 +274,6 @@ fn overlay_colors(context: &egui::Context) -> OverlayColors {
             // lighter overlay-specific token preserves that appearance while
             // keeping the non-text mark at 3:1 over the translucent surface.
             waveform: Color32::from_rgb(178, 162, 255),
-            meter_active: palette.success,
-            meter_inactive: Color32::from_rgb(180, 180, 188),
             error: Color32::from_rgb(255, 200, 200),
             warning: Color32::from_rgb(255, 222, 170),
             shadow: Color32::from_black_alpha(96),
@@ -298,8 +285,6 @@ fn overlay_colors(context: &egui::Context) -> OverlayColors {
             text: palette.text,
             muted_text: Color32::from_rgb(65, 75, 90),
             waveform: palette.recording_waveform,
-            meter_active: palette.success_text,
-            meter_inactive: Color32::from_rgb(100, 112, 132),
             error: palette.error_text,
             warning: palette.warning,
             shadow: Color32::from_black_alpha(54),
@@ -359,22 +344,19 @@ fn viewport_builder(
 
 fn render_overlay(context: &egui::Context, state: &OverlayViewState) {
     let colors = overlay_colors(context);
-    let vertical_inset = capsule_vertical_inset(state.mode);
-    let rounding = (window_spec(state.mode).height_points - vertical_inset * 2.0) / 2.0;
-    let shadow_blur = capsule_shadow_blur(state.mode);
-    let shadow_offset_y = capsule_shadow_offset_y(state.mode);
+    let rounding = (window_spec(state.mode).height_points - CAPSULE_VERTICAL_INSET * 2.0) / 2.0;
     egui::CentralPanel::default()
         .frame(egui::Frame::none().fill(Color32::TRANSPARENT))
         .show(context, |ui| {
-            let capsule_rect = painted_capsule_bounds(ui.max_rect(), state.mode);
+            let capsule_rect = painted_capsule_bounds(ui.max_rect());
             ui.allocate_ui_at_rect(capsule_rect, |ui| {
                 egui::Frame::none()
                     .fill(colors.surface)
                     .rounding(egui::Rounding::same(rounding))
                     .stroke(Stroke::new(1.0, colors.border))
                     .shadow(egui::epaint::Shadow {
-                        offset: egui::vec2(0.0, shadow_offset_y),
-                        blur: shadow_blur,
+                        offset: egui::vec2(0.0, CAPSULE_SHADOW_OFFSET_Y),
+                        blur: CAPSULE_SHADOW_BLUR,
                         spread: 0.0,
                         color: colors.shadow,
                     })
@@ -403,35 +385,8 @@ fn render_overlay(context: &egui::Context, state: &OverlayViewState) {
         });
 }
 
-fn capsule_vertical_inset(mode: OverlayMode) -> f32 {
-    if mode == OverlayMode::Live {
-        LIVE_CAPSULE_VERTICAL_INSET
-    } else {
-        COMPACT_CAPSULE_VERTICAL_INSET
-    }
-}
-
-fn capsule_shadow_blur(mode: OverlayMode) -> f32 {
-    if mode == OverlayMode::Live {
-        LIVE_CAPSULE_SHADOW_BLUR
-    } else {
-        COMPACT_CAPSULE_SHADOW_BLUR
-    }
-}
-
-fn capsule_shadow_offset_y(mode: OverlayMode) -> f32 {
-    if mode == OverlayMode::Live {
-        LIVE_CAPSULE_SHADOW_OFFSET_Y
-    } else {
-        COMPACT_CAPSULE_SHADOW_OFFSET_Y
-    }
-}
-
-fn painted_capsule_bounds(viewport: egui::Rect, mode: OverlayMode) -> egui::Rect {
-    viewport.shrink2(egui::vec2(
-        CAPSULE_HORIZONTAL_INSET,
-        capsule_vertical_inset(mode),
-    ))
+fn painted_capsule_bounds(viewport: egui::Rect) -> egui::Rect {
+    viewport.shrink2(egui::vec2(CAPSULE_HORIZONTAL_INSET, CAPSULE_VERTICAL_INSET))
 }
 
 fn reserved_control_width() -> f32 {
@@ -439,31 +394,30 @@ fn reserved_control_width() -> f32 {
 }
 
 fn render_compact_status_row(ui: &mut egui::Ui, state: &OverlayViewState, colors: OverlayColors) {
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 4.0;
-        let status_color = phase_color(state.phase);
-        let (dot_rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), Sense::hover());
-        ui.painter()
-            .circle_filled(dot_rect.center(), 4.0, status_color);
-
-        let label = if state.phase == OverlayPhase::Listening {
-            "Scribe is recording"
+    ui.horizontal_centered(|ui| {
+        render_brand_mark(ui, state, colors);
+        ui.add_space(8.0);
+        let (label, color) = if state.error.is_some() || state.phase == OverlayPhase::Error {
+            ("Error".to_owned(), colors.error)
+        } else if state.notice.is_some() {
+            ("Notice".to_owned(), colors.warning)
         } else {
-            state.phase.label()
+            (
+                state
+                    .elapsed
+                    .map(format_elapsed)
+                    .unwrap_or_else(|| "00:00".to_owned()),
+                colors.muted_text,
+            )
         };
-        ui.label(RichText::new(label).strong().size(13.0).color(colors.text));
-        render_level_meter(ui, state, COMPACT_METER_WIDTH, colors);
-
-        if let Some(elapsed) = state.elapsed {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(
-                    RichText::new(format_elapsed(elapsed))
-                        .color(colors.muted_text)
-                        .size(12.0)
-                        .monospace(),
-                );
-            });
-        }
+        let response = ui.label(RichText::new(label).size(13.0).color(color));
+        ui.ctx().accesskit_node_builder(response.id, |builder| {
+            builder.set_name(compact_accessible_text(state));
+            if state.error.is_some() || state.notice.is_some() || state.phase == OverlayPhase::Error
+            {
+                builder.set_live(egui::accesskit::Live::Polite);
+            }
+        });
     });
 }
 
@@ -541,45 +495,6 @@ fn render_brand_mark(ui: &mut egui::Ui, state: &OverlayViewState, colors: Overla
     );
 }
 
-fn render_level_meter(
-    ui: &mut egui::Ui,
-    state: &OverlayViewState,
-    width: f32,
-    colors: OverlayColors,
-) {
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 20.0), Sense::hover());
-    let level = state.audio_level.rms.max(state.audio_level.peak * 0.7);
-    response.widget_info(|| {
-        let mut info = egui::WidgetInfo::labeled(
-            egui::WidgetType::ProgressIndicator,
-            "Microphone input level",
-        );
-        info.value = Some((level * 100.0).round() as f64);
-        info
-    });
-    let bars = 4;
-    let gap = 2.0;
-    let bar_width = (rect.width() - gap * (bars - 1) as f32) / bars as f32;
-
-    for index in 0..bars {
-        let threshold = (index + 1) as f32 / bars as f32;
-        let active = level >= threshold * 0.78;
-        let normalized_height = if active { threshold } else { 0.22 };
-        let height = (rect.height() * normalized_height).max(4.0);
-        let left = rect.left() + index as f32 * (bar_width + gap);
-        let bar = egui::Rect::from_min_max(
-            egui::pos2(left, rect.bottom() - height),
-            egui::pos2(left + bar_width, rect.bottom()),
-        );
-        let color = if active {
-            colors.meter_active
-        } else {
-            colors.meter_inactive
-        };
-        ui.painter().rect_filled(bar, 2.0, color);
-    }
-}
-
 fn live_preview_layout(
     ui: &egui::Ui,
     state: &OverlayViewState,
@@ -633,6 +548,22 @@ pub(super) fn live_accessible_text(state: &OverlayViewState) -> String {
             state.transcript.committed, state.transcript.tentative
         )
     }
+}
+
+pub(super) fn compact_accessible_text(state: &OverlayViewState) -> String {
+    if let Some(error) = &state.error {
+        return error_message(error);
+    }
+    if let Some(notice) = &state.notice {
+        return notice.clone();
+    }
+    if state.phase == OverlayPhase::Error {
+        return state.phase.label().to_owned();
+    }
+    format!(
+        "Elapsed time {}",
+        format_elapsed(state.elapsed.unwrap_or_default())
+    )
 }
 
 fn error_message(error: &super::controller::OverlayError) -> String {
@@ -777,15 +708,6 @@ fn is_left_binding_punctuation(character: char) -> bool {
     )
 }
 
-fn phase_color(phase: OverlayPhase) -> Color32 {
-    match phase {
-        OverlayPhase::Error => Color32::from_rgb(239, 108, 104),
-        OverlayPhase::Success => Color32::from_rgb(91, 201, 158),
-        OverlayPhase::Hidden => Color32::TRANSPARENT,
-        _ => Color32::from_rgb(105, 169, 255),
-    }
-}
-
 fn format_elapsed(elapsed: Duration) -> String {
     let seconds = elapsed.as_secs();
     format!("{:02}:{:02}", seconds / 60, seconds % 60)
@@ -823,7 +745,7 @@ mod tests {
         assert_eq!((live.width_points, live.height_points), (600.0, 62.0));
         assert!((560.0..=640.0).contains(&live.width_points));
         assert!((56.0..=64.0).contains(&live.height_points));
-        assert_eq!((minimal.width_points, minimal.height_points), (320.0, 52.0));
+        assert_eq!((minimal.width_points, minimal.height_points), (200.0, 62.0));
     }
 
     #[test]
@@ -884,40 +806,42 @@ mod tests {
             OverlayWindowBounds {
                 x: 100,
                 y: 20,
-                width: 320,
-                height: 52,
+                width: 200,
+                height: 62,
             },
             window_spec(OverlayMode::Minimal),
         );
-        assert_eq!(control.x + control.width, 412);
+        assert_eq!(control.x + control.width, 284);
         assert_eq!((control.width, control.height), (44, 44));
     }
 
     #[test]
-    fn live_cancel_control_uses_the_reference_inset_and_shared_center_at_each_dpi() {
-        let spec = window_spec(OverlayMode::Live);
-        for scale in [1.0, 1.25, 1.5, 2.0] {
-            let display = OverlayWindowBounds {
-                x: -240,
-                y: 80,
-                width: (spec.width_points * scale).round() as i32,
-                height: (spec.height_points * scale).round() as i32,
-            };
-            let control = control_window_bounds(display, spec);
-            let expected_size = (CONTROL_SIZE * scale).round() as i32;
-            let expected_inset = (LIVE_CONTROL_HORIZONTAL_INSET * scale).round() as i32;
-            assert_eq!(
-                (control.width, control.height),
-                (expected_size, expected_size)
-            );
-            assert_eq!(
-                display.x + display.width - control.x - control.width,
-                expected_inset
-            );
-            assert!(
-                (control.y * 2 + control.height - (display.y * 2 + display.height)).abs() <= 1,
-                "control must remain within half a physical pixel of the display center at {scale}x"
-            );
+    fn cancel_control_uses_the_shared_shell_inset_and_center_at_each_dpi() {
+        for mode in [OverlayMode::Live, OverlayMode::Minimal] {
+            let spec = window_spec(mode);
+            for scale in [1.0, 1.25, 1.5, 2.0] {
+                let display = OverlayWindowBounds {
+                    x: -240,
+                    y: 80,
+                    width: (spec.width_points * scale).round() as i32,
+                    height: (spec.height_points * scale).round() as i32,
+                };
+                let control = control_window_bounds(display, spec);
+                let expected_size = (CONTROL_SIZE * scale).round() as i32;
+                let expected_inset = (CONTROL_HORIZONTAL_INSET * scale).round() as i32;
+                assert_eq!(
+                    (control.width, control.height),
+                    (expected_size, expected_size)
+                );
+                assert_eq!(
+                    display.x + display.width - control.x - control.width,
+                    expected_inset
+                );
+                assert!(
+                    (control.y * 2 + control.height - (display.y * 2 + display.height)).abs() <= 1,
+                    "{mode:?} control must remain within half a physical pixel of the display center at {scale}x"
+                );
+            }
         }
     }
 
@@ -929,20 +853,20 @@ mod tests {
                 egui::Pos2::ZERO,
                 egui::vec2(spec.width_points, spec.height_points),
             );
-            let capsule = painted_capsule_bounds(viewport, mode);
+            let capsule = painted_capsule_bounds(viewport);
             assert_eq!(capsule.left(), CAPSULE_HORIZONTAL_INSET);
             assert_eq!(
                 capsule.right(),
                 spec.width_points - CAPSULE_HORIZONTAL_INSET
             );
-            assert_eq!(capsule.top(), capsule_vertical_inset(mode));
+            assert_eq!(capsule.top(), CAPSULE_VERTICAL_INSET);
             assert_eq!(
                 capsule.bottom(),
-                spec.height_points - capsule_vertical_inset(mode)
+                spec.height_points - CAPSULE_VERTICAL_INSET
             );
             let shadow_bounds = capsule
-                .expand(capsule_shadow_blur(mode))
-                .translate(egui::vec2(0.0, capsule_shadow_offset_y(mode)));
+                .expand(CAPSULE_SHADOW_BLUR)
+                .translate(egui::vec2(0.0, CAPSULE_SHADOW_OFFSET_Y));
             assert!(
                 viewport.contains_rect(shadow_bounds),
                 "the {mode:?} capsule shadow must stay inside its transparent viewport"
@@ -977,7 +901,7 @@ mod tests {
                 };
                 let control = control_window_bounds(display, spec);
                 let horizontal_inset = (CAPSULE_HORIZONTAL_INSET * scale).round() as i32;
-                let vertical_inset = (capsule_vertical_inset(mode) * scale).round() as i32;
+                let vertical_inset = (CAPSULE_VERTICAL_INSET * scale).round() as i32;
                 let capsule = OverlayWindowBounds {
                     x: display.x + horizontal_inset,
                     y: display.y + vertical_inset,
@@ -1171,7 +1095,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_status_elements_fit_left_of_reserved_control_slot() {
+    fn compact_shell_contains_only_the_logo_and_proportional_timer_before_the_control_slot() {
         let context = egui::Context::default();
         context.enable_accesskit();
         let input = egui::RawInput {
@@ -1186,50 +1110,35 @@ mod tests {
             mode: OverlayMode::Minimal,
             phase: OverlayPhase::Listening,
             elapsed: Some(Duration::from_secs(65)),
-            audio_level: super::super::controller::OverlayAudioLevel {
-                rms: 0.5,
-                peak: 0.75,
-            },
             ..Default::default()
         };
 
         let output = context.run(input, |context| render_overlay(context, &state));
         let nodes = output.platform_output.accesskit_update.unwrap().nodes;
         let boundary = f64::from(MINIMAL_WIDTH - reserved_control_width());
-        assert!(
-            nodes
+        assert!(nodes.iter().all(|(_, node)| {
+            !matches!(
+                node.name(),
+                Some("Scribe is recording") | Some("Microphone input level")
+            )
+        }));
+        let element_bounds = ["Scribe", "Elapsed time 01:05"].map(|name| {
+            let node = nodes
                 .iter()
-                .all(|(_, node)| node.name() != Some("Recording indicator")),
-            "the phase dot is decorative because adjacent text names the state"
-        );
-        let element_bounds =
-            ["Scribe is recording", "Microphone input level", "01:05"].map(|name| {
-                let bounds = nodes
-                    .iter()
-                    .find_map(|(_, node)| {
-                        (node.name() == Some(name)).then(|| node.bounds()).flatten()
-                    })
-                    .unwrap_or_else(|| panic!("missing compact overlay node {name}"));
-                assert!(
-                    bounds.x1 <= boundary,
-                    "{name} overlaps control slot: {bounds:?}"
-                );
-                assert!(
-                    bounds.y0 >= 0.0 && bounds.y1 <= f64::from(MINIMAL_HEIGHT),
-                    "{name} exceeds compact overlay height: {bounds:?}"
-                );
-                (name, bounds)
-            });
-        for adjacent in element_bounds.windows(2) {
+                .find_map(|(_, node)| (node.name() == Some(name)).then_some(node))
+                .unwrap_or_else(|| panic!("missing compact overlay node {name}"));
+            let bounds = node.bounds().expect("compact node bounds");
             assert!(
-                adjacent[0].1.x1 <= adjacent[1].1.x0,
-                "{} overlaps {}: {:?} and {:?}",
-                adjacent[0].0,
-                adjacent[1].0,
-                adjacent[0].1,
-                adjacent[1].1
+                bounds.x1 <= boundary,
+                "{name} overlaps control slot: {bounds:?}"
             );
-        }
+            assert!(
+                bounds.y0 >= 0.0 && bounds.y1 <= f64::from(MINIMAL_HEIGHT),
+                "{name} exceeds compact overlay height: {bounds:?}"
+            );
+            (name, bounds)
+        });
+        assert!(element_bounds[0].1.x1 <= element_bounds[1].1.x0);
     }
 
     #[test]
@@ -1493,12 +1402,78 @@ mod tests {
             .expect("compact overlay should expose AccessKit");
 
         assert!(update.nodes.iter().all(|(_, node)| node.live().is_none()));
+        assert!(update.nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::Image
+                && node.name() == Some("Scribe")
+                && node.description() == Some("Scribe is recording")
+        }));
         assert!(
             update
                 .nodes
                 .iter()
-                .any(|(_, node)| node.name() == Some("Scribe is recording"))
+                .any(|(_, node)| node.name() == Some("Elapsed time 00:00"))
         );
+        assert!(update.nodes.iter().all(|(_, node)| {
+            !node
+                .name()
+                .is_some_and(|name| name.contains("committed words"))
+        }));
+    }
+
+    #[test]
+    fn compact_error_and_notice_replace_the_timer_and_announce_the_full_message() {
+        let cases = [
+            (
+                OverlayViewState {
+                    mode: OverlayMode::Minimal,
+                    phase: OverlayPhase::Error,
+                    error: Some(super::super::controller::OverlayError {
+                        message: "Microphone unavailable".to_owned(),
+                        recovery: OverlayRecovery::Retry,
+                    }),
+                    ..OverlayViewState::default()
+                },
+                "Microphone unavailable You can retry.",
+            ),
+            (
+                OverlayViewState {
+                    mode: OverlayMode::Minimal,
+                    phase: OverlayPhase::Listening,
+                    notice: Some("Preview paused while final transcription continues.".to_owned()),
+                    ..OverlayViewState::default()
+                },
+                "Preview paused while final transcription continues.",
+            ),
+        ];
+
+        for (state, expected) in cases {
+            let context = egui::Context::default();
+            context.enable_accesskit();
+            let output = context.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(MINIMAL_WIDTH, MINIMAL_HEIGHT),
+                    )),
+                    ..Default::default()
+                },
+                |context| render_overlay(context, &state),
+            );
+            let update = output.platform_output.accesskit_update.unwrap();
+            let live = update
+                .nodes
+                .iter()
+                .filter(|(_, node)| node.live() == Some(egui::accesskit::Live::Polite))
+                .collect::<Vec<_>>();
+            assert_eq!(live.len(), 1);
+            assert_eq!(live[0].1.name(), Some(expected));
+            assert!(update.nodes.iter().all(|(_, node)| {
+                !node.name().is_some_and(|name| {
+                    name.starts_with("Committed transcript:")
+                        || name.contains("Live estimate, may change")
+                })
+            }));
+        }
     }
 
     #[test]
@@ -1645,12 +1620,6 @@ mod tests {
                     contrast(colors.muted_text) >= 4.5,
                     "muted text {:?} must contrast with composited surface {:?} over {background:?}",
                     colors.muted_text,
-                    surface
-                );
-                assert!(
-                    contrast(colors.meter_inactive) >= 3.0,
-                    "inactive meter {:?} must contrast with composited surface {:?} over {background:?}",
-                    colors.meter_inactive,
                     surface
                 );
                 assert!(
