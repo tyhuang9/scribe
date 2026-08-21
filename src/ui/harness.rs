@@ -120,10 +120,11 @@ impl Fixture {
                 session_id: Some(SessionId(42)),
                 mode,
                 phase: OverlayPhase::Listening,
+                live_preview_available: mode == OverlayMode::Live,
                 audio_level: OverlayAudioLevel::new(0.58, 0.78),
                 transcript: OverlayTranscript {
                     committed: "Clicking the settings icon in the top".to_owned(),
-                    tentative: "right opens recording preferences.".to_owned(),
+                    tentative: "right...".to_owned(),
                     revision: 1,
                 },
                 elapsed: Some(Duration::from_secs(12)),

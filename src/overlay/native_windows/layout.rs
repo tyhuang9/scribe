@@ -83,8 +83,8 @@ impl DisplayLayout {
                 // capsule viewport, so its center—not a rederived logical
                 // height—is authoritative for painting and UIA.
                 let content_center_y = root.center_y();
-                let recording_mark = centered_rect(16.0, 30.0, 30.0, content_center_y, scale);
-                let divider_line = centered_rect(110.5, 1.0, 24.0, content_center_y, scale);
+                let recording_mark = centered_rect(19.0, 30.0, 30.0, content_center_y, scale);
+                let divider_line = centered_rect(124.5, 1.0, 24.0, content_center_y, scale);
                 let divider_stroke_radius = scale.max(1.0) / 2.0;
                 // Preserve a physical-pixel guard around GDI+'s antialiased
                 // line footprint. The line itself remains centered; this is
@@ -104,10 +104,10 @@ impl DisplayLayout {
                     recording_mark,
                     status_text: None,
                     meter: recording_mark,
-                    elapsed: centered_rect(56.0, 48.0, 23.0, content_center_y, scale),
+                    elapsed: centered_rect(72.0, 48.0, 23.0, content_center_y, scale),
                     divider: Some(divider),
                     divider_line: Some(divider_line),
-                    preview: Some(centered_rect(123.0, 426.0, 23.0, content_center_y, scale)),
+                    preview: Some(centered_rect(142.0, 407.0, 23.0, content_center_y, scale)),
                 }
             }
             OverlayMode::Minimal | OverlayMode::Off => {
@@ -217,11 +217,11 @@ mod tests {
         assert_eq!(layout.content_center_y, 39.0);
         assert_eq!(
             layout.elapsed.translated(bounds.x, bounds.y),
-            PhysicalRect::new(-1050.0, 1143.625, -990.0, 1172.375)
+            PhysicalRect::new(-1030.0, 1143.625, -970.0, 1172.375)
         );
         assert_eq!(
             layout.preview.unwrap().translated(bounds.x, bounds.y),
-            PhysicalRect::new(-966.25, 1143.625, -433.75, 1172.375)
+            PhysicalRect::new(-942.5, 1143.625, -433.75, 1172.375)
         );
     }
 

@@ -26,6 +26,7 @@ const WINDOW_MARGIN: f32 = 24.0;
 pub(super) const CONTROL_SIZE: f32 = 44.0;
 const CONTROL_CONTENT_GAP: f32 = 8.0;
 const CAPSULE_HORIZONTAL_INSET: f32 = 8.0;
+const LIVE_CONTROL_HORIZONTAL_INSET: f32 = 16.0;
 const LIVE_CAPSULE_VERTICAL_INSET: f32 = 8.0;
 const COMPACT_CAPSULE_VERTICAL_INSET: f32 = 4.0;
 const LIVE_CAPSULE_SHADOW_BLUR: f32 = 6.0;
@@ -37,7 +38,6 @@ const LIVE_WAVEFORM_SIZE: f32 = 30.0;
 const MAX_PREVIEW_GRAPHEMES: usize = 512;
 const MAX_MESSAGE_GRAPHEMES: usize = 256;
 const LIVE_PREVIEW_ROWS: usize = 1;
-const STATIC_WAVEFORM_LEVEL: f32 = 0.55;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OverlayAction {
@@ -184,7 +184,12 @@ pub(super) fn control_window_bounds(
 ) -> OverlayWindowBounds {
     let scale = display.width as f32 / display_spec.width_points;
     let size = (CONTROL_SIZE * scale).round() as i32;
-    let horizontal_inset = (CAPSULE_HORIZONTAL_INSET * scale).round() as i32;
+    let control_inset = if display_spec.width_points == LIVE_WIDTH {
+        LIVE_CONTROL_HORIZONTAL_INSET
+    } else {
+        CAPSULE_HORIZONTAL_INSET
+    };
+    let horizontal_inset = (control_inset * scale).round() as i32;
     OverlayWindowBounds {
         x: display.x + display.width - horizontal_inset - size,
         y: display.y + (display.height - size) / 2,
@@ -255,7 +260,6 @@ struct OverlayColors {
     inner_highlight: Color32,
     text: Color32,
     muted_text: Color32,
-    tentative_text: Color32,
     waveform: Color32,
     meter_active: Color32,
     meter_inactive: Color32,
@@ -270,15 +274,20 @@ fn overlay_colors(context: &egui::Context) -> OverlayColors {
         OverlayColors {
             // This app-owned tint remains deterministic while its alpha lets
             // the underlying desktop content show through.
-            surface: Color32::from_rgba_unmultiplied(25, 31, 42, 218),
-            border: Color32::from_rgba_unmultiplied(220, 229, 242, 76),
-            inner_highlight: Color32::from_rgba_unmultiplied(255, 255, 255, 42),
+            // The egui fallback does not composite native shadow rings beneath
+            // the fill, so this tint lands near the reference RGB 89/90/95 on
+            // its light backdrop without the native renderer's compensation.
+            surface: Color32::from_rgba_unmultiplied(31, 32, 39, 184),
+            border: Color32::from_rgba_unmultiplied(220, 229, 242, 36),
+            inner_highlight: Color32::from_rgba_unmultiplied(255, 255, 255, 18),
             text: palette.text,
-            muted_text: Color32::from_rgb(202, 211, 224),
-            tentative_text: Color32::from_rgb(166, 180, 202),
-            waveform: palette.recording_waveform,
+            muted_text: Color32::from_rgb(210, 210, 216),
+            // The supplied reference uses a purple brand mark. This slightly
+            // lighter overlay-specific token preserves that appearance while
+            // keeping the non-text mark at 3:1 over the translucent surface.
+            waveform: Color32::from_rgb(178, 162, 255),
             meter_active: palette.success,
-            meter_inactive: Color32::from_rgb(128, 142, 162),
+            meter_inactive: Color32::from_rgb(180, 180, 188),
             error: palette.error,
             warning: palette.warning,
             shadow: Color32::from_black_alpha(96),
@@ -290,7 +299,6 @@ fn overlay_colors(context: &egui::Context) -> OverlayColors {
             inner_highlight: Color32::from_rgba_unmultiplied(255, 255, 255, 156),
             text: palette.text,
             muted_text: Color32::from_rgb(65, 75, 90),
-            tentative_text: Color32::from_rgb(72, 84, 102),
             waveform: palette.recording_waveform,
             meter_active: palette.success_text,
             meter_inactive: Color32::from_rgb(100, 112, 132),
@@ -442,13 +450,13 @@ fn paint_capsule_inner_highlight(
     color: Color32,
 ) {
     let horizontal_inset = (rounding * 0.45).min(capsule.width() / 4.0);
-    let y = capsule.top() + 1.5;
+    let y = capsule.top() + 1.0;
     ui.painter().line_segment(
         [
             egui::pos2(capsule.left() + horizontal_inset, y),
             egui::pos2(capsule.right() - horizontal_inset, y),
         ],
-        Stroke::new(1.0, color),
+        Stroke::new(0.5, color),
     );
 }
 
@@ -483,39 +491,36 @@ fn render_compact_status_row(ui: &mut egui::Ui, state: &OverlayViewState, colors
 
 fn render_live_status_row(ui: &mut egui::Ui, state: &OverlayViewState, colors: OverlayColors) {
     ui.horizontal_centered(|ui| {
-        render_waveform_meter(ui, state, colors);
+        render_brand_mark(ui, state, colors);
         ui.add_space(8.0);
         let elapsed = state
             .elapsed
             .map(format_elapsed)
             .unwrap_or_else(|| "00:00".into());
-        ui.label(
-            RichText::new(elapsed)
-                .size(13.0)
-                .monospace()
-                .color(colors.muted_text),
-        );
-        render_divider(ui, colors);
-        let response = ui.label(live_preview_layout(ui, state, colors, ui.available_width()));
-        ui.ctx().accesskit_node_builder(response.id, |builder| {
-            builder.set_name(live_accessible_text(state));
-            if state.error.is_some() || state.notice.is_some() {
-                builder.set_live(egui::accesskit::Live::Polite);
-            }
-        });
-        if let Some(announcement_text) = live_overlay_announcement(state) {
-            let announcement = ui.allocate_response(egui::Vec2::ZERO, Sense::hover());
-            ui.ctx().accesskit_node_builder(announcement.id, |builder| {
-                builder.set_role(egui::accesskit::Role::StaticText);
-                builder.set_name(announcement_text);
-                builder.set_live(egui::accesskit::Live::Polite);
+        ui.label(RichText::new(elapsed).size(13.0).color(colors.muted_text));
+        if state.live_preview_available {
+            render_divider(ui, colors);
+            let response = ui.label(live_preview_layout(ui, state, colors, ui.available_width()));
+            ui.ctx().accesskit_node_builder(response.id, |builder| {
+                builder.set_name(live_accessible_text(state));
+                if state.error.is_some() || state.notice.is_some() {
+                    builder.set_live(egui::accesskit::Live::Polite);
+                }
             });
+            if let Some(announcement_text) = live_overlay_announcement(state) {
+                let announcement = ui.allocate_response(egui::Vec2::ZERO, Sense::hover());
+                ui.ctx().accesskit_node_builder(announcement.id, |builder| {
+                    builder.set_role(egui::accesskit::Role::StaticText);
+                    builder.set_name(announcement_text);
+                    builder.set_live(egui::accesskit::Live::Polite);
+                });
+            }
         }
     });
 }
 
 pub(super) fn live_overlay_announcement(state: &OverlayViewState) -> Option<&str> {
-    if state.error.is_some() || state.notice.is_some() {
+    if !state.live_preview_available || state.error.is_some() || state.notice.is_some() {
         return None;
     }
     if let Some(announcement) = state.transcript_announcement.as_deref() {
@@ -534,72 +539,28 @@ fn render_divider(ui: &mut egui::Ui, colors: OverlayColors) {
     ui.add_space(6.0);
 }
 
-fn render_waveform_meter(ui: &mut egui::Ui, state: &OverlayViewState, colors: OverlayColors) {
+fn render_brand_mark(ui: &mut egui::Ui, state: &OverlayViewState, colors: OverlayColors) {
     let (rect, response) = ui.allocate_exact_size(
         egui::vec2(LIVE_WAVEFORM_SIZE, LIVE_WAVEFORM_SIZE),
         Sense::hover(),
     );
-    let level = state.audio_level.rms.max(state.audio_level.peak * 0.7);
-    response.widget_info(|| {
-        let mut info = egui::WidgetInfo::labeled(
-            egui::WidgetType::ProgressIndicator,
-            "Microphone input level",
-        );
-        info.value = Some((level * 100.0).round() as f64);
-        info
-    });
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Other, "Scribe"));
     ui.ctx().accesskit_node_builder(response.id, |builder| {
-        builder.set_role(egui::accesskit::Role::ProgressIndicator);
-        builder.set_name("Microphone input level");
+        builder.set_role(egui::accesskit::Role::Image);
+        builder.set_name("Scribe");
         builder.set_description(if state.phase == OverlayPhase::Listening {
             "Scribe is recording"
         } else {
             state.phase.label()
         });
     });
-    let visuals = waveform_visuals(level, state.reduced_motion, colors);
-    ui.painter()
-        .circle_filled(rect.center(), visuals.halo_radius, visuals.halo_color);
     ui.painter().text(
         rect.center(),
         egui::Align2::CENTER_CENTER,
         egui_phosphor::regular::WAVEFORM,
         egui::FontId::proportional(27.0),
-        visuals.glyph_color,
+        colors.waveform,
     );
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct WaveformVisuals {
-    glyph_color: Color32,
-    halo_radius: f32,
-    halo_color: Color32,
-}
-
-fn waveform_visuals(level: f32, reduced_motion: bool, colors: OverlayColors) -> WaveformVisuals {
-    let visual_level = if reduced_motion {
-        STATIC_WAVEFORM_LEVEL
-    } else {
-        level.clamp(0.0, 1.0)
-    };
-    WaveformVisuals {
-        glyph_color: colors.waveform,
-        halo_radius: waveform_halo_radius(visual_level),
-        halo_color: waveform_halo_color(visual_level, colors),
-    }
-}
-
-fn waveform_halo_radius(level: f32) -> f32 {
-    2.5 + level.clamp(0.0, 1.0) * 3.5
-}
-
-fn waveform_halo_color(level: f32, colors: OverlayColors) -> Color32 {
-    Color32::from_rgba_unmultiplied(
-        colors.waveform.r(),
-        colors.waveform.g(),
-        colors.waveform.b(),
-        (16.0 + level.clamp(0.0, 1.0) * 48.0).round() as u8,
-    )
 }
 
 fn render_level_meter(
@@ -717,10 +678,10 @@ fn transcript_layout_for_rows(
     let total_graphemes = full.text.graphemes(true).count();
     let mut low = 0;
     let mut high = total_graphemes.min(MAX_PREVIEW_GRAPHEMES);
-    let mut best = tail_layout_job(&full, 0);
+    let mut best = head_layout_job(&full, 0);
     while low <= high {
         let keep = low + (high - low) / 2;
-        let candidate = tail_layout_job(&full, keep);
+        let candidate = head_layout_job(&full, keep);
         let rows = ui.fonts(|fonts| fonts.layout_job(candidate.clone()).rows.len());
         if rows <= max_rows {
             best = candidate;
@@ -796,39 +757,6 @@ fn head_layout_job(full: &egui::text::LayoutJob, keep_graphemes: usize) -> egui:
     result
 }
 
-fn tail_layout_job(full: &egui::text::LayoutJob, keep_graphemes: usize) -> egui::text::LayoutJob {
-    let total_graphemes = full.text.graphemes(true).count();
-    if keep_graphemes >= total_graphemes {
-        return full.clone();
-    }
-    let start = full
-        .text
-        .grapheme_indices(true)
-        .nth(total_graphemes.saturating_sub(keep_graphemes))
-        .map_or(full.text.len(), |(index, _)| index);
-    let mut result = full.clone();
-    result.text.clear();
-    result.sections.clear();
-    let first_format = full
-        .sections
-        .iter()
-        .find(|section| section.byte_range.end > start)
-        .map(|section| section.format.clone())
-        .unwrap_or_default();
-    result.append("…", 0.0, first_format);
-    for section in &full.sections {
-        let section_start = section.byte_range.start.max(start);
-        if section_start < section.byte_range.end {
-            result.append(
-                &full.text[section_start..section.byte_range.end],
-                0.0,
-                section.format.clone(),
-            );
-        }
-    }
-    result
-}
-
 fn transcript_layout(
     committed: &str,
     tentative: &str,
@@ -840,7 +768,7 @@ fn transcript_layout(
         committed,
         0.0,
         egui::TextFormat {
-            color: colors.text,
+            color: colors.muted_text,
             ..Default::default()
         },
     );
@@ -856,8 +784,7 @@ fn transcript_layout(
         tentative,
         0.0,
         egui::TextFormat {
-            color: colors.tentative_text,
-            italics: true,
+            color: colors.muted_text,
             ..Default::default()
         },
     );
@@ -989,6 +916,34 @@ mod tests {
     }
 
     #[test]
+    fn live_cancel_control_uses_the_reference_inset_and_shared_center_at_each_dpi() {
+        let spec = window_spec(OverlayMode::Live);
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            let display = OverlayWindowBounds {
+                x: -240,
+                y: 80,
+                width: (spec.width_points * scale).round() as i32,
+                height: (spec.height_points * scale).round() as i32,
+            };
+            let control = control_window_bounds(display, spec);
+            let expected_size = (CONTROL_SIZE * scale).round() as i32;
+            let expected_inset = (LIVE_CONTROL_HORIZONTAL_INSET * scale).round() as i32;
+            assert_eq!(
+                (control.width, control.height),
+                (expected_size, expected_size)
+            );
+            assert_eq!(
+                display.x + display.width - control.x - control.width,
+                expected_inset
+            );
+            assert!(
+                (control.y * 2 + control.height - (display.y * 2 + display.height)).abs() <= 1,
+                "control must remain within half a physical pixel of the display center at {scale}x"
+            );
+        }
+    }
+
+    #[test]
     fn painted_capsules_keep_shadow_room_and_enclose_cancel_controls() {
         for mode in [OverlayMode::Live, OverlayMode::Minimal] {
             let spec = window_spec(mode);
@@ -1067,25 +1022,6 @@ mod tests {
     }
 
     #[test]
-    fn waveform_halo_tracks_microphone_activity() {
-        let colors = overlay_colors(&egui::Context::default());
-        let silent = waveform_visuals(0.0, false, colors);
-        let loud = waveform_visuals(1.0, false, colors);
-        assert_eq!(silent.glyph_color, loud.glyph_color);
-        assert!(loud.halo_radius > silent.halo_radius);
-        assert!(loud.halo_color.a() > silent.halo_color.a());
-    }
-
-    #[test]
-    fn reduced_motion_keeps_live_waveform_visuals_static() {
-        let colors = overlay_colors(&egui::Context::default());
-        assert_eq!(
-            waveform_visuals(0.0, true, colors),
-            waveform_visuals(1.0, true, colors)
-        );
-    }
-
-    #[test]
     fn inner_highlight_is_painted_after_the_translucent_surface() {
         let context = egui::Context::default();
         let colors = overlay_colors(&context);
@@ -1131,6 +1067,7 @@ mod tests {
             session_id: Some(SessionId(9)),
             mode: OverlayMode::Live,
             phase: OverlayPhase::Listening,
+            live_preview_available: true,
             elapsed: Some(Duration::from_secs(5)),
             transcript: super::super::controller::OverlayTranscript {
                 committed: "committed text".into(),
@@ -1143,7 +1080,7 @@ mod tests {
         let nodes = output.platform_output.accesskit_update.unwrap().nodes;
         let boundary = f64::from(LIVE_WIDTH - reserved_control_width());
         for name in [
-            "Microphone input level",
+            "Scribe",
             "00:05",
             "Committed transcript: committed text. Live estimate, may change: tentative text",
         ] {
@@ -1159,6 +1096,47 @@ mod tests {
     }
 
     #[test]
+    fn live_fallback_without_a_started_preview_keeps_timer_and_omits_transcript_semantics() {
+        let context = egui::Context::default();
+        context.enable_accesskit();
+        let state = OverlayViewState {
+            session_id: Some(SessionId(10)),
+            mode: OverlayMode::Live,
+            phase: OverlayPhase::Listening,
+            live_preview_available: false,
+            elapsed: Some(Duration::from_secs(12)),
+            transcript: super::super::controller::OverlayTranscript {
+                committed: "must not leak".into(),
+                tentative: "into the fallback shell".into(),
+                revision: 1,
+            },
+            transcript_announcement: Some("must not be announced".into()),
+            ..Default::default()
+        };
+        let output = context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(LIVE_WIDTH, LIVE_HEIGHT),
+                )),
+                ..Default::default()
+            },
+            |context| render_overlay(context, &state),
+        );
+        let nodes = output.platform_output.accesskit_update.unwrap().nodes;
+        assert!(nodes.iter().any(|(_, node)| node.name() == Some("00:12")));
+        assert!(nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::Image && node.name() == Some("Scribe")
+        }));
+        assert!(nodes.iter().all(|(_, node)| {
+            node.live().is_none()
+                && !node.name().is_some_and(|name| {
+                    name.contains("must not leak") || name.contains("must not be announced")
+                })
+        }));
+    }
+
+    #[test]
     fn constrained_live_overlay_keeps_estimate_semantics_on_the_transcript_in_both_themes() {
         for visuals in [egui::Visuals::light(), egui::Visuals::dark()] {
             let context = egui::Context::default();
@@ -1168,6 +1146,7 @@ mod tests {
             let state = OverlayViewState {
                 mode: OverlayMode::Live,
                 phase: OverlayPhase::Listening,
+                live_preview_available: true,
                 transcript: super::super::controller::OverlayTranscript {
                     committed: "a long committed prefix that must be tail truncated".into(),
                     tentative: "and a changing tentative suffix".into(),
@@ -1280,7 +1259,7 @@ mod tests {
     }
 
     #[test]
-    fn preview_tail_is_unicode_safe_and_limited_to_one_rendered_row() {
+    fn preview_head_is_unicode_safe_and_limited_to_one_rendered_row() {
         let context = egui::Context::default();
         let mut result = None;
         let _ = context.run(egui::RawInput::default(), |context| {
@@ -1302,12 +1281,12 @@ mod tests {
         assert!(layout.text.is_char_boundary(layout.text.len()));
         assert!(
             layout.sections.len() >= 2,
-            "styled tail should retain formatting"
+            "styled head should retain formatting"
         );
     }
 
     #[test]
-    fn one_row_preview_tail_starts_at_a_grapheme_boundary() {
+    fn one_row_preview_preserves_the_committed_prefix_and_trails_with_ellipsis() {
         let context = egui::Context::default();
         let original = concat!(
             "prefix prefix prefix prefix prefix prefix ",
@@ -1327,42 +1306,17 @@ mod tests {
             });
         });
         let layout = result.expect("preview layout should render");
-        let retained = layout.text.strip_prefix('\u{2026}').unwrap_or(&layout.text);
+        let retained = layout.text.strip_suffix('\u{2026}').unwrap_or(&layout.text);
         assert!(!retained.is_empty(), "one-row preview should retain text");
-        assert!(original.ends_with(retained));
+        assert!(original.starts_with(retained));
+        assert!(layout.text.ends_with('\u{2026}'));
         assert!(
-            original
-                .grapheme_indices(true)
-                .any(|(index, _)| &original[index..] == retained),
-            "preview tail must start at a grapheme-cluster boundary: {retained:?}"
+            retained.len() == original.len()
+                || original
+                    .grapheme_indices(true)
+                    .any(|(index, _)| index == retained.len()),
+            "preview head must end at a grapheme-cluster boundary: {retained:?}"
         );
-    }
-
-    #[test]
-    fn tail_layout_never_splits_combining_or_emoji_graphemes() {
-        let colors = overlay_colors(&egui::Context::default());
-        for sample in [
-            "e\u{301}",
-            "\u{6f22}",
-            "\u{1f1fa}\u{1f1f8}",
-            "\u{1f44d}\u{1f3fd}",
-            "\u{1f469}\u{200d}\u{1f4bb}",
-        ] {
-            let original = format!("before {sample}");
-            let full = transcript_layout(&original, "", LIVE_WIDTH, colors);
-            for keep in 0..=original.graphemes(true).count() {
-                let tail = tail_layout_job(&full, keep);
-                let retained = tail.text.strip_prefix('\u{2026}').unwrap_or(&tail.text);
-                assert!(original.ends_with(retained));
-                assert!(
-                    retained.is_empty()
-                        || original
-                            .grapheme_indices(true)
-                            .any(|(index, _)| &original[index..] == retained),
-                    "{sample:?} was split at {keep} retained graphemes: {retained:?}"
-                );
-            }
-        }
     }
 
     #[test]
@@ -1422,6 +1376,7 @@ mod tests {
         context.enable_accesskit();
         let state = OverlayViewState {
             phase: OverlayPhase::Listening,
+            live_preview_available: true,
             transcript: super::super::controller::OverlayTranscript {
                 committed: "hello".to_owned(),
                 tentative: "world".to_owned(),
@@ -1467,9 +1422,7 @@ mod tests {
                     .is_some_and(|name| name.contains("Live estimate"))
         }));
         assert!(update.nodes.iter().any(|(_, node)| {
-            node.role() == egui::accesskit::Role::ProgressIndicator
-                && node.name() == Some("Microphone input level")
-                && node.numeric_value() == Some(0.0)
+            node.role() == egui::accesskit::Role::Image && node.name() == Some("Scribe")
         }));
         assert!(
             update
@@ -1490,6 +1443,7 @@ mod tests {
             context.enable_accesskit();
             let state = OverlayViewState {
                 phase,
+                live_preview_available: true,
                 transcript: super::super::controller::OverlayTranscript {
                     tentative: "tentative words".to_owned(),
                     ..Default::default()
@@ -1589,6 +1543,7 @@ mod tests {
                 } else {
                     OverlayPhase::Listening
                 },
+                live_preview_available: true,
                 notice: notice.map(str::to_owned),
                 error,
                 transcript_announcement: Some("Committed transcript: stale".to_owned()),
@@ -1628,6 +1583,7 @@ mod tests {
         context.enable_accesskit();
         let state = OverlayViewState {
             phase: OverlayPhase::Error,
+            live_preview_available: true,
             error: Some(super::super::controller::OverlayError {
                 message: "Live preview has not acknowledged cancellation".to_owned(),
                 recovery: OverlayRecovery::WaitForPreview,
@@ -1702,7 +1658,6 @@ mod tests {
                 };
                 assert!(contrast(colors.text) >= 4.5);
                 assert!(contrast(colors.muted_text) >= 4.5);
-                assert!(contrast(colors.tentative_text) >= 4.5);
                 assert!(contrast(colors.meter_inactive) >= 3.0);
                 assert_eq!(colors.waveform.a(), 255);
                 let waveform_contrast = contrast(colors.waveform);

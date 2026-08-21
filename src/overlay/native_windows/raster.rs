@@ -3,19 +3,19 @@ use std::{borrow::Cow, ffi::c_void, mem::zeroed, ptr::null_mut, sync::Mutex, tim
 use eframe::egui::Color32;
 use unicode_segmentation::UnicodeSegmentation;
 use windows_sys::Win32::Graphics::GdiPlus::{
-    FillModeAlternate, FontStyleBold, FontStyleItalic, FontStyleRegular, GdipAddPathArc,
-    GdipCloneFontFamily, GdipClosePathFigure, GdipCreateBitmapFromScan0, GdipCreateFont,
-    GdipCreateFontFamilyFromName, GdipCreatePath, GdipCreatePen1, GdipCreateSolidFill,
-    GdipDeleteBrush, GdipDeleteFont, GdipDeleteFontFamily, GdipDeleteGraphics, GdipDeletePath,
-    GdipDeletePen, GdipDeletePrivateFontCollection, GdipDeleteStringFormat, GdipDisposeImage,
-    GdipDrawLine, GdipDrawPath, GdipDrawString, GdipFillEllipse, GdipFillPath,
-    GdipGetFontCollectionFamilyCount, GdipGetFontCollectionFamilyList,
-    GdipGetGenericFontFamilySansSerif, GdipGetImageGraphicsContext, GdipGraphicsClear,
-    GdipMeasureString, GdipNewPrivateFontCollection, GdipPrivateAddMemoryFont,
-    GdipSetSmoothingMode, GdipSetStringFormatFlags, GdipSetTextRenderingHint,
-    GdipStringFormatGetGenericTypographic, GdiplusShutdown, GdiplusStartup, GdiplusStartupInput,
-    GpBitmap, GpBrush, GpFont, GpFontCollection, GpFontFamily, GpGraphics, GpImage, GpPath, GpPen,
-    GpSolidFill, GpStringFormat, Ok as GDI_PLUS_OK, RectF, SmoothingModeAntiAlias8x8,
+    FillModeAlternate, FontStyleBold, FontStyleRegular, GdipAddPathArc, GdipCloneFontFamily,
+    GdipClosePathFigure, GdipCreateBitmapFromScan0, GdipCreateFont, GdipCreateFontFamilyFromName,
+    GdipCreatePath, GdipCreatePen1, GdipCreateSolidFill, GdipDeleteBrush, GdipDeleteFont,
+    GdipDeleteFontFamily, GdipDeleteGraphics, GdipDeletePath, GdipDeletePen,
+    GdipDeletePrivateFontCollection, GdipDeleteStringFormat, GdipDisposeImage, GdipDrawLine,
+    GdipDrawPath, GdipDrawString, GdipFillEllipse, GdipFillPath, GdipGetFontCollectionFamilyCount,
+    GdipGetFontCollectionFamilyList, GdipGetGenericFontFamilySansSerif,
+    GdipGetImageGraphicsContext, GdipGraphicsClear, GdipMeasureString,
+    GdipNewPrivateFontCollection, GdipPrivateAddMemoryFont, GdipSetSmoothingMode,
+    GdipSetStringFormatFlags, GdipSetTextRenderingHint, GdipStringFormatGetGenericTypographic,
+    GdiplusShutdown, GdiplusStartup, GdiplusStartupInput, GpBitmap, GpBrush, GpFont,
+    GpFontCollection, GpFontFamily, GpGraphics, GpImage, GpPath, GpPen, GpSolidFill,
+    GpStringFormat, Ok as GDI_PLUS_OK, RectF, SmoothingModeAntiAlias8x8,
     StringFormatFlagsMeasureTrailingSpaces, StringFormatFlagsNoWrap,
     TextRenderingHintAntiAliasGridFit, UnitPixel,
 };
@@ -57,7 +57,6 @@ struct NativeColors {
     inner_highlight: Argb,
     text: Argb,
     muted_text: Argb,
-    tentative_text: Argb,
     waveform: Argb,
     meter_active: Argb,
     meter_inactive: Argb,
@@ -75,15 +74,15 @@ impl NativeColors {
         };
         if dark_mode {
             Self {
-                surface: Argb::new(218, 25, 31, 42),
-                border: Argb::new(76, 220, 229, 242),
-                inner_highlight: Argb::new(42, 255, 255, 255),
+                surface: Argb::new(184, 56, 57, 65),
+                border: Argb::new(36, 220, 229, 242),
+                inner_highlight: Argb::new(18, 255, 255, 255),
                 text: Argb::from_color(palette.text),
-                muted_text: Argb::new(255, 202, 211, 224),
-                tentative_text: Argb::new(255, 166, 180, 202),
-                waveform: Argb::from_color(palette.recording_waveform),
+                muted_text: Argb::new(255, 210, 210, 216),
+                // Overlay-specific accessible variant of the reference purple.
+                waveform: Argb::new(255, 178, 162, 255),
                 meter_active: Argb::from_color(palette.success),
-                meter_inactive: Argb::new(255, 128, 142, 162),
+                meter_inactive: Argb::new(255, 180, 180, 188),
                 error: Argb::from_color(palette.error),
                 warning: Argb::from_color(palette.warning),
                 shadow: Argb::new(96, 0, 0, 0),
@@ -95,7 +94,6 @@ impl NativeColors {
                 inner_highlight: Argb::new(156, 255, 255, 255),
                 text: Argb::from_color(palette.text),
                 muted_text: Argb::new(255, 65, 75, 90),
-                tentative_text: Argb::new(255, 72, 84, 102),
                 waveform: Argb::from_color(palette.recording_waveform),
                 meter_active: Argb::from_color(palette.success_text),
                 meter_inactive: Argb::new(255, 100, 112, 132),
@@ -152,7 +150,6 @@ impl LayeredFrame {
 enum TextStyle {
     Regular,
     Bold,
-    Italic,
     Monospace,
     Phosphor,
 }
@@ -162,7 +159,7 @@ enum TextStyle {
 /// in the native rasterizer cache.
 fn baseline_sample(style: TextStyle) -> &'static str {
     match style {
-        TextStyle::Regular | TextStyle::Bold | TextStyle::Italic => "Agjpqy",
+        TextStyle::Regular | TextStyle::Bold => "Agjpqy",
         TextStyle::Monospace => "00:12",
         TextStyle::Phosphor => egui_phosphor::regular::WAVEFORM,
     }
@@ -204,11 +201,6 @@ impl StyledLine {
 
     fn head(&self, keep: usize) -> Self {
         slice_styled_line(self, 0, keep, true)
-    }
-
-    fn tail(&self, keep: usize) -> Self {
-        let total = self.grapheme_count();
-        slice_styled_line(self, total.saturating_sub(keep), total, false)
     }
 }
 
@@ -447,10 +439,10 @@ fn draw_capsule(
     canvas.stroke_rounded_rect(x, y, width, height, radius, scale.max(1.0), colors.border)?;
     canvas.draw_line(
         x + radius * 0.45,
-        y + 1.5 * scale,
+        y + scale,
         x + width - radius * 0.45,
-        y + 1.5 * scale,
-        scale.max(1.0),
+        y + scale,
+        (0.5 * scale).max(1.0),
         colors.inner_highlight,
     )
 }
@@ -461,33 +453,22 @@ fn draw_live(
     layout: &DisplayLayout,
     colors: NativeColors,
 ) -> Result<(), RasterError> {
-    draw_live_waveform(canvas, state, layout, colors)?;
+    draw_live_brand_mark(canvas, layout, colors)?;
     draw_live_elapsed(canvas, state, layout, colors)?;
+    if !state.live_preview_available {
+        return Ok(());
+    }
     draw_live_divider(canvas, layout, colors)?;
     draw_live_preview(canvas, state, layout, colors)
 }
 
-fn draw_live_waveform(
+fn draw_live_brand_mark(
     canvas: &mut Canvas<'_>,
-    state: &OverlayViewState,
     layout: &DisplayLayout,
     colors: NativeColors,
 ) -> Result<(), RasterError> {
     let scale = layout.scale;
-    let center_y = layout.recording_mark.center_y();
-    let level = normalized_level(state);
-    let visual_level = if state.reduced_motion { 0.55 } else { level };
     let center_x = layout.recording_mark.center_x();
-    let halo_radius = (2.5 + visual_level * 3.5) * scale;
-    let waveform_alpha = (16.0 + visual_level * 48.0).round() as u8;
-    let waveform_rgb = colors.waveform.0;
-    canvas.fill_ellipse(
-        center_x - halo_radius,
-        center_y - halo_radius,
-        halo_radius * 2.0,
-        halo_radius * 2.0,
-        Argb((waveform_rgb & 0x00FF_FFFF) | ((waveform_alpha as u32) << 24)),
-    )?;
     canvas.draw_centered_text_in_rect(
         egui_phosphor::regular::WAVEFORM,
         center_x,
@@ -516,7 +497,7 @@ fn draw_live_elapsed(
         layout.elapsed.width(),
         layout.elapsed,
         13.0 * scale,
-        TextStyle::Monospace,
+        TextStyle::Regular,
         colors.muted_text,
     )?;
     Ok(())
@@ -560,7 +541,7 @@ fn draw_live_preview(
             MAX_MESSAGE_GRAPHEMES,
         )?
     } else {
-        fit_tail(
+        fit_head(
             canvas,
             &line,
             max_width,
@@ -706,7 +687,7 @@ fn live_line(state: &OverlayViewState, colors: NativeColors) -> StyledLine {
     if !committed.is_empty() {
         sections.push(StyledSection {
             text: committed.clone(),
-            color: colors.text,
+            color: colors.muted_text,
             style: TextStyle::Regular,
         });
     }
@@ -718,15 +699,15 @@ fn live_line(state: &OverlayViewState, colors: NativeColors) -> StyledLine {
     {
         sections.push(StyledSection {
             text: " ".to_owned(),
-            color: colors.text,
+            color: colors.muted_text,
             style: TextStyle::Regular,
         });
     }
     if !tentative.is_empty() {
         sections.push(StyledSection {
             text: tentative.clone(),
-            color: colors.tentative_text,
-            style: TextStyle::Italic,
+            color: colors.muted_text,
+            style: TextStyle::Regular,
         });
     }
     StyledLine { sections }
@@ -741,17 +722,6 @@ fn fit_head(
 ) -> Result<StyledLine, RasterError> {
     let total = line.grapheme_count().min(limit);
     binary_search_fit(total, |keep| line.head(keep), canvas, max_width, font_size)
-}
-
-fn fit_tail(
-    canvas: &mut Canvas<'_>,
-    line: &StyledLine,
-    max_width: f32,
-    font_size: f32,
-    limit: usize,
-) -> Result<StyledLine, RasterError> {
-    let total = line.grapheme_count().min(limit);
-    binary_search_fit(total, |keep| line.tail(keep), canvas, max_width, font_size)
 }
 
 fn binary_search_fit(
@@ -1267,12 +1237,11 @@ impl Font {
         }
         let family_name = match style {
             TextStyle::Monospace => "Consolas",
-            TextStyle::Regular | TextStyle::Bold | TextStyle::Italic => "Segoe UI",
+            TextStyle::Regular | TextStyle::Bold => "Segoe UI",
             TextStyle::Phosphor => unreachable!("Phosphor is handled above"),
         };
         let font_style = match style {
             TextStyle::Bold => FontStyleBold,
-            TextStyle::Italic => FontStyleItalic,
             TextStyle::Regular | TextStyle::Monospace => FontStyleRegular,
             TextStyle::Phosphor => unreachable!("Phosphor is handled above"),
         };
@@ -1593,10 +1562,11 @@ mod tests {
             session_id: Some(SessionId(42)),
             mode,
             phase: OverlayPhase::Listening,
+            live_preview_available: mode == OverlayMode::Live,
             audio_level: OverlayAudioLevel::new(0.65, 0.82),
             transcript: super::super::super::controller::OverlayTranscript {
-                committed: "The native overlay keeps the latest committed phrase".to_owned(),
-                tentative: " and this tentative ending".to_owned(),
+                committed: "Clicking the settings icon in the top".to_owned(),
+                tentative: "right...".to_owned(),
                 revision: 7,
             },
             elapsed: Some(Duration::from_secs(12)),
@@ -1612,7 +1582,21 @@ mod tests {
                     session_id: Some(SessionId(43)),
                     mode: OverlayMode::Live,
                     phase: OverlayPhase::Listening,
+                    live_preview_available: true,
                     elapsed: Some(Duration::ZERO),
+                    ..OverlayViewState::default()
+                },
+                600,
+                62,
+            ),
+            (
+                "live-no-preview",
+                OverlayViewState {
+                    session_id: Some(SessionId(46)),
+                    mode: OverlayMode::Live,
+                    phase: OverlayPhase::Listening,
+                    live_preview_available: false,
+                    elapsed: Some(Duration::from_secs(12)),
                     ..OverlayViewState::default()
                 },
                 600,
@@ -1635,6 +1619,7 @@ mod tests {
                     session_id: Some(SessionId(45)),
                     mode: OverlayMode::Live,
                     phase: OverlayPhase::Error,
+                    live_preview_available: true,
                     error: Some(super::super::super::controller::OverlayError {
                         message: "Microphone unavailable".to_owned(),
                         recovery: OverlayRecovery::Retry,
@@ -1663,7 +1648,7 @@ mod tests {
 
     #[derive(Clone, Copy)]
     enum IsolatedComponent {
-        Waveform,
+        BrandMark,
         Elapsed,
         Divider,
         Preview,
@@ -1689,7 +1674,7 @@ mod tests {
         let mut canvas = Canvas::new(rasterizer, &mut frame.pixels, width, height).unwrap();
         let colors = NativeColors::for_theme(dark_mode);
         match component {
-            IsolatedComponent::Waveform => draw_live_waveform(&mut canvas, state, layout, colors),
+            IsolatedComponent::BrandMark => draw_live_brand_mark(&mut canvas, layout, colors),
             IsolatedComponent::Elapsed => draw_live_elapsed(&mut canvas, state, layout, colors),
             IsolatedComponent::Divider => draw_live_divider(&mut canvas, layout, colors),
             IsolatedComponent::Preview => draw_live_preview(&mut canvas, state, layout, colors),
@@ -1707,6 +1692,24 @@ mod tests {
             }
         }
         .unwrap();
+        drop(canvas);
+        frame
+    }
+
+    fn live_shell_only_frame(
+        rasterizer: &NativeRasterizer,
+        state: &OverlayViewState,
+        layout: &DisplayLayout,
+        dark_mode: bool,
+    ) -> LayeredFrame {
+        let width = layout.root.width() as i32;
+        let height = layout.root.height() as i32;
+        let mut frame = LayeredFrame::transparent(width, height).unwrap();
+        let mut canvas = Canvas::new(rasterizer, &mut frame.pixels, width, height).unwrap();
+        let colors = NativeColors::for_theme(dark_mode);
+        draw_capsule(&mut canvas, OverlayMode::Live, layout.scale, colors).unwrap();
+        draw_live_brand_mark(&mut canvas, layout, colors).unwrap();
+        draw_live_elapsed(&mut canvas, state, layout, colors).unwrap();
         drop(canvas);
         frame
     }
@@ -1823,7 +1826,7 @@ mod tests {
             let live = state(OverlayMode::Live);
             rasterizer.render_display(&live, true, 600, 62).unwrap();
             let first = rasterizer.baseline_cache_stats();
-            assert_eq!(first, (4, 4), "one metric per Live font/style pair");
+            assert_eq!(first, (2, 2), "one metric per Live font/style pair");
 
             rasterizer.render_display(&live, false, 600, 62).unwrap();
             assert_eq!(
@@ -1875,7 +1878,7 @@ mod tests {
             assert!(frame.pixels.chunks_exact(4).any(|pixel| pixel[3] > 0));
             assert_eq!(
                 rasterizer.baseline_cache_stats().0,
-                4,
+                2,
                 "the separator must reuse the Regular baseline instead of probing its zero-ink glyph"
             );
         });
@@ -1897,10 +1900,10 @@ mod tests {
                                     &state,
                                     &layout,
                                     dark_mode,
-                                    IsolatedComponent::Waveform,
+                                    IsolatedComponent::BrandMark,
                                 );
                                 let waveform = assert_component_is_contained_and_centered(
-                                    "waveform",
+                                    "Scribe brand mark",
                                     &waveform_frame,
                                     layout.recording_mark,
                                     layout.content_center_y,
@@ -1953,7 +1956,7 @@ mod tests {
                                     true,
                                 );
                                 assert_no_adjacent_ink_overlap(&[
-                                    ("waveform", waveform),
+                                    ("Scribe brand mark", waveform),
                                     ("elapsed time", elapsed),
                                     ("divider", divider),
                                     ("preview", preview),
@@ -2035,6 +2038,43 @@ mod tests {
     }
 
     #[test]
+    fn live_mode_without_a_started_preview_paints_only_the_reference_logo_and_timer_shell() {
+        with_rasterizer(|rasterizer| {
+            for dpi in [96, 120, 144, 192] {
+                let bounds = production_bounds(OverlayMode::Live, dpi);
+                let layout = DisplayLayout::from_bounds(OverlayMode::Live, bounds).unwrap();
+                for dark_mode in [false, true] {
+                    let mut unavailable = state(OverlayMode::Live);
+                    unavailable.live_preview_available = false;
+                    unavailable.transcript.committed = "must not leak".to_owned();
+                    unavailable.transcript.tentative = "into the overlay".to_owned();
+                    let rendered = rasterizer
+                        .render_display(&unavailable, dark_mode, bounds.width, bounds.height)
+                        .unwrap();
+                    let shell = live_shell_only_frame(rasterizer, &unavailable, &layout, dark_mode);
+                    assert_eq!(
+                        rendered, shell,
+                        "unavailable live preview painted divider or transcript content at {dpi} DPI"
+                    );
+
+                    let available = rasterizer
+                        .render_display(
+                            &state(OverlayMode::Live),
+                            dark_mode,
+                            bounds.width,
+                            bounds.height,
+                        )
+                        .unwrap();
+                    assert_ne!(
+                        available, shell,
+                        "started preview must add the divider and transcript at {dpi} DPI"
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
     fn control_frame_paints_only_a_transparent_x_surface() {
         let frame = with_rasterizer(|rasterizer| rasterizer.render_control(true, 44, 44).unwrap());
         assert_eq!(frame.alpha_at(0, 0), 0);
@@ -2048,36 +2088,19 @@ mod tests {
     }
 
     #[test]
-    fn production_raster_source_matches_pr50() {
-        const PR50_PRODUCTION_SHA256: &str =
-            "b55312b40a692f1edb70def84e7f374c2577fedcd0e8e1ad83d9b9bc9f9bf079";
-        let source = include_str!("raster.rs").replace("\r\n", "\n");
-        let production = source
-            .split_once("#[cfg(test)]\nmod tests")
-            .expect("native raster test-module boundary must remain explicit")
-            .0;
-
-        assert_eq!(
-            format!("{:x}", Sha256::digest(production.as_bytes())),
-            PR50_PRODUCTION_SHA256,
-            "production native raster source diverged from PR50 commit 1d50d02"
-        );
-    }
-
-    #[test]
-    fn pr50_fixture_checksums_are_valid() {
+    fn reference_contract_fixture_checksums_are_valid() {
         let fixture_root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("testdata")
-            .join("overlay-pr50");
+            .join("overlay-reference");
         let sums = std::fs::read_to_string(fixture_root.join("SHA256SUMS"))
-            .expect("read PR50 fixture checksums");
+            .expect("read reference-contract fixture checksums");
 
         for (line_number, line) in sums.lines().enumerate() {
             let (expected, name) = line
                 .split_once("  ")
                 .unwrap_or_else(|| panic!("invalid SHA256SUMS line {}", line_number + 1));
             let bytes = std::fs::read(fixture_root.join(name))
-                .unwrap_or_else(|error| panic!("read PR50 fixture {name}: {error}"));
+                .unwrap_or_else(|error| panic!("read reference-contract fixture {name}: {error}"));
             assert_eq!(
                 format!("{:x}", Sha256::digest(bytes)),
                 expected,
@@ -2087,10 +2110,10 @@ mod tests {
     }
 
     #[test]
-    fn pr50_native_overlay_raster_golden_frames_are_pixel_identical() {
+    fn reference_contract_native_overlay_raster_golden_frames_are_pixel_identical() {
         let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("testdata")
-            .join("overlay-pr50");
+            .join("overlay-reference");
         let scales = [(1, 1, "96"), (5, 4, "120"), (3, 2, "144"), (2, 1, "192")];
 
         with_rasterizer(|rasterizer| {
@@ -2111,8 +2134,8 @@ mod tests {
                         assert_eq!(
                             frame.pixels,
                             std::fs::read(fixture_root.join(format!("{name}-{theme}-{dpi}.bgra")))
-                                .expect("read immutable PR50 overlay fixture"),
-                            "{name} {theme} at {dpi} DPI diverged from PR50"
+                                .expect("read immutable reference-contract overlay fixture"),
+                            "{name} {theme} at {dpi} DPI diverged from the approved reference contract"
                         );
                     }
 
@@ -2126,8 +2149,8 @@ mod tests {
                     assert_eq!(
                         control.pixels,
                         std::fs::read(fixture_root.join(format!("cancel-{theme}-{dpi}.bgra")))
-                            .expect("read immutable PR50 cancel-control fixture"),
-                        "cancel control {theme} at {dpi} DPI diverged from PR50"
+                            .expect("read immutable reference-contract cancel-control fixture"),
+                        "cancel control {theme} at {dpi} DPI diverged from the approved reference contract"
                     );
                 }
             }
@@ -2140,8 +2163,8 @@ mod tests {
                     assert_eq!(
                         frame.pixels,
                         std::fs::read(fixture_root.join(format!("{name}-{theme}-96.bgra")))
-                            .expect("read immutable PR50 edge-state fixture"),
-                        "{name} {theme} at 96 DPI diverged from PR50"
+                            .expect("read immutable reference-contract edge-state fixture"),
+                        "{name} {theme} at 96 DPI diverged from the approved reference contract"
                     );
                 }
             }
@@ -2149,11 +2172,11 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "explicit fixture-maintenance tool; see testdata/overlay-pr50/MANIFEST.md"]
-    fn generate_pr50_overlay_fixture_candidate() {
+    #[ignore = "explicit fixture-maintenance tool; see testdata/overlay-reference/MANIFEST.md"]
+    fn generate_reference_contract_overlay_fixture_candidate() {
         let requested = std::path::PathBuf::from(
-            std::env::var_os("SCRIBE_PR50_GOLDEN_OUTPUT_DIR")
-                .expect("set SCRIBE_PR50_GOLDEN_OUTPUT_DIR to an external output directory"),
+            std::env::var_os("SCRIBE_OVERLAY_REFERENCE_OUTPUT_DIR")
+                .expect("set SCRIBE_OVERLAY_REFERENCE_OUTPUT_DIR to an external output directory"),
         );
         assert!(requested.is_absolute(), "fixture output must be absolute");
         let parent = requested
@@ -2246,7 +2269,7 @@ mod tests {
     }
 
     #[test]
-    fn transcript_tail_is_grapheme_safe_and_keeps_tentative_style() {
+    fn transcript_head_is_grapheme_safe_and_keeps_the_committed_prefix_visible() {
         let colors = NativeColors::for_theme(true);
         let state = OverlayViewState {
             transcript: super::super::super::controller::OverlayTranscript {
@@ -2258,10 +2281,11 @@ mod tests {
             ..OverlayViewState::default()
         };
         let line = live_line(&state, colors);
-        let tail = line.tail(4);
-        assert!(tail.text().starts_with('…'));
-        assert!(tail.text().ends_with("🧑🏽‍💻"));
-        assert_eq!(tail.sections.last().unwrap().style, TextStyle::Italic);
+        let head = line.head(9);
+        assert!(head.text().starts_with("prefix 👨‍👩‍👧‍👦"));
+        assert!(head.text().ends_with('…'));
+        assert_eq!(head.sections.last().unwrap().style, TextStyle::Regular);
+        assert_eq!(head.sections.last().unwrap().color, colors.muted_text);
     }
 
     #[test]
@@ -2279,9 +2303,8 @@ mod tests {
     }
 
     #[test]
-    fn reduced_motion_freezes_waveform_level_without_changing_audio_state() {
+    fn live_brand_mark_is_static_across_audio_levels() {
         let mut quiet = state(OverlayMode::Live);
-        quiet.reduced_motion = true;
         quiet.audio_level = OverlayAudioLevel::new(0.0, 0.0);
         let mut loud = quiet.clone();
         loud.audio_level = OverlayAudioLevel::new(1.0, 1.0);
@@ -2335,7 +2358,7 @@ mod tests {
         );
         assert_eq!(
             NativeColors::for_theme(true).waveform,
-            Argb::from_color(ThemePalette::dark().recording_waveform)
+            Argb::new(255, 178, 162, 255)
         );
     }
 }

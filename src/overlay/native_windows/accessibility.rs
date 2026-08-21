@@ -169,9 +169,13 @@ fn display_tree(
         return hidden_tree(WindowRole::Display);
     }
     let mut classes = NodeClassSet::new();
-    let preview_visible = state.mode == OverlayMode::Live;
-    let elapsed_visible = preview_visible || state.elapsed.is_some();
-    let mut children = vec![DISPLAY_STATUS_ID, DISPLAY_METER_ID];
+    let live_mode = state.mode == OverlayMode::Live;
+    let preview_visible = live_mode && state.live_preview_available;
+    let elapsed_visible = live_mode || state.elapsed.is_some();
+    let mut children = vec![DISPLAY_STATUS_ID];
+    if !live_mode {
+        children.push(DISPLAY_METER_ID);
+    }
     if elapsed_visible {
         children.push(DISPLAY_ELAPSED_ID);
     }
@@ -193,28 +197,38 @@ fn display_tree(
     } else {
         state.phase.label()
     };
-    let mut status = NodeBuilder::new(Role::StaticText);
-    status.set_name(status_name);
+    let mut status = NodeBuilder::new(if live_mode {
+        Role::Image
+    } else {
+        Role::StaticText
+    });
+    if live_mode {
+        status.set_name("Scribe");
+        status.set_description(status_name);
+    } else {
+        status.set_name(status_name);
+    }
     status.set_bounds(accesskit_rect(layout.status));
-
-    let level = state
-        .audio_level
-        .rms
-        .max(state.audio_level.peak * 0.7)
-        .clamp(0.0, 1.0);
-    let mut meter = NodeBuilder::new(Role::ProgressIndicator);
-    meter.set_name("Microphone input level");
-    meter.set_description(status_name);
-    meter.set_numeric_value((level * 100.0).round() as f64);
-    meter.set_min_numeric_value(0.0);
-    meter.set_max_numeric_value(100.0);
-    meter.set_bounds(accesskit_rect(layout.meter));
 
     let mut nodes = vec![
         (DISPLAY_ROOT_ID, root.build(&mut classes)),
         (DISPLAY_STATUS_ID, status.build(&mut classes)),
-        (DISPLAY_METER_ID, meter.build(&mut classes)),
     ];
+    if !live_mode {
+        let level = state
+            .audio_level
+            .rms
+            .max(state.audio_level.peak * 0.7)
+            .clamp(0.0, 1.0);
+        let mut meter = NodeBuilder::new(Role::ProgressIndicator);
+        meter.set_name("Microphone input level");
+        meter.set_description(status_name);
+        meter.set_numeric_value((level * 100.0).round() as f64);
+        meter.set_min_numeric_value(0.0);
+        meter.set_max_numeric_value(100.0);
+        meter.set_bounds(accesskit_rect(layout.meter));
+        nodes.push((DISPLAY_METER_ID, meter.build(&mut classes)));
+    }
     if elapsed_visible {
         let mut elapsed = NodeBuilder::new(Role::StaticText);
         elapsed.set_name(format!(
@@ -371,6 +385,7 @@ mod tests {
         let state = OverlayViewState {
             mode: OverlayMode::Live,
             phase: OverlayPhase::Listening,
+            live_preview_available: true,
             transcript: OverlayTranscript {
                 committed: "committed".to_owned(),
                 tentative: " tentative".to_owned(),
@@ -401,6 +416,46 @@ mod tests {
             *id == DISPLAY_ELAPSED_ID
                 && node.name() == Some("Elapsed time 00:00")
                 && node.live().is_none()
+        }));
+        assert!(tree.nodes.iter().any(|(id, node)| {
+            *id == DISPLAY_STATUS_ID && node.role() == Role::Image && node.name() == Some("Scribe")
+        }));
+        assert!(tree.nodes.iter().all(|(id, _)| *id != DISPLAY_METER_ID));
+    }
+
+    #[test]
+    fn live_tree_without_a_started_preview_exposes_only_logo_status_and_elapsed_time() {
+        let state = OverlayViewState {
+            mode: OverlayMode::Live,
+            phase: OverlayPhase::Listening,
+            live_preview_available: false,
+            elapsed: Some(std::time::Duration::from_secs(12)),
+            transcript: OverlayTranscript {
+                committed: "must not leak".to_owned(),
+                tentative: "into accessibility".to_owned(),
+                revision: 3,
+            },
+            transcript_announcement: Some("must not be announced".to_owned()),
+            ..OverlayViewState::default()
+        };
+        let bounds = display_bounds(OverlayMode::Live);
+        let layout = DisplayLayout::from_bounds(OverlayMode::Live, bounds).unwrap();
+        let tree = display_tree(&state, true, Some(bounds));
+
+        assert!(tree.nodes.iter().any(|(id, node)| {
+            *id == DISPLAY_ELAPSED_ID
+                && node.name() == Some("Elapsed time 00:12")
+                && node.bounds() == Some(accesskit_rect(layout.elapsed))
+        }));
+        assert!(tree.nodes.iter().any(|(id, node)| {
+            *id == DISPLAY_STATUS_ID
+                && node.role() == Role::Image
+                && node.name() == Some("Scribe")
+                && node.description() == Some("Scribe is recording")
+        }));
+        assert!(tree.nodes.iter().all(|(id, _)| *id != DISPLAY_METER_ID));
+        assert!(tree.nodes.iter().all(|(id, node)| {
+            *id != DISPLAY_PREVIEW_ID && *id != DISPLAY_ANNOUNCEMENT_ID && node.live().is_none()
         }));
     }
 
@@ -434,6 +489,7 @@ mod tests {
         let state = OverlayViewState {
             mode: OverlayMode::Live,
             phase: OverlayPhase::Listening,
+            live_preview_available: true,
             elapsed: Some(std::time::Duration::from_secs(12)),
             transcript_announcement: Some("Committed transcript: test".to_owned()),
             ..OverlayViewState::default()
@@ -452,20 +508,19 @@ mod tests {
         );
         assert_eq!(
             node(DISPLAY_STATUS_ID).bounds(),
-            Some(Rect::new(20.0, 20.25, 57.5, 57.75))
+            Some(Rect::new(23.75, 20.25, 61.25, 57.75))
         );
-        assert_eq!(
-            node(DISPLAY_METER_ID).bounds(),
-            node(DISPLAY_STATUS_ID).bounds()
-        );
+        assert_eq!(node(DISPLAY_STATUS_ID).role(), Role::Image);
+        assert_eq!(node(DISPLAY_STATUS_ID).name(), Some("Scribe"));
+        assert!(tree.nodes.iter().all(|(id, _)| *id != DISPLAY_METER_ID));
         assert_eq!(node(DISPLAY_ELAPSED_ID).name(), Some("Elapsed time 00:12"));
         assert_eq!(
             node(DISPLAY_ELAPSED_ID).bounds(),
-            Some(Rect::new(70.0, 24.625, 130.0, 53.375))
+            Some(Rect::new(90.0, 24.625, 150.0, 53.375))
         );
         assert_eq!(
             node(DISPLAY_PREVIEW_ID).bounds(),
-            Some(Rect::new(153.75, 24.625, 686.25, 53.375))
+            Some(Rect::new(177.5, 24.625, 686.25, 53.375))
         );
         assert_eq!(
             node(DISPLAY_ANNOUNCEMENT_ID).bounds(),
@@ -511,6 +566,7 @@ mod tests {
                 let state = OverlayViewState {
                     mode,
                     phase: OverlayPhase::Listening,
+                    live_preview_available: mode == OverlayMode::Live,
                     elapsed: Some(std::time::Duration::from_secs(12)),
                     ..OverlayViewState::default()
                 };
@@ -527,10 +583,14 @@ mod tests {
                     node(DISPLAY_STATUS_ID).bounds(),
                     Some(accesskit_rect(layout.status))
                 );
-                assert_eq!(
-                    node(DISPLAY_METER_ID).bounds(),
-                    Some(accesskit_rect(layout.meter))
-                );
+                if mode == OverlayMode::Live {
+                    assert!(tree.nodes.iter().all(|(id, _)| *id != DISPLAY_METER_ID));
+                } else {
+                    assert_eq!(
+                        node(DISPLAY_METER_ID).bounds(),
+                        Some(accesskit_rect(layout.meter))
+                    );
+                }
                 assert_eq!(
                     node(DISPLAY_ELAPSED_ID).bounds(),
                     Some(accesskit_rect(layout.elapsed))
