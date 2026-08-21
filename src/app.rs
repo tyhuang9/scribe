@@ -77,11 +77,12 @@ use crate::ui::{
     ModelReadiness, ModelSizeTier, ModelSpeedTier, ModelViewModel, ReadyModelPickerAction,
     RecordingMode, RecordingSettingsView, RemoteCatalogActionKind, RemoteCatalogActionView,
     RemoteCatalogEntryView, RemoteCatalogFilters, RemoteCatalogSort, RemoteCatalogStatusKind,
-    RemoteCatalogStatusView, RemoteCatalogVariantView, RemoteCatalogView, ScreenAction, ScreenView,
-    SettingsTab, SidebarModelView, ThemePalette, UiRoute, configure_accessible_style, history_page,
-    minimum_primary_target_height, recording_mode, render_screen,
-    request_models_route_heading_focus, scroll_focused_control_into_view, settings_save_state,
-    show_navigation, show_route_scroll, theme_palette, transcription_state, ui_palette,
+    RemoteCatalogStatusView, RemoteCatalogVariantView, RemoteCatalogView, ResolvedTheme,
+    ScreenAction, ScreenView, SettingsTab, SidebarModelView, ThemePalette, UiRoute,
+    configure_accessible_style, history_page, minimum_primary_target_height, recording_mode,
+    render_screen, request_models_route_heading_focus, scroll_focused_control_into_view,
+    settings_save_state, show_navigation, show_route_scroll, theme_palette, transcription_state,
+    ui_palette,
 };
 
 #[cfg(test)]
@@ -3241,6 +3242,7 @@ pub struct LocalTranscriberApp {
     transcript: String,
     raw_transcript: String,
     status_message: String,
+    theme_announcement: Option<String>,
     hotkey_input: String,
     model_search: String,
     model_language_filter: ModelLanguageFilter,
@@ -3434,6 +3436,7 @@ impl LocalTranscriberApp {
             transcript: String::new(),
             raw_transcript: String::new(),
             status_message,
+            theme_announcement: None,
             active_recording: None,
             pending_recording: None,
             abandoned_capture_cleanups: Vec::new(),
@@ -9458,17 +9461,31 @@ impl eframe::App for LocalTranscriberApp {
         let sidebar_models = Arc::clone(&self.remote_catalog.local_models);
         let sidebar_selected_model_id = self.config.general.selected_default_model.clone();
         let sidebar_disabled_reason = self.artifact_mutation_block_reason();
-        if let Some(action) = show_navigation(
+        let resolved_theme =
+            match resolve_theme_mode(self.config.general.theme_mode, frame.info().system_theme) {
+                ThemeMode::Dark => ResolvedTheme::Dark,
+                ThemeMode::Light | ThemeMode::System => ResolvedTheme::Light,
+            };
+        let (theme_action, model_action) = show_navigation(
             ctx,
             &mut self.current_tab,
             self.config.developer.debug_mode,
+            resolved_theme,
             SidebarModelView {
                 selected_model_id: Some(&sidebar_selected_model_id),
                 models: &sidebar_models,
                 disabled_reason: sidebar_disabled_reason.as_deref(),
             },
-        ) {
+        );
+        if theme_action != ScreenAction::None {
+            self.apply_settings_screen_action(theme_action);
+            ctx.request_repaint();
+        }
+        if let Some(action) = model_action {
             self.apply_ready_model_picker_action(action);
+        }
+        if let Some(message) = self.theme_announcement.take() {
+            paint_theme_change_status(ctx, &message);
         }
         self.sync_settings_playground_route();
         self.sync_passive_microphone_monitor();
@@ -9731,6 +9748,7 @@ impl LocalTranscriberApp {
             | ScreenAction::SetRestoreClipboardAfterInsert(_)
             | ScreenAction::SetPasteDelayMs(_)
             | ScreenAction::SetTheme(_)
+            | ScreenAction::ToggleResolvedTheme(_)
             | ScreenAction::SetOverlayMode(_)
             | ScreenAction::SetVadEnabled(_)
             | ScreenAction::SetSpeechConfirmationMs(_)
@@ -12224,6 +12242,16 @@ impl LocalTranscriberApp {
                 };
                 self.save_config();
             }
+            ScreenAction::ToggleResolvedTheme(resolved_theme) => {
+                let next_theme = match resolved_theme {
+                    ResolvedTheme::Dark => ThemeMode::Light,
+                    ResolvedTheme::Light => ThemeMode::Dark,
+                };
+                self.config.general.theme_mode = next_theme;
+                self.save_config();
+                self.status_message = format!("Theme changed to {}.", next_theme.label());
+                self.theme_announcement = Some(self.status_message.clone());
+            }
             ScreenAction::SetOverlayMode(value) => {
                 self.config.overlay.mode = match value.as_str() {
                     "Live preview" => OverlayMode::Live,
@@ -12595,6 +12623,22 @@ fn page(
 fn content_panel_frame(ctx: &egui::Context) -> Frame {
     let colors = theme_palette(ctx);
     Frame::none().fill(colors.content_bg)
+}
+
+fn paint_theme_change_status(ctx: &egui::Context, message: &str) {
+    let screen_rect = ctx.screen_rect();
+    egui::Area::new(egui::Id::new("theme-change-live-status"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(egui::pos2(screen_rect.max.x + 1.0, screen_rect.max.y + 1.0))
+        .show(ctx, |ui| {
+            let response = ui.label(message);
+            ui.ctx().accesskit_node_builder(response.id, |builder| {
+                builder.set_role(egui::accesskit::Role::Status);
+                builder.set_name(message);
+                builder.set_live(egui::accesskit::Live::Polite);
+                builder.set_live_atomic();
+            });
+        });
 }
 
 fn card(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)) {
@@ -19481,16 +19525,18 @@ mod layout_tests {
             |ctx| {
                 let sidebar_models = Arc::clone(&app.remote_catalog.local_models);
                 let selected_model_id = app.config.general.selected_default_model.clone();
-                if let Some(action) = show_navigation(
+                let (_, model_action) = show_navigation(
                     ctx,
                     &mut app.current_tab,
                     false,
+                    ResolvedTheme::Light,
                     SidebarModelView {
                         selected_model_id: Some(&selected_model_id),
                         models: &sidebar_models,
                         disabled_reason: None,
                     },
-                ) {
+                );
+                if let Some(action) = model_action {
                     app.apply_ready_model_picker_action(action);
                 }
                 egui::CentralPanel::default()
@@ -19673,7 +19719,13 @@ mod layout_tests {
     }
 
     fn show_test_navigation(ctx: &egui::Context, current_tab: &mut Tab) {
-        show_navigation(ctx, current_tab, true, SidebarModelView::default());
+        show_navigation(
+            ctx,
+            current_tab,
+            true,
+            ResolvedTheme::Light,
+            SidebarModelView::default(),
+        );
     }
 
     fn max_visible_painted_x(output: &egui::FullOutput) -> f32 {
@@ -19818,6 +19870,7 @@ mod layout_tests {
             transcript: String::new(),
             raw_transcript: String::new(),
             status_message: "Ready".to_owned(),
+            theme_announcement: None,
             active_recording: None,
             pending_recording: None,
             abandoned_capture_cleanups: Vec::new(),

@@ -27,7 +27,7 @@ pub(crate) use state::{
     ModelSizeTier, ModelSpeedTier, ModelViewModel, RecordingMode, RemoteCatalogActionKind,
     RemoteCatalogActionView, RemoteCatalogEntryView, RemoteCatalogFilters, RemoteCatalogSort,
     RemoteCatalogStatusKind, RemoteCatalogStatusView, RemoteCatalogVariantView, RemoteCatalogView,
-    SettingsTab, UiRoute,
+    ResolvedTheme, SettingsTab, UiRoute,
 };
 
 #[cfg(test)]
