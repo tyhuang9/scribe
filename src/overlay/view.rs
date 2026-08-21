@@ -257,7 +257,6 @@ fn render_cancel_control(context: &egui::Context) -> bool {
 struct OverlayColors {
     surface: Color32,
     border: Color32,
-    inner_highlight: Color32,
     text: Color32,
     muted_text: Color32,
     waveform: Color32,
@@ -280,7 +279,6 @@ fn overlay_colors(context: &egui::Context) -> OverlayColors {
             // shadow compensation.
             surface: Color32::from_rgba_unmultiplied(25, 26, 33, 184),
             border: Color32::from_rgba_unmultiplied(220, 229, 242, 36),
-            inner_highlight: Color32::from_rgba_unmultiplied(255, 255, 255, 18),
             text: palette.text,
             muted_text: Color32::from_rgb(210, 210, 216),
             // The supplied reference uses a purple brand mark. This slightly
@@ -297,7 +295,6 @@ fn overlay_colors(context: &egui::Context) -> OverlayColors {
         OverlayColors {
             surface: Color32::from_rgba_unmultiplied(248, 250, 253, 228),
             border: Color32::from_rgba_unmultiplied(35, 47, 66, 64),
-            inner_highlight: Color32::from_rgba_unmultiplied(255, 255, 255, 156),
             text: palette.text,
             muted_text: Color32::from_rgb(65, 75, 90),
             waveform: palette.recording_waveform,
@@ -403,9 +400,6 @@ fn render_overlay(context: &egui::Context, state: &OverlayViewState) {
                         );
                     });
             });
-            // The translucent surface must be painted before this subtle top edge;
-            // otherwise the frame fill would cover the highlight entirely.
-            paint_capsule_inner_highlight(ui, capsule_rect, rounding, colors.inner_highlight);
         });
 }
 
@@ -442,23 +436,6 @@ fn painted_capsule_bounds(viewport: egui::Rect, mode: OverlayMode) -> egui::Rect
 
 fn reserved_control_width() -> f32 {
     CONTROL_SIZE + CONTROL_CONTENT_GAP + CAPSULE_HORIZONTAL_INSET
-}
-
-fn paint_capsule_inner_highlight(
-    ui: &egui::Ui,
-    capsule: egui::Rect,
-    rounding: f32,
-    color: Color32,
-) {
-    let horizontal_inset = (rounding * 0.45).min(capsule.width() / 4.0);
-    let y = capsule.top() + 1.0;
-    ui.painter().line_segment(
-        [
-            egui::pos2(capsule.left() + horizontal_inset, y),
-            egui::pos2(capsule.right() - horizontal_inset, y),
-        ],
-        Stroke::new(0.5, color),
-    );
 }
 
 fn render_compact_status_row(ui: &mut egui::Ui, state: &OverlayViewState, colors: OverlayColors) {
@@ -1020,37 +997,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn inner_highlight_is_painted_after_the_translucent_surface() {
-        let context = egui::Context::default();
-        let colors = overlay_colors(&context);
-        let output = context.run(
-            egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    egui::vec2(LIVE_WIDTH, LIVE_HEIGHT),
-                )),
-                ..Default::default()
-            },
-            |context| render_overlay(context, &OverlayViewState::default()),
-        );
-        let highlight_index = output
-            .shapes
-            .iter()
-            .rposition(|shape| {
-                matches!(
-                    shape.shape,
-                    egui::epaint::Shape::LineSegment { stroke, .. }
-                        if stroke.color == colors.inner_highlight
-                )
-            })
-            .expect("overlay should paint its inner highlight");
-        assert!(
-            Some(highlight_index) == output.shapes.len().checked_sub(1),
-            "the inner highlight must be painted after the translucent surface and overlay content"
-        );
     }
 
     #[test]

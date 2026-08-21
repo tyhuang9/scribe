@@ -54,7 +54,6 @@ impl Argb {
 struct NativeColors {
     surface: Argb,
     border: Argb,
-    inner_highlight: Argb,
     text: Argb,
     muted_text: Argb,
     waveform: Argb,
@@ -76,7 +75,6 @@ impl NativeColors {
             Self {
                 surface: Argb::new(184, 52, 53, 61),
                 border: Argb::new(36, 220, 229, 242),
-                inner_highlight: Argb::new(18, 255, 255, 255),
                 text: Argb::from_color(palette.text),
                 muted_text: Argb::new(255, 210, 210, 216),
                 // Overlay-specific accessible variant of the reference purple.
@@ -91,7 +89,6 @@ impl NativeColors {
             Self {
                 surface: Argb::new(228, 248, 250, 253),
                 border: Argb::new(64, 35, 47, 66),
-                inner_highlight: Argb::new(156, 255, 255, 255),
                 text: Argb::from_color(palette.text),
                 muted_text: Argb::new(255, 65, 75, 90),
                 waveform: Argb::from_color(palette.recording_waveform),
@@ -436,15 +433,7 @@ fn draw_capsule(
         )?;
     }
     canvas.fill_rounded_rect(x, y, width, height, radius, colors.surface)?;
-    canvas.stroke_rounded_rect(x, y, width, height, radius, scale.max(1.0), colors.border)?;
-    canvas.draw_line(
-        x + radius * 0.45,
-        y + scale,
-        x + width - radius * 0.45,
-        y + scale,
-        (0.5 * scale).max(1.0),
-        colors.inner_highlight,
-    )
+    canvas.stroke_rounded_rect(x, y, width, height, radius, scale.max(1.0), colors.border)
 }
 
 fn draw_live(
