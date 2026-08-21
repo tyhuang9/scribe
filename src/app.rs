@@ -3211,6 +3211,7 @@ pub struct LocalTranscriberApp {
     transcript: String,
     raw_transcript: String,
     status_message: String,
+    theme_announcement: Option<String>,
     hotkey_input: String,
     model_search: String,
     model_language_filter: ModelLanguageFilter,
@@ -3402,6 +3403,7 @@ impl LocalTranscriberApp {
             transcript: String::new(),
             raw_transcript: String::new(),
             status_message,
+            theme_announcement: None,
             active_recording: None,
             pending_recording: None,
             abandoned_capture_cleanups: Vec::new(),
@@ -9361,6 +9363,9 @@ impl eframe::App for LocalTranscriberApp {
             self.apply_settings_screen_action(navigation_action);
             ctx.request_repaint();
         }
+        if let Some(message) = self.theme_announcement.take() {
+            paint_theme_change_status(ctx, &message);
+        }
         self.sync_settings_playground_route();
         self.sync_passive_microphone_monitor();
         egui::CentralPanel::default()
@@ -12098,11 +12103,14 @@ impl LocalTranscriberApp {
                 self.save_config();
             }
             ScreenAction::ToggleResolvedTheme(resolved_theme) => {
-                self.config.general.theme_mode = match resolved_theme {
+                let next_theme = match resolved_theme {
                     ResolvedTheme::Dark => ThemeMode::Light,
                     ResolvedTheme::Light => ThemeMode::Dark,
                 };
+                self.config.general.theme_mode = next_theme;
                 self.save_config();
+                self.status_message = format!("Theme changed to {}.", next_theme.label());
+                self.theme_announcement = Some(self.status_message.clone());
             }
             ScreenAction::SetOverlayMode(value) => {
                 self.config.overlay.mode = match value.as_str() {
@@ -12414,6 +12422,22 @@ fn paint_viewport_background(ctx: &egui::Context) {
         0.0,
         colors.content_bg,
     );
+}
+
+fn paint_theme_change_status(ctx: &egui::Context, message: &str) {
+    let screen_rect = ctx.screen_rect();
+    egui::Area::new(egui::Id::new("theme-change-live-status"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(egui::pos2(screen_rect.max.x + 1.0, screen_rect.max.y + 1.0))
+        .show(ctx, |ui| {
+            let response = ui.label(message);
+            ui.ctx().accesskit_node_builder(response.id, |builder| {
+                builder.set_role(egui::accesskit::Role::Status);
+                builder.set_name(message);
+                builder.set_live(egui::accesskit::Live::Polite);
+                builder.set_live_atomic();
+            });
+        });
 }
 
 fn page(
@@ -14870,8 +14894,57 @@ mod layout_tests {
             app.apply_settings_screen_action(ScreenAction::ToggleResolvedTheme(resolved_theme));
 
             assert_eq!(app.config.general.theme_mode, expected);
-            assert_eq!(app.status_message, "Settings saved");
+            assert_eq!(
+                app.status_message,
+                format!("Theme changed to {}.", expected.label())
+            );
         }
+    }
+
+    #[test]
+    fn shell_theme_toggle_announces_the_resulting_theme_politely() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_stitch_style(&ctx);
+        ctx.set_visuals(stitch_visuals(ThemeMode::Light));
+        let mut app = test_app();
+        app.current_tab = Tab::Transcribe;
+        app.apply_settings_screen_action(ScreenAction::ToggleResolvedTheme(ResolvedTheme::Light));
+        let message = app
+            .theme_announcement
+            .take()
+            .expect("theme toggle should queue an accessibility announcement");
+
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(960.0, 680.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                paint_theme_change_status(ctx, &message);
+                egui::CentralPanel::default()
+                    .frame(content_panel_frame(ctx))
+                    .show(ctx, |ui| {
+                        show_route_scroll(ui, UiRoute::Transcribe, |ui| app.ui_transcribe(ui));
+                    });
+            },
+        );
+        let notice = output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .unwrap()
+            .nodes
+            .iter()
+            .map(|(_, node)| node)
+            .find(|node| node.name() == Some("Theme changed to Dark."))
+            .expect("theme change result should be exposed to accessibility");
+        assert_eq!(notice.role(), egui::accesskit::Role::Status);
+        assert_eq!(notice.live(), Some(egui::accesskit::Live::Polite));
+        assert!(notice.is_live_atomic());
     }
 
     #[test]
@@ -19335,6 +19408,7 @@ mod layout_tests {
             transcript: String::new(),
             raw_transcript: String::new(),
             status_message: "Ready".to_owned(),
+            theme_announcement: None,
             active_recording: None,
             pending_recording: None,
             abandoned_capture_cleanups: Vec::new(),

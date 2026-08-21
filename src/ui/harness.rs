@@ -336,6 +336,7 @@ impl Fixture {
             remote_catalog: remote_catalog_fixture(),
             settings,
             settings_playground_open: false,
+            theme_announcement: None,
         }
     }
 }
@@ -400,6 +401,7 @@ fn model(
 struct FixtureData {
     route: UiRoute,
     transcription: TranscriptionState,
+    theme_announcement: Option<String>,
     models: Vec<ModelViewModel>,
     model_catalog: Vec<ModelViewModel>,
     comparison: ModelComparisonState,
@@ -662,6 +664,9 @@ fn show_harness(ctx: &egui::Context, data: &mut FixtureData, page: &mut AppPage)
             ResolvedTheme::Light
         },
     );
+    if let Some(message) = data.theme_announcement.take() {
+        paint_theme_change_status(ctx, &message);
+    }
     if *page != AppPage::General || !matches!(data.route, UiRoute::Settings(_)) {
         data.settings_playground_open = false;
     }
@@ -693,6 +698,22 @@ fn show_harness(ctx: &egui::Context, data: &mut FixtureData, page: &mut AppPage)
     } else {
         navigation_action
     }
+}
+
+fn paint_theme_change_status(ctx: &egui::Context, message: &str) {
+    let screen_rect = ctx.screen_rect();
+    egui::Area::new(egui::Id::new("harness-theme-change-live-status"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(egui::pos2(screen_rect.max.x + 1.0, screen_rect.max.y + 1.0))
+        .show(ctx, |ui| {
+            let response = ui.label(message);
+            ui.ctx().accesskit_node_builder(response.id, |builder| {
+                builder.set_role(egui::accesskit::Role::Status);
+                builder.set_name(message);
+                builder.set_live(egui::accesskit::Live::Polite);
+                builder.set_live_atomic();
+            });
+        });
 }
 
 fn apply_action(data: &mut FixtureData, page: &mut AppPage, action: ScreenAction) {
@@ -944,11 +965,12 @@ fn apply_action(data: &mut FixtureData, page: &mut AppPage, action: ScreenAction
         ScreenAction::OpenModelSettings => *page = AppPage::Models,
         ScreenAction::SetTheme(value) => data.settings.theme_label = value,
         ScreenAction::ToggleResolvedTheme(resolved_theme) => {
-            data.settings.theme_label = match resolved_theme {
+            let next_theme = match resolved_theme {
                 ResolvedTheme::Dark => "Light",
                 ResolvedTheme::Light => "Dark",
-            }
-            .into()
+            };
+            data.settings.theme_label = next_theme.into();
+            data.theme_announcement = Some(format!("Theme changed to {next_theme}."));
         }
         ScreenAction::SetOverlayMode(value) => data.settings.overlay_label = value,
         ScreenAction::SetRecordingMode(mode) => data.transcription.recording_mode = mode,
@@ -1079,9 +1101,69 @@ mod tests {
                 )],
             );
             apply_harness_action(&ctx, &mut data, &mut page, action);
+            let output = render_with_input(&ctx, &mut data, &mut page, 960.0, 680.0, Vec::new()).0;
+            let expected_notice = format!("Theme changed to {expected_label}.");
 
             assert_eq!(ctx.style().visuals.dark_mode, expected_dark);
             assert_eq!(data.settings.theme_label, expected_label);
+            assert_eq!(theme_status_count(&output, &expected_notice), 1);
+            let next = render_with_input(&ctx, &mut data, &mut page, 960.0, 680.0, Vec::new()).0;
+            assert_eq!(theme_status_count(&next, &expected_notice), 0);
+        }
+    }
+
+    #[test]
+    fn harness_theme_toggle_status_is_one_shot_across_primary_routes() {
+        for fixture in [
+            Fixture::TranscribeReady,
+            Fixture::ModelsInstalled,
+            Fixture::History,
+            Fixture::SettingsRecording,
+        ] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            configure_harness_style(&ctx, false);
+            let mut data = fixture.data();
+            let mut page = fixture.page();
+            let (initial, initial_action) =
+                render_with_input(&ctx, &mut data, &mut page, 960.0, 680.0, Vec::new());
+            assert_eq!(initial_action, ScreenAction::None, "{fixture:?}");
+            let target = named_node_id(&initial, "Switch to dark theme");
+            let (_, action) = render_with_input(
+                &ctx,
+                &mut data,
+                &mut page,
+                960.0,
+                680.0,
+                vec![egui::Event::AccessKitActionRequest(
+                    egui::accesskit::ActionRequest {
+                        action: egui::accesskit::Action::Default,
+                        target,
+                        data: None,
+                    },
+                )],
+            );
+            assert_eq!(
+                action,
+                ScreenAction::ToggleResolvedTheme(ResolvedTheme::Light),
+                "{fixture:?}"
+            );
+            apply_harness_action(&ctx, &mut data, &mut page, action);
+            let expected_notice = "Theme changed to Dark.";
+            let activation =
+                render_with_input(&ctx, &mut data, &mut page, 960.0, 680.0, Vec::new()).0;
+            assert_eq!(
+                theme_status_count(&activation, expected_notice),
+                1,
+                "{fixture:?} should announce once on activation frame"
+            );
+            assert_ne!(data.transcription.notice.as_deref(), Some(expected_notice));
+            let next = render_with_input(&ctx, &mut data, &mut page, 960.0, 680.0, Vec::new()).0;
+            assert_eq!(
+                theme_status_count(&next, expected_notice),
+                0,
+                "{fixture:?} should not repeat the announcement"
+            );
         }
     }
 
@@ -1407,6 +1489,23 @@ mod tests {
                         && node.is_live_atomic()
                 })
         );
+    }
+
+    fn theme_status_count(output: &egui::FullOutput, expected: &str) -> usize {
+        output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .unwrap()
+            .nodes
+            .iter()
+            .filter(|(_, node)| {
+                node.role() == egui::accesskit::Role::Status
+                    && node.name() == Some(expected)
+                    && node.live() == Some(egui::accesskit::Live::Polite)
+                    && node.is_live_atomic()
+            })
+            .count()
     }
 
     fn assert_near(actual: f64, expected: f64, label: &str) {

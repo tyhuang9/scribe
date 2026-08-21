@@ -146,30 +146,18 @@ pub(crate) fn show_navigation(
                 colors.muted_text,
             );
             ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-                let (icon, label, accessible_name) = match resolved_theme {
-                    ResolvedTheme::Dark => (Icon::Sun, "Light theme", "Switch to light theme"),
-                    ResolvedTheme::Light => (Icon::Moon, "Dark theme", "Switch to dark theme"),
+                let (icon, accessible_name) = match resolved_theme {
+                    ResolvedTheme::Dark => (Icon::Sun, "Switch to light theme"),
+                    ResolvedTheme::Light => (Icon::Moon, "Switch to dark theme"),
                 };
-                let response = match mode {
-                    NavigationMode::Full => theme_full_button(
-                        ui,
-                        icon,
-                        label,
-                        accessible_name,
-                        colors.active_card_bg,
-                        colors.text,
-                        colors.muted_text,
-                    ),
-                    NavigationMode::Compact => nav_icon_button(
-                        ui,
-                        icon,
-                        accessible_name,
-                        false,
-                        colors.active_card_bg,
-                        colors.text,
-                        colors.muted_text,
-                    ),
-                };
+                let response = theme_icon_button(
+                    ui,
+                    icon,
+                    accessible_name,
+                    colors.active_card_bg,
+                    colors.text,
+                    colors.muted_text,
+                );
                 response.widget_info(|| {
                     egui::WidgetInfo::labeled(egui::WidgetType::Button, accessible_name)
                 });
@@ -304,17 +292,15 @@ fn nav_full_button(
     response
 }
 
-fn theme_full_button(
+fn theme_icon_button(
     ui: &mut egui::Ui,
     icon: Icon,
-    label: &str,
     accessible_name: &str,
     hover_fill: Color32,
     text: Color32,
     muted: Color32,
 ) -> egui::Response {
-    let width = ui.available_width();
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 44.0), Sense::click());
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(44.0), Sense::click());
     let fill = if response.hovered() {
         hover_fill.gamma_multiply(0.45)
     } else {
@@ -328,14 +314,8 @@ fn theme_full_button(
         egui::FontId::proportional(22.0),
         if response.hovered() { text } else { muted },
     );
-    ui.painter().text(
-        rect.min + Vec2::new(46.0, 21.0),
-        egui::Align2::LEFT_CENTER,
-        label,
-        egui::FontId::proportional(15.0),
-        if response.hovered() { text } else { muted },
-    );
     paint_focus_ring(ui, &response, Rounding::same(5.0));
+    focus_tooltip(ui, &response, accessible_name);
     response.on_hover_text(accessible_name)
 }
 
@@ -605,16 +585,23 @@ mod tests {
     }
 
     #[test]
-    fn full_navigation_paints_the_theme_label() {
-        let ctx = egui::Context::default();
-        ctx.enable_accesskit();
-        let (output, _) = render_navigation(&ctx, 1_180.0, ResolvedTheme::Light, Vec::new());
-        assert!(output.shapes.iter().any(|shape| {
-            matches!(
-                &shape.shape,
-                egui::epaint::Shape::Text(text) if text.galley.text() == "Dark theme"
-            )
-        }));
+    fn expanded_and_compact_theme_toggles_are_icon_only_and_minimal() {
+        for width in [1_180.0, 960.0] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            let (output, _) = render_navigation(&ctx, width, ResolvedTheme::Light, Vec::new());
+            let (_, node) = named_node(&output, "Switch to dark theme");
+            let bounds = node.bounds().expect("theme target bounds");
+            assert_eq!(bounds.x1 - bounds.x0, 44.0);
+            assert!(!output.shapes.iter().any(|shape| {
+                matches!(
+                    &shape.shape,
+                    egui::epaint::Shape::Text(text)
+                        if text.galley.text() == "Dark theme"
+                            || text.galley.text() == "Light theme"
+                )
+            }));
+        }
     }
 
     #[test]
