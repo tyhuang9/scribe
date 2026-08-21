@@ -5762,7 +5762,11 @@ impl LocalTranscriberApp {
     fn apply_history_action(&mut self, action: HistoryPageAction) {
         match action {
             HistoryPageAction::ApplySearch => {
-                self.history_applied_search = self.history_search.trim().to_owned();
+                let search = self.history_search.trim().to_owned();
+                if search == self.history_applied_search {
+                    return;
+                }
+                self.history_applied_search = search;
                 self.history_records.clear();
                 self.history_next = None;
                 self.request_history_page(false);
@@ -5770,6 +5774,7 @@ impl LocalTranscriberApp {
             HistoryPageAction::ClearSearch => {
                 self.history_search.clear();
                 self.history_applied_search.clear();
+                self.history_search_focus_pending = true;
                 self.history_records.clear();
                 self.history_next = None;
                 self.request_history_page(false);
@@ -14485,6 +14490,35 @@ mod layout_tests {
 
     static NEXT_TEST_SESSION: AtomicU64 = AtomicU64::new(1);
 
+    #[derive(Default)]
+    struct NoopAccessKitChangeHandler;
+
+    impl accesskit_consumer::TreeChangeHandler for NoopAccessKitChangeHandler {
+        fn node_added(&mut self, _node: &accesskit_consumer::Node<'_>) {}
+
+        fn node_updated(
+            &mut self,
+            _old_node: &accesskit_consumer::DetachedNode,
+            _new_node: &accesskit_consumer::Node<'_>,
+        ) {
+        }
+
+        fn focus_moved(
+            &mut self,
+            _old_node: Option<&accesskit_consumer::DetachedNode>,
+            _new_node: Option<&accesskit_consumer::Node<'_>>,
+            _current_state: &accesskit_consumer::TreeState,
+        ) {
+        }
+
+        fn node_removed(
+            &mut self,
+            _node: &accesskit_consumer::DetachedNode,
+            _current_state: &accesskit_consumer::TreeState,
+        ) {
+        }
+    }
+
     #[test]
     fn start_tab_env_parser_accepts_known_tabs() {
         assert_eq!(tab_from_env_value("models"), Some(Tab::Models));
@@ -16979,6 +17013,23 @@ mod layout_tests {
     }
 
     #[test]
+    fn applying_an_unchanged_normalized_history_search_does_not_reload() {
+        let mut app = test_app();
+        app.history_search = "  meeting  ".into();
+        app.history_applied_search = "meeting".into();
+        app.history_query_sequence = 7;
+
+        app.apply_history_action(HistoryPageAction::ApplySearch);
+
+        assert_eq!(app.history_applied_search, "meeting");
+        assert_eq!(
+            app.history_query_sequence, 7,
+            "an unchanged live-search query must not start another history request"
+        );
+        assert!(!app.history_loading);
+    }
+
+    #[test]
     fn clearing_history_search_immediately_loads_an_unfiltered_first_page() {
         let mut app = test_app();
         let history_root = std::env::temp_dir().join(format!(
@@ -17028,6 +17079,10 @@ mod layout_tests {
 
         assert!(app.history_search.is_empty());
         assert!(app.history_applied_search.is_empty());
+        assert!(
+            app.history_search_focus_pending,
+            "clearing history must return focus to the search input next frame"
+        );
         assert!(app.history_records.is_empty());
         assert!(
             app.history_loading,
@@ -23764,11 +23819,9 @@ mod layout_tests {
             .iter()
             .find(|(_, node)| {
                 node.role() == egui::accesskit::Role::Group
-                    && node
-                        .name()
-                        .is_some_and(|name| name.contains("model whisper_cpp_base_en"))
+                    && node.name() == Some("History results")
             })
-            .expect("missing contextual history group");
+            .expect("missing stable History results group");
         let contextual_heading_id = update
             .nodes
             .iter()
@@ -23788,8 +23841,20 @@ mod layout_tests {
             })
             .map(|(id, _)| *id)
             .expect("missing history delete action");
-        assert!(group.1.children().contains(&contextual_heading_id));
-        assert!(group.1.children().contains(&delete_id));
+        let is_group_descendant = |target| {
+            let mut pending = group.1.children().to_vec();
+            while let Some(id) = pending.pop() {
+                if id == target {
+                    return true;
+                }
+                if let Some((_, node)) = update.nodes.iter().find(|(node_id, _)| *node_id == id) {
+                    pending.extend_from_slice(node.children());
+                }
+            }
+            false
+        };
+        assert!(is_group_descendant(contextual_heading_id));
+        assert!(is_group_descendant(delete_id));
         assert!(update.nodes.iter().any(|(_, node)| {
             node.name() == Some("1 history entries loaded")
                 && node.live() == Some(egui::accesskit::Live::Polite)
@@ -23815,6 +23880,93 @@ mod layout_tests {
             .find(|node| node.name() == Some("Raw transcript"))
             .expect("missing raw transcript disclosure");
         assert_eq!(disclosure.is_expanded(), Some(false));
+    }
+
+    #[test]
+    fn live_history_search_keeps_real_app_accesskit_updates_consumer_safe() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_stitch_style(&ctx);
+        let mut app = test_app();
+        app.current_tab = Tab::History;
+        let history_root = std::env::temp_dir().join(format!(
+            "scribe-history-accesskit-live-search-{}-{}",
+            std::process::id(),
+            NEXT_TEST_SESSION.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&history_root);
+        app.history_store = Some(
+            HistoryStore::open(&history_root, HistoryRetentionPolicy::default())
+                .expect("History test store should open"),
+        );
+        let record = HistoryRecord {
+            id: 1,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            completed_at_ms: Some(1),
+            status: HistoryStatus::Completed,
+            raw_text: "meeting transcript".to_owned(),
+            final_text: Some("meeting transcript".to_owned()),
+            model_id: "whisper_cpp_base_en".to_owned(),
+            metrics: HistoryMetrics::default(),
+            pinned: false,
+            source_app: None,
+            audio_path: None,
+            failure: None,
+            retry_count: 0,
+            output_outcome: None,
+        };
+        app.history_records = vec![record.clone()];
+        app.history_search_focus_pending = true;
+
+        let render = |app: &mut LocalTranscriberApp, events: Vec<egui::Event>| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1_024.0, 900.0),
+                    )),
+                    focused: true,
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    show_test_navigation(ctx, &mut app.current_tab);
+                    egui::CentralPanel::default()
+                        .frame(content_panel_frame(ctx))
+                        .show(ctx, |ui| {
+                            show_route_scroll(ui, UiRoute::History, |ui| app.ui_history(ui))
+                        });
+                },
+            )
+            .platform_output
+            .accesskit_update
+            .expect("History should expose AccessKit")
+        };
+
+        let initial = render(&mut app, Vec::new());
+        let mut consumer = accesskit_consumer::Tree::new(initial, true);
+        let settled = render(&mut app, Vec::new());
+        consumer.update_and_process_changes(settled, &mut NoopAccessKitChangeHandler);
+
+        // This is the real empty -> first-character transition: it adds the
+        // conditional Clear action while ui_history applies live search,
+        // clears record cards, and enters the loading body in the same frame.
+        let typed = render(&mut app, vec![egui::Event::Text("m".into())]);
+        assert_eq!(app.history_search, "m");
+        assert!(app.history_records.is_empty());
+        assert!(app.history_loading);
+        consumer.update_and_process_changes(typed, &mut NoopAccessKitChangeHandler);
+
+        let loading = render(&mut app, Vec::new());
+        consumer.update_and_process_changes(loading, &mut NoopAccessKitChangeHandler);
+        app.history_loading = false;
+        app.history_records = vec![record];
+        let filtered = render(&mut app, Vec::new());
+        consumer.update_and_process_changes(filtered, &mut NoopAccessKitChangeHandler);
+
+        drop(app);
+        let _ = std::fs::remove_dir_all(history_root);
     }
 
     #[test]

@@ -80,12 +80,17 @@ fn main() -> eframe::Result<()> {
     result
 }
 
+/// The native app never presents route content below this logical viewport.
+/// Component tests still cover narrower content regions directly so their
+/// fallback layout is deterministic without weakening this production limit.
+pub(crate) const MIN_APP_INNER_SIZE: [f32; 2] = [960.0, 680.0];
+
 fn native_options() -> eframe::NativeOptions {
     let inner_size = initial_window_size();
     eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size(inner_size)
-            .with_min_inner_size([960.0, 680.0])
+            .with_min_inner_size(MIN_APP_INNER_SIZE)
             .with_resizable(true)
             .with_transparent(root_viewport_requests_transparency(cfg!(
                 target_os = "windows"

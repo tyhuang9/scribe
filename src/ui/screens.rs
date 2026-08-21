@@ -10,8 +10,8 @@ use eframe::egui::{
 use super::{
     about_page,
     controls::{
-        ButtonTone, Icon, button, card, focus_tooltip, icon_glyph, keycap, keycap_width,
-        paint_focus_ring, search_field,
+        ButtonTone, Icon, SearchFieldResponse, button, card, focus_tooltip, icon_glyph, keycap,
+        keycap_width, paint_focus_ring, search_field,
     },
     state::{
         ComparisonPhase, ComparisonResultPhase, ModelCardKey, ModelComparisonState, ModelDialog,
@@ -130,6 +130,16 @@ fn current_content_width(ui: &egui::Ui) -> f32 {
     (available.max.x.min(clip.max.x).min(viewport.max.x)
         - available.min.x.max(clip.min.x).max(viewport.min.x))
     .max(0.0)
+}
+
+fn models_content_width(ui: &egui::Ui) -> f32 {
+    // egui 0.27 leaves one trailing item-spacing slot in the Models content
+    // UI's reported available width. Flexible rows that consume the full
+    // value otherwise paint exactly one gap beyond the route's right edge.
+    let reported = current_content_width(ui);
+    (reported - ui.spacing().item_spacing.x)
+        .max(44.0)
+        .min(reported)
 }
 
 fn selector_text_width(ui: &egui::Ui, text: &str, font: egui::FontId) -> f32 {
@@ -1852,6 +1862,32 @@ fn local_model_matches(
                 .is_some_and(|description| description.to_ascii_lowercase().contains(query)))
 }
 
+fn remote_catalog_variant_matches(
+    entry: &RemoteCatalogEntryView,
+    variant: &RemoteCatalogVariantView,
+    query: &str,
+    language_filter: ModelLanguageFilter,
+) -> bool {
+    language_filter.matches(&entry.languages)
+        && (query.is_empty()
+            || [
+                entry.display_name.as_str(),
+                entry.description.as_str(),
+                entry.language_summary.as_str(),
+                entry.repository.as_str(),
+                variant.id.as_str(),
+                variant.filename.as_str(),
+                variant.size_label.as_str(),
+                variant.accuracy_guidance.as_str(),
+            ]
+            .into_iter()
+            .any(|field| field.to_ascii_lowercase().contains(query))
+            || variant
+                .status_label
+                .as_deref()
+                .is_some_and(|status| status.to_ascii_lowercase().contains(query)))
+}
+
 fn build_model_card_lists<'a>(
     models: &'a [ModelViewModel],
     model_catalog: &'a [ModelViewModel],
@@ -1875,17 +1911,23 @@ fn build_model_card_lists<'a>(
         .map(ModelCard::Local)
         .collect::<Vec<_>>();
     available.extend(remote_catalog.entries.iter().flat_map(|entry| {
-        entry.variants.iter().filter_map(|variant| {
-            let duplicates_local = variant
-                .normalized_model_id
-                .as_deref()
-                .is_some_and(|id| known_ids.contains(id))
-                || variant
-                    .managed_model_id
+        entry
+            .variants
+            .iter()
+            .filter(|variant| {
+                remote_catalog_variant_matches(entry, variant, &query, language_filter)
+            })
+            .filter_map(|variant| {
+                let duplicates_local = variant
+                    .normalized_model_id
                     .as_deref()
-                    .is_some_and(|id| known_ids.contains(id));
-            (!duplicates_local).then_some(ModelCard::Remote(entry, variant))
-        })
+                    .is_some_and(|id| known_ids.contains(id))
+                    || variant
+                        .managed_model_id
+                        .as_deref()
+                        .is_some_and(|id| known_ids.contains(id));
+                (!duplicates_local).then_some(ModelCard::Remote(entry, variant))
+            })
     }));
     (installed, available)
 }
@@ -2931,6 +2973,298 @@ fn compact_model_icon_action(
     }
     paint_focus_ring(ui, &response, Rounding::same(7.0));
     response
+}
+
+fn model_language_filter_control(
+    ui: &mut egui::Ui,
+    selected: &mut ModelLanguageFilter,
+    compact: bool,
+) -> egui::Response {
+    if compact {
+        return compact_model_language_filter_control(ui, selected);
+    }
+    let combo = ComboBox::from_id_source("models-language")
+        .selected_text(format!("{}  {}", icon_glyph(Icon::Globe), selected.label()))
+        .width(156.0)
+        .show_ui(ui, |ui| {
+            for value in ModelLanguageFilter::ALL {
+                ui.selectable_value(selected, value, value.label());
+            }
+        });
+    ui.ctx()
+        .accesskit_node_builder(combo.response.id, |builder| {
+            builder.set_name("Filter model languages")
+        });
+    combo.response
+}
+
+fn compact_model_language_filter_control(
+    ui: &mut egui::Ui,
+    selected: &mut ModelLanguageFilter,
+) -> egui::Response {
+    #[derive(Clone)]
+    struct DeferredFocusRestore {
+        trigger: egui::Id,
+        popup_focus_ids: Vec<egui::Id>,
+    }
+
+    let colors = ui_palette(ui);
+    let popup_id = ui.make_persistent_id("models-language-popup");
+    let restore_id = popup_id.with("focus-restore");
+    if let Some(restore) = ui.data(|data| data.get_temp::<DeferredFocusRestore>(restore_id)) {
+        ui.data_mut(|data| data.remove::<DeferredFocusRestore>(restore_id));
+        let focused = ui.memory(|memory| memory.focused());
+        if focused.is_none() || focused.is_some_and(|id| restore.popup_focus_ids.contains(&id)) {
+            ui.memory_mut(|memory| memory.request_focus(restore.trigger));
+        }
+    }
+    let (target, response) = ui.allocate_exact_size(Vec2::splat(44.0), Sense::click());
+    let mut expanded = ui.memory(|memory| memory.is_popup_open(popup_id));
+    let keyboard_activate = response.has_focus()
+        && ui.input(|input| {
+            input.key_pressed(egui::Key::Enter) || input.key_pressed(egui::Key::Space)
+        });
+    if response.clicked() || keyboard_activate {
+        ui.memory_mut(|memory| memory.toggle_popup(popup_id));
+        expanded = ui.memory(|memory| memory.is_popup_open(popup_id));
+    }
+    let escape_pressed = expanded && ui.input(|input| input.key_pressed(egui::Key::Escape));
+    let mut selected_from_popup = false;
+    let mut popup_focus_ids = Vec::new();
+    if expanded && !escape_pressed {
+        egui::popup::popup_below_widget(ui, popup_id, &response, |ui| {
+            for value in ModelLanguageFilter::ALL {
+                let option = ui.selectable_value(selected, value, value.label());
+                popup_focus_ids.push(option.id);
+                let keyboard_select = option.has_focus()
+                    && ui.input(|input| {
+                        input.key_pressed(egui::Key::Enter) || input.key_pressed(egui::Key::Space)
+                    });
+                if option.clicked() || keyboard_select {
+                    *selected = value;
+                    selected_from_popup = true;
+                }
+            }
+        });
+    }
+    let clicked_elsewhere = expanded && response.clicked_elsewhere();
+    if selected_from_popup || escape_pressed {
+        ui.memory_mut(|memory| memory.close_popup());
+        response.request_focus();
+        expanded = false;
+    } else if clicked_elsewhere {
+        let focused = ui.memory(|memory| memory.focused());
+        ui.memory_mut(|memory| memory.close_popup());
+        let needs_focus_restore = match focused {
+            None => true,
+            Some(id) => id == response.id || popup_focus_ids.contains(&id),
+        };
+        if needs_focus_restore {
+            ui.data_mut(|data| {
+                data.insert_temp(
+                    restore_id,
+                    DeferredFocusRestore {
+                        trigger: response.id,
+                        popup_focus_ids,
+                    },
+                );
+            });
+        }
+        expanded = false;
+    }
+    if response.hovered() || response.has_focus() || expanded {
+        ui.painter()
+            .rect_filled(target, Rounding::same(5.0), colors.active_card_bg);
+    }
+    ui.painter().text(
+        target.center(),
+        Align2::CENTER_CENTER,
+        icon_glyph(Icon::Globe),
+        egui::FontId::proportional(18.0),
+        colors.muted_text,
+    );
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::ComboBox, "Filter model languages")
+    });
+    ui.ctx().accesskit_node_builder(response.id, |builder| {
+        builder.set_role(egui::accesskit::Role::ComboBox);
+        builder.set_name("Filter model languages");
+        builder.set_description(format!("Current language filter: {}", selected.label()));
+        builder.set_expanded(expanded);
+        builder.set_bounds(accesskit_rect(target));
+    });
+    paint_focus_ring(ui, &response, Rounding::same(5.0));
+    focus_tooltip(ui, &response, "Filter model languages");
+    response.on_hover_text("Filter model languages")
+}
+
+struct ModelCatalogActions {
+    action: ScreenAction,
+    #[cfg(test)]
+    refresh: egui::Response,
+    #[cfg(test)]
+    import: egui::Response,
+}
+
+fn model_catalog_actions(
+    ui: &mut egui::Ui,
+    management: &ModelManagementState,
+    restore_remove_target_gone: bool,
+    remote_catalog: &RemoteCatalogView,
+) -> ModelCatalogActions {
+    let refresh = compact_model_icon_action(
+        ui,
+        Icon::Refresh,
+        "Refresh trusted model catalog",
+        remote_catalog.refresh_enabled,
+        (!remote_catalog.refresh_enabled).then_some("The catalog is already refreshing."),
+        None,
+    );
+    let import = compact_model_icon_action(ui, Icon::Plus, "Import local GGUF", true, None, None);
+    if management.restore_add_focus
+        || management.restore_after_removal_focus
+        || restore_remove_target_gone
+    {
+        import.request_focus();
+    }
+    let action = if refresh.clicked() && remote_catalog.refresh_enabled {
+        ScreenAction::RetryRemoteCatalog
+    } else if import.clicked() {
+        ScreenAction::AddModel
+    } else {
+        ScreenAction::None
+    };
+    ModelCatalogActions {
+        action,
+        #[cfg(test)]
+        refresh,
+        #[cfg(test)]
+        import,
+    }
+}
+
+struct ModelToolbarResponse {
+    search: SearchFieldResponse,
+    selected: ModelLanguageFilter,
+    action: ScreenAction,
+    #[cfg(test)]
+    language: egui::Response,
+    #[cfg(test)]
+    refresh: egui::Response,
+    #[cfg(test)]
+    import: egui::Response,
+}
+
+fn model_toolbar(
+    ui: &mut egui::Ui,
+    query: &mut String,
+    management: &ModelManagementState,
+    restore_remove_target_gone: bool,
+    language_filter: ModelLanguageFilter,
+    remote_catalog: &RemoteCatalogView,
+) -> ModelToolbarResponse {
+    let inline_toolbar_width = 160.0 + 156.0 + 44.0 * 2.0 + ui.spacing().item_spacing.x * 3.0;
+    let toolbar_width = models_content_width(ui);
+    let mut language = None;
+    let (search, selected, catalog_actions) = if toolbar_width >= inline_toolbar_width {
+        let mut search = None;
+        let mut selected = language_filter;
+        let mut catalog_actions = None;
+        ui.horizontal(|ui| {
+            let reserved = 156.0 + 44.0 * 2.0 + ui.spacing().item_spacing.x * 3.0;
+            search = Some(search_field(
+                ui,
+                (toolbar_width - reserved).max(160.0),
+                "models-search",
+                query,
+                "Search models",
+                "Search models by name, language, or variant",
+                "Filters installed and available models as you type.",
+            ));
+            language = Some(model_language_filter_control(ui, &mut selected, false));
+            catalog_actions = Some(model_catalog_actions(
+                ui,
+                management,
+                restore_remove_target_gone,
+                remote_catalog,
+            ));
+        });
+        (
+            search.expect("the inline models toolbar always renders search"),
+            selected,
+            catalog_actions.expect("the inline models toolbar always renders actions"),
+        )
+    } else {
+        let search = search_field(
+            ui,
+            toolbar_width,
+            "models-search",
+            query,
+            "Search models",
+            "Search models by name, language, or variant",
+            "Filters installed and available models as you type.",
+        );
+        ui.add_space(8.0);
+        let mut selected = language_filter;
+        let mut catalog_actions = None;
+        let compact_language = toolbar_width < 260.0;
+        if toolbar_width >= if compact_language { 148.0 } else { 260.0 } {
+            ui.horizontal(|ui| {
+                language = Some(model_language_filter_control(
+                    ui,
+                    &mut selected,
+                    compact_language,
+                ));
+                catalog_actions = Some(model_catalog_actions(
+                    ui,
+                    management,
+                    restore_remove_target_gone,
+                    remote_catalog,
+                ));
+            });
+        } else {
+            // Preserve visual and keyboard order without forcing a narrow
+            // route to scroll horizontally. At 45px the globe-only filter
+            // and each action take their own 44px row.
+            language = Some(model_language_filter_control(ui, &mut selected, true));
+            ui.add_space(8.0);
+            if toolbar_width >= 96.0 {
+                ui.horizontal(|ui| {
+                    catalog_actions = Some(model_catalog_actions(
+                        ui,
+                        management,
+                        restore_remove_target_gone,
+                        remote_catalog,
+                    ));
+                });
+            } else {
+                catalog_actions = Some(model_catalog_actions(
+                    ui,
+                    management,
+                    restore_remove_target_gone,
+                    remote_catalog,
+                ));
+            }
+        }
+        (
+            search,
+            selected,
+            catalog_actions.expect("the narrow models toolbar always renders actions"),
+        )
+    };
+    #[cfg(not(test))]
+    let _ = language;
+    ModelToolbarResponse {
+        search,
+        selected,
+        action: catalog_actions.action,
+        #[cfg(test)]
+        language: language.expect("the models toolbar always renders the language filter"),
+        #[cfg(test)]
+        refresh: catalog_actions.refresh,
+        #[cfg(test)]
+        import: catalog_actions.import,
+    }
 }
 
 fn model_lifecycle_button(
@@ -4160,20 +4494,13 @@ fn render_model_section(
     name: &'static str,
     cards: &[ModelCard<'_>],
     expanded: bool,
-    toggle_action: Option<ScreenAction>,
+    toggle_action: ScreenAction,
     focus: ModelSectionFocus,
     _terminal: bool,
 ) -> (ScreenAction, bool) {
     let colors = ui_palette(ui);
-    let toggle_enabled = toggle_action.is_some();
-    let (header_rect, header) = ui.allocate_exact_size(
-        Vec2::new(ui.available_width(), 44.0),
-        if toggle_enabled {
-            Sense::click()
-        } else {
-            Sense::hover()
-        },
-    );
+    let (header_rect, header) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 44.0), Sense::click());
     if header.hovered() {
         ui.painter()
             .rect_filled(header_rect, Rounding::same(5.0), colors.active_card_bg);
@@ -4195,23 +4522,17 @@ fn render_model_section(
     });
     ui.ctx().accesskit_node_builder(header.id, |builder| {
         builder.set_role(egui::accesskit::Role::Button);
-        if toggle_enabled {
-            builder.set_name(format!(
-                "{} {name} models",
-                if expanded { "Collapse" } else { "Expand" }
-            ));
-        } else {
-            builder.set_name(format!("{name} models expanded for search"));
-            builder.set_disabled();
-            builder.set_description("Clear the search to restore this section's saved state.");
-        }
+        builder.set_name(format!(
+            "{} {name} models",
+            if expanded { "Collapse" } else { "Expand" }
+        ));
         builder.set_expanded(expanded);
         builder.set_bounds(accesskit_rect(header_rect));
     });
     paint_focus_ring(ui, &header, Rounding::same(5.0));
     scroll_focused_control_into_view(ui, &header);
     let mut action = if header.clicked() {
-        toggle_action.unwrap_or(ScreenAction::None)
+        toggle_action
     } else {
         ScreenAction::None
     };
@@ -4260,10 +4581,9 @@ fn models(
     // A native scroll viewport can reserve space that is not reflected in the
     // inherited layout width. Bound this route to the actually paintable area
     // so card frames and trailing controls keep their right inset.
-    ui.set_width(current_content_width(ui));
+    ui.set_width(models_content_width(ui));
     let colors = ui_palette(ui);
     let mut action = ScreenAction::None;
-    let mut import_control = None;
     let mut restored_remove_focus = false;
     let dialog_active = management.dialog.is_some();
     let restore_remove_target_gone = management
@@ -4286,61 +4606,24 @@ fn models(
     );
     ui.add_space(18.0);
     let mut query = remote_catalog.query.clone();
-    let search = search_field(
+    let toolbar = model_toolbar(
         ui,
-        ui.available_width(),
-        "models-search",
         &mut query,
-        "Search models",
-        "Search models by name, language, or variant",
-        "Filters installed and available models as you type.",
+        management,
+        restore_remove_target_gone,
+        language_filter,
+        remote_catalog,
     );
-    if search.changed {
+    if toolbar.search.changed {
         action = ScreenAction::SetRemoteCatalogQuery(query);
     }
-    if search.clear_requested {
+    if toolbar.search.clear_requested {
         action = ScreenAction::SetRemoteCatalogQuery(String::new());
     }
-    ui.add_space(8.0);
-    ui.horizontal(|ui| {
-        let mut selected = language_filter;
-        let combo = ComboBox::from_id_source("models-language")
-            .selected_text(format!("{}  {}", icon_glyph(Icon::Globe), selected.label()))
-            .width(156.0)
-            .show_ui(ui, |ui| {
-                for value in ModelLanguageFilter::ALL {
-                    ui.selectable_value(&mut selected, value, value.label());
-                }
-            });
-        ui.ctx().accesskit_node_builder(combo.response.id, |builder| builder.set_name("Filter model languages"));
-        if selected != language_filter {
-            action = ScreenAction::SetModelLanguageFilter(selected);
-        }
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            let import = compact_model_icon_action(ui, Icon::Plus, "Import local GGUF", true, None, None);
-            if management.restore_add_focus
-                || management.restore_after_removal_focus
-                || restore_remove_target_gone
-            {
-                import.request_focus();
-            }
-            import_control = Some(import.clone());
-            if import.clicked() {
-                action = ScreenAction::AddModel;
-            }
-            let refresh = compact_model_icon_action(
-                ui,
-                Icon::Refresh,
-                "Refresh trusted model catalog",
-                remote_catalog.refresh_enabled,
-                (!remote_catalog.refresh_enabled).then_some("The catalog is already refreshing."),
-                None,
-            );
-            if refresh.clicked() && remote_catalog.refresh_enabled {
-                action = ScreenAction::RetryRemoteCatalog;
-            }
-        });
-    });
+    if toolbar.selected != language_filter {
+        action = ScreenAction::SetModelLanguageFilter(toolbar.selected);
+    }
+    merge_model_action(&mut action, toolbar.action);
     ui.add_space(8.0);
     if matches!(
         remote_catalog.status.kind,
@@ -4395,7 +4678,6 @@ fn models(
         .filter(|model| model.installed && model.ready)
         .count()
         > 1;
-    let search_active = !remote_catalog.query.trim().is_empty();
     let comparison_viewport = ui
         .data(|data| data.get_temp::<egui::Rect>(egui::Id::new(("route-viewport", UiRoute::Models))))
         .unwrap_or_else(|| ui.clip_rect());
@@ -4424,10 +4706,8 @@ fn models(
             ui,
             "Installed",
             &installed_cards,
-            management.installed_expanded
-                || search_active
-                || management.restore_remove_focus.is_some(),
-            (!search_active).then_some(ScreenAction::ToggleInstalledModels),
+            management.installed_expanded || management.restore_remove_focus.is_some(),
+            ScreenAction::ToggleInstalledModels,
             ModelSectionFocus {
                 expanded: management.expanded_model_card.as_ref(),
                 can_replace_active,
@@ -4441,8 +4721,8 @@ fn models(
             ui,
             "Available",
             &available_cards,
-            management.available_expanded || search_active,
-            (!search_active).then_some(ScreenAction::ToggleAvailableModels),
+            management.available_expanded,
+            ScreenAction::ToggleAvailableModels,
             ModelSectionFocus {
                 expanded: management.expanded_model_card.as_ref(),
                 can_replace_active,
@@ -7407,7 +7687,7 @@ mod tests {
     use super::*;
     use crate::{
         history::{HistoryMetrics, HistoryRecord, HistoryStatus},
-        ui::{HistoryPageState, history_page},
+        ui::{HistoryPageAction, HistoryPageState, history_page, theme::ThemePalette},
     };
 
     type AccessKitNodes = std::collections::HashMap<egui::accesskit::NodeId, egui::accesskit::Node>;
@@ -7418,6 +7698,35 @@ mod tests {
         OrphanedNodes,
         OrphanedNodes,
     );
+
+    #[derive(Default)]
+    struct NoopAccessKitChangeHandler;
+
+    impl accesskit_consumer::TreeChangeHandler for NoopAccessKitChangeHandler {
+        fn node_added(&mut self, _node: &accesskit_consumer::Node<'_>) {}
+
+        fn node_updated(
+            &mut self,
+            _old_node: &accesskit_consumer::DetachedNode,
+            _new_node: &accesskit_consumer::Node<'_>,
+        ) {
+        }
+
+        fn focus_moved(
+            &mut self,
+            _old_node: Option<&accesskit_consumer::DetachedNode>,
+            _new_node: Option<&accesskit_consumer::Node<'_>>,
+            _current_state: &accesskit_consumer::TreeState,
+        ) {
+        }
+
+        fn node_removed(
+            &mut self,
+            _node: &accesskit_consumer::DetachedNode,
+            _current_state: &accesskit_consumer::TreeState,
+        ) {
+        }
+    }
 
     /// Mirrors the orphan-removal pass in AccessKit consumer 0.16.1. This is
     /// intentionally exercised against egui's real consecutive TreeUpdates:
@@ -7527,6 +7836,558 @@ mod tests {
         assert_eq!(wrapped.right(), identity.right());
         assert_eq!(wrapped.center().y, 40.0);
         assert!(identity.contains_rect(wrapped));
+    }
+
+    #[test]
+    fn models_search_preserves_saved_section_state_and_toggle_actions() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        crate::ui::controls::configure_accessible_style(&ctx);
+        let installed = ModelViewModel {
+            id: "matching-installed".into(),
+            display_name: "Matching installed model".into(),
+            installed: true,
+            ready: true,
+            languages: vec!["en".into()],
+            ..Default::default()
+        };
+        let available = ModelViewModel {
+            id: "matching-available".into(),
+            display_name: "Matching available model".into(),
+            languages: vec!["en".into()],
+            ..Default::default()
+        };
+        let management = ModelManagementState {
+            installed_expanded: false,
+            available_expanded: false,
+            ..Default::default()
+        };
+        let remote_catalog = RemoteCatalogView {
+            query: "matching".into(),
+            refresh_enabled: true,
+            ..Default::default()
+        };
+        let render = |events| {
+            let mut action = ScreenAction::None;
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        Vec2::new(680.0, 500.0),
+                    )),
+                    events,
+                    focused: true,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        action = models(
+                            ui,
+                            std::slice::from_ref(&installed),
+                            std::slice::from_ref(&available),
+                            &ModelComparisonState::default(),
+                            &management,
+                            ModelLanguageFilter::All,
+                            &remote_catalog,
+                        );
+                    });
+                },
+            );
+            (output, action)
+        };
+        let (initial, action) = render(Vec::new());
+        assert_eq!(action, ScreenAction::None);
+        let nodes = &initial
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .expect("models search should update AccessKit")
+            .nodes;
+        assert!(nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::Status
+                && node.name() == Some("2 model results: 1 installed, 1 available.")
+        }));
+        for name in ["Expand Installed models", "Expand Available models"] {
+            let node = nodes
+                .iter()
+                .find_map(|(_, node)| (node.name() == Some(name)).then_some(node))
+                .unwrap_or_else(|| panic!("missing active-search toggle: {name}"));
+            assert_eq!(node.role(), egui::accesskit::Role::Button);
+            assert!(
+                !node.is_disabled(),
+                "{name} must remain available during search"
+            );
+        }
+        let installed_bounds = named_role_bounds(
+            &initial,
+            "Expand Installed models",
+            egui::accesskit::Role::Button,
+        );
+        let click_point = accesskit_rect_center(installed_bounds);
+        let _ = render(vec![egui::Event::PointerButton {
+            pos: click_point,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        let (_, action) = render(vec![egui::Event::PointerButton {
+            pos: click_point,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        assert_eq!(action, ScreenAction::ToggleInstalledModels);
+    }
+
+    struct ModelToolbarBounds {
+        content: egui::Rect,
+        search: egui::Rect,
+        language: egui::Rect,
+        refresh: egui::Rect,
+        import: egui::Rect,
+    }
+
+    fn render_model_toolbar_in_content_region(
+        width: f32,
+        dark_mode: bool,
+        text_scale: f32,
+    ) -> ModelToolbarBounds {
+        let management = ModelManagementState::default();
+        let remote_catalog = RemoteCatalogView {
+            refresh_enabled: true,
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        crate::ui::controls::configure_accessible_style(&ctx);
+        ctx.set_visuals(if dark_mode {
+            egui::Visuals::dark()
+        } else {
+            egui::Visuals::light()
+        });
+        if text_scale > 1.0 {
+            ctx.style_mut(|style| {
+                for font in style.text_styles.values_mut() {
+                    font.size *= text_scale;
+                }
+            });
+        }
+        let mut bounds = None;
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(1_000.0, 500.0),
+                )),
+                focused: true,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    // This harness supplies the toolbar's exact content
+                    // width, avoiding panel-margin artifacts. ui_palette
+                    // derives Scribe's ThemePalette from these visuals.
+                    assert_eq!(
+                        ui_palette(ui).panel_bg,
+                        if dark_mode {
+                            ThemePalette::dark().panel_bg
+                        } else {
+                            ThemePalette::light().panel_bg
+                        }
+                    );
+                    let content =
+                        egui::Rect::from_min_size(ui.cursor().min, Vec2::new(width, 320.0));
+                    ui.allocate_ui_at_rect(content, |ui| {
+                        ui.set_width(content.width());
+                        let mut query = String::new();
+                        let toolbar = model_toolbar(
+                            ui,
+                            &mut query,
+                            &management,
+                            false,
+                            ModelLanguageFilter::All,
+                            &remote_catalog,
+                        );
+                        bounds = Some(ModelToolbarBounds {
+                            content,
+                            search: toolbar.search.input.rect,
+                            language: toolbar.language.rect,
+                            refresh: toolbar.refresh.rect,
+                            import: toolbar.import.rect,
+                        });
+                    });
+                });
+            },
+        );
+        bounds.expect("toolbar content harness should render every visible control")
+    }
+
+    #[test]
+    fn models_toolbar_reflows_inside_exact_content_regions() {
+        for (width, dark_mode, text_scale) in [
+            (45.0, false, 1.0),
+            (120.0, true, 1.0),
+            (220.0, false, 1.5),
+            (220.0, true, 1.5),
+            (680.0, false, 1.0),
+        ] {
+            let bounds = render_model_toolbar_in_content_region(width, dark_mode, text_scale);
+            for (name, control) in [
+                ("Search models", bounds.search),
+                ("Filter model languages", bounds.language),
+                ("Refresh trusted model catalog", bounds.refresh),
+                ("Import local GGUF", bounds.import),
+            ] {
+                assert!(
+                    bounds.content.contains_rect(control),
+                    "{name} must stay inside the provided {width}px content region: content={:?}, control={control:?}",
+                    bounds.content,
+                );
+                assert!(
+                    control.width() >= 44.0 && control.height() >= 44.0,
+                    "{name} must retain a 44px target at width {width}: {control:?}"
+                );
+            }
+            assert!(
+                (bounds.search.top() - bounds.content.top()).abs() < 1.0,
+                "search input must retain first-row priority at width {width}"
+            );
+            match width as i32 {
+                680 => {
+                    assert!(
+                        (bounds.search.top() - bounds.language.top()).abs() < 1.0
+                            && bounds.search.left() <= bounds.language.left()
+                            && bounds.language.left() <= bounds.refresh.left()
+                            && bounds.refresh.right() <= bounds.import.left(),
+                        "wide toolbar must keep search and controls adjacent in visual/tab order"
+                    );
+                }
+                220 => {
+                    assert!(
+                        bounds.search.bottom() <= bounds.language.top()
+                            && (bounds.language.top() - bounds.refresh.top()).abs() < 1.0
+                            && bounds.language.left() <= bounds.refresh.left()
+                            && bounds.refresh.right() <= bounds.import.left(),
+                        "220px toolbar must reflow search before compact controls without changing order"
+                    );
+                }
+                120 => {
+                    assert!(
+                        bounds.search.bottom() <= bounds.language.top()
+                            && bounds.language.bottom() <= bounds.refresh.top()
+                            && (bounds.refresh.top() - bounds.import.top()).abs() < 1.0
+                            && bounds.refresh.right() <= bounds.import.left(),
+                        "120px toolbar must stack search and language before adjacent actions"
+                    );
+                }
+                45 => {
+                    assert!(
+                        bounds.search.bottom() <= bounds.language.top()
+                            && bounds.language.bottom() <= bounds.refresh.top()
+                            && bounds.refresh.bottom() <= bounds.import.top(),
+                        "45px toolbar must defer auxiliary controls into contained rows"
+                    );
+                }
+                _ => unreachable!("test widths are explicit"),
+            }
+        }
+    }
+
+    #[test]
+    fn narrow_toolbar_component_tests_are_below_the_real_app_minimum() {
+        assert_eq!(crate::MIN_APP_INNER_SIZE, [960.0, 680.0]);
+        assert!(
+            [45.0, 120.0, 220.0]
+                .into_iter()
+                .all(|width| width < crate::MIN_APP_INNER_SIZE[0]),
+            "sub-44 component widths exercise fallback behavior; the native app cannot expose them as a viewport"
+        );
+    }
+
+    #[test]
+    fn compact_language_filter_preserves_selection_popup_and_keyboard_contracts() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        crate::ui::controls::configure_accessible_style(&ctx);
+        let mut selected = ModelLanguageFilter::All;
+        let render = |selected: &mut ModelLanguageFilter, events| {
+            let mut response = None;
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        Vec2::new(320.0, 320.0),
+                    )),
+                    events,
+                    focused: true,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        response = Some(compact_model_language_filter_control(ui, selected));
+                    });
+                },
+            );
+            (
+                output,
+                response.expect("compact language filter should render"),
+            )
+        };
+        let (_, language) = render(&mut selected, Vec::new());
+        assert_eq!(language.rect.size(), Vec2::splat(44.0));
+        let point = language.rect.center();
+        let _ = render(&mut selected, vec![primary_pointer_event(point, true)]);
+        let (activated, _) = render(&mut selected, vec![primary_pointer_event(point, false)]);
+        assert!(
+            compact_language_filter_expanded(&activated),
+            "pointer activation must announce the expanded state in the activation frame"
+        );
+        let (open, _) = render(&mut selected, Vec::new());
+        let nodes = &open
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .expect("open compact filter should update AccessKit")
+            .nodes;
+        assert!(nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::ComboBox
+                && node.name() == Some("Filter model languages")
+                && node.is_expanded() == Some(true)
+        }));
+        let english = nodes
+            .iter()
+            .find_map(|(_, node)| {
+                (node.name() == Some("English"))
+                    .then(|| node.bounds())
+                    .flatten()
+            })
+            .expect("open filter should expose its English option");
+        assert!(
+            nodes
+                .iter()
+                .any(|(_, node)| node.name() == Some("All languages"))
+        );
+        assert!(
+            nodes
+                .iter()
+                .any(|(_, node)| node.name() == Some("Multilingual"))
+        );
+        let english_point = accesskit_rect_center(english);
+        let _ = render(
+            &mut selected,
+            vec![primary_pointer_event(english_point, true)],
+        );
+        let (selection_frame, trigger_after_selection) = render(
+            &mut selected,
+            vec![primary_pointer_event(english_point, false)],
+        );
+        assert_eq!(selected, ModelLanguageFilter::English);
+        assert!(
+            !compact_language_filter_expanded(&selection_frame),
+            "selecting an option must announce the collapsed state in the selection frame"
+        );
+        assert_eq!(
+            ctx.memory(|memory| memory.focused()),
+            Some(trigger_after_selection.id),
+            "pointer selection must restore focus to the compact filter trigger"
+        );
+        let (selected_output, _) = render(&mut selected, Vec::new());
+        let selected_node = selected_output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .and_then(|update| {
+                update.nodes.iter().find_map(|(_, node)| {
+                    (node.role() == egui::accesskit::Role::ComboBox
+                        && node.name() == Some("Filter model languages"))
+                    .then_some(node)
+                })
+            })
+            .expect("compact filter should retain its accessible name");
+        assert_eq!(
+            selected_node.description(),
+            Some("Current language filter: English")
+        );
+        selected = ModelLanguageFilter::All;
+        let (_, language) = render(&mut selected, Vec::new());
+        ctx.memory_mut(|memory| memory.request_focus(language.id));
+        let (keyboard_activation, _) = render(
+            &mut selected,
+            vec![key_press(egui::Key::Enter, egui::Modifiers::NONE)],
+        );
+        assert!(
+            compact_language_filter_expanded(&keyboard_activation),
+            "keyboard activation must announce expanded without waiting for another frame"
+        );
+        // This follows egui's real focus order from the trigger into the
+        // popup and then from the current filter to English.
+        for _ in 0..3 {
+            let _ = render(
+                &mut selected,
+                vec![key_press(egui::Key::Tab, egui::Modifiers::NONE)],
+            );
+        }
+        let (keyboard_selection, trigger_after_keyboard_selection) = render(
+            &mut selected,
+            vec![key_press(egui::Key::Enter, egui::Modifiers::NONE)],
+        );
+        assert_eq!(selected, ModelLanguageFilter::English);
+        assert!(
+            !compact_language_filter_expanded(&keyboard_selection),
+            "keyboard selection must announce collapsed in the selection frame"
+        );
+        assert_eq!(
+            ctx.memory(|memory| memory.focused()),
+            Some(trigger_after_keyboard_selection.id),
+            "keyboard selection must restore trigger focus"
+        );
+        let _ = render(
+            &mut selected,
+            vec![key_press(egui::Key::Enter, egui::Modifiers::NONE)],
+        );
+        let (escape_frame, trigger_after_escape) = render(
+            &mut selected,
+            vec![key_press(egui::Key::Escape, egui::Modifiers::NONE)],
+        );
+        assert!(
+            !compact_language_filter_expanded(&escape_frame),
+            "Escape must announce collapsed in the closing frame"
+        );
+        assert_eq!(
+            ctx.memory(|memory| memory.focused()),
+            Some(trigger_after_escape.id),
+            "Escape must restore focus to the compact filter trigger"
+        );
+        let (closed, _) = render(&mut selected, Vec::new());
+        assert!(
+            closed
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .is_some_and(|update| update.nodes.iter().any(|(_, node)| {
+                    node.role() == egui::accesskit::Role::ComboBox
+                        && node.name() == Some("Filter model languages")
+                        && node.is_expanded() == Some(false)
+                }))
+        );
+    }
+
+    #[test]
+    fn compact_language_filter_restores_or_preserves_focus_after_popup_close() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        crate::ui::controls::configure_accessible_style(&ctx);
+        let mut selected = ModelLanguageFilter::All;
+        let previous_text = std::cell::RefCell::new(String::new());
+        let next_text = std::cell::RefCell::new(String::new());
+        let render = |selected: &mut ModelLanguageFilter, events| {
+            let mut previous = None;
+            let mut trigger = None;
+            let mut next = None;
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        Vec2::new(400.0, 400.0),
+                    )),
+                    events,
+                    focused: true,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        ui.horizontal(|ui| {
+                            previous = Some({
+                                let mut text = previous_text.borrow_mut();
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut *text)
+                                        .hint_text("Previous focus target"),
+                                )
+                            });
+                            trigger = Some(compact_model_language_filter_control(ui, selected));
+                            next = Some({
+                                let mut text = next_text.borrow_mut();
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut *text)
+                                        .hint_text("Next focus target"),
+                                )
+                            });
+                        });
+                    });
+                },
+            );
+            (
+                output,
+                previous.expect("previous focus target should render"),
+                trigger.expect("compact filter should render"),
+                next.expect("next focus target should render"),
+            )
+        };
+        let (_, previous, trigger, _next) = render(&mut selected, Vec::new());
+        let open_popup = |selected: &mut ModelLanguageFilter| {
+            let _ = render(
+                selected,
+                vec![primary_pointer_event(trigger.rect.center(), true)],
+            );
+            render(
+                selected,
+                vec![primary_pointer_event(trigger.rect.center(), false)],
+            )
+        };
+        let (opened, _, _trigger, next) = open_popup(&mut selected);
+        assert!(compact_language_filter_expanded(&opened));
+        let _ = render(
+            &mut selected,
+            vec![primary_pointer_event(next.rect.center(), true)],
+        );
+        let (outside_destination, _, _trigger, next) = render(
+            &mut selected,
+            vec![primary_pointer_event(next.rect.center(), false)],
+        );
+        assert!(!compact_language_filter_expanded(&outside_destination));
+        let _ = render(&mut selected, Vec::new());
+        assert_eq!(
+            ctx.memory(|memory| memory.focused()),
+            Some(next.id),
+            "outside click must preserve a real focusable destination"
+        );
+
+        let (reopened, _, _trigger, _) = open_popup(&mut selected);
+        assert!(compact_language_filter_expanded(&reopened));
+        let blank = egui::pos2(360.0, 360.0);
+        let _ = render(&mut selected, vec![primary_pointer_event(blank, true)]);
+        let (outside_blank, _, trigger, _) =
+            render(&mut selected, vec![primary_pointer_event(blank, false)]);
+        assert!(!compact_language_filter_expanded(&outside_blank));
+        let _ = render(&mut selected, Vec::new());
+        assert_eq!(
+            ctx.memory(|memory| memory.focused()),
+            Some(trigger.id),
+            "outside click without a focus destination must restore the trigger"
+        );
+
+        let _ = render(
+            &mut selected,
+            vec![key_press(egui::Key::Tab, egui::Modifiers::NONE)],
+        );
+        assert_eq!(
+            ctx.memory(|memory| memory.focused()),
+            Some(next.id),
+            "Tab should continue from the restored trigger to the next control"
+        );
+        ctx.memory_mut(|memory| memory.request_focus(trigger.id));
+        let _ = render(
+            &mut selected,
+            vec![key_press(egui::Key::Tab, egui::Modifiers::SHIFT)],
+        );
+        // egui schedules backwards tab traversal for the next frame so the
+        // destination can receive its gained-focus state.
+        let _ = render(&mut selected, Vec::new());
+        assert_eq!(
+            ctx.memory(|memory| memory.focused()),
+            Some(previous.id),
+            "Shift+Tab should continue from the trigger to the previous control"
+        );
     }
 
     #[test]
@@ -9607,6 +10468,174 @@ mod tests {
     }
 
     #[test]
+    fn remote_catalog_cards_apply_query_language_and_duplicate_filters() {
+        let known_local = ModelViewModel {
+            id: "known-local".into(),
+            display_name: "Installed duplicate target".into(),
+            installed: true,
+            ready: true,
+            languages: vec!["en".into()],
+            ..Default::default()
+        };
+        let entries = vec![
+            RemoteCatalogEntryView {
+                id: "acme/english-archive".into(),
+                display_name: "English Archive".into(),
+                description: "Production transcription for English recordings.".into(),
+                languages: vec!["en".into()],
+                language_summary: "English only".into(),
+                repository: "acme/english-archive".into(),
+                variants: vec![
+                    RemoteCatalogVariantView {
+                        id: "english-q5-balanced".into(),
+                        filename: "english-q5.gguf".into(),
+                        size_label: "512 MB".into(),
+                        status_label: Some("Stable".into()),
+                        accuracy_guidance: "Balanced accuracy".into(),
+                        ..Default::default()
+                    },
+                    RemoteCatalogVariantView {
+                        id: "english-experimental".into(),
+                        filename: "english-fast.gguf".into(),
+                        size_label: "410 MB".into(),
+                        status_label: Some("Experimental candidate".into()),
+                        accuracy_guidance: "Fast transcription".into(),
+                        ..Default::default()
+                    },
+                    RemoteCatalogVariantView {
+                        id: "english-normalized-duplicate".into(),
+                        filename: "english-duplicate.gguf".into(),
+                        accuracy_guidance: "Balanced accuracy".into(),
+                        normalized_model_id: Some("known-local".into()),
+                        ..Default::default()
+                    },
+                    RemoteCatalogVariantView {
+                        id: "english-managed-duplicate".into(),
+                        filename: "english-managed-duplicate.gguf".into(),
+                        accuracy_guidance: "Balanced accuracy".into(),
+                        managed_model_id: Some("known-local".into()),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+            RemoteCatalogEntryView {
+                id: "acme/world".into(),
+                display_name: "World Speech".into(),
+                description: "Multilingual transcription.".into(),
+                languages: vec!["en".into(), "es".into()],
+                language_summary: "English, Spanish".into(),
+                repository: "acme/world".into(),
+                variants: vec![RemoteCatalogVariantView {
+                    id: "world-q4".into(),
+                    filename: "world-q4.gguf".into(),
+                    size_label: "1.2 GB".into(),
+                    status_label: Some("Stable".into()),
+                    accuracy_guidance: "Fast transcription".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            RemoteCatalogEntryView {
+                id: "acme/japanese".into(),
+                display_name: "Japanese Speech".into(),
+                description: "Japanese transcription.".into(),
+                languages: vec!["ja".into()],
+                language_summary: "Japanese".into(),
+                repository: "acme/japanese".into(),
+                variants: vec![RemoteCatalogVariantView {
+                    id: "japanese-q5-balanced".into(),
+                    filename: "japanese-q5.gguf".into(),
+                    size_label: "512 MB".into(),
+                    status_label: Some("Stable".into()),
+                    accuracy_guidance: "Balanced accuracy".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        ];
+
+        for (query, language_filter, expected_remote_ids) in [
+            (
+                "english archive",
+                ModelLanguageFilter::English,
+                &["english-q5-balanced", "english-experimental"][..],
+            ),
+            (
+                "production transcription",
+                ModelLanguageFilter::English,
+                &["english-q5-balanced", "english-experimental"][..],
+            ),
+            (
+                "english only",
+                ModelLanguageFilter::English,
+                &["english-q5-balanced", "english-experimental"][..],
+            ),
+            (
+                "acme/english-archive",
+                ModelLanguageFilter::English,
+                &["english-q5-balanced", "english-experimental"][..],
+            ),
+            (
+                "english-q5-balanced",
+                ModelLanguageFilter::English,
+                &["english-q5-balanced"][..],
+            ),
+            (
+                "english-q5.gguf",
+                ModelLanguageFilter::English,
+                &["english-q5-balanced"][..],
+            ),
+            (
+                "balanced accuracy",
+                ModelLanguageFilter::English,
+                &["english-q5-balanced"][..],
+            ),
+            (
+                "experimental candidate",
+                ModelLanguageFilter::English,
+                &["english-experimental"][..],
+            ),
+            (
+                "512 mb",
+                ModelLanguageFilter::English,
+                &["english-q5-balanced"][..],
+            ),
+            (
+                "acme/world",
+                ModelLanguageFilter::Multilingual,
+                &["world-q4"][..],
+            ),
+            ("not in the catalog", ModelLanguageFilter::All, &[][..]),
+        ] {
+            let remote_catalog = RemoteCatalogView {
+                query: query.into(),
+                entries: entries.clone(),
+                ..Default::default()
+            };
+            let (installed, available) = build_model_card_lists(
+                std::slice::from_ref(&known_local),
+                &[],
+                &remote_catalog,
+                language_filter,
+            );
+
+            assert!(installed.is_empty(), "query={query}");
+            assert_eq!(available.len(), expected_remote_ids.len(), "query={query}");
+            let remote_ids = available
+                .iter()
+                .map(|card| match card {
+                    ModelCard::Remote(_, variant) => variant.id.as_str(),
+                    ModelCard::Local(_) => {
+                        panic!("query={query} unexpectedly included a local card")
+                    }
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(remote_ids.as_slice(), expected_remote_ids, "query={query}");
+        }
+    }
+
+    #[test]
     fn comparison_empty_cells_render_an_em_dash() {
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
@@ -9951,6 +10980,122 @@ mod tests {
             }
         }
 
+        fn is_descendant(
+            update: &egui::accesskit::TreeUpdate,
+            ancestor: egui::accesskit::NodeId,
+            target: egui::accesskit::NodeId,
+        ) -> bool {
+            let Some((_, ancestor)) = update.nodes.iter().find(|(id, _)| *id == ancestor) else {
+                return false;
+            };
+            let mut pending = ancestor.children().to_vec();
+            while let Some(id) = pending.pop() {
+                if id == target {
+                    return true;
+                }
+                if let Some((_, node)) = update.nodes.iter().find(|(node_id, _)| *node_id == id) {
+                    pending.extend_from_slice(node.children());
+                }
+            }
+            false
+        }
+
+        fn assert_history_results_semantics(update: &egui::accesskit::TreeUpdate) {
+            let results_id = update
+                .nodes
+                .iter()
+                .find(|(_, node)| {
+                    node.role() == egui::accesskit::Role::Group
+                        && node.name() == Some("History results")
+                })
+                .map(|(id, _)| *id)
+                .expect("History must expose one stable results group");
+            let heading_id = update
+                .nodes
+                .iter()
+                .find(|(_, node)| {
+                    node.role() == egui::accesskit::Role::Heading
+                        && node
+                            .name()
+                            .is_some_and(|name| name.starts_with("Completed - "))
+                })
+                .map(|(id, _)| *id)
+                .expect("populated History must expose a record heading");
+            let action_id = update
+                .nodes
+                .iter()
+                .find(|(_, node)| {
+                    node.role() == egui::accesskit::Role::Button
+                        && node.name() == Some("Delete entry")
+                })
+                .map(|(id, _)| *id)
+                .expect("populated History must expose record actions");
+            assert!(is_descendant(update, results_id, heading_id));
+            assert!(is_descendant(update, results_id, action_id));
+        }
+
+        fn assert_multi_record_context(
+            update: &egui::accesskit::TreeUpdate,
+            model_ids: &[&str],
+            armed_model_id: &str,
+        ) {
+            let results_id = update
+                .nodes
+                .iter()
+                .find(|(_, node)| {
+                    node.role() == egui::accesskit::Role::Group
+                        && node.name() == Some("History results")
+                })
+                .map(|(id, _)| *id)
+                .expect("History must expose one stable results group");
+            for model_id in model_ids {
+                let raw_id = update
+                    .nodes
+                    .iter()
+                    .find(|(_, node)| {
+                        node.name() == Some("Raw transcript")
+                            && node
+                                .description()
+                                .is_some_and(|description| description.contains(model_id))
+                    })
+                    .map(|(id, _)| *id)
+                    .unwrap_or_else(|| {
+                        panic!("Raw transcript disclosure must identify model {model_id}")
+                    });
+                assert!(is_descendant(update, results_id, raw_id));
+            }
+            let armed_id = update
+                .nodes
+                .iter()
+                .find(|(_, node)| {
+                    node.name() == Some("Paste armed")
+                        && node.description().is_some_and(|description| {
+                            description.contains(armed_model_id)
+                                && description.contains("already armed")
+                        })
+                })
+                .map(|(id, _)| *id)
+                .expect("armed paste action must identify its record context");
+            assert!(is_descendant(update, results_id, armed_id));
+        }
+
+        fn assert_incremental_safe(
+            previous: &egui::accesskit::TreeUpdate,
+            next: &egui::accesskit::TreeUpdate,
+            transition: &str,
+        ) {
+            let (_, _, orphaned_updated, orphaned_added) =
+                apply_accesskit_incremental_update(previous, next);
+            assert!(
+                orphaned_updated.is_empty(),
+                "{transition} orphaned updated nodes: {orphaned_updated:?}"
+            );
+            assert!(
+                orphaned_added.is_empty(),
+                "{transition} orphaned added nodes: {orphaned_added:?}"
+            );
+        }
+
         fn render_source_route(ctx: &egui::Context, route: UiRoute) -> egui::accesskit::TreeUpdate {
             let state = TranscriptionState {
                 phase: TranscriptionPhase::Ready,
@@ -9987,8 +11132,10 @@ mod tests {
             ctx: &egui::Context,
             records: &[HistoryRecord],
             loading: bool,
+            query: &str,
+            armed_repaste: Option<i64>,
         ) -> egui::accesskit::TreeUpdate {
-            let mut search = String::new();
+            let mut search = query.to_owned();
             ctx.run(raw_input(), |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     show_route_scroll(ui, UiRoute::History, |ui| {
@@ -10029,7 +11176,7 @@ mod tests {
                                         work_active: false,
                                         playing: None,
                                         playback_stopping: false,
-                                        armed_repaste: None,
+                                        armed_repaste,
                                         focus_search: false,
                                         focus_delete_confirmation: false,
                                     },
@@ -10042,6 +11189,78 @@ mod tests {
             .platform_output
             .accesskit_update
             .expect("history should expose AccessKit")
+        }
+
+        fn render_history_interaction(
+            ctx: &egui::Context,
+            search: &mut String,
+            records: &[HistoryRecord],
+            loading: bool,
+            focus_search: bool,
+            events: Vec<egui::Event>,
+        ) -> (egui::accesskit::TreeUpdate, Option<HistoryPageAction>) {
+            let mut action = None;
+            let output = ctx.run(
+                egui::RawInput {
+                    events,
+                    ..raw_input()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        show_route_scroll(ui, UiRoute::History, |ui| {
+                            ui.allocate_ui_with_layout(
+                                egui::Vec2::new(ui.available_width(), 0.0),
+                                egui::Layout::top_down(egui::Align::LEFT),
+                                |ui| {
+                                    ui.horizontal_top(|ui| {
+                                        let heading =
+                                            ui.label(RichText::new("History").size(30.0).strong());
+                                        ui.ctx().accesskit_node_builder(heading.id, |builder| {
+                                            builder.set_role(egui::accesskit::Role::Heading);
+                                        });
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                ui.label("Ready");
+                                            },
+                                        );
+                                    });
+                                    ui.add_space(2.0);
+                                    let status = ui.label("Ready");
+                                    ui.ctx().accesskit_node_builder(status.id, |builder| {
+                                        builder.set_live(egui::accesskit::Live::Polite);
+                                    });
+                                    ui.add_space(14.0);
+                                    action = history_page(
+                                        ui,
+                                        HistoryPageState {
+                                            search,
+                                            records,
+                                            has_more: false,
+                                            loading,
+                                            error: None,
+                                            confirm_delete: None,
+                                            work_active: false,
+                                            playing: None,
+                                            playback_stopping: false,
+                                            armed_repaste: None,
+                                            focus_search,
+                                            focus_delete_confirmation: false,
+                                        },
+                                    );
+                                },
+                            );
+                        });
+                    });
+                },
+            );
+            (
+                output
+                    .platform_output
+                    .accesskit_update
+                    .expect("interactive history should expose AccessKit"),
+                action,
+            )
         }
 
         let record = history_record();
@@ -10066,7 +11285,7 @@ mod tests {
                 let ctx = egui::Context::default();
                 ctx.enable_accesskit();
                 let source = render_source_route(&ctx, source_route);
-                let history = render_history(&ctx, records, loading);
+                let history = render_history(&ctx, records, loading, "", None);
                 let (nodes, _root, orphaned_updated, orphaned_added) =
                     apply_accesskit_incremental_update(&source, &history);
 
@@ -10087,13 +11306,228 @@ mod tests {
                 if state_name == "populated" {
                     assert!(nodes.values().any(|node| {
                         node.role() == egui::accesskit::Role::Group
-                            && node
-                                .name()
-                                .is_some_and(|name| name.contains("history entry"))
+                            && node.name() == Some("History results")
                     }));
+                    assert_history_results_semantics(&history);
                 }
+                let mut consumer = accesskit_consumer::Tree::new(source, true);
+                consumer.update_and_process_changes(history, &mut NoopAccessKitChangeHandler);
             }
         }
+
+        // Live History search changes both the search-control subtree and the
+        // result subtree across consecutive incremental updates. Exercise the
+        // same populated -> loading -> filtered sequence used by the app so an
+        // updated AccessKit node can never also be removed as an orphan.
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let populated = render_history(&ctx, std::slice::from_ref(&record), false, "", None);
+        let loading = render_history(&ctx, &[], true, "meeting", None);
+        let mut consumer = accesskit_consumer::Tree::new(populated.clone(), true);
+        consumer.update_and_process_changes(loading.clone(), &mut NoopAccessKitChangeHandler);
+        let (_, _, orphaned_updated, orphaned_added) =
+            apply_accesskit_incremental_update(&populated, &loading);
+        assert!(
+            orphaned_updated.is_empty(),
+            "live search orphaned updated nodes while entering loading: {orphaned_updated:?}"
+        );
+        assert!(
+            orphaned_added.is_empty(),
+            "live search orphaned added nodes while entering loading: {orphaned_added:?}"
+        );
+
+        let filtered = render_history(&ctx, std::slice::from_ref(&record), false, "meeting", None);
+        consumer.update_and_process_changes(filtered.clone(), &mut NoopAccessKitChangeHandler);
+        let (_, _, orphaned_updated, orphaned_added) =
+            apply_accesskit_incremental_update(&loading, &filtered);
+        assert!(
+            orphaned_updated.is_empty(),
+            "live search orphaned updated nodes while showing results: {orphaned_updated:?}"
+        );
+        assert!(
+            orphaned_added.is_empty(),
+            "live search orphaned added nodes while showing results: {orphaned_added:?}"
+        );
+
+        let removed = render_history(&ctx, &[], false, "meeting", None);
+        let (_, _, orphaned_updated, orphaned_added) =
+            apply_accesskit_incremental_update(&filtered, &removed);
+        assert!(
+            orphaned_updated.is_empty(),
+            "record removal orphaned updated nodes: {orphaned_updated:?}"
+        );
+        assert!(
+            orphaned_added.is_empty(),
+            "record removal orphaned added nodes: {orphaned_added:?}"
+        );
+        consumer.update_and_process_changes(removed.clone(), &mut NoopAccessKitChangeHandler);
+
+        let mut replacement_record = record.clone();
+        replacement_record.id = 2;
+        replacement_record.raw_text = "replacement transcript".into();
+        replacement_record.final_text = Some("replacement transcript".into());
+        let replacement = render_history(
+            &ctx,
+            std::slice::from_ref(&replacement_record),
+            false,
+            "meeting",
+            None,
+        );
+        let mut replacement_consumer = accesskit_consumer::Tree::new(filtered.clone(), true);
+        replacement_consumer
+            .update_and_process_changes(replacement.clone(), &mut NoopAccessKitChangeHandler);
+        let (_, _, orphaned_updated, orphaned_added) =
+            apply_accesskit_incremental_update(&filtered, &replacement);
+        assert!(
+            orphaned_updated.is_empty(),
+            "record replacement orphaned updated nodes: {orphaned_updated:?}"
+        );
+        assert!(
+            orphaned_added.is_empty(),
+            "record replacement orphaned added nodes: {orphaned_added:?}"
+        );
+
+        let mut second_record = record.clone();
+        second_record.id = 8;
+        second_record.raw_text = "second transcript".into();
+        second_record.final_text = Some("clean second transcript".into());
+        second_record.model_id = "whisper_cpp_small_en".into();
+        let mut third_record = record.clone();
+        third_record.id = 9;
+        third_record.raw_text = "third transcript".into();
+        third_record.final_text = Some("clean third transcript".into());
+        third_record.model_id = "whisper_cpp_medium_en".into();
+
+        let three_records = render_history(
+            &ctx,
+            &[record.clone(), second_record.clone(), third_record.clone()],
+            false,
+            "",
+            Some(second_record.id),
+        );
+        assert_history_results_semantics(&three_records);
+        assert_multi_record_context(
+            &three_records,
+            &[
+                "whisper_cpp_base_en",
+                "whisper_cpp_small_en",
+                "whisper_cpp_medium_en",
+            ],
+            "whisper_cpp_small_en",
+        );
+        let mut multi_record_consumer = accesskit_consumer::Tree::new(three_records.clone(), true);
+
+        let middle_removed = render_history(
+            &ctx,
+            &[record.clone(), third_record.clone()],
+            false,
+            "",
+            None,
+        );
+        assert_incremental_safe(&three_records, &middle_removed, "middle record removal");
+        multi_record_consumer
+            .update_and_process_changes(middle_removed.clone(), &mut NoopAccessKitChangeHandler);
+        assert_history_results_semantics(&middle_removed);
+
+        let first_removed =
+            render_history(&ctx, std::slice::from_ref(&third_record), false, "", None);
+        assert_incremental_safe(&middle_removed, &first_removed, "first record removal");
+        multi_record_consumer
+            .update_and_process_changes(first_removed.clone(), &mut NoopAccessKitChangeHandler);
+        assert_history_results_semantics(&first_removed);
+
+        let replacement_after_removals = render_history(
+            &ctx,
+            std::slice::from_ref(&replacement_record),
+            false,
+            "replacement",
+            None,
+        );
+        assert_incremental_safe(
+            &first_removed,
+            &replacement_after_removals,
+            "remaining record replacement",
+        );
+        multi_record_consumer.update_and_process_changes(
+            replacement_after_removals.clone(),
+            &mut NoopAccessKitChangeHandler,
+        );
+        assert_history_results_semantics(&replacement_after_removals);
+
+        let loading_after_records = render_history(&ctx, &[], true, "replacement", None);
+        assert_incremental_safe(
+            &replacement_after_removals,
+            &loading_after_records,
+            "populated to loading",
+        );
+        multi_record_consumer.update_and_process_changes(
+            loading_after_records.clone(),
+            &mut NoopAccessKitChangeHandler,
+        );
+
+        let empty_after_loading = render_history(&ctx, &[], false, "replacement", None);
+        assert_incremental_safe(
+            &loading_after_records,
+            &empty_after_loading,
+            "loading to empty",
+        );
+        multi_record_consumer.update_and_process_changes(
+            empty_after_loading.clone(),
+            &mut NoopAccessKitChangeHandler,
+        );
+
+        let results_after_empty = render_history(
+            &ctx,
+            std::slice::from_ref(&replacement_record),
+            false,
+            "replacement",
+            None,
+        );
+        assert_incremental_safe(
+            &empty_after_loading,
+            &results_after_empty,
+            "empty to results",
+        );
+        multi_record_consumer.update_and_process_changes(
+            results_after_empty.clone(),
+            &mut NoopAccessKitChangeHandler,
+        );
+        assert_history_results_semantics(&results_after_empty);
+
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut search = String::new();
+        let (initial, _) = render_history_interaction(
+            &ctx,
+            &mut search,
+            std::slice::from_ref(&record),
+            false,
+            true,
+            Vec::new(),
+        );
+        let mut consumer = accesskit_consumer::Tree::new(initial, true);
+        let (settled, _) = render_history_interaction(
+            &ctx,
+            &mut search,
+            std::slice::from_ref(&record),
+            false,
+            false,
+            Vec::new(),
+        );
+        consumer.update_and_process_changes(settled, &mut NoopAccessKitChangeHandler);
+        let (typed, typed_action) = render_history_interaction(
+            &ctx,
+            &mut search,
+            std::slice::from_ref(&record),
+            false,
+            false,
+            vec![egui::Event::Text("meeting".into())],
+        );
+        assert_eq!(typed_action, Some(HistoryPageAction::ApplySearch));
+        consumer.update_and_process_changes(typed, &mut NoopAccessKitChangeHandler);
+        let (loading, _) =
+            render_history_interaction(&ctx, &mut search, &[], true, false, Vec::new());
+        consumer.update_and_process_changes(loading, &mut NoopAccessKitChangeHandler);
     }
 
     #[test]
@@ -11240,6 +12674,39 @@ mod tests {
                 })
             })
             .unwrap_or_else(|| panic!("missing {name} {role:?} bounds"))
+    }
+
+    fn primary_pointer_event(pos: egui::Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    fn key_press(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }
+    }
+
+    fn compact_language_filter_expanded(output: &egui::FullOutput) -> bool {
+        output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .is_some_and(|update| {
+                update.nodes.iter().any(|(_, node)| {
+                    node.role() == egui::accesskit::Role::ComboBox
+                        && node.name() == Some("Filter model languages")
+                        && node.is_expanded() == Some(true)
+                })
+            })
     }
 
     fn model_layout_bounds(output: &egui::FullOutput, name: &str) -> egui::accesskit::Rect {

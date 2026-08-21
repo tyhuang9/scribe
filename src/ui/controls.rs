@@ -99,43 +99,6 @@ pub(crate) fn button(
     response
 }
 
-pub(crate) fn icon_button(ui: &mut Ui, icon: Icon, accessible_name: &str) -> Response {
-    let colors = ui_palette(ui);
-    let enabled = ui.is_enabled();
-    let (target_rect, response) =
-        ui.allocate_exact_size(Vec2::splat(PRIMARY_TARGET_HEIGHT), Sense::click());
-    let visual_rect =
-        egui::Rect::from_center_size(target_rect.center(), Vec2::splat(COMPACT_BUTTON_HEIGHT));
-    ui.painter().rect(
-        visual_rect,
-        Rounding::same(5.0),
-        if response.hovered() {
-            colors.panel_bg
-        } else {
-            Color32::TRANSPARENT
-        },
-        Stroke::new(1.0, colors.border),
-    );
-    ui.painter().text(
-        visual_rect.center(),
-        egui::Align2::CENTER_CENTER,
-        icon_glyph(icon),
-        FontId::proportional(20.0),
-        colors.muted_text,
-    );
-    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, accessible_name));
-    ui.ctx().accesskit_node_builder(response.id, |builder| {
-        builder.set_role(egui::accesskit::Role::Button);
-        builder.set_name(accessible_name);
-        if !enabled {
-            builder.set_disabled();
-        }
-    });
-    paint_focus_ring(ui, &response, Rounding::same(5.0));
-    focus_tooltip(ui, &response, accessible_name);
-    response.on_hover_text(accessible_name)
-}
-
 pub(crate) fn focus_tooltip(ui: &Ui, response: &Response, text: &str) {
     if response.has_focus() {
         egui::show_tooltip_for(
@@ -161,13 +124,13 @@ pub(crate) fn paint_focus_ring(ui: &Ui, response: &Response, rounding: Rounding)
 
 /// A consistent search affordance for routes that filter local UI content.
 ///
-/// The clear target is always reserved so adding or removing text never shifts
-/// neighbouring controls. Callers decide whether query changes filter live or
-/// need an explicit submit action.
+/// The clear target is shown only for nonempty, sufficiently wide fields;
+/// Escape remains available from the focused input at every width. Callers
+/// decide whether query changes filter live or need an explicit submit action.
 pub(crate) struct SearchFieldResponse {
     pub input: Response,
     #[cfg(test)]
-    pub clear: Response,
+    pub clear: Option<Response>,
     #[cfg(test)]
     pub surface: egui::Rect,
     pub changed: bool,
@@ -192,39 +155,47 @@ pub(crate) fn search_field(
     // TextEdit surrenders focus for Escape, so preserve its pre-edit focus
     // state to let the route handle the intended clear action.
     let had_input_focus = ui.memory(|memory| memory.has_focus(field_id));
-    // Allocate one fixed surface before adding child controls. This exactly
-    // preserves the old full-width 44px edit geometry at every route width.
+    // Allocate one fixed surface before adding child controls. This keeps the
+    // text edit's route geometry predictable while retaining a restrained,
+    // filled search surface. A quiet idle border gives the field a clear
+    // boundary without competing with the stronger keyboard focus ring.
     let (surface_rect, _) = ui.allocate_exact_size(
         Vec2::new(width.min(ui.available_width()), PRIMARY_TARGET_HEIGHT),
         Sense::hover(),
     );
-    ui.painter().rect(
-        surface_rect,
+    ui.painter()
+        .rect_filled(surface_rect, Rounding::same(5.0), colors.panel_bg);
+    ui.painter().rect_stroke(
+        surface_rect.shrink(0.5),
         Rounding::same(5.0),
-        colors.card_bg,
         Stroke::new(1.0, colors.border_strong),
     );
-    // On a compact surface the clear target takes the trailing 44px without
-    // an inset and the decorative glyph yields first. This keeps both the
-    // clear target and a positive text-edit rect contained instead of
-    // allowing either child to extend outside a narrow parent.
+    // Keep the Clear slot and accessibility node stable as the first query
+    // character is typed. Empty fields leave the target hidden and disabled;
+    // at pathological widths Escape remains available from the text input.
+    let allocate_clear = surface_rect.width() >= 88.0;
+    let clear_enabled = !value.is_empty();
     let standard_layout = surface_rect.width() >= 160.0;
-    let trailing_inset = if standard_layout { 10.0 } else { 0.0 };
     let minimum_input_width = 1.0;
-    let clear_width =
-        PRIMARY_TARGET_HEIGHT.min((surface_rect.width() - minimum_input_width).max(0.0));
+    let clear_width = if allocate_clear {
+        PRIMARY_TARGET_HEIGHT
+    } else {
+        0.0
+    };
     let clear_rect = egui::Rect::from_min_size(
-        egui::pos2(
-            surface_rect.right() - trailing_inset - clear_width,
-            surface_rect.top(),
-        ),
+        egui::pos2(surface_rect.right() - clear_width, surface_rect.top()),
         Vec2::new(clear_width, PRIMARY_TARGET_HEIGHT),
     );
     let icon_width = if standard_layout { 20.0 } else { 0.0 };
     let input_left = surface_rect.left() + if standard_layout { 38.0 } else { 0.0 };
-    let input_right = (clear_rect.left() - if standard_layout { 8.0 } else { 0.0 })
-        .max(input_left + minimum_input_width)
-        .min(surface_rect.right());
+    let input_right = (clear_rect.left()
+        - if allocate_clear && standard_layout {
+            8.0
+        } else {
+            0.0
+        })
+    .max(input_left + minimum_input_width)
+    .min(surface_rect.right());
     let input_rect = egui::Rect::from_min_max(
         egui::pos2(
             input_left.min(input_right - minimum_input_width),
@@ -249,30 +220,96 @@ pub(crate) fn search_field(
         );
     }
     let mut input_ui = ui.child_ui(input_rect, Layout::left_to_right(Align::Center));
-    let input = input_ui.add_sized(
-        input_rect.size(),
-        egui::TextEdit::singleline(value)
-            .id(field_id)
-            .hint_text(hint_text)
-            .frame(false),
-    );
-    let mut clear_ui = ui.child_ui(clear_rect, Layout::left_to_right(Align::Center));
-    let clear = clear_ui
-        .add_enabled_ui(!value.is_empty(), |ui| {
-            icon_button(ui, Icon::Close, &format!("Clear {accessible_name}"))
-        })
+    // Mirror `Ui::add_sized`, but retain TextEdit's rich output so custom
+    // placeholder paint can use the exact galley origin and clip rectangle.
+    // This includes TextEdit's own 4px/2px content margin and centered
+    // vertical alignment instead of approximating either from `input_rect`.
+    let main_dir = input_ui.layout().main_dir();
+    let input_output = input_ui
+        .allocate_ui_with_layout(
+            input_rect.size(),
+            Layout::centered_and_justified(main_dir),
+            |ui| {
+                egui::TextEdit::singleline(value)
+                    .id(field_id)
+                    .vertical_align(Align::Center)
+                    .frame(false)
+                    .show(ui)
+            },
+        )
         .inner;
-    let clear_requested = !value.is_empty()
-        && (clear.clicked()
-            || (clear.has_focus() && clear_key_pressed)
-            || (had_input_focus && escape_pressed));
+    let input = input_output.response;
+    if value.is_empty() {
+        // egui 0.27 paints built-in hint text at the response's top edge even
+        // when typed text is vertically aligned. Paint the placeholder at the
+        // empty TextEdit galley's actual origin so hint, typed text, and caret
+        // share the exact content baseline and internal margins.
+        let hint_color = ui.visuals().weak_text_color();
+        let hint_galley = ui.painter().layout_no_wrap(
+            hint_text.to_owned(),
+            egui::TextStyle::Body.resolve(ui.style()),
+            hint_color,
+        );
+        let hint_position = input_output.galley_pos;
+        ui.painter()
+            .with_clip_rect(input_output.text_clip_rect)
+            .galley(hint_position, hint_galley, hint_color);
+    }
+    let clear = allocate_clear.then(|| {
+        let target = clear_rect;
+        let response = if clear_enabled {
+            ui.interact(target, field_id.with("clear"), Sense::click())
+        } else {
+            ui.add_enabled_ui(false, |ui| {
+                ui.interact(target, field_id.with("clear"), Sense::click())
+            })
+            .inner
+        };
+        if clear_enabled && (response.hovered() || response.has_focus()) {
+            ui.painter().rect_filled(
+                target.shrink(6.0),
+                Rounding::same(5.0),
+                colors.active_card_bg,
+            );
+        }
+        if clear_enabled {
+            ui.painter().text(
+                target.center(),
+                egui::Align2::CENTER_CENTER,
+                icon_glyph(Icon::Close),
+                FontId::proportional(18.0),
+                colors.muted_text,
+            );
+        }
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Button, format!("Clear {accessible_name}"))
+        });
+        ui.ctx().accesskit_node_builder(response.id, |builder| {
+            builder.set_role(egui::accesskit::Role::Button);
+            builder.set_name(format!("Clear {accessible_name}"));
+            builder.set_description(format!("Clears the current {accessible_name} query."));
+            if !clear_enabled {
+                builder.set_disabled();
+                builder.set_hidden();
+            }
+        });
+        if clear_enabled {
+            paint_focus_ring(ui, &response, Rounding::same(5.0));
+            focus_tooltip(ui, &response, &format!("Clear {accessible_name}"));
+            response.on_hover_text(format!("Clear {accessible_name}"))
+        } else {
+            response
+        }
+    });
+    let clear_requested = (clear
+        .as_ref()
+        .is_some_and(|clear| clear.clicked() || (clear.has_focus() && clear_key_pressed))
+        || (had_input_focus && escape_pressed))
+        && !value.is_empty();
 
     ui.ctx().accesskit_node_builder(input.id, |builder| {
         builder.set_name(accessible_name);
         builder.set_description(description);
-    });
-    ui.ctx().accesskit_node_builder(clear.id, |builder| {
-        builder.set_description(format!("Clears the current {accessible_name} query."));
     });
     if input.has_focus() {
         ui.painter().rect_stroke(
@@ -474,6 +511,35 @@ mod tests {
     use super::*;
     use egui_phosphor::regular;
 
+    #[derive(Default)]
+    struct NoopAccessKitChangeHandler;
+
+    impl accesskit_consumer::TreeChangeHandler for NoopAccessKitChangeHandler {
+        fn node_added(&mut self, _node: &accesskit_consumer::Node<'_>) {}
+
+        fn node_updated(
+            &mut self,
+            _old_node: &accesskit_consumer::DetachedNode,
+            _new_node: &accesskit_consumer::Node<'_>,
+        ) {
+        }
+
+        fn focus_moved(
+            &mut self,
+            _old_node: Option<&accesskit_consumer::DetachedNode>,
+            _new_node: Option<&accesskit_consumer::Node<'_>>,
+            _current_state: &accesskit_consumer::TreeState,
+        ) {
+        }
+
+        fn node_removed(
+            &mut self,
+            _node: &accesskit_consumer::DetachedNode,
+            _current_state: &accesskit_consumer::TreeState,
+        ) {
+        }
+    }
+
     #[test]
     fn primary_targets_meet_wcag_pointer_size() {
         assert!(minimum_primary_target_height() >= 44.0);
@@ -492,51 +558,6 @@ mod tests {
         assert_eq!(icon_glyph(Icon::Cancellation), regular::PROHIBIT);
         assert_eq!(icon_glyph(Icon::ConfidenceScores), regular::SEAL_CHECK);
         assert_eq!(icon_glyph(Icon::CustomVocabulary), regular::NOTE_PENCIL);
-    }
-
-    #[test]
-    fn compact_controls_keep_full_size_pointer_targets() {
-        let ctx = egui::Context::default();
-        configure_accessible_style(&ctx);
-        let mut button_target_height = 0.0;
-        let mut icon_target_height = 0.0;
-        let output = ctx.run(
-            egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    Vec2::new(640.0, 320.0),
-                )),
-                ..Default::default()
-            },
-            |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    button_target_height = button(ui, "Save", ButtonTone::Primary).rect.height();
-                    icon_target_height = icon_button(ui, Icon::Refresh, "Refresh").rect.height();
-                    keycap(ui, "Ctrl");
-                });
-            },
-        );
-
-        assert_eq!(button_target_height, PRIMARY_TARGET_HEIGHT);
-        assert_eq!(icon_target_height, PRIMARY_TARGET_HEIGHT);
-        let painted_rect_heights: Vec<_> = output
-            .shapes
-            .iter()
-            .filter_map(|shape| match shape.shape {
-                egui::epaint::Shape::Rect(ref rect) => Some(rect.rect.height()),
-                _ => None,
-            })
-            .collect();
-        assert!(
-            painted_rect_heights
-                .iter()
-                .any(|height| (*height - COMPACT_BUTTON_HEIGHT).abs() < 0.1)
-        );
-        assert!(
-            painted_rect_heights
-                .iter()
-                .any(|height| { *height >= 28.0 && *height <= 30.0 })
-        );
     }
 
     #[test]
@@ -596,7 +617,211 @@ mod tests {
     }
 
     #[test]
-    fn search_field_exposes_a_labelled_full_size_clear_action_without_layout_shift() {
+    fn search_field_centers_its_input_and_clear_target_in_the_fixed_height_surface() {
+        let ctx = egui::Context::default();
+        configure_accessible_style(&ctx);
+        let mut query = "base".to_owned();
+        let mut surface = egui::Rect::NOTHING;
+        let mut input = egui::Rect::NOTHING;
+        let mut clear = egui::Rect::NOTHING;
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(320.0, 120.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let response = search_field(
+                        ui,
+                        ui.available_width(),
+                        "centered-search-field",
+                        &mut query,
+                        "Search models",
+                        "Search models",
+                        "Filters models as you type.",
+                    );
+                    surface = response.surface;
+                    input = response.input.rect;
+                    clear = response
+                        .clear
+                        .expect("populated search should show a clear target")
+                        .rect;
+                });
+            },
+        );
+        assert_eq!(input.height(), PRIMARY_TARGET_HEIGHT);
+        assert_eq!(clear.height(), PRIMARY_TARGET_HEIGHT);
+        assert!(
+            (input.center().y - surface.center().y).abs() < f32::EPSILON
+                && (clear.center().y - surface.center().y).abs() < f32::EPSILON,
+            "the text input and clear affordance must remain vertically centered: surface={surface:?}, input={input:?}, clear={clear:?}"
+        );
+    }
+
+    #[test]
+    fn search_field_placeholder_matches_typed_text_and_caret_content_geometry() {
+        let hint = "Search models by name, language, or variant";
+        let render = |query: &str| {
+            let ctx = egui::Context::default();
+            configure_accessible_style(&ctx);
+            let mut query = query.to_owned();
+            let mut input_rect = egui::Rect::NOTHING;
+            let mut cursor_stroke = egui::Stroke::NONE;
+            let output = ctx.run(
+                egui::RawInput {
+                    focused: true,
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        Vec2::new(600.0, 120.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let field_id = ui.make_persistent_id("centered-search-placeholder");
+                        ui.memory_mut(|memory| memory.request_focus(field_id));
+                        cursor_stroke = ui.visuals().text_cursor;
+                        input_rect = search_field(
+                            ui,
+                            ui.available_width(),
+                            "centered-search-placeholder",
+                            &mut query,
+                            "Search models",
+                            hint,
+                            "Filters models as you type.",
+                        )
+                        .input
+                        .rect;
+                    });
+                },
+            );
+            (output, input_rect, cursor_stroke)
+        };
+
+        let (empty, input_rect, cursor_stroke) = render("");
+        let (clip_rect, placeholder_bounds) = empty
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Text(text) if text.galley.text() == hint => Some((
+                    shape.clip_rect,
+                    egui::Rect::from_min_size(text.pos, text.galley.size()),
+                )),
+                _ => None,
+            })
+            .expect("search placeholder should be painted as a galley");
+        assert_eq!(clip_rect, input_rect.shrink2(Vec2::new(4.0, 2.0)));
+        assert!(clip_rect.contains_rect(placeholder_bounds));
+
+        let (typed, typed_input_rect, typed_cursor_stroke) = render("Search");
+        assert_eq!(typed_input_rect, input_rect);
+        assert_eq!(typed_cursor_stroke, cursor_stroke);
+        let (typed_clip_rect, typed_bounds) = typed
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Text(text) if text.galley.text() == "Search" => Some((
+                    shape.clip_rect,
+                    egui::Rect::from_min_size(text.pos, text.galley.size()),
+                )),
+                _ => None,
+            })
+            .expect("typed search value should be painted as a galley");
+        // TextEdit expands its painter clip by one pixel so the caret is not
+        // cut off; the underlying content clip used by the placeholder stays
+        // exact. Both still share the same content origin and baseline.
+        assert_eq!(typed_clip_rect, clip_rect.expand(1.0));
+        assert_eq!(typed_bounds.min.y, placeholder_bounds.min.y);
+        assert_eq!(typed_bounds.height(), placeholder_bounds.height());
+
+        let cursor_bounds = |output: &egui::FullOutput| {
+            output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::epaint::Shape::LineSegment { points, stroke }
+                        if *stroke == cursor_stroke
+                            && (points[0].x - points[1].x).abs() < f32::EPSILON
+                            && clip_rect.contains(points[0])
+                            && clip_rect.contains(points[1]) =>
+                    {
+                        Some(egui::Rect::from_two_pos(points[0], points[1]))
+                    }
+                    _ => None,
+                })
+                .expect("focused search field should paint a text caret")
+        };
+        let empty_cursor = cursor_bounds(&empty);
+        let typed_cursor = cursor_bounds(&typed);
+        assert!(
+            (empty_cursor.center().y - placeholder_bounds.center().y).abs() < 0.1,
+            "empty caret and placeholder must share a vertical center: caret={empty_cursor:?}, placeholder={placeholder_bounds:?}"
+        );
+        assert_eq!(typed_cursor.min.y, empty_cursor.min.y);
+        assert_eq!(typed_cursor.max.y, empty_cursor.max.y);
+        assert!((typed_cursor.center().y - typed_bounds.center().y).abs() < 0.1);
+    }
+
+    #[test]
+    fn search_field_paints_an_idle_outline_and_a_stronger_focus_outline() {
+        let ctx = egui::Context::default();
+        configure_accessible_style(&ctx);
+        ctx.set_visuals(egui::Visuals::light());
+        let mut query = String::new();
+        let raw = || egui::RawInput {
+            focused: true,
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                Vec2::new(320.0, 120.0),
+            )),
+            ..Default::default()
+        };
+        let idle = ctx.run(raw(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                search_field(
+                    ui,
+                    ui.available_width(),
+                    "search-field-outline",
+                    &mut query,
+                    "Search models",
+                    "Search models",
+                    "Filters models as you type.",
+                );
+            });
+        });
+        assert!(idle.shapes.iter().any(|shape| matches!(
+            shape.shape,
+            egui::epaint::Shape::Rect(rect)
+                if rect.stroke.width == 1.0 && rect.stroke.color == super::super::theme::ThemePalette::light().border_strong
+        )));
+
+        let focused = ctx.run(raw(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let field_id = ui.make_persistent_id("search-field-outline");
+                ui.memory_mut(|memory| memory.request_focus(field_id));
+                search_field(
+                    ui,
+                    ui.available_width(),
+                    "search-field-outline",
+                    &mut query,
+                    "Search models",
+                    "Search models",
+                    "Filters models as you type.",
+                );
+            });
+        });
+        assert!(focused.shapes.iter().any(|shape| matches!(
+            shape.shape,
+            egui::epaint::Shape::Rect(rect)
+                if rect.stroke.width == 2.0 && rect.stroke.color == super::super::theme::ThemePalette::light().accent
+        )));
+    }
+
+    #[test]
+    fn search_field_keeps_a_stable_labelled_clear_slot_when_empty() {
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
         configure_accessible_style(&ctx);
@@ -675,22 +900,12 @@ mod tests {
             .accesskit_update
             .expect("empty search field should update AccessKit")
             .nodes;
-        let disabled_clear = empty_nodes
+        let empty_clear = empty_nodes
             .iter()
             .find_map(|(_, node)| (node.name() == Some("Clear Search models")).then_some(node))
-            .expect("empty search still reserves its clear target");
-        assert!(disabled_clear.is_disabled());
-        assert_eq!(
-            disabled_clear
-                .bounds()
-                .expect("disabled clear action needs bounds")
-                .height(),
-            clear
-                .bounds()
-                .expect("enabled clear action needs bounds")
-                .height(),
-            "empty and populated search fields must reserve identical clear geometry"
-        );
+            .expect("an empty roomy search should retain its Clear node");
+        assert!(empty_clear.is_disabled());
+        assert!(empty_clear.is_hidden());
         assert!(
             empty_nodes
                 .iter()
@@ -700,13 +915,114 @@ mod tests {
     }
 
     #[test]
-    fn search_field_keeps_its_input_and_clear_target_contained_when_compact() {
-        for width in [45.0, 53.0, 54.0, 80.0, 100.0] {
+    fn search_field_clear_node_is_stable_across_empty_typed_and_cleared_updates() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let render = |query: &mut String| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        Vec2::new(320.0, 120.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        search_field(
+                            ui,
+                            ui.available_width(),
+                            "stable-clear-node",
+                            query,
+                            "Search history",
+                            "Search transcript, model, or app",
+                            "Filters saved history as you type.",
+                        );
+                    });
+                },
+            )
+            .platform_output
+            .accesskit_update
+            .expect("search should update AccessKit")
+        };
+        let clear_node = |update: &egui::accesskit::TreeUpdate| {
+            update
+                .nodes
+                .iter()
+                .find(|(_, node)| node.name() == Some("Clear Search history"))
+                .map(|(id, node)| (*id, node.clone()))
+                .expect("roomy search should retain the Clear node")
+        };
+
+        let mut query = String::new();
+        let empty = render(&mut query);
+        let (clear_id, empty_clear) = clear_node(&empty);
+        assert_eq!(empty_clear.role(), egui::accesskit::Role::Button);
+        assert!(empty_clear.is_disabled());
+        assert!(empty_clear.is_hidden());
+        let mut consumer = accesskit_consumer::Tree::new(empty, true);
+
+        query.push('m');
+        let typed = render(&mut query);
+        let (typed_id, typed_clear) = clear_node(&typed);
+        assert_eq!(typed_id, clear_id);
+        assert_eq!(typed_clear.role(), egui::accesskit::Role::Button);
+        assert!(!typed_clear.is_disabled());
+        assert!(!typed_clear.is_hidden());
+        consumer.update_and_process_changes(typed, &mut NoopAccessKitChangeHandler);
+
+        query.clear();
+        let cleared = render(&mut query);
+        let (cleared_id, cleared_node) = clear_node(&cleared);
+        assert_eq!(cleared_id, clear_id);
+        assert_eq!(cleared_node.role(), egui::accesskit::Role::Button);
+        assert!(cleared_node.is_disabled());
+        assert!(cleared_node.is_hidden());
+        consumer.update_and_process_changes(cleared, &mut NoopAccessKitChangeHandler);
+    }
+
+    #[test]
+    fn search_field_omits_the_clear_node_below_the_slot_threshold_in_both_states() {
+        for initial in ["", "m"] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            configure_accessible_style(&ctx);
+            let mut query = initial.to_owned();
+            let output = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let response = search_field(
+                        ui,
+                        45.0,
+                        "compact-stable-clear-node",
+                        &mut query,
+                        "Search history",
+                        "Search transcript, model, or app",
+                        "Filters saved history as you type.",
+                    );
+                    assert!(response.clear.is_none());
+                });
+            });
+            assert!(
+                output
+                    .platform_output
+                    .accesskit_update
+                    .expect("compact search should update AccessKit")
+                    .nodes
+                    .iter()
+                    .all(|(_, node)| node.name() != Some("Clear Search history"))
+            );
+        }
+    }
+
+    #[test]
+    fn search_field_keeps_its_input_and_visible_clear_target_contained_when_compact() {
+        for width in [45.0, 120.0, 220.0] {
             let ctx = egui::Context::default();
             let mut query = "base".to_owned();
             let mut surface = egui::Rect::NOTHING;
             let mut input = egui::Rect::NOTHING;
-            let mut clear = egui::Rect::NOTHING;
+            let mut clear = None;
             let _ = ctx.run(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
@@ -728,7 +1044,7 @@ mod tests {
                         );
                         surface = response.surface;
                         input = response.input.rect;
-                        clear = response.clear.rect;
+                        clear = response.clear.map(|response| response.rect);
                     });
                 },
             );
@@ -740,14 +1056,23 @@ mod tests {
                 surface.contains_rect(input),
                 "input must remain inside the surface at width {width}: surface={surface:?}, input={input:?}"
             );
-            assert!(
-                surface.contains_rect(clear),
-                "clear action must remain inside the surface at width {width}: surface={surface:?}, clear={clear:?}"
-            );
-            assert!(
-                clear.width() >= PRIMARY_TARGET_HEIGHT && clear.height() >= PRIMARY_TARGET_HEIGHT,
-                "clear action must retain its 44px target at width {width}: {clear:?}"
-            );
+            if width < 88.0 {
+                assert!(
+                    clear.is_none(),
+                    "the visual clear action should yield at pathological width {width}"
+                );
+            } else {
+                let clear = clear.expect("roomy compact fields should expose the clear action");
+                assert!(
+                    surface.contains_rect(clear),
+                    "clear action must remain inside the surface at width {width}: surface={surface:?}, clear={clear:?}"
+                );
+                assert!(
+                    clear.width() >= PRIMARY_TARGET_HEIGHT
+                        && clear.height() >= PRIMARY_TARGET_HEIGHT,
+                    "clear action must retain a 44px target at width {width}: {clear:?}"
+                );
+            }
         }
     }
 
@@ -791,6 +1116,35 @@ mod tests {
             },
         );
         assert!(clear_requested);
+
+        let _ = ctx.run(
+            egui::RawInput {
+                focused: true,
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(320.0, 120.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    clear_requested = search_field(
+                        ui,
+                        ui.available_width(),
+                        "search-field-escape",
+                        &mut query,
+                        "Search models",
+                        "Search models",
+                        "Filters models as you type.",
+                    )
+                    .clear_requested;
+                });
+            },
+        );
+        assert!(
+            !clear_requested,
+            "a single Escape press must request exactly one clear action"
+        );
     }
 
     #[test]
@@ -821,6 +1175,7 @@ mod tests {
                             "Filters models as you type.",
                         )
                         .clear
+                        .expect("roomy search should render its clear action")
                         .id;
                     });
                 },
