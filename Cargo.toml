@@ -39,6 +39,11 @@ windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Graphic
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[dev-dependencies]
+# Exercise egui's incremental accessibility updates through the same
+# consumer version used by the Windows adapter.
+accesskit_consumer = "=0.16.1"
+
 [build-dependencies]
 cc = "1"
 sha2 = "0.10"

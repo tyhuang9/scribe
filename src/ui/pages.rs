@@ -5,6 +5,8 @@ use eframe::egui::{self, RichText};
 
 use crate::history::{HistoryRecord, HistoryStatus};
 
+use super::controls::search_field;
+
 fn semantic_heading(ui: &mut egui::Ui, text: RichText) -> egui::Response {
     let response = ui.label(text);
     ui.ctx().accesskit_node_builder(response.id, |builder| {
@@ -28,15 +30,18 @@ fn set_accessible_description(ui: &egui::Ui, response: &egui::Response, descript
 fn set_collapsing_header_accessibility<R>(
     ctx: &egui::Context,
     response: &egui::containers::CollapsingResponse<R>,
+    description: &str,
 ) {
     ctx.accesskit_node_builder(response.header_response.id, |builder| {
         builder.set_expanded(response.body_response.is_some());
+        builder.set_description(description);
     });
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum HistoryPageAction {
     ApplySearch,
+    ClearSearch,
     Refresh,
     LoadMore,
     Copy { text: String, label: &'static str },
@@ -85,32 +90,76 @@ pub(crate) fn history_page(
         focus_delete_confirmation,
     } = state;
     let mut action = None;
-    ui.horizontal(|ui| {
-        let label = ui.label("Search history");
-        let search_response = ui.add_sized(
-            [(ui.available_width() - 188.0).max(120.0), 44.0],
-            egui::TextEdit::singleline(search).hint_text("Search transcript, model, or app"),
-        );
-        search_response.clone().labelled_by(label.id);
-        if focus_search {
-            search_response.request_focus();
-        }
-        let enter =
-            search_response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
-        if ui
-            .add_sized([86.0, 44.0], egui::Button::new("Search"))
-            .clicked()
-            || enter
-        {
-            action = Some(HistoryPageAction::ApplySearch);
-        }
-        if ui
-            .add_sized([86.0, 44.0], egui::Button::new("Refresh"))
-            .clicked()
-        {
-            action = Some(HistoryPageAction::Refresh);
+    const HISTORY_ACTION_WIDTH: f32 = 86.0;
+    const HISTORY_CONTROL_HEIGHT: f32 = 44.0;
+    const MINIMUM_INLINE_SEARCH_WIDTH: f32 = 160.0;
+    let row_spacing = ui.spacing().item_spacing.x;
+    let single_row_minimum = MINIMUM_INLINE_SEARCH_WIDTH + HISTORY_ACTION_WIDTH + row_spacing;
+    let single_row = ui.available_width() >= single_row_minimum;
+    let mut search_response = None;
+    ui.vertical(|ui| {
+        if single_row {
+            ui.horizontal(|ui| {
+                let search_width =
+                    ui.available_width() - HISTORY_ACTION_WIDTH - ui.spacing().item_spacing.x;
+                search_response = Some(search_field(
+                    ui,
+                    search_width,
+                    "history-search",
+                    search,
+                    "Search history",
+                    "Search transcript, model, or app",
+                    "Filters saved history as you type.",
+                ));
+                let refresh_clicked = ui
+                    .add_sized(
+                        [HISTORY_ACTION_WIDTH, HISTORY_CONTROL_HEIGHT],
+                        egui::Button::new("Refresh"),
+                    )
+                    .clicked();
+                if refresh_clicked {
+                    action = Some(HistoryPageAction::Refresh);
+                }
+            });
+        } else {
+            search_response = Some(search_field(
+                ui,
+                ui.available_width(),
+                "history-search",
+                search,
+                "Search history",
+                "Search transcript, model, or app",
+                "Filters saved history as you type.",
+            ));
+            ui.add_space(ui.spacing().item_spacing.y);
+            // Keep Refresh on a second row before it can force the search
+            // field below its usable width. On very narrow routes the wrapped
+            // layout keeps the 44px control contained.
+            let action_width =
+                HISTORY_ACTION_WIDTH.min(ui.available_width().max(HISTORY_CONTROL_HEIGHT));
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .add_sized(
+                        [action_width, HISTORY_CONTROL_HEIGHT],
+                        egui::Button::new("Refresh"),
+                    )
+                    .clicked()
+                {
+                    action = Some(HistoryPageAction::Refresh);
+                }
+            });
         }
     });
+    let search_response = search_response.expect("history search field is always rendered");
+    if focus_search {
+        search_response.input.request_focus();
+    }
+    if search_response.changed {
+        action = Some(HistoryPageAction::ApplySearch);
+    }
+    if search_response.clear_requested {
+        action = Some(HistoryPageAction::ClearSearch);
+    }
 
     let history_status = if loading {
         "Loading local history".to_owned()
@@ -144,21 +193,24 @@ pub(crate) fn history_page(
     }
 
     ui.add_space(12.0);
+    let results_id = ui.make_persistent_id("history-results");
+    ui.ctx().accesskit_node_builder(results_id, |builder| {
+        builder.set_role(egui::accesskit::Role::Group);
+        builder.set_name("History results");
+    });
+    let ctx = ui.ctx().clone();
+    ctx.with_accessibility_parent(results_id, || {
     if loading && records.is_empty() {
         ui.spinner();
         ui.label("Loading local history…");
-        return action;
-    }
-    if records.is_empty() {
+    } else if records.is_empty() {
         ui.group(|ui| {
             ui.label(RichText::new("No matching history entries").strong());
             ui.label(
                 "Completed and failed dictations appear here when history storage is enabled.",
             );
         });
-        return action;
-    }
-
+    } else {
     for record in records {
         let time_label = relative_time_label(record.created_at_ms);
         let entry_context = format!(
@@ -167,14 +219,7 @@ pub(crate) fn history_page(
             time_label,
             record.model_id
         );
-        let card_id = ui.make_persistent_id(("history-card-group", record.id));
-        ui.ctx().accesskit_node_builder(card_id, |builder| {
-            builder.set_role(egui::accesskit::Role::Group);
-            builder.set_name(entry_context.clone());
-        });
-        let ctx = ui.ctx().clone();
-        ctx.with_accessibility_parent(card_id, || {
-            ui.group(|ui| {
+        ui.group(|ui| {
             ui.horizontal_wrapped(|ui| {
                 semantic_heading(
                     ui,
@@ -218,7 +263,11 @@ pub(crate) fn history_page(
                     .show(ui, |ui| {
                         ui.label(&record.raw_text);
                     });
-                set_collapsing_header_accessibility(ui.ctx(), &disclosure);
+                set_collapsing_header_accessibility(
+                    ui.ctx(),
+                    &disclosure,
+                    &format!("Shows or hides the raw transcript for {entry_context}"),
+                );
             }
             if let Some(failure) = record.failure.as_deref() {
                 ui.colored_label(ui.visuals().error_fg_color, failure);
@@ -297,9 +346,9 @@ pub(crate) fn history_page(
                     );
                     if armed_repaste == Some(record.id) {
                         ui.ctx().accesskit_node_builder(response.id, |builder| {
-                            builder.set_description(
-                                "Paste is already armed. Focus the destination and press the configured shortcut within 30 seconds.",
-                            );
+                            builder.set_description(format!(
+                                "Paste is already armed for {entry_context}. Focus the destination and press the configured shortcut within 30 seconds."
+                            ));
                         });
                     } else {
                         set_accessible_description(
@@ -447,7 +496,6 @@ pub(crate) fn history_page(
                     }
                 });
             }
-            });
         });
         ui.add_space(12.0);
     }
@@ -463,6 +511,8 @@ pub(crate) fn history_page(
     {
         action = Some(HistoryPageAction::LoadMore);
     }
+    }
+    });
     action
 }
 
@@ -507,4 +557,340 @@ pub(crate) fn about_page(ui: &mut egui::Ui, model_dir: &Path, config_path: Optio
         Some(path) => format!("Settings: {}", path.display()),
         None => "Settings: platform path unavailable".to_owned(),
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::configure_accessible_style;
+
+    fn render_history(
+        ctx: &egui::Context,
+        search: &mut String,
+        focus_search: bool,
+        focus_before_render: Option<egui::Id>,
+        events: Vec<egui::Event>,
+        width: f32,
+    ) -> (egui::FullOutput, Option<HistoryPageAction>, egui::Id) {
+        let mut action = None;
+        let mut search_id = egui::Id::NULL;
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, 320.0),
+                )),
+                focused: true,
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    search_id = ui.make_persistent_id("history-search");
+                    if let Some(id) = focus_before_render {
+                        ui.memory_mut(|memory| memory.request_focus(id));
+                    }
+                    action = history_page(ui, state(search, focus_search));
+                });
+            },
+        );
+        (output, action, search_id)
+    }
+
+    fn state<'a>(search: &'a mut String, focus_search: bool) -> HistoryPageState<'a> {
+        HistoryPageState {
+            search,
+            records: &[],
+            has_more: false,
+            loading: false,
+            error: None,
+            confirm_delete: None,
+            work_active: false,
+            playing: None,
+            playback_stopping: false,
+            armed_repaste: None,
+            focus_search,
+            focus_delete_confirmation: false,
+        }
+    }
+
+    #[test]
+    fn history_search_applies_the_typed_query_once_as_it_is_edited() {
+        let ctx = egui::Context::default();
+        configure_accessible_style(&ctx);
+        let mut search = String::new();
+        let raw = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(375.0, 240.0),
+            )),
+            focused: true,
+            ..Default::default()
+        };
+        let _ = ctx.run(raw(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                assert_eq!(history_page(ui, state(&mut search, true)), None);
+            });
+        });
+        let mut action = None;
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::Text("meeting".into())],
+                ..raw()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    action = history_page(ui, state(&mut search, false));
+                });
+            },
+        );
+        assert_eq!(search, "meeting");
+        assert_eq!(action, Some(HistoryPageAction::ApplySearch));
+
+        let _ = ctx.run(raw(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                action = history_page(ui, state(&mut search, false));
+            });
+        });
+        assert_eq!(
+            action, None,
+            "an unchanged live-search query must not trigger a second reload"
+        );
+    }
+
+    #[test]
+    fn history_search_and_refresh_wrap_without_escaping_a_narrow_route() {
+        for width in [120.0, 220.0] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            configure_accessible_style(&ctx);
+            let mut search = "meeting".to_owned();
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(width, 320.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        assert_eq!(history_page(ui, state(&mut search, false)), None);
+                    });
+                },
+            );
+            let nodes = &output
+                .platform_output
+                .accesskit_update
+                .expect("history controls should update AccessKit")
+                .nodes;
+            for name in ["Search history", "Refresh"] {
+                let node = nodes
+                    .iter()
+                    .find_map(|(_, node)| (node.name() == Some(name)).then_some(node))
+                    .unwrap_or_else(|| panic!("missing narrow history control: {name}"));
+                let bounds = node
+                    .bounds()
+                    .unwrap_or_else(|| panic!("{name} needs accessibility bounds"));
+                assert!(
+                    bounds.x0 >= 0.0
+                        && bounds.x1 <= f64::from(width)
+                        && bounds.y0 >= 0.0
+                        && bounds.y1 <= 320.0,
+                    "{name} must remain inside the narrow route at width {width}: {bounds:?}"
+                );
+                assert!(
+                    bounds.width() >= 44.0 && bounds.height() >= 44.0,
+                    "{name} must retain a 44px target at width {width}: {bounds:?}"
+                );
+            }
+            assert!(
+                nodes.iter().all(|(_, node)| node.name() != Some("Search")),
+                "History filters as it is edited and must not expose a redundant Search button"
+            );
+        }
+    }
+
+    #[test]
+    fn history_pointer_and_keyboard_clear_return_focus_exactly_once() {
+        #[derive(Clone, Copy, Debug)]
+        enum Activation {
+            Click,
+            Key(egui::Key),
+        }
+
+        for activation in [
+            Activation::Click,
+            Activation::Key(egui::Key::Enter),
+            Activation::Key(egui::Key::Space),
+        ] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            configure_accessible_style(&ctx);
+            let mut search = "meeting".to_owned();
+            let (initial, _, _) = render_history(&ctx, &mut search, false, None, Vec::new(), 375.0);
+            let initial_nodes = &initial
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .expect("history controls should update AccessKit")
+                .nodes;
+            let node_id = |name: &str| {
+                initial_nodes
+                    .iter()
+                    .find_map(|(id, node)| (node.name() == Some(name)).then_some(*id))
+                    .unwrap_or_else(|| panic!("missing History control: {name}"))
+            };
+            let clear_node = node_id("Clear Search history");
+            let action = match activation {
+                Activation::Click => {
+                    let bounds = initial
+                        .platform_output
+                        .accesskit_update
+                        .as_ref()
+                        .expect("history controls should update AccessKit")
+                        .nodes
+                        .iter()
+                        .find_map(|(_, node)| {
+                            (node.name() == Some("Clear Search history")).then(|| node.bounds())
+                        })
+                        .flatten()
+                        .expect("populated history search needs a clear target");
+                    let point = egui::pos2(
+                        ((bounds.x0 + bounds.x1) / 2.0) as f32,
+                        ((bounds.y0 + bounds.y1) / 2.0) as f32,
+                    );
+                    let (_, pressed, _) = render_history(
+                        &ctx,
+                        &mut search,
+                        false,
+                        None,
+                        vec![
+                            egui::Event::PointerMoved(point),
+                            egui::Event::PointerButton {
+                                pos: point,
+                                button: egui::PointerButton::Primary,
+                                pressed: true,
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                        ],
+                        375.0,
+                    );
+                    assert_eq!(pressed, None, "pointer press must not clear early");
+                    render_history(
+                        &ctx,
+                        &mut search,
+                        false,
+                        None,
+                        vec![
+                            egui::Event::PointerMoved(point),
+                            egui::Event::PointerButton {
+                                pos: point,
+                                button: egui::PointerButton::Primary,
+                                pressed: false,
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                        ],
+                        375.0,
+                    )
+                    .1
+                }
+                Activation::Key(key) => {
+                    let (_, focus_action, _) = render_history(
+                        &ctx,
+                        &mut search,
+                        false,
+                        None,
+                        vec![egui::Event::AccessKitActionRequest(
+                            egui::accesskit::ActionRequest {
+                                action: egui::accesskit::Action::Focus,
+                                target: clear_node,
+                                data: None,
+                            },
+                        )],
+                        375.0,
+                    );
+                    assert_eq!(focus_action, None);
+                    let (_, settled_action, _) =
+                        render_history(&ctx, &mut search, false, None, Vec::new(), 375.0);
+                    assert_eq!(settled_action, None);
+                    render_history(
+                        &ctx,
+                        &mut search,
+                        false,
+                        None,
+                        vec![egui::Event::Key {
+                            key,
+                            physical_key: None,
+                            pressed: true,
+                            repeat: false,
+                            modifiers: egui::Modifiers::NONE,
+                        }],
+                        375.0,
+                    )
+                    .1
+                }
+            };
+
+            assert_eq!(
+                action,
+                Some(HistoryPageAction::ClearSearch),
+                "{activation:?} must clear History"
+            );
+            let mut clear_count = 1;
+            search.clear();
+            let (focused, next_action, _) =
+                render_history(&ctx, &mut search, true, None, Vec::new(), 375.0);
+            assert_eq!(next_action, None);
+            let update = focused
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .expect("focused history search should update AccessKit");
+            let focused_node = update
+                .nodes
+                .iter()
+                .find_map(|(id, node)| (*id == update.focus).then_some(node))
+                .expect("focused History node should be present");
+            assert_eq!(focused_node.name(), Some("Search history"));
+            let (_, repeated_action, _) =
+                render_history(&ctx, &mut search, false, None, Vec::new(), 375.0);
+            if repeated_action == Some(HistoryPageAction::ClearSearch) {
+                clear_count += 1;
+            }
+            assert_eq!(clear_count, 1, "a clear gesture must be handled once");
+        }
+    }
+
+    #[test]
+    fn history_inline_controls_fit_at_the_minimum_search_width_threshold() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut search = "meeting".to_owned();
+        // CentralPanel contributes 8px on each side, leaving exactly
+        // 160px search + 8px gap + 86px Refresh in the route.
+        let width = 270.0;
+        let (output, action, _) = render_history(&ctx, &mut search, false, None, Vec::new(), width);
+        assert_eq!(action, None);
+        let nodes = &output
+            .platform_output
+            .accesskit_update
+            .expect("history controls should update AccessKit")
+            .nodes;
+        let bounds = |name: &str| {
+            nodes
+                .iter()
+                .find_map(|(_, node)| (node.name() == Some(name)).then(|| node.bounds()))
+                .flatten()
+                .unwrap_or_else(|| panic!("missing bounds for {name}"))
+        };
+        let search_bounds = bounds("Search history");
+        let clear_bounds = bounds("Clear Search history");
+        let refresh_bounds = bounds("Refresh");
+        assert_eq!(search_bounds.y0, refresh_bounds.y0);
+        assert_eq!(clear_bounds.y0, refresh_bounds.y0);
+        assert!(clear_bounds.x1 < refresh_bounds.x0);
+        assert!(refresh_bounds.x1 <= f64::from(width));
+    }
 }
