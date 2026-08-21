@@ -73,21 +73,15 @@ impl SettingsHelp {
 
 fn settings_help_metadata(label: &str) -> Option<SettingsHelp> {
     match label {
-        "Mode" => Some(RECORDING_MODE_HELP),
-        "Duration limit" => Some(DURATION_LIMIT_HELP),
-        "Global record hotkey" => Some(GLOBAL_RECORD_HOTKEY_HELP),
-        "Device" => Some(AUDIO_DEVICE_HELP),
-        "Streaming mode" => Some(STREAMING_MODE_HELP),
         "Transcription device" => Some(TRANSCRIPTION_DEVICE_HELP),
+        "Streaming mode" => Some(STREAMING_MODE_HELP),
         "Speech confirmation ms" => Some(SPEECH_CONFIRMATION_HELP),
         "Internal pause ms" => Some(INTERNAL_PAUSE_HELP),
         "End after silence ms" => Some(END_AFTER_SILENCE_HELP),
         "Pre-roll ms" => Some(PRE_ROLL_HELP),
         "Post-roll ms" => Some(POST_ROLL_HELP),
         "Active model" => Some(ACTIVE_MODEL_HELP),
-        "Theme" => Some(THEME_HELP),
         "Dictation overlay" => Some(DICTATION_OVERLAY_HELP),
-        "Overlay position" => Some(OVERLAY_POSITION_HELP),
         "Paste delay ms" => Some(PASTE_DELAY_HELP),
         "History storage" => Some(HISTORY_STORAGE_HELP),
         "Maximum unpinned entries" => Some(MAX_HISTORY_ENTRIES_HELP),
@@ -97,45 +91,21 @@ fn settings_help_metadata(label: &str) -> Option<SettingsHelp> {
     }
 }
 
-const RECORDING_MODE_HELP: SettingsHelp = SettingsHelp::new(
-    "recording-mode-help",
-    "Choose whether the record shortcut starts and stops recording, or records only while it is held.",
-);
-const DURATION_LIMIT_HELP: SettingsHelp = SettingsHelp::new(
-    "duration-limit-help",
-    "Automatically stop a recording at this limit to prevent an accidental recording from continuing.",
-);
-const GLOBAL_RECORD_HOTKEY_HELP: SettingsHelp = SettingsHelp::new(
-    "global-record-hotkey-help",
-    "This shortcut starts recording anywhere on your desktop when Scribe can register it.",
-);
-const AUDIO_DEVICE_HELP: SettingsHelp = SettingsHelp::new(
-    "audio-device-help",
-    "Choose the microphone Scribe listens to. OS default follows your system's current input device.",
-);
-const STREAMING_MODE_HELP: SettingsHelp = SettingsHelp::new(
-    "streaming-mode-help",
-    "Choose whether Scribe shows a rolling local preview while recording or waits for the final transcription.",
-);
 const TRANSCRIPTION_DEVICE_HELP: SettingsHelp = SettingsHelp::new(
     "transcription-device-help",
     "Auto selects available local hardware. GPU may be faster when supported; CPU only avoids GPU acceleration.",
+);
+const STREAMING_MODE_HELP: SettingsHelp = SettingsHelp::new(
+    "streaming-mode-help",
+    "For transcription sessions, Auto and Rolling preview show temporary local text while recording; Final text only waits for the final transcription.",
 );
 const ACTIVE_MODEL_HELP: SettingsHelp = SettingsHelp::new(
     "active-model-help",
     "The selected local model determines transcription accuracy, speed, and disk use. Manage models to change it.",
 );
-const THEME_HELP: SettingsHelp = SettingsHelp::new(
-    "theme-help",
-    "System follows your desktop appearance. Light and Dark keep Scribe in that appearance regardless of system changes.",
-);
 const DICTATION_OVERLAY_HELP: SettingsHelp = SettingsHelp::new(
     "dictation-overlay-help",
     "Show recording feedback above other apps. This is unavailable where Scribe cannot verify that the overlay will not steal focus.",
-);
-const OVERLAY_POSITION_HELP: SettingsHelp = SettingsHelp::new(
-    "overlay-position-help",
-    "Choose whether the dictation overlay appears near the top or bottom of the active display.",
 );
 const PASTE_DELAY_HELP: SettingsHelp = SettingsHelp::new(
     "paste-delay-help",
@@ -6045,7 +6015,6 @@ fn recording_settings_panel(
             ctx.accesskit_node_builder(radio_group_id, |builder| {
                 builder.set_role(egui::accesskit::Role::RadioGroup);
                 builder.set_name("Recording mode");
-                builder.set_description(RECORDING_MODE_HELP.description);
             });
             ctx.with_accessibility_parent(radio_group_id, || {
                 compact_setting_row(ui, "Mode", true, |ui, _| {
@@ -6077,7 +6046,7 @@ fn recording_settings_panel(
             }
             compact_setting_row(ui, "Duration limit", false, |ui, label_id| {
                 let mut duration = settings.duration_seconds;
-                let response = ComboBox::from_id_source("duration-limit")
+                ComboBox::from_id_source("duration-limit")
                     .selected_text(&settings.duration_label)
                     .width(240.0)
                     .show_ui(ui, |ui| {
@@ -6091,7 +6060,6 @@ fn recording_settings_panel(
                     })
                     .response
                     .labelled_by(label_id);
-                describe_setting(ui, &response, DURATION_LIMIT_HELP);
                 if duration != settings.duration_seconds {
                     *action = ScreenAction::SetDurationSeconds(duration);
                 }
@@ -6124,7 +6092,6 @@ fn recording_settings_panel(
                         let capture = button(ui, capture_name, ButtonTone::Secondary);
                         ui.ctx().accesskit_node_builder(capture.id, |builder| {
                             builder.set_name(capture_name);
-                            builder.set_description(GLOBAL_RECORD_HOTKEY_HELP.description);
                             builder.set_selected(settings.hotkey_capture_active);
                         });
                         if capture.clicked() {
@@ -6142,7 +6109,7 @@ fn recording_settings_panel(
             });
             compact_setting_row(ui, "Device", true, |ui, label_id| {
                 let mut selected = settings.selected_audio_device.clone();
-                let response = ComboBox::from_id_source("audio-device")
+                ComboBox::from_id_source("audio-device")
                     .selected_text(&settings.device_label)
                     .width(360.0)
                     .show_ui(ui, |ui| {
@@ -6153,7 +6120,6 @@ fn recording_settings_panel(
                     })
                     .response
                     .labelled_by(label_id);
-                describe_setting(ui, &response, AUDIO_DEVICE_HELP);
                 if selected != settings.selected_audio_device {
                     *action = ScreenAction::SetAudioDevice(selected);
                 }
@@ -6424,8 +6390,8 @@ fn general_settings_panel(
     ui.add_space(16.0);
     settings_section(ui, "Appearance", |ui| {
         let mut theme = settings.theme_label.clone();
-        let _ = SettingsRow::show(ui, "Theme", true, |ui, label_id| {
-            let response = ComboBox::from_id_source("theme-mode")
+        compact_setting_row(ui, "Theme", true, |ui, label_id| {
+            ComboBox::from_id_source("theme-mode")
                 .selected_text(&theme)
                 .show_ui(ui, |ui| {
                     for value in ["Light", "Dark", "System"] {
@@ -6434,7 +6400,6 @@ fn general_settings_panel(
                 })
                 .response
                 .labelled_by(label_id);
-            describe_setting(ui, &response, THEME_HELP);
         });
         if theme != settings.theme_label {
             *action = ScreenAction::SetTheme(theme);
@@ -6463,24 +6428,21 @@ fn general_settings_panel(
             *action = ScreenAction::SetOverlayMode(overlay);
         }
         let mut position = settings.overlay_position_label.clone();
-        let _ = SettingsRow::show(ui, "Overlay position", false, |ui, label_id| {
-            let response = ui
-                .add_enabled_ui(
-                    settings.overlay_available && settings.overlay_label != "Off",
-                    |ui| {
-                        ComboBox::from_id_source("overlay-position")
-                            .selected_text(&position)
-                            .show_ui(ui, |ui| {
-                                for value in ["Top", "Bottom"] {
-                                    ui.selectable_value(&mut position, value.to_owned(), value);
-                                }
-                            })
-                            .response
-                            .labelled_by(label_id)
-                    },
-                )
-                .inner;
-            describe_setting(ui, &response, OVERLAY_POSITION_HELP);
+        compact_setting_row(ui, "Overlay position", false, |ui, label_id| {
+            ui.add_enabled_ui(
+                settings.overlay_available && settings.overlay_label != "Off",
+                |ui| {
+                    ComboBox::from_id_source("overlay-position")
+                        .selected_text(&position)
+                        .show_ui(ui, |ui| {
+                            for value in ["Top", "Bottom"] {
+                                ui.selectable_value(&mut position, value.to_owned(), value);
+                            }
+                        })
+                        .response
+                        .labelled_by(label_id)
+                },
+            );
         });
         if position != settings.overlay_position_label {
             *action = ScreenAction::SetOverlayPosition(position);
@@ -10313,12 +10275,10 @@ mod tests {
         assert!(nodes.iter().any(|(_, node)| {
             node.role() == egui::accesskit::Role::RadioGroup
                 && node.name() == Some("Recording mode")
-                && node.description() == Some(RECORDING_MODE_HELP.description)
         }));
-        assert!(nodes.iter().any(|(_, node)| {
+        assert!(!nodes.iter().any(|(_, node)| {
             node.role() == egui::accesskit::Role::Button
-                && node.name() == Some("Change shortcut")
-                && node.description() == Some(GLOBAL_RECORD_HOTKEY_HELP.description)
+                && node.name() == Some("Global record hotkey information")
         }));
         let selected_tab = nodes
             .iter()
@@ -10520,19 +10480,13 @@ mod tests {
                 SettingsTab::General,
                 &[
                     ("Active model", ACTIVE_MODEL_HELP),
-                    ("Theme", THEME_HELP),
                     ("Dictation overlay", DICTATION_OVERLAY_HELP),
-                    ("Overlay position", OVERLAY_POSITION_HELP),
                     ("Paste delay ms", PASTE_DELAY_HELP),
                 ][..],
             ),
             (
                 SettingsTab::Recording,
                 &[
-                    ("Mode", RECORDING_MODE_HELP),
-                    ("Duration limit", DURATION_LIMIT_HELP),
-                    ("Global record hotkey", GLOBAL_RECORD_HOTKEY_HELP),
-                    ("Device", AUDIO_DEVICE_HELP),
                     ("Streaming mode", STREAMING_MODE_HELP),
                     ("Transcription device", TRANSCRIPTION_DEVICE_HELP),
                 ][..],
@@ -10550,6 +10504,16 @@ mod tests {
                     ("Transcript days", TRANSCRIPT_RETENTION_DAYS_HELP),
                     ("Audio days", AUDIO_RETENTION_DAYS_HELP),
                 ][..],
+            ),
+        ];
+        let expected_absent = [
+            (
+                SettingsTab::General,
+                ["Theme", "Overlay position"].as_slice(),
+            ),
+            (
+                SettingsTab::Recording,
+                ["Mode", "Duration limit", "Global record hotkey", "Device"].as_slice(),
             ),
         ];
 
@@ -10580,6 +10544,30 @@ mod tests {
                 assert_eq!(help_node.is_expanded(), Some(false));
                 let bounds = help_node.bounds().expect("help target bounds");
                 assert!(bounds.width() >= 44.0 && bounds.height() >= 44.0);
+            }
+        }
+        for (tab, labels) in expected_absent {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            let output = ctx.run(Default::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let _ = settings(ui, tab, &TranscriptionState::default(), &settings_view);
+                });
+            });
+            let nodes = &output
+                .platform_output
+                .accesskit_update
+                .expect("settings should expose AccessKit")
+                .nodes;
+            for label in labels {
+                let name = format!("{label} information");
+                assert!(
+                    !nodes.iter().any(|(_, node)| {
+                        node.role() == egui::accesskit::Role::Button
+                            && node.name() == Some(name.as_str())
+                    }),
+                    "{name} should not expose redundant contextual help"
+                );
             }
         }
     }
@@ -11693,9 +11681,7 @@ mod tests {
             let nodes = &output.platform_output.accesskit_update.unwrap().nodes;
             if tab == SettingsTab::Recording {
                 assert!(nodes.iter().any(|(_, node)| {
-                    node.name() == Some("Cancel hotkey capture")
-                        && node.is_selected() == Some(true)
-                        && node.description() == Some(GLOBAL_RECORD_HOTKEY_HELP.description)
+                    node.name() == Some("Cancel hotkey capture") && node.is_selected() == Some(true)
                 }));
             } else {
                 let history_storage_description = format!(
