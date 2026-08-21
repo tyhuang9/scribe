@@ -120,13 +120,14 @@ impl Fixture {
                 session_id: Some(SessionId(42)),
                 mode,
                 phase: OverlayPhase::Listening,
+                live_preview_available: mode == OverlayMode::Live,
                 audio_level: OverlayAudioLevel::new(0.58, 0.78),
                 transcript: OverlayTranscript {
-                    committed: "Clicking the settings icon in the top".to_owned(),
-                    tentative: "right opens recording preferences.".to_owned(),
+                    committed: "Alright, What is going on? Why is there a line on".to_owned(),
+                    tentative: "That's pretty cool. These newest words stay visible.".to_owned(),
                     revision: 1,
                 },
-                elapsed: Some(Duration::from_secs(12)),
+                elapsed: Some(Duration::from_secs(10)),
                 ..OverlayViewState::default()
             },
         })
@@ -1045,10 +1046,16 @@ mod tests {
                 overlay.state.audio_level,
                 OverlayAudioLevel::new(0.58, 0.78)
             );
-            assert_eq!(overlay.state.elapsed, Some(Duration::from_secs(12)));
+            assert_eq!(overlay.state.elapsed, Some(Duration::from_secs(10)));
             assert_eq!(overlay.state.transcript.revision, 1);
-            assert!(!overlay.state.transcript.committed.is_empty());
-            assert!(!overlay.state.transcript.tentative.is_empty());
+            assert_eq!(
+                overlay.state.transcript.committed,
+                "Alright, What is going on? Why is there a line on"
+            );
+            assert_eq!(
+                overlay.state.transcript.tentative,
+                "That's pretty cool. These newest words stay visible."
+            );
             assert!(overlay.state.transcript_announcement.is_none());
             assert!(overlay.state.notice.is_none());
             assert!(overlay.state.error.is_none());
@@ -1433,7 +1440,10 @@ mod tests {
             assert_within_tolerance(hotkey.y0, 118.0, 3.0, "wide hotkey row start");
             assert_within_tolerance(panel.y0, 185.0, 6.0, "wide transcript panel top");
 
-            let bounds = node_matching(&output, |node| node.name() == Some(committed.as_str()))
+            let committed_node =
+                node_matching(&output, |node| node.name() == Some(committed.as_str()));
+            assert_eq!(committed_node.live(), Some(egui::accesskit::Live::Polite));
+            let bounds = committed_node
                 .bounds()
                 .expect("inline transcript label should expose bounds");
             assert_bounds_within(bounds, panel, "wrapped inline transcript text");
@@ -1441,11 +1451,24 @@ mod tests {
                 bounds.y1 - bounds.y0 > 32.0,
                 "inline transcript label did not wrap: {bounds:?}"
             );
+            let estimate_name = format!("Live estimate, may change: {provisional}");
+            let estimate =
+                node_matching(&output, |node| node.name() == Some(estimate_name.as_str()));
+            assert_eq!(estimate.role(), egui::accesskit::Role::StaticText);
+            assert!(estimate.live().is_none());
             assert!(
-                !node_names(&output)
+                output
+                    .platform_output
+                    .accesskit_update
+                    .as_ref()
+                    .unwrap()
+                    .nodes
                     .iter()
-                    .any(|name| name.contains(&provisional)),
-                "provisional text should remain visual-only and outside live accessibility names"
+                    .filter(|(_, node)| node.live() == Some(egui::accesskit::Live::Polite))
+                    .all(|(_, node)| {
+                        !node.name().is_some_and(|name| name.contains(&provisional))
+                    }),
+                "provisional text must remain outside polite live regions"
             );
             for name in ["Clear", "Copy"] {
                 let bounds = node_matching(&output, |node| {

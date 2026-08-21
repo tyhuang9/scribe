@@ -373,6 +373,7 @@ fn map_native_error(error: NativeError) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transcription::PreviewDecodeOptions;
 
     #[test]
     fn queued_request_cancelled_before_router_transcribe_never_starts_native_inference() {
@@ -452,6 +453,18 @@ mod tests {
         assert_eq!(native.task, Task::Translate);
         assert_eq!(native.timestamps, TimestampKind::Segment);
         assert_eq!(native.language.as_deref(), Some("en"));
+    }
+
+    #[test]
+    fn capable_preview_policy_requests_native_segment_timestamps() {
+        let preview = PreviewDecodeOptions::for_capabilities(&RuntimeCapabilities {
+            timestamps: true,
+            ..RuntimeCapabilities::default()
+        });
+
+        let native = run_options(&preview.transcription_options());
+
+        assert_eq!(native.timestamps, TimestampKind::Segment);
     }
 
     #[test]

@@ -274,19 +274,24 @@ fn onnx_bundle_http_and_typed_receipts_stay_below_the_service_boundary() {
 }
 
 #[test]
-fn tentative_transcripts_have_no_output_module_path() {
-    let output = fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("src")
-            .join("text_output.rs"),
-    )
-    .expect("text output source must be readable");
-    let production = production_prefix(&output).to_ascii_lowercase();
+fn tentative_transcripts_have_no_output_or_history_module_path() {
+    let source_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let protected = [
+        source_root.join("text_output.rs"),
+        source_root.join("history").join("mod.rs"),
+        source_root.join("history").join("database.rs"),
+    ];
 
-    assert!(
-        !production.contains("tentative"),
-        "text output must only receive finalized text; tentative text belongs in the overlay"
-    );
+    for path in protected {
+        let source = fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("{} must be readable: {error}", path.display()));
+        let production = production_prefix(&source).to_ascii_lowercase();
+        assert!(
+            !production.contains("tentative"),
+            "{} must only receive finalized text; tentative text belongs in the overlay",
+            path.display()
+        );
+    }
 }
 
 #[test]

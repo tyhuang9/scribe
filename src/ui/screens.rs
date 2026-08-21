@@ -1373,9 +1373,18 @@ fn transcript_frame(
                                 transcript.append(
                                     &state.committed_transcript,
                                     0.0,
-                                    body_format.clone(),
+                                    body_format,
                                 );
-                                transcript.append(" ", 0.0, body_format);
+                                transcript.append(
+                                    "  Live estimate: ",
+                                    0.0,
+                                    egui::TextFormat {
+                                        font_id: egui::TextStyle::Body.resolve(ui.style()),
+                                        color: colors.tertiary_text,
+                                        italics: true,
+                                        ..Default::default()
+                                    },
+                                );
                                 transcript.append(
                                     &state.provisional_transcript,
                                     0.0,
@@ -1390,21 +1399,46 @@ fn transcript_frame(
                             };
                             ui.ctx().accesskit_node_builder(response.id, |builder| {
                                 builder.set_name(state.committed_transcript.as_str());
+                                if !state.provisional_transcript.is_empty() {
+                                    builder.set_description(
+                                        "Italic text is a live estimate and may change until recording ends.",
+                                    );
+                                }
                                 if !state.suppress_live_announcements {
                                     builder.set_live(egui::accesskit::Live::Polite);
                                     builder.set_live_atomic();
                                 }
                             });
+                            if !state.provisional_transcript.is_empty() {
+                                let estimate =
+                                    ui.allocate_response(Vec2::ZERO, egui::Sense::hover());
+                                ui.ctx().accesskit_node_builder(estimate.id, |builder| {
+                                    builder.set_role(egui::accesskit::Role::StaticText);
+                                    builder.set_name(format!(
+                                        "Live estimate, may change: {}",
+                                        state.provisional_transcript
+                                    ));
+                                });
+                            }
                         }
                         if state.committed_transcript.trim().is_empty()
                             && !state.provisional_transcript.is_empty()
                         {
                             ui.add_space(8.0);
-                            ui.label(
-                                RichText::new(&state.provisional_transcript)
-                                    .italics()
-                                    .color(colors.tertiary_text),
+                            let response = ui.label(
+                                RichText::new(format!(
+                                    "Live estimate: {}",
+                                    state.provisional_transcript
+                                ))
+                                .italics()
+                                .color(colors.tertiary_text),
                             );
+                            ui.ctx().accesskit_node_builder(response.id, |builder| {
+                                builder.set_name(format!(
+                                    "Live estimate, may change: {}",
+                                    state.provisional_transcript
+                                ));
+                            });
                         }
                         if state.last_successful_capture_ms.is_some()
                             || state.selected_model_id.is_some()
@@ -8773,14 +8807,43 @@ mod tests {
                 .iter()
                 .any(|(_, node)| node.name() == Some("Recording"))
         );
-        assert!(polite_nodes.iter().any(|(_, node)| {
-            node.name()
-                .is_some_and(|name| name.contains("committed words"))
-        }));
+        let committed = nodes
+            .iter()
+            .find_map(|(_, node)| (node.name() == Some("committed words")).then_some(node))
+            .expect("committed transcript node");
+        assert_eq!(committed.live(), Some(egui::accesskit::Live::Polite));
+        let estimate = nodes
+            .iter()
+            .find_map(|(_, node)| {
+                (node.name() == Some("Live estimate, may change: tentative words")).then_some(node)
+            })
+            .expect("separate live-estimate node with actual provisional text");
+        assert_eq!(estimate.role(), egui::accesskit::Role::StaticText);
+        assert!(estimate.live().is_none());
         assert!(polite_nodes.iter().all(|(_, node)| {
             !node
                 .name()
                 .is_some_and(|name| name.contains("tentative words"))
+        }));
+        assert!(nodes.iter().any(|(_, node)| {
+            node.description()
+                == Some("Italic text is a live estimate and may change until recording ends.")
+        }));
+    }
+
+    #[test]
+    fn provisional_only_text_is_visibly_and_accessibly_named_as_a_live_estimate() {
+        let state = TranscriptionState {
+            phase: TranscriptionPhase::Listening,
+            selected_model_id: Some("base.en".into()),
+            provisional_transcript: "words may change".into(),
+            ..Default::default()
+        };
+        let output = render_transcribe(&state, &[]);
+        let nodes = &output.platform_output.accesskit_update.unwrap().nodes;
+
+        assert!(nodes.iter().any(|(_, node)| {
+            node.name() == Some("Live estimate, may change: words may change")
         }));
     }
 

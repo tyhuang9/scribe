@@ -771,8 +771,11 @@ impl TranscriptStabilizer {
         }
 
         if commit_count > 0 {
-            self.committed.extend(current.drain(..commit_count));
-            self.state.committed = render_words(&self.committed);
+            for word in current.drain(..commit_count) {
+                append_display_word(&mut self.state.committed, &word.display);
+                self.committed.push(word);
+            }
+            debug_assert_eq!(self.state.committed, render_words(&self.committed));
         }
         self.previous = Some(current.clone());
         self.refresh_tentative(&current);
@@ -902,10 +905,9 @@ fn remove_committed_overlap(
     let overlap = (1..=max_overlap)
         .rev()
         .find(|&count| {
-            committed[committed.len() - count..]
-                .iter()
-                .zip(&current[..count])
-                .all(|(left, right)| normalized(&left.display) == normalized(&right.display))
+            let committed_tail = &committed[committed.len() - count..];
+            let current_prefix = &current[..count];
+            word_sequences_match(committed_tail, current_prefix)
         })
         .unwrap_or_default();
     if overlap > 0 {
@@ -915,12 +917,63 @@ fn remove_committed_overlap(
 }
 
 fn has_full_committed_prefix(committed: &[HypothesisWord], current: &[HypothesisWord]) -> bool {
-    !committed.is_empty()
-        && current.len() >= committed.len()
-        && committed
+    if committed.is_empty() || current.len() < committed.len() {
+        return false;
+    }
+    let current_prefix = &current[..committed.len()];
+    word_sequences_match(committed, current_prefix)
+}
+
+fn word_sequences_match(left: &[HypothesisWord], right: &[HypothesisWord]) -> bool {
+    if left.len() != right.len()
+        || !left
             .iter()
-            .zip(&current[..committed.len()])
+            .zip(right)
             .all(|(left, right)| normalized(&left.display) == normalized(&right.display))
+    {
+        return false;
+    }
+    let timestamped = timestamps_are_trustworthy(left) && timestamps_are_trustworthy(right);
+    if !timestamped {
+        return true;
+    }
+    if left
+        .iter()
+        .zip(right)
+        .all(|(left, right)| timestamps_match(left, right))
+    {
+        return true;
+    }
+
+    // Native decoders expose segment timing, not word timing. Preview mapping
+    // therefore divides each segment evenly across its words, and the same
+    // spoken clause can move by more than the per-word drift allowance when a
+    // pause changes segment boundaries in the next rolling window. A
+    // multi-word sequence whose aggregate audio spans substantially overlap is
+    // still the same audio. Disjoint repeated speech remains new text.
+    left.len() > 1 && timestamp_spans_substantially_overlap(left, right)
+}
+
+fn timestamp_spans_substantially_overlap(
+    left: &[HypothesisWord],
+    right: &[HypothesisWord],
+) -> bool {
+    let (Some(left_start), Some(left_end), Some(right_start), Some(right_end)) = (
+        left.first().and_then(|word| word.start_frame),
+        left.last().and_then(|word| word.end_frame),
+        right.first().and_then(|word| word.start_frame),
+        right.last().and_then(|word| word.end_frame),
+    ) else {
+        return false;
+    };
+    let overlap_start = left_start.max(right_start);
+    let overlap_end = left_end.min(right_end);
+    if overlap_end <= overlap_start {
+        return false;
+    }
+    let overlap = overlap_end - overlap_start;
+    let shorter_span = (left_end - left_start).min(right_end - right_start);
+    overlap.saturating_mul(2) >= shorter_span
 }
 
 fn normalized(display: &str) -> String {
@@ -934,15 +987,19 @@ fn normalized(display: &str) -> String {
 fn render_words(words: &[HypothesisWord]) -> String {
     let mut text = String::new();
     for word in words {
-        if word.display.is_empty() {
-            continue;
-        }
-        if !text.is_empty() && !is_closing_punctuation(&word.display) {
-            text.push(' ');
-        }
-        text.push_str(&word.display);
+        append_display_word(&mut text, &word.display);
     }
     text
+}
+
+fn append_display_word(text: &mut String, display: &str) {
+    if display.is_empty() {
+        return;
+    }
+    if !text.is_empty() && !is_closing_punctuation(display) {
+        text.push(' ');
+    }
+    text.push_str(display);
 }
 
 fn is_closing_punctuation(word: &str) -> bool {
@@ -1309,6 +1366,42 @@ mod tests {
     }
 
     #[test]
+    fn correction_dropout_punctuation_and_rollover_trace_keeps_committed_bytes_monotonic() {
+        let mut stabilizer =
+            TranscriptStabilizer::new(SessionId(7), RequestId(11), ModelId::new("preview-model"));
+        let trace = [
+            hypothesis(1, 0, 48_000, "Schedule a meeting with Alice"),
+            hypothesis(2, 0, 48_000, "Schedule a meeting with Alice"),
+            hypothesis(3, 0, 48_000, "Schedule a meeting with Alex tomorrow"),
+            hypothesis(4, 0, 48_000, "Schedule a meeting with Alex tomorrow"),
+            hypothesis(5, 0, 48_000, ""),
+            hypothesis(6, 16_000, 64_000, "with Alex tomorrow, tomorrow at noon"),
+            hypothesis(7, 16_000, 64_000, "with Alex tomorrow, tomorrow at noon"),
+        ];
+        let mut previous_committed = String::new();
+        let mut states = Vec::new();
+
+        for hypothesis in trace {
+            let state = stabilizer.push(hypothesis).unwrap();
+            assert!(
+                state.committed.starts_with(&previous_committed),
+                "committed bytes changed from {previous_committed:?} to {:?}",
+                state.committed
+            );
+            previous_committed = state.committed.clone();
+            states.push(state);
+        }
+
+        assert_eq!(states[2].committed, "Schedule a meeting with");
+        assert_eq!(states[2].tentative, "Alex tomorrow");
+        assert_eq!(
+            states[4], states[3],
+            "a decode dropout must preserve display state"
+        );
+        assert!(states.last().unwrap().tentative.contains("tomorrow"));
+    }
+
+    #[test]
     fn punctuation_and_case_stay_tentative_until_their_display_form_repeats() {
         let mut stabilizer =
             TranscriptStabilizer::new(SessionId(7), RequestId(11), ModelId::new("preview-model"));
@@ -1391,6 +1484,211 @@ mod tests {
 
         assert_eq!(state.committed, "go go");
         assert_eq!(state.tentative, "now please");
+    }
+
+    #[test]
+    fn absolute_timing_distinguishes_a_new_repeated_word_from_window_overlap() {
+        let mut stabilizer =
+            TranscriptStabilizer::new(SessionId(7), RequestId(11), ModelId::new("preview-model"));
+        stabilizer.committed = vec![HypothesisWord::new("go").at_absolute_frames(1_000, 4_000)];
+        stabilizer.state.committed = "go".to_owned();
+        stabilizer.previous = Some(vec![
+            HypothesisWord::new("go").at_absolute_frames(20_000, 24_000),
+            HypothesisWord::new("now").at_absolute_frames(25_000, 29_000),
+        ]);
+        let new_occurrence = TranscriptHypothesis {
+            identity: identity(1),
+            window_start_frame: 16_000,
+            window_end_frame: 64_000,
+            words: vec![
+                HypothesisWord::new("go").at_absolute_frames(20_000, 24_000),
+                HypothesisWord::new("now").at_absolute_frames(25_000, 29_000),
+            ],
+        };
+
+        let state = stabilizer.push(new_occurrence).unwrap();
+
+        assert_eq!(state.committed, "go go now");
+        assert!(state.tentative.is_empty());
+    }
+
+    #[test]
+    fn timestamped_rollover_preserves_repeated_word_count_and_exact_prefixes() {
+        let mut stabilizer =
+            TranscriptStabilizer::new(SessionId(7), RequestId(11), ModelId::new("preview-model"));
+        let opening = |sequence| TranscriptHypothesis {
+            identity: identity(sequence),
+            window_start_frame: 0,
+            window_end_frame: 48_000,
+            words: vec![
+                HypothesisWord::new("we").at_absolute_frames(4_000, 8_000),
+                HypothesisWord::new("go").at_absolute_frames(9_000, 13_000),
+                HypothesisWord::new("go").at_absolute_frames(14_000, 18_000),
+                HypothesisWord::new("home").at_absolute_frames(40_000, 44_000),
+            ],
+        };
+        stabilizer.push(opening(1)).unwrap();
+        let before_rollover = stabilizer.push(opening(2)).unwrap();
+        assert_eq!(before_rollover.committed, "we go go");
+        assert_eq!(before_rollover.tentative, "home");
+
+        let rolled = TranscriptHypothesis {
+            identity: identity(3),
+            window_start_frame: 12_000,
+            window_end_frame: 64_000,
+            words: vec![
+                HypothesisWord::new("go").at_absolute_frames(14_000, 18_000),
+                HypothesisWord::new("home").at_absolute_frames(40_000, 44_000),
+                HypothesisWord::new("now").at_absolute_frames(52_000, 56_000),
+            ],
+        };
+        let after_rollover = stabilizer.push(rolled).unwrap();
+
+        assert!(
+            after_rollover
+                .committed
+                .starts_with(&before_rollover.committed)
+        );
+        assert_eq!(after_rollover.committed, "we go go home");
+        assert_eq!(after_rollover.tentative, "now");
+        assert_eq!(
+            after_rollover
+                .committed
+                .split_whitespace()
+                .filter(|word| *word == "go")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn timestamped_pause_rollover_deduplicates_a_committed_clause_when_word_estimates_drift() {
+        let mut stabilizer =
+            TranscriptStabilizer::new(SessionId(7), RequestId(11), ModelId::new("preview-model"));
+        let opening = |sequence, window_end_frame| TranscriptHypothesis {
+            identity: identity(sequence),
+            window_start_frame: 0,
+            window_end_frame,
+            words: vec![
+                HypothesisWord::new("This").at_absolute_frames(0, 2_000),
+                HypothesisWord::new("is").at_absolute_frames(2_000, 4_000),
+                HypothesisWord::new("a").at_absolute_frames(4_000, 6_000),
+                HypothesisWord::new("model").at_absolute_frames(6_000, 10_000),
+                HypothesisWord::new("preview.").at_absolute_frames(10_000, 16_000),
+                HypothesisWord::new("And").at_absolute_frames(18_000, 21_000),
+                HypothesisWord::new("what").at_absolute_frames(21_000, 24_000),
+                HypothesisWord::new("is").at_absolute_frames(24_000, 27_000),
+                HypothesisWord::new("going").at_absolute_frames(27_000, 31_000),
+                HypothesisWord::new("on").at_absolute_frames(31_000, 34_000),
+                HypothesisWord::new("here?").at_absolute_frames(34_000, 38_000),
+            ],
+        };
+        let mut previous_committed = String::new();
+        for update in [opening(1, 48_000), opening(2, 48_000), opening(3, 56_000)] {
+            let state = stabilizer.push(update).unwrap();
+            assert!(state.committed.starts_with(&previous_committed));
+            previous_committed = state.committed;
+        }
+        assert_eq!(
+            previous_committed,
+            "This is a model preview. And what is going on here?"
+        );
+
+        let rolled = TranscriptHypothesis {
+            identity: identity(4),
+            window_start_frame: 16_000,
+            window_end_frame: 64_000,
+            words: vec![
+                HypothesisWord::new("And").at_absolute_frames(24_000, 27_000),
+                HypothesisWord::new("what").at_absolute_frames(27_000, 30_000),
+                HypothesisWord::new("is").at_absolute_frames(30_000, 33_000),
+                HypothesisWord::new("going").at_absolute_frames(33_000, 37_000),
+                HypothesisWord::new("on").at_absolute_frames(37_000, 40_000),
+                HypothesisWord::new("here?").at_absolute_frames(40_000, 44_000),
+            ],
+        };
+
+        let state = stabilizer.push(rolled).unwrap();
+
+        assert_eq!(
+            state.committed,
+            "This is a model preview. And what is going on here?"
+        );
+        assert!(
+            state.tentative.is_empty(),
+            "the rolled window must not repeat a clause whose audio span overlaps committed text"
+        );
+    }
+
+    #[test]
+    fn timestamped_disjoint_repeated_clause_remains_new_tentative_text() {
+        let mut stabilizer =
+            TranscriptStabilizer::new(SessionId(7), RequestId(11), ModelId::new("preview-model"));
+        stabilizer.committed = vec![
+            HypothesisWord::new("And").at_absolute_frames(18_000, 21_000),
+            HypothesisWord::new("what").at_absolute_frames(21_000, 24_000),
+            HypothesisWord::new("is").at_absolute_frames(24_000, 27_000),
+            HypothesisWord::new("going").at_absolute_frames(27_000, 31_000),
+            HypothesisWord::new("on").at_absolute_frames(31_000, 34_000),
+            HypothesisWord::new("here?").at_absolute_frames(34_000, 38_000),
+        ];
+        stabilizer.state.committed = render_words(&stabilizer.committed);
+        stabilizer.previous = Some(Vec::new());
+
+        let repeated_later = TranscriptHypothesis {
+            identity: identity(1),
+            window_start_frame: 32_000,
+            window_end_frame: 80_000,
+            words: vec![
+                HypothesisWord::new("And").at_absolute_frames(45_000, 48_000),
+                HypothesisWord::new("what").at_absolute_frames(48_000, 51_000),
+                HypothesisWord::new("is").at_absolute_frames(51_000, 54_000),
+                HypothesisWord::new("going").at_absolute_frames(54_000, 58_000),
+                HypothesisWord::new("on").at_absolute_frames(58_000, 61_000),
+                HypothesisWord::new("here?").at_absolute_frames(61_000, 65_000),
+            ],
+        };
+
+        let state = stabilizer.push(repeated_later).unwrap();
+
+        assert_eq!(state.committed, "And what is going on here?");
+        assert_eq!(state.tentative, "And what is going on here?");
+    }
+
+    #[test]
+    fn untimed_rollover_fallback_preserves_repeated_word_count_and_exact_prefixes() {
+        let mut stabilizer =
+            TranscriptStabilizer::new(SessionId(7), RequestId(11), ModelId::new("preview-model"));
+        stabilizer
+            .push(hypothesis(1, 0, 48_000, "we go go home"))
+            .unwrap();
+        let before_rollover = stabilizer
+            .push(hypothesis(2, 0, 48_000, "we go go home"))
+            .unwrap();
+        assert_eq!(before_rollover.committed, "we go go");
+        assert_eq!(before_rollover.tentative, "home");
+
+        let overlap = stabilizer
+            .push(hypothesis(3, 16_000, 64_000, "go home now"))
+            .unwrap();
+        assert!(overlap.committed.starts_with(&before_rollover.committed));
+        assert_eq!(overlap.committed, "we go go");
+        assert_eq!(overlap.tentative, "home now");
+
+        let after_rollover = stabilizer
+            .push(hypothesis(4, 24_000, 72_000, "home now"))
+            .unwrap();
+        assert!(after_rollover.committed.starts_with(&overlap.committed));
+        assert_eq!(after_rollover.committed, "we go go home");
+        assert_eq!(after_rollover.tentative, "now");
+        assert_eq!(
+            after_rollover
+                .committed
+                .split_whitespace()
+                .filter(|word| *word == "go")
+                .count(),
+            2
+        );
     }
 
     #[test]

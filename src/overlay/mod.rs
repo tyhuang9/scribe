@@ -2,6 +2,8 @@ mod controller;
 #[cfg(target_os = "windows")]
 mod native_windows;
 pub mod platform;
+#[cfg(test)]
+mod preview_parity;
 mod view;
 
 // Keep one facade for future runtime-neutral event wiring even though Phase 5
@@ -13,7 +15,7 @@ pub use controller::{
 };
 pub use platform::{
     CapturedTarget, OverlayPosition, capture_foreground_target,
-    captured_target_application_identity, overlay_focus_safety_available, reduced_motion_preferred,
+    captured_target_application_identity, overlay_focus_safety_available,
 };
 pub use view::{OverlayAction, show_overlay_viewport};
 
