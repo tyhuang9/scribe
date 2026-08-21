@@ -5,7 +5,8 @@ use super::{
     model_picker::{
         ReadyModelPickerAction, close_ready_model_picker_and_restore_focus, show_ready_model_picker,
     },
-    state::ModelViewModel,
+    screens::ScreenAction,
+    state::{ModelViewModel, ResolvedTheme},
     theme_palette,
 };
 
@@ -92,8 +93,9 @@ pub(crate) fn show_navigation(
     ctx: &egui::Context,
     current: &mut AppPage,
     debug_enabled: bool,
+    resolved_theme: ResolvedTheme,
     model: SidebarModelView<'_>,
-) -> Option<ReadyModelPickerAction> {
+) -> (ScreenAction, Option<ReadyModelPickerAction>) {
     if !current.visible(debug_enabled) {
         *current = AppPage::Transcribe;
     }
@@ -104,6 +106,7 @@ pub(crate) fn show_navigation(
         NavigationMode::Compact => (COMPACT_RAIL_HORIZONTAL_MARGIN, COMPACT_RAIL_CONTENT_WIDTH),
     };
     let mut model_action = None;
+    let mut theme_action = ScreenAction::None;
     let navigation = egui::SidePanel::left("navigation")
         .frame(
             Frame::none()
@@ -205,12 +208,55 @@ pub(crate) fn show_navigation(
                 ui.ctx()
                     .accesskit_node_builder(response.id, |builder| builder.set_expanded(false));
             }
+            ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+                let (icon, accessible_name) = match resolved_theme {
+                    ResolvedTheme::Dark => (Icon::Sun, "Switch to light theme"),
+                    ResolvedTheme::Light => (Icon::Moon, "Switch to dark theme"),
+                };
+                let response = theme_icon_button(
+                    ui,
+                    icon,
+                    accessible_name,
+                    colors.active_card_bg,
+                    colors.text,
+                    colors.muted_text,
+                );
+                response.widget_info(|| {
+                    egui::WidgetInfo::labeled(egui::WidgetType::Button, accessible_name)
+                });
+                ui.ctx().accesskit_node_builder(response.id, |builder| {
+                    builder.set_role(egui::accesskit::Role::Button);
+                    builder.set_name(accessible_name);
+                    builder.set_description(format!(
+                        "Current appearance is {}. Activating saves {} as the theme.",
+                        if resolved_theme == ResolvedTheme::Dark {
+                            "dark"
+                        } else {
+                            "light"
+                        },
+                        if resolved_theme == ResolvedTheme::Dark {
+                            "Light"
+                        } else {
+                            "Dark"
+                        }
+                    ));
+                });
+                if response.clicked()
+                    || (response.has_focus()
+                        && ui.input(|input| {
+                            input.key_pressed(egui::Key::Enter)
+                                || input.key_pressed(egui::Key::Space)
+                        }))
+                {
+                    theme_action = ScreenAction::ToggleResolvedTheme(resolved_theme);
+                }
+            });
         });
     ctx.accesskit_node_builder(navigation.response.id, |builder| {
         builder.set_role(egui::accesskit::Role::Navigation);
         builder.set_name("Main navigation");
     });
-    model_action
+    (theme_action, model_action)
 }
 
 fn active_model_name<'a>(selected_model_id: Option<&str>, models: &'a [ModelViewModel]) -> &'a str {
@@ -456,6 +502,37 @@ fn nav_icon_button(
     response.on_hover_text(accessible_name)
 }
 
+fn theme_icon_button(
+    ui: &mut egui::Ui,
+    icon: Icon,
+    accessible_name: &str,
+    hover_fill: Color32,
+    text: Color32,
+    muted: Color32,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(44.0), Sense::click());
+    let fill = if response.hovered() {
+        hover_fill.gamma_multiply(0.45)
+    } else {
+        Color32::TRANSPARENT
+    };
+    ui.painter().rect_filled(rect, Rounding::same(5.0), fill);
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        icon_glyph(icon),
+        egui::FontId::proportional(22.0),
+        if response.hovered() || response.has_focus() {
+            text
+        } else {
+            muted
+        },
+    );
+    paint_focus_ring(ui, &response, Rounding::same(5.0));
+    focus_tooltip(ui, &response, accessible_name);
+    response.on_hover_text(accessible_name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -508,16 +585,18 @@ mod tests {
             },
             |ctx| {
                 let mut page = AppPage::History;
-                action = show_navigation(
+                let (_, model_action) = show_navigation(
                     ctx,
                     &mut page,
                     false,
+                    ResolvedTheme::Light,
                     SidebarModelView {
                         selected_model_id,
                         models,
                         disabled_reason,
                     },
                 );
+                action = model_action;
             },
         );
         (output, action)
@@ -538,7 +617,13 @@ mod tests {
         let ctx = egui::Context::default();
         let mut page = AppPage::Debug;
         let _ = ctx.run(Default::default(), |ctx| {
-            show_navigation(ctx, &mut page, false, SidebarModelView::default());
+            show_navigation(
+                ctx,
+                &mut page,
+                false,
+                ResolvedTheme::Light,
+                SidebarModelView::default(),
+            );
         });
         assert_eq!(page, AppPage::Transcribe);
     }
@@ -637,7 +722,13 @@ mod tests {
                     ..Default::default()
                 },
                 |ctx| {
-                    show_navigation(ctx, &mut page, false, SidebarModelView::default());
+                    show_navigation(
+                        ctx,
+                        &mut page,
+                        false,
+                        ResolvedTheme::Light,
+                        SidebarModelView::default(),
+                    );
                 },
             );
             let update = output.platform_output.accesskit_update.unwrap();
@@ -667,7 +758,13 @@ mod tests {
                 ..Default::default()
             },
             |ctx| {
-                show_navigation(ctx, &mut page, false, SidebarModelView::default());
+                show_navigation(
+                    ctx,
+                    &mut page,
+                    false,
+                    ResolvedTheme::Light,
+                    SidebarModelView::default(),
+                );
             },
         );
         let update = output.platform_output.accesskit_update.unwrap();
@@ -1002,6 +1099,70 @@ mod tests {
         assert_eq!(
             ctx.memory(|memory| memory.focused()),
             Some(egui::Id::new("active-model-trigger"))
+        );
+    }
+
+    #[test]
+    fn theme_toggle_is_icon_only_and_accesskit_activatable_without_displacing_model_picker() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let models = ready_sidebar_models();
+        let render = |events| {
+            let mut theme_action = ScreenAction::None;
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        Vec2::new(960.0, 680.0),
+                    )),
+                    focused: true,
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    let mut page = AppPage::History;
+                    (theme_action, _) = show_navigation(
+                        ctx,
+                        &mut page,
+                        false,
+                        ResolvedTheme::Light,
+                        SidebarModelView {
+                            selected_model_id: Some("base.en"),
+                            models: &models,
+                            disabled_reason: None,
+                        },
+                    );
+                },
+            );
+            (output, theme_action)
+        };
+
+        let (initial, action) = render(Vec::new());
+        assert_eq!(action, ScreenAction::None);
+        let update = initial
+            .platform_output
+            .accesskit_update
+            .expect("sidebar controls should expose an AccessKit update");
+        let theme_target = update
+            .nodes
+            .iter()
+            .find_map(|(id, node)| (node.name() == Some("Switch to dark theme")).then_some(*id))
+            .expect("icon-only theme target");
+        assert!(update.nodes.iter().any(|(_, node)| {
+            node.name()
+                == Some("Change active model: Whisper Base English with a deliberately long display name")
+        }));
+
+        let (_, action) = render(vec![egui::Event::AccessKitActionRequest(
+            egui::accesskit::ActionRequest {
+                action: egui::accesskit::Action::Default,
+                target: theme_target,
+                data: None,
+            },
+        )]);
+        assert_eq!(
+            action,
+            ScreenAction::ToggleResolvedTheme(ResolvedTheme::Light)
         );
     }
 }

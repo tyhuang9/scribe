@@ -22,8 +22,8 @@ use super::{
         ModelDownloadState, ModelLanguageFilter, ModelManagementState, ModelSizeTier,
         ModelSpeedTier, ModelViewModel, RemoteCatalogActionKind, RemoteCatalogActionView,
         RemoteCatalogEntryView, RemoteCatalogStatusKind, RemoteCatalogStatusView,
-        RemoteCatalogVariantView, RemoteCatalogView, SettingsTab, TranscriptionPhase,
-        TranscriptionState, UiRoute,
+        RemoteCatalogVariantView, RemoteCatalogView, ResolvedTheme, SettingsTab,
+        TranscriptionPhase, TranscriptionState, UiRoute,
     },
     theme_palette,
 };
@@ -323,6 +323,7 @@ impl Fixture {
         FixtureData {
             route,
             transcription,
+            theme_announcement: None,
             models,
             comparison,
             model_management: if self == Self::ModelsCardExpanded {
@@ -402,6 +403,7 @@ fn model(
 struct FixtureData {
     route: UiRoute,
     transcription: TranscriptionState,
+    theme_announcement: Option<String>,
     models: Vec<ModelViewModel>,
     model_catalog: Vec<ModelViewModel>,
     comparison: ModelComparisonState,
@@ -654,20 +656,29 @@ fn render_settings_playground_fixture(ui: &mut egui::Ui) -> ScreenAction {
 }
 
 fn show_harness(ctx: &egui::Context, data: &mut FixtureData, page: &mut AppPage) -> ScreenAction {
-    let navigation_action = show_navigation(
+    let resolved_theme = if ctx.style().visuals.dark_mode {
+        ResolvedTheme::Dark
+    } else {
+        ResolvedTheme::Light
+    };
+    let (theme_action, model_action) = show_navigation(
         ctx,
         page,
         false,
+        resolved_theme,
         SidebarModelView {
             selected_model_id: data.transcription.selected_model_id.as_deref(),
             models: &data.model_catalog,
             disabled_reason: data.transcription.model_change_disabled_reason.as_deref(),
         },
-    )
-    .map(|action| match action {
+    );
+    let navigation_action = model_action.map(|action| match action {
         ReadyModelPickerAction::Select(id) => ScreenAction::SelectQuickModel(id),
         ReadyModelPickerAction::ManageModels => ScreenAction::OpenModelSettings,
     });
+    if let Some(message) = data.theme_announcement.take() {
+        paint_theme_change_status(ctx, &message);
+    }
     if *page != AppPage::General || !matches!(data.route, UiRoute::Settings(_)) {
         data.settings_playground_open = false;
     }
@@ -694,7 +705,27 @@ fn show_harness(ctx: &egui::Context, data: &mut FixtureData, page: &mut AppPage)
             })
         })
         .inner;
-    navigation_action.unwrap_or(screen_action)
+    if theme_action != ScreenAction::None {
+        theme_action
+    } else {
+        navigation_action.unwrap_or(screen_action)
+    }
+}
+
+fn paint_theme_change_status(ctx: &egui::Context, message: &str) {
+    let screen_rect = ctx.screen_rect();
+    egui::Area::new(egui::Id::new("harness-theme-change-live-status"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(egui::pos2(screen_rect.max.x + 1.0, screen_rect.max.y + 1.0))
+        .show(ctx, |ui| {
+            let response = ui.label(message);
+            ui.ctx().accesskit_node_builder(response.id, |builder| {
+                builder.set_role(egui::accesskit::Role::Status);
+                builder.set_name(message);
+                builder.set_live(egui::accesskit::Live::Polite);
+                builder.set_live_atomic();
+            });
+        });
 }
 
 fn apply_action(data: &mut FixtureData, page: &mut AppPage, action: ScreenAction) {
@@ -950,6 +981,14 @@ fn apply_action(data: &mut FixtureData, page: &mut AppPage, action: ScreenAction
         ScreenAction::SetCloseToTray(value) => data.settings.close_to_tray = value,
         ScreenAction::OpenModelSettings => *page = AppPage::Models,
         ScreenAction::SetTheme(value) => data.settings.theme_label = value,
+        ScreenAction::ToggleResolvedTheme(resolved_theme) => {
+            let next_theme = match resolved_theme {
+                ResolvedTheme::Dark => "Light",
+                ResolvedTheme::Light => "Dark",
+            };
+            data.settings.theme_label = next_theme.into();
+            data.theme_announcement = Some(format!("Theme changed to {next_theme}."));
+        }
         ScreenAction::SetOverlayMode(value) => data.settings.overlay_label = value,
         ScreenAction::SetRecordingMode(mode) => data.transcription.recording_mode = mode,
         ScreenAction::SetDurationSeconds(seconds) => {
