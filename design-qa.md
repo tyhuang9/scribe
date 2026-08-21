@@ -863,3 +863,82 @@ final result: blocked
   isolated fixture was stopped only after its executable path was revalidated.
 
 final result: passed
+
+---
+
+# Native overlay tail-follow and Compact-shell revision - Product Design QA - 2026-08-21
+
+## Source and same-state evidence
+
+- Reviewed implementation source head: `5e43cfb` (`Tail-follow live text only
+  after overflow`), including the focused production commits `8099cac`,
+  `1f26dd1`, and `e97ebbb`.
+- The reported 769 x 89 capture is tracked as
+  `design-qa-evidence/overlay-native/reported-live-overlay-top-line.png`
+  (SHA-256
+  `15a6791e254722290c59e4c7966260cabe80f6e0db3acd7710d7e722bad97949`).
+  It records the unintended inner top line, `00:10`, head-preserving preview,
+  and trailing ellipsis from the prior build.
+- `design-qa-evidence/overlay-native/reported-vs-revised-live-light-120.png`
+  places that report and the revised 120-DPI native raster in one same-state
+  comparison (SHA-256
+  `0de32080b7e5d22accfcd46b96369b7896d6a0f0dbc1c98bab9eaf716193f250`).
+- `design-qa-evidence/overlay-native/revised-live-compact-light-120.png` and
+  `design-qa-evidence/overlay-native/revised-live-compact-dark-120.png` compare
+  Live and Compact at the same `00:10` fixture state in each theme. Their
+  SHA-256 values are
+  `c91961928bd7e3838e7ec0c06d9f0b5a106b0f6f387dc98d68aa54a6efe5dad9`
+  and
+  `65cff8bd116fefba077a57ef19e38a8a9d53dc8febcf05b5cb7320e7f06b8365`.
+- The four underlying 120-DPI raster composites are tracked as
+  `revised-raster-{live,compact}-{light,dark}-120.png`; the regenerated raw
+  96/120/144/192-DPI fixture corpus and checksums live in
+  `testdata/overlay-reference/`.
+
+## Visual and interaction acceptance
+
+- The explicit second inner-highlight stroke is removed from both renderers.
+  The capsule retains its normal perimeter border and shadow, so removing the
+  reported line does not flatten or detach the surface.
+- A short or exact-fitting Live preview begins at the established preview
+  origin. The first true overflow switches to a clipped, right-anchored tail;
+  later appended words remain visible at the fixed right edge while earlier
+  ink moves left. No synthetic ellipsis is drawn, and the fit boundary never
+  splits a Unicode grapheme.
+- The 200 x 62 logical Compact presentation uses the same capsule height,
+  radius, surface, border, shadow, vertical centerline, static bundled
+  Phosphor waveform, proportional timer, cancel glyph, and 16-point cancel
+  inset as Live. It omits only Live's transcript and divider, so it is compact
+  without leaving a 600-point blank transcript region.
+- Normal Compact is exactly brand, timer, and cancel. For an error or notice,
+  the timer region temporarily shows the concise colored word `Error` or
+  `Notice`; the full message and recovery detail remain available in the same
+  bounded accessible announcement node. This is accepted as the least
+  disruptive failure treatment because it preserves the stable no-activation
+  shell and keeps failures visible without reintroducing transcript content.
+- Light and dark combined comparisons show no seam, black cancel tile,
+  clipped glyph, vertical drift, extra divider, transcript residue, or
+  reappearance of the reported inner line. The dark rendering remains in the
+  selected PR #50 neutral/violet family, while the light rendering retains the
+  existing contrast-qualified inverse treatment.
+
+## Verification and limitations
+
+- The fixture candidate was generated outside the repository and visually
+  accepted before its bytes were copied into the tracked corpus. Checksum,
+  byte-identical golden, and harness-state tests pass against the promoted
+  fixtures.
+- Deterministic egui and native traces cover the left-aligned fit threshold,
+  first overflow, sequential leftward movement with fixed right edge, and
+  grapheme-safe clipping. Native layout/raster/UI Automation contracts cover
+  96, 120, 144, and 192 DPI and preserve the exact 44 x 44 logical cancel
+  target.
+- Full committed/tentative state and accessibility wording remain untruncated;
+  only the painted Live viewport is clipped. Tentative text remains isolated
+  from final output and history by the existing controller contract.
+- These comparisons are deterministic native layered-raster composites.
+  Fresh physical Windows.Graphics.Capture evidence, independent UI/UX and
+  accessibility review, and the full repository/release gates are recorded as
+  separate integration evidence; they are not implied by this visual pass.
+
+final result: passed
