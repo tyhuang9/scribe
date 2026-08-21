@@ -193,18 +193,6 @@ pub(crate) fn keycap(ui: &mut Ui, text: &str) {
         });
 }
 
-pub(crate) fn keycap_width(ui: &Ui, text: &str) -> f32 {
-    ui.painter()
-        .layout_no_wrap(
-            text.to_owned(),
-            FontId::monospace(TextStyle::Small.resolve(ui.style()).size),
-            ui_palette(ui).text,
-        )
-        .size()
-        .x
-        + KEYCAP_HORIZONTAL_PADDING * 2.0
-}
-
 #[allow(dead_code)]
 pub(crate) fn notice(ui: &mut Ui, text: &str, error: bool) -> Response {
     let colors = ui_palette(ui);

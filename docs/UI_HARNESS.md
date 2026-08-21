@@ -46,10 +46,11 @@ not runtime assets.
 - `history`
 - `settings/recording`
 - `overlay/live-light` and `overlay/live-dark` -- the real 600 x 62 hardened
-  Live preview viewport with fixed Recording state, microphone level, `00:12`
-  timer, and sample committed/tentative transcript.
-- `overlay/compact-light` and `overlay/compact-dark` -- the real 320 x 52
-  hardened Compact status viewport with the same fixed state.
+  Live preview viewport with fixed Recording state, `00:10` timer, static
+  Phosphor brand mark, and an overflowing committed/tentative transcript.
+- `overlay/compact-light` and `overlay/compact-dark` -- the real 200 x 62
+  hardened Compact viewport with the same shell, brand, timer, and cancel
+  treatment, but no divider or transcript.
 
 ## Overlay capture fixtures
 
@@ -87,18 +88,20 @@ display has `WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE |
 WS_EX_TOOLWINDOW`; the cancel control has the same profile without
 `WS_EX_TRANSPARENT`. Both are submitted as top-down premultiplied BGRA DIBs by
 `UpdateLayeredWindow(ULW_ALPHA)` and shown topmost without activation. The
-display exposes the current phase, microphone meter, elapsed time, and preview
+display exposes the current phase, static brand, elapsed time, and preview
 through its native AccessKit adapter; the control exposes the exact `Cancel
 recording and discard it` button and a standard Windows tooltip. If display
 accessibility or pixel presentation fails, both AccessKit trees reset hidden
 before both windows hide. If only the cancel tooltip/control capability fails,
 the passive display remains and the X hides. Elapsed time is a static semantic
 node rather than a live region: Live always exposes its visible timer, while
-Compact exposes one only when it is painted.
+Compact exposes its normal timer as static text. A Compact failure temporarily
+paints `Error` or `Notice` in that same bounded region and exposes the complete
+message and recovery detail as the sole polite live region.
 
 AccessKit node bounds and GDI+ paint placement share the same physical layout
-derived from the actual `OverlayWindowBounds`. Waveform/status, timer, divider,
-preview, and Compact status geometry use one physical capsule centerline; the
+derived from the actual `OverlayWindowBounds`. Brand, timer, divider, preview,
+and Compact geometry use one physical capsule centerline; the
 deterministic native tests assert at 100%, 125%, 150%, and 200% DPI that no
 visible content rectangle drifts by more than 0.5 physical pixel. AccessKit
 supplies physical client coordinates and its Windows adapter translates them
@@ -110,7 +113,11 @@ The surface is deliberately painted translucent glass, not a native backdrop
 blur. This keeps light/dark output deterministic and fail-soft on Windows
 versions and graphics drivers where compositor blur cannot be proved. Physical
 pixel dimensions scale with the destination monitor DPI: 600 x 62 Live and
-320 x 52 Compact are logical-point dimensions.
+200 x 62 Compact are logical-point dimensions. Live preview text stays
+left-aligned while the complete line fits. Once it overflows, the clipped line
+follows the newest grapheme-safe suffix with a fixed right edge and no
+ellipsis. Full committed/tentative state and accessibility text are not
+truncated.
 
 For compositor acceptance, use `Windows.Graphics.Capture`; `BitBlt` and
 `PrintWindow` are not authoritative for layered-window visibility. The local
