@@ -777,3 +777,64 @@ final result: passed
 - Copy: unchanged.
 
 final result: blocked
+
+---
+
+# Native Live overlay reference restoration - Product Design QA - 2026-08-20
+
+## Source and implementation evidence
+
+- Selected source: `C:\Users\huang\.codex\attachments\8c74ab60-cbfb-4a09-8ee4-cade05f597f2\image-1.png`
+  (1175 x 152 pixels; SHA-256
+  `0ea2c3df19e1f40346fda7e5499b5815a6c8b601a6cc9b95e23ccbddffb19bf6`).
+- Deterministic native 192-DPI composite:
+  `design-qa-evidence/overlay-native/reference-contract-live-dark.png`.
+- Same-state comparison:
+  `design-qa-evidence/overlay-native/reference-contract-comparison.png`.
+- The comparison maps the implementation capsule's measured physical bounds
+  onto the source capsule bounds. It does not stretch to the arbitrary image
+  crop. Both rows use `00:12` and `Clicking the settings icon in the top
+  right...` on an RGB 240/240/245 backdrop.
+
+## Fidelity review
+
+- Composition matches the selected order: the existing bundled Phosphor
+  `WAVEFORM` glyph as a static Scribe brand mark, regular elapsed time, one
+  divider, one continuous regular live transcript line, and the cancel X.
+- The mark is no longer an audio-driven meter or halo. The dark overlay-specific
+  purple is slightly lighter than the screenshot to preserve 3:1 non-text
+  contrast and remains within the selected violet family.
+- Elapsed time uses Segoe UI regular rather than slashed Consolas zeros. The
+  transcript keeps its beginning and places any fitting ellipsis at the end,
+  matching both the source and the committed-prefix product invariant.
+- The capsule center composites to approximately RGB 89/90/97 over the review
+  backdrop; the source center is approximately RGB 89/90/95. Border and top
+  highlight opacity and thickness were reduced after the first comparison to
+  remove the double-line appearance. Radius, surface height, shadow envelope,
+  logo scale, text weight, divider position, preview origin, and cancel inset
+  have no remaining P0, P1, or P2 mismatch after capsule-bound normalization.
+- The Live cancel control remains an exact 44 x 44 logical target and moved to
+  a 16-point right inset. Its physical center and raster/UI Automation bounds
+  remain derived from shared geometry at 96, 120, 144, and 192 DPI.
+- When rolling preview never starts, the Live shell intentionally retains only
+  logo, elapsed time, and cancel. Divider, preview pixels, preview node, and
+  live-region announcement are absent. A preview that starts and later fails
+  keeps its error notice. User-selected Minimal mode is unchanged.
+- Committed and tentative transcript regions remain separate in controller
+  state and accessibility wording. The source-selected visual presentation is
+  intentionally one continuous regular light-gray line; tentative text is not
+  promoted into final output or history.
+
+## Verification and limitations
+
+- Deterministic raster, geometry, contrast, live/no-preview, Unicode fitting,
+  and AccessKit tests cover the accepted composition and exact physical bounds.
+- The comparison image is a code-rendered native layered-raster composite, not
+  a Windows.Graphics.Capture frame. It is valid same-state Product Design
+  evidence because the renderer bytes, alpha composition, control placement,
+  and reference backdrop are all deterministic.
+- A fresh physical WGC capture of the staged executable remains a manual
+  pre-merge check. No existing Scribe process was terminated or disturbed to
+  obtain this review.
+
+final result: passed
