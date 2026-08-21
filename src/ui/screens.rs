@@ -11,7 +11,7 @@ use super::{
     about_page,
     controls::{
         ButtonTone, Icon, SearchFieldResponse, button, card, focus_tooltip, icon_glyph, keycap,
-        keycap_width, paint_focus_ring, search_field,
+        paint_focus_ring, search_field,
     },
     model_picker::{
         ReadyModelPickerAction, close_ready_model_picker_and_restore_focus, show_ready_model_picker,
