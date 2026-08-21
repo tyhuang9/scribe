@@ -432,7 +432,19 @@ fn render_live_status_row(ui: &mut egui::Ui, state: &OverlayViewState, colors: O
         ui.label(RichText::new(elapsed).size(13.0).color(colors.muted_text));
         if state.live_preview_available || state.error.is_some() {
             render_divider(ui, colors);
-            let response = ui.label(live_preview_layout(ui, state, colors, ui.available_width()));
+            let layout = live_preview_layout(ui, state, colors, ui.available_width());
+            let follows_transcript_tail = state.error.is_none()
+                && state.notice.is_none()
+                && (!state.transcript.committed.is_empty()
+                    || !state.transcript.tentative.is_empty());
+            let response = if follows_transcript_tail {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(layout)
+                })
+                .inner
+            } else {
+                ui.label(layout)
+            };
             ui.ctx().accesskit_node_builder(response.id, |builder| {
                 builder.set_name(live_accessible_text(state));
                 if state.error.is_some() || state.notice.is_some() {
@@ -587,10 +599,10 @@ fn transcript_layout_for_rows(
     let total_graphemes = full.text.graphemes(true).count();
     let mut low = 0;
     let mut high = total_graphemes.min(MAX_PREVIEW_GRAPHEMES);
-    let mut best = head_layout_job(&full, 0);
+    let mut best = tail_layout_job(&full, 0);
     while low <= high {
         let keep = low + (high - low) / 2;
-        let candidate = head_layout_job(&full, keep);
+        let candidate = tail_layout_job(&full, keep);
         let rows = ui.fonts(|fonts| fonts.layout_job(candidate.clone()).rows.len());
         if rows <= max_rows {
             best = candidate;
@@ -602,6 +614,37 @@ fn transcript_layout_for_rows(
         }
     }
     best
+}
+
+fn tail_layout_job(full: &egui::text::LayoutJob, keep_graphemes: usize) -> egui::text::LayoutJob {
+    let total_graphemes = full.text.graphemes(true).count();
+    if keep_graphemes >= total_graphemes {
+        let mut result = full.clone();
+        result.halign = egui::Align::RIGHT;
+        return result;
+    }
+    let start_grapheme = total_graphemes.saturating_sub(keep_graphemes);
+    let start = full
+        .text
+        .grapheme_indices(true)
+        .nth(start_grapheme)
+        .map_or(full.text.len(), |(index, _)| index);
+    let mut result = full.clone();
+    result.text.clear();
+    result.sections.clear();
+    result.halign = egui::Align::RIGHT;
+    for section in &full.sections {
+        let overlap_start = start.max(section.byte_range.start);
+        let overlap_end = full.text.len().min(section.byte_range.end);
+        if overlap_start < overlap_end {
+            result.append(
+                &full.text[overlap_start..overlap_end],
+                0.0,
+                section.format.clone(),
+            );
+        }
+    }
+    result
 }
 
 fn message_layout_for_rows(
@@ -1148,7 +1191,7 @@ mod tests {
     }
 
     #[test]
-    fn preview_head_is_unicode_safe_and_limited_to_one_rendered_row() {
+    fn preview_tail_is_unicode_safe_and_limited_to_one_rendered_row() {
         let context = egui::Context::default();
         let mut result = None;
         let _ = context.run(egui::RawInput::default(), |context| {
@@ -1168,14 +1211,12 @@ mod tests {
         let (layout, rows) = result.unwrap();
         assert!(rows <= LIVE_PREVIEW_ROWS);
         assert!(layout.text.is_char_boundary(layout.text.len()));
-        assert!(
-            layout.sections.len() >= 2,
-            "styled head should retain formatting"
-        );
+        assert!(!layout.sections.is_empty());
+        assert_eq!(layout.halign, egui::Align::RIGHT);
     }
 
     #[test]
-    fn one_row_preview_preserves_the_committed_prefix_and_trails_with_ellipsis() {
+    fn one_row_preview_keeps_the_newest_grapheme_safe_suffix_without_an_ellipsis() {
         let context = egui::Context::default();
         let original = concat!(
             "prefix prefix prefix prefix prefix prefix ",
@@ -1195,16 +1236,69 @@ mod tests {
             });
         });
         let layout = result.expect("preview layout should render");
-        let retained = layout.text.strip_suffix('\u{2026}').unwrap_or(&layout.text);
+        let retained = layout.text.as_str();
         assert!(!retained.is_empty(), "one-row preview should retain text");
-        assert!(original.starts_with(retained));
-        assert!(layout.text.ends_with('\u{2026}'));
+        assert!(original.ends_with(retained));
+        assert!(!layout.text.contains('\u{2026}'));
+        let retained_start = original.len() - retained.len();
         assert!(
-            retained.len() == original.len()
+            retained_start == 0
                 || original
                     .grapheme_indices(true)
-                    .any(|(index, _)| index == retained.len()),
-            "preview head must end at a grapheme-cluster boundary: {retained:?}"
+                    .any(|(index, _)| index == retained_start),
+            "preview tail must start at a grapheme-cluster boundary: {retained:?}"
+        );
+        assert_eq!(layout.halign, egui::Align::RIGHT);
+    }
+
+    #[test]
+    fn appended_preview_words_move_the_egui_label_left_while_its_right_edge_stays_fixed() {
+        fn preview_bounds(committed: &str) -> egui::accesskit::Rect {
+            let context = egui::Context::default();
+            context.enable_accesskit();
+            let state = OverlayViewState {
+                mode: OverlayMode::Live,
+                phase: OverlayPhase::Listening,
+                live_preview_available: true,
+                elapsed: Some(Duration::from_secs(10)),
+                transcript: super::super::controller::OverlayTranscript {
+                    committed: committed.to_owned(),
+                    revision: 1,
+                    ..Default::default()
+                },
+                ..OverlayViewState::default()
+            };
+            let output = context.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(LIVE_WIDTH, LIVE_HEIGHT),
+                    )),
+                    ..Default::default()
+                },
+                |context| render_overlay(context, &state),
+            );
+            let expected = format!("Committed transcript: {committed}");
+            output
+                .platform_output
+                .accesskit_update
+                .unwrap()
+                .nodes
+                .into_iter()
+                .find_map(|(_, node)| {
+                    (node.name() == Some(expected.as_str()))
+                        .then(|| node.bounds())
+                        .flatten()
+                })
+                .expect("preview bounds")
+        }
+
+        let first = preview_bounds("anchor");
+        let appended = preview_bounds("anchor more anchor");
+        assert!(appended.x0 < first.x0, "{first:?} -> {appended:?}");
+        assert!(
+            (appended.x1 - first.x1).abs() <= 0.5,
+            "{first:?} -> {appended:?}"
         );
     }
 
@@ -1231,6 +1325,37 @@ mod tests {
                             .any(|(index, _)| index == retained.len()),
                     "{sample:?} was split at {keep} retained graphemes: {retained:?}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn tail_layout_never_splits_combining_or_emoji_graphemes() {
+        let colors = overlay_colors(&egui::Context::default());
+        for sample in [
+            "e\u{301}",
+            "\u{6f22}",
+            "\u{1f1fa}\u{1f1f8}",
+            "\u{1f44d}\u{1f3fd}",
+            "\u{1f469}\u{200d}\u{1f4bb}",
+        ] {
+            let original = format!("before {sample}");
+            let full = transcript_layout(&original, "", LIVE_WIDTH, colors);
+            for keep in 0..=original.graphemes(true).count() {
+                let tail = tail_layout_job(&full, keep);
+                assert!(original.ends_with(&tail.text));
+                let start = original.len() - tail.text.len();
+                assert!(
+                    start == 0
+                        || start == original.len()
+                        || original
+                            .grapheme_indices(true)
+                            .any(|(index, _)| index == start),
+                    "{sample:?} was split at {keep} retained graphemes: {:?}",
+                    tail.text
+                );
+                assert!(!tail.text.contains('\u{2026}'));
+                assert_eq!(tail.halign, egui::Align::RIGHT);
             }
         }
     }

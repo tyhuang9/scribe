@@ -123,11 +123,11 @@ impl Fixture {
                 live_preview_available: mode == OverlayMode::Live,
                 audio_level: OverlayAudioLevel::new(0.58, 0.78),
                 transcript: OverlayTranscript {
-                    committed: "Clicking the settings icon in the top".to_owned(),
-                    tentative: "right...".to_owned(),
+                    committed: "Alright, What is going on? Why is there a line on".to_owned(),
+                    tentative: "That's pretty cool. These newest words stay visible.".to_owned(),
                     revision: 1,
                 },
-                elapsed: Some(Duration::from_secs(12)),
+                elapsed: Some(Duration::from_secs(10)),
                 ..OverlayViewState::default()
             },
         })
@@ -1046,10 +1046,16 @@ mod tests {
                 overlay.state.audio_level,
                 OverlayAudioLevel::new(0.58, 0.78)
             );
-            assert_eq!(overlay.state.elapsed, Some(Duration::from_secs(12)));
+            assert_eq!(overlay.state.elapsed, Some(Duration::from_secs(10)));
             assert_eq!(overlay.state.transcript.revision, 1);
-            assert!(!overlay.state.transcript.committed.is_empty());
-            assert!(!overlay.state.transcript.tentative.is_empty());
+            assert_eq!(
+                overlay.state.transcript.committed,
+                "Alright, What is going on? Why is there a line on"
+            );
+            assert_eq!(
+                overlay.state.transcript.tentative,
+                "That's pretty cool. These newest words stay visible."
+            );
             assert!(overlay.state.transcript_announcement.is_none());
             assert!(overlay.state.notice.is_none());
             assert!(overlay.state.error.is_none());

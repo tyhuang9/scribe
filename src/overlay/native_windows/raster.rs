@@ -187,7 +187,12 @@ impl StyledLine {
     }
 
     fn head(&self, keep: usize) -> Self {
-        slice_styled_line(self, 0, keep, true)
+        slice_styled_line(self, 0, keep, Some(true))
+    }
+
+    fn tail(&self, keep: usize) -> Self {
+        let total = self.grapheme_count();
+        slice_styled_line(self, total.saturating_sub(keep), total, None)
     }
 }
 
@@ -515,7 +520,10 @@ fn draw_live_preview(
     let preview = layout.preview.expect("live layout includes preview bounds");
     let max_width = preview.width();
     let line = live_line(state, colors);
-    let line = if state.error.is_some() || state.notice.is_some() {
+    let show_transcript_tail = state.error.is_none()
+        && state.notice.is_none()
+        && (!state.transcript.committed.is_empty() || !state.transcript.tentative.is_empty());
+    let line = if !show_transcript_tail {
         fit_head(
             canvas,
             &line,
@@ -524,7 +532,7 @@ fn draw_live_preview(
             MAX_MESSAGE_GRAPHEMES,
         )?
     } else {
-        fit_head(
+        fit_tail(
             canvas,
             &line,
             max_width,
@@ -532,7 +540,13 @@ fn draw_live_preview(
             MAX_PREVIEW_GRAPHEMES,
         )?
     };
-    canvas.draw_styled_line(&line, preview.x0, max_width, preview, 13.0 * scale)
+    let x = if show_transcript_tail {
+        let width = canvas.measure_styled_line(&line, 13.0 * scale)?;
+        (preview.x1 - width).max(preview.x0)
+    } else {
+        preview.x0
+    };
+    canvas.draw_styled_line(&line, x, preview.x1 - x, preview, 13.0 * scale)
 }
 
 fn draw_compact(
@@ -632,6 +646,17 @@ fn fit_head(
     binary_search_fit(total, |keep| line.head(keep), canvas, max_width, font_size)
 }
 
+fn fit_tail(
+    canvas: &mut Canvas<'_>,
+    line: &StyledLine,
+    max_width: f32,
+    font_size: f32,
+    limit: usize,
+) -> Result<StyledLine, RasterError> {
+    let total = line.grapheme_count().min(limit);
+    binary_search_fit(total, |keep| line.tail(keep), canvas, max_width, font_size)
+}
+
 fn binary_search_fit(
     total: usize,
     candidate: impl Fn(usize) -> StyledLine,
@@ -657,7 +682,12 @@ fn binary_search_fit(
     Ok(best)
 }
 
-fn slice_styled_line(line: &StyledLine, start: usize, end: usize, head: bool) -> StyledLine {
+fn slice_styled_line(
+    line: &StyledLine,
+    start: usize,
+    end: usize,
+    ellipsis_at_end: Option<bool>,
+) -> StyledLine {
     let text = line.text();
     let total = text.graphemes(true).count();
     if start == 0 && end >= total {
@@ -681,7 +711,10 @@ fn slice_styled_line(line: &StyledLine, start: usize, end: usize, head: bool) ->
         }
         section_start = section_end;
     }
-    let ellipsis_style = if head {
+    let Some(ellipsis_at_end) = ellipsis_at_end else {
+        return StyledLine { sections };
+    };
+    let ellipsis_style = if ellipsis_at_end {
         sections.last().cloned()
     } else {
         sections.first().cloned()
@@ -696,7 +729,7 @@ fn slice_styled_line(line: &StyledLine, start: usize, end: usize, head: bool) ->
         text: "…".to_owned(),
         ..ellipsis_style
     };
-    if head {
+    if ellipsis_at_end {
         sections.push(ellipsis);
     } else {
         sections.insert(0, ellipsis);
@@ -2273,6 +2306,91 @@ mod tests {
         assert!(head.text().ends_with('…'));
         assert_eq!(head.sections.last().unwrap().style, TextStyle::Regular);
         assert_eq!(head.sections.last().unwrap().color, colors.muted_text);
+    }
+
+    #[test]
+    fn transcript_tail_is_grapheme_safe_keeps_the_newest_suffix_and_has_no_marker() {
+        let colors = NativeColors::for_theme(true);
+        let state = OverlayViewState {
+            transcript: super::super::super::controller::OverlayTranscript {
+                committed: "prefix \u{1f469}\u{200d}\u{1f4bb} caf\u{e9}".to_owned(),
+                tentative: " ending \u{1f9d1}\u{1f3fd}\u{200d}\u{1f4bb}".to_owned(),
+                ..Default::default()
+            },
+            phase: OverlayPhase::Listening,
+            ..OverlayViewState::default()
+        };
+        let line = live_line(&state, colors);
+        let full = line.text();
+        for keep in 0..=line.grapheme_count() {
+            let tail = line.tail(keep).text();
+            assert!(full.ends_with(&tail));
+            assert!(!tail.contains('\u{2026}'));
+            let start = full.len() - tail.len();
+            assert!(
+                start == 0
+                    || start == full.len()
+                    || full.grapheme_indices(true).any(|(index, _)| index == start),
+                "tail split a grapheme at keep={keep}: {tail:?}"
+            );
+        }
+        with_rasterizer(|rasterizer| {
+            let mut pixels = vec![0; 160 * 64 * 4];
+            let mut canvas = Canvas::new(rasterizer, &mut pixels, 160, 64).unwrap();
+            let fitted = fit_tail(&mut canvas, &line, 80.0, 13.0, MAX_PREVIEW_GRAPHEMES)
+                .expect("fit newest transcript suffix");
+            let fitted_text = fitted.text();
+            assert!(full.ends_with(&fitted_text));
+            assert!(fitted_text.len() < full.len());
+            assert!(!fitted_text.contains('\u{2026}'));
+            assert!(canvas.measure_styled_line(&fitted, 13.0).unwrap() <= 80.0);
+        });
+    }
+
+    #[test]
+    fn appended_preview_words_shift_existing_ink_left_and_keep_the_newest_suffix_right_anchored() {
+        with_rasterizer(|rasterizer| {
+            for dpi in [96, 120, 144, 192] {
+                let bounds = production_bounds(OverlayMode::Live, dpi);
+                let layout = DisplayLayout::from_bounds(OverlayMode::Live, bounds).unwrap();
+                let mut first = state(OverlayMode::Live);
+                first.transcript.committed = "anchor".to_owned();
+                first.transcript.tentative.clear();
+                let mut appended = first.clone();
+                appended.transcript.committed = "anchor more anchor".to_owned();
+
+                let first_ink = component_ink_bounds(&isolated_component_frame(
+                    rasterizer,
+                    &first,
+                    &layout,
+                    true,
+                    IsolatedComponent::Preview,
+                ))
+                .expect("first preview ink");
+                let appended_ink = component_ink_bounds(&isolated_component_frame(
+                    rasterizer,
+                    &appended,
+                    &layout,
+                    true,
+                    IsolatedComponent::Preview,
+                ))
+                .expect("appended preview ink");
+
+                assert!(
+                    appended_ink.x0 < first_ink.x0,
+                    "existing preview ink must move left as words append at {dpi} DPI: {first_ink:?} -> {appended_ink:?}"
+                );
+                let right_tolerance = (2.0 * layout.scale).ceil() as i32;
+                assert!(
+                    (appended_ink.x1 - first_ink.x1).abs() <= right_tolerance,
+                    "the repeated newest suffix must remain anchored at the same right edge at {dpi} DPI: {first_ink:?} -> {appended_ink:?}"
+                );
+                assert!(
+                    appended_ink.x1 >= layout.preview.unwrap().x1.floor() as i32 - 8,
+                    "newest suffix must remain visible at the preview's right edge at {dpi} DPI: {appended_ink:?}"
+                );
+            }
+        });
     }
 
     #[test]
