@@ -523,6 +523,9 @@ fn draw_live_preview(
     let show_transcript_tail = state.error.is_none()
         && state.notice.is_none()
         && (!state.transcript.committed.is_empty() || !state.transcript.tentative.is_empty());
+    let transcript_overflows = show_transcript_tail
+        && (line.grapheme_count() > MAX_PREVIEW_GRAPHEMES
+            || canvas.measure_styled_line(&line, 13.0 * scale)? > max_width);
     let line = if !show_transcript_tail {
         fit_head(
             canvas,
@@ -531,7 +534,7 @@ fn draw_live_preview(
             13.0 * scale,
             MAX_MESSAGE_GRAPHEMES,
         )?
-    } else {
+    } else if transcript_overflows {
         fit_tail(
             canvas,
             &line,
@@ -539,8 +542,10 @@ fn draw_live_preview(
             13.0 * scale,
             MAX_PREVIEW_GRAPHEMES,
         )?
+    } else {
+        line
     };
-    let x = if show_transcript_tail {
+    let x = if transcript_overflows {
         let width = canvas.measure_styled_line(&line, 13.0 * scale)?;
         (preview.x1 - width).max(preview.x0)
     } else {
@@ -1479,12 +1484,29 @@ mod tests {
             live_preview_available: mode == OverlayMode::Live,
             audio_level: OverlayAudioLevel::new(0.65, 0.82),
             transcript: super::super::super::controller::OverlayTranscript {
-                committed: "Clicking the settings icon in the top".to_owned(),
-                tentative: "right...".to_owned(),
+                committed: "Alright, What is going on? Why is there a line on".to_owned(),
+                tentative: "That's pretty cool. These newest words stay visible.".to_owned(),
                 revision: 7,
             },
-            elapsed: Some(Duration::from_secs(12)),
+            elapsed: Some(Duration::from_secs(10)),
             ..OverlayViewState::default()
+        }
+    }
+
+    #[test]
+    fn reference_contract_state_matches_the_overlay_comparison_harness() {
+        for mode in [OverlayMode::Live, OverlayMode::Minimal] {
+            let state = state(mode);
+            assert_eq!(state.elapsed, Some(Duration::from_secs(10)));
+            assert_eq!(
+                state.transcript.committed,
+                "Alright, What is going on? Why is there a line on"
+            );
+            assert_eq!(
+                state.transcript.tentative,
+                "That's pretty cool. These newest words stay visible."
+            );
+            assert_eq!(state.live_preview_available, mode == OverlayMode::Live);
         }
     }
 
@@ -2348,46 +2370,79 @@ mod tests {
     }
 
     #[test]
-    fn appended_preview_words_shift_existing_ink_left_and_keep_the_newest_suffix_right_anchored() {
+    fn transcript_stays_at_the_left_origin_until_overflow_then_follows_the_tail() {
         with_rasterizer(|rasterizer| {
             for dpi in [96, 120, 144, 192] {
                 let bounds = production_bounds(OverlayMode::Live, dpi);
                 let layout = DisplayLayout::from_bounds(OverlayMode::Live, bounds).unwrap();
-                let mut first = state(OverlayMode::Live);
-                first.transcript.committed = "anchor".to_owned();
-                first.transcript.tentative.clear();
-                let mut appended = first.clone();
-                appended.transcript.committed = "anchor more anchor".to_owned();
+                let preview = layout.preview.unwrap();
+                let mut pixels = vec![0; bounds.width as usize * bounds.height as usize * 4];
+                let mut canvas =
+                    Canvas::new(rasterizer, &mut pixels, bounds.width, bounds.height).unwrap();
+                let font_size = 13.0 * layout.scale;
+                let prefix = (1..)
+                    .map(|count| "W".repeat(count))
+                    .take_while(|text| {
+                        let line =
+                            StyledLine::plain(text, NativeColors::for_theme(true).muted_text);
+                        canvas.measure_styled_line(&line, font_size).unwrap() <= preview.width()
+                    })
+                    .last()
+                    .expect("at least one glyph fits the preview");
+                let overflow_count = (1..32)
+                    .find(|count| {
+                        let text = format!("{prefix}{}", "i".repeat(*count));
+                        let line =
+                            StyledLine::plain(text, NativeColors::for_theme(true).muted_text);
+                        canvas.measure_styled_line(&line, font_size).unwrap() > preview.width()
+                    })
+                    .expect("narrow glyphs eventually overflow the preview");
+                let exact_text = format!("{prefix}{}", "i".repeat(overflow_count - 1));
+                drop(canvas);
 
-                let first_ink = component_ink_bounds(&isolated_component_frame(
-                    rasterizer,
-                    &first,
-                    &layout,
-                    true,
-                    IsolatedComponent::Preview,
-                ))
-                .expect("first preview ink");
-                let appended_ink = component_ink_bounds(&isolated_component_frame(
-                    rasterizer,
-                    &appended,
-                    &layout,
-                    true,
-                    IsolatedComponent::Preview,
-                ))
-                .expect("appended preview ink");
+                let preview_ink = |committed: String| {
+                    let mut candidate = state(OverlayMode::Live);
+                    candidate.transcript.committed = committed;
+                    candidate.transcript.tentative.clear();
+                    component_ink_bounds(&isolated_component_frame(
+                        rasterizer,
+                        &candidate,
+                        &layout,
+                        true,
+                        IsolatedComponent::Preview,
+                    ))
+                    .expect("preview ink")
+                };
+                let short_ink = preview_ink("short".to_owned());
+                let exact_ink = preview_ink(exact_text.clone());
+                let first_overflow_ink =
+                    preview_ink(format!("{prefix}{}", "i".repeat(overflow_count)));
+                let later_ink = (overflow_count + 1..=overflow_count + 16)
+                    .map(|count| preview_ink(format!("{prefix}{}", "i".repeat(count))))
+                    .find(|ink| ink.x0 < first_overflow_ink.x0)
+                    .expect("a later append should widen the retained tail");
 
+                let left_tolerance = (3.0 * layout.scale).ceil() as i32;
                 assert!(
-                    appended_ink.x0 < first_ink.x0,
-                    "existing preview ink must move left as words append at {dpi} DPI: {first_ink:?} -> {appended_ink:?}"
-                );
-                let right_tolerance = (2.0 * layout.scale).ceil() as i32;
-                assert!(
-                    (appended_ink.x1 - first_ink.x1).abs() <= right_tolerance,
-                    "the repeated newest suffix must remain anchored at the same right edge at {dpi} DPI: {first_ink:?} -> {appended_ink:?}"
+                    (short_ink.x0 - preview.x0.floor() as i32).abs() <= left_tolerance,
+                    "short text must start at preview.x0 at {dpi} DPI: {short_ink:?}"
                 );
                 assert!(
-                    appended_ink.x1 >= layout.preview.unwrap().x1.floor() as i32 - 8,
-                    "newest suffix must remain visible at the preview's right edge at {dpi} DPI: {appended_ink:?}"
+                    (exact_ink.x0 - preview.x0.floor() as i32).abs() <= left_tolerance,
+                    "last-fitting text must start at preview.x0 at {dpi} DPI: {exact_ink:?}"
+                );
+                let right_tolerance = (8.0 * layout.scale).ceil() as i32;
+                assert!(
+                    first_overflow_ink.x1 >= preview.x1.floor() as i32 - right_tolerance,
+                    "the first overflow must transition to the preview's right edge at {dpi} DPI: {first_overflow_ink:?}"
+                );
+                assert!(
+                    later_ink.x0 < first_overflow_ink.x0,
+                    "retained ink must move left after another append at {dpi} DPI: {first_overflow_ink:?} -> {later_ink:?}"
+                );
+                assert!(
+                    (later_ink.x1 - first_overflow_ink.x1).abs() <= right_tolerance,
+                    "overflowing tails must keep a fixed right edge at {dpi} DPI: {first_overflow_ink:?} -> {later_ink:?}"
                 );
             }
         });

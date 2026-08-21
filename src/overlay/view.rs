@@ -433,10 +433,7 @@ fn render_live_status_row(ui: &mut egui::Ui, state: &OverlayViewState, colors: O
         if state.live_preview_available || state.error.is_some() {
             render_divider(ui, colors);
             let layout = live_preview_layout(ui, state, colors, ui.available_width());
-            let follows_transcript_tail = state.error.is_none()
-                && state.notice.is_none()
-                && (!state.transcript.committed.is_empty()
-                    || !state.transcript.tentative.is_empty());
+            let follows_transcript_tail = layout.halign == egui::Align::RIGHT;
             let response = if follows_transcript_tail {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(layout)
@@ -597,6 +594,10 @@ fn transcript_layout_for_rows(
 ) -> egui::text::LayoutJob {
     let full = transcript_layout(committed, tentative, max_width, colors);
     let total_graphemes = full.text.graphemes(true).count();
+    let full_rows = ui.fonts(|fonts| fonts.layout_job(full.clone()).rows.len());
+    if total_graphemes <= MAX_PREVIEW_GRAPHEMES && full_rows <= max_rows {
+        return full;
+    }
     let mut low = 0;
     let mut high = total_graphemes.min(MAX_PREVIEW_GRAPHEMES);
     let mut best = tail_layout_job(&full, 0);
@@ -1252,7 +1253,75 @@ mod tests {
     }
 
     #[test]
-    fn appended_preview_words_move_the_egui_label_left_while_its_right_edge_stays_fixed() {
+    fn transcript_stays_left_aligned_through_exact_fit_then_tail_follows_after_overflow() {
+        let context = egui::Context::default();
+        let mut result = None;
+        let _ = context.run(egui::RawInput::default(), |context| {
+            egui::CentralPanel::default().show(context, |ui| {
+                let colors = overlay_colors(context);
+                let exact_text = "W".repeat(24);
+                let unbounded = transcript_layout(&exact_text, "", f32::INFINITY, colors);
+                let exact_width = ui.fonts(|fonts| fonts.layout_job(unbounded).size().x);
+                let short = transcript_layout_for_rows(
+                    ui,
+                    "short",
+                    "",
+                    exact_width,
+                    LIVE_PREVIEW_ROWS,
+                    colors,
+                );
+                let exact = transcript_layout_for_rows(
+                    ui,
+                    &exact_text,
+                    "",
+                    exact_width,
+                    LIVE_PREVIEW_ROWS,
+                    colors,
+                );
+                let first_overflow_text = format!("{exact_text}i");
+                let first_overflow = transcript_layout_for_rows(
+                    ui,
+                    &first_overflow_text,
+                    "",
+                    exact_width,
+                    LIVE_PREVIEW_ROWS,
+                    colors,
+                );
+                let first_width =
+                    ui.fonts(|fonts| fonts.layout_job(first_overflow.clone()).size().x);
+                let later = (2..=8).find_map(|appended| {
+                    let text = format!("{exact_text}{}", "i".repeat(appended));
+                    let layout = transcript_layout_for_rows(
+                        ui,
+                        &text,
+                        "",
+                        exact_width,
+                        LIVE_PREVIEW_ROWS,
+                        colors,
+                    );
+                    let width = ui.fonts(|fonts| fonts.layout_job(layout.clone()).size().x);
+                    (layout.halign == egui::Align::RIGHT && width > first_width + 0.1)
+                        .then_some((layout, width))
+                });
+                result = Some((short, exact, first_overflow, first_width, later));
+            });
+        });
+
+        let (short, exact, first_overflow, first_width, later) = result.unwrap();
+        assert_eq!(short.halign, egui::Align::LEFT);
+        assert_eq!(exact.halign, egui::Align::LEFT);
+        assert_eq!(exact.text, "W".repeat(24));
+        assert_eq!(first_overflow.halign, egui::Align::RIGHT);
+        assert!(first_overflow.text.ends_with('i'));
+        assert!(!first_overflow.text.contains('\u{2026}'));
+        let (later, later_width) = later.expect("a later append should widen the retained tail");
+        let preview_x1 = 500.0;
+        assert!(preview_x1 - later_width < preview_x1 - first_width);
+        assert_eq!(later.halign, egui::Align::RIGHT);
+    }
+
+    #[test]
+    fn overflowing_preview_words_move_the_egui_label_left_while_its_right_edge_stays_fixed() {
         fn preview_bounds(committed: &str) -> egui::accesskit::Rect {
             let context = egui::Context::default();
             context.enable_accesskit();
@@ -1293,8 +1362,43 @@ mod tests {
                 .expect("preview bounds")
         }
 
-        let first = preview_bounds("anchor");
-        let appended = preview_bounds("anchor more anchor");
+        fn text_width(text: &str) -> f32 {
+            let context = egui::Context::default();
+            let mut width = None;
+            let _ = context.run(egui::RawInput::default(), |context| {
+                egui::CentralPanel::default().show(context, |ui| {
+                    let layout =
+                        transcript_layout(text, "", f32::INFINITY, overlay_colors(context));
+                    width = Some(ui.fonts(|fonts| fonts.layout_job(layout).size().x));
+                });
+            });
+            width.unwrap()
+        }
+
+        let short = preview_bounds("short");
+        let overflowing_probe = preview_bounds(&"W".repeat(128));
+        let preview_x0 = short.x0;
+        let preview_x1 = overflowing_probe.x1;
+        let preview_width = (preview_x1 - preview_x0) as f32;
+        let prefix = (1..128)
+            .map(|count| "W".repeat(count))
+            .take_while(|text| text_width(text) <= preview_width)
+            .last()
+            .expect("at least one glyph fits the preview");
+        let overflow_count = (1..32)
+            .find(|count| text_width(&format!("{prefix}{}", "i".repeat(*count))) > preview_width)
+            .expect("narrow glyphs eventually overflow the preview");
+        let exact_text = format!("{prefix}{}", "i".repeat(overflow_count - 1));
+        let exact = preview_bounds(&exact_text);
+        assert!((short.x0 - preview_x0).abs() <= 0.5);
+        assert!((exact.x0 - preview_x0).abs() <= 0.5);
+
+        let first = preview_bounds(&format!("{prefix}{}", "i".repeat(overflow_count)));
+        assert!((first.x1 - preview_x1).abs() <= 0.5);
+        let appended = (overflow_count + 1..=overflow_count + 16)
+            .map(|count| preview_bounds(&format!("{prefix}{}", "i".repeat(count))))
+            .find(|bounds| bounds.x0 < first.x0 && (bounds.x1 - first.x1).abs() <= 0.5)
+            .expect("a later overflowing append should move retained ink left");
         assert!(appended.x0 < first.x0, "{first:?} -> {appended:?}");
         assert!(
             (appended.x1 - first.x1).abs() <= 0.5,
