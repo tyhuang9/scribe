@@ -936,9 +936,25 @@ final result: passed
 - Full committed/tentative state and accessibility wording remain untruncated;
   only the painted Live viewport is clipped. Tentative text remains isolated
   from final output and history by the existing controller contract.
-- These comparisons are deterministic native layered-raster composites.
-  Fresh physical Windows.Graphics.Capture evidence, independent UI/UX and
-  accessibility review, and the full repository/release gates are recorded as
-  separate integration evidence; they are not implied by this visual pass.
+- The deterministic comparisons are complemented by fresh hardware
+  `Windows.Graphics.Capture` evidence from exact source head `bf4be29` and
+  isolated executable SHA-256
+  `2aad0bc56e36812859035ebec3ac2b6185a262a9520ceb39bac1f5872e8bd55e`:
+  `revised-wgc-{live,compact}-{light,dark}.{png,json}`. All four manifests
+  record hardware D3D capture, visible/uncloaked layered windows, unchanged
+  foreground HWNDs, and 120-DPI physical geometry of 750 x 78 Live or
+  250 x 78 Compact plus a 55 x 55 cancel control. The four PNGs were inspected
+  together; the overlay is present in each, the reported inner line is absent,
+  Live retains its newest visible words, and Compact retains only the matching
+  brand/timer/X shell.
+- The left secondary monitor was detected at `[-1920,163..0,1243]` and direct
+  `SetWindowPos`, `SetWindowPlacement`, foreground-shortcut, and cursor-monitor
+  placement were attempted. The harness continuously reapplied its maximized
+  viewport on the 120-DPI primary monitor, so this fresh WGC set does not claim
+  left-secondary placement. The earlier selected-reference WGC remains valid
+  evidence for negative-coordinate placement, while automated physical-layout
+  contracts cover all four DPI scales.
+- Independent UI/UX and accessibility review plus the full repository/release
+  gates are recorded separately; they are not implied by this visual pass.
 
 final result: passed

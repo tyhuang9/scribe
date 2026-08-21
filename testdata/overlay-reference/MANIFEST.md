@@ -115,6 +115,25 @@ temporary attachment path:
   `c91961928bd7e3838e7ec0c06d9f0b5a106b0f6f387dc98d68aa54a6efe5dad9`
 - `revised-live-compact-dark-120.png` SHA-256:
   `65cff8bd116fefba077a57ef19e38a8a9d53dc8febcf05b5cb7320e7f06b8365`
+- `revised-wgc-live-light.png` / `.json` SHA-256:
+  `db1064074985a3b830c31a7f250b63eacf64070aa237deba5423d8107c5dda89` /
+  `c34345a165e1aafe7a41d2706ff978b9cb3bbc8e350f920d291080fa00683357`
+- `revised-wgc-live-dark.png` / `.json` SHA-256:
+  `a9b671024e2cb4028f862e3fd3cc942bb986931b86bb45acf4b16d96ba2de6c3` /
+  `c9b410550ae31f31e7a69c816f26325f0e4250fdf7381a604511873d6f3e028f`
+- `revised-wgc-compact-light.png` / `.json` SHA-256:
+  `a03361c48ff158afd7b168628e7cd06e21dbcb89bb15af63ca24ab7c844993d8` /
+  `8fb295476ac84e1ffcebb7308a5a7031efe76d03fae4acd79be531ed7612b6b9`
+- `revised-wgc-compact-dark.png` / `.json` SHA-256:
+  `1414f7dbdb7ee07cd8b964df88810ac467a4e8c6854b05f33df154fd212f3103` /
+  `448184396f1b9d8ebb3ef090b9c3ac989c302aeb386b5c44ab2a6463f72fd24e`
+
+The revised WGC set was captured from source head `bf4be29` with the exact
+isolated executable SHA-256
+`2aad0bc56e36812859035ebec3ac2b6185a262a9520ceb39bac1f5872e8bd55e`.
+Each manifest records hardware D3D capture, 120 DPI, visible/uncloaked layered
+windows, an unchanged foreground HWND, and the expected 750 x 78 Live or
+250 x 78 Compact display plus 55 x 55 cancel control.
 
 The final Product Design and specialist UI/UX acceptance record is the latest
 "Native overlay tail-follow and Compact-shell revision" section of
