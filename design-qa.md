@@ -777,3 +777,184 @@ final result: passed
 - Copy: unchanged.
 
 final result: blocked
+
+---
+
+# Native Live overlay reference restoration - Product Design QA - 2026-08-20
+
+## Source and implementation evidence
+
+- Selected tracked source:
+  `design-qa-evidence/overlay-native/reference-source.png` (1175 x 152 pixels;
+  byte-identical to the original supplied attachment; SHA-256
+  `0ea2c3df19e1f40346fda7e5499b5815a6c8b601a6cc9b95e23ccbddffb19bf6`).
+- Deterministic native 192-DPI composite:
+  `design-qa-evidence/overlay-native/reference-contract-live-dark.png`.
+- Same-state comparison:
+  `design-qa-evidence/overlay-native/reference-contract-comparison.png`
+  (SHA-256
+  `f428ec83234fffad9e7b084c6164959af942e8c21d91ed53ceaa5c13109cc223`).
+- Hardware `Windows.Graphics.Capture` evidence at 96 DPI on the left secondary
+  monitor: `design-qa-evidence/overlay-native/reference-contract-wgc-live-dark-96.png`
+  and its exact HWND/monitor manifest
+  `design-qa-evidence/overlay-native/reference-contract-wgc-live-dark-96.json`.
+- The comparison maps the implementation capsule's measured physical bounds
+  onto the source capsule bounds. It does not stretch to the arbitrary image
+  crop. Both rows use `00:12` and `Clicking the settings icon in the top
+  right...` on an RGB 240/240/245 backdrop.
+
+## Fidelity review
+
+- Composition matches the selected order: the existing bundled Phosphor
+  `WAVEFORM` glyph as a static Scribe brand mark, regular elapsed time, one
+  divider, one continuous regular live transcript line, and the cancel X.
+- The mark is no longer an audio-driven meter or halo. The dark overlay-specific
+  purple is slightly lighter than the screenshot to preserve 3:1 non-text
+  contrast and remains within the selected violet family.
+- Elapsed time uses Segoe UI regular rather than slashed Consolas zeros. The
+  transcript keeps its beginning and places any fitting ellipsis at the end,
+  matching both the source and the committed-prefix product invariant.
+- An unpainted capsule-center pixel composites to RGB 87/87/94 over the review
+  backdrop; comparable source pixels are approximately RGB
+  81-85/82-86/86-90. Border and top highlight opacity and thickness were
+  reduced after the first comparison to remove the double-line appearance.
+  Radius, surface height, shadow envelope, logo scale, text weight, divider
+  position, preview origin, and cancel inset have no remaining P0, P1, or P2
+  mismatch after capsule-bound normalization.
+- The Live cancel control remains an exact 44 x 44 logical target and moved to
+  a 16-point right inset. Its physical center and raster/UI Automation bounds
+  remain derived from shared geometry at 96, 120, 144, and 192 DPI.
+- When rolling preview never starts, the Live shell intentionally retains only
+  logo, elapsed time, and cancel during normal recording phases. Divider,
+  preview pixels, preview node, and live-region announcement are absent. A
+  later general capture error is still visible and politely announced; a
+  preview that starts and later fails keeps its error notice. User-selected
+  Minimal mode is unchanged.
+- Committed and tentative transcript regions remain separate in controller
+  state and accessibility wording. The source-selected visual presentation is
+  intentionally one continuous regular light-gray line; tentative text is not
+  promoted into final output or history.
+
+## Verification and limitations
+
+- Deterministic raster, geometry, live/no-preview, Unicode fitting, and
+  AccessKit tests cover the accepted composition and exact physical bounds.
+  Contrast tests composite both renderers' translucent surfaces over black and
+  white backdrop extremes; the native regression samples actual premultiplied
+  output. On its limiting dark/white case, normal muted, error, and warning
+  text measure at least 4.5:1 and the Scribe mark measures at least 3:1.
+- The tracked fixture corpus and both comparison images were regenerated after
+  the final surface/contrast adjustment and reviewed together on 2026-08-20.
+- The comparison image is a code-rendered native layered-raster composite, not
+  a Windows.Graphics.Capture frame. It is valid same-state Product Design
+  evidence because the renderer bytes, alpha composition, control placement,
+  and reference backdrop are all deterministic.
+- The fresh physical WGC capture used the checked-in isolated overlay harness
+  from this head (all features, executable SHA-256
+  `158a2c2f50d930681e55baf046129b9eefb2d7d323d29f81b0621a9fba50c63c`).
+  Its manifest proves hardware D3D capture, an uncloaked 600 x 62 display, a
+  separate 44 x 44 cancel control, DPI 96, and placement on the left 1920 x
+  1080 secondary monitor. The crop confirms the layered windows are visible
+  together without a seam or black control tile. Its dark fixture panel is not
+  used for palette comparison because translucent surface color is
+  backdrop-dependent; the deterministic light-backdrop comparison above owns
+  that fidelity check.
+- The existing staged Scribe process was not terminated or disturbed. The
+  isolated fixture was stopped only after its executable path was revalidated.
+
+final result: passed
+
+---
+
+# Native overlay tail-follow and Compact-shell revision - Product Design QA - 2026-08-21
+
+## Source and same-state evidence
+
+- Reviewed implementation source head: `5e43cfb` (`Tail-follow live text only
+  after overflow`), including the focused production commits `8099cac`,
+  `1f26dd1`, and `e97ebbb`.
+- The reported 769 x 89 capture is tracked as
+  `design-qa-evidence/overlay-native/reported-live-overlay-top-line.png`
+  (SHA-256
+  `15a6791e254722290c59e4c7966260cabe80f6e0db3acd7710d7e722bad97949`).
+  It records the unintended inner top line, `00:10`, head-preserving preview,
+  and trailing ellipsis from the prior build.
+- `design-qa-evidence/overlay-native/reported-vs-revised-live-light-120.png`
+  places that report and the revised 120-DPI native raster in one same-state
+  comparison (SHA-256
+  `0de32080b7e5d22accfcd46b96369b7896d6a0f0dbc1c98bab9eaf716193f250`).
+- `design-qa-evidence/overlay-native/revised-live-compact-light-120.png` and
+  `design-qa-evidence/overlay-native/revised-live-compact-dark-120.png` compare
+  Live and Compact at the same `00:10` fixture state in each theme. Their
+  SHA-256 values are
+  `c91961928bd7e3838e7ec0c06d9f0b5a106b0f6f387dc98d68aa54a6efe5dad9`
+  and
+  `65cff8bd116fefba077a57ef19e38a8a9d53dc8febcf05b5cb7320e7f06b8365`.
+- The four underlying 120-DPI raster composites are tracked as
+  `revised-raster-{live,compact}-{light,dark}-120.png`; the regenerated raw
+  96/120/144/192-DPI fixture corpus and checksums live in
+  `testdata/overlay-reference/`.
+
+## Visual and interaction acceptance
+
+- The explicit second inner-highlight stroke is removed from both renderers.
+  The capsule retains its normal perimeter border and shadow, so removing the
+  reported line does not flatten or detach the surface.
+- A short or exact-fitting Live preview begins at the established preview
+  origin. The first true overflow switches to a clipped, right-anchored tail;
+  later appended words remain visible at the fixed right edge while earlier
+  ink moves left. No synthetic ellipsis is drawn, and the fit boundary never
+  splits a Unicode grapheme.
+- The 200 x 62 logical Compact presentation uses the same capsule height,
+  radius, surface, border, shadow, vertical centerline, static bundled
+  Phosphor waveform, proportional timer, cancel glyph, and 16-point cancel
+  inset as Live. It omits only Live's transcript and divider, so it is compact
+  without leaving a 600-point blank transcript region.
+- Normal Compact is exactly brand, timer, and cancel. For an error or notice,
+  the timer region temporarily shows the concise colored word `Error` or
+  `Notice`; the full message and recovery detail remain available in the same
+  bounded accessible announcement node. This is accepted as the least
+  disruptive failure treatment because it preserves the stable no-activation
+  shell and keeps failures visible without reintroducing transcript content.
+- Light and dark combined comparisons show no seam, black cancel tile,
+  clipped glyph, vertical drift, extra divider, transcript residue, or
+  reappearance of the reported inner line. The dark rendering remains in the
+  selected PR #50 neutral/violet family, while the light rendering retains the
+  existing contrast-qualified inverse treatment.
+
+## Verification and limitations
+
+- The fixture candidate was generated outside the repository and visually
+  accepted before its bytes were copied into the tracked corpus. Checksum,
+  byte-identical golden, and harness-state tests pass against the promoted
+  fixtures.
+- Deterministic egui and native traces cover the left-aligned fit threshold,
+  first overflow, sequential leftward movement with fixed right edge, and
+  grapheme-safe clipping. Native layout/raster/UI Automation contracts cover
+  96, 120, 144, and 192 DPI and preserve the exact 44 x 44 logical cancel
+  target.
+- Full committed/tentative state and accessibility wording remain untruncated;
+  only the painted Live viewport is clipped. Tentative text remains isolated
+  from final output and history by the existing controller contract.
+- The deterministic comparisons are complemented by fresh hardware
+  `Windows.Graphics.Capture` evidence from exact source head `bf4be29` and
+  isolated executable SHA-256
+  `2aad0bc56e36812859035ebec3ac2b6185a262a9520ceb39bac1f5872e8bd55e`:
+  `revised-wgc-{live,compact}-{light,dark}.{png,json}`. All four manifests
+  record hardware D3D capture, visible/uncloaked layered windows, unchanged
+  foreground HWNDs, and 120-DPI physical geometry of 750 x 78 Live or
+  250 x 78 Compact plus a 55 x 55 cancel control. The four PNGs were inspected
+  together; the overlay is present in each, the reported inner line is absent,
+  Live retains its newest visible words, and Compact retains only the matching
+  brand/timer/X shell.
+- The left secondary monitor was detected at `[-1920,163..0,1243]` and direct
+  `SetWindowPos`, `SetWindowPlacement`, foreground-shortcut, and cursor-monitor
+  placement were attempted. The harness continuously reapplied its maximized
+  viewport on the 120-DPI primary monitor, so this fresh WGC set does not claim
+  left-secondary placement. The earlier selected-reference WGC remains valid
+  evidence for negative-coordinate placement, while automated physical-layout
+  contracts cover all four DPI scales.
+- Independent UI/UX and accessibility review plus the full repository/release
+  gates are recorded separately; they are not implied by this visual pass.
+
+final result: passed

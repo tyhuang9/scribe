@@ -1,15 +1,14 @@
-use std::{borrow::Cow, ffi::c_void, mem::zeroed, ptr::null_mut, time::Duration};
+use std::{borrow::Cow, ffi::c_void, mem::zeroed, ptr::null_mut, sync::Mutex, time::Duration};
 
 use eframe::egui::Color32;
 use unicode_segmentation::UnicodeSegmentation;
 use windows_sys::Win32::Graphics::GdiPlus::{
-    FillModeAlternate, FontStyleBold, FontStyleItalic, FontStyleRegular, GdipAddPathArc,
-    GdipCloneFontFamily, GdipClosePathFigure, GdipCreateBitmapFromScan0, GdipCreateFont,
-    GdipCreateFontFamilyFromName, GdipCreatePath, GdipCreatePen1, GdipCreateSolidFill,
-    GdipDeleteBrush, GdipDeleteFont, GdipDeleteFontFamily, GdipDeleteGraphics, GdipDeletePath,
-    GdipDeletePen, GdipDeletePrivateFontCollection, GdipDeleteStringFormat, GdipDisposeImage,
-    GdipDrawLine, GdipDrawPath, GdipDrawString, GdipFillEllipse, GdipFillPath,
-    GdipGetFontCollectionFamilyCount, GdipGetFontCollectionFamilyList,
+    FillModeAlternate, FontStyleRegular, GdipAddPathArc, GdipCloneFontFamily, GdipClosePathFigure,
+    GdipCreateBitmapFromScan0, GdipCreateFont, GdipCreateFontFamilyFromName, GdipCreatePath,
+    GdipCreatePen1, GdipCreateSolidFill, GdipDeleteBrush, GdipDeleteFont, GdipDeleteFontFamily,
+    GdipDeleteGraphics, GdipDeletePath, GdipDeletePen, GdipDeletePrivateFontCollection,
+    GdipDeleteStringFormat, GdipDisposeImage, GdipDrawLine, GdipDrawPath, GdipDrawString,
+    GdipFillPath, GdipGetFontCollectionFamilyCount, GdipGetFontCollectionFamilyList,
     GdipGetGenericFontFamilySansSerif, GdipGetImageGraphicsContext, GdipGraphicsClear,
     GdipMeasureString, GdipNewPrivateFontCollection, GdipPrivateAddMemoryFont,
     GdipSetSmoothingMode, GdipSetStringFormatFlags, GdipSetTextRenderingHint,
@@ -24,10 +23,7 @@ use super::{
     super::{
         controller::{OverlayMode, OverlayPhase, OverlayRecovery, OverlayViewState},
         platform::OverlayWindowBounds,
-        view::{
-            CONTROL_SIZE, LIVE_HEIGHT, LIVE_WIDTH, MINIMAL_HEIGHT, MINIMAL_WIDTH,
-            live_estimate_marker,
-        },
+        view::{CONTROL_SIZE, LIVE_HEIGHT, LIVE_WIDTH, MINIMAL_WIDTH},
     },
     layout::DisplayLayout,
 };
@@ -36,6 +32,7 @@ use crate::ui::ThemePalette;
 const PIXEL_FORMAT_32BPP_PARGB: i32 = 0x000E_200B;
 const MAX_PREVIEW_GRAPHEMES: usize = 512;
 const MAX_MESSAGE_GRAPHEMES: usize = 256;
+const BASELINE_METRIC_CAPACITY: usize = 16;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Argb(u32);
@@ -56,13 +53,9 @@ impl Argb {
 struct NativeColors {
     surface: Argb,
     border: Argb,
-    inner_highlight: Argb,
     text: Argb,
     muted_text: Argb,
-    tentative_text: Argb,
     waveform: Argb,
-    meter_active: Argb,
-    meter_inactive: Argb,
     error: Argb,
     warning: Argb,
     shadow: Argb,
@@ -77,30 +70,23 @@ impl NativeColors {
         };
         if dark_mode {
             Self {
-                surface: Argb::new(218, 25, 31, 42),
-                border: Argb::new(76, 220, 229, 242),
-                inner_highlight: Argb::new(42, 255, 255, 255),
+                surface: Argb::new(184, 52, 53, 61),
+                border: Argb::new(36, 220, 229, 242),
                 text: Argb::from_color(palette.text),
-                muted_text: Argb::new(255, 202, 211, 224),
-                tentative_text: Argb::new(255, 166, 180, 202),
-                waveform: Argb::from_color(palette.recording_waveform),
-                meter_active: Argb::from_color(palette.success),
-                meter_inactive: Argb::new(255, 128, 142, 162),
-                error: Argb::from_color(palette.error),
-                warning: Argb::from_color(palette.warning),
+                muted_text: Argb::new(255, 210, 210, 216),
+                // Overlay-specific accessible variant of the reference purple.
+                waveform: Argb::new(255, 178, 162, 255),
+                error: Argb::new(255, 255, 200, 200),
+                warning: Argb::new(255, 255, 222, 170),
                 shadow: Argb::new(96, 0, 0, 0),
             }
         } else {
             Self {
                 surface: Argb::new(228, 248, 250, 253),
                 border: Argb::new(64, 35, 47, 66),
-                inner_highlight: Argb::new(156, 255, 255, 255),
                 text: Argb::from_color(palette.text),
                 muted_text: Argb::new(255, 65, 75, 90),
-                tentative_text: Argb::new(255, 72, 84, 102),
                 waveform: Argb::from_color(palette.recording_waveform),
-                meter_active: Argb::from_color(palette.success_text),
-                meter_inactive: Argb::new(255, 100, 112, 132),
                 error: Argb::from_color(palette.error_text),
                 warning: Argb::from_color(palette.warning),
                 shadow: Argb::new(54, 0, 0, 0),
@@ -153,10 +139,17 @@ impl LayeredFrame {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TextStyle {
     Regular,
-    Bold,
-    Italic,
-    Monospace,
     Phosphor,
+}
+
+/// Representative ascender/descender runs used only to establish stable font
+/// baselines. They are deliberately fixed: transcript text is never retained
+/// in the native rasterizer cache.
+fn baseline_sample(style: TextStyle) -> &'static str {
+    match style {
+        TextStyle::Regular => "Agjpqy",
+        TextStyle::Phosphor => egui_phosphor::regular::WAVEFORM,
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -194,19 +187,76 @@ impl StyledLine {
     }
 
     fn head(&self, keep: usize) -> Self {
-        slice_styled_line(self, 0, keep, true)
+        slice_styled_line(self, 0, keep, Some(true))
     }
 
     fn tail(&self, keep: usize) -> Self {
         let total = self.grapheme_count();
-        slice_styled_line(self, total.saturating_sub(keep), total, false)
+        slice_styled_line(self, total.saturating_sub(keep), total, None)
     }
 }
 
 pub(super) struct NativeRasterizer {
     // Fields drop in declaration order: release the private family before GDI+ shutdown.
     phosphor: PrivateFont,
+    baseline_metrics: Mutex<BaselineMetricCache>,
+    #[cfg(test)]
+    baseline_probe_count: std::sync::atomic::AtomicUsize,
     _gdiplus: GdiPlusSession,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BaselineMetric {
+    style: TextStyle,
+    font_size_bits: u32,
+    ink_center_y: f32,
+}
+
+#[derive(Debug)]
+struct BaselineMetricCache {
+    entries: [Option<BaselineMetric>; BASELINE_METRIC_CAPACITY],
+    next_eviction: usize,
+}
+
+impl Default for BaselineMetricCache {
+    fn default() -> Self {
+        Self {
+            entries: [None; BASELINE_METRIC_CAPACITY],
+            next_eviction: 0,
+        }
+    }
+}
+
+impl BaselineMetricCache {
+    fn get(&self, style: TextStyle, font_size: f32) -> Option<f32> {
+        self.entries
+            .iter()
+            .flatten()
+            .find(|metric| metric.style == style && metric.font_size_bits == font_size.to_bits())
+            .map(|metric| metric.ink_center_y)
+    }
+
+    fn insert(&mut self, style: TextStyle, font_size: f32, ink_center_y: f32) {
+        if let Some(slot) = self.entries.iter_mut().find(|entry| entry.is_none()) {
+            *slot = Some(BaselineMetric {
+                style,
+                font_size_bits: font_size.to_bits(),
+                ink_center_y,
+            });
+            return;
+        }
+        self.entries[self.next_eviction] = Some(BaselineMetric {
+            style,
+            font_size_bits: font_size.to_bits(),
+            ink_center_y,
+        });
+        self.next_eviction = (self.next_eviction + 1) % BASELINE_METRIC_CAPACITY;
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.iter().flatten().count()
+    }
 }
 
 impl NativeRasterizer {
@@ -215,8 +265,80 @@ impl NativeRasterizer {
         let phosphor = PrivateFont::phosphor_regular()?;
         Ok(Self {
             phosphor,
+            baseline_metrics: Mutex::new(BaselineMetricCache::default()),
+            #[cfg(test)]
+            baseline_probe_count: std::sync::atomic::AtomicUsize::new(0),
             _gdiplus: gdiplus,
         })
+    }
+
+    fn baseline_ink_center_y(&self, font_size: f32, style: TextStyle) -> Result<f32, RasterError> {
+        if let Some(center) = self
+            .baseline_metrics
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(style, font_size)
+        {
+            return Ok(center);
+        }
+
+        let center = self.measure_baseline_ink_center_y(font_size, style)?;
+        #[cfg(test)]
+        self.baseline_probe_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut metrics = self
+            .baseline_metrics
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Ok(metrics.get(style, font_size).unwrap_or_else(|| {
+            metrics.insert(style, font_size, center);
+            center
+        }))
+    }
+
+    fn measure_baseline_ink_center_y(
+        &self,
+        font_size: f32,
+        style: TextStyle,
+    ) -> Result<f32, RasterError> {
+        let sample = baseline_sample(style);
+        let width = (font_size * 16.0).ceil().clamp(1.0, 32_768.0) as i32;
+        let height = (font_size * 4.0).ceil().max(1.0) as i32;
+        let mut probe = LayeredFrame::transparent(width, height)?;
+        let mut canvas = Canvas::new(self, &mut probe.pixels, width, height)?;
+        canvas.draw_text(
+            sample,
+            0.0,
+            0.0,
+            width as f32,
+            height as f32,
+            font_size,
+            style,
+            Argb::new(255, 255, 255, 255),
+        )?;
+        drop(canvas);
+        let mut first = None;
+        let mut last = None;
+        for y in 0..height {
+            if (0..width).any(|x| probe.pixels[((y * width + x) * 4 + 3) as usize] > 0) {
+                first.get_or_insert(y);
+                last = Some(y);
+            }
+        }
+        let (first, last) = first.zip(last).ok_or(RasterError::TextTooLong)?;
+        Ok((first + last + 1) as f32 / 2.0)
+    }
+
+    #[cfg(test)]
+    fn baseline_cache_stats(&self) -> (usize, usize) {
+        (
+            self.baseline_metrics
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            self.baseline_probe_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
     }
 
     pub(super) fn render_display(
@@ -284,10 +406,14 @@ fn draw_capsule(
     scale: f32,
     colors: NativeColors,
 ) -> Result<(), RasterError> {
-    let (logical_width, logical_height, vertical_inset, shadow_extent, shadow_offset) = match mode {
-        OverlayMode::Live => (LIVE_WIDTH, LIVE_HEIGHT, 8.0, 5.0, 2.0),
-        OverlayMode::Minimal | OverlayMode::Off => (MINIMAL_WIDTH, MINIMAL_HEIGHT, 4.0, 2.0, 1.0),
+    let logical_width = match mode {
+        OverlayMode::Live => LIVE_WIDTH,
+        OverlayMode::Minimal | OverlayMode::Off => MINIMAL_WIDTH,
     };
+    let logical_height = LIVE_HEIGHT;
+    let vertical_inset = 8.0;
+    let shadow_extent = 5.0;
+    let shadow_offset = 2.0;
     let x = 8.0 * scale;
     let y = vertical_inset * scale;
     let width = (logical_width - 16.0) * scale;
@@ -306,15 +432,7 @@ fn draw_capsule(
         )?;
     }
     canvas.fill_rounded_rect(x, y, width, height, radius, colors.surface)?;
-    canvas.stroke_rounded_rect(x, y, width, height, radius, scale.max(1.0), colors.border)?;
-    canvas.draw_line(
-        x + radius * 0.45,
-        y + 1.5 * scale,
-        x + width - radius * 0.45,
-        y + 1.5 * scale,
-        scale.max(1.0),
-        colors.inner_highlight,
-    )
+    canvas.stroke_rounded_rect(x, y, width, height, radius, scale.max(1.0), colors.border)
 }
 
 fn draw_live(
@@ -323,80 +441,92 @@ fn draw_live(
     layout: &DisplayLayout,
     colors: NativeColors,
 ) -> Result<(), RasterError> {
+    draw_live_brand_mark(canvas, layout, colors)?;
+    draw_live_elapsed(canvas, state, layout, colors)?;
+    if !state.live_preview_available && state.error.is_none() {
+        return Ok(());
+    }
+    draw_live_divider(canvas, layout, colors)?;
+    draw_live_preview(canvas, state, layout, colors)
+}
+
+fn draw_live_brand_mark(
+    canvas: &mut Canvas<'_>,
+    layout: &DisplayLayout,
+    colors: NativeColors,
+) -> Result<(), RasterError> {
     let scale = layout.scale;
-    let center_y = layout.recording_mark.center_y();
-    let level = normalized_level(state);
-    let visual_level = if state.reduced_motion { 0.55 } else { level };
     let center_x = layout.recording_mark.center_x();
-    let halo_radius = (2.5 + visual_level * 3.5) * scale;
-    let waveform_alpha = (16.0 + visual_level * 48.0).round() as u8;
-    let waveform_rgb = colors.waveform.0;
-    canvas.fill_ellipse(
-        center_x - halo_radius,
-        center_y - halo_radius,
-        halo_radius * 2.0,
-        halo_radius * 2.0,
-        Argb((waveform_rgb & 0x00FF_FFFF) | ((waveform_alpha as u32) << 24)),
-    )?;
-    canvas.draw_centered_text(
+    canvas.draw_centered_text_in_rect(
         egui_phosphor::regular::WAVEFORM,
         center_x,
-        layout.recording_mark.y0,
         layout.recording_mark.width(),
-        layout.recording_mark.height(),
+        layout.recording_mark,
         27.0 * scale,
         TextStyle::Phosphor,
         colors.waveform,
-    )?;
+    )
+}
 
+fn draw_live_elapsed(
+    canvas: &mut Canvas<'_>,
+    state: &OverlayViewState,
+    layout: &DisplayLayout,
+    colors: NativeColors,
+) -> Result<(), RasterError> {
+    let scale = layout.scale;
     let elapsed = state
         .elapsed
         .map(format_elapsed)
         .unwrap_or_else(|| "00:00".to_owned());
-    canvas.draw_text(
+    canvas.draw_text_centered_in_rect(
         &elapsed,
         layout.elapsed.x0,
-        layout.elapsed.y0,
         layout.elapsed.width(),
-        layout.elapsed.height(),
+        layout.elapsed,
         13.0 * scale,
-        TextStyle::Monospace,
+        TextStyle::Regular,
         colors.muted_text,
     )?;
+    Ok(())
+}
+
+fn draw_live_divider(
+    canvas: &mut Canvas<'_>,
+    layout: &DisplayLayout,
+    colors: NativeColors,
+) -> Result<(), RasterError> {
+    let scale = layout.scale;
+    let divider = layout
+        .divider_line
+        .expect("live layout includes divider line bounds");
     canvas.draw_line(
-        111.0 * scale,
-        19.0 * scale,
-        111.0 * scale,
-        43.0 * scale,
+        divider.center_x(),
+        divider.y0,
+        divider.center_x(),
+        divider.y1,
         scale.max(1.0),
         colors.border,
-    )?;
+    )
+}
 
+fn draw_live_preview(
+    canvas: &mut Canvas<'_>,
+    state: &OverlayViewState,
+    layout: &DisplayLayout,
+    colors: NativeColors,
+) -> Result<(), RasterError> {
+    let scale = layout.scale;
     let preview = layout.preview.expect("live layout includes preview bounds");
-    let mut text_x = preview.x0;
-    let mut max_width = preview.width();
-    if let Some(marker) = live_estimate_marker(state) {
-        let marker_font_size = 11.0 * scale;
-        let marker_width = canvas
-            .measure_text(marker, marker_font_size, TextStyle::Bold)?
-            .min(max_width);
-        canvas.draw_text(
-            marker,
-            text_x,
-            preview.y0,
-            marker_width,
-            preview.height(),
-            marker_font_size,
-            TextStyle::Bold,
-            colors.tentative_text,
-        )?;
-        let marker_gap = 6.0 * scale;
-        let marker_reservation = (marker_width + marker_gap).min(max_width);
-        text_x += marker_reservation;
-        max_width -= marker_reservation;
-    }
+    let max_width = preview.width();
     let line = live_line(state, colors);
-    let line = if state.error.is_some() || state.notice.is_some() {
+    let show_transcript_tail = state.error.is_none()
+        && state.notice.is_none()
+        && (!state.transcript.committed.is_empty() || !state.transcript.tentative.is_empty());
+    let transcript_overflows = show_transcript_tail
+        && (line.grapheme_count() > MAX_PREVIEW_GRAPHEMES
+            || canvas.measure_styled_line(&line, 13.0 * scale)? > max_width);
+    let line = if !show_transcript_tail {
         fit_head(
             canvas,
             &line,
@@ -404,7 +534,7 @@ fn draw_live(
             13.0 * scale,
             MAX_MESSAGE_GRAPHEMES,
         )?
-    } else {
+    } else if transcript_overflows {
         fit_tail(
             canvas,
             &line,
@@ -412,16 +542,16 @@ fn draw_live(
             13.0 * scale,
             MAX_PREVIEW_GRAPHEMES,
         )?
+    } else {
+        line
     };
-    canvas.draw_styled_line(
-        &line,
-        text_x,
-        preview.y0,
-        max_width,
-        preview.height(),
-        13.0 * scale,
-    )?;
-    Ok(())
+    let x = if transcript_overflows {
+        let width = canvas.measure_styled_line(&line, 13.0 * scale)?;
+        (preview.x1 - width).max(preview.x0)
+    } else {
+        preview.x0
+    };
+    canvas.draw_styled_line(&line, x, preview.x1 - x, preview, 13.0 * scale)
 }
 
 fn draw_compact(
@@ -430,76 +560,37 @@ fn draw_compact(
     layout: &DisplayLayout,
     colors: NativeColors,
 ) -> Result<(), RasterError> {
-    let scale = layout.scale;
-    let center_y = layout.recording_mark.center_y();
-    let phase = phase_color(state.phase);
-    canvas.fill_ellipse(
-        layout.recording_mark.x0,
-        layout.recording_mark.y0,
-        layout.recording_mark.width(),
-        layout.recording_mark.height(),
-        phase,
-    )?;
-    let label = if state.phase == OverlayPhase::Listening {
-        "Scribe is recording"
-    } else {
-        state.phase.label()
-    };
-    let status_text = layout
-        .status_text
-        .expect("compact layout includes status text bounds");
-    canvas.draw_text(
-        label,
-        status_text.x0,
-        status_text.y0,
-        status_text.width(),
-        status_text.height(),
-        13.0 * scale,
-        TextStyle::Bold,
-        colors.text,
-    )?;
-
-    let level = normalized_level(state);
-    for index in 0..4 {
-        let threshold = (index + 1) as f32 / 4.0;
-        let active = level >= threshold * 0.78;
-        let normalized_height = if active { threshold } else { 0.22 };
-        let height = (layout.meter.height() * normalized_height).max(4.0 * scale);
-        let x = layout.meter.x0 + index as f32 * 9.0 * scale;
-        canvas.fill_rounded_rect(
-            x,
-            center_y - height / 2.0,
-            7.0 * scale,
-            height,
-            2.0 * scale,
-            if active {
-                colors.meter_active
-            } else {
-                colors.meter_inactive
-            },
-        )?;
-    }
-    if let Some(elapsed) = state.elapsed {
-        canvas.draw_text(
-            &format_elapsed(elapsed),
-            layout.elapsed.x0,
-            layout.elapsed.y0,
-            layout.elapsed.width(),
-            layout.elapsed.height(),
-            12.0 * scale,
-            TextStyle::Monospace,
-            colors.muted_text,
-        )?;
-    }
-    Ok(())
+    draw_live_brand_mark(canvas, layout, colors)?;
+    draw_compact_status(canvas, state, layout, colors)
 }
 
-fn normalized_level(state: &OverlayViewState) -> f32 {
-    state
-        .audio_level
-        .rms
-        .max(state.audio_level.peak * 0.7)
-        .clamp(0.0, 1.0)
+fn draw_compact_status(
+    canvas: &mut Canvas<'_>,
+    state: &OverlayViewState,
+    layout: &DisplayLayout,
+    colors: NativeColors,
+) -> Result<(), RasterError> {
+    let scale = layout.scale;
+    let (label, color) = if state.error.is_some() || state.phase == OverlayPhase::Error {
+        ("Error".to_owned(), colors.error)
+    } else if state.notice.is_some() {
+        ("Notice".to_owned(), colors.warning)
+    } else {
+        (
+            format_elapsed(state.elapsed.unwrap_or_default()),
+            colors.muted_text,
+        )
+    };
+    canvas.draw_text_centered_in_rect(
+        &label,
+        layout.elapsed.x0,
+        layout.elapsed.width(),
+        layout.elapsed,
+        13.0 * scale,
+        TextStyle::Regular,
+        color,
+    )?;
+    Ok(())
 }
 
 fn live_line(state: &OverlayViewState, colors: NativeColors) -> StyledLine {
@@ -523,7 +614,7 @@ fn live_line(state: &OverlayViewState, colors: NativeColors) -> StyledLine {
     if !committed.is_empty() {
         sections.push(StyledSection {
             text: committed.clone(),
-            color: colors.text,
+            color: colors.muted_text,
             style: TextStyle::Regular,
         });
     }
@@ -535,15 +626,15 @@ fn live_line(state: &OverlayViewState, colors: NativeColors) -> StyledLine {
     {
         sections.push(StyledSection {
             text: " ".to_owned(),
-            color: colors.text,
+            color: colors.muted_text,
             style: TextStyle::Regular,
         });
     }
     if !tentative.is_empty() {
         sections.push(StyledSection {
             text: tentative.clone(),
-            color: colors.tentative_text,
-            style: TextStyle::Italic,
+            color: colors.muted_text,
+            style: TextStyle::Regular,
         });
     }
     StyledLine { sections }
@@ -596,7 +687,12 @@ fn binary_search_fit(
     Ok(best)
 }
 
-fn slice_styled_line(line: &StyledLine, start: usize, end: usize, head: bool) -> StyledLine {
+fn slice_styled_line(
+    line: &StyledLine,
+    start: usize,
+    end: usize,
+    ellipsis_at_end: Option<bool>,
+) -> StyledLine {
     let text = line.text();
     let total = text.graphemes(true).count();
     if start == 0 && end >= total {
@@ -620,7 +716,10 @@ fn slice_styled_line(line: &StyledLine, start: usize, end: usize, head: bool) ->
         }
         section_start = section_end;
     }
-    let ellipsis_style = if head {
+    let Some(ellipsis_at_end) = ellipsis_at_end else {
+        return StyledLine { sections };
+    };
+    let ellipsis_style = if ellipsis_at_end {
         sections.last().cloned()
     } else {
         sections.first().cloned()
@@ -635,7 +734,7 @@ fn slice_styled_line(line: &StyledLine, start: usize, end: usize, head: bool) ->
         text: "…".to_owned(),
         ..ellipsis_style
     };
-    if head {
+    if ellipsis_at_end {
         sections.push(ellipsis);
     } else {
         sections.insert(0, ellipsis);
@@ -654,15 +753,6 @@ fn is_left_binding_punctuation(character: char) -> bool {
         character,
         '.' | ',' | '!' | '?' | ':' | ';' | '%' | ')' | ']' | '}' | '…'
     )
-}
-
-fn phase_color(phase: OverlayPhase) -> Argb {
-    match phase {
-        OverlayPhase::Error => Argb::new(255, 239, 108, 104),
-        OverlayPhase::Success => Argb::new(255, 91, 201, 158),
-        OverlayPhase::Hidden => Argb::TRANSPARENT,
-        _ => Argb::new(255, 105, 169, 255),
-    }
 }
 
 pub(super) fn format_elapsed(elapsed: Duration) -> String {
@@ -772,22 +862,6 @@ impl<'a> Canvas<'a> {
         })
     }
 
-    fn fill_ellipse(
-        &mut self,
-        x: f32,
-        y: f32,
-        width: f32,
-        height: f32,
-        color: Argb,
-    ) -> Result<(), RasterError> {
-        with_brush(color, |brush| {
-            status(
-                unsafe { GdipFillEllipse(self.graphics, brush, x, y, width, height) },
-                "fill ellipse",
-            )
-        })
-    }
-
     fn draw_line(
         &mut self,
         x1: f32,
@@ -805,6 +879,33 @@ impl<'a> Canvas<'a> {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn draw_centered_text_in_rect(
+        &mut self,
+        text: &str,
+        center_x: f32,
+        width: f32,
+        rect: super::layout::PhysicalRect,
+        font_size: f32,
+        style: TextStyle,
+        color: Argb,
+    ) -> Result<(), RasterError> {
+        let measured = self.measure_text(text, font_size, style)?;
+        self.draw_text_centered_in_rect(
+            text,
+            center_x - measured.min(width) / 2.0,
+            width,
+            rect,
+            font_size,
+            style,
+            color,
+        )?;
+        Ok(())
+    }
+
+    /// The cancel control has independent hit-target geometry and intentionally
+    /// retains its established glyph placement. Overlay content uses the
+    /// centerline-aware variant above.
     #[allow(clippy::too_many_arguments)]
     fn draw_centered_text(
         &mut self,
@@ -829,6 +930,24 @@ impl<'a> Canvas<'a> {
             color,
         )?;
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_text_centered_in_rect(
+        &mut self,
+        text: &str,
+        x: f32,
+        width: f32,
+        rect: super::layout::PhysicalRect,
+        font_size: f32,
+        style: TextStyle,
+        color: Argb,
+    ) -> Result<f32, RasterError> {
+        // Font/style/scale baseline metrics are bounded and reused by the
+        // rasterizer, avoiding text-dependent allocation or transcript
+        // retention on every meter repaint.
+        let y = rect.center_y() - self.rasterizer.baseline_ink_center_y(font_size, style)?;
+        self.draw_text(text, x, y, width, rect.height(), font_size, style, color)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -895,6 +1014,18 @@ impl<'a> Canvas<'a> {
         font_size: f32,
         style: TextStyle,
     ) -> Result<f32, RasterError> {
+        Ok(self
+            .measure_text_bounds(text, font_size, style)?
+            .Width
+            .max(0.0))
+    }
+
+    fn measure_text_bounds(
+        &mut self,
+        text: &str,
+        font_size: f32,
+        style: TextStyle,
+    ) -> Result<RectF, RasterError> {
         let font = Font::new(self.rasterizer, style, font_size)?;
         let format = StringFormat::new()?;
         let wide: Vec<u16> = text.encode_utf16().collect();
@@ -922,7 +1053,7 @@ impl<'a> Canvas<'a> {
             },
             "measure text",
         )?;
-        Ok(measured.Width.max(0.0))
+        Ok(measured)
     }
 
     fn measure_styled_line(
@@ -940,9 +1071,8 @@ impl<'a> Canvas<'a> {
         &mut self,
         line: &StyledLine,
         x: f32,
-        y: f32,
         width: f32,
-        height: f32,
+        rect: super::layout::PhysicalRect,
         font_size: f32,
     ) -> Result<(), RasterError> {
         let mut cursor = x;
@@ -951,12 +1081,11 @@ impl<'a> Canvas<'a> {
             if cursor >= right {
                 break;
             }
-            let measured = self.draw_text(
+            let measured = self.draw_text_centered_in_rect(
                 &section.text,
                 cursor,
-                y,
                 right - cursor,
-                height,
+                rect,
                 font_size,
                 section.style,
                 section.color,
@@ -1028,14 +1157,11 @@ impl Font {
             return Self::from_borrowed_family(rasterizer.phosphor.family, FontStyleRegular, size);
         }
         let family_name = match style {
-            TextStyle::Monospace => "Consolas",
-            TextStyle::Regular | TextStyle::Bold | TextStyle::Italic => "Segoe UI",
+            TextStyle::Regular => "Segoe UI",
             TextStyle::Phosphor => unreachable!("Phosphor is handled above"),
         };
         let font_style = match style {
-            TextStyle::Bold => FontStyleBold,
-            TextStyle::Italic => FontStyleItalic,
-            TextStyle::Regular | TextStyle::Monospace => FontStyleRegular,
+            TextStyle::Regular => FontStyleRegular,
             TextStyle::Phosphor => unreachable!("Phosphor is handled above"),
         };
         Self::from_named_family(&wide_null(family_name), font_style, size)
@@ -1326,10 +1452,23 @@ pub(super) enum RasterError {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::Cell, sync::Mutex};
+    use std::{cell::Cell, fmt::Write as _, path::Path, sync::Mutex};
 
+    use super::super::layout::PhysicalRect;
     use super::*;
-    use crate::{overlay::controller::OverlayAudioLevel, transcription::SessionId};
+    use crate::{
+        overlay::{
+            controller::OverlayAudioLevel,
+            platform::{OverlayPosition, PhysicalWorkArea, calculate_window_bounds},
+            preview_parity::{
+                HorizontalAnchor, PARITY_GRAPHEMES, PREVIEW_PARITY_CASES, PreviewInput,
+                assert_text_contract, long_message,
+            },
+            view::window_spec,
+        },
+        transcription::SessionId,
+    };
+    use sha2::{Digest, Sha256};
 
     static RASTER_TEST_MUTEX: Mutex<()> = Mutex::new(());
 
@@ -1346,14 +1485,242 @@ mod tests {
             session_id: Some(SessionId(42)),
             mode,
             phase: OverlayPhase::Listening,
+            live_preview_available: mode == OverlayMode::Live,
             audio_level: OverlayAudioLevel::new(0.65, 0.82),
             transcript: super::super::super::controller::OverlayTranscript {
-                committed: "The native overlay keeps the latest committed phrase".to_owned(),
-                tentative: " and this tentative ending".to_owned(),
+                committed: "Alright, What is going on? Why is there a line on".to_owned(),
+                tentative: "That's pretty cool. These newest words stay visible.".to_owned(),
                 revision: 7,
             },
-            elapsed: Some(Duration::from_secs(12)),
+            elapsed: Some(Duration::from_secs(10)),
             ..OverlayViewState::default()
+        }
+    }
+
+    #[test]
+    fn reference_contract_state_matches_the_overlay_comparison_harness() {
+        for mode in [OverlayMode::Live, OverlayMode::Minimal] {
+            let state = state(mode);
+            assert_eq!(state.elapsed, Some(Duration::from_secs(10)));
+            assert_eq!(
+                state.transcript.committed,
+                "Alright, What is going on? Why is there a line on"
+            );
+            assert_eq!(
+                state.transcript.tentative,
+                "That's pretty cool. These newest words stay visible."
+            );
+            assert_eq!(state.live_preview_available, mode == OverlayMode::Live);
+        }
+    }
+
+    fn edge_golden_states() -> Vec<(&'static str, OverlayViewState, i32, i32)> {
+        vec![
+            (
+                "live-empty",
+                OverlayViewState {
+                    session_id: Some(SessionId(43)),
+                    mode: OverlayMode::Live,
+                    phase: OverlayPhase::Listening,
+                    live_preview_available: true,
+                    elapsed: Some(Duration::ZERO),
+                    ..OverlayViewState::default()
+                },
+                600,
+                62,
+            ),
+            (
+                "live-no-preview",
+                OverlayViewState {
+                    session_id: Some(SessionId(46)),
+                    mode: OverlayMode::Live,
+                    phase: OverlayPhase::Listening,
+                    live_preview_available: false,
+                    elapsed: Some(Duration::from_secs(12)),
+                    ..OverlayViewState::default()
+                },
+                600,
+                62,
+            ),
+            (
+                "compact-finalizing",
+                OverlayViewState {
+                    session_id: Some(SessionId(44)),
+                    mode: OverlayMode::Minimal,
+                    phase: OverlayPhase::Finalizing,
+                    ..OverlayViewState::default()
+                },
+                MINIMAL_WIDTH as i32,
+                LIVE_HEIGHT as i32,
+            ),
+            (
+                "live-error",
+                OverlayViewState {
+                    session_id: Some(SessionId(45)),
+                    mode: OverlayMode::Live,
+                    phase: OverlayPhase::Error,
+                    live_preview_available: true,
+                    error: Some(super::super::super::controller::OverlayError {
+                        message: "Microphone unavailable".to_owned(),
+                        recovery: OverlayRecovery::Retry,
+                    }),
+                    ..OverlayViewState::default()
+                },
+                600,
+                62,
+            ),
+        ]
+    }
+
+    fn production_bounds(mode: OverlayMode, dpi: u32) -> OverlayWindowBounds {
+        calculate_window_bounds(
+            PhysicalWorkArea {
+                left: -2_000,
+                top: 100,
+                right: 2_000,
+                bottom: 2_000,
+            },
+            dpi,
+            window_spec(mode),
+            OverlayPosition::BottomCenter,
+        )
+    }
+
+    #[derive(Clone, Copy)]
+    enum IsolatedComponent {
+        BrandMark,
+        Elapsed,
+        Divider,
+        Preview,
+        CompactStatus,
+    }
+
+    /// Paints exactly one content layer on a canvas that is larger than its
+    /// production viewport. This makes edge clipping and neighbor overlap
+    /// observable without relying on the capsule background.
+    fn isolated_component_frame(
+        rasterizer: &NativeRasterizer,
+        state: &OverlayViewState,
+        layout: &DisplayLayout,
+        dark_mode: bool,
+        component: IsolatedComponent,
+    ) -> LayeredFrame {
+        let width = layout.root.width() as i32 + 4;
+        let height = layout.root.height() as i32 + 4;
+        let mut frame = LayeredFrame::transparent(width, height).unwrap();
+        let mut canvas = Canvas::new(rasterizer, &mut frame.pixels, width, height).unwrap();
+        let colors = NativeColors::for_theme(dark_mode);
+        match component {
+            IsolatedComponent::BrandMark => draw_live_brand_mark(&mut canvas, layout, colors),
+            IsolatedComponent::Elapsed => draw_live_elapsed(&mut canvas, state, layout, colors),
+            IsolatedComponent::Divider => draw_live_divider(&mut canvas, layout, colors),
+            IsolatedComponent::Preview => draw_live_preview(&mut canvas, state, layout, colors),
+            IsolatedComponent::CompactStatus => {
+                draw_compact_status(&mut canvas, state, layout, colors)
+            }
+        }
+        .unwrap();
+        drop(canvas);
+        frame
+    }
+
+    fn live_shell_only_frame(
+        rasterizer: &NativeRasterizer,
+        state: &OverlayViewState,
+        layout: &DisplayLayout,
+        dark_mode: bool,
+    ) -> LayeredFrame {
+        let width = layout.root.width() as i32;
+        let height = layout.root.height() as i32;
+        let mut frame = LayeredFrame::transparent(width, height).unwrap();
+        let mut canvas = Canvas::new(rasterizer, &mut frame.pixels, width, height).unwrap();
+        let colors = NativeColors::for_theme(dark_mode);
+        draw_capsule(&mut canvas, OverlayMode::Live, layout.scale, colors).unwrap();
+        draw_live_brand_mark(&mut canvas, layout, colors).unwrap();
+        draw_live_elapsed(&mut canvas, state, layout, colors).unwrap();
+        drop(canvas);
+        frame
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct InkBounds {
+        x0: i32,
+        y0: i32,
+        x1: i32,
+        y1: i32,
+    }
+
+    impl InkBounds {
+        fn center_y(&self) -> f32 {
+            (self.y0 + self.y1 + 1) as f32 / 2.0
+        }
+
+        fn intersects(self, other: Self) -> bool {
+            self.x0 <= other.x1 && other.x0 <= self.x1 && self.y0 <= other.y1 && other.y0 <= self.y1
+        }
+    }
+
+    fn component_ink_bounds(content: &LayeredFrame) -> Option<InkBounds> {
+        let mut result: Option<InkBounds> = None;
+        for y in 0..content.height {
+            for x in 0..content.width {
+                let offset = ((y * content.width + x) * 4) as usize;
+                if content.pixels[offset + 3] > 0 {
+                    let bounds = result.get_or_insert(InkBounds {
+                        x0: x,
+                        y0: y,
+                        x1: x,
+                        y1: y,
+                    });
+                    bounds.x0 = bounds.x0.min(x);
+                    bounds.y0 = bounds.y0.min(y);
+                    bounds.x1 = bounds.x1.max(x);
+                    bounds.y1 = bounds.y1.max(y);
+                }
+            }
+        }
+        result
+    }
+
+    fn assert_component_is_contained_and_centered(
+        component: &str,
+        content: &LayeredFrame,
+        rect: PhysicalRect,
+        center_y: f32,
+        visual_center_tolerance: f32,
+        requires_vertical_edge_margin: bool,
+    ) -> InkBounds {
+        let ink =
+            component_ink_bounds(content).unwrap_or_else(|| panic!("{component} painted no ink"));
+        assert!(
+            (ink.center_y() - center_y).abs() <= visual_center_tolerance,
+            "{component} ink center {} drifted from physical centerline {center_y}: {ink:?}",
+            ink.center_y(),
+        );
+        assert!(
+            ink.x0 as f32 + 0.5 >= rect.x0 - 0.5
+                && ink.y0 as f32 + 0.5 >= rect.y0 - 0.5
+                && ink.x1 as f32 + 0.5 <= rect.x1 + 0.5
+                && ink.y1 as f32 + 0.5 <= rect.y1 + 0.5,
+            "{component} ink escaped its assigned rectangle: {ink:?} vs {rect:?}"
+        );
+        if requires_vertical_edge_margin {
+            assert!(
+                ink.y0 as f32 + 0.5 > rect.y0 && ink.y1 as f32 + 0.5 < rect.y1,
+                "{component} ink touched an assigned vertical edge and may be clipped: {ink:?} vs {rect:?}"
+            );
+        }
+        ink
+    }
+
+    fn assert_no_adjacent_ink_overlap(components: &[(&str, InkBounds)]) {
+        for (index, (name, bounds)) in components.iter().enumerate() {
+            for (other_name, other_bounds) in components.iter().skip(index + 1) {
+                assert!(
+                    !bounds.intersects(*other_bounds),
+                    "{name} ink {bounds:?} overlapped {other_name} ink {other_bounds:?}"
+                );
+            }
         }
     }
 
@@ -1373,12 +1740,374 @@ mod tests {
     fn compact_frame_has_transparent_corners_and_a_painted_capsule() {
         let frame = with_rasterizer(|rasterizer| {
             rasterizer
-                .render_display(&state(OverlayMode::Minimal), true, 320, 52)
+                .render_display(
+                    &state(OverlayMode::Minimal),
+                    true,
+                    MINIMAL_WIDTH as i32,
+                    LIVE_HEIGHT as i32,
+                )
                 .unwrap()
         });
         assert_eq!(frame.alpha_at(0, 0), 0);
-        assert!(frame.alpha_at(160, 26) > 0);
+        assert!(frame.alpha_at(100, 31) > 0);
         assert!(frame.pixels.chunks_exact(4).any(|pixel| pixel[3] > 0));
+    }
+
+    #[test]
+    fn compact_shell_ignores_audio_and_transcript_but_visibly_replaces_timer_on_error() {
+        let normal = state(OverlayMode::Minimal);
+        let mut changed_hidden_state = normal.clone();
+        changed_hidden_state.audio_level = OverlayAudioLevel::new(0.0, 1.0);
+        changed_hidden_state.transcript.committed = "must stay out of compact".to_owned();
+        changed_hidden_state.transcript.tentative = "including estimates".to_owned();
+        let mut failed = normal.clone();
+        failed.phase = OverlayPhase::Error;
+        failed.error = Some(super::super::super::controller::OverlayError {
+            message: "Microphone unavailable".to_owned(),
+            recovery: OverlayRecovery::Retry,
+        });
+
+        with_rasterizer(|rasterizer| {
+            let normal = rasterizer
+                .render_display(&normal, true, MINIMAL_WIDTH as i32, LIVE_HEIGHT as i32)
+                .unwrap();
+            assert_eq!(
+                normal,
+                rasterizer
+                    .render_display(
+                        &changed_hidden_state,
+                        true,
+                        MINIMAL_WIDTH as i32,
+                        LIVE_HEIGHT as i32,
+                    )
+                    .unwrap(),
+                "compact must not paint the old input meter or transcript content"
+            );
+            assert_ne!(
+                normal,
+                rasterizer
+                    .render_display(&failed, true, MINIMAL_WIDTH as i32, LIVE_HEIGHT as i32,)
+                    .unwrap(),
+                "compact failures must visibly replace the timer with an error state"
+            );
+        });
+    }
+
+    #[test]
+    fn cached_font_baselines_are_bounded_reused_and_release_evicted_probe_scopes() {
+        with_rasterizer(|rasterizer| {
+            let live = state(OverlayMode::Live);
+            rasterizer.render_display(&live, true, 600, 62).unwrap();
+            let first = rasterizer.baseline_cache_stats();
+            assert_eq!(first, (2, 2), "one metric per Live font/style pair");
+
+            rasterizer.render_display(&live, false, 600, 62).unwrap();
+            assert_eq!(
+                rasterizer.baseline_cache_stats(),
+                first,
+                "theme changes and repeated live frames must reuse cached baselines"
+            );
+
+            for index in 0..BASELINE_METRIC_CAPACITY + 3 {
+                rasterizer
+                    .baseline_ink_center_y(8.0 + index as f32, TextStyle::Regular)
+                    .unwrap();
+            }
+            let (entries, probes) = rasterizer.baseline_cache_stats();
+            assert_eq!(entries, BASELINE_METRIC_CAPACITY);
+            assert_eq!(
+                probes,
+                first.1 + BASELINE_METRIC_CAPACITY + 2,
+                "only the pre-existing 13 px Regular metric may be reused during eviction"
+            );
+
+            // Each evicted probe owned a bitmap, graphics context, and font
+            // only for its measurement scope. A normal frame must still
+            // render after fixed-capacity churn, exercising their RAII drops.
+            rasterizer.render_display(&live, true, 600, 62).unwrap();
+            assert_eq!(
+                rasterizer.baseline_cache_stats().0,
+                BASELINE_METRIC_CAPACITY
+            );
+        });
+    }
+
+    #[test]
+    fn standalone_preview_separator_renders_without_a_text_ink_probe() {
+        let mut live = state(OverlayMode::Live);
+        live.transcript.committed = "Hello".to_owned();
+        live.transcript.tentative = "world".to_owned();
+        let line = live_line(&live, NativeColors::for_theme(true));
+        assert!(line.sections.iter().any(|section| section.text == " "));
+        with_rasterizer(|rasterizer| {
+            let mut pixels = vec![0; 128 * 64 * 4];
+            let mut canvas = Canvas::new(rasterizer, &mut pixels, 128, 64).unwrap();
+            assert!(
+                canvas.measure_text(" ", 13.0, TextStyle::Regular).unwrap() > 0.0,
+                "the standalone separator must retain a measurable advance"
+            );
+            drop(canvas);
+            let frame = rasterizer.render_display(&live, true, 600, 62).unwrap();
+            assert!(frame.pixels.chunks_exact(4).any(|pixel| pixel[3] > 0));
+            assert_eq!(
+                rasterizer.baseline_cache_stats().0,
+                2,
+                "the separator must reuse the Regular baseline instead of probing its zero-ink glyph"
+            );
+        });
+    }
+
+    #[test]
+    fn every_rastered_content_element_uses_the_production_centerline_at_supported_dpi() {
+        with_rasterizer(|rasterizer| {
+            for mode in [OverlayMode::Live, OverlayMode::Minimal] {
+                for dpi in [96, 120, 144, 192] {
+                    let bounds = production_bounds(mode, dpi);
+                    let layout = DisplayLayout::from_bounds(mode, bounds).unwrap();
+                    for dark_mode in [false, true] {
+                        let state = state(mode);
+                        match mode {
+                            OverlayMode::Live => {
+                                let waveform_frame = isolated_component_frame(
+                                    rasterizer,
+                                    &state,
+                                    &layout,
+                                    dark_mode,
+                                    IsolatedComponent::BrandMark,
+                                );
+                                let waveform = assert_component_is_contained_and_centered(
+                                    "Scribe brand mark",
+                                    &waveform_frame,
+                                    layout.recording_mark,
+                                    layout.content_center_y,
+                                    0.5,
+                                    false,
+                                );
+                                let elapsed_frame = isolated_component_frame(
+                                    rasterizer,
+                                    &state,
+                                    &layout,
+                                    dark_mode,
+                                    IsolatedComponent::Elapsed,
+                                );
+                                let elapsed = assert_component_is_contained_and_centered(
+                                    "elapsed time",
+                                    &elapsed_frame,
+                                    layout.elapsed,
+                                    layout.content_center_y,
+                                    2.5,
+                                    true,
+                                );
+                                let divider_frame = isolated_component_frame(
+                                    rasterizer,
+                                    &state,
+                                    &layout,
+                                    dark_mode,
+                                    IsolatedComponent::Divider,
+                                );
+                                let divider = assert_component_is_contained_and_centered(
+                                    "divider",
+                                    &divider_frame,
+                                    layout.divider.unwrap(),
+                                    layout.content_center_y,
+                                    0.5,
+                                    true,
+                                );
+                                let preview_frame = isolated_component_frame(
+                                    rasterizer,
+                                    &state,
+                                    &layout,
+                                    dark_mode,
+                                    IsolatedComponent::Preview,
+                                );
+                                let preview = assert_component_is_contained_and_centered(
+                                    "preview",
+                                    &preview_frame,
+                                    layout.preview.unwrap(),
+                                    layout.content_center_y,
+                                    2.5,
+                                    true,
+                                );
+                                assert_no_adjacent_ink_overlap(&[
+                                    ("Scribe brand mark", waveform),
+                                    ("elapsed time", elapsed),
+                                    ("divider", divider),
+                                    ("preview", preview),
+                                ]);
+                            }
+                            OverlayMode::Minimal | OverlayMode::Off => {
+                                let brand_frame = isolated_component_frame(
+                                    rasterizer,
+                                    &state,
+                                    &layout,
+                                    dark_mode,
+                                    IsolatedComponent::BrandMark,
+                                );
+                                let brand = assert_component_is_contained_and_centered(
+                                    "compact Scribe brand mark",
+                                    &brand_frame,
+                                    layout.recording_mark,
+                                    layout.content_center_y,
+                                    0.5,
+                                    false,
+                                );
+                                let status_frame = isolated_component_frame(
+                                    rasterizer,
+                                    &state,
+                                    &layout,
+                                    dark_mode,
+                                    IsolatedComponent::CompactStatus,
+                                );
+                                let status = assert_component_is_contained_and_centered(
+                                    "compact elapsed time",
+                                    &status_frame,
+                                    layout.elapsed,
+                                    layout.content_center_y,
+                                    2.5,
+                                    true,
+                                );
+                                assert_no_adjacent_ink_overlap(&[
+                                    ("compact Scribe brand mark", brand),
+                                    ("compact elapsed time", status),
+                                ]);
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn live_mode_without_a_started_preview_paints_only_the_reference_logo_and_timer_shell() {
+        with_rasterizer(|rasterizer| {
+            for dpi in [96, 120, 144, 192] {
+                let bounds = production_bounds(OverlayMode::Live, dpi);
+                let layout = DisplayLayout::from_bounds(OverlayMode::Live, bounds).unwrap();
+                for dark_mode in [false, true] {
+                    let mut unavailable = state(OverlayMode::Live);
+                    unavailable.live_preview_available = false;
+                    unavailable.transcript.committed = "must not leak".to_owned();
+                    unavailable.transcript.tentative = "into the overlay".to_owned();
+                    let rendered = rasterizer
+                        .render_display(&unavailable, dark_mode, bounds.width, bounds.height)
+                        .unwrap();
+                    let shell = live_shell_only_frame(rasterizer, &unavailable, &layout, dark_mode);
+                    assert_eq!(
+                        rendered, shell,
+                        "unavailable live preview painted divider or transcript content at {dpi} DPI"
+                    );
+
+                    let available = rasterizer
+                        .render_display(
+                            &state(OverlayMode::Live),
+                            dark_mode,
+                            bounds.width,
+                            bounds.height,
+                        )
+                        .unwrap();
+                    assert_ne!(
+                        available, shell,
+                        "started preview must add the divider and transcript at {dpi} DPI"
+                    );
+
+                    let mut failed = unavailable.clone();
+                    failed.phase = OverlayPhase::Error;
+                    failed.error = Some(super::super::super::controller::OverlayError {
+                        message: "Microphone unavailable".to_owned(),
+                        recovery: OverlayRecovery::Retry,
+                    });
+                    let rendered_error = rasterizer
+                        .render_display(&failed, dark_mode, bounds.width, bounds.height)
+                        .unwrap();
+                    assert_ne!(
+                        rendered_error, shell,
+                        "capture errors must remain visible when preview never started at {dpi} DPI"
+                    );
+                }
+            }
+        });
+    }
+
+    fn srgb_relative_luminance(red: u8, green: u8, blue: u8) -> f32 {
+        let linearize = |channel: u8| {
+            let value = f32::from(channel) / 255.0;
+            if value <= 0.04045 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * linearize(red) + 0.7152 * linearize(green) + 0.0722 * linearize(blue)
+    }
+
+    fn contrast_ratio(foreground: Argb, background: [u8; 3]) -> f32 {
+        let foreground_luminance = srgb_relative_luminance(
+            ((foreground.0 >> 16) & 0xff) as u8,
+            ((foreground.0 >> 8) & 0xff) as u8,
+            (foreground.0 & 0xff) as u8,
+        );
+        let background_luminance =
+            srgb_relative_luminance(background[0], background[1], background[2]);
+        let lighter = foreground_luminance.max(background_luminance);
+        let darker = foreground_luminance.min(background_luminance);
+        (lighter + 0.05) / (darker + 0.05)
+    }
+
+    fn composite_premultiplied_bgra(pixel: [u8; 4], backdrop: u8) -> [u8; 3] {
+        let remaining_alpha = u16::from(255 - pixel[3]);
+        let composite = |premultiplied: u8| {
+            (u16::from(premultiplied) + u16::from(backdrop) * remaining_alpha / 255).min(255) as u8
+        };
+        [
+            composite(pixel[2]),
+            composite(pixel[1]),
+            composite(pixel[0]),
+        ]
+    }
+
+    #[test]
+    fn native_overlay_text_tokens_meet_contrast_on_actual_translucent_surfaces() {
+        with_rasterizer(|rasterizer| {
+            for dark_mode in [false, true] {
+                let width = LIVE_WIDTH as i32;
+                let height = LIVE_HEIGHT as i32;
+                let mut frame = LayeredFrame::transparent(width, height).unwrap();
+                let colors = NativeColors::for_theme(dark_mode);
+                let mut canvas = Canvas::new(rasterizer, &mut frame.pixels, width, height).unwrap();
+                draw_capsule(&mut canvas, OverlayMode::Live, 1.0, colors).unwrap();
+                drop(canvas);
+
+                let center = ((height / 2 * width + width / 2) * 4) as usize;
+                let pixel: [u8; 4] = frame.pixels[center..center + 4]
+                    .try_into()
+                    .expect("sample one premultiplied BGRA pixel");
+                assert!(pixel[3] > 0, "capsule center must be painted");
+
+                for backdrop in [0, 255] {
+                    let surface = composite_premultiplied_bgra(pixel, backdrop);
+                    for (name, token) in [
+                        ("muted text", colors.muted_text),
+                        ("error", colors.error),
+                        ("warning", colors.warning),
+                    ] {
+                        let ratio = contrast_ratio(token, surface);
+                        assert!(
+                            ratio >= 4.5,
+                            "{name} contrast {ratio:.2}:1 failed on the {} overlay over a {backdrop} backdrop; sampled surface {surface:?}",
+                            if dark_mode { "dark" } else { "light" }
+                        );
+                    }
+
+                    let brand_ratio = contrast_ratio(colors.waveform, surface);
+                    assert!(
+                        brand_ratio >= 3.0,
+                        "brand contrast {brand_ratio:.2}:1 failed on the {} overlay over a {backdrop} backdrop; sampled surface {surface:?}",
+                        if dark_mode { "dark" } else { "light" }
+                    );
+                }
+            }
+        });
     }
 
     #[test]
@@ -1392,6 +2121,182 @@ mod tests {
             .filter(|pixel| pixel[3] > 0)
             .count();
         assert!(painted < 44 * 44 / 3);
+    }
+
+    #[test]
+    fn reference_contract_fixture_checksums_are_valid() {
+        let fixture_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata")
+            .join("overlay-reference");
+        let sums = std::fs::read_to_string(fixture_root.join("SHA256SUMS"))
+            .expect("read reference-contract fixture checksums");
+
+        for (line_number, line) in sums.lines().enumerate() {
+            let (expected, name) = line
+                .split_once("  ")
+                .unwrap_or_else(|| panic!("invalid SHA256SUMS line {}", line_number + 1));
+            let bytes = std::fs::read(fixture_root.join(name))
+                .unwrap_or_else(|error| panic!("read reference-contract fixture {name}: {error}"));
+            assert_eq!(
+                format!("{:x}", Sha256::digest(bytes)),
+                expected,
+                "fixture digest mismatch for {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn reference_contract_native_overlay_raster_golden_frames_are_pixel_identical() {
+        let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata")
+            .join("overlay-reference");
+        let scales = [(1, 1, "96"), (5, 4, "120"), (3, 2, "144"), (2, 1, "192")];
+
+        with_rasterizer(|rasterizer| {
+            for (numerator, denominator, dpi) in scales {
+                for (dark, theme) in [(false, "light"), (true, "dark")] {
+                    for (mode, name, logical_width, logical_height) in [
+                        (OverlayMode::Live, "live", 600, 62),
+                        (
+                            OverlayMode::Minimal,
+                            "compact",
+                            MINIMAL_WIDTH as i32,
+                            LIVE_HEIGHT as i32,
+                        ),
+                    ] {
+                        let frame = rasterizer
+                            .render_display(
+                                &state(mode),
+                                dark,
+                                logical_width * numerator / denominator,
+                                logical_height * numerator / denominator,
+                            )
+                            .expect("render overlay fixture frame");
+                        assert_eq!(
+                            frame.pixels,
+                            std::fs::read(fixture_root.join(format!("{name}-{theme}-{dpi}.bgra")))
+                                .expect("read immutable reference-contract overlay fixture"),
+                            "{name} {theme} at {dpi} DPI diverged from the approved reference contract"
+                        );
+                    }
+
+                    let control = rasterizer
+                        .render_control(
+                            dark,
+                            44 * numerator / denominator,
+                            44 * numerator / denominator,
+                        )
+                        .expect("render cancel-control fixture frame");
+                    assert_eq!(
+                        control.pixels,
+                        std::fs::read(fixture_root.join(format!("cancel-{theme}-{dpi}.bgra")))
+                            .expect("read immutable reference-contract cancel-control fixture"),
+                        "cancel control {theme} at {dpi} DPI diverged from the approved reference contract"
+                    );
+                }
+            }
+
+            for (name, state, width, height) in edge_golden_states() {
+                for (dark, theme) in [(false, "light"), (true, "dark")] {
+                    let frame = rasterizer
+                        .render_display(&state, dark, width, height)
+                        .expect("render edge-state overlay fixture frame");
+                    assert_eq!(
+                        frame.pixels,
+                        std::fs::read(fixture_root.join(format!("{name}-{theme}-96.bgra")))
+                            .expect("read immutable reference-contract edge-state fixture"),
+                        "{name} {theme} at 96 DPI diverged from the approved reference contract"
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    #[ignore = "explicit fixture-maintenance tool; see testdata/overlay-reference/MANIFEST.md"]
+    fn generate_reference_contract_overlay_fixture_candidate() {
+        let requested = std::path::PathBuf::from(
+            std::env::var_os("SCRIBE_OVERLAY_REFERENCE_OUTPUT_DIR")
+                .expect("set SCRIBE_OVERLAY_REFERENCE_OUTPUT_DIR to an external output directory"),
+        );
+        assert!(requested.is_absolute(), "fixture output must be absolute");
+        let parent = requested
+            .parent()
+            .expect("fixture output must have a parent")
+            .canonicalize()
+            .expect("fixture output parent must already exist");
+        let output = parent.join(
+            requested
+                .file_name()
+                .expect("fixture output must name a directory"),
+        );
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .canonicalize()
+            .expect("canonicalize repository root");
+        assert!(
+            !output.starts_with(&repository),
+            "fixture output must be outside the repository"
+        );
+        std::fs::create_dir_all(&output).expect("create external fixture output directory");
+
+        let mut generated = Vec::new();
+        let mut write_frame = |name: String, pixels: Vec<u8>| {
+            std::fs::write(output.join(&name), &pixels)
+                .unwrap_or_else(|error| panic!("write generated fixture {name}: {error}"));
+            generated.push((name, format!("{:x}", Sha256::digest(pixels))));
+        };
+
+        with_rasterizer(|rasterizer| {
+            for (numerator, denominator, dpi) in
+                [(1, 1, "96"), (5, 4, "120"), (3, 2, "144"), (2, 1, "192")]
+            {
+                for (dark, theme) in [(false, "light"), (true, "dark")] {
+                    for (mode, name, logical_width, logical_height) in [
+                        (OverlayMode::Live, "live", 600, 62),
+                        (
+                            OverlayMode::Minimal,
+                            "compact",
+                            MINIMAL_WIDTH as i32,
+                            LIVE_HEIGHT as i32,
+                        ),
+                    ] {
+                        let frame = rasterizer
+                            .render_display(
+                                &state(mode),
+                                dark,
+                                logical_width * numerator / denominator,
+                                logical_height * numerator / denominator,
+                            )
+                            .expect("render generated fixture frame");
+                        write_frame(format!("{name}-{theme}-{dpi}.bgra"), frame.pixels);
+                    }
+                    let control = rasterizer
+                        .render_control(
+                            dark,
+                            44 * numerator / denominator,
+                            44 * numerator / denominator,
+                        )
+                        .expect("render generated control fixture");
+                    write_frame(format!("cancel-{theme}-{dpi}.bgra"), control.pixels);
+                }
+            }
+
+            for (name, state, width, height) in edge_golden_states() {
+                for (dark, theme) in [(false, "light"), (true, "dark")] {
+                    let frame = rasterizer
+                        .render_display(&state, dark, width, height)
+                        .expect("render generated edge-state fixture");
+                    write_frame(format!("{name}-{theme}-96.bgra"), frame.pixels);
+                }
+            }
+        });
+
+        generated.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        let mut sums = String::new();
+        for (name, digest) in generated {
+            writeln!(&mut sums, "{digest}  {name}").expect("format fixture checksum");
+        }
+        std::fs::write(output.join("SHA256SUMS"), sums).expect("write generated fixture checksums");
     }
 
     #[test]
@@ -1410,7 +2315,7 @@ mod tests {
     }
 
     #[test]
-    fn transcript_tail_is_grapheme_safe_and_keeps_tentative_style() {
+    fn transcript_head_is_grapheme_safe_and_keeps_the_committed_prefix_visible() {
         let colors = NativeColors::for_theme(true);
         let state = OverlayViewState {
             transcript: super::super::super::controller::OverlayTranscript {
@@ -1422,10 +2327,248 @@ mod tests {
             ..OverlayViewState::default()
         };
         let line = live_line(&state, colors);
-        let tail = line.tail(4);
-        assert!(tail.text().starts_with('…'));
-        assert!(tail.text().ends_with("🧑🏽‍💻"));
-        assert_eq!(tail.sections.last().unwrap().style, TextStyle::Italic);
+        let head = line.head(9);
+        assert!(head.text().starts_with("prefix 👨‍👩‍👧‍👦"));
+        assert!(head.text().ends_with('…'));
+        assert_eq!(head.sections.last().unwrap().style, TextStyle::Regular);
+        assert_eq!(head.sections.last().unwrap().color, colors.muted_text);
+    }
+
+    #[test]
+    fn transcript_tail_is_grapheme_safe_keeps_the_newest_suffix_and_has_no_marker() {
+        let colors = NativeColors::for_theme(true);
+        let state = OverlayViewState {
+            transcript: super::super::super::controller::OverlayTranscript {
+                committed: "prefix \u{1f469}\u{200d}\u{1f4bb} caf\u{e9}".to_owned(),
+                tentative: " ending \u{1f9d1}\u{1f3fd}\u{200d}\u{1f4bb}".to_owned(),
+                ..Default::default()
+            },
+            phase: OverlayPhase::Listening,
+            ..OverlayViewState::default()
+        };
+        let line = live_line(&state, colors);
+        let full = line.text();
+        for keep in 0..=line.grapheme_count() {
+            let tail = line.tail(keep).text();
+            assert!(full.ends_with(&tail));
+            assert!(!tail.contains('\u{2026}'));
+            let start = full.len() - tail.len();
+            assert!(
+                start == 0
+                    || start == full.len()
+                    || full.grapheme_indices(true).any(|(index, _)| index == start),
+                "tail split a grapheme at keep={keep}: {tail:?}"
+            );
+        }
+        with_rasterizer(|rasterizer| {
+            let mut pixels = vec![0; 160 * 64 * 4];
+            let mut canvas = Canvas::new(rasterizer, &mut pixels, 160, 64).unwrap();
+            let fitted = fit_tail(&mut canvas, &line, 80.0, 13.0, MAX_PREVIEW_GRAPHEMES)
+                .expect("fit newest transcript suffix");
+            let fitted_text = fitted.text();
+            assert!(full.ends_with(&fitted_text));
+            assert!(fitted_text.len() < full.len());
+            assert!(!fitted_text.contains('\u{2026}'));
+            assert!(canvas.measure_styled_line(&fitted, 13.0).unwrap() <= 80.0);
+        });
+    }
+
+    #[test]
+    fn transcript_stays_at_the_left_origin_until_overflow_then_follows_the_tail() {
+        with_rasterizer(|rasterizer| {
+            for dpi in [96, 120, 144, 192] {
+                let bounds = production_bounds(OverlayMode::Live, dpi);
+                let layout = DisplayLayout::from_bounds(OverlayMode::Live, bounds).unwrap();
+                let preview = layout.preview.unwrap();
+                let mut pixels = vec![0; bounds.width as usize * bounds.height as usize * 4];
+                let mut canvas =
+                    Canvas::new(rasterizer, &mut pixels, bounds.width, bounds.height).unwrap();
+                let font_size = 13.0 * layout.scale;
+                let prefix = (1..)
+                    .map(|count| "W".repeat(count))
+                    .take_while(|text| {
+                        let line =
+                            StyledLine::plain(text, NativeColors::for_theme(true).muted_text);
+                        canvas.measure_styled_line(&line, font_size).unwrap() <= preview.width()
+                    })
+                    .last()
+                    .expect("at least one glyph fits the preview");
+                let overflow_count = (1..32)
+                    .find(|count| {
+                        let text = format!("{prefix}{}", "i".repeat(*count));
+                        let line =
+                            StyledLine::plain(text, NativeColors::for_theme(true).muted_text);
+                        canvas.measure_styled_line(&line, font_size).unwrap() > preview.width()
+                    })
+                    .expect("narrow glyphs eventually overflow the preview");
+                let exact_text = format!("{prefix}{}", "i".repeat(overflow_count - 1));
+                drop(canvas);
+
+                let preview_ink = |committed: String| {
+                    let mut candidate = state(OverlayMode::Live);
+                    candidate.transcript.committed = committed;
+                    candidate.transcript.tentative.clear();
+                    component_ink_bounds(&isolated_component_frame(
+                        rasterizer,
+                        &candidate,
+                        &layout,
+                        true,
+                        IsolatedComponent::Preview,
+                    ))
+                    .expect("preview ink")
+                };
+                let short_ink = preview_ink("short".to_owned());
+                let exact_ink = preview_ink(exact_text.clone());
+                let first_overflow_ink =
+                    preview_ink(format!("{prefix}{}", "i".repeat(overflow_count)));
+                let later_ink = (overflow_count + 1..=overflow_count + 16)
+                    .map(|count| preview_ink(format!("{prefix}{}", "i".repeat(count))))
+                    .find(|ink| ink.x0 < first_overflow_ink.x0)
+                    .expect("a later append should widen the retained tail");
+
+                let left_tolerance = (3.0 * layout.scale).ceil() as i32;
+                assert!(
+                    (short_ink.x0 - preview.x0.floor() as i32).abs() <= left_tolerance,
+                    "short text must start at preview.x0 at {dpi} DPI: {short_ink:?}"
+                );
+                assert!(
+                    (exact_ink.x0 - preview.x0.floor() as i32).abs() <= left_tolerance,
+                    "last-fitting text must start at preview.x0 at {dpi} DPI: {exact_ink:?}"
+                );
+                let right_tolerance = (8.0 * layout.scale).ceil() as i32;
+                assert!(
+                    first_overflow_ink.x1 >= preview.x1.floor() as i32 - right_tolerance,
+                    "the first overflow must transition to the preview's right edge at {dpi} DPI: {first_overflow_ink:?}"
+                );
+                assert!(
+                    later_ink.x0 < first_overflow_ink.x0,
+                    "retained ink must move left after another append at {dpi} DPI: {first_overflow_ink:?} -> {later_ink:?}"
+                );
+                assert!(
+                    (later_ink.x1 - first_overflow_ink.x1).abs() <= right_tolerance,
+                    "overflowing tails must keep a fixed right edge at {dpi} DPI: {first_overflow_ink:?} -> {later_ink:?}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn native_preview_matches_the_shared_cross_renderer_parity_contract() {
+        with_rasterizer(|rasterizer| {
+            let mut pixels = vec![0; 512 * 64 * 4];
+            let mut canvas = Canvas::new(rasterizer, &mut pixels, 512, 64).unwrap();
+            let colors = NativeColors::for_theme(true);
+            let exact_text = "W".repeat(24);
+            let exact_line = StyledLine::plain(&exact_text, colors.muted_text);
+            let exact_width = canvas.measure_styled_line(&exact_line, 13.0).unwrap();
+
+            for case in PREVIEW_PARITY_CASES {
+                let (original, line, max_width) = match case.input {
+                    PreviewInput::Message => {
+                        let original = long_message(case.input);
+                        let line = StyledLine::plain(&original, colors.muted_text);
+                        (original, line, 96.0)
+                    }
+                    PreviewInput::Error => {
+                        let original = long_message(case.input);
+                        let state = OverlayViewState {
+                            error: Some(super::super::super::controller::OverlayError {
+                                message: original.clone(),
+                                recovery: OverlayRecovery::None,
+                            }),
+                            ..OverlayViewState::default()
+                        };
+                        (original, live_line(&state, colors), 96.0)
+                    }
+                    PreviewInput::Notice => {
+                        let original = long_message(case.input);
+                        let state = OverlayViewState {
+                            notice: Some(original.clone()),
+                            ..OverlayViewState::default()
+                        };
+                        (original, live_line(&state, colors), 96.0)
+                    }
+                    PreviewInput::TranscriptShort => {
+                        let original = PARITY_GRAPHEMES.to_owned();
+                        let state = OverlayViewState {
+                            transcript: super::super::super::controller::OverlayTranscript {
+                                committed: original.clone(),
+                                ..Default::default()
+                            },
+                            ..OverlayViewState::default()
+                        };
+                        (original, live_line(&state, colors), exact_width)
+                    }
+                    PreviewInput::TranscriptExactFit => {
+                        (exact_text.clone(), exact_line.clone(), exact_width)
+                    }
+                    PreviewInput::TranscriptOverflow => {
+                        let original = format!("{exact_text}{PARITY_GRAPHEMES}");
+                        let state = OverlayViewState {
+                            transcript: super::super::super::controller::OverlayTranscript {
+                                committed: original.clone(),
+                                ..Default::default()
+                            },
+                            ..OverlayViewState::default()
+                        };
+                        (original, live_line(&state, colors), exact_width)
+                    }
+                };
+
+                let message_case = matches!(
+                    case.input,
+                    PreviewInput::Message | PreviewInput::Error | PreviewInput::Notice
+                );
+                let actual_anchor = if !message_case
+                    && (line.grapheme_count() > MAX_PREVIEW_GRAPHEMES
+                        || canvas.measure_styled_line(&line, 13.0).unwrap() > max_width)
+                {
+                    HorizontalAnchor::Right
+                } else {
+                    HorizontalAnchor::Left
+                };
+                assert_eq!(actual_anchor, case.anchor, "{} anchor", case.name);
+
+                let rendered = if message_case {
+                    fit_head(&mut canvas, &line, max_width, 13.0, MAX_MESSAGE_GRAPHEMES).unwrap()
+                } else {
+                    match actual_anchor {
+                        HorizontalAnchor::Left => {
+                            assert!(
+                                canvas.measure_styled_line(&line, 13.0).unwrap() <= max_width,
+                                "{} must fit before clipping",
+                                case.name
+                            );
+                            line
+                        }
+                        HorizontalAnchor::Right => {
+                            fit_tail(&mut canvas, &line, max_width, 13.0, MAX_PREVIEW_GRAPHEMES)
+                                .unwrap()
+                        }
+                    }
+                };
+                let rendered_text = rendered.text();
+                assert_text_contract(case, &original, &rendered_text);
+
+                let width = canvas.measure_styled_line(&rendered, 13.0).unwrap();
+                let preview_x0 = 100.0;
+                let preview_x1 = preview_x0 + max_width;
+                let painted_x = match actual_anchor {
+                    HorizontalAnchor::Left => preview_x0,
+                    HorizontalAnchor::Right => preview_x1 - width,
+                };
+                match actual_anchor {
+                    HorizontalAnchor::Left => {
+                        assert_eq!(painted_x, preview_x0, "{} left anchor", case.name)
+                    }
+                    HorizontalAnchor::Right => assert!(
+                        (painted_x + width - preview_x1).abs() <= f32::EPSILON,
+                        "{} right anchor",
+                        case.name
+                    ),
+                }
+            }
+        });
     }
 
     #[test]
@@ -1443,9 +2586,8 @@ mod tests {
     }
 
     #[test]
-    fn reduced_motion_freezes_waveform_level_without_changing_audio_state() {
+    fn live_brand_mark_is_static_across_audio_levels() {
         let mut quiet = state(OverlayMode::Live);
-        quiet.reduced_motion = true;
         quiet.audio_level = OverlayAudioLevel::new(0.0, 0.0);
         let mut loud = quiet.clone();
         loud.audio_level = OverlayAudioLevel::new(1.0, 1.0);
@@ -1499,7 +2641,7 @@ mod tests {
         );
         assert_eq!(
             NativeColors::for_theme(true).waveform,
-            Argb::from_color(ThemePalette::dark().recording_waveform)
+            Argb::new(255, 178, 162, 255)
         );
     }
 }
