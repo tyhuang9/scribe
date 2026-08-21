@@ -10,8 +10,10 @@ use eframe::egui::{
 use super::{
     about_page,
     controls::{
-        ButtonTone, Icon, button, card, focus_tooltip, icon_glyph, keycap, keycap_width,
-        paint_focus_ring,
+        ButtonTone, Icon, button, card, focus_tooltip, icon_glyph, keycap, paint_focus_ring,
+    },
+    model_picker::{
+        ReadyModelPickerAction, close_ready_model_picker_and_restore_focus, show_ready_model_picker,
     },
     state::{
         ComparisonPhase, ComparisonResultPhase, ModelCardKey, ModelComparisonState, ModelDialog,
@@ -27,16 +29,13 @@ use super::{
 const TRANSCRIPT_PANEL_PREFERRED_MIN_HEIGHT: f32 = 565.0;
 const TRANSCRIPT_PANEL_MIN_HEIGHT: f32 = 272.0;
 const MODEL_REQUIRED_CONTENT_HEIGHT: f32 = 176.0;
-const SELECTOR_CARD_VERTICAL_MARGIN: f32 = 0.0;
 const SELECTOR_CONTROL_HEIGHT: f32 = 44.0;
-const SELECTOR_VISUAL_HEIGHT: f32 = 36.0;
-const SELECTOR_ACTION_WIDTH: f32 = 72.0;
-// The selected-model card is deliberately only 36px tall, so a 32px action
-// makes the two surfaces read as one oversized control. Keep the 44px target
-// while reducing this particular button's painted height.
-const SELECTOR_ACTION_VISUAL_HEIGHT: f32 = 28.0;
-const SELECTOR_HOTKEY_ROW_HEIGHT: f32 = 28.0;
-const SELECTOR_HOTKEY_VERTICAL_INSET: f32 = 4.0;
+const SELECTOR_MODEL_MIN_WIDTH: f32 = 224.0;
+const SELECTOR_MODEL_MAX_WIDTH: f32 = 360.0;
+const SELECTOR_HOTKEY_MIN_WIDTH: f32 = 224.0;
+const SELECTOR_HOTKEY_MAX_WIDTH: f32 = 300.0;
+const SELECTOR_CARD_ROUNDING: f32 = 6.0;
+const HOTKEY_CAPTURE_PROMPT: &str = "Press shortcut · Esc cancels";
 const TRANSCRIPT_FOOTER_INSET: f32 = 16.0;
 const TRANSCRIPT_BODY_PADDING: f32 = 26.0;
 const TRANSCRIPT_BODY_VERTICAL_PADDING: f32 = 24.0;
@@ -85,6 +84,7 @@ const STORE_APPLICATION_IDENTITY_DESCRIPTION: &str =
 const ENABLE_MODEL_PLAYGROUND_SWITCH_ID: &str = "enable-model-playground-switch";
 const ENABLE_MODEL_PLAYGROUND_DESCRIPTION: &str = "Enable the local model Playground for installed-model testing. Disabling it closes the Playground.";
 const ROUTE_FOCUSED_CONTROL_SCROLL: &str = "route-focused-control-scroll";
+const MODELS_ROUTE_HEADING_FOCUS_REQUEST: &str = "models-route-heading-focus-request";
 #[cfg(test)]
 const ROUTE_SCROLL_DIAGNOSTICS: &str = "route-scroll-diagnostics";
 const COMPARISON_BODY_FOCUSED_CONTROL_SCROLL: &str = "comparison-body-focused-control-scroll";
@@ -105,6 +105,10 @@ pub(crate) fn scroll_focused_control_into_view(ui: &egui::Ui, response: &egui::R
         });
         response.scroll_to_me(Some(Align::Center));
     }
+}
+
+pub(crate) fn request_models_route_heading_focus(ctx: &egui::Context) {
+    ctx.data_mut(|data| data.insert_temp(egui::Id::new(MODELS_ROUTE_HEADING_FOCUS_REQUEST), true));
 }
 
 fn scroll_focused_comparison_body_control(ui: &egui::Ui, response: &egui::Response) {
@@ -139,148 +143,123 @@ fn selector_text_width(ui: &egui::Ui, text: &str, font: egui::FontId) -> f32 {
         .x
 }
 
-fn hotkey_content_width(ui: &egui::Ui, hotkey: &str) -> f32 {
-    let gap = ui.spacing().item_spacing.x;
-    let mut item_widths = vec![
-        selector_text_width(
-            ui,
-            icon_glyph(Icon::Keyboard),
-            egui::FontId::proportional(18.0),
-        ),
-        selector_text_width(ui, "Hotkey:", egui::TextStyle::Body.resolve(ui.style())),
-    ];
-    let keys = hotkey
-        .split('+')
-        .map(str::trim)
-        .filter(|key| !key.is_empty())
+fn selector_card_width(ui: &egui::Ui, value: &str, min_width: f32, max_width: f32) -> f32 {
+    // Both quick controls are action cards, not expanding form fields. Reserve
+    // enough room for a useful value but cap their footprint on wide screens.
+    (76.0 + selector_text_width(ui, value, egui::FontId::proportional(14.0)))
+        .clamp(min_width, max_width)
+}
+
+fn ellipsized_selector_value(
+    ui: &egui::Ui,
+    text: &str,
+    font: egui::FontId,
+    color: Color32,
+    max_width: f32,
+) -> (String, std::sync::Arc<egui::Galley>) {
+    let max_width = max_width.max(0.0);
+    let layout = |value: &str| {
+        ui.painter()
+            .layout_no_wrap(value.to_owned(), font.clone(), color)
+    };
+    let full = layout(text);
+    if full.size().x <= max_width {
+        return (text.to_owned(), full);
+    }
+
+    const ELLIPSIS: &str = "…";
+    if layout(ELLIPSIS).size().x > max_width {
+        return (String::new(), layout(""));
+    }
+    let boundaries = text
+        .char_indices()
+        .map(|(index, _)| index)
+        .chain(std::iter::once(text.len()))
         .collect::<Vec<_>>();
-    for (index, key) in keys.iter().enumerate() {
-        if index > 0 {
-            item_widths.push(selector_text_width(
-                ui,
-                "+",
-                egui::TextStyle::Body.resolve(ui.style()),
-            ));
-        }
-        item_widths.push(keycap_width(ui, key));
-    }
-    32.0 + item_widths.iter().sum::<f32>() + gap * item_widths.len().saturating_sub(1) as f32
-}
-
-fn selector_hotkey_width(available_width: f32, intrinsic_width: f32) -> f32 {
-    (available_width * 0.28)
-        .clamp(220.0, 280.0)
-        .max(intrinsic_width)
-}
-
-fn selector_inline_width_threshold(ui: &egui::Ui, name: &str, hotkey: &str) -> f32 {
-    let model_width = model_content_width(ui, name);
-    let hotkey_intrinsic_width = hotkey_content_width(ui, hotkey);
-    let gap = ui.spacing().item_spacing.x;
-    let mut lower = 0.0;
-    let mut upper = model_width + hotkey_intrinsic_width.max(280.0) + gap;
-    for _ in 0..24 {
-        let width = (lower + upper) * 0.5;
-        let required = model_width + selector_hotkey_width(width, hotkey_intrinsic_width) + gap;
-        if width < required {
-            lower = width;
+    let mut low = 0;
+    let mut high = boundaries.len();
+    while low + 1 < high {
+        let middle = (low + high) / 2;
+        let candidate = format!("{}{}", &text[..boundaries[middle]], ELLIPSIS);
+        if layout(&candidate).size().x <= max_width {
+            low = middle;
         } else {
-            upper = width;
+            high = middle;
         }
     }
-    upper
+    let displayed = format!("{}{}", &text[..boundaries[low]], ELLIPSIS);
+    let galley = layout(&displayed);
+    (displayed, galley)
 }
 
-fn hotkey_wrapped_row_count(ui: &egui::Ui, hotkey: &str, content_width: f32) -> usize {
-    let mut item_widths = vec![
-        selector_text_width(
-            ui,
-            icon_glyph(Icon::Keyboard),
-            egui::FontId::proportional(18.0),
-        ),
-        selector_text_width(ui, "Hotkey:", egui::TextStyle::Body.resolve(ui.style())),
-    ];
-    let keys = hotkey
-        .split('+')
-        .map(str::trim)
-        .filter(|key| !key.is_empty())
-        .collect::<Vec<_>>();
-    if let Some((first, remaining)) = keys.split_first() {
-        item_widths.push(keycap_width(ui, first));
-        for key in remaining {
-            item_widths.push(
-                selector_text_width(ui, "+", egui::TextStyle::Body.resolve(ui.style()))
-                    + ui.spacing().item_spacing.x
-                    + keycap_width(ui, key),
-            );
-        }
-    }
-
-    let gap = ui.spacing().item_spacing.x;
-    let mut rows = 1;
-    let mut used = 0.0;
-    for item_width in item_widths {
-        let required = if used == 0.0 {
-            item_width
+fn paint_selector_card(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    response: &egui::Response,
+    icon: Icon,
+    heading: &str,
+    value: &str,
+) {
+    let colors = ui_palette(ui);
+    let fill = if !response.enabled() {
+        colors.disabled_bg
+    } else if response.hovered() || response.has_focus() {
+        colors.panel_bg
+    } else {
+        colors.card_bg
+    };
+    let stroke = Stroke::new(
+        1.0,
+        if response.enabled() && (response.hovered() || response.has_focus()) {
+            colors.border_strong
         } else {
-            used + gap + item_width
-        };
-        if used > 0.0 && required > content_width {
-            rows += 1;
-            used = item_width;
-        } else {
-            used = required;
-        }
-    }
-    rows
-}
-
-fn model_name_layout(ui: &egui::Ui, name: &str, width: f32) -> std::sync::Arc<egui::Galley> {
-    ui.painter().layout(
-        name.to_owned(),
-        egui::TextStyle::Body.resolve(ui.style()),
-        ui_palette(ui).text,
-        width.max(1.0),
-    )
-}
-
-fn render_wrapped_hotkey(ui: &mut egui::Ui, hotkey: &str) {
-    ui.label(
-        RichText::new(icon_glyph(Icon::Keyboard))
-            .size(18.0)
-            .color(ui_palette(ui).muted_text),
+            colors.border
+        },
     );
-    ui.label("Hotkey:");
-    let keys = hotkey
-        .split('+')
-        .map(str::trim)
-        .filter(|key| !key.is_empty())
-        .collect::<Vec<_>>();
-    if let Some((first, remaining)) = keys.split_first() {
-        keycap(ui, first);
-        for key in remaining {
-            let pair_width =
-                selector_text_width(ui, "+", egui::TextStyle::Body.resolve(ui.style()))
-                    + ui.spacing().item_spacing.x
-                    + keycap_width(ui, key);
-            ui.allocate_ui_with_layout(
-                Vec2::new(pair_width, SELECTOR_HOTKEY_ROW_HEIGHT),
-                Layout::left_to_right(Align::Center),
-                |ui| {
-                    ui.label(RichText::new("+").color(ui_palette(ui).muted_text));
-                    keycap(ui, key);
-                },
-            );
-        }
-    }
-}
+    ui.painter()
+        .rect(rect, Rounding::same(SELECTOR_CARD_ROUNDING), fill, stroke);
 
-fn model_content_width(ui: &egui::Ui, name: &str) -> f32 {
-    32.0 + selector_text_width(ui, icon_glyph(Icon::Cpu), egui::FontId::proportional(20.0))
-        + ui.spacing().item_spacing.x
-        + selector_text_width(ui, name, egui::TextStyle::Body.resolve(ui.style()))
-        + ui.spacing().item_spacing.x
-        + SELECTOR_ACTION_WIDTH
+    let icon_x = rect.min.x + 18.0;
+    ui.painter().text(
+        egui::pos2(icon_x, rect.center().y),
+        Align2::CENTER_CENTER,
+        icon_glyph(icon),
+        egui::FontId::proportional(19.0),
+        if response.enabled() {
+            colors.muted_text
+        } else {
+            colors.text
+        },
+    );
+    let text_rect = egui::Rect::from_min_max(
+        egui::pos2(rect.min.x + 36.0, rect.min.y + 5.0),
+        egui::pos2(rect.max.x - 10.0, rect.max.y - 4.0),
+    );
+    let painter = ui.painter().with_clip_rect(text_rect);
+    painter.text(
+        egui::pos2(text_rect.min.x, rect.min.y + 12.0),
+        Align2::LEFT_CENTER,
+        heading,
+        egui::FontId::proportional(11.0),
+        colors.muted_text,
+    );
+    let value_color = if response.enabled() {
+        colors.text
+    } else {
+        colors.muted_text
+    };
+    let (_, value_galley) = ellipsized_selector_value(
+        ui,
+        value,
+        egui::FontId::proportional(14.0),
+        value_color,
+        text_rect.width(),
+    );
+    let value_position = egui::pos2(
+        text_rect.min.x,
+        rect.min.y + 28.0 - value_galley.size().y * 0.5,
+    );
+    painter.galley(value_position, value_galley, value_color);
 }
 
 fn transcript_panel_height(ui: &egui::Ui) -> f32 {
@@ -415,6 +394,9 @@ pub(crate) enum ScreenAction {
     None,
     AddModel,
     ChangeModel,
+    SelectQuickModel(String),
+    StartHotkeyCapture,
+    CancelHotkeyCapture,
     StartRecording,
     StopRecording,
     AbandonRecording,
@@ -498,7 +480,7 @@ pub(crate) enum ScreenAction {
 
 pub(crate) fn render_screen(ui: &mut egui::Ui, view: &ScreenView<'_>) -> ScreenAction {
     match view.route {
-        UiRoute::Transcribe => transcribe(ui, view.transcription, view.models),
+        UiRoute::Transcribe => transcribe(ui, view.transcription, view.models, view.model_catalog),
         UiRoute::Models => models(
             ui,
             view.models,
@@ -682,291 +664,217 @@ fn selector_row(
     ui: &mut egui::Ui,
     state: &TranscriptionState,
     models: &[ModelViewModel],
+    quick_models: &[ModelViewModel],
 ) -> ScreenAction {
     let name = selected_model_name(state, models);
     let no_model = state.phase == TranscriptionPhase::NoModel;
-    let disabled_reason = model_selector_disabled_reason(state.phase);
+    let model_disabled_reason = state
+        .model_change_disabled_reason
+        .as_deref()
+        .or_else(|| model_selector_disabled_reason(state.phase));
+    let hotkey_disabled_reason = state.hotkey_change_disabled_reason.as_deref();
     let mut action = ScreenAction::None;
     let available_width = current_content_width(ui);
     let gap = ui.spacing().item_spacing.x;
-    let hotkey_intrinsic_width = hotkey_content_width(ui, &state.hotkey);
-    let hotkey_width = selector_hotkey_width(available_width, hotkey_intrinsic_width);
-    // Keep the established wide layout until the model field would cut into either
-    // its full label or the Change action. At that precise point the hotkey moves
-    // intact to a second row rather than allowing its keycaps to paint outside.
-    let compact = available_width < selector_inline_width_threshold(ui, name, &state.hotkey);
-    let model_width = if compact {
-        available_width
+    let model_width =
+        selector_card_width(ui, name, SELECTOR_MODEL_MIN_WIDTH, SELECTOR_MODEL_MAX_WIDTH);
+    let hotkey_value = if state.hotkey_capture_active {
+        HOTKEY_CAPTURE_PROMPT
     } else {
-        available_width - hotkey_width - gap
+        &state.hotkey
+    };
+    let hotkey_width = selector_card_width(
+        ui,
+        hotkey_value,
+        SELECTOR_HOTKEY_MIN_WIDTH,
+        SELECTOR_HOTKEY_MAX_WIDTH,
+    );
+    let inline = available_width >= model_width + hotkey_width + gap;
+    let model_width = if inline {
+        model_width
+    } else {
+        available_width.min(SELECTOR_MODEL_MAX_WIDTH)
+    };
+    let hotkey_width = if inline {
+        hotkey_width
+    } else {
+        available_width.min(SELECTOR_HOTKEY_MAX_WIDTH)
     };
     ui.allocate_ui_with_layout(
         Vec2::new(available_width, 0.0),
-        if compact {
-            Layout::top_down(Align::LEFT)
-        } else {
+        if inline {
             Layout::left_to_right(Align::TOP)
+        } else {
+            Layout::top_down(Align::LEFT)
         },
         |ui| {
-            let model_card_id = ui.make_persistent_id("selected-model-card");
-            let model_reflows = compact && model_width < model_content_width(ui, name);
-            let model_icon_width =
-                selector_text_width(ui, icon_glyph(Icon::Cpu), egui::FontId::proportional(20.0));
-            let model_name_width = (model_width
-                - 32.0
-                - SELECTOR_ACTION_WIDTH
-                - model_icon_width
-                - ui.spacing().item_spacing.x * 2.0)
-                .max(1.0);
-            let model_name_galley = model_name_layout(ui, name, model_name_width);
-            let model_visual_height = if model_reflows {
-                SELECTOR_VISUAL_HEIGHT
-                    .max(model_name_galley.size().y + SELECTOR_HOTKEY_VERTICAL_INSET * 2.0)
-            } else {
-                SELECTOR_VISUAL_HEIGHT
-            };
-            let model_card_height =
-                model_visual_height + (SELECTOR_CONTROL_HEIGHT - SELECTOR_VISUAL_HEIGHT);
+            let was_enabled = ui.is_enabled();
+            ui.set_enabled(was_enabled && model_disabled_reason.is_none());
             let (model_card_rect, _) = ui.allocate_exact_size(
-                Vec2::new(model_width, model_card_height),
+                Vec2::new(model_width, SELECTOR_CONTROL_HEIGHT),
                 egui::Sense::hover(),
             );
-            let model_card_visual_rect = egui::Rect::from_center_size(
-                model_card_rect.center(),
-                Vec2::new(model_card_rect.width(), model_visual_height),
-            );
-            let model_card_frame = Frame::none()
-                .fill(ui_palette(ui).card_bg)
-                .stroke(Stroke::new(1.0, ui_palette(ui).border))
-                .rounding(Rounding::same(5.0));
-            ui.painter()
-                .add(model_card_frame.paint(model_card_visual_rect));
-            let content_rect = egui::Rect::from_min_max(
-                egui::pos2(
-                    model_card_visual_rect.min.x + 16.0,
-                    model_card_visual_rect.min.y
-                        + if model_reflows {
-                            SELECTOR_HOTKEY_VERTICAL_INSET
-                        } else {
-                            SELECTOR_CARD_VERTICAL_MARGIN
-                        },
-                ),
-                egui::pos2(
-                    model_card_visual_rect.max.x - 16.0,
-                    model_card_visual_rect.max.y
-                        - if model_reflows {
-                            SELECTOR_HOTKEY_VERTICAL_INSET
-                        } else {
-                            SELECTOR_CARD_VERTICAL_MARGIN
-                        },
-                ),
-            );
-            let action_visual_slot = egui::Rect::from_min_max(
-                egui::pos2(
-                    (content_rect.max.x - SELECTOR_ACTION_WIDTH).max(content_rect.min.x),
-                    content_rect.min.y,
-                ),
-                content_rect.max,
-            );
-            let action_rect = egui::Rect::from_center_size(
-                egui::pos2(action_visual_slot.center().x, model_card_rect.center().y),
-                Vec2::new(SELECTOR_ACTION_WIDTH, SELECTOR_CONTROL_HEIGHT),
-            );
-            let label_rect = egui::Rect::from_min_max(
-                content_rect.min,
-                egui::pos2(action_visual_slot.min.x, content_rect.max.y),
-            );
-            let mut label_ui = ui.child_ui(label_rect, Layout::left_to_right(Align::Center));
-            label_ui.label(
-                RichText::new(icon_glyph(Icon::Cpu))
-                    .size(20.0)
-                    .color(ui_palette(&label_ui).muted_text),
-            );
-            if model_reflows {
-                label_ui.add_sized(
-                    Vec2::new(model_name_width, model_name_galley.size().y),
-                    egui::Label::new(RichText::new(name).strong()).wrap(true),
-                );
-            } else {
-                label_ui.label(RichText::new(name).strong());
-            }
-            let action_label = if no_model { "Select" } else { "Change" };
-            let was_enabled = ui.is_enabled();
-            ui.set_enabled(was_enabled && disabled_reason.is_none());
             let response = ui.interact(
-                action_rect,
-                ui.make_persistent_id("selected-model-action"),
+                model_card_rect,
+                egui::Id::new("selected-model-action"),
                 egui::Sense::click(),
             );
             ui.set_enabled(was_enabled);
-            let colors = ui_palette(ui);
-            let hovered = response.enabled() && response.hovered();
-            let action_visual_rect = egui::Rect::from_center_size(
-                action_rect.center(),
-                Vec2::new(SELECTOR_ACTION_WIDTH, SELECTOR_ACTION_VISUAL_HEIGHT),
+            let picker_id = egui::Id::new("quick-model-picker");
+            if !response.enabled() {
+                close_ready_model_picker_and_restore_focus(ui, picker_id, response.id);
+            }
+            paint_selector_card(
+                ui,
+                model_card_rect,
+                &response,
+                Icon::Cpu,
+                "Active model",
+                name,
             );
-            ui.painter().rect(
-                action_visual_rect,
-                Rounding::same(5.0),
-                if hovered {
-                    colors.panel_bg
-                } else {
-                    egui::Color32::TRANSPARENT
-                },
-                if hovered {
-                    Stroke::new(1.0, colors.border)
-                } else {
-                    Stroke::NONE
-                },
-            );
-            ui.painter().text(
-                action_visual_rect.center(),
-                Align2::CENTER_CENTER,
-                action_label,
-                egui::FontId::proportional(13.0),
-                if response.enabled() {
-                    colors.text
-                } else {
-                    colors.muted_text
-                },
-            );
+            let action_name = if no_model {
+                "Add a model".to_owned()
+            } else {
+                format!("Choose active model: {name}")
+            };
             response
-                .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, action_label));
-            ui.ctx().accesskit_node_builder(response.id, |builder| {
-                builder.set_role(egui::accesskit::Role::Button);
-                builder.set_name(action_label);
-                builder.set_bounds(egui::accesskit::Rect {
-                    x0: action_rect.min.x.into(),
-                    y0: action_rect.min.y.into(),
-                    x1: action_rect.max.x.into(),
-                    y1: action_rect.max.y.into(),
-                });
-                if !response.enabled() {
-                    builder.set_disabled();
-                }
-            });
-            paint_focus_ring(ui, &response, Rounding::same(5.0));
-            if let Some(reason) = disabled_reason {
+                .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, &action_name));
+            paint_focus_ring(ui, &response, Rounding::same(SELECTOR_CARD_ROUNDING));
+            if let Some(reason) = model_disabled_reason {
                 ui.ctx().accesskit_node_builder(response.id, |builder| {
                     builder.set_description(reason);
                 });
                 focus_tooltip(ui, &response, reason);
                 response.clone().on_hover_text(reason);
             }
-            if response.clicked() {
+            let model_keyboard_activated = response.has_focus()
+                && ui.input(|input| {
+                    input.key_pressed(egui::Key::Enter) || input.key_pressed(egui::Key::Space)
+                });
+            if response.enabled() && (response.clicked() || model_keyboard_activated) {
                 action = if no_model {
                     ScreenAction::AddModel
                 } else {
-                    ScreenAction::ChangeModel
+                    ScreenAction::None
                 };
+                if !no_model {
+                    ui.memory_mut(|memory| memory.toggle_popup(picker_id));
+                }
             }
-            ui.ctx().accesskit_node_builder(model_card_id, |builder| {
-                builder.set_role(egui::accesskit::Role::Group);
-                builder.set_name("Selected model");
+            let picker_open = ui.memory(|memory| memory.is_popup_open(picker_id));
+            ui.ctx().accesskit_node_builder(response.id, |builder| {
+                builder.set_role(egui::accesskit::Role::Button);
+                builder.set_name(action_name.clone());
+                builder.set_description(
+                    model_disabled_reason.unwrap_or("Opens the installed ready-model picker."),
+                );
+                builder.set_expanded(picker_open);
                 builder.set_bounds(egui::accesskit::Rect {
                     x0: model_card_rect.min.x.into(),
                     y0: model_card_rect.min.y.into(),
                     x1: model_card_rect.max.x.into(),
                     y1: model_card_rect.max.y.into(),
                 });
+                if !response.enabled() {
+                    builder.set_disabled();
+                }
             });
-            if compact {
+            if response.enabled() && response.hovered() {
+                response
+                    .clone()
+                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+            }
+            if response.enabled()
+                && !no_model
+                && let Some(picker_action) = show_ready_model_picker(
+                    ui,
+                    picker_id,
+                    &response,
+                    state.selected_model_id.as_deref(),
+                    quick_models,
+                )
+            {
+                action = match picker_action {
+                    ReadyModelPickerAction::Select(id) => ScreenAction::SelectQuickModel(id),
+                    ReadyModelPickerAction::ManageModels => ScreenAction::OpenModelSettings,
+                };
+            }
+            let picker_open = ui.memory(|memory| memory.is_popup_open(picker_id));
+            ui.ctx()
+                .accesskit_node_builder(response.id, |builder| builder.set_expanded(picker_open));
+            if !inline {
                 ui.add_space(ui.spacing().item_spacing.y);
             }
-            let hotkey_width = if compact {
-                available_width
-            } else {
-                hotkey_width
-            };
-            let wraps_hotkey = compact && hotkey_width < hotkey_intrinsic_width;
-            let hotkey_rows = if wraps_hotkey {
-                hotkey_wrapped_row_count(ui, &state.hotkey, (hotkey_width - 32.0).max(0.0))
-            } else {
-                1
-            };
-            let hotkey_visual_height = if wraps_hotkey {
-                SELECTOR_HOTKEY_VERTICAL_INSET * 2.0
-                    + hotkey_rows as f32
-                        * (SELECTOR_HOTKEY_ROW_HEIGHT + ui.spacing().item_spacing.y)
-            } else {
-                SELECTOR_VISUAL_HEIGHT
-            };
-            let hotkey_card_height =
-                hotkey_visual_height + (SELECTOR_CONTROL_HEIGHT - SELECTOR_VISUAL_HEIGHT);
-            let hotkey_card_id = ui.make_persistent_id("recording-hotkey-card");
+            let was_enabled = ui.is_enabled();
+            ui.set_enabled(was_enabled && hotkey_disabled_reason.is_none());
             let (hotkey_card_rect, _) = ui.allocate_exact_size(
-                Vec2::new(hotkey_width, hotkey_card_height),
+                Vec2::new(hotkey_width, SELECTOR_CONTROL_HEIGHT),
                 egui::Sense::hover(),
             );
-            let hotkey_card_visual_rect = egui::Rect::from_center_size(
-                hotkey_card_rect.center(),
-                Vec2::new(hotkey_card_rect.width(), hotkey_visual_height),
+            let hotkey_response = ui.interact(
+                hotkey_card_rect,
+                egui::Id::new("recording-hotkey-action"),
+                egui::Sense::click(),
             );
-            let hotkey_card_frame = Frame::none()
-                .fill(if no_model {
-                    ui_palette(ui).disabled_bg
-                } else {
-                    ui_palette(ui).card_bg
-                })
-                .stroke(Stroke::new(1.0, ui_palette(ui).border))
-                .rounding(Rounding::same(5.0));
-            ui.painter()
-                .add(hotkey_card_frame.paint(hotkey_card_visual_rect));
-            let hotkey_content_rect = egui::Rect::from_min_max(
-                egui::pos2(
-                    hotkey_card_visual_rect.min.x + 16.0,
-                    hotkey_card_visual_rect.min.y + SELECTOR_HOTKEY_VERTICAL_INSET,
-                ),
-                egui::pos2(
-                    hotkey_card_visual_rect.max.x - 16.0,
-                    hotkey_card_visual_rect.max.y - SELECTOR_HOTKEY_VERTICAL_INSET,
-                ),
+            ui.set_enabled(was_enabled);
+            paint_selector_card(
+                ui,
+                hotkey_card_rect,
+                &hotkey_response,
+                Icon::Keyboard,
+                "Recording shortcut",
+                hotkey_value,
             );
-            let render_hotkey = |ui: &mut egui::Ui| {
-                ui.label(
-                    RichText::new(icon_glyph(Icon::Keyboard))
-                        .size(18.0)
-                        .color(ui_palette(ui).muted_text),
-                );
-                ui.label("Hotkey:");
-                let mut keys = state
-                    .hotkey
-                    .split('+')
-                    .map(str::trim)
-                    .filter(|key| !key.is_empty())
-                    .peekable();
-                while let Some(key) = keys.next() {
-                    keycap(ui, key);
-                    if keys.peek().is_some() {
-                        ui.label(RichText::new("+").color(ui_palette(ui).muted_text));
-                    }
-                }
+            let hotkey_action_name = if state.hotkey_capture_active {
+                "Cancel recording shortcut capture"
+            } else {
+                "Change recording shortcut"
             };
-            let mut hotkey_content_ui = ui.child_ui(
-                hotkey_content_rect,
-                if wraps_hotkey {
-                    Layout::top_down(Align::LEFT)
-                } else {
-                    Layout::left_to_right(Align::Center)
-                },
-            );
-            hotkey_content_ui.add_enabled_ui(!no_model, |ui| {
-                if wraps_hotkey {
-                    ui.horizontal_wrapped(|ui| render_wrapped_hotkey(ui, &state.hotkey));
-                } else {
-                    render_hotkey(ui);
-                }
+            hotkey_response.widget_info(|| {
+                egui::WidgetInfo::labeled(egui::WidgetType::Button, hotkey_action_name)
             });
-            ui.ctx().accesskit_node_builder(hotkey_card_id, |builder| {
-                builder.set_role(egui::accesskit::Role::Group);
-                builder.set_name("Recording hotkey");
-                builder.set_bounds(egui::accesskit::Rect {
-                    x0: hotkey_card_rect.min.x.into(),
-                    y0: hotkey_card_rect.min.y.into(),
-                    x1: hotkey_card_rect.max.x.into(),
-                    y1: hotkey_card_rect.max.y.into(),
+            ui.ctx()
+                .accesskit_node_builder(hotkey_response.id, |builder| {
+                    builder.set_role(egui::accesskit::Role::Button);
+                    builder.set_name(hotkey_action_name);
+                    builder.set_bounds(egui::accesskit::Rect {
+                        x0: hotkey_card_rect.min.x.into(),
+                        y0: hotkey_card_rect.min.y.into(),
+                        x1: hotkey_card_rect.max.x.into(),
+                        y1: hotkey_card_rect.max.y.into(),
+                    });
+                    if !hotkey_response.enabled() {
+                        builder.set_disabled();
+                    }
                 });
-            });
+            paint_focus_ring(ui, &hotkey_response, Rounding::same(SELECTOR_CARD_ROUNDING));
+            if let Some(reason) = hotkey_disabled_reason {
+                ui.ctx()
+                    .accesskit_node_builder(hotkey_response.id, |builder| {
+                        builder.set_description(reason);
+                    });
+                focus_tooltip(ui, &hotkey_response, reason);
+                hotkey_response.clone().on_hover_text(reason);
+            } else {
+                focus_tooltip(ui, &hotkey_response, hotkey_action_name);
+            }
+            if hotkey_response.enabled() && hotkey_response.hovered() {
+                hotkey_response
+                    .clone()
+                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+            }
+            let hotkey_keyboard_activated = hotkey_response.has_focus()
+                && ui.input(|input| {
+                    input.key_pressed(egui::Key::Enter) || input.key_pressed(egui::Key::Space)
+                });
+            if hotkey_response.enabled() && (hotkey_response.clicked() || hotkey_keyboard_activated)
+            {
+                action = if state.hotkey_capture_active {
+                    ScreenAction::CancelHotkeyCapture
+                } else {
+                    ScreenAction::StartHotkeyCapture
+                };
+            }
         },
     );
     action
@@ -1711,9 +1619,19 @@ fn transcribe(
     ui: &mut egui::Ui,
     state: &TranscriptionState,
     models: &[ModelViewModel],
+    quick_models: &[ModelViewModel],
 ) -> ScreenAction {
     header(ui, "Transcribe", "Audio stays on this device.");
-    let action = selector_row(ui, state, models);
+    let action = selector_row(
+        ui,
+        state,
+        models,
+        if quick_models.is_empty() {
+            models
+        } else {
+            quick_models
+        },
+    );
     ui.add_space(12.0);
     let panel_action = transcript_frame(ui, state, transcript_panel_height(ui));
     ui.add_space(14.0);
@@ -4257,11 +4175,24 @@ fn models(
         data.remove::<egui::Rect>(egui::Id::new("models-final-card-rect"));
     });
     ui.add_enabled_ui(!dialog_active, |ui| {
-    let response = ui.label(RichText::new("Models").size(30.0).strong());
+    let response = ui.add(
+        egui::Label::new(RichText::new("Models").size(30.0).strong())
+            .selectable(false)
+            .sense(Sense::focusable_noninteractive()),
+    );
     ui.ctx().accesskit_node_builder(response.id, |builder| {
         builder.set_role(egui::accesskit::Role::Heading);
+        builder.set_name("Models");
         builder.set_bounds(accesskit_rect(response.rect));
     });
+    if ui.data_mut(|data| {
+        let id = egui::Id::new(MODELS_ROUTE_HEADING_FOCUS_REQUEST);
+        let requested = data.get_temp::<bool>(id).unwrap_or(false);
+        data.remove::<bool>(id);
+        requested
+    }) {
+        response.request_focus();
+    }
     ui.label(
         RichText::new("Manage the speech models available on this device.")
             .color(colors.muted_text),
@@ -8582,6 +8513,77 @@ mod tests {
         })
     }
 
+    fn render_selector_with_key(
+        ctx: &egui::Context,
+        state: &TranscriptionState,
+        models: &[ModelViewModel],
+        focus_id: egui::Id,
+        key: egui::Key,
+        picker_open: bool,
+    ) -> (egui::FullOutput, ScreenAction) {
+        let mut action = ScreenAction::None;
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(900.0, 300.0),
+                )),
+                focused: true,
+                events: vec![egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    if picker_open {
+                        ui.memory_mut(|memory| {
+                            memory.open_popup(egui::Id::new("quick-model-picker"));
+                        });
+                    }
+                    ctx.memory_mut(|memory| memory.request_focus(focus_id));
+                    action = selector_row(ui, state, models, models);
+                });
+            },
+        );
+        (output, action)
+    }
+
+    fn render_selector_with_events(
+        ctx: &egui::Context,
+        state: &TranscriptionState,
+        models: &[ModelViewModel],
+        width: f32,
+        events: Vec<egui::Event>,
+    ) -> (egui::FullOutput, ScreenAction) {
+        let mut action = ScreenAction::None;
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(width + 16.0, 320.0),
+                )),
+                focused: true,
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(width, 0.0),
+                        Layout::top_down(Align::LEFT),
+                        |ui| action = selector_row(ui, state, models, models),
+                    );
+                });
+            },
+        );
+        (output, action)
+    }
+
     #[test]
     fn elapsed_display_is_deterministic() {
         assert_eq!(format_elapsed(8_000), "00:08");
@@ -8611,19 +8613,628 @@ mod tests {
         }];
         let output = render_transcribe(&state, &models);
         let nodes = &output.platform_output.accesskit_update.unwrap().nodes;
-        for name in ["+", "2 MINS AGO", "BASE.EN"] {
+        for name in ["2 MINS AGO", "BASE.EN"] {
             assert!(
                 nodes.iter().any(|(_, node)| node.name() == Some(name)),
                 "missing visible Transcribe label {name}"
             );
         }
+        let hotkey = nodes
+            .iter()
+            .find_map(|(_, node)| {
+                (node.role() == egui::accesskit::Role::Button
+                    && node.name() == Some("Change recording shortcut"))
+                .then_some(node)
+            })
+            .expect("recording shortcut button");
+        let bounds = hotkey.bounds().expect("recording shortcut bounds");
+        assert!(bounds.width() >= 44.0 && bounds.height() >= 44.0);
         assert!(nodes.iter().any(|(_, node)| {
-            node.role() == egui::accesskit::Role::Group && node.name() == Some("Recording hotkey")
+            node.role() == egui::accesskit::Role::Button
+                && node.name() == Some("Choose active model: whisper.cpp base.en")
         }));
+        assert!(
+            !nodes.iter().any(|(_, node)| {
+                node.role() == egui::accesskit::Role::Button
+                    && matches!(node.name(), Some("Change") | Some("Select"))
+            }),
+            "the card must be the only model chooser, without a nested Change target"
+        );
     }
 
     #[test]
-    fn selector_switches_layout_at_its_measured_content_threshold() {
+    fn quick_controls_support_enter_space_current_checkmark_and_ready_models_only() {
+        let state = TranscriptionState {
+            phase: TranscriptionPhase::Ready,
+            selected_model_id: Some("base.en".into()),
+            hotkey: "Ctrl+Space".into(),
+            ..Default::default()
+        };
+        let models = vec![
+            ModelViewModel {
+                id: "base.en".into(),
+                display_name: "Whisper Base".into(),
+                installed: true,
+                ready: true,
+                ..Default::default()
+            },
+            ModelViewModel {
+                id: "tiny.en".into(),
+                display_name: "Whisper Tiny".into(),
+                installed: true,
+                ready: true,
+                ..Default::default()
+            },
+            ModelViewModel {
+                id: "broken.en".into(),
+                display_name: "Broken model".into(),
+                installed: true,
+                ready: false,
+                ..Default::default()
+            },
+        ];
+
+        for key in [egui::Key::Enter, egui::Key::Space] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            crate::ui::controls::configure_accessible_style(&ctx);
+            let _ = render_selector_with_key(
+                &ctx,
+                &state,
+                &models,
+                egui::Id::new("recording-hotkey-action"),
+                egui::Key::Escape,
+                false,
+            );
+            let (_, action) = render_selector_with_key(
+                &ctx,
+                &state,
+                &models,
+                egui::Id::new("recording-hotkey-action"),
+                key,
+                false,
+            );
+            assert_eq!(action, ScreenAction::StartHotkeyCapture);
+
+            let capturing = TranscriptionState {
+                hotkey_capture_active: true,
+                ..state.clone()
+            };
+            let _ = render_selector_with_key(
+                &ctx,
+                &capturing,
+                &models,
+                egui::Id::new("recording-hotkey-action"),
+                egui::Key::Escape,
+                false,
+            );
+            let (_, action) = render_selector_with_key(
+                &ctx,
+                &capturing,
+                &models,
+                egui::Id::new("recording-hotkey-action"),
+                key,
+                false,
+            );
+            assert_eq!(action, ScreenAction::CancelHotkeyCapture);
+
+            let _ = render_selector_with_key(
+                &ctx,
+                &state,
+                &models,
+                egui::Id::new("selected-model-action"),
+                egui::Key::Escape,
+                false,
+            );
+            let (picker, action) = render_selector_with_key(
+                &ctx,
+                &state,
+                &models,
+                egui::Id::new("selected-model-action"),
+                key,
+                false,
+            );
+            assert_eq!(action, ScreenAction::None);
+            let nodes = picker.platform_output.accesskit_update.unwrap().nodes;
+            let change = nodes
+                .iter()
+                .find_map(|(_, node)| {
+                    (node.name() == Some("Choose active model: Whisper Base")).then_some(node)
+                })
+                .expect("model card action");
+            let bounds = change.bounds().expect("Change bounds");
+            assert!(bounds.width() >= 44.0 && bounds.height() >= 44.0);
+            assert_eq!(change.is_expanded(), Some(true));
+
+            let (closed, action) = render_selector_with_key(
+                &ctx,
+                &state,
+                &models,
+                egui::Id::new("selected-model-action"),
+                egui::Key::Escape,
+                false,
+            );
+            assert_eq!(action, ScreenAction::None);
+            let closed_change = closed
+                .platform_output
+                .accesskit_update
+                .unwrap()
+                .nodes
+                .into_iter()
+                .find_map(|(_, node)| {
+                    (node.name() == Some("Choose active model: Whisper Base")).then_some(node)
+                })
+                .expect("closed model card action");
+            assert_eq!(closed_change.is_expanded(), Some(false));
+            assert_eq!(
+                ctx.memory(|memory| memory.focused()),
+                Some(egui::Id::new("selected-model-action"))
+            );
+
+            let _ = render_selector_with_key(
+                &ctx,
+                &state,
+                &models,
+                egui::Id::new("quick-model-picker").with(("option", "tiny.en")),
+                egui::Key::Escape,
+                true,
+            );
+            let (picker, action) = render_selector_with_key(
+                &ctx,
+                &state,
+                &models,
+                egui::Id::new("quick-model-picker").with(("option", "tiny.en")),
+                key,
+                true,
+            );
+            assert_eq!(action, ScreenAction::SelectQuickModel("tiny.en".into()));
+            let nodes = picker.platform_output.accesskit_update.unwrap().nodes;
+            assert!(nodes.iter().any(|(_, node)| {
+                node.name() == Some("Whisper Base, current model")
+                    && node.is_selected() == Some(true)
+            }));
+            assert!(nodes.iter().any(|(_, node)| {
+                node.name() == Some("Select Whisper Tiny") && node.is_selected() == Some(false)
+            }));
+            assert!(
+                !nodes
+                    .iter()
+                    .any(|(_, node)| node.name() == Some("Broken model"))
+            );
+        }
+    }
+
+    #[test]
+    fn disabled_transcribe_model_card_closes_an_open_picker_and_ignores_keyboard_activation() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        crate::ui::controls::configure_accessible_style(&ctx);
+        let reason = "Wait for the current operation before changing models.";
+        let state = TranscriptionState {
+            phase: TranscriptionPhase::Ready,
+            selected_model_id: Some("base.en".into()),
+            hotkey: "Ctrl+Space".into(),
+            model_change_disabled_reason: Some(reason.into()),
+            ..Default::default()
+        };
+        let models = vec![
+            ModelViewModel {
+                id: "base.en".into(),
+                display_name: "Whisper Base".into(),
+                installed: true,
+                ready: true,
+                ..Default::default()
+            },
+            ModelViewModel {
+                id: "tiny.en".into(),
+                display_name: "Whisper Tiny".into(),
+                installed: true,
+                ready: true,
+                ..Default::default()
+            },
+        ];
+        let popup_id = egui::Id::new("quick-model-picker");
+        let (output, action) = render_selector_with_key(
+            &ctx,
+            &state,
+            &models,
+            popup_id.with(("option", "tiny.en")),
+            egui::Key::Enter,
+            true,
+        );
+        assert_eq!(action, ScreenAction::None);
+        assert!(!ctx.memory(|memory| memory.is_popup_open(popup_id)));
+        assert_eq!(
+            ctx.memory(|memory| memory.focused()),
+            Some(egui::Id::new("selected-model-action"))
+        );
+        let update = output.platform_output.accesskit_update.unwrap();
+        let change = update
+            .nodes
+            .iter()
+            .find_map(|(_, node)| {
+                (node.role() == egui::accesskit::Role::Button
+                    && node.name() == Some("Choose active model: Whisper Base"))
+                .then_some(node)
+            })
+            .expect("disabled model card action");
+        assert!(change.is_disabled());
+        assert_eq!(change.description(), Some(reason));
+        assert_eq!(change.is_expanded(), Some(false));
+        assert!(
+            !update
+                .nodes
+                .iter()
+                .any(|(_, node)| node.name() == Some("Select Whisper Tiny"))
+        );
+    }
+
+    #[test]
+    fn quick_model_picker_manage_models_surrenders_card_focus() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        crate::ui::controls::configure_accessible_style(&ctx);
+        let state = TranscriptionState {
+            phase: TranscriptionPhase::Ready,
+            selected_model_id: Some("base.en".into()),
+            hotkey: "Ctrl+Space".into(),
+            ..Default::default()
+        };
+        let models = vec![ModelViewModel {
+            id: "base.en".into(),
+            display_name: "Whisper Base".into(),
+            installed: true,
+            ready: true,
+            ..Default::default()
+        }];
+        let picker_id = egui::Id::new("quick-model-picker");
+        let card_id = egui::Id::new("selected-model-action");
+        ctx.memory_mut(|memory| {
+            memory.open_popup(picker_id);
+            memory.request_focus(card_id);
+        });
+        let (opened, _) = render_selector_with_events(&ctx, &state, &models, 900.0, Vec::new());
+        let manage_id = opened
+            .platform_output
+            .accesskit_update
+            .unwrap()
+            .nodes
+            .into_iter()
+            .find_map(|(id, node)| {
+                node.name()
+                    .is_some_and(|name| name.starts_with("Manage models"))
+                    .then_some(id)
+            })
+            .expect("Manage models action");
+        let (_, action) = render_selector_with_events(
+            &ctx,
+            &state,
+            &models,
+            900.0,
+            vec![egui::Event::AccessKitActionRequest(
+                egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Default,
+                    target: manage_id,
+                    data: None,
+                },
+            )],
+        );
+        assert_eq!(action, ScreenAction::OpenModelSettings);
+        assert!(!ctx.memory(|memory| memory.is_popup_open(picker_id)));
+        assert_ne!(ctx.memory(|memory| memory.focused()), Some(card_id));
+    }
+
+    #[test]
+    fn disabled_focused_hotkey_ignores_enter_and_space_for_start_and_cancel() {
+        let models = vec![ModelViewModel {
+            id: "base.en".into(),
+            display_name: "Whisper Base".into(),
+            installed: true,
+            ready: true,
+            ..Default::default()
+        }];
+        for capture_active in [false, true] {
+            for key in [egui::Key::Enter, egui::Key::Space] {
+                let ctx = egui::Context::default();
+                ctx.enable_accesskit();
+                crate::ui::controls::configure_accessible_style(&ctx);
+                let state = TranscriptionState {
+                    phase: TranscriptionPhase::Ready,
+                    selected_model_id: Some("base.en".into()),
+                    hotkey: "Ctrl+Space".into(),
+                    hotkey_capture_active: capture_active,
+                    hotkey_change_disabled_reason: Some("Hotkey change unavailable.".into()),
+                    ..Default::default()
+                };
+                let (output, action) = render_selector_with_key(
+                    &ctx,
+                    &state,
+                    &models,
+                    egui::Id::new("recording-hotkey-action"),
+                    key,
+                    false,
+                );
+                assert_eq!(action, ScreenAction::None);
+                let expected_name = if capture_active {
+                    "Cancel recording shortcut capture"
+                } else {
+                    "Change recording shortcut"
+                };
+                let hotkey = output
+                    .platform_output
+                    .accesskit_update
+                    .unwrap()
+                    .nodes
+                    .into_iter()
+                    .find_map(|(_, node)| {
+                        (node.role() == egui::accesskit::Role::Button
+                            && node.name() == Some(expected_name))
+                        .then_some(node)
+                    })
+                    .expect("disabled hotkey action");
+                assert!(hotkey.is_disabled());
+            }
+        }
+    }
+
+    #[test]
+    fn hotkey_capture_keeps_the_quick_control_height_stable() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        crate::ui::controls::configure_accessible_style(&ctx);
+        let state = TranscriptionState {
+            phase: TranscriptionPhase::Ready,
+            selected_model_id: Some("base.en".into()),
+            hotkey: "Ctrl+Space".into(),
+            hotkey_capture_active: true,
+            ..Default::default()
+        };
+        let models = vec![ModelViewModel {
+            id: "base.en".into(),
+            display_name: "Whisper Base".into(),
+            installed: true,
+            ready: true,
+            ..Default::default()
+        }];
+        let (output, action) =
+            render_selector_with_events(&ctx, &state, &models, 363.0, Vec::new());
+        assert_eq!(action, ScreenAction::None);
+        let update = output.platform_output.accesskit_update.unwrap();
+        let bounds = |name: &str| {
+            update
+                .nodes
+                .iter()
+                .find_map(|(_, node)| (node.name() == Some(name)).then(|| node.bounds()))
+                .flatten()
+                .unwrap_or_else(|| panic!("missing {name}"))
+        };
+        let capture = bounds("Cancel recording shortcut capture");
+        assert!(capture.width() <= SELECTOR_HOTKEY_MAX_WIDTH as f64);
+        assert_eq!(capture.height(), SELECTOR_CONTROL_HEIGHT as f64);
+
+        let idle_state = TranscriptionState {
+            hotkey_capture_active: false,
+            ..state
+        };
+        let (idle, _) = render_selector_with_events(&ctx, &idle_state, &models, 363.0, Vec::new());
+        let idle_update = idle.platform_output.accesskit_update.unwrap();
+        let idle_card = idle_update
+            .nodes
+            .iter()
+            .find_map(|(_, node)| {
+                (node.name() == Some("Change recording shortcut")).then(|| node.bounds())
+            })
+            .flatten()
+            .expect("idle hotkey card");
+        assert_eq!(capture.height(), idle_card.height());
+    }
+
+    #[test]
+    fn selector_values_fit_the_minimum_card_without_hard_clipping() {
+        let ctx = egui::Context::default();
+        crate::ui::controls::configure_accessible_style(&ctx);
+        let text_width = SELECTOR_MODEL_MIN_WIDTH - 36.0 - 10.0;
+        let long_model =
+            "Whisper Large v3 Turbo English with an intentionally very long descriptive name";
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(500.0, 160.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let color = ui_palette(ui).text;
+                    let font = egui::FontId::proportional(14.0);
+                    let (capture_text, capture_galley) = ellipsized_selector_value(
+                        ui,
+                        HOTKEY_CAPTURE_PROMPT,
+                        font.clone(),
+                        color,
+                        text_width,
+                    );
+                    assert_eq!(capture_text, HOTKEY_CAPTURE_PROMPT);
+                    assert!(capture_galley.size().x <= text_width);
+
+                    let (model_text, model_galley) =
+                        ellipsized_selector_value(ui, long_model, font, color, text_width);
+                    assert!(model_text.ends_with('…'));
+                    assert!(!model_text.contains('�'));
+                    assert!(model_galley.size().x <= text_width);
+                    let paint_origin = egui::pos2(36.0, 28.0 - model_galley.size().y * 0.5);
+                    let paint_bounds = egui::Rect::from_min_size(paint_origin, model_galley.size());
+                    let value_bounds = egui::Rect::from_min_max(
+                        egui::pos2(36.0, 5.0),
+                        egui::pos2(SELECTOR_MODEL_MIN_WIDTH - 10.0, 40.0),
+                    );
+                    assert!(value_bounds.contains_rect(paint_bounds));
+                });
+            },
+        );
+
+        let render_ctx = egui::Context::default();
+        render_ctx.enable_accesskit();
+        crate::ui::controls::configure_accessible_style(&render_ctx);
+        let state = TranscriptionState {
+            phase: TranscriptionPhase::Ready,
+            selected_model_id: Some("long-model".into()),
+            hotkey: "Ctrl+Space".into(),
+            hotkey_capture_active: true,
+            ..Default::default()
+        };
+        let models = vec![ModelViewModel {
+            id: "long-model".into(),
+            display_name: long_model.into(),
+            installed: true,
+            ready: true,
+            ..Default::default()
+        }];
+        let (output, action) =
+            render_selector_with_events(&render_ctx, &state, &models, 900.0, Vec::new());
+        assert_eq!(action, ScreenAction::None);
+        let painted_values = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Text(text) => Some(text.galley.text()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(painted_values.contains(&HOTKEY_CAPTURE_PROMPT));
+        assert!(!painted_values.contains(&long_model));
+        assert!(
+            painted_values
+                .iter()
+                .any(|text| text.starts_with("Whisper Large") && text.ends_with('…'))
+        );
+    }
+
+    #[test]
+    fn enabled_selector_cards_use_pointing_hand_across_the_whole_surface_but_disabled_do_not() {
+        let models = vec![ModelViewModel {
+            id: "base.en".into(),
+            display_name: "Whisper Base".into(),
+            installed: true,
+            ready: true,
+            ..Default::default()
+        }];
+        let state = TranscriptionState {
+            phase: TranscriptionPhase::Ready,
+            selected_model_id: Some("base.en".into()),
+            hotkey: "Ctrl+Space".into(),
+            ..Default::default()
+        };
+        for (name, expected_action) in [
+            ("Choose active model: Whisper Base", ScreenAction::None),
+            (
+                "Change recording shortcut",
+                ScreenAction::StartHotkeyCapture,
+            ),
+        ] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            crate::ui::controls::configure_accessible_style(&ctx);
+            let (initial, _) =
+                render_selector_with_events(&ctx, &state, &models, 900.0, Vec::new());
+            let bounds = initial
+                .platform_output
+                .accesskit_update
+                .unwrap()
+                .nodes
+                .into_iter()
+                .find_map(|(_, node)| (node.name() == Some(name)).then(|| node.bounds()))
+                .flatten()
+                .expect("selector action bounds");
+            let point = egui::pos2(
+                (bounds.x0 + 4.0) as f32,
+                ((bounds.y0 + bounds.y1) / 2.0) as f32,
+            );
+            let (hovered, _) = render_selector_with_events(
+                &ctx,
+                &state,
+                &models,
+                900.0,
+                vec![egui::Event::PointerMoved(point)],
+            );
+            assert_eq!(
+                hovered.platform_output.cursor_icon,
+                egui::CursorIcon::PointingHand
+            );
+            let _ = render_selector_with_events(
+                &ctx,
+                &state,
+                &models,
+                900.0,
+                vec![
+                    egui::Event::PointerMoved(point),
+                    egui::Event::PointerButton {
+                        pos: point,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+            let (_, action) = render_selector_with_events(
+                &ctx,
+                &state,
+                &models,
+                900.0,
+                vec![
+                    egui::Event::PointerMoved(point),
+                    egui::Event::PointerButton {
+                        pos: point,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+            assert_eq!(action, expected_action);
+        }
+
+        let disabled = TranscriptionState {
+            model_change_disabled_reason: Some("Model change unavailable.".into()),
+            hotkey_change_disabled_reason: Some("Hotkey change unavailable.".into()),
+            ..state
+        };
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        crate::ui::controls::configure_accessible_style(&ctx);
+        let (initial, _) = render_selector_with_events(&ctx, &disabled, &models, 900.0, Vec::new());
+        let change = initial
+            .platform_output
+            .accesskit_update
+            .unwrap()
+            .nodes
+            .into_iter()
+            .find_map(|(_, node)| {
+                (node.name() == Some("Choose active model: Whisper Base")).then(|| node.bounds())
+            })
+            .flatten()
+            .expect("disabled model card bounds");
+        let point = egui::pos2(
+            (change.x0 + 4.0) as f32,
+            ((change.y0 + change.y1) / 2.0) as f32,
+        );
+        let (hovered, action) = render_selector_with_events(
+            &ctx,
+            &disabled,
+            &models,
+            900.0,
+            vec![egui::Event::PointerMoved(point)],
+        );
+        assert_ne!(
+            hovered.platform_output.cursor_icon,
+            egui::CursorIcon::PointingHand
+        );
+        assert_eq!(action, ScreenAction::None);
+    }
+
+    #[test]
+    fn selector_cards_are_bounded_and_stack_at_their_compact_threshold() {
         let state = TranscriptionState {
             phase: TranscriptionPhase::Ready,
             selected_model_id: Some("large-v3-turbo.en".into()),
@@ -8650,11 +9261,17 @@ mod tests {
             },
             |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    threshold = selector_inline_width_threshold(
+                    threshold = selector_card_width(
                         ui,
                         selected_model_name(&state, &models),
+                        SELECTOR_MODEL_MIN_WIDTH,
+                        SELECTOR_MODEL_MAX_WIDTH,
+                    ) + selector_card_width(
+                        ui,
                         &state.hotkey,
-                    );
+                        SELECTOR_HOTKEY_MIN_WIDTH,
+                        SELECTOR_HOTKEY_MAX_WIDTH,
+                    ) + ui.spacing().item_spacing.x;
                 });
             },
         );
@@ -8681,7 +9298,7 @@ mod tests {
                             Vec2::new(width, 0.0),
                             Layout::top_down(Align::LEFT),
                             |ui| {
-                                selector_row(ui, &state, &models);
+                                selector_row(ui, &state, &models, &models);
                             },
                         );
                     });
@@ -8692,12 +9309,25 @@ mod tests {
                 update
                     .nodes
                     .iter()
-                    .find_map(|(_, node)| (node.name() == Some(name)).then(|| node.bounds()))
+                    .find_map(|(_, node)| {
+                        (node.name() == Some(name)
+                            || (name.starts_with("Choose active model:")
+                                && node.name().is_some_and(|node_name| {
+                                    node_name.starts_with("Choose active model:")
+                                })))
+                        .then(|| node.bounds())
+                    })
                     .flatten()
                     .unwrap_or_else(|| panic!("missing {name} bounds"))
             };
-            let model = bounds("Selected model");
-            let hotkey = bounds("Recording hotkey");
+            let model = bounds(
+                "Choose active model: Whisper Large v3 Turbo English â€” high accuracy dictation",
+            );
+            let hotkey = bounds("Change recording shortcut");
+            assert!(model.width() <= SELECTOR_MODEL_MAX_WIDTH as f64);
+            assert!(hotkey.width() <= SELECTOR_HOTKEY_MAX_WIDTH as f64);
+            assert_eq!(model.height(), SELECTOR_CONTROL_HEIGHT as f64);
+            assert_eq!(hotkey.height(), SELECTOR_CONTROL_HEIGHT as f64);
             if should_stack {
                 assert!(model.y1 <= hotkey.y0);
             } else {
@@ -8991,7 +9621,8 @@ mod tests {
             let output = render_transcribe(&state, &models);
             let nodes = &output.platform_output.accesskit_update.unwrap().nodes;
             assert!(nodes.iter().any(|(_, node)| {
-                node.name() == Some("Change") && node.description() == Some(reason)
+                node.name() == Some("Choose active model: whisper.cpp base.en")
+                    && node.description() == Some(reason)
             }));
         }
     }

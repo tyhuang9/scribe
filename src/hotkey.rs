@@ -40,16 +40,38 @@ impl HotkeyService {
     }
 
     pub fn register(&mut self, spec: &str) -> Result<()> {
-        self.hotkey = None;
-        self.manager = None;
         global_hotkey_startup_allowed()?;
+        let replacement = parse_hotkey(spec)?;
+        if self.hotkey == Some(replacement) {
+            self.last_error = None;
+            return Ok(());
+        }
 
-        let manager = GlobalHotKeyManager::new()?;
-        let hotkey = parse_hotkey(spec)?;
-        manager.register(hotkey)?;
+        // Register the replacement through a separate manager before touching
+        // the active binding. This keeps the old shortcut effective when the
+        // OS rejects a conflicting replacement.
+        let replacement_manager = GlobalHotKeyManager::new()?;
+        let previous_manager = self.manager.as_ref();
+        if let Err(error) = replace_hotkey_registration(
+            self.hotkey,
+            replacement,
+            |candidate| replacement_manager.register(candidate).map_err(Into::into),
+            |previous| match previous_manager {
+                Some(manager) => manager.unregister(previous).map_err(Into::into),
+                None => Ok(()),
+            },
+            |candidate| {
+                replacement_manager
+                    .unregister(candidate)
+                    .map_err(Into::into)
+            },
+        ) {
+            self.last_error = Some(error.to_string());
+            return Err(error);
+        }
 
-        self.manager = Some(manager);
-        self.hotkey = Some(hotkey);
+        self.manager = Some(replacement_manager);
+        self.hotkey = Some(replacement);
         self.last_error = None;
         Ok(())
     }
@@ -67,6 +89,29 @@ impl HotkeyService {
         }
         events
     }
+}
+
+fn replace_hotkey_registration(
+    previous: Option<HotKey>,
+    replacement: HotKey,
+    register_replacement: impl FnOnce(HotKey) -> Result<()>,
+    unregister_previous: impl FnOnce(HotKey) -> Result<()>,
+    rollback_replacement: impl FnOnce(HotKey) -> Result<()>,
+) -> Result<()> {
+    register_replacement(replacement)?;
+    if let Some(previous) = previous
+        && let Err(error) = unregister_previous(previous)
+    {
+        return match rollback_replacement(replacement) {
+            Ok(()) => Err(anyhow!(
+                "could not retire the previous hotkey: {error}; the previous shortcut remains active"
+            )),
+            Err(rollback_error) => Err(anyhow!(
+                "could not retire the previous hotkey: {error}; replacement cleanup also failed: {rollback_error}"
+            )),
+        };
+    }
+    Ok(())
 }
 
 fn event_from_global(event: GlobalHotKeyEvent, registered_id: Option<u32>) -> Option<HotkeyEvent> {
@@ -209,6 +254,73 @@ mod tests {
     fn rejects_missing_or_unknown_key() {
         assert!(parse_hotkey("Ctrl+Shift").is_err());
         assert!(parse_hotkey("Ctrl+Mouse1").is_err());
+    }
+
+    #[test]
+    fn failed_replacement_registration_never_retires_the_previous_hotkey() {
+        let previous = parse_hotkey("Ctrl+Shift+Space").unwrap();
+        let replacement = parse_hotkey("Ctrl+Alt+K").unwrap();
+        let calls = std::cell::RefCell::new(Vec::new());
+
+        let error = replace_hotkey_registration(
+            Some(previous),
+            replacement,
+            |_| {
+                calls.borrow_mut().push("register replacement");
+                Err(anyhow!("shortcut is already in use"))
+            },
+            |_| {
+                calls.borrow_mut().push("unregister previous");
+                Ok(())
+            },
+            |_| {
+                calls.borrow_mut().push("rollback replacement");
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("already in use"));
+        assert_eq!(*calls.borrow(), ["register replacement"]);
+    }
+
+    #[test]
+    fn failed_previous_retirement_rolls_back_the_registered_replacement() {
+        let previous = parse_hotkey("Ctrl+Shift+Space").unwrap();
+        let replacement = parse_hotkey("Ctrl+Alt+K").unwrap();
+        let calls = std::cell::RefCell::new(Vec::new());
+
+        let error = replace_hotkey_registration(
+            Some(previous),
+            replacement,
+            |_| {
+                calls.borrow_mut().push("register replacement");
+                Ok(())
+            },
+            |_| {
+                calls.borrow_mut().push("unregister previous");
+                Err(anyhow!("previous manager is unavailable"))
+            },
+            |_| {
+                calls.borrow_mut().push("rollback replacement");
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("previous shortcut remains active")
+        );
+        assert_eq!(
+            *calls.borrow(),
+            [
+                "register replacement",
+                "unregister previous",
+                "rollback replacement"
+            ]
+        );
     }
 
     #[test]
