@@ -115,7 +115,6 @@ pub struct OverlayViewState {
     pub notice: Option<String>,
     pub error: Option<OverlayError>,
     pub elapsed: Option<Duration>,
-    pub reduced_motion: bool,
 }
 
 impl Default for OverlayViewState {
@@ -131,7 +130,6 @@ impl Default for OverlayViewState {
             notice: None,
             error: None,
             elapsed: None,
-            reduced_motion: false,
         }
     }
 }
@@ -152,14 +150,8 @@ pub struct OverlayController {
 }
 
 impl OverlayController {
-    pub fn new(reduced_motion: bool) -> Self {
-        Self {
-            state: OverlayViewState {
-                reduced_motion,
-                ..OverlayViewState::default()
-            },
-            last_transcript_revision: None,
-        }
+    pub fn new() -> Self {
+        Self::default()
     }
 
     pub fn state(&self) -> &OverlayViewState {
@@ -167,12 +159,10 @@ impl OverlayController {
     }
 
     pub fn begin_session(&mut self, session_id: SessionId, mode: OverlayMode) {
-        let reduced_motion = self.state.reduced_motion;
         self.state = OverlayViewState {
             session_id: Some(session_id),
             mode,
             phase: OverlayPhase::Preparing,
-            reduced_motion,
             ..OverlayViewState::default()
         };
         self.last_transcript_revision = None;
@@ -325,10 +315,8 @@ impl OverlayController {
             return false;
         }
         let mode = self.state.mode;
-        let reduced_motion = self.state.reduced_motion;
         self.state = OverlayViewState {
             mode,
-            reduced_motion,
             ..OverlayViewState::default()
         };
         self.last_transcript_revision = None;
@@ -351,7 +339,7 @@ mod tests {
 
     #[test]
     fn begin_session_has_no_fabricated_transcript() {
-        let mut controller = OverlayController::new(false);
+        let mut controller = OverlayController::new();
 
         controller.begin_session(SessionId(7), OverlayMode::Live);
 
@@ -365,7 +353,7 @@ mod tests {
 
     #[test]
     fn failed_preview_keeps_its_notice_but_rejects_late_updates_until_final() {
-        let mut controller = OverlayController::new(false);
+        let mut controller = OverlayController::new();
         controller.begin_session(SessionId(7), OverlayMode::Live);
         assert!(controller.set_live_preview_available(SessionId(7), true));
         assert!(controller.update_transcript(SessionId(7), "stable", " draft", 1));
@@ -389,7 +377,7 @@ mod tests {
 
     #[test]
     fn new_and_hidden_sessions_clear_preview_availability() {
-        let mut controller = OverlayController::new(false);
+        let mut controller = OverlayController::new();
         controller.begin_session(SessionId(7), OverlayMode::Live);
         assert!(controller.set_live_preview_available(SessionId(7), true));
 
@@ -402,7 +390,7 @@ mod tests {
 
     #[test]
     fn stale_session_and_revision_updates_are_ignored() {
-        let mut controller = OverlayController::new(false);
+        let mut controller = OverlayController::new();
         controller.begin_session(SessionId(7), OverlayMode::Live);
         assert!(controller.set_live_preview_available(SessionId(7), true));
 
@@ -414,7 +402,7 @@ mod tests {
 
     #[test]
     fn final_transcript_supersedes_any_preview_revision_and_clears_tentative() {
-        let mut controller = OverlayController::new(false);
+        let mut controller = OverlayController::new();
         controller.begin_session(SessionId(7), OverlayMode::Live);
         assert!(controller.set_live_preview_available(SessionId(7), true));
         assert!(controller.update_transcript(SessionId(7), "hello", " wor", 41));
@@ -432,7 +420,7 @@ mod tests {
 
     #[test]
     fn only_newly_committed_text_is_announced_during_preview() {
-        let mut controller = OverlayController::new(false);
+        let mut controller = OverlayController::new();
         controller.begin_session(SessionId(7), OverlayMode::Live);
         assert!(controller.set_live_preview_available(SessionId(7), true));
 
@@ -452,7 +440,7 @@ mod tests {
 
     #[test]
     fn preview_unavailable_notice_clears_stale_tentative_text() {
-        let mut controller = OverlayController::new(false);
+        let mut controller = OverlayController::new();
         controller.begin_session(SessionId(7), OverlayMode::Live);
         assert!(controller.set_live_preview_available(SessionId(7), true));
         controller.update_transcript(SessionId(7), "stable", " stale", 1);
@@ -474,7 +462,7 @@ mod tests {
 
     #[test]
     fn error_clears_stale_transcript_announcement() {
-        let mut controller = OverlayController::new(false);
+        let mut controller = OverlayController::new();
         controller.begin_session(SessionId(7), OverlayMode::Live);
         assert!(controller.set_live_preview_available(SessionId(7), true));
         controller.update_transcript(SessionId(7), "stable", " draft", 1);
@@ -487,7 +475,7 @@ mod tests {
 
     #[test]
     fn audio_levels_are_finite_and_bounded() {
-        let mut controller = OverlayController::new(false);
+        let mut controller = OverlayController::new();
         controller.begin_session(SessionId(1), OverlayMode::Minimal);
 
         assert!(controller.update_audio_level(SessionId(1), f32::NAN, 4.0));
@@ -498,7 +486,7 @@ mod tests {
 
     #[test]
     fn off_mode_never_becomes_visible() {
-        let mut controller = OverlayController::new(false);
+        let mut controller = OverlayController::new();
         controller.begin_session(SessionId(1), OverlayMode::Off);
 
         assert!(!controller.state().is_visible());

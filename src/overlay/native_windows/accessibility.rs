@@ -170,7 +170,7 @@ fn display_tree(
     }
     let mut classes = NodeClassSet::new();
     let live_mode = state.mode == OverlayMode::Live;
-    let preview_visible = live_mode && state.live_preview_available;
+    let preview_visible = live_mode && (state.live_preview_available || state.error.is_some());
     let elapsed_visible = live_mode || state.elapsed.is_some();
     let mut children = vec![DISPLAY_STATUS_ID];
     if !live_mode {
@@ -457,6 +457,33 @@ mod tests {
         assert!(tree.nodes.iter().all(|(id, node)| {
             *id != DISPLAY_PREVIEW_ID && *id != DISPLAY_ANNOUNCEMENT_ID && node.live().is_none()
         }));
+    }
+
+    #[test]
+    fn live_tree_exposes_capture_errors_when_preview_never_started() {
+        let state = OverlayViewState {
+            mode: OverlayMode::Live,
+            phase: OverlayPhase::Error,
+            live_preview_available: false,
+            elapsed: Some(std::time::Duration::from_secs(12)),
+            error: Some(super::super::super::controller::OverlayError {
+                message: "Microphone unavailable".to_owned(),
+                recovery: super::super::super::controller::OverlayRecovery::Retry,
+            }),
+            ..OverlayViewState::default()
+        };
+        let tree = display_tree(&state, true, Some(display_bounds(OverlayMode::Live)));
+
+        assert!(tree.nodes.iter().any(|(id, node)| {
+            *id == DISPLAY_PREVIEW_ID
+                && node.name() == Some("Microphone unavailable You can retry.")
+                && node.live() == Some(Live::Polite)
+        }));
+        assert!(
+            tree.nodes
+                .iter()
+                .all(|(id, _)| *id != DISPLAY_ANNOUNCEMENT_ID)
+        );
     }
 
     #[test]

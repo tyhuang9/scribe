@@ -3445,7 +3445,7 @@ impl LocalTranscriberApp {
             #[cfg(test)]
             test_gguf_fixture: None,
             captured_targets: HashMap::new(),
-            overlay_controller: OverlayController::new(overlay::reduced_motion_preferred()),
+            overlay_controller: OverlayController::new(),
             overlay_hide_at: None,
             overlay_presented: false,
             overlay_first_presented_at: HashMap::new(),
@@ -19342,7 +19342,7 @@ mod layout_tests {
             diagnostics: DiagnosticsStore::default(),
             test_gguf_fixture: Some(fixture),
             captured_targets: HashMap::new(),
-            overlay_controller: OverlayController::new(false),
+            overlay_controller: OverlayController::new(),
             overlay_hide_at: None,
             overlay_presented: false,
             overlay_first_presented_at: HashMap::new(),

@@ -8,14 +8,17 @@ same-state design QA.
 
 ## Selected reference
 
-- Source: `C:\Users\huang\.codex\attachments\8c74ab60-cbfb-4a09-8ee4-cade05f597f2\image-1.png`
+- Tracked source: `design-qa-evidence/overlay-native/reference-source.png`
+- Original attachment provenance:
+  `C:\Users\huang\.codex\attachments\8c74ab60-cbfb-4a09-8ee4-cade05f597f2\image-1.png`
 - Dimensions: 1175 x 152 pixels
 - SHA-256: `0ea2c3df19e1f40346fda7e5499b5815a6c8b601a6cc9b95e23ccbddffb19bf6`
 - Required Live order: static Scribe brand mark, elapsed time, divider, live
   transcript, and the existing cancel control at the right.
 - When rolling preview did not start, Live retains the same shell with brand,
-  elapsed time, and cancel control; divider and transcript are absent. Minimal
-  mode remains a distinct user-selected presentation.
+  elapsed time, and cancel control; divider and transcript are absent during
+  normal recording phases. A subsequent general capture error remains visible
+  and announced. Minimal mode remains a distinct user-selected presentation.
 
 The implementation uses the bundled Phosphor `WAVEFORM` glyph as the static
 Scribe brand mark. It does not fabricate a logo or animate the mark from audio
@@ -80,3 +83,20 @@ review history live in `design-qa-evidence/overlay-native/` and
 be pixel-identical across arbitrary desktop backgrounds; they lock the
 approved renderer that satisfies the reference composition and measured
 contract.
+
+The tracked approval artifacts make the review reproducible without the
+temporary attachment path:
+
+- `reference-source.png` SHA-256:
+  `0ea2c3df19e1f40346fda7e5499b5815a6c8b601a6cc9b95e23ccbddffb19bf6`
+- `reference-contract-live-dark.png` SHA-256:
+  `913cb4d8b587295eeea2bc679d9bf19a0686abb7ac783bd29141c885b2a60b79`
+- `reference-contract-comparison.png` SHA-256:
+  `f428ec83234fffad9e7b084c6164959af942e8c21d91ed53ceaa5c13109cc223`
+- `reference-contract-wgc-live-dark-96.png` SHA-256:
+  `3878d61ba5e2b50e3869ab713d0433d8ab8213f8fabcf45ee2fe76043f51ed0d`
+- `reference-contract-wgc-live-dark-96.json` SHA-256:
+  `a637e23137a6fd8bcfa8ff29b5f90f964731b674f613070953a956f45de280e0`
+
+The final Product Design and specialist UI/UX acceptance record is the latest
+"Native Live overlay reference restoration" section of `design-qa.md`.

@@ -455,7 +455,7 @@ fn draw_live(
 ) -> Result<(), RasterError> {
     draw_live_brand_mark(canvas, layout, colors)?;
     draw_live_elapsed(canvas, state, layout, colors)?;
-    if !state.live_preview_available {
+    if !state.live_preview_available && state.error.is_none() {
         return Ok(());
     }
     draw_live_divider(canvas, layout, colors)?;
@@ -2068,6 +2068,20 @@ mod tests {
                     assert_ne!(
                         available, shell,
                         "started preview must add the divider and transcript at {dpi} DPI"
+                    );
+
+                    let mut failed = unavailable.clone();
+                    failed.phase = OverlayPhase::Error;
+                    failed.error = Some(super::super::super::controller::OverlayError {
+                        message: "Microphone unavailable".to_owned(),
+                        recovery: OverlayRecovery::Retry,
+                    });
+                    let rendered_error = rasterizer
+                        .render_display(&failed, dark_mode, bounds.width, bounds.height)
+                        .unwrap();
+                    assert_ne!(
+                        rendered_error, shell,
+                        "capture errors must remain visible when preview never started at {dpi} DPI"
                     );
                 }
             }

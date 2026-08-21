@@ -784,13 +784,20 @@ final result: blocked
 
 ## Source and implementation evidence
 
-- Selected source: `C:\Users\huang\.codex\attachments\8c74ab60-cbfb-4a09-8ee4-cade05f597f2\image-1.png`
-  (1175 x 152 pixels; SHA-256
+- Selected tracked source:
+  `design-qa-evidence/overlay-native/reference-source.png` (1175 x 152 pixels;
+  byte-identical to the original supplied attachment; SHA-256
   `0ea2c3df19e1f40346fda7e5499b5815a6c8b601a6cc9b95e23ccbddffb19bf6`).
 - Deterministic native 192-DPI composite:
   `design-qa-evidence/overlay-native/reference-contract-live-dark.png`.
 - Same-state comparison:
-  `design-qa-evidence/overlay-native/reference-contract-comparison.png`.
+  `design-qa-evidence/overlay-native/reference-contract-comparison.png`
+  (SHA-256
+  `f428ec83234fffad9e7b084c6164959af942e8c21d91ed53ceaa5c13109cc223`).
+- Hardware `Windows.Graphics.Capture` evidence at 96 DPI on the left secondary
+  monitor: `design-qa-evidence/overlay-native/reference-contract-wgc-live-dark-96.png`
+  and its exact HWND/monitor manifest
+  `design-qa-evidence/overlay-native/reference-contract-wgc-live-dark-96.json`.
 - The comparison maps the implementation capsule's measured physical bounds
   onto the source capsule bounds. It does not stretch to the arbitrary image
   crop. Both rows use `00:12` and `Clicking the settings icon in the top
@@ -818,9 +825,11 @@ final result: blocked
   a 16-point right inset. Its physical center and raster/UI Automation bounds
   remain derived from shared geometry at 96, 120, 144, and 192 DPI.
 - When rolling preview never starts, the Live shell intentionally retains only
-  logo, elapsed time, and cancel. Divider, preview pixels, preview node, and
-  live-region announcement are absent. A preview that starts and later fails
-  keeps its error notice. User-selected Minimal mode is unchanged.
+  logo, elapsed time, and cancel during normal recording phases. Divider,
+  preview pixels, preview node, and live-region announcement are absent. A
+  later general capture error is still visible and politely announced; a
+  preview that starts and later fails keeps its error notice. User-selected
+  Minimal mode is unchanged.
 - Committed and tentative transcript regions remain separate in controller
   state and accessibility wording. The source-selected visual presentation is
   intentionally one continuous regular light-gray line; tentative text is not
@@ -840,8 +849,17 @@ final result: blocked
   a Windows.Graphics.Capture frame. It is valid same-state Product Design
   evidence because the renderer bytes, alpha composition, control placement,
   and reference backdrop are all deterministic.
-- A fresh physical WGC capture of the staged executable remains a manual
-  pre-merge check. No existing Scribe process was terminated or disturbed to
-  obtain this review.
+- The fresh physical WGC capture used the checked-in isolated overlay harness
+  from this head (all features, executable SHA-256
+  `158a2c2f50d930681e55baf046129b9eefb2d7d323d29f81b0621a9fba50c63c`).
+  Its manifest proves hardware D3D capture, an uncloaked 600 x 62 display, a
+  separate 44 x 44 cancel control, DPI 96, and placement on the left 1920 x
+  1080 secondary monitor. The crop confirms the layered windows are visible
+  together without a seam or black control tile. Its dark fixture panel is not
+  used for palette comparison because translucent surface color is
+  backdrop-dependent; the deterministic light-backdrop comparison above owns
+  that fidelity check.
+- The existing staged Scribe process was not terminated or disturbed. The
+  isolated fixture was stopped only after its executable path was revalidated.
 
 final result: passed

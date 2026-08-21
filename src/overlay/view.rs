@@ -499,7 +499,7 @@ fn render_live_status_row(ui: &mut egui::Ui, state: &OverlayViewState, colors: O
             .map(format_elapsed)
             .unwrap_or_else(|| "00:00".into());
         ui.label(RichText::new(elapsed).size(13.0).color(colors.muted_text));
-        if state.live_preview_available {
+        if state.live_preview_available || state.error.is_some() {
             render_divider(ui, colors);
             let response = ui.label(live_preview_layout(ui, state, colors, ui.available_width()));
             ui.ctx().accesskit_node_builder(response.id, |builder| {
@@ -1134,6 +1134,39 @@ mod tests {
                 && !node.name().is_some_and(|name| {
                     name.contains("must not leak") || name.contains("must not be announced")
                 })
+        }));
+    }
+
+    #[test]
+    fn live_fallback_exposes_capture_errors_when_preview_never_started() {
+        let context = egui::Context::default();
+        context.enable_accesskit();
+        let state = OverlayViewState {
+            session_id: Some(SessionId(11)),
+            mode: OverlayMode::Live,
+            phase: OverlayPhase::Error,
+            live_preview_available: false,
+            elapsed: Some(Duration::from_secs(12)),
+            error: Some(super::super::controller::OverlayError {
+                message: "Microphone unavailable".into(),
+                recovery: OverlayRecovery::Retry,
+            }),
+            ..Default::default()
+        };
+        let output = context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(LIVE_WIDTH, LIVE_HEIGHT),
+                )),
+                ..Default::default()
+            },
+            |context| render_overlay(context, &state),
+        );
+        let nodes = output.platform_output.accesskit_update.unwrap().nodes;
+        assert!(nodes.iter().any(|(_, node)| {
+            node.name() == Some("Microphone unavailable You can retry.")
+                && node.live() == Some(egui::accesskit::Live::Polite)
         }));
     }
 
