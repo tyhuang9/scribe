@@ -55,6 +55,97 @@ const ROUTE_BOTTOM_INSET: f32 = 16.0;
 const ROUTE_AUTO_ID_STRIDE: usize = 100_000;
 const SETTINGS_COMPACT_BREAKPOINT: f32 = 620.0;
 const SETTINGS_LABEL_COLUMN_WIDTH: f32 = 270.0;
+#[derive(Clone, Copy)]
+struct SettingsHelp {
+    id_source: &'static str,
+    description: &'static str,
+}
+
+impl SettingsHelp {
+    const fn new(id_source: &'static str, description: &'static str) -> Self {
+        Self {
+            id_source,
+            description,
+        }
+    }
+}
+
+fn settings_help_metadata(label: &str) -> Option<SettingsHelp> {
+    match label {
+        "Transcription device" => Some(TRANSCRIPTION_DEVICE_HELP),
+        "Streaming mode" => Some(STREAMING_MODE_HELP),
+        "Speech confirmation ms" => Some(SPEECH_CONFIRMATION_HELP),
+        "Internal pause ms" => Some(INTERNAL_PAUSE_HELP),
+        "End after silence ms" => Some(END_AFTER_SILENCE_HELP),
+        "Pre-roll ms" => Some(PRE_ROLL_HELP),
+        "Post-roll ms" => Some(POST_ROLL_HELP),
+        "Active model" => Some(ACTIVE_MODEL_HELP),
+        "Dictation overlay" => Some(DICTATION_OVERLAY_HELP),
+        "Paste delay ms" => Some(PASTE_DELAY_HELP),
+        "History storage" => Some(HISTORY_STORAGE_HELP),
+        "Maximum unpinned entries" => Some(MAX_HISTORY_ENTRIES_HELP),
+        "Transcript days" => Some(TRANSCRIPT_RETENTION_DAYS_HELP),
+        "Audio days" => Some(AUDIO_RETENTION_DAYS_HELP),
+        _ => None,
+    }
+}
+
+const TRANSCRIPTION_DEVICE_HELP: SettingsHelp = SettingsHelp::new(
+    "transcription-device-help",
+    "Auto selects available local hardware. GPU may be faster when supported; CPU only avoids GPU acceleration.",
+);
+const STREAMING_MODE_HELP: SettingsHelp = SettingsHelp::new(
+    "streaming-mode-help",
+    "For transcription sessions, Auto and Rolling preview show temporary local text while recording; Final text only waits for the final transcription.",
+);
+const ACTIVE_MODEL_HELP: SettingsHelp = SettingsHelp::new(
+    "active-model-help",
+    "The selected local model determines transcription accuracy, speed, and disk use. Manage models to change it.",
+);
+const DICTATION_OVERLAY_HELP: SettingsHelp = SettingsHelp::new(
+    "dictation-overlay-help",
+    "Show recording feedback above other apps. This is unavailable where Scribe cannot verify that the overlay will not steal focus.",
+);
+const PASTE_DELAY_HELP: SettingsHelp = SettingsHelp::new(
+    "paste-delay-help",
+    "Wait this long after copying before Scribe sends the paste shortcut to the captured app.",
+);
+const HISTORY_STORAGE_HELP: SettingsHelp = SettingsHelp::new(
+    "history-storage-help",
+    "Choose whether Scribe keeps no history, transcript text only, or transcript text with retained audio on this device.",
+);
+const MAX_HISTORY_ENTRIES_HELP: SettingsHelp = SettingsHelp::new(
+    "maximum-unpinned-entries-help",
+    "When the limit is reached, Scribe removes the oldest unpinned entries. Pinned entries are kept.",
+);
+const TRANSCRIPT_RETENTION_DAYS_HELP: SettingsHelp = SettingsHelp::new(
+    "transcript-retention-days-help",
+    "Remove the entire unpinned history entry, including any retained audio, after this many days. Pinned entries are kept.",
+);
+const AUDIO_RETENTION_DAYS_HELP: SettingsHelp = SettingsHelp::new(
+    "audio-retention-days-help",
+    "Remove only retained audio from unpinned entries after this many days; the transcript entry remains. Pinned entries are kept.",
+);
+const SPEECH_CONFIRMATION_HELP: SettingsHelp = SettingsHelp::new(
+    "speech-confirmation-ms-help",
+    "Require speech to continue for this long before Scribe treats it as confirmed speech.",
+);
+const INTERNAL_PAUSE_HELP: SettingsHelp = SettingsHelp::new(
+    "internal-pause-ms-help",
+    "Treat a pause shorter than this as part of the same phrase rather than a new speech segment.",
+);
+const END_AFTER_SILENCE_HELP: SettingsHelp = SettingsHelp::new(
+    "end-after-silence-ms-help",
+    "In Press once mode, end recording after speech has stopped for this long.",
+);
+const PRE_ROLL_HELP: SettingsHelp = SettingsHelp::new(
+    "pre-roll-ms-help",
+    "Keep this much audio from just before speech begins so the first word is less likely to be cut off.",
+);
+const POST_ROLL_HELP: SettingsHelp = SettingsHelp::new(
+    "post-roll-ms-help",
+    "Keep this much audio after speech ends so the last word is less likely to be cut off.",
+);
 const LIVE_TRANSCRIPTION_PREVIEW_SWITCH_ID: &str = "live-transcription-preview-switch";
 const LIVE_TRANSCRIPTION_PREVIEW_DESCRIPTION: &str =
     "Temporary local live text is replaced by the final transcription.";
@@ -6057,8 +6148,8 @@ fn recording_settings_panel(
         );
         ui.add_enabled_ui(!recording_locked, |ui| {
             let mut streaming = settings.streaming_label.clone();
-            setting_row_with_separator(ui, "Streaming mode", true, |ui, label_id| {
-                ComboBox::from_id_source("streaming-mode")
+            let _ = SettingsRow::show(ui, "Streaming mode", true, |ui, label_id| {
+                let response = ComboBox::from_id_source("streaming-mode")
                     .selected_text(&streaming)
                     .show_ui(ui, |ui| {
                         for value in ["Auto", "Rolling preview", "Final text only"] {
@@ -6067,13 +6158,14 @@ fn recording_settings_panel(
                     })
                     .response
                     .labelled_by(label_id);
+                describe_setting(ui, &response, STREAMING_MODE_HELP);
             });
             if streaming != settings.streaming_label {
                 *action = ScreenAction::SetStreamingMode(streaming);
             }
             let mut acceleration = settings.acceleration_label.clone();
-            setting_row(ui, "Transcription device", |ui, label_id| {
-                ComboBox::from_id_source("advanced-transcription-device-mode")
+            let _ = SettingsRow::show(ui, "Transcription device", false, |ui, label_id| {
+                let response = ComboBox::from_id_source("advanced-transcription-device-mode")
                     .selected_text(&acceleration)
                     .show_ui(ui, |ui| {
                         for value in ["Auto", "GPU", "CPU only"] {
@@ -6084,6 +6176,7 @@ fn recording_settings_panel(
                     })
                     .response
                     .labelled_by(label_id);
+                describe_setting(ui, &response, TRANSCRIPTION_DEVICE_HELP);
             });
             if acceleration != settings.acceleration_label {
                 *action = ScreenAction::SetAcceleration(acceleration);
@@ -6173,26 +6266,41 @@ fn voice_detection_settings_section(
         ui.add_enabled_ui(!recording_locked, |ui| {
             if vad_enabled {
                 ui.separator();
-                for (index, (label, value, action_for)) in [
-                    ("Speech confirmation ms", settings.speech_confirmation_ms, 0),
-                    ("Internal pause ms", settings.internal_pause_ms, 1),
-                    ("End after silence ms", settings.endpoint_silence_ms, 2),
-                    ("Pre-roll ms", settings.pre_roll_ms, 3),
-                    ("Post-roll ms", settings.post_roll_ms, 4),
+                for (index, (label, value, action_for, help)) in [
+                    (
+                        "Speech confirmation ms",
+                        settings.speech_confirmation_ms,
+                        0,
+                        SPEECH_CONFIRMATION_HELP,
+                    ),
+                    (
+                        "Internal pause ms",
+                        settings.internal_pause_ms,
+                        1,
+                        INTERNAL_PAUSE_HELP,
+                    ),
+                    (
+                        "End after silence ms",
+                        settings.endpoint_silence_ms,
+                        2,
+                        END_AFTER_SILENCE_HELP,
+                    ),
+                    ("Pre-roll ms", settings.pre_roll_ms, 3, PRE_ROLL_HELP),
+                    ("Post-roll ms", settings.post_roll_ms, 4, POST_ROLL_HELP),
                 ]
                 .into_iter()
                 .enumerate()
                 {
                     let _ = SettingsRow::show(ui, label, index < 4, |ui, label_id| {
                         let mut edited = value as i64;
-                        if ui
+                        let response = ui
                             .add_sized(
                                 [96.0, 44.0],
                                 egui::DragValue::new(&mut edited).clamp_range(0..=5_000),
                             )
-                            .labelled_by(label_id)
-                            .changed()
-                        {
+                            .labelled_by(label_id);
+                        describe_setting(ui, &response, help);
+                        if response.changed() {
                             *action = match action_for {
                                 0 => ScreenAction::SetSpeechConfirmationMs(edited.max(50) as u32),
                                 1 => ScreenAction::SetInternalPauseMs(edited.max(100) as u32),
@@ -6239,7 +6347,9 @@ fn general_settings_panel(
         );
         let _ = SettingsRow::show(ui, "Active model", false, |ui, _| {
             ui.label(&settings.active_model_label);
-            if button(ui, "Manage models", ButtonTone::Secondary).clicked() {
+            let manage = button(ui, "Manage models", ButtonTone::Secondary);
+            describe_setting(ui, &manage, ACTIVE_MODEL_HELP);
+            if manage.clicked() {
                 *action = ScreenAction::OpenModelSettings;
             }
         });
@@ -6247,7 +6357,7 @@ fn general_settings_panel(
     ui.add_space(16.0);
     settings_section(ui, "Appearance", |ui| {
         let mut theme = settings.theme_label.clone();
-        setting_row_with_separator(ui, "Theme", true, |ui, label_id| {
+        compact_setting_row(ui, "Theme", true, |ui, label_id| {
             ComboBox::from_id_source("theme-mode")
                 .selected_text(&theme)
                 .show_ui(ui, |ui| {
@@ -6262,9 +6372,9 @@ fn general_settings_panel(
             *action = ScreenAction::SetTheme(theme);
         }
         let mut overlay = settings.overlay_label.clone();
-        setting_row_with_separator(ui, "Dictation overlay", true, |ui, label_id| {
+        let _ = SettingsRow::show(ui, "Dictation overlay", true, |ui, label_id| {
             ui.vertical(|ui| {
-                ui.add_enabled_ui(settings.overlay_available, |ui| {
+                let response = ui.add_enabled_ui(settings.overlay_available, |ui| {
                     ComboBox::from_id_source("overlay-mode")
                         .selected_text(&overlay)
                         .show_ui(ui, |ui| {
@@ -6273,8 +6383,9 @@ fn general_settings_panel(
                             }
                         })
                         .response
-                        .labelled_by(label_id);
-                });
+                        .labelled_by(label_id)
+                }).inner;
+                describe_setting(ui, &response, DICTATION_OVERLAY_HELP);
                 if !settings.overlay_available {
                     ui.label(RichText::new("The overlay is unavailable because focus safety is not verified on this platform.").color(ui_palette(ui).warning));
                 }
@@ -6284,7 +6395,7 @@ fn general_settings_panel(
             *action = ScreenAction::SetOverlayMode(overlay);
         }
         let mut position = settings.overlay_position_label.clone();
-        setting_row(ui, "Overlay position", |ui, label_id| {
+        compact_setting_row(ui, "Overlay position", false, |ui, label_id| {
             ui.add_enabled_ui(
                 settings.overlay_available && settings.overlay_label != "Off",
                 |ui| {
@@ -6296,7 +6407,7 @@ fn general_settings_panel(
                             }
                         })
                         .response
-                        .labelled_by(label_id);
+                        .labelled_by(label_id)
                 },
             );
         });
@@ -6369,14 +6480,14 @@ fn output_settings_panel(
                 );
                 let _ = SettingsRow::show(ui, "Paste delay ms", false, |ui, label_id| {
                     let mut delay = settings.paste_delay_ms as i64;
-                    if ui
+                    let response = ui
                         .add_sized(
                             [96.0, 44.0],
                             egui::DragValue::new(&mut delay).clamp_range(1..=1_000),
                         )
-                        .labelled_by(label_id)
-                        .changed()
-                    {
+                        .labelled_by(label_id);
+                    describe_setting(ui, &response, PASTE_DELAY_HELP);
+                    if response.changed() {
                         *action = ScreenAction::SetPasteDelayMs(delay as u64);
                     }
                 });
@@ -6436,7 +6547,13 @@ fn advanced_settings_panel(
                             .labelled_by(label_id)
                     })
                     .inner;
-                describe_history_lock(ui, &response, settings.history_locked, None);
+                describe_setting(ui, &response, HISTORY_STORAGE_HELP);
+                describe_history_lock(
+                    ui,
+                    &response,
+                    settings.history_locked,
+                    Some(HISTORY_STORAGE_HELP.description),
+                );
             });
             if mode != settings.history_mode_label {
                 *action = ScreenAction::SetHistoryMode(mode.clone());
@@ -6454,7 +6571,13 @@ fn advanced_settings_panel(
                             .labelled_by(label_id)
                         })
                         .inner;
-                    describe_history_lock(ui, &response, settings.history_locked, None);
+                    describe_setting(ui, &response, MAX_HISTORY_ENTRIES_HELP);
+                    describe_history_lock(
+                        ui,
+                        &response,
+                        settings.history_locked,
+                        Some(MAX_HISTORY_ENTRIES_HELP.description),
+                    );
                     if response.changed() {
                         *action = ScreenAction::SetMaxHistoryEntries(maximum as u32);
                     }
@@ -6463,10 +6586,14 @@ fn advanced_settings_panel(
                     ui,
                     OptionalRetentionSetting {
                         label: "Limit transcript age",
+                        days_label: "Transcript days",
                         unlimited_label: "Keep transcripts until deleted",
                         configured_days: settings.transcript_retention_days,
-                        switch_id: LIMIT_TRANSCRIPT_AGE_SWITCH_ID,
-                        description: LIMIT_TRANSCRIPT_AGE_DESCRIPTION,
+                        help: SettingsHelp::new(
+                            LIMIT_TRANSCRIPT_AGE_SWITCH_ID,
+                            LIMIT_TRANSCRIPT_AGE_DESCRIPTION,
+                        ),
+                        days_help: TRANSCRIPT_RETENTION_DAYS_HELP,
                     },
                     settings.history_locked,
                     action,
@@ -6477,10 +6604,14 @@ fn advanced_settings_panel(
                         ui,
                         OptionalRetentionSetting {
                             label: "Limit audio age",
+                            days_label: "Audio days",
                             unlimited_label: "Keep retained audio until its entry is deleted",
                             configured_days: settings.audio_retention_days,
-                            switch_id: LIMIT_AUDIO_AGE_SWITCH_ID,
-                            description: LIMIT_AUDIO_AGE_DESCRIPTION,
+                            help: SettingsHelp::new(
+                                LIMIT_AUDIO_AGE_SWITCH_ID,
+                                LIMIT_AUDIO_AGE_DESCRIPTION,
+                            ),
+                            days_help: AUDIO_RETENTION_DAYS_HELP,
                         },
                         settings.history_locked,
                         action,
@@ -6594,10 +6725,11 @@ fn advanced_settings_panel(
 
 struct OptionalRetentionSetting<'a> {
     label: &'a str,
+    days_label: &'a str,
     unlimited_label: &'a str,
     configured_days: Option<u32>,
-    switch_id: &'a str,
-    description: &'a str,
+    help: SettingsHelp,
+    days_help: SettingsHelp,
 }
 
 fn optional_retention_control(
@@ -6611,20 +6743,20 @@ fn optional_retention_control(
     let _ = SettingsRow::show_with_help(
         ui,
         setting.label,
-        setting.switch_id,
-        setting.description,
+        setting.help.id_source,
+        setting.help.description,
         false,
         |ui, _| {
             ui.vertical(|ui| {
                 let limit = settings_switch(
                     ui,
-                    setting.switch_id,
+                    setting.help.id_source,
                     limited,
                     setting.label,
-                    setting.description,
+                    setting.help.description,
                     !history_locked,
                 );
-                describe_history_lock(ui, &limit, history_locked, Some(setting.description));
+                describe_history_lock(ui, &limit, history_locked, Some(setting.help.description));
                 if limit.clicked() {
                     limited = !limited;
                     *action = update(limited.then_some(setting.configured_days.unwrap_or(30)));
@@ -6640,7 +6772,7 @@ fn optional_retention_control(
     ui.separator();
     if limited {
         let mut days = setting.configured_days.unwrap_or(30) as i64;
-        let _ = SettingsRow::show(ui, "Days", false, |ui, label_id| {
+        let _ = SettingsRow::show(ui, setting.days_label, false, |ui, label_id| {
             let response = ui
                 .add_enabled_ui(!history_locked, |ui| {
                     ui.add_sized(
@@ -6650,7 +6782,13 @@ fn optional_retention_control(
                     .labelled_by(label_id)
                 })
                 .inner;
-            describe_history_lock(ui, &response, history_locked, None);
+            describe_setting(ui, &response, setting.days_help);
+            describe_history_lock(
+                ui,
+                &response,
+                history_locked,
+                Some(setting.days_help.description),
+            );
             if response.changed() {
                 *action = update(Some(days as u32));
             }
@@ -6844,7 +6982,8 @@ impl SettingsRow {
         separator_after: bool,
         contents: impl FnOnce(&mut egui::Ui, egui::Id),
     ) -> egui::Response {
-        Self::show_with_optional_help(ui, label, None, separator_after, contents)
+        let help = settings_help_metadata(label).map(|help| (help.id_source, help.description));
+        Self::show_with_optional_help(ui, label, help, separator_after, contents)
     }
 
     fn show_with_help(
@@ -7214,19 +7353,6 @@ fn settings_section(ui: &mut egui::Ui, title: &str, contents: impl FnOnce(&mut e
     SettingsSection::show(ui, title, contents);
 }
 
-fn setting_row(ui: &mut egui::Ui, label: &str, contents: impl FnOnce(&mut egui::Ui, egui::Id)) {
-    setting_row_with_separator(ui, label, false, contents);
-}
-
-fn setting_row_with_separator(
-    ui: &mut egui::Ui,
-    label: &str,
-    separator_after: bool,
-    contents: impl FnOnce(&mut egui::Ui, egui::Id),
-) {
-    let _ = SettingsRow::show(ui, label, separator_after, contents);
-}
-
 fn compact_setting_row(
     ui: &mut egui::Ui,
     label: &str,
@@ -7234,6 +7360,12 @@ fn compact_setting_row(
     contents: impl FnOnce(&mut egui::Ui, egui::Id),
 ) {
     let _ = SettingsRow::show(ui, label, separator_after, contents);
+}
+
+fn describe_setting(ui: &egui::Ui, response: &egui::Response, help: SettingsHelp) {
+    ui.ctx().accesskit_node_builder(response.id, |builder| {
+        builder.set_description(help.description);
+    });
 }
 
 fn next_tab(tab: SettingsTab) -> SettingsTab {
@@ -10836,11 +10968,14 @@ mod tests {
                 .iter()
                 .any(|(_, node)| node.role() == egui::accesskit::Role::TabList)
         );
-        assert!(
-            nodes
-                .iter()
-                .any(|(_, node)| node.role() == egui::accesskit::Role::RadioGroup)
-        );
+        assert!(nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::RadioGroup
+                && node.name() == Some("Recording mode")
+        }));
+        assert!(!nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::Button
+                && node.name() == Some("Global record hotkey information")
+        }));
         let selected_tab = nodes
             .iter()
             .find(|(_, node)| {
@@ -11013,6 +11148,121 @@ mod tests {
                 assert!(
                     help_bounds.x1 <= bounds.x0,
                     "{name} help must stay in the label column before its switch"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn non_obvious_settings_expose_contextual_help_with_accessible_descriptions() {
+        assert_eq!(
+            TRANSCRIPT_RETENTION_DAYS_HELP.description,
+            "Remove the entire unpinned history entry, including any retained audio, after this many days. Pinned entries are kept."
+        );
+        assert_eq!(
+            AUDIO_RETENTION_DAYS_HELP.description,
+            "Remove only retained audio from unpinned entries after this many days; the transcript entry remains. Pinned entries are kept."
+        );
+        let settings_view = RecordingSettingsView {
+            auto_insert_transcript: true,
+            show_restore_clipboard: true,
+            history_mode_label: "Transcript and audio".into(),
+            transcript_retention_days: Some(30),
+            audio_retention_days: Some(30),
+            ..Default::default()
+        };
+        let expected = [
+            (
+                SettingsTab::General,
+                &[
+                    ("Active model", ACTIVE_MODEL_HELP),
+                    ("Dictation overlay", DICTATION_OVERLAY_HELP),
+                    ("Paste delay ms", PASTE_DELAY_HELP),
+                ][..],
+            ),
+            (
+                SettingsTab::Recording,
+                &[
+                    ("Streaming mode", STREAMING_MODE_HELP),
+                    ("Transcription device", TRANSCRIPTION_DEVICE_HELP),
+                ][..],
+            ),
+            (
+                SettingsTab::Advanced,
+                &[
+                    ("Speech confirmation ms", SPEECH_CONFIRMATION_HELP),
+                    ("Internal pause ms", INTERNAL_PAUSE_HELP),
+                    ("End after silence ms", END_AFTER_SILENCE_HELP),
+                    ("Pre-roll ms", PRE_ROLL_HELP),
+                    ("Post-roll ms", POST_ROLL_HELP),
+                    ("History storage", HISTORY_STORAGE_HELP),
+                    ("Maximum unpinned entries", MAX_HISTORY_ENTRIES_HELP),
+                    ("Transcript days", TRANSCRIPT_RETENTION_DAYS_HELP),
+                    ("Audio days", AUDIO_RETENTION_DAYS_HELP),
+                ][..],
+            ),
+        ];
+        let expected_absent = [
+            (
+                SettingsTab::General,
+                ["Theme", "Overlay position"].as_slice(),
+            ),
+            (
+                SettingsTab::Recording,
+                ["Mode", "Duration limit", "Global record hotkey", "Device"].as_slice(),
+            ),
+        ];
+
+        for (tab, rows) in expected {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            let output = ctx.run(Default::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let _ = settings(ui, tab, &TranscriptionState::default(), &settings_view);
+                });
+            });
+            let nodes = &output
+                .platform_output
+                .accesskit_update
+                .expect("settings should expose AccessKit")
+                .nodes;
+            for (label, help) in rows {
+                let name = format!("{label} information");
+                let help_node = nodes
+                    .iter()
+                    .find_map(|(_, node)| {
+                        (node.role() == egui::accesskit::Role::Button
+                            && node.name() == Some(name.as_str()))
+                        .then_some(node)
+                    })
+                    .unwrap_or_else(|| panic!("missing {name}"));
+                assert_eq!(help_node.description(), Some(help.description));
+                assert_eq!(help_node.is_expanded(), Some(false));
+                let bounds = help_node.bounds().expect("help target bounds");
+                assert!(bounds.width() >= 44.0 && bounds.height() >= 44.0);
+            }
+        }
+        for (tab, labels) in expected_absent {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            let output = ctx.run(Default::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let _ = settings(ui, tab, &TranscriptionState::default(), &settings_view);
+                });
+            });
+            let nodes = &output
+                .platform_output
+                .accesskit_update
+                .expect("settings should expose AccessKit")
+                .nodes;
+            for label in labels {
+                let name = format!("{label} information");
+                assert!(
+                    !nodes.iter().any(|(_, node)| {
+                        node.role() == egui::accesskit::Role::Button
+                            && node.name() == Some(name.as_str())
+                    }),
+                    "{name} should not expose redundant contextual help"
                 );
             }
         }
@@ -12130,6 +12380,10 @@ mod tests {
                     node.name() == Some("Cancel hotkey capture") && node.is_selected() == Some(true)
                 }));
             } else {
+                let history_storage_description = format!(
+                    "{} Unavailable while a retained-audio retry owns its history row.",
+                    HISTORY_STORAGE_HELP.description
+                );
                 assert!(nodes.iter().any(|(_, node)| {
                     node.name()
                         == Some(
@@ -12140,10 +12394,7 @@ mod tests {
                 }));
                 assert!(nodes.iter().any(|(_, node)| {
                     node.role() == egui::accesskit::Role::ComboBox
-                        && node.description()
-                            == Some(
-                                "Unavailable while a retained-audio retry owns its history row.",
-                            )
+                        && node.description() == Some(history_storage_description.as_str())
                 }));
             }
         }
@@ -12655,7 +12906,9 @@ mod tests {
                         })
             }));
             assert_eq!(
-                nodes.iter().any(|(_, node)| node.name() == Some("Days")),
+                nodes
+                    .iter()
+                    .any(|(_, node)| node.name() == Some("Transcript days")),
                 !initially_enabled
             );
 
@@ -12678,7 +12931,7 @@ mod tests {
                 .nodes;
             let days_count = nodes
                 .iter()
-                .filter(|(_, node)| node.name() == Some("Days"))
+                .filter(|(_, node)| node.name() == Some("Audio days"))
                 .count();
             assert_eq!(days_count, usize::from(!initially_enabled));
             assert!(nodes.iter().any(|(_, node)| {
