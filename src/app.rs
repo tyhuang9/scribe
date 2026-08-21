@@ -74,14 +74,14 @@ use crate::ui::{
     AppPage, ComparisonPhase, ComparisonResult, ComparisonResultPhase, HistoryPageAction,
     HistoryPageState, MicrophonePermission, ModelCapabilities, ModelCardKey, ModelComparisonState,
     ModelCompatibility, ModelDialog, ModelDownloadState, ModelLanguageFilter, ModelManagementState,
-    ModelReadiness, ModelSizeTier, ModelSpeedTier, ModelViewModel, RecordingMode,
-    RecordingSettingsView, RemoteCatalogActionKind, RemoteCatalogActionView,
+    ModelReadiness, ModelSizeTier, ModelSpeedTier, ModelViewModel, ReadyModelPickerAction,
+    RecordingMode, RecordingSettingsView, RemoteCatalogActionKind, RemoteCatalogActionView,
     RemoteCatalogEntryView, RemoteCatalogFilters, RemoteCatalogSort, RemoteCatalogStatusKind,
     RemoteCatalogStatusView, RemoteCatalogVariantView, RemoteCatalogView, ScreenAction, ScreenView,
-    SettingsTab, ThemePalette, UiRoute, configure_accessible_style, history_page,
-    minimum_primary_target_height, recording_mode, render_screen, scroll_focused_control_into_view,
-    settings_save_state, show_navigation, show_route_scroll, theme_palette, transcription_state,
-    ui_palette,
+    SettingsTab, SidebarModelView, ThemePalette, UiRoute, configure_accessible_style, history_page,
+    minimum_primary_target_height, recording_mode, render_screen,
+    request_models_route_heading_focus, scroll_focused_control_into_view, settings_save_state,
+    show_navigation, show_route_scroll, theme_palette, transcription_state, ui_palette,
 };
 
 #[cfg(test)]
@@ -3207,6 +3207,7 @@ pub struct LocalTranscriberApp {
     #[cfg(test)]
     comparison_output_replacement_count: usize,
     model_management: ModelManagementState,
+    models_route_focus_pending: bool,
     status: TranscriptionStatus,
     transcript: String,
     raw_transcript: String,
@@ -3398,6 +3399,7 @@ impl LocalTranscriberApp {
             #[cfg(test)]
             comparison_output_replacement_count: 0,
             model_management: ModelManagementState::default(),
+            models_route_focus_pending: false,
             status: TranscriptionStatus::Idle,
             transcript: String::new(),
             raw_transcript: String::new(),
@@ -8126,6 +8128,44 @@ impl LocalTranscriberApp {
         true
     }
 
+    fn select_ready_model_from_picker(&mut self, model_id: &str) -> bool {
+        let Some(model) = config::configured_models(&self.config)
+            .into_iter()
+            .find(|model| model.id == model_id)
+        else {
+            self.status_message =
+                "That model is no longer available. Refresh Models and choose a ready model."
+                    .to_owned();
+            return false;
+        };
+        if !self.effective_install_status(&model).is_runnable()
+            || runtime_status_for_model(&self.config, &model) != ModelRuntimeStatus::Ready
+        {
+            self.status_message = format!(
+                "{} is no longer ready. Repair it or choose another ready model in Models.",
+                model.name
+            );
+            return false;
+        }
+        if let Some(reason) = self.artifact_mutation_block_reason() {
+            self.status_message = reason;
+            return false;
+        }
+        self.select_model_as_default(&model)
+    }
+
+    fn apply_ready_model_picker_action(&mut self, action: ReadyModelPickerAction) {
+        match action {
+            ReadyModelPickerAction::Select(id) => {
+                self.select_ready_model_from_picker(&id);
+            }
+            ReadyModelPickerAction::ManageModels => {
+                self.current_tab = Tab::Models;
+                self.models_route_focus_pending = true;
+            }
+        }
+    }
+
     fn active_model_removal_replacement(&self, removed_id: &str) -> Option<SttModelInfo> {
         let built_in_rank = crate::model_catalog::normal_model_descriptors()
             .into_iter()
@@ -9318,6 +9358,10 @@ impl eframe::App for LocalTranscriberApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // Consume only focus requests carried into this frame. Navigation may
+        // queue a new request below, which intentionally waits for the next
+        // frame so the Models route and its accessibility tree are stable.
+        let focus_models_route_heading = std::mem::take(&mut self.models_route_focus_pending);
         self.apply_theme(ctx, frame);
         paint_viewport_background(ctx);
         self.handle_close_request(ctx);
@@ -9382,7 +9426,21 @@ impl eframe::App for LocalTranscriberApp {
             }
             _ => {}
         }
-        show_navigation(ctx, &mut self.current_tab, self.config.developer.debug_mode);
+        let sidebar_models = Arc::clone(&self.remote_catalog.local_models);
+        let sidebar_selected_model_id = self.config.general.selected_default_model.clone();
+        let sidebar_disabled_reason = self.artifact_mutation_block_reason();
+        if let Some(action) = show_navigation(
+            ctx,
+            &mut self.current_tab,
+            self.config.developer.debug_mode,
+            SidebarModelView {
+                selected_model_id: Some(&sidebar_selected_model_id),
+                models: &sidebar_models,
+                disabled_reason: sidebar_disabled_reason.as_deref(),
+            },
+        ) {
+            self.apply_ready_model_picker_action(action);
+        }
         self.sync_settings_playground_route();
         self.sync_passive_microphone_monitor();
         egui::CentralPanel::default()
@@ -9398,7 +9456,12 @@ impl eframe::App for LocalTranscriberApp {
                         self.ui_general_settings(ui);
                     }
                 }),
-                Tab::Models => show_route_scroll(ui, UiRoute::Models, |ui| self.ui_models(ui)),
+                Tab::Models => show_route_scroll(ui, UiRoute::Models, |ui| {
+                    if focus_models_route_heading {
+                        request_models_route_heading_focus(ui.ctx());
+                    }
+                    self.ui_models(ui)
+                }),
                 Tab::History => show_route_scroll(ui, UiRoute::History, |ui| self.ui_history(ui)),
                 Tab::Advanced => unreachable!("advanced navigation is routed to Settings"),
                 Tab::About => unreachable!("about navigation is routed to Settings"),
@@ -9568,33 +9631,13 @@ impl LocalTranscriberApp {
 
     fn apply_transcribe_screen_action(&mut self, action: ScreenAction) {
         match action {
-            ScreenAction::AddModel
-            | ScreenAction::ChangeModel
-            | ScreenAction::OpenModelSettings => self.current_tab = Tab::Models,
+            ScreenAction::AddModel | ScreenAction::ChangeModel => self.current_tab = Tab::Models,
+            ScreenAction::OpenModelSettings => {
+                self.current_tab = Tab::Models;
+                self.models_route_focus_pending = true;
+            }
             ScreenAction::SelectQuickModel(id) => {
-                let Some(model) = config::configured_models(&self.config)
-                    .into_iter()
-                    .find(|model| model.id == id)
-                else {
-                    self.status_message =
-                        "That model is no longer available. Refresh Models and choose a ready model."
-                            .to_owned();
-                    return;
-                };
-                if !self.effective_install_status(&model).is_runnable()
-                    || runtime_status_for_model(&self.config, &model) != ModelRuntimeStatus::Ready
-                {
-                    self.status_message = format!(
-                        "{} is no longer ready. Repair it or choose another ready model in Models.",
-                        model.name
-                    );
-                    return;
-                }
-                if let Some(reason) = self.artifact_mutation_block_reason() {
-                    self.status_message = reason;
-                    return;
-                }
-                self.select_model_as_default(&model);
+                self.select_ready_model_from_picker(&id);
             }
             ScreenAction::StartHotkeyCapture => self.start_hotkey_capture(),
             ScreenAction::CancelHotkeyCapture => self.cancel_hotkey_capture(),
@@ -14691,6 +14734,99 @@ mod layout_tests {
     }
 
     #[test]
+    fn manage_models_keyboard_navigation_focuses_the_models_heading_next_frame() {
+        for sidebar_entry in [true, false] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            configure_stitch_style(&ctx);
+            let mut app = test_app();
+            let installed_fixture = install_test_catalog_model(&mut app, "whisper_cpp_base_en");
+            app.current_tab = if sidebar_entry {
+                Tab::History
+            } else {
+                Tab::Transcribe
+            };
+            let trigger_id = egui::Id::new(if sidebar_entry {
+                "active-model-trigger"
+            } else {
+                "selected-model-action"
+            });
+            let popup_id = egui::Id::new(if sidebar_entry {
+                "sidebar-ready-model-picker"
+            } else {
+                "quick-model-picker"
+            });
+            ctx.memory_mut(|memory| memory.request_focus(trigger_id));
+
+            let opened =
+                render_app_navigation_frame(&ctx, &mut app, vec![pressed_key(egui::Key::Enter)]);
+            assert!(ctx.memory(|memory| memory.is_popup_open(popup_id)));
+            let manage_id = opened
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .unwrap()
+                .nodes
+                .iter()
+                .find_map(|(id, node)| {
+                    node.name()
+                        .is_some_and(|name| name.starts_with("Manage models"))
+                        .then_some(*id)
+                })
+                .expect("ready-model picker should expose Manage models");
+
+            let focused_menu = render_app_navigation_frame(
+                &ctx,
+                &mut app,
+                vec![egui::Event::AccessKitActionRequest(
+                    egui::accesskit::ActionRequest {
+                        action: egui::accesskit::Action::Focus,
+                        target: manage_id,
+                        data: None,
+                    },
+                )],
+            );
+            assert_eq!(
+                focused_menu
+                    .platform_output
+                    .accesskit_update
+                    .as_ref()
+                    .unwrap()
+                    .focus,
+                manage_id
+            );
+
+            let navigated =
+                render_app_navigation_frame(&ctx, &mut app, vec![pressed_key(egui::Key::Enter)]);
+            assert_eq!(app.current_tab, Tab::Models);
+            assert!(app.models_route_focus_pending);
+            assert!(!ctx.memory(|memory| memory.is_popup_open(popup_id)));
+            assert_ne!(ctx.memory(|memory| memory.focused()), Some(trigger_id));
+            let navigated_update = navigated.platform_output.accesskit_update.as_ref().unwrap();
+            assert!(!navigated_update.nodes.iter().any(|(id, node)| {
+                *id == navigated_update.focus
+                    && node.role() == egui::accesskit::Role::Heading
+                    && node.name() == Some("Models")
+            }));
+
+            let settled = render_app_navigation_frame(&ctx, &mut app, Vec::new());
+            assert!(!app.models_route_focus_pending);
+            let update = settled.platform_output.accesskit_update.as_ref().unwrap();
+            let focused = update
+                .nodes
+                .iter()
+                .find(|(id, _)| *id == update.focus)
+                .map(|(_, node)| node)
+                .expect("focused Models destination should remain in the accessibility tree");
+            assert_eq!(focused.role(), egui::accesskit::Role::Heading);
+            assert_eq!(focused.name(), Some("Models"));
+            assert_ne!(ctx.memory(|memory| memory.focused()), Some(trigger_id));
+
+            let _ = fs::remove_file(installed_fixture);
+        }
+    }
+
+    #[test]
     fn focused_final_playground_control_scrolls_the_outer_production_route() {
         let width = 840.0;
         let height = 420.0;
@@ -19074,6 +19210,68 @@ mod layout_tests {
         })
     }
 
+    fn render_app_navigation_frame(
+        ctx: &egui::Context,
+        app: &mut LocalTranscriberApp,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        let focus_models_route_heading = std::mem::take(&mut app.models_route_focus_pending);
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1_180.0, 815.0),
+                )),
+                focused: true,
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                let sidebar_models = Arc::clone(&app.remote_catalog.local_models);
+                let selected_model_id = app.config.general.selected_default_model.clone();
+                if let Some(action) = show_navigation(
+                    ctx,
+                    &mut app.current_tab,
+                    false,
+                    SidebarModelView {
+                        selected_model_id: Some(&selected_model_id),
+                        models: &sidebar_models,
+                        disabled_reason: None,
+                    },
+                ) {
+                    app.apply_ready_model_picker_action(action);
+                }
+                egui::CentralPanel::default()
+                    .frame(content_panel_frame(ctx))
+                    .show(ctx, |ui| match app.current_tab {
+                        Tab::Transcribe => {
+                            show_route_scroll(ui, UiRoute::Transcribe, |ui| app.ui_transcribe(ui))
+                        }
+                        Tab::Models => show_route_scroll(ui, UiRoute::Models, |ui| {
+                            if focus_models_route_heading {
+                                request_models_route_heading_focus(ui.ctx());
+                            }
+                            app.ui_models(ui)
+                        }),
+                        Tab::History => {
+                            show_route_scroll(ui, UiRoute::History, |ui| app.ui_history(ui))
+                        }
+                        _ => unreachable!("focus-route test uses primary non-settings pages"),
+                    });
+            },
+        )
+    }
+
+    fn pressed_key(key: egui::Key) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
     fn render_debug_route_with_input(
         ctx: &egui::Context,
         app: &mut LocalTranscriberApp,
@@ -19223,7 +19421,7 @@ mod layout_tests {
     }
 
     fn show_test_navigation(ctx: &egui::Context, current_tab: &mut Tab) {
-        show_navigation(ctx, current_tab, true);
+        show_navigation(ctx, current_tab, true, SidebarModelView::default());
     }
 
     fn max_visible_painted_x(output: &egui::FullOutput) -> f32 {
@@ -19362,6 +19560,7 @@ mod layout_tests {
             comparison_wer_compute_count: 0,
             comparison_output_replacement_count: 0,
             model_management: ModelManagementState::default(),
+            models_route_focus_pending: false,
             status: TranscriptionStatus::Idle,
             transcript: String::new(),
             raw_transcript: String::new(),
@@ -21407,7 +21606,7 @@ mod layout_tests {
     }
 
     #[test]
-    fn quick_model_selection_revalidates_a_stale_ready_catalog_entry() {
+    fn both_quick_model_entry_points_revalidate_a_stale_ready_catalog_entry() {
         let mut app = test_app();
         let previous = app.config.general.selected_default_model.clone();
         let mut cached_models = app.remote_catalog.local_models.to_vec();
@@ -21420,15 +21619,47 @@ mod layout_tests {
         });
         app.remote_catalog.local_models = cached_models.into();
 
-        app.apply_transcribe_screen_action(ScreenAction::SelectQuickModel(
-            "stale-ready-model".into(),
-        ));
+        for sidebar in [false, true] {
+            if sidebar {
+                app.apply_ready_model_picker_action(ReadyModelPickerAction::Select(
+                    "stale-ready-model".into(),
+                ));
+            } else {
+                app.apply_transcribe_screen_action(ScreenAction::SelectQuickModel(
+                    "stale-ready-model".into(),
+                ));
+            }
+            assert_eq!(app.config.general.selected_default_model, previous);
+            assert_eq!(
+                app.status_message,
+                "That model is no longer available. Refresh Models and choose a ready model."
+            );
+        }
+    }
 
-        assert_eq!(app.config.general.selected_default_model, previous);
-        assert_eq!(
-            app.status_message,
-            "That model is no longer available. Refresh Models and choose a ready model."
-        );
+    #[test]
+    fn ready_model_picker_helper_preserves_selection_while_artifact_mutation_is_busy() {
+        let mut app = test_app();
+        install_test_catalog_model(&mut app, "whisper_cpp_base_en");
+        let previous = app.config.general.selected_default_model.clone();
+        app.playground_pending = 1;
+
+        for sidebar in [false, true] {
+            if sidebar {
+                app.apply_ready_model_picker_action(ReadyModelPickerAction::Select(
+                    "whisper_cpp_base_en".into(),
+                ));
+            } else {
+                app.apply_transcribe_screen_action(ScreenAction::SelectQuickModel(
+                    "whisper_cpp_base_en".into(),
+                ));
+            }
+            assert_eq!(app.config.general.selected_default_model, previous);
+            assert_eq!(
+                app.status_message,
+                "Wait for Playground jobs to finish before changing speech artifacts."
+            );
+        }
     }
 
     #[test]
