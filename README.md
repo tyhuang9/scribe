@@ -279,6 +279,14 @@ The report contains allowlisted machine, model, backend, capability, and timing
 metadata only. It omits transcript text, audio, source paths, runtime output,
 and raw error chains, and refuses to overwrite an existing report.
 
+## Windows release downloads
+
+Windows x64 releases are published from GitHub Actions when a `v*` tag is
+created. Download `Scribe-Setup-<version>.exe` from the GitHub release for a
+normal per-user installation, or `Scribe-<version>-windows-x64.zip` for a
+portable copy. Scribe installs speech models separately from its Models page;
+models are not bundled in the installer.
+
 ## Config
 
 Settings are stored in a platform-specific config directory using the `directories` crate.
