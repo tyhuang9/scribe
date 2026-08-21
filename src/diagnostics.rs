@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
-const DIAGNOSTIC_SCHEMA_VERSION: u32 = 1;
+const DIAGNOSTIC_SCHEMA_VERSION: u32 = 2;
 const MAX_SESSION_SNAPSHOTS: usize = 50;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -59,6 +59,7 @@ pub(crate) struct SessionDiagnostic {
     pub compute_backend: Option<String>,
     pub streaming_mode: Option<String>,
     pub cold_or_warm: Option<String>,
+    pub output_outcome: Option<String>,
     pub metrics: SessionMetrics,
 }
 
@@ -197,6 +198,7 @@ mod tests {
             compute_backend: Some("CPU".into()),
             streaming_mode: Some("rolling".into()),
             cold_or_warm: Some("warm".into()),
+            output_outcome: None,
             metrics: SessionMetrics {
                 model_load_ms: Some(0),
                 ..SessionMetrics::default()
@@ -207,9 +209,13 @@ mod tests {
     #[test]
     fn report_is_allowlisted_and_marks_private_content_excluded() {
         let mut store = DiagnosticsStore::default();
-        store.record(diagnostic(7));
+        let mut entry = diagnostic(7);
+        entry.output_outcome = Some("inserted_clipboard_restore_skipped".to_owned());
+        store.record(entry);
         let json = serde_json::to_string_pretty(&store.report()).unwrap();
 
+        assert!(json.contains("\"schema_version\": 2"));
+        assert!(json.contains("\"output_outcome\": \"inserted_clipboard_restore_skipped\""));
         assert!(json.contains("\"transcript_content_included\": false"));
         assert!(json.contains("\"audio_content_included\": false"));
         assert!(json.contains("\"secrets_included\": false"));

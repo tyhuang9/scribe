@@ -207,10 +207,6 @@ pub fn harden_overlay_window_at(
     imp::harden_overlay_window_at(exact_title, bounds, visible, profile)
 }
 
-pub fn reduced_motion_preferred() -> bool {
-    imp::reduced_motion_preferred()
-}
-
 /// Whether this platform adapter can enforce non-activation and reject Scribe
 /// windows as output targets. Callers should force the effective mode to Off
 /// when this returns false.
@@ -242,9 +238,9 @@ mod imp {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         EnumWindows, GWL_EXSTYLE, GetCursorPos, GetForegroundWindow, GetPropW, GetWindowLongPtrW,
         GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, HWND_TOPMOST, IsWindow,
-        SPI_GETCLIENTAREAANIMATION, SWP_FRAMECHANGED, SWP_HIDEWINDOW, SWP_NOACTIVATE,
-        SWP_SHOWWINDOW, SetForegroundWindow, SetPropW, SetWindowLongPtrW, SetWindowPos,
-        SystemParametersInfoW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
+        SWP_FRAMECHANGED, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_SHOWWINDOW, SetForegroundWindow,
+        SetPropW, SetWindowLongPtrW, SetWindowPos, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+        WS_EX_TRANSPARENT,
     };
 
     use super::{
@@ -522,19 +518,6 @@ mod imp {
                 SWP_NOACTIVATE | SWP_FRAMECHANGED | visibility_flag,
             ) != 0
         })
-    }
-
-    pub(super) fn reduced_motion_preferred() -> bool {
-        let mut animations_enabled: BOOL = 1;
-        let succeeded = unsafe {
-            SystemParametersInfoW(
-                SPI_GETCLIENTAREAANIMATION,
-                0,
-                (&mut animations_enabled as *mut BOOL).cast::<c_void>(),
-                0,
-            )
-        };
-        succeeded != 0 && animations_enabled == 0
     }
 
     pub(super) fn overlay_focus_safety_available() -> bool {
@@ -1051,10 +1034,6 @@ mod imp {
         _visible: bool,
         _profile: OverlayHardeningProfile,
     ) -> bool {
-        false
-    }
-
-    pub(super) fn reduced_motion_preferred() -> bool {
         false
     }
 
