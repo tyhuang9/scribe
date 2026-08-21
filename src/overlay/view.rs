@@ -275,9 +275,10 @@ fn overlay_colors(context: &egui::Context) -> OverlayColors {
             // This app-owned tint remains deterministic while its alpha lets
             // the underlying desktop content show through.
             // The egui fallback does not composite native shadow rings beneath
-            // the fill, so this tint lands near the reference RGB 89/90/95 on
-            // its light backdrop without the native renderer's compensation.
-            surface: Color32::from_rgba_unmultiplied(31, 32, 39, 184),
+            // the fill, so this tint lands near the reference's neutral-gray
+            // surface on its light backdrop without the native renderer's
+            // shadow compensation.
+            surface: Color32::from_rgba_unmultiplied(25, 26, 33, 184),
             border: Color32::from_rgba_unmultiplied(220, 229, 242, 36),
             inner_highlight: Color32::from_rgba_unmultiplied(255, 255, 255, 18),
             text: palette.text,
@@ -288,8 +289,8 @@ fn overlay_colors(context: &egui::Context) -> OverlayColors {
             waveform: Color32::from_rgb(178, 162, 255),
             meter_active: palette.success,
             meter_inactive: Color32::from_rgb(180, 180, 188),
-            error: palette.error,
-            warning: palette.warning,
+            error: Color32::from_rgb(255, 200, 200),
+            warning: Color32::from_rgb(255, 222, 170),
             shadow: Color32::from_black_alpha(96),
         }
     } else {
@@ -1627,16 +1628,15 @@ mod tests {
             0.2126 * linear(color.r()) + 0.7152 * linear(color.g()) + 0.0722 * linear(color.b())
         }
         fn composite_over(foreground: Color32, background: Color32) -> Color32 {
+            let [red, green, blue, alpha] = foreground.to_srgba_unmultiplied();
             let remaining_alpha = u16::from(255 - foreground.a());
             Color32::from_rgb(
-                ((u16::from(foreground.r()) * u16::from(foreground.a())
-                    + u16::from(background.r()) * remaining_alpha)
+                ((u16::from(red) * u16::from(alpha) + u16::from(background.r()) * remaining_alpha)
                     / 255) as u8,
-                ((u16::from(foreground.g()) * u16::from(foreground.a())
+                ((u16::from(green) * u16::from(alpha)
                     + u16::from(background.g()) * remaining_alpha)
                     / 255) as u8,
-                ((u16::from(foreground.b()) * u16::from(foreground.a())
-                    + u16::from(background.b()) * remaining_alpha)
+                ((u16::from(blue) * u16::from(alpha) + u16::from(background.b()) * remaining_alpha)
                     / 255) as u8,
             )
         }
@@ -1656,9 +1656,36 @@ mod tests {
                     };
                     (light + 0.05) / (dark + 0.05)
                 };
-                assert!(contrast(colors.text) >= 4.5);
-                assert!(contrast(colors.muted_text) >= 4.5);
-                assert!(contrast(colors.meter_inactive) >= 3.0);
+                assert!(
+                    contrast(colors.text) >= 4.5,
+                    "text {:?} must contrast with composited surface {:?} over {background:?}",
+                    colors.text,
+                    surface
+                );
+                assert!(
+                    contrast(colors.muted_text) >= 4.5,
+                    "muted text {:?} must contrast with composited surface {:?} over {background:?}",
+                    colors.muted_text,
+                    surface
+                );
+                assert!(
+                    contrast(colors.meter_inactive) >= 3.0,
+                    "inactive meter {:?} must contrast with composited surface {:?} over {background:?}",
+                    colors.meter_inactive,
+                    surface
+                );
+                assert!(
+                    contrast(colors.error) >= 4.5,
+                    "error text {:?} must contrast with composited surface {:?} over {background:?}",
+                    colors.error,
+                    surface
+                );
+                assert!(
+                    contrast(colors.warning) >= 4.5,
+                    "warning text {:?} must contrast with composited surface {:?} over {background:?}",
+                    colors.warning,
+                    surface
+                );
                 assert_eq!(colors.waveform.a(), 255);
                 let waveform_contrast = contrast(colors.waveform);
                 assert!(

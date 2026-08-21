@@ -74,7 +74,7 @@ impl NativeColors {
         };
         if dark_mode {
             Self {
-                surface: Argb::new(184, 56, 57, 65),
+                surface: Argb::new(184, 52, 53, 61),
                 border: Argb::new(36, 220, 229, 242),
                 inner_highlight: Argb::new(18, 255, 255, 255),
                 text: Argb::from_color(palette.text),
@@ -83,8 +83,8 @@ impl NativeColors {
                 waveform: Argb::new(255, 178, 162, 255),
                 meter_active: Argb::from_color(palette.success),
                 meter_inactive: Argb::new(255, 180, 180, 188),
-                error: Argb::from_color(palette.error),
-                warning: Argb::from_color(palette.warning),
+                error: Argb::new(255, 255, 200, 200),
+                warning: Argb::new(255, 255, 222, 170),
                 shadow: Argb::new(96, 0, 0, 0),
             }
         } else {
@@ -2068,6 +2068,87 @@ mod tests {
                     assert_ne!(
                         available, shell,
                         "started preview must add the divider and transcript at {dpi} DPI"
+                    );
+                }
+            }
+        });
+    }
+
+    fn srgb_relative_luminance(red: u8, green: u8, blue: u8) -> f32 {
+        let linearize = |channel: u8| {
+            let value = f32::from(channel) / 255.0;
+            if value <= 0.04045 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * linearize(red) + 0.7152 * linearize(green) + 0.0722 * linearize(blue)
+    }
+
+    fn contrast_ratio(foreground: Argb, background: [u8; 3]) -> f32 {
+        let foreground_luminance = srgb_relative_luminance(
+            ((foreground.0 >> 16) & 0xff) as u8,
+            ((foreground.0 >> 8) & 0xff) as u8,
+            (foreground.0 & 0xff) as u8,
+        );
+        let background_luminance =
+            srgb_relative_luminance(background[0], background[1], background[2]);
+        let lighter = foreground_luminance.max(background_luminance);
+        let darker = foreground_luminance.min(background_luminance);
+        (lighter + 0.05) / (darker + 0.05)
+    }
+
+    fn composite_premultiplied_bgra(pixel: [u8; 4], backdrop: u8) -> [u8; 3] {
+        let remaining_alpha = u16::from(255 - pixel[3]);
+        let composite = |premultiplied: u8| {
+            (u16::from(premultiplied) + u16::from(backdrop) * remaining_alpha / 255).min(255) as u8
+        };
+        [
+            composite(pixel[2]),
+            composite(pixel[1]),
+            composite(pixel[0]),
+        ]
+    }
+
+    #[test]
+    fn native_overlay_text_tokens_meet_contrast_on_actual_translucent_surfaces() {
+        with_rasterizer(|rasterizer| {
+            for dark_mode in [false, true] {
+                let width = LIVE_WIDTH as i32;
+                let height = LIVE_HEIGHT as i32;
+                let mut frame = LayeredFrame::transparent(width, height).unwrap();
+                let colors = NativeColors::for_theme(dark_mode);
+                let mut canvas = Canvas::new(rasterizer, &mut frame.pixels, width, height).unwrap();
+                draw_capsule(&mut canvas, OverlayMode::Live, 1.0, colors).unwrap();
+                drop(canvas);
+
+                let center = ((height / 2 * width + width / 2) * 4) as usize;
+                let pixel: [u8; 4] = frame.pixels[center..center + 4]
+                    .try_into()
+                    .expect("sample one premultiplied BGRA pixel");
+                assert!(pixel[3] > 0, "capsule center must be painted");
+
+                for backdrop in [0, 255] {
+                    let surface = composite_premultiplied_bgra(pixel, backdrop);
+                    for (name, token) in [
+                        ("muted text", colors.muted_text),
+                        ("error", colors.error),
+                        ("warning", colors.warning),
+                    ] {
+                        let ratio = contrast_ratio(token, surface);
+                        assert!(
+                            ratio >= 4.5,
+                            "{name} contrast {ratio:.2}:1 failed on the {} overlay over a {backdrop} backdrop; sampled surface {surface:?}",
+                            if dark_mode { "dark" } else { "light" }
+                        );
+                    }
+
+                    let brand_ratio = contrast_ratio(colors.waveform, surface);
+                    assert!(
+                        brand_ratio >= 3.0,
+                        "brand contrast {brand_ratio:.2}:1 failed on the {} overlay over a {backdrop} backdrop; sampled surface {surface:?}",
+                        if dark_mode { "dark" } else { "light" }
                     );
                 }
             }

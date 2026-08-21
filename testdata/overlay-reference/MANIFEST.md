@@ -33,10 +33,12 @@ physical center, and uses the reference-specific 16 logical-pixel right inset
 in Live mode.
 
 The dark capsule uses a neutral translucent surface compensated for the native
-shadow stack. Over the reference backdrop (approximately RGB 240/240/245), its
-center composites near RGB 89/90/97, compared with the source's approximately
-RGB 89/90/95. The slightly lighter purple mark is an accessibility-constrained
-variant that maintains at least 3:1 non-text contrast.
+shadow stack. Over the reference backdrop (approximately RGB 240/240/245), an
+unpainted center pixel composites to RGB 87/87/94; comparable source pixels are
+approximately RGB 81-85/82-86/86-90. The slightly lighter purple mark is an
+accessibility-constrained variant that maintains at least 3:1 non-text
+contrast. Native and fallback regressions also verify at least 4.5:1 for normal
+muted, error, and warning text over black and white backdrop extremes.
 
 ## Corpus
 

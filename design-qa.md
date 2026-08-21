@@ -807,12 +807,13 @@ final result: blocked
 - Elapsed time uses Segoe UI regular rather than slashed Consolas zeros. The
   transcript keeps its beginning and places any fitting ellipsis at the end,
   matching both the source and the committed-prefix product invariant.
-- The capsule center composites to approximately RGB 89/90/97 over the review
-  backdrop; the source center is approximately RGB 89/90/95. Border and top
-  highlight opacity and thickness were reduced after the first comparison to
-  remove the double-line appearance. Radius, surface height, shadow envelope,
-  logo scale, text weight, divider position, preview origin, and cancel inset
-  have no remaining P0, P1, or P2 mismatch after capsule-bound normalization.
+- An unpainted capsule-center pixel composites to RGB 87/87/94 over the review
+  backdrop; comparable source pixels are approximately RGB
+  81-85/82-86/86-90. Border and top highlight opacity and thickness were
+  reduced after the first comparison to remove the double-line appearance.
+  Radius, surface height, shadow envelope, logo scale, text weight, divider
+  position, preview origin, and cancel inset have no remaining P0, P1, or P2
+  mismatch after capsule-bound normalization.
 - The Live cancel control remains an exact 44 x 44 logical target and moved to
   a 16-point right inset. Its physical center and raster/UI Automation bounds
   remain derived from shared geometry at 96, 120, 144, and 192 DPI.
@@ -827,8 +828,14 @@ final result: blocked
 
 ## Verification and limitations
 
-- Deterministic raster, geometry, contrast, live/no-preview, Unicode fitting,
-  and AccessKit tests cover the accepted composition and exact physical bounds.
+- Deterministic raster, geometry, live/no-preview, Unicode fitting, and
+  AccessKit tests cover the accepted composition and exact physical bounds.
+  Contrast tests composite both renderers' translucent surfaces over black and
+  white backdrop extremes; the native regression samples actual premultiplied
+  output. On its limiting dark/white case, normal muted, error, and warning
+  text measure at least 4.5:1 and the Scribe mark measures at least 3:1.
+- The tracked fixture corpus and both comparison images were regenerated after
+  the final surface/contrast adjustment and reviewed together on 2026-08-20.
 - The comparison image is a code-rendered native layered-raster composite, not
   a Windows.Graphics.Capture frame. It is valid same-state Product Design
   evidence because the renderer bytes, alpha composition, control placement,
