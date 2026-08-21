@@ -278,8 +278,8 @@ impl Default for GeneralSettings {
 impl Default for RecordingSettings {
     fn default() -> Self {
         Self {
-            hotkey: "Ctrl+Shift+Space".to_owned(),
-            hotkey_mode: HotkeyMode::Toggle,
+            hotkey: "Ctrl+Space".to_owned(),
+            hotkey_mode: HotkeyMode::HoldToTalk,
             audio_input_device_name: None,
             max_recording_seconds: 30,
             vad_enabled: true,

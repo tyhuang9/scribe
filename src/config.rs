@@ -1310,7 +1310,8 @@ mod tests {
         assert!(config.general.close_to_tray);
         assert!(config.output.auto_insert_transcript);
         assert!(config.output.restore_clipboard_after_insert);
-        assert_eq!(config.recording.hotkey_mode, HotkeyMode::Toggle);
+        assert_eq!(config.recording.hotkey, "Ctrl+Shift+Space");
+        assert_eq!(config.recording.hotkey_mode, HotkeyMode::HoldToTalk);
         assert_eq!(config.output.paste_delay_ms, 75);
         assert_eq!(config.general.theme_mode, ThemeMode::Light);
         assert_eq!(
