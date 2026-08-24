@@ -181,11 +181,14 @@ pub(super) fn is_cancellable(state: &OverlayViewState) -> bool {
 /// A compact, visual status affordance for lifecycle work. It intentionally
 /// stays textual so the native GDI+ and egui renderers share the same copy.
 /// Screen readers use `status_text` without the decorative glyph.
-pub(super) fn phase_status_label(phase: OverlayPhase) -> String {
+pub(super) fn phase_status_label_with_motion(
+    phase: OverlayPhase,
+    progress_animation_enabled: bool,
+) -> String {
     if !phase.is_progressing() {
         return phase.status_text().to_owned();
     }
-    let glyph = if overlay_animations_enabled() {
+    let glyph = if progress_animation_enabled && overlay_animations_enabled() {
         let elapsed = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -410,8 +413,13 @@ fn render_overlay(context: &egui::Context, state: &OverlayViewState) {
                     .inner_margin(egui::Margin::symmetric(14.0, 8.0))
                     .show(ui, |ui| {
                         let available = ui.available_size();
+                        let control_reserved_width = if is_cancellable(state) {
+                            reserved_control_width()
+                        } else {
+                            CAPSULE_HORIZONTAL_INSET
+                        };
                         let content_size = egui::vec2(
-                            (available.x - reserved_control_width()).max(1.0),
+                            (available.x - control_reserved_width).max(1.0),
                             available.y,
                         );
                         ui.allocate_ui_with_layout(
@@ -457,7 +465,10 @@ fn render_compact_status_row(ui: &mut egui::Ui, state: &OverlayViewState, colors
                 colors.muted_text,
             )
         } else {
-            (phase_status_label(state.phase), colors.muted_text)
+            (
+                phase_status_label_with_motion(state.phase, state.progress_animation_enabled),
+                colors.muted_text,
+            )
         };
         let response = ui.label(RichText::new(label).size(13.0).color(color));
         ui.ctx().accesskit_node_builder(response.id, |builder| {
@@ -594,7 +605,7 @@ fn live_preview_layout(
     if !state.phase.shows_live_transcript() {
         return message_layout_for_rows(
             ui,
-            &phase_status_label(state.phase),
+            &phase_status_label_with_motion(state.phase, state.progress_animation_enabled),
             colors.muted_text,
             max_width,
             LIVE_PREVIEW_ROWS,
@@ -908,9 +919,22 @@ mod tests {
 
     #[test]
     fn progress_status_labels_include_the_lifecycle_copy() {
-        assert!(phase_status_label(OverlayPhase::Processing).ends_with("Transcribing…"));
-        assert!(phase_status_label(OverlayPhase::Finalizing).ends_with("Finishing recording…"));
-        assert_eq!(phase_status_label(OverlayPhase::Success), "Done");
+        assert!(
+            phase_status_label_with_motion(OverlayPhase::Processing, true)
+                .ends_with("Transcribing…")
+        );
+        assert!(
+            phase_status_label_with_motion(OverlayPhase::Finalizing, true)
+                .ends_with("Finishing recording…")
+        );
+        assert_eq!(
+            phase_status_label_with_motion(OverlayPhase::Success, true),
+            "Done"
+        );
+        assert_eq!(
+            phase_status_label_with_motion(OverlayPhase::Processing, false),
+            "○ Transcribing…"
+        );
     }
 
     #[test]
@@ -1191,6 +1215,7 @@ mod tests {
             context.enable_accesskit();
             let width = 300.0;
             let state = OverlayViewState {
+                session_id: Some(SessionId(11)),
                 mode: OverlayMode::Live,
                 phase: OverlayPhase::Listening,
                 live_preview_available: true,

@@ -25962,6 +25962,10 @@ mod layout_tests {
             app.overlay_controller
                 .set_live_preview_available(session_id, true)
         );
+        assert!(
+            app.overlay_controller
+                .set_phase(session_id, OverlayPhase::Listening)
+        );
 
         let event =
             |sequence, model_id: ModelId, committed: &str, tentative: &str| PreviewEvent::Update {
@@ -26011,6 +26015,10 @@ mod layout_tests {
         assert!(
             app.overlay_controller
                 .set_live_preview_available(session_id, true)
+        );
+        assert!(
+            app.overlay_controller
+                .set_phase(session_id, OverlayPhase::Listening)
         );
         app.apply_rolling_preview_event(PreviewEvent::Update {
             identity: StreamIdentity {

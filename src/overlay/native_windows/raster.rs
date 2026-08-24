@@ -23,7 +23,9 @@ use super::{
     super::{
         controller::{OverlayMode, OverlayPhase, OverlayRecovery, OverlayViewState},
         platform::OverlayWindowBounds,
-        view::{CONTROL_SIZE, LIVE_HEIGHT, LIVE_WIDTH, MINIMAL_WIDTH, phase_status_label},
+        view::{
+            CONTROL_SIZE, LIVE_HEIGHT, LIVE_WIDTH, MINIMAL_WIDTH, phase_status_label_with_motion,
+        },
     },
     layout::DisplayLayout,
 };
@@ -586,6 +588,11 @@ fn draw_compact_status(
     colors: NativeColors,
 ) -> Result<(), RasterError> {
     let scale = layout.scale;
+    let status_bounds = if state.phase == OverlayPhase::Listening {
+        layout.elapsed
+    } else {
+        layout.lifecycle_status
+    };
     let (label, color) = if state.error.is_some() || state.phase == OverlayPhase::Error {
         ("Error".to_owned(), colors.error)
     } else if state.notice.is_some() {
@@ -595,22 +602,17 @@ fn draw_compact_status(
             format_elapsed(state.elapsed.unwrap_or_default()),
             colors.muted_text,
         )
-    } else if state.phase_announcement.is_some() {
-        (phase_status_label(state.phase), colors.muted_text)
     } else {
-        // Immutable reference fixtures construct display-only states without
-        // the controller's transition token. Preserve their historical timer
-        // contract; real lifecycle transitions always carry that token.
         (
-            format_elapsed(state.elapsed.unwrap_or_default()),
+            phase_status_label_with_motion(state.phase, state.progress_animation_enabled),
             colors.muted_text,
         )
     };
     canvas.draw_text_centered_in_rect(
         &label,
-        layout.elapsed.x0,
-        layout.elapsed.width(),
-        layout.elapsed,
+        status_bounds.x0,
+        status_bounds.width(),
+        status_bounds,
         13.0 * scale,
         TextStyle::Regular,
         color,
@@ -631,7 +633,10 @@ fn live_line(state: &OverlayViewState, colors: NativeColors) -> StyledLine {
         return StyledLine::plain(notice, colors.warning);
     }
     if !state.phase.shows_live_transcript() {
-        return StyledLine::plain(phase_status_label(state.phase), colors.muted_text);
+        return StyledLine::plain(
+            phase_status_label_with_motion(state.phase, state.progress_animation_enabled),
+            colors.muted_text,
+        );
     }
     let committed = &state.transcript.committed;
     let tentative = &state.transcript.tentative;
@@ -1576,9 +1581,114 @@ mod tests {
                     session_id: Some(SessionId(44)),
                     mode: OverlayMode::Minimal,
                     phase: OverlayPhase::Finalizing,
+                    elapsed: Some(Duration::from_secs(12)),
+                    phase_announcement: Some("Finishing recording…".to_owned()),
+                    progress_animation_enabled: false,
                     ..OverlayViewState::default()
                 },
                 MINIMAL_WIDTH as i32,
+                LIVE_HEIGHT as i32,
+            ),
+            (
+                "compact-processing",
+                OverlayViewState {
+                    session_id: Some(SessionId(47)),
+                    mode: OverlayMode::Minimal,
+                    phase: OverlayPhase::Processing,
+                    elapsed: Some(Duration::from_secs(12)),
+                    phase_announcement: Some("Transcribing…".to_owned()),
+                    progress_animation_enabled: false,
+                    ..OverlayViewState::default()
+                },
+                MINIMAL_WIDTH as i32,
+                LIVE_HEIGHT as i32,
+            ),
+            (
+                "compact-pasting",
+                OverlayViewState {
+                    session_id: Some(SessionId(48)),
+                    mode: OverlayMode::Minimal,
+                    phase: OverlayPhase::Pasting,
+                    elapsed: Some(Duration::from_secs(12)),
+                    phase_announcement: Some("Pasting…".to_owned()),
+                    progress_animation_enabled: false,
+                    ..OverlayViewState::default()
+                },
+                MINIMAL_WIDTH as i32,
+                LIVE_HEIGHT as i32,
+            ),
+            (
+                "compact-success",
+                OverlayViewState {
+                    session_id: Some(SessionId(49)),
+                    mode: OverlayMode::Minimal,
+                    phase: OverlayPhase::Success,
+                    elapsed: Some(Duration::from_secs(12)),
+                    phase_announcement: Some("Done".to_owned()),
+                    progress_animation_enabled: false,
+                    ..OverlayViewState::default()
+                },
+                MINIMAL_WIDTH as i32,
+                LIVE_HEIGHT as i32,
+            ),
+            (
+                "live-finalizing",
+                OverlayViewState {
+                    session_id: Some(SessionId(50)),
+                    mode: OverlayMode::Live,
+                    phase: OverlayPhase::Finalizing,
+                    live_preview_available: true,
+                    elapsed: Some(Duration::from_secs(12)),
+                    phase_announcement: Some("Finishing recording…".to_owned()),
+                    progress_animation_enabled: false,
+                    ..OverlayViewState::default()
+                },
+                LIVE_WIDTH as i32,
+                LIVE_HEIGHT as i32,
+            ),
+            (
+                "live-processing",
+                OverlayViewState {
+                    session_id: Some(SessionId(51)),
+                    mode: OverlayMode::Live,
+                    phase: OverlayPhase::Processing,
+                    live_preview_available: true,
+                    elapsed: Some(Duration::from_secs(12)),
+                    phase_announcement: Some("Transcribing…".to_owned()),
+                    progress_animation_enabled: false,
+                    ..OverlayViewState::default()
+                },
+                LIVE_WIDTH as i32,
+                LIVE_HEIGHT as i32,
+            ),
+            (
+                "live-pasting",
+                OverlayViewState {
+                    session_id: Some(SessionId(52)),
+                    mode: OverlayMode::Live,
+                    phase: OverlayPhase::Pasting,
+                    live_preview_available: true,
+                    elapsed: Some(Duration::from_secs(12)),
+                    phase_announcement: Some("Pasting…".to_owned()),
+                    progress_animation_enabled: false,
+                    ..OverlayViewState::default()
+                },
+                LIVE_WIDTH as i32,
+                LIVE_HEIGHT as i32,
+            ),
+            (
+                "live-success",
+                OverlayViewState {
+                    session_id: Some(SessionId(53)),
+                    mode: OverlayMode::Live,
+                    phase: OverlayPhase::Success,
+                    live_preview_available: true,
+                    elapsed: Some(Duration::from_secs(12)),
+                    phase_announcement: Some("Done".to_owned()),
+                    progress_animation_enabled: false,
+                    ..OverlayViewState::default()
+                },
+                LIVE_WIDTH as i32,
                 LIVE_HEIGHT as i32,
             ),
             (
@@ -2519,6 +2629,7 @@ mod tests {
                     PreviewInput::TranscriptShort => {
                         let original = PARITY_GRAPHEMES.to_owned();
                         let state = OverlayViewState {
+                            phase: OverlayPhase::Listening,
                             transcript: super::super::super::controller::OverlayTranscript {
                                 committed: original.clone(),
                                 ..Default::default()
@@ -2533,6 +2644,7 @@ mod tests {
                     PreviewInput::TranscriptOverflow => {
                         let original = format!("{exact_text}{PARITY_GRAPHEMES}");
                         let state = OverlayViewState {
+                            phase: OverlayPhase::Listening,
                             transcript: super::super::super::controller::OverlayTranscript {
                                 committed: original.clone(),
                                 ..Default::default()
@@ -2603,6 +2715,7 @@ mod tests {
     fn transcript_composition_preserves_punctuation_binding() {
         let colors = NativeColors::for_theme(true);
         let state = OverlayViewState {
+            phase: OverlayPhase::Listening,
             transcript: super::super::super::controller::OverlayTranscript {
                 committed: "Hello".to_owned(),
                 tentative: ", world".to_owned(),

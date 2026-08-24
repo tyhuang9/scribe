@@ -145,6 +145,9 @@ pub struct OverlayViewState {
     pub notice: Option<String>,
     pub error: Option<OverlayError>,
     pub elapsed: Option<Duration>,
+    /// Lets a rendering host request a static progress indicator. The Windows
+    /// setting remains authoritative when this is true.
+    pub progress_animation_enabled: bool,
 }
 
 impl Default for OverlayViewState {
@@ -161,6 +164,7 @@ impl Default for OverlayViewState {
             notice: None,
             error: None,
             elapsed: None,
+            progress_animation_enabled: true,
         }
     }
 }
@@ -409,6 +413,7 @@ mod tests {
         let mut controller = OverlayController::new();
         controller.begin_session(SessionId(7), OverlayMode::Live);
         assert!(controller.set_live_preview_available(SessionId(7), true));
+        assert!(controller.set_phase(SessionId(7), OverlayPhase::Listening));
         assert!(controller.update_transcript(SessionId(7), "stable", " draft", 1));
 
         assert!(controller.show_preview_unavailable(
@@ -446,6 +451,7 @@ mod tests {
         let mut controller = OverlayController::new();
         controller.begin_session(SessionId(7), OverlayMode::Live);
         assert!(controller.set_live_preview_available(SessionId(7), true));
+        assert!(controller.set_phase(SessionId(7), OverlayPhase::Listening));
 
         assert!(!controller.update_transcript(SessionId(6), "old", "", 1));
         assert!(controller.update_transcript(SessionId(7), "hello", " wor", 2));
@@ -458,6 +464,7 @@ mod tests {
         let mut controller = OverlayController::new();
         controller.begin_session(SessionId(7), OverlayMode::Live);
         assert!(controller.set_live_preview_available(SessionId(7), true));
+        assert!(controller.set_phase(SessionId(7), OverlayPhase::Listening));
         assert!(controller.update_transcript(SessionId(7), "hello", " wor", 41));
 
         assert!(controller.replace_with_final(SessionId(7), "Hello world."));
@@ -476,6 +483,7 @@ mod tests {
         let mut controller = OverlayController::new();
         controller.begin_session(SessionId(7), OverlayMode::Live);
         assert!(controller.set_live_preview_available(SessionId(7), true));
+        assert!(controller.set_phase(SessionId(7), OverlayPhase::Listening));
 
         assert!(controller.update_transcript(SessionId(7), "hello", " world", 1));
         assert_eq!(
@@ -496,6 +504,7 @@ mod tests {
         let mut controller = OverlayController::new();
         controller.begin_session(SessionId(7), OverlayMode::Live);
         assert!(controller.set_live_preview_available(SessionId(7), true));
+        assert!(controller.set_phase(SessionId(7), OverlayPhase::Listening));
         controller.update_transcript(SessionId(7), "stable", " stale", 1);
 
         assert!(controller.show_preview_unavailable(
@@ -518,6 +527,7 @@ mod tests {
         let mut controller = OverlayController::new();
         controller.begin_session(SessionId(7), OverlayMode::Live);
         assert!(controller.set_live_preview_available(SessionId(7), true));
+        assert!(controller.set_phase(SessionId(7), OverlayPhase::Listening));
         assert!(controller.update_transcript(SessionId(7), "stable", " stale", 1));
 
         for (phase, expected) in [
@@ -561,6 +571,7 @@ mod tests {
         let mut controller = OverlayController::new();
         controller.begin_session(SessionId(7), OverlayMode::Live);
         assert!(controller.set_live_preview_available(SessionId(7), true));
+        assert!(controller.set_phase(SessionId(7), OverlayPhase::Listening));
         controller.update_transcript(SessionId(7), "stable", " draft", 1);
         assert!(controller.state().transcript_announcement.is_some());
 

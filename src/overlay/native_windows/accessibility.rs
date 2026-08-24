@@ -221,7 +221,13 @@ fn display_tree(
                 elapsed.set_live(Live::Polite);
             }
         }
-        elapsed.set_bounds(accesskit_rect(layout.elapsed));
+        let elapsed_bounds =
+            if state.mode == OverlayMode::Minimal && state.phase != OverlayPhase::Listening {
+                layout.lifecycle_status
+            } else {
+                layout.elapsed
+            };
+        elapsed.set_bounds(accesskit_rect(elapsed_bounds));
         nodes.push((DISPLAY_ELAPSED_ID, elapsed.build(&mut classes)));
     }
     if preview_visible {
@@ -547,6 +553,25 @@ mod tests {
     }
 
     #[test]
+    fn compact_lifecycle_status_uses_the_same_extended_bounds_as_the_raster() {
+        let state = OverlayViewState {
+            mode: OverlayMode::Minimal,
+            phase: OverlayPhase::Processing,
+            phase_announcement: Some("Transcribing…".to_owned()),
+            ..OverlayViewState::default()
+        };
+        let bounds = display_bounds(OverlayMode::Minimal);
+        let layout = DisplayLayout::from_bounds(OverlayMode::Minimal, bounds).unwrap();
+        let tree = display_tree(&state, true, Some(bounds));
+
+        assert!(tree.nodes.iter().any(|(id, node)| {
+            *id == DISPLAY_ELAPSED_ID
+                && node.name() == Some("Transcribing…")
+                && node.bounds() == Some(accesskit_rect(layout.lifecycle_status))
+        }));
+    }
+
+    #[test]
     fn visible_live_nodes_use_current_physical_layout_bounds() {
         let state = OverlayViewState {
             mode: OverlayMode::Live,
@@ -620,7 +645,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_error_and_notice_use_the_timer_bounds_as_the_only_polite_status() {
+    fn compact_error_uses_the_lifecycle_bounds_while_notice_keeps_the_timer_bounds() {
         let cases = [
             (
                 OverlayViewState {
@@ -657,7 +682,12 @@ mod tests {
             assert_eq!(live.len(), 1);
             assert_eq!(live[0].0, DISPLAY_ELAPSED_ID);
             assert_eq!(live[0].1.name(), Some(expected));
-            assert_eq!(live[0].1.bounds(), Some(accesskit_rect(layout.elapsed)));
+            let expected_bounds = if state.phase == OverlayPhase::Listening {
+                layout.elapsed
+            } else {
+                layout.lifecycle_status
+            };
+            assert_eq!(live[0].1.bounds(), Some(accesskit_rect(expected_bounds)));
             assert!(
                 tree.nodes
                     .iter()
