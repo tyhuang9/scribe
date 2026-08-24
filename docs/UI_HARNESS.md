@@ -176,7 +176,7 @@ fixture below remains a larger deterministic reference viewport; use the
   and 26% lifecycle. The fixed 44 x 44 disclosure target lives inside the
   lifecycle zone. Below 620 px, identity content stacks above metrics,
   features, lifecycle, and disclosure controls. The native shell
-  has a 960 × 680 minimum; 375 px component behavior is deterministic-test
+  has an 840 × 500 minimum; 375 px component behavior is deterministic-test
   coverage only.
 - Expanded details grow inside the same card surface and preserve the collapsed
   card's left and right edges. A one-line description retains the summary's
