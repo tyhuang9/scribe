@@ -3829,8 +3829,9 @@ fn render_unified_model_card(
     let lifecycle = model_lifecycle_controls(card, can_replace_active);
     let show_collapsed_remote_provenance = !expanded
         && matches!(card, ModelCard::Remote(_, _))
-        && lifecycle.primary.enabled
-        && matches!(lifecycle.primary.label.as_str(), "Install" | "Resume");
+        && lifecycle.primary.as_ref().is_some_and(|primary| {
+            primary.enabled && matches!(primary.label.as_str(), "Install" | "Resume")
+        });
     let title_selects_model =
         matches!(card, ModelCard::Local(model) if model.installed && model.ready && !model.active);
     let activation_id = ui.make_persistent_id(("select-model-card", card_key.clone()));
