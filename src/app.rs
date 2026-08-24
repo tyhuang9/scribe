@@ -24375,7 +24375,7 @@ mod layout_tests {
         ctx.set_visuals(stitch_visuals(ThemeMode::Light));
         let mut app = test_app();
         app.current_tab = Tab::General;
-        app.settings_tab = SettingsTab::Advanced;
+        app.settings_tab = SettingsTab::Recording;
         app.playing_history_id = Some(1);
 
         let output = ctx.run(
