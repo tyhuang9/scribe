@@ -2181,6 +2181,162 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn every_main_window_route_reflows_inside_the_840_by_500_minimum_viewport() {
+        const WIDTH: f32 = 840.0;
+        const HEIGHT: f32 = 500.0;
+
+        // This is the production shell path: navigation and the central route
+        // scroll area render together. The legacy Output route aliases General,
+        // while About is a Settings tab rather than a standalone main window.
+        for (label, fixture, page, route, heading, visible_content, scrolls_vertically) in [
+            (
+                "Transcribe",
+                Fixture::TranscribeReady,
+                AppPage::Transcribe,
+                UiRoute::Transcribe,
+                "Transcribe",
+                "Start recording",
+                true,
+            ),
+            (
+                "Models",
+                Fixture::ModelsInstalled,
+                AppPage::Models,
+                UiRoute::Models,
+                "Models",
+                "Search models",
+                true,
+            ),
+            (
+                "Settings / General",
+                Fixture::SettingsRecording,
+                AppPage::General,
+                UiRoute::Settings(SettingsTab::General),
+                "Settings",
+                "General settings",
+                true,
+            ),
+            (
+                "Settings / Recording",
+                Fixture::SettingsRecording,
+                AppPage::General,
+                UiRoute::Settings(SettingsTab::Recording),
+                "Settings",
+                "Recording behavior",
+                true,
+            ),
+            (
+                "Settings / Advanced",
+                Fixture::SettingsRecording,
+                AppPage::General,
+                UiRoute::Settings(SettingsTab::Advanced),
+                "Settings",
+                "Voice detection",
+                true,
+            ),
+            (
+                "Settings / About",
+                Fixture::SettingsRecording,
+                AppPage::General,
+                UiRoute::Settings(SettingsTab::About),
+                "Settings",
+                "Application",
+                false,
+            ),
+            (
+                "History",
+                Fixture::History,
+                AppPage::History,
+                UiRoute::History,
+                "History",
+                "Local dictation history remains available in production.",
+                false,
+            ),
+        ] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            configure_accessible_style(&ctx);
+            let mut data = fixture.data();
+            data.route = route;
+            let mut page = page;
+
+            let (output, action) =
+                render_with_input(&ctx, &mut data, &mut page, WIDTH, HEIGHT, Vec::new());
+            assert_eq!(action, ScreenAction::None, "{label} must render passively");
+            assert_eq!(
+                harness_route(page, data.route),
+                route,
+                "{label} must keep its route while it reflows"
+            );
+
+            let (_, offset, content_size, viewport) = ctx
+                .data(|data| {
+                    data.get_temp::<(egui::Id, egui::Vec2, egui::Vec2, egui::Rect)>(egui::Id::new(
+                        "route-scroll-diagnostics",
+                    ))
+                })
+                .expect("the central route scroll area must report diagnostics");
+            assert!(
+                viewport.left() >= -LAYOUT_TOLERANCE as f32
+                    && viewport.right() <= WIDTH + LAYOUT_TOLERANCE as f32
+                    && viewport.top() >= -LAYOUT_TOLERANCE as f32
+                    && viewport.bottom() <= HEIGHT + LAYOUT_TOLERANCE as f32,
+                "{label} route viewport escaped the {WIDTH}x{HEIGHT} shell: {viewport:?}"
+            );
+            assert!(
+                content_size.x <= viewport.width() + LAYOUT_TOLERANCE as f32,
+                "{label} created horizontal overflow: content={content_size:?}, viewport={viewport:?}"
+            );
+            assert!(
+                offset.x.abs() <= LAYOUT_TOLERANCE as f32,
+                "{label} must remain on the vertical-only route scroll axis: offset={offset:?}"
+            );
+            let has_vertical_overflow =
+                content_size.y > viewport.height() + LAYOUT_TOLERANCE as f32;
+            assert_eq!(
+                has_vertical_overflow,
+                scrolls_vertically,
+                "{label} must {} at the minimum viewport: content={content_size:?}, viewport={viewport:?}",
+                if scrolls_vertically {
+                    "use the central vertical scroll area"
+                } else {
+                    "reflow without unnecessary vertical scrolling"
+                }
+            );
+
+            assert!(
+                output.shapes.iter().all(|shape| {
+                    shape.clip_rect.min.x >= -LAYOUT_TOLERANCE as f32
+                        && shape.clip_rect.max.x <= WIDTH + LAYOUT_TOLERANCE as f32
+                        && shape.clip_rect.min.y >= -LAYOUT_TOLERANCE as f32
+                        && shape.clip_rect.max.y <= HEIGHT + LAYOUT_TOLERANCE as f32
+                }),
+                "{label} emitted paint clipping outside the {WIDTH}x{HEIGHT} shell"
+            );
+
+            let heading_bounds = node_matching(&output, |node| {
+                node.role() == egui::accesskit::Role::Heading && node.name() == Some(heading)
+            })
+            .bounds()
+            .expect("route heading must expose AccessKit bounds");
+            let viewport_bounds = egui::accesskit::Rect {
+                x0: viewport.left().into(),
+                y0: viewport.top().into(),
+                x1: viewport.right().into(),
+                y1: viewport.bottom().into(),
+            };
+            assert_bounds_within(heading_bounds, viewport_bounds, &format!("{label} heading"));
+            assert!(
+                node_names(&output)
+                    .iter()
+                    .any(|name| name == visible_content),
+                "{label} must expose visible reference content {visible_content:?} through AccessKit"
+            );
+        }
+    }
+
     #[test]
     fn every_fixture_exposes_its_visible_reference_content() {
         for (fixture, expected) in [
