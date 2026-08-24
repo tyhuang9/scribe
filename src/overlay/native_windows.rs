@@ -4,9 +4,7 @@ mod raster;
 
 use std::{
     cell::{Cell, RefCell},
-    collections::hash_map::DefaultHasher,
     ffi::c_void,
-    hash::{Hash, Hasher},
     mem::{offset_of, size_of, zeroed},
     panic::{AssertUnwindSafe, catch_unwind},
     ptr::{null, null_mut},
@@ -160,13 +158,32 @@ enum NativeOverlayEvent {
 struct NativeEventSink {
     tx: Sender<NativeOverlayEvent>,
     repaint_context: eframe::egui::Context,
+    presentation: Arc<Mutex<NativePresentationObservation>>,
 }
 
 impl NativeEventSink {
     fn emit(&self, event: NativeOverlayEvent) {
+        if let NativeOverlayEvent::Presented {
+            visible,
+            session_id,
+        } = &event
+        {
+            let mut presentation = self
+                .presentation
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            presentation.visible = *visible;
+            presentation.session_id = visible.then_some(*session_id).flatten();
+        }
         let _ = self.tx.try_send(event);
         self.repaint_context.request_repaint();
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct NativePresentationObservation {
+    visible: bool,
+    session_id: Option<SessionId>,
 }
 
 #[derive(Clone, Debug)]
@@ -199,7 +216,7 @@ impl OverlaySnapshot {
             mode: self.state.mode,
             phase: self.state.phase,
             transcript_revision: self.state.transcript.revision,
-            content_digest: overlay_content_digest(&self.state),
+            content: OverlayRenderContent::from(&self.state),
             rms_bucket: quantized_level(self.state.audio_level.rms),
             peak_bucket: quantized_level(self.state.audio_level.peak),
             elapsed_second: self.state.elapsed.map_or(0, |elapsed| elapsed.as_secs()),
@@ -219,7 +236,7 @@ struct OverlayRenderKey {
     mode: super::controller::OverlayMode,
     phase: super::controller::OverlayPhase,
     transcript_revision: u64,
-    content_digest: u64,
+    content: OverlayRenderContent,
     rms_bucket: u8,
     peak_bucket: u8,
     elapsed_second: u64,
@@ -231,24 +248,32 @@ struct OverlayRenderKey {
     animation_frame: u8,
 }
 
-fn overlay_content_digest(state: &OverlayViewState) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    state.transcript.committed.hash(&mut hasher);
-    state.transcript.tentative.hash(&mut hasher);
-    state.phase_announcement.hash(&mut hasher);
-    state.transcript_announcement.hash(&mut hasher);
-    state.notice.hash(&mut hasher);
-    if let Some(error) = &state.error {
-        error.message.hash(&mut hasher);
-        match error.recovery {
-            super::controller::OverlayRecovery::None => 0_u8,
-            super::controller::OverlayRecovery::Retry => 1_u8,
-            super::controller::OverlayRecovery::WaitForPreview => 2_u8,
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OverlayRenderContent {
+    committed: String,
+    tentative: String,
+    phase_announcement: Option<String>,
+    transcript_announcement: Option<String>,
+    notice: Option<String>,
+    error: Option<(String, super::controller::OverlayRecovery)>,
+    live_preview_available: bool,
+}
+
+impl From<&OverlayViewState> for OverlayRenderContent {
+    fn from(state: &OverlayViewState) -> Self {
+        Self {
+            committed: state.transcript.committed.clone(),
+            tentative: state.transcript.tentative.clone(),
+            phase_announcement: state.phase_announcement.clone(),
+            transcript_announcement: state.transcript_announcement.clone(),
+            notice: state.notice.clone(),
+            error: state
+                .error
+                .as_ref()
+                .map(|error| (error.message.clone(), error.recovery)),
+            live_preview_available: state.live_preview_available,
         }
-        .hash(&mut hasher);
     }
-    state.live_preview_available.hash(&mut hasher);
-    hasher.finish()
 }
 
 fn quantized_level(level: f32) -> u8 {
@@ -1351,8 +1376,7 @@ struct NativeOverlayService {
     mailbox: Arc<SnapshotMailbox>,
     events: Receiver<NativeOverlayEvent>,
     worker: Option<JoinHandle<()>>,
-    presented: bool,
-    presented_session: Option<SessionId>,
+    presentation: Arc<Mutex<NativePresentationObservation>>,
     pending_action: Option<OverlayAction>,
     last_reported_failure: Option<NativeOverlayFailure>,
 }
@@ -1364,9 +1388,11 @@ impl NativeOverlayService {
             shutdown: AtomicBool::new(false),
         });
         let (event_tx, events) = bounded(OVERLAY_EVENT_CAPACITY);
+        let presentation = Arc::new(Mutex::new(NativePresentationObservation::default()));
         let event_sink = NativeEventSink {
             tx: event_tx,
             repaint_context: context.clone(),
+            presentation: Arc::clone(&presentation),
         };
         let worker_mailbox = Arc::clone(&mailbox);
         let panic_sink = event_sink.clone();
@@ -1394,17 +1420,18 @@ impl NativeOverlayService {
             mailbox,
             events,
             worker: Some(worker),
-            presented: false,
-            presented_session: None,
+            presentation,
             pending_action: None,
             last_reported_failure: None,
         })
     }
 
     fn submit(&self, snapshot: OverlaySnapshot) {
-        if let Ok(mut latest) = self.mailbox.latest.lock() {
-            *latest = Some(snapshot);
-        }
+        *self
+            .mailbox
+            .latest
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(snapshot);
         if let Some(worker) = &self.worker {
             worker.thread().unpark();
         }
@@ -1415,10 +1442,8 @@ impl NativeOverlayService {
             match event {
                 NativeOverlayEvent::Presented {
                     visible,
-                    session_id,
+                    session_id: _,
                 } => {
-                    self.presented = visible;
-                    self.presented_session = visible.then_some(session_id).flatten();
                     if visible {
                         self.last_reported_failure = None;
                     }
@@ -1440,10 +1465,14 @@ impl NativeOverlayService {
 
     fn output_for(&mut self, snapshot: &OverlaySnapshot) -> OverlayViewportOutput {
         self.poll_events();
+        let presentation = *self
+            .presentation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let presented = snapshot.requested_visible
-            && self.presented
+            && presentation.visible
             && (snapshot.state.session_id.is_none()
-                || self.presented_session == snapshot.state.session_id);
+                || presentation.session_id == snapshot.state.session_id);
         OverlayViewportOutput {
             presented,
             action: self.pending_action.take(),
@@ -1456,8 +1485,11 @@ impl NativeOverlayService {
             worker.thread().unpark();
             let _ = worker.join();
         }
-        self.presented = false;
-        self.presented_session = None;
+        *self
+            .presentation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            NativePresentationObservation::default();
     }
 }
 
@@ -1481,8 +1513,8 @@ fn run_native_overlay_thread(mailbox: Arc<SnapshotMailbox>, event_sink: NativeEv
         let next_snapshot = mailbox
             .latest
             .lock()
-            .ok()
-            .and_then(|mut latest| latest.take());
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
         if let Some(snapshot) = next_snapshot {
             current_snapshot = Some(snapshot);
             process_snapshot(
@@ -2011,6 +2043,7 @@ mod tests {
             event_sink: NativeEventSink {
                 tx,
                 repaint_context: eframe::egui::Context::default(),
+                presentation: Arc::new(Mutex::new(NativePresentationObservation::default())),
             },
         });
         let state = WindowProcedureState {
@@ -2080,6 +2113,7 @@ mod tests {
             event_sink: NativeEventSink {
                 tx,
                 repaint_context: eframe::egui::Context::default(),
+                presentation: Arc::new(Mutex::new(NativePresentationObservation::default())),
             },
         };
         bridge.emit_abandon();
