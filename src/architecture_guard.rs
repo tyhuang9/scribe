@@ -591,7 +591,7 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
     for required in [
         "Release payload differs from its explicit inventory",
         "/VERYSILENT",
-        "Assert-Bundle $installedRoot",
+        "Assert-Bundle -Root $installedRoot -AllowedAdditionalFiles $InnoSetupUninstallerArtifacts",
     ] {
         assert!(
             package_verifier.contains(required),
