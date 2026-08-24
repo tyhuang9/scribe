@@ -48,6 +48,9 @@ jobs:
         run: |
           & .\scripts\prepare-windows-release-inputs.ps1 -OutputDirectory .ci-release-inputs
 
+      - name: Fetch locked Rust dependencies
+        run: cargo fetch --locked
+
       - name: Build validated portable package
         shell: pwsh
         run: |
