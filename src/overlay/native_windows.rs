@@ -153,7 +153,6 @@ enum NativeOverlayEvent {
         visible: bool,
         session_id: Option<SessionId>,
     },
-    Action(OverlayAction),
     Failure(NativeOverlayFailure),
 }
 
@@ -179,13 +178,15 @@ impl NativeEventSink {
             presentation.visible = *visible;
             presentation.session_id = visible.then_some(*session_id).flatten();
         }
-        if let NativeOverlayEvent::Action(action) = &event {
-            *self
-                .retained_action
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(*action);
-        }
         let _ = self.tx.try_send(event);
+        self.repaint_context.request_repaint();
+    }
+
+    fn emit_action(&self, action: OverlayAction) {
+        *self
+            .retained_action
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(action);
         self.repaint_context.request_repaint();
     }
 }
@@ -400,9 +401,7 @@ impl ControlActionBridge {
         let session_id = self.session_id.lock().ok().and_then(|current| *current);
         if let Some(session_id) = session_id {
             self.event_sink
-                .emit(NativeOverlayEvent::Action(OverlayAction::Abandon(
-                    session_id,
-                )));
+                .emit_action(OverlayAction::Abandon(session_id));
         }
     }
 }
@@ -1527,7 +1526,6 @@ impl NativeOverlayService {
                         self.last_reported_failure = None;
                     }
                 }
-                NativeOverlayEvent::Action(action) => self.pending_action = Some(action),
                 NativeOverlayEvent::Failure(failure) => {
                     if self.last_reported_failure != Some(failure) {
                         eprintln!(
@@ -2074,15 +2072,15 @@ mod tests {
 
         bridge.bind(Some(SessionId(41)));
         bridge.emit_abandon();
-        assert!(matches!(
-            rx.try_recv(),
-            Ok(NativeOverlayEvent::Action(OverlayAction::Abandon(
-                SessionId(41)
-            )))
-        ));
+        assert_eq!(
+            retained_action.lock().unwrap().take(),
+            Some(OverlayAction::Abandon(SessionId(41)))
+        );
+        assert!(rx.try_recv().is_err());
 
         bridge.bind(None);
         bridge.emit_abandon();
+        assert!(retained_action.lock().unwrap().is_none());
         assert!(rx.try_recv().is_err());
     }
 
@@ -2100,15 +2098,48 @@ mod tests {
             NativeOverlayFailureStage::Visibility,
             None,
         )));
-        event_sink.emit(NativeOverlayEvent::Action(OverlayAction::Abandon(
-            SessionId(52),
-        )));
+        event_sink.emit_action(OverlayAction::Abandon(SessionId(52)));
 
         assert!(matches!(rx.try_recv(), Ok(NativeOverlayEvent::Failure(_))));
         assert_eq!(
             retained_action.lock().unwrap().take(),
             Some(OverlayAction::Abandon(SessionId(52)))
         );
+    }
+
+    #[test]
+    fn action_slot_delivers_each_cancel_only_once() {
+        let (tx, events) = bounded(1);
+        let presentation = Arc::new(Mutex::new(NativePresentationObservation::default()));
+        let retained_action = Arc::new(Mutex::new(None));
+        let event_sink = NativeEventSink {
+            tx,
+            repaint_context: eframe::egui::Context::default(),
+            presentation: Arc::clone(&presentation),
+            retained_action: Arc::clone(&retained_action),
+        };
+        let mut service = NativeOverlayService {
+            mailbox: Arc::new(SnapshotMailbox {
+                latest: Mutex::new(None),
+                shutdown: AtomicBool::new(false),
+            }),
+            events,
+            worker: None,
+            presentation,
+            retained_action,
+            pending_action: None,
+            last_reported_failure: None,
+        };
+
+        event_sink.emit_action(OverlayAction::Abandon(SessionId(63)));
+        service.poll_events();
+        assert_eq!(
+            service.pending_action.take(),
+            Some(OverlayAction::Abandon(SessionId(63)))
+        );
+
+        service.poll_events();
+        assert_eq!(service.pending_action.take(), None);
     }
 
     #[test]
