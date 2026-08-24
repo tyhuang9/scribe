@@ -24,7 +24,7 @@ UninstallDisplayIcon={app}\{#AppExeName}
 WizardStyle=modern
 
 [Files]
-Source: "..\dist\portable\{#AppExeName}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\dist\portable\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExeName}"

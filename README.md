@@ -62,7 +62,7 @@ use **GitHub Actions** as its source. The default project site uses
 - A Windows, Linux, or macOS desktop session compatible with `eframe` and `global-hotkey`. Windows x64 is the primary release target; Linux and macOS retain conservative build/output fallbacks but are not release-qualified.
 - Windows source builds require the Visual Studio 2022 C++ build tools and a Windows-native CMake on `PATH`. An MSYS CMake cannot select the required Visual Studio generator.
 - A microphone visible to the host OS.
-- Normal transcription requires an installed compatible GGUF model. Its CPU runtime is statically linked in-process; no separate runtime package or sidecar process is required.
+- Normal transcription requires a compatible GGUF model. Official Windows x64 releases include the verified English Base model beside Scribe; source builds and non-Windows builds may instead require a locally installed compatible model. Its CPU runtime is statically linked in-process; no separate runtime package or sidecar process is required.
 - GPU transcription is not currently verified. An explicit GPU preference fails clearly instead of silently changing the backend.
 
 On Ubuntu, install the microphone and tray build dependencies:
@@ -292,8 +292,10 @@ and raw error chains, and refuses to overwrite an existing report.
 Windows x64 releases are published from GitHub Actions when a `v*` tag is
 created. Download `Scribe-Setup-<version>.exe` from the GitHub release for a
 normal per-user installation, or `Scribe-<version>-windows-x64.zip` for a
-portable copy. Scribe installs speech models separately from its Models page;
-models are not bundled in the installer.
+portable copy. Both packages include the pinned English Base model, its
+attribution notices, the compatible runtime files, and a hash inventory. For a
+portable install, extract the entire ZIP and run `local-transcriber.exe`; the
+executable alone is not a supported distribution.
 
 ## Config
 

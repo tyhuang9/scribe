@@ -4,6 +4,7 @@ Set-StrictMode -Version Latest
 $repositoryRoot = [System.IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $releaseScript = Join-Path $PSScriptRoot "build-windows-release.ps1"
 $modelScript = Join-Path $PSScriptRoot "bundle-base-model.ps1"
+$packageVerifier = Join-Path $PSScriptRoot "verify-windows-release-package.ps1"
 $source = Get-Content -LiteralPath $releaseScript -Raw
 $helpersStart = $source.IndexOf("function Get-NormalizedFullPath")
 $helpersEnd = $source.IndexOf("if (-not [Environment]::Is64BitOperatingSystem")
@@ -27,12 +28,14 @@ function Invoke-ExpectedFailure([scriptblock]$Action, [string]$ExpectedText) {
 }
 
 function Write-TestPe([string]$Path, [uint16]$Machine) {
-    $bytes = [byte[]]::new(128)
+    $bytes = [byte[]]::new(256)
     $bytes[0] = 0x4D
     $bytes[1] = 0x5A
     [BitConverter]::GetBytes([uint32]0x40).CopyTo($bytes, 0x3C)
     [BitConverter]::GetBytes([uint32]0x00004550).CopyTo($bytes, 0x40)
     [BitConverter]::GetBytes($Machine).CopyTo($bytes, 0x44)
+    [BitConverter]::GetBytes([uint16]0x20B).CopyTo($bytes, 0x58)
+    [BitConverter]::GetBytes([uint16]2).CopyTo($bytes, 0x9C)
     [System.IO.File]::WriteAllBytes($Path, $bytes)
 }
 
@@ -44,7 +47,14 @@ try {
     Write-TestPe $amd64 0x8664
     Write-TestPe $x86 0x014C
     Assert-Amd64Pe $amd64
+    Assert-WindowsGuiSubsystem $amd64
     Invoke-ExpectedFailure { Assert-Amd64Pe $x86 } "PE Machine mismatch"
+    $consoleSubsystem = Join-Path $testRoot "console-subsystem.exe"
+    Write-TestPe $consoleSubsystem 0x8664
+    $consoleBytes = [System.IO.File]::ReadAllBytes($consoleSubsystem)
+    [BitConverter]::GetBytes([uint16]3).CopyTo($consoleBytes, 0x9C)
+    [System.IO.File]::WriteAllBytes($consoleSubsystem, $consoleBytes)
+    Invoke-ExpectedFailure { Assert-WindowsGuiSubsystem $consoleSubsystem } "PE subsystem mismatch"
 
     $final = Join-Path $testRoot "Scribe-windows-x64"
     $validStaging = "$final.staging-$PID-$([guid]::NewGuid().ToString('N'))"
@@ -134,6 +144,40 @@ try {
     Invoke-ExpectedFailure {
         & $modelScript -Source "missing-model" -Destination $junctionDestination -Executable (Join-Path $junctionDestination "local-transcriber.exe")
     } "reparse point"
+
+    $workflow = Get-Content -LiteralPath (Join-Path $repositoryRoot ".github\workflows\release.yml") -Raw
+    if ($workflow -notmatch "prepare-windows-release-inputs\.ps1" -or
+        $workflow -notmatch "build-windows-release\.ps1" -or
+        $workflow -match "Copy-Item target\\release\\local-transcriber\.exe") {
+        throw "Windows release workflow must package the validated full bundle, not a bare executable."
+    }
+    $installer = Get-Content -LiteralPath (Join-Path $repositoryRoot "installer\scribe.iss") -Raw
+    if ($installer -notmatch 'Source: "\.\.\\dist\\portable\\\*"' -or
+        $installer -notmatch "recursesubdirs" -or
+        $installer -notmatch "createallsubdirs") {
+        throw "Windows installer must recursively install the validated portable payload."
+    }
+
+    $verificationBundle = Join-Path $testRoot "verification-bundle"
+    New-Item -ItemType Directory -Path $verificationBundle | Out-Null
+    $verificationReadme = Join-Path $verificationBundle "README.txt"
+    [System.IO.File]::WriteAllText($verificationReadme, "verified portable payload", [System.Text.UTF8Encoding]::new($false))
+    $verificationItem = Get-Item -LiteralPath $verificationReadme
+    $verificationInventory = [ordered]@{
+        schema_version = 1
+        platform_triple = "x86_64-pc-windows-msvc"
+        files = @([ordered]@{
+            path = "README.txt"
+            size_bytes = [int64]$verificationItem.Length
+            sha256 = (Get-FileHash -LiteralPath $verificationReadme -Algorithm SHA256).Hash.ToLowerInvariant()
+        })
+    }
+    [System.IO.File]::WriteAllText(
+        (Join-Path $verificationBundle "bundle-inventory.json"),
+        ($verificationInventory | ConvertTo-Json -Depth 5),
+        [System.Text.UTF8Encoding]::new($false)
+    )
+    & $packageVerifier -BundlePath $verificationBundle
 
     Write-Output "Windows release packaging fail-closed tests passed."
 }

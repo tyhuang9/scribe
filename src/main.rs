@@ -1,3 +1,8 @@
+#![cfg_attr(
+    all(target_os = "windows", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
+
 mod app;
 mod audio;
 mod benchmark;
@@ -74,10 +79,39 @@ fn main() -> eframe::Result<()> {
         }),
     );
     if let Err(err) = &result {
-        eprintln!("Scribe failed to start: {err}");
+        report_startup_failure(err);
         print_linux_display_help(err);
     }
     result
+}
+
+fn report_startup_failure(error: &eframe::Error) {
+    eprintln!("Scribe failed to start: {error}");
+
+    #[cfg(all(target_os = "windows", not(debug_assertions)))]
+    {
+        use std::iter;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            MB_ICONERROR, MB_OK, MB_SETFOREGROUND, MessageBoxW,
+        };
+
+        fn wide_null_terminated(value: &str) -> Vec<u16> {
+            value.encode_utf16().chain(iter::once(0)).collect()
+        }
+
+        let title = wide_null_terminated("Scribe startup failure");
+        let message = wide_null_terminated(&format!(
+            "Scribe could not start.\n\n{error}\n\nSee the Windows Event Viewer or launch Scribe from a terminal for more details."
+        ));
+        unsafe {
+            MessageBoxW(
+                0,
+                message.as_ptr(),
+                title.as_ptr(),
+                MB_OK | MB_ICONERROR | MB_SETFOREGROUND,
+            );
+        }
+    }
 }
 
 /// The native app never presents route content below this logical viewport.
