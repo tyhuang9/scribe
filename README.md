@@ -295,7 +295,7 @@ Scribe stores new config under the Scribe application directory. On first launch
 
 The config stores:
 
-- selected default model (fresh profiles use the included `whisper_cpp_base_en`)
+- selected default model (fresh profiles use the bundled `whisper_cpp_base_en`)
 - Playground-selected models (the persisted `playground_selected_models` key; older `playground_enabled_models` and `enabled_models` keys migrate on load)
 - persisted model playground order
 - managed model install metadata

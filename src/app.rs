@@ -8731,7 +8731,7 @@ impl LocalTranscriberApp {
     fn uninstall_model(&mut self, model: &SttModelInfo) -> bool {
         if model.artifact_origin == ModelArtifactOrigin::Bundled {
             self.status_message =
-                "This model is included with Scribe and cannot be removed.".to_owned();
+                "This model is installed with Scribe and cannot be removed.".to_owned();
             return false;
         }
         if let Some(reason) = self.artifact_mutation_block_reason() {
@@ -8903,7 +8903,7 @@ impl LocalTranscriberApp {
             return true;
         }
         let Some(path) = model.local_path.as_ref().filter(|path| path.is_file()) else {
-            let message = "The model included with Scribe is missing. Choose Repair to download and verify the exact pinned model; Scribe will not download it automatically.".to_owned();
+            let message = "The installed model is missing. Choose Repair to download and verify the exact pinned model; Scribe will not download it automatically.".to_owned();
             self.model_downloads
                 .insert(model.id.clone(), ModelInstallStatus::Error(message.clone()));
             self.status = TranscriptionStatus::Error;
@@ -8918,7 +8918,7 @@ impl LocalTranscriberApp {
             )
         {
             let message = format!(
-                "The model included with Scribe failed integrity verification. Choose Repair to download and verify the exact pinned model; Scribe will not replace it automatically: {error}"
+                "The installed model failed integrity verification. Choose Repair to download and verify the exact pinned model; Scribe will not replace it automatically: {error}"
             );
             self.model_downloads
                 .insert(model.id.clone(), ModelInstallStatus::Error(message.clone()));
@@ -10772,7 +10772,7 @@ impl LocalTranscriberApp {
         } else {
             (
                 if bundled {
-                    "Repair included model"
+                    "Repair installed model"
                 } else {
                     "Not installed"
                 }
@@ -10785,7 +10785,7 @@ impl LocalTranscriberApp {
                     .or_else(|| install_admission_block_reason.clone())
                     .or_else(|| {
                         Some(if bundled {
-                            "The included model is missing or failed verification. Repair downloads the exact pinned model after you choose it."
+                            "The installed model is missing or failed verification. Repair downloads the exact pinned model after you choose it."
                         } else {
                             "Install this model before using it."
                         }.to_owned())
@@ -17948,10 +17948,7 @@ mod layout_tests {
 
         model.local_path = Some(missing_path);
         assert!(!app.validate_bundled_model_artifact_or_report(&model));
-        assert!(
-            app.status_message
-                .contains("included with Scribe is missing")
-        );
+        assert!(app.status_message.contains("installed model is missing"));
         assert!(
             app.status_message
                 .contains("will not download it automatically")
@@ -18003,7 +18000,7 @@ mod layout_tests {
         assert_eq!(serde_json::to_value(&app.config).unwrap(), before);
         assert_eq!(
             app.status_message,
-            "This model is included with Scribe and cannot be removed."
+            "This model is installed with Scribe and cannot be removed."
         );
         fs::remove_dir_all(root).unwrap();
     }

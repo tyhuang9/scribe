@@ -2247,7 +2247,10 @@ struct ModelLifecyclePresentation<'a> {
 }
 
 struct ModelLifecycleControls<'a> {
-    primary: ModelLifecyclePresentation<'a>,
+    /// Settled bundled models have no lifecycle action to expose. Their
+    /// non-removability is conveyed by the model card's accessible description
+    /// instead of a redundant disabled "Installed" button.
+    primary: Option<ModelLifecyclePresentation<'a>>,
     discard: Option<ScreenAction>,
     discard_name: Option<String>,
     error_message: Option<&'a str>,
@@ -2336,11 +2339,11 @@ fn model_lifecycle_presentation<'a>(
         ModelCard::Local(model) if model.included => ModelLifecyclePresentation {
             action: ScreenAction::None,
             icon: Icon::CheckCircle,
-            label: "Included".into(),
-            accessible_name: format!("{} is included with Scribe", model.display_name),
+            label: "Installed".into(),
+            accessible_name: format!("{} is installed with Scribe", model.display_name),
             enabled: false,
             disabled_reason: Some(
-                "This verified model is included with Scribe and cannot be removed.",
+                "This verified model is installed with Scribe and cannot be removed.",
             ),
             visible_status: None,
             compact_size: None,
@@ -2518,7 +2521,7 @@ fn model_lifecycle_controls<'a>(
     card: ModelCard<'a>,
     can_replace_active: bool,
 ) -> ModelLifecycleControls<'a> {
-    let mut primary = model_lifecycle_presentation(card, can_replace_active);
+    let mut primary = Some(model_lifecycle_presentation(card, can_replace_active));
     let discard = match card {
         ModelCard::Local(model)
             if model.download_state == ModelDownloadState::Downloading
@@ -2567,12 +2570,17 @@ fn model_lifecycle_controls<'a>(
         ),
     });
     if discard.is_some()
-        && matches!(primary.label.as_str(), "Install" | "Retry" | "Resume")
-        && !matches!(
-            primary.action,
-            ScreenAction::CancelModelInstall(_) | ScreenAction::CancelRemoteCatalogInstall(_)
-        )
+        && primary
+            .as_ref()
+            .is_some_and(|primary| matches!(primary.label.as_str(), "Install" | "Retry" | "Resume"))
+        && !primary.as_ref().is_some_and(|primary| {
+            matches!(
+                primary.action,
+                ScreenAction::CancelModelInstall(_) | ScreenAction::CancelRemoteCatalogInstall(_)
+            )
+        })
     {
+        let primary = primary.as_mut().expect("primary lifecycle presentation");
         primary.icon = Icon::Play;
         primary.label = "Resume".into();
         let model_name = match card {
@@ -2580,6 +2588,12 @@ fn model_lifecycle_controls<'a>(
             ModelCard::Remote(entry, variant) => remote_variant_accessible_name(entry, variant),
         };
         primary.accessible_name = format!("Resume {model_name} download");
+    }
+    if matches!(
+        card,
+        ModelCard::Local(model) if model.included && model.installed && model.ready
+    ) {
+        primary = None;
     }
     ModelLifecycleControls {
         primary,
@@ -3496,7 +3510,10 @@ fn render_unified_model_card(
                                 action: &mut ScreenAction,
                                 restored_remove_focus: &mut bool,
                                 focus_within: &mut bool| {
-            if let Some(status) = lifecycle.primary.visible_status.as_deref() {
+            let Some(primary) = lifecycle.primary.as_ref() else {
+                return ui.allocate_exact_size(Vec2::ZERO, Sense::hover()).1;
+            };
+            if let Some(status) = primary.visible_status.as_deref() {
                 let response = ui.label(RichText::new(status).small().color(colors.muted_text));
                 ui.ctx().accesskit_node_builder(response.id, |builder| {
                     builder.set_name(status);
@@ -3504,23 +3521,23 @@ fn render_unified_model_card(
                 ui.add_space(6.0);
             }
             if (matches!(
-                lifecycle.primary.action,
+                primary.action,
                 ScreenAction::CancelModelInstall(_) | ScreenAction::CancelRemoteCatalogInstall(_)
-            ) || (lifecycle.discard.is_some() && matches!(lifecycle.primary.icon, Icon::Play)))
+            ) || (lifecycle.discard.is_some() && matches!(primary.icon, Icon::Play)))
                 && let Some(progress) = model_download_progress_presentation(card)
             {
                 let download = render_model_download_module(
                     ui,
                     &progress,
-                    lifecycle.primary.icon,
-                    &lifecycle.primary.accessible_name,
-                    lifecycle.primary.enabled,
-                    lifecycle.primary.disabled_reason,
+                    primary.icon,
+                    &primary.accessible_name,
+                    primary.enabled,
+                    primary.disabled_reason,
                     lifecycle.discard_name.as_deref(),
                 );
                 *focus_within |= download.cancel_has_focus || download.discard_has_focus;
-                if download.cancel_clicked && lifecycle.primary.enabled {
-                    *action = lifecycle.primary.action.clone();
+                if download.cancel_clicked && primary.enabled {
+                    *action = primary.action.clone();
                 } else if download.discard_clicked
                     && let Some(discard) = lifecycle.discard.as_ref()
                 {
@@ -3528,40 +3545,31 @@ fn render_unified_model_card(
                 }
                 return download.response;
             }
-            let label = if lifecycle.primary.tone == ModelLifecycleTone::DestructiveOutline {
-                lifecycle.primary.label.clone()
+            let label = if primary.tone == ModelLifecycleTone::DestructiveOutline {
+                primary.label.clone()
             } else {
-                lifecycle.primary.compact_size.as_ref().map_or_else(
-                    || {
-                        format!(
-                            "{}  {}",
-                            icon_glyph(lifecycle.primary.icon),
-                            lifecycle.primary.label
-                        )
-                    },
-                    |size| format!("{}  {size}", icon_glyph(lifecycle.primary.icon)),
+                primary.compact_size.as_ref().map_or_else(
+                    || format!("{}  {}", icon_glyph(primary.icon), primary.label),
+                    |size| format!("{}  {size}", icon_glyph(primary.icon)),
                 )
             };
             let mut lifecycle_response = model_lifecycle_button(
                 ui,
                 &label,
-                &lifecycle.primary.accessible_name,
-                lifecycle.primary.enabled,
-                lifecycle.primary.disabled_reason,
-                lifecycle.primary.tone,
+                &primary.accessible_name,
+                primary.enabled,
+                primary.disabled_reason,
+                primary.tone,
             );
             *focus_within |= lifecycle_response.has_focus();
             if restore_remove_focus
-                && matches!(
-                    lifecycle.primary.action,
-                    ScreenAction::RequestModelRemoval(_)
-                )
+                && matches!(primary.action, ScreenAction::RequestModelRemoval(_))
             {
                 lifecycle_response.request_focus();
                 *restored_remove_focus = true;
             }
-            if lifecycle_response.clicked() && lifecycle.primary.enabled {
-                *action = lifecycle.primary.action.clone();
+            if lifecycle_response.clicked() && primary.enabled {
+                *action = primary.action.clone();
             }
             if let (Some(discard), Some(discard_name)) = (
                 lifecycle.discard.as_ref(),
@@ -3950,11 +3958,17 @@ fn render_unified_model_card(
         }
         response
     };
+    let card_accessible_description = match card {
+        ModelCard::Local(model) if model.included && model.installed && model.ready => {
+            Some("Installed with Scribe; this model cannot be removed.".to_owned())
+        }
+        _ => model_download_progress_presentation(card).map(|progress| progress.accessible_text),
+    };
     ui.ctx().accesskit_node_builder(frame.id, |builder| {
         builder.set_role(egui::accesskit::Role::Group);
         builder.set_name(format!("{accessible_card_name} model"));
-        if let Some(progress) = model_download_progress_presentation(card) {
-            builder.set_description(progress.accessible_text);
+        if let Some(description) = card_accessible_description {
+            builder.set_description(description);
         }
         builder.set_bounds(accesskit_rect(frame.rect));
     });
@@ -7501,6 +7515,22 @@ mod tests {
             ScreenAction::RequestModelRemoval(_)
         ));
         assert_eq!(stable.tone, ModelLifecycleTone::DestructiveOutline);
+        let stable_model = ModelViewModel {
+            id: "stable".into(),
+            installed: true,
+            download_state: ModelDownloadState::Installed,
+            removal_supported: true,
+            ..Default::default()
+        };
+        let stable_controls = model_lifecycle_controls(ModelCard::Local(&stable_model), true);
+        assert_eq!(
+            stable_controls
+                .primary
+                .as_ref()
+                .expect("normal installed models keep a lifecycle control")
+                .label,
+            "Delete"
+        );
 
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
@@ -7596,7 +7626,7 @@ mod tests {
     }
 
     #[test]
-    fn bundled_model_lifecycle_is_included_or_user_triggered_repair() {
+    fn bundled_model_hides_settled_lifecycle_but_retains_repair_path() {
         let included = ModelViewModel {
             id: BUNDLED_BASE_MODEL_ID.into(),
             display_name: "Whisper Base — English".into(),
@@ -7610,12 +7640,18 @@ mod tests {
         };
         let presentation = model_lifecycle_presentation(ModelCard::Local(&included), true);
         assert_eq!(presentation.action, ScreenAction::None);
-        assert_eq!(presentation.label, "Included");
+        assert_eq!(presentation.label, "Installed");
         assert_eq!(presentation.icon, Icon::CheckCircle);
         assert!(!presentation.enabled);
         assert_eq!(
             presentation.disabled_reason,
-            Some("This verified model is included with Scribe and cannot be removed.")
+            Some("This verified model is installed with Scribe and cannot be removed.")
+        );
+        assert!(
+            model_lifecycle_controls(ModelCard::Local(&included), true)
+                .primary
+                .is_none(),
+            "settled bundled models must not expose a redundant Installed lifecycle control"
         );
 
         let repair = ModelViewModel {
@@ -7637,6 +7673,14 @@ mod tests {
         );
         assert_eq!(presentation.label, "Repair");
         assert!(presentation.enabled);
+        assert_eq!(
+            model_lifecycle_controls(ModelCard::Local(&repair), true)
+                .primary
+                .as_ref()
+                .expect("corrupt bundled models keep the Repair action")
+                .label,
+            "Repair"
+        );
     }
 
     #[test]
