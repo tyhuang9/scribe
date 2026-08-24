@@ -21,6 +21,28 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Prepare reviewed sherpa-onnx archive
+        shell: pwsh
+        env:
+          SHERPA_ONNX_ARCHIVE_NAME: sherpa-onnx-v1.13.5-win-x64-static-MT-Release-lib.tar.bz2
+          SHERPA_ONNX_ARCHIVE_SHA256: b7080b6f470bac96ef0afe56b25ae9b2f9f0ca82d10dad19bf3a2fc5ffd6cffc
+          SHERPA_ONNX_ARCHIVE_SIZE: '120217991'
+        run: |
+          $archiveDir = Join-Path $env:GITHUB_WORKSPACE '.ci-native'
+          $archivePath = Join-Path $archiveDir $env:SHERPA_ONNX_ARCHIVE_NAME
+          New-Item -ItemType Directory -Force -Path $archiveDir | Out-Null
+          $url = "https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.13.5/$env:SHERPA_ONNX_ARCHIVE_NAME"
+          curl.exe --fail --location --retry 3 --retry-delay 2 --output $archivePath $url
+          $file = Get-Item $archivePath
+          if ($file.Length -ne [int64]$env:SHERPA_ONNX_ARCHIVE_SIZE) {
+            throw "Unexpected sherpa-onnx archive size: $($file.Length)"
+          }
+          $actualSha256 = (Get-FileHash -Algorithm SHA256 -Path $archivePath).Hash.ToLowerInvariant()
+          if ($actualSha256 -ne $env:SHERPA_ONNX_ARCHIVE_SHA256) {
+            throw "Unexpected sherpa-onnx archive SHA-256: $actualSha256"
+          }
+          "SHERPA_ONNX_ARCHIVE_DIR=$archiveDir" >> $env:GITHUB_ENV
+
       - name: Build release binary
         run: cargo build --release --locked
 
