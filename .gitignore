@@ -12,3 +12,6 @@
 /website/node_modules/
 /website/.astro/
 /website/dist/
+
+# Reviewed native archives are downloaded locally by the release workflow.
+/.ci-native/
