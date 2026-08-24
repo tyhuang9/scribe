@@ -411,12 +411,13 @@ samples with maximum 10 ms mono RMS 0.001559. Its comparison against the former
 classification.
 
 As of 2026-08-17, exact sequential 512-sample Silero decisions classify speech.
-The persisted `Speech detection sensitivity` control maps inversely to Silero's
-probability threshold. The separate noninteractive input meter and capture-wide
-maximum RMS/peak values are level telemetry and diagnostic low-input guidance
-only; they never accept or reject speech. Automated coverage verifies this
-separation, final partial diagnostic windows, redacted scalar serialization, and
-no output for every no-speech completion.
+The persisted `Speech detection sensitivity` marker maps inversely to Silero's
+probability threshold. Its combined Input level bar has a read-only teal meter
+fill for RMS telemetry; the marker remains an AI probability control rather
+than a volume cutoff. Capture-wide maximum RMS/peak values remain diagnostic
+low-input guidance only; they never accept or reject speech. Automated coverage
+verifies that separation, final partial diagnostic windows, redacted scalar
+serialization, and no output for every no-speech completion.
 
 REC-06 and STT-06 remain **NOT VERIFIED** until an operator corrects the
 physical mute/gain state and executes both the low-input and restored-speech

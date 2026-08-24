@@ -15980,7 +15980,7 @@ mod layout_tests {
         app.current_tab = Tab::Models;
         assert!(!app.passive_microphone_monitor_needed());
         app.current_tab = Tab::General;
-        app.settings_tab = SettingsTab::Advanced;
+        app.settings_tab = SettingsTab::Recording;
         assert!(!app.passive_microphone_monitor_needed());
         app.settings_tab = SettingsTab::Recording;
         app.window_hidden_to_tray = true;
@@ -24398,10 +24398,10 @@ mod layout_tests {
             .iter()
             .find(|(_, node)| {
                 node.role() == egui::accesskit::Role::StaticText
-                    && node.name() == Some("Speech detection sensitivity")
+                    && node.name() == Some("Input level")
             })
             .map(|(id, _)| *id)
-            .expect("missing speech detection sensitivity label");
+            .expect("missing input level label");
         let slider = update
             .nodes
             .iter()
@@ -24459,7 +24459,7 @@ mod layout_tests {
             peak: 0.15,
         });
         let mut app = test_app();
-        app.settings_tab = SettingsTab::Advanced;
+        app.settings_tab = SettingsTab::Recording;
         app.microphone_test = MicrophoneTest::Active { session };
         let update = render(&ctx, &mut app);
         assert!(update.nodes.iter().any(|(_, node)| {

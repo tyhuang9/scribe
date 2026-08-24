@@ -7306,7 +7306,7 @@ fn input_level_sensitivity_control(
         ui.painter().rect_filled(
             egui::Rect::from_min_size(track.min, Vec2::new(live_width, track.height())),
             rounding,
-            colors.primary,
+            colors.slider_live_above,
         );
     }
     ui.painter().rect_stroke(
@@ -7322,24 +7322,20 @@ fn input_level_sensitivity_control(
     } else {
         8.0
     };
-    ui.painter()
-        .circle_filled(thumb_center, thumb_radius, colors.card_bg);
-    ui.painter().circle_stroke(
+    // The two high-contrast rings keep the sensitivity marker visible over
+    // both the idle track and the teal microphone-level fill.
+    ui.painter().circle_filled(
+        thumb_center,
+        thumb_radius + 2.0,
+        colors.sensitivity_marker_on_track,
+    );
+    ui.painter().circle_filled(
         thumb_center,
         thumb_radius,
-        Stroke::new(
-            if response.has_focus() && sensitivity_enabled {
-                3.0
-            } else {
-                2.0
-            },
-            if sensitivity_enabled {
-                colors.slider_threshold_fill
-            } else {
-                colors.muted_text
-            },
-        ),
+        colors.sensitivity_marker_on_live,
     );
+    ui.painter()
+        .circle_filled(thumb_center, thumb_radius - 3.0, colors.card_bg);
     ui.painter().text(
         egui::pos2(track.right() + LABEL_GAP, rect.center().y),
         Align2::LEFT_CENTER,
