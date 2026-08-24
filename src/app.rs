@@ -95,9 +95,10 @@ const ACTIVE_REPAINT_DELAY: Duration = Duration::from_millis(100);
 const METER_REPAINT_DELAY: Duration = Duration::from_millis(40);
 const PASSIVE_MONITOR_REPAINT_DELAY: Duration = Duration::from_millis(50);
 const IDLE_REPAINT_DELAY: Duration = Duration::from_millis(500);
-const INPUT_LEVEL_ATTACK: Duration = Duration::from_millis(30);
-const INPUT_LEVEL_RELEASE: Duration = Duration::from_millis(240);
-const INPUT_LEVEL_STALE_AFTER: Duration = Duration::from_millis(160);
+const INPUT_LEVEL_ATTACK: Duration = Duration::from_millis(60);
+const INPUT_LEVEL_PEAK_HOLD: Duration = Duration::from_millis(120);
+const INPUT_LEVEL_RELEASE: Duration = Duration::from_millis(320);
+const INPUT_LEVEL_STALE_AFTER: Duration = Duration::from_millis(250);
 const INPUT_LEVEL_MIN_DBFS: f32 = -72.0;
 const INPUT_LEVEL_MAX_DBFS: f32 = 0.0;
 const SETTINGS_SAVE_DEBOUNCE: Duration = Duration::from_millis(300);
@@ -196,6 +197,7 @@ struct MicrophoneLevelEnvelope {
     last_step_at: Option<Instant>,
     last_fresh_sample_at: Option<Instant>,
     last_revision: Option<u64>,
+    peak_hold_until: Option<Instant>,
 }
 
 impl Default for MicrophoneLevelEnvelope {
@@ -205,6 +207,7 @@ impl Default for MicrophoneLevelEnvelope {
             last_step_at: None,
             last_fresh_sample_at: None,
             last_revision: None,
+            peak_hold_until: None,
         }
     }
 }
@@ -213,6 +216,7 @@ impl MicrophoneLevelEnvelope {
     fn reset_source(&mut self) {
         self.last_fresh_sample_at = None;
         self.last_revision = None;
+        self.peak_hold_until = None;
     }
 
     fn clear(&mut self) {
@@ -239,10 +243,19 @@ impl MicrophoneLevelEnvelope {
         } else {
             0.0
         };
+        if target > self.position {
+            self.peak_hold_until = Some(now + INPUT_LEVEL_PEAK_HOLD);
+        }
+        if !fresh {
+            self.peak_hold_until = None;
+        }
         let elapsed = self.last_step_at.map_or(METER_REPAINT_DELAY, |previous| {
             now.saturating_duration_since(previous)
         });
         self.last_step_at = Some(now);
+        if target < self.position && self.peak_hold_until.is_some_and(|until| now < until) {
+            return self.position;
+        }
         let time_constant = if target > self.position {
             INPUT_LEVEL_ATTACK
         } else {
@@ -15888,32 +15901,43 @@ mod layout_tests {
     }
 
     #[test]
-    fn microphone_level_envelope_attacks_fast_releases_slowly_and_resets_stale_input() {
+    fn microphone_level_envelope_uses_the_configured_attack_hold_release_and_stale_timings() {
         let base = Instant::now();
         let mut envelope = MicrophoneLevelEnvelope::default();
         let attack = envelope.update(1.0, Some(1), true, base);
         assert!(
-            attack > 0.5,
-            "attack should move most of the way in one meter frame"
+            (0.48..0.49).contains(&attack),
+            "a 40 ms step should use the configured 60 ms attack time constant"
         );
 
-        let release = envelope.update(0.0, Some(2), true, base + METER_REPAINT_DELAY);
+        let held = envelope.update(0.0, Some(2), true, base + METER_REPAINT_DELAY);
+        assert_eq!(held, attack, "the displayed peak should hold for 120 ms");
+
+        let release = envelope.update(
+            0.0,
+            Some(3),
+            true,
+            base + INPUT_LEVEL_PEAK_HOLD + METER_REPAINT_DELAY,
+        );
         assert!(
-            release > 0.4,
-            "release should settle more slowly than attack"
+            release > attack * 0.65,
+            "the configured 320 ms release should settle gradually after peak hold"
         );
         assert!(release < attack);
 
         let stale = envelope.update(
             1.0,
-            Some(2),
+            Some(3),
             true,
-            base + INPUT_LEVEL_STALE_AFTER + Duration::from_millis(81),
+            base + INPUT_LEVEL_PEAK_HOLD
+                + METER_REPAINT_DELAY
+                + INPUT_LEVEL_STALE_AFTER
+                + Duration::from_millis(81),
         );
         assert!(stale < release, "a stale unchanged sample must decay");
         let settled = envelope.update(
             1.0,
-            Some(2),
+            Some(3),
             true,
             base + INPUT_LEVEL_STALE_AFTER + Duration::from_secs(3),
         );
@@ -15959,8 +15983,8 @@ mod layout_tests {
         app.current_tab = Tab::Models;
         assert!(!app.passive_microphone_monitor_needed());
         app.current_tab = Tab::General;
-        app.settings_tab = SettingsTab::Advanced;
-        assert!(!app.passive_microphone_monitor_needed());
+        app.settings_tab = SettingsTab::Recording;
+        assert!(app.passive_microphone_monitor_needed());
         app.settings_tab = SettingsTab::Recording;
         app.window_hidden_to_tray = true;
         assert!(!app.passive_microphone_monitor_needed());
@@ -24354,7 +24378,7 @@ mod layout_tests {
         ctx.set_visuals(stitch_visuals(ThemeMode::Light));
         let mut app = test_app();
         app.current_tab = Tab::General;
-        app.settings_tab = SettingsTab::Advanced;
+        app.settings_tab = SettingsTab::Recording;
         app.playing_history_id = Some(1);
 
         let output = ctx.run(
@@ -24377,10 +24401,10 @@ mod layout_tests {
             .iter()
             .find(|(_, node)| {
                 node.role() == egui::accesskit::Role::StaticText
-                    && node.name() == Some("Speech detection sensitivity")
+                    && node.name() == Some("Input level")
             })
             .map(|(id, _)| *id)
-            .expect("missing speech detection sensitivity label");
+            .expect("missing input level label");
         let slider = update
             .nodes
             .iter()
@@ -24438,7 +24462,7 @@ mod layout_tests {
             peak: 0.15,
         });
         let mut app = test_app();
-        app.settings_tab = SettingsTab::Advanced;
+        app.settings_tab = SettingsTab::Recording;
         app.microphone_test = MicrophoneTest::Active { session };
         let update = render(&ctx, &mut app);
         assert!(update.nodes.iter().any(|(_, node)| {
@@ -24469,11 +24493,17 @@ mod layout_tests {
         app.microphone_test_error = Some("Microphone permission denied".to_owned());
         app.microphone_monitor_retry_required = true;
         let update = render(&ctx, &mut app);
-        assert!(
-            !update
+        assert_eq!(
+            update
                 .nodes
                 .iter()
-                .any(|(_, node)| node.role() == egui::accesskit::Role::Slider)
+                .filter(|(_, node)| {
+                    node.role() == egui::accesskit::Role::Slider
+                        && node.name() == Some("Speech detection sensitivity")
+                })
+                .count(),
+            1,
+            "the sensitivity slider remains available even when microphone monitoring fails"
         );
         assert!(!update.nodes.iter().any(|(_, node)| {
             node.name() == Some("Voice detected") || node.name() == Some("Clipping")
