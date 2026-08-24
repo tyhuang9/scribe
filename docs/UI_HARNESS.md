@@ -167,12 +167,16 @@ production test hook.
 
 ## Model-card contract
 
+The production root window has an 840 x 500 logical minimum. The 960 x 680
+fixture below remains a larger deterministic reference viewport; use the
+840 x 500 boundary test in `src/main.rs` for the mixed-DPI minimum contract.
+
 - Cards use the full usable Models-route width. At widths at least 620 px, the
   summary uses deterministic nested zones: 50% identity, 24% Speed/Accuracy,
   and 26% lifecycle. The fixed 44 x 44 disclosure target lives inside the
   lifecycle zone. Below 620 px, identity content stacks above metrics,
   features, lifecycle, and disclosure controls. The native shell
-  has a 960 × 680 minimum; 375 px component behavior is deterministic-test
+  has an 840 × 500 minimum; 375 px component behavior is deterministic-test
   coverage only.
 - Expanded details grow inside the same card surface and preserve the collapsed
   card's left and right edges. A one-line description retains the summary's

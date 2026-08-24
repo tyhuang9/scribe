@@ -328,6 +328,23 @@ new activation/paste latency timestamps remain NOT VERIFIED on a desktop.
 | Multi-monitor/mixed-DPI | UI-06, OUT-05 | **NOT VERIFIED** — no multi-monitor run. | **NOT VERIFIED** |
 | USB + Bluetooth microphones | REC-01, REC-02 | **NOT VERIFIED** — no physical devices available to this documentation run. | **NOT VERIFIED** |
 
+### Mixed-DPI main-window acceptance
+
+Run this check on Windows with an unmaximized Scribe window, one 1920 x 1080
+display at 100% scaling, and a second display at 125%, 150%, or 200% scaling:
+
+1. Open Scribe at its default 1180 x 815 size and drag it by the title bar so
+   the window crosses onto the other display. The complete window should remain
+   at the drop location instead of snapping back to the source monitor.
+2. Repeat using Win + Shift + Left/Right Arrow, then maximize and restore on
+   each display. The window should remain usable and retain normal title-bar,
+   Snap, and restore behavior.
+3. Resize to the smallest allowed window. It should stop at 840 x 500 logical
+   pixels, with route content scrolling or reflowing and no horizontal clipping.
+
+Record the source/target monitor scaling and a screenshot of the final window
+position. Keep this row **NOT VERIFIED** until a physical run is completed.
+
 ### Completion rule
 
 This living matrix remains valid only while each implemented phase updates its

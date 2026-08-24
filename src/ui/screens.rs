@@ -57,7 +57,11 @@ const ROUTE_BOTTOM_INSET: f32 = 16.0;
 // each top-level route in its own range so a route transition cannot reparent
 // an automatic ID while AccessKit removes the previous route's subtree.
 const ROUTE_AUTO_ID_STRIDE: usize = 100_000;
-const SETTINGS_COMPACT_BREAKPOINT: f32 = 620.0;
+// A desktop two-column row needs room for the 270px label column, the widest
+// 360px device selector, its Refresh action, and the surrounding spacing.
+// Below this width, keeping labels above their controls preserves the central
+// route's vertical-only scrolling contract instead of clipping the action.
+const SETTINGS_COMPACT_BREAKPOINT: f32 = 760.0;
 const SETTINGS_LABEL_COLUMN_WIDTH: f32 = 270.0;
 #[derive(Clone, Copy)]
 struct SettingsHelp {
@@ -8245,7 +8249,7 @@ mod tests {
 
     #[test]
     fn narrow_toolbar_component_tests_are_below_the_real_app_minimum() {
-        assert_eq!(crate::MIN_APP_INNER_SIZE, [960.0, 680.0]);
+        assert_eq!(crate::MIN_APP_INNER_SIZE, [840.0, 500.0]);
         assert!(
             [45.0, 120.0, 220.0]
                 .into_iter()
