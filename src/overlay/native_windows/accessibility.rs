@@ -17,7 +17,10 @@ use super::{
 use crate::overlay::{
     controller::{OverlayMode, OverlayPhase, OverlayViewState},
     platform::OverlayWindowBounds,
-    view::{compact_accessible_text, live_accessible_text, live_overlay_announcement},
+    view::{
+        compact_accessible_text, live_accessible_text, live_overlay_announcement,
+        status_mark_accessibility,
+    },
 };
 
 const DISPLAY_ROOT_ID: NodeId = NodeId(0xD100);
@@ -188,13 +191,9 @@ fn display_tree(
     root.set_children(children);
     root.set_bounds(accesskit_rect(layout.root));
 
-    let status_name = if state.phase == OverlayPhase::Listening {
-        "Scribe is recording"
-    } else {
-        state.phase.status_text()
-    };
+    let (status_indicator_name, status_name) = status_mark_accessibility(state);
     let mut status = NodeBuilder::new(Role::Image);
-    status.set_name("Scribe");
+    status.set_name(status_indicator_name);
     status.set_description(status_name);
     status.set_bounds(accesskit_rect(layout.status));
 
@@ -490,6 +489,33 @@ mod tests {
                 && node.live().is_none()
                 && node.name() == Some("Transcribing…")
         }));
+    }
+
+    #[test]
+    fn success_tree_exposes_the_completion_indicator_and_done_in_both_modes() {
+        for mode in [OverlayMode::Live, OverlayMode::Minimal] {
+            let state = OverlayViewState {
+                mode,
+                phase: OverlayPhase::Success,
+                elapsed: Some(std::time::Duration::from_secs(12)),
+                phase_announcement: Some("Done".to_owned()),
+                ..OverlayViewState::default()
+            };
+            let tree = display_tree(&state, true, Some(display_bounds(mode)));
+
+            assert!(tree.nodes.iter().any(|(id, node)| {
+                *id == DISPLAY_STATUS_ID
+                    && node.role() == Role::Image
+                    && node.name() == Some("Scribe completion indicator")
+                    && node.description() == Some("Scribe completed successfully")
+            }));
+            assert!(
+                tree.nodes
+                    .iter()
+                    .any(|(_, node)| node.name() == Some("Done")),
+                "{mode:?} success state should retain completion text"
+            );
+        }
     }
 
     #[test]

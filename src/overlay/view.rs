@@ -301,6 +301,7 @@ struct OverlayColors {
     text: Color32,
     muted_text: Color32,
     waveform: Color32,
+    success: Color32,
     error: Color32,
     warning: Color32,
     shadow: Color32,
@@ -324,6 +325,7 @@ fn overlay_colors(context: &egui::Context) -> OverlayColors {
             // lighter overlay-specific token preserves that appearance while
             // keeping the non-text mark at 3:1 over the translucent surface.
             waveform: Color32::from_rgb(178, 162, 255),
+            success: palette.success_text,
             error: Color32::from_rgb(255, 200, 200),
             warning: Color32::from_rgb(255, 222, 170),
             shadow: Color32::from_black_alpha(96),
@@ -335,6 +337,7 @@ fn overlay_colors(context: &egui::Context) -> OverlayColors {
             text: palette.text,
             muted_text: Color32::from_rgb(65, 75, 90),
             waveform: palette.recording_waveform,
+            success: palette.success_text,
             error: palette.error_text,
             warning: palette.warning,
             shadow: Color32::from_black_alpha(54),
@@ -467,7 +470,7 @@ fn render_compact_status_row(ui: &mut egui::Ui, state: &OverlayViewState, colors
         } else {
             (
                 phase_status_label_with_motion(state.phase, state.progress_animation_enabled),
-                colors.muted_text,
+                phase_status_color(state.phase, colors),
             )
         };
         let response = ui.label(RichText::new(label).size(13.0).color(color));
@@ -568,23 +571,57 @@ fn render_brand_mark(ui: &mut egui::Ui, state: &OverlayViewState, colors: Overla
         egui::vec2(LIVE_WAVEFORM_SIZE, LIVE_WAVEFORM_SIZE),
         Sense::hover(),
     );
-    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Other, "Scribe"));
+    let (accessible_name, accessible_description) = status_mark_accessibility(state);
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Other, accessible_name));
     ui.ctx().accesskit_node_builder(response.id, |builder| {
         builder.set_role(egui::accesskit::Role::Image);
-        builder.set_name("Scribe");
-        builder.set_description(if state.phase == OverlayPhase::Listening {
-            "Scribe is recording"
-        } else {
-            state.phase.status_text()
-        });
+        builder.set_name(accessible_name);
+        builder.set_description(accessible_description);
     });
     ui.painter().text(
         rect.center(),
         egui::Align2::CENTER_CENTER,
-        egui_phosphor::regular::WAVEFORM,
+        status_mark_glyph(state),
         egui::FontId::proportional(27.0),
-        colors.waveform,
+        status_mark_color(state, colors),
     );
+}
+
+pub(super) fn status_mark_glyph(state: &OverlayViewState) -> &'static str {
+    if state.phase == OverlayPhase::Success {
+        egui_phosphor::regular::CHECK_CIRCLE
+    } else {
+        egui_phosphor::regular::WAVEFORM
+    }
+}
+
+pub(super) fn status_mark_accessibility(state: &OverlayViewState) -> (&'static str, &'static str) {
+    if state.phase == OverlayPhase::Success {
+        (
+            "Scribe completion indicator",
+            "Scribe completed successfully",
+        )
+    } else if state.phase == OverlayPhase::Listening {
+        ("Scribe", "Scribe is recording")
+    } else {
+        ("Scribe", state.phase.status_text())
+    }
+}
+
+fn status_mark_color(state: &OverlayViewState, colors: OverlayColors) -> Color32 {
+    if state.phase == OverlayPhase::Success {
+        colors.success
+    } else {
+        colors.waveform
+    }
+}
+
+fn phase_status_color(phase: OverlayPhase, colors: OverlayColors) -> Color32 {
+    if phase == OverlayPhase::Success {
+        colors.success
+    } else {
+        colors.muted_text
+    }
 }
 
 fn live_preview_layout(
@@ -606,7 +643,7 @@ fn live_preview_layout(
         return message_layout_for_rows(
             ui,
             &phase_status_label_with_motion(state.phase, state.progress_animation_enabled),
-            colors.muted_text,
+            phase_status_color(state.phase, colors),
             max_width,
             LIVE_PREVIEW_ROWS,
         );
@@ -935,6 +972,67 @@ mod tests {
             phase_status_label_with_motion(OverlayPhase::Processing, false),
             "○ Transcribing…"
         );
+    }
+
+    #[test]
+    fn success_uses_a_completion_mark_and_done_in_both_overlay_modes_and_themes() {
+        let success = OverlayViewState {
+            phase: OverlayPhase::Success,
+            elapsed: Some(Duration::from_secs(12)),
+            phase_announcement: Some("Done".to_owned()),
+            ..Default::default()
+        };
+        assert_eq!(
+            status_mark_glyph(&success),
+            egui_phosphor::regular::CHECK_CIRCLE
+        );
+        assert_eq!(
+            status_mark_accessibility(&success),
+            (
+                "Scribe completion indicator",
+                "Scribe completed successfully"
+            )
+        );
+
+        for visuals in [egui::Visuals::light(), egui::Visuals::dark()] {
+            for (mode, size) in [
+                (OverlayMode::Live, egui::vec2(LIVE_WIDTH, LIVE_HEIGHT)),
+                (
+                    OverlayMode::Minimal,
+                    egui::vec2(MINIMAL_WIDTH, MINIMAL_HEIGHT),
+                ),
+            ] {
+                let context = egui::Context::default();
+                context.set_visuals(visuals.clone());
+                context.enable_accesskit();
+                let state = OverlayViewState {
+                    mode,
+                    ..success.clone()
+                };
+                let output = context.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                        ..Default::default()
+                    },
+                    |context| render_overlay(context, &state),
+                );
+                let nodes = output
+                    .platform_output
+                    .accesskit_update
+                    .expect("success overlay should expose AccessKit")
+                    .nodes;
+
+                assert!(nodes.iter().any(|(_, node)| {
+                    node.role() == egui::accesskit::Role::Image
+                        && node.name() == Some("Scribe completion indicator")
+                        && node.description() == Some("Scribe completed successfully")
+                }));
+                assert!(
+                    nodes.iter().any(|(_, node)| node.name() == Some("Done")),
+                    "{mode:?} success state should retain its visible completion text"
+                );
+            }
+        }
     }
 
     #[test]
