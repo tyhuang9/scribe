@@ -221,9 +221,8 @@ impl OverlaySnapshot {
         }
     }
 
-    fn render_key(&self, animation_frame: u8) -> OverlayRenderKey {
-        OverlayRenderKey {
-            visible: self.requested_visible,
+    fn display_render_key(&self, animation_frame: u8) -> DisplayRenderKey {
+        DisplayRenderKey {
             mode: self.state.mode,
             phase: self.state.phase,
             transcript_revision: self.state.transcript.revision,
@@ -234,16 +233,22 @@ impl OverlaySnapshot {
             dark_mode: self.dark_mode,
             dpi: self.dpi,
             display_bounds: self.display_bounds,
-            control_bounds: self.control_bounds,
-            control_requested: self.control_requested,
             animation_frame,
+        }
+    }
+
+    fn control_render_key(&self) -> ControlRenderKey {
+        ControlRenderKey {
+            visible: self.control_requested,
+            dark_mode: self.dark_mode,
+            dpi: self.dpi,
+            bounds: self.control_bounds,
         }
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct OverlayRenderKey {
-    visible: bool,
+struct DisplayRenderKey {
     mode: super::controller::OverlayMode,
     phase: super::controller::OverlayPhase,
     transcript_revision: u64,
@@ -254,12 +259,22 @@ struct OverlayRenderKey {
     dark_mode: bool,
     dpi: u32,
     display_bounds: Option<OverlayWindowBounds>,
-    control_bounds: Option<OverlayWindowBounds>,
-    control_requested: bool,
     // The rasterizer resolves the shared time-based progress glyph while it
     // paints. This epoch is the cache invalidator for that indirect animation
     // input; reduced motion holds it at zero.
     animation_frame: u8,
+}
+
+/// The cancel control has an independent layered surface. It is deliberately
+/// insulated from display content, meter, and spinner invalidation because its
+/// painted X is static; a control visibility, theme, DPI, or bounds change is
+/// the only reason to redraw it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ControlRenderKey {
+    visible: bool,
+    dark_mode: bool,
+    dpi: u32,
+    bounds: Option<OverlayWindowBounds>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -793,7 +808,8 @@ struct NativeOverlayHost {
     rasterizer: NativeRasterizer,
     action_bridge: Arc<ControlActionBridge>,
     pair_failure: Arc<PairFailureBridge>,
-    last_render_key: Option<OverlayRenderKey>,
+    last_display_render_key: Option<DisplayRenderKey>,
+    last_control_render_key: Option<ControlRenderKey>,
 }
 
 impl NativeOverlayHost {
@@ -821,7 +837,8 @@ impl NativeOverlayHost {
             rasterizer,
             action_bridge,
             pair_failure,
-            last_render_key: None,
+            last_display_render_key: None,
+            last_control_render_key: None,
         })
     }
 
@@ -843,15 +860,38 @@ impl NativeOverlayHost {
                 Some(WindowRole::Control),
             )
         })?;
-        let key = snapshot.render_key(animation_frame);
-        let bounds_changed = self.last_render_key.as_ref().is_some_and(|previous| {
-            previous.display_bounds != key.display_bounds
-                || previous.control_bounds != key.control_bounds
-                || previous.dpi != key.dpi
-        });
-        if needs_pixel_submission(self.last_render_key.as_ref(), &key) {
-            self.render_and_submit(snapshot, display_bounds, control_bounds)?;
-            self.last_render_key = Some(key);
+        let display_key = snapshot.display_render_key(animation_frame);
+        let control_key = snapshot.control_render_key();
+        let bounds_changed = self
+            .last_display_render_key
+            .as_ref()
+            .is_some_and(|previous| {
+                previous.display_bounds != display_key.display_bounds
+                    || previous.dpi != display_key.dpi
+            })
+            || self
+                .last_control_render_key
+                .as_ref()
+                .is_some_and(|previous| {
+                    previous.bounds != control_key.bounds || previous.dpi != control_key.dpi
+                });
+        let invalidation = pixel_invalidation(
+            self.last_display_render_key.as_ref(),
+            self.last_control_render_key.as_ref(),
+            &display_key,
+            &control_key,
+        );
+        if invalidation.display_pixels {
+            self.render_and_submit_display(snapshot, display_bounds)?;
+            self.last_display_render_key = Some(display_key);
+        }
+        if invalidation.control_changed {
+            if invalidation.control_pixels {
+                self.render_and_submit_control(snapshot, control_bounds)?;
+            } else {
+                self.control.update_accessibility(None, false, false, None);
+            }
+            self.last_control_render_key = Some(control_key);
         }
         if snapshot.control_requested {
             self.action_bridge.bind(snapshot.state.session_id);
@@ -902,11 +942,10 @@ impl NativeOverlayHost {
         Ok(true)
     }
 
-    fn render_and_submit(
+    fn render_and_submit_display(
         &mut self,
         snapshot: &OverlaySnapshot,
         display_bounds: OverlayWindowBounds,
-        control_bounds: OverlayWindowBounds,
     ) -> Result<(), NativeOverlayFailure> {
         let display_frame = self
             .rasterizer
@@ -922,23 +961,6 @@ impl NativeOverlayHost {
                     Some(WindowRole::Display),
                 )
             })?;
-        let control_frame = snapshot
-            .control_requested
-            .then(|| {
-                self.rasterizer.render_control(
-                    snapshot.dark_mode,
-                    control_bounds.width,
-                    control_bounds.height,
-                )
-            })
-            .transpose()
-            .map_err(|_| {
-                NativeOverlayFailure::new(
-                    NativeOverlayFailureStage::Rasterization,
-                    Some(WindowRole::Control),
-                )
-            })?;
-
         if !self.display.update_accessibility(
             Some(&snapshot.state),
             true,
@@ -950,28 +972,42 @@ impl NativeOverlayHost {
                 Some(WindowRole::Display),
             ));
         }
-        if snapshot.control_requested {
-            if !self.control.control_capabilities_ready()
-                || !self.control.update_accessibility(
-                    Some(&snapshot.state),
-                    true,
-                    true,
-                    Some(control_bounds),
-                )
-            {
-                return Err(NativeOverlayFailure::new(
-                    NativeOverlayFailureStage::Accessibility,
-                    Some(WindowRole::Control),
-                ));
-            }
-        } else {
-            self.control.update_accessibility(None, false, false, None);
-        }
-
         self.display.submit_frame(display_bounds, &display_frame)?;
-        if let Some(control_frame) = control_frame.as_ref() {
-            self.control.submit_frame(control_bounds, control_frame)?;
+        Ok(())
+    }
+
+    fn render_and_submit_control(
+        &mut self,
+        snapshot: &OverlaySnapshot,
+        control_bounds: OverlayWindowBounds,
+    ) -> Result<(), NativeOverlayFailure> {
+        if !self.control.control_capabilities_ready()
+            || !self.control.update_accessibility(
+                Some(&snapshot.state),
+                true,
+                true,
+                Some(control_bounds),
+            )
+        {
+            return Err(NativeOverlayFailure::new(
+                NativeOverlayFailureStage::Accessibility,
+                Some(WindowRole::Control),
+            ));
         }
+        let control_frame = self
+            .rasterizer
+            .render_control(
+                snapshot.dark_mode,
+                control_bounds.width,
+                control_bounds.height,
+            )
+            .map_err(|_| {
+                NativeOverlayFailure::new(
+                    NativeOverlayFailureStage::Rasterization,
+                    Some(WindowRole::Control),
+                )
+            })?;
+        self.control.submit_frame(control_bounds, &control_frame)?;
         Ok(())
     }
 
@@ -1014,7 +1050,8 @@ impl NativeOverlayHost {
         self.control.prepare_hide();
         self.display.prepare_hide();
         hide_windows_transactionally(&[&self.control, &self.display]);
-        self.last_render_key = None;
+        self.last_display_render_key = None;
+        self.last_control_render_key = None;
     }
 
     fn take_pair_recovery_request(&self) -> bool {
@@ -1022,7 +1059,28 @@ impl NativeOverlayHost {
     }
 }
 
-fn needs_pixel_submission(previous: Option<&OverlayRenderKey>, next: &OverlayRenderKey) -> bool {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PixelInvalidation {
+    display_pixels: bool,
+    control_changed: bool,
+    control_pixels: bool,
+}
+
+fn pixel_invalidation(
+    previous_display: Option<&DisplayRenderKey>,
+    previous_control: Option<&ControlRenderKey>,
+    next_display: &DisplayRenderKey,
+    next_control: &ControlRenderKey,
+) -> PixelInvalidation {
+    let control_changed = needs_pixel_submission(previous_control, next_control);
+    PixelInvalidation {
+        display_pixels: needs_pixel_submission(previous_display, next_display),
+        control_changed,
+        control_pixels: control_changed && next_control.visible,
+    }
+}
+
+fn needs_pixel_submission<T: PartialEq>(previous: Option<&T>, next: &T) -> bool {
     previous != Some(next)
 }
 
@@ -1906,10 +1964,10 @@ mod tests {
     }
 
     #[test]
-    fn unchanged_render_keys_do_not_request_another_pixel_submission() {
+    fn unchanged_display_render_keys_do_not_request_another_pixel_submission() {
         let snapshot = snapshot_for_test();
-        let first = snapshot.render_key(0);
-        let same = snapshot.render_key(0);
+        let first = snapshot.display_render_key(0);
+        let same = snapshot.display_render_key(0);
         let mut previous = None;
         let mut submissions = 0;
         for key in [&first, &same] {
@@ -1924,35 +1982,95 @@ mod tests {
     }
 
     #[test]
-    fn render_key_covers_content_quantized_levels_animation_theme_dpi_and_bounds() {
+    fn display_and_control_render_keys_cover_their_respective_inputs() {
         let snapshot = snapshot_for_test();
-        let baseline = snapshot.render_key(2);
+        let display_baseline = snapshot.display_render_key(2);
+        let control_baseline = snapshot.control_render_key();
 
         let mut same_buckets = snapshot.clone();
         same_buckets.state.audio_level.rms = 0.001;
         same_buckets.state.audio_level.peak = 0.001;
-        assert_eq!(baseline.rms_bucket, same_buckets.render_key(2).rms_bucket);
+        assert_eq!(
+            display_baseline.rms_bucket,
+            same_buckets.display_render_key(2).rms_bucket
+        );
 
         let mut content_changed = snapshot.clone();
         content_changed.state.transcript.committed = "different".to_owned();
-        assert_ne!(baseline, content_changed.render_key(2));
+        assert_ne!(display_baseline, content_changed.display_render_key(2));
+        assert_eq!(control_baseline, content_changed.control_render_key());
 
         let mut level_changed = snapshot.clone();
         level_changed.state.audio_level.rms = 1.0;
-        assert_ne!(baseline, level_changed.render_key(2));
+        assert_ne!(display_baseline, level_changed.display_render_key(2));
+        assert_eq!(control_baseline, level_changed.control_render_key());
 
         let mut theme_changed = snapshot.clone();
         theme_changed.dark_mode = false;
-        assert_ne!(baseline, theme_changed.render_key(2));
+        assert_ne!(display_baseline, theme_changed.display_render_key(2));
+        assert_ne!(control_baseline, theme_changed.control_render_key());
 
         let mut dpi_changed = snapshot.clone();
         dpi_changed.dpi = 144;
-        assert_ne!(baseline, dpi_changed.render_key(2));
+        assert_ne!(display_baseline, dpi_changed.display_render_key(2));
+        assert_ne!(control_baseline, dpi_changed.control_render_key());
 
-        let mut bounds_changed = snapshot.clone();
-        bounds_changed.display_bounds.as_mut().unwrap().x += 1;
-        assert_ne!(baseline, bounds_changed.render_key(2));
-        assert_ne!(baseline, snapshot.render_key(3));
+        let mut display_bounds_changed = snapshot.clone();
+        display_bounds_changed.display_bounds.as_mut().unwrap().x += 1;
+        assert_ne!(
+            display_baseline,
+            display_bounds_changed.display_render_key(2)
+        );
+        assert_eq!(
+            control_baseline,
+            display_bounds_changed.control_render_key()
+        );
+
+        let mut control_bounds_changed = snapshot.clone();
+        control_bounds_changed.control_bounds.as_mut().unwrap().x += 1;
+        assert_eq!(
+            display_baseline,
+            control_bounds_changed.display_render_key(2)
+        );
+        assert_ne!(
+            control_baseline,
+            control_bounds_changed.control_render_key()
+        );
+        assert_ne!(display_baseline, snapshot.display_render_key(3));
+        assert_eq!(control_baseline, snapshot.control_render_key());
+    }
+
+    #[test]
+    fn meter_or_transcript_changes_do_not_resubmit_control_pixels() {
+        let snapshot = snapshot_for_test();
+        let display_baseline = snapshot.display_render_key(0);
+        let control_baseline = snapshot.control_render_key();
+
+        let mut meter_changed = snapshot.clone();
+        meter_changed.state.audio_level.rms = 0.8;
+        meter_changed.state.audio_level.peak = 0.9;
+        let meter_invalidation = pixel_invalidation(
+            Some(&display_baseline),
+            Some(&control_baseline),
+            &meter_changed.display_render_key(0),
+            &meter_changed.control_render_key(),
+        );
+        assert!(meter_invalidation.display_pixels);
+        assert!(!meter_invalidation.control_changed);
+        assert!(!meter_invalidation.control_pixels);
+
+        let mut transcript_changed = snapshot;
+        transcript_changed.state.transcript.committed = "new words".to_owned();
+        transcript_changed.state.transcript.revision += 1;
+        let transcript_invalidation = pixel_invalidation(
+            Some(&display_baseline),
+            Some(&control_baseline),
+            &transcript_changed.display_render_key(0),
+            &transcript_changed.control_render_key(),
+        );
+        assert!(transcript_invalidation.display_pixels);
+        assert!(!transcript_invalidation.control_changed);
+        assert!(!transcript_invalidation.control_pixels);
     }
 
     #[test]
