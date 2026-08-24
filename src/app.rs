@@ -12161,7 +12161,7 @@ impl LocalTranscriberApp {
             diagnostics.push(notice.to_owned());
         }
         if let Some(diagnostic) = self.overlay_diagnostic {
-            diagnostics.push(diagnostic.settings_diagnostic().to_owned());
+            diagnostics.push(diagnostic.settings_diagnostic());
         }
         diagnostics
     }
@@ -15664,7 +15664,7 @@ mod layout_tests {
     #[test]
     fn overlay_diagnostics_are_private_deduplicated_and_cleared_after_recovery() {
         let mut app = test_app();
-        let diagnostic = OverlayDiagnostic::NativeRasterization;
+        let diagnostic = OverlayDiagnostic::Rasterization;
 
         app.report_overlay_diagnostic(diagnostic);
         assert_eq!(app.overlay_diagnostic, Some(diagnostic));
@@ -15672,7 +15672,7 @@ mod layout_tests {
         assert!(
             app.settings_diagnostics()
                 .iter()
-                .any(|line| line == diagnostic.settings_diagnostic())
+                .any(|line| line == &diagnostic.settings_diagnostic())
         );
         assert!(!app.status_message.contains("HWND"));
         assert!(!app.status_message.contains("transcript"));

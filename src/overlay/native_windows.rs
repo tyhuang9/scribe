@@ -136,16 +136,14 @@ impl NativeOverlayFailure {
 
     const fn diagnostic(self) -> OverlayDiagnostic {
         match self.stage {
-            NativeOverlayFailureStage::HostCreation => OverlayDiagnostic::NativeHost,
-            NativeOverlayFailureStage::Rasterization => OverlayDiagnostic::NativeRasterization,
-            NativeOverlayFailureStage::Accessibility => OverlayDiagnostic::NativeAccessibility,
-            NativeOverlayFailureStage::LayeredPresentation => {
-                OverlayDiagnostic::NativeLayeredPresentation
-            }
-            NativeOverlayFailureStage::Positioning => OverlayDiagnostic::NativePositioning,
-            NativeOverlayFailureStage::Visibility => OverlayDiagnostic::NativeVisibility,
-            NativeOverlayFailureStage::WindowProcedure => OverlayDiagnostic::NativeWindowProcedure,
-            NativeOverlayFailureStage::WorkerPanicked => OverlayDiagnostic::NativeWorker,
+            NativeOverlayFailureStage::HostCreation => OverlayDiagnostic::Host,
+            NativeOverlayFailureStage::Rasterization => OverlayDiagnostic::Rasterization,
+            NativeOverlayFailureStage::Accessibility => OverlayDiagnostic::Accessibility,
+            NativeOverlayFailureStage::LayeredPresentation => OverlayDiagnostic::Presentation,
+            NativeOverlayFailureStage::Positioning => OverlayDiagnostic::Positioning,
+            NativeOverlayFailureStage::Visibility => OverlayDiagnostic::Visibility,
+            NativeOverlayFailureStage::WindowProcedure => OverlayDiagnostic::WindowProcedure,
+            NativeOverlayFailureStage::WorkerPanicked => OverlayDiagnostic::Worker,
         }
     }
 }
@@ -2306,10 +2304,7 @@ mod tests {
             Some(WindowRole::Display),
         )));
         let first = service.output_for(&snapshot);
-        assert_eq!(
-            first.diagnostic,
-            Some(OverlayDiagnostic::NativeRasterization)
-        );
+        assert_eq!(first.diagnostic, Some(OverlayDiagnostic::Rasterization));
 
         event_sink.emit(NativeOverlayEvent::Failure(NativeOverlayFailure::new(
             NativeOverlayFailureStage::Rasterization,
@@ -2329,7 +2324,7 @@ mod tests {
         )));
         assert_eq!(
             service.output_for(&snapshot).diagnostic,
-            Some(OverlayDiagnostic::NativeRasterization)
+            Some(OverlayDiagnostic::Rasterization)
         );
     }
 

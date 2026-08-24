@@ -51,27 +51,27 @@ pub enum OverlayAction {
 /// none of which belong in the app status or diagnostics UI.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OverlayDiagnostic {
-    NativeHost,
-    NativeRasterization,
-    NativeAccessibility,
-    NativeLayeredPresentation,
-    NativePositioning,
-    NativeVisibility,
-    NativeWindowProcedure,
-    NativeWorker,
+    Host,
+    Rasterization,
+    Accessibility,
+    Presentation,
+    Positioning,
+    Visibility,
+    WindowProcedure,
+    Worker,
 }
 
 impl OverlayDiagnostic {
     pub const fn code(self) -> &'static str {
         match self {
-            Self::NativeHost => "native-overlay-host",
-            Self::NativeRasterization => "native-overlay-raster",
-            Self::NativeAccessibility => "native-overlay-accessibility",
-            Self::NativeLayeredPresentation => "native-overlay-layered-present",
-            Self::NativePositioning => "native-overlay-position",
-            Self::NativeVisibility => "native-overlay-visibility",
-            Self::NativeWindowProcedure => "native-overlay-window-procedure",
-            Self::NativeWorker => "native-overlay-worker",
+            Self::Host => "native-overlay-host",
+            Self::Rasterization => "native-overlay-raster",
+            Self::Accessibility => "native-overlay-accessibility",
+            Self::Presentation => "native-overlay-layered-present",
+            Self::Positioning => "native-overlay-position",
+            Self::Visibility => "native-overlay-visibility",
+            Self::WindowProcedure => "native-overlay-window-procedure",
+            Self::Worker => "native-overlay-worker",
         }
     }
 
@@ -81,33 +81,11 @@ impl OverlayDiagnostic {
         "Overlay presentation is unavailable. Recording will continue without it."
     }
 
-    pub const fn settings_diagnostic(self) -> &'static str {
-        match self {
-            Self::NativeHost => {
-                "Overlay diagnostic: native-overlay-host. Recording will continue without the overlay."
-            }
-            Self::NativeRasterization => {
-                "Overlay diagnostic: native-overlay-raster. Recording will continue without the overlay."
-            }
-            Self::NativeAccessibility => {
-                "Overlay diagnostic: native-overlay-accessibility. Recording will continue without the overlay."
-            }
-            Self::NativeLayeredPresentation => {
-                "Overlay diagnostic: native-overlay-layered-present. Recording will continue without the overlay."
-            }
-            Self::NativePositioning => {
-                "Overlay diagnostic: native-overlay-position. Recording will continue without the overlay."
-            }
-            Self::NativeVisibility => {
-                "Overlay diagnostic: native-overlay-visibility. Recording will continue without the overlay."
-            }
-            Self::NativeWindowProcedure => {
-                "Overlay diagnostic: native-overlay-window-procedure. Recording will continue without the overlay."
-            }
-            Self::NativeWorker => {
-                "Overlay diagnostic: native-overlay-worker. Recording will continue without the overlay."
-            }
-        }
+    pub fn settings_diagnostic(self) -> String {
+        format!(
+            "Overlay diagnostic: {}. Recording will continue without the overlay.",
+            self.code()
+        )
     }
 }
 
