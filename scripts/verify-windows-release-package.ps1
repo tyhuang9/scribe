@@ -18,7 +18,13 @@ function Get-RelativeBundlePath([string]$Root, [string]$Path) {
     return [System.Uri]::UnescapeDataString($rootUri.MakeRelativeUri($pathUri).ToString()).Replace('\', '/')
 }
 
-function Assert-Bundle([string]$Root) {
+function Assert-Bundle {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Root,
+        [string[]]$AllowedAdditionalFiles = @()
+    )
+
     $root = Get-NormalizedPath $Root
     $inventoryPath = Join-Path $root "bundle-inventory.json"
     if (-not (Test-Path -LiteralPath $inventoryPath -PathType Leaf)) {
@@ -28,7 +34,17 @@ function Assert-Bundle([string]$Root) {
     if ($inventory.schema_version -ne 1 -or $inventory.platform_triple -ne "x86_64-pc-windows-msvc") {
         throw "Bundle inventory has an unexpected schema or platform."
     }
-    $expected = @($inventory.files.path) + @("bundle-inventory.json") | Sort-Object
+    $normalizedAllowedAdditionalFiles = @($AllowedAdditionalFiles | ForEach-Object {
+        if ([string]::IsNullOrWhiteSpace($_) -or $_ -match '[\\/]') {
+            throw "Allowed additional release files must be root-level filenames."
+        }
+        $_
+    } | Sort-Object -Unique)
+    if ($normalizedAllowedAdditionalFiles.Count -ne $AllowedAdditionalFiles.Count) {
+        throw "Allowed additional release files must not contain duplicate names."
+    }
+
+    $expected = @($inventory.files.path) + @("bundle-inventory.json") + $normalizedAllowedAdditionalFiles | Sort-Object
     $actual = @(Get-ChildItem -LiteralPath $root -Recurse -File -Force | ForEach-Object {
         Get-RelativeBundlePath $root $_.FullName
     } | Sort-Object)
@@ -47,6 +63,10 @@ function Assert-Bundle([string]$Root) {
         }
     }
 }
+
+# A fresh Inno Setup installation writes these two default-named uninstaller files
+# into {app}. They are installer metadata, not part of the portable release tree.
+$InnoSetupUninstallerArtifacts = @("unins000.exe", "unins000.dat")
 
 $bundle = Get-NormalizedPath $BundlePath
 Assert-Bundle $bundle
@@ -72,7 +92,7 @@ try {
         if ($LASTEXITCODE -ne 0) {
             throw "Silent installer verification failed with exit code $LASTEXITCODE."
         }
-        Assert-Bundle $installedRoot
+        Assert-Bundle -Root $installedRoot -AllowedAdditionalFiles $InnoSetupUninstallerArtifacts
     }
 }
 finally {

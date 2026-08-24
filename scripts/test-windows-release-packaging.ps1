@@ -14,6 +14,14 @@ if ($helpersStart -lt 0 -or $helpersEnd -le $helpersStart) {
 $expectedPeMachine = 0x8664
 Invoke-Expression $source.Substring($helpersStart, $helpersEnd - $helpersStart)
 
+$verifierSource = Get-Content -LiteralPath $packageVerifier -Raw
+$verifierHelpersStart = $verifierSource.IndexOf("function Get-NormalizedPath")
+$verifierHelpersEnd = $verifierSource.IndexOf("`$bundle = Get-NormalizedPath")
+if ($verifierHelpersStart -lt 0 -or $verifierHelpersEnd -le $verifierHelpersStart) {
+    throw "Could not isolate Windows release package verifier helpers for testing."
+}
+Invoke-Expression $verifierSource.Substring($verifierHelpersStart, $verifierHelpersEnd - $verifierHelpersStart)
+
 function Invoke-ExpectedFailure([scriptblock]$Action, [string]$ExpectedText) {
     try {
         & $Action
@@ -178,6 +186,17 @@ try {
         [System.Text.UTF8Encoding]::new($false)
     )
     & $packageVerifier -BundlePath $verificationBundle
+
+    $installedVerificationBundle = Join-Path $testRoot "installed-verification-bundle"
+    Copy-Item -LiteralPath $verificationBundle -Destination $installedVerificationBundle -Recurse
+    [System.IO.File]::WriteAllBytes((Join-Path $installedVerificationBundle "unins000.exe"), [byte[]](0x4D, 0x5A))
+    [System.IO.File]::WriteAllBytes((Join-Path $installedVerificationBundle "unins000.dat"), [byte[]](1, 2, 3))
+    Assert-Bundle -Root $installedVerificationBundle -AllowedAdditionalFiles $InnoSetupUninstallerArtifacts
+
+    [System.IO.File]::WriteAllBytes((Join-Path $installedVerificationBundle "unexpected-installer-payload.bin"), [byte[]](4))
+    Invoke-ExpectedFailure {
+        Assert-Bundle -Root $installedVerificationBundle -AllowedAdditionalFiles $InnoSetupUninstallerArtifacts
+    } "Release payload differs from its explicit inventory"
 
     Write-Output "Windows release packaging fail-closed tests passed."
 }
