@@ -82,9 +82,10 @@ These fixtures pass an explicit unfocused presentation state through the same
 hotkey, model, history, or settings services and do not perform release or
 discard behavior.
 
-On Windows, this path does not use an eframe immediate child viewport. It owns
-two native top-level `WS_POPUP` layered windows on the UI thread. The passive
-display has `WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE |
+On Windows, this path does not use an eframe immediate child viewport. The
+dedicated `scribe-native-overlay` service thread owns two native top-level
+`WS_POPUP` layered windows; the app thread submits coalesced snapshots through
+its latest-state mailbox. The passive display has `WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE |
 WS_EX_TOOLWINDOW`; the cancel control has the same profile without
 `WS_EX_TRANSPARENT`. Both are submitted as top-down premultiplied BGRA DIBs by
 `UpdateLayeredWindow(ULW_ALPHA)` and shown topmost without activation. The

@@ -44,10 +44,58 @@ pub enum OverlayAction {
     Abandon(SessionId),
 }
 
+/// A privacy-safe reason why the native overlay could not be presented.
+///
+/// This deliberately exposes only a stable Scribe-owned category. Native
+/// errors can include HWNDs, operating-system details, and rendered content,
+/// none of which belong in the app status or diagnostics UI.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OverlayDiagnostic {
+    Host,
+    Rasterization,
+    Accessibility,
+    Presentation,
+    Positioning,
+    Visibility,
+    WindowProcedure,
+    Worker,
+}
+
+impl OverlayDiagnostic {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Host => "native-overlay-host",
+            Self::Rasterization => "native-overlay-raster",
+            Self::Accessibility => "native-overlay-accessibility",
+            Self::Presentation => "native-overlay-layered-present",
+            Self::Positioning => "native-overlay-position",
+            Self::Visibility => "native-overlay-visibility",
+            Self::WindowProcedure => "native-overlay-window-procedure",
+            Self::Worker => "native-overlay-worker",
+        }
+    }
+
+    /// User-facing copy intentionally avoids leaking platform-specific
+    /// failure details while making the degraded behavior explicit.
+    pub const fn status_message(self) -> &'static str {
+        "Overlay presentation is unavailable. Recording will continue without it."
+    }
+
+    pub fn settings_diagnostic(self) -> String {
+        format!(
+            "Overlay diagnostic: {}. Recording will continue without the overlay.",
+            self.code()
+        )
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct OverlayViewportOutput {
     pub presented: bool,
     pub action: Option<OverlayAction>,
+    /// A newly observed native overlay failure, if any. This contains only a
+    /// stable privacy-safe category, never native error details or text.
+    pub diagnostic: Option<OverlayDiagnostic>,
 }
 
 pub fn show_overlay_viewport(
@@ -159,6 +207,7 @@ fn show_eframe_overlay_viewport(
     OverlayViewportOutput {
         presented,
         action: action.get(),
+        diagnostic: None,
     }
 }
 
