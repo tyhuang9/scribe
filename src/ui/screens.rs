@@ -8245,7 +8245,7 @@ mod tests {
 
     #[test]
     fn narrow_toolbar_component_tests_are_below_the_real_app_minimum() {
-        assert_eq!(crate::MIN_APP_INNER_SIZE, [960.0, 680.0]);
+        assert_eq!(crate::MIN_APP_INNER_SIZE, [840.0, 500.0]);
         assert!(
             [45.0, 120.0, 220.0]
                 .into_iter()
