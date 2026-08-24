@@ -2494,6 +2494,15 @@ fn take_native_string(value: *mut c_char) -> Option<String> {
 mod tests {
     use super::*;
 
+    fn production_app_source(source: &str) -> String {
+        let lines = source.lines().collect::<Vec<_>>();
+        let test_module_start = lines
+            .windows(2)
+            .position(|pair| pair[0] == "#[cfg(test)]" && pair[1] == "mod layout_tests {")
+            .expect("app source must contain the layout test module");
+        lines[..test_module_start].join("\n")
+    }
+
     struct TestOnnxControl {
         loads: AtomicU64,
         unloads: AtomicU64,
@@ -3692,10 +3701,7 @@ mod tests {
             .find(|(path, _)| path.file_name().is_some_and(|name| name == "app.rs"))
             .map(|(_, source)| source)
             .unwrap();
-        let app = app
-            .split("\n#[cfg(test)]\nmod layout_tests")
-            .next()
-            .unwrap();
+        let app = production_app_source(app);
         for forbidden in [
             "use crate::stt",
             "runtime_catalog::",
@@ -3719,12 +3725,9 @@ mod tests {
                 continue;
             }
             let production_source = if path.file_name().is_some_and(|name| name == "app.rs") {
-                source
-                    .split("\n#[cfg(test)]\nmod layout_tests")
-                    .next()
-                    .unwrap()
+                production_app_source(source)
             } else {
-                source
+                source.clone()
             };
             if production_source.contains("provider_for_backend") {
                 let allowed = path.ends_with("stt/mod.rs")
@@ -3747,12 +3750,9 @@ mod tests {
                 continue;
             }
             let production_source = if path.file_name().is_some_and(|name| name == "app.rs") {
-                source
-                    .split("\n#[cfg(test)]\nmod layout_tests")
-                    .next()
-                    .unwrap()
+                production_app_source(source)
             } else {
-                source
+                source.clone()
             };
             for concrete_adapter in [
                 "stt::whisper_cpp",
@@ -3772,6 +3772,16 @@ mod tests {
                     path.display()
                 );
             }
+        }
+    }
+
+    #[test]
+    fn production_app_source_excludes_layout_tests_with_crlf_or_lf() {
+        for source in [
+            "fn production() {}\n#[cfg(test)]\nmod layout_tests {\n}\n",
+            "fn production() {}\r\n#[cfg(test)]\r\nmod layout_tests {\r\n}\r\n",
+        ] {
+            assert_eq!(production_app_source(source), "fn production() {}");
         }
     }
 }

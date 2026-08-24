@@ -89,6 +89,41 @@ function Assert-Amd64Pe([string]$Path) {
     }
 }
 
+function Get-PeSubsystem([string]$Path) {
+    $null = Assert-RegularFile $Path
+    $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+    try {
+        if ($stream.Length -lt 256) {
+            throw "PE file is too short for an optional header: $Path"
+        }
+        $reader = [System.IO.BinaryReader]::new($stream)
+        $stream.Position = 0x3C
+        $peOffset = $reader.ReadUInt32()
+        $optionalHeader = [int64]$peOffset + 24
+        $subsystemOffset = $optionalHeader + 68
+        if ($subsystemOffset -gt ($stream.Length - 2)) {
+            throw "PE subsystem field is outside the file: $Path"
+        }
+        $stream.Position = $optionalHeader
+        $magic = $reader.ReadUInt16()
+        if ($magic -notin 0x10B, 0x20B) {
+            throw "PE file has an unsupported optional header: $Path"
+        }
+        $stream.Position = $subsystemOffset
+        return $reader.ReadUInt16()
+    }
+    finally {
+        $stream.Dispose()
+    }
+}
+
+function Assert-WindowsGuiSubsystem([string]$Path) {
+    $subsystem = Get-PeSubsystem $Path
+    if ($subsystem -ne 2) {
+        throw ("PE subsystem mismatch for {0}: expected Windows GUI (2), got {1}" -f $Path, $subsystem)
+    }
+}
+
 function Assert-ExactFile([string]$Path, [int64]$ExpectedSize, [string]$ExpectedHash) {
     $item = Assert-RegularFile $Path
     if ($item.Length -ne $ExpectedSize) {
@@ -234,6 +269,7 @@ finally {
 $cargoReleaseRoot = Join-Path $repositoryRoot "target\$targetTriple\release"
 $sourceExecutable = Join-Path $cargoReleaseRoot "local-transcriber.exe"
 Assert-Amd64Pe $sourceExecutable
+Assert-WindowsGuiSubsystem $sourceExecutable
 
 try {
     New-Item -ItemType Directory -Path $stagingBundle | Out-Null
@@ -262,6 +298,17 @@ try {
     }
     $stagedModelManifest = Join-Path $stagingBundle "bundled-model-manifest.json"
     Copy-Item -LiteralPath $modelManifestPath -Destination $stagedModelManifest
+    $cargoManifest = Get-Content -LiteralPath (Join-Path $repositoryRoot "Cargo.toml") -Raw
+    $versionMatch = [regex]::Match($cargoManifest, '(?m)^version\s*=\s*"([^"]+)"')
+    if (-not $versionMatch.Success) {
+        throw "Could not read the Scribe version from Cargo.toml."
+    }
+    $portableReadme = Join-Path $stagingBundle "README.txt"
+    [System.IO.File]::WriteAllText(
+        $portableReadme,
+        "Scribe $($versionMatch.Groups[1].Value)`r`n`r`nExtract this entire folder before running local-transcriber.exe. This portable Windows x64 package includes the verified English Base model and compatibility runtime; do not distribute the executable by itself.`r`n",
+        [System.Text.UTF8Encoding]::new($false)
+    )
 
     Assert-NoReparseAncestors $stagingBundle
     Assert-TreeHasNoReparsePoints $stagingBundle
@@ -273,6 +320,7 @@ try {
         Assert-CopyMatchesSource $sourcePath (Join-Path $stagedLicenses (Split-Path -Leaf $relativePath))
     }
     Assert-Amd64Pe $stagedExecutable
+    Assert-WindowsGuiSubsystem $stagedExecutable
     Assert-ExactFile $stagedModel ([int64]$modelManifest.size_bytes) $modelManifest.sha256
     foreach ($file in $runtimeManifest.files) {
         $path = Join-Path $stagedRuntimeRoot ($file.path -replace '/', '\')
@@ -293,6 +341,7 @@ try {
         $null = $expectedPaths.Add("licenses/$(Split-Path -Leaf $relativePath)")
     }
     $null = $expectedPaths.Add("bundled-model-manifest.json")
+    $null = $expectedPaths.Add("README.txt")
     Assert-ExactAllowlist $stagingBundle $expectedPaths.ToArray()
 
     $previousHubOffline = $env:HF_HUB_OFFLINE

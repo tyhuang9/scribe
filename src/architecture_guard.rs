@@ -477,6 +477,9 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
         "Remove-ValidatedStaging",
         "Assert-ExactAllowlist",
         "bundle-inventory.json",
+        "README.txt",
+        "Assert-WindowsGuiSubsystem",
+        "Windows GUI (2)",
         "Move-Item -LiteralPath $stagingBundle -Destination $finalBundle",
         r#"artifacts\Scribe-windows-x64"#,
         "Final release bundle already exists",
@@ -490,6 +493,67 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
     assert!(
         !release.contains(r#"target\release"#),
         "the unqualified Cargo release directory must not be used as a bundle"
+    );
+
+    let release_inputs = fs::read_to_string(
+        repository
+            .join("scripts")
+            .join("prepare-windows-release-inputs.ps1"),
+    )
+    .expect("release input preparation script must be readable");
+    for required in [
+        "whisper-cpp-v1.9.1-windows-x64.json",
+        "whisper-base-en-q8_0-windows-x64.json",
+        "Get-FileHash",
+        "Expand-Archive",
+        "huggingface.co/$modelRepository/resolve/$modelRevision/$modelFilename",
+        "Release input SHA-256 mismatch",
+    ] {
+        assert!(
+            release_inputs.contains(required),
+            "release input preparation must retain {required}"
+        );
+    }
+
+    let workflow = fs::read_to_string(
+        repository
+            .join(".github")
+            .join("workflows")
+            .join("release.yml"),
+    )
+    .expect("Windows release workflow must be readable");
+    for required in [
+        "prepare-windows-release-inputs.ps1",
+        "build-windows-release.ps1",
+        "verify-windows-release-package.ps1",
+        "-BundlePath dist\\portable",
+    ] {
+        assert!(
+            workflow.contains(required),
+            "Windows release workflow must retain {required}"
+        );
+    }
+    assert!(
+        !workflow.contains("Copy-Item target\\release\\local-transcriber.exe"),
+        "Windows release workflow must not publish a bare executable"
+    );
+
+    let installer = fs::read_to_string(repository.join("installer").join("scribe.iss"))
+        .expect("Windows installer script must be readable");
+    assert!(
+        installer.contains("Source: \"..\\dist\\portable\\*\"")
+            && installer.contains("recursesubdirs")
+            && installer.contains("createallsubdirs"),
+        "Windows installer must recursively copy the validated portable payload"
+    );
+
+    let main = fs::read_to_string(repository.join("src").join("main.rs"))
+        .expect("application main source must be readable");
+    assert!(
+        main.contains("windows_subsystem = \"windows\"")
+            && main.contains("report_startup_failure")
+            && main.contains("MessageBoxW"),
+        "non-debug Windows startup failures must stay visible without a console"
     );
 
     let packaging_tests = fs::read_to_string(
@@ -508,10 +572,30 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
         "Stale staging refusal",
         "exact executable name",
         "canonical executable parent",
+        "PE subsystem mismatch",
+        "Windows release workflow",
+        "Windows installer",
     ] {
         assert!(
             packaging_tests.contains(required),
             "Windows release fail-closed tests must cover {required}"
+        );
+    }
+
+    let package_verifier = fs::read_to_string(
+        repository
+            .join("scripts")
+            .join("verify-windows-release-package.ps1"),
+    )
+    .expect("release payload verifier must be readable");
+    for required in [
+        "Release payload differs from its explicit inventory",
+        "/VERYSILENT",
+        "Assert-Bundle -Root $installedRoot -AllowedAdditionalFiles $InnoSetupUninstallerArtifacts",
+    ] {
+        assert!(
+            package_verifier.contains(required),
+            "release payload verifier must retain {required}"
         );
     }
 

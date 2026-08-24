@@ -43,23 +43,24 @@ jobs:
           }
           "SHERPA_ONNX_ARCHIVE_DIR=$archiveDir" >> $env:GITHUB_ENV
 
-      - name: Build release binary
-        run: cargo build --release --locked
+      - name: Download and verify pinned release inputs
+        shell: pwsh
+        run: |
+          & .\scripts\prepare-windows-release-inputs.ps1 -OutputDirectory .ci-release-inputs
 
-      - name: Stage portable package
+      - name: Fetch locked Rust dependencies
+        run: cargo fetch --locked
+
+      - name: Build validated portable package
         shell: pwsh
         run: |
           $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches.Groups[1].Value
           if (-not $version) { throw "Could not read package version from Cargo.toml" }
           "APP_VERSION=$version" >> $env:GITHUB_ENV
-          New-Item -ItemType Directory -Force -Path dist\portable | Out-Null
-          Copy-Item target\release\local-transcriber.exe dist\portable\local-transcriber.exe
-          Set-Content -Path dist\portable\README.txt -Value @"
-          Scribe $version
-
-          Run local-transcriber.exe to start Scribe. Models can be installed from the Models page.
-          Windows x64 is the currently release-qualified platform.
-          "@
+          & .\scripts\build-windows-release.ps1 `
+            -ModelSource .ci-release-inputs\model\whisper-base.en-Q8_0.gguf `
+            -RuntimeSource .ci-release-inputs\runtime `
+            -BundlePath dist\portable
           Compress-Archive -Path dist\portable\* -DestinationPath "dist\Scribe-$version-windows-x64.zip" -Force
 
       - name: Install Inno Setup
@@ -72,6 +73,14 @@ jobs:
           $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
           if (-not (Test-Path $iscc)) { throw "Inno Setup compiler not found at $iscc" }
           & $iscc "/DAppVersion=$env:APP_VERSION" installer\scribe.iss
+
+      - name: Verify portable ZIP and silent installer payloads
+        shell: pwsh
+        run: |
+          & .\scripts\verify-windows-release-package.ps1 `
+            -BundlePath dist\portable `
+            -PortableZipPath "dist\Scribe-$env:APP_VERSION-windows-x64.zip" `
+            -InstallerPath "dist\Scribe-Setup-$env:APP_VERSION.exe"
 
       - name: Upload release files
         uses: actions/upload-artifact@v6
