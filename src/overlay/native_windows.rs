@@ -4,11 +4,18 @@ mod raster;
 
 use std::{
     cell::{Cell, RefCell},
+    collections::hash_map::DefaultHasher,
     ffi::c_void,
+    hash::{Hash, Hasher},
     mem::{offset_of, size_of, zeroed},
     panic::{AssertUnwindSafe, catch_unwind},
     ptr::{null, null_mut},
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread::{self, JoinHandle},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crossbeam_channel::{Receiver, Sender, bounded};
@@ -28,15 +35,16 @@ use windows_sys::Win32::{
         },
         Input::KeyboardAndMouse::{GetCapture, ReleaseCapture, SetCapture},
         WindowsAndMessaging::{
-            CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, GWL_EXSTYLE,
-            GWLP_USERDATA, GetClientRect, GetWindowLongPtrW, HTCLIENT, HTTRANSPARENT, HWND_TOPMOST,
-            IsWindowVisible, MA_NOACTIVATE, RegisterClassExW, SW_HIDE, SW_SHOWNOACTIVATE,
-            SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE,
+            BeginDeferWindowPos, CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DeferWindowPos,
+            DestroyWindow, DispatchMessageW, EndDeferWindowPos, GWL_EXSTYLE, GWLP_USERDATA,
+            GetClientRect, GetWindowLongPtrW, HTCLIENT, HTTRANSPARENT, HWND_TOPMOST,
+            IsWindowVisible, MA_NOACTIVATE, MSG, PM_REMOVE, PeekMessageW, RegisterClassExW,
+            SW_HIDE, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE,
             SWP_NOZORDER, SWP_SHOWWINDOW, SendMessageW, SetWindowLongPtrW, SetWindowPos,
-            ShowWindow, ULW_ALPHA, UpdateLayeredWindow, WM_CANCELMODE, WM_CAPTURECHANGED,
-            WM_DESTROY, WM_GETOBJECT, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_NCCREATE,
-            WM_NCDESTROY, WM_NCHITTEST, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-            WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+            ShowWindow, TranslateMessage, ULW_ALPHA, UpdateLayeredWindow, WM_CANCELMODE,
+            WM_CAPTURECHANGED, WM_DESTROY, WM_GETOBJECT, WM_LBUTTONDOWN, WM_LBUTTONUP,
+            WM_MOUSEACTIVATE, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WNDCLASSEXW, WS_EX_LAYERED,
+            WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
         },
     },
 };
@@ -63,6 +71,10 @@ const REQUIRED_BASE_EX_STYLE: u32 =
     WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST;
 const DISPLAY_EX_STYLE: u32 = REQUIRED_BASE_EX_STYLE | WS_EX_TRANSPARENT;
 const CONTROL_EX_STYLE: u32 = REQUIRED_BASE_EX_STYLE;
+const OVERLAY_THREAD_POLL_INTERVAL: Duration = Duration::from_millis(16);
+const OVERLAY_HEALTH_INTERVAL: Duration = Duration::from_millis(500);
+const OVERLAY_ANIMATION_INTERVAL: Duration = Duration::from_millis(125);
+const OVERLAY_EVENT_CAPACITY: usize = 32;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WindowRole {
@@ -97,10 +109,156 @@ impl WindowRole {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeOverlayFailureStage {
+    HostCreation,
+    Rasterization,
+    Accessibility,
+    LayeredPresentation,
+    Positioning,
+    Visibility,
+    WorkerPanicked,
+}
+
+impl NativeOverlayFailureStage {
+    const fn diagnostic_code(self) -> &'static str {
+        match self {
+            Self::HostCreation => "native-overlay-host",
+            Self::Rasterization => "native-overlay-raster",
+            Self::Accessibility => "native-overlay-accessibility",
+            Self::LayeredPresentation => "native-overlay-layered-present",
+            Self::Positioning => "native-overlay-position",
+            Self::Visibility => "native-overlay-visibility",
+            Self::WorkerPanicked => "native-overlay-worker",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeOverlayFailure {
+    stage: NativeOverlayFailureStage,
+    role: Option<WindowRole>,
+}
+
+impl NativeOverlayFailure {
+    const fn new(stage: NativeOverlayFailureStage, role: Option<WindowRole>) -> Self {
+        Self { stage, role }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum NativeOverlayEvent {
+    Presented {
+        visible: bool,
+        session_id: Option<SessionId>,
+    },
+    Action(OverlayAction),
+    Failure(NativeOverlayFailure),
+}
+
+#[derive(Clone, Debug)]
+struct NativeEventSink {
+    tx: Sender<NativeOverlayEvent>,
+    repaint_context: eframe::egui::Context,
+}
+
+impl NativeEventSink {
+    fn emit(&self, event: NativeOverlayEvent) {
+        let _ = self.tx.try_send(event);
+        self.repaint_context.request_repaint();
+    }
+}
+
+#[derive(Clone, Debug)]
+struct OverlaySnapshot {
+    state: OverlayViewState,
+    dark_mode: bool,
+    dpi: u32,
+    display_bounds: Option<OverlayWindowBounds>,
+    control_bounds: Option<OverlayWindowBounds>,
+    requested_visible: bool,
+    control_requested: bool,
+}
+
+impl OverlaySnapshot {
+    fn hidden(state: &OverlayViewState, dark_mode: bool) -> Self {
+        Self {
+            state: state.clone(),
+            dark_mode,
+            dpi: 96,
+            display_bounds: None,
+            control_bounds: None,
+            requested_visible: false,
+            control_requested: false,
+        }
+    }
+
+    fn render_key(&self, animation_frame: u8) -> OverlayRenderKey {
+        OverlayRenderKey {
+            visible: self.requested_visible,
+            mode: self.state.mode,
+            phase: self.state.phase,
+            transcript_revision: self.state.transcript.revision,
+            content_digest: overlay_content_digest(&self.state),
+            rms_bucket: quantized_level(self.state.audio_level.rms),
+            peak_bucket: quantized_level(self.state.audio_level.peak),
+            elapsed_second: self.state.elapsed.map_or(0, |elapsed| elapsed.as_secs()),
+            dark_mode: self.dark_mode,
+            dpi: self.dpi,
+            display_bounds: self.display_bounds,
+            control_bounds: self.control_bounds,
+            control_requested: self.control_requested,
+            animation_frame,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OverlayRenderKey {
+    visible: bool,
+    mode: super::controller::OverlayMode,
+    phase: super::controller::OverlayPhase,
+    transcript_revision: u64,
+    content_digest: u64,
+    rms_bucket: u8,
+    peak_bucket: u8,
+    elapsed_second: u64,
+    dark_mode: bool,
+    dpi: u32,
+    display_bounds: Option<OverlayWindowBounds>,
+    control_bounds: Option<OverlayWindowBounds>,
+    control_requested: bool,
+    animation_frame: u8,
+}
+
+fn overlay_content_digest(state: &OverlayViewState) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    state.transcript.committed.hash(&mut hasher);
+    state.transcript.tentative.hash(&mut hasher);
+    state.phase_announcement.hash(&mut hasher);
+    state.transcript_announcement.hash(&mut hasher);
+    state.notice.hash(&mut hasher);
+    if let Some(error) = &state.error {
+        error.message.hash(&mut hasher);
+        match error.recovery {
+            super::controller::OverlayRecovery::None => 0_u8,
+            super::controller::OverlayRecovery::Retry => 1_u8,
+            super::controller::OverlayRecovery::WaitForPreview => 2_u8,
+        }
+        .hash(&mut hasher);
+    }
+    state.live_preview_available.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn quantized_level(level: f32) -> u8 {
+    (level.clamp(0.0, 1.0) * 40.0).round() as u8
+}
+
 #[derive(Debug)]
 struct ControlActionBridge {
     session_id: Mutex<Option<SessionId>>,
-    tx: Sender<OverlayAction>,
+    event_sink: NativeEventSink,
 }
 
 impl ControlActionBridge {
@@ -113,7 +271,10 @@ impl ControlActionBridge {
     fn emit_abandon(&self) {
         let session_id = self.session_id.lock().ok().and_then(|current| *current);
         if let Some(session_id) = session_id {
-            let _ = self.tx.try_send(OverlayAction::Abandon(session_id));
+            self.event_sink
+                .emit(NativeOverlayEvent::Action(OverlayAction::Abandon(
+                    session_id,
+                )));
         }
     }
 }
@@ -236,25 +397,47 @@ impl NativeWindow {
             && (self.role.requires_transparency() || style & WS_EX_TRANSPARENT == 0)
     }
 
-    fn submit_frame(&mut self, bounds: OverlayWindowBounds, frame: &LayeredFrame) -> bool {
+    fn submit_frame(
+        &mut self,
+        bounds: OverlayWindowBounds,
+        frame: &LayeredFrame,
+    ) -> Result<(), NativeOverlayFailure> {
         if frame.width != bounds.width || frame.height != bounds.height {
-            return false;
+            return Err(NativeOverlayFailure::new(
+                NativeOverlayFailureStage::LayeredPresentation,
+                Some(self.role),
+            ));
         }
         let needs_surface = self
             .surface
             .as_ref()
             .is_none_or(|surface| surface.width != frame.width || surface.height != frame.height);
         if needs_surface {
-            self.surface = LayeredSurface::new(frame.width, frame.height).ok();
+            self.surface = Some(LayeredSurface::new(frame.width, frame.height).map_err(|_| {
+                NativeOverlayFailure::new(
+                    NativeOverlayFailureStage::LayeredPresentation,
+                    Some(self.role),
+                )
+            })?);
         }
         self.surface
             .as_mut()
             .is_some_and(|surface| surface.submit(self.hwnd, bounds, frame))
+            .then_some(())
+            .ok_or_else(|| {
+                NativeOverlayFailure::new(
+                    NativeOverlayFailureStage::LayeredPresentation,
+                    Some(self.role),
+                )
+            })
     }
 
-    fn show_no_activate(&mut self, bounds: OverlayWindowBounds) -> bool {
+    fn prepare_show(&mut self, bounds: OverlayWindowBounds) -> Result<(), NativeOverlayFailure> {
         if !self.is_hardened() {
-            return false;
+            return Err(NativeOverlayFailure::new(
+                NativeOverlayFailureStage::Positioning,
+                Some(self.role),
+            ));
         }
         if self.role == WindowRole::Control
             && !self
@@ -262,12 +445,26 @@ impl NativeWindow {
                 .as_mut()
                 .is_some_and(|tooltip| tooltip.update_bounds(bounds.width, bounds.height))
         {
-            return false;
+            return Err(NativeOverlayFailure::new(
+                NativeOverlayFailureStage::Positioning,
+                Some(self.role),
+            ));
         }
-        unsafe {
-            ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
+        Ok(())
+    }
+
+    fn is_visible(&self) -> bool {
+        unsafe { IsWindowVisible(self.hwnd) != 0 }
+    }
+
+    fn reassert_topmost(&self, bounds: OverlayWindowBounds) -> Result<(), NativeOverlayFailure> {
+        if !self.is_hardened() {
+            return Err(NativeOverlayFailure::new(
+                NativeOverlayFailureStage::Positioning,
+                Some(self.role),
+            ));
         }
-        let placed = unsafe {
+        if unsafe {
             SetWindowPos(
                 self.hwnd,
                 HWND_TOPMOST,
@@ -275,19 +472,31 @@ impl NativeWindow {
                 bounds.y,
                 bounds.width,
                 bounds.height,
-                SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW,
-            ) != 0
-        };
-        placed && unsafe { IsWindowVisible(self.hwnd) != 0 }
+                SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+            )
+        } == 0
+        {
+            return Err(NativeOverlayFailure::new(
+                NativeOverlayFailureStage::Positioning,
+                Some(self.role),
+            ));
+        }
+        self.is_visible().then_some(()).ok_or_else(|| {
+            NativeOverlayFailure::new(NativeOverlayFailureStage::Visibility, Some(self.role))
+        })
     }
 
-    fn hide(&self) {
+    fn prepare_hide(&self) {
         self._procedure_state.cancel_press();
         if unsafe { GetCapture() } == self.hwnd {
             unsafe {
                 ReleaseCapture();
             }
         }
+    }
+
+    fn hide(&self) {
+        self.prepare_hide();
         unsafe {
             SetWindowPos(
                 self.hwnd,
@@ -303,7 +512,6 @@ impl NativeWindow {
                     | SWP_NOZORDER
                     | SWP_NOOWNERZORDER,
             );
-            ShowWindow(self.hwnd, SW_HIDE);
         }
     }
 }
@@ -450,15 +658,14 @@ struct NativeOverlayHost {
     control: NativeWindow,
     rasterizer: NativeRasterizer,
     action_bridge: Arc<ControlActionBridge>,
-    action_rx: Receiver<OverlayAction>,
+    last_render_key: Option<OverlayRenderKey>,
 }
 
 impl NativeOverlayHost {
-    fn new() -> Result<Self, NativeOverlayError> {
-        let (action_tx, action_rx) = bounded(4);
+    fn new(event_sink: NativeEventSink) -> Result<Self, NativeOverlayError> {
         let action_bridge = Arc::new(ControlActionBridge {
             session_id: Mutex::new(None),
-            tx: action_tx,
+            event_sink,
         });
         let display = NativeWindow::create(WindowRole::Display, None)?;
         let control = NativeWindow::create(WindowRole::Control, Some(Arc::clone(&action_bridge)))?;
@@ -468,67 +675,204 @@ impl NativeOverlayHost {
             control,
             rasterizer,
             action_bridge,
-            action_rx,
+            last_render_key: None,
         })
     }
 
-    fn next_action(&self) -> Option<OverlayAction> {
-        let mut newest = None;
-        while let Ok(action) = self.action_rx.try_recv() {
-            newest = Some(action);
+    fn apply_snapshot(
+        &mut self,
+        snapshot: &OverlaySnapshot,
+        animation_frame: u8,
+    ) -> Result<bool, NativeOverlayFailure> {
+        if !snapshot.requested_visible {
+            self.hide();
+            return Ok(false);
         }
-        newest
+        let display_bounds = snapshot.display_bounds.ok_or_else(|| {
+            NativeOverlayFailure::new(NativeOverlayFailureStage::Positioning, None)
+        })?;
+        let control_bounds = snapshot.control_bounds.ok_or_else(|| {
+            NativeOverlayFailure::new(
+                NativeOverlayFailureStage::Positioning,
+                Some(WindowRole::Control),
+            )
+        })?;
+        let key = snapshot.render_key(animation_frame);
+        let bounds_changed = self.last_render_key.as_ref().is_some_and(|previous| {
+            previous.display_bounds != key.display_bounds
+                || previous.control_bounds != key.control_bounds
+                || previous.dpi != key.dpi
+        });
+        if needs_pixel_submission(self.last_render_key.as_ref(), &key) {
+            self.render_and_submit(snapshot, display_bounds, control_bounds)?;
+            self.last_render_key = Some(key);
+        }
+        if snapshot.control_requested {
+            self.action_bridge.bind(snapshot.state.session_id);
+        }
+
+        let display_visible = self.display.is_visible();
+        let control_visible = self.control.is_visible();
+        if !display_visible || control_visible != snapshot.control_requested {
+            if snapshot.control_requested {
+                self.display.prepare_show(display_bounds)?;
+                self.control.prepare_show(control_bounds)?;
+                if !show_windows_transactionally(&[
+                    (&self.display, display_bounds),
+                    (&self.control, control_bounds),
+                ]) {
+                    self.hide();
+                    return Err(NativeOverlayFailure::new(
+                        NativeOverlayFailureStage::Positioning,
+                        None,
+                    ));
+                }
+            } else {
+                self.hide_control();
+                self.display.prepare_show(display_bounds)?;
+                if !show_windows_transactionally(&[(&self.display, display_bounds)]) {
+                    self.hide();
+                    return Err(NativeOverlayFailure::new(
+                        NativeOverlayFailureStage::Positioning,
+                        Some(WindowRole::Display),
+                    ));
+                }
+            }
+        }
+
+        if !self.display.is_visible()
+            || (snapshot.control_requested && !self.control.is_visible())
+            || (!snapshot.control_requested && self.control.is_visible())
+        {
+            self.hide();
+            return Err(NativeOverlayFailure::new(
+                NativeOverlayFailureStage::Visibility,
+                None,
+            ));
+        }
+        if bounds_changed {
+            self.health_check(snapshot)?;
+        }
+        Ok(true)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn present(
+    fn render_and_submit(
         &mut self,
+        snapshot: &OverlaySnapshot,
         display_bounds: OverlayWindowBounds,
-        display_frame: &LayeredFrame,
-        control_requested: bool,
         control_bounds: OverlayWindowBounds,
-        control_frame: &LayeredFrame,
-        session_id: Option<SessionId>,
-    ) -> NativePresentationResult {
-        let display_presented = try_present_transaction(&mut WindowPresentation {
-            window: &mut self.display,
-            bounds: display_bounds,
-            frame: display_frame,
-        });
-        if !finish_display_presentation(display_presented, self) {
-            return NativePresentationResult::default();
+    ) -> Result<(), NativeOverlayFailure> {
+        let display_frame = self
+            .rasterizer
+            .render_display(
+                &snapshot.state,
+                snapshot.dark_mode,
+                display_bounds.width,
+                display_bounds.height,
+            )
+            .map_err(|_| {
+                NativeOverlayFailure::new(
+                    NativeOverlayFailureStage::Rasterization,
+                    Some(WindowRole::Display),
+                )
+            })?;
+        let control_frame = snapshot
+            .control_requested
+            .then(|| {
+                self.rasterizer.render_control(
+                    snapshot.dark_mode,
+                    control_bounds.width,
+                    control_bounds.height,
+                )
+            })
+            .transpose()
+            .map_err(|_| {
+                NativeOverlayFailure::new(
+                    NativeOverlayFailureStage::Rasterization,
+                    Some(WindowRole::Control),
+                )
+            })?;
+
+        if !self.display.update_accessibility(
+            Some(&snapshot.state),
+            true,
+            false,
+            Some(display_bounds),
+        ) {
+            return Err(NativeOverlayFailure::new(
+                NativeOverlayFailureStage::Accessibility,
+                Some(WindowRole::Display),
+            ));
+        }
+        if snapshot.control_requested {
+            if !self.control.control_capabilities_ready()
+                || !self.control.update_accessibility(
+                    Some(&snapshot.state),
+                    true,
+                    true,
+                    Some(control_bounds),
+                )
+            {
+                return Err(NativeOverlayFailure::new(
+                    NativeOverlayFailureStage::Accessibility,
+                    Some(WindowRole::Control),
+                ));
+            }
+        } else {
+            self.control.update_accessibility(None, false, false, None);
         }
 
-        let control_presented = if control_requested {
-            let presented = try_present_transaction(&mut WindowPresentation {
-                window: &mut self.control,
-                bounds: control_bounds,
-                frame: control_frame,
-            });
-            self.action_bridge
-                .bind(presented.then_some(session_id).flatten());
-            if !presented {
-                self.hide_control();
-            }
-            presented
-        } else {
-            self.hide_control();
-            false
-        };
-        combine_presentation_results(display_presented, control_requested, control_presented)
+        self.display.submit_frame(display_bounds, &display_frame)?;
+        if let Some(control_frame) = control_frame.as_ref() {
+            self.control.submit_frame(control_bounds, control_frame)?;
+        }
+        Ok(())
+    }
+
+    fn health_check(&mut self, snapshot: &OverlaySnapshot) -> Result<(), NativeOverlayFailure> {
+        if !snapshot.requested_visible {
+            return Ok(());
+        }
+        let display_bounds = snapshot.display_bounds.ok_or_else(|| {
+            NativeOverlayFailure::new(NativeOverlayFailureStage::Positioning, None)
+        })?;
+        self.display.reassert_topmost(display_bounds)?;
+        if snapshot.control_requested {
+            let control_bounds = snapshot.control_bounds.ok_or_else(|| {
+                NativeOverlayFailure::new(
+                    NativeOverlayFailureStage::Positioning,
+                    Some(WindowRole::Control),
+                )
+            })?;
+            self.control.reassert_topmost(control_bounds)?;
+        } else if self.control.is_visible() {
+            return Err(NativeOverlayFailure::new(
+                NativeOverlayFailureStage::Visibility,
+                Some(WindowRole::Control),
+            ));
+        }
+        Ok(())
     }
 
     fn hide_control(&mut self) {
         self.action_bridge.bind(None);
         self.control.update_accessibility(None, false, false, None);
-        self.control.hide();
+        self.control.prepare_hide();
+        hide_windows_transactionally(&[&self.control]);
     }
 
     fn hide(&mut self) {
-        hide_overlay_fail_closed(self);
+        self.action_bridge.bind(None);
+        self.display.update_accessibility(None, false, false, None);
+        self.control.update_accessibility(None, false, false, None);
+        self.control.prepare_hide();
+        self.display.prepare_hide();
+        hide_windows_transactionally(&[&self.control, &self.display]);
+        self.last_render_key = None;
     }
 }
 
+#[cfg(test)]
 trait FailClosedOverlay {
     fn unbind_action(&mut self);
     fn reset_display_accessibility_hidden(&mut self);
@@ -537,28 +881,7 @@ trait FailClosedOverlay {
     fn hide_display_window(&mut self);
 }
 
-impl FailClosedOverlay for NativeOverlayHost {
-    fn unbind_action(&mut self) {
-        self.action_bridge.bind(None);
-    }
-
-    fn reset_display_accessibility_hidden(&mut self) {
-        self.display.update_accessibility(None, false, false, None);
-    }
-
-    fn reset_control_accessibility_hidden(&mut self) {
-        self.control.update_accessibility(None, false, false, None);
-    }
-
-    fn hide_control_window(&mut self) {
-        self.control.hide();
-    }
-
-    fn hide_display_window(&mut self) {
-        self.display.hide();
-    }
-}
-
+#[cfg(test)]
 fn hide_overlay_fail_closed(overlay: &mut impl FailClosedOverlay) {
     overlay.unbind_action();
     // Reset both provider trees before hiding either HWND so a failed presentation can never
@@ -569,6 +892,7 @@ fn hide_overlay_fail_closed(overlay: &mut impl FailClosedOverlay) {
     overlay.hide_display_window();
 }
 
+#[cfg(test)]
 fn finish_display_presentation(presented: bool, overlay: &mut impl FailClosedOverlay) -> bool {
     if !presented {
         hide_overlay_fail_closed(overlay);
@@ -576,63 +900,107 @@ fn finish_display_presentation(presented: bool, overlay: &mut impl FailClosedOve
     presented
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct NativePresentationResult {
     display_presented: bool,
     control_presented: bool,
 }
 
-trait PresentationTransaction {
-    fn verify_hardening(&mut self) -> bool;
-    fn submit_pixels(&mut self) -> bool;
-    fn show_no_activate(&mut self) -> bool;
-    fn is_visible(&mut self) -> bool;
-}
-
-struct WindowPresentation<'a> {
-    window: &'a mut NativeWindow,
-    bounds: OverlayWindowBounds,
-    frame: &'a LayeredFrame,
-}
-
-impl PresentationTransaction for WindowPresentation<'_> {
-    fn verify_hardening(&mut self) -> bool {
-        self.window.is_hardened()
-    }
-
-    fn submit_pixels(&mut self) -> bool {
-        self.window.submit_frame(self.bounds, self.frame)
-    }
-
-    fn show_no_activate(&mut self) -> bool {
-        self.window.show_no_activate(self.bounds)
-    }
-
-    fn is_visible(&mut self) -> bool {
-        unsafe { IsWindowVisible(self.window.hwnd) != 0 }
-    }
-}
-
-fn try_present_transaction(transaction: &mut impl PresentationTransaction) -> bool {
-    transaction.verify_hardening()
-        && transaction.submit_pixels()
-        && transaction.show_no_activate()
-        && transaction.is_visible()
-}
-
+#[cfg(test)]
 fn combine_presentation_results(
     display_presented: bool,
     control_requested: bool,
     control_presented: bool,
 ) -> NativePresentationResult {
+    let pair_presented = display_presented && (!control_requested || control_presented);
     NativePresentationResult {
-        display_presented,
-        control_presented: display_presented && control_requested && control_presented,
+        display_presented: pair_presented,
+        control_presented: pair_presented && control_requested,
     }
 }
 
+#[cfg(test)]
 fn display_prerequisites_ready(rendered: bool, accessible: bool) -> bool {
     rendered && accessible
+}
+
+fn needs_pixel_submission(previous: Option<&OverlayRenderKey>, next: &OverlayRenderKey) -> bool {
+    previous != Some(next)
+}
+
+fn show_windows_transactionally(windows: &[(&NativeWindow, OverlayWindowBounds)]) -> bool {
+    if windows.is_empty() {
+        return true;
+    }
+    let mut deferred = unsafe { BeginDeferWindowPos(windows.len() as i32) };
+    if deferred.is_null() {
+        return false;
+    }
+    for (window, bounds) in windows {
+        deferred = unsafe {
+            DeferWindowPos(
+                deferred,
+                window.hwnd,
+                HWND_TOPMOST,
+                bounds.x,
+                bounds.y,
+                bounds.width,
+                bounds.height,
+                SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW,
+            )
+        };
+        if deferred.is_null() {
+            return false;
+        }
+    }
+    unsafe { EndDeferWindowPos(deferred) != 0 }
+}
+
+fn hide_windows_transactionally(windows: &[&NativeWindow]) -> bool {
+    if windows.is_empty() {
+        return true;
+    }
+    let mut deferred = unsafe { BeginDeferWindowPos(windows.len() as i32) };
+    if deferred.is_null() {
+        for window in windows {
+            window.hide();
+        }
+        return false;
+    }
+    for window in windows {
+        deferred = unsafe {
+            DeferWindowPos(
+                deferred,
+                window.hwnd,
+                null_mut(),
+                0,
+                0,
+                0,
+                0,
+                SWP_HIDEWINDOW
+                    | SWP_NOACTIVATE
+                    | SWP_NOMOVE
+                    | SWP_NOSIZE
+                    | SWP_NOZORDER
+                    | SWP_NOOWNERZORDER,
+            )
+        };
+        if deferred.is_null() {
+            for window in windows {
+                window.hide();
+            }
+            return false;
+        }
+    }
+    if unsafe { EndDeferWindowPos(deferred) } == 0 {
+        for window in windows {
+            window.hide();
+        }
+        false
+    } else {
+        true
+    }
 }
 
 struct LayeredSurface {
@@ -974,14 +1342,336 @@ fn wide_null(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+struct SnapshotMailbox {
+    latest: Mutex<Option<OverlaySnapshot>>,
+    shutdown: AtomicBool,
+}
+
+struct NativeOverlayService {
+    mailbox: Arc<SnapshotMailbox>,
+    events: Receiver<NativeOverlayEvent>,
+    worker: Option<JoinHandle<()>>,
+    presented: bool,
+    presented_session: Option<SessionId>,
+    pending_action: Option<OverlayAction>,
+    last_reported_failure: Option<NativeOverlayFailure>,
+}
+
+impl NativeOverlayService {
+    fn new(context: &eframe::egui::Context) -> Result<Self, NativeOverlayFailure> {
+        let mailbox = Arc::new(SnapshotMailbox {
+            latest: Mutex::new(None),
+            shutdown: AtomicBool::new(false),
+        });
+        let (event_tx, events) = bounded(OVERLAY_EVENT_CAPACITY);
+        let event_sink = NativeEventSink {
+            tx: event_tx,
+            repaint_context: context.clone(),
+        };
+        let worker_mailbox = Arc::clone(&mailbox);
+        let panic_sink = event_sink.clone();
+        let worker = thread::Builder::new()
+            .name("scribe-native-overlay".to_owned())
+            .spawn(move || {
+                let result = catch_unwind(AssertUnwindSafe(|| {
+                    run_native_overlay_thread(worker_mailbox, event_sink);
+                }));
+                if result.is_err() {
+                    panic_sink.emit(NativeOverlayEvent::Failure(NativeOverlayFailure::new(
+                        NativeOverlayFailureStage::WorkerPanicked,
+                        None,
+                    )));
+                    panic_sink.emit(NativeOverlayEvent::Presented {
+                        visible: false,
+                        session_id: None,
+                    });
+                }
+            })
+            .map_err(|_| {
+                NativeOverlayFailure::new(NativeOverlayFailureStage::HostCreation, None)
+            })?;
+        Ok(Self {
+            mailbox,
+            events,
+            worker: Some(worker),
+            presented: false,
+            presented_session: None,
+            pending_action: None,
+            last_reported_failure: None,
+        })
+    }
+
+    fn submit(&self, snapshot: OverlaySnapshot) {
+        if let Ok(mut latest) = self.mailbox.latest.lock() {
+            *latest = Some(snapshot);
+        }
+        if let Some(worker) = &self.worker {
+            worker.thread().unpark();
+        }
+    }
+
+    fn poll_events(&mut self) {
+        while let Ok(event) = self.events.try_recv() {
+            match event {
+                NativeOverlayEvent::Presented {
+                    visible,
+                    session_id,
+                } => {
+                    self.presented = visible;
+                    self.presented_session = visible.then_some(session_id).flatten();
+                    if visible {
+                        self.last_reported_failure = None;
+                    }
+                }
+                NativeOverlayEvent::Action(action) => self.pending_action = Some(action),
+                NativeOverlayEvent::Failure(failure) => {
+                    if self.last_reported_failure != Some(failure) {
+                        eprintln!(
+                            "Scribe overlay diagnostic: {} ({:?})",
+                            failure.stage.diagnostic_code(),
+                            failure.role
+                        );
+                        self.last_reported_failure = Some(failure);
+                    }
+                }
+            }
+        }
+    }
+
+    fn output_for(&mut self, snapshot: &OverlaySnapshot) -> OverlayViewportOutput {
+        self.poll_events();
+        let presented = snapshot.requested_visible
+            && self.presented
+            && (snapshot.state.session_id.is_none()
+                || self.presented_session == snapshot.state.session_id);
+        OverlayViewportOutput {
+            presented,
+            action: self.pending_action.take(),
+        }
+    }
+
+    fn shutdown(&mut self) {
+        self.mailbox.shutdown.store(true, Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            worker.thread().unpark();
+            let _ = worker.join();
+        }
+        self.presented = false;
+        self.presented_session = None;
+    }
+}
+
+impl Drop for NativeOverlayService {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+fn run_native_overlay_thread(mailbox: Arc<SnapshotMailbox>, event_sink: NativeEventSink) {
+    let mut host: Option<NativeOverlayHost> = None;
+    let mut current_snapshot: Option<OverlaySnapshot> = None;
+    let mut last_presented: Option<(bool, Option<SessionId>)> = None;
+    let mut last_failure = None;
+    let mut last_health_check = Instant::now();
+    let mut last_animation_tick = Instant::now();
+    let mut animations_enabled = overlay_animations_enabled();
+
+    while !mailbox.shutdown.load(Ordering::Acquire) {
+        pump_overlay_messages();
+        let next_snapshot = mailbox
+            .latest
+            .lock()
+            .ok()
+            .and_then(|mut latest| latest.take());
+        if let Some(snapshot) = next_snapshot {
+            current_snapshot = Some(snapshot);
+            process_snapshot(
+                &mut host,
+                current_snapshot.as_ref().expect("snapshot stored"),
+                &event_sink,
+                &mut last_presented,
+                &mut last_failure,
+                animations_enabled,
+            );
+        }
+
+        let now = Instant::now();
+        if now.duration_since(last_animation_tick) >= OVERLAY_ANIMATION_INTERVAL {
+            last_animation_tick = now;
+            if current_snapshot.as_ref().is_some_and(|snapshot| {
+                snapshot.requested_visible
+                    && animations_enabled
+                    && snapshot.state.phase.is_progressing()
+            }) && let Some(snapshot) = current_snapshot.as_ref()
+            {
+                process_snapshot(
+                    &mut host,
+                    snapshot,
+                    &event_sink,
+                    &mut last_presented,
+                    &mut last_failure,
+                    animations_enabled,
+                );
+            }
+        }
+
+        if now.duration_since(last_health_check) >= OVERLAY_HEALTH_INTERVAL {
+            last_health_check = now;
+            animations_enabled = overlay_animations_enabled();
+            if let (Some(host), Some(snapshot)) = (host.as_mut(), current_snapshot.as_ref())
+                && snapshot.requested_visible
+                && let Err(failure) = host.health_check(snapshot)
+            {
+                host.hide();
+                emit_failure_once(&event_sink, failure, &mut last_failure);
+                emit_presented_if_changed(&event_sink, false, None, &mut last_presented);
+            }
+        }
+        thread::park_timeout(OVERLAY_THREAD_POLL_INTERVAL);
+    }
+
+    if let Some(host) = host.as_mut() {
+        host.hide();
+    }
+    pump_overlay_messages();
+    emit_presented_if_changed(&event_sink, false, None, &mut last_presented);
+}
+
+fn process_snapshot(
+    host: &mut Option<NativeOverlayHost>,
+    snapshot: &OverlaySnapshot,
+    event_sink: &NativeEventSink,
+    last_presented: &mut Option<(bool, Option<SessionId>)>,
+    last_failure: &mut Option<NativeOverlayFailure>,
+    animations_enabled: bool,
+) {
+    if !snapshot.requested_visible {
+        if let Some(host) = host.as_mut() {
+            host.hide();
+        }
+        emit_presented_if_changed(event_sink, false, None, last_presented);
+        return;
+    }
+    if host.is_none() {
+        match NativeOverlayHost::new(event_sink.clone()) {
+            Ok(new_host) => *host = Some(new_host),
+            Err(_) => {
+                emit_failure_once(
+                    event_sink,
+                    NativeOverlayFailure::new(NativeOverlayFailureStage::HostCreation, None),
+                    last_failure,
+                );
+                emit_presented_if_changed(event_sink, false, None, last_presented);
+                return;
+            }
+        }
+    }
+    let animation_frame = overlay_animation_frame(snapshot, animations_enabled);
+    match host
+        .as_mut()
+        .expect("native overlay host initialized")
+        .apply_snapshot(snapshot, animation_frame)
+    {
+        Ok(visible) => {
+            *last_failure = None;
+            emit_presented_if_changed(
+                event_sink,
+                visible,
+                snapshot.state.session_id,
+                last_presented,
+            );
+        }
+        Err(failure) => {
+            if let Some(host) = host.as_mut() {
+                host.hide();
+            }
+            emit_failure_once(event_sink, failure, last_failure);
+            emit_presented_if_changed(event_sink, false, None, last_presented);
+        }
+    }
+}
+
+fn emit_failure_once(
+    event_sink: &NativeEventSink,
+    failure: NativeOverlayFailure,
+    last_failure: &mut Option<NativeOverlayFailure>,
+) {
+    if *last_failure != Some(failure) {
+        event_sink.emit(NativeOverlayEvent::Failure(failure));
+        *last_failure = Some(failure);
+    }
+}
+
+fn emit_presented_if_changed(
+    event_sink: &NativeEventSink,
+    visible: bool,
+    session_id: Option<SessionId>,
+    last_presented: &mut Option<(bool, Option<SessionId>)>,
+) {
+    let next = (visible, visible.then_some(session_id).flatten());
+    if *last_presented != Some(next) {
+        event_sink.emit(NativeOverlayEvent::Presented {
+            visible,
+            session_id,
+        });
+        *last_presented = Some(next);
+    }
+}
+
+fn overlay_animation_frame(snapshot: &OverlaySnapshot, animations_enabled: bool) -> u8 {
+    if !animations_enabled || !snapshot.state.phase.is_progressing() {
+        return 0;
+    }
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    ((elapsed / OVERLAY_ANIMATION_INTERVAL.as_millis()) % 8) as u8
+}
+
+fn pump_overlay_messages() {
+    let mut message: MSG = unsafe { zeroed() };
+    while unsafe { PeekMessageW(&mut message, null_mut(), 0, 0, PM_REMOVE) } != 0 {
+        unsafe {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+    }
+}
+
+fn overlay_animations_enabled() -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::SystemParametersInfoW;
+
+    const SPI_GETCLIENTAREAANIMATION: u32 = 0x1042;
+    let mut enabled = 0i32;
+    unsafe {
+        SystemParametersInfoW(
+            SPI_GETCLIENTAREAANIMATION,
+            0,
+            (&mut enabled as *mut i32).cast::<c_void>(),
+            0,
+        ) != 0
+            && enabled != 0
+    }
+}
+
+fn snapshot_dpi(spec_width_points: f32, display_width_pixels: i32) -> u32 {
+    if !spec_width_points.is_finite() || spec_width_points <= 0.0 || display_width_pixels <= 0 {
+        return 96;
+    }
+    ((display_width_pixels as f32 / spec_width_points) * 96.0)
+        .round()
+        .clamp(48.0, 768.0) as u32
+}
+
 thread_local! {
-    static NATIVE_OVERLAY_HOST: RefCell<Option<NativeOverlayHost>> = const { RefCell::new(None) };
+    static NATIVE_OVERLAY_SERVICE: RefCell<Option<NativeOverlayService>> = const { RefCell::new(None) };
 }
 
 pub(super) fn shutdown_overlay_viewport() {
-    NATIVE_OVERLAY_HOST.with(|slot| {
-        if let Some(mut host) = slot.borrow_mut().take() {
-            host.hide();
+    NATIVE_OVERLAY_SERVICE.with(|slot| {
+        if let Some(mut service) = slot.borrow_mut().take() {
+            service.shutdown();
         }
     });
 }
@@ -993,107 +1683,40 @@ pub(super) fn show_overlay_viewport(
     position: OverlayPosition,
     presentation: OverlayPresentation,
 ) -> OverlayViewportOutput {
-    NATIVE_OVERLAY_HOST.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        let requested_visible = state.is_visible() && presentation.permits_background_overlay();
-        if !requested_visible {
-            let action = slot.as_ref().and_then(NativeOverlayHost::next_action);
-            if let Some(host) = slot.as_mut() {
-                host.hide();
-            }
-            return OverlayViewportOutput {
-                presented: false,
-                action,
-            };
-        }
-
+    let dark_mode = context.style().visuals.dark_mode;
+    let requested_visible = state.is_visible() && presentation.permits_background_overlay();
+    let snapshot = if requested_visible {
         let spec = window_spec(state.mode);
-        let Some(display_bounds) = overlay_window_bounds(target, spec, position) else {
-            let action = slot.as_ref().and_then(NativeOverlayHost::next_action);
-            if let Some(host) = slot.as_mut() {
-                host.hide();
+        if let Some(display_bounds) = overlay_window_bounds(target, spec, position) {
+            let control_bounds = control_window_bounds(display_bounds, spec);
+            OverlaySnapshot {
+                state: state.clone(),
+                dark_mode,
+                dpi: snapshot_dpi(spec.width_points, display_bounds.width),
+                display_bounds: Some(display_bounds),
+                control_bounds: Some(control_bounds),
+                requested_visible: true,
+                control_requested: is_cancellable(state),
             }
-            return OverlayViewportOutput {
-                presented: false,
-                action,
-            };
-        };
+        } else {
+            OverlaySnapshot::hidden(state, dark_mode)
+        }
+    } else {
+        OverlaySnapshot::hidden(state, dark_mode)
+    };
 
+    NATIVE_OVERLAY_SERVICE.with(|slot| {
+        let mut slot = slot.borrow_mut();
         if slot.is_none() {
-            let Ok(host) = NativeOverlayHost::new() else {
+            let Ok(service) = NativeOverlayService::new(context) else {
+                eprintln!("Scribe overlay diagnostic: native-overlay-host (None)");
                 return OverlayViewportOutput::default();
             };
-            *slot = Some(host);
+            *slot = Some(service);
         }
-        let host = slot.as_mut().expect("native overlay host initialized");
-        let action = host.next_action();
-        let dark_mode = context.style().visuals.dark_mode;
-        let Ok(display_frame) = host.rasterizer.render_display(
-            state,
-            dark_mode,
-            display_bounds.width,
-            display_bounds.height,
-        ) else {
-            host.hide();
-            return OverlayViewportOutput {
-                presented: false,
-                action,
-            };
-        };
-
-        let control_bounds = control_window_bounds(display_bounds, spec);
-        let control_requested = is_cancellable(state);
-        let control_frame = control_requested
-            .then(|| {
-                host.rasterizer.render_control(
-                    dark_mode,
-                    control_bounds.width,
-                    control_bounds.height,
-                )
-            })
-            .transpose()
-            .ok()
-            .flatten();
-        let control_rendered = control_frame.is_some();
-        let display_accessible =
-            host.display
-                .update_accessibility(Some(state), true, false, Some(display_bounds));
-        if !display_prerequisites_ready(true, display_accessible) {
-            host.hide();
-            return OverlayViewportOutput {
-                presented: false,
-                action,
-            };
-        }
-        let control_candidate =
-            control_requested && control_rendered && host.control.control_capabilities_ready();
-        let control_accessible = if control_candidate {
-            host.control
-                .update_accessibility(Some(state), true, true, Some(control_bounds))
-        } else {
-            host.control.update_accessibility(None, false, false, None);
-            false
-        };
-        let transparent_control = LayeredFrame {
-            width: control_bounds.width,
-            height: control_bounds.height,
-            pixels: vec![
-                0;
-                frame_byte_len(control_bounds.width, control_bounds.height).unwrap_or(0)
-            ],
-        };
-        let result = host.present(
-            display_bounds,
-            &display_frame,
-            control_candidate && control_accessible,
-            control_bounds,
-            control_frame.as_ref().unwrap_or(&transparent_control),
-            state.session_id,
-        );
-        OverlayViewportOutput {
-            presented: result.display_presented,
-            action,
-        }
+        let service = slot.as_mut().expect("native overlay service initialized");
+        service.submit(snapshot.clone());
+        service.output_for(&snapshot)
     })
 }
 
@@ -1101,6 +1724,20 @@ pub(super) fn show_overlay_viewport(
 mod tests {
     use super::super::platform::OverlayWindowSpec;
     use super::*;
+
+    trait PresentationTransaction {
+        fn verify_hardening(&mut self) -> bool;
+        fn submit_pixels(&mut self) -> bool;
+        fn show_no_activate(&mut self) -> bool;
+        fn is_visible(&mut self) -> bool;
+    }
+
+    fn try_present_transaction(transaction: &mut impl PresentationTransaction) -> bool {
+        transaction.verify_hardening()
+            && transaction.submit_pixels()
+            && transaction.show_no_activate()
+            && transaction.is_visible()
+    }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum Step {
@@ -1198,6 +1835,37 @@ mod tests {
         }
     }
 
+    fn snapshot_for_test() -> OverlaySnapshot {
+        let mut state = OverlayViewState {
+            session_id: Some(SessionId(7)),
+            phase: super::super::controller::OverlayPhase::Listening,
+            elapsed: Some(Duration::from_millis(1_250)),
+            ..OverlayViewState::default()
+        };
+        state.transcript.committed = "hello".to_owned();
+        state.transcript.revision = 3;
+        let display_bounds = OverlayWindowBounds {
+            x: -1200,
+            y: 900,
+            width: 750,
+            height: 78,
+        };
+        OverlaySnapshot {
+            state,
+            dark_mode: true,
+            dpi: 120,
+            display_bounds: Some(display_bounds),
+            control_bounds: Some(OverlayWindowBounds {
+                x: -520,
+                y: 912,
+                width: 55,
+                height: 55,
+            }),
+            requested_visible: true,
+            control_requested: true,
+        }
+    }
+
     #[test]
     fn display_and_control_profiles_are_deliberately_distinct() {
         assert_eq!(
@@ -1210,6 +1878,88 @@ mod tests {
             REQUIRED_BASE_EX_STYLE
         );
         assert_eq!(CONTROL_EX_STYLE & WS_EX_TRANSPARENT, 0);
+    }
+
+    #[test]
+    fn unchanged_render_keys_do_not_request_another_pixel_submission() {
+        let snapshot = snapshot_for_test();
+        let first = snapshot.render_key(0);
+        let same = snapshot.render_key(0);
+        let mut previous = None;
+        let mut submissions = 0;
+        for key in [&first, &same] {
+            if needs_pixel_submission(previous.as_ref(), key) {
+                submissions += 1;
+                previous = Some(key.clone());
+            }
+        }
+
+        assert_eq!(submissions, 1);
+        assert!(!needs_pixel_submission(Some(&first), &same));
+    }
+
+    #[test]
+    fn render_key_covers_content_quantized_levels_animation_theme_dpi_and_bounds() {
+        let snapshot = snapshot_for_test();
+        let baseline = snapshot.render_key(2);
+
+        let mut same_buckets = snapshot.clone();
+        same_buckets.state.audio_level.rms = 0.001;
+        same_buckets.state.audio_level.peak = 0.001;
+        assert_eq!(baseline.rms_bucket, same_buckets.render_key(2).rms_bucket);
+
+        let mut content_changed = snapshot.clone();
+        content_changed.state.transcript.committed = "different".to_owned();
+        assert_ne!(baseline, content_changed.render_key(2));
+
+        let mut level_changed = snapshot.clone();
+        level_changed.state.audio_level.rms = 1.0;
+        assert_ne!(baseline, level_changed.render_key(2));
+
+        let mut theme_changed = snapshot.clone();
+        theme_changed.dark_mode = false;
+        assert_ne!(baseline, theme_changed.render_key(2));
+
+        let mut dpi_changed = snapshot.clone();
+        dpi_changed.dpi = 144;
+        assert_ne!(baseline, dpi_changed.render_key(2));
+
+        let mut bounds_changed = snapshot.clone();
+        bounds_changed.display_bounds.as_mut().unwrap().x += 1;
+        assert_ne!(baseline, bounds_changed.render_key(2));
+        assert_ne!(baseline, snapshot.render_key(3));
+    }
+
+    #[test]
+    fn latest_snapshot_mailbox_coalesces_superseded_meter_updates() {
+        let mailbox = SnapshotMailbox {
+            latest: Mutex::new(None),
+            shutdown: AtomicBool::new(false),
+        };
+        let first = snapshot_for_test();
+        let mut newest = first.clone();
+        newest.state.transcript.revision = 9;
+        newest.state.audio_level.rms = 0.8;
+
+        *mailbox.latest.lock().unwrap() = Some(first);
+        *mailbox.latest.lock().unwrap() = Some(newest.clone());
+
+        assert_eq!(
+            mailbox.latest.lock().unwrap().take().unwrap().state,
+            newest.state
+        );
+    }
+
+    #[test]
+    fn failure_events_are_structured_and_do_not_carry_overlay_content() {
+        let failure = NativeOverlayFailure::new(
+            NativeOverlayFailureStage::Rasterization,
+            Some(WindowRole::Display),
+        );
+        let diagnostic = format!("{failure:?}");
+        assert!(diagnostic.contains("Rasterization"));
+        assert!(!diagnostic.contains("transcript"));
+        assert!(!diagnostic.contains("hello"));
     }
 
     #[test]
@@ -1258,7 +2008,10 @@ mod tests {
         let (tx, rx) = bounded(1);
         let bridge = Arc::new(ControlActionBridge {
             session_id: Mutex::new(Some(SessionId(91))),
-            tx,
+            event_sink: NativeEventSink {
+                tx,
+                repaint_context: eframe::egui::Context::default(),
+            },
         });
         let state = WindowProcedureState {
             role: WindowRole::Control,
@@ -1300,13 +2053,10 @@ mod tests {
     }
 
     #[test]
-    fn control_failure_does_not_revoke_a_presented_passive_display() {
+    fn paired_control_failure_prevents_a_presented_overlay_pair() {
         assert_eq!(
             combine_presentation_results(true, true, false),
-            NativePresentationResult {
-                display_presented: true,
-                control_presented: false,
-            }
+            NativePresentationResult::default()
         );
         assert_eq!(
             combine_presentation_results(false, true, true),
@@ -1327,14 +2077,22 @@ mod tests {
         let (tx, rx) = bounded(4);
         let bridge = ControlActionBridge {
             session_id: Mutex::new(None),
-            tx,
+            event_sink: NativeEventSink {
+                tx,
+                repaint_context: eframe::egui::Context::default(),
+            },
         };
         bridge.emit_abandon();
         assert!(rx.try_recv().is_err());
 
         bridge.bind(Some(SessionId(41)));
         bridge.emit_abandon();
-        assert_eq!(rx.try_recv(), Ok(OverlayAction::Abandon(SessionId(41))));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(NativeOverlayEvent::Action(OverlayAction::Abandon(
+                SessionId(41)
+            )))
+        ));
 
         bridge.bind(None);
         bridge.emit_abandon();
