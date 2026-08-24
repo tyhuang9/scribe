@@ -514,14 +514,14 @@ fn render_live_status_row(ui: &mut egui::Ui, state: &OverlayViewState, colors: O
                     builder.set_live(egui::accesskit::Live::Polite);
                 }
             });
-            if let Some(announcement_text) = live_overlay_announcement(state) {
-                let announcement = ui.allocate_response(egui::Vec2::ZERO, Sense::hover());
-                ui.ctx().accesskit_node_builder(announcement.id, |builder| {
-                    builder.set_role(egui::accesskit::Role::StaticText);
-                    builder.set_name(announcement_text);
-                    builder.set_live(egui::accesskit::Live::Polite);
-                });
-            }
+        }
+        if let Some(announcement_text) = live_overlay_announcement(state) {
+            let announcement = ui.allocate_response(egui::Vec2::ZERO, Sense::hover());
+            ui.ctx().accesskit_node_builder(announcement.id, |builder| {
+                builder.set_role(egui::accesskit::Role::StaticText);
+                builder.set_name(announcement_text);
+                builder.set_live(egui::accesskit::Live::Polite);
+            });
         }
     });
 }
@@ -1802,6 +1802,48 @@ mod tests {
                     .is_some_and(|name| name.contains("tentative words"))
             );
         }
+    }
+
+    #[test]
+    fn listening_without_a_preview_announces_recording_without_exposing_transcript_nodes() {
+        let context = egui::Context::default();
+        context.enable_accesskit();
+        let state = OverlayViewState {
+            mode: OverlayMode::Live,
+            phase: OverlayPhase::Listening,
+            phase_announcement: Some("Recording".to_owned()),
+            transcript: super::super::controller::OverlayTranscript {
+                committed: "must not leak".to_owned(),
+                tentative: " into accessibility".to_owned(),
+                revision: 1,
+            },
+            ..OverlayViewState::default()
+        };
+
+        let output = context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(LIVE_WIDTH, LIVE_HEIGHT),
+                )),
+                ..Default::default()
+            },
+            |context| render_overlay(context, &state),
+        );
+        let update = output.platform_output.accesskit_update.unwrap();
+        let polite_nodes = update
+            .nodes
+            .iter()
+            .filter(|(_, node)| node.live() == Some(egui::accesskit::Live::Polite))
+            .collect::<Vec<_>>();
+
+        assert_eq!(polite_nodes.len(), 1);
+        assert_eq!(polite_nodes[0].1.name(), Some("Recording"));
+        assert!(update.nodes.iter().all(|(_, node)| {
+            !node
+                .name()
+                .is_some_and(|name| name.contains("must not leak"))
+        }));
     }
 
     #[test]

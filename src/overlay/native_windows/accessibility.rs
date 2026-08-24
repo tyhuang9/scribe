@@ -179,7 +179,7 @@ fn display_tree(
         children.push(DISPLAY_PREVIEW_ID);
     }
     let announcement = live_overlay_announcement(state);
-    if preview_visible && announcement.is_some() {
+    if live_mode && announcement.is_some() {
         children.push(DISPLAY_ANNOUNCEMENT_ID);
     }
 
@@ -230,12 +230,12 @@ fn display_tree(
         preview.set_bounds(accesskit_rect(
             layout.preview.expect("live layout includes preview bounds"),
         ));
-        if state.error.is_some() || state.notice.is_some() || state.phase_announcement.is_some() {
+        if state.error.is_some() || state.notice.is_some() {
             preview.set_live(Live::Polite);
         }
         nodes.push((DISPLAY_PREVIEW_ID, preview.build(&mut classes)));
     }
-    if preview_visible && let Some(announcement) = announcement {
+    if live_mode && let Some(announcement) = announcement {
         let mut live = NodeBuilder::new(Role::StaticText);
         live.set_name(announcement);
         live.set_live(Live::Polite);
@@ -409,12 +409,13 @@ mod tests {
     }
 
     #[test]
-    fn live_tree_without_a_started_preview_exposes_only_logo_status_and_elapsed_time() {
+    fn live_tree_without_a_started_preview_announces_recording_once_without_transcript_nodes() {
         let state = OverlayViewState {
             mode: OverlayMode::Live,
             phase: OverlayPhase::Listening,
             live_preview_available: false,
             elapsed: Some(std::time::Duration::from_secs(12)),
+            phase_announcement: Some("Recording".to_owned()),
             transcript: OverlayTranscript {
                 committed: "must not leak".to_owned(),
                 tentative: "into accessibility".to_owned(),
@@ -438,8 +439,50 @@ mod tests {
                 && node.name() == Some("Scribe")
                 && node.description() == Some("Scribe is recording")
         }));
+        let polite_nodes = tree
+            .nodes
+            .iter()
+            .filter(|(_, node)| node.live() == Some(Live::Polite))
+            .collect::<Vec<_>>();
+        assert_eq!(polite_nodes.len(), 1);
+        assert_eq!(polite_nodes[0].0, DISPLAY_ANNOUNCEMENT_ID);
+        assert_eq!(polite_nodes[0].1.name(), Some("Recording"));
         assert!(tree.nodes.iter().all(|(id, node)| {
-            *id != DISPLAY_PREVIEW_ID && *id != DISPLAY_ANNOUNCEMENT_ID && node.live().is_none()
+            *id != DISPLAY_PREVIEW_ID
+                && !node
+                    .name()
+                    .is_some_and(|name| name.contains("must not leak"))
+        }));
+    }
+
+    #[test]
+    fn lifecycle_phase_announcements_have_one_native_live_owner() {
+        let state = OverlayViewState {
+            mode: OverlayMode::Live,
+            phase: OverlayPhase::Processing,
+            live_preview_available: true,
+            phase_announcement: Some("Transcribing…".to_owned()),
+            transcript: OverlayTranscript {
+                committed: "stale preview".to_owned(),
+                tentative: " must not be announced".to_owned(),
+                revision: 1,
+            },
+            ..OverlayViewState::default()
+        };
+        let tree = display_tree(&state, true, Some(display_bounds(OverlayMode::Live)));
+        let polite_nodes = tree
+            .nodes
+            .iter()
+            .filter(|(_, node)| node.live() == Some(Live::Polite))
+            .collect::<Vec<_>>();
+
+        assert_eq!(polite_nodes.len(), 1);
+        assert_eq!(polite_nodes[0].0, DISPLAY_ANNOUNCEMENT_ID);
+        assert_eq!(polite_nodes[0].1.name(), Some("Transcribing…"));
+        assert!(tree.nodes.iter().any(|(id, node)| {
+            *id == DISPLAY_PREVIEW_ID
+                && node.live().is_none()
+                && node.name() == Some("Transcribing…")
         }));
     }
 
