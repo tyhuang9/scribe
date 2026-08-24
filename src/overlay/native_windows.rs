@@ -70,6 +70,7 @@ const REQUIRED_BASE_EX_STYLE: u32 =
 const DISPLAY_EX_STYLE: u32 = REQUIRED_BASE_EX_STYLE | WS_EX_TRANSPARENT;
 const CONTROL_EX_STYLE: u32 = REQUIRED_BASE_EX_STYLE;
 const OVERLAY_THREAD_POLL_INTERVAL: Duration = Duration::from_millis(16);
+const OVERLAY_THREAD_IDLE_INTERVAL: Duration = Duration::from_millis(500);
 const OVERLAY_HEALTH_INTERVAL: Duration = Duration::from_millis(500);
 const OVERLAY_ANIMATION_INTERVAL: Duration = Duration::from_millis(125);
 const OVERLAY_EVENT_CAPACITY: usize = 32;
@@ -115,6 +116,7 @@ enum NativeOverlayFailureStage {
     LayeredPresentation,
     Positioning,
     Visibility,
+    WindowProcedure,
     WorkerPanicked,
 }
 
@@ -127,6 +129,7 @@ impl NativeOverlayFailureStage {
             Self::LayeredPresentation => "native-overlay-layered-present",
             Self::Positioning => "native-overlay-position",
             Self::Visibility => "native-overlay-visibility",
+            Self::WindowProcedure => "native-overlay-window-procedure",
             Self::WorkerPanicked => "native-overlay-worker",
         }
     }
@@ -159,6 +162,7 @@ struct NativeEventSink {
     tx: Sender<NativeOverlayEvent>,
     repaint_context: eframe::egui::Context,
     presentation: Arc<Mutex<NativePresentationObservation>>,
+    retained_action: Arc<Mutex<Option<OverlayAction>>>,
 }
 
 impl NativeEventSink {
@@ -174,6 +178,12 @@ impl NativeEventSink {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             presentation.visible = *visible;
             presentation.session_id = visible.then_some(*session_id).flatten();
+        }
+        if let NativeOverlayEvent::Action(action) = &event {
+            *self
+                .retained_action
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(*action);
         }
         let _ = self.tx.try_send(event);
         self.repaint_context.request_repaint();
@@ -245,6 +255,9 @@ struct OverlayRenderKey {
     display_bounds: Option<OverlayWindowBounds>,
     control_bounds: Option<OverlayWindowBounds>,
     control_requested: bool,
+    // The rasterizer resolves the shared time-based progress glyph while it
+    // paints. This epoch is the cache invalidator for that indirect animation
+    // input; reduced motion holds it at zero.
     animation_frame: u8,
 }
 
@@ -286,6 +299,96 @@ struct ControlActionBridge {
     event_sink: NativeEventSink,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct OverlayWindowPair {
+    display: isize,
+    control: isize,
+}
+
+struct PairFailureBridge {
+    windows: Mutex<OverlayWindowPair>,
+    recovery_requested: AtomicBool,
+    action_bridge: Arc<ControlActionBridge>,
+    event_sink: NativeEventSink,
+}
+
+impl PairFailureBridge {
+    fn bind(&self, role: WindowRole, hwnd: HWND) {
+        let mut windows = self
+            .windows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match role {
+            WindowRole::Display => windows.display = hwnd as isize,
+            WindowRole::Control => windows.control = hwnd as isize,
+        }
+    }
+
+    fn unbind(&self, role: WindowRole, hwnd: HWND) {
+        let mut windows = self
+            .windows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let slot = match role {
+            WindowRole::Display => &mut windows.display,
+            WindowRole::Control => &mut windows.control,
+        };
+        if *slot == hwnd as isize {
+            *slot = 0;
+        }
+    }
+
+    fn fail_closed(&self, role: WindowRole) {
+        self.action_bridge.bind(None);
+        self.recovery_requested.store(true, Ordering::Release);
+        let windows = *self
+            .windows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let captured = unsafe { GetCapture() } as isize;
+        if captured != 0 && (captured == windows.display || captured == windows.control) {
+            unsafe {
+                ReleaseCapture();
+            }
+        }
+        for handle in [windows.control, windows.display] {
+            if handle == 0 {
+                continue;
+            }
+            unsafe {
+                SetWindowPos(
+                    handle as HWND,
+                    null_mut(),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_HIDEWINDOW
+                        | SWP_NOACTIVATE
+                        | SWP_NOMOVE
+                        | SWP_NOSIZE
+                        | SWP_NOZORDER
+                        | SWP_NOOWNERZORDER,
+                );
+                ShowWindow(handle as HWND, SW_HIDE);
+            }
+        }
+        self.event_sink
+            .emit(NativeOverlayEvent::Failure(NativeOverlayFailure::new(
+                NativeOverlayFailureStage::WindowProcedure,
+                Some(role),
+            )));
+        self.event_sink.emit(NativeOverlayEvent::Presented {
+            visible: false,
+            session_id: None,
+        });
+    }
+
+    fn take_recovery_request(&self) -> bool {
+        self.recovery_requested.swap(false, Ordering::AcqRel)
+    }
+}
+
 impl ControlActionBridge {
     fn bind(&self, session_id: Option<SessionId>) {
         if let Ok(mut current) = self.session_id.lock() {
@@ -307,6 +410,7 @@ impl ControlActionBridge {
 struct WindowProcedureState {
     role: WindowRole,
     action_bridge: Option<Arc<ControlActionBridge>>,
+    pair_failure: Arc<PairFailureBridge>,
     pressed: Cell<bool>,
     accessibility: RefCell<Option<NativeAccessibility>>,
 }
@@ -330,6 +434,7 @@ struct NativeWindow {
     role: WindowRole,
     surface: Option<LayeredSurface>,
     tooltip: Option<NativeTooltip>,
+    pair_failure: Arc<PairFailureBridge>,
     _procedure_state: Box<WindowProcedureState>,
 }
 
@@ -337,6 +442,7 @@ impl NativeWindow {
     fn create(
         role: WindowRole,
         action_bridge: Option<Arc<ControlActionBridge>>,
+        pair_failure: Arc<PairFailureBridge>,
     ) -> Result<Self, NativeOverlayError> {
         register_window_classes()?;
         let class_name = wide_null(role.class_name());
@@ -345,6 +451,7 @@ impl NativeWindow {
         let mut procedure_state = Box::new(WindowProcedureState {
             role,
             action_bridge,
+            pair_failure: Arc::clone(&pair_failure),
             pressed: Cell::new(false),
             accessibility: RefCell::new(None),
         });
@@ -376,8 +483,10 @@ impl NativeWindow {
             role,
             surface: None,
             tooltip: None,
+            pair_failure,
             _procedure_state: procedure_state,
         };
+        window.pair_failure.bind(role, hwnd);
         if !window.is_hardened() {
             return Err(NativeOverlayError::Hardening(role));
         }
@@ -543,6 +652,7 @@ impl NativeWindow {
 
 impl Drop for NativeWindow {
     fn drop(&mut self) {
+        self.pair_failure.unbind(self.role, self.hwnd);
         self.tooltip.take();
         self._procedure_state.accessibility.borrow_mut().take();
         self.hide();
@@ -683,6 +793,7 @@ struct NativeOverlayHost {
     control: NativeWindow,
     rasterizer: NativeRasterizer,
     action_bridge: Arc<ControlActionBridge>,
+    pair_failure: Arc<PairFailureBridge>,
     last_render_key: Option<OverlayRenderKey>,
 }
 
@@ -692,14 +803,25 @@ impl NativeOverlayHost {
             session_id: Mutex::new(None),
             event_sink,
         });
-        let display = NativeWindow::create(WindowRole::Display, None)?;
-        let control = NativeWindow::create(WindowRole::Control, Some(Arc::clone(&action_bridge)))?;
+        let pair_failure = Arc::new(PairFailureBridge {
+            windows: Mutex::new(OverlayWindowPair::default()),
+            recovery_requested: AtomicBool::new(false),
+            action_bridge: Arc::clone(&action_bridge),
+            event_sink: action_bridge.event_sink.clone(),
+        });
+        let display = NativeWindow::create(WindowRole::Display, None, Arc::clone(&pair_failure))?;
+        let control = NativeWindow::create(
+            WindowRole::Control,
+            Some(Arc::clone(&action_bridge)),
+            Arc::clone(&pair_failure),
+        )?;
         let rasterizer = NativeRasterizer::new()?;
         Ok(Self {
             display,
             control,
             rasterizer,
             action_bridge,
+            pair_failure,
             last_render_key: None,
         })
     }
@@ -895,59 +1017,10 @@ impl NativeOverlayHost {
         hide_windows_transactionally(&[&self.control, &self.display]);
         self.last_render_key = None;
     }
-}
 
-#[cfg(test)]
-trait FailClosedOverlay {
-    fn unbind_action(&mut self);
-    fn reset_display_accessibility_hidden(&mut self);
-    fn reset_control_accessibility_hidden(&mut self);
-    fn hide_control_window(&mut self);
-    fn hide_display_window(&mut self);
-}
-
-#[cfg(test)]
-fn hide_overlay_fail_closed(overlay: &mut impl FailClosedOverlay) {
-    overlay.unbind_action();
-    // Reset both provider trees before hiding either HWND so a failed presentation can never
-    // leave a visible semantic tree behind a hidden surface.
-    overlay.reset_display_accessibility_hidden();
-    overlay.reset_control_accessibility_hidden();
-    overlay.hide_control_window();
-    overlay.hide_display_window();
-}
-
-#[cfg(test)]
-fn finish_display_presentation(presented: bool, overlay: &mut impl FailClosedOverlay) -> bool {
-    if !presented {
-        hide_overlay_fail_closed(overlay);
+    fn take_pair_recovery_request(&self) -> bool {
+        self.pair_failure.take_recovery_request()
     }
-    presented
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct NativePresentationResult {
-    display_presented: bool,
-    control_presented: bool,
-}
-
-#[cfg(test)]
-fn combine_presentation_results(
-    display_presented: bool,
-    control_requested: bool,
-    control_presented: bool,
-) -> NativePresentationResult {
-    let pair_presented = display_presented && (!control_requested || control_presented);
-    NativePresentationResult {
-        display_presented: pair_presented,
-        control_presented: pair_presented && control_requested,
-    }
-}
-
-#[cfg(test)]
-fn display_prerequisites_ready(rendered: bool, accessible: bool) -> bool {
-    rendered && accessible
 }
 
 fn needs_pixel_submission(previous: Option<&OverlayRenderKey>, next: &OverlayRenderKey) -> bool {
@@ -1252,7 +1325,9 @@ unsafe fn native_overlay_wnd_proc_panic_fallback(
     // cannot remain operable. The outer containment also catches any panic in this cleanup.
     let state = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const WindowProcedureState;
     if !state.is_null() {
-        fail_closed_window_state(unsafe { &*state });
+        let state = unsafe { &*state };
+        fail_closed_window_state(state);
+        state.pair_failure.fail_closed(state.role);
     }
     unsafe {
         ShowWindow(hwnd, SW_HIDE);
@@ -1377,6 +1452,7 @@ struct NativeOverlayService {
     events: Receiver<NativeOverlayEvent>,
     worker: Option<JoinHandle<()>>,
     presentation: Arc<Mutex<NativePresentationObservation>>,
+    retained_action: Arc<Mutex<Option<OverlayAction>>>,
     pending_action: Option<OverlayAction>,
     last_reported_failure: Option<NativeOverlayFailure>,
 }
@@ -1389,10 +1465,12 @@ impl NativeOverlayService {
         });
         let (event_tx, events) = bounded(OVERLAY_EVENT_CAPACITY);
         let presentation = Arc::new(Mutex::new(NativePresentationObservation::default()));
+        let retained_action = Arc::new(Mutex::new(None));
         let event_sink = NativeEventSink {
             tx: event_tx,
             repaint_context: context.clone(),
             presentation: Arc::clone(&presentation),
+            retained_action: Arc::clone(&retained_action),
         };
         let worker_mailbox = Arc::clone(&mailbox);
         let panic_sink = event_sink.clone();
@@ -1421,6 +1499,7 @@ impl NativeOverlayService {
             events,
             worker: Some(worker),
             presentation,
+            retained_action,
             pending_action: None,
             last_reported_failure: None,
         })
@@ -1461,6 +1540,14 @@ impl NativeOverlayService {
                 }
             }
         }
+        if let Some(action) = self
+            .retained_action
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            self.pending_action = Some(action);
+        }
     }
 
     fn output_for(&mut self, snapshot: &OverlaySnapshot) -> OverlayViewportOutput {
@@ -1500,6 +1587,10 @@ impl Drop for NativeOverlayService {
 }
 
 fn run_native_overlay_thread(mailbox: Arc<SnapshotMailbox>, event_sink: NativeEventSink) {
+    // Layered topmost HWNDs are a desktop-compositor integration. They cover
+    // ordinary and DWM-composited borderless windows; exclusive fullscreen,
+    // Independent Flip, graphics injection, and anti-cheat interaction are
+    // intentionally outside this service's contract.
     let mut host: Option<NativeOverlayHost> = None;
     let mut current_snapshot: Option<OverlaySnapshot> = None;
     let mut last_presented: Option<(bool, Option<SessionId>)> = None;
@@ -1510,6 +1601,12 @@ fn run_native_overlay_thread(mailbox: Arc<SnapshotMailbox>, event_sink: NativeEv
 
     while !mailbox.shutdown.load(Ordering::Acquire) {
         pump_overlay_messages();
+        if let Some(host) = host.as_mut()
+            && host.take_pair_recovery_request()
+        {
+            host.hide();
+            emit_presented_if_changed(&event_sink, false, None, &mut last_presented);
+        }
         let next_snapshot = mailbox
             .latest
             .lock()
@@ -1559,7 +1656,15 @@ fn run_native_overlay_thread(mailbox: Arc<SnapshotMailbox>, event_sink: NativeEv
                 emit_presented_if_changed(&event_sink, false, None, &mut last_presented);
             }
         }
-        thread::park_timeout(OVERLAY_THREAD_POLL_INTERVAL);
+        let wait = if current_snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.requested_visible)
+        {
+            OVERLAY_THREAD_POLL_INTERVAL
+        } else {
+            OVERLAY_THREAD_IDLE_INTERVAL
+        };
+        thread::park_timeout(wait);
     }
 
     if let Some(host) = host.as_mut() {
@@ -1757,116 +1862,6 @@ mod tests {
     use super::super::platform::OverlayWindowSpec;
     use super::*;
 
-    trait PresentationTransaction {
-        fn verify_hardening(&mut self) -> bool;
-        fn submit_pixels(&mut self) -> bool;
-        fn show_no_activate(&mut self) -> bool;
-        fn is_visible(&mut self) -> bool;
-    }
-
-    fn try_present_transaction(transaction: &mut impl PresentationTransaction) -> bool {
-        transaction.verify_hardening()
-            && transaction.submit_pixels()
-            && transaction.show_no_activate()
-            && transaction.is_visible()
-    }
-
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    enum Step {
-        Verify,
-        Submit,
-        Show,
-        Visible,
-        Unbind,
-        ResetDisplayAccessibility,
-        ResetControlAccessibility,
-        HideControlWindow,
-        HideDisplayWindow,
-    }
-
-    struct FakeTransaction {
-        fail_at: Option<Step>,
-        steps: Vec<Step>,
-    }
-
-    impl FakeTransaction {
-        fn new(fail_at: Option<Step>) -> Self {
-            Self {
-                fail_at,
-                steps: Vec::new(),
-            }
-        }
-
-        fn step(&mut self, step: Step) -> bool {
-            self.steps.push(step);
-            self.fail_at != Some(step)
-        }
-    }
-
-    impl PresentationTransaction for FakeTransaction {
-        fn verify_hardening(&mut self) -> bool {
-            self.step(Step::Verify)
-        }
-
-        fn submit_pixels(&mut self) -> bool {
-            self.step(Step::Submit)
-        }
-
-        fn show_no_activate(&mut self) -> bool {
-            self.step(Step::Show)
-        }
-
-        fn is_visible(&mut self) -> bool {
-            self.step(Step::Visible)
-        }
-    }
-
-    struct FakeOverlay {
-        display_accessibility_visible: bool,
-        control_accessibility_visible: bool,
-        display_window_visible: bool,
-        control_window_visible: bool,
-        steps: Vec<Step>,
-    }
-
-    impl FakeOverlay {
-        fn visible() -> Self {
-            Self {
-                display_accessibility_visible: true,
-                control_accessibility_visible: true,
-                display_window_visible: true,
-                control_window_visible: true,
-                steps: Vec::new(),
-            }
-        }
-    }
-
-    impl FailClosedOverlay for FakeOverlay {
-        fn unbind_action(&mut self) {
-            self.steps.push(Step::Unbind);
-        }
-
-        fn reset_display_accessibility_hidden(&mut self) {
-            self.steps.push(Step::ResetDisplayAccessibility);
-            self.display_accessibility_visible = false;
-        }
-
-        fn reset_control_accessibility_hidden(&mut self) {
-            self.steps.push(Step::ResetControlAccessibility);
-            self.control_accessibility_visible = false;
-        }
-
-        fn hide_control_window(&mut self) {
-            self.steps.push(Step::HideControlWindow);
-            self.control_window_visible = false;
-        }
-
-        fn hide_display_window(&mut self) {
-            self.steps.push(Step::HideDisplayWindow);
-            self.display_window_visible = false;
-        }
-    }
-
     fn snapshot_for_test() -> OverlaySnapshot {
         let mut state = OverlayViewState {
             session_id: Some(SessionId(7)),
@@ -1995,16 +1990,6 @@ mod tests {
     }
 
     #[test]
-    fn presentation_requires_every_ordered_native_step() {
-        let mut transaction = FakeTransaction::new(None);
-        assert!(try_present_transaction(&mut transaction));
-        assert_eq!(
-            transaction.steps,
-            vec![Step::Verify, Step::Submit, Step::Show, Step::Visible]
-        );
-    }
-
-    #[test]
     fn window_procedure_dispatch_contains_panics_and_uses_the_fallback() {
         let fallback_called = Cell::new(false);
         let result = contain_wnd_proc_dispatch(
@@ -2038,17 +2023,28 @@ mod tests {
     #[test]
     fn panic_cleanup_revokes_the_control_action_and_adapter() {
         let (tx, rx) = bounded(1);
+        let presentation = Arc::new(Mutex::new(NativePresentationObservation::default()));
+        let retained_action = Arc::new(Mutex::new(None));
+        let event_sink = NativeEventSink {
+            tx,
+            repaint_context: eframe::egui::Context::default(),
+            presentation,
+            retained_action,
+        };
         let bridge = Arc::new(ControlActionBridge {
             session_id: Mutex::new(Some(SessionId(91))),
-            event_sink: NativeEventSink {
-                tx,
-                repaint_context: eframe::egui::Context::default(),
-                presentation: Arc::new(Mutex::new(NativePresentationObservation::default())),
-            },
+            event_sink: event_sink.clone(),
+        });
+        let pair_failure = Arc::new(PairFailureBridge {
+            windows: Mutex::new(OverlayWindowPair::default()),
+            recovery_requested: AtomicBool::new(false),
+            action_bridge: Arc::clone(&bridge),
+            event_sink,
         });
         let state = WindowProcedureState {
             role: WindowRole::Control,
             action_bridge: Some(Arc::clone(&bridge)),
+            pair_failure,
             pressed: Cell::new(true),
             accessibility: RefCell::new(None),
         };
@@ -2061,59 +2057,16 @@ mod tests {
     }
 
     #[test]
-    fn every_post_accessibility_presentation_failure_resets_both_trees_before_hiding() {
-        for failure in [Step::Verify, Step::Submit, Step::Show, Step::Visible] {
-            let mut transaction = FakeTransaction::new(Some(failure));
-            let presented = try_present_transaction(&mut transaction);
-            let mut overlay = FakeOverlay::visible();
-            assert!(!finish_display_presentation(presented, &mut overlay));
-            assert!(!transaction.steps.contains(&Step::Visible) || failure == Step::Visible);
-            assert!(!overlay.display_accessibility_visible);
-            assert!(!overlay.control_accessibility_visible);
-            assert!(!overlay.display_window_visible);
-            assert!(!overlay.control_window_visible);
-            assert_eq!(
-                overlay.steps,
-                vec![
-                    Step::Unbind,
-                    Step::ResetDisplayAccessibility,
-                    Step::ResetControlAccessibility,
-                    Step::HideControlWindow,
-                    Step::HideDisplayWindow,
-                ]
-            );
-        }
-    }
-
-    #[test]
-    fn paired_control_failure_prevents_a_presented_overlay_pair() {
-        assert_eq!(
-            combine_presentation_results(true, true, false),
-            NativePresentationResult::default()
-        );
-        assert_eq!(
-            combine_presentation_results(false, true, true),
-            NativePresentationResult::default()
-        );
-    }
-
-    #[test]
-    fn display_requires_both_pixels_and_accessibility_ownership() {
-        assert!(display_prerequisites_ready(true, true));
-        assert!(!display_prerequisites_ready(false, true));
-        assert!(!display_prerequisites_ready(true, false));
-        assert!(!display_prerequisites_ready(false, false));
-    }
-
-    #[test]
     fn action_bridge_binds_the_session_at_event_time() {
         let (tx, rx) = bounded(4);
+        let retained_action = Arc::new(Mutex::new(None));
         let bridge = ControlActionBridge {
             session_id: Mutex::new(None),
             event_sink: NativeEventSink {
                 tx,
                 repaint_context: eframe::egui::Context::default(),
                 presentation: Arc::new(Mutex::new(NativePresentationObservation::default())),
+                retained_action: Arc::clone(&retained_action),
             },
         };
         bridge.emit_abandon();
@@ -2131,6 +2084,66 @@ mod tests {
         bridge.bind(None);
         bridge.emit_abandon();
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn saturated_event_channel_retains_the_latest_cancel_action() {
+        let (tx, rx) = bounded(1);
+        let retained_action = Arc::new(Mutex::new(None));
+        let event_sink = NativeEventSink {
+            tx,
+            repaint_context: eframe::egui::Context::default(),
+            presentation: Arc::new(Mutex::new(NativePresentationObservation::default())),
+            retained_action: Arc::clone(&retained_action),
+        };
+        event_sink.emit(NativeOverlayEvent::Failure(NativeOverlayFailure::new(
+            NativeOverlayFailureStage::Visibility,
+            None,
+        )));
+        event_sink.emit(NativeOverlayEvent::Action(OverlayAction::Abandon(
+            SessionId(52),
+        )));
+
+        assert!(matches!(rx.try_recv(), Ok(NativeOverlayEvent::Failure(_))));
+        assert_eq!(
+            retained_action.lock().unwrap().take(),
+            Some(OverlayAction::Abandon(SessionId(52)))
+        );
+    }
+
+    #[test]
+    fn pair_failure_bridge_revokes_actions_and_marks_the_pair_hidden() {
+        let (tx, _rx) = bounded(4);
+        let presentation = Arc::new(Mutex::new(NativePresentationObservation {
+            visible: true,
+            session_id: Some(SessionId(81)),
+        }));
+        let event_sink = NativeEventSink {
+            tx,
+            repaint_context: eframe::egui::Context::default(),
+            presentation: Arc::clone(&presentation),
+            retained_action: Arc::new(Mutex::new(None)),
+        };
+        let action_bridge = Arc::new(ControlActionBridge {
+            session_id: Mutex::new(Some(SessionId(81))),
+            event_sink: event_sink.clone(),
+        });
+        let pair = PairFailureBridge {
+            windows: Mutex::new(OverlayWindowPair::default()),
+            recovery_requested: AtomicBool::new(false),
+            action_bridge: Arc::clone(&action_bridge),
+            event_sink,
+        };
+
+        pair.fail_closed(WindowRole::Display);
+        action_bridge.emit_abandon();
+
+        assert_eq!(
+            *presentation.lock().unwrap(),
+            NativePresentationObservation::default()
+        );
+        assert!(pair.take_recovery_request());
+        assert!(action_bridge.session_id.lock().unwrap().is_none());
     }
 
     #[test]
