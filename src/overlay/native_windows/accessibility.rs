@@ -17,7 +17,10 @@ use super::{
 use crate::overlay::{
     controller::{OverlayMode, OverlayPhase, OverlayViewState},
     platform::OverlayWindowBounds,
-    view::{compact_accessible_text, live_accessible_text, live_overlay_announcement},
+    view::{
+        compact_accessible_text, live_accessible_text, live_overlay_announcement,
+        status_mark_accessibility,
+    },
 };
 
 const DISPLAY_ROOT_ID: NodeId = NodeId(0xD100);
@@ -169,13 +172,17 @@ fn display_tree(
     }
     let mut classes = NodeClassSet::new();
     let live_mode = state.mode == OverlayMode::Live;
-    let preview_visible = live_mode && (state.live_preview_available || state.error.is_some());
+    let preview_visible = live_mode
+        && (state.shows_live_transcript()
+            || state.error.is_some()
+            || state.notice.is_some()
+            || state.phase != OverlayPhase::Listening);
     let mut children = vec![DISPLAY_STATUS_ID, DISPLAY_ELAPSED_ID];
     if preview_visible {
         children.push(DISPLAY_PREVIEW_ID);
     }
     let announcement = live_overlay_announcement(state);
-    if preview_visible && announcement.is_some() {
+    if live_mode && announcement.is_some() {
         children.push(DISPLAY_ANNOUNCEMENT_ID);
     }
 
@@ -184,13 +191,9 @@ fn display_tree(
     root.set_children(children);
     root.set_bounds(accesskit_rect(layout.root));
 
-    let status_name = if state.phase == OverlayPhase::Listening {
-        "Scribe is recording"
-    } else {
-        state.phase.label()
-    };
+    let (status_indicator_name, status_name) = status_mark_accessibility(state);
     let mut status = NodeBuilder::new(Role::Image);
-    status.set_name("Scribe");
+    status.set_name(status_indicator_name);
     status.set_description(status_name);
     status.set_bounds(accesskit_rect(layout.status));
 
@@ -201,18 +204,29 @@ fn display_tree(
     {
         let mut elapsed = NodeBuilder::new(Role::StaticText);
         if live_mode {
-            elapsed.set_name(format!(
-                "Elapsed time {}",
-                format_elapsed(state.elapsed.unwrap_or_default())
-            ));
+            let elapsed_text = format_elapsed(state.elapsed.unwrap_or_default());
+            if state.phase == OverlayPhase::Listening {
+                elapsed.set_name(format!("Elapsed time {elapsed_text}"));
+            } else {
+                elapsed.set_name(format!("Recorded {elapsed_text}"));
+            }
         } else {
             elapsed.set_name(compact_accessible_text(state));
-            if state.error.is_some() || state.notice.is_some() || state.phase == OverlayPhase::Error
+            if state.error.is_some()
+                || state.notice.is_some()
+                || state.phase_announcement.is_some()
+                || state.phase == OverlayPhase::Error
             {
                 elapsed.set_live(Live::Polite);
             }
         }
-        elapsed.set_bounds(accesskit_rect(layout.elapsed));
+        let elapsed_bounds =
+            if state.mode == OverlayMode::Minimal && state.phase != OverlayPhase::Listening {
+                layout.lifecycle_status
+            } else {
+                layout.elapsed
+            };
+        elapsed.set_bounds(accesskit_rect(elapsed_bounds));
         nodes.push((DISPLAY_ELAPSED_ID, elapsed.build(&mut classes)));
     }
     if preview_visible {
@@ -226,7 +240,7 @@ fn display_tree(
         }
         nodes.push((DISPLAY_PREVIEW_ID, preview.build(&mut classes)));
     }
-    if preview_visible && let Some(announcement) = announcement {
+    if live_mode && let Some(announcement) = announcement {
         let mut live = NodeBuilder::new(Role::StaticText);
         live.set_name(announcement);
         live.set_live(Live::Polite);
@@ -400,12 +414,13 @@ mod tests {
     }
 
     #[test]
-    fn live_tree_without_a_started_preview_exposes_only_logo_status_and_elapsed_time() {
+    fn live_tree_without_a_started_preview_announces_recording_once_without_transcript_nodes() {
         let state = OverlayViewState {
             mode: OverlayMode::Live,
             phase: OverlayPhase::Listening,
             live_preview_available: false,
             elapsed: Some(std::time::Duration::from_secs(12)),
+            phase_announcement: Some("Recording".to_owned()),
             transcript: OverlayTranscript {
                 committed: "must not leak".to_owned(),
                 tentative: "into accessibility".to_owned(),
@@ -429,9 +444,78 @@ mod tests {
                 && node.name() == Some("Scribe")
                 && node.description() == Some("Scribe is recording")
         }));
+        let polite_nodes = tree
+            .nodes
+            .iter()
+            .filter(|(_, node)| node.live() == Some(Live::Polite))
+            .collect::<Vec<_>>();
+        assert_eq!(polite_nodes.len(), 1);
+        assert_eq!(polite_nodes[0].0, DISPLAY_ANNOUNCEMENT_ID);
+        assert_eq!(polite_nodes[0].1.name(), Some("Recording"));
         assert!(tree.nodes.iter().all(|(id, node)| {
-            *id != DISPLAY_PREVIEW_ID && *id != DISPLAY_ANNOUNCEMENT_ID && node.live().is_none()
+            *id != DISPLAY_PREVIEW_ID
+                && !node
+                    .name()
+                    .is_some_and(|name| name.contains("must not leak"))
         }));
+    }
+
+    #[test]
+    fn lifecycle_phase_announcements_have_one_native_live_owner() {
+        let state = OverlayViewState {
+            mode: OverlayMode::Live,
+            phase: OverlayPhase::Processing,
+            live_preview_available: true,
+            phase_announcement: Some("Transcribing…".to_owned()),
+            transcript: OverlayTranscript {
+                committed: "stale preview".to_owned(),
+                tentative: " must not be announced".to_owned(),
+                revision: 1,
+            },
+            ..OverlayViewState::default()
+        };
+        let tree = display_tree(&state, true, Some(display_bounds(OverlayMode::Live)));
+        let polite_nodes = tree
+            .nodes
+            .iter()
+            .filter(|(_, node)| node.live() == Some(Live::Polite))
+            .collect::<Vec<_>>();
+
+        assert_eq!(polite_nodes.len(), 1);
+        assert_eq!(polite_nodes[0].0, DISPLAY_ANNOUNCEMENT_ID);
+        assert_eq!(polite_nodes[0].1.name(), Some("Transcribing…"));
+        assert!(tree.nodes.iter().any(|(id, node)| {
+            *id == DISPLAY_PREVIEW_ID
+                && node.live().is_none()
+                && node.name() == Some("Transcribing…")
+        }));
+    }
+
+    #[test]
+    fn success_tree_exposes_the_completion_indicator_and_done_in_both_modes() {
+        for mode in [OverlayMode::Live, OverlayMode::Minimal] {
+            let state = OverlayViewState {
+                mode,
+                phase: OverlayPhase::Success,
+                elapsed: Some(std::time::Duration::from_secs(12)),
+                phase_announcement: Some("Done".to_owned()),
+                ..OverlayViewState::default()
+            };
+            let tree = display_tree(&state, true, Some(display_bounds(mode)));
+
+            assert!(tree.nodes.iter().any(|(id, node)| {
+                *id == DISPLAY_STATUS_ID
+                    && node.role() == Role::Image
+                    && node.name() == Some("Scribe completion indicator")
+                    && node.description() == Some("Scribe completed successfully")
+            }));
+            assert!(
+                tree.nodes
+                    .iter()
+                    .any(|(_, node)| node.name() == Some("Done")),
+                "{mode:?} success state should retain completion text"
+            );
+        }
     }
 
     #[test]
@@ -491,6 +575,25 @@ mod tests {
         }));
         assert!(tree.nodes.iter().any(|(id, node)| {
             *id == DISPLAY_ELAPSED_ID && node.name() == Some("Elapsed time 00:00")
+        }));
+    }
+
+    #[test]
+    fn compact_lifecycle_status_uses_the_same_extended_bounds_as_the_raster() {
+        let state = OverlayViewState {
+            mode: OverlayMode::Minimal,
+            phase: OverlayPhase::Processing,
+            phase_announcement: Some("Transcribing…".to_owned()),
+            ..OverlayViewState::default()
+        };
+        let bounds = display_bounds(OverlayMode::Minimal);
+        let layout = DisplayLayout::from_bounds(OverlayMode::Minimal, bounds).unwrap();
+        let tree = display_tree(&state, true, Some(bounds));
+
+        assert!(tree.nodes.iter().any(|(id, node)| {
+            *id == DISPLAY_ELAPSED_ID
+                && node.name() == Some("Transcribing…")
+                && node.bounds() == Some(accesskit_rect(layout.lifecycle_status))
         }));
     }
 
@@ -568,7 +671,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_error_and_notice_use_the_timer_bounds_as_the_only_polite_status() {
+    fn compact_error_uses_the_lifecycle_bounds_while_notice_keeps_the_timer_bounds() {
         let cases = [
             (
                 OverlayViewState {
@@ -605,7 +708,12 @@ mod tests {
             assert_eq!(live.len(), 1);
             assert_eq!(live[0].0, DISPLAY_ELAPSED_ID);
             assert_eq!(live[0].1.name(), Some(expected));
-            assert_eq!(live[0].1.bounds(), Some(accesskit_rect(layout.elapsed)));
+            let expected_bounds = if state.phase == OverlayPhase::Listening {
+                layout.elapsed
+            } else {
+                layout.lifecycle_status
+            };
+            assert_eq!(live[0].1.bounds(), Some(accesskit_rect(expected_bounds)));
             assert!(
                 tree.nodes
                     .iter()

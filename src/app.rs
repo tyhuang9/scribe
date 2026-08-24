@@ -971,9 +971,9 @@ fn effective_native_overlay_mode(mode: OverlayMode) -> NativeOverlayMode {
 fn live_overlay_owns_announcements(
     presented: bool,
     mode: NativeOverlayMode,
-    live_preview_available: bool,
+    phase: OverlayPhase,
 ) -> bool {
-    presented && mode == NativeOverlayMode::Live && live_preview_available
+    presented && mode == NativeOverlayMode::Live && phase != OverlayPhase::Hidden
 }
 
 fn rolling_preview_enabled(source: RecordingSource, mode: StreamingMode) -> bool {
@@ -3426,7 +3426,7 @@ impl LocalTranscriberApp {
             playground_reference_transcript: String::new(),
             playground_reference_user_edited: false,
             playground_ranking_mode: RankingMode::Balanced,
-            hotkey_service: HotkeyService::new(&config.recording.hotkey),
+            hotkey_service: HotkeyService::new(&config.recording.hotkey, &cc.egui_ctx),
             config,
             config_path,
             settings_store,
@@ -4091,8 +4091,9 @@ impl LocalTranscriberApp {
         } else if self.has_active_work() {
             ACTIVE_REPAINT_DELAY
         } else {
-            // Hotkey events are integrated from update(), so idle still polls slowly. Tray
-            // handlers wake the event loop directly and do not depend on this polling clock.
+            // The global-hotkey callback wakes the event loop directly. This
+            // slow repaint remains only as a recovery fallback if an external
+            // platform callback fails to wake the native event loop.
             IDLE_REPAINT_DELAY
         }
     }
@@ -9651,7 +9652,7 @@ impl LocalTranscriberApp {
         state.suppress_live_announcements = live_overlay_owns_announcements(
             self.overlay_presented,
             self.overlay_controller.state().mode,
-            self.overlay_controller.state().live_preview_available,
+            self.overlay_controller.state().phase,
         );
         state.hotkey_capture_active = self.capturing_hotkey;
         state.hotkey_change_disabled_reason = self.quick_hotkey_change_block_reason();
@@ -12190,7 +12191,7 @@ impl LocalTranscriberApp {
         state.suppress_live_announcements = live_overlay_owns_announcements(
             self.overlay_presented,
             self.overlay_controller.state().mode,
-            self.overlay_controller.state().live_preview_available,
+            self.overlay_controller.state().phase,
         );
         let settings = RecordingSettingsView {
             close_to_tray: self.config.general.close_to_tray,
@@ -20188,7 +20189,7 @@ mod layout_tests {
             playground_reference_transcript: String::new(),
             playground_reference_user_edited: false,
             playground_ranking_mode: RankingMode::Balanced,
-            hotkey_service: HotkeyService::new(&config.recording.hotkey),
+            hotkey_service: HotkeyService::new(&config.recording.hotkey, &egui::Context::default()),
             config,
             config_path: None,
             settings_store: None,
@@ -25961,6 +25962,10 @@ mod layout_tests {
             app.overlay_controller
                 .set_live_preview_available(session_id, true)
         );
+        assert!(
+            app.overlay_controller
+                .set_phase(session_id, OverlayPhase::Listening)
+        );
 
         let event =
             |sequence, model_id: ModelId, committed: &str, tentative: &str| PreviewEvent::Update {
@@ -26010,6 +26015,10 @@ mod layout_tests {
         assert!(
             app.overlay_controller
                 .set_live_preview_available(session_id, true)
+        );
+        assert!(
+            app.overlay_controller
+                .set_phase(session_id, OverlayPhase::Listening)
         );
         app.apply_rolling_preview_event(PreviewEvent::Update {
             identity: StreamIdentity {
@@ -26098,27 +26107,27 @@ mod layout_tests {
         assert!(live_overlay_owns_announcements(
             true,
             NativeOverlayMode::Live,
-            true,
+            OverlayPhase::Preparing,
         ));
         assert!(!live_overlay_owns_announcements(
             true,
             NativeOverlayMode::Minimal,
-            true,
+            OverlayPhase::Listening,
         ));
         assert!(!live_overlay_owns_announcements(
             false,
             NativeOverlayMode::Live,
-            true,
+            OverlayPhase::Listening,
         ));
         assert!(!live_overlay_owns_announcements(
             true,
             NativeOverlayMode::Off,
-            true,
+            OverlayPhase::Listening,
         ));
         assert!(!live_overlay_owns_announcements(
             true,
             NativeOverlayMode::Live,
-            false,
+            OverlayPhase::Hidden,
         ));
     }
 

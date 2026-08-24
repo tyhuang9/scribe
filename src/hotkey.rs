@@ -1,6 +1,11 @@
-use std::time::Instant;
+use std::{
+    sync::{Arc, OnceLock, RwLock},
+    time::Instant,
+};
 
 use anyhow::{Result, anyhow};
+use crossbeam_channel::{Receiver, Sender, unbounded};
+use eframe::egui;
 use global_hotkey::hotkey::{Code, HotKey, Modifiers};
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 
@@ -16,17 +21,58 @@ pub struct ObservedHotkeyEvent {
     pub observed_at: Instant,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct QueuedGlobalHotkeyEvent {
+    event: GlobalHotKeyEvent,
+    observed_at: Instant,
+}
+
 pub struct HotkeyService {
     manager: Option<GlobalHotKeyManager>,
     hotkey: Option<HotKey>,
+    event_rx: Receiver<QueuedGlobalHotkeyEvent>,
     pub last_error: Option<String>,
 }
 
+/// `global-hotkey` owns one process-wide callback. Keep its callback small:
+/// enqueue the event first, then wake both a visible egui viewport and a
+/// hidden Windows viewport. The app still consumes events through
+/// `poll_events`, which keeps recording state single-threaded.
+struct EventHandlerState {
+    receiver: Receiver<QueuedGlobalHotkeyEvent>,
+    wake_context: Arc<RwLock<egui::Context>>,
+}
+
+#[derive(Clone)]
+struct EventBridge {
+    sender: Sender<QueuedGlobalHotkeyEvent>,
+    native_wake: Arc<dyn Fn() + Send + Sync>,
+    repaint_wake: Arc<dyn Fn() + Send + Sync>,
+}
+
+impl EventBridge {
+    fn send(&self, event: GlobalHotKeyEvent) {
+        if self
+            .sender
+            .send(QueuedGlobalHotkeyEvent {
+                event,
+                observed_at: Instant::now(),
+            })
+            .is_err()
+        {
+            return;
+        }
+        (self.native_wake)();
+        (self.repaint_wake)();
+    }
+}
+
 impl HotkeyService {
-    pub fn new(spec: &str) -> Self {
+    pub fn new(spec: &str, context: &egui::Context) -> Self {
         let mut service = Self {
             manager: None,
             hotkey: None,
+            event_rx: install_event_handler(context),
             last_error: None,
         };
         if let Err(err) = global_hotkey_startup_allowed() {
@@ -79,16 +125,50 @@ impl HotkeyService {
     pub fn poll_events(&self) -> Vec<ObservedHotkeyEvent> {
         let registered_id = self.hotkey.map(|hotkey| hotkey.id());
         let mut events = Vec::new();
-        while let Ok(event) = GlobalHotKeyEvent::receiver().try_recv() {
-            if let Some(event) = event_from_global(event, registered_id) {
+        while let Ok(observed) = self.event_rx.try_recv() {
+            if let Some(event) = event_from_global(observed.event, registered_id) {
                 events.push(ObservedHotkeyEvent {
                     event,
-                    observed_at: Instant::now(),
+                    observed_at: observed.observed_at,
                 });
             }
         }
         events
     }
+}
+
+fn install_event_handler(context: &egui::Context) -> Receiver<QueuedGlobalHotkeyEvent> {
+    static STATE: OnceLock<EventHandlerState> = OnceLock::new();
+
+    let state = STATE.get_or_init(|| {
+        let (sender, receiver) = unbounded();
+        let wake_context = Arc::new(RwLock::new(context.clone()));
+        let repaint_context = Arc::clone(&wake_context);
+        let bridge = EventBridge {
+            sender,
+            native_wake: Arc::new(crate::tray::wake_scribe_app_from_background_event),
+            repaint_wake: Arc::new(move || {
+                let context = repaint_context
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone();
+                context.request_repaint();
+            }),
+        };
+        GlobalHotKeyEvent::set_event_handler(Some(move |event| bridge.send(event)));
+        EventHandlerState {
+            receiver,
+            wake_context,
+        }
+    });
+
+    // The global handler cannot be replaced, but test harnesses and eframe
+    // restarts can construct a new context in the same process.
+    *state
+        .wake_context
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = context.clone();
+    state.receiver.clone()
 }
 
 fn replace_hotkey_registration(
@@ -242,6 +322,11 @@ fn letter_code(ch: char) -> Code {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
     use super::*;
 
     #[test]
@@ -364,5 +449,75 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn drains_press_and_release_from_the_app_owned_event_channel() {
+        let hotkey = parse_hotkey("Ctrl+Shift+Space").unwrap();
+        let (sender, receiver) = unbounded();
+        let service = HotkeyService {
+            manager: None,
+            hotkey: Some(hotkey),
+            event_rx: receiver,
+            last_error: None,
+        };
+
+        sender
+            .send(QueuedGlobalHotkeyEvent {
+                event: GlobalHotKeyEvent {
+                    id: hotkey.id(),
+                    state: HotKeyState::Pressed,
+                },
+                observed_at: Instant::now(),
+            })
+            .unwrap();
+        sender
+            .send(QueuedGlobalHotkeyEvent {
+                event: GlobalHotKeyEvent {
+                    id: hotkey.id(),
+                    state: HotKeyState::Released,
+                },
+                observed_at: Instant::now(),
+            })
+            .unwrap();
+
+        assert_eq!(
+            service
+                .poll_events()
+                .into_iter()
+                .map(|event| event.event)
+                .collect::<Vec<_>>(),
+            vec![HotkeyEvent::Pressed, HotkeyEvent::Released]
+        );
+    }
+
+    #[test]
+    fn event_bridge_enqueues_before_waking_the_event_loop() {
+        let (sender, receiver) = unbounded();
+        let native_wakes = Arc::new(AtomicUsize::new(0));
+        let repaint_wakes = Arc::new(AtomicUsize::new(0));
+        let native_wake_count = Arc::clone(&native_wakes);
+        let repaint_wake_count = Arc::clone(&repaint_wakes);
+        let bridge = EventBridge {
+            sender,
+            native_wake: Arc::new(move || {
+                native_wake_count.fetch_add(1, Ordering::SeqCst);
+            }),
+            repaint_wake: Arc::new(move || {
+                repaint_wake_count.fetch_add(1, Ordering::SeqCst);
+            }),
+        };
+        let hotkey = parse_hotkey("Ctrl+Shift+Space").unwrap();
+
+        bridge.send(GlobalHotKeyEvent {
+            id: hotkey.id(),
+            state: HotKeyState::Pressed,
+        });
+
+        let queued = receiver.recv().unwrap();
+        assert_eq!(queued.event.id(), hotkey.id());
+        assert_eq!(queued.event.state(), HotKeyState::Pressed);
+        assert_eq!(native_wakes.load(Ordering::SeqCst), 1);
+        assert_eq!(repaint_wakes.load(Ordering::SeqCst), 1);
     }
 }

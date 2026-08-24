@@ -52,6 +52,9 @@ pub(super) struct DisplayLayout {
     pub status: PhysicalRect,
     pub recording_mark: PhysicalRect,
     pub elapsed: PhysicalRect,
+    /// The wider Compact-only area that becomes available once the separate
+    /// cancel target is hidden after recording stops.
+    pub lifecycle_status: PhysicalRect,
     /// Allocation including the antialiased stroke footprint.
     pub divider: Option<PhysicalRect>,
     /// The GDI+ centerline submitted to `GdipDrawLine`.
@@ -101,6 +104,7 @@ impl DisplayLayout {
                     status: recording_mark,
                     recording_mark,
                     elapsed: centered_rect(72.0, 48.0, 23.0, content_center_y, scale),
+                    lifecycle_status: centered_rect(142.0, 407.0, 23.0, content_center_y, scale),
                     divider: Some(divider),
                     divider_line: Some(divider_line),
                     preview: Some(centered_rect(142.0, 407.0, 23.0, content_center_y, scale)),
@@ -116,6 +120,7 @@ impl DisplayLayout {
                     status: recording_mark,
                     recording_mark,
                     elapsed: centered_rect(72.0, 48.0, 23.0, content_center_y, scale),
+                    lifecycle_status: centered_rect(58.0, 128.0, 23.0, content_center_y, scale),
                     divider: None,
                     divider_line: None,
                     preview: None,
@@ -278,6 +283,25 @@ mod tests {
             assert!(compact.divider.is_none());
             assert!(compact.divider_line.is_none());
             assert!(compact.preview.is_none());
+        }
+    }
+
+    #[test]
+    fn compact_lifecycle_status_uses_the_control_free_area() {
+        for dpi in [96, 120, 144, 192] {
+            let layout = DisplayLayout::from_bounds(
+                OverlayMode::Minimal,
+                production_bounds(OverlayMode::Minimal, dpi),
+            )
+            .unwrap();
+            assert!(layout.lifecycle_status.x0 >= layout.recording_mark.x1);
+            assert!(layout.lifecycle_status.x1 <= layout.root.x1);
+            assert!(layout.lifecycle_status.width() > layout.elapsed.width());
+            assert_eq!(
+                layout.lifecycle_status.center_y(),
+                layout.content_center_y,
+                "Compact lifecycle status must remain centered at {dpi} DPI"
+            );
         }
     }
 

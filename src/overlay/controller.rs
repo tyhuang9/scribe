@@ -38,6 +38,32 @@ impl OverlayPhase {
             Self::Error => "Error",
         }
     }
+
+    /// The concise, user-facing status that replaces recording-only content
+    /// after capture stops.
+    pub fn status_text(self) -> &'static str {
+        match self {
+            Self::Hidden => "Hidden",
+            Self::Preparing => "Starting microphone…",
+            Self::Listening => "Recording",
+            Self::Finalizing => "Finishing recording…",
+            Self::Processing => "Transcribing…",
+            Self::Pasting => "Pasting…",
+            Self::Success => "Done",
+            Self::Error => "Error",
+        }
+    }
+
+    pub fn is_progressing(self) -> bool {
+        matches!(
+            self,
+            Self::Preparing | Self::Finalizing | Self::Processing | Self::Pasting
+        )
+    }
+
+    pub fn shows_live_transcript(self) -> bool {
+        self == Self::Listening
+    }
 }
 
 /// Whether the root Scribe viewport is safe to cover with a background-only
@@ -111,10 +137,17 @@ pub struct OverlayViewState {
     /// logo-and-timer shell when this is false, without exposing an empty or
     /// misleading transcript region.
     pub live_preview_available: bool,
+    /// Set only when the phase changes. Renderers expose this as a polite
+    /// live region, giving assistive technology one announcement per phase
+    /// transition instead of narrating each repaint.
+    pub phase_announcement: Option<String>,
     pub transcript_announcement: Option<String>,
     pub notice: Option<String>,
     pub error: Option<OverlayError>,
     pub elapsed: Option<Duration>,
+    /// Lets a rendering host request a static progress indicator. The Windows
+    /// setting remains authoritative when this is true.
+    pub progress_animation_enabled: bool,
 }
 
 impl Default for OverlayViewState {
@@ -126,10 +159,12 @@ impl Default for OverlayViewState {
             audio_level: OverlayAudioLevel::default(),
             transcript: OverlayTranscript::default(),
             live_preview_available: false,
+            phase_announcement: None,
             transcript_announcement: None,
             notice: None,
             error: None,
             elapsed: None,
+            progress_animation_enabled: true,
         }
     }
 }
@@ -137,6 +172,10 @@ impl Default for OverlayViewState {
 impl OverlayViewState {
     pub fn is_visible(&self) -> bool {
         self.mode != OverlayMode::Off && self.phase != OverlayPhase::Hidden
+    }
+
+    pub fn shows_live_transcript(&self) -> bool {
+        self.phase.shows_live_transcript() && self.live_preview_available
     }
 }
 
@@ -163,6 +202,7 @@ impl OverlayController {
             session_id: Some(session_id),
             mode,
             phase: OverlayPhase::Preparing,
+            phase_announcement: Some(OverlayPhase::Preparing.status_text().to_owned()),
             ..OverlayViewState::default()
         };
         self.last_transcript_revision = None;
@@ -192,6 +232,15 @@ impl OverlayController {
         }
         if self.state.phase != phase {
             self.state.notice = None;
+            self.state.phase_announcement =
+                (phase != OverlayPhase::Hidden).then(|| phase.status_text().to_owned());
+            if !phase.shows_live_transcript() {
+                // Rolling hypotheses are only meaningful while the microphone
+                // is live. Never let the last tentative words look like
+                // current recording content while final transcription runs.
+                self.state.transcript.tentative.clear();
+                self.state.transcript_announcement = None;
+            }
         }
         self.state.phase = phase;
         if phase != OverlayPhase::Error {
@@ -217,6 +266,7 @@ impl OverlayController {
     ) -> bool {
         if !self.is_current(session_id)
             || !self.state.live_preview_available
+            || !self.state.phase.shows_live_transcript()
             || self.state.notice.is_some()
             || self
                 .last_transcript_revision
@@ -226,6 +276,7 @@ impl OverlayController {
         }
 
         let committed = committed.into();
+        self.state.phase_announcement = None;
         self.state.transcript_announcement =
             committed_delta(&self.state.transcript.committed, &committed)
                 .map(|delta| format!("Committed transcript: {delta}"));
@@ -287,6 +338,7 @@ impl OverlayController {
             return false;
         }
         self.state.phase = OverlayPhase::Error;
+        self.state.phase_announcement = None;
         self.state.transcript_announcement = None;
         self.state.error = Some(OverlayError {
             message: message.into(),
@@ -304,6 +356,7 @@ impl OverlayController {
             return false;
         }
         self.state.phase = OverlayPhase::Listening;
+        self.state.phase_announcement = None;
         self.state.notice = Some(message.into());
         self.state.transcript.tentative.clear();
         self.state.transcript_announcement = None;
@@ -347,6 +400,10 @@ mod tests {
         assert!(controller.state().transcript.committed.is_empty());
         assert!(controller.state().transcript.tentative.is_empty());
         assert!(!controller.state().live_preview_available);
+        assert_eq!(
+            controller.state().phase_announcement.as_deref(),
+            Some("Starting microphone…")
+        );
         assert!(!controller.update_transcript(SessionId(7), "not shown", "", 1));
         assert!(!controller.show_preview_unavailable(SessionId(7), "not shown"));
     }
@@ -356,6 +413,7 @@ mod tests {
         let mut controller = OverlayController::new();
         controller.begin_session(SessionId(7), OverlayMode::Live);
         assert!(controller.set_live_preview_available(SessionId(7), true));
+        assert!(controller.set_phase(SessionId(7), OverlayPhase::Listening));
         assert!(controller.update_transcript(SessionId(7), "stable", " draft", 1));
 
         assert!(controller.show_preview_unavailable(
@@ -393,6 +451,7 @@ mod tests {
         let mut controller = OverlayController::new();
         controller.begin_session(SessionId(7), OverlayMode::Live);
         assert!(controller.set_live_preview_available(SessionId(7), true));
+        assert!(controller.set_phase(SessionId(7), OverlayPhase::Listening));
 
         assert!(!controller.update_transcript(SessionId(6), "old", "", 1));
         assert!(controller.update_transcript(SessionId(7), "hello", " wor", 2));
@@ -405,6 +464,7 @@ mod tests {
         let mut controller = OverlayController::new();
         controller.begin_session(SessionId(7), OverlayMode::Live);
         assert!(controller.set_live_preview_available(SessionId(7), true));
+        assert!(controller.set_phase(SessionId(7), OverlayPhase::Listening));
         assert!(controller.update_transcript(SessionId(7), "hello", " wor", 41));
 
         assert!(controller.replace_with_final(SessionId(7), "Hello world."));
@@ -423,6 +483,7 @@ mod tests {
         let mut controller = OverlayController::new();
         controller.begin_session(SessionId(7), OverlayMode::Live);
         assert!(controller.set_live_preview_available(SessionId(7), true));
+        assert!(controller.set_phase(SessionId(7), OverlayPhase::Listening));
 
         assert!(controller.update_transcript(SessionId(7), "hello", " world", 1));
         assert_eq!(
@@ -443,6 +504,7 @@ mod tests {
         let mut controller = OverlayController::new();
         controller.begin_session(SessionId(7), OverlayMode::Live);
         assert!(controller.set_live_preview_available(SessionId(7), true));
+        assert!(controller.set_phase(SessionId(7), OverlayPhase::Listening));
         controller.update_transcript(SessionId(7), "stable", " stale", 1);
 
         assert!(controller.show_preview_unavailable(
@@ -461,10 +523,55 @@ mod tests {
     }
 
     #[test]
+    fn post_recording_phases_clear_tentative_preview_and_reject_late_updates() {
+        let mut controller = OverlayController::new();
+        controller.begin_session(SessionId(7), OverlayMode::Live);
+        assert!(controller.set_live_preview_available(SessionId(7), true));
+        assert!(controller.set_phase(SessionId(7), OverlayPhase::Listening));
+        assert!(controller.update_transcript(SessionId(7), "stable", " stale", 1));
+
+        for (phase, expected) in [
+            (OverlayPhase::Finalizing, "Finishing recording…"),
+            (OverlayPhase::Processing, "Transcribing…"),
+            (OverlayPhase::Pasting, "Pasting…"),
+            (OverlayPhase::Success, "Done"),
+        ] {
+            assert!(controller.set_phase(SessionId(7), phase));
+            assert!(controller.state().transcript.tentative.is_empty());
+            assert!(controller.state().transcript_announcement.is_none());
+            assert_eq!(
+                controller.state().phase_announcement.as_deref(),
+                Some(expected)
+            );
+            assert!(
+                !controller.update_transcript(SessionId(7), "late", " update", 2),
+                "{phase:?} must reject preview updates after recording stops"
+            );
+        }
+    }
+
+    #[test]
+    fn phase_copy_matches_the_recording_lifecycle() {
+        assert_eq!(
+            OverlayPhase::Preparing.status_text(),
+            "Starting microphone…"
+        );
+        assert_eq!(OverlayPhase::Listening.status_text(), "Recording");
+        assert_eq!(
+            OverlayPhase::Finalizing.status_text(),
+            "Finishing recording…"
+        );
+        assert_eq!(OverlayPhase::Processing.status_text(), "Transcribing…");
+        assert_eq!(OverlayPhase::Pasting.status_text(), "Pasting…");
+        assert_eq!(OverlayPhase::Success.status_text(), "Done");
+    }
+
+    #[test]
     fn error_clears_stale_transcript_announcement() {
         let mut controller = OverlayController::new();
         controller.begin_session(SessionId(7), OverlayMode::Live);
         assert!(controller.set_live_preview_available(SessionId(7), true));
+        assert!(controller.set_phase(SessionId(7), OverlayPhase::Listening));
         controller.update_transcript(SessionId(7), "stable", " draft", 1);
         assert!(controller.state().transcript_announcement.is_some());
 
