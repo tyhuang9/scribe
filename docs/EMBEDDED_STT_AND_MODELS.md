@@ -88,7 +88,7 @@ The distinction below is deliberate and must remain explicit in later reports.
 | `--scribe-install-smoke` child mode | Isolated health/load/decode/unload/reload validation before activation | **No** | This is a bounded installer helper, not a dictation sidecar and not an inference server. |
 | Local HTTP listeners | Test fixtures only | **No** | Loopback listeners in `src/installations.rs` are behind `#[cfg(test)]`; source inspection found no production STT listener, localhost setting, or health-polling client. |
 
-**Current default-path statement:** with the installed default `whisper_cpp_tiny_en` GGUF model, Scribe transcribes through the safe in-process Rust-owned adapter. It does not install or start a runtime package, Python, a localhost server, or an inference executable. Retained GGML models still use the compatibility native package; CLI and process bridges remain non-default migration debt.
+**Current default-path statement:** fresh Windows x64 profiles select the release-bundled `whisper_cpp_base_en` GGUF model and transcribe through the safe in-process Rust-owned adapter. Existing explicit selections are preserved. Scribe does not install or start a runtime package, Python, a localhost server, or an inference executable for this GGUF route. Retained GGML models still use the compatibility native package; CLI and process bridges remain non-default migration debt.
 
 `README.md` still uses the phrase “bundled sidecar” in one requirements sentence. That wording does not accurately distinguish the in-process primary DLL from the compatibility CLI and should be corrected in a separate documentation-consistency change.
 
@@ -98,7 +98,7 @@ The distinction below is deliberate and must remain explicit in later reports.
 
 | Item | Current fact | Required follow-up / limitation |
 | --- | --- | --- |
-| Safe GGUF adapter | `src/embedded_runtime.rs` uses `transcribe-cpp = "=0.1.3"` directly, with `default-features = false`. It owns a retained `Model` and `Session`, initializes backends once, maps only owned neutral data above the private router, and has no application-owned `unsafe` code. | Current static build is CPU-only. `Gpu` requests fail explicitly until a packaged, smoke-tested GPU feature/backend is added. The checked-in default `whisper_cpp_tiny_en` is a pinned trusted GGUF and does not require a runtime package. |
+| Safe GGUF adapter | `src/embedded_runtime.rs` uses `transcribe-cpp = "=0.1.3"` directly, with `default-features = false`. It owns a retained `Model` and `Session`, initializes backends once, maps only owned neutral data above the private router, and has no application-owned `unsafe` code. | Current static build is CPU-only. `Gpu` requests fail explicitly until a packaged, smoke-tested GPU feature/backend is added. The fresh-profile `whisper_cpp_base_en` is a pinned trusted GGUF bundled beside the Windows x64 executable and does not require a runtime package. |
 | Legacy adapter | `src/runtime_router.rs`, `native/whisper_shim.c`, and vendored v1.9.1 headers implement the existing `.bin` route. Rust uses opaque native handles, copies callback text into owned `String`s, and confines FFI to the router. | It remains temporary compatibility code until catalog and packaging migration lets the safe GGUF route become the product default. |
 | Native source/version | The primary package and vendored headers are whisper.cpp v1.9.1, commit `f049fff95a089aa9969deb009cdd4892b3e74916`. The package manifest identifies logical runtime `transcribe-cpp`. | This identifies the checked-in package, not a claim that a future `transcribe-cpp` crate wraps the same ABI. |
 | Runtime package | `runtime-manifests/whisper-cpp-v1.9.1-windows-x64.json` pins a 7,982,101-byte archive, archive SHA-256, 13 allowlisted files, individual sizes/hashes, native entrypoint, and compatibility CLI entrypoint. | Packaged-release smoke evidence remains platform-specific. |
@@ -108,7 +108,7 @@ The distinction below is deliberate and must remain explicit in later reports.
 
 | Target | Current package behavior | Current status |
 | --- | --- | --- |
-| Windows x86_64 | One pinned whisper.cpp v1.9.1 CPU package. `Auto` and `Cpu` resolve to CPU; `Gpu` returns a structured unsupported-GPU error. The release bundler invokes only `bundle-whisper-runtime.sh`. | **Current fact for source/manifests; packaged desktop smoke remains unverified here.** |
+| Windows x86_64 | One pinned whisper.cpp v1.9.1 CPU compatibility package plus the pinned base.en Q8_0 GGUF beside the executable. `Auto` and `Cpu` resolve to CPU; `Gpu` returns a structured unsupported-GPU error. `build-windows-release.ps1` performs a locked, offline target-triple build, validates AMD64 PE inputs, stages an explicit allowlist in a unique sibling transaction directory, runs the GGUF smoke offline, writes a hash inventory, and only then atomically publishes `artifacts/Scribe-windows-x64`. | **Source/manifests and packaging enforcement are implemented; physical packaged desktop acceptance remains required.** |
 | macOS | No pinned primary package in the checked-in manifest. No Metal package is verified. | **Unavailable / unverified; do not claim CPU or Metal release support.** |
 | Linux | No pinned primary package in the checked-in manifest. No Vulkan or other GPU package is verified. | **Unavailable / unverified; do not claim CPU or GPU release support.** |
 
@@ -118,12 +118,12 @@ The desktop shell may compile for Linux/macOS, but that is separate from a verif
 
 ### Normalized catalog
 
-`src/model_catalog.rs` remains the checked-in normalized catalog used for managed installs. Its default `whisper_cpp_tiny_en` is the tested `handy-computer` GGUF pin and uses the package-free safe route; the remaining compatibility entries are pinned `ggerganov/whisper.cpp` GGML artifacts. `src/huggingface_catalog.rs` supplies backend-owned dynamic discovery/cache using existing `ureq`; the Models page asynchronously renders its trusted, cache-aware model cards without direct frontend HTTP or URL construction. Trusted dynamic GGUF variants now use a stable source-derived ID and can be installed through the same verified transaction; they remain Experimental rather than being claimed as Supported.
+`src/model_catalog.rs` remains the checked-in normalized catalog used for managed installs. Fresh profiles select its stable `whisper_cpp_base_en` ID, whose exact `handy-computer` Q8_0 GGUF pin is packaged beside the Windows x64 executable; `whisper_cpp_tiny_en` remains a compatible managed option. `src/huggingface_catalog.rs` supplies backend-owned dynamic discovery/cache using existing `ureq`; the Models page asynchronously renders its trusted, cache-aware model cards without direct frontend HTTP or URL construction. Trusted dynamic GGUF variants now use a stable source-derived ID and can be installed through the same verified transaction; they remain Experimental rather than being claimed as Supported.
 
 | ID | File format and file | Exact size | Current compatibility |
 | --- | --- | ---: | --- |
 | `whisper_cpp_tiny_en` | GGUF `whisper-tiny.en-Q4_K_M.gguf` from `handy-computer/whisper-tiny.en-gguf` revision `becb8bcb804405dc97b380a523d9975888820986` | 43,545,248 bytes | Experimental |
-| `whisper_cpp_base_en` | GGML `ggml-base.en.bin` | 147,964,211 bytes | Experimental |
+| `whisper_cpp_base_en` | GGUF `whisper-base.en-Q8_0.gguf` from `handy-computer/whisper-base.en-gguf` revision `cf0804db15fb341d00c9274b90da9cbb4fe2e5c6` | 84,886,208 bytes | Experimental |
 | `whisper_cpp_small_en` | GGML `ggml-small.en.bin` | 487,614,201 bytes | Experimental |
 | `whisper_cpp_medium_en` | GGML `ggml-medium.en.bin` | 1,533,774,781 bytes | Experimental |
 

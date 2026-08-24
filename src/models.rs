@@ -13,8 +13,20 @@ pub struct SttModelInfo {
     pub accuracy_tier: String,
     pub speed_tier: String,
     pub local_path: Option<PathBuf>,
+    #[serde(default)]
+    pub artifact_origin: ModelArtifactOrigin,
     pub install_status: ModelInstallStatus,
     pub download_model: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ModelArtifactOrigin {
+    #[default]
+    Catalog,
+    Managed,
+    Imported,
+    External,
+    Bundled,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -203,6 +215,7 @@ pub fn default_model_catalog() -> Vec<SttModelInfo> {
                 accuracy_tier: descriptor.accuracy_guidance.to_owned(),
                 speed_tier: descriptor.speed_guidance.to_owned(),
                 local_path: None,
+                artifact_origin: ModelArtifactOrigin::Catalog,
                 install_status: ModelInstallStatus::NotInstalled,
                 download_model,
             }
@@ -347,6 +360,7 @@ fn legacy_model(
         accuracy_tier: accuracy_tier.to_owned(),
         speed_tier: speed_tier.to_owned(),
         local_path: None,
+        artifact_origin: ModelArtifactOrigin::Catalog,
         install_status: ModelInstallStatus::NotInstalled,
         download_model: Some(download_model.to_owned()),
     }

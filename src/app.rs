@@ -53,8 +53,11 @@ use crate::installations::{
 use crate::installed_manifest;
 use crate::managed_downloads;
 use crate::model_catalog::ArtifactFormat;
+#[cfg(test)]
+use crate::model_catalog::BUNDLED_BASE_MODEL_ID;
 use crate::models::{
-    ModelInstallStatus, ModelRuntimeStatus, SttModelInfo, TranscriptionStatus, format_bytes,
+    ModelArtifactOrigin, ModelInstallStatus, ModelRuntimeStatus, SttModelInfo, TranscriptionStatus,
+    format_bytes,
 };
 use crate::overlay::{
     self, CapturedTarget, OverlayController, OverlayMode as NativeOverlayMode, OverlayPhase,
@@ -3664,6 +3667,9 @@ impl LocalTranscriberApp {
         let Some(model) = self.selected_model() else {
             return;
         };
+        if !self.validate_bundled_model_artifact_or_report(&model) {
+            return;
+        }
         let model_id = ModelId::new(&model.id);
         let embedded_gguf = config::remote_gguf_artifact(&self.config, &model.id).is_some()
             || config::imported_gguf_artifact(&self.config, &model.id).is_some();
@@ -8843,6 +8849,11 @@ impl LocalTranscriberApp {
     /// still require recovery after that point, so callers must not undo the
     /// newly persisted active-model selection on a committed removal.
     fn uninstall_model(&mut self, model: &SttModelInfo) -> bool {
+        if model.artifact_origin == ModelArtifactOrigin::Bundled {
+            self.status_message =
+                "This model is installed with Scribe and cannot be removed.".to_owned();
+            return false;
+        }
         if let Some(reason) = self.artifact_mutation_block_reason() {
             self.status_message = reason;
             return false;
@@ -9004,6 +9015,37 @@ impl LocalTranscriberApp {
                 false => format!("Removed {} from Scribe.", model.name),
             }
         };
+        true
+    }
+
+    fn validate_bundled_model_artifact_or_report(&mut self, model: &SttModelInfo) -> bool {
+        if model.artifact_origin != ModelArtifactOrigin::Bundled {
+            return true;
+        }
+        let Some(path) = model.local_path.as_ref().filter(|path| path.is_file()) else {
+            let message = "The installed model is missing. Choose Repair to download and verify the exact pinned model; Scribe will not download it automatically.".to_owned();
+            self.model_downloads
+                .insert(model.id.clone(), ModelInstallStatus::Error(message.clone()));
+            self.status = TranscriptionStatus::Error;
+            self.status_message = message;
+            return false;
+        };
+        if let Err(error) = self
+            .transcription_service
+            .verify_model_artifact_for_installation(
+                &ModelId::new(&model.id),
+                Some(path.to_path_buf()),
+            )
+        {
+            let message = format!(
+                "The installed model failed integrity verification. Choose Repair to download and verify the exact pinned model; Scribe will not replace it automatically: {error}"
+            );
+            self.model_downloads
+                .insert(model.id.clone(), ModelInstallStatus::Error(message.clone()));
+            self.status = TranscriptionStatus::Error;
+            self.status_message = message;
+            return false;
+        }
         true
     }
 
@@ -10750,7 +10792,9 @@ impl LocalTranscriberApp {
         // still Scribe-owned; an arbitrary configured path is not.
         let app_owned_legacy_artifact = app_owned_legacy_catalog_artifact(&self.config, model);
         let legacy_cleanup_pending = app_owned_legacy_cleanup_artifact(&self.config, model);
-        let installed = manageable && !legacy_cleanup_pending;
+        let bundled = model.artifact_origin == ModelArtifactOrigin::Bundled;
+        let installed =
+            manageable && !legacy_cleanup_pending && (!bundled || install_status.is_runnable());
         let custom = model.local_path.is_some()
             && !self.config.general.managed_models.contains_key(&model.id)
             && !self
@@ -10759,7 +10803,8 @@ impl LocalTranscriberApp {
                 .managed_remote_models
                 .contains_key(&model.id)
             && !imported_gguf
-            && !app_owned_legacy_artifact;
+            && !app_owned_legacy_artifact
+            && !bundled;
         let exact_install_active = self.artifact_installations.contains_key(&model.id);
         let install_phase = self.artifact_installations.phase_for_model(&model.id);
         let mut download_state = match &install_status {
@@ -10816,6 +10861,7 @@ impl LocalTranscriberApp {
         let install_admission_blocked = install_admission_block_reason.is_some();
         let selected = manageable && self.config.general.selected_default_model == model.id;
         let active = installed && selected && runtime_ready;
+        let included = bundled && installed && runtime_ready;
         let migration_pending =
             manageable && config::model_needs_pinned_gguf_migration(&self.config, model);
         let (
@@ -10896,14 +10942,25 @@ impl LocalTranscriberApp {
             )
         } else {
             (
-                "Not installed".to_owned(),
+                if bundled {
+                    "Repair installed model"
+                } else {
+                    "Not installed"
+                }
+                .to_owned(),
                 false,
                 false,
                 false,
                 partial_inspection_error
                     .clone()
                     .or_else(|| install_admission_block_reason.clone())
-                    .or_else(|| Some("Install this model before using it.".to_owned())),
+                    .or_else(|| {
+                        Some(if bundled {
+                            "The installed model is missing or failed verification. Repair downloads the exact pinned model after you choose it."
+                        } else {
+                            "Install this model before using it."
+                        }.to_owned())
+                    }),
             )
         };
         let manifest = crate::model_catalog::runtime_model_manifest(&ModelId::new(&model.id));
@@ -10934,6 +10991,8 @@ impl LocalTranscriberApp {
                 .local_path
                 .as_ref()
                 .map(|path| path.display().to_string()),
+            bundled,
+            included,
             installed,
             legacy_cleanup_pending,
             selected,
@@ -10956,7 +11015,8 @@ impl LocalTranscriberApp {
             primary_action_repairs_runtime,
             primary_action_disabled_reason,
             cancel_supported: install_phase.is_some_and(ArtifactInstallPhase::allows_cancellation),
-            removal_supported: !custom
+            removal_supported: !bundled
+                && !custom
                 && (imported_gguf
                     || app_owned_legacy_artifact
                     || supports_managed_uninstall(model, &install_status)),
@@ -18495,6 +18555,110 @@ mod layout_tests {
     }
 
     #[test]
+    fn bundled_model_projection_is_included_ready_and_non_removable() {
+        let app = test_app();
+        let mut model = config::configured_models(&app.config)
+            .into_iter()
+            .find(|model| model.id == BUNDLED_BASE_MODEL_ID)
+            .expect("base catalog model");
+        model.local_path = Some(PathBuf::from("whisper-base.en-Q8_0.gguf"));
+        model.artifact_origin = ModelArtifactOrigin::Bundled;
+        model.install_status = ModelInstallStatus::Installed;
+        let descriptor = app
+            .transcription_service
+            .model_descriptor(&ModelId::new(BUNDLED_BASE_MODEL_ID))
+            .unwrap();
+
+        let projected =
+            app.model_management_view_model(&model, Some(&descriptor), &PartialInspection::Missing);
+
+        assert!(projected.bundled);
+        assert!(projected.included);
+        assert!(projected.installed);
+        assert!(projected.ready);
+        assert!(!projected.custom);
+        assert!(!projected.removal_supported);
+    }
+
+    #[test]
+    fn missing_and_corrupt_bundled_models_fail_closed_without_automatic_replacement() {
+        let root = std::env::temp_dir().join(format!(
+            "scribe-app-bundled-integrity-{}-{}",
+            std::process::id(),
+            NEXT_TEST_SESSION.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let missing_path = root.join("missing").join("whisper-base.en-Q8_0.gguf");
+        let corrupt_path = root.join("whisper-base.en-Q8_0.gguf");
+        fs::write(&corrupt_path, b"not the pinned bundled model").unwrap();
+        let mut app = test_app();
+        let mut model = config::configured_models(&app.config)
+            .into_iter()
+            .find(|model| model.id == BUNDLED_BASE_MODEL_ID)
+            .expect("base catalog model");
+        model.artifact_origin = ModelArtifactOrigin::Bundled;
+        model.install_status = ModelInstallStatus::Installed;
+
+        model.local_path = Some(missing_path);
+        assert!(!app.validate_bundled_model_artifact_or_report(&model));
+        assert!(app.status_message.contains("installed model is missing"));
+        assert!(
+            app.status_message
+                .contains("will not download it automatically")
+        );
+        assert!(matches!(
+            app.model_downloads.get(BUNDLED_BASE_MODEL_ID),
+            Some(ModelInstallStatus::Error(message)) if message.contains("Choose Repair")
+        ));
+
+        app.model_downloads.clear();
+        model.local_path = Some(corrupt_path.clone());
+        assert!(!app.validate_bundled_model_artifact_or_report(&model));
+        assert!(app.status_message.contains("failed integrity verification"));
+        assert!(
+            app.status_message
+                .contains("will not replace it automatically")
+        );
+        assert!(corrupt_path.is_file());
+        assert!(matches!(
+            app.model_downloads.get(BUNDLED_BASE_MODEL_ID),
+            Some(ModelInstallStatus::Error(message)) if message.contains("Choose Repair")
+        ));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bundled_model_uninstall_guard_preserves_the_artifact_and_configuration() {
+        let root = std::env::temp_dir().join(format!(
+            "scribe-app-bundled-remove-{}-{}",
+            std::process::id(),
+            NEXT_TEST_SESSION.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("whisper-base.en-Q8_0.gguf");
+        fs::write(&path, b"immutable packaged fixture").unwrap();
+        let mut app = test_app();
+        let before = serde_json::to_value(&app.config).unwrap();
+        let mut model = config::configured_models(&app.config)
+            .into_iter()
+            .find(|model| model.id == BUNDLED_BASE_MODEL_ID)
+            .expect("base catalog model");
+        model.local_path = Some(path.clone());
+        model.artifact_origin = ModelArtifactOrigin::Bundled;
+        model.install_status = ModelInstallStatus::Installed;
+
+        assert!(!app.uninstall_model(&model));
+        assert!(path.is_file());
+        assert_eq!(serde_json::to_value(&app.config).unwrap(), before);
+        assert_eq!(
+            app.status_message,
+            "This model is installed with Scribe and cannot be removed."
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn legacy_model_projection_exposes_upgrade_without_changing_its_stable_id() {
         let root = std::env::temp_dir().join(format!(
             "scribe-app-legacy-upgrade-{}-{}",
@@ -18739,6 +18903,7 @@ mod layout_tests {
             accuracy_tier: "Unknown".to_owned(),
             speed_tier: "Unknown".to_owned(),
             local_path: None,
+            artifact_origin: ModelArtifactOrigin::Catalog,
             install_status: ModelInstallStatus::Installed,
             download_model: None,
         };
@@ -19938,6 +20103,7 @@ mod layout_tests {
             load_duration_ms: 0,
             decode_duration_ms: 0,
             reload_duration_ms: 0,
+            cancellation_verified: false,
         }
     }
 
@@ -19957,6 +20123,8 @@ mod layout_tests {
             .general
             .model_paths
             .insert("whisper_cpp_tiny_en".to_owned(), fixture.clone());
+        config.general.selected_default_model = "whisper_cpp_tiny_en".to_owned();
+        config.general.playground_selected_models = vec!["whisper_cpp_tiny_en".to_owned()];
         config::normalize_config(&mut config);
         let (tx, rx) = unbounded();
         let tx = AppEventSink::new(tx, egui::Context::default());
@@ -22333,6 +22501,7 @@ mod layout_tests {
             local_path: Some(PathBuf::from(
                 "/home/tyhuang/Projects/whisper.cpp/models/ggml-base.en.bin",
             )),
+            artifact_origin: ModelArtifactOrigin::External,
             install_status: ModelInstallStatus::Installed,
             download_model: Some("base.en".to_owned()),
         }
@@ -23642,6 +23811,7 @@ mod layout_tests {
     #[test]
     fn playground_membership_adds_once_and_uninstall_cleanup_removes_model() {
         let mut config = AppConfig::default();
+        config.general.playground_selected_models.clear();
         set_model_selected(&mut config, "whisper_cpp_tiny_en", true);
         set_model_selected(&mut config, "whisper_cpp_tiny_en", true);
         assert_eq!(
@@ -25284,6 +25454,7 @@ mod layout_tests {
             accuracy_tier: String::new(),
             speed_tier: String::new(),
             local_path: None,
+            artifact_origin: ModelArtifactOrigin::Catalog,
             install_status: ModelInstallStatus::Installed,
             download_model: None,
         };

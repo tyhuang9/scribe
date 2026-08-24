@@ -1,0 +1,149 @@
+$ErrorActionPreference = "Stop"
+Set-StrictMode -Version Latest
+
+$repositoryRoot = [System.IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
+$releaseScript = Join-Path $PSScriptRoot "build-windows-release.ps1"
+$modelScript = Join-Path $PSScriptRoot "bundle-base-model.ps1"
+$source = Get-Content -LiteralPath $releaseScript -Raw
+$helpersStart = $source.IndexOf("function Get-NormalizedFullPath")
+$helpersEnd = $source.IndexOf("if (-not [Environment]::Is64BitOperatingSystem")
+if ($helpersStart -lt 0 -or $helpersEnd -le $helpersStart) {
+    throw "Could not isolate Windows release helper functions for testing."
+}
+$expectedPeMachine = 0x8664
+Invoke-Expression $source.Substring($helpersStart, $helpersEnd - $helpersStart)
+
+function Invoke-ExpectedFailure([scriptblock]$Action, [string]$ExpectedText) {
+    try {
+        & $Action
+    }
+    catch {
+        if (-not $_.Exception.Message.Contains($ExpectedText)) {
+            throw "Expected failure containing '$ExpectedText', got: $($_.Exception.Message)"
+        }
+        return
+    }
+    throw "Expected failure containing '$ExpectedText', but the action succeeded."
+}
+
+function Write-TestPe([string]$Path, [uint16]$Machine) {
+    $bytes = [byte[]]::new(128)
+    $bytes[0] = 0x4D
+    $bytes[1] = 0x5A
+    [BitConverter]::GetBytes([uint32]0x40).CopyTo($bytes, 0x3C)
+    [BitConverter]::GetBytes([uint32]0x00004550).CopyTo($bytes, 0x40)
+    [BitConverter]::GetBytes($Machine).CopyTo($bytes, 0x44)
+    [System.IO.File]::WriteAllBytes($Path, $bytes)
+}
+
+$testRoot = Join-Path ([System.IO.Path]::GetTempPath()) "scribe-release-script-$PID-$([guid]::NewGuid().ToString('N'))"
+New-Item -ItemType Directory -Path $testRoot | Out-Null
+try {
+    $amd64 = Join-Path $testRoot "amd64.exe"
+    $x86 = Join-Path $testRoot "x86.exe"
+    Write-TestPe $amd64 0x8664
+    Write-TestPe $x86 0x014C
+    Assert-Amd64Pe $amd64
+    Invoke-ExpectedFailure { Assert-Amd64Pe $x86 } "PE Machine mismatch"
+
+    $final = Join-Path $testRoot "Scribe-windows-x64"
+    $validStaging = "$final.staging-$PID-$([guid]::NewGuid().ToString('N'))"
+    New-Item -ItemType Directory -Path $validStaging | Out-Null
+    [System.IO.File]::WriteAllBytes((Join-Path $validStaging "marker.bin"), [byte[]](1, 2, 3))
+    Remove-ValidatedStaging $validStaging $final
+    if (Test-Path -LiteralPath $validStaging) {
+        throw "Validated staging cleanup did not remove its bounded target."
+    }
+
+    $outsideParent = Join-Path $testRoot "outside-parent"
+    New-Item -ItemType Directory -Path $outsideParent | Out-Null
+    $outside = Join-Path $outsideParent "Scribe-windows-x64.staging-$PID-$([guid]::NewGuid().ToString('N'))"
+    New-Item -ItemType Directory -Path $outside | Out-Null
+    $outsideMarker = Join-Path $outside "keep.bin"
+    [System.IO.File]::WriteAllBytes($outsideMarker, [byte[]](4, 5, 6))
+    Invoke-ExpectedFailure { Remove-ValidatedStaging $outside $final } "direct sibling"
+    if (-not (Test-Path -LiteralPath $outsideMarker -PathType Leaf)) {
+        throw "Out-of-bounds cleanup touched an unrelated marker."
+    }
+
+    $allowlist = Join-Path $testRoot "allowlist"
+    New-Item -ItemType Directory -Path (Join-Path $allowlist "nested") -Force | Out-Null
+    [System.IO.File]::WriteAllBytes((Join-Path $allowlist "one.bin"), [byte[]](1))
+    [System.IO.File]::WriteAllBytes((Join-Path $allowlist "nested\two.bin"), [byte[]](2))
+    Assert-ExactAllowlist $allowlist @("one.bin", "nested/two.bin")
+    [System.IO.File]::WriteAllBytes((Join-Path $allowlist "unexpected.bin"), [byte[]](3))
+    Invoke-ExpectedFailure {
+        Assert-ExactAllowlist $allowlist @("one.bin", "nested/two.bin")
+    } "outside the explicit allowlist"
+
+    $inventoryFile = Join-Path $allowlist "one.bin"
+    $inventoryItem = Get-Item -LiteralPath $inventoryFile
+    $inventoryHash = (Get-FileHash -LiteralPath $inventoryFile -Algorithm SHA256).Hash
+    Assert-ExactFile $inventoryFile $inventoryItem.Length $inventoryHash
+    [System.IO.File]::WriteAllBytes($inventoryFile, [byte[]](9))
+    Invoke-ExpectedFailure {
+        Assert-ExactFile $inventoryFile $inventoryItem.Length $inventoryHash
+    } "SHA-256 mismatch"
+
+    $targetBundle = Join-Path $repositoryRoot "target\scribe-release-probe-$PID"
+    Invoke-ExpectedFailure {
+        & $releaseScript -ModelSource "missing-model" -RuntimeSource "missing-runtime" -BundlePath $targetBundle
+    } "Cargo target directories"
+    if (Test-Path -LiteralPath $targetBundle) {
+        throw "Rejected Cargo-target bundle path was mutated."
+    }
+
+    $existingFinal = Join-Path $testRoot "existing-final"
+    New-Item -ItemType Directory -Path $existingFinal | Out-Null
+    $existingMarker = Join-Path $existingFinal "keep.bin"
+    [System.IO.File]::WriteAllBytes($existingMarker, [byte[]](7))
+    Invoke-ExpectedFailure {
+        & $releaseScript -ModelSource "missing-model" -RuntimeSource "missing-runtime" -BundlePath $existingFinal
+    } "already exists"
+    if (-not (Test-Path -LiteralPath $existingMarker -PathType Leaf)) {
+        throw "Existing final bundle was mutated."
+    }
+
+    $staleFinal = Join-Path $testRoot "stale-final"
+    $stale = "$staleFinal.staging-old"
+    New-Item -ItemType Directory -Path $stale | Out-Null
+    $staleMarker = Join-Path $stale "keep.bin"
+    [System.IO.File]::WriteAllBytes($staleMarker, [byte[]](8))
+    Invoke-ExpectedFailure {
+        & $releaseScript -ModelSource "missing-model" -RuntimeSource "missing-runtime" -BundlePath $staleFinal
+    } "stale release staging sibling"
+    if (-not (Test-Path -LiteralPath $staleMarker -PathType Leaf)) {
+        throw "Stale staging refusal mutated the stale directory."
+    }
+
+    $modelDestination = Join-Path $testRoot "model-destination"
+    $otherDestination = Join-Path $testRoot "other-destination"
+    New-Item -ItemType Directory -Path $modelDestination | Out-Null
+    New-Item -ItemType Directory -Path $otherDestination | Out-Null
+    Invoke-ExpectedFailure {
+        & $modelScript -Source "missing-model" -Destination $modelDestination -Executable (Join-Path $modelDestination "renamed.exe")
+    } "exact executable name"
+    Invoke-ExpectedFailure {
+        & $modelScript -Source "missing-model" -Destination $modelDestination -Executable (Join-Path $otherDestination "local-transcriber.exe")
+    } "canonical executable parent"
+
+    $realDestination = Join-Path $testRoot "real-destination"
+    $junctionDestination = Join-Path $testRoot "junction-destination"
+    New-Item -ItemType Directory -Path $realDestination | Out-Null
+    New-Item -ItemType Junction -Path $junctionDestination -Target $realDestination | Out-Null
+    Invoke-ExpectedFailure {
+        & $modelScript -Source "missing-model" -Destination $junctionDestination -Executable (Join-Path $junctionDestination "local-transcriber.exe")
+    } "reparse point"
+
+    Write-Output "Windows release packaging fail-closed tests passed."
+}
+finally {
+    $tempRoot = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath())
+    $resolvedTestRoot = [System.IO.Path]::GetFullPath($testRoot)
+    if (-not $resolvedTestRoot.StartsWith($tempRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Refused test cleanup outside the system temporary directory."
+    }
+    if (Test-Path -LiteralPath $resolvedTestRoot) {
+        Remove-Item -LiteralPath $resolvedTestRoot -Recurse -Force
+    }
+}

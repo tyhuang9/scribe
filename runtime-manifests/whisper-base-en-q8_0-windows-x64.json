@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "model_id": "whisper_cpp_base_en",
+  "platform_triple": "x86_64-pc-windows-msvc",
+  "repository": "handy-computer/whisper-base.en-gguf",
+  "revision": "cf0804db15fb341d00c9274b90da9cbb4fe2e5c6",
+  "artifact_filename": "whisper-base.en-Q8_0.gguf",
+  "size_bytes": 84886208,
+  "sha256": "3b46ca40bccbf7609c68d88a36d96077a04ca7c87f2060ede06f129fac3e7652",
+  "attribution_files": [
+    "resources/licenses/Apache-2.0.txt",
+    "resources/licenses/OpenAI-Whisper-MIT.txt",
+    "resources/licenses/Whisper-Base-En-NOTICE.txt"
+  ]
+}

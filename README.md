@@ -246,17 +246,25 @@ developer recovery: `SHERPA_ONNX_ALLOW_DEBUG_DOWNLOAD=1`.
 The repository still packages a pinned whisper.cpp v1.9.1 compatibility
 runtime for retained GGML models and a narrowly scoped bootstrap fallback when
 the primary native GGUF adapter cannot initialize. It is an in-process DLL path
-with a hash-verified CLI fallback, not the normal GGUF route. Build a Windows
-release bundle with:
+with a hash-verified CLI fallback, not the normal GGUF route. Build the
+qualified Windows x64 release from local, previously acquired pinned sources
+with:
 
-```bash
-scripts/build-release-bundle.sh
+```powershell
+.\scripts\build-windows-release.ps1 `
+  -RuntimeSource C:\path\to\verified-whisper-runtime `
+  -ModelSource C:\path\to\whisper-base.en-Q8_0.gguf
 ```
 
-The bundler stages that compatibility package under
-`target/release/runtimes/whisper_cpp`. The app validates the exact package
-manifest before use; packaging variants do not create additional logical
-runtime kinds.
+The bundler performs a locked, offline build for `x86_64-pc-windows-msvc`,
+then stages an explicit artifact allowlist in a unique transaction directory.
+Only after the compatibility runtime, executable architecture, exact pinned
+base.en GGUF, redistribution notices, offline load/decode/cancel/unload smoke,
+and generated hash inventory all validate is the directory atomically renamed
+to `artifacts/Scribe-windows-x64`. Cargo's `target` tree remains build input and
+is never used or mutated as the distributable bundle. The scripts do not
+download the model. The app validates the exact artifact again before use;
+packaging variants do not create additional logical runtime kinds.
 
 The repository retains separate faster-whisper, Vosk, sherpa-onnx, Moonshine,
 Parakeet, and CUDA scripts solely for bounded development investigation and
@@ -295,7 +303,7 @@ Scribe stores new config under the Scribe application directory. On first launch
 
 The config stores:
 
-- selected default model
+- selected default model (fresh profiles use the bundled `whisper_cpp_base_en`)
 - Playground-selected models (the persisted `playground_selected_models` key; older `playground_enabled_models` and `enabled_models` keys migrate on load)
 - persisted model playground order
 - managed model install metadata

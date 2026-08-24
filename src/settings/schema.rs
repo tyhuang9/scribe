@@ -10,6 +10,7 @@ use super::super::{
     default_playground_model_order, default_whisper_cuda_backend_path,
     default_whisper_cuda_library_paths,
 };
+use crate::model_catalog::BUNDLED_BASE_MODEL_ID;
 use crate::transcription::AccelerationPreference;
 
 pub const CURRENT_SCHEMA_VERSION: u32 = 2;
@@ -258,8 +259,8 @@ impl Default for AppConfig {
 impl Default for GeneralSettings {
     fn default() -> Self {
         Self {
-            selected_default_model: "whisper_cpp_tiny_en".to_owned(),
-            playground_selected_models: vec!["whisper_cpp_tiny_en".to_owned()],
+            selected_default_model: BUNDLED_BASE_MODEL_ID.to_owned(),
+            playground_selected_models: vec![BUNDLED_BASE_MODEL_ID.to_owned()],
             playground_model_order: default_playground_model_order(),
             managed_models: HashMap::new(),
             managed_remote_models: HashMap::new(),

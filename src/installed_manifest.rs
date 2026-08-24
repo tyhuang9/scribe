@@ -367,6 +367,7 @@ mod tests {
             load_duration_ms: 2,
             decode_duration_ms: 3,
             reload_duration_ms: 4,
+            cancellation_verified: true,
         }
     }
 
