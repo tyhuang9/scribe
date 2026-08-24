@@ -1,4 +1,7 @@
-use std::{cell::Cell, time::Duration};
+use std::{
+    cell::Cell,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use eframe::egui::{self, Color32, RichText, Sense, Stroke, ViewportClass};
 use unicode_segmentation::UnicodeSegmentation;
@@ -34,6 +37,7 @@ const LIVE_WAVEFORM_SIZE: f32 = 30.0;
 const MAX_PREVIEW_GRAPHEMES: usize = 512;
 const MAX_MESSAGE_GRAPHEMES: usize = 256;
 const LIVE_PREVIEW_ROWS: usize = 1;
+const PROGRESS_GLYPHS: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OverlayAction {
@@ -172,6 +176,49 @@ pub(super) fn is_cancellable(state: &OverlayViewState) -> bool {
             state.phase,
             OverlayPhase::Preparing | OverlayPhase::Listening
         )
+}
+
+/// A compact, visual status affordance for lifecycle work. It intentionally
+/// stays textual so the native GDI+ and egui renderers share the same copy.
+/// Screen readers use `status_text` without the decorative glyph.
+pub(super) fn phase_status_label(phase: OverlayPhase) -> String {
+    if !phase.is_progressing() {
+        return phase.status_text().to_owned();
+    }
+    let glyph = if overlay_animations_enabled() {
+        let elapsed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        PROGRESS_GLYPHS[(elapsed / 125) as usize % PROGRESS_GLYPHS.len()]
+    } else {
+        "○"
+    };
+    format!("{glyph} {}", phase.status_text())
+}
+
+#[cfg(target_os = "windows")]
+fn overlay_animations_enabled() -> bool {
+    use std::ffi::c_void;
+
+    use windows_sys::Win32::UI::WindowsAndMessaging::SystemParametersInfoW;
+
+    const SPI_GETCLIENTAREAANIMATION: u32 = 0x1042;
+    let mut enabled = 0i32;
+    unsafe {
+        SystemParametersInfoW(
+            SPI_GETCLIENTAREAANIMATION,
+            0,
+            &mut enabled as *mut i32 as *mut c_void,
+            0,
+        ) != 0
+            && enabled != 0
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn overlay_animations_enabled() -> bool {
+    true
 }
 
 pub(super) fn control_window_bounds(
@@ -401,7 +448,7 @@ fn render_compact_status_row(ui: &mut egui::Ui, state: &OverlayViewState, colors
             ("Error".to_owned(), colors.error)
         } else if state.notice.is_some() {
             ("Notice".to_owned(), colors.warning)
-        } else {
+        } else if state.phase == OverlayPhase::Listening {
             (
                 state
                     .elapsed
@@ -409,11 +456,16 @@ fn render_compact_status_row(ui: &mut egui::Ui, state: &OverlayViewState, colors
                     .unwrap_or_else(|| "00:00".to_owned()),
                 colors.muted_text,
             )
+        } else {
+            (phase_status_label(state.phase), colors.muted_text)
         };
         let response = ui.label(RichText::new(label).size(13.0).color(color));
         ui.ctx().accesskit_node_builder(response.id, |builder| {
             builder.set_name(compact_accessible_text(state));
-            if state.error.is_some() || state.notice.is_some() || state.phase == OverlayPhase::Error
+            if state.error.is_some()
+                || state.notice.is_some()
+                || state.phase_announcement.is_some()
+                || state.phase == OverlayPhase::Error
             {
                 builder.set_live(egui::accesskit::Live::Polite);
             }
@@ -425,12 +477,26 @@ fn render_live_status_row(ui: &mut egui::Ui, state: &OverlayViewState, colors: O
     ui.horizontal_centered(|ui| {
         render_brand_mark(ui, state, colors);
         ui.add_space(8.0);
-        let elapsed = state
-            .elapsed
-            .map(format_elapsed)
-            .unwrap_or_else(|| "00:00".into());
+        let elapsed = if state.phase == OverlayPhase::Listening {
+            state
+                .elapsed
+                .map(format_elapsed)
+                .unwrap_or_else(|| "00:00".into())
+        } else {
+            format!(
+                "Recorded {}",
+                state
+                    .elapsed
+                    .map(format_elapsed)
+                    .unwrap_or_else(|| "00:00".into())
+            )
+        };
         ui.label(RichText::new(elapsed).size(13.0).color(colors.muted_text));
-        if state.live_preview_available || state.error.is_some() {
+        if state.shows_live_transcript()
+            || state.error.is_some()
+            || state.notice.is_some()
+            || state.phase != OverlayPhase::Listening
+        {
             render_divider(ui, colors);
             let layout = live_preview_layout(ui, state, colors, ui.available_width());
             let follows_transcript_tail = layout.halign == egui::Align::RIGHT;
@@ -461,13 +527,19 @@ fn render_live_status_row(ui: &mut egui::Ui, state: &OverlayViewState, colors: O
 }
 
 pub(super) fn live_overlay_announcement(state: &OverlayViewState) -> Option<&str> {
-    if !state.live_preview_available || state.error.is_some() || state.notice.is_some() {
+    if state.error.is_some() || state.notice.is_some() {
+        return None;
+    }
+    if let Some(announcement) = state.phase_announcement.as_deref() {
+        return Some(announcement);
+    }
+    if !state.shows_live_transcript() {
         return None;
     }
     if let Some(announcement) = state.transcript_announcement.as_deref() {
         return Some(announcement);
     }
-    (state.phase != OverlayPhase::Hidden).then(|| state.phase.label())
+    None
 }
 
 fn render_divider(ui: &mut egui::Ui, colors: OverlayColors) {
@@ -492,7 +564,7 @@ fn render_brand_mark(ui: &mut egui::Ui, state: &OverlayViewState, colors: Overla
         builder.set_description(if state.phase == OverlayPhase::Listening {
             "Scribe is recording"
         } else {
-            state.phase.label()
+            state.phase.status_text()
         });
     });
     ui.painter().text(
@@ -517,6 +589,16 @@ fn live_preview_layout(
 
     if let Some(notice) = &state.notice {
         return message_layout_for_rows(ui, notice, colors.warning, max_width, LIVE_PREVIEW_ROWS);
+    }
+
+    if !state.phase.shows_live_transcript() {
+        return message_layout_for_rows(
+            ui,
+            &phase_status_label(state.phase),
+            colors.muted_text,
+            max_width,
+            LIVE_PREVIEW_ROWS,
+        );
     }
 
     if state.transcript.committed.is_empty() && state.transcript.tentative.is_empty() {
@@ -546,8 +628,11 @@ pub(super) fn live_accessible_text(state: &OverlayViewState) -> String {
     if let Some(notice) = &state.notice {
         return notice.clone();
     }
+    if !state.phase.shows_live_transcript() {
+        return state.phase.status_text().to_owned();
+    }
     if state.transcript.committed.is_empty() && state.transcript.tentative.is_empty() {
-        return state.phase.label().to_owned();
+        return state.phase.status_text().to_owned();
     }
     if state.transcript.tentative.is_empty() {
         format!("Committed transcript: {}", state.transcript.committed)
@@ -567,7 +652,10 @@ pub(super) fn compact_accessible_text(state: &OverlayViewState) -> String {
         return notice.clone();
     }
     if state.phase == OverlayPhase::Error {
-        return state.phase.label().to_owned();
+        return state.phase.status_text().to_owned();
+    }
+    if state.phase != OverlayPhase::Listening {
+        return state.phase.status_text().to_owned();
     }
     format!(
         "Elapsed time {}",
@@ -816,6 +904,13 @@ mod tests {
             phase: OverlayPhase::Finalizing,
             ..preparing
         }));
+    }
+
+    #[test]
+    fn progress_status_labels_include_the_lifecycle_copy() {
+        assert!(phase_status_label(OverlayPhase::Processing).ends_with("Transcribing…"));
+        assert!(phase_status_label(OverlayPhase::Finalizing).ends_with("Finishing recording…"));
+        assert_eq!(phase_status_label(OverlayPhase::Success), "Done");
     }
 
     #[test]
@@ -1659,15 +1754,19 @@ mod tests {
     #[test]
     fn phase_only_updates_have_one_polite_live_region() {
         for (phase, expected) in [
-            (OverlayPhase::Preparing, "Preparing"),
+            (OverlayPhase::Preparing, "Starting microphone…"),
             (OverlayPhase::Listening, "Recording"),
-            (OverlayPhase::Finalizing, "Finalizing"),
+            (OverlayPhase::Finalizing, "Finishing recording…"),
+            (OverlayPhase::Processing, "Transcribing…"),
+            (OverlayPhase::Pasting, "Pasting…"),
+            (OverlayPhase::Success, "Done"),
         ] {
             let context = egui::Context::default();
             context.enable_accesskit();
             let state = OverlayViewState {
                 phase,
                 live_preview_available: true,
+                phase_announcement: Some(expected.to_owned()),
                 transcript: super::super::controller::OverlayTranscript {
                     tentative: "tentative words".to_owned(),
                     ..Default::default()
@@ -1807,6 +1906,53 @@ mod tests {
                     name.starts_with("Committed transcript:")
                         || name.contains("Live estimate, may change")
                 })
+            }));
+        }
+    }
+
+    #[test]
+    fn compact_lifecycle_status_replaces_the_frozen_timer_once_recording_stops() {
+        for (phase, expected) in [
+            (OverlayPhase::Finalizing, "Finishing recording…"),
+            (OverlayPhase::Processing, "Transcribing…"),
+            (OverlayPhase::Pasting, "Pasting…"),
+            (OverlayPhase::Success, "Done"),
+        ] {
+            let context = egui::Context::default();
+            context.enable_accesskit();
+            let state = OverlayViewState {
+                mode: OverlayMode::Minimal,
+                phase,
+                elapsed: Some(std::time::Duration::from_secs(12)),
+                phase_announcement: Some(expected.to_owned()),
+                transcript: super::super::controller::OverlayTranscript {
+                    committed: "stale words".to_owned(),
+                    tentative: " that must not be shown".to_owned(),
+                    revision: 1,
+                },
+                ..OverlayViewState::default()
+            };
+            let output = context.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(MINIMAL_WIDTH, MINIMAL_HEIGHT),
+                    )),
+                    ..Default::default()
+                },
+                |context| render_overlay(context, &state),
+            );
+            let update = output.platform_output.accesskit_update.unwrap();
+            let status = update
+                .nodes
+                .iter()
+                .find(|(_, node)| node.live() == Some(egui::accesskit::Live::Polite))
+                .expect("phase transition should have one polite announcement")
+                .1
+                .name();
+            assert_eq!(status, Some(expected));
+            assert!(update.nodes.iter().all(|(_, node)| {
+                !node.name().is_some_and(|name| name.contains("stale words"))
             }));
         }
     }

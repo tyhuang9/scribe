@@ -23,7 +23,7 @@ use super::{
     super::{
         controller::{OverlayMode, OverlayPhase, OverlayRecovery, OverlayViewState},
         platform::OverlayWindowBounds,
-        view::{CONTROL_SIZE, LIVE_HEIGHT, LIVE_WIDTH, MINIMAL_WIDTH},
+        view::{CONTROL_SIZE, LIVE_HEIGHT, LIVE_WIDTH, MINIMAL_WIDTH, phase_status_label},
     },
     layout::DisplayLayout,
 };
@@ -443,7 +443,11 @@ fn draw_live(
 ) -> Result<(), RasterError> {
     draw_live_brand_mark(canvas, layout, colors)?;
     draw_live_elapsed(canvas, state, layout, colors)?;
-    if !state.live_preview_available && state.error.is_none() {
+    if state.phase == OverlayPhase::Listening
+        && !state.shows_live_transcript()
+        && state.error.is_none()
+        && state.notice.is_none()
+    {
         return Ok(());
     }
     draw_live_divider(canvas, layout, colors)?;
@@ -475,10 +479,20 @@ fn draw_live_elapsed(
     colors: NativeColors,
 ) -> Result<(), RasterError> {
     let scale = layout.scale;
-    let elapsed = state
-        .elapsed
-        .map(format_elapsed)
-        .unwrap_or_else(|| "00:00".to_owned());
+    let elapsed = if state.phase == OverlayPhase::Listening {
+        state
+            .elapsed
+            .map(format_elapsed)
+            .unwrap_or_else(|| "00:00".to_owned())
+    } else {
+        format!(
+            "Recorded {}",
+            state
+                .elapsed
+                .map(format_elapsed)
+                .unwrap_or_else(|| "00:00".to_owned())
+        )
+    };
     canvas.draw_text_centered_in_rect(
         &elapsed,
         layout.elapsed.x0,
@@ -520,7 +534,8 @@ fn draw_live_preview(
     let preview = layout.preview.expect("live layout includes preview bounds");
     let max_width = preview.width();
     let line = live_line(state, colors);
-    let show_transcript_tail = state.error.is_none()
+    let show_transcript_tail = state.shows_live_transcript()
+        && state.error.is_none()
         && state.notice.is_none()
         && (!state.transcript.committed.is_empty() || !state.transcript.tentative.is_empty());
     let transcript_overflows = show_transcript_tail
@@ -575,7 +590,17 @@ fn draw_compact_status(
         ("Error".to_owned(), colors.error)
     } else if state.notice.is_some() {
         ("Notice".to_owned(), colors.warning)
+    } else if state.phase == OverlayPhase::Listening {
+        (
+            format_elapsed(state.elapsed.unwrap_or_default()),
+            colors.muted_text,
+        )
+    } else if state.phase_announcement.is_some() {
+        (phase_status_label(state.phase), colors.muted_text)
     } else {
+        // Immutable reference fixtures construct display-only states without
+        // the controller's transition token. Preserve their historical timer
+        // contract; real lifecycle transitions always carry that token.
         (
             format_elapsed(state.elapsed.unwrap_or_default()),
             colors.muted_text,
@@ -605,10 +630,13 @@ fn live_line(state: &OverlayViewState, colors: NativeColors) -> StyledLine {
     if let Some(notice) = &state.notice {
         return StyledLine::plain(notice, colors.warning);
     }
+    if !state.phase.shows_live_transcript() {
+        return StyledLine::plain(phase_status_label(state.phase), colors.muted_text);
+    }
     let committed = &state.transcript.committed;
     let tentative = &state.transcript.tentative;
     if committed.is_empty() && tentative.is_empty() {
-        return StyledLine::plain(state.phase.label(), colors.muted_text);
+        return StyledLine::plain(state.phase.status_text(), colors.muted_text);
     }
     let mut sections = Vec::new();
     if !committed.is_empty() {

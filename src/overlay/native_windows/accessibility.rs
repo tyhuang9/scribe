@@ -169,7 +169,11 @@ fn display_tree(
     }
     let mut classes = NodeClassSet::new();
     let live_mode = state.mode == OverlayMode::Live;
-    let preview_visible = live_mode && (state.live_preview_available || state.error.is_some());
+    let preview_visible = live_mode
+        && (state.shows_live_transcript()
+            || state.error.is_some()
+            || state.notice.is_some()
+            || state.phase != OverlayPhase::Listening);
     let mut children = vec![DISPLAY_STATUS_ID, DISPLAY_ELAPSED_ID];
     if preview_visible {
         children.push(DISPLAY_PREVIEW_ID);
@@ -187,7 +191,7 @@ fn display_tree(
     let status_name = if state.phase == OverlayPhase::Listening {
         "Scribe is recording"
     } else {
-        state.phase.label()
+        state.phase.status_text()
     };
     let mut status = NodeBuilder::new(Role::Image);
     status.set_name("Scribe");
@@ -201,13 +205,18 @@ fn display_tree(
     {
         let mut elapsed = NodeBuilder::new(Role::StaticText);
         if live_mode {
-            elapsed.set_name(format!(
-                "Elapsed time {}",
-                format_elapsed(state.elapsed.unwrap_or_default())
-            ));
+            let elapsed_text = format_elapsed(state.elapsed.unwrap_or_default());
+            if state.phase == OverlayPhase::Listening {
+                elapsed.set_name(format!("Elapsed time {elapsed_text}"));
+            } else {
+                elapsed.set_name(format!("Recorded {elapsed_text}"));
+            }
         } else {
             elapsed.set_name(compact_accessible_text(state));
-            if state.error.is_some() || state.notice.is_some() || state.phase == OverlayPhase::Error
+            if state.error.is_some()
+                || state.notice.is_some()
+                || state.phase_announcement.is_some()
+                || state.phase == OverlayPhase::Error
             {
                 elapsed.set_live(Live::Polite);
             }
@@ -221,7 +230,7 @@ fn display_tree(
         preview.set_bounds(accesskit_rect(
             layout.preview.expect("live layout includes preview bounds"),
         ));
-        if state.error.is_some() || state.notice.is_some() {
+        if state.error.is_some() || state.notice.is_some() || state.phase_announcement.is_some() {
             preview.set_live(Live::Polite);
         }
         nodes.push((DISPLAY_PREVIEW_ID, preview.build(&mut classes)));
