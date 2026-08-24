@@ -44,10 +44,80 @@ pub enum OverlayAction {
     Abandon(SessionId),
 }
 
+/// A privacy-safe reason why the native overlay could not be presented.
+///
+/// This deliberately exposes only a stable Scribe-owned category. Native
+/// errors can include HWNDs, operating-system details, and rendered content,
+/// none of which belong in the app status or diagnostics UI.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OverlayDiagnostic {
+    NativeHost,
+    NativeRasterization,
+    NativeAccessibility,
+    NativeLayeredPresentation,
+    NativePositioning,
+    NativeVisibility,
+    NativeWindowProcedure,
+    NativeWorker,
+}
+
+impl OverlayDiagnostic {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::NativeHost => "native-overlay-host",
+            Self::NativeRasterization => "native-overlay-raster",
+            Self::NativeAccessibility => "native-overlay-accessibility",
+            Self::NativeLayeredPresentation => "native-overlay-layered-present",
+            Self::NativePositioning => "native-overlay-position",
+            Self::NativeVisibility => "native-overlay-visibility",
+            Self::NativeWindowProcedure => "native-overlay-window-procedure",
+            Self::NativeWorker => "native-overlay-worker",
+        }
+    }
+
+    /// User-facing copy intentionally avoids leaking platform-specific
+    /// failure details while making the degraded behavior explicit.
+    pub const fn status_message(self) -> &'static str {
+        "Overlay presentation is unavailable. Recording will continue without it."
+    }
+
+    pub const fn settings_diagnostic(self) -> &'static str {
+        match self {
+            Self::NativeHost => {
+                "Overlay diagnostic: native-overlay-host. Recording will continue without the overlay."
+            }
+            Self::NativeRasterization => {
+                "Overlay diagnostic: native-overlay-raster. Recording will continue without the overlay."
+            }
+            Self::NativeAccessibility => {
+                "Overlay diagnostic: native-overlay-accessibility. Recording will continue without the overlay."
+            }
+            Self::NativeLayeredPresentation => {
+                "Overlay diagnostic: native-overlay-layered-present. Recording will continue without the overlay."
+            }
+            Self::NativePositioning => {
+                "Overlay diagnostic: native-overlay-position. Recording will continue without the overlay."
+            }
+            Self::NativeVisibility => {
+                "Overlay diagnostic: native-overlay-visibility. Recording will continue without the overlay."
+            }
+            Self::NativeWindowProcedure => {
+                "Overlay diagnostic: native-overlay-window-procedure. Recording will continue without the overlay."
+            }
+            Self::NativeWorker => {
+                "Overlay diagnostic: native-overlay-worker. Recording will continue without the overlay."
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct OverlayViewportOutput {
     pub presented: bool,
     pub action: Option<OverlayAction>,
+    /// A newly observed native overlay failure, if any. This contains only a
+    /// stable privacy-safe category, never native error details or text.
+    pub diagnostic: Option<OverlayDiagnostic>,
 }
 
 pub fn show_overlay_viewport(
@@ -159,6 +229,7 @@ fn show_eframe_overlay_viewport(
     OverlayViewportOutput {
         presented,
         action: action.get(),
+        diagnostic: None,
     }
 }
 

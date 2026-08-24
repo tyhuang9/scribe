@@ -51,7 +51,10 @@ use super::{
     OverlayAction,
     controller::{OverlayPresentation, OverlayViewState},
     platform::{CapturedTarget, OverlayPosition, OverlayWindowBounds, overlay_window_bounds},
-    view::{OverlayViewportOutput, control_window_bounds, is_cancellable, window_spec},
+    view::{
+        OverlayDiagnostic, OverlayViewportOutput, control_window_bounds, is_cancellable,
+        window_spec,
+    },
 };
 use crate::transcription::SessionId;
 
@@ -120,21 +123,6 @@ enum NativeOverlayFailureStage {
     WorkerPanicked,
 }
 
-impl NativeOverlayFailureStage {
-    const fn diagnostic_code(self) -> &'static str {
-        match self {
-            Self::HostCreation => "native-overlay-host",
-            Self::Rasterization => "native-overlay-raster",
-            Self::Accessibility => "native-overlay-accessibility",
-            Self::LayeredPresentation => "native-overlay-layered-present",
-            Self::Positioning => "native-overlay-position",
-            Self::Visibility => "native-overlay-visibility",
-            Self::WindowProcedure => "native-overlay-window-procedure",
-            Self::WorkerPanicked => "native-overlay-worker",
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct NativeOverlayFailure {
     stage: NativeOverlayFailureStage,
@@ -144,6 +132,21 @@ struct NativeOverlayFailure {
 impl NativeOverlayFailure {
     const fn new(stage: NativeOverlayFailureStage, role: Option<WindowRole>) -> Self {
         Self { stage, role }
+    }
+
+    const fn diagnostic(self) -> OverlayDiagnostic {
+        match self.stage {
+            NativeOverlayFailureStage::HostCreation => OverlayDiagnostic::NativeHost,
+            NativeOverlayFailureStage::Rasterization => OverlayDiagnostic::NativeRasterization,
+            NativeOverlayFailureStage::Accessibility => OverlayDiagnostic::NativeAccessibility,
+            NativeOverlayFailureStage::LayeredPresentation => {
+                OverlayDiagnostic::NativeLayeredPresentation
+            }
+            NativeOverlayFailureStage::Positioning => OverlayDiagnostic::NativePositioning,
+            NativeOverlayFailureStage::Visibility => OverlayDiagnostic::NativeVisibility,
+            NativeOverlayFailureStage::WindowProcedure => OverlayDiagnostic::NativeWindowProcedure,
+            NativeOverlayFailureStage::WorkerPanicked => OverlayDiagnostic::NativeWorker,
+        }
     }
 }
 
@@ -1511,7 +1514,8 @@ struct NativeOverlayService {
     presentation: Arc<Mutex<NativePresentationObservation>>,
     retained_action: Arc<Mutex<Option<OverlayAction>>>,
     pending_action: Option<OverlayAction>,
-    last_reported_failure: Option<NativeOverlayFailure>,
+    pending_diagnostic: Option<OverlayDiagnostic>,
+    last_reported_diagnostic: Option<OverlayDiagnostic>,
 }
 
 impl NativeOverlayService {
@@ -1558,7 +1562,8 @@ impl NativeOverlayService {
             presentation,
             retained_action,
             pending_action: None,
-            last_reported_failure: None,
+            pending_diagnostic: None,
+            last_reported_diagnostic: None,
         })
     }
 
@@ -1581,17 +1586,14 @@ impl NativeOverlayService {
                     session_id: _,
                 } => {
                     if visible {
-                        self.last_reported_failure = None;
+                        self.last_reported_diagnostic = None;
                     }
                 }
                 NativeOverlayEvent::Failure(failure) => {
-                    if self.last_reported_failure != Some(failure) {
-                        eprintln!(
-                            "Scribe overlay diagnostic: {} ({:?})",
-                            failure.stage.diagnostic_code(),
-                            failure.role
-                        );
-                        self.last_reported_failure = Some(failure);
+                    let diagnostic = failure.diagnostic();
+                    if self.last_reported_diagnostic != Some(diagnostic) {
+                        self.pending_diagnostic = Some(diagnostic);
+                        self.last_reported_diagnostic = Some(diagnostic);
                     }
                 }
             }
@@ -1619,6 +1621,7 @@ impl NativeOverlayService {
         OverlayViewportOutput {
             presented,
             action: self.pending_action.take(),
+            diagnostic: self.pending_diagnostic.take(),
         }
     }
 
@@ -1901,9 +1904,14 @@ pub(super) fn show_overlay_viewport(
     NATIVE_OVERLAY_SERVICE.with(|slot| {
         let mut slot = slot.borrow_mut();
         if slot.is_none() {
-            let Ok(service) = NativeOverlayService::new(context) else {
-                eprintln!("Scribe overlay diagnostic: native-overlay-host (None)");
-                return OverlayViewportOutput::default();
+            let service = match NativeOverlayService::new(context) {
+                Ok(service) => service,
+                Err(failure) => {
+                    return OverlayViewportOutput {
+                        diagnostic: Some(failure.diagnostic()),
+                        ..OverlayViewportOutput::default()
+                    };
+                }
             };
             *slot = Some(service);
         }
@@ -2103,6 +2111,12 @@ mod tests {
         assert!(diagnostic.contains("Rasterization"));
         assert!(!diagnostic.contains("transcript"));
         assert!(!diagnostic.contains("hello"));
+
+        let app_diagnostic = failure.diagnostic();
+        assert_eq!(app_diagnostic.code(), "native-overlay-raster");
+        assert!(!app_diagnostic.status_message().contains("HWND"));
+        assert!(!app_diagnostic.settings_diagnostic().contains("HWND"));
+        assert!(!app_diagnostic.settings_diagnostic().contains("transcript"));
     }
 
     #[test]
@@ -2246,7 +2260,8 @@ mod tests {
             presentation,
             retained_action,
             pending_action: None,
-            last_reported_failure: None,
+            pending_diagnostic: None,
+            last_reported_diagnostic: None,
         };
 
         event_sink.emit_action(OverlayAction::Abandon(SessionId(63)));
@@ -2258,6 +2273,71 @@ mod tests {
 
         service.poll_events();
         assert_eq!(service.pending_action.take(), None);
+    }
+
+    #[test]
+    fn service_propagates_each_failure_diagnostic_once_until_a_presentation_recovers() {
+        let (tx, events) = bounded(8);
+        let presentation = Arc::new(Mutex::new(NativePresentationObservation::default()));
+        let retained_action = Arc::new(Mutex::new(None));
+        let event_sink = NativeEventSink {
+            tx,
+            repaint_context: eframe::egui::Context::default(),
+            presentation: Arc::clone(&presentation),
+            retained_action: Arc::clone(&retained_action),
+        };
+        let mut service = NativeOverlayService {
+            mailbox: Arc::new(SnapshotMailbox {
+                latest: Mutex::new(None),
+                shutdown: AtomicBool::new(false),
+            }),
+            events,
+            worker: None,
+            presentation,
+            retained_action,
+            pending_action: None,
+            pending_diagnostic: None,
+            last_reported_diagnostic: None,
+        };
+        let snapshot = snapshot_for_test();
+
+        event_sink.emit(NativeOverlayEvent::Failure(NativeOverlayFailure::new(
+            NativeOverlayFailureStage::Rasterization,
+            Some(WindowRole::Display),
+        )));
+        let first = service.output_for(&snapshot);
+        assert_eq!(
+            first.diagnostic,
+            Some(OverlayDiagnostic::NativeRasterization)
+        );
+
+        event_sink.emit(NativeOverlayEvent::Failure(NativeOverlayFailure::new(
+            NativeOverlayFailureStage::Rasterization,
+            Some(WindowRole::Control),
+        )));
+        assert_eq!(service.output_for(&snapshot).diagnostic, None);
+
+        event_sink.emit(NativeOverlayEvent::Presented {
+            visible: true,
+            session_id: snapshot.state.session_id,
+        });
+        assert_eq!(service.output_for(&snapshot).diagnostic, None);
+
+        event_sink.emit(NativeOverlayEvent::Failure(NativeOverlayFailure::new(
+            NativeOverlayFailureStage::Rasterization,
+            Some(WindowRole::Display),
+        )));
+        assert_eq!(
+            service.output_for(&snapshot).diagnostic,
+            Some(OverlayDiagnostic::NativeRasterization)
+        );
+    }
+
+    #[test]
+    fn harness_documentation_describes_the_native_service_thread_contract() {
+        let harness = include_str!("../../docs/UI_HARNESS.md");
+        assert!(harness.contains("dedicated `scribe-native-overlay` service thread"));
+        assert!(!harness.contains("layered windows on the UI thread"));
     }
 
     #[test]

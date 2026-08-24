@@ -60,8 +60,8 @@ use crate::models::{
     format_bytes,
 };
 use crate::overlay::{
-    self, CapturedTarget, OverlayController, OverlayMode as NativeOverlayMode, OverlayPhase,
-    OverlayPosition as NativeOverlayPosition, OverlayRecovery,
+    self, CapturedTarget, OverlayController, OverlayDiagnostic, OverlayMode as NativeOverlayMode,
+    OverlayPhase, OverlayPosition as NativeOverlayPosition, OverlayRecovery,
 };
 use crate::prepared_audio::PreparedAudio;
 use crate::streaming::PreviewEvent;
@@ -3334,6 +3334,7 @@ pub struct LocalTranscriberApp {
     overlay_controller: OverlayController,
     overlay_hide_at: Option<Instant>,
     overlay_presented: bool,
+    overlay_diagnostic: Option<OverlayDiagnostic>,
     overlay_first_presented_at: HashMap<SessionId, Instant>,
     hotkey_service: HotkeyService,
     tray_service: Option<TrayService>,
@@ -3495,6 +3496,7 @@ impl LocalTranscriberApp {
             overlay_controller: OverlayController::new(),
             overlay_hide_at: None,
             overlay_presented: false,
+            overlay_diagnostic: None,
             overlay_first_presented_at: HashMap::new(),
             tray_service: None,
             last_tray_state: None,
@@ -4442,6 +4444,23 @@ impl LocalTranscriberApp {
             && active.latency.overlay_visible_at.is_none()
         {
             active.latency.overlay_visible_at = Some(presented_at);
+        }
+    }
+
+    fn report_overlay_diagnostic(&mut self, diagnostic: OverlayDiagnostic) {
+        if self.overlay_diagnostic == Some(diagnostic) {
+            return;
+        }
+        self.overlay_diagnostic = Some(diagnostic);
+        self.status_message = diagnostic.status_message().to_owned();
+    }
+
+    fn clear_overlay_diagnostic_if_recovered(&mut self) {
+        let Some(diagnostic) = self.overlay_diagnostic.take() else {
+            return;
+        };
+        if self.status_message == diagnostic.status_message() {
+            self.status_message = "Overlay presentation restored.".to_owned();
         }
     }
 
@@ -9501,6 +9520,11 @@ impl eframe::App for LocalTranscriberApp {
             },
         );
         self.overlay_presented = overlay_output.presented;
+        if let Some(diagnostic) = overlay_output.diagnostic {
+            self.report_overlay_diagnostic(diagnostic);
+        } else if overlay_output.presented {
+            self.clear_overlay_diagnostic_if_recovered();
+        }
         if overlay_output.presented {
             self.record_overlay_presented(overlay_session_id);
         }
@@ -12135,6 +12159,9 @@ impl LocalTranscriberApp {
         }
         if let Some(notice) = text_output::paste_automation_notice() {
             diagnostics.push(notice.to_owned());
+        }
+        if let Some(diagnostic) = self.overlay_diagnostic {
+            diagnostics.push(diagnostic.settings_diagnostic().to_owned());
         }
         diagnostics
     }
@@ -15631,6 +15658,42 @@ mod layout_tests {
         assert!(
             app.overlay_first_presented_at
                 .contains_key(&current_session)
+        );
+    }
+
+    #[test]
+    fn overlay_diagnostics_are_private_deduplicated_and_cleared_after_recovery() {
+        let mut app = test_app();
+        let diagnostic = OverlayDiagnostic::NativeRasterization;
+
+        app.report_overlay_diagnostic(diagnostic);
+        assert_eq!(app.overlay_diagnostic, Some(diagnostic));
+        assert_eq!(app.status_message, diagnostic.status_message());
+        assert!(
+            app.settings_diagnostics()
+                .iter()
+                .any(|line| line == diagnostic.settings_diagnostic())
+        );
+        assert!(!app.status_message.contains("HWND"));
+        assert!(!app.status_message.contains("transcript"));
+
+        app.status_message = "A later application status takes precedence.".to_owned();
+        app.report_overlay_diagnostic(diagnostic);
+        assert_eq!(
+            app.status_message, "A later application status takes precedence.",
+            "the same native failure must not overwrite an unrelated status repeatedly"
+        );
+
+        app.clear_overlay_diagnostic_if_recovered();
+        assert_eq!(app.overlay_diagnostic, None);
+        assert_eq!(
+            app.status_message,
+            "A later application status takes precedence."
+        );
+        assert!(
+            !app.settings_diagnostics()
+                .iter()
+                .any(|line| line.contains(diagnostic.code()))
         );
     }
 
@@ -20255,6 +20318,7 @@ mod layout_tests {
             overlay_controller: OverlayController::new(),
             overlay_hide_at: None,
             overlay_presented: false,
+            overlay_diagnostic: None,
             overlay_first_presented_at: HashMap::new(),
             tray_service: None,
             last_tray_state: None,
