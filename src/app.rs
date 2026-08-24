@@ -15929,7 +15929,10 @@ mod layout_tests {
             1.0,
             Some(3),
             true,
-            base + INPUT_LEVEL_STALE_AFTER + Duration::from_millis(81),
+            base + INPUT_LEVEL_PEAK_HOLD
+                + METER_REPAINT_DELAY
+                + INPUT_LEVEL_STALE_AFTER
+                + Duration::from_millis(81),
         );
         assert!(stale < release, "a stale unchanged sample must decay");
         let settled = envelope.update(
@@ -15981,7 +15984,7 @@ mod layout_tests {
         assert!(!app.passive_microphone_monitor_needed());
         app.current_tab = Tab::General;
         app.settings_tab = SettingsTab::Recording;
-        assert!(!app.passive_microphone_monitor_needed());
+        assert!(app.passive_microphone_monitor_needed());
         app.settings_tab = SettingsTab::Recording;
         app.window_hidden_to_tray = true;
         assert!(!app.passive_microphone_monitor_needed());
@@ -24490,11 +24493,17 @@ mod layout_tests {
         app.microphone_test_error = Some("Microphone permission denied".to_owned());
         app.microphone_monitor_retry_required = true;
         let update = render(&ctx, &mut app);
-        assert!(
-            !update
+        assert_eq!(
+            update
                 .nodes
                 .iter()
-                .any(|(_, node)| node.role() == egui::accesskit::Role::Slider)
+                .filter(|(_, node)| {
+                    node.role() == egui::accesskit::Role::Slider
+                        && node.name() == Some("Speech detection sensitivity")
+                })
+                .count(),
+            1,
+            "the sensitivity slider remains available even when microphone monitoring fails"
         );
         assert!(!update.nodes.iter().any(|(_, node)| {
             node.name() == Some("Voice detected") || node.name() == Some("Clipping")
