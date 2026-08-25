@@ -9,6 +9,8 @@ mod benchmark;
 mod compatibility_bridge;
 mod config;
 mod core;
+#[cfg(all(feature = "ui-harness", debug_assertions))]
+mod debug_demo;
 mod diagnostics;
 mod disk_space;
 mod embedded_runtime;
@@ -69,7 +71,7 @@ fn main() -> eframe::Result<()> {
 
     #[cfg(all(feature = "ui-harness", debug_assertions))]
     let demo_transcript = match ui::fixture_from_env() {
-        Some(ui::Fixture::DemoAudio) => match ui::transcribe_demo_audio_from_env() {
+        Some(ui::Fixture::DemoAudio) => match debug_demo::transcribe_demo_audio_from_env() {
             Ok(Some(transcript)) => Some(transcript),
             Ok(None) => {
                 eprintln!("Scribe demo playback requires SCRIBE_DEMO_AUDIO to name a WAV file.");
