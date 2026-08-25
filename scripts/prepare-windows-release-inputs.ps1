@@ -44,6 +44,25 @@ function Download-And-Verify([string]$Url, [string]$Destination, [int64]$Size, [
     Assert-ExactFile $Destination $Size $Sha256
 }
 
+function Resolve-RuntimeArchiveFile([string]$RuntimeSource, [string]$ManifestPath) {
+    $declaredPath = $ManifestPath -replace '/', '\\'
+    $nestedPath = Join-Path $RuntimeSource $declaredPath
+    if (Test-Path -LiteralPath $nestedPath -PathType Leaf) {
+        return $nestedPath
+    }
+
+    # whisper.cpp v1.9.1's Windows archive places its release binaries directly
+    # under Release/, while Scribe intentionally stages them under bin/ to keep
+    # the runtime layout stable. Accept only this explicit flattened equivalent;
+    # the size and hash checks below still authenticate every file.
+    $flatPath = Join-Path $RuntimeSource (Split-Path -Leaf $declaredPath)
+    if (Test-Path -LiteralPath $flatPath -PathType Leaf) {
+        return $flatPath
+    }
+
+    throw "Pinned runtime archive is missing declared file '$ManifestPath' under '$RuntimeSource'."
+}
+
 $outputRoot = [System.IO.Path]::GetFullPath($OutputDirectory)
 if (Test-Path -LiteralPath $outputRoot) {
     throw "Release input directory already exists; remove or archive it explicitly first: $outputRoot"
@@ -75,7 +94,7 @@ if (-not (Test-Path -LiteralPath $runtimeSource -PathType Container)) {
 
 foreach ($file in $runtimeManifest.files) {
     $relativePath = $file.path -replace '/', '\\'
-    $source = Join-Path $runtimeSource $relativePath
+    $source = Resolve-RuntimeArchiveFile $runtimeSource $file.path
     Assert-ExactFile $source ([int64]$file.size_bytes) $file.sha256
     $destination = Join-Path $runtimeRoot $relativePath
     New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null
