@@ -10980,7 +10980,10 @@ impl LocalTranscriberApp {
             )
         } else {
             (
-                if bundled {
+                // Preparing the runtime is not evidence that this bundled model's
+                // artifact was installed. Avoid presenting a repair action until
+                // the installer has actually established that state.
+                if bundled && !matches!(install_status, ModelInstallStatus::InstallingRuntime) {
                     "Repair installed model"
                 } else {
                     "Not installed"
