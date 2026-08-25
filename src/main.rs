@@ -1,3 +1,8 @@
+#![cfg_attr(
+    all(target_os = "windows", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
+
 mod app;
 mod audio;
 mod benchmark;
@@ -74,16 +79,47 @@ fn main() -> eframe::Result<()> {
         }),
     );
     if let Err(err) = &result {
-        eprintln!("Scribe failed to start: {err}");
+        report_startup_failure(err);
         print_linux_display_help(err);
     }
     result
 }
 
-/// The native app never presents route content below this logical viewport.
-/// Component tests still cover narrower content regions directly so their
-/// fallback layout is deterministic without weakening this production limit.
-pub(crate) const MIN_APP_INNER_SIZE: [f32; 2] = [960.0, 680.0];
+fn report_startup_failure(error: &eframe::Error) {
+    eprintln!("Scribe failed to start: {error}");
+
+    #[cfg(all(target_os = "windows", not(debug_assertions)))]
+    {
+        use std::iter;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            MB_ICONERROR, MB_OK, MB_SETFOREGROUND, MessageBoxW,
+        };
+
+        fn wide_null_terminated(value: &str) -> Vec<u16> {
+            value.encode_utf16().chain(iter::once(0)).collect()
+        }
+
+        let title = wide_null_terminated("Scribe startup failure");
+        let message = wide_null_terminated(&format!(
+            "Scribe could not start.\n\n{error}\n\nSee the Windows Event Viewer or launch Scribe from a terminal for more details."
+        ));
+        unsafe {
+            MessageBoxW(
+                std::ptr::null_mut(),
+                message.as_ptr(),
+                title.as_ptr(),
+                MB_OK | MB_ICONERROR | MB_SETFOREGROUND,
+            );
+        }
+    }
+}
+
+/// The native app can fit its responsive shell in this logical viewport.
+///
+/// Keeping the minimum below a 1080p work area at high Windows scaling lets
+/// users drag the window between mixed-DPI monitors without winit having to
+/// clamp it back onto the source display.
+pub(crate) const MIN_APP_INNER_SIZE: [f32; 2] = [840.0, 500.0];
 
 fn native_options() -> eframe::NativeOptions {
     let inner_size = initial_window_size();
@@ -92,18 +128,14 @@ fn native_options() -> eframe::NativeOptions {
             .with_inner_size(inner_size)
             .with_min_inner_size(MIN_APP_INNER_SIZE)
             .with_resizable(true)
-            .with_transparent(root_viewport_requests_transparency(cfg!(
-                target_os = "windows"
-            ))),
+            // Root content owns its opaque background. Transparency remains
+            // limited to the native overlay windows.
+            .with_transparent(false),
         follow_system_theme: true,
         default_theme: eframe::Theme::Light,
         event_loop_builder: Some(Box::new(configure_event_loop_backend)),
         ..Default::default()
     }
-}
-
-const fn root_viewport_requests_transparency(target_is_windows: bool) -> bool {
-    target_is_windows
 }
 
 fn initial_window_size() -> [f32; 2] {
@@ -123,7 +155,10 @@ fn parse_harness_viewport(value: &str) -> Option<[f32; 2]> {
     let (width, height) = value.trim().split_once('x')?;
     let width = width.trim().parse::<f32>().ok()?;
     let height = height.trim().parse::<f32>().ok()?;
-    (width.is_finite() && height.is_finite() && width >= 960.0 && height >= 680.0)
+    (width.is_finite()
+        && height.is_finite()
+        && width >= MIN_APP_INNER_SIZE[0]
+        && height >= MIN_APP_INNER_SIZE[1])
         .then_some([width, height])
 }
 
@@ -246,32 +281,30 @@ mod tests {
         assert_eq!(options.viewport.inner_size, Some(egui::vec2(1180.0, 815.0)));
         assert_eq!(
             options.viewport.min_inner_size,
-            Some(egui::vec2(960.0, 680.0))
+            Some(egui::vec2(840.0, 500.0))
         );
         assert_eq!(options.viewport.resizable, Some(true));
-        assert_eq!(
-            options.viewport.transparent,
-            Some(cfg!(target_os = "windows"))
-        );
+        assert_eq!(options.viewport.transparent, Some(false));
         assert!(options.follow_system_theme);
     }
 
     #[test]
-    fn root_requests_alpha_capable_config_only_on_windows() {
-        assert!(root_viewport_requests_transparency(true));
-        assert!(!root_viewport_requests_transparency(false));
+    fn root_viewport_is_opaque_while_overlay_owns_transparency() {
+        assert_eq!(native_options().viewport.transparent, Some(false));
+        assert_eq!(MIN_APP_INNER_SIZE, [840.0, 500.0]);
     }
 
     #[cfg(all(feature = "ui-harness", debug_assertions))]
     #[test]
     fn harness_viewport_parser_accepts_supported_sizes_and_rejects_invalid_input() {
+        assert_eq!(parse_harness_viewport("840x500"), Some([840.0, 500.0]));
         assert_eq!(parse_harness_viewport("960x680"), Some([960.0, 680.0]));
         assert_eq!(
             parse_harness_viewport(" 1180 x 815 "),
             Some([1180.0, 815.0])
         );
-        assert_eq!(parse_harness_viewport("959x680"), None);
-        assert_eq!(parse_harness_viewport("960x679"), None);
+        assert_eq!(parse_harness_viewport("839x500"), None);
+        assert_eq!(parse_harness_viewport("840x499"), None);
         assert_eq!(parse_harness_viewport("wide"), None);
     }
 

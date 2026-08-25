@@ -1,9 +1,9 @@
 # Scribe
 
-**Local-first speech-to-text for your desktop.** Scribe records from your microphone, transcribes on your device, and leaves the finished text ready to copy or (on Windows, when enabled) insert into the app you were using.
+**Local-first speech-to-text for your desktop.** Scribe records from your microphone, transcribes on your device, and leaves the finished text ready to copy or, on Windows when enabled, insert into the app you were using.
 
 <p>
-  <a href="https://github.com/tyhuang9/scribe/releases/latest/download/Scribe-Setup-windows-x64.exe">
+  <a href="https://github.com/tyhuang9/scribe/releases/latest/download/Scribe-Setup.exe">
     <img src="https://img.shields.io/badge/Windows%20installer-Download-0078D4?style=for-the-badge&logo=windows&logoColor=white" alt="Download the Windows installer" />
   </a>
   <a href="https://github.com/tyhuang9/scribe/releases/latest/download/Scribe-windows-x64.zip">
@@ -14,12 +14,12 @@
   </a>
 </p>
 
-Windows x64 is the current release target. Once a release is published, the first two badges download the latest installer or portable ZIP directly; the [GitHub Releases page](https://github.com/tyhuang9/scribe/releases) lists versioned files and release notes. Speech models are installed separately inside Scribe.
+Windows x64 is the current release target. The first two badges download the latest installer or portable ZIP directly; the [GitHub Releases page](https://github.com/tyhuang9/scribe/releases) lists versioned files and release notes. The installer is currently unsigned, so verify that it came from the Scribe release page before continuing. It includes the English Base model; add other models inside Scribe.
 
 ## Start here
 
 1. Install Scribe, then open it.
-2. In **Models**, install a trusted model or add a compatible local GGUF model.
+2. In **Models**, choose the included model, install a trusted model, or add a compatible local GGUF model.
 3. In **Transcribe**, select the model and press **Start recording**.
 4. Speak normally, then stop recording. Copy the final transcript or enable Windows insertion in Settings.
 

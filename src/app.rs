@@ -60,8 +60,8 @@ use crate::models::{
     format_bytes,
 };
 use crate::overlay::{
-    self, CapturedTarget, OverlayController, OverlayMode as NativeOverlayMode, OverlayPhase,
-    OverlayPosition as NativeOverlayPosition, OverlayRecovery,
+    self, CapturedTarget, OverlayController, OverlayDiagnostic, OverlayMode as NativeOverlayMode,
+    OverlayPhase, OverlayPosition as NativeOverlayPosition, OverlayRecovery,
 };
 use crate::prepared_audio::PreparedAudio;
 use crate::streaming::PreviewEvent;
@@ -95,9 +95,10 @@ const ACTIVE_REPAINT_DELAY: Duration = Duration::from_millis(100);
 const METER_REPAINT_DELAY: Duration = Duration::from_millis(40);
 const PASSIVE_MONITOR_REPAINT_DELAY: Duration = Duration::from_millis(50);
 const IDLE_REPAINT_DELAY: Duration = Duration::from_millis(500);
-const INPUT_LEVEL_ATTACK: Duration = Duration::from_millis(30);
-const INPUT_LEVEL_RELEASE: Duration = Duration::from_millis(240);
-const INPUT_LEVEL_STALE_AFTER: Duration = Duration::from_millis(160);
+const INPUT_LEVEL_ATTACK: Duration = Duration::from_millis(60);
+const INPUT_LEVEL_PEAK_HOLD: Duration = Duration::from_millis(120);
+const INPUT_LEVEL_RELEASE: Duration = Duration::from_millis(320);
+const INPUT_LEVEL_STALE_AFTER: Duration = Duration::from_millis(250);
 const INPUT_LEVEL_MIN_DBFS: f32 = -72.0;
 const INPUT_LEVEL_MAX_DBFS: f32 = 0.0;
 const SETTINGS_SAVE_DEBOUNCE: Duration = Duration::from_millis(300);
@@ -196,6 +197,7 @@ struct MicrophoneLevelEnvelope {
     last_step_at: Option<Instant>,
     last_fresh_sample_at: Option<Instant>,
     last_revision: Option<u64>,
+    peak_hold_until: Option<Instant>,
 }
 
 impl Default for MicrophoneLevelEnvelope {
@@ -205,6 +207,7 @@ impl Default for MicrophoneLevelEnvelope {
             last_step_at: None,
             last_fresh_sample_at: None,
             last_revision: None,
+            peak_hold_until: None,
         }
     }
 }
@@ -213,6 +216,7 @@ impl MicrophoneLevelEnvelope {
     fn reset_source(&mut self) {
         self.last_fresh_sample_at = None;
         self.last_revision = None;
+        self.peak_hold_until = None;
     }
 
     fn clear(&mut self) {
@@ -239,10 +243,19 @@ impl MicrophoneLevelEnvelope {
         } else {
             0.0
         };
+        if target > self.position {
+            self.peak_hold_until = Some(now + INPUT_LEVEL_PEAK_HOLD);
+        }
+        if !fresh {
+            self.peak_hold_until = None;
+        }
         let elapsed = self.last_step_at.map_or(METER_REPAINT_DELAY, |previous| {
             now.saturating_duration_since(previous)
         });
         self.last_step_at = Some(now);
+        if target < self.position && self.peak_hold_until.is_some_and(|until| now < until) {
+            return self.position;
+        }
         let time_constant = if target > self.position {
             INPUT_LEVEL_ATTACK
         } else {
@@ -958,9 +971,9 @@ fn effective_native_overlay_mode(mode: OverlayMode) -> NativeOverlayMode {
 fn live_overlay_owns_announcements(
     presented: bool,
     mode: NativeOverlayMode,
-    live_preview_available: bool,
+    phase: OverlayPhase,
 ) -> bool {
-    presented && mode == NativeOverlayMode::Live && live_preview_available
+    presented && mode == NativeOverlayMode::Live && phase != OverlayPhase::Hidden
 }
 
 fn rolling_preview_enabled(source: RecordingSource, mode: StreamingMode) -> bool {
@@ -3321,6 +3334,7 @@ pub struct LocalTranscriberApp {
     overlay_controller: OverlayController,
     overlay_hide_at: Option<Instant>,
     overlay_presented: bool,
+    overlay_diagnostic: Option<OverlayDiagnostic>,
     overlay_first_presented_at: HashMap<SessionId, Instant>,
     hotkey_service: HotkeyService,
     tray_service: Option<TrayService>,
@@ -3413,7 +3427,7 @@ impl LocalTranscriberApp {
             playground_reference_transcript: String::new(),
             playground_reference_user_edited: false,
             playground_ranking_mode: RankingMode::Balanced,
-            hotkey_service: HotkeyService::new(&config.recording.hotkey),
+            hotkey_service: HotkeyService::new(&config.recording.hotkey, &cc.egui_ctx),
             config,
             config_path,
             settings_store,
@@ -3482,6 +3496,7 @@ impl LocalTranscriberApp {
             overlay_controller: OverlayController::new(),
             overlay_hide_at: None,
             overlay_presented: false,
+            overlay_diagnostic: None,
             overlay_first_presented_at: HashMap::new(),
             tray_service: None,
             last_tray_state: None,
@@ -4078,8 +4093,9 @@ impl LocalTranscriberApp {
         } else if self.has_active_work() {
             ACTIVE_REPAINT_DELAY
         } else {
-            // Hotkey events are integrated from update(), so idle still polls slowly. Tray
-            // handlers wake the event loop directly and do not depend on this polling clock.
+            // The global-hotkey callback wakes the event loop directly. This
+            // slow repaint remains only as a recovery fallback if an external
+            // platform callback fails to wake the native event loop.
             IDLE_REPAINT_DELAY
         }
     }
@@ -4428,6 +4444,23 @@ impl LocalTranscriberApp {
             && active.latency.overlay_visible_at.is_none()
         {
             active.latency.overlay_visible_at = Some(presented_at);
+        }
+    }
+
+    fn report_overlay_diagnostic(&mut self, diagnostic: OverlayDiagnostic) {
+        if self.overlay_diagnostic == Some(diagnostic) {
+            return;
+        }
+        self.overlay_diagnostic = Some(diagnostic);
+        self.status_message = diagnostic.status_message().to_owned();
+    }
+
+    fn clear_overlay_diagnostic_if_recovered(&mut self) {
+        let Some(diagnostic) = self.overlay_diagnostic.take() else {
+            return;
+        };
+        if self.status_message == diagnostic.status_message() {
+            self.status_message = "Overlay presentation restored.".to_owned();
         }
     }
 
@@ -9487,6 +9520,11 @@ impl eframe::App for LocalTranscriberApp {
             },
         );
         self.overlay_presented = overlay_output.presented;
+        if let Some(diagnostic) = overlay_output.diagnostic {
+            self.report_overlay_diagnostic(diagnostic);
+        } else if overlay_output.presented {
+            self.clear_overlay_diagnostic_if_recovered();
+        }
         if overlay_output.presented {
             self.record_overlay_presented(overlay_session_id);
         }
@@ -9638,7 +9676,7 @@ impl LocalTranscriberApp {
         state.suppress_live_announcements = live_overlay_owns_announcements(
             self.overlay_presented,
             self.overlay_controller.state().mode,
-            self.overlay_controller.state().live_preview_available,
+            self.overlay_controller.state().phase,
         );
         state.hotkey_capture_active = self.capturing_hotkey;
         state.hotkey_change_disabled_reason = self.quick_hotkey_change_block_reason();
@@ -10942,7 +10980,10 @@ impl LocalTranscriberApp {
             )
         } else {
             (
-                if bundled {
+                // Preparing the runtime is not evidence that this bundled model's
+                // artifact was installed. Avoid presenting a repair action until
+                // the installer has actually established that state.
+                if bundled && !matches!(install_status, ModelInstallStatus::InstallingRuntime) {
                     "Repair installed model"
                 } else {
                     "Not installed"
@@ -12122,6 +12163,9 @@ impl LocalTranscriberApp {
         if let Some(notice) = text_output::paste_automation_notice() {
             diagnostics.push(notice.to_owned());
         }
+        if let Some(diagnostic) = self.overlay_diagnostic {
+            diagnostics.push(diagnostic.settings_diagnostic());
+        }
         diagnostics
     }
 
@@ -12177,7 +12221,7 @@ impl LocalTranscriberApp {
         state.suppress_live_announcements = live_overlay_owns_announcements(
             self.overlay_presented,
             self.overlay_controller.state().mode,
-            self.overlay_controller.state().live_preview_available,
+            self.overlay_controller.state().phase,
         );
         let settings = RecordingSettingsView {
             close_to_tray: self.config.general.close_to_tray,
@@ -15621,6 +15665,42 @@ mod layout_tests {
     }
 
     #[test]
+    fn overlay_diagnostics_are_private_deduplicated_and_cleared_after_recovery() {
+        let mut app = test_app();
+        let diagnostic = OverlayDiagnostic::Rasterization;
+
+        app.report_overlay_diagnostic(diagnostic);
+        assert_eq!(app.overlay_diagnostic, Some(diagnostic));
+        assert_eq!(app.status_message, diagnostic.status_message());
+        assert!(
+            app.settings_diagnostics()
+                .iter()
+                .any(|line| line == &diagnostic.settings_diagnostic())
+        );
+        assert!(!app.status_message.contains("HWND"));
+        assert!(!app.status_message.contains("transcript"));
+
+        app.status_message = "A later application status takes precedence.".to_owned();
+        app.report_overlay_diagnostic(diagnostic);
+        assert_eq!(
+            app.status_message, "A later application status takes precedence.",
+            "the same native failure must not overwrite an unrelated status repeatedly"
+        );
+
+        app.clear_overlay_diagnostic_if_recovered();
+        assert_eq!(app.overlay_diagnostic, None);
+        assert_eq!(
+            app.status_message,
+            "A later application status takes precedence."
+        );
+        assert!(
+            !app.settings_diagnostics()
+                .iter()
+                .any(|line| line.contains(diagnostic.code()))
+        );
+    }
+
+    #[test]
     fn explicit_stop_before_capture_ready_finalizes_and_dispatches_once() {
         let mut app = test_app();
         let session_id = app
@@ -15888,32 +15968,43 @@ mod layout_tests {
     }
 
     #[test]
-    fn microphone_level_envelope_attacks_fast_releases_slowly_and_resets_stale_input() {
+    fn microphone_level_envelope_uses_the_configured_attack_hold_release_and_stale_timings() {
         let base = Instant::now();
         let mut envelope = MicrophoneLevelEnvelope::default();
         let attack = envelope.update(1.0, Some(1), true, base);
         assert!(
-            attack > 0.5,
-            "attack should move most of the way in one meter frame"
+            (0.48..0.49).contains(&attack),
+            "a 40 ms step should use the configured 60 ms attack time constant"
         );
 
-        let release = envelope.update(0.0, Some(2), true, base + METER_REPAINT_DELAY);
+        let held = envelope.update(0.0, Some(2), true, base + METER_REPAINT_DELAY);
+        assert_eq!(held, attack, "the displayed peak should hold for 120 ms");
+
+        let release = envelope.update(
+            0.0,
+            Some(3),
+            true,
+            base + INPUT_LEVEL_PEAK_HOLD + METER_REPAINT_DELAY,
+        );
         assert!(
-            release > 0.4,
-            "release should settle more slowly than attack"
+            release > attack * 0.65,
+            "the configured 320 ms release should settle gradually after peak hold"
         );
         assert!(release < attack);
 
         let stale = envelope.update(
             1.0,
-            Some(2),
+            Some(3),
             true,
-            base + INPUT_LEVEL_STALE_AFTER + Duration::from_millis(81),
+            base + INPUT_LEVEL_PEAK_HOLD
+                + METER_REPAINT_DELAY
+                + INPUT_LEVEL_STALE_AFTER
+                + Duration::from_millis(81),
         );
         assert!(stale < release, "a stale unchanged sample must decay");
         let settled = envelope.update(
             1.0,
-            Some(2),
+            Some(3),
             true,
             base + INPUT_LEVEL_STALE_AFTER + Duration::from_secs(3),
         );
@@ -15959,8 +16050,8 @@ mod layout_tests {
         app.current_tab = Tab::Models;
         assert!(!app.passive_microphone_monitor_needed());
         app.current_tab = Tab::General;
-        app.settings_tab = SettingsTab::Advanced;
-        assert!(!app.passive_microphone_monitor_needed());
+        app.settings_tab = SettingsTab::Recording;
+        assert!(app.passive_microphone_monitor_needed());
         app.settings_tab = SettingsTab::Recording;
         app.window_hidden_to_tray = true;
         assert!(!app.passive_microphone_monitor_needed());
@@ -20164,7 +20255,7 @@ mod layout_tests {
             playground_reference_transcript: String::new(),
             playground_reference_user_edited: false,
             playground_ranking_mode: RankingMode::Balanced,
-            hotkey_service: HotkeyService::new(&config.recording.hotkey),
+            hotkey_service: HotkeyService::new(&config.recording.hotkey, &egui::Context::default()),
             config,
             config_path: None,
             settings_store: None,
@@ -20230,6 +20321,7 @@ mod layout_tests {
             overlay_controller: OverlayController::new(),
             overlay_hide_at: None,
             overlay_presented: false,
+            overlay_diagnostic: None,
             overlay_first_presented_at: HashMap::new(),
             tray_service: None,
             last_tray_state: None,
@@ -24354,7 +24446,7 @@ mod layout_tests {
         ctx.set_visuals(stitch_visuals(ThemeMode::Light));
         let mut app = test_app();
         app.current_tab = Tab::General;
-        app.settings_tab = SettingsTab::Advanced;
+        app.settings_tab = SettingsTab::Recording;
         app.playing_history_id = Some(1);
 
         let output = ctx.run(
@@ -24377,10 +24469,10 @@ mod layout_tests {
             .iter()
             .find(|(_, node)| {
                 node.role() == egui::accesskit::Role::StaticText
-                    && node.name() == Some("Speech detection sensitivity")
+                    && node.name() == Some("Input level")
             })
             .map(|(id, _)| *id)
-            .expect("missing speech detection sensitivity label");
+            .expect("missing input level label");
         let slider = update
             .nodes
             .iter()
@@ -24438,7 +24530,7 @@ mod layout_tests {
             peak: 0.15,
         });
         let mut app = test_app();
-        app.settings_tab = SettingsTab::Advanced;
+        app.settings_tab = SettingsTab::Recording;
         app.microphone_test = MicrophoneTest::Active { session };
         let update = render(&ctx, &mut app);
         assert!(update.nodes.iter().any(|(_, node)| {
@@ -24469,11 +24561,17 @@ mod layout_tests {
         app.microphone_test_error = Some("Microphone permission denied".to_owned());
         app.microphone_monitor_retry_required = true;
         let update = render(&ctx, &mut app);
-        assert!(
-            !update
+        assert_eq!(
+            update
                 .nodes
                 .iter()
-                .any(|(_, node)| node.role() == egui::accesskit::Role::Slider)
+                .filter(|(_, node)| {
+                    node.role() == egui::accesskit::Role::Slider
+                        && node.name() == Some("Speech detection sensitivity")
+                })
+                .count(),
+            1,
+            "the sensitivity slider remains available even when microphone monitoring fails"
         );
         assert!(!update.nodes.iter().any(|(_, node)| {
             node.name() == Some("Voice detected") || node.name() == Some("Clipping")
@@ -25931,6 +26029,10 @@ mod layout_tests {
             app.overlay_controller
                 .set_live_preview_available(session_id, true)
         );
+        assert!(
+            app.overlay_controller
+                .set_phase(session_id, OverlayPhase::Listening)
+        );
 
         let event =
             |sequence, model_id: ModelId, committed: &str, tentative: &str| PreviewEvent::Update {
@@ -25980,6 +26082,10 @@ mod layout_tests {
         assert!(
             app.overlay_controller
                 .set_live_preview_available(session_id, true)
+        );
+        assert!(
+            app.overlay_controller
+                .set_phase(session_id, OverlayPhase::Listening)
         );
         app.apply_rolling_preview_event(PreviewEvent::Update {
             identity: StreamIdentity {
@@ -26068,27 +26174,27 @@ mod layout_tests {
         assert!(live_overlay_owns_announcements(
             true,
             NativeOverlayMode::Live,
-            true,
+            OverlayPhase::Preparing,
         ));
         assert!(!live_overlay_owns_announcements(
             true,
             NativeOverlayMode::Minimal,
-            true,
+            OverlayPhase::Listening,
         ));
         assert!(!live_overlay_owns_announcements(
             false,
             NativeOverlayMode::Live,
-            true,
+            OverlayPhase::Listening,
         ));
         assert!(!live_overlay_owns_announcements(
             true,
             NativeOverlayMode::Off,
-            true,
+            OverlayPhase::Listening,
         ));
         assert!(!live_overlay_owns_announcements(
             true,
             NativeOverlayMode::Live,
-            false,
+            OverlayPhase::Hidden,
         ));
     }
 

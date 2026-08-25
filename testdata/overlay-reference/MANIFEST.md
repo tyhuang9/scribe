@@ -24,7 +24,9 @@ same-state design QA.
   elapsed time, and cancel control; divider and transcript are absent during
   normal recording phases. A subsequent general capture error remains visible
   and announced. Compact (the serialized `Minimal` mode) uses the same visual
-  shell, brand, timer, and cancel control without a divider or transcript.
+  shell, brand, timer, and cancel control without a divider or transcript
+  while listening; it replaces the frozen timer with the current lifecycle
+  status after recording ends.
 
 The implementation uses the bundled Phosphor `WAVEFORM` glyph as the static
 Scribe brand mark. It does not fabricate a logo or animate the mark from audio
@@ -65,8 +67,9 @@ long enough to exercise tail-follow behavior.
 | `cancel` | 44 x 44 | independent cancel control | light, dark | 96, 120, 144, 192 |
 | `live-empty` | 600 x 62 | Live, Listening, empty started preview | light, dark | 96 |
 | `live-no-preview` | 600 x 62 | Live, Listening, preview unavailable | light, dark | 96 |
-| `compact-finalizing` | 200 x 62 | Compact (`Minimal`), Finalizing | light, dark | 96 |
-| `live-error` | 600 x 62 | Live, retryable preview error | light, dark | 96 |
+| `compact-finalizing`, `compact-processing`, `compact-pasting`, `compact-success` | 200 x 62 | Compact (`Minimal`) lifecycle states, static reduced-motion glyph for active work; Success uses a green check-circle with `Done` | light, dark | 96 |
+| `live-finalizing`, `live-processing`, `live-pasting`, `live-success` | 600 x 62 | Live lifecycle states with recorded-time context and static reduced-motion glyph for active work; Success uses a green check-circle with `Done` | light, dark | 96 |
+| `live-error` | 600 x 62 | Live, retryable preview error with recorded-time context | light, dark | 96 |
 
 The suffix is the DPI. Every `.bgra` file contains exactly
 `physical_width x physical_height x 4` bytes. `SHA256SUMS` records every frame,

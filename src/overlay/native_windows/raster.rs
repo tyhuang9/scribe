@@ -23,7 +23,10 @@ use super::{
     super::{
         controller::{OverlayMode, OverlayPhase, OverlayRecovery, OverlayViewState},
         platform::OverlayWindowBounds,
-        view::{CONTROL_SIZE, LIVE_HEIGHT, LIVE_WIDTH, MINIMAL_WIDTH},
+        view::{
+            CONTROL_SIZE, LIVE_HEIGHT, LIVE_WIDTH, MINIMAL_WIDTH, phase_status_label_with_motion,
+            status_mark_glyph,
+        },
     },
     layout::DisplayLayout,
 };
@@ -56,6 +59,7 @@ struct NativeColors {
     text: Argb,
     muted_text: Argb,
     waveform: Argb,
+    success: Argb,
     error: Argb,
     warning: Argb,
     shadow: Argb,
@@ -76,6 +80,7 @@ impl NativeColors {
                 muted_text: Argb::new(255, 210, 210, 216),
                 // Overlay-specific accessible variant of the reference purple.
                 waveform: Argb::new(255, 178, 162, 255),
+                success: Argb::from_color(palette.success_text),
                 error: Argb::new(255, 255, 200, 200),
                 warning: Argb::new(255, 255, 222, 170),
                 shadow: Argb::new(96, 0, 0, 0),
@@ -87,6 +92,7 @@ impl NativeColors {
                 text: Argb::from_color(palette.text),
                 muted_text: Argb::new(255, 65, 75, 90),
                 waveform: Argb::from_color(palette.recording_waveform),
+                success: Argb::from_color(palette.success_text),
                 error: Argb::from_color(palette.error_text),
                 warning: Argb::from_color(palette.warning),
                 shadow: Argb::new(54, 0, 0, 0),
@@ -441,9 +447,13 @@ fn draw_live(
     layout: &DisplayLayout,
     colors: NativeColors,
 ) -> Result<(), RasterError> {
-    draw_live_brand_mark(canvas, layout, colors)?;
+    draw_live_brand_mark(canvas, state, layout, colors)?;
     draw_live_elapsed(canvas, state, layout, colors)?;
-    if !state.live_preview_available && state.error.is_none() {
+    if state.phase == OverlayPhase::Listening
+        && !state.shows_live_transcript()
+        && state.error.is_none()
+        && state.notice.is_none()
+    {
         return Ok(());
     }
     draw_live_divider(canvas, layout, colors)?;
@@ -452,19 +462,20 @@ fn draw_live(
 
 fn draw_live_brand_mark(
     canvas: &mut Canvas<'_>,
+    state: &OverlayViewState,
     layout: &DisplayLayout,
     colors: NativeColors,
 ) -> Result<(), RasterError> {
     let scale = layout.scale;
     let center_x = layout.recording_mark.center_x();
     canvas.draw_centered_text_in_rect(
-        egui_phosphor::regular::WAVEFORM,
+        status_mark_glyph(state),
         center_x,
         layout.recording_mark.width(),
         layout.recording_mark,
         27.0 * scale,
         TextStyle::Phosphor,
-        colors.waveform,
+        status_mark_color(state, colors),
     )
 }
 
@@ -475,10 +486,20 @@ fn draw_live_elapsed(
     colors: NativeColors,
 ) -> Result<(), RasterError> {
     let scale = layout.scale;
-    let elapsed = state
-        .elapsed
-        .map(format_elapsed)
-        .unwrap_or_else(|| "00:00".to_owned());
+    let elapsed = if state.phase == OverlayPhase::Listening {
+        state
+            .elapsed
+            .map(format_elapsed)
+            .unwrap_or_else(|| "00:00".to_owned())
+    } else {
+        format!(
+            "Recorded {}",
+            state
+                .elapsed
+                .map(format_elapsed)
+                .unwrap_or_else(|| "00:00".to_owned())
+        )
+    };
     canvas.draw_text_centered_in_rect(
         &elapsed,
         layout.elapsed.x0,
@@ -520,7 +541,8 @@ fn draw_live_preview(
     let preview = layout.preview.expect("live layout includes preview bounds");
     let max_width = preview.width();
     let line = live_line(state, colors);
-    let show_transcript_tail = state.error.is_none()
+    let show_transcript_tail = state.shows_live_transcript()
+        && state.error.is_none()
         && state.notice.is_none()
         && (!state.transcript.committed.is_empty() || !state.transcript.tentative.is_empty());
     let transcript_overflows = show_transcript_tail
@@ -560,7 +582,7 @@ fn draw_compact(
     layout: &DisplayLayout,
     colors: NativeColors,
 ) -> Result<(), RasterError> {
-    draw_live_brand_mark(canvas, layout, colors)?;
+    draw_live_brand_mark(canvas, state, layout, colors)?;
     draw_compact_status(canvas, state, layout, colors)
 }
 
@@ -571,21 +593,31 @@ fn draw_compact_status(
     colors: NativeColors,
 ) -> Result<(), RasterError> {
     let scale = layout.scale;
+    let status_bounds = if state.phase == OverlayPhase::Listening {
+        layout.elapsed
+    } else {
+        layout.lifecycle_status
+    };
     let (label, color) = if state.error.is_some() || state.phase == OverlayPhase::Error {
         ("Error".to_owned(), colors.error)
     } else if state.notice.is_some() {
         ("Notice".to_owned(), colors.warning)
-    } else {
+    } else if state.phase == OverlayPhase::Listening {
         (
             format_elapsed(state.elapsed.unwrap_or_default()),
             colors.muted_text,
         )
+    } else {
+        (
+            phase_status_label_with_motion(state.phase, state.progress_animation_enabled),
+            phase_status_color(state.phase, colors),
+        )
     };
     canvas.draw_text_centered_in_rect(
         &label,
-        layout.elapsed.x0,
-        layout.elapsed.width(),
-        layout.elapsed,
+        status_bounds.x0,
+        status_bounds.width(),
+        status_bounds,
         13.0 * scale,
         TextStyle::Regular,
         color,
@@ -605,10 +637,16 @@ fn live_line(state: &OverlayViewState, colors: NativeColors) -> StyledLine {
     if let Some(notice) = &state.notice {
         return StyledLine::plain(notice, colors.warning);
     }
+    if !state.phase.shows_live_transcript() {
+        return StyledLine::plain(
+            phase_status_label_with_motion(state.phase, state.progress_animation_enabled),
+            phase_status_color(state.phase, colors),
+        );
+    }
     let committed = &state.transcript.committed;
     let tentative = &state.transcript.tentative;
     if committed.is_empty() && tentative.is_empty() {
-        return StyledLine::plain(state.phase.label(), colors.muted_text);
+        return StyledLine::plain(state.phase.status_text(), colors.muted_text);
     }
     let mut sections = Vec::new();
     if !committed.is_empty() {
@@ -638,6 +676,22 @@ fn live_line(state: &OverlayViewState, colors: NativeColors) -> StyledLine {
         });
     }
     StyledLine { sections }
+}
+
+fn status_mark_color(state: &OverlayViewState, colors: NativeColors) -> Argb {
+    if state.phase == OverlayPhase::Success {
+        colors.success
+    } else {
+        colors.waveform
+    }
+}
+
+fn phase_status_color(phase: OverlayPhase, colors: NativeColors) -> Argb {
+    if phase == OverlayPhase::Success {
+        colors.success
+    } else {
+        colors.muted_text
+    }
 }
 
 fn fit_head(
@@ -1548,9 +1602,114 @@ mod tests {
                     session_id: Some(SessionId(44)),
                     mode: OverlayMode::Minimal,
                     phase: OverlayPhase::Finalizing,
+                    elapsed: Some(Duration::from_secs(12)),
+                    phase_announcement: Some("Finishing recording…".to_owned()),
+                    progress_animation_enabled: false,
                     ..OverlayViewState::default()
                 },
                 MINIMAL_WIDTH as i32,
+                LIVE_HEIGHT as i32,
+            ),
+            (
+                "compact-processing",
+                OverlayViewState {
+                    session_id: Some(SessionId(47)),
+                    mode: OverlayMode::Minimal,
+                    phase: OverlayPhase::Processing,
+                    elapsed: Some(Duration::from_secs(12)),
+                    phase_announcement: Some("Transcribing…".to_owned()),
+                    progress_animation_enabled: false,
+                    ..OverlayViewState::default()
+                },
+                MINIMAL_WIDTH as i32,
+                LIVE_HEIGHT as i32,
+            ),
+            (
+                "compact-pasting",
+                OverlayViewState {
+                    session_id: Some(SessionId(48)),
+                    mode: OverlayMode::Minimal,
+                    phase: OverlayPhase::Pasting,
+                    elapsed: Some(Duration::from_secs(12)),
+                    phase_announcement: Some("Pasting…".to_owned()),
+                    progress_animation_enabled: false,
+                    ..OverlayViewState::default()
+                },
+                MINIMAL_WIDTH as i32,
+                LIVE_HEIGHT as i32,
+            ),
+            (
+                "compact-success",
+                OverlayViewState {
+                    session_id: Some(SessionId(49)),
+                    mode: OverlayMode::Minimal,
+                    phase: OverlayPhase::Success,
+                    elapsed: Some(Duration::from_secs(12)),
+                    phase_announcement: Some("Done".to_owned()),
+                    progress_animation_enabled: false,
+                    ..OverlayViewState::default()
+                },
+                MINIMAL_WIDTH as i32,
+                LIVE_HEIGHT as i32,
+            ),
+            (
+                "live-finalizing",
+                OverlayViewState {
+                    session_id: Some(SessionId(50)),
+                    mode: OverlayMode::Live,
+                    phase: OverlayPhase::Finalizing,
+                    live_preview_available: true,
+                    elapsed: Some(Duration::from_secs(12)),
+                    phase_announcement: Some("Finishing recording…".to_owned()),
+                    progress_animation_enabled: false,
+                    ..OverlayViewState::default()
+                },
+                LIVE_WIDTH as i32,
+                LIVE_HEIGHT as i32,
+            ),
+            (
+                "live-processing",
+                OverlayViewState {
+                    session_id: Some(SessionId(51)),
+                    mode: OverlayMode::Live,
+                    phase: OverlayPhase::Processing,
+                    live_preview_available: true,
+                    elapsed: Some(Duration::from_secs(12)),
+                    phase_announcement: Some("Transcribing…".to_owned()),
+                    progress_animation_enabled: false,
+                    ..OverlayViewState::default()
+                },
+                LIVE_WIDTH as i32,
+                LIVE_HEIGHT as i32,
+            ),
+            (
+                "live-pasting",
+                OverlayViewState {
+                    session_id: Some(SessionId(52)),
+                    mode: OverlayMode::Live,
+                    phase: OverlayPhase::Pasting,
+                    live_preview_available: true,
+                    elapsed: Some(Duration::from_secs(12)),
+                    phase_announcement: Some("Pasting…".to_owned()),
+                    progress_animation_enabled: false,
+                    ..OverlayViewState::default()
+                },
+                LIVE_WIDTH as i32,
+                LIVE_HEIGHT as i32,
+            ),
+            (
+                "live-success",
+                OverlayViewState {
+                    session_id: Some(SessionId(53)),
+                    mode: OverlayMode::Live,
+                    phase: OverlayPhase::Success,
+                    live_preview_available: true,
+                    elapsed: Some(Duration::from_secs(12)),
+                    phase_announcement: Some("Done".to_owned()),
+                    progress_animation_enabled: false,
+                    ..OverlayViewState::default()
+                },
+                LIVE_WIDTH as i32,
                 LIVE_HEIGHT as i32,
             ),
             (
@@ -1611,7 +1770,9 @@ mod tests {
         let mut canvas = Canvas::new(rasterizer, &mut frame.pixels, width, height).unwrap();
         let colors = NativeColors::for_theme(dark_mode);
         match component {
-            IsolatedComponent::BrandMark => draw_live_brand_mark(&mut canvas, layout, colors),
+            IsolatedComponent::BrandMark => {
+                draw_live_brand_mark(&mut canvas, state, layout, colors)
+            }
             IsolatedComponent::Elapsed => draw_live_elapsed(&mut canvas, state, layout, colors),
             IsolatedComponent::Divider => draw_live_divider(&mut canvas, layout, colors),
             IsolatedComponent::Preview => draw_live_preview(&mut canvas, state, layout, colors),
@@ -1636,7 +1797,7 @@ mod tests {
         let mut canvas = Canvas::new(rasterizer, &mut frame.pixels, width, height).unwrap();
         let colors = NativeColors::for_theme(dark_mode);
         draw_capsule(&mut canvas, OverlayMode::Live, layout.scale, colors).unwrap();
-        draw_live_brand_mark(&mut canvas, layout, colors).unwrap();
+        draw_live_brand_mark(&mut canvas, state, layout, colors).unwrap();
         draw_live_elapsed(&mut canvas, state, layout, colors).unwrap();
         drop(canvas);
         frame
@@ -2491,6 +2652,7 @@ mod tests {
                     PreviewInput::TranscriptShort => {
                         let original = PARITY_GRAPHEMES.to_owned();
                         let state = OverlayViewState {
+                            phase: OverlayPhase::Listening,
                             transcript: super::super::super::controller::OverlayTranscript {
                                 committed: original.clone(),
                                 ..Default::default()
@@ -2505,6 +2667,7 @@ mod tests {
                     PreviewInput::TranscriptOverflow => {
                         let original = format!("{exact_text}{PARITY_GRAPHEMES}");
                         let state = OverlayViewState {
+                            phase: OverlayPhase::Listening,
                             transcript: super::super::super::controller::OverlayTranscript {
                                 committed: original.clone(),
                                 ..Default::default()
@@ -2575,6 +2738,7 @@ mod tests {
     fn transcript_composition_preserves_punctuation_binding() {
         let colors = NativeColors::for_theme(true);
         let state = OverlayViewState {
+            phase: OverlayPhase::Listening,
             transcript: super::super::super::controller::OverlayTranscript {
                 committed: "Hello".to_owned(),
                 tentative: ", world".to_owned(),
@@ -2595,6 +2759,47 @@ mod tests {
             assert_eq!(
                 rasterizer.render_display(&quiet, true, 600, 62).unwrap(),
                 rasterizer.render_display(&loud, true, 600, 62).unwrap()
+            );
+        });
+    }
+
+    #[test]
+    fn success_renders_the_completion_mark_instead_of_the_recording_waveform() {
+        let recording = state(OverlayMode::Live);
+        let mut success = recording.clone();
+        success.phase = OverlayPhase::Success;
+        success.progress_animation_enabled = false;
+
+        assert_eq!(
+            status_mark_glyph(&success),
+            egui_phosphor::regular::CHECK_CIRCLE
+        );
+        with_rasterizer(|rasterizer| {
+            let layout = DisplayLayout::from_bounds(
+                OverlayMode::Live,
+                OverlayWindowBounds {
+                    x: 0,
+                    y: 0,
+                    width: LIVE_WIDTH as i32,
+                    height: LIVE_HEIGHT as i32,
+                },
+            )
+            .expect("production layout");
+            assert_ne!(
+                isolated_component_frame(
+                    rasterizer,
+                    &recording,
+                    &layout,
+                    false,
+                    IsolatedComponent::BrandMark,
+                ),
+                isolated_component_frame(
+                    rasterizer,
+                    &success,
+                    &layout,
+                    false,
+                    IsolatedComponent::BrandMark,
+                )
             );
         });
     }

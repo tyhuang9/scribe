@@ -82,9 +82,10 @@ These fixtures pass an explicit unfocused presentation state through the same
 hotkey, model, history, or settings services and do not perform release or
 discard behavior.
 
-On Windows, this path does not use an eframe immediate child viewport. It owns
-two native top-level `WS_POPUP` layered windows on the UI thread. The passive
-display has `WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE |
+On Windows, this path does not use an eframe immediate child viewport. The
+dedicated `scribe-native-overlay` service thread owns two native top-level
+`WS_POPUP` layered windows; the app thread submits coalesced snapshots through
+its latest-state mailbox. The passive display has `WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE |
 WS_EX_TOOLWINDOW`; the cancel control has the same profile without
 `WS_EX_TRANSPARENT`. Both are submitted as top-down premultiplied BGRA DIBs by
 `UpdateLayeredWindow(ULW_ALPHA)` and shown topmost without activation. The
@@ -167,12 +168,16 @@ production test hook.
 
 ## Model-card contract
 
+The production root window has an 840 x 500 logical minimum. The 960 x 680
+fixture below remains a larger deterministic reference viewport; use the
+840 x 500 boundary test in `src/main.rs` for the mixed-DPI minimum contract.
+
 - Cards use the full usable Models-route width. At widths at least 620 px, the
   summary uses deterministic nested zones: 50% identity, 24% Speed/Accuracy,
   and 26% lifecycle. The fixed 44 x 44 disclosure target lives inside the
   lifecycle zone. Below 620 px, identity content stacks above metrics,
   features, lifecycle, and disclosure controls. The native shell
-  has a 960 × 680 minimum; 375 px component behavior is deterministic-test
+  has an 840 × 500 minimum; 375 px component behavior is deterministic-test
   coverage only.
 - Expanded details grow inside the same card surface and preserve the collapsed
   card's left and right edges. A one-line description retains the summary's

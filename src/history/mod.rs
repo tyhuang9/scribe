@@ -18,10 +18,16 @@ use crate::prepared_audio::PreparedAudio;
 const DEFAULT_CHANNEL_CAPACITY: usize = 64;
 const MAX_PAGE_SIZE: usize = 100;
 pub(crate) const MAX_HISTORY_AUDIO_FRAMES: usize = 16_000 * 600;
-const HISTORY_STARTUP_TIMEOUT: Duration = Duration::from_secs(3);
+// Worker startup includes private-directory hardening, SQLite recovery, and
+// WAL reconciliation. Hosted Windows runners can delay that work long enough
+// to exceed a short scheduler-sensitive deadline without a worker failure.
+const HISTORY_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const HISTORY_SEND_TIMEOUT: Duration = Duration::from_millis(100);
 const HISTORY_REPLY_TIMEOUT: Duration = Duration::from_millis(1_500);
-const HISTORY_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(500);
+// Keep the process lock held until the worker has had a realistic chance to
+// close SQLite and release its handle. This prevents a store dropped by one
+// caller from spuriously blocking an immediate, safe reopen by the next one.
+const HISTORY_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 static LAST_HISTORY_ID: AtomicI64 = AtomicI64::new(0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

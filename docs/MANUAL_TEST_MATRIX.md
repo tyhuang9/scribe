@@ -328,6 +328,23 @@ new activation/paste latency timestamps remain NOT VERIFIED on a desktop.
 | Multi-monitor/mixed-DPI | UI-06, OUT-05 | **NOT VERIFIED** — no multi-monitor run. | **NOT VERIFIED** |
 | USB + Bluetooth microphones | REC-01, REC-02 | **NOT VERIFIED** — no physical devices available to this documentation run. | **NOT VERIFIED** |
 
+### Mixed-DPI main-window acceptance
+
+Run this check on Windows with an unmaximized Scribe window, one 1920 x 1080
+display at 100% scaling, and a second display at 125%, 150%, or 200% scaling:
+
+1. Open Scribe at its default 1180 x 815 size and drag it by the title bar so
+   the window crosses onto the other display. The complete window should remain
+   at the drop location instead of snapping back to the source monitor.
+2. Repeat using Win + Shift + Left/Right Arrow, then maximize and restore on
+   each display. The window should remain usable and retain normal title-bar,
+   Snap, and restore behavior.
+3. Resize to the smallest allowed window. It should stop at 840 x 500 logical
+   pixels, with route content scrolling or reflowing and no horizontal clipping.
+
+Record the source/target monitor scaling and a screenshot of the final window
+position. Keep this row **NOT VERIFIED** until a physical run is completed.
+
 ### Completion rule
 
 This living matrix remains valid only while each implemented phase updates its
@@ -411,12 +428,13 @@ samples with maximum 10 ms mono RMS 0.001559. Its comparison against the former
 classification.
 
 As of 2026-08-17, exact sequential 512-sample Silero decisions classify speech.
-The persisted `Speech detection sensitivity` control maps inversely to Silero's
-probability threshold. The separate noninteractive input meter and capture-wide
-maximum RMS/peak values are level telemetry and diagnostic low-input guidance
-only; they never accept or reject speech. Automated coverage verifies this
-separation, final partial diagnostic windows, redacted scalar serialization, and
-no output for every no-speech completion.
+The persisted `Speech detection sensitivity` marker maps inversely to Silero's
+probability threshold. Its combined Input level bar has a read-only teal meter
+fill for RMS telemetry; the marker remains an AI probability control rather
+than a volume cutoff. Capture-wide maximum RMS/peak values remain diagnostic
+low-input guidance only; they never accept or reject speech. Automated coverage
+verifies that separation, final partial diagnostic windows, redacted scalar
+serialization, and no output for every no-speech completion.
 
 REC-06 and STT-06 remain **NOT VERIFIED** until an operator corrects the
 physical mute/gain state and executes both the low-input and restored-speech
@@ -426,17 +444,17 @@ rows through the real GUI/hotkey/target/output path.
 
 | ID | Platform | Steps | Expected result | Status |
 | --- | --- | --- | --- | --- |
-| MIC-01 | Win/Linux/macOS | Open Settings > Recording with a working selected microphone, speak softly/loudly, then stay silent. | One noninteractive `Input level` meter reflects RMS/peak telemetry, attacks quickly, releases smoothly, and settles to minimum. It does not expose a speech threshold or classify speech. No audio or transcript artifact is retained. | **NOT VERIFIED** - automated UI and no-retention paths pass; physical input still requires an operator. |
-| MIC-02 | Win/Linux/macOS | In Settings > Advanced, adjust `Speech detection sensitivity` with pointer and Left/Right arrows, dictate at several sensitivities, and restart Scribe. | Pointer and keyboard adjustment work; a more-sensitive setting lowers the configured Silero speech-probability threshold for the next recording; confirmation/pause timing plus pre/post-roll avoid clipped phrases; the setting survives restart. | **NOT VERIFIED** - inverse mapping, accessibility, Silero threshold, and persistence tests pass; acoustic boundary behavior still requires an operator. |
+| MIC-01 | Win/Linux/macOS | Open Settings > Recording with a working selected microphone, speak softly/loudly, then stay silent. | The teal `Input level` fill reflects RMS telemetry with a 60 ms attack, 120 ms peak hold, 320 ms release, and 250 ms stale-input reset. It is telemetry only and retains no audio or transcript artifact. | **NOT VERIFIED** - automated envelope, UI, and no-retention paths pass; physical input still requires an operator. |
+| MIC-02 | Win/Linux/macOS | In Settings > Recording, adjust the `Speech detection sensitivity` marker with pointer and Left/Right arrows, dictate at several sensitivities, and restart Scribe. | The visible `Sensitivity N%` marker works with pointer and keyboard; a more-sensitive setting lowers the configured Silero speech-probability threshold for the next recording; confirmation/pause timing plus pre/post-roll avoid clipped phrases; the setting survives restart. The marker is disabled while recording, but the live level fill remains visible. | **NOT VERIFIED** - inverse mapping, accessibility, Silero threshold, persistence, and recording lockout tests pass; acoustic boundary behavior still requires an operator. |
 | MIC-03 | Win/Linux/macOS | With Settings > Recording open, begin dictation; stop, switch the selected input, start retained-audio playback, leave Recording, and return. | Idle monitoring yields before dictation/playback with no duplicate input stream. Active dictation supplies the live input meter and is not stopped by navigation. Idle monitoring follows the new device and stops outside Recording. | **NOT VERIFIED** - ownership/deferred-start tests pass; device/driver timing still requires an operator. |
-| MIC-04 | Win/Linux/macOS | Navigate to the slider using keyboard and a screen reader in light and dark themes. | The control is named `Speech detection sensitivity`, has one Slider role with help and normalized value actions, and exposes no dBFS/RMS or live speech-state announcements. The separate live level meter remains noninteractive. | **PARTIAL** - automated AccessKit, interaction, and meter-separation assertions pass; screen-reader and visual theme checks still require an operator. |
+| MIC-04 | Win/Linux/macOS | Navigate to the combined bar using keyboard and a screen reader in light and dark themes. | Exactly one control is named `Speech detection sensitivity` with a Slider role, help, normalized value actions, and no live microphone-level announcements. Its visible `Sensitivity N%` label distinguishes the marker from the teal microphone-volume fill. | **PARTIAL** - automated AccessKit, pointer/keyboard interaction, and lockout assertions pass; screen-reader and visual theme checks still require an operator. |
 
 ### Sensitivity and meter implementation evidence
 
 The current automated suite covers inverse Silero probability mapping,
-click/drag/arrow interaction, the single sensitivity-slider AccessKit contract,
-separate noninteractive RMS/peak meter attack/release and stale reset, meter
-revisions, no-retention meter capture, exact 512-sample VAD cadence,
+click/drag/arrow interaction, the single combined sensitivity-slider AccessKit
+contract, RMS meter attack/hold/release and stale reset, meter revisions,
+no-retention meter capture, exact 512-sample VAD cadence,
 timing/pre-roll regressions, settings round-tripping, and monitor ownership
 handoff. The earlier
 `qa/microphone-test-final-*.png` screenshots show the superseded UI and must not

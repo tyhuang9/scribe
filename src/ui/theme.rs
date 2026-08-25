@@ -19,6 +19,10 @@ pub(crate) struct ThemePalette {
     pub slider_remainder_fill: Color32,
     pub slider_live_below: Color32,
     pub slider_live_above: Color32,
+    /// Outer marker ring that stays distinct from the idle track.
+    pub sensitivity_marker_on_track: Color32,
+    /// Inner marker ring that stays distinct from the teal live-input fill.
+    pub sensitivity_marker_on_live: Color32,
     /// Short model-card meter colors. `meter_track` is intentionally neutral.
     pub meter_track: Color32,
     pub meter_rating_1: Color32,
@@ -83,6 +87,8 @@ impl ThemePalette {
             slider_remainder_fill: Color32::from_rgb(226, 232, 240),
             slider_live_below: Color32::from_rgb(29, 78, 216),
             slider_live_above: Color32::from_rgb(6, 118, 71),
+            sensitivity_marker_on_track: Color32::from_rgb(23, 27, 36),
+            sensitivity_marker_on_live: Color32::WHITE,
             meter_track: Color32::from_rgb(226, 232, 240),
             meter_rating_1: Color32::from_rgb(220, 38, 38),
             meter_rating_2: Color32::from_rgb(194, 65, 12),
@@ -132,6 +138,8 @@ impl ThemePalette {
             slider_remainder_fill: Color32::from_rgb(53, 61, 76),
             slider_live_below: Color32::from_rgb(96, 165, 250),
             slider_live_above: Color32::from_rgb(74, 222, 128),
+            sensitivity_marker_on_track: Color32::from_rgb(247, 250, 252),
+            sensitivity_marker_on_live: Color32::from_rgb(17, 19, 24),
             meter_track: Color32::from_rgb(53, 61, 76),
             meter_rating_1: Color32::from_rgb(248, 113, 113),
             meter_rating_2: Color32::from_rgb(251, 146, 60),
@@ -250,6 +258,24 @@ mod tests {
             );
             assert!(
                 contrast_ratio(palette.slider_live_above, palette.slider_remainder_fill) >= 3.0
+            );
+        }
+    }
+
+    #[test]
+    fn sensitivity_marker_rings_remain_distinct_from_both_input_bar_states() {
+        for palette in [ThemePalette::light(), ThemePalette::dark()] {
+            assert!(
+                contrast_ratio(
+                    palette.sensitivity_marker_on_track,
+                    palette.slider_remainder_fill
+                ) >= 3.0
+            );
+            assert!(
+                contrast_ratio(
+                    palette.sensitivity_marker_on_live,
+                    palette.slider_live_above
+                ) >= 3.0
             );
         }
     }

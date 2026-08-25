@@ -22,6 +22,47 @@ function Get-NormalizedFullPath([string]$Path) {
     return $full.TrimEnd([char[]]@('\', '/'))
 }
 
+function Invoke-NativeProcess(
+    [string]$ExecutablePath,
+    [string[]]$Arguments
+) {
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $ExecutablePath
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $quotedArguments = foreach ($argument in $Arguments) {
+        if ($argument.Contains('"')) {
+            throw "Native process arguments cannot contain a double quote."
+        }
+        if ($argument.EndsWith('\')) {
+            throw "Native process arguments cannot end with a backslash."
+        }
+        '"' + $argument + '"'
+    }
+    $startInfo.Arguments = $quotedArguments -join ' '
+
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    try {
+        if (-not $process.Start()) {
+            throw "Could not start native process: $ExecutablePath"
+        }
+        $stdout = $process.StandardOutput.ReadToEndAsync()
+        $stderr = $process.StandardError.ReadToEndAsync()
+        $process.WaitForExit()
+        return [pscustomobject]@{
+            ExitCode = $process.ExitCode
+            Stdout = $stdout.GetAwaiter().GetResult()
+            Stderr = $stderr.GetAwaiter().GetResult()
+        }
+    }
+    finally {
+        $process.Dispose()
+    }
+}
+
 function Assert-NoReparseAncestors([string]$Path) {
     $current = Get-NormalizedFullPath $Path
     while (-not (Test-Path -LiteralPath $current)) {
@@ -191,24 +232,42 @@ try {
     try {
         $env:HF_HUB_OFFLINE = "1"
         $env:TRANSFORMERS_OFFLINE = "1"
-        $smokeJson = & $executablePath `
-            --scribe-install-smoke-parent `
-            $manifest.model_id `
-            $destinationModel `
-            gguf `
-            - `
-            $manifest.size_bytes `
-            $manifest.sha256 `
-            cpu
-        if ($LASTEXITCODE -ne 0) {
-            throw "Offline bundled-model smoke failed with exit code $LASTEXITCODE."
+        $smokeProcess = Invoke-NativeProcess $executablePath @(
+            "--scribe-install-smoke-parent",
+            [string]$manifest.model_id,
+            $destinationModel,
+            "gguf",
+            "-",
+            [string]$manifest.size_bytes,
+            [string]$manifest.sha256,
+            "cpu"
+        )
+        if ($smokeProcess.ExitCode -ne 0) {
+            throw "Offline bundled-model smoke failed with exit code $($smokeProcess.ExitCode): $($smokeProcess.Stderr.Trim())"
         }
     }
     finally {
         $env:HF_HUB_OFFLINE = $previousHubOffline
         $env:TRANSFORMERS_OFFLINE = $previousTransformersOffline
     }
-    $smoke = ($smokeJson | Out-String) | ConvertFrom-Json
+    if ([string]::IsNullOrWhiteSpace($smokeProcess.Stdout)) {
+        throw "Offline bundled-model smoke returned no diagnostics. Stderr: $($smokeProcess.Stderr.Trim())"
+    }
+    try {
+        $smoke = $smokeProcess.Stdout | ConvertFrom-Json
+    }
+    catch {
+        throw "Offline bundled-model smoke returned invalid JSON: $($_.Exception.Message). Stderr: $($smokeProcess.Stderr.Trim())"
+    }
+    $smokeProperties = @($smoke.PSObject.Properties.Name)
+    foreach ($requiredProperty in @("cancellation_verified", "capabilities", "detected_architecture")) {
+        if ($requiredProperty -notin $smokeProperties) {
+            throw "Offline bundled-model smoke diagnostics are missing '$requiredProperty'."
+        }
+    }
+    if ($null -eq $smoke.capabilities -or "cancellation" -notin @($smoke.capabilities.PSObject.Properties.Name)) {
+        throw "Offline bundled-model smoke diagnostics are missing 'capabilities.cancellation'."
+    }
     if (-not $smoke.cancellation_verified) {
         throw "Offline bundled-model smoke did not verify cancellation."
     }

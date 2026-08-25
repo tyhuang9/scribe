@@ -11,7 +11,7 @@ AppId={{8E0F1935-8E3D-4B1D-9A42-7C7D7C3D5E7A}
 AppName={#AppName}
 AppVersion={#AppVersion}
 AppPublisher={#AppPublisher}
-DefaultDirName={autopf}\Scribe
+DefaultDirName={localappdata}\Programs\Scribe
 DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
 OutputDir=..\dist
@@ -21,10 +21,14 @@ SolidCompression=yes
 ArchitecturesInstallIn64BitMode=x64
 PrivilegesRequired=lowest
 UninstallDisplayIcon={app}\{#AppExeName}
+VersionInfoCompany={#AppPublisher}
+VersionInfoProductName={#AppName}
+VersionInfoProductVersion={#AppVersion}
+VersionInfoVersion={#AppVersion}
 WizardStyle=modern
 
 [Files]
-Source: "..\dist\portable\{#AppExeName}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\dist\portable\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExeName}"

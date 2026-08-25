@@ -26,6 +26,47 @@ function Get-NormalizedFullPath([string]$Path) {
     return $full.TrimEnd([char[]]@('\', '/'))
 }
 
+function Invoke-NativeProcess(
+    [string]$ExecutablePath,
+    [string[]]$Arguments
+) {
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $ExecutablePath
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $quotedArguments = foreach ($argument in $Arguments) {
+        if ($argument.Contains('"')) {
+            throw "Native process arguments cannot contain a double quote."
+        }
+        if ($argument.EndsWith('\')) {
+            throw "Native process arguments cannot end with a backslash."
+        }
+        '"' + $argument + '"'
+    }
+    $startInfo.Arguments = $quotedArguments -join ' '
+
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    try {
+        if (-not $process.Start()) {
+            throw "Could not start native process: $ExecutablePath"
+        }
+        $stdout = $process.StandardOutput.ReadToEndAsync()
+        $stderr = $process.StandardError.ReadToEndAsync()
+        $process.WaitForExit()
+        return [pscustomobject]@{
+            ExitCode = $process.ExitCode
+            Stdout = $stdout.GetAwaiter().GetResult()
+            Stderr = $stderr.GetAwaiter().GetResult()
+        }
+    }
+    finally {
+        $process.Dispose()
+    }
+}
+
 function Assert-NoReparseAncestors([string]$Path) {
     $current = Get-NormalizedFullPath $Path
     while (-not (Test-Path -LiteralPath $current)) {
@@ -86,6 +127,41 @@ function Assert-Amd64Pe([string]$Path) {
     }
     finally {
         $stream.Dispose()
+    }
+}
+
+function Get-PeSubsystem([string]$Path) {
+    $null = Assert-RegularFile $Path
+    $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+    try {
+        if ($stream.Length -lt 256) {
+            throw "PE file is too short for an optional header: $Path"
+        }
+        $reader = [System.IO.BinaryReader]::new($stream)
+        $stream.Position = 0x3C
+        $peOffset = $reader.ReadUInt32()
+        $optionalHeader = [int64]$peOffset + 24
+        $subsystemOffset = $optionalHeader + 68
+        if ($subsystemOffset -gt ($stream.Length - 2)) {
+            throw "PE subsystem field is outside the file: $Path"
+        }
+        $stream.Position = $optionalHeader
+        $magic = $reader.ReadUInt16()
+        if ($magic -notin 0x10B, 0x20B) {
+            throw "PE file has an unsupported optional header: $Path"
+        }
+        $stream.Position = $subsystemOffset
+        return $reader.ReadUInt16()
+    }
+    finally {
+        $stream.Dispose()
+    }
+}
+
+function Assert-WindowsGuiSubsystem([string]$Path) {
+    $subsystem = Get-PeSubsystem $Path
+    if ($subsystem -ne 2) {
+        throw ("PE subsystem mismatch for {0}: expected Windows GUI (2), got {1}" -f $Path, $subsystem)
     }
 }
 
@@ -234,6 +310,7 @@ finally {
 $cargoReleaseRoot = Join-Path $repositoryRoot "target\$targetTriple\release"
 $sourceExecutable = Join-Path $cargoReleaseRoot "local-transcriber.exe"
 Assert-Amd64Pe $sourceExecutable
+Assert-WindowsGuiSubsystem $sourceExecutable
 
 try {
     New-Item -ItemType Directory -Path $stagingBundle | Out-Null
@@ -262,6 +339,17 @@ try {
     }
     $stagedModelManifest = Join-Path $stagingBundle "bundled-model-manifest.json"
     Copy-Item -LiteralPath $modelManifestPath -Destination $stagedModelManifest
+    $cargoManifest = Get-Content -LiteralPath (Join-Path $repositoryRoot "Cargo.toml") -Raw
+    $versionMatch = [regex]::Match($cargoManifest, '(?m)^version\s*=\s*"([^"]+)"')
+    if (-not $versionMatch.Success) {
+        throw "Could not read the Scribe version from Cargo.toml."
+    }
+    $portableReadme = Join-Path $stagingBundle "README.txt"
+    [System.IO.File]::WriteAllText(
+        $portableReadme,
+        "Scribe $($versionMatch.Groups[1].Value)`r`n`r`nExtract this entire folder before running local-transcriber.exe. This portable Windows x64 package includes the verified English Base model and compatibility runtime; do not distribute the executable by itself.`r`n",
+        [System.Text.UTF8Encoding]::new($false)
+    )
 
     Assert-NoReparseAncestors $stagingBundle
     Assert-TreeHasNoReparsePoints $stagingBundle
@@ -273,6 +361,7 @@ try {
         Assert-CopyMatchesSource $sourcePath (Join-Path $stagedLicenses (Split-Path -Leaf $relativePath))
     }
     Assert-Amd64Pe $stagedExecutable
+    Assert-WindowsGuiSubsystem $stagedExecutable
     Assert-ExactFile $stagedModel ([int64]$modelManifest.size_bytes) $modelManifest.sha256
     foreach ($file in $runtimeManifest.files) {
         $path = Join-Path $stagedRuntimeRoot ($file.path -replace '/', '\')
@@ -293,6 +382,7 @@ try {
         $null = $expectedPaths.Add("licenses/$(Split-Path -Leaf $relativePath)")
     }
     $null = $expectedPaths.Add("bundled-model-manifest.json")
+    $null = $expectedPaths.Add("README.txt")
     Assert-ExactAllowlist $stagingBundle $expectedPaths.ToArray()
 
     $previousHubOffline = $env:HF_HUB_OFFLINE
@@ -300,26 +390,47 @@ try {
     try {
         $env:HF_HUB_OFFLINE = "1"
         $env:TRANSFORMERS_OFFLINE = "1"
-        $smokeJson = & $stagedExecutable `
-            --scribe-install-smoke-parent `
-            $modelManifest.model_id `
-            $stagedModel `
-            gguf `
-            - `
-            $modelManifest.size_bytes `
-            $modelManifest.sha256 `
-            cpu
-        if ($LASTEXITCODE -ne 0) {
-            throw "Offline staged-bundle smoke failed with exit code $LASTEXITCODE."
+        $smokeProcess = Invoke-NativeProcess $stagedExecutable @(
+            "--scribe-install-smoke-parent",
+            [string]$modelManifest.model_id,
+            $stagedModel,
+            "gguf",
+            "-",
+            [string]$modelManifest.size_bytes,
+            [string]$modelManifest.sha256,
+            "cpu"
+        )
+        if ($smokeProcess.ExitCode -ne 0) {
+            throw "Offline staged-bundle smoke failed with exit code $($smokeProcess.ExitCode): $($smokeProcess.Stderr.Trim())"
         }
     }
     finally {
         $env:HF_HUB_OFFLINE = $previousHubOffline
         $env:TRANSFORMERS_OFFLINE = $previousTransformersOffline
     }
-    $smoke = ($smokeJson | Out-String) | ConvertFrom-Json
+    if ([string]::IsNullOrWhiteSpace($smokeProcess.Stdout)) {
+        throw "Offline staged-bundle smoke returned no diagnostics. Stderr: $($smokeProcess.Stderr.Trim())"
+    }
+    try {
+        $smoke = $smokeProcess.Stdout | ConvertFrom-Json
+    }
+    catch {
+        throw "Offline staged-bundle smoke returned invalid JSON: $($_.Exception.Message). Stderr: $($smokeProcess.Stderr.Trim())"
+    }
+    $smokeProperties = @($smoke.PSObject.Properties.Name)
+    foreach ($requiredProperty in @("cancellation_verified", "capabilities", "detected_architecture")) {
+        if ($requiredProperty -notin $smokeProperties) {
+            throw "Offline staged-bundle smoke diagnostics are missing '$requiredProperty'."
+        }
+    }
+    if ($null -eq $smoke.capabilities -or "cancellation" -notin @($smoke.capabilities.PSObject.Properties.Name)) {
+        throw "Offline staged-bundle smoke diagnostics are missing 'capabilities.cancellation'."
+    }
     if (-not $smoke.cancellation_verified -or -not $smoke.capabilities.cancellation) {
         throw "Offline staged-bundle smoke did not verify cancellation."
+    }
+    if ([string]::IsNullOrWhiteSpace([string]$smoke.detected_architecture)) {
+        throw "Offline staged-bundle smoke did not report the detected model architecture."
     }
 
     $inventoryEntries = @($expectedPaths.ToArray() | Sort-Object | ForEach-Object {

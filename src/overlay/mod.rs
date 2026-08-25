@@ -17,7 +17,7 @@ pub use platform::{
     CapturedTarget, OverlayPosition, capture_foreground_target,
     captured_target_application_identity, overlay_focus_safety_available,
 };
-pub use view::{OverlayAction, show_overlay_viewport};
+pub use view::{OverlayAction, OverlayDiagnostic, show_overlay_viewport};
 
 pub(crate) fn shutdown_overlay_viewport() {
     #[cfg(target_os = "windows")]

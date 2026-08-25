@@ -231,6 +231,20 @@ fn publish_event(command: TrayCommand) {
     }
 }
 
+/// Wakes a hidden Scribe window for a background event such as a global
+/// hotkey. The eframe repaint wake is owned by the event source; this path
+/// only supplies the Win32 message-loop wake needed while the root viewport
+/// is hidden to the tray.
+pub fn wake_scribe_app_from_background_event() {
+    let publisher = EVENT_TARGET
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    if let Some(publisher) = publisher {
+        wake_hidden_main_window(publisher.main_window_handle);
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn valid_main_window_handle(handle: Option<isize>) -> Option<isize> {
     use windows_sys::Win32::UI::WindowsAndMessaging::IsWindow;
