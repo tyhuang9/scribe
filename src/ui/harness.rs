@@ -1,15 +1,24 @@
 //! Development-only deterministic fixtures. Actions update only local fixture state.
 
-use std::time::Duration;
+use std::{
+    path::Path,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
+use anyhow::Result;
 use eframe::egui::{self, CentralPanel, Frame};
 
 use crate::{
+    config,
+    model_catalog::BUNDLED_BASE_MODEL_ID,
     overlay::{
         self, OverlayAudioLevel, OverlayMode, OverlayPhase, OverlayPosition, OverlayPresentation,
         OverlayTranscript, OverlayViewState,
     },
+    prepared_audio::PreparedAudio,
     transcription::SessionId,
+    transcription::{RequestId, TranscriptionRequest, TranscriptionService},
 };
 
 use super::{
@@ -39,6 +48,7 @@ pub(crate) enum Fixture {
     TranscribeFinalizing,
     TranscribeNoSpeech,
     TranscribeMicrophoneError,
+    DemoAudio,
     ModelsInstalled,
     ModelsLifecycle,
     ModelsDownloadDownloading,
@@ -87,6 +97,7 @@ impl Fixture {
             "transcribe/finalizing" => Self::TranscribeFinalizing,
             "transcribe/no-speech" => Self::TranscribeNoSpeech,
             "transcribe/microphone-error" => Self::TranscribeMicrophoneError,
+            "demo/audio" => Self::DemoAudio,
             "models/installed" => Self::ModelsInstalled,
             "models/lifecycle" => Self::ModelsLifecycle,
             "models/download-downloading" => Self::ModelsDownloadDownloading,
@@ -210,6 +221,7 @@ impl Fixture {
                 transcription.phase = TranscriptionPhase::MicrophoneError;
                 transcription.notice = Some("Scribe couldn’t access your microphone".into());
             }
+            Self::DemoAudio => unreachable!("demo/audio is initialized from an audio file"),
             Self::ModelsInstalled
             | Self::SettingsRecording
             | Self::History
@@ -467,11 +479,51 @@ pub(crate) fn fixture_from_env() -> Option<Fixture> {
         .and_then(|value| Fixture::parse(&value))
 }
 
+/// Resolves the explicitly requested debug-only demo audio to genuine local
+/// transcription output. The UI timing is simulated later, but its text comes
+/// from the same service used by the desktop application.
+pub(crate) fn transcribe_demo_audio_from_env() -> Result<Option<String>, String> {
+    let Some(path) = std::env::var_os("SCRIBE_DEMO_AUDIO") else {
+        return Ok(None);
+    };
+    transcribe_demo_audio(Path::new(&path)).map(Some)
+}
+
+fn transcribe_demo_audio(path: &Path) -> Result<String, String> {
+    let audio = PreparedAudio::from_wav_path(path)
+        .map(Arc::new)
+        .map_err(|error| format!("could not prepare demo WAV: {error}"))?;
+    let (config, _) = config::load_config()
+        .map_err(|error| format!("could not load the local Scribe configuration: {error}"))?;
+    let service = TranscriptionService::new(config);
+    let mut request = TranscriptionRequest::new(
+        SessionId(900_001),
+        RequestId(900_001),
+        audio,
+        BUNDLED_BASE_MODEL_ID,
+    );
+    request.model_path = std::env::var_os("SCRIBE_DEMO_MODEL").map(Into::into);
+    let outcome = service
+        .transcribe(request)
+        .map_err(|error| format!("could not transcribe the demo WAV: {error}"))?;
+    let transcript = outcome.transcript.text.trim();
+    if transcript.is_empty() {
+        return Err("the demo WAV did not contain recognizable speech".to_owned());
+    }
+    Ok(transcript.to_owned())
+}
+
 pub(crate) struct UiHarnessApp {
     page: AppPage,
     data: FixtureData,
     overlay: Option<OverlayHarnessFixture>,
     overlay_presented: bool,
+    demo_playback: Option<DemoPlayback>,
+}
+
+struct DemoPlayback {
+    started_at: Instant,
+    transcript: String,
 }
 
 fn configure_harness_style(ctx: &egui::Context, dark_mode: bool) {
@@ -502,7 +554,46 @@ impl UiHarnessApp {
             data: fixture.data(),
             overlay,
             overlay_presented: false,
+            demo_playback: None,
         }
+    }
+
+    pub(crate) fn new_demo_audio(cc: &eframe::CreationContext<'_>, transcript: String) -> Self {
+        let mut app = Self::new(cc, Fixture::TranscribeReady);
+        app.data.transcription.committed_transcript.clear();
+        app.data.transcription.notice = Some(
+            "Demo playback — transcript generated locally from a prerecorded audio file.".into(),
+        );
+        app.demo_playback = Some(DemoPlayback {
+            started_at: Instant::now(),
+            transcript,
+        });
+        app
+    }
+
+    fn advance_demo_playback(&mut self) {
+        let Some(demo) = self.demo_playback.as_ref() else {
+            return;
+        };
+        let elapsed = demo.started_at.elapsed();
+        self.data.transcription.elapsed_ms = elapsed.as_millis() as u64;
+        self.data.transcription.phase = if elapsed < Duration::from_millis(1_600) {
+            self.data.transcription.provisional_transcript = demo
+                .transcript
+                .split_whitespace()
+                .take(5)
+                .collect::<Vec<_>>()
+                .join(" ");
+            TranscriptionPhase::Listening
+        } else if elapsed < Duration::from_millis(2_500) {
+            self.data.transcription.provisional_transcript.clear();
+            TranscriptionPhase::Finalizing
+        } else {
+            self.data.transcription.provisional_transcript.clear();
+            self.data.transcription.committed_transcript = demo.transcript.clone();
+            self.data.transcription.last_successful_capture_ms = Some(0);
+            TranscriptionPhase::Ready
+        };
     }
 }
 impl eframe::App for UiHarnessApp {
@@ -513,6 +604,7 @@ impl eframe::App for UiHarnessApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.advance_demo_playback();
         if let Some(overlay) = &self.overlay {
             show_overlay_fixture_host(ctx, self.overlay_presented);
             let output = overlay::show_overlay_viewport(
@@ -563,7 +655,11 @@ impl eframe::App for UiHarnessApp {
             self.data.model_management.restore_after_removal_focus = false;
         }
         apply_action(&mut self.data, &mut self.page, action);
-        ctx.request_repaint_after(std::time::Duration::from_secs(60));
+        ctx.request_repaint_after(if self.demo_playback.is_some() {
+            Duration::from_millis(33)
+        } else {
+            Duration::from_secs(60)
+        });
     }
 }
 
@@ -1139,6 +1235,7 @@ mod tests {
             data: Fixture::TranscribeReady.data(),
             overlay: None,
             overlay_presented: false,
+            demo_playback: None,
         };
 
         for visuals in [egui::Visuals::light(), egui::Visuals::dark()] {
@@ -6158,6 +6255,7 @@ mod tests {
             Fixture::parse("transcribe/ready"),
             Some(Fixture::TranscribeReady)
         );
+        assert_eq!(Fixture::parse("demo/audio"), Some(Fixture::DemoAudio));
         assert_eq!(Fixture::parse("debug"), None);
     }
 }

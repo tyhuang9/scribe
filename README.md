@@ -27,9 +27,9 @@ Scribe keeps microphone audio and transcription on your device. It has no accoun
 
 ## See it in action
 
-![Illustrated Scribe transcription demo: Scribe is listening and turns spoken words into a final transcript ready to copy.](docs/assets/transcription-demo.svg)
+![Animated Scribe demo: a prerecorded audio clip progresses through recording and finalization to a local transcript that is ready to copy.](docs/assets/transcription-demo.gif)
 
-Scribe can show a tentative preview while you speak, then creates a final transcript when recording stops. Only that final text can be copied or inserted.
+The animation uses a prerecorded audio clip. Its recording and finalization timing is staged for clarity, while the displayed text is generated locally from that clip. In regular use, Scribe can show a tentative preview while you speak, then creates a final transcript when recording stops. Only that final text can be copied or inserted.
 
 ## Everyday controls
 

@@ -19,6 +19,27 @@ not runtime assets.
 
 ## Fixture routes
 
+### Demo audio playback
+
+`demo/audio` is a debug-only capture aid. It runs a local WAV through Scribe's
+real transcription service, then deliberately stages the harness as recording,
+finalizing, and complete so a short product demo can be captured without a
+microphone or audio-loopback device. It is excluded from normal builds and its
+on-screen notice identifies the playback as a prerecorded-file demo.
+
+```powershell
+$env:SCRIBE_UI_HARNESS = 'demo/audio'
+$env:SCRIBE_DEMO_AUDIO = 'C:\path\to\demo.wav'
+$env:SCRIBE_DEMO_MODEL = 'C:\path\to\whisper-base.en-Q8_0.gguf'
+cargo run --features ui-harness
+```
+
+Use a canonical WAV file (for example, convert an `.m4a` source to mono,
+16 kHz PCM WAV before launching). The staged timing is illustrative; only the
+transcript itself comes from the supplied audio. `SCRIBE_DEMO_MODEL` is only
+needed when the debug executable does not already have the bundled model beside
+it.
+
 - `transcribe/no-model`
 - `transcribe/ready`
 - `transcribe/listening`
