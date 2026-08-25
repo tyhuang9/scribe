@@ -1,18 +1,20 @@
-name: Build Scribe release
+name: Build Windows installer
 
 on:
+  pull_request:
   workflow_dispatch:
   push:
-    tags:
-      - "v*"
+    branches: [main]
+    tags: ["v*"]
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  windows:
-    name: Windows x64 installer
+  build:
+    name: Build and verify Windows installer
     runs-on: windows-latest
+    timeout-minutes: 60
 
     steps:
       - name: Check out source
@@ -20,6 +22,9 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@1.96.0
+
+      - name: Fetch locked Rust dependencies
+        run: cargo fetch --locked
 
       - name: Prepare reviewed sherpa-onnx archive
         shell: pwsh
@@ -43,59 +48,95 @@ jobs:
           }
           "SHERPA_ONNX_ARCHIVE_DIR=$archiveDir" >> $env:GITHUB_ENV
 
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Lint
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: Test
+        run: cargo test --locked --all-features
+
       - name: Download and verify pinned release inputs
         shell: pwsh
         run: |
           & .\scripts\prepare-windows-release-inputs.ps1 -OutputDirectory .ci-release-inputs
 
-      - name: Fetch locked Rust dependencies
-        run: cargo fetch --locked
-
-      - name: Build validated portable package
+      - name: Build validated portable payload
         shell: pwsh
         run: |
           $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches.Groups[1].Value
-          if (-not $version) { throw "Could not read package version from Cargo.toml" }
+          if (-not $version) { throw "Could not read the package version from Cargo.toml" }
           "APP_VERSION=$version" >> $env:GITHUB_ENV
           & .\scripts\build-windows-release.ps1 `
             -ModelSource .ci-release-inputs\model\whisper-base.en-Q8_0.gguf `
             -RuntimeSource .ci-release-inputs\runtime `
             -BundlePath dist\portable
-          Compress-Archive -Path dist\portable\* -DestinationPath "dist\Scribe-$version-windows-x64.zip" -Force
 
       - name: Install Inno Setup
         shell: pwsh
         run: choco install innosetup --no-progress --yes
 
-      - name: Build Windows installer
+      - name: Build and normalize Windows installer
         shell: pwsh
         run: |
           $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
           if (-not (Test-Path $iscc)) { throw "Inno Setup compiler not found at $iscc" }
           & $iscc "/DAppVersion=$env:APP_VERSION" installer\scribe.iss
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup compilation failed with exit code $LASTEXITCODE" }
+          $generated = @(Get-ChildItem -Path dist -Filter "Scribe-Setup-$env:APP_VERSION.exe" -File)
+          if ($generated.Count -ne 1) { throw "Expected exactly one versioned installer; found $($generated.Count)" }
+          Copy-Item -LiteralPath $generated[0].FullName -Destination dist\Scribe-Setup.exe -Force
 
-      - name: Verify portable ZIP and silent installer payloads
+      - name: Verify complete installer payload
         shell: pwsh
         run: |
           & .\scripts\verify-windows-release-package.ps1 `
             -BundlePath dist\portable `
-            -PortableZipPath "dist\Scribe-$env:APP_VERSION-windows-x64.zip" `
-            -InstallerPath "dist\Scribe-Setup-$env:APP_VERSION.exe"
+            -InstallerPath dist\Scribe-Setup.exe
 
-      - name: Upload release files
+      - name: Upload Windows installer
         uses: actions/upload-artifact@v6
         with:
-          name: scribe-windows-x64
-          path: |
-            dist/Scribe-*-windows-x64.zip
-            dist/Scribe-Setup-*.exe
+          name: windows-installer
+          path: dist/Scribe-Setup.exe
           if-no-files-found: error
 
-      - name: Publish GitHub release
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v3
+  release:
+    name: Create GitHub release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v5
+
+      - name: Validate semantic tag and application version
+        shell: pwsh
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          if ($tag -notmatch '^v\d+\.\d+\.\d+$') {
+            throw "Release tags must be exact semantic versions such as v0.2.0; received $tag"
+          }
+          $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches.Groups[1].Value
+          if (-not $version) { throw "Could not read the package version from Cargo.toml" }
+          if ($tag -ne "v$version") {
+            throw "Release tag $tag does not match Cargo.toml version $version"
+          }
+
+      - name: Download verified installer
+        uses: actions/download-artifact@v7
         with:
-          generate_release_notes: true
-          files: |
-            dist/Scribe-*-windows-x64.zip
-            dist/Scribe-Setup-*.exe
+          name: windows-installer
+          path: release-assets
+
+      - name: Create release with generated notes
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $installer = Get-Item -LiteralPath release-assets\Scribe-Setup.exe -ErrorAction Stop
+          gh release create $env:GITHUB_REF_NAME $installer.FullName --generate-notes --title $env:GITHUB_REF_NAME
