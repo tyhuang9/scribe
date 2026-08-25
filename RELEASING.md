@@ -76,13 +76,39 @@ explicitly enable `publish_release`. Publication from any other branch is
 blocked. The workflow derives the tag as `v<package version>` from the checked
 out root `Cargo.toml` and targets exactly the default-branch commit identified
 by the workflow's `GITHUB_SHA`; there is no user-supplied release tag or target.
-After validating both assets, it atomically creates that tag at the exact commit
-and verifies the remote ref before creating the release. Tag-triggered runs also
-verify that the pushed tag resolves to the workflow commit. Publication jobs
-queue rather than cancel or overlap. The workflow then creates a stable,
+After validating both assets, the workflow verifies the release-tag protection
+prerequisite below. It then atomically creates that tag at the exact commit and
+verifies the remote ref before creating the release. Tag-triggered runs also
+verify that the pushed tag resolves to the workflow commit. One publication job
+runs at a time and GitHub holds up to 100 additional pending jobs; attempts over
+that platform queue limit can be canceled. The workflow then creates a stable,
 non-draft, non-prerelease GitHub Release containing exactly `Scribe-Setup.exe`
-and `Scribe-windows-x64.zip`, so the README's `releases/latest/download/...`
-links remain permanent.
+and `Scribe-windows-x64.zip`, so the README's
+`releases/latest/download/...` links remain permanent.
+
+### Required release-tag ruleset
+
+Before publishing, a repository administrator must configure this prerequisite
+out of band in **Settings → Rules → Rulesets** after receiving explicit approval
+for the repository setting change. The workflow only verifies the setting; it
+does not create or modify repository rulesets.
+
+Create exactly one repository tag ruleset with this contract:
+
+- Name: `Protect release tags`
+- Enforcement status: **Active**
+- Target: **Tags**
+- Ref-name inclusion: exactly `refs/tags/v*`
+- Ref-name exclusions: none
+- Rules: **Restrict updates** and **Restrict deletions** enabled; do not restrict
+  creation
+- Bypass list: empty
+
+This permits creation of a new matching release tag while preventing that tag
+from being moved or deleted after creation. Publication fails closed if the
+ruleset is missing, duplicated, inactive, ambiguous, unreadable, or differs from
+this contract. The repository must be configured separately before the first
+publish-enabled run can succeed.
 
 Manual publication refuses to proceed if either the derived tag or its GitHub
 Release already exists. It does not replace assets, move tags, or otherwise
@@ -93,10 +119,12 @@ rerun will intentionally refuse to overwrite it. Inspect the tag and release
 state before taking action; prefer correcting the version in `Cargo.toml` and
 publishing a new version. To retry the same version, a repository maintainer
 must first confirm that no release exists, verify that the orphan tag points to
-the intended commit, and explicitly delete only that tag. Only a repository
-maintainer should delete an erroneous release or tag as an explicit rollback,
-after preserving any needed assets and confirming that no users or automation
-depend on that version.
+the intended commit, and obtain explicit approval for a repository administrator
+to temporarily change the protective ruleset, delete only that tag, and restore
+the exact active ruleset contract before rerunning. Only a repository
+administrator should delete an erroneous release or tag as an explicit
+rollback, after preserving any needed assets and confirming that no users or
+automation depend on that version.
 
 ## GitHub Pages
 

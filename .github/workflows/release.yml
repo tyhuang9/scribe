@@ -233,6 +233,82 @@ jobs:
             }
           }
 
+          $requiredRulesetName = 'Protect release tags'
+          $rulesetIds = @(& gh api --paginate `
+            "repos/$env:GITHUB_REPOSITORY/rulesets?per_page=100" `
+            --jq ".[] | select(.name == `"$requiredRulesetName`") | .id" 2>&1)
+          $rulesetListExit = $LASTEXITCODE
+          if ($rulesetListExit -ne 0) {
+            throw "Could not list repository rulesets; refusing publication: $($rulesetIds -join ' ')"
+          }
+          if ($rulesetIds.Count -ne 1 -or $rulesetIds[0] -notmatch '^\d+$') {
+            throw "Expected exactly one repository ruleset named $requiredRulesetName; found $($rulesetIds.Count)"
+          }
+
+          $rulesetResponse = @(& gh api `
+            "repos/$env:GITHUB_REPOSITORY/rulesets/$($rulesetIds[0])" 2>&1)
+          $rulesetDetailExit = $LASTEXITCODE
+          if ($rulesetDetailExit -ne 0) {
+            throw "Could not read repository ruleset $requiredRulesetName; refusing publication: $($rulesetResponse -join ' ')"
+          }
+          try {
+            $ruleset = ($rulesetResponse -join "`n") | ConvertFrom-Json -Depth 100
+          } catch {
+            throw "Could not parse repository ruleset $requiredRulesetName; refusing publication: $($_.Exception.Message)"
+          }
+          foreach ($requiredProperty in @('name', 'target', 'source_type', 'source', 'enforcement', 'conditions', 'rules', 'bypass_actors')) {
+            if ($null -eq $ruleset.PSObject.Properties[$requiredProperty]) {
+              throw "Repository ruleset $requiredRulesetName is missing required property $requiredProperty"
+            }
+          }
+          if ($ruleset.name -cne $requiredRulesetName -or
+              $ruleset.target -cne 'tag' -or
+              $ruleset.source_type -cne 'Repository' -or
+              $ruleset.source -cne $env:GITHUB_REPOSITORY -or
+              $ruleset.enforcement -cne 'active') {
+            throw "Ruleset $requiredRulesetName must be an active tag ruleset owned by $env:GITHUB_REPOSITORY"
+          }
+          if ($null -eq $ruleset.conditions -or
+              $null -eq $ruleset.conditions.PSObject.Properties['ref_name']) {
+            throw "Repository ruleset $requiredRulesetName must define ref-name conditions"
+          }
+          $refName = $ruleset.conditions.ref_name
+          if ($null -eq $refName -or
+              $null -eq $refName.PSObject.Properties['include'] -or
+              $null -eq $refName.PSObject.Properties['exclude'] -or
+              $refName.include -isnot [System.Array] -or
+              $refName.exclude -isnot [System.Array]) {
+            throw "Repository ruleset $requiredRulesetName must define unambiguous ref includes and exclusions"
+          }
+          $includedRefs = @($refName.include)
+          $excludedRefs = @($refName.exclude)
+          if ($includedRefs.Count -ne 1 -or $includedRefs[0] -cne 'refs/tags/v*') {
+            throw "Repository ruleset $requiredRulesetName must include exactly refs/tags/v*"
+          }
+          if ($excludedRefs.Count -ne 0) {
+            throw "Repository ruleset $requiredRulesetName must not exclude any refs"
+          }
+          if ($ruleset.bypass_actors -isnot [System.Array] -or
+              @($ruleset.bypass_actors).Count -ne 0) {
+            throw "Repository ruleset $requiredRulesetName must not allow bypass actors"
+          }
+          if ($ruleset.rules -isnot [System.Array]) {
+            throw "Repository ruleset $requiredRulesetName must define an unambiguous rules array"
+          }
+          $ruleTypes = @($ruleset.rules | ForEach-Object {
+            if ($null -eq $_.PSObject.Properties['type'] -or $_.type -isnot [string]) {
+              throw "Repository ruleset $requiredRulesetName contains a rule without a valid type"
+            }
+            $_.type
+          })
+          if (@($ruleTypes | Where-Object { $_ -ceq 'update' }).Count -ne 1 -or
+              @($ruleTypes | Where-Object { $_ -ceq 'deletion' }).Count -ne 1) {
+            throw "Repository ruleset $requiredRulesetName must restrict tag updates and deletions"
+          }
+          if (@($ruleTypes | Where-Object { $_ -ceq 'creation' }).Count -ne 0) {
+            throw "Repository ruleset $requiredRulesetName must allow creation of new matching tags"
+          }
+
           if ($env:GITHUB_EVENT_NAME -eq 'workflow_dispatch') {
             $createTagResult = @(& gh api --method POST "repos/$env:GITHUB_REPOSITORY/git/refs" `
               -f "ref=refs/tags/$env:RELEASE_TAG" `

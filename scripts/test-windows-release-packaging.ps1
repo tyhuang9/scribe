@@ -193,6 +193,18 @@ try {
         'sha=$env:RELEASE_SHA',
         'git/ref/tags/$env:RELEASE_TAG',
         'refs/tags/$env:RELEASE_TAG^{}',
+        "`$requiredRulesetName = 'Protect release tags'",
+        'rulesets?per_page=100',
+        "`$ruleset.target -cne 'tag'",
+        "`$ruleset.source_type -cne 'Repository'",
+        "`$ruleset.source -cne `$env:GITHUB_REPOSITORY",
+        "`$ruleset.enforcement -cne 'active'",
+        "`$includedRefs[0] -cne 'refs/tags/v*'",
+        "`$excludedRefs.Count -ne 0",
+        "`$ruleset.bypass_actors",
+        "`$_ -ceq 'update'",
+        "`$_ -ceq 'deletion'",
+        "`$_ -ceq 'creation'",
         '--draft=false',
         '--latest',
         '--prerelease=false',
@@ -234,12 +246,15 @@ try {
         throw "Windows release packaging contracts must run before release input preparation and build."
     }
     $assetValidationPosition = $workflow.IndexOf("`$assetRoot =")
+    $rulesetPreflightPosition = $workflow.IndexOf("`$requiredRulesetName = 'Protect release tags'")
     $atomicTagPosition = $workflow.IndexOf('gh api --method POST')
     $releaseCreationPosition = $workflow.IndexOf('gh release create')
     if ($assetValidationPosition -lt 0 -or
+        $rulesetPreflightPosition -le $assetValidationPosition -or
+        $atomicTagPosition -le $rulesetPreflightPosition -or
         $atomicTagPosition -le $assetValidationPosition -or
         $releaseCreationPosition -le $atomicTagPosition) {
-        throw "Manual tags must be created atomically after asset validation and immediately before release creation."
+        throw "Release-tag rules must be verified before atomic tag creation and release publication."
     }
     if ($workflow -notmatch '(?ms)release:\s+name: Create GitHub release.*?permissions:\s+contents: write' -or
         $workflow -notmatch '(?ms)^permissions:\s+contents: read') {
