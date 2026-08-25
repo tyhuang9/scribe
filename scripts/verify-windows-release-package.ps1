@@ -12,6 +12,47 @@ function Get-NormalizedPath([string]$Path) {
     return [System.IO.Path]::GetFullPath($Path).TrimEnd([char[]]@('\', '/'))
 }
 
+function Invoke-NativeProcess(
+    [string]$ExecutablePath,
+    [string[]]$Arguments
+) {
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $ExecutablePath
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $quotedArguments = foreach ($argument in $Arguments) {
+        if ($argument.Contains('"')) {
+            throw "Native process arguments cannot contain a double quote."
+        }
+        if ($argument.EndsWith('\')) {
+            throw "Native process arguments cannot end with a backslash."
+        }
+        '"' + $argument + '"'
+    }
+    $startInfo.Arguments = $quotedArguments -join ' '
+
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    try {
+        if (-not $process.Start()) {
+            throw "Could not start native process: $ExecutablePath"
+        }
+        $stdout = $process.StandardOutput.ReadToEndAsync()
+        $stderr = $process.StandardError.ReadToEndAsync()
+        $process.WaitForExit()
+        return [pscustomobject]@{
+            ExitCode = $process.ExitCode
+            Stdout = $stdout.GetAwaiter().GetResult()
+            Stderr = $stderr.GetAwaiter().GetResult()
+        }
+    }
+    finally {
+        $process.Dispose()
+    }
+}
+
 function Get-RelativeBundlePath([string]$Root, [string]$Path) {
     $rootUri = [System.Uri]::new((Get-NormalizedPath $Root) + [System.IO.Path]::DirectorySeparatorChar)
     $pathUri = [System.Uri]::new((Get-NormalizedPath $Path))
@@ -88,9 +129,15 @@ try {
             throw "Windows installer is missing: $InstallerPath"
         }
         $installedRoot = Join-Path $temporaryRoot "installed"
-        & $InstallerPath /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP- "/DIR=$installedRoot"
-        if ($LASTEXITCODE -ne 0) {
-            throw "Silent installer verification failed with exit code $LASTEXITCODE."
+        $installerProcess = Invoke-NativeProcess $InstallerPath @(
+            "/VERYSILENT",
+            "/SUPPRESSMSGBOXES",
+            "/NORESTART",
+            "/SP-",
+            "/DIR=$installedRoot"
+        )
+        if ($installerProcess.ExitCode -ne 0) {
+            throw "Silent installer verification failed with exit code $($installerProcess.ExitCode): $($installerProcess.Stderr.Trim())"
         }
         Assert-Bundle -Root $installedRoot -AllowedAdditionalFiles $InnoSetupUninstallerArtifacts
     }

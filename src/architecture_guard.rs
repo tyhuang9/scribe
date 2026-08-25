@@ -596,6 +596,9 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
     .expect("release payload verifier must be readable");
     for required in [
         "Release payload differs from its explicit inventory",
+        "Invoke-NativeProcess",
+        "RedirectStandardOutput",
+        "WaitForExit",
         "/VERYSILENT",
         "Assert-Bundle -Root $installedRoot -AllowedAdditionalFiles $InnoSetupUninstallerArtifacts",
     ] {
