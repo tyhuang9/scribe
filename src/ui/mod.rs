@@ -35,4 +35,4 @@ pub(crate) use state::RemoteCatalogSizeTier;
 pub(crate) use theme::{ThemePalette, theme_palette, ui_palette};
 
 #[cfg(all(feature = "ui-harness", debug_assertions))]
-pub(crate) use harness::{Fixture, UiHarnessApp, fixture_from_env, transcribe_demo_audio_from_env};
+pub(crate) use harness::{Fixture, UiHarnessApp, fixture_from_env};
