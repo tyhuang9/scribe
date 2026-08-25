@@ -105,7 +105,7 @@ fn report_startup_failure(error: &eframe::Error) {
         ));
         unsafe {
             MessageBoxW(
-                0,
+                std::ptr::null_mut(),
                 message.as_ptr(),
                 title.as_ptr(),
                 MB_OK | MB_ICONERROR | MB_SETFOREGROUND,
