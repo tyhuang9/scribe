@@ -64,6 +64,18 @@ try {
     [System.IO.File]::WriteAllBytes($consoleSubsystem, $consoleBytes)
     Invoke-ExpectedFailure { Assert-WindowsGuiSubsystem $consoleSubsystem } "PE subsystem mismatch"
 
+    $pwshPath = (Get-Process -Id $PID).Path
+    $nativeProcess = Invoke-NativeProcess $pwshPath @(
+        "-NoProfile",
+        "-Command",
+        "[Console]::Out.Write('captured-output'); [Console]::Error.Write('captured-error'); exit 7"
+    )
+    if ($nativeProcess.ExitCode -ne 7 -or
+        $nativeProcess.Stdout -ne "captured-output" -or
+        $nativeProcess.Stderr -ne "captured-error") {
+        throw "Synchronous native-process capture did not preserve exit, stdout, and stderr evidence."
+    }
+
     $final = Join-Path $testRoot "Scribe-windows-x64"
     $validStaging = "$final.staging-$PID-$([guid]::NewGuid().ToString('N'))"
     New-Item -ItemType Directory -Path $validStaging | Out-Null

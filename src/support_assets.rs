@@ -521,6 +521,15 @@ mod tests {
         sddl
     }
 
+    #[cfg(windows)]
+    fn dacl_contains_current_user(sddl: &str, user_sid: &str) -> bool {
+        // Windows serializes the built-in local Administrator SID (RID 500) as
+        // the SDDL alias `LA` on hosted runners. Accept that canonical form in
+        // addition to the literal token SID while retaining a principal check.
+        sddl.contains(&format!(";;;{user_sid})"))
+            || (user_sid.ends_with("-500") && sddl.contains(";;;LA)"))
+    }
+
     #[test]
     fn embedded_asset_matches_pinned_release_facts() {
         verify_bytes(SILERO_VAD_BYTES).unwrap();
@@ -593,7 +602,7 @@ mod tests {
             let sddl = security_descriptor_sddl(path);
             assert!(sddl.starts_with("D:P"), "DACL is not protected: {sddl}");
             assert!(
-                sddl.contains(&format!(";;;{user_sid})")),
+                dacl_contains_current_user(&sddl, &user_sid),
                 "DACL omitted current user SID {user_sid}: {sddl}"
             );
             assert!(sddl.contains(";;;SY)"), "DACL omitted LocalSystem: {sddl}");

@@ -863,6 +863,16 @@ fn sidecar_security_descriptor_sddl(path: &Path) -> String {
 }
 
 #[cfg(windows)]
+fn dacl_contains_current_user(sddl: &str, user_sid: &str) -> bool {
+    // Windows serializes the built-in local Administrator SID (RID 500) as the
+    // SDDL alias `LA` on hosted runners. Compare that canonical form as well as
+    // the literal token SID so this still proves that the ACE belongs to the
+    // current process user rather than merely matching display text.
+    sddl.contains(&format!(";;;{user_sid})"))
+        || (user_sid.ends_with("-500") && sddl.contains(";;;LA)"))
+}
+
+#[cfg(windows)]
 fn assert_sidecar_open_is_denied(path: &Path) {
     let error = fs::OpenOptions::new()
         .read(true)
@@ -928,7 +938,7 @@ fn stale_wal_and_shm_acl_is_repaired_before_history_reopen() {
             "sidecar DACL is not protected: {sddl}"
         );
         assert!(
-            sddl.contains(&format!(";;;{user_sid}")),
+            dacl_contains_current_user(&sddl, &user_sid),
             "repaired sidecar DACL omitted current user SID {user_sid}: {sddl}"
         );
         assert!(

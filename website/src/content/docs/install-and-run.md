@@ -1,11 +1,25 @@
 ---
 title: Install and run
-description: Prepare a desktop development environment and start Scribe from source.
+description: Install Scribe on Windows or prepare a desktop development environment from source.
 ---
+
+## Windows installer
+
+[Download Scribe for Windows](https://github.com/tyhuang9/scribe/releases/latest/download/Scribe-Setup.exe){.primary-link}
+
+The installer is for Windows x64 and installs Scribe for the current user, with
+a Start menu entry and uninstaller. It includes the pinned English Base model,
+its attribution notices, the compatible runtime files, and a hash inventory.
+Older installers remain on the [Scribe Releases page](https://github.com/tyhuang9/scribe/releases).
+
+The installer is currently unsigned. Windows may show a SmartScreen or unknown
+publisher warning. Download it only from the link above or the official Releases
+page, confirm the repository is `tyhuang9/scribe`, and review the release notes
+before deciding whether to continue.
 
 ## Before you start
 
-Scribe currently runs from a source checkout. You need a current stable Rust toolchain with Rust 2024 edition support, a desktop session compatible with `eframe` and `global-hotkey`, and a microphone visible to the operating system. Recorded automated verification used Rust 1.96.0; the project does not currently declare a tested minimum Rust version. Windows x64 is the primary release target; Linux and macOS retain conservative fallbacks but are not release-qualified.
+For source builds, you need a current stable Rust toolchain with Rust 2024 edition support, a desktop session compatible with `eframe` and `global-hotkey`, and a microphone visible to the operating system. Recorded automated verification used Rust 1.96.0; the project does not currently declare a tested minimum Rust version. Windows x64 is the primary release target; Linux and macOS retain conservative fallbacks but are not release-qualified.
 
 See [Project status](../project-status/) for the current scope and the repository references that maintain this guide.
 

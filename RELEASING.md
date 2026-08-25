@@ -1,0 +1,93 @@
+# Releasing Scribe for Windows
+
+Scribe's canonical application version is the `version` field in the root
+`Cargo.toml`. A stable GitHub release must use an exact matching tag: application
+version `0.2.0` becomes tag `v0.2.0`.
+
+## Build a local installer
+
+Use Windows x64 with the Rust 1.96.0 toolchain, Visual Studio 2022 C++ build
+tools, CMake, and Inno Setup 6 installed. From the repository root:
+
+```powershell
+$archiveName = 'sherpa-onnx-v1.13.5-win-x64-static-MT-Release-lib.tar.bz2'
+$archiveDir = Join-Path $PWD '.ci-native'
+$archivePath = Join-Path $archiveDir $archiveName
+New-Item -ItemType Directory -Force -Path $archiveDir | Out-Null
+curl.exe --fail --location --retry 3 --retry-delay 2 --output $archivePath "https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.13.5/$archiveName"
+if ((Get-Item -LiteralPath $archivePath).Length -ne 120217991) { throw 'Unexpected sherpa-onnx archive size' }
+if ((Get-FileHash -Algorithm SHA256 -Path $archivePath).Hash.ToLowerInvariant() -ne 'b7080b6f470bac96ef0afe56b25ae9b2f9f0ca82d10dad19bf3a2fc5ffd6cffc') { throw 'Unexpected sherpa-onnx archive SHA-256' }
+$env:SHERPA_ONNX_ARCHIVE_DIR = $archiveDir
+.\scripts\prepare-windows-release-inputs.ps1 -OutputDirectory .release-inputs
+.\scripts\build-windows-release.ps1 `
+  -ModelSource .release-inputs\model\whisper-base.en-Q8_0.gguf `
+  -RuntimeSource .release-inputs\runtime `
+  -BundlePath dist\portable
+$version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches.Groups[1].Value
+& "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DAppVersion=$version" installer\scribe.iss
+Copy-Item "dist\Scribe-Setup-$version.exe" dist\Scribe-Setup.exe -Force
+.\scripts\verify-windows-release-package.ps1 -BundlePath dist\portable -InstallerPath dist\Scribe-Setup.exe
+```
+
+The Inno Setup compiler first writes `dist\Scribe-Setup-<version>.exe`; the
+normalized release asset is `dist\Scribe-Setup.exe`. Do not distribute a bare
+`local-transcriber.exe`: the installer must include the complete staged payload.
+The scripts download the exact pinned runtime/model sources and verify their
+sizes and SHA-256 values before they are staged.
+
+## Publish a version
+
+1. Update the root `Cargo.toml` version and any appropriate release notes.
+2. Run the local validation and installer build above.
+3. Commit and push the version change through the normal review process.
+4. Create and push the matching tag:
+
+   ```powershell
+   git tag v0.2.0
+   git push origin v0.2.0
+   ```
+
+5. The `Build Windows installer` workflow validates formatting, clippy, tests,
+   downloads verified inputs, builds the full staged payload and Inno Setup
+   installer, verifies the installed payload, and uploads `Scribe-Setup.exe`.
+   For a matching exact semantic tag, its release job validates the tag against
+   `Cargo.toml`, then creates the GitHub Release with generated notes and that
+   installer asset.
+
+The permanent latest-installer URL is:
+
+<https://github.com/tyhuang9/scribe/releases/latest/download/Scribe-Setup.exe>
+
+Previous versions remain available at:
+
+<https://github.com/tyhuang9/scribe/releases>
+
+## Manual CI build
+
+Open **Actions → Build Windows installer → Run workflow** to create a temporary
+`windows-installer` artifact. Artifacts are for validation; use the GitHub
+Release link above for a public download.
+
+## GitHub Pages
+
+The documentation is deployed by `.github/workflows/docs.yml`. Once per
+repository, open **Settings → Pages** and set **Source** to **GitHub Actions**.
+The default project URL is <https://tyhuang9.github.io/scribe/> and contains the
+same permanent download link.
+
+## Signing
+
+The installer is currently unsigned. Windows may show a SmartScreen or unknown
+publisher warning. Do not claim it is signed or add certificate configuration
+until a real code-signing identity and secret-management process are approved.
+
+## Common release failures
+
+- **Tag rejected:** use an exact semantic tag such as `v0.2.0`, with the same
+  value as `Cargo.toml`.
+- **Pinned input verification fails:** do not bypass it; investigate the source,
+  size, and SHA-256 mismatch before retrying.
+- **Installer payload verification fails:** rebuild the staged `dist\portable`
+  directory; the installer must include every item from `bundle-inventory.json`.
+- **Pages does not deploy:** confirm Pages is set to GitHub Actions and that the
+  documentation change has reached `main`.
