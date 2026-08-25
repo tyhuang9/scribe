@@ -99,11 +99,18 @@ jobs:
             -BundlePath dist\portable `
             -InstallerPath dist\Scribe-Setup.exe
 
-      - name: Upload Windows installer
+      - name: Package verified portable ZIP
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist\portable\* -DestinationPath dist\Scribe-windows-x64.zip -Force
+
+      - name: Upload Windows release assets
         uses: actions/upload-artifact@v6
         with:
-          name: windows-installer
-          path: dist/Scribe-Setup.exe
+          name: windows-release-assets
+          path: |
+            dist/Scribe-Setup.exe
+            dist/Scribe-windows-x64.zip
           if-no-files-found: error
 
   release:
@@ -131,10 +138,10 @@ jobs:
             throw "Release tag $tag does not match Cargo.toml version $version"
           }
 
-      - name: Download verified installer
+      - name: Download verified release assets
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
-          name: windows-installer
+          name: windows-release-assets
           path: release-assets
 
       - name: Create release with generated notes
@@ -142,5 +149,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $installer = Get-Item -LiteralPath release-assets\Scribe-Setup.exe -ErrorAction Stop
-          gh release create $env:GITHUB_REF_NAME $installer.FullName --generate-notes --title $env:GITHUB_REF_NAME
+          $assets = @(Get-ChildItem -LiteralPath release-assets -File)
+          if ($assets.Count -ne 2) { throw "Expected installer and portable ZIP; found $($assets.Count) release assets" }
+          gh release create $env:GITHUB_REF_NAME $assets.FullName --generate-notes --title $env:GITHUB_REF_NAME
