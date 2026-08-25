@@ -25,4 +25,4 @@ Managed model files live under Scribe's app-data `models` directory. Trusted ins
 
 The embedded GGUF adapter is CPU-only. `Auto` resolves to CPU, `CPU` requests it explicitly, and `GPU` reports that no verified accelerator is available. Linux and macOS can compile conservative app fallbacks, but their desktop/model combinations are not release-qualified.
 
-For packaging and benchmark details, consult the [repository README](https://github.com/tyhuang9/scribe#models-and-runtime). It is the detailed implementation reference.
+For packaging, model-validation, and benchmark details, consult the repository’s [technical overview](https://github.com/tyhuang9/scribe/blob/main/docs/TECHNICAL_OVERVIEW.md) and the linked implementation records.
