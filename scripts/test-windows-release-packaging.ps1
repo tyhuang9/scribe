@@ -185,10 +185,18 @@ try {
         'Could not confirm that release',
         'needs: build',
         'name: windows-release-assets',
+        '& .\scripts\test-windows-release-packaging.ps1',
+        'queue: max',
+        'gh api --method POST',
+        'git/refs',
+        'ref=refs/tags/$env:RELEASE_TAG',
+        'sha=$env:RELEASE_SHA',
+        'git/ref/tags/$env:RELEASE_TAG',
+        'refs/tags/$env:RELEASE_TAG^{}',
         '--draft=false',
         '--latest',
         '--prerelease=false',
-        '--target $env:RELEASE_TARGET_SHA'
+        '--verify-tag'
     )) {
         if (-not $workflow.Contains($requiredPublicationGuard)) {
             throw "Windows release workflow must retain publication guard: $requiredPublicationGuard"
@@ -212,6 +220,26 @@ try {
             -not $workflow.Contains("'$canonicalAsset'")) {
             throw "Windows release workflow must upload and publish canonical README asset $canonicalAsset."
         }
+    }
+    if ($workflow.Contains('--target $env:RELEASE_TARGET_SHA') -or
+        $workflow.Contains('cancel-in-progress:')) {
+        throw "Windows release publication must use verified atomic tags and non-cancelling queued concurrency."
+    }
+    $contractTestPosition = $workflow.IndexOf('& .\scripts\test-windows-release-packaging.ps1')
+    $releaseInputPosition = $workflow.IndexOf('prepare-windows-release-inputs.ps1')
+    $releaseBuildPosition = $workflow.IndexOf('build-windows-release.ps1')
+    if ($contractTestPosition -lt 0 -or
+        $contractTestPosition -ge $releaseInputPosition -or
+        $contractTestPosition -ge $releaseBuildPosition) {
+        throw "Windows release packaging contracts must run before release input preparation and build."
+    }
+    $assetValidationPosition = $workflow.IndexOf("`$assetRoot =")
+    $atomicTagPosition = $workflow.IndexOf('gh api --method POST')
+    $releaseCreationPosition = $workflow.IndexOf('gh release create')
+    if ($assetValidationPosition -lt 0 -or
+        $atomicTagPosition -le $assetValidationPosition -or
+        $releaseCreationPosition -le $atomicTagPosition) {
+        throw "Manual tags must be created atomically after asset validation and immediately before release creation."
     }
     if ($workflow -notmatch '(?ms)release:\s+name: Create GitHub release.*?permissions:\s+contents: write' -or
         $workflow -notmatch '(?ms)^permissions:\s+contents: read') {

@@ -76,17 +76,25 @@ explicitly enable `publish_release`. Publication from any other branch is
 blocked. The workflow derives the tag as `v<package version>` from the checked
 out root `Cargo.toml` and targets exactly the default-branch commit identified
 by the workflow's `GITHUB_SHA`; there is no user-supplied release tag or target.
-It creates a stable, non-draft, non-prerelease GitHub Release containing exactly
-`Scribe-Setup.exe` and `Scribe-windows-x64.zip`, so the README's
-`releases/latest/download/...` links remain permanent.
+After validating both assets, it atomically creates that tag at the exact commit
+and verifies the remote ref before creating the release. Tag-triggered runs also
+verify that the pushed tag resolves to the workflow commit. Publication jobs
+queue rather than cancel or overlap. The workflow then creates a stable,
+non-draft, non-prerelease GitHub Release containing exactly `Scribe-Setup.exe`
+and `Scribe-windows-x64.zip`, so the README's `releases/latest/download/...`
+links remain permanent.
 
 Manual publication refuses to proceed if either the derived tag or its GitHub
 Release already exists. It does not replace assets, move tags, or otherwise
 clobber a prior release. If a run fails before publication, fix the underlying
 validation or packaging problem and rerun it. If it fails after creating a tag
-or release, inspect the published state before taking action; prefer correcting
-the version in `Cargo.toml` and publishing a new version. Only a repository
-maintainer should delete an erroneous release and tag as an explicit rollback,
+but before publishing the release, the atomic tag can remain as an orphan and a
+rerun will intentionally refuse to overwrite it. Inspect the tag and release
+state before taking action; prefer correcting the version in `Cargo.toml` and
+publishing a new version. To retry the same version, a repository maintainer
+must first confirm that no release exists, verify that the orphan tag points to
+the intended commit, and explicitly delete only that tag. Only a repository
+maintainer should delete an erroneous release or tag as an explicit rollback,
 after preserving any needed assets and confirming that no users or automation
 depend on that version.
 
@@ -115,5 +123,7 @@ until a real code-signing identity and secret-management process are approved.
   and explicitly enable `publish_release`; disabled dispatches only validate.
 - **Tag or release already exists:** do not overwrite it. Confirm the existing
   release is valid or increment `Cargo.toml` to a new version and publish that.
+  If it is an orphan tag from a failed manual publication, use the recovery
+  checks above before a maintainer deletes that specific tag and reruns.
 - **Pages does not deploy:** confirm Pages is set to GitHub Actions and that the
   documentation change has reached `main`.

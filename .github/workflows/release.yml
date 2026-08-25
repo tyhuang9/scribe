@@ -26,6 +26,11 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v5
 
+      - name: Test Windows release packaging contracts
+        shell: pwsh
+        run: |
+          & .\scripts\test-windows-release-packaging.ps1
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@1.96.0
         with:
@@ -129,7 +134,7 @@ jobs:
     runs-on: windows-latest
     concurrency:
       group: windows-release-publication
-      cancel-in-progress: false
+      queue: max
     permissions:
       contents: write
 
@@ -212,7 +217,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ steps.release-metadata.outputs.tag }}
-          RELEASE_TARGET_SHA: ${{ steps.release-metadata.outputs.target_sha }}
+          RELEASE_SHA: ${{ steps.release-metadata.outputs.target_sha }}
         run: |
           $assetRoot = [System.IO.Path]::GetFullPath((Join-Path $PWD 'release-assets'))
           $expectedNames = @('Scribe-Setup.exe', 'Scribe-windows-x64.zip')
@@ -228,10 +233,57 @@ jobs:
             }
           }
 
+          if ($env:GITHUB_EVENT_NAME -eq 'workflow_dispatch') {
+            $createTagResult = @(& gh api --method POST "repos/$env:GITHUB_REPOSITORY/git/refs" `
+              -f "ref=refs/tags/$env:RELEASE_TAG" `
+              -f "sha=$env:RELEASE_SHA" `
+              --silent 2>&1)
+            $createTagExit = $LASTEXITCODE
+            if ($createTagExit -ne 0) {
+              throw "Could not atomically create tag $env:RELEASE_TAG at $env:RELEASE_SHA; refusing publication: $($createTagResult -join ' ')"
+            }
+
+            $remoteRef = @(& gh api "repos/$env:GITHUB_REPOSITORY/git/ref/tags/$env:RELEASE_TAG" `
+              --jq '.object.type + " " + .object.sha' 2>&1)
+            $remoteRefExit = $LASTEXITCODE
+            if ($remoteRefExit -ne 0 -or $remoteRef.Count -ne 1) {
+              throw "Could not verify newly created tag $env:RELEASE_TAG; refusing publication: $($remoteRef -join ' ')"
+            }
+            $remoteRefParts = $remoteRef[0] -split ' ', 2
+            if ($remoteRefParts.Count -ne 2 -or
+                $remoteRefParts[0] -cne 'commit' -or
+                $remoteRefParts[1] -cne $env:RELEASE_SHA) {
+              throw "New tag $env:RELEASE_TAG does not resolve exactly to commit $env:RELEASE_SHA; received $($remoteRef -join ' ')"
+            }
+          } else {
+            $remoteRefs = @(& git ls-remote --exit-code origin `
+              "refs/tags/$env:RELEASE_TAG" `
+              "refs/tags/$env:RELEASE_TAG^{}" 2>&1)
+            $remoteRefsExit = $LASTEXITCODE
+            if ($remoteRefsExit -ne 0) {
+              throw "Could not read pushed tag $env:RELEASE_TAG; refusing publication: $($remoteRefs -join ' ')"
+            }
+            $parsedRemoteRefs = @($remoteRefs | ForEach-Object {
+              $parts = $_ -split '\s+', 2
+              if ($parts.Count -eq 2) {
+                [pscustomobject]@{ Sha = $parts[0]; Ref = $parts[1] }
+              }
+            })
+            $directTags = @($parsedRemoteRefs | Where-Object { $_.Ref -ceq "refs/tags/$env:RELEASE_TAG" })
+            $peeledTags = @($parsedRemoteRefs | Where-Object { $_.Ref -ceq "refs/tags/$env:RELEASE_TAG^{}" })
+            if ($directTags.Count -ne 1 -or $peeledTags.Count -gt 1) {
+              throw "Expected one remote tag and at most one peeled tag for $env:RELEASE_TAG"
+            }
+            $resolvedTagSha = if ($peeledTags.Count -eq 1) { $peeledTags[0].Sha } else { $directTags[0].Sha }
+            if ($resolvedTagSha -cne $env:RELEASE_SHA) {
+              throw "Pushed tag $env:RELEASE_TAG resolves to $resolvedTagSha instead of workflow commit $env:RELEASE_SHA"
+            }
+          }
+
           gh release create $env:RELEASE_TAG $expectedPaths `
             --draft=false `
             --generate-notes `
             --latest `
             --prerelease=false `
             --title $env:RELEASE_TAG `
-            --target $env:RELEASE_TARGET_SHA
+            --verify-tag
