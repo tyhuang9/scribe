@@ -67,12 +67,34 @@ fn main() -> eframe::Result<()> {
     }
     configure_graphics_environment();
 
+    #[cfg(all(feature = "ui-harness", debug_assertions))]
+    let demo_transcript = match ui::fixture_from_env() {
+        Some(ui::Fixture::DemoAudio) => match ui::transcribe_demo_audio_from_env() {
+            Ok(Some(transcript)) => Some(transcript),
+            Ok(None) => {
+                eprintln!("Scribe demo playback requires SCRIBE_DEMO_AUDIO to name a WAV file.");
+                None
+            }
+            Err(error) => {
+                eprintln!("Scribe demo playback could not start: {error}");
+                None
+            }
+        },
+        _ => None,
+    };
+
     let result = eframe::run_native(
         "Scribe",
         native_options(),
-        Box::new(|cc| {
+        Box::new(move |cc| {
             #[cfg(all(feature = "ui-harness", debug_assertions))]
-            if let Some(fixture) = ui::fixture_from_env() {
+            if let Some(transcript) = demo_transcript {
+                return Box::new(ui::UiHarnessApp::new_demo_audio(cc, transcript));
+            }
+            #[cfg(all(feature = "ui-harness", debug_assertions))]
+            if let Some(fixture) = ui::fixture_from_env()
+                && fixture != ui::Fixture::DemoAudio
+            {
                 return Box::new(ui::UiHarnessApp::new(cc, fixture));
             }
             Box::new(app::LocalTranscriberApp::new(cc))
