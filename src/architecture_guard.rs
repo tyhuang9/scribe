@@ -443,6 +443,9 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
         .expect("bundled model packaging script must be readable");
     for required in [
         "Get-FileHash",
+        "Invoke-NativeProcess",
+        "RedirectStandardOutput",
+        "WaitForExit",
         "--scribe-install-smoke-parent",
         "HF_HUB_OFFLINE",
         "TRANSFORMERS_OFFLINE",
@@ -480,6 +483,9 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
         "README.txt",
         "Assert-WindowsGuiSubsystem",
         "Windows GUI (2)",
+        "Invoke-NativeProcess",
+        "RedirectStandardOutput",
+        "WaitForExit",
         "Move-Item -LiteralPath $stagingBundle -Destination $finalBundle",
         r#"artifacts\Scribe-windows-x64"#,
         "Final release bundle already exists",
