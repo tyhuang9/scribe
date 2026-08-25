@@ -14,6 +14,14 @@ manual and compatibility evidence; see
 `docs/SCRIBE_REVAMP_IMPLEMENTATION_REPORT.md` and the newer
 `docs/EMBEDDED_STT_AND_MODELS.md` implementation record.
 
+## Download
+
+[Download the latest Windows installer →](https://github.com/tyhuang9/scribe/releases/latest/download/Scribe-Setup.exe)
+
+[View releases and previous versions](https://github.com/tyhuang9/scribe/releases)
+
+See the [installation documentation](https://tyhuang9.github.io/scribe/install-and-run/) for installation and Windows security guidance. The installer is currently unsigned, so Windows may show a publisher warning; verify that the download came from the Scribe GitHub release before continuing.
+
 The application/runtime boundary remains narrow. Scribe may invoke the selected
 runtime during startup integrity/health validation, and it starts session model
 loading concurrently when the user records audio.
@@ -289,13 +297,15 @@ and raw error chains, and refuses to overwrite an existing report.
 
 ## Windows release downloads
 
-Windows x64 releases are published from GitHub Actions when a `v*` tag is
-created. Download `Scribe-Setup-<version>.exe` from the GitHub release for a
-normal per-user installation, or `Scribe-<version>-windows-x64.zip` for a
-portable copy. Both packages include the pinned English Base model, its
-attribution notices, the compatible runtime files, and a hash inventory. For a
-portable install, extract the entire ZIP and run `local-transcriber.exe`; the
-executable alone is not a supported distribution.
+Windows x64 releases are published from GitHub Actions when an exact semantic
+`v*` tag is created. The permanent latest-download URL always serves
+[`Scribe-Setup.exe`](https://github.com/tyhuang9/scribe/releases/latest/download/Scribe-Setup.exe);
+previous installers remain available from the [Releases page](https://github.com/tyhuang9/scribe/releases).
+The per-user installer includes the pinned English Base model, attribution
+notices, compatible runtime files, and a hash inventory. It is currently
+unsigned, so Windows may show a publisher warning. Confirm the release page and
+download URL before choosing the Windows option to continue. See
+[RELEASING.md](RELEASING.md) for the maintained packaging and release process.
 
 ## Config
 
