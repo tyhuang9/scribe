@@ -171,6 +171,52 @@ try {
         $workflow -match "Copy-Item target\\release\\local-transcriber\.exe") {
         throw "Windows release workflow must package the validated full bundle, not a bare executable."
     }
+    foreach ($requiredPublicationGuard in @(
+        'publish_release:',
+        'type: boolean',
+        'default: false',
+        "inputs.publish_release == true",
+        "github.event.repository.default_branch",
+        "github.ref == format('refs/heads/{0}', github.event.repository.default_branch)",
+        "github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')",
+        "if: github.event_name == 'workflow_dispatch'",
+        'git ls-remote --exit-code --tags origin',
+        'Could not confirm that tag',
+        'Could not confirm that release',
+        'needs: build',
+        'name: windows-release-assets',
+        '--draft=false',
+        '--latest',
+        '--prerelease=false',
+        '--target $env:RELEASE_TARGET_SHA'
+    )) {
+        if (-not $workflow.Contains($requiredPublicationGuard)) {
+            throw "Windows release workflow must retain publication guard: $requiredPublicationGuard"
+        }
+    }
+
+    $readme = Get-Content -LiteralPath (Join-Path $repositoryRoot "README.md") -Raw
+    $canonicalReleaseAssets = @('Scribe-Setup.exe', 'Scribe-windows-x64.zip')
+    $latestDownloadMatches = @(
+        [regex]::Matches($readme, 'releases/latest/download/(?<asset>[^"?#<]+)')
+    )
+    $readmeReleaseAssets = @($latestDownloadMatches | ForEach-Object { $_.Groups['asset'].Value })
+    if ($readmeReleaseAssets.Count -ne $canonicalReleaseAssets.Count) {
+        throw "README must link exactly the canonical installer and portable ZIP release assets."
+    }
+    foreach ($canonicalAsset in $canonicalReleaseAssets) {
+        if (@($readmeReleaseAssets | Where-Object { $_ -ceq $canonicalAsset }).Count -ne 1) {
+            throw "README must link exactly once to canonical release asset $canonicalAsset."
+        }
+        if (-not $workflow.Contains("dist/$canonicalAsset") -or
+            -not $workflow.Contains("'$canonicalAsset'")) {
+            throw "Windows release workflow must upload and publish canonical README asset $canonicalAsset."
+        }
+    }
+    if ($workflow -notmatch '(?ms)release:\s+name: Create GitHub release.*?permissions:\s+contents: write' -or
+        $workflow -notmatch '(?ms)^permissions:\s+contents: read') {
+        throw "GitHub contents write permission must remain scoped to the release job."
+    }
     $installer = Get-Content -LiteralPath (Join-Path $repositoryRoot "installer\scribe.iss") -Raw
     if ($installer -notmatch 'Source: "\.\.\\dist\\portable\\\*"' -or
         $installer -notmatch "recursesubdirs" -or
