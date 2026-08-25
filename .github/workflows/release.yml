@@ -22,6 +22,10 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          # The toolchain action installs only rustc and cargo unless requested.
+          # Keep the CI formatting and linting tools available for this pinned Rust release.
+          components: rustfmt, clippy
 
       - name: Fetch locked Rust dependencies
         run: cargo fetch --locked
