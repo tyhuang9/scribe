@@ -35,7 +35,7 @@ normalized release asset is `dist\Scribe-Setup.exe`. Do not distribute a bare
 The scripts download the exact pinned runtime/model sources and verify their
 sizes and SHA-256 values before they are staged.
 
-## Publish a version
+## Publish a version from a tag
 
 1. Update the root `Cargo.toml` version and any appropriate release notes.
 2. Run the local validation and installer build above.
@@ -49,10 +49,11 @@ sizes and SHA-256 values before they are staged.
 
 5. The `Build Windows installer` workflow validates formatting, clippy, tests,
    downloads verified inputs, builds the full staged payload and Inno Setup
-   installer, verifies the installed payload, and uploads `Scribe-Setup.exe`.
+   installer, verifies the installed payload, and uploads `Scribe-Setup.exe`
+   and `Scribe-windows-x64.zip`.
    For a matching exact semantic tag, its release job validates the tag against
    `Cargo.toml`, then creates the GitHub Release with generated notes and that
-   installer asset.
+   exact installer and portable ZIP asset pair.
 
 The permanent latest-installer URL is:
 
@@ -62,11 +63,32 @@ Previous versions remain available at:
 
 <https://github.com/tyhuang9/scribe/releases>
 
-## Manual CI build
+## Manual validation and publication
 
-Open **Actions → Build Windows installer → Run workflow** to create a temporary
-`windows-installer` artifact. Artifacts are for validation; use the GitHub
-Release link above for a public download.
+Open **Actions → Build Windows installer → Run workflow**. The
+`publish_release` input defaults to `false`; leave it disabled for a
+validation-only build. That run performs the complete build and packaging
+checks and creates a temporary `windows-release-assets` workflow artifact, but
+it cannot create a GitHub Release.
+
+To publish without pushing a tag, select the repository's default branch and
+explicitly enable `publish_release`. Publication from any other branch is
+blocked. The workflow derives the tag as `v<package version>` from the checked
+out root `Cargo.toml` and targets exactly the default-branch commit identified
+by the workflow's `GITHUB_SHA`; there is no user-supplied release tag or target.
+It creates a stable, non-draft, non-prerelease GitHub Release containing exactly
+`Scribe-Setup.exe` and `Scribe-windows-x64.zip`, so the README's
+`releases/latest/download/...` links remain permanent.
+
+Manual publication refuses to proceed if either the derived tag or its GitHub
+Release already exists. It does not replace assets, move tags, or otherwise
+clobber a prior release. If a run fails before publication, fix the underlying
+validation or packaging problem and rerun it. If it fails after creating a tag
+or release, inspect the published state before taking action; prefer correcting
+the version in `Cargo.toml` and publishing a new version. Only a repository
+maintainer should delete an erroneous release and tag as an explicit rollback,
+after preserving any needed assets and confirming that no users or automation
+depend on that version.
 
 ## GitHub Pages
 
@@ -89,5 +111,9 @@ until a real code-signing identity and secret-management process are approved.
   size, and SHA-256 mismatch before retrying.
 - **Installer payload verification fails:** rebuild the staged `dist\portable`
   directory; the installer must include every item from `bundle-inventory.json`.
+- **Manual publication is skipped:** rerun from the repository default branch
+  and explicitly enable `publish_release`; disabled dispatches only validate.
+- **Tag or release already exists:** do not overwrite it. Confirm the existing
+  release is valid or increment `Cargo.toml` to a new version and publish that.
 - **Pages does not deploy:** confirm Pages is set to GitHub Actions and that the
   documentation change has reached `main`.
