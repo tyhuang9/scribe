@@ -171,6 +171,95 @@ try {
         $workflow -match "Copy-Item target\\release\\local-transcriber\.exe") {
         throw "Windows release workflow must package the validated full bundle, not a bare executable."
     }
+    foreach ($requiredPublicationGuard in @(
+        'publish_release:',
+        'type: boolean',
+        'default: false',
+        "inputs.publish_release == true",
+        "github.event.repository.default_branch",
+        "github.ref == format('refs/heads/{0}', github.event.repository.default_branch)",
+        "github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')",
+        "if: github.event_name == 'workflow_dispatch'",
+        'git ls-remote --exit-code --tags origin',
+        'Could not confirm that tag',
+        'Could not confirm that release',
+        'needs: build',
+        'name: windows-release-assets',
+        '& .\scripts\test-windows-release-packaging.ps1',
+        'queue: max',
+        'gh api --method POST',
+        'git/refs',
+        'ref=refs/tags/$env:RELEASE_TAG',
+        'sha=$env:RELEASE_SHA',
+        'git/ref/tags/$env:RELEASE_TAG',
+        'refs/tags/$env:RELEASE_TAG^{}',
+        "`$requiredRulesetName = 'Protect release tags'",
+        'rulesets?per_page=100',
+        "`$ruleset.target -cne 'tag'",
+        "`$ruleset.source_type -cne 'Repository'",
+        "`$ruleset.source -cne `$env:GITHUB_REPOSITORY",
+        "`$ruleset.enforcement -cne 'active'",
+        "`$includedRefs[0] -cne 'refs/tags/v*'",
+        "`$excludedRefs.Count -ne 0",
+        "`$ruleset.bypass_actors",
+        "`$_ -ceq 'update'",
+        "`$_ -ceq 'deletion'",
+        "`$_ -ceq 'creation'",
+        '--draft=false',
+        '--latest',
+        '--prerelease=false',
+        '--verify-tag'
+    )) {
+        if (-not $workflow.Contains($requiredPublicationGuard)) {
+            throw "Windows release workflow must retain publication guard: $requiredPublicationGuard"
+        }
+    }
+
+    $readme = Get-Content -LiteralPath (Join-Path $repositoryRoot "README.md") -Raw
+    $canonicalReleaseAssets = @('Scribe-Setup.exe', 'Scribe-windows-x64.zip')
+    $latestDownloadMatches = @(
+        [regex]::Matches($readme, 'releases/latest/download/(?<asset>[^"?#<]+)')
+    )
+    $readmeReleaseAssets = @($latestDownloadMatches | ForEach-Object { $_.Groups['asset'].Value })
+    if ($readmeReleaseAssets.Count -ne $canonicalReleaseAssets.Count) {
+        throw "README must link exactly the canonical installer and portable ZIP release assets."
+    }
+    foreach ($canonicalAsset in $canonicalReleaseAssets) {
+        if (@($readmeReleaseAssets | Where-Object { $_ -ceq $canonicalAsset }).Count -ne 1) {
+            throw "README must link exactly once to canonical release asset $canonicalAsset."
+        }
+        if (-not $workflow.Contains("dist/$canonicalAsset") -or
+            -not $workflow.Contains("'$canonicalAsset'")) {
+            throw "Windows release workflow must upload and publish canonical README asset $canonicalAsset."
+        }
+    }
+    if ($workflow.Contains('--target $env:RELEASE_TARGET_SHA') -or
+        $workflow.Contains('cancel-in-progress:')) {
+        throw "Windows release publication must use verified atomic tags and non-cancelling queued concurrency."
+    }
+    $contractTestPosition = $workflow.IndexOf('& .\scripts\test-windows-release-packaging.ps1')
+    $releaseInputPosition = $workflow.IndexOf('prepare-windows-release-inputs.ps1')
+    $releaseBuildPosition = $workflow.IndexOf('build-windows-release.ps1')
+    if ($contractTestPosition -lt 0 -or
+        $contractTestPosition -ge $releaseInputPosition -or
+        $contractTestPosition -ge $releaseBuildPosition) {
+        throw "Windows release packaging contracts must run before release input preparation and build."
+    }
+    $assetValidationPosition = $workflow.IndexOf("`$assetRoot =")
+    $rulesetPreflightPosition = $workflow.IndexOf("`$requiredRulesetName = 'Protect release tags'")
+    $atomicTagPosition = $workflow.IndexOf('gh api --method POST')
+    $releaseCreationPosition = $workflow.IndexOf('gh release create')
+    if ($assetValidationPosition -lt 0 -or
+        $rulesetPreflightPosition -le $assetValidationPosition -or
+        $atomicTagPosition -le $rulesetPreflightPosition -or
+        $atomicTagPosition -le $assetValidationPosition -or
+        $releaseCreationPosition -le $atomicTagPosition) {
+        throw "Release-tag rules must be verified before atomic tag creation and release publication."
+    }
+    if ($workflow -notmatch '(?ms)release:\s+name: Create GitHub release.*?permissions:\s+contents: write' -or
+        $workflow -notmatch '(?ms)^permissions:\s+contents: read') {
+        throw "GitHub contents write permission must remain scoped to the release job."
+    }
     $installer = Get-Content -LiteralPath (Join-Path $repositoryRoot "installer\scribe.iss") -Raw
     if ($installer -notmatch 'Source: "\.\.\\dist\\portable\\\*"' -or
         $installer -notmatch "recursesubdirs" -or

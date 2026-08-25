@@ -3,6 +3,12 @@ name: Build Windows installer
 on:
   pull_request:
   workflow_dispatch:
+    inputs:
+      publish_release:
+        description: Publish a stable GitHub Release from the default branch after validation
+        required: true
+        type: boolean
+        default: false
   push:
     branches: [main]
     tags: ["v*"]
@@ -19,6 +25,11 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v5
+
+      - name: Test Windows release packaging contracts
+        shell: pwsh
+        run: |
+          & .\scripts\test-windows-release-packaging.ps1
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@1.96.0
@@ -115,27 +126,84 @@ jobs:
 
   release:
     name: Create GitHub release
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    if: >-
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) ||
+      (github.event_name == 'workflow_dispatch' && inputs.publish_release == true &&
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
     needs: build
     runs-on: windows-latest
+    concurrency:
+      group: windows-release-publication
+      queue: max
     permissions:
       contents: write
 
     steps:
-      - name: Check out tagged source
+      - name: Check out release source
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          ref: ${{ github.sha }}
 
-      - name: Validate semantic tag and application version
+      - name: Resolve and validate release metadata
+        id: release-metadata
         shell: pwsh
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
-          $tag = $env:GITHUB_REF_NAME
-          if ($tag -notmatch '^v\d+\.\d+\.\d+$') {
-            throw "Release tags must be exact semantic versions such as v0.2.0; received $tag"
+          $versionMatches = @(Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"')
+          if ($versionMatches.Count -ne 1) {
+            throw "Expected exactly one package version in Cargo.toml; found $($versionMatches.Count)"
           }
-          $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches.Groups[1].Value
-          if (-not $version) { throw "Could not read the package version from Cargo.toml" }
-          if ($tag -ne "v$version") {
-            throw "Release tag $tag does not match Cargo.toml version $version"
+          $version = $versionMatches[0].Matches.Groups[1].Value
+          $derivedTag = "v$version"
+          if ($derivedTag -notmatch '^v\d+\.\d+\.\d+$') {
+            throw "Cargo.toml package version must be an exact semantic version; received $version"
+          }
+
+          if ($env:GITHUB_EVENT_NAME -eq 'push') {
+            $tag = $env:GITHUB_REF_NAME
+            if ($tag -notmatch '^v\d+\.\d+\.\d+$') {
+              throw "Release tags must be exact semantic versions such as v0.2.0; received $tag"
+            }
+            if ($tag -ne $derivedTag) {
+              throw "Release tag $tag does not match Cargo.toml version $version"
+            }
+          } elseif ($env:GITHUB_EVENT_NAME -eq 'workflow_dispatch') {
+            $expectedRef = "refs/heads/$env:DEFAULT_BRANCH"
+            if ($env:GITHUB_REF -ne $expectedRef) {
+              throw "Manual release publication is restricted to the default branch $env:DEFAULT_BRANCH"
+            }
+            $tag = $derivedTag
+          } else {
+            throw "Unsupported release event $env:GITHUB_EVENT_NAME"
+          }
+
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "target_sha=$env:GITHUB_SHA" >> $env:GITHUB_OUTPUT
+
+      - name: Refuse duplicate manual release
+        if: github.event_name == 'workflow_dispatch'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release-metadata.outputs.tag }}
+        run: |
+          $null = & git ls-remote --exit-code --tags origin "refs/tags/$env:RELEASE_TAG" 2>$null
+          $tagLookupExit = $LASTEXITCODE
+          if ($tagLookupExit -eq 0) {
+            throw "Tag $env:RELEASE_TAG already exists; refusing to overwrite it"
+          }
+          if ($tagLookupExit -ne 2) {
+            throw "Could not confirm that tag $env:RELEASE_TAG is absent (git exit $tagLookupExit)"
+          }
+
+          $releaseLookup = @(& gh api "repos/$env:GITHUB_REPOSITORY/releases/tags/$env:RELEASE_TAG" --silent 2>&1)
+          $releaseLookupExit = $LASTEXITCODE
+          if ($releaseLookupExit -eq 0) {
+            throw "Release $env:RELEASE_TAG already exists; refusing to overwrite it"
+          }
+          if (($releaseLookup -join "`n") -notmatch '\(HTTP 404\)') {
+            throw "Could not confirm that release $env:RELEASE_TAG is absent: $($releaseLookup -join ' ')"
           }
 
       - name: Download verified release assets
@@ -148,7 +216,150 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release-metadata.outputs.tag }}
+          RELEASE_SHA: ${{ steps.release-metadata.outputs.target_sha }}
         run: |
-          $assets = @(Get-ChildItem -LiteralPath release-assets -File)
-          if ($assets.Count -ne 2) { throw "Expected installer and portable ZIP; found $($assets.Count) release assets" }
-          gh release create $env:GITHUB_REF_NAME $assets.FullName --generate-notes --title $env:GITHUB_REF_NAME
+          $assetRoot = [System.IO.Path]::GetFullPath((Join-Path $PWD 'release-assets'))
+          $expectedNames = @('Scribe-Setup.exe', 'Scribe-windows-x64.zip')
+          $expectedPaths = @($expectedNames | ForEach-Object { Join-Path $assetRoot $_ })
+          $assets = @(Get-ChildItem -LiteralPath $assetRoot -File -Recurse)
+          if ($assets.Count -ne $expectedPaths.Count) {
+            throw "Expected exactly $($expectedPaths.Count) release assets; found $($assets.Count)"
+          }
+          foreach ($expectedPath in $expectedPaths) {
+            $matches = @($assets | Where-Object { $_.FullName -ceq $expectedPath })
+            if ($matches.Count -ne 1) {
+              throw "Expected exactly one canonical release asset at $expectedPath; found $($matches.Count)"
+            }
+          }
+
+          $requiredRulesetName = 'Protect release tags'
+          $rulesetIds = @(& gh api --paginate `
+            "repos/$env:GITHUB_REPOSITORY/rulesets?per_page=100" `
+            --jq ".[] | select(.name == `"$requiredRulesetName`") | .id" 2>&1)
+          $rulesetListExit = $LASTEXITCODE
+          if ($rulesetListExit -ne 0) {
+            throw "Could not list repository rulesets; refusing publication: $($rulesetIds -join ' ')"
+          }
+          if ($rulesetIds.Count -ne 1 -or $rulesetIds[0] -notmatch '^\d+$') {
+            throw "Expected exactly one repository ruleset named $requiredRulesetName; found $($rulesetIds.Count)"
+          }
+
+          $rulesetResponse = @(& gh api `
+            "repos/$env:GITHUB_REPOSITORY/rulesets/$($rulesetIds[0])" 2>&1)
+          $rulesetDetailExit = $LASTEXITCODE
+          if ($rulesetDetailExit -ne 0) {
+            throw "Could not read repository ruleset $requiredRulesetName; refusing publication: $($rulesetResponse -join ' ')"
+          }
+          try {
+            $ruleset = ($rulesetResponse -join "`n") | ConvertFrom-Json -Depth 100
+          } catch {
+            throw "Could not parse repository ruleset $requiredRulesetName; refusing publication: $($_.Exception.Message)"
+          }
+          foreach ($requiredProperty in @('name', 'target', 'source_type', 'source', 'enforcement', 'conditions', 'rules', 'bypass_actors')) {
+            if ($null -eq $ruleset.PSObject.Properties[$requiredProperty]) {
+              throw "Repository ruleset $requiredRulesetName is missing required property $requiredProperty"
+            }
+          }
+          if ($ruleset.name -cne $requiredRulesetName -or
+              $ruleset.target -cne 'tag' -or
+              $ruleset.source_type -cne 'Repository' -or
+              $ruleset.source -cne $env:GITHUB_REPOSITORY -or
+              $ruleset.enforcement -cne 'active') {
+            throw "Ruleset $requiredRulesetName must be an active tag ruleset owned by $env:GITHUB_REPOSITORY"
+          }
+          if ($null -eq $ruleset.conditions -or
+              $null -eq $ruleset.conditions.PSObject.Properties['ref_name']) {
+            throw "Repository ruleset $requiredRulesetName must define ref-name conditions"
+          }
+          $refName = $ruleset.conditions.ref_name
+          if ($null -eq $refName -or
+              $null -eq $refName.PSObject.Properties['include'] -or
+              $null -eq $refName.PSObject.Properties['exclude'] -or
+              $refName.include -isnot [System.Array] -or
+              $refName.exclude -isnot [System.Array]) {
+            throw "Repository ruleset $requiredRulesetName must define unambiguous ref includes and exclusions"
+          }
+          $includedRefs = @($refName.include)
+          $excludedRefs = @($refName.exclude)
+          if ($includedRefs.Count -ne 1 -or $includedRefs[0] -cne 'refs/tags/v*') {
+            throw "Repository ruleset $requiredRulesetName must include exactly refs/tags/v*"
+          }
+          if ($excludedRefs.Count -ne 0) {
+            throw "Repository ruleset $requiredRulesetName must not exclude any refs"
+          }
+          if ($ruleset.bypass_actors -isnot [System.Array] -or
+              @($ruleset.bypass_actors).Count -ne 0) {
+            throw "Repository ruleset $requiredRulesetName must not allow bypass actors"
+          }
+          if ($ruleset.rules -isnot [System.Array]) {
+            throw "Repository ruleset $requiredRulesetName must define an unambiguous rules array"
+          }
+          $ruleTypes = @($ruleset.rules | ForEach-Object {
+            if ($null -eq $_.PSObject.Properties['type'] -or $_.type -isnot [string]) {
+              throw "Repository ruleset $requiredRulesetName contains a rule without a valid type"
+            }
+            $_.type
+          })
+          if (@($ruleTypes | Where-Object { $_ -ceq 'update' }).Count -ne 1 -or
+              @($ruleTypes | Where-Object { $_ -ceq 'deletion' }).Count -ne 1) {
+            throw "Repository ruleset $requiredRulesetName must restrict tag updates and deletions"
+          }
+          if (@($ruleTypes | Where-Object { $_ -ceq 'creation' }).Count -ne 0) {
+            throw "Repository ruleset $requiredRulesetName must allow creation of new matching tags"
+          }
+
+          if ($env:GITHUB_EVENT_NAME -eq 'workflow_dispatch') {
+            $createTagResult = @(& gh api --method POST "repos/$env:GITHUB_REPOSITORY/git/refs" `
+              -f "ref=refs/tags/$env:RELEASE_TAG" `
+              -f "sha=$env:RELEASE_SHA" `
+              --silent 2>&1)
+            $createTagExit = $LASTEXITCODE
+            if ($createTagExit -ne 0) {
+              throw "Could not atomically create tag $env:RELEASE_TAG at $env:RELEASE_SHA; refusing publication: $($createTagResult -join ' ')"
+            }
+
+            $remoteRef = @(& gh api "repos/$env:GITHUB_REPOSITORY/git/ref/tags/$env:RELEASE_TAG" `
+              --jq '.object.type + " " + .object.sha' 2>&1)
+            $remoteRefExit = $LASTEXITCODE
+            if ($remoteRefExit -ne 0 -or $remoteRef.Count -ne 1) {
+              throw "Could not verify newly created tag $env:RELEASE_TAG; refusing publication: $($remoteRef -join ' ')"
+            }
+            $remoteRefParts = $remoteRef[0] -split ' ', 2
+            if ($remoteRefParts.Count -ne 2 -or
+                $remoteRefParts[0] -cne 'commit' -or
+                $remoteRefParts[1] -cne $env:RELEASE_SHA) {
+              throw "New tag $env:RELEASE_TAG does not resolve exactly to commit $env:RELEASE_SHA; received $($remoteRef -join ' ')"
+            }
+          } else {
+            $remoteRefs = @(& git ls-remote --exit-code origin `
+              "refs/tags/$env:RELEASE_TAG" `
+              "refs/tags/$env:RELEASE_TAG^{}" 2>&1)
+            $remoteRefsExit = $LASTEXITCODE
+            if ($remoteRefsExit -ne 0) {
+              throw "Could not read pushed tag $env:RELEASE_TAG; refusing publication: $($remoteRefs -join ' ')"
+            }
+            $parsedRemoteRefs = @($remoteRefs | ForEach-Object {
+              $parts = $_ -split '\s+', 2
+              if ($parts.Count -eq 2) {
+                [pscustomobject]@{ Sha = $parts[0]; Ref = $parts[1] }
+              }
+            })
+            $directTags = @($parsedRemoteRefs | Where-Object { $_.Ref -ceq "refs/tags/$env:RELEASE_TAG" })
+            $peeledTags = @($parsedRemoteRefs | Where-Object { $_.Ref -ceq "refs/tags/$env:RELEASE_TAG^{}" })
+            if ($directTags.Count -ne 1 -or $peeledTags.Count -gt 1) {
+              throw "Expected one remote tag and at most one peeled tag for $env:RELEASE_TAG"
+            }
+            $resolvedTagSha = if ($peeledTags.Count -eq 1) { $peeledTags[0].Sha } else { $directTags[0].Sha }
+            if ($resolvedTagSha -cne $env:RELEASE_SHA) {
+              throw "Pushed tag $env:RELEASE_TAG resolves to $resolvedTagSha instead of workflow commit $env:RELEASE_SHA"
+            }
+          }
+
+          gh release create $env:RELEASE_TAG $expectedPaths `
+            --draft=false `
+            --generate-notes `
+            --latest `
+            --prerelease=false `
+            --title $env:RELEASE_TAG `
+            --verify-tag
