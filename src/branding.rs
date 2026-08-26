@@ -16,9 +16,31 @@ pub(crate) const DEEP_NAVY: Color32 = Color32::from_rgb(0x06, 0x1C, 0x2E);
 pub(crate) const NAVY_SURFACE: Color32 = DEEP_INK;
 pub(crate) const TEAL_ACCENT: Color32 = Color32::from_rgb(0x7C, 0xCB, 0xC9);
 
-const BAR_X: [f32; 7] = [0.16, 0.273, 0.387, 0.5, 0.613, 0.727, 0.84];
-const BAR_HEIGHT: [f32; 7] = [0.38, 0.62, 0.78, 0.94, 0.78, 0.62, 0.38];
-const BAR_WIDTH: f32 = 0.085;
+const BAR_X: [f32; 7] = [
+    20.5 / 128.0,
+    35.5 / 128.0,
+    49.5 / 128.0,
+    64.5 / 128.0,
+    78.5 / 128.0,
+    92.5 / 128.0,
+    107.5 / 128.0,
+];
+const BAR_HEIGHT: [f32; 7] = [
+    48.0 / 128.0,
+    80.0 / 128.0,
+    100.0 / 128.0,
+    120.0 / 128.0,
+    100.0 / 128.0,
+    80.0 / 128.0,
+    48.0 / 128.0,
+];
+const BAR_WIDTH: f32 = 11.0 / 128.0;
+const S_STROKE_WIDTH: f32 = 16.6 / 128.0;
+const S_CURVES: [[(f32, f32); 4]; 3] = [
+    [(0.70, 0.28), (0.61, 0.16), (0.35, 0.18), (0.30, 0.37)],
+    [(0.30, 0.37), (0.26, 0.54), (0.72, 0.47), (0.68, 0.66)],
+    [(0.68, 0.66), (0.65, 0.84), (0.37, 0.84), (0.28, 0.70)],
+];
 
 pub(crate) fn show_mark(ui: &mut egui::Ui, size: f32, announce: bool) -> Response {
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
@@ -54,7 +76,7 @@ pub(crate) fn paint_mark(painter: &egui::Painter, rect: Rect, dark_mode: bool) {
     }
 
     let points = s_curve_points(rect, 10);
-    let stroke_width = size * 0.13;
+    let stroke_width = size * S_STROKE_WIDTH;
     painter.add(egui::Shape::line(
         points.clone(),
         Stroke::new(stroke_width, Color32::WHITE),
@@ -160,13 +182,8 @@ fn distance_to_segment(point: Pos2, start: Pos2, end: Pos2) -> f32 {
 }
 
 fn s_curve_points(rect: Rect, segments_per_curve: usize) -> Vec<Pos2> {
-    let normalized_curves = [
-        [(0.70, 0.28), (0.61, 0.16), (0.35, 0.18), (0.30, 0.37)],
-        [(0.30, 0.37), (0.26, 0.54), (0.72, 0.47), (0.68, 0.66)],
-        [(0.68, 0.66), (0.65, 0.84), (0.37, 0.84), (0.28, 0.70)],
-    ];
-    let mut points = Vec::with_capacity(segments_per_curve * normalized_curves.len() + 1);
-    for (curve_index, curve) in normalized_curves.into_iter().enumerate() {
+    let mut points = Vec::with_capacity(segments_per_curve * S_CURVES.len() + 1);
+    for (curve_index, curve) in S_CURVES.into_iter().enumerate() {
         for step in 0..=segments_per_curve {
             if curve_index > 0 && step == 0 {
                 continue;
@@ -202,6 +219,94 @@ fn s_curve_points(rect: Rect, segments_per_curve: usize) -> Vec<Pos2> {
 mod tests {
     use super::*;
 
+    const MARK_SVG: &str = include_str!("../assets/branding/scribe-mark.svg");
+    const LIGHT_LOCKUP_SVG: &str = include_str!("../assets/branding/scribe-lockup-light.svg");
+    const DARK_LOCKUP_SVG: &str = include_str!("../assets/branding/scribe-lockup-dark.svg");
+
+    fn attribute<'a>(tag: &'a str, name: &str) -> &'a str {
+        let prefix = format!("{name}=\"");
+        let start = tag.find(&prefix).expect("SVG attribute") + prefix.len();
+        let end = tag[start..].find('"').expect("closing quote") + start;
+        &tag[start..end]
+    }
+
+    fn mark_rects(svg: &str) -> Vec<(f32, f32, f32, f32)> {
+        svg.match_indices("<rect")
+            .filter_map(|(start, _)| {
+                let end = svg[start..].find("/>")? + start + 2;
+                let tag = &svg[start..end];
+                (attribute(tag, "width") == "11").then(|| {
+                    (
+                        attribute(tag, "x").parse().unwrap(),
+                        attribute(tag, "y").parse().unwrap(),
+                        attribute(tag, "width").parse().unwrap(),
+                        attribute(tag, "height").parse().unwrap(),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    fn bar_centers_for_fill(svg: &str, fill: &str) -> Vec<f32> {
+        let group_start = svg
+            .find(&format!("<g fill=\"{fill}\">"))
+            .expect("brand color group");
+        let group_end = svg[group_start..].find("</g>").expect("color group close") + group_start;
+        let mut centers = mark_rects(&svg[group_start..group_end])
+            .into_iter()
+            .map(|(x, _, width, _)| (x + width / 2.0) / 128.0)
+            .collect::<Vec<_>>();
+        centers.sort_by(f32::total_cmp);
+        centers
+    }
+
+    fn path_data(svg: &str) -> &str {
+        let start = svg.find("<path").expect("S path");
+        let end = svg[start..].find("/>").expect("path close") + start + 2;
+        attribute(&svg[start..end], "d")
+    }
+
+    fn path_numbers(path: &str) -> Vec<f32> {
+        path.split(|character: char| {
+            !(character.is_ascii_digit() || matches!(character, '.' | '-'))
+        })
+        .filter(|part| !part.is_empty())
+        .map(|part| part.parse().expect("numeric SVG path coordinate"))
+        .collect()
+    }
+
+    fn assert_mark_geometry(svg: &str) {
+        let mut rects = mark_rects(svg);
+        rects.sort_by(|left, right| left.0.total_cmp(&right.0));
+        assert_eq!(rects.len(), BAR_X.len());
+        for ((x, y, width, height), (&center_x, &normalized_height)) in
+            rects.into_iter().zip(BAR_X.iter().zip(&BAR_HEIGHT))
+        {
+            assert!(((x + width / 2.0) / 128.0 - center_x).abs() <= f32::EPSILON);
+            assert!((height / 128.0 - normalized_height).abs() <= f32::EPSILON);
+            assert!((width / 128.0 - BAR_WIDTH).abs() <= f32::EPSILON);
+            assert!(((y + height / 2.0) / 128.0 - 0.5).abs() <= f32::EPSILON);
+        }
+
+        let actual = path_numbers(path_data(svg));
+        let expected = S_CURVES
+            .iter()
+            .enumerate()
+            .flat_map(|(curve_index, curve)| curve.iter().skip(usize::from(curve_index > 0)))
+            .flat_map(|(x, y)| [x * 128.0, y * 128.0])
+            .collect::<Vec<_>>();
+        assert_eq!(actual.len(), expected.len());
+        for (actual, expected) in actual.into_iter().zip(expected) {
+            assert!((actual - expected).abs() <= 0.06);
+        }
+        let path_start = svg.find("<path").unwrap();
+        let path_end = svg[path_start..].find("/>").unwrap() + path_start + 2;
+        let path = &svg[path_start..path_end];
+        let stroke_width: f32 = attribute(path, "stroke-width").parse().unwrap();
+        assert!((stroke_width / 128.0 - S_STROKE_WIDTH).abs() <= 0.001);
+        assert_eq!(attribute(path, "stroke"), "#fff");
+    }
+
     #[test]
     fn raw_palette_matches_the_identity_contract() {
         assert_eq!(DEEP_INK.to_array(), [0x08, 0x23, 0x3A, 0xFF]);
@@ -233,6 +338,40 @@ mod tests {
                 rgba.chunks_exact(4)
                     .any(|pixel| pixel == Color32::WHITE.to_array())
             );
+        }
+    }
+
+    #[test]
+    fn canonical_svg_mark_and_lockups_match_the_native_identity_geometry() {
+        for (svg, primary_fill) in [
+            (MARK_SVG, "#2D979C"),
+            (LIGHT_LOCKUP_SVG, "#2D979C"),
+            (DARK_LOCKUP_SVG, "#7CCBC9"),
+        ] {
+            assert_mark_geometry(svg);
+            assert_eq!(
+                bar_centers_for_fill(svg, primary_fill),
+                [BAR_X[0], BAR_X[2], BAR_X[3], BAR_X[4], BAR_X[6]]
+            );
+            assert_eq!(bar_centers_for_fill(svg, "#ACDBD9"), [BAR_X[1], BAR_X[5]]);
+        }
+        assert_eq!(path_data(MARK_SVG), path_data(LIGHT_LOCKUP_SVG));
+        assert_eq!(path_data(MARK_SVG), path_data(DARK_LOCKUP_SVG));
+        assert!(MARK_SVG.contains("fill=\"#2D979C\""));
+        assert!(LIGHT_LOCKUP_SVG.contains("fill=\"#2D979C\""));
+        assert!(DARK_LOCKUP_SVG.contains("fill=\"#7CCBC9\""));
+    }
+
+    #[test]
+    fn canonical_root_lockups_match_the_theme_and_wordmark_contract() {
+        assert!(LIGHT_LOCKUP_SVG.contains("fill=\"#08233A\""));
+        assert!(DARK_LOCKUP_SVG.contains("fill=\"#061C2E\""));
+        assert!(DARK_LOCKUP_SVG.contains("fill=\"#08233A\""));
+        assert!(DARK_LOCKUP_SVG.contains("fill=\"#EAF5F5\""));
+        for svg in [LIGHT_LOCKUP_SVG, DARK_LOCKUP_SVG] {
+            assert!(svg.contains("<title id=\"title\">scribe</title>"));
+            assert!(svg.contains(">scribe</text>"));
+            assert!(svg.contains(TAGLINE));
         }
     }
 }

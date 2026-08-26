@@ -13746,11 +13746,12 @@ fn body_strong(label: &str) -> RichText {
 }
 
 fn card_title(ui: &Ui, label: &str, active: bool) -> RichText {
+    let colors = ui_palette(ui);
     let text = RichText::new(label)
         .font(FontId::proportional(15.0))
         .strong();
     if active {
-        text.color(ui_palette(ui).accent)
+        text.color(colors.text)
     } else {
         text
     }
@@ -13952,7 +13953,7 @@ fn stitch_visuals(theme_mode: ThemeMode) -> egui::Visuals {
     };
     let colors = ThemePalette::from_visuals(&visuals);
     visuals.override_text_color = Some(colors.text);
-    visuals.selection.bg_fill = colors.accent;
+    visuals.selection.bg_fill = colors.selection_fill;
     visuals.selection.stroke = Stroke::new(1.0, colors.selection_text);
     visuals.hyperlink_color = colors.accent;
     visuals.panel_fill = colors.content_bg;
@@ -15281,11 +15282,14 @@ mod layout_tests {
             (ThemeMode::Dark, ThemePalette::dark()),
         ] {
             let visuals = stitch_visuals(mode);
-            assert_eq!(visuals.selection.bg_fill, palette.accent);
+            assert_eq!(visuals.selection.bg_fill, palette.selection_fill);
             assert_eq!(visuals.selection.stroke.color, palette.selection_text);
             assert!(
                 contrast_ratio(visuals.selection.stroke.color, visuals.selection.bg_fill) >= 4.5
             );
+            for surface in [palette.card_bg, visuals.extreme_bg_color] {
+                assert!(contrast_ratio(visuals.selection.stroke.color, surface) >= 3.0);
+            }
             for stroke in [
                 visuals.widgets.inactive.bg_stroke,
                 visuals.widgets.hovered.bg_stroke,
@@ -15293,6 +15297,48 @@ mod layout_tests {
             ] {
                 assert!(contrast_ratio(stroke.color, palette.card_bg) >= 3.0);
             }
+        }
+    }
+
+    #[test]
+    fn active_playground_model_title_renders_with_accessible_card_text() {
+        for (mode, palette) in [
+            (ThemeMode::Light, ThemePalette::light()),
+            (ThemeMode::Dark, ThemePalette::dark()),
+        ] {
+            let ctx = egui::Context::default();
+            ctx.set_visuals(stitch_visuals(mode));
+            let output = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    Frame::none().fill(palette.active_card_bg).show(ui, |ui| {
+                        ui.label(card_title(ui, "Selected model", true));
+                    });
+                });
+            });
+            let title = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::epaint::Shape::Text(text) if text.galley.text() == "Selected model" => {
+                        Some(text)
+                    }
+                    _ => None,
+                })
+                .expect("selected model title should render");
+            let rendered_color = title
+                .override_text_color
+                .or_else(|| {
+                    title
+                        .galley
+                        .job
+                        .sections
+                        .first()
+                        .map(|section| section.format.color)
+                })
+                .filter(|color| *color != Color32::PLACEHOLDER)
+                .unwrap_or(title.fallback_color);
+            assert_eq!(rendered_color, palette.text);
+            assert!(contrast_ratio(rendered_color, palette.active_card_bg) >= 4.5);
         }
     }
 

@@ -39,7 +39,10 @@ pub(crate) struct ThemePalette {
     pub meter_rating_5: Color32,
     pub primary: Color32,
     pub accent: Color32,
-    /// Foreground for generic selected text on the exact accent fill.
+    /// Generic selection fill. Dark mode uses a deeper semantic teal so egui's
+    /// shared selected-text/focus stroke can remain visible in both roles.
+    pub selection_fill: Color32,
+    /// Foreground for generic selected text and egui's coupled focus frame.
     pub selection_text: Color32,
     /// Scribe teal recording mark shared by foreground and native overlay renderers.
     pub recording_waveform: Color32,
@@ -108,6 +111,7 @@ impl ThemePalette {
             meter_rating_5: Color32::from_rgb(6, 118, 71),
             primary: DEEP_INK,
             accent: SCRIBE_TEAL,
+            selection_fill: SCRIBE_TEAL,
             selection_text: DEEP_INK,
             recording_waveform: SCRIBE_TEAL,
             segmented_control_bg: SCRIBE_TEAL,
@@ -159,7 +163,8 @@ impl ThemePalette {
             meter_rating_5: TEAL_ACCENT,
             primary: ICE_MIST,
             accent: TEAL_ACCENT,
-            selection_text: DEEP_NAVY,
+            selection_fill: Color32::from_rgb(23, 111, 116),
+            selection_text: ICE_MIST,
             recording_waveform: TEAL_ACCENT,
             segmented_control_bg: TEAL_ACCENT,
             segmented_control_selected_text: ICE_MIST,
@@ -276,8 +281,9 @@ mod tests {
     #[test]
     fn generic_selection_and_control_boundary_tokens_meet_contrast_requirements() {
         for palette in [ThemePalette::light(), ThemePalette::dark()] {
-            assert!(contrast_ratio(palette.selection_text, palette.accent) >= 4.5);
+            assert!(contrast_ratio(palette.selection_text, palette.selection_fill) >= 4.5);
             for surface in [palette.card_bg, palette.panel_bg, palette.content_bg] {
+                assert!(contrast_ratio(palette.selection_text, surface) >= 3.0);
                 assert!(contrast_ratio(palette.control_border, surface) >= 3.0);
             }
         }
