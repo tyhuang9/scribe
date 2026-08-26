@@ -1,5 +1,10 @@
 //! Phase 2 native whisper.cpp runtime boundary.
 //!
+//! `worker-only native runtime`: production inference invokes this module only
+//! after the private inference-worker entrypoint has taken over the child
+//! process. The main process uses only its lightweight catalog/capability
+//! helpers; injected in-process construction is retained for unit tests.
+//!
 //! The router owns the only runtime-kind selection. The C shim owns every
 //! upstream ABI struct passed by value; Rust communicates only with an opaque
 //! handle and primitive callback values.
@@ -197,6 +202,18 @@ impl NativeBootstrapFailure {
                 .map(|root| NativePackage::compatibility_cli_path_for_root(&root))
                 .is_some_and(|cli| verify_compatibility_cli(&cli).is_ok()),
             _ => false,
+        }
+    }
+
+    pub(crate) fn compatibility_cli_path(&self) -> Option<PathBuf> {
+        match self {
+            Self::NativeLibrary {
+                compatibility_cli_path,
+                ..
+            } => Some(compatibility_cli_path.clone()),
+            Self::PackageFileMissing { path } => native_package_root(path)
+                .map(|root| NativePackage::compatibility_cli_path_for_root(&root)),
+            _ => None,
         }
     }
 }
@@ -647,10 +664,18 @@ impl RuntimeRouter {
     }
 
     pub(crate) fn handles_model(&self, model_id: &ModelId) -> bool {
+        Self::handles_model_id(model_id)
+    }
+
+    pub(crate) fn handles_model_id(model_id: &ModelId) -> bool {
         runtime_kind_for_model(model_id).is_some()
     }
 
     pub(crate) fn managed_runtime_id(&self, model_id: &ModelId) -> Option<&'static str> {
+        Self::managed_runtime_id_for(model_id)
+    }
+
+    pub(crate) fn managed_runtime_id_for(model_id: &ModelId) -> Option<&'static str> {
         if runtime_model_manifest(model_id)
             .is_some_and(|manifest| manifest.artifact_filename.ends_with(".gguf"))
         {
@@ -663,6 +688,10 @@ impl RuntimeRouter {
     }
 
     pub(crate) fn capabilities(&self, model_id: &ModelId) -> Option<RuntimeCapabilities> {
+        Self::capabilities_for_model(model_id)
+    }
+
+    pub(crate) fn capabilities_for_model(model_id: &ModelId) -> Option<RuntimeCapabilities> {
         runtime_kind_for_model(model_id).map(|kind| match kind {
             RuntimeKind::TranscribeCpp => TranscribeCppRuntime::runtime_capabilities(),
             RuntimeKind::OnnxSpeech => unreachable!("catalog models never select private ONNX"),
@@ -670,6 +699,10 @@ impl RuntimeRouter {
     }
 
     pub(crate) fn embedded_capabilities(&self) -> RuntimeCapabilities {
+        Self::embedded_runtime_capabilities()
+    }
+
+    pub(crate) fn embedded_runtime_capabilities() -> RuntimeCapabilities {
         TranscribeCppRuntime::runtime_capabilities()
     }
 

@@ -1,4 +1,8 @@
-//! Safe in-process `transcribe-cpp` adapter.
+//! Safe `transcribe-cpp` adapter.
+//!
+//! `worker-only native runtime`: production construction occurs exclusively
+//! inside the private inference child. In-process use is limited to focused
+//! unit tests that exercise the adapter without launching the application.
 //!
 //! This module is deliberately below the application-facing transcription
 //! boundary. It owns the safe crate's model/session lifecycle and converts its

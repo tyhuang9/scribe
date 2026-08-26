@@ -38,7 +38,7 @@ pub use crate::model_catalog::{
     CompatibilityStatus, ModelCapabilities, ModelDescriptor, ModelRole,
 };
 use crate::models::{SttModelInfo, TranscriptResult as LegacyTranscriptResult};
-use crate::onnx_worker::OnnxModelSpec;
+use crate::onnx_worker::{InferenceWorkerSupervisor, OnnxModelSpec};
 use crate::prepared_audio::{PREPARED_SAMPLE_RATE, PreparedAudio};
 use crate::runtime_router::{
     IdleTimeoutAction, NativeBootstrapFailure, RuntimeArtifact, RuntimeError, RuntimeExecution,
@@ -131,7 +131,8 @@ pub struct ResolvedAcceleration {
 }
 
 /// A runtime-neutral reference to a configured model catalog entry.
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct ModelId(String);
 
 impl ModelId {
@@ -173,7 +174,7 @@ impl From<&str> for ModelId {
 }
 
 /// Normalized final transcript returned by a speech engine.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Transcript {
     pub text: String,
     pub segments: Vec<TranscriptSegment>,
@@ -189,7 +190,7 @@ pub struct Transcript {
 ///
 /// Timing and confidence are optional because the current command-line
 /// adapters do not consistently provide them for every configured backend.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TranscriptSegment {
     pub text: String,
     pub start_ms: Option<u64>,
@@ -258,7 +259,7 @@ fn transcript_hypothesis(
 /// Phase 1 represents the options needed by the future common contract, but
 /// the legacy command-line route only accepts its default behavior. The
 /// service rejects an unsupported non-default option instead of ignoring it.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TranscriptionOptions {
     pub language: Option<String>,
     pub translate_to_english: bool,
@@ -725,7 +726,9 @@ struct RuntimeWorkerInner {
     commands: SyncSender<RuntimeCommand>,
     worker: Mutex<Option<std::thread::JoinHandle<()>>>,
     shutdown_gate: Mutex<()>,
-    cancellation: RuntimeRouter,
+    cancellation_generation: Arc<AtomicU64>,
+    in_process_router: Option<RuntimeRouter>,
+    inference: Option<InferenceWorkerSupervisor>,
 }
 
 impl RuntimeWorker {
@@ -742,9 +745,48 @@ impl RuntimeWorker {
                 commands,
                 worker: Mutex::new(Some(worker)),
                 shutdown_gate: Mutex::new(()),
-                cancellation: router,
+                cancellation_generation: Arc::new(AtomicU64::new(0)),
+                in_process_router: Some(router),
+                inference: None,
             }),
         }
+    }
+
+    fn new_process() -> Self {
+        cleanup_stale_temporary_audio();
+        let inference = InferenceWorkerSupervisor::unstarted();
+        let worker_inference = inference.clone();
+        let (commands, receiver) = sync_channel(1);
+        let worker = std::thread::Builder::new()
+            .name("scribe-inference-dispatch".to_owned())
+            .spawn(move || inference_worker_dispatch_loop(worker_inference, receiver))
+            .expect("Scribe could not create its inference dispatch worker");
+        Self {
+            inner: Arc::new(RuntimeWorkerInner {
+                commands,
+                worker: Mutex::new(Some(worker)),
+                shutdown_gate: Mutex::new(()),
+                cancellation_generation: Arc::new(AtomicU64::new(0)),
+                in_process_router: None,
+                inference: Some(inference),
+            }),
+        }
+    }
+
+    fn cancel_active(&self) {
+        self.inner
+            .cancellation_generation
+            .fetch_add(1, Ordering::AcqRel);
+        if let Some(router) = &self.inner.in_process_router {
+            router.cancel_active();
+        }
+        if let Some(inference) = &self.inner.inference {
+            inference.cancel_active();
+        }
+    }
+
+    fn cancellation_snapshot(&self) -> u64 {
+        self.inner.cancellation_generation.load(Ordering::Acquire)
     }
 
     fn transcribe(
@@ -755,6 +797,11 @@ impl RuntimeWorker {
         options: TranscriptionOptions,
         cancellation_snapshot: u64,
     ) -> Result<RuntimeExecution, RuntimeError> {
+        if self.cancellation_snapshot() != cancellation_snapshot {
+            return Err(RuntimeError::Engine(
+                "transcription request was cancelled before inference dispatch".to_owned(),
+            ));
+        }
         let (reply, response) = sync_channel(1);
         self.inner
             .commands
@@ -849,7 +896,13 @@ impl RuntimeWorker {
 
 impl RuntimeWorkerInner {
     fn shutdown_and_join(&self, timeout: Duration) -> bool {
-        self.cancellation.cancel_active();
+        self.cancellation_generation.fetch_add(1, Ordering::AcqRel);
+        if let Some(router) = &self.in_process_router {
+            router.cancel_active();
+        }
+        if let Some(inference) = &self.inference {
+            inference.cancel_active();
+        }
         let deadline = Instant::now() + timeout;
         let _shutdown_guard = loop {
             match self.shutdown_gate.try_lock() {
@@ -1041,21 +1094,108 @@ fn runtime_worker_loop(router: RuntimeRouter, commands: Receiver<RuntimeCommand>
     }
 }
 
+fn inference_worker_dispatch_loop(
+    inference: InferenceWorkerSupervisor,
+    commands: Receiver<RuntimeCommand>,
+) {
+    let mut idle_wait = WARM_MODEL_TTL;
+    loop {
+        let succeeded = match commands.recv_timeout(idle_wait) {
+            Ok(RuntimeCommand::Transcribe {
+                artifact,
+                preference,
+                audio,
+                options,
+                cancellation_snapshot: _,
+                reply,
+            }) => {
+                let result = inference.transcribe(artifact, preference, &audio, options);
+                let succeeded = result.is_ok();
+                let _ = reply.send(result);
+                succeeded
+            }
+            Ok(RuntimeCommand::Load {
+                artifact,
+                preference,
+                reply,
+            }) => {
+                let result = inference.load(artifact, preference);
+                let succeeded = result.is_ok();
+                let _ = reply.send(result);
+                succeeded
+            }
+            Ok(RuntimeCommand::Health {
+                artifact,
+                preference,
+                reply,
+            }) => {
+                let result = inference.health(artifact, preference);
+                let succeeded = result.is_ok();
+                let _ = reply.send(result);
+                succeeded
+            }
+            Ok(RuntimeCommand::StartStream {
+                artifact,
+                preference,
+                options,
+                reply,
+            }) => {
+                let result = inference.start_stream(artifact, preference, options);
+                let succeeded = result.is_ok();
+                let _ = reply.send(result);
+                succeeded
+            }
+            Ok(RuntimeCommand::Unload { reply }) => {
+                let result = inference.unload();
+                let succeeded = result.is_ok();
+                let _ = reply.send(result);
+                succeeded
+            }
+            Ok(RuntimeCommand::Shutdown { reply }) => {
+                let result = inference.shutdown();
+                let _ = reply.send(result);
+                break;
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                // The five-minute TTL unloads only the worker-owned model. A
+                // healthy process generation remains available for the next
+                // cold load and Hello is not repeated.
+                let _ = inference.unload();
+                idle_wait = WARM_MODEL_TTL;
+                continue;
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                let _ = inference.shutdown();
+                break;
+            }
+        };
+        idle_wait = if succeeded {
+            WARM_MODEL_TTL
+        } else {
+            // Failed changed loads are cold in the child. Keep the process,
+            // but do not claim a fresh warm interval for a model.
+            WARM_MODEL_TTL
+        };
+    }
+}
+
 /// Application-facing boundary for all transcription work.
 #[derive(Clone, Debug)]
 pub struct TranscriptionService {
     config: AppConfig,
+    #[cfg(test)]
     router: RuntimeRouter,
     worker: RuntimeWorker,
 }
 
 impl TranscriptionService {
     pub fn new(config: AppConfig) -> Self {
-        let router = RuntimeRouter::new();
+        let worker = RuntimeWorker::new_process();
         Self {
             config,
-            worker: RuntimeWorker::new(router.clone()),
-            router,
+            worker,
+            #[cfg(test)]
+            router: RuntimeRouter::new(),
         }
     }
 
@@ -1064,6 +1204,7 @@ impl TranscriptionService {
     pub fn with_config(&self, config: AppConfig) -> Self {
         Self {
             config,
+            #[cfg(test)]
             router: self.router.clone(),
             worker: self.worker.clone(),
         }
@@ -1099,7 +1240,7 @@ impl TranscriptionService {
                 self.config.performance.acceleration_preference,
                 audio,
                 options,
-                self.router.cancellation_snapshot(),
+                self.worker.cancellation_snapshot(),
             )
             .map_err(Into::into)
     }
@@ -1228,7 +1369,7 @@ impl TranscriptionService {
                     preference,
                     audio,
                     TranscriptionOptions::default(),
-                    self.router.cancellation_snapshot(),
+                    self.worker.cancellation_snapshot(),
                 )
                 .map_err(|error| anyhow!("staged ONNX bundle decode smoke failed: {error}"))?;
             ensure_install_not_cancelled(cancellation)?;
@@ -1391,12 +1532,12 @@ impl TranscriptionService {
             || config::imported_gguf_artifact(&self.config, model_id.as_str()).is_some()
         {
             return Ok(
-                persisted_capabilities.unwrap_or_else(|| self.router.embedded_capabilities())
+                persisted_capabilities.unwrap_or_else(RuntimeRouter::embedded_runtime_capabilities)
             );
         }
-        if self.router.handles_model(model_id) {
+        if RuntimeRouter::handles_model_id(model_id) {
             let runtime_capabilities = persisted_capabilities
-                .or_else(|| self.router.capabilities(model_id))
+                .or_else(|| RuntimeRouter::capabilities_for_model(model_id))
                 .ok_or_else(|| anyhow!("runtime router rejected its own selected model"))?;
             let descriptor = model_descriptor(model_id)
                 .ok_or_else(|| anyhow!("unknown normalized transcription model: {model_id}"))?;
@@ -1566,14 +1707,14 @@ impl TranscriptionService {
     /// Requests lock-free cancellation of native work submitted before this
     /// call. Later requests capture the new generation and are unaffected.
     pub fn cancel_active(&self) {
-        self.router.cancel_active();
+        self.worker.cancel_active();
         crate::stt::cancel_active_processes();
     }
 
     /// Cancels active work and waits for service requests and compatibility
     /// processes to release their transient audio resources.
     pub fn cancel_active_and_wait(&self, timeout: Duration) -> bool {
-        self.router.cancel_active();
+        self.worker.cancel_active();
         crate::stt::cancel_active_processes_and_wait(timeout)
     }
 
@@ -1588,7 +1729,7 @@ impl TranscriptionService {
     /// audio preparation or transcription to another thread.
     pub fn transcription_ticket(&self) -> TranscriptionTicket {
         TranscriptionTicket {
-            native_generation: self.router.cancellation_snapshot(),
+            native_generation: self.worker.cancellation_snapshot(),
             process_generation: crate::stt::cancellation_snapshot(),
         }
     }
@@ -1598,7 +1739,7 @@ impl TranscriptionService {
         let ticket = self.transcription_ticket();
         let registration = crate::stt::register_cancellable_request(ticket.process_generation)
             .map_err(|error| anyhow!(error))?;
-        if self.router.cancellation_snapshot() != ticket.native_generation {
+        if self.worker.cancellation_snapshot() != ticket.native_generation {
             return Err(anyhow!(
                 "transcription request was cancelled before dispatch"
             ));
@@ -1746,8 +1887,10 @@ impl TranscriptionService {
         if let Some(package_root) = runtime_model.package_root.as_deref() {
             verify_primary_runtime_package_tree(package_root)?;
         }
-        let router = RuntimeRouter::new();
-        let worker = RuntimeWorker::new(router.clone());
+        // The smoke helper itself remains lightweight and launches a fresh,
+        // disposable unified inference child so regular warm state is never
+        // loaded, unloaded, or invalidated by installation verification.
+        let worker = RuntimeWorker::new_process();
         let preference = self.config.performance.acceleration_preference;
         ensure_install_not_cancelled(cancellation)?;
 
@@ -1778,14 +1921,14 @@ impl TranscriptionService {
                 preference,
                 Arc::clone(&audio),
                 TranscriptionOptions::default(),
-                router.cancellation_snapshot(),
+                worker.cancellation_snapshot(),
             )
             .map_err(|error| anyhow!("staged transcription smoke failed: {error}"))?;
         let decode_duration_ms = decode_started.elapsed().as_millis();
         ensure_install_not_cancelled(cancellation)?;
 
-        let stale_generation = router.cancellation_snapshot();
-        router.cancel_active();
+        let stale_generation = worker.cancellation_snapshot();
+        worker.cancel_active();
         let cancellation_error = worker
             .transcribe(
                 runtime_model.clone(),
@@ -1848,7 +1991,7 @@ impl TranscriptionService {
         model_id: ModelId,
         model_path: Option<PathBuf>,
     ) -> Result<(PreviewAudioPublisher, RollingPreviewHandle)> {
-        if !self.router.handles_model(&model_id)
+        if !RuntimeRouter::handles_model_id(&model_id)
             && config::remote_gguf_artifact(&self.config, model_id.as_str()).is_none()
             && config::imported_gguf_artifact(&self.config, model_id.as_str()).is_none()
         {
@@ -1919,12 +2062,12 @@ impl TranscriptionService {
     ) -> Result<TranscriptionOutcome> {
         let task = self.begin_transcription_task()?;
         let ticket = task.ticket;
-        if self.router.cancellation_snapshot() != ticket.native_generation {
+        if self.worker.cancellation_snapshot() != ticket.native_generation {
             return Err(anyhow!(
                 "rolling preview was cancelled before native dispatch"
             ));
         }
-        if !self.router.handles_model(&request.model_id)
+        if !RuntimeRouter::handles_model_id(&request.model_id)
             && config::remote_gguf_artifact(&self.config, request.model_id.as_str()).is_none()
             && config::imported_gguf_artifact(&self.config, request.model_id.as_str()).is_none()
         {
@@ -1970,13 +2113,13 @@ impl TranscriptionService {
         task: TranscriptionTask,
     ) -> Result<TranscriptionOutcome> {
         let ticket = task.ticket;
-        if self.router.cancellation_snapshot() != ticket.native_generation {
+        if self.worker.cancellation_snapshot() != ticket.native_generation {
             return Err(anyhow!(
                 "transcription request was cancelled before dispatch"
             ));
         }
         let model = self.resolve_model(&request.model_id, request.model_path.clone())?;
-        if self.router.handles_model(&request.model_id)
+        if RuntimeRouter::handles_model_id(&request.model_id)
             || config::remote_gguf_artifact(&self.config, request.model_id.as_str()).is_some()
             || config::imported_gguf_artifact(&self.config, request.model_id.as_str()).is_some()
         {
@@ -2119,7 +2262,7 @@ impl TranscriptionService {
             None
         } else {
             Some(
-                match self.router.managed_runtime_id(&model_id) {
+                match RuntimeRouter::managed_runtime_id_for(&model_id) {
                     Some(runtime_id) => {
                         configured_managed_runtime_root(&self.config, runtime_id)?
                     }
@@ -4625,7 +4768,9 @@ mod tests {
                 commands,
                 worker: Mutex::new(Some(worker)),
                 shutdown_gate: Mutex::new(()),
-                cancellation: RuntimeRouter::new(),
+                cancellation_generation: Arc::new(AtomicU64::new(0)),
+                in_process_router: Some(RuntimeRouter::new()),
+                inference: None,
             }),
         }
     }

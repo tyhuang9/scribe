@@ -23,11 +23,30 @@ use sherpa_onnx::{
     OnlineRecognizerConfig, OnlineStream, OnlineTransducerModelConfig,
 };
 
+use crate::model_catalog::ArtifactFormat;
+use crate::prepared_audio::{PREPARED_SAMPLE_RATE, PreparedAudio};
+use crate::runtime_router::{
+    NativeBootstrapFailure, NativeRuntimeDiagnostics, RuntimeArtifact, RuntimeError,
+    RuntimeExecution, RuntimeLoadExecution, RuntimeModel, RuntimeRouter,
+};
 use crate::silero_vad_native::{SileroVadModel, VadThreshold, WINDOW_SAMPLES};
-use crate::transcription::{AccelerationPreference, ComputeDevice, ResolvedAcceleration};
+use crate::transcription::{
+    AccelerationPreference, ComputeDevice, ModelId, ResolvedAcceleration, RuntimeCapabilities,
+    SpeechStream, StreamUpdate, Transcript, TranscriptSegment, TranscriptionOptions,
+};
 
-pub(crate) const PROTOCOL_MAGIC: [u8; 4] = *b"SCON";
-pub(crate) const PROTOCOL_VERSION: u8 = 2;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
+pub(crate) const PROTOCOL_MAGIC: [u8; 4] = *b"SCIF";
+pub(crate) const PROTOCOL_VERSION: u8 = 3;
+pub(crate) const INFERENCE_WORKER_FLAG: &str = "--scribe-inference-worker";
+pub(crate) const VAD_WORKER_FLAG: &str = "--scribe-vad-worker";
+const LEGACY_ONNX_WORKER_FLAG: &str = "--onnx-worker";
 const HEADER_LEN: usize = 26;
 const MAX_CONTROL_BYTES: usize = 256 * 1024;
 const MAX_AUDIO_BYTES: usize = 16 * 1024 * 1024;
@@ -484,6 +503,19 @@ enum Control {
     Load {
         model: OnnxModelSpec,
     },
+    LoadRuntime {
+        artifact: WireRuntimeArtifact,
+        preference: AccelerationPreference,
+    },
+    BeginBatch {
+        artifact: WireRuntimeArtifact,
+        preference: AccelerationPreference,
+        options: TranscriptionOptions,
+        source_sample_rate: u32,
+        source_channels: u16,
+        source_frames: usize,
+    },
+    EndBatch,
     Transcribe,
     StartStream,
     AudioChunk,
@@ -505,6 +537,15 @@ enum Control {
     Health,
     Shutdown,
     Ready,
+    RuntimeLoaded {
+        execution: WireRuntimeLoadExecution,
+    },
+    RuntimeTranscript {
+        execution: WireRuntimeExecution,
+    },
+    RuntimeFailed {
+        error: WireRuntimeError,
+    },
     Text {
         text: String,
         final_result: bool,
@@ -525,6 +566,9 @@ impl Control {
             self,
             Self::Hello
                 | Self::Load { .. }
+                | Self::LoadRuntime { .. }
+                | Self::BeginBatch { .. }
+                | Self::EndBatch
                 | Self::Transcribe
                 | Self::StartStream
                 | Self::AudioChunk
@@ -545,6 +589,9 @@ impl Control {
         matches!(
             self,
             Self::Ready
+                | Self::RuntimeLoaded { .. }
+                | Self::RuntimeTranscript { .. }
+                | Self::RuntimeFailed { .. }
                 | Self::Text { .. }
                 | Self::VadDecision { .. }
                 | Self::Ok
@@ -617,17 +664,335 @@ trait WorkerLauncher: Send + Sync {
     fn launch(&self) -> Result<SpawnedWorker>;
 }
 
-struct OsWorkerLauncher;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkerRole {
+    Inference,
+    Vad,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WireArtifactFormat {
+    Gguf,
+    LegacyGgml,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct WireRuntimeModel {
+    id: String,
+    path: PathBuf,
+    format: WireArtifactFormat,
+    package_root: Option<PathBuf>,
+    expected_size_bytes: u64,
+    expected_sha256: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "runtime", content = "model", rename_all = "snake_case")]
+enum WireRuntimeArtifact {
+    Gguf(WireRuntimeModel),
+    LegacyCompatibility(WireRuntimeModel),
+    OnnxBundle(OnnxModelSpec),
+}
+
+impl From<RuntimeArtifact> for WireRuntimeArtifact {
+    fn from(artifact: RuntimeArtifact) -> Self {
+        match artifact {
+            RuntimeArtifact::Gguf(model) => Self::Gguf(model.into()),
+            RuntimeArtifact::LegacyCompatibility(model) => Self::LegacyCompatibility(model.into()),
+            RuntimeArtifact::OnnxBundle(model) => Self::OnnxBundle(model),
+        }
+    }
+}
+
+impl TryFrom<WireRuntimeArtifact> for RuntimeArtifact {
+    type Error = anyhow::Error;
+
+    fn try_from(artifact: WireRuntimeArtifact) -> Result<Self> {
+        Ok(match artifact {
+            WireRuntimeArtifact::Gguf(model) => Self::Gguf(model.try_into()?),
+            WireRuntimeArtifact::LegacyCompatibility(model) => {
+                Self::LegacyCompatibility(model.try_into()?)
+            }
+            WireRuntimeArtifact::OnnxBundle(model) => Self::OnnxBundle(model),
+        })
+    }
+}
+
+impl From<RuntimeModel> for WireRuntimeModel {
+    fn from(model: RuntimeModel) -> Self {
+        Self {
+            id: model.id.into_inner(),
+            path: model.path,
+            format: match model.format {
+                ArtifactFormat::Gguf => WireArtifactFormat::Gguf,
+                ArtifactFormat::LegacyGgml => WireArtifactFormat::LegacyGgml,
+            },
+            package_root: model.package_root,
+            expected_size_bytes: model.expected_size_bytes,
+            expected_sha256: model.expected_sha256,
+        }
+    }
+}
+
+impl TryFrom<WireRuntimeModel> for RuntimeModel {
+    type Error = anyhow::Error;
+
+    fn try_from(model: WireRuntimeModel) -> Result<Self> {
+        let format = match model.format {
+            WireArtifactFormat::Gguf => ArtifactFormat::Gguf,
+            WireArtifactFormat::LegacyGgml => ArtifactFormat::LegacyGgml,
+        };
+        Ok(Self {
+            id: ModelId::new(model.id),
+            path: model.path,
+            format,
+            package_root: model.package_root,
+            expected_size_bytes: model.expected_size_bytes,
+            expected_sha256: model.expected_sha256,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct WireRuntimeDiagnostics {
+    resolved_acceleration: ResolvedAcceleration,
+    native_library_path: PathBuf,
+    warm_reused: bool,
+    model_load_duration_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct WireRuntimeExecution {
+    transcript: WireTranscript,
+    diagnostics: WireRuntimeDiagnostics,
+    processing_duration_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct WireTranscript {
+    text: String,
+    segments: Vec<WireTranscriptSegment>,
+    detected_language: Option<String>,
+    duration_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct WireTranscriptSegment {
+    text: String,
+    start_ms: Option<u64>,
+    end_ms: Option<u64>,
+    confidence: Option<f32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct WireRuntimeLoadExecution {
+    diagnostics: WireRuntimeDiagnostics,
+    detected_architecture: String,
+    capabilities: RuntimeCapabilities,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct WireRuntimeError {
+    message: String,
+    compatibility_cli_path: Option<PathBuf>,
+}
+
+impl WireRuntimeError {
+    fn from_runtime(error: &RuntimeError) -> Self {
+        let compatibility_cli_path = match error {
+            RuntimeError::Bootstrap(failure) if failure.cli_fallback_eligible() => {
+                failure.compatibility_cli_path()
+            }
+            _ => None,
+        };
+        Self {
+            message: error.to_string(),
+            compatibility_cli_path,
+        }
+    }
+
+    fn into_runtime(self) -> RuntimeError {
+        match self.compatibility_cli_path {
+            Some(compatibility_cli_path) => {
+                RuntimeError::Bootstrap(NativeBootstrapFailure::NativeLibrary {
+                    message: self.message,
+                    compatibility_cli_path,
+                })
+            }
+            None => RuntimeError::WorkerUnavailable(self.message),
+        }
+    }
+}
+
+impl From<NativeRuntimeDiagnostics> for WireRuntimeDiagnostics {
+    fn from(value: NativeRuntimeDiagnostics) -> Self {
+        Self {
+            resolved_acceleration: value.resolved_acceleration,
+            native_library_path: value.native_library_path,
+            warm_reused: value.warm_reused,
+            model_load_duration_ms: u64::try_from(value.model_load_duration_ms).unwrap_or(u64::MAX),
+        }
+    }
+}
+
+impl From<WireRuntimeDiagnostics> for NativeRuntimeDiagnostics {
+    fn from(value: WireRuntimeDiagnostics) -> Self {
+        Self {
+            resolved_acceleration: value.resolved_acceleration,
+            native_library_path: value.native_library_path,
+            warm_reused: value.warm_reused,
+            model_load_duration_ms: u128::from(value.model_load_duration_ms),
+        }
+    }
+}
+
+impl From<RuntimeExecution> for WireRuntimeExecution {
+    fn from(value: RuntimeExecution) -> Self {
+        Self {
+            transcript: value.transcript.into(),
+            diagnostics: value.diagnostics.into(),
+            processing_duration_ms: u64::try_from(value.processing_duration_ms).unwrap_or(u64::MAX),
+        }
+    }
+}
+
+impl From<WireRuntimeExecution> for RuntimeExecution {
+    fn from(value: WireRuntimeExecution) -> Self {
+        Self {
+            transcript: value.transcript.into(),
+            diagnostics: value.diagnostics.into(),
+            processing_duration_ms: u128::from(value.processing_duration_ms),
+        }
+    }
+}
+
+impl From<Transcript> for WireTranscript {
+    fn from(value: Transcript) -> Self {
+        Self {
+            text: value.text,
+            segments: value.segments.into_iter().map(Into::into).collect(),
+            detected_language: value.detected_language,
+            duration_ms: value
+                .duration_ms
+                .map(|duration| u64::try_from(duration).unwrap_or(u64::MAX)),
+        }
+    }
+}
+
+impl From<WireTranscript> for Transcript {
+    fn from(value: WireTranscript) -> Self {
+        Self {
+            text: value.text,
+            segments: value.segments.into_iter().map(Into::into).collect(),
+            detected_language: value.detected_language,
+            duration_ms: value.duration_ms.map(u128::from),
+        }
+    }
+}
+
+impl From<TranscriptSegment> for WireTranscriptSegment {
+    fn from(value: TranscriptSegment) -> Self {
+        Self {
+            text: value.text,
+            start_ms: value.start_ms,
+            end_ms: value.end_ms,
+            confidence: value.confidence,
+        }
+    }
+}
+
+impl From<WireTranscriptSegment> for TranscriptSegment {
+    fn from(value: WireTranscriptSegment) -> Self {
+        Self {
+            text: value.text,
+            start_ms: value.start_ms,
+            end_ms: value.end_ms,
+            confidence: value.confidence,
+        }
+    }
+}
+
+impl From<RuntimeLoadExecution> for WireRuntimeLoadExecution {
+    fn from(value: RuntimeLoadExecution) -> Self {
+        Self {
+            diagnostics: value.diagnostics.into(),
+            detected_architecture: value.detected_architecture,
+            capabilities: value.capabilities,
+        }
+    }
+}
+
+impl From<WireRuntimeLoadExecution> for RuntimeLoadExecution {
+    fn from(value: WireRuntimeLoadExecution) -> Self {
+        Self {
+            diagnostics: value.diagnostics.into(),
+            detected_architecture: value.detected_architecture,
+            capabilities: value.capabilities,
+        }
+    }
+}
+
+fn control_allowed_for_role(control: &Control, role: WorkerRole) -> bool {
+    match role {
+        WorkerRole::Inference => !matches!(
+            control,
+            Control::LoadVad { .. }
+                | Control::StartVad { .. }
+                | Control::VadWindow
+                | Control::ResetVad
+                | Control::EndVad
+        ),
+        WorkerRole::Vad => matches!(
+            control,
+            Control::Hello
+                | Control::LoadVad { .. }
+                | Control::StartVad { .. }
+                | Control::VadWindow
+                | Control::ResetVad
+                | Control::EndVad
+                | Control::Cancel { .. }
+                | Control::Unload
+                | Control::Health
+                | Control::Shutdown
+        ),
+    }
+}
+
+struct OsWorkerLauncher {
+    role: WorkerRole,
+}
+
+impl OsWorkerLauncher {
+    const fn inference() -> Self {
+        Self {
+            role: WorkerRole::Inference,
+        }
+    }
+
+    const fn vad() -> Self {
+        Self {
+            role: WorkerRole::Vad,
+        }
+    }
+}
 
 impl WorkerLauncher for OsWorkerLauncher {
     fn launch(&self) -> Result<SpawnedWorker> {
         let executable = std::env::current_exe()?;
-        let mut child = Command::new(executable)
-            .arg("--onnx-worker")
+        let worker_flag = match self.role {
+            WorkerRole::Inference => INFERENCE_WORKER_FLAG,
+            WorkerRole::Vad => VAD_WORKER_FLAG,
+        };
+        let mut command = Command::new(executable);
+        command
+            .arg(worker_flag)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()?;
+            .stderr(Stdio::inherit());
+        configure_hidden_worker_command(&mut command);
+        let mut child = command.spawn()?;
+        let process_guard = bind_worker_process_tree(&child)?;
         let stdin = child
             .stdin
             .take()
@@ -641,13 +1006,95 @@ impl WorkerLauncher for OsWorkerLauncher {
             stdout: Box::new(stdout),
             process: Arc::new(OsWorkerProcess {
                 child: Mutex::new(child),
+                process_guard,
             }),
         })
     }
 }
 
+fn configure_hidden_worker_command(command: &mut Command) {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW};
+        command.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
+    }
+    #[cfg(unix)]
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(windows)]
+struct ProcessTreeGuard(isize);
+
+#[cfg(windows)]
+unsafe impl Send for ProcessTreeGuard {}
+#[cfg(windows)]
+unsafe impl Sync for ProcessTreeGuard {}
+
+#[cfg(windows)]
+impl Drop for ProcessTreeGuard {
+    fn drop(&mut self) {
+        if self.0 != 0 {
+            unsafe {
+                windows_sys::Win32::Foundation::CloseHandle(self.0 as _);
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+struct ProcessTreeGuard;
+
+fn bind_worker_process_tree(child: &Child) -> Result<ProcessTreeGuard> {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+            SetInformationJobObject,
+        };
+
+        let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if job.is_null() {
+            return Err(std::io::Error::last_os_error())
+                .context("could not create worker job object");
+        }
+        let mut limits = unsafe { std::mem::zeroed::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() };
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let configured = unsafe {
+            SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        };
+        let assigned = configured != 0
+            && unsafe { AssignProcessToJobObject(job, child.as_raw_handle() as _) } != 0;
+        if !assigned {
+            let error = std::io::Error::last_os_error();
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(job) };
+            return Err(error).context("could not bind worker to its kill-on-close job object");
+        }
+        return Ok(ProcessTreeGuard(job as isize));
+    }
+    #[cfg(unix)]
+    {
+        let _ = child;
+        Ok(ProcessTreeGuard)
+    }
+}
+
 struct OsWorkerProcess {
     child: Mutex<Child>,
+    #[allow(dead_code)]
+    process_guard: ProcessTreeGuard,
 }
 
 impl WorkerProcess for OsWorkerProcess {
@@ -665,11 +1112,28 @@ impl WorkerProcess for OsWorkerProcess {
             .child
             .lock()
             .map_err(|_| anyhow!("ONNX worker process lock was poisoned"))?;
+        #[cfg(unix)]
+        if child.try_wait()?.is_none() {
+            let process_group = -(child.id() as i32);
+            let result = unsafe { libc::kill(process_group, libc::SIGKILL) };
+            if result == -1 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::ESRCH) {
+                    return Err(anyhow!(
+                        "could not terminate inference worker process group: {error}"
+                    ));
+                }
+            }
+            return Ok(());
+        }
+        #[cfg(not(unix))]
         if child.try_wait()?.is_none()
             && let Err(kill_error) = child.kill()
             && child.try_wait()?.is_none()
         {
-            return Err(anyhow!("could not terminate ONNX worker: {kill_error}"));
+            return Err(anyhow!(
+                "could not terminate inference worker: {kill_error}"
+            ));
         }
         Ok(())
     }
@@ -735,7 +1199,7 @@ pub(crate) struct OnnxWorkerSupervisor {
 
 impl OnnxWorkerSupervisor {
     pub(crate) fn spawn() -> Result<Self> {
-        Self::with_launcher(Arc::new(OsWorkerLauncher))
+        Self::with_launcher(Arc::new(OsWorkerLauncher::inference()))
     }
 
     fn with_launcher(launcher: Arc<dyn WorkerLauncher>) -> Result<Self> {
@@ -1798,7 +2262,7 @@ impl SileroVadWorkerSupervisor {
         };
         Ok(Self {
             transport: OnnxWorkerSupervisor::with_launcher_and_deadlines(
-                Arc::new(OsWorkerLauncher),
+                Arc::new(OsWorkerLauncher::vad()),
                 transport_deadlines,
             )?,
             deadlines,
@@ -1816,7 +2280,7 @@ impl SileroVadWorkerSupervisor {
         cancelled: &AtomicBool,
     ) -> Result<(Self, u64)> {
         Self::acquire_session_with_launcher_and_deadlines(
-            Arc::new(OsWorkerLauncher),
+            Arc::new(OsWorkerLauncher::vad()),
             session_id,
             first_request_id,
             num_threads,
@@ -2372,21 +2836,324 @@ impl Drop for SupervisorInner {
 
 /// Dispatches the private worker before any eframe initialization.
 pub(crate) fn maybe_run_worker() -> Option<i32> {
-    if !std::env::args_os()
-        .skip(1)
-        .any(|arg| arg == "--onnx-worker")
-    {
-        return None;
-    }
+    let role = std::env::args_os().skip(1).find_map(|arg| {
+        if arg == INFERENCE_WORKER_FLAG || arg == LEGACY_ONNX_WORKER_FLAG {
+            Some(WorkerRole::Inference)
+        } else if arg == VAD_WORKER_FLAG {
+            Some(WorkerRole::Vad)
+        } else {
+            None
+        }
+    })?;
     Some(
-        match worker_loop(std::io::stdin().lock(), std::io::stdout().lock()) {
+        match worker_loop_for_role(std::io::stdin().lock(), std::io::stdout().lock(), role) {
             Ok(()) => 0,
             Err(error) => {
-                eprintln!("ONNX worker failed: {error:#}");
+                eprintln!("Scribe {role:?} worker failed: {error:#}");
                 1
             }
         },
     )
+}
+
+/// Generic parent-side facade for the one process-isolated STT generation.
+/// It owns no native model/session/recognizer objects.
+#[derive(Clone)]
+pub(crate) struct InferenceWorkerSupervisor {
+    transport: OnnxWorkerSupervisor,
+    next_correlation: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl InferenceWorkerSupervisor {
+    pub(crate) fn unstarted() -> Self {
+        Self {
+            transport: OnnxWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+                Arc::new(OsWorkerLauncher::inference()),
+                SupervisorDeadlines::default(),
+            ),
+            next_correlation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
+    pub(crate) fn spawn() -> Result<Self> {
+        let supervisor = Self::unstarted();
+        supervisor.transport.ensure_generation()?;
+        Ok(supervisor)
+    }
+
+    fn next_id(&self) -> u64 {
+        self.next_correlation
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1)
+            .max(1)
+    }
+
+    pub(crate) fn load(
+        &self,
+        artifact: RuntimeArtifact,
+        preference: AccelerationPreference,
+    ) -> Result<RuntimeLoadExecution, RuntimeError> {
+        let generation = self
+            .transport
+            .ensure_generation()
+            .map_err(worker_unavailable)?;
+        let correlation = self.next_id();
+        let frame = control_frame(
+            correlation,
+            correlation,
+            &Control::LoadRuntime {
+                artifact: artifact.into(),
+                preference,
+            },
+        )
+        .map_err(worker_unavailable)?;
+        match self
+            .transport
+            .active_round_trip_with_timeout(
+                generation,
+                correlation,
+                correlation,
+                &[frame],
+                self.transport.inner.deadlines.load,
+            )
+            .map_err(worker_unavailable)?
+        {
+            Control::RuntimeLoaded { execution } => Ok(execution.into()),
+            Control::RuntimeFailed { error } => Err(error.into_runtime()),
+            Control::Error { message } => Err(RuntimeError::WorkerUnavailable(message)),
+            _ => {
+                let _ = self.transport.invalidate_generation(
+                    generation,
+                    "unexpected inference load response",
+                    true,
+                );
+                Err(RuntimeError::WorkerUnavailable(
+                    "unexpected inference load response".to_owned(),
+                ))
+            }
+        }
+    }
+
+    pub(crate) fn transcribe(
+        &self,
+        artifact: RuntimeArtifact,
+        preference: AccelerationPreference,
+        audio: &PreparedAudio,
+        options: TranscriptionOptions,
+    ) -> Result<RuntimeExecution, RuntimeError> {
+        validate_pcm_samples(&audio.samples).map_err(worker_unavailable)?;
+        let generation = self
+            .transport
+            .ensure_generation()
+            .map_err(worker_unavailable)?;
+        let session_id = self.next_id();
+        let begin_id = self.next_id();
+        let begin = control_frame(
+            session_id,
+            begin_id,
+            &Control::BeginBatch {
+                artifact: artifact.into(),
+                preference,
+                options,
+                source_sample_rate: audio.source_sample_rate,
+                source_channels: audio.source_channels,
+                source_frames: audio.source_frames,
+            },
+        )
+        .map_err(worker_unavailable)?;
+        expect_ok(
+            self.transport
+                .active_round_trip_with_timeout(
+                    generation,
+                    session_id,
+                    begin_id,
+                    &[begin],
+                    self.transport.inner.deadlines.load,
+                )
+                .map_err(worker_unavailable)?,
+        )
+        .map_err(worker_unavailable)?;
+
+        const CHUNK_SAMPLES: usize = 256 * 1024;
+        for samples in audio.samples.chunks(CHUNK_SAMPLES) {
+            let request_id = self.next_id();
+            let frames = [
+                control_frame(session_id, request_id, &Control::AudioChunk)
+                    .map_err(worker_unavailable)?,
+                Frame {
+                    kind: FrameKind::Pcm,
+                    session_id,
+                    request_id,
+                    body: encode_pcm(samples).map_err(worker_unavailable)?,
+                },
+            ];
+            expect_ok(
+                self.transport
+                    .active_round_trip(generation, session_id, request_id, &frames)
+                    .map_err(worker_unavailable)?,
+            )
+            .map_err(worker_unavailable)?;
+        }
+        let end_id = self.next_id();
+        let end =
+            control_frame(session_id, end_id, &Control::EndBatch).map_err(worker_unavailable)?;
+        match self
+            .transport
+            .active_round_trip(generation, session_id, end_id, &[end])
+            .map_err(worker_unavailable)?
+        {
+            Control::RuntimeTranscript { execution } => Ok(execution.into()),
+            Control::RuntimeFailed { error } => Err(error.into_runtime()),
+            Control::Error { message } => Err(RuntimeError::WorkerUnavailable(message)),
+            _ => {
+                let _ = self.transport.invalidate_generation(
+                    generation,
+                    "unexpected inference batch response",
+                    true,
+                );
+                Err(RuntimeError::WorkerUnavailable(
+                    "unexpected inference batch response".to_owned(),
+                ))
+            }
+        }
+    }
+
+    pub(crate) fn health(
+        &self,
+        artifact: RuntimeArtifact,
+        preference: AccelerationPreference,
+    ) -> Result<(), RuntimeError> {
+        self.load(artifact, preference)?;
+        let id = self.next_id();
+        self.transport.health(id, id).map_err(worker_unavailable)
+    }
+
+    pub(crate) fn start_stream(
+        &self,
+        artifact: RuntimeArtifact,
+        preference: AccelerationPreference,
+        options: TranscriptionOptions,
+    ) -> Result<Box<dyn SpeechStream>, RuntimeError> {
+        if options != TranscriptionOptions::default() {
+            return Err(RuntimeError::OnnxUnavailable(
+                "native ONNX streaming currently accepts only default options".to_owned(),
+            ));
+        }
+        self.load(artifact, preference)?;
+        let session_id = self.next_id();
+        let request_id = self.next_id();
+        self.transport
+            .start_stream(session_id, request_id)
+            .map_err(worker_unavailable)?;
+        Ok(Box::new(InferenceWorkerStream {
+            supervisor: self.clone(),
+            session_id,
+            closed: false,
+        }))
+    }
+
+    pub(crate) fn unload(&self) -> Result<(), RuntimeError> {
+        self.transport.unload().map_err(worker_unavailable)
+    }
+
+    pub(crate) fn cancel_active(&self) {
+        let _ = self.transport.cancel_active();
+    }
+
+    pub(crate) fn shutdown(&self) -> Result<(), RuntimeError> {
+        let generation = self
+            .transport
+            .inner
+            .state
+            .lock()
+            .map_err(|_| RuntimeError::WorkerUnavailable("inference state lock poisoned".into()))?
+            .current
+            .as_ref()
+            .map(|current| current.generation);
+        if let Some(generation) = generation {
+            self.transport
+                .round_trip_on_generation(
+                    generation,
+                    0,
+                    self.next_id(),
+                    Control::Shutdown,
+                    self.transport.inner.deadlines.control,
+                )
+                .map_err(worker_unavailable)?;
+            self.transport
+                .invalidate_generation(generation, "inference worker shut down", false)
+                .map_err(worker_unavailable)?;
+        }
+        Ok(())
+    }
+}
+
+fn worker_unavailable(error: impl std::fmt::Display) -> RuntimeError {
+    RuntimeError::WorkerUnavailable(error.to_string())
+}
+
+struct InferenceWorkerStream {
+    supervisor: InferenceWorkerSupervisor,
+    session_id: u64,
+    closed: bool,
+}
+
+impl SpeechStream for InferenceWorkerStream {
+    fn push_audio(&mut self, samples: &[f32]) -> Result<StreamUpdate> {
+        if self.closed {
+            bail!("the inference stream is closed");
+        }
+        let request_id = self.supervisor.next_id();
+        let text = self
+            .supervisor
+            .transport
+            .audio_chunk(self.session_id, request_id, samples)?;
+        Ok(StreamUpdate {
+            committed: String::new(),
+            tentative: text,
+        })
+    }
+
+    fn finalize(mut self: Box<Self>) -> Result<Transcript> {
+        let request_id = self.supervisor.next_id();
+        let text = self
+            .supervisor
+            .transport
+            .end_stream(self.session_id, request_id)?;
+        self.closed = true;
+        Ok(Transcript {
+            segments: if text.is_empty() {
+                Vec::new()
+            } else {
+                vec![TranscriptSegment {
+                    text: text.clone(),
+                    start_ms: None,
+                    end_ms: None,
+                    confidence: None,
+                }]
+            },
+            text,
+            detected_language: None,
+            duration_ms: None,
+        })
+    }
+
+    fn cancel(mut self: Box<Self>) -> Result<()> {
+        let request_id = self.supervisor.next_id();
+        self.supervisor
+            .transport
+            .cancel_stream(self.session_id, request_id)?;
+        self.closed = true;
+        Ok(())
+    }
+}
+
+impl Drop for InferenceWorkerStream {
+    fn drop(&mut self) {
+        if !self.closed {
+            self.supervisor.transport.abandon_stream(self.session_id);
+        }
+    }
 }
 
 fn worker_loop(mut input: impl Read, mut output: impl Write) -> Result<()> {
@@ -2395,6 +3162,21 @@ fn worker_loop(mut input: impl Read, mut output: impl Write) -> Result<()> {
         &mut output,
         &NativeRecognizerFactory,
         &NativeVadFactory,
+        None,
+    )
+}
+
+fn worker_loop_for_role(
+    mut input: impl Read,
+    mut output: impl Write,
+    role: WorkerRole,
+) -> Result<()> {
+    worker_loop_with_factories(
+        &mut input,
+        &mut output,
+        &NativeRecognizerFactory,
+        &NativeVadFactory,
+        Some(role),
     )
 }
 
@@ -2451,7 +3233,24 @@ fn worker_loop_with_factory<F: WorkerRecognizerFactory>(
     mut output: impl Write,
     factory: &F,
 ) -> Result<()> {
-    worker_loop_with_factories(&mut input, &mut output, factory, &NativeVadFactory)
+    worker_loop_with_factories(&mut input, &mut output, factory, &NativeVadFactory, None)
+}
+
+struct PendingWorkerBatch {
+    artifact: WireRuntimeArtifact,
+    preference: AccelerationPreference,
+    options: TranscriptionOptions,
+    source_sample_rate: u32,
+    source_channels: u16,
+    source_frames: usize,
+    samples: Vec<f32>,
+}
+
+#[derive(Clone)]
+struct LoadedRuntimeMetadata {
+    identity: String,
+    artifact: WireRuntimeArtifact,
+    load: WireRuntimeLoadExecution,
 }
 
 fn worker_loop_with_factories<F: WorkerRecognizerFactory, V: WorkerVadFactory>(
@@ -2459,6 +3258,7 @@ fn worker_loop_with_factories<F: WorkerRecognizerFactory, V: WorkerVadFactory>(
     mut output: impl Write,
     factory: &F,
     vad_factory: &V,
+    role: Option<WorkerRole>,
 ) -> Result<()> {
     // This declaration order makes the stream drop before its recognizer on
     // structural protocol failure. Normal replacement paths clear it explicitly.
@@ -2467,9 +3267,35 @@ fn worker_loop_with_factories<F: WorkerRecognizerFactory, V: WorkerVadFactory>(
         None;
     let mut loaded_vad: Option<V::Vad> = None;
     let mut active_vad: Option<ActiveWorkerVad> = None;
+    // worker-only native runtime: the heavyweight router is constructed only
+    // after the child entrypoint has claimed the process role.
+    let runtime_router = RuntimeRouter::new();
+    let mut loaded_runtime: Option<LoadedRuntimeMetadata> = None;
+    let mut pending_batch: Option<PendingWorkerBatch> = None;
     loop {
-        let frame = read_frame(&mut input)?;
+        let frame = match read_frame(&mut input) {
+            Ok(frame) => frame,
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::UnexpectedEof) =>
+            {
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
         let (session_id, request_id, control) = parse_parent_control(frame)?;
+        if role.is_some_and(|role| !control_allowed_for_role(&control, role)) {
+            write_worker_response(
+                &mut output,
+                session_id,
+                request_id,
+                Control::Error {
+                    message: format!("{role:?} worker rejected a cross-role command"),
+                },
+            )?;
+            continue;
+        }
         match control {
             Control::Hello => {
                 write_worker_response(&mut output, session_id, request_id, Control::Ready)?;
@@ -2501,12 +3327,83 @@ fn worker_loop_with_factories<F: WorkerRecognizerFactory, V: WorkerVadFactory>(
                 })();
                 write_worker_result(&mut output, session_id, request_id, result)?;
             }
+            Control::LoadRuntime {
+                artifact,
+                preference,
+            } => {
+                let result = load_worker_runtime(
+                    &runtime_router,
+                    factory,
+                    &mut loaded,
+                    &mut loaded_runtime,
+                    &mut active_stream,
+                    artifact,
+                    preference,
+                )
+                .map(|execution| Control::RuntimeLoaded { execution });
+                write_runtime_result(&mut output, session_id, request_id, result)?;
+            }
+            Control::BeginBatch {
+                artifact,
+                preference,
+                options,
+                source_sample_rate,
+                source_channels,
+                source_frames,
+            } => {
+                let result = (|| {
+                    if pending_batch.is_some() {
+                        bail!("a runtime batch is already active");
+                    }
+                    if active_stream.is_some() || loaded_vad.is_some() {
+                        bail!("cannot begin a runtime batch while a stream is active");
+                    }
+                    load_worker_runtime(
+                        &runtime_router,
+                        factory,
+                        &mut loaded,
+                        &mut loaded_runtime,
+                        &mut active_stream,
+                        artifact.clone(),
+                        preference,
+                    )?;
+                    pending_batch = Some(PendingWorkerBatch {
+                        artifact,
+                        preference,
+                        options,
+                        source_sample_rate,
+                        source_channels,
+                        source_frames,
+                        samples: Vec::new(),
+                    });
+                    Ok(Control::Ok)
+                })();
+                write_worker_result(&mut output, session_id, request_id, result)?;
+            }
+            Control::EndBatch => {
+                let result = pending_batch
+                    .take()
+                    .ok_or_else(|| anyhow!("no runtime batch is active"))
+                    .and_then(|batch| {
+                        execute_worker_batch(
+                            &runtime_router,
+                            loaded.as_ref(),
+                            loaded_runtime.as_ref(),
+                            batch,
+                        )
+                    })
+                    .map(|execution| Control::RuntimeTranscript { execution });
+                write_runtime_result(&mut output, session_id, request_id, result)?;
+            }
             Control::Health => {
                 write_worker_response(&mut output, session_id, request_id, Control::Ok)?;
             }
             Control::Unload => {
+                pending_batch = None;
                 active_stream = None;
                 loaded = None;
+                loaded_runtime = None;
+                let _ = runtime_router.unload_all();
                 active_vad = None;
                 loaded_vad = None;
                 write_worker_response(&mut output, session_id, request_id, Control::Ok)?;
@@ -2542,8 +3439,11 @@ fn worker_loop_with_factories<F: WorkerRecognizerFactory, V: WorkerVadFactory>(
                 write_worker_result(&mut output, session_id, request_id, result)?;
             }
             Control::Shutdown => {
+                drop(pending_batch.take());
                 drop(active_stream.take());
                 drop(loaded.take());
+                drop(loaded_runtime.take());
+                let _ = runtime_router.unload_all();
                 drop(loaded_vad.take());
                 write_worker_response(&mut output, session_id, request_id, Control::Ok)?;
                 return Ok(());
@@ -2593,6 +3493,24 @@ fn worker_loop_with_factories<F: WorkerRecognizerFactory, V: WorkerVadFactory>(
             }
             Control::AudioChunk => {
                 let samples = read_correlated_pcm(&mut input, session_id, request_id);
+                if pending_batch.is_some() {
+                    let result = samples.and_then(|samples| {
+                        let batch = pending_batch.as_mut().expect("runtime batch checked above");
+                        let next_len = batch
+                            .samples
+                            .len()
+                            .checked_add(samples.len())
+                            .ok_or_else(|| anyhow!("runtime batch sample count overflowed"))?;
+                        if next_len > MAX_AUDIO_SAMPLES {
+                            pending_batch = None;
+                            bail!("runtime batch exceeds the {MAX_AUDIO_BYTES}-byte limit");
+                        }
+                        batch.samples.extend_from_slice(&samples);
+                        Ok(Control::Ok)
+                    });
+                    write_worker_result(&mut output, session_id, request_id, result)?;
+                    continue;
+                }
                 let result = match samples {
                     Ok(samples) => handle_audio_chunk(
                         loaded.as_ref(),
@@ -2731,6 +3649,9 @@ fn worker_loop_with_factories<F: WorkerRecognizerFactory, V: WorkerVadFactory>(
                 write_worker_result(&mut output, session_id, request_id, result)?;
             }
             Control::Ready
+            | Control::RuntimeLoaded { .. }
+            | Control::RuntimeTranscript { .. }
+            | Control::RuntimeFailed { .. }
             | Control::Text { .. }
             | Control::VadDecision { .. }
             | Control::Ok
@@ -2751,6 +3672,173 @@ fn read_correlated_pcm(
         bail!("invalid or mis-correlated ONNX PCM frame");
     }
     decode_pcm(&pcm.body)
+}
+
+fn wire_artifact_identity(artifact: &WireRuntimeArtifact) -> Result<String> {
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(artifact)?)
+    ))
+}
+
+fn onnx_architecture(family: OnnxModelFamily) -> String {
+    match family {
+        OnnxModelFamily::Moonshine => "moonshine",
+        OnnxModelFamily::NemoCtc => "nemo-ctc",
+        OnnxModelFamily::Canary => "canary",
+        OnnxModelFamily::OfflineTransducer => "offline-transducer",
+        OnnxModelFamily::OnlineTransducer => "online-transducer",
+    }
+    .to_owned()
+}
+
+fn onnx_runtime_capabilities(family: OnnxModelFamily) -> RuntimeCapabilities {
+    RuntimeCapabilities {
+        streaming: family == OnnxModelFamily::OnlineTransducer,
+        cancellation: true,
+        ..RuntimeCapabilities::default()
+    }
+}
+
+fn load_worker_runtime<F: WorkerRecognizerFactory>(
+    runtime_router: &RuntimeRouter,
+    factory: &F,
+    loaded_onnx: &mut Option<LoadedWorkerRecognizer<F::Recognizer>>,
+    loaded_runtime: &mut Option<LoadedRuntimeMetadata>,
+    active_stream: &mut Option<ActiveWorkerStream<<F::Recognizer as WorkerRecognizer>::Stream>>,
+    artifact: WireRuntimeArtifact,
+    preference: AccelerationPreference,
+) -> Result<WireRuntimeLoadExecution> {
+    if active_stream.is_some() {
+        bail!("cannot replace a runtime while a stream is active");
+    }
+    let identity = wire_artifact_identity(&artifact)?;
+    if let Some(current) = loaded_runtime
+        .as_ref()
+        .filter(|current| current.identity == identity)
+    {
+        let mut reused = current.load.clone();
+        reused.diagnostics.warm_reused = true;
+        reused.diagnostics.model_load_duration_ms = 0;
+        return Ok(reused);
+    }
+
+    // A changed load is fail-cold: release the prior native owner before
+    // validating or constructing its replacement.
+    loaded_runtime.take();
+    loaded_onnx.take();
+    runtime_router
+        .unload_all()
+        .map_err(|error| anyhow!(error.to_string()))?;
+
+    let load_started = Instant::now();
+    let execution = match &artifact {
+        WireRuntimeArtifact::OnnxBundle(model) => {
+            let acceleration = resolve_cpu_only_acceleration(preference)?;
+            let validated = model.validated()?;
+            let recognizer = factory.create(&validated)?;
+            *loaded_onnx = Some(LoadedWorkerRecognizer {
+                identity: validated.fingerprint()?,
+                family: model.family,
+                recognizer,
+            });
+            WireRuntimeLoadExecution {
+                diagnostics: WireRuntimeDiagnostics {
+                    resolved_acceleration: acceleration,
+                    native_library_path: PathBuf::from("<worker-local sherpa-onnx>"),
+                    warm_reused: false,
+                    model_load_duration_ms: u64::try_from(load_started.elapsed().as_millis())
+                        .unwrap_or(u64::MAX),
+                },
+                detected_architecture: onnx_architecture(model.family),
+                capabilities: onnx_runtime_capabilities(model.family),
+            }
+        }
+        WireRuntimeArtifact::Gguf(_) | WireRuntimeArtifact::LegacyCompatibility(_) => {
+            let runtime_artifact = RuntimeArtifact::try_from(artifact.clone())?;
+            runtime_router
+                .load(runtime_artifact, preference)
+                .map(WireRuntimeLoadExecution::from)
+                .map_err(anyhow::Error::new)?
+        }
+    };
+    *loaded_runtime = Some(LoadedRuntimeMetadata {
+        identity,
+        artifact,
+        load: execution.clone(),
+    });
+    Ok(execution)
+}
+
+fn execute_worker_batch<R: WorkerRecognizer>(
+    runtime_router: &RuntimeRouter,
+    loaded_onnx: Option<&LoadedWorkerRecognizer<R>>,
+    loaded_runtime: Option<&LoadedRuntimeMetadata>,
+    batch: PendingWorkerBatch,
+) -> Result<WireRuntimeExecution> {
+    validate_pcm_samples(&batch.samples)?;
+    let loaded = loaded_runtime.ok_or_else(|| anyhow!("no runtime model is loaded"))?;
+    if loaded.identity != wire_artifact_identity(&batch.artifact)?
+        || loaded.artifact != batch.artifact
+    {
+        bail!("runtime batch artifact does not match the loaded model");
+    }
+    let audio = PreparedAudio::from_captured_mono(
+        batch.samples,
+        batch.source_sample_rate,
+        batch.source_channels,
+        batch.source_frames,
+    )?;
+    if audio.sample_rate != PREPARED_SAMPLE_RATE {
+        bail!("runtime batch was not prepared at {PREPARED_SAMPLE_RATE} Hz");
+    }
+    match batch.artifact {
+        WireRuntimeArtifact::OnnxBundle(_) => {
+            if batch.options != TranscriptionOptions::default() {
+                bail!("sherpa-onnx worker currently accepts only default transcription options");
+            }
+            let recognizer = loaded_onnx.ok_or_else(|| anyhow!("no ONNX model is loaded"))?;
+            let started = Instant::now();
+            let text = recognizer.recognizer.transcribe(&audio.samples)?;
+            let processing_duration_ms =
+                u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            let duration_ms = (audio.samples.len() as u128)
+                .saturating_mul(1_000)
+                .checked_div(u128::from(PREPARED_SAMPLE_RATE))
+                .and_then(|value| u64::try_from(value).ok());
+            Ok(WireRuntimeExecution {
+                transcript: WireTranscript {
+                    segments: if text.is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![WireTranscriptSegment {
+                            text: text.clone(),
+                            start_ms: None,
+                            end_ms: duration_ms,
+                            confidence: None,
+                        }]
+                    },
+                    text,
+                    detected_language: None,
+                    duration_ms,
+                },
+                diagnostics: loaded.load.diagnostics.clone(),
+                processing_duration_ms,
+            })
+        }
+        WireRuntimeArtifact::Gguf(_) | WireRuntimeArtifact::LegacyCompatibility(_) => {
+            runtime_router
+                .transcribe(
+                    RuntimeArtifact::try_from(batch.artifact)?,
+                    batch.preference,
+                    &audio,
+                    &batch.options,
+                    runtime_router.cancellation_snapshot(),
+                )
+                .map(WireRuntimeExecution::from)
+                .map_err(anyhow::Error::new)
+        }
+    }
 }
 
 fn handle_audio_chunk<R: WorkerRecognizer>(
@@ -2838,6 +3926,26 @@ fn write_worker_result(
         Ok(response) => response,
         Err(error) => Control::Error {
             message: error.to_string(),
+        },
+    };
+    write_worker_response(output, session_id, request_id, response)
+}
+
+fn write_runtime_result(
+    output: &mut impl Write,
+    session_id: u64,
+    request_id: u64,
+    result: Result<Control>,
+) -> Result<()> {
+    let response = match result {
+        Ok(response) => response,
+        Err(error) => match error.downcast_ref::<RuntimeError>() {
+            Some(runtime) => Control::RuntimeFailed {
+                error: WireRuntimeError::from_runtime(runtime),
+            },
+            None => Control::Error {
+                message: error.to_string(),
+            },
         },
     };
     write_worker_response(output, session_id, request_id, response)
@@ -3561,6 +4669,16 @@ mod tests {
                 | Control::Cancel { .. }
                 | Control::Unload
                 | Control::Health => respond(output, session_id, request_id, Control::Ok),
+                Control::LoadRuntime { .. } | Control::BeginBatch { .. } | Control::EndBatch => {
+                    respond(
+                        output,
+                        session_id,
+                        request_id,
+                        Control::Error {
+                            message: "generic runtime unavailable in legacy fake".to_owned(),
+                        },
+                    )
+                }
                 Control::StartStream | Control::AudioChunk | Control::EndStream => respond(
                     output,
                     session_id,
@@ -3594,6 +4712,9 @@ mod tests {
                     },
                 ),
                 Control::Ready
+                | Control::RuntimeLoaded { .. }
+                | Control::RuntimeTranscript { .. }
+                | Control::RuntimeFailed { .. }
                 | Control::Text { .. }
                 | Control::VadDecision { .. }
                 | Control::Ok
@@ -4069,6 +5190,103 @@ mod tests {
         .unwrap();
     }
 
+    #[test]
+    fn protocol_v3_has_distinct_inference_and_vad_roles() {
+        assert_eq!(PROTOCOL_MAGIC, *b"SCIF");
+        assert_eq!(PROTOCOL_VERSION, 3);
+        assert_eq!(INFERENCE_WORKER_FLAG, "--scribe-inference-worker");
+        assert_eq!(VAD_WORKER_FLAG, "--scribe-vad-worker");
+        assert!(!control_allowed_for_role(
+            &Control::LoadVad { num_threads: 1 },
+            WorkerRole::Inference,
+        ));
+        assert!(!control_allowed_for_role(
+            &Control::Transcribe,
+            WorkerRole::Vad,
+        ));
+        assert!(control_allowed_for_role(
+            &Control::Health,
+            WorkerRole::Inference,
+        ));
+        assert!(control_allowed_for_role(&Control::Health, WorkerRole::Vad,));
+    }
+
+    #[test]
+    fn unified_worker_assembles_chunked_onnx_batch_in_one_child() {
+        let root = test_root("unified-chunked-batch");
+        let spec = spec_with_roles(
+            &root,
+            OnnxModelFamily::NemoCtc,
+            &[OnnxFileRole::Model, OnnxFileRole::Tokens],
+        );
+        let artifact = WireRuntimeArtifact::OnnxBundle(spec);
+        let mut input = Vec::new();
+        append_control(&mut input, 0, 0, Control::Hello);
+        append_control(
+            &mut input,
+            7,
+            1,
+            Control::LoadRuntime {
+                artifact: artifact.clone(),
+                preference: AccelerationPreference::Cpu,
+            },
+        );
+        append_control(
+            &mut input,
+            7,
+            2,
+            Control::BeginBatch {
+                artifact,
+                preference: AccelerationPreference::Cpu,
+                options: TranscriptionOptions::default(),
+                source_sample_rate: PREPARED_SAMPLE_RATE,
+                source_channels: 1,
+                source_frames: 4,
+            },
+        );
+        append_control(&mut input, 7, 3, Control::AudioChunk);
+        append_pcm(&mut input, 7, 3, &[0.1, 0.2]);
+        append_control(&mut input, 7, 4, Control::AudioChunk);
+        append_pcm(&mut input, 7, 4, &[-0.1, -0.2]);
+        append_control(&mut input, 7, 5, Control::EndBatch);
+        append_control(&mut input, 7, 6, Control::Shutdown);
+
+        let recognizers = FakeRecognizerFactory::new();
+        let vad = FakeVadFactory::new();
+        let mut output = Vec::new();
+        worker_loop_with_factories(
+            Cursor::new(input),
+            &mut output,
+            &recognizers,
+            &vad,
+            Some(WorkerRole::Inference),
+        )
+        .unwrap();
+        let mut output = Cursor::new(output);
+        let mut responses = Vec::new();
+        while output.position() < output.get_ref().len() as u64 {
+            responses.push(
+                parse_worker_control(read_frame(&mut output).unwrap())
+                    .unwrap()
+                    .2,
+            );
+        }
+        assert!(matches!(responses[0], Control::Ready));
+        assert!(matches!(responses[1], Control::RuntimeLoaded { .. }));
+        assert!(matches!(responses[2], Control::Ok));
+        assert!(matches!(responses[3], Control::Ok));
+        assert!(matches!(responses[4], Control::Ok));
+        match &responses[5] {
+            Control::RuntimeTranscript { execution } => {
+                assert_eq!(execution.transcript.text, "batch:test-NemoCtc:1");
+            }
+            other => panic!("expected runtime transcript, got {other:?}"),
+        }
+        assert!(matches!(responses[6], Control::Ok));
+        assert_eq!(recognizers.snapshot().transcriptions, 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     fn run_framed_fake_worker(
         factory: &FakeRecognizerFactory,
         input: Vec<u8>,
@@ -4094,6 +5312,7 @@ mod tests {
             &mut output,
             recognizer_factory,
             vad_factory,
+            None,
         )
         .unwrap();
         let mut output = Cursor::new(output);
