@@ -244,19 +244,12 @@ jobs:
           }
 
           $requiredRulesetName = 'Protect release tags'
-          $rulesetIds = @(& gh api --paginate `
-            "repos/$env:GITHUB_REPOSITORY/rulesets?per_page=100" `
-            --jq ".[] | select(.name == `"$requiredRulesetName`") | .id" 2>&1)
-          $rulesetListExit = $LASTEXITCODE
-          if ($rulesetListExit -ne 0) {
-            throw "Could not list repository rulesets; refusing publication: $($rulesetIds -join ' ')"
-          }
-          if ($rulesetIds.Count -ne 1 -or $rulesetIds[0] -notmatch '^\d+$') {
-            throw "Expected exactly one repository ruleset named $requiredRulesetName; found $($rulesetIds.Count)"
-          }
-
+          $requiredRulesetId = 21505050
+          $requiredRulesetNodeId = 'RRS_lACqUmVwb3NpdG9yec5L6WbnzgFIJBo'
+          $requiredRulesetUpdatedAt = '2026-08-25T18:57:12.727-05:00'
           $rulesetResponse = @(& gh api `
-            "repos/$env:GITHUB_REPOSITORY/rulesets/$($rulesetIds[0])" 2>&1)
+            -H 'X-GitHub-Api-Version: 2026-03-10' `
+            "repos/$env:GITHUB_REPOSITORY/rulesets/$requiredRulesetId" 2>&1)
           $rulesetDetailExit = $LASTEXITCODE
           if ($rulesetDetailExit -ne 0) {
             throw "Could not read repository ruleset $requiredRulesetName; refusing publication: $($rulesetResponse -join ' ')"
@@ -266,12 +259,15 @@ jobs:
           } catch {
             throw "Could not parse repository ruleset $requiredRulesetName; refusing publication: $($_.Exception.Message)"
           }
-          foreach ($requiredProperty in @('name', 'target', 'source_type', 'source', 'enforcement', 'conditions', 'rules', 'bypass_actors')) {
+          foreach ($requiredProperty in @('id', 'node_id', 'updated_at', 'name', 'target', 'source_type', 'source', 'enforcement', 'current_user_can_bypass', 'conditions', 'rules')) {
             if ($null -eq $ruleset.PSObject.Properties[$requiredProperty]) {
               throw "Repository ruleset $requiredRulesetName is missing required property $requiredProperty"
             }
           }
-          if ($ruleset.name -cne $requiredRulesetName -or
+          if ($ruleset.id -ne $requiredRulesetId -or
+              $ruleset.node_id -cne $requiredRulesetNodeId -or
+              $ruleset.updated_at -cne $requiredRulesetUpdatedAt -or
+              $ruleset.name -cne $requiredRulesetName -or
               $ruleset.target -cne 'tag' -or
               $ruleset.source_type -cne 'Repository' -or
               $ruleset.source -cne $env:GITHUB_REPOSITORY -or
@@ -279,13 +275,12 @@ jobs:
             throw "Ruleset $requiredRulesetName must be an active tag ruleset owned by $env:GITHUB_REPOSITORY"
           }
           if ($null -eq $ruleset.conditions -or
-              $null -eq $ruleset.conditions.PSObject.Properties['ref_name']) {
-            throw "Repository ruleset $requiredRulesetName must define ref-name conditions"
+              @($ruleset.conditions.PSObject.Properties.Name) -cne @('ref_name')) {
+            throw "Repository ruleset $requiredRulesetName must define only ref-name conditions"
           }
           $refName = $ruleset.conditions.ref_name
           if ($null -eq $refName -or
-              $null -eq $refName.PSObject.Properties['include'] -or
-              $null -eq $refName.PSObject.Properties['exclude'] -or
+              @($refName.PSObject.Properties.Name | Sort-Object) -cne @('exclude', 'include') -or
               $refName.include -isnot [System.Array] -or
               $refName.exclude -isnot [System.Array]) {
             throw "Repository ruleset $requiredRulesetName must define unambiguous ref includes and exclusions"
@@ -298,9 +293,12 @@ jobs:
           if ($excludedRefs.Count -ne 0) {
             throw "Repository ruleset $requiredRulesetName must not exclude any refs"
           }
-          if ($ruleset.bypass_actors -isnot [System.Array] -or
-              @($ruleset.bypass_actors).Count -ne 0) {
+          if ($null -ne $ruleset.PSObject.Properties['bypass_actors'] -and
+              ($ruleset.bypass_actors -isnot [System.Array] -or @($ruleset.bypass_actors).Count -ne 0)) {
             throw "Repository ruleset $requiredRulesetName must not allow bypass actors"
+          }
+          if ($ruleset.current_user_can_bypass -cne 'never') {
+            throw "Repository ruleset $requiredRulesetName must not allow the workflow token to bypass"
           }
           if ($ruleset.rules -isnot [System.Array]) {
             throw "Repository ruleset $requiredRulesetName must define an unambiguous rules array"
@@ -311,12 +309,10 @@ jobs:
             }
             $_.type
           })
-          if (@($ruleTypes | Where-Object { $_ -ceq 'update' }).Count -ne 1 -or
+          if ($ruleTypes.Count -ne 2 -or
+              @($ruleTypes | Where-Object { $_ -ceq 'update' }).Count -ne 1 -or
               @($ruleTypes | Where-Object { $_ -ceq 'deletion' }).Count -ne 1) {
-            throw "Repository ruleset $requiredRulesetName must restrict tag updates and deletions"
-          }
-          if (@($ruleTypes | Where-Object { $_ -ceq 'creation' }).Count -ne 0) {
-            throw "Repository ruleset $requiredRulesetName must allow creation of new matching tags"
+            throw "Repository ruleset $requiredRulesetName must contain exactly update and deletion rules"
           }
 
           if ($env:GITHUB_EVENT_NAME -eq 'workflow_dispatch') {

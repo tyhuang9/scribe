@@ -47,6 +47,94 @@ function Write-TestPe([string]$Path, [uint16]$Machine) {
     [System.IO.File]::WriteAllBytes($Path, $bytes)
 }
 
+function New-TestReleaseRuleset {
+    @'
+{
+  "id": 21505050,
+  "node_id": "RRS_lACqUmVwb3NpdG9yec5L6WbnzgFIJBo",
+  "updated_at": "2026-08-25T18:57:12.727-05:00",
+  "name": "Protect release tags",
+  "target": "tag",
+  "source_type": "Repository",
+  "source": "tyhuang9/scribe",
+  "enforcement": "active",
+  "current_user_can_bypass": "never",
+  "conditions": {
+    "ref_name": {
+      "include": ["refs/tags/v*"],
+      "exclude": []
+    }
+  },
+  "rules": [
+    { "type": "update" },
+    { "type": "deletion" }
+  ]
+}
+'@ | ConvertFrom-Json -Depth 20
+}
+
+function Assert-ReleaseRulesetContract([psobject]$Ruleset) {
+    $requiredRulesetName = 'Protect release tags'
+    $requiredRulesetId = 21505050
+    $requiredRulesetNodeId = 'RRS_lACqUmVwb3NpdG9yec5L6WbnzgFIJBo'
+    $requiredRulesetUpdatedAt = '2026-08-25T18:57:12.727-05:00'
+    foreach ($requiredProperty in @(
+        'id', 'node_id', 'updated_at', 'name', 'target', 'source_type', 'source',
+        'enforcement', 'current_user_can_bypass', 'conditions', 'rules'
+    )) {
+        if ($null -eq $Ruleset.PSObject.Properties[$requiredProperty]) {
+            throw "Ruleset is missing required property $requiredProperty"
+        }
+    }
+    if ($Ruleset.id -ne $requiredRulesetId -or
+        $Ruleset.node_id -cne $requiredRulesetNodeId -or
+        $Ruleset.updated_at -cne $requiredRulesetUpdatedAt -or
+        $Ruleset.name -cne $requiredRulesetName -or
+        $Ruleset.target -cne 'tag' -or
+        $Ruleset.source_type -cne 'Repository' -or
+        $Ruleset.source -cne 'tyhuang9/scribe' -or
+        $Ruleset.enforcement -cne 'active' -or
+        $Ruleset.current_user_can_bypass -cne 'never') {
+        throw "Ruleset identity, ownership, enforcement, or bypass contract changed"
+    }
+    $conditionNames = @($Ruleset.conditions.PSObject.Properties.Name)
+    if ($conditionNames.Count -ne 1 -or $conditionNames[0] -cne 'ref_name') {
+        throw "Ruleset must define only ref-name conditions"
+    }
+    $refName = $Ruleset.conditions.ref_name
+    $refNameProperties = @($refName.PSObject.Properties.Name | Sort-Object)
+    if ($refNameProperties.Count -ne 2 -or
+        $refNameProperties[0] -cne 'exclude' -or
+        $refNameProperties[1] -cne 'include' -or
+        $refName.include -isnot [System.Array] -or
+        $refName.exclude -isnot [System.Array]) {
+        throw "Ruleset must define unambiguous ref includes and exclusions"
+    }
+    if (@($refName.include).Count -ne 1 -or
+        @($refName.include)[0] -cne 'refs/tags/v*' -or
+        @($refName.exclude).Count -ne 0) {
+        throw "Ruleset ref conditions changed"
+    }
+    if ($null -ne $Ruleset.PSObject.Properties['bypass_actors'] -and
+        ($Ruleset.bypass_actors -isnot [System.Array] -or @($Ruleset.bypass_actors).Count -ne 0)) {
+        throw "Ruleset must not allow bypass actors"
+    }
+    if ($Ruleset.rules -isnot [System.Array]) {
+        throw "Ruleset must define an unambiguous rules array"
+    }
+    $ruleTypes = @($Ruleset.rules | ForEach-Object {
+        if ($null -eq $_.PSObject.Properties['type'] -or $_.type -isnot [string]) {
+            throw "Ruleset contains a rule without a valid type"
+        }
+        $_.type
+    })
+    if ($ruleTypes.Count -ne 2 -or
+        @($ruleTypes | Where-Object { $_ -ceq 'update' }).Count -ne 1 -or
+        @($ruleTypes | Where-Object { $_ -ceq 'deletion' }).Count -ne 1) {
+        throw "Ruleset must contain exactly update and deletion rules"
+    }
+}
+
 $testRoot = Join-Path ([System.IO.Path]::GetTempPath()) "scribe-release-script-$PID-$([guid]::NewGuid().ToString('N'))"
 New-Item -ItemType Directory -Path $testRoot | Out-Null
 try {
@@ -171,6 +259,27 @@ try {
         $workflow -match "Copy-Item target\\release\\local-transcriber\.exe") {
         throw "Windows release workflow must package the validated full bundle, not a bare executable."
     }
+    $releaseRulesetFixture = New-TestReleaseRuleset
+    Assert-ReleaseRulesetContract $releaseRulesetFixture
+    foreach ($mutation in @(
+        @{ Name = 'id'; Action = { param($ruleset) $ruleset.id = 1 }; Expected = 'identity' },
+        @{ Name = 'node id'; Action = { param($ruleset) $ruleset.node_id = 'RRS_wrong' }; Expected = 'identity' },
+        @{ Name = 'revision'; Action = { param($ruleset) $ruleset.updated_at = '2026-08-25T18:57:12.728-05:00' }; Expected = 'identity' },
+        @{ Name = 'current-user bypass'; Action = { param($ruleset) $ruleset.current_user_can_bypass = 'always' }; Expected = 'identity' },
+        @{ Name = 'ref condition'; Action = { param($ruleset) $ruleset.conditions.ref_name.include = @('refs/tags/*') }; Expected = 'ref conditions' },
+        @{ Name = 'extra rule'; Action = { param($ruleset) $ruleset.rules += [pscustomobject]@{ type = 'creation' } }; Expected = 'exactly update and deletion' }
+    )) {
+        $mutatedRuleset = New-TestReleaseRuleset
+        & $mutation.Action $mutatedRuleset
+        Invoke-ExpectedFailure {
+            Assert-ReleaseRulesetContract $mutatedRuleset
+        } $mutation.Expected
+    }
+    $bypassActorRuleset = New-TestReleaseRuleset
+    $bypassActorRuleset | Add-Member -NotePropertyName bypass_actors -NotePropertyValue @([pscustomobject]@{ actor_type = 'RepositoryRole' })
+    Invoke-ExpectedFailure {
+        Assert-ReleaseRulesetContract $bypassActorRuleset
+    } 'must not allow bypass actors'
     foreach ($requiredPublicationGuard in @(
         'publish_release:',
         'type: boolean',
@@ -198,17 +307,27 @@ try {
         'git/ref/tags/$env:RELEASE_TAG',
         'refs/tags/$env:RELEASE_TAG^{}',
         "`$requiredRulesetName = 'Protect release tags'",
-        'rulesets?per_page=100',
+        "`$requiredRulesetId = 21505050",
+        "`$requiredRulesetNodeId = 'RRS_lACqUmVwb3NpdG9yec5L6WbnzgFIJBo'",
+        "`$requiredRulesetUpdatedAt = '2026-08-25T18:57:12.727-05:00'",
+        "-H 'X-GitHub-Api-Version: 2026-03-10'",
+        'rulesets/$requiredRulesetId',
+        "`$ruleset.id -ne `$requiredRulesetId",
+        "`$ruleset.node_id -cne `$requiredRulesetNodeId",
+        "`$ruleset.updated_at -cne `$requiredRulesetUpdatedAt",
         "`$ruleset.target -cne 'tag'",
         "`$ruleset.source_type -cne 'Repository'",
         "`$ruleset.source -cne `$env:GITHUB_REPOSITORY",
         "`$ruleset.enforcement -cne 'active'",
+        "`$ruleset.current_user_can_bypass -cne 'never'",
         "`$includedRefs[0] -cne 'refs/tags/v*'",
         "`$excludedRefs.Count -ne 0",
         "`$ruleset.bypass_actors",
+        "`$null -ne `$ruleset.PSObject.Properties['bypass_actors']",
         "`$_ -ceq 'update'",
         "`$_ -ceq 'deletion'",
-        "`$_ -ceq 'creation'",
+        "`$ruleTypes.Count -ne 2",
+        'must contain exactly update and deletion rules',
         '--draft=false',
         '--latest',
         '--prerelease=false',
@@ -217,6 +336,10 @@ try {
         if (-not $workflow.Contains($requiredPublicationGuard)) {
             throw "Windows release workflow must retain publication guard: $requiredPublicationGuard"
         }
+    }
+    if ($workflow.Contains('rulesets?per_page=100') -or
+        $workflow -match "requiredProperty in @\([^)]*bypass_actors") {
+        throw "Windows release workflow must not discover or require hidden bypass actor fields"
     }
 
     $readme = Get-Content -LiteralPath (Join-Path $repositoryRoot "README.md") -Raw
