@@ -5967,7 +5967,10 @@ impl LocalTranscriberApp {
                     self.status_message = "Native history playback is unavailable".to_owned();
                 }
             }
-            HistoryPageAction::Retry(history_id) => self.start_history_retry(history_id),
+            HistoryPageAction::Retry(history_id) => {
+                self.history_more_focus_pending = Some(history_id);
+                self.start_history_retry(history_id);
+            }
             HistoryPageAction::DeleteAudio(id) => {
                 self.history_more_focus_pending = Some(id);
                 self.start_history_mutation("Retained audio deleted", move |store| {
@@ -12742,7 +12745,7 @@ impl LocalTranscriberApp {
                 )
             })
             .collect::<HashMap<_, _>>();
-        for model in &self.remote_catalog.local_models {
+        for model in self.remote_catalog.local_models.iter() {
             names
                 .entry(model.id.clone())
                 .or_insert_with(|| model.display_name.clone());
@@ -17848,6 +17851,9 @@ mod layout_tests {
         assert!(app.history_confirmation_focus_pending);
         app.apply_history_action(HistoryPageAction::CancelDelete);
         assert_eq!(app.history_delete_confirmation, None);
+        assert_eq!(app.history_more_focus_pending, Some(record.id));
+
+        app.apply_history_action(HistoryPageAction::Retry(record.id));
         assert_eq!(app.history_more_focus_pending, Some(record.id));
 
         app.history_records.clear();

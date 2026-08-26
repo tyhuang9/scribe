@@ -9,6 +9,7 @@ use crate::history::{HistoryRecord, HistoryStatus};
 
 use super::{
     controls::{card, search_field},
+    screens::scroll_focused_control_into_view,
     theme::ui_palette,
 };
 
@@ -50,6 +51,70 @@ pub(crate) enum HistoryPageAction {
     CancelDelete,
     ToggleTranscript(i64),
     ToggleDetails(i64),
+}
+
+fn history_action_activated(ui: &egui::Ui, response: &egui::Response) -> bool {
+    response.enabled()
+        && (response.clicked()
+            || (response.has_focus()
+                && ui.input(|input| {
+                    input.key_pressed(egui::Key::Enter) || input.key_pressed(egui::Key::Space)
+                }))
+            || ui.input(|input| {
+                input.has_accesskit_action_request(response.id, egui::accesskit::Action::Default)
+            }))
+}
+
+fn stable_history_button(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    label: &str,
+    size: egui::Vec2,
+    enabled: bool,
+) -> egui::Response {
+    let was_enabled = ui.is_enabled();
+    ui.set_enabled(was_enabled && enabled);
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let response = ui.interact(rect, id, egui::Sense::click());
+    ui.set_enabled(was_enabled);
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, label.to_owned()));
+
+    if ui.is_rect_visible(rect) {
+        let visuals = ui.style().interact(&response);
+        ui.painter().rect(
+            rect.expand(visuals.expansion),
+            visuals.rounding,
+            visuals.weak_bg_fill,
+            visuals.bg_stroke,
+        );
+        ui.painter().text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            label,
+            egui::TextStyle::Button.resolve(ui.style()),
+            visuals.text_color(),
+        );
+    }
+    if let Some(cursor) = ui.visuals().interact_cursor
+        && response.hovered()
+    {
+        ui.ctx().set_cursor_icon(cursor);
+    }
+    response
+}
+
+fn history_menu_item(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    label: &str,
+    width: f32,
+    enabled: bool,
+) -> egui::Response {
+    let response = stable_history_button(ui, id, label, egui::vec2(width, 44.0), enabled);
+    ui.ctx().accesskit_node_builder(response.id, |builder| {
+        builder.set_role(egui::accesskit::Role::MenuItem);
+    });
+    response
 }
 
 pub(crate) struct HistoryPageState<'a> {
@@ -179,11 +244,15 @@ pub(crate) fn history_page(
     } else {
         format!("{} history entries loaded", records.len())
     };
-    let history_status = ui
-        .push_id("history-live-status", |ui| ui.label(history_status))
+    let history_status_node = ui
+        .push_id("history-live-status", |ui| {
+            ui.allocate_response(egui::Vec2::ZERO, egui::Sense::hover())
+        })
         .inner;
     ui.ctx()
-        .accesskit_node_builder(history_status.id, |builder| {
+        .accesskit_node_builder(history_status_node.id, |builder| {
+            builder.set_role(egui::accesskit::Role::Status);
+            builder.set_name(history_status);
             builder.set_live(egui::accesskit::Live::Polite);
             builder.set_live_atomic();
             if loading {
@@ -193,7 +262,7 @@ pub(crate) fn history_page(
 
     if let Some(error) = error {
         ui.add_space(8.0);
-        ui.colored_label(ui.visuals().error_fg_color, error);
+        ui.colored_label(ui_palette(ui).error_text, error);
     }
 
     ui.add_space(12.0);
@@ -232,7 +301,8 @@ pub(crate) fn history_page(
             .final_text
             .as_deref()
             .is_some_and(|final_text| {
-                !record.raw_text.trim().is_empty()
+                !final_text.trim().is_empty()
+                    && !record.raw_text.trim().is_empty()
                     && record.raw_text.trim() != final_text.trim()
             });
         let (preview, is_truncated) = transcript_preview(display_text);
@@ -256,13 +326,16 @@ pub(crate) fn history_page(
                     .strong(),
                 );
                 if let Some(source_app) = record.source_app.as_deref() {
-                    ui.label(RichText::new(source_app).color(ui.visuals().weak_text_color()));
+                    ui.label(RichText::new(source_app).color(ui_palette(ui).muted_text));
                 }
                 if record.pinned {
-                    ui.label(
+                    let pinned = ui.label(
                         RichText::new(format!("{} Pinned", egui_phosphor::regular::PUSH_PIN))
-                            .color(ui.visuals().weak_text_color()),
+                            .color(ui_palette(ui).muted_text),
                     );
+                    ui.ctx().accesskit_node_builder(pinned.id, |builder| {
+                        builder.set_name("Pinned");
+                    });
                 }
             });
 
@@ -301,12 +374,15 @@ pub(crate) fn history_page(
                         }
                     ),
                 );
-                if response.clicked() {
+                ui.ctx().accesskit_node_builder(response.id, |builder| {
+                    builder.set_expanded(show_full_transcript);
+                });
+                if history_action_activated(ui, &response) {
                     action = Some(HistoryPageAction::ToggleTranscript(record.id));
                 }
             }
             if let Some(failure) = record.failure.as_deref() {
-                ui.colored_label(ui.visuals().error_fg_color, failure);
+                ui.colored_label(ui_palette(ui).error_text, failure);
             }
 
             if details_visible {
@@ -314,10 +390,20 @@ pub(crate) fn history_page(
                 ui.separator();
                 ui.add_space(8.0);
                 ui.label(RichText::new("Details").strong());
-                ui.label(format!("Model: {model_name}"));
-                if let Some(output_outcome) = record.output_outcome.as_deref() {
-                    ui.label(format!("Output: {}", output_outcome.replace('_', " ")));
+                if model_names.contains_key(&record.model_id) {
+                    ui.label(format!("Model: {model_name}"));
+                } else {
+                    ui.label("Model: Removed or custom model");
+                    ui.label(format!("Model ID: {}", record.model_id));
                 }
+                ui.label(format!(
+                    "Output: {}",
+                    record
+                        .output_outcome
+                        .as_deref()
+                        .map(|outcome| outcome.replace('_', " "))
+                        .unwrap_or_else(|| "Not recorded".to_owned())
+                ));
                 ui.horizontal_wrapped(|ui| {
                     if let Some(duration) = record.metrics.audio_duration_ms {
                         ui.label(format!("Audio: {}", format_duration(duration)));
@@ -328,9 +414,7 @@ pub(crate) fn history_page(
                     if let Some(rtf) = record.metrics.realtime_factor {
                         ui.label(format!("RTF: {rtf:.2}"));
                     }
-                    if record.retry_count > 0 {
-                        ui.label(format!("Retries: {}", record.retry_count));
-                    }
+                    ui.label(format!("Retries: {}", record.retry_count));
                 });
                 if raw_is_distinct {
                     ui.add_space(4.0);
@@ -342,7 +426,7 @@ pub(crate) fn history_page(
                         &copy_raw,
                         &format!("Copies the raw transcript for {entry_context}"),
                     );
-                    if copy_raw.clicked() {
+                    if history_action_activated(ui, &copy_raw) {
                         action = Some(HistoryPageAction::Copy {
                             text: record.raw_text.clone(),
                             label: "Raw transcript",
@@ -354,13 +438,22 @@ pub(crate) fn history_page(
             ui.add_space(8.0);
             ui.horizontal_wrapped(|ui| {
                 if !display_text.trim().is_empty() {
-                    let response = ui.add_sized([88.0, 44.0], egui::Button::new("Copy"));
+                    let response = ui.add_sized(
+                        [104.0, 44.0],
+                        egui::Button::new(format!(
+                            "{} Copy",
+                            egui_phosphor::regular::COPY
+                        )),
+                    );
+                    ui.ctx().accesskit_node_builder(response.id, |builder| {
+                        builder.set_name("Copy");
+                    });
                     set_accessible_description(
                         ui,
                         &response,
                         &format!("Copies the transcript for {entry_context}"),
                     );
-                    if response.clicked() {
+                    if history_action_activated(ui, &response) {
                         action = Some(HistoryPageAction::Copy {
                             text: display_text.to_owned(),
                             label: "Transcript",
@@ -379,8 +472,15 @@ pub(crate) fn history_page(
                     };
                     let response = ui.add_enabled(
                         !work_active && armed_repaste != Some(record.id),
-                        egui::Button::new(button_text).min_size([112.0, 44.0].into()),
+                        egui::Button::new(format!(
+                            "{} {button_text}",
+                            egui_phosphor::regular::CLIPBOARD_TEXT
+                        ))
+                        .min_size([132.0, 44.0].into()),
                     );
+                    ui.ctx().accesskit_node_builder(response.id, |builder| {
+                        builder.set_name(button_text);
+                    });
                     if armed_repaste == Some(record.id) {
                         ui.ctx().accesskit_node_builder(response.id, |builder| {
                             builder.set_description(format!(
@@ -394,7 +494,7 @@ pub(crate) fn history_page(
                             &format!("Arms a one-time safe paste for {entry_context}"),
                         );
                     }
-                    if response.clicked() {
+                    if history_action_activated(ui, &response) {
                         action = Some(HistoryPageAction::ArmRepaste {
                             id: record.id,
                             text: final_text.to_owned(),
@@ -428,87 +528,172 @@ pub(crate) fn history_page(
                     };
                     let response = ui.add_enabled(
                         enabled,
-                        egui::Button::new(label).min_size([88.0, 44.0].into()),
+                        egui::Button::new(format!(
+                            "{} {label}",
+                            if label == "Play" {
+                                egui_phosphor::regular::PLAY
+                            } else {
+                                egui_phosphor::regular::STOP
+                            }
+                        ))
+                        .min_size([104.0, 44.0].into()),
                     );
+                    ui.ctx().accesskit_node_builder(response.id, |builder| {
+                        builder.set_name(label);
+                    });
                     set_accessible_description(ui, &response, &description);
-                    if response.clicked()
+                    if history_action_activated(ui, &response)
                         && let Some(page_action) = page_action
                     {
                         action = Some(page_action);
                     }
                 }
 
-                let more = ui.menu_button("More actions", |ui| {
-                        let pin = ui.add_enabled(
+                let popup_id = ui.make_persistent_id(("history-more-actions", record.id));
+                let first_item_focus_id = popup_id.with("focus-first-item");
+                let focus_first_item = ui.data_mut(|data| {
+                    let focus = data.get_temp::<bool>(first_item_focus_id).unwrap_or(false);
+                    data.remove::<bool>(first_item_focus_id);
+                    focus
+                });
+                let more = stable_history_button(
+                    ui,
+                    popup_id.with("trigger"),
+                    &format!("{} More", egui_phosphor::regular::DOTS_THREE),
+                    egui::vec2(112.0, 44.0),
+                    true,
+                );
+                let mut popup_open = ui.memory(|memory| memory.is_popup_open(popup_id));
+                let open_requested = history_action_activated(ui, &more);
+                if open_requested {
+                    ui.memory_mut(|memory| memory.toggle_popup(popup_id));
+                    popup_open = ui.memory(|memory| memory.is_popup_open(popup_id));
+                    if popup_open {
+                        ui.data_mut(|data| data.insert_temp(first_item_focus_id, true));
+                    }
+                }
+                ui.ctx().accesskit_node_builder(more.id, |builder| {
+                    builder.set_name("More actions");
+                    builder.set_expanded(popup_open);
+                    builder.set_has_popup(egui::accesskit::HasPopup::Menu);
+                    builder.set_default_action_verb(egui::accesskit::DefaultActionVerb::Open);
+                    builder.add_action(egui::accesskit::Action::Default);
+                });
+                set_accessible_description(
+                    ui,
+                    &more,
+                    &format!(
+                        "Shows additional actions for {entry_context}. Details are {}.",
+                        if details_visible { "shown" } else { "hidden" }
+                    ),
+                );
+                if focus_more_action == Some(record.id) {
+                    more.request_focus();
+                    scroll_focused_control_into_view(ui, &more);
+                }
+
+                let escape_pressed = popup_open
+                    && ui.input(|input| input.key_pressed(egui::Key::Escape));
+                if popup_open && !escape_pressed {
+                    egui::popup::popup_below_widget(ui, popup_id, &more, |ui| {
+                        let menu_id = popup_id.with("menu");
+                        ui.ctx().accesskit_node_builder(menu_id, |builder| {
+                            builder.set_role(egui::accesskit::Role::Menu);
+                            builder.set_name("More actions menu");
+                        });
+                        let menu_ctx = ui.ctx().clone();
+                        menu_ctx.with_accessibility_parent(menu_id, || {
+                        let pin = history_menu_item(
+                            ui,
+                            popup_id.with("pin"),
+                            if record.pinned { "Unpin" } else { "Pin" },
+                            112.0,
                             !work_active,
-                            egui::Button::new(if record.pinned { "Unpin" } else { "Pin" })
-                                .min_size([112.0, 44.0].into()),
                         );
-                        if pin.clicked() {
+                        if focus_first_item {
+                            pin.request_focus();
+                        }
+                        if history_action_activated(ui, &pin) {
                             action = Some(HistoryPageAction::TogglePinned {
                                 id: record.id,
                                 pinned: !record.pinned,
                             });
-                            ui.close_menu();
+                            ui.memory_mut(|memory| memory.close_popup());
                         }
-                        let details = ui.add_sized(
-                            [144.0, 44.0],
-                            egui::Button::new(if details_visible {
+                        let details = history_menu_item(
+                            ui,
+                            popup_id.with("details"),
+                            if details_visible {
                                 "Hide details"
                             } else {
                                 "Show details"
-                            }),
+                            },
+                            144.0,
+                            true,
                         );
-                        if details.clicked() {
+                        ui.ctx().accesskit_node_builder(details.id, |builder| {
+                            builder.set_expanded(details_visible);
+                        });
+                        if history_action_activated(ui, &details) {
                             action = Some(HistoryPageAction::ToggleDetails(record.id));
-                            ui.close_menu();
+                            ui.memory_mut(|memory| memory.close_popup());
                         }
                         if record.status == HistoryStatus::Failed && record.audio_path.is_some() {
-                            let retry = ui.add_enabled(
+                            let retry = history_menu_item(
+                                ui,
+                                popup_id.with("retry"),
+                                "Retry",
+                                112.0,
                                 !work_active,
-                                egui::Button::new("Retry").min_size([112.0, 44.0].into()),
                             );
-                            if retry.clicked() {
+                            if history_action_activated(ui, &retry) {
                                 action = Some(HistoryPageAction::Retry(record.id));
-                                ui.close_menu();
+                                ui.memory_mut(|memory| memory.close_popup());
                             }
                         }
                         if record.audio_path.is_some() {
-                            let delete_audio = ui.add_enabled(
+                            let delete_audio = history_menu_item(
+                                ui,
+                                popup_id.with("delete-audio"),
+                                "Delete retained audio",
+                                176.0,
                                 !work_active && playing != Some(record.id),
-                                egui::Button::new("Delete retained audio")
-                                    .min_size([176.0, 44.0].into()),
                             );
-                            if delete_audio.clicked() {
+                            if history_action_activated(ui, &delete_audio) {
                                 action = Some(HistoryPageAction::DeleteAudio(record.id));
-                                ui.close_menu();
+                                ui.memory_mut(|memory| memory.close_popup());
                             }
                         }
                         ui.separator();
-                        let delete_entry = ui.add_enabled(
+                        let delete_entry = history_menu_item(
+                            ui,
+                            popup_id.with("delete-entry"),
+                            "Delete entry",
+                            144.0,
                             !work_active,
-                            egui::Button::new("Delete entry").min_size([144.0, 44.0].into()),
                         );
-                        if delete_entry.clicked() {
+                        if history_action_activated(ui, &delete_entry) {
                             action = Some(HistoryPageAction::RequestDelete(record.id));
-                            ui.close_menu();
+                            ui.memory_mut(|memory| memory.close_popup());
                         }
-                    },
-                );
-                set_accessible_description(
-                    ui,
-                    &more.response,
-                    &format!("Shows additional actions for {entry_context}"),
-                );
-                if focus_more_action == Some(record.id) {
-                    more.response.request_focus();
+                        });
+
+                    });
+                }
+                let tab_pressed = popup_open && ui.input(|input| input.key_pressed(egui::Key::Tab));
+                if escape_pressed
+                    || tab_pressed
+                    || (popup_open && more.clicked_elsewhere() && action.is_none())
+                {
+                    ui.memory_mut(|memory| memory.close_popup());
+                    more.request_focus();
                 }
             });
 
             if confirm_delete == Some(record.id) {
                 ui.add_space(8.0);
                 let prompt = ui.colored_label(
-                    ui.visuals().warn_fg_color,
+                    ui_palette(ui).warning,
                     "Delete this transcript and any retained audio? This cannot be undone.",
                 );
                 ui.ctx().accesskit_node_builder(prompt.id, |builder| {
@@ -526,7 +711,7 @@ pub(crate) fn history_page(
                         &confirm,
                         &format!("Permanently deletes {entry_context}"),
                     );
-                    if confirm.clicked() {
+                    if history_action_activated(ui, &confirm) {
                         action = Some(HistoryPageAction::ConfirmDelete(record.id));
                     }
                     let cancel = ui.add_sized([88.0, 44.0], egui::Button::new("Cancel"));
@@ -537,8 +722,9 @@ pub(crate) fn history_page(
                     );
                     if focus_delete_confirmation {
                         cancel.request_focus();
+                        scroll_focused_control_into_view(ui, &cancel);
                     }
-                    if cancel.clicked() {
+                    if history_action_activated(ui, &cancel) {
                         action = Some(HistoryPageAction::CancelDelete);
                     }
                 });
@@ -573,9 +759,9 @@ fn history_status_label(status: HistoryStatus) -> &'static str {
 
 fn history_status_color(ui: &egui::Ui, status: HistoryStatus) -> egui::Color32 {
     match status {
-        HistoryStatus::Pending => ui.visuals().warn_fg_color,
+        HistoryStatus::Pending => ui_palette(ui).warning,
         HistoryStatus::Completed => ui_palette(ui).success_text,
-        HistoryStatus::Failed => ui.visuals().error_fg_color,
+        HistoryStatus::Failed => ui_palette(ui).error_text,
     }
 }
 
@@ -645,6 +831,16 @@ mod tests {
     use super::*;
     use crate::ui::configure_accessible_style;
 
+    fn empty_model_names() -> &'static HashMap<String, String> {
+        static EMPTY: std::sync::OnceLock<HashMap<String, String>> = std::sync::OnceLock::new();
+        EMPTY.get_or_init(HashMap::new)
+    }
+
+    fn empty_expanded_entries() -> &'static HashSet<i64> {
+        static EMPTY: std::sync::OnceLock<HashSet<i64>> = std::sync::OnceLock::new();
+        EMPTY.get_or_init(HashSet::new)
+    }
+
     fn render_history(
         ctx: &egui::Context,
         search: &mut String,
@@ -690,9 +886,9 @@ mod tests {
             playing: None,
             playback_stopping: false,
             armed_repaste: None,
-            model_names: &HashMap::new(),
-            expanded_transcripts: &HashSet::new(),
-            expanded_details: &HashSet::new(),
+            model_names: empty_model_names(),
+            expanded_transcripts: empty_expanded_entries(),
+            expanded_details: empty_expanded_entries(),
             focus_search,
             focus_delete_confirmation: false,
             focus_more_action: None,
@@ -1045,16 +1241,16 @@ mod tests {
                         expanded_details: &expanded_details,
                         focus_search: false,
                         focus_delete_confirmation: false,
-                        focus_more_action: None,
+                        focus_more_action: Some(record.id),
                     },
                 );
             });
         });
-        let nodes = &output
+        let update = output
             .platform_output
             .accesskit_update
-            .expect("expanded details should update AccessKit")
-            .nodes;
+            .expect("expanded details should update AccessKit");
+        let nodes = &update.nodes;
         for expected in [
             "Model: Whisper Base — English",
             "Output: pasted safely",
@@ -1069,6 +1265,159 @@ mod tests {
                 nodes.iter().any(|(_, node)| node.name() == Some(expected)),
                 "missing expanded History detail: {expected}"
             );
+        }
+        assert_eq!(
+            nodes
+                .iter()
+                .find_map(|(id, node)| (*id == update.focus).then(|| node.name()))
+                .flatten(),
+            Some("More actions")
+        );
+    }
+
+    #[test]
+    fn empty_final_text_uses_raw_once_and_details_keep_complete_fallback_metadata() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let record = HistoryRecord {
+            id: 8,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            completed_at_ms: Some(1),
+            status: HistoryStatus::Completed,
+            raw_text: "raw transcript used as the display transcript".to_owned(),
+            final_text: Some("   ".to_owned()),
+            model_id: "removed-custom-model".to_owned(),
+            metrics: crate::history::HistoryMetrics::default(),
+            pinned: false,
+            source_app: None,
+            audio_path: None,
+            failure: None,
+            retry_count: 0,
+            output_outcome: None,
+        };
+        let expanded_details = HashSet::from([record.id]);
+        let mut search = String::new();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                history_page(
+                    ui,
+                    HistoryPageState {
+                        search: &mut search,
+                        records: std::slice::from_ref(&record),
+                        has_more: false,
+                        loading: false,
+                        error: None,
+                        confirm_delete: None,
+                        work_active: false,
+                        playing: None,
+                        playback_stopping: false,
+                        armed_repaste: None,
+                        model_names: empty_model_names(),
+                        expanded_transcripts: empty_expanded_entries(),
+                        expanded_details: &expanded_details,
+                        focus_search: false,
+                        focus_delete_confirmation: false,
+                        focus_more_action: None,
+                    },
+                );
+            });
+        });
+        let nodes = &output
+            .platform_output
+            .accesskit_update
+            .expect("expanded details should update AccessKit")
+            .nodes;
+
+        for expected in [
+            "raw transcript used as the display transcript",
+            "Model: Removed or custom model",
+            "Model ID: removed-custom-model",
+            "Output: Not recorded",
+            "Retries: 0",
+        ] {
+            assert!(
+                nodes.iter().any(|(_, node)| node.name() == Some(expected)),
+                "missing fallback History detail: {expected}"
+            );
+        }
+        assert!(nodes.iter().all(|(_, node)| {
+            !matches!(node.name(), Some("Raw transcript") | Some("Copy raw"))
+        }));
+    }
+
+    #[test]
+    fn loading_error_and_empty_history_use_one_visible_state_treatment() {
+        fn collect_text(shape: &egui::epaint::Shape, output: &mut Vec<String>) {
+            match shape {
+                egui::epaint::Shape::Text(text) => output.push(text.galley.text().to_owned()),
+                egui::epaint::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        collect_text(shape, output);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        for (loading, error, expected, forbidden) in [
+            (
+                true,
+                None,
+                "Loading local history…",
+                "Loading local history",
+            ),
+            (
+                false,
+                Some("History unavailable"),
+                "History unavailable",
+                "History error: History unavailable",
+            ),
+            (false, None, "No matching history entries", ""),
+        ] {
+            let ctx = egui::Context::default();
+            let mut search = String::new();
+            let output = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    history_page(
+                        ui,
+                        HistoryPageState {
+                            search: &mut search,
+                            records: &[],
+                            has_more: false,
+                            loading,
+                            error,
+                            confirm_delete: None,
+                            work_active: false,
+                            playing: None,
+                            playback_stopping: false,
+                            armed_repaste: None,
+                            model_names: empty_model_names(),
+                            expanded_transcripts: empty_expanded_entries(),
+                            expanded_details: empty_expanded_entries(),
+                            focus_search: false,
+                            focus_delete_confirmation: false,
+                            focus_more_action: None,
+                        },
+                    );
+                });
+            });
+            let mut painted = Vec::new();
+            for shape in &output.shapes {
+                collect_text(&shape.shape, &mut painted);
+            }
+            assert_eq!(
+                painted
+                    .iter()
+                    .filter(|text| text.as_str() == expected)
+                    .count(),
+                1,
+                "History state should be painted once: {painted:?}"
+            );
+            if !forbidden.is_empty() {
+                assert!(painted.iter().all(|text| text != forbidden));
+            }
         }
     }
 }
