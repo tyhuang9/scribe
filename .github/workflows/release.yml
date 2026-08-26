@@ -188,22 +188,32 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ steps.release-metadata.outputs.tag }}
         run: |
-          $null = & git ls-remote --exit-code --tags origin "refs/tags/$env:RELEASE_TAG" 2>$null
-          $tagLookupExit = $LASTEXITCODE
-          if ($tagLookupExit -eq 0) {
-            throw "Tag $env:RELEASE_TAG already exists; refusing to overwrite it"
-          }
-          if ($tagLookupExit -ne 2) {
-            throw "Could not confirm that tag $env:RELEASE_TAG is absent (git exit $tagLookupExit)"
-          }
+          $savedNativeErrorPreference = $PSNativeCommandUseErrorActionPreference
+          try {
+            $PSNativeCommandUseErrorActionPreference = $false
 
-          $releaseLookup = @(& gh api "repos/$env:GITHUB_REPOSITORY/releases/tags/$env:RELEASE_TAG" --silent 2>&1)
-          $releaseLookupExit = $LASTEXITCODE
-          if ($releaseLookupExit -eq 0) {
-            throw "Release $env:RELEASE_TAG already exists; refusing to overwrite it"
+            $null = & git ls-remote --exit-code --tags origin "refs/tags/$env:RELEASE_TAG" 2>$null
+            $tagLookupExit = $LASTEXITCODE
+            if ($tagLookupExit -eq 0) {
+              throw "Tag $env:RELEASE_TAG already exists; refusing to overwrite it"
+            }
+            if ($tagLookupExit -ne 2) {
+              throw "Could not confirm that tag $env:RELEASE_TAG is absent (git exit $tagLookupExit)"
+            }
+
+            $releaseLookup = @(& gh api "repos/$env:GITHUB_REPOSITORY/releases/tags/$env:RELEASE_TAG" --silent 2>&1)
+            $releaseLookupExit = $LASTEXITCODE
+            if ($releaseLookupExit -eq 0) {
+              throw "Release $env:RELEASE_TAG already exists; refusing to overwrite it"
+            }
+            if (($releaseLookup -join "`n") -notmatch '\(HTTP 404\)') {
+              throw "Could not confirm that release $env:RELEASE_TAG is absent: $($releaseLookup -join ' ')"
+            }
+
+            $global:LASTEXITCODE = 0
           }
-          if (($releaseLookup -join "`n") -notmatch '\(HTTP 404\)') {
-            throw "Could not confirm that release $env:RELEASE_TAG is absent: $($releaseLookup -join ' ')"
+          finally {
+            $PSNativeCommandUseErrorActionPreference = $savedNativeErrorPreference
           }
 
       - name: Download verified release assets
