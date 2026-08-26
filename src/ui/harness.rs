@@ -4,6 +4,7 @@ use eframe::egui::{self, CentralPanel, Frame};
 use std::time::{Duration, Instant};
 
 use crate::{
+    config::SpeechDetectionMode,
     overlay::{
         self, OverlayAudioLevel, OverlayMode, OverlayPhase, OverlayPosition, OverlayPresentation,
         OverlayTranscript, OverlayViewState,
@@ -171,7 +172,8 @@ impl Fixture {
             duration_label: "30 seconds".into(),
             provisional_feedback: true,
             device_label: "Microphone (fifine Microphone)".into(),
-            speech_detection_sensitivity_percent: 38,
+            voice_detection_mode: SpeechDetectionMode::ManualThreshold,
+            input_threshold_dbfs: -42.0,
             input_level_percent: 68,
             ..Default::default()
         };
@@ -1054,8 +1056,11 @@ fn apply_action(data: &mut FixtureData, page: &mut AppPage, action: ScreenAction
             data.settings.selected_audio_device = device.clone();
             data.settings.device_label = device.unwrap_or_else(|| "OS default".into());
         }
-        ScreenAction::SetSpeechDetectionSensitivity(percent) => {
-            data.settings.speech_detection_sensitivity_percent = percent;
+        ScreenAction::SetVoiceDetectionMode(mode) => {
+            data.settings.voice_detection_mode = mode;
+        }
+        ScreenAction::SetInputThresholdDbfs(dbfs) => {
+            data.settings.input_threshold_dbfs = f32::from(dbfs);
         }
         ScreenAction::RefreshDevices | ScreenAction::ChangeShortcut => {}
         ScreenAction::SetAutoInsertTranscript(value) => {
@@ -3672,10 +3677,15 @@ mod tests {
     #[test]
     fn settings_recording_fixture_contains_visible_live_meter_signal() {
         let data = Fixture::SettingsRecording.data();
-        assert_eq!(data.settings.speech_detection_sensitivity_percent, 38);
+        assert_eq!(
+            data.settings.voice_detection_mode,
+            SpeechDetectionMode::ManualThreshold
+        );
+        assert_eq!(data.settings.input_threshold_dbfs, -42.0);
         assert_eq!(data.settings.input_level_percent, 68);
         assert!(
-            data.settings.input_level_percent > data.settings.speech_detection_sensitivity_percent,
+            data.settings.input_level_percent
+                > ((data.settings.input_threshold_dbfs + 72.0) / 72.0 * 100.0) as u8,
             "the deterministic fixture should visibly cross the configured threshold"
         );
     }

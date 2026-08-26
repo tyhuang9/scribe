@@ -6,8 +6,8 @@ use serde_json::{Map, Value};
 
 use super::schema::{
     AppConfig, CURRENT_SCHEMA_VERSION, DeveloperSettings, GeneralSettings, HistorySettings,
-    OutputSettings, OverlaySettings, PerformanceSettings, RecordingSettings, StreamingSettings,
-    UnknownFields,
+    OutputSettings, OverlaySettings, PerformanceSettings, RecordingSettings, SpeechDetectionMode,
+    StreamingSettings, UnknownFields,
 };
 use crate::transcription::AccelerationPreference;
 
@@ -76,6 +76,7 @@ fn parse_sectioned(mut root: Map<String, Value>, diagnostics: &mut ParseDiagnost
     );
     let recording = parse_recording(
         take_section(&mut root, "recording", &[], diagnostics),
+        stored_schema_version,
         diagnostics,
     );
     let streaming = parse_streaming(
@@ -250,9 +251,18 @@ fn migrate_legacy_flat(
         config.recording.vad_enabled,
         diagnostics,
     );
-    config.recording.speech_probability_threshold = take_speech_probability_threshold(
+    config.recording.speech_detection_mode = take(
         &mut root,
-        config.recording.speech_probability_threshold,
+        "speech_detection_mode",
+        &[],
+        SpeechDetectionMode::Ai,
+        diagnostics,
+    );
+    config.recording.input_threshold_dbfs = take_input_threshold_dbfs(
+        &mut root,
+        config.recording.input_threshold_dbfs,
+        true,
+        true,
         diagnostics,
     );
     config.recording.speech_confirmation_ms = take(
@@ -457,32 +467,51 @@ fn parse_general(
     }
 }
 
-fn take_speech_probability_threshold(
+fn take_input_threshold_dbfs(
     section: &mut Map<String, Value>,
     default: f32,
+    discard_legacy_fields: bool,
+    convert_legacy_rms: bool,
     diagnostics: &mut ParseDiagnostics,
 ) -> f32 {
-    let has_current_value = section.contains_key("speech_probability_threshold");
-    let threshold = take(
-        section,
-        "speech_probability_threshold",
-        &[],
-        default,
-        diagnostics,
-    );
-    // Legacy RMS values have no meaningful probability conversion. Their
-    // presence migrates to the recommended threshold unless the new field is
-    // explicitly present.
-    section.remove("manual_activation_rms");
-    if has_current_value {
+    if discard_legacy_fields && !convert_legacy_rms {
+        // Version 2 predates the literal threshold and selected mode. Do not
+        // reinterpret any stray values as a user choice during this upgrade.
+        section.remove("input_threshold_dbfs");
+        section.remove("speech_probability_threshold");
+        section.remove("manual_activation_rms");
+        return default;
+    }
+    let has_current_value = section.contains_key("input_threshold_dbfs");
+    let threshold = take(section, "input_threshold_dbfs", &[], default, diagnostics);
+    if !discard_legacy_fields {
+        return threshold;
+    }
+    // The old probability setting no longer controls a capture mode. Remove it
+    // rather than serializing a dormant, misleading option back to disk.
+    section.remove("speech_probability_threshold");
+    if has_current_value || !convert_legacy_rms {
+        section.remove("manual_activation_rms");
         threshold
     } else {
-        default
+        match section.remove("manual_activation_rms") {
+            Some(Value::Number(value)) => value
+                .as_f64()
+                .filter(|rms| rms.is_finite() && *rms > 0.0)
+                .map(|rms| (20.0 * rms.log10()) as f32)
+                .unwrap_or(default),
+            Some(_) => {
+                diagnostics.invalid_values_salvaged = true;
+                default
+            }
+            None => default,
+        }
     }
 }
 
 fn parse_recording(
     mut section: Map<String, Value>,
+    stored_schema_version: u32,
     diagnostics: &mut ParseDiagnostics,
 ) -> RecordingSettings {
     let defaults = RecordingSettings::default();
@@ -516,9 +545,23 @@ fn parse_recording(
             defaults.vad_enabled,
             diagnostics,
         ),
-        speech_probability_threshold: take_speech_probability_threshold(
+        speech_detection_mode: if stored_schema_version == 2 {
+            section.remove("speech_detection_mode");
+            SpeechDetectionMode::Ai
+        } else {
+            take(
+                &mut section,
+                "speech_detection_mode",
+                &[],
+                SpeechDetectionMode::Ai,
+                diagnostics,
+            )
+        },
+        input_threshold_dbfs: take_input_threshold_dbfs(
             &mut section,
-            defaults.speech_probability_threshold,
+            defaults.input_threshold_dbfs,
+            stored_schema_version < CURRENT_SCHEMA_VERSION,
+            stored_schema_version < 2,
             diagnostics,
         ),
         speech_confirmation_ms: take(
@@ -864,7 +907,11 @@ mod tests {
         );
         assert_eq!(config.recording.hotkey, "Alt+Space");
         assert!(!config.recording.vad_enabled);
-        assert_eq!(config.recording.speech_probability_threshold, 0.5);
+        assert_eq!(
+            config.recording.speech_detection_mode,
+            SpeechDetectionMode::Ai
+        );
+        assert!((config.recording.input_threshold_dbfs - 20.0 * 0.031_f32.log10()).abs() < 1e-5);
         assert_eq!(config.recording.speech_confirmation_ms, 180);
         assert_eq!(config.recording.internal_pause_ms, 520);
         assert_eq!(config.recording.endpoint_silence_ms, 980);
@@ -897,8 +944,12 @@ mod tests {
         assert_eq!(config.recording.pre_roll_ms, 250);
         assert_eq!(config.recording.post_roll_ms, 200);
         assert_eq!(
-            config.recording.speech_probability_threshold,
-            RecordingSettings::default().speech_probability_threshold
+            config.recording.speech_detection_mode,
+            SpeechDetectionMode::Ai
+        );
+        assert_eq!(
+            config.recording.input_threshold_dbfs,
+            RecordingSettings::default().input_threshold_dbfs
         );
         assert_eq!(config.output.paste_delay_ms, 75);
         assert_eq!(config.overlay.mode, OverlayMode::Minimal);
@@ -915,9 +966,9 @@ mod tests {
     }
 
     #[test]
-    fn legacy_rms_sensitivity_migrates_to_recommended_probability_threshold() {
+    fn invalid_legacy_rms_defaults_to_the_safe_manual_threshold() {
         let (config, diagnostics) = parse_settings_value_with_diagnostics(json!({
-            "schema_version": CURRENT_SCHEMA_VERSION,
+            "schema_version": 1,
             "recording": {
                 "sensitivity_mode": "not-a-mode",
                 "manual_activation_rms": "not-a-number",
@@ -925,7 +976,11 @@ mod tests {
             }
         }));
 
-        assert_eq!(config.recording.speech_probability_threshold, 0.5);
+        assert_eq!(
+            config.recording.speech_detection_mode,
+            SpeechDetectionMode::Ai
+        );
+        assert_eq!(config.recording.input_threshold_dbfs, -42.0);
         assert_eq!(
             config.recording.unknown["future_microphone_option"],
             json!({"kept": true})
@@ -934,7 +989,7 @@ mod tests {
             config.recording.unknown["sensitivity_mode"],
             json!("not-a-mode")
         );
-        assert!(!diagnostics.invalid_values_salvaged);
+        assert!(diagnostics.invalid_values_salvaged);
         assert_eq!(
             serde_json::to_value(config).unwrap()["recording"]["future_microphone_option"],
             json!({"kept": true})
@@ -944,7 +999,7 @@ mod tests {
     #[test]
     fn explicit_hotkey_and_mode_are_preserved_without_a_schema_migration() {
         let config = parse_settings_value(json!({
-            "schema_version": CURRENT_SCHEMA_VERSION,
+            "schema_version": 2,
             "recording": {
                 "hotkey": "Alt+Shift+R",
                 "hotkey_mode": "toggle"
@@ -957,25 +1012,84 @@ mod tests {
     }
 
     #[test]
-    fn current_probability_threshold_wins_over_legacy_rms_and_round_trips() {
+    fn detection_mode_and_manual_dbfs_threshold_round_trip() {
         let config = parse_settings_value(json!({
             "schema_version": CURRENT_SCHEMA_VERSION,
+            "recording": {
+                "speech_detection_mode": "manual_threshold",
+                "input_threshold_dbfs": -37.0,
+                "future_recording_option": {"preserved": true}
+            }
+        }));
+
+        assert_eq!(
+            config.recording.speech_detection_mode,
+            SpeechDetectionMode::ManualThreshold
+        );
+        assert_eq!(config.recording.input_threshold_dbfs, -37.0);
+        let serialized = serde_json::to_value(config).unwrap();
+        assert_eq!(
+            serialized["recording"]["speech_detection_mode"],
+            json!("manual_threshold")
+        );
+        assert_eq!(
+            serialized["recording"]["input_threshold_dbfs"],
+            json!(-37.0)
+        );
+        assert_eq!(
+            serialized["recording"]["future_recording_option"],
+            json!({"preserved": true})
+        );
+    }
+
+    #[test]
+    fn version_two_probability_settings_migrate_to_ai_and_do_not_round_trip() {
+        let config = parse_settings_value(json!({
+            "schema_version": 2,
             "recording": {
                 "speech_probability_threshold": 0.35,
                 "manual_activation_rms": 0.99
             }
         }));
 
-        assert_eq!(config.recording.speech_probability_threshold, 0.35);
-        let serialized = serde_json::to_value(config).unwrap();
-        assert!(
-            (serialized["recording"]["speech_probability_threshold"]
-                .as_f64()
-                .unwrap()
-                - 0.35)
-                .abs()
-                < 1e-6
+        assert_eq!(
+            config.recording.speech_detection_mode,
+            SpeechDetectionMode::Ai
         );
+        assert_eq!(
+            config.recording.input_threshold_dbfs,
+            RecordingSettings::default().input_threshold_dbfs
+        );
+        let serialized = serde_json::to_value(config).unwrap();
+        assert_eq!(
+            serialized["recording"]["speech_detection_mode"],
+            json!("ai")
+        );
+        assert!(
+            serialized["recording"]
+                .get("speech_probability_threshold")
+                .is_none()
+        );
+        assert!(
+            serialized["recording"]
+                .get("manual_activation_rms")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn version_one_manual_rms_converts_to_the_dormant_manual_threshold() {
+        let config = parse_settings_value(json!({
+            "schema_version": 1,
+            "recording": {"manual_activation_rms": 0.1}
+        }));
+
+        assert_eq!(
+            config.recording.speech_detection_mode,
+            SpeechDetectionMode::Ai
+        );
+        assert!((config.recording.input_threshold_dbfs + 20.0).abs() < 1e-5);
+        let serialized = serde_json::to_value(config).unwrap();
         assert!(
             serialized["recording"]
                 .get("manual_activation_rms")
@@ -1146,7 +1260,8 @@ mod tests {
             "recording": {
                 "vad_enabled": false,
                 "sensitivity_mode": "manual",
-                "manual_activation_rms": 0.02,
+                "speech_detection_mode": "manual_threshold",
+                "input_threshold_dbfs": -37.0,
                 "speech_confirmation_ms": 200,
                 "internal_pause_ms": 500,
                 "endpoint_silence_ms": 1000,
@@ -1157,7 +1272,11 @@ mod tests {
         }));
 
         assert!(!config.recording.vad_enabled);
-        assert_eq!(config.recording.speech_probability_threshold, 0.5);
+        assert_eq!(
+            config.recording.speech_detection_mode,
+            SpeechDetectionMode::ManualThreshold
+        );
+        assert_eq!(config.recording.input_threshold_dbfs, -37.0);
         assert_eq!(config.recording.speech_confirmation_ms, 200);
         assert_eq!(config.recording.internal_pause_ms, 500);
         assert_eq!(config.recording.endpoint_silence_ms, 1000);
@@ -1170,13 +1289,12 @@ mod tests {
         );
         assert_eq!(serialized["recording"]["sensitivity_mode"], json!("manual"));
         assert_eq!(
-            serialized["recording"]["speech_probability_threshold"],
-            json!(0.5)
+            serialized["recording"]["speech_detection_mode"],
+            json!("manual_threshold")
         );
-        assert!(
-            serialized["recording"]
-                .get("manual_activation_rms")
-                .is_none()
+        assert_eq!(
+            serialized["recording"]["input_threshold_dbfs"],
+            json!(-37.0)
         );
     }
 
@@ -1273,6 +1391,11 @@ mod tests {
                 "selected_default_model": "whisper_cpp_base_en",
                 "future_general": [1, 2, 3]
             },
+            "recording": {
+                "manual_activation_rms": 0.99,
+                "speech_probability_threshold": 0.35,
+                "future_recording": {"kept": true}
+            },
             "streaming": {"future_streaming": {"enabled": true}},
             "future_root": {"format": "new"}
         });
@@ -1282,6 +1405,18 @@ mod tests {
 
         assert_eq!(serialized["schema_version"], CURRENT_SCHEMA_VERSION + 7);
         assert_eq!(serialized["general"]["future_general"], json!([1, 2, 3]));
+        assert_eq!(
+            serialized["recording"]["manual_activation_rms"],
+            json!(0.99)
+        );
+        assert_eq!(
+            serialized["recording"]["speech_probability_threshold"],
+            json!(0.35)
+        );
+        assert_eq!(
+            serialized["recording"]["future_recording"],
+            json!({"kept": true})
+        );
         assert_eq!(
             serialized["streaming"]["future_streaming"],
             json!({"enabled": true})

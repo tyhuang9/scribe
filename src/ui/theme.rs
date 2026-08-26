@@ -251,14 +251,12 @@ mod tests {
     }
 
     #[test]
-    fn live_meter_fill_has_non_text_contrast_against_both_track_regions() {
+    fn both_live_meter_fill_states_have_non_text_contrast_against_track_regions() {
         for palette in [ThemePalette::light(), ThemePalette::dark()] {
-            assert!(
-                contrast_ratio(palette.slider_live_above, palette.slider_threshold_fill) >= 3.0
-            );
-            assert!(
-                contrast_ratio(palette.slider_live_above, palette.slider_remainder_fill) >= 3.0
-            );
+            for fill in [palette.slider_live_below, palette.slider_live_above] {
+                assert!(contrast_ratio(fill, palette.slider_threshold_fill) >= 3.0);
+                assert!(contrast_ratio(fill, palette.slider_remainder_fill) >= 3.0);
+            }
         }
     }
 
@@ -271,12 +269,11 @@ mod tests {
                     palette.slider_remainder_fill
                 ) >= 3.0
             );
-            assert!(
-                contrast_ratio(
-                    palette.sensitivity_marker_on_live,
-                    palette.slider_live_above
-                ) >= 3.0
-            );
+            for fill in [palette.slider_live_below, palette.slider_live_above] {
+                let outer_ring_contrast = contrast_ratio(palette.sensitivity_marker_on_track, fill);
+                let inner_ring_contrast = contrast_ratio(palette.sensitivity_marker_on_live, fill);
+                assert!(outer_ring_contrast.max(inner_ring_contrast) >= 3.0);
+            }
         }
     }
 

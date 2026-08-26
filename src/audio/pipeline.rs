@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
+#[cfg(test)]
 use crate::onnx_worker::SileroVadDecision;
 use crate::prepared_audio::{PREPARED_SAMPLE_RATE, PreparedAudio};
 use crate::silero_vad_native::WINDOW_SAMPLES;
@@ -9,10 +10,12 @@ use crate::streaming::{DECODE_INTERVAL_MS, PreviewAudioPublisher, ROLLING_WINDOW
 
 use super::{
     CaptureError, CaptureIntent, CaptureOptions, CaptureStopReason, LevelSnapshot,
-    MAX_CAPTURE_PREPARED_FRAMES, SpeechDetector, VadOptions, input_format_is_credible,
+    MAX_CAPTURE_PREPARED_FRAMES, SpeechDetectionMode, SpeechDetector, VadOptions,
+    input_format_is_credible,
 };
 
 const LEVEL_WINDOW_SAMPLES: usize = (PREPARED_SAMPLE_RATE as usize) * 30 / 1_000;
+const MANUAL_GATE_WINDOW_SAMPLES: usize = LEVEL_WINDOW_SAMPLES;
 const SIGNAL_DIAGNOSTIC_WINDOW_SAMPLES: usize = (PREPARED_SAMPLE_RATE as usize) / 100;
 const TARGET_RMS: f32 = 0.1;
 const TARGET_PEAK_CEILING: f32 = 0.95;
@@ -36,6 +39,7 @@ pub(super) struct Pipeline {
     levels: LevelTracker,
     vad_enabled: bool,
     vad: VadTracker,
+    manual_gate: Option<ManualThresholdGate>,
     preview_publisher: Option<PreviewAudioPublisher>,
     next_preview_frame: usize,
 }
@@ -59,12 +63,21 @@ impl Pipeline {
             });
         }
         options.vad.validate()?;
+        options.detection_mode.validate()?;
         let vad_enabled = options.vad_enabled && options.intent == CaptureIntent::Dictation;
-        if vad_enabled != detector.is_some() {
+        let requires_detector =
+            vad_enabled && matches!(options.detection_mode, SpeechDetectionMode::Ai);
+        if requires_detector != detector.is_some() {
             return Err(CaptureError::InvalidOptions(
-                "speech-classifying capture requires exactly one Silero VAD session",
+                "AI speech-classifying capture requires exactly one Silero VAD session",
             ));
         }
+        let manual_gate = match (options.intent, options.detection_mode) {
+            (CaptureIntent::Dictation, SpeechDetectionMode::ManualThreshold { threshold_rms }) => {
+                Some(ManualThresholdGate::new(threshold_rms))
+            }
+            _ => None,
+        };
         Ok(Self {
             source_sample_rate,
             source_channels,
@@ -78,6 +91,7 @@ impl Pipeline {
             levels: LevelTracker::new(level_bits, peak_bits, level_observed, level_revision),
             vad_enabled,
             vad: VadTracker::new(options.vad, options.endpointing_enabled, detector),
+            manual_gate,
             preview_publisher: None,
             next_preview_frame: PREVIEW_INTERVAL_FRAMES,
         })
@@ -107,21 +121,34 @@ impl Pipeline {
         let limit_exceeded = &mut self.limit_exceeded;
         let levels = &mut self.levels;
         let vad = &mut self.vad;
+        let manual_gate = &mut self.manual_gate;
         let vad_enabled = self.vad_enabled;
         let retain_audio = self.retain_audio;
         let mut vad_result = Ok(());
         self.resampler.push(mono, |output| {
-            if retain_audio {
-                push_bounded(
-                    prepared,
-                    limit_exceeded,
-                    output,
-                    MAX_CAPTURE_PREPARED_FRAMES,
-                );
-            }
             levels.push(output);
-            if vad_enabled && vad_result.is_ok() {
-                vad_result = vad.push(output);
+            if let Some(gate) = manual_gate.as_mut() {
+                gate.push(output);
+                if let Some((speech, samples, count)) = gate.flush_complete() {
+                    if retain_audio {
+                        push_gate_window(prepared, limit_exceeded, &samples[..count], speech);
+                    }
+                    if vad_enabled {
+                        vad.push_manual_window(speech, count);
+                    }
+                }
+            } else {
+                if retain_audio {
+                    push_bounded(
+                        prepared,
+                        limit_exceeded,
+                        output,
+                        MAX_CAPTURE_PREPARED_FRAMES,
+                    );
+                }
+                if vad_enabled && vad_result.is_ok() {
+                    vad_result = vad.push_ai(output);
+                }
             }
         });
         if vad_result.is_err() {
@@ -201,23 +228,46 @@ impl Pipeline {
         let limit_exceeded = &mut self.limit_exceeded;
         let levels = &mut self.levels;
         let vad = &mut self.vad;
+        let manual_gate = &mut self.manual_gate;
         let vad_enabled = self.vad_enabled;
         let retain_audio = self.retain_audio;
         let mut vad_result = Ok(());
         self.resampler.finish(|output| {
-            if retain_audio {
-                push_bounded(
-                    prepared,
-                    limit_exceeded,
-                    output,
-                    MAX_CAPTURE_PREPARED_FRAMES,
-                );
-            }
             levels.push(output);
-            if vad_enabled && vad_result.is_ok() {
-                vad_result = vad.push(output);
+            if let Some(gate) = manual_gate.as_mut() {
+                gate.push(output);
+                if let Some((speech, samples, count)) = gate.flush_complete() {
+                    if retain_audio {
+                        push_gate_window(prepared, limit_exceeded, &samples[..count], speech);
+                    }
+                    if vad_enabled {
+                        vad.push_manual_window(speech, count);
+                    }
+                }
+            } else {
+                if retain_audio {
+                    push_bounded(
+                        prepared,
+                        limit_exceeded,
+                        output,
+                        MAX_CAPTURE_PREPARED_FRAMES,
+                    );
+                }
+                if vad_enabled && vad_result.is_ok() {
+                    vad_result = vad.push_ai(output);
+                }
             }
         });
+        if let Some(gate) = manual_gate.as_mut()
+            && let Some((speech, samples, count)) = gate.flush_partial()
+        {
+            if retain_audio {
+                push_gate_window(prepared, limit_exceeded, &samples[..count], speech);
+            }
+            if vad_enabled {
+                vad.push_manual_window(speech, count);
+            }
+        }
         if let Err(error) = vad_result {
             self.invalidate_preview();
             return Err(error);
@@ -292,6 +342,12 @@ impl Pipeline {
         self.levels.maximum()
     }
 
+    pub(super) fn manual_threshold_crossed(&self) -> bool {
+        self.manual_gate
+            .as_ref()
+            .is_some_and(ManualThresholdGate::has_crossed_threshold)
+    }
+
     pub(super) fn cancel_speech_detector(&mut self) -> Result<(), CaptureError> {
         self.invalidate_preview();
         self.vad.cancel_detector()
@@ -334,6 +390,72 @@ fn push_bounded(samples: &mut Vec<f32>, exceeded: &mut bool, sample: f32, maximu
         samples.push(sample);
     } else {
         *exceeded = true;
+    }
+}
+
+fn push_gate_window(
+    prepared: &mut Vec<f32>,
+    exceeded: &mut bool,
+    samples: &[f32],
+    passes_threshold: bool,
+) {
+    for &sample in samples {
+        push_bounded(
+            prepared,
+            exceeded,
+            if passes_threshold { sample } else { 0.0 },
+            MAX_CAPTURE_PREPARED_FRAMES,
+        );
+    }
+}
+
+struct ManualThresholdGate {
+    threshold_rms: f32,
+    samples: [f32; MANUAL_GATE_WINDOW_SAMPLES],
+    count: usize,
+    crossed_threshold: bool,
+}
+
+impl ManualThresholdGate {
+    fn new(threshold_rms: f32) -> Self {
+        Self {
+            threshold_rms,
+            samples: [0.0; MANUAL_GATE_WINDOW_SAMPLES],
+            count: 0,
+            crossed_threshold: false,
+        }
+    }
+
+    fn push(&mut self, sample: f32) {
+        self.samples[self.count] = finite_unit(sample);
+        self.count += 1;
+    }
+
+    fn flush_complete(&mut self) -> Option<(bool, [f32; MANUAL_GATE_WINDOW_SAMPLES], usize)> {
+        (self.count == MANUAL_GATE_WINDOW_SAMPLES).then(|| self.flush())
+    }
+
+    fn flush_partial(&mut self) -> Option<(bool, [f32; MANUAL_GATE_WINDOW_SAMPLES], usize)> {
+        (self.count > 0).then(|| self.flush())
+    }
+
+    fn flush(&mut self) -> (bool, [f32; MANUAL_GATE_WINDOW_SAMPLES], usize) {
+        let count = self.count;
+        let rms = (self.samples[..count]
+            .iter()
+            .map(|sample| f64::from(*sample) * f64::from(*sample))
+            .sum::<f64>()
+            / count as f64)
+            .sqrt() as f32;
+        let samples = self.samples;
+        self.count = 0;
+        let passes_threshold = rms >= self.threshold_rms;
+        self.crossed_threshold |= passes_threshold;
+        (passes_threshold, samples, count)
+    }
+
+    fn has_crossed_threshold(&self) -> bool {
+        self.crossed_threshold
     }
 }
 
@@ -594,7 +716,7 @@ impl VadTracker {
         }
     }
 
-    fn push(&mut self, sample: f32) -> Result<(), CaptureError> {
+    fn push_ai(&mut self, sample: f32) -> Result<(), CaptureError> {
         let sample = finite_unit(sample);
         self.window[self.window_samples] = sample;
         self.window_samples += 1;
@@ -607,25 +729,30 @@ impl VadTracker {
                     "Silero VAD session disappeared during capture",
                 ))?
                 .compute(&self.window)?;
-            self.process_window(decision);
+            self.process_window(decision.speech, decision.probability, WINDOW_SAMPLES);
             self.window_samples = 0;
         }
         Ok(())
     }
 
-    fn process_window(&mut self, decision: SileroVadDecision) {
+    fn push_manual_window(&mut self, speech: bool, sample_count: usize) {
+        self.processed_samples = self.processed_samples.saturating_add(sample_count);
+        self.process_window(speech, if speech { 1.0 } else { 0.0 }, sample_count);
+    }
+
+    fn process_window(&mut self, speech: bool, probability: f32, sample_count: usize) {
         if self.endpoint_frame.is_some() {
             return;
         }
-        self.last_probability = decision.probability;
+        self.last_probability = probability;
         let frame_end = self.processed_samples;
-        let frame_start = frame_end.saturating_sub(WINDOW_SAMPLES);
+        let frame_start = frame_end.saturating_sub(sample_count);
 
         match self.state {
             VadState::Waiting => {
-                if decision.speech {
+                if speech {
                     self.candidate_start_frame.get_or_insert(frame_start);
-                    self.candidate_samples += WINDOW_SAMPLES;
+                    self.candidate_samples += sample_count;
                     if self.candidate_samples
                         >= duration_to_prepared_frames(self.options.speech_confirmation)
                     {
@@ -640,7 +767,7 @@ impl VadTracker {
                 }
             }
             VadState::Active => {
-                if decision.speech {
+                if speech {
                     self.last_voice_frame = frame_end;
                 } else if frame_end.saturating_sub(self.last_voice_frame)
                     >= duration_to_prepared_frames(self.options.pause)
@@ -649,7 +776,7 @@ impl VadTracker {
                 }
             }
             VadState::Paused => {
-                if decision.speech {
+                if speech {
                     self.state = VadState::Active;
                     self.last_voice_frame = frame_end;
                 } else {
@@ -766,6 +893,25 @@ mod tests {
             channels,
             CaptureOptions::default(),
             default_detector(),
+            rms,
+            peak,
+            observed,
+            revision,
+        )
+        .unwrap()
+    }
+
+    fn manual_pipeline(threshold_rms: f32, vad: VadOptions) -> Pipeline {
+        let (rms, peak, observed, revision) = level_state();
+        Pipeline::new(
+            PREPARED_SAMPLE_RATE,
+            1,
+            CaptureOptions {
+                vad,
+                detection_mode: SpeechDetectionMode::ManualThreshold { threshold_rms },
+                ..CaptureOptions::default()
+            },
+            None,
             rms,
             peak,
             observed,
@@ -1335,6 +1481,267 @@ mod tests {
     }
 
     #[test]
+    fn manual_threshold_zeros_quiet_windows_preserves_equal_windows_and_uses_raw_metering() {
+        let mut pipeline = manual_pipeline(
+            0.1,
+            VadOptions::new(
+                Duration::from_millis(30),
+                Duration::from_millis(30),
+                Duration::from_millis(60),
+                Duration::ZERO,
+                Duration::ZERO,
+            ),
+        );
+
+        for _ in 0..MANUAL_GATE_WINDOW_SAMPLES {
+            pipeline.push_interleaved(0.05).unwrap();
+        }
+        assert_eq!(pipeline.prepared.len(), MANUAL_GATE_WINDOW_SAMPLES);
+        assert!(pipeline.prepared.iter().all(|sample| *sample == 0.0));
+        assert!((pipeline.maximum_levels().rms - 0.05).abs() < 1e-6);
+        assert!(!pipeline.manual_threshold_crossed());
+
+        for _ in 0..MANUAL_GATE_WINDOW_SAMPLES {
+            pipeline.push_interleaved(0.1).unwrap();
+        }
+        assert_eq!(pipeline.prepared.len(), 2 * MANUAL_GATE_WINDOW_SAMPLES);
+        assert!(
+            pipeline.prepared[MANUAL_GATE_WINDOW_SAMPLES..]
+                .iter()
+                .all(|sample| (*sample - 0.1).abs() < 1e-6)
+        );
+        assert_eq!(
+            pipeline.vad.speech_start_frame,
+            Some(MANUAL_GATE_WINDOW_SAMPLES)
+        );
+        assert!(pipeline.manual_threshold_crossed());
+    }
+
+    #[test]
+    fn manual_threshold_shares_gated_timing_between_rolling_preview_and_final_audio() {
+        let (snapshot_tx, snapshot_rx) = mpsc::channel();
+        let mut preview_session = RollingPreviewSession::<()>::new(move |snapshot| {
+            snapshot_tx
+                .send((
+                    snapshot.window_start_frame,
+                    snapshot.window_end_frame,
+                    snapshot.audio.samples.clone(),
+                ))
+                .unwrap();
+            Ok(StreamUpdate::default())
+        })
+        .unwrap();
+        let publisher = preview_session.audio_publisher(
+            SessionId(14),
+            RequestId(16),
+            ModelId::new("preview-model"),
+        );
+        let (rms, peak, observed, revision) = level_state();
+        let mut pipeline = Pipeline::new(
+            PREPARED_SAMPLE_RATE,
+            1,
+            CaptureOptions {
+                vad: VadOptions::new(
+                    Duration::from_millis(30),
+                    Duration::from_millis(30),
+                    Duration::from_millis(60),
+                    Duration::from_millis(30),
+                    Duration::ZERO,
+                ),
+                endpointing_enabled: false,
+                detection_mode: SpeechDetectionMode::ManualThreshold { threshold_rms: 0.1 },
+                ..CaptureOptions::default()
+            },
+            None,
+            rms,
+            peak,
+            observed,
+            revision,
+        )
+        .unwrap()
+        .with_preview_publisher(Some(publisher));
+
+        for _ in 0..MANUAL_GATE_WINDOW_SAMPLES {
+            pipeline.push_interleaved(0.05).unwrap();
+        }
+        for _ in 0..8 * MANUAL_GATE_WINDOW_SAMPLES {
+            pipeline.push_interleaved(0.2).unwrap();
+        }
+
+        assert_eq!(pipeline.source_frames(), 9 * MANUAL_GATE_WINDOW_SAMPLES);
+        assert_eq!(pipeline.prepared.len(), 9 * MANUAL_GATE_WINDOW_SAMPLES);
+        assert!(
+            pipeline.prepared[..MANUAL_GATE_WINDOW_SAMPLES]
+                .iter()
+                .all(|sample| *sample == 0.0)
+        );
+        assert!(
+            pipeline.prepared[MANUAL_GATE_WINDOW_SAMPLES..]
+                .iter()
+                .all(|sample| (*sample - 0.2).abs() < 1e-6)
+        );
+
+        pipeline.publish_due_previews();
+        let (start, end, preview_samples) = snapshot_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("manual gated audio should schedule a rolling preview");
+        assert_eq!(start, 0);
+        assert_eq!(end, PREVIEW_INTERVAL_FRAMES as u64);
+        assert_eq!(preview_samples.len(), PREVIEW_INTERVAL_FRAMES);
+        assert!(
+            preview_samples[..MANUAL_GATE_WINDOW_SAMPLES]
+                .iter()
+                .all(|sample| *sample == 0.0)
+        );
+        assert!(
+            preview_samples[MANUAL_GATE_WINDOW_SAMPLES..]
+                .iter()
+                .all(|sample| *sample > 0.0)
+        );
+
+        pipeline.invalidate_preview();
+        assert!(preview_session.stop_and_join(Duration::from_secs(1)));
+        let final_audio = pipeline
+            .finish(CaptureStopReason::Explicit)
+            .unwrap()
+            .expect("confirmed manual speech should retain final audio");
+        assert_eq!(
+            final_audio.source_frames,
+            9 * MANUAL_GATE_WINDOW_SAMPLES,
+            "zeroed windows preserve source timing"
+        );
+        assert_eq!(final_audio.samples.len(), 9 * MANUAL_GATE_WINDOW_SAMPLES);
+        assert!(
+            final_audio.samples[..MANUAL_GATE_WINDOW_SAMPLES]
+                .iter()
+                .all(|sample| *sample == 0.0)
+        );
+        assert!(
+            final_audio.samples[MANUAL_GATE_WINDOW_SAMPLES..]
+                .iter()
+                .all(|sample| *sample > 0.0)
+        );
+    }
+
+    #[test]
+    fn manual_threshold_flushes_and_gates_a_final_partial_window() {
+        let mut pipeline = manual_pipeline(0.1, VadOptions::default());
+        for _ in 0..123 {
+            pipeline.push_interleaved(0.05).unwrap();
+        }
+        assert!(pipeline.prepared.is_empty());
+
+        assert!(
+            pipeline
+                .finish(CaptureStopReason::Explicit)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(pipeline.prepared.len(), 123);
+        assert!(pipeline.prepared.iter().all(|sample| *sample == 0.0));
+        assert_eq!(pipeline.source_frames(), 123);
+    }
+
+    #[test]
+    fn manual_threshold_preserves_an_above_threshold_final_partial_window() {
+        let mut pipeline = manual_pipeline(0.1, VadOptions::default());
+        for _ in 0..123 {
+            pipeline.push_interleaved(0.2).unwrap();
+        }
+
+        assert!(pipeline.prepared.is_empty());
+        let _ = pipeline.finish(CaptureStopReason::Explicit).unwrap();
+        assert_eq!(pipeline.prepared.len(), 123);
+        assert!(
+            pipeline
+                .prepared
+                .iter()
+                .all(|sample| (*sample - 0.2).abs() < 1e-6)
+        );
+        assert_eq!(pipeline.source_frames(), 123);
+        assert!(pipeline.manual_threshold_crossed());
+    }
+
+    #[test]
+    fn manual_threshold_uses_resampled_stereo_windows_without_dropping_frames() {
+        let (rms, peak, observed, revision) = level_state();
+        let mut pipeline = Pipeline::new(
+            48_000,
+            2,
+            CaptureOptions {
+                vad: VadOptions::new(
+                    Duration::from_millis(30),
+                    Duration::from_millis(30),
+                    Duration::from_millis(60),
+                    Duration::ZERO,
+                    Duration::ZERO,
+                ),
+                detection_mode: SpeechDetectionMode::ManualThreshold { threshold_rms: 0.1 },
+                ..CaptureOptions::default()
+            },
+            None,
+            rms,
+            peak,
+            observed,
+            revision,
+        )
+        .unwrap();
+
+        for _ in 0..1_440 {
+            pipeline.push_interleaved(0.2).unwrap();
+            pipeline.push_interleaved(0.2).unwrap();
+        }
+        for _ in 0..1_440 {
+            pipeline.push_interleaved(0.05).unwrap();
+            pipeline.push_interleaved(0.05).unwrap();
+        }
+
+        assert_eq!(pipeline.source_frames(), 2_880);
+        assert_eq!(pipeline.prepared.len(), 2 * MANUAL_GATE_WINDOW_SAMPLES);
+        assert!(
+            pipeline.prepared[..MANUAL_GATE_WINDOW_SAMPLES]
+                .iter()
+                .all(|sample| (*sample - 0.2).abs() < 1e-6)
+        );
+        assert!(
+            pipeline.prepared[MANUAL_GATE_WINDOW_SAMPLES..]
+                .iter()
+                .all(|sample| *sample == 0.0)
+        );
+        assert!(!pipeline.endpoint_triggered());
+
+        for _ in 0..1_440 {
+            pipeline.push_interleaved(0.05).unwrap();
+            pipeline.push_interleaved(0.05).unwrap();
+        }
+
+        assert_eq!(pipeline.source_frames(), 4_320);
+        assert_eq!(pipeline.prepared.len(), 3 * MANUAL_GATE_WINDOW_SAMPLES);
+        assert!(
+            pipeline.prepared[MANUAL_GATE_WINDOW_SAMPLES..]
+                .iter()
+                .all(|sample| *sample == 0.0)
+        );
+        assert!(pipeline.endpoint_triggered());
+    }
+
+    #[test]
+    fn ai_mode_keeps_raw_audio_and_uses_its_detector_path() {
+        let mut pipeline = pipeline(PREPARED_SAMPLE_RATE, 1);
+        for _ in 0..MANUAL_GATE_WINDOW_SAMPLES {
+            pipeline.push_interleaved(0.05).unwrap();
+        }
+
+        assert_eq!(pipeline.prepared.len(), MANUAL_GATE_WINDOW_SAMPLES);
+        assert!(
+            pipeline
+                .prepared
+                .iter()
+                .all(|sample| (*sample - 0.05).abs() < 1e-6)
+        );
+    }
+
+    #[test]
     fn capture_maximum_levels_include_full_and_partial_signal_and_meter_windows() {
         let mut pipeline = pipeline(PREPARED_SAMPLE_RATE, 1);
         for _ in 0..LEVEL_WINDOW_SAMPLES {
@@ -1585,6 +1992,7 @@ mod tests {
             1,
             CaptureOptions {
                 intent: CaptureIntent::MeterOnly,
+                detection_mode: SpeechDetectionMode::ManualThreshold { threshold_rms: 0.1 },
                 ..CaptureOptions::default()
             },
             None,
@@ -1594,6 +2002,7 @@ mod tests {
             Arc::clone(&revision),
         )
         .unwrap();
+        assert!(pipeline.manual_gate.is_none());
         push_mono_ms(&mut pipeline, 150, 0.03);
 
         assert!(observed.load(Ordering::Acquire));
@@ -1797,7 +2206,7 @@ mod tests {
             1,
             CaptureOptions {
                 vad_enabled: false,
-                endpointing_enabled: false,
+                endpointing_enabled: true,
                 ..CaptureOptions::default()
             },
             None,
@@ -1815,5 +2224,37 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(prepared.samples.len(), PREPARED_SAMPLE_RATE as usize);
+    }
+
+    #[test]
+    fn manual_threshold_still_gates_dictation_when_speech_tracking_is_disabled() {
+        let (rms, peak, observed, revision) = level_state();
+        let mut pipeline = Pipeline::new(
+            PREPARED_SAMPLE_RATE,
+            1,
+            CaptureOptions {
+                vad_enabled: false,
+                endpointing_enabled: false,
+                detection_mode: SpeechDetectionMode::ManualThreshold { threshold_rms: 0.1 },
+                ..CaptureOptions::default()
+            },
+            None,
+            rms,
+            peak,
+            observed,
+            revision,
+        )
+        .unwrap();
+
+        push_mono_ms(&mut pipeline, 30, 0.05);
+        assert!(pipeline.vad.speech_start_frame.is_none());
+        assert!(!pipeline.endpoint_triggered());
+
+        let prepared = pipeline
+            .finish(CaptureStopReason::Explicit)
+            .unwrap()
+            .unwrap();
+        assert_eq!(prepared.samples.len(), MANUAL_GATE_WINDOW_SAMPLES);
+        assert!(prepared.samples.iter().all(|sample| *sample == 0.0));
     }
 }

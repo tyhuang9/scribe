@@ -13,15 +13,15 @@ use super::super::{
 use crate::model_catalog::BUNDLED_BASE_MODEL_ID;
 use crate::transcription::AccelerationPreference;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 2;
+pub const CURRENT_SCHEMA_VERSION: u32 = 3;
 pub const DEFAULT_SPEECH_CONFIRMATION_MS: u32 = 150;
 pub const DEFAULT_INTERNAL_PAUSE_MS: u32 = 450;
 pub const DEFAULT_ENDPOINT_SILENCE_MS: u32 = 900;
 pub const DEFAULT_PRE_ROLL_MS: u32 = 250;
 pub const DEFAULT_POST_ROLL_MS: u32 = 200;
-pub const DEFAULT_SPEECH_PROBABILITY_THRESHOLD: f32 = 0.5;
-pub const MIN_SPEECH_PROBABILITY_THRESHOLD: f32 = 0.2;
-pub const MAX_SPEECH_PROBABILITY_THRESHOLD: f32 = 0.8;
+pub const DEFAULT_INPUT_THRESHOLD_DBFS: f32 = -42.0;
+pub const MIN_INPUT_THRESHOLD_DBFS: f32 = -72.0;
+pub const MAX_INPUT_THRESHOLD_DBFS: f32 = 0.0;
 pub type UnknownFields = BTreeMap<String, Value>;
 
 #[derive(Clone, Debug, Serialize)]
@@ -66,7 +66,8 @@ pub struct RecordingSettings {
     pub audio_input_device_name: Option<String>,
     pub max_recording_seconds: u32,
     pub vad_enabled: bool,
-    pub speech_probability_threshold: f32,
+    pub speech_detection_mode: SpeechDetectionMode,
+    pub input_threshold_dbfs: f32,
     pub speech_confirmation_ms: u32,
     pub internal_pause_ms: u32,
     pub endpoint_silence_ms: u32,
@@ -74,6 +75,14 @@ pub struct RecordingSettings {
     pub post_roll_ms: u32,
     #[serde(flatten)]
     pub unknown: UnknownFields,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpeechDetectionMode {
+    #[default]
+    Ai,
+    ManualThreshold,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -284,7 +293,8 @@ impl Default for RecordingSettings {
             audio_input_device_name: None,
             max_recording_seconds: 30,
             vad_enabled: true,
-            speech_probability_threshold: DEFAULT_SPEECH_PROBABILITY_THRESHOLD,
+            speech_detection_mode: SpeechDetectionMode::Ai,
+            input_threshold_dbfs: DEFAULT_INPUT_THRESHOLD_DBFS,
             speech_confirmation_ms: DEFAULT_SPEECH_CONFIRMATION_MS,
             internal_pause_ms: DEFAULT_INTERNAL_PAUSE_MS,
             endpoint_silence_ms: DEFAULT_ENDPOINT_SILENCE_MS,

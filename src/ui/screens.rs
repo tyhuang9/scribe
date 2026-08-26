@@ -7,6 +7,8 @@ use eframe::egui::{
     Sense, Stroke, Vec2,
 };
 
+use crate::config::SpeechDetectionMode;
+
 #[cfg(test)]
 use crate::model_catalog::BUNDLED_BASE_MODEL_ID;
 
@@ -167,10 +169,14 @@ const RESTORE_CLIPBOARD_DESCRIPTION: &str =
 const STOP_AFTER_SPEECH_SWITCH_ID: &str = "stop-after-speech-ends-switch";
 const STOP_AFTER_SPEECH_DESCRIPTION: &str =
     "In Press once mode, stop recording after the configured silence. Hold mode is unaffected.";
-const SPEECH_DETECTION_SENSITIVITY_HELP_ID: &str = "speech-detection-sensitivity-help";
-const INPUT_LEVEL_SENSITIVITY_CONTROL_ID: &str = "input-level-sensitivity-control";
-const SPEECH_DETECTION_SENSITIVITY_DESCRIPTION: &str = "More sensitive settings lower the speech-probability threshold, so quieter or less certain speech is more likely to be detected.";
-const INPUT_LEVEL_SENSITIVITY_DESCRIPTION: &str = "The teal fill shows microphone volume. The marker adjusts how readily Scribe treats audio as speech; it is not a literal volume cutoff.";
+const VOICE_DETECTION_MODE_CONTROL_ID: &str = "voice-detection-mode-control";
+const INPUT_THRESHOLD_CONTROL_ID: &str = "input-threshold-control";
+const INPUT_THRESHOLD_TRACK_WIDTH: f32 = 280.0;
+const INPUT_THRESHOLD_LABEL_GAP: f32 = 12.0;
+const INPUT_THRESHOLD_LABEL_WIDTH: f32 = 108.0;
+const INPUT_THRESHOLD_MARKER_HIT_RADIUS: f32 = 11.0;
+const AI_MICROPHONE_LEVEL_DESCRIPTION: &str = "Shows the live microphone level. This meter is read-only; AI voice detection uses Silero to decide what is speech.";
+const MANUAL_INPUT_THRESHOLD_DESCRIPTION: &str = "Shows the live microphone level and the input threshold. Quieter 30 millisecond audio windows are silenced before transcription; loud background sounds can still pass manual detection.";
 const VOICE_DETECTION_LOCKED_DESCRIPTION: &str =
     "Finish recording before changing voice detection settings.";
 const LIMIT_TRANSCRIPT_AGE_SWITCH_ID: &str = "limit-transcript-age-switch";
@@ -396,7 +402,8 @@ pub(crate) struct RecordingSettingsView {
     pub selected_audio_device: Option<String>,
     pub audio_devices: Vec<String>,
     pub device_label: String,
-    pub speech_detection_sensitivity_percent: u8,
+    pub voice_detection_mode: SpeechDetectionMode,
+    pub input_threshold_dbfs: f32,
     pub input_level_percent: u8,
     pub microphone_error: Option<String>,
     pub auto_insert_transcript: bool,
@@ -446,7 +453,8 @@ impl Default for RecordingSettingsView {
             selected_audio_device: None,
             audio_devices: Vec::new(),
             device_label: "OS default".into(),
-            speech_detection_sensitivity_percent: 50,
+            voice_detection_mode: SpeechDetectionMode::Ai,
+            input_threshold_dbfs: -42.0,
             input_level_percent: 0,
             microphone_error: None,
             auto_insert_transcript: false,
@@ -565,7 +573,8 @@ pub(crate) enum ScreenAction {
     SetDurationSeconds(u32),
     ToggleProvisionalFeedback,
     SetAudioDevice(Option<String>),
-    SetSpeechDetectionSensitivity(u8),
+    SetVoiceDetectionMode(SpeechDetectionMode),
+    SetInputThresholdDbfs(i8),
     RefreshDevices,
     ChangeShortcut,
     SetAutoInsertTranscript(bool),
@@ -6337,7 +6346,9 @@ fn recording_settings_panel(
     let colors = ui_palette(ui);
     let recording_locked = matches!(
         state.phase,
-        TranscriptionPhase::Listening | TranscriptionPhase::Finalizing
+        TranscriptionPhase::RequestingMicrophone
+            | TranscriptionPhase::Listening
+            | TranscriptionPhase::Finalizing
     );
     settings_section(ui, "Recording behavior", |ui| {
         ui.add_space(6.0);
@@ -6486,11 +6497,82 @@ fn recording_settings_panel(
                 }
             });
         });
+        let voice_detection_group_id = ui.make_persistent_id("voice-detection-mode-group");
+        let focused_voice_detection_mode = [
+            SpeechDetectionMode::Ai,
+            SpeechDetectionMode::ManualThreshold,
+        ]
+        .into_iter()
+        .find(|mode| ui.memory(|memory| memory.has_focus(voice_detection_mode_id(*mode))));
+        let voice_detection_arrow_pressed = !recording_locked
+            && ui.input(|input| {
+                input.key_pressed(egui::Key::ArrowRight) || input.key_pressed(egui::Key::ArrowLeft)
+            });
+        let ctx = ui.ctx().clone();
+        ctx.accesskit_node_builder(voice_detection_group_id, |builder| {
+            builder.set_role(egui::accesskit::Role::RadioGroup);
+            builder.set_name("Voice detection");
+        });
+        let mut voice_detection_radio_ids = Vec::new();
+        ctx.with_accessibility_parent(voice_detection_group_id, || {
+            let _ = SettingsRow::show_with_help(
+                ui,
+                "Voice detection",
+                VOICE_DETECTION_MODE_CONTROL_ID,
+                "Choose AI voice detection for semantic speech classification, or set a literal microphone-volume threshold.",
+                true,
+                |ui, label_id| {
+                    for (mode, response) in voice_detection_mode_toggle(
+                        ui,
+                        settings.voice_detection_mode,
+                        !recording_locked,
+                    ) {
+                        voice_detection_radio_ids.push(response.id);
+                        let response = response.labelled_by(label_id);
+                        if response.clicked() && mode != settings.voice_detection_mode {
+                            *action = ScreenAction::SetVoiceDetectionMode(mode);
+                        }
+                        if focused_voice_detection_mode == Some(mode)
+                            && voice_detection_arrow_pressed
+                        {
+                            let next = if mode == SpeechDetectionMode::Ai {
+                                SpeechDetectionMode::ManualThreshold
+                            } else {
+                                SpeechDetectionMode::Ai
+                            };
+                            ui.memory_mut(|memory| {
+                                memory.request_focus(voice_detection_mode_id(next))
+                            });
+                            *action = ScreenAction::SetVoiceDetectionMode(next);
+                        }
+                    }
+                },
+            );
+        });
+        let voice_detection_radio_group = voice_detection_radio_ids
+            .iter()
+            .map(|id| id.value().into())
+            .collect::<Vec<_>>();
+        for id in voice_detection_radio_ids {
+            ui.ctx().accesskit_node_builder(id, |builder| {
+                builder.set_radio_group(voice_detection_radio_group.clone());
+            });
+        }
+        let (level_help, level_description) = match settings.voice_detection_mode {
+            SpeechDetectionMode::Ai => ("microphone-level-help", AI_MICROPHONE_LEVEL_DESCRIPTION),
+            SpeechDetectionMode::ManualThreshold => {
+                ("input-threshold-help", MANUAL_INPUT_THRESHOLD_DESCRIPTION)
+            }
+        };
         let _ = SettingsRow::show_with_help(
             ui,
-            "Input level",
-            SPEECH_DETECTION_SENSITIVITY_HELP_ID,
-            INPUT_LEVEL_SENSITIVITY_DESCRIPTION,
+            if settings.voice_detection_mode == SpeechDetectionMode::Ai {
+                "Microphone level"
+            } else {
+                "Input threshold"
+            },
+            level_help,
+            level_description,
             false,
             |ui, label_id| {
                 let (icon_rect, _) = ui.allocate_exact_size(Vec2::new(24.0, 40.0), Sense::hover());
@@ -6501,16 +6583,24 @@ fn recording_settings_panel(
                     egui::FontId::proportional(18.0),
                     colors.muted_text,
                 );
-                let mut percent = settings.speech_detection_sensitivity_percent;
-                let response = input_level_sensitivity_control(
-                    ui,
-                    settings.input_level_percent,
-                    &mut percent,
-                    !recording_locked,
-                )
-                .labelled_by(label_id);
-                if response.changed() {
-                    *action = ScreenAction::SetSpeechDetectionSensitivity(percent);
+                match settings.voice_detection_mode {
+                    SpeechDetectionMode::Ai => {
+                        microphone_level_meter(ui, settings.input_level_percent)
+                            .labelled_by(label_id);
+                    }
+                    SpeechDetectionMode::ManualThreshold => {
+                        let mut threshold = settings.input_threshold_dbfs.round() as i8;
+                        let response = input_threshold_control(
+                            ui,
+                            settings.input_level_percent,
+                            &mut threshold,
+                            !recording_locked,
+                        )
+                        .labelled_by(label_id);
+                        if response.changed() {
+                            *action = ScreenAction::SetInputThresholdDbfs(threshold);
+                        }
+                    }
                 }
             },
         );
@@ -7186,50 +7276,196 @@ fn describe_history_lock(
     }
 }
 
-fn input_level_sensitivity_control(
+fn voice_detection_mode_toggle(
+    ui: &mut egui::Ui,
+    selected: SpeechDetectionMode,
+    enabled: bool,
+) -> Vec<(SpeechDetectionMode, egui::Response)> {
+    const OPTIONS: [(SpeechDetectionMode, &str, &str); 2] = [
+        (
+            SpeechDetectionMode::Ai,
+            "AI voice detection",
+            "Silero classifies speech. The microphone level is read-only telemetry.",
+        ),
+        (
+            SpeechDetectionMode::ManualThreshold,
+            "Manual volume threshold",
+            "Silence microphone audio below the configured dBFS input threshold.",
+        ),
+    ];
+    ui.horizontal_wrapped(|ui| {
+        OPTIONS
+            .into_iter()
+            .map(|(mode, label, description)| {
+                let (rect, _) = ui.allocate_exact_size(Vec2::new(204.0, 44.0), Sense::hover());
+                let response = ui.interact(
+                    rect,
+                    egui::Id::new((VOICE_DETECTION_MODE_CONTROL_ID, mode)),
+                    if enabled {
+                        Sense::click()
+                    } else {
+                        Sense::hover()
+                    },
+                );
+                let colors = ui_palette(ui);
+                let selected = selected == mode;
+                ui.painter().rect(
+                    rect.shrink2(Vec2::new(2.0, 4.0)),
+                    Rounding::same(6.0),
+                    if selected {
+                        colors.active_card_bg
+                    } else {
+                        colors.card_bg
+                    },
+                    Stroke::new(
+                        1.0,
+                        if selected {
+                            colors.accent
+                        } else {
+                            colors.border
+                        },
+                    ),
+                );
+                ui.painter().text(
+                    rect.center(),
+                    Align2::CENTER_CENTER,
+                    label,
+                    egui::FontId::proportional(14.0),
+                    if enabled {
+                        colors.text
+                    } else {
+                        colors.muted_text
+                    },
+                );
+                response.widget_info(|| {
+                    egui::WidgetInfo::labeled(egui::WidgetType::RadioButton, label)
+                });
+                ui.ctx().accesskit_node_builder(response.id, |builder| {
+                    builder.set_role(egui::accesskit::Role::RadioButton);
+                    builder.set_name(label);
+                    builder.set_description(if enabled {
+                        description.to_owned()
+                    } else {
+                        format!("{description} {VOICE_DETECTION_LOCKED_DESCRIPTION}")
+                    });
+                    builder.set_checked(if selected {
+                        egui::accesskit::Checked::True
+                    } else {
+                        egui::accesskit::Checked::False
+                    });
+                    if !enabled {
+                        builder.set_disabled();
+                    }
+                });
+                paint_focus_ring(ui, &response, Rounding::same(6.0));
+                focus_tooltip(ui, &response, description);
+                (mode, response)
+            })
+            .collect()
+    })
+    .inner
+}
+
+fn voice_detection_mode_id(mode: SpeechDetectionMode) -> egui::Id {
+    egui::Id::new((VOICE_DETECTION_MODE_CONTROL_ID, mode))
+}
+
+fn microphone_level_meter(ui: &mut egui::Ui, live_level_percent: u8) -> egui::Response {
+    let desired = Vec2::new(
+        INPUT_THRESHOLD_TRACK_WIDTH + INPUT_THRESHOLD_LABEL_GAP + INPUT_THRESHOLD_LABEL_WIDTH,
+        44.0,
+    );
+    let (rect, response) = ui.allocate_exact_size(desired, Sense::hover());
+    let track = egui::Rect::from_center_size(
+        egui::pos2(
+            rect.left() + INPUT_THRESHOLD_TRACK_WIDTH * 0.5,
+            rect.center().y,
+        ),
+        Vec2::new(INPUT_THRESHOLD_TRACK_WIDTH, 10.0),
+    );
+    let colors = ui_palette(ui);
+    let rounding = Rounding::same(5.0);
+    ui.painter()
+        .rect_filled(track, rounding, colors.slider_remainder_fill);
+    let live_width = track.width() * (f32::from(live_level_percent.min(100)) / 100.0);
+    if live_width > 0.0 {
+        ui.painter().rect_filled(
+            egui::Rect::from_min_size(track.min, Vec2::new(live_width, track.height())),
+            rounding,
+            colors.slider_live_below,
+        );
+    }
+    ui.painter().rect_stroke(
+        track,
+        rounding,
+        Stroke::new(1.0, colors.slider_track_border),
+    );
+    ui.painter().text(
+        egui::pos2(track.right() + INPUT_THRESHOLD_LABEL_GAP, rect.center().y),
+        Align2::LEFT_CENTER,
+        "Live input",
+        egui::FontId::proportional(14.0),
+        colors.text,
+    );
+    ui.ctx().accesskit_node_builder(response.id, |builder| {
+        builder.set_role(egui::accesskit::Role::Meter);
+        builder.set_name("Microphone level");
+        builder.set_description(AI_MICROPHONE_LEVEL_DESCRIPTION);
+        builder.set_min_numeric_value(0.0);
+        builder.set_max_numeric_value(100.0);
+        builder.set_numeric_value(f64::from(live_level_percent));
+        builder.set_bounds(accesskit_rect(rect));
+    });
+    response
+}
+
+fn input_threshold_control(
     ui: &mut egui::Ui,
     live_level_percent: u8,
-    sensitivity_percent: &mut u8,
-    sensitivity_enabled: bool,
+    threshold_dbfs: &mut i8,
+    threshold_enabled: bool,
 ) -> egui::Response {
     use egui::accesskit::{Action, ActionData};
 
-    const TRACK_WIDTH: f32 = 280.0;
-    const LABEL_GAP: f32 = 12.0;
-    const LABEL_WIDTH: f32 = 108.0;
-
-    let desired = Vec2::new(TRACK_WIDTH + LABEL_GAP + LABEL_WIDTH, 44.0);
+    let desired = Vec2::new(
+        INPUT_THRESHOLD_TRACK_WIDTH + INPUT_THRESHOLD_LABEL_GAP + INPUT_THRESHOLD_LABEL_WIDTH,
+        44.0,
+    );
     let (rect, _) = ui.allocate_exact_size(desired, Sense::hover());
+    let track = input_threshold_track_rect(rect);
+    let track_interaction = input_threshold_interaction_rect(rect, track);
     let mut response = ui.interact(
-        rect,
-        egui::Id::new(INPUT_LEVEL_SENSITIVITY_CONTROL_ID),
-        if sensitivity_enabled {
+        track_interaction,
+        egui::Id::new(INPUT_THRESHOLD_CONTROL_ID),
+        if threshold_enabled {
             Sense::click_and_drag()
         } else {
             Sense::hover()
         },
     );
-    let track = egui::Rect::from_center_size(
-        egui::pos2(rect.left() + TRACK_WIDTH * 0.5, rect.center().y),
-        Vec2::new(TRACK_WIDTH, 10.0),
-    );
-    let previous = *sensitivity_percent;
-    let mut value = f32::from(*sensitivity_percent).clamp(0.0, 100.0);
+    let previous = *threshold_dbfs;
+    let mut value = f32::from(*threshold_dbfs).clamp(-72.0, 0.0);
 
-    if sensitivity_enabled && response.clicked() {
+    let pointer_is_on_track_or_marker = response
+        .interact_pointer_pos()
+        .is_some_and(|pointer| track_interaction.contains(pointer));
+    if threshold_enabled && response.clicked() && pointer_is_on_track_or_marker {
         response.request_focus();
     }
-    if sensitivity_enabled
+    if threshold_enabled
         && (response.clicked() || response.dragged())
-        && let Some(pointer) = response.interact_pointer_pos()
-        && pointer.x <= track.right()
+        && pointer_is_on_track_or_marker
     {
-        value = (100.0 * (pointer.x - track.left()) / track.width()).clamp(0.0, 100.0);
+        let pointer = response
+            .interact_pointer_pos()
+            .expect("a pointer interaction on the threshold track has a pointer position");
+        let pointer_x = pointer.x.clamp(track.left(), track.right());
+        value = (-72.0 + 72.0 * (pointer_x - track.left()) / track.width()).clamp(-72.0, 0.0);
     }
 
     let mut decrement = 0usize;
     let mut increment = 0usize;
-    if sensitivity_enabled && response.has_focus() {
+    if threshold_enabled && response.has_focus() {
         ui.ctx().memory_mut(|memory| {
             memory.set_focus_lock_filter(
                 response.id,
@@ -7243,14 +7479,14 @@ fn input_level_sensitivity_control(
             decrement += input.num_presses(egui::Key::ArrowLeft);
             increment += input.num_presses(egui::Key::ArrowRight);
             if input.key_pressed(egui::Key::Home) {
-                value = 0.0;
+                value = -72.0;
             }
             if input.key_pressed(egui::Key::End) {
-                value = 100.0;
+                value = 0.0;
             }
         });
     }
-    if sensitivity_enabled {
+    if threshold_enabled {
         ui.input(|input| {
             decrement += input.num_accesskit_action_requests(response.id, Action::Decrement);
             increment += input.num_accesskit_action_requests(response.id, Action::Increment);
@@ -7261,39 +7497,35 @@ fn input_level_sensitivity_control(
             }
         });
     }
-    value = (value + increment as f32 - decrement as f32).clamp(0.0, 100.0);
-    *sensitivity_percent = value.round() as u8;
-    if *sensitivity_percent != previous {
+    value = (value + increment as f32 - decrement as f32).clamp(-72.0, 0.0);
+    *threshold_dbfs = value.round() as i8;
+    if *threshold_dbfs != previous {
         response.mark_changed();
     }
 
-    let threshold = 0.8 - (f32::from(*sensitivity_percent) / 100.0) * 0.6;
     let mut description = format!(
-        "{INPUT_LEVEL_SENSITIVITY_DESCRIPTION} {SPEECH_DETECTION_SENSITIVITY_DESCRIPTION} {} percent sensitivity uses a {threshold:.2} speech probability threshold. Use Left and Right arrow keys to adjust.",
-        *sensitivity_percent
+        "{MANUAL_INPUT_THRESHOLD_DESCRIPTION} Current threshold: {}. Use Left and Right arrow keys to adjust by 1 dBFS; Home sets −72 dBFS and End sets 0 dBFS.",
+        format_dbfs(*threshold_dbfs)
     );
-    if !sensitivity_enabled {
+    if !threshold_enabled {
         description.push(' ');
         description.push_str(VOICE_DETECTION_LOCKED_DESCRIPTION);
     }
-    response.widget_info(|| {
-        egui::WidgetInfo::slider(
-            f64::from(*sensitivity_percent),
-            "Speech detection sensitivity",
-        )
-    });
+    response
+        .widget_info(|| egui::WidgetInfo::slider(f64::from(*threshold_dbfs), "Input threshold"));
     ui.ctx().accesskit_node_builder(response.id, |builder| {
-        builder.set_name("Speech detection sensitivity");
+        builder.set_name("Input threshold");
         builder.set_description(description);
-        builder.set_min_numeric_value(0.0);
-        builder.set_max_numeric_value(100.0);
+        builder.set_min_numeric_value(-72.0);
+        builder.set_max_numeric_value(0.0);
         builder.set_numeric_value_step(1.0);
-        if sensitivity_enabled {
+        builder.set_numeric_value(f64::from(*threshold_dbfs));
+        if threshold_enabled {
             builder.add_action(Action::SetValue);
-            if *sensitivity_percent < 100 {
+            if *threshold_dbfs < 0 {
                 builder.add_action(Action::Increment);
             }
-            if *sensitivity_percent > 0 {
+            if *threshold_dbfs > -72 {
                 builder.add_action(Action::Decrement);
             }
         } else {
@@ -7306,11 +7538,16 @@ fn input_level_sensitivity_control(
     ui.painter()
         .rect_filled(track, rounding, colors.slider_remainder_fill);
     let live_width = track.width() * (f32::from(live_level_percent.min(100)) / 100.0);
+    let threshold_position = input_threshold_position(*threshold_dbfs);
     if live_width > 0.0 {
         ui.painter().rect_filled(
             egui::Rect::from_min_size(track.min, Vec2::new(live_width, track.height())),
             rounding,
-            colors.slider_live_above,
+            if input_level_reaches_threshold(live_level_percent, *threshold_dbfs) {
+                colors.slider_live_above
+            } else {
+                colors.slider_live_below
+            },
         );
     }
     ui.painter().rect_stroke(
@@ -7318,10 +7555,9 @@ fn input_level_sensitivity_control(
         rounding,
         Stroke::new(1.0, colors.slider_track_border),
     );
-    let sensitivity_position = f32::from(*sensitivity_percent) / 100.0;
-    let sensitivity_x = track.left() + track.width() * sensitivity_position;
-    let thumb_center = egui::pos2(sensitivity_x, track.center().y);
-    let thumb_radius = if sensitivity_enabled && response.dragged() {
+    let threshold_x = track.left() + track.width() * threshold_position;
+    let thumb_center = egui::pos2(threshold_x, track.center().y);
+    let thumb_radius = if threshold_enabled && response.dragged() {
         9.0
     } else {
         8.0
@@ -7341,20 +7577,60 @@ fn input_level_sensitivity_control(
     ui.painter()
         .circle_filled(thumb_center, thumb_radius - 3.0, colors.card_bg);
     ui.painter().text(
-        egui::pos2(track.right() + LABEL_GAP, rect.center().y),
+        egui::pos2(track.right() + INPUT_THRESHOLD_LABEL_GAP, rect.center().y),
         Align2::LEFT_CENTER,
-        format!("Sensitivity {}%", *sensitivity_percent),
+        format_dbfs(*threshold_dbfs),
         egui::FontId::proportional(14.0),
-        if sensitivity_enabled {
+        if threshold_enabled {
             colors.text
         } else {
             colors.muted_text
         },
     );
-    if sensitivity_enabled {
+    if threshold_enabled {
         paint_focus_ring(ui, &response, Rounding::same(5.0));
     }
     response
+}
+
+fn input_threshold_track_rect(rect: egui::Rect) -> egui::Rect {
+    egui::Rect::from_center_size(
+        egui::pos2(
+            rect.left() + INPUT_THRESHOLD_TRACK_WIDTH * 0.5,
+            rect.center().y,
+        ),
+        Vec2::new(INPUT_THRESHOLD_TRACK_WIDTH, 10.0),
+    )
+}
+
+fn input_threshold_interaction_rect(rect: egui::Rect, track: egui::Rect) -> egui::Rect {
+    // The outer marker ring extends beyond the track at either endpoint. Keep
+    // that visible area interactive without spilling into the value label.
+    egui::Rect::from_min_max(
+        egui::pos2(track.left() - INPUT_THRESHOLD_MARKER_HIT_RADIUS, rect.top()),
+        egui::pos2(
+            track.right() + INPUT_THRESHOLD_MARKER_HIT_RADIUS,
+            rect.bottom(),
+        ),
+    )
+}
+
+fn input_threshold_position(threshold_dbfs: i8) -> f32 {
+    (f32::from(threshold_dbfs.clamp(-72, 0)) + 72.0) / 72.0
+}
+
+fn input_level_reaches_threshold(live_level_percent: u8, threshold_dbfs: i8) -> bool {
+    let live = u16::from(live_level_percent.min(100)) * 72;
+    let threshold = u16::from((threshold_dbfs.clamp(-72, 0) + 72) as u8) * 100;
+    live >= threshold
+}
+
+fn format_dbfs(value: i8) -> String {
+    if value < 0 {
+        format!("−{} dBFS", value.unsigned_abs())
+    } else {
+        format!("{value} dBFS")
+    }
 }
 
 struct SettingsSection;
@@ -11743,7 +12019,7 @@ mod tests {
                     "Recording mode",
                     "Global record hotkey",
                     "Change shortcut",
-                    "Input level",
+                    "Microphone level",
                     "Live transcription preview",
                     "Streaming mode",
                     "Transcription device",
@@ -11752,7 +12028,6 @@ mod tests {
             (
                 SettingsTab::Advanced,
                 &[
-                    "Voice detection",
                     "History and privacy",
                     "Developer and diagnostics",
                     "Stop after speech ends",
@@ -14121,11 +14396,12 @@ mod tests {
     }
 
     #[test]
-    fn input_level_combines_live_meter_with_one_accessible_sensitivity_slider() {
+    fn voice_detection_exposes_an_ai_meter_or_manual_threshold_slider() {
         use egui::accesskit::{Action, Role};
 
-        let settings_view = RecordingSettingsView {
-            speech_detection_sensitivity_percent: 42,
+        let manual_view = RecordingSettingsView {
+            voice_detection_mode: SpeechDetectionMode::ManualThreshold,
+            input_threshold_dbfs: -42.0,
             input_level_percent: 72,
             ..Default::default()
         };
@@ -14137,7 +14413,7 @@ mod tests {
                     ui,
                     SettingsTab::Recording,
                     &TranscriptionState::default(),
-                    &settings_view,
+                    &manual_view,
                 );
             });
         });
@@ -14145,32 +14421,32 @@ mod tests {
         let sliders = nodes
             .iter()
             .filter(|(_, node)| {
-                node.role() == Role::Slider && node.name() == Some("Speech detection sensitivity")
+                node.role() == Role::Slider && node.name() == Some("Input threshold")
             })
             .collect::<Vec<_>>();
         assert_eq!(sliders.len(), 1);
         let slider = &sliders[0].1;
-        assert_eq!(slider.min_numeric_value(), Some(0.0));
-        assert_eq!(slider.max_numeric_value(), Some(100.0));
-        assert_eq!(slider.numeric_value(), Some(42.0));
+        assert_eq!(slider.min_numeric_value(), Some(-72.0));
+        assert_eq!(slider.max_numeric_value(), Some(0.0));
+        assert_eq!(slider.numeric_value(), Some(-42.0));
         assert!(slider.supports_action(Action::SetValue));
         assert!(slider.supports_action(Action::Increment));
         assert!(slider.supports_action(Action::Decrement));
         assert!(
             slider
                 .description()
-                .is_some_and(|description| description.contains("speech probability threshold"))
+                .is_some_and(|description| description.contains("30 millisecond audio windows"))
         );
         assert!(
             slider
                 .description()
-                .is_some_and(|description| description.contains("teal fill"))
+                .is_some_and(|description| description.contains("dBFS"))
         );
         assert!(!slider.is_disabled());
         assert!(
             nodes
                 .iter()
-                .any(|(_, node)| node.name() == Some("Input level"))
+                .any(|(_, node)| node.name() == Some("Manual volume threshold"))
         );
 
         let advanced_ctx = egui::Context::default();
@@ -14181,7 +14457,7 @@ mod tests {
                     ui,
                     SettingsTab::Advanced,
                     &TranscriptionState::default(),
-                    &settings_view,
+                    &manual_view,
                 );
             });
         });
@@ -14203,7 +14479,7 @@ mod tests {
                         phase: TranscriptionPhase::Listening,
                         ..Default::default()
                     },
-                    &settings_view,
+                    &manual_view,
                 );
             });
         });
@@ -14214,10 +14490,10 @@ mod tests {
             .nodes
             .into_iter()
             .find_map(|(_, node)| {
-                (node.role() == Role::Slider && node.name() == Some("Speech detection sensitivity"))
+                (node.role() == Role::Slider && node.name() == Some("Input threshold"))
                     .then_some(node)
             })
-            .expect("recording settings should retain the disabled sensitivity slider");
+            .expect("recording settings should retain the disabled manual threshold slider");
         assert!(locked_slider.is_disabled());
         assert!(!locked_slider.supports_action(Action::SetValue));
         assert!(!locked_slider.supports_action(Action::Increment));
@@ -14225,14 +14501,38 @@ mod tests {
         assert!(locked_slider.description().is_some_and(|description| {
             description.contains(VOICE_DETECTION_LOCKED_DESCRIPTION)
         }));
+
+        let ai_view = RecordingSettingsView {
+            voice_detection_mode: SpeechDetectionMode::Ai,
+            input_level_percent: 72,
+            ..Default::default()
+        };
+        let ai_ctx = egui::Context::default();
+        ai_ctx.enable_accesskit();
+        let ai = ai_ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = settings(
+                    ui,
+                    SettingsTab::Recording,
+                    &TranscriptionState::default(),
+                    &ai_view,
+                );
+            });
+        });
+        let ai_nodes = &ai.platform_output.accesskit_update.unwrap().nodes;
+        assert!(ai_nodes.iter().any(|(_, node)| {
+            node.role() == Role::Meter && node.name() == Some("Microphone level")
+        }));
+        assert!(!ai_nodes.iter().any(|(_, node)| node.role() == Role::Slider));
     }
 
     #[test]
-    fn input_level_sensitivity_slider_supports_pointer_and_keyboard_adjustment() {
+    fn manual_input_threshold_slider_supports_pointer_keyboard_and_home_end() {
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
         let settings_view = RecordingSettingsView {
-            speech_detection_sensitivity_percent: 42,
+            voice_detection_mode: SpeechDetectionMode::ManualThreshold,
+            input_threshold_dbfs: -42.0,
             input_level_percent: 72,
             ..Default::default()
         };
@@ -14247,13 +14547,14 @@ mod tests {
             .into_iter()
             .find_map(|(_, node)| {
                 (node.role() == egui::accesskit::Role::Slider
-                    && node.name() == Some("Speech detection sensitivity"))
+                    && node.name() == Some("Input threshold"))
                 .then(|| node.bounds())
                 .flatten()
             })
             .expect("combined slider should expose bounds");
+        let track_left = bounds.x0 + 11.0;
         let point = egui::pos2(
-            (bounds.x0 + 98.0) as f32,
+            (track_left + 98.0) as f32,
             ((bounds.y0 + bounds.y1) * 0.5) as f32,
         );
         let _ = render_recording_settings_with_input(
@@ -14284,8 +14585,84 @@ mod tests {
         );
         assert!(matches!(
             pointer_action,
-            ScreenAction::SetSpeechDetectionSensitivity(35)
+            ScreenAction::SetInputThresholdDbfs(-47)
         ));
+
+        let padding_point = egui::pos2(
+            ((bounds.x0 + bounds.x1) * 0.5) as f32,
+            (bounds.y0 + 1.0) as f32,
+        );
+        let _ = render_recording_settings_with_input(
+            &ctx,
+            &settings_view,
+            vec![
+                egui::Event::PointerMoved(padding_point),
+                egui::Event::PointerButton {
+                    pos: padding_point,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        let (_, full_height_action) = render_recording_settings_with_input(
+            &ctx,
+            &settings_view,
+            vec![
+                egui::Event::PointerMoved(padding_point),
+                egui::Event::PointerButton {
+                    pos: padding_point,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        assert_eq!(full_height_action, ScreenAction::SetInputThresholdDbfs(-36));
+
+        // The endpoint marker visibly extends beyond the 280 px track, so both
+        // outer halves remain draggable and clamp to the matching endpoint.
+        for (endpoint, expected) in [
+            (
+                egui::pos2((bounds.x0 + 1.0) as f32, (bounds.y1 - 1.0) as f32),
+                -72,
+            ),
+            (
+                egui::pos2((bounds.x1 - 1.0) as f32, (bounds.y1 - 1.0) as f32),
+                0,
+            ),
+        ] {
+            let _ = render_recording_settings_with_input(
+                &ctx,
+                &settings_view,
+                vec![
+                    egui::Event::PointerMoved(endpoint),
+                    egui::Event::PointerButton {
+                        pos: endpoint,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+            let (_, endpoint_action) = render_recording_settings_with_input(
+                &ctx,
+                &settings_view,
+                vec![
+                    egui::Event::PointerMoved(endpoint),
+                    egui::Event::PointerButton {
+                        pos: endpoint,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+            assert_eq!(
+                endpoint_action,
+                ScreenAction::SetInputThresholdDbfs(expected)
+            );
+        }
 
         let _ = ctx.run(
             egui::RawInput {
@@ -14301,7 +14678,7 @@ mod tests {
                         &settings_view,
                     );
                     ui.memory_mut(|memory| {
-                        memory.request_focus(egui::Id::new(INPUT_LEVEL_SENSITIVITY_CONTROL_ID))
+                        memory.request_focus(egui::Id::new(INPUT_THRESHOLD_CONTROL_ID))
                     });
                 });
             },
@@ -14318,10 +14695,369 @@ mod tests {
                 modifiers: egui::Modifiers::NONE,
             }],
         );
-        assert_eq!(
-            keyboard_action,
-            ScreenAction::SetSpeechDetectionSensitivity(43)
+        assert_eq!(keyboard_action, ScreenAction::SetInputThresholdDbfs(-41));
+
+        let (_, home_action) = render_recording_settings_with_input(
+            &ctx,
+            &settings_view,
+            vec![egui::Event::Key {
+                key: egui::Key::Home,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
         );
+        assert_eq!(home_action, ScreenAction::SetInputThresholdDbfs(-72));
+        let (_, end_action) = render_recording_settings_with_input(
+            &ctx,
+            &settings_view,
+            vec![egui::Event::Key {
+                key: egui::Key::End,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert_eq!(end_action, ScreenAction::SetInputThresholdDbfs(0));
+    }
+
+    #[test]
+    fn manual_input_threshold_slider_executes_accesskit_value_actions() {
+        use egui::accesskit::{Action, ActionData, ActionRequest, Role};
+
+        let settings_view = RecordingSettingsView {
+            voice_detection_mode: SpeechDetectionMode::ManualThreshold,
+            input_threshold_dbfs: -42.0,
+            input_level_percent: 72,
+            ..Default::default()
+        };
+        for (requested_action, data, expected) in [
+            (Action::Increment, None, -41),
+            (Action::Decrement, None, -43),
+            (Action::SetValue, Some(ActionData::NumericValue(-17.4)), -17),
+            (Action::SetValue, Some(ActionData::NumericValue(8.0)), 0),
+        ] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            let initial = render_recording_settings_with_input(&ctx, &settings_view, Vec::new()).0;
+            let target = initial
+                .platform_output
+                .accesskit_update
+                .expect("recording settings should expose AccessKit")
+                .nodes
+                .into_iter()
+                .find_map(|(id, node)| {
+                    (node.role() == Role::Slider && node.name() == Some("Input threshold"))
+                        .then_some(id)
+                })
+                .expect("manual input threshold slider");
+
+            let (_, action) = render_recording_settings_with_input(
+                &ctx,
+                &settings_view,
+                vec![egui::Event::AccessKitActionRequest(ActionRequest {
+                    action: requested_action,
+                    target,
+                    data,
+                })],
+            );
+
+            assert_eq!(action, ScreenAction::SetInputThresholdDbfs(expected));
+        }
+    }
+
+    #[test]
+    fn manual_input_threshold_fill_switches_at_the_exact_marker_boundary() {
+        assert!(!input_level_reaches_threshold(49, -36));
+        assert!(input_level_reaches_threshold(50, -36));
+        assert!(input_level_reaches_threshold(51, -36));
+        assert!(input_level_reaches_threshold(0, -72));
+        assert!(!input_level_reaches_threshold(99, 0));
+        assert!(input_level_reaches_threshold(100, 0));
+    }
+
+    #[test]
+    fn manual_input_threshold_geometry_contains_marker_and_compact_control() {
+        let rect = egui::Rect::from_min_size(egui::pos2(20.0, 30.0), egui::vec2(400.0, 44.0));
+        let track = input_threshold_track_rect(rect);
+        let interaction = input_threshold_interaction_rect(rect, track);
+
+        assert_eq!(track.width(), INPUT_THRESHOLD_TRACK_WIDTH);
+        assert_eq!(track.left(), rect.left());
+        assert_eq!(
+            interaction.left(),
+            track.left() - INPUT_THRESHOLD_MARKER_HIT_RADIUS
+        );
+        assert_eq!(
+            interaction.right(),
+            track.right() + INPUT_THRESHOLD_MARKER_HIT_RADIUS
+        );
+        assert!(interaction.right() < track.right() + INPUT_THRESHOLD_LABEL_GAP);
+        assert_eq!(
+            track.left() + track.width() * input_threshold_position(-72),
+            track.left()
+        );
+        assert_eq!(
+            track.left() + track.width() * input_threshold_position(-36),
+            track.center().x
+        );
+        assert_eq!(
+            track.left() + track.width() * input_threshold_position(0),
+            track.right()
+        );
+
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let settings_view = RecordingSettingsView {
+            voice_detection_mode: SpeechDetectionMode::ManualThreshold,
+            ..Default::default()
+        };
+        let compact_width = 620.0;
+        let output = render_settings_with_input_at(
+            &ctx,
+            SettingsTab::Recording,
+            &TranscriptionState::default(),
+            &settings_view,
+            Vec::new(),
+            None,
+            compact_width,
+        )
+        .0;
+        let bounds = output
+            .platform_output
+            .accesskit_update
+            .expect("compact recording settings should expose AccessKit")
+            .nodes
+            .into_iter()
+            .find_map(|(_, node)| {
+                (node.role() == egui::accesskit::Role::Slider
+                    && node.name() == Some("Input threshold"))
+                .then(|| node.bounds())
+                .flatten()
+            })
+            .expect("compact input threshold bounds");
+        assert!(bounds.x0 >= 0.0);
+        assert!(bounds.x1 <= f64::from(compact_width));
+    }
+
+    #[test]
+    fn manual_threshold_display_uses_a_unicode_minus() {
+        assert_eq!(format_dbfs(-42), "−42 dBFS");
+        assert_eq!(format_dbfs(0), "0 dBFS");
+    }
+
+    #[test]
+    fn voice_detection_mode_selector_changes_when_idle_and_locks_while_requesting() {
+        use egui::accesskit::Role;
+
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let settings_view = RecordingSettingsView::default();
+        let initial = render_recording_settings_with_input(&ctx, &settings_view, Vec::new()).0;
+        let bounds = initial
+            .platform_output
+            .accesskit_update
+            .expect("recording settings should expose AccessKit")
+            .nodes
+            .into_iter()
+            .find_map(|(_, node)| {
+                (node.role() == Role::RadioButton && node.name() == Some("Manual volume threshold"))
+                    .then(|| node.bounds())
+                    .flatten()
+            })
+            .expect("manual detection mode should expose bounds");
+        let point = accesskit_rect_center(bounds);
+        let _ = render_recording_settings_with_input(
+            &ctx,
+            &settings_view,
+            vec![
+                egui::Event::PointerMoved(point),
+                egui::Event::PointerButton {
+                    pos: point,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        let (_, action) = render_recording_settings_with_input(
+            &ctx,
+            &settings_view,
+            vec![
+                egui::Event::PointerMoved(point),
+                egui::Event::PointerButton {
+                    pos: point,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        assert_eq!(
+            action,
+            ScreenAction::SetVoiceDetectionMode(SpeechDetectionMode::ManualThreshold)
+        );
+
+        let (_, locked_action) = render_settings_with_input(
+            &ctx,
+            SettingsTab::Recording,
+            &TranscriptionState {
+                phase: TranscriptionPhase::RequestingMicrophone,
+                ..Default::default()
+            },
+            &settings_view,
+            Vec::new(),
+        );
+        assert_eq!(locked_action, ScreenAction::None);
+        let locked = render_settings_with_input(
+            &ctx,
+            SettingsTab::Recording,
+            &TranscriptionState {
+                phase: TranscriptionPhase::RequestingMicrophone,
+                ..Default::default()
+            },
+            &settings_view,
+            Vec::new(),
+        )
+        .0;
+        let locked_nodes = &locked.platform_output.accesskit_update.unwrap().nodes;
+        assert!(locked_nodes.iter().any(|(_, node)| {
+            node.role() == Role::RadioButton
+                && node.name() == Some("Manual volume threshold")
+                && node.is_disabled()
+        }));
+    }
+
+    #[test]
+    fn voice_detection_mode_selector_has_radio_group_peers_and_keyboard_behavior() {
+        use egui::accesskit::Role;
+
+        let settings_view = RecordingSettingsView::default();
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let initial = render_recording_settings_with_input(&ctx, &settings_view, Vec::new()).0;
+        let nodes = &initial
+            .platform_output
+            .accesskit_update
+            .expect("recording settings should expose AccessKit")
+            .nodes;
+        assert!(nodes.iter().any(|(_, node)| {
+            node.role() == Role::RadioGroup && node.name() == Some("Voice detection")
+        }));
+        let radio_groups = nodes
+            .iter()
+            .filter(|(_, node)| node.role() == Role::RadioButton)
+            .filter(|(_, node)| {
+                matches!(
+                    node.name(),
+                    Some("AI voice detection") | Some("Manual volume threshold")
+                )
+            })
+            .map(|(_, node)| node.radio_group().to_vec())
+            .collect::<Vec<_>>();
+        assert_eq!(radio_groups.len(), 2);
+        assert_eq!(radio_groups[0], radio_groups[1]);
+        assert_eq!(radio_groups[0].len(), 2);
+
+        for (focused, key, expected) in [
+            (
+                SpeechDetectionMode::Ai,
+                egui::Key::ArrowRight,
+                SpeechDetectionMode::ManualThreshold,
+            ),
+            (
+                SpeechDetectionMode::ManualThreshold,
+                egui::Key::ArrowLeft,
+                SpeechDetectionMode::Ai,
+            ),
+            (
+                SpeechDetectionMode::ManualThreshold,
+                egui::Key::Enter,
+                SpeechDetectionMode::ManualThreshold,
+            ),
+            (
+                SpeechDetectionMode::ManualThreshold,
+                egui::Key::Space,
+                SpeechDetectionMode::ManualThreshold,
+            ),
+        ] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            let _ = ctx.run(
+                egui::RawInput {
+                    focused: true,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let _ = settings(
+                            ui,
+                            SettingsTab::Recording,
+                            &TranscriptionState::default(),
+                            &settings_view,
+                        );
+                        ui.memory_mut(|memory| {
+                            memory.request_focus(voice_detection_mode_id(focused))
+                        });
+                    });
+                },
+            );
+            let _ = render_recording_settings_with_input(&ctx, &settings_view, Vec::new());
+            let (_, action) = render_recording_settings_with_input(
+                &ctx,
+                &settings_view,
+                vec![egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+            assert_eq!(action, ScreenAction::SetVoiceDetectionMode(expected));
+        }
+
+        let locked_state = TranscriptionState {
+            phase: TranscriptionPhase::RequestingMicrophone,
+            ..Default::default()
+        };
+        let _ = ctx.run(
+            egui::RawInput {
+                focused: true,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let _ = settings(ui, SettingsTab::Recording, &locked_state, &settings_view);
+                    ui.memory_mut(|memory| {
+                        memory.request_focus(voice_detection_mode_id(SpeechDetectionMode::Ai))
+                    });
+                });
+            },
+        );
+        let _ = render_settings_with_input(
+            &ctx,
+            SettingsTab::Recording,
+            &locked_state,
+            &settings_view,
+            Vec::new(),
+        );
+        let (_, disabled_action) = render_settings_with_input(
+            &ctx,
+            SettingsTab::Recording,
+            &locked_state,
+            &settings_view,
+            vec![egui::Event::Key {
+                key: egui::Key::ArrowRight,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert_eq!(disabled_action, ScreenAction::None);
     }
 
     #[test]
@@ -14750,10 +15486,7 @@ mod tests {
                     SettingsTab::Recording => &[
                         ("Duration limit", egui::accesskit::Role::ComboBox),
                         ("Device", egui::accesskit::Role::ComboBox),
-                        (
-                            "Speech detection sensitivity",
-                            egui::accesskit::Role::Slider,
-                        ),
+                        ("Microphone level", egui::accesskit::Role::Meter),
                         ("Streaming mode", egui::accesskit::Role::ComboBox),
                         ("Transcription device", egui::accesskit::Role::ComboBox),
                     ],
