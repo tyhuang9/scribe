@@ -1091,7 +1091,7 @@ fn recording_controls(ui: &mut egui::Ui, state: &TranscriptionState) -> ScreenAc
 }
 
 fn transcribe_status_notice(state: &TranscriptionState) -> Option<TranscribeNotice> {
-    match state.phase {
+    let phase_error = match state.phase {
         TranscriptionPhase::NoModel => Some(TranscribeNotice::error(
             "Add a speech model to start transcribing.",
             TranscribeRecoveryAction::AddModel,
@@ -1104,6 +1104,21 @@ fn transcribe_status_notice(state: &TranscriptionState) -> Option<TranscribeNoti
             "The selected speech model could not be loaded.",
             TranscribeRecoveryAction::OpenModelSettings,
         )),
+        _ => None,
+    };
+    if phase_error.is_some() {
+        return phase_error;
+    }
+
+    if state
+        .notice
+        .as_ref()
+        .is_some_and(|notice| notice.tone == TranscribeNoticeTone::Error)
+    {
+        return state.notice.clone();
+    }
+
+    match state.phase {
         TranscriptionPhase::RequestingMicrophone => Some(TranscribeNotice::information(
             "Requesting microphone access…",
         )),
@@ -1117,6 +1132,9 @@ fn transcribe_status_notice(state: &TranscriptionState) -> Option<TranscribeNoti
         TranscriptionPhase::ModelLoading => {
             Some(TranscribeNotice::information("Loading speech model…"))
         }
+        TranscriptionPhase::NoModel
+        | TranscriptionPhase::MicrophoneError
+        | TranscriptionPhase::ModelError => unreachable!("phase errors return above"),
         TranscriptionPhase::NoSpeech | TranscriptionPhase::Ready => state.notice.clone(),
     }
 }
@@ -1297,11 +1315,16 @@ fn transcript_frame(ui: &mut egui::Ui, state: &TranscriptionState) -> ScreenActi
     let transcript_panel_id = ui.make_persistent_id("transcript-panel");
     let body_height = transcript_body_height(ui, state);
     let has_committed_transcript = !state.committed_transcript.trim().is_empty();
-    let panel = Frame::none()
-        .fill(colors.card_bg)
-        .stroke(Stroke::new(1.0, colors.border))
-        .rounding(Rounding::same(5.0))
-        .show(ui, |ui| {
+    let ctx = ui.ctx().clone();
+    ctx.accesskit_node_builder(transcript_panel_id, |_| {});
+    let mut panel = None;
+    ctx.with_accessibility_parent(transcript_panel_id, || {
+        panel = Some(
+            Frame::none()
+                .fill(colors.card_bg)
+                .stroke(Stroke::new(1.0, colors.border))
+                .rounding(Rounding::same(5.0))
+                .show(ui, |ui| {
             ui.set_width(ui.available_width());
             let scroll_focus_id = egui::Id::new("transcript-text-scroll-keyboard-focus");
             let scroll_output = Frame::none()
@@ -1455,7 +1478,7 @@ fn transcript_frame(ui: &mut egui::Ui, state: &TranscriptionState) -> ScreenActi
                         ui.add_space(TRANSCRIPT_BODY_VERTICAL_PADDING);
                         }));
                     });
-                    scroll_output.expect("transcript scroll area must render")
+                        scroll_output.expect("transcript scroll area must render")
                 })
                 .inner;
             let scrollable = scroll_output.content_size.y > scroll_output.inner_rect.height() + 1.0;
@@ -1541,13 +1564,15 @@ fn transcript_frame(ui: &mut egui::Ui, state: &TranscriptionState) -> ScreenActi
             } else {
                 ScreenAction::None
             }
-        });
-    ui.ctx()
-        .accesskit_node_builder(transcript_panel_id, |builder| {
-            builder.set_role(egui::accesskit::Role::Group);
-            builder.set_name("Transcript panel");
-            builder.set_bounds(accesskit_rect(panel.response.rect));
-        });
+                }),
+        );
+    });
+    let panel = panel.expect("transcript panel must render");
+    ctx.accesskit_node_builder(transcript_panel_id, |builder| {
+        builder.set_role(egui::accesskit::Role::Group);
+        builder.set_name("Transcript panel");
+        builder.set_bounds(accesskit_rect(panel.response.rect));
+    });
     panel.inner
 }
 
@@ -10177,6 +10202,15 @@ mod tests {
             "Loading speech model…"
         );
 
+        let loading_error = TranscriptionState {
+            phase: TranscriptionPhase::ModelLoading,
+            notice: Some(TranscribeNotice::failure("Clipboard unavailable.")),
+            ..Default::default()
+        };
+        let notice = transcribe_status_notice(&loading_error).unwrap();
+        assert_eq!(notice.tone, TranscribeNoticeTone::Error);
+        assert_eq!(notice.message, "Clipboard unavailable.");
+
         let microphone = TranscriptionState {
             phase: TranscriptionPhase::MicrophoneError,
             notice: Some(TranscribeNotice::information("Unrelated runtime detail")),
@@ -11107,8 +11141,30 @@ mod tests {
             .iter()
             .find(|(_, node)| node.name() == Some(transcript.as_str()))
             .expect("transcript text node");
+        let panel = nodes
+            .iter()
+            .find(|(_, node)| {
+                node.role() == egui::accesskit::Role::Group
+                    && node.name() == Some("Transcript panel")
+            })
+            .expect("transcript panel node");
+        let copy = nodes
+            .iter()
+            .find(|(_, node)| {
+                node.role() == egui::accesskit::Role::Button && node.name() == Some("Copy")
+            })
+            .expect("copy action");
+        let clear = nodes
+            .iter()
+            .find(|(_, node)| {
+                node.role() == egui::accesskit::Role::Button && node.name() == Some("Clear")
+            })
+            .expect("clear action");
 
         assert!(accesskit_descends_from(nodes, scroll.0, transcript.0));
+        assert!(accesskit_descends_from(nodes, panel.0, scroll.0));
+        assert!(accesskit_descends_from(nodes, panel.0, copy.0));
+        assert!(accesskit_descends_from(nodes, panel.0, clear.0));
         assert_eq!(
             requested_transcript_scroll_offset(128.0, 48.0, 256.0, None),
             None,
