@@ -10,8 +10,8 @@ export default defineConfig({
       description: 'Lightning-fast local transcription that stays out of your way.',
       disable404Route: true,
       logo: {
-        light: './src/assets/scribe-lockup-light.svg',
-        dark: './src/assets/scribe-lockup-dark.svg',
+        light: './src/assets/scribe-header-light.svg',
+        dark: './src/assets/scribe-header-dark.svg',
         alt: '',
         replacesTitle: true
       },

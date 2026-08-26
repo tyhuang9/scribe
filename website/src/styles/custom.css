@@ -58,12 +58,6 @@
   padding: 2.5rem 0 1rem;
 }
 
-.scribe-hero-lockup { margin-bottom: 1.75rem; }
-.scribe-hero-lockup img { display: block; height: auto; max-width: min(100%, 23.25rem); }
-.theme-logo-dark { display: none !important; }
-:root[data-theme='dark'] .theme-logo-light { display: none !important; }
-:root[data-theme='dark'] .theme-logo-dark { display: block !important; }
-
 header .site-title img { height: auto; max-height: 2.35rem; width: auto; }
 
 .scribe-intro .intro-title {
@@ -94,7 +88,6 @@ header .site-title img { height: auto; max-height: 2.35rem; width: auto; }
   color: #fff;
   display: inline-block;
   font-weight: 700;
-  margin-right: 1rem;
   padding: 0.7rem 0.95rem;
   text-decoration: none;
 }
@@ -103,6 +96,8 @@ header .site-title img { height: auto; max-height: 2.35rem; width: auto; }
 :root[data-theme='dark'] .primary-link { background: var(--scribe-teal-accent); color: var(--scribe-deep-navy); }
 :root[data-theme='dark'] .primary-link:hover { background: var(--scribe-soft-aqua); color: var(--scribe-deep-navy); }
 :where(a, button, [role='button']):focus-visible { outline: 3px solid var(--scribe-focus); outline-offset: 3px; }
+
+.hero-actions { align-items: center; display: flex; flex-wrap: wrap; gap: 0.75rem 1rem; margin: 1.25rem 0; }
 
 .shortcut-note { color: var(--sl-color-gray-2); font-size: 0.9rem; }
 .shortcut { align-items: center; display: inline-flex; gap: 0.2rem; white-space: nowrap; }

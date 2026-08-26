@@ -1,7 +1,7 @@
 <h1 align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/branding/scribe-lockup-dark.svg" />
-    <img src="docs/assets/branding/scribe-lockup-light.svg" width="360" alt="Scribe" />
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/branding/scribe-header-dark.svg" />
+    <img src="docs/assets/branding/scribe-header-light.svg" width="300" alt="Scribe" />
   </picture>
 </h1>
 

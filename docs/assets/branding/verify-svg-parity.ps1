@@ -7,7 +7,8 @@ $canonicalPath = Join-Path $repositoryRoot 'assets\branding\scribe-mark.svg'
 $canonicalXml = [xml](Get-Content -Raw -LiteralPath $canonicalPath)
 
 function Get-BarGeometry([xml]$document) {
-    @($document.svg.g) |
+    @($document.SelectNodes('//*[local-name()="g"]')) |
+        Where-Object { $_.GetAttribute('fill') -in '#2D979C', '#7CCBC9', '#ACDBD9' } |
         ForEach-Object { @($_.rect) } |
         Sort-Object { [double]$_.x } |
         ForEach-Object { '{0},{1},{2},{3},{4}' -f $_.x, $_.y, $_.width, $_.height, $_.rx }
@@ -29,10 +30,16 @@ function Assert-HashSet([string[]]$relativePaths, [string]$label) {
 }
 
 $canonicalGeometry = Get-BarGeometry $canonicalXml
-$canonicalPathNode = @($canonicalXml.svg.path)[0]
+$canonicalPathNode = $canonicalXml.SelectSingleNode('//*[local-name()="path"]')
 $targets = @(
+    @{ Path = 'assets\branding\scribe-lockup-light.svg'; Primary = '#2D979C' },
+    @{ Path = 'assets\branding\scribe-lockup-dark.svg'; Primary = '#7CCBC9' },
     @{ Path = 'docs\assets\branding\scribe-mark.svg'; Primary = '#2D979C' },
     @{ Path = 'website\public\brand\scribe-mark.svg'; Primary = '#2D979C' },
+    @{ Path = 'docs\assets\branding\scribe-header-light.svg'; Primary = '#2D979C' },
+    @{ Path = 'website\src\assets\scribe-header-light.svg'; Primary = '#2D979C' },
+    @{ Path = 'docs\assets\branding\scribe-header-dark.svg'; Primary = '#7CCBC9' },
+    @{ Path = 'website\src\assets\scribe-header-dark.svg'; Primary = '#7CCBC9' },
     @{ Path = 'docs\assets\branding\scribe-lockup-light.svg'; Primary = '#2D979C' },
     @{ Path = 'website\public\brand\scribe-lockup-light.svg'; Primary = '#2D979C' },
     @{ Path = 'website\src\assets\scribe-lockup-light.svg'; Primary = '#2D979C' },
@@ -47,7 +54,7 @@ foreach ($target in $targets) {
     $document = [xml](Get-Content -Raw -LiteralPath $path)
     Assert-Equal (Get-BarGeometry $document) $canonicalGeometry "$($target.Path) bar geometry differs from the canonical mark."
 
-    $groups = @($document.svg.g)
+    $groups = @($document.SelectNodes('//*[local-name()="g"]'))
     $primaryBars = @($groups | Where-Object { $_.fill -eq $target.Primary } | ForEach-Object { @($_.rect) })
     $secondaryBars = @($groups | Where-Object { $_.fill -eq '#ACDBD9' } | ForEach-Object { @($_.rect) })
     if ($primaryBars.Count -ne 5 -or $secondaryBars.Count -ne 2) {
@@ -55,7 +62,7 @@ foreach ($target in $targets) {
     }
     Assert-Equal @($secondaryBars | Sort-Object { [double]$_.x } | ForEach-Object x) @('30', '87') "$($target.Path) Soft Aqua bars must be the outer-adjacent pair."
 
-    $pathNode = @($document.svg.path)[0]
+    $pathNode = $document.SelectSingleNode('//*[local-name()="path"]')
     foreach ($attribute in 'd', 'stroke-width', 'stroke-linecap', 'stroke-linejoin') {
         if ($pathNode.$attribute -ne $canonicalPathNode.$attribute) {
             throw "$($target.Path) S-path $attribute differs from the canonical mark."
@@ -78,5 +85,26 @@ Assert-HashSet @(
     'website\public\brand\scribe-lockup-dark.svg',
     'website\src\assets\scribe-lockup-dark.svg'
 ) 'Dark lockup'
+Assert-HashSet @(
+    'docs\assets\branding\scribe-header-light.svg',
+    'website\src\assets\scribe-header-light.svg'
+) 'Light compact header'
+Assert-HashSet @(
+    'docs\assets\branding\scribe-header-dark.svg',
+    'website\src\assets\scribe-header-dark.svg'
+) 'Dark compact header'
+
+foreach ($headerPath in @(
+    'docs\assets\branding\scribe-header-light.svg',
+    'website\src\assets\scribe-header-light.svg',
+    'docs\assets\branding\scribe-header-dark.svg',
+    'website\src\assets\scribe-header-dark.svg'
+)) {
+    $headerXml = [xml](Get-Content -Raw -LiteralPath (Join-Path $repositoryRoot $headerPath))
+    $visibleText = @($headerXml.SelectNodes('//*[local-name()="text"]'))
+    if ($visibleText.Count -ne 1 -or $visibleText[0].InnerText -ne 'scribe') {
+        throw "$headerPath must contain only the lowercase wordmark and no tagline."
+    }
+}
 
 Write-Output "Brand SVG parity verified for $($targets.Count) documentation and website assets."
