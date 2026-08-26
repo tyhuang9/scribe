@@ -22,7 +22,7 @@ use super::{
         ModelDownloadState, ModelLanguageFilter, ModelManagementState, ModelSizeTier,
         ModelSpeedTier, ModelViewModel, RemoteCatalogActionKind, RemoteCatalogActionView,
         RemoteCatalogEntryView, RemoteCatalogStatusKind, RemoteCatalogStatusView,
-        RemoteCatalogVariantView, RemoteCatalogView, ResolvedTheme, SettingsTab,
+        RemoteCatalogVariantView, RemoteCatalogView, ResolvedTheme, SettingsTab, TranscribeNotice,
         TranscriptionPhase, TranscriptionState, UiRoute,
     },
     theme_palette,
@@ -207,7 +207,9 @@ impl Fixture {
             Self::TranscribeFinalizing => transcription.phase = TranscriptionPhase::Finalizing,
             Self::TranscribeNoSpeech => {
                 transcription.phase = TranscriptionPhase::NoSpeech;
-                transcription.notice = Some("No speech detected — nothing was added.".into());
+                transcription.notice = Some(TranscribeNotice::information(
+                    "No speech detected — nothing was added.",
+                ));
             }
             Self::TranscribeMicrophoneError => {
                 transcription.phase = TranscriptionPhase::MicrophoneError;
