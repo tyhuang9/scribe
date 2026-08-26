@@ -569,6 +569,41 @@ struct RemovalJournalDocument {
 }
 
 impl ManagedRemoval {
+    /// Stages deletion of one exact regular file without following links or
+    /// crossing a reparse-point ancestor. This is used for installer-owned
+    /// executable siblings, whose removal authority must never be inferred
+    /// from a user-configured model path.
+    pub(crate) fn stage_exact_regular_file(
+        target: &Path,
+        allowed_target: &Path,
+        prior_config_fingerprint: String,
+    ) -> Result<Self, InstallError> {
+        let allowed_target = allowed_target.to_path_buf();
+        validate_reconciliation_target(
+            target,
+            std::slice::from_ref(&allowed_target),
+            "regular-file removal",
+        )?;
+        reject_link_or_reparse_ancestors(target)?;
+        let metadata = fs::symlink_metadata(target).map_err(|error| {
+            failed(format!(
+                "failed to inspect exact removal target {}: {error}",
+                target.display()
+            ))
+        })?;
+        if !metadata.file_type().is_file() || runtime_metadata_is_link_or_reparse(&metadata) {
+            return Err(failed(format!(
+                "exact removal target is not a regular non-link file: {}",
+                target.display()
+            )));
+        }
+        Self::stage(
+            target,
+            std::slice::from_ref(&allowed_target),
+            prior_config_fingerprint,
+        )
+    }
+
     pub(crate) fn stage(
         target: &Path,
         allowed_targets: &[PathBuf],
@@ -708,6 +743,52 @@ impl ManagedRemoval {
         }
         Ok(())
     }
+}
+
+/// Removes one exact regular file after the same no-link validation used by
+/// transactional bundled-model deletion. This is safe for startup cleanup
+/// because the persisted exclusion is already the source of truth: either
+/// side of an interrupted remove continues to keep the artifact out of use.
+pub(crate) fn remove_exact_regular_file(
+    target: &Path,
+    allowed_target: &Path,
+) -> Result<bool, InstallError> {
+    let allowed_target = allowed_target.to_path_buf();
+    validate_reconciliation_target(
+        target,
+        std::slice::from_ref(&allowed_target),
+        "regular-file cleanup",
+    )?;
+    reject_link_or_reparse_ancestors(target)?;
+    let metadata = match fs::symlink_metadata(target) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(failed(format!(
+                "failed to inspect exact cleanup target {}: {error}",
+                target.display()
+            )));
+        }
+    };
+    if !metadata.file_type().is_file() || runtime_metadata_is_link_or_reparse(&metadata) {
+        return Err(failed(format!(
+            "exact cleanup target is not a regular non-link file: {}",
+            target.display()
+        )));
+    }
+    fs::remove_file(target).map_err(|error| {
+        failed(format!(
+            "failed to remove exact cleanup target {}: {error}",
+            target.display()
+        ))
+    })?;
+    sync_parent(target).map_err(|error| {
+        InstallError::RecoveryRequired(format!(
+            "removed {}, but its parent directory could not be made durable: {error}",
+            target.display()
+        ))
+    })?;
+    Ok(true)
 }
 
 pub(crate) fn reconcile_managed_removal(
@@ -4990,6 +5071,49 @@ mod tests {
 
         assert_eq!(fs::read(&target).unwrap(), b"model");
         assert!(!removal_tombstone_path(&target).unwrap().exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn exact_regular_file_removal_rejects_directories_and_wrong_targets() {
+        let root = unique_root("exact-removal-safety");
+        fs::create_dir_all(&root).unwrap();
+        let target = root.join("included.gguf");
+        let other = root.join("configured.gguf");
+        fs::write(&target, b"included").unwrap();
+        fs::write(&other, b"external").unwrap();
+        let fingerprint = format!("{:x}", Sha256::digest(b"config"));
+
+        let wrong_target =
+            ManagedRemoval::stage_exact_regular_file(&other, &target, fingerprint.clone())
+                .unwrap_err();
+        assert!(wrong_target.to_string().contains("outside"));
+        assert_eq!(fs::read(&other).unwrap(), b"external");
+
+        let directory = root.join("directory.gguf");
+        fs::create_dir_all(&directory).unwrap();
+        let directory_error =
+            ManagedRemoval::stage_exact_regular_file(&directory, &directory, fingerprint)
+                .unwrap_err();
+        assert!(
+            directory_error
+                .to_string()
+                .contains("regular non-link file")
+        );
+        assert!(directory.is_dir());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn exact_regular_file_cleanup_is_idempotent() {
+        let root = unique_root("exact-removal-cleanup");
+        fs::create_dir_all(&root).unwrap();
+        let target = root.join("included.gguf");
+        fs::write(&target, b"included").unwrap();
+
+        assert!(remove_exact_regular_file(&target, &target).unwrap());
+        assert!(!target.exists());
+        assert!(!remove_exact_regular_file(&target, &target).unwrap());
         fs::remove_dir_all(root).unwrap();
     }
 

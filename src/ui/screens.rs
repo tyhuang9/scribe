@@ -2441,17 +2441,16 @@ fn model_lifecycle_presentation<'a>(
             }
         }
         ModelCard::Local(model) if model.included => ModelLifecyclePresentation {
-            action: ScreenAction::None,
-            icon: Icon::CheckCircle,
-            label: "Installed".into(),
-            accessible_name: format!("{} is installed with Scribe", model.display_name),
-            enabled: false,
-            disabled_reason: Some(
-                "This verified model is installed with Scribe and cannot be removed.",
-            ),
+            action: ScreenAction::RequestModelRemoval(model.id.clone()),
+            icon: Icon::Trash,
+            label: "Delete".into(),
+            accessible_name: format!("Delete {}", model.display_name),
+            enabled: model.removal_supported,
+            disabled_reason: (!model.removal_supported)
+                .then_some("This included artifact is not eligible for safe removal."),
             visible_status: None,
             compact_size: None,
-            tone: ModelLifecycleTone::Standard,
+            tone: ModelLifecycleTone::DestructiveOutline,
         },
         ModelCard::Local(model) if model.installed => {
             if model.primary_action_installs_upgrade || model.primary_action_repairs_runtime {
@@ -2695,7 +2694,11 @@ fn model_lifecycle_controls<'a>(
     }
     if matches!(
         card,
-        ModelCard::Local(model) if model.included && model.installed && model.ready
+        ModelCard::Local(model)
+            if model.included
+                && model.installed
+                && model.ready
+                && !model.removal_supported
     ) {
         primary = None;
     }
@@ -4374,7 +4377,7 @@ fn render_unified_model_card(
     };
     let card_accessible_description = match card {
         ModelCard::Local(model) if model.included && model.installed && model.ready => {
-            Some("Installed with Scribe; this model cannot be removed.".to_owned())
+            Some("Installed with Scribe; choose Delete to remove this included model.".to_owned())
         }
         _ => model_download_progress_presentation(card).map(|progress| progress.accessible_text),
     };
@@ -4712,6 +4715,29 @@ fn models(
         RichText::new("Manage the speech models available on this device.")
             .color(colors.muted_text),
     );
+    if let Some(warning) = management.lifecycle_warning.as_deref() {
+        ui.add_space(10.0);
+        let alert = Frame::none()
+            .fill(colors.panel_bg)
+            .stroke(Stroke::new(1.0, colors.warning))
+            .rounding(Rounding::same(6.0))
+            .inner_margin(Margin::symmetric(12.0, 10.0))
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new(icon_glyph(Icon::Warning))
+                            .size(18.0)
+                            .color(colors.warning),
+                    );
+                    ui.label(warning);
+                });
+            });
+        ui.ctx().accesskit_node_builder(alert.response.id, |builder| {
+            builder.set_role(egui::accesskit::Role::Alert);
+            builder.set_name(warning);
+            builder.set_bounds(accesskit_rect(alert.response.rect));
+        });
+    }
     ui.add_space(18.0);
     let mut query = remote_catalog.query.clone();
     let toolbar = model_toolbar(
@@ -8946,7 +8972,7 @@ mod tests {
     }
 
     #[test]
-    fn bundled_model_hides_settled_lifecycle_but_retains_repair_path() {
+    fn bundled_model_exposes_delete_and_retains_repair_path() {
         let included = ModelViewModel {
             id: BUNDLED_BASE_MODEL_ID.into(),
             display_name: "Whisper Base — English".into(),
@@ -8954,24 +8980,24 @@ mod tests {
             included: true,
             installed: true,
             ready: true,
-            removal_supported: false,
+            removal_supported: true,
             download_state: ModelDownloadState::Installed,
             ..Default::default()
         };
         let presentation = model_lifecycle_presentation(ModelCard::Local(&included), true);
-        assert_eq!(presentation.action, ScreenAction::None);
-        assert_eq!(presentation.label, "Installed");
-        assert_eq!(presentation.icon, Icon::CheckCircle);
-        assert!(!presentation.enabled);
         assert_eq!(
-            presentation.disabled_reason,
-            Some("This verified model is installed with Scribe and cannot be removed.")
+            presentation.action,
+            ScreenAction::RequestModelRemoval(BUNDLED_BASE_MODEL_ID.into())
         );
+        assert_eq!(presentation.label, "Delete");
+        assert_eq!(presentation.icon, Icon::Trash);
+        assert!(presentation.enabled);
+        assert!(presentation.disabled_reason.is_none());
         assert!(
-            model_lifecycle_controls(ModelCard::Local(&included), true)
+            model_lifecycle_controls(ModelCard::Local(&included), false)
                 .primary
-                .is_none(),
-            "settled bundled models must not expose a redundant Installed lifecycle control"
+                .is_some(),
+            "included Base remains deletable even when it is the last ready model"
         );
 
         let repair = ModelViewModel {
