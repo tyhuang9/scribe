@@ -1,5 +1,7 @@
 use eframe::egui::{self, Color32, Frame, Margin, Rounding, Sense, Stroke, Vec2};
 
+use crate::branding;
+
 use super::{
     controls::{Icon, focus_tooltip, icon_glyph, paint_focus_ring},
     model_picker::{
@@ -371,33 +373,27 @@ fn active_model_button(
     response
 }
 
-fn brand(ui: &mut egui::Ui, mode: NavigationMode, text: Color32, muted: Color32) {
-    ui.horizontal(|ui| {
-        ui.label(
-            egui::RichText::new(icon_glyph(Icon::Waveform))
-                .size(28.0)
-                .color(text),
-        );
+fn brand(ui: &mut egui::Ui, mode: NavigationMode, text: Color32, _muted: Color32) {
+    let response = ui.horizontal(|ui| {
+        branding::show_mark(ui, 32.0);
         if mode == NavigationMode::Full {
-            ui.add_space(4.0);
-            ui.vertical(|ui| {
-                let heading = ui.label(
-                    egui::RichText::new("Scribe")
-                        .size(22.0)
-                        .color(text)
-                        .strong(),
-                );
-                ui.ctx().accesskit_node_builder(heading.id, |builder| {
-                    builder.set_role(egui::accesskit::Role::Heading);
-                });
-                ui.label(
-                    egui::RichText::new("Local Speech-to-Text")
-                        .small()
-                        .color(muted),
-                );
+            ui.add_space(5.0);
+            let heading = ui.label(
+                egui::RichText::new(branding::WORDMARK)
+                    .size(23.0)
+                    .color(text)
+                    .strong(),
+            );
+            ui.ctx().accesskit_node_builder(heading.id, |builder| {
+                builder.set_role(egui::accesskit::Role::Heading);
+                builder.set_name("Scribe");
             });
         }
     });
+    ui.ctx()
+        .accesskit_node_builder(response.response.id, |builder| {
+            builder.set_description(branding::TAGLINE);
+        });
 }
 
 fn nav_button(
@@ -742,6 +738,38 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn navigation_brand_mark_has_image_semantics_and_a_named_wordmark() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut page = AppPage::Transcribe;
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(1_180.0, 680.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                show_navigation(
+                    ctx,
+                    &mut page,
+                    false,
+                    ResolvedTheme::Light,
+                    SidebarModelView::default(),
+                );
+            },
+        );
+        let update = output.platform_output.accesskit_update.unwrap();
+        assert!(update.nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::Image && node.name() == Some("Scribe logo")
+        }));
+        assert!(update.nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::Heading && node.name() == Some("Scribe")
+        }));
     }
 
     #[test]

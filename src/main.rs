@@ -6,6 +6,7 @@
 mod app;
 mod audio;
 mod benchmark;
+mod branding;
 mod compatibility_bridge;
 mod config;
 mod core;
@@ -152,6 +153,11 @@ fn native_options() -> eframe::NativeOptions {
             .with_inner_size(inner_size)
             .with_min_inner_size(MIN_APP_INNER_SIZE)
             .with_resizable(true)
+            .with_icon(egui::IconData {
+                rgba: branding::app_icon_rgba(128),
+                width: 128,
+                height: 128,
+            })
             // Root content owns its opaque background. Transparency remains
             // limited to the native overlay windows.
             .with_transparent(false),
@@ -309,6 +315,9 @@ mod tests {
         );
         assert_eq!(options.viewport.resizable, Some(true));
         assert_eq!(options.viewport.transparent, Some(false));
+        let icon = options.viewport.icon.expect("Scribe window icon");
+        assert_eq!((icon.width, icon.height), (128, 128));
+        assert_eq!(icon.rgba.len(), 128 * 128 * 4);
         assert!(options.follow_system_theme);
     }
 

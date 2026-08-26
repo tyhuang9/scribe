@@ -13804,13 +13804,13 @@ fn chip_colors(ui: &Ui, tone: ChipTone) -> (Color32, Color32, Stroke) {
         ),
         ChipTone::Active if ui.visuals().dark_mode => (
             colors.accent,
-            Color32::from_rgb(24, 48, 84),
-            Stroke::new(1.0, Color32::from_rgb(42, 86, 143)),
+            Color32::from_rgb(18, 57, 67),
+            Stroke::new(1.0, colors.border_strong),
         ),
         ChipTone::Active => (
-            Color32::from_rgb(29, 78, 216),
-            Color32::from_rgb(219, 234, 254),
-            Stroke::new(1.0, Color32::from_rgb(191, 219, 254)),
+            Color32::from_rgb(23, 111, 116),
+            colors.panel_bg,
+            Stroke::new(1.0, colors.border_strong),
         ),
     }
 }
@@ -13953,6 +13953,7 @@ fn stitch_visuals(theme_mode: ThemeMode) -> egui::Visuals {
     let colors = ThemePalette::from_visuals(&visuals);
     visuals.override_text_color = Some(colors.text);
     visuals.selection.bg_fill = colors.accent;
+    visuals.selection.stroke = Stroke::new(1.0, colors.text);
     visuals.hyperlink_color = colors.accent;
     visuals.panel_fill = colors.content_bg;
     visuals.window_fill = colors.card_bg;

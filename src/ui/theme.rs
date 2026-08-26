@@ -1,5 +1,10 @@
 use eframe::egui::{self, Color32, Ui};
 
+use crate::branding::{
+    DEEP_INK, DEEP_NAVY, ICE_MIST, LIVE_CORAL, NAVY_SURFACE, SCRIBE_TEAL, SOFT_AQUA, TEAL_ACCENT,
+    WARM_SAND,
+};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ThemePalette {
     pub shell_bg: Color32,
@@ -32,9 +37,9 @@ pub(crate) struct ThemePalette {
     pub meter_rating_5: Color32,
     pub primary: Color32,
     pub accent: Color32,
-    /// Scribe-purple recording mark shared by foreground and native overlay renderers.
+    /// Scribe teal recording mark shared by foreground and native overlay renderers.
     pub recording_waveform: Color32,
-    /// Theme-coherent blue/neutral track for the compact recording-mode selector.
+    /// Theme-coherent teal/neutral track for the compact recording-mode selector.
     pub segmented_control_bg: Color32,
     /// Foreground for the selected segment on the current card surface.
     pub segmented_control_selected_text: Color32,
@@ -70,101 +75,99 @@ impl ThemePalette {
 
     pub(crate) fn light() -> Self {
         Self {
-            shell_bg: Color32::from_rgb(230, 232, 234),
-            content_bg: Color32::from_rgb(247, 249, 251),
+            shell_bg: ICE_MIST,
+            content_bg: Color32::from_rgb(247, 251, 251),
             sidebar_bg: Color32::WHITE,
             card_bg: Color32::WHITE,
-            panel_bg: Color32::from_rgb(248, 250, 252),
-            disabled_bg: Color32::from_rgb(242, 244, 247),
-            active_card_bg: Color32::from_rgb(239, 246, 255),
-            text: Color32::from_rgb(29, 33, 42),
-            muted_text: Color32::from_rgb(85, 95, 109),
-            tertiary_text: Color32::from_rgb(89, 101, 118),
-            border: Color32::from_rgb(226, 232, 240),
-            border_strong: Color32::from_rgb(203, 213, 225),
-            slider_track_border: Color32::from_rgb(116, 128, 145),
-            slider_threshold_fill: Color32::from_rgb(147, 197, 253),
-            slider_remainder_fill: Color32::from_rgb(226, 232, 240),
-            slider_live_below: Color32::from_rgb(29, 78, 216),
-            slider_live_above: Color32::from_rgb(6, 118, 71),
-            sensitivity_marker_on_track: Color32::from_rgb(23, 27, 36),
+            panel_bg: ICE_MIST,
+            disabled_bg: Color32::from_rgb(241, 247, 247),
+            active_card_bg: Color32::from_rgb(216, 238, 237),
+            text: DEEP_INK,
+            muted_text: Color32::from_rgb(64, 91, 110),
+            tertiary_text: Color32::from_rgb(82, 105, 122),
+            border: SOFT_AQUA,
+            border_strong: SCRIBE_TEAL,
+            slider_track_border: SCRIBE_TEAL,
+            slider_threshold_fill: ICE_MIST,
+            slider_remainder_fill: Color32::from_rgb(250, 252, 252),
+            slider_live_below: SCRIBE_TEAL,
+            slider_live_above: Color32::from_rgb(50, 107, 75),
+            sensitivity_marker_on_track: DEEP_INK,
             sensitivity_marker_on_live: Color32::WHITE,
-            meter_track: Color32::from_rgb(226, 232, 240),
+            meter_track: ICE_MIST,
             meter_rating_1: Color32::from_rgb(220, 38, 38),
             meter_rating_2: Color32::from_rgb(194, 65, 12),
             meter_rating_3: Color32::from_rgb(161, 98, 7),
             meter_rating_4: Color32::from_rgb(77, 124, 15),
             meter_rating_5: Color32::from_rgb(6, 118, 71),
-            primary: Color32::from_rgb(6, 10, 18),
-            accent: Color32::from_rgb(37, 99, 235),
-            // A slightly deeper companion to the reference purple preserves 3:1 contrast
-            // when the translucent light surface is composited over dark desktop content.
-            recording_waveform: Color32::from_rgb(118, 94, 235),
-            segmented_control_bg: Color32::from_rgb(37, 99, 235),
-            segmented_control_selected_text: Color32::from_rgb(29, 33, 42),
-            inactive_toggle_track: Color32::from_rgb(100, 116, 139),
-            success: Color32::from_rgb(18, 183, 106),
-            success_text: Color32::from_rgb(6, 118, 71),
-            warning: Color32::from_rgb(146, 64, 14),
-            error: Color32::from_rgb(217, 45, 32),
-            error_text: Color32::from_rgb(151, 27, 31),
-            danger_button_text: Color32::WHITE,
-            error_pale: Color32::from_rgb(254, 228, 226),
-            error_border: Color32::from_rgb(253, 162, 155),
-            neutral_notice_text: Color32::from_rgb(71, 84, 103),
-            primary_button_bg: Color32::from_rgb(23, 27, 36),
-            primary_button_text: Color32::WHITE,
-            inverse_neutral_bg: Color32::from_rgb(23, 27, 36),
+            primary: DEEP_INK,
+            accent: SCRIBE_TEAL,
+            recording_waveform: SCRIBE_TEAL,
+            segmented_control_bg: SCRIBE_TEAL,
+            segmented_control_selected_text: DEEP_INK,
+            inactive_toggle_track: Color32::from_rgb(88, 114, 126),
+            success: Color32::from_rgb(57, 123, 90),
+            success_text: Color32::from_rgb(40, 97, 69),
+            warning: Color32::from_rgb(123, 80, 36),
+            error: LIVE_CORAL,
+            error_text: Color32::from_rgb(132, 46, 38),
+            danger_button_text: DEEP_INK,
+            error_pale: Color32::from_rgb(255, 240, 237),
+            error_border: LIVE_CORAL,
+            neutral_notice_text: Color32::from_rgb(64, 91, 110),
+            primary_button_bg: SCRIBE_TEAL,
+            primary_button_text: DEEP_INK,
+            inverse_neutral_bg: DEEP_INK,
             inverse_neutral_text: Color32::WHITE,
         }
     }
 
     pub(crate) fn dark() -> Self {
         Self {
-            shell_bg: Color32::from_rgb(15, 18, 24),
-            content_bg: Color32::from_rgb(15, 18, 24),
-            sidebar_bg: Color32::from_rgb(20, 24, 32),
-            card_bg: Color32::from_rgb(26, 31, 41),
-            panel_bg: Color32::from_rgb(22, 27, 36),
-            disabled_bg: Color32::from_rgb(36, 42, 54),
-            active_card_bg: Color32::from_rgb(25, 42, 68),
-            text: Color32::from_rgb(236, 241, 247),
-            muted_text: Color32::from_rgb(156, 166, 179),
-            tertiary_text: Color32::from_rgb(135, 146, 160),
-            border: Color32::from_rgb(53, 61, 76),
-            border_strong: Color32::from_rgb(76, 86, 104),
-            slider_track_border: Color32::from_rgb(112, 126, 147),
-            slider_threshold_fill: Color32::from_rgb(30, 64, 108),
-            slider_remainder_fill: Color32::from_rgb(53, 61, 76),
-            slider_live_below: Color32::from_rgb(96, 165, 250),
-            slider_live_above: Color32::from_rgb(74, 222, 128),
-            sensitivity_marker_on_track: Color32::from_rgb(247, 250, 252),
-            sensitivity_marker_on_live: Color32::from_rgb(17, 19, 24),
-            meter_track: Color32::from_rgb(53, 61, 76),
-            meter_rating_1: Color32::from_rgb(248, 113, 113),
-            meter_rating_2: Color32::from_rgb(251, 146, 60),
-            meter_rating_3: Color32::from_rgb(250, 204, 21),
-            meter_rating_4: Color32::from_rgb(163, 230, 53),
-            meter_rating_5: Color32::from_rgb(74, 222, 128),
-            primary: Color32::from_rgb(247, 250, 252),
-            accent: Color32::from_rgb(96, 165, 250),
-            recording_waveform: Color32::from_rgb(139, 124, 246),
-            segmented_control_bg: Color32::from_rgb(96, 115, 140),
-            segmented_control_selected_text: Color32::from_rgb(236, 241, 247),
-            inactive_toggle_track: Color32::from_rgb(96, 115, 140),
-            success: Color32::from_rgb(74, 222, 128),
-            success_text: Color32::from_rgb(134, 239, 172),
-            warning: Color32::from_rgb(251, 191, 36),
-            error: Color32::from_rgb(248, 113, 113),
-            error_text: Color32::from_rgb(254, 202, 202),
-            danger_button_text: Color32::from_rgb(17, 19, 24),
-            error_pale: Color32::from_rgb(77, 33, 36),
-            error_border: Color32::from_rgb(153, 62, 65),
-            neutral_notice_text: Color32::from_rgb(196, 205, 217),
-            primary_button_bg: Color32::from_rgb(37, 99, 235),
-            primary_button_text: Color32::WHITE,
-            inverse_neutral_bg: Color32::from_rgb(247, 250, 252),
-            inverse_neutral_text: Color32::from_rgb(17, 19, 24),
+            shell_bg: DEEP_NAVY,
+            content_bg: DEEP_NAVY,
+            sidebar_bg: NAVY_SURFACE,
+            card_bg: Color32::from_rgb(11, 43, 66),
+            panel_bg: Color32::from_rgb(9, 38, 61),
+            disabled_bg: Color32::from_rgb(23, 52, 74),
+            active_card_bg: Color32::from_rgb(18, 65, 77),
+            text: ICE_MIST,
+            muted_text: SOFT_AQUA,
+            tertiary_text: Color32::from_rgb(145, 185, 187),
+            border: Color32::from_rgb(36, 81, 102),
+            border_strong: TEAL_ACCENT,
+            slider_track_border: TEAL_ACCENT,
+            slider_threshold_fill: Color32::from_rgb(23, 58, 76),
+            slider_remainder_fill: Color32::from_rgb(36, 71, 93),
+            slider_live_below: TEAL_ACCENT,
+            slider_live_above: WARM_SAND,
+            sensitivity_marker_on_track: ICE_MIST,
+            sensitivity_marker_on_live: DEEP_NAVY,
+            meter_track: Color32::from_rgb(23, 58, 76),
+            meter_rating_1: LIVE_CORAL,
+            meter_rating_2: Color32::from_rgb(240, 160, 112),
+            meter_rating_3: WARM_SAND,
+            meter_rating_4: Color32::from_rgb(168, 210, 159),
+            meter_rating_5: TEAL_ACCENT,
+            primary: ICE_MIST,
+            accent: TEAL_ACCENT,
+            recording_waveform: TEAL_ACCENT,
+            segmented_control_bg: TEAL_ACCENT,
+            segmented_control_selected_text: ICE_MIST,
+            inactive_toggle_track: Color32::from_rgb(100, 133, 143),
+            success: TEAL_ACCENT,
+            success_text: Color32::from_rgb(157, 223, 183),
+            warning: WARM_SAND,
+            error: LIVE_CORAL,
+            error_text: Color32::from_rgb(255, 210, 203),
+            danger_button_text: DEEP_NAVY,
+            error_pale: Color32::from_rgb(82, 45, 49),
+            error_border: LIVE_CORAL,
+            neutral_notice_text: SOFT_AQUA,
+            primary_button_bg: TEAL_ACCENT,
+            primary_button_text: DEEP_NAVY,
+            inverse_neutral_bg: ICE_MIST,
+            inverse_neutral_text: DEEP_NAVY,
         }
     }
 
@@ -239,15 +242,24 @@ mod tests {
     }
 
     #[test]
-    fn recording_waveform_uses_reference_purple_tokens() {
-        assert_eq!(
-            ThemePalette::light().recording_waveform,
-            Color32::from_rgb(118, 94, 235)
-        );
-        assert_eq!(
-            ThemePalette::dark().recording_waveform,
-            Color32::from_rgb(139, 124, 246)
-        );
+    fn recording_waveform_uses_reference_teal_tokens() {
+        assert_eq!(ThemePalette::light().recording_waveform, SCRIBE_TEAL);
+        assert_eq!(ThemePalette::dark().recording_waveform, TEAL_ACCENT);
+    }
+
+    #[test]
+    fn brand_actions_pair_exact_raw_fills_with_accessible_foregrounds() {
+        let light = ThemePalette::light();
+        assert_eq!(light.primary_button_bg, SCRIBE_TEAL);
+        assert!(contrast_ratio(light.primary_button_text, light.primary_button_bg) >= 4.5);
+        assert_eq!(light.error, LIVE_CORAL);
+        assert!(contrast_ratio(light.danger_button_text, light.error) >= 4.5);
+
+        let dark = ThemePalette::dark();
+        assert_eq!(dark.primary_button_bg, TEAL_ACCENT);
+        assert!(contrast_ratio(dark.primary_button_text, dark.primary_button_bg) >= 4.5);
+        assert_eq!(dark.warning, WARM_SAND);
+        assert_eq!(dark.error, LIVE_CORAL);
     }
 
     #[test]

@@ -634,19 +634,19 @@ fn show_overlay_fixture_host(ctx: &egui::Context, overlay_presented: bool) {
             let panel_width = 150.0;
             let panels = [
                 (
-                    egui::Color32::from_rgb(248, 250, 253),
-                    egui::Color32::from_rgb(29, 33, 42),
+                    crate::branding::ICE_MIST,
+                    crate::branding::DEEP_INK,
                     "LIGHT SAMPLE",
                 ),
                 (
-                    egui::Color32::from_rgb(22, 27, 36),
-                    egui::Color32::from_rgb(236, 241, 247),
+                    crate::branding::DEEP_NAVY,
+                    crate::branding::ICE_MIST,
                     "DARK SAMPLE",
                 ),
                 (
-                    egui::Color32::from_rgb(37, 99, 235),
-                    egui::Color32::WHITE,
-                    "SCRIBE BLUE",
+                    crate::branding::SCRIBE_TEAL,
+                    crate::branding::DEEP_INK,
+                    "SCRIBE TEAL",
                 ),
             ];
             let panel_count = (sample_area.width() / panel_width).ceil() as usize;
