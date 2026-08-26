@@ -13,7 +13,11 @@ use super::platform::{
     CapturedTarget, OverlayHardeningProfile, OverlayPosition, OverlayWindowBounds,
     OverlayWindowSpec, harden_overlay_window, harden_overlay_window_at, overlay_window_bounds,
 };
-use crate::{transcription::SessionId, ui::theme_palette};
+use crate::{
+    branding::{DEEP_INK, DEEP_NAVY, ICE_MIST, SOFT_AQUA, TEAL_ACCENT},
+    transcription::SessionId,
+    ui::theme_palette,
+};
 
 pub const OVERLAY_VIEWPORT_KEY: &str = "scribe-dictation-overlay";
 pub const OVERLAY_WINDOW_TITLE: &str = "Scribe Dictation Overlay";
@@ -360,35 +364,45 @@ fn overlay_colors(context: &egui::Context) -> OverlayColors {
     let palette = theme_palette(context);
     if context.style().visuals.dark_mode {
         OverlayColors {
-            // This app-owned tint remains deterministic while its alpha lets
-            // the underlying desktop content show through.
-            // The egui fallback does not composite native shadow rings beneath
-            // the fill, so this tint lands near the reference's neutral-gray
-            // surface on its light backdrop without the native renderer's
-            // shadow compensation.
-            surface: Color32::from_rgba_unmultiplied(25, 26, 33, 184),
-            border: Color32::from_rgba_unmultiplied(220, 229, 242, 36),
-            text: palette.text,
-            muted_text: Color32::from_rgb(210, 210, 216),
-            // The supplied reference uses a purple brand mark. This slightly
-            // lighter overlay-specific token preserves that appearance while
-            // keeping the non-text mark at 3:1 over the translucent surface.
-            waveform: Color32::from_rgb(178, 162, 255),
-            success: palette.success_text,
-            error: Color32::from_rgb(255, 200, 200),
-            warning: Color32::from_rgb(255, 222, 170),
+            // The exact Deep Navy surface stays deterministic while its alpha
+            // lets the underlying desktop content show through.
+            surface: Color32::from_rgba_unmultiplied(
+                DEEP_NAVY.r(),
+                DEEP_NAVY.g(),
+                DEEP_NAVY.b(),
+                184,
+            ),
+            border: Color32::from_rgba_unmultiplied(
+                TEAL_ACCENT.r(),
+                TEAL_ACCENT.g(),
+                TEAL_ACCENT.b(),
+                36,
+            ),
+            text: ICE_MIST,
+            muted_text: SOFT_AQUA,
+            waveform: TEAL_ACCENT,
+            success: Color32::from_rgb(157, 223, 183),
+            error: Color32::from_rgb(255, 210, 203),
+            warning: Color32::from_rgb(246, 223, 194),
             shadow: Color32::from_black_alpha(96),
         }
     } else {
         OverlayColors {
-            surface: Color32::from_rgba_unmultiplied(248, 250, 253, 228),
-            border: Color32::from_rgba_unmultiplied(35, 47, 66, 64),
-            text: palette.text,
-            muted_text: Color32::from_rgb(65, 75, 90),
-            waveform: palette.recording_waveform,
-            success: palette.success_text,
-            error: palette.error_text,
-            warning: palette.warning,
+            surface: Color32::from_rgba_unmultiplied(ICE_MIST.r(), ICE_MIST.g(), ICE_MIST.b(), 228),
+            border: Color32::from_rgba_unmultiplied(
+                palette.accent.r(),
+                palette.accent.g(),
+                palette.accent.b(),
+                64,
+            ),
+            text: DEEP_INK,
+            muted_text: Color32::from_rgb(64, 91, 110),
+            // The exact light teal remains a raw identity token; this deeper
+            // semantic teal keeps the mark above 3:1 on a translucent surface.
+            waveform: Color32::from_rgb(23, 111, 116),
+            success: Color32::from_rgb(40, 97, 69),
+            error: Color32::from_rgb(132, 46, 38),
+            warning: Color32::from_rgb(123, 80, 36),
             shadow: Color32::from_black_alpha(54),
         }
     }

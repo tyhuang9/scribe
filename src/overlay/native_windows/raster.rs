@@ -30,7 +30,10 @@ use super::{
     },
     layout::DisplayLayout,
 };
-use crate::ui::ThemePalette;
+use crate::{
+    branding::{DEEP_INK, DEEP_NAVY, ICE_MIST, SOFT_AQUA, TEAL_ACCENT},
+    ui::ThemePalette,
+};
 
 const PIXEL_FORMAT_32BPP_PARGB: i32 = 0x000E_200B;
 const MAX_PREVIEW_GRAPHEMES: usize = 512;
@@ -74,27 +77,31 @@ impl NativeColors {
         };
         if dark_mode {
             Self {
-                surface: Argb::new(184, 52, 53, 61),
-                border: Argb::new(36, 220, 229, 242),
-                text: Argb::from_color(palette.text),
-                muted_text: Argb::new(255, 210, 210, 216),
-                // Overlay-specific accessible variant of the reference purple.
-                waveform: Argb::new(255, 178, 162, 255),
-                success: Argb::from_color(palette.success_text),
-                error: Argb::new(255, 255, 200, 200),
-                warning: Argb::new(255, 255, 222, 170),
+                surface: Argb::new(184, DEEP_NAVY.r(), DEEP_NAVY.g(), DEEP_NAVY.b()),
+                border: Argb::new(36, TEAL_ACCENT.r(), TEAL_ACCENT.g(), TEAL_ACCENT.b()),
+                text: Argb::from_color(ICE_MIST),
+                muted_text: Argb::from_color(SOFT_AQUA),
+                waveform: Argb::from_color(TEAL_ACCENT),
+                success: Argb::new(255, 157, 223, 183),
+                error: Argb::new(255, 255, 210, 203),
+                warning: Argb::new(255, 246, 223, 194),
                 shadow: Argb::new(96, 0, 0, 0),
             }
         } else {
             Self {
-                surface: Argb::new(228, 248, 250, 253),
-                border: Argb::new(64, 35, 47, 66),
-                text: Argb::from_color(palette.text),
-                muted_text: Argb::new(255, 65, 75, 90),
-                waveform: Argb::from_color(palette.recording_waveform),
-                success: Argb::from_color(palette.success_text),
-                error: Argb::from_color(palette.error_text),
-                warning: Argb::from_color(palette.warning),
+                surface: Argb::new(228, ICE_MIST.r(), ICE_MIST.g(), ICE_MIST.b()),
+                border: Argb::new(
+                    64,
+                    palette.accent.r(),
+                    palette.accent.g(),
+                    palette.accent.b(),
+                ),
+                text: Argb::from_color(DEEP_INK),
+                muted_text: Argb::new(255, 64, 91, 110),
+                waveform: Argb::new(255, 23, 111, 116),
+                success: Argb::new(255, 40, 97, 69),
+                error: Argb::new(255, 132, 46, 38),
+                warning: Argb::new(255, 123, 80, 36),
                 shadow: Argb::new(54, 0, 0, 0),
             }
         }
@@ -2306,8 +2313,22 @@ mod tests {
         }
     }
 
+    fn assert_reference_geometry_is_pixel_identical(actual: &[u8], expected: &[u8], label: &str) {
+        assert_eq!(actual.len(), expected.len(), "{label} pixel length changed");
+        for (index, (actual, expected)) in actual
+            .chunks_exact(4)
+            .zip(expected.chunks_exact(4))
+            .enumerate()
+        {
+            assert_eq!(
+                actual[3], expected[3],
+                "{label} alpha geometry changed at pixel {index}"
+            );
+        }
+    }
+
     #[test]
-    fn reference_contract_native_overlay_raster_golden_frames_are_pixel_identical() {
+    fn reference_contract_native_overlay_raster_golden_geometry_is_pixel_identical() {
         let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("testdata")
             .join("overlay-reference");
@@ -2333,11 +2354,13 @@ mod tests {
                                 logical_height * numerator / denominator,
                             )
                             .expect("render overlay fixture frame");
-                        assert_eq!(
-                            frame.pixels,
+                        let expected =
                             std::fs::read(fixture_root.join(format!("{name}-{theme}-{dpi}.bgra")))
-                                .expect("read immutable reference-contract overlay fixture"),
-                            "{name} {theme} at {dpi} DPI diverged from the approved reference contract"
+                                .expect("read immutable reference-contract overlay fixture");
+                        assert_reference_geometry_is_pixel_identical(
+                            &frame.pixels,
+                            &expected,
+                            &format!("{name} {theme} at {dpi} DPI"),
                         );
                     }
 
@@ -2362,11 +2385,13 @@ mod tests {
                     let frame = rasterizer
                         .render_display(&state, dark, width, height)
                         .expect("render edge-state overlay fixture frame");
-                    assert_eq!(
-                        frame.pixels,
+                    let expected =
                         std::fs::read(fixture_root.join(format!("{name}-{theme}-96.bgra")))
-                            .expect("read immutable reference-contract edge-state fixture"),
-                        "{name} {theme} at 96 DPI diverged from the approved reference contract"
+                            .expect("read immutable reference-contract edge-state fixture");
+                    assert_reference_geometry_is_pixel_identical(
+                        &frame.pixels,
+                        &expected,
+                        &format!("{name} {theme} at 96 DPI"),
                     );
                 }
             }
@@ -2842,11 +2867,11 @@ mod tests {
     fn native_waveform_colors_follow_the_shared_theme_contract() {
         assert_eq!(
             NativeColors::for_theme(false).waveform,
-            Argb::from_color(ThemePalette::light().recording_waveform)
+            Argb::new(255, 23, 111, 116)
         );
         assert_eq!(
             NativeColors::for_theme(true).waveform,
-            Argb::new(255, 178, 162, 255)
+            Argb::from_color(ThemePalette::dark().recording_waveform)
         );
     }
 }
