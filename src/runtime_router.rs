@@ -663,10 +663,6 @@ impl RuntimeRouter {
         )
     }
 
-    pub(crate) fn handles_model(&self, model_id: &ModelId) -> bool {
-        Self::handles_model_id(model_id)
-    }
-
     pub(crate) fn handles_model_id(model_id: &ModelId) -> bool {
         runtime_kind_for_model(model_id).is_some()
     }
@@ -687,19 +683,11 @@ impl RuntimeRouter {
         })
     }
 
-    pub(crate) fn capabilities(&self, model_id: &ModelId) -> Option<RuntimeCapabilities> {
-        Self::capabilities_for_model(model_id)
-    }
-
     pub(crate) fn capabilities_for_model(model_id: &ModelId) -> Option<RuntimeCapabilities> {
         runtime_kind_for_model(model_id).map(|kind| match kind {
             RuntimeKind::TranscribeCpp => TranscribeCppRuntime::runtime_capabilities(),
             RuntimeKind::OnnxSpeech => unreachable!("catalog models never select private ONNX"),
         })
-    }
-
-    pub(crate) fn embedded_capabilities(&self) -> RuntimeCapabilities {
-        Self::embedded_runtime_capabilities()
     }
 
     pub(crate) fn embedded_runtime_capabilities() -> RuntimeCapabilities {

@@ -756,17 +756,21 @@ impl RuntimeWorker {
         cleanup_stale_temporary_audio();
         let inference = InferenceWorkerSupervisor::unstarted();
         let worker_inference = inference.clone();
+        let cancellation_generation = Arc::new(AtomicU64::new(0));
+        let worker_cancellation = cancellation_generation.clone();
         let (commands, receiver) = sync_channel(1);
         let worker = std::thread::Builder::new()
             .name("scribe-inference-dispatch".to_owned())
-            .spawn(move || inference_worker_dispatch_loop(worker_inference, receiver))
+            .spawn(move || {
+                inference_worker_dispatch_loop(worker_inference, worker_cancellation, receiver)
+            })
             .expect("Scribe could not create its inference dispatch worker");
         Self {
             inner: Arc::new(RuntimeWorkerInner {
                 commands,
                 worker: Mutex::new(Some(worker)),
                 shutdown_gate: Mutex::new(()),
-                cancellation_generation: Arc::new(AtomicU64::new(0)),
+                cancellation_generation,
                 in_process_router: None,
                 inference: Some(inference),
             }),
@@ -1096,6 +1100,7 @@ fn runtime_worker_loop(router: RuntimeRouter, commands: Receiver<RuntimeCommand>
 
 fn inference_worker_dispatch_loop(
     inference: InferenceWorkerSupervisor,
+    cancellation_generation: Arc<AtomicU64>,
     commands: Receiver<RuntimeCommand>,
 ) {
     let mut idle_wait = WARM_MODEL_TTL;
@@ -1106,10 +1111,25 @@ fn inference_worker_dispatch_loop(
                 preference,
                 audio,
                 options,
-                cancellation_snapshot: _,
+                cancellation_snapshot,
                 reply,
             }) => {
-                let result = inference.transcribe(artifact, preference, &audio, options);
+                let result = if cancellation_generation.load(Ordering::Acquire)
+                    != cancellation_snapshot
+                {
+                    Err(RuntimeError::Engine(
+                        "transcription request was cancelled before inference dispatch".to_owned(),
+                    ))
+                } else {
+                    inference.transcribe(
+                        artifact,
+                        preference,
+                        &audio,
+                        options,
+                        cancellation_snapshot,
+                        &cancellation_generation,
+                    )
+                };
                 let succeeded = result.is_ok();
                 let _ = reply.send(result);
                 succeeded
@@ -1160,7 +1180,7 @@ fn inference_worker_dispatch_loop(
                 // The five-minute TTL unloads only the worker-owned model. A
                 // healthy process generation remains available for the next
                 // cold load and Hello is not repeated.
-                let _ = inference.unload();
+                let _ = inference.unload_if_idle();
                 idle_wait = WARM_MODEL_TTL;
                 continue;
             }
@@ -1190,12 +1210,17 @@ pub struct TranscriptionService {
 
 impl TranscriptionService {
     pub fn new(config: AppConfig) -> Self {
+        #[cfg(not(test))]
         let worker = RuntimeWorker::new_process();
+        #[cfg(test)]
+        let router = RuntimeRouter::new();
+        #[cfg(test)]
+        let worker = RuntimeWorker::new(router.clone());
         Self {
             config,
             worker,
             #[cfg(test)]
-            router: RuntimeRouter::new(),
+            router,
         }
     }
 
