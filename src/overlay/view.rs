@@ -959,6 +959,7 @@ fn format_elapsed(elapsed: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::branding::SCRIBE_TEAL;
     use crate::overlay::preview_parity::{
         HorizontalAnchor, PARITY_GRAPHEMES, PREVIEW_PARITY_CASES, PreviewInput,
         assert_text_contract, long_message,
