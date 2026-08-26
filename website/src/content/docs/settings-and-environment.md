@@ -5,7 +5,7 @@ description: Configure local behavior without turning Scribe into a background s
 
 Settings are stored as local JSON in a platform-specific Scribe configuration directory.
 
-The shell provides **Transcribe**, **General**, **Models**, **History**, **Advanced**, and **About** pages, plus opt-in **Debug** tools. Settings cover the active model, hotkey and mode, microphone and input sensitivity, recording/endpointing, overlay mode, history/privacy, performance, tray behavior, focused-app insertion, clipboard restoration, and paste delay.
+The shell provides **Transcribe**, **General**, **Models**, **History**, **Advanced**, and **About** pages, plus opt-in **Debug** tools. Settings cover the active model, hotkey and mode, microphone selection, AI voice detection or a manual dBFS input threshold, recording/endpointing, overlay mode, history/privacy, performance, tray behavior, focused-app insertion, clipboard restoration, and paste delay.
 
 Settings use a versioned schema with field-level salvage, unknown-field preservation, corrupt-file backup, debounced saves, and atomic same-directory replacement. A first launch can migrate an older Local Transcriber configuration only when no Scribe configuration already exists.
 

@@ -4,10 +4,10 @@ mod schema;
 
 pub use repository::SettingsStore;
 pub use schema::{
-    AppConfig, CURRENT_SCHEMA_VERSION, DEFAULT_SPEECH_PROBABILITY_THRESHOLD, DeveloperSettings,
-    GeneralSettings, HistoryMode, HistorySettings, MAX_SPEECH_PROBABILITY_THRESHOLD,
-    MIN_SPEECH_PROBABILITY_THRESHOLD, OutputSettings, OverlayMode, OverlayPosition,
-    OverlaySettings, PerformanceSettings, RecordingSettings, StreamingMode, StreamingSettings,
+    AppConfig, CURRENT_SCHEMA_VERSION, DEFAULT_INPUT_THRESHOLD_DBFS, DeveloperSettings,
+    GeneralSettings, HistoryMode, HistorySettings, MAX_INPUT_THRESHOLD_DBFS,
+    MIN_INPUT_THRESHOLD_DBFS, OutputSettings, OverlayMode, OverlayPosition, OverlaySettings,
+    PerformanceSettings, RecordingSettings, SpeechDetectionMode, StreamingMode, StreamingSettings,
 };
 
 pub(crate) use migrations::parse_settings_value_with_diagnostics;

@@ -5,7 +5,7 @@ description: Record a short clip and keep the result local.
 
 1. Start Scribe and open **Models**.
 2. Install and select a trusted Experimental GGUF variant, or validate a local GGUF in place. The normal path needs no separate runtime package.
-3. Open **General**, choose the microphone, and speak while watching **Input sensitivity**. Set its threshold below your normal voice level.
+3. Open **General**, choose the microphone, and speak while watching **Microphone level**. AI voice detection is the default; if you select **Manual volume threshold**, set its `−72..0 dBFS` marker below your normal voice level and above room noise.
 4. Focus the intended destination, then press `Ctrl+Shift+Space`; or use the in-app Start/Stop control when global hotkeys are unavailable.
 5. Speak, then stop. The overlay may show committed and tentative rolling-preview text.
 6. Review the final transcript. If focused-app insertion is enabled and the Windows target is still safe, Scribe pastes the final text once. Unsafe targets use the clipboard fallback. If another app changes the clipboard during output, Scribe preserves that content and leaves the final transcript in Scribe for manual copying.

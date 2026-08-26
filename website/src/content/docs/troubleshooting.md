@@ -9,9 +9,9 @@ Confirm that a microphone is visible to the host OS and an Experimental GGUF mod
 
 ## “No speech was detected”
 
-An input meter above 0% only proves that samples are arriving. Speech must cross the VAD threshold for long enough to be accepted. Open **General**, speak at your normal distance, and move the **Input sensitivity** threshold below the live voice peaks but above the resting noise floor. Also check physical mute, Windows input-device selection, per-device gain, and microphone privacy access.
+An input meter above 0% only proves that samples are arriving. In **AI voice detection**, Silero still decides what counts as speech. In **Manual volume threshold**, audio below the `−72..0 dBFS` marker is silenced, so lower the marker below normal voice peaks while keeping it above the resting noise floor. Also check physical mute, Windows input-device selection, per-device gain, and microphone privacy access.
 
-If normal speech cannot cross the threshold even at the most sensitive setting, test the microphone in the operating system. A very low signal is a capture/device problem, not a model failure.
+If normal speech does not cross a manual threshold even at `−72 dBFS`, test the microphone in the operating system. A very low signal is a capture/device problem, not a model failure.
 
 ## Runtime fails or a terminal appears
 

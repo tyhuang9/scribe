@@ -113,8 +113,34 @@ pub struct CaptureOptions {
     pub vad_enabled: bool,
     pub endpointing_enabled: bool,
     pub vad: VadOptions,
-    pub speech_probability_threshold: f32,
+    pub detection_mode: SpeechDetectionMode,
     pub intent: CaptureIntent,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SpeechDetectionMode {
+    /// Silero's bundled default probability cutoff (0.5).
+    Ai,
+    /// A literal RMS cutoff applied to complete 30 ms prepared-audio windows.
+    ManualThreshold { threshold_rms: f32 },
+}
+
+impl SpeechDetectionMode {
+    fn validate(self) -> Result<(), CaptureError> {
+        match self {
+            Self::Ai => VadThreshold::new(0.5)
+                .map(|_| ())
+                .map_err(WorkerSpeechDetector::vad_error),
+            Self::ManualThreshold { threshold_rms }
+                if threshold_rms.is_finite() && (0.0..=1.0).contains(&threshold_rms) =>
+            {
+                Ok(())
+            }
+            Self::ManualThreshold { .. } => Err(CaptureError::InvalidOptions(
+                "manual input threshold must be finite and within [0, 1]",
+            )),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -129,7 +155,7 @@ impl CaptureOptions {
             vad_enabled: true,
             endpointing_enabled: true,
             vad,
-            speech_probability_threshold: config::DEFAULT_SPEECH_PROBABILITY_THRESHOLD,
+            detection_mode: SpeechDetectionMode::Ai,
             intent: CaptureIntent::Dictation,
         }
     }
@@ -217,6 +243,8 @@ pub struct CaptureMetrics {
     pub maximum_input_rms: f32,
     /// Maximum native sample peak observed by the 30 ms meter windows.
     pub maximum_input_peak: f32,
+    /// Whether any raw manual-threshold gate window met or exceeded its RMS cutoff.
+    pub manual_threshold_crossed: bool,
     pub dropped_samples: usize,
     pub stream_restarts: u32,
 }
@@ -507,6 +535,7 @@ impl RecordingSession {
                     prepared_frames,
                     maximum_input_rms: 0.0,
                     maximum_input_peak: 0.0,
+                    manual_threshold_crossed: false,
                     dropped_samples: 0,
                     stream_restarts: 0,
                 },
@@ -558,8 +587,7 @@ pub fn start_recording(
     cancellation: CaptureCancellation,
 ) -> Result<RecordingSession, CaptureError> {
     options.vad.validate()?;
-    VadThreshold::new(options.speech_probability_threshold)
-        .map_err(WorkerSpeechDetector::vad_error)?;
+    options.detection_mode.validate()?;
     let stop_requested = Arc::clone(&cancellation.stop_requested);
     let discard_requested = Arc::new(AtomicBool::new(false));
     let rms_bits = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
@@ -823,6 +851,7 @@ fn capture_worker(
     let speech_trigger_elapsed = pipeline.speech_trigger_elapsed();
     let audio = pipeline.finish(stop_reason)?.map(Arc::new);
     let maximum_levels = pipeline.maximum_levels();
+    let manual_threshold_crossed = pipeline.manual_threshold_crossed();
     let prepared_frames = audio.as_ref().map_or(0, |audio| audio.samples.len());
     Ok(CaptureCompletion {
         audio,
@@ -837,6 +866,7 @@ fn capture_worker(
             prepared_frames,
             maximum_input_rms: maximum_levels.rms,
             maximum_input_peak: maximum_levels.peak,
+            manual_threshold_crossed,
             dropped_samples: dropped_samples.load(Ordering::Relaxed),
             stream_restarts: restart_policy.attempts,
         },
@@ -868,11 +898,13 @@ fn acquire_speech_detector(
     factory: &dyn SpeechDetectorFactory,
     cancelled: &AtomicBool,
 ) -> Result<Option<Box<dyn SpeechDetector>>, CaptureError> {
-    if options.intent == CaptureIntent::MeterOnly || !options.vad_enabled {
+    if options.intent == CaptureIntent::MeterOnly
+        || !options.vad_enabled
+        || !matches!(options.detection_mode, SpeechDetectionMode::Ai)
+    {
         return Ok(None);
     }
-    let threshold = VadThreshold::new(options.speech_probability_threshold)
-        .map_err(WorkerSpeechDetector::vad_error)?;
+    let threshold = VadThreshold::new(0.5).map_err(WorkerSpeechDetector::vad_error)?;
     factory.acquire(threshold, cancelled).map(Some)
 }
 
@@ -1234,28 +1266,41 @@ mod tests {
         assert_eq!(factory.calls.load(Ordering::Relaxed), 1);
         assert_eq!(
             f32::from_bits(factory.threshold_bits.load(Ordering::Relaxed)),
-            config::DEFAULT_SPEECH_PROBABILITY_THRESHOLD
+            0.5
         );
         drop(detector);
     }
 
     #[test]
-    fn configured_probability_threshold_is_passed_to_the_detector_factory() {
+    fn ai_detection_uses_the_fixed_default_threshold_and_manual_detection_skips_silero() {
         let factory = CountingDetectorFactory {
             calls: AtomicUsize::new(0),
             threshold_bits: AtomicU32::new(f32::NAN.to_bits()),
         };
         let options = CaptureOptions {
-            speech_probability_threshold: 0.73,
+            detection_mode: SpeechDetectionMode::ManualThreshold { threshold_rms: 0.1 },
             ..CaptureOptions::default()
         };
 
-        drop(acquire_speech_detector(&options, &factory, &AtomicBool::new(false)).unwrap());
+        assert!(
+            acquire_speech_detector(&options, &factory, &AtomicBool::new(false))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(factory.calls.load(Ordering::Relaxed), 0);
 
+        drop(
+            acquire_speech_detector(
+                &CaptureOptions::default(),
+                &factory,
+                &AtomicBool::new(false),
+            )
+            .unwrap(),
+        );
         assert_eq!(factory.calls.load(Ordering::Relaxed), 1);
         assert_eq!(
             f32::from_bits(factory.threshold_bits.load(Ordering::Relaxed)),
-            0.73
+            0.5
         );
     }
 

@@ -23,10 +23,10 @@ pub mod settings;
 
 #[allow(unused_imports)]
 pub use settings::{
-    AppConfig, CURRENT_SCHEMA_VERSION, DEFAULT_SPEECH_PROBABILITY_THRESHOLD, DeveloperSettings,
+    AppConfig, CURRENT_SCHEMA_VERSION, DEFAULT_INPUT_THRESHOLD_DBFS, DeveloperSettings,
     GeneralSettings, HistoryMode, HistorySettings, OutputSettings, OverlayMode, OverlayPosition,
-    OverlaySettings, PerformanceSettings, RecordingSettings, SettingsStore, StreamingMode,
-    StreamingSettings,
+    OverlaySettings, PerformanceSettings, RecordingSettings, SettingsStore, SpeechDetectionMode,
+    StreamingMode, StreamingSettings,
 };
 
 pub const MAX_RECORDING_SECONDS: u32 = 600;
@@ -951,15 +951,13 @@ pub fn normalize_config(config: &mut AppConfig) {
         .min(MAX_RECORDING_SECONDS);
     config.recording.speech_confirmation_ms =
         config.recording.speech_confirmation_ms.clamp(50, 1_000);
-    if !config.recording.speech_probability_threshold.is_finite() {
-        config.recording.speech_probability_threshold =
-            settings::DEFAULT_SPEECH_PROBABILITY_THRESHOLD;
+    if !config.recording.input_threshold_dbfs.is_finite() {
+        config.recording.input_threshold_dbfs = settings::DEFAULT_INPUT_THRESHOLD_DBFS;
     }
-    config.recording.speech_probability_threshold =
-        config.recording.speech_probability_threshold.clamp(
-            settings::MIN_SPEECH_PROBABILITY_THRESHOLD,
-            settings::MAX_SPEECH_PROBABILITY_THRESHOLD,
-        );
+    config.recording.input_threshold_dbfs = config.recording.input_threshold_dbfs.clamp(
+        settings::MIN_INPUT_THRESHOLD_DBFS,
+        settings::MAX_INPUT_THRESHOLD_DBFS,
+    );
     config.recording.internal_pause_ms = config
         .recording
         .internal_pause_ms
@@ -1581,27 +1579,27 @@ mod tests {
     }
 
     #[test]
-    fn speech_probability_threshold_normalizes_to_the_supported_range() {
+    fn input_threshold_dbfs_normalizes_to_the_supported_range() {
         let mut config = AppConfig::default();
-        config.recording.speech_probability_threshold = f32::INFINITY;
+        config.recording.input_threshold_dbfs = f32::INFINITY;
         normalize_config(&mut config);
         assert_eq!(
-            config.recording.speech_probability_threshold,
-            settings::DEFAULT_SPEECH_PROBABILITY_THRESHOLD
+            config.recording.input_threshold_dbfs,
+            settings::DEFAULT_INPUT_THRESHOLD_DBFS
         );
 
-        config.recording.speech_probability_threshold = 10.0;
+        config.recording.input_threshold_dbfs = 10.0;
         normalize_config(&mut config);
         assert_eq!(
-            config.recording.speech_probability_threshold,
-            settings::MAX_SPEECH_PROBABILITY_THRESHOLD
+            config.recording.input_threshold_dbfs,
+            settings::MAX_INPUT_THRESHOLD_DBFS
         );
 
-        config.recording.speech_probability_threshold = -10.0;
+        config.recording.input_threshold_dbfs = -100.0;
         normalize_config(&mut config);
         assert_eq!(
-            config.recording.speech_probability_threshold,
-            settings::MIN_SPEECH_PROBABILITY_THRESHOLD
+            config.recording.input_threshold_dbfs,
+            settings::MIN_INPUT_THRESHOLD_DBFS
         );
     }
 

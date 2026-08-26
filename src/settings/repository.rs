@@ -435,6 +435,65 @@ mod tests {
     }
 
     #[test]
+    fn version_two_voice_detection_settings_are_rewritten_and_reload_cleanly() {
+        let dir = test_dir("version-two-voice-detection");
+        let path = dir.join("config.json");
+        fs::write(
+            &path,
+            br#"{
+                "schema_version": 2,
+                "recording": {
+                    "speech_probability_threshold": 0.35,
+                    "manual_activation_rms": 0.1
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let migrated = load_from_path(&path).unwrap();
+        assert_eq!(
+            migrated.recording.speech_detection_mode,
+            super::super::SpeechDetectionMode::Ai
+        );
+        assert_eq!(
+            migrated.recording.input_threshold_dbfs,
+            super::super::DEFAULT_INPUT_THRESHOLD_DBFS
+        );
+
+        let rewritten: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            rewritten["schema_version"],
+            Value::from(super::super::CURRENT_SCHEMA_VERSION)
+        );
+        assert_eq!(rewritten["recording"]["speech_detection_mode"], "ai");
+        assert_eq!(
+            rewritten["recording"]["input_threshold_dbfs"],
+            super::super::DEFAULT_INPUT_THRESHOLD_DBFS
+        );
+        assert!(
+            rewritten["recording"]
+                .get("speech_probability_threshold")
+                .is_none()
+        );
+        assert!(
+            rewritten["recording"]
+                .get("manual_activation_rms")
+                .is_none()
+        );
+
+        let reloaded = load_from_path(&path).unwrap();
+        assert_eq!(
+            reloaded.recording.speech_detection_mode,
+            migrated.recording.speech_detection_mode
+        );
+        assert_eq!(
+            reloaded.recording.input_threshold_dbfs,
+            migrated.recording.input_threshold_dbfs
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn injected_replace_failure_preserves_the_previous_file() {
         let dir = test_dir("replace-failure");
         let path = dir.join("config.json");
@@ -489,10 +548,10 @@ mod tests {
         let mut store = SettingsStore::new(path.clone(), Duration::from_secs(60));
         let mut first = AppConfig::default();
         first.recording.hotkey = "First".to_owned();
-        first.recording.speech_probability_threshold = 0.7;
+        first.recording.input_threshold_dbfs = -36.0;
         let mut latest = first.clone();
         latest.recording.hotkey = "Latest".to_owned();
-        latest.recording.speech_probability_threshold = 0.35;
+        latest.recording.input_threshold_dbfs = -52.0;
 
         store.schedule(&first);
         store.schedule(&latest);
@@ -503,7 +562,7 @@ mod tests {
 
         let persisted = load_from_path(&path).unwrap();
         assert_eq!(persisted.recording.hotkey, "Latest");
-        assert!((persisted.recording.speech_probability_threshold - 0.35).abs() < f32::EPSILON);
+        assert!((persisted.recording.input_threshold_dbfs + 52.0).abs() < f32::EPSILON);
         assert!(!store.flush().unwrap());
         fs::remove_dir_all(dir).unwrap();
     }

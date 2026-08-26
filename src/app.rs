@@ -21,7 +21,8 @@ use serde::Deserialize;
 
 use crate::audio::{
     self, CaptureCancellation, CaptureCompletion, CaptureError, CaptureIntent, CaptureMetrics,
-    CaptureOptions, CaptureStopReason, LevelSnapshot, RecordingSession, VadOptions,
+    CaptureOptions, CaptureStopReason, LevelSnapshot, RecordingSession,
+    SpeechDetectionMode as CaptureSpeechDetectionMode, VadOptions,
 };
 use crate::benchmark::{
     self, BenchmarkMetric, BenchmarkModelInput, BenchmarkModelResult, RankingMode,
@@ -29,7 +30,7 @@ use crate::benchmark::{
 use crate::compatibility_bridge::{self, ProviderHandle};
 use crate::config::{
     self, AppConfig, HistoryMode, HotkeyMode, OverlayMode, OverlayPosition, SettingsStore,
-    StreamingMode, ThemeMode,
+    SpeechDetectionMode, StreamingMode, ThemeMode,
 };
 use crate::core::{DictationPhase, SessionCoordinator, SessionPurpose, StopReason};
 use crate::diagnostics::{
@@ -138,7 +139,12 @@ fn capture_options_from_config(config: &AppConfig) -> CaptureOptions {
             Duration::from_millis(config.recording.pre_roll_ms.into()),
             Duration::from_millis(config.recording.post_roll_ms.into()),
         ),
-        speech_probability_threshold: config.recording.speech_probability_threshold,
+        detection_mode: match config.recording.speech_detection_mode {
+            SpeechDetectionMode::Ai => CaptureSpeechDetectionMode::Ai,
+            SpeechDetectionMode::ManualThreshold => CaptureSpeechDetectionMode::ManualThreshold {
+                threshold_rms: dbfs_to_rms(config.recording.input_threshold_dbfs),
+            },
+        },
         intent: CaptureIntent::Dictation,
     }
 }
@@ -150,6 +156,15 @@ fn rms_to_dbfs(rms: f32) -> f32 {
     (20.0 * rms.log10()).clamp(INPUT_LEVEL_MIN_DBFS, INPUT_LEVEL_MAX_DBFS)
 }
 
+fn dbfs_to_rms(dbfs: f32) -> f32 {
+    let dbfs = if dbfs.is_finite() {
+        dbfs.clamp(INPUT_LEVEL_MIN_DBFS, INPUT_LEVEL_MAX_DBFS)
+    } else {
+        config::settings::DEFAULT_INPUT_THRESHOLD_DBFS
+    };
+    10.0_f32.powf(dbfs / 20.0)
+}
+
 fn dbfs_to_slider_position(dbfs: f32) -> f32 {
     ((dbfs.clamp(INPUT_LEVEL_MIN_DBFS, INPUT_LEVEL_MAX_DBFS) - INPUT_LEVEL_MIN_DBFS)
         / (INPUT_LEVEL_MAX_DBFS - INPUT_LEVEL_MIN_DBFS))
@@ -158,37 +173,6 @@ fn dbfs_to_slider_position(dbfs: f32) -> f32 {
 
 fn rms_to_slider_position(rms: f32) -> f32 {
     dbfs_to_slider_position(rms_to_dbfs(rms))
-}
-
-fn sensitivity_fraction_to_speech_probability_threshold(fraction: f32) -> f32 {
-    let fraction = if fraction.is_finite() {
-        fraction.clamp(0.0, 1.0)
-    } else {
-        0.5
-    };
-    (config::settings::MAX_SPEECH_PROBABILITY_THRESHOLD
-        - fraction
-            * (config::settings::MAX_SPEECH_PROBABILITY_THRESHOLD
-                - config::settings::MIN_SPEECH_PROBABILITY_THRESHOLD))
-        .clamp(
-            config::settings::MIN_SPEECH_PROBABILITY_THRESHOLD,
-            config::settings::MAX_SPEECH_PROBABILITY_THRESHOLD,
-        )
-}
-
-fn speech_probability_threshold_to_sensitivity_fraction(threshold: f32) -> f32 {
-    let threshold = if threshold.is_finite() {
-        threshold.clamp(
-            config::settings::MIN_SPEECH_PROBABILITY_THRESHOLD,
-            config::settings::MAX_SPEECH_PROBABILITY_THRESHOLD,
-        )
-    } else {
-        config::settings::DEFAULT_SPEECH_PROBABILITY_THRESHOLD
-    };
-    ((config::settings::MAX_SPEECH_PROBABILITY_THRESHOLD - threshold)
-        / (config::settings::MAX_SPEECH_PROBABILITY_THRESHOLD
-            - config::settings::MIN_SPEECH_PROBABILITY_THRESHOLD))
-        .clamp(0.0, 1.0)
 }
 
 #[derive(Clone, Debug)]
@@ -280,10 +264,23 @@ fn no_speech_feedback(
     maximum_input_rms: Option<f32>,
     input_device_name: Option<&str>,
     low_input_diagnostic_floor: f32,
+    detection_mode: SpeechDetectionMode,
+    manual_threshold_crossed: Option<bool>,
 ) -> NoSpeechFeedback {
     let input_was_too_low = maximum_input_rms
         .filter(|rms| rms.is_finite())
         .is_some_and(|rms| rms < low_input_diagnostic_floor);
+    if !input_was_too_low
+        && detection_mode == SpeechDetectionMode::ManualThreshold
+        && manual_threshold_crossed == Some(false)
+    {
+        return NoSpeechFeedback {
+            status_message:
+                "Microphone input did not cross the manual threshold; lower the input threshold and try again."
+                    .to_owned(),
+            overlay_message: "Input did not cross the manual threshold",
+        };
+    }
     if !input_was_too_low {
         return NoSpeechFeedback {
             status_message: "No speech detected; nothing was pasted.".to_owned(),
@@ -309,12 +306,15 @@ fn no_speech_feedback(
 
 fn no_speech_feedback_for_capture(
     maximum_input_rms: Option<f32>,
+    manual_threshold_crossed: Option<bool>,
     diagnostics: &CaptureDiagnosticContext,
 ) -> NoSpeechFeedback {
     no_speech_feedback(
         maximum_input_rms,
         diagnostics.input_device_name.as_deref(),
         diagnostics.low_input_diagnostic_floor,
+        diagnostics.detection_mode,
+        manual_threshold_crossed,
     )
 }
 
@@ -557,6 +557,7 @@ impl MicrophoneTest {
 struct CaptureDiagnosticContext {
     low_input_diagnostic_floor: f32,
     input_device_name: Option<String>,
+    detection_mode: SpeechDetectionMode,
 }
 
 impl CaptureDiagnosticContext {
@@ -564,6 +565,7 @@ impl CaptureDiagnosticContext {
         Self {
             low_input_diagnostic_floor: low_input_diagnostic_floor(config),
             input_device_name: config.recording.audio_input_device_name.clone(),
+            detection_mode: config.recording.speech_detection_mode,
         }
     }
 }
@@ -573,6 +575,7 @@ impl Default for CaptureDiagnosticContext {
         Self {
             low_input_diagnostic_floor: audio::LOW_INPUT_DIAGNOSTIC_RMS,
             input_device_name: None,
+            detection_mode: SpeechDetectionMode::Ai,
         }
     }
 }
@@ -710,6 +713,7 @@ struct LatencyTrace {
     processing_duration_ms: Option<u64>,
     maximum_input_rms: Option<f32>,
     maximum_input_peak: Option<f32>,
+    manual_threshold_crossed: Option<bool>,
     capture_diagnostics: Option<CaptureDiagnosticContext>,
 }
 
@@ -744,6 +748,7 @@ impl LatencyTrace {
             processing_duration_ms: None,
             maximum_input_rms: None,
             maximum_input_peak: None,
+            manual_threshold_crossed: None,
             capture_diagnostics: None,
         }
     }
@@ -790,6 +795,7 @@ impl LatencyTrace {
     fn observe_capture_metrics(&mut self, metrics: &CaptureMetrics) {
         self.maximum_input_rms = Some(metrics.maximum_input_rms);
         self.maximum_input_peak = Some(metrics.maximum_input_peak);
+        self.manual_threshold_crossed = Some(metrics.manual_threshold_crossed);
     }
 
     fn diagnostic_snapshot(
@@ -5615,6 +5621,7 @@ impl LocalTranscriberApp {
                 let Some(audio) = completion.audio else {
                     let feedback = no_speech_feedback_for_capture(
                         capture.latency.maximum_input_rms,
+                        Some(completion.metrics.manual_threshold_crossed),
                         &capture.capture_diagnostics,
                     );
                     let _ = self.session_coordinator.cancel_active();
@@ -6832,6 +6839,9 @@ impl LocalTranscriberApp {
                                     .unwrap_or_default();
                                 let feedback = no_speech_feedback_for_capture(
                                     latency.as_ref().and_then(|trace| trace.maximum_input_rms),
+                                    latency
+                                        .as_ref()
+                                        .and_then(|trace| trace.manual_threshold_crossed),
                                     &diagnostics,
                                 );
                                 if let Some(context) = history_context {
@@ -9818,7 +9828,8 @@ impl LocalTranscriberApp {
             | ScreenAction::SetDurationSeconds(_)
             | ScreenAction::ToggleProvisionalFeedback
             | ScreenAction::SetAudioDevice(_)
-            | ScreenAction::SetSpeechDetectionSensitivity(_)
+            | ScreenAction::SetVoiceDetectionMode(_)
+            | ScreenAction::SetInputThresholdDbfs(_)
             | ScreenAction::RepairModelRuntime(_)
             | ScreenAction::MaintainModelRuntime(_)
             | ScreenAction::SetRemoteCatalogQuery(_)
@@ -12236,11 +12247,8 @@ impl LocalTranscriberApp {
                 .audio_input_device_name
                 .clone()
                 .unwrap_or_else(|| "OS default".to_owned()),
-            speech_detection_sensitivity_percent:
-                (speech_probability_threshold_to_sensitivity_fraction(
-                    self.config.recording.speech_probability_threshold,
-                ) * 100.0)
-                    .round() as u8,
+            voice_detection_mode: self.config.recording.speech_detection_mode,
+            input_threshold_dbfs: self.config.recording.input_threshold_dbfs,
             input_level_percent,
             microphone_error: self.microphone_test_error.clone(),
             auto_insert_transcript: self.config.output.auto_insert_transcript,
@@ -12405,11 +12413,15 @@ impl LocalTranscriberApp {
                 self.microphone_level_envelope.reset_source();
                 self.save_config();
             }
-            ScreenAction::SetSpeechDetectionSensitivity(percent) => {
-                self.config.recording.speech_probability_threshold =
-                    sensitivity_fraction_to_speech_probability_threshold(
-                        f32::from(percent) / 100.0,
-                    );
+            ScreenAction::SetVoiceDetectionMode(mode) => {
+                self.config.recording.speech_detection_mode = mode;
+                self.save_config();
+            }
+            ScreenAction::SetInputThresholdDbfs(dbfs) => {
+                self.config.recording.input_threshold_dbfs = f32::from(dbfs).clamp(
+                    config::settings::MIN_INPUT_THRESHOLD_DBFS,
+                    config::settings::MAX_INPUT_THRESHOLD_DBFS,
+                );
                 self.save_config();
             }
             ScreenAction::RefreshDevices => self.refresh_audio_devices(),
@@ -15889,6 +15901,8 @@ mod layout_tests {
             Some(audio::LOW_INPUT_DIAGNOSTIC_RMS / 10.0),
             Some("Microphone (fifine  Microphone)"),
             audio::LOW_INPUT_DIAGNOSTIC_RMS,
+            SpeechDetectionMode::Ai,
+            None,
         );
         assert_eq!(
             low.status_message,
@@ -15903,6 +15917,8 @@ mod layout_tests {
             Some(audio::LOW_INPUT_DIAGNOSTIC_RMS),
             Some("Microphone Array"),
             audio::LOW_INPUT_DIAGNOSTIC_RMS,
+            SpeechDetectionMode::Ai,
+            None,
         );
         assert_eq!(
             non_silent.status_message,
@@ -15912,47 +15928,44 @@ mod layout_tests {
     }
 
     #[test]
-    fn speech_probability_setting_does_not_change_low_input_diagnostics() {
+    fn manual_threshold_no_speech_recommends_lowering_the_threshold() {
         let mut config = AppConfig::default();
-        config.recording.speech_probability_threshold = 0.2;
+        config.recording.speech_detection_mode = SpeechDetectionMode::ManualThreshold;
 
         let feedback = no_speech_feedback(
-            Some(audio::LOW_INPUT_DIAGNOSTIC_RMS / 2.0),
+            Some(0.1),
             Some("Microphone Array"),
             low_input_diagnostic_floor(&config),
+            config.recording.speech_detection_mode,
+            Some(false),
         );
 
-        assert!(feedback.status_message.contains("silent or too low"));
-        config.recording.speech_probability_threshold = 0.8;
+        assert!(
+            feedback
+                .status_message
+                .contains("lower the input threshold")
+        );
         assert_eq!(
-            low_input_diagnostic_floor(&config),
-            audio::LOW_INPUT_DIAGNOSTIC_RMS
+            feedback.overlay_message,
+            "Input did not cross the manual threshold"
         );
     }
 
     #[test]
-    fn sensitivity_slider_inversely_maps_to_probability_threshold() {
+    fn short_manual_audio_that_crossed_the_threshold_uses_normal_no_speech_feedback() {
+        let feedback = no_speech_feedback(
+            Some(0.1),
+            Some("Microphone Array"),
+            audio::LOW_INPUT_DIAGNOSTIC_RMS,
+            SpeechDetectionMode::ManualThreshold,
+            Some(true),
+        );
+
         assert_eq!(
-            sensitivity_fraction_to_speech_probability_threshold(0.0),
-            config::settings::MAX_SPEECH_PROBABILITY_THRESHOLD
+            feedback.status_message,
+            "No speech detected; nothing was pasted."
         );
-        assert_eq!(
-            sensitivity_fraction_to_speech_probability_threshold(0.5),
-            config::settings::DEFAULT_SPEECH_PROBABILITY_THRESHOLD
-        );
-        assert_eq!(
-            sensitivity_fraction_to_speech_probability_threshold(1.0),
-            config::settings::MIN_SPEECH_PROBABILITY_THRESHOLD
-        );
-        assert!(
-            sensitivity_fraction_to_speech_probability_threshold(0.75)
-                < sensitivity_fraction_to_speech_probability_threshold(0.25)
-        );
-        for fraction in [0.0_f32, 0.2, 0.5, 0.8, 1.0] {
-            let threshold = sensitivity_fraction_to_speech_probability_threshold(fraction);
-            let round_trip = speech_probability_threshold_to_sensitivity_fraction(threshold);
-            assert!((round_trip - fraction).abs() < 1e-6);
-        }
+        assert_eq!(feedback.overlay_message, "No speech detected");
     }
 
     #[test]
@@ -16425,16 +16438,64 @@ mod layout_tests {
     }
 
     #[test]
-    fn no_speech_feedback_uses_capture_start_device_and_fixed_level_floor() {
+    fn manual_detection_settings_remain_editable_during_passive_monitoring_and_errors() {
+        let mut monitoring = passive_monitor_test_app();
+        set_fake_starting_monitor(&mut monitoring, 24);
+
+        monitoring.apply_settings_screen_action(ScreenAction::SetVoiceDetectionMode(
+            SpeechDetectionMode::ManualThreshold,
+        ));
+        monitoring.apply_settings_screen_action(ScreenAction::SetInputThresholdDbfs(-24));
+
+        assert_eq!(
+            monitoring.config.recording.speech_detection_mode,
+            SpeechDetectionMode::ManualThreshold
+        );
+        assert_eq!(monitoring.config.recording.input_threshold_dbfs, -24.0);
+        assert!(matches!(
+            monitoring.microphone_test,
+            MicrophoneTest::Starting {
+                request_id: 24,
+                stop_requested: false,
+                ..
+            }
+        ));
+
+        let mut errored = passive_monitor_test_app();
+        errored.microphone_test_error = Some("Microphone permission denied".to_owned());
+        errored.microphone_monitor_retry_required = true;
+
+        errored.apply_settings_screen_action(ScreenAction::SetVoiceDetectionMode(
+            SpeechDetectionMode::ManualThreshold,
+        ));
+        errored.apply_settings_screen_action(ScreenAction::SetInputThresholdDbfs(-18));
+
+        assert_eq!(
+            errored.config.recording.speech_detection_mode,
+            SpeechDetectionMode::ManualThreshold
+        );
+        assert_eq!(errored.config.recording.input_threshold_dbfs, -18.0);
+        assert_eq!(
+            errored.microphone_test_error.as_deref(),
+            Some("Microphone permission denied")
+        );
+        assert!(errored.microphone_monitor_retry_required);
+    }
+
+    #[test]
+    fn no_speech_feedback_uses_capture_start_settings_and_fixed_level_floor() {
         let mut config = AppConfig::default();
-        config.recording.speech_probability_threshold = 0.2;
+        config.recording.speech_detection_mode = SpeechDetectionMode::ManualThreshold;
+        config.recording.input_threshold_dbfs = -24.0;
         config.recording.audio_input_device_name = Some("FIFINE A8".to_owned());
         let diagnostics = CaptureDiagnosticContext::from_config(&config);
 
-        config.recording.speech_probability_threshold = 0.8;
+        config.recording.speech_detection_mode = SpeechDetectionMode::Ai;
+        config.recording.input_threshold_dbfs = -12.0;
         config.recording.audio_input_device_name = Some("Different microphone".to_owned());
         let feedback = no_speech_feedback_for_capture(
             Some(audio::LOW_INPUT_DIAGNOSTIC_RMS / 2.0),
+            Some(false),
             &diagnostics,
         );
 
@@ -16444,10 +16505,14 @@ mod layout_tests {
         );
         assert_eq!(diagnostics.input_device_name.as_deref(), Some("FIFINE A8"));
         assert!(feedback.status_message.starts_with("FIFINE microphone"));
+        assert_eq!(
+            diagnostics.detection_mode,
+            SpeechDetectionMode::ManualThreshold
+        );
     }
 
     #[test]
-    fn speech_sensitivity_update_does_not_mutate_level_diagnostics() {
+    fn threshold_update_does_not_mutate_active_capture_diagnostics() {
         let mut app = test_app();
         app.active_recording = Some(ActiveRecording {
             session_id: SessionId(901),
@@ -16469,7 +16534,7 @@ mod layout_tests {
             cancellation: CaptureCancellation::new(),
         });
 
-        app.apply_settings_screen_action(ScreenAction::SetSpeechDetectionSensitivity(100));
+        app.apply_settings_screen_action(ScreenAction::SetInputThresholdDbfs(-24));
 
         assert_eq!(
             app.active_recording
@@ -16487,11 +16552,11 @@ mod layout_tests {
                 .low_input_diagnostic_floor,
             audio::LOW_INPUT_DIAGNOSTIC_RMS
         );
-        assert_eq!(app.config.recording.speech_probability_threshold, 0.2);
+        assert_eq!(app.config.recording.input_threshold_dbfs, -24.0);
     }
 
     #[test]
-    fn capture_ready_preserves_probability_setting_and_rms_diagnostic_separation() {
+    fn capture_ready_preserves_manual_threshold_and_rms_diagnostic_separation() {
         let mut app = test_app();
         let session_id = app
             .session_coordinator
@@ -16506,7 +16571,8 @@ mod layout_tests {
             capture_diagnostics: CaptureDiagnosticContext::from_config(&app.config),
             cancellation: CaptureCancellation::new(),
         });
-        app.config.recording.speech_probability_threshold = 0.2;
+        app.config.recording.speech_detection_mode = SpeechDetectionMode::ManualThreshold;
+        app.config.recording.input_threshold_dbfs = -24.0;
         app.tx
             .send(AppEvent::CaptureReady {
                 session_id,
@@ -16520,7 +16586,11 @@ mod layout_tests {
         app.poll_events();
 
         let active = app.active_recording.as_ref().unwrap();
-        assert_eq!(app.config.recording.speech_probability_threshold, 0.2);
+        assert_eq!(
+            app.config.recording.speech_detection_mode,
+            SpeechDetectionMode::ManualThreshold
+        );
+        assert_eq!(app.config.recording.input_threshold_dbfs, -24.0);
         assert_eq!(
             active.capture_diagnostics.low_input_diagnostic_floor,
             audio::LOW_INPUT_DIAGNOSTIC_RMS
@@ -16529,7 +16599,7 @@ mod layout_tests {
     }
 
     #[test]
-    fn typed_recording_settings_keep_silero_classification_when_endpointing_is_off() {
+    fn typed_recording_settings_keep_manual_detection_when_endpointing_is_off() {
         let mut config = AppConfig::default();
         config.recording.vad_enabled = false;
         config.recording.speech_confirmation_ms = 175;
@@ -16537,6 +16607,8 @@ mod layout_tests {
         config.recording.endpoint_silence_ms = 975;
         config.recording.pre_roll_ms = 300;
         config.recording.post_roll_ms = 225;
+        config.recording.speech_detection_mode = SpeechDetectionMode::ManualThreshold;
+        config.recording.input_threshold_dbfs = -36.0;
 
         let options = capture_options_from_config(&config);
 
@@ -16551,10 +16623,31 @@ mod layout_tests {
         assert_eq!(options.vad.pre_roll, Duration::from_millis(300));
         assert_eq!(options.vad.post_roll, Duration::from_millis(225));
         assert_eq!(options.intent, CaptureIntent::Dictation);
+        assert_eq!(
+            options.detection_mode,
+            CaptureSpeechDetectionMode::ManualThreshold {
+                threshold_rms: dbfs_to_rms(-36.0)
+            }
+        );
+    }
 
-        config.recording.speech_probability_threshold = 0.2;
-        let unchanged = capture_options_from_config(&config);
-        assert_eq!(unchanged.speech_probability_threshold, 0.2);
+    #[test]
+    fn capture_options_snapshot_manual_detection_before_later_settings_changes() {
+        let mut config = AppConfig::default();
+        config.recording.speech_detection_mode = SpeechDetectionMode::ManualThreshold;
+        config.recording.input_threshold_dbfs = -24.0;
+
+        let options_at_capture_start = capture_options_from_config(&config);
+        config.recording.speech_detection_mode = SpeechDetectionMode::Ai;
+        config.recording.input_threshold_dbfs = -6.0;
+
+        assert_eq!(
+            options_at_capture_start.detection_mode,
+            CaptureSpeechDetectionMode::ManualThreshold {
+                threshold_rms: dbfs_to_rms(-24.0)
+            }
+        );
+        assert!(options_at_capture_start.vad_enabled);
     }
 
     #[test]
@@ -16661,6 +16754,7 @@ mod layout_tests {
             processing_duration_ms: Some(500),
             maximum_input_rms: Some(0.25),
             maximum_input_peak: Some(0.75),
+            manual_threshold_crossed: None,
             capture_diagnostics: None,
         };
 
@@ -16704,6 +16798,7 @@ mod layout_tests {
             prepared_frames: 8_320,
             maximum_input_rms: 0.2,
             maximum_input_peak: 0.8,
+            manual_threshold_crossed: false,
             dropped_samples: 0,
             stream_restarts: 0,
         });
@@ -16769,6 +16864,7 @@ mod layout_tests {
             processing_duration_ms: None,
             maximum_input_rms: Some(0.2),
             maximum_input_peak: Some(0.8),
+            manual_threshold_crossed: None,
             capture_diagnostics: None,
         };
 
@@ -18082,6 +18178,7 @@ mod layout_tests {
                     prepared_frames: 1_600,
                     maximum_input_rms: 0.2,
                     maximum_input_peak: 0.4,
+                    manual_threshold_crossed: false,
                     dropped_samples: 0,
                     stream_restarts: 0,
                 },
@@ -24439,7 +24536,7 @@ mod layout_tests {
     }
 
     #[test]
-    fn speech_detection_sensitivity_has_accessible_label_help_and_value_semantics() {
+    fn ai_voice_detection_has_an_accessible_non_live_microphone_meter() {
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
         configure_stitch_style(&ctx);
@@ -24464,36 +24561,28 @@ mod layout_tests {
             },
         );
         let update = output.platform_output.accesskit_update.unwrap();
-        let sensitivity_label_id = update
-            .nodes
-            .iter()
-            .find(|(_, node)| {
-                node.role() == egui::accesskit::Role::StaticText
-                    && node.name() == Some("Input level")
-            })
-            .map(|(id, _)| *id)
-            .expect("missing input level label");
-        let slider = update
+        let meter = update
             .nodes
             .iter()
             .map(|(_, node)| node)
             .find(|node| {
-                node.role() == egui::accesskit::Role::Slider
-                    && node.name() == Some("Speech detection sensitivity")
+                node.role() == egui::accesskit::Role::Meter
+                    && node.name() == Some("Microphone level")
             })
-            .expect("missing accessible speech detection sensitivity slider");
-        assert!(slider.labelled_by().contains(&sensitivity_label_id));
-        assert_eq!(slider.min_numeric_value(), Some(0.0));
-        assert_eq!(slider.max_numeric_value(), Some(100.0));
-        assert!(slider.numeric_value().is_some());
-        assert!(slider.description().is_some_and(|description| {
-            description.contains("Left and Right arrow keys")
-                && description.contains("speech probability threshold")
+            .expect("missing accessible microphone level meter");
+        assert_eq!(meter.min_numeric_value(), Some(0.0));
+        assert_eq!(meter.max_numeric_value(), Some(100.0));
+        assert!(meter.numeric_value().is_some());
+        assert!(meter.description().is_some_and(|description| {
+            description.contains("Silero") && description.contains("read-only")
         }));
-        assert!(!update.nodes.iter().any(|(_, node)| {
-            node.name()
-                .is_some_and(|name| name.contains("dBFS") || name.contains("RMS"))
-        }));
+        assert!(meter.live().is_none());
+        assert!(
+            !update
+                .nodes
+                .iter()
+                .any(|(_, node)| node.role() == egui::accesskit::Role::Slider)
+        );
     }
 
     #[test]
@@ -24534,14 +24623,7 @@ mod layout_tests {
         app.microphone_test = MicrophoneTest::Active { session };
         let update = render(&ctx, &mut app);
         assert!(update.nodes.iter().any(|(_, node)| {
-            node.role() == egui::accesskit::Role::Slider
-                && node.name() == Some("Speech detection sensitivity")
-        }));
-        assert!(update.nodes.iter().any(|(_, node)| {
-            node.role() == egui::accesskit::Role::Slider
-                && node
-                    .description()
-                    .is_some_and(|description| description.contains("speech probability threshold"))
+            node.role() == egui::accesskit::Role::Meter && node.name() == Some("Microphone level")
         }));
         assert!(!update.nodes.iter().any(|(_, node)| {
             node.live().is_some()
@@ -24566,12 +24648,12 @@ mod layout_tests {
                 .nodes
                 .iter()
                 .filter(|(_, node)| {
-                    node.role() == egui::accesskit::Role::Slider
-                        && node.name() == Some("Speech detection sensitivity")
+                    node.role() == egui::accesskit::Role::Meter
+                        && node.name() == Some("Microphone level")
                 })
                 .count(),
             1,
-            "the sensitivity slider remains available even when microphone monitoring fails"
+            "the AI microphone meter remains available even when microphone monitoring fails"
         );
         assert!(!update.nodes.iter().any(|(_, node)| {
             node.name() == Some("Voice detected") || node.name() == Some("Clipping")

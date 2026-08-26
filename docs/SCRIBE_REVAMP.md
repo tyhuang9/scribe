@@ -6,13 +6,13 @@ remains **NO-GO** pending the manual, compatibility, streaming, soak, and
 measurement evidence identified below. This document preserves the historical
 Phase 0 audit and records each implemented phase against the consolidated plan.
 
-> **Current implementation note (2026-08-17):** RMS-based adaptive VAD,
-> `manual_activation_rms`, and the combined `Input sensitivity` slider described
-> in historical checkpoints below are superseded. Current capture classifies
-> speech only from exact sequential 512-sample Silero decisions. Settings expose
-> `Speech detection sensitivity`, which maps inversely to Silero's probability
-> threshold, plus a separate noninteractive RMS/peak input meter. RMS is retained
-> only for level display and low-input diagnostic guidance.
+> **Current implementation note (2026-08-26):** Historical RMS-based adaptive
+> VAD, `manual_activation_rms`, and probability sensitivity controls below are
+> superseded. AI voice detection uses exact sequential 512-sample Silero
+> decisions at its fixed default threshold and exposes a read-only microphone
+> meter. Manual volume threshold exposes a literal `−72..0 dBFS` cutoff and
+> silences quieter 30 ms audio windows before preview, transcription, or
+> retained-history audio.
 
 ## How to read this document
 
@@ -2111,62 +2111,53 @@ launched successfully. A spoken GUI/hotkey/paste run after physically
 correcting the A8 top mute or bottom gain remains **NOT VERIFIED** and no manual
 matrix row is promoted by this checkpoint.
 
-## Input sensitivity slider
+## Voice-detection modes and literal input threshold
 
-> **Superseded UI and persistence design:** The combined RMS/threshold slider and
-> `manual_activation_rms` behavior below are retained as historical context only.
-> Current UI has a `Speech detection sensitivity` control for Silero probability
-> and a separate noninteractive input-level meter.
+Recording > Recording input exposes two explicit, model-independent modes.
+`AI voice detection` is the default and keeps Silero's fixed 0.5 probability
+threshold. Its `Microphone level` control is a read-only live meter; it does not
+apply an amplitude gate. `Manual volume threshold` replaces that meter with one
+combined `Input threshold` meter and slider. The slider spans −72 to 0 dBFS in
+1 dB steps and defaults to −42 dBFS. Its whole-number dBFS value and marker are
+always visible, including when the microphone is unavailable.
 
-General > Audio exposes one model-independent `Input sensitivity` slider. Its
-track combines the latest microphone RMS with the persisted activation
-threshold; while dragging or keyboard-adjusting, a compact bubble shows the
-current whole-dB threshold. There is no test button, Automatic/Manual selector,
-idle numeric meter, second meter, waveform, calibration action, or
-speech/clipping label.
-The threshold thumb remains usable when input is unavailable.
+Manual capture downmixes and resamples to 16 kHz before evaluating fixed
+480-sample, 30 ms windows. A raw-window RMS at or above the threshold passes the
+original samples. A quieter window contributes the same number of zero samples.
+The final partial window uses the same rule, so source accounting, preview
+offsets, final transcription, retained-history duration, pre-roll, post-roll,
+and playback timing remain unchanged. The same pass/zero decision drives speech
+confirmation, pause, and optional endpointing. `Stop after speech ends` remains
+orthogonal and works in both detection modes.
 
-When General is visible and dictation is idle, the existing native
-CPAL/ring/pipeline service owns a `MeterOnly` session. That intent retains no
-prepared audio and creates no preview, transcript, output, history, overlay, or
-audio file. During active dictation, the slider reads the existing recording
-session's atomic level telemetry instead of opening another stream. Monitor
-teardown is acknowledged before deferred dictation or retained-audio playback
-starts, so the owners never overlap. Deferred recording and playback are
-mutually exclusive; recording takes priority and playback is rejected while a
-capture is queued or active. Leaving General stops only the idle monitor,
-clears its envelope/repaint state, and never stops active dictation.
+The capture worker publishes raw pre-gate microphone levels and bounded scalar
+diagnostics. The UI smooths those values for calibration without presenting the
+display as an exact acceptance log. In manual mode, the complete live fill uses
+the below-threshold color until its rendered endpoint reaches the marker, then
+switches to the above-threshold color. The slider supports its full visible
+44 px pointer target, marker-endpoint dragging, Left/Right arrows, Home/End,
+visible focus, and AccessKit set/increment/decrement actions. Continuous meter
+changes are deliberately not live-announced.
 
-The capture worker continues to publish normalized mono RMS every 30 ms through
-latest-value atomics. Each publication increments a revision counter. The UI
-uses a 30 ms attack, 240 ms release, and a 160 ms stale-sample deadline; stale
-or absent input decays to the track minimum instead of freezing. Repaint remains
-at the approximately 33 Hz meter cadence only while capture, monitoring, or
-release animation is active.
+When Recording settings are visible and dictation is idle, the existing native
+CPAL/ring/pipeline service owns a `MeterOnly` session. That intent remains raw,
+classifier-free, non-retaining, and unable to create preview, transcript,
+output, history, overlay, or audio files. Mode and threshold remain editable
+during passive monitoring and microphone errors. Changes are disabled from the
+microphone request through finalization, and each capture snapshots its settings
+at startup.
 
-The internal slider range is -72 to 0 dBFS, with a default threshold near
--42 dBFS. Values remain internal: the accessible slider exposes only a
-normalized range and adjustment actions. The base track is split at the thumb
-into distinct threshold and remainder fills. The live fill keeps one thickness;
-crossing remains spatially visible because the fill extends beyond the thumb,
-and its high-contrast color changes from the below-threshold tone to success. Keyboard focus
-uses a neutral heavier thumb outline and center dot rather than an accent halo.
-The custom control has a 44 px interaction target, click/drag, focus, Left/Right
-arrows, and AccessKit increment/decrement/set-value actions.
-
-The persisted `manual_activation_rms` field is the only runtime sensitivity
-setting. An obsolete `sensitivity_mode` property is preserved as unknown
-compatibility data when encountered, but cannot select a second behavior.
-Pointer and keyboard changes update the in-memory value immediately,
-use the existing 300 ms debounced settings store, and write a shared atomic read
-by the VAD on the next 10 ms frame. Existing confirmation, 3 dB-class release
-hysteresis, pause/hangover, endpointing, pre-roll, and post-roll behavior is
-unchanged. The advanced endpointing option controls only automatic stop in
-Toggle mode; it cannot bypass sensitivity gating. Per-device thresholds remain
-deferred because the current device selection exposes only a display name
-rather than a stable identifier.
+Settings schema version 3 persists `recording.speech_detection_mode` as `ai` or
+`manual_threshold` and `recording.input_threshold_dbfs` as a finite, clamped
+−72..0 value. Version-2 settings migrate to AI with a dormant −42 dBFS manual
+threshold; probability sensitivity is not converted to amplitude. Valid
+pre-version-2 `manual_activation_rms` values migrate only to the dormant dBFS
+threshold, while AI remains selected. Future unknown fields continue to be
+preserved.
 
 The earlier `qa/microphone-test-final-*.png` captures document the superseded
-button-and-diagnostics UI and are not evidence of the current slider design.
-Physical microphone, device-disconnect, and permission-failure verification of
-the redesigned lifecycle remains **NOT VERIFIED**.
+button-and-diagnostics UI and are not evidence of the current two-mode meter
+and threshold design.
+Physical two-microphone, device-disconnect, permission-failure, retained-audio,
+theme, scaling, and assistive-technology verification of the redesigned
+lifecycle remains **NOT VERIFIED**.
