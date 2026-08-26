@@ -274,13 +274,18 @@ jobs:
               $ruleset.enforcement -cne 'active') {
             throw "Ruleset $requiredRulesetName must be an active tag ruleset owned by $env:GITHUB_REPOSITORY"
           }
+          $conditionNames = @($ruleset.conditions.PSObject.Properties.Name)
           if ($null -eq $ruleset.conditions -or
-              @($ruleset.conditions.PSObject.Properties.Name) -cne @('ref_name')) {
+              $conditionNames.Count -ne 1 -or
+              $conditionNames[0] -cne 'ref_name') {
             throw "Repository ruleset $requiredRulesetName must define only ref-name conditions"
           }
           $refName = $ruleset.conditions.ref_name
+          $refNamePropertyNames = @($refName.PSObject.Properties.Name | Sort-Object)
           if ($null -eq $refName -or
-              @($refName.PSObject.Properties.Name | Sort-Object) -cne @('exclude', 'include') -or
+              $refNamePropertyNames.Count -ne 2 -or
+              $refNamePropertyNames[0] -cne 'exclude' -or
+              $refNamePropertyNames[1] -cne 'include' -or
               $refName.include -isnot [System.Array] -or
               $refName.exclude -isnot [System.Array]) {
             throw "Repository ruleset $requiredRulesetName must define unambiguous ref includes and exclusions"
