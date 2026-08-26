@@ -667,10 +667,6 @@ impl RuntimeRouter {
         runtime_kind_for_model(model_id).is_some()
     }
 
-    pub(crate) fn managed_runtime_id(&self, model_id: &ModelId) -> Option<&'static str> {
-        Self::managed_runtime_id_for(model_id)
-    }
-
     pub(crate) fn managed_runtime_id_for(model_id: &ModelId) -> Option<&'static str> {
         if runtime_model_manifest(model_id)
             .is_some_and(|manifest| manifest.artifact_filename.ends_with(".gguf"))
@@ -3308,15 +3304,16 @@ mod tests {
 
     #[test]
     fn safe_gguf_catalog_artifacts_do_not_require_a_managed_runtime_package() {
-        let router = RuntimeRouter::new();
-
         for id in [
             "whisper_cpp_tiny_en",
             "whisper_cpp_base_en",
             "whisper_cpp_small_en",
             "whisper_cpp_medium_en",
         ] {
-            assert_eq!(router.managed_runtime_id(&ModelId::new(id)), None);
+            assert_eq!(
+                RuntimeRouter::managed_runtime_id_for(&ModelId::new(id)),
+                None
+            );
         }
     }
 

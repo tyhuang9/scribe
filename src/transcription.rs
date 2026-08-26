@@ -1467,9 +1467,7 @@ impl TranscriptionService {
                 installed_package_root: None,
             });
         }
-        let runtime_id = self
-            .router
-            .managed_runtime_id(model_id)
+        let runtime_id = RuntimeRouter::managed_runtime_id_for(model_id)
             .ok_or_else(|| anyhow!("model {model_id} has no installable native runtime"))?;
         let installed_package_root = configured_managed_runtime_root(&self.config, runtime_id)?
             .or_else(|| primary_runtime_package_root(&self.config));
@@ -1491,9 +1489,7 @@ impl TranscriptionService {
                 "embedded GGUF models do not have a recoverable runtime package"
             ));
         }
-        let runtime_id = self
-            .router
-            .managed_runtime_id(model_id)
+        let runtime_id = RuntimeRouter::managed_runtime_id_for(model_id)
             .ok_or_else(|| anyhow!("model {model_id} has no installable native runtime"))?;
         Ok(InstallationBinding {
             managed_runtime_id: runtime_id.to_owned(),
@@ -1505,9 +1501,7 @@ impl TranscriptionService {
         &self,
         model_id: &ModelId,
     ) -> Result<Option<RuntimeRecovery>> {
-        let runtime_id = self
-            .router
-            .managed_runtime_id(model_id)
+        let runtime_id = RuntimeRouter::managed_runtime_id_for(model_id)
             .ok_or_else(|| anyhow!("model {model_id} has no managed native runtime"))?;
         let target = config::runtime_storage_dir().join(runtime_id);
         let previous = previous_runtime_root(&target);
