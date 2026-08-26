@@ -183,6 +183,10 @@ try {
         'git ls-remote --exit-code --tags origin',
         'Could not confirm that tag',
         'Could not confirm that release',
+        '$savedNativeErrorPreference = $PSNativeCommandUseErrorActionPreference',
+        '$PSNativeCommandUseErrorActionPreference = $false',
+        '$global:LASTEXITCODE = 0',
+        '$PSNativeCommandUseErrorActionPreference = $savedNativeErrorPreference',
         'needs: build',
         'name: windows-release-assets',
         '& .\scripts\test-windows-release-packaging.ps1',
@@ -237,6 +241,86 @@ try {
         $workflow.Contains('cancel-in-progress:')) {
         throw "Windows release publication must use verified atomic tags and non-cancelling queued concurrency."
     }
+    $duplicateGuardStepStart = $workflow.IndexOf('      - name: Refuse duplicate manual release')
+    $duplicateGuardRunMarker = $workflow.IndexOf('        run: |', $duplicateGuardStepStart)
+    $duplicateGuardScriptStart = $workflow.IndexOf("`n", $duplicateGuardRunMarker) + 1
+    $duplicateGuardScriptEnd = $workflow.IndexOf('      - name: Download verified release assets', $duplicateGuardScriptStart)
+    if ($duplicateGuardStepStart -lt 0 -or
+        $duplicateGuardRunMarker -lt $duplicateGuardStepStart -or
+        $duplicateGuardScriptStart -le $duplicateGuardRunMarker -or
+        $duplicateGuardScriptEnd -le $duplicateGuardScriptStart) {
+        throw "Could not isolate the duplicate manual release guard for executable testing."
+    }
+    $duplicateGuardScriptLines = @(
+        $workflow.Substring(
+            $duplicateGuardScriptStart,
+            $duplicateGuardScriptEnd - $duplicateGuardScriptStart
+        ) -split '\r?\n' | ForEach-Object {
+            if ($_.StartsWith('          ', [System.StringComparison]::Ordinal)) {
+                $_.Substring(10)
+            } else {
+                $_
+            }
+        }
+    )
+    $duplicateGuardScript = $duplicateGuardScriptLines -join "`r`n"
+    $duplicateGuardOrder = @(
+        '$savedNativeErrorPreference = $PSNativeCommandUseErrorActionPreference',
+        'try {',
+        '$PSNativeCommandUseErrorActionPreference = $false',
+        '& git ls-remote --exit-code --tags origin',
+        '$tagLookupExit = $LASTEXITCODE',
+        '& gh api "repos/$env:GITHUB_REPOSITORY/releases/tags/$env:RELEASE_TAG"',
+        '$releaseLookupExit = $LASTEXITCODE',
+        '$global:LASTEXITCODE = 0',
+        'finally {',
+        '$PSNativeCommandUseErrorActionPreference = $savedNativeErrorPreference'
+    )
+    $previousGuardPosition = -1
+    foreach ($guardFragment in $duplicateGuardOrder) {
+        $guardPosition = $duplicateGuardScript.IndexOf($guardFragment, [System.StringComparison]::Ordinal)
+        if ($guardPosition -le $previousGuardPosition) {
+            throw "Duplicate manual release guard must preserve probe handling order at: $guardFragment"
+        }
+        $previousGuardPosition = $guardPosition
+    }
+    if ($duplicateGuardScript -notmatch '(?m)^\s*\$null = & git ls-remote[^\r\n]+\r?\n\s*\$tagLookupExit = \$LASTEXITCODE\r?$' -or
+        $duplicateGuardScript -notmatch '(?m)^\s*\$releaseLookup = @\(& gh api[^\r\n]+\r?\n\s*\$releaseLookupExit = \$LASTEXITCODE\r?$') {
+        throw "Duplicate manual release probes must capture native exit codes immediately."
+    }
+
+    $absenceProbeBin = Join-Path $testRoot "absence-probe-bin"
+    New-Item -ItemType Directory -Path $absenceProbeBin | Out-Null
+    [System.IO.File]::WriteAllText(
+        (Join-Path $absenceProbeBin 'git.cmd'),
+        "@exit /b 2`r`n",
+        [System.Text.UTF8Encoding]::new($false)
+    )
+    [System.IO.File]::WriteAllText(
+        (Join-Path $absenceProbeBin 'gh.cmd'),
+        "@echo gh: release not found (HTTP 404) 1^>^&2`r`n@exit /b 1`r`n",
+        [System.Text.UTF8Encoding]::new($false)
+    )
+    $absenceProbeScript = Join-Path $testRoot 'test-absence-probes.ps1'
+    $quotedAbsenceProbeBin = $absenceProbeBin.Replace("'", "''")
+    $absenceProbePrelude = @"
+`$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+`$PSNativeCommandUseErrorActionPreference = `$true
+`$env:PATH = '$quotedAbsenceProbeBin;' + `$env:PATH
+`$env:RELEASE_TAG = 'v0.1.0'
+`$env:GITHUB_REPOSITORY = 'tyhuang9/scribe'
+"@
+    [System.IO.File]::WriteAllText(
+        $absenceProbeScript,
+        "$absenceProbePrelude`r`n$duplicateGuardScript`r`nexit `$LASTEXITCODE`r`n",
+        [System.Text.UTF8Encoding]::new($false)
+    )
+    $absenceProbeResult = Invoke-NativeProcess $pwshPath @('-NoProfile', '-File', $absenceProbeScript)
+    if ($absenceProbeResult.ExitCode -ne 0) {
+        throw "Expected absent tag and release probes to survive the GitHub PowerShell wrapper; exit $($absenceProbeResult.ExitCode): $($absenceProbeResult.Stderr)"
+    }
+
     $contractTestPosition = $workflow.IndexOf('& .\scripts\test-windows-release-packaging.ps1')
     $releaseInputPosition = $workflow.IndexOf('prepare-windows-release-inputs.ps1')
     $releaseBuildPosition = $workflow.IndexOf('build-windows-release.ps1')
