@@ -42,7 +42,7 @@ use crate::history::{
     HistoryRecord, HistoryRetentionPolicy, HistoryStatus, HistoryStore, NewHistoryEntry,
 };
 use crate::history_playback::{PlaybackEvent, PlaybackService};
-use crate::hotkey::{HotkeyEvent, HotkeyService};
+use crate::hotkey::{HotkeyEvent, HotkeyService, normalize_hotkey_spec};
 use crate::huggingface_catalog::{
     CatalogSource, HuggingFaceCatalogService, ModelInventorySnapshot, RemoteModel, TrustedArtifact,
 };
@@ -82,11 +82,11 @@ use crate::ui::{
     RecordingMode, RecordingSettingsView, RemoteCatalogActionKind, RemoteCatalogActionView,
     RemoteCatalogEntryView, RemoteCatalogFilters, RemoteCatalogSort, RemoteCatalogStatusKind,
     RemoteCatalogStatusView, RemoteCatalogVariantView, RemoteCatalogView, ResolvedTheme,
-    ScreenAction, ScreenView, SettingsTab, SidebarModelView, ThemePalette, UiRoute,
-    configure_accessible_style, history_page, minimum_primary_target_height, recording_mode,
-    render_screen, request_models_route_heading_focus, scroll_focused_control_into_view,
-    settings_save_state, show_navigation, show_route_scroll, theme_palette, transcription_state,
-    ui_palette,
+    ScreenAction, ScreenView, SettingsTab, SidebarModelView, ThemePalette, TranscribeNotice,
+    UiRoute, configure_accessible_style, history_page, minimum_primary_target_height,
+    recording_mode, render_screen, request_models_route_heading_focus,
+    scroll_focused_control_into_view, settings_save_state, show_navigation, show_route_scroll,
+    theme_palette, transcription_state, ui_palette,
 };
 
 #[cfg(test)]
@@ -8122,6 +8122,31 @@ impl LocalTranscriberApp {
     }
 
     fn apply_hotkey(&mut self) {
+        let normalized = match normalize_hotkey_spec(&self.hotkey_input) {
+            Ok(spec) => spec,
+            Err(err) => {
+                self.capturing_hotkey = false;
+                self.hotkey_input = self.config.recording.hotkey.clone();
+                self.status = TranscriptionStatus::Error;
+                self.status_message = format!(
+                    "Failed to register hotkey: {err}. The previous shortcut is still active."
+                );
+                return;
+            }
+        };
+        let persisted = normalize_hotkey_spec(&self.config.recording.hotkey)
+            .unwrap_or_else(|_| self.config.recording.hotkey.clone());
+        if normalized == persisted {
+            self.capturing_hotkey = false;
+            self.hotkey_input = normalized.clone();
+            if self.config.recording.hotkey != normalized {
+                self.config.recording.hotkey = normalized;
+                self.save_config();
+            }
+            self.status_message = "Recording shortcut unchanged.".to_owned();
+            return;
+        }
+        self.hotkey_input = normalized;
         match self.hotkey_service.register(&self.hotkey_input) {
             Ok(()) => {
                 self.capturing_hotkey = false;
@@ -9674,11 +9699,8 @@ impl LocalTranscriberApp {
                 .unwrap_or_default(),
             self.transcript.clone(),
             provisional_transcript.unwrap_or_default(),
-            if no_speech {
-                Some("No speech detected — nothing was added.".to_owned())
-            } else {
-                (!self.status_message.is_empty()).then(|| self.status_message.clone())
-            },
+            no_speech
+                .then(|| TranscribeNotice::information("No speech detected — nothing was added.")),
             self.config.recording.hotkey.clone(),
             recording_mode(self.config.recording.hotkey_mode == HotkeyMode::HoldToTalk),
             microphone_permission,
@@ -12220,11 +12242,8 @@ impl LocalTranscriberApp {
             0,
             self.transcript.clone(),
             String::new(),
-            if no_speech {
-                Some("No speech detected — nothing was added.".to_owned())
-            } else {
-                (!self.status_message.is_empty()).then(|| self.status_message.clone())
-            },
+            no_speech
+                .then(|| TranscribeNotice::information("No speech detected — nothing was added.")),
             self.config.recording.hotkey.clone(),
             recording_mode(self.config.recording.hotkey_mode == HotkeyMode::HoldToTalk),
             self.microphone_permission(),

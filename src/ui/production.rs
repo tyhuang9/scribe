@@ -3,7 +3,8 @@
 use crate::models::TranscriptionStatus;
 
 use super::state::{
-    MicrophonePermission, RecordingMode, SettingsSaveState, TranscriptionPhase, TranscriptionState,
+    MicrophonePermission, RecordingMode, SettingsSaveState, TranscribeNotice, TranscriptionPhase,
+    TranscriptionState,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -23,7 +24,7 @@ pub(crate) fn transcription_state(
     elapsed_ms: u64,
     transcript: String,
     provisional_transcript: String,
-    notice: Option<String>,
+    notice: Option<TranscribeNotice>,
     hotkey: String,
     recording_mode: RecordingMode,
     microphone_permission: MicrophonePermission,
@@ -115,7 +116,9 @@ mod tests {
             0,
             "Saved text".into(),
             String::new(),
-            Some("Scribe couldn\u{2019}t access your microphone".into()),
+            Some(TranscribeNotice::information(
+                "Scribe couldn\u{2019}t access your microphone",
+            )),
             "Ctrl+Shift+Space".into(),
             RecordingMode::PressOnce,
             MicrophonePermission::Denied,
