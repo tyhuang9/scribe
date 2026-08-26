@@ -427,34 +427,35 @@ samples with maximum 10 ms mono RMS 0.001559. Its comparison against the former
 0.012 RMS activation floor is historical and no longer describes speech
 classification.
 
-As of 2026-08-17, exact sequential 512-sample Silero decisions classify speech.
-The persisted `Speech detection sensitivity` marker maps inversely to Silero's
-probability threshold. Its combined Input level bar has a read-only teal meter
-fill for RMS telemetry; the marker remains an AI probability control rather
-than a volume cutoff. Capture-wide maximum RMS/peak values remain diagnostic
-low-input guidance only; they never accept or reject speech. Automated coverage
-verifies that separation, final partial diagnostic windows, redacted scalar
-serialization, and no output for every no-speech completion.
+AI voice detection is the default and uses exact sequential Silero decisions at
+its fixed default probability threshold. Its microphone meter is telemetry only.
+Manual volume threshold exposes a literal `−72..0 dBFS` cutoff: each 30 ms
+window below it is replaced with silence before preview, transcription, or
+retained-history audio. Capture-wide maximum RMS/peak values remain diagnostic
+low-input guidance. In Manual mode, no speech with healthy input recommends
+lowering the input threshold; genuinely weak hardware input retains mute/gain
+guidance.
 
 REC-06 and STT-06 remain **NOT VERIFIED** until an operator corrects the
 physical mute/gain state and executes both the low-input and restored-speech
 rows through the real GUI/hotkey/target/output path.
 
-## Speech-detection sensitivity and input-meter rows
+## Voice-detection mode and input-meter rows
 
 | ID | Platform | Steps | Expected result | Status |
 | --- | --- | --- | --- | --- |
-| MIC-01 | Win/Linux/macOS | Open Settings > Recording with a working selected microphone, speak softly/loudly, then stay silent. | The teal `Input level` fill reflects RMS telemetry with a 60 ms attack, 120 ms peak hold, 320 ms release, and 250 ms stale-input reset. It is telemetry only and retains no audio or transcript artifact. | **NOT VERIFIED** - automated envelope, UI, and no-retention paths pass; physical input still requires an operator. |
-| MIC-02 | Win/Linux/macOS | In Settings > Recording, adjust the `Speech detection sensitivity` marker with pointer and Left/Right arrows, dictate at several sensitivities, and restart Scribe. | The visible `Sensitivity N%` marker works with pointer and keyboard; a more-sensitive setting lowers the configured Silero speech-probability threshold for the next recording; confirmation/pause timing plus pre/post-roll avoid clipped phrases; the setting survives restart. The marker is disabled while recording, but the live level fill remains visible. | **NOT VERIFIED** - inverse mapping, accessibility, Silero threshold, persistence, and recording lockout tests pass; acoustic boundary behavior still requires an operator. |
+| MIC-01 | Win/Linux/macOS | Open Settings > Recording with a working selected microphone, select `AI voice detection`, speak softly/loudly, then stay silent. | The read-only `Microphone level` meter reflects RMS telemetry with a 60 ms attack, 120 ms peak hold, 320 ms release, and 250 ms stale-input reset. Silero decides speech; no threshold marker is shown and monitoring retains no audio or transcript artifact. | **NOT VERIFIED** - automated envelope, Meter semantics, UI, and no-retention paths pass; physical input still requires an operator. |
+| MIC-02 | Win/Linux/macOS | Select `Manual volume threshold`, set `−42 dBFS`, adjust it with pointer, Left/Right, Home, and End, dictate below/equal/above the marker, then restart Scribe. | The combined bar exposes `Input threshold` with a whole-number `−72..0 dBFS` Slider. Audio below it is silenced in 30 ms windows; equality passes and the live fill switches completely to the above-threshold color. The mode and cutoff persist. The mode and threshold are disabled from microphone request through finalization, but remain editable during passive monitoring and microphone errors. | **NOT VERIFIED** - persistence, DSP, accessibility, and lockout paths are automated; acoustic boundary behavior still requires an operator. |
 | MIC-03 | Win/Linux/macOS | With Settings > Recording open, begin dictation; stop, switch the selected input, start retained-audio playback, leave Recording, and return. | Idle monitoring yields before dictation/playback with no duplicate input stream. Active dictation supplies the live input meter and is not stopped by navigation. Idle monitoring follows the new device and stops outside Recording. | **NOT VERIFIED** - ownership/deferred-start tests pass; device/driver timing still requires an operator. |
-| MIC-04 | Win/Linux/macOS | Navigate to the combined bar using keyboard and a screen reader in light and dark themes. | Exactly one control is named `Speech detection sensitivity` with a Slider role, help, normalized value actions, and no live microphone-level announcements. Its visible `Sensitivity N%` label distinguishes the marker from the teal microphone-volume fill. | **PARTIAL** - automated AccessKit, pointer/keyboard interaction, and lockout assertions pass; screen-reader and visual theme checks still require an operator. |
+| MIC-04 | Win/Linux/macOS | Navigate the mode selector and both meter states using keyboard and a screen reader in light and dark themes. | The mode selector exposes two labelled RadioButtons. AI exposes one non-live `Microphone level` Meter; Manual exposes one `Input threshold` Slider with `−72..0` values and 1 dB value actions. Continuous microphone level changes are not announced. | **PARTIAL** - automated AccessKit, pointer/keyboard interaction, and lockout assertions pass; screen-reader and visual theme checks still require an operator. |
 
-### Sensitivity and meter implementation evidence
+### Voice-detection and meter implementation evidence
 
-The current automated suite covers inverse Silero probability mapping,
-click/drag/arrow interaction, the single combined sensitivity-slider AccessKit
-contract, RMS meter attack/hold/release and stale reset, meter revisions,
-no-retention meter capture, exact 512-sample VAD cadence,
+The current automated suite covers AI and manual mode selection,
+click/drag/arrow/Home/End interaction, the combined input-threshold Slider and
+read-only AI Meter AccessKit contracts, RMS meter attack/hold/release and stale
+reset, meter revisions, no-retention meter capture, exact 512-sample Silero
+cadence, manual 30 ms gating,
 timing/pre-roll regressions, settings round-tripping, and monitor ownership
 handoff. The earlier
 `qa/microphone-test-final-*.png` screenshots show the superseded UI and must not

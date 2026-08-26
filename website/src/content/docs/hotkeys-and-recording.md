@@ -9,9 +9,9 @@ The in-app Start/Stop control remains the dependable fallback when a desktop ses
 
 ## Microphone and speech detection
 
-Open **General** to watch the selected microphone with the **Input sensitivity** slider. The native meter-only monitor starts while that page is open: its live fill shows incoming level and its thumb sets the speech-activation threshold. It does not create a transcript, history entry, or retained audio file. Input above 0% can still be background noise below the threshold; move the threshold below your speaking level while leaving it above the room's noise floor.
+Open **General** to watch the selected microphone in **Recording input**. The native meter-only monitor starts while that page is open and does not create a transcript, history entry, or retained audio file.
 
-Scribe's voice activity detector (VAD) decides which frames contain speech. It uses a noise floor, hysteresis, pre-roll, post-roll, and silence timing so brief fluctuations do not clip or repeatedly toggle speech. An explicit shortcut release or Stop action always takes priority over automatic endpointing.
+**AI voice detection** is the default. Its read-only microphone meter shows incoming level while Silero decides what is speech. Choose **Manual volume threshold** when you need a literal cutoff: move the `−72..0 dBFS` input-threshold marker below your normal voice but above resting room noise. Each quieter 30 ms window is replaced with silence before preview, transcription, and retained-history audio. Loud background sounds can still pass manual detection. An explicit shortcut release or Stop action always takes priority over automatic endpointing.
 
 ## Linux note
 
