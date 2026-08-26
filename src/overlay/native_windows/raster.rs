@@ -2371,11 +2371,13 @@ mod tests {
                             44 * numerator / denominator,
                         )
                         .expect("render cancel-control fixture frame");
-                    assert_eq!(
-                        control.pixels,
+                    let expected =
                         std::fs::read(fixture_root.join(format!("cancel-{theme}-{dpi}.bgra")))
-                            .expect("read immutable reference-contract cancel-control fixture"),
-                        "cancel control {theme} at {dpi} DPI diverged from the approved reference contract"
+                            .expect("read immutable reference-contract cancel-control fixture");
+                    assert_reference_geometry_is_pixel_identical(
+                        &control.pixels,
+                        &expected,
+                        &format!("cancel control {theme} at {dpi} DPI"),
                     );
                 }
             }
