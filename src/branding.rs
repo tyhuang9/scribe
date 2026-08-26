@@ -20,14 +20,17 @@ const BAR_X: [f32; 7] = [0.16, 0.273, 0.387, 0.5, 0.613, 0.727, 0.84];
 const BAR_HEIGHT: [f32; 7] = [0.38, 0.62, 0.78, 0.94, 0.78, 0.62, 0.38];
 const BAR_WIDTH: f32 = 0.085;
 
-pub(crate) fn show_mark(ui: &mut egui::Ui, size: f32) -> Response {
+pub(crate) fn show_mark(ui: &mut egui::Ui, size: f32, announce: bool) -> Response {
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
     paint_mark(ui.painter(), rect, ui.visuals().dark_mode);
-    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Other, "Scribe logo"));
-    ui.ctx().accesskit_node_builder(response.id, |builder| {
-        builder.set_role(egui::accesskit::Role::Image);
-        builder.set_name("Scribe logo");
-    });
+    if announce {
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Other, "Scribe logo"));
+        ui.ctx().accesskit_node_builder(response.id, |builder| {
+            builder.set_role(egui::accesskit::Role::Image);
+            builder.set_name("Scribe logo");
+            builder.set_description(TAGLINE);
+        });
+    }
     response
 }
 

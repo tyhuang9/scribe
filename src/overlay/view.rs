@@ -2278,6 +2278,45 @@ mod tests {
     }
 
     #[test]
+    fn overlay_semantic_colors_match_the_identity_contract() {
+        let light_context = egui::Context::default();
+        light_context.set_visuals(egui::Visuals::light());
+        let light = overlay_colors(&light_context);
+        assert_eq!(
+            light.surface,
+            Color32::from_rgba_unmultiplied(ICE_MIST.r(), ICE_MIST.g(), ICE_MIST.b(), 228)
+        );
+        assert_eq!(
+            light.border,
+            Color32::from_rgba_unmultiplied(SCRIBE_TEAL.r(), SCRIBE_TEAL.g(), SCRIBE_TEAL.b(), 64)
+        );
+        assert_eq!(light.text, DEEP_INK);
+        assert_eq!(light.muted_text, Color32::from_rgb(64, 91, 110));
+        assert_eq!(light.waveform, Color32::from_rgb(23, 111, 116));
+        assert_eq!(light.success, Color32::from_rgb(40, 97, 69));
+        assert_eq!(light.error, Color32::from_rgb(132, 46, 38));
+        assert_eq!(light.warning, Color32::from_rgb(123, 80, 36));
+
+        let dark_context = egui::Context::default();
+        dark_context.set_visuals(egui::Visuals::dark());
+        let dark = overlay_colors(&dark_context);
+        assert_eq!(
+            dark.surface,
+            Color32::from_rgba_unmultiplied(DEEP_NAVY.r(), DEEP_NAVY.g(), DEEP_NAVY.b(), 184)
+        );
+        assert_eq!(
+            dark.border,
+            Color32::from_rgba_unmultiplied(TEAL_ACCENT.r(), TEAL_ACCENT.g(), TEAL_ACCENT.b(), 36)
+        );
+        assert_eq!(dark.text, ICE_MIST);
+        assert_eq!(dark.muted_text, SOFT_AQUA);
+        assert_eq!(dark.waveform, TEAL_ACCENT);
+        assert_eq!(dark.success, Color32::from_rgb(157, 223, 183));
+        assert_eq!(dark.error, Color32::from_rgb(255, 210, 203));
+        assert_eq!(dark.warning, Color32::from_rgb(246, 223, 194));
+    }
+
+    #[test]
     fn glass_overlay_tokens_meet_contrast_requirements_in_both_themes() {
         fn linear(channel: u8) -> f32 {
             let value = f32::from(channel) / 255.0;

@@ -1079,7 +1079,7 @@ fn recording_status_header(ui: &mut egui::Ui, state: &TranscriptionState) -> Scr
                 ui,
                 Icon::Close,
                 "Cancel recording and discard it",
-                colors.error,
+                colors.error_fill,
                 colors.danger_button_text,
                 Stroke::NONE,
             );
@@ -1092,8 +1092,9 @@ fn recording_status_header(ui: &mut egui::Ui, state: &TranscriptionState) -> Scr
                     let (dot_rect, _) =
                         ui.allocate_exact_size(Vec2::splat(8.0), egui::Sense::hover());
                     ui.painter()
-                        .circle_filled(dot_rect.center(), 4.0, colors.error);
-                    let status = ui.label(RichText::new("Recording").strong().color(colors.error));
+                        .circle_filled(dot_rect.center(), 4.0, colors.error_fill);
+                    let status =
+                        ui.label(RichText::new("Recording").strong().color(colors.error_text));
                     ui.ctx().accesskit_node_builder(status.id, |builder| {
                         if !state.suppress_live_announcements {
                             builder.set_live(egui::accesskit::Live::Polite);
@@ -1123,7 +1124,7 @@ fn recording_status_header(ui: &mut egui::Ui, state: &TranscriptionState) -> Scr
                 ui,
                 Icon::Close,
                 "Cancel recording and discard it",
-                colors.error,
+                colors.error_fill,
                 colors.danger_button_text,
                 Stroke::NONE,
             );
@@ -1163,7 +1164,7 @@ fn recording_status_header(ui: &mut egui::Ui, state: &TranscriptionState) -> Scr
                 ui.label(
                     RichText::new("Speech model unavailable")
                         .strong()
-                        .color(colors.error),
+                        .color(colors.error_text),
                 );
                 ui.label("Open model settings to repair or choose another model.");
             });
@@ -1721,7 +1722,7 @@ fn microphone_error_notice(ui: &mut egui::Ui, technical_detail: &str) -> ScreenA
                         egui::Button::new(
                             RichText::new("Try again").color(colors.danger_button_text),
                         )
-                        .fill(colors.error)
+                        .fill(colors.error_fill)
                         .stroke(Stroke::NONE)
                         .rounding(Rounding::same(5.0))
                         .min_size(retry_size),
@@ -4739,7 +4740,7 @@ fn models(
     ) {
         let status = ui.label(RichText::new(&remote_catalog.status.message).color(
             match remote_catalog.status.kind {
-                RemoteCatalogStatusKind::Error => colors.error,
+                RemoteCatalogStatusKind::Error => colors.error_text,
                 RemoteCatalogStatusKind::Offline => colors.warning,
                 _ => colors.muted_text,
             },

@@ -2864,14 +2864,25 @@ mod tests {
     }
 
     #[test]
-    fn native_waveform_colors_follow_the_shared_theme_contract() {
-        assert_eq!(
-            NativeColors::for_theme(false).waveform,
-            Argb::new(255, 23, 111, 116)
-        );
-        assert_eq!(
-            NativeColors::for_theme(true).waveform,
-            Argb::from_color(ThemePalette::dark().recording_waveform)
-        );
+    fn native_overlay_semantic_colors_match_the_identity_contract() {
+        let light = NativeColors::for_theme(false);
+        assert_eq!(light.surface, Argb::new(228, 234, 245, 245));
+        assert_eq!(light.border, Argb::new(64, 45, 151, 156));
+        assert_eq!(light.text, Argb::from_color(DEEP_INK));
+        assert_eq!(light.muted_text, Argb::new(255, 64, 91, 110));
+        assert_eq!(light.waveform, Argb::new(255, 23, 111, 116));
+        assert_eq!(light.success, Argb::new(255, 40, 97, 69));
+        assert_eq!(light.error, Argb::new(255, 132, 46, 38));
+        assert_eq!(light.warning, Argb::new(255, 123, 80, 36));
+
+        let dark = NativeColors::for_theme(true);
+        assert_eq!(dark.surface, Argb::new(184, 6, 28, 46));
+        assert_eq!(dark.border, Argb::new(36, 124, 203, 201));
+        assert_eq!(dark.text, Argb::from_color(ICE_MIST));
+        assert_eq!(dark.muted_text, Argb::from_color(SOFT_AQUA));
+        assert_eq!(dark.waveform, Argb::from_color(TEAL_ACCENT));
+        assert_eq!(dark.success, Argb::new(255, 157, 223, 183));
+        assert_eq!(dark.error, Argb::new(255, 255, 210, 203));
+        assert_eq!(dark.warning, Argb::new(255, 246, 223, 194));
     }
 }

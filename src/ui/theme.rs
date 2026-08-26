@@ -19,6 +19,8 @@ pub(crate) struct ThemePalette {
     pub tertiary_text: Color32,
     pub border: Color32,
     pub border_strong: Color32,
+    /// Idle input/control boundary with at least 3:1 contrast on control surfaces.
+    pub control_border: Color32,
     pub slider_track_border: Color32,
     pub slider_threshold_fill: Color32,
     pub slider_remainder_fill: Color32,
@@ -37,6 +39,8 @@ pub(crate) struct ThemePalette {
     pub meter_rating_5: Color32,
     pub primary: Color32,
     pub accent: Color32,
+    /// Foreground for generic selected text on the exact accent fill.
+    pub selection_text: Color32,
     /// Scribe teal recording mark shared by foreground and native overlay renderers.
     pub recording_waveform: Color32,
     /// Theme-coherent teal/neutral track for the compact recording-mode selector.
@@ -49,7 +53,8 @@ pub(crate) struct ThemePalette {
     pub success: Color32,
     pub success_text: Color32,
     pub warning: Color32,
-    pub error: Color32,
+    /// Exact Live Coral fill for destructive controls and recording/error dots.
+    pub error_fill: Color32,
     /// Accessible error copy on `error_pale`.
     pub error_text: Color32,
     /// Foreground used on the solid danger fill.
@@ -87,6 +92,7 @@ impl ThemePalette {
             tertiary_text: Color32::from_rgb(82, 105, 122),
             border: SOFT_AQUA,
             border_strong: SCRIBE_TEAL,
+            control_border: Color32::from_rgb(88, 114, 126),
             slider_track_border: SCRIBE_TEAL,
             slider_threshold_fill: ICE_MIST,
             slider_remainder_fill: Color32::from_rgb(250, 252, 252),
@@ -102,6 +108,7 @@ impl ThemePalette {
             meter_rating_5: Color32::from_rgb(6, 118, 71),
             primary: DEEP_INK,
             accent: SCRIBE_TEAL,
+            selection_text: DEEP_INK,
             recording_waveform: SCRIBE_TEAL,
             segmented_control_bg: SCRIBE_TEAL,
             segmented_control_selected_text: DEEP_INK,
@@ -109,7 +116,7 @@ impl ThemePalette {
             success: Color32::from_rgb(57, 123, 90),
             success_text: Color32::from_rgb(40, 97, 69),
             warning: Color32::from_rgb(123, 80, 36),
-            error: LIVE_CORAL,
+            error_fill: LIVE_CORAL,
             error_text: Color32::from_rgb(132, 46, 38),
             danger_button_text: DEEP_INK,
             error_pale: Color32::from_rgb(255, 240, 237),
@@ -136,6 +143,7 @@ impl ThemePalette {
             tertiary_text: Color32::from_rgb(145, 185, 187),
             border: Color32::from_rgb(36, 81, 102),
             border_strong: TEAL_ACCENT,
+            control_border: Color32::from_rgb(100, 133, 143),
             slider_track_border: TEAL_ACCENT,
             slider_threshold_fill: Color32::from_rgb(23, 58, 76),
             slider_remainder_fill: Color32::from_rgb(36, 71, 93),
@@ -151,6 +159,7 @@ impl ThemePalette {
             meter_rating_5: TEAL_ACCENT,
             primary: ICE_MIST,
             accent: TEAL_ACCENT,
+            selection_text: DEEP_NAVY,
             recording_waveform: TEAL_ACCENT,
             segmented_control_bg: TEAL_ACCENT,
             segmented_control_selected_text: ICE_MIST,
@@ -158,7 +167,7 @@ impl ThemePalette {
             success: TEAL_ACCENT,
             success_text: Color32::from_rgb(157, 223, 183),
             warning: WARM_SAND,
-            error: LIVE_CORAL,
+            error_fill: LIVE_CORAL,
             error_text: Color32::from_rgb(255, 210, 203),
             danger_button_text: DEEP_NAVY,
             error_pale: Color32::from_rgb(82, 45, 49),
@@ -201,7 +210,7 @@ mod tests {
         assert!(contrast_ratio(palette.success_text, palette.card_bg) >= 4.5);
         assert!(contrast_ratio(palette.warning, palette.card_bg) >= 4.5);
         assert!(contrast_ratio(palette.error_text, palette.error_pale) >= 4.5);
-        assert!(contrast_ratio(palette.danger_button_text, palette.error) >= 4.5);
+        assert!(contrast_ratio(palette.danger_button_text, palette.error_fill) >= 4.5);
         assert!(contrast_ratio(palette.tertiary_text, palette.card_bg) >= 4.5);
         assert!(contrast_ratio(palette.tertiary_text, palette.content_bg) >= 4.5);
     }
@@ -211,7 +220,7 @@ mod tests {
         let palette = ThemePalette::dark();
 
         assert!(contrast_ratio(palette.error_text, palette.error_pale) >= 4.5);
-        assert!(contrast_ratio(palette.danger_button_text, palette.error) >= 4.5);
+        assert!(contrast_ratio(palette.danger_button_text, palette.error_fill) >= 4.5);
     }
 
     #[test]
@@ -252,14 +261,26 @@ mod tests {
         let light = ThemePalette::light();
         assert_eq!(light.primary_button_bg, SCRIBE_TEAL);
         assert!(contrast_ratio(light.primary_button_text, light.primary_button_bg) >= 4.5);
-        assert_eq!(light.error, LIVE_CORAL);
-        assert!(contrast_ratio(light.danger_button_text, light.error) >= 4.5);
+        assert_eq!(light.error_fill, LIVE_CORAL);
+        assert!(contrast_ratio(light.danger_button_text, light.error_fill) >= 4.5);
+        assert!(contrast_ratio(light.error_text, light.card_bg) >= 4.5);
 
         let dark = ThemePalette::dark();
         assert_eq!(dark.primary_button_bg, TEAL_ACCENT);
         assert!(contrast_ratio(dark.primary_button_text, dark.primary_button_bg) >= 4.5);
         assert_eq!(dark.warning, WARM_SAND);
-        assert_eq!(dark.error, LIVE_CORAL);
+        assert_eq!(dark.error_fill, LIVE_CORAL);
+        assert!(contrast_ratio(dark.error_text, dark.card_bg) >= 4.5);
+    }
+
+    #[test]
+    fn generic_selection_and_control_boundary_tokens_meet_contrast_requirements() {
+        for palette in [ThemePalette::light(), ThemePalette::dark()] {
+            assert!(contrast_ratio(palette.selection_text, palette.accent) >= 4.5);
+            for surface in [palette.card_bg, palette.panel_bg, palette.content_bg] {
+                assert!(contrast_ratio(palette.control_border, surface) >= 3.0);
+            }
+        }
     }
 
     #[test]
