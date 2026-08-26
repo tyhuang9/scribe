@@ -62,6 +62,7 @@ pub(crate) struct TranscriptionState {
     pub hotkey_capture_active: bool,
     pub hotkey_change_disabled_reason: Option<String>,
     pub model_change_disabled_reason: Option<String>,
+    pub record_control_needs_focus: bool,
     /// True only while the successfully presented background overlay owns
     /// recording announcements for this frame.
     pub suppress_live_announcements: bool,
@@ -104,6 +105,14 @@ impl TranscribeNotice {
             tone: TranscribeNoticeTone::Error,
             message: message.into(),
             recovery_action: Some(recovery_action),
+        }
+    }
+
+    pub(crate) fn failure(message: impl Into<String>) -> Self {
+        Self {
+            tone: TranscribeNoticeTone::Error,
+            message: message.into(),
+            recovery_action: None,
         }
     }
 }

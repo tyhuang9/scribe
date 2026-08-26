@@ -41,7 +41,6 @@ pub(crate) fn transcription_state(
         {
             TranscriptionPhase::MicrophoneError
         }
-        (TranscriptionStatus::Error, _, _, _) => TranscriptionPhase::ModelError,
         _ => match model_readiness {
             ModelReadiness::Ready => TranscriptionPhase::Ready,
             ModelReadiness::Loading => TranscriptionPhase::ModelLoading,
@@ -186,5 +185,27 @@ mod tests {
             MicrophonePermission::Unknown,
         );
         assert_eq!(no_model.phase, TranscriptionPhase::NoModel);
+    }
+
+    #[test]
+    fn unrelated_global_errors_do_not_become_transcribe_model_failures() {
+        let state = transcription_state(
+            TranscriptionStatus::Error,
+            Some("base.en".into()),
+            ModelReadiness::Ready,
+            false,
+            false,
+            0,
+            "Keep this text".into(),
+            String::new(),
+            None,
+            "Ctrl+Space".into(),
+            RecordingMode::PressOnce,
+            MicrophonePermission::Granted,
+        );
+
+        assert_eq!(state.phase, TranscriptionPhase::Ready);
+        assert!(state.notice.is_none());
+        assert_eq!(state.committed_transcript, "Keep this text");
     }
 }
