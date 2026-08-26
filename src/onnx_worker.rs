@@ -6515,15 +6515,46 @@ mod tests {
 
     #[test]
     #[ignore = "requires SCRIBE_ONNX_WORKER_EXE to name a built Scribe executable; runs the hidden worker protocol without downloading"]
-    fn hidden_worker_manual_protocol_smoke() {
+    fn hidden_inference_worker_manual_protocol_smoke() {
         let executable = required_fixture_path("SCRIBE_ONNX_WORKER_EXE");
         let mut child = Command::new(executable)
-            .arg("--onnx-worker")
+            .arg(INFERENCE_WORKER_FLAG)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
-            .expect("spawn hidden ONNX worker executable");
+            .expect("spawn hidden inference worker executable");
+        let mut input = child.stdin.take().expect("worker stdin");
+        let mut output = child.stdout.take().expect("worker stdout");
+        for (request_id, control, expected) in [
+            (1, Control::Hello, "ready"),
+            (2, Control::Health, "ok"),
+            (3, Control::Shutdown, "ok"),
+        ] {
+            write_frame(&mut input, &control_frame(0, request_id, &control).unwrap()).unwrap();
+            let (_, received_request, response) =
+                parse_worker_control(read_frame(&mut output).unwrap()).unwrap();
+            assert_eq!(received_request, request_id);
+            match expected {
+                "ready" => assert!(matches!(response, Control::Ready)),
+                "ok" => assert!(matches!(response, Control::Ok)),
+                _ => unreachable!(),
+            }
+        }
+        assert!(child.wait().unwrap().success());
+    }
+
+    #[test]
+    #[ignore = "requires SCRIBE_ONNX_WORKER_EXE to name a built Scribe executable; runs the hidden worker protocol without downloading"]
+    fn hidden_vad_worker_manual_protocol_smoke() {
+        let executable = required_fixture_path("SCRIBE_ONNX_WORKER_EXE");
+        let mut child = Command::new(executable)
+            .arg(VAD_WORKER_FLAG)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("spawn hidden VAD worker executable");
         let mut input = child.stdin.take().expect("worker stdin");
         let mut output = child.stdout.take().expect("worker stdout");
         for (request_id, control, expected) in [
