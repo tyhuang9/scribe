@@ -94,7 +94,7 @@ cancel-window title is exactly `Scribe Dictation Overlay Cancel`. Capture the
 combined screen region because the X intentionally lives in its own native
 window. The maximized fixture host is titled exactly
 `Scribe Overlay Fixture Background` and remains repaintable behind the overlay.
-Its repeating light, dark, and Scribe-blue panels provide hard edges and text
+Its repeating light, dark, and Scribe-teal panels provide hard edges and text
 for judging painted translucency, tint, and any seam between the two overlay
 windows; they are fixture-only paint, not a production asset.
 

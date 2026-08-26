@@ -1,4 +1,11 @@
-# Scribe
+<h1 align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/branding/scribe-lockup-dark.svg" />
+    <img src="docs/assets/branding/scribe-lockup-light.svg" width="360" alt="Scribe" />
+  </picture>
+</h1>
+
+<p align="center"><strong>Lightning-fast local transcription that stays out of your way.</strong></p>
 
 **Local-first speech-to-text for your desktop.** Scribe records from your microphone, transcribes on your device, and leaves the finished text ready to copy or, on Windows when enabled, insert into the app you were using.
 
@@ -10,7 +17,7 @@
     <img src="https://img.shields.io/badge/Windows%20portable%20ZIP-Download-24292F?style=for-the-badge&logo=github&logoColor=white" alt="Download the portable Windows ZIP" />
   </a>
   <a href="https://tyhuang9.github.io/scribe/">
-    <img src="https://img.shields.io/badge/Documentation-Read%20the%20guide-4C1D95?style=for-the-badge&logo=readthedocs&logoColor=white" alt="Read the Scribe documentation" />
+    <img src="https://img.shields.io/badge/Documentation-Read%20the%20guide-2D979C?style=for-the-badge&logo=readthedocs&logoColor=white" alt="Read the Scribe documentation" />
   </a>
 </p>
 
