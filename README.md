@@ -17,7 +17,7 @@
     <img src="https://img.shields.io/badge/Windows%20portable%20ZIP-Download-24292F?style=for-the-badge&logo=github&logoColor=white" alt="Download the portable Windows ZIP" />
   </a>
   <a href="https://tyhuang9.github.io/scribe/">
-    <img src="https://img.shields.io/badge/Documentation-Read%20the%20guide-2D979C?style=for-the-badge&logo=readthedocs&logoColor=white" alt="Read the Scribe documentation" />
+    <img src="https://img.shields.io/badge/Documentation-Read%20the%20guide-176D70?style=for-the-badge&logo=readthedocs&logoColor=white" alt="Read the Scribe documentation" />
   </a>
 </p>
 

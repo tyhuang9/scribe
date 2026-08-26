@@ -1,8 +1,11 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-labelledby="title">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-labelledby="title description">
   <title id="title">Scribe</title>
-  <rect width="64" height="64" rx="14" fill="#061C2E"/>
-  <g fill="#7CCBC9">
-    <rect x="5" y="26" width="6" height="12" rx="3"/><rect x="13" y="21" width="6" height="22" rx="3"/><rect x="21" y="15" width="6" height="34" rx="3"/><rect x="29" y="9" width="6" height="46" rx="3"/><rect x="37" y="15" width="6" height="34" rx="3"/><rect x="45" y="21" width="6" height="22" rx="3"/><rect x="53" y="26" width="6" height="12" rx="3"/>
+  <desc id="description">The canonical Scribe waveform-S mark on Deep Navy.</desc>
+  <defs><clipPath id="icon-tile"><rect x="5.12" y="5.12" width="117.76" height="117.76" rx="24.32"/></clipPath></defs>
+  <rect x="5.12" y="5.12" width="117.76" height="117.76" rx="24.32" fill="#061C2E"/>
+  <g fill="#7CCBC9" clip-path="url(#icon-tile)">
+    <rect x="15" y="40" width="11" height="48" rx="5.5"/><rect x="44" y="14" width="11" height="100" rx="5.5"/><rect x="59" y="4" width="11" height="120" rx="5.5"/><rect x="73" y="14" width="11" height="100" rx="5.5"/><rect x="102" y="40" width="11" height="48" rx="5.5"/>
   </g>
-  <path d="M42 20c-4-4-17-4-18 4-1 7 17 6 17 15 0 8-14 11-21 5" fill="none" stroke="#EAF5F5" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+  <g fill="#ACDBD9" clip-path="url(#icon-tile)"><rect x="30" y="24" width="11" height="80" rx="5.5"/><rect x="87" y="24" width="11" height="80" rx="5.5"/></g>
+  <path d="M89.6 35.8C78.1 20.5 49.9 23 43 47.4c-4.8 20.9 46.1 10.6 43.5 36.5-2.3 22.6-35.4 23.5-50.7 5.7" fill="none" stroke="#fff" stroke-width="16.6" stroke-linecap="round" stroke-linejoin="round" clip-path="url(#icon-tile)"/>
 </svg>
