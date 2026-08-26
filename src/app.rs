@@ -12745,7 +12745,7 @@ impl LocalTranscriberApp {
                 )
             })
             .collect::<HashMap<_, _>>();
-        for model in self.remote_catalog.local_models.iter() {
+        for model in self.remote_catalog.local_models.as_ref() {
             names
                 .entry(model.id.clone())
                 .or_insert_with(|| model.display_name.clone());

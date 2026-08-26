@@ -354,13 +354,18 @@ pub(crate) fn history_page(
                 });
             }
             if is_truncated {
-                let response = ui.add_sized(
-                    [164.0, 44.0],
-                    egui::Button::new(if show_full_transcript {
+                let transcript_toggle_id =
+                    ui.make_persistent_id(("history-transcript-toggle", record.id));
+                let response = stable_history_button(
+                    ui,
+                    transcript_toggle_id,
+                    if show_full_transcript {
                         "Show less"
                     } else {
                         "Show full transcript"
-                    }),
+                    },
+                    egui::vec2(164.0, 44.0),
+                    true,
                 );
                 set_accessible_description(
                     ui,
@@ -420,7 +425,14 @@ pub(crate) fn history_page(
                     ui.add_space(4.0);
                     ui.label(RichText::new("Raw transcript").strong());
                     ui.label(&record.raw_text);
-                    let copy_raw = ui.add_sized([112.0, 44.0], egui::Button::new("Copy raw"));
+                    let copy_raw_id = ui.make_persistent_id(("history-copy-raw", record.id));
+                    let copy_raw = stable_history_button(
+                        ui,
+                        copy_raw_id,
+                        "Copy raw",
+                        egui::vec2(112.0, 44.0),
+                        true,
+                    );
                     set_accessible_description(
                         ui,
                         &copy_raw,
@@ -438,12 +450,13 @@ pub(crate) fn history_page(
             ui.add_space(8.0);
             ui.horizontal_wrapped(|ui| {
                 if !display_text.trim().is_empty() {
-                    let response = ui.add_sized(
-                        [104.0, 44.0],
-                        egui::Button::new(format!(
-                            "{} Copy",
-                            egui_phosphor::regular::COPY
-                        )),
+                    let copy_id = ui.make_persistent_id(("history-copy", record.id));
+                    let response = stable_history_button(
+                        ui,
+                        copy_id,
+                        &format!("{} Copy", egui_phosphor::regular::COPY),
+                        egui::vec2(104.0, 44.0),
+                        true,
                     );
                     ui.ctx().accesskit_node_builder(response.id, |builder| {
                         builder.set_name("Copy");
@@ -470,13 +483,16 @@ pub(crate) fn history_page(
                     } else {
                         "Paste again"
                     };
-                    let response = ui.add_enabled(
-                        !work_active && armed_repaste != Some(record.id),
-                        egui::Button::new(format!(
+                    let repaste_id = ui.make_persistent_id(("history-repaste", record.id));
+                    let response = stable_history_button(
+                        ui,
+                        repaste_id,
+                        &format!(
                             "{} {button_text}",
                             egui_phosphor::regular::CLIPBOARD_TEXT
-                        ))
-                        .min_size([132.0, 44.0].into()),
+                        ),
+                        egui::vec2(132.0, 44.0),
+                        !work_active && armed_repaste != Some(record.id),
                     );
                     ui.ctx().accesskit_node_builder(response.id, |builder| {
                         builder.set_name(button_text);
@@ -526,17 +542,20 @@ pub(crate) fn history_page(
                             Some(HistoryPageAction::Play(record.id)),
                         )
                     };
-                    let response = ui.add_enabled(
-                        enabled,
-                        egui::Button::new(format!(
+                    let playback_id = ui.make_persistent_id(("history-playback", record.id));
+                    let response = stable_history_button(
+                        ui,
+                        playback_id,
+                        &format!(
                             "{} {label}",
                             if label == "Play" {
                                 egui_phosphor::regular::PLAY
                             } else {
                                 egui_phosphor::regular::STOP
                             }
-                        ))
-                        .min_size([104.0, 44.0].into()),
+                        ),
+                        egui::vec2(104.0, 44.0),
+                        enabled,
                     );
                     ui.ctx().accesskit_node_builder(response.id, |builder| {
                         builder.set_name(label);
@@ -702,9 +721,13 @@ pub(crate) fn history_page(
                     builder.set_live_atomic();
                 });
                 ui.horizontal_wrapped(|ui| {
-                    let confirm = ui.add_enabled(
+                    let confirm_id = ui.make_persistent_id(("history-confirm-delete", record.id));
+                    let confirm = stable_history_button(
+                        ui,
+                        confirm_id,
+                        "Delete permanently",
+                        egui::vec2(144.0, 44.0),
                         !work_active,
-                        egui::Button::new("Delete permanently").min_size([144.0, 44.0].into()),
                     );
                     set_accessible_description(
                         ui,
@@ -714,7 +737,14 @@ pub(crate) fn history_page(
                     if history_action_activated(ui, &confirm) {
                         action = Some(HistoryPageAction::ConfirmDelete(record.id));
                     }
-                    let cancel = ui.add_sized([88.0, 44.0], egui::Button::new("Cancel"));
+                    let cancel_id = ui.make_persistent_id(("history-cancel-delete", record.id));
+                    let cancel = stable_history_button(
+                        ui,
+                        cancel_id,
+                        "Cancel",
+                        egui::vec2(88.0, 44.0),
+                        true,
+                    );
                     set_accessible_description(
                         ui,
                         &cancel,

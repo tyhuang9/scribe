@@ -2860,6 +2860,14 @@ mod tests {
     #[test]
     fn history_more_identity_survives_earlier_record_insertion_and_removal() {
         fn more_id_for_model(output: &egui::FullOutput, model_id: &str) -> egui::accesskit::NodeId {
+            action_id_for_model(output, "More actions", model_id)
+        }
+
+        fn action_id_for_model(
+            output: &egui::FullOutput,
+            action_name: &str,
+            model_id: &str,
+        ) -> egui::accesskit::NodeId {
             output
                 .platform_output
                 .accesskit_update
@@ -2868,13 +2876,13 @@ mod tests {
                 .nodes
                 .iter()
                 .find_map(|(id, node)| {
-                    (node.name() == Some("More actions")
+                    (node.name() == Some(action_name)
                         && node
                             .description()
                             .is_some_and(|description| description.contains(model_id)))
                     .then_some(*id)
                 })
-                .unwrap_or_else(|| panic!("missing More actions for {model_id}"))
+                .unwrap_or_else(|| panic!("missing {action_name} for {model_id}"))
         }
 
         let ctx = egui::Context::default();
@@ -2885,6 +2893,7 @@ mod tests {
         data.history_focus_more_action = Some(2);
         let (initial, _) = render_with_input(&ctx, &mut data, &mut page, 1024.0, 768.0, Vec::new());
         let target_id = more_id_for_model(&initial, "custom-removed-model");
+        let copy_id = action_id_for_model(&initial, "Copy", "custom-removed-model");
         assert_eq!(
             initial
                 .platform_output
@@ -2906,6 +2915,10 @@ mod tests {
             target_id
         );
         assert_eq!(
+            action_id_for_model(&after_insertion, "Copy", "custom-removed-model"),
+            copy_id
+        );
+        assert_eq!(
             after_insertion
                 .platform_output
                 .accesskit_update
@@ -2922,6 +2935,10 @@ mod tests {
         assert_eq!(
             more_id_for_model(&after_removal, "custom-removed-model"),
             target_id
+        );
+        assert_eq!(
+            action_id_for_model(&after_removal, "Copy", "custom-removed-model"),
+            copy_id
         );
         assert_eq!(
             after_removal
