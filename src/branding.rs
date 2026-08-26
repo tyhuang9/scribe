@@ -36,10 +36,28 @@ const BAR_HEIGHT: [f32; 7] = [
 ];
 const BAR_WIDTH: f32 = 11.0 / 128.0;
 const S_STROKE_WIDTH: f32 = 16.6 / 128.0;
+// Absolute control points from the canonical 128-unit SVG path, normalized for
+// the egui and runtime-icon renderers. The SVG's later cubic segments are
+// relative; these values include that translation instead of approximating the curve.
 const S_CURVES: [[(f32, f32); 4]; 3] = [
-    [(0.70, 0.28), (0.61, 0.16), (0.35, 0.18), (0.30, 0.37)],
-    [(0.30, 0.37), (0.26, 0.54), (0.72, 0.47), (0.68, 0.66)],
-    [(0.68, 0.66), (0.65, 0.84), (0.37, 0.84), (0.28, 0.70)],
+    [
+        (89.6 / 128.0, 35.8 / 128.0),
+        (78.1 / 128.0, 20.5 / 128.0),
+        (49.9 / 128.0, 23.0 / 128.0),
+        (43.0 / 128.0, 47.4 / 128.0),
+    ],
+    [
+        (43.0 / 128.0, 47.4 / 128.0),
+        (38.2 / 128.0, 68.3 / 128.0),
+        (89.1 / 128.0, 58.0 / 128.0),
+        (86.5 / 128.0, 83.9 / 128.0),
+    ],
+    [
+        (86.5 / 128.0, 83.9 / 128.0),
+        (84.2 / 128.0, 106.5 / 128.0),
+        (51.1 / 128.0, 107.4 / 128.0),
+        (35.8 / 128.0, 89.6 / 128.0),
+    ],
 ];
 
 pub(crate) fn show_mark(ui: &mut egui::Ui, size: f32, announce: bool) -> Response {
@@ -266,13 +284,105 @@ mod tests {
         attribute(&svg[start..end], "d")
     }
 
-    fn path_numbers(path: &str) -> Vec<f32> {
-        path.split(|character: char| {
-            !(character.is_ascii_digit() || matches!(character, '.' | '-'))
-        })
-        .filter(|part| !part.is_empty())
-        .map(|part| part.parse().expect("numeric SVG path coordinate"))
-        .collect()
+    fn path_numbers(segment: &str) -> Vec<f32> {
+        let mut values = Vec::new();
+        let mut current = String::new();
+        for character in segment.chars() {
+            if character == '-' {
+                if !current.is_empty() {
+                    values.push(current.parse().expect("numeric SVG path coordinate"));
+                    current.clear();
+                }
+                current.push(character);
+            } else if character.is_ascii_digit() || character == '.' {
+                current.push(character);
+            } else if !current.is_empty() {
+                values.push(current.parse().expect("numeric SVG path coordinate"));
+                current.clear();
+            }
+        }
+        if !current.is_empty() {
+            values.push(current.parse().expect("numeric SVG path coordinate"));
+        }
+        values
+    }
+
+    fn coordinate(values: &[f32], index: usize) -> (f32, f32) {
+        (values[index], values[index + 1])
+    }
+
+    fn relative_curve(start: (f32, f32), values: &[f32]) -> [(f32, f32); 4] {
+        assert_eq!(values.len(), 6);
+        [
+            start,
+            (start.0 + values[0], start.1 + values[1]),
+            (start.0 + values[2], start.1 + values[3]),
+            (start.0 + values[4], start.1 + values[5]),
+        ]
+    }
+
+    fn absolute_s_curves(path: &str) -> [[(f32, f32); 4]; 3] {
+        assert!(path.starts_with('M'));
+        let absolute_command = path.find('C').expect("absolute cubic command");
+        let relative_command = path[absolute_command + 1..]
+            .find('c')
+            .expect("relative cubic command")
+            + absolute_command
+            + 1;
+
+        let move_to = path_numbers(&path[1..absolute_command]);
+        let absolute = path_numbers(&path[absolute_command + 1..relative_command]);
+        // SVG repeats the previous command when another complete coordinate
+        // set follows, so one `c` encodes both remaining cubic segments here.
+        let relative = path_numbers(&path[relative_command + 1..]);
+        assert_eq!(move_to.len(), 2);
+        assert_eq!(absolute.len(), 6);
+        assert_eq!(relative.len(), 12);
+
+        let first = [
+            coordinate(&move_to, 0),
+            coordinate(&absolute, 0),
+            coordinate(&absolute, 2),
+            coordinate(&absolute, 4),
+        ];
+        let second = relative_curve(first[3], &relative[..6]);
+        let third = relative_curve(second[3], &relative[6..]);
+        [first, second, third]
+    }
+
+    fn sample_absolute_curves(
+        curves: [[(f32, f32); 4]; 3],
+        segments_per_curve: usize,
+    ) -> Vec<Pos2> {
+        let mut points = Vec::new();
+        for (curve_index, curve) in curves.into_iter().enumerate() {
+            for step in 0..=segments_per_curve {
+                if curve_index > 0 && step == 0 {
+                    continue;
+                }
+                let t = step as f32 / segments_per_curve as f32;
+                let inverse = 1.0 - t;
+                let weights = [
+                    inverse.powi(3),
+                    3.0 * inverse.powi(2) * t,
+                    3.0 * inverse * t.powi(2),
+                    t.powi(3),
+                ];
+                points.push(Pos2::new(
+                    curve
+                        .iter()
+                        .zip(weights)
+                        .map(|((x, _), weight)| x * weight)
+                        .sum(),
+                    curve
+                        .iter()
+                        .zip(weights)
+                        .map(|((_, y), weight)| y * weight)
+                        .sum(),
+                ));
+            }
+        }
+        points
     }
 
     fn assert_mark_geometry(svg: &str) {
@@ -288,16 +398,21 @@ mod tests {
             assert!(((y + height / 2.0) / 128.0 - 0.5).abs() <= f32::EPSILON);
         }
 
-        let actual = path_numbers(path_data(svg));
-        let expected = S_CURVES
-            .iter()
-            .enumerate()
-            .flat_map(|(curve_index, curve)| curve.iter().skip(usize::from(curve_index > 0)))
-            .flat_map(|(x, y)| [x * 128.0, y * 128.0])
-            .collect::<Vec<_>>();
-        assert_eq!(actual.len(), expected.len());
-        for (actual, expected) in actual.into_iter().zip(expected) {
-            assert!((actual - expected).abs() <= 0.06);
+        let actual = absolute_s_curves(path_data(svg));
+        for (actual_curve, expected_curve) in actual.into_iter().zip(S_CURVES) {
+            for ((actual_x, actual_y), (expected_x, expected_y)) in
+                actual_curve.into_iter().zip(expected_curve)
+            {
+                assert!((actual_x - expected_x * 128.0).abs() <= 0.0001);
+                assert!((actual_y - expected_y * 128.0).abs() <= 0.0001);
+            }
+        }
+        let native_points =
+            s_curve_points(Rect::from_min_max(Pos2::ZERO, Pos2::new(128.0, 128.0)), 10);
+        let canonical_points = sample_absolute_curves(actual, 10);
+        assert_eq!(native_points.len(), canonical_points.len());
+        for (native, canonical) in native_points.into_iter().zip(canonical_points) {
+            assert!(native.distance(canonical) <= 0.0001);
         }
         let path_start = svg.find("<path").unwrap();
         let path_end = svg[path_start..].find("/>").unwrap() + path_start + 2;
