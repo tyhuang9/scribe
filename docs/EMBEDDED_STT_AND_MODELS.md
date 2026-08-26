@@ -55,23 +55,33 @@ SessionCoordinator + LocalTranscriberApp
 TranscriptionService (runtime-neutral API)
         |
         v
-private RuntimeRouter -> bounded dedicated "scribe-native-runtime" worker
+InferenceWorkerSupervisor -> one persistent hidden STT child
+        |                    `--scribe-inference-worker`
+        |                    (private SCIF v3 stdin/stdout pipes)
+        v
+worker-local RuntimeRouter
         |
         +--> `.gguf` -> private EmbeddedRuntime -> safe `transcribe-cpp` 0.1.3 API
         |                       |
-        |                       +--> statically linked native CPU backend in-process
+        |                       +--> statically linked native CPU backend in the STT child
         |
         +--> legacy `.bin` -> private TranscribeCppRuntime -> C shim -> dynamically loaded whisper.dll
                                 |
-                                +--> hash-verified CPU ggml backend DLL selected in-process
+                                +--> hash-verified CPU ggml backend DLL selected in the STT child
         |
+        +--> validated ONNX bundle -> sherpa-onnx recognizer in the same STT child
+
+separate VAD child: `--scribe-vad-worker` (VAD only; not an STT runtime)
+
         v
 final Transcript -> overlay/history/output (only finalized text can paste)
 ```
 
-**Current fact:** `src/transcription.rs` owns the application-facing `TranscriptionService`, `SpeechEngine`, optional `StreamingSpeechEngine`, `SpeechStream`, normalized `Transcript`, `TranscriptionOptions`, `RuntimeCapabilities`, acceleration preference, and session/request correlation types. The architecture-guard tests prevent UI/application modules from naming `RuntimeRouter`, `TranscribeCppRuntime`, or model-family terms.
+**Current fact:** `src/transcription.rs` owns the application-facing `TranscriptionService`, `SpeechEngine`, optional `StreamingSpeechEngine`, `SpeechStream`, normalized `Transcript`, `TranscriptionOptions`, `RuntimeCapabilities`, acceleration preference, and session/request correlation types. In production, `TranscriptionService` owns the process supervisor and no native model/session/recognizer or FFI handle. The architecture-guard tests prevent UI/application modules from naming `RuntimeRouter`, `TranscribeCppRuntime`, or model-family terms, and fail if native construction escapes the marked worker-runtime modules.
 
-**Current fact:** `RuntimeRouter` is the only runtime selector and currently has exactly one private `RuntimeKind`: `TranscribeCpp`. The router serializes the native context with a mutex. `RuntimeWorker` uses a capacity-one synchronous command channel, performs native load/decode/unload on the named worker, and uses a lock-free cancellation generation. The model is retained for five minutes of inactivity (`WARM_MODEL_TTL`), unloaded after that timeout, on an explicit unload, or at shutdown. A failed native decode discards the context so the next request cannot be falsely reported as warm.
+**Current fact:** the persistent `--scribe-inference-worker` child is the only production owner of the worker-local router and native runtime state. It directly owns the GGUF `EmbeddedRuntime`, legacy GGML `TranscribeCppRuntime`, and sherpa-onnx recognizers. The separate `--scribe-vad-worker` instance owns VAD state and accepts only VAD controls. The supervisor uses framed SCIF v3 messages over private anonymous stdin/stdout pipes; it does not use localhost, HTTP, or another network transport. Native model/session/recognizer construction is limited to marked child-runtime modules.
+
+**Current fact:** the STT worker retains a loaded model for five minutes of inactivity (`WARM_MODEL_TTL`), unloads after that timeout, on an explicit unload, or at shutdown, and can be invalidated/restarted when cancellation or a native failure requires process recovery. A failed native decode discards the child-owned context so the next request cannot be falsely reported as warm. Normal GGUF remains local/native/Python-free, but it is process-isolated rather than in-process.
 
 **Current fact:** normal live text is not a claim of native streaming. The primary model capabilities say `native_streaming: false`; `Auto` and `Rolling` can run the bounded rolling *batch* preview scheduler in `src/streaming.rs`. The stabilizer emits committed and tentative text to the overlay, with session, request, model, and sequence correlation. Finalized text alone reaches output.
 
@@ -81,16 +91,25 @@ The distinction below is deliberate and must remain explicit in later reports.
 
 | Mechanism | Current role | Is it the default normalized dictation route? | Notes |
 | --- | --- | --- | --- |
-| Safe `transcribe-cpp` static CPU backend | In-process primary inference for the default trusted GGUF model | **Yes** | It has no downloaded runtime package, CLI, localhost service, or Python dependency. |
-| `whisper.dll` plus allowlisted `ggml*.dll` files | In-process compatibility inference for retained GGML models | **No** | A dynamically loaded native library is in-process; it is not a localhost service or sidecar process. |
+| Safe `transcribe-cpp` static CPU backend | Primary GGUF inference in the persistent STT child | **Yes** | It remains local/native and has no downloaded runtime package, CLI, localhost service, or Python dependency. |
+| `whisper.dll` plus allowlisted `ggml*.dll` files | Compatibility inference in the persistent STT child for retained GGML models | **No** | The native DLL is process-isolated with the other STT runtimes; it is not a localhost service. |
+| sherpa-onnx validated bundle | ONNX inference directly in the persistent STT child | **No** | The STT child owns the recognizer; it does not spawn a nested ONNX worker. |
 | `whisper-cli` | Compatibility fallback only after a native bootstrap/ABI/native-library-load failure and only after CLI hash verification | **No** | It is an external process, but it is not a server. It must be retired once packaged native bootstrap reliability has parity evidence. |
 | faster-whisper, Vosk, sherpa-onnx/Moonshine/Parakeet adapters | Private legacy configuration/artifact compatibility bridge | **No** | `src/stt/*` invokes short-lived processes; several require Python environments. They are retained migration debt, not normalized UI/service support. |
-| `--scribe-install-smoke` child mode | Isolated health/load/decode/unload/reload validation before activation | **No** | This is a bounded installer helper, not a dictation sidecar and not an inference server. |
+| `--scribe-install-smoke` child mode | Fresh disposable health/load/decode/unload/reload validation before activation | **No** | This process is intentionally separate from the persistent dictation worker and is discarded after the smoke. |
 | Local HTTP listeners | Test fixtures only | **No** | Loopback listeners in `src/installations.rs` are behind `#[cfg(test)]`; source inspection found no production STT listener, localhost setting, or health-polling client. |
 
-**Current default-path statement:** fresh Windows x64 profiles select the release-bundled `whisper_cpp_base_en` GGUF model and transcribe through the safe in-process Rust-owned adapter. Existing explicit selections are preserved. Scribe does not install or start a runtime package, Python, a localhost server, or an inference executable for this GGUF route. Retained GGML models still use the compatibility native package; CLI and process bridges remain non-default migration debt.
+**Current default-path statement:** fresh Windows x64 profiles select the release-bundled `whisper_cpp_base_en` GGUF model and transcribe through the safe Rust-owned adapter in the persistent `--scribe-inference-worker` child. Existing explicit selections are preserved. Scribe does not install or start a runtime package, Python, or localhost server for this GGUF route; the same executable is launched as the private worker process. Retained GGML models use the compatibility native package in that child. The verified legacy CLI remains an exceptional fallback after native bootstrap failure and hash verification; other legacy process bridges remain non-default migration debt.
 
-`README.md` still uses the phrase “bundled sidecar” in one requirements sentence. That wording does not accurately distinguish the in-process primary DLL from the compatibility CLI and should be corrected in a separate documentation-consistency change.
+`README.md` still uses the phrase “bundled sidecar” in one requirements sentence. That wording should be corrected in a separate documentation-consistency change; it does not change the private worker boundary described here.
+
+### Process boundary invariants
+
+- The desktop process owns UI/session coordination, microphone capture, bounded audio preparation, output, history, and the supervisor. It does not construct native GGUF/GGML/sherpa model objects, sessions, recognizers, or native FFI handles.
+- One persistent `--scribe-inference-worker` child directly owns the STT router and the GGUF, legacy GGML, and sherpa-onnx runtime state. It must not spawn a nested ONNX worker.
+- VAD uses a separate `--scribe-vad-worker` instance and role. VAD controls and STT controls are rejected across that role boundary.
+- STT and VAD use private anonymous stdin/stdout pipes with SCIF v3 framing. stdout carries protocol frames only; diagnostics use stderr. There is no localhost or network inference transport.
+- `--scribe-install-smoke` is a disposable validation process. It is not the persistent dictation worker and its success does not establish desktop-process native ownership.
 
 ## Runtime implementation and platform constraints
 
@@ -98,8 +117,9 @@ The distinction below is deliberate and must remain explicit in later reports.
 
 | Item | Current fact | Required follow-up / limitation |
 | --- | --- | --- |
-| Safe GGUF adapter | `src/embedded_runtime.rs` uses `transcribe-cpp = "=0.1.3"` directly, with `default-features = false`. It owns a retained `Model` and `Session`, initializes backends once, maps only owned neutral data above the private router, and has no application-owned `unsafe` code. | Current static build is CPU-only. `Gpu` requests fail explicitly until a packaged, smoke-tested GPU feature/backend is added. The fresh-profile `whisper_cpp_base_en` is a pinned trusted GGUF bundled beside the Windows x64 executable and does not require a runtime package. |
-| Legacy adapter | `src/runtime_router.rs`, `native/whisper_shim.c`, and vendored v1.9.1 headers implement the existing `.bin` route. Rust uses opaque native handles, copies callback text into owned `String`s, and confines FFI to the router. | It remains temporary compatibility code until catalog and packaging migration lets the safe GGUF route become the product default. |
+| Safe GGUF adapter | `src/embedded_runtime.rs` uses `transcribe-cpp = "=0.1.3"` directly, with `default-features = false`. The `Model` and `Session` are constructed and retained only in the persistent STT child; the desktop process receives owned neutral results and has no application-owned `unsafe` code. | Current static build is CPU-only. `Gpu` requests fail explicitly until a packaged, smoke-tested GPU feature/backend is added. The fresh-profile `whisper_cpp_base_en` is a pinned trusted GGUF bundled beside the Windows x64 executable and does not require a runtime package. |
+| sherpa-onnx adapter | The persistent STT child constructs validated `OfflineRecognizer`/`OnlineRecognizer` instances directly for ONNX bundles. | The child must not spawn a nested ONNX worker; legacy `src/stt/*` process bridges remain migration-only. |
+| Legacy adapter | `src/runtime_router.rs`, `native/whisper_shim.c`, and vendored v1.9.1 headers implement the existing `.bin` route inside the STT child. Rust uses opaque native handles, copies callback text into owned `String`s, and confines FFI to marked worker-runtime modules. | It remains temporary compatibility code until catalog and packaging migration lets the safe GGUF route become the product default. |
 | Native source/version | The primary package and vendored headers are whisper.cpp v1.9.1, commit `f049fff95a089aa9969deb009cdd4892b3e74916`. The package manifest identifies logical runtime `transcribe-cpp`. | This identifies the checked-in package, not a claim that a future `transcribe-cpp` crate wraps the same ABI. |
 | Runtime package | `runtime-manifests/whisper-cpp-v1.9.1-windows-x64.json` pins a 7,982,101-byte archive, archive SHA-256, 13 allowlisted files, individual sizes/hashes, native entrypoint, and compatibility CLI entrypoint. | Packaged-release smoke evidence remains platform-specific. |
 | Backend discovery | The package dynamically loads only the hash-verified CPU allowlist and selects the highest scored CPU backend. | Device enumeration and support beyond the packaged CPU profile are not proven by this record. |
@@ -167,7 +187,7 @@ Each artifact has a checked-in SHA-256 and is English, batch-capable, CPU-only, 
 | Compatibility `whisper-cli` | `runtime_router.rs` fallback verification; `stt/whisper_cpp.rs`; compatibility bridge | Remove default fallback once native bootstrap/package reliability meets parity; no user-facing runtime pairing. | Yes, non-default | Native package load, model load, decode, cancellation, restart, and package smoke are reliable on each supported target. |
 | faster-whisper Python runner | `stt/faster_whisper.rs`, `stt/mod.rs`, legacy catalog/runtime catalog | Curated primary-runtime artifact only if it passes the common contract; otherwise retire. | Yes, private migration bridge | Config/artifact migration plan and replacement evidence for affected users. |
 | Vosk Python runner | `stt/vosk.rs`, `stt/mod.rs`, legacy catalog/runtime catalog | Retire from normal product catalog. | Yes, private migration bridge | Explicit user migration/removal behavior; no remaining config path needs execution. |
-| sherpa/Moonshine/Parakeet runners | `stt/sherpa_onnx.rs`, `stt/mod.rs`, legacy catalog/runtime catalog | Retire unless a concrete, measured candidate earns an optional private compatibility handler. | Yes, private migration bridge | The complete benefit, lifecycle, cancellation, memory, platform, and compatibility gate passes—or the models are retired. |
+| sherpa/Moonshine/Parakeet runners | Validated sherpa-onnx inference is owned directly by the persistent STT child; `stt/sherpa_onnx.rs`, `stt/mod.rs`, and legacy catalog/runtime entries remain migration bridges | Keep the unified child route private while the legacy configuration paths are retired or migrated. | Yes, private migration bridge | The complete benefit, lifecycle, cancellation, memory, platform, and compatibility gate passes—or the legacy models are retired. |
 | Static model catalog and direct pinned downloads | `model_catalog.rs`, `managed_downloads.rs`, `installations.rs`, Models UI in `app.rs` | Rust `HuggingFaceCatalogService` plus curated overlay and trusted variant installer. | Yes, until catalog parity | Discovery, versioned cache/fallback, strict variant filtering, typed download resolution, dynamic validation/activation, persisted source pins, Use/Remove, and revision-aware update installation now exist. |
 | Legacy model-path validation | `config.rs` backend-name branches | Installed manifests and runtime-derived capability validation. | Yes | Imported and managed artifacts can be classified without application-level backend branching. |
 | Runtime package installer | `runtime_catalog.rs`, `managed_downloads.rs`, `installations.rs` | Retain only as app-packaged native dependency distribution; never install a Python or arbitrary executable through the model installer. | Yes for primary package | Per-platform self-contained package tests and removal of legacy runtime-pack UI. |
@@ -238,8 +258,8 @@ The safe adapter was built with the Visual Studio 2022 C++ environment and its V
 | `disk_space::tests` and `installations::tests::disk_space_preflight_accounts_for_resumable_partial_bytes` | PASS: model-download preflight keeps a 1 GiB reserve, fails closed for probe/overflow errors, and accounts for retained resumable or oversized partial bytes without touching them. |
 | `cargo build --release --all-features` | PASS with the Visual Studio 2022 developer environment and its Windows-native CMake executable. |
 | `embedded_runtime::compatible_gguf_loads_and_reports_runtime_capabilities` | PASS with a local trusted fixture; the safe wrapper reported strict CPU backend. |
-| `embedded_runtime::compatible_gguf_transcribes_canonical_audio_in_process` | PASS with a local trusted fixture and canonical WAV input; no CLI, server, or external inference process was started. |
-| Release app installation smoke, `--scribe-install-smoke whisper_cpp_tiny_en <fixture> - cpu` | PASS: safe model health/load/decode/reload completed in 111/39/212/119 ms with strict CPU and no runtime package root. |
+| `embedded_runtime::compatible_gguf_transcribes_canonical_audio_in_process` | PASS as a historical adapter-level unit test with a local trusted fixture and canonical WAV input. It predates the process-isolated production route and is not evidence that the desktop process constructs native inference state. |
+| Release app installation smoke, `--scribe-install-smoke whisper_cpp_tiny_en <fixture> - cpu` | PASS as a disposable child-process smoke: safe model health/load/decode/reload completed in 111/39/212/119 ms with strict CPU and no runtime package root. The smoke process is discarded after validation. |
 
 The tested model fixture was `handy-computer/whisper-tiny.en-gguf` at revision `becb8bcb804405dc97b380a523d9975888820986`, file `whisper-tiny.en-Q4_K_M.gguf`, 43,545,248 bytes, SHA-256 `3bfa6200aa12a21409445401f7871b5c733546dc45a29eb4871fcb3c7954e08b`. This same pin is now the checked-in default catalog artifact; the fixture remains separate local test evidence rather than an installed user artifact.
 
@@ -255,6 +275,6 @@ The tested model fixture was `handy-computer/whisper-tiny.en-gguf` at revision `
 
 ## Current conclusion
 
-Scribe now has a real safe, in-process `transcribe-cpp` 0.1.3 GGUF default with retained model/session lifecycle, bounded-worker routing, cancellation, explicit option/acceleration errors, and isolated install-smoke evidence. Its installer does not stage a runtime archive for GGUF and atomically persists an installed-model provenance record with observed architecture and capabilities. Trusted backend discovery/cache, strict variant resolution, destination-volume preflight, and Rust-native Models-page catalog cards can now install, validate, activate, use, update, and remove typed dynamic GGUF variants. Users can also validate and reference an external local GGUF without Scribe copying or deleting it; its locally observed fingerprint is kept distinct from trusted remote provenance. macOS/Linux packages, richer dynamic-card operation state, and legacy-process retirement remain incomplete.
+Scribe now has a process-isolated safe `transcribe-cpp` 0.1.3 GGUF route with retained model/session lifecycle, bounded-worker routing, cancellation, explicit option/acceleration errors, and disposable install-smoke evidence. The persistent STT child also directly owns validated sherpa-onnx and legacy GGML compatibility state; the separate VAD child has its own role and process. The desktop process constructs no native model/session/recognizer or FFI state. Its installer does not stage a runtime archive for GGUF and atomically persists an installed-model provenance record with observed architecture and capabilities. Trusted backend discovery/cache, strict variant resolution, destination-volume preflight, and Rust-native Models-page catalog cards can now install, validate, activate, use, update, and remove typed dynamic GGUF variants. Users can also validate and reference an external local GGUF without Scribe copying or deleting it; its locally observed fingerprint is kept distinct from trusted remote provenance. macOS/Linux packages, richer dynamic-card operation state, and legacy-process retirement remain incomplete.
 
 No statement in this record promotes those planned capabilities, the four Experimental models, or platform packaging to Supported status without the required evidence.
