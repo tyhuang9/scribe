@@ -30,6 +30,7 @@ pub use settings::{
 };
 
 pub const MAX_RECORDING_SECONDS: u32 = 600;
+pub(crate) const RECORDING_CAPTURE_SAFETY_ALLOWANCE_SECONDS: u32 = 2;
 pub const MAX_HISTORY_ENTRIES: u32 = 1_000;
 pub const MAX_HISTORY_RETENTION_DAYS: u32 = 3_650;
 

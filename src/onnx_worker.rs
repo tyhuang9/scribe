@@ -23,6 +23,7 @@ use sherpa_onnx::{
     OnlineRecognizerConfig, OnlineStream, OnlineTransducerModelConfig,
 };
 
+use crate::config;
 use crate::model_catalog::ArtifactFormat;
 use crate::prepared_audio::{PREPARED_SAMPLE_RATE, PreparedAudio};
 use crate::runtime_router::{
@@ -51,8 +52,8 @@ const PARENT_LIVENESS_ENV: &str = "SCRIBE_PRIVATE_PARENT_LIVENESS";
 const PARENT_CONTROL_CANCEL: u8 = b'C';
 const HEADER_LEN: usize = 26;
 const MAX_CONTROL_BYTES: usize = 256 * 1024;
-const MAX_AUDIO_BYTES: usize = 16 * 1024 * 1024;
-const MAX_AUDIO_SAMPLES: usize = MAX_AUDIO_BYTES / size_of::<f32>();
+const MAX_PCM_FRAME_BYTES: usize = 16 * 1024 * 1024;
+const MAX_PCM_FRAME_SAMPLES: usize = MAX_PCM_FRAME_BYTES / size_of::<f32>();
 const MAX_TRANSCRIPT_TEXT_BYTES: usize = 96 * 1024;
 const MAX_TRANSCRIPT_SEGMENTS: usize = 1024;
 const MAX_SEGMENT_TEXT_BYTES: usize = 8 * 1024;
@@ -420,7 +421,7 @@ struct Frame {
 fn write_frame(writer: &mut impl Write, frame: &Frame) -> Result<()> {
     let limit = match frame.kind {
         FrameKind::Control => MAX_CONTROL_BYTES,
-        FrameKind::Pcm => MAX_AUDIO_BYTES,
+        FrameKind::Pcm => MAX_PCM_FRAME_BYTES,
     };
     if frame.body.len() > limit {
         bail!("worker frame exceeds {limit}-byte limit");
@@ -448,7 +449,7 @@ fn read_frame(reader: &mut impl Read) -> Result<Frame> {
     let body_len = u32::from_le_bytes(header[6..10].try_into().unwrap()) as usize;
     let limit = match kind {
         FrameKind::Control => MAX_CONTROL_BYTES,
-        FrameKind::Pcm => MAX_AUDIO_BYTES,
+        FrameKind::Pcm => MAX_PCM_FRAME_BYTES,
     };
     if body_len > limit {
         bail!("ONNX worker frame body exceeds {limit}-byte limit");
@@ -478,8 +479,8 @@ fn decode_pcm(body: &[u8]) -> Result<Vec<f32>> {
     if !body.len().is_multiple_of(size_of::<f32>()) {
         bail!("ONNX PCM byte length must be a multiple of four");
     }
-    if body.len() > MAX_AUDIO_BYTES {
-        bail!("ONNX PCM exceeds the {MAX_AUDIO_BYTES}-byte limit");
+    if body.len() > MAX_PCM_FRAME_BYTES {
+        bail!("ONNX PCM frame exceeds the {MAX_PCM_FRAME_BYTES}-byte limit");
     }
     let samples = body
         .chunks_exact(size_of::<f32>())
@@ -493,8 +494,8 @@ fn validate_pcm_samples(samples: &[f32]) -> Result<()> {
     if samples.is_empty() {
         bail!("ONNX PCM must contain at least one sample");
     }
-    if samples.len() > MAX_AUDIO_SAMPLES {
-        bail!("ONNX PCM exceeds the {MAX_AUDIO_BYTES}-byte limit");
+    if samples.len() > MAX_PCM_FRAME_SAMPLES {
+        bail!("ONNX PCM frame exceeds the {MAX_PCM_FRAME_BYTES}-byte limit");
     }
     if let Some((index, sample)) = samples
         .iter()
@@ -505,6 +506,62 @@ fn validate_pcm_samples(samples: &[f32]) -> Result<()> {
         bail!("ONNX PCM sample {index} is non-finite or outside [-1, 1]: {sample}");
     }
     Ok(())
+}
+
+fn prepared_sample_count_for_seconds(seconds: u32) -> Result<usize> {
+    usize::try_from(seconds)
+        .ok()
+        .and_then(|seconds| seconds.checked_mul(PREPARED_SAMPLE_RATE as usize))
+        .ok_or_else(|| anyhow!("prepared-audio duration exceeds addressable sample count"))
+}
+
+fn max_cumulative_audio_samples() -> Result<usize> {
+    config::MAX_RECORDING_SECONDS
+        .checked_add(config::RECORDING_CAPTURE_SAFETY_ALLOWANCE_SECONDS)
+        .ok_or_else(|| anyhow!("recording duration plus capture allowance overflowed"))
+        .and_then(prepared_sample_count_for_seconds)
+}
+
+fn validate_cumulative_sample_count(sample_count: usize) -> Result<()> {
+    if sample_count == 0 {
+        bail!("runtime audio must contain at least one sample");
+    }
+    let limit = max_cumulative_audio_samples()?;
+    if sample_count > limit {
+        bail!("runtime audio exceeds the {limit}-sample cumulative limit");
+    }
+    Ok(())
+}
+
+fn checked_cumulative_sample_count(current: usize, incoming: usize) -> Result<usize> {
+    let next = current
+        .checked_add(incoming)
+        .ok_or_else(|| anyhow!("runtime audio sample count overflowed"))?;
+    validate_cumulative_sample_count(next)?;
+    Ok(next)
+}
+
+fn validate_cumulative_pcm_samples(samples: &[f32]) -> Result<()> {
+    validate_cumulative_sample_count(samples.len())?;
+    if let Some((index, sample)) = samples
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, sample)| !sample.is_finite() || !(-1.0..=1.0).contains(sample))
+    {
+        bail!("runtime PCM sample {index} is non-finite or outside [-1, 1]: {sample}");
+    }
+    Ok(())
+}
+
+fn reserve_batch_samples(declared_samples: usize) -> Result<Vec<f32>> {
+    let mut samples = Vec::new();
+    samples.try_reserve_exact(declared_samples).map_err(|_| {
+        anyhow::Error::new(RuntimeError::Engine(
+            "runtime batch could not reserve its declared bounded audio buffer".to_owned(),
+        ))
+    })?;
+    Ok(samples)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -3473,7 +3530,7 @@ impl InferenceWorkerSupervisor {
                 "transcription request was cancelled before inference dispatch".to_owned(),
             ));
         }
-        validate_pcm_samples(&audio.samples).map_err(worker_unavailable)?;
+        validate_cumulative_pcm_samples(&audio.samples).map_err(worker_unavailable)?;
         let generation = self
             .transport
             .ensure_generation()
@@ -3998,9 +4055,8 @@ fn worker_loop_with_factories<F: WorkerRecognizerFactory, V: WorkerVadFactory>(
                     if active_stream.is_some() || loaded_vad.is_some() {
                         bail!("cannot begin a runtime batch while a stream is active");
                     }
-                    if declared_samples == 0 || declared_samples > MAX_AUDIO_SAMPLES {
-                        bail!("runtime batch declared an invalid sample count");
-                    }
+                    validate_cumulative_sample_count(declared_samples)?;
+                    let samples = reserve_batch_samples(declared_samples)?;
                     let load = load_worker_runtime(
                         &runtime_router,
                         factory,
@@ -4022,7 +4078,7 @@ fn worker_loop_with_factories<F: WorkerRecognizerFactory, V: WorkerVadFactory>(
                         source_channels,
                         source_frames,
                         load,
-                        samples: Vec::new(),
+                        samples,
                     });
                     Ok(Control::Ok)
                 })();
@@ -4183,14 +4239,11 @@ fn worker_loop_with_factories<F: WorkerRecognizerFactory, V: WorkerVadFactory>(
                         if request_id <= batch.last_request_id {
                             bail!("runtime batch audio request is stale");
                         }
-                        let next_len = batch
-                            .samples
-                            .len()
-                            .checked_add(samples.len())
-                            .ok_or_else(|| anyhow!("runtime batch sample count overflowed"))?;
-                        if next_len > MAX_AUDIO_SAMPLES {
+                        let next_len =
+                            checked_cumulative_sample_count(batch.samples.len(), samples.len())?;
+                        if next_len > batch.declared_samples {
                             pending_batch = None;
-                            bail!("runtime batch exceeds the {MAX_AUDIO_BYTES}-byte limit");
+                            bail!("runtime batch received more samples than it declared");
                         }
                         batch.samples.extend_from_slice(&samples);
                         batch.last_request_id = request_id;
@@ -4513,7 +4566,7 @@ fn execute_worker_batch<R: WorkerRecognizer>(
     loaded_runtime: Option<&LoadedRuntimeMetadata>,
     batch: PendingWorkerBatch,
 ) -> Result<WireRuntimeExecution> {
-    validate_pcm_samples(&batch.samples)?;
+    validate_cumulative_pcm_samples(&batch.samples)?;
     let loaded = loaded_runtime.ok_or_else(|| anyhow!("no runtime model is loaded"))?;
     if loaded.identity != wire_artifact_identity(&batch.artifact, batch.preference)?
         || loaded.artifact != batch.artifact
@@ -4589,20 +4642,22 @@ fn handle_audio_chunk<R: WorkerRecognizer>(
     if recognizer.family != OnnxModelFamily::OnlineTransducer {
         bail!("streaming requires an online ONNX transducer");
     }
-    let stream = active_stream
-        .as_mut()
+    let current = active_stream
+        .as_ref()
         .ok_or_else(|| anyhow!("no ONNX stream is active"))?;
-    if stream.session_id != session_id {
+    if current.session_id != session_id {
         bail!("ONNX stream belongs to a different session");
     }
-    let Some(sample_count) = stream.sample_count.checked_add(samples.len()) else {
-        *active_stream = None;
-        bail!("ONNX stream sample count overflowed");
+    let sample_count = match checked_cumulative_sample_count(current.sample_count, samples.len()) {
+        Ok(sample_count) => sample_count,
+        Err(error) => {
+            *active_stream = None;
+            return Err(error);
+        }
     };
-    if sample_count > MAX_AUDIO_SAMPLES {
-        *active_stream = None;
-        bail!("ONNX stream exceeds the {MAX_AUDIO_BYTES}-byte cumulative limit");
-    }
+    let stream = active_stream
+        .as_mut()
+        .expect("stream existence was validated before cumulative accounting");
     let result = recognizer
         .recognizer
         .accept_chunk(&mut stream.stream, samples)
@@ -8403,7 +8458,7 @@ mod tests {
             raw_header(
                 PROTOCOL_VERSION,
                 FrameKind::Pcm as u8,
-                (MAX_AUDIO_BYTES + 1) as u32,
+                (MAX_PCM_FRAME_BYTES + 1) as u32,
             ),
         ] {
             assert!(read_frame(&mut Cursor::new(bytes)).is_err());
@@ -8590,11 +8645,55 @@ mod tests {
                 "decoded {invalid}"
             );
         }
-        assert!(validate_pcm_samples(&vec![0.0; MAX_AUDIO_SAMPLES + 1]).is_err());
+        assert!(validate_cumulative_sample_count(usize::MAX).is_err());
 
         let samples = [-1.0, -0.25, 0.0, 0.25, 1.0];
         let encoded = encode_pcm(&samples).unwrap();
         assert_eq!(decode_pcm(&encoded).unwrap(), samples);
+    }
+
+    #[test]
+    fn frame_and_cumulative_pcm_limits_cover_full_recording_duration_without_allocation() {
+        let seconds_262 = prepared_sample_count_for_seconds(262).unwrap();
+        let seconds_263 = prepared_sample_count_for_seconds(263).unwrap();
+        let seconds_600 = prepared_sample_count_for_seconds(600).unwrap();
+        let cumulative_limit = max_cumulative_audio_samples().unwrap();
+
+        assert!(seconds_262 <= MAX_PCM_FRAME_SAMPLES);
+        assert!(seconds_263 > MAX_PCM_FRAME_SAMPLES);
+        assert!(validate_cumulative_sample_count(seconds_262).is_ok());
+        assert!(validate_cumulative_sample_count(seconds_263).is_ok());
+        assert!(validate_cumulative_sample_count(seconds_600).is_ok());
+        assert_eq!(
+            cumulative_limit,
+            prepared_sample_count_for_seconds(
+                config::MAX_RECORDING_SECONDS + config::RECORDING_CAPTURE_SAFETY_ALLOWANCE_SECONDS
+            )
+            .unwrap()
+        );
+        assert!(validate_cumulative_sample_count(cumulative_limit).is_ok());
+        assert!(validate_cumulative_sample_count(cumulative_limit + 1).is_err());
+    }
+
+    #[test]
+    fn stream_cumulative_accounting_accepts_the_limit_and_rejects_overflow() {
+        let limit = max_cumulative_audio_samples().unwrap();
+        assert_eq!(
+            checked_cumulative_sample_count(limit - 1, 1).unwrap(),
+            limit
+        );
+        assert!(checked_cumulative_sample_count(limit, 1).is_err());
+        assert!(checked_cumulative_sample_count(usize::MAX, 1).is_err());
+    }
+
+    #[test]
+    fn batch_reservation_failure_is_a_bounded_typed_runtime_error() {
+        let error = reserve_batch_samples(usize::MAX).unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<RuntimeError>(),
+            Some(RuntimeError::Engine(message))
+                if message == "runtime batch could not reserve its declared bounded audio buffer"
+        ));
     }
 
     #[test]
