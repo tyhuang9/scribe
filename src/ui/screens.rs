@@ -2,6 +2,9 @@
 
 use std::{collections::HashSet, path::Path};
 
+#[cfg(test)]
+use std::collections::HashMap;
+
 use eframe::egui::{
     self, Align, Align2, Color32, ComboBox, Frame, Layout, Margin, RichText, Rounding, ScrollArea,
     Sense, Stroke, Vec2,
@@ -12409,8 +12412,12 @@ mod tests {
                                         playing: None,
                                         playback_stopping: false,
                                         armed_repaste,
+                                        model_names: &HashMap::new(),
+                                        expanded_transcripts: &HashSet::new(),
+                                        expanded_details: &HashSet::new(),
                                         focus_search: false,
                                         focus_delete_confirmation: false,
+                                        focus_more_action: None,
                                     },
                                 );
                             },
@@ -12476,8 +12483,12 @@ mod tests {
                                             playing: None,
                                             playback_stopping: false,
                                             armed_repaste: None,
+                                            model_names: &HashMap::new(),
+                                            expanded_transcripts: &HashSet::new(),
+                                            expanded_details: &HashSet::new(),
                                             focus_search,
                                             focus_delete_confirmation: false,
+                                            focus_more_action: None,
                                         },
                                     );
                                 },
