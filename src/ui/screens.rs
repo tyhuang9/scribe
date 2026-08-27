@@ -2321,7 +2321,8 @@ fn collapsed_local_model_facts(card: ModelCard<'_>) -> Option<&'static str> {
 }
 
 fn render_collapsed_local_model_facts(ui: &mut egui::Ui, card: ModelCard<'_>, expanded: bool) {
-    if !expanded && let Some(facts) = collapsed_local_model_facts(card) {
+    let _ = expanded;
+    if let Some(facts) = collapsed_local_model_facts(card) {
         let colors = ui_palette(ui);
         ui.horizontal(|ui| {
             for fact in facts.split(" · ") {
@@ -2343,16 +2344,14 @@ fn render_collapsed_local_model_facts(ui: &mut egui::Ui, card: ModelCard<'_>, ex
 }
 
 fn model_card_accessible_description(card: ModelCard<'_>, expanded: bool) -> Option<String> {
+    let _ = expanded;
     let description = match card {
         ModelCard::Local(model) if model.included && model.installed && model.ready => {
             Some("Installed with Scribe; this model cannot be removed.".to_owned())
         }
         _ => model_download_progress_presentation(card).map(|progress| progress.accessible_text),
     };
-    match (
-        description,
-        collapsed_local_model_facts(card).filter(|_| !expanded),
-    ) {
+    match (description, collapsed_local_model_facts(card)) {
         (Some(description), Some(facts)) => Some(format!("{description}. {facts}")),
         (None, Some(facts)) => Some(facts.to_owned()),
         (description, None) => description,
@@ -9069,7 +9068,10 @@ mod tests {
             model_card_accessible_description(ModelCard::Local(&moonshine), false).as_deref(),
             Some("Experimental · CPU only · Final text only")
         );
-        assert!(model_card_accessible_description(ModelCard::Local(&moonshine), true).is_none());
+        assert_eq!(
+            model_card_accessible_description(ModelCard::Local(&moonshine), true).as_deref(),
+            Some("Experimental · CPU only · Final text only")
+        );
         let presentation = model_lifecycle_presentation(ModelCard::Local(&moonshine), true);
         assert_eq!(presentation.label, "Repair");
         assert_eq!(presentation.visible_status.as_deref(), Some("Needs repair"));

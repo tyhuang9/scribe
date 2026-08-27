@@ -1200,6 +1200,7 @@ enum AppEvent {
     OnnxBundleInstallFinished {
         job_id: u64,
         model_id: String,
+        paused: bool,
         result: Result<InstallSmoke, String>,
     },
     CaptureReady {
@@ -6426,6 +6427,7 @@ impl LocalTranscriberApp {
                 AppEvent::OnnxBundleInstallFinished {
                     job_id,
                     model_id,
+                    paused,
                     result,
                 } => {
                     if self.onnx_bundle_install.as_ref().is_none_or(
@@ -6452,7 +6454,6 @@ impl LocalTranscriberApp {
                             self.rebuild_local_models_after_committed_change();
                         }
                         Err(message) => {
-                            let paused = message.to_ascii_lowercase().contains("cancel");
                             self.model_downloads.insert(
                                 model_id,
                                 ModelInstallStatus::Error(if paused {
@@ -8580,9 +8581,14 @@ impl LocalTranscriberApp {
                             .map_err(|error| error.to_string())?;
                         Ok(smoke)
                     });
+                    // Only a failed operation observes pause. Once activation
+                    // commits, a late cancellation signal cannot relabel the
+                    // successful installation as paused.
+                    let paused = result.is_err() && cancellation.is_cancelled();
                     let _ = tx.send(AppEvent::OnnxBundleInstallFinished {
                         job_id,
                         model_id: event_model_id,
+                        paused,
                         result,
                     });
                 });
@@ -25793,6 +25799,43 @@ mod layout_tests {
         assert_eq!(view.download_state, ModelDownloadState::Downloading);
         assert_eq!(view.downloaded_bytes, 17);
         assert!(view.cancel_supported);
+    }
+
+    #[test]
+    fn onnx_completion_uses_typed_pause_truth_not_error_text() {
+        let mut app = test_app();
+        let model_id = "moonshine-tiny-en-int8-onnx".to_owned();
+        app.onnx_bundle_install = Some((51, model_id.clone(), InstallCancellation::default()));
+        app.tx
+            .send(AppEvent::OnnxBundleInstallFinished {
+                job_id: 51,
+                model_id: model_id.clone(),
+                paused: false,
+                result: Err("decoder reported cancellation-shaped metadata".to_owned()),
+            })
+            .unwrap();
+        app.poll_events();
+        assert!(matches!(app.status, TranscriptionStatus::Error));
+        assert!(
+            app.status_message
+                .starts_with("ONNX model installation failed:")
+        );
+
+        app.onnx_bundle_install = Some((52, model_id.clone(), InstallCancellation::default()));
+        app.tx
+            .send(AppEvent::OnnxBundleInstallFinished {
+                job_id: 52,
+                model_id,
+                paused: true,
+                result: Err("transfer stopped".to_owned()),
+            })
+            .unwrap();
+        app.poll_events();
+        assert!(matches!(app.status, TranscriptionStatus::Idle));
+        assert!(
+            app.status_message
+                .starts_with("Paused ONNX model download.")
+        );
     }
 
     #[test]
