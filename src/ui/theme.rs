@@ -194,6 +194,87 @@ impl ThemePalette {
             _ => self.meter_rating_5,
         }
     }
+
+    /// Build the complete egui visual contract for Scribe. Keeping this recipe
+    /// beside the semantic palette prevents production and deterministic UI
+    /// fixtures from drifting back to egui's stock gray/blue interaction states.
+    pub(crate) fn visuals(dark_mode: bool) -> egui::Visuals {
+        let mut visuals = if dark_mode {
+            egui::Visuals::dark()
+        } else {
+            egui::Visuals::light()
+        };
+        let colors = if dark_mode {
+            Self::dark()
+        } else {
+            Self::light()
+        };
+
+        visuals.override_text_color = Some(colors.text);
+        visuals.selection.bg_fill = colors.selection_fill;
+        visuals.selection.stroke = egui::Stroke::new(1.0, colors.selection_text);
+        visuals.hyperlink_color = colors.accent;
+        visuals.faint_bg_color = colors.disabled_bg;
+        visuals.extreme_bg_color = colors.panel_bg;
+        visuals.code_bg_color = colors.panel_bg;
+        visuals.warn_fg_color = colors.warning;
+        visuals.error_fg_color = colors.error_text;
+        visuals.panel_fill = colors.content_bg;
+        visuals.window_fill = colors.card_bg;
+        visuals.window_stroke = egui::Stroke::new(1.0, colors.border);
+        visuals.window_shadow.color = brand_shadow(colors.primary, 42);
+        visuals.popup_shadow.color = brand_shadow(colors.primary, 56);
+        visuals.text_cursor = egui::Stroke::new(2.0, colors.accent);
+        visuals.interact_cursor = Some(egui::CursorIcon::PointingHand);
+
+        let rounding = egui::Rounding::same(6.0);
+        visuals.widgets.noninteractive = egui::style::WidgetVisuals {
+            bg_fill: colors.card_bg,
+            weak_bg_fill: colors.panel_bg,
+            bg_stroke: egui::Stroke::new(1.0, colors.border),
+            rounding,
+            fg_stroke: egui::Stroke::new(1.0, colors.text),
+            expansion: 0.0,
+        };
+        visuals.widgets.inactive = egui::style::WidgetVisuals {
+            bg_fill: colors.card_bg,
+            weak_bg_fill: colors.panel_bg,
+            bg_stroke: egui::Stroke::new(1.0, colors.control_border),
+            rounding,
+            fg_stroke: egui::Stroke::new(1.0, colors.text),
+            expansion: 0.0,
+        };
+        visuals.widgets.hovered = egui::style::WidgetVisuals {
+            bg_fill: colors.active_card_bg,
+            weak_bg_fill: colors.active_card_bg,
+            bg_stroke: egui::Stroke::new(1.5, colors.border_strong),
+            rounding,
+            fg_stroke: egui::Stroke::new(1.5, colors.text),
+            expansion: 0.0,
+        };
+        visuals.widgets.active = egui::style::WidgetVisuals {
+            bg_fill: colors.active_card_bg,
+            weak_bg_fill: colors.active_card_bg,
+            bg_stroke: egui::Stroke::new(1.5, colors.accent),
+            rounding,
+            fg_stroke: egui::Stroke::new(1.5, colors.text),
+            expansion: 0.0,
+        };
+        visuals.widgets.open = egui::style::WidgetVisuals {
+            bg_fill: colors.active_card_bg,
+            weak_bg_fill: colors.active_card_bg,
+            bg_stroke: egui::Stroke::new(1.5, colors.accent),
+            rounding,
+            fg_stroke: egui::Stroke::new(1.5, colors.text),
+            expansion: 0.0,
+        };
+
+        visuals
+    }
+}
+
+fn brand_shadow(color: Color32, alpha: u8) -> Color32 {
+    Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha)
 }
 
 pub(crate) fn theme_palette(ctx: &egui::Context) -> ThemePalette {
@@ -336,6 +417,68 @@ mod tests {
             assert!(
                 contrast_ratio(palette.inverse_neutral_text, palette.inverse_neutral_bg) >= 4.5
             );
+        }
+    }
+
+    #[test]
+    fn complete_visuals_recipe_uses_brand_tokens_for_every_widget_state() {
+        for (dark_mode, palette) in [(false, ThemePalette::light()), (true, ThemePalette::dark())] {
+            let visuals = ThemePalette::visuals(dark_mode);
+
+            assert_eq!(visuals.dark_mode, dark_mode);
+            assert_eq!(visuals.panel_fill, palette.content_bg);
+            assert_eq!(visuals.window_fill, palette.card_bg);
+            assert_eq!(visuals.window_stroke.color, palette.border);
+            assert_eq!(visuals.selection.bg_fill, palette.selection_fill);
+            assert_eq!(visuals.selection.stroke.color, palette.selection_text);
+            assert_eq!(visuals.text_cursor.color, palette.accent);
+            assert_eq!(
+                visuals.interact_cursor,
+                Some(egui::CursorIcon::PointingHand)
+            );
+
+            let states = [
+                visuals.widgets.noninteractive,
+                visuals.widgets.inactive,
+                visuals.widgets.hovered,
+                visuals.widgets.active,
+                visuals.widgets.open,
+            ];
+            assert!(
+                states
+                    .iter()
+                    .all(|state| state.fg_stroke.color == palette.text)
+            );
+            assert_eq!(
+                visuals.widgets.noninteractive.weak_bg_fill,
+                palette.panel_bg
+            );
+            assert_eq!(visuals.widgets.inactive.weak_bg_fill, palette.panel_bg);
+            for state in [
+                visuals.widgets.hovered,
+                visuals.widgets.active,
+                visuals.widgets.open,
+            ] {
+                assert_eq!(state.bg_fill, palette.active_card_bg);
+                assert_eq!(state.weak_bg_fill, palette.active_card_bg);
+            }
+        }
+    }
+
+    #[test]
+    fn interactive_visuals_preserve_text_and_boundary_contrast() {
+        for (dark_mode, palette) in [(false, ThemePalette::light()), (true, ThemePalette::dark())] {
+            let visuals = ThemePalette::visuals(dark_mode);
+            for state in [
+                visuals.widgets.inactive,
+                visuals.widgets.hovered,
+                visuals.widgets.active,
+                visuals.widgets.open,
+            ] {
+                assert!(contrast_ratio(state.fg_stroke.color, state.bg_fill) >= 4.5);
+                assert!(contrast_ratio(state.bg_stroke.color, palette.card_bg) >= 3.0);
+            }
+            assert!(contrast_ratio(visuals.text_cursor.color, palette.card_bg) >= 3.0);
         }
     }
 

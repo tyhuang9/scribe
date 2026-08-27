@@ -13947,25 +13947,7 @@ fn resolve_theme_mode(theme_mode: ThemeMode, system_theme: Option<eframe::Theme>
 }
 
 fn stitch_visuals(theme_mode: ThemeMode) -> egui::Visuals {
-    let mut visuals = match theme_mode {
-        ThemeMode::Dark => egui::Visuals::dark(),
-        ThemeMode::Light | ThemeMode::System => egui::Visuals::light(),
-    };
-    let colors = ThemePalette::from_visuals(&visuals);
-    visuals.override_text_color = Some(colors.text);
-    visuals.selection.bg_fill = colors.selection_fill;
-    visuals.selection.stroke = Stroke::new(1.0, colors.selection_text);
-    visuals.hyperlink_color = colors.accent;
-    visuals.panel_fill = colors.content_bg;
-    visuals.window_fill = colors.card_bg;
-    visuals.extreme_bg_color = colors.panel_bg;
-    visuals.widgets.noninteractive.bg_fill = colors.card_bg;
-    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, colors.border);
-    visuals.widgets.inactive.bg_fill = colors.card_bg;
-    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, colors.control_border);
-    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, colors.border_strong);
-    visuals.widgets.active.bg_stroke = Stroke::new(1.0, colors.accent);
-    visuals
+    ThemePalette::visuals(matches!(theme_mode, ThemeMode::Dark))
 }
 
 #[cfg(test)]

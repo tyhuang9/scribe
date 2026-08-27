@@ -9,6 +9,7 @@ Run a fixture in a debug build:
 ```powershell
 $env:SCRIBE_UI_HARNESS = 'models/card-expanded'
 $env:SCRIBE_UI_HARNESS_VIEWPORT = '1180x815'
+$env:SCRIBE_UI_HARNESS_THEME = 'light'
 cargo run --features ui-harness
 ```
 
@@ -16,6 +17,13 @@ Unknown fixture names fail closed to normal application startup. The harness
 freezes timers, relative time, and sample metadata for repeatable screenshots.
 The visual references in `docs/ui-reference/` are documentation-only and are
 not runtime assets.
+
+Set `SCRIBE_UI_HARNESS_THEME` to exactly `light` or `dark` to render ordinary
+fixtures with the corresponding production Scribe theme. When it is unset or
+invalid, the harness defaults deterministically to light. The four overlay
+fixtures keep the explicit theme encoded in their route name. The sidebar theme
+toggle updates the harness visuals immediately, using the same complete egui
+visual recipe as the production application.
 
 ## Fixture routes
 
