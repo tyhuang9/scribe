@@ -201,7 +201,7 @@ final result: passed
 - Brand source: `%TEMP%\codex-clipboard-9f363fa0-574a-4347-a370-81196cd258b3.png` (original supplied attachment).
 - Light native capture: `design-qa-evidence/branding/native-light.png`.
 - Dark native capture: `design-qa-evidence/branding/native-dark.png`.
-- Frozen implementation head: `90f84ec` (`Strengthen Scribe navigation lockup`).
+- Reviewed branding correction baseline: `30e0185` (`Validate distinct canonical lockup contracts`).
 
 The source board and both native captures were opened together at original
 resolution. The captured fixture is `transcribe/listening` with the full
