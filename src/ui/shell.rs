@@ -375,7 +375,7 @@ fn active_model_button(
 
 fn brand(ui: &mut egui::Ui, mode: NavigationMode, text: Color32, _muted: Color32) {
     ui.horizontal(|ui| {
-        branding::show_app_icon(ui, 34.0, mode == NavigationMode::Compact);
+        branding::show_app_icon(ui, 44.0, mode == NavigationMode::Compact);
         if mode == NavigationMode::Full {
             ui.add_space(6.0);
             let heading = ui.label(
