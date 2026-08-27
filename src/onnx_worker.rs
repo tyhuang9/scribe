@@ -26,9 +26,10 @@ use sherpa_onnx::{
 use crate::config;
 use crate::model_catalog::ArtifactFormat;
 use crate::prepared_audio::{PREPARED_SAMPLE_RATE, PreparedAudio};
+use crate::runtime_artifact::RuntimeArtifact;
 use crate::runtime_router::{
-    NativeBootstrapFailure, NativeRuntimeDiagnostics, RuntimeArtifact, RuntimeError,
-    RuntimeExecution, RuntimeLoadExecution, RuntimeModel, RuntimeRouter,
+    NativeBootstrapFailure, NativeRuntimeDiagnostics, RuntimeError, RuntimeExecution,
+    RuntimeLoadExecution, RuntimeModel, RuntimeRouter,
 };
 use crate::silero_vad_native::{SileroVadModel, VadThreshold, WINDOW_SAMPLES};
 use crate::transcription::{
@@ -47,7 +48,6 @@ pub(crate) const PROTOCOL_MAGIC: [u8; 4] = *b"SCIF";
 pub(crate) const PROTOCOL_VERSION: u8 = 3;
 pub(crate) const INFERENCE_WORKER_FLAG: &str = "--scribe-inference-worker";
 pub(crate) const VAD_WORKER_FLAG: &str = "--scribe-vad-worker";
-const LEGACY_ONNX_WORKER_FLAG: &str = "--onnx-worker";
 const PARENT_LIVENESS_ENV: &str = "SCRIBE_PRIVATE_PARENT_LIVENESS";
 const PARENT_CONTROL_CANCEL: u8 = b'C';
 const HEADER_LEN: usize = 26;
@@ -3426,13 +3426,11 @@ pub(crate) fn maybe_run_worker() -> Option<i32> {
 }
 
 fn worker_role_from_args(args: &[std::ffi::OsString]) -> Result<Option<WorkerRole>> {
-    let known_flag_present = args.iter().any(|arg| {
-        arg == INFERENCE_WORKER_FLAG || arg == VAD_WORKER_FLAG || arg == LEGACY_ONNX_WORKER_FLAG
-    });
+    let known_flag_present = args
+        .iter()
+        .any(|arg| arg == INFERENCE_WORKER_FLAG || arg == VAD_WORKER_FLAG);
     match args {
-        [arg] if arg == INFERENCE_WORKER_FLAG || arg == LEGACY_ONNX_WORKER_FLAG => {
-            Ok(Some(WorkerRole::Inference))
-        }
+        [arg] if arg == INFERENCE_WORKER_FLAG => Ok(Some(WorkerRole::Inference)),
         [arg] if arg == VAD_WORKER_FLAG => Ok(Some(WorkerRole::Vad)),
         _ if known_flag_present => {
             bail!("worker flags are mutually exclusive and accept no additional arguments")

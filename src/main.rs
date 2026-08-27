@@ -31,6 +31,7 @@ mod onnx_model_bundles;
 mod onnx_worker;
 mod overlay;
 mod prepared_audio;
+mod runtime_artifact;
 mod runtime_catalog;
 mod runtime_router;
 mod silero_vad_native;

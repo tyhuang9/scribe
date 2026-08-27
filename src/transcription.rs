@@ -40,8 +40,9 @@ pub use crate::model_catalog::{
 use crate::models::{SttModelInfo, TranscriptResult as LegacyTranscriptResult};
 use crate::onnx_worker::{InferenceWorkerSupervisor, OnnxModelSpec};
 use crate::prepared_audio::{PREPARED_SAMPLE_RATE, PreparedAudio};
+use crate::runtime_artifact::RuntimeArtifact;
 use crate::runtime_router::{
-    IdleTimeoutAction, NativeBootstrapFailure, RuntimeArtifact, RuntimeError, RuntimeExecution,
+    IdleTimeoutAction, NativeBootstrapFailure, RuntimeError, RuntimeExecution,
     RuntimeLoadExecution, RuntimeModel, RuntimeRouter, WARM_MODEL_TTL, verify_compatibility_cli,
 };
 use crate::streaming::{
