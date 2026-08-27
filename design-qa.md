@@ -194,6 +194,65 @@ final result: passed
 
 ---
 
+# Approved application-icon tile correction - Product Design QA - 2026-08-26
+
+## Source and same-state evidence
+
+- The user-selected source is the 128 x 127 opaque PNG at
+  `%TEMP%\codex-clipboard-63f7f774-b8dc-4a3a-b684-8799b6c331bd.png`,
+  SHA-256
+  `f836d49b93ba3e2027d31e10588fe30f755837f912dc59e0e94c0565ded0aac4`.
+  The checked-in canonical asset is byte-identical to that source.
+- The production `app_icon_rgba(128)` result was exported without an
+  alternate renderer to
+  `design-qa-evidence/branding/runtime-app-icon-128.png` (128 x 128,
+  SHA-256
+  `824f1608019c24858bef947dd4dbb4b790f26cc5d6074b8d596c19a7fc1f9ceb`).
+- The 128 x 127 reference and 128 x 128 production result were inspected
+  together in one original-resolution comparison input. The raised Deep Navy
+  tile, inset rim, soft elevation, seven aqua/teal bars, dominant white `S`,
+  spacing, and edge density match visibly; the required one-row square
+  normalization introduces no visible distortion.
+
+## Findings, correction, and acceptance
+
+- P1 before correction: the full-sidebar treatment used a small flat waveform
+  mark on the surrounding navy surface. It omitted the requested rounded tile,
+  depth, rim, and separation, so it did not match the selected application
+  icon.
+- The correction uses the supplied raster pixels directly. No handcrafted
+  SVG, code drawing, or regenerated approximation stands in for this asset.
+- Window and sidebar load the normalized 128 px production texture. The full
+  sidebar presents it at 44 logical pixels so the tile depth and `S` remain
+  legible beside the wordmark; the earlier 34 px trial was rejected during
+  native inspection as visually undersized.
+- Tray/system consumers use independently area-resampled 16 px and 32 px
+  outputs rather than shrinking an already-filtered texture. Locked pixel
+  digests cover 16, 32, and 128 px outputs, and every output remains fully
+  opaque.
+- Overlay and recording-status marks intentionally remain separate semantic
+  marks; this correction does not replace them with the application tile.
+
+## Verification and limitations
+
+- The corrected dark-theme native fixture is running at 1500 x 900 on the
+  left secondary monitor with the sidebar, window icon, and shared system-icon
+  source enabled.
+- Windows foreground capture was intermittently occluded by another full-screen
+  application. Therefore the tracked fidelity artifact is the production
+  renderer output itself, not a composited desktop screenshot. This limitation
+  does not affect the icon comparison: the evidence bytes come directly from
+  the same `app_icon_rgba(128)` function used by the window and sidebar.
+- Focused source-hash/dimension/opacity, deterministic resampling, native
+  window-icon, tray, sidebar semantics, formatting, and strict Clippy checks
+  pass. Independent code and accessibility/UI reviews reported no P0, P1, or
+  P2 issue before the final 44 px visibility adjustment; that adjustment is a
+  single presentation-size change and is covered by the final focused run.
+
+final result: passed
+
+---
+
 # Scribe identity and palette refresh — Product Design QA — 2026-08-26
 
 ## Source and implementation evidence
