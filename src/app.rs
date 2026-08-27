@@ -14486,11 +14486,12 @@ fn body_strong(label: &str) -> RichText {
 }
 
 fn card_title(ui: &Ui, label: &str, active: bool) -> RichText {
+    let colors = ui_palette(ui);
     let text = RichText::new(label)
         .font(FontId::proportional(15.0))
         .strong();
     if active {
-        text.color(ui_palette(ui).accent)
+        text.color(colors.text)
     } else {
         text
     }
@@ -14512,45 +14513,25 @@ fn chip_colors(ui: &Ui, tone: ChipTone) -> (Color32, Color32, Stroke) {
             colors.panel_bg,
             Stroke::new(1.0, colors.border),
         ),
-        ChipTone::Success if ui.visuals().dark_mode => (
-            colors.success,
-            Color32::from_rgb(20, 61, 42),
-            Stroke::new(1.0, Color32::from_rgb(34, 105, 70)),
-        ),
         ChipTone::Success => (
-            Color32::from_rgb(22, 101, 52),
-            Color32::from_rgb(240, 253, 244),
-            Stroke::new(1.0, Color32::from_rgb(187, 247, 208)),
-        ),
-        ChipTone::Warning if ui.visuals().dark_mode => (
-            colors.warning,
-            Color32::from_rgb(69, 50, 18),
-            Stroke::new(1.0, Color32::from_rgb(117, 83, 25)),
+            colors.chip_success_text,
+            colors.chip_success_fill,
+            Stroke::new(1.0, colors.chip_success_border),
         ),
         ChipTone::Warning => (
-            Color32::from_rgb(146, 64, 14),
-            Color32::from_rgb(254, 252, 232),
-            Stroke::new(1.0, Color32::from_rgb(254, 240, 138)),
-        ),
-        ChipTone::Error if ui.visuals().dark_mode => (
-            colors.error,
-            Color32::from_rgb(78, 29, 36),
-            Stroke::new(1.0, Color32::from_rgb(127, 45, 55)),
+            colors.chip_warning_text,
+            colors.chip_warning_fill,
+            Stroke::new(1.0, colors.chip_warning_border),
         ),
         ChipTone::Error => (
-            Color32::from_rgb(185, 28, 28),
-            Color32::from_rgb(254, 242, 242),
-            Stroke::new(1.0, Color32::from_rgb(254, 202, 202)),
-        ),
-        ChipTone::Active if ui.visuals().dark_mode => (
-            colors.accent,
-            Color32::from_rgb(24, 48, 84),
-            Stroke::new(1.0, Color32::from_rgb(42, 86, 143)),
+            colors.chip_error_text,
+            colors.chip_error_fill,
+            Stroke::new(1.0, colors.chip_error_border),
         ),
         ChipTone::Active => (
-            Color32::from_rgb(29, 78, 216),
-            Color32::from_rgb(219, 234, 254),
-            Stroke::new(1.0, Color32::from_rgb(191, 219, 254)),
+            colors.chip_active_text,
+            colors.chip_active_fill,
+            Stroke::new(1.0, colors.chip_active_border),
         ),
     }
 }
@@ -14686,24 +14667,7 @@ fn resolve_theme_mode(theme_mode: ThemeMode, system_theme: Option<eframe::Theme>
 }
 
 fn stitch_visuals(theme_mode: ThemeMode) -> egui::Visuals {
-    let mut visuals = match theme_mode {
-        ThemeMode::Dark => egui::Visuals::dark(),
-        ThemeMode::Light | ThemeMode::System => egui::Visuals::light(),
-    };
-    let colors = ThemePalette::from_visuals(&visuals);
-    visuals.override_text_color = Some(colors.text);
-    visuals.selection.bg_fill = colors.accent;
-    visuals.hyperlink_color = colors.accent;
-    visuals.panel_fill = colors.content_bg;
-    visuals.window_fill = colors.card_bg;
-    visuals.extreme_bg_color = colors.panel_bg;
-    visuals.widgets.noninteractive.bg_fill = colors.card_bg;
-    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, colors.border);
-    visuals.widgets.inactive.bg_fill = colors.card_bg;
-    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, colors.border);
-    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, colors.border_strong);
-    visuals.widgets.active.bg_stroke = Stroke::new(1.0, colors.accent);
-    visuals
+    ThemePalette::visuals(matches!(theme_mode, ThemeMode::Dark))
 }
 
 #[cfg(test)]
@@ -16031,27 +15995,99 @@ mod layout_tests {
     }
 
     #[test]
-    fn light_theme_status_badges_meet_aa_text_contrast() {
-        let ctx = egui::Context::default();
-        ctx.set_visuals(stitch_visuals(ThemeMode::Light));
-        let mut combinations = Vec::new();
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                for tone in [
-                    ChipTone::Success,
-                    ChipTone::Warning,
-                    ChipTone::Active,
-                    ChipTone::Error,
-                ] {
-                    let (text, fill, _) = chip_colors(ui, tone);
-                    combinations.push((text, fill));
-                }
-            });
-        });
+    fn generic_selected_text_and_control_boundaries_use_accessible_semantics() {
+        for (mode, palette) in [
+            (ThemeMode::Light, ThemePalette::light()),
+            (ThemeMode::Dark, ThemePalette::dark()),
+        ] {
+            let visuals = stitch_visuals(mode);
+            assert_eq!(visuals.selection.bg_fill, palette.selection_fill);
+            assert_eq!(visuals.selection.stroke.color, palette.selection_text);
+            assert!(
+                contrast_ratio(visuals.selection.stroke.color, visuals.selection.bg_fill) >= 4.5
+            );
+            for surface in [palette.card_bg, visuals.extreme_bg_color] {
+                assert!(contrast_ratio(visuals.selection.stroke.color, surface) >= 3.0);
+            }
+            for stroke in [
+                visuals.widgets.inactive.bg_stroke,
+                visuals.widgets.hovered.bg_stroke,
+                visuals.widgets.active.bg_stroke,
+            ] {
+                assert!(contrast_ratio(stroke.color, palette.card_bg) >= 3.0);
+            }
+        }
+    }
 
-        for (text, fill) in combinations {
-            let ratio = contrast_ratio(text, fill);
-            assert!(ratio >= 4.5, "contrast ratio was {ratio:.2}");
+    #[test]
+    fn active_playground_model_title_renders_with_accessible_card_text() {
+        for (mode, palette) in [
+            (ThemeMode::Light, ThemePalette::light()),
+            (ThemeMode::Dark, ThemePalette::dark()),
+        ] {
+            let ctx = egui::Context::default();
+            ctx.set_visuals(stitch_visuals(mode));
+            let output = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    Frame::none().fill(palette.active_card_bg).show(ui, |ui| {
+                        ui.label(card_title(ui, "Selected model", true));
+                    });
+                });
+            });
+            let title = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::epaint::Shape::Text(text) if text.galley.text() == "Selected model" => {
+                        Some(text)
+                    }
+                    _ => None,
+                })
+                .expect("selected model title should render");
+            let rendered_color = title
+                .override_text_color
+                .or_else(|| {
+                    title
+                        .galley
+                        .job
+                        .sections
+                        .first()
+                        .map(|section| section.format.color)
+                })
+                .filter(|color| *color != Color32::PLACEHOLDER)
+                .unwrap_or(title.fallback_color);
+            assert_eq!(rendered_color, palette.text);
+            assert!(contrast_ratio(rendered_color, palette.active_card_bg) >= 4.5);
+        }
+    }
+
+    #[test]
+    fn status_badges_meet_aa_text_contrast_in_both_themes() {
+        for mode in [ThemeMode::Light, ThemeMode::Dark] {
+            let ctx = egui::Context::default();
+            ctx.set_visuals(stitch_visuals(mode));
+            let mut combinations = Vec::new();
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    for tone in [
+                        ChipTone::Success,
+                        ChipTone::Warning,
+                        ChipTone::Active,
+                        ChipTone::Error,
+                    ] {
+                        let (text, fill, _) = chip_colors(ui, tone);
+                        combinations.push((text, fill));
+                    }
+                });
+            });
+
+            for (text, fill) in combinations {
+                let ratio = contrast_ratio(text, fill);
+                assert!(
+                    ratio >= 4.5,
+                    "contrast ratio was {ratio:.2} in {mode:?} mode"
+                );
+            }
         }
     }
 

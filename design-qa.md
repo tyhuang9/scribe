@@ -194,6 +194,174 @@ final result: passed
 
 ---
 
+# Charcoal application palette revision - Product Design QA - 2026-08-26
+
+## Source and native evidence
+
+- The selected reference board is tracked at
+  `design-qa-evidence/branding/charcoal-brand-board-reference.png` (1448 x
+  1086), SHA-256
+  `d158562d1ac56108cee6249262121c1cf15bff7b9efca02c0068d45aee18fd21`.
+  It is byte-identical to the user-supplied PNG.
+- `design-qa-evidence/branding/charcoal-app-dark-1500x900.png` is the fresh
+  native dark Transcribe fixture at a 1500 x 900 logical viewport (1502 x 932
+  including native chrome), SHA-256
+  `e0f86aa046551add4dc71346eaeec98de7479fc53082da58f6ed23521e69ecfc`.
+- The reference board and native dark state were inspected together in one
+  original-resolution comparison input. The implementation now matches the
+  reference's neutral charcoal hierarchy rather than the superseded blue-navy
+  hierarchy: Charcoal `#121418`, Surface `#1A1D22`, Soft Text `#E9F0F0`, Muted
+  Gray `#8E99A3`, Scribe Teal `#2D979C`, and Live Coral `#FD816F`.
+- A live native light state was also inspected before capture automation was
+  stopped. It retained the reference's Deep Ink, Scribe Teal, Soft Aqua, Ice
+  Mist, Warm Sand, and Live Coral hierarchy. No blank or partial light capture
+  is retained as evidence.
+
+## Visual and semantic acceptance
+
+- The dark shell, sidebar, cards, transcript panel, dividers, selected row,
+  disabled controls, text hierarchy, chips, buttons, sliders, meters, focus,
+  warning, error, success, and recording states all derive from the new shared
+  semantic palette. No application surface falls back to the retired navy
+  runtime alias.
+- The approved application-icon raster remains byte-identical and is still
+  presented at 44 logical pixels beside the wordmark. This palette pass does
+  not recolor or redraw the logo asset.
+- The egui and native overlay renderers share the same Charcoal/Surface base.
+  Because the capsule is translucent over arbitrary desktop content, explicit
+  overlay-only foreground variants preserve 4.5:1 text and 3:1 non-text
+  contrast over black and white extremes. Overlay geometry, transparency,
+  window split, state, timing, and accessibility behavior are unchanged.
+- The visible blue pointer halo in the native evidence is the capture helper's
+  cursor indicator, not a product color or focus treatment, and is excluded
+  from palette comparison.
+
+## Verification and limitations
+
+- Exact raw-token and semantic-role assertions, egui widget-state recipes,
+  light/dark text and status contrast, shell/harness theme selection, chip
+  contrast, overlay renderer parity, actual GDI+ composite contrast, and
+  deterministic overlay alpha/geometry tests pass.
+- Strict all-target/all-feature Clippy, formatting, and diff checks pass at the
+  native palette freeze.
+- The user stopped Computer Use with Escape during the second light screenshot
+  refresh, so no further GUI input or tracked light capture was attempted in
+  this turn. The automated exact-token/contrast coverage and the prior live
+  light inspection are recorded separately from the retained dark evidence.
+
+final result: passed
+
+---
+
+# Approved application-icon tile correction - Product Design QA - 2026-08-26
+
+## Source and same-state evidence
+
+- The user-selected source is the 128 x 127 opaque PNG at
+  `%TEMP%\codex-clipboard-63f7f774-b8dc-4a3a-b684-8799b6c331bd.png`,
+  SHA-256
+  `f836d49b93ba3e2027d31e10588fe30f755837f912dc59e0e94c0565ded0aac4`.
+  The checked-in canonical asset is byte-identical to that source.
+- The production `app_icon_rgba(128)` result was exported without an
+  alternate renderer to
+  `design-qa-evidence/branding/runtime-app-icon-128.png` (128 x 128,
+  SHA-256
+  `824f1608019c24858bef947dd4dbb4b790f26cc5d6074b8d596c19a7fc1f9ceb`).
+- The 128 x 127 reference and 128 x 128 production result were inspected
+  together in one original-resolution comparison input. The raised Deep Navy
+  tile, inset rim, soft elevation, seven aqua/teal bars, dominant white `S`,
+  spacing, and edge density match visibly; the required one-row square
+  normalization introduces no visible distortion.
+
+## Findings, correction, and acceptance
+
+- P1 before correction: the full-sidebar treatment used a small flat waveform
+  mark on the surrounding navy surface. It omitted the requested rounded tile,
+  depth, rim, and separation, so it did not match the selected application
+  icon.
+- The correction uses the supplied raster pixels directly. No handcrafted
+  SVG, code drawing, or regenerated approximation stands in for this asset.
+- Window and sidebar load the normalized 128 px production texture. The full
+  sidebar presents it at 44 logical pixels so the tile depth and `S` remain
+  legible beside the wordmark; the earlier 34 px trial was rejected during
+  native inspection as visually undersized.
+- Tray/system consumers use independently area-resampled 16 px and 32 px
+  outputs rather than shrinking an already-filtered texture. Locked pixel
+  digests cover 16, 32, and 128 px outputs, and every output remains fully
+  opaque.
+- Overlay and recording-status marks intentionally remain separate semantic
+  marks; this correction does not replace them with the application tile.
+
+## Verification and limitations
+
+- The corrected dark-theme native fixture is running at 1500 x 900 on the
+  left secondary monitor with the sidebar, window icon, and shared system-icon
+  source enabled.
+- Windows foreground capture was intermittently occluded by another full-screen
+  application. Therefore the tracked fidelity artifact is the production
+  renderer output itself, not a composited desktop screenshot. This limitation
+  does not affect the icon comparison: the evidence bytes come directly from
+  the same `app_icon_rgba(128)` function used by the window and sidebar.
+- Focused source-hash/dimension/opacity, deterministic resampling, native
+  window-icon, tray, sidebar semantics, formatting, and strict Clippy checks
+  pass. Independent code and accessibility/UI reviews reported no P0, P1, or
+  P2 issue before the final 44 px visibility adjustment; that adjustment is a
+  single presentation-size change and is covered by the final focused run.
+
+final result: passed
+
+---
+
+# Scribe identity and palette refresh — Product Design QA — 2026-08-26
+
+## Source and implementation evidence
+
+- Brand source: `%TEMP%\codex-clipboard-9f363fa0-574a-4347-a370-81196cd258b3.png` (original supplied attachment).
+- Light native capture: `design-qa-evidence/branding/native-light.png`.
+- Dark native capture: `design-qa-evidence/branding/native-dark.png`.
+- Reviewed branding correction baseline: `30e0185` (`Validate distinct canonical lockup contracts`).
+
+The source board and both native captures were opened together at original
+resolution. The captured fixture is `transcribe/listening` with the full
+navigation lockup visible. Both captures come from the rebuilt Windows UI
+harness and were taken after placing the native window wholly on the physical
+left secondary display.
+
+## Fidelity result
+
+- The navigation uses the canonical seven-bar waveform-S mark beside the
+  lowercase `scribe` wordmark; the title-bar application icon uses the same
+  identity family.
+- Light surfaces visibly use Deep Ink, Scribe Teal, Soft Aqua, Ice Mist, and
+  Live Coral in the roles defined by the supplied board.
+- Dark surfaces visibly use Deep Navy, Navy Surface, Teal Accent, Soft Aqua,
+  and Live Coral in the same hierarchy as the supplied board.
+- Active navigation, selector surfaces, borders, recording state, buttons,
+  text hierarchy, hover/weak states, and the theme switch inherit the shared
+  branded visuals rather than egui defaults.
+- The light/dark control switches the live native view and exposes the correct
+  accessible name after the state settles (`Switch to dark theme` / `Switch to
+  light theme`).
+- No P0, P1, or P2 identity, palette, clipping, overlap, or contrast mismatch
+  remains in the reviewed full-width state. Layout and fixture copy differ from
+  the brand-board examples by design; the board is the source for identity and
+  color roles, not a request to replace Scribe's current information
+  architecture.
+
+## Verification
+
+- `cargo fmt --all -- --check`: passed.
+- `cargo check --locked --all-targets --all-features`: passed.
+- `cargo clippy --locked --all-targets --all-features -- -D warnings`: passed.
+- `cargo test --locked --all-features brand`: 8 passed, 0 failed.
+- `cargo build --locked --features ui-harness`: passed.
+- Native light and dark theme switching: passed.
+- Full navigation lockup and left-secondary placement: passed.
+
+final result: passed
+
+---
+
 # Foreground-aware recording overlay QA - 2026-08-17
 
 ## Source and implementation scope

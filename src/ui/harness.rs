@@ -66,6 +66,41 @@ pub(crate) enum Fixture {
     OverlayCompactDark,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HarnessTheme {
+    Light,
+    Dark,
+}
+
+impl HarnessTheme {
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim() {
+            "light" => Some(Self::Light),
+            "dark" => Some(Self::Dark),
+            _ => None,
+        }
+    }
+
+    fn dark_mode(self) -> bool {
+        self == Self::Dark
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Light => "Light",
+            Self::Dark => "Dark",
+        }
+    }
+
+    fn from_settings_label(label: &str) -> Self {
+        if label == "Dark" {
+            Self::Dark
+        } else {
+            Self::Light
+        }
+    }
+}
+
 impl Fixture {
     #[cfg(test)]
     pub(crate) const ALL: [Self; 21] = [
@@ -622,6 +657,12 @@ pub(crate) fn fixture_from_env() -> Option<Fixture> {
         .and_then(|value| Fixture::parse(&value))
 }
 
+fn harness_theme_from_env() -> Option<HarnessTheme> {
+    std::env::var("SCRIBE_UI_HARNESS_THEME")
+        .ok()
+        .and_then(|value| HarnessTheme::parse(&value))
+}
+
 pub(crate) struct UiHarnessApp {
     page: AppPage,
     data: FixtureData,
@@ -636,21 +677,22 @@ struct DemoPlayback {
 }
 
 fn configure_harness_style(ctx: &egui::Context, dark_mode: bool) {
-    ctx.set_visuals(if dark_mode {
-        egui::Visuals::dark()
-    } else {
-        egui::Visuals::light()
-    });
+    ctx.set_visuals(ThemePalette::visuals(dark_mode));
     configure_accessible_style(ctx);
 }
 
 impl UiHarnessApp {
     pub(crate) fn new(cc: &eframe::CreationContext<'_>, fixture: Fixture) -> Self {
         let overlay = fixture.overlay();
-        configure_harness_style(
-            &cc.egui_ctx,
-            fixture.dark_mode() || overlay.as_ref().is_some_and(|fixture| fixture.dark_mode),
-        );
+        let theme =
+            if fixture.dark_mode() || overlay.as_ref().is_some_and(|fixture| fixture.dark_mode) {
+                HarnessTheme::Dark
+            } else if overlay.is_some() {
+                HarnessTheme::Light
+            } else {
+                harness_theme_from_env().unwrap_or(HarnessTheme::Light)
+            };
+        configure_harness_style(&cc.egui_ctx, theme.dark_mode());
         if overlay.is_some() {
             cc.egui_ctx.send_viewport_cmd(egui::ViewportCommand::Title(
                 "Scribe Overlay Fixture Background".to_owned(),
@@ -658,9 +700,11 @@ impl UiHarnessApp {
             cc.egui_ctx
                 .send_viewport_cmd(egui::ViewportCommand::Maximized(true));
         }
+        let mut data = fixture.data();
+        data.settings.theme_label = theme.label().into();
         Self {
             page: fixture.page(),
-            data: fixture.data(),
+            data,
             overlay,
             overlay_presented: false,
             demo_playback: None,
@@ -763,12 +807,29 @@ impl eframe::App for UiHarnessApp {
         if clear_after_removal_focus {
             self.data.model_management.restore_after_removal_focus = false;
         }
-        apply_action(&mut self.data, &mut self.page, action);
+        apply_harness_action(ctx, &mut self.data, &mut self.page, action);
         ctx.request_repaint_after(if self.demo_playback.is_some() {
             Duration::from_millis(33)
         } else {
             Duration::from_secs(60)
         });
+    }
+}
+
+fn apply_harness_action(
+    ctx: &egui::Context,
+    data: &mut FixtureData,
+    page: &mut AppPage,
+    action: ScreenAction,
+) {
+    let changes_theme = matches!(
+        &action,
+        ScreenAction::SetTheme(_) | ScreenAction::ToggleResolvedTheme(_)
+    );
+    apply_action(data, page, action);
+    if changes_theme {
+        let theme = HarnessTheme::from_settings_label(&data.settings.theme_label);
+        configure_harness_style(ctx, theme.dark_mode());
     }
 }
 
@@ -783,21 +844,18 @@ fn show_overlay_fixture_host(ctx: &egui::Context, overlay_presented: bool) {
                 viewport.right_bottom(),
             );
             let panel_width = 150.0;
+            let dark_palette = ThemePalette::dark();
             let panels = [
                 (
-                    egui::Color32::from_rgb(248, 250, 253),
-                    egui::Color32::from_rgb(29, 33, 42),
+                    crate::branding::ICE_MIST,
+                    crate::branding::DEEP_INK,
                     "LIGHT SAMPLE",
                 ),
+                (dark_palette.content_bg, dark_palette.text, "DARK SAMPLE"),
                 (
-                    egui::Color32::from_rgb(22, 27, 36),
-                    egui::Color32::from_rgb(236, 241, 247),
-                    "DARK SAMPLE",
-                ),
-                (
-                    egui::Color32::from_rgb(37, 99, 235),
-                    egui::Color32::WHITE,
-                    "SCRIBE BLUE",
+                    dark_palette.accent,
+                    dark_palette.primary_button_text,
+                    "SCRIBE TEAL",
                 ),
             ];
             let panel_count = (sample_area.width() / panel_width).ceil() as usize;
@@ -1371,6 +1429,7 @@ mod tests {
 
         let style = ctx.style();
         assert!(!style.visuals.dark_mode);
+        assert_eq!(style.visuals, ThemePalette::visuals(false));
         assert_eq!(style.spacing.interact_size, egui::vec2(44.0, 44.0));
         assert_eq!(
             style.text_styles[&egui::TextStyle::Body],
@@ -1442,6 +1501,38 @@ mod tests {
         let dark_ctx = egui::Context::default();
         configure_harness_style(&dark_ctx, true);
         assert!(dark_ctx.style().visuals.dark_mode);
+    }
+
+    #[test]
+    fn harness_theme_parser_accepts_only_documented_deterministic_values() {
+        assert_eq!(HarnessTheme::parse("light"), Some(HarnessTheme::Light));
+        assert_eq!(HarnessTheme::parse("dark"), Some(HarnessTheme::Dark));
+        assert_eq!(HarnessTheme::parse(" light "), Some(HarnessTheme::Light));
+        assert_eq!(HarnessTheme::parse("Light"), None);
+        assert_eq!(HarnessTheme::parse("system"), None);
+        assert_eq!(HarnessTheme::parse(""), None);
+    }
+
+    #[test]
+    fn harness_theme_toggle_mutates_the_visuals_used_by_the_next_frame() {
+        let ctx = egui::Context::default();
+        configure_harness_style(&ctx, false);
+        let mut data = Fixture::TranscribeReady.data();
+        let mut page = Fixture::TranscribeReady.page();
+
+        apply_harness_action(
+            &ctx,
+            &mut data,
+            &mut page,
+            ScreenAction::ToggleResolvedTheme(ResolvedTheme::Light),
+        );
+
+        assert_eq!(data.settings.theme_label, "Dark");
+        assert_eq!(ctx.style().visuals, ThemePalette::visuals(true));
+        assert_eq!(
+            data.theme_announcement.as_deref(),
+            Some("Theme changed to Dark.")
+        );
     }
 
     #[test]

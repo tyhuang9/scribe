@@ -13,7 +13,11 @@ use super::platform::{
     CapturedTarget, OverlayHardeningProfile, OverlayPosition, OverlayWindowBounds,
     OverlayWindowSpec, harden_overlay_window, harden_overlay_window_at, overlay_window_bounds,
 };
-use crate::{transcription::SessionId, ui::theme_palette};
+use crate::{
+    branding::{DEEP_INK, DEEP_NAVY, ICE_MIST, TEAL_ACCENT},
+    transcription::SessionId,
+    ui::theme_palette,
+};
 
 pub const OVERLAY_VIEWPORT_KEY: &str = "scribe-dictation-overlay";
 pub const OVERLAY_WINDOW_TITLE: &str = "Scribe Dictation Overlay";
@@ -356,39 +360,69 @@ struct OverlayColors {
     shadow: Color32,
 }
 
+// Muted Gray is too low-contrast on this intentionally translucent capsule
+// over a light desktop. This overlay-only neutral stays close to Soft Text
+// while preserving the 4.5:1 text requirement on either extreme backdrop.
+pub(super) const DARK_OVERLAY_MUTED_TEXT: Color32 = Color32::from_rgb(220, 229, 230);
+
 fn overlay_colors(context: &egui::Context) -> OverlayColors {
     let palette = theme_palette(context);
     if context.style().visuals.dark_mode {
+        debug_assert_ne!(
+            palette.panel_bg, DEEP_NAVY,
+            "the charcoal overlay must not regress to the retired Deep Navy surface"
+        );
+        debug_assert_ne!(
+            palette.recording_waveform, TEAL_ACCENT,
+            "the charcoal overlay must not regress to the retired teal accent"
+        );
         OverlayColors {
-            // This app-owned tint remains deterministic while its alpha lets
-            // the underlying desktop content show through.
-            // The egui fallback does not composite native shadow rings beneath
-            // the fill, so this tint lands near the reference's neutral-gray
-            // surface on its light backdrop without the native renderer's
-            // shadow compensation.
-            surface: Color32::from_rgba_unmultiplied(25, 26, 33, 184),
-            border: Color32::from_rgba_unmultiplied(220, 229, 242, 36),
+            // Preserve the established glass alpha; low-contrast foreground
+            // roles below use explicit overlay-safe variants instead.
+            surface: Color32::from_rgba_unmultiplied(
+                palette.panel_bg.r(),
+                palette.panel_bg.g(),
+                palette.panel_bg.b(),
+                184,
+            ),
+            border: Color32::from_rgba_unmultiplied(
+                palette.border.r(),
+                palette.border.g(),
+                palette.border.b(),
+                36,
+            ),
             text: palette.text,
-            muted_text: Color32::from_rgb(210, 210, 216),
-            // The supplied reference uses a purple brand mark. This slightly
-            // lighter overlay-specific token preserves that appearance while
-            // keeping the non-text mark at 3:1 over the translucent surface.
-            waveform: Color32::from_rgb(178, 162, 255),
-            success: palette.success_text,
-            error: Color32::from_rgb(255, 200, 200),
-            warning: Color32::from_rgb(255, 222, 170),
-            shadow: Color32::from_black_alpha(96),
+            muted_text: DARK_OVERLAY_MUTED_TEXT,
+            // This is the palette's contrast-safe teal foreground for the
+            // raw Scribe Teal accent.
+            waveform: palette.chip_active_text,
+            success: palette.success,
+            error: palette.error_text,
+            warning: palette.chip_warning_text,
+            shadow: Color32::from_rgba_unmultiplied(
+                palette.shell_bg.r(),
+                palette.shell_bg.g(),
+                palette.shell_bg.b(),
+                96,
+            ),
         }
     } else {
         OverlayColors {
-            surface: Color32::from_rgba_unmultiplied(248, 250, 253, 228),
-            border: Color32::from_rgba_unmultiplied(35, 47, 66, 64),
-            text: palette.text,
-            muted_text: Color32::from_rgb(65, 75, 90),
-            waveform: palette.recording_waveform,
-            success: palette.success_text,
-            error: palette.error_text,
-            warning: palette.warning,
+            surface: Color32::from_rgba_unmultiplied(ICE_MIST.r(), ICE_MIST.g(), ICE_MIST.b(), 228),
+            border: Color32::from_rgba_unmultiplied(
+                palette.accent.r(),
+                palette.accent.g(),
+                palette.accent.b(),
+                64,
+            ),
+            text: DEEP_INK,
+            muted_text: Color32::from_rgb(64, 91, 110),
+            // The exact light teal remains a raw identity token; this deeper
+            // semantic teal keeps the mark above 3:1 on a translucent surface.
+            waveform: Color32::from_rgb(23, 111, 116),
+            success: Color32::from_rgb(40, 97, 69),
+            error: Color32::from_rgb(132, 46, 38),
+            warning: Color32::from_rgb(123, 80, 36),
             shadow: Color32::from_black_alpha(54),
         }
     }
@@ -945,6 +979,7 @@ fn format_elapsed(elapsed: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::branding::SCRIBE_TEAL;
     use crate::overlay::preview_parity::{
         HorizontalAnchor, PARITY_GRAPHEMES, PREVIEW_PARITY_CASES, PreviewInput,
         assert_text_contract, long_message,
@@ -2261,6 +2296,66 @@ mod tests {
                         && !name.contains("You can retry")
                 })
         }));
+    }
+
+    #[test]
+    fn overlay_semantic_colors_match_the_identity_contract() {
+        let light_context = egui::Context::default();
+        light_context.set_visuals(egui::Visuals::light());
+        let light = overlay_colors(&light_context);
+        assert_eq!(
+            light.surface,
+            Color32::from_rgba_unmultiplied(ICE_MIST.r(), ICE_MIST.g(), ICE_MIST.b(), 228)
+        );
+        assert_eq!(
+            light.border,
+            Color32::from_rgba_unmultiplied(SCRIBE_TEAL.r(), SCRIBE_TEAL.g(), SCRIBE_TEAL.b(), 64)
+        );
+        assert_eq!(light.text, DEEP_INK);
+        assert_eq!(light.muted_text, Color32::from_rgb(64, 91, 110));
+        assert_eq!(light.waveform, Color32::from_rgb(23, 111, 116));
+        assert_eq!(light.success, Color32::from_rgb(40, 97, 69));
+        assert_eq!(light.error, Color32::from_rgb(132, 46, 38));
+        assert_eq!(light.warning, Color32::from_rgb(123, 80, 36));
+
+        let dark_context = egui::Context::default();
+        dark_context.set_visuals(egui::Visuals::dark());
+        let dark = overlay_colors(&dark_context);
+        let dark_palette = crate::ui::ThemePalette::dark();
+        assert_eq!(
+            dark.surface,
+            Color32::from_rgba_unmultiplied(
+                dark_palette.panel_bg.r(),
+                dark_palette.panel_bg.g(),
+                dark_palette.panel_bg.b(),
+                184,
+            )
+        );
+        assert_eq!(
+            dark.border,
+            Color32::from_rgba_unmultiplied(
+                dark_palette.border.r(),
+                dark_palette.border.g(),
+                dark_palette.border.b(),
+                36,
+            )
+        );
+        assert_eq!(dark.text, dark_palette.text);
+        assert_eq!(DARK_OVERLAY_MUTED_TEXT.to_array(), [220, 229, 230, 255]);
+        assert_eq!(dark.muted_text, DARK_OVERLAY_MUTED_TEXT);
+        assert_eq!(dark.waveform, dark_palette.chip_active_text);
+        assert_eq!(dark.success, dark_palette.success);
+        assert_eq!(dark.error, dark_palette.error_text);
+        assert_eq!(dark.warning, dark_palette.chip_warning_text);
+        assert_eq!(
+            dark.shadow,
+            Color32::from_rgba_unmultiplied(
+                dark_palette.shell_bg.r(),
+                dark_palette.shell_bg.g(),
+                dark_palette.shell_bg.b(),
+                96,
+            )
+        );
     }
 
     #[test]

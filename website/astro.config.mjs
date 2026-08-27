@@ -6,9 +6,15 @@ export default defineConfig({
   base: process.env.BASE_PATH ?? '/scribe',
   integrations: [
     starlight({
-      title: 'Scribe Documentation',
-      description: 'Practical documentation for the local-first Scribe desktop app.',
+      title: 'Scribe documentation',
+      description: 'Lightning-fast local transcription that stays out of your way.',
       disable404Route: true,
+      logo: {
+        light: './src/assets/scribe-header-light.svg',
+        dark: './src/assets/scribe-header-dark.svg',
+        alt: '',
+        replacesTitle: true
+      },
       social: [{ icon: 'github', label: 'GitHub', href: 'https://github.com/tyhuang9/scribe' }],
       sidebar: [
         { label: 'Overview', link: '/' },

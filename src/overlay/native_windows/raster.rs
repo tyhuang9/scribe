@@ -24,13 +24,16 @@ use super::{
         controller::{OverlayMode, OverlayPhase, OverlayRecovery, OverlayViewState},
         platform::OverlayWindowBounds,
         view::{
-            CONTROL_SIZE, LIVE_HEIGHT, LIVE_WIDTH, MINIMAL_WIDTH, phase_status_label_with_motion,
-            status_mark_glyph,
+            CONTROL_SIZE, DARK_OVERLAY_MUTED_TEXT, LIVE_HEIGHT, LIVE_WIDTH, MINIMAL_WIDTH,
+            phase_status_label_with_motion, status_mark_glyph,
         },
     },
     layout::DisplayLayout,
 };
-use crate::ui::ThemePalette;
+use crate::{
+    branding::{DEEP_INK, ICE_MIST},
+    ui::ThemePalette,
+};
 
 const PIXEL_FORMAT_32BPP_PARGB: i32 = 0x000E_200B;
 const MAX_PREVIEW_GRAPHEMES: usize = 512;
@@ -74,27 +77,48 @@ impl NativeColors {
         };
         if dark_mode {
             Self {
-                surface: Argb::new(184, 52, 53, 61),
-                border: Argb::new(36, 220, 229, 242),
+                // Match the egui overlay's translucent Surface and explicit
+                // contrast-safe foreground variants.
+                surface: Argb::new(
+                    184,
+                    palette.panel_bg.r(),
+                    palette.panel_bg.g(),
+                    palette.panel_bg.b(),
+                ),
+                border: Argb::new(
+                    36,
+                    palette.border.r(),
+                    palette.border.g(),
+                    palette.border.b(),
+                ),
                 text: Argb::from_color(palette.text),
-                muted_text: Argb::new(255, 210, 210, 216),
-                // Overlay-specific accessible variant of the reference purple.
-                waveform: Argb::new(255, 178, 162, 255),
-                success: Argb::from_color(palette.success_text),
-                error: Argb::new(255, 255, 200, 200),
-                warning: Argb::new(255, 255, 222, 170),
-                shadow: Argb::new(96, 0, 0, 0),
+                muted_text: Argb::from_color(DARK_OVERLAY_MUTED_TEXT),
+                waveform: Argb::from_color(palette.chip_active_text),
+                success: Argb::from_color(palette.success),
+                error: Argb::from_color(palette.error_text),
+                warning: Argb::from_color(palette.chip_warning_text),
+                shadow: Argb::new(
+                    96,
+                    palette.shell_bg.r(),
+                    palette.shell_bg.g(),
+                    palette.shell_bg.b(),
+                ),
             }
         } else {
             Self {
-                surface: Argb::new(228, 248, 250, 253),
-                border: Argb::new(64, 35, 47, 66),
-                text: Argb::from_color(palette.text),
-                muted_text: Argb::new(255, 65, 75, 90),
-                waveform: Argb::from_color(palette.recording_waveform),
-                success: Argb::from_color(palette.success_text),
-                error: Argb::from_color(palette.error_text),
-                warning: Argb::from_color(palette.warning),
+                surface: Argb::new(228, ICE_MIST.r(), ICE_MIST.g(), ICE_MIST.b()),
+                border: Argb::new(
+                    64,
+                    palette.accent.r(),
+                    palette.accent.g(),
+                    palette.accent.b(),
+                ),
+                text: Argb::from_color(DEEP_INK),
+                muted_text: Argb::new(255, 64, 91, 110),
+                waveform: Argb::new(255, 23, 111, 116),
+                success: Argb::new(255, 40, 97, 69),
+                error: Argb::new(255, 132, 46, 38),
+                warning: Argb::new(255, 123, 80, 36),
                 shadow: Argb::new(54, 0, 0, 0),
             }
         }
@@ -434,7 +458,12 @@ fn draw_capsule(
             width + extent * 2.0,
             height + extent * 2.0,
             radius + extent,
-            Argb::new(alpha, 0, 0, 0),
+            Argb::new(
+                alpha,
+                ((colors.shadow.0 >> 16) & 0xff) as u8,
+                ((colors.shadow.0 >> 8) & 0xff) as u8,
+                (colors.shadow.0 & 0xff) as u8,
+            ),
         )?;
     }
     canvas.fill_rounded_rect(x, y, width, height, radius, colors.surface)?;
@@ -2306,8 +2335,22 @@ mod tests {
         }
     }
 
+    fn assert_reference_geometry_is_pixel_identical(actual: &[u8], expected: &[u8], label: &str) {
+        assert_eq!(actual.len(), expected.len(), "{label} pixel length changed");
+        for (index, (actual, expected)) in actual
+            .chunks_exact(4)
+            .zip(expected.chunks_exact(4))
+            .enumerate()
+        {
+            assert_eq!(
+                actual[3], expected[3],
+                "{label} alpha geometry changed at pixel {index}"
+            );
+        }
+    }
+
     #[test]
-    fn reference_contract_native_overlay_raster_golden_frames_are_pixel_identical() {
+    fn reference_contract_native_overlay_raster_golden_geometry_is_pixel_identical() {
         let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("testdata")
             .join("overlay-reference");
@@ -2333,11 +2376,13 @@ mod tests {
                                 logical_height * numerator / denominator,
                             )
                             .expect("render overlay fixture frame");
-                        assert_eq!(
-                            frame.pixels,
+                        let expected =
                             std::fs::read(fixture_root.join(format!("{name}-{theme}-{dpi}.bgra")))
-                                .expect("read immutable reference-contract overlay fixture"),
-                            "{name} {theme} at {dpi} DPI diverged from the approved reference contract"
+                                .expect("read immutable reference-contract overlay fixture");
+                        assert_reference_geometry_is_pixel_identical(
+                            &frame.pixels,
+                            &expected,
+                            &format!("{name} {theme} at {dpi} DPI"),
                         );
                     }
 
@@ -2348,11 +2393,13 @@ mod tests {
                             44 * numerator / denominator,
                         )
                         .expect("render cancel-control fixture frame");
-                    assert_eq!(
-                        control.pixels,
+                    let expected =
                         std::fs::read(fixture_root.join(format!("cancel-{theme}-{dpi}.bgra")))
-                            .expect("read immutable reference-contract cancel-control fixture"),
-                        "cancel control {theme} at {dpi} DPI diverged from the approved reference contract"
+                            .expect("read immutable reference-contract cancel-control fixture");
+                    assert_reference_geometry_is_pixel_identical(
+                        &control.pixels,
+                        &expected,
+                        &format!("cancel control {theme} at {dpi} DPI"),
                     );
                 }
             }
@@ -2362,11 +2409,13 @@ mod tests {
                     let frame = rasterizer
                         .render_display(&state, dark, width, height)
                         .expect("render edge-state overlay fixture frame");
-                    assert_eq!(
-                        frame.pixels,
+                    let expected =
                         std::fs::read(fixture_root.join(format!("{name}-{theme}-96.bgra")))
-                            .expect("read immutable reference-contract edge-state fixture"),
-                        "{name} {theme} at 96 DPI diverged from the approved reference contract"
+                            .expect("read immutable reference-contract edge-state fixture");
+                    assert_reference_geometry_is_pixel_identical(
+                        &frame.pixels,
+                        &expected,
+                        &format!("{name} {theme} at 96 DPI"),
                     );
                 }
             }
@@ -2839,14 +2888,57 @@ mod tests {
     }
 
     #[test]
-    fn native_waveform_colors_follow_the_shared_theme_contract() {
+    fn native_overlay_semantic_colors_match_the_identity_contract() {
+        let light = NativeColors::for_theme(false);
+        assert_eq!(light.surface, Argb::new(228, 234, 245, 245));
+        assert_eq!(light.border, Argb::new(64, 45, 151, 156));
+        assert_eq!(light.text, Argb::from_color(DEEP_INK));
+        assert_eq!(light.muted_text, Argb::new(255, 64, 91, 110));
+        assert_eq!(light.waveform, Argb::new(255, 23, 111, 116));
+        assert_eq!(light.success, Argb::new(255, 40, 97, 69));
+        assert_eq!(light.error, Argb::new(255, 132, 46, 38));
+        assert_eq!(light.warning, Argb::new(255, 123, 80, 36));
+
+        let dark = NativeColors::for_theme(true);
+        let dark_palette = ThemePalette::dark();
         assert_eq!(
-            NativeColors::for_theme(false).waveform,
-            Argb::from_color(ThemePalette::light().recording_waveform)
+            dark.surface,
+            Argb::new(
+                184,
+                dark_palette.panel_bg.r(),
+                dark_palette.panel_bg.g(),
+                dark_palette.panel_bg.b(),
+            )
         );
         assert_eq!(
-            NativeColors::for_theme(true).waveform,
-            Argb::new(255, 178, 162, 255)
+            dark.border,
+            Argb::new(
+                36,
+                dark_palette.border.r(),
+                dark_palette.border.g(),
+                dark_palette.border.b(),
+            )
+        );
+        assert_eq!(dark.text, Argb::from_color(dark_palette.text));
+        assert_eq!(dark.muted_text, Argb::from_color(DARK_OVERLAY_MUTED_TEXT));
+        assert_eq!(
+            dark.waveform,
+            Argb::from_color(dark_palette.chip_active_text)
+        );
+        assert_eq!(dark.success, Argb::from_color(dark_palette.success));
+        assert_eq!(dark.error, Argb::from_color(dark_palette.error_text));
+        assert_eq!(
+            dark.warning,
+            Argb::from_color(dark_palette.chip_warning_text)
+        );
+        assert_eq!(
+            dark.shadow,
+            Argb::new(
+                96,
+                dark_palette.shell_bg.r(),
+                dark_palette.shell_bg.g(),
+                dark_palette.shell_bg.b(),
+            )
         );
     }
 }

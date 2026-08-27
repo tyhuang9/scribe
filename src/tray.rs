@@ -5,6 +5,8 @@ use std::time::Duration;
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
+use crate::branding;
+
 const MENU_SHOW: &str = "scribe-show";
 const MENU_HIDE: &str = "scribe-hide";
 const MENU_TOGGLE_RECORDING: &str = "scribe-toggle-recording";
@@ -439,26 +441,9 @@ fn recording_label(is_recording: bool) -> &'static str {
 }
 
 fn scribe_icon() -> Result<Icon> {
-    const SIZE: u32 = 16;
-    let mut rgba = Vec::with_capacity((SIZE * SIZE * 4) as usize);
-    for y in 0..SIZE {
-        for x in 0..SIZE {
-            let inside = (2..=13).contains(&x) && (2..=13).contains(&y);
-            let mic_stem = (7..=8).contains(&x) && (5..=12).contains(&y);
-            let mic_head = (5..=10).contains(&x) && (3..=8).contains(&y);
-            let base = (4..=11).contains(&x) && y == 13;
-            let (r, g, b, a) = if !inside {
-                (0, 0, 0, 0)
-            } else if mic_head || mic_stem || base {
-                (255, 255, 255, 255)
-            } else {
-                (24, 102, 196, 255)
-            };
-            rgba.extend([r, g, b, a]);
-        }
-    }
-
-    Icon::from_rgba(rgba, SIZE, SIZE).context("failed to create tray icon bitmap")
+    const SIZE: u32 = 32;
+    Icon::from_rgba(branding::app_icon_rgba(SIZE), SIZE, SIZE)
+        .context("failed to create Scribe tray icon bitmap")
 }
 
 #[cfg(test)]
@@ -531,5 +516,10 @@ mod tests {
         );
         assert_eq!(command_from_menu_id(MENU_QUIT), Some(TrayCommand::Quit));
         assert_eq!(command_from_menu_id("unknown"), None);
+    }
+
+    #[test]
+    fn tray_icon_uses_the_shared_scribe_identity() {
+        assert!(scribe_icon().is_ok());
     }
 }

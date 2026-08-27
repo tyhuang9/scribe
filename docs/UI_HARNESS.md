@@ -9,6 +9,7 @@ Run a fixture in a debug build:
 ```powershell
 $env:SCRIBE_UI_HARNESS = 'models/card-expanded'
 $env:SCRIBE_UI_HARNESS_VIEWPORT = '1180x815'
+$env:SCRIBE_UI_HARNESS_THEME = 'light'
 cargo run --features ui-harness
 ```
 
@@ -16,6 +17,18 @@ Unknown fixture names fail closed to normal application startup. The harness
 freezes timers, relative time, and sample metadata for repeatable screenshots.
 The visual references in `docs/ui-reference/` are documentation-only and are
 not runtime assets.
+
+Set `SCRIBE_UI_HARNESS_THEME` to exactly `light` or `dark` to render ordinary
+fixtures with the corresponding production Scribe theme. `dark` is the current
+deterministic Charcoal sample: Charcoal `#121418` shell, Surface `#1A1D22`
+cards and navigation, Soft Text `#E9F0F0`, Muted Gray `#8E99A3`, Scribe Teal
+`#2D979C`, and Live Coral `#FD816F`. `light` retains the exact Deep Ink,
+Scribe Teal, Soft Aqua, Ice Mist, Warm Sand, and Live Coral application
+tokens. When it is unset or invalid, the harness defaults deterministically to
+light. The four overlay fixtures keep the explicit theme encoded in their route
+name; their `*-dark` routes use the same Charcoal sample. The sidebar theme
+toggle updates the harness visuals immediately, using the same complete egui
+visual recipe as the production application.
 
 ## Fixture routes
 
@@ -102,7 +115,7 @@ cancel-window title is exactly `Scribe Dictation Overlay Cancel`. Capture the
 combined screen region because the X intentionally lives in its own native
 window. The maximized fixture host is titled exactly
 `Scribe Overlay Fixture Background` and remains repaintable behind the overlay.
-Its repeating light, dark, and Scribe-blue panels provide hard edges and text
+Its repeating light, dark, and Scribe-teal panels provide hard edges and text
 for judging painted translucency, tint, and any seam between the two overlay
 windows; they are fixture-only paint, not a production asset.
 

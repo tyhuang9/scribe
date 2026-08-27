@@ -1689,7 +1689,7 @@ fn microphone_error_notice(ui: &mut egui::Ui, technical_detail: &str) -> ScreenA
                         egui::Button::new(
                             RichText::new("Try again").color(colors.danger_button_text),
                         )
-                        .fill(colors.error)
+                        .fill(colors.error_fill)
                         .stroke(Stroke::NONE)
                         .rounding(Rounding::same(5.0))
                         .min_size(retry_size),
@@ -4773,7 +4773,7 @@ fn models(
     ) {
         let status = ui.label(RichText::new(&remote_catalog.status.message).color(
             match remote_catalog.status.kind {
-                RemoteCatalogStatusKind::Error => colors.error,
+                RemoteCatalogStatusKind::Error => colors.error_text,
                 RemoteCatalogStatusKind::Offline => colors.warning,
                 _ => colors.muted_text,
             },

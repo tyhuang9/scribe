@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 190" role="img" aria-labelledby="title description">
+  <title id="title">scribe</title>
+  <desc id="description">Scribe logo and the tagline Lightning-fast local transcription that stays out of your way.</desc>
+  <rect width="640" height="190" rx="18" fill="#061C2E"/>
+  <g transform="translate(12 12) scale(1.12)">
+    <rect width="128" height="128" rx="25" fill="#08233A"/>
+    <g fill="#7CCBC9"><rect x="15" y="40" width="11" height="48" rx="5.5"/><rect x="44" y="14" width="11" height="100" rx="5.5"/><rect x="59" y="4" width="11" height="120" rx="5.5"/><rect x="73" y="14" width="11" height="100" rx="5.5"/><rect x="102" y="40" width="11" height="48" rx="5.5"/></g>
+    <g fill="#ACDBD9"><rect x="30" y="24" width="11" height="80" rx="5.5"/><rect x="87" y="24" width="11" height="80" rx="5.5"/></g>
+    <path d="M89.6 35.8C78.1 20.5 49.9 23 43 47.4c-4.8 20.9 46.1 10.6 43.5 36.5-2.3 22.6-35.4 23.5-50.7 5.7" fill="none" stroke="#fff" stroke-width="16.6" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+  <text x="184" y="92" fill="#EAF5F5" font-family="Inter, Segoe UI, sans-serif" font-size="74" font-weight="700" letter-spacing="-2">scribe</text>
+  <text x="188" y="138" fill="#ACDBD9" font-family="Inter, Segoe UI, sans-serif" font-size="18">Lightning-fast local transcription</text>
+  <text x="188" y="164" fill="#ACDBD9" font-family="Inter, Segoe UI, sans-serif" font-size="18">that stays out of your way.</text>
+</svg>
