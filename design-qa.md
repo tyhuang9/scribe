@@ -194,6 +194,65 @@ final result: passed
 
 ---
 
+# Charcoal application palette revision - Product Design QA - 2026-08-26
+
+## Source and native evidence
+
+- The selected reference board is tracked at
+  `design-qa-evidence/branding/charcoal-brand-board-reference.png` (1448 x
+  1086), SHA-256
+  `d158562d1ac56108cee6249262121c1cf15bff7b9efca02c0068d45aee18fd21`.
+  It is byte-identical to the user-supplied PNG.
+- `design-qa-evidence/branding/charcoal-app-dark-1500x900.png` is the fresh
+  native dark Transcribe fixture at a 1500 x 900 logical viewport (1502 x 932
+  including native chrome), SHA-256
+  `e0f86aa046551add4dc71346eaeec98de7479fc53082da58f6ed23521e69ecfc`.
+- The reference board and native dark state were inspected together in one
+  original-resolution comparison input. The implementation now matches the
+  reference's neutral charcoal hierarchy rather than the superseded blue-navy
+  hierarchy: Charcoal `#121418`, Surface `#1A1D22`, Soft Text `#E9F0F0`, Muted
+  Gray `#8E99A3`, Scribe Teal `#2D979C`, and Live Coral `#FD816F`.
+- A live native light state was also inspected before capture automation was
+  stopped. It retained the reference's Deep Ink, Scribe Teal, Soft Aqua, Ice
+  Mist, Warm Sand, and Live Coral hierarchy. No blank or partial light capture
+  is retained as evidence.
+
+## Visual and semantic acceptance
+
+- The dark shell, sidebar, cards, transcript panel, dividers, selected row,
+  disabled controls, text hierarchy, chips, buttons, sliders, meters, focus,
+  warning, error, success, and recording states all derive from the new shared
+  semantic palette. No application surface falls back to the retired navy
+  runtime alias.
+- The approved application-icon raster remains byte-identical and is still
+  presented at 44 logical pixels beside the wordmark. This palette pass does
+  not recolor or redraw the logo asset.
+- The egui and native overlay renderers share the same Charcoal/Surface base.
+  Because the capsule is translucent over arbitrary desktop content, explicit
+  overlay-only foreground variants preserve 4.5:1 text and 3:1 non-text
+  contrast over black and white extremes. Overlay geometry, transparency,
+  window split, state, timing, and accessibility behavior are unchanged.
+- The visible blue pointer halo in the native evidence is the capture helper's
+  cursor indicator, not a product color or focus treatment, and is excluded
+  from palette comparison.
+
+## Verification and limitations
+
+- Exact raw-token and semantic-role assertions, egui widget-state recipes,
+  light/dark text and status contrast, shell/harness theme selection, chip
+  contrast, overlay renderer parity, actual GDI+ composite contrast, and
+  deterministic overlay alpha/geometry tests pass.
+- Strict all-target/all-feature Clippy, formatting, and diff checks pass at the
+  native palette freeze.
+- The user stopped Computer Use with Escape during the second light screenshot
+  refresh, so no further GUI input or tracked light capture was attempted in
+  this turn. The automated exact-token/contrast coverage and the prior live
+  light inspection are recorded separately from the retained dark evidence.
+
+final result: passed
+
+---
+
 # Approved application-icon tile correction - Product Design QA - 2026-08-26
 
 ## Source and same-state evidence

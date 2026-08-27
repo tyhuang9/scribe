@@ -24,14 +24,14 @@ use super::{
         controller::{OverlayMode, OverlayPhase, OverlayRecovery, OverlayViewState},
         platform::OverlayWindowBounds,
         view::{
-            CONTROL_SIZE, LIVE_HEIGHT, LIVE_WIDTH, MINIMAL_WIDTH, phase_status_label_with_motion,
-            status_mark_glyph,
+            CONTROL_SIZE, DARK_OVERLAY_MUTED_TEXT, LIVE_HEIGHT, LIVE_WIDTH, MINIMAL_WIDTH,
+            phase_status_label_with_motion, status_mark_glyph,
         },
     },
     layout::DisplayLayout,
 };
 use crate::{
-    branding::{DEEP_INK, DEEP_NAVY, ICE_MIST, SOFT_AQUA, TEAL_ACCENT},
+    branding::{DEEP_INK, ICE_MIST},
     ui::ThemePalette,
 };
 
@@ -77,15 +77,32 @@ impl NativeColors {
         };
         if dark_mode {
             Self {
-                surface: Argb::new(184, DEEP_NAVY.r(), DEEP_NAVY.g(), DEEP_NAVY.b()),
-                border: Argb::new(36, TEAL_ACCENT.r(), TEAL_ACCENT.g(), TEAL_ACCENT.b()),
-                text: Argb::from_color(ICE_MIST),
-                muted_text: Argb::from_color(SOFT_AQUA),
-                waveform: Argb::from_color(TEAL_ACCENT),
-                success: Argb::new(255, 157, 223, 183),
-                error: Argb::new(255, 255, 210, 203),
-                warning: Argb::new(255, 246, 223, 194),
-                shadow: Argb::new(96, 0, 0, 0),
+                // Match the egui overlay's translucent Surface and explicit
+                // contrast-safe foreground variants.
+                surface: Argb::new(
+                    184,
+                    palette.panel_bg.r(),
+                    palette.panel_bg.g(),
+                    palette.panel_bg.b(),
+                ),
+                border: Argb::new(
+                    36,
+                    palette.border.r(),
+                    palette.border.g(),
+                    palette.border.b(),
+                ),
+                text: Argb::from_color(palette.text),
+                muted_text: Argb::from_color(DARK_OVERLAY_MUTED_TEXT),
+                waveform: Argb::from_color(palette.chip_active_text),
+                success: Argb::from_color(palette.success),
+                error: Argb::from_color(palette.error_text),
+                warning: Argb::from_color(palette.chip_warning_text),
+                shadow: Argb::new(
+                    96,
+                    palette.shell_bg.r(),
+                    palette.shell_bg.g(),
+                    palette.shell_bg.b(),
+                ),
             }
         } else {
             Self {
@@ -441,7 +458,12 @@ fn draw_capsule(
             width + extent * 2.0,
             height + extent * 2.0,
             radius + extent,
-            Argb::new(alpha, 0, 0, 0),
+            Argb::new(
+                alpha,
+                ((colors.shadow.0 >> 16) & 0xff) as u8,
+                ((colors.shadow.0 >> 8) & 0xff) as u8,
+                (colors.shadow.0 & 0xff) as u8,
+            ),
         )?;
     }
     canvas.fill_rounded_rect(x, y, width, height, radius, colors.surface)?;
@@ -2878,13 +2900,45 @@ mod tests {
         assert_eq!(light.warning, Argb::new(255, 123, 80, 36));
 
         let dark = NativeColors::for_theme(true);
-        assert_eq!(dark.surface, Argb::new(184, 6, 28, 46));
-        assert_eq!(dark.border, Argb::new(36, 124, 203, 201));
-        assert_eq!(dark.text, Argb::from_color(ICE_MIST));
-        assert_eq!(dark.muted_text, Argb::from_color(SOFT_AQUA));
-        assert_eq!(dark.waveform, Argb::from_color(TEAL_ACCENT));
-        assert_eq!(dark.success, Argb::new(255, 157, 223, 183));
-        assert_eq!(dark.error, Argb::new(255, 255, 210, 203));
-        assert_eq!(dark.warning, Argb::new(255, 246, 223, 194));
+        let dark_palette = ThemePalette::dark();
+        assert_eq!(
+            dark.surface,
+            Argb::new(
+                184,
+                dark_palette.panel_bg.r(),
+                dark_palette.panel_bg.g(),
+                dark_palette.panel_bg.b(),
+            )
+        );
+        assert_eq!(
+            dark.border,
+            Argb::new(
+                36,
+                dark_palette.border.r(),
+                dark_palette.border.g(),
+                dark_palette.border.b(),
+            )
+        );
+        assert_eq!(dark.text, Argb::from_color(dark_palette.text));
+        assert_eq!(dark.muted_text, Argb::from_color(DARK_OVERLAY_MUTED_TEXT));
+        assert_eq!(
+            dark.waveform,
+            Argb::from_color(dark_palette.chip_active_text)
+        );
+        assert_eq!(dark.success, Argb::from_color(dark_palette.success));
+        assert_eq!(dark.error, Argb::from_color(dark_palette.error_text));
+        assert_eq!(
+            dark.warning,
+            Argb::from_color(dark_palette.chip_warning_text)
+        );
+        assert_eq!(
+            dark.shadow,
+            Argb::new(
+                96,
+                dark_palette.shell_bg.r(),
+                dark_palette.shell_bg.g(),
+                dark_palette.shell_bg.b(),
+            )
+        );
     }
 }

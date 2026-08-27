@@ -1,6 +1,9 @@
 :root {
-  --scribe-deep-navy: #061c2e;
   --scribe-deep-ink: #08233a;
+  --scribe-charcoal: #121418;
+  --scribe-surface-dark: #1a1d22;
+  --scribe-soft-text: #e9f0f0;
+  --scribe-muted-gray: #8e99a3;
   --scribe-teal: #2d979c;
   --scribe-teal-text: #176d70;
   --scribe-teal-accent: #7ccbc9;
@@ -31,25 +34,27 @@
 }
 
 :root[data-theme='dark'] {
-  --scribe-surface: #08233a;
-  --scribe-surface-muted: #061c2e;
-  --scribe-focus: #7ccbc9;
-  --sl-color-accent-low: #08233a;
-  --sl-color-accent: #7ccbc9;
-  --sl-color-accent-high: #eaf5f5;
-  --sl-color-text: #eaf5f5;
-  --sl-color-text-accent: #7ccbc9;
-  --sl-color-text-invert: #061c2e;
-  --sl-color-gray-1: #eaf5f5;
-  --sl-color-gray-2: #acdbd9;
-  --sl-color-gray-3: #7ccbc9;
+  --scribe-surface: var(--scribe-surface-dark);
+  --scribe-surface-muted: var(--scribe-charcoal);
+  /* Accessible light-on-dark teal for small text and hover states. */
+  --scribe-teal-accent: #77d1d3;
+  --scribe-focus: var(--scribe-teal);
+  --sl-color-accent-low: var(--scribe-surface-dark);
+  --sl-color-accent: var(--scribe-teal);
+  --sl-color-accent-high: var(--scribe-soft-text);
+  --sl-color-text: var(--scribe-soft-text);
+  --sl-color-text-accent: var(--scribe-teal-accent);
+  --sl-color-text-invert: var(--scribe-charcoal);
+  --sl-color-gray-1: var(--scribe-soft-text);
+  --sl-color-gray-2: var(--scribe-muted-gray);
+  --sl-color-gray-3: #bac5cb;
   --sl-color-gray-4: #2d979c;
-  --sl-color-gray-5: #17495b;
-  --sl-color-gray-6: #08233a;
-  --sl-color-bg: #061c2e;
-  --sl-color-bg-nav: #08233a;
-  --sl-color-bg-sidebar: #08233a;
-  --sl-color-hairline: #17495b;
+  --sl-color-gray-5: #343a42;
+  --sl-color-gray-6: var(--scribe-surface-dark);
+  --sl-color-bg: var(--scribe-charcoal);
+  --sl-color-bg-nav: var(--scribe-surface-dark);
+  --sl-color-bg-sidebar: var(--scribe-surface-dark);
+  --sl-color-hairline: #616b75;
   --sl-color-hairline-light: #2d979c;
 }
 
@@ -93,8 +98,8 @@ header .site-title img { height: auto; max-height: 2.35rem; width: auto; }
 }
 
 .primary-link:hover { background: var(--scribe-teal-text); color: #fff; }
-:root[data-theme='dark'] .primary-link { background: var(--scribe-teal-accent); color: var(--scribe-deep-navy); }
-:root[data-theme='dark'] .primary-link:hover { background: var(--scribe-soft-aqua); color: var(--scribe-deep-navy); }
+:root[data-theme='dark'] .primary-link { background: var(--scribe-teal); color: var(--scribe-charcoal); }
+:root[data-theme='dark'] .primary-link:hover { background: var(--scribe-teal-accent); color: var(--scribe-charcoal); }
 :where(a, button, [role='button']):focus-visible { outline: 3px solid var(--scribe-focus); outline-offset: 3px; }
 
 .hero-actions { align-items: center; display: flex; flex-wrap: wrap; gap: 0.75rem 1rem; margin: 1.25rem 0; }

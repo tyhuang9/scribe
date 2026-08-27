@@ -14,7 +14,6 @@ pub(crate) const ICE_MIST: Color32 = Color32::from_rgb(0xEA, 0xF5, 0xF5);
 pub(crate) const WARM_SAND: Color32 = Color32::from_rgb(0xE9, 0xD1, 0xB1);
 pub(crate) const LIVE_CORAL: Color32 = Color32::from_rgb(0xFD, 0x81, 0x6F);
 pub(crate) const DEEP_NAVY: Color32 = Color32::from_rgb(0x06, 0x1C, 0x2E);
-pub(crate) const NAVY_SURFACE: Color32 = DEEP_INK;
 pub(crate) const TEAL_ACCENT: Color32 = Color32::from_rgb(0x7C, 0xCB, 0xC9);
 
 const APP_ICON_PNG: &[u8] = include_bytes!("../assets/branding/scribe-app-icon.png");
@@ -452,7 +451,6 @@ mod tests {
         assert_eq!(WARM_SAND.to_array(), [0xE9, 0xD1, 0xB1, 0xFF]);
         assert_eq!(LIVE_CORAL.to_array(), [0xFD, 0x81, 0x6F, 0xFF]);
         assert_eq!(DEEP_NAVY.to_array(), [0x06, 0x1C, 0x2E, 0xFF]);
-        assert_eq!(NAVY_SURFACE.to_array(), [0x08, 0x23, 0x3A, 0xFF]);
         assert_eq!(TEAL_ACCENT.to_array(), [0x7C, 0xCB, 0xC9, 0xFF]);
     }
 

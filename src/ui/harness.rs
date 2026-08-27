@@ -844,20 +844,17 @@ fn show_overlay_fixture_host(ctx: &egui::Context, overlay_presented: bool) {
                 viewport.right_bottom(),
             );
             let panel_width = 150.0;
+            let dark_palette = ThemePalette::dark();
             let panels = [
                 (
                     crate::branding::ICE_MIST,
                     crate::branding::DEEP_INK,
                     "LIGHT SAMPLE",
                 ),
+                (dark_palette.content_bg, dark_palette.text, "DARK SAMPLE"),
                 (
-                    crate::branding::DEEP_NAVY,
-                    crate::branding::ICE_MIST,
-                    "DARK SAMPLE",
-                ),
-                (
-                    crate::branding::SCRIBE_TEAL,
-                    crate::branding::DEEP_INK,
+                    dark_palette.accent,
+                    dark_palette.primary_button_text,
                     "SCRIBE TEAL",
                 ),
             ];
