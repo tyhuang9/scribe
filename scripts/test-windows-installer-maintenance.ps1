@@ -69,6 +69,37 @@ foreach ($actionLabel in @('Install Scribe', 'Update Scribe from ', 'Repair Scri
     }
 }
 
+# A repairable product registration is independent from the old uninstaller.
+$loadExistingInstallStart = $installer.IndexOf('procedure LoadExistingInstallation;', [System.StringComparison]::Ordinal)
+$loadExistingInstallEnd = $installer.IndexOf('procedure AddRemoveAction;', $loadExistingInstallStart, [System.StringComparison]::Ordinal)
+if ($loadExistingInstallStart -lt 0 -or $loadExistingInstallEnd -le $loadExistingInstallStart) {
+    throw 'Could not isolate existing-install detection for maintenance regression checks.'
+}
+$loadExistingInstall = $installer.Substring($loadExistingInstallStart, $loadExistingInstallEnd - $loadExistingInstallStart)
+if ($loadExistingInstall -notmatch 'IsSafeInstallPath\(ExistingInstallPath\)' -or
+    $loadExistingInstall -notmatch 'ExistingInstallUsable :=[\s\S]*StrToVersion\(ExistingVersion, ExistingPackedVersion\)[\s\S]*StrToVersion\(''\{#AppVersion\}'', SetupPackedVersion\)') {
+    throw 'Update and Repair must require a valid stable registration, version, and install path.'
+}
+$safePathValidationPosition = $loadExistingInstall.IndexOf('IsSafeInstallPath(ExistingInstallPath)', [System.StringComparison]::Ordinal)
+$productValidationPosition = $loadExistingInstall.IndexOf(
+    'ExistingInstallUsable :=',
+    $safePathValidationPosition,
+    [System.StringComparison]::Ordinal
+)
+$uninstallerLookupPosition = $loadExistingInstall.IndexOf("RegQueryStringValue(HKCU, ScribeUninstallRegKey, 'UninstallString'", [System.StringComparison]::Ordinal)
+if ($productValidationPosition -lt 0 -or $uninstallerLookupPosition -le $productValidationPosition) {
+    throw 'Missing or corrupt uninstaller data must not block Update or Repair eligibility.'
+}
+$productValidation = $loadExistingInstall.Substring(
+    $productValidationPosition,
+    $uninstallerLookupPosition - $productValidationPosition
+)
+if ($productValidation.Contains('ExistingUninstallerTrusted', [System.StringComparison]::Ordinal)) {
+    throw 'Existing uninstaller trust must not be a precondition for Update or Repair.'
+}
+Assert-Contains 'A missing or corrupt old uninstaller must not prevent an in-place update or' 'broken-uninstaller repair contract'
+Assert-Contains 'MaintenancePage.Add(''Remove Scribe (unavailable: uninstaller is missing or invalid)'')' 'clear unavailable-remove action'
+
 # Removal is terminal and runs only a validated executable path, never a registry command line.
 Assert-Contains 'function IsTrustedUninstaller' 'uninstaller validation'
 Assert-Contains "(Copy(CandidateName, 1, 5) = 'unins')" 'Inno uninstaller filename validation'
@@ -81,6 +112,7 @@ Assert-Contains 'Scribe removal was cancelled or did not finish' 'removal cancel
 Assert-Contains 'RegKeyExists(HKCU, ScribeUninstallRegKey) then begin' 'post-uninstall registry confirmation'
 Assert-Contains 'RemovalCompleted := True;' 'successful removal state'
 Assert-Matches 'procedure CancelButtonClick[\s\S]*RemovalCompleted[\s\S]*Confirm := False[\s\S]*Cancel := True' 'clean setup exit after successful removal'
+Assert-Contains 'Remove is unavailable because this Scribe installation has no trusted uninstaller.' 'missing or corrupt uninstaller remove rejection'
 
 # No installer deletion directive may target Scribe data outside {app}.
 if ($installer -match '(?mi)^\[UninstallDelete\]' -or $installer -match '(?mi)^\[InstallDelete\]') {

@@ -72,6 +72,14 @@ begin
   Result := RemoveBackslashUnlessRoot(Directory);
 end;
 
+function IsSafeInstallPath(const InstallPath: String): Boolean;
+begin
+  Result :=
+    (InstallPath <> '') and
+    PathIsRooted(InstallPath) and
+    not PathHasInvalidCharacters(InstallPath, True);
+end;
+
 function ExtractUninstallerExecutable(const UninstallString: String; var Executable: String): Boolean;
 var
   ClosingQuote: Integer;
@@ -133,19 +141,32 @@ begin
 
   if not RegQueryStringValue(HKCU, ScribeUninstallRegKey, 'DisplayVersion', ExistingVersion) or
      not RegQueryStringValue(HKCU, ScribeUninstallRegKey, 'InstallLocation', ExistingInstallPath) or
-     not RegQueryStringValue(HKCU, ScribeUninstallRegKey, 'UninstallString', UninstallString) or
-     not ExtractUninstallerExecutable(UninstallString, ExistingUninstallerPath) or
-     not IsTrustedUninstaller(ExistingUninstallerPath, ExistingInstallPath) then begin
+     not IsSafeInstallPath(ExistingInstallPath) then begin
     exit;
   end;
 
-  ExistingUninstallerTrusted := True;
   ExistingInstallUsable :=
     (ExistingVersion <> '') and
     StrToVersion(ExistingVersion, ExistingPackedVersion) and
     StrToVersion('{#AppVersion}', SetupPackedVersion);
   if ExistingInstallUsable then
     ExistingVersionComparison := ComparePackedVersion(ExistingPackedVersion, SetupPackedVersion);
+
+  { A missing or corrupt old uninstaller must not prevent an in-place update or
+    repair from recreating it. It is required only for the Remove action. }
+  if RegQueryStringValue(HKCU, ScribeUninstallRegKey, 'UninstallString', UninstallString) and
+     ExtractUninstallerExecutable(UninstallString, ExistingUninstallerPath) then begin
+    ExistingUninstallerTrusted :=
+      IsTrustedUninstaller(ExistingUninstallerPath, ExistingInstallPath);
+  end;
+end;
+
+procedure AddRemoveAction;
+begin
+  if ExistingUninstallerTrusted then
+    MaintenancePage.Add('Remove Scribe')
+  else
+    MaintenancePage.Add('Remove Scribe (unavailable: uninstaller is missing or invalid)');
 end;
 
 procedure AddMaintenancePage;
@@ -165,22 +186,22 @@ begin
     MaintenancePage.SelectedValueIndex := 0;
     SelectedMaintenanceAction := maInstall;
   end else if not ExistingInstallUsable then begin
-    MaintenancePage.Add('Remove the registered Scribe installation');
+    AddRemoveAction;
     MaintenancePage.Add('Cancel');
     MaintenancePage.SelectedValueIndex := 1;
     SelectedMaintenanceAction := maBlocked;
   end else if ExistingVersionComparison < 0 then begin
     MaintenancePage.Add('Update Scribe from ' + ExistingVersion + ' to {#AppVersion}');
-    MaintenancePage.Add('Remove Scribe');
+    AddRemoveAction;
     MaintenancePage.SelectedValueIndex := 0;
     SelectedMaintenanceAction := maUpdate;
   end else if ExistingVersionComparison = 0 then begin
     MaintenancePage.Add('Repair Scribe {#AppVersion}');
-    MaintenancePage.Add('Remove Scribe');
+    AddRemoveAction;
     MaintenancePage.SelectedValueIndex := 0;
     SelectedMaintenanceAction := maRepair;
   end else begin
-    MaintenancePage.Add('Remove the newer Scribe ' + ExistingVersion + ' installation');
+    AddRemoveAction;
     MaintenancePage.Add('Cancel (do not downgrade)');
     MaintenancePage.SelectedValueIndex := 1;
     SelectedMaintenanceAction := maBlocked;
@@ -208,8 +229,9 @@ var
 begin
   Result := False;
   if not ExistingUninstallerTrusted then begin
-    MsgBox('Scribe is registered as installed, but its uninstaller details are invalid. ' +
-      'For safety, this setup will not run a registry-provided command.', mbError, MB_OK);
+    MsgBox('Remove is unavailable because this Scribe installation has no trusted uninstaller. ' +
+      'Choose Update or Repair to recreate installer registration, or remove it through Windows after fixing the installation.',
+      mbError, MB_OK);
     exit;
   end;
 
