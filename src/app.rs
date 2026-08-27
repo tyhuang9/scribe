@@ -3308,7 +3308,11 @@ pub struct LocalTranscriberApp {
     history_error: Option<String>,
     history_delete_confirmation: Option<i64>,
     history_confirmation_focus_pending: bool,
+    history_confirmation_return_focus: Option<i64>,
     history_search_focus_pending: bool,
+    history_more_focus_pending: Option<i64>,
+    history_expanded_transcripts: HashSet<i64>,
+    history_expanded_details: HashSet<i64>,
     history_mutation_sequence: u64,
     history_mutation_in_flight: Option<u64>,
     pending_history_retention_policy: Option<HistoryRetentionPolicy>,
@@ -3478,7 +3482,11 @@ impl LocalTranscriberApp {
             history_error,
             history_delete_confirmation: None,
             history_confirmation_focus_pending: false,
+            history_confirmation_return_focus: None,
             history_search_focus_pending: false,
+            history_more_focus_pending: None,
+            history_expanded_transcripts: HashSet::new(),
+            history_expanded_details: HashSet::new(),
             history_mutation_sequence: 0,
             history_mutation_in_flight: None,
             pending_history_retention_policy: None,
@@ -5874,6 +5882,7 @@ impl LocalTranscriberApp {
                 }
                 self.history_applied_search = search;
                 self.history_records.clear();
+                self.prune_history_card_ui_state();
                 self.history_next = None;
                 self.request_history_page(false);
             }
@@ -5882,6 +5891,7 @@ impl LocalTranscriberApp {
                 self.history_applied_search.clear();
                 self.history_search_focus_pending = true;
                 self.history_records.clear();
+                self.prune_history_card_ui_state();
                 self.history_next = None;
                 self.request_history_page(false);
             }
@@ -5900,6 +5910,7 @@ impl LocalTranscriberApp {
                 );
             }
             HistoryPageAction::TogglePinned { id, pinned } => {
+                self.history_more_focus_pending = Some(id);
                 self.start_history_mutation(
                     if pinned {
                         "History entry pinned"
@@ -5956,8 +5967,12 @@ impl LocalTranscriberApp {
                     self.status_message = "Native history playback is unavailable".to_owned();
                 }
             }
-            HistoryPageAction::Retry(history_id) => self.start_history_retry(history_id),
+            HistoryPageAction::Retry(history_id) => {
+                self.history_more_focus_pending = Some(history_id);
+                self.start_history_retry(history_id);
+            }
             HistoryPageAction::DeleteAudio(id) => {
+                self.history_more_focus_pending = Some(id);
                 self.start_history_mutation("Retained audio deleted", move |store| {
                     store
                         .delete_audio(id)
@@ -5968,16 +5983,56 @@ impl LocalTranscriberApp {
             HistoryPageAction::RequestDelete(id) => {
                 self.history_delete_confirmation = Some(id);
                 self.history_confirmation_focus_pending = true;
+                self.history_confirmation_return_focus = Some(id);
             }
             HistoryPageAction::ConfirmDelete(id) => {
                 self.history_delete_confirmation = None;
+                self.history_confirmation_return_focus = None;
                 self.history_search_focus_pending = true;
                 self.delete_history_entry(id);
             }
             HistoryPageAction::CancelDelete => {
                 self.history_delete_confirmation = None;
-                self.history_search_focus_pending = true;
+                self.history_more_focus_pending = self.history_confirmation_return_focus.take();
             }
+            HistoryPageAction::ToggleTranscript(id) => {
+                toggle_history_card_state(&mut self.history_expanded_transcripts, id);
+            }
+            HistoryPageAction::ToggleDetails(id) => {
+                toggle_history_card_state(&mut self.history_expanded_details, id);
+                self.history_more_focus_pending = Some(id);
+            }
+        }
+    }
+
+    fn prune_history_card_ui_state(&mut self) {
+        let visible_ids = self
+            .history_records
+            .iter()
+            .map(|record| record.id)
+            .collect::<HashSet<_>>();
+        self.history_expanded_transcripts
+            .retain(|id| visible_ids.contains(id));
+        self.history_expanded_details
+            .retain(|id| visible_ids.contains(id));
+        if self
+            .history_more_focus_pending
+            .is_some_and(|id| !visible_ids.contains(&id))
+        {
+            self.history_more_focus_pending = None;
+        }
+        if self
+            .history_confirmation_return_focus
+            .is_some_and(|id| !visible_ids.contains(&id))
+        {
+            self.history_confirmation_return_focus = None;
+        }
+        if self
+            .history_delete_confirmation
+            .is_some_and(|id| !visible_ids.contains(&id))
+        {
+            self.history_delete_confirmation = None;
+            self.history_confirmation_focus_pending = false;
         }
     }
 
@@ -6598,6 +6653,7 @@ impl LocalTranscriberApp {
                             } else {
                                 self.history_records = page.records;
                             }
+                            self.prune_history_card_ui_state();
                             self.history_next = page.next;
                             self.history_error = None;
                         }
@@ -12641,8 +12697,10 @@ impl LocalTranscriberApp {
         let work_active = self.has_active_work();
         let playing = self.playing_history_id;
         let armed = self.armed_history_repaste.as_ref().map(|armed| armed.id);
+        let model_names = self.history_model_names();
         let focus_search = self.history_search_focus_pending;
         let focus_delete_confirmation = self.history_confirmation_focus_pending;
+        let focus_more_action = self.history_more_focus_pending;
         let mut action = None;
         page(ui, "History", status, &status_message, |ui| {
             action = history_page(
@@ -12658,16 +12716,47 @@ impl LocalTranscriberApp {
                     playing,
                     playback_stopping: self.history_playback_stopping,
                     armed_repaste: armed,
+                    model_names: &model_names,
+                    expanded_transcripts: &self.history_expanded_transcripts,
+                    expanded_details: &self.history_expanded_details,
                     focus_search,
                     focus_delete_confirmation,
+                    focus_more_action,
                 },
             );
         });
         self.history_search_focus_pending = false;
         self.history_confirmation_focus_pending = false;
+        self.history_more_focus_pending = None;
         if let Some(action) = action {
             self.apply_history_action(action);
         }
+    }
+
+    fn history_model_names(&self) -> HashMap<String, String> {
+        let mut names = self
+            .transcription_service
+            .model_descriptors()
+            .into_iter()
+            .map(|descriptor| {
+                (
+                    descriptor.id.as_str().to_owned(),
+                    descriptor.display_name.to_owned(),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        for model in self.remote_catalog.local_models.as_ref() {
+            names
+                .entry(model.id.clone())
+                .or_insert_with(|| model.display_name.clone());
+        }
+        names
+    }
+}
+
+fn toggle_history_card_state(states: &mut HashSet<i64>, id: i64) {
+    if !states.insert(id) {
+        states.remove(&id);
     }
 }
 
@@ -17730,6 +17819,51 @@ mod layout_tests {
     }
 
     #[test]
+    fn history_card_expansion_is_ephemeral_and_delete_cancel_restores_more_actions_focus() {
+        let mut app = test_app();
+        let record = HistoryRecord {
+            id: 31,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            completed_at_ms: Some(1),
+            status: HistoryStatus::Completed,
+            raw_text: "saved transcript".to_owned(),
+            final_text: Some("saved transcript".to_owned()),
+            model_id: "whisper_cpp_base_en".to_owned(),
+            metrics: HistoryMetrics::default(),
+            pinned: false,
+            source_app: None,
+            audio_path: None,
+            failure: None,
+            retry_count: 0,
+            output_outcome: None,
+        };
+        app.history_records = vec![record.clone()];
+
+        app.apply_history_action(HistoryPageAction::ToggleTranscript(record.id));
+        app.apply_history_action(HistoryPageAction::ToggleDetails(record.id));
+        assert!(app.history_expanded_transcripts.contains(&record.id));
+        assert!(app.history_expanded_details.contains(&record.id));
+        assert_eq!(app.history_more_focus_pending, Some(record.id));
+
+        app.apply_history_action(HistoryPageAction::RequestDelete(record.id));
+        assert_eq!(app.history_delete_confirmation, Some(record.id));
+        assert!(app.history_confirmation_focus_pending);
+        app.apply_history_action(HistoryPageAction::CancelDelete);
+        assert_eq!(app.history_delete_confirmation, None);
+        assert_eq!(app.history_more_focus_pending, Some(record.id));
+
+        app.apply_history_action(HistoryPageAction::Retry(record.id));
+        assert_eq!(app.history_more_focus_pending, Some(record.id));
+
+        app.history_records.clear();
+        app.prune_history_card_ui_state();
+        assert!(app.history_expanded_transcripts.is_empty());
+        assert!(app.history_expanded_details.is_empty());
+        assert_eq!(app.history_more_focus_pending, None);
+    }
+
+    #[test]
     fn recording_is_blocked_until_history_playback_is_terminal() {
         let mut app = test_app();
         app.playing_history_id = Some(21);
@@ -20395,7 +20529,11 @@ mod layout_tests {
             history_error: None,
             history_delete_confirmation: None,
             history_confirmation_focus_pending: false,
+            history_confirmation_return_focus: None,
             history_search_focus_pending: false,
+            history_more_focus_pending: None,
+            history_expanded_transcripts: HashSet::new(),
+            history_expanded_details: HashSet::new(),
             history_mutation_sequence: 0,
             history_mutation_in_flight: None,
             pending_history_retention_policy: None,
@@ -24793,8 +24931,12 @@ mod layout_tests {
                             playing: None,
                             playback_stopping: false,
                             armed_repaste: None,
+                            model_names: &HashMap::new(),
+                            expanded_transcripts: &HashSet::new(),
+                            expanded_details: &HashSet::new(),
                             focus_search: false,
                             focus_delete_confirmation: true,
+                            focus_more_action: None,
                         },
                     );
                 });
@@ -24809,13 +24951,20 @@ mod layout_tests {
             node.role() == egui::accesskit::Role::Heading
                 && node
                     .name()
-                    .is_some_and(|name| name.starts_with("Completed - "))
+                    .is_some_and(|name| name.starts_with("Completed — "))
         }));
-        for expected in ["Copy", "Paste again", "Pin", "Delete entry"] {
+        for expected in ["Copy", "Paste again"] {
             assert!(update.nodes.iter().any(|(_, node)| {
                 node.role() == egui::accesskit::Role::Button && node.name() == Some(expected)
             }));
         }
+        assert!(
+            update
+                .nodes
+                .iter()
+                .any(|(_, node)| node.name() == Some("More actions")),
+            "History must expose a labeled more-actions menu"
+        );
         let group = update
             .nodes
             .iter()
@@ -24831,18 +24980,16 @@ mod layout_tests {
                 node.role() == egui::accesskit::Role::Heading
                     && node
                         .name()
-                        .is_some_and(|name| name.starts_with("Completed - "))
+                        .is_some_and(|name| name.starts_with("Completed — "))
             })
             .map(|(id, _)| *id)
             .expect("missing contextual history heading");
-        let delete_id = update
+        let more_actions_id = update
             .nodes
             .iter()
-            .find(|(_, node)| {
-                node.role() == egui::accesskit::Role::Button && node.name() == Some("Delete entry")
-            })
+            .find(|(_, node)| node.name() == Some("More actions"))
             .map(|(id, _)| *id)
-            .expect("missing history delete action");
+            .expect("missing history more-actions menu");
         let is_group_descendant = |target| {
             let mut pending = group.1.children().to_vec();
             while let Some(id) = pending.pop() {
@@ -24856,15 +25003,14 @@ mod layout_tests {
             false
         };
         assert!(is_group_descendant(contextual_heading_id));
-        assert!(is_group_descendant(delete_id));
+        assert!(is_group_descendant(more_actions_id));
         assert!(update.nodes.iter().any(|(_, node)| {
             node.name() == Some("1 history entries loaded")
                 && node.live() == Some(egui::accesskit::Live::Polite)
                 && node.is_live_atomic()
         }));
         assert!(update.nodes.iter().any(|(_, node)| {
-            node.role() == egui::accesskit::Role::Button
-                && node.name() == Some("Delete entry")
+            node.name() == Some("More actions")
                 && node
                     .description()
                     .is_some_and(|description| description.contains("whisper_cpp_base_en"))
@@ -24875,13 +25021,6 @@ mod layout_tests {
             .find(|(id, _)| *id == update.focus)
             .map(|(_, node)| node);
         assert_eq!(focused.and_then(|node| node.name()), Some("Cancel"));
-        let disclosure = update
-            .nodes
-            .iter()
-            .map(|(_, node)| node)
-            .find(|node| node.name() == Some("Raw transcript"))
-            .expect("missing raw transcript disclosure");
-        assert_eq!(disclosure.is_expanded(), Some(false));
     }
 
     #[test]

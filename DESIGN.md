@@ -15,6 +15,14 @@ Scribe should feel like a native utility, not a dashboard. The default Transcrib
 - 28px outer content margins, 12-16px panel spacing, and 4-8px radii.
 - No decorative shadows, gradients, marketing hero sections, or nested card layouts.
 
+## History
+
+- History uses one quiet bordered card per entry: 6px radius, 16px inner padding, and 12px between cards. Cards never gain a shadow or change size on hover.
+- Card hierarchy is status and relative time first, followed by optional source app and a passive pinned marker. The transcript preview is next; a grapheme-safe 240-character preview exposes `Show full transcript` only when needed.
+- Keep immediate use close at hand: Copy, Paste again when final text is available, and Play/Stop when retained audio is available. Put retention, retry, detail, and destructive actions in a labeled `More actions` menu.
+- Details are a temporary in-session expansion, not persisted history state. They disclose the friendly model name (or stored model ID when unavailable), output outcome, timing and retry metadata, plus raw transcript and Copy raw only when raw and final text differ.
+- Destructive deletion remains explicitly confirmed. Menu dismissal and canceled deletion return focus to the entry’s `More actions` control; confirmation initially focuses Cancel. History cards must keep their actions keyboard reachable, visibly focused, and wrapped inside narrow routes.
+
 ## Color
 
 - Canvas: `#F7F9FB`

@@ -2,6 +2,9 @@
 
 use std::{collections::HashSet, path::Path};
 
+#[cfg(test)]
+use std::collections::HashMap;
+
 use eframe::egui::{
     self, Align, Align2, Color32, ComboBox, Frame, Layout, Margin, RichText, Rounding, ScrollArea,
     Sense, Stroke, Vec2,
@@ -637,7 +640,17 @@ pub(crate) fn show_route_scroll<T>(
     route: UiRoute,
     add_contents: impl FnOnce(&mut egui::Ui) -> T,
 ) -> T {
+    // History commonly overflows vertically even at the minimum viewport.
+    // Reserve its solid-scrollbar gutter before sizing full-width cards so
+    // the vertical track never creates a hidden horizontal overflow axis.
     let route_width = ui.available_width();
+    let route_width = (route_width
+        - if route == UiRoute::History {
+            ui.spacing().item_spacing.x
+        } else {
+            0.0
+        })
+    .max(0.0);
     let viewport_id = egui::Id::new(("route-viewport", route));
     ui.data_mut(|data| data.insert_temp(viewport_id, ui.max_rect()));
     let scroll = ScrollArea::vertical()
@@ -656,7 +669,7 @@ pub(crate) fn show_route_scroll<T>(
                     content
                 })
                 .inner;
-            if route != UiRoute::Models
+            if !matches!(route, UiRoute::Models | UiRoute::History)
                 && let Some((id, rect)) = ui.data(|data| {
                     data.get_temp::<(egui::Id, egui::Rect)>(egui::Id::new(
                         ROUTE_FOCUSED_CONTROL_SCROLL,
@@ -668,7 +681,7 @@ pub(crate) fn show_route_scroll<T>(
             }
             content
         });
-    if route == UiRoute::Models {
+    if matches!(route, UiRoute::Models | UiRoute::History) {
         let focused_control_scroll = ui.data_mut(|data| {
             let key = egui::Id::new(ROUTE_FOCUSED_CONTROL_SCROLL);
             let value = data.get_temp::<(egui::Id, egui::Rect)>(key);
@@ -680,9 +693,11 @@ pub(crate) fn show_route_scroll<T>(
         {
             let mut state = scroll.state;
             let mut visible_rect = scroll.inner_rect;
-            if let Some(dock_rect) = ui.data(|data| {
-                data.get_temp::<egui::Rect>(egui::Id::new("models-comparison-dock-rect"))
-            }) {
+            if route == UiRoute::Models
+                && let Some(dock_rect) = ui.data(|data| {
+                    data.get_temp::<egui::Rect>(egui::Id::new("models-comparison-dock-rect"))
+                })
+            {
                 visible_rect.max.y = visible_rect
                     .max
                     .y
@@ -12249,7 +12264,7 @@ mod tests {
                     node.role() == egui::accesskit::Role::Heading
                         && node
                             .name()
-                            .is_some_and(|name| name.starts_with("Completed - "))
+                            .is_some_and(|name| name.starts_with("Completed — "))
                 })
                 .map(|(id, _)| *id)
                 .expect("populated History must expose a record heading");
@@ -12258,7 +12273,7 @@ mod tests {
                 .iter()
                 .find(|(_, node)| {
                     node.role() == egui::accesskit::Role::Button
-                        && node.name() == Some("Delete entry")
+                        && node.name() == Some("More actions")
                 })
                 .map(|(id, _)| *id)
                 .expect("populated History must expose record actions");
@@ -12281,20 +12296,18 @@ mod tests {
                 .map(|(id, _)| *id)
                 .expect("History must expose one stable results group");
             for model_id in model_ids {
-                let raw_id = update
+                let more_actions_id = update
                     .nodes
                     .iter()
                     .find(|(_, node)| {
-                        node.name() == Some("Raw transcript")
+                        node.name() == Some("More actions")
                             && node
                                 .description()
                                 .is_some_and(|description| description.contains(model_id))
                     })
                     .map(|(id, _)| *id)
-                    .unwrap_or_else(|| {
-                        panic!("Raw transcript disclosure must identify model {model_id}")
-                    });
-                assert!(is_descendant(update, results_id, raw_id));
+                    .unwrap_or_else(|| panic!("More actions must identify model {model_id}"));
+                assert!(is_descendant(update, results_id, more_actions_id));
             }
             let armed_id = update
                 .nodes
@@ -12409,8 +12422,12 @@ mod tests {
                                         playing: None,
                                         playback_stopping: false,
                                         armed_repaste,
+                                        model_names: &HashMap::new(),
+                                        expanded_transcripts: &HashSet::new(),
+                                        expanded_details: &HashSet::new(),
                                         focus_search: false,
                                         focus_delete_confirmation: false,
+                                        focus_more_action: None,
                                     },
                                 );
                             },
@@ -12476,8 +12493,12 @@ mod tests {
                                             playing: None,
                                             playback_stopping: false,
                                             armed_repaste: None,
+                                            model_names: &HashMap::new(),
+                                            expanded_transcripts: &HashSet::new(),
+                                            expanded_details: &HashSet::new(),
                                             focus_search,
                                             focus_delete_confirmation: false,
+                                            focus_more_action: None,
                                         },
                                     );
                                 },
@@ -12598,18 +12619,28 @@ mod tests {
         replacement_record.id = 2;
         replacement_record.raw_text = "replacement transcript".into();
         replacement_record.final_text = Some("replacement transcript".into());
+        let replacement_ctx = egui::Context::default();
+        replacement_ctx.enable_accesskit();
+        let replacement_base = render_history(
+            &replacement_ctx,
+            std::slice::from_ref(&record),
+            false,
+            "meeting",
+            None,
+        );
         let replacement = render_history(
-            &ctx,
+            &replacement_ctx,
             std::slice::from_ref(&replacement_record),
             false,
             "meeting",
             None,
         );
-        let mut replacement_consumer = accesskit_consumer::Tree::new(filtered.clone(), true);
+        let mut replacement_consumer =
+            accesskit_consumer::Tree::new(replacement_base.clone(), true);
         replacement_consumer
             .update_and_process_changes(replacement.clone(), &mut NoopAccessKitChangeHandler);
         let (_, _, orphaned_updated, orphaned_added) =
-            apply_accesskit_incremental_update(&filtered, &replacement);
+            apply_accesskit_incremental_update(&replacement_base, &replacement);
         assert!(
             orphaned_updated.is_empty(),
             "record replacement orphaned updated nodes: {orphaned_updated:?}"
