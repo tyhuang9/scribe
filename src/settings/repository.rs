@@ -102,13 +102,20 @@ pub(crate) fn save_to_path(path: &Path, config: &AppConfig) -> Result<()> {
 
 pub(crate) fn artifact_config_fingerprint(config: &AppConfig) -> Result<String> {
     let normalized = normalized_config(config);
-    let witness = serde_json::json!({
+    let mut witness = serde_json::json!({
         "managed_models": normalized.general.managed_models,
         "managed_remote_models": normalized.general.managed_remote_models,
         "imported_gguf_models": normalized.general.imported_gguf_models,
         "managed_runtimes": normalized.general.managed_runtimes,
         "model_paths": normalized.general.model_paths,
     });
+    // Preserve fingerprints produced by schema-v2 builds when there is no
+    // exclusion. Once an included artifact is deleted, the non-empty opt-out
+    // becomes the durable witness distinguishing rollback from commit.
+    if !normalized.general.excluded_bundled_model_ids.is_empty() {
+        witness["excluded_bundled_model_ids"] =
+            serde_json::to_value(normalized.general.excluded_bundled_model_ids)?;
+    }
     let canonical = canonical_json(witness);
     Ok(format!(
         "{:x}",
@@ -617,6 +624,13 @@ mod tests {
         assert_eq!(artifact_config_fingerprint(&restarted).unwrap(), expected);
         let mut changed = restarted.clone();
         changed.recording.hotkey = "Different".to_owned();
+        assert_eq!(artifact_config_fingerprint(&changed).unwrap(), expected);
+        changed
+            .general
+            .excluded_bundled_model_ids
+            .push(crate::model_catalog::BUNDLED_BASE_MODEL_ID.to_owned());
+        assert_ne!(artifact_config_fingerprint(&changed).unwrap(), expected);
+        changed.general.excluded_bundled_model_ids.clear();
         assert_eq!(artifact_config_fingerprint(&changed).unwrap(), expected);
         changed.general.model_paths.insert(
             "whisper_cpp_tiny_en".to_owned(),

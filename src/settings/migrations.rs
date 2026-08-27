@@ -134,6 +134,13 @@ fn migrate_legacy_flat(
         config.general.selected_default_model,
         diagnostics,
     );
+    config.general.excluded_bundled_model_ids = take(
+        &mut root,
+        "excluded_bundled_model_ids",
+        &[],
+        config.general.excluded_bundled_model_ids,
+        diagnostics,
+    );
     config.general.playground_selected_models = take(
         &mut root,
         "playground_selected_models",
@@ -379,6 +386,13 @@ fn parse_general(
             "selected_default_model",
             &[],
             defaults.selected_default_model,
+            diagnostics,
+        ),
+        excluded_bundled_model_ids: take(
+            &mut section,
+            "excluded_bundled_model_ids",
+            &[],
+            defaults.excluded_bundled_model_ids,
             diagnostics,
         ),
         playground_selected_models: take(
@@ -934,6 +948,7 @@ mod tests {
         }));
 
         assert_eq!(config.general.selected_default_model, "whisper_cpp_base_en");
+        assert!(config.general.excluded_bundled_model_ids.is_empty());
         assert_eq!(config.recording.hotkey, "Ctrl+Space");
         assert_eq!(config.recording.hotkey_mode, HotkeyMode::HoldToTalk);
         assert_eq!(config.recording.max_recording_seconds, 30);
@@ -962,6 +977,28 @@ mod tests {
         assert_eq!(
             config.performance.acceleration_preference,
             AccelerationPreference::Auto
+        );
+    }
+
+    #[test]
+    fn bundled_model_exclusions_round_trip_in_the_current_schema() {
+        let config = parse_settings_value(json!({
+            "schema_version": 2,
+            "general": {
+                "selected_default_model": "",
+                "excluded_bundled_model_ids": ["whisper_cpp_base_en"]
+            }
+        }));
+
+        assert_eq!(config.schema_version, CURRENT_SCHEMA_VERSION);
+        assert_eq!(
+            config.general.excluded_bundled_model_ids,
+            ["whisper_cpp_base_en"]
+        );
+        let serialized = serde_json::to_value(config).unwrap();
+        assert_eq!(
+            serialized["general"]["excluded_bundled_model_ids"],
+            json!(["whisper_cpp_base_en"])
         );
     }
 
