@@ -49,7 +49,7 @@ Normal GGUF remains local, native, CPU-only in the currently verified package, a
 
 ## Models and installation
 
-The normal **Models** experience accepts trusted GGUF installations and compatible local GGUF imports. Managed downloads use pinned source facts, resumable transfers, size and SHA-256 checks, a native smoke test, and atomic activation. Local imports remain in place: Scribe fingerprints and validates them without copying, uploading, moving, or deleting the source file.
+The normal **Models** experience exposes five checked-in Experimental entries: four transcribe.cpp artifacts and the receipt-backed `moonshine-tiny-en-int8-onnx` bundle. Managed downloads use pinned source facts, resumable transfers, exact size and SHA-256 checks, a native subprocess smoke test, and atomic activation. Moonshine is CPU-only and final-text-only. Local GGUF imports remain in place: Scribe fingerprints and validates them without copying, uploading, moving, or deleting the source file.
 
 All normal catalog models are currently Experimental. The exact catalog, runtime details, compatibility boundaries, and known legacy migration paths are maintained in the [embedded STT and models record](EMBEDDED_STT_AND_MODELS.md).
 

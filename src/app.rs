@@ -6452,11 +6452,28 @@ impl LocalTranscriberApp {
                             self.rebuild_local_models_after_committed_change();
                         }
                         Err(message) => {
-                            self.model_downloads
-                                .insert(model_id, ModelInstallStatus::Error(message.clone()));
-                            self.status = TranscriptionStatus::Error;
-                            self.status_message =
-                                format!("ONNX model installation failed: {message}");
+                            let paused = message.to_ascii_lowercase().contains("cancel");
+                            self.model_downloads.insert(
+                                model_id,
+                                ModelInstallStatus::Error(if paused {
+                                    "Paused. Downloaded partials were retained for Resume."
+                                        .to_owned()
+                                } else {
+                                    message.clone()
+                                }),
+                            );
+                            self.status = if paused {
+                                TranscriptionStatus::Idle
+                            } else {
+                                TranscriptionStatus::Error
+                            };
+                            self.status_message = if paused {
+                                "Paused ONNX model download. Downloaded partials were retained; choose Resume to continue."
+                                    .to_owned()
+                            } else {
+                                format!("ONNX model installation failed: {message}")
+                            };
+                            self.rebuild_model_inventory_projection();
                         }
                     }
                 }
@@ -8830,7 +8847,7 @@ impl LocalTranscriberApp {
         {
             crate::onnx_model_bundles::pause_onnx_bundle_install(cancellation);
             self.status_message =
-                "Cancelling ONNX model installation. Exact partials will be kept for Resume."
+                "Pausing ONNX model download. Exact partials will be retained for Resume."
                     .to_owned();
             self.rebuild_model_inventory_projection();
             return;
@@ -11031,6 +11048,10 @@ impl LocalTranscriberApp {
         let app_owned_legacy_artifact = app_owned_legacy_catalog_artifact(&self.config, model);
         let legacy_cleanup_pending = app_owned_legacy_cleanup_artifact(&self.config, model);
         let bundled = model.artifact_origin == ModelArtifactOrigin::Bundled;
+        let receipt_backed = matches!(
+            crate::model_catalog::normalized_install_artifact(&ModelId::new(&model.id)),
+            Some(crate::model_catalog::NormalizedInstallArtifact::ReceiptBackedBundle { .. })
+        );
         let installed =
             manageable && !legacy_cleanup_pending && (!bundled || install_status.is_runnable());
         let custom = model.local_path.is_some()
@@ -11182,6 +11203,19 @@ impl LocalTranscriberApp {
                         (!repairable)
                             .then(|| "This model does not have a repairable runtime.".to_owned())
                     }),
+            )
+        } else if receipt_backed && matches!(install_status, ModelInstallStatus::Missing) {
+            (
+                "Repair model".to_owned(),
+                !install_admission_blocked && supports_managed_install(model),
+                false,
+                false,
+                install_admission_block_reason.clone().or_else(|| {
+                    Some(
+                        "The canonical ONNX bundle is incomplete or failed receipt validation. Repair downloads and verifies the exact pinned bundle."
+                            .to_owned(),
+                    )
+                }),
             )
         } else {
             (
