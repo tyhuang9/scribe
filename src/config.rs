@@ -962,7 +962,6 @@ pub fn runtime_id_for_backend(backend: &str) -> String {
 }
 
 pub fn normalize_config(config: &mut AppConfig) {
-    migrate_legacy_model_ids(config);
     config
         .general
         .excluded_bundled_model_ids
@@ -1108,10 +1107,14 @@ fn apply_managed_model_metadata(config: &mut AppConfig) {
         .collect::<HashMap<_, _>>();
     let storage_dir = model_storage_dir(config);
     config.general.managed_models.retain(|id, install| {
-        expected_paths
-            .get(id)
-            .is_some_and(|paths| paths.contains(&install.path))
-            && safe_managed_model_path(&storage_dir, &install.path)
+        let Some(paths) = expected_paths.get(id) else {
+            // Unsupported and retired records are intentionally inert. Keep
+            // them byte-for-byte at the settings layer so users can downgrade
+            // or inspect an old profile without Scribe rewriting their legacy
+            // installation metadata or touching the referenced artifacts.
+            return true;
+        };
+        paths.contains(&install.path) && safe_managed_model_path(&storage_dir, &install.path)
     });
 
     for (id, path) in &config.general.model_paths {
@@ -1290,60 +1293,6 @@ fn safe_managed_model_path(storage_dir: &Path, path: &Path) -> bool {
         .ok()
         .zip(storage_dir.canonicalize().ok())
         .is_some_and(|(path, storage)| path.starts_with(storage))
-}
-
-fn migrate_legacy_model_ids(config: &mut AppConfig) {
-    let legacy_ids = [
-        "faster_whisper",
-        "sherpa_onnx_streaming",
-        "faster_whisper_small_en",
-        "faster_whisper_medium_en",
-    ];
-    let migrations = [
-        ("faster_whisper", "faster_whisper_small_en_gpu"),
-        ("sherpa_onnx_streaming", "sherpa_onnx_zipformer_small"),
-        ("faster_whisper_small_en", "faster_whisper_small_en_gpu"),
-        ("faster_whisper_medium_en", "faster_whisper_medium_en_gpu"),
-    ];
-
-    for (old_id, new_id) in migrations {
-        if config.general.selected_default_model == old_id {
-            config.general.selected_default_model = new_id.to_owned();
-        }
-        for id in &mut config.general.playground_selected_models {
-            if id == old_id {
-                *id = new_id.to_owned();
-            }
-        }
-        for id in &mut config.general.playground_model_order {
-            if id == old_id {
-                *id = new_id.to_owned();
-            }
-        }
-        if let Some(path) = config.general.model_paths.remove(old_id) {
-            config
-                .general
-                .model_paths
-                .entry(new_id.to_owned())
-                .or_insert(path);
-        }
-        if let Some(install) = config.general.managed_models.remove(old_id) {
-            config
-                .general
-                .managed_models
-                .entry(new_id.to_owned())
-                .or_insert(install);
-        }
-    }
-
-    config
-        .general
-        .model_paths
-        .retain(|id, _| !legacy_ids.iter().any(|legacy_id| legacy_id == &id.as_str()));
-    config
-        .general
-        .managed_models
-        .retain(|id, _| !legacy_ids.iter().any(|legacy_id| legacy_id == &id.as_str()));
 }
 
 fn normalize_playground_order(config: &mut AppConfig, catalog_ids: &[String]) {
@@ -1620,12 +1569,9 @@ mod tests {
         normalize_config(&mut config);
 
         assert!(config.general.playground_model_order.len() >= default_model_catalog().len());
-        assert!(
-            config
-                .general
-                .playground_model_order
-                .iter()
-                .any(|id| id == "faster_whisper_turbo")
+        assert_eq!(
+            config.general.playground_model_order,
+            default_playground_model_order()
         );
         assert!(config.general.close_to_tray);
         assert!(config.output.auto_insert_transcript);
@@ -1845,13 +1791,15 @@ mod tests {
     }
 
     #[test]
-    fn playground_selection_normalizes_invalid_and_duplicate_ids() {
+    fn playground_selection_filters_retired_invalid_and_duplicate_ids() {
         let mut config = AppConfig {
             general: GeneralSettings {
                 playground_selected_models: vec![
                     "faster_whisper_medium_en_gpu".to_owned(),
                     "invalid".to_owned(),
                     "faster_whisper_medium_en_gpu".to_owned(),
+                    "whisper_cpp_small_en".to_owned(),
+                    "whisper_cpp_small_en".to_owned(),
                 ],
                 ..Default::default()
             },
@@ -1861,7 +1809,67 @@ mod tests {
         normalize_config(&mut config);
         assert_eq!(
             config.general.playground_selected_models,
-            ["faster_whisper_medium_en_gpu"]
+            ["whisper_cpp_small_en"]
+        );
+    }
+
+    #[test]
+    fn retired_model_settings_remain_inert_while_live_selections_are_filtered() {
+        let retired_path = PathBuf::from("copied-profile/legacy/model.bin");
+        let retired_install =
+            ManagedModelInstall::app_managed(retired_path.clone(), "legacy-profile");
+        let retired_runtime = ManagedRuntimeInstall::new(PathBuf::from(
+            "copied-profile/runtimes/faster-whisper/bin/runner.py",
+        ));
+        let mut config = AppConfig::default();
+        config.general.selected_default_model = "faster_whisper".to_owned();
+        config.general.playground_selected_models = vec![
+            "faster_whisper".to_owned(),
+            "faster_whisper_tiny_en".to_owned(),
+            "whisper_cpp_small_en".to_owned(),
+        ];
+        config.general.playground_model_order = vec![
+            "faster_whisper_tiny_en".to_owned(),
+            "whisper_cpp_small_en".to_owned(),
+        ];
+        config
+            .general
+            .model_paths
+            .insert("faster_whisper".to_owned(), retired_path.clone());
+        config
+            .general
+            .managed_models
+            .insert("faster_whisper_tiny_en".to_owned(), retired_install.clone());
+        config
+            .general
+            .managed_runtimes
+            .insert("faster_whisper".to_owned(), retired_runtime.clone());
+
+        normalize_config(&mut config);
+
+        assert_eq!(config.general.selected_default_model, BUNDLED_BASE_MODEL_ID);
+        assert_eq!(
+            config.general.playground_selected_models,
+            ["whisper_cpp_small_en"]
+        );
+        assert!(
+            !config
+                .general
+                .playground_model_order
+                .iter()
+                .any(|id| id == "faster_whisper_tiny_en")
+        );
+        assert_eq!(
+            config.general.model_paths.get("faster_whisper"),
+            Some(&retired_path)
+        );
+        assert_eq!(
+            config.general.managed_models.get("faster_whisper_tiny_en"),
+            Some(&retired_install)
+        );
+        assert_eq!(
+            config.general.managed_runtimes.get("faster_whisper"),
+            Some(&retired_runtime)
         );
     }
 

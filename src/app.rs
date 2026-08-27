@@ -21374,7 +21374,7 @@ mod layout_tests {
     }
 
     #[test]
-    fn startup_reconciliation_uses_first_ready_catalog_model_deterministically() {
+    fn retired_selection_uses_first_ready_supported_model_deterministically() {
         let mut app = test_app();
         let storage = std::env::temp_dir().join(format!(
             "scribe-startup-selection-{}-{}",
@@ -21384,7 +21384,7 @@ mod layout_tests {
         fs::create_dir_all(&storage).unwrap();
         app.config.general.model_storage_dir = storage.clone();
         app.config.general.model_paths.clear();
-        app.config.general.selected_default_model = "whisper_cpp_tiny_en".to_owned();
+        app.config.general.selected_default_model = "faster_whisper_tiny_en".to_owned();
         let small = install_test_catalog_model(&mut app, "whisper_cpp_small_en");
 
         app.reconcile_startup_model_selection();
@@ -21402,7 +21402,7 @@ mod layout_tests {
     }
 
     #[test]
-    fn startup_reconciliation_clears_selection_when_nothing_is_runnable() {
+    fn retired_selection_clears_when_no_supported_model_is_runnable() {
         let mut app = test_app();
         let storage = std::env::temp_dir().join(format!(
             "scribe-startup-empty-{}-{}",
@@ -21413,7 +21413,7 @@ mod layout_tests {
         app.config.general.model_storage_dir = storage.clone();
         app.config.general.model_paths.clear();
         app.config.general.managed_models.clear();
-        app.config.general.selected_default_model = "whisper_cpp_tiny_en".to_owned();
+        app.config.general.selected_default_model = "vosk_small_en".to_owned();
 
         app.reconcile_startup_model_selection();
 

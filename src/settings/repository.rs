@@ -442,6 +442,99 @@ mod tests {
     }
 
     #[test]
+    fn copied_profile_preserves_retired_settings_unknown_fields_and_artifact_bytes() {
+        let dir = test_dir("retired-provider-profile");
+        let path = dir.join("config.json");
+        let artifact = dir.join("copied-profile").join("legacy-model.bin");
+        let runtime = dir.join("copied-profile").join("legacy-runner.py");
+        let sentinel = b"legacy-provider-artifact-sentinel\0\xff";
+        fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        fs::write(&artifact, sentinel).unwrap();
+        fs::write(&runtime, b"legacy runner sentinel").unwrap();
+        let original = serde_json::json!({
+            "schema_version": super::super::CURRENT_SCHEMA_VERSION,
+            "general": {
+                "selected_default_model": "faster_whisper",
+                "playground_selected_models": [
+                    "faster_whisper_tiny_en",
+                    "whisper_cpp_small_en"
+                ],
+                "playground_model_order": [
+                    "faster_whisper_tiny_en",
+                    "whisper_cpp_small_en"
+                ],
+                "model_paths": {
+                    "faster_whisper": artifact
+                },
+                "managed_models": {
+                    "faster_whisper_tiny_en": {
+                        "path": artifact,
+                        "source": "copied-profile",
+                        "future_receipt": {"preserved": true}
+                    }
+                },
+                "managed_runtimes": {
+                    "faster_whisper": {
+                        "path": runtime,
+                        "source": "copied-profile",
+                        "future_runtime_receipt": {"preserved": true}
+                    }
+                },
+                "future_general": {"preserved": true}
+            },
+            "future_root": {"preserved": true}
+        });
+        fs::write(&path, serde_json::to_vec_pretty(&original).unwrap()).unwrap();
+
+        let config = load_from_path(&path).unwrap();
+
+        assert_eq!(
+            config.general.selected_default_model,
+            crate::model_catalog::BUNDLED_BASE_MODEL_ID
+        );
+        assert_eq!(
+            config.general.playground_selected_models,
+            ["whisper_cpp_small_en"]
+        );
+        assert_eq!(config.general.model_paths["faster_whisper"], artifact);
+        assert_eq!(
+            config.general.managed_models["faster_whisper_tiny_en"].unknown["future_receipt"],
+            serde_json::json!({"preserved": true})
+        );
+        assert_eq!(
+            config.general.managed_runtimes["faster_whisper"].unknown["future_runtime_receipt"],
+            serde_json::json!({"preserved": true})
+        );
+        assert_eq!(
+            config.general.unknown["future_general"],
+            serde_json::json!({"preserved": true})
+        );
+        assert_eq!(
+            config.unknown["future_root"],
+            serde_json::json!({"preserved": true})
+        );
+        assert_eq!(fs::read(&artifact).unwrap(), sentinel);
+        assert_eq!(fs::read(&runtime).unwrap(), b"legacy runner sentinel");
+
+        let rewritten: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            rewritten["general"]["model_paths"]["faster_whisper"],
+            serde_json::json!(artifact)
+        );
+        assert_eq!(
+            rewritten["general"]["managed_models"]["faster_whisper_tiny_en"]["future_receipt"],
+            serde_json::json!({"preserved": true})
+        );
+        assert_eq!(
+            rewritten["general"]["managed_runtimes"]["faster_whisper"]["future_runtime_receipt"],
+            serde_json::json!({"preserved": true})
+        );
+        assert_eq!(fs::read(&artifact).unwrap(), sentinel);
+        assert_eq!(fs::read(&runtime).unwrap(), b"legacy runner sentinel");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn version_two_voice_detection_settings_are_rewritten_and_reload_cleanly() {
         let dir = test_dir("version-two-voice-detection");
         let path = dir.join("config.json");

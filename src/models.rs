@@ -168,23 +168,9 @@ pub fn backend_capabilities(backend: &str) -> BackendCapabilities {
             streaming: false,
             experimental: false,
         },
-        "faster-whisper" => BackendCapabilities {
+        "sherpa-onnx" => BackendCapabilities {
             runnable: true,
-            supports_local_files: true,
-            supports_downloads: true,
-            streaming: false,
-            experimental: false,
-        },
-        "Vosk" => BackendCapabilities {
-            runnable: true,
-            supports_local_files: true,
-            supports_downloads: true,
-            streaming: false,
-            experimental: false,
-        },
-        "sherpa-onnx" | "Moonshine" | "Parakeet" => BackendCapabilities {
-            runnable: true,
-            supports_local_files: true,
+            supports_local_files: false,
             supports_downloads: true,
             streaming: false,
             experimental: true,
@@ -200,7 +186,7 @@ pub fn backend_capabilities(backend: &str) -> BackendCapabilities {
 }
 
 pub fn default_model_catalog() -> Vec<SttModelInfo> {
-    let mut models = crate::model_catalog::model_descriptors()
+    crate::model_catalog::model_descriptors()
         .into_iter()
         .map(|descriptor| {
             let (backend, download_model) =
@@ -229,150 +215,7 @@ pub fn default_model_catalog() -> Vec<SttModelInfo> {
                 download_model,
             }
         })
-        .collect::<Vec<_>>();
-    // These entries remain solely for the private Phase 1 compatibility
-    // bridge and existing configuration migration. They are intentionally
-    // absent from the normalized UI/service catalog and provide no evidence
-    // for a shipped runtime handler.
-    models.extend([
-        legacy_model(
-            "vosk_small_en",
-            "Vosk small English",
-            "Vosk",
-            "Offline Apache 2.0 English compatibility model.",
-            "1 GB",
-            "Basic",
-            "Fast",
-            "vosk-model-small-en-us-0.15",
-        ),
-        legacy_model(
-            "faster_whisper_tiny_en",
-            "faster-whisper tiny.en",
-            "faster-whisper",
-            "Legacy compatibility model retained for migration.",
-            "1 GB",
-            "Basic",
-            "Fastest",
-            "tiny.en",
-        ),
-        legacy_model(
-            "faster_whisper_base_en",
-            "faster-whisper base.en",
-            "faster-whisper",
-            "Legacy compatibility model retained for migration.",
-            "1 GB",
-            "Good",
-            "Fast",
-            "base.en",
-        ),
-        legacy_model(
-            "faster_whisper_small_en_gpu",
-            "faster-whisper small.en",
-            "faster-whisper",
-            "Legacy compatibility model retained for migration.",
-            "1-2 GB",
-            "Good",
-            "Fast",
-            "small.en",
-        ),
-        legacy_model(
-            "faster_whisper_medium_en_gpu",
-            "faster-whisper medium.en",
-            "faster-whisper",
-            "Legacy compatibility model retained for migration.",
-            "3-6 GB",
-            "High",
-            "Medium",
-            "medium.en",
-        ),
-        legacy_model(
-            "faster_whisper_large_v3",
-            "faster-whisper large-v3",
-            "faster-whisper",
-            "Legacy compatibility model retained for migration.",
-            "5-10 GB",
-            "Highest",
-            "Slow",
-            "large-v3",
-        ),
-        legacy_model(
-            "faster_whisper_turbo",
-            "faster-whisper turbo",
-            "faster-whisper",
-            "Legacy compatibility model retained for migration.",
-            "4-8 GB",
-            "High",
-            "Fast",
-            "turbo",
-        ),
-        legacy_model(
-            "faster_whisper_distil_large_v3",
-            "faster-whisper distil-large-v3",
-            "faster-whisper",
-            "Legacy compatibility model retained for migration.",
-            "3-6 GB",
-            "High",
-            "Fast",
-            "distil-large-v3",
-        ),
-        legacy_model(
-            "sherpa_onnx_zipformer_small",
-            "sherpa-onnx Zipformer Small",
-            "sherpa-onnx",
-            "Legacy offline compatibility model; not the streaming candidate.",
-            "1-2 GB",
-            "Good",
-            "Fast",
-            "sherpa-onnx-zipformer-small-en-2023-06-26",
-        ),
-        legacy_model(
-            "moonshine",
-            "Moonshine tiny English",
-            "Moonshine",
-            "Legacy compatibility model retained for migration.",
-            "1-2 GB",
-            "Good",
-            "Fast",
-            "sherpa-onnx-moonshine-tiny-en-quantized-2026-02-27",
-        ),
-        legacy_model(
-            "parakeet_0_6b",
-            "Parakeet Unified 0.6B int8",
-            "Parakeet",
-            "Legacy compatibility model retained for migration.",
-            "2-4 GB",
-            "High",
-            "Medium",
-            "sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-non-streaming",
-        ),
-    ]);
-    models
-}
-
-#[allow(clippy::too_many_arguments)]
-fn legacy_model(
-    id: &str,
-    name: &str,
-    backend: &str,
-    description: &str,
-    expected_ram: &str,
-    accuracy_tier: &str,
-    speed_tier: &str,
-    download_model: &str,
-) -> SttModelInfo {
-    SttModelInfo {
-        id: id.to_owned(),
-        name: name.to_owned(),
-        backend: backend.to_owned(),
-        description: description.to_owned(),
-        expected_ram: expected_ram.to_owned(),
-        accuracy_tier: accuracy_tier.to_owned(),
-        speed_tier: speed_tier.to_owned(),
-        local_path: None,
-        artifact_origin: ModelArtifactOrigin::Catalog,
-        install_status: ModelInstallStatus::NotInstalled,
-        download_model: Some(download_model.to_owned()),
-    }
+        .collect()
 }
 
 pub fn format_bytes(bytes: u64) -> String {
@@ -421,19 +264,15 @@ mod tests {
     }
 
     #[test]
-    fn bundled_phase_supports_all_managed_runtime_backends() {
+    fn supported_backends_are_native_only() {
         assert!(backend_capabilities("whisper.cpp").runnable);
-        assert!(backend_capabilities("faster-whisper").runnable);
-        assert!(backend_capabilities("faster-whisper").supports_downloads);
-        assert!(backend_capabilities("Vosk").runnable);
-        assert!(backend_capabilities("Vosk").supports_downloads);
         assert!(backend_capabilities("sherpa-onnx").runnable);
         assert!(backend_capabilities("sherpa-onnx").supports_downloads);
+        assert!(!backend_capabilities("sherpa-onnx").supports_local_files);
         assert!(!backend_capabilities("sherpa-onnx").streaming);
-        assert!(backend_capabilities("Moonshine").runnable);
-        assert!(backend_capabilities("Moonshine").supports_downloads);
-        assert!(backend_capabilities("Parakeet").runnable);
-        assert!(backend_capabilities("Parakeet").supports_downloads);
+        for retired in ["faster-whisper", "Vosk", "Moonshine", "Parakeet"] {
+            assert!(!backend_capabilities(retired).runnable, "{retired}");
+        }
     }
 
     #[test]
@@ -456,6 +295,36 @@ mod tests {
                 .count(),
             1
         );
-        assert!(catalog.iter().any(|model| model.id == "moonshine"));
+        assert_eq!(
+            catalog.len(),
+            crate::model_catalog::model_descriptors().len()
+        );
+    }
+
+    #[test]
+    fn retired_provider_ids_and_aliases_are_not_supported_catalog_entries() {
+        let catalog = default_model_catalog();
+        for retired in [
+            "vosk_small_en",
+            "faster_whisper_tiny_en",
+            "faster_whisper_base_en",
+            "faster_whisper_small_en_gpu",
+            "faster_whisper_medium_en_gpu",
+            "faster_whisper_large_v3",
+            "faster_whisper_turbo",
+            "faster_whisper_distil_large_v3",
+            "sherpa_onnx_zipformer_small",
+            "moonshine",
+            "parakeet_0_6b",
+            "faster_whisper",
+            "faster_whisper_small_en",
+            "faster_whisper_medium_en",
+            "sherpa_onnx_streaming",
+        ] {
+            assert!(
+                catalog.iter().all(|model| model.id != retired),
+                "retired model or alias remains recognized: {retired}"
+            );
+        }
     }
 }
