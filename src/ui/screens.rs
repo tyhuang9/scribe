@@ -9000,7 +9000,7 @@ mod tests {
     }
 
     #[test]
-    fn moonshine_collapsed_facts_and_receipt_repair_are_runtime_neutral() {
+    fn moonshine_badges_are_absent_and_receipt_repair_remains_generic() {
         let moonshine = ModelViewModel {
             id: "moonshine-tiny-en-int8-onnx".into(),
             display_name: "Moonshine Tiny — English".into(),

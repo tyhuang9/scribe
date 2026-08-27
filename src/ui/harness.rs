@@ -3296,6 +3296,89 @@ mod tests {
     }
 
     #[test]
+    fn moonshine_receipt_cards_have_no_legacy_badges_in_all_card_states() {
+        fn shape_texts(shape: &egui::epaint::Shape, texts: &mut Vec<String>) {
+            match shape {
+                egui::epaint::Shape::Text(text) => texts.push(text.galley.text().to_owned()),
+                egui::epaint::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        shape_texts(shape, texts);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        for (width, expanded) in [
+            (560.0, false),
+            (560.0, true),
+            (1180.0, false),
+            (1180.0, true),
+        ] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            configure_accessible_style(&ctx);
+            let mut data = Fixture::ModelsInstalled.data();
+            data.models.clear();
+            data.model_catalog = vec![ModelViewModel {
+                id: "moonshine-tiny-en-int8-onnx".into(),
+                display_name: "Moonshine Tiny — English".into(),
+                install_supported: true,
+                install_action_enabled: true,
+                primary_action_label: "Repair model".into(),
+                download_state: ModelDownloadState::Failed,
+                ..Default::default()
+            }];
+            if expanded {
+                data.model_management.expanded_model_card =
+                    Some(ModelCardKey::Local("moonshine-tiny-en-int8-onnx".into()));
+            }
+            let mut page = AppPage::Models;
+            let output = render_with_input(&ctx, &mut data, &mut page, width, 815.0, Vec::new()).0;
+            let names = node_names(&output);
+            for legacy in ["Experimental", "CPU only", "Final text only"] {
+                assert!(
+                    !names.iter().any(|name| name.contains(legacy)),
+                    "{legacy} must not be exposed in {width}px {expanded:?} card"
+                );
+            }
+            assert!(names.iter().any(|name| name == "Needs repair"));
+            let repair = node_matching(&output, |node| {
+                node.role() == egui::accesskit::Role::Button
+                    && node.name() == Some("Repair Moonshine Tiny — English")
+            });
+            assert!(!repair.is_disabled());
+            let card = node_matching(&output, |node| {
+                node.role() == egui::accesskit::Role::Group
+                    && node.name() == Some("Moonshine Tiny — English model")
+            });
+            assert_eq!(card.is_expanded(), None);
+            let details = node_matching(&output, |node| {
+                node.role() == egui::accesskit::Role::Button
+                    && node.name()
+                        == Some(
+                            format!(
+                                "{} details for Moonshine Tiny — English",
+                                if expanded { "Collapse" } else { "Expand" }
+                            )
+                            .as_str(),
+                        )
+            });
+            assert_eq!(details.is_expanded(), Some(expanded));
+            let mut texts = Vec::new();
+            for shape in &output.shapes {
+                shape_texts(&shape.shape, &mut texts);
+            }
+            for legacy in ["Experimental", "CPU only", "Final text only"] {
+                assert!(
+                    !texts.iter().any(|text| text.contains(legacy)),
+                    "{legacy} must not be painted in {width}px {expanded:?} card"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn model_card_ratings_render_all_proportional_bins_and_truthful_unknown_meters() {
         for (guidance, label, value) in [
             ("Basic", "Basic", 1_u8),
