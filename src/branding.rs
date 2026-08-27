@@ -1,4 +1,5 @@
-use eframe::egui::{self, Color32, Pos2, Rect, Response, Rounding, Sense, Stroke, Vec2};
+use eframe::egui::{self, Color32, Pos2, Rect, Response, Sense, Vec2};
+use std::{io::Cursor, sync::OnceLock};
 
 pub(crate) const WORDMARK: &str = "scribe";
 pub(crate) const TAGLINE: &str = "Lightning-fast local transcription that stays out of your way.";
@@ -16,6 +17,20 @@ pub(crate) const DEEP_NAVY: Color32 = Color32::from_rgb(0x06, 0x1C, 0x2E);
 pub(crate) const NAVY_SURFACE: Color32 = DEEP_INK;
 pub(crate) const TEAL_ACCENT: Color32 = Color32::from_rgb(0x7C, 0xCB, 0xC9);
 
+const APP_ICON_PNG: &[u8] = include_bytes!("../assets/branding/scribe-app-icon.png");
+const APP_ICON_SOURCE_WIDTH: u32 = 128;
+const APP_ICON_SOURCE_HEIGHT: u32 = 127;
+const APP_ICON_TEXTURE_ID: &str = "scribe-app-icon-tile";
+
+struct DecodedAppIcon {
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
+}
+
+static DECODED_APP_ICON: OnceLock<DecodedAppIcon> = OnceLock::new();
+
+#[cfg(test)]
 const BAR_X: [f32; 7] = [
     20.5 / 128.0,
     35.5 / 128.0,
@@ -25,6 +40,7 @@ const BAR_X: [f32; 7] = [
     92.5 / 128.0,
     107.5 / 128.0,
 ];
+#[cfg(test)]
 const BAR_HEIGHT: [f32; 7] = [
     48.0 / 128.0,
     80.0 / 128.0,
@@ -34,11 +50,14 @@ const BAR_HEIGHT: [f32; 7] = [
     80.0 / 128.0,
     48.0 / 128.0,
 ];
+#[cfg(test)]
 const BAR_WIDTH: f32 = 11.0 / 128.0;
+#[cfg(test)]
 const S_STROKE_WIDTH: f32 = 16.6 / 128.0;
 // Absolute control points from the canonical 128-unit SVG path, normalized for
-// the egui and runtime-icon renderers. The SVG's later cubic segments are
-// relative; these values include that translation instead of approximating the curve.
+// the SVG parity tests. The SVG's later cubic segments are relative; these
+// values include that translation instead of approximating the curve.
+#[cfg(test)]
 const S_CURVES: [[(f32, f32); 4]; 3] = [
     [
         (89.6 / 128.0, 35.8 / 128.0),
@@ -60,9 +79,15 @@ const S_CURVES: [[(f32, f32); 4]; 3] = [
     ],
 ];
 
-pub(crate) fn show_mark(ui: &mut egui::Ui, size: f32, announce: bool) -> Response {
+pub(crate) fn show_app_icon(ui: &mut egui::Ui, size: f32, announce: bool) -> Response {
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
-    paint_mark(ui.painter(), rect, ui.visuals().dark_mode);
+    let texture = app_icon_texture(ui.ctx());
+    ui.painter().image(
+        texture.id(),
+        rect,
+        Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+        Color32::WHITE,
+    );
     if announce {
         response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Other, "Scribe logo"));
         ui.ctx().accesskit_node_builder(response.id, |builder| {
@@ -74,131 +99,120 @@ pub(crate) fn show_mark(ui: &mut egui::Ui, size: f32, announce: bool) -> Respons
     response
 }
 
-pub(crate) fn paint_mark(painter: &egui::Painter, rect: Rect, dark_mode: bool) {
-    let size = rect.width().min(rect.height());
-    let rect = Rect::from_center_size(rect.center(), Vec2::splat(size));
-    let bar_primary = if dark_mode { TEAL_ACCENT } else { SCRIBE_TEAL };
-    let bar_secondary = SOFT_AQUA;
-
-    for (index, (&x, &height)) in BAR_X.iter().zip(&BAR_HEIGHT).enumerate() {
-        let bar_width = size * BAR_WIDTH;
-        let bar_height = size * height;
-        let center = Pos2::new(rect.left() + size * x, rect.center().y);
-        let bar = Rect::from_center_size(center, Vec2::new(bar_width, bar_height));
-        let fill = if matches!(index, 1 | 5) {
-            bar_secondary
-        } else {
-            bar_primary
-        };
-        painter.rect_filled(bar, Rounding::same(bar_width / 2.0), fill);
+fn app_icon_texture(ctx: &egui::Context) -> egui::TextureHandle {
+    let texture_id = egui::Id::new(APP_ICON_TEXTURE_ID);
+    if let Some(texture) = ctx.data(|data| data.get_temp::<egui::TextureHandle>(texture_id)) {
+        return texture;
     }
 
-    let points = s_curve_points(rect, 10);
-    let stroke_width = size * S_STROKE_WIDTH;
-    painter.add(egui::Shape::line(
-        points.clone(),
-        Stroke::new(stroke_width, Color32::WHITE),
-    ));
-    if let (Some(first), Some(last)) = (points.first(), points.last()) {
-        painter.circle_filled(*first, stroke_width / 2.0, Color32::WHITE);
-        painter.circle_filled(*last, stroke_width / 2.0, Color32::WHITE);
-    }
+    let texture = ctx.load_texture(
+        APP_ICON_TEXTURE_ID,
+        egui::ColorImage::from_rgba_unmultiplied(
+            [
+                APP_ICON_SOURCE_WIDTH as usize,
+                APP_ICON_SOURCE_WIDTH as usize,
+            ],
+            &app_icon_rgba(APP_ICON_SOURCE_WIDTH),
+        ),
+        egui::TextureOptions::LINEAR,
+    );
+    ctx.data_mut(|data| data.insert_temp(texture_id, texture.clone()));
+    texture
 }
 
-/// Generates the shared window/tray icon without image-decoding dependencies.
-/// The icon is supersampled so small system-tray sizes keep smooth capsule and
-/// letter edges.
+/// Decodes the approved opaque app tile and resamples it to a square system
+/// icon. The canonical PNG stays byte-for-byte unchanged at 128×127; every
+/// consumer uses the same area-weighted box normalization.
 pub(crate) fn app_icon_rgba(size: u32) -> Vec<u8> {
-    const SAMPLES: u32 = 4;
+    assert!(size > 0, "Scribe app icon size must be non-zero");
+    let source = decoded_app_icon();
     let mut rgba = Vec::with_capacity((size * size * 4) as usize);
     for y in 0..size {
         for x in 0..size {
-            let mut channels = [0_u32; 4];
-            for sample_y in 0..SAMPLES {
-                for sample_x in 0..SAMPLES {
-                    let px = (x as f32 + (sample_x as f32 + 0.5) / SAMPLES as f32) / size as f32;
-                    let py = (y as f32 + (sample_y as f32 + 0.5) / SAMPLES as f32) / size as f32;
-                    let sample = icon_sample(px, py);
-                    for (total, value) in channels.iter_mut().zip(sample) {
-                        *total += u32::from(value);
-                    }
-                }
-            }
-            let divisor = SAMPLES * SAMPLES;
-            rgba.extend(channels.map(|value| (value / divisor) as u8));
+            rgba.extend(area_resampled_pixel(source, size, x, y));
         }
     }
     rgba
 }
 
-fn icon_sample(x: f32, y: f32) -> [u8; 4] {
-    if !inside_rounded_rect(x, y, 0.04, 0.04, 0.96, 0.96, 0.19) {
-        return [0, 0, 0, 0];
-    }
+fn area_resampled_pixel(source: &DecodedAppIcon, size: u32, x: u32, y: u32) -> [u8; 4] {
+    let source_x_start = x * source.width;
+    let source_x_end = (x + 1) * source.width;
+    let source_y_start = y * source.height;
+    let source_y_end = (y + 1) * source.height;
+    let mut channels = [0_u64; 4];
+    let mut total_weight = 0_u64;
 
-    let mut color = DEEP_NAVY.to_array();
-    for (index, (&center_x, &height)) in BAR_X.iter().zip(&BAR_HEIGHT).enumerate() {
-        let half_width = BAR_WIDTH / 2.0;
-        let half_height = height / 2.0;
-        if inside_rounded_rect(
-            x,
-            y,
-            center_x - half_width,
-            0.5 - half_height,
-            center_x + half_width,
-            0.5 + half_height,
-            half_width,
-        ) {
-            color = if matches!(index, 1 | 5) {
-                SOFT_AQUA.to_array()
-            } else {
-                TEAL_ACCENT.to_array()
-            };
+    for source_y in source_y_start / size..source_y_end.div_ceil(size) {
+        let y_weight =
+            (source_y_end.min((source_y + 1) * size) - source_y_start.max(source_y * size)) as u64;
+        for source_x in source_x_start / size..source_x_end.div_ceil(size) {
+            let x_weight = (source_x_end.min((source_x + 1) * size)
+                - source_x_start.max(source_x * size)) as u64;
+            let weight = x_weight * y_weight;
+            let pixel_start = (source_y as usize * source.width as usize + source_x as usize) * 4;
+            for (channel, value) in channels
+                .iter_mut()
+                .zip(&source.rgba[pixel_start..pixel_start + 4])
+            {
+                *channel += u64::from(*value) * weight;
+            }
+            total_weight += weight;
         }
     }
 
-    if point_near_s_curve(x, y, 0.065) {
-        Color32::WHITE.to_array()
-    } else {
-        color
-    }
+    channels.map(|value| ((value + total_weight / 2) / total_weight) as u8)
 }
 
-fn inside_rounded_rect(
-    x: f32,
-    y: f32,
-    left: f32,
-    top: f32,
-    right: f32,
-    bottom: f32,
-    radius: f32,
-) -> bool {
-    let nearest_x = x.clamp(left + radius, right - radius);
-    let nearest_y = y.clamp(top + radius, bottom - radius);
-    let dx = x - nearest_x;
-    let dy = y - nearest_y;
-    x >= left && x <= right && y >= top && y <= bottom && dx * dx + dy * dy <= radius * radius
+fn decoded_app_icon() -> &'static DecodedAppIcon {
+    DECODED_APP_ICON.get_or_init(|| {
+        decode_app_icon().expect("the checked-in Scribe application icon must be a valid RGBA PNG")
+    })
 }
 
-fn point_near_s_curve(x: f32, y: f32, radius: f32) -> bool {
-    let target = Pos2::new(x, y);
-    let rect = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
-    let points = s_curve_points(rect, 16);
-    points
-        .windows(2)
-        .any(|segment| distance_to_segment(target, segment[0], segment[1]) <= radius)
+fn decode_app_icon() -> Result<DecodedAppIcon, String> {
+    let mut decoder = png::Decoder::new(Cursor::new(APP_ICON_PNG));
+    decoder.set_transformations(png::Transformations::normalize_to_color8());
+    let mut reader = decoder
+        .read_info()
+        .map_err(|error| format!("could not read Scribe application icon: {error}"))?;
+    let mut decoded = vec![
+        0;
+        reader
+            .output_buffer_size()
+            .ok_or("application icon is too large")?
+    ];
+    let output = reader
+        .next_frame(&mut decoded)
+        .map_err(|error| format!("could not decode Scribe application icon: {error}"))?;
+    let pixels = &decoded[..output.buffer_size()];
+    let rgba = match output.color_type {
+        png::ColorType::Rgba => pixels.to_vec(),
+        png::ColorType::Rgb => pixels
+            .chunks_exact(3)
+            .flat_map(|pixel| [pixel[0], pixel[1], pixel[2], u8::MAX])
+            .collect(),
+        png::ColorType::Grayscale => pixels
+            .iter()
+            .flat_map(|&value| [value, value, value, u8::MAX])
+            .collect(),
+        png::ColorType::GrayscaleAlpha => pixels
+            .chunks_exact(2)
+            .flat_map(|pixel| [pixel[0], pixel[0], pixel[0], pixel[1]])
+            .collect(),
+        png::ColorType::Indexed => {
+            return Err("application icon decoder left an indexed PNG unexpanded".into());
+        }
+    };
+
+    Ok(DecodedAppIcon {
+        width: output.width,
+        height: output.height,
+        rgba,
+    })
 }
 
-fn distance_to_segment(point: Pos2, start: Pos2, end: Pos2) -> f32 {
-    let segment = end - start;
-    let length_squared = segment.length_sq();
-    if length_squared <= f32::EPSILON {
-        return point.distance(start);
-    }
-    let t = ((point - start).dot(segment) / length_squared).clamp(0.0, 1.0);
-    point.distance(start + segment * t)
-}
-
+#[cfg(test)]
 fn s_curve_points(rect: Rect, segments_per_curve: usize) -> Vec<Pos2> {
     let mut points = Vec::with_capacity(segments_per_curve * S_CURVES.len() + 1);
     for (curve_index, curve) in S_CURVES.into_iter().enumerate() {
@@ -236,6 +250,7 @@ fn s_curve_points(rect: Rect, segments_per_curve: usize) -> Vec<Pos2> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
 
     const MARK_SVG: &str = include_str!("../assets/branding/scribe-mark.svg");
     const LIGHT_LOCKUP_SVG: &str = include_str!("../assets/branding/scribe-lockup-light.svg");
@@ -436,24 +451,48 @@ mod tests {
     }
 
     #[test]
-    fn generated_icon_has_valid_dimensions_transparency_and_brand_pixels() {
-        for size in [16, 32, 128] {
+    fn canonical_app_icon_preserves_the_approved_source_bytes_and_dimensions() {
+        assert_eq!(
+            format!("{:x}", Sha256::digest(APP_ICON_PNG)),
+            "f836d49b93ba3e2027d31e10588fe30f755837f912dc59e0e94c0565ded0aac4"
+        );
+        let source = decoded_app_icon();
+        assert_eq!(
+            (source.width, source.height),
+            (APP_ICON_SOURCE_WIDTH, APP_ICON_SOURCE_HEIGHT)
+        );
+        assert_eq!(source.rgba.len(), 128 * 127 * 4);
+        assert!(source.rgba.chunks_exact(4).all(|pixel| pixel[3] == u8::MAX));
+    }
+
+    #[test]
+    fn app_icon_normalization_is_square_deterministic_and_uses_the_supplied_tile() {
+        for (size, expected_digest) in [
+            (
+                16,
+                "48741963414c1ebeedb01012da4480b956ee15d37bc601dc60aa32fed0fe87f3",
+            ),
+            (
+                32,
+                "977ae7bac1609c6445ec2d6934ddb98798b2ff4138ff52f7d17e61e68a2c1d3c",
+            ),
+            (
+                128,
+                "bb6f9c33ee92955f1f8e4369154cd868b8959a210546a484201fa3d26c99a7cb",
+            ),
+        ] {
             let rgba = app_icon_rgba(size);
             assert_eq!(rgba.len(), (size * size * 4) as usize);
-            assert_eq!(&rgba[0..4], &[0, 0, 0, 0]);
-            assert!(
-                rgba.chunks_exact(4)
-                    .any(|pixel| pixel == DEEP_NAVY.to_array())
-            );
-            assert!(
-                rgba.chunks_exact(4)
-                    .any(|pixel| pixel == TEAL_ACCENT.to_array())
-            );
-            assert!(
-                rgba.chunks_exact(4)
-                    .any(|pixel| pixel == Color32::WHITE.to_array())
-            );
+            assert!(rgba.chunks_exact(4).all(|pixel| pixel[3] == u8::MAX));
+            assert_eq!(format!("{:x}", Sha256::digest(&rgba)), expected_digest);
         }
+
+        let normalized = app_icon_rgba(128);
+        let source = decoded_app_icon();
+        assert_eq!(
+            &normalized[127 * 128 * 4..128 * 128 * 4],
+            &source.rgba[126 * 128 * 4..127 * 128 * 4]
+        );
     }
 
     #[test]

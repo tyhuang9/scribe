@@ -17,6 +17,7 @@ egui-phosphor = "=0.5.0"
 global-hotkey = "0.6"
 hound = "3.5"
 libloading = "0.8"
+png = "0.18.1"
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 raw-window-handle = "0.6"
 serde = { version = "1", features = ["derive"] }

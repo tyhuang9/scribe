@@ -375,7 +375,7 @@ fn active_model_button(
 
 fn brand(ui: &mut egui::Ui, mode: NavigationMode, text: Color32, _muted: Color32) {
     ui.horizontal(|ui| {
-        branding::show_mark(ui, 34.0, mode == NavigationMode::Compact);
+        branding::show_app_icon(ui, 34.0, mode == NavigationMode::Compact);
         if mode == NavigationMode::Full {
             ui.add_space(6.0);
             let heading = ui.label(
@@ -738,7 +738,7 @@ mod tests {
     }
 
     #[test]
-    fn navigation_brand_semantics_avoid_redundant_full_logo_announcement() {
+    fn navigation_app_icon_preserves_full_and_compact_brand_semantics() {
         for (width, expects_image, expects_heading) in
             [(1_180.0, false, true), (960.0, true, false)]
         {

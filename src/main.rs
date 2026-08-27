@@ -317,7 +317,7 @@ mod tests {
         assert_eq!(options.viewport.transparent, Some(false));
         let icon = options.viewport.icon.expect("Scribe window icon");
         assert_eq!((icon.width, icon.height), (128, 128));
-        assert_eq!(icon.rgba.len(), 128 * 128 * 4);
+        assert_eq!(icon.rgba, branding::app_icon_rgba(128));
         assert!(options.follow_system_theme);
     }
 
