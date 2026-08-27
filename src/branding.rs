@@ -185,6 +185,12 @@ fn decode_app_icon() -> Result<DecodedAppIcon, String> {
     let output = reader
         .next_frame(&mut decoded)
         .map_err(|error| format!("could not decode Scribe application icon: {error}"))?;
+    if (output.width, output.height) != (APP_ICON_SOURCE_WIDTH, APP_ICON_SOURCE_HEIGHT) {
+        return Err(format!(
+            "application icon must be {APP_ICON_SOURCE_WIDTH}x{APP_ICON_SOURCE_HEIGHT}, got {}x{}",
+            output.width, output.height
+        ));
+    }
     let pixels = &decoded[..output.buffer_size()];
     let rgba = match output.color_type {
         png::ColorType::Rgba => pixels.to_vec(),
