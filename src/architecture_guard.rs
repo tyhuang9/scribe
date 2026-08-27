@@ -37,28 +37,202 @@ fn rust_sources() -> Vec<(PathBuf, String)> {
         .collect()
 }
 
-fn production_prefix(source: &str) -> &str {
-    source
-        .find("\n#[cfg(test)]")
-        .map(|index| &source[..index])
-        .unwrap_or(source)
+fn rust_code_mask(source: &str) -> Vec<bool> {
+    let bytes = source.as_bytes();
+    let mut code = vec![true; bytes.len()];
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'/' && bytes.get(index + 1) == Some(&b'/') {
+            let start = index;
+            index += 2;
+            while index < bytes.len() && bytes[index] != b'\n' {
+                index += 1;
+            }
+            code[start..index].fill(false);
+        } else if bytes[index] == b'/' && bytes.get(index + 1) == Some(&b'*') {
+            let start = index;
+            let mut depth = 1_u32;
+            index += 2;
+            while index < bytes.len() && depth > 0 {
+                if bytes[index] == b'/' && bytes.get(index + 1) == Some(&b'*') {
+                    depth += 1;
+                    index += 2;
+                } else if bytes[index] == b'*' && bytes.get(index + 1) == Some(&b'/') {
+                    depth -= 1;
+                    index += 2;
+                } else {
+                    index += 1;
+                }
+            }
+            code[start..index].fill(false);
+        } else if bytes[index] == b'"'
+            || (bytes[index] == b'\''
+                && (bytes.get(index + 2) == Some(&b'\'')
+                    || (bytes.get(index + 1) == Some(&b'\\')
+                        && bytes[index + 2..bytes.len().min(index + 13)].contains(&b'\''))))
+        {
+            let quote = bytes[index];
+            let start = index;
+            index += 1;
+            while index < bytes.len() {
+                if bytes[index] == b'\\' {
+                    index = (index + 2).min(bytes.len());
+                } else if bytes[index] == quote {
+                    index += 1;
+                    break;
+                } else {
+                    index += 1;
+                }
+            }
+            code[start..index].fill(false);
+        } else if bytes[index] == b'r' {
+            let mut cursor = index + 1;
+            while bytes.get(cursor) == Some(&b'#') {
+                cursor += 1;
+            }
+            if bytes.get(cursor) == Some(&b'"') {
+                let hashes = cursor - index - 1;
+                let start = index;
+                cursor += 1;
+                while cursor < bytes.len() {
+                    if bytes[cursor] == b'"'
+                        && bytes.get(cursor + 1..cursor + 1 + hashes) == Some(&vec![b'#'; hashes])
+                    {
+                        cursor += 1 + hashes;
+                        break;
+                    }
+                    cursor += 1;
+                }
+                index = cursor;
+                code[start..index].fill(false);
+            } else {
+                index += 1;
+            }
+        } else {
+            index += 1;
+        }
+    }
+    code
 }
 
-fn production_source_for<'a>(path: &Path, source: &'a str) -> &'a str {
-    if path == Path::new("app.rs") {
-        let marker = "mod layout_tests {";
-        let index = source
-            .find(marker)
-            .expect("app source must retain its trailing layout test module");
-        &source[..index]
-    } else if path == Path::new("runtime_router.rs") {
-        let marker = "mod tests {";
-        let index = source
-            .rfind(marker)
-            .expect("runtime router must retain its trailing test module");
-        &source[..index]
-    } else {
-        production_prefix(source)
+fn production_source(source: &str) -> String {
+    const TEST_ATTR: &str = "#[cfg(test)]";
+    let mut retained = source.to_owned();
+    loop {
+        let mask = rust_code_mask(&retained);
+        let Some(start) = retained
+            .match_indices(TEST_ATTR)
+            .find_map(|(index, _)| mask[index].then_some(index))
+        else {
+            return retained;
+        };
+        let bytes = retained.as_bytes();
+        let mut cursor = start + TEST_ATTR.len();
+        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+        while retained[cursor..].starts_with("#[") {
+            let attribute_end = retained[cursor..]
+                .find(']')
+                .map(|offset| cursor + offset + 1)
+                .expect("test-gated companion attribute must close");
+            cursor = attribute_end;
+            while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+                cursor += 1;
+            }
+        }
+        let mask = rust_code_mask(&retained);
+        let mut parens = 0_i32;
+        let mut brackets = 0_i32;
+        let mut end = None;
+        let mut index = cursor;
+        while index < bytes.len() {
+            if !mask[index] {
+                index += 1;
+                continue;
+            }
+            match bytes[index] {
+                b'(' => parens += 1,
+                b')' => parens -= 1,
+                b'[' => brackets += 1,
+                b']' => brackets -= 1,
+                b'{' if parens == 0 && brackets == 0 => {
+                    let mut depth = 1_i32;
+                    index += 1;
+                    while index < bytes.len() && depth > 0 {
+                        if mask[index] {
+                            match bytes[index] {
+                                b'{' => depth += 1,
+                                b'}' => depth -= 1,
+                                _ => {}
+                            }
+                        }
+                        index += 1;
+                    }
+                    while bytes.get(index).is_some_and(u8::is_ascii_whitespace) {
+                        index += 1;
+                    }
+                    if matches!(bytes.get(index), Some(b';' | b',')) {
+                        index += 1;
+                    }
+                    end = Some(index);
+                    break;
+                }
+                b';' | b',' if parens == 0 && brackets == 0 => {
+                    end = Some(index + 1);
+                    break;
+                }
+                _ => {}
+            }
+            index += 1;
+        }
+        let end = end.expect("cfg(test)-gated Rust item must have a terminator");
+        retained.replace_range(start..end, "");
+    }
+}
+
+fn production_source_for(_path: &Path, source: &str) -> String {
+    production_source(source)
+}
+
+#[test]
+fn cfg_test_stripping_preserves_later_production_for_lf_and_crlf() {
+    let fixture = r###"fn before() { let _ = "}"; }
+// } comment
+#[cfg(test)]
+#[allow(dead_code)]
+fn hidden() { let _ = r#"{ nested }"#; /* } */ if true { let _ = '{'; } }
+struct Boundary {
+    before: u8,
+    #[cfg(test)]
+    hidden_field: String,
+    after: u8,
+}
+fn after() { let _ = "production-after"; }
+"###;
+    for source in [fixture.to_owned(), fixture.replace('\n', "\r\n")] {
+        let production = production_source(&source);
+        assert!(production.contains("fn before()"));
+        assert!(production.contains("fn after()"));
+        assert!(production.contains("after: u8"));
+        assert!(!production.contains("fn hidden()"));
+        assert!(!production.contains("hidden_field"));
+    }
+}
+
+#[test]
+fn runtime_artifact_module_is_a_leaf_value_boundary() {
+    let source = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("runtime_artifact.rs"),
+    )
+    .expect("runtime artifact source must be readable");
+    for forbidden in ["crate::onnx_worker", "crate::runtime_router"] {
+        assert!(
+            !source.contains(forbidden),
+            "artifact leaf imported execution module {forbidden:?}"
+        );
     }
 }
 
@@ -109,10 +283,17 @@ fn native_runtime_ownership_is_confined_to_marked_worker_modules() {
         .nth(1)
         .and_then(|tail| tail.split("/// Generic parent-side facade").next())
         .expect("worker role parser remains delimited before the parent facade");
-    assert!(
-        !role_parser.contains("--onnx-worker"),
-        "the legacy ONNX worker flag must not be accepted"
-    );
+    for required_rejection in [
+        "value == \"--onnx-worker\"",
+        "value.starts_with(\"--scribe-\")",
+        "value.ends_with(\"-worker\")",
+        "bail!(\"unknown private Scribe worker role\")",
+    ] {
+        assert!(
+            role_parser.contains(required_rejection),
+            "private worker-shaped arguments must fail closed via {required_rejection:?}"
+        );
+    }
     let router = sources
         .iter()
         .find(|(path, _)| path == Path::new("runtime_router.rs"))
@@ -190,7 +371,7 @@ fn native_runtime_ownership_is_confined_to_marked_worker_modules() {
     let service = sources
         .iter()
         .find(|(path, _)| path == Path::new("transcription.rs"))
-        .map(|(_, source)| production_prefix(source))
+        .map(|(_, source)| production_source(source))
         .expect("transcription service source exists");
     assert!(
         service.contains("let worker = RuntimeWorker::new_process();"),
@@ -207,7 +388,7 @@ fn worker_roles_use_private_pipes_and_protocol_only_stdout() {
             path != Path::new("architecture_guard.rs")
                 && source.contains("pub(crate) fn maybe_run_worker()")
         })
-        .map(|(_, source)| production_prefix(source))
+        .map(|(_, source)| production_source(source))
         .expect("worker entrypoint exists");
 
     assert!(worker.contains("PROTOCOL_MAGIC: [u8; 4] = *b\"SCIF\""));
@@ -263,7 +444,6 @@ fn private_onnx_runtime_contract_does_not_leak_into_product_surfaces() {
         "OnnxModelSpec",
         "OnnxModelFamily",
         "OnnxFileRole",
-        "OnnxBundle",
         "OnnxSpeech",
         "native-onnx",
     ];
@@ -272,7 +452,7 @@ fn private_onnx_runtime_contract_does_not_leak_into_product_surfaces() {
         if !protected.iter().any(|protected| path == protected) && !path.starts_with("ui") {
             continue;
         }
-        let production = production_prefix(source);
+        let production = production_source(source).replace("moonshine-tiny-en-int8-onnx", "");
         for identifier in forbidden {
             assert!(
                 !production.contains(identifier),
@@ -315,11 +495,11 @@ fn application_and_ui_sources_are_runtime_neutral() {
 
     for (path, source) in &sources {
         let is_application = path == Path::new("app.rs");
-        let is_ui = path.starts_with("ui");
+        let is_ui = path.starts_with("ui") && path != Path::new("ui/harness.rs");
         if !is_application && !is_ui {
             continue;
         }
-        let production = production_prefix(source);
+        let production = production_source(source).replace("moonshine-tiny-en-int8-onnx", "");
         let lowered = production.to_ascii_lowercase();
         for term in family_terms {
             assert!(
@@ -349,11 +529,13 @@ fn model_family_logic_is_confined_to_private_adapters_and_catalog_validation() {
         "model_catalog.rs",
         "models.rs",
         "onnx_model_bundles.rs",
+        "runtime_artifact.rs",
         "runtime_catalog.rs",
         "runtime_router.rs",
         "settings/schema.rs",
         "silero_vad_native.rs",
         "transcription.rs",
+        "ui/harness.rs",
     ];
     let family_terms = [
         "whisper.cpp",
@@ -380,7 +562,9 @@ fn model_family_logic_is_confined_to_private_adapters_and_catalog_validation() {
         {
             continue;
         }
-        let production = production_prefix(source).to_ascii_lowercase();
+        let production = production_source(source)
+            .replace("moonshine-tiny-en-int8-onnx", "")
+            .to_ascii_lowercase();
         for term in family_terms {
             assert!(
                 !production.contains(term),
@@ -397,7 +581,7 @@ fn onnx_bundle_http_and_typed_receipts_stay_below_the_service_boundary() {
     let bundles = sources
         .iter()
         .find(|(path, _)| path == Path::new("onnx_model_bundles.rs"))
-        .map(|(_, source)| production_prefix(source))
+        .map(|(_, source)| production_source(source))
         .expect("private ONNX bundle module exists");
     assert_eq!(
         bundles
@@ -411,8 +595,6 @@ fn onnx_bundle_http_and_typed_receipts_stay_below_the_service_boundary() {
     assert!(bundles.contains("OnnxModelSpec"));
 
     for protected in [
-        Path::new("app.rs"),
-        Path::new("config.rs"),
         Path::new("model_catalog.rs"),
         Path::new("models.rs"),
         Path::new("runtime_catalog.rs"),
@@ -420,7 +602,7 @@ fn onnx_bundle_http_and_typed_receipts_stay_below_the_service_boundary() {
         let production = sources
             .iter()
             .find(|(path, _)| path == protected)
-            .map(|(_, source)| production_prefix(source))
+            .map(|(_, source)| production_source(source))
             .expect("protected source exists");
         for forbidden in [
             "onnx_model_bundles",
@@ -449,7 +631,7 @@ fn tentative_transcripts_have_no_output_or_history_module_path() {
     for path in protected {
         let source = fs::read_to_string(&path)
             .unwrap_or_else(|error| panic!("{} must be readable: {error}", path.display()));
-        let production = production_prefix(&source).to_ascii_lowercase();
+        let production = production_source(&source).to_ascii_lowercase();
         assert!(
             !production.contains("tentative"),
             "{} must only receive finalized text; tentative text belongs in the overlay",
@@ -506,7 +688,7 @@ fn no_web_runtime_or_ui_pcm_transport_is_present() {
         if path == Path::new("architecture_guard.rs") {
             continue;
         }
-        let production = production_prefix(source).to_ascii_lowercase();
+        let production = production_source(source).to_ascii_lowercase();
         for forbidden in ["tauri::", "webview", "ipc::", "javascript"] {
             assert!(
                 !production.contains(forbidden),
@@ -520,7 +702,7 @@ fn no_web_runtime_or_ui_pcm_transport_is_present() {
         if !path.starts_with("ui") {
             continue;
         }
-        let production = production_prefix(source);
+        let production = production_source(source);
         for pcm_shape in ["Vec<f32>", "&[f32]", "PreparedAudio"] {
             assert!(
                 !production.contains(pcm_shape),

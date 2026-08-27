@@ -30,7 +30,7 @@ use crate::installations::{
     rollback_to_previous_runtime, stage_file_bundle_for_target, verify_regular_directory_root,
     verify_runtime_tree,
 };
-use crate::onnx_worker::{OnnxFileRole, OnnxModelFamily, OnnxModelSpec};
+use crate::runtime_artifact::{OnnxFileRole, OnnxModelFamily, OnnxModelSpec};
 use crate::transcription::{InstallSmoke, VerifiedOnnxBundleSmoke};
 
 const CATALOG_BYTES: &[u8] = include_bytes!(concat!(
@@ -1667,6 +1667,11 @@ pub(crate) fn current_executable_receipt_at(
         )));
     }
     Ok((receipt, spec))
+}
+
+#[cfg(test)]
+pub(crate) fn verified_test_receipt_at(root: &Path) -> Result<OnnxModelSpec, InstallError> {
+    verified_receipt_at(root).map(|(_, spec)| spec)
 }
 
 pub(crate) fn rollback_to_previous_onnx_bundle(target_root: &Path) -> Result<bool, InstallError> {

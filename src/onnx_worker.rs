@@ -26,10 +26,12 @@ use sherpa_onnx::{
 use crate::config;
 use crate::model_catalog::ArtifactFormat;
 use crate::prepared_audio::{PREPARED_SAMPLE_RATE, PreparedAudio};
-use crate::runtime_artifact::RuntimeArtifact;
+use crate::runtime_artifact::{
+    OnnxFileRole, OnnxModelFamily, OnnxModelSpec, RuntimeArtifact, RuntimeModel,
+};
 use crate::runtime_router::{
     NativeBootstrapFailure, NativeRuntimeDiagnostics, RuntimeError, RuntimeExecution,
-    RuntimeLoadExecution, RuntimeModel, RuntimeRouter,
+    RuntimeLoadExecution, RuntimeRouter,
 };
 use crate::silero_vad_native::{SileroVadModel, VadThreshold, WINDOW_SAMPLES};
 use crate::transcription::{
@@ -133,40 +135,6 @@ impl MonotonicDeadline {
         }
         Ok(remaining)
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum OnnxFileRole {
-    Model,
-    Encoder,
-    Decoder,
-    Joiner,
-    Tokens,
-    Preprocessor,
-    UncachedDecoder,
-    CachedDecoder,
-    MergedDecoder,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum OnnxModelFamily {
-    Moonshine,
-    NemoCtc,
-    Canary,
-    OfflineTransducer,
-    OnlineTransducer,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct OnnxModelSpec {
-    pub id: String,
-    pub root: PathBuf,
-    pub family: OnnxModelFamily,
-    pub files: BTreeMap<OnnxFileRole, PathBuf>,
-    pub num_threads: u16,
 }
 
 impl OnnxModelSpec {
@@ -3430,12 +3398,17 @@ fn worker_role_from_args(args: &[std::ffi::OsString]) -> Result<Option<WorkerRol
     let known_flag_present = args
         .iter()
         .any(|arg| arg == INFERENCE_WORKER_FLAG || arg == VAD_WORKER_FLAG);
+    let private_worker_shape_present = args.iter().any(|arg| {
+        let value = arg.to_string_lossy();
+        value == "--onnx-worker" || (value.starts_with("--scribe-") && value.ends_with("-worker"))
+    });
     match args {
         [arg] if arg == INFERENCE_WORKER_FLAG => Ok(Some(WorkerRole::Inference)),
         [arg] if arg == VAD_WORKER_FLAG => Ok(Some(WorkerRole::Vad)),
         _ if known_flag_present => {
             bail!("worker flags are mutually exclusive and accept no additional arguments")
         }
+        _ if private_worker_shape_present => bail!("unknown private Scribe worker role"),
         _ => Ok(None),
     }
 }
@@ -3489,6 +3462,10 @@ impl InferenceWorkerSupervisor {
         artifact: RuntimeArtifact,
         preference: AccelerationPreference,
     ) -> Result<RuntimeLoadExecution, RuntimeError> {
+        if matches!(artifact, RuntimeArtifact::OnnxBundle(_)) {
+            resolve_cpu_only_acceleration(preference)
+                .map_err(|error| RuntimeError::OnnxUnavailable(error.to_string()))?;
+        }
         let generation = self
             .transport
             .ensure_generation()
@@ -6207,9 +6184,12 @@ mod tests {
             Some(WorkerRole::Inference)
         );
         assert_eq!(
-            worker_role_from_args(&[OsString::from("--onnx-worker")]).unwrap(),
-            None
+            worker_role_from_args(&[OsString::from("--onnx-worker")])
+                .unwrap_err()
+                .to_string(),
+            "unknown private Scribe worker role"
         );
+        assert!(worker_role_from_args(&[OsString::from("--scribe-unknown-worker")]).is_err());
         assert_eq!(
             worker_role_from_args(&[OsString::from(VAD_WORKER_FLAG)]).unwrap(),
             Some(WorkerRole::Vad)
@@ -6397,6 +6377,31 @@ mod tests {
         );
         supervisor.unload().unwrap();
         assert_eq!(launcher.launches.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn onnx_gpu_rejection_happens_before_inference_child_spawn() {
+        let root = test_root("gpu-before-spawn");
+        let artifact = RuntimeArtifact::OnnxBundle(spec_with_roles(
+            &root,
+            OnnxModelFamily::NemoCtc,
+            NEMO_CTC_ROLES,
+        ));
+        let launcher = Arc::new(TestLauncher::new([TestMode::Normal]));
+        let inference = InferenceWorkerSupervisor {
+            transport: OnnxWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+                launcher.clone(),
+                short_deadlines(),
+            ),
+            next_correlation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        };
+
+        let error = inference
+            .load(artifact, AccelerationPreference::Gpu)
+            .unwrap_err();
+        assert!(matches!(error, RuntimeError::OnnxUnavailable(_)));
+        assert_eq!(launcher.launches.load(Ordering::Acquire), 0);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

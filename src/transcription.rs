@@ -38,12 +38,12 @@ pub use crate::model_catalog::{
     CompatibilityStatus, ModelCapabilities, ModelDescriptor, ModelRole,
 };
 use crate::models::{SttModelInfo, TranscriptResult as LegacyTranscriptResult};
-use crate::onnx_worker::{InferenceWorkerSupervisor, OnnxModelSpec};
+use crate::onnx_worker::InferenceWorkerSupervisor;
 use crate::prepared_audio::{PREPARED_SAMPLE_RATE, PreparedAudio};
-use crate::runtime_artifact::RuntimeArtifact;
+use crate::runtime_artifact::{OnnxModelSpec, RuntimeArtifact, RuntimeModel};
 use crate::runtime_router::{
     IdleTimeoutAction, NativeBootstrapFailure, RuntimeError, RuntimeExecution,
-    RuntimeLoadExecution, RuntimeModel, RuntimeRouter, WARM_MODEL_TTL, verify_compatibility_cli,
+    RuntimeLoadExecution, RuntimeRouter, WARM_MODEL_TTL, verify_compatibility_cli,
 };
 use crate::streaming::{
     HypothesisWord, PreviewAudioPublisher, PreviewEvent, RollingPreviewSession, StreamIdentity,
@@ -1357,6 +1357,41 @@ impl TranscriptionService {
             .load(
                 self.onnx_artifact_from_receipt(root)?,
                 AccelerationPreference::Cpu,
+            )
+            .map_err(Into::into)
+    }
+
+    #[cfg(test)]
+    fn preload_onnx_bundle_from_verified_test_receipt(
+        &self,
+        root: &Path,
+    ) -> Result<RuntimeLoadExecution> {
+        let spec = crate::onnx_model_bundles::verified_test_receipt_at(root)
+            .map_err(|error| anyhow!("test ONNX receipt verification failed: {error}"))?;
+        self.worker
+            .load(
+                RuntimeArtifact::OnnxBundle(spec),
+                AccelerationPreference::Cpu,
+            )
+            .map_err(Into::into)
+    }
+
+    #[cfg(test)]
+    fn transcribe_onnx_bundle_from_verified_test_receipt(
+        &self,
+        root: &Path,
+        audio: Arc<PreparedAudio>,
+        options: TranscriptionOptions,
+    ) -> Result<RuntimeExecution> {
+        let spec = crate::onnx_model_bundles::verified_test_receipt_at(root)
+            .map_err(|error| anyhow!("test ONNX receipt verification failed: {error}"))?;
+        self.worker
+            .transcribe(
+                RuntimeArtifact::OnnxBundle(spec),
+                AccelerationPreference::Cpu,
+                audio,
+                options,
+                self.worker.cancellation_snapshot(),
             )
             .map_err(Into::into)
     }
@@ -3091,6 +3126,8 @@ fn intersect_capabilities(
 mod tests {
     use super::*;
     use crate::models::TranscriptSegment as LegacyTranscriptSegment;
+    use crate::runtime_artifact::{OnnxFileRole, OnnxModelFamily};
+    use crate::runtime_router::NativeRuntimeDiagnostics;
     use sha2::{Digest, Sha256};
     use std::io::Cursor;
 
@@ -4091,6 +4128,223 @@ mod tests {
                 inference: None,
             }),
         }
+    }
+
+    fn service_onnx_spec(label: &str) -> (PathBuf, OnnxModelSpec) {
+        let root = std::env::temp_dir().join(format!(
+            "scribe-service-onnx-{label}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let files = [
+            OnnxFileRole::Encoder,
+            OnnxFileRole::Decoder,
+            OnnxFileRole::Joiner,
+            OnnxFileRole::Tokens,
+        ]
+        .into_iter()
+        .map(|role| {
+            let relative = PathBuf::from(format!("{role:?}.fixture").to_ascii_lowercase());
+            fs::write(root.join(&relative), format!("{label}-{role:?}")).unwrap();
+            (role, relative)
+        })
+        .collect();
+        let spec = OnnxModelSpec {
+            id: "zipformer-streaming-en-20m-int8-onnx".to_owned(),
+            root: root.clone(),
+            family: OnnxModelFamily::OnlineTransducer,
+            files,
+            num_threads: 1,
+        };
+        (root, spec)
+    }
+
+    fn test_load_execution() -> RuntimeLoadExecution {
+        RuntimeLoadExecution {
+            diagnostics: NativeRuntimeDiagnostics {
+                resolved_acceleration: ResolvedAcceleration {
+                    requested: AccelerationPreference::Cpu,
+                    resolved: ComputeDevice::Cpu,
+                    diagnostic: None,
+                },
+                native_library_path: PathBuf::from("<test-inference-child>"),
+                warm_reused: false,
+                model_load_duration_ms: 1,
+            },
+            detected_architecture: "nemo-ctc".to_owned(),
+            capabilities: RuntimeCapabilities::default(),
+        }
+    }
+
+    #[test]
+    fn receipt_backed_onnx_dispatch_crosses_the_runtime_worker_boundary() {
+        let (root, spec) = service_onnx_spec("receipt-dispatch");
+        crate::onnx_model_bundles::write_test_receipt_for_spec(&spec).unwrap();
+        let expected = spec.clone();
+        let worker = simulated_runtime_worker(move |receiver| {
+            match receiver.recv().unwrap() {
+                RuntimeCommand::Load {
+                    artifact: RuntimeArtifact::OnnxBundle(actual),
+                    preference,
+                    reply,
+                } => {
+                    assert_eq!(actual, expected);
+                    assert_eq!(preference, AccelerationPreference::Cpu);
+                    reply.send(Ok(test_load_execution())).unwrap();
+                }
+                _ => panic!("receipt preload must dispatch an ONNX load command"),
+            }
+            match receiver.recv().unwrap() {
+                RuntimeCommand::Transcribe {
+                    artifact: RuntimeArtifact::OnnxBundle(actual),
+                    preference,
+                    reply,
+                    ..
+                } => {
+                    assert_eq!(actual, expected);
+                    assert_eq!(preference, AccelerationPreference::Cpu);
+                    reply
+                        .send(Ok(RuntimeExecution {
+                            transcript: Transcript {
+                                text: "service-boundary".to_owned(),
+                                segments: Vec::new(),
+                                detected_language: None,
+                                duration_ms: None,
+                            },
+                            diagnostics: test_load_execution().diagnostics,
+                            processing_duration_ms: 1,
+                        }))
+                        .unwrap();
+                }
+                _ => panic!("receipt transcription must dispatch an ONNX batch command"),
+            }
+            if let RuntimeCommand::Shutdown { reply } = receiver.recv().unwrap() {
+                reply.send(Ok(())).unwrap();
+            }
+        });
+        let service = TranscriptionService {
+            config: AppConfig::default(),
+            router: RuntimeRouter::new(),
+            worker,
+        };
+
+        service
+            .preload_onnx_bundle_from_verified_test_receipt(&root)
+            .unwrap();
+        let execution = service
+            .transcribe_onnx_bundle_from_verified_test_receipt(
+                &root,
+                prepared_audio(),
+                TranscriptionOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(execution.transcript.text, "service-boundary");
+        drop(service);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn staged_smoke_preserves_decode_failure_and_unloads_across_worker_boundary() {
+        let (root, spec) = service_onnx_spec("decode-cleanup");
+        let unloads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let worker_unloads = Arc::clone(&unloads);
+        let worker = simulated_runtime_worker(move |receiver| {
+            while let Ok(command) = receiver.recv() {
+                match command {
+                    RuntimeCommand::Health { reply, .. } => reply.send(Ok(())).unwrap(),
+                    RuntimeCommand::Load { reply, .. } => {
+                        reply.send(Ok(test_load_execution())).unwrap()
+                    }
+                    RuntimeCommand::Transcribe { reply, .. } => reply
+                        .send(Err(RuntimeError::Engine(
+                            "deterministic service decode failure".to_owned(),
+                        )))
+                        .unwrap(),
+                    RuntimeCommand::Unload { reply } => {
+                        worker_unloads.fetch_add(1, Ordering::AcqRel);
+                        reply.send(Ok(())).unwrap();
+                    }
+                    RuntimeCommand::Shutdown { reply } => {
+                        reply.send(Ok(())).unwrap();
+                        break;
+                    }
+                    RuntimeCommand::StartStream { .. } => {
+                        panic!("staged offline smoke must not start a stream")
+                    }
+                }
+            }
+        });
+        let service = TranscriptionService {
+            config: AppConfig::default(),
+            router: RuntimeRouter::new(),
+            worker,
+        };
+
+        let error = service
+            .verify_onnx_artifact_smoke(
+                RuntimeArtifact::OnnxBundle(spec),
+                &InstallCancellation::default(),
+            )
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("deterministic service decode failure")
+        );
+        assert_eq!(unloads.load(Ordering::Acquire), 2);
+        drop(service);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn staged_smoke_health_failure_still_unloads_across_worker_boundary() {
+        let (root, spec) = service_onnx_spec("health-cleanup");
+        let unloads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let worker_unloads = Arc::clone(&unloads);
+        let worker = simulated_runtime_worker(move |receiver| {
+            while let Ok(command) = receiver.recv() {
+                match command {
+                    RuntimeCommand::Health { reply, .. } => reply
+                        .send(Err(RuntimeError::Engine(
+                            "deterministic service health failure".to_owned(),
+                        )))
+                        .unwrap(),
+                    RuntimeCommand::Unload { reply } => {
+                        worker_unloads.fetch_add(1, Ordering::AcqRel);
+                        reply.send(Ok(())).unwrap();
+                    }
+                    RuntimeCommand::Shutdown { reply } => {
+                        reply.send(Ok(())).unwrap();
+                        break;
+                    }
+                    _ => panic!("health failure must stop staged smoke before load/decode"),
+                }
+            }
+        });
+        let service = TranscriptionService {
+            config: AppConfig::default(),
+            router: RuntimeRouter::new(),
+            worker,
+        };
+
+        let error = service
+            .verify_onnx_artifact_smoke(
+                RuntimeArtifact::OnnxBundle(spec),
+                &InstallCancellation::default(),
+            )
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("deterministic service health failure")
+        );
+        assert_eq!(unloads.load(Ordering::Acquire), 1);
+        drop(service);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -27,7 +27,7 @@ use crate::model_catalog::{
     ArtifactFormat, RuntimeRequirement, RuntimeVersion, runtime_model_manifest,
 };
 use crate::prepared_audio::{PREPARED_SAMPLE_RATE, PreparedAudio};
-use crate::runtime_artifact::RuntimeArtifact;
+use crate::runtime_artifact::{RuntimeArtifact, RuntimeModel};
 use crate::transcription::{
     AccelerationPreference, ComputeDevice, ModelId, ResolvedAcceleration, RuntimeCapabilities,
     SpeechEngine, SpeechStream, Transcript, TranscriptSegment, TranscriptionOptions,
@@ -85,19 +85,6 @@ const COMMON_GGML_DEPENDENCIES: [(&str, &str); 11] = [
         "45ff644d301b8a1fffc7c5e3864205047360eb197814c7311f366d106bb5b19f",
     ),
 ];
-
-/// A model selected for the sole native whisper.cpp runtime.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RuntimeModel {
-    pub id: ModelId,
-    pub path: PathBuf,
-    pub format: ArtifactFormat,
-    /// Legacy GGML uses a hash-verified package; the safe GGUF route is
-    /// statically linked and deliberately has no downloaded runtime package.
-    pub package_root: Option<PathBuf>,
-    pub expected_size_bytes: u64,
-    pub expected_sha256: String,
-}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct NativeRuntimeDiagnostics {
@@ -237,14 +224,9 @@ fn runtime_kind_for_model(model_id: &ModelId) -> Option<RuntimeKind> {
     }
 }
 
+#[cfg(test)]
 fn is_gguf_model(model: &RuntimeModel) -> bool {
     model.format == ArtifactFormat::Gguf
-}
-
-impl RuntimeModel {
-    pub(crate) fn is_gguf(&self) -> bool {
-        is_gguf_model(self)
-    }
 }
 
 /// A remote GGUF is admitted only after `TranscriptionService` has resolved
