@@ -28,6 +28,55 @@ function Assert-Matches {
     }
 }
 
+function Test-CanonicalFixedDirectory {
+    param(
+        [Parameter(Mandatory)] [string] $Path,
+        [bool] $IsFixedDrive = $true
+    )
+
+    if ($Path -cne $Path.Trim() -or
+        $Path -notmatch '^[A-Za-z]:\\' -or
+        $Path.Length -le 3 -or
+        $Path.EndsWith('\') -or
+        $Path.Contains('/') -or
+        -not $IsFixedDrive) {
+        return $false
+    }
+    foreach ($segment in ($Path.Substring(3) -split '\\')) {
+        if ($segment.Length -eq 0 -or $segment -in @('.', '..') -or
+            $segment.EndsWith('.') -or $segment.EndsWith(' ')) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Test-TrustedUninstallerScenario {
+    param(
+        [Parameter(Mandatory)] [string] $InstallPath,
+        [Parameter(Mandatory)] [string] $UninstallString,
+        [bool] $IsFixedDrive = $true
+    )
+
+    if (-not (Test-CanonicalFixedDirectory $InstallPath $IsFixedDrive)) {
+        return $false
+    }
+    $trimmedCommand = $UninstallString.Trim()
+    if ($trimmedCommand -notmatch '^"(?<path>[^"]+)"$') {
+        return $false
+    }
+    $uninstallerPath = $Matches.path
+    if (-not (Test-CanonicalFixedDirectory ([System.IO.Path]::GetDirectoryName($uninstallerPath)) $IsFixedDrive) -or
+        [System.IO.Path]::GetFileName($uninstallerPath) -notmatch '(?i)^unins\d{3}\.exe$') {
+        return $false
+    }
+    return [string]::Equals(
+        [System.IO.Path]::GetDirectoryName($uninstallerPath),
+        $InstallPath,
+        [System.StringComparison]::OrdinalIgnoreCase
+    )
+}
+
 $appGuid = '8E0F1935-8E3D-4B1D-9A42-7C7D7C3D5E7A'
 $uninstallKey = "Software\Microsoft\Windows\CurrentVersion\Uninstall\{$appGuid}_is1"
 
@@ -78,11 +127,11 @@ if ($loadExistingInstallStart -lt 0 -or $loadExistingInstallEnd -le $loadExistin
     throw 'Could not isolate existing-install detection for maintenance regression checks.'
 }
 $loadExistingInstall = $installer.Substring($loadExistingInstallStart, $loadExistingInstallEnd - $loadExistingInstallStart)
-if ($loadExistingInstall -notmatch 'IsSafeInstallPath\(ExistingInstallPath\)' -or
+if ($loadExistingInstall -notmatch 'TryGetCanonicalFixedDirectory\(RegisteredInstallPath, ExistingInstallPath\)' -or
     $loadExistingInstall -notmatch 'ExistingInstallUsable :=[\s\S]*StrToVersion\(ExistingVersion, ExistingPackedVersion\)[\s\S]*StrToVersion\(''\{#AppVersion\}'', SetupPackedVersion\)') {
     throw 'Update and Repair must require a valid stable registration, version, and install path.'
 }
-$safePathValidationPosition = $loadExistingInstall.IndexOf('IsSafeInstallPath(ExistingInstallPath)', [System.StringComparison]::Ordinal)
+$safePathValidationPosition = $loadExistingInstall.IndexOf('TryGetCanonicalFixedDirectory(RegisteredInstallPath, ExistingInstallPath)', [System.StringComparison]::Ordinal)
 $productValidationPosition = $loadExistingInstall.IndexOf(
     'ExistingInstallUsable :=',
     $safePathValidationPosition,
@@ -104,7 +153,15 @@ Assert-Contains 'MaintenancePage.Add(''Remove Scribe (unavailable: uninstaller i
 
 # Removal is terminal and runs only a validated executable path, never a registry command line.
 Assert-Contains 'function IsTrustedUninstaller' 'uninstaller validation'
-Assert-Contains "(Copy(CandidateName, 1, 5) = 'unins')" 'Inno uninstaller filename validation'
+Assert-Contains 'function IsInnoUninstallerFilename' 'strict Inno uninstaller filename validation'
+Assert-Contains "(Length(NormalizedFilename) = 12)" 'three-digit uninstaller filename length'
+Assert-Contains "(Copy(NormalizedFilename, 1, 5) = 'unins')" 'uninstaller filename prefix'
+Assert-Contains "(Copy(NormalizedFilename, 9, 4) = '.exe')" 'uninstaller executable extension'
+Assert-Contains 'GetDriveType(Copy(CanonicalPath, 1, 3)) = DriveFixed' 'fixed-drive path requirement'
+Assert-Contains 'function RevalidateExistingUninstaller' 'pre-execution uninstaller revalidation'
+Assert-Matches 'function ExtractUninstallerExecutable[\s\S]*Trim\(UninstallString\)[\s\S]*TrimmedCommand\[1\][\s\S]*TrimmedCommand\[Length\(TrimmedCommand\)\][\s\S]*no arguments, switches, or suffixes' 'exact quoted uninstall command requirement'
+Assert-Matches 'function RevalidateExistingUninstaller[\s\S]*TryGetCanonicalFixedDirectory[\s\S]*IsTrustedUninstaller[\s\S]*CompareText\(CanonicalUninstallerPath, ExistingUninstallerPath\)' 'pre-execution registry and path revalidation'
+Assert-Matches 'function RemoveExistingInstallation[\s\S]*if not RevalidateExistingUninstaller then begin[\s\S]*Exec\(ExistingUninstallerPath' 'revalidation immediately before execution'
 Assert-Contains "Exec(ExistingUninstallerPath, '/NORESTART'" 'validated uninstaller execution'
 if ($installer -match 'Exec\(UninstallString') {
     throw 'Installer must never execute UninstallString directly.'
@@ -117,6 +174,39 @@ Assert-Contains 'Remove is unavailable because this Scribe installation has no t
 if (-not $windowsDocumentation.Contains('Setup reports exit code `2` even when the uninstaller succeeded.', [System.StringComparison]::Ordinal) -or
     -not $windowsDocumentation.Contains('Verify that Scribe''s uninstall registration is gone', [System.StringComparison]::Ordinal)) {
     throw 'Windows documentation must define the Remove automation exit contract and registry verification.'
+}
+
+# Exercise the strict registry-command and path trust model with representative cases.
+foreach ($invalidPath in @(
+    'C:\',
+    '\\server\share\Scribe',
+    '\\?\C:\Scribe',
+    'C:\Scribe\..\Other',
+    'C:\Scribe\\Nested',
+    'C:\Scribe.\Nested',
+    'C:\Scribe\'
+)) {
+    if (Test-CanonicalFixedDirectory $invalidPath) {
+        throw "Unsafe registered install path was accepted: $invalidPath"
+    }
+}
+if (Test-CanonicalFixedDirectory 'Z:\Scribe' $false) {
+    throw 'A non-fixed/network drive install path was accepted.'
+}
+foreach ($validFilename in @('unins000.exe', 'unins001.exe')) {
+    if (-not (Test-TrustedUninstallerScenario 'C:\Apps\Scribe' "`"C:\Apps\Scribe\$validFilename`"")) {
+        throw "Compatible Inno uninstaller was rejected: $validFilename"
+    }
+}
+foreach ($invalidCommand in @(
+    '"C:\Apps\Scribe\uninsEvil.exe"',
+    '"C:\Apps\Scribe\unins0000.exe"',
+    '"C:\Apps\Scribe\unins000.exe" /SILENT',
+    '"C:\Other\unins000.exe"'
+)) {
+    if (Test-TrustedUninstallerScenario 'C:\Apps\Scribe' $invalidCommand) {
+        throw "Unsafe registered uninstaller was accepted: $invalidCommand"
+    }
 }
 
 # An Inno uninstaller may hand work to a self-copy after its original process exits.

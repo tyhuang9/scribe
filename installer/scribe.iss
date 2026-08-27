@@ -51,6 +51,7 @@ const
     'Software\Microsoft\Windows\CurrentVersion\Uninstall\{8E0F1935-8E3D-4B1D-9A42-7C7D7C3D5E7A}_is1';
   UninstallKeyPollIntervalMs = 250;
   UninstallKeyPollAttempts = 20;
+  DriveFixed = 3;
 
 type
   TMaintenanceAction = (maInstall, maUpdate, maRepair, maRemove, maBlocked);
@@ -69,65 +70,162 @@ var
   SelectedMaintenanceAction: TMaintenanceAction;
   RemovalCompleted: Boolean;
 
-function NormalizeDirectory(const Directory: String): String;
-begin
-  Result := RemoveBackslashUnlessRoot(Directory);
-end;
+function GetDriveType(const RootPathName: String): Cardinal;
+  external 'GetDriveTypeW@kernel32.dll stdcall';
 
-function IsSafeInstallPath(const InstallPath: String): Boolean;
+function IsAsciiDriveLetter(const Character: Char): Boolean;
 begin
   Result :=
-    (InstallPath <> '') and
-    PathIsRooted(InstallPath) and
-    not PathHasInvalidCharacters(InstallPath, True);
+    ((Character >= 'A') and (Character <= 'Z')) or
+    ((Character >= 'a') and (Character <= 'z'));
+end;
+
+function HasOnlyCanonicalDirectorySegments(const Path: String): Boolean;
+var
+  SegmentStart: Integer;
+  SeparatorOffset: Integer;
+  Segment: String;
+begin
+  Result := False;
+  SegmentStart := 4;
+  while SegmentStart <= Length(Path) do begin
+    SeparatorOffset := Pos('\', Copy(Path, SegmentStart, Length(Path)));
+    if SeparatorOffset = 0 then begin
+      Segment := Copy(Path, SegmentStart, Length(Path));
+      SegmentStart := Length(Path) + 1;
+    end else begin
+      Segment := Copy(Path, SegmentStart, SeparatorOffset - 1);
+      SegmentStart := SegmentStart + SeparatorOffset;
+    end;
+
+    if Segment = '' then begin
+      exit;
+    end;
+    if (Segment = '.') or (Segment = '..') or
+       (Segment[Length(Segment)] = '.') or (Segment[Length(Segment)] = ' ') then begin
+      exit;
+    end;
+  end;
+  Result := True;
+end;
+
+function TryGetCanonicalFixedDirectory(const Candidate: String; var CanonicalPath: String): Boolean;
+begin
+  CanonicalPath := '';
+  Result := False;
+  if (Candidate = '') or (Candidate <> Trim(Candidate)) or
+     (Length(Candidate) <= 3) then begin
+    exit;
+  end;
+  if (Candidate[Length(Candidate)] = '\') or
+     not IsAsciiDriveLetter(Candidate[1]) or
+     (Candidate[2] <> ':') or
+     (Candidate[3] <> '\') or
+     (Pos('/', Candidate) <> 0) or
+     PathHasInvalidCharacters(Candidate, True) or
+     not HasOnlyCanonicalDirectorySegments(Candidate) then begin
+    exit;
+  end;
+
+  CanonicalPath := ExpandFileName(Candidate);
+  Result :=
+    (CompareText(CanonicalPath, Candidate) = 0) and
+    (GetDriveType(Copy(CanonicalPath, 1, 3)) = DriveFixed);
+  if not Result then begin
+    CanonicalPath := '';
+  end;
 end;
 
 function ExtractUninstallerExecutable(const UninstallString: String; var Executable: String): Boolean;
 var
-  ClosingQuote: Integer;
-  FirstSpace: Integer;
+  TrimmedCommand: String;
 begin
   Result := False;
   Executable := '';
+  TrimmedCommand := Trim(UninstallString);
 
-  if UninstallString = '' then begin
+  if (TrimmedCommand = '') or (Length(TrimmedCommand) < 3) then begin
+    exit;
+  end;
+  if (TrimmedCommand[1] <> '"') or
+     (TrimmedCommand[Length(TrimmedCommand)] <> '"') then begin
     exit;
   end;
 
-  if UninstallString[1] = '"' then begin
-    ClosingQuote := Pos('"', Copy(UninstallString, 2, Length(UninstallString)));
-    if ClosingQuote = 0 then begin
-      exit;
-    end;
-    Executable := Copy(UninstallString, 2, ClosingQuote - 1);
-  end else begin
-    { An unquoted command with spaces is ambiguous. Refuse it rather than
-      guessing at a registry-provided command line. }
-    FirstSpace := Pos(' ', UninstallString);
-    if FirstSpace <> 0 then begin
-      exit;
-    end;
-    Executable := UninstallString;
+  { Permit only outer whitespace. The command itself must be one quoted
+    executable path with no arguments, switches, or suffixes. }
+  if Pos('"', Copy(TrimmedCommand, 2, Length(TrimmedCommand) - 2)) <> 0 then begin
+    exit;
   end;
-
-  Result := (Executable <> '') and PathIsRooted(Executable);
+  Executable := Copy(TrimmedCommand, 2, Length(TrimmedCommand) - 2);
+  Result := Executable <> '';
 end;
 
-function IsTrustedUninstaller(const Candidate, InstallPath: String): Boolean;
+function IsInnoUninstallerFilename(const Filename: String): Boolean;
 var
-  CandidateName: String;
+  NormalizedFilename: String;
+  Index: Integer;
 begin
-  CandidateName := Lowercase(ExtractFileName(Candidate));
+  NormalizedFilename := Lowercase(Filename);
   Result :=
-    FileExists(Candidate) and
-    (CompareText(NormalizeDirectory(ExtractFileDir(Candidate)), NormalizeDirectory(InstallPath)) = 0) and
-    (Copy(CandidateName, 1, 5) = 'unins') and
-    (ExtractFileExt(CandidateName) = '.exe');
+    (Length(NormalizedFilename) = 12) and
+    (Copy(NormalizedFilename, 1, 5) = 'unins') and
+    (Copy(NormalizedFilename, 9, 4) = '.exe');
+  if not Result then begin
+    exit;
+  end;
+  for Index := 6 to 8 do begin
+    if (NormalizedFilename[Index] < '0') or (NormalizedFilename[Index] > '9') then begin
+      Result := False;
+      exit;
+    end;
+  end;
+end;
+
+function TryGetCanonicalUninstallerPath(const Candidate: String; var CanonicalPath: String): Boolean;
+var
+  CanonicalDirectory: String;
+  Filename: String;
+begin
+  CanonicalPath := '';
+  Filename := ExtractFileName(Candidate);
+  Result :=
+    IsInnoUninstallerFilename(Filename) and
+    TryGetCanonicalFixedDirectory(ExtractFileDir(Candidate), CanonicalDirectory);
+  if not Result then begin
+    exit;
+  end;
+
+  CanonicalPath := ExpandFileName(Candidate);
+  Result := CompareText(CanonicalPath, AddBackslash(CanonicalDirectory) + Filename) = 0;
+  if not Result then begin
+    CanonicalPath := '';
+  end;
+end;
+
+function IsTrustedUninstaller(const Candidate, CanonicalInstallPath: String;
+  var CanonicalUninstallerPath: String): Boolean;
+var
+  CanonicalUninstallerDirectory: String;
+begin
+  Result := TryGetCanonicalUninstallerPath(Candidate, CanonicalUninstallerPath);
+  if not Result then begin
+    exit;
+  end;
+  CanonicalUninstallerDirectory := ExtractFileDir(CanonicalUninstallerPath);
+  Result :=
+    FileExists(CanonicalUninstallerPath) and
+    (CompareText(CanonicalUninstallerDirectory, CanonicalInstallPath) = 0);
+  if not Result then begin
+    CanonicalUninstallerPath := '';
+  end;
 end;
 
 procedure LoadExistingInstallation;
 var
   UninstallString: String;
+  RegisteredInstallPath: String;
+  UninstallerCandidate: String;
 begin
   ExistingInstallDetected := RegKeyExists(HKCU, ScribeUninstallRegKey);
   ExistingInstallUsable := False;
@@ -142,8 +240,8 @@ begin
   end;
 
   if not RegQueryStringValue(HKCU, ScribeUninstallRegKey, 'DisplayVersion', ExistingVersion) or
-     not RegQueryStringValue(HKCU, ScribeUninstallRegKey, 'InstallLocation', ExistingInstallPath) or
-     not IsSafeInstallPath(ExistingInstallPath) then begin
+     not RegQueryStringValue(HKCU, ScribeUninstallRegKey, 'InstallLocation', RegisteredInstallPath) or
+     not TryGetCanonicalFixedDirectory(RegisteredInstallPath, ExistingInstallPath) then begin
     exit;
   end;
 
@@ -159,9 +257,9 @@ begin
   { A missing or corrupt old uninstaller must not prevent an in-place update or
     repair from recreating it. It is required only for the Remove action. }
   if RegQueryStringValue(HKCU, ScribeUninstallRegKey, 'UninstallString', UninstallString) and
-     ExtractUninstallerExecutable(UninstallString, ExistingUninstallerPath) then begin
+     ExtractUninstallerExecutable(UninstallString, UninstallerCandidate) then begin
     ExistingUninstallerTrusted :=
-      IsTrustedUninstaller(ExistingUninstallerPath, ExistingInstallPath);
+      IsTrustedUninstaller(UninstallerCandidate, ExistingInstallPath, ExistingUninstallerPath);
   end;
 end;
 
@@ -241,6 +339,28 @@ begin
   end;
 end;
 
+function RevalidateExistingUninstaller: Boolean;
+var
+  RegisteredInstallPath: String;
+  CanonicalInstallPath: String;
+  UninstallString: String;
+  UninstallerCandidate: String;
+  CanonicalUninstallerPath: String;
+begin
+  Result := False;
+  if not RegKeyExists(HKCU, ScribeUninstallRegKey) or
+     not RegQueryStringValue(HKCU, ScribeUninstallRegKey, 'InstallLocation', RegisteredInstallPath) or
+     not TryGetCanonicalFixedDirectory(RegisteredInstallPath, CanonicalInstallPath) or
+     (CompareText(CanonicalInstallPath, ExistingInstallPath) <> 0) or
+     not RegQueryStringValue(HKCU, ScribeUninstallRegKey, 'UninstallString', UninstallString) or
+     not ExtractUninstallerExecutable(UninstallString, UninstallerCandidate) or
+     not IsTrustedUninstaller(UninstallerCandidate, CanonicalInstallPath, CanonicalUninstallerPath) then begin
+    exit;
+  end;
+
+  Result := CompareText(CanonicalUninstallerPath, ExistingUninstallerPath) = 0;
+end;
+
 function RemoveExistingInstallation: Boolean;
 var
   ResultCode: Integer;
@@ -256,6 +376,11 @@ begin
   { Run only the validated uninstaller executable and supply our own arguments;
     never replay the registry command line. No /SILENT flag lets its normal UI
     report cancellation or failure to the user. }
+  if not RevalidateExistingUninstaller then begin
+    MsgBox('Remove is unavailable because Scribe installer registration changed or can no longer be trusted. ' +
+      'Choose Update or Repair to recreate installer registration.', mbError, MB_OK);
+    exit;
+  end;
   if not Exec(ExistingUninstallerPath, '/NORESTART', '', SW_SHOWNORMAL,
       ewWaitUntilTerminated, ResultCode) then begin
     MsgBox('Scribe could not start its uninstaller. Nothing was installed or changed.', mbError, MB_OK);
