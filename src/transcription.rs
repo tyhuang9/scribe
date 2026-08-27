@@ -777,6 +777,32 @@ impl RuntimeWorker {
         }
     }
 
+    #[cfg(test)]
+    fn new_process_for_executable(executable: PathBuf) -> Self {
+        cleanup_stale_temporary_audio();
+        let inference = InferenceWorkerSupervisor::unstarted_for_executable(executable);
+        let worker_inference = inference.clone();
+        let cancellation_generation = Arc::new(AtomicU64::new(0));
+        let worker_cancellation = cancellation_generation.clone();
+        let (commands, receiver) = sync_channel(1);
+        let worker = std::thread::Builder::new()
+            .name("scribe-inference-diagnostic-dispatch".to_owned())
+            .spawn(move || {
+                inference_worker_dispatch_loop(worker_inference, worker_cancellation, receiver)
+            })
+            .expect("Scribe could not create its diagnostic inference dispatch worker");
+        Self {
+            inner: Arc::new(RuntimeWorkerInner {
+                commands,
+                worker: Mutex::new(Some(worker)),
+                shutdown_gate: Mutex::new(()),
+                cancellation_generation,
+                in_process_router: None,
+                inference: Some(inference),
+            }),
+        }
+    }
+
     fn cancel_active(&self) {
         self.inner
             .cancellation_generation
@@ -1241,6 +1267,15 @@ impl TranscriptionService {
             config,
             worker: RuntimeWorker::new(router.clone()),
             router,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_process_executable(config: AppConfig, executable: PathBuf) -> Self {
+        Self {
+            config,
+            worker: RuntimeWorker::new_process_for_executable(executable),
+            router: RuntimeRouter::new(),
         }
     }
 
@@ -3673,6 +3708,14 @@ mod tests {
             .expect("set SCRIBE_ONNX_BUNDLE_WAV_SHA256 to the exact lowercase WAV SHA-256");
         let expected_text = std::env::var("SCRIBE_ONNX_BUNDLE_EXPECTED_TRANSCRIPT")
             .expect("set SCRIBE_ONNX_BUNDLE_EXPECTED_TRANSCRIPT to the required spoken text");
+        let worker_executable = PathBuf::from(
+            std::env::var_os("SCRIBE_ONNX_WORKER_EXE")
+                .expect("set SCRIBE_ONNX_WORKER_EXE to a separately built Scribe executable"),
+        );
+        assert!(
+            worker_executable.is_file(),
+            "SCRIBE_ONNX_WORKER_EXE must name an existing Scribe executable"
+        );
         assert!(
             !normalize_fixture_transcript(&expected_text).is_empty(),
             "the required expected transcript must contain letters or numbers"
@@ -3694,7 +3737,7 @@ mod tests {
         .unwrap();
         let mut config = AppConfig::default();
         config.performance.acceleration_preference = AccelerationPreference::Cpu;
-        let service = TranscriptionService::new(config);
+        let service = TranscriptionService::with_process_executable(config, worker_executable);
         let verified = service
             .verify_onnx_bundle_for_installation(staged, &cancellation)
             .unwrap();
