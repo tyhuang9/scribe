@@ -375,12 +375,12 @@ fn active_model_button(
 
 fn brand(ui: &mut egui::Ui, mode: NavigationMode, text: Color32, _muted: Color32) {
     ui.horizontal(|ui| {
-        branding::show_mark(ui, 32.0, mode == NavigationMode::Compact);
+        branding::show_mark(ui, 34.0, mode == NavigationMode::Compact);
         if mode == NavigationMode::Full {
-            ui.add_space(5.0);
+            ui.add_space(6.0);
             let heading = ui.label(
                 egui::RichText::new(branding::WORDMARK)
-                    .size(23.0)
+                    .size(24.0)
                     .color(text)
                     .strong(),
             );
