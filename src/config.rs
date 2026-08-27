@@ -1923,7 +1923,7 @@ mod tests {
             },
             ..AppConfig::default()
         };
-        let before = config.clone();
+        let before = serde_json::to_vec(&config).unwrap();
         let model_id = ModelId::new("moonshine-tiny-en-int8-onnx");
         let expected = root
             .join("onnx-bundles")
@@ -1938,7 +1938,8 @@ mod tests {
         );
         assert!(installed_onnx_bundle_root(&config, &model_id).is_none());
         assert_eq!(
-            config, before,
+            serde_json::to_vec(&config).unwrap(),
+            before,
             "read-only discovery must not mutate settings"
         );
 
@@ -1954,7 +1955,8 @@ mod tests {
         assert_eq!(projected.local_path.as_deref(), Some(expected.as_path()));
         assert_eq!(projected.install_status, ModelInstallStatus::Missing);
         assert_eq!(
-            config, before,
+            serde_json::to_vec(&config).unwrap(),
+            before,
             "failed receipt discovery must not mutate settings"
         );
         fs::remove_dir_all(root).unwrap();
