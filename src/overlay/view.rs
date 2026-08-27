@@ -14,7 +14,7 @@ use super::platform::{
     OverlayWindowSpec, harden_overlay_window, harden_overlay_window_at, overlay_window_bounds,
 };
 use crate::{
-    branding::{DEEP_INK, DEEP_NAVY, ICE_MIST, SOFT_AQUA, TEAL_ACCENT},
+    branding::{DEEP_INK, DEEP_NAVY, ICE_MIST, TEAL_ACCENT},
     transcription::SessionId,
     ui::theme_palette,
 };
@@ -360,31 +360,51 @@ struct OverlayColors {
     shadow: Color32,
 }
 
+// Muted Gray is too low-contrast on this intentionally translucent capsule
+// over a light desktop. This overlay-only neutral stays close to Soft Text
+// while preserving the 4.5:1 text requirement on either extreme backdrop.
+pub(super) const DARK_OVERLAY_MUTED_TEXT: Color32 = Color32::from_rgb(220, 229, 230);
+
 fn overlay_colors(context: &egui::Context) -> OverlayColors {
     let palette = theme_palette(context);
     if context.style().visuals.dark_mode {
+        debug_assert_ne!(
+            palette.panel_bg, DEEP_NAVY,
+            "the charcoal overlay must not regress to the retired Deep Navy surface"
+        );
+        debug_assert_ne!(
+            palette.recording_waveform, TEAL_ACCENT,
+            "the charcoal overlay must not regress to the retired teal accent"
+        );
         OverlayColors {
-            // The exact Deep Navy surface stays deterministic while its alpha
-            // lets the underlying desktop content show through.
+            // Preserve the established glass alpha; low-contrast foreground
+            // roles below use explicit overlay-safe variants instead.
             surface: Color32::from_rgba_unmultiplied(
-                DEEP_NAVY.r(),
-                DEEP_NAVY.g(),
-                DEEP_NAVY.b(),
+                palette.panel_bg.r(),
+                palette.panel_bg.g(),
+                palette.panel_bg.b(),
                 184,
             ),
             border: Color32::from_rgba_unmultiplied(
-                TEAL_ACCENT.r(),
-                TEAL_ACCENT.g(),
-                TEAL_ACCENT.b(),
+                palette.border.r(),
+                palette.border.g(),
+                palette.border.b(),
                 36,
             ),
-            text: ICE_MIST,
-            muted_text: SOFT_AQUA,
-            waveform: TEAL_ACCENT,
-            success: Color32::from_rgb(157, 223, 183),
-            error: Color32::from_rgb(255, 210, 203),
-            warning: Color32::from_rgb(246, 223, 194),
-            shadow: Color32::from_black_alpha(96),
+            text: palette.text,
+            muted_text: DARK_OVERLAY_MUTED_TEXT,
+            // This is the palette's contrast-safe teal foreground for the
+            // raw Scribe Teal accent.
+            waveform: palette.chip_active_text,
+            success: palette.success,
+            error: palette.error_text,
+            warning: palette.chip_warning_text,
+            shadow: Color32::from_rgba_unmultiplied(
+                palette.shell_bg.r(),
+                palette.shell_bg.g(),
+                palette.shell_bg.b(),
+                96,
+            ),
         }
     } else {
         OverlayColors {
@@ -2301,20 +2321,41 @@ mod tests {
         let dark_context = egui::Context::default();
         dark_context.set_visuals(egui::Visuals::dark());
         let dark = overlay_colors(&dark_context);
+        let dark_palette = crate::ui::ThemePalette::dark();
         assert_eq!(
             dark.surface,
-            Color32::from_rgba_unmultiplied(DEEP_NAVY.r(), DEEP_NAVY.g(), DEEP_NAVY.b(), 184)
+            Color32::from_rgba_unmultiplied(
+                dark_palette.panel_bg.r(),
+                dark_palette.panel_bg.g(),
+                dark_palette.panel_bg.b(),
+                184,
+            )
         );
         assert_eq!(
             dark.border,
-            Color32::from_rgba_unmultiplied(TEAL_ACCENT.r(), TEAL_ACCENT.g(), TEAL_ACCENT.b(), 36)
+            Color32::from_rgba_unmultiplied(
+                dark_palette.border.r(),
+                dark_palette.border.g(),
+                dark_palette.border.b(),
+                36,
+            )
         );
-        assert_eq!(dark.text, ICE_MIST);
-        assert_eq!(dark.muted_text, SOFT_AQUA);
-        assert_eq!(dark.waveform, TEAL_ACCENT);
-        assert_eq!(dark.success, Color32::from_rgb(157, 223, 183));
-        assert_eq!(dark.error, Color32::from_rgb(255, 210, 203));
-        assert_eq!(dark.warning, Color32::from_rgb(246, 223, 194));
+        assert_eq!(dark.text, dark_palette.text);
+        assert_eq!(DARK_OVERLAY_MUTED_TEXT.to_array(), [220, 229, 230, 255]);
+        assert_eq!(dark.muted_text, DARK_OVERLAY_MUTED_TEXT);
+        assert_eq!(dark.waveform, dark_palette.chip_active_text);
+        assert_eq!(dark.success, dark_palette.success);
+        assert_eq!(dark.error, dark_palette.error_text);
+        assert_eq!(dark.warning, dark_palette.chip_warning_text);
+        assert_eq!(
+            dark.shadow,
+            Color32::from_rgba_unmultiplied(
+                dark_palette.shell_bg.r(),
+                dark_palette.shell_bg.g(),
+                dark_palette.shell_bg.b(),
+                96,
+            )
+        );
     }
 
     #[test]
