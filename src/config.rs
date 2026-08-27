@@ -361,6 +361,30 @@ pub fn configured_models(config: &AppConfig) -> Vec<SttModelInfo> {
     configured_models_with_bundled_path(config, bundled_model_path())
 }
 
+pub(crate) fn onnx_bundle_storage_dir(config: &AppConfig) -> PathBuf {
+    model_storage_dir(config).join("onnx-bundles")
+}
+
+pub(crate) fn installed_onnx_bundle_root(
+    config: &AppConfig,
+    model_id: &ModelId,
+) -> Option<PathBuf> {
+    let crate::model_catalog::NormalizedInstallArtifact::ReceiptBackedBundle { bundle_id, .. } =
+        crate::model_catalog::normalized_install_artifact(model_id)?
+    else {
+        return None;
+    };
+    if bundle_id != model_id.as_str() || bundle_id != "moonshine-tiny-en-int8-onnx" {
+        return None;
+    }
+    let root =
+        crate::onnx_model_bundles::bundle_target_root(&onnx_bundle_storage_dir(config), bundle_id)
+            .ok()?;
+    crate::onnx_model_bundles::current_executable_receipt_at(&root)
+        .ok()
+        .map(|_| root)
+}
+
 fn configured_models_with_bundled_path(
     config: &AppConfig,
     bundled_base_path: Option<PathBuf>,
@@ -368,6 +392,12 @@ fn configured_models_with_bundled_path(
     let mut models = default_model_catalog()
         .into_iter()
         .map(|mut model| {
+            if let Some(root) = installed_onnx_bundle_root(config, &ModelId::new(&model.id)) {
+                model.local_path = Some(root);
+                model.artifact_origin = ModelArtifactOrigin::Managed;
+                model.install_status = ModelInstallStatus::Installed;
+                return model;
+            }
             let bundled_path = (model.id == BUNDLED_BASE_MODEL_ID)
                 .then(|| bundled_base_path.clone())
                 .flatten();
@@ -834,6 +864,16 @@ fn first_matching_file(root: &Path, patterns: &[&str]) -> Option<PathBuf> {
 }
 
 pub fn downloaded_model_path(config: &AppConfig, model: &SttModelInfo) -> Option<PathBuf> {
+    if matches!(
+        crate::model_catalog::normalized_install_artifact(&ModelId::new(&model.id)),
+        Some(crate::model_catalog::NormalizedInstallArtifact::ReceiptBackedBundle { .. })
+    ) {
+        return crate::onnx_model_bundles::bundle_target_root(
+            &onnx_bundle_storage_dir(config),
+            &model.id,
+        )
+        .ok();
+    }
     model
         .download_model
         .as_ref()
