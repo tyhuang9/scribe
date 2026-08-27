@@ -203,13 +203,22 @@ pub fn default_model_catalog() -> Vec<SttModelInfo> {
     let mut models = crate::model_catalog::model_descriptors()
         .into_iter()
         .map(|descriptor| {
-            let runtime = crate::model_catalog::runtime_model_manifest(&descriptor.id)
-                .expect("every normalized descriptor must have a runtime manifest");
-            let download_model = Some(runtime.artifact_filename.to_owned());
+            let (backend, download_model) =
+                match crate::model_catalog::normalized_install_artifact(&descriptor.id)
+                    .expect("every normalized descriptor must have an installation binding")
+                {
+                    crate::model_catalog::NormalizedInstallArtifact::SingleGguf(artifact) => {
+                        ("whisper.cpp", Some(artifact.filename.to_owned()))
+                    }
+                    crate::model_catalog::NormalizedInstallArtifact::ReceiptBackedBundle {
+                        bundle_id,
+                        ..
+                    } => ("sherpa-onnx", Some(bundle_id.to_owned())),
+                };
             SttModelInfo {
                 id: descriptor.id.into_inner(),
                 name: descriptor.display_name.to_owned(),
-                backend: "whisper.cpp".to_owned(),
+                backend: backend.to_owned(),
                 description: descriptor.description.to_owned(),
                 expected_ram: descriptor.expected_ram.to_owned(),
                 accuracy_tier: descriptor.accuracy_guidance.to_owned(),
@@ -425,5 +434,28 @@ mod tests {
         assert!(backend_capabilities("Moonshine").supports_downloads);
         assert!(backend_capabilities("Parakeet").runnable);
         assert!(backend_capabilities("Parakeet").supports_downloads);
+    }
+
+    #[test]
+    fn default_catalog_projects_one_receipt_backed_moonshine_model() {
+        let catalog = default_model_catalog();
+        let moonshine = catalog
+            .iter()
+            .find(|model| model.id == "moonshine-tiny-en-int8-onnx")
+            .unwrap();
+
+        assert_eq!(moonshine.backend, "sherpa-onnx");
+        assert_eq!(
+            moonshine.download_model.as_deref(),
+            Some("moonshine-tiny-en-int8-onnx")
+        );
+        assert_eq!(
+            catalog
+                .iter()
+                .filter(|model| model.id == "moonshine-tiny-en-int8-onnx")
+                .count(),
+            1
+        );
+        assert!(catalog.iter().any(|model| model.id == "moonshine"));
     }
 }

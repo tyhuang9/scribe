@@ -3460,6 +3460,24 @@ impl InferenceWorkerSupervisor {
         }
     }
 
+    /// Test-only process launcher for diagnostics that must exercise the real
+    /// hidden worker role from a separately built Scribe executable. Production
+    /// construction remains pinned to `current_exe()` and cannot be redirected
+    /// by environment or configuration.
+    #[cfg(test)]
+    pub(crate) fn unstarted_for_executable(executable: PathBuf) -> Self {
+        Self {
+            transport: OnnxWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+                Arc::new(OsWorkerLauncher::for_executable(
+                    WorkerRole::Inference,
+                    executable,
+                )),
+                SupervisorDeadlines::default(),
+            ),
+            next_correlation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
     fn next_id(&self) -> u64 {
         self.next_correlation
             .fetch_add(1, Ordering::AcqRel)

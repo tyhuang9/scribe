@@ -38,6 +38,39 @@ struct ArtifactManifest {
     sha256: &'static str,
 }
 
+/// The trusted installation shape behind a normalized catalog entry.
+///
+/// GGUF models retain their individual pinned artifact manifests. ONNX models
+/// are installed only through their verified multi-file receipt bundle; they
+/// must never be represented as a made-up single-file artifact.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ModelArtifactBinding {
+    SingleGguf(ArtifactManifest),
+    ReceiptBackedBundle {
+        bundle_id: &'static str,
+        aggregate_size_bytes: u64,
+    },
+}
+
+impl ModelArtifactBinding {
+    const fn aggregate_size_bytes(self) -> u64 {
+        match self {
+            Self::SingleGguf(artifact) => artifact.size_bytes,
+            Self::ReceiptBackedBundle {
+                aggregate_size_bytes,
+                ..
+            } => aggregate_size_bytes,
+        }
+    }
+
+    const fn single_gguf(self) -> Option<ArtifactManifest> {
+        match self {
+            Self::SingleGguf(artifact) => Some(artifact),
+            Self::ReceiptBackedBundle { .. } => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct CompatibilityEvidence {
     id: &'static str,
@@ -109,10 +142,10 @@ struct ModelManifest {
     speed_guidance: &'static str,
     accuracy_guidance: &'static str,
     recommended: bool,
-    runtime: RuntimeRequirement,
+    runtime: Option<RuntimeRequirement>,
     architecture: ModelArchitecture,
     minimum_runtime_version: RuntimeVersion,
-    artifact: ArtifactManifest,
+    artifact: ModelArtifactBinding,
     legacy_ggml_artifact: Option<ArtifactManifest>,
     languages: &'static [&'static str],
     capabilities: ModelCapabilities,
@@ -239,6 +272,17 @@ pub(crate) struct RuntimeArtifactManifest {
     pub(crate) format: ArtifactFormat,
 }
 
+/// Safe normalized installation binding for callers that need to select an
+/// installer without assuming every model is a single GGUF download.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NormalizedInstallArtifact {
+    SingleGguf(RuntimeArtifactManifest),
+    ReceiptBackedBundle {
+        bundle_id: &'static str,
+        aggregate_size_bytes: u64,
+    },
+}
+
 const TRANSCRIBE_CPP_VERSION: RuntimeVersion = RuntimeVersion {
     major: 1,
     minor: 9,
@@ -258,6 +302,11 @@ const BATCH_ENGLISH_CAPABILITIES: ModelCapabilities = ModelCapabilities {
     gpu: false,
 };
 
+const MOONSHINE_TINY_CAPABILITIES: ModelCapabilities = ModelCapabilities {
+    timestamps: false,
+    ..BATCH_ENGLISH_CAPABILITIES
+};
+
 const NO_ROLES: &[ModelRole] = &[];
 
 const PHASE_ZERO_SMOKE: CompatibilityEvidence = CompatibilityEvidence {
@@ -265,6 +314,18 @@ const PHASE_ZERO_SMOKE: CompatibilityEvidence = CompatibilityEvidence {
     source: COMPATIBILITY_EVIDENCE_DOCUMENT,
     load: true,
     known_fixture: true,
+    cancellation: false,
+    unload_reload: false,
+    acceleration: false,
+    platform: false,
+    receipt: None,
+};
+
+const MOONSHINE_TINY_ONNX_EXPERIMENTAL: CompatibilityEvidence = CompatibilityEvidence {
+    id: "moonshine-tiny-en-int8-onnx-catalog-evidence",
+    source: "resources/onnx-model-bundles-v1.json",
+    load: false,
+    known_fixture: false,
     cancellation: false,
     unload_reload: false,
     acceleration: false,
@@ -286,6 +347,7 @@ const PHASE_TWO_BASE_SMOKE: CompatibilityEvidence = CompatibilityEvidence {
 
 const MODELS: &[ModelManifest] = &[
     handy_computer_tiny_en_manifest(),
+    moonshine_tiny_en_int8_onnx_manifest(),
     whisper_manifest(
         BUNDLED_BASE_MODEL_ID,
         "Whisper Base — English",
@@ -382,16 +444,16 @@ const fn handy_computer_tiny_en_manifest() -> ModelManifest {
         expected_ram: "1 GB",
         speed_guidance: "Fastest",
         accuracy_guidance: "Basic",
-        runtime: RuntimeRequirement::PrimaryNative,
+        runtime: Some(RuntimeRequirement::PrimaryNative),
         architecture: ModelArchitecture::EncoderDecoder,
         minimum_runtime_version: TRANSCRIBE_CPP_VERSION,
-        artifact: ArtifactManifest {
+        artifact: ModelArtifactBinding::SingleGguf(ArtifactManifest {
             repository: "handy-computer/whisper-tiny.en-gguf",
             revision: HANDY_COMPUTER_TINY_EN_REVISION,
             filename: "whisper-tiny.en-Q4_K_M.gguf",
             size_bytes: 43_545_248,
             sha256: "3bfa6200aa12a21409445401f7871b5c733546dc45a29eb4871fcb3c7954e08b",
-        },
+        }),
         legacy_ggml_artifact: None,
         languages: &["en"],
         capabilities: BATCH_ENGLISH_CAPABILITIES,
@@ -402,6 +464,36 @@ const fn handy_computer_tiny_en_manifest() -> ModelManifest {
             reason: "The complete compatibility suite has not passed.",
         },
         evidence: PHASE_ZERO_SMOKE,
+    }
+}
+
+const fn moonshine_tiny_en_int8_onnx_manifest() -> ModelManifest {
+    ModelManifest {
+        id: "moonshine-tiny-en-int8-onnx",
+        display_name: "Moonshine Tiny — English",
+        variant_label: "Tiny",
+        description: "Compact local English model for fast dictation.",
+        storage_guidance: "~42 MB",
+        expected_ram: "1 GB",
+        speed_guidance: "Fast",
+        accuracy_guidance: "Good",
+        recommended: false,
+        runtime: None,
+        architecture: ModelArchitecture::EncoderDecoder,
+        minimum_runtime_version: TRANSCRIBE_CPP_VERSION,
+        artifact: ModelArtifactBinding::ReceiptBackedBundle {
+            bundle_id: "moonshine-tiny-en-int8-onnx",
+            aggregate_size_bytes: 44_256_550,
+        },
+        legacy_ggml_artifact: None,
+        languages: &["en"],
+        capabilities: MOONSHINE_TINY_CAPABILITIES,
+        roles: NO_ROLES,
+        compatibility: CompatibilityStatus::Experimental {
+            evidence: MOONSHINE_TINY_ONNX_EXPERIMENTAL.link(),
+            reason: "The complete compatibility suite has not passed.",
+        },
+        evidence: MOONSHINE_TINY_ONNX_EXPERIMENTAL,
     }
 }
 
@@ -426,10 +518,10 @@ const fn whisper_manifest(
         speed_guidance: guidance.speed,
         accuracy_guidance: guidance.accuracy,
         recommended,
-        runtime: RuntimeRequirement::PrimaryNative,
+        runtime: Some(RuntimeRequirement::PrimaryNative),
         architecture: ModelArchitecture::EncoderDecoder,
         minimum_runtime_version: TRANSCRIBE_CPP_VERSION,
-        artifact,
+        artifact: ModelArtifactBinding::SingleGguf(artifact),
         legacy_ggml_artifact: Some(legacy_ggml_artifact),
         languages: &["en"],
         capabilities: BATCH_ENGLISH_CAPABILITIES,
@@ -467,20 +559,53 @@ pub(crate) fn runtime_model_manifest(id: &ModelId) -> Option<RuntimeModelManifes
     MODELS
         .iter()
         .find(|manifest| manifest.id == id.as_str())
-        .map(|manifest| RuntimeModelManifest {
-            id: manifest.id,
-            runtime: manifest.runtime,
-            minimum_runtime_version: manifest.minimum_runtime_version,
-            artifact_repository: manifest.artifact.repository,
-            artifact_revision: manifest.artifact.revision,
-            artifact_filename: manifest.artifact.filename,
-            artifact_size_bytes: manifest.artifact.size_bytes,
-            artifact_storage_estimate: manifest.storage_guidance,
-            artifact_sha256: manifest.artifact.sha256,
-            legacy_ggml_artifact: manifest
-                .legacy_ggml_artifact
-                .map(|artifact| runtime_artifact(artifact, ArtifactFormat::LegacyGgml)),
+        .and_then(|manifest| {
+            let runtime = manifest.runtime?;
+            manifest
+                .artifact
+                .single_gguf()
+                .map(|artifact| RuntimeModelManifest {
+                    id: manifest.id,
+                    runtime,
+                    minimum_runtime_version: manifest.minimum_runtime_version,
+                    artifact_repository: artifact.repository,
+                    artifact_revision: artifact.revision,
+                    artifact_filename: artifact.filename,
+                    artifact_size_bytes: artifact.size_bytes,
+                    artifact_storage_estimate: manifest.storage_guidance,
+                    artifact_sha256: artifact.sha256,
+                    legacy_ggml_artifact: manifest
+                        .legacy_ggml_artifact
+                        .map(|artifact| runtime_artifact(artifact, ArtifactFormat::LegacyGgml)),
+                })
         })
+}
+
+pub(crate) fn normalized_install_artifact(id: &ModelId) -> Option<NormalizedInstallArtifact> {
+    assert_catalog_valid();
+    MODELS
+        .iter()
+        .find(|manifest| manifest.id == id.as_str())
+        .map(|manifest| match manifest.artifact {
+            ModelArtifactBinding::SingleGguf(artifact) => NormalizedInstallArtifact::SingleGguf(
+                runtime_artifact(artifact, ArtifactFormat::Gguf),
+            ),
+            ModelArtifactBinding::ReceiptBackedBundle {
+                bundle_id,
+                aggregate_size_bytes,
+            } => NormalizedInstallArtifact::ReceiptBackedBundle {
+                bundle_id,
+                aggregate_size_bytes,
+            },
+        })
+}
+
+pub(crate) fn normalized_model_storage_estimate(id: &ModelId) -> Option<&'static str> {
+    assert_catalog_valid();
+    MODELS
+        .iter()
+        .find(|manifest| manifest.id == id.as_str())
+        .map(|manifest| manifest.storage_guidance)
 }
 
 pub(crate) fn runtime_artifact_manifest_for_path(
@@ -518,10 +643,12 @@ const fn runtime_artifact(
     }
 }
 
-/// Every normalized catalog artifact is loaded by the embedded runtime.
+/// Only single-file GGUF entries are loaded by the embedded runtime.
 pub(crate) fn model_uses_embedded_runtime(id: &ModelId) -> bool {
     assert_catalog_valid();
-    MODELS.iter().any(|manifest| manifest.id == id.as_str())
+    MODELS
+        .iter()
+        .any(|manifest| manifest.id == id.as_str() && manifest.artifact.single_gguf().is_some())
 }
 
 /// Resolves a remote artifact to an existing normalized catalog entry only
@@ -536,9 +663,11 @@ pub(crate) fn normalized_model_id_for_pinned_artifact(
     MODELS
         .iter()
         .find(|manifest| {
-            manifest.artifact.repository == repository
-                && manifest.artifact.revision == revision
-                && manifest.artifact.filename == filename
+            manifest.artifact.single_gguf().is_some_and(|artifact| {
+                artifact.repository == repository
+                    && artifact.revision == revision
+                    && artifact.filename == filename
+            })
         })
         .map(|manifest| ModelId::new(manifest.id))
 }
@@ -570,7 +699,7 @@ impl ModelManifest {
             speed_guidance: self.speed_guidance,
             accuracy_guidance: self.accuracy_guidance,
             recommended: self.recommended,
-            artifact_size_bytes: self.artifact.size_bytes,
+            artifact_size_bytes: self.artifact.aggregate_size_bytes(),
             languages: self.languages.to_vec(),
             capabilities: self.capabilities,
             roles: self.roles.to_vec(),
@@ -690,16 +819,31 @@ fn validate_manifests(manifests: &[ModelManifest]) -> Result<(), String> {
         {
             return Err(format!("{} has incomplete user guidance", manifest.id));
         }
-        if manifest.minimum_runtime_version
-            == (RuntimeVersion {
-                major: 0,
-                minor: 0,
-                patch: 0,
-            })
+        if manifest.runtime.is_some()
+            && manifest.minimum_runtime_version
+                == (RuntimeVersion {
+                    major: 0,
+                    minor: 0,
+                    patch: 0,
+                })
         {
             return Err(format!("{} has no minimum runtime version", manifest.id));
         }
-        validate_artifact(manifest.artifact)?;
+        match manifest.artifact {
+            ModelArtifactBinding::SingleGguf(artifact) => validate_artifact(artifact)?,
+            ModelArtifactBinding::ReceiptBackedBundle {
+                bundle_id,
+                aggregate_size_bytes,
+            } => {
+                if manifest.id != bundle_id {
+                    return Err(format!(
+                        "{} must use its own receipt-backed bundle id",
+                        manifest.id
+                    ));
+                }
+                validate_receipt_backed_bundle(bundle_id, aggregate_size_bytes)?;
+            }
+        }
         if let Some(legacy_ggml_artifact) = manifest.legacy_ggml_artifact {
             validate_artifact(legacy_ggml_artifact)?;
             if !legacy_ggml_artifact.filename.ends_with(".bin") {
@@ -805,13 +949,19 @@ fn validate_compatibility_receipt(manifest: &ModelManifest) -> Result<(), String
     let valid_hash =
         |value: &str| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit());
     let embedded_hash = |contents: &[u8]| format!("{:x}", Sha256::digest(contents));
+    let artifact = manifest.artifact.single_gguf().ok_or_else(|| {
+        format!(
+            "{} cannot use a single-artifact compatibility receipt for a receipt-backed bundle",
+            manifest.id
+        )
+    })?;
     if document.schema_version != 1
         || document.model_id != manifest.id
         || document.evidence_id != manifest.evidence.id
         || document.runtime_version != runtime_version
         || !document
             .model_artifact_sha256
-            .eq_ignore_ascii_case(manifest.artifact.sha256)
+            .eq_ignore_ascii_case(artifact.sha256)
         || !valid_hash(&document.runtime_package_sha256)
         || !embedded_hash(receipt.runtime_package_manifest)
             .eq_ignore_ascii_case(&document.runtime_package_sha256)
@@ -832,6 +982,20 @@ fn validate_compatibility_receipt(manifest: &ModelManifest) -> Result<(), String
             "{} compatibility receipt does not match the manifest or complete gate",
             manifest.id
         ));
+    }
+    Ok(())
+}
+
+fn validate_receipt_backed_bundle(
+    bundle_id: &str,
+    aggregate_size_bytes: u64,
+) -> Result<(), String> {
+    let stable_id = !bundle_id.is_empty()
+        && bundle_id.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+        });
+    if !stable_id || aggregate_size_bytes == 0 {
+        return Err("receipt-backed bundle metadata is invalid".to_owned());
     }
     Ok(())
 }
@@ -865,8 +1029,8 @@ mod tests {
     #[test]
     fn production_catalog_is_valid_and_has_unique_ids() {
         assert_eq!(validate_catalog(), Ok(()));
-        assert_eq!(model_descriptors().len(), 4);
-        assert_eq!(normal_model_descriptors().len(), 4);
+        assert_eq!(model_descriptors().len(), 5);
+        assert_eq!(normal_model_descriptors().len(), 5);
         assert_eq!(
             model_descriptors()
                 .into_iter()
@@ -881,6 +1045,11 @@ mod tests {
                     ModelId::new("whisper_cpp_tiny_en"),
                     "Whisper Tiny — English",
                     "tiny.en",
+                ),
+                (
+                    ModelId::new("moonshine-tiny-en-int8-onnx"),
+                    "Moonshine Tiny — English",
+                    "Tiny",
                 ),
                 (
                     ModelId::new("whisper_cpp_base_en"),
@@ -906,6 +1075,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 ModelId::new("whisper_cpp_tiny_en"),
+                ModelId::new("moonshine-tiny-en-int8-onnx"),
                 ModelId::new("whisper_cpp_base_en"),
                 ModelId::new("whisper_cpp_small_en"),
                 ModelId::new("whisper_cpp_medium_en"),
@@ -915,7 +1085,7 @@ mod tests {
 
     #[test]
     fn remote_artifact_must_match_every_pinned_source_fact_to_use_local_installation() {
-        let artifact = MODELS[0].artifact;
+        let artifact = MODELS[0].artifact.single_gguf().unwrap();
         assert_eq!(
             normalized_model_id_for_pinned_artifact(
                 artifact.repository,
@@ -1008,8 +1178,10 @@ mod tests {
     #[test]
     fn malformed_artifacts_are_rejected() {
         let mut manifest = MODELS[0];
-        manifest.artifact.filename = "../model.bin";
-        manifest.artifact.sha256 = "not-a-sha";
+        let mut artifact = manifest.artifact.single_gguf().unwrap();
+        artifact.filename = "../model.bin";
+        artifact.sha256 = "not-a-sha";
+        manifest.artifact = ModelArtifactBinding::SingleGguf(artifact);
 
         assert!(
             validate_manifests(&[manifest])
@@ -1072,8 +1244,9 @@ mod tests {
     fn supported_status_requires_a_matching_machine_readable_receipt() {
         const RECEIPT: &str = r#"{"schema_version":1,"model_id":"whisper_cpp_tiny_en","evidence_id":"phase-0-whisper-jfk-process-smoke","runtime_version":"1.9.1","model_artifact_sha256":"921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f","runtime_package_sha256":"6510693d373c9ed4adbb708015135ea9ec885c8e4312d543ca7d1c2f3dbbd7dc","fixture_corpus_sha256":"9799f3da4289f4db1586d89570026fc0d2ba4f5cec8c64daaebedf8e0643cccf","results_sha256":"a341e990e02ed8589238eb1e8c152a855ec2fbbcd2519d069f5378c098bb28fa","platform":"windows-x86_64","load":true,"known_fixture":true,"cancellation":true,"unload_reload":true,"acceleration":true,"platform_tests":true}"#;
         let mut manifest = MODELS[0];
-        manifest.artifact.sha256 =
-            "921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f";
+        let mut artifact = manifest.artifact.single_gguf().unwrap();
+        artifact.sha256 = "921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f";
+        manifest.artifact = ModelArtifactBinding::SingleGguf(artifact);
         manifest.evidence = CompatibilityEvidence {
             load: true,
             known_fixture: true,
@@ -1171,7 +1344,7 @@ mod tests {
         let mut renamed = MODELS[0];
         renamed.id = "name-with-no-runtime-prefix";
 
-        assert_eq!(renamed.runtime, RuntimeRequirement::PrimaryNative);
+        assert_eq!(renamed.runtime, Some(RuntimeRequirement::PrimaryNative));
         assert_eq!(
             runtime_model_manifest(&ModelId::new("whisper_cpp_base_en"))
                 .map(|manifest| manifest.runtime),
@@ -1276,8 +1449,45 @@ mod tests {
     }
 
     #[test]
+    fn moonshine_is_the_only_receipt_backed_onnx_descriptor() {
+        let descriptor = model_descriptor(&ModelId::new("moonshine-tiny-en-int8-onnx")).unwrap();
+        assert_eq!(descriptor.artifact_size_bytes, 44_256_550);
+        assert_eq!(descriptor.languages, vec!["en"]);
+        assert!(!descriptor.capabilities.native_streaming);
+        assert!(!descriptor.capabilities.timestamps);
+        assert!(descriptor.capabilities.cpu);
+        assert!(!descriptor.capabilities.gpu);
+        assert!(matches!(
+            descriptor.compatibility,
+            CompatibilityStatus::Experimental { .. }
+        ));
+        assert_eq!(
+            normalized_install_artifact(&descriptor.id),
+            Some(NormalizedInstallArtifact::ReceiptBackedBundle {
+                bundle_id: "moonshine-tiny-en-int8-onnx",
+                aggregate_size_bytes: 44_256_550,
+            })
+        );
+        assert_eq!(runtime_model_manifest(&descriptor.id), None);
+        assert!(!model_uses_embedded_runtime(&descriptor.id));
+        assert_eq!(runtime_model_download_url(&descriptor.id), None);
+        assert_eq!(
+            MODELS
+                .iter()
+                .filter(|model| {
+                    matches!(
+                        model.artifact,
+                        ModelArtifactBinding::ReceiptBackedBundle { .. }
+                    )
+                })
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn catalog_contains_exactly_one_runtime_handler_candidate() {
-        let runtimes: HashSet<_> = MODELS.iter().map(|model| model.runtime).collect();
+        let runtimes: HashSet<_> = MODELS.iter().filter_map(|model| model.runtime).collect();
 
         assert_eq!(runtimes, HashSet::from([RuntimeRequirement::PrimaryNative]));
     }

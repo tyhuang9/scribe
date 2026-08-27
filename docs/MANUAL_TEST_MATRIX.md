@@ -92,7 +92,7 @@ manual rows remain NOT VERIFIED.
 | --- | --- | --- |
 | Format/check/lint/build | `cargo fmt --all -- --check`; `cargo check --all-targets --all-features`; strict Clippy; `cargo build --all-features` | PASS |
 | Unit/integration tests | `cargo test --all-targets --all-features` | PASS - 252 discovered, 247 passed, 0 failed, 5 ignored environment-required tests |
-| Normalized catalog | Catalog validation, evidence-link/hashed-receipt binding, role-gating, malformed-artifact, duplicate-ID, capability-intersection, minimum-runtime enforcement, and ID-prefix independence tests | PASS - four primary descriptors, all Experimental, zero curated roles |
+| Normalized catalog | Catalog validation, evidence-link/typed-receipt binding, role-gating, malformed-artifact, duplicate-ID, capability-intersection, minimum-runtime enforcement, and ID-prefix independence tests | PASS - five primary descriptors, all Experimental, zero curated roles; Moonshine is receipt-backed, CPU-only, and final-text-only |
 | Architecture boundary | Rust source-boundary test plus `wsl.exe python3 scripts/check-catalog-boundaries.py` | PASS - one logical handler; neutral production UI including Playground; family-coded quick actions/IDs rejected; legacy provider and concrete adapter selection confined to its private bridge |
 | Release build/package | `cargo build --release --all-features`; verified PowerShell package script | PASS |
 | Release primary fixture | ignored exact service JFK smoke with pinned v1.9.1/base.en/JFK paths | PASS - cold load 290 ms, first decode 791 ms, retained decode 780 ms; explicit unload/reload passed |
@@ -173,9 +173,11 @@ remain NOT VERIFIED.
 The rolling latency harness includes 250 ms cloned canonical frame publication
 and native decode, but bypasses the production capture pipeline and does not
 include a real hotkey, microphone driver, overlay paint, or target application.
-All desktop rows remain NOT VERIFIED. Four catalog models
+All desktop rows remain NOT VERIFIED. Five catalog models
 remain Experimental, zero are Supported, native streaming remains false, and
 the Zipformer/second-handler decision remains NO-GO.
+
+For the real Moonshine subprocess smoke, build Scribe and set `SCRIBE_ONNX_WORKER_EXE` to the built executable. Run the ignored `transcription::tests::diagnostic_real_hugging_face_bundle_install_load_and_decode` test with `SCRIBE_ONNX_BUNDLE_TEST=1`, a dedicated `SCRIBE_ONNX_BUNDLE_STORAGE_DIR`, `SCRIBE_ONNX_BUNDLE_WAV` and its exact lowercase `SCRIBE_ONNX_BUNDLE_WAV_SHA256`, plus `SCRIBE_ONNX_BUNDLE_EXPECTED_TRANSCRIPT`. Verify stage, child Hello/load/health/silence smoke, known spoken-WAV decode, unload/reload, and activation. This remains manual evidence until the exact fixture and result are versioned.
 
 ## Automated Phase 8 checkpoint
 

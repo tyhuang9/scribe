@@ -777,6 +777,32 @@ impl RuntimeWorker {
         }
     }
 
+    #[cfg(test)]
+    fn new_process_for_executable(executable: PathBuf) -> Self {
+        cleanup_stale_temporary_audio();
+        let inference = InferenceWorkerSupervisor::unstarted_for_executable(executable);
+        let worker_inference = inference.clone();
+        let cancellation_generation = Arc::new(AtomicU64::new(0));
+        let worker_cancellation = cancellation_generation.clone();
+        let (commands, receiver) = sync_channel(1);
+        let worker = std::thread::Builder::new()
+            .name("scribe-inference-diagnostic-dispatch".to_owned())
+            .spawn(move || {
+                inference_worker_dispatch_loop(worker_inference, worker_cancellation, receiver)
+            })
+            .expect("Scribe could not create its diagnostic inference dispatch worker");
+        Self {
+            inner: Arc::new(RuntimeWorkerInner {
+                commands,
+                worker: Mutex::new(Some(worker)),
+                shutdown_gate: Mutex::new(()),
+                cancellation_generation,
+                in_process_router: None,
+                inference: Some(inference),
+            }),
+        }
+    }
+
     fn cancel_active(&self) {
         self.inner
             .cancellation_generation
@@ -1244,6 +1270,15 @@ impl TranscriptionService {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_process_executable(config: AppConfig, executable: PathBuf) -> Self {
+        Self {
+            config,
+            worker: RuntimeWorker::new_process_for_executable(executable),
+            router: RuntimeRouter::new(),
+        }
+    }
+
     pub(crate) fn preload_runtime_artifact(
         &self,
         artifact: RuntimeArtifact,
@@ -1308,7 +1343,12 @@ impl TranscriptionService {
         &self,
         root: &Path,
     ) -> Result<RuntimeLoadExecution> {
-        self.preload_runtime_artifact(self.onnx_artifact_from_receipt(root)?)
+        self.worker
+            .load(
+                self.onnx_artifact_from_receipt(root)?,
+                AccelerationPreference::Cpu,
+            )
+            .map_err(Into::into)
     }
 
     pub(crate) fn transcribe_onnx_bundle_from_receipt(
@@ -1317,7 +1357,15 @@ impl TranscriptionService {
         audio: Arc<PreparedAudio>,
         options: TranscriptionOptions,
     ) -> Result<RuntimeExecution> {
-        self.transcribe_runtime_artifact(self.onnx_artifact_from_receipt(root)?, audio, options)
+        self.worker
+            .transcribe(
+                self.onnx_artifact_from_receipt(root)?,
+                AccelerationPreference::Cpu,
+                audio,
+                options,
+                self.worker.cancellation_snapshot(),
+            )
+            .map_err(Into::into)
     }
 
     /// Runs the staged bundle through the process-isolated ONNX worker before
@@ -1585,6 +1633,20 @@ impl TranscriptionService {
         model_id: &ModelId,
         model_path: Option<PathBuf>,
     ) -> Result<ModelLoadOutcome> {
+        if let Some(root) = config::installed_onnx_bundle_root(&self.config, model_id) {
+            if model_path.as_ref().is_some_and(|path| path != &root) {
+                return Err(anyhow!(
+                    "selected ONNX bundle path is not its canonical receipt root"
+                ));
+            }
+            let execution = self.preload_onnx_bundle_from_receipt(&root)?;
+            return Ok(ModelLoadOutcome {
+                model_id: model_id.clone(),
+                resolved_acceleration: execution.diagnostics.resolved_acceleration,
+                model_load_duration_ms: execution.diagnostics.model_load_duration_ms,
+                warm_model_reused: execution.diagnostics.warm_reused,
+            });
+        }
         let model = self.resolve_model(model_id, model_path)?;
         let runtime_model = self.resolve_runtime_model(model)?;
         let execution = self
@@ -1605,6 +1667,20 @@ impl TranscriptionService {
     /// Checks the selected primary runtime package and model without allowing
     /// UI or coordinator code to name the concrete handler.
     pub fn health_check(&self, model_id: &ModelId, model_path: Option<PathBuf>) -> Result<()> {
+        if let Some(root) = config::installed_onnx_bundle_root(&self.config, model_id) {
+            if model_path.as_ref().is_some_and(|path| path != &root) {
+                return Err(anyhow!(
+                    "selected ONNX bundle path is not its canonical receipt root"
+                ));
+            }
+            return self
+                .worker
+                .health_check(
+                    self.onnx_artifact_from_receipt(&root)?,
+                    AccelerationPreference::Cpu,
+                )
+                .map_err(Into::into);
+        }
         let model = self.resolve_model(model_id, model_path)?;
         let runtime_model = self.resolve_runtime_model(model)?;
         self.worker
@@ -2138,6 +2214,30 @@ impl TranscriptionService {
             ));
         }
         let model = self.resolve_model(&request.model_id, request.model_path.clone())?;
+        if let Some(root) = config::installed_onnx_bundle_root(&self.config, &request.model_id) {
+            if request
+                .model_path
+                .as_ref()
+                .is_some_and(|path| path != &root)
+            {
+                return Err(anyhow!(
+                    "selected ONNX bundle path is not its canonical receipt root"
+                ));
+            }
+            validate_default_options(&request.options)?;
+            let artifact = self.onnx_artifact_from_receipt(&root)?;
+            let execution = self
+                .worker
+                .transcribe(
+                    artifact,
+                    AccelerationPreference::Cpu,
+                    Arc::clone(&request.audio),
+                    request.options.clone(),
+                    ticket.native_generation,
+                )
+                .map_err(|error| anyhow!(error))?;
+            return Ok(map_native_execution(request, model, execution));
+        }
         if RuntimeRouter::handles_model_id(&request.model_id)
             || config::remote_gguf_artifact(&self.config, request.model_id.as_str()).is_some()
             || config::imported_gguf_artifact(&self.config, request.model_id.as_str()).is_some()
@@ -3673,6 +3773,14 @@ mod tests {
             .expect("set SCRIBE_ONNX_BUNDLE_WAV_SHA256 to the exact lowercase WAV SHA-256");
         let expected_text = std::env::var("SCRIBE_ONNX_BUNDLE_EXPECTED_TRANSCRIPT")
             .expect("set SCRIBE_ONNX_BUNDLE_EXPECTED_TRANSCRIPT to the required spoken text");
+        let worker_executable = PathBuf::from(
+            std::env::var_os("SCRIBE_ONNX_WORKER_EXE")
+                .expect("set SCRIBE_ONNX_WORKER_EXE to a separately built Scribe executable"),
+        );
+        assert!(
+            worker_executable.is_file(),
+            "SCRIBE_ONNX_WORKER_EXE must name an existing Scribe executable"
+        );
         assert!(
             !normalize_fixture_transcript(&expected_text).is_empty(),
             "the required expected transcript must contain letters or numbers"
@@ -3694,7 +3802,7 @@ mod tests {
         .unwrap();
         let mut config = AppConfig::default();
         config.performance.acceleration_preference = AccelerationPreference::Cpu;
-        let service = TranscriptionService::new(config);
+        let service = TranscriptionService::with_process_executable(config, worker_executable);
         let verified = service
             .verify_onnx_bundle_for_installation(staged, &cancellation)
             .unwrap();
@@ -4479,7 +4587,12 @@ mod tests {
         let service = TranscriptionService::new(AppConfig::default());
         let descriptors = service.model_descriptors();
 
-        assert_eq!(descriptors.len(), 4);
+        assert_eq!(descriptors.len(), 5);
+        assert!(
+            descriptors
+                .iter()
+                .any(|descriptor| descriptor.id.as_str() == "moonshine-tiny-en-int8-onnx")
+        );
         for descriptor in descriptors {
             assert!(matches!(
                 descriptor.compatibility,
