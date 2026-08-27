@@ -13773,45 +13773,25 @@ fn chip_colors(ui: &Ui, tone: ChipTone) -> (Color32, Color32, Stroke) {
             colors.panel_bg,
             Stroke::new(1.0, colors.border),
         ),
-        ChipTone::Success if ui.visuals().dark_mode => (
-            colors.success,
-            Color32::from_rgb(20, 61, 42),
-            Stroke::new(1.0, Color32::from_rgb(34, 105, 70)),
-        ),
         ChipTone::Success => (
-            Color32::from_rgb(22, 101, 52),
-            Color32::from_rgb(240, 253, 244),
-            Stroke::new(1.0, Color32::from_rgb(187, 247, 208)),
-        ),
-        ChipTone::Warning if ui.visuals().dark_mode => (
-            colors.warning,
-            Color32::from_rgb(69, 50, 18),
-            Stroke::new(1.0, Color32::from_rgb(117, 83, 25)),
+            colors.chip_success_text,
+            colors.chip_success_fill,
+            Stroke::new(1.0, colors.chip_success_border),
         ),
         ChipTone::Warning => (
-            Color32::from_rgb(146, 64, 14),
-            Color32::from_rgb(254, 252, 232),
-            Stroke::new(1.0, Color32::from_rgb(254, 240, 138)),
-        ),
-        ChipTone::Error if ui.visuals().dark_mode => (
-            colors.error_text,
-            Color32::from_rgb(78, 29, 36),
-            Stroke::new(1.0, Color32::from_rgb(127, 45, 55)),
+            colors.chip_warning_text,
+            colors.chip_warning_fill,
+            Stroke::new(1.0, colors.chip_warning_border),
         ),
         ChipTone::Error => (
-            Color32::from_rgb(185, 28, 28),
-            Color32::from_rgb(254, 242, 242),
-            Stroke::new(1.0, Color32::from_rgb(254, 202, 202)),
-        ),
-        ChipTone::Active if ui.visuals().dark_mode => (
-            colors.accent,
-            Color32::from_rgb(18, 57, 67),
-            Stroke::new(1.0, colors.border_strong),
+            colors.chip_error_text,
+            colors.chip_error_fill,
+            Stroke::new(1.0, colors.chip_error_border),
         ),
         ChipTone::Active => (
-            Color32::from_rgb(23, 111, 116),
-            colors.panel_bg,
-            Stroke::new(1.0, colors.border_strong),
+            colors.chip_active_text,
+            colors.chip_active_fill,
+            Stroke::new(1.0, colors.chip_active_border),
         ),
     }
 }
