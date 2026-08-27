@@ -198,7 +198,7 @@ final result: passed
 
 ## Source and implementation evidence
 
-- Brand source: `C:\Users\huang\AppData\Local\Temp\codex-clipboard-9f363fa0-574a-4347-a370-81196cd258b3.png`.
+- Brand source: `%TEMP%\codex-clipboard-9f363fa0-574a-4347-a370-81196cd258b3.png` (original supplied attachment).
 - Light native capture: `design-qa-evidence/branding/native-light.png`.
 - Dark native capture: `design-qa-evidence/branding/native-dark.png`.
 - Frozen implementation head: `90f84ec` (`Strengthen Scribe navigation lockup`).
