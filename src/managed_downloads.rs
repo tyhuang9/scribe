@@ -43,6 +43,69 @@ pub(crate) struct ModelDownloadAdmission {
     pub(crate) disk: DiskSpacePreflight,
 }
 
+/// Admission for a catalog-owned, receipt-backed ONNX directory bundle.
+/// Kept distinct from `ModelDownloadAdmission` so callers cannot accidentally
+/// route a multi-file bundle through `DownloadedArtifact` or invent a hash for
+/// a synthetic single-file model.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct OnnxBundleDownloadAdmission {
+    pub(crate) bundle_id: String,
+    pub(crate) storage_root: PathBuf,
+    pub(crate) disk: DiskSpacePreflight,
+}
+
+pub(crate) fn normalized_onnx_bundle_admission(
+    config: &AppConfig,
+    model_id: &ModelId,
+) -> Result<Option<OnnxBundleDownloadAdmission>, InstallError> {
+    let Some(crate::model_catalog::NormalizedInstallArtifact::ReceiptBackedBundle {
+        bundle_id,
+        ..
+    }) = crate::model_catalog::normalized_install_artifact(model_id)
+    else {
+        return Ok(None);
+    };
+    if bundle_id != model_id.as_str() || bundle_id != "moonshine-tiny-en-int8-onnx" {
+        return Err(InstallError::Failed(
+            "normalized ONNX bundle identity did not match the supported catalog entry".to_owned(),
+        ));
+    }
+    let storage_root = config::onnx_bundle_storage_dir(config);
+    let disk = crate::onnx_model_bundles::bundle_disk_space_preflight(bundle_id, &storage_root)?;
+    Ok(Some(OnnxBundleDownloadAdmission {
+        bundle_id: bundle_id.to_owned(),
+        storage_root,
+        disk,
+    }))
+}
+
+pub(crate) fn prepare_onnx_bundle(
+    admission: &OnnxBundleDownloadAdmission,
+    cancellation: &InstallCancellation,
+    progress: &dyn Fn(InstallProgress),
+) -> Result<crate::onnx_model_bundles::StagedOnnxBundle, InstallError> {
+    crate::onnx_model_bundles::stage_onnx_bundle_install(
+        &admission.bundle_id,
+        &admission.storage_root,
+        cancellation,
+        progress,
+    )
+}
+
+pub(crate) fn discard_normalized_onnx_bundle_partials(
+    config: &AppConfig,
+    model_id: &ModelId,
+) -> Result<Option<u64>, InstallError> {
+    let Some(admission) = normalized_onnx_bundle_admission(config, model_id)? else {
+        return Ok(None);
+    };
+    crate::onnx_model_bundles::discard_onnx_bundle_partials(
+        &admission.bundle_id,
+        &admission.storage_root,
+    )
+    .map(Some)
+}
+
 pub(crate) fn normalized_model_download_admission(
     config: &AppConfig,
     model_id: &ModelId,
@@ -55,6 +118,16 @@ pub(crate) fn normalized_model_retained_partial(
     config: &AppConfig,
     model_id: &ModelId,
 ) -> Result<Option<RetainedPartial>, InstallError> {
+    if let Some(crate::model_catalog::NormalizedInstallArtifact::ReceiptBackedBundle {
+        bundle_id,
+        ..
+    }) = crate::model_catalog::normalized_install_artifact(model_id)
+    {
+        return crate::onnx_model_bundles::retained_onnx_bundle_partial(
+            bundle_id,
+            &config::onnx_bundle_storage_dir(config),
+        );
+    }
     pinned_artifact_retained_partial(&normalized_model_download_spec(config, model_id)?)
 }
 
@@ -62,6 +135,17 @@ pub(crate) fn discard_normalized_model_partial(
     config: &AppConfig,
     model_id: &ModelId,
 ) -> Result<bool, InstallError> {
+    if let Some(crate::model_catalog::NormalizedInstallArtifact::ReceiptBackedBundle {
+        bundle_id,
+        ..
+    }) = crate::model_catalog::normalized_install_artifact(model_id)
+    {
+        return crate::onnx_model_bundles::discard_onnx_bundle_partials(
+            bundle_id,
+            &config::onnx_bundle_storage_dir(config),
+        )
+        .map(|count| count != 0);
+    }
     discard_pinned_artifact_partial(&normalized_model_download_spec(config, model_id)?)
 }
 

@@ -28,7 +28,9 @@ const MAX_RING_SAMPLES: usize = 2_000_000;
 const MAX_STREAM_RESTARTS: u32 = 2;
 const MAX_DRAIN_SAMPLES_PER_TICK: usize = 4_096;
 const STREAM_RESTART_BACKOFF: Duration = Duration::from_millis(50);
-const MAX_CAPTURE_PREPARED_FRAMES: usize = 16_000 * (config::MAX_RECORDING_SECONDS as usize + 2);
+const MAX_CAPTURE_PREPARED_FRAMES: usize = 16_000
+    * (config::MAX_RECORDING_SECONDS as usize
+        + config::RECORDING_CAPTURE_SAFETY_ALLOWANCE_SECONDS as usize);
 pub(super) const MIN_INPUT_SAMPLE_RATE: u32 = 8_000;
 pub(super) const MAX_INPUT_SAMPLE_RATE: u32 = 384_000;
 pub(super) const MAX_INPUT_CHANNELS: u16 = 32;

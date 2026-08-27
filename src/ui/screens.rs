@@ -2274,6 +2274,52 @@ fn model_row_description(card: ModelCard<'_>) -> String {
     }
 }
 
+fn collapsed_local_model_facts(card: ModelCard<'_>) -> Option<&'static str> {
+    matches!(
+        card,
+        ModelCard::Local(model) if model.id == "moonshine-tiny-en-int8-onnx"
+    )
+    .then_some("Experimental · CPU only · Final text only")
+}
+
+fn render_collapsed_local_model_facts(ui: &mut egui::Ui, card: ModelCard<'_>, expanded: bool) {
+    let _ = expanded;
+    if let Some(facts) = collapsed_local_model_facts(card) {
+        let colors = ui_palette(ui);
+        ui.horizontal(|ui| {
+            for fact in facts.split(" · ") {
+                let response = Frame::none()
+                    .fill(colors.panel_bg)
+                    .stroke(Stroke::new(1.0, colors.border))
+                    .rounding(Rounding::same(6.0))
+                    .inner_margin(Margin::symmetric(6.0, 2.0))
+                    .show(ui, |ui| {
+                        ui.label(RichText::new(fact).small().color(colors.muted_text))
+                    })
+                    .inner;
+                ui.ctx().accesskit_node_builder(response.id, |builder| {
+                    builder.set_name(fact);
+                });
+            }
+        });
+    }
+}
+
+fn model_card_accessible_description(card: ModelCard<'_>, expanded: bool) -> Option<String> {
+    let _ = expanded;
+    let description = match card {
+        ModelCard::Local(model) if model.included && model.installed && model.ready => {
+            Some("Installed with Scribe; this model cannot be removed.".to_owned())
+        }
+        _ => model_download_progress_presentation(card).map(|progress| progress.accessible_text),
+    };
+    match (description, collapsed_local_model_facts(card)) {
+        (Some(description), Some(facts)) => Some(format!("{description}. {facts}")),
+        (None, Some(facts)) => Some(facts.to_owned()),
+        (description, None) => description,
+    }
+}
+
 fn remote_primary_action(variant: &RemoteCatalogVariantView) -> Option<&RemoteCatalogActionView> {
     variant.actions.iter().find(|action| {
         matches!(
@@ -2461,7 +2507,10 @@ fn model_lifecycle_presentation<'a>(
             }
         }
         ModelCard::Local(model) => {
-            let (action, label) = if model.bundled {
+            let receipt_needs_repair = model.id == "moonshine-tiny-en-int8-onnx"
+                && model.download_state == ModelDownloadState::Failed
+                && model.primary_action_label == "Repair model";
+            let (action, label) = if model.bundled || receipt_needs_repair {
                 (ScreenAction::InstallModel(model.id.clone()), "Repair")
             } else if model.primary_action_installs_upgrade {
                 (ScreenAction::UpgradeModel(model.id.clone()), "Upgrade")
@@ -2500,7 +2549,7 @@ fn model_lifecycle_presentation<'a>(
                     (!model.install_supported)
                         .then_some("This model has no supported managed download in this build.")
                 }),
-                visible_status: None,
+                visible_status: receipt_needs_repair.then(|| "Needs repair".to_owned()),
                 compact_size: model
                     .total_bytes
                     .map(format_compact_artifact_size)
@@ -3979,6 +4028,7 @@ fn render_unified_model_card(
             let description_width = card_content_width;
             description_fade_rect =
                 render_model_description(ui, &description, description_width, 26.0, expanded);
+            render_collapsed_local_model_facts(ui, card, expanded);
             ui.horizontal(|ui| {
                 rating_meter(
                     ui,
@@ -4042,6 +4092,7 @@ fn render_unified_model_card(
                                 26.0,
                                 expanded,
                             );
+                            render_collapsed_local_model_facts(ui, card, expanded);
                             ui.add_space(4.0);
                             let metadata_group_width = identity_width * 0.60;
                             let metadata_cell_width = identity_width * 0.30;
@@ -4337,12 +4388,7 @@ fn render_unified_model_card(
         }
         response
     };
-    let card_accessible_description = match card {
-        ModelCard::Local(model) if model.included && model.installed && model.ready => {
-            Some("Installed with Scribe; choose Delete to remove this included model.".to_owned())
-        }
-        _ => model_download_progress_presentation(card).map(|progress| progress.accessible_text),
-    };
+    let card_accessible_description = model_card_accessible_description(card, expanded);
     ui.ctx().accesskit_node_builder(frame.id, |builder| {
         builder.set_role(egui::accesskit::Role::Group);
         builder.set_name(format!("{accessible_card_name} model"));
@@ -8989,6 +9035,57 @@ mod tests {
                 .label,
             "Repair"
         );
+    }
+
+    #[test]
+    fn moonshine_collapsed_facts_and_receipt_repair_are_runtime_neutral() {
+        let moonshine = ModelViewModel {
+            id: "moonshine-tiny-en-int8-onnx".into(),
+            display_name: "Moonshine Tiny — English".into(),
+            install_supported: true,
+            install_action_enabled: true,
+            primary_action_label: "Repair model".into(),
+            download_state: ModelDownloadState::Failed,
+            ..Default::default()
+        };
+        assert_eq!(
+            collapsed_local_model_facts(ModelCard::Local(&moonshine)),
+            Some("Experimental · CPU only · Final text only")
+        );
+        assert_eq!(
+            model_card_accessible_description(ModelCard::Local(&moonshine), false).as_deref(),
+            Some("Experimental · CPU only · Final text only")
+        );
+        assert_eq!(
+            model_card_accessible_description(ModelCard::Local(&moonshine), true).as_deref(),
+            Some("Experimental · CPU only · Final text only")
+        );
+        let presentation = model_lifecycle_presentation(ModelCard::Local(&moonshine), true);
+        assert_eq!(presentation.label, "Repair");
+        assert_eq!(presentation.visible_status.as_deref(), Some("Needs repair"));
+        assert!(presentation.enabled);
+    }
+
+    #[test]
+    fn active_download_uses_pause_while_queued_work_uses_cancel() {
+        let active = ModelViewModel {
+            id: "moonshine-tiny-en-int8-onnx".into(),
+            display_name: "Moonshine Tiny — English".into(),
+            cancel_supported: true,
+            download_state: ModelDownloadState::Downloading,
+            ..Default::default()
+        };
+        let paused = model_lifecycle_presentation(ModelCard::Local(&active), true);
+        assert_eq!(paused.label, "Pause");
+        assert!(paused.accessible_name.starts_with("Pause "));
+
+        let queued = ModelViewModel {
+            download_state: ModelDownloadState::Queued,
+            ..active
+        };
+        let cancelled = model_lifecycle_presentation(ModelCard::Local(&queued), true);
+        assert_eq!(cancelled.label, "Cancel");
+        assert!(cancelled.accessible_name.starts_with("Cancel "));
     }
 
     #[test]

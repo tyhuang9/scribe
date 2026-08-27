@@ -1191,6 +1191,17 @@ enum PlaygroundAction {
 }
 
 enum AppEvent {
+    OnnxBundleInstallProgress {
+        job_id: u64,
+        model_id: String,
+        progress: InstallProgress,
+    },
+    OnnxBundleInstallFinished {
+        job_id: u64,
+        model_id: String,
+        paused: bool,
+        result: Result<InstallSmoke, String>,
+    },
     CaptureReady {
         session_id: SessionId,
         result: Result<RecordingSession, audio::CaptureError>,
@@ -3334,6 +3345,7 @@ pub struct LocalTranscriberApp {
     model_downloads: HashMap<String, ModelInstallStatus>,
     runtime_jobs: HashMap<String, RuntimeInstallJob>,
     artifact_installations: ArtifactInstallCoordinator,
+    onnx_bundle_install: Option<(u64, String, InstallCancellation)>,
     discard_partial_after_install: HashMap<String, (u64, RemotePartialProbeSource)>,
     #[cfg(test)]
     partial_discard_recovery_error_for_test: Option<String>,
@@ -3482,6 +3494,7 @@ impl LocalTranscriberApp {
             model_downloads: HashMap::new(),
             runtime_jobs: HashMap::new(),
             artifact_installations: ArtifactInstallCoordinator::default(),
+            onnx_bundle_install: None,
             discard_partial_after_install: HashMap::new(),
             #[cfg(test)]
             partial_discard_recovery_error_for_test: None,
@@ -3852,6 +3865,43 @@ impl LocalTranscriberApp {
             return;
         }
         let model_id = ModelId::new(&model.id);
+        if matches!(
+            crate::model_catalog::normalized_install_artifact(&model_id),
+            Some(crate::model_catalog::NormalizedInstallArtifact::ReceiptBackedBundle { .. })
+        ) {
+            let Some(root) = config::installed_onnx_bundle_root(&self.config, &model_id) else {
+                let message = "The selected ONNX model receipt or bundle tree is missing, tampered, or no longer matches this Scribe catalog. Choose Repair before transcription."
+                    .to_owned();
+                self.model_downloads
+                    .insert(model.id.clone(), ModelInstallStatus::Error(message.clone()));
+                self.status = TranscriptionStatus::Error;
+                self.status_message = message;
+                return;
+            };
+            if model.local_path.as_deref() != Some(root.as_path()) {
+                self.status = TranscriptionStatus::Error;
+                self.status_message =
+                    "The selected ONNX model does not resolve to its canonical receipt root. Repair or remove it before transcription."
+                        .to_owned();
+                return;
+            }
+            if let Err(error) = self
+                .transcription_service
+                .health_check(&model_id, Some(root))
+            {
+                self.model_downloads.insert(
+                    model.id.clone(),
+                    ModelInstallStatus::Error(format!(
+                        "The selected ONNX bundle failed startup receipt and worker validation: {error}"
+                    )),
+                );
+                self.status = TranscriptionStatus::Error;
+                self.status_message = format!(
+                    "The selected ONNX bundle failed startup validation; choose Repair: {error}"
+                );
+            }
+            return;
+        }
         let embedded_gguf = config::remote_gguf_artifact(&self.config, &model.id).is_some()
             || config::imported_gguf_artifact(&self.config, &model.id).is_some();
         if !embedded_gguf
@@ -6604,6 +6654,81 @@ impl LocalTranscriberApp {
     fn poll_events(&mut self) {
         while let Ok(event) = self.rx.try_recv() {
             match event {
+                AppEvent::OnnxBundleInstallProgress {
+                    job_id,
+                    model_id,
+                    progress,
+                } => {
+                    if self.onnx_bundle_install.as_ref().is_some_and(
+                        |(active_job, active_model, _)| {
+                            *active_job == job_id && active_model == &model_id
+                        },
+                    ) {
+                        self.model_downloads.insert(
+                            model_id,
+                            ModelInstallStatus::Downloading {
+                                downloaded_bytes: progress.completed_bytes,
+                                total_bytes: Some(progress.total_bytes),
+                                bytes_per_second: progress.bytes_per_second,
+                            },
+                        );
+                        self.rebuild_model_inventory_projection();
+                    }
+                }
+                AppEvent::OnnxBundleInstallFinished {
+                    job_id,
+                    model_id,
+                    paused,
+                    result,
+                } => {
+                    if self.onnx_bundle_install.as_ref().is_none_or(
+                        |(active_job, active_model, _)| {
+                            *active_job != job_id || active_model != &model_id
+                        },
+                    ) {
+                        continue;
+                    }
+                    self.onnx_bundle_install = None;
+                    self.remote_catalog.invalidate_local_models();
+                    match result {
+                        Ok(smoke) => {
+                            self.model_downloads
+                                .insert(model_id, ModelInstallStatus::Installed);
+                            self.status = TranscriptionStatus::Idle;
+                            self.status_message = format!(
+                                "ONNX model installed and smoke-tested (health {} ms, load {} ms, decode {} ms, reload {} ms, CPU).",
+                                smoke.health_duration_ms,
+                                smoke.load_duration_ms,
+                                smoke.decode_duration_ms,
+                                smoke.reload_duration_ms,
+                            );
+                            self.rebuild_local_models_after_committed_change();
+                        }
+                        Err(message) => {
+                            self.model_downloads.insert(
+                                model_id,
+                                ModelInstallStatus::Error(if paused {
+                                    "Paused. Downloaded partials were retained for Resume."
+                                        .to_owned()
+                                } else {
+                                    message.clone()
+                                }),
+                            );
+                            self.status = if paused {
+                                TranscriptionStatus::Idle
+                            } else {
+                                TranscriptionStatus::Error
+                            };
+                            self.status_message = if paused {
+                                "Paused ONNX model download. Downloaded partials were retained; choose Resume to continue."
+                                    .to_owned()
+                            } else {
+                                format!("ONNX model installation failed: {message}")
+                            };
+                            self.rebuild_model_inventory_projection();
+                        }
+                    }
+                }
                 AppEvent::MicrophoneTestReady { request_id, result } => {
                     let state = std::mem::take(&mut self.microphone_test);
                     match state {
@@ -8764,6 +8889,80 @@ impl LocalTranscriberApp {
             return;
         }
 
+        let model_id = ModelId::new(&model.id);
+        match managed_downloads::normalized_onnx_bundle_admission(&self.config, &model_id) {
+            Ok(Some(admission)) => {
+                if self.onnx_bundle_install.is_some() {
+                    self.fail_model_install(
+                        &model.id,
+                        "An ONNX model installation is already active.".to_owned(),
+                    );
+                    return;
+                }
+                let job_id = INSTALL_JOB_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+                let cancellation = InstallCancellation::default();
+                self.onnx_bundle_install = Some((job_id, model.id.clone(), cancellation.clone()));
+                self.model_downloads.insert(
+                    model.id.clone(),
+                    ModelInstallStatus::Downloading {
+                        downloaded_bytes: 0,
+                        total_bytes: model_download_total_bytes(model),
+                        bytes_per_second: None,
+                    },
+                );
+                self.status = TranscriptionStatus::Idle;
+                self.status_message = format!("Downloading {}...", model.name);
+                self.rebuild_model_inventory_projection();
+                let tx = self.tx.clone();
+                let service = self.current_transcription_service();
+                let event_model_id = model.id.clone();
+                thread::spawn(move || {
+                    let progress = |progress| {
+                        let _ = tx.send(AppEvent::OnnxBundleInstallProgress {
+                            job_id,
+                            model_id: event_model_id.clone(),
+                            progress,
+                        });
+                    };
+                    let result = managed_downloads::prepare_onnx_bundle(
+                        &admission,
+                        &cancellation,
+                        &progress,
+                    )
+                    .map_err(|error| error.to_string())
+                    .and_then(|staged| {
+                        service
+                            .verify_onnx_bundle_for_installation(staged, &cancellation)
+                            .map_err(|error| error.to_string())
+                    })
+                    .and_then(|verified| {
+                        let smoke = verified.smoke().clone();
+                        verified
+                            .activate()
+                            .and_then(|activated| activated.commit())
+                            .map_err(|error| error.to_string())?;
+                        Ok(smoke)
+                    });
+                    // Only a failed operation observes pause. Once activation
+                    // commits, a late cancellation signal cannot relabel the
+                    // successful installation as paused.
+                    let paused = result.is_err() && cancellation.is_cancelled();
+                    let _ = tx.send(AppEvent::OnnxBundleInstallFinished {
+                        job_id,
+                        model_id: event_model_id,
+                        paused,
+                        result,
+                    });
+                });
+                return;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                self.fail_model_install(&model.id, format!("Could not admit ONNX bundle: {error}"));
+                return;
+            }
+        }
+
         if !supports_managed_install(model) {
             self.status = TranscriptionStatus::Error;
             self.status_message = format!(
@@ -8779,7 +8978,6 @@ impl LocalTranscriberApp {
             return;
         }
 
-        let model_id = ModelId::new(&model.id);
         if let Err(error) = self.transcription_service.installation_binding(&model_id) {
             self.fail_model_install(
                 &model.id,
@@ -9012,6 +9210,16 @@ impl LocalTranscriberApp {
     }
 
     fn cancel_artifact_install(&mut self, model_id: &str) {
+        if let Some((_, active_model_id, cancellation)) = &self.onnx_bundle_install
+            && active_model_id == model_id
+        {
+            crate::onnx_model_bundles::pause_onnx_bundle_install(cancellation);
+            self.status_message =
+                "Pausing ONNX model download. Exact partials will be retained for Resume."
+                    .to_owned();
+            self.rebuild_model_inventory_projection();
+            return;
+        }
         let display_name = self
             .remote_catalog
             .local_models
@@ -9291,6 +9499,9 @@ impl LocalTranscriberApp {
                 config::downloaded_model_path(&self.config, model).as_ref() == Some(path)
             })
             .filter(|path| is_app_managed_model_path(&self.config, path));
+        let onnx_bundle_target =
+            config::onnx_bundle_target_root(&self.config, &ModelId::new(&model.id))
+                .filter(|path| is_app_managed_model_path(&self.config, path));
         let legacy_catalog_target = app_owned_legacy_catalog_artifact(&self.config, model)
             .then(|| model.local_path.clone())
             .flatten();
@@ -9317,6 +9528,7 @@ impl LocalTranscriberApp {
         let managed_target = bundled_target
             .clone()
             .or(static_managed_target)
+            .or(onnx_bundle_target)
             .or(remote_managed_target)
             .or(imported_receipt_target)
             .or(legacy_catalog_target);
@@ -11281,6 +11493,10 @@ impl LocalTranscriberApp {
         let app_owned_legacy_artifact = app_owned_legacy_catalog_artifact(&self.config, model);
         let legacy_cleanup_pending = app_owned_legacy_cleanup_artifact(&self.config, model);
         let bundled = model.artifact_origin == ModelArtifactOrigin::Bundled;
+        let receipt_backed = matches!(
+            crate::model_catalog::normalized_install_artifact(&ModelId::new(&model.id)),
+            Some(crate::model_catalog::NormalizedInstallArtifact::ReceiptBackedBundle { .. })
+        );
         let installed =
             manageable && !legacy_cleanup_pending && (!bundled || install_status.is_runnable());
         let custom = model.local_path.is_some()
@@ -11293,7 +11509,12 @@ impl LocalTranscriberApp {
             && !imported_gguf
             && !app_owned_legacy_artifact
             && !bundled;
-        let exact_install_active = self.artifact_installations.contains_key(&model.id);
+        let onnx_install_active = self
+            .onnx_bundle_install
+            .as_ref()
+            .is_some_and(|(_, active_model_id, _)| active_model_id == &model.id);
+        let exact_install_active =
+            self.artifact_installations.contains_key(&model.id) || onnx_install_active;
         let install_phase = self.artifact_installations.phase_for_model(&model.id);
         let mut download_state = match &install_status {
             ModelInstallStatus::Installed if legacy_cleanup_pending => {
@@ -11428,6 +11649,19 @@ impl LocalTranscriberApp {
                             .then(|| "This model does not have a repairable runtime.".to_owned())
                     }),
             )
+        } else if receipt_backed && matches!(install_status, ModelInstallStatus::Missing) {
+            (
+                "Repair model".to_owned(),
+                !install_admission_blocked && supports_managed_install(model),
+                false,
+                false,
+                install_admission_block_reason.clone().or_else(|| {
+                    Some(
+                        "The canonical ONNX bundle is incomplete or failed receipt validation. Repair downloads and verifies the exact pinned bundle."
+                            .to_owned(),
+                    )
+                }),
+            )
         } else {
             (
                 // Preparing the runtime is not evidence that this bundled model's
@@ -11505,7 +11739,8 @@ impl LocalTranscriberApp {
             primary_action_installs_upgrade,
             primary_action_repairs_runtime,
             primary_action_disabled_reason,
-            cancel_supported: install_phase.is_some_and(ArtifactInstallPhase::allows_cancellation),
+            cancel_supported: onnx_install_active
+                || install_phase.is_some_and(ArtifactInstallPhase::allows_cancellation),
             removal_supported: (bundled && model.id == BUNDLED_BASE_MODEL_ID && installed)
                 || (!bundled
                     && !custom
@@ -12056,6 +12291,15 @@ impl LocalTranscriberApp {
     }
 
     fn discard_normalized_model_partial(&mut self, model_id: ModelId) {
+        if let Some((_, active_model_id, cancellation)) = &self.onnx_bundle_install
+            && active_model_id == model_id.as_str()
+        {
+            cancellation.cancel();
+            self.status_message =
+                "Cancelling ONNX download; retained exact partials can be discarded after it exits."
+                    .to_owned();
+            return;
+        }
         if let Some((job_id, cancellation)) =
             self.artifact_installations.get(model_id.as_str()).cloned()
         {
@@ -12073,7 +12317,16 @@ impl LocalTranscriberApp {
             self.status_message = format!("Could not discard the retained partial: {reason}");
             return;
         }
-        let result = managed_downloads::discard_normalized_model_partial(&self.config, &model_id);
+        let result = match managed_downloads::discard_normalized_onnx_bundle_partials(
+            &self.config,
+            &model_id,
+        ) {
+            Ok(Some(count)) => Ok(count != 0),
+            Ok(None) => {
+                managed_downloads::discard_normalized_model_partial(&self.config, &model_id)
+            }
+            Err(error) => Err(error),
+        };
         self.finish_partial_discard(model_id.as_str(), result);
     }
 
@@ -15089,6 +15342,22 @@ fn cards_for_models(
 }
 
 fn runtime_status_for_model(config: &AppConfig, model: &SttModelInfo) -> ModelRuntimeStatus {
+    if matches!(
+        crate::model_catalog::normalized_install_artifact(&ModelId::new(&model.id)),
+        Some(crate::model_catalog::NormalizedInstallArtifact::ReceiptBackedBundle { .. })
+    ) {
+        return match &model.install_status {
+            ModelInstallStatus::Installed => ModelRuntimeStatus::Ready,
+            ModelInstallStatus::Downloading { .. } | ModelInstallStatus::InstallingRuntime => {
+                ModelRuntimeStatus::Downloading
+            }
+            ModelInstallStatus::NotInstalled => ModelRuntimeStatus::NotInstalled,
+            ModelInstallStatus::Missing => ModelRuntimeStatus::MissingConfiguration,
+            ModelInstallStatus::Error(message) | ModelInstallStatus::RuntimeError(message) => {
+                ModelRuntimeStatus::Error(message.clone())
+            }
+        };
+    }
     if config::remote_gguf_artifact(config, &model.id).is_some()
         || config::imported_gguf_artifact(config, &model.id).is_some()
         || (crate::model_catalog::model_uses_embedded_runtime(&ModelId::new(&model.id))
@@ -20907,6 +21176,7 @@ mod layout_tests {
             model_downloads: HashMap::new(),
             runtime_jobs: HashMap::new(),
             artifact_installations: ArtifactInstallCoordinator::default(),
+            onnx_bundle_install: None,
             discard_partial_after_install: HashMap::new(),
             partial_discard_recovery_error_for_test: None,
             local_gguf_import: None,
@@ -26291,6 +26561,82 @@ mod layout_tests {
         assert_eq!(
             runtime_status_for_model(&AppConfig::default(), &model),
             ModelRuntimeStatus::Ready
+        );
+    }
+
+    #[test]
+    fn installed_receipt_backed_onnx_model_is_ready_without_legacy_runtime_record() {
+        let mut model = config::configured_models(&AppConfig::default())
+            .into_iter()
+            .find(|model| model.id == "moonshine-tiny-en-int8-onnx")
+            .unwrap();
+        model.install_status = ModelInstallStatus::Installed;
+        model.local_path = Some(PathBuf::from("/canonical/receipt-backed-root"));
+
+        assert_eq!(
+            runtime_status_for_model(&AppConfig::default(), &model),
+            ModelRuntimeStatus::Ready
+        );
+    }
+
+    #[test]
+    fn active_onnx_bundle_job_projects_downloading_progress_and_cancel() {
+        let mut app = test_app();
+        let model_id = "moonshine-tiny-en-int8-onnx".to_owned();
+        app.onnx_bundle_install = Some((41, model_id.clone(), InstallCancellation::default()));
+        app.model_downloads.insert(
+            model_id.clone(),
+            ModelInstallStatus::Downloading {
+                downloaded_bytes: 17,
+                total_bytes: Some(44_256_550),
+                bytes_per_second: Some(9),
+            },
+        );
+
+        let view = app
+            .build_model_management_catalog()
+            .into_iter()
+            .find(|model| model.id == model_id)
+            .unwrap();
+        assert_eq!(view.download_state, ModelDownloadState::Downloading);
+        assert_eq!(view.downloaded_bytes, 17);
+        assert!(view.cancel_supported);
+    }
+
+    #[test]
+    fn onnx_completion_uses_typed_pause_truth_not_error_text() {
+        let mut app = test_app();
+        let model_id = "moonshine-tiny-en-int8-onnx".to_owned();
+        app.onnx_bundle_install = Some((51, model_id.clone(), InstallCancellation::default()));
+        app.tx
+            .send(AppEvent::OnnxBundleInstallFinished {
+                job_id: 51,
+                model_id: model_id.clone(),
+                paused: false,
+                result: Err("decoder reported cancellation-shaped metadata".to_owned()),
+            })
+            .unwrap();
+        app.poll_events();
+        assert!(matches!(app.status, TranscriptionStatus::Error));
+        assert!(
+            app.status_message
+                .starts_with("ONNX model installation failed:")
+        );
+
+        app.onnx_bundle_install = Some((52, model_id.clone(), InstallCancellation::default()));
+        app.tx
+            .send(AppEvent::OnnxBundleInstallFinished {
+                job_id: 52,
+                model_id,
+                paused: true,
+                result: Err("transfer stopped".to_owned()),
+            })
+            .unwrap();
+        app.poll_events();
+        assert!(matches!(app.status, TranscriptionStatus::Idle));
+        assert!(
+            app.status_message
+                .starts_with("Paused ONNX model download.")
         );
     }
 

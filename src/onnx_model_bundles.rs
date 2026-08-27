@@ -24,7 +24,8 @@ use crate::installations::{
     InstallError, InstallProgress, PinnedArtifact, PinnedArtifactInspectionPlan, RuntimeFileSpec,
     StagedRuntime, directory_activation_rollback_root, discard_file_bundle_staging,
     discard_pinned_artifact_partial, download_pinned_artifact_for_target,
-    inspect_pinned_artifact_for_target, path_entry_exists_no_follow, read_regular_file_no_follow,
+    inspect_pinned_artifact_for_target, path_entry_exists_no_follow,
+    pinned_artifact_retained_partial, read_regular_file_no_follow,
     restore_interrupted_directory_replacement, retain_interrupted_directory_replacement,
     rollback_to_previous_runtime, stage_file_bundle_for_target, verify_regular_directory_root,
     verify_runtime_tree,
@@ -1486,6 +1487,25 @@ pub(crate) fn discard_onnx_bundle_partials(
     Ok(discarded)
 }
 
+pub(crate) fn retained_onnx_bundle_partial(
+    model_id: &str,
+    storage_root: &Path,
+) -> Result<Option<crate::installations::RetainedPartial>, InstallError> {
+    let manifest = bundle_manifest(model_id)
+        .ok_or_else(|| failed(format!("unknown internal ONNX bundle {model_id}")))?;
+    let bytes =
+        pinned_files(storage_root, manifest)?
+            .iter()
+            .try_fold(0_u64, |total, artifact| {
+                let bytes =
+                    pinned_artifact_retained_partial(artifact)?.map_or(0, |partial| partial.bytes);
+                total
+                    .checked_add(bytes)
+                    .ok_or_else(|| failed("ONNX retained partial size overflowed"))
+            })?;
+    Ok((bytes != 0).then_some(crate::installations::RetainedPartial { bytes }))
+}
+
 /// Pause is represented by the downloader's cancellation token. Any current
 /// file is synced before return and its exact resumable partial is retained;
 /// already completed revision-cache files are also left intact.
@@ -1769,6 +1789,28 @@ mod tests {
         ))
     }
 
+    #[test]
+    fn normalized_receipt_binding_matches_private_bundle_authority() {
+        let model_id = crate::transcription::ModelId::new("moonshine-tiny-en-int8-onnx");
+        let crate::model_catalog::NormalizedInstallArtifact::ReceiptBackedBundle {
+            bundle_id,
+            aggregate_size_bytes,
+        } = crate::model_catalog::normalized_install_artifact(&model_id).unwrap()
+        else {
+            panic!("Moonshine must remain receipt-backed");
+        };
+        let manifest = bundle_manifest(bundle_id).unwrap();
+        assert_eq!(manifest.id, bundle_id);
+        assert_eq!(
+            manifest
+                .files
+                .iter()
+                .map(|file| file.size_bytes)
+                .sum::<u64>(),
+            aggregate_size_bytes
+        );
+    }
+
     fn write_fixture_bundle(root: &Path, model_id: &str, marker: &str) -> OnnxBundleReceipt {
         fs::create_dir_all(root).unwrap();
         let mut manifest = bundle_manifest("moonshine-tiny-en-int8-onnx")
@@ -2007,10 +2049,15 @@ mod tests {
         let target = bundle_target_root(&root, model_id).unwrap();
         let guard = acquire_bundle_target(&target).unwrap();
 
+        assert_eq!(
+            retained_onnx_bundle_partial(model_id, &root).unwrap(),
+            Some(crate::installations::RetainedPartial { bytes: 8 })
+        );
         assert!(discard_onnx_bundle_partials(model_id, &root).is_err());
         assert!(partial.exists());
         drop(guard);
         assert_eq!(discard_onnx_bundle_partials(model_id, &root).unwrap(), 1);
+        assert_eq!(retained_onnx_bundle_partial(model_id, &root).unwrap(), None);
         assert!(!partial.exists());
         fs::remove_dir_all(root).unwrap();
     }
