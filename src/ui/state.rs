@@ -52,7 +52,9 @@ pub(crate) struct TranscriptionState {
     pub recording_started_at_ms: Option<u64>,
     pub elapsed_ms: u64,
     pub last_successful_capture_ms: Option<u64>,
-    pub notice: Option<String>,
+    /// A Transcribe-local result or recovery message. Cross-route application
+    /// status is intentionally not rendered on this screen.
+    pub notice: Option<TranscribeNotice>,
     pub microphone_permission: MicrophonePermission,
     pub selected_audio_device_id: Option<String>,
     pub recording_mode: RecordingMode,
@@ -60,9 +62,59 @@ pub(crate) struct TranscriptionState {
     pub hotkey_capture_active: bool,
     pub hotkey_change_disabled_reason: Option<String>,
     pub model_change_disabled_reason: Option<String>,
+    pub record_control_needs_focus: bool,
     /// True only while the successfully presented background overlay owns
     /// recording announcements for this frame.
     pub suppress_live_announcements: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TranscribeNoticeTone {
+    Information,
+    Error,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TranscribeRecoveryAction {
+    AddModel,
+    OpenModelSettings,
+    RetryMicrophone,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TranscribeNotice {
+    pub tone: TranscribeNoticeTone,
+    pub message: String,
+    pub recovery_action: Option<TranscribeRecoveryAction>,
+}
+
+impl TranscribeNotice {
+    pub(crate) fn information(message: impl Into<String>) -> Self {
+        Self {
+            tone: TranscribeNoticeTone::Information,
+            message: message.into(),
+            recovery_action: None,
+        }
+    }
+
+    pub(crate) fn error(
+        message: impl Into<String>,
+        recovery_action: TranscribeRecoveryAction,
+    ) -> Self {
+        Self {
+            tone: TranscribeNoticeTone::Error,
+            message: message.into(),
+            recovery_action: Some(recovery_action),
+        }
+    }
+
+    pub(crate) fn failure(message: impl Into<String>) -> Self {
+        Self {
+            tone: TranscribeNoticeTone::Error,
+            message: message.into(),
+            recovery_action: None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -140,7 +192,10 @@ impl TranscriptionState {
             {
                 self.phase = TranscriptionPhase::MicrophoneError;
                 self.microphone_permission = MicrophonePermission::Denied;
-                self.notice = Some("Scribe couldn\u{2019}t access your microphone.".into());
+                self.notice = Some(TranscribeNotice::error(
+                    "Scribe couldn\u{2019}t access your microphone.",
+                    TranscribeRecoveryAction::RetryMicrophone,
+                ));
             }
             TranscriptionEvent::Partial(text) if self.phase == TranscriptionPhase::Listening => {
                 self.provisional_transcript = text;
@@ -161,7 +216,9 @@ impl TranscriptionState {
             {
                 self.provisional_transcript.clear();
                 self.phase = TranscriptionPhase::NoSpeech;
-                self.notice = Some("No speech detected — nothing was added.".into());
+                self.notice = Some(TranscribeNotice::information(
+                    "No speech detected — nothing was added.",
+                ));
             }
             TranscriptionEvent::ModelFailed if self.phase == TranscriptionPhase::ModelLoading => {
                 self.provisional_transcript.clear();
@@ -379,6 +436,8 @@ pub(crate) struct ModelManagementState {
     /// The deterministic ready replacement named in an active-model removal confirmation.
     pub removal_replacement: Option<String>,
     pub mutation_block_reason: Option<String>,
+    /// Actionable warning scoped to bundled-model cleanup on the Models page.
+    pub lifecycle_warning: Option<String>,
     /// Quiet aggregate lifecycle summary; byte progress is intentionally excluded.
     pub install_status_summary: Option<String>,
     pub installed_expanded: bool,
@@ -396,6 +455,7 @@ impl Default for ModelManagementState {
             restore_remove_focus: None,
             removal_replacement: None,
             mutation_block_reason: None,
+            lifecycle_warning: None,
             install_status_summary: None,
             installed_expanded: true,
             available_expanded: true,

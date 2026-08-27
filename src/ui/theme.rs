@@ -358,6 +358,15 @@ mod tests {
     }
 
     #[test]
+    fn history_card_text_tokens_meet_aa_in_both_themes() {
+        for palette in [ThemePalette::light(), ThemePalette::dark()] {
+            for foreground in [palette.muted_text, palette.warning, palette.error_text] {
+                assert!(contrast_ratio(foreground, palette.card_bg) >= 4.5);
+            }
+        }
+    }
+
+    #[test]
     fn recording_mode_toggle_uses_semantic_colours_with_aa_contrast() {
         let light = ThemePalette::light();
         assert_eq!(light.segmented_control_bg, light.accent);
