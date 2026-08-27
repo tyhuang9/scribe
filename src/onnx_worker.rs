@@ -236,6 +236,7 @@ impl OnnxModelSpec {
         })
     }
 
+    #[cfg(test)]
     fn fingerprint(&self) -> Result<String> {
         self.validated()?.fingerprint()
     }
@@ -1704,6 +1705,7 @@ pub(crate) struct OnnxWorkerSupervisor {
 }
 
 impl OnnxWorkerSupervisor {
+    #[cfg(test)]
     fn with_launcher(launcher: Arc<dyn WorkerLauncher>) -> Result<Self> {
         Self::with_launcher_and_deadlines(launcher, SupervisorDeadlines::default())
     }
@@ -1734,6 +1736,7 @@ impl OnnxWorkerSupervisor {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn load(
         &self,
         session_id: u64,
@@ -1784,6 +1787,7 @@ impl OnnxWorkerSupervisor {
         Ok(false)
     }
 
+    #[cfg(test)]
     pub(crate) fn transcribe(
         &self,
         session_id: u64,
@@ -2132,6 +2136,7 @@ impl OnnxWorkerSupervisor {
     /// failed. This is the router's fail-closed boundary for alternate and test
     /// supervisor implementations whose `load` errors do not invalidate their
     /// own process generation.
+    #[cfg(test)]
     pub(crate) fn terminate_current(&self) -> Result<()> {
         let generation = self
             .inner

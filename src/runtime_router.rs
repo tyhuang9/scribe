@@ -349,6 +349,7 @@ pub(crate) enum IdleTimeoutAction {
 }
 
 impl RuntimeActivity {
+    #[cfg(test)]
     fn acquire_stream(&self) -> Result<RuntimeActivityLease, RuntimeError> {
         let mut state = self.inner.lock().map_err(|_| RuntimeError::Poisoned)?;
         state.active_streams = state.active_streams.saturating_add(1);
@@ -429,6 +430,7 @@ pub(crate) struct RuntimeActivityLease {
 
 #[derive(Clone, Copy)]
 enum RuntimeActivityKind {
+    #[cfg(test)]
     Stream,
     Request,
 }
@@ -455,6 +457,7 @@ impl RuntimeActivityLease {
             && state.generation == self.generation
         {
             match self.kind {
+                #[cfg(test)]
                 RuntimeActivityKind::Stream => {
                     state.active_streams = state.active_streams.saturating_sub(1);
                 }
