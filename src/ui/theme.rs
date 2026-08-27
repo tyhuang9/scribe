@@ -11,6 +11,9 @@ pub(crate) const DARK_SOFT_TEXT: Color32 = Color32::from_rgb(0xE9, 0xF0, 0xF0);
 pub(crate) const DARK_MUTED_GRAY: Color32 = Color32::from_rgb(0x8E, 0x99, 0xA3);
 pub(crate) const DARK_SCRIBE_TEAL: Color32 = Color32::from_rgb(0x2D, 0x97, 0x9C);
 pub(crate) const DARK_LIVE_CORAL: Color32 = Color32::from_rgb(0xFD, 0x81, 0x6F);
+// A neutral one-step elevation from Surface for active model cards and
+// information panels. It deliberately avoids the teal interaction accent.
+const DARK_ELEVATED_SURFACE: Color32 = Color32::from_rgb(0x23, 0x26, 0x2C);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ThemePalette {
@@ -170,7 +173,7 @@ impl ThemePalette {
             content_bg: DARK_CHARCOAL,
             sidebar_bg: DARK_SURFACE,
             card_bg: DARK_SURFACE,
-            panel_bg: DARK_SURFACE,
+            panel_bg: DARK_ELEVATED_SURFACE,
             disabled_bg: Color32::from_rgb(34, 38, 45),
             active_card_bg: Color32::from_rgb(32, 58, 60),
             text: DARK_SOFT_TEXT,
@@ -203,7 +206,7 @@ impl ThemePalette {
             chip_success_text: Color32::from_rgb(178, 228, 203),
             chip_success_fill: Color32::from_rgb(28, 64, 49),
             chip_success_border: Color32::from_rgb(60, 139, 104),
-            chip_warning_text: Color32::from_rgb(242, 207, 145),
+            chip_warning_text: Color32::from_rgb(255, 223, 173),
             chip_warning_fill: Color32::from_rgb(72, 54, 30),
             chip_warning_border: Color32::from_rgb(154, 112, 53),
             chip_error_text: Color32::from_rgb(255, 199, 190),
@@ -214,9 +217,9 @@ impl ThemePalette {
             chip_active_border: DARK_SCRIBE_TEAL,
             success: Color32::from_rgb(178, 228, 203),
             success_text: Color32::from_rgb(178, 228, 203),
-            warning: Color32::from_rgb(242, 194, 123),
+            warning: Color32::from_rgb(255, 223, 173),
             error_fill: DARK_LIVE_CORAL,
-            error_text: Color32::from_rgb(255, 199, 190),
+            error_text: Color32::from_rgb(255, 228, 222),
             danger_button_text: DARK_CHARCOAL,
             error_pale: Color32::from_rgb(74, 45, 49),
             error_border: DARK_LIVE_CORAL,
@@ -399,7 +402,7 @@ mod tests {
         let dark = ThemePalette::dark();
         assert_eq!(dark.primary_button_bg, DARK_SCRIBE_TEAL);
         assert!(contrast_ratio(dark.primary_button_text, dark.primary_button_bg) >= 4.5);
-        assert_eq!(dark.warning, Color32::from_rgb(242, 194, 123));
+        assert_eq!(dark.warning, Color32::from_rgb(255, 223, 173));
         assert_eq!(dark.error_fill, DARK_LIVE_CORAL);
         assert!(contrast_ratio(dark.error_text, dark.card_bg) >= 4.5);
     }
@@ -418,12 +421,26 @@ mod tests {
         assert_eq!(palette.content_bg, DARK_CHARCOAL);
         assert_eq!(palette.sidebar_bg, DARK_SURFACE);
         assert_eq!(palette.card_bg, DARK_SURFACE);
-        assert_eq!(palette.panel_bg, DARK_SURFACE);
+        assert_eq!(palette.panel_bg, DARK_ELEVATED_SURFACE);
         assert_eq!(palette.text, DARK_SOFT_TEXT);
         assert_eq!(palette.muted_text, DARK_MUTED_GRAY);
         assert_eq!(palette.accent, DARK_SCRIBE_TEAL);
         assert_eq!(palette.recording_waveform, DARK_SCRIBE_TEAL);
         assert_eq!(palette.error_fill, DARK_LIVE_CORAL);
+    }
+
+    #[test]
+    fn dark_model_card_states_use_a_neutral_elevated_panel_surface() {
+        let palette = ThemePalette::dark();
+
+        assert_eq!(palette.card_bg, DARK_SURFACE);
+        assert_eq!(palette.panel_bg, DARK_ELEVATED_SURFACE);
+        assert_ne!(palette.card_bg, palette.panel_bg);
+        assert!(palette.panel_bg.r() > palette.card_bg.r());
+        assert!(palette.panel_bg.g() > palette.card_bg.g());
+        assert!(palette.panel_bg.b() > palette.card_bg.b());
+        assert!(contrast_ratio(palette.text, palette.panel_bg) >= 4.5);
+        assert!(contrast_ratio(palette.control_border, palette.panel_bg) >= 3.0);
     }
 
     #[test]
