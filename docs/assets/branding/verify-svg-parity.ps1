@@ -70,19 +70,51 @@ foreach ($target in $targets) {
     }
 }
 
+$tagline = 'Lightning-fast local transcription that stays out of your way.'
+$canonicalLockupContracts = @(
+    @{
+        Path = 'assets\branding\scribe-lockup-light.svg'
+        RequiredFills = @('#fff', '#08233A', '#2D979C')
+    },
+    @{
+        Path = 'assets\branding\scribe-lockup-dark.svg'
+        RequiredFills = @('#061C2E', '#08233A', '#EAF5F5', '#7CCBC9')
+    }
+)
+
+foreach ($contract in $canonicalLockupContracts) {
+    $lockupPath = Join-Path $repositoryRoot $contract.Path
+    $rawLockup = Get-Content -Raw -LiteralPath $lockupPath
+    $lockupXml = [xml]$rawLockup
+    $title = $lockupXml.SelectSingleNode('//*[local-name()="title"]')
+    $description = $lockupXml.SelectSingleNode('//*[local-name()="desc"]')
+    $visibleText = @($lockupXml.SelectNodes('//*[local-name()="text"]') | ForEach-Object InnerText)
+    $expectedText = @('scribe', 'Lightning-fast local transcription', 'that stays out of your way.')
+
+    if ($title.InnerText -ne 'scribe' -or $description.InnerText -notlike "*$tagline*") {
+        throw "$($contract.Path) must expose the lowercase wordmark and exact tagline to assistive technology."
+    }
+    if (($visibleText -join '|') -ne ($expectedText -join '|')) {
+        throw "$($contract.Path) must visibly contain the lowercase wordmark and exact two-line tagline."
+    }
+    foreach ($fill in $contract.RequiredFills) {
+        if (-not $rawLockup.Contains("fill=`"$fill`"")) {
+            throw "$($contract.Path) is missing required theme fill $fill."
+        }
+    }
+}
+
 Assert-HashSet @(
     'assets\branding\scribe-mark.svg',
     'docs\assets\branding\scribe-mark.svg',
     'website\public\brand\scribe-mark.svg'
 ) 'Canonical mark'
 Assert-HashSet @(
-    'assets\branding\scribe-lockup-light.svg',
     'docs\assets\branding\scribe-lockup-light.svg',
     'website\public\brand\scribe-lockup-light.svg',
     'website\src\assets\scribe-lockup-light.svg'
 ) 'Light lockup'
 Assert-HashSet @(
-    'assets\branding\scribe-lockup-dark.svg',
     'docs\assets\branding\scribe-lockup-dark.svg',
     'website\public\brand\scribe-lockup-dark.svg',
     'website\src\assets\scribe-lockup-dark.svg'
