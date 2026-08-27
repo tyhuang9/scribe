@@ -1697,7 +1697,7 @@ impl ProcessWorkerSupervisor {
             .active_stream
             .is_some()
         {
-            bail!("an ONNX stream is already active");
+            bail!("a worker stream is already active");
         }
         let frame = control_frame(session_id, request_id, &Control::StartStream)?;
         match self.active_round_trip(generation, session_id, request_id, &[frame])? {
@@ -1819,7 +1819,7 @@ impl ProcessWorkerSupervisor {
             let stream = state
                 .active_stream
                 .filter(|stream| stream.session_id == session_id)
-                .ok_or_else(|| anyhow!("no ONNX stream is active for session {session_id}"))?;
+                .ok_or_else(|| anyhow!("no worker stream is active for session {session_id}"))?;
             (stream, state.active_request)
         };
         if let Some(active_request) = active_request {
@@ -1828,7 +1828,7 @@ impl ProcessWorkerSupervisor {
             {
                 return self.cancel_active();
             }
-            bail!("another ONNX request is active");
+            bail!("another worker request is active");
         }
         self.round_trip_on_generation(
             stream.generation,
@@ -1959,10 +1959,10 @@ impl ProcessWorkerSupervisor {
             .inner
             .pending
             .lock()
-            .map_err(|_| anyhow!("ONNX pending map lock was poisoned"))?
+            .map_err(|_| anyhow!("process worker pending map lock was poisoned"))?
             .remove(&target);
         if let Some(waiter) = waiter {
-            let _ = waiter.send(Err("ONNX transcription request was cancelled".to_owned()));
+            let _ = waiter.send(Err("process worker request was cancelled".to_owned()));
         } else {
             // The stdout reader already claimed the response. Treat that as
             // completion winning the race rather than killing a healthy
@@ -1974,7 +1974,7 @@ impl ProcessWorkerSupervisor {
         {
             state.active_request = None;
         }
-        self.invalidate_generation(target.generation, "ONNX request cancelled", true)?;
+        self.invalidate_generation(target.generation, "process worker request cancelled", true)?;
         Ok(CancelOutcome::HardInvalidated)
     }
 
@@ -2032,7 +2032,7 @@ impl ProcessWorkerSupervisor {
             .inner
             .spawn_gate
             .lock()
-            .map_err(|_| anyhow!("ONNX spawn lock was poisoned"))?;
+            .map_err(|_| anyhow!("process worker spawn lock was poisoned"))?;
         let existing = {
             let state = self
                 .inner
@@ -2090,7 +2090,7 @@ impl ProcessWorkerSupervisor {
             .inner
             .writer
             .lock()
-            .map_err(|_| anyhow!("ONNX writer lock was poisoned"))? =
+            .map_err(|_| anyhow!("process worker writer lock was poisoned"))? =
             Some(WriterSlot { generation, stdin });
         if let Err(error) = Self::start_reader(&self.inner, generation, stdout) {
             self.invalidate_generation(generation, &error.to_string(), true)?;
@@ -2132,7 +2132,7 @@ impl ProcessWorkerSupervisor {
         let launcher = Arc::clone(&self.inner.launcher);
         let (result_tx, result_rx) = sync_channel(1);
         std::thread::Builder::new()
-            .name("scribe-onnx-launch".to_owned())
+            .name("scribe-process-worker-launch".to_owned())
             .spawn(move || {
                 let result = launcher.launch();
                 if deadline.remaining().is_err() {
@@ -2183,7 +2183,7 @@ impl ProcessWorkerSupervisor {
     ) -> Result<()> {
         let weak = Arc::downgrade(inner);
         std::thread::Builder::new()
-            .name(format!("scribe-onnx-reader-{generation}"))
+            .name(format!("scribe-process-worker-reader-{generation}"))
             .spawn(move || {
                 loop {
                     let response = read_frame(&mut stdout).and_then(parse_worker_control);
@@ -2251,14 +2251,14 @@ impl ProcessWorkerSupervisor {
             .inner
             .pending
             .lock()
-            .map_err(|_| anyhow!("ONNX pending map lock was poisoned"))?;
+            .map_err(|_| anyhow!("process worker pending map lock was poisoned"))?;
         match pending.entry(correlation) {
             Entry::Vacant(entry) => {
                 entry.insert(reply);
             }
             Entry::Occupied(_) => {
                 bail!(
-                    "duplicate ONNX request correlation for generation {}, session {}, request {}",
+                    "duplicate process worker request correlation for generation {}, session {}, request {}",
                     correlation.generation,
                     correlation.session_id,
                     correlation.request_id
@@ -2344,7 +2344,7 @@ impl ProcessWorkerSupervisor {
                     .is_some_and(|current| current.generation == generation) =>
             {
                 if state.active_request.is_some() {
-                    Some(anyhow!("an ONNX transcription request is already active"))
+                    Some(anyhow!("a process worker request is already active"))
                 } else {
                     state.active_request = Some(correlation);
                     None
@@ -2377,7 +2377,7 @@ impl ProcessWorkerSupervisor {
             .map_err(|_| anyhow!("process worker supervisor state lock was poisoned"))?
             .active_stream
             .filter(|stream| stream.session_id == session_id)
-            .ok_or_else(|| anyhow!("no ONNX stream is active for session {session_id}"))
+            .ok_or_else(|| anyhow!("no worker stream is active for session {session_id}"))
     }
 
     fn clear_stream(&self, generation: u64, session_id: u64) {
@@ -2454,7 +2454,7 @@ impl ProcessWorkerSupervisor {
             .inner
             .writer
             .lock()
-            .map_err(|_| anyhow!("ONNX writer lock was poisoned"))?;
+            .map_err(|_| anyhow!("process worker writer lock was poisoned"))?;
         let slot = writer
             .as_mut()
             .filter(|slot| slot.generation == generation)
@@ -3213,7 +3213,7 @@ fn reap_process(process: Arc<dyn WorkerProcess>, generation: u64) -> Result<()> 
     // wait can never delay termination of a later generation.
     let reaper_process = Arc::clone(&process);
     if let Err(error) = std::thread::Builder::new()
-        .name(format!("scribe-onnx-reaper-{generation}"))
+        .name(format!("scribe-process-worker-reaper-{generation}"))
         .spawn(move || {
             if let Err(error) = reaper_process.wait() {
                 eprintln!("process worker generation {generation} reaper failed: {error:#}");
@@ -4053,7 +4053,7 @@ fn worker_loop_with_factories<F: WorkerRecognizerFactory, V: WorkerVadFactory>(
                         bail!("streaming requires an online ONNX transducer");
                     }
                     if active_stream.is_some() {
-                        bail!("an ONNX stream is already active");
+                        bail!("a worker stream is already active");
                     }
                     active_stream = Some(ActiveWorkerStream {
                         session_id,
@@ -4480,7 +4480,7 @@ fn handle_audio_chunk<R: WorkerRecognizer>(
     }
     let current = active_stream
         .as_ref()
-        .ok_or_else(|| anyhow!("no ONNX stream is active"))?;
+        .ok_or_else(|| anyhow!("no worker stream is active"))?;
     if current.session_id != session_id {
         bail!("ONNX stream belongs to a different session");
     }
@@ -4525,7 +4525,7 @@ fn finish_worker_stream<R: WorkerRecognizer>(
         .as_ref()
         .is_none_or(|stream| stream.session_id != session_id)
     {
-        bail!("no ONNX stream is active for session {session_id}");
+        bail!("no worker stream is active for session {session_id}");
     }
     let mut stream = active_stream.take().expect("stream checked above");
     recognizer

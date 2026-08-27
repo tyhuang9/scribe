@@ -237,13 +237,92 @@ fn runtime_artifact_module_is_a_leaf_value_boundary() {
 }
 
 const WORKER_RUNTIME_MARKER: &str = "worker-only native runtime";
+const NATIVE_RUNTIME_OWNER_PATHS: [&str; 3] =
+    ["embedded_runtime.rs", "onnx_worker.rs", "runtime_router.rs"];
 
-fn is_marked_worker_runtime(path: &Path, source: &str) -> bool {
-    path != Path::new("architecture_guard.rs") && source.contains(WORKER_RUNTIME_MARKER)
+fn is_native_runtime_owner(path: &Path) -> bool {
+    NATIVE_RUNTIME_OWNER_PATHS
+        .iter()
+        .any(|allowed| path == Path::new(allowed))
 }
 
 #[test]
-fn native_runtime_ownership_is_confined_to_marked_worker_modules() {
+fn native_runtime_marker_set_matches_exact_owner_allowlist() {
+    let sources = rust_sources();
+    let mut documented = sources
+        .iter()
+        .filter(|(path, source)| {
+            path != Path::new("architecture_guard.rs") && source.contains(WORKER_RUNTIME_MARKER)
+        })
+        .map(|(path, _)| path.as_path())
+        .collect::<Vec<_>>();
+    documented.sort();
+    let mut expected = NATIVE_RUNTIME_OWNER_PATHS
+        .iter()
+        .map(Path::new)
+        .collect::<Vec<_>>();
+    expected.sort();
+    assert_eq!(documented, expected);
+
+    let copied_marker = "//! worker-only native runtime\nfn escaped() {}";
+    assert!(copied_marker.contains(WORKER_RUNTIME_MARKER));
+    assert!(!is_native_runtime_owner(Path::new("copied_marker.rs")));
+}
+
+#[test]
+fn generic_process_worker_transport_has_neutral_diagnostics_and_thread_names() {
+    let worker = rust_sources()
+        .into_iter()
+        .find(|(path, _)| path == Path::new("onnx_worker.rs"))
+        .map(|(_, source)| production_source(&source))
+        .expect("process worker source exists");
+    let transport = worker
+        .split("pub(crate) struct ProcessWorkerSupervisor")
+        .nth(1)
+        .and_then(|tail| {
+            tail.split("pub(crate) struct InferenceWorkerSupervisor")
+                .next()
+        })
+        .expect("generic process worker transport remains delimited");
+    for stale in [
+        "ONNX pending map",
+        "ONNX transcription request",
+        "ONNX request",
+        "ONNX spawn lock",
+        "ONNX writer lock",
+        "an ONNX stream",
+        "no ONNX stream",
+        "another ONNX request",
+    ] {
+        assert!(
+            !transport.contains(stale),
+            "generic process worker transport restored ONNX-specific diagnostic {stale:?}"
+        );
+    }
+    for stale in [
+        "scribe-onnx-launch",
+        "scribe-onnx-reader-",
+        "scribe-onnx-reaper-",
+    ] {
+        assert!(
+            !worker.contains(stale),
+            "generic process worker thread restored ONNX-specific label {stale:?}"
+        );
+    }
+    for required in [
+        "scribe-process-worker-launch",
+        "scribe-process-worker-reader-",
+        "scribe-process-worker-reaper-",
+    ] {
+        assert!(
+            worker.contains(required),
+            "generic process worker thread label {required:?} is missing"
+        );
+    }
+}
+
+#[test]
+fn native_runtime_ownership_is_confined_to_exact_owner_paths() {
     let sources = rust_sources();
     let worker = sources
         .iter()
@@ -318,30 +397,29 @@ fn native_runtime_ownership_is_confined_to_marked_worker_modules() {
         );
     }
 
-    let marked_worker_sources = sources
+    let native_owner_sources = sources
         .iter()
-        .filter(|(path, source)| is_marked_worker_runtime(path, source))
-        // A worker module may contain focused `#[cfg(test)]` adapters between
-        // its production sections. The stable module marker is authoritative
-        // for ownership, so inspect the complete marked module here; the
-        // escape scan below still uses the production prefix for unmarked code.
+        .filter(|(path, _)| is_native_runtime_owner(path))
+        // An owner module may contain focused `#[cfg(test)]` adapters between
+        // its production sections. The exact path allowlist is authoritative,
+        // so inspect the complete owner module here.
         .map(|(_, source)| source.as_str())
         .collect::<Vec<_>>();
     assert!(
-        marked_worker_sources.iter().any(|source| {
+        native_owner_sources.iter().any(|source| {
             source.contains("OfflineRecognizer::create(")
                 && source.contains("OnlineRecognizer::create(")
         }),
         "the marked child runtime must directly own the sherpa recognizers"
     );
     assert!(
-        marked_worker_sources
+        native_owner_sources
             .iter()
             .any(|source| source.contains("SileroVadModel::load_bundled(")),
         "the marked child runtime must directly own the VAD recognizer"
     );
     assert!(
-        marked_worker_sources
+        native_owner_sources
             .iter()
             .any(|source| source.contains("Model::load_with(")),
         "the marked child runtime must directly own the embedded GGUF model"
@@ -367,8 +445,8 @@ fn native_runtime_ownership_is_confined_to_marked_worker_modules() {
             .any(|constructor| production.contains(constructor))
         {
             assert!(
-                is_marked_worker_runtime(path, source),
-                "native model/session/recognizer/FFI construction escaped the marked worker runtime: {}",
+                is_native_runtime_owner(path),
+                "native model/session/recognizer/FFI construction escaped the exact owner allowlist: {}",
                 path.display()
             );
         }
@@ -628,7 +706,7 @@ fn model_family_logic_is_confined_to_private_adapters_and_catalog_validation() {
     for (path, source) in &sources {
         if path == Path::new("architecture_guard.rs")
             || path.starts_with("stt")
-            || is_marked_worker_runtime(path, source)
+            || is_native_runtime_owner(path)
             || allowed_files
                 .iter()
                 .any(|allowed| path == Path::new(allowed))
