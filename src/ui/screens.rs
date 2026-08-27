@@ -2274,49 +2274,13 @@ fn model_row_description(card: ModelCard<'_>) -> String {
     }
 }
 
-fn collapsed_local_model_facts(card: ModelCard<'_>) -> Option<&'static str> {
-    matches!(
-        card,
-        ModelCard::Local(model) if model.id == "moonshine-tiny-en-int8-onnx"
-    )
-    .then_some("Experimental · CPU only · Final text only")
-}
-
-fn render_collapsed_local_model_facts(ui: &mut egui::Ui, card: ModelCard<'_>, expanded: bool) {
-    let _ = expanded;
-    if let Some(facts) = collapsed_local_model_facts(card) {
-        let colors = ui_palette(ui);
-        ui.horizontal(|ui| {
-            for fact in facts.split(" · ") {
-                let response = Frame::none()
-                    .fill(colors.panel_bg)
-                    .stroke(Stroke::new(1.0, colors.border))
-                    .rounding(Rounding::same(6.0))
-                    .inner_margin(Margin::symmetric(6.0, 2.0))
-                    .show(ui, |ui| {
-                        ui.label(RichText::new(fact).small().color(colors.muted_text))
-                    })
-                    .inner;
-                ui.ctx().accesskit_node_builder(response.id, |builder| {
-                    builder.set_name(fact);
-                });
-            }
-        });
-    }
-}
-
 fn model_card_accessible_description(card: ModelCard<'_>, expanded: bool) -> Option<String> {
     let _ = expanded;
-    let description = match card {
+    match card {
         ModelCard::Local(model) if model.included && model.installed && model.ready => {
             Some("Installed with Scribe; this model cannot be removed.".to_owned())
         }
         _ => model_download_progress_presentation(card).map(|progress| progress.accessible_text),
-    };
-    match (description, collapsed_local_model_facts(card)) {
-        (Some(description), Some(facts)) => Some(format!("{description}. {facts}")),
-        (None, Some(facts)) => Some(facts.to_owned()),
-        (description, None) => description,
     }
 }
 
@@ -4028,7 +3992,6 @@ fn render_unified_model_card(
             let description_width = card_content_width;
             description_fade_rect =
                 render_model_description(ui, &description, description_width, 26.0, expanded);
-            render_collapsed_local_model_facts(ui, card, expanded);
             ui.horizontal(|ui| {
                 rating_meter(
                     ui,
@@ -4092,7 +4055,6 @@ fn render_unified_model_card(
                                 26.0,
                                 expanded,
                             );
-                            render_collapsed_local_model_facts(ui, card, expanded);
                             ui.add_space(4.0);
                             let metadata_group_width = identity_width * 0.60;
                             let metadata_cell_width = identity_width * 0.30;
@@ -9049,21 +9011,32 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            collapsed_local_model_facts(ModelCard::Local(&moonshine)),
-            Some("Experimental · CPU only · Final text only")
-        );
-        assert_eq!(
             model_card_accessible_description(ModelCard::Local(&moonshine), false).as_deref(),
-            Some("Experimental · CPU only · Final text only")
+            None
         );
         assert_eq!(
             model_card_accessible_description(ModelCard::Local(&moonshine), true).as_deref(),
-            Some("Experimental · CPU only · Final text only")
+            None
         );
         let presentation = model_lifecycle_presentation(ModelCard::Local(&moonshine), true);
+        assert_eq!(
+            presentation.action,
+            ScreenAction::InstallModel(moonshine.id.clone())
+        );
         assert_eq!(presentation.label, "Repair");
+        assert_eq!(
+            presentation.accessible_name,
+            "Repair Moonshine Tiny — English"
+        );
         assert_eq!(presentation.visible_status.as_deref(), Some("Needs repair"));
         assert!(presentation.enabled);
+
+        let controls = model_lifecycle_controls(ModelCard::Local(&moonshine), true);
+        let primary = controls.primary.expect("receipt repair stays visible");
+        assert_eq!(primary.label, "Repair");
+        assert_eq!(primary.accessible_name, "Repair Moonshine Tiny — English");
+        assert_eq!(primary.visible_status.as_deref(), Some("Needs repair"));
+        assert!(primary.enabled);
     }
 
     #[test]
