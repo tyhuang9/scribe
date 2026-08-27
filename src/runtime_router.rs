@@ -23,9 +23,9 @@ use thiserror::Error;
 use transcribe_cpp::CancelToken;
 
 use crate::embedded_runtime::{EmbeddedRuntime, TRANSCRIBE_CPP_VERSION};
-use crate::model_catalog::{
-    ArtifactFormat, RuntimeRequirement, RuntimeVersion, runtime_model_manifest,
-};
+#[cfg(test)]
+use crate::model_catalog::ArtifactFormat;
+use crate::model_catalog::{RuntimeRequirement, RuntimeVersion, runtime_model_manifest};
 use crate::prepared_audio::{PREPARED_SAMPLE_RATE, PreparedAudio};
 use crate::runtime_artifact::{RuntimeArtifact, RuntimeModel};
 use crate::transcription::{
