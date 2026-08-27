@@ -4,6 +4,7 @@ Set-StrictMode -Version Latest
 $repositoryRoot = [System.IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $installerPath = Join-Path $repositoryRoot 'installer\scribe.iss'
 $installer = Get-Content -LiteralPath $installerPath -Raw
+$windowsDocumentation = Get-Content -LiteralPath (Join-Path $repositoryRoot 'website\src\content\docs\platforms\windows.md') -Raw
 
 function Assert-Contains {
     param(
@@ -111,8 +112,12 @@ if ($installer -match 'Exec\(UninstallString') {
 Assert-Matches 'SelectedMaintenanceAction = maRemove[\s\S]*RemoveExistingInstallation[\s\S]*WizardForm\.Close[\s\S]*Result := False' 'remove-only termination before installation'
 Assert-Contains 'Scribe removal was cancelled or did not finish' 'removal cancellation check'
 Assert-Contains 'RemovalCompleted := True;' 'successful removal state'
-Assert-Matches 'procedure CancelButtonClick[\s\S]*RemovalCompleted[\s\S]*Confirm := False[\s\S]*Cancel := True' 'clean setup exit after successful removal'
+Assert-Matches 'procedure CancelButtonClick[\s\S]*RemovalCompleted[\s\S]*Confirm := False[\s\S]*Cancel := True' 'terminal no-install routing through Inno cancellation'
 Assert-Contains 'Remove is unavailable because this Scribe installation has no trusted uninstaller.' 'missing or corrupt uninstaller remove rejection'
+if (-not $windowsDocumentation.Contains('Setup reports exit code `2` even when the uninstaller succeeded.', [System.StringComparison]::Ordinal) -or
+    -not $windowsDocumentation.Contains('Verify that Scribe''s uninstall registration is gone', [System.StringComparison]::Ordinal)) {
+    throw 'Windows documentation must define the Remove automation exit contract and registry verification.'
+}
 
 # An Inno uninstaller may hand work to a self-copy after its original process exits.
 Assert-Contains 'UninstallKeyPollIntervalMs = 250;' 'bounded uninstaller polling interval'
