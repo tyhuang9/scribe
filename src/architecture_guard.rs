@@ -44,6 +44,24 @@ fn production_prefix(source: &str) -> &str {
         .unwrap_or(source)
 }
 
+fn production_source_for<'a>(path: &Path, source: &'a str) -> &'a str {
+    if path == Path::new("app.rs") {
+        let marker = "mod layout_tests {";
+        let index = source
+            .find(marker)
+            .expect("app source must retain its trailing layout test module");
+        &source[..index]
+    } else if path == Path::new("runtime_router.rs") {
+        let marker = "mod tests {";
+        let index = source
+            .rfind(marker)
+            .expect("runtime router must retain its trailing test module");
+        &source[..index]
+    } else {
+        production_prefix(source)
+    }
+}
+
 const WORKER_RUNTIME_MARKER: &str = "worker-only native runtime";
 
 fn is_marked_worker_runtime(path: &Path, source: &str) -> bool {
@@ -71,10 +89,45 @@ fn native_runtime_ownership_is_confined_to_marked_worker_modules() {
         "WorkerRole::Vad",
         "fn worker_loop_for_role",
         "RuntimeRouter::new()",
+        "fn load_worker_runtime",
+        "fn execute_worker_batch",
+        "WireRuntimeArtifact::OnnxBundle",
     ] {
         assert!(
             worker.contains(required),
             "unified child runtime must retain {required:?}"
+        );
+    }
+    for obsolete in ["LEGACY_ONNX_WORKER_FLAG", "OnnxSpeechRuntime"] {
+        assert!(
+            !worker.contains(obsolete),
+            "obsolete nested ONNX topology {obsolete:?} must stay removed"
+        );
+    }
+    let role_parser = worker
+        .split("fn worker_role_from_args")
+        .nth(1)
+        .and_then(|tail| tail.split("/// Generic parent-side facade").next())
+        .expect("worker role parser remains delimited before the parent facade");
+    assert!(
+        !role_parser.contains("--onnx-worker"),
+        "the legacy ONNX worker flag must not be accepted"
+    );
+    let router = sources
+        .iter()
+        .find(|(path, _)| path == Path::new("runtime_router.rs"))
+        .map(|(path, source)| production_source_for(path, source))
+        .expect("runtime router source exists");
+    for obsolete in [
+        "OnnxSupervisorControl",
+        "OnnxSupervisorFactory",
+        "production_onnx_supervisor",
+        "OnnxWorkerSupervisor",
+        "HeavyRuntimeOwner::OnnxSpeech",
+    ] {
+        assert!(
+            !router.contains(obsolete),
+            "RuntimeRouter restored obsolete ONNX machinery {obsolete:?}"
         );
     }
 
@@ -121,7 +174,7 @@ fn native_runtime_ownership_is_confined_to_marked_worker_modules() {
         if path == Path::new("architecture_guard.rs") {
             continue;
         }
-        let production = production_prefix(source);
+        let production = production_source_for(path, source);
         if native_constructors
             .iter()
             .any(|constructor| production.contains(constructor))

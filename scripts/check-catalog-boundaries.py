@@ -18,12 +18,53 @@ def fail(message: str) -> None:
     raise SystemExit(1)
 
 
+def rust_item(source: str, signature: str) -> str:
+    """Return one brace-delimited Rust item, ignoring braces inside strings."""
+    start = source.find(signature)
+    if start < 0:
+        fail(f"expected Rust item {signature!r}")
+    brace = source.find("{", start)
+    if brace < 0:
+        fail(f"expected body for Rust item {signature!r}")
+    depth = 0
+    in_string = False
+    escaped = False
+    for index in range(brace, len(source)):
+        character = source[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            continue
+        if character == '"':
+            in_string = True
+        elif character == "{":
+            depth += 1
+        elif character == "}":
+            depth -= 1
+            if depth == 0:
+                return source[start : index + 1]
+    fail(f"unterminated Rust item {signature!r}")
+
+
+def production_source(source: str) -> str:
+    return source.split("\n#[cfg(test)]", maxsplit=1)[0]
+
+
+def without_trailing_test_module(source: str) -> str:
+    matches = list(re.finditer(r"(?m)^#\[cfg\(test\)\]\s*\nmod\s+tests\s*\{", source))
+    return source[: matches[-1].start()] if matches else source
+
+
 def native_pcm_ui_violations(sources: dict[str, str]) -> list[tuple[str, str]]:
     violations = []
     for relative, source in sources.items():
         if not relative.startswith("ui/"):
             continue
-        production = source.split("\n#[cfg(test)]", maxsplit=1)[0]
+        production = production_source(source)
         for pcm_shape in NATIVE_PCM_SHAPES:
             if pcm_shape in production:
                 violations.append((relative, pcm_shape))
@@ -32,7 +73,7 @@ def native_pcm_ui_violations(sources: dict[str, str]) -> list[tuple[str, str]]:
 
 def main() -> None:
     sources = {path: path.read_text(encoding="utf-8") for path in SRC.rglob("*.rs")}
-    router = sources[SRC / "runtime_router.rs"]
+    router = without_trailing_test_module(sources[SRC / "runtime_router.rs"])
 
     pcm_self_test = native_pcm_ui_violations(
         {
@@ -47,19 +88,36 @@ def main() -> None:
     for path, source in sources.items():
         if path.name in {"runtime_router.rs", "architecture_guard.rs"}:
             continue
-        for concrete in ("RuntimeKind", "TranscribeCppRuntime", "OnnxSpeechRuntime"):
+        for concrete in ("RuntimeKind", "TranscribeCppRuntime"):
             if concrete in source:
                 fail(f"{concrete} escaped the private router into {path.relative_to(ROOT)}")
 
     if router.count("struct TranscribeCppRuntime") != 1:
         fail("expected exactly one TranscribeCppRuntime declaration")
-    if router.count("struct OnnxSpeechRuntime") != 1:
-        fail("expected exactly one private router-owned OnnxSpeechRuntime declaration")
+    for obsolete in (
+        "OnnxSpeechRuntime",
+        "OnnxSupervisorControl",
+        "OnnxSupervisorFactory",
+        "production_onnx_supervisor",
+        "HeavyRuntimeOwner::OnnxSpeech",
+    ):
+        if obsolete in router:
+            fail(f"obsolete nested ONNX router machinery {obsolete!r} was restored")
+    if "OnnxWorkerSupervisor" in router:
+        fail("RuntimeRouter may not own or spawn an ONNX worker")
     if ".starts_with(\"whisper_cpp_\")" in router:
         fail("runtime routing still depends on a model-ID prefix")
 
     app = sources[SRC / "app.rs"]
-    app_production = app.split("\n#[cfg(test)]\nmod layout_tests", maxsplit=1)[0]
+    # app.rs contains cfg(test)-gated helpers near the top and production UI
+    # far below them. Stop only at the actual trailing layout-test module so
+    # later production paths are never silently omitted.
+    layout_tests = re.search(
+        r"(?m)^#\[cfg\(test\)\]\s*\nmod\s+layout_tests\s*\{", app
+    )
+    if layout_tests is None:
+        fail("app.rs trailing layout test module is missing")
+    app_production = app[: layout_tests.start()]
     family_terms = (
         "whisper.cpp",
         "faster-whisper",
@@ -143,6 +201,7 @@ def main() -> None:
         "runtime_catalog.rs",
         "runtime_router.rs",
         "settings/schema.rs",
+        "silero_vad_native.rs",
         "transcription.rs",
     }
     expanded_family_terms = family_terms + (
@@ -161,7 +220,7 @@ def main() -> None:
             or relative in family_validation_allowlist
         ):
             continue
-        production = source.split("\n#[cfg(test)]", maxsplit=1)[0].lower()
+        production = production_source(source).lower()
         for term in expanded_family_terms:
             if term in production:
                 fail(
@@ -182,7 +241,7 @@ def main() -> None:
     for path, source in sources.items():
         if path.name == "architecture_guard.rs":
             continue
-        production = source.split("\n#[cfg(test)]", maxsplit=1)[0].lower()
+        production = production_source(source).lower()
         for web_transport in ("tauri::", "webview", "ipc::", "javascript"):
             if web_transport in production:
                 fail(
@@ -190,9 +249,7 @@ def main() -> None:
                     f"{path.relative_to(ROOT)}"
                 )
 
-    bundle_source = sources[SRC / "onnx_model_bundles.rs"].split(
-        "\n#[cfg(test)]", maxsplit=1
-    )[0]
+    bundle_source = production_source(sources[SRC / "onnx_model_bundles.rs"])
     if bundle_source.count("download_pinned_artifact_for_target(") != 1:
         fail("only the explicit ONNX bundle install path may invoke HTTP")
     for protected_name in (
@@ -202,7 +259,7 @@ def main() -> None:
         "models.rs",
         "runtime_catalog.rs",
     ):
-        protected = sources[SRC / protected_name].split("\n#[cfg(test)]", maxsplit=1)[0]
+        protected = production_source(sources[SRC / protected_name])
         for forbidden in (
             "onnx_model_bundles",
             "OnnxBundleReceipt",
@@ -222,8 +279,32 @@ def main() -> None:
         fail(f"native PCM shape {pcm_shape!r} escaped into src/{relative}")
 
     text_output = sources[SRC / "text_output.rs"]
-    if "tentative" in text_output.split("\n#[cfg(test)]", maxsplit=1)[0].lower():
+    if "tentative" in production_source(text_output).lower():
         fail("tentative transcript text has a path into the output module")
+
+    worker = sources[SRC / "onnx_worker.rs"]
+    for required in (
+        'INFERENCE_WORKER_FLAG: &str = "--scribe-inference-worker"',
+        'VAD_WORKER_FLAG: &str = "--scribe-vad-worker"',
+        "fn load_worker_runtime",
+        "fn execute_worker_batch",
+        "WireRuntimeArtifact::OnnxBundle",
+        "OfflineRecognizer::create(",
+        "OnlineRecognizer::create(",
+    ):
+        if required not in worker:
+            fail(f"direct child-owned ONNX topology lost {required!r}")
+    worker_role = rust_item(worker, "fn worker_role_from_args")
+    if "LEGACY_ONNX_WORKER_FLAG" in worker or "--onnx-worker" in worker_role:
+        fail("legacy --onnx-worker role was restored")
+    for signature in ("fn load_worker_runtime", "fn execute_worker_batch"):
+        item = rust_item(worker, signature)
+        for nested_spawn in ("Command::new", "OnnxWorkerSupervisor", "OsWorkerLauncher"):
+            if nested_spawn in item:
+                fail(
+                    f"normalized ONNX path {signature} can spawn nested worker via "
+                    f"{nested_spawn!r}"
+                )
 
     catalog = sources[SRC / "model_catalog.rs"]
     descriptor = re.search(

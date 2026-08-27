@@ -1704,10 +1704,6 @@ pub(crate) struct OnnxWorkerSupervisor {
 }
 
 impl OnnxWorkerSupervisor {
-    pub(crate) fn spawn() -> Result<Self> {
-        Self::with_launcher(Arc::new(OsWorkerLauncher::inference()))
-    }
-
     fn with_launcher(launcher: Arc<dyn WorkerLauncher>) -> Result<Self> {
         Self::with_launcher_and_deadlines(launcher, SupervisorDeadlines::default())
     }
@@ -6206,8 +6202,8 @@ mod tests {
             Some(WorkerRole::Inference)
         );
         assert_eq!(
-            worker_role_from_args(&[OsString::from(LEGACY_ONNX_WORKER_FLAG)]).unwrap(),
-            Some(WorkerRole::Inference)
+            worker_role_from_args(&[OsString::from("--onnx-worker")]).unwrap(),
+            None
         );
         assert_eq!(
             worker_role_from_args(&[OsString::from(VAD_WORKER_FLAG)]).unwrap(),
@@ -6588,6 +6584,67 @@ mod tests {
         }
         assert!(matches!(responses[6], Control::Ok));
         assert_eq!(recognizers.snapshot().transcriptions, 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn one_inference_child_routes_gguf_then_onnx_without_nested_worker() {
+        let root = test_root("unified-gguf-then-onnx");
+        let missing_gguf = root.join("missing.gguf");
+        let onnx = WireRuntimeArtifact::OnnxBundle(spec_with_roles(
+            &root,
+            OnnxModelFamily::NemoCtc,
+            &[OnnxFileRole::Model, OnnxFileRole::Tokens],
+        ));
+        let mut input = Vec::new();
+        append_control(&mut input, 0, 0, Control::Hello);
+        append_control(
+            &mut input,
+            1,
+            1,
+            Control::LoadRuntime {
+                artifact: WireRuntimeArtifact::Gguf(WireRuntimeModel {
+                    id: "missing-gguf".to_owned(),
+                    path: missing_gguf,
+                    format: WireArtifactFormat::Gguf,
+                    package_root: None,
+                    expected_size_bytes: 1,
+                    expected_sha256: "0".repeat(64),
+                }),
+                preference: AccelerationPreference::Cpu,
+            },
+        );
+        append_control(
+            &mut input,
+            2,
+            2,
+            Control::BeginBatch {
+                artifact: onnx,
+                preference: AccelerationPreference::Cpu,
+                options: TranscriptionOptions::default(),
+                source_sample_rate: PREPARED_SAMPLE_RATE,
+                source_channels: 1,
+                source_frames: 1,
+                declared_samples: 1,
+            },
+        );
+        append_control(&mut input, 2, 3, Control::AudioChunk);
+        append_pcm(&mut input, 2, 3, &[0.1]);
+        append_control(&mut input, 2, 4, Control::EndBatch);
+        append_control(&mut input, 0, 5, Control::Shutdown);
+
+        let factory = FakeRecognizerFactory::new();
+        let responses = run_framed_fake_worker(&factory, input);
+        assert!(matches!(responses[0].2, Control::Ready));
+        assert!(matches!(
+            responses[1].2,
+            Control::RuntimeFailed { .. } | Control::Error { .. }
+        ));
+        assert!(matches!(responses[2].2, Control::Ok));
+        assert!(matches!(responses[3].2, Control::Ok));
+        assert!(matches!(responses[4].2, Control::RuntimeTranscript { .. }));
+        assert!(matches!(responses[5].2, Control::Ok));
+        assert_eq!(factory.snapshot().recognizers_created, 1);
         std::fs::remove_dir_all(root).unwrap();
     }
 
