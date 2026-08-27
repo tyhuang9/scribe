@@ -1620,6 +1620,20 @@ impl TranscriptionService {
         model_id: &ModelId,
         model_path: Option<PathBuf>,
     ) -> Result<ModelLoadOutcome> {
+        if let Some(root) = config::installed_onnx_bundle_root(&self.config, model_id) {
+            if model_path.as_ref().is_some_and(|path| path != &root) {
+                return Err(anyhow!(
+                    "selected ONNX bundle path is not its canonical receipt root"
+                ));
+            }
+            let execution = self.preload_onnx_bundle_from_receipt(&root)?;
+            return Ok(ModelLoadOutcome {
+                model_id: model_id.clone(),
+                resolved_acceleration: execution.diagnostics.resolved_acceleration,
+                model_load_duration_ms: execution.diagnostics.model_load_duration_ms,
+                warm_model_reused: execution.diagnostics.warm_reused,
+            });
+        }
         let model = self.resolve_model(model_id, model_path)?;
         let runtime_model = self.resolve_runtime_model(model)?;
         let execution = self
@@ -1640,6 +1654,14 @@ impl TranscriptionService {
     /// Checks the selected primary runtime package and model without allowing
     /// UI or coordinator code to name the concrete handler.
     pub fn health_check(&self, model_id: &ModelId, model_path: Option<PathBuf>) -> Result<()> {
+        if let Some(root) = config::installed_onnx_bundle_root(&self.config, model_id) {
+            if model_path.as_ref().is_some_and(|path| path != &root) {
+                return Err(anyhow!(
+                    "selected ONNX bundle path is not its canonical receipt root"
+                ));
+            }
+            return self.health_check_runtime_artifact(self.onnx_artifact_from_receipt(&root)?);
+        }
         let model = self.resolve_model(model_id, model_path)?;
         let runtime_model = self.resolve_runtime_model(model)?;
         self.worker
@@ -2173,6 +2195,30 @@ impl TranscriptionService {
             ));
         }
         let model = self.resolve_model(&request.model_id, request.model_path.clone())?;
+        if let Some(root) = config::installed_onnx_bundle_root(&self.config, &request.model_id) {
+            if request
+                .model_path
+                .as_ref()
+                .is_some_and(|path| path != &root)
+            {
+                return Err(anyhow!(
+                    "selected ONNX bundle path is not its canonical receipt root"
+                ));
+            }
+            validate_default_options(&request.options)?;
+            let artifact = self.onnx_artifact_from_receipt(&root)?;
+            let execution = self
+                .worker
+                .transcribe(
+                    artifact,
+                    self.config.performance.acceleration_preference,
+                    Arc::clone(&request.audio),
+                    request.options.clone(),
+                    ticket.native_generation,
+                )
+                .map_err(|error| anyhow!(error))?;
+            return Ok(map_native_execution(request, model, execution));
+        }
         if RuntimeRouter::handles_model_id(&request.model_id)
             || config::remote_gguf_artifact(&self.config, request.model_id.as_str()).is_some()
             || config::imported_gguf_artifact(&self.config, request.model_id.as_str()).is_some()
