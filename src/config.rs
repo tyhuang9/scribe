@@ -369,14 +369,7 @@ pub(crate) fn installed_onnx_bundle_root(
     config: &AppConfig,
     model_id: &ModelId,
 ) -> Option<PathBuf> {
-    let crate::model_catalog::NormalizedInstallArtifact::ReceiptBackedBundle { bundle_id, .. } =
-        crate::model_catalog::normalized_install_artifact(model_id)?
-    else {
-        return None;
-    };
-    if bundle_id != model_id.as_str() || bundle_id != "moonshine-tiny-en-int8-onnx" {
-        return None;
-    }
+    let bundle_id = crate::model_catalog::normalized_receipt_backed_bundle_id(model_id)?;
     let root = onnx_bundle_target_root(config, model_id)?;
     crate::onnx_model_bundles::current_executable_receipt_at(&root)
         .ok()

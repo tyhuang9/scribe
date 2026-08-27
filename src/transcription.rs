@@ -465,6 +465,15 @@ pub(crate) struct InstallationBinding {
     pub(crate) installed_package_root: Option<PathBuf>,
 }
 
+/// The normalized install plan derived from the trusted catalog. These plans
+/// are artifact-only: worker readiness follows verification and activation,
+/// never a compatibility-provider runtime request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum InstallPlan {
+    PinnedGguf,
+    ReceiptBackedOnnx,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RuntimeRecovery {
     pub(crate) managed_runtime_id: String,
@@ -1502,27 +1511,23 @@ impl TranscriptionService {
             .ok_or_else(|| anyhow!("unknown normalized transcription model: {model_id}"))
     }
 
-    pub(crate) fn installation_binding(&self, model_id: &ModelId) -> Result<InstallationBinding> {
-        if model_uses_embedded_gguf(model_id)
-            || config::remote_gguf_artifact(&self.config, model_id.as_str()).is_some()
-            || config::imported_gguf_artifact(&self.config, model_id.as_str()).is_some()
-        {
-            return Ok(InstallationBinding {
-                // This stable internal token lets the existing operation
-                // machinery correlate the request without representing a
-                // downloadable or executable runtime.
-                managed_runtime_id: "embedded-transcribe-cpp".to_owned(),
-                installed_package_root: None,
-            });
+    pub(crate) fn install_plan(&self, model_id: &ModelId) -> Option<InstallPlan> {
+        Self::install_plan_for_config(&self.config, model_id)
+    }
+
+    pub(crate) fn install_plan_for_config(
+        _config: &AppConfig,
+        model_id: &ModelId,
+    ) -> Option<InstallPlan> {
+        match crate::model_catalog::normalized_install_artifact(model_id) {
+            Some(crate::model_catalog::NormalizedInstallArtifact::SingleGguf(_)) => {
+                Some(InstallPlan::PinnedGguf)
+            }
+            Some(crate::model_catalog::NormalizedInstallArtifact::ReceiptBackedBundle {
+                ..
+            }) => Some(InstallPlan::ReceiptBackedOnnx),
+            None => None,
         }
-        let runtime_id = RuntimeRouter::managed_runtime_id_for(model_id)
-            .ok_or_else(|| anyhow!("model {model_id} has no installable native runtime"))?;
-        let installed_package_root = configured_managed_runtime_root(&self.config, runtime_id)?
-            .or_else(|| primary_runtime_package_root(&self.config));
-        Ok(InstallationBinding {
-            managed_runtime_id: runtime_id.to_owned(),
-            installed_package_root,
-        })
     }
 
     /// Returns the deterministic catalog target without trusting persisted
@@ -1532,9 +1537,9 @@ impl TranscriptionService {
         &self,
         model_id: &ModelId,
     ) -> Result<InstallationBinding> {
-        if model_uses_embedded_gguf(model_id) {
+        if self.install_plan(model_id).is_some() {
             return Err(anyhow!(
-                "embedded GGUF models do not have a recoverable runtime package"
+                "artifact-only models do not have a recoverable runtime package"
             ));
         }
         let runtime_id = RuntimeRouter::managed_runtime_id_for(model_id)
@@ -4547,7 +4552,7 @@ mod tests {
     }
 
     #[test]
-    fn imported_gguf_uses_the_embedded_installation_binding() {
+    fn imported_gguf_is_not_a_normalized_install_plan() {
         let root = std::env::temp_dir().join(format!(
             "scribe-imported-gguf-service-{}",
             std::process::id()
@@ -4572,14 +4577,23 @@ mod tests {
         config::normalize_config(&mut config);
         let service = TranscriptionService::new(config);
 
-        assert_eq!(
-            service
-                .installation_binding(&ModelId::new(id))
-                .unwrap()
-                .managed_runtime_id,
-            "embedded-transcribe-cpp"
-        );
+        assert_eq!(service.install_plan(&ModelId::new(id)), None);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn normalized_catalog_install_plans_never_require_a_legacy_runtime() {
+        let service = TranscriptionService::new(AppConfig::default());
+
+        assert_eq!(
+            service.install_plan(&ModelId::new("whisper_cpp_tiny_en")),
+            Some(InstallPlan::PinnedGguf)
+        );
+        assert_eq!(
+            service.install_plan(&ModelId::new("moonshine-tiny-en-int8-onnx")),
+            Some(InstallPlan::ReceiptBackedOnnx)
+        );
+        assert_eq!(service.install_plan(&ModelId::new("moonshine")), None);
     }
 
     #[test]

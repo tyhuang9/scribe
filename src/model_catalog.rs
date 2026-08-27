@@ -600,6 +600,19 @@ pub(crate) fn normalized_install_artifact(id: &ModelId) -> Option<NormalizedInst
         })
 }
 
+/// Returns a catalog-authorized receipt-backed bundle ID only when the
+/// descriptor's typed receipt binding is self-consistent.
+pub(crate) fn normalized_receipt_backed_bundle_id(id: &ModelId) -> Option<&'static str> {
+    match normalized_install_artifact(id)? {
+        NormalizedInstallArtifact::ReceiptBackedBundle { bundle_id, .. }
+            if bundle_id == id.as_str() =>
+        {
+            Some(bundle_id)
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn normalized_model_storage_estimate(id: &ModelId) -> Option<&'static str> {
     assert_catalog_valid();
     MODELS
@@ -1482,6 +1495,19 @@ mod tests {
                 })
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn receipt_backed_bundle_authorization_comes_from_catalog_metadata() {
+        let id = ModelId::new("moonshine-tiny-en-int8-onnx");
+        assert_eq!(
+            normalized_receipt_backed_bundle_id(&id),
+            Some("moonshine-tiny-en-int8-onnx")
+        );
+        assert_eq!(
+            normalized_receipt_backed_bundle_id(&ModelId::new("moonshine")),
+            None
         );
     }
 

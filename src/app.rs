@@ -2277,14 +2277,14 @@ fn run_verified_install_finalizer(
             "Installation cancelled while waiting for verification. The verified partial was retained for Resume.",
         ));
     }
-    let (runtime_id, existing_runtime_root) = if model_uses_embedded_runtime {
-        ("embedded-transcribe-cpp".to_owned(), None)
-    } else {
-        let binding = service
-            .installation_binding(&model_id)
-            .map_err(|error| InstallJobFailure::normal(error.to_string()))?;
-        (binding.managed_runtime_id, binding.installed_package_root)
-    };
+    if !model_uses_embedded_runtime && service.install_plan(&model_id).is_none() {
+        return Err(InstallJobFailure::normal(format!(
+            "model {model_id} has no verified normalized install plan"
+        )));
+    }
+    let (runtime_id, existing_runtime_root) = ("artifact-only".to_owned(), None);
+    let model_uses_embedded_runtime =
+        model_uses_embedded_runtime || service.install_plan(&model_id).is_some();
     service.unload_runtime().map_err(|error| {
         InstallJobFailure::normal(format!(
             "Could not release the active speech artifact before install: {error}"
@@ -2938,8 +2938,9 @@ fn model_download_uses_runtime(
         matches!(
             model_downloads.get(&model.id),
             Some(ModelInstallStatus::Downloading { .. })
-        ) && compatibility_bridge::provider_for_model(&model)
-            .is_some_and(|provider| provider.id() == runtime_id)
+        ) && !uses_artifact_only_install(config, &model)
+            && compatibility_bridge::provider_for_model(&model)
+                .is_some_and(|provider| provider.id() == runtime_id)
     })
 }
 
@@ -2955,6 +2956,15 @@ fn apply_runtime_uninstall_result(
 }
 
 fn runtime_action_state_inner(config: &AppConfig, model: &SttModelInfo) -> RuntimeActionState {
+    if uses_artifact_only_install(config, model) {
+        return RuntimeActionState {
+            kind: RuntimeActionKind::Install,
+            enabled: false,
+            disabled_tooltip: Some(
+                "This verified model artifact does not use a managed runtime package.".to_owned(),
+            ),
+        };
+    }
     let Some(provider) = compatibility_bridge::provider_for_model(model) else {
         return RuntimeActionState {
             kind: RuntimeActionKind::Install,
@@ -3022,6 +3032,12 @@ fn runtime_action_state_inner(config: &AppConfig, model: &SttModelInfo) -> Runti
     )
 }
 
+fn uses_artifact_only_install(config: &AppConfig, model: &SttModelInfo) -> bool {
+    TranscriptionService::install_plan_for_config(config, &ModelId::new(&model.id)).is_some()
+        || config::remote_gguf_artifact(config, &model.id).is_some()
+        || config::imported_gguf_artifact(config, &model.id).is_some()
+}
+
 fn runtime_action_state_for_source(
     config: &AppConfig,
     _model: &SttModelInfo,
@@ -3062,6 +3078,12 @@ fn runtime_action_state_for_source(
 fn supports_managed_install(model: &SttModelInfo) -> bool {
     if model.download_model.is_none() {
         return false;
+    }
+    if matches!(
+        crate::model_catalog::normalized_install_artifact(&ModelId::new(&model.id)),
+        Some(_)
+    ) {
+        return true;
     }
     if let Some(capability) = verified_installation_capability(&ModelId::new(&model.id)) {
         return matches!(capability, VerifiedInstallationCapability::Available { .. });
@@ -3912,25 +3934,7 @@ impl LocalTranscriberApp {
         {
             return;
         }
-        let binding = match self.transcription_service.installation_binding(&model_id) {
-            Ok(binding) => binding,
-            Err(error) => {
-                let message = format!(
-                    "The managed runtime settings record is unsafe or unavailable; repair or remove it before transcription: {error}"
-                );
-                self.artifact_recovery_error = Some(message.clone());
-                self.status = TranscriptionStatus::Error;
-                self.status_message = message;
-                return;
-            }
-        };
-        if !embedded_gguf
-            && !self
-                .config
-                .general
-                .managed_runtimes
-                .contains_key(&binding.managed_runtime_id)
-        {
+        if self.transcription_service.install_plan(&model_id).is_none() && !embedded_gguf {
             return;
         }
         if model.local_path.as_ref().is_none_or(|path| !path.is_file()) {
@@ -8792,11 +8796,7 @@ impl LocalTranscriberApp {
         if self.reinstate_verified_bundled_model(model) {
             return;
         }
-        if self
-            .transcription_service
-            .installation_binding(&ModelId::new(&model.id))
-            .is_ok()
-        {
+        if uses_artifact_only_install(&self.config, model) {
             self.start_model_download_only(model);
             return;
         }
@@ -8978,10 +8978,10 @@ impl LocalTranscriberApp {
             return;
         }
 
-        if let Err(error) = self.transcription_service.installation_binding(&model_id) {
+        if self.transcription_service.install_plan(&model_id).is_none() {
             self.fail_model_install(
                 &model.id,
-                format!("This model is not eligible for verified installation: {error}"),
+                "This model is not eligible for verified installation.".to_owned(),
             );
             return;
         }
@@ -9131,13 +9131,15 @@ impl LocalTranscriberApp {
             let runtime_admission = self
                 .transcription_service
                 .with_config(self.config.clone())
-                .installation_binding(&ModelId::new(&waiting_model_id))
-                .map_err(|error| InstallError::Failed(error.to_string()))
-                .and_then(|binding| {
-                    managed_downloads::primary_runtime_preparation_admission(
-                        &config::runtime_storage_dir().join(binding.managed_runtime_id),
+                .install_plan(&ModelId::new(&waiting_model_id))
+                .ok_or_else(|| {
+                    InstallError::Failed(
+                        "legacy install unexpectedly requested runtime preparation".to_owned(),
                     )
-                });
+                })
+                .and(Err(InstallError::Failed(
+                    "artifact-only install unexpectedly requested runtime preparation".to_owned(),
+                )));
             let runtime_admission = match runtime_admission {
                 Ok(admission) => admission,
                 Err(error) => {
@@ -9725,11 +9727,7 @@ impl LocalTranscriberApp {
 
     fn request_runtime_install(&mut self, model: &SttModelInfo, intent: RuntimeJobIntent) {
         self.remote_catalog.invalidate_local_models();
-        if self
-            .transcription_service
-            .installation_binding(&ModelId::new(&model.id))
-            .is_ok()
-        {
+        if uses_artifact_only_install(&self.config, model) {
             match intent {
                 RuntimeJobIntent::DownloadModel(_) => self.start_model_download_only(model),
                 RuntimeJobIntent::RepairModel(_) | RuntimeJobIntent::Maintenance
@@ -9893,7 +9891,7 @@ impl LocalTranscriberApp {
         }
         if let Ok(binding) = self
             .transcription_service
-            .installation_binding(&ModelId::new(&model.id))
+            .recovery_installation_binding(&ModelId::new(&model.id))
         {
             let target = config::runtime_storage_dir().join(&binding.managed_runtime_id);
             let owns_target = self
@@ -26576,6 +26574,39 @@ mod layout_tests {
         assert_eq!(
             runtime_status_for_model(&AppConfig::default(), &model),
             ModelRuntimeStatus::Ready
+        );
+    }
+
+    #[test]
+    fn normalized_moonshine_install_is_artifact_only_and_never_offers_runtime_actions() {
+        let moonshine = config::configured_models(&AppConfig::default())
+            .into_iter()
+            .find(|model| model.id == "moonshine-tiny-en-int8-onnx")
+            .unwrap();
+
+        assert!(supports_managed_install(&moonshine));
+        assert!(!model_download_uses_runtime(
+            &AppConfig::default(),
+            &HashMap::from([(
+                moonshine.id.clone(),
+                ModelInstallStatus::Downloading {
+                    downloaded_bytes: 1,
+                    total_bytes: Some(44_256_550),
+                    bytes_per_second: None,
+                },
+            )]),
+            "moonshine",
+        ));
+        assert_eq!(
+            runtime_action_state(&AppConfig::default(), &moonshine),
+            RuntimeActionState {
+                kind: RuntimeActionKind::Install,
+                enabled: false,
+                disabled_tooltip: Some(
+                    "This verified model artifact does not use a managed runtime package."
+                        .to_owned(),
+                ),
+            }
         );
     }
 
