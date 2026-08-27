@@ -1,6 +1,6 @@
 use eframe::egui::{self, Color32, Ui};
 
-use crate::branding::{DEEP_INK, ICE_MIST, LIVE_CORAL, SCRIBE_TEAL, SOFT_AQUA};
+use crate::branding::{DEEP_INK, ICE_MIST, LIVE_CORAL, SCRIBE_TEAL, SOFT_AQUA, WARM_SAND};
 
 // Raw dark application tokens from the approved Scribe identity board. These
 // deliberately live apart from `branding`'s light identity constants: the
@@ -140,7 +140,7 @@ impl ThemePalette {
             chip_success_fill: Color32::from_rgb(240, 253, 244),
             chip_success_border: Color32::from_rgb(187, 247, 208),
             chip_warning_text: Color32::from_rgb(146, 64, 14),
-            chip_warning_fill: Color32::from_rgb(254, 252, 232),
+            chip_warning_fill: WARM_SAND,
             chip_warning_border: Color32::from_rgb(254, 240, 138),
             chip_error_text: Color32::from_rgb(185, 28, 28),
             chip_error_fill: Color32::from_rgb(254, 242, 242),
@@ -340,6 +340,8 @@ mod tests {
         assert!(contrast_ratio(palette.warning, palette.card_bg) >= 4.5);
         assert!(contrast_ratio(palette.error_text, palette.error_pale) >= 4.5);
         assert!(contrast_ratio(palette.danger_button_text, palette.error_fill) >= 4.5);
+        assert_eq!(palette.chip_warning_fill, WARM_SAND);
+        assert!(contrast_ratio(palette.chip_warning_text, palette.chip_warning_fill) >= 4.5);
         assert!(contrast_ratio(palette.tertiary_text, palette.card_bg) >= 4.5);
         assert!(contrast_ratio(palette.tertiary_text, palette.content_bg) >= 4.5);
     }
