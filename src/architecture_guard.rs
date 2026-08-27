@@ -272,7 +272,13 @@ fn native_runtime_ownership_is_confined_to_marked_worker_modules() {
             "unified child runtime must retain {required:?}"
         );
     }
-    for obsolete in ["LEGACY_ONNX_WORKER_FLAG", "OnnxSpeechRuntime"] {
+    for obsolete in [
+        "LEGACY_ONNX_WORKER_FLAG",
+        "OnnxSpeechRuntime",
+        "OnnxWorkerSupervisor",
+        "Control::Load {",
+        "Control::Transcribe",
+    ] {
         assert!(
             !worker.contains(obsolete),
             "obsolete nested ONNX topology {obsolete:?} must stay removed"
@@ -303,7 +309,7 @@ fn native_runtime_ownership_is_confined_to_marked_worker_modules() {
         "OnnxSupervisorControl",
         "OnnxSupervisorFactory",
         "production_onnx_supervisor",
-        "OnnxWorkerSupervisor",
+        "ProcessWorkerSupervisor",
         "HeavyRuntimeOwner::OnnxSpeech",
     ] {
         assert!(
@@ -392,7 +398,7 @@ fn worker_roles_use_private_pipes_and_protocol_only_stdout() {
         .expect("worker entrypoint exists");
 
     assert!(worker.contains("PROTOCOL_MAGIC: [u8; 4] = *b\"SCIF\""));
-    assert!(worker.contains("PROTOCOL_VERSION: u8 = 3"));
+    assert!(worker.contains("PROTOCOL_VERSION: u8 = 4"));
     assert!(worker.contains("Stdio::piped()"));
     assert!(worker.contains("std::io::stdout().lock()"));
     assert!(worker.contains("stderr(Stdio::inherit())"));
@@ -429,6 +435,73 @@ fn worker_roles_use_private_pipes_and_protocol_only_stdout() {
             && worker.contains("WorkerRole::Vad => VAD_WORKER_FLAG"),
         "STT and VAD must launch as distinct worker roles"
     );
+}
+
+#[test]
+fn retired_download_helpers_and_private_descriptor_fields_stay_removed() {
+    let sources = rust_sources();
+    let downloads = sources
+        .iter()
+        .find(|(path, _)| path == Path::new("managed_downloads.rs"))
+        .map(|(_, source)| production_source(source))
+        .expect("managed download source exists");
+    for retired in [
+        "download_faster_whisper_model",
+        "download_vosk_model",
+        "download_sherpa_model",
+        "download_runner_model",
+    ] {
+        assert!(
+            !downloads.contains(retired),
+            "retired download helper {retired:?} was restored"
+        );
+    }
+
+    let catalog = sources
+        .iter()
+        .find(|(path, _)| path == Path::new("model_catalog.rs"))
+        .map(|(_, source)| production_source(source))
+        .expect("model catalog source exists");
+    let declaration = catalog
+        .find("pub struct ModelDescriptor")
+        .expect("ModelDescriptor declaration exists");
+    let open = catalog[declaration..]
+        .find('{')
+        .map(|offset| declaration + offset)
+        .expect("ModelDescriptor body opens");
+    let mask = rust_code_mask(&catalog);
+    let mut depth = 1_i32;
+    let mut close = open + 1;
+    while close < catalog.len() && depth > 0 {
+        if mask[close] {
+            match catalog.as_bytes()[close] {
+                b'{' => depth += 1,
+                b'}' => depth -= 1,
+                _ => {}
+            }
+        }
+        close += 1;
+    }
+    assert_eq!(depth, 0, "ModelDescriptor body closes");
+    let body = &catalog[open + 1..close - 1];
+    for private in [
+        "backend",
+        "runtime",
+        "architecture",
+        "artifact",
+        "revision",
+        "sha256",
+        "filename",
+    ] {
+        assert!(
+            !body.lines().any(|line| {
+                line.trim_start()
+                    .strip_prefix("pub ")
+                    .is_some_and(|field| field.starts_with(&format!("{private}:")))
+            }),
+            "ModelDescriptor leaks private field {private:?}"
+        );
+    }
 }
 
 #[test]

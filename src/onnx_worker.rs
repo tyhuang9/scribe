@@ -47,7 +47,7 @@ use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt;
 
 pub(crate) const PROTOCOL_MAGIC: [u8; 4] = *b"SCIF";
-pub(crate) const PROTOCOL_VERSION: u8 = 3;
+pub(crate) const PROTOCOL_VERSION: u8 = 4;
 pub(crate) const INFERENCE_WORKER_FLAG: &str = "--scribe-inference-worker";
 pub(crate) const VAD_WORKER_FLAG: &str = "--scribe-vad-worker";
 const PARENT_LIVENESS_ENV: &str = "SCRIBE_PRIVATE_PARENT_LIVENESS";
@@ -203,11 +203,6 @@ impl OnnxModelSpec {
             num_threads: self.num_threads,
         })
     }
-
-    #[cfg(test)]
-    fn fingerprint(&self) -> Result<String> {
-        self.validated()?.fingerprint()
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -220,10 +215,6 @@ struct ValidatedOnnxModel {
 }
 
 impl ValidatedOnnxModel {
-    fn fingerprint(&self) -> Result<String> {
-        Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(self)?)))
-    }
-
     fn path(&self, role: OnnxFileRole) -> Result<String> {
         let path = self
             .files
@@ -409,10 +400,10 @@ fn read_frame(reader: &mut impl Read) -> Result<Frame> {
     let mut header = [0_u8; HEADER_LEN];
     reader.read_exact(&mut header)?;
     if header[..4] != PROTOCOL_MAGIC {
-        bail!("invalid ONNX worker frame magic");
+        bail!("invalid process worker frame magic");
     }
     if header[4] != PROTOCOL_VERSION {
-        bail!("unsupported ONNX worker protocol version {}", header[4]);
+        bail!("unsupported process worker protocol version {}", header[4]);
     }
     let kind = FrameKind::try_from(header[5])?;
     let body_len = u32::from_le_bytes(header[6..10].try_into().unwrap()) as usize;
@@ -421,7 +412,7 @@ fn read_frame(reader: &mut impl Read) -> Result<Frame> {
         FrameKind::Pcm => MAX_PCM_FRAME_BYTES,
     };
     if body_len > limit {
-        bail!("ONNX worker frame body exceeds {limit}-byte limit");
+        bail!("process worker frame body exceeds {limit}-byte limit");
     }
     let mut body = vec![0; body_len];
     reader.read_exact(&mut body)?;
@@ -537,9 +528,6 @@ fn reserve_batch_samples(declared_samples: usize) -> Result<Vec<f32>> {
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 enum Control {
     Hello,
-    Load {
-        model: OnnxModelSpec,
-    },
     LoadRuntime {
         artifact: WireRuntimeArtifact,
         preference: AccelerationPreference,
@@ -554,7 +542,6 @@ enum Control {
         declared_samples: usize,
     },
     EndBatch,
-    Transcribe,
     StartStream,
     AudioChunk,
     EndStream,
@@ -603,11 +590,9 @@ impl Control {
         matches!(
             self,
             Self::Hello
-                | Self::Load { .. }
                 | Self::LoadRuntime { .. }
                 | Self::BeginBatch { .. }
                 | Self::EndBatch
-                | Self::Transcribe
                 | Self::StartStream
                 | Self::AudioChunk
                 | Self::EndStream
@@ -1027,7 +1012,7 @@ impl WireRuntimeError {
 
     fn into_runtime_for_generation(
         self,
-        transport: &OnnxWorkerSupervisor,
+        transport: &ProcessWorkerSupervisor,
         generation: u64,
     ) -> RuntimeError {
         if self.fatal {
@@ -1154,11 +1139,9 @@ fn control_allowed_for_role(control: &Control, role: WorkerRole) -> bool {
         WorkerRole::Inference => matches!(
             control,
             Control::Hello
-                | Control::Load { .. }
                 | Control::LoadRuntime { .. }
                 | Control::BeginBatch { .. }
                 | Control::EndBatch
-                | Control::Transcribe
                 | Control::StartStream
                 | Control::AudioChunk
                 | Control::EndStream
@@ -1236,11 +1219,11 @@ impl WorkerLauncher for OsWorkerLauncher {
         let stdin = child
             .stdin
             .take()
-            .ok_or_else(|| anyhow!("ONNX worker stdin unavailable"))?;
+            .ok_or_else(|| anyhow!("process worker stdin unavailable"))?;
         let stdout = child
             .stdout
             .take()
-            .ok_or_else(|| anyhow!("ONNX worker stdout unavailable"))?;
+            .ok_or_else(|| anyhow!("process worker stdout unavailable"))?;
         Ok(SpawnedWorker {
             stdin: Box::new(stdin),
             stdout: Box::new(stdout),
@@ -1573,7 +1556,7 @@ impl WorkerProcess for OsWorkerProcess {
         Ok(self
             .child
             .lock()
-            .map_err(|_| anyhow!("ONNX worker process lock was poisoned"))?
+            .map_err(|_| anyhow!("process worker process lock was poisoned"))?
             .try_wait()?
             .is_none())
     }
@@ -1586,7 +1569,7 @@ impl WorkerProcess for OsWorkerProcess {
         let mut child = self
             .child
             .lock()
-            .map_err(|_| anyhow!("ONNX worker process lock was poisoned"))?;
+            .map_err(|_| anyhow!("process worker process lock was poisoned"))?;
         #[cfg(unix)]
         if child.try_wait()?.is_none() {
             let process_group = -(child.id() as i32);
@@ -1617,7 +1600,7 @@ impl WorkerProcess for OsWorkerProcess {
         let _ = self
             .child
             .lock()
-            .map_err(|_| anyhow!("ONNX worker process lock was poisoned"))?
+            .map_err(|_| anyhow!("process worker process lock was poisoned"))?
             .wait()?;
         Ok(())
     }
@@ -1668,11 +1651,11 @@ struct SupervisorInner {
 /// own correlated reply channel. A dedicated reader owns each generation's
 /// stdout, and stdin is locked only while a complete logical request is emitted.
 #[derive(Clone)]
-pub(crate) struct OnnxWorkerSupervisor {
+pub(crate) struct ProcessWorkerSupervisor {
     inner: Arc<SupervisorInner>,
 }
 
-impl OnnxWorkerSupervisor {
+impl ProcessWorkerSupervisor {
     #[cfg(test)]
     fn with_launcher(launcher: Arc<dyn WorkerLauncher>) -> Result<Self> {
         Self::with_launcher_and_deadlines(launcher, SupervisorDeadlines::default())
@@ -1704,100 +1687,13 @@ impl OnnxWorkerSupervisor {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn load(
-        &self,
-        session_id: u64,
-        request_id: u64,
-        model: OnnxModelSpec,
-    ) -> Result<bool> {
-        let identity = model.fingerprint()?;
-        let generation = self.ensure_generation()?;
-        let reused = self
-            .inner
-            .state
-            .lock()
-            .map_err(|_| anyhow!("ONNX supervisor state lock was poisoned"))?
-            .active_model
-            .as_ref()
-            .is_some_and(|(loaded_generation, loaded_identity)| {
-                *loaded_generation == generation && loaded_identity == &identity
-            });
-        if reused {
-            return Ok(true);
-        }
-        let load = control_frame(session_id, request_id, &Control::Load { model })?;
-        if let Err(error) = self
-            .active_round_trip_with_timeout(
-                generation,
-                session_id,
-                request_id,
-                &[load],
-                self.inner.deadlines.load,
-            )
-            .and_then(expect_ok)
-        {
-            self.invalidate_generation(generation, "ONNX model load failed", true)?;
-            return Err(error);
-        }
-        let mut state = self
-            .inner
-            .state
-            .lock()
-            .map_err(|_| anyhow!("ONNX supervisor state lock was poisoned"))?;
-        if state
-            .current
-            .as_ref()
-            .is_some_and(|current| current.generation == generation)
-        {
-            state.active_model = Some((generation, identity));
-        }
-        Ok(false)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn transcribe(
-        &self,
-        session_id: u64,
-        request_id: u64,
-        samples: &[f32],
-    ) -> Result<String> {
-        let pcm = encode_pcm(samples)?;
-        let generation = self.ensure_generation()?;
-        let control = control_frame(session_id, request_id, &Control::Transcribe)?;
-        let frames = [
-            control,
-            Frame {
-                kind: FrameKind::Pcm,
-                session_id,
-                request_id,
-                body: pcm,
-            },
-        ];
-        match self.active_round_trip(generation, session_id, request_id, &frames)? {
-            Control::Text {
-                text,
-                final_result: true,
-            } => Ok(text),
-            Control::Error { message } => bail!("ONNX worker: {message}"),
-            _ => {
-                self.invalidate_generation(
-                    generation,
-                    "unexpected ONNX worker transcription response",
-                    true,
-                )?;
-                bail!("unexpected ONNX worker transcription response")
-            }
-        }
-    }
-
     pub(crate) fn start_stream(&self, session_id: u64, request_id: u64) -> Result<()> {
         let generation = self.ensure_generation()?;
         if self
             .inner
             .state
             .lock()
-            .map_err(|_| anyhow!("ONNX supervisor state lock was poisoned"))?
+            .map_err(|_| anyhow!("process worker supervisor state lock was poisoned"))?
             .active_stream
             .is_some()
         {
@@ -1806,17 +1702,16 @@ impl OnnxWorkerSupervisor {
         let frame = control_frame(session_id, request_id, &Control::StartStream)?;
         match self.active_round_trip(generation, session_id, request_id, &[frame])? {
             Control::Ok => {
-                let mut state = self
-                    .inner
-                    .state
-                    .lock()
-                    .map_err(|_| anyhow!("ONNX supervisor state lock was poisoned"))?;
+                let mut state =
+                    self.inner.state.lock().map_err(|_| {
+                        anyhow!("process worker supervisor state lock was poisoned")
+                    })?;
                 if state
                     .current
                     .as_ref()
                     .is_none_or(|current| current.generation != generation)
                 {
-                    bail!("ONNX worker generation {generation} is unavailable");
+                    bail!("process worker generation {generation} is unavailable");
                 }
                 state.active_stream = Some(SupervisorStream {
                     generation,
@@ -1825,14 +1720,14 @@ impl OnnxWorkerSupervisor {
                 });
                 Ok(())
             }
-            Control::Error { message } => bail!("ONNX worker: {message}"),
+            Control::Error { message } => bail!("process worker: {message}"),
             _ => {
                 self.invalidate_generation(
                     generation,
-                    "unexpected ONNX worker start-stream response",
+                    "unexpected process worker start-stream response",
                     true,
                 )?;
-                bail!("unexpected ONNX worker start-stream response")
+                bail!("unexpected process worker start-stream response")
             }
         }
     }
@@ -1870,15 +1765,15 @@ impl OnnxWorkerSupervisor {
             }
             Control::Error { message } => {
                 self.clear_stream(generation, session_id);
-                bail!("ONNX worker: {message}")
+                bail!("process worker: {message}")
             }
             _ => {
                 self.invalidate_generation(
                     generation,
-                    "unexpected ONNX worker audio-chunk response",
+                    "unexpected process worker audio-chunk response",
                     true,
                 )?;
-                bail!("unexpected ONNX worker audio-chunk response")
+                bail!("unexpected process worker audio-chunk response")
             }
         }
     }
@@ -1893,14 +1788,14 @@ impl OnnxWorkerSupervisor {
                 text,
                 final_result: true,
             } => Ok(text),
-            Control::Error { message } => bail!("ONNX worker: {message}"),
+            Control::Error { message } => bail!("process worker: {message}"),
             _ => {
                 self.invalidate_generation(
                     generation,
-                    "unexpected ONNX worker end-stream response",
+                    "unexpected process worker end-stream response",
                     true,
                 )?;
-                bail!("unexpected ONNX worker end-stream response")
+                bail!("unexpected process worker end-stream response")
             }
         }
     }
@@ -1920,7 +1815,7 @@ impl OnnxWorkerSupervisor {
                 .inner
                 .state
                 .lock()
-                .map_err(|_| anyhow!("ONNX supervisor state lock was poisoned"))?;
+                .map_err(|_| anyhow!("process worker supervisor state lock was poisoned"))?;
             let stream = state
                 .active_stream
                 .filter(|stream| stream.session_id == session_id)
@@ -1977,7 +1872,7 @@ impl OnnxWorkerSupervisor {
             .inner
             .state
             .lock()
-            .map_err(|_| anyhow!("ONNX supervisor state lock was poisoned"))?;
+            .map_err(|_| anyhow!("process worker supervisor state lock was poisoned"))?;
         if state
             .current
             .as_ref()
@@ -1994,7 +1889,7 @@ impl OnnxWorkerSupervisor {
             .inner
             .state
             .lock()
-            .map_err(|_| anyhow!("ONNX supervisor state lock was poisoned"))?
+            .map_err(|_| anyhow!("process worker supervisor state lock was poisoned"))?
             .current
             .as_ref()
             .map(|current| current.generation))
@@ -2005,7 +1900,7 @@ impl OnnxWorkerSupervisor {
             .inner
             .state
             .lock()
-            .map_err(|_| anyhow!("ONNX supervisor state lock was poisoned"))?
+            .map_err(|_| anyhow!("process worker supervisor state lock was poisoned"))?
             .active_stream
             .is_some())
     }
@@ -2025,7 +1920,7 @@ impl OnnxWorkerSupervisor {
                 .inner
                 .state
                 .lock()
-                .map_err(|_| anyhow!("ONNX supervisor state lock was poisoned"))?;
+                .map_err(|_| anyhow!("process worker supervisor state lock was poisoned"))?;
             let Some(target) = state.active_request else {
                 return Ok(CancelOutcome::NoActiveRequest);
             };
@@ -2047,7 +1942,7 @@ impl OnnxWorkerSupervisor {
                     .inner
                     .state
                     .lock()
-                    .map_err(|_| anyhow!("ONNX supervisor state lock was poisoned"))?
+                    .map_err(|_| anyhow!("process worker supervisor state lock was poisoned"))?
                     .active_request
                     == Some(target);
                 if !still_active {
@@ -2110,14 +2005,14 @@ impl OnnxWorkerSupervisor {
             .inner
             .state
             .lock()
-            .map_err(|_| anyhow!("ONNX supervisor state lock was poisoned"))?
+            .map_err(|_| anyhow!("process worker supervisor state lock was poisoned"))?
             .current
             .as_ref()
             .map(|current| current.generation);
         if let Some(generation) = generation {
             self.invalidate_generation(
                 generation,
-                "ONNX worker generation was explicitly retired",
+                "process worker generation was explicitly retired",
                 true,
             )?;
         }
@@ -2143,7 +2038,7 @@ impl OnnxWorkerSupervisor {
                 .inner
                 .state
                 .lock()
-                .map_err(|_| anyhow!("ONNX supervisor state lock was poisoned"))?;
+                .map_err(|_| anyhow!("process worker supervisor state lock was poisoned"))?;
             state
                 .current
                 .as_ref()
@@ -2153,15 +2048,15 @@ impl OnnxWorkerSupervisor {
             match process.is_running() {
                 Ok(true) => return Ok(generation),
                 Ok(false) => {
-                    self.invalidate_generation(generation, "ONNX worker exited", false)?;
+                    self.invalidate_generation(generation, "process worker exited", false)?;
                 }
                 Err(error) => {
                     self.invalidate_generation(
                         generation,
-                        "could not inspect ONNX worker process",
+                        "could not inspect process worker process",
                         true,
                     )?;
-                    return Err(anyhow!("could not inspect ONNX worker process: {error}"));
+                    return Err(anyhow!("could not inspect process worker process: {error}"));
                 }
             }
         }
@@ -2180,7 +2075,7 @@ impl OnnxWorkerSupervisor {
                 .inner
                 .state
                 .lock()
-                .map_err(|_| anyhow!("ONNX supervisor state lock was poisoned"))?;
+                .map_err(|_| anyhow!("process worker supervisor state lock was poisoned"))?;
             state.next_generation = state.next_generation.saturating_add(1).max(1);
             let generation = state.next_generation;
             state.current = Some(CurrentGeneration {
@@ -2252,7 +2147,7 @@ impl OnnxWorkerSupervisor {
                     retire_unpublished_worker_synchronously(worker);
                 }
             })
-            .context("could not start bounded ONNX worker launcher")?;
+            .context("could not start bounded process worker launcher")?;
 
         loop {
             if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
@@ -2275,7 +2170,7 @@ impl OnnxWorkerSupervisor {
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                     deadline.remaining()?;
-                    bail!("ONNX worker launcher disconnected")
+                    bail!("process worker launcher disconnected")
                 }
             }
         }
@@ -2298,14 +2193,14 @@ impl OnnxWorkerSupervisor {
                     let (session_id, request_id, control) = match response {
                         Ok(response) => response,
                         Err(error) => {
-                            if let Err(retire_error) = OnnxWorkerSupervisor::from_inner(inner)
+                            if let Err(retire_error) = ProcessWorkerSupervisor::from_inner(inner)
                                 .invalidate_generation(
                                 generation,
-                                &format!("ONNX worker stdout failed: {error}"),
+                                &format!("process worker stdout failed: {error}"),
                                 true,
                             ) {
                                 eprintln!(
-                                    "could not retire failed ONNX worker generation {generation}: {retire_error:#}"
+                                    "could not retire failed process worker generation {generation}: {retire_error:#}"
                                 );
                             }
                             break;
@@ -2329,21 +2224,21 @@ impl OnnxWorkerSupervisor {
                         let _ = waiter.send(Ok(control));
                         continue;
                     }
-                    if let Err(error) = OnnxWorkerSupervisor::from_inner(inner)
+                    if let Err(error) = ProcessWorkerSupervisor::from_inner(inner)
                         .invalidate_generation(
                         generation,
-                        "stale or mis-correlated ONNX worker response",
+                        "stale or mis-correlated process worker response",
                         true,
                     ) {
                         eprintln!(
-                            "could not retire mis-correlated ONNX worker generation {generation}: {error:#}"
+                            "could not retire mis-correlated process worker generation {generation}: {error:#}"
                         );
                     }
                     break;
                 }
             })
             .map(|_| ())
-            .map_err(|error| anyhow!("could not start ONNX worker stdout reader: {error}"))
+            .map_err(|error| anyhow!("could not start process worker stdout reader: {error}"))
     }
 
     fn from_inner(inner: Arc<SupervisorInner>) -> Self {
@@ -2378,13 +2273,13 @@ impl OnnxWorkerSupervisor {
                 .is_some_and(|current| current.generation == correlation.generation),
             Err(_) => {
                 self.unregister(correlation);
-                bail!("ONNX supervisor state lock was poisoned");
+                bail!("process worker supervisor state lock was poisoned");
             }
         };
         if !current {
             self.unregister(correlation);
             bail!(
-                "ONNX worker generation {} is unavailable",
+                "process worker generation {} is unavailable",
                 correlation.generation
             );
         }
@@ -2456,9 +2351,9 @@ impl OnnxWorkerSupervisor {
                 }
             }
             Ok(_) => Some(anyhow!(
-                "ONNX worker generation {generation} is unavailable"
+                "process worker generation {generation} is unavailable"
             )),
-            Err(_) => Some(anyhow!("ONNX supervisor state lock was poisoned")),
+            Err(_) => Some(anyhow!("process worker supervisor state lock was poisoned")),
         };
         if let Some(error) = active_error {
             self.unregister(correlation);
@@ -2479,7 +2374,7 @@ impl OnnxWorkerSupervisor {
         self.inner
             .state
             .lock()
-            .map_err(|_| anyhow!("ONNX supervisor state lock was poisoned"))?
+            .map_err(|_| anyhow!("process worker supervisor state lock was poisoned"))?
             .active_stream
             .filter(|stream| stream.session_id == session_id)
             .ok_or_else(|| anyhow!("no ONNX stream is active for session {session_id}"))
@@ -2518,7 +2413,7 @@ impl OnnxWorkerSupervisor {
         cancelled: Option<&AtomicBool>,
     ) -> Result<()> {
         if !command.is_parent_command() {
-            bail!("cannot send a response-only control to the ONNX worker");
+            bail!("cannot send a response-only control to the process worker");
         }
         let expects_ready = matches!(command, Control::Hello);
         let correlation = Correlation {
@@ -2542,14 +2437,14 @@ impl OnnxWorkerSupervisor {
         match self.await_response_with_cancellation(correlation, response, timeout, cancelled)? {
             Control::Ready if expects_ready => Ok(()),
             Control::Ok if !expects_ready => Ok(()),
-            Control::Error { message } => bail!("ONNX worker: {message}"),
+            Control::Error { message } => bail!("process worker: {message}"),
             _ => {
                 self.invalidate_generation(
                     generation,
-                    "unexpected ONNX worker control response",
+                    "unexpected process worker control response",
                     true,
                 )?;
-                bail!("unexpected ONNX worker control response")
+                bail!("unexpected process worker control response")
             }
         }
     }
@@ -2563,7 +2458,7 @@ impl OnnxWorkerSupervisor {
         let slot = writer
             .as_mut()
             .filter(|slot| slot.generation == generation)
-            .ok_or_else(|| anyhow!("ONNX worker generation {generation} is unavailable"))?;
+            .ok_or_else(|| anyhow!("process worker generation {generation} is unavailable"))?;
         for frame in frames {
             write_frame(&mut slot.stdin, frame)?;
         }
@@ -2579,7 +2474,7 @@ impl OnnxWorkerSupervisor {
     ) -> Result<Control> {
         let deadline = Instant::now()
             .checked_add(timeout)
-            .ok_or_else(|| anyhow!("ONNX worker response deadline overflowed"))?;
+            .ok_or_else(|| anyhow!("process worker response deadline overflowed"))?;
         loop {
             if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
                 self.unregister(correlation);
@@ -2595,11 +2490,11 @@ impl OnnxWorkerSupervisor {
                 self.unregister(correlation);
                 self.invalidate_generation(
                     correlation.generation,
-                    "ONNX worker response deadline exceeded",
+                    "process worker response deadline exceeded",
                     true,
                 )?;
                 bail!(
-                    "ONNX worker response deadline exceeded after {} ms",
+                    "process worker response deadline exceeded after {} ms",
                     timeout.as_millis()
                 );
             }
@@ -2612,7 +2507,7 @@ impl OnnxWorkerSupervisor {
                 Ok(result) => return result.map_err(anyhow::Error::msg),
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    bail!("ONNX worker response channel disconnected")
+                    bail!("process worker response channel disconnected")
                 }
             }
         }
@@ -2632,7 +2527,7 @@ impl OnnxWorkerSupervisor {
                 .inner
                 .state
                 .lock()
-                .map_err(|_| anyhow!("ONNX supervisor state lock was poisoned"))?;
+                .map_err(|_| anyhow!("process worker supervisor state lock was poisoned"))?;
             loop {
                 let Some(current) = state.current.as_ref() else {
                     return Ok(());
@@ -2648,11 +2543,11 @@ impl OnnxWorkerSupervisor {
                     .inner
                     .retirement_changed
                     .wait_timeout(state, self.inner.deadlines.cancel)
-                    .map_err(|_| anyhow!("ONNX supervisor state lock was poisoned"))?;
+                    .map_err(|_| anyhow!("process worker supervisor state lock was poisoned"))?;
                 state = next_state;
                 if timeout.timed_out() && state.retiring_generations.contains(&generation) {
                     bail!(
-                        "ONNX worker generation {generation} termination did not complete within {} ms",
+                        "process worker generation {generation} termination did not complete within {} ms",
                         self.inner.deadlines.cancel.as_millis()
                     );
                 }
@@ -2664,7 +2559,7 @@ impl OnnxWorkerSupervisor {
             }
             self.inner.retirement_changed.notify_all();
             return Err(error).with_context(|| {
-                format!("could not initiate termination of ONNX worker generation {generation}")
+                format!("could not initiate termination of process worker generation {generation}")
             });
         }
         {
@@ -2672,7 +2567,7 @@ impl OnnxWorkerSupervisor {
                 .inner
                 .state
                 .lock()
-                .map_err(|_| anyhow!("ONNX supervisor state lock was poisoned"))?;
+                .map_err(|_| anyhow!("process worker supervisor state lock was poisoned"))?;
             let Some(current) = state.current.as_ref() else {
                 state.retiring_generations.remove(&generation);
                 self.inner.retirement_changed.notify_all();
@@ -2774,7 +2669,7 @@ pub(crate) struct SileroVadDecision {
 #[derive(Clone)]
 #[allow(dead_code)]
 pub(crate) struct SileroVadWorkerSupervisor {
-    transport: OnnxWorkerSupervisor,
+    transport: ProcessWorkerSupervisor,
     deadlines: VadDeadlines,
 }
 
@@ -2787,7 +2682,7 @@ impl SileroVadWorkerSupervisor {
             ..SupervisorDeadlines::default()
         };
         Ok(Self {
-            transport: OnnxWorkerSupervisor::with_launcher_and_deadlines(
+            transport: ProcessWorkerSupervisor::with_launcher_and_deadlines(
                 Arc::new(OsWorkerLauncher::vad()),
                 transport_deadlines,
             )?,
@@ -2832,7 +2727,7 @@ impl SileroVadWorkerSupervisor {
             ..SupervisorDeadlines::default()
         };
         let supervisor = Self {
-            transport: OnnxWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+            transport: ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
                 launcher,
                 transport_deadlines,
             ),
@@ -2898,7 +2793,7 @@ impl SileroVadWorkerSupervisor {
     }
 
     #[cfg(test)]
-    fn with_transport(transport: OnnxWorkerSupervisor) -> Self {
+    fn with_transport(transport: ProcessWorkerSupervisor) -> Self {
         Self {
             transport,
             deadlines: VadDeadlines::default(),
@@ -2907,7 +2802,7 @@ impl SileroVadWorkerSupervisor {
 
     #[cfg(test)]
     fn with_transport_and_deadlines(
-        transport: OnnxWorkerSupervisor,
+        transport: ProcessWorkerSupervisor,
         deadlines: VadDeadlines,
     ) -> Self {
         Self {
@@ -2949,7 +2844,7 @@ impl SileroVadWorkerSupervisor {
             .inner
             .state
             .lock()
-            .map_err(|_| anyhow!("ONNX supervisor state lock was poisoned"))?
+            .map_err(|_| anyhow!("process worker supervisor state lock was poisoned"))?
             .active_model
             .as_ref()
             .is_some_and(|(loaded_generation, loaded_identity)| {
@@ -2980,7 +2875,7 @@ impl SileroVadWorkerSupervisor {
             .inner
             .state
             .lock()
-            .map_err(|_| anyhow!("ONNX supervisor state lock was poisoned"))?;
+            .map_err(|_| anyhow!("process worker supervisor state lock was poisoned"))?;
         if state
             .current
             .as_ref()
@@ -3022,7 +2917,7 @@ impl SileroVadWorkerSupervisor {
             .inner
             .state
             .lock()
-            .map_err(|_| anyhow!("ONNX supervisor state lock was poisoned"))?
+            .map_err(|_| anyhow!("process worker supervisor state lock was poisoned"))?
             .active_stream
             .is_some()
         {
@@ -3057,12 +2952,10 @@ impl SileroVadWorkerSupervisor {
         };
         match response {
             Control::Ok => {
-                let mut state = self
-                    .transport
-                    .inner
-                    .state
-                    .lock()
-                    .map_err(|_| anyhow!("ONNX supervisor state lock was poisoned"))?;
+                let mut state =
+                    self.transport.inner.state.lock().map_err(|_| {
+                        anyhow!("process worker supervisor state lock was poisoned")
+                    })?;
                 if state
                     .current
                     .as_ref()
@@ -3277,8 +3170,8 @@ impl SileroVadWorkerSupervisor {
 fn expect_ok(response: Control) -> Result<()> {
     match response {
         Control::Ok => Ok(()),
-        Control::Error { message } => bail!("ONNX worker: {message}"),
-        _ => bail!("unexpected ONNX worker control response"),
+        Control::Error { message } => bail!("process worker: {message}"),
+        _ => bail!("unexpected process worker control response"),
     }
 }
 
@@ -3291,10 +3184,10 @@ fn retire_unpublished_worker(worker: SpawnedWorker) {
     drop(stdin);
     drop(stdout);
     if let Err(error) = process.terminate() {
-        eprintln!("could not terminate late ONNX worker launch: {error:#}");
+        eprintln!("could not terminate late process worker launch: {error:#}");
     }
     if let Err(error) = reap_process(process, 0) {
-        eprintln!("could not reap late ONNX worker launch: {error:#}");
+        eprintln!("could not reap late process worker launch: {error:#}");
     }
 }
 
@@ -3307,10 +3200,10 @@ fn retire_unpublished_worker_synchronously(worker: SpawnedWorker) {
     drop(stdin);
     drop(stdout);
     if let Err(error) = process.terminate() {
-        eprintln!("could not terminate late ONNX worker launch: {error:#}");
+        eprintln!("could not terminate late process worker launch: {error:#}");
     }
     if let Err(error) = process.wait() {
-        eprintln!("could not reap late ONNX worker launch: {error:#}");
+        eprintln!("could not reap late process worker launch: {error:#}");
     }
 }
 
@@ -3323,7 +3216,7 @@ fn reap_process(process: Arc<dyn WorkerProcess>, generation: u64) -> Result<()> 
         .name(format!("scribe-onnx-reaper-{generation}"))
         .spawn(move || {
             if let Err(error) = reaper_process.wait() {
-                eprintln!("ONNX worker generation {generation} reaper failed: {error:#}");
+                eprintln!("process worker generation {generation} reaper failed: {error:#}");
             }
         })
     {
@@ -3331,7 +3224,7 @@ fn reap_process(process: Arc<dyn WorkerProcess>, generation: u64) -> Result<()> 
         // reaped before this process can safely forget it.
         process.wait().with_context(|| {
             format!(
-                "could not start ONNX worker generation {generation} reaper ({error}) and synchronous reaping failed"
+                "could not start process worker generation {generation} reaper ({error}) and synchronous reaping failed"
             )
         })?;
     }
@@ -3355,7 +3248,7 @@ impl Drop for SupervisorInner {
                 .terminate()
                 .and_then(|()| current.process.wait())
         {
-            eprintln!("ONNX worker shutdown failed: {error:#}");
+            eprintln!("process worker shutdown failed: {error:#}");
         }
     }
 }
@@ -3417,14 +3310,14 @@ fn worker_role_from_args(args: &[std::ffi::OsString]) -> Result<Option<WorkerRol
 /// It owns no native model/session/recognizer objects.
 #[derive(Clone)]
 pub(crate) struct InferenceWorkerSupervisor {
-    transport: OnnxWorkerSupervisor,
+    transport: ProcessWorkerSupervisor,
     next_correlation: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl InferenceWorkerSupervisor {
     pub(crate) fn unstarted() -> Self {
         Self {
-            transport: OnnxWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+            transport: ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
                 Arc::new(OsWorkerLauncher::inference()),
                 SupervisorDeadlines::default(),
             ),
@@ -3439,7 +3332,7 @@ impl InferenceWorkerSupervisor {
     #[cfg(test)]
     pub(crate) fn unstarted_for_executable(executable: PathBuf) -> Self {
         Self {
-            transport: OnnxWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+            transport: ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
                 Arc::new(OsWorkerLauncher::for_executable(
                     WorkerRole::Inference,
                     executable,
@@ -3872,7 +3765,6 @@ trait WorkerVad {
 }
 
 struct LoadedWorkerRecognizer<R> {
-    identity: String,
     family: OnnxModelFamily,
     recognizer: R,
 }
@@ -3982,36 +3874,6 @@ fn worker_loop_with_factories<F: WorkerRecognizerFactory, V: WorkerVadFactory>(
         match control {
             Control::Hello => {
                 write_worker_response(&mut output, session_id, request_id, Control::Ready)?;
-            }
-            Control::Load { model } => {
-                let result = (|| {
-                    if pending_batch.is_some() {
-                        bail!("cannot replace a transcription model while a batch is active");
-                    }
-                    if loaded_vad.is_some() {
-                        bail!("cannot load a transcription model in a VAD worker");
-                    }
-                    let model = model.validated()?;
-                    let identity = model.fingerprint()?;
-                    if loaded
-                        .as_ref()
-                        .is_some_and(|loaded| loaded.identity == identity)
-                    {
-                        return Ok(Control::Ok);
-                    }
-                    if active_stream.is_some() {
-                        bail!("cannot replace an ONNX recognizer while a stream is active");
-                    }
-                    drop(loaded.take());
-                    let recognizer = factory.create(&model)?;
-                    loaded = Some(LoadedWorkerRecognizer {
-                        identity,
-                        family: model.family,
-                        recognizer,
-                    });
-                    Ok(Control::Ok)
-                })();
-                write_worker_result(&mut output, session_id, request_id, result)?;
             }
             Control::LoadRuntime {
                 artifact,
@@ -4178,25 +4040,6 @@ fn worker_loop_with_factories<F: WorkerRecognizerFactory, V: WorkerVadFactory>(
                 drop(loaded_vad.take());
                 write_worker_response(&mut output, session_id, request_id, Control::Ok)?;
                 return Ok(());
-            }
-            Control::Transcribe => {
-                let samples = read_correlated_pcm(&mut input, session_id, request_id);
-                let result = samples.and_then(|samples| {
-                    if active_stream.is_some() || loaded_vad.is_some() {
-                        bail!("cannot run batch transcription while an ONNX stream is active");
-                    }
-                    let recognizer = loaded
-                        .as_ref()
-                        .ok_or_else(|| anyhow!("no ONNX model is loaded"))?;
-                    recognizer
-                        .recognizer
-                        .transcribe(&samples)
-                        .map(|text| Control::Text {
-                            text,
-                            final_result: true,
-                        })
-                });
-                write_worker_result(&mut output, session_id, request_id, result)?;
             }
             Control::StartStream => {
                 let result = (|| {
@@ -4522,7 +4365,6 @@ fn load_worker_runtime<F: WorkerRecognizerFactory>(
             let validated = model.validated()?;
             let recognizer = factory.create(&validated)?;
             *loaded_onnx = Some(LoadedWorkerRecognizer {
-                identity: validated.fingerprint()?,
                 family: model.family,
                 recognizer,
             });
@@ -5450,9 +5292,6 @@ mod tests {
         BlockedHello {
             started: TestSender<()>,
         },
-        BlockedDecode {
-            started: TestSender<()>,
-        },
         BlockedStreamOperation {
             end_stream: bool,
             started: TestSender<()>,
@@ -5461,10 +5300,6 @@ mod tests {
             completed: TestSender<()>,
         },
         HoldOne {
-            started: TestSender<()>,
-            release: TestReceiver<()>,
-        },
-        HoldLoad {
             started: TestSender<()>,
             release: TestReceiver<()>,
         },
@@ -5497,8 +5332,6 @@ mod tests {
             blocked: TestSender<()>,
         },
         MalformedVadWindow,
-        FailChangedLoad,
-        FailChangedLoadWithActiveStream,
     }
 
     struct TestLauncher {
@@ -5610,29 +5443,13 @@ mod tests {
             };
             let (session_id, request_id, control) = parse_parent_control(frame).unwrap();
             match control {
-                Control::Transcribe => {
-                    let pcm = read_frame(input).unwrap();
-                    assert_eq!(pcm.kind, FrameKind::Pcm);
-                    assert_eq!((pcm.session_id, pcm.request_id), (session_id, request_id));
-                    respond(
-                        output,
-                        session_id,
-                        request_id,
-                        Control::Text {
-                            text: "test transcript".to_owned(),
-                            final_result: true,
-                        },
-                    );
-                }
                 Control::Shutdown => {
                     respond(output, session_id, request_id, Control::Ok);
                     return;
                 }
-                Control::Hello
-                | Control::Load { .. }
-                | Control::Cancel { .. }
-                | Control::Unload
-                | Control::Health => respond(output, session_id, request_id, Control::Ok),
+                Control::Hello | Control::Cancel { .. } | Control::Unload | Control::Health => {
+                    respond(output, session_id, request_id, Control::Ok)
+                }
                 Control::LoadRuntime { .. } | Control::BeginBatch { .. } | Control::EndBatch => {
                     respond(
                         output,
@@ -5735,14 +5552,6 @@ mod tests {
             TestMode::MalformedVadWindow => {
                 run_malformed_vad_window_worker(&mut input, &mut output)
             }
-            TestMode::BlockedDecode { started } => {
-                let (session_id, request_id, control) = read_parent_control(&mut input);
-                assert!(matches!(control, Control::Transcribe));
-                let pcm = read_frame(&mut input).unwrap();
-                assert_eq!((pcm.session_id, pcm.request_id), (session_id, request_id));
-                started.send(()).unwrap();
-                let _ = read_frame(&mut input);
-            }
             TestMode::BlockedStreamOperation {
                 end_stream,
                 started,
@@ -5782,15 +5591,6 @@ mod tests {
             TestMode::HoldOne { started, release } => {
                 let (session_id, request_id, control) = read_parent_control(&mut input);
                 assert!(matches!(control, Control::Health));
-                started.send(()).unwrap();
-                if release.recv().is_ok() {
-                    respond(&mut output, session_id, request_id, Control::Ok);
-                    run_normal_worker(&mut input, &mut output);
-                }
-            }
-            TestMode::HoldLoad { started, release } => {
-                let (session_id, request_id, control) = read_parent_control(&mut input);
-                assert!(matches!(control, Control::Load { .. }));
                 started.send(()).unwrap();
                 if release.recv().is_ok() {
                     respond(&mut output, session_id, request_id, Control::Ok);
@@ -5846,41 +5646,6 @@ mod tests {
                     control_frame(session_id, request_id, &Control::Health).unwrap()
                 };
                 write_frame(&mut output, &frame).unwrap();
-            }
-            TestMode::FailChangedLoad => {
-                let (session_id, request_id, control) = read_parent_control(&mut input);
-                assert!(matches!(control, Control::Load { .. }));
-                respond(&mut output, session_id, request_id, Control::Ok);
-                let (session_id, request_id, control) = read_parent_control(&mut input);
-                assert!(matches!(control, Control::Load { .. }));
-                respond(
-                    &mut output,
-                    session_id,
-                    request_id,
-                    Control::Error {
-                        message: "replacement failed".to_owned(),
-                    },
-                );
-                let _ = read_frame(&mut input);
-            }
-            TestMode::FailChangedLoadWithActiveStream => {
-                let (session_id, request_id, control) = read_parent_control(&mut input);
-                assert!(matches!(control, Control::Load { .. }));
-                respond(&mut output, session_id, request_id, Control::Ok);
-                let (session_id, request_id, control) = read_parent_control(&mut input);
-                assert!(matches!(control, Control::StartStream));
-                respond(&mut output, session_id, request_id, Control::Ok);
-                let (session_id, request_id, control) = read_parent_control(&mut input);
-                assert!(matches!(control, Control::Load { .. }));
-                respond(
-                    &mut output,
-                    session_id,
-                    request_id,
-                    Control::Error {
-                        message: "cannot replace a model while a stream is active".to_owned(),
-                    },
-                );
-                let _ = read_frame(&mut input);
             }
         }
     }
@@ -6055,8 +5820,8 @@ mod tests {
         }
     }
 
-    fn test_supervisor(launcher: Arc<TestLauncher>) -> OnnxWorkerSupervisor {
-        OnnxWorkerSupervisor::with_launcher(launcher).unwrap()
+    fn test_supervisor(launcher: Arc<TestLauncher>) -> ProcessWorkerSupervisor {
+        ProcessWorkerSupervisor::with_launcher(launcher).unwrap()
     }
 
     fn short_deadlines() -> SupervisorDeadlines {
@@ -6155,9 +5920,9 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v3_has_distinct_inference_and_vad_roles() {
+    fn protocol_v4_has_distinct_inference_and_vad_roles() {
         assert_eq!(PROTOCOL_MAGIC, *b"SCIF");
-        assert_eq!(PROTOCOL_VERSION, 3);
+        assert_eq!(PROTOCOL_VERSION, 4);
         assert_eq!(INFERENCE_WORKER_FLAG, "--scribe-inference-worker");
         assert_eq!(VAD_WORKER_FLAG, "--scribe-vad-worker");
         assert!(!control_allowed_for_role(
@@ -6165,7 +5930,22 @@ mod tests {
             WorkerRole::Inference,
         ));
         assert!(!control_allowed_for_role(
-            &Control::Transcribe,
+            &Control::BeginBatch {
+                artifact: WireRuntimeArtifact::Gguf(WireRuntimeModel {
+                    id: "fixture".to_owned(),
+                    path: PathBuf::from("fixture.gguf"),
+                    format: WireArtifactFormat::Gguf,
+                    package_root: None,
+                    expected_size_bytes: 1,
+                    expected_sha256: "0".repeat(64),
+                }),
+                preference: AccelerationPreference::Cpu,
+                options: TranscriptionOptions::default(),
+                source_sample_rate: PREPARED_SAMPLE_RATE,
+                source_channels: 1,
+                source_frames: 1,
+                declared_samples: 1,
+            },
             WorkerRole::Vad,
         ));
         assert!(control_allowed_for_role(
@@ -6371,7 +6151,7 @@ mod tests {
     #[test]
     fn unload_without_a_generation_does_not_spawn_a_worker() {
         let launcher = Arc::new(TestLauncher::new([]));
-        let supervisor = OnnxWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+        let supervisor = ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
             launcher.clone(),
             SupervisorDeadlines::default(),
         );
@@ -6389,7 +6169,7 @@ mod tests {
         ));
         let launcher = Arc::new(TestLauncher::new([TestMode::Normal]));
         let inference = InferenceWorkerSupervisor {
-            transport: OnnxWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+            transport: ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
                 launcher.clone(),
                 short_deadlines(),
             ),
@@ -6409,7 +6189,7 @@ mod tests {
         let root = test_root("stale-batch-cancellation");
         let launcher = Arc::new(TestLauncher::new([]));
         let supervisor = InferenceWorkerSupervisor {
-            transport: OnnxWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+            transport: ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
                 launcher.clone(),
                 SupervisorDeadlines::default(),
             ),
@@ -6441,7 +6221,7 @@ mod tests {
     #[test]
     fn cancellation_between_batch_requests_retires_the_current_generation() {
         let launcher = Arc::new(TestLauncher::new([TestMode::Normal]));
-        let transport = OnnxWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+        let transport = ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
             launcher,
             SupervisorDeadlines::default(),
         );
@@ -6457,7 +6237,7 @@ mod tests {
     fn cooperative_cancel_fixture(
         acknowledge: bool,
     ) -> (
-        OnnxWorkerSupervisor,
+        ProcessWorkerSupervisor,
         Arc<CooperativeCancelProcess>,
         TestReceiver<PendingResult>,
     ) {
@@ -6466,7 +6246,7 @@ mod tests {
             session_id: 7,
             request_id: 9,
         };
-        let supervisor = OnnxWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+        let supervisor = ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
             Arc::new(TestLauncher::new([])),
             SupervisorDeadlines {
                 cancel: Duration::from_millis(20),
@@ -6796,54 +6576,6 @@ mod tests {
         }))
     }
 
-    fn fixture_audio() -> PreparedAudio {
-        PreparedAudio::from_wav_path(required_fixture_path("SCRIBE_ONNX_AUDIO"))
-            .expect("SCRIBE_ONNX_AUDIO must name a readable speech WAV fixture")
-    }
-
-    fn moonshine_fixture_spec() -> OnnxModelSpec {
-        let root = required_fixture_path("SCRIBE_ONNX_MOONSHINE_ROOT");
-        OnnxModelSpec {
-            id: "moonshine-tiny-en-local-fixture".to_owned(),
-            root,
-            family: OnnxModelFamily::Moonshine,
-            files: BTreeMap::from([
-                (OnnxFileRole::Encoder, PathBuf::from("encoder_model.ort")),
-                (
-                    OnnxFileRole::MergedDecoder,
-                    PathBuf::from("decoder_model_merged.ort"),
-                ),
-                (OnnxFileRole::Tokens, PathBuf::from("tokens.txt")),
-            ]),
-            num_threads: 1,
-        }
-    }
-
-    fn zipformer_fixture_spec() -> OnnxModelSpec {
-        let root = required_fixture_path("SCRIBE_ONNX_ZIPFORMER_ROOT");
-        OnnxModelSpec {
-            id: "zipformer-en-20m-local-fixture".to_owned(),
-            root,
-            family: OnnxModelFamily::OnlineTransducer,
-            files: BTreeMap::from([
-                (
-                    OnnxFileRole::Encoder,
-                    PathBuf::from("encoder-epoch-99-avg-1.int8.onnx"),
-                ),
-                (
-                    OnnxFileRole::Decoder,
-                    PathBuf::from("decoder-epoch-99-avg-1.int8.onnx"),
-                ),
-                (
-                    OnnxFileRole::Joiner,
-                    PathBuf::from("joiner-epoch-99-avg-1.int8.onnx"),
-                ),
-                (OnnxFileRole::Tokens, PathBuf::from("tokens.txt")),
-            ]),
-            num_threads: 1,
-        }
-    }
-
     fn run_native_worker(input: Vec<u8>) -> Vec<(u64, u64, Control)> {
         let mut output = Vec::new();
         worker_loop(Cursor::new(input), &mut output).unwrap();
@@ -6964,81 +6696,6 @@ mod tests {
         );
         assert!(first.is_finite() && second.is_finite());
         assert_eq!(after_reset, first);
-    }
-
-    #[test]
-    #[ignore = "requires SCRIBE_ONNX_MOONSHINE_ROOT and SCRIBE_ONNX_AUDIO; local fixtures only, never downloads"]
-    fn native_moonshine_offline_fixture_uses_the_typed_bundle_contract() {
-        let model = moonshine_fixture_spec();
-        model.validate().unwrap();
-        let audio = fixture_audio();
-        let mut input = Vec::new();
-        append_control(&mut input, 0, 1, Control::Hello);
-        append_control(&mut input, 0, 2, Control::Health);
-        append_control(&mut input, 1, 3, Control::Load { model });
-        append_control(&mut input, 1, 4, Control::Transcribe);
-        append_pcm(&mut input, 1, 4, &audio.samples);
-        append_control(&mut input, 0, 5, Control::Shutdown);
-
-        let responses = run_native_worker(input);
-        assert!(matches!(responses[0].2, Control::Ready));
-        assert!(matches!(responses[1].2, Control::Ok));
-        assert!(matches!(responses[2].2, Control::Ok));
-        assert!(matches!(
-            responses[3].2,
-            Control::Text {
-                final_result: true,
-                ..
-            }
-        ));
-        assert!(matches!(responses[4].2, Control::Ok));
-    }
-
-    #[test]
-    #[ignore = "requires SCRIBE_ONNX_ZIPFORMER_ROOT and SCRIBE_ONNX_AUDIO; local fixtures only, never downloads"]
-    fn native_zipformer_fixture_uses_true_online_streaming() {
-        let model = zipformer_fixture_spec();
-        model.validate().unwrap();
-        let audio = fixture_audio();
-        let midpoint = audio.samples.len() / 2;
-        assert!(midpoint > 0, "fixture must contain at least two samples");
-        let mut input = Vec::new();
-        append_control(&mut input, 0, 1, Control::Hello);
-        append_control(&mut input, 2, 2, Control::Load { model });
-        append_control(&mut input, 8, 3, Control::StartStream);
-        append_control(&mut input, 8, 4, Control::AudioChunk);
-        append_pcm(&mut input, 8, 4, &audio.samples[..midpoint]);
-        append_control(&mut input, 8, 5, Control::AudioChunk);
-        append_pcm(&mut input, 8, 5, &audio.samples[midpoint..]);
-        append_control(&mut input, 8, 6, Control::EndStream);
-        append_control(&mut input, 0, 7, Control::Shutdown);
-
-        let responses = run_native_worker(input);
-        assert!(matches!(responses[0].2, Control::Ready));
-        assert!(matches!(responses[1].2, Control::Ok));
-        assert!(matches!(responses[2].2, Control::Ok));
-        assert!(matches!(
-            responses[3].2,
-            Control::Text {
-                final_result: false,
-                ..
-            }
-        ));
-        assert!(matches!(
-            responses[4].2,
-            Control::Text {
-                final_result: false,
-                ..
-            }
-        ));
-        assert!(matches!(
-            responses[5].2,
-            Control::Text {
-                final_result: true,
-                ..
-            }
-        ));
-        assert!(matches!(responses[6].2, Control::Ok));
     }
 
     #[test]
@@ -7165,374 +6822,6 @@ mod tests {
     }
 
     #[test]
-    fn framed_worker_reuses_loaded_offline_recognizer_and_replaces_on_change() {
-        let root = test_root("worker-offline-reuse");
-        let first = spec_with_roles(&root, OnnxModelFamily::OfflineTransducer, TRANSDUCER_ROLES);
-        let first_id = first.id.clone();
-        let mut second = first.clone();
-        second.id = "second-offline".to_owned();
-        let factory = FakeRecognizerFactory::new();
-        let mut input = Vec::new();
-        append_control(&mut input, 0, 0, Control::Hello);
-        append_control(
-            &mut input,
-            1,
-            1,
-            Control::Load {
-                model: first.clone(),
-            },
-        );
-        append_control(
-            &mut input,
-            1,
-            2,
-            Control::Load {
-                model: first.clone(),
-            },
-        );
-        append_control(&mut input, 1, 3, Control::Transcribe);
-        append_pcm(&mut input, 1, 3, &[0.1]);
-        append_control(&mut input, 1, 4, Control::Transcribe);
-        append_pcm(&mut input, 1, 4, &[-0.1]);
-        append_control(
-            &mut input,
-            1,
-            5,
-            Control::Load {
-                model: second.clone(),
-            },
-        );
-        append_control(&mut input, 0, 6, Control::Unload);
-        append_control(&mut input, 1, 7, Control::Load { model: first });
-        append_control(&mut input, 0, 8, Control::Shutdown);
-
-        let responses = run_framed_fake_worker(&factory, input);
-        assert_eq!(responses.len(), 9);
-        assert!(matches!(responses[0].2, Control::Ready));
-        assert!(matches!(responses[1].2, Control::Ok));
-        assert!(matches!(responses[2].2, Control::Ok));
-        assert!(matches!(
-            responses[3].2,
-            Control::Text {
-                final_result: true,
-                ..
-            }
-        ));
-        assert!(matches!(
-            responses[4].2,
-            Control::Text {
-                final_result: true,
-                ..
-            }
-        ));
-        assert!(responses[3].0 == 1 && responses[3].1 == 3);
-        assert!(responses[4].0 == 1 && responses[4].1 == 4);
-
-        let state = factory.snapshot();
-        assert_eq!(state.create_attempts, 3);
-        assert_eq!(state.recognizers_created, 3);
-        assert_eq!(state.transcriptions, 2);
-        assert_eq!(state.recognizer_drops, 3);
-        let create_second = state
-            .events
-            .iter()
-            .position(|event| event == "create:second-offline")
-            .unwrap();
-        let drop_first = state
-            .events
-            .iter()
-            .position(|event| event == &format!("drop-recognizer:{first_id}"))
-            .unwrap();
-        assert!(drop_first < create_second);
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn failed_changed_load_drops_previous_recognizer_and_leaves_worker_cold() {
-        let root = test_root("worker-failed-load");
-        let first = spec_with_roles(&root, OnnxModelFamily::NemoCtc, NEMO_CTC_ROLES);
-        let mut failing = first.clone();
-        failing.id = "fail-replacement".to_owned();
-        let factory = FakeRecognizerFactory::new();
-        let mut input = Vec::new();
-        append_control(&mut input, 0, 0, Control::Hello);
-        append_control(
-            &mut input,
-            1,
-            1,
-            Control::Load {
-                model: first.clone(),
-            },
-        );
-        append_control(&mut input, 1, 2, Control::Load { model: failing });
-        append_control(&mut input, 1, 3, Control::Transcribe);
-        append_pcm(&mut input, 1, 3, &[0.2]);
-        append_control(&mut input, 0, 4, Control::Shutdown);
-
-        let responses = run_framed_fake_worker(&factory, input);
-        assert_error(&responses[2], "construction failed");
-        assert_error(&responses[3], "no ONNX model is loaded");
-        let state = factory.snapshot();
-        assert_eq!(state.create_attempts, 2);
-        assert_eq!(state.recognizers_created, 1);
-        assert_eq!(state.transcriptions, 0);
-        assert_eq!(state.recognizer_drops, 1);
-        let dropped = state
-            .events
-            .iter()
-            .position(|event| event == &format!("drop-recognizer:{}", first.id))
-            .unwrap();
-        let attempted = state
-            .events
-            .iter()
-            .position(|event| event == "create-attempt:fail-replacement")
-            .unwrap();
-        assert!(dropped < attempted);
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn framed_worker_rejects_all_stream_commands_for_offline_models() {
-        let root = test_root("worker-offline-stream");
-        let model = spec_with_roles(&root, OnnxModelFamily::Moonshine, MOONSHINE_MERGED_ROLES);
-        let factory = FakeRecognizerFactory::new();
-        let mut input = Vec::new();
-        append_control(&mut input, 0, 0, Control::Hello);
-        append_control(&mut input, 1, 1, Control::Load { model });
-        append_control(&mut input, 7, 2, Control::StartStream);
-        append_control(&mut input, 7, 3, Control::AudioChunk);
-        append_pcm(&mut input, 7, 3, &[0.1]);
-        append_control(&mut input, 7, 4, Control::EndStream);
-        append_control(&mut input, 0, 5, Control::Shutdown);
-
-        let responses = run_framed_fake_worker(&factory, input);
-        assert_error(&responses[2], "online ONNX transducer");
-        assert_error(&responses[3], "online ONNX transducer");
-        assert_error(&responses[4], "online ONNX transducer");
-        let state = factory.snapshot();
-        assert_eq!(state.offline_stream_backend_calls, 0);
-        assert_eq!(state.stream_starts, 0);
-        assert_eq!(state.chunks_accepted, 0);
-        assert_eq!(state.input_finished, 0);
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn framed_worker_runs_true_online_chunks_and_finalizes_once() {
-        let root = test_root("worker-online-stream");
-        let model = spec_with_roles(&root, OnnxModelFamily::OnlineTransducer, TRANSDUCER_ROLES);
-        let factory = FakeRecognizerFactory::new();
-        let mut input = Vec::new();
-        append_control(&mut input, 0, 0, Control::Hello);
-        append_control(&mut input, 2, 1, Control::Load { model });
-        append_control(&mut input, 9, 2, Control::StartStream);
-        append_control(&mut input, 9, 3, Control::AudioChunk);
-        append_pcm(&mut input, 9, 3, &[0.1, 0.2]);
-        append_control(&mut input, 9, 4, Control::AudioChunk);
-        append_pcm(&mut input, 9, 4, &[-0.1]);
-        append_control(&mut input, 9, 5, Control::EndStream);
-        append_control(&mut input, 2, 6, Control::Transcribe);
-        append_pcm(&mut input, 2, 6, &[0.3]);
-        append_control(&mut input, 0, 7, Control::Shutdown);
-
-        let responses = run_framed_fake_worker(&factory, input);
-        assert!(matches!(responses[2].2, Control::Ok));
-        for (response, expected) in [(&responses[3], "partial-1"), (&responses[4], "partial-2")] {
-            match &response.2 {
-                Control::Text {
-                    text,
-                    final_result: false,
-                } => assert_eq!(text, expected),
-                other => panic!("expected non-final partial, got {other:?}"),
-            }
-        }
-        match &responses[5].2 {
-            Control::Text {
-                text,
-                final_result: true,
-            } => assert_eq!(text, "final-2"),
-            other => panic!("expected final stream result, got {other:?}"),
-        }
-        assert!(matches!(
-            responses[6].2,
-            Control::Text {
-                final_result: true,
-                ..
-            }
-        ));
-        let state = factory.snapshot();
-        assert_eq!(state.stream_starts, 1);
-        assert_eq!(state.chunks_accepted, 2);
-        assert_eq!(state.input_finished, 1);
-        assert_eq!(state.drains, 3);
-        assert_eq!(state.result_reads, 3);
-        assert_eq!(state.stream_drops, 1);
-        assert_eq!(state.transcriptions, 1);
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn framed_worker_rejects_bad_stream_order_without_corrupting_valid_stream() {
-        let root = test_root("worker-stream-order");
-        let model = spec_with_roles(&root, OnnxModelFamily::OnlineTransducer, TRANSDUCER_ROLES);
-        let factory = FakeRecognizerFactory::new();
-        let mut input = Vec::new();
-        append_control(&mut input, 0, 0, Control::Hello);
-        append_control(&mut input, 1, 1, Control::Load { model });
-        append_control(&mut input, 10, 2, Control::AudioChunk);
-        append_pcm(&mut input, 10, 2, &[0.1]);
-        append_control(&mut input, 10, 3, Control::EndStream);
-        append_control(&mut input, 10, 4, Control::StartStream);
-        append_control(&mut input, 11, 5, Control::StartStream);
-        append_control(&mut input, 11, 6, Control::AudioChunk);
-        append_pcm(&mut input, 11, 6, &[0.1]);
-        append_control(&mut input, 11, 7, Control::EndStream);
-        append_control(
-            &mut input,
-            10,
-            8,
-            Control::Cancel {
-                target_session_id: 10,
-                target_request_id: 999,
-            },
-        );
-        append_control(&mut input, 10, 9, Control::AudioChunk);
-        append_pcm(&mut input, 10, 9, &[0.2]);
-        append_control(&mut input, 10, 10, Control::EndStream);
-        append_control(&mut input, 0, 11, Control::Shutdown);
-
-        let responses = run_framed_fake_worker(&factory, input);
-        assert_error(&responses[2], "no ONNX stream");
-        assert_error(&responses[3], "no ONNX stream");
-        assert!(matches!(responses[4].2, Control::Ok));
-        assert_error(&responses[5], "already active");
-        assert_error(&responses[6], "different session");
-        assert_error(&responses[7], "session 11");
-        assert_error(&responses[8], "no matching");
-        assert!(matches!(
-            responses[9].2,
-            Control::Text {
-                final_result: false,
-                ..
-            }
-        ));
-        assert!(matches!(
-            responses[10].2,
-            Control::Text {
-                final_result: true,
-                ..
-            }
-        ));
-        let state = factory.snapshot();
-        assert_eq!(state.stream_starts, 1);
-        assert_eq!(state.chunks_accepted, 1);
-        assert_eq!(state.input_finished, 1);
-        assert_eq!(state.stream_drops, 1);
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn framed_worker_cancel_matches_latest_stream_request_and_clears_stream() {
-        let root = test_root("worker-stream-cancel");
-        let model = spec_with_roles(&root, OnnxModelFamily::OnlineTransducer, TRANSDUCER_ROLES);
-        let factory = FakeRecognizerFactory::new();
-        let mut input = Vec::new();
-        append_control(&mut input, 0, 0, Control::Hello);
-        append_control(&mut input, 1, 1, Control::Load { model });
-        append_control(&mut input, 12, 2, Control::StartStream);
-        append_control(&mut input, 12, 3, Control::AudioChunk);
-        append_pcm(&mut input, 12, 3, &[0.1]);
-        append_control(
-            &mut input,
-            12,
-            4,
-            Control::Cancel {
-                target_session_id: 12,
-                target_request_id: 3,
-            },
-        );
-        append_control(&mut input, 12, 5, Control::EndStream);
-        append_control(&mut input, 0, 6, Control::Shutdown);
-
-        let responses = run_framed_fake_worker(&factory, input);
-        assert!(matches!(responses[4].2, Control::Ok));
-        assert_error(&responses[5], "no ONNX stream");
-        let state = factory.snapshot();
-        assert_eq!(state.stream_drops, 1);
-        assert_eq!(state.input_finished, 0);
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn framed_worker_rejects_invalid_pcm_before_fake_backend() {
-        let root = test_root("worker-invalid-pcm");
-        let model = spec_with_roles(&root, OnnxModelFamily::OnlineTransducer, TRANSDUCER_ROLES);
-        let factory = FakeRecognizerFactory::new();
-        let mut input = Vec::new();
-        append_control(&mut input, 0, 0, Control::Hello);
-        append_control(&mut input, 1, 1, Control::Load { model });
-        append_control(&mut input, 14, 2, Control::StartStream);
-        append_control(&mut input, 14, 3, Control::AudioChunk);
-        append_pcm(&mut input, 14, 3, &[f32::NAN]);
-        append_control(&mut input, 1, 4, Control::Transcribe);
-        append_pcm(&mut input, 1, 4, &[1.01]);
-        append_control(&mut input, 0, 5, Control::Shutdown);
-
-        let responses = run_framed_fake_worker(&factory, input);
-        assert_error(&responses[3], "non-finite or outside");
-        assert_error(&responses[4], "non-finite or outside");
-        let state = factory.snapshot();
-        assert_eq!(state.chunks_accepted, 0);
-        assert_eq!(state.transcriptions, 0);
-        assert_eq!(state.stream_drops, 1);
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn unload_and_shutdown_drop_stream_before_owning_recognizer() {
-        let root = test_root("worker-drop-order");
-        let first = spec_with_roles(&root, OnnxModelFamily::OnlineTransducer, TRANSDUCER_ROLES);
-        let first_id = first.id.clone();
-        let mut second = first.clone();
-        second.id = "second-online".to_owned();
-        let factory = FakeRecognizerFactory::new();
-        let mut input = Vec::new();
-        append_control(&mut input, 0, 0, Control::Hello);
-        append_control(&mut input, 1, 1, Control::Load { model: first });
-        append_control(&mut input, 20, 2, Control::StartStream);
-        append_control(&mut input, 0, 3, Control::Unload);
-        append_control(&mut input, 1, 4, Control::Load { model: second });
-        append_control(&mut input, 21, 5, Control::StartStream);
-        append_control(&mut input, 0, 6, Control::Shutdown);
-
-        let responses = run_framed_fake_worker(&factory, input);
-        assert!(
-            responses
-                .iter()
-                .all(|response| !matches!(response.2, Control::Error { .. }))
-        );
-        let state = factory.snapshot();
-        assert_eq!(state.stream_drops, 2);
-        assert_eq!(state.recognizer_drops, 2);
-        let relevant = state
-            .events
-            .iter()
-            .filter(|event| event.starts_with("drop-"))
-            .cloned()
-            .collect::<Vec<_>>();
-        assert_eq!(
-            relevant,
-            vec![
-                "drop-stream".to_owned(),
-                format!("drop-recognizer:{first_id}"),
-                "drop-stream".to_owned(),
-                "drop-recognizer:second-online".to_owned(),
-            ]
-        );
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
     fn vad_and_transcription_supervisors_own_independent_transports() {
         let transcription_launcher = Arc::new(TestLauncher::new([TestMode::Normal]));
         let vad_launcher = Arc::new(TestLauncher::new([TestMode::VadNormal]));
@@ -7553,9 +6842,11 @@ mod tests {
             TestMode::VadCrashOnWindow,
             TestMode::VadNormal,
         ]));
-        let transport =
-            OnnxWorkerSupervisor::with_launcher_and_deadlines(launcher.clone(), short_deadlines())
-                .unwrap();
+        let transport = ProcessWorkerSupervisor::with_launcher_and_deadlines(
+            launcher.clone(),
+            short_deadlines(),
+        )
+        .unwrap();
         let vad = SileroVadWorkerSupervisor::with_transport(transport);
         let threshold = VadThreshold::new(0.5).unwrap();
         let window = [0.1; WINDOW_SAMPLES];
@@ -7577,9 +6868,11 @@ mod tests {
 
     fn assert_vad_control_crash_retires_generation(mode: TestMode, fail_end: bool) {
         let launcher = Arc::new(TestLauncher::new([mode, TestMode::VadNormal]));
-        let transport =
-            OnnxWorkerSupervisor::with_launcher_and_deadlines(launcher.clone(), short_deadlines())
-                .unwrap();
+        let transport = ProcessWorkerSupervisor::with_launcher_and_deadlines(
+            launcher.clone(),
+            short_deadlines(),
+        )
+        .unwrap();
         let vad = SileroVadWorkerSupervisor::with_transport(transport);
         let threshold = VadThreshold::new(0.5).unwrap();
         let window = [0.1; WINDOW_SAMPLES];
@@ -7625,9 +6918,11 @@ mod tests {
             ])
             .with_process_events(kill_started_tx, reaped_tx),
         );
-        let transport =
-            OnnxWorkerSupervisor::with_launcher_and_deadlines(launcher.clone(), short_deadlines())
-                .unwrap();
+        let transport = ProcessWorkerSupervisor::with_launcher_and_deadlines(
+            launcher.clone(),
+            short_deadlines(),
+        )
+        .unwrap();
         let vad = SileroVadWorkerSupervisor::with_transport_and_deadlines(
             transport,
             short_vad_deadlines(),
@@ -8048,49 +7343,6 @@ mod tests {
     }
 
     #[test]
-    fn blocked_transcription_is_cancelled_within_250_milliseconds() {
-        let (started_tx, started_rx) = channel();
-        let (kill_started_tx, kill_started_rx) = channel();
-        let (reaped_tx, reaped_rx) = channel();
-        let launcher = Arc::new(
-            TestLauncher::new([
-                TestMode::BlockedDecode {
-                    started: started_tx,
-                },
-                TestMode::Normal,
-            ])
-            .with_process_events(kill_started_tx, reaped_tx),
-        );
-        let supervisor = test_supervisor(launcher);
-        let transcription_supervisor = supervisor.clone();
-        let transcription = std::thread::spawn(move || {
-            transcription_supervisor.transcribe(41, 91, &[0.0, 0.25, -0.25])
-        });
-        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        // Model a request thread blocked inside an OS pipe write: cancellation
-        // must not wait for or attempt to take the stdin writer mutex.
-        let writer_guard = supervisor.inner.writer.lock().unwrap();
-
-        let cancel_started = Instant::now();
-        supervisor.cancel_active().unwrap();
-        let error = transcription.join().unwrap().unwrap_err();
-        kill_started_rx
-            .recv_timeout(Duration::from_millis(250))
-            .unwrap();
-        let remaining = Duration::from_millis(250).saturating_sub(cancel_started.elapsed());
-        reaped_rx.recv_timeout(remaining).unwrap();
-        let cancel_and_reap_duration = cancel_started.elapsed();
-
-        assert!(
-            cancel_and_reap_duration <= Duration::from_millis(250),
-            "cancellation and reaping took {cancel_and_reap_duration:?}"
-        );
-        assert!(error.to_string().contains("cancelled"));
-        drop(writer_guard);
-        supervisor.health(42, 92).unwrap();
-    }
-
-    #[test]
     fn hung_health_expires_its_deadline_invalidates_generation_and_recovers() {
         let (started_tx, started_rx) = channel();
         let (release_tx, release_rx) = channel();
@@ -8101,9 +7353,11 @@ mod tests {
             },
             TestMode::Normal,
         ]));
-        let supervisor =
-            OnnxWorkerSupervisor::with_launcher_and_deadlines(launcher.clone(), short_deadlines())
-                .unwrap();
+        let supervisor = ProcessWorkerSupervisor::with_launcher_and_deadlines(
+            launcher.clone(),
+            short_deadlines(),
+        )
+        .unwrap();
         let waiting = supervisor.clone();
         let request = std::thread::spawn(move || waiting.health(70, 71));
         started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
@@ -8114,71 +7368,6 @@ mod tests {
         drop(release_tx);
         supervisor.health(72, 73).unwrap();
         assert_eq!(launcher.launches.load(Ordering::Acquire), 2);
-    }
-
-    #[test]
-    fn hung_load_is_cancellable_and_cannot_deliver_a_stale_success() {
-        let root = test_root("hung-load-cancel");
-        let model = spec_with_roles(&root, OnnxModelFamily::NemoCtc, NEMO_CTC_ROLES);
-        let (started_tx, started_rx) = channel();
-        let (release_tx, release_rx) = channel();
-        let launcher = Arc::new(TestLauncher::new([
-            TestMode::HoldLoad {
-                started: started_tx,
-                release: release_rx,
-            },
-            TestMode::Normal,
-        ]));
-        let supervisor =
-            OnnxWorkerSupervisor::with_launcher_and_deadlines(launcher.clone(), short_deadlines())
-                .unwrap();
-        let waiting = supervisor.clone();
-        let first_model = model.clone();
-        let request = std::thread::spawn(move || waiting.load(80, 81, first_model));
-        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        let cancel_started = Instant::now();
-        supervisor.cancel_active().unwrap();
-        assert!(cancel_started.elapsed() < Duration::from_millis(250));
-        assert!(
-            request
-                .join()
-                .unwrap()
-                .unwrap_err()
-                .to_string()
-                .contains("cancelled")
-        );
-        drop(release_tx);
-        assert!(!supervisor.load(82, 83, model).unwrap());
-        assert_eq!(launcher.launches.load(Ordering::Acquire), 2);
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn hung_load_deadline_fails_closed_and_recovers_on_a_new_generation() {
-        let root = test_root("hung-load-deadline");
-        let model = spec_with_roles(&root, OnnxModelFamily::NemoCtc, NEMO_CTC_ROLES);
-        let (started_tx, started_rx) = channel();
-        let (release_tx, release_rx) = channel();
-        let launcher = Arc::new(TestLauncher::new([
-            TestMode::HoldLoad {
-                started: started_tx,
-                release: release_rx,
-            },
-            TestMode::Normal,
-        ]));
-        let supervisor =
-            OnnxWorkerSupervisor::with_launcher_and_deadlines(launcher.clone(), short_deadlines())
-                .unwrap();
-        let waiting = supervisor.clone();
-        let first_model = model.clone();
-        let request = std::thread::spawn(move || waiting.load(84, 85, first_model));
-        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        let error = request.join().unwrap().unwrap_err();
-        assert!(error.to_string().contains("deadline exceeded"));
-        drop(release_tx);
-        assert!(!supervisor.load(86, 87, model).unwrap());
-        assert_eq!(launcher.launches.load(Ordering::Acquire), 2);
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -8195,7 +7384,8 @@ mod tests {
             .with_process_events(kill_started_tx, reaped_tx),
         );
         let supervisor =
-            OnnxWorkerSupervisor::with_launcher_and_deadlines(launcher, short_deadlines()).unwrap();
+            ProcessWorkerSupervisor::with_launcher_and_deadlines(launcher, short_deadlines())
+                .unwrap();
         supervisor.start_stream(88, 89).unwrap();
         let waiting = supervisor.clone();
         let cancel = std::thread::spawn(move || waiting.cancel_stream(88, 90));
@@ -8208,64 +7398,6 @@ mod tests {
             .recv_timeout(Duration::from_millis(250))
             .unwrap();
         drop(release_tx);
-    }
-
-    #[test]
-    fn blocked_old_generation_reap_cannot_delay_new_generation_termination() {
-        let (first_started_tx, first_started_rx) = channel();
-        let (first_release_tx, first_release_rx) = channel();
-        let (second_started_tx, second_started_rx) = channel();
-        let (kill_started_tx, kill_started_rx) = channel();
-        let (reaped_tx, reaped_rx) = channel();
-        let launcher = Arc::new(
-            TestLauncher::new([
-                TestMode::HoldCancel {
-                    started: first_started_tx,
-                    release: first_release_rx,
-                },
-                TestMode::BlockedDecode {
-                    started: second_started_tx,
-                },
-            ])
-            .with_process_events(kill_started_tx, reaped_tx),
-        );
-        let supervisor =
-            OnnxWorkerSupervisor::with_launcher_and_deadlines(launcher, short_deadlines()).unwrap();
-
-        supervisor.start_stream(100, 1).unwrap();
-        let first_cancel_supervisor = supervisor.clone();
-        let first_cancel =
-            std::thread::spawn(move || first_cancel_supervisor.cancel_stream(100, 2));
-        first_started_rx
-            .recv_timeout(Duration::from_secs(1))
-            .unwrap();
-        assert!(first_cancel.join().unwrap().is_err());
-        kill_started_rx
-            .recv_timeout(Duration::from_millis(250))
-            .unwrap();
-
-        let second_request_supervisor = supervisor.clone();
-        let second_request =
-            std::thread::spawn(move || second_request_supervisor.transcribe(101, 3, &[0.0, 0.1]));
-        second_started_rx
-            .recv_timeout(Duration::from_secs(1))
-            .unwrap();
-        let cancel_started = Instant::now();
-        supervisor.cancel_active().unwrap();
-        assert!(
-            cancel_started.elapsed() <= Duration::from_millis(250),
-            "second-generation cancellation took {:?}",
-            cancel_started.elapsed()
-        );
-        kill_started_rx
-            .recv_timeout(Duration::from_millis(250))
-            .expect("the blocked first-generation wait must not serialize the second kill");
-        assert!(second_request.join().unwrap().is_err());
-
-        first_release_tx.send(()).unwrap();
-        for _ in 0..2 {
-            reaped_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        }
     }
 
     #[test]
@@ -8393,71 +7525,6 @@ mod tests {
         assert_eq!(supervisor.generation_for_test(), replacement_generation);
     }
 
-    #[test]
-    fn failed_changed_load_invalidates_cached_identity_and_recovers_on_clean_generation() {
-        let root = test_root("supervisor-failed-changed-load");
-        let first = spec_with_roles(&root, OnnxModelFamily::NemoCtc, NEMO_CTC_ROLES);
-        let mut changed = first.clone();
-        changed.id = "changed-model".to_owned();
-        let (kill_started_tx, kill_started_rx) = channel();
-        let (reaped_tx, reaped_rx) = channel();
-        let launcher = Arc::new(
-            TestLauncher::new([TestMode::FailChangedLoad, TestMode::Normal])
-                .with_process_events(kill_started_tx, reaped_tx),
-        );
-        let supervisor = test_supervisor(Arc::clone(&launcher));
-
-        assert!(!supervisor.load(1, 1, first.clone()).unwrap());
-        let error = supervisor.load(2, 2, changed).unwrap_err();
-        assert!(error.to_string().contains("replacement failed"));
-        kill_started_rx
-            .recv_timeout(Duration::from_secs(1))
-            .unwrap();
-        reaped_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-
-        assert!(!supervisor.load(3, 3, first.clone()).unwrap());
-        assert!(supervisor.load(4, 4, first).unwrap());
-        assert_eq!(launcher.launches.load(Ordering::Acquire), 2);
-
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn changed_load_during_stream_retires_generation_and_stale_stream_never_spawns_worker() {
-        let root = test_root("supervisor-stream-replacement");
-        let first = spec_with_roles(&root, OnnxModelFamily::NemoCtc, NEMO_CTC_ROLES);
-        let mut changed = first.clone();
-        changed.id = "changed-stream-model".to_owned();
-        let (kill_started_tx, kill_started_rx) = channel();
-        let (reaped_tx, _reaped_rx) = channel();
-        let launcher = Arc::new(
-            TestLauncher::new([TestMode::FailChangedLoadWithActiveStream, TestMode::Normal])
-                .with_process_events(kill_started_tx, reaped_tx),
-        );
-        let supervisor = test_supervisor(Arc::clone(&launcher));
-
-        assert!(!supervisor.load(110, 1, first).unwrap());
-        supervisor.start_stream(111, 2).unwrap();
-        let error = supervisor.load(112, 3, changed).unwrap_err();
-        assert!(error.to_string().contains("stream is active"));
-        kill_started_rx
-            .recv_timeout(Duration::from_millis(250))
-            .unwrap();
-        assert_eq!(launcher.launches.load(Ordering::Acquire), 1);
-
-        assert!(supervisor.audio_chunk(111, 4, &[0.1]).is_err());
-        assert!(supervisor.end_stream(111, 5).is_err());
-        assert_eq!(
-            launcher.launches.load(Ordering::Acquire),
-            1,
-            "a stale stream must not create an empty replacement generation"
-        );
-        supervisor.health(113, 6).unwrap();
-        assert_eq!(launcher.launches.load(Ordering::Acquire), 2);
-
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
     fn assert_generation_failure_fails_all_pending_and_recovers(malformed: bool) {
         let (received_tx, received_rx) = channel();
         let (kill_started_tx, kill_started_rx) = channel();
@@ -8546,6 +7613,24 @@ mod tests {
         ] {
             assert!(read_frame(&mut Cursor::new(bytes)).is_err());
         }
+    }
+
+    #[test]
+    fn protocol_v4_rejects_v3_and_removed_direct_commands() {
+        let v3 = raw_header(3, FrameKind::Control as u8, 0);
+        assert!(read_frame(&mut Cursor::new(v3)).is_err());
+
+        for removed in [
+            br#"{"command":"load","model":{}}"#.as_slice(),
+            br#"{"command":"transcribe"}"#.as_slice(),
+        ] {
+            assert!(serde_json::from_slice::<Control>(removed).is_err());
+        }
+
+        assert!(worker_role_from_args(&[std::ffi::OsString::from("--onnx-worker")]).is_err());
+        assert!(
+            worker_role_from_args(&[std::ffi::OsString::from("--scribe-onnx-worker")]).is_err()
+        );
     }
 
     #[test]
