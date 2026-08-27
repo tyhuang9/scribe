@@ -194,6 +194,56 @@ final result: passed
 
 ---
 
+# Scribe identity and palette refresh — Product Design QA — 2026-08-26
+
+## Source and implementation evidence
+
+- Brand source: `C:\Users\huang\AppData\Local\Temp\codex-clipboard-9f363fa0-574a-4347-a370-81196cd258b3.png`.
+- Light native capture: `design-qa-evidence/branding/native-light.png`.
+- Dark native capture: `design-qa-evidence/branding/native-dark.png`.
+- Frozen implementation head: `90f84ec` (`Strengthen Scribe navigation lockup`).
+
+The source board and both native captures were opened together at original
+resolution. The captured fixture is `transcribe/listening` with the full
+navigation lockup visible. Both captures come from the rebuilt Windows UI
+harness and were taken after placing the native window wholly on the physical
+left secondary display.
+
+## Fidelity result
+
+- The navigation uses the canonical seven-bar waveform-S mark beside the
+  lowercase `scribe` wordmark; the title-bar application icon uses the same
+  identity family.
+- Light surfaces visibly use Deep Ink, Scribe Teal, Soft Aqua, Ice Mist, and
+  Live Coral in the roles defined by the supplied board.
+- Dark surfaces visibly use Deep Navy, Navy Surface, Teal Accent, Soft Aqua,
+  and Live Coral in the same hierarchy as the supplied board.
+- Active navigation, selector surfaces, borders, recording state, buttons,
+  text hierarchy, hover/weak states, and the theme switch inherit the shared
+  branded visuals rather than egui defaults.
+- The light/dark control switches the live native view and exposes the correct
+  accessible name after the state settles (`Switch to dark theme` / `Switch to
+  light theme`).
+- No P0, P1, or P2 identity, palette, clipping, overlap, or contrast mismatch
+  remains in the reviewed full-width state. Layout and fixture copy differ from
+  the brand-board examples by design; the board is the source for identity and
+  color roles, not a request to replace Scribe's current information
+  architecture.
+
+## Verification
+
+- `cargo fmt --all -- --check`: passed.
+- `cargo check --locked --all-targets --all-features`: passed.
+- `cargo clippy --locked --all-targets --all-features -- -D warnings`: passed.
+- `cargo test --locked --all-features brand`: 8 passed, 0 failed.
+- `cargo build --locked --features ui-harness`: passed.
+- Native light and dark theme switching: passed.
+- Full navigation lockup and left-secondary placement: passed.
+
+final result: passed
+
+---
+
 # Foreground-aware recording overlay QA - 2026-08-17
 
 ## Source and implementation scope
