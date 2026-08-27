@@ -990,18 +990,12 @@ fn validate_receipt_backed_bundle(
     bundle_id: &str,
     aggregate_size_bytes: u64,
 ) -> Result<(), String> {
-    let bundle = crate::onnx_model_bundles::bundle_manifest(bundle_id).ok_or_else(|| {
-        format!("receipt-backed bundle is absent from the ONNX manifest: {bundle_id}")
-    })?;
-    let manifest_size = bundle.files.iter().try_fold(0_u64, |total, file| {
-        total
-            .checked_add(file.size_bytes)
-            .ok_or_else(|| format!("receipt-backed bundle size overflowed: {bundle_id}"))
-    })?;
-    if manifest_size != aggregate_size_bytes {
-        return Err(format!(
-            "receipt-backed bundle aggregate size does not match the ONNX manifest: {bundle_id}"
-        ));
+    let stable_id = !bundle_id.is_empty()
+        && bundle_id.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+        });
+    if !stable_id || aggregate_size_bytes == 0 {
+        return Err("receipt-backed bundle metadata is invalid".to_owned());
     }
     Ok(())
 }

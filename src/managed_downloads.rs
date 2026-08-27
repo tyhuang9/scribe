@@ -118,6 +118,16 @@ pub(crate) fn normalized_model_retained_partial(
     config: &AppConfig,
     model_id: &ModelId,
 ) -> Result<Option<RetainedPartial>, InstallError> {
+    if let Some(crate::model_catalog::NormalizedInstallArtifact::ReceiptBackedBundle {
+        bundle_id,
+        ..
+    }) = crate::model_catalog::normalized_install_artifact(model_id)
+    {
+        return crate::onnx_model_bundles::retained_onnx_bundle_partial(
+            bundle_id,
+            &config::onnx_bundle_storage_dir(config),
+        );
+    }
     pinned_artifact_retained_partial(&normalized_model_download_spec(config, model_id)?)
 }
 
@@ -125,6 +135,17 @@ pub(crate) fn discard_normalized_model_partial(
     config: &AppConfig,
     model_id: &ModelId,
 ) -> Result<bool, InstallError> {
+    if let Some(crate::model_catalog::NormalizedInstallArtifact::ReceiptBackedBundle {
+        bundle_id,
+        ..
+    }) = crate::model_catalog::normalized_install_artifact(model_id)
+    {
+        return crate::onnx_model_bundles::discard_onnx_bundle_partials(
+            bundle_id,
+            &config::onnx_bundle_storage_dir(config),
+        )
+        .map(|count| count != 0);
+    }
     discard_pinned_artifact_partial(&normalized_model_download_spec(config, model_id)?)
 }
 

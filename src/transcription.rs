@@ -4587,7 +4587,12 @@ mod tests {
         let service = TranscriptionService::new(AppConfig::default());
         let descriptors = service.model_descriptors();
 
-        assert_eq!(descriptors.len(), 4);
+        assert_eq!(descriptors.len(), 5);
+        assert!(
+            descriptors
+                .iter()
+                .any(|descriptor| descriptor.id.as_str() == "moonshine-tiny-en-int8-onnx")
+        );
         for descriptor in descriptors {
             assert!(matches!(
                 descriptor.compatibility,

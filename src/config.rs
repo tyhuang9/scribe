@@ -377,12 +377,19 @@ pub(crate) fn installed_onnx_bundle_root(
     if bundle_id != model_id.as_str() || bundle_id != "moonshine-tiny-en-int8-onnx" {
         return None;
     }
-    let root =
-        crate::onnx_model_bundles::bundle_target_root(&onnx_bundle_storage_dir(config), bundle_id)
-            .ok()?;
+    let root = onnx_bundle_target_root(config, model_id)?;
     crate::onnx_model_bundles::current_executable_receipt_at(&root)
         .ok()
         .map(|_| root)
+}
+
+pub(crate) fn onnx_bundle_target_root(config: &AppConfig, model_id: &ModelId) -> Option<PathBuf> {
+    let crate::model_catalog::NormalizedInstallArtifact::ReceiptBackedBundle { bundle_id, .. } =
+        crate::model_catalog::normalized_install_artifact(model_id)?
+    else {
+        return None;
+    };
+    (bundle_id == model_id.as_str()).then(|| onnx_bundle_storage_dir(config).join(bundle_id))
 }
 
 fn configured_models_with_bundled_path(
@@ -1938,6 +1945,10 @@ mod tests {
         );
         assert!(installed_onnx_bundle_root(&config, &model_id).is_none());
         assert_eq!(
+            onnx_bundle_target_root(&config, &model_id),
+            Some(expected.clone())
+        );
+        assert_eq!(
             serde_json::to_vec(&config).unwrap(),
             before,
             "read-only discovery must not mutate settings"
@@ -1954,6 +1965,11 @@ mod tests {
             .unwrap();
         assert_eq!(projected.local_path.as_deref(), Some(expected.as_path()));
         assert_eq!(projected.install_status, ModelInstallStatus::Missing);
+        assert_eq!(
+            onnx_bundle_target_root(&config, &model_id),
+            Some(expected.clone()),
+            "cleanup target remains deterministic when execution receipt is invalid"
+        );
         assert_eq!(
             serde_json::to_vec(&config).unwrap(),
             before,
