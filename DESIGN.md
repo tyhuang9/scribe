@@ -50,6 +50,11 @@ not replacements for the six exact dark application tokens. Approved identity
 SVG and icon asset bytes remain intentionally stable and are not recolored by
 the application theme.
 
+`#23262C` is the approved derived dark elevation surface. Use it only when a
+raised or active panel must remain visibly distinct from Surface `#1A1D22`,
+such as the active model-card state; it is not a seventh canonical palette
+token.
+
 ### Semantic and accessibility mappings
 
 - Deep Ink is the normal text color on white and Ice Mist. Soft Text is the normal text color on Charcoal and Surface, while Muted Gray is reserved for supporting copy and metadata.
