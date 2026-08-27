@@ -369,7 +369,7 @@ pub(crate) fn installed_onnx_bundle_root(
     config: &AppConfig,
     model_id: &ModelId,
 ) -> Option<PathBuf> {
-    let bundle_id = crate::model_catalog::normalized_receipt_backed_bundle_id(model_id)?;
+    crate::model_catalog::normalized_receipt_backed_bundle_id(model_id)?;
     let root = onnx_bundle_target_root(config, model_id)?;
     crate::onnx_model_bundles::current_executable_receipt_at(&root)
         .ok()

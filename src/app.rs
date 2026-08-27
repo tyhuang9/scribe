@@ -2297,7 +2297,7 @@ fn run_verified_install_finalizer(
     let mut runtime_version = None;
     let mut runtime_package_id = None;
     let mut runtime_archive_sha256 = None;
-    let mut candidate_root = (!model_uses_embedded_runtime)
+    let mut candidate_root: Option<PathBuf> = (!model_uses_embedded_runtime)
         .then_some(existing_runtime_root)
         .flatten();
 
@@ -3937,6 +3937,25 @@ impl LocalTranscriberApp {
         if self.transcription_service.install_plan(&model_id).is_none() && !embedded_gguf {
             return;
         }
+        let binding = if !embedded_gguf {
+            match self
+                .transcription_service
+                .recovery_installation_binding(&model_id)
+            {
+                Ok(binding) => Some(binding),
+                Err(error) => {
+                    let message = format!(
+                        "The managed runtime settings record is unsafe or unavailable; repair or remove it before transcription: {error}"
+                    );
+                    self.artifact_recovery_error = Some(message.clone());
+                    self.status = TranscriptionStatus::Error;
+                    self.status_message = message;
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         if model.local_path.as_ref().is_none_or(|path| !path.is_file()) {
             return;
         }
@@ -3979,7 +3998,7 @@ impl LocalTranscriberApp {
             Ok(None) => {
                 match self.restore_bundled_runtime_fallback(
                     &model,
-                    &binding.managed_runtime_id,
+                    &binding.as_ref().unwrap().managed_runtime_id,
                     "Managed runtime failed; restored and verified the immutable bundled runtime.",
                 ) {
                     Ok(()) => return,
@@ -3997,7 +4016,7 @@ impl LocalTranscriberApp {
             Err(error) => {
                 match self.restore_bundled_runtime_fallback(
                     &model,
-                    &binding.managed_runtime_id,
+                    &binding.as_ref().unwrap().managed_runtime_id,
                     "Managed runtime and its previous package failed verification; restored and verified the immutable bundled runtime.",
                 ) {
                     Ok(()) => return,
@@ -4045,7 +4064,7 @@ impl LocalTranscriberApp {
             Err(error) => {
                 match self.restore_bundled_runtime_fallback(
                     &model,
-                    &binding.managed_runtime_id,
+                    &binding.as_ref().unwrap().managed_runtime_id,
                     "The previous runtime failed verification; restored and verified the immutable bundled runtime.",
                 ) {
                     Ok(()) => {}

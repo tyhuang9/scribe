@@ -4582,6 +4582,42 @@ mod tests {
     }
 
     #[test]
+    fn trusted_remote_gguf_is_not_a_normalized_install_plan() {
+        let root =
+            std::env::temp_dir().join(format!("scribe-remote-gguf-service-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let repository = "handy-computer/example-asr-gguf";
+        let revision = "0123456789abcdef0123456789abcdef01234567";
+        let filename = "example-Q4_K_M.gguf";
+        let id = config::managed_remote_model_id(repository, revision, filename).unwrap();
+        let path = root.join(filename);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(&path, b"fixture").unwrap();
+        let mut config = AppConfig::default();
+        config.general.managed_remote_models.insert(
+            id.clone(),
+            config::ManagedRemoteModelInstall::trusted(
+                config::RemoteGgufArtifact {
+                    repository: repository.to_owned(),
+                    revision: revision.to_owned(),
+                    filename: filename.to_owned(),
+                    expected_size_bytes: 7,
+                    expected_sha256: format!("{:x}", Sha256::digest(b"fixture")),
+                },
+                path,
+                "Remote fixture".to_owned(),
+                "Trusted remote fixture".to_owned(),
+                vec!["en".to_owned()],
+                false,
+            ),
+        );
+        let service = TranscriptionService::new(config);
+
+        assert_eq!(service.install_plan(&ModelId::new(id)), None);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn normalized_catalog_install_plans_never_require_a_legacy_runtime() {
         let service = TranscriptionService::new(AppConfig::default());
 

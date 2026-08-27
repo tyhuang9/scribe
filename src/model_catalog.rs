@@ -603,9 +603,16 @@ pub(crate) fn normalized_install_artifact(id: &ModelId) -> Option<NormalizedInst
 /// Returns a catalog-authorized receipt-backed bundle ID only when the
 /// descriptor's typed receipt binding is self-consistent.
 pub(crate) fn normalized_receipt_backed_bundle_id(id: &ModelId) -> Option<&'static str> {
-    match normalized_install_artifact(id)? {
+    receipt_backed_bundle_id_for_artifact(id.as_str(), normalized_install_artifact(id)?)
+}
+
+fn receipt_backed_bundle_id_for_artifact(
+    model_id: &str,
+    artifact: NormalizedInstallArtifact,
+) -> Option<&'static str> {
+    match artifact {
         NormalizedInstallArtifact::ReceiptBackedBundle { bundle_id, .. }
-            if bundle_id == id.as_str() =>
+            if bundle_id == model_id =>
         {
             Some(bundle_id)
         }
@@ -1500,13 +1507,35 @@ mod tests {
 
     #[test]
     fn receipt_backed_bundle_authorization_comes_from_catalog_metadata() {
-        let id = ModelId::new("moonshine-tiny-en-int8-onnx");
         assert_eq!(
-            normalized_receipt_backed_bundle_id(&id),
-            Some("moonshine-tiny-en-int8-onnx")
+            receipt_backed_bundle_id_for_artifact(
+                "synthetic-receipt-backed-bundle",
+                NormalizedInstallArtifact::ReceiptBackedBundle {
+                    bundle_id: "synthetic-receipt-backed-bundle",
+                    aggregate_size_bytes: 1,
+                },
+            ),
+            Some("synthetic-receipt-backed-bundle")
         );
         assert_eq!(
-            normalized_receipt_backed_bundle_id(&ModelId::new("moonshine")),
+            receipt_backed_bundle_id_for_artifact(
+                "synthetic-receipt-backed-bundle",
+                NormalizedInstallArtifact::ReceiptBackedBundle {
+                    bundle_id: "different-bundle",
+                    aggregate_size_bytes: 1,
+                },
+            ),
+            None
+        );
+        assert_eq!(
+            receipt_backed_bundle_id_for_artifact(
+                "synthetic-receipt-backed-bundle",
+                normalized_install_artifact(&ModelId::new("whisper_cpp_tiny_en")).unwrap(),
+            ),
+            None
+        );
+        assert_eq!(
+            normalized_receipt_backed_bundle_id(&ModelId::new("unknown-receipt-backed-bundle")),
             None
         );
     }
