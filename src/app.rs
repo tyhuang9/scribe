@@ -3924,9 +3924,10 @@ impl LocalTranscriberApp {
             }
             return;
         }
-        let embedded_gguf = config::remote_gguf_artifact(&self.config, &model.id).is_some()
+        let artifact_only = self.transcription_service.install_plan(&model_id).is_some()
+            || config::remote_gguf_artifact(&self.config, &model.id).is_some()
             || config::imported_gguf_artifact(&self.config, &model.id).is_some();
-        if !embedded_gguf
+        if !artifact_only
             && self
                 .transcription_service
                 .model_descriptor(&model_id)
@@ -3934,28 +3935,6 @@ impl LocalTranscriberApp {
         {
             return;
         }
-        if self.transcription_service.install_plan(&model_id).is_none() && !embedded_gguf {
-            return;
-        }
-        let binding = if !embedded_gguf {
-            match self
-                .transcription_service
-                .recovery_installation_binding(&model_id)
-            {
-                Ok(binding) => Some(binding),
-                Err(error) => {
-                    let message = format!(
-                        "The managed runtime settings record is unsafe or unavailable; repair or remove it before transcription: {error}"
-                    );
-                    self.artifact_recovery_error = Some(message.clone());
-                    self.status = TranscriptionStatus::Error;
-                    self.status_message = message;
-                    return;
-                }
-            }
-        } else {
-            None
-        };
         if model.local_path.as_ref().is_none_or(|path| !path.is_file()) {
             return;
         }
@@ -3980,7 +3959,7 @@ impl LocalTranscriberApp {
         }
         let current_error = current.unwrap_err();
         let _ = self.transcription_service.unload_runtime();
-        if embedded_gguf {
+        if artifact_only {
             let message = format!(
                 "The selected GGUF could not be loaded by the embedded runtime: {current_error}"
             );
@@ -3990,6 +3969,21 @@ impl LocalTranscriberApp {
             self.status_message = message;
             return;
         }
+        let binding = match self
+            .transcription_service
+            .recovery_installation_binding(&model_id)
+        {
+            Ok(binding) => binding,
+            Err(error) => {
+                let message = format!(
+                    "The managed runtime settings record is unsafe or unavailable; repair or remove it before transcription: {error}"
+                );
+                self.artifact_recovery_error = Some(message.clone());
+                self.status = TranscriptionStatus::Error;
+                self.status_message = message;
+                return;
+            }
+        };
         let recovery = match self
             .transcription_service
             .rollback_to_previous_runtime(&model_id)
@@ -3998,7 +3992,7 @@ impl LocalTranscriberApp {
             Ok(None) => {
                 match self.restore_bundled_runtime_fallback(
                     &model,
-                    &binding.as_ref().unwrap().managed_runtime_id,
+                    &binding.managed_runtime_id,
                     "Managed runtime failed; restored and verified the immutable bundled runtime.",
                 ) {
                     Ok(()) => return,
@@ -4016,7 +4010,7 @@ impl LocalTranscriberApp {
             Err(error) => {
                 match self.restore_bundled_runtime_fallback(
                     &model,
-                    &binding.as_ref().unwrap().managed_runtime_id,
+                    &binding.managed_runtime_id,
                     "Managed runtime and its previous package failed verification; restored and verified the immutable bundled runtime.",
                 ) {
                     Ok(()) => return,
@@ -4064,7 +4058,7 @@ impl LocalTranscriberApp {
             Err(error) => {
                 match self.restore_bundled_runtime_fallback(
                     &model,
-                    &binding.as_ref().unwrap().managed_runtime_id,
+                    &binding.managed_runtime_id,
                     "The previous runtime failed verification; restored and verified the immutable bundled runtime.",
                 ) {
                     Ok(()) => {}
@@ -26579,6 +26573,25 @@ mod layout_tests {
             runtime_status_for_model(&AppConfig::default(), &model),
             ModelRuntimeStatus::Ready
         );
+    }
+
+    #[test]
+    fn normalized_pinned_gguf_startup_uses_artifact_validation_not_runtime_recovery() {
+        let mut app = test_app();
+
+        app.validate_startup_runtime_or_recover();
+
+        assert!(matches!(app.status, TranscriptionStatus::Error));
+        assert!(matches!(
+            app.model_downloads
+                .get(&app.config.general.selected_default_model),
+            Some(ModelInstallStatus::Error(_))
+        ));
+        assert!(
+            !app.status_message
+                .contains("managed runtime settings record")
+        );
+        assert!(app.artifact_recovery_error.is_none());
     }
 
     #[test]
