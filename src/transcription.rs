@@ -1343,7 +1343,12 @@ impl TranscriptionService {
         &self,
         root: &Path,
     ) -> Result<RuntimeLoadExecution> {
-        self.preload_runtime_artifact(self.onnx_artifact_from_receipt(root)?)
+        self.worker
+            .load(
+                self.onnx_artifact_from_receipt(root)?,
+                AccelerationPreference::Cpu,
+            )
+            .map_err(Into::into)
     }
 
     pub(crate) fn transcribe_onnx_bundle_from_receipt(
@@ -1352,7 +1357,15 @@ impl TranscriptionService {
         audio: Arc<PreparedAudio>,
         options: TranscriptionOptions,
     ) -> Result<RuntimeExecution> {
-        self.transcribe_runtime_artifact(self.onnx_artifact_from_receipt(root)?, audio, options)
+        self.worker
+            .transcribe(
+                self.onnx_artifact_from_receipt(root)?,
+                AccelerationPreference::Cpu,
+                audio,
+                options,
+                self.worker.cancellation_snapshot(),
+            )
+            .map_err(Into::into)
     }
 
     /// Runs the staged bundle through the process-isolated ONNX worker before
@@ -1660,7 +1673,13 @@ impl TranscriptionService {
                     "selected ONNX bundle path is not its canonical receipt root"
                 ));
             }
-            return self.health_check_runtime_artifact(self.onnx_artifact_from_receipt(&root)?);
+            return self
+                .worker
+                .health_check(
+                    self.onnx_artifact_from_receipt(&root)?,
+                    AccelerationPreference::Cpu,
+                )
+                .map_err(Into::into);
         }
         let model = self.resolve_model(model_id, model_path)?;
         let runtime_model = self.resolve_runtime_model(model)?;
@@ -2211,7 +2230,7 @@ impl TranscriptionService {
                 .worker
                 .transcribe(
                     artifact,
-                    self.config.performance.acceleration_preference,
+                    AccelerationPreference::Cpu,
                     Arc::clone(&request.audio),
                     request.options.clone(),
                     ticket.native_generation,

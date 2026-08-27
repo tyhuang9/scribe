@@ -3704,6 +3704,43 @@ impl LocalTranscriberApp {
             return;
         }
         let model_id = ModelId::new(&model.id);
+        if matches!(
+            crate::model_catalog::normalized_install_artifact(&model_id),
+            Some(crate::model_catalog::NormalizedInstallArtifact::ReceiptBackedBundle { .. })
+        ) {
+            let Some(root) = config::installed_onnx_bundle_root(&self.config, &model_id) else {
+                let message = "The selected ONNX model receipt or bundle tree is missing, tampered, or no longer matches this Scribe catalog. Choose Repair before transcription."
+                    .to_owned();
+                self.model_downloads
+                    .insert(model.id.clone(), ModelInstallStatus::Error(message.clone()));
+                self.status = TranscriptionStatus::Error;
+                self.status_message = message;
+                return;
+            };
+            if model.local_path.as_deref() != Some(root.as_path()) {
+                self.status = TranscriptionStatus::Error;
+                self.status_message =
+                    "The selected ONNX model does not resolve to its canonical receipt root. Repair or remove it before transcription."
+                        .to_owned();
+                return;
+            }
+            if let Err(error) = self
+                .transcription_service
+                .health_check(&model_id, Some(root))
+            {
+                self.model_downloads.insert(
+                    model.id.clone(),
+                    ModelInstallStatus::Error(format!(
+                        "The selected ONNX bundle failed startup receipt and worker validation: {error}"
+                    )),
+                );
+                self.status = TranscriptionStatus::Error;
+                self.status_message = format!(
+                    "The selected ONNX bundle failed startup validation; choose Repair: {error}"
+                );
+            }
+            return;
+        }
         let embedded_gguf = config::remote_gguf_artifact(&self.config, &model.id).is_some()
             || config::imported_gguf_artifact(&self.config, &model.id).is_some();
         if !embedded_gguf
@@ -8477,7 +8514,7 @@ impl LocalTranscriberApp {
                 if self.onnx_bundle_install.is_some() {
                     self.fail_model_install(
                         &model.id,
-                        "An ONNX model installation is already active.",
+                        "An ONNX model installation is already active.".to_owned(),
                     );
                     return;
                 }
@@ -9060,6 +9097,9 @@ impl LocalTranscriberApp {
                 config::downloaded_model_path(&self.config, model).as_ref() == Some(path)
             })
             .filter(|path| is_app_managed_model_path(&self.config, path));
+        let onnx_bundle_target =
+            config::installed_onnx_bundle_root(&self.config, &ModelId::new(&model.id))
+                .filter(|path| is_app_managed_model_path(&self.config, path));
         let legacy_catalog_target = app_owned_legacy_catalog_artifact(&self.config, model)
             .then(|| model.local_path.clone())
             .flatten();
@@ -9084,6 +9124,7 @@ impl LocalTranscriberApp {
             .filter(|path| is_app_managed_model_path(&self.config, path));
         let imported_local = imported_receipt_target.is_some();
         let managed_target = static_managed_target
+            .or(onnx_bundle_target)
             .or(remote_managed_target)
             .or(imported_receipt_target)
             .or(legacy_catalog_target);
@@ -11743,6 +11784,15 @@ impl LocalTranscriberApp {
     }
 
     fn discard_normalized_model_partial(&mut self, model_id: ModelId) {
+        if let Some((_, active_model_id, cancellation)) = &self.onnx_bundle_install
+            && active_model_id == model_id.as_str()
+        {
+            cancellation.cancel();
+            self.status_message =
+                "Cancelling ONNX download; retained exact partials can be discarded after it exits."
+                    .to_owned();
+            return;
+        }
         if let Some((job_id, cancellation)) =
             self.artifact_installations.get(model_id.as_str()).cloned()
         {
@@ -11760,7 +11810,16 @@ impl LocalTranscriberApp {
             self.status_message = format!("Could not discard the retained partial: {reason}");
             return;
         }
-        let result = managed_downloads::discard_normalized_model_partial(&self.config, &model_id);
+        let result = match managed_downloads::discard_normalized_onnx_bundle_partials(
+            &self.config,
+            &model_id,
+        ) {
+            Ok(Some(count)) => Ok(count != 0),
+            Ok(None) => {
+                managed_downloads::discard_normalized_model_partial(&self.config, &model_id)
+            }
+            Err(error) => Err(error),
+        };
         self.finish_partial_discard(model_id.as_str(), result);
     }
 

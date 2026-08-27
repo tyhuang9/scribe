@@ -392,10 +392,26 @@ fn configured_models_with_bundled_path(
     let mut models = default_model_catalog()
         .into_iter()
         .map(|mut model| {
-            if let Some(root) = installed_onnx_bundle_root(config, &ModelId::new(&model.id)) {
-                model.local_path = Some(root);
+            let model_id = ModelId::new(&model.id);
+            if matches!(
+                crate::model_catalog::normalized_install_artifact(&model_id),
+                Some(crate::model_catalog::NormalizedInstallArtifact::ReceiptBackedBundle { .. })
+            ) {
+                let root = crate::onnx_model_bundles::bundle_target_root(
+                    &onnx_bundle_storage_dir(config),
+                    &model.id,
+                )
+                .expect("normalized ONNX model id is a stable bundle id");
+                let installed = installed_onnx_bundle_root(config, &model_id).is_some();
+                model.local_path = root.exists().then_some(root);
                 model.artifact_origin = ModelArtifactOrigin::Managed;
-                model.install_status = ModelInstallStatus::Installed;
+                model.install_status = if installed {
+                    ModelInstallStatus::Installed
+                } else if model.local_path.is_some() {
+                    ModelInstallStatus::Missing
+                } else {
+                    ModelInstallStatus::NotInstalled
+                };
                 return model;
             }
             let bundled_path = (model.id == BUNDLED_BASE_MODEL_ID)
@@ -1891,6 +1907,63 @@ mod tests {
             downloaded_model_path(&config, &faster_model).unwrap(),
             PathBuf::from("/tmp/scribe-models/faster-whisper/faster_whisper_tiny_en")
         );
+    }
+
+    #[test]
+    fn receipt_backed_onnx_projection_is_canonical_and_failure_closed() {
+        let root = std::env::temp_dir().join(format!(
+            "scribe-onnx-config-projection-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let config = AppConfig {
+            general: GeneralSettings {
+                model_storage_dir: root.clone(),
+                ..Default::default()
+            },
+            ..AppConfig::default()
+        };
+        let before = config.clone();
+        let model_id = ModelId::new("moonshine-tiny-en-int8-onnx");
+        let expected = root
+            .join("onnx-bundles")
+            .join("moonshine-tiny-en-int8-onnx");
+        let catalog_model = default_model_catalog()
+            .into_iter()
+            .find(|model| model.id == model_id.as_str())
+            .unwrap();
+        assert_eq!(
+            downloaded_model_path(&config, &catalog_model),
+            Some(expected.clone())
+        );
+        assert!(installed_onnx_bundle_root(&config, &model_id).is_none());
+        assert_eq!(
+            config, before,
+            "read-only discovery must not mutate settings"
+        );
+
+        fs::create_dir_all(&expected).unwrap();
+        fs::write(expected.join("tokens.txt"), b"plausible but unreceipted").unwrap();
+        fs::write(expected.join("encoder.int8.onnx"), b"tampered").unwrap();
+        fs::write(expected.join("decoder.int8.onnx"), b"tampered").unwrap();
+        fs::write(expected.join("joiner.int8.onnx"), b"tampered").unwrap();
+        let projected = configured_models(&config)
+            .into_iter()
+            .find(|model| model.id == model_id.as_str())
+            .unwrap();
+        assert_eq!(projected.local_path.as_deref(), Some(expected.as_path()));
+        assert_eq!(projected.install_status, ModelInstallStatus::Missing);
+        assert_eq!(
+            config, before,
+            "failed receipt discovery must not mutate settings"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn wrong_onnx_bundle_id_has_no_canonical_install_root() {
+        let config = AppConfig::default();
+        assert!(installed_onnx_bundle_root(&config, &ModelId::new("moonshine-wrong-id")).is_none());
     }
 
     #[test]
