@@ -76,11 +76,13 @@ Assert-HashSet @(
     'website\public\brand\scribe-mark.svg'
 ) 'Canonical mark'
 Assert-HashSet @(
+    'assets\branding\scribe-lockup-light.svg',
     'docs\assets\branding\scribe-lockup-light.svg',
     'website\public\brand\scribe-lockup-light.svg',
     'website\src\assets\scribe-lockup-light.svg'
 ) 'Light lockup'
 Assert-HashSet @(
+    'assets\branding\scribe-lockup-dark.svg',
     'docs\assets\branding\scribe-lockup-dark.svg',
     'website\public\brand\scribe-lockup-dark.svg',
     'website\src\assets\scribe-lockup-dark.svg'
