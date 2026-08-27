@@ -3079,10 +3079,7 @@ fn supports_managed_install(model: &SttModelInfo) -> bool {
     if model.download_model.is_none() {
         return false;
     }
-    if matches!(
-        crate::model_catalog::normalized_install_artifact(&ModelId::new(&model.id)),
-        Some(_)
-    ) {
+    if crate::model_catalog::normalized_install_artifact(&ModelId::new(&model.id)).is_some() {
         return true;
     }
     if let Some(capability) = verified_installation_capability(&ModelId::new(&model.id)) {
