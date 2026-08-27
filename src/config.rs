@@ -30,6 +30,7 @@ pub use settings::{
 };
 
 pub const MAX_RECORDING_SECONDS: u32 = 600;
+pub(crate) const RECORDING_CAPTURE_SAFETY_ALLOWANCE_SECONDS: u32 = 2;
 pub const MAX_HISTORY_ENTRIES: u32 = 1_000;
 pub const MAX_HISTORY_RETENTION_DAYS: u32 = 3_650;
 
@@ -360,6 +361,37 @@ pub fn configured_models(config: &AppConfig) -> Vec<SttModelInfo> {
     configured_models_with_bundled_path(config, bundled_model_path())
 }
 
+pub(crate) fn onnx_bundle_storage_dir(config: &AppConfig) -> PathBuf {
+    model_storage_dir(config).join("onnx-bundles")
+}
+
+pub(crate) fn installed_onnx_bundle_root(
+    config: &AppConfig,
+    model_id: &ModelId,
+) -> Option<PathBuf> {
+    let crate::model_catalog::NormalizedInstallArtifact::ReceiptBackedBundle { bundle_id, .. } =
+        crate::model_catalog::normalized_install_artifact(model_id)?
+    else {
+        return None;
+    };
+    if bundle_id != model_id.as_str() || bundle_id != "moonshine-tiny-en-int8-onnx" {
+        return None;
+    }
+    let root = onnx_bundle_target_root(config, model_id)?;
+    crate::onnx_model_bundles::current_executable_receipt_at(&root)
+        .ok()
+        .map(|_| root)
+}
+
+pub(crate) fn onnx_bundle_target_root(config: &AppConfig, model_id: &ModelId) -> Option<PathBuf> {
+    let crate::model_catalog::NormalizedInstallArtifact::ReceiptBackedBundle { bundle_id, .. } =
+        crate::model_catalog::normalized_install_artifact(model_id)?
+    else {
+        return None;
+    };
+    (bundle_id == model_id.as_str()).then(|| onnx_bundle_storage_dir(config).join(bundle_id))
+}
+
 fn configured_models_with_bundled_path(
     config: &AppConfig,
     bundled_base_path: Option<PathBuf>,
@@ -367,6 +399,28 @@ fn configured_models_with_bundled_path(
     let mut models = default_model_catalog()
         .into_iter()
         .map(|mut model| {
+            let model_id = ModelId::new(&model.id);
+            if matches!(
+                crate::model_catalog::normalized_install_artifact(&model_id),
+                Some(crate::model_catalog::NormalizedInstallArtifact::ReceiptBackedBundle { .. })
+            ) {
+                let root = crate::onnx_model_bundles::bundle_target_root(
+                    &onnx_bundle_storage_dir(config),
+                    &model.id,
+                )
+                .expect("normalized ONNX model id is a stable bundle id");
+                let installed = installed_onnx_bundle_root(config, &model_id).is_some();
+                model.local_path = root.exists().then_some(root);
+                model.artifact_origin = ModelArtifactOrigin::Managed;
+                model.install_status = if installed {
+                    ModelInstallStatus::Installed
+                } else if model.local_path.is_some() {
+                    ModelInstallStatus::Missing
+                } else {
+                    ModelInstallStatus::NotInstalled
+                };
+                return model;
+            }
             let bundled_path = (model.id == BUNDLED_BASE_MODEL_ID
                 && !config
                     .general
@@ -838,6 +892,16 @@ fn first_matching_file(root: &Path, patterns: &[&str]) -> Option<PathBuf> {
 }
 
 pub fn downloaded_model_path(config: &AppConfig, model: &SttModelInfo) -> Option<PathBuf> {
+    if matches!(
+        crate::model_catalog::normalized_install_artifact(&ModelId::new(&model.id)),
+        Some(crate::model_catalog::NormalizedInstallArtifact::ReceiptBackedBundle { .. })
+    ) {
+        return crate::onnx_model_bundles::bundle_target_root(
+            &onnx_bundle_storage_dir(config),
+            &model.id,
+        )
+        .ok();
+    }
     model
         .download_model
         .as_ref()
@@ -1905,6 +1969,74 @@ mod tests {
             downloaded_model_path(&config, &faster_model).unwrap(),
             PathBuf::from("/tmp/scribe-models/faster-whisper/faster_whisper_tiny_en")
         );
+    }
+
+    #[test]
+    fn receipt_backed_onnx_projection_is_canonical_and_failure_closed() {
+        let root = std::env::temp_dir().join(format!(
+            "scribe-onnx-config-projection-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let config = AppConfig {
+            general: GeneralSettings {
+                model_storage_dir: root.clone(),
+                ..Default::default()
+            },
+            ..AppConfig::default()
+        };
+        let before = serde_json::to_vec(&config).unwrap();
+        let model_id = ModelId::new("moonshine-tiny-en-int8-onnx");
+        let expected = root
+            .join("onnx-bundles")
+            .join("moonshine-tiny-en-int8-onnx");
+        let catalog_model = default_model_catalog()
+            .into_iter()
+            .find(|model| model.id == model_id.as_str())
+            .unwrap();
+        assert_eq!(
+            downloaded_model_path(&config, &catalog_model),
+            Some(expected.clone())
+        );
+        assert!(installed_onnx_bundle_root(&config, &model_id).is_none());
+        assert_eq!(
+            onnx_bundle_target_root(&config, &model_id),
+            Some(expected.clone())
+        );
+        assert_eq!(
+            serde_json::to_vec(&config).unwrap(),
+            before,
+            "read-only discovery must not mutate settings"
+        );
+
+        fs::create_dir_all(&expected).unwrap();
+        fs::write(expected.join("tokens.txt"), b"plausible but unreceipted").unwrap();
+        fs::write(expected.join("encoder.int8.onnx"), b"tampered").unwrap();
+        fs::write(expected.join("decoder.int8.onnx"), b"tampered").unwrap();
+        fs::write(expected.join("joiner.int8.onnx"), b"tampered").unwrap();
+        let projected = configured_models(&config)
+            .into_iter()
+            .find(|model| model.id == model_id.as_str())
+            .unwrap();
+        assert_eq!(projected.local_path.as_deref(), Some(expected.as_path()));
+        assert_eq!(projected.install_status, ModelInstallStatus::Missing);
+        assert_eq!(
+            onnx_bundle_target_root(&config, &model_id),
+            Some(expected.clone()),
+            "cleanup target remains deterministic when execution receipt is invalid"
+        );
+        assert_eq!(
+            serde_json::to_vec(&config).unwrap(),
+            before,
+            "failed receipt discovery must not mutate settings"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn wrong_onnx_bundle_id_has_no_canonical_install_root() {
+        let config = AppConfig::default();
+        assert!(installed_onnx_bundle_root(&config, &ModelId::new("moonshine-wrong-id")).is_none());
     }
 
     #[test]

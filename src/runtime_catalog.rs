@@ -435,6 +435,22 @@ pub fn model_artifact_spec(model_id: &str) -> Option<ModelArtifactSpec> {
             sha256: Some(manifest.artifact_sha256),
         });
     }
+    if let Some(crate::model_catalog::NormalizedInstallArtifact::ReceiptBackedBundle {
+        bundle_id,
+        aggregate_size_bytes,
+    }) = crate::model_catalog::normalized_install_artifact(&normalized_id)
+    {
+        return Some(ModelArtifactSpec {
+            model_id: bundle_id,
+            storage_estimate: crate::model_catalog::normalized_model_storage_estimate(
+                &normalized_id,
+            )
+            .expect("receipt-backed normalized model must have storage guidance"),
+            download_bytes: Some(aggregate_size_bytes),
+            version: None,
+            sha256: None,
+        });
+    }
     MODEL_ARTIFACTS
         .iter()
         .find(|artifact| artifact.model_id == model_id)
@@ -562,6 +578,21 @@ mod tests {
         }
         assert_eq!(
             backend_spec("whisper.cpp").unwrap().device_support,
+            DeviceSupport::CpuOnly
+        );
+    }
+
+    #[test]
+    fn receipt_backed_moonshine_artifact_uses_its_aggregate_download_size() {
+        let artifact = model_artifact_spec("moonshine-tiny-en-int8-onnx").unwrap();
+
+        assert_eq!(artifact.model_id, "moonshine-tiny-en-int8-onnx");
+        assert_eq!(artifact.storage_estimate, "~42 MB");
+        assert_eq!(artifact.download_bytes, Some(44_256_550));
+        assert_eq!(artifact.version, None);
+        assert_eq!(artifact.sha256, None);
+        assert_eq!(
+            backend_spec("sherpa-onnx").unwrap().device_support,
             DeviceSupport::CpuOnly
         );
     }

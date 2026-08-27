@@ -38,52 +38,163 @@ fn rust_sources() -> Vec<(PathBuf, String)> {
 }
 
 fn production_prefix(source: &str) -> &str {
-    source.split("\n#[cfg(test)]").next().unwrap_or(source)
+    source
+        .find("\n#[cfg(test)]")
+        .map(|index| &source[..index])
+        .unwrap_or(source)
+}
+
+const WORKER_RUNTIME_MARKER: &str = "worker-only native runtime";
+
+fn is_marked_worker_runtime(path: &Path, source: &str) -> bool {
+    path != Path::new("architecture_guard.rs") && source.contains(WORKER_RUNTIME_MARKER)
 }
 
 #[test]
-fn concrete_runtime_selection_is_private_and_single_handler() {
+fn native_runtime_ownership_is_confined_to_marked_worker_modules() {
     let sources = rust_sources();
-    let router = sources
+    let worker = sources
         .iter()
-        .find(|(path, _)| path == Path::new("runtime_router.rs"))
-        .map(|(_, source)| source)
-        .expect("runtime router exists");
+        .find(|(path, source)| {
+            path != Path::new("architecture_guard.rs")
+                && source.contains("pub(crate) fn maybe_run_worker()")
+        })
+        .map(|(_, source)| source.as_str())
+        .expect("worker entrypoint exists");
 
-    assert_eq!(
-        router.matches("struct TranscribeCppRuntime").count(),
-        1,
-        "the application must ship exactly one primary runtime declaration"
-    );
-    assert_eq!(
-        router.matches("struct OnnxSpeechRuntime").count(),
-        1,
-        "the private ONNX handler must have exactly one router-owned declaration"
-    );
-    assert_eq!(
-        router
-            .matches("impl SpeechEngine for TranscribeCppRuntime")
-            .count(),
-        1,
-        "the primary handler must implement the common engine contract once"
+    for required in [
+        "INFERENCE_WORKER_FLAG",
+        "VAD_WORKER_FLAG",
+        "--scribe-inference-worker",
+        "--scribe-vad-worker",
+        "WorkerRole::Inference",
+        "WorkerRole::Vad",
+        "fn worker_loop_for_role",
+        "RuntimeRouter::new()",
+    ] {
+        assert!(
+            worker.contains(required),
+            "unified child runtime must retain {required:?}"
+        );
+    }
+
+    let marked_worker_sources = sources
+        .iter()
+        .filter(|(path, source)| is_marked_worker_runtime(path, source))
+        // A worker module may contain focused `#[cfg(test)]` adapters between
+        // its production sections. The stable module marker is authoritative
+        // for ownership, so inspect the complete marked module here; the
+        // escape scan below still uses the production prefix for unmarked code.
+        .map(|(_, source)| source.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        marked_worker_sources.iter().any(|source| {
+            source.contains("OfflineRecognizer::create(")
+                && source.contains("OnlineRecognizer::create(")
+        }),
+        "the marked child runtime must directly own the sherpa recognizers"
     );
     assert!(
-        router.contains("enum RuntimeKind") && !router.contains("pub enum RuntimeKind"),
-        "RuntimeKind must remain private to the router"
+        marked_worker_sources
+            .iter()
+            .any(|source| source.contains("SileroVadModel::load_bundled(")),
+        "the marked child runtime must directly own the VAD recognizer"
+    );
+    assert!(
+        marked_worker_sources
+            .iter()
+            .any(|source| source.contains("Model::load_with(")),
+        "the marked child runtime must directly own the embedded GGUF model"
     );
 
+    let native_constructors = [
+        "Model::load_with(",
+        "EmbeddedRuntime::new(",
+        "TranscribeCppRuntime::new(",
+        "OfflineRecognizer::create(",
+        "OnlineRecognizer::create(",
+        "SileroVadModel::load_bundled(",
+        "NativeRuntimeOpaque",
+        "NativeWhisperHandle",
+    ];
     for (path, source) in &sources {
-        if path == Path::new("runtime_router.rs") || path == Path::new("architecture_guard.rs") {
+        if path == Path::new("architecture_guard.rs") {
             continue;
         }
-        for concrete in ["RuntimeKind", "TranscribeCppRuntime", "OnnxSpeechRuntime"] {
+        let production = production_prefix(source);
+        if native_constructors
+            .iter()
+            .any(|constructor| production.contains(constructor))
+        {
             assert!(
-                !source.contains(concrete),
-                "{concrete} escaped the private router into {}",
+                is_marked_worker_runtime(path, source),
+                "native model/session/recognizer/FFI construction escaped the marked worker runtime: {}",
                 path.display()
             );
         }
     }
+
+    let service = sources
+        .iter()
+        .find(|(path, _)| path == Path::new("transcription.rs"))
+        .map(|(_, source)| production_prefix(source))
+        .expect("transcription service source exists");
+    assert!(
+        service.contains("let worker = RuntimeWorker::new_process();"),
+        "production TranscriptionService must dispatch through the process supervisor"
+    );
+}
+
+#[test]
+fn worker_roles_use_private_pipes_and_protocol_only_stdout() {
+    let sources = rust_sources();
+    let worker = sources
+        .iter()
+        .find(|(path, source)| {
+            path != Path::new("architecture_guard.rs")
+                && source.contains("pub(crate) fn maybe_run_worker()")
+        })
+        .map(|(_, source)| production_prefix(source))
+        .expect("worker entrypoint exists");
+
+    assert!(worker.contains("PROTOCOL_MAGIC: [u8; 4] = *b\"SCIF\""));
+    assert!(worker.contains("PROTOCOL_VERSION: u8 = 3"));
+    assert!(worker.contains("Stdio::piped()"));
+    assert!(worker.contains("std::io::stdout().lock()"));
+    assert!(worker.contains("stderr(Stdio::inherit())"));
+    assert!(
+        !worker
+            .lines()
+            .any(|line| line.trim_start().starts_with("print!("))
+    );
+    assert!(
+        !worker
+            .lines()
+            .any(|line| line.trim_start().starts_with("println!("))
+    );
+
+    for forbidden in [
+        "TcpListener",
+        "TcpStream",
+        "UdpSocket",
+        "localhost",
+        "127.0.0.1",
+        "http://",
+        "https://",
+        "reqwest",
+        "ureq",
+    ] {
+        assert!(
+            !worker.contains(forbidden),
+            "worker transport must remain private pipe-based; found {forbidden:?}"
+        );
+    }
+
+    assert!(
+        worker.contains("WorkerRole::Inference => INFERENCE_WORKER_FLAG")
+            && worker.contains("WorkerRole::Vad => VAD_WORKER_FLAG"),
+        "STT and VAD must launch as distinct worker roles"
+    );
 }
 
 #[test]
@@ -185,7 +296,6 @@ fn model_family_logic_is_confined_to_private_adapters_and_catalog_validation() {
         "model_catalog.rs",
         "models.rs",
         "onnx_model_bundles.rs",
-        "onnx_worker.rs",
         "runtime_catalog.rs",
         "runtime_router.rs",
         "settings/schema.rs",
@@ -210,6 +320,7 @@ fn model_family_logic_is_confined_to_private_adapters_and_catalog_validation() {
     for (path, source) in &sources {
         if path == Path::new("architecture_guard.rs")
             || path.starts_with("stt")
+            || is_marked_worker_runtime(path, source)
             || allowed_files
                 .iter()
                 .any(|allowed| path == Path::new(allowed))

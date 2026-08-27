@@ -34,7 +34,7 @@ zip = { version = "=8.6.0", default-features = false, features = ["deflate"] }
 
 [target.'cfg(windows)'.dependencies]
 accesskit_windows = "=0.15.1"
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Graphics_GdiPlus", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_DataExchange", "Win32_System_Diagnostics_Debug", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_Threading", "Win32_UI_Controls", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Graphics_GdiPlus", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_DataExchange", "Win32_System_Diagnostics_Debug", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_Pipes", "Win32_System_Threading", "Win32_UI_Controls", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
