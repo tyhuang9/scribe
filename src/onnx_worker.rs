@@ -1302,14 +1302,14 @@ impl ParentLivenessChannel {
         use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
         use windows_sys::Win32::System::Pipes::CreatePipe;
 
-        let mut security = SECURITY_ATTRIBUTES {
+        let security = SECURITY_ATTRIBUTES {
             nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
             lpSecurityDescriptor: std::ptr::null_mut(),
             bInheritHandle: 1,
         };
         let mut child_read = std::ptr::null_mut();
         let mut parent_write = std::ptr::null_mut();
-        if unsafe { CreatePipe(&mut child_read, &mut parent_write, &mut security, 0) } == 0 {
+        if unsafe { CreatePipe(&mut child_read, &mut parent_write, &security, 0) } == 0 {
             return Err(std::io::Error::last_os_error())
                 .context("could not create parent-liveness pipe");
         }
@@ -1582,7 +1582,7 @@ fn bind_worker_process_tree(child: &Child) -> Result<ProcessTreeGuard> {
             unsafe { windows_sys::Win32::Foundation::CloseHandle(job) };
             return Err(error).context("could not bind worker to its kill-on-close job object");
         }
-        return Ok(ProcessTreeGuard(job as isize));
+        Ok(ProcessTreeGuard(job as isize))
     }
     #[cfg(unix)]
     {
