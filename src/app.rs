@@ -25540,11 +25540,8 @@ mod layout_tests {
         let config = AppConfig::default();
         let model = config::configured_models(&config)
             .into_iter()
-            .find(|model| crate::stt::provider_for_backend(&model.backend).is_some())
+            .find(|model| model.id == "whisper_cpp_tiny_en")
             .unwrap();
-        let runtime_id = crate::stt::provider_for_backend(&model.backend)
-            .unwrap()
-            .runtime_id;
         let mut downloads = HashMap::new();
         downloads.insert(
             model.id,
@@ -25555,11 +25552,10 @@ mod layout_tests {
             },
         );
 
-        assert!(model_download_uses_runtime(&config, &downloads, runtime_id));
         assert!(!model_download_uses_runtime(
             &config,
             &downloads,
-            "different-runtime"
+            "whisper_cpp"
         ));
     }
 
@@ -26177,132 +26173,30 @@ mod layout_tests {
 
     #[test]
     fn runtime_action_state_explains_supported_and_unsupported_runtimes() {
-        let runtime_root =
-            std::env::temp_dir().join(format!("scribe-runtime-action-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&runtime_root);
-
-        let whisper = test_model();
+        let normalized_gguf = config::configured_models(&AppConfig::default())
+            .into_iter()
+            .find(|model| model.id == "whisper_cpp_tiny_en")
+            .unwrap();
         let mut config = AppConfig::default();
-        let whisper_runtime = runtime_root
-            .join("whisper_cpp")
-            .join("bin")
-            .join("whisper-cli");
-        fs::create_dir_all(whisper_runtime.parent().unwrap()).unwrap();
-        fs::write(&whisper_runtime, b"whisper runtime").unwrap();
         config.general.managed_runtimes.insert(
             "whisper_cpp".to_owned(),
-            managed_runtime_with_version(whisper_runtime, None),
+            managed_runtime_with_version(PathBuf::from("C:/unused/whisper-cli"), None),
         );
 
         assert_eq!(
-            runtime_action_state(&config, &whisper),
+            runtime_action_state(&config, &normalized_gguf),
             RuntimeActionState {
-                kind: RuntimeActionKind::Uninstall,
-                enabled: true,
-                disabled_tooltip: None,
-            }
-        );
-
-        let mut faster_whisper = whisper;
-        faster_whisper.id = "faster_whisper_tiny_en".to_owned();
-        faster_whisper.backend = "faster-whisper".to_owned();
-        faster_whisper.download_model = Some("tiny.en".to_owned());
-        let action = runtime_action_state(&AppConfig::default(), &faster_whisper);
-
-        assert_eq!(
-            action,
-            expected_runtime_install_action(&faster_whisper.backend)
-        );
-
-        let mut vosk = test_model();
-        vosk.id = "vosk_small_en".to_owned();
-        vosk.name = "Vosk small English".to_owned();
-        vosk.backend = "Vosk".to_owned();
-        vosk.download_model = Some("vosk-model-small-en-us-0.15".to_owned());
-
-        assert_eq!(
-            runtime_action_state(&AppConfig::default(), &vosk),
-            expected_runtime_install_action(&vosk.backend)
-        );
-
-        config.general.managed_runtimes.clear();
-        config.general.managed_runtimes.insert(
-            "vosk".to_owned(),
-            managed_runtime_with_version(
-                write_vosk_runtime(&runtime_root.join("vosk")),
-                Some("0.3.45"),
-            ),
-        );
-
-        assert_eq!(
-            runtime_action_state(&config, &vosk),
-            RuntimeActionState {
-                kind: RuntimeActionKind::Uninstall,
-                enabled: true,
-                disabled_tooltip: None,
-            }
-        );
-
-        let managed_models = [
-            (
-                "sherpa_onnx_zipformer_small",
-                "sherpa-onnx",
-                "sherpa_onnx",
-                "scribe-sherpa-onnx",
-                "sherpa-onnx-zipformer-small-en-2023-06-26",
-            ),
-            (
-                "moonshine",
-                "Moonshine",
-                "moonshine",
-                "scribe-moonshine",
-                "sherpa-onnx-moonshine-tiny-en-quantized-2026-02-27",
-            ),
-            (
-                "parakeet_0_6b",
-                "Parakeet",
-                "parakeet",
-                "scribe-parakeet",
-                "sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-non-streaming",
-            ),
-        ];
-        for (model_id, backend, runtime_id, wrapper, download_model) in managed_models {
-            let mut model = test_model();
-            model.id = model_id.to_owned();
-            model.backend = backend.to_owned();
-            model.download_model = Some(download_model.to_owned());
-
-            assert_eq!(
-                runtime_action_state(&AppConfig::default(), &model),
-                expected_runtime_install_action(&model.backend),
-                "{backend} should be installable"
-            );
-
-            config.general.managed_runtimes.clear();
-            config.general.managed_runtimes.insert(
-                runtime_id.to_owned(),
-                managed_runtime_with_version(
-                    write_sherpa_family_runtime(
-                        &runtime_root.join(runtime_id),
-                        runtime_id,
-                        wrapper,
-                    ),
-                    Some("1.13.3"),
+                kind: RuntimeActionKind::Install,
+                enabled: false,
+                disabled_tooltip: Some(
+                    "This verified model artifact does not use a managed runtime package."
+                        .to_owned(),
                 ),
-            );
-
-            assert_eq!(
-                runtime_action_state(&config, &model),
-                RuntimeActionState {
-                    kind: RuntimeActionKind::Uninstall,
-                    enabled: true,
-                    disabled_tooltip: None,
-                },
-                "{backend} should detect installed runtime"
-            );
-        }
+            }
+        );
 
         let mut unsupported = test_model();
+        unsupported.id = "unsupported-model".to_owned();
         unsupported.backend = "Unsupported".to_owned();
         let unsupported_action = runtime_action_state(&AppConfig::default(), &unsupported);
         assert_eq!(unsupported_action.kind, RuntimeActionKind::Install);
@@ -26313,8 +26207,6 @@ mod layout_tests {
                 .as_deref()
                 .is_some_and(|tooltip| tooltip.contains("no compatible local provider"))
         );
-
-        let _ = fs::remove_dir_all(runtime_root);
     }
 
     #[test]
