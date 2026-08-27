@@ -42,7 +42,7 @@ use crate::history::{
     HistoryRecord, HistoryRetentionPolicy, HistoryStatus, HistoryStore, NewHistoryEntry,
 };
 use crate::history_playback::{PlaybackEvent, PlaybackService};
-use crate::hotkey::{HotkeyEvent, HotkeyService};
+use crate::hotkey::{HotkeyEvent, HotkeyService, normalize_hotkey_spec};
 use crate::huggingface_catalog::{
     CatalogSource, HuggingFaceCatalogService, ModelInventorySnapshot, RemoteModel, TrustedArtifact,
 };
@@ -82,11 +82,11 @@ use crate::ui::{
     RecordingMode, RecordingSettingsView, RemoteCatalogActionKind, RemoteCatalogActionView,
     RemoteCatalogEntryView, RemoteCatalogFilters, RemoteCatalogSort, RemoteCatalogStatusKind,
     RemoteCatalogStatusView, RemoteCatalogVariantView, RemoteCatalogView, ResolvedTheme,
-    ScreenAction, ScreenView, SettingsTab, SidebarModelView, ThemePalette, UiRoute,
-    configure_accessible_style, history_page, minimum_primary_target_height, recording_mode,
-    render_screen, request_models_route_heading_focus, scroll_focused_control_into_view,
-    settings_save_state, show_navigation, show_route_scroll, theme_palette, transcription_state,
-    ui_palette,
+    ScreenAction, ScreenView, SettingsTab, SidebarModelView, ThemePalette, TranscribeNotice,
+    TranscribeRecoveryAction, UiRoute, configure_accessible_style, history_page,
+    minimum_primary_target_height, recording_mode, render_screen,
+    request_models_route_heading_focus, scroll_focused_control_into_view, settings_save_state,
+    show_navigation, show_route_scroll, theme_palette, transcription_state, ui_palette,
 };
 
 #[cfg(test)]
@@ -3264,6 +3264,7 @@ pub struct LocalTranscriberApp {
     transcript: String,
     raw_transcript: String,
     status_message: String,
+    transcribe_notice: Option<TranscribeNotice>,
     theme_announcement: Option<String>,
     hotkey_input: String,
     model_search: String,
@@ -3281,6 +3282,7 @@ pub struct LocalTranscriberApp {
     deferred_recording_start: Option<DeferredRecordingStart>,
     deferred_history_playback: Option<i64>,
     capturing_hotkey: bool,
+    transcribe_record_focus_pending: bool,
     model_downloads: HashMap<String, ModelInstallStatus>,
     runtime_jobs: HashMap<String, RuntimeInstallJob>,
     artifact_installations: ArtifactInstallCoordinator,
@@ -3420,6 +3422,7 @@ impl LocalTranscriberApp {
             deferred_recording_start: None,
             deferred_history_playback: None,
             capturing_hotkey: false,
+            transcribe_record_focus_pending: false,
             model_downloads: HashMap::new(),
             runtime_jobs: HashMap::new(),
             artifact_installations: ArtifactInstallCoordinator::default(),
@@ -3463,6 +3466,7 @@ impl LocalTranscriberApp {
             transcript: String::new(),
             raw_transcript: String::new(),
             status_message,
+            transcribe_notice: None,
             theme_announcement: None,
             active_recording: None,
             pending_recording: None,
@@ -4615,6 +4619,8 @@ impl LocalTranscriberApp {
             return;
         }
         let message = message.into();
+        let transcribe_session =
+            self.session_coordinator.active_purpose() == Some(SessionPurpose::Dictation);
         let _ = self.session_coordinator.fail(session_id);
         if let Some(pending) = self.pending_output.take()
             && let Some(latency) = pending.latency.as_ref()
@@ -4628,6 +4634,16 @@ impl LocalTranscriberApp {
         }
         self.status = TranscriptionStatus::Error;
         self.status_message = message.clone();
+        if transcribe_session {
+            self.transcribe_notice = Some(if message.starts_with("Microphone failed:") {
+                TranscribeNotice::error(
+                    "Scribe couldn’t access your microphone.",
+                    TranscribeRecoveryAction::RetryMicrophone,
+                )
+            } else {
+                TranscribeNotice::failure(message.clone())
+            });
+        }
         self.finish_overlay_error(session_id, &message);
     }
 
@@ -4991,17 +5007,31 @@ impl LocalTranscriberApp {
                 });
                 self.stop_microphone_test();
                 self.status_message = "Preparing microphone".to_owned();
+                if source == RecordingSource::Transcribe {
+                    self.transcribe_notice =
+                        Some(TranscribeNotice::information("Preparing microphone…"));
+                }
             }
             return;
         }
         if self.playing_history_id.is_some() {
             self.status_message =
                 "Stop retained-audio playback before starting dictation".to_owned();
+            if source == RecordingSource::Transcribe {
+                self.transcribe_notice =
+                    Some(TranscribeNotice::failure(self.status_message.clone()));
+            }
             return;
         }
         if let Some(message) = self.artifact_recovery_error.as_ref() {
             self.status = TranscriptionStatus::Error;
             self.status_message = message.clone();
+            if source == RecordingSource::Transcribe {
+                self.transcribe_notice = Some(TranscribeNotice::error(
+                    message.clone(),
+                    TranscribeRecoveryAction::OpenModelSettings,
+                ));
+            }
             return;
         }
         if !self.artifact_installations.is_empty() || !self.runtime_jobs.is_empty() {
@@ -5009,6 +5039,12 @@ impl LocalTranscriberApp {
             self.status_message =
                 "Wait for the active model/runtime installation to finish or cancel it before transcribing."
                     .to_owned();
+            if source == RecordingSource::Transcribe {
+                self.transcribe_notice = Some(TranscribeNotice::error(
+                    self.status_message.clone(),
+                    TranscribeRecoveryAction::OpenModelSettings,
+                ));
+            }
             return;
         }
         if self.capture_is_active() {
@@ -5029,12 +5065,20 @@ impl LocalTranscriberApp {
                 self.status = TranscriptionStatus::Error;
                 self.status_message =
                     "Choose or install a local model before transcribing.".to_owned();
+                self.transcribe_notice = Some(TranscribeNotice::error(
+                    self.status_message.clone(),
+                    TranscribeRecoveryAction::AddModel,
+                ));
                 return;
             };
             let runtime_status = runtime_status_for_model(&self.config, &model);
             if runtime_status != ModelRuntimeStatus::Ready {
                 self.status = TranscriptionStatus::Error;
                 self.status_message = setup_message_for_status(&runtime_status);
+                self.transcribe_notice = Some(TranscribeNotice::error(
+                    self.status_message.clone(),
+                    TranscribeRecoveryAction::OpenModelSettings,
+                ));
                 return;
             }
             Some(model)
@@ -5062,6 +5106,10 @@ impl LocalTranscriberApp {
                 }
                 self.status = TranscriptionStatus::Error;
                 self.status_message = format!("Could not start dictation: {err}");
+                if source == RecordingSource::Transcribe {
+                    self.transcribe_notice =
+                        Some(TranscribeNotice::failure(self.status_message.clone()));
+                }
                 return;
             }
         };
@@ -8178,12 +8226,46 @@ impl LocalTranscriberApp {
     }
 
     fn apply_hotkey(&mut self) {
+        let normalized = match normalize_hotkey_spec(&self.hotkey_input) {
+            Ok(spec) => spec,
+            Err(err) => {
+                self.capturing_hotkey = false;
+                self.hotkey_input = self.config.recording.hotkey.clone();
+                self.status = TranscriptionStatus::Error;
+                self.status_message = format!(
+                    "Failed to register hotkey: {err}. The previous shortcut is still active."
+                );
+                self.transcribe_notice =
+                    Some(TranscribeNotice::failure(self.status_message.clone()));
+                return;
+            }
+        };
+        let persisted = normalize_hotkey_spec(&self.config.recording.hotkey)
+            .unwrap_or_else(|_| self.config.recording.hotkey.clone());
+        if normalized == persisted {
+            self.capturing_hotkey = false;
+            self.hotkey_input = normalized.clone();
+            if self.config.recording.hotkey != normalized {
+                self.config.recording.hotkey = normalized;
+                self.save_config();
+            }
+            self.status_message = "Recording shortcut unchanged.".to_owned();
+            self.transcribe_notice = Some(TranscribeNotice::information(
+                "Recording shortcut unchanged.",
+            ));
+            return;
+        }
+        self.hotkey_input = normalized;
         match self.hotkey_service.register(&self.hotkey_input) {
             Ok(()) => {
                 self.capturing_hotkey = false;
                 self.config.recording.hotkey = self.hotkey_input.clone();
                 self.save_config();
                 self.status_message = format!("Registered hotkey {}", self.config.recording.hotkey);
+                self.transcribe_notice = Some(TranscribeNotice::information(format!(
+                    "Recording shortcut changed to {}.",
+                    self.config.recording.hotkey
+                )));
             }
             Err(err) => {
                 self.capturing_hotkey = false;
@@ -8192,6 +8274,8 @@ impl LocalTranscriberApp {
                 self.status_message = format!(
                     "Failed to register hotkey: {err}. The previous shortcut is still active."
                 );
+                self.transcribe_notice =
+                    Some(TranscribeNotice::failure(self.status_message.clone()));
             }
         }
     }
@@ -8210,17 +8294,25 @@ impl LocalTranscriberApp {
 
     fn start_hotkey_capture(&mut self) {
         if let Some(reason) = self.quick_hotkey_change_block_reason() {
-            self.status_message = reason;
+            self.status_message = reason.clone();
+            self.transcribe_notice = Some(TranscribeNotice::failure(reason));
             return;
         }
         self.capturing_hotkey = true;
         self.status_message = "Press the new hotkey combination. Press Escape or the recording shortcut card again to cancel.".to_owned();
+        self.transcribe_notice = Some(TranscribeNotice::information(
+            "Press the new shortcut now. Press Escape or activate the shortcut control again to cancel.",
+        ));
     }
 
     fn cancel_hotkey_capture(&mut self) {
         self.capturing_hotkey = false;
         self.hotkey_input = self.config.recording.hotkey.clone();
         self.status_message = "Hotkey capture cancelled.".to_owned();
+        self.transcribe_notice = Some(TranscribeNotice::information(format!(
+            "Shortcut unchanged: {}.",
+            self.config.recording.hotkey
+        )));
     }
 
     fn apply_theme(&self, ctx: &egui::Context, frame: &eframe::Frame) {
@@ -8235,12 +8327,11 @@ impl LocalTranscriberApp {
             return;
         }
 
-        if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
-            self.cancel_hotkey_capture();
-            return;
-        }
-
         if let Some(spec) = ctx.input(captured_hotkey_spec) {
+            if spec == "Esc" {
+                self.cancel_hotkey_capture();
+                return;
+            }
             self.hotkey_input = spec;
             self.apply_hotkey();
         }
@@ -9731,9 +9822,11 @@ impl LocalTranscriberApp {
             self.transcript.clone(),
             provisional_transcript.unwrap_or_default(),
             if no_speech {
-                Some("No speech detected — nothing was added.".to_owned())
+                Some(TranscribeNotice::information(
+                    "No speech detected — nothing was added.",
+                ))
             } else {
-                (!self.status_message.is_empty()).then(|| self.status_message.clone())
+                self.transcribe_notice.clone()
             },
             self.config.recording.hotkey.clone(),
             recording_mode(self.config.recording.hotkey_mode == HotkeyMode::HoldToTalk),
@@ -9747,6 +9840,7 @@ impl LocalTranscriberApp {
         state.hotkey_capture_active = self.capturing_hotkey;
         state.hotkey_change_disabled_reason = self.quick_hotkey_change_block_reason();
         state.model_change_disabled_reason = self.artifact_mutation_block_reason();
+        state.record_control_needs_focus = self.transcribe_record_focus_pending;
         let settings = RecordingSettingsView {
             duration_label: format!("{} seconds", self.config.recording.max_recording_seconds),
             provisional_feedback: self.config.streaming.mode != StreamingMode::FinalOnly,
@@ -9779,6 +9873,7 @@ impl LocalTranscriberApp {
                 recording_settings: &settings,
             },
         );
+        self.transcribe_record_focus_pending = false;
         self.apply_transcribe_screen_action(action);
     }
 
@@ -9836,17 +9931,21 @@ impl LocalTranscriberApp {
 
     fn apply_transcribe_screen_action(&mut self, action: ScreenAction) {
         match action {
-            ScreenAction::AddModel | ScreenAction::ChangeModel => self.current_tab = Tab::Models,
-            ScreenAction::OpenModelSettings => {
+            ScreenAction::AddModel | ScreenAction::OpenModelSettings => {
                 self.current_tab = Tab::Models;
                 self.models_route_focus_pending = true;
             }
             ScreenAction::SelectQuickModel(id) => {
+                self.transcribe_notice = None;
                 self.select_ready_model_from_picker(&id);
             }
-            ScreenAction::StartHotkeyCapture => self.start_hotkey_capture(),
+            ScreenAction::StartHotkeyCapture => {
+                self.transcribe_notice = None;
+                self.start_hotkey_capture();
+            }
             ScreenAction::CancelHotkeyCapture => self.cancel_hotkey_capture(),
             ScreenAction::StartRecording | ScreenAction::RetryMicrophone => {
+                self.transcribe_notice = None;
                 self.start_recording(RecordingSource::Transcribe)
             }
             ScreenAction::StopRecording => self.stop_recording(),
@@ -9854,10 +9953,21 @@ impl LocalTranscriberApp {
                 if let Some(session_id) = self.session_coordinator.active_session_id() {
                     self.abandon_recording(session_id);
                 }
+                self.transcribe_record_focus_pending = true;
             }
             ScreenAction::OpenAudioSettings => self.open_system_audio_settings(),
-            ScreenAction::ClearTranscript => self.clear_transcript_history(),
-            ScreenAction::CopyTranscript => self.copy_transcript_to_clipboard(),
+            ScreenAction::ClearTranscript => {
+                self.clear_transcript_history();
+                self.transcribe_notice = Some(TranscribeNotice::information("Transcript cleared."));
+            }
+            ScreenAction::CopyTranscript => {
+                self.copy_transcript_to_clipboard();
+                self.transcribe_notice = Some(if self.status_message == "Transcript copied" {
+                    TranscribeNotice::information("Transcript copied.")
+                } else {
+                    TranscribeNotice::failure(self.status_message.clone())
+                });
+            }
             ScreenAction::None
             | ScreenAction::AcknowledgeModelRemovalFocus
             | ScreenAction::SelectModel(_)
@@ -12276,11 +12386,8 @@ impl LocalTranscriberApp {
             0,
             self.transcript.clone(),
             String::new(),
-            if no_speech {
-                Some("No speech detected — nothing was added.".to_owned())
-            } else {
-                (!self.status_message.is_empty()).then(|| self.status_message.clone())
-            },
+            no_speech
+                .then(|| TranscribeNotice::information("No speech detected — nothing was added.")),
             self.config.recording.hotkey.clone(),
             recording_mode(self.config.recording.hotkey_mode == HotkeyMode::HoldToTalk),
             self.microphone_permission(),
@@ -12655,7 +12762,6 @@ impl LocalTranscriberApp {
             | ScreenAction::ConfirmModelRemoval(_)
             | ScreenAction::CloseModelDialog
             | ScreenAction::AddModel
-            | ScreenAction::ChangeModel
             | ScreenAction::StartHotkeyCapture
             | ScreenAction::CancelHotkeyCapture
             | ScreenAction::StartRecording
@@ -20470,6 +20576,7 @@ mod layout_tests {
             deferred_recording_start: None,
             deferred_history_playback: None,
             capturing_hotkey: false,
+            transcribe_record_focus_pending: false,
             model_downloads: HashMap::new(),
             runtime_jobs: HashMap::new(),
             artifact_installations: ArtifactInstallCoordinator::default(),
@@ -20510,6 +20617,7 @@ mod layout_tests {
             transcript: String::new(),
             raw_transcript: String::new(),
             status_message: "Ready".to_owned(),
+            transcribe_notice: None,
             theme_announcement: None,
             active_recording: None,
             pending_recording: None,
@@ -22554,6 +22662,109 @@ mod layout_tests {
         assert!(!app.capturing_hotkey);
         assert_eq!(app.hotkey_input, original);
         assert_eq!(app.status_message, "Hotkey capture cancelled.");
+    }
+
+    #[test]
+    fn reentering_the_current_shortcut_is_a_normalized_scoped_success() {
+        let mut app = test_app();
+        app.config.recording.hotkey = "control + option + k".to_owned();
+        app.hotkey_input = "Ctrl+Alt+K".to_owned();
+
+        app.apply_hotkey();
+
+        assert!(!app.capturing_hotkey);
+        assert_eq!(app.config.recording.hotkey, "Ctrl+Alt+K");
+        assert_eq!(app.hotkey_input, "Ctrl+Alt+K");
+        assert_eq!(app.status_message, "Recording shortcut unchanged.");
+        assert_eq!(
+            app.transcribe_notice
+                .as_ref()
+                .map(|notice| notice.message.as_str()),
+            Some("Recording shortcut unchanged.")
+        );
+    }
+
+    #[test]
+    fn modified_escape_can_be_reentered_as_the_current_shortcut() {
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        app.config.recording.hotkey = "Ctrl+Esc".to_owned();
+        app.hotkey_input = "Ctrl+Esc".to_owned();
+        app.capturing_hotkey = true;
+
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers {
+                        ctrl: true,
+                        ..Default::default()
+                    },
+                }],
+                ..Default::default()
+            },
+            |ctx| app.poll_hotkey_capture(ctx),
+        );
+
+        assert!(!app.capturing_hotkey);
+        assert_eq!(app.config.recording.hotkey, "Ctrl+Esc");
+        assert_eq!(app.status_message, "Recording shortcut unchanged.");
+    }
+
+    #[test]
+    fn transcribe_start_failures_publish_page_scoped_recovery() {
+        let mut app = test_app();
+        app.config.general.selected_default_model.clear();
+
+        app.start_recording(RecordingSource::Transcribe);
+
+        assert_eq!(app.status, TranscriptionStatus::Error);
+        assert_eq!(
+            app.transcribe_notice
+                .as_ref()
+                .and_then(|notice| notice.recovery_action),
+            Some(TranscribeRecoveryAction::AddModel)
+        );
+        assert_eq!(
+            app.transcribe_notice
+                .as_ref()
+                .map(|notice| notice.message.as_str()),
+            Some("Choose or install a local model before transcribing.")
+        );
+
+        app.transcribe_notice = None;
+        app.playing_history_id = Some(42);
+        app.start_recording(RecordingSource::Transcribe);
+
+        assert_eq!(
+            app.transcribe_notice
+                .as_ref()
+                .map(|notice| notice.message.as_str()),
+            Some("Stop retained-audio playback before starting dictation")
+        );
+    }
+
+    #[test]
+    fn asynchronous_dictation_failures_publish_one_scoped_notice() {
+        let mut app = test_app();
+        let session_id = app
+            .session_coordinator
+            .begin(SessionPurpose::Dictation)
+            .unwrap();
+
+        app.fail_dictation_session_now(session_id, "Microphone failed: device unavailable");
+
+        assert_eq!(app.status, TranscriptionStatus::Error);
+        assert_eq!(
+            app.transcribe_notice,
+            Some(TranscribeNotice::error(
+                "Scribe couldn’t access your microphone.",
+                TranscribeRecoveryAction::RetryMicrophone,
+            ))
+        );
     }
 
     #[test]

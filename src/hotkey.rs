@@ -243,6 +243,64 @@ pub fn parse_hotkey(spec: &str) -> Result<HotKey> {
     Ok(HotKey::new(Some(modifiers), key))
 }
 
+/// Validate and serialize a shortcut in the stable persisted presentation
+/// used by the capture control. Equivalent input such as `control + space`
+/// therefore never creates a duplicate binding or formatting-only setting
+/// change.
+pub fn normalize_hotkey_spec(spec: &str) -> Result<String> {
+    let mut ctrl = false;
+    let mut shift = false;
+    let mut alt = false;
+    let mut super_key = false;
+    let mut key = None;
+
+    for part in spec.split('+') {
+        let token = part.trim().to_ascii_lowercase();
+        match token.as_str() {
+            "ctrl" | "control" => ctrl = true,
+            "shift" => shift = true,
+            "alt" | "option" => alt = true,
+            "super" | "meta" | "cmd" | "command" | "win" => super_key = true,
+            "" => {}
+            _ => {
+                parse_key(&token)?;
+                key = Some(match token.as_str() {
+                    "return" => "Enter".to_owned(),
+                    "escape" => "Esc".to_owned(),
+                    "arrowup" => "Up".to_owned(),
+                    "arrowdown" => "Down".to_owned(),
+                    "arrowleft" => "Left".to_owned(),
+                    "arrowright" => "Right".to_owned(),
+                    _ if token.len() == 1 => token.to_ascii_uppercase(),
+                    _ => {
+                        let mut chars = token.chars();
+                        let first = chars.next().expect("validated nonempty key");
+                        first.to_uppercase().collect::<String>() + chars.as_str()
+                    }
+                });
+            }
+        }
+    }
+
+    let key =
+        key.ok_or_else(|| anyhow!("hotkey must include a key, for example Ctrl+Shift+Space"))?;
+    let mut parts = Vec::new();
+    if ctrl {
+        parts.push("Ctrl".to_owned());
+    }
+    if shift {
+        parts.push("Shift".to_owned());
+    }
+    if alt {
+        parts.push("Alt".to_owned());
+    }
+    if super_key {
+        parts.push("Super".to_owned());
+    }
+    parts.push(key);
+    Ok(parts.join("+"))
+}
+
 fn parse_key(token: &str) -> Result<Code> {
     match token {
         "space" => Ok(Code::Space),
@@ -339,6 +397,15 @@ mod tests {
     fn rejects_missing_or_unknown_key() {
         assert!(parse_hotkey("Ctrl+Shift").is_err());
         assert!(parse_hotkey("Ctrl+Mouse1").is_err());
+    }
+
+    #[test]
+    fn normalizes_equivalent_shortcuts_to_a_single_persisted_format() {
+        assert_eq!(
+            normalize_hotkey_spec("control + option + k").unwrap(),
+            "Ctrl+Alt+K"
+        );
+        assert_eq!(normalize_hotkey_spec("Ctrl+Escape").unwrap(), "Ctrl+Esc");
     }
 
     #[test]

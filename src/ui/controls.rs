@@ -114,10 +114,20 @@ pub(crate) fn focus_tooltip(ui: &Ui, response: &Response, text: &str) {
 
 pub(crate) fn paint_focus_ring(ui: &Ui, response: &Response, rounding: Rounding) {
     if response.has_focus() {
+        let contrast_color = if ui.visuals().dark_mode {
+            egui::Color32::WHITE
+        } else {
+            egui::Color32::BLACK
+        };
         ui.painter().rect_stroke(
             response.rect.shrink(1.0),
             rounding,
-            Stroke::new(2.0, ui_palette(ui).accent),
+            Stroke::new(3.0, contrast_color),
+        );
+        ui.painter().rect_stroke(
+            response.rect.shrink(3.0),
+            rounding,
+            Stroke::new(1.0, ui_palette(ui).accent),
         );
     }
 }
@@ -585,27 +595,38 @@ mod tests {
     }
 
     #[test]
-    fn focused_custom_control_paints_a_two_point_focus_ring() {
-        let ctx = egui::Context::default();
-        let output = ctx.run(
-            egui::RawInput {
-                focused: true,
-                ..Default::default()
-            },
-            |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    let (rect, response) =
-                        ui.allocate_exact_size(Vec2::new(44.0, 44.0), Sense::click());
-                    response.request_focus();
-                    paint_focus_ring(ui, &response, Rounding::same(5.0));
-                    rect
-                });
-            },
-        );
-        assert!(output.shapes.iter().any(|shape| matches!(
-            shape.shape,
-            egui::epaint::Shape::Rect(rect) if rect.stroke.width == 2.0
-        )));
+    fn focused_custom_control_paints_a_contrast_halo_and_accent_ring() {
+        for (visuals, halo) in [
+            (egui::Visuals::light(), egui::Color32::BLACK),
+            (egui::Visuals::dark(), egui::Color32::WHITE),
+        ] {
+            let ctx = egui::Context::default();
+            ctx.set_visuals(visuals);
+            let output = ctx.run(
+                egui::RawInput {
+                    focused: true,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let (rect, response) =
+                            ui.allocate_exact_size(Vec2::new(44.0, 44.0), Sense::click());
+                        response.request_focus();
+                        paint_focus_ring(ui, &response, Rounding::same(5.0));
+                        rect
+                    });
+                },
+            );
+            assert!(output.shapes.iter().any(|shape| matches!(
+                shape.shape,
+                egui::epaint::Shape::Rect(rect)
+                    if rect.stroke.width == 3.0 && rect.stroke.color == halo
+            )));
+            assert!(output.shapes.iter().any(|shape| matches!(
+                shape.shape,
+                egui::epaint::Shape::Rect(rect) if rect.stroke.width == 1.0
+            )));
+        }
     }
 
     #[test]
