@@ -49,6 +49,8 @@ const
     installations under this identity, independent of the chosen app folder. }
   ScribeUninstallRegKey =
     'Software\Microsoft\Windows\CurrentVersion\Uninstall\{8E0F1935-8E3D-4B1D-9A42-7C7D7C3D5E7A}_is1';
+  UninstallKeyPollIntervalMs = 250;
+  UninstallKeyPollAttempts = 20;
 
 type
   TMaintenanceAction = (maInstall, maUpdate, maRepair, maRemove, maBlocked);
@@ -147,6 +149,8 @@ begin
 
   ExistingInstallUsable :=
     (ExistingVersion <> '') and
+    { Release CI permits only exact numeric x.y.z versions. StrToVersion
+      compares that form as x.y.z.0; prerelease and build metadata are out of scope. }
     StrToVersion(ExistingVersion, ExistingPackedVersion) and
     StrToVersion('{#AppVersion}', SetupPackedVersion);
   if ExistingInstallUsable then
@@ -223,6 +227,20 @@ begin
   end;
 end;
 
+function WaitForUninstallRegistrationRemoval: Boolean;
+var
+  Attempt: Integer;
+begin
+  Result := not RegKeyExists(HKCU, ScribeUninstallRegKey);
+  for Attempt := 1 to UninstallKeyPollAttempts do begin
+    if Result then begin
+      exit;
+    end;
+    Sleep(UninstallKeyPollIntervalMs);
+    Result := not RegKeyExists(HKCU, ScribeUninstallRegKey);
+  end;
+end;
+
 function RemoveExistingInstallation: Boolean;
 var
   ResultCode: Integer;
@@ -248,7 +266,8 @@ begin
       'Nothing will be installed by this setup.', mbError, MB_OK);
     exit;
   end;
-  if RegKeyExists(HKCU, ScribeUninstallRegKey) then begin
+
+  if not WaitForUninstallRegistrationRemoval then begin
     MsgBox('Scribe removal was cancelled or did not finish. Nothing will be installed by this setup.',
       mbInformation, MB_OK);
     exit;

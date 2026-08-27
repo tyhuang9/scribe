@@ -55,6 +55,7 @@ Assert-Matches 'ExistingVersionComparison > 0[\s\S]*will not downgrade' 'downgra
 Assert-Contains 'StrToVersion(ExistingVersion, ExistingPackedVersion)' 'validated installed version parsing'
 Assert-Contains "StrToVersion('{#AppVersion}', SetupPackedVersion)" 'validated setup version parsing'
 Assert-Contains 'ComparePackedVersion(ExistingPackedVersion, SetupPackedVersion)' 'supported packed-version comparison'
+Assert-Contains 'Release CI permits only exact numeric x.y.z versions. StrToVersion' 'three-component release-version invariant'
 if ($installer.Contains('CompareVersion(', [System.StringComparison]::Ordinal)) {
     throw 'Installer must use the supported packed-version comparison APIs.'
 }
@@ -109,10 +110,18 @@ if ($installer -match 'Exec\(UninstallString') {
 }
 Assert-Matches 'SelectedMaintenanceAction = maRemove[\s\S]*RemoveExistingInstallation[\s\S]*WizardForm\.Close[\s\S]*Result := False' 'remove-only termination before installation'
 Assert-Contains 'Scribe removal was cancelled or did not finish' 'removal cancellation check'
-Assert-Contains 'RegKeyExists(HKCU, ScribeUninstallRegKey) then begin' 'post-uninstall registry confirmation'
 Assert-Contains 'RemovalCompleted := True;' 'successful removal state'
 Assert-Matches 'procedure CancelButtonClick[\s\S]*RemovalCompleted[\s\S]*Confirm := False[\s\S]*Cancel := True' 'clean setup exit after successful removal'
 Assert-Contains 'Remove is unavailable because this Scribe installation has no trusted uninstaller.' 'missing or corrupt uninstaller remove rejection'
+
+# An Inno uninstaller may hand work to a self-copy after its original process exits.
+Assert-Contains 'UninstallKeyPollIntervalMs = 250;' 'bounded uninstaller polling interval'
+Assert-Contains 'UninstallKeyPollAttempts = 20;' 'bounded uninstaller polling attempt count'
+Assert-Matches 'function WaitForUninstallRegistrationRemoval[\s\S]*for Attempt := 1 to UninstallKeyPollAttempts do[\s\S]*Sleep\(UninstallKeyPollIntervalMs\)[\s\S]*not RegKeyExists\(HKCU, ScribeUninstallRegKey\)' 'bounded post-uninstall registration wait'
+Assert-Matches 'ResultCode <> 0[\s\S]*if not WaitForUninstallRegistrationRemoval then begin[\s\S]*Scribe removal was cancelled or did not finish' 'remove failure only after bounded completion wait'
+if ($installer -match 'ExitProcess@|TerminateProcess@|\bExitProcess\(') {
+    throw 'Terminal remove must not abruptly terminate Setup and bypass its cleanup lifecycle.'
+}
 
 # No installer deletion directive may target Scribe data outside {app}.
 if ($installer -match '(?mi)^\[UninstallDelete\]' -or $installer -match '(?mi)^\[InstallDelete\]') {
