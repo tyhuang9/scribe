@@ -421,9 +421,14 @@ fn configured_models_with_bundled_path(
                 };
                 return model;
             }
-            let bundled_path = (model.id == BUNDLED_BASE_MODEL_ID)
-                .then(|| bundled_base_path.clone())
-                .flatten();
+            let bundled_path = (model.id == BUNDLED_BASE_MODEL_ID
+                && !config
+                    .general
+                    .excluded_bundled_model_ids
+                    .iter()
+                    .any(|id| id == &model.id))
+            .then(|| bundled_base_path.clone())
+            .flatten();
             let configured_path = config.general.model_paths.get(&model.id).cloned();
             let managed_path = managed_model_path(config, &model);
             let downloaded_path = downloaded_model_path(config, &model);
@@ -965,6 +970,11 @@ pub fn runtime_id_for_backend(backend: &str) -> String {
 
 pub fn normalize_config(config: &mut AppConfig) {
     migrate_legacy_model_ids(config);
+    config
+        .general
+        .excluded_bundled_model_ids
+        .retain(|id| id == BUNDLED_BASE_MODEL_ID);
+    dedup_preserving_order(&mut config.general.excluded_bundled_model_ids);
     if config.general.model_storage_dir.as_os_str().is_empty() {
         config.general.model_storage_dir = default_model_storage_dir();
     }
@@ -1537,6 +1547,51 @@ mod tests {
         assert_eq!(projected.artifact_origin, ModelArtifactOrigin::Managed);
         assert!(managed.is_file());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn excluded_bundled_base_is_available_even_when_an_update_restores_its_file() {
+        let root = unique_bundled_root("excluded-restored");
+        fs::create_dir_all(&root).unwrap();
+        let bundle = root.join("whisper-base.en-Q8_0.gguf");
+        fs::write(&bundle, b"restored packaged fixture").unwrap();
+        let mut config = AppConfig::default();
+        config.general.model_storage_dir = root.join("storage");
+        config
+            .general
+            .excluded_bundled_model_ids
+            .push(BUNDLED_BASE_MODEL_ID.to_owned());
+
+        let projected = configured_models_with_bundled_path(&config, Some(bundle.clone()))
+            .into_iter()
+            .find(|model| model.id == BUNDLED_BASE_MODEL_ID)
+            .unwrap();
+
+        assert_ne!(projected.local_path.as_deref(), Some(bundle.as_path()));
+        assert_ne!(projected.artifact_origin, ModelArtifactOrigin::Bundled);
+        assert_eq!(projected.install_status, ModelInstallStatus::NotInstalled);
+        assert!(
+            bundle.is_file(),
+            "projection must not mutate restored bytes"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn excluded_bundled_ids_normalize_to_the_known_unique_set() {
+        let mut config = AppConfig::default();
+        config.general.excluded_bundled_model_ids = vec![
+            "unknown-bundle".to_owned(),
+            BUNDLED_BASE_MODEL_ID.to_owned(),
+            BUNDLED_BASE_MODEL_ID.to_owned(),
+        ];
+
+        normalize_config(&mut config);
+
+        assert_eq!(
+            config.general.excluded_bundled_model_ids,
+            [BUNDLED_BASE_MODEL_ID]
+        );
     }
 
     #[test]

@@ -43,6 +43,9 @@ pub struct AppConfig {
 #[serde(default)]
 pub struct GeneralSettings {
     pub selected_default_model: String,
+    /// Bundled artifacts the user explicitly removed. The opt-out survives
+    /// application updates until the user chooses Install for that model.
+    pub excluded_bundled_model_ids: Vec<String>,
     pub playground_selected_models: Vec<String>,
     pub playground_model_order: Vec<String>,
     pub managed_models: HashMap<String, ManagedModelInstall>,
@@ -269,6 +272,7 @@ impl Default for GeneralSettings {
     fn default() -> Self {
         Self {
             selected_default_model: BUNDLED_BASE_MODEL_ID.to_owned(),
+            excluded_bundled_model_ids: Vec::new(),
             playground_selected_models: vec![BUNDLED_BASE_MODEL_ID.to_owned()],
             playground_model_order: default_playground_model_order(),
             managed_models: HashMap::new(),

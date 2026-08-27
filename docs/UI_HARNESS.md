@@ -64,7 +64,15 @@ it.
   capability flags for verifying the four-feature UI filter, Requirements,
   and a fixture-only Repair maintenance control.
 - `models/compare-expanded`
-- `history`
+- `history` — production History cards spanning completed, failed, pending,
+  pinned, retained-audio, raw/final, removed-model, and long-text states.
+- `history/details` — expanded long transcript and details, including active
+  retained-audio playback.
+- `history/confirmation` — the inline destructive entry confirmation with
+  initial focus on Cancel.
+- `history/dark` — the expanded History composition using the dark palette.
+  Use the labeled More button in any History fixture to capture and verify the
+  keyboard-accessible overflow menu.
 - `settings/recording`
 - `overlay/live-light` and `overlay/live-dark` -- the real 600 x 62 hardened
   Live preview viewport with fixed Recording state, `00:10` timer, static
