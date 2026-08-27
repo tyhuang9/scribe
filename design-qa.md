@@ -198,8 +198,11 @@ final result: passed
 
 ## Source and native evidence
 
-- The selected reference board is the 1448 x 1086 PNG at
-  `%TEMP%\codex-clipboard-a314e5b9-3a08-4168-994d-25afcdc392c1.png`.
+- The selected reference board is tracked at
+  `design-qa-evidence/branding/charcoal-brand-board-reference.png` (1448 x
+  1086), SHA-256
+  `d158562d1ac56108cee6249262121c1cf15bff7b9efca02c0068d45aee18fd21`.
+  It is byte-identical to the user-supplied PNG.
 - `design-qa-evidence/branding/charcoal-app-dark-1500x900.png` is the fresh
   native dark Transcribe fixture at a 1500 x 900 logical viewport (1502 x 932
   including native chrome), SHA-256
