@@ -323,25 +323,6 @@ pub(crate) struct RuntimePreparationAdmission {
     pub(crate) staging: DiskSpacePreflight,
 }
 
-pub(crate) fn primary_runtime_preparation_admission(
-    target_root: &Path,
-) -> Result<RuntimePreparationAdmission, InstallError> {
-    let downloads = config::runtime_storage_dir().join(".downloads");
-    let archive_path = downloads.join("whisper-cpp-v1.9.1-windows-x64-cpu.zip");
-    let spec = crate::runtime_catalog::primary_runtime_install_spec(archive_path)
-        .map_err(InstallError::Failed)?;
-    let expanded_bytes = spec.archive.files.iter().try_fold(0_u64, |total, file| {
-        total
-            .checked_add(file.size_bytes)
-            .ok_or_else(|| InstallError::Failed("runtime staging size overflowed".to_owned()))
-    })?;
-    Ok(RuntimePreparationAdmission {
-        archive: download_admission(&spec.archive.artifact)?,
-        staging: crate::disk_space::preflight_download_destination(target_root, expanded_bytes)
-            .map_err(InstallError::Failed)?,
-    })
-}
-
 pub(crate) fn prepare_primary_runtime(
     target_root: &Path,
     expected_archive_target_identity: &CanonicalTargetIdentity,
