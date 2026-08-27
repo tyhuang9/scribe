@@ -26210,6 +26210,114 @@ mod layout_tests {
     }
 
     #[test]
+    fn legacy_runtime_action_state_preserves_compatibility_provider_actions() {
+        let runtime_root =
+            std::env::temp_dir().join(format!("scribe-runtime-action-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&runtime_root);
+
+        let mut faster_whisper = test_model();
+        faster_whisper.id = "faster_whisper_tiny_en".to_owned();
+        faster_whisper.backend = "faster-whisper".to_owned();
+        faster_whisper.download_model = Some("tiny.en".to_owned());
+        let action = runtime_action_state(&AppConfig::default(), &faster_whisper);
+
+        assert_eq!(
+            action,
+            expected_runtime_install_action(&faster_whisper.backend)
+        );
+
+        let mut vosk = test_model();
+        vosk.id = "vosk_small_en".to_owned();
+        vosk.name = "Vosk small English".to_owned();
+        vosk.backend = "Vosk".to_owned();
+        vosk.download_model = Some("vosk-model-small-en-us-0.15".to_owned());
+
+        assert_eq!(
+            runtime_action_state(&AppConfig::default(), &vosk),
+            expected_runtime_install_action(&vosk.backend)
+        );
+
+        let mut config = AppConfig::default();
+        config.general.managed_runtimes.insert(
+            "vosk".to_owned(),
+            managed_runtime_with_version(
+                write_vosk_runtime(&runtime_root.join("vosk")),
+                Some("0.3.45"),
+            ),
+        );
+
+        assert_eq!(
+            runtime_action_state(&config, &vosk),
+            RuntimeActionState {
+                kind: RuntimeActionKind::Uninstall,
+                enabled: true,
+                disabled_tooltip: None,
+            }
+        );
+
+        let managed_models = [
+            (
+                "sherpa_onnx_zipformer_small",
+                "sherpa-onnx",
+                "sherpa_onnx",
+                "scribe-sherpa-onnx",
+                "sherpa-onnx-zipformer-small-en-2023-06-26",
+            ),
+            (
+                "moonshine",
+                "Moonshine",
+                "moonshine",
+                "scribe-moonshine",
+                "sherpa-onnx-moonshine-tiny-en-quantized-2026-02-27",
+            ),
+            (
+                "parakeet_0_6b",
+                "Parakeet",
+                "parakeet",
+                "scribe-parakeet",
+                "sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-non-streaming",
+            ),
+        ];
+        for (model_id, backend, runtime_id, wrapper, download_model) in managed_models {
+            let mut model = test_model();
+            model.id = model_id.to_owned();
+            model.backend = backend.to_owned();
+            model.download_model = Some(download_model.to_owned());
+
+            assert_eq!(
+                runtime_action_state(&AppConfig::default(), &model),
+                expected_runtime_install_action(&model.backend),
+                "{backend} should be installable"
+            );
+
+            config.general.managed_runtimes.clear();
+            config.general.managed_runtimes.insert(
+                runtime_id.to_owned(),
+                managed_runtime_with_version(
+                    write_sherpa_family_runtime(
+                        &runtime_root.join(runtime_id),
+                        runtime_id,
+                        wrapper,
+                    ),
+                    Some("1.13.3"),
+                ),
+            );
+
+            assert_eq!(
+                runtime_action_state(&config, &model),
+                RuntimeActionState {
+                    kind: RuntimeActionKind::Uninstall,
+                    enabled: true,
+                    disabled_tooltip: None,
+                },
+                "{backend} should detect installed runtime"
+            );
+        }
+
+        let _ = fs::remove_dir_all(runtime_root);
+    }
+
+    #[test]
     fn runtime_action_state_ignores_stale_runtime_metadata() {
         let runtime_root =
             std::env::temp_dir().join(format!("scribe-stale-runtime-{}", std::process::id()));
