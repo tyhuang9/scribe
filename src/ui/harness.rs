@@ -1,10 +1,15 @@
 //! Development-only deterministic fixtures. Actions update only local fixture state.
 
 use eframe::egui::{self, CentralPanel, Frame};
-use std::time::{Duration, Instant};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 
 use crate::{
     config::SpeechDetectionMode,
+    history::{HistoryMetrics, HistoryRecord, HistoryStatus},
     overlay::{
         self, OverlayAudioLevel, OverlayMode, OverlayPhase, OverlayPosition, OverlayPresentation,
         OverlayTranscript, OverlayViewState,
@@ -13,7 +18,7 @@ use crate::{
 };
 
 use super::{
-    ThemePalette, configure_accessible_style,
+    HistoryPageAction, HistoryPageState, ThemePalette, configure_accessible_style, history_page,
     model_picker::ReadyModelPickerAction,
     screens::{RecordingSettingsView, ScreenAction, ScreenView, render_screen, show_route_scroll},
     shell::{AppPage, SidebarModelView, show_navigation},
@@ -22,7 +27,7 @@ use super::{
         ModelDownloadState, ModelLanguageFilter, ModelManagementState, ModelSizeTier,
         ModelSpeedTier, ModelViewModel, RemoteCatalogActionKind, RemoteCatalogActionView,
         RemoteCatalogEntryView, RemoteCatalogStatusKind, RemoteCatalogStatusView,
-        RemoteCatalogVariantView, RemoteCatalogView, ResolvedTheme, SettingsTab,
+        RemoteCatalogVariantView, RemoteCatalogView, ResolvedTheme, SettingsTab, TranscribeNotice,
         TranscriptionPhase, TranscriptionState, UiRoute,
     },
     theme_palette,
@@ -51,6 +56,9 @@ pub(crate) enum Fixture {
     ModelsCardExpanded,
     ModelsCompareExpanded,
     History,
+    HistoryDetails,
+    HistoryConfirmation,
+    HistoryDark,
     SettingsRecording,
     OverlayLiveLight,
     OverlayLiveDark,
@@ -95,7 +103,7 @@ impl HarnessTheme {
 
 impl Fixture {
     #[cfg(test)]
-    pub(crate) const ALL: [Self; 18] = [
+    pub(crate) const ALL: [Self; 21] = [
         Self::TranscribeNoModel,
         Self::TranscribeReady,
         Self::TranscribeListening,
@@ -113,6 +121,9 @@ impl Fixture {
         Self::ModelsCardExpanded,
         Self::ModelsCompareExpanded,
         Self::History,
+        Self::HistoryDetails,
+        Self::HistoryConfirmation,
+        Self::HistoryDark,
         Self::SettingsRecording,
     ];
     pub(crate) fn parse(value: &str) -> Option<Self> {
@@ -135,6 +146,9 @@ impl Fixture {
             "models/card-expanded" => Self::ModelsCardExpanded,
             "models/compare-expanded" => Self::ModelsCompareExpanded,
             "history" => Self::History,
+            "history/details" => Self::HistoryDetails,
+            "history/confirmation" => Self::HistoryConfirmation,
+            "history/dark" => Self::HistoryDark,
             "settings/recording" => Self::SettingsRecording,
             "overlay/live-light" => Self::OverlayLiveLight,
             "overlay/live-dark" => Self::OverlayLiveDark,
@@ -183,7 +197,10 @@ impl Fixture {
             | Self::ModelsCardFocus
             | Self::ModelsCardExpanded
             | Self::ModelsCompareExpanded => AppPage::Models,
-            Self::History => AppPage::History,
+            Self::History
+            | Self::HistoryDetails
+            | Self::HistoryConfirmation
+            | Self::HistoryDark => AppPage::History,
             Self::SettingsRecording => AppPage::General,
             _ => AppPage::Transcribe,
         }
@@ -223,7 +240,10 @@ impl Fixture {
             | Self::ModelsCardFocus
             | Self::ModelsCardExpanded
             | Self::ModelsCompareExpanded => UiRoute::Models,
-            Self::History => UiRoute::History,
+            Self::History
+            | Self::HistoryDetails
+            | Self::HistoryConfirmation
+            | Self::HistoryDark => UiRoute::History,
             Self::SettingsRecording => UiRoute::Settings(SettingsTab::Recording),
             _ => UiRoute::Transcribe,
         };
@@ -242,16 +262,23 @@ impl Fixture {
             Self::TranscribeFinalizing => transcription.phase = TranscriptionPhase::Finalizing,
             Self::TranscribeNoSpeech => {
                 transcription.phase = TranscriptionPhase::NoSpeech;
-                transcription.notice = Some("No speech detected — nothing was added.".into());
+                transcription.notice = Some(TranscribeNotice::information(
+                    "No speech detected — nothing was added.",
+                ));
             }
             Self::TranscribeMicrophoneError => {
                 transcription.phase = TranscriptionPhase::MicrophoneError;
-                transcription.notice = Some("Scribe couldn’t access your microphone".into());
+                transcription.notice = Some(TranscribeNotice::information(
+                    "Scribe couldn’t access your microphone",
+                ));
             }
             Self::DemoAudio => unreachable!("demo/audio is initialized from an audio file"),
             Self::ModelsInstalled
             | Self::SettingsRecording
             | Self::History
+            | Self::HistoryDetails
+            | Self::HistoryConfirmation
+            | Self::HistoryDark
             | Self::OverlayLiveLight
             | Self::OverlayLiveDark
             | Self::OverlayCompactLight
@@ -359,6 +386,21 @@ impl Fixture {
                     models.iter().map(|model| model.id.clone()).collect();
             }
         }
+        let history_records = self
+            .is_history()
+            .then(history_fixture_records)
+            .unwrap_or_default();
+        let history_expanded_transcripts =
+            if matches!(self, Self::HistoryDetails | Self::HistoryDark) {
+                HashSet::from([1])
+            } else {
+                HashSet::new()
+            };
+        let history_expanded_details = if matches!(self, Self::HistoryDetails | Self::HistoryDark) {
+            HashSet::from([1, 2])
+        } else {
+            HashSet::new()
+        };
         FixtureData {
             route,
             transcription,
@@ -378,8 +420,107 @@ impl Fixture {
             remote_catalog: remote_catalog_fixture(),
             settings,
             settings_playground_open: false,
+            history_search: String::new(),
+            history_records,
+            history_confirm_delete: (self == Self::HistoryConfirmation).then_some(2),
+            history_playing: matches!(self, Self::HistoryDetails | Self::HistoryDark).then_some(1),
+            history_armed_repaste: None,
+            history_model_names: HashMap::from([(
+                "whisper_cpp_base_en".to_owned(),
+                "Whisper Base — English".to_owned(),
+            )]),
+            history_expanded_transcripts,
+            history_expanded_details,
+            history_focus_delete_confirmation: self == Self::HistoryConfirmation,
+            history_focus_more_action: None,
         }
     }
+
+    fn is_history(self) -> bool {
+        matches!(
+            self,
+            Self::History | Self::HistoryDetails | Self::HistoryConfirmation | Self::HistoryDark
+        )
+    }
+
+    fn dark_mode(self) -> bool {
+        matches!(
+            self,
+            Self::HistoryDark | Self::OverlayLiveDark | Self::OverlayCompactDark
+        )
+    }
+}
+
+fn history_fixture_records() -> Vec<HistoryRecord> {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+    let long_transcript = "Scribe kept this long meeting transcript entirely on this device. "
+        .repeat(8)
+        .trim()
+        .to_owned();
+    vec![
+        HistoryRecord {
+            id: 1,
+            created_at_ms: now_ms - 120_000,
+            updated_at_ms: now_ms - 110_000,
+            completed_at_ms: Some(now_ms - 110_000),
+            status: HistoryStatus::Completed,
+            raw_text: format!("Raw capture: {long_transcript}"),
+            final_text: Some(long_transcript),
+            model_id: "whisper_cpp_base_en".to_owned(),
+            metrics: HistoryMetrics {
+                audio_duration_ms: Some(42_300),
+                processing_duration_ms: Some(2_800),
+                realtime_factor: Some(0.07),
+            },
+            pinned: true,
+            source_app: Some("Notes".to_owned()),
+            audio_path: Some(PathBuf::from("fixture-completed.wav")),
+            failure: None,
+            retry_count: 0,
+            output_outcome: Some("pasted_safely".to_owned()),
+        },
+        HistoryRecord {
+            id: 2,
+            created_at_ms: now_ms - 3_600_000,
+            updated_at_ms: now_ms - 3_590_000,
+            completed_at_ms: None,
+            status: HistoryStatus::Failed,
+            raw_text: "A recoverable partial transcript from retained audio.".to_owned(),
+            final_text: None,
+            model_id: "custom-removed-model".to_owned(),
+            metrics: HistoryMetrics {
+                audio_duration_ms: Some(18_000),
+                processing_duration_ms: None,
+                realtime_factor: None,
+            },
+            pinned: false,
+            source_app: Some("Mail".to_owned()),
+            audio_path: Some(PathBuf::from("fixture-failed.wav")),
+            failure: Some("The local model stopped before transcription completed.".to_owned()),
+            retry_count: 1,
+            output_outcome: None,
+        },
+        HistoryRecord {
+            id: 3,
+            created_at_ms: now_ms - 8_000,
+            updated_at_ms: now_ms - 8_000,
+            completed_at_ms: None,
+            status: HistoryStatus::Pending,
+            raw_text: String::new(),
+            final_text: None,
+            model_id: "whisper_cpp_base_en".to_owned(),
+            metrics: HistoryMetrics::default(),
+            pinned: false,
+            source_app: None,
+            audio_path: None,
+            failure: None,
+            retry_count: 0,
+            output_outcome: None,
+        },
+    ]
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -451,6 +592,16 @@ struct FixtureData {
     remote_catalog: RemoteCatalogView,
     settings: RecordingSettingsView,
     settings_playground_open: bool,
+    history_search: String,
+    history_records: Vec<HistoryRecord>,
+    history_confirm_delete: Option<i64>,
+    history_playing: Option<i64>,
+    history_armed_repaste: Option<i64>,
+    history_model_names: HashMap<String, String>,
+    history_expanded_transcripts: HashSet<i64>,
+    history_expanded_details: HashSet<i64>,
+    history_focus_delete_confirmation: bool,
+    history_focus_more_action: Option<i64>,
 }
 
 fn remote_catalog_fixture() -> RemoteCatalogView {
@@ -533,16 +684,14 @@ fn configure_harness_style(ctx: &egui::Context, dark_mode: bool) {
 impl UiHarnessApp {
     pub(crate) fn new(cc: &eframe::CreationContext<'_>, fixture: Fixture) -> Self {
         let overlay = fixture.overlay();
-        let theme = overlay.as_ref().map_or_else(
-            || harness_theme_from_env().unwrap_or(HarnessTheme::Light),
-            |fixture| {
-                if fixture.dark_mode {
-                    HarnessTheme::Dark
-                } else {
-                    HarnessTheme::Light
-                }
-            },
-        );
+        let theme =
+            if fixture.dark_mode() || overlay.as_ref().is_some_and(|fixture| fixture.dark_mode) {
+                HarnessTheme::Dark
+            } else if overlay.is_some() {
+                HarnessTheme::Light
+            } else {
+                harness_theme_from_env().unwrap_or(HarnessTheme::Light)
+            };
         configure_harness_style(&cc.egui_ctx, theme.dark_mode());
         if overlay.is_some() {
             cc.egui_ctx.send_viewport_cmd(egui::ViewportCommand::Title(
@@ -565,9 +714,9 @@ impl UiHarnessApp {
     pub(crate) fn new_demo_audio(cc: &eframe::CreationContext<'_>, transcript: String) -> Self {
         let mut app = Self::new(cc, Fixture::TranscribeReady);
         app.data.transcription.committed_transcript.clear();
-        app.data.transcription.notice = Some(
-            "Demo playback — transcript generated locally from a prerecorded audio file.".into(),
-        );
+        app.data.transcription.notice = Some(TranscribeNotice::information(
+            "Demo playback — transcript generated locally from a prerecorded audio file.",
+        ));
         app.demo_playback = Some(DemoPlayback {
             started_at: Instant::now(),
             transcript,
@@ -799,6 +948,54 @@ fn show_harness(ctx: &egui::Context, data: &mut FixtureData, page: &mut AppPage)
     if *page != AppPage::General || !matches!(data.route, UiRoute::Settings(_)) {
         data.settings_playground_open = false;
     }
+    if *page == AppPage::History {
+        let page_action = CentralPanel::default()
+            .frame(Frame::none().fill(theme_palette(ctx).content_bg))
+            .show(ctx, |ui| {
+                show_route_scroll(ui, UiRoute::History, |ui| {
+                    let heading = ui.label(
+                        egui::RichText::new("History")
+                            .font(egui::FontId::proportional(30.0))
+                            .color(theme_palette(ui.ctx()).primary)
+                            .strong(),
+                    );
+                    ui.ctx().accesskit_node_builder(heading.id, |builder| {
+                        builder.set_role(egui::accesskit::Role::Heading);
+                    });
+                    ui.add_space(14.0);
+                    history_page(
+                        ui,
+                        HistoryPageState {
+                            search: &mut data.history_search,
+                            records: &data.history_records,
+                            has_more: false,
+                            loading: false,
+                            error: None,
+                            confirm_delete: data.history_confirm_delete,
+                            work_active: false,
+                            playing: data.history_playing,
+                            playback_stopping: false,
+                            armed_repaste: data.history_armed_repaste,
+                            model_names: &data.history_model_names,
+                            expanded_transcripts: &data.history_expanded_transcripts,
+                            expanded_details: &data.history_expanded_details,
+                            focus_search: false,
+                            focus_delete_confirmation: data.history_focus_delete_confirmation,
+                            focus_more_action: data.history_focus_more_action,
+                        },
+                    )
+                })
+            })
+            .inner;
+        if let Some(action) = page_action {
+            apply_history_fixture_action(data, action);
+        }
+        return if theme_action != ScreenAction::None {
+            theme_action
+        } else {
+            navigation_action.unwrap_or(ScreenAction::None)
+        };
+    }
     let view = ScreenView {
         route: harness_route(*page, data.route),
         transcription: &data.transcription,
@@ -826,6 +1023,66 @@ fn show_harness(ctx: &egui::Context, data: &mut FixtureData, page: &mut AppPage)
         theme_action
     } else {
         navigation_action.unwrap_or(screen_action)
+    }
+}
+
+fn apply_history_fixture_action(data: &mut FixtureData, action: HistoryPageAction) {
+    match action {
+        HistoryPageAction::ApplySearch
+        | HistoryPageAction::ClearSearch
+        | HistoryPageAction::Refresh
+        | HistoryPageAction::LoadMore
+        | HistoryPageAction::Copy { .. } => {}
+        HistoryPageAction::ArmRepaste { id, .. } => data.history_armed_repaste = Some(id),
+        HistoryPageAction::TogglePinned { id, pinned } => {
+            if let Some(record) = data
+                .history_records
+                .iter_mut()
+                .find(|record| record.id == id)
+            {
+                record.pinned = pinned;
+            }
+            data.history_focus_more_action = Some(id);
+        }
+        HistoryPageAction::Play(id) => data.history_playing = Some(id),
+        HistoryPageAction::StopPlayback => data.history_playing = None,
+        HistoryPageAction::Retry(id) => data.history_focus_more_action = Some(id),
+        HistoryPageAction::DeleteAudio(id) => {
+            if let Some(record) = data
+                .history_records
+                .iter_mut()
+                .find(|record| record.id == id)
+            {
+                record.audio_path = None;
+            }
+            data.history_focus_more_action = Some(id);
+        }
+        HistoryPageAction::RequestDelete(id) => {
+            data.history_confirm_delete = Some(id);
+            data.history_focus_delete_confirmation = true;
+        }
+        HistoryPageAction::ConfirmDelete(id) => {
+            data.history_records.retain(|record| record.id != id);
+            data.history_confirm_delete = None;
+            data.history_focus_delete_confirmation = false;
+        }
+        HistoryPageAction::CancelDelete => {
+            data.history_focus_more_action = data.history_confirm_delete.take();
+            data.history_focus_delete_confirmation = false;
+        }
+        HistoryPageAction::ToggleTranscript(id) => {
+            toggle_fixture_history_state(&mut data.history_expanded_transcripts, id);
+        }
+        HistoryPageAction::ToggleDetails(id) => {
+            toggle_fixture_history_state(&mut data.history_expanded_details, id);
+            data.history_focus_more_action = Some(id);
+        }
+    }
+}
+
+fn toggle_fixture_history_state(entries: &mut HashSet<i64>, id: i64) {
+    if !entries.remove(&id) {
+        entries.insert(id);
     }
 }
 
@@ -941,10 +1198,6 @@ fn apply_action(data: &mut FixtureData, page: &mut AppPage, action: ScreenAction
             data.model_management.restore_remove_focus = None;
             data.models.retain(|model| model.id != id);
             data.model_management.restore_after_removal_focus = true;
-        }
-        ScreenAction::ChangeModel => {
-            data.transcription.selected_model_id = Some("base.en".into());
-            data.transcription.phase = TranscriptionPhase::Ready;
         }
         ScreenAction::StartHotkeyCapture => data.transcription.hotkey_capture_active = true,
         ScreenAction::CancelHotkeyCapture => data.transcription.hotkey_capture_active = false,
@@ -1310,7 +1563,7 @@ mod tests {
     fn render(fixture: Fixture, width: f32, height: f32) -> egui::FullOutput {
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
-        configure_accessible_style(&ctx);
+        configure_harness_style(&ctx, fixture.dark_mode());
         let mut page = fixture.page();
         let mut data = fixture.data();
         ctx.run(
@@ -1354,6 +1607,8 @@ mod tests {
         let clear_comparison_panel_focus = data.comparison.focus_panel;
         let clear_reference_notice = data.comparison.reference_notice.is_some();
         let clear_after_removal_focus = data.model_management.restore_after_removal_focus;
+        let clear_history_confirmation_focus = data.history_focus_delete_confirmation;
+        let clear_history_more_focus = data.history_focus_more_action.is_some();
         let mut action = ScreenAction::None;
         let output = ctx.run(
             egui::RawInput {
@@ -1388,6 +1643,12 @@ mod tests {
         }
         if clear_after_removal_focus {
             data.model_management.restore_after_removal_focus = false;
+        }
+        if clear_history_confirmation_focus {
+            data.history_focus_delete_confirmation = false;
+        }
+        if clear_history_more_focus {
+            data.history_focus_more_action = None;
         }
         (output, action)
     }
@@ -1431,8 +1692,8 @@ mod tests {
         node_matching(output, |node| {
             node.role() == egui::accesskit::Role::Button
                 && node.name().is_some_and(|name| {
-                    name == "Change recording shortcut"
-                        || name == "Cancel recording shortcut capture"
+                    name.starts_with("Change recording shortcut. Current shortcut:")
+                        || name.starts_with("Recording shortcut capture.")
                 })
         })
         .bounds()
@@ -1625,13 +1886,13 @@ mod tests {
 
     #[test]
     fn transcribe_layout_stays_within_shell_at_reference_widths() {
-        for (width, height) in [(1180.0, 815.0), (960.0, 680.0)] {
+        for (width, height) in [(1_180.0, 815.0), (1_024.0, 768.0), (960.0, 680.0)] {
             let ctx = egui::Context::default();
             ctx.enable_accesskit();
             configure_accessible_style(&ctx);
             let mut data = Fixture::TranscribeReady.data();
             let mut page = Fixture::TranscribeReady.page();
-            let committed = "A deliberately long committed transcript should wrap within the bounded transcript panel without pushing any controls beyond the application content region. ".repeat(8);
+            let committed = "A deliberately long committed transcript should wrap within the bounded transcript panel without pushing any controls beyond the application content region. ".repeat(16);
             let provisional = "A deliberately long provisional transcript should also wrap within the bounded transcript panel rather than creating horizontal overflow. ".repeat(8);
             data.transcription.committed_transcript = committed.clone();
             data.transcription.provisional_transcript = provisional.clone();
@@ -1649,118 +1910,113 @@ mod tests {
             let panel = named_node_bounds(&output, "Transcript panel");
             let model = quick_model_card_bounds(&output);
             let hotkey = quick_hotkey_card_bounds(&output);
-            assert!(
-                panel.x0 >= viewport.x0 - LAYOUT_TOLERANCE
-                    && panel.x1 <= viewport.x1 + LAYOUT_TOLERANCE,
-                "transcript panel must remain within the viewport width: {panel:?}"
-            );
-            for (label, card) in [("selected model card", model), ("hotkey card", hotkey)] {
-                assert!(
-                    card.x0 >= panel.x0 - LAYOUT_TOLERANCE
-                        && card.x1 <= panel.x1 + LAYOUT_TOLERANCE,
-                    "{label} {card:?} must remain within content width {panel:?}"
-                );
-                assert_bounds_within(card, viewport, label);
-                assert_within_tolerance(
-                    card.y1 - card.y0,
-                    44.0,
-                    3.0,
-                    "compact selector card height",
-                );
+            for (label, bounds) in [
+                ("transcript panel", panel),
+                ("selected model card", model),
+                ("hotkey card", hotkey),
+            ] {
+                assert_bounds_within(bounds, viewport, label);
             }
-            assert_within_tolerance(model.y0, 118.0, 3.0, "selector row start");
+            assert_within_tolerance(model.y0, hotkey.y0, 3.0, "inline control bar");
+            assert_within_tolerance(model.y1 - model.y0, 44.0, 3.0, "model target height");
+            assert_within_tolerance(hotkey.y1 - hotkey.y0, 44.0, 3.0, "shortcut target height");
+
+            let scroll = node_matching(&output, |node| {
+                node.role() == egui::accesskit::Role::ScrollView
+                    && node.name() == Some("Scrollable transcript text")
+            });
+            let scroll_bounds = scroll.bounds().expect("scrollable transcript bounds");
+            assert_bounds_within(scroll_bounds, panel, "transcript scroll viewport");
             assert!(
-                model.x1 <= hotkey.x0 + LAYOUT_TOLERANCE,
-                "selector cards overlap: {model:?} and {hotkey:?}"
+                scroll_bounds.y1 - scroll_bounds.y0 <= 320.0 + LAYOUT_TOLERANCE,
+                "transcript viewport exceeded its maximum: {scroll_bounds:?}"
             );
-            assert_within_tolerance(hotkey.y0, 118.0, 3.0, "wide hotkey row start");
-            assert_within_tolerance(panel.y0, 185.0, 6.0, "wide transcript panel top");
+            assert!(scroll.scroll_y_max().unwrap_or_default() > 0.0);
 
             let committed_node =
                 node_matching(&output, |node| node.name() == Some(committed.as_str()));
             assert_eq!(committed_node.live(), Some(egui::accesskit::Live::Polite));
-            let bounds = committed_node
-                .bounds()
-                .expect("inline transcript label should expose bounds");
-            assert_bounds_within(bounds, panel, "wrapped inline transcript text");
-            assert!(
-                bounds.y1 - bounds.y0 > 32.0,
-                "inline transcript label did not wrap: {bounds:?}"
-            );
             let estimate_name = format!("Live estimate, may change: {provisional}");
             let estimate =
                 node_matching(&output, |node| node.name() == Some(estimate_name.as_str()));
             assert_eq!(estimate.role(), egui::accesskit::Role::StaticText);
             assert!(estimate.live().is_none());
-            assert!(
-                output
-                    .platform_output
-                    .accesskit_update
-                    .as_ref()
-                    .unwrap()
-                    .nodes
-                    .iter()
-                    .filter(|(_, node)| node.live() == Some(egui::accesskit::Live::Polite))
-                    .all(|(_, node)| {
-                        !node.name().is_some_and(|name| name.contains(&provisional))
-                    }),
-                "provisional text must remain outside polite live regions"
-            );
+
             for name in ["Clear", "Copy"] {
-                let bounds = node_matching(&output, |node| {
-                    node.name()
-                        .is_some_and(|actual| actual == name || actual.contains(name))
-                })
-                .bounds()
-                .expect("transcript action should expose bounds");
+                let bounds = node_matching(&output, |node| node.name() == Some(name))
+                    .bounds()
+                    .expect("transcript action should expose bounds");
                 assert_bounds_within(bounds, panel, name);
+                assert!(bounds.y1 - bounds.y0 >= 44.0);
             }
-            let normal = render(Fixture::TranscribeReady, width, height);
-            let normal_panel = named_node_bounds(&normal, "Transcript panel");
-            let clear = node_matching(&normal, |node| node.name() == Some("Clear"))
-                .bounds()
-                .expect("Clear should expose bounds");
-            let copy = node_matching(&normal, |node| {
-                node.name()
-                    .is_some_and(|name| name == "Copy" || name.contains("Copy"))
-            })
-            .bounds()
-            .expect("Copy should expose bounds");
-            let helper = node_matching(&normal, |node| {
-                node.name()
-                    .is_some_and(|name| name.contains("Silence is ignored"))
-            })
-            .bounds()
-            .expect("Silence helper should expose bounds");
-            assert_bounds_within(normal_panel, viewport, "reference transcript panel");
-            if height >= 815.0 {
-                assert_within_tolerance(
-                    normal_panel.y1 - normal_panel.y0,
-                    565.0,
-                    8.0,
-                    "preferred transcript panel height",
-                );
-            } else {
-                assert!(
-                    normal_panel.y1 - normal_panel.y0 < 565.0,
-                    "short viewport must reduce the transcript panel height: {normal_panel:?}"
-                );
+            let names = node_names(&output);
+            assert!(!names.iter().any(|name| name.contains("Silence is ignored")));
+            assert!(!names.iter().any(|name| name == "BASE.EN"));
+        }
+    }
+
+    #[test]
+    fn active_transcribe_states_fit_reference_viewports_in_both_themes() {
+        for dark in [false, true] {
+            for fixture in [Fixture::TranscribeListening, Fixture::TranscribeFinalizing] {
+                for (width, height) in [(1_180.0, 815.0), (1_024.0, 768.0), (960.0, 680.0)] {
+                    let ctx = egui::Context::default();
+                    ctx.enable_accesskit();
+                    configure_accessible_style(&ctx);
+                    ctx.set_visuals(if dark {
+                        egui::Visuals::dark()
+                    } else {
+                        egui::Visuals::light()
+                    });
+                    let mut data = fixture.data();
+                    let mut page = fixture.page();
+                    let (output, action) =
+                        render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
+                    assert_eq!(action, ScreenAction::None);
+
+                    let viewport = egui::accesskit::Rect {
+                        x0: 0.0,
+                        y0: 0.0,
+                        x1: width.into(),
+                        y1: height.into(),
+                    };
+                    for (label, bounds) in [
+                        ("model control", quick_model_card_bounds(&output)),
+                        ("shortcut control", quick_hotkey_card_bounds(&output)),
+                        (
+                            "transcript panel",
+                            named_node_bounds(&output, "Transcript panel"),
+                        ),
+                    ] {
+                        assert_bounds_within(bounds, viewport, label);
+                    }
+                    let status_name = match fixture {
+                        Fixture::TranscribeListening => "Recording",
+                        Fixture::TranscribeFinalizing => "Finalizing transcript…",
+                        _ => unreachable!(),
+                    };
+                    assert_bounds_within(
+                        named_node_bounds(&output, status_name),
+                        viewport,
+                        "active status row",
+                    );
+                    let primary_name = match fixture {
+                        Fixture::TranscribeListening => "Stop recording",
+                        Fixture::TranscribeFinalizing => "Start recording",
+                        _ => unreachable!(),
+                    };
+                    let primary = named_node_bounds(&output, primary_name);
+                    assert_bounds_within(primary, viewport, "active recording action");
+                    assert!(primary.y1 - primary.y0 >= 44.0 - LAYOUT_TOLERANCE);
+                    if fixture == Fixture::TranscribeListening {
+                        assert_bounds_within(
+                            named_node_bounds(&output, "Cancel recording and discard it"),
+                            viewport,
+                            "cancel recording action",
+                        );
+                    }
+                }
             }
-            for action_bounds in [clear, copy] {
-                assert_bounds_within(action_bounds, normal_panel, "transcript footer action");
-                assert_within_tolerance(
-                    normal_panel.y1 - action_bounds.y1,
-                    14.0,
-                    3.0,
-                    "transcript footer bottom inset",
-                );
-            }
-            assert_within_tolerance(normal_panel.x1 - copy.x1, 16.0, 3.0, "Copy right inset");
-            assert_bounds_within(helper, viewport, "Silence helper");
-            assert!(
-                helper.y1 <= viewport.y1 + LAYOUT_TOLERANCE,
-                "Silence helper must remain within the central viewport: {helper:?}"
-            );
         }
     }
 
@@ -1857,8 +2113,8 @@ mod tests {
     }
 
     #[test]
-    fn no_model_layout_keeps_the_bordered_empty_state_and_hides_transcript_controls() {
-        for (width, height) in [(1180.0, 815.0), (960.0, 680.0)] {
+    fn no_model_layout_uses_one_compact_recovery_row_and_empty_transcript() {
+        for (width, height) in [(1_180.0, 815.0), (1_024.0, 768.0), (960.0, 680.0)] {
             let ctx = egui::Context::default();
             ctx.enable_accesskit();
             configure_accessible_style(&ctx);
@@ -1877,68 +2133,25 @@ mod tests {
             let panel = named_node_bounds(&output, "Transcript panel");
             let selector = quick_model_card_bounds(&output);
             let hotkey = quick_hotkey_card_bounds(&output);
-            let empty_state = named_node_bounds(&output, "Model required empty state");
-            let select = node_matching(&output, |node| node.name() == Some("Add a model"))
-                .bounds()
-                .expect("Add a model should expose bounds");
-            assert_bounds_within(panel, viewport, "transcript panel");
-            assert_bounds_within(selector, viewport, "selected model card");
-            assert_bounds_within(hotkey, viewport, "hotkey card");
-            assert_bounds_within(empty_state, panel, "model-required empty state");
+            let status = named_node_bounds(&output, "Add a speech model to start transcribing.");
+            let placeholder = named_node_bounds(&output, "Your transcript will appear here.");
+            for (label, bounds) in [
+                ("transcript panel", panel),
+                ("selected model card", selector),
+                ("hotkey card", hotkey),
+                ("recovery status", status),
+            ] {
+                assert_bounds_within(bounds, viewport, label);
+            }
+            assert_bounds_within(placeholder, panel, "empty transcript placeholder");
+            assert_within_tolerance(selector.y0, hotkey.y0, 3.0, "inline control bar");
             for card in [selector, hotkey] {
-                assert_within_tolerance(card.y1 - card.y0, 44.0, 3.0, "selector card height");
+                assert_within_tolerance(card.y1 - card.y0, 44.0, 3.0, "selector height");
             }
-            assert_within_tolerance(selector.y0, 118.0, 3.0, "model row start");
-            assert!(
-                selector.x0 >= panel.x0 - LAYOUT_TOLERANCE
-                    && selector.x1 <= panel.x1 + LAYOUT_TOLERANCE,
-                "selected model card {selector:?} must fit transcript panel {panel:?}"
-            );
-            assert_within_tolerance(hotkey.y0, 118.0, 3.0, "wide hotkey row start");
-            assert_within_tolerance(panel.y0, 185.0, 6.0, "wide model-required panel top");
-            assert!(
-                panel.y1 <= viewport.y1 + LAYOUT_TOLERANCE,
-                "model-required panel must honor the remaining viewport height: {panel:?}"
-            );
-            if height >= 815.0 {
-                assert_within_tolerance(
-                    panel.y1 - panel.y0,
-                    565.0,
-                    6.0,
-                    "preferred model-required panel height",
-                );
-            } else {
-                assert!(
-                    panel.y1 - panel.y0 < 565.0,
-                    "short viewport must reduce the model-required panel height: {panel:?}"
-                );
-            }
-            let helper = node_matching(&output, |node| {
-                node.name()
-                    .is_some_and(|name| name.contains("Silence is ignored"))
-            })
-            .bounds()
-            .expect("Silence helper should expose bounds");
-            assert_bounds_within(helper, viewport, "Silence helper");
-            assert_eq!(
-                select, selector,
-                "the no-model card must be interactive edge to edge"
-            );
-
-            let panel_midpoint = (panel.y0 + panel.y1) / 2.0;
-            let empty_midpoint = (empty_state.y0 + empty_state.y1) / 2.0;
-            assert!(
-                (empty_midpoint - panel_midpoint).abs() <= (panel.y1 - panel.y0) * 0.04,
-                "empty state should remain centered in its panel: panel={panel:?}, empty={empty_state:?}"
-            );
-            let update = output.platform_output.accesskit_update.as_ref().unwrap();
-            assert!(!update.nodes.iter().any(|(_, node)| {
-                node.role() == egui::accesskit::Role::Heading && node.name() == Some("Transcript")
-            }));
-            assert!(!update.nodes.iter().any(|(_, node)| {
-                node.name()
-                    .is_some_and(|name| name == "Clear" || name.contains("Copy"))
-            }));
+            let names = node_names(&output);
+            assert!(names.iter().any(|name| name == "Add model"));
+            assert!(!names.iter().any(|name| name == "Clear" || name == "Copy"));
+            assert!(!names.iter().any(|name| name.contains("Silence is ignored")));
         }
     }
 
@@ -2011,100 +2224,96 @@ mod tests {
     }
 
     #[test]
-    fn transcribe_fixtures_keep_the_polished_reference_content_and_insets() {
-        let ready = render(Fixture::TranscribeReady, 1180.0, 815.0);
+    fn transcribe_fixtures_keep_the_compact_status_and_content_hierarchy() {
+        let ready = render(Fixture::TranscribeReady, 1_180.0, 815.0);
         let panel = named_node_bounds(&ready, "Transcript panel");
-        let ready_status = named_node_bounds(&ready, "Recording status");
         let start = node_matching(&ready, |node| {
             node.role() == egui::accesskit::Role::Button && node.name() == Some("Start recording")
         })
         .bounds()
         .expect("Start recording should expose bounds");
-        let transcript = node_matching(&ready, |node| {
-            node.name()
-                == Some(
-                    "Today's meeting notes regarding the local-first architecture. We discussed the importance of privacy and keeping all model inference on the user's machine to ensure zero data leakage. The performance of the small models is acceptable for dictation, but we might need to explore quantized larger models for complex technical jargon.",
-                )
-        })
-        .bounds()
-        .expect("reference transcript should expose bounds");
-        let relative_time = node_matching(&ready, |node| node.name() == Some("2 MINS AGO"))
-            .bounds()
-            .expect("relative-time chip should expose bounds");
-        let model_chip = node_matching(&ready, |node| node.name() == Some("BASE.EN"))
-            .bounds()
-            .expect("model chip should expose bounds");
-
-        for name in [
-            "Choose active model: whisper.cpp base.en",
-            "2 MINS AGO",
-            "BASE.EN",
-        ] {
-            assert!(
-                node_names(&ready).iter().any(|actual| actual == name),
-                "ready fixture missing polished reference content {name}"
-            );
-        }
+        assert!(start.y1 - start.y0 >= 44.0 - LAYOUT_TOLERANCE);
+        assert_bounds_within(
+            start,
+            egui::accesskit::Rect {
+                x0: 0.0,
+                y0: 0.0,
+                x1: 1_180.0,
+                y1: 815.0,
+            },
+            "record action",
+        );
+        let names = node_names(&ready);
         assert!(
-            start.y1 - start.y0 >= 44.0 - LAYOUT_TOLERANCE,
-            "recording control must retain a 44px target: {start:?}"
+            names
+                .iter()
+                .any(|name| name == "Choose active model: whisper.cpp base.en")
         );
-        assert_within_tolerance(
-            ready_status.y1 - ready_status.y0,
-            80.0,
-            1.0,
-            "ready status strip height",
+        assert!(
+            names
+                .iter()
+                .any(|name| { name.starts_with("Change recording shortcut. Current shortcut:") })
         );
-        assert_within_tolerance(
-            start.y0 - ready_status.y0,
-            18.0,
-            3.0,
-            "centered recording control top inset",
+        assert!(
+            !names
+                .iter()
+                .any(|name| name == "2 MINS AGO" || name == "BASE.EN")
         );
-        assert_within_tolerance(
-            ready_status.y1 - start.y1,
-            12.0,
-            1.0,
-            "centered recording control bottom inset",
-        );
-        assert_within_tolerance(
-            transcript.x0 - panel.x0,
-            27.0,
-            4.0,
-            "transcript body left inset",
-        );
-        for (name, bounds) in [
-            ("relative-time chip", relative_time),
-            ("model chip", model_chip),
-        ] {
-            assert_within_tolerance(bounds.y1 - bounds.y0, 26.0, 1.0, name);
+        assert!(!names.iter().any(|name| name.contains("Silence is ignored")));
+        assert!(!names.iter().any(|name| name == "Ready"));
+        for name in ["Clear", "Copy"] {
+            let bounds = named_node_bounds(&ready, name);
             assert_bounds_within(bounds, panel, name);
         }
 
-        let microphone = render(Fixture::TranscribeMicrophoneError, 1180.0, 815.0);
+        let microphone = render(Fixture::TranscribeMicrophoneError, 1_180.0, 815.0);
         let canonical_count = node_names(&microphone)
             .iter()
             .filter(|name| name.as_str() == "Scribe couldn’t access your microphone.")
             .count();
-        assert_eq!(
-            canonical_count, 1,
-            "microphone error should not repeat its headline"
+        assert_eq!(canonical_count, 1);
+        assert!(
+            node_names(&microphone)
+                .iter()
+                .any(|name| name == "Try again")
+        );
+        assert!(
+            node_names(&microphone)
+                .iter()
+                .any(|name| name == "Transcript panel")
         );
 
-        for fixture in [Fixture::TranscribeListening, Fixture::TranscribeFinalizing] {
-            let output = render(fixture, 1180.0, 815.0);
-            let status = named_node_bounds(&output, "Recording status");
-            assert_within_tolerance(
-                status.y1 - status.y0,
-                80.0,
-                1.0,
-                "every transcript-present phase uses the same status strip height",
-            );
-        }
+        let listening = render(Fixture::TranscribeListening, 1_180.0, 815.0);
+        assert!(
+            node_names(&listening)
+                .iter()
+                .any(|name| name == "Recording")
+        );
+        assert!(
+            node_names(&listening)
+                .iter()
+                .any(|name| name == "Stop recording")
+        );
+        assert!(
+            node_names(&listening)
+                .iter()
+                .any(|name| name == "Cancel recording and discard it")
+        );
 
-        let no_model = render(Fixture::TranscribeNoModel, 1180.0, 815.0);
+        let finalizing = render(Fixture::TranscribeFinalizing, 1_180.0, 815.0);
+        assert!(
+            node_names(&finalizing)
+                .iter()
+                .any(|name| name == "Finalizing transcript…")
+        );
+        assert!(
+            node_names(&finalizing)
+                .iter()
+                .any(|name| name == "Transcript panel")
+        );
+
+        let no_model = render(Fixture::TranscribeNoModel, 1_180.0, 815.0);
         assert!(node_names(&no_model).iter().any(|name| name == "Add model"));
-        assert!(!node_names(&ready).iter().any(|name| name == "Transcript"));
     }
 
     fn page_event(key: egui::Key) -> egui::Event {
@@ -2321,7 +2530,7 @@ mod tests {
     #[test]
     fn every_fixture_renders_at_native_preferred_and_minimum_dimensions() {
         for fixture in Fixture::ALL {
-            for (width, height) in [(1180.0, 815.0), (960.0, 680.0)] {
+            for (width, height) in [(1180.0, 815.0), (1024.0, 768.0), (960.0, 680.0)] {
                 let output = render(fixture, width, height);
                 assert!(
                     output
@@ -2331,6 +2540,494 @@ mod tests {
                             && shape.clip_rect.min.x >= 0.0
                             && shape.clip_rect.max.y <= height
                             && shape.clip_rect.min.y >= 0.0)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn history_fixtures_render_production_cards_across_approved_viewports() {
+        for fixture in [
+            Fixture::History,
+            Fixture::HistoryDetails,
+            Fixture::HistoryConfirmation,
+            Fixture::HistoryDark,
+        ] {
+            for (width, height) in [(960.0, 680.0), (1024.0, 768.0), (1180.0, 815.0)] {
+                let output = render(fixture, width, height);
+                let names = node_names(&output);
+                for expected in [
+                    "Search history",
+                    "Completed",
+                    "Failed",
+                    "Pending",
+                    "More actions",
+                ] {
+                    assert!(
+                        names.iter().any(|name| name.contains(expected)),
+                        "{fixture:?} at {width}x{height} missing {expected}"
+                    );
+                }
+                assert!(names.iter().all(|name| {
+                    !name.contains("Local dictation history remains available in production")
+                }));
+                assert!(output.shapes.iter().all(|shape| {
+                    shape.clip_rect.min.x >= 0.0
+                        && shape.clip_rect.min.y >= 0.0
+                        && shape.clip_rect.max.x <= width
+                        && shape.clip_rect.max.y <= height
+                }));
+            }
+        }
+    }
+
+    #[test]
+    fn history_harness_opens_the_real_more_actions_menu() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_harness_style(&ctx, false);
+        let mut page = AppPage::History;
+        let mut data = Fixture::History.data();
+        data.history_records.truncate(1);
+        let (initial, initial_action) =
+            render_with_input(&ctx, &mut data, &mut page, 1024.0, 768.0, Vec::new());
+        assert_eq!(initial_action, ScreenAction::None);
+        let more_id = named_node_id(&initial, "More actions");
+        let _ = render_with_input(
+            &ctx,
+            &mut data,
+            &mut page,
+            1024.0,
+            768.0,
+            vec![egui::Event::AccessKitActionRequest(
+                egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Focus,
+                    target: more_id,
+                    data: None,
+                },
+            )],
+        );
+        let _ = render_with_input(&ctx, &mut data, &mut page, 1024.0, 768.0, Vec::new());
+        let (_, action) = render_with_input(
+            &ctx,
+            &mut data,
+            &mut page,
+            1024.0,
+            768.0,
+            vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert_eq!(action, ScreenAction::None);
+        let (opened, settled_action) =
+            render_with_input(&ctx, &mut data, &mut page, 1024.0, 768.0, Vec::new());
+        assert_eq!(settled_action, ScreenAction::None);
+        let names = node_names(&opened);
+        for expected in [
+            "Unpin",
+            "Show details",
+            "Delete retained audio",
+            "Delete entry",
+        ] {
+            assert!(
+                names.iter().any(|name| name == expected),
+                "opened History More menu missing {expected}"
+            );
+        }
+        assert_eq!(focused_node(&opened).name(), Some("Unpin"));
+        assert!(
+            opened
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .expect("open menu should update AccessKit")
+                .nodes
+                .iter()
+                .any(|(_, node)| {
+                    node.name() == Some("More actions menu")
+                        && node.role() == egui::accesskit::Role::Menu
+                })
+        );
+        for item in [
+            "Unpin",
+            "Show details",
+            "Delete retained audio",
+            "Delete entry",
+        ] {
+            assert!(
+                opened
+                    .platform_output
+                    .accesskit_update
+                    .as_ref()
+                    .expect("open menu should update AccessKit")
+                    .nodes
+                    .iter()
+                    .any(|(_, node)| {
+                        node.name() == Some(item) && node.role() == egui::accesskit::Role::MenuItem
+                    })
+            );
+        }
+
+        let (closed, close_action) = render_with_input(
+            &ctx,
+            &mut data,
+            &mut page,
+            1024.0,
+            768.0,
+            vec![page_event(egui::Key::Escape)],
+        );
+        assert_eq!(close_action, ScreenAction::None);
+        assert_eq!(focused_node(&closed).name(), Some("More actions"));
+        assert_eq!(named_node_id(&closed, "More actions"), more_id);
+        assert!(node_names(&closed).iter().all(|name| name != "Unpin"));
+
+        let _ = render_with_input(
+            &ctx,
+            &mut data,
+            &mut page,
+            1024.0,
+            768.0,
+            vec![page_event(egui::Key::Space)],
+        );
+        let (reopened, _) =
+            render_with_input(&ctx, &mut data, &mut page, 1024.0, 768.0, Vec::new());
+        assert_eq!(focused_node(&reopened).name(), Some("Unpin"));
+
+        let (tab_closed, _) = render_with_input(
+            &ctx,
+            &mut data,
+            &mut page,
+            1024.0,
+            768.0,
+            vec![page_event(egui::Key::Tab)],
+        );
+        assert_eq!(focused_node(&tab_closed).name(), Some("More actions"));
+        let (tab_settled, _) =
+            render_with_input(&ctx, &mut data, &mut page, 1024.0, 768.0, Vec::new());
+        assert!(node_names(&tab_settled).iter().all(|name| name != "Unpin"));
+
+        let _ = render_with_input(
+            &ctx,
+            &mut data,
+            &mut page,
+            1024.0,
+            768.0,
+            vec![page_event(egui::Key::Space)],
+        );
+        let _ = render_with_input(&ctx, &mut data, &mut page, 1024.0, 768.0, Vec::new());
+
+        let (details_focused, _) = render_with_input(
+            &ctx,
+            &mut data,
+            &mut page,
+            1024.0,
+            768.0,
+            vec![page_event(egui::Key::ArrowDown)],
+        );
+        assert_eq!(focused_node(&details_focused).name(), Some("Show details"));
+        let _ = render_with_input(
+            &ctx,
+            &mut data,
+            &mut page,
+            1024.0,
+            768.0,
+            vec![page_event(egui::Key::Enter)],
+        );
+        assert!(data.history_expanded_details.contains(&1));
+        let (details_shown, _) =
+            render_with_input(&ctx, &mut data, &mut page, 1024.0, 768.0, Vec::new());
+        assert_eq!(focused_node(&details_shown).name(), Some("More actions"));
+        assert!(
+            focused_node(&details_shown)
+                .description()
+                .is_some_and(|description| description.contains("Details are shown"))
+        );
+    }
+
+    #[test]
+    fn history_delete_confirmation_cancel_restores_the_originating_more_button() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_harness_style(&ctx, false);
+        let mut page = AppPage::History;
+        let mut data = Fixture::History.data();
+        data.history_records.truncate(1);
+
+        let (initial, _) = render_with_input(&ctx, &mut data, &mut page, 840.0, 500.0, Vec::new());
+        let more_id = named_node_id(&initial, "More actions");
+        let _ = render_with_input(
+            &ctx,
+            &mut data,
+            &mut page,
+            840.0,
+            500.0,
+            vec![egui::Event::AccessKitActionRequest(
+                egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Default,
+                    target: more_id,
+                    data: None,
+                },
+            )],
+        );
+        let (menu, _) = render_with_input(&ctx, &mut data, &mut page, 840.0, 500.0, Vec::new());
+        let delete_entry_id = named_node_id(&menu, "Delete entry");
+        let _ = render_with_input(
+            &ctx,
+            &mut data,
+            &mut page,
+            840.0,
+            500.0,
+            vec![egui::Event::AccessKitActionRequest(
+                egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Default,
+                    target: delete_entry_id,
+                    data: None,
+                },
+            )],
+        );
+        assert_eq!(data.history_confirm_delete, Some(1));
+
+        let (confirmation, _) =
+            render_with_input(&ctx, &mut data, &mut page, 840.0, 500.0, Vec::new());
+        assert_eq!(focused_node(&confirmation).name(), Some("Cancel"));
+        let cancel_id = named_node_id(&confirmation, "Cancel");
+        let _ = render_with_input(
+            &ctx,
+            &mut data,
+            &mut page,
+            840.0,
+            500.0,
+            vec![egui::Event::AccessKitActionRequest(
+                egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Default,
+                    target: cancel_id,
+                    data: None,
+                },
+            )],
+        );
+        assert_eq!(data.history_confirm_delete, None);
+        let (restored, _) = render_with_input(&ctx, &mut data, &mut page, 840.0, 500.0, Vec::new());
+        assert_eq!(named_node_id(&restored, "More actions"), more_id);
+        assert_eq!(focused_node(&restored).name(), Some("More actions"));
+    }
+
+    #[test]
+    fn history_more_focus_and_identity_survive_pin_and_audio_mutations() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_harness_style(&ctx, false);
+        let mut page = AppPage::History;
+        let mut data = Fixture::History.data();
+        data.history_records.truncate(1);
+
+        let (initial, _) = render_with_input(&ctx, &mut data, &mut page, 1024.0, 768.0, Vec::new());
+        let more_id = named_node_id(&initial, "More actions");
+        let _ = render_with_input(
+            &ctx,
+            &mut data,
+            &mut page,
+            1024.0,
+            768.0,
+            vec![egui::Event::AccessKitActionRequest(
+                egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Default,
+                    target: more_id,
+                    data: None,
+                },
+            )],
+        );
+        let (menu, _) = render_with_input(&ctx, &mut data, &mut page, 1024.0, 768.0, Vec::new());
+        let unpin_id = named_node_id(&menu, "Unpin");
+        let _ = render_with_input(
+            &ctx,
+            &mut data,
+            &mut page,
+            1024.0,
+            768.0,
+            vec![egui::Event::AccessKitActionRequest(
+                egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Default,
+                    target: unpin_id,
+                    data: None,
+                },
+            )],
+        );
+        let (unpinned, _) =
+            render_with_input(&ctx, &mut data, &mut page, 1024.0, 768.0, Vec::new());
+        assert!(!data.history_records[0].pinned);
+        assert_eq!(named_node_id(&unpinned, "More actions"), more_id);
+        assert_eq!(focused_node(&unpinned).name(), Some("More actions"));
+
+        let _ = render_with_input(
+            &ctx,
+            &mut data,
+            &mut page,
+            1024.0,
+            768.0,
+            vec![egui::Event::AccessKitActionRequest(
+                egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Default,
+                    target: more_id,
+                    data: None,
+                },
+            )],
+        );
+        let (menu, _) = render_with_input(&ctx, &mut data, &mut page, 1024.0, 768.0, Vec::new());
+        let delete_audio_id = named_node_id(&menu, "Delete retained audio");
+        let _ = render_with_input(
+            &ctx,
+            &mut data,
+            &mut page,
+            1024.0,
+            768.0,
+            vec![egui::Event::AccessKitActionRequest(
+                egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Default,
+                    target: delete_audio_id,
+                    data: None,
+                },
+            )],
+        );
+        let (audio_deleted, _) =
+            render_with_input(&ctx, &mut data, &mut page, 1024.0, 768.0, Vec::new());
+        assert!(data.history_records[0].audio_path.is_none());
+        assert_eq!(named_node_id(&audio_deleted, "More actions"), more_id);
+        assert_eq!(focused_node(&audio_deleted).name(), Some("More actions"));
+    }
+
+    #[test]
+    fn history_more_identity_survives_earlier_record_insertion_and_removal() {
+        fn more_id_for_model(output: &egui::FullOutput, model_id: &str) -> egui::accesskit::NodeId {
+            action_id_for_model(output, "More actions", model_id)
+        }
+
+        fn action_id_for_model(
+            output: &egui::FullOutput,
+            action_name: &str,
+            model_id: &str,
+        ) -> egui::accesskit::NodeId {
+            output
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .expect("History should update AccessKit")
+                .nodes
+                .iter()
+                .find_map(|(id, node)| {
+                    (node.name() == Some(action_name)
+                        && node
+                            .description()
+                            .is_some_and(|description| description.contains(model_id)))
+                    .then_some(*id)
+                })
+                .unwrap_or_else(|| panic!("missing {action_name} for {model_id}"))
+        }
+
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_harness_style(&ctx, false);
+        let mut page = AppPage::History;
+        let mut data = Fixture::History.data();
+        data.history_focus_more_action = Some(2);
+        let (initial, _) = render_with_input(&ctx, &mut data, &mut page, 1024.0, 768.0, Vec::new());
+        let target_id = more_id_for_model(&initial, "custom-removed-model");
+        let copy_id = action_id_for_model(&initial, "Copy", "custom-removed-model");
+        assert_eq!(
+            initial
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .unwrap()
+                .focus,
+            target_id
+        );
+
+        let mut inserted = data.history_records[0].clone();
+        inserted.id = 99;
+        inserted.model_id = "inserted-model".to_owned();
+        data.history_records.insert(0, inserted);
+        let (after_insertion, _) =
+            render_with_input(&ctx, &mut data, &mut page, 1024.0, 768.0, Vec::new());
+        assert_eq!(
+            more_id_for_model(&after_insertion, "custom-removed-model"),
+            target_id
+        );
+        assert_eq!(
+            action_id_for_model(&after_insertion, "Copy", "custom-removed-model"),
+            copy_id
+        );
+        assert_eq!(
+            after_insertion
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .unwrap()
+                .focus,
+            target_id
+        );
+
+        data.history_records
+            .retain(|record| !matches!(record.id, 99 | 1));
+        let (after_removal, _) =
+            render_with_input(&ctx, &mut data, &mut page, 1024.0, 768.0, Vec::new());
+        assert_eq!(
+            more_id_for_model(&after_removal, "custom-removed-model"),
+            target_id
+        );
+        assert_eq!(
+            action_id_for_model(&after_removal, "Copy", "custom-removed-model"),
+            copy_id
+        );
+        assert_eq!(
+            after_removal
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .unwrap()
+                .focus,
+            target_id
+        );
+    }
+
+    #[test]
+    fn history_restored_focus_is_visible_in_short_viewports() {
+        for (width, height) in [(840.0, 500.0), (960.0, 680.0)] {
+            for confirmation in [false, true] {
+                let ctx = egui::Context::default();
+                ctx.enable_accesskit();
+                configure_harness_style(&ctx, false);
+                let mut page = AppPage::History;
+                let mut data = Fixture::History.data();
+                data.history_records.truncate(1);
+                data.history_expanded_transcripts.insert(1);
+                data.history_expanded_details.insert(1);
+                if confirmation {
+                    data.history_confirm_delete = Some(1);
+                    data.history_focus_delete_confirmation = true;
+                } else {
+                    data.history_focus_more_action = Some(1);
+                }
+
+                let _ = render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
+                let (focused, _) =
+                    render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
+                let node = focused_node(&focused);
+                assert_eq!(
+                    node.name(),
+                    Some(if confirmation {
+                        "Cancel"
+                    } else {
+                        "More actions"
+                    })
+                );
+                let bounds = node.bounds().expect("focused History action needs bounds");
+                assert!(
+                    bounds.y0 >= 0.0 && bounds.y1 <= f64::from(height),
+                    "focused History action escaped {width}x{height}: {bounds:?}"
                 );
             }
         }
@@ -2352,7 +3049,7 @@ mod tests {
                 UiRoute::Transcribe,
                 "Transcribe",
                 "Start recording",
-                true,
+                false,
             ),
             (
                 "Models",
@@ -2405,8 +3102,8 @@ mod tests {
                 AppPage::History,
                 UiRoute::History,
                 "History",
-                "Local dictation history remains available in production.",
-                false,
+                "Search history",
+                true,
             ),
         ] {
             let ctx = egui::Context::default();
@@ -2532,6 +3229,10 @@ mod tests {
                 "Use whisper.cpp tiny.en for future transcriptions",
             ),
             (Fixture::ModelsCompareExpanded, "No data"),
+            (Fixture::History, "Completed"),
+            (Fixture::HistoryDetails, "Raw transcript"),
+            (Fixture::HistoryConfirmation, "Delete permanently"),
+            (Fixture::HistoryDark, "Removed or custom model"),
             (Fixture::SettingsRecording, "Recording behavior"),
         ] {
             assert!(

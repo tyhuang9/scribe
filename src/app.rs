@@ -42,7 +42,7 @@ use crate::history::{
     HistoryRecord, HistoryRetentionPolicy, HistoryStatus, HistoryStore, NewHistoryEntry,
 };
 use crate::history_playback::{PlaybackEvent, PlaybackService};
-use crate::hotkey::{HotkeyEvent, HotkeyService};
+use crate::hotkey::{HotkeyEvent, HotkeyService, normalize_hotkey_spec};
 use crate::huggingface_catalog::{
     CatalogSource, HuggingFaceCatalogService, ModelInventorySnapshot, RemoteModel, TrustedArtifact,
 };
@@ -50,12 +50,11 @@ use crate::installations::{
     ActivationJournal, ActivationPhase, DirectoryReplacement, FileReplacement, InstallCancellation,
     InstallError, InstallProgress, InstallStage, ManagedRemoval, discover_managed_removal_targets,
     fingerprint_file_cancellable, reconcile_activation_journal, reconcile_managed_removal,
+    remove_exact_regular_file,
 };
 use crate::installed_manifest;
 use crate::managed_downloads;
-use crate::model_catalog::ArtifactFormat;
-#[cfg(test)]
-use crate::model_catalog::BUNDLED_BASE_MODEL_ID;
+use crate::model_catalog::{ArtifactFormat, BUNDLED_BASE_MODEL_ID};
 use crate::models::{
     ModelArtifactOrigin, ModelInstallStatus, ModelRuntimeStatus, SttModelInfo, TranscriptionStatus,
     format_bytes,
@@ -82,11 +81,11 @@ use crate::ui::{
     RecordingMode, RecordingSettingsView, RemoteCatalogActionKind, RemoteCatalogActionView,
     RemoteCatalogEntryView, RemoteCatalogFilters, RemoteCatalogSort, RemoteCatalogStatusKind,
     RemoteCatalogStatusView, RemoteCatalogVariantView, RemoteCatalogView, ResolvedTheme,
-    ScreenAction, ScreenView, SettingsTab, SidebarModelView, ThemePalette, UiRoute,
-    configure_accessible_style, history_page, minimum_primary_target_height, recording_mode,
-    render_screen, request_models_route_heading_focus, scroll_focused_control_into_view,
-    settings_save_state, show_navigation, show_route_scroll, theme_palette, transcription_state,
-    ui_palette,
+    ScreenAction, ScreenView, SettingsTab, SidebarModelView, ThemePalette, TranscribeNotice,
+    TranscribeRecoveryAction, UiRoute, configure_accessible_style, history_page,
+    minimum_primary_target_height, recording_mode, render_screen,
+    request_models_route_heading_focus, scroll_focused_control_into_view, settings_save_state,
+    show_navigation, show_route_scroll, theme_palette, transcription_state, ui_palette,
 };
 
 #[cfg(test)]
@@ -3238,6 +3237,55 @@ fn env_flag_value_enabled(value: &str) -> bool {
     )
 }
 
+fn cleanup_excluded_bundled_model(config: &AppConfig) -> Result<bool, InstallError> {
+    cleanup_excluded_bundled_model_at(config, config::bundled_model_path())
+}
+
+fn cleanup_excluded_bundled_model_at(
+    config: &AppConfig,
+    bundled_path: Option<PathBuf>,
+) -> Result<bool, InstallError> {
+    if !config
+        .general
+        .excluded_bundled_model_ids
+        .iter()
+        .any(|id| id == BUNDLED_BASE_MODEL_ID)
+    {
+        return Ok(false);
+    }
+    let Some(path) = bundled_path else {
+        return Ok(false);
+    };
+    remove_exact_regular_file(&path, &path)
+}
+
+fn apply_removed_model_config(
+    config: &mut AppConfig,
+    model_id: &str,
+    replacement: Option<&SttModelInfo>,
+    exclude_bundled: bool,
+) {
+    config.general.managed_models.remove(model_id);
+    config.general.managed_remote_models.remove(model_id);
+    config.general.imported_gguf_models.remove(model_id);
+    config.general.model_paths.remove(model_id);
+    set_model_selected(config, model_id, false);
+    if config.general.selected_default_model == model_id {
+        config.general.selected_default_model =
+            replacement.map_or_else(String::new, |model| model.id.clone());
+        if let Some(replacement) = replacement {
+            compatibility_bridge::record_selected_provider(config, replacement);
+        }
+    }
+    if exclude_bundled {
+        config
+            .general
+            .excluded_bundled_model_ids
+            .push(BUNDLED_BASE_MODEL_ID.to_owned());
+    }
+    config::normalize_config(config);
+}
+
 pub struct LocalTranscriberApp {
     config: AppConfig,
     config_path: Option<PathBuf>,
@@ -3264,6 +3312,7 @@ pub struct LocalTranscriberApp {
     transcript: String,
     raw_transcript: String,
     status_message: String,
+    transcribe_notice: Option<TranscribeNotice>,
     theme_announcement: Option<String>,
     hotkey_input: String,
     model_search: String,
@@ -3281,6 +3330,7 @@ pub struct LocalTranscriberApp {
     deferred_recording_start: Option<DeferredRecordingStart>,
     deferred_history_playback: Option<i64>,
     capturing_hotkey: bool,
+    transcribe_record_focus_pending: bool,
     model_downloads: HashMap<String, ModelInstallStatus>,
     runtime_jobs: HashMap<String, RuntimeInstallJob>,
     artifact_installations: ArtifactInstallCoordinator,
@@ -3290,6 +3340,7 @@ pub struct LocalTranscriberApp {
     local_gguf_import: Option<LocalGgufImportJob>,
     local_gguf_import_status: Option<String>,
     artifact_recovery_error: Option<String>,
+    bundled_model_cleanup_warning: Option<String>,
     active_recording: Option<ActiveRecording>,
     pending_recording: Option<PendingRecording>,
     abandoned_capture_cleanups: Vec<AbandonedCaptureCleanup>,
@@ -3308,7 +3359,11 @@ pub struct LocalTranscriberApp {
     history_error: Option<String>,
     history_delete_confirmation: Option<i64>,
     history_confirmation_focus_pending: bool,
+    history_confirmation_return_focus: Option<i64>,
     history_search_focus_pending: bool,
+    history_more_focus_pending: Option<i64>,
+    history_expanded_transcripts: HashSet<i64>,
+    history_expanded_details: HashSet<i64>,
     history_mutation_sequence: u64,
     history_mutation_in_flight: Option<u64>,
     pending_history_retention_policy: Option<HistoryRetentionPolicy>,
@@ -3362,6 +3417,13 @@ impl LocalTranscriberApp {
             ),
         };
         config::normalize_config(&mut config);
+        let bundled_model_cleanup_warning = cleanup_excluded_bundled_model(&config)
+            .err()
+            .map(|error| {
+                format!(
+                    "The excluded included model could not be removed after this update: {error}. It remains disabled. Close other processes and restart Scribe to retry cleanup, or choose Install to verify and reinstate it."
+                )
+            });
         cc.egui_ctx.set_visuals(stitch_visuals(resolve_theme_mode(
             config.general.theme_mode,
             cc.integration_info.system_theme,
@@ -3416,6 +3478,7 @@ impl LocalTranscriberApp {
             deferred_recording_start: None,
             deferred_history_playback: None,
             capturing_hotkey: false,
+            transcribe_record_focus_pending: false,
             model_downloads: HashMap::new(),
             runtime_jobs: HashMap::new(),
             artifact_installations: ArtifactInstallCoordinator::default(),
@@ -3425,6 +3488,7 @@ impl LocalTranscriberApp {
             local_gguf_import: None,
             local_gguf_import_status: None,
             artifact_recovery_error: None,
+            bundled_model_cleanup_warning,
             playground_cards,
             playground_selector_draft: None,
             playground_selector_return_focus: None,
@@ -3459,6 +3523,7 @@ impl LocalTranscriberApp {
             transcript: String::new(),
             raw_transcript: String::new(),
             status_message,
+            transcribe_notice: None,
             theme_announcement: None,
             active_recording: None,
             pending_recording: None,
@@ -3478,7 +3543,11 @@ impl LocalTranscriberApp {
             history_error,
             history_delete_confirmation: None,
             history_confirmation_focus_pending: false,
+            history_confirmation_return_focus: None,
             history_search_focus_pending: false,
+            history_more_focus_pending: None,
+            history_expanded_transcripts: HashSet::new(),
+            history_expanded_details: HashSet::new(),
             history_mutation_sequence: 0,
             history_mutation_in_flight: None,
             pending_history_retention_policy: None,
@@ -3573,12 +3642,16 @@ impl LocalTranscriberApp {
                     "could not fingerprint durable settings before artifact recovery: {error}"
                 ))
             });
+        let bundled_removal_target = config::bundled_model_path();
         let removal_recovery = durable_artifact_fingerprint
             .as_ref()
             .map_err(|error| {
                 crate::installations::InstallError::RecoveryRequired(error.to_string())
             })
             .and_then(|fingerprint| {
+                if let Some(target) = bundled_removal_target.as_ref() {
+                    reconcile_managed_removal(target, std::slice::from_ref(target), fingerprint)?;
+                }
                 let removal_roots = vec![
                     config::model_storage_dir(&app.config),
                     config::runtime_storage_dir(),
@@ -3637,6 +3710,7 @@ impl LocalTranscriberApp {
             }
         }
         if app.artifact_recovery_error.is_none() {
+            app.reconcile_startup_model_selection();
             app.validate_startup_runtime_or_recover();
         }
 
@@ -3682,6 +3756,92 @@ impl LocalTranscriberApp {
 
     fn selected_model(&self) -> Option<SttModelInfo> {
         config::selected_model(&self.config)
+    }
+
+    fn startup_model_is_ready(&self, model: &SttModelInfo) -> bool {
+        if runtime_status_for_model(&self.config, model) != ModelRuntimeStatus::Ready {
+            return false;
+        }
+        model.artifact_origin != ModelArtifactOrigin::Bundled
+            || model.local_path.as_ref().is_some_and(|path| {
+                self.transcription_service
+                    .verify_model_artifact_for_installation(
+                        &ModelId::new(&model.id),
+                        Some(path.to_path_buf()),
+                    )
+                    .is_ok()
+            })
+    }
+
+    /// Repairs only an unavailable selection. A healthy explicit choice is
+    /// never replaced. Catalog order is stable, making the final fallback
+    /// deterministic across launches.
+    fn reconcile_startup_model_selection(&mut self) {
+        let models = config::configured_models(&self.config);
+        if models.iter().any(|model| {
+            model.id == self.config.general.selected_default_model
+                && self.startup_model_is_ready(model)
+        }) {
+            return;
+        }
+
+        let replacement = models
+            .iter()
+            .find(|model| {
+                model.id == BUNDLED_BASE_MODEL_ID
+                    && model.artifact_origin == ModelArtifactOrigin::Bundled
+                    && self.startup_model_is_ready(model)
+            })
+            .or_else(|| {
+                models
+                    .iter()
+                    .find(|model| self.startup_model_is_ready(model))
+            })
+            .cloned();
+        let next_id = replacement
+            .as_ref()
+            .map_or_else(String::new, |model| model.id.clone());
+        if self.config.general.selected_default_model == next_id {
+            return;
+        }
+
+        let previous = self.config.clone();
+        self.config.general.selected_default_model = next_id;
+        if let Some(model) = replacement.as_ref() {
+            compatibility_bridge::record_selected_provider(&mut self.config, model);
+        }
+        config::normalize_config(&mut self.config);
+        #[cfg(test)]
+        let persistence = if self.config_path.is_none() {
+            Ok(())
+        } else {
+            config::save_config(&self.config)
+        };
+        #[cfg(not(test))]
+        let persistence = config::save_config(&self.config);
+        if let Err(error) = persistence {
+            self.config = previous;
+            self.status = TranscriptionStatus::Error;
+            self.status_message = format!(
+                "The selected model is unavailable, and Scribe could not save a ready replacement: {error}"
+            );
+            return;
+        }
+        if let Some(store) = self.settings_store.as_mut() {
+            store.mark_current_persisted();
+        }
+        self.transcription_service = self.transcription_service.with_config(self.config.clone());
+        self.refresh_playground_cards_from_config();
+        self.status = TranscriptionStatus::Idle;
+        self.status_message = replacement.map_or_else(
+            || "No speech model is ready. Install a model to begin transcribing.".to_owned(),
+            |model| {
+                format!(
+                    "Selected {} because the previous speech model was unavailable.",
+                    model.name
+                )
+            },
+        );
     }
 
     fn validate_startup_runtime_or_recover(&mut self) {
@@ -4607,6 +4767,8 @@ impl LocalTranscriberApp {
             return;
         }
         let message = message.into();
+        let transcribe_session =
+            self.session_coordinator.active_purpose() == Some(SessionPurpose::Dictation);
         let _ = self.session_coordinator.fail(session_id);
         if let Some(pending) = self.pending_output.take()
             && let Some(latency) = pending.latency.as_ref()
@@ -4620,6 +4782,16 @@ impl LocalTranscriberApp {
         }
         self.status = TranscriptionStatus::Error;
         self.status_message = message.clone();
+        if transcribe_session {
+            self.transcribe_notice = Some(if message.starts_with("Microphone failed:") {
+                TranscribeNotice::error(
+                    "Scribe couldn’t access your microphone.",
+                    TranscribeRecoveryAction::RetryMicrophone,
+                )
+            } else {
+                TranscribeNotice::failure(message.clone())
+            });
+        }
         self.finish_overlay_error(session_id, &message);
     }
 
@@ -4983,17 +5155,31 @@ impl LocalTranscriberApp {
                 });
                 self.stop_microphone_test();
                 self.status_message = "Preparing microphone".to_owned();
+                if source == RecordingSource::Transcribe {
+                    self.transcribe_notice =
+                        Some(TranscribeNotice::information("Preparing microphone…"));
+                }
             }
             return;
         }
         if self.playing_history_id.is_some() {
             self.status_message =
                 "Stop retained-audio playback before starting dictation".to_owned();
+            if source == RecordingSource::Transcribe {
+                self.transcribe_notice =
+                    Some(TranscribeNotice::failure(self.status_message.clone()));
+            }
             return;
         }
         if let Some(message) = self.artifact_recovery_error.as_ref() {
             self.status = TranscriptionStatus::Error;
             self.status_message = message.clone();
+            if source == RecordingSource::Transcribe {
+                self.transcribe_notice = Some(TranscribeNotice::error(
+                    message.clone(),
+                    TranscribeRecoveryAction::OpenModelSettings,
+                ));
+            }
             return;
         }
         if !self.artifact_installations.is_empty() || !self.runtime_jobs.is_empty() {
@@ -5001,6 +5187,12 @@ impl LocalTranscriberApp {
             self.status_message =
                 "Wait for the active model/runtime installation to finish or cancel it before transcribing."
                     .to_owned();
+            if source == RecordingSource::Transcribe {
+                self.transcribe_notice = Some(TranscribeNotice::error(
+                    self.status_message.clone(),
+                    TranscribeRecoveryAction::OpenModelSettings,
+                ));
+            }
             return;
         }
         if self.capture_is_active() {
@@ -5021,12 +5213,20 @@ impl LocalTranscriberApp {
                 self.status = TranscriptionStatus::Error;
                 self.status_message =
                     "Choose or install a local model before transcribing.".to_owned();
+                self.transcribe_notice = Some(TranscribeNotice::error(
+                    self.status_message.clone(),
+                    TranscribeRecoveryAction::AddModel,
+                ));
                 return;
             };
             let runtime_status = runtime_status_for_model(&self.config, &model);
             if runtime_status != ModelRuntimeStatus::Ready {
                 self.status = TranscriptionStatus::Error;
                 self.status_message = setup_message_for_status(&runtime_status);
+                self.transcribe_notice = Some(TranscribeNotice::error(
+                    self.status_message.clone(),
+                    TranscribeRecoveryAction::OpenModelSettings,
+                ));
                 return;
             }
             Some(model)
@@ -5054,6 +5254,10 @@ impl LocalTranscriberApp {
                 }
                 self.status = TranscriptionStatus::Error;
                 self.status_message = format!("Could not start dictation: {err}");
+                if source == RecordingSource::Transcribe {
+                    self.transcribe_notice =
+                        Some(TranscribeNotice::failure(self.status_message.clone()));
+                }
                 return;
             }
         };
@@ -5874,6 +6078,7 @@ impl LocalTranscriberApp {
                 }
                 self.history_applied_search = search;
                 self.history_records.clear();
+                self.prune_history_card_ui_state();
                 self.history_next = None;
                 self.request_history_page(false);
             }
@@ -5882,6 +6087,7 @@ impl LocalTranscriberApp {
                 self.history_applied_search.clear();
                 self.history_search_focus_pending = true;
                 self.history_records.clear();
+                self.prune_history_card_ui_state();
                 self.history_next = None;
                 self.request_history_page(false);
             }
@@ -5900,6 +6106,7 @@ impl LocalTranscriberApp {
                 );
             }
             HistoryPageAction::TogglePinned { id, pinned } => {
+                self.history_more_focus_pending = Some(id);
                 self.start_history_mutation(
                     if pinned {
                         "History entry pinned"
@@ -5956,8 +6163,12 @@ impl LocalTranscriberApp {
                     self.status_message = "Native history playback is unavailable".to_owned();
                 }
             }
-            HistoryPageAction::Retry(history_id) => self.start_history_retry(history_id),
+            HistoryPageAction::Retry(history_id) => {
+                self.history_more_focus_pending = Some(history_id);
+                self.start_history_retry(history_id);
+            }
             HistoryPageAction::DeleteAudio(id) => {
+                self.history_more_focus_pending = Some(id);
                 self.start_history_mutation("Retained audio deleted", move |store| {
                     store
                         .delete_audio(id)
@@ -5968,16 +6179,56 @@ impl LocalTranscriberApp {
             HistoryPageAction::RequestDelete(id) => {
                 self.history_delete_confirmation = Some(id);
                 self.history_confirmation_focus_pending = true;
+                self.history_confirmation_return_focus = Some(id);
             }
             HistoryPageAction::ConfirmDelete(id) => {
                 self.history_delete_confirmation = None;
+                self.history_confirmation_return_focus = None;
                 self.history_search_focus_pending = true;
                 self.delete_history_entry(id);
             }
             HistoryPageAction::CancelDelete => {
                 self.history_delete_confirmation = None;
-                self.history_search_focus_pending = true;
+                self.history_more_focus_pending = self.history_confirmation_return_focus.take();
             }
+            HistoryPageAction::ToggleTranscript(id) => {
+                toggle_history_card_state(&mut self.history_expanded_transcripts, id);
+            }
+            HistoryPageAction::ToggleDetails(id) => {
+                toggle_history_card_state(&mut self.history_expanded_details, id);
+                self.history_more_focus_pending = Some(id);
+            }
+        }
+    }
+
+    fn prune_history_card_ui_state(&mut self) {
+        let visible_ids = self
+            .history_records
+            .iter()
+            .map(|record| record.id)
+            .collect::<HashSet<_>>();
+        self.history_expanded_transcripts
+            .retain(|id| visible_ids.contains(id));
+        self.history_expanded_details
+            .retain(|id| visible_ids.contains(id));
+        if self
+            .history_more_focus_pending
+            .is_some_and(|id| !visible_ids.contains(&id))
+        {
+            self.history_more_focus_pending = None;
+        }
+        if self
+            .history_confirmation_return_focus
+            .is_some_and(|id| !visible_ids.contains(&id))
+        {
+            self.history_confirmation_return_focus = None;
+        }
+        if self
+            .history_delete_confirmation
+            .is_some_and(|id| !visible_ids.contains(&id))
+        {
+            self.history_delete_confirmation = None;
+            self.history_confirmation_focus_pending = false;
         }
     }
 
@@ -6598,6 +6849,7 @@ impl LocalTranscriberApp {
                             } else {
                                 self.history_records = page.records;
                             }
+                            self.prune_history_card_ui_state();
                             self.history_next = page.next;
                             self.history_error = None;
                         }
@@ -7337,6 +7589,13 @@ impl LocalTranscriberApp {
                                     install.sha256 = Some(result.model_sha256.clone());
                                     install
                                 });
+                        }
+                        if model_id == BUNDLED_BASE_MODEL_ID {
+                            self.config
+                                .general
+                                .excluded_bundled_model_ids
+                                .retain(|id| id != BUNDLED_BASE_MODEL_ID);
+                            self.bundled_model_cleanup_warning = None;
                         }
                         set_model_selected(&mut self.config, &model_id, true);
                         if should_activate_installed_model(active_model_is_runnable) {
@@ -8122,12 +8381,46 @@ impl LocalTranscriberApp {
     }
 
     fn apply_hotkey(&mut self) {
+        let normalized = match normalize_hotkey_spec(&self.hotkey_input) {
+            Ok(spec) => spec,
+            Err(err) => {
+                self.capturing_hotkey = false;
+                self.hotkey_input = self.config.recording.hotkey.clone();
+                self.status = TranscriptionStatus::Error;
+                self.status_message = format!(
+                    "Failed to register hotkey: {err}. The previous shortcut is still active."
+                );
+                self.transcribe_notice =
+                    Some(TranscribeNotice::failure(self.status_message.clone()));
+                return;
+            }
+        };
+        let persisted = normalize_hotkey_spec(&self.config.recording.hotkey)
+            .unwrap_or_else(|_| self.config.recording.hotkey.clone());
+        if normalized == persisted {
+            self.capturing_hotkey = false;
+            self.hotkey_input = normalized.clone();
+            if self.config.recording.hotkey != normalized {
+                self.config.recording.hotkey = normalized;
+                self.save_config();
+            }
+            self.status_message = "Recording shortcut unchanged.".to_owned();
+            self.transcribe_notice = Some(TranscribeNotice::information(
+                "Recording shortcut unchanged.",
+            ));
+            return;
+        }
+        self.hotkey_input = normalized;
         match self.hotkey_service.register(&self.hotkey_input) {
             Ok(()) => {
                 self.capturing_hotkey = false;
                 self.config.recording.hotkey = self.hotkey_input.clone();
                 self.save_config();
                 self.status_message = format!("Registered hotkey {}", self.config.recording.hotkey);
+                self.transcribe_notice = Some(TranscribeNotice::information(format!(
+                    "Recording shortcut changed to {}.",
+                    self.config.recording.hotkey
+                )));
             }
             Err(err) => {
                 self.capturing_hotkey = false;
@@ -8136,6 +8429,8 @@ impl LocalTranscriberApp {
                 self.status_message = format!(
                     "Failed to register hotkey: {err}. The previous shortcut is still active."
                 );
+                self.transcribe_notice =
+                    Some(TranscribeNotice::failure(self.status_message.clone()));
             }
         }
     }
@@ -8154,17 +8449,25 @@ impl LocalTranscriberApp {
 
     fn start_hotkey_capture(&mut self) {
         if let Some(reason) = self.quick_hotkey_change_block_reason() {
-            self.status_message = reason;
+            self.status_message = reason.clone();
+            self.transcribe_notice = Some(TranscribeNotice::failure(reason));
             return;
         }
         self.capturing_hotkey = true;
         self.status_message = "Press the new hotkey combination. Press Escape or the recording shortcut card again to cancel.".to_owned();
+        self.transcribe_notice = Some(TranscribeNotice::information(
+            "Press the new shortcut now. Press Escape or activate the shortcut control again to cancel.",
+        ));
     }
 
     fn cancel_hotkey_capture(&mut self) {
         self.capturing_hotkey = false;
         self.hotkey_input = self.config.recording.hotkey.clone();
         self.status_message = "Hotkey capture cancelled.".to_owned();
+        self.transcribe_notice = Some(TranscribeNotice::information(format!(
+            "Shortcut unchanged: {}.",
+            self.config.recording.hotkey
+        )));
     }
 
     fn apply_theme(&self, ctx: &egui::Context, frame: &eframe::Frame) {
@@ -8179,12 +8482,11 @@ impl LocalTranscriberApp {
             return;
         }
 
-        if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
-            self.cancel_hotkey_capture();
-            return;
-        }
-
         if let Some(spec) = ctx.input(captured_hotkey_spec) {
+            if spec == "Esc" {
+                self.cancel_hotkey_capture();
+                return;
+            }
             self.hotkey_input = spec;
             self.apply_hotkey();
         }
@@ -8362,6 +8664,9 @@ impl LocalTranscriberApp {
             self.status_message = format!("{} is already being installed.", model.name);
             return;
         }
+        if self.reinstate_verified_bundled_model(model) {
+            return;
+        }
         if self
             .transcription_service
             .installation_binding(&ModelId::new(&model.id))
@@ -8385,6 +8690,63 @@ impl LocalTranscriberApp {
 
     fn start_model_download_only(&mut self, model: &SttModelInfo) {
         self.start_model_download_with_runtime_policy(model, false);
+    }
+
+    fn reinstate_verified_bundled_model(&mut self, model: &SttModelInfo) -> bool {
+        if model.id != BUNDLED_BASE_MODEL_ID
+            || !self
+                .config
+                .general
+                .excluded_bundled_model_ids
+                .iter()
+                .any(|id| id == BUNDLED_BASE_MODEL_ID)
+        {
+            return false;
+        }
+        let Some(path) = config::bundled_model_path().filter(|path| path.is_file()) else {
+            return false;
+        };
+        if self
+            .transcription_service
+            .verify_model_artifact_for_installation(
+                &ModelId::new(BUNDLED_BASE_MODEL_ID),
+                Some(path),
+            )
+            .is_err()
+        {
+            return false;
+        }
+
+        let previous = self.config.clone();
+        self.config
+            .general
+            .excluded_bundled_model_ids
+            .retain(|id| id != BUNDLED_BASE_MODEL_ID);
+        config::normalize_config(&mut self.config);
+        #[cfg(test)]
+        let persistence = if self.config_path.is_none() {
+            Ok(())
+        } else {
+            config::save_config(&self.config)
+        };
+        #[cfg(not(test))]
+        let persistence = config::save_config(&self.config);
+        if let Err(error) = persistence {
+            self.config = previous;
+            self.status = TranscriptionStatus::Error;
+            self.status_message =
+                format!("The included model is valid, but Scribe could not reinstate it: {error}");
+            return true;
+        }
+        if let Some(store) = self.settings_store.as_mut() {
+            store.mark_current_persisted();
+        }
+        self.bundled_model_cleanup_warning = None;
+        self.transcription_service = self.transcription_service.with_config(self.config.clone());
+        self.rebuild_local_models_after_committed_change();
+        self.status = TranscriptionStatus::Idle;
+        self.status_message = format!("Installed {}.", model.name);
+        true
     }
 
     fn start_model_download_with_runtime_policy(
@@ -8892,11 +9254,22 @@ impl LocalTranscriberApp {
     /// still require recovery after that point, so callers must not undo the
     /// newly persisted active-model selection on a committed removal.
     fn uninstall_model(&mut self, model: &SttModelInfo) -> bool {
-        if model.artifact_origin == ModelArtifactOrigin::Bundled {
-            self.status_message =
-                "This model is installed with Scribe and cannot be removed.".to_owned();
-            return false;
-        }
+        let bundled_target = if model.id == BUNDLED_BASE_MODEL_ID
+            && model.artifact_origin == ModelArtifactOrigin::Bundled
+        {
+            let expected = config::bundled_model_path();
+            match model.local_path.as_ref().zip(expected) {
+                Some((actual, expected)) if actual == &expected => Some(expected),
+                _ => {
+                    self.status = TranscriptionStatus::Error;
+                    self.status_message = "The included model path did not match Scribe's signed manifest location; no file was removed.".to_owned();
+                    return false;
+                }
+            }
+        } else {
+            None
+        };
+        let removing_bundled = bundled_target.is_some();
         if let Some(reason) = self.artifact_mutation_block_reason() {
             self.status_message = reason;
             return false;
@@ -8905,6 +9278,9 @@ impl LocalTranscriberApp {
             self.status_message = format!("Could not unload the selected model: {error}");
             return false;
         }
+        let replacement = (self.config.general.selected_default_model == model.id)
+            .then(|| self.active_model_removal_replacement(&model.id))
+            .flatten();
         let static_managed_target = self
             .config
             .general
@@ -8938,7 +9314,9 @@ impl LocalTranscriberApp {
             })
             .filter(|path| is_app_managed_model_path(&self.config, path));
         let imported_local = imported_receipt_target.is_some();
-        let managed_target = static_managed_target
+        let managed_target = bundled_target
+            .clone()
+            .or(static_managed_target)
             .or(remote_managed_target)
             .or(imported_receipt_target)
             .or(legacy_catalog_target);
@@ -8953,8 +9331,18 @@ impl LocalTranscriberApp {
         };
         let mut staged_removal = match managed_target.as_ref() {
             Some(target) => {
-                match ManagedRemoval::stage(target, std::slice::from_ref(target), prior_fingerprint)
-                {
+                let staged = if removing_bundled {
+                    ManagedRemoval::stage_exact_regular_file(
+                        target,
+                        bundled_target
+                            .as_ref()
+                            .expect("bundled target was established"),
+                        prior_fingerprint,
+                    )
+                } else {
+                    ManagedRemoval::stage(target, std::slice::from_ref(target), prior_fingerprint)
+                };
+                match staged {
                     Ok(removal) => Some(removal),
                     Err(error) => {
                         if error.requires_recovery() {
@@ -8974,16 +9362,12 @@ impl LocalTranscriberApp {
         let previous_config = self.config.clone();
         self.remote_catalog.invalidate_local_models();
         self.model_downloads.remove(&model.id);
-        self.config.general.managed_models.remove(&model.id);
-        self.config.general.managed_remote_models.remove(&model.id);
-        self.config.general.imported_gguf_models.remove(&model.id);
-        self.config.general.model_paths.remove(&model.id);
-        set_model_selected(&mut self.config, &model.id, false);
-
-        if self.config.general.selected_default_model == model.id {
-            select_first_installed_model(&mut self.config);
-        }
-        config::normalize_config(&mut self.config);
+        apply_removed_model_config(
+            &mut self.config,
+            &model.id,
+            replacement.as_ref(),
+            removing_bundled,
+        );
         let removal_preparation = config::settings::artifact_config_fingerprint(&self.config)
             .map_err(|error| error.to_string())
             .and_then(|fingerprint| {
@@ -9020,12 +9404,44 @@ impl LocalTranscriberApp {
         let persistence = config::save_config(&self.config);
         if let Err(error) = persistence {
             self.config = previous_config;
-            let message = format!(
-                "Could not confirm model removal settings persistence: {error}. The artifact tombstone and removal journal were retained; restart Scribe to reconcile the durable settings witness."
-            );
-            if staged_removal.is_some() {
-                self.artifact_recovery_error = Some(message.clone());
-            }
+            let message = if removing_bundled {
+                let file_rollback = staged_removal
+                    .take()
+                    .and_then(|removal| removal.rollback().err());
+                #[cfg(test)]
+                let config_rollback = if self.config_path.is_none() {
+                    None
+                } else {
+                    config::save_config(&self.config).err()
+                };
+                #[cfg(not(test))]
+                let config_rollback = config::save_config(&self.config).err();
+                let message = format!(
+                    "Could not persist the included-model removal: {error}.{}{}",
+                    file_rollback
+                        .as_ref()
+                        .map(|error| format!(" Restoring the model file also failed: {error}."))
+                        .unwrap_or_else(|| " The model file was restored.".to_owned()),
+                    config_rollback
+                        .as_ref()
+                        .map(|error| format!(
+                            " Restoring the previous settings also failed: {error}."
+                        ))
+                        .unwrap_or_else(|| " The previous settings were restored.".to_owned()),
+                );
+                if file_rollback.is_some() || config_rollback.is_some() {
+                    self.artifact_recovery_error = Some(message.clone());
+                }
+                message
+            } else {
+                let message = format!(
+                    "Could not confirm model removal settings persistence: {error}. The artifact tombstone and removal journal were retained; restart Scribe to reconcile the durable settings witness."
+                );
+                if staged_removal.is_some() {
+                    self.artifact_recovery_error = Some(message.clone());
+                }
+                message
+            };
             self.status = TranscriptionStatus::Error;
             self.status_message = message;
             return false;
@@ -9036,6 +9452,9 @@ impl LocalTranscriberApp {
         }
         self.transcription_service = self.transcription_service.with_config(self.config.clone());
         self.refresh_playground_cards_from_config();
+        if removing_bundled {
+            self.bundled_model_cleanup_warning = None;
+        }
         if let Some(error) = cleanup {
             let message = format!(
                 "{} was removed, but cleanup is incomplete; restart Scribe before changing artifacts again: {error}",
@@ -9675,9 +10094,11 @@ impl LocalTranscriberApp {
             self.transcript.clone(),
             provisional_transcript.unwrap_or_default(),
             if no_speech {
-                Some("No speech detected — nothing was added.".to_owned())
+                Some(TranscribeNotice::information(
+                    "No speech detected — nothing was added.",
+                ))
             } else {
-                (!self.status_message.is_empty()).then(|| self.status_message.clone())
+                self.transcribe_notice.clone()
             },
             self.config.recording.hotkey.clone(),
             recording_mode(self.config.recording.hotkey_mode == HotkeyMode::HoldToTalk),
@@ -9691,6 +10112,7 @@ impl LocalTranscriberApp {
         state.hotkey_capture_active = self.capturing_hotkey;
         state.hotkey_change_disabled_reason = self.quick_hotkey_change_block_reason();
         state.model_change_disabled_reason = self.artifact_mutation_block_reason();
+        state.record_control_needs_focus = self.transcribe_record_focus_pending;
         let settings = RecordingSettingsView {
             duration_label: format!("{} seconds", self.config.recording.max_recording_seconds),
             provisional_feedback: self.config.streaming.mode != StreamingMode::FinalOnly,
@@ -9723,6 +10145,7 @@ impl LocalTranscriberApp {
                 recording_settings: &settings,
             },
         );
+        self.transcribe_record_focus_pending = false;
         self.apply_transcribe_screen_action(action);
     }
 
@@ -9780,17 +10203,21 @@ impl LocalTranscriberApp {
 
     fn apply_transcribe_screen_action(&mut self, action: ScreenAction) {
         match action {
-            ScreenAction::AddModel | ScreenAction::ChangeModel => self.current_tab = Tab::Models,
-            ScreenAction::OpenModelSettings => {
+            ScreenAction::AddModel | ScreenAction::OpenModelSettings => {
                 self.current_tab = Tab::Models;
                 self.models_route_focus_pending = true;
             }
             ScreenAction::SelectQuickModel(id) => {
+                self.transcribe_notice = None;
                 self.select_ready_model_from_picker(&id);
             }
-            ScreenAction::StartHotkeyCapture => self.start_hotkey_capture(),
+            ScreenAction::StartHotkeyCapture => {
+                self.transcribe_notice = None;
+                self.start_hotkey_capture();
+            }
             ScreenAction::CancelHotkeyCapture => self.cancel_hotkey_capture(),
             ScreenAction::StartRecording | ScreenAction::RetryMicrophone => {
+                self.transcribe_notice = None;
                 self.start_recording(RecordingSource::Transcribe)
             }
             ScreenAction::StopRecording => self.stop_recording(),
@@ -9798,10 +10225,21 @@ impl LocalTranscriberApp {
                 if let Some(session_id) = self.session_coordinator.active_session_id() {
                     self.abandon_recording(session_id);
                 }
+                self.transcribe_record_focus_pending = true;
             }
             ScreenAction::OpenAudioSettings => self.open_system_audio_settings(),
-            ScreenAction::ClearTranscript => self.clear_transcript_history(),
-            ScreenAction::CopyTranscript => self.copy_transcript_to_clipboard(),
+            ScreenAction::ClearTranscript => {
+                self.clear_transcript_history();
+                self.transcribe_notice = Some(TranscribeNotice::information("Transcript cleared."));
+            }
+            ScreenAction::CopyTranscript => {
+                self.copy_transcript_to_clipboard();
+                self.transcribe_notice = Some(if self.status_message == "Transcript copied" {
+                    TranscribeNotice::information("Transcript copied.")
+                } else {
+                    TranscribeNotice::failure(self.status_message.clone())
+                });
+            }
             ScreenAction::None
             | ScreenAction::AcknowledgeModelRemovalFocus
             | ScreenAction::SelectModel(_)
@@ -9917,6 +10355,7 @@ impl LocalTranscriberApp {
             self.request_remote_catalog();
         }
         self.model_management.mutation_block_reason = self.artifact_mutation_block_reason();
+        self.model_management.lifecycle_warning = self.bundled_model_cleanup_warning.clone();
         self.model_management.install_status_summary =
             self.artifact_installations.aggregate_status();
         self.model_comparison.start_disabled_reason =
@@ -11067,11 +11506,12 @@ impl LocalTranscriberApp {
             primary_action_repairs_runtime,
             primary_action_disabled_reason,
             cancel_supported: install_phase.is_some_and(ArtifactInstallPhase::allows_cancellation),
-            removal_supported: !bundled
-                && !custom
-                && (imported_gguf
-                    || app_owned_legacy_artifact
-                    || supports_managed_uninstall(model, &install_status)),
+            removal_supported: (bundled && model.id == BUNDLED_BASE_MODEL_ID && installed)
+                || (!bundled
+                    && !custom
+                    && (imported_gguf
+                        || app_owned_legacy_artifact
+                        || supports_managed_uninstall(model, &install_status))),
             partial_cleanup_available,
             partial_cleanup_enabled: partial_cleanup_available && has_partial && !mutation_blocked,
             partial_cleanup_disabled_reason: if partial_cleanup_available {
@@ -11173,9 +11613,17 @@ impl LocalTranscriberApp {
             }
             ScreenAction::RequestModelRemoval(id) => {
                 let active = self.config.general.selected_default_model == id;
-                let replacement_required =
-                    active && !app_owned_legacy_cleanup_artifact_for_id(&self.config, &id);
-                let replacement = replacement_required
+                let bundled = config::configured_models(&self.config)
+                    .into_iter()
+                    .find(|model| model.id == id)
+                    .is_some_and(|model| {
+                        model.id == BUNDLED_BASE_MODEL_ID
+                            && model.artifact_origin == ModelArtifactOrigin::Bundled
+                    });
+                let replacement_required = active
+                    && !bundled
+                    && !app_owned_legacy_cleanup_artifact_for_id(&self.config, &id);
+                let replacement = active
                     .then(|| self.active_model_removal_replacement(&id))
                     .flatten();
                 if replacement_required && replacement.is_none() {
@@ -11333,10 +11781,20 @@ impl LocalTranscriberApp {
                 self.model_management.restore_remove_focus = None;
                 self.model_management.restore_after_removal_focus = false;
                 let active = self.config.general.selected_default_model == id;
+                let bundled = config::configured_models(&self.config)
+                    .into_iter()
+                    .find(|model| model.id == id)
+                    .is_some_and(|model| {
+                        model.id == BUNDLED_BASE_MODEL_ID
+                            && model.artifact_origin == ModelArtifactOrigin::Bundled
+                    });
                 let legacy_cleanup_pending =
                     app_owned_legacy_cleanup_artifact_for_id(&self.config, &id);
                 let mut replacement_name = None;
-                if active && !legacy_cleanup_pending {
+                if bundled {
+                    self.model_management.removal_replacement = None;
+                }
+                if active && !legacy_cleanup_pending && !bundled {
                     let expected = self.model_management.removal_replacement.take();
                     let replacement = expected.as_deref().and_then(|expected_id| {
                         self.active_model_removal_replacement(&id)
@@ -12220,11 +12678,8 @@ impl LocalTranscriberApp {
             0,
             self.transcript.clone(),
             String::new(),
-            if no_speech {
-                Some("No speech detected — nothing was added.".to_owned())
-            } else {
-                (!self.status_message.is_empty()).then(|| self.status_message.clone())
-            },
+            no_speech
+                .then(|| TranscribeNotice::information("No speech detected — nothing was added.")),
             self.config.recording.hotkey.clone(),
             recording_mode(self.config.recording.hotkey_mode == HotkeyMode::HoldToTalk),
             self.microphone_permission(),
@@ -12599,7 +13054,6 @@ impl LocalTranscriberApp {
             | ScreenAction::ConfirmModelRemoval(_)
             | ScreenAction::CloseModelDialog
             | ScreenAction::AddModel
-            | ScreenAction::ChangeModel
             | ScreenAction::StartHotkeyCapture
             | ScreenAction::CancelHotkeyCapture
             | ScreenAction::StartRecording
@@ -12641,8 +13095,10 @@ impl LocalTranscriberApp {
         let work_active = self.has_active_work();
         let playing = self.playing_history_id;
         let armed = self.armed_history_repaste.as_ref().map(|armed| armed.id);
+        let model_names = self.history_model_names();
         let focus_search = self.history_search_focus_pending;
         let focus_delete_confirmation = self.history_confirmation_focus_pending;
+        let focus_more_action = self.history_more_focus_pending;
         let mut action = None;
         page(ui, "History", status, &status_message, |ui| {
             action = history_page(
@@ -12658,16 +13114,47 @@ impl LocalTranscriberApp {
                     playing,
                     playback_stopping: self.history_playback_stopping,
                     armed_repaste: armed,
+                    model_names: &model_names,
+                    expanded_transcripts: &self.history_expanded_transcripts,
+                    expanded_details: &self.history_expanded_details,
                     focus_search,
                     focus_delete_confirmation,
+                    focus_more_action,
                 },
             );
         });
         self.history_search_focus_pending = false;
         self.history_confirmation_focus_pending = false;
+        self.history_more_focus_pending = None;
         if let Some(action) = action {
             self.apply_history_action(action);
         }
+    }
+
+    fn history_model_names(&self) -> HashMap<String, String> {
+        let mut names = self
+            .transcription_service
+            .model_descriptors()
+            .into_iter()
+            .map(|descriptor| {
+                (
+                    descriptor.id.as_str().to_owned(),
+                    descriptor.display_name.to_owned(),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        for model in self.remote_catalog.local_models.as_ref() {
+            names
+                .entry(model.id.clone())
+                .or_insert_with(|| model.display_name.clone());
+        }
+        names
+    }
+}
+
+fn toggle_history_card_state(states: &mut HashSet<i64>, id: i64) {
+    if !states.insert(id) {
+        states.remove(&id);
     }
 }
 
@@ -14489,6 +14976,7 @@ fn app_owned_legacy_cleanup_artifact_for_id(config: &AppConfig, model_id: &str) 
         .is_some_and(|model| app_owned_legacy_cleanup_artifact(config, &model))
 }
 
+#[cfg(test)]
 fn select_first_installed_model(config: &mut AppConfig) {
     config.general.selected_default_model = config::configured_models(config)
         .into_iter()
@@ -17786,6 +18274,51 @@ mod layout_tests {
     }
 
     #[test]
+    fn history_card_expansion_is_ephemeral_and_delete_cancel_restores_more_actions_focus() {
+        let mut app = test_app();
+        let record = HistoryRecord {
+            id: 31,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            completed_at_ms: Some(1),
+            status: HistoryStatus::Completed,
+            raw_text: "saved transcript".to_owned(),
+            final_text: Some("saved transcript".to_owned()),
+            model_id: "whisper_cpp_base_en".to_owned(),
+            metrics: HistoryMetrics::default(),
+            pinned: false,
+            source_app: None,
+            audio_path: None,
+            failure: None,
+            retry_count: 0,
+            output_outcome: None,
+        };
+        app.history_records = vec![record.clone()];
+
+        app.apply_history_action(HistoryPageAction::ToggleTranscript(record.id));
+        app.apply_history_action(HistoryPageAction::ToggleDetails(record.id));
+        assert!(app.history_expanded_transcripts.contains(&record.id));
+        assert!(app.history_expanded_details.contains(&record.id));
+        assert_eq!(app.history_more_focus_pending, Some(record.id));
+
+        app.apply_history_action(HistoryPageAction::RequestDelete(record.id));
+        assert_eq!(app.history_delete_confirmation, Some(record.id));
+        assert!(app.history_confirmation_focus_pending);
+        app.apply_history_action(HistoryPageAction::CancelDelete);
+        assert_eq!(app.history_delete_confirmation, None);
+        assert_eq!(app.history_more_focus_pending, Some(record.id));
+
+        app.apply_history_action(HistoryPageAction::Retry(record.id));
+        assert_eq!(app.history_more_focus_pending, Some(record.id));
+
+        app.history_records.clear();
+        app.prune_history_card_ui_state();
+        assert!(app.history_expanded_transcripts.is_empty());
+        assert!(app.history_expanded_details.is_empty());
+        assert_eq!(app.history_more_focus_pending, None);
+    }
+
+    #[test]
     fn recording_is_blocked_until_history_playback_is_terminal() {
         let mut app = test_app();
         app.playing_history_id = Some(21);
@@ -18821,7 +19354,7 @@ mod layout_tests {
         assert!(projected.installed);
         assert!(projected.ready);
         assert!(!projected.custom);
-        assert!(!projected.removal_supported);
+        assert!(projected.removal_supported);
     }
 
     #[test]
@@ -18873,7 +19406,7 @@ mod layout_tests {
     }
 
     #[test]
-    fn bundled_model_uninstall_guard_preserves_the_artifact_and_configuration() {
+    fn bundled_model_uninstall_rejects_an_arbitrary_path() {
         let root = std::env::temp_dir().join(format!(
             "scribe-app-bundled-remove-{}-{}",
             std::process::id(),
@@ -18881,7 +19414,7 @@ mod layout_tests {
         ));
         fs::create_dir_all(&root).unwrap();
         let path = root.join("whisper-base.en-Q8_0.gguf");
-        fs::write(&path, b"immutable packaged fixture").unwrap();
+        fs::write(&path, b"external fixture").unwrap();
         let mut app = test_app();
         let before = serde_json::to_value(&app.config).unwrap();
         let mut model = config::configured_models(&app.config)
@@ -18895,10 +19428,8 @@ mod layout_tests {
         assert!(!app.uninstall_model(&model));
         assert!(path.is_file());
         assert_eq!(serde_json::to_value(&app.config).unwrap(), before);
-        assert_eq!(
-            app.status_message,
-            "This model is installed with Scribe and cannot be removed."
-        );
+        assert!(app.status_message.contains("did not match"));
+        assert!(app.status_message.contains("no file was removed"));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -20392,6 +20923,7 @@ mod layout_tests {
             deferred_recording_start: None,
             deferred_history_playback: None,
             capturing_hotkey: false,
+            transcribe_record_focus_pending: false,
             model_downloads: HashMap::new(),
             runtime_jobs: HashMap::new(),
             artifact_installations: ArtifactInstallCoordinator::default(),
@@ -20400,6 +20932,7 @@ mod layout_tests {
             local_gguf_import: None,
             local_gguf_import_status: None,
             artifact_recovery_error: None,
+            bundled_model_cleanup_warning: None,
             playground_cards,
             playground_selector_draft: None,
             playground_selector_return_focus: None,
@@ -20432,6 +20965,7 @@ mod layout_tests {
             transcript: String::new(),
             raw_transcript: String::new(),
             status_message: "Ready".to_owned(),
+            transcribe_notice: None,
             theme_announcement: None,
             active_recording: None,
             pending_recording: None,
@@ -20451,7 +20985,11 @@ mod layout_tests {
             history_error: None,
             history_delete_confirmation: None,
             history_confirmation_focus_pending: false,
+            history_confirmation_return_focus: None,
             history_search_focus_pending: false,
+            history_more_focus_pending: None,
+            history_expanded_transcripts: HashSet::new(),
+            history_expanded_details: HashSet::new(),
             history_mutation_sequence: 0,
             history_mutation_in_flight: None,
             pending_history_retention_policy: None,
@@ -20500,6 +21038,130 @@ mod layout_tests {
         app.remote_catalog.invalidate_local_models();
         app.rebuild_model_inventory_projection();
         fixture
+    }
+
+    #[test]
+    fn startup_reconciliation_preserves_a_healthy_explicit_selection() {
+        let mut app = test_app();
+        let selected = app.config.general.selected_default_model.clone();
+
+        app.reconcile_startup_model_selection();
+
+        assert_eq!(app.config.general.selected_default_model, selected);
+        assert_eq!(app.status_message, "Ready");
+    }
+
+    #[test]
+    fn update_restored_bundle_is_removed_only_while_excluded() {
+        let root = std::env::temp_dir().join(format!(
+            "scribe-update-restored-bundle-{}-{}",
+            std::process::id(),
+            NEXT_TEST_SESSION.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("whisper-base.en-Q8_0.gguf");
+        fs::write(&path, b"restored model").unwrap();
+        let mut config = AppConfig::default();
+
+        assert!(!cleanup_excluded_bundled_model_at(&config, Some(path.clone())).unwrap());
+        assert!(path.is_file());
+
+        config
+            .general
+            .excluded_bundled_model_ids
+            .push(BUNDLED_BASE_MODEL_ID.to_owned());
+        assert!(cleanup_excluded_bundled_model_at(&config, Some(path.clone())).unwrap());
+        assert!(!path.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn bundled_removal_config_allows_active_last_model_and_persists_exclusion() {
+        let mut config = AppConfig::default();
+
+        apply_removed_model_config(&mut config, BUNDLED_BASE_MODEL_ID, None, true);
+
+        assert!(config.general.selected_default_model.is_empty());
+        assert_eq!(
+            config.general.excluded_bundled_model_ids,
+            [BUNDLED_BASE_MODEL_ID]
+        );
+        assert!(
+            !config
+                .general
+                .playground_selected_models
+                .iter()
+                .any(|id| id == BUNDLED_BASE_MODEL_ID)
+        );
+    }
+
+    #[test]
+    fn bundled_removal_config_selects_the_supplied_ready_replacement() {
+        let mut config = AppConfig::default();
+        let replacement = crate::models::default_model_catalog()
+            .into_iter()
+            .find(|model| model.id == "whisper_cpp_small_en")
+            .unwrap();
+
+        apply_removed_model_config(&mut config, BUNDLED_BASE_MODEL_ID, Some(&replacement), true);
+
+        assert_eq!(
+            config.general.selected_default_model,
+            "whisper_cpp_small_en"
+        );
+        assert_eq!(
+            config.general.excluded_bundled_model_ids,
+            [BUNDLED_BASE_MODEL_ID]
+        );
+    }
+
+    #[test]
+    fn startup_reconciliation_uses_first_ready_catalog_model_deterministically() {
+        let mut app = test_app();
+        let storage = std::env::temp_dir().join(format!(
+            "scribe-startup-selection-{}-{}",
+            std::process::id(),
+            NEXT_TEST_SESSION.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&storage).unwrap();
+        app.config.general.model_storage_dir = storage.clone();
+        app.config.general.model_paths.clear();
+        app.config.general.selected_default_model = "whisper_cpp_tiny_en".to_owned();
+        let small = install_test_catalog_model(&mut app, "whisper_cpp_small_en");
+
+        app.reconcile_startup_model_selection();
+
+        assert_eq!(
+            app.config.general.selected_default_model,
+            "whisper_cpp_small_en"
+        );
+        assert!(
+            app.status_message
+                .contains("previous speech model was unavailable")
+        );
+        let _ = fs::remove_file(small);
+        let _ = fs::remove_dir_all(storage);
+    }
+
+    #[test]
+    fn startup_reconciliation_clears_selection_when_nothing_is_runnable() {
+        let mut app = test_app();
+        let storage = std::env::temp_dir().join(format!(
+            "scribe-startup-empty-{}-{}",
+            std::process::id(),
+            NEXT_TEST_SESSION.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&storage).unwrap();
+        app.config.general.model_storage_dir = storage.clone();
+        app.config.general.model_paths.clear();
+        app.config.general.managed_models.clear();
+        app.config.general.selected_default_model = "whisper_cpp_tiny_en".to_owned();
+
+        app.reconcile_startup_model_selection();
+
+        assert!(app.config.general.selected_default_model.is_empty());
+        assert!(app.status_message.contains("No speech model is ready"));
+        let _ = fs::remove_dir_all(storage);
     }
 
     #[test]
@@ -22472,6 +23134,109 @@ mod layout_tests {
         assert!(!app.capturing_hotkey);
         assert_eq!(app.hotkey_input, original);
         assert_eq!(app.status_message, "Hotkey capture cancelled.");
+    }
+
+    #[test]
+    fn reentering_the_current_shortcut_is_a_normalized_scoped_success() {
+        let mut app = test_app();
+        app.config.recording.hotkey = "control + option + k".to_owned();
+        app.hotkey_input = "Ctrl+Alt+K".to_owned();
+
+        app.apply_hotkey();
+
+        assert!(!app.capturing_hotkey);
+        assert_eq!(app.config.recording.hotkey, "Ctrl+Alt+K");
+        assert_eq!(app.hotkey_input, "Ctrl+Alt+K");
+        assert_eq!(app.status_message, "Recording shortcut unchanged.");
+        assert_eq!(
+            app.transcribe_notice
+                .as_ref()
+                .map(|notice| notice.message.as_str()),
+            Some("Recording shortcut unchanged.")
+        );
+    }
+
+    #[test]
+    fn modified_escape_can_be_reentered_as_the_current_shortcut() {
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        app.config.recording.hotkey = "Ctrl+Esc".to_owned();
+        app.hotkey_input = "Ctrl+Esc".to_owned();
+        app.capturing_hotkey = true;
+
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers {
+                        ctrl: true,
+                        ..Default::default()
+                    },
+                }],
+                ..Default::default()
+            },
+            |ctx| app.poll_hotkey_capture(ctx),
+        );
+
+        assert!(!app.capturing_hotkey);
+        assert_eq!(app.config.recording.hotkey, "Ctrl+Esc");
+        assert_eq!(app.status_message, "Recording shortcut unchanged.");
+    }
+
+    #[test]
+    fn transcribe_start_failures_publish_page_scoped_recovery() {
+        let mut app = test_app();
+        app.config.general.selected_default_model.clear();
+
+        app.start_recording(RecordingSource::Transcribe);
+
+        assert_eq!(app.status, TranscriptionStatus::Error);
+        assert_eq!(
+            app.transcribe_notice
+                .as_ref()
+                .and_then(|notice| notice.recovery_action),
+            Some(TranscribeRecoveryAction::AddModel)
+        );
+        assert_eq!(
+            app.transcribe_notice
+                .as_ref()
+                .map(|notice| notice.message.as_str()),
+            Some("Choose or install a local model before transcribing.")
+        );
+
+        app.transcribe_notice = None;
+        app.playing_history_id = Some(42);
+        app.start_recording(RecordingSource::Transcribe);
+
+        assert_eq!(
+            app.transcribe_notice
+                .as_ref()
+                .map(|notice| notice.message.as_str()),
+            Some("Stop retained-audio playback before starting dictation")
+        );
+    }
+
+    #[test]
+    fn asynchronous_dictation_failures_publish_one_scoped_notice() {
+        let mut app = test_app();
+        let session_id = app
+            .session_coordinator
+            .begin(SessionPurpose::Dictation)
+            .unwrap();
+
+        app.fail_dictation_session_now(session_id, "Microphone failed: device unavailable");
+
+        assert_eq!(app.status, TranscriptionStatus::Error);
+        assert_eq!(
+            app.transcribe_notice,
+            Some(TranscribeNotice::error(
+                "Scribe couldn’t access your microphone.",
+                TranscribeRecoveryAction::RetryMicrophone,
+            ))
+        );
     }
 
     #[test]
@@ -24849,8 +25614,12 @@ mod layout_tests {
                             playing: None,
                             playback_stopping: false,
                             armed_repaste: None,
+                            model_names: &HashMap::new(),
+                            expanded_transcripts: &HashSet::new(),
+                            expanded_details: &HashSet::new(),
                             focus_search: false,
                             focus_delete_confirmation: true,
+                            focus_more_action: None,
                         },
                     );
                 });
@@ -24865,13 +25634,20 @@ mod layout_tests {
             node.role() == egui::accesskit::Role::Heading
                 && node
                     .name()
-                    .is_some_and(|name| name.starts_with("Completed - "))
+                    .is_some_and(|name| name.starts_with("Completed — "))
         }));
-        for expected in ["Copy", "Paste again", "Pin", "Delete entry"] {
+        for expected in ["Copy", "Paste again"] {
             assert!(update.nodes.iter().any(|(_, node)| {
                 node.role() == egui::accesskit::Role::Button && node.name() == Some(expected)
             }));
         }
+        assert!(
+            update
+                .nodes
+                .iter()
+                .any(|(_, node)| node.name() == Some("More actions")),
+            "History must expose a labeled more-actions menu"
+        );
         let group = update
             .nodes
             .iter()
@@ -24887,18 +25663,16 @@ mod layout_tests {
                 node.role() == egui::accesskit::Role::Heading
                     && node
                         .name()
-                        .is_some_and(|name| name.starts_with("Completed - "))
+                        .is_some_and(|name| name.starts_with("Completed — "))
             })
             .map(|(id, _)| *id)
             .expect("missing contextual history heading");
-        let delete_id = update
+        let more_actions_id = update
             .nodes
             .iter()
-            .find(|(_, node)| {
-                node.role() == egui::accesskit::Role::Button && node.name() == Some("Delete entry")
-            })
+            .find(|(_, node)| node.name() == Some("More actions"))
             .map(|(id, _)| *id)
-            .expect("missing history delete action");
+            .expect("missing history more-actions menu");
         let is_group_descendant = |target| {
             let mut pending = group.1.children().to_vec();
             while let Some(id) = pending.pop() {
@@ -24912,15 +25686,14 @@ mod layout_tests {
             false
         };
         assert!(is_group_descendant(contextual_heading_id));
-        assert!(is_group_descendant(delete_id));
+        assert!(is_group_descendant(more_actions_id));
         assert!(update.nodes.iter().any(|(_, node)| {
             node.name() == Some("1 history entries loaded")
                 && node.live() == Some(egui::accesskit::Live::Polite)
                 && node.is_live_atomic()
         }));
         assert!(update.nodes.iter().any(|(_, node)| {
-            node.role() == egui::accesskit::Role::Button
-                && node.name() == Some("Delete entry")
+            node.name() == Some("More actions")
                 && node
                     .description()
                     .is_some_and(|description| description.contains("whisper_cpp_base_en"))
@@ -24931,13 +25704,6 @@ mod layout_tests {
             .find(|(id, _)| *id == update.focus)
             .map(|(_, node)| node);
         assert_eq!(focused.and_then(|node| node.name()), Some("Cancel"));
-        let disclosure = update
-            .nodes
-            .iter()
-            .map(|(_, node)| node)
-            .find(|node| node.name() == Some("Raw transcript"))
-            .expect("missing raw transcript disclosure");
-        assert_eq!(disclosure.is_expanded(), Some(false));
     }
 
     #[test]
