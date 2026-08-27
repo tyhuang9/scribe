@@ -423,7 +423,7 @@ begin
   if SelectedMaintenanceAction = maRemove then begin
     if RemoveExistingInstallation then begin
       { Removal is a terminal action: do not allow this setup to continue into
-        [Files] after the existing uninstaller has finished. }
+        the file-copy phase after the existing uninstaller has finished. }
       RemovalCompleted := True;
       WizardForm.Close;
     end;
