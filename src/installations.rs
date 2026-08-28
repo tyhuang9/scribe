@@ -4269,13 +4269,16 @@ mod tests {
                 },
             ]);
             let updates = Mutex::new(Vec::new());
+            let mut policy = fast_retry_policy();
+            policy.stalled_after = Duration::from_secs(60);
+            policy.reconnect_after = Duration::from_secs(120);
 
             let candidate = download_pinned_artifact_with_policy(
                 &source,
                 &spec,
                 &InstallCancellation::default(),
                 &|update| updates.lock().unwrap().push(update),
-                fast_retry_policy(),
+                policy,
             )
             .unwrap();
 
