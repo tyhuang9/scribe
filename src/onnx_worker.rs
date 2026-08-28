@@ -2618,21 +2618,6 @@ pub(crate) struct SileroVadWorkerSupervisor {
 
 #[allow(dead_code)]
 impl SileroVadWorkerSupervisor {
-    pub(crate) fn spawn() -> Result<Self> {
-        let deadlines = VadDeadlines::default();
-        let transport_deadlines = SupervisorDeadlines {
-            hello: deadlines.acquisition,
-            ..SupervisorDeadlines::default()
-        };
-        Ok(Self {
-            transport: ProcessWorkerSupervisor::with_launcher_and_deadlines(
-                Arc::new(OsWorkerLauncher::vad()),
-                transport_deadlines,
-            )?,
-            deadlines,
-        })
-    }
-
     /// Starts a dedicated worker and establishes a ready VAD session within one
     /// aggregate monotonic budget. The returned request id is the first id that
     /// may be used for a window; ids before it belong to acquisition controls.
