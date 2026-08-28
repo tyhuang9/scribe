@@ -94,7 +94,7 @@ manual rows remain NOT VERIFIED.
 | --- | --- | --- |
 | Format/check/lint/build | `cargo fmt --all -- --check`; `cargo check --all-targets --all-features`; strict Clippy; `cargo build --all-features` | PASS |
 | Unit/integration tests | `cargo test --all-targets --all-features` | PASS - 252 discovered, 247 passed, 0 failed, 5 ignored environment-required tests |
-| Normalized catalog | Catalog validation, evidence-link/typed-receipt binding, role-gating, malformed-artifact, duplicate-ID, capability-intersection, minimum-runtime enforcement, and ID-prefix independence tests | PASS - six primary descriptors, all Experimental, zero curated roles; two Moonshine bundles are receipt-backed, CPU-only, and final-text-only |
+| Normalized catalog | Catalog validation, evidence-link/typed-receipt binding, role-gating, malformed-artifact, duplicate-ID, capability-intersection, minimum-runtime enforcement, and ID-prefix independence tests | PASS - five primary descriptors, all Experimental, zero curated roles; Moonshine is receipt-backed, CPU-only, and final-text-only |
 | Architecture boundary | Rust source-boundary test plus `wsl.exe python3 scripts/check-catalog-boundaries.py` | PASS - one logical handler; neutral production UI including Playground; family-coded quick actions/IDs rejected; legacy provider and concrete adapter selection confined to its private bridge |
 | Release build/package | `cargo build --release --all-features`; verified PowerShell package script | PASS |
 | Release primary fixture | ignored exact service JFK smoke with pinned v1.9.1/base.en/JFK paths | PASS - cold load 290 ms, first decode 791 ms, retained decode 780 ms; explicit unload/reload passed |
@@ -175,7 +175,7 @@ remain NOT VERIFIED.
 The rolling latency harness includes 250 ms cloned canonical frame publication
 and native decode, but bypasses the production capture pipeline and does not
 include a real hotkey, microphone driver, overlay paint, or target application.
-All desktop rows remain NOT VERIFIED. Six catalog models
+All desktop rows remain NOT VERIFIED. Five catalog models
 remain Experimental, zero are Supported, native streaming remains false, and
 the Zipformer/second-handler decision remains NO-GO.
 
