@@ -1338,6 +1338,8 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
         "INNO_NUPKG_SHA256: a0dad33db33099d9cd2b89ac2d08b5d70c589b15118ced3b95f469f044f99950",
         "INNO_INSTALLER_SHA256: 4d11e8050b6185e0d49bd9e8cc661a7a59f44959a621d31d11033124c4e8a7b0",
         "-ExerciseStableUpgrade",
+        "-EvidenceDirectory dist\\installer-verification-logs",
+        "name: windows-installer-verification-logs",
     ] {
         assert!(
             workflow.contains(required),
@@ -1409,23 +1411,33 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
             && installer.contains("DefaultDirName={code:ResolveDefaultDir}")
             && installer.contains("{localappdata}\\Programs\\Scribe")
             && installer.contains("AppId={code:ResolveAppId}")
-            && installer.contains("{param:SCRIBEVERIFY|}")
+            && installer.contains("ReadBoundedToken('SCRIBEVERIFY')")
             && installer.contains("function PrepareToInstall")
-            && installer.contains("function ValidateStableInstallTree")
+            && installer.contains("function ValidateAndBindInstallTree")
             && installer.contains("function QueryExistingAttributes")
-            && installer.contains("function OpenDirectoryForInspection")
-            && installer.contains("function ProbeExistingFileForUpdate")
-            && installer.contains("FileListDirectory")
+            && installer.contains("function BindDirectory")
+            && installer.contains("function BindFileForUpdate")
+            && installer.contains("FindFirstFileW")
+            && installer.contains("FindNextFileW")
+            && installer.contains("FindFirstStreamW")
+            && installer.contains("FindNextStreamW")
             && installer.contains("FileShareRead or FileShareWrite")
-            && installer.contains("GenericRead or GenericWrite or DeleteAccess")
+            && installer.contains("GenericRead or GenericWrite")
             && installer.contains("FileFlagBackupSemantics or FileFlagOpenReparsePoint")
             && installer.contains("DLLGetLastError")
-            && installer.contains("GetLastError()")
             && installer.contains("ErrorFileNotFound")
             && installer.contains("ErrorPathNotFound")
             && installer.contains("ErrorNoMoreFiles")
+            && installer.contains("ErrorHandleEof")
             && installer.contains("FILE_ATTRIBUTE_REPARSE_POINT")
             && installer.contains("case-insensitive path collision")
+            && installer.contains("alternate NTFS data stream")
+            && installer.contains("SizeOf(FindDataLayoutProbe) <> 592")
+            && installer.contains("SizeOf(StreamDataLayoutProbe) <> 600")
+            && installer.contains("CreateUninstallRegKey=IsNormalInstall")
+            && installer.contains("Check: IsNormalInstall")
+            && installer.contains("UsePreviousAppDir=no")
+            && installer.contains("UsePreviousLanguage=no")
             && installer.contains("Setup did not delete or change any existing content")
             && installer.contains("VerificationInstallDir(Token)")
             && installer.contains("WizardDirValue"),
@@ -1437,48 +1449,75 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
         "every installer attribute query must use the fail-closed error-classifying helper"
     );
     let directory_probe_start = installer
-        .find("function OpenDirectoryForInspection")
-        .expect("installer directory probe must exist");
+        .find("function BindDirectory")
+        .expect("installer directory identity binding must exist");
     let directory_probe_end = installer[directory_probe_start..]
-        .find("function ProbeExistingFileForUpdate")
+        .find("function BindFileForUpdate")
         .map(|offset| directory_probe_start + offset)
-        .expect("installer file probe must follow the directory probe");
+        .expect("installer file identity binding must follow directory binding");
     assert!(
         !installer[directory_probe_start..directory_probe_end].contains("FileShareDelete"),
-        "installer must keep enumerated directories from being renamed during preflight"
+        "installer must keep enumerated directories from being renamed after preflight"
+    );
+    let file_probe_end = installer[directory_probe_end..]
+        .find("function ValidateNoReparseAncestors")
+        .map(|offset| directory_probe_end + offset)
+        .expect("installer ancestor validator must follow file identity binding");
+    let file_probe_source = &installer[directory_probe_end..file_probe_end];
+    assert!(
+        !file_probe_source.contains("FileShareDelete")
+            && file_probe_source.contains("RetainBoundHandle(IdentityHandle")
+            && file_probe_source.contains("RejectAlternateStreams(Path, False")
+            && file_probe_source.contains("GenericRead or GenericWrite"),
+        "installer must identity-bind each allowed file, reject ADS, and prove update access"
     );
     let inspect_start = installer
         .find("function InspectExistingTree")
         .expect("installer tree inspector must exist");
     let inspect_end = installer[inspect_start..]
-        .find("function ValidateStableInstallTree")
+        .find("function ValidateAndBindInstallTree")
         .map(|offset| inspect_start + offset)
         .expect("stable tree validator must follow tree inspector");
     let inspect_source = &installer[inspect_start..inspect_end];
     let first_probe = inspect_source
-        .find("OpenDirectoryForInspection(")
-        .expect("installer enumeration must have a leading access probe");
+        .find("BindDirectory(")
+        .expect("installer enumeration must first bind directory identity");
     let enumeration_start = inspect_source
-        .find("FindFirst(")
-        .expect("installer tree inspection must enumerate entries");
+        .find("FindFirstFileW(")
+        .expect("installer tree inspection must use native enumeration");
     let enumeration_end = inspect_source
-        .rfind("FindNext(")
-        .expect("installer tree inspection must continue enumeration");
+        .rfind("FindNextFileW(")
+        .expect("installer tree inspection must continue native enumeration");
     assert!(
         first_probe < enumeration_start && enumeration_start < enumeration_end,
         "installer enumeration must retain a reparse-aware directory handle while reading entries"
     );
     assert!(
-        inspect_source.contains("if EnumerationError <> ErrorNoMoreFiles")
-            && inspect_source.contains("if EnumerationError <> ErrorFileNotFound")
+        inspect_source.contains("if ErrorCode <> ErrorNoMoreFiles")
+            && inspect_source.contains("if ErrorCode = ErrorFileNotFound")
             && inspect_source
-                .matches("EnumerationError := GetLastError();")
+                .matches("ErrorCode := DLLGetLastError;")
                 .count()
                 == 2,
         "installer enumeration must fail closed on start and continuation errors"
     );
+    let lifecycle_start = installer
+        .find("function PrepareToInstall")
+        .expect("installer preflight lifecycle must exist");
+    let lifecycle_source = &installer[lifecycle_start..];
     assert!(
-        !installer.contains("[InstallDelete]"),
+        installer.contains("BoundHandles: array[0..31] of THandle")
+            && installer.contains("procedure ReleaseBoundHandles()")
+            && lifecycle_source.contains("if CurStep = ssPostInstall then")
+            && lifecycle_source.contains("procedure DeinitializeSetup();")
+            && lifecycle_source.matches("ReleaseBoundHandles();").count() >= 4,
+        "installer must retain identity handles through installation and release them on every exit"
+    );
+    assert!(
+        !installer.contains("[InstallDelete]")
+            && !installer.contains("[UninstallDelete]")
+            && !installer.contains("[Registry]")
+            && !installer.contains("[INI]"),
         "Windows installer must not broadly delete an existing program directory"
     );
 
@@ -1540,19 +1579,27 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
         "RedirectStandardOutput",
         "WaitForExit",
         "/VERYSILENT",
-        "/NOICONS",
         "Assert-SafePortableZip",
         "Assert-PayloadParity $bundle $zipRoot \"Portable ZIP\"",
         "Assert-PayloadParity $bundle $installedRoot \"Installed\"",
         "AllowedAdditionalFiles $InnoSetupUninstallerArtifacts",
         "/SCRIBEVERIFY=$verificationToken",
-        "Remove-VerificationUninstallRegistration",
+        "Assert-IsolatedInstallerLog",
+        "Assert-ExactTreeSnapshot",
+        "Invoke-ProtectedRenameRace",
+        "Invoke-ReparseRefusalFixture",
         "Assert-Amd64GuiPe",
         "Assert-ReviewedWindowsPe",
         "[switch]$ExerciseStableUpgrade",
+        "[string]$EvidenceDirectory",
         "accepted an override outside its derived temporary destination",
-        "Stable installer accepted a case-insensitive path collision",
-        "Stable installer accepted an unexpected legacy runtime tree",
+        "Stable case-insensitive path collision",
+        "Stable unexpected legacy runtime tree",
+        "Stable payload file with alternate data stream",
+        "Stable payload directory with alternate data stream",
+        "Stable root rename race",
+        "Stable child-directory rename race",
+        "Stable file rename race",
         "Bundle inventory paths differ from the canonical self-contained payload allowlist",
     ] {
         assert!(
