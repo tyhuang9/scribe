@@ -98,3 +98,40 @@ pub(crate) fn model_download_total_bytes(model: &SttModelInfo) -> Option<u64> {
 pub(crate) fn entrypoint_is_usable(provider_id: &str, path: &Path) -> bool {
     runtime_catalog::runtime_entrypoint_is_usable(provider_id, path)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalized_models_cannot_resolve_the_legacy_provider() {
+        let config = AppConfig::default();
+        let catalog = crate::models::default_model_catalog();
+        for model in &catalog {
+            assert!(
+                provider_for_legacy_model(&config, model).is_none(),
+                "normalized model {} resolved a compatibility provider",
+                model.id
+            );
+        }
+
+        let mut receipt_model = catalog
+            .iter()
+            .find(|model| model.id == "moonshine-tiny-en-int8-onnx")
+            .unwrap()
+            .clone();
+        receipt_model.backend = "whisper.cpp".to_owned();
+        assert!(provider_for_legacy_model(&config, &receipt_model).is_none());
+
+        let mut legacy_model = catalog
+            .iter()
+            .find(|model| model.backend == "whisper.cpp")
+            .unwrap()
+            .clone();
+        legacy_model.id = "legacy-whisper-ggml".to_owned();
+        assert_eq!(
+            provider_for_legacy_model(&config, &legacy_model).map(ProviderHandle::id),
+            Some("whisper_cpp")
+        );
+    }
+}

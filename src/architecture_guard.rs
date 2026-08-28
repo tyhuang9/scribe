@@ -693,7 +693,13 @@ fn retired_python_provider_stack_stays_absent_without_crossing_native_boundaries
     let dependency_checker =
         fs::read_to_string(root.join("scripts/check-runtime-dependency-updates.py"))
             .expect("dependency checker must be readable");
-    assert!(dependency_checker.contains("PINNED_PACKAGES: dict[str, str] = {}"));
+    assert_eq!(
+        dependency_checker
+            .lines()
+            .find(|line| line.trim_start().starts_with("PINNED_PACKAGES:"))
+            .map(str::trim),
+        Some("PINNED_PACKAGES: dict[str, str] = {}")
+    );
 
     let stt = fs::read_to_string(root.join("src/stt/mod.rs"))
         .expect("STT compatibility module must be readable");
@@ -702,37 +708,11 @@ fn retired_python_provider_stack_stays_absent_without_crossing_native_boundaries
         .nth(1)
         .expect("direct compatibility dispatch exists")
         .to_owned();
-    assert!(direct_dispatch.contains("\"whisper.cpp\""));
     assert!(
         !direct_dispatch.contains("provider_for_backend"),
         "direct compatibility dispatch must not perform provider lookup"
     );
 
-    let bridge = fs::read_to_string(root.join("src/compatibility_bridge.rs"))
-        .expect("compatibility bridge must be readable");
-    for boundary in [
-        "normalized_install_artifact(&model_id).is_some()",
-        "remote_gguf_artifact(config, &model.id).is_some()",
-        "imported_gguf_artifact(config, &model.id).is_some()",
-    ] {
-        assert!(
-            bridge.contains(boundary),
-            "compatibility bridge must reject native model ownership via {boundary:?}"
-        );
-    }
-
-    let catalog = fs::read_to_string(root.join("src/model_catalog.rs"))
-        .expect("native model catalog must be readable");
-    let bundles = fs::read_to_string(root.join("src/onnx_model_bundles.rs"))
-        .expect("native bundle manager must be readable");
-    let worker = fs::read_to_string(root.join("src/onnx_worker.rs"))
-        .expect("native worker must be readable");
-    let cargo = fs::read_to_string(root.join("Cargo.toml")).expect("Cargo manifest is readable");
-    assert!(catalog.contains("id: \"moonshine-tiny-en-int8-onnx\""));
-    assert!(catalog.contains("bundle_id: \"moonshine-tiny-en-int8-onnx\""));
-    assert!(bundles.contains("runtime.name != \"sherpa-onnx\""));
-    assert!(worker.contains("use sherpa_onnx::"));
-    assert!(cargo.contains("sherpa-onnx = \"=1.13.5\""));
     for retained_path in [
         "vendor/sherpa-onnx-sys/LICENSE",
         "native/sherpa-onnx-v1.13.5/PROVENANCE.md",

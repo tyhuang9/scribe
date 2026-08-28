@@ -6300,13 +6300,18 @@ mod tests {
     }
 
     #[test]
-    fn unified_worker_assembles_chunked_onnx_batch_in_one_child() {
+    fn unified_worker_routes_exact_moonshine_bundle_in_one_child() {
         let root = test_root("unified-chunked-batch");
-        let spec = spec_with_roles(
+        let mut spec = spec_with_roles(
             &root,
-            OnnxModelFamily::NemoCtc,
-            &[OnnxFileRole::Model, OnnxFileRole::Tokens],
+            OnnxModelFamily::Moonshine,
+            &[
+                OnnxFileRole::Encoder,
+                OnnxFileRole::MergedDecoder,
+                OnnxFileRole::Tokens,
+            ],
         );
+        spec.id = "moonshine-tiny-en-int8-onnx".to_owned();
         let artifact = WireRuntimeArtifact::OnnxBundle(spec);
         let mut input = Vec::new();
         append_control(&mut input, 0, 0, Control::Hello);
@@ -6368,7 +6373,10 @@ mod tests {
         assert!(matches!(responses[4], Control::Ok));
         match &responses[5] {
             Control::RuntimeTranscript { execution } => {
-                assert_eq!(execution.transcript.text, "batch:test-NemoCtc:1");
+                assert_eq!(
+                    execution.transcript.text,
+                    "batch:moonshine-tiny-en-int8-onnx:1"
+                );
             }
             other => panic!("expected runtime transcript, got {other:?}"),
         }

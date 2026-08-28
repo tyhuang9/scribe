@@ -4088,6 +4088,27 @@ mod tests {
     }
 
     fn service_onnx_spec(label: &str) -> (PathBuf, OnnxModelSpec) {
+        service_onnx_spec_with(
+            label,
+            "zipformer-streaming-en-20m-int8-onnx",
+            OnnxModelFamily::OnlineTransducer,
+            1,
+            &[
+                OnnxFileRole::Encoder,
+                OnnxFileRole::Decoder,
+                OnnxFileRole::Joiner,
+                OnnxFileRole::Tokens,
+            ],
+        )
+    }
+
+    fn service_onnx_spec_with(
+        label: &str,
+        id: &str,
+        family: OnnxModelFamily,
+        num_threads: u16,
+        roles: &[OnnxFileRole],
+    ) -> (PathBuf, OnnxModelSpec) {
         let root = std::env::temp_dir().join(format!(
             "scribe-service-onnx-{label}-{}-{}",
             std::process::id(),
@@ -4097,25 +4118,21 @@ mod tests {
                 .as_nanos()
         ));
         fs::create_dir_all(&root).unwrap();
-        let files = [
-            OnnxFileRole::Encoder,
-            OnnxFileRole::Decoder,
-            OnnxFileRole::Joiner,
-            OnnxFileRole::Tokens,
-        ]
-        .into_iter()
-        .map(|role| {
-            let relative = PathBuf::from(format!("{role:?}.fixture").to_ascii_lowercase());
-            fs::write(root.join(&relative), format!("{label}-{role:?}")).unwrap();
-            (role, relative)
-        })
-        .collect();
+        let files = roles
+            .iter()
+            .copied()
+            .map(|role| {
+                let relative = PathBuf::from(format!("{role:?}.fixture").to_ascii_lowercase());
+                fs::write(root.join(&relative), format!("{label}-{role:?}")).unwrap();
+                (role, relative)
+            })
+            .collect();
         let spec = OnnxModelSpec {
-            id: "zipformer-streaming-en-20m-int8-onnx".to_owned(),
+            id: id.to_owned(),
             root: root.clone(),
-            family: OnnxModelFamily::OnlineTransducer,
+            family,
             files,
-            num_threads: 1,
+            num_threads,
         };
         (root, spec)
     }
@@ -4138,8 +4155,18 @@ mod tests {
     }
 
     #[test]
-    fn receipt_backed_onnx_dispatch_crosses_the_runtime_worker_boundary() {
-        let (root, spec) = service_onnx_spec("receipt-dispatch");
+    fn exact_receipt_backed_moonshine_dispatch_crosses_the_runtime_worker_boundary() {
+        let (root, spec) = service_onnx_spec_with(
+            "receipt-dispatch",
+            "moonshine-tiny-en-int8-onnx",
+            OnnxModelFamily::Moonshine,
+            4,
+            &[
+                OnnxFileRole::Encoder,
+                OnnxFileRole::MergedDecoder,
+                OnnxFileRole::Tokens,
+            ],
+        );
         crate::onnx_model_bundles::write_test_receipt_for_spec(&spec).unwrap();
         let expected = spec.clone();
         let worker = simulated_runtime_worker(move |receiver| {
