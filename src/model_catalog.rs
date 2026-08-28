@@ -984,8 +984,21 @@ fn validate_receipt_backed_bundle(
         && bundle_id.bytes().all(|byte| {
             byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
         });
-    if !stable_id || aggregate_size_bytes == 0 {
-        return Err("receipt-backed bundle metadata is invalid".to_owned());
+    if !stable_id {
+        return Err("receipt-backed bundle id is invalid".to_owned());
+    }
+    if aggregate_size_bytes == 0 {
+        return Err("receipt-backed bundle aggregate size is invalid".to_owned());
+    }
+    let pinned_aggregate_size_bytes =
+        crate::receipt_bundle_catalog::available_bundle_aggregate_size_bytes(bundle_id)
+            .ok_or_else(|| {
+                format!("receipt-backed bundle {bundle_id} is not an available pinned bundle")
+            })?;
+    if pinned_aggregate_size_bytes != aggregate_size_bytes {
+        return Err(format!(
+            "receipt-backed bundle {bundle_id} aggregate size does not match its pinned files"
+        ));
     }
     Ok(())
 }
@@ -1404,6 +1417,29 @@ mod tests {
         assert_eq!(
             normalized_receipt_backed_bundle_id(&ModelId::new("unknown-receipt-backed-bundle")),
             None
+        );
+    }
+
+    #[test]
+    fn receipt_backed_bundles_must_match_available_pinned_bundle_metadata() {
+        assert_eq!(
+            validate_receipt_backed_bundle("moonshine-tiny-en-int8-onnx", 44_256_550),
+            Ok(())
+        );
+        assert!(
+            validate_receipt_backed_bundle("unknown-receipt-backed-bundle", 1)
+                .unwrap_err()
+                .contains("not an available pinned bundle")
+        );
+        assert!(
+            validate_receipt_backed_bundle("parakeet-tdt-ctc-110m-en-int8-onnx", 1)
+                .unwrap_err()
+                .contains("not an available pinned bundle")
+        );
+        assert!(
+            validate_receipt_backed_bundle("moonshine-tiny-en-int8-onnx", 44_256_549)
+                .unwrap_err()
+                .contains("does not match its pinned files")
         );
     }
 
