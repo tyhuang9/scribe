@@ -2018,6 +2018,20 @@ impl ArtifactInstallCoordinator {
         Some(job.download_diagnostic)
     }
 
+    fn record_terminal_download_fault(
+        &mut self,
+        model_id: &str,
+        job_id: u64,
+        category: DownloadFaultCategory,
+    ) -> Option<DownloadDiagnosticProgress> {
+        let job = self
+            .jobs
+            .get_mut(model_id)
+            .filter(|job| job.handle.0 == job_id)?;
+        job.download_diagnostic.fault_category = Some(category);
+        Some(job.download_diagnostic)
+    }
+
     /// Returns the preceding activity only when this is a correlated transfer
     /// transition. Byte-only events carry `None` and intentionally do not
     /// clear the retained activity state.
@@ -7934,6 +7948,11 @@ impl LocalTranscriberApp {
                                     .to_owned(),
                             ),
                         );
+                        self.record_artifact_finalization_failure(
+                            &model_id,
+                            job_id,
+                            DownloadFaultCategory::LocalStorage,
+                        );
                         self.finish_artifact_install(&model_id, job_id);
                         continue;
                     }
@@ -8108,6 +8127,11 @@ impl LocalTranscriberApp {
                             .insert(model_id.clone(), ModelInstallStatus::Error(message.clone()));
                         self.status = TranscriptionStatus::Error;
                         self.status_message = message;
+                        self.record_artifact_finalization_failure(
+                            &model_id,
+                            job_id,
+                            DownloadFaultCategory::LocalStorage,
+                        );
                         self.finish_artifact_install(&model_id, job_id);
                         continue;
                     }
@@ -8123,6 +8147,11 @@ impl LocalTranscriberApp {
                             .insert(model_id.clone(), ModelInstallStatus::Error(message.clone()));
                         self.status = TranscriptionStatus::Error;
                         self.status_message = message;
+                        self.record_artifact_finalization_failure(
+                            &model_id,
+                            job_id,
+                            DownloadFaultCategory::LocalStorage,
+                        );
                         self.finish_artifact_install(&model_id, job_id);
                         continue;
                     }
@@ -8136,6 +8165,11 @@ impl LocalTranscriberApp {
                             .insert(model_id.clone(), ModelInstallStatus::Error(message.clone()));
                         self.status = TranscriptionStatus::Error;
                         self.status_message = message;
+                        self.record_artifact_finalization_failure(
+                            &model_id,
+                            job_id,
+                            DownloadFaultCategory::LocalStorage,
+                        );
                         self.finish_artifact_install(&model_id, job_id);
                         continue;
                     }
@@ -8194,6 +8228,11 @@ impl LocalTranscriberApp {
                         self.freeze_artifact_installs_for_recovery(Some(job_id));
                         self.status = TranscriptionStatus::Error;
                         self.status_message = message;
+                        self.record_artifact_finalization_failure(
+                            &model_id,
+                            job_id,
+                            DownloadFaultCategory::LocalStorage,
+                        );
                     } else {
                         self.status = TranscriptionStatus::Idle;
                         self.status_message = message;
@@ -9761,6 +9800,38 @@ impl LocalTranscriberApp {
                     completed,
                     total,
                     terminal.retry_number,
+                )
+            },
+        );
+    }
+
+    fn record_artifact_finalization_failure(
+        &mut self,
+        model_id: &str,
+        job_id: u64,
+        category: DownloadFaultCategory,
+    ) {
+        let Some(terminal) = self
+            .artifact_installations
+            .record_terminal_download_fault(model_id, job_id, category)
+        else {
+            return;
+        };
+        self.record_download_diagnostic(
+            model_id,
+            job_id,
+            terminal.completed_bytes,
+            terminal.total_bytes,
+            |run, job, artifact, source, completed, total| {
+                DownloadDiagnosticEvent::failure(
+                    run,
+                    job,
+                    artifact,
+                    source,
+                    completed,
+                    total,
+                    terminal.retry_number,
+                    category,
                 )
             },
         );
@@ -24995,6 +25066,81 @@ mod layout_tests {
         assert!(debug.contains("retry_number: Some(1)"));
         drop(app);
         drop(diagnostics);
+        let _ = fs::remove_dir_all(diagnostics_dir);
+    }
+
+    #[test]
+    fn app_side_finalization_failure_is_terminal_across_restart() {
+        let mut app = test_app();
+        let run = DownloadRunId::new("finalization-failure-test").unwrap();
+        let diagnostics_dir = std::env::temp_dir().join(format!(
+            "scribe-finalization-failure-diagnostics-{}-{}",
+            std::process::id(),
+            NEXT_TEST_SESSION.fetch_add(1, Ordering::Relaxed)
+        ));
+        let diagnostics = DownloadDiagnostics::start(&diagnostics_dir, &run);
+        app.download_diagnostics = Some(diagnostics.clone());
+        app.download_diagnostic_run = Some(run);
+        let model_id = "whisper_cpp_tiny_en".to_owned();
+        let job_id = 887;
+        app.artifact_installations
+            .insert(model_id.clone(), (job_id, InstallCancellation::default()));
+        app.artifact_installations
+            .initialize_download_diagnostic(&model_id, job_id, Some(100));
+        app.artifact_installations
+            .update_download_diagnostic_progress(&model_id, job_id, 73, Some(100));
+        app.artifact_installations.update_download_activity(
+            &model_id,
+            job_id,
+            DownloadActivity::RetryScheduled {
+                attempt: 2,
+                max_attempts: 3,
+                delay_ms: 2_000,
+                cause: DownloadFaultKind::Dns,
+            },
+        );
+        assert!(app.artifact_installations.mark_prepared(
+            &model_id,
+            job_id,
+            coordinator_prepared(&model_id),
+        ));
+        assert!(app.artifact_installations.take_next_finalizer().is_some());
+
+        app.record_artifact_finalization_failure(
+            &model_id,
+            job_id,
+            DownloadFaultCategory::LocalStorage,
+        );
+        assert!(app.artifact_installations.finish(&model_id, job_id));
+
+        let events = diagnostics.snapshot();
+        let failures = events
+            .iter()
+            .filter(|event| format!("{event:?}").contains("outcome: Failure"))
+            .collect::<Vec<_>>();
+        assert_eq!(failures.len(), 1);
+        let debug = format!("{:?}", failures[0]);
+        assert!(debug.contains("completed_bytes: 73"));
+        assert!(debug.contains("total_bytes: Some(100)"));
+        assert!(debug.contains("retry_number: Some(2)"));
+        assert!(debug.contains("fault_category: Some(LocalStorage)"));
+        assert!(!debug.contains("path"));
+        assert!(!debug.contains("raw_error"));
+        assert!(matches!(
+            diagnostics.flush(Duration::from_secs(2)),
+            crate::diagnostics::DownloadDiagnosticFlush::Flushed
+        ));
+        drop(app);
+        drop(diagnostics);
+
+        let restarted = DownloadDiagnostics::start(
+            &diagnostics_dir,
+            &DownloadRunId::new("finalization-failure-next-run").unwrap(),
+        );
+        let restarted_debug = format!("{:?}", restarted.snapshot());
+        assert!(restarted_debug.contains("outcome: Failure"));
+        assert!(!restarted_debug.contains("PriorRunInterruption"));
+        drop(restarted);
         let _ = fs::remove_dir_all(diagnostics_dir);
     }
 
