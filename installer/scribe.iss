@@ -36,7 +36,7 @@ VersionInfoVersion={#AppVersion}
 WizardStyle=modern
 
 [Files]
-Source: "..\dist\portable\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "..\dist\portable\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs; BeforeInstall: ReleasePayloadHandleForCurrentFile
 
 [Icons]
 Name: "{code:ResolveStartMenuDirectory}\{#AppName}"; Filename: "{code:ResolveLaunchTarget}"; Check: IsNormalInstall
@@ -321,6 +321,45 @@ begin
       BoundHandleReleaseBeforeInnoReplacement[I] := False;
     end;
   end;
+end;
+
+procedure ReleasePayloadHandleForCurrentFile();
+var
+  CurrentPath: String;
+  MatchingHandleIndex: Integer;
+  I: Integer;
+  ErrorCode: LongInt;
+begin
+  CurrentPath := RemoveBackslashUnlessRoot(ExpandFileName(CurrentFilename));
+  MatchingHandleIndex := -1;
+  for I := 0 to BoundHandleCount - 1 do
+  begin
+    if (BoundHandles[I] <> InvalidHandleValue) and
+       SameStr(BoundHandlePaths[I], CurrentPath) then
+    begin
+      if BoundHandleReleaseBeforeInnoReplacement[I] then
+        RaiseException('Scribe Setup refused to release an Inno uninstaller handle from a payload file callback.');
+      if MatchingHandleIndex <> -1 then
+        RaiseException('Scribe Setup refused to release an ambiguously matched payload file handle: ' + CurrentPath);
+      MatchingHandleIndex := I;
+    end;
+  end;
+  if FileExists(CurrentPath) then
+  begin
+    if MatchingHandleIndex = -1 then
+      RaiseException('Scribe Setup refused to install over an existing payload file without its retained preflight handle: ' + CurrentPath);
+    if not CloseHandle(BoundHandles[MatchingHandleIndex]) then
+    begin
+      ErrorCode := DLLGetLastError;
+      RaiseException('Scribe Setup could not release the retained payload file handle immediately before replacement: ' +
+        CurrentPath + ' (' + SysErrorMessage(ErrorCode) + ').');
+    end;
+    BoundHandles[MatchingHandleIndex] := InvalidHandleValue;
+    BoundHandlePaths[MatchingHandleIndex] := '';
+    BoundHandleReleaseBeforeInnoReplacement[MatchingHandleIndex] := False;
+  end
+  else if MatchingHandleIndex <> -1 then
+    RaiseException('Scribe Setup refused a payload file that changed identity before replacement: ' + CurrentPath);
 end;
 
 function RetainBoundHandle(

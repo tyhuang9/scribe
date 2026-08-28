@@ -884,6 +884,7 @@ Set-StrictMode -Version Latest
     if ($installer -notmatch 'Source: "\.\.\\dist\\portable\\\*"' -or
         $installer -notmatch "recursesubdirs" -or
         $installer -notmatch "createallsubdirs" -or
+        $installer -notmatch 'BeforeInstall: ReleasePayloadHandleForCurrentFile' -or
         $installer -notmatch '#define StableAppIdGuid "8E0F1935-8E3D-4B1D-9A42-7C7D7C3D5E7A"' -or
         $installer -notmatch 'DefaultDirName=\{code:ResolveDefaultDir\}' -or
         $installer -notmatch '\{localappdata\}\\Programs\\Scribe' -or
@@ -980,6 +981,22 @@ Set-StrictMode -Version Latest
         $uninstallerLifecycleSource -match 'IsInnoUninstallerArtifact\(Path\)' -or
         $uninstallerLifecycleSource -notmatch 'RetainBoundHandle\(DirectoryHandle, Path, False, ErrorText\)') {
         throw 'Installer uninstaller release must be selected only from the validated relative path; directories and payload bindings must remain delete-denying.'
+    }
+    $payloadReleaseStart = $installer.IndexOf('procedure ReleasePayloadHandleForCurrentFile')
+    $payloadReleaseEnd = $installer.IndexOf('function RetainBoundHandle', $payloadReleaseStart)
+    if ($payloadReleaseStart -lt 0 -or $payloadReleaseEnd -le $payloadReleaseStart) {
+        throw 'Could not isolate the per-file payload handle release contract.'
+    }
+    $payloadReleaseSource = $installer.Substring($payloadReleaseStart, $payloadReleaseEnd - $payloadReleaseStart)
+    if ($payloadReleaseSource -notmatch 'CurrentPath := RemoveBackslashUnlessRoot\(ExpandFileName\(CurrentFilename\)\)' -or
+        $payloadReleaseSource -notmatch 'SameStr\(BoundHandlePaths\[I\], CurrentPath\)' -or
+        $payloadReleaseSource -notmatch 'if BoundHandleReleaseBeforeInnoReplacement\[I\] then\s+RaiseException' -or
+        $payloadReleaseSource -notmatch 'if MatchingHandleIndex <> -1 then\s+RaiseException' -or
+        $payloadReleaseSource -notmatch 'if FileExists\(CurrentPath\) then[\s\S]*if MatchingHandleIndex = -1 then\s+RaiseException' -or
+        $payloadReleaseSource -notmatch 'if not CloseHandle\(BoundHandles\[MatchingHandleIndex\]\) then' -or
+        $payloadReleaseSource -notmatch 'BoundHandles\[MatchingHandleIndex\] := InvalidHandleValue' -or
+        $payloadReleaseSource -notmatch 'else if MatchingHandleIndex <> -1 then\s+RaiseException') {
+        throw 'Payload BeforeInstall handling must release exactly one retained payload handle immediately before replacement and fail closed on absent, ambiguous, metadata, or changed paths.'
     }
     foreach ($existingAllowedPath in @($expectedPortablePayloadPaths) + @('unins000.exe', 'unins000.dat')) {
         $innoPath = $existingAllowedPath.Replace('/', '\')

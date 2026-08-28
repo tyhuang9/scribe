@@ -1407,6 +1407,7 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
         installer.contains("Source: \"..\\dist\\portable\\*\"")
             && installer.contains("recursesubdirs")
             && installer.contains("createallsubdirs")
+            && installer.contains("BeforeInstall: ReleasePayloadHandleForCurrentFile")
             && installer.contains("StableAppIdGuid \"8E0F1935-8E3D-4B1D-9A42-7C7D7C3D5E7A\"")
             && installer.contains("DefaultDirName={code:ResolveDefaultDir}")
             && installer.contains("{localappdata}\\Programs\\Scribe")
@@ -1527,6 +1528,14 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
         .map(|offset| uninstaller_release_start + offset)
         .expect("installer retained-handle helper must follow uninstaller release helper");
     let uninstaller_release_source = &installer[uninstaller_release_start..uninstaller_release_end];
+    let payload_release_start = installer
+        .find("procedure ReleasePayloadHandleForCurrentFile")
+        .expect("installer must release each payload handle at its BeforeInstall boundary");
+    let payload_release_end = installer[payload_release_start..]
+        .find("function RetainBoundHandle")
+        .map(|offset| payload_release_start + offset)
+        .expect("installer retained-handle helper must follow payload release helper");
+    let payload_release_source = &installer[payload_release_start..payload_release_end];
     let lifecycle_start = installer
         .find("function PrepareToInstall")
         .expect("installer preflight lifecycle must exist");
@@ -1541,6 +1550,20 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
             && uninstaller_release_source
                 .contains("if BoundHandleReleaseBeforeInnoReplacement[I] then")
             && uninstaller_release_source.contains("CloseHandle(BoundHandles[I])")
+            && payload_release_source.contains(
+                "CurrentPath := RemoveBackslashUnlessRoot(ExpandFileName(CurrentFilename))"
+            )
+            && payload_release_source.contains("SameStr(BoundHandlePaths[I], CurrentPath)")
+            && payload_release_source
+                .contains("if BoundHandleReleaseBeforeInnoReplacement[I] then")
+            && payload_release_source.contains("if MatchingHandleIndex <> -1 then")
+            && payload_release_source.contains("if FileExists(CurrentPath) then")
+            && payload_release_source.contains("if MatchingHandleIndex = -1 then")
+            && payload_release_source
+                .contains("if not CloseHandle(BoundHandles[MatchingHandleIndex]) then")
+            && payload_release_source
+                .contains("BoundHandles[MatchingHandleIndex] := InvalidHandleValue")
+            && payload_release_source.contains("else if MatchingHandleIndex <> -1 then")
             && lifecycle_source.contains("ReleaseInnoUninstallerHandles();")
             && matches!(
                 (
