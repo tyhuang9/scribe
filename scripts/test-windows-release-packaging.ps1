@@ -599,8 +599,10 @@ Set-StrictMode -Version Latest
         }
     }
     if ($workflow -notmatch 'dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e\s+# 1\.96\.0' -or
-        $workflow -notmatch '-ExerciseStableUpgrade') {
-        throw "Windows release workflow must pin Rust and exercise the compiled stable-upgrade contract."
+        $workflow -notmatch '-ExerciseStableUpgrade' -or
+        $workflow -notmatch '-EvidenceDirectory dist\\installer-verification-logs' -or
+        $workflow -notmatch '(?ms)name: Upload installer verification evidence\s+if: always\(\).*?name: windows-installer-verification-logs') {
+        throw "Windows release workflow must pin Rust, exercise compiled installer contracts, and retain their logs."
     }
     $innoProvenancePath = Join-Path $repositoryRoot 'installer\inno-setup-6.7.1-provenance.json'
     $innoProvenance = Get-Content -LiteralPath $innoProvenancePath -Raw | ConvertFrom-Json
@@ -633,44 +635,69 @@ Set-StrictMode -Version Latest
         $installer -notmatch 'DefaultDirName=\{code:ResolveDefaultDir\}' -or
         $installer -notmatch '\{localappdata\}\\Programs\\Scribe' -or
         $installer -notmatch 'AppId=\{code:ResolveAppId\}' -or
-        $installer -notmatch '\{param:SCRIBEVERIFY\|\}' -or
+        $installer -notmatch "ReadBoundedToken\('SCRIBEVERIFY'\)" -or
         $installer -notmatch 'function PrepareToInstall' -or
-        $installer -notmatch 'function ValidateStableInstallTree' -or
+        $installer -notmatch 'function ValidateAndBindInstallTree' -or
         $installer -notmatch 'function QueryExistingAttributes' -or
-        $installer -notmatch 'function OpenDirectoryForInspection' -or
-        $installer -notmatch 'function ProbeExistingFileForUpdate' -or
-        $installer -notmatch 'FileListDirectory' -or
-        $installer -notmatch 'FileListDirectory,\s+FileShareRead or FileShareWrite,' -or
-        $installer -notmatch 'GenericRead or GenericWrite or DeleteAccess' -or
+        $installer -notmatch 'function BindDirectory' -or
+        $installer -notmatch 'function BindFileForUpdate' -or
+        $installer -notmatch 'FindFirstFileW' -or
+        $installer -notmatch 'FindNextFileW' -or
+        $installer -notmatch 'FindFirstStreamW' -or
+        $installer -notmatch 'FindNextStreamW' -or
+        $installer -notmatch 'FileShareRead or FileShareWrite' -or
+        $installer -notmatch 'GenericRead or GenericWrite' -or
         $installer -notmatch 'FileFlagBackupSemantics or FileFlagOpenReparsePoint' -or
         $installer -notmatch 'DLLGetLastError' -or
-        $installer -notmatch 'GetLastError\(\)' -or
         $installer -notmatch 'ErrorFileNotFound' -or
         $installer -notmatch 'ErrorPathNotFound' -or
         $installer -notmatch 'ErrorNoMoreFiles' -or
+        $installer -notmatch 'ErrorHandleEof' -or
         $installer -notmatch 'FILE_ATTRIBUTE_REPARSE_POINT' -or
         $installer -notmatch 'case-insensitive path collision' -or
+        $installer -notmatch 'alternate NTFS data stream' -or
+        $installer -notmatch 'SizeOf\(FindDataLayoutProbe\) <> 592' -or
+        $installer -notmatch 'SizeOf\(StreamDataLayoutProbe\) <> 600' -or
+        $installer -notmatch 'CreateUninstallRegKey=IsNormalInstall' -or
+        $installer -notmatch 'Check: IsNormalInstall' -or
+        $installer -notmatch 'UsePreviousAppDir=no' -or
+        $installer -notmatch 'UsePreviousLanguage=no' -or
         $installer -notmatch 'Setup did not delete or change any existing content' -or
         $installer -notmatch 'VerificationInstallDir\(Token\)' -or
         $installer -notmatch 'WizardDirValue' -or
-        $installer -match '(?m)^\[InstallDelete\]') {
+        $installer -match '(?m)^\[(?:InstallDelete|UninstallDelete|Registry|INI)\]') {
         throw "Windows installer must preflight and recursively install only the validated portable payload."
     }
     if ([regex]::Matches($installer, 'GetFileAttributesW\(').Count -ne 2) {
         throw "Every installer attribute query must use the fail-closed error-classifying helper."
     }
     $inspectStart = $installer.IndexOf('function InspectExistingTree')
-    $inspectEnd = $installer.IndexOf('function ValidateStableInstallTree', $inspectStart)
+    $inspectEnd = $installer.IndexOf('function ValidateAndBindInstallTree', $inspectStart)
     $inspectSource = $installer.Substring($inspectStart, $inspectEnd - $inspectStart)
-    $firstInspectionProbe = $inspectSource.IndexOf('OpenDirectoryForInspection(')
-    $enumerationStart = $inspectSource.IndexOf('FindFirst(')
-    $enumerationEnd = $inspectSource.LastIndexOf('FindNext(')
-    if ($firstInspectionProbe -lt 0 -or
+    $firstInspectionProbe = $inspectSource.IndexOf('BindDirectory(')
+    $enumerationStart = $inspectSource.IndexOf('FindFirstFileW(')
+    $enumerationEnd = $inspectSource.LastIndexOf('FindNextFileW(')
+    if ($inspectStart -lt 0 -or
+        $inspectEnd -le $inspectStart -or
+        $firstInspectionProbe -lt 0 -or
         $enumerationStart -le $firstInspectionProbe -or
         $enumerationEnd -le $enumerationStart -or
-        $inspectSource -notmatch 'EnumerationError := GetLastError\(\);\s+if EnumerationError <> ErrorNoMoreFiles' -or
-        $inspectSource -notmatch 'else\s+begin\s+EnumerationError := GetLastError\(\);\s+if EnumerationError <> ErrorFileNotFound') {
-        throw "Installer enumeration must hold a reparse-aware directory handle and classify every termination."
+        $inspectSource -notmatch 'ErrorCode := DLLGetLastError;\s+if ErrorCode = ErrorFileNotFound' -or
+        $inspectSource -notmatch 'ErrorCode := DLLGetLastError;\s+if ErrorCode <> ErrorNoMoreFiles') {
+        throw "Installer enumeration must bind directory identity and classify native enumeration errors immediately."
+    }
+    $prepareStart = $installer.IndexOf('function PrepareToInstall')
+    $prepareEnd = $installer.IndexOf('procedure CurStepChanged', $prepareStart)
+    $lifecycleSource = $installer.Substring($prepareStart)
+    if ($prepareStart -lt 0 -or
+        $prepareEnd -le $prepareStart -or
+        $installer -notmatch 'procedure ReleaseBoundHandles' -or
+        $installer -notmatch 'BoundHandles: array\[0\.\.31\] of THandle' -or
+        $installer -notmatch 'RetainBoundHandle\(IdentityHandle' -or
+        $installer -notmatch 'RetainBoundHandle\(DirectoryHandle' -or
+        $lifecycleSource -notmatch 'if CurStep = ssPostInstall then\s+ReleaseBoundHandles\(\)' -or
+        $lifecycleSource -notmatch 'procedure DeinitializeSetup\(\);\s+begin\s+ReleaseBoundHandles\(\)') {
+        throw "Installer identity handles must remain bound through file installation and close on every completion path."
     }
     foreach ($existingAllowedPath in @($expectedPortablePayloadPaths) + @('unins000.exe', 'unins000.dat')) {
         $innoPath = $existingAllowedPath.Replace('/', '\')
@@ -680,12 +707,22 @@ Set-StrictMode -Version Latest
     }
     foreach ($requiredVerifierContract in @(
         '[switch]$ExerciseStableUpgrade',
+        '[string]$EvidenceDirectory',
         'scribe-release-verification-$verificationToken',
         'accepted an override outside its derived temporary destination',
         'setCaseSensitiveInfo',
-        'Stable installer accepted a case-insensitive path collision',
-        'Stable installer accepted an unexpected legacy runtime tree',
-        'Stable installer deleted or mutated refused legacy content'
+        'Stable case-insensitive path collision',
+        'Stable unexpected legacy runtime tree',
+        'Stable payload file with alternate data stream',
+        'Stable payload directory with alternate data stream',
+        'Stable incompatible file sharing',
+        'Stable access-denied enumeration',
+        'Stable access-denied update',
+        'Stable root rename race',
+        'Stable child-directory rename race',
+        'Stable file rename race',
+        'Invoke-ReparseRefusalFixture',
+        'mutated controlled paths, bytes, metadata, entries, or streams'
     )) {
         if (-not $verifierSource.Contains($requiredVerifierContract)) {
             throw "Windows package verifier is missing compiled-installer contract: $requiredVerifierContract"

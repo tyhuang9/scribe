@@ -3,7 +3,8 @@ param(
     [string]$BundlePath,
     [string]$PortableZipPath,
     [string]$InstallerPath,
-    [switch]$ExerciseStableUpgrade
+    [switch]$ExerciseStableUpgrade,
+    [string]$EvidenceDirectory
 )
 
 $ErrorActionPreference = "Stop"
@@ -462,37 +463,6 @@ function Assert-SafePortableZip([string]$Path) {
     }
 }
 
-function Test-VerificationUninstallRegistration([string]$AppId) {
-    $subkey = "Software\Microsoft\Windows\CurrentVersion\Uninstall\$AppId`_is1"
-    foreach ($view in @([Microsoft.Win32.RegistryView]::Registry64, [Microsoft.Win32.RegistryView]::Registry32)) {
-        $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::CurrentUser, $view)
-        try {
-            $key = $base.OpenSubKey($subkey, $false)
-            if ($null -ne $key) {
-                $key.Dispose()
-                return $true
-            }
-        }
-        finally {
-            $base.Dispose()
-        }
-    }
-    return $false
-}
-
-function Remove-VerificationUninstallRegistration([string]$AppId) {
-    $subkey = "Software\Microsoft\Windows\CurrentVersion\Uninstall\$AppId`_is1"
-    foreach ($view in @([Microsoft.Win32.RegistryView]::Registry64, [Microsoft.Win32.RegistryView]::Registry32)) {
-        $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::CurrentUser, $view)
-        try {
-            $base.DeleteSubKeyTree($subkey, $false)
-        }
-        finally {
-            $base.Dispose()
-        }
-    }
-}
-
 function Remove-ValidatedTemporaryRoot([string]$Path) {
     if (-not (Test-Path -LiteralPath $Path)) {
         return
@@ -500,12 +470,278 @@ function Remove-ValidatedTemporaryRoot([string]$Path) {
     $tempRoot = Get-NormalizedPath ([System.IO.Path]::GetTempPath())
     $resolved = Get-NormalizedPath $Path
     if (-not [string]::Equals((Split-Path -Parent $resolved), $tempRoot, [System.StringComparison]::OrdinalIgnoreCase) -or
-        (Split-Path -Leaf $resolved) -cnotmatch '^scribe-release-verification-[0-9a-f]{32}$') {
+        (Split-Path -Leaf $resolved) -cnotmatch '^scribe-release-(?:verification|stable-test|shell-test|package-verifier)-[0-9a-f]{32}$') {
         throw "Refused release verification cleanup outside its bounded temporary directory."
     }
     Assert-NoReparseAncestors $resolved
     Assert-TreeHasNoReparsePoints $resolved
     Remove-Item -LiteralPath $resolved -Recurse -Force
+}
+
+function New-TestShellFixture([string]$Token) {
+    if ($Token -cnotmatch '^[0-9a-f]{32}$') {
+        throw "Test shell fixture requires an exact lower-case token."
+    }
+    $root = Join-Path ([System.IO.Path]::GetTempPath()) "scribe-release-shell-test-$Token"
+    if (Test-Path -LiteralPath $root) {
+        throw "Token-bound test shell root unexpectedly already exists: $root"
+    }
+    Assert-NoReparseAncestors $root
+    $startMenu = Join-Path $root "StartMenu"
+    $desktop = Join-Path $root "Desktop"
+    New-Item -ItemType Directory -Path $startMenu | Out-Null
+    New-Item -ItemType Directory -Path $desktop | Out-Null
+    [System.IO.File]::WriteAllBytes((Join-Path $startMenu "Scribe.lnk"), [byte[]](83, 84, 65, 82, 84))
+    [System.IO.File]::WriteAllBytes((Join-Path $desktop "Scribe.lnk"), [byte[]](68, 69, 83, 75))
+    [System.IO.File]::WriteAllBytes((Join-Path $root "run-sentinel.exe"), [byte[]](82, 85, 78))
+    [System.IO.File]::WriteAllBytes((Join-Path $root "task-sentinel.txt"), [byte[]](84, 65, 83, 75))
+    return Get-NormalizedPath $root
+}
+
+function Get-ExactTreeSnapshot([string]$Root) {
+    $resolved = Get-NormalizedPath $Root
+    Assert-NoReparseAncestors $resolved
+    Assert-TreeHasNoReparsePoints $resolved
+    $entries = [System.Collections.Generic.List[object]]::new()
+    foreach ($item in @((Get-Item -LiteralPath $resolved -Force)) +
+        @(Get-ChildItem -LiteralPath $resolved -Recurse -Force | Sort-Object FullName)) {
+        $relativePath = if ($item.FullName -ceq $resolved) {
+            "."
+        }
+        else {
+            Get-RelativeBundlePath $resolved $item.FullName
+        }
+        $isDirectory = $item -is [System.IO.DirectoryInfo]
+        $hash = if ($isDirectory) {
+            ""
+        }
+        else {
+            (Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+        }
+        $streams = @(Get-Item -LiteralPath $item.FullName -Stream * -ErrorAction Stop | ForEach-Object {
+            $streamHash = if ($_.Stream -ceq ':$DATA') {
+                $hash
+            }
+            else {
+                $streamBytes = Get-Content -LiteralPath $item.FullName -Stream $_.Stream -AsByteStream -Raw
+                [Convert]::ToHexString(
+                    [System.Security.Cryptography.SHA256]::HashData([byte[]]$streamBytes)
+                ).ToLowerInvariant()
+            }
+            [pscustomobject]@{
+                Name = [string]$_.Stream
+                Length = [int64]$_.Length
+                Sha256 = $streamHash
+            }
+        } | Sort-Object Name)
+        $entries.Add([pscustomobject]@{
+            Path = $relativePath
+            Directory = $isDirectory
+            Length = if ($isDirectory) { [int64]0 } else { [int64]$item.Length }
+            Sha256 = $hash
+            Attributes = [int]$item.Attributes
+            CreationTimeUtcTicks = $item.CreationTimeUtc.Ticks
+            LastWriteTimeUtcTicks = $item.LastWriteTimeUtc.Ticks
+            Streams = $streams
+        })
+    }
+    return ($entries | ConvertTo-Json -Depth 6 -Compress)
+}
+
+function Assert-ExactTreeSnapshot(
+    [string]$Root,
+    [string]$ExpectedSnapshot,
+    [string]$Description
+) {
+    $actual = Get-ExactTreeSnapshot $Root
+    if ($actual -cne $ExpectedSnapshot) {
+        throw "$Description mutated controlled paths, bytes, metadata, entries, or streams."
+    }
+}
+
+function Assert-IsolatedInstallerLog([string]$Path, [string]$Description) {
+    $null = Assert-RegularFile $Path
+    $content = Get-Content -LiteralPath $Path -Raw
+    foreach ($forbiddenPattern in @(
+        '(?im)-- Icon entry --',
+        '(?im)-- Run entry --',
+        '(?im)Selected tasks:.*desktopicon',
+        '(?im)Creating new uninstall key:',
+        '(?im)Updating existing uninstall key:'
+    )) {
+        if ($content -match $forbiddenPattern) {
+            throw "$Description performed forbidden shell, task, run, or uninstall-registration integration."
+        }
+    }
+}
+
+function Invoke-IsolatedInstallerProcess(
+    [string]$Installer,
+    [string[]]$Arguments,
+    [string]$LogPath,
+    [string]$ShellRoot,
+    [string]$ShellSnapshot,
+    [string]$Description
+) {
+    $process = Invoke-NativeProcess $Installer @($Arguments + "/LOG=$LogPath")
+    Assert-IsolatedInstallerLog $LogPath $Description
+    Assert-ExactTreeSnapshot $ShellRoot $ShellSnapshot $Description
+    return $process
+}
+
+function Invoke-ExpectedInstallerRefusal(
+    [string]$Installer,
+    [string[]]$Arguments,
+    [string]$LogPath,
+    [string]$ShellRoot,
+    [string]$ShellSnapshot,
+    [string]$InstallRoot,
+    [string]$Description
+) {
+    $before = Get-ExactTreeSnapshot $InstallRoot
+    $process = Invoke-IsolatedInstallerProcess `
+        $Installer $Arguments $LogPath $ShellRoot $ShellSnapshot $Description
+    if ($process.ExitCode -eq 0) {
+        throw "$Description was accepted instead of being refused fail-closed."
+    }
+    Assert-ExactTreeSnapshot $InstallRoot $before $Description
+}
+
+function Invoke-ProtectedRenameRace(
+    [string]$Installer,
+    [string[]]$Arguments,
+    [string]$LogPath,
+    [string]$ShellRoot,
+    [string]$ShellSnapshot,
+    [string]$TestContainer,
+    [string]$TargetPath,
+    [string]$Description
+) {
+    $readyPath = Join-Path $TestContainer "preflight-ready"
+    $continuePath = Join-Path $TestContainer "preflight-continue"
+    foreach ($marker in @($readyPath, $continuePath)) {
+        if (Test-Path -LiteralPath $marker) {
+            Remove-Item -LiteralPath $marker -Force
+        }
+    }
+    $argumentsWithLog = @($Arguments + "/SCRIBETESTPAUSE=1" + "/LOG=$LogPath")
+    $process = Start-Process -FilePath $Installer -ArgumentList $argumentsWithLog -PassThru
+    $swappedPath = "$TargetPath-swapped"
+    $renameSucceeded = $false
+    try {
+        $deadline = [DateTime]::UtcNow.AddSeconds(60)
+        while (-not (Test-Path -LiteralPath $readyPath)) {
+            if ($process.HasExited) {
+                throw "$Description installer exited before its handle-bound preflight marker."
+            }
+            if ([DateTime]::UtcNow -ge $deadline) {
+                throw "$Description timed out waiting for its handle-bound preflight marker."
+            }
+            Start-Sleep -Milliseconds 50
+        }
+        try {
+            if (Test-Path -LiteralPath $TargetPath -PathType Container) {
+                [System.IO.Directory]::Move($TargetPath, $swappedPath)
+            }
+            else {
+                [System.IO.File]::Move($TargetPath, $swappedPath)
+            }
+            $renameSucceeded = $true
+        }
+        catch [System.IO.IOException] {
+            $renameSucceeded = $false
+        }
+        catch [System.UnauthorizedAccessException] {
+            $renameSucceeded = $false
+        }
+        if ($renameSucceeded) {
+            if (Test-Path -LiteralPath $swappedPath -PathType Container) {
+                [System.IO.Directory]::Move($swappedPath, $TargetPath)
+            }
+            else {
+                [System.IO.File]::Move($swappedPath, $TargetPath)
+            }
+        }
+    }
+    finally {
+        [System.IO.File]::WriteAllText($continuePath, "continue")
+        $process.WaitForExit()
+        $exitCode = $process.ExitCode
+        $process.Dispose()
+    }
+    Assert-IsolatedInstallerLog $LogPath $Description
+    Assert-ExactTreeSnapshot $ShellRoot $ShellSnapshot $Description
+    if ($renameSucceeded) {
+        throw "$Description was vulnerable to a rename/swap after preflight."
+    }
+    if ($exitCode -ne 0) {
+        throw "$Description failed after the protected rename was correctly denied (exit $exitCode)."
+    }
+}
+
+function Invoke-ReparseRefusalFixture(
+    [string]$Installer,
+    [string]$HarnessRoot,
+    [ValidateSet("root", "child")]
+    [string]$Kind
+) {
+    $token = [guid]::NewGuid().ToString('N')
+    $container = Join-Path ([System.IO.Path]::GetTempPath()) "scribe-release-stable-test-$token"
+    $installRoot = Join-Path $container "installed"
+    $targetRoot = Join-Path $container "fixture-target"
+    $linkPath = if ($Kind -ceq "root") { $installRoot } else { Join-Path $installRoot "licenses" }
+    $shellRoot = $null
+    Assert-NoReparseAncestors $container
+    New-Item -ItemType Directory -Path $container | Out-Null
+    New-Item -ItemType Directory -Path $targetRoot | Out-Null
+    [System.IO.File]::WriteAllBytes((Join-Path $targetRoot "sentinel.bin"), [byte[]](82, 69, 80, 65, 82, 83, 69))
+    if ($Kind -ceq "child") {
+        New-Item -ItemType Directory -Path $installRoot | Out-Null
+    }
+    try {
+        $null = New-Item -ItemType Junction -Path $linkPath -Target $targetRoot
+        $linkItem = Get-Item -LiteralPath $linkPath -Force
+        if (($linkItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq 0) {
+            throw "Could not create the bounded $Kind reparse fixture."
+        }
+        $targetSnapshot = Get-ExactTreeSnapshot $targetRoot
+        $shellRoot = New-TestShellFixture $token
+        $shellSnapshot = Get-ExactTreeSnapshot $shellRoot
+        $logPath = Join-Path $HarnessRoot "stable-$Kind-reparse.log"
+        $arguments = @(
+            "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-",
+            "/SCRIBESTABLETEST=$token"
+        )
+        $process = Invoke-IsolatedInstallerProcess `
+            $Installer $arguments $logPath $shellRoot $shellSnapshot `
+            "Stable $Kind reparse fixture"
+        if ($process.ExitCode -eq 0) {
+            throw "Stable $Kind reparse fixture was accepted instead of refused fail-closed."
+        }
+        Assert-ExactTreeSnapshot $targetRoot $targetSnapshot "Stable $Kind reparse fixture target"
+        $postLink = Get-Item -LiteralPath $linkPath -Force
+        if (($postLink.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq 0) {
+            throw "Stable $Kind reparse fixture link was replaced or removed."
+        }
+        $rootEntries = @(Get-ChildItem -LiteralPath $installRoot -Force)
+        if ($Kind -ceq "child" -and
+            ($rootEntries.Count -ne 1 -or $rootEntries[0].Name -cne "licenses")) {
+            throw "Stable child reparse refusal created or removed install-root entries."
+        }
+    }
+    finally {
+        if (Test-Path -LiteralPath $linkPath) {
+            $linkItem = Get-Item -LiteralPath $linkPath -Force
+            if (($linkItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq 0) {
+                throw "Refused to clean a reparse fixture whose exact link identity changed: $linkPath"
+            }
+            Remove-Item -LiteralPath $linkPath -Force
+        }
+        if ($null -ne $shellRoot) {
+            Remove-ValidatedTemporaryRoot $shellRoot
+        }
+        Remove-ValidatedTemporaryRoot $container
+    }
 }
 
 # A fresh Inno Setup installation writes these two default-named uninstaller files
@@ -515,17 +751,35 @@ $InnoSetupUninstallerArtifacts = @("unins000.exe", "unins000.dat")
 $bundle = Get-NormalizedPath $BundlePath
 $null = Assert-Bundle $bundle
 
+$harnessToken = [guid]::NewGuid().ToString('N')
+$temporaryRoot = Join-Path ([System.IO.Path]::GetTempPath()) "scribe-release-package-verifier-$harnessToken"
 $verificationToken = [guid]::NewGuid().ToString('N')
-$temporaryRoot = Join-Path ([System.IO.Path]::GetTempPath()) "scribe-release-verification-$verificationToken"
-$verificationAppId = "{8E0F1935-8E3D-4B1D-9A42-7C7D7C3D5E7A}.verification.$verificationToken"
+$verificationRoot = Join-Path ([System.IO.Path]::GetTempPath()) "scribe-release-verification-$verificationToken"
 $verificationUninstaller = $null
-$stableAppId = "{8E0F1935-8E3D-4B1D-9A42-7C7D7C3D5E7A}"
 $stableUninstaller = $null
+$stableContainer = $null
+$stableShellRoot = $null
+$evidenceRoot = $null
 Assert-NoReparseAncestors $temporaryRoot
-if (Test-VerificationUninstallRegistration $verificationAppId) {
-    throw "Unique installer verification registration unexpectedly already exists."
+Assert-NoReparseAncestors $verificationRoot
+if (Test-Path -LiteralPath $verificationRoot) {
+    throw "Unique token-bound verification root unexpectedly already exists."
 }
 New-Item -ItemType Directory -Path $temporaryRoot | Out-Null
+if ($EvidenceDirectory) {
+    $evidenceRoot = Get-NormalizedPath $EvidenceDirectory
+    $expectedEvidenceRoot = Get-NormalizedPath (Join-Path $repositoryRoot "dist\installer-verification-logs")
+    if (-not [string]::Equals($evidenceRoot, $expectedEvidenceRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Installer verification evidence must use the repository's exact dist/installer-verification-logs directory."
+    }
+    if (Test-Path -LiteralPath $evidenceRoot) {
+        throw "Installer verification evidence directory must not already exist."
+    }
+    Assert-NoReparseAncestors $evidenceRoot
+    New-Item -ItemType Directory -Path $evidenceRoot | Out-Null
+}
+$verificationShellRoot = New-TestShellFixture $verificationToken
+$verificationShellSnapshot = Get-ExactTreeSnapshot $verificationShellRoot
 try {
     if ($PortableZipPath) {
         $portableZip = Get-NormalizedPath $PortableZipPath
@@ -539,16 +793,17 @@ try {
     if ($InstallerPath) {
         $installer = Get-NormalizedPath $InstallerPath
         $null = Assert-RegularFile $installer
-        $installedRoot = Join-Path $temporaryRoot "installed"
+        $installedRoot = Join-Path $verificationRoot "installed"
         $escapedVerificationRoot = Join-Path $temporaryRoot "escaped"
+        $escapedLog = Join-Path $temporaryRoot "verification-escape.log"
         $escapedProcess = Invoke-NativeProcess $installer @(
             "/VERYSILENT",
             "/SUPPRESSMSGBOXES",
             "/NORESTART",
             "/SP-",
-            "/NOICONS",
             "/DIR=$escapedVerificationRoot",
-            "/SCRIBEVERIFY=$verificationToken"
+            "/SCRIBEVERIFY=$verificationToken",
+            "/LOG=$escapedLog"
         )
         if ($escapedProcess.ExitCode -eq 0) {
             throw "Installer verification token accepted an override outside its derived temporary destination."
@@ -556,46 +811,48 @@ try {
         if (Test-Path -LiteralPath $escapedVerificationRoot) {
             throw "Rejected installer verification destination was created or mutated."
         }
-        if (Test-VerificationUninstallRegistration $verificationAppId) {
-            throw "Rejected installer verification destination created an uninstall registration."
-        }
+        Assert-IsolatedInstallerLog $escapedLog "Rejected installer verification"
+        Assert-ExactTreeSnapshot $verificationShellRoot $verificationShellSnapshot "Rejected installer verification"
+        $verificationLog = Join-Path $temporaryRoot "verification-install.log"
         $installerProcess = Invoke-NativeProcess $installer @(
             "/VERYSILENT",
             "/SUPPRESSMSGBOXES",
             "/NORESTART",
             "/SP-",
-            "/NOICONS",
-            "/SCRIBEVERIFY=$verificationToken"
+            "/SCRIBEVERIFY=$verificationToken",
+            "/LOG=$verificationLog"
         )
         if ($installerProcess.ExitCode -ne 0) {
             throw "Silent installer verification failed with exit code $($installerProcess.ExitCode): $($installerProcess.Stderr.Trim())"
         }
-        if (-not (Test-VerificationUninstallRegistration $verificationAppId)) {
-            throw "Installer verification mode did not create its isolated uninstall registration."
-        }
+        Assert-IsolatedInstallerLog $verificationLog "Installer verification"
+        Assert-ExactTreeSnapshot $verificationShellRoot $verificationShellSnapshot "Installer verification"
         $verificationUninstaller = Join-Path $installedRoot "unins000.exe"
         $null = Assert-Bundle -Root $installedRoot -AllowedAdditionalFiles $InnoSetupUninstallerArtifacts
         Assert-PayloadParity $bundle $installedRoot "Installed"
 
+        $verificationUninstallLog = Join-Path $temporaryRoot "verification-uninstall.log"
         $uninstallProcess = Invoke-NativeProcess $verificationUninstaller @(
             "/VERYSILENT",
             "/SUPPRESSMSGBOXES",
-            "/NORESTART"
+            "/NORESTART",
+            "/LOG=$verificationUninstallLog"
         )
         if ($uninstallProcess.ExitCode -ne 0) {
             throw "Installer verification cleanup failed with exit code $($uninstallProcess.ExitCode): $($uninstallProcess.Stderr.Trim())"
         }
         $verificationUninstaller = $null
-        if (Test-VerificationUninstallRegistration $verificationAppId) {
-            throw "Installer verification cleanup left its isolated uninstall registration behind."
-        }
+        Assert-ExactTreeSnapshot $verificationShellRoot $verificationShellSnapshot "Installer verification uninstaller"
 
         if ($ExerciseStableUpgrade) {
-            if (Test-VerificationUninstallRegistration $stableAppId) {
-                throw "Stable Scribe uninstall registration already exists; refusing the isolated stable-upgrade exercise."
-            }
-            $stableRoot = Join-Path $temporaryRoot "stable"
+            $stableToken = [guid]::NewGuid().ToString('N')
+            $stableContainer = Join-Path ([System.IO.Path]::GetTempPath()) "scribe-release-stable-test-$stableToken"
+            $stableRoot = Join-Path $stableContainer "installed"
+            Assert-NoReparseAncestors $stableContainer
+            New-Item -ItemType Directory -Path $stableContainer | Out-Null
             New-Item -ItemType Directory -Path $stableRoot | Out-Null
+            $stableShellRoot = New-TestShellFixture $stableToken
+            $stableShellSnapshot = Get-ExactTreeSnapshot $stableShellRoot
             $fsutil = Join-Path $env:SystemRoot "System32\fsutil.exe"
             $caseSensitiveProcess = Invoke-NativeProcess $fsutil @(
                 "file", "setCaseSensitiveInfo", $stableRoot, "enable"
@@ -605,20 +862,24 @@ try {
             }
 
             $stableInstallArguments = @(
-                "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-", "/NOICONS", "/DIR=$stableRoot"
+                "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-",
+                "/SCRIBESTABLETEST=$stableToken"
             )
-            $stableInstall = Invoke-NativeProcess $installer $stableInstallArguments
+            $stableInstall = Invoke-IsolatedInstallerProcess `
+                $installer $stableInstallArguments `
+                (Join-Path $temporaryRoot "stable-install.log") `
+                $stableShellRoot $stableShellSnapshot "Initial stable-test install"
             if ($stableInstall.ExitCode -ne 0) {
                 throw "Initial isolated stable installation failed with exit code $($stableInstall.ExitCode): $($stableInstall.Stderr.Trim())"
-            }
-            if (-not (Test-VerificationUninstallRegistration $stableAppId)) {
-                throw "Initial isolated stable installation did not create the stable uninstall registration."
             }
             $stableUninstaller = Join-Path $stableRoot "unins000.exe"
             $null = Assert-Bundle -Root $stableRoot -AllowedAdditionalFiles $InnoSetupUninstallerArtifacts
             Assert-PayloadParity $bundle $stableRoot "Initial stable install"
 
-            $stableUpgrade = Invoke-NativeProcess $installer $stableInstallArguments
+            $stableUpgrade = Invoke-IsolatedInstallerProcess `
+                $installer $stableInstallArguments `
+                (Join-Path $temporaryRoot "stable-upgrade.log") `
+                $stableShellRoot $stableShellSnapshot "Canonical stable-test upgrade"
             if ($stableUpgrade.ExitCode -ne 0) {
                 throw "Canonical stable upgrade failed with exit code $($stableUpgrade.ExitCode): $($stableUpgrade.Stderr.Trim())"
             }
@@ -631,45 +892,170 @@ try {
             if (@(Get-ChildItem -LiteralPath $stableRoot -File | Where-Object { $_.Name -ieq "README.txt" }).Count -ne 2) {
                 throw "Could not create the isolated case-collision fixture."
             }
-            $caseCollisionHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $caseCollision).Hash
-            $caseCollisionInstall = Invoke-NativeProcess $installer $stableInstallArguments
-            if ($caseCollisionInstall.ExitCode -eq 0) {
-                throw "Stable installer accepted a case-insensitive path collision."
-            }
-            if (-not (Test-Path -LiteralPath $caseCollision -PathType Leaf) -or
-                (Get-FileHash -Algorithm SHA256 -LiteralPath $caseCollision).Hash -cne $caseCollisionHash) {
-                throw "Stable installer mutated the refused case-collision fixture."
-            }
+            Invoke-ExpectedInstallerRefusal `
+                $installer $stableInstallArguments `
+                (Join-Path $temporaryRoot "stable-case-collision.log") `
+                $stableShellRoot $stableShellSnapshot $stableRoot `
+                "Stable case-insensitive path collision"
             Remove-Item -LiteralPath $caseCollision
 
             $legacyDirectory = Join-Path $stableRoot "runtimes"
             New-Item -ItemType Directory -Path $legacyDirectory | Out-Null
             $legacyFile = Join-Path $legacyDirectory "whisper.dll"
             [System.IO.File]::WriteAllBytes($legacyFile, [byte[]](1, 3, 3, 7))
-            $legacyHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $legacyFile).Hash
-            $legacyInstall = Invoke-NativeProcess $installer $stableInstallArguments
-            if ($legacyInstall.ExitCode -eq 0) {
-                throw "Stable installer accepted an unexpected legacy runtime tree."
+            Invoke-ExpectedInstallerRefusal `
+                $installer $stableInstallArguments `
+                (Join-Path $temporaryRoot "stable-legacy-runtime.log") `
+                $stableShellRoot $stableShellSnapshot $stableRoot `
+                "Stable unexpected legacy runtime tree"
+            Remove-Item -LiteralPath $legacyDirectory -Recurse -Force
+
+            $unexpectedFile = Join-Path $stableRoot "unexpected.txt"
+            [System.IO.File]::WriteAllBytes($unexpectedFile, [byte[]](85, 78, 75, 78, 79, 87, 78))
+            Invoke-ExpectedInstallerRefusal `
+                $installer $stableInstallArguments `
+                (Join-Path $temporaryRoot "stable-unexpected-file.log") `
+                $stableShellRoot $stableShellSnapshot $stableRoot `
+                "Stable unexpected file"
+            Remove-Item -LiteralPath $unexpectedFile -Force
+
+            $canonicalReadme = Join-Path $stableRoot "README.txt"
+            $originalReadmeAttributes = (Get-Item -LiteralPath $canonicalReadme -Force).Attributes
+            Set-ItemProperty -LiteralPath $canonicalReadme -Name IsReadOnly -Value $true
+            Invoke-ExpectedInstallerRefusal `
+                $installer $stableInstallArguments `
+                (Join-Path $temporaryRoot "stable-readonly.log") `
+                $stableShellRoot $stableShellSnapshot $stableRoot `
+                "Stable read-only payload file"
+            (Get-Item -LiteralPath $canonicalReadme -Force).Attributes = $originalReadmeAttributes
+
+            [System.IO.File]::WriteAllBytes("$canonicalReadme`:scribe-test", [byte[]](65, 68, 83))
+            Invoke-ExpectedInstallerRefusal `
+                $installer $stableInstallArguments `
+                (Join-Path $temporaryRoot "stable-file-ads.log") `
+                $stableShellRoot $stableShellSnapshot $stableRoot `
+                "Stable payload file with alternate data stream"
+            Remove-Item -LiteralPath $canonicalReadme -Stream "scribe-test"
+
+            $licensesRoot = Join-Path $stableRoot "licenses"
+            [System.IO.File]::WriteAllBytes("$licensesRoot`:scribe-test", [byte[]](65, 68, 83))
+            Invoke-ExpectedInstallerRefusal `
+                $installer $stableInstallArguments `
+                (Join-Path $temporaryRoot "stable-directory-ads.log") `
+                $stableShellRoot $stableShellSnapshot $stableRoot `
+                "Stable payload directory with alternate data stream"
+            Remove-Item -LiteralPath $licensesRoot -Stream "scribe-test"
+
+            $sharingSnapshot = Get-ExactTreeSnapshot $stableRoot
+            $exclusiveHandle = [System.IO.File]::Open(
+                $canonicalReadme,
+                [System.IO.FileMode]::Open,
+                [System.IO.FileAccess]::Read,
+                [System.IO.FileShare]::None
+            )
+            try {
+                $sharingInstall = Invoke-IsolatedInstallerProcess `
+                    $installer $stableInstallArguments `
+                    (Join-Path $temporaryRoot "stable-sharing.log") `
+                    $stableShellRoot $stableShellSnapshot "Stable incompatible file sharing"
+                if ($sharingInstall.ExitCode -eq 0) {
+                    throw "Stable incompatible file sharing was accepted instead of refused fail-closed."
+                }
             }
-            if (-not (Test-Path -LiteralPath $legacyFile -PathType Leaf) -or
-                (Get-FileHash -Algorithm SHA256 -LiteralPath $legacyFile).Hash -cne $legacyHash) {
-                throw "Stable installer deleted or mutated refused legacy content."
+            finally {
+                $exclusiveHandle.Dispose()
             }
+            Assert-ExactTreeSnapshot $stableRoot $sharingSnapshot "Stable incompatible file sharing"
+
+            $currentIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+            $enumerationSnapshot = Get-ExactTreeSnapshot $stableRoot
+            $originalLicensesAcl = Get-Acl -LiteralPath $licensesRoot
+            $deniedLicensesAcl = Get-Acl -LiteralPath $licensesRoot
+            $denyEnumeration = [System.Security.AccessControl.FileSystemAccessRule]::new(
+                $currentIdentity,
+                [System.Security.AccessControl.FileSystemRights]::ListDirectory,
+                [System.Security.AccessControl.InheritanceFlags]::None,
+                [System.Security.AccessControl.PropagationFlags]::None,
+                [System.Security.AccessControl.AccessControlType]::Deny
+            )
+            $null = $deniedLicensesAcl.AddAccessRule($denyEnumeration)
+            Set-Acl -LiteralPath $licensesRoot -AclObject $deniedLicensesAcl
+            try {
+                $enumerationInstall = Invoke-IsolatedInstallerProcess `
+                    $installer $stableInstallArguments `
+                    (Join-Path $temporaryRoot "stable-enumeration-access-denied.log") `
+                    $stableShellRoot $stableShellSnapshot "Stable access-denied enumeration"
+                if ($enumerationInstall.ExitCode -eq 0) {
+                    throw "Stable access-denied enumeration was accepted instead of refused fail-closed."
+                }
+            }
+            finally {
+                Set-Acl -LiteralPath $licensesRoot -AclObject $originalLicensesAcl
+            }
+            Assert-ExactTreeSnapshot $stableRoot $enumerationSnapshot "Stable access-denied enumeration"
+
+            $updateSnapshot = Get-ExactTreeSnapshot $stableRoot
+            $originalReadmeAcl = Get-Acl -LiteralPath $canonicalReadme
+            $deniedReadmeAcl = Get-Acl -LiteralPath $canonicalReadme
+            $denyUpdate = [System.Security.AccessControl.FileSystemAccessRule]::new(
+                $currentIdentity,
+                [System.Security.AccessControl.FileSystemRights]::WriteData,
+                [System.Security.AccessControl.InheritanceFlags]::None,
+                [System.Security.AccessControl.PropagationFlags]::None,
+                [System.Security.AccessControl.AccessControlType]::Deny
+            )
+            $null = $deniedReadmeAcl.AddAccessRule($denyUpdate)
+            Set-Acl -LiteralPath $canonicalReadme -AclObject $deniedReadmeAcl
+            try {
+                $updateInstall = Invoke-IsolatedInstallerProcess `
+                    $installer $stableInstallArguments `
+                    (Join-Path $temporaryRoot "stable-update-access-denied.log") `
+                    $stableShellRoot $stableShellSnapshot "Stable access-denied update"
+                if ($updateInstall.ExitCode -eq 0) {
+                    throw "Stable access-denied update was accepted instead of refused fail-closed."
+                }
+            }
+            finally {
+                Set-Acl -LiteralPath $canonicalReadme -AclObject $originalReadmeAcl
+            }
+            Assert-ExactTreeSnapshot $stableRoot $updateSnapshot "Stable access-denied update"
+
+            Invoke-ProtectedRenameRace `
+                $installer $stableInstallArguments `
+                (Join-Path $temporaryRoot "stable-root-rename-race.log") `
+                $stableShellRoot $stableShellSnapshot $stableContainer $stableRoot `
+                "Stable root rename race"
+            $null = Assert-Bundle -Root $stableRoot -AllowedAdditionalFiles $InnoSetupUninstallerArtifacts
+            Assert-PayloadParity $bundle $stableRoot "Stable root rename race"
+
+            Invoke-ProtectedRenameRace `
+                $installer $stableInstallArguments `
+                (Join-Path $temporaryRoot "stable-child-rename-race.log") `
+                $stableShellRoot $stableShellSnapshot $stableContainer $licensesRoot `
+                "Stable child-directory rename race"
+            $null = Assert-Bundle -Root $stableRoot -AllowedAdditionalFiles $InnoSetupUninstallerArtifacts
+            Assert-PayloadParity $bundle $stableRoot "Stable child-directory rename race"
+
+            Invoke-ProtectedRenameRace `
+                $installer $stableInstallArguments `
+                (Join-Path $temporaryRoot "stable-file-rename-race.log") `
+                $stableShellRoot $stableShellSnapshot $stableContainer $canonicalReadme `
+                "Stable file rename race"
+            $null = Assert-Bundle -Root $stableRoot -AllowedAdditionalFiles $InnoSetupUninstallerArtifacts
+            Assert-PayloadParity $bundle $stableRoot "Stable file rename race"
 
             $stableUninstall = Invoke-NativeProcess $stableUninstaller @(
-                "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"
+                "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART",
+                "/LOG=$(Join-Path $temporaryRoot 'stable-uninstall.log')"
             )
             if ($stableUninstall.ExitCode -ne 0) {
                 throw "Stable-upgrade fixture cleanup failed with exit code $($stableUninstall.ExitCode): $($stableUninstall.Stderr.Trim())"
             }
             $stableUninstaller = $null
-            if (Test-VerificationUninstallRegistration $stableAppId) {
-                throw "Stable-upgrade fixture cleanup left the stable uninstall registration behind."
-            }
-            if (-not (Test-Path -LiteralPath $legacyFile -PathType Leaf) -or
-                (Get-FileHash -Algorithm SHA256 -LiteralPath $legacyFile).Hash -cne $legacyHash) {
-                throw "Stable uninstaller unexpectedly deleted or mutated refused legacy content."
-            }
+            Assert-ExactTreeSnapshot $stableShellRoot $stableShellSnapshot "Stable-test uninstaller"
+
+            Invoke-ReparseRefusalFixture $installer $temporaryRoot "root"
+            Invoke-ReparseRefusalFixture $installer $temporaryRoot "child"
         }
     }
 }
@@ -677,7 +1063,8 @@ finally {
     if ($null -ne $stableUninstaller -and (Test-Path -LiteralPath $stableUninstaller -PathType Leaf)) {
         try {
             $stableCleanup = Invoke-NativeProcess $stableUninstaller @(
-                "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"
+                "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART",
+                "/LOG=$(Join-Path $temporaryRoot 'stable-emergency-uninstall.log')"
             )
             if ($stableCleanup.ExitCode -ne 0) {
                 Write-Warning "Stable-upgrade fixture uninstaller cleanup returned exit $($stableCleanup.ExitCode)."
@@ -692,7 +1079,8 @@ finally {
             $cleanupProcess = Invoke-NativeProcess $verificationUninstaller @(
                 "/VERYSILENT",
                 "/SUPPRESSMSGBOXES",
-                "/NORESTART"
+                "/NORESTART",
+                "/LOG=$(Join-Path $temporaryRoot 'verification-emergency-uninstall.log')"
             )
             if ($cleanupProcess.ExitCode -ne 0) {
                 Write-Warning "Installer verification uninstaller cleanup returned exit $($cleanupProcess.ExitCode)."
@@ -702,9 +1090,20 @@ finally {
             Write-Warning "Installer verification uninstaller cleanup failed: $($_.Exception.Message)"
         }
     }
-    if (Test-VerificationUninstallRegistration $verificationAppId) {
-        Remove-VerificationUninstallRegistration $verificationAppId
+    if ($null -ne $evidenceRoot -and (Test-Path -LiteralPath $temporaryRoot -PathType Container)) {
+        foreach ($log in @(Get-ChildItem -LiteralPath $temporaryRoot -Filter "*.log" -File)) {
+            $null = Assert-RegularFile $log.FullName
+            Copy-Item -LiteralPath $log.FullName -Destination (Join-Path $evidenceRoot $log.Name)
+        }
     }
+    if ($null -ne $stableShellRoot) {
+        Remove-ValidatedTemporaryRoot $stableShellRoot
+    }
+    if ($null -ne $stableContainer) {
+        Remove-ValidatedTemporaryRoot $stableContainer
+    }
+    Remove-ValidatedTemporaryRoot $verificationShellRoot
+    Remove-ValidatedTemporaryRoot $verificationRoot
     Remove-ValidatedTemporaryRoot $temporaryRoot
 }
 

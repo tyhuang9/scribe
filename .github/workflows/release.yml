@@ -158,7 +158,16 @@ jobs:
             -BundlePath dist\portable `
             -PortableZipPath dist\Scribe-windows-x64.zip `
             -InstallerPath dist\Scribe-Setup.exe `
-            -ExerciseStableUpgrade
+            -ExerciseStableUpgrade `
+            -EvidenceDirectory dist\installer-verification-logs
+
+      - name: Upload installer verification evidence
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: windows-installer-verification-logs
+          path: dist/installer-verification-logs
+          if-no-files-found: warn
 
       - name: Upload Windows release assets
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
