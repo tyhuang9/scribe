@@ -6,15 +6,11 @@
 //! verified and inventoried without catalog or network access. Executing or
 //! activating a bundle additionally requires the current embedded catalog.
 
-#[cfg(test)]
-use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
-#[cfg(test)]
-use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -59,73 +55,6 @@ const MOONSHINE_MIT_LICENSE_BYTES: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/resources/licenses/Moonshine-MIT.txt"
 ));
-
-#[cfg(test)]
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(crate) struct ReceiptVerificationStats {
-    pub(crate) calls: usize,
-    /// Sum of the declared bytes hashed by successful exact-tree verification.
-    pub(crate) verified_bytes: u64,
-    /// Samples are diagnostic evidence only; tests must not make timing claims.
-    pub(crate) durations: Vec<Duration>,
-}
-
-#[cfg(test)]
-thread_local! {
-    static RECEIPT_VERIFICATION_OBSERVER: RefCell<Option<ReceiptVerificationStats>> = const {
-        RefCell::new(None)
-    };
-}
-
-#[cfg(test)]
-pub(crate) fn observe_receipt_verifications_for_test<T>(
-    operation: impl FnOnce() -> T,
-) -> (T, ReceiptVerificationStats) {
-    RECEIPT_VERIFICATION_OBSERVER.with(|observer| {
-        assert!(
-            observer.borrow().is_none(),
-            "receipt verification observers cannot be nested"
-        );
-        *observer.borrow_mut() = Some(ReceiptVerificationStats::default());
-    });
-    let result = operation();
-    let stats = RECEIPT_VERIFICATION_OBSERVER.with(|observer| {
-        observer
-            .borrow_mut()
-            .take()
-            .expect("receipt verification observer remains installed")
-    });
-    (result, stats)
-}
-
-#[cfg(test)]
-struct ReceiptVerificationSample {
-    started: Instant,
-    verified_bytes: u64,
-}
-
-#[cfg(test)]
-impl ReceiptVerificationSample {
-    fn new() -> Self {
-        Self {
-            started: Instant::now(),
-            verified_bytes: 0,
-        }
-    }
-}
-
-#[cfg(test)]
-impl Drop for ReceiptVerificationSample {
-    fn drop(&mut self) {
-        RECEIPT_VERIFICATION_OBSERVER.with(|observer| {
-            if let Some(stats) = observer.borrow_mut().as_mut() {
-                stats.calls += 1;
-                stats.verified_bytes += self.verified_bytes;
-                stats.durations.push(self.started.elapsed());
-            }
-        });
-    }
-}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -1582,6 +1511,73 @@ pub(crate) fn retained_onnx_bundle_partial(
 /// already completed revision-cache files are also left intact.
 pub(crate) fn pause_onnx_bundle_install(cancellation: &InstallCancellation) {
     cancellation.cancel();
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ReceiptVerificationStats {
+    pub(crate) calls: usize,
+    /// Sum of the declared bytes hashed by successful exact-tree verification.
+    pub(crate) verified_bytes: u64,
+    /// Samples are diagnostic evidence only; tests must not make timing claims.
+    pub(crate) durations: Vec<std::time::Duration>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static RECEIPT_VERIFICATION_OBSERVER: std::cell::RefCell<Option<ReceiptVerificationStats>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+#[cfg(test)]
+pub(crate) fn observe_receipt_verifications_for_test<T>(
+    operation: impl FnOnce() -> T,
+) -> (T, ReceiptVerificationStats) {
+    RECEIPT_VERIFICATION_OBSERVER.with(|observer| {
+        assert!(
+            observer.borrow().is_none(),
+            "receipt verification observers cannot be nested"
+        );
+        *observer.borrow_mut() = Some(ReceiptVerificationStats::default());
+    });
+    let result = operation();
+    let stats = RECEIPT_VERIFICATION_OBSERVER.with(|observer| {
+        observer
+            .borrow_mut()
+            .take()
+            .expect("receipt verification observer remains installed")
+    });
+    (result, stats)
+}
+
+#[cfg(test)]
+struct ReceiptVerificationSample {
+    started: std::time::Instant,
+    verified_bytes: u64,
+}
+
+#[cfg(test)]
+impl ReceiptVerificationSample {
+    fn new() -> Self {
+        Self {
+            started: std::time::Instant::now(),
+            verified_bytes: 0,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for ReceiptVerificationSample {
+    fn drop(&mut self) {
+        RECEIPT_VERIFICATION_OBSERVER.with(|observer| {
+            if let Some(stats) = observer.borrow_mut().as_mut() {
+                stats.calls += 1;
+                stats.verified_bytes += self.verified_bytes;
+                stats.durations.push(self.started.elapsed());
+            }
+        });
+    }
 }
 
 fn validate_receipt(receipt: &OnnxBundleReceipt) -> Result<(), InstallError> {

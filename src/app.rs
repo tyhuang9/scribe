@@ -6832,10 +6832,13 @@ impl LocalTranscriberApp {
                         self.artifact_recovery_error = Some(message.clone());
                         self.freeze_artifact_installs_for_recovery(Some(job_id));
                     }
-                    self.fail_model_install(&model_id, message.clone());
                     if recovery_required || self.artifact_recovery_error.is_none() {
+                        self.fail_model_install(&model_id, message.clone());
                         self.status = TranscriptionStatus::Error;
                         self.status_message = format!("Installation failed: {message}");
+                    } else {
+                        self.model_downloads
+                            .insert(model_id.clone(), ModelInstallStatus::Error(message.clone()));
                     }
                     if let Some(result) = discard_result {
                         let cleanup_succeeded = result.is_ok();
@@ -9886,9 +9889,8 @@ impl LocalTranscriberApp {
     }
 
     fn rebuild_local_models_after_committed_change(&mut self) {
-        if self.remote_catalog.local_models_dirty {
-            self.rebuild_model_inventory_projection();
-        }
+        self.remote_catalog.invalidate_local_models();
+        self.rebuild_model_inventory_projection();
     }
 
     #[cfg(test)]
@@ -18830,6 +18832,8 @@ mod layout_tests {
         app.config.general.model_paths.clear();
         app.config.general.managed_models.clear();
         app.config.general.selected_default_model = "vosk_small_en".to_owned();
+        app.remote_catalog.invalidate_local_models();
+        app.rebuild_model_inventory_projection();
 
         app.reconcile_startup_model_selection();
 
