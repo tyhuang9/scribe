@@ -1,8 +1,6 @@
 param(
     [Parameter(Mandatory = $true)]
     [string]$ModelSource,
-    [Parameter(Mandatory = $true)]
-    [string]$RuntimeSource,
     [string]$BundlePath
 )
 
@@ -12,9 +10,7 @@ Set-StrictMode -Version Latest
 $targetTriple = "x86_64-pc-windows-msvc"
 $expectedPeMachine = 0x8664
 $repositoryRoot = [System.IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
-$runtimeManifestPath = Join-Path $repositoryRoot "runtime-manifests\whisper-cpp-v1.9.1-windows-x64.json"
 $modelManifestPath = Join-Path $repositoryRoot "runtime-manifests\whisper-base-en-q8_0-windows-x64.json"
-$runtimeManifest = Get-Content -LiteralPath $runtimeManifestPath -Raw | ConvertFrom-Json
 $modelManifest = Get-Content -LiteralPath $modelManifestPath -Raw | ConvertFrom-Json
 
 function Get-NormalizedFullPath([string]$Path) {
@@ -240,8 +236,8 @@ if (-not [Environment]::Is64BitOperatingSystem -or
     [Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
     throw "The release bundle is qualified only for Windows x64."
 }
-if ($runtimeManifest.platform_triple -ne $targetTriple -or $modelManifest.platform_triple -ne $targetTriple) {
-    throw "Release manifests do not match the qualified Windows x64 target triple."
+if ($modelManifest.platform_triple -ne $targetTriple) {
+    throw "The bundled model manifest does not match the qualified Windows x64 target triple."
 }
 if (-not $BundlePath) {
     $BundlePath = Join-Path $repositoryRoot "artifacts\Scribe-windows-x64"
@@ -281,20 +277,8 @@ if (Test-Path -LiteralPath $stagingBundle) {
 }
 
 $modelSourcePath = Get-NormalizedFullPath $ModelSource
-$runtimeSourceRoot = Get-NormalizedFullPath $RuntimeSource
 Assert-NoReparseAncestors $modelSourcePath
-Assert-NoReparseAncestors $runtimeSourceRoot
 Assert-ExactFile $modelSourcePath ([int64]$modelManifest.size_bytes) $modelManifest.sha256
-if (-not (Test-Path -LiteralPath $runtimeSourceRoot -PathType Container)) {
-    throw "Pinned runtime source does not exist: $runtimeSourceRoot"
-}
-foreach ($file in $runtimeManifest.files) {
-    $runtimeSourcePath = Join-Path $runtimeSourceRoot ($file.path -replace '/', '\')
-    Assert-ExactFile $runtimeSourcePath ([int64]$file.size_bytes) $file.sha256
-    if ([System.IO.Path]::GetExtension($runtimeSourcePath) -in @('.dll', '.exe')) {
-        Assert-Amd64Pe $runtimeSourcePath
-    }
-}
 
 Push-Location $repositoryRoot
 try {
@@ -318,16 +302,6 @@ try {
     $stagedExecutable = Join-Path $stagingBundle "local-transcriber.exe"
     Copy-Item -LiteralPath $sourceExecutable -Destination $stagedExecutable
 
-    $stagedRuntimeRoot = Join-Path $stagingBundle "runtimes\whisper_cpp"
-    foreach ($file in $runtimeManifest.files) {
-        $relative = $file.path -replace '/', '\'
-        $sourcePath = Join-Path $runtimeSourceRoot $relative
-        $destinationPath = Join-Path $stagedRuntimeRoot $relative
-        New-Item -ItemType Directory -Path (Split-Path -Parent $destinationPath) -Force | Out-Null
-        Copy-Item -LiteralPath $sourcePath -Destination $destinationPath
-    }
-    Copy-Item -LiteralPath $runtimeManifestPath -Destination (Join-Path $stagedRuntimeRoot "runtime-manifest.json")
-
     $stagedModel = Join-Path $stagingBundle $modelManifest.artifact_filename
     Copy-Item -LiteralPath $modelSourcePath -Destination $stagedModel
     $stagedLicenses = Join-Path $stagingBundle "licenses"
@@ -347,14 +321,13 @@ try {
     $portableReadme = Join-Path $stagingBundle "README.txt"
     [System.IO.File]::WriteAllText(
         $portableReadme,
-        "Scribe $($versionMatch.Groups[1].Value)`r`n`r`nExtract this entire folder before running local-transcriber.exe. This portable Windows x64 package includes the verified English Base model and compatibility runtime; do not distribute the executable by itself.`r`n",
+        "Scribe $($versionMatch.Groups[1].Value)`r`n`r`nExtract this entire folder before running local-transcriber.exe. This portable Windows x64 package contains one self-contained application executable plus the verified English Base model; do not distribute the executable by itself.`r`n",
         [System.Text.UTF8Encoding]::new($false)
     )
 
     Assert-NoReparseAncestors $stagingBundle
     Assert-TreeHasNoReparsePoints $stagingBundle
     Assert-CopyMatchesSource $sourceExecutable $stagedExecutable
-    Assert-CopyMatchesSource $runtimeManifestPath (Join-Path $stagedRuntimeRoot "runtime-manifest.json")
     Assert-CopyMatchesSource $modelManifestPath $stagedModelManifest
     foreach ($relativePath in $modelManifest.attribution_files) {
         $sourcePath = Join-Path $repositoryRoot ($relativePath -replace '/', '\')
@@ -363,20 +336,8 @@ try {
     Assert-Amd64Pe $stagedExecutable
     Assert-WindowsGuiSubsystem $stagedExecutable
     Assert-ExactFile $stagedModel ([int64]$modelManifest.size_bytes) $modelManifest.sha256
-    foreach ($file in $runtimeManifest.files) {
-        $path = Join-Path $stagedRuntimeRoot ($file.path -replace '/', '\')
-        Assert-ExactFile $path ([int64]$file.size_bytes) $file.sha256
-        if ([System.IO.Path]::GetExtension($path) -in @('.dll', '.exe')) {
-            Assert-Amd64Pe $path
-        }
-    }
-
     $expectedPaths = [System.Collections.Generic.List[string]]::new()
     $null = $expectedPaths.Add("local-transcriber.exe")
-    foreach ($file in $runtimeManifest.files) {
-        $null = $expectedPaths.Add("runtimes/whisper_cpp/$($file.path)")
-    }
-    $null = $expectedPaths.Add("runtimes/whisper_cpp/runtime-manifest.json")
     $null = $expectedPaths.Add($modelManifest.artifact_filename)
     foreach ($relativePath in $modelManifest.attribution_files) {
         $null = $expectedPaths.Add("licenses/$(Split-Path -Leaf $relativePath)")

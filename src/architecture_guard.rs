@@ -802,24 +802,15 @@ fn retired_python_provider_stack_stays_absent_without_crossing_native_boundaries
             );
         }
     }
-    let dependency_defaults = fs::read_to_string(root.join("scripts/runtime-dependencies.env"))
-        .expect("runtime dependency defaults must be readable");
-    assert!(
-        dependency_defaults
-            .lines()
-            .all(|line| line.trim().is_empty() || line.trim_start().starts_with('#')),
-        "retired Python dependency pins were restored"
-    );
-    let dependency_checker =
-        fs::read_to_string(root.join("scripts/check-runtime-dependency-updates.py"))
-            .expect("dependency checker must be readable");
-    assert_eq!(
-        dependency_checker
-            .lines()
-            .find(|line| line.trim_start().starts_with("PINNED_PACKAGES:"))
-            .map(str::trim),
-        Some("PINNED_PACKAGES: dict[str, str] = {}")
-    );
+    for removed_runtime_maintenance_path in [
+        "scripts/runtime-dependencies.env",
+        "scripts/check-runtime-dependency-updates.py",
+    ] {
+        assert!(
+            !root.join(removed_runtime_maintenance_path).exists(),
+            "retired dynamic runtime maintenance tool was restored: {removed_runtime_maintenance_path}"
+        );
+    }
 
     let stt = fs::read_to_string(root.join("src/stt/mod.rs"))
         .expect("STT cancellation module must be readable");
@@ -1260,16 +1251,42 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
     )
     .expect("release input preparation script must be readable");
     for required in [
-        "whisper-cpp-v1.9.1-windows-x64.json",
         "whisper-base-en-q8_0-windows-x64.json",
         "Get-FileHash",
-        "Expand-Archive",
         "huggingface.co/$modelRepository/resolve/$modelRevision/$modelFilename",
         "Release input SHA-256 mismatch",
     ] {
         assert!(
             release_inputs.contains(required),
             "release input preparation must retain {required}"
+        );
+    }
+    for forbidden in ["RuntimeSource", "runtime-manifest.json", "Expand-Archive"] {
+        assert!(
+            !release_inputs.contains(forbidden),
+            "release input preparation must not retain dynamic runtime contract {forbidden}"
+        );
+    }
+
+    for removed_runtime_path in [
+        "runtime-manifests/whisper-cpp-v1.9.1-windows-x64.json",
+        "scripts/build-release-bundle.sh",
+        "scripts/build-whisper-cuda.sh",
+        "scripts/build-whisper-ollama-cuda-backend.sh",
+        "scripts/bundle-whisper-runtime.ps1",
+        "scripts/bundle-whisper-runtime.sh",
+        "scripts/check-runtime-dependency-updates.py",
+        "scripts/runtime-dependencies.env",
+    ] {
+        assert!(
+            !repository.join(removed_runtime_path).exists(),
+            "obsolete dynamic runtime release artifact must stay removed: {removed_runtime_path}"
+        );
+    }
+    for forbidden in ["RuntimeSource", "runtimes/whisper_cpp", "runtime-manifest.json"] {
+        assert!(
+            !release.contains(forbidden),
+            "self-contained release build must not stage dynamic runtime artifact {forbidden}"
         );
     }
 

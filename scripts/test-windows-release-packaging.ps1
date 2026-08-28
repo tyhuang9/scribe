@@ -205,7 +205,7 @@ try {
 
     $targetBundle = Join-Path $repositoryRoot "target\scribe-release-probe-$PID"
     Invoke-ExpectedFailure {
-        & $releaseScript -ModelSource "missing-model" -RuntimeSource "missing-runtime" -BundlePath $targetBundle
+        & $releaseScript -ModelSource "missing-model" -BundlePath $targetBundle
     } "Cargo target directories"
     if (Test-Path -LiteralPath $targetBundle) {
         throw "Rejected Cargo-target bundle path was mutated."
@@ -216,7 +216,7 @@ try {
     $existingMarker = Join-Path $existingFinal "keep.bin"
     [System.IO.File]::WriteAllBytes($existingMarker, [byte[]](7))
     Invoke-ExpectedFailure {
-        & $releaseScript -ModelSource "missing-model" -RuntimeSource "missing-runtime" -BundlePath $existingFinal
+        & $releaseScript -ModelSource "missing-model" -BundlePath $existingFinal
     } "already exists"
     if (-not (Test-Path -LiteralPath $existingMarker -PathType Leaf)) {
         throw "Existing final bundle was mutated."
@@ -228,7 +228,7 @@ try {
     $staleMarker = Join-Path $stale "keep.bin"
     [System.IO.File]::WriteAllBytes($staleMarker, [byte[]](8))
     Invoke-ExpectedFailure {
-        & $releaseScript -ModelSource "missing-model" -RuntimeSource "missing-runtime" -BundlePath $staleFinal
+        & $releaseScript -ModelSource "missing-model" -BundlePath $staleFinal
     } "stale release staging sibling"
     if (-not (Test-Path -LiteralPath $staleMarker -PathType Leaf)) {
         throw "Stale staging refusal mutated the stale directory."

@@ -85,7 +85,6 @@ jobs:
           "APP_VERSION=$version" >> $env:GITHUB_ENV
           & .\scripts\build-windows-release.ps1 `
             -ModelSource .ci-release-inputs\model\whisper-base.en-Q8_0.gguf `
-            -RuntimeSource .ci-release-inputs\runtime `
             -BundlePath dist\portable
 
       - name: Install Inno Setup
