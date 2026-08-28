@@ -5,6 +5,7 @@ $repositoryRoot = [System.IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoo
 $releaseScript = Join-Path $PSScriptRoot "build-windows-release.ps1"
 $modelScript = Join-Path $PSScriptRoot "bundle-base-model.ps1"
 $packageVerifier = Join-Path $PSScriptRoot "verify-windows-release-package.ps1"
+. (Join-Path $PSScriptRoot "windows-pe-imports.ps1")
 $source = Get-Content -LiteralPath $releaseScript -Raw
 $helpersStart = $source.IndexOf("function Get-NormalizedFullPath")
 $helpersEnd = $source.IndexOf("if (-not [Environment]::Is64BitOperatingSystem")
@@ -42,15 +43,51 @@ function Invoke-ExpectedFailure([scriptblock]$Action, [string]$ExpectedText) {
     throw "Expected failure containing '$ExpectedText', but the action succeeded."
 }
 
-function Write-TestPe([string]$Path, [uint16]$Machine) {
-    $bytes = [byte[]]::new(256)
+function Write-TestPe(
+    [string]$Path,
+    [uint16]$Machine,
+    [string]$NormalImport = "kernel32.dll",
+    [string]$DelayImport = "user32.dll",
+    [uint16]$Subsystem = 2
+) {
+    $bytes = [byte[]]::new(0x600)
     $bytes[0] = 0x4D
     $bytes[1] = 0x5A
-    [BitConverter]::GetBytes([uint32]0x40).CopyTo($bytes, 0x3C)
-    [BitConverter]::GetBytes([uint32]0x00004550).CopyTo($bytes, 0x40)
-    [BitConverter]::GetBytes($Machine).CopyTo($bytes, 0x44)
-    [BitConverter]::GetBytes([uint16]0x20B).CopyTo($bytes, 0x58)
-    [BitConverter]::GetBytes([uint16]2).CopyTo($bytes, 0x9C)
+    [BitConverter]::GetBytes([uint32]0x80).CopyTo($bytes, 0x3C)
+    [BitConverter]::GetBytes([uint32]0x00004550).CopyTo($bytes, 0x80)
+    [BitConverter]::GetBytes($Machine).CopyTo($bytes, 0x84)
+    [BitConverter]::GetBytes([uint16]1).CopyTo($bytes, 0x86)
+    [BitConverter]::GetBytes([uint16]0xF0).CopyTo($bytes, 0x94)
+    $optionalOffset = 0x98
+    [BitConverter]::GetBytes([uint16]0x20B).CopyTo($bytes, $optionalOffset)
+    [BitConverter]::GetBytes([uint64]0x140000000).CopyTo($bytes, $optionalOffset + 24)
+    [BitConverter]::GetBytes([uint32]0x1000).CopyTo($bytes, $optionalOffset + 32)
+    [BitConverter]::GetBytes([uint32]0x200).CopyTo($bytes, $optionalOffset + 36)
+    [BitConverter]::GetBytes([uint32]0x2000).CopyTo($bytes, $optionalOffset + 56)
+    [BitConverter]::GetBytes([uint32]0x200).CopyTo($bytes, $optionalOffset + 60)
+    [BitConverter]::GetBytes($Subsystem).CopyTo($bytes, $optionalOffset + 68)
+    [BitConverter]::GetBytes([uint32]16).CopyTo($bytes, $optionalOffset + 108)
+    [BitConverter]::GetBytes([uint32]0x1000).CopyTo($bytes, $optionalOffset + 120)
+    [BitConverter]::GetBytes([uint32]40).CopyTo($bytes, $optionalOffset + 124)
+    [BitConverter]::GetBytes([uint32]0x1040).CopyTo($bytes, $optionalOffset + 216)
+    [BitConverter]::GetBytes([uint32]64).CopyTo($bytes, $optionalOffset + 220)
+
+    $sectionOffset = $optionalOffset + 0xF0
+    [System.Text.Encoding]::ASCII.GetBytes('.rdata').CopyTo($bytes, $sectionOffset)
+    [BitConverter]::GetBytes([uint32]0x400).CopyTo($bytes, $sectionOffset + 8)
+    [BitConverter]::GetBytes([uint32]0x1000).CopyTo($bytes, $sectionOffset + 12)
+    [BitConverter]::GetBytes([uint32]0x400).CopyTo($bytes, $sectionOffset + 16)
+    [BitConverter]::GetBytes([uint32]0x200).CopyTo($bytes, $sectionOffset + 20)
+
+    [BitConverter]::GetBytes([uint32]0x1100).CopyTo($bytes, 0x200)
+    [BitConverter]::GetBytes([uint32]0x1080).CopyTo($bytes, 0x20C)
+    [BitConverter]::GetBytes([uint32]0x1110).CopyTo($bytes, 0x210)
+    [BitConverter]::GetBytes([uint32]1).CopyTo($bytes, 0x240)
+    [BitConverter]::GetBytes([uint32]0x10A0).CopyTo($bytes, 0x244)
+    [BitConverter]::GetBytes([uint32]0x1120).CopyTo($bytes, 0x24C)
+    [BitConverter]::GetBytes([uint32]0x1130).CopyTo($bytes, 0x250)
+    ([System.Text.Encoding]::ASCII.GetBytes($NormalImport + [char]0)).CopyTo($bytes, 0x280)
+    ([System.Text.Encoding]::ASCII.GetBytes($DelayImport + [char]0)).CopyTo($bytes, 0x2A0)
     [System.IO.File]::WriteAllBytes($Path, $bytes)
 }
 
@@ -151,13 +188,26 @@ try {
     Write-TestPe $x86 0x014C
     Assert-Amd64Pe $amd64
     Assert-WindowsGuiSubsystem $amd64
+    $syntheticImportReport = Assert-ReviewedWindowsPe $amd64
+    if ($syntheticImportReport.NormalImports -cnotcontains "kernel32.dll" -or
+        $syntheticImportReport.DelayImports -cnotcontains "user32.dll") {
+        throw "Synthetic PE fixture did not prove both normal and delay import parsing."
+    }
     Invoke-ExpectedFailure { Assert-Amd64Pe $x86 } "PE Machine mismatch"
     $consoleSubsystem = Join-Path $testRoot "console-subsystem.exe"
-    Write-TestPe $consoleSubsystem 0x8664
-    $consoleBytes = [System.IO.File]::ReadAllBytes($consoleSubsystem)
-    [BitConverter]::GetBytes([uint16]3).CopyTo($consoleBytes, 0x9C)
-    [System.IO.File]::WriteAllBytes($consoleSubsystem, $consoleBytes)
+    Write-TestPe $consoleSubsystem 0x8664 "kernel32.dll" "user32.dll" 3
     Invoke-ExpectedFailure { Assert-WindowsGuiSubsystem $consoleSubsystem } "PE subsystem mismatch"
+
+    $forbiddenNormalImport = Join-Path $testRoot "forbidden-normal-import.exe"
+    Write-TestPe $forbiddenNormalImport 0x8664 "whisper.dll" "user32.dll"
+    Invoke-ExpectedFailure {
+        Assert-ReviewedWindowsPe $forbiddenNormalImport
+    } "unreviewed normal import DLL: whisper.dll"
+    $forbiddenDelayImport = Join-Path $testRoot "forbidden-delay-import.exe"
+    Write-TestPe $forbiddenDelayImport 0x8664 "kernel32.dll" "onnxruntime.dll"
+    Invoke-ExpectedFailure {
+        Assert-ReviewedWindowsPe $forbiddenDelayImport
+    } "unreviewed delay import DLL: onnxruntime.dll"
 
     $pwshPath = (Get-Process -Id $PID).Path
     $nativeProcess = Invoke-NativeProcess $pwshPath @(
@@ -170,6 +220,18 @@ try {
         $nativeProcess.Stderr -ne "captured-error") {
         throw "Synchronous native-process capture did not preserve exit, stdout, and stderr evidence."
     }
+
+    $validSmoke = [pscustomobject]@{
+        cancellation_verified = $true
+        capabilities = [pscustomobject]@{ cancellation = $true }
+        detected_architecture = "whisper"
+    }
+    Assert-ReleaseSmokeDiagnostics $validSmoke
+    $wrongArchitectureSmoke = $validSmoke.PSObject.Copy()
+    $wrongArchitectureSmoke.detected_architecture = "whisper-compatible"
+    Invoke-ExpectedFailure {
+        Assert-ReleaseSmokeDiagnostics $wrongArchitectureSmoke
+    } "expected detected architecture 'whisper'"
 
     $final = Join-Path $testRoot "Scribe-windows-x64"
     $validStaging = "$final.staging-$PID-$([guid]::NewGuid().ToString('N'))"
@@ -233,6 +295,31 @@ try {
         throw "Rejected external Cargo-target bundle path was mutated."
     }
 
+    $relativeCargoTarget = "relative-cargo-target-$PID"
+    $resolvedRelativeCargoTarget = Join-Path $repositoryRoot $relativeCargoTarget
+    $differentWorkingDirectory = Join-Path $testRoot "different-cwd"
+    New-Item -ItemType Directory -Path $differentWorkingDirectory | Out-Null
+    try {
+        $env:CARGO_TARGET_DIR = $relativeCargoTarget
+        Push-Location $differentWorkingDirectory
+        try {
+            Invoke-ExpectedFailure {
+                & $releaseScript `
+                    -ModelSource "missing-model" `
+                    -BundlePath (Join-Path $resolvedRelativeCargoTarget "portable")
+            } "Cargo target directories"
+        }
+        finally {
+            Pop-Location
+        }
+    }
+    finally {
+        $env:CARGO_TARGET_DIR = $previousCargoTargetDirectory
+    }
+    if (Test-Path -LiteralPath $resolvedRelativeCargoTarget) {
+        throw "Rejected repository-relative Cargo target was mutated."
+    }
+
     $existingFinal = Join-Path $testRoot "existing-final"
     New-Item -ItemType Directory -Path $existingFinal | Out-Null
     $existingMarker = Join-Path $existingFinal "keep.bin"
@@ -278,7 +365,9 @@ try {
     $workflow = Get-Content -LiteralPath (Join-Path $repositoryRoot ".github\workflows\release.yml") -Raw
     if ($workflow -notmatch "prepare-windows-release-inputs\.ps1" -or
         $workflow -notmatch "build-windows-release\.ps1" -or
-        $workflow -notmatch "choco install innosetup --version=6\.7\.1" -or
+        $workflow -notmatch "INNO_NUPKG_SHA256: a0dad33db33099d9cd2b89ac2d08b5d70c589b15118ced3b95f469f044f99950" -or
+        $workflow -notmatch "INNO_INSTALLER_SHA256: 4d11e8050b6185e0d49bd9e8cc661a7a59f44959a621d31d11033124c4e8a7b0" -or
+        $workflow -match "choco install innosetup" -or
         $workflow -notmatch "-PortableZipPath dist\\Scribe-windows-x64\.zip" -or
         $workflow -match "-RuntimeSource" -or
         $workflow -match "Copy-Item target\\release\\local-transcriber\.exe") {
@@ -503,16 +592,53 @@ Set-StrictMode -Version Latest
         $workflow -notmatch '(?ms)^permissions:\s+contents: read') {
         throw "GitHub contents write permission must remain scoped to the release job."
     }
+    $usesLines = @($workflow -split "`r?`n" | Where-Object { $_ -match '^\s*uses:\s*' })
+    foreach ($usesLine in $usesLines) {
+        if ($usesLine -notmatch '^\s*uses:\s*[^@\s]+@[0-9a-f]{40}(?:\s+#.*)?$') {
+            throw "Every GitHub Action reference must use an immutable full commit SHA: $usesLine"
+        }
+    }
+    if ($workflow -notmatch 'dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e\s+# 1\.96\.0' -or
+        $workflow -notmatch '-ExerciseStableUpgrade') {
+        throw "Windows release workflow must pin Rust and exercise the compiled stable-upgrade contract."
+    }
     $installer = Get-Content -LiteralPath (Join-Path $repositoryRoot "installer\scribe.iss") -Raw
     if ($installer -notmatch 'Source: "\.\.\\dist\\portable\\\*"' -or
         $installer -notmatch "recursesubdirs" -or
         $installer -notmatch "createallsubdirs" -or
         $installer -notmatch '#define StableAppIdGuid "8E0F1935-8E3D-4B1D-9A42-7C7D7C3D5E7A"' -or
-        $installer -notmatch 'DefaultDirName=\{localappdata\}\\Programs\\Scribe' -or
+        $installer -notmatch 'DefaultDirName=\{code:ResolveDefaultDir\}' -or
+        $installer -notmatch '\{localappdata\}\\Programs\\Scribe' -or
         $installer -notmatch 'AppId=\{code:ResolveAppId\}' -or
         $installer -notmatch '\{param:SCRIBEVERIFY\|\}' -or
+        $installer -notmatch 'function PrepareToInstall' -or
+        $installer -notmatch 'function ValidateStableInstallTree' -or
+        $installer -notmatch 'FILE_ATTRIBUTE_REPARSE_POINT' -or
+        $installer -notmatch 'case-insensitive path collision' -or
+        $installer -notmatch 'Setup did not delete or change any existing content' -or
+        $installer -notmatch 'VerificationInstallDir\(Token\)' -or
+        $installer -notmatch 'WizardDirValue' -or
         $installer -match '(?m)^\[InstallDelete\]') {
-        throw "Windows installer must recursively install the validated portable payload."
+        throw "Windows installer must preflight and recursively install only the validated portable payload."
+    }
+    foreach ($existingAllowedPath in @($expectedPortablePayloadPaths) + @('unins000.exe', 'unins000.dat')) {
+        $innoPath = $existingAllowedPath.Replace('/', '\')
+        if (-not $installer.Contains("'$innoPath'")) {
+            throw "Windows installer existing-tree preflight is missing canonical path $existingAllowedPath."
+        }
+    }
+    foreach ($requiredVerifierContract in @(
+        '[switch]$ExerciseStableUpgrade',
+        'scribe-release-verification-$verificationToken',
+        'accepted an override outside its derived temporary destination',
+        'setCaseSensitiveInfo',
+        'Stable installer accepted a case-insensitive path collision',
+        'Stable installer accepted an unexpected legacy runtime tree',
+        'Stable installer deleted or mutated refused legacy content'
+    )) {
+        if (-not $verifierSource.Contains($requiredVerifierContract)) {
+            throw "Windows package verifier is missing compiled-installer contract: $requiredVerifierContract"
+        }
     }
 
     $verificationBundle = Join-Path $testRoot "verification-bundle"

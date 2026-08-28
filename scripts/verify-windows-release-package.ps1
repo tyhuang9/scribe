@@ -2,11 +2,14 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$BundlePath,
     [string]$PortableZipPath,
-    [string]$InstallerPath
+    [string]$InstallerPath,
+    [switch]$ExerciseStableUpgrade
 )
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
+
+. (Join-Path $PSScriptRoot "windows-pe-imports.ps1")
 
 $targetTriple = "x86_64-pc-windows-msvc"
 $expectedPeMachine = 0x8664
@@ -395,6 +398,7 @@ function Assert-Bundle {
     }
 
     Assert-Amd64GuiPe (Join-Path $root "local-transcriber.exe")
+    $null = Assert-ReviewedWindowsPe (Join-Path $root "local-transcriber.exe")
 }
 
 function Assert-PayloadParity([string]$ReferenceRoot, [string]$CandidateRoot, [string]$Description) {
@@ -496,7 +500,7 @@ function Remove-ValidatedTemporaryRoot([string]$Path) {
     $tempRoot = Get-NormalizedPath ([System.IO.Path]::GetTempPath())
     $resolved = Get-NormalizedPath $Path
     if (-not [string]::Equals((Split-Path -Parent $resolved), $tempRoot, [System.StringComparison]::OrdinalIgnoreCase) -or
-        (Split-Path -Leaf $resolved) -cnotmatch '^scribe-release-verification-[0-9]+-[0-9a-f]{32}$') {
+        (Split-Path -Leaf $resolved) -cnotmatch '^scribe-release-verification-[0-9a-f]{32}$') {
         throw "Refused release verification cleanup outside its bounded temporary directory."
     }
     Assert-NoReparseAncestors $resolved
@@ -511,10 +515,12 @@ $InnoSetupUninstallerArtifacts = @("unins000.exe", "unins000.dat")
 $bundle = Get-NormalizedPath $BundlePath
 $null = Assert-Bundle $bundle
 
-$temporaryRoot = Join-Path ([System.IO.Path]::GetTempPath()) "scribe-release-verification-$PID-$([guid]::NewGuid().ToString('N'))"
 $verificationToken = [guid]::NewGuid().ToString('N')
+$temporaryRoot = Join-Path ([System.IO.Path]::GetTempPath()) "scribe-release-verification-$verificationToken"
 $verificationAppId = "{8E0F1935-8E3D-4B1D-9A42-7C7D7C3D5E7A}.verification.$verificationToken"
 $verificationUninstaller = $null
+$stableAppId = "{8E0F1935-8E3D-4B1D-9A42-7C7D7C3D5E7A}"
+$stableUninstaller = $null
 Assert-NoReparseAncestors $temporaryRoot
 if (Test-VerificationUninstallRegistration $verificationAppId) {
     throw "Unique installer verification registration unexpectedly already exists."
@@ -534,13 +540,31 @@ try {
         $installer = Get-NormalizedPath $InstallerPath
         $null = Assert-RegularFile $installer
         $installedRoot = Join-Path $temporaryRoot "installed"
+        $escapedVerificationRoot = Join-Path $temporaryRoot "escaped"
+        $escapedProcess = Invoke-NativeProcess $installer @(
+            "/VERYSILENT",
+            "/SUPPRESSMSGBOXES",
+            "/NORESTART",
+            "/SP-",
+            "/NOICONS",
+            "/DIR=$escapedVerificationRoot",
+            "/SCRIBEVERIFY=$verificationToken"
+        )
+        if ($escapedProcess.ExitCode -eq 0) {
+            throw "Installer verification token accepted an override outside its derived temporary destination."
+        }
+        if (Test-Path -LiteralPath $escapedVerificationRoot) {
+            throw "Rejected installer verification destination was created or mutated."
+        }
+        if (Test-VerificationUninstallRegistration $verificationAppId) {
+            throw "Rejected installer verification destination created an uninstall registration."
+        }
         $installerProcess = Invoke-NativeProcess $installer @(
             "/VERYSILENT",
             "/SUPPRESSMSGBOXES",
             "/NORESTART",
             "/SP-",
             "/NOICONS",
-            "/DIR=$installedRoot",
             "/SCRIBEVERIFY=$verificationToken"
         )
         if ($installerProcess.ExitCode -ne 0) {
@@ -565,9 +589,104 @@ try {
         if (Test-VerificationUninstallRegistration $verificationAppId) {
             throw "Installer verification cleanup left its isolated uninstall registration behind."
         }
+
+        if ($ExerciseStableUpgrade) {
+            if (Test-VerificationUninstallRegistration $stableAppId) {
+                throw "Stable Scribe uninstall registration already exists; refusing the isolated stable-upgrade exercise."
+            }
+            $stableRoot = Join-Path $temporaryRoot "stable"
+            New-Item -ItemType Directory -Path $stableRoot | Out-Null
+            $fsutil = Join-Path $env:SystemRoot "System32\fsutil.exe"
+            $caseSensitiveProcess = Invoke-NativeProcess $fsutil @(
+                "file", "setCaseSensitiveInfo", $stableRoot, "enable"
+            )
+            if ($caseSensitiveProcess.ExitCode -ne 0) {
+                throw "Could not enable the isolated stable-upgrade case-collision fixture: $($caseSensitiveProcess.Stderr.Trim())"
+            }
+
+            $stableInstallArguments = @(
+                "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-", "/NOICONS", "/DIR=$stableRoot"
+            )
+            $stableInstall = Invoke-NativeProcess $installer $stableInstallArguments
+            if ($stableInstall.ExitCode -ne 0) {
+                throw "Initial isolated stable installation failed with exit code $($stableInstall.ExitCode): $($stableInstall.Stderr.Trim())"
+            }
+            if (-not (Test-VerificationUninstallRegistration $stableAppId)) {
+                throw "Initial isolated stable installation did not create the stable uninstall registration."
+            }
+            $stableUninstaller = Join-Path $stableRoot "unins000.exe"
+            $null = Assert-Bundle -Root $stableRoot -AllowedAdditionalFiles $InnoSetupUninstallerArtifacts
+            Assert-PayloadParity $bundle $stableRoot "Initial stable install"
+
+            $stableUpgrade = Invoke-NativeProcess $installer $stableInstallArguments
+            if ($stableUpgrade.ExitCode -ne 0) {
+                throw "Canonical stable upgrade failed with exit code $($stableUpgrade.ExitCode): $($stableUpgrade.Stderr.Trim())"
+            }
+            $null = Assert-Bundle -Root $stableRoot -AllowedAdditionalFiles $InnoSetupUninstallerArtifacts
+            Assert-PayloadParity $bundle $stableRoot "Stable upgrade"
+
+            $canonicalReadme = Join-Path $stableRoot "README.txt"
+            $caseCollision = Join-Path $stableRoot "readme.txt"
+            Copy-Item -LiteralPath $canonicalReadme -Destination $caseCollision
+            if (@(Get-ChildItem -LiteralPath $stableRoot -File | Where-Object { $_.Name -ieq "README.txt" }).Count -ne 2) {
+                throw "Could not create the isolated case-collision fixture."
+            }
+            $caseCollisionHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $caseCollision).Hash
+            $caseCollisionInstall = Invoke-NativeProcess $installer $stableInstallArguments
+            if ($caseCollisionInstall.ExitCode -eq 0) {
+                throw "Stable installer accepted a case-insensitive path collision."
+            }
+            if (-not (Test-Path -LiteralPath $caseCollision -PathType Leaf) -or
+                (Get-FileHash -Algorithm SHA256 -LiteralPath $caseCollision).Hash -cne $caseCollisionHash) {
+                throw "Stable installer mutated the refused case-collision fixture."
+            }
+            Remove-Item -LiteralPath $caseCollision
+
+            $legacyDirectory = Join-Path $stableRoot "runtimes"
+            New-Item -ItemType Directory -Path $legacyDirectory | Out-Null
+            $legacyFile = Join-Path $legacyDirectory "whisper.dll"
+            [System.IO.File]::WriteAllBytes($legacyFile, [byte[]](1, 3, 3, 7))
+            $legacyHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $legacyFile).Hash
+            $legacyInstall = Invoke-NativeProcess $installer $stableInstallArguments
+            if ($legacyInstall.ExitCode -eq 0) {
+                throw "Stable installer accepted an unexpected legacy runtime tree."
+            }
+            if (-not (Test-Path -LiteralPath $legacyFile -PathType Leaf) -or
+                (Get-FileHash -Algorithm SHA256 -LiteralPath $legacyFile).Hash -cne $legacyHash) {
+                throw "Stable installer deleted or mutated refused legacy content."
+            }
+
+            $stableUninstall = Invoke-NativeProcess $stableUninstaller @(
+                "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"
+            )
+            if ($stableUninstall.ExitCode -ne 0) {
+                throw "Stable-upgrade fixture cleanup failed with exit code $($stableUninstall.ExitCode): $($stableUninstall.Stderr.Trim())"
+            }
+            $stableUninstaller = $null
+            if (Test-VerificationUninstallRegistration $stableAppId) {
+                throw "Stable-upgrade fixture cleanup left the stable uninstall registration behind."
+            }
+            if (-not (Test-Path -LiteralPath $legacyFile -PathType Leaf) -or
+                (Get-FileHash -Algorithm SHA256 -LiteralPath $legacyFile).Hash -cne $legacyHash) {
+                throw "Stable uninstaller unexpectedly deleted or mutated refused legacy content."
+            }
+        }
     }
 }
 finally {
+    if ($null -ne $stableUninstaller -and (Test-Path -LiteralPath $stableUninstaller -PathType Leaf)) {
+        try {
+            $stableCleanup = Invoke-NativeProcess $stableUninstaller @(
+                "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"
+            )
+            if ($stableCleanup.ExitCode -ne 0) {
+                Write-Warning "Stable-upgrade fixture uninstaller cleanup returned exit $($stableCleanup.ExitCode)."
+            }
+        }
+        catch {
+            Write-Warning "Stable-upgrade fixture uninstaller cleanup failed: $($_.Exception.Message)"
+        }
+    }
     if ($null -ne $verificationUninstaller -and (Test-Path -LiteralPath $verificationUninstaller -PathType Leaf)) {
         try {
             $cleanupProcess = Invoke-NativeProcess $verificationUninstaller @(

@@ -32,7 +32,7 @@ jobs:
           & .\scripts\test-windows-release-packaging.ps1
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@1.96.0
+        uses: dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e # 1.96.0 branch reviewed 2026-08-27
         with:
           # The toolchain action installs only rustc and cargo unless requested.
           # Keep the CI formatting and linting tools available for this pinned Rust release.
@@ -87,14 +87,52 @@ jobs:
             -ModelSource .ci-release-inputs\model\whisper-base.en-Q8_0.gguf `
             -BundlePath dist\portable
 
-      - name: Install Inno Setup
+      - name: Acquire digest-pinned Inno Setup
         shell: pwsh
-        run: choco install innosetup --version=6.7.1 --no-progress --yes
+        env:
+          INNO_NUPKG_SHA256: a0dad33db33099d9cd2b89ac2d08b5d70c589b15118ced3b95f469f044f99950
+          INNO_NUPKG_SIZE: '10017031'
+          INNO_INSTALLER_SHA256: 4d11e8050b6185e0d49bd9e8cc661a7a59f44959a621d31d11033124c4e8a7b0
+          INNO_INSTALLER_SIZE: '10619024'
+        run: |
+          $packageRoot = Join-Path $env:GITHUB_WORKSPACE '.ci-tools\inno-package'
+          $installRoot = Join-Path $env:GITHUB_WORKSPACE '.ci-tools\inno-setup'
+          $packagePath = Join-Path $packageRoot 'InnoSetup.6.7.1.nupkg'
+          New-Item -ItemType Directory -Path $packageRoot | Out-Null
+          curl.exe --fail --location --retry 3 --retry-delay 2 `
+            --output $packagePath `
+            'https://community.chocolatey.org/api/v2/package/InnoSetup/6.7.1'
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to download InnoSetup.6.7.1.nupkg' }
+          $package = Get-Item -LiteralPath $packagePath
+          if ($package.Length -ne [int64]$env:INNO_NUPKG_SIZE) {
+            throw "Unexpected Inno Setup nupkg size: $($package.Length)"
+          }
+          $packageHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $packagePath).Hash.ToLowerInvariant()
+          if ($packageHash -cne $env:INNO_NUPKG_SHA256) {
+            throw "Unexpected Inno Setup nupkg SHA-256: $packageHash"
+          }
+          $expandedRoot = Join-Path $packageRoot 'expanded'
+          Expand-Archive -LiteralPath $packagePath -DestinationPath $expandedRoot
+          $installerPath = Join-Path $expandedRoot 'tools\innosetup-6.7.1.exe'
+          $installer = Get-Item -LiteralPath $installerPath
+          if ($installer.Length -ne [int64]$env:INNO_INSTALLER_SIZE) {
+            throw "Unexpected embedded Inno Setup installer size: $($installer.Length)"
+          }
+          $installerHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $installerPath).Hash.ToLowerInvariant()
+          if ($installerHash -cne $env:INNO_INSTALLER_SHA256) {
+            throw "Unexpected embedded Inno Setup installer SHA-256: $installerHash"
+          }
+          & $installerPath /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP- /NOICONS /CURRENTUSER "/DIR=$installRoot"
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup installation failed with exit code $LASTEXITCODE" }
+          $iscc = Join-Path $installRoot 'ISCC.exe'
+          $isccVersion = (Get-Item -LiteralPath $iscc).VersionInfo.ProductVersion
+          if ($isccVersion -notlike '6.7.1*') { throw "Expected Inno Setup 6.7.1; found $isccVersion" }
+          "INNO_ISCC=$iscc" >> $env:GITHUB_ENV
 
       - name: Build and normalize Windows installer
         shell: pwsh
         run: |
-          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          $iscc = $env:INNO_ISCC
           if (-not (Test-Path $iscc)) { throw "Inno Setup compiler not found at $iscc" }
           $isccVersion = (Get-Item -LiteralPath $iscc).VersionInfo.ProductVersion
           if ($isccVersion -notlike '6.7.1*') { throw "Expected Inno Setup 6.7.1; found $isccVersion" }
@@ -115,7 +153,8 @@ jobs:
           & .\scripts\verify-windows-release-package.ps1 `
             -BundlePath dist\portable `
             -PortableZipPath dist\Scribe-windows-x64.zip `
-            -InstallerPath dist\Scribe-Setup.exe
+            -InstallerPath dist\Scribe-Setup.exe `
+            -ExerciseStableUpgrade
 
       - name: Upload Windows release assets
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0

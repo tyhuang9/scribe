@@ -1223,6 +1223,8 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
         "cargo build --locked --offline --release --all-features --target $targetTriple",
         "x86_64-pc-windows-msvc",
         "CARGO_TARGET_DIR",
+        "[System.IO.Path]::IsPathFullyQualified($env:CARGO_TARGET_DIR)",
+        "Join-Path $repositoryRoot $env:CARGO_TARGET_DIR",
         r#"$cargoTargetRoot "$targetTriple\release""#,
         "Assert-Amd64Pe",
         "0x8664",
@@ -1233,6 +1235,7 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
         "bundle-inventory.json",
         "README.txt",
         "Assert-WindowsGuiSubsystem",
+        "Assert-ReviewedWindowsPe",
         "Windows GUI (2)",
         "Invoke-NativeProcess",
         "RedirectStandardOutput",
@@ -1250,7 +1253,10 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
         "licenses/Silero-VAD-MIT.txt",
         "licenses/Silero-VAD-PROVENANCE.md",
         "This release workflow does not claim Authenticode signing",
+        "setup refuses safely and does not delete or change that content",
         "Do not delete per-user app data or external/imported models as part of rollback",
+        "Assert-ReleaseSmokeDiagnostics",
+        r#"detected architecture 'whisper'"#,
     ] {
         assert!(
             release.contains(required),
@@ -1328,18 +1334,43 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
         "-PortableZipPath dist\\Scribe-windows-x64.zip",
         "actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09",
         "actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f",
+        "dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e",
+        "INNO_NUPKG_SHA256: a0dad33db33099d9cd2b89ac2d08b5d70c589b15118ced3b95f469f044f99950",
+        "INNO_INSTALLER_SHA256: 4d11e8050b6185e0d49bd9e8cc661a7a59f44959a621d31d11033124c4e8a7b0",
+        "-ExerciseStableUpgrade",
     ] {
         assert!(
             workflow.contains(required),
             "Windows release workflow must retain {required}"
         );
     }
-    for floating_action in ["actions/checkout@v5", "actions/upload-artifact@v6"] {
+    for uses_line in workflow
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("uses:"))
+    {
+        let reference = uses_line
+            .strip_prefix("uses:")
+            .expect("uses line prefix checked")
+            .split('#')
+            .next()
+            .expect("action reference must exist")
+            .trim();
+        let (_, revision) = reference
+            .rsplit_once('@')
+            .expect("GitHub Action reference must contain @");
         assert!(
-            !workflow.contains(floating_action),
-            "Windows release workflow must pin {floating_action} to a reviewed commit"
+            revision.len() == 40
+                && revision
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+            "GitHub Action reference must use a lowercase immutable full SHA: {uses_line}"
         );
     }
+    assert!(
+        !workflow.contains("choco install innosetup"),
+        "Inno Setup acquisition must not trust a mutable network-only Chocolatey install"
+    );
     assert!(
         !workflow.contains("Copy-Item target\\release\\local-transcriber.exe"),
         "Windows release workflow must not publish a bare executable"
@@ -1352,10 +1383,18 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
             && installer.contains("recursesubdirs")
             && installer.contains("createallsubdirs")
             && installer.contains("StableAppIdGuid \"8E0F1935-8E3D-4B1D-9A42-7C7D7C3D5E7A\"")
-            && installer.contains("DefaultDirName={localappdata}\\Programs\\Scribe")
+            && installer.contains("DefaultDirName={code:ResolveDefaultDir}")
+            && installer.contains("{localappdata}\\Programs\\Scribe")
             && installer.contains("AppId={code:ResolveAppId}")
-            && installer.contains("{param:SCRIBEVERIFY|}"),
-        "Windows installer must recursively copy the validated portable payload"
+            && installer.contains("{param:SCRIBEVERIFY|}")
+            && installer.contains("function PrepareToInstall")
+            && installer.contains("function ValidateStableInstallTree")
+            && installer.contains("FILE_ATTRIBUTE_REPARSE_POINT")
+            && installer.contains("case-insensitive path collision")
+            && installer.contains("Setup did not delete or change any existing content")
+            && installer.contains("VerificationInstallDir(Token)")
+            && installer.contains("WizardDirValue"),
+        "Windows installer must preflight and recursively copy only the validated portable payload"
     );
     assert!(
         !installer.contains("[InstallDelete]"),
@@ -1383,6 +1422,8 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
         "Out-of-bounds cleanup",
         "outside the explicit allowlist",
         "Cargo-target bundle path",
+        "repository-relative Cargo target",
+        "expected detected architecture 'whisper'",
         "Existing final bundle",
         "Stale staging refusal",
         "exact executable name",
@@ -1396,6 +1437,9 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
         "RUNTIMES/whisper/whisper.dll",
         "nested/model.ONNX",
         "python/runner.py",
+        "unreviewed normal import DLL: whisper.dll",
+        "unreviewed delay import DLL: onnxruntime.dll",
+        "setCaseSensitiveInfo",
     ] {
         assert!(
             packaging_tests.contains(required),
@@ -1423,11 +1467,37 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
         "/SCRIBEVERIFY=$verificationToken",
         "Remove-VerificationUninstallRegistration",
         "Assert-Amd64GuiPe",
+        "Assert-ReviewedWindowsPe",
+        "[switch]$ExerciseStableUpgrade",
+        "accepted an override outside its derived temporary destination",
+        "Stable installer accepted a case-insensitive path collision",
+        "Stable installer accepted an unexpected legacy runtime tree",
         "Bundle inventory paths differ from the canonical self-contained payload allowlist",
     ] {
         assert!(
             package_verifier.contains(required),
             "release payload verifier must retain {required}"
+        );
+    }
+
+    let pe_imports = fs::read_to_string(repository.join("scripts").join("windows-pe-imports.ps1"))
+        .expect("self-contained Windows PE import parser must be readable");
+    for required in [
+        "Read-PeImportDirectory",
+        r#"[ValidateSet("normal", "delay")]"#,
+        "normalDirectoryOffset",
+        "delayDirectoryOffset",
+        "Convert-PeRvaToFileOffset",
+        "Assert-ReviewedWindowsPe",
+        "unreviewed normal import DLL",
+        "unreviewed delay import DLL",
+        "api-ms-win-core-path-l1-1-0.dll",
+        "kernel32.dll",
+        "user32.dll",
+    ] {
+        assert!(
+            pe_imports.contains(required),
+            "self-contained Windows PE import parser must retain {required}"
         );
     }
 

@@ -7,6 +7,8 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
+. (Join-Path $PSScriptRoot "windows-pe-imports.ps1")
+
 $targetTriple = "x86_64-pc-windows-msvc"
 $expectedPeMachine = 0x8664
 $repositoryRoot = [System.IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
@@ -308,6 +310,27 @@ function Assert-ExactAllowlist([string]$Root, [string[]]$ExpectedPaths) {
     }
 }
 
+function Assert-ReleaseSmokeDiagnostics([psobject]$Smoke) {
+    if ($null -eq $Smoke) {
+        throw "Offline staged-bundle smoke diagnostics are missing."
+    }
+    $smokeProperties = @($Smoke.PSObject.Properties.Name)
+    foreach ($requiredProperty in @("cancellation_verified", "capabilities", "detected_architecture")) {
+        if ($requiredProperty -notin $smokeProperties) {
+            throw "Offline staged-bundle smoke diagnostics are missing '$requiredProperty'."
+        }
+    }
+    if ($null -eq $Smoke.capabilities -or "cancellation" -notin @($Smoke.capabilities.PSObject.Properties.Name)) {
+        throw "Offline staged-bundle smoke diagnostics are missing 'capabilities.cancellation'."
+    }
+    if (-not $Smoke.cancellation_verified -or -not $Smoke.capabilities.cancellation) {
+        throw "Offline staged-bundle smoke did not verify cancellation."
+    }
+    if ([string]$Smoke.detected_architecture -cne "whisper") {
+        throw "Offline staged-bundle smoke expected detected architecture 'whisper'; received '$($Smoke.detected_architecture)'."
+    }
+}
+
 if (-not [Environment]::Is64BitOperatingSystem -or
     [Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
     throw "The release bundle is qualified only for Windows x64."
@@ -349,7 +372,12 @@ $defaultCargoTargetRoot = Get-NormalizedFullPath (Join-Path $repositoryRoot "tar
 $cargoTargetRoot = if ([string]::IsNullOrWhiteSpace($env:CARGO_TARGET_DIR)) {
     $defaultCargoTargetRoot
 } else {
-    Get-NormalizedFullPath $env:CARGO_TARGET_DIR
+    $cargoTargetCandidate = if ([System.IO.Path]::IsPathFullyQualified($env:CARGO_TARGET_DIR)) {
+        $env:CARGO_TARGET_DIR
+    } else {
+        Join-Path $repositoryRoot $env:CARGO_TARGET_DIR
+    }
+    Get-NormalizedFullPath $cargoTargetCandidate
 }
 foreach ($protectedCargoTargetRoot in @($defaultCargoTargetRoot, $cargoTargetRoot)) {
     if ([string]::Equals($finalBundle, $protectedCargoTargetRoot, [System.StringComparison]::OrdinalIgnoreCase) -or
@@ -398,6 +426,7 @@ $cargoReleaseRoot = Join-Path $cargoTargetRoot "$targetTriple\release"
 $sourceExecutable = Join-Path $cargoReleaseRoot "local-transcriber.exe"
 Assert-Amd64Pe $sourceExecutable
 Assert-WindowsGuiSubsystem $sourceExecutable
+$null = Assert-ReviewedWindowsPe $sourceExecutable
 
 try {
     New-Item -ItemType Directory -Path $stagingBundle | Out-Null
@@ -442,6 +471,7 @@ try {
         "",
         "UPGRADES, USER DATA, AND ROLLBACK",
         "Installing, uninstalling, or replacing the portable program directory is not intended to delete Scribe app-data settings, history, downloaded receipt-backed ONNX bundles, or managed model receipts. Imported GGUF files and external sentinel files remain outside the packaged payload and must not be removed by an upgrade.",
+        "The installer checks an existing Scribe program directory before copying. If it contains an unexpected, legacy, case-colliding, or reparse-point entry, setup refuses safely and does not delete or change that content. You choose whether to back up the program directory, uninstall the previous version, or remove the unexpected entry before retrying.",
         "To roll back the installer, close Scribe, uninstall the current program payload, and install a previously verified installer. To roll back portable use, close Scribe and launch a previously verified complete portable folder. Do not delete per-user app data or external/imported models as part of rollback.",
         ""
     ) -join "`r`n"
@@ -462,6 +492,7 @@ try {
     }
     Assert-Amd64Pe $stagedExecutable
     Assert-WindowsGuiSubsystem $stagedExecutable
+    $null = Assert-ReviewedWindowsPe $stagedExecutable
     Assert-ExactFile $stagedModel ([int64]$modelManifest.size_bytes) $modelManifest.sha256
     $expectedPaths = [System.Collections.Generic.List[string]]::new()
     $null = $expectedPaths.Add("local-transcriber.exe")
@@ -504,21 +535,7 @@ try {
     catch {
         throw "Offline staged-bundle smoke returned invalid JSON: $($_.Exception.Message). Stderr: $($smokeProcess.Stderr.Trim())"
     }
-    $smokeProperties = @($smoke.PSObject.Properties.Name)
-    foreach ($requiredProperty in @("cancellation_verified", "capabilities", "detected_architecture")) {
-        if ($requiredProperty -notin $smokeProperties) {
-            throw "Offline staged-bundle smoke diagnostics are missing '$requiredProperty'."
-        }
-    }
-    if ($null -eq $smoke.capabilities -or "cancellation" -notin @($smoke.capabilities.PSObject.Properties.Name)) {
-        throw "Offline staged-bundle smoke diagnostics are missing 'capabilities.cancellation'."
-    }
-    if (-not $smoke.cancellation_verified -or -not $smoke.capabilities.cancellation) {
-        throw "Offline staged-bundle smoke did not verify cancellation."
-    }
-    if ([string]::IsNullOrWhiteSpace([string]$smoke.detected_architecture)) {
-        throw "Offline staged-bundle smoke did not report the detected model architecture."
-    }
+    Assert-ReleaseSmokeDiagnostics $smoke
 
     $inventoryEntries = @($expectedPaths.ToArray() | Sort-Object | ForEach-Object {
         $path = Join-Path $stagingBundle ($_ -replace '/', '\')
