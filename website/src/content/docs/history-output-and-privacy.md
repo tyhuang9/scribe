@@ -17,6 +17,11 @@ The History page supports search, pagination, copy, Windows-safe Paste again, pi
 
 ## Local-first boundary
 
-Scribe has no cloud speech-to-text service, user accounts, synchronization, or plugin system. The normal GGUF path is in-process and has no Python or localhost server. Private legacy process adapters remain for configuration/artifact migration and are not selectable through the normal UI. Settings, history, and managed model metadata stay in platform-specific local app-data locations.
+Scribe has no cloud speech-to-text service, user accounts, synchronization, or
+plugin system. Normal GGUF and receipt-backed ONNX inference run in a private
+persistent local child process, with no Python or localhost server. VAD uses a
+separate local process path. Legacy user configuration and artifact files stay
+preserved but are no longer recognized or executed. Settings, history, and
+managed model metadata stay in platform-specific local app-data locations.
 
 Normal capture creates no temporary WAV. Retained audio exists only when you select **Transcript + audio**. Review text before copying or pasting it into another app: that destination may have its own storage and privacy policy.

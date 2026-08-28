@@ -1,9 +1,12 @@
 # TODO
 
-Phase 11 implementation gates discovered 623 tests: 614 passed, 0 failed, and 9
-explicit local-runtime/fixture tests were ignored. The remaining items below are
-release evidence or follow-up improvements; see
-`docs/SCRIBE_REVAMP_IMPLEMENTATION_REPORT.md` for the final NO-GO rationale.
+> **Historical test snapshot:** The Phase 11 count below—623 discovered, 614
+> passed, 0 failed, 9 ignored—was recorded on 2026-08-05. It is not a current
+> rebaseline. Current implementation truth is maintained in
+> `docs/TECHNICAL_OVERVIEW.md`; live qualification remains in
+> `docs/MANUAL_TEST_MATRIX.md`.
+
+The remaining items below are release evidence or follow-up improvements.
 
 ## Release Evidence
 
@@ -12,8 +15,8 @@ release evidence or follow-up improvements; see
   history, multi-monitor/DPI, and standard/elevated targets.
 - Capture comparable desktop median/p95 latency, RTF, memory, and idle-CPU
   measurements on the same machine, fixture, model, and resolved backend.
-- Run conservative build/fallback checks on macOS and Linux; normalized runtime
-  install remains unavailable until each platform has a pinned measured package.
+- Run conservative build checks on macOS and Linux. Their desktop/model
+  combinations remain unqualified.
 
 ## MVP Hardening
 
@@ -26,14 +29,10 @@ release evidence or follow-up improvements; see
 ## Compatibility
 
 - Run the complete load/fixture/cancel/unload/reload/acceleration/platform suite
-  before promoting any of the four Whisper artifacts from Experimental.
-- Evaluate the exact sherpa-onnx v1.13.4 Zipformer candidate only with the named
-  native package, shared corpus, WER, memory, cancellation, lifecycle, and
-  Windows first-partial thresholds. Keep `OnnxSpeechRuntime` absent on NO-GO.
-- Remove the preserved private faster-whisper, Vosk, and
-  sherpa/Moonshine/Parakeet compatibility adapters only after intended roles
-  have verified replacements. Keep release packaging and normalized UI isolated
-  from them; preserve config aliases and user artifacts.
+  before promoting any of the five normal catalog models from Experimental.
+- Preserve legacy user configuration and artifact files without recognizing or
+  executing them in production. Do not represent their presence as a supported
+  runtime path or assume an installer removes them.
 
 ## Streaming And Voice UX
 
@@ -44,8 +43,8 @@ release evidence or follow-up improvements; see
 
 ## Model Management
 
-- Publish the pinned Windows runtime archive through the release pipeline and
-  exercise real network interruption/resume and power-loss recovery.
+- Exercise real network interruption/resume and power-loss recovery for both
+  pinned GGUF artifacts and the receipt-backed ONNX bundle.
 - Add local model inventory scanning for safely adopting exact verified files.
 - Add disk usage reporting.
 - Add per-model benchmark history for latency and accuracy notes.
