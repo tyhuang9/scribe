@@ -636,6 +636,8 @@ pub(crate) struct RemoteCatalogVariantView {
     pub total_bytes: Option<u64>,
     /// The installer-reported failure retained for the model-card error alert.
     pub error_message: Option<String>,
+    /// True after transfer completion when verification and activation are no longer cancellable.
+    pub finalizing: bool,
     pub size_tier: ModelSizeTier,
     pub speed_tier: ModelSpeedTier,
     pub accuracy_guidance: String,

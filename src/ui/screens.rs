@@ -2587,7 +2587,13 @@ fn model_lifecycle_presentation<'a>(
                     (!model.install_supported)
                         .then_some("This model has no supported managed download in this build.")
                 }),
-                visible_status: receipt_needs_repair.then(|| "Needs repair".to_owned()),
+                visible_status: if model.download_state == ModelDownloadState::Failed
+                    && model.partial_cleanup_available
+                {
+                    Some("Download failed — Resume to retry or discard the partial.".to_owned())
+                } else {
+                    receipt_needs_repair.then(|| "Needs repair".to_owned())
+                },
                 compact_size: model
                     .total_bytes
                     .map(format_compact_artifact_size)
@@ -2601,6 +2607,21 @@ fn model_lifecycle_presentation<'a>(
         }
         ModelCard::Remote(entry, variant) => {
             let variant_name = remote_variant_accessible_name(entry, variant);
+            if variant.finalizing {
+                return ModelLifecyclePresentation {
+                    action: ScreenAction::None,
+                    icon: Icon::Spinner,
+                    label: "Installing…".into(),
+                    accessible_name: format!("Installing {variant_name}"),
+                    enabled: false,
+                    disabled_reason: Some(
+                        "Scribe is verifying and activating the model and cannot cancel this step.",
+                    ),
+                    visible_status: Some("Verifying and activating".to_owned()),
+                    compact_size: None,
+                    tone: ModelLifecycleTone::Standard,
+                };
+            }
             let remote = variant
                 .actions
                 .iter()
@@ -2652,11 +2673,13 @@ fn model_lifecycle_presentation<'a>(
                 ),
                 enabled: remote.is_some_and(|action| action.enabled),
                 disabled_reason: remote.and_then(|action| action.disabled_reason.as_deref()),
-                visible_status: remote_download_activity_visible_status(variant).or_else(|| {
-                    cancel_waiting
-                        .then(|| variant.status_label.clone())
-                        .flatten()
-                }),
+                visible_status: remote_download_activity_visible_status(variant)
+                    .or_else(|| model_download_failure_recovery_status(card))
+                    .or_else(|| {
+                        cancel_waiting
+                            .then(|| variant.status_label.clone())
+                            .flatten()
+                    }),
                 compact_size: (label == "Install")
                     .then(|| format_compact_artifact_size(variant.size_bytes)),
                 tone: match label {
@@ -2678,20 +2701,20 @@ fn model_lifecycle_controls<'a>(
         ModelCard::Local(model)
             if matches!(
                 model.download_state,
-                ModelDownloadState::Downloading
-                    | ModelDownloadState::Stalled
-                    | ModelDownloadState::Retrying { .. }
-            ) || (matches!(
-                model.download_state,
                 ModelDownloadState::Cancelled
                     | ModelDownloadState::Failed
                     | ModelDownloadState::Paused
                     | ModelDownloadState::PartialRetained
-            ) && model.partial_cleanup_available) =>
+            ) && model.partial_cleanup_available =>
         {
             Some(ScreenAction::DiscardModelPartial(model.id.clone()))
         }
-        ModelCard::Remote(_, variant) => {
+        ModelCard::Remote(_, variant)
+            if !variant
+                .actions
+                .iter()
+                .any(|action| matches!(action.kind, RemoteCatalogActionKind::Cancel { .. })) =>
+        {
             variant
                 .actions
                 .iter()
@@ -3402,6 +3425,19 @@ fn model_toolbar(
     }
 }
 
+fn model_lifecycle_button_width(ui: &egui::Ui, label: &str, tone: ModelLifecycleTone) -> f32 {
+    let text = match tone {
+        ModelLifecycleTone::DestructiveOutline => format!("{}  {label}", icon_glyph(Icon::Trash)),
+        _ => label.to_owned(),
+    };
+    let galley = ui.painter().layout_no_wrap(
+        text,
+        egui::TextStyle::Button.resolve(ui.style()),
+        ui_palette(ui).text,
+    );
+    (galley.size().x + 24.0).max(44.0)
+}
+
 fn model_lifecycle_button(
     ui: &mut egui::Ui,
     label: &str,
@@ -3515,8 +3551,20 @@ fn render_model_download_module(
     let mut discard_clicked = false;
     let mut discard_has_focus = false;
     let available_width = ui.available_width();
-    let control_count = if discard_name.is_some() { 2.0 } else { 1.0 };
-    let controls_width = 44.0 * control_count + ui.spacing().item_spacing.x * (control_count - 1.0);
+    let discard_width = discard_name.map_or(0.0, |_| {
+        model_lifecycle_button_width(
+            ui,
+            "Discard partial",
+            ModelLifecycleTone::DestructiveOutline,
+        )
+    });
+    let controls_width = 44.0
+        + discard_width
+        + if discard_name.is_some() {
+            ui.spacing().item_spacing.x
+        } else {
+            0.0
+        };
     const MIN_TRACK_WIDTH: f32 = 44.0;
     let track_and_controls_fit =
         available_width >= controls_width + ui.spacing().item_spacing.x + MIN_TRACK_WIDTH;
@@ -3586,13 +3634,13 @@ fn render_model_download_module(
                     cancel_clicked = cancel.clicked();
                     cancel_has_focus = cancel.has_focus();
                     if let Some(discard_name) = discard_name {
-                        let discard = compact_model_icon_action(
+                        let discard = model_lifecycle_button(
                             ui,
-                            Icon::Close,
+                            "Discard partial",
                             discard_name,
                             true,
                             None,
-                            None,
+                            ModelLifecycleTone::DestructiveOutline,
                         );
                         discard_clicked = discard.clicked();
                         discard_has_focus = discard.has_focus();
@@ -4100,15 +4148,23 @@ fn render_unified_model_card(
                 activation_exclusions.push(render_model_features(ui, card, feature_width).rect);
             });
             ui.horizontal(|ui| {
-                activation_exclusions.push(
-                    render_lifecycle(
-                        ui,
-                        &mut action,
-                        &mut restored_remove_focus,
-                        &mut focus_within,
+                let lifecycle_width =
+                    (ui.available_width() - 44.0 - ui.spacing().item_spacing.x).max(0.0);
+                let lifecycle = ui
+                    .allocate_ui_with_layout(
+                        Vec2::new(lifecycle_width, 0.0),
+                        Layout::top_down(Align::Min),
+                        |ui| {
+                            render_lifecycle(
+                                ui,
+                                &mut action,
+                                &mut restored_remove_focus,
+                                &mut focus_within,
+                            )
+                        },
                     )
-                    .rect,
-                );
+                    .inner;
+                activation_exclusions.push(lifecycle.rect);
                 activation_exclusions.push(render_details(ui, &mut action, &mut focus_within).rect);
             });
             render_collapsed_remote_provenance(ui);
@@ -5630,6 +5686,23 @@ fn model_download_semantic_status(card: ModelCard<'_>) -> Option<String> {
     match card {
         ModelCard::Local(model) => model_download_activity_visible_status(model.download_state),
         ModelCard::Remote(_, variant) => remote_download_activity_visible_status(variant),
+    }
+}
+
+fn model_download_failure_recovery_status(card: ModelCard<'_>) -> Option<String> {
+    match card {
+        ModelCard::Local(model)
+            if model.download_state == ModelDownloadState::Failed
+                && model.partial_cleanup_available =>
+        {
+            Some("Download failed — Resume to retry or discard the partial.".to_owned())
+        }
+        ModelCard::Remote(_, variant)
+            if variant.error_message.is_some() && remote_has_retained_partial(variant) =>
+        {
+            Some("Download failed — Resume to retry or discard the partial.".to_owned())
+        }
+        _ => None,
     }
 }
 
@@ -9343,11 +9416,6 @@ mod tests {
                 "Pause Geometry download download",
                 egui::accesskit::Role::Button,
             );
-            let discard = named_role_bounds(
-                &output,
-                "Discard partial for Geometry download",
-                egui::accesskit::Role::Button,
-            );
             assert_eq!(lifecycle.height(), f64::from(MODEL_CARD_SUMMARY_HEIGHT));
             assert_eq!(body.height(), f64::from(MODEL_CARD_SUMMARY_HEIGHT));
             assert_eq!(rail.width(), 44.0);
@@ -9358,18 +9426,14 @@ mod tests {
                 "the stable byte label must stay above the track: label={label:?} track={track:?}"
             );
             assert!(
-                label.y1 <= pause.y0 && label.y1 <= discard.y0,
-                "the stable byte label must stay above its controls: label={label:?} pause={pause:?} discard={discard:?}"
+                label.y1 <= pause.y0,
+                "the stable byte label must stay above Pause: label={label:?} pause={pause:?}"
             );
             assert!(
                 track.y0 < pause.y1 && pause.y0 < track.y1,
                 "Pause must share the desktop track row: track={track:?} pause={pause:?}"
             );
-            assert!(
-                track.y0 < discard.y1 && discard.y0 < track.y1,
-                "Discard must share the desktop track row: track={track:?} discard={discard:?}"
-            );
-            let module_bottom = track.y1.max(pause.y1).max(discard.y1);
+            let module_bottom = track.y1.max(pause.y1);
             let module_center = (label.y0 + module_bottom) / 2.0;
             let lifecycle_center = (lifecycle.y0 + lifecycle.y1) / 2.0;
             assert!(
@@ -9382,8 +9446,14 @@ mod tests {
                 "track={track:?} pause={pause:?}"
             );
             assert!(
-                pause.x1 <= discard.x0 + 0.1,
-                "pause={pause:?} discard={discard:?}"
+                !output
+                    .platform_output
+                    .accesskit_update
+                    .as_ref()
+                    .is_some_and(|update| update.nodes.iter().any(|(_, node)| {
+                        node.name() == Some("Discard partial for Geometry download")
+                    })),
+                "active transfers must only expose Pause"
             );
         }
     }
@@ -9457,7 +9527,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_download_card_keeps_track_and_controls_on_one_row_at_375px() {
+    fn compact_active_download_card_keeps_pause_without_discard_at_375px() {
         let model = ModelViewModel {
             id: "compact-download".into(),
             display_name: "Compact download".into(),
@@ -9476,27 +9546,23 @@ mod tests {
             "Pause Compact download download",
             egui::accesskit::Role::Button,
         );
-        let discard = named_role_bounds(
-            &output,
-            "Discard partial for Compact download",
-            egui::accesskit::Role::Button,
-        );
         assert!(label.y1 <= track.y0, "label={label:?} track={track:?}");
         assert!(
             track.y0 < pause.y1 && pause.y0 < track.y1,
             "pause={pause:?} track={track:?}"
         );
         assert!(
-            track.y0 < discard.y1 && discard.y0 < track.y1,
-            "discard={discard:?} track={track:?}"
-        );
-        assert!(
             track.x1 <= pause.x0 + 0.1,
             "track={track:?} pause={pause:?}"
         );
         assert!(
-            pause.x1 <= discard.x0 + 0.1,
-            "pause={pause:?} discard={discard:?}"
+            !output
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .is_some_and(|update| update.nodes.iter().any(|(_, node)| {
+                    node.name() == Some("Discard partial for Compact download")
+                }))
         );
     }
 
@@ -9541,11 +9607,6 @@ mod tests {
                         "Pause Stable byte slot download",
                         egui::accesskit::Role::Button,
                     ),
-                    named_role_bounds(
-                        output,
-                        "Discard partial for Stable byte slot",
-                        egui::accesskit::Role::Button,
-                    ),
                 )
             };
             let early_layout = layout(&early_output, &early_progress);
@@ -9553,7 +9614,6 @@ mod tests {
             assert_eq!(early_layout.0, late_layout.0, "label slot at {width}px");
             assert_eq!(early_layout.1, late_layout.1, "track slot at {width}px");
             assert_eq!(early_layout.2, late_layout.2, "Pause slot at {width}px");
-            assert_eq!(early_layout.3, late_layout.3, "Discard slot at {width}px");
         }
     }
 
@@ -9614,7 +9674,7 @@ mod tests {
             assert!(
                 model_lifecycle_controls(ModelCard::Local(&model), true)
                     .discard
-                    .is_some()
+                    .is_none()
             );
         }
 
@@ -9659,6 +9719,12 @@ mod tests {
         assert_eq!(
             controls.error_accessible_name.as_deref(),
             Some("Show download error for Failed retained download")
+        );
+        assert_eq!(
+            model_lifecycle_presentation(ModelCard::Local(&failed), true)
+                .visible_status
+                .as_deref(),
+            Some("Download failed — Resume to retry or discard the partial.")
         );
         let failed_output = render_model_card_at(&failed, 375.0, 680.0, Vec::new());
         for name in [
@@ -9810,13 +9876,17 @@ mod tests {
             "Pause Compact retry download",
             egui::accesskit::Role::Button,
         );
-        let discard = named_role_bounds(
-            &output,
-            "Discard partial for Compact retry",
-            egui::accesskit::Role::Button,
+        assert!(pause.width() >= 44.0 && pause.x1 <= 375.0);
+        assert!(
+            !output
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .is_some_and(|update| update
+                    .nodes
+                    .iter()
+                    .any(|(_, node)| { node.name() == Some("Discard partial for Compact retry") }))
         );
-        assert!(pause.width() >= 44.0 && discard.width() >= 44.0);
-        assert!(pause.x1 <= discard.x0 + 0.1);
 
         let entry = RemoteCatalogEntryView {
             id: "remote".into(),
@@ -9876,6 +9946,43 @@ mod tests {
     }
 
     #[test]
+    fn local_and_remote_finalizing_share_disabled_non_cancellation_presentation() {
+        let local = ModelViewModel {
+            id: "finalizing-local".into(),
+            display_name: "Finalizing local".into(),
+            download_state: ModelDownloadState::Verifying,
+            ..Default::default()
+        };
+        let entry = RemoteCatalogEntryView {
+            id: "finalizing-remote".into(),
+            display_name: "Finalizing remote".into(),
+            ..Default::default()
+        };
+        let variant = RemoteCatalogVariantView {
+            id: "finalizing-q5".into(),
+            filename: "finalizing-q5.gguf".into(),
+            status_label: Some("Verifying and activating".into()),
+            finalizing: true,
+            ..Default::default()
+        };
+        for lifecycle in [
+            model_lifecycle_presentation(ModelCard::Local(&local), true),
+            model_lifecycle_presentation(ModelCard::Remote(&entry, &variant), true),
+        ] {
+            assert_eq!(lifecycle.action, ScreenAction::None);
+            assert_eq!(lifecycle.label, "Installing…");
+            assert!(!lifecycle.enabled);
+            assert_eq!(lifecycle.icon, Icon::Spinner);
+        }
+        assert_eq!(
+            model_lifecycle_presentation(ModelCard::Remote(&entry, &variant), true)
+                .visible_status
+                .as_deref(),
+            Some("Verifying and activating")
+        );
+    }
+
+    #[test]
     fn remote_retained_states_keep_resume_discard_and_error_controls_at_375px() {
         let entry = RemoteCatalogEntryView {
             id: "remote-retained".into(),
@@ -9927,9 +10034,19 @@ mod tests {
             ] {
                 let bounds = named_role_bounds(&output, &name, egui::accesskit::Role::Button);
                 assert!(bounds.width() >= 44.0 && bounds.height() >= 44.0, "{name}");
-                assert!(bounds.x0 >= 0.0 && bounds.x1 <= 375.0, "{name}");
+                assert!(bounds.x0 >= 0.0 && bounds.x1 <= 375.0, "{name}: {bounds:?}");
             }
             if let Some(error) = error_message {
+                assert!(
+                    output
+                        .platform_output
+                        .accesskit_update
+                        .as_ref()
+                        .is_some_and(|update| update.nodes.iter().any(|(_, node)| {
+                            node.name()
+                                == Some("Download failed — Resume to retry or discard the partial.")
+                        }))
+                );
                 let error_name = format!("Show download error for {remote_name}");
                 let warning = output
                     .platform_output

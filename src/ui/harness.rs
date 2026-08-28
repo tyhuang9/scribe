@@ -3246,31 +3246,28 @@ mod tests {
         for (fixture, expected_controls) in [
             (
                 Fixture::ModelsDownloadDownloading,
-                [
-                    "Pause Whisper Parakeet download",
-                    "Discard partial for Whisper Parakeet",
-                ],
+                &["Pause Whisper Parakeet download"][..],
             ),
             (
                 Fixture::ModelsDownloadRetained,
-                [
+                &[
                     "Resume Whisper Moonshine download",
                     "Discard partial for Whisper Moonshine",
-                ],
+                ][..],
             ),
             (
                 Fixture::ModelsDownloadFailedPartial,
-                [
+                &[
                     "Resume Whisper Medium retained download",
                     "Discard partial for Whisper Medium retained",
-                ],
+                ][..],
             ),
             (
                 Fixture::ModelsDownloadFailedAlert,
-                [
+                &[
                     "Install Whisper Medium",
                     "Show download error for Whisper Medium",
-                ],
+                ][..],
             ),
         ] {
             for (width, height) in [(1180.0, 815.0), (960.0, 680.0)] {
@@ -5760,17 +5757,11 @@ mod tests {
             ScreenAction::CancelModelInstall("progress".into()),
             "Pause must retain the partial and win over the selectable card target",
         );
-        assert_eq!(
-            click_named_control(
-                &ctx,
-                &mut data,
-                &mut page,
-                1180.0,
-                815.0,
-                "Discard partial for Progress",
-            ),
-            ScreenAction::DiscardModelPartial("progress".into()),
-            "X must request the exact partial cleanup without selecting the card",
+        assert!(
+            !node_names(&output)
+                .iter()
+                .any(|name| name == "Discard partial for Progress"),
+            "active transfers must expose Pause without destructive partial cleanup",
         );
 
         data.models[0].downloaded_bytes = 42;
@@ -6854,7 +6845,18 @@ mod tests {
                 .iter()
                 .any(|name| name == "Resume Whisper Moonshine download")
         );
-        let discard = named_node_id(&initial, "Discard partial for Whisper Moonshine");
+        let discard_name = "Discard partial for Whisper Moonshine";
+        let discard_bounds = named_node_bounds(&initial, discard_name);
+        assert!(
+            discard_bounds.width() >= 44.0 && discard_bounds.height() >= 44.0,
+            "the explicitly named destructive control remains pointer reachable"
+        );
+        assert_eq!(
+            click_named_control(&ctx, &mut data, &mut page, 1180.0, 815.0, discard_name),
+            ScreenAction::DiscardModelPartial("moonshine.base".into()),
+            "the named destructive control dispatches partial cleanup without selecting the card",
+        );
+        let discard = named_node_id(&initial, discard_name);
         let (_, action) = render_with_input(
             &ctx,
             &mut data,
@@ -6911,7 +6913,7 @@ mod tests {
         });
         assert!(
             !discard.is_disabled(),
-            "the always-available X delegates safety checks to the app mutation barrier"
+            "the always-available destructive control delegates safety checks to the app mutation barrier"
         );
 
         let mut remote = Fixture::ModelsInstalled.data();
@@ -6938,6 +6940,14 @@ mod tests {
         let discard = named_node_id(
             &initial,
             "Discard partial for Compact English (compact-english-q5.gguf)",
+        );
+        let discard_bounds = named_node_bounds(
+            &initial,
+            "Discard partial for Compact English (compact-english-q5.gguf)",
+        );
+        assert!(
+            discard_bounds.width() >= 44.0 && discard_bounds.height() >= 44.0,
+            "the remote destructive control remains keyboard reachable",
         );
         let (_, action) = render_with_input(
             &ctx,

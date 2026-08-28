@@ -11512,7 +11512,8 @@ impl LocalTranscriberApp {
                         status,
                         ModelInstallStatus::Downloading { .. }
                             | ModelInstallStatus::InstallingRuntime
-                    ) {
+                    ) && install_phase != Some(ArtifactInstallPhase::Finalizing)
+                    {
                         actions.push(RemoteCatalogActionView {
                             label: "Cancel".to_owned(),
                             kind: RemoteCatalogActionKind::Cancel {
@@ -11600,6 +11601,7 @@ impl LocalTranscriberApp {
                     downloaded_bytes,
                     total_bytes,
                     error_message,
+                    finalizing: install_phase == Some(ArtifactInstallPhase::Finalizing),
                     size_tier: size_tier_for_bytes(variant.size_bytes),
                     speed_tier: descriptor
                         .as_ref()
