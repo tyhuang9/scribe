@@ -3118,7 +3118,7 @@ mod tests {
         let service = TranscriptionService::new(AppConfig::default());
         let descriptors = service.model_descriptors();
 
-        assert_eq!(descriptors.len(), 6);
+        assert_eq!(descriptors.len(), 7);
         assert!(
             descriptors
                 .iter()
@@ -3128,6 +3128,11 @@ mod tests {
             descriptors
                 .iter()
                 .any(|descriptor| descriptor.id.as_str() == "moonshine-base-en-int8-onnx")
+        );
+        assert!(
+            descriptors
+                .iter()
+                .any(|descriptor| descriptor.id.as_str() == "parakeet-tdt-06b-v2-en-int8-onnx")
         );
         for descriptor in descriptors {
             assert!(matches!(
