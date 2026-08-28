@@ -1417,6 +1417,7 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
             && installer.contains("function QueryExistingAttributes")
             && installer.contains("function BindDirectory")
             && installer.contains("function BindFileForUpdate")
+            && installer.contains("function IsInnoUninstallerArtifact")
             && installer.contains("FindFirstFileW")
             && installer.contains("FindNextFileW")
             && installer.contains("FindFirstStreamW")
@@ -1464,12 +1465,30 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
         .map(|offset| directory_probe_end + offset)
         .expect("installer ancestor validator must follow file identity binding");
     let file_probe_source = &installer[directory_probe_end..file_probe_end];
+    let uninstaller_artifact_start = installer
+        .find("function IsInnoUninstallerArtifact")
+        .expect("installer uninstaller artifact predicate must exist");
+    let uninstaller_artifact_end = installer[uninstaller_artifact_start..]
+        .find("function QueryExistingAttributes")
+        .map(|offset| uninstaller_artifact_start + offset)
+        .expect("installer attribute helper must follow uninstaller artifact predicate");
+    let uninstaller_artifact_source =
+        &installer[uninstaller_artifact_start..uninstaller_artifact_end];
     assert!(
-        !file_probe_source.contains("FileShareDelete")
-            && file_probe_source.contains("RetainBoundHandle(IdentityHandle")
-            && file_probe_source.contains("RejectAlternateStreams(Path, False")
-            && file_probe_source.contains("GenericRead or GenericWrite"),
-        "installer must identity-bind each allowed file, reject ADS, and prove update access"
+        installer.contains("FileShareDelete = $00000004")
+            && uninstaller_artifact_source.contains("SameStr(RelativePath, 'unins000.exe')")
+            && uninstaller_artifact_source.contains("SameStr(RelativePath, 'unins000.dat')")
+            && uninstaller_artifact_source
+                .matches("SameStr(RelativePath,")
+                .count()
+                == 2
+            && file_probe_source.contains("AllowDeleteSharing: Boolean")
+            && file_probe_source.contains("ShareMode := FileShareRead or FileShareWrite")
+            && file_probe_source.contains("if AllowDeleteSharing then")
+            && file_probe_source.contains("ShareMode := ShareMode or FileShareDelete")
+            && file_probe_source.contains("Path, 0, ShareMode, 0, OpenExisting")
+            && file_probe_source.contains("Path, GenericRead or GenericWrite, ShareMode"),
+        "installer may permit delete sharing only for the exact Inno uninstaller pair"
     );
     let inspect_start = installer
         .find("function InspectExistingTree")
@@ -1479,6 +1498,13 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
         .map(|offset| inspect_start + offset)
         .expect("stable tree validator must follow tree inspector");
     let inspect_source = &installer[inspect_start..inspect_end];
+    assert!(
+        inspect_source.contains("BindFileForUpdate(\n            ChildPath, IsInnoUninstallerArtifact(RelativePath), ErrorText)")
+            && file_probe_source.contains("RetainBoundHandle(IdentityHandle")
+            && file_probe_source.contains("RejectAlternateStreams(Path, False")
+            && file_probe_source.contains("GenericRead or GenericWrite"),
+        "installer must retain delete-denying payload identity handles while validating the Inno metadata exception by relative path"
+    );
     let first_probe = inspect_source
         .find("BindDirectory(")
         .expect("installer enumeration must first bind directory identity");
