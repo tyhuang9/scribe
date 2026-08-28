@@ -13,7 +13,6 @@ use sha2::{Digest, Sha256};
 use crate::model_catalog::BUNDLED_BASE_MODEL_ID;
 use crate::model_catalog::runtime_model_manifest;
 use crate::models::{ModelArtifactOrigin, ModelInstallStatus, SttModelInfo, default_model_catalog};
-use crate::runtime_catalog;
 #[cfg(test)]
 use crate::transcription::AccelerationPreference;
 use crate::transcription::ModelId;
@@ -21,13 +20,12 @@ use crate::transcription::ModelId;
 #[path = "settings/mod.rs"]
 pub mod settings;
 
-#[allow(unused_imports)]
 pub use settings::{
-    AppConfig, CURRENT_SCHEMA_VERSION, DEFAULT_INPUT_THRESHOLD_DBFS, DeveloperSettings,
-    GeneralSettings, HistoryMode, HistorySettings, OutputSettings, OverlayMode, OverlayPosition,
-    OverlaySettings, PerformanceSettings, RecordingSettings, SettingsStore, SpeechDetectionMode,
-    StreamingMode, StreamingSettings,
+    AppConfig, CURRENT_SCHEMA_VERSION, HistoryMode, OverlayMode, OverlayPosition, SettingsStore,
+    SpeechDetectionMode, StreamingMode,
 };
+#[cfg(test)]
+pub use settings::{GeneralSettings, RecordingSettings};
 
 pub const MAX_RECORDING_SECONDS: u32 = 600;
 pub(crate) const RECORDING_CAPTURE_SAFETY_ALLOWANCE_SECONDS: u32 = 2;
@@ -36,23 +34,6 @@ pub const MAX_HISTORY_RETENTION_DAYS: u32 = 3_650;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct ManagedModelInstall {
-    pub path: PathBuf,
-    #[serde(default)]
-    pub source: Option<String>,
-    #[serde(default)]
-    pub version: Option<String>,
-    #[serde(default)]
-    pub sha256: Option<String>,
-    #[serde(default)]
-    pub platform: Option<String>,
-    #[serde(default)]
-    pub installed_at_unix_seconds: Option<u64>,
-    #[serde(flatten)]
-    pub unknown: BTreeMap<String, Value>,
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
-pub struct ManagedRuntimeInstall {
     pub path: PathBuf,
     #[serde(default)]
     pub source: Option<String>,
@@ -205,53 +186,7 @@ impl<'de> Deserialize<'de> for ManagedModelInstall {
     }
 }
 
-impl<'de> Deserialize<'de> for ManagedRuntimeInstall {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let fields = deserialize_managed_install(deserializer)?;
-        Ok(Self {
-            path: fields.path,
-            source: fields.source,
-            version: fields.version,
-            sha256: fields.sha256,
-            platform: fields.platform,
-            installed_at_unix_seconds: fields.installed_at_unix_seconds,
-            unknown: fields.unknown,
-        })
-    }
-}
-
 impl ManagedModelInstall {
-    #[cfg(test)]
-    pub fn new(path: PathBuf) -> Self {
-        Self {
-            path,
-            ..Self::default()
-        }
-    }
-
-    pub fn app_managed(path: PathBuf, source: &str) -> Self {
-        Self {
-            path,
-            source: Some(source.to_owned()),
-            platform: Some(current_platform_key()),
-            installed_at_unix_seconds: current_unix_seconds(),
-            ..Self::default()
-        }
-    }
-}
-
-impl ManagedRuntimeInstall {
-    #[cfg(test)]
-    pub fn new(path: PathBuf) -> Self {
-        Self {
-            path,
-            ..Self::default()
-        }
-    }
-
     pub fn app_managed(path: PathBuf, source: &str) -> Self {
         Self {
             path,
@@ -371,9 +306,11 @@ pub(crate) fn installed_onnx_bundle_root(
 ) -> Option<PathBuf> {
     crate::model_catalog::normalized_receipt_backed_bundle_id(model_id)?;
     let root = onnx_bundle_target_root(config, model_id)?;
-    crate::onnx_model_bundles::current_executable_receipt_at(&root)
-        .ok()
-        .map(|_| root)
+    // This is routing metadata only. Receipt/tree integrity is established by
+    // `TranscriptionService::onnx_artifact_from_receipt` immediately before
+    // native dispatch; inventory construction must not become an execution
+    // authorization cache or perform a second full tree verification.
+    (root.is_dir() && root.join("install-receipt.json").is_file()).then_some(root)
 }
 
 pub(crate) fn onnx_bundle_target_root(config: &AppConfig, model_id: &ModelId) -> Option<PathBuf> {
@@ -422,20 +359,25 @@ fn configured_models_with_bundled_path(
                     .any(|id| id == &model.id))
             .then(|| bundled_base_path.clone())
             .flatten();
-            let configured_path = config.general.model_paths.get(&model.id).cloned();
-            let managed_path = managed_model_path(config, &model);
+            let configured_path = config
+                .general
+                .model_paths
+                .get(&model.id)
+                .filter(|path| current_pinned_gguf_path(&model_id, path))
+                .cloned();
+            let managed_path = managed_model_path(config, &model)
+                .filter(|path| current_pinned_gguf_path(&model_id, path));
             let downloaded_path = downloaded_model_path(config, &model);
-            let legacy_downloaded_path = legacy_downloaded_model_path(config, &model);
             let explicit_path =
                 first_non_empty_path([managed_path.clone(), configured_path.clone()]);
-            let mut candidate_paths = built_in_model_candidate_paths(
-                config,
-                &model,
-                downloaded_path.clone(),
+            let mut candidate_paths = [
                 managed_path.clone(),
                 configured_path.clone(),
-                legacy_downloaded_path,
-            );
+                downloaded_path.clone(),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
             if let Some(path) = bundled_path.as_ref() {
                 let verified_managed_primary = config
                     .general
@@ -508,85 +450,11 @@ fn configured_models_with_bundled_path(
     models
 }
 
-fn built_in_model_candidate_paths(
-    config: &AppConfig,
-    model: &SttModelInfo,
-    primary: Option<PathBuf>,
-    managed: Option<PathBuf>,
-    configured: Option<PathBuf>,
-    legacy: Option<PathBuf>,
-) -> Vec<PathBuf> {
-    let Some(manifest) = runtime_model_manifest(&ModelId::new(model.id.clone())) else {
-        return [primary, managed, configured, legacy]
-            .into_iter()
-            .flatten()
-            .collect();
-    };
-    let Some(legacy_artifact) = manifest.legacy_ggml_artifact else {
-        return [primary, managed, configured, legacy]
-            .into_iter()
-            .flatten()
-            .collect();
-    };
-    let is_primary = |path: &Path| {
+fn current_pinned_gguf_path(model_id: &ModelId, path: &Path) -> bool {
+    runtime_model_manifest(model_id).is_some_and(|manifest| {
         path.file_name().and_then(|name| name.to_str()) == Some(manifest.artifact_filename)
-    };
-    let is_legacy = |path: &Path| {
-        path.file_name().and_then(|name| name.to_str()) == Some(legacy_artifact.filename)
-    };
-    let valid_legacy_exists = [managed.as_ref(), configured.as_ref(), legacy.as_ref()]
-        .into_iter()
-        .flatten()
-        .any(|path| is_legacy(path) && is_valid_model_install_path(model, path));
-    if !valid_legacy_exists {
-        return [primary, managed, configured, legacy]
-            .into_iter()
-            .flatten()
-            .collect();
-    }
-
-    // An explicit persisted primary path remains authoritative for external
-    // configurations; runtime loading still verifies its pinned size/SHA.
-    if configured.as_deref().is_some_and(is_primary) {
-        return [configured, managed, primary, legacy]
-            .into_iter()
-            .flatten()
-            .collect();
-    }
-
-    // Normalized installs persist this record only after the activation
-    // journal has activated the verified artifact and prepared the atomic
-    // settings commit. Mere primary-file existence must not displace legacy.
-    let verified_managed_primary =
-        config
-            .general
-            .managed_models
-            .get(&model.id)
-            .is_some_and(|install| {
-                managed.as_ref().is_some_and(|path| is_primary(path))
-                    && install.source.as_deref() == Some("verified-manifest-download")
-                    && install
-                        .sha256
-                        .as_deref()
-                        .is_some_and(|sha256| sha256.eq_ignore_ascii_case(manifest.artifact_sha256))
-            });
-    if verified_managed_primary {
-        [managed, primary, configured, legacy]
-            .into_iter()
-            .flatten()
-            .collect()
-    } else {
-        let candidates = [managed, configured, legacy, primary]
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>();
-        candidates
-            .iter()
-            .filter(|path| !is_primary(path))
-            .chain(candidates.iter().filter(|path| is_primary(path)))
-            .cloned()
-            .collect()
-    }
+            && manifest.artifact_filename.ends_with(".gguf")
+    })
 }
 
 /// Stable opaque IDs ensure a catalog display name or filename cannot be used
@@ -706,12 +574,6 @@ fn imported_gguf_model_info(id: &str, install: &ImportedGgufModelInstall) -> Stt
     }
 }
 
-pub fn selected_model(config: &AppConfig) -> Option<SttModelInfo> {
-    configured_models(config)
-        .into_iter()
-        .find(|model| model.id == config.general.selected_default_model)
-}
-
 pub fn playground_selected_installed_models(config: &AppConfig) -> Vec<SttModelInfo> {
     let mut models = configured_models(config)
         .into_iter()
@@ -764,10 +626,10 @@ fn bundled_model_path_for_executable(executable: &Path) -> Option<PathBuf> {
         .map(|directory| directory.join(manifest.artifact_filename))
 }
 
-pub fn runtime_storage_dir() -> PathBuf {
+pub fn artifact_state_storage_dir() -> PathBuf {
     scribe_project_dirs()
-        .map(|dirs| dirs.data_dir().join("runtimes"))
-        .unwrap_or_else(|_| PathBuf::from("runtimes"))
+        .map(|dirs| dirs.data_dir().join("artifact-state"))
+        .unwrap_or_else(|_| PathBuf::from("artifact-state"))
 }
 
 pub fn history_storage_dir() -> Result<PathBuf> {
@@ -786,102 +648,10 @@ pub fn managed_model_path(config: &AppConfig, model: &SttModelInfo) -> Option<Pa
 pub fn is_valid_model_install_path(model: &SttModelInfo, path: &Path) -> bool {
     match model.backend.as_str() {
         "whisper.cpp" | "transcribe-cpp" => path.is_file(),
-        "faster-whisper" => is_faster_whisper_model_dir(path),
-        "Vosk" => is_vosk_model_dir(path),
-        "sherpa-onnx" => is_sherpa_onnx_model_dir(path),
-        "Moonshine" => is_moonshine_model_dir(path),
-        "Parakeet" => is_parakeet_model_dir(path),
-        _ => path.exists(),
+        // Receipt-backed ONNX bundles are validated before reaching this
+        // compatibility helper; unsupported legacy providers stay inert.
+        _ => false,
     }
-}
-
-pub fn is_faster_whisper_model_dir(path: &Path) -> bool {
-    path.is_dir() && path.join("model.bin").is_file() && path.join("config.json").is_file()
-}
-
-pub fn is_vosk_model_dir(path: &Path) -> bool {
-    let graph = path.join("graph");
-    let has_graph = graph.join("HCLG.fst").is_file()
-        || (graph.join("HCLr.fst").is_file() && graph.join("Gr.fst").is_file());
-    path.is_dir()
-        && path.join("am").join("final.mdl").is_file()
-        && path.join("conf").join("model.conf").is_file()
-        && has_graph
-}
-
-pub fn is_sherpa_onnx_model_dir(path: &Path) -> bool {
-    path.is_dir()
-        && path.join("tokens.txt").is_file()
-        && first_matching_file(
-            path,
-            &[
-                "encoder-epoch-99-avg-1.int8.onnx",
-                "encoder-epoch-99-avg-1.onnx",
-                "encoder*.onnx",
-            ],
-        )
-        .is_some()
-        && first_matching_file(
-            path,
-            &[
-                "decoder-epoch-99-avg-1.onnx",
-                "decoder-epoch-99-avg-1.int8.onnx",
-                "decoder*.onnx",
-            ],
-        )
-        .is_some()
-        && first_matching_file(
-            path,
-            &[
-                "joiner-epoch-99-avg-1.int8.onnx",
-                "joiner-epoch-99-avg-1.onnx",
-                "joiner*.onnx",
-            ],
-        )
-        .is_some()
-}
-
-pub fn is_moonshine_model_dir(path: &Path) -> bool {
-    path.is_dir()
-        && path.join("tokens.txt").is_file()
-        && path.join("encoder_model.ort").is_file()
-        && path.join("decoder_model_merged.ort").is_file()
-}
-
-pub fn is_parakeet_model_dir(path: &Path) -> bool {
-    path.is_dir()
-        && path.join("tokens.txt").is_file()
-        && path.join("encoder.int8.onnx").is_file()
-        && path.join("decoder.int8.onnx").is_file()
-        && path.join("joiner.int8.onnx").is_file()
-}
-
-fn first_matching_file(root: &Path, patterns: &[&str]) -> Option<PathBuf> {
-    for pattern in patterns {
-        let literal = root.join(pattern);
-        if literal.is_file() {
-            return Some(literal);
-        }
-        if !pattern.contains('*') {
-            continue;
-        }
-        let Some((prefix, suffix)) = pattern.split_once('*') else {
-            continue;
-        };
-        let Ok(entries) = fs::read_dir(root) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
-                continue;
-            };
-            if path.is_file() && file_name.starts_with(prefix) && file_name.ends_with(suffix) {
-                return Some(path);
-            }
-        }
-    }
-    None
 }
 
 pub fn downloaded_model_path(config: &AppConfig, model: &SttModelInfo) -> Option<PathBuf> {
@@ -895,74 +665,16 @@ pub fn downloaded_model_path(config: &AppConfig, model: &SttModelInfo) -> Option
         )
         .ok();
     }
-    model
-        .download_model
-        .as_ref()
-        .map(|download_model| match model.backend.as_str() {
-            "whisper.cpp" if download_model.ends_with(".gguf") => {
-                model_storage_dir(config).join("gguf").join(download_model)
-            }
-            "whisper.cpp" => model_storage_dir(config)
-                .join("whisper.cpp")
-                .join(download_model),
-            "faster-whisper" => model_storage_dir(config)
-                .join("faster-whisper")
-                .join(&model.id),
-            _ => model_storage_dir(config)
-                .join(runtime_id_for_backend(&model.backend))
-                .join(&model.id),
-        })
-}
-
-/// Legacy GGML files remain readable for the same logical model ID. New
-/// installs never target this path; it is a fallback until a verified GGUF
-/// activation commits the primary destination.
-pub(crate) fn legacy_downloaded_model_path(
-    config: &AppConfig,
-    model: &SttModelInfo,
-) -> Option<PathBuf> {
-    crate::model_catalog::runtime_model_manifest(&crate::transcription::ModelId::new(&model.id))
-        .and_then(|manifest| manifest.legacy_ggml_artifact)
-        .map(|artifact| {
-            model_storage_dir(config)
-                .join("whisper.cpp")
-                .join(artifact.filename)
-        })
-}
-
-/// Reports whether a stable catalog ID still resolves to its retained GGML
-/// compatibility artifact instead of the pinned GGUF destination. Callers use
-/// this as a migration contract only; it does not alter settings or files.
-pub(crate) fn model_needs_pinned_gguf_migration(config: &AppConfig, model: &SttModelInfo) -> bool {
-    let Some(primary) = downloaded_model_path(config, model) else {
-        return false;
-    };
-    let Some(legacy) = crate::model_catalog::runtime_model_manifest(
-        &crate::transcription::ModelId::new(&model.id),
-    )
-    .and_then(|manifest| manifest.legacy_ggml_artifact) else {
-        return false;
-    };
-    model.local_path.as_ref().is_some_and(|path| {
-        path != &primary && path.file_name().is_some_and(|name| name == legacy.filename)
-    })
-}
-
-pub fn managed_runtime_path(config: &AppConfig, backend: &str) -> Option<PathBuf> {
-    config
-        .general
-        .managed_runtimes
-        .get(&runtime_id_for_backend(backend))
-        .map(|install| install.path.clone())
-        .filter(|path| !path.as_os_str().is_empty())
-}
-
-pub fn runtime_id_for_backend(backend: &str) -> String {
-    runtime_catalog::runtime_id_for_backend(backend)
+    let download_model = model.download_model.as_ref()?;
+    match model.backend.as_str() {
+        "whisper.cpp" if download_model.ends_with(".gguf") => {
+            Some(model_storage_dir(config).join("gguf").join(download_model))
+        }
+        _ => None,
+    }
 }
 
 pub fn normalize_config(config: &mut AppConfig) {
-    migrate_legacy_model_ids(config);
     config
         .general
         .excluded_bundled_model_ids
@@ -984,27 +696,28 @@ pub fn normalize_config(config: &mut AppConfig) {
     {
         config.recording.audio_input_device_name = None;
     }
-    if config.performance.whisper_gpu_device > 16 {
-        config.performance.whisper_gpu_device = 0;
-    }
-    config
-        .performance
-        .whisper_cuda_library_paths
-        .retain(|path| !path.as_os_str().is_empty());
-    dedup_paths_preserving_order(&mut config.performance.whisper_cuda_library_paths);
-
-    if !config.general.selected_default_model.is_empty()
-        && !catalog
-            .iter()
-            .any(|model| model.id == config.general.selected_default_model)
-    {
-        config.general.selected_default_model = BUNDLED_BASE_MODEL_ID.to_owned();
-    }
-
-    config
+    let bundled_base_is_excluded = config
         .general
-        .playground_selected_models
-        .retain(|id| catalog_ids.iter().any(|catalog_id| catalog_id == id));
+        .excluded_bundled_model_ids
+        .iter()
+        .any(|id| id == BUNDLED_BASE_MODEL_ID);
+    let selected_is_current = catalog_ids
+        .iter()
+        .any(|id| id == &config.general.selected_default_model)
+        && !(bundled_base_is_excluded
+            && config.general.selected_default_model == BUNDLED_BASE_MODEL_ID);
+    if !config.general.selected_default_model.is_empty() && !selected_is_current {
+        config.general.selected_default_model = if bundled_base_is_excluded {
+            String::new()
+        } else {
+            BUNDLED_BASE_MODEL_ID.to_owned()
+        };
+    }
+
+    config.general.playground_selected_models.retain(|id| {
+        catalog_ids.iter().any(|catalog_id| catalog_id == id)
+            && !(bundled_base_is_excluded && id == BUNDLED_BASE_MODEL_ID)
+    });
     dedup_preserving_order(&mut config.general.playground_selected_models);
 
     normalize_playground_order(config, &catalog_ids);
@@ -1054,28 +767,6 @@ pub fn normalize_config(config: &mut AppConfig) {
     }
 }
 
-fn default_whisper_cuda_backend_path() -> Option<PathBuf> {
-    [
-        "/usr/local/lib/ollama/cuda_v13/libggml-cuda.so",
-        "/usr/local/lib/ollama/cuda_v12/libggml-cuda.so",
-    ]
-    .into_iter()
-    .map(PathBuf::from)
-    .find(|path| path.exists())
-}
-
-fn default_whisper_cuda_library_paths() -> Vec<PathBuf> {
-    [
-        "/usr/local/lib/ollama",
-        "/usr/local/lib/ollama/cuda_v13",
-        "/usr/local/lib/ollama/cuda_v12",
-    ]
-    .into_iter()
-    .map(PathBuf::from)
-    .filter(|path| path.exists())
-    .collect()
-}
-
 fn default_paste_delay_ms() -> u64 {
     75
 }
@@ -1094,41 +785,46 @@ fn default_playground_model_order() -> Vec<String> {
 }
 
 fn apply_managed_model_metadata(config: &mut AppConfig) {
+    apply_managed_model_metadata_with_path_probe(config, Path::exists);
+}
+
+fn apply_managed_model_metadata_with_path_probe(
+    config: &mut AppConfig,
+    mut path_exists: impl FnMut(&Path) -> bool,
+) {
     let expected_paths = default_model_catalog()
         .into_iter()
         .filter_map(|model| {
-            downloaded_model_path(config, &model).map(|path| {
-                let mut paths = vec![path];
-                if let Some(legacy_path) = legacy_downloaded_model_path(config, &model) {
-                    paths.push(legacy_path);
-                }
-                (model.id.clone(), paths)
-            })
+            downloaded_model_path(config, &model).map(|path| (model.id.clone(), vec![path]))
         })
         .collect::<HashMap<_, _>>();
     let storage_dir = model_storage_dir(config);
     config.general.managed_models.retain(|id, install| {
-        expected_paths
-            .get(id)
-            .is_some_and(|paths| paths.contains(&install.path))
-            && safe_managed_model_path(&storage_dir, &install.path)
+        let Some(paths) = expected_paths.get(id) else {
+            // Unsupported and retired records are intentionally inert. Keep
+            // them byte-for-byte at the settings layer so users can downgrade
+            // or inspect an old profile without Scribe rewriting their legacy
+            // installation metadata or touching the referenced artifacts.
+            return true;
+        };
+        paths.contains(&install.path) && safe_managed_model_path(&storage_dir, &install.path)
     });
 
     for (id, path) in &config.general.model_paths {
-        if path.exists()
-            && expected_paths
-                .get(id)
-                .is_some_and(|paths| paths.contains(path))
-            && safe_managed_model_path(&storage_dir, path)
-        {
-            config
-                .general
-                .managed_models
-                .entry(id.clone())
-                .or_insert_with(|| {
-                    ManagedModelInstall::app_managed(path.clone(), "legacy-model-path")
-                });
+        let Some(paths) = expected_paths.get(id) else {
+            continue;
+        };
+        if !paths.contains(path) {
+            continue;
         }
+        if !path_exists(path) || !safe_managed_model_path(&storage_dir, path) {
+            continue;
+        }
+        config
+            .general
+            .managed_models
+            .entry(id.clone())
+            .or_insert_with(|| ManagedModelInstall::app_managed(path.clone(), "legacy-model-path"));
     }
 
     for install in config.general.managed_models.values_mut() {
@@ -1290,60 +986,6 @@ fn safe_managed_model_path(storage_dir: &Path, path: &Path) -> bool {
         .ok()
         .zip(storage_dir.canonicalize().ok())
         .is_some_and(|(path, storage)| path.starts_with(storage))
-}
-
-fn migrate_legacy_model_ids(config: &mut AppConfig) {
-    let legacy_ids = [
-        "faster_whisper",
-        "sherpa_onnx_streaming",
-        "faster_whisper_small_en",
-        "faster_whisper_medium_en",
-    ];
-    let migrations = [
-        ("faster_whisper", "faster_whisper_small_en_gpu"),
-        ("sherpa_onnx_streaming", "sherpa_onnx_zipformer_small"),
-        ("faster_whisper_small_en", "faster_whisper_small_en_gpu"),
-        ("faster_whisper_medium_en", "faster_whisper_medium_en_gpu"),
-    ];
-
-    for (old_id, new_id) in migrations {
-        if config.general.selected_default_model == old_id {
-            config.general.selected_default_model = new_id.to_owned();
-        }
-        for id in &mut config.general.playground_selected_models {
-            if id == old_id {
-                *id = new_id.to_owned();
-            }
-        }
-        for id in &mut config.general.playground_model_order {
-            if id == old_id {
-                *id = new_id.to_owned();
-            }
-        }
-        if let Some(path) = config.general.model_paths.remove(old_id) {
-            config
-                .general
-                .model_paths
-                .entry(new_id.to_owned())
-                .or_insert(path);
-        }
-        if let Some(install) = config.general.managed_models.remove(old_id) {
-            config
-                .general
-                .managed_models
-                .entry(new_id.to_owned())
-                .or_insert(install);
-        }
-    }
-
-    config
-        .general
-        .model_paths
-        .retain(|id, _| !legacy_ids.iter().any(|legacy_id| legacy_id == &id.as_str()));
-    config
-        .general
-        .managed_models
-        .retain(|id, _| !legacy_ids.iter().any(|legacy_id| legacy_id == &id.as_str()));
 }
 
 fn normalize_playground_order(config: &mut AppConfig, catalog_ids: &[String]) {
@@ -1589,87 +1231,20 @@ mod tests {
 
     #[test]
     fn fresh_default_is_base_and_normalization_preserves_an_explicit_existing_selection() {
-        let fresh = AppConfig::default();
+        let root = unique_bundled_root("identity-normalization");
+        let mut fresh = AppConfig::default();
+        fresh.general.model_storage_dir = root.clone();
+        normalize_config(&mut fresh);
         assert_eq!(fresh.general.selected_default_model, BUNDLED_BASE_MODEL_ID);
 
         let mut existing = AppConfig::default();
+        existing.general.model_storage_dir = root;
         existing.general.selected_default_model = "whisper_cpp_small_en".to_owned();
         normalize_config(&mut existing);
         assert_eq!(
             existing.general.selected_default_model,
             "whisper_cpp_small_en"
         );
-    }
-
-    #[test]
-    fn old_config_without_playground_order_normalizes() {
-        let old_config = r#"{
-            "selected_default_model": "whisper_cpp_tiny_en",
-            "enabled_models": ["whisper_cpp_tiny_en"],
-            "hotkey": "Ctrl+Shift+Space",
-            "whisper_executable_path": null,
-            "model_paths": {},
-            "last_used_backend": "whisper.cpp",
-            "debug_mode": false,
-            "max_recording_seconds": 30
-        }"#;
-
-        let mut config: AppConfig = serde_json::from_str(old_config).unwrap();
-        assert!(config.general.playground_model_order.is_empty());
-
-        normalize_config(&mut config);
-
-        assert!(config.general.playground_model_order.len() >= default_model_catalog().len());
-        assert!(
-            config
-                .general
-                .playground_model_order
-                .iter()
-                .any(|id| id == "faster_whisper_turbo")
-        );
-        assert!(config.general.close_to_tray);
-        assert!(config.output.auto_insert_transcript);
-        assert!(config.output.restore_clipboard_after_insert);
-        assert_eq!(config.recording.hotkey, "Ctrl+Shift+Space");
-        assert_eq!(config.recording.hotkey_mode, HotkeyMode::HoldToTalk);
-        assert_eq!(config.output.paste_delay_ms, 75);
-        assert_eq!(config.general.theme_mode, ThemeMode::Light);
-        assert_eq!(
-            config.performance.acceleration_preference,
-            AccelerationPreference::Cpu
-        );
-        assert_eq!(
-            config.general.playground_selected_models,
-            vec!["whisper_cpp_tiny_en".to_owned()]
-        );
-        assert_eq!(config.performance.whisper_gpu_device, 0);
-        assert!(config.performance.whisper_cuda_library_paths.len() <= 3);
-        assert!(config.recording.audio_input_device_name.is_none());
-        assert!(!config.general.model_storage_dir.as_os_str().is_empty());
-        assert!(config.general.model_storage_dir.ends_with("models"));
-    }
-
-    #[test]
-    fn new_default_config_uses_auto_performance() {
-        let config = AppConfig::default();
-
-        assert_eq!(
-            config.performance.acceleration_preference,
-            AccelerationPreference::Auto
-        );
-        assert_eq!(config.performance.whisper_gpu_device, 0);
-        assert!(!config.output.auto_insert_transcript);
-        assert!(config.recording.vad_enabled);
-        assert_eq!(config.recording.speech_confirmation_ms, 150);
-        assert_eq!(config.recording.internal_pause_ms, 450);
-        assert_eq!(config.recording.endpoint_silence_ms, 900);
-        assert_eq!(config.recording.pre_roll_ms, 250);
-        assert_eq!(config.recording.post_roll_ms, 200);
-        assert_eq!(config.streaming.mode, StreamingMode::Auto);
-        assert_eq!(config.history.mode, HistoryMode::TranscriptOnly);
-        assert_eq!(config.history.max_unpinned_entries, 20);
-        assert!(!config.history.mode.stores_audio());
-        assert!(config.history.mode.stores_transcripts());
     }
 
     #[test]
@@ -1757,24 +1332,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_whisper_compute_key_migrates_to_neutral_acceleration_key() {
-        let object = serde_json::json!({
-            "selected_default_model": "whisper_cpp_tiny_en",
-            "whisper_compute_mode": "prefer_gpu"
-        });
-
-        let config: AppConfig = serde_json::from_value(object).unwrap();
-        assert_eq!(
-            config.performance.acceleration_preference,
-            AccelerationPreference::Gpu
-        );
-
-        let serialized = serde_json::to_value(config).unwrap();
-        assert_eq!(serialized["performance"]["acceleration_preference"], "gpu");
-        assert!(serialized.get("whisper_compute_mode").is_none());
-    }
-
-    #[test]
     fn hotkey_mode_uses_stable_snake_case_names() {
         let config = AppConfig {
             recording: RecordingSettings {
@@ -1792,44 +1349,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_gpu_device_normalizes_to_default() {
-        let mut config = AppConfig {
-            performance: PerformanceSettings {
-                whisper_gpu_device: 99,
-                ..Default::default()
-            },
-            ..AppConfig::default()
-        };
-
-        normalize_config(&mut config);
-
-        assert_eq!(config.performance.whisper_gpu_device, 0);
-    }
-
-    #[test]
-    fn duplicate_cuda_library_paths_normalize_to_unique_paths() {
-        let mut config = AppConfig {
-            performance: PerformanceSettings {
-                whisper_cuda_library_paths: vec![
-                    PathBuf::from("/tmp/cuda"),
-                    PathBuf::from("/tmp/cuda"),
-                    PathBuf::new(),
-                ],
-                ..Default::default()
-            },
-            ..AppConfig::default()
-        };
-
-        normalize_config(&mut config);
-
-        assert_eq!(
-            config.performance.whisper_cuda_library_paths,
-            vec![PathBuf::from("/tmp/cuda")]
-        );
-    }
-
-    #[test]
-    fn empty_playground_selection_remains_empty_after_normalize() {
+    fn explicit_empty_playground_selection_is_preserved() {
         let mut config = AppConfig {
             general: GeneralSettings {
                 playground_selected_models: Vec::new(),
@@ -1840,18 +1360,20 @@ mod tests {
 
         normalize_config(&mut config);
 
-        assert!(config.general.playground_selected_models.is_empty());
         assert_eq!(config.general.selected_default_model, BUNDLED_BASE_MODEL_ID);
+        assert!(config.general.playground_selected_models.is_empty());
     }
 
     #[test]
-    fn playground_selection_normalizes_invalid_and_duplicate_ids() {
+    fn playground_selection_filters_retired_invalid_and_duplicate_ids() {
         let mut config = AppConfig {
             general: GeneralSettings {
                 playground_selected_models: vec![
                     "faster_whisper_medium_en_gpu".to_owned(),
                     "invalid".to_owned(),
                     "faster_whisper_medium_en_gpu".to_owned(),
+                    "whisper_cpp_small_en".to_owned(),
+                    "whisper_cpp_small_en".to_owned(),
                 ],
                 ..Default::default()
             },
@@ -1861,30 +1383,51 @@ mod tests {
         normalize_config(&mut config);
         assert_eq!(
             config.general.playground_selected_models,
-            ["faster_whisper_medium_en_gpu"]
+            ["whisper_cpp_small_en"]
         );
     }
 
     #[test]
-    fn legacy_playground_selection_keys_deserialize_and_new_key_serializes() {
-        for key in ["playground_enabled_models", "enabled_models"] {
-            let mut value = serde_json::json!({
-                "selected_default_model": "whisper_cpp_tiny_en"
-            });
-            value
-                .as_object_mut()
-                .unwrap()
-                .insert(key.to_owned(), serde_json::json!(["whisper_cpp_base_en"]));
-            let config: AppConfig = serde_json::from_value(value).unwrap();
-            assert_eq!(
-                config.general.playground_selected_models,
-                ["whisper_cpp_base_en"]
-            );
-        }
+    fn retired_and_unauthorized_model_paths_are_not_probed() {
+        let mut config = AppConfig::default();
+        config.general.model_storage_dir = PathBuf::from("test-model-storage");
+        let catalog = default_model_catalog();
+        let authorized_model = catalog
+            .iter()
+            .find(|model| model.id == "whisper_cpp_tiny_en")
+            .unwrap();
+        let authorized_path = downloaded_model_path(&config, authorized_model).unwrap();
+        let unauthorized_path = PathBuf::from("copied-profile/unmanaged-supported-model.gguf");
+        let retired_path = PathBuf::from("copied-profile/retired-provider-model.bin");
+        config
+            .general
+            .model_paths
+            .insert(authorized_model.id.clone(), authorized_path.clone());
+        config
+            .general
+            .model_paths
+            .insert("whisper_cpp_small_en".to_owned(), unauthorized_path.clone());
+        config
+            .general
+            .model_paths
+            .insert("faster_whisper".to_owned(), retired_path.clone());
 
-        let serialized = serde_json::to_string(&AppConfig::default()).unwrap();
-        assert!(serialized.contains("playground_selected_models"));
-        assert!(!serialized.contains("playground_enabled_models"));
+        let mut probed = Vec::new();
+        apply_managed_model_metadata_with_path_probe(&mut config, |path| {
+            probed.push(path.to_path_buf());
+            false
+        });
+
+        assert_eq!(probed, [authorized_path]);
+        assert_eq!(
+            config.general.model_paths.get("faster_whisper"),
+            Some(&retired_path)
+        );
+        assert_eq!(
+            config.general.model_paths.get("whisper_cpp_small_en"),
+            Some(&unauthorized_path)
+        );
+        assert!(config.general.managed_models.is_empty());
     }
 
     #[test]
@@ -1893,14 +1436,13 @@ mod tests {
             "scribe-playground-selection-{}",
             std::process::id()
         ));
-        let model_dir = root.join("whisper.cpp");
         let _ = fs::remove_dir_all(&root);
+        let model_dir = root.join("gguf");
         fs::create_dir_all(&model_dir).unwrap();
         let tiny_path = root.join("gguf").join("whisper-tiny.en-Q4_K_M.gguf");
-        fs::create_dir_all(tiny_path.parent().unwrap()).unwrap();
         fs::write(tiny_path, b"tiny").unwrap();
-        fs::write(model_dir.join("ggml-base.en.bin"), b"base").unwrap();
-        fs::write(model_dir.join("ggml-small.en.bin"), b"small").unwrap();
+        fs::write(model_dir.join("whisper-base.en-Q8_0.gguf"), b"base").unwrap();
+        fs::write(model_dir.join("whisper-small.en-Q8_0.gguf"), b"small").unwrap();
 
         let mut config = AppConfig {
             general: GeneralSettings {
@@ -1928,40 +1470,6 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(ids, ["whisper_cpp_base_en", "whisper_cpp_tiny_en"]);
         let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn downloaded_model_path_resolves_inside_storage_dir() {
-        let config = AppConfig {
-            general: GeneralSettings {
-                model_storage_dir: PathBuf::from("/tmp/scribe-models"),
-                ..Default::default()
-            },
-            ..AppConfig::default()
-        };
-        let model = default_model_catalog()
-            .into_iter()
-            .find(|model| model.id == "whisper_cpp_base_en")
-            .unwrap();
-
-        assert_eq!(
-            downloaded_model_path(&config, &model).unwrap(),
-            PathBuf::from("/tmp/scribe-models/gguf/whisper-base.en-Q8_0.gguf")
-        );
-        assert_eq!(
-            legacy_downloaded_model_path(&config, &model).unwrap(),
-            PathBuf::from("/tmp/scribe-models/whisper.cpp/ggml-base.en.bin")
-        );
-
-        let faster_model = default_model_catalog()
-            .into_iter()
-            .find(|model| model.id == "faster_whisper_tiny_en")
-            .unwrap();
-
-        assert_eq!(
-            downloaded_model_path(&config, &faster_model).unwrap(),
-            PathBuf::from("/tmp/scribe-models/faster-whisper/faster_whisper_tiny_en")
-        );
     }
 
     #[test]
@@ -2033,198 +1541,19 @@ mod tests {
     }
 
     #[test]
-    fn legacy_ggml_falls_back_until_the_pinned_gguf_is_activated() {
-        let root = std::env::temp_dir().join(format!(
-            "scribe-gguf-migration-paths-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&root);
-        let mut config = AppConfig {
-            general: GeneralSettings {
-                model_storage_dir: root.clone(),
-                selected_default_model: "whisper_cpp_base_en".to_owned(),
-                ..Default::default()
-            },
-            ..AppConfig::default()
-        };
-        let model = default_model_catalog()
-            .into_iter()
-            .find(|model| model.id == "whisper_cpp_base_en")
-            .unwrap();
-        let legacy = legacy_downloaded_model_path(&config, &model).unwrap();
-        let primary = downloaded_model_path(&config, &model).unwrap();
-        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
-        fs::create_dir_all(primary.parent().unwrap()).unwrap();
-        fs::write(&legacy, b"legacy GGML").unwrap();
-        fs::write(&primary, b"unactivated or corrupt GGUF").unwrap();
-        config
-            .general
-            .model_paths
-            .insert(model.id.clone(), legacy.clone());
-
-        normalize_config(&mut config);
-        let before_activation = selected_model(&config).unwrap();
-        assert_eq!(before_activation.id, "whisper_cpp_base_en");
-        assert_eq!(config.general.selected_default_model, "whisper_cpp_base_en");
-        assert_eq!(
-            before_activation.local_path.as_deref(),
-            Some(legacy.as_path())
-        );
-        assert!(model_needs_pinned_gguf_migration(
-            &config,
-            &before_activation
-        ));
-
-        let manifest = runtime_model_manifest(&ModelId::new(model.id.clone())).unwrap();
-        let mut untrusted_primary =
-            ManagedModelInstall::app_managed(primary.clone(), "verified-manifest-download");
-        untrusted_primary.sha256 = Some("0".repeat(64));
-        config
-            .general
-            .managed_models
-            .insert(model.id.clone(), untrusted_primary);
-        let mismatched_receipt = selected_model(&config).unwrap();
-        assert_eq!(
-            mismatched_receipt.local_path.as_deref(),
-            Some(legacy.as_path())
-        );
-        assert!(model_needs_pinned_gguf_migration(
-            &config,
-            &mismatched_receipt
-        ));
-
-        let mut verified_primary =
-            ManagedModelInstall::app_managed(primary.clone(), "verified-manifest-download");
-        verified_primary.sha256 = Some(manifest.artifact_sha256.to_owned());
-        config
-            .general
-            .managed_models
-            .insert(model.id.clone(), verified_primary);
-        normalize_config(&mut config);
-        let after_activation = selected_model(&config).unwrap();
-        assert_eq!(after_activation.id, "whisper_cpp_base_en");
-        assert_eq!(config.general.selected_default_model, "whisper_cpp_base_en");
-        assert_eq!(
-            after_activation.local_path.as_deref(),
-            Some(primary.as_path())
-        );
-        assert!(!model_needs_pinned_gguf_migration(
-            &config,
-            &after_activation
-        ));
-        assert_eq!(fs::read(&legacy).unwrap(), b"legacy GGML");
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn legacy_ggml_managed_path_is_retained_without_becoming_a_new_install_destination() {
-        let root =
-            std::env::temp_dir().join(format!("scribe-gguf-legacy-managed-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        let legacy = root.join("whisper.cpp").join("ggml-small.en.bin");
-        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
-        fs::write(&legacy, b"legacy GGML").unwrap();
-        let mut config = AppConfig {
-            general: GeneralSettings {
-                model_storage_dir: root.clone(),
-                selected_default_model: "whisper_cpp_small_en".to_owned(),
-                managed_models: HashMap::from([(
-                    "whisper_cpp_small_en".to_owned(),
-                    ManagedModelInstall::app_managed(legacy.clone(), "legacy-ggml"),
-                )]),
-                ..Default::default()
-            },
-            ..AppConfig::default()
-        };
-
-        normalize_config(&mut config);
-        let model = selected_model(&config).unwrap();
-        assert_eq!(model.id, "whisper_cpp_small_en");
-        assert_eq!(model.local_path.as_deref(), Some(legacy.as_path()));
-        assert_eq!(
-            downloaded_model_path(&config, &model).unwrap(),
-            root.join("gguf").join("whisper-small.en-Q8_0.gguf")
-        );
-        assert_eq!(
-            managed_model_path(&config, &model).as_deref(),
-            Some(legacy.as_path())
-        );
-        assert!(model_needs_pinned_gguf_migration(&config, &model));
-        assert!(legacy.is_file());
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn vosk_directory_accepts_official_small_model_layout() {
-        let root = std::env::temp_dir().join(format!("scribe-vosk-model-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(root.join("am")).unwrap();
-        fs::create_dir_all(root.join("conf")).unwrap();
-        fs::create_dir_all(root.join("graph")).unwrap();
-        fs::write(root.join("am").join("final.mdl"), b"model").unwrap();
-        fs::write(root.join("conf").join("model.conf"), b"conf").unwrap();
-
-        assert!(!is_vosk_model_dir(&root));
-
-        fs::write(root.join("graph").join("HCLr.fst"), b"hclr").unwrap();
-        assert!(!is_vosk_model_dir(&root));
-
-        fs::write(root.join("graph").join("Gr.fst"), b"gr").unwrap();
-
-        assert!(is_vosk_model_dir(&root));
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn sherpa_family_directories_require_backend_specific_model_files() {
-        let root = std::env::temp_dir().join(format!("scribe-sherpa-model-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        let sherpa = root.join("sherpa");
-        let moonshine = root.join("moonshine");
-        let parakeet = root.join("parakeet");
-        fs::create_dir_all(&sherpa).unwrap();
-        fs::create_dir_all(&moonshine).unwrap();
-        fs::create_dir_all(&parakeet).unwrap();
-
-        fs::write(sherpa.join("tokens.txt"), b"tokens").unwrap();
-        fs::write(sherpa.join("encoder-epoch-99-avg-1.int8.onnx"), b"encoder").unwrap();
-        fs::write(sherpa.join("decoder-epoch-99-avg-1.onnx"), b"decoder").unwrap();
-        assert!(!is_sherpa_onnx_model_dir(&sherpa));
-        fs::write(sherpa.join("joiner-epoch-99-avg-1.int8.onnx"), b"joiner").unwrap();
-        assert!(is_sherpa_onnx_model_dir(&sherpa));
-
-        fs::write(moonshine.join("tokens.txt"), b"tokens").unwrap();
-        fs::write(moonshine.join("encoder_model.ort"), b"encoder").unwrap();
-        assert!(!is_moonshine_model_dir(&moonshine));
-        fs::write(moonshine.join("decoder_model_merged.ort"), b"decoder").unwrap();
-        assert!(is_moonshine_model_dir(&moonshine));
-
-        fs::write(parakeet.join("tokens.txt"), b"tokens").unwrap();
-        fs::write(parakeet.join("encoder.int8.onnx"), b"encoder").unwrap();
-        fs::write(parakeet.join("decoder.int8.onnx"), b"decoder").unwrap();
-        assert!(!is_parakeet_model_dir(&parakeet));
-        fs::write(parakeet.join("joiner.int8.onnx"), b"joiner").unwrap();
-        assert!(is_parakeet_model_dir(&parakeet));
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
     fn downloaded_model_file_wins_over_stale_configured_path() {
         let temp_dir =
             std::env::temp_dir().join(format!("scribe-config-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&temp_dir);
-        let model_dir = temp_dir.join("whisper.cpp");
+        let model_dir = temp_dir.join("gguf");
         fs::create_dir_all(&model_dir).unwrap();
-        let downloaded_path = model_dir.join("ggml-base.en.bin");
+        let downloaded_path = model_dir.join("whisper-base.en-Q8_0.gguf");
         fs::write(&downloaded_path, b"model").unwrap();
 
         let mut model_paths = HashMap::new();
         model_paths.insert(
             "whisper_cpp_base_en".to_owned(),
-            temp_dir.join("missing-model.bin"),
+            temp_dir.join("missing").join("whisper-base.en-Q8_0.gguf"),
         );
         let config = AppConfig {
             general: GeneralSettings {
@@ -2235,7 +1564,7 @@ mod tests {
             ..AppConfig::default()
         };
 
-        let model = configured_models(&config)
+        let model = configured_models_with_bundled_path(&config, None)
             .into_iter()
             .find(|model| model.id == "whisper_cpp_base_en")
             .unwrap();
@@ -2253,7 +1582,7 @@ mod tests {
         let _ = fs::remove_dir_all(&temp_dir);
         let app_storage = temp_dir.join("app-models");
         fs::create_dir_all(&app_storage).unwrap();
-        let model_path = app_storage.join("whisper.cpp").join("ggml-base.en.bin");
+        let model_path = app_storage.join("gguf").join("whisper-base.en-Q8_0.gguf");
         fs::create_dir_all(model_path.parent().unwrap()).unwrap();
         fs::write(&model_path, b"model").unwrap();
 
@@ -2283,54 +1612,6 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&temp_dir);
-    }
-
-    #[test]
-    fn legacy_managed_install_records_deserialize_with_empty_metadata() {
-        let model: ManagedModelInstall =
-            serde_json::from_str(r#"{"path":"/tmp/scribe/model.bin"}"#).unwrap();
-        let runtime: ManagedRuntimeInstall =
-            serde_json::from_str(r#"{"path":"/tmp/scribe/runtime/bin/runner"}"#).unwrap();
-
-        assert_eq!(model.path, PathBuf::from("/tmp/scribe/model.bin"));
-        assert!(model.source.is_none());
-        assert!(model.version.is_none());
-        assert!(model.sha256.is_none());
-        assert!(model.platform.is_none());
-        assert!(model.installed_at_unix_seconds.is_none());
-
-        assert_eq!(
-            runtime.path,
-            PathBuf::from("/tmp/scribe/runtime/bin/runner")
-        );
-        assert!(runtime.source.is_none());
-        assert!(runtime.version.is_none());
-        assert!(runtime.sha256.is_none());
-        assert!(runtime.platform.is_none());
-        assert!(runtime.installed_at_unix_seconds.is_none());
-    }
-
-    #[test]
-    fn app_managed_install_records_include_source_and_platform() {
-        let model =
-            ManagedModelInstall::app_managed(PathBuf::from("/tmp/scribe/model.bin"), "download");
-        let runtime = ManagedRuntimeInstall::app_managed(
-            PathBuf::from("/tmp/scribe/runtime/bin/runner"),
-            "packaged-runtime",
-        );
-
-        assert_eq!(model.source.as_deref(), Some("download"));
-        assert_eq!(runtime.source.as_deref(), Some("packaged-runtime"));
-        assert_eq!(
-            model.platform.as_deref(),
-            Some(current_platform_key().as_str())
-        );
-        assert_eq!(
-            runtime.platform.as_deref(),
-            Some(current_platform_key().as_str())
-        );
-        assert!(model.installed_at_unix_seconds.is_some());
-        assert!(runtime.installed_at_unix_seconds.is_some());
     }
 
     #[test]
@@ -2543,7 +1824,7 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&temp_dir);
         let app_storage = temp_dir.join("app-models");
-        let external_path = temp_dir.join("external").join("ggml-base.en.bin");
+        let external_path = temp_dir.join("external").join("whisper-base.en-Q8_0.gguf");
         fs::create_dir_all(external_path.parent().unwrap()).unwrap();
         fs::write(&external_path, b"model").unwrap();
 
@@ -2559,7 +1840,7 @@ mod tests {
         };
 
         normalize_config(&mut config);
-        let model = configured_models(&config)
+        let model = configured_models_with_bundled_path(&config, None)
             .into_iter()
             .find(|model| model.id == "whisper_cpp_base_en")
             .unwrap();
@@ -2569,50 +1850,6 @@ mod tests {
         assert_eq!(model.install_status, ModelInstallStatus::Installed);
 
         let _ = fs::remove_dir_all(&temp_dir);
-    }
-
-    #[test]
-    fn faster_whisper_directory_requires_ctranslate2_payload() {
-        let temp_dir =
-            std::env::temp_dir().join(format!("scribe-fw-config-test-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&temp_dir);
-        let model_dir = temp_dir
-            .join("faster-whisper")
-            .join("faster_whisper_small_en_gpu");
-        fs::create_dir_all(&model_dir).unwrap();
-        fs::write(model_dir.join("config.json"), b"{}").unwrap();
-
-        let config = AppConfig {
-            general: GeneralSettings {
-                model_storage_dir: temp_dir.clone(),
-                ..Default::default()
-            },
-            ..AppConfig::default()
-        };
-        let model = configured_models(&config)
-            .into_iter()
-            .find(|model| model.id == "faster_whisper_small_en_gpu")
-            .unwrap();
-
-        assert_eq!(model.local_path.as_deref(), Some(model_dir.as_path()));
-        assert_eq!(model.install_status, ModelInstallStatus::Missing);
-
-        fs::write(model_dir.join("model.bin"), b"model").unwrap();
-        let model = configured_models(&config)
-            .into_iter()
-            .find(|model| model.id == "faster_whisper_small_en_gpu")
-            .unwrap();
-
-        assert_eq!(model.local_path.as_deref(), Some(model_dir.as_path()));
-        assert_eq!(model.install_status, ModelInstallStatus::Installed);
-
-        let _ = fs::remove_dir_all(&temp_dir);
-    }
-
-    #[test]
-    fn runtime_ids_are_stable_slugs() {
-        assert_eq!(runtime_id_for_backend("whisper.cpp"), "whisper_cpp");
-        assert_eq!(runtime_id_for_backend("sherpa-onnx"), "sherpa_onnx");
     }
 
     #[test]

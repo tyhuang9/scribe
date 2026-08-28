@@ -375,8 +375,6 @@ impl Fixture {
                         cpu: true,
                         gpu: true,
                     };
-                    expanded.runtime_action_label = Some("Repair".into());
-                    expanded.runtime_action_enabled = true;
                 }
             }
             Self::ModelsCompareExpanded => {
@@ -1103,10 +1101,7 @@ fn apply_action(data: &mut FixtureData, page: &mut AppPage, action: ScreenAction
     match action {
         ScreenAction::None
         | ScreenAction::InstallModel(_)
-        | ScreenAction::UpgradeModel(_)
         | ScreenAction::CancelModelInstall(_)
-        | ScreenAction::RepairModelRuntime(_)
-        | ScreenAction::MaintainModelRuntime(_)
         | ScreenAction::RetryRemoteCatalog => {}
         ScreenAction::DiscardModelPartial(id) => {
             if let Some(model) = data
@@ -3296,6 +3291,89 @@ mod tests {
     }
 
     #[test]
+    fn moonshine_receipt_cards_have_no_legacy_badges_in_all_card_states() {
+        fn shape_texts(shape: &egui::epaint::Shape, texts: &mut Vec<String>) {
+            match shape {
+                egui::epaint::Shape::Text(text) => texts.push(text.galley.text().to_owned()),
+                egui::epaint::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        shape_texts(shape, texts);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        for (width, expanded) in [
+            (560.0, false),
+            (560.0, true),
+            (1180.0, false),
+            (1180.0, true),
+        ] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            configure_accessible_style(&ctx);
+            let mut data = Fixture::ModelsInstalled.data();
+            data.models.clear();
+            data.model_catalog = vec![ModelViewModel {
+                id: "moonshine-tiny-en-int8-onnx".into(),
+                display_name: "Moonshine Tiny — English".into(),
+                install_supported: true,
+                install_action_enabled: true,
+                primary_action_label: "Repair model".into(),
+                download_state: ModelDownloadState::Failed,
+                ..Default::default()
+            }];
+            if expanded {
+                data.model_management.expanded_model_card =
+                    Some(ModelCardKey::Local("moonshine-tiny-en-int8-onnx".into()));
+            }
+            let mut page = AppPage::Models;
+            let output = render_with_input(&ctx, &mut data, &mut page, width, 815.0, Vec::new()).0;
+            let names = node_names(&output);
+            for legacy in ["Experimental", "CPU only", "Final text only"] {
+                assert!(
+                    !names.iter().any(|name| name.contains(legacy)),
+                    "{legacy} must not be exposed in {width}px {expanded:?} card"
+                );
+            }
+            assert!(names.iter().any(|name| name == "Needs repair"));
+            let repair = node_matching(&output, |node| {
+                node.role() == egui::accesskit::Role::Button
+                    && node.name() == Some("Repair Moonshine Tiny — English")
+            });
+            assert!(!repair.is_disabled());
+            let card = node_matching(&output, |node| {
+                node.role() == egui::accesskit::Role::Group
+                    && node.name() == Some("Moonshine Tiny — English model")
+            });
+            assert_eq!(card.is_expanded(), None);
+            let details = node_matching(&output, |node| {
+                node.role() == egui::accesskit::Role::Button
+                    && node.name()
+                        == Some(
+                            format!(
+                                "{} details for Moonshine Tiny — English",
+                                if expanded { "Collapse" } else { "Expand" }
+                            )
+                            .as_str(),
+                        )
+            });
+            assert_eq!(details.is_expanded(), Some(expanded));
+            let mut texts = Vec::new();
+            for shape in &output.shapes {
+                shape_texts(&shape.shape, &mut texts);
+            }
+            for legacy in ["Experimental", "CPU only", "Final text only"] {
+                assert!(
+                    !texts.iter().any(|text| text.contains(legacy)),
+                    "{legacy} must not be painted in {width}px {expanded:?} card"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn model_card_ratings_render_all_proportional_bins_and_truthful_unknown_meters() {
         for (guidance, label, value) in [
             ("Basic", "Basic", 1_u8),
@@ -4573,7 +4651,6 @@ mod tests {
             "GPU",
             "Supported",
             "FEATURES",
-            "MAINTENANCE",
         ] {
             assert!(node_names(&expanded).iter().any(|name| name == detail));
         }
@@ -4740,11 +4817,7 @@ mod tests {
                 "hidden feature {hidden}"
             );
         }
-        assert!(
-            names
-                .iter()
-                .any(|name| name == "Repair runtime for whisper.cpp tiny.en")
-        );
+        assert!(!names.iter().any(|name| name.contains("runtime")));
     }
 
     #[test]
@@ -5110,8 +5183,6 @@ mod tests {
             ("expanded feature row gap 1", 4.0),
             ("features requirements gap", 12.0),
             ("requirements heading content gap", 6.0),
-            ("requirements maintenance gap", 12.0),
-            ("maintenance heading content gap", 6.0),
         ] {
             assert_near(
                 rect(name).height(),
@@ -5139,11 +5210,9 @@ mod tests {
         let features_content = rect("features content");
         let requirements_heading = rect("requirements heading");
         let requirements_content = rect("requirements content");
-        let maintenance_heading = rect("maintenance heading");
         assert!(features_heading.y1 <= features_content.y0);
         assert!(features_content.y1 <= requirements_heading.y0);
         assert!(requirements_heading.y1 <= requirements_content.y0);
-        assert!(requirements_content.y1 <= maintenance_heading.y0);
         assert!(
             requirements_content.height() <= 44.0 + LAYOUT_TOLERANCE,
             "requirement cells should keep their natural compact height"
@@ -5401,139 +5470,6 @@ mod tests {
             let output = render_with_input(&ctx, &mut data, &mut page, 1180.0, 815.0, Vec::new()).0;
             assert!(node_names(&output).iter().any(|name| name == expected));
         }
-    }
-
-    #[test]
-    fn model_card_lifecycle_controls_dispatch_matching_actions() {
-        let (width, height) = (1180.0, 815.0);
-        let cases = [
-            (
-                "Install",
-                ModelDownloadState::NotInstalled,
-                false,
-                false,
-                false,
-                false,
-                ScreenAction::InstallModel("lifecycle".into()),
-            ),
-            (
-                "Install",
-                ModelDownloadState::Failed,
-                false,
-                false,
-                false,
-                false,
-                ScreenAction::InstallModel("lifecycle".into()),
-            ),
-            (
-                "Resume Lifecycle download",
-                ModelDownloadState::Cancelled,
-                true,
-                false,
-                false,
-                false,
-                ScreenAction::InstallModel("lifecycle".into()),
-            ),
-            (
-                "Pause Lifecycle download",
-                ModelDownloadState::Downloading,
-                false,
-                false,
-                false,
-                false,
-                ScreenAction::CancelModelInstall("lifecycle".into()),
-            ),
-            (
-                "Delete",
-                ModelDownloadState::Installed,
-                false,
-                true,
-                false,
-                false,
-                ScreenAction::RequestModelRemoval("lifecycle".into()),
-            ),
-            (
-                "Upgrade",
-                ModelDownloadState::Installed,
-                false,
-                true,
-                true,
-                false,
-                ScreenAction::UpgradeModel("lifecycle".into()),
-            ),
-            (
-                "Repair",
-                ModelDownloadState::Installed,
-                false,
-                true,
-                false,
-                true,
-                ScreenAction::RepairModelRuntime("lifecycle".into()),
-            ),
-        ];
-
-        for (label, download_state, partial, installed, upgrade, repair, expected) in cases {
-            let ctx = egui::Context::default();
-            ctx.enable_accesskit();
-            configure_accessible_style(&ctx);
-            let mut data = Fixture::ModelsInstalled.data();
-            let mut model = ModelViewModel {
-                id: "lifecycle".into(),
-                display_name: "Lifecycle".into(),
-                installed,
-                ready: installed && !upgrade && !repair,
-                install_supported: true,
-                install_action_enabled: true,
-                cancel_supported: true,
-                removal_supported: true,
-                primary_action_enabled: true,
-                primary_action_installs_upgrade: upgrade,
-                primary_action_repairs_runtime: repair,
-                download_state,
-                partial_cleanup_available: partial,
-                languages: vec!["en".into()],
-                ..Default::default()
-            };
-            if label == "Install" {
-                model.download_state = ModelDownloadState::NotInstalled;
-            }
-            data.models = installed.then_some(model.clone()).into_iter().collect();
-            data.model_catalog = (!installed).then_some(model).into_iter().collect();
-            let mut page = AppPage::Models;
-            let name = if label.ends_with(" download") {
-                label.to_owned()
-            } else {
-                format!("{label} Lifecycle")
-            };
-            assert_eq!(
-                click_named_control(&ctx, &mut data, &mut page, width, height, &name),
-                expected,
-                "{label}"
-            );
-        }
-
-        let ctx = egui::Context::default();
-        ctx.enable_accesskit();
-        configure_accessible_style(&ctx);
-        let mut data = Fixture::ModelsInstalled.data();
-        data.models.clear();
-        data.model_catalog = vec![ModelViewModel {
-            id: "lifecycle".into(),
-            display_name: "Lifecycle".into(),
-            download_state: ModelDownloadState::Verifying,
-            install_supported: true,
-            languages: vec!["en".into()],
-            ..Default::default()
-        }];
-        let mut page = AppPage::Models;
-        let output = render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
-        let installing = node_matching(&output, |node| node.name() == Some("Installing Lifecycle"));
-        assert!(installing.is_disabled());
-        assert!(
-            installing
-                .description()
-                .is_some_and(|text| text.contains("cannot cancel"))
-        );
     }
 
     #[test]
@@ -5923,118 +5859,6 @@ mod tests {
     }
 
     #[test]
-    fn full_card_interaction_exists_only_for_ready_inactive_installed_models() {
-        let (width, height) = (1180.0, 815.0);
-        let ctx = egui::Context::default();
-        ctx.enable_accesskit();
-        configure_accessible_style(&ctx);
-        let mut data = Fixture::ModelsInstalled.data();
-        let mut page = AppPage::Models;
-        let output = render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
-        let card_target = node_matching(&output, |node| {
-            node.name() == Some("Use whisper.cpp tiny.en for future transcriptions")
-        });
-        assert_eq!(card_target.role(), egui::accesskit::Role::Button);
-        assert!(card_target.supports_action(egui::accesskit::Action::Default));
-        assert!(
-            card_target
-                .bounds()
-                .is_some_and(|bounds| bounds.height() >= 44.0)
-        );
-        let card_target_id =
-            named_node_id(&output, "Use whisper.cpp tiny.en for future transcriptions");
-        assert_eq!(
-            render_with_input(
-                &ctx,
-                &mut data,
-                &mut page,
-                width,
-                height,
-                vec![egui::Event::AccessKitActionRequest(
-                    egui::accesskit::ActionRequest {
-                        action: egui::accesskit::Action::Default,
-                        target: card_target_id,
-                        data: None,
-                    }
-                )],
-            )
-            .1,
-            ScreenAction::SelectModel("tiny.en".into())
-        );
-
-        let active = node_matching(&output, |node| {
-            node.name() == Some("whisper.cpp base.en")
-                && node.role() == egui::accesskit::Role::StaticText
-        });
-        assert!(active.bounds().is_some());
-        assert!(
-            !node_names(&output)
-                .iter()
-                .any(|name| name == "Use whisper.cpp base.en for future transcriptions")
-        );
-
-        for (display_name, model) in [
-            (
-                "Available title",
-                ModelViewModel {
-                    id: "available-title".into(),
-                    display_name: "Available title".into(),
-                    install_supported: true,
-                    install_action_enabled: true,
-                    languages: vec!["en".into()],
-                    ..Default::default()
-                },
-            ),
-            (
-                "Upgrade title",
-                ModelViewModel {
-                    id: "upgrade-title".into(),
-                    display_name: "Upgrade title".into(),
-                    installed: true,
-                    primary_action_enabled: true,
-                    primary_action_installs_upgrade: true,
-                    download_state: ModelDownloadState::Installed,
-                    languages: vec!["en".into()],
-                    ..Default::default()
-                },
-            ),
-            (
-                "Repair title",
-                ModelViewModel {
-                    id: "repair-title".into(),
-                    display_name: "Repair title".into(),
-                    installed: true,
-                    primary_action_enabled: true,
-                    primary_action_repairs_runtime: true,
-                    download_state: ModelDownloadState::Installed,
-                    languages: vec!["en".into()],
-                    ..Default::default()
-                },
-            ),
-        ] {
-            let mut fixture = Fixture::ModelsInstalled.data();
-            if model.installed {
-                fixture.models = vec![model];
-                fixture.model_catalog.clear();
-            } else {
-                fixture.models.clear();
-                fixture.model_catalog = vec![model];
-            }
-            let rendered =
-                render_with_input(&ctx, &mut fixture, &mut page, width, height, Vec::new()).0;
-            assert_eq!(
-                node_matching(&rendered, |node| node.name() == Some(display_name)).role(),
-                egui::accesskit::Role::StaticText,
-            );
-            assert!(
-                !node_names(&rendered).iter().any(|name| {
-                    name == &format!("Use {display_name} for future transcriptions")
-                })
-            );
-        }
-    }
-
-    #[test]
     fn full_card_background_pointer_keyboard_and_accesskit_activate_once() {
         let (width, height) = (1180.0, 815.0);
         let activate_at = |label: &str, node_name: Option<&str>| {
@@ -6218,88 +6042,6 @@ mod tests {
         );
         apply_action(&mut data, &mut page, action);
         assert!(data.model_management.restore_remove_focus.is_none());
-    }
-
-    #[test]
-    fn inline_runtime_and_active_uninstall_reasons_are_exposed() {
-        let ctx = egui::Context::default();
-        ctx.enable_accesskit();
-        configure_accessible_style(&ctx);
-        let mut data = Fixture::ModelsInstalled.data();
-        let mut active = data.models.remove(0);
-        active.runtime_action_label = Some("Repair".into());
-        active.runtime_action_enabled = false;
-        active.runtime_action_disabled_reason =
-            Some("Runtime maintenance is already running.".into());
-        data.models = vec![active.clone()];
-        data.model_catalog.clear();
-        data.model_management.expanded_model_card = Some(ModelCardKey::Local(active.id.clone()));
-        let mut page = AppPage::Models;
-        let output = render_with_input(&ctx, &mut data, &mut page, 1180.0, 815.0, Vec::new()).0;
-        let runtime = node_matching(&output, |node| {
-            node.name() == Some(format!("Repair runtime for {}", active.display_name).as_str())
-        });
-        assert!(runtime.is_disabled());
-        assert_eq!(
-            runtime.description(),
-            Some("Runtime maintenance is already running.")
-        );
-        assert!(
-            output
-                .platform_output
-                .accesskit_update
-                .as_ref()
-                .unwrap()
-                .nodes
-                .iter()
-                .any(|(_, node)| {
-                    node.name() == Some(format!("Delete {}", active.display_name).as_str())
-                        && node.description()
-                            == Some(
-                                "Install another ready model before removing the selected model.",
-                            )
-                })
-        );
-    }
-
-    #[test]
-    fn expanded_maintenance_control_participates_in_model_card_focus_within() {
-        let ctx = egui::Context::default();
-        ctx.enable_accesskit();
-        configure_accessible_style(&ctx);
-        let mut data = Fixture::ModelsInstalled.data();
-        let mut model = data.models.remove(0);
-        model.runtime_action_label = Some("Repair".into());
-        model.runtime_action_enabled = true;
-        data.models = vec![model.clone()];
-        data.model_catalog.clear();
-        data.model_management.expanded_model_card = Some(ModelCardKey::Local(model.id.clone()));
-        let mut page = AppPage::Models;
-        let initial = render_with_input(&ctx, &mut data, &mut page, 1180.0, 815.0, Vec::new()).0;
-        let name = format!("Repair runtime for {}", model.display_name);
-        let target = named_node_id(&initial, &name);
-        let (focused, action) = render_with_input(
-            &ctx,
-            &mut data,
-            &mut page,
-            1180.0,
-            815.0,
-            vec![egui::Event::AccessKitActionRequest(
-                egui::accesskit::ActionRequest {
-                    action: egui::accesskit::Action::Focus,
-                    target,
-                    data: None,
-                },
-            )],
-        );
-        assert_eq!(action, ScreenAction::None);
-        assert_eq!(focused_node(&focused).name(), Some(name.as_str()));
-        let card = named_node_bounds(&focused, &format!("{} model", model.display_name));
-        assert_bounds_within(
-            named_node_bounds(&focused, &name),
-            card,
-            "expanded maintenance focus target",
-        );
     }
 
     #[test]
@@ -6968,44 +6710,6 @@ mod tests {
                 remote_model_id: "trusted-speech/compact-english".into(),
                 variant_id: "compact-english-q5".into(),
             }
-        );
-    }
-
-    #[test]
-    fn expanded_legacy_cleanup_uses_upgrade_and_explicit_uninstall() {
-        let ctx = egui::Context::default();
-        ctx.enable_accesskit();
-        configure_accessible_style(&ctx);
-        let mut data = Fixture::ModelsInstalled.data();
-        data.models.clear();
-        data.model_catalog = vec![ModelViewModel {
-            id: "legacy".into(),
-            display_name: "Legacy model".into(),
-            legacy_cleanup_pending: true,
-            selected: true,
-            primary_action_installs_upgrade: true,
-            primary_action_enabled: true,
-            removal_supported: true,
-            languages: vec!["en".into()],
-            ..Default::default()
-        }];
-        data.model_management.expanded_model_card = Some(ModelCardKey::Local("legacy".into()));
-        let mut page = AppPage::Models;
-        let output = render_with_input(&ctx, &mut data, &mut page, 1180.0, 815.0, Vec::new()).0;
-        assert!(
-            node_names(&output)
-                .iter()
-                .any(|name| name == "Upgrade Legacy model")
-        );
-        assert!(
-            node_names(&output)
-                .iter()
-                .any(|name| name == "Delete Legacy model")
-        );
-        assert!(
-            !node_names(&output)
-                .iter()
-                .any(|name| name == "Install Legacy model")
         );
     }
 

@@ -1,4 +1,4 @@
-//! Runtime-neutral transcription contracts and the Phase 1 legacy bridge.
+//! Runtime-neutral transcription contracts for static GGUF and native ONNX.
 //!
 //! Application code should depend on [`TranscriptionService`] and the types in
 //! this module rather than on a concrete STT backend. The current adapters are
@@ -7,42 +7,38 @@
 
 // Phase 1 establishes the complete stable contract before native streaming,
 // lifecycle wiring, and capability UI are introduced in later phases.
-#![allow(dead_code)]
-
 use std::fmt;
-use std::fs::{self, OpenOptions};
-use std::io::BufWriter;
+#[cfg(test)]
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex, TryLockError};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
-#[cfg(unix)]
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+#[cfg(test)]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{self, AppConfig};
-use crate::installations::{
-    InstallCancellation, previous_runtime_root, rollback_to_previous_runtime, verify_runtime_tree,
-};
+use crate::installations::InstallCancellation;
 use crate::model_catalog::{
     ArtifactFormat, model_descriptor, normal_model_descriptors, runtime_artifact_manifest_for_path,
-    runtime_model_manifest,
 };
-#[allow(unused_imports)]
-pub use crate::model_catalog::{
-    CompatibilityStatus, ModelCapabilities, ModelDescriptor, ModelRole,
-};
-use crate::models::{SttModelInfo, TranscriptResult as LegacyTranscriptResult};
-use crate::onnx_worker::{InferenceWorkerSupervisor, OnnxModelSpec};
+pub use crate::model_catalog::{CompatibilityStatus, ModelDescriptor};
+use crate::models::SttModelInfo;
+#[cfg(test)]
+use crate::onnx_model_bundles::OnnxBundleManifest;
+use crate::onnx_worker::InferenceWorkerSupervisor;
 use crate::prepared_audio::{PREPARED_SAMPLE_RATE, PreparedAudio};
+use crate::runtime_artifact::{OnnxModelSpec, RuntimeArtifact, RuntimeModel};
+#[cfg(test)]
+use crate::runtime_router::IdleTimeoutAction;
 use crate::runtime_router::{
-    IdleTimeoutAction, NativeBootstrapFailure, RuntimeArtifact, RuntimeError, RuntimeExecution,
-    RuntimeLoadExecution, RuntimeModel, RuntimeRouter, WARM_MODEL_TTL, verify_compatibility_cli,
+    RuntimeError, RuntimeExecution, RuntimeLoadExecution, RuntimeRouter, WARM_MODEL_TTL,
 };
 use crate::streaming::{
     HypothesisWord, PreviewAudioPublisher, PreviewEvent, RollingPreviewSession, StreamIdentity,
@@ -94,6 +90,7 @@ pub enum AccelerationPreference {
 }
 
 impl AccelerationPreference {
+    #[cfg(test)]
     pub const ALL: [Self; 3] = [Self::Auto, Self::Gpu, Self::Cpu];
 
     pub fn label(self) -> &'static str {
@@ -308,7 +305,7 @@ pub struct RuntimeCapabilities {
     pub supported_languages: Vec<String>,
 }
 
-/// A fully staged model/runtime pair that has not yet been activated.
+/// A fully staged model artifact that has not yet been activated.
 /// Concrete runtime selection remains private to the router used by the
 /// service's dedicated verification worker.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -316,17 +313,13 @@ pub(crate) struct InstallationCandidate {
     pub(crate) model_id: ModelId,
     pub(crate) model_path: PathBuf,
     pub(crate) artifact_format: ArtifactFormat,
-    pub(crate) runtime_package_root: Option<PathBuf>,
     pub(crate) expected_size_bytes: u64,
     pub(crate) expected_sha256: String,
 }
 
 impl InstallationCandidate {
-    pub(crate) fn normalized(
-        model_id: ModelId,
-        model_path: PathBuf,
-        runtime_package_root: Option<PathBuf>,
-    ) -> Result<Self> {
+    #[cfg(test)]
+    pub(crate) fn normalized(model_id: ModelId, model_path: PathBuf) -> Result<Self> {
         let manifest =
             runtime_artifact_manifest_for_path(&model_id, &model_path).ok_or_else(|| {
                 anyhow!(
@@ -338,7 +331,6 @@ impl InstallationCandidate {
             model_id,
             model_path,
             artifact_format: manifest.format,
-            runtime_package_root,
             expected_size_bytes: manifest.size_bytes,
             expected_sha256: manifest.sha256.to_owned(),
         })
@@ -348,7 +340,6 @@ impl InstallationCandidate {
         model_id: ModelId,
         model_path: PathBuf,
         artifact_format: ArtifactFormat,
-        runtime_package_root: Option<PathBuf>,
         expected_size_bytes: u64,
         expected_sha256: String,
     ) -> Self {
@@ -356,7 +347,6 @@ impl InstallationCandidate {
             model_id,
             model_path,
             artifact_format,
-            runtime_package_root,
             expected_size_bytes,
             expected_sha256,
         }
@@ -459,12 +449,6 @@ impl VerifiedInstallationCandidate {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct InstallationBinding {
-    pub(crate) managed_runtime_id: String,
-    pub(crate) installed_package_root: Option<PathBuf>,
-}
-
 /// The normalized install plan derived from the trusted catalog. These plans
 /// are artifact-only: worker readiness follows verification and activation,
 /// never a compatibility-provider runtime request.
@@ -472,41 +456,6 @@ pub(crate) struct InstallationBinding {
 pub(crate) enum InstallPlan {
     PinnedGguf,
     ReceiptBackedOnnx,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RuntimeRecovery {
-    pub(crate) managed_runtime_id: String,
-    pub(crate) entrypoint: PathBuf,
-    pub(crate) version: String,
-    pub(crate) archive_sha256: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum VerifiedInstallationCapability {
-    Available { package_version: String },
-    Unavailable { reason: String },
-}
-
-/// Reports verified installation support for a normalized model. Concrete
-/// package and catalog selection stay below the application-facing service
-/// boundary, while callers can distinguish a legacy model from a normalized
-/// model whose package is unavailable on this platform.
-pub(crate) fn verified_installation_capability(
-    model_id: &ModelId,
-) -> Option<VerifiedInstallationCapability> {
-    runtime_model_manifest(model_id)?;
-    let archive = config::runtime_storage_dir()
-        .join(".downloads")
-        .join("whisper-cpp-v1.9.1-windows-x64-cpu.zip");
-    Some(
-        match crate::runtime_catalog::primary_runtime_install_spec(archive) {
-            Ok(package) => VerifiedInstallationCapability::Available {
-                package_version: package.version,
-            },
-            Err(reason) => VerifiedInstallationCapability::Unavailable { reason },
-        },
-    )
 }
 
 /// A streaming decoder update with stable and revisable portions separated.
@@ -520,33 +469,9 @@ pub struct StreamUpdate {
 pub trait SpeechEngine: Send {
     fn load(&mut self) -> Result<()>;
 
-    fn transcribe(
-        &mut self,
-        audio: &PreparedAudio,
-        options: &TranscriptionOptions,
-    ) -> Result<Transcript>;
-
     fn capabilities(&self) -> RuntimeCapabilities;
 
-    fn health_check(&mut self) -> Result<()>;
-
-    fn cancel(&mut self) -> Result<()>;
-
     fn unload(&mut self) -> Result<()>;
-}
-
-/// Optional extension for engines that can decode incrementally.
-pub trait StreamingSpeechEngine: SpeechEngine {
-    fn start_stream(&mut self, options: &TranscriptionOptions) -> Result<Box<dyn SpeechStream>>;
-}
-
-/// A live speech-decoding session.
-pub trait SpeechStream: Send {
-    fn push_audio(&mut self, samples: &[f32]) -> Result<StreamUpdate>;
-
-    fn finalize(self: Box<Self>) -> Result<Transcript>;
-
-    fn cancel(self: Box<Self>) -> Result<()>;
 }
 
 /// A prepared-audio request that preserves application correlation IDs.
@@ -709,12 +634,6 @@ enum RuntimeCommand {
         preference: AccelerationPreference,
         reply: SyncSender<Result<(), RuntimeError>>,
     },
-    StartStream {
-        artifact: RuntimeArtifact,
-        preference: AccelerationPreference,
-        options: TranscriptionOptions,
-        reply: SyncSender<Result<Box<dyn SpeechStream>, RuntimeError>>,
-    },
     Unload {
         reply: SyncSender<Result<(), RuntimeError>>,
     },
@@ -741,8 +660,8 @@ struct RuntimeWorkerInner {
 }
 
 impl RuntimeWorker {
+    #[cfg(test)]
     fn new(router: RuntimeRouter) -> Self {
-        cleanup_stale_temporary_audio();
         let (commands, receiver) = sync_channel(1);
         let worker_router = router.clone();
         let worker = std::thread::Builder::new()
@@ -762,7 +681,6 @@ impl RuntimeWorker {
     }
 
     fn new_process() -> Self {
-        cleanup_stale_temporary_audio();
         let inference = InferenceWorkerSupervisor::unstarted();
         let worker_inference = inference.clone();
         let cancellation_generation = Arc::new(AtomicU64::new(0));
@@ -788,7 +706,6 @@ impl RuntimeWorker {
 
     #[cfg(test)]
     fn new_process_for_executable(executable: PathBuf) -> Self {
-        cleanup_stale_temporary_audio();
         let inference = InferenceWorkerSupervisor::unstarted_for_executable(executable);
         let worker_inference = inference.clone();
         let cancellation_generation = Arc::new(AtomicU64::new(0));
@@ -888,27 +805,6 @@ impl RuntimeWorker {
             .send(RuntimeCommand::Health {
                 artifact: artifact.into(),
                 preference,
-                reply,
-            })
-            .map_err(|error| RuntimeError::WorkerUnavailable(error.to_string()))?;
-        response
-            .recv()
-            .map_err(|error| RuntimeError::WorkerUnavailable(error.to_string()))?
-    }
-
-    fn start_stream(
-        &self,
-        artifact: impl Into<RuntimeArtifact>,
-        preference: AccelerationPreference,
-        options: TranscriptionOptions,
-    ) -> Result<Box<dyn SpeechStream>, RuntimeError> {
-        let (reply, response) = sync_channel(1);
-        self.inner
-            .commands
-            .send(RuntimeCommand::StartStream {
-                artifact: artifact.into(),
-                preference,
-                options,
                 reply,
             })
             .map_err(|error| RuntimeError::WorkerUnavailable(error.to_string()))?;
@@ -1028,6 +924,7 @@ impl fmt::Debug for RuntimeWorker {
     }
 }
 
+#[cfg(test)]
 fn runtime_worker_loop(router: RuntimeRouter, commands: Receiver<RuntimeCommand>) {
     let activity = router.runtime_activity();
     let mut idle_wait = WARM_MODEL_TTL;
@@ -1071,18 +968,6 @@ fn runtime_worker_loop(router: RuntimeRouter, commands: Receiver<RuntimeCommand>
             }) => {
                 let request_activity = activity.acquire_request().ok();
                 let result = router.health_check(artifact, preference);
-                let succeeded = result.is_ok();
-                let _ = reply.send(result);
-                (succeeded, request_activity)
-            }
-            Ok(RuntimeCommand::StartStream {
-                artifact,
-                preference,
-                options,
-                reply,
-            }) => {
-                let request_activity = activity.acquire_request().ok();
-                let result = router.start_stream(artifact, preference, &options);
                 let succeeded = result.is_ok();
                 let _ = reply.send(result);
                 (succeeded, request_activity)
@@ -1189,17 +1074,6 @@ fn inference_worker_dispatch_loop(
                 let _ = reply.send(result);
                 succeeded
             }
-            Ok(RuntimeCommand::StartStream {
-                artifact,
-                preference,
-                options,
-                reply,
-            }) => {
-                let result = inference.start_stream(artifact, preference, options);
-                let succeeded = result.is_ok();
-                let _ = reply.send(result);
-                succeeded
-            }
             Ok(RuntimeCommand::Unload { reply }) => {
                 let result = inference.unload();
                 let succeeded = result.is_ok();
@@ -1240,6 +1114,8 @@ pub struct TranscriptionService {
     config: AppConfig,
     #[cfg(test)]
     router: RuntimeRouter,
+    #[cfg(test)]
+    current_receipt_manifest: Option<OnnxBundleManifest>,
     worker: RuntimeWorker,
 }
 
@@ -1256,6 +1132,8 @@ impl TranscriptionService {
             worker,
             #[cfg(test)]
             router,
+            #[cfg(test)]
+            current_receipt_manifest: None,
         }
     }
 
@@ -1266,16 +1144,9 @@ impl TranscriptionService {
             config,
             #[cfg(test)]
             router: self.router.clone(),
+            #[cfg(test)]
+            current_receipt_manifest: self.current_receipt_manifest.clone(),
             worker: self.worker.clone(),
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn with_runtime_router(config: AppConfig, router: RuntimeRouter) -> Self {
-        Self {
-            config,
-            worker: RuntimeWorker::new(router.clone()),
-            router,
         }
     }
 
@@ -1285,55 +1156,17 @@ impl TranscriptionService {
             config,
             worker: RuntimeWorker::new_process_for_executable(executable),
             router: RuntimeRouter::new(),
+            current_receipt_manifest: None,
         }
     }
 
-    pub(crate) fn preload_runtime_artifact(
-        &self,
-        artifact: RuntimeArtifact,
-    ) -> Result<RuntimeLoadExecution> {
-        self.worker
-            .load(artifact, self.config.performance.acceleration_preference)
-            .map_err(Into::into)
+    #[cfg(test)]
+    fn with_test_current_receipt_manifest(mut self, manifest: OnnxBundleManifest) -> Self {
+        self.current_receipt_manifest = Some(manifest);
+        self
     }
 
-    pub(crate) fn transcribe_runtime_artifact(
-        &self,
-        artifact: RuntimeArtifact,
-        audio: Arc<PreparedAudio>,
-        options: TranscriptionOptions,
-    ) -> Result<RuntimeExecution> {
-        self.worker
-            .transcribe(
-                artifact,
-                self.config.performance.acceleration_preference,
-                audio,
-                options,
-                self.worker.cancellation_snapshot(),
-            )
-            .map_err(Into::into)
-    }
-
-    pub(crate) fn health_check_runtime_artifact(&self, artifact: RuntimeArtifact) -> Result<()> {
-        self.worker
-            .health_check(artifact, self.config.performance.acceleration_preference)
-            .map_err(Into::into)
-    }
-
-    pub(crate) fn start_runtime_stream(
-        &self,
-        artifact: RuntimeArtifact,
-        options: TranscriptionOptions,
-    ) -> Result<Box<dyn SpeechStream>> {
-        self.worker
-            .start_stream(
-                artifact,
-                self.config.performance.acceleration_preference,
-                options,
-            )
-            .map_err(Into::into)
-    }
-
+    #[cfg(test)]
     pub(crate) fn unload_runtime_artifacts(&self) -> Result<()> {
         self.worker.unload().map_err(Into::into)
     }
@@ -1343,7 +1176,23 @@ impl TranscriptionService {
     /// manifest. This path is local-only and never grants a self-authored or
     /// retired receipt executable trust.
     fn onnx_artifact_from_receipt(&self, root: &Path) -> Result<RuntimeArtifact> {
-        let (_, spec) = crate::onnx_model_bundles::current_executable_receipt_at(root)
+        #[cfg(not(test))]
+        let spec = crate::onnx_model_bundles::current_executable_receipt_at(root)
+            .map(|(_, spec)| spec)
+            .map_err(|error| anyhow!("installed ONNX bundle verification failed: {error}"))?;
+        #[cfg(test)]
+        let spec = self
+            .current_receipt_manifest
+            .as_ref()
+            .map_or_else(
+                || crate::onnx_model_bundles::current_executable_receipt_at(root),
+                |manifest| {
+                    crate::onnx_model_bundles::current_executable_receipt_at_with_manifest_for_test(
+                        root, manifest,
+                    )
+                },
+            )
+            .map(|(_, spec)| spec)
             .map_err(|error| anyhow!("installed ONNX bundle verification failed: {error}"))?;
         Ok(RuntimeArtifact::OnnxBundle(spec))
     }
@@ -1360,6 +1209,7 @@ impl TranscriptionService {
             .map_err(Into::into)
     }
 
+    #[cfg(test)]
     pub(crate) fn transcribe_onnx_bundle_from_receipt(
         &self,
         root: &Path,
@@ -1530,55 +1380,6 @@ impl TranscriptionService {
         }
     }
 
-    /// Returns the deterministic catalog target without trusting persisted
-    /// runtime paths. Startup uses it to find recovery state even when a
-    /// managed-runtime settings record is absent or malformed.
-    pub(crate) fn recovery_installation_binding(
-        &self,
-        model_id: &ModelId,
-    ) -> Result<InstallationBinding> {
-        if self.install_plan(model_id).is_some() {
-            return Err(anyhow!(
-                "artifact-only models do not have a recoverable runtime package"
-            ));
-        }
-        let runtime_id = RuntimeRouter::managed_runtime_id_for(model_id)
-            .ok_or_else(|| anyhow!("model {model_id} has no installable native runtime"))?;
-        Ok(InstallationBinding {
-            managed_runtime_id: runtime_id.to_owned(),
-            installed_package_root: Some(config::runtime_storage_dir().join(runtime_id)),
-        })
-    }
-
-    pub(crate) fn rollback_to_previous_runtime(
-        &self,
-        model_id: &ModelId,
-    ) -> Result<Option<RuntimeRecovery>> {
-        let runtime_id = RuntimeRouter::managed_runtime_id_for(model_id)
-            .ok_or_else(|| anyhow!("model {model_id} has no managed native runtime"))?;
-        let target = config::runtime_storage_dir().join(runtime_id);
-        let previous = previous_runtime_root(&target);
-        if !previous.exists() {
-            return Ok(None);
-        }
-        let archive = config::runtime_storage_dir()
-            .join(".downloads")
-            .join("whisper-cpp-v1.9.1-windows-x64-cpu.zip");
-        let spec = crate::runtime_catalog::primary_runtime_install_spec(archive)
-            .map_err(|error| anyhow!(error))?;
-        verify_runtime_tree(&previous, &spec.archive.files)
-            .map_err(|error| anyhow!("previous runtime failed manifest verification: {error}"))?;
-        if !rollback_to_previous_runtime(&target).map_err(|error| anyhow!(error))? {
-            return Ok(None);
-        }
-        Ok(Some(RuntimeRecovery {
-            managed_runtime_id: runtime_id.to_owned(),
-            entrypoint: target.join(spec.compatibility_entrypoint),
-            version: spec.version,
-            archive_sha256: spec.archive.artifact.sha256,
-        }))
-    }
-
     /// Returns the conservative feature set for a configured model.
     pub fn capabilities_for(&self, model_id: &ModelId) -> Result<RuntimeCapabilities> {
         let model = self.resolve_model(model_id, None)?;
@@ -1615,7 +1416,9 @@ impl TranscriptionService {
                 .ok_or_else(|| anyhow!("unknown normalized transcription model: {model_id}"))?;
             return Ok(intersect_capabilities(&runtime_capabilities, &descriptor));
         }
-        Ok(capabilities_for_legacy_model(&model))
+        Err(anyhow!(
+            "model {model_id} has no supported native transcription runtime"
+        ))
     }
 
     fn effective_descriptor(&self, mut descriptor: ModelDescriptor) -> ModelDescriptor {
@@ -1703,9 +1506,6 @@ impl TranscriptionService {
     ) -> Result<()> {
         let model = self.resolve_model(model_id, model_path)?;
         let runtime_model = self.resolve_runtime_model(model)?;
-        if let Some(package_root) = runtime_model.package_root.as_deref() {
-            verify_primary_runtime_package_tree(package_root)?;
-        }
         verify_runtime_model_artifact(&runtime_model)?;
         let mut smoke_config = self.config.clone();
         smoke_config.performance.acceleration_preference = AccelerationPreference::Cpu;
@@ -1715,57 +1515,6 @@ impl TranscriptionService {
                     runtime_model.id,
                     runtime_model.path,
                     runtime_model.format,
-                    runtime_model.package_root,
-                    runtime_model.expected_size_bytes,
-                    runtime_model.expected_sha256,
-                ),
-                &InstallCancellation::default(),
-            )
-            .map(|_| ())
-    }
-
-    /// Verifies only the immutable package shipped beside the application.
-    /// Developer and managed runtime paths are deliberately excluded so a
-    /// recovery message can never claim that an arbitrary CLI was bundled.
-    pub(crate) fn startup_bundled_runtime_health_and_load(
-        &self,
-        model_id: &ModelId,
-        model_path: Option<PathBuf>,
-    ) -> Result<()> {
-        let package_root = crate::compatibility_bridge::primary_bundled_runtime_package_root()
-            .ok_or_else(|| anyhow!("the application executable has no package directory"))?;
-        let model = self.resolve_model(model_id, model_path)?;
-        let path = model
-            .local_path
-            .ok_or_else(|| anyhow!("download {} before verification", model.name))?;
-        let manifest = runtime_artifact_manifest_for_path(model_id, &path).ok_or_else(|| {
-            anyhow!(
-                "model {} has no pinned size and SHA-256 evidence for {}",
-                model.name,
-                path.display()
-            )
-        })?;
-        let runtime_model = RuntimeModel {
-            id: model_id.clone(),
-            path,
-            format: manifest.format,
-            package_root: Some(package_root),
-            expected_size_bytes: manifest.size_bytes,
-            expected_sha256: manifest.sha256.to_owned(),
-        };
-        if let Some(package_root) = runtime_model.package_root.as_deref() {
-            verify_primary_runtime_package_tree(package_root)?;
-        }
-        verify_runtime_model_artifact(&runtime_model)?;
-        let mut smoke_config = self.config.clone();
-        smoke_config.performance.acceleration_preference = AccelerationPreference::Cpu;
-        self.with_config(smoke_config)
-            .verify_installation_candidate(
-                InstallationCandidate::pinned(
-                    runtime_model.id,
-                    runtime_model.path,
-                    runtime_model.format,
-                    runtime_model.package_root,
                     runtime_model.expected_size_bytes,
                     runtime_model.expected_sha256,
                 ),
@@ -1808,14 +1557,14 @@ impl TranscriptionService {
     /// call. Later requests capture the new generation and are unaffected.
     pub fn cancel_active(&self) {
         self.worker.cancel_active();
-        crate::stt::cancel_active_processes();
+        crate::stt::cancel_active_requests();
     }
 
     /// Cancels active work and waits for service requests and compatibility
     /// processes to release their transient audio resources.
     pub fn cancel_active_and_wait(&self, timeout: Duration) -> bool {
         self.worker.cancel_active();
-        crate::stt::cancel_active_processes_and_wait(timeout)
+        crate::stt::cancel_active_requests_and_wait(timeout)
     }
 
     /// Stops the dedicated native runtime and joins it within the caller's
@@ -1873,16 +1622,7 @@ impl TranscriptionService {
             .arg(INSTALL_SMOKE_HELPER_FLAG)
             .arg(candidate.model_id.as_str())
             .arg(&candidate.model_path)
-            .arg(match candidate.artifact_format {
-                ArtifactFormat::Gguf => "gguf",
-                ArtifactFormat::LegacyGgml => "legacy-ggml",
-            })
-            .arg(
-                candidate
-                    .runtime_package_root
-                    .as_deref()
-                    .unwrap_or_else(|| Path::new("-")),
-            )
+            .arg("gguf")
             .arg(candidate.expected_size_bytes.to_string())
             .arg(&candidate.expected_sha256)
             .arg(acceleration)
@@ -1980,13 +1720,9 @@ impl TranscriptionService {
             id: candidate.model_id,
             path: candidate.model_path,
             format: candidate.artifact_format,
-            package_root: candidate.runtime_package_root,
             expected_size_bytes: candidate.expected_size_bytes,
             expected_sha256: candidate.expected_sha256,
         };
-        if let Some(package_root) = runtime_model.package_root.as_deref() {
-            verify_primary_runtime_package_tree(package_root)?;
-        }
         // The smoke helper itself remains lightweight and launches a fresh,
         // disposable unified inference child so regular warm state is never
         // loaded, unloaded, or invalidated by installation verification.
@@ -2191,6 +1927,7 @@ impl TranscriptionService {
         Ok(map_native_execution(request, model, execution))
     }
 
+    #[cfg(test)]
     pub fn transcribe_with_ticket(
         &self,
         request: TranscriptionRequest,
@@ -2250,7 +1987,10 @@ impl TranscriptionService {
             return self.transcribe_primary(request, model, ticket);
         }
 
-        self.transcribe_legacy(request, model, ticket)
+        Err(anyhow!(
+            "model {} has no supported native transcription runtime",
+            request.model_id
+        ))
     }
 
     fn transcribe_primary(
@@ -2261,89 +2001,16 @@ impl TranscriptionService {
     ) -> Result<TranscriptionOutcome> {
         validate_default_options(&request.options)?;
         let runtime_model = self.resolve_runtime_model(model.clone())?;
-        match self.worker.transcribe(
-            runtime_model,
-            self.config.performance.acceleration_preference,
-            Arc::clone(&request.audio),
-            request.options.clone(),
-            ticket.native_generation,
-        ) {
-            Ok(execution) => Ok(map_native_execution(request, model, execution)),
-            Err(crate::runtime_router::RuntimeError::Bootstrap(failure))
-                if failure.cli_fallback_eligible() =>
-            {
-                self.transcribe_legacy_with_fallback_reason(request, model, failure, ticket)
-            }
-            Err(error) => Err(anyhow!(error)),
-        }
-    }
-
-    fn transcribe_legacy(
-        &self,
-        request: TranscriptionRequest,
-        model: SttModelInfo,
-        ticket: TranscriptionTicket,
-    ) -> Result<TranscriptionOutcome> {
-        self.transcribe_legacy_inner(request, model, None, ticket)
-    }
-
-    fn transcribe_legacy_with_fallback_reason(
-        &self,
-        request: TranscriptionRequest,
-        model: SttModelInfo,
-        failure: NativeBootstrapFailure,
-        ticket: TranscriptionTicket,
-    ) -> Result<TranscriptionOutcome> {
-        self.transcribe_legacy_inner(request, model, Some(failure.to_string()), ticket)
-    }
-
-    fn transcribe_legacy_inner(
-        &self,
-        request: TranscriptionRequest,
-        model: SttModelInfo,
-        fallback_reason: Option<String>,
-        ticket: TranscriptionTicket,
-    ) -> Result<TranscriptionOutcome> {
-        if fallback_reason.is_some() {
-            let cli = crate::compatibility_bridge::primary_runtime_entrypoint(&self.config)
-                .ok_or_else(|| anyhow!("the verified compatibility CLI is unavailable"))?;
-            verify_compatibility_cli(&cli).map_err(|error| anyhow!(error))?;
-        }
-        let mut engine =
-            LegacyBatchAdapter::new(self.config.clone(), model, ticket.process_generation);
-        engine.load()?;
-        let transcription = engine.transcribe(&request.audio, &request.options);
-        let unload_result = engine.unload();
-        let transcript = transcription?;
-        unload_result?;
-        let diagnostics = engine.take_diagnostics().ok_or_else(|| {
-            anyhow!("legacy transcription completed without diagnostics; this is a service bug")
-        })?;
-        validate_response_model_id(&request.model_id, &diagnostics)?;
-
-        let mut stderr = diagnostics.stderr;
-        if let Some(reason) = fallback_reason {
-            if !stderr.is_empty() {
-                stderr.push('\n');
-            }
-            stderr.push_str("Native bootstrap fallback: ");
-            stderr.push_str(&reason);
-        }
-
-        Ok(TranscriptionOutcome {
-            session_id: request.session_id,
-            request_id: request.request_id,
-            model_id: diagnostics.model_id,
-            model_name: diagnostics.model_name,
-            backend_label: diagnostics.backend_label,
-            transcript,
-            processing_duration_ms: diagnostics.processing_duration_ms,
-            resolved_acceleration: None,
-            model_load_duration_ms: None,
-            warm_model_reused: false,
-            stdout: diagnostics.stdout,
-            stderr,
-        })
+        self.worker
+            .transcribe(
+                runtime_model,
+                self.config.performance.acceleration_preference,
+                Arc::clone(&request.audio),
+                request.options.clone(),
+                ticket.native_generation,
+            )
+            .map(|execution| map_native_execution(request, model, execution))
+            .map_err(|error| anyhow!(error))
     }
 
     fn resolve_runtime_model(&self, model: SttModelInfo) -> Result<RuntimeModel> {
@@ -2382,29 +2049,10 @@ impl TranscriptionService {
                     artifact.sha256.to_owned(),
                 )
             };
-        let package_root = if artifact_format == ArtifactFormat::Gguf {
-            None
-        } else {
-            Some(
-                match RuntimeRouter::managed_runtime_id_for(&model_id) {
-                    Some(runtime_id) => {
-                        configured_managed_runtime_root(&self.config, runtime_id)?
-                    }
-                    None => None,
-                }
-                .or_else(|| primary_runtime_package_root(&self.config))
-                .ok_or_else(|| {
-                    anyhow!(
-                        "the verified native runtime package is not installed; install it from Models or configure the compatibility CLI"
-                    )
-                })?,
-            )
-        };
         Ok(RuntimeModel {
             id: model.id.into(),
             path,
             format: artifact_format,
-            package_root,
             expected_size_bytes,
             expected_sha256,
         })
@@ -2456,12 +2104,8 @@ pub(crate) fn maybe_run_installation_smoke_helper() -> Option<i32> {
             .map_err(|_| anyhow!("artifact format is not valid Unicode"))?;
         let artifact_format = match artifact_format.as_str() {
             "gguf" => ArtifactFormat::Gguf,
-            "legacy-ggml" => ArtifactFormat::LegacyGgml,
             _ => return Err(anyhow!("invalid artifact format")),
         };
-        let runtime_package_root = args
-            .next()
-            .ok_or_else(|| anyhow!("missing runtime package root"))?;
         let expected_size_bytes = args
             .next()
             .ok_or_else(|| anyhow!("missing expected model size"))?
@@ -2500,7 +2144,6 @@ pub(crate) fn maybe_run_installation_smoke_helper() -> Option<i32> {
             ModelId::new(model_id),
             PathBuf::from(model_path),
             artifact_format,
-            (runtime_package_root != "-").then(|| PathBuf::from(runtime_package_root)),
             expected_size_bytes,
             expected_sha256,
         );
@@ -2549,17 +2192,7 @@ fn verify_runtime_model_artifact(runtime_model: &RuntimeModel) -> Result<()> {
     .map_err(|error| anyhow!("model integrity verification failed: {error}"))
 }
 
-fn verify_primary_runtime_package_tree(package_root: &Path) -> Result<()> {
-    let archive = config::runtime_storage_dir()
-        .join(".downloads")
-        .join("whisper-cpp-v1.9.1-windows-x64-cpu.zip");
-    let spec = crate::runtime_catalog::primary_runtime_install_spec(archive)
-        .map_err(|error| anyhow!("could not resolve the pinned runtime manifest: {error}"))?;
-    verify_runtime_tree(package_root, &spec.archive.files).map_err(|error| {
-        anyhow!("runtime package tree failed exact manifest verification: {error}")
-    })
-}
-
+#[cfg(test)]
 fn model_uses_embedded_gguf(model_id: &ModelId) -> bool {
     crate::model_catalog::model_uses_embedded_runtime(model_id)
 }
@@ -2569,157 +2202,6 @@ fn ensure_install_not_cancelled(cancellation: &InstallCancellation) -> Result<()
         Err(anyhow!("installation verification was cancelled"))
     } else {
         Ok(())
-    }
-}
-
-fn primary_runtime_package_root(config: &AppConfig) -> Option<PathBuf> {
-    let entrypoint = crate::compatibility_bridge::primary_runtime_entrypoint(config)?;
-    let bin_dir = entrypoint.parent()?;
-    if bin_dir
-        .file_name()
-        .is_some_and(|name| name.eq_ignore_ascii_case("bin"))
-    {
-        bin_dir.parent().map(Path::to_path_buf)
-    } else {
-        Some(bin_dir.to_path_buf())
-    }
-}
-
-fn configured_managed_runtime_root(
-    config: &AppConfig,
-    runtime_id: &str,
-) -> Result<Option<PathBuf>> {
-    configured_managed_runtime_root_in(config, runtime_id, &config::runtime_storage_dir())
-}
-
-fn configured_managed_runtime_root_in(
-    config: &AppConfig,
-    runtime_id: &str,
-    storage_dir: &Path,
-) -> Result<Option<PathBuf>> {
-    let Some(install) = config.general.managed_runtimes.get(runtime_id) else {
-        return Ok(None);
-    };
-    if install
-        .path
-        .components()
-        .any(|component| matches!(component, std::path::Component::ParentDir))
-    {
-        return Err(anyhow!(
-            "managed runtime {runtime_id} contains a parent-directory path component"
-        ));
-    }
-    let expected = storage_dir.join(runtime_id);
-    if !install.path.starts_with(storage_dir) {
-        return Err(anyhow!(
-            "managed runtime {runtime_id} points outside its catalog target: configured {}, expected {}",
-            install.path.display(),
-            expected.display()
-        ));
-    }
-    if runtime_path_has_link_or_reparse_below(storage_dir, &expected)
-        || runtime_path_has_link_or_reparse_below(storage_dir, &install.path)
-    {
-        return Err(anyhow!(
-            "managed runtime {runtime_id} crosses a symbolic link or Windows reparse point"
-        ));
-    }
-    let archive = storage_dir
-        .join(".downloads")
-        .join("whisper-cpp-v1.9.1-windows-x64-cpu.zip");
-    let spec = crate::runtime_catalog::primary_runtime_install_spec(archive)
-        .map_err(|error| anyhow!("could not resolve the pinned runtime entrypoint: {error}"))?;
-    let expected_entrypoint = expected.join(spec.compatibility_entrypoint);
-    let configured_entrypoint = install.path.canonicalize().map_err(|error| {
-        anyhow!(
-            "managed runtime {runtime_id} entrypoint {} is unavailable: {error}",
-            install.path.display()
-        )
-    })?;
-    let expected_entrypoint_canonical = expected_entrypoint.canonicalize().map_err(|error| {
-        anyhow!(
-            "managed runtime {runtime_id} pinned entrypoint {} is unavailable: {error}",
-            expected_entrypoint.display()
-        )
-    })?;
-    if configured_entrypoint != expected_entrypoint_canonical {
-        return Err(anyhow!(
-            "managed runtime {runtime_id} does not name its exact pinned entrypoint: configured {}, expected {}",
-            install.path.display(),
-            expected_entrypoint.display()
-        ));
-    }
-    let configured = package_root_from_entrypoint(&install.path).ok_or_else(|| {
-        anyhow!(
-            "managed runtime {runtime_id} has no package root for {}",
-            install.path.display()
-        )
-    })?;
-    let expected_canonical = expected.canonicalize().map_err(|error| {
-        anyhow!(
-            "managed runtime {runtime_id} target {} is unavailable: {error}",
-            expected.display()
-        )
-    })?;
-    let configured_canonical = configured.canonicalize().map_err(|error| {
-        anyhow!(
-            "managed runtime {runtime_id} configured root {} is unavailable: {error}",
-            configured.display()
-        )
-    })?;
-    if configured_canonical != expected_canonical {
-        return Err(anyhow!(
-            "managed runtime {runtime_id} points outside its catalog target: configured {}, expected {}",
-            configured.display(),
-            expected.display()
-        ));
-    }
-    Ok(Some(expected))
-}
-
-fn runtime_path_has_link_or_reparse_below(root: &Path, path: &Path) -> bool {
-    let Ok(relative) = path.strip_prefix(root) else {
-        return true;
-    };
-    let mut current = root.to_path_buf();
-    for component in relative.components() {
-        if !matches!(component, std::path::Component::Normal(_)) {
-            return true;
-        }
-        current.push(component.as_os_str());
-        let Ok(metadata) = fs::symlink_metadata(&current) else {
-            return true;
-        };
-        if runtime_metadata_is_link_or_reparse(&metadata) {
-            return true;
-        }
-    }
-    false
-}
-
-#[cfg(windows)]
-fn runtime_metadata_is_link_or_reparse(metadata: &fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
-    metadata.file_type().is_symlink()
-        || metadata.file_attributes()
-            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
-            != 0
-}
-
-#[cfg(not(windows))]
-fn runtime_metadata_is_link_or_reparse(metadata: &fs::Metadata) -> bool {
-    metadata.file_type().is_symlink()
-}
-
-fn package_root_from_entrypoint(entrypoint: &Path) -> Option<PathBuf> {
-    let parent = entrypoint.parent()?;
-    if parent
-        .file_name()
-        .is_some_and(|name| name.eq_ignore_ascii_case("bin"))
-    {
-        parent.parent().map(Path::to_path_buf)
-    } else {
-        Some(parent.to_path_buf())
     }
 }
 
@@ -2741,278 +2223,11 @@ fn map_native_execution(
         warm_model_reused: execution.diagnostics.warm_reused,
         stdout: String::new(),
         stderr: format!(
-            "native_library={} warm_reused={}",
-            execution.diagnostics.native_library_path.display(),
+            "runtime={} warm_reused={}",
+            execution.diagnostics.runtime_location.display(),
             execution.diagnostics.warm_reused
         ),
     }
-}
-
-/// The sole Phase 1 adapter for the pre-existing command-line backend path.
-///
-/// It intentionally delegates to `stt::transcribe_with_config` unchanged so
-/// all existing configured model paths and runtime resolution behavior remain
-/// intact during extraction.
-struct LegacyBatchAdapter {
-    config: AppConfig,
-    model: SttModelInfo,
-    cancellation_snapshot: crate::stt::CancellationSnapshot,
-    diagnostics: Option<LegacyDiagnostics>,
-}
-
-impl LegacyBatchAdapter {
-    fn new(
-        config: AppConfig,
-        model: SttModelInfo,
-        cancellation_snapshot: crate::stt::CancellationSnapshot,
-    ) -> Self {
-        Self {
-            config,
-            model,
-            cancellation_snapshot,
-            diagnostics: None,
-        }
-    }
-
-    fn take_diagnostics(&mut self) -> Option<LegacyDiagnostics> {
-        self.diagnostics.take()
-    }
-}
-
-impl SpeechEngine for LegacyBatchAdapter {
-    fn load(&mut self) -> Result<()> {
-        // The legacy route starts a fresh child process for each request, so
-        // there is no persistent engine to preload or validate here.
-        Ok(())
-    }
-
-    fn transcribe(
-        &mut self,
-        audio: &PreparedAudio,
-        options: &TranscriptionOptions,
-    ) -> Result<Transcript> {
-        validate_default_options(options)?;
-        let prepared_wav = TemporaryPreparedWav::create(audio)?;
-
-        let result = crate::stt::transcribe_with_config(
-            &self.config,
-            prepared_wav.path().to_path_buf(),
-            self.model.clone(),
-            self.cancellation_snapshot,
-        )?;
-        let (transcript, diagnostics) = map_legacy_result(result);
-        self.diagnostics = Some(diagnostics);
-        Ok(transcript)
-    }
-
-    fn capabilities(&self) -> RuntimeCapabilities {
-        capabilities_for_legacy_model(&self.model)
-    }
-
-    fn health_check(&mut self) -> Result<()> {
-        Err(anyhow!(
-            "legacy command-line health checks are not implemented in Phase 1"
-        ))
-    }
-
-    fn cancel(&mut self) -> Result<()> {
-        crate::stt::cancel_active_processes();
-        Ok(())
-    }
-
-    fn unload(&mut self) -> Result<()> {
-        // Each legacy invocation is a child process, so there is no loaded
-        // in-process engine state to release.
-        Ok(())
-    }
-}
-
-static TEMP_AUDIO_SEQUENCE: AtomicU64 = AtomicU64::new(1);
-
-/// Compatibility artifact for the transitional process adapters. Paths never
-/// cross the application-facing service contract, and the file is removed by
-/// RAII on every success and error path.
-struct TemporaryPreparedWav {
-    path: PathBuf,
-}
-
-impl TemporaryPreparedWav {
-    fn create(audio: &PreparedAudio) -> Result<Self> {
-        if audio.sample_rate != 16_000
-            || audio.samples.is_empty()
-            || audio
-                .samples
-                .iter()
-                .any(|sample| !sample.is_finite() || !(-1.0..=1.0).contains(sample))
-        {
-            return Err(anyhow!(
-                "legacy compatibility bridge received invalid prepared audio"
-            ));
-        }
-
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let sequence = TEMP_AUDIO_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let directory = private_temporary_audio_dir()?;
-        let path = directory.join(format!(
-            "scribe-prepared-{}-{nonce}-{sequence}.wav",
-            std::process::id()
-        ));
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        options.mode(0o600);
-        let file = options
-            .open(&path)
-            .map_err(|err| anyhow!("failed to create private prepared-audio WAV: {err}"))?;
-        let temporary = Self { path };
-        let spec = hound::WavSpec {
-            channels: 1,
-            sample_rate: 16_000,
-            bits_per_sample: 16,
-            sample_format: hound::SampleFormat::Int,
-        };
-        let mut writer = hound::WavWriter::new(BufWriter::new(file), spec)
-            .map_err(|err| anyhow!("failed to initialize prepared-audio WAV: {err}"))?;
-        for sample in &audio.samples {
-            let pcm = (sample * i16::MAX as f32).round() as i16;
-            writer
-                .write_sample(pcm)
-                .map_err(|err| anyhow!("failed to write prepared-audio WAV: {err}"))?;
-        }
-        writer
-            .finalize()
-            .map_err(|err| anyhow!("failed to finalize prepared-audio WAV: {err}"))?;
-
-        Ok(temporary)
-    }
-
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-fn private_temporary_audio_dir() -> Result<PathBuf> {
-    #[cfg(test)]
-    let root = std::env::temp_dir().join("scribe-test-private-data");
-    #[cfg(not(test))]
-    let runtime_dir = config::runtime_storage_dir();
-    #[cfg(not(test))]
-    let root = runtime_dir
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(std::env::temp_dir);
-    let directory = root.join("transient-audio");
-    if !directory.is_dir() {
-        let mut builder = fs::DirBuilder::new();
-        builder.recursive(true);
-        #[cfg(unix)]
-        builder.mode(0o700);
-        builder.create(&directory).map_err(|error| {
-            anyhow!(
-                "failed to create private prepared-audio directory {}: {error}",
-                directory.display()
-            )
-        })?;
-    }
-    #[cfg(unix)]
-    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).map_err(|error| {
-        anyhow!(
-            "failed to secure prepared-audio directory {}: {error}",
-            directory.display()
-        )
-    })?;
-    Ok(directory)
-}
-
-fn cleanup_stale_temporary_audio() {
-    let Ok(directory) = private_temporary_audio_dir() else {
-        return;
-    };
-    let Ok(entries) = fs::read_dir(directory) else {
-        return;
-    };
-    let now = SystemTime::now();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with("scribe-prepared-") && name.ends_with(".wav"))
-        {
-            continue;
-        }
-        let is_stale = entry
-            .metadata()
-            .ok()
-            .and_then(|metadata| metadata.modified().ok())
-            .and_then(|modified| now.duration_since(modified).ok())
-            .is_some_and(|age| age >= std::time::Duration::from_secs(24 * 60 * 60));
-        if is_stale {
-            let _ = fs::remove_file(path);
-        }
-    }
-}
-
-impl Drop for TemporaryPreparedWav {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
-}
-
-#[derive(Debug)]
-struct LegacyDiagnostics {
-    model_id: ModelId,
-    model_name: String,
-    backend_label: String,
-    processing_duration_ms: Option<u128>,
-    stdout: String,
-    stderr: String,
-}
-
-fn map_legacy_result(result: LegacyTranscriptResult) -> (Transcript, LegacyDiagnostics) {
-    let transcript = Transcript {
-        text: result.text,
-        segments: result
-            .segments
-            .into_iter()
-            .map(|segment| TranscriptSegment {
-                text: segment.text,
-                start_ms: segment.start_ms,
-                end_ms: segment.end_ms,
-                confidence: None,
-            })
-            .collect(),
-        detected_language: None,
-        duration_ms: None,
-    };
-    let diagnostics = LegacyDiagnostics {
-        model_id: result.model_id.into(),
-        model_name: result.model_name,
-        backend_label: result.backend,
-        processing_duration_ms: result.duration_ms,
-        stdout: result.stdout,
-        stderr: result.stderr,
-    };
-
-    (transcript, diagnostics)
-}
-
-fn validate_response_model_id(
-    requested_model_id: &ModelId,
-    diagnostics: &LegacyDiagnostics,
-) -> Result<()> {
-    if diagnostics.model_id != *requested_model_id {
-        return Err(anyhow!(
-            "legacy transcription returned model {} for request model {}",
-            diagnostics.model_id,
-            requested_model_id
-        ));
-    }
-
-    Ok(())
 }
 
 fn validate_default_options(options: &TranscriptionOptions) -> Result<()> {
@@ -3048,17 +2263,6 @@ fn validate_preview_options(options: &TranscriptionOptions) -> Result<()> {
     validate_default_options(&options_without_timestamps)
 }
 
-fn capabilities_for_legacy_model(model: &SttModelInfo) -> RuntimeCapabilities {
-    RuntimeCapabilities {
-        // Only the current Vosk and faster-whisper adapters reliably expose
-        // timestamp values. whisper.cpp strips its text timing and the sherpa
-        // family currently reports null segment bounds.
-        timestamps: matches!(model.backend.as_str(), "faster-whisper" | "Vosk"),
-        cancellation: true,
-        ..RuntimeCapabilities::default()
-    }
-}
-
 fn intersect_capabilities(
     runtime: &RuntimeCapabilities,
     descriptor: &ModelDescriptor,
@@ -3089,347 +2293,12 @@ fn intersect_capabilities(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::TranscriptSegment as LegacyTranscriptSegment;
-    use crate::onnx_worker::{OnnxFileRole, OnnxModelFamily, OnnxModelSpec};
-    use crate::runtime_router::{OnnxSupervisorControl, RuntimeArtifact};
+    use crate::runtime_artifact::{OnnxFileRole, OnnxModelFamily};
+    use crate::runtime_router::NativeRuntimeDiagnostics;
     use sha2::{Digest, Sha256};
-    use std::collections::BTreeMap;
     use std::io::Cursor;
-    use std::sync::Condvar;
 
     const MAX_DIAGNOSTIC_ONNX_WAV_BYTES: u64 = 256 * 1024 * 1024;
-
-    #[test]
-    fn legacy_install_smoke_diagnostics_default_cancellation_evidence_to_false() {
-        let smoke = InstallSmoke {
-            resolved_acceleration: ResolvedAcceleration {
-                requested: AccelerationPreference::Cpu,
-                resolved: ComputeDevice::Cpu,
-                diagnostic: None,
-            },
-            detected_architecture: "whisper".to_owned(),
-            capabilities: RuntimeCapabilities::default(),
-            health_duration_ms: 1,
-            load_duration_ms: 2,
-            decode_duration_ms: 3,
-            reload_duration_ms: 4,
-            cancellation_verified: true,
-        };
-        let mut serialized = serde_json::to_value(smoke).unwrap();
-        serialized
-            .as_object_mut()
-            .unwrap()
-            .remove("cancellation_verified");
-
-        let legacy: InstallSmoke = serde_json::from_value(serialized).unwrap();
-        assert!(!legacy.cancellation_verified);
-    }
-
-    #[derive(Default)]
-    struct FakeOnnxState {
-        loaded: Option<OnnxModelSpec>,
-        load_calls: usize,
-        maximum_loaded_models: usize,
-        events: Vec<String>,
-        fail_next_load: bool,
-        fail_load_call: Option<usize>,
-        fail_transcribe: bool,
-        fail_health: bool,
-        fail_start_stream: bool,
-        transcribe_calls: usize,
-        health_calls: usize,
-        unload_calls: usize,
-        unloaded_active_streams: usize,
-        cancel_active_calls: usize,
-        termination_calls: usize,
-        stream: Option<(u64, usize)>,
-        stream_cancels: usize,
-        batch_started: bool,
-        block_batch: bool,
-        batch_cancelled: bool,
-        cancel_install_on_transcribe: Option<InstallCancellation>,
-        cancel_install_on_health: Option<InstallCancellation>,
-        cancel_install_on_load_call: Option<(usize, InstallCancellation)>,
-    }
-
-    #[derive(Default)]
-    struct FakeOnnxControl {
-        state: Mutex<FakeOnnxState>,
-        changed: Condvar,
-    }
-
-    impl FakeOnnxControl {
-        fn set_block_batch(&self) {
-            self.state.lock().unwrap().block_batch = true;
-        }
-
-        fn wait_for_batch(&self) {
-            let mut state = self.state.lock().unwrap();
-            while !state.batch_started {
-                state = self.changed.wait(state).unwrap();
-            }
-        }
-
-        fn fail_next_load(&self) {
-            self.state.lock().unwrap().fail_next_load = true;
-        }
-
-        fn fail_load_call(&self, call: usize) {
-            self.state.lock().unwrap().fail_load_call = Some(call);
-        }
-
-        fn fail_transcribe(&self) {
-            self.state.lock().unwrap().fail_transcribe = true;
-        }
-
-        fn cancel_install_on_transcribe(&self, cancellation: InstallCancellation) {
-            self.state.lock().unwrap().cancel_install_on_transcribe = Some(cancellation);
-        }
-
-        fn cancel_install_on_health(&self, cancellation: InstallCancellation) {
-            self.state.lock().unwrap().cancel_install_on_health = Some(cancellation);
-        }
-
-        fn cancel_install_on_load_call(&self, call: usize, cancellation: InstallCancellation) {
-            self.state.lock().unwrap().cancel_install_on_load_call = Some((call, cancellation));
-        }
-    }
-
-    impl OnnxSupervisorControl for FakeOnnxControl {
-        fn load(
-            &self,
-            _session_id: u64,
-            _request_id: u64,
-            model: OnnxModelSpec,
-        ) -> anyhow::Result<bool> {
-            let mut state = self.state.lock().unwrap();
-            state.load_calls += 1;
-            if state
-                .cancel_install_on_load_call
-                .as_ref()
-                .is_some_and(|(call, _)| *call == state.load_calls)
-                && let Some((_, cancellation)) = state.cancel_install_on_load_call.take()
-            {
-                cancellation.cancel();
-            }
-            let warm = state.loaded.as_ref() == Some(&model);
-            if !warm {
-                if let Some(previous) = state.loaded.take() {
-                    state.events.push(format!("evict:{}", previous.id));
-                }
-                state.events.push(format!("load:{}", model.id));
-            }
-            if state.fail_load_call == Some(state.load_calls) {
-                state.fail_load_call = None;
-                state.loaded = Some(model);
-                state.maximum_loaded_models = state.maximum_loaded_models.max(1);
-                anyhow::bail!("deterministic ONNX load failure on call");
-            }
-            if std::mem::take(&mut state.fail_next_load) {
-                anyhow::bail!("deterministic ONNX load failure");
-            }
-            state.loaded = Some(model);
-            state.maximum_loaded_models = state.maximum_loaded_models.max(1);
-            Ok(warm)
-        }
-
-        fn transcribe(
-            &self,
-            _session_id: u64,
-            _request_id: u64,
-            _samples: &[f32],
-        ) -> anyhow::Result<String> {
-            let mut state = self.state.lock().unwrap();
-            state.transcribe_calls += 1;
-            if let Some(cancellation) = state.cancel_install_on_transcribe.take() {
-                cancellation.cancel();
-            }
-            if state.fail_transcribe {
-                state.loaded = None;
-                anyhow::bail!("deterministic ONNX transcribe failure");
-            }
-            state.batch_started = true;
-            self.changed.notify_all();
-            while state.block_batch && !state.batch_cancelled {
-                state = self.changed.wait(state).unwrap();
-            }
-            if state.batch_cancelled {
-                anyhow::bail!("fake ONNX batch cancelled");
-            }
-            Ok("neutral fake transcript".to_owned())
-        }
-
-        fn start_stream(&self, session_id: u64, _request_id: u64) -> anyhow::Result<()> {
-            let mut state = self.state.lock().unwrap();
-            if state.fail_start_stream {
-                state.loaded = None;
-                anyhow::bail!("deterministic ONNX start-stream failure");
-            }
-            if state.stream.is_some() {
-                anyhow::bail!("fake ONNX stream already active");
-            }
-            state.stream = Some((session_id, 0));
-            Ok(())
-        }
-
-        fn audio_chunk(
-            &self,
-            session_id: u64,
-            _request_id: u64,
-            _samples: &[f32],
-        ) -> anyhow::Result<String> {
-            let mut state = self.state.lock().unwrap();
-            let stream = state
-                .stream
-                .as_mut()
-                .filter(|stream| stream.0 == session_id)
-                .ok_or_else(|| anyhow!("no matching fake ONNX stream"))?;
-            stream.1 += 1;
-            Ok(format!("partial-{}", stream.1))
-        }
-
-        fn end_stream(&self, session_id: u64, _request_id: u64) -> anyhow::Result<String> {
-            let mut state = self.state.lock().unwrap();
-            let (_, chunks) = state
-                .stream
-                .take()
-                .filter(|stream| stream.0 == session_id)
-                .ok_or_else(|| anyhow!("no matching fake ONNX stream"))?;
-            Ok(format!("final-{chunks}"))
-        }
-
-        fn cancel_stream(&self, session_id: u64, _request_id: u64) -> anyhow::Result<()> {
-            let mut state = self.state.lock().unwrap();
-            if state
-                .stream
-                .is_none_or(|(active_session, _)| active_session != session_id)
-            {
-                anyhow::bail!("no matching fake ONNX stream");
-            }
-            state.stream = None;
-            state.stream_cancels += 1;
-            Ok(())
-        }
-
-        fn health(&self, _session_id: u64, _request_id: u64) -> anyhow::Result<()> {
-            let mut state = self.state.lock().unwrap();
-            state.health_calls += 1;
-            if let Some(cancellation) = state.cancel_install_on_health.take() {
-                cancellation.cancel();
-            }
-            if state.fail_health {
-                state.loaded = None;
-                anyhow::bail!("deterministic ONNX health failure");
-            }
-            Ok(())
-        }
-
-        fn unload(&self) -> anyhow::Result<()> {
-            let mut state = self.state.lock().unwrap();
-            state.unload_calls += 1;
-            if state.stream.is_some() {
-                state.unloaded_active_streams += 1;
-            }
-            state.stream = None;
-            state.loaded = None;
-            Ok(())
-        }
-
-        fn cancel_active(&self) -> anyhow::Result<()> {
-            let mut state = self.state.lock().unwrap();
-            state.cancel_active_calls += 1;
-            state.batch_cancelled = true;
-            self.changed.notify_all();
-            Ok(())
-        }
-
-        fn abandon_stream(&self, session_id: u64) {
-            let mut state = self
-                .state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if state
-                .stream
-                .is_some_and(|(active_session, _)| active_session == session_id)
-            {
-                state.stream = None;
-                state.stream_cancels += 1;
-            }
-        }
-
-        fn terminate_current(&self) -> anyhow::Result<()> {
-            let mut state = self.state.lock().unwrap();
-            state.termination_calls += 1;
-            state.events.push("terminate:onnx".to_owned());
-            state.stream = None;
-            state.loaded = None;
-            state.batch_cancelled = true;
-            self.changed.notify_all();
-            Ok(())
-        }
-    }
-
-    fn onnx_spec(label: &str, family: OnnxModelFamily) -> (PathBuf, OnnxModelSpec) {
-        let suffix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "scribe-router-onnx-{label}-{}-{suffix}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&root).unwrap();
-        let roles = match family {
-            OnnxModelFamily::OnlineTransducer | OnnxModelFamily::OfflineTransducer => vec![
-                OnnxFileRole::Encoder,
-                OnnxFileRole::Decoder,
-                OnnxFileRole::Joiner,
-                OnnxFileRole::Tokens,
-            ],
-            OnnxModelFamily::NemoCtc => vec![OnnxFileRole::Model, OnnxFileRole::Tokens],
-            other => panic!("test helper does not define a fixture for {other:?}"),
-        };
-        let files = roles
-            .into_iter()
-            .map(|role| {
-                let relative = PathBuf::from(format!("{role:?}.fixture").to_ascii_lowercase());
-                fs::write(root.join(&relative), format!("{label}-{role:?}")).unwrap();
-                (role, relative)
-            })
-            .collect::<BTreeMap<_, _>>();
-        let spec = OnnxModelSpec {
-            id: format!("private-{label}"),
-            root: root.clone(),
-            family,
-            files,
-            num_threads: 1,
-        };
-        (root, spec)
-    }
-
-    fn onnx_test_service(
-        preference: AccelerationPreference,
-    ) -> (
-        TranscriptionService,
-        Arc<FakeOnnxControl>,
-        Arc<std::sync::atomic::AtomicUsize>,
-    ) {
-        let control = Arc::new(FakeOnnxControl::default());
-        let spawn_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let factory_control = Arc::clone(&control);
-        let factory_spawn_count = Arc::clone(&spawn_count);
-        let router = RuntimeRouter::with_test_onnx_factory(move || {
-            factory_spawn_count.fetch_add(1, Ordering::AcqRel);
-            Ok(Arc::clone(&factory_control) as Arc<dyn OnnxSupervisorControl>)
-        });
-        let mut config = AppConfig::default();
-        config.performance.acceleration_preference = preference;
-        (
-            TranscriptionService::with_runtime_router(config, router),
-            control,
-            spawn_count,
-        )
-    }
 
     fn prepared_audio() -> Arc<PreparedAudio> {
         Arc::new(PreparedAudio {
@@ -3500,225 +2369,6 @@ mod tests {
             writer.finalize().unwrap();
         }
         cursor.into_inner()
-    }
-
-    #[test]
-    fn private_runtime_artifact_routes_onnx_load_health_and_transcribe_through_worker() {
-        let (root, spec) = onnx_spec("online-service", OnnxModelFamily::OnlineTransducer);
-        let artifact = RuntimeArtifact::OnnxBundle(spec);
-        let (service, control, spawn_count) = onnx_test_service(AccelerationPreference::Cpu);
-
-        let cold = service.preload_runtime_artifact(artifact.clone()).unwrap();
-        let warm = service.preload_runtime_artifact(artifact.clone()).unwrap();
-        service
-            .health_check_runtime_artifact(artifact.clone())
-            .unwrap();
-        let execution = service
-            .transcribe_runtime_artifact(
-                artifact,
-                prepared_audio(),
-                TranscriptionOptions::default(),
-            )
-            .unwrap();
-
-        assert!(!cold.diagnostics.warm_reused);
-        assert!(warm.diagnostics.warm_reused);
-        assert_eq!(
-            cold.diagnostics.resolved_acceleration.requested,
-            AccelerationPreference::Cpu
-        );
-        assert_eq!(
-            cold.diagnostics.resolved_acceleration.resolved,
-            ComputeDevice::Cpu
-        );
-        assert!(cold.capabilities.cancellation);
-        assert!(cold.capabilities.streaming);
-        assert!(!cold.capabilities.timestamps);
-        assert!(!cold.capabilities.language_detection);
-        assert_eq!(cold.detected_architecture, "online-transducer");
-        assert_eq!(execution.transcript.text, "neutral fake transcript");
-        assert!(execution.transcript.segments.is_empty());
-        assert_eq!(execution.transcript.detected_language, None);
-        assert_eq!(execution.transcript.duration_ms, None);
-        assert!(execution.diagnostics.warm_reused);
-        assert_eq!(spawn_count.load(Ordering::Acquire), 1);
-        let state = control.state.lock().unwrap();
-        assert_eq!(state.health_calls, 1);
-        assert_eq!(state.transcribe_calls, 1);
-        drop(state);
-        service.unload_runtime_artifacts().unwrap();
-        assert_eq!(control.state.lock().unwrap().unload_calls, 1);
-
-        drop(service);
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn receipt_backed_onnx_bundle_routes_below_transcription_service() {
-        let (root, spec) = onnx_spec("receipt-service", OnnxModelFamily::OnlineTransducer);
-        crate::onnx_model_bundles::write_test_receipt_for_spec(&spec).unwrap();
-        let (service, control, _) = onnx_test_service(AccelerationPreference::Cpu);
-
-        assert!(service.preload_onnx_bundle_from_receipt(&root).is_err());
-        assert!(
-            service
-                .transcribe_onnx_bundle_from_receipt(
-                    &root,
-                    prepared_audio(),
-                    TranscriptionOptions::default(),
-                )
-                .is_err()
-        );
-        assert_eq!(control.state.lock().unwrap().transcribe_calls, 0);
-
-        fs::write(root.join("unexpected.onnx"), b"unexpected").unwrap();
-        assert!(service.preload_onnx_bundle_from_receipt(&root).is_err());
-        service.unload_runtime_artifacts().unwrap();
-        drop(service);
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn staged_receipt_smoke_uses_fixed_cpu_and_observed_worker_evidence() {
-        let (root, spec) = onnx_spec("receipt-smoke", OnnxModelFamily::OnlineTransducer);
-        crate::onnx_model_bundles::write_test_receipt_for_spec(&spec).unwrap();
-        let (service, control, _) = onnx_test_service(AccelerationPreference::Gpu);
-        let smoke = service
-            .verify_onnx_artifact_smoke(
-                RuntimeArtifact::OnnxBundle(spec),
-                &InstallCancellation::default(),
-            )
-            .unwrap();
-
-        assert_eq!(
-            smoke.resolved_acceleration.requested,
-            AccelerationPreference::Cpu
-        );
-        assert_eq!(smoke.resolved_acceleration.resolved, ComputeDevice::Cpu);
-        assert_eq!(smoke.detected_architecture, "online-transducer");
-        assert!(smoke.capabilities.streaming);
-        let state = control.state.lock().unwrap();
-        assert_eq!(state.health_calls, 1);
-        assert_eq!(state.transcribe_calls, 1);
-        assert_eq!(state.load_calls, 4);
-        assert_eq!(state.unload_calls, 3);
-        assert!(state.loaded.is_none());
-        drop(state);
-        drop(service);
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn staged_onnx_smoke_unloads_after_decode_failure_and_preserves_primary_error() {
-        let (root, spec) = onnx_spec("smoke-decode-failure", OnnxModelFamily::OnlineTransducer);
-        let (service, control, _) = onnx_test_service(AccelerationPreference::Cpu);
-        control.fail_transcribe();
-
-        let error = service
-            .verify_onnx_artifact_smoke(
-                RuntimeArtifact::OnnxBundle(spec),
-                &InstallCancellation::default(),
-            )
-            .unwrap_err();
-
-        assert!(error.to_string().contains("decode smoke failed"));
-        let state = control.state.lock().unwrap();
-        assert_eq!(state.unload_calls, 2);
-        assert!(state.loaded.is_none());
-        drop(state);
-        assert_eq!(service.router.onnx_state_for_test(), (false, false, false));
-        drop(service);
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn staged_onnx_smoke_unloads_when_install_is_cancelled_during_decode() {
-        let (root, spec) = onnx_spec("smoke-cancel", OnnxModelFamily::OnlineTransducer);
-        let (service, control, _) = onnx_test_service(AccelerationPreference::Cpu);
-        let cancellation = InstallCancellation::default();
-        control.cancel_install_on_transcribe(cancellation.clone());
-
-        let error = service
-            .verify_onnx_artifact_smoke(RuntimeArtifact::OnnxBundle(spec), &cancellation)
-            .unwrap_err();
-
-        assert!(error.to_string().contains("cancelled"));
-        let state = control.state.lock().unwrap();
-        assert_eq!(state.unload_calls, 2);
-        assert!(state.loaded.is_none());
-        drop(state);
-        assert_eq!(service.router.onnx_state_for_test(), (false, false, false));
-        drop(service);
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn staged_onnx_smoke_unloads_when_cancelled_after_health() {
-        let (root, spec) = onnx_spec("smoke-cancel-health", OnnxModelFamily::OnlineTransducer);
-        let (service, control, _) = onnx_test_service(AccelerationPreference::Cpu);
-        let cancellation = InstallCancellation::default();
-        control.cancel_install_on_health(cancellation.clone());
-
-        let error = service
-            .verify_onnx_artifact_smoke(RuntimeArtifact::OnnxBundle(spec), &cancellation)
-            .unwrap_err();
-
-        assert!(error.to_string().contains("cancelled"));
-        let state = control.state.lock().unwrap();
-        assert_eq!(state.health_calls, 1);
-        assert_eq!(state.unload_calls, 1);
-        assert!(state.loaded.is_none());
-        drop(state);
-        assert_eq!(service.router.onnx_state_for_test(), (false, false, false));
-        drop(service);
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn staged_onnx_smoke_unloads_when_cancelled_immediately_after_load() {
-        let (root, spec) = onnx_spec("smoke-cancel-load", OnnxModelFamily::OnlineTransducer);
-        let (service, control, _) = onnx_test_service(AccelerationPreference::Cpu);
-        let cancellation = InstallCancellation::default();
-        control.cancel_install_on_load_call(2, cancellation.clone());
-
-        let error = service
-            .verify_onnx_artifact_smoke(RuntimeArtifact::OnnxBundle(spec), &cancellation)
-            .unwrap_err();
-
-        assert!(error.to_string().contains("cancelled"));
-        let state = control.state.lock().unwrap();
-        assert_eq!(state.health_calls, 1);
-        assert_eq!(state.load_calls, 2);
-        assert_eq!(state.unload_calls, 2);
-        assert!(state.loaded.is_none());
-        drop(state);
-        assert_eq!(service.router.onnx_state_for_test(), (false, false, false));
-        drop(service);
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn staged_onnx_smoke_unloads_after_reload_load_failure() {
-        let (root, spec) = onnx_spec("smoke-reload-failure", OnnxModelFamily::OnlineTransducer);
-        let (service, control, _) = onnx_test_service(AccelerationPreference::Cpu);
-        control.fail_load_call(4);
-
-        let error = service
-            .verify_onnx_artifact_smoke(
-                RuntimeArtifact::OnnxBundle(spec),
-                &InstallCancellation::default(),
-            )
-            .unwrap_err();
-
-        assert!(error.to_string().contains("reload failed"));
-        let state = control.state.lock().unwrap();
-        assert_eq!(state.load_calls, 4);
-        assert_eq!(state.unload_calls, 3);
-        assert!(state.loaded.is_none());
-        drop(state);
-        assert_eq!(service.router.onnx_state_for_test(), (false, false, false));
-        drop(service);
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -3842,429 +2492,6 @@ mod tests {
         }
         let activated = verified.activate().unwrap();
         activated.commit().unwrap();
-    }
-
-    #[test]
-    fn onnx_same_model_reuses_warm_and_changed_model_evicts_first() {
-        let (first_root, first) = onnx_spec("same-model-first", OnnxModelFamily::NemoCtc);
-        let (second_root, second) = onnx_spec("same-model-second", OnnxModelFamily::NemoCtc);
-        let (service, control, spawn_count) = onnx_test_service(AccelerationPreference::Cpu);
-
-        let cold = service
-            .preload_runtime_artifact(RuntimeArtifact::OnnxBundle(first.clone()))
-            .unwrap();
-        let warm = service
-            .preload_runtime_artifact(RuntimeArtifact::OnnxBundle(first))
-            .unwrap();
-        let replacement = service
-            .preload_runtime_artifact(RuntimeArtifact::OnnxBundle(second))
-            .unwrap();
-
-        assert!(!cold.diagnostics.warm_reused);
-        assert!(warm.diagnostics.warm_reused);
-        assert!(!replacement.diagnostics.warm_reused);
-        assert_eq!(spawn_count.load(Ordering::Acquire), 1);
-        let state = control.state.lock().unwrap();
-        assert_eq!(state.maximum_loaded_models, 1);
-        assert_eq!(
-            state.events,
-            [
-                "load:private-same-model-first",
-                "evict:private-same-model-first",
-                "load:private-same-model-second",
-            ]
-        );
-        drop(state);
-
-        service.unload_runtime_artifacts().unwrap();
-        drop(service);
-        fs::remove_dir_all(first_root).unwrap();
-        fs::remove_dir_all(second_root).unwrap();
-    }
-
-    #[test]
-    fn failed_onnx_load_discards_adapter_owner_and_cancellation_then_recovers_cold() {
-        let (first_root, first) = onnx_spec("failed-load-first", OnnxModelFamily::NemoCtc);
-        let (second_root, second) = onnx_spec("failed-load-second", OnnxModelFamily::NemoCtc);
-        let (service, control, spawn_count) = onnx_test_service(AccelerationPreference::Cpu);
-        service
-            .preload_runtime_artifact(RuntimeArtifact::OnnxBundle(first.clone()))
-            .unwrap();
-        control.fail_next_load();
-
-        let error = service
-            .preload_runtime_artifact(RuntimeArtifact::OnnxBundle(second))
-            .unwrap_err();
-
-        assert!(
-            error
-                .to_string()
-                .contains("deterministic ONNX load failure")
-        );
-        assert_eq!(service.router.onnx_state_for_test(), (false, false, false));
-        assert_eq!(service.router.runtime_activity().active_streams(), 0);
-        assert!(control.state.lock().unwrap().loaded.is_none());
-        let recovered = service
-            .preload_runtime_artifact(RuntimeArtifact::OnnxBundle(first))
-            .unwrap();
-        assert!(!recovered.diagnostics.warm_reused);
-        assert_eq!(spawn_count.load(Ordering::Acquire), 2);
-
-        service.unload_runtime_artifacts().unwrap();
-        drop(service);
-        fs::remove_dir_all(first_root).unwrap();
-        fs::remove_dir_all(second_root).unwrap();
-    }
-
-    #[test]
-    fn failed_model_replacement_during_stream_unloads_before_discard_and_recovers() {
-        let (first_root, first) = onnx_spec(
-            "stream-replacement-first",
-            OnnxModelFamily::OnlineTransducer,
-        );
-        let (second_root, second) = onnx_spec(
-            "stream-replacement-second",
-            OnnxModelFamily::OnlineTransducer,
-        );
-        let (service, control, spawn_count) = onnx_test_service(AccelerationPreference::Cpu);
-        let mut stream = service
-            .start_runtime_stream(
-                RuntimeArtifact::OnnxBundle(first.clone()),
-                TranscriptionOptions::default(),
-            )
-            .unwrap();
-        assert_eq!(service.router.runtime_activity().active_streams(), 1);
-        control.fail_next_load();
-
-        let error = service
-            .preload_runtime_artifact(RuntimeArtifact::OnnxBundle(second))
-            .unwrap_err();
-
-        assert!(
-            error
-                .to_string()
-                .contains("deterministic ONNX load failure")
-        );
-        {
-            let state = control.state.lock().unwrap();
-            assert_eq!(state.unload_calls, 1);
-            assert_eq!(state.termination_calls, 0);
-            assert!(state.loaded.is_none());
-            assert!(state.stream.is_none());
-            assert_eq!(state.maximum_loaded_models, 1);
-        }
-        assert_eq!(service.router.onnx_state_for_test(), (false, false, false));
-        assert_eq!(service.router.runtime_activity().active_streams(), 0);
-        assert!(stream.push_audio(&[0.1]).is_err());
-        assert_eq!(spawn_count.load(Ordering::Acquire), 1);
-
-        let recovered = service
-            .preload_runtime_artifact(RuntimeArtifact::OnnxBundle(first))
-            .unwrap();
-        assert!(!recovered.diagnostics.warm_reused);
-        assert_eq!(spawn_count.load(Ordering::Acquire), 2);
-        drop(stream);
-
-        service.unload_runtime_artifacts().unwrap();
-        drop(service);
-        fs::remove_dir_all(first_root).unwrap();
-        fs::remove_dir_all(second_root).unwrap();
-    }
-
-    #[test]
-    fn failed_onnx_transcribe_discards_adapter_owner_and_cancellation() {
-        let (root, spec) = onnx_spec("failed-transcribe", OnnxModelFamily::NemoCtc);
-        let artifact = RuntimeArtifact::OnnxBundle(spec);
-        let (service, control, spawn_count) = onnx_test_service(AccelerationPreference::Cpu);
-        service.preload_runtime_artifact(artifact.clone()).unwrap();
-        control.fail_transcribe();
-
-        let error = service
-            .transcribe_runtime_artifact(
-                artifact.clone(),
-                prepared_audio(),
-                TranscriptionOptions::default(),
-            )
-            .unwrap_err();
-
-        assert!(
-            error
-                .to_string()
-                .contains("deterministic ONNX transcribe failure")
-        );
-        assert_eq!(service.router.onnx_state_for_test(), (false, false, false));
-        assert_eq!(service.router.runtime_activity().active_streams(), 0);
-        let recovered = service.preload_runtime_artifact(artifact).unwrap();
-        assert!(!recovered.diagnostics.warm_reused);
-        assert_eq!(spawn_count.load(Ordering::Acquire), 2);
-
-        service.unload_runtime_artifacts().unwrap();
-        drop(service);
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn failed_onnx_health_and_stream_start_discard_adapter_state() {
-        let (health_root, health_spec) = onnx_spec("failed-health", OnnxModelFamily::NemoCtc);
-        let (health_service, health_control, _) = onnx_test_service(AccelerationPreference::Cpu);
-        health_service
-            .preload_runtime_artifact(RuntimeArtifact::OnnxBundle(health_spec.clone()))
-            .unwrap();
-        health_control.state.lock().unwrap().fail_health = true;
-        assert!(
-            health_service
-                .health_check_runtime_artifact(RuntimeArtifact::OnnxBundle(health_spec))
-                .is_err()
-        );
-        assert_eq!(
-            health_service.router.onnx_state_for_test(),
-            (false, false, false)
-        );
-
-        let (stream_root, stream_spec) =
-            onnx_spec("failed-start", OnnxModelFamily::OnlineTransducer);
-        let (stream_service, stream_control, _) = onnx_test_service(AccelerationPreference::Cpu);
-        stream_control.state.lock().unwrap().fail_start_stream = true;
-        assert!(
-            stream_service
-                .start_runtime_stream(
-                    RuntimeArtifact::OnnxBundle(stream_spec),
-                    TranscriptionOptions::default(),
-                )
-                .is_err()
-        );
-        assert_eq!(
-            stream_service.router.onnx_state_for_test(),
-            (false, false, false)
-        );
-        assert_eq!(stream_service.router.runtime_activity().active_streams(), 0);
-
-        drop(health_service);
-        drop(stream_service);
-        fs::remove_dir_all(health_root).unwrap();
-        fs::remove_dir_all(stream_root).unwrap();
-    }
-
-    #[test]
-    fn private_onnx_gpu_request_fails_before_supervisor_spawn() {
-        let (root, spec) = onnx_spec("gpu-rejected", OnnxModelFamily::NemoCtc);
-        let (service, _control, spawn_count) = onnx_test_service(AccelerationPreference::Gpu);
-
-        let error = service
-            .preload_runtime_artifact(RuntimeArtifact::OnnxBundle(spec))
-            .unwrap_err();
-
-        assert!(error.to_string().contains("CPU-only"));
-        assert!(error.to_string().contains("Auto or CPU only"));
-        assert_eq!(spawn_count.load(Ordering::Acquire), 0);
-        drop(service);
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn private_onnx_stream_maps_partial_final_cancel_and_rejects_offline_bundle() {
-        let (online_root, online) = onnx_spec("online-stream", OnnxModelFamily::OnlineTransducer);
-        let (offline_root, offline) = onnx_spec("offline-stream", OnnxModelFamily::NemoCtc);
-        let (service, control, _spawn_count) = onnx_test_service(AccelerationPreference::Auto);
-
-        let mut stream = service
-            .start_runtime_stream(
-                RuntimeArtifact::OnnxBundle(online.clone()),
-                TranscriptionOptions::default(),
-            )
-            .unwrap();
-        assert_eq!(service.router.runtime_activity().active_streams(), 1);
-        assert_eq!(
-            stream.push_audio(&[0.1]).unwrap(),
-            StreamUpdate {
-                committed: String::new(),
-                tentative: "partial-1".to_owned(),
-            }
-        );
-        assert_eq!(stream.push_audio(&[-0.1]).unwrap().tentative, "partial-2");
-        let final_transcript = stream.finalize().unwrap();
-        assert_eq!(service.router.runtime_activity().active_streams(), 0);
-        assert_eq!(final_transcript.text, "final-2");
-        assert!(final_transcript.segments.is_empty());
-        assert_eq!(final_transcript.detected_language, None);
-
-        let stream = service
-            .start_runtime_stream(
-                RuntimeArtifact::OnnxBundle(online.clone()),
-                TranscriptionOptions::default(),
-            )
-            .unwrap();
-        assert_eq!(service.router.runtime_activity().active_streams(), 1);
-        stream.cancel().unwrap();
-        assert_eq!(service.router.runtime_activity().active_streams(), 0);
-        assert_eq!(control.state.lock().unwrap().stream_cancels, 1);
-
-        let stream = service
-            .start_runtime_stream(
-                RuntimeArtifact::OnnxBundle(online.clone()),
-                TranscriptionOptions::default(),
-            )
-            .unwrap();
-        assert_eq!(service.router.runtime_activity().active_streams(), 1);
-        drop(stream);
-        assert_eq!(service.router.runtime_activity().active_streams(), 0);
-        assert_eq!(control.state.lock().unwrap().stream_cancels, 2);
-
-        let error = service
-            .start_runtime_stream(
-                RuntimeArtifact::OnnxBundle(offline),
-                TranscriptionOptions::default(),
-            )
-            .err()
-            .expect("offline ONNX bundles must not return a stream handle");
-        assert!(error.to_string().contains("online ONNX transducer"));
-
-        drop(service);
-        fs::remove_dir_all(online_root).unwrap();
-        fs::remove_dir_all(offline_root).unwrap();
-    }
-
-    #[test]
-    fn explicit_unload_clears_active_stream_lease_and_native_stream() {
-        let (root, spec) = onnx_spec("explicit-stream-unload", OnnxModelFamily::OnlineTransducer);
-        let (service, control, _) = onnx_test_service(AccelerationPreference::Cpu);
-        let stream = service
-            .start_runtime_stream(
-                RuntimeArtifact::OnnxBundle(spec),
-                TranscriptionOptions::default(),
-            )
-            .unwrap();
-        assert_eq!(service.router.runtime_activity().active_streams(), 1);
-
-        service.unload_runtime_artifacts().unwrap();
-
-        assert_eq!(service.router.runtime_activity().active_streams(), 0);
-        assert_eq!(control.state.lock().unwrap().unloaded_active_streams, 1);
-        assert_eq!(service.router.onnx_state_for_test(), (false, false, false));
-        drop(stream);
-        assert_eq!(service.router.runtime_activity().active_streams(), 0);
-
-        drop(service);
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn active_onnx_batch_cancel_does_not_wait_for_router_state_lock() {
-        let (root, spec) = onnx_spec("batch-cancel", OnnxModelFamily::NemoCtc);
-        let artifact = RuntimeArtifact::OnnxBundle(spec);
-        let (service, control, _spawn_count) = onnx_test_service(AccelerationPreference::Cpu);
-        service.preload_runtime_artifact(artifact.clone()).unwrap();
-        control.set_block_batch();
-
-        let worker_service = service.clone();
-        let batch = std::thread::spawn(move || {
-            worker_service.transcribe_runtime_artifact(
-                artifact,
-                prepared_audio(),
-                TranscriptionOptions::default(),
-            )
-        });
-        control.wait_for_batch();
-        let cancel_started = Instant::now();
-        service.cancel_active();
-        let error = batch.join().unwrap().unwrap_err();
-
-        assert!(
-            cancel_started.elapsed() <= Duration::from_millis(250),
-            "ONNX cancellation waited for the router state mutex"
-        );
-        assert!(error.to_string().contains("cancelled"));
-        assert_eq!(control.state.lock().unwrap().cancel_active_calls, 1);
-
-        drop(service);
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    #[ignore = "manual: requires local GGUF, WAV, and retained legacy GGML paths"]
-    fn manual_known_wav_gguf_migration_smoke_uses_the_pinned_candidate_handoff() {
-        let gguf = PathBuf::from(
-            std::env::var("SCRIBE_TRANSCRIBE_CPP_GGUF")
-                .expect("set SCRIBE_TRANSCRIBE_CPP_GGUF to the exact pinned base Q8 GGUF"),
-        );
-        let wav = PathBuf::from(
-            std::env::var("SCRIBE_TRANSCRIBE_CPP_AUDIO")
-                .expect("set SCRIBE_TRANSCRIBE_CPP_AUDIO to a known spoken WAV"),
-        );
-        let legacy = PathBuf::from(
-            std::env::var("SCRIBE_TRANSCRIBE_CPP_LEGACY")
-                .expect("set SCRIBE_TRANSCRIBE_CPP_LEGACY to the retained ggml-base.en.bin"),
-        );
-        assert!(legacy.is_file(), "the retained legacy GGML file must exist");
-        let model_id = ModelId::new("whisper_cpp_base_en");
-        let candidate = InstallationCandidate::normalized(model_id.clone(), gguf.clone(), None)
-            .expect("the supplied GGUF filename must match the catalog-pinned base Q8 artifact");
-        let expected_size_bytes = candidate.expected_size_bytes;
-        let expected_sha256 = candidate.expected_sha256.clone();
-        let audio = Arc::new(PreparedAudio::from_wav_path(&wav).expect("load the supplied WAV"));
-        assert!(
-            !audio.samples.is_empty(),
-            "the supplied WAV must contain audio"
-        );
-
-        let mut config = AppConfig::default();
-        config.general.selected_default_model = model_id.as_str().to_owned();
-        config
-            .general
-            .model_paths
-            .insert(model_id.as_str().to_owned(), legacy.clone());
-        let prior = serde_json::to_value(&config).unwrap();
-        let service = TranscriptionService::new(config.clone());
-        let cancellation = InstallCancellation::default();
-        let verified = service
-            .verify_installation_candidate_for_activation_with(
-                candidate,
-                &cancellation,
-                |candidate| {
-                    let smoke =
-                        service.verify_installation_candidate(candidate.clone(), &cancellation)?;
-                    let mut request = TranscriptionRequest::new(
-                        SessionId(1),
-                        RequestId(1),
-                        Arc::clone(&audio),
-                        model_id.clone(),
-                    );
-                    request.model_path = Some(gguf.clone());
-                    let transcript = service.transcribe(request)?.transcript.text;
-                    assert!(
-                        !transcript.trim().is_empty(),
-                        "known-WAV smoke must produce a non-empty transcript"
-                    );
-                    if let Ok(expected) = std::env::var("SCRIBE_TRANSCRIBE_CPP_EXPECTED_TRANSCRIPT")
-                    {
-                        assert!(
-                            transcript.contains(&expected),
-                            "transcript did not contain SCRIBE_TRANSCRIBE_CPP_EXPECTED_TRANSCRIPT"
-                        );
-                    }
-                    Ok(smoke)
-                },
-            )
-            .expect("the local GGUF must pass its catalog pin and known-WAV smoke");
-        verified
-            .authorize_activation(
-                &model_id,
-                &gguf,
-                expected_size_bytes,
-                &expected_sha256,
-                &cancellation,
-            )
-            .expect("only a verified candidate may switch the configured path");
-        config
-            .general
-            .model_paths
-            .insert(model_id.as_str().to_owned(), gguf);
-        assert_eq!(config.general.selected_default_model, model_id.as_str());
-        assert_ne!(serde_json::to_value(&config).unwrap(), prior);
-        assert!(
-            legacy.is_file(),
-            "the migration smoke must not remove legacy GGML"
-        );
     }
 
     #[test]
@@ -4419,138 +2646,6 @@ mod tests {
         assert!(validate_preview_options(&timestamp_request).is_ok());
     }
 
-    fn legacy_result() -> LegacyTranscriptResult {
-        LegacyTranscriptResult {
-            model_id: "faster_whisper_tiny_en".to_owned(),
-            model_name: "faster-whisper tiny.en".to_owned(),
-            backend: "faster-whisper".to_owned(),
-            text: "hello world".to_owned(),
-            segments: vec![LegacyTranscriptSegment {
-                start_ms: Some(12),
-                end_ms: Some(345),
-                text: "hello world".to_owned(),
-            }],
-            duration_ms: Some(678),
-            stdout: "runner output".to_owned(),
-            stderr: "runner diagnostic".to_owned(),
-        }
-    }
-
-    #[test]
-    fn legacy_result_mapping_preserves_metadata_and_keeps_processing_time_separate() {
-        let (transcript, diagnostics) = map_legacy_result(legacy_result());
-
-        assert_eq!(transcript.text, "hello world");
-        assert_eq!(transcript.duration_ms, None);
-        assert_eq!(transcript.detected_language, None);
-        assert_eq!(
-            transcript.segments,
-            vec![TranscriptSegment {
-                text: "hello world".to_owned(),
-                start_ms: Some(12),
-                end_ms: Some(345),
-                confidence: None,
-            }]
-        );
-        assert_eq!(diagnostics.model_id, ModelId::new("faster_whisper_tiny_en"));
-        assert_eq!(diagnostics.model_name, "faster-whisper tiny.en");
-        assert_eq!(diagnostics.backend_label, "faster-whisper");
-        assert_eq!(diagnostics.processing_duration_ms, Some(678));
-        assert_eq!(diagnostics.stdout, "runner output");
-        assert_eq!(diagnostics.stderr, "runner diagnostic");
-    }
-
-    #[test]
-    fn legacy_result_mapping_preserves_unknown_processing_time_and_timestamps() {
-        let mut result = legacy_result();
-        result.duration_ms = None;
-        result.segments = vec![LegacyTranscriptSegment {
-            start_ms: None,
-            end_ms: None,
-            text: "unknown timing".to_owned(),
-        }];
-
-        let (transcript, diagnostics) = map_legacy_result(result);
-
-        assert_eq!(transcript.duration_ms, None);
-        assert_eq!(diagnostics.processing_duration_ms, None);
-        assert_eq!(transcript.segments[0].start_ms, None);
-        assert_eq!(transcript.segments[0].end_ms, None);
-    }
-
-    #[test]
-    fn default_options_request_only_legacy_supported_behavior() {
-        assert_eq!(
-            TranscriptionOptions::default(),
-            TranscriptionOptions {
-                language: None,
-                translate_to_english: false,
-                enable_timestamps: false,
-                initial_prompt: None,
-            }
-        );
-        assert!(validate_default_options(&TranscriptionOptions::default()).is_ok());
-    }
-
-    #[test]
-    fn legacy_options_fail_instead_of_being_silently_ignored() {
-        let unsupported_options = [
-            TranscriptionOptions {
-                language: Some("en".to_owned()),
-                ..TranscriptionOptions::default()
-            },
-            TranscriptionOptions {
-                translate_to_english: true,
-                ..TranscriptionOptions::default()
-            },
-            TranscriptionOptions {
-                enable_timestamps: true,
-                ..TranscriptionOptions::default()
-            },
-            TranscriptionOptions {
-                initial_prompt: Some("domain vocabulary".to_owned()),
-                ..TranscriptionOptions::default()
-            },
-        ];
-
-        for options in unsupported_options {
-            assert!(validate_default_options(&options).is_err());
-        }
-    }
-
-    #[test]
-    fn capabilities_are_conservative_for_every_legacy_backend() {
-        for model in config::configured_models(&AppConfig::default()) {
-            let capabilities = capabilities_for_legacy_model(&model);
-            let timestamps_expected = matches!(model.backend.as_str(), "faster-whisper" | "Vosk");
-
-            assert_eq!(
-                capabilities.timestamps, timestamps_expected,
-                "{} timestamp capability",
-                model.backend
-            );
-            assert!(capabilities.cancellation, "{} cancellation", model.backend);
-            assert!(!capabilities.streaming, "{} streaming", model.backend);
-            assert!(!capabilities.translation, "{} translation", model.backend);
-            assert!(
-                !capabilities.language_detection,
-                "{} language detection",
-                model.backend
-            );
-            assert!(
-                !capabilities.confidence_scores,
-                "{} confidence scores",
-                model.backend
-            );
-            assert!(
-                !capabilities.custom_vocabulary,
-                "{} custom vocabulary",
-                model.backend
-            );
-            assert!(capabilities.supported_languages.is_empty());
-        }
-    }
-
     #[test]
     fn imported_gguf_is_not_a_normalized_install_plan() {
         let root = std::env::temp_dir().join(format!(
@@ -4618,21 +2713,6 @@ mod tests {
     }
 
     #[test]
-    fn normalized_catalog_install_plans_never_require_a_legacy_runtime() {
-        let service = TranscriptionService::new(AppConfig::default());
-
-        assert_eq!(
-            service.install_plan(&ModelId::new("whisper_cpp_tiny_en")),
-            Some(InstallPlan::PinnedGguf)
-        );
-        assert_eq!(
-            service.install_plan(&ModelId::new("moonshine-tiny-en-int8-onnx")),
-            Some(InstallPlan::ReceiptBackedOnnx)
-        );
-        assert_eq!(service.install_plan(&ModelId::new("moonshine")), None);
-    }
-
-    #[test]
     fn normalized_catalog_exposes_only_neutral_experimental_descriptors() {
         let service = TranscriptionService::new(AppConfig::default());
         let descriptors = service.model_descriptors();
@@ -4657,23 +2737,6 @@ mod tests {
                     .all(|language| *language == "en")
             );
         }
-    }
-
-    #[test]
-    fn rolling_preview_rejects_legacy_models_instead_of_using_cli_fallback() {
-        let service = TranscriptionService::new(AppConfig::default());
-        let result = service.start_rolling_preview(
-            SessionId(1),
-            RequestId(1),
-            ModelId::new("faster_whisper_tiny_en"),
-            None,
-        );
-
-        let error = match result {
-            Err(error) => error,
-            Ok(_) => panic!("legacy models must not start rolling preview"),
-        };
-        assert!(error.to_string().contains("verified native runtime"));
     }
 
     #[test]
@@ -4792,92 +2855,12 @@ mod tests {
     }
 
     #[test]
-    fn service_returns_legacy_adapter_option_errors_without_needing_a_runtime() {
-        let service = TranscriptionService::new(AppConfig::default());
-        let mut request = TranscriptionRequest::new(
-            SessionId(4),
-            RequestId(10),
-            prepared_audio(),
-            "whisper_cpp_tiny_en",
-        );
-        request.options.initial_prompt = Some("domain vocabulary".to_owned());
-
-        let error = service.transcribe(request).unwrap_err();
-
-        assert!(error.to_string().contains("initial prompts"));
-    }
-
-    #[test]
-    fn legacy_adapter_reports_unimplemented_health_check_without_a_runtime() {
-        let model = config::configured_models(&AppConfig::default())
-            .into_iter()
-            .find(|model| model.id == "whisper_cpp_tiny_en")
-            .expect("whisper.cpp tiny model exists");
-        let mut adapter = LegacyBatchAdapter::new(
-            AppConfig::default(),
-            model,
-            crate::stt::cancellation_snapshot(),
-        );
-
-        let error = adapter.health_check().unwrap_err();
-
-        assert!(error.to_string().contains("not implemented"));
-    }
-
-    #[test]
-    fn legacy_adapter_has_explicit_stateless_load_and_process_cancel_semantics() {
-        let model = config::configured_models(&AppConfig::default())
-            .into_iter()
-            .find(|model| model.id == "whisper_cpp_tiny_en")
-            .expect("whisper.cpp tiny model exists");
-        let mut adapter = LegacyBatchAdapter::new(
-            AppConfig::default(),
-            model,
-            crate::stt::cancellation_snapshot(),
-        );
-
-        adapter
-            .load()
-            .expect("legacy adapter has no persistent load");
-        adapter
-            .cancel()
-            .expect("legacy child cancellation is available");
-        adapter
-            .unload()
-            .expect("legacy adapter has no persistent unload");
-    }
-
-    #[test]
-    fn legacy_bridge_wav_is_private_canonical_and_removed_on_drop() {
-        let audio = prepared_audio();
-        let temporary = TemporaryPreparedWav::create(&audio).unwrap();
-        let path = temporary.path().to_path_buf();
-        let round_trip = PreparedAudio::from_wav_path(&path).unwrap();
-
-        assert_eq!(round_trip.sample_rate, 16_000);
-        assert_eq!(round_trip.source_channels, 1);
-        assert_eq!(round_trip.samples.len(), audio.samples.len());
-        drop(temporary);
-        assert!(!path.exists());
-    }
-
-    #[test]
     fn model_id_exposes_a_neutral_stable_reference() {
         let model_id = ModelId::new("whisper_cpp_tiny_en");
 
         assert_eq!(model_id.as_str(), "whisper_cpp_tiny_en");
         assert_eq!(model_id.to_string(), "whisper_cpp_tiny_en");
         assert_eq!(model_id.into_inner(), "whisper_cpp_tiny_en");
-    }
-
-    #[test]
-    fn legacy_response_model_must_match_the_requested_model() {
-        let (_, diagnostics) = map_legacy_result(legacy_result());
-        let error = validate_response_model_id(&ModelId::new("whisper_cpp_tiny_en"), &diagnostics)
-            .unwrap_err();
-
-        assert!(error.to_string().contains("returned model"));
-        assert!(error.to_string().contains("faster_whisper_tiny_en"));
     }
 
     #[test]
@@ -4957,6 +2940,442 @@ mod tests {
         }
     }
 
+    fn service_onnx_spec(label: &str) -> (PathBuf, OnnxModelSpec) {
+        service_onnx_spec_with(
+            label,
+            "zipformer-streaming-en-20m-int8-onnx",
+            OnnxModelFamily::OnlineTransducer,
+            1,
+            &[
+                OnnxFileRole::Encoder,
+                OnnxFileRole::Decoder,
+                OnnxFileRole::Joiner,
+                OnnxFileRole::Tokens,
+            ],
+        )
+    }
+
+    fn service_onnx_spec_with(
+        label: &str,
+        id: &str,
+        family: OnnxModelFamily,
+        num_threads: u16,
+        roles: &[OnnxFileRole],
+    ) -> (PathBuf, OnnxModelSpec) {
+        let root = std::env::temp_dir().join(format!(
+            "scribe-service-onnx-{label}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let files = roles
+            .iter()
+            .copied()
+            .map(|role| {
+                let relative = PathBuf::from(format!("{role:?}.fixture").to_ascii_lowercase());
+                fs::write(root.join(&relative), format!("{label}-{role:?}")).unwrap();
+                (role, relative)
+            })
+            .collect();
+        let spec = OnnxModelSpec {
+            id: id.to_owned(),
+            root: root.clone(),
+            family,
+            files,
+            num_threads,
+        };
+        (root, spec)
+    }
+
+    fn test_load_execution() -> RuntimeLoadExecution {
+        RuntimeLoadExecution {
+            diagnostics: NativeRuntimeDiagnostics {
+                resolved_acceleration: ResolvedAcceleration {
+                    requested: AccelerationPreference::Cpu,
+                    resolved: ComputeDevice::Cpu,
+                    diagnostic: None,
+                },
+                runtime_location: PathBuf::from("<test-inference-child>"),
+                warm_reused: false,
+                model_load_duration_ms: 1,
+            },
+            detected_architecture: "nemo-ctc".to_owned(),
+            capabilities: RuntimeCapabilities::default(),
+        }
+    }
+
+    #[test]
+    fn exact_current_receipt_dispatches_and_self_authored_receipt_is_rejected() {
+        let (root, spec) = service_onnx_spec_with(
+            "receipt-dispatch",
+            "moonshine-tiny-en-int8-onnx",
+            OnnxModelFamily::Moonshine,
+            4,
+            &[
+                OnnxFileRole::Encoder,
+                OnnxFileRole::MergedDecoder,
+                OnnxFileRole::Tokens,
+            ],
+        );
+        let current_manifest =
+            crate::onnx_model_bundles::write_test_receipt_for_spec(&spec).unwrap();
+        let (self_authored_root, self_authored_spec) = service_onnx_spec_with(
+            "self-authored-receipt",
+            "moonshine-tiny-en-int8-onnx",
+            OnnxModelFamily::Moonshine,
+            4,
+            &[
+                OnnxFileRole::Encoder,
+                OnnxFileRole::MergedDecoder,
+                OnnxFileRole::Tokens,
+            ],
+        );
+        crate::onnx_model_bundles::write_test_receipt_for_spec(&self_authored_spec).unwrap();
+        let production_error =
+            crate::onnx_model_bundles::current_executable_receipt_at(&self_authored_root)
+                .unwrap_err();
+        assert!(
+            production_error
+                .to_string()
+                .contains("does not match the current embedded manifest")
+        );
+        let expected = spec.clone();
+        let worker = simulated_runtime_worker(move |receiver| {
+            match receiver.recv().unwrap() {
+                RuntimeCommand::Load {
+                    artifact: RuntimeArtifact::OnnxBundle(actual),
+                    preference,
+                    reply,
+                } => {
+                    assert_eq!(actual, expected);
+                    assert_eq!(preference, AccelerationPreference::Cpu);
+                    reply.send(Ok(test_load_execution())).unwrap();
+                }
+                _ => panic!("receipt preload must dispatch an ONNX load command"),
+            }
+            match receiver.recv().unwrap() {
+                RuntimeCommand::Transcribe {
+                    artifact: RuntimeArtifact::OnnxBundle(actual),
+                    preference,
+                    reply,
+                    ..
+                } => {
+                    assert_eq!(actual, expected);
+                    assert_eq!(preference, AccelerationPreference::Cpu);
+                    reply
+                        .send(Ok(RuntimeExecution {
+                            transcript: Transcript {
+                                text: "service-boundary".to_owned(),
+                                segments: Vec::new(),
+                                detected_language: None,
+                                duration_ms: None,
+                            },
+                            diagnostics: test_load_execution().diagnostics,
+                            processing_duration_ms: 1,
+                        }))
+                        .unwrap();
+                }
+                _ => panic!("receipt transcription must dispatch an ONNX batch command"),
+            }
+            if let RuntimeCommand::Shutdown { reply } = receiver.recv().unwrap() {
+                reply.send(Ok(())).unwrap();
+            }
+        });
+        let service = TranscriptionService {
+            config: AppConfig::default(),
+            router: RuntimeRouter::new(),
+            current_receipt_manifest: None,
+            worker,
+        }
+        .with_test_current_receipt_manifest(current_manifest);
+
+        let error = service
+            .preload_onnx_bundle_from_receipt(&self_authored_root)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not match the controlled current manifest")
+        );
+
+        service.preload_onnx_bundle_from_receipt(&root).unwrap();
+        let execution = service
+            .transcribe_onnx_bundle_from_receipt(
+                &root,
+                prepared_audio(),
+                TranscriptionOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(execution.transcript.text, "service-boundary");
+        drop(service);
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(self_authored_root).unwrap();
+    }
+
+    #[test]
+    fn public_moonshine_operations_verify_each_receipt_once_before_dispatch() {
+        let model_id = ModelId::new("moonshine-tiny-en-int8-onnx");
+        let (fixture_root, mut spec) = service_onnx_spec_with(
+            "public-receipt-observer",
+            model_id.as_str(),
+            OnnxModelFamily::Moonshine,
+            4,
+            &[
+                OnnxFileRole::Encoder,
+                OnnxFileRole::MergedDecoder,
+                OnnxFileRole::Tokens,
+            ],
+        );
+        let storage = fixture_root.with_file_name(format!(
+            "scribe-service-public-receipt-storage-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let root = storage.join("onnx-bundles").join(model_id.as_str());
+        fs::create_dir_all(root.parent().unwrap()).unwrap();
+        fs::rename(&fixture_root, &root).unwrap();
+        spec.root = root.clone();
+        let current_manifest =
+            crate::onnx_model_bundles::write_test_receipt_for_spec(&spec).unwrap();
+
+        let expected = spec.clone();
+        let worker_dispatches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let worker_dispatches_for_thread = Arc::clone(&worker_dispatches);
+        let worker = simulated_runtime_worker(move |receiver| {
+            while let Ok(command) = receiver.recv() {
+                match command {
+                    RuntimeCommand::Load {
+                        artifact: RuntimeArtifact::OnnxBundle(actual),
+                        preference,
+                        reply,
+                    } => {
+                        worker_dispatches_for_thread.fetch_add(1, Ordering::SeqCst);
+                        assert_eq!(actual, expected);
+                        assert_eq!(preference, AccelerationPreference::Cpu);
+                        reply.send(Ok(test_load_execution())).unwrap();
+                    }
+                    RuntimeCommand::Health {
+                        artifact: RuntimeArtifact::OnnxBundle(actual),
+                        preference,
+                        reply,
+                    } => {
+                        worker_dispatches_for_thread.fetch_add(1, Ordering::SeqCst);
+                        assert_eq!(actual, expected);
+                        assert_eq!(preference, AccelerationPreference::Cpu);
+                        reply.send(Ok(())).unwrap();
+                    }
+                    RuntimeCommand::Transcribe {
+                        artifact: RuntimeArtifact::OnnxBundle(actual),
+                        preference,
+                        reply,
+                        ..
+                    } => {
+                        worker_dispatches_for_thread.fetch_add(1, Ordering::SeqCst);
+                        assert_eq!(actual, expected);
+                        assert_eq!(preference, AccelerationPreference::Cpu);
+                        reply
+                            .send(Ok(RuntimeExecution {
+                                transcript: Transcript {
+                                    text: "public-operation".to_owned(),
+                                    segments: Vec::new(),
+                                    detected_language: None,
+                                    duration_ms: None,
+                                },
+                                diagnostics: test_load_execution().diagnostics,
+                                processing_duration_ms: 1,
+                            }))
+                            .unwrap();
+                    }
+                    RuntimeCommand::Shutdown { reply } => {
+                        reply.send(Ok(())).unwrap();
+                        break;
+                    }
+                    _ => panic!("unexpected public ONNX command"),
+                }
+            }
+        });
+        let mut config = AppConfig::default();
+        config.general.model_storage_dir = storage.clone();
+        let service = TranscriptionService {
+            config,
+            router: RuntimeRouter::new(),
+            current_receipt_manifest: None,
+            worker,
+        }
+        .with_test_current_receipt_manifest(current_manifest);
+
+        let (preload, preload_stats) =
+            crate::onnx_model_bundles::observe_receipt_verifications_for_test(|| {
+                service.preload_model(&model_id, None)
+            });
+        let (health, health_stats) =
+            crate::onnx_model_bundles::observe_receipt_verifications_for_test(|| {
+                service.health_check(&model_id, None)
+            });
+        let (transcribe, transcribe_stats) =
+            crate::onnx_model_bundles::observe_receipt_verifications_for_test(|| {
+                service.transcribe(TranscriptionRequest::new(
+                    SessionId(730),
+                    RequestId(731),
+                    prepared_audio(),
+                    model_id.clone(),
+                ))
+            });
+        preload.unwrap();
+        health.unwrap();
+        transcribe.unwrap();
+        for stats in [&preload_stats, &health_stats, &transcribe_stats] {
+            assert_eq!(stats.calls, 1);
+            assert!(stats.verified_bytes > 0);
+            assert_eq!(stats.durations.len(), 1);
+        }
+        assert_eq!(worker_dispatches.load(Ordering::SeqCst), 3);
+
+        fs::write(root.join(&spec.files[&OnnxFileRole::Encoder]), b"tampered").unwrap();
+        let (tampered, tampered_stats) =
+            crate::onnx_model_bundles::observe_receipt_verifications_for_test(|| {
+                service.preload_model(&model_id, None)
+            });
+        assert!(tampered.is_err());
+        assert_eq!(tampered_stats.calls, 1);
+        assert_eq!(tampered_stats.verified_bytes, 0);
+        assert_eq!(tampered_stats.durations.len(), 1);
+        assert_eq!(worker_dispatches.load(Ordering::SeqCst), 3);
+
+        let (tampered_health, tampered_health_stats) =
+            crate::onnx_model_bundles::observe_receipt_verifications_for_test(|| {
+                service.health_check(&model_id, None)
+            });
+        assert!(tampered_health.is_err());
+        assert_eq!(tampered_health_stats.calls, 1);
+        assert_eq!(tampered_health_stats.verified_bytes, 0);
+        assert_eq!(tampered_health_stats.durations.len(), 1);
+        assert_eq!(worker_dispatches.load(Ordering::SeqCst), 3);
+
+        let (tampered_transcribe, tampered_transcribe_stats) =
+            crate::onnx_model_bundles::observe_receipt_verifications_for_test(|| {
+                service.transcribe(TranscriptionRequest::new(
+                    SessionId(732),
+                    RequestId(733),
+                    prepared_audio(),
+                    model_id.clone(),
+                ))
+            });
+        assert!(tampered_transcribe.is_err());
+        assert_eq!(tampered_transcribe_stats.calls, 1);
+        assert_eq!(tampered_transcribe_stats.verified_bytes, 0);
+        assert_eq!(tampered_transcribe_stats.durations.len(), 1);
+        assert_eq!(worker_dispatches.load(Ordering::SeqCst), 3);
+
+        drop(service);
+        fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[test]
+    fn staged_smoke_preserves_decode_failure_and_unloads_across_worker_boundary() {
+        let (root, spec) = service_onnx_spec("decode-cleanup");
+        let unloads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let worker_unloads = Arc::clone(&unloads);
+        let worker = simulated_runtime_worker(move |receiver| {
+            while let Ok(command) = receiver.recv() {
+                match command {
+                    RuntimeCommand::Health { reply, .. } => reply.send(Ok(())).unwrap(),
+                    RuntimeCommand::Load { reply, .. } => {
+                        reply.send(Ok(test_load_execution())).unwrap()
+                    }
+                    RuntimeCommand::Transcribe { reply, .. } => reply
+                        .send(Err(RuntimeError::Engine(
+                            "deterministic service decode failure".to_owned(),
+                        )))
+                        .unwrap(),
+                    RuntimeCommand::Unload { reply } => {
+                        worker_unloads.fetch_add(1, Ordering::AcqRel);
+                        reply.send(Ok(())).unwrap();
+                    }
+                    RuntimeCommand::Shutdown { reply } => {
+                        reply.send(Ok(())).unwrap();
+                        break;
+                    }
+                }
+            }
+        });
+        let service = TranscriptionService {
+            config: AppConfig::default(),
+            router: RuntimeRouter::new(),
+            current_receipt_manifest: None,
+            worker,
+        };
+
+        let error = service
+            .verify_onnx_artifact_smoke(
+                RuntimeArtifact::OnnxBundle(spec),
+                &InstallCancellation::default(),
+            )
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("deterministic service decode failure")
+        );
+        assert_eq!(unloads.load(Ordering::Acquire), 2);
+        drop(service);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn staged_smoke_health_failure_still_unloads_across_worker_boundary() {
+        let (root, spec) = service_onnx_spec("health-cleanup");
+        let unloads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let worker_unloads = Arc::clone(&unloads);
+        let worker = simulated_runtime_worker(move |receiver| {
+            while let Ok(command) = receiver.recv() {
+                match command {
+                    RuntimeCommand::Health { reply, .. } => reply
+                        .send(Err(RuntimeError::Engine(
+                            "deterministic service health failure".to_owned(),
+                        )))
+                        .unwrap(),
+                    RuntimeCommand::Unload { reply } => {
+                        worker_unloads.fetch_add(1, Ordering::AcqRel);
+                        reply.send(Ok(())).unwrap();
+                    }
+                    RuntimeCommand::Shutdown { reply } => {
+                        reply.send(Ok(())).unwrap();
+                        break;
+                    }
+                    _ => panic!("health failure must stop staged smoke before load/decode"),
+                }
+            }
+        });
+        let service = TranscriptionService {
+            config: AppConfig::default(),
+            router: RuntimeRouter::new(),
+            current_receipt_manifest: None,
+            worker,
+        };
+
+        let error = service
+            .verify_onnx_artifact_smoke(
+                RuntimeArtifact::OnnxBundle(spec),
+                &InstallCancellation::default(),
+            )
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("deterministic service health failure")
+        );
+        assert_eq!(unloads.load(Ordering::Acquire), 1);
+        drop(service);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn native_shutdown_deadline_is_bounded_while_a_command_is_stuck() {
         let (started_sender, started_receiver) = sync_channel(1);
@@ -5030,451 +3449,7 @@ mod tests {
         }
     }
 
-    #[test]
-    #[ignore = "requires a local whisper.cpp CLI, GGML model, and JFK WAV fixture; set SCRIBE_WHISPER_CPP_CLI, SCRIBE_WHISPER_CPP_MODEL, and SCRIBE_WHISPER_CPP_AUDIO"]
-    fn transcription_service_jfk_smoke_uses_the_whisper_cpp_facade() {
-        let whisper_cli = PathBuf::from(
-            std::env::var_os("SCRIBE_WHISPER_CPP_CLI")
-                .expect("set SCRIBE_WHISPER_CPP_CLI to the pinned whisper.cpp CLI"),
-        );
-        let model_path = PathBuf::from(
-            std::env::var_os("SCRIBE_WHISPER_CPP_MODEL")
-                .expect("set SCRIBE_WHISPER_CPP_MODEL to the pinned GGML model"),
-        );
-        let audio_path = PathBuf::from(
-            std::env::var_os("SCRIBE_WHISPER_CPP_AUDIO")
-                .expect("set SCRIBE_WHISPER_CPP_AUDIO to the JFK WAV fixture"),
-        );
-
-        let mut config = AppConfig::default();
-        config.developer.whisper_executable_path = Some(whisper_cli);
-        let service = TranscriptionService::new(config);
-        let session_id = SessionId(701);
-        let request_id = RequestId(1701);
-        let audio = Arc::new(
-            PreparedAudio::from_wav_path(audio_path)
-                .expect("the configured JFK fixture is a readable WAV"),
-        );
-        let mut request =
-            TranscriptionRequest::new(session_id, request_id, audio.clone(), "whisper_cpp_base_en");
-        request.model_path = Some(model_path.clone());
-
-        service
-            .health_check(
-                &ModelId::new("whisper_cpp_base_en"),
-                request.model_path.clone(),
-            )
-            .expect("pinned runtime package and model pass health validation");
-
-        let outcome = service
-            .transcribe(request)
-            .expect("whisper.cpp facade smoke transcription succeeds");
-
-        assert!(!outcome.transcript.text.trim().is_empty());
-        assert_eq!(outcome.session_id, session_id);
-        assert_eq!(outcome.request_id, request_id);
-        assert_eq!(outcome.model_id, ModelId::new("whisper_cpp_base_en"));
-        assert_eq!(outcome.model_name, "English Base");
-        assert_eq!(outcome.backend_label, "transcribe-cpp");
-        assert!(!outcome.warm_model_reused);
-        assert!(
-            outcome
-                .model_load_duration_ms
-                .is_some_and(|value| value > 0)
-        );
-        assert_eq!(
-            outcome
-                .resolved_acceleration
-                .as_ref()
-                .map(|resolved| &resolved.resolved),
-            Some(&ComputeDevice::Cpu)
-        );
-
-        let mut warm_request = TranscriptionRequest::new(
-            session_id,
-            RequestId(request_id.0 + 1),
-            Arc::clone(&audio),
-            "whisper_cpp_base_en",
-        );
-        warm_request.model_path = Some(model_path.clone());
-        let warm = service
-            .transcribe(warm_request)
-            .expect("retained native model transcribes a second request");
-        assert!(warm.warm_model_reused);
-        assert_eq!(warm.model_load_duration_ms, Some(0));
-
-        service
-            .unload_runtime()
-            .expect("explicit native unload succeeds");
-        let mut reload_request = TranscriptionRequest::new(
-            session_id,
-            RequestId(request_id.0 + 2),
-            audio,
-            "whisper_cpp_base_en",
-        );
-        reload_request.model_path = Some(model_path);
-        let reloaded = service
-            .transcribe(reload_request)
-            .expect("native model reload succeeds after explicit unload");
-        assert!(!reloaded.warm_model_reused);
-        eprintln!(
-            "native_jfk first_load_ms={} first_decode_ms={} warm_load_ms={} warm_decode_ms={}",
-            outcome.model_load_duration_ms.unwrap_or_default(),
-            outcome.processing_duration_ms.unwrap_or_default(),
-            warm.model_load_duration_ms.unwrap_or_default(),
-            warm.processing_duration_ms.unwrap_or_default(),
-        );
-    }
-
-    #[test]
-    #[ignore = "requires the same local pinned whisper.cpp package, base.en model, and JFK fixture as the service smoke test"]
-    fn native_runtime_jfk_cold_and_warm_benchmark() {
-        use std::time::Instant;
-
-        let cli = PathBuf::from(std::env::var_os("SCRIBE_WHISPER_CPP_CLI").unwrap());
-        let model_path = PathBuf::from(std::env::var_os("SCRIBE_WHISPER_CPP_MODEL").unwrap());
-        let audio_path = PathBuf::from(std::env::var_os("SCRIBE_WHISPER_CPP_AUDIO").unwrap());
-        let audio = Arc::new(PreparedAudio::from_wav_path(audio_path).unwrap());
-        let mut config = AppConfig::default();
-        config.developer.whisper_executable_path = Some(cli);
-        config.performance.acceleration_preference = AccelerationPreference::Cpu;
-        let make_request = |request_id: u64| {
-            let mut request = TranscriptionRequest::new(
-                SessionId(8_000 + request_id),
-                RequestId(request_id),
-                audio.clone(),
-                "whisper_cpp_base_en",
-            );
-            request.model_path = Some(model_path.clone());
-            request
-        };
-
-        let mut cold_total = Vec::new();
-        let mut cold_load = Vec::new();
-        for index in 0..5_u64 {
-            let service = TranscriptionService::new(config.clone());
-            let started = Instant::now();
-            let outcome = service.transcribe(make_request(index + 1)).unwrap();
-            cold_total.push(started.elapsed().as_millis());
-            cold_load.push(outcome.model_load_duration_ms.unwrap());
-            assert!(!outcome.warm_model_reused);
-        }
-
-        let service = TranscriptionService::new(config);
-        service.transcribe(make_request(100)).unwrap();
-        let mut warm_total = Vec::new();
-        let mut warm_decode = Vec::new();
-        for index in 0..20_u64 {
-            let started = Instant::now();
-            let outcome = service.transcribe(make_request(index + 101)).unwrap();
-            warm_total.push(started.elapsed().as_millis());
-            warm_decode.push(outcome.processing_duration_ms.unwrap());
-            assert!(outcome.warm_model_reused);
-        }
-
-        eprintln!(
-            "native_jfk_benchmark cold_total_median_ms={} cold_total_p95_ms={} cold_load_median_ms={} cold_load_p95_ms={} warm_total_median_ms={} warm_total_p95_ms={} warm_decode_median_ms={} warm_decode_p95_ms={}",
-            percentile(&cold_total, 50),
-            percentile(&cold_total, 95),
-            percentile(&cold_load, 50),
-            percentile(&cold_load, 95),
-            percentile(&warm_total, 50),
-            percentile(&warm_total, 95),
-            percentile(&warm_decode, 50),
-            percentile(&warm_decode, 95),
-        );
-    }
-
-    #[test]
-    #[ignore = "requires the same local pinned whisper.cpp package, base.en model, and JFK fixture as the service smoke test"]
-    fn rolling_preview_jfk_first_partial_benchmark() {
-        use sha2::{Digest, Sha256};
-        use std::io::Read;
-        use std::time::Instant;
-
-        let cli = PathBuf::from(std::env::var_os("SCRIBE_WHISPER_CPP_CLI").unwrap());
-        let model_path = PathBuf::from(std::env::var_os("SCRIBE_WHISPER_CPP_MODEL").unwrap());
-        let audio_path = PathBuf::from(std::env::var_os("SCRIBE_WHISPER_CPP_AUDIO").unwrap());
-        let verify_file = |path: &Path, expected_size: u64, expected_sha256: &str| {
-            assert_eq!(fs::metadata(path).unwrap().len(), expected_size);
-            let mut file = fs::File::open(path).unwrap();
-            let mut hasher = Sha256::new();
-            let mut buffer = [0_u8; 64 * 1024];
-            loop {
-                let read = file.read(&mut buffer).unwrap();
-                if read == 0 {
-                    break;
-                }
-                hasher.update(&buffer[..read]);
-            }
-            assert_eq!(format!("{:x}", hasher.finalize()), expected_sha256);
-        };
-        verify_file(
-            &model_path,
-            147_964_211,
-            "a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002",
-        );
-        verify_file(
-            &audio_path,
-            352_078,
-            "59dfb9a4acb36fe2a2affc14bacbee2920ff435cb13cc314a08c13f66ba7860e",
-        );
-        let audio = PreparedAudio::from_wav_path(audio_path).unwrap();
-        let mut config = AppConfig::default();
-        config.developer.whisper_executable_path = Some(cli);
-        config.performance.acceleration_preference = AccelerationPreference::Cpu;
-
-        let run_preview = |service: &TranscriptionService, run_id: u64| {
-            let model_id = ModelId::new("whisper_cpp_base_en");
-            let (publisher, mut handle) = service
-                .start_rolling_preview(
-                    SessionId(12_000 + run_id),
-                    RequestId(13_000 + run_id),
-                    model_id,
-                    Some(model_path.clone()),
-                )
-                .unwrap();
-            let started = Instant::now();
-            let interval = crate::prepared_audio::PREPARED_SAMPLE_RATE as usize
-                * crate::streaming::DECODE_INTERVAL_MS as usize
-                / 1_000;
-            let window = crate::prepared_audio::PREPARED_SAMPLE_RATE as usize
-                * crate::streaming::ROLLING_WINDOW_MS as usize
-                / 1_000;
-            let mut next_end = interval;
-            let deadline = started + Duration::from_secs(30);
-            let first_partial = loop {
-                let elapsed_intervals = (started.elapsed().as_millis()
-                    / u128::from(crate::streaming::DECODE_INTERVAL_MS))
-                    as usize;
-                let due_end = elapsed_intervals
-                    .saturating_mul(interval)
-                    .min(audio.samples.len());
-                while next_end <= due_end && next_end <= audio.samples.len() {
-                    let start = next_end.saturating_sub(window);
-                    assert!(
-                        publisher
-                            .publish_window(start as u64, audio.samples[start..next_end].to_vec())
-                            .unwrap()
-                    );
-                    next_end = next_end.saturating_add(interval);
-                }
-                if let Some(event) = handle.try_next() {
-                    match event {
-                        PreviewEvent::Update { update, .. }
-                            if !update.committed.is_empty() || !update.tentative.is_empty() =>
-                        {
-                            let text = format!("{} {}", update.committed, update.tentative)
-                                .to_ascii_lowercase();
-                            assert!(
-                                ["and", "fellow", "americans", "country", "ask"].iter().any(
-                                    |expected| text.split_whitespace().any(|word| {
-                                        word.trim_matches(|character: char| {
-                                            !character.is_alphanumeric()
-                                        }) == *expected
-                                    })
-                                ),
-                                "first partial did not contain an expected JFK fixture word: {text:?}"
-                            );
-                            break started.elapsed().as_millis();
-                        }
-                        PreviewEvent::Update { .. } => {}
-                        PreviewEvent::Error { error, .. } => {
-                            panic!("rolling preview failed: {error}")
-                        }
-                    }
-                }
-                assert!(Instant::now() < deadline, "rolling preview timed out");
-                std::thread::sleep(Duration::from_millis(2));
-            };
-            handle.close();
-            assert!(handle.stop_and_join(Duration::from_secs(5)));
-            first_partial
-        };
-
-        let mut cold_first_partial = Vec::new();
-        for run_id in 0..5 {
-            let service = TranscriptionService::new(config.clone());
-            cold_first_partial.push(run_preview(&service, run_id));
-        }
-
-        let service = TranscriptionService::new(config);
-        service
-            .preload_model(
-                &ModelId::new("whisper_cpp_base_en"),
-                Some(model_path.clone()),
-            )
-            .unwrap();
-        let mut warm_first_partial = Vec::new();
-        for run_id in 0..20 {
-            warm_first_partial.push(run_preview(&service, 100 + run_id));
-        }
-
-        eprintln!(
-            "rolling_preview_jfk cold_samples_ms={cold_first_partial:?} warm_samples_ms={warm_first_partial:?} first_partial_cold_median_ms={} first_partial_cold_p95_ms={} first_partial_warm_median_ms={} first_partial_warm_p95_ms={}",
-            percentile(&cold_first_partial, 50),
-            percentile(&cold_first_partial, 95),
-            percentile(&warm_first_partial, 50),
-            percentile(&warm_first_partial, 95),
-        );
-    }
-
-    #[test]
-    #[ignore = "requires the same local pinned whisper.cpp package, base.en model, and JFK fixture as the service smoke test"]
-    fn native_runtime_cancellation_interrupts_active_decode() {
-        let cli = PathBuf::from(std::env::var_os("SCRIBE_WHISPER_CPP_CLI").unwrap());
-        let model_path = PathBuf::from(std::env::var_os("SCRIBE_WHISPER_CPP_MODEL").unwrap());
-        let audio_path = PathBuf::from(std::env::var_os("SCRIBE_WHISPER_CPP_AUDIO").unwrap());
-        let fixture = PreparedAudio::from_wav_path(audio_path).unwrap();
-        let mut samples = Vec::with_capacity(fixture.samples.len() * 20);
-        for _ in 0..20 {
-            samples.extend_from_slice(&fixture.samples);
-        }
-        let audio = Arc::new(PreparedAudio {
-            source_frames: samples.len(),
-            samples,
-            sample_rate: fixture.sample_rate,
-            source_sample_rate: fixture.sample_rate,
-            source_channels: 1,
-        });
-        let mut config = AppConfig::default();
-        config.developer.whisper_executable_path = Some(cli);
-        config.performance.acceleration_preference = AccelerationPreference::Cpu;
-        let service = TranscriptionService::new(config);
-        service
-            .preload_model(
-                &ModelId::new("whisper_cpp_base_en"),
-                Some(model_path.clone()),
-            )
-            .unwrap();
-
-        let worker_service = service.clone();
-        let worker = std::thread::spawn(move || {
-            let mut request = TranscriptionRequest::new(
-                SessionId(9_001),
-                RequestId(9_001),
-                audio,
-                "whisper_cpp_base_en",
-            );
-            request.model_path = Some(model_path);
-            worker_service.transcribe(request)
-        });
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        let cancel_started = std::time::Instant::now();
-        service.cancel_active();
-        let error = worker.join().unwrap().unwrap_err();
-        let cancellation_latency = cancel_started.elapsed();
-        eprintln!("native_cancel_ack_ms={}", cancellation_latency.as_millis());
-
-        assert!(cancellation_latency <= std::time::Duration::from_secs(2));
-        assert!(error.to_string().contains("inference failed"));
-    }
-
-    #[test]
-    fn configured_managed_runtime_root_requires_exact_catalog_target() {
-        let root = std::env::temp_dir().join(format!(
-            "scribe-managed-runtime-root-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let storage = root.join("runtimes");
-        let expected_root = storage.join("whisper_cpp");
-        let expected_entrypoint = expected_root.join("bin").join("whisper-cli.exe");
-        let external_entrypoint = root.join("external").join("bin").join("whisper-cli.exe");
-        fs::create_dir_all(expected_entrypoint.parent().unwrap()).unwrap();
-        fs::create_dir_all(external_entrypoint.parent().unwrap()).unwrap();
-        fs::write(&expected_entrypoint, b"expected").unwrap();
-        fs::write(&external_entrypoint, b"external").unwrap();
-        let mut config = AppConfig::default();
-        config.general.managed_runtimes.insert(
-            "whisper_cpp".to_owned(),
-            config::ManagedRuntimeInstall::app_managed(expected_entrypoint.clone(), "test"),
-        );
-
-        assert_eq!(
-            configured_managed_runtime_root_in(&config, "whisper_cpp", &storage).unwrap(),
-            Some(expected_root.clone())
-        );
-
-        config.general.managed_runtimes.insert(
-            "whisper_cpp".to_owned(),
-            config::ManagedRuntimeInstall::app_managed(external_entrypoint, "test"),
-        );
-        assert!(
-            configured_managed_runtime_root_in(&config, "whisper_cpp", &storage)
-                .unwrap_err()
-                .to_string()
-                .contains("outside its catalog target")
-        );
-
-        let arbitrary_entrypoint = expected_root.join("bin").join("arbitrary.exe");
-        fs::write(&arbitrary_entrypoint, b"arbitrary").unwrap();
-        config.general.managed_runtimes.insert(
-            "whisper_cpp".to_owned(),
-            config::ManagedRuntimeInstall::app_managed(arbitrary_entrypoint, "test"),
-        );
-        assert!(
-            configured_managed_runtime_root_in(&config, "whisper_cpp", &storage)
-                .unwrap_err()
-                .to_string()
-                .contains("exact pinned entrypoint")
-        );
-
-        config.general.managed_runtimes.insert(
-            "whisper_cpp".to_owned(),
-            config::ManagedRuntimeInstall::app_managed(
-                expected_root.join("bin").join("..").join("whisper-cli.exe"),
-                "test",
-            ),
-        );
-        assert!(
-            configured_managed_runtime_root_in(&config, "whisper_cpp", &storage)
-                .unwrap_err()
-                .to_string()
-                .contains("parent-directory")
-        );
-        fs::remove_dir_all(root).unwrap();
-    }
-
     #[cfg(unix)]
-    #[test]
-    fn configured_managed_runtime_root_rejects_symlinked_catalog_directory() {
-        use std::os::unix::fs::symlink;
-
-        let root = std::env::temp_dir().join(format!(
-            "scribe-managed-runtime-link-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let storage = root.join("runtimes");
-        let external = root.join("external");
-        fs::create_dir_all(&storage).unwrap();
-        fs::create_dir_all(external.join("bin")).unwrap();
-        fs::write(external.join("bin").join("whisper-cli"), b"external").unwrap();
-        symlink(&external, storage.join("whisper_cpp")).unwrap();
-        let mut config = AppConfig::default();
-        config.general.managed_runtimes.insert(
-            "whisper_cpp".to_owned(),
-            config::ManagedRuntimeInstall::app_managed(
-                storage.join("whisper_cpp").join("bin").join("whisper-cli"),
-                "test",
-            ),
-        );
-
-        assert!(
-            configured_managed_runtime_root_in(&config, "whisper_cpp", &storage)
-                .unwrap_err()
-                .to_string()
-                .contains("symbolic link")
-        );
-        fs::remove_dir_all(root).unwrap();
-    }
 
     fn percentile(values: &[u128], percentile: usize) -> u128 {
         let mut sorted = values.to_vec();

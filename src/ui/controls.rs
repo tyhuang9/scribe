@@ -378,47 +378,6 @@ pub(crate) fn keycap(ui: &mut Ui, text: &str) {
         });
 }
 
-#[allow(dead_code)]
-pub(crate) fn notice(ui: &mut Ui, text: &str, error: bool) -> Response {
-    let colors = ui_palette(ui);
-    let (fill, stroke, color, icon) = if error {
-        (
-            colors.error_pale,
-            colors.error_border,
-            colors.error_text,
-            Icon::MicrophoneOff,
-        )
-    } else {
-        (
-            colors.panel_bg,
-            colors.border,
-            colors.neutral_notice_text,
-            Icon::Info,
-        )
-    };
-    let width = ui.available_width();
-    ui.allocate_ui_with_layout(Vec2::new(width, 0.0), Layout::top_down(Align::LEFT), |ui| {
-        Frame::none()
-            .fill(fill)
-            .stroke(Stroke::new(1.0, stroke))
-            .rounding(Rounding::same(5.0))
-            .inner_margin(Margin::same(12.0))
-            .show(ui, |ui| {
-                ui.set_min_width((width - 24.0).max(0.0));
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(
-                        egui::RichText::new(icon_glyph(icon))
-                            .size(18.0)
-                            .color(color),
-                    );
-                    ui.label(egui::RichText::new(text).color(color));
-                });
-            });
-    })
-    .response
-}
-
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Icon {
     Waveform,
@@ -431,18 +390,14 @@ pub(crate) enum Icon {
     Sun,
     Moon,
     Info,
-    Copy,
     ChevronDown,
     ChevronUp,
-    Stop,
     MicrophoneOff,
     Keyboard,
     Refresh,
     Cpu,
     Globe,
     CheckCircle,
-    Gauge,
-    Folder,
     Plus,
     Download,
     Play,
@@ -451,16 +406,11 @@ pub(crate) enum Icon {
     Trash,
     Close,
     Search,
-    ChevronRight,
     Spinner,
     Streaming,
     WordTimestamps,
     Translation,
-    LanguageDetection,
     BatchTranscription,
-    Cancellation,
-    ConfidenceScores,
-    CustomVocabulary,
 }
 
 pub(crate) fn icon_glyph(icon: Icon) -> &'static str {
@@ -476,17 +426,13 @@ pub(crate) fn icon_glyph(icon: Icon) -> &'static str {
         Icon::Debug => regular::BUG,
         Icon::Sun => regular::SUN,
         Icon::Moon => regular::MOON,
-        Icon::Copy => regular::COPY,
         Icon::ChevronDown => regular::CARET_DOWN,
         Icon::ChevronUp => regular::CARET_UP,
-        Icon::Stop => regular::STOP,
         Icon::MicrophoneOff => regular::MICROPHONE_SLASH,
         Icon::Keyboard => regular::KEYBOARD,
         Icon::Cpu => regular::CPU,
         Icon::Globe => regular::GLOBE,
         Icon::CheckCircle => regular::CHECK_CIRCLE,
-        Icon::Gauge => regular::GAUGE,
-        Icon::Folder => regular::FOLDER,
         Icon::Plus => regular::PLUS,
         Icon::Download => regular::DOWNLOAD,
         Icon::Play => regular::PLAY,
@@ -495,16 +441,11 @@ pub(crate) fn icon_glyph(icon: Icon) -> &'static str {
         Icon::Trash => regular::TRASH,
         Icon::Close => regular::X,
         Icon::Search => regular::MAGNIFYING_GLASS,
-        Icon::ChevronRight => regular::CARET_RIGHT,
         Icon::Spinner => regular::CIRCLE_NOTCH,
         Icon::Streaming => regular::WAVEFORM,
         Icon::WordTimestamps => regular::SUBTITLES,
         Icon::Translation => regular::TRANSLATE,
-        Icon::LanguageDetection => regular::GLOBE,
         Icon::BatchTranscription => regular::LIST_BULLETS,
-        Icon::Cancellation => regular::PROHIBIT,
-        Icon::ConfidenceScores => regular::SEAL_CHECK,
-        Icon::CustomVocabulary => regular::NOTE_PENCIL,
     }
 }
 
@@ -555,19 +496,14 @@ mod tests {
         assert_eq!(icon_glyph(Icon::Streaming), regular::WAVEFORM);
         assert_eq!(icon_glyph(Icon::WordTimestamps), regular::SUBTITLES);
         assert_eq!(icon_glyph(Icon::Translation), regular::TRANSLATE);
-        assert_eq!(icon_glyph(Icon::LanguageDetection), regular::GLOBE);
         assert_eq!(icon_glyph(Icon::BatchTranscription), regular::LIST_BULLETS);
-        assert_eq!(icon_glyph(Icon::Cancellation), regular::PROHIBIT);
-        assert_eq!(icon_glyph(Icon::ConfidenceScores), regular::SEAL_CHECK);
-        assert_eq!(icon_glyph(Icon::CustomVocabulary), regular::NOTE_PENCIL);
     }
 
     #[test]
-    fn cards_and_notices_allocate_the_available_content_width() {
+    fn cards_allocate_the_available_content_width() {
         let ctx = egui::Context::default();
         let mut available_width = 0.0;
         let mut card_width = 0.0;
-        let mut notice_width = 0.0;
         let _ = ctx.run(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
@@ -580,17 +516,12 @@ mod tests {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     available_width = ui.available_width();
                     card_width = card(ui, |_| {}).rect.width();
-                    notice_width = notice(ui, "A full-width notice", false).rect.width();
                 });
             },
         );
         assert!(
             card_width >= available_width - 1.0,
             "card={card_width}, available={available_width}"
-        );
-        assert!(
-            notice_width >= available_width - 1.0,
-            "notice={notice_width}, available={available_width}"
         );
     }
 

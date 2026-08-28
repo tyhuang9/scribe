@@ -7,7 +7,6 @@ mod app;
 mod audio;
 mod benchmark;
 mod branding;
-mod compatibility_bridge;
 mod config;
 mod core;
 #[cfg(all(feature = "ui-harness", debug_assertions))]
@@ -26,12 +25,11 @@ mod model_catalog;
 mod models;
 // This delivery unit intentionally exposes only private service hooks; a later
 // coordinator branch may call its install APIs without widening product types.
-#[allow(dead_code)]
 mod onnx_model_bundles;
 mod onnx_worker;
 mod overlay;
 mod prepared_audio;
-mod runtime_catalog;
+mod runtime_artifact;
 mod runtime_router;
 mod silero_vad_native;
 mod streaming;
