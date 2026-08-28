@@ -1224,6 +1224,7 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
         "Assert-SafeStagingPath",
         "Remove-ValidatedStaging",
         "Assert-ExactAllowlist",
+        "Assert-AllowedPayloadFile",
         "bundle-inventory.json",
         "README.txt",
         "Assert-WindowsGuiSubsystem",
@@ -1314,6 +1315,7 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
         "build-windows-release.ps1",
         "verify-windows-release-package.ps1",
         "-BundlePath dist\\portable",
+        "-PortableZipPath dist\\Scribe-windows-x64.zip",
     ] {
         assert!(
             workflow.contains(required),
@@ -1330,8 +1332,16 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
     assert!(
         installer.contains("Source: \"..\\dist\\portable\\*\"")
             && installer.contains("recursesubdirs")
-            && installer.contains("createallsubdirs"),
+            && installer.contains("createallsubdirs")
+            && installer.contains("StableAppIdGuid \"8E0F1935-8E3D-4B1D-9A42-7C7D7C3D5E7A\"")
+            && installer.contains("DefaultDirName={localappdata}\\Programs\\Scribe")
+            && installer.contains("AppId={code:ResolveAppId}")
+            && installer.contains("{param:SCRIBEVERIFY|}"),
         "Windows installer must recursively copy the validated portable payload"
+    );
+    assert!(
+        !installer.contains("[InstallDelete]"),
+        "Windows installer must not broadly delete an existing program directory"
     );
 
     let main = fs::read_to_string(repository.join("src").join("main.rs"))
@@ -1362,6 +1372,12 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
         "PE subsystem mismatch",
         "Windows release workflow",
         "Windows installer",
+        "duplicate case-insensitive",
+        "Assert-SafePortableZip",
+        "Assert-PayloadParity",
+        "RUNTIMES/whisper/whisper.dll",
+        "nested/model.ONNX",
+        "python/runner.py",
     ] {
         assert!(
             packaging_tests.contains(required),
@@ -1381,7 +1397,14 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
         "RedirectStandardOutput",
         "WaitForExit",
         "/VERYSILENT",
-        "Assert-Bundle -Root $installedRoot -AllowedAdditionalFiles $InnoSetupUninstallerArtifacts",
+        "Assert-SafePortableZip",
+        "Assert-PayloadParity $bundle $zipRoot \"Portable ZIP\"",
+        "Assert-PayloadParity $bundle $installedRoot \"Installed\"",
+        "AllowedAdditionalFiles $InnoSetupUninstallerArtifacts",
+        "/SCRIBEVERIFY=$verificationToken",
+        "Remove-VerificationUninstallRegistration",
+        "Assert-Amd64GuiPe",
+        "Bundle inventory paths differ from the canonical self-contained payload allowlist",
     ] {
         assert!(
             package_verifier.contains(required),

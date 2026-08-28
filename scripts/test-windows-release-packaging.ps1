@@ -15,11 +15,18 @@ $expectedPeMachine = 0x8664
 Invoke-Expression $source.Substring($helpersStart, $helpersEnd - $helpersStart)
 
 $verifierSource = Get-Content -LiteralPath $packageVerifier -Raw
+$verifierPreambleStart = $verifierSource.IndexOf("`$targetTriple =")
 $verifierHelpersStart = $verifierSource.IndexOf("function Get-NormalizedPath")
 $verifierHelpersEnd = $verifierSource.IndexOf("`$bundle = Get-NormalizedPath")
-if ($verifierHelpersStart -lt 0 -or $verifierHelpersEnd -le $verifierHelpersStart) {
+if ($verifierPreambleStart -lt 0 -or
+    $verifierHelpersStart -le $verifierPreambleStart -or
+    $verifierHelpersEnd -le $verifierHelpersStart) {
     throw "Could not isolate Windows release package verifier helpers for testing."
 }
+$verifierPreamble = $verifierSource.Substring($verifierPreambleStart, $verifierHelpersStart - $verifierPreambleStart)
+$quotedScriptRoot = $PSScriptRoot.Replace("'", "''")
+$verifierPreamble = $verifierPreamble.Replace('$PSScriptRoot', "'$quotedScriptRoot'")
+Invoke-Expression $verifierPreamble
 Invoke-Expression $verifierSource.Substring($verifierHelpersStart, $verifierHelpersEnd - $verifierHelpersStart)
 
 function Invoke-ExpectedFailure([scriptblock]$Action, [string]$ExpectedText) {
@@ -196,7 +203,7 @@ try {
 
     $inventoryFile = Join-Path $allowlist "one.bin"
     $inventoryItem = Get-Item -LiteralPath $inventoryFile
-    $inventoryHash = (Get-FileHash -LiteralPath $inventoryFile -Algorithm SHA256).Hash
+    $inventoryHash = (Get-FileHash -LiteralPath $inventoryFile -Algorithm SHA256).Hash.ToLowerInvariant()
     Assert-ExactFile $inventoryFile $inventoryItem.Length $inventoryHash
     [System.IO.File]::WriteAllBytes($inventoryFile, [byte[]](9))
     Invoke-ExpectedFailure {
@@ -256,6 +263,9 @@ try {
     $workflow = Get-Content -LiteralPath (Join-Path $repositoryRoot ".github\workflows\release.yml") -Raw
     if ($workflow -notmatch "prepare-windows-release-inputs\.ps1" -or
         $workflow -notmatch "build-windows-release\.ps1" -or
+        $workflow -notmatch "choco install innosetup --version=6\.7\.1" -or
+        $workflow -notmatch "-PortableZipPath dist\\Scribe-windows-x64\.zip" -or
+        $workflow -match "-RuntimeSource" -or
         $workflow -match "Copy-Item target\\release\\local-transcriber\.exe") {
         throw "Windows release workflow must package the validated full bundle, not a bare executable."
     }
@@ -457,6 +467,12 @@ Set-StrictMode -Version Latest
         $contractTestPosition -ge $releaseBuildPosition) {
         throw "Windows release packaging contracts must run before release input preparation and build."
     }
+    $portableZipPosition = $workflow.IndexOf('Compress-Archive -Path dist\portable\*')
+    $payloadParityPosition = $workflow.IndexOf('-PortableZipPath dist\Scribe-windows-x64.zip')
+    if ($portableZipPosition -lt 0 -or
+        $payloadParityPosition -le $portableZipPosition) {
+        throw "Portable ZIP creation must precede portable/installer parity verification."
+    }
     $assetValidationPosition = $workflow.IndexOf("`$assetRoot =")
     $rulesetPreflightPosition = $workflow.IndexOf("`$requiredRulesetName = 'Protect release tags'")
     $atomicTagPosition = $workflow.IndexOf('gh api --method POST')
@@ -475,22 +491,62 @@ Set-StrictMode -Version Latest
     $installer = Get-Content -LiteralPath (Join-Path $repositoryRoot "installer\scribe.iss") -Raw
     if ($installer -notmatch 'Source: "\.\.\\dist\\portable\\\*"' -or
         $installer -notmatch "recursesubdirs" -or
-        $installer -notmatch "createallsubdirs") {
+        $installer -notmatch "createallsubdirs" -or
+        $installer -notmatch '#define StableAppIdGuid "8E0F1935-8E3D-4B1D-9A42-7C7D7C3D5E7A"' -or
+        $installer -notmatch 'DefaultDirName=\{localappdata\}\\Programs\\Scribe' -or
+        $installer -notmatch 'AppId=\{code:ResolveAppId\}' -or
+        $installer -notmatch '\{param:SCRIBEVERIFY\|\}' -or
+        $installer -match '(?m)^\[InstallDelete\]') {
         throw "Windows installer must recursively install the validated portable payload."
     }
 
     $verificationBundle = Join-Path $testRoot "verification-bundle"
     New-Item -ItemType Directory -Path $verificationBundle | Out-Null
-    $verificationReadme = Join-Path $verificationBundle "README.txt"
-    [System.IO.File]::WriteAllText($verificationReadme, "verified portable payload", [System.Text.UTF8Encoding]::new($false))
-    $verificationItem = Get-Item -LiteralPath $verificationReadme
+    $fixtureModelBytes = [byte[]](0x47, 0x47, 0x55, 0x46, 1, 2, 3, 4)
+    $fixtureModelHash = [Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($fixtureModelBytes)).ToLowerInvariant()
+    $fixtureModelManifest = [pscustomobject]@{
+        schema_version = 1
+        platform_triple = "x86_64-pc-windows-msvc"
+        artifact_filename = "whisper-base.en-Q8_0.gguf"
+        size_bytes = [int64]$fixtureModelBytes.Length
+        sha256 = $fixtureModelHash
+    }
+    $fixtureManifestSource = Join-Path $testRoot "fixture-model-manifest.json"
+    [System.IO.File]::WriteAllText(
+        $fixtureManifestSource,
+        ($fixtureModelManifest | ConvertTo-Json -Depth 5),
+        [System.Text.UTF8Encoding]::new($false)
+    )
+
+    foreach ($relativePath in $expectedInventoryPaths) {
+        $path = Join-Path $verificationBundle ($relativePath -replace '/', '\')
+        New-Item -ItemType Directory -Path (Split-Path -Parent $path) -Force | Out-Null
+        switch ($relativePath) {
+            "local-transcriber.exe" { Write-TestPe $path 0x8664 }
+            "whisper-base.en-Q8_0.gguf" { [System.IO.File]::WriteAllBytes($path, $fixtureModelBytes) }
+            "bundled-model-manifest.json" { Copy-Item -LiteralPath $fixtureManifestSource -Destination $path }
+            default {
+                [System.IO.File]::WriteAllText(
+                    $path,
+                    "verified fixture for $relativePath",
+                    [System.Text.UTF8Encoding]::new($false)
+                )
+            }
+        }
+    }
+
     $verificationInventory = [ordered]@{
         schema_version = 1
         platform_triple = "x86_64-pc-windows-msvc"
-        files = @([ordered]@{
-            path = "README.txt"
-            size_bytes = [int64]$verificationItem.Length
-            sha256 = (Get-FileHash -LiteralPath $verificationReadme -Algorithm SHA256).Hash.ToLowerInvariant()
+        files = @($expectedInventoryPaths | Sort-Object | ForEach-Object {
+            $relativePath = $_
+            $path = Join-Path $verificationBundle ($relativePath -replace '/', '\')
+            $item = Get-Item -LiteralPath $path
+            [ordered]@{
+                path = $relativePath
+                size_bytes = [int64]$item.Length
+                sha256 = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+            }
         })
     }
     [System.IO.File]::WriteAllText(
@@ -498,18 +554,95 @@ Set-StrictMode -Version Latest
         ($verificationInventory | ConvertTo-Json -Depth 5),
         [System.Text.UTF8Encoding]::new($false)
     )
-    & $packageVerifier -BundlePath $verificationBundle
+    Assert-Bundle `
+        -Root $verificationBundle `
+        -ExpectedModelManifest $fixtureModelManifest `
+        -ExpectedModelManifestPath $fixtureManifestSource `
+        -ExpectedLegalFiles @()
+
+    foreach ($forbiddenPath in @(
+        "RUNTIMES/whisper/whisper.dll",
+        "nested/runtime-manifest.JSON",
+        "nested/GGML.DLL",
+        "nested/SHERPA-helper.exe",
+        "nested/onnxruntime.dll",
+        "WHISPER-CLI.EXE",
+        "main.exe",
+        "python/runner.py",
+        ".venv/module.pyd",
+        "nested/model.ONNX",
+        "nested/model.ORT"
+    )) {
+        Invoke-ExpectedFailure {
+            Assert-AllowedPayloadFile $forbiddenPath
+        } "Release payload contains"
+    }
+    foreach ($unsafePath in @("../escape.txt", "nested/../escape.txt", "C:/escape.txt", "nested\escape.txt")) {
+        Invoke-ExpectedFailure {
+            Assert-SafeRelativePayloadPath $unsafePath
+        } "unsafe"
+    }
+
+    $portableZip = Join-Path $testRoot "verification-portable.zip"
+    Compress-Archive -Path (Join-Path $verificationBundle '*') -DestinationPath $portableZip
+    Assert-SafePortableZip $portableZip
+
+    $traversalZip = Join-Path $testRoot "traversal.zip"
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $zip = [System.IO.Compression.ZipFile]::Open($traversalZip, [System.IO.Compression.ZipArchiveMode]::Create)
+    try {
+        $null = $zip.CreateEntry("../escape.txt")
+    }
+    finally {
+        $zip.Dispose()
+    }
+    Invoke-ExpectedFailure {
+        Assert-SafePortableZip $traversalZip
+    } "unsafe"
+
+    $caseCollisionZip = Join-Path $testRoot "case-collision.zip"
+    $zip = [System.IO.Compression.ZipFile]::Open($caseCollisionZip, [System.IO.Compression.ZipArchiveMode]::Create)
+    try {
+        $null = $zip.CreateEntry("README.txt")
+        $null = $zip.CreateEntry("readme.txt")
+    }
+    finally {
+        $zip.Dispose()
+    }
+    Invoke-ExpectedFailure {
+        Assert-SafePortableZip $caseCollisionZip
+    } "duplicate case-insensitive"
 
     $installedVerificationBundle = Join-Path $testRoot "installed-verification-bundle"
     Copy-Item -LiteralPath $verificationBundle -Destination $installedVerificationBundle -Recurse
     [System.IO.File]::WriteAllBytes((Join-Path $installedVerificationBundle "unins000.exe"), [byte[]](0x4D, 0x5A))
     [System.IO.File]::WriteAllBytes((Join-Path $installedVerificationBundle "unins000.dat"), [byte[]](1, 2, 3))
-    Assert-Bundle -Root $installedVerificationBundle -AllowedAdditionalFiles $InnoSetupUninstallerArtifacts
+    Assert-Bundle `
+        -Root $installedVerificationBundle `
+        -AllowedAdditionalFiles $InnoSetupUninstallerArtifacts `
+        -ExpectedModelManifest $fixtureModelManifest `
+        -ExpectedModelManifestPath $fixtureManifestSource `
+        -ExpectedLegalFiles @()
+    Assert-PayloadParity $verificationBundle $installedVerificationBundle "Installed fixture"
 
     [System.IO.File]::WriteAllBytes((Join-Path $installedVerificationBundle "unexpected-installer-payload.bin"), [byte[]](4))
     Invoke-ExpectedFailure {
-        Assert-Bundle -Root $installedVerificationBundle -AllowedAdditionalFiles $InnoSetupUninstallerArtifacts
+        Assert-Bundle `
+            -Root $installedVerificationBundle `
+            -AllowedAdditionalFiles $InnoSetupUninstallerArtifacts `
+            -ExpectedModelManifest $fixtureModelManifest `
+            -ExpectedModelManifestPath $fixtureManifestSource `
+            -ExpectedLegalFiles @()
     } "Release payload differs from its explicit inventory"
+
+    Remove-Item -LiteralPath (Join-Path $installedVerificationBundle "unexpected-installer-payload.bin")
+    $installedReadme = Join-Path $installedVerificationBundle "README.txt"
+    $readmeBytes = [System.IO.File]::ReadAllBytes($installedReadme)
+    $readmeBytes[0] = $readmeBytes[0] -bxor 0x01
+    [System.IO.File]::WriteAllBytes($installedReadme, $readmeBytes)
+    Invoke-ExpectedFailure {
+        Assert-PayloadParity $verificationBundle $installedVerificationBundle "Installed fixture"
+    } "payload parity mismatch"
 
     Write-Output "Windows release packaging fail-closed tests passed."
 }

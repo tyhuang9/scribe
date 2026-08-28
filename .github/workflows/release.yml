@@ -89,30 +89,33 @@ jobs:
 
       - name: Install Inno Setup
         shell: pwsh
-        run: choco install innosetup --no-progress --yes
+        run: choco install innosetup --version=6.7.1 --no-progress --yes
 
       - name: Build and normalize Windows installer
         shell: pwsh
         run: |
           $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
           if (-not (Test-Path $iscc)) { throw "Inno Setup compiler not found at $iscc" }
+          $isccVersion = (Get-Item -LiteralPath $iscc).VersionInfo.ProductVersion
+          if ($isccVersion -notlike '6.7.1*') { throw "Expected Inno Setup 6.7.1; found $isccVersion" }
           & $iscc "/DAppVersion=$env:APP_VERSION" installer\scribe.iss
           if ($LASTEXITCODE -ne 0) { throw "Inno Setup compilation failed with exit code $LASTEXITCODE" }
           $generated = @(Get-ChildItem -Path dist -Filter "Scribe-Setup-$env:APP_VERSION.exe" -File)
           if ($generated.Count -ne 1) { throw "Expected exactly one versioned installer; found $($generated.Count)" }
           Copy-Item -LiteralPath $generated[0].FullName -Destination dist\Scribe-Setup.exe -Force
 
-      - name: Verify complete installer payload
+      - name: Package portable ZIP
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist\portable\* -DestinationPath dist\Scribe-windows-x64.zip -Force
+
+      - name: Verify portable and installer payload parity
         shell: pwsh
         run: |
           & .\scripts\verify-windows-release-package.ps1 `
             -BundlePath dist\portable `
+            -PortableZipPath dist\Scribe-windows-x64.zip `
             -InstallerPath dist\Scribe-Setup.exe
-
-      - name: Package verified portable ZIP
-        shell: pwsh
-        run: |
-          Compress-Archive -Path dist\portable\* -DestinationPath dist\Scribe-windows-x64.zip -Force
 
       - name: Upload Windows release assets
         uses: actions/upload-artifact@v6
