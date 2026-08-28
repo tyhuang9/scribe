@@ -21,11 +21,8 @@ pub(crate) enum UiRoute {
     Settings(SettingsTab),
     // These routes remain part of the shared renderer contract even though
     // this native shell currently routes the pages outside `ScreenView`.
-    #[allow(dead_code)]
     History,
-    #[allow(dead_code)]
     About,
-    #[allow(dead_code)]
     Debug,
 }
 
@@ -139,7 +136,6 @@ pub(crate) enum ResolvedTheme {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-#[allow(dead_code)]
 pub(crate) enum ModelDownloadState {
     #[default]
     NotInstalled,
@@ -170,7 +166,6 @@ pub(crate) struct ModelCapabilities {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-#[allow(dead_code)]
 pub(crate) enum ModelSpeedTier {
     VeryFast,
     Fast,
@@ -181,7 +176,6 @@ pub(crate) enum ModelSpeedTier {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-#[allow(dead_code)]
 pub(crate) enum ModelSizeTier {
     Tiny,
     Small,
@@ -363,7 +357,6 @@ pub(crate) struct RemoteCatalogFilters {
     pub size_tier: RemoteCatalogSizeTier,
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum RemoteCatalogSizeTier {
     #[default]
@@ -373,7 +366,6 @@ pub(crate) enum RemoteCatalogSizeTier {
     Large,
 }
 
-#[allow(dead_code)]
 impl RemoteCatalogSizeTier {
     pub(crate) const fn label(self) -> &'static str {
         match self {
@@ -400,7 +392,6 @@ impl RemoteCatalogSizeTier {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum RemoteCatalogSort {
     #[default]
@@ -410,7 +401,6 @@ pub(crate) enum RemoteCatalogSort {
     Name,
 }
 
-#[allow(dead_code)]
 impl RemoteCatalogSort {
     pub(crate) const fn label(self) -> &'static str {
         match self {
@@ -530,7 +520,6 @@ pub(crate) struct RemoteCatalogView {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-#[allow(dead_code)]
 pub(crate) enum ComparisonPhase {
     #[default]
     Idle,
@@ -603,7 +592,6 @@ impl ModelComparisonState {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-#[allow(dead_code)]
 pub(crate) enum SettingsSaveState {
     #[default]
     Clean,

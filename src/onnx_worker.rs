@@ -1172,8 +1172,8 @@ impl WorkerLauncher for OsWorkerLauncher {
             stdout: Box::new(stdout),
             process: Arc::new(OsWorkerProcess {
                 child: Mutex::new(child),
-                process_guard,
-                parent_liveness,
+                _process_guard: process_guard,
+                _parent_liveness: parent_liveness,
             }),
         })
     }
@@ -1488,10 +1488,8 @@ fn bind_worker_process_tree(child: &Child) -> Result<ProcessTreeGuard> {
 
 struct OsWorkerProcess {
     child: Mutex<Child>,
-    #[allow(dead_code)]
-    process_guard: ProcessTreeGuard,
-    #[allow(dead_code)]
-    parent_liveness: ParentLivenessChannel,
+    _process_guard: ProcessTreeGuard,
+    _parent_liveness: ParentLivenessChannel,
 }
 
 impl WorkerProcess for OsWorkerProcess {
@@ -1505,7 +1503,7 @@ impl WorkerProcess for OsWorkerProcess {
     }
 
     fn request_cooperative_cancel(&self) -> Result<bool> {
-        self.parent_liveness.request_cancel()
+        self._parent_liveness.request_cancel()
     }
 
     fn terminate(&self) -> Result<()> {
@@ -1599,12 +1597,12 @@ pub(crate) struct ProcessWorkerSupervisor {
 }
 
 impl ProcessWorkerSupervisor {
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     fn with_launcher(launcher: Arc<dyn WorkerLauncher>) -> Result<Self> {
         Self::with_launcher_and_deadlines(launcher, SupervisorDeadlines::default())
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     fn with_launcher_and_deadlines(
         launcher: Arc<dyn WorkerLauncher>,
         deadlines: SupervisorDeadlines,
@@ -2611,13 +2609,11 @@ pub(crate) struct SileroVadDecision {
 /// Dedicated VAD-only supervisor. Each instance owns a separate hidden worker
 /// process and cannot submit transcription commands through this API.
 #[derive(Clone)]
-#[allow(dead_code)]
 pub(crate) struct SileroVadWorkerSupervisor {
     transport: ProcessWorkerSupervisor,
     deadlines: VadDeadlines,
 }
 
-#[allow(dead_code)]
 impl SileroVadWorkerSupervisor {
     /// Starts a dedicated worker and establishes a ready VAD session within one
     /// aggregate monotonic budget. The returned request id is the first id that
@@ -2740,6 +2736,7 @@ impl SileroVadWorkerSupervisor {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn load(&self, session_id: u64, request_id: u64, num_threads: u16) -> Result<bool> {
         let generation = self.transport.ensure_generation()?;
         self.load_on_generation(
@@ -2815,6 +2812,7 @@ impl SileroVadWorkerSupervisor {
         Ok(false)
     }
 
+    #[cfg(test)]
     pub(crate) fn start_session(
         &self,
         session_id: u64,
@@ -2984,6 +2982,7 @@ impl SileroVadWorkerSupervisor {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn reset(&self, session_id: u64, request_id: u64) -> Result<()> {
         let stream = self.transport.require_stream(session_id)?;
         let result = self.transport.round_trip_on_generation(
@@ -3046,6 +3045,7 @@ impl SileroVadWorkerSupervisor {
         self.transport.abandon_stream(session_id);
     }
 
+    #[cfg(test)]
     pub(crate) fn health(&self, session_id: u64, request_id: u64) -> Result<()> {
         let generation = self.transport.ensure_generation()?;
         self.health_on_generation(

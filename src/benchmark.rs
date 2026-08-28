@@ -401,7 +401,6 @@ impl RawBenchmarkMetrics {
 }
 
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub struct BenchmarkModelResult {
     pub model_id: String,
     pub model_name: String,

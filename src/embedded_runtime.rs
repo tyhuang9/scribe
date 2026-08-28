@@ -9,8 +9,6 @@
 //! owned output into Scribe's neutral transcript contract. No caller above
 //! `RuntimeRouter` can observe a model family, FFI handle, or native backend.
 
-#![allow(dead_code)]
-
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};

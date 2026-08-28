@@ -378,7 +378,6 @@ pub(crate) fn keycap(ui: &mut Ui, text: &str) {
         });
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Icon {
     Waveform,

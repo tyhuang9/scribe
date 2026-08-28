@@ -7,8 +7,6 @@
 
 // Phase 1 establishes the complete stable contract before native streaming,
 // lifecycle wiring, and capability UI are introduced in later phases.
-#![allow(dead_code)]
-
 use std::fmt;
 #[cfg(test)]
 use std::fs;
@@ -30,10 +28,7 @@ use crate::installations::InstallCancellation;
 use crate::model_catalog::{
     ArtifactFormat, model_descriptor, normal_model_descriptors, runtime_artifact_manifest_for_path,
 };
-#[allow(unused_imports)]
-pub use crate::model_catalog::{
-    CompatibilityStatus, ModelCapabilities, ModelDescriptor, ModelRole,
-};
+pub use crate::model_catalog::{CompatibilityStatus, ModelDescriptor};
 use crate::models::SttModelInfo;
 #[cfg(test)]
 use crate::onnx_model_bundles::OnnxBundleManifest;

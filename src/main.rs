@@ -25,7 +25,6 @@ mod model_catalog;
 mod models;
 // This delivery unit intentionally exposes only private service hooks; a later
 // coordinator branch may call its install APIs without widening product types.
-#[allow(dead_code)]
 mod onnx_model_bundles;
 mod onnx_worker;
 mod overlay;
