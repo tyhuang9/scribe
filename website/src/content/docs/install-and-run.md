@@ -38,6 +38,44 @@ For a quick compile check without launching the app:
 cargo check
 ```
 
+## Optional Vulkan source build
+
+Published Scribe releases and the default commands above remain CPU-only. To
+experiment with Vulkan acceleration for GGUF models on Windows, install the
+Khronos Vulkan SDK and open a new PowerShell session so its environment is
+available:
+
+```powershell
+winget install --id KhronosGroup.VulkanSDK --exact
+$env:VULKAN_SDK
+Get-Command glslc
+```
+
+Then compile or run the opt-in build:
+
+```powershell
+cargo check --features vulkan-acceleration
+cargo run --features vulkan-acceleration
+```
+
+The feature does not add GPU support to the receipt-backed Moonshine ONNX
+bundle. For GGUF models, **Auto** tries a compatible Vulkan device before
+falling back to CPU, **CPU only** stays on CPU, and **GPU** is a strict Vulkan
+request that fails if the backend is unavailable.
+
+The metadata-only benchmark can compare identical input without changing the
+saved acceleration preference:
+
+```powershell
+cargo run --features vulkan-acceleration -- --benchmark fixture.wav --model whisper_cpp_base_en --acceleration cpu --output cpu.json
+cargo run --features vulkan-acceleration -- --benchmark fixture.wav --model whisper_cpp_base_en --acceleration gpu --output gpu.json
+```
+
+Each report records the requested mode, the runtime's resolved device, and
+timings. It does not contain audio, transcript text, or local paths. Use `auto`
+for a third run when you also want evidence of the normal GPU-first fallback
+policy.
+
 ## Linux dependencies
 
 On Ubuntu, install the microphone and tray build dependencies:
@@ -53,8 +91,9 @@ Some distributions use the older `libappindicator3` package names. Scribe can ru
 
 A normal transcription needs an installed Experimental catalog model: one of the
 pinned GGUF artifacts or the receipt-backed Moonshine ONNX bundle. GGUF uses
-Scribe's statically linked `transcribe-cpp` 0.1.3 CPU backend, and the ONNX
-bundle uses native Sherpa ONNX. Both execute in Scribe's private persistent
-inference child, so they do not download a runtime package or start a localhost
-service. Read [Models and runtimes](../models-and-runtimes/) before installing a
-model.
+Scribe's statically linked `transcribe-cpp` 0.1.3 backend; it is CPU-only unless
+a source developer compiles the opt-in Vulkan feature. The ONNX bundle uses
+native Sherpa ONNX and remains CPU-only. Both execute in Scribe's private
+persistent inference child, so they do not download a runtime package or start
+a localhost service. Read [Models and runtimes](../models-and-runtimes/) before
+installing a model.

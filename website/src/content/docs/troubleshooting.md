@@ -26,6 +26,26 @@ downloaded runtime package, GGML/DLL route, or inference CLI. VAD has its own
 separate worker/process path. If a model fails, revalidate or reinstall that
 model rather than looking for a runtime package.
 
+## Vulkan source build fails or does not use the GPU
+
+Vulkan acceleration is an opt-in source-build feature for GGUF models, not a
+published-release capability. Confirm that the Khronos Vulkan SDK is installed,
+then open a new PowerShell session and check both the SDK variable and shader
+compiler before rebuilding:
+
+```powershell
+$env:VULKAN_SDK
+Get-Command glslc
+cargo check --features vulkan-acceleration
+```
+
+Also update the display driver's Vulkan support. In a feature build, **Auto**
+may truthfully report CPU when no compatible Vulkan device initializes; that is
+the intended fallback. **GPU** is strict and returns a backend-unavailable error
+instead of silently using CPU. These controls do not accelerate the Moonshine
+ONNX bundle. The Linux `SCRIBE_USE_GPU` setting below controls desktop rendering
+and is unrelated to transcription acceleration.
+
 ## Linux tray or startup issue
 
 Start without tray initialization:
