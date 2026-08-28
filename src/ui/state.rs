@@ -254,6 +254,18 @@ pub(crate) struct ModelViewModel {
     pub error_message: Option<String>,
 }
 
+impl ModelViewModel {
+    pub(crate) fn normalize(mut self) -> Self {
+        if self.active {
+            self.installed = true;
+            self.download_state = ModelDownloadState::Installed;
+        } else if self.download_state == ModelDownloadState::Installed {
+            self.installed = true;
+        }
+        self
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ModelDialog {
     Add,

@@ -1599,11 +1599,12 @@ pub(crate) struct ProcessWorkerSupervisor {
 }
 
 impl ProcessWorkerSupervisor {
-    #[cfg(test)]
+    #[cfg_attr(not(test), allow(dead_code))]
     fn with_launcher(launcher: Arc<dyn WorkerLauncher>) -> Result<Self> {
         Self::with_launcher_and_deadlines(launcher, SupervisorDeadlines::default())
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn with_launcher_and_deadlines(
         launcher: Arc<dyn WorkerLauncher>,
         deadlines: SupervisorDeadlines,

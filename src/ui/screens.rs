@@ -26,12 +26,12 @@ use super::{
     },
     state::{
         ComparisonPhase, ComparisonResultPhase, ModelCardKey, ModelComparisonState, ModelDialog,
-        ModelDownloadState, ModelLanguageFilter, ModelManagementState, ModelSizeTier,
-        ModelSpeedTier, ModelViewModel, RecordingMode, RemoteCatalogActionKind,
-        RemoteCatalogActionView, RemoteCatalogEntryView, RemoteCatalogStatusKind,
-        RemoteCatalogVariantView, RemoteCatalogView, ResolvedTheme, SettingsSaveState, SettingsTab,
-        TranscribeNotice, TranscribeNoticeTone, TranscribeRecoveryAction, TranscriptionPhase,
-        TranscriptionState, UiRoute,
+        ModelDownloadState, ModelLanguageFilter, ModelManagementState, ModelSpeedTier,
+        ModelViewModel, RecordingMode, RemoteCatalogActionKind, RemoteCatalogActionView,
+        RemoteCatalogEntryView, RemoteCatalogStatusKind, RemoteCatalogVariantView,
+        RemoteCatalogView, ResolvedTheme, SettingsSaveState, SettingsTab, TranscribeNotice,
+        TranscribeNoticeTone, TranscribeRecoveryAction, TranscriptionPhase, TranscriptionState,
+        UiRoute,
     },
     ui_palette,
 };
