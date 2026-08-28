@@ -37,6 +37,7 @@ mod silero_vad_native;
 mod streaming;
 mod stt;
 mod support_assets;
+mod system_preferences;
 mod text_output;
 mod transcription;
 mod tray;
