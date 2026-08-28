@@ -24985,11 +24985,15 @@ mod layout_tests {
                 .iter()
                 .all(|descriptor| descriptor.capabilities.cpu)
         );
-        assert!(
-            descriptors
-                .iter()
-                .all(|descriptor| !descriptor.capabilities.gpu)
-        );
+        for descriptor in descriptors {
+            assert_eq!(
+                descriptor.capabilities.gpu,
+                cfg!(feature = "vulkan-acceleration")
+                    && crate::model_catalog::model_uses_embedded_runtime(&descriptor.id),
+                "{} advertised the wrong GPU capability",
+                descriptor.id
+            );
+        }
     }
 
     #[test]
