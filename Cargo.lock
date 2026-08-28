@@ -2585,7 +2585,6 @@ dependencies = [
  "global-hotkey",
  "hound",
  "libc",
- "libloading 0.8.9",
  "png 0.18.1",
  "raw-window-handle 0.6.2",
  "rusqlite",

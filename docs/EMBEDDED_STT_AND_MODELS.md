@@ -1,6 +1,31 @@
 # Embedded STT and model management
 
-**Record status:** Phase 1 safe-runtime implementation plus migration inventory. Updated from the checked-out source and targeted native-fixture verification on 2026-08-05. This is a living implementation record, not a claim that every item in the target specification is complete.
+**Record status:** Current architecture and catalog contract, with dated Phase 0-11 verification snapshots retained below. Updated from the checked-out source on 2026-08-28. This is a living implementation record, not a claim that every item in the target specification is complete.
+
+> **Current-source supersession:** The current architecture and catalog below are
+> authoritative. Every dated Phase baseline, command result, pass count, and
+> former-runtime statement retained in this record is historical evidence, not
+> a current test rebaseline or a supported-path claim. Use the live
+> [manual test matrix](MANUAL_TEST_MATRIX.md) for remaining physical/hardware
+> qualification.
+
+## Current architecture and catalog
+
+Normal GGUF inference and receipt-backed ONNX inference both run in the private
+persistent `--scribe-inference-worker` child over private SCIF v3 stdin/stdout
+pipes. GGUF uses the statically linked native `transcribe-cpp` CPU backend;
+receipt-backed ONNX bundles use native Sherpa ONNX in that same child. VAD has
+its own `--scribe-vad-worker` production process and is not an STT runtime.
+The desktop process does not construct model objects or recognizers.
+
+There is no Python runtime, localhost service, dynamic runtime package,
+GGML/DLL route, or CLI fallback in the production inference path. The normal
+catalog has five Experimental entries and zero Supported entries:
+`whisper_cpp_tiny_en`, `whisper_cpp_base_en`, `whisper_cpp_small_en`,
+`whisper_cpp_medium_en`, and receipt-backed `moonshine-tiny-en-int8-onnx`.
+Local GGUF imports are validated in place; Scribe neither copies nor deletes
+them. Legacy user configuration and artifact files are preserved, but production
+paths no longer recognize or execute them.
 
 ## How to read this record
 
@@ -10,7 +35,7 @@
 
 Where this record differs from older prose, the current source and pinned manifests are authoritative. A reference to a “sidecar” must identify whether it is the default dictation path, an explicit compatibility fallback, or an isolated installation-smoke helper.
 
-## Phase 0 baseline
+## Historical Phase 0 baseline
 
 ### Repository and verification baseline
 
@@ -31,13 +56,13 @@ The six ignored tests require a local runtime/model/fixture environment. A passi
 
 ### Timing instrumentation and measurement status
 
-**Current fact:** `src/app.rs::LatencyTrace` and `src/diagnostics.rs` capture hotkey-to-overlay, capture start, first meter update, model load, first partial, recording duration, capture finalization, final-text, and paste/output timestamps. `src/benchmark.rs` records fixture preparation, model-load, and backend-processing timings through `TranscriptionService`.
+**Historical snapshot:** `src/app.rs::LatencyTrace` and `src/diagnostics.rs` capture hotkey-to-overlay, capture start, first meter update, model load, first partial, recording duration, capture finalization, final-text, and paste/output timestamps. `src/benchmark.rs` records fixture preparation, model-load, and backend-processing timings through `TranscriptionService`.
 
-**Current fact:** speech-onset and a separate post-processing interval are intentionally emitted as unavailable when no verified measure exists. This prevents meter cadence or a wall-clock decode duration from being misreported as VAD onset or audio timeline duration.
+**Historical snapshot:** speech-onset and a separate post-processing interval are intentionally emitted as unavailable when no verified measure exists. This prevents meter cadence or a wall-clock decode duration from being misreported as VAD onset or audio timeline duration.
 
 **Unverified for this Phase 0 record:** a fresh, comparable before/after measurement on one machine, model class, acceleration setting, and audio fixture. Do not infer latency, memory, real-time-factor, accuracy, or GPU improvement from the instrumentation alone.
 
-## Current architecture
+## Historical architecture snapshot (superseded)
 
 ### Normalized dictation route
 
@@ -77,15 +102,15 @@ separate VAD child: `--scribe-vad-worker` (VAD only; not an STT runtime)
 final Transcript -> overlay/history/output (only finalized text can paste)
 ```
 
-**Current fact:** `src/transcription.rs` owns the application-facing `TranscriptionService`, `SpeechEngine`, optional `StreamingSpeechEngine`, `SpeechStream`, normalized `Transcript`, `TranscriptionOptions`, `RuntimeCapabilities`, acceleration preference, and session/request correlation types. In production, `TranscriptionService` owns the process supervisor and no native model/session/recognizer or FFI handle. The architecture-guard tests prevent UI/application modules from naming `RuntimeRouter`, `TranscribeCppRuntime`, or model-family terms, and fail if native construction escapes the marked worker-runtime modules.
+**Historical snapshot:** `src/transcription.rs` owns the application-facing `TranscriptionService`, `SpeechEngine`, optional `StreamingSpeechEngine`, `SpeechStream`, normalized `Transcript`, `TranscriptionOptions`, `RuntimeCapabilities`, acceleration preference, and session/request correlation types. In production, `TranscriptionService` owns the process supervisor and no native model/session/recognizer or FFI handle. The architecture-guard tests prevent UI/application modules from naming `RuntimeRouter`, `TranscribeCppRuntime`, or model-family terms, and fail if native construction escapes the marked worker-runtime modules.
 
-**Current fact:** the persistent `--scribe-inference-worker` child is the only production owner of the worker-local router and native runtime state. It directly owns the GGUF `EmbeddedRuntime`, legacy GGML `TranscribeCppRuntime`, and sherpa-onnx recognizers. The separate `--scribe-vad-worker` instance owns VAD state and accepts only VAD controls. The supervisor uses framed SCIF v3 messages over private anonymous stdin/stdout pipes; it does not use localhost, HTTP, or another network transport. Native model/session/recognizer construction is limited to marked child-runtime modules.
+**Historical snapshot:** the persistent `--scribe-inference-worker` child is the only production owner of the worker-local router and native runtime state. It directly owns the GGUF `EmbeddedRuntime`, legacy GGML `TranscribeCppRuntime`, and sherpa-onnx recognizers. The separate `--scribe-vad-worker` instance owns VAD state and accepts only VAD controls. The supervisor uses framed SCIF v3 messages over private anonymous stdin/stdout pipes; it does not use localhost, HTTP, or another network transport. Native model/session/recognizer construction is limited to marked child-runtime modules.
 
-**Current fact:** the STT worker retains a loaded model for five minutes of inactivity (`WARM_MODEL_TTL`), unloads after that timeout, on an explicit unload, or at shutdown, and can be invalidated/restarted when cancellation or a native failure requires process recovery. A failed native decode discards the child-owned context so the next request cannot be falsely reported as warm. Normal GGUF remains local/native/Python-free, but it is process-isolated rather than in-process.
+**Historical snapshot:** the STT worker retains a loaded model for five minutes of inactivity (`WARM_MODEL_TTL`), unloads after that timeout, on an explicit unload, or at shutdown, and can be invalidated/restarted when cancellation or a native failure requires process recovery. A failed native decode discards the child-owned context so the next request cannot be falsely reported as warm. Normal GGUF remains local/native/Python-free, but it is process-isolated rather than in-process.
 
-**Current fact:** normal live text is not a claim of native streaming. The primary model capabilities say `native_streaming: false`; `Auto` and `Rolling` can run the bounded rolling *batch* preview scheduler in `src/streaming.rs`. The stabilizer emits committed and tentative text to the overlay, with session, request, model, and sequence correlation. Finalized text alone reaches output.
+**Historical snapshot:** normal live text is not a claim of native streaming. The primary model capabilities say `native_streaming: false`; `Auto` and `Rolling` can run the bounded rolling *batch* preview scheduler in `src/streaming.rs`. The stabilizer emits committed and tentative text to the overlay, with session, request, model, and sequence correlation. Finalized text alone reaches output.
 
-### Default route versus processes and servers
+### Historical default route versus processes and servers
 
 The distinction below is deliberate and must remain explicit in later reports.
 
@@ -113,7 +138,7 @@ The distinction below is deliberate and must remain explicit in later reports.
 
 ## Runtime implementation and platform constraints
 
-### Current embedded adapter
+### Historical embedded adapter
 
 | Item | Current fact | Required follow-up / limitation |
 | --- | --- | --- |
@@ -134,7 +159,7 @@ The distinction below is deliberate and must remain explicit in later reports.
 
 The desktop shell may compile for Linux/macOS, but that is separate from a verified STT package. The target state is CPU plus verified Metal on supported macOS builds and CPU plus a packaged verified GPU backend on supported Windows/Linux builds; that is **planned work**, not the current matrix.
 
-## Current catalog and installation inventory
+## Historical catalog and installation inventory
 
 ### Normalized catalog
 
@@ -161,7 +186,7 @@ Each single-file artifact has a checked-in SHA-256. Moonshine instead uses a typ
 | sherpa-onnx / Moonshine / Parakeet | Python/runner process; ONNX-family directories | Keep private only for migration evaluation. Do not add a second logical runtime unless a named evidence gate passes. |
 | Existing unmanaged paths | Readable through compatibility/config migration | Never call them managed installs or delete them during normal cleanup. Import only after validation is designed and tested. |
 
-### Current installer behavior
+### Historical installer behavior
 
 **Current fact:** `managed_downloads.rs` resolves a caller-supplied `ModelId` against the local normalized catalog, then obtains a checked-in pinned URL, revision, expected size, and SHA-256. The UI does not provide an arbitrary model URL to this API.
 
@@ -197,7 +222,7 @@ Each single-file artifact has a checked-in SHA-256. Moonshine instead uses a typ
 
 ## Security, privacy, and trust decisions
 
-### Current controls supported by source
+### Historical controls supported by source
 
 - **Pinned artifact trust:** normalized model URLs, full revisions, exact sizes, and SHA-256 values are checked in. Runtime package archives and every extracted runtime file are likewise allowlisted and hash-checked.
 - **Native-only normal audio route:** capture PCM is retained in native Rust workers; the normalized transcription route has no HTTP STT request. Current artifact HTTP is for model/runtime bytes only.
@@ -276,7 +301,7 @@ The tested model fixture was `handy-computer/whisper-tiny.en-gguf` at revision `
 6. Migrate or explicitly retire each legacy adapter and delete its runtime install/process-management UI only after its users have a tested path.
 7. Run the remaining production-only packaged-release and manual platform suites; publish only measured latency/compatibility results.
 
-## Current conclusion
+## Historical conclusion
 
 Scribe now has a process-isolated safe `transcribe-cpp` 0.1.3 GGUF route with retained model/session lifecycle, bounded-worker routing, cancellation, explicit option/acceleration errors, and disposable install-smoke evidence. The persistent STT child also directly owns validated sherpa-onnx and legacy GGML compatibility state; the separate VAD child has its own role and process. The desktop process constructs no native model/session/recognizer or FFI state. Its installer does not stage a runtime archive for GGUF and atomically persists an installed-model provenance record with observed architecture and capabilities. Trusted backend discovery/cache, strict variant resolution, destination-volume preflight, and Rust-native Models-page catalog cards can now install, validate, activate, use, update, and remove typed dynamic GGUF variants. Users can also validate and reference an external local GGUF without Scribe copying or deleting it; its locally observed fingerprint is kept distinct from trusted remote provenance. macOS/Linux packages, richer dynamic-card operation state, and legacy-process retirement remain incomplete.
 
