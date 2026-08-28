@@ -365,12 +365,6 @@ impl RankingMode {
 pub struct BenchmarkModelInput {
     pub model_id: String,
     pub model_name: String,
-    pub predicted_transcript: String,
-    pub reference_transcript: String,
-    pub elapsed_ms: Option<u128>,
-    pub audio_duration_ms: Option<u128>,
-    pub peak_ram_mb: Option<f64>,
-    pub peak_vram_mb: Option<f64>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -537,12 +531,6 @@ pub fn score_benchmark_models(inputs: Vec<BenchmarkModelInput>) -> Vec<Benchmark
             BenchmarkModelResult {
                 model_id: input.model_id,
                 model_name: input.model_name,
-                predicted_transcript: input.predicted_transcript,
-                reference_transcript: input.reference_transcript,
-                elapsed_ms: input.elapsed_ms,
-                audio_duration_ms: input.audio_duration_ms,
-                peak_ram_mb: input.peak_ram_mb,
-                peak_vram_mb: input.peak_vram_mb,
                 raw_metrics,
                 normalized_scores: HashMap::new(),
                 overall_scores: HashMap::new(),
