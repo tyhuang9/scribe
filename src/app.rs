@@ -6932,6 +6932,10 @@ impl LocalTranscriberApp {
                         .get(&model_id)
                         .and_then(model_install_download_bytes)
                         .unwrap_or((0, None));
+                    // Consume only the intent correlated with this exact ONNX
+                    // job. A stale completion cannot delete bytes owned by a
+                    // replacement job because it is rejected above.
+                    let discard_source = self.take_requested_partial_discard(&model_id, job_id);
                     match result {
                         Ok(smoke) => {
                             self.record_download_diagnostic(
@@ -6996,7 +7000,7 @@ impl LocalTranscriberApp {
                                 .and_then(model_install_download_bytes)
                                 .unwrap_or((0, None));
                             self.model_downloads.insert(
-                                model_id,
+                                model_id.clone(),
                                 if paused {
                                     ModelInstallStatus::Paused {
                                         downloaded_bytes,
@@ -7017,7 +7021,12 @@ impl LocalTranscriberApp {
                             } else {
                                 format!("ONNX model installation failed: {message}")
                             };
-                            self.rebuild_model_inventory_projection();
+                            if let Some(source) = discard_source {
+                                let result = self.discard_partial_source(&source);
+                                self.finish_partial_discard(&model_id, result);
+                            } else {
+                                self.rebuild_model_inventory_projection();
+                            }
                         }
                     }
                 }
@@ -9330,6 +9339,7 @@ impl LocalTranscriberApp {
                 }
                 let job_id = INSTALL_JOB_SEQUENCE.fetch_add(1, Ordering::Relaxed);
                 let cancellation = InstallCancellation::default();
+                self.discard_partial_after_install.remove(&model.id);
                 self.onnx_bundle_install = Some((job_id, model.id.clone(), cancellation.clone()));
                 self.onnx_download_activity = None;
                 self.model_downloads.insert(
@@ -13126,12 +13136,16 @@ impl LocalTranscriberApp {
     }
 
     fn discard_normalized_model_partial(&mut self, model_id: ModelId) {
-        if let Some((_, active_model_id, cancellation)) = &self.onnx_bundle_install
+        if let Some((job_id, active_model_id, cancellation)) = &self.onnx_bundle_install
             && active_model_id == model_id.as_str()
         {
+            self.discard_partial_after_install.insert(
+                model_id.as_str().to_owned(),
+                (*job_id, RemotePartialProbeSource::Normalized(model_id)),
+            );
             cancellation.cancel();
             self.status_message =
-                "Cancelling ONNX download; retained exact partials can be discarded after it exits."
+                "Cancelling ONNX download; retained exact partials will be discarded after it exits."
                     .to_owned();
             return;
         }
@@ -28476,6 +28490,94 @@ mod layout_tests {
         assert_eq!(view.download_state, ModelDownloadState::Downloading);
         assert_eq!(view.downloaded_bytes, 17);
         assert!(view.cancel_supported);
+    }
+
+    #[test]
+    fn active_onnx_cancel_and_discard_waits_for_the_correlated_worker_exit() {
+        let root = partial_cleanup_test_root("active-onnx-cancel-discard");
+        let mut app = test_app();
+        app.config.general.model_storage_dir = root.clone();
+        config::normalize_config(&mut app.config);
+        let model_id = "moonshine-tiny-en-int8-onnx".to_owned();
+        let cancellation = InstallCancellation::default();
+        app.onnx_bundle_install = Some((71, model_id.clone(), cancellation.clone()));
+        app.model_downloads.insert(
+            model_id.clone(),
+            ModelInstallStatus::Downloading {
+                downloaded_bytes: 17,
+                total_bytes: Some(44_256_550),
+                bytes_per_second: None,
+            },
+        );
+
+        app.apply_model_management_action(ScreenAction::DiscardModelPartial(model_id.clone()));
+
+        assert!(cancellation.is_cancelled());
+        assert_eq!(
+            app.discard_partial_after_install
+                .get(&model_id)
+                .map(|(job_id, _)| *job_id),
+            Some(71)
+        );
+        assert!(app.model_downloads.contains_key(&model_id));
+
+        app.tx
+            .send(AppEvent::OnnxBundleInstallFinished {
+                job_id: 71,
+                model_id: model_id.clone(),
+                paused: true,
+                result: Err("transfer stopped".to_owned()),
+            })
+            .unwrap();
+        app.poll_events();
+
+        assert!(app.onnx_bundle_install.is_none());
+        assert!(!app.discard_partial_after_install.contains_key(&model_id));
+        assert!(!app.model_downloads.contains_key(&model_id));
+        assert!(
+            app.status_message
+                .contains("No retained partial download was found")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stale_onnx_completion_cannot_consume_a_replacement_jobs_discard_intent() {
+        let mut app = test_app();
+        let model_id = "moonshine-tiny-en-int8-onnx".to_owned();
+        let cancellation = InstallCancellation::default();
+        app.onnx_bundle_install = Some((82, model_id.clone(), cancellation.clone()));
+        app.discard_partial_after_install.insert(
+            model_id.clone(),
+            (
+                82,
+                RemotePartialProbeSource::Normalized(ModelId::new(&model_id)),
+            ),
+        );
+
+        app.tx
+            .send(AppEvent::OnnxBundleInstallFinished {
+                job_id: 81,
+                model_id: model_id.clone(),
+                paused: true,
+                result: Err("stale worker exit".to_owned()),
+            })
+            .unwrap();
+        app.poll_events();
+
+        assert_eq!(
+            app.onnx_bundle_install
+                .as_ref()
+                .map(|(job_id, active_model, _)| (*job_id, active_model.as_str())),
+            Some((82, model_id.as_str()))
+        );
+        assert!(!cancellation.is_cancelled());
+        assert_eq!(
+            app.discard_partial_after_install
+                .get(&model_id)
+                .map(|(job_id, _)| *job_id),
+            Some(82)
+        );
     }
 
     #[test]

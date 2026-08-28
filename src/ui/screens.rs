@@ -2417,14 +2417,11 @@ fn model_lifecycle_presentation<'a>(
                 accessible_name: format!("Resume {} download", model.display_name),
                 enabled: model.install_action_enabled,
                 disabled_reason: model.primary_action_disabled_reason.as_deref(),
-                visible_status: Some(
-                    if model.download_state == ModelDownloadState::Paused {
-                        "Paused"
-                    } else {
-                        "Partial download retained"
-                    }
-                    .to_owned(),
-                ),
+                // Keep the paused progress module geometrically identical to
+                // the active module. The transition remains available to
+                // assistive technology without adding shifting visible text.
+                visible_status: (model.download_state == ModelDownloadState::PartialRetained)
+                    .then(|| "Partial download retained".to_owned()),
                 compact_size: None,
                 tone: ModelLifecycleTone::InverseFilled,
             }
@@ -2700,42 +2697,73 @@ fn model_lifecycle_controls<'a>(
     can_replace_active: bool,
 ) -> ModelLifecycleControls<'a> {
     let mut primary = Some(model_lifecycle_presentation(card, can_replace_active));
+    let active_transfer = match card {
+        ModelCard::Local(model) => matches!(
+            model.download_state,
+            ModelDownloadState::Downloading
+                | ModelDownloadState::Stalled
+                | ModelDownloadState::Retrying { .. }
+        ),
+        ModelCard::Remote(_, variant) => {
+            remote_has_download_progress(variant.status_label.as_deref())
+                && variant
+                    .actions
+                    .iter()
+                    .any(|action| matches!(action.kind, RemoteCatalogActionKind::Cancel { .. }))
+        }
+    };
+    let paused_transfer = match card {
+        ModelCard::Local(model) => model.download_state == ModelDownloadState::Paused,
+        ModelCard::Remote(_, variant) => variant.status_label.as_deref() == Some("Paused"),
+    };
     let discard = match card {
         ModelCard::Local(model)
-            if matches!(
-                model.download_state,
-                ModelDownloadState::Cancelled
-                    | ModelDownloadState::Failed
-                    | ModelDownloadState::Paused
-                    | ModelDownloadState::PartialRetained
-            ) && model.partial_cleanup_available =>
+            if active_transfer
+                || paused_transfer
+                || (matches!(
+                    model.download_state,
+                    ModelDownloadState::Cancelled
+                        | ModelDownloadState::Failed
+                        | ModelDownloadState::Paused
+                        | ModelDownloadState::PartialRetained
+                ) && model.partial_cleanup_available) =>
         {
             Some(ScreenAction::DiscardModelPartial(model.id.clone()))
         }
-        ModelCard::Remote(_, variant)
-            if !variant
-                .actions
-                .iter()
-                .any(|action| matches!(action.kind, RemoteCatalogActionKind::Cancel { .. })) =>
-        {
-            variant
-                .actions
-                .iter()
-                .find_map(|action| match &action.kind {
-                    RemoteCatalogActionKind::DiscardPartial {
-                        remote_model_id,
-                        variant_id,
-                    } => Some(ScreenAction::DiscardRemoteCatalogPartial {
-                        remote_model_id: remote_model_id.clone(),
-                        variant_id: variant_id.clone(),
-                    }),
-                    _ => None,
+        ModelCard::Remote(entry, variant) => variant
+            .actions
+            .iter()
+            .find_map(|action| match &action.kind {
+                RemoteCatalogActionKind::DiscardPartial {
+                    remote_model_id,
+                    variant_id,
+                } => Some(ScreenAction::DiscardRemoteCatalogPartial {
+                    remote_model_id: remote_model_id.clone(),
+                    variant_id: variant_id.clone(),
+                }),
+                _ => None,
+            })
+            // Render the active-transfer X from byte zero rather than waiting
+            // for an asynchronous retained-partial probe.
+            .or_else(|| {
+                (active_transfer || paused_transfer).then(|| {
+                    ScreenAction::DiscardRemoteCatalogPartial {
+                        remote_model_id: entry.id.clone(),
+                        variant_id: variant.id.clone(),
+                    }
                 })
-        }
+            }),
         _ => None,
     };
     let discard_name = discard.as_ref().map(|_| match card {
+        ModelCard::Local(model) if active_transfer => {
+            format!("Cancel and discard partial for {}", model.display_name)
+        }
         ModelCard::Local(model) => format!("Discard partial for {}", model.display_name),
+        ModelCard::Remote(entry, variant) if active_transfer => format!(
+            "Cancel and discard partial for {}",
+            remote_variant_accessible_name(entry, variant)
+        ),
         ModelCard::Remote(entry, variant) => format!(
             "Discard partial for {}",
             remote_variant_accessible_name(entry, variant)
@@ -4167,8 +4195,16 @@ fn render_unified_model_card(
             } else if let Some(status) = model_download_semantic_status(card) {
                 // Installing has a clear button label already; expose its
                 // transition separately to assistive technology without
-                // duplicating that label on the visible card.
-                let response = ui.allocate_response(Vec2::ZERO, Sense::hover());
+                // duplicating that label on the visible card. Interact with a
+                // zero-sized rect without advancing the layout cursor so a
+                // semantic-only pause announcement cannot shift the module.
+                let status_id =
+                    ui.make_persistent_id(("model-download-semantic-status", card.key()));
+                let response = ui.interact(
+                    egui::Rect::from_min_size(ui.cursor().min, Vec2::ZERO),
+                    status_id,
+                    Sense::hover(),
+                );
                 let accessible_status = format!("{accessible_card_name}: {status}");
                 ui.ctx().accesskit_node_builder(response.id, |builder| {
                     builder.set_role(egui::accesskit::Role::Status);
@@ -5767,11 +5803,11 @@ fn model_download_progress_presentation(
                 ModelDownloadState::Downloading
                     | ModelDownloadState::Stalled
                     | ModelDownloadState::Retrying { .. }
+                    | ModelDownloadState::Paused
             ) || (matches!(
                 model.download_state,
                 ModelDownloadState::Cancelled
                     | ModelDownloadState::Failed
-                    | ModelDownloadState::Paused
                     | ModelDownloadState::PartialRetained
             ) && model.partial_cleanup_available) =>
         {
@@ -5779,6 +5815,7 @@ fn model_download_progress_presentation(
         }
         ModelCard::Remote(_, variant)
             if remote_has_download_progress(variant.status_label.as_deref())
+                || variant.status_label.as_deref() == Some("Paused")
                 || remote_has_retained_partial(variant) =>
         {
             (variant.downloaded_bytes?, variant.total_bytes)
@@ -5870,9 +5907,15 @@ fn model_download_semantic_status(card: ModelCard<'_>) -> Option<String> {
         {
             Some("Installing…".to_owned())
         }
+        ModelCard::Local(model) if model.download_state == ModelDownloadState::Paused => {
+            Some("Paused".to_owned())
+        }
         ModelCard::Local(model) => model_download_activity_visible_status(model.download_state),
         ModelCard::Remote(_, variant) if variant.finalizing => {
             Some("Verifying and activating".to_owned())
+        }
+        ModelCard::Remote(_, variant) if variant.status_label.as_deref() == Some("Paused") => {
+            Some("Paused".to_owned())
         }
         ModelCard::Remote(_, variant) => remote_download_activity_visible_status(variant),
     }
@@ -9605,6 +9648,11 @@ mod tests {
                 "Pause Geometry download download",
                 egui::accesskit::Role::Button,
             );
+            let discard = named_role_bounds(
+                &output,
+                "Cancel and discard partial for Geometry download",
+                egui::accesskit::Role::Button,
+            );
             assert_eq!(lifecycle.height(), f64::from(MODEL_CARD_SUMMARY_HEIGHT));
             assert_eq!(body.height(), f64::from(MODEL_CARD_SUMMARY_HEIGHT));
             assert_eq!(rail.width(), 44.0);
@@ -9635,15 +9683,11 @@ mod tests {
                 "track={track:?} pause={pause:?}"
             );
             assert!(
-                !output
-                    .platform_output
-                    .accesskit_update
-                    .as_ref()
-                    .is_some_and(|update| update.nodes.iter().any(|(_, node)| {
-                        node.name() == Some("Discard partial for Geometry download")
-                    })),
-                "active transfers must only expose Pause"
+                pause.x1 <= discard.x0 && discard.x1 <= body.x1 + 0.1,
+                "Pause and cancel/discard must stay adjacent in the lifecycle body: pause={pause:?} discard={discard:?} body={body:?}"
             );
+            assert_eq!(discard.width(), 44.0);
+            assert_eq!(discard.height(), 44.0);
         }
     }
 
@@ -9719,7 +9763,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_active_download_card_keeps_pause_without_discard_at_375px() {
+    fn compact_active_download_card_keeps_adjacent_pause_and_cancel_discard_at_375px() {
         let model = ModelViewModel {
             id: "compact-download".into(),
             display_name: "Compact download".into(),
@@ -9747,15 +9791,165 @@ mod tests {
             track.x1 <= pause.x0 + 0.1,
             "track={track:?} pause={pause:?}"
         );
+        let discard = named_role_bounds(
+            &output,
+            "Cancel and discard partial for Compact download",
+            egui::accesskit::Role::Button,
+        );
+        assert_eq!(pause.width(), 44.0);
+        assert_eq!(discard.width(), 44.0);
+        assert_eq!(pause.height(), 44.0);
+        assert_eq!(discard.height(), 44.0);
         assert!(
-            !output
+            pause.x1 <= discard.x0,
+            "pause={pause:?} discard={discard:?}"
+        );
+        assert!(discard.x1 <= 375.0, "discard={discard:?}");
+    }
+
+    #[test]
+    fn pausing_keeps_progress_and_control_geometry_without_visible_paused_text() {
+        for (width, height) in [(1180.0, 815.0), (375.0, 680.0)] {
+            let active = ModelViewModel {
+                id: "stable-controls".into(),
+                display_name: "Stable controls".into(),
+                download_state: ModelDownloadState::Downloading,
+                downloaded_bytes: 42,
+                total_bytes: Some(100),
+                cancel_supported: true,
+                ..Default::default()
+            };
+            let paused = ModelViewModel {
+                download_state: ModelDownloadState::Paused,
+                install_action_enabled: true,
+                ..active.clone()
+            };
+            let active_output = render_model_card_at(&active, width, height, Vec::new());
+            let paused_output = render_model_card_at(&paused, width, height, Vec::new());
+            let progress = "Downloading 42B of 100B, 42% complete";
+            let active_track =
+                model_layout_bounds(&active_output, &format!("{progress} layout download track"));
+            let paused_track =
+                model_layout_bounds(&paused_output, &format!("{progress} layout download track"));
+            let active_primary = named_role_bounds(
+                &active_output,
+                "Pause Stable controls download",
+                egui::accesskit::Role::Button,
+            );
+            let paused_primary = named_role_bounds(
+                &paused_output,
+                "Resume Stable controls download",
+                egui::accesskit::Role::Button,
+            );
+            let active_discard = named_role_bounds(
+                &active_output,
+                "Cancel and discard partial for Stable controls",
+                egui::accesskit::Role::Button,
+            );
+            let paused_discard = named_role_bounds(
+                &paused_output,
+                "Discard partial for Stable controls",
+                egui::accesskit::Role::Button,
+            );
+            assert_eq!(active_track, paused_track, "track at {width}px");
+            assert_eq!(active_primary, paused_primary, "primary at {width}px");
+            assert_eq!(active_discard, paused_discard, "discard at {width}px");
+            assert!(
+                !paused_output
+                    .platform_output
+                    .accesskit_update
+                    .as_ref()
+                    .is_some_and(|update| update.nodes.iter().any(|(_, node)| {
+                        node.role() == egui::accesskit::Role::StaticText
+                            && node.name() == Some("Paused")
+                    })),
+                "Paused must be announced semantically without visible shifting text"
+            );
+            let paused_status = paused_output
                 .platform_output
                 .accesskit_update
                 .as_ref()
-                .is_some_and(|update| update.nodes.iter().any(|(_, node)| {
-                    node.name() == Some("Discard partial for Compact download")
-                }))
-        );
+                .expect("paused accessibility update")
+                .nodes
+                .iter()
+                .find(|(_, node)| {
+                    node.role() == egui::accesskit::Role::Status
+                        && node.name() == Some("Stable controls: Paused")
+                })
+                .expect("paused semantic status");
+            assert_eq!(paused_status.1.live(), Some(egui::accesskit::Live::Polite));
+        }
+
+        let entry = RemoteCatalogEntryView {
+            id: "stable-remote".into(),
+            display_name: "Stable remote".into(),
+            ..Default::default()
+        };
+        let active = RemoteCatalogVariantView {
+            id: "stable-q5".into(),
+            filename: "stable-q5.gguf".into(),
+            status_label: Some("Downloading".into()),
+            downloaded_bytes: Some(42),
+            total_bytes: Some(100),
+            actions: vec![RemoteCatalogActionView {
+                label: "Cancel".into(),
+                kind: RemoteCatalogActionKind::Cancel {
+                    model_id: "stable-managed".into(),
+                },
+                enabled: true,
+                disabled_reason: None,
+            }],
+            ..Default::default()
+        };
+        let paused = RemoteCatalogVariantView {
+            status_label: Some("Paused".into()),
+            actions: vec![RemoteCatalogActionView {
+                label: "Resume".into(),
+                kind: RemoteCatalogActionKind::Install {
+                    remote_model_id: entry.id.clone(),
+                    variant_id: active.id.clone(),
+                },
+                enabled: true,
+                disabled_reason: None,
+            }],
+            ..active.clone()
+        };
+        for (width, height) in [(1180.0, 815.0), (375.0, 680.0)] {
+            let active_output = render_remote_model_card_at(&entry, &active, width, height);
+            let paused_output = render_remote_model_card_at(&entry, &paused, width, height);
+            let progress = "Downloading 42B of 100B, 42% complete";
+            assert_eq!(
+                model_layout_bounds(&active_output, &format!("{progress} layout download track")),
+                model_layout_bounds(&paused_output, &format!("{progress} layout download track")),
+                "remote track at {width}px"
+            );
+            assert_eq!(
+                named_role_bounds(
+                    &active_output,
+                    "Pause Stable remote (stable-q5.gguf)",
+                    egui::accesskit::Role::Button,
+                ),
+                named_role_bounds(
+                    &paused_output,
+                    "Resume Stable remote (stable-q5.gguf) download",
+                    egui::accesskit::Role::Button,
+                ),
+                "remote primary at {width}px"
+            );
+            assert_eq!(
+                named_role_bounds(
+                    &active_output,
+                    "Cancel and discard partial for Stable remote (stable-q5.gguf)",
+                    egui::accesskit::Role::Button,
+                ),
+                named_role_bounds(
+                    &paused_output,
+                    "Discard partial for Stable remote (stable-q5.gguf)",
+                    egui::accesskit::Role::Button,
+                ),
+                "remote discard at {width}px"
+            );
+        }
     }
 
     #[test]
@@ -9863,10 +10057,11 @@ mod tests {
             let lifecycle = model_lifecycle_presentation(ModelCard::Local(&model), true);
             assert_eq!(lifecycle.label, "Pause");
             assert_eq!(lifecycle.visible_status.as_deref(), expected_status);
-            assert!(
-                model_lifecycle_controls(ModelCard::Local(&model), true)
-                    .discard
-                    .is_none()
+            let controls = model_lifecycle_controls(ModelCard::Local(&model), true);
+            assert!(controls.discard.is_some());
+            assert_eq!(
+                controls.discard_name.as_deref(),
+                Some("Cancel and discard partial for Resilient download")
             );
         }
 
@@ -9885,7 +10080,11 @@ mod tests {
                 ..Default::default()
             };
             let controls = model_lifecycle_controls(ModelCard::Local(&model), true);
-            assert_eq!(controls.primary.unwrap().label, "Resume");
+            let primary = controls.primary.unwrap();
+            assert_eq!(primary.label, "Resume");
+            if state == ModelDownloadState::Paused {
+                assert_eq!(primary.visible_status, None);
+            }
             assert!(controls.discard.is_some());
             assert_eq!(controls.error_message, None);
         }
@@ -10069,16 +10268,12 @@ mod tests {
             egui::accesskit::Role::Button,
         );
         assert!(pause.width() >= 44.0 && pause.x1 <= 375.0);
-        assert!(
-            !output
-                .platform_output
-                .accesskit_update
-                .as_ref()
-                .is_some_and(|update| update
-                    .nodes
-                    .iter()
-                    .any(|(_, node)| { node.name() == Some("Discard partial for Compact retry") }))
+        let discard = named_role_bounds(
+            &output,
+            "Cancel and discard partial for Compact retry",
+            egui::accesskit::Role::Button,
         );
+        assert!(discard.width() >= 44.0 && discard.x1 <= 375.0);
 
         let entry = RemoteCatalogEntryView {
             id: "remote".into(),
@@ -10135,6 +10330,12 @@ mod tests {
             egui::accesskit::Role::Button,
         );
         assert!(pause.width() >= 44.0 && pause.x1 <= 375.0);
+        let discard = named_role_bounds(
+            &remote_output,
+            "Cancel and discard partial for Remote retry ()",
+            egui::accesskit::Role::Button,
+        );
+        assert!(discard.width() >= 44.0 && discard.x1 <= 375.0);
     }
 
     #[test]
@@ -10279,7 +10480,7 @@ mod tests {
                             cancel_name: "Pause focus test download",
                             cancel_enabled: true,
                             cancel_reason: None,
-                            discard_name: None,
+                            discard_name: Some("Cancel and discard partial for focus test"),
                         },
                     )
                     .primary_id,
@@ -10302,7 +10503,7 @@ mod tests {
                             cancel_name: "Resume focus test download",
                             cancel_enabled: true,
                             cancel_reason: None,
-                            discard_name: Some("Discard partial for focus test download"),
+                            discard_name: Some("Discard partial for focus test"),
                         },
                     )
                     .primary_id,
