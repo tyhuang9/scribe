@@ -1475,20 +1475,21 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
     let uninstaller_artifact_source =
         &installer[uninstaller_artifact_start..uninstaller_artifact_end];
     assert!(
-        installer.contains("FileShareDelete = $00000004")
+        !installer.contains("FileShareDelete")
             && uninstaller_artifact_source.contains("SameStr(RelativePath, 'unins000.exe')")
             && uninstaller_artifact_source.contains("SameStr(RelativePath, 'unins000.dat')")
             && uninstaller_artifact_source
                 .matches("SameStr(RelativePath,")
                 .count()
                 == 2
-            && file_probe_source.contains("AllowDeleteSharing: Boolean")
-            && file_probe_source.contains("ShareMode := FileShareRead or FileShareWrite")
-            && file_probe_source.contains("if AllowDeleteSharing then")
-            && file_probe_source.contains("ShareMode := ShareMode or FileShareDelete")
-            && file_probe_source.contains("Path, 0, ShareMode, 0, OpenExisting")
-            && file_probe_source.contains("Path, GenericRead or GenericWrite, ShareMode"),
-        "installer may permit delete sharing only for the exact Inno uninstaller pair"
+            && file_probe_source.contains("ReleaseBeforeInnoReplacement: Boolean")
+            && file_probe_source
+                .contains("IdentityHandle, Path, ReleaseBeforeInnoReplacement, ErrorText",)
+            && file_probe_source
+                .contains("Path, 0, FileShareRead or FileShareWrite, 0, OpenExisting")
+            && file_probe_source
+                .contains("Path, GenericRead or GenericWrite, FileShareRead or FileShareWrite"),
+        "installer must keep normal file bindings delete-denying and tag only the exact Inno uninstaller pair for release"
     );
     let inspect_start = installer
         .find("function InspectExistingTree")
@@ -1515,13 +1516,37 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
     let error_argument = bind_file_call_source
         .find("ErrorText")
         .expect("installer file binding must preserve its fail-closed error result");
+    let uninstaller_release_start = installer
+        .find("procedure ReleaseInnoUninstallerHandles")
+        .expect("installer must release Inno uninstaller handles before replacement");
+    let uninstaller_release_end = installer[uninstaller_release_start..]
+        .find("function RetainBoundHandle")
+        .map(|offset| uninstaller_release_start + offset)
+        .expect("installer retained-handle helper must follow uninstaller release helper");
+    let uninstaller_release_source = &installer[uninstaller_release_start..uninstaller_release_end];
+    let lifecycle_start = installer
+        .find("function PrepareToInstall")
+        .expect("installer preflight lifecycle must exist");
+    let lifecycle_source = &installer[lifecycle_start..];
     assert!(
         child_path_argument < uninstaller_argument
             && uninstaller_argument < error_argument
-            && file_probe_source.contains("RetainBoundHandle(IdentityHandle")
+            && file_probe_source.contains("RetainBoundHandle(")
+            && file_probe_source.contains("IdentityHandle, Path, ReleaseBeforeInnoReplacement")
             && file_probe_source.contains("RejectAlternateStreams(Path, False")
-            && file_probe_source.contains("GenericRead or GenericWrite"),
-        "installer must retain delete-denying payload identity handles while validating the Inno metadata exception by relative path"
+            && file_probe_source.contains("GenericRead or GenericWrite")
+            && uninstaller_release_source
+                .contains("if BoundHandleReleaseBeforeInnoReplacement[I] then")
+            && uninstaller_release_source.contains("CloseHandle(BoundHandles[I])")
+            && lifecycle_source.contains("ReleaseInnoUninstallerHandles();")
+            && matches!(
+                (
+                    lifecycle_source.find("ReleaseInnoUninstallerHandles();"),
+                    lifecycle_source.find("WaitAtTestBoundary();")
+                ),
+                (Some(release), Some(pause)) if release < pause
+            ),
+        "installer must retain delete-denying payload identity handles while releasing only the validated Inno metadata handles before file replacement"
     );
     let first_probe = inspect_source
         .find("BindDirectory(")
@@ -1545,10 +1570,6 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
                 == 2,
         "installer enumeration must fail closed on start and continuation errors"
     );
-    let lifecycle_start = installer
-        .find("function PrepareToInstall")
-        .expect("installer preflight lifecycle must exist");
-    let lifecycle_source = &installer[lifecycle_start..];
     assert!(
         installer.contains("BoundHandles: array[0..31] of THandle")
             && installer.contains("procedure ReleaseBoundHandles()")

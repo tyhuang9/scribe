@@ -945,32 +945,40 @@ Set-StrictMode -Version Latest
     if ($prepareStart -lt 0 -or
         $prepareEnd -le $prepareStart -or
         $installer -notmatch 'procedure ReleaseBoundHandles' -or
+        $installer -notmatch 'procedure ReleaseInnoUninstallerHandles' -or
         $installer -notmatch 'BoundHandles: array\[0\.\.31\] of THandle' -or
-        $installer -notmatch 'RetainBoundHandle\(IdentityHandle' -or
+        $installer -notmatch 'BoundHandleReleaseBeforeInnoReplacement: array\[0\.\.31\] of Boolean' -or
+        $installer -notmatch 'RetainBoundHandle\(\s*IdentityHandle' -or
         $installer -notmatch 'RetainBoundHandle\(DirectoryHandle' -or
         $lifecycleSource -notmatch 'if CurStep = ssPostInstall then\s+ReleaseBoundHandles\(\)' -or
         $lifecycleSource -notmatch 'procedure DeinitializeSetup\(\);\s+begin\s+ReleaseBoundHandles\(\)') {
         throw "Installer identity handles must remain bound through file installation and close on every completion path."
     }
-    $uninstallerSharingStart = $installer.IndexOf('function IsInnoUninstallerArtifact')
-    $uninstallerSharingEnd = $installer.IndexOf('function ValidateNoReparseAncestors', $uninstallerSharingStart)
-    if ($uninstallerSharingStart -lt 0 -or $uninstallerSharingEnd -le $uninstallerSharingStart) {
-        throw 'Could not isolate the Inno uninstaller sharing contract.'
+    $uninstallerLifecycleStart = $installer.IndexOf('procedure ReleaseInnoUninstallerHandles')
+    $uninstallerLifecycleEnd = $installer.IndexOf('function ValidateNoReparseAncestors', $uninstallerLifecycleStart)
+    if ($uninstallerLifecycleStart -lt 0 -or $uninstallerLifecycleEnd -le $uninstallerLifecycleStart) {
+        throw 'Could not isolate the Inno uninstaller release contract.'
     }
-    $uninstallerSharingSource = $installer.Substring($uninstallerSharingStart, $uninstallerSharingEnd - $uninstallerSharingStart)
-    if ($installer -notmatch 'FileShareDelete = \$00000004' -or
-        $uninstallerSharingSource -notmatch "function IsInnoUninstallerArtifact[\s\S]*SameStr\(RelativePath, 'unins000\.exe'\)[\s\S]*SameStr\(RelativePath, 'unins000\.dat'\)" -or
-        $uninstallerSharingSource -notmatch 'function BindFileForUpdate\([\s\S]*AllowDeleteSharing: Boolean' -or
-        $uninstallerSharingSource -notmatch 'ShareMode := FileShareRead or FileShareWrite;[\s\S]*if AllowDeleteSharing then[\s\S]*ShareMode := ShareMode or FileShareDelete' -or
-        $uninstallerSharingSource -notmatch 'Path, 0, ShareMode, 0, OpenExisting' -or
-        $uninstallerSharingSource -notmatch 'Path, GenericRead or GenericWrite, ShareMode,' -or
+    $uninstallerLifecycleSource = $installer.Substring($uninstallerLifecycleStart, $uninstallerLifecycleEnd - $uninstallerLifecycleStart)
+    if ($installer -match 'FileShareDelete' -or
+        $uninstallerLifecycleSource -notmatch 'function IsInnoUninstallerArtifact[\s\S]*SameStr\(RelativePath, ''unins000\.exe''\)[\s\S]*SameStr\(RelativePath, ''unins000\.dat''\)' -or
+        $uninstallerLifecycleSource -notmatch 'function BindFileForUpdate\([\s\S]*ReleaseBeforeInnoReplacement: Boolean' -or
+        $uninstallerLifecycleSource -notmatch 'RetainBoundHandle\([\s\S]*IdentityHandle, Path, ReleaseBeforeInnoReplacement, ErrorText\)' -or
+        $uninstallerLifecycleSource -notmatch 'if BoundHandleReleaseBeforeInnoReplacement\[I\] then[\s\S]*CloseHandle\(BoundHandles\[I\]\)' -or
+        $installer -notmatch 'if CurStep = ssInstall then[\s\S]*ReleaseInnoUninstallerHandles\(\);[\s\S]*WaitAtTestBoundary\(\)' -or
         $installer -notmatch 'BindFileForUpdate\(\s*ChildPath, IsInnoUninstallerArtifact\(RelativePath\), ErrorText\)') {
-        throw 'Installer must permit delete sharing only for the validated Inno uninstaller pair while retaining payload identity handles.'
+        throw 'Installer must release only validated Inno uninstaller handles before Inno begins file replacement while retaining payload identity handles.'
     }
-    $payloadSharingSource = $installer.Substring($installer.IndexOf('function IsAllowedExistingFile'), $uninstallerSharingStart - $installer.IndexOf('function IsAllowedExistingFile'))
-    if ($payloadSharingSource -notmatch "SameStr\(RelativePath, 'local-transcriber\.exe'\)" -or
-        $uninstallerSharingSource -match 'IsInnoUninstallerArtifact\(Path\)') {
-        throw 'Installer uninstaller delete sharing must be selected only from the validated relative path, never an untrusted full path.'
+    $uninstallerArtifactStart = $installer.IndexOf('function IsInnoUninstallerArtifact')
+    $payloadBindingStart = $installer.IndexOf('function IsAllowedExistingFile')
+    if ($payloadBindingStart -lt 0 -or $uninstallerArtifactStart -le $payloadBindingStart) {
+        throw 'Could not isolate the payload binding policy.'
+    }
+    $payloadBindingSource = $installer.Substring($payloadBindingStart, $uninstallerArtifactStart - $payloadBindingStart)
+    if ($payloadBindingSource -notmatch "SameStr\(RelativePath, 'local-transcriber\.exe'\)" -or
+        $uninstallerLifecycleSource -match 'IsInnoUninstallerArtifact\(Path\)' -or
+        $uninstallerLifecycleSource -notmatch 'RetainBoundHandle\(DirectoryHandle, Path, False, ErrorText\)') {
+        throw 'Installer uninstaller release must be selected only from the validated relative path; directories and payload bindings must remain delete-denying.'
     }
     foreach ($existingAllowedPath in @($expectedPortablePayloadPaths) + @('unins000.exe', 'unins000.dat')) {
         $innoPath = $existingAllowedPath.Replace('/', '\')

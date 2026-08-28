@@ -83,7 +83,6 @@ const
   ErrorHandleEof = 38;
   FileShareRead = $00000001;
   FileShareWrite = $00000002;
-  FileShareDelete = $00000004;
   GenericWrite = $40000000;
   GenericRead = $80000000;
   OpenExisting = 3;
@@ -95,6 +94,7 @@ const
 var
   BoundHandles: array[0..31] of THandle;
   BoundHandlePaths: array[0..31] of String;
+  BoundHandleReleaseBeforeInnoReplacement: array[0..31] of Boolean;
   BoundHandleCount: Integer;
   TestPauseRequested: Boolean;
   TestContainerRoot: String;
@@ -301,13 +301,32 @@ begin
       CloseHandle(BoundHandles[I]);
     BoundHandles[I] := InvalidHandleValue;
     BoundHandlePaths[I] := '';
+    BoundHandleReleaseBeforeInnoReplacement[I] := False;
   end;
   BoundHandleCount := 0;
+end;
+
+procedure ReleaseInnoUninstallerHandles();
+var
+  I: Integer;
+begin
+  for I := BoundHandleCount - 1 downto 0 do
+  begin
+    if BoundHandleReleaseBeforeInnoReplacement[I] then
+    begin
+      if BoundHandles[I] <> InvalidHandleValue then
+        CloseHandle(BoundHandles[I]);
+      BoundHandles[I] := InvalidHandleValue;
+      BoundHandlePaths[I] := '';
+      BoundHandleReleaseBeforeInnoReplacement[I] := False;
+    end;
+  end;
 end;
 
 function RetainBoundHandle(
   Handle: THandle;
   Path: String;
+  ReleaseBeforeInnoReplacement: Boolean;
   var ErrorText: String
 ): Boolean;
 begin
@@ -320,6 +339,7 @@ begin
   end;
   BoundHandles[BoundHandleCount] := Handle;
   BoundHandlePaths[BoundHandleCount] := Path;
+  BoundHandleReleaseBeforeInnoReplacement[BoundHandleCount] := ReleaseBeforeInnoReplacement;
   BoundHandleCount := BoundHandleCount + 1;
   Result := True;
 end;
@@ -493,7 +513,7 @@ begin
       Path + ' (' + SysErrorMessage(ErrorCode) + ').';
     Exit;
   end;
-  if not RetainBoundHandle(DirectoryHandle, Path, ErrorText) then
+  if not RetainBoundHandle(DirectoryHandle, Path, False, ErrorText) then
     Exit;
   if not QueryExistingAttributes(Path, Attributes, PathExists, ErrorText) then
     Exit;
@@ -511,25 +531,19 @@ end;
 
 function BindFileForUpdate(
   Path: String;
-  AllowDeleteSharing: Boolean;
+  ReleaseBeforeInnoReplacement: Boolean;
   var ErrorText: String
 ): Boolean;
 var
   IdentityHandle: THandle;
   UpdateProbe: THandle;
-  ShareMode: LongWord;
   Attributes: LongWord;
   PathExists: Boolean;
   ErrorCode: LongInt;
 begin
   Result := False;
-  ShareMode := FileShareRead or FileShareWrite;
-  { Inno Setup replaces only its own uninstaller pair with MoveFileEx. Keep
-    payload files delete-denying, but allow replacement of this metadata pair. }
-  if AllowDeleteSharing then
-    ShareMode := ShareMode or FileShareDelete;
   IdentityHandle := CreateFileW(
-    Path, 0, ShareMode, 0, OpenExisting,
+    Path, 0, FileShareRead or FileShareWrite, 0, OpenExisting,
     FileFlagOpenReparsePoint, 0);
   if IdentityHandle = InvalidHandleValue then
   begin
@@ -538,7 +552,8 @@ begin
       Path + ' (' + SysErrorMessage(ErrorCode) + ').';
     Exit;
   end;
-  if not RetainBoundHandle(IdentityHandle, Path, ErrorText) then
+  if not RetainBoundHandle(
+    IdentityHandle, Path, ReleaseBeforeInnoReplacement, ErrorText) then
     Exit;
   if not QueryExistingAttributes(Path, Attributes, PathExists, ErrorText) then
     Exit;
@@ -557,7 +572,7 @@ begin
   if not RejectAlternateStreams(Path, False, ErrorText) then
     Exit;
   UpdateProbe := CreateFileW(
-    Path, GenericRead or GenericWrite, ShareMode,
+    Path, GenericRead or GenericWrite, FileShareRead or FileShareWrite,
     0, OpenExisting, FileFlagOpenReparsePoint, 0);
   if UpdateProbe = InvalidHandleValue then
   begin
@@ -968,7 +983,10 @@ end;
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssInstall then
+  begin
+    ReleaseInnoUninstallerHandles();
     WaitAtTestBoundary();
+  end;
   if CurStep = ssPostInstall then
     ReleaseBoundHandles();
 end;
