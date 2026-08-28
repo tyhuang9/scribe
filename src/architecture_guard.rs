@@ -1498,8 +1498,26 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
         .map(|offset| inspect_start + offset)
         .expect("stable tree validator must follow tree inspector");
     let inspect_source = &installer[inspect_start..inspect_end];
+    let bind_file_call_start = inspect_source
+        .find("BindFileForUpdate(")
+        .expect("installer tree inspection must bind existing files");
+    let bind_file_call_end = inspect_source[bind_file_call_start..]
+        .find(") then")
+        .map(|offset| bind_file_call_start + offset)
+        .expect("installer file binding call must close before its failure branch");
+    let bind_file_call_source = &inspect_source[bind_file_call_start..bind_file_call_end];
+    let child_path_argument = bind_file_call_source
+        .find("ChildPath")
+        .expect("installer file binding must use the enumerated child path");
+    let uninstaller_argument = bind_file_call_source
+        .find("IsInnoUninstallerArtifact(RelativePath)")
+        .expect("installer file binding must classify the validated relative path");
+    let error_argument = bind_file_call_source
+        .find("ErrorText")
+        .expect("installer file binding must preserve its fail-closed error result");
     assert!(
-        inspect_source.contains("BindFileForUpdate(\n            ChildPath, IsInnoUninstallerArtifact(RelativePath), ErrorText)")
+        child_path_argument < uninstaller_argument
+            && uninstaller_argument < error_argument
             && file_probe_source.contains("RetainBoundHandle(IdentityHandle")
             && file_probe_source.contains("RejectAlternateStreams(Path, False")
             && file_probe_source.contains("GenericRead or GenericWrite"),
