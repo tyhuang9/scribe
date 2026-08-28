@@ -307,6 +307,12 @@ const MOONSHINE_TINY_CAPABILITIES: ModelCapabilities = ModelCapabilities {
     ..BATCH_ENGLISH_CAPABILITIES
 };
 
+const MOONSHINE_BASE_CAPABILITIES: ModelCapabilities = ModelCapabilities {
+    cancellation: false,
+    timestamps: false,
+    ..BATCH_ENGLISH_CAPABILITIES
+};
+
 const NO_ROLES: &[ModelRole] = &[];
 
 const PHASE_ZERO_SMOKE: CompatibilityEvidence = CompatibilityEvidence {
@@ -333,6 +339,18 @@ const MOONSHINE_TINY_ONNX_EXPERIMENTAL: CompatibilityEvidence = CompatibilityEvi
     receipt: None,
 };
 
+const MOONSHINE_BASE_ONNX_EXPERIMENTAL: CompatibilityEvidence = CompatibilityEvidence {
+    id: "moonshine-base-en-int8-onnx-windows-sherpa-1.13.5-fixture-gate",
+    source: "docs/MANUAL_TEST_MATRIX.md",
+    load: true,
+    known_fixture: true,
+    cancellation: false,
+    unload_reload: true,
+    acceleration: false,
+    platform: true,
+    receipt: None,
+};
+
 const PHASE_TWO_BASE_SMOKE: CompatibilityEvidence = CompatibilityEvidence {
     id: "phase-2-native-base-en-jfk-smoke",
     source: COMPATIBILITY_EVIDENCE_DOCUMENT,
@@ -348,6 +366,7 @@ const PHASE_TWO_BASE_SMOKE: CompatibilityEvidence = CompatibilityEvidence {
 const MODELS: &[ModelManifest] = &[
     handy_computer_tiny_en_manifest(),
     moonshine_tiny_en_int8_onnx_manifest(),
+    moonshine_base_en_int8_onnx_manifest(),
     whisper_manifest(
         BUNDLED_BASE_MODEL_ID,
         "Whisper Base — English",
@@ -471,6 +490,35 @@ const fn moonshine_tiny_en_int8_onnx_manifest() -> ModelManifest {
             reason: "The complete compatibility suite has not passed.",
         },
         evidence: MOONSHINE_TINY_ONNX_EXPERIMENTAL,
+    }
+}
+
+const fn moonshine_base_en_int8_onnx_manifest() -> ModelManifest {
+    ModelManifest {
+        id: "moonshine-base-en-int8-onnx",
+        display_name: "Moonshine Base — English",
+        variant_label: "Base INT8",
+        description: "Converted five-file Moonshine Base INT8 English model; source and converter revisions are unrecorded.",
+        storage_guidance: "~274 MiB",
+        expected_ram: "Not yet measured",
+        speed_guidance: "Not yet measured",
+        accuracy_guidance: "Fixture verified only",
+        recommended: false,
+        runtime: None,
+        architecture: ModelArchitecture::EncoderDecoder,
+        minimum_runtime_version: TRANSCRIBE_CPP_VERSION,
+        artifact: ModelArtifactBinding::ReceiptBackedBundle {
+            bundle_id: "moonshine-base-en-int8-onnx",
+            aggregate_size_bytes: 286_930_831,
+        },
+        languages: &["en"],
+        capabilities: MOONSHINE_BASE_CAPABILITIES,
+        roles: NO_ROLES,
+        compatibility: CompatibilityStatus::Experimental {
+            evidence: MOONSHINE_BASE_ONNX_EXPERIMENTAL.link(),
+            reason: "Cancellation, restart recovery, latency, resource use, accelerators, and non-Windows support remain unverified.",
+        },
+        evidence: MOONSHINE_BASE_ONNX_EXPERIMENTAL,
     }
 }
 
@@ -1052,8 +1100,8 @@ mod tests {
     #[test]
     fn production_catalog_is_valid_and_has_unique_ids() {
         assert_eq!(validate_catalog(), Ok(()));
-        assert_eq!(model_descriptors().len(), 5);
-        assert_eq!(normal_model_descriptors().len(), 5);
+        assert_eq!(model_descriptors().len(), 6);
+        assert_eq!(normal_model_descriptors().len(), 6);
         assert_eq!(
             model_descriptors()
                 .into_iter()
@@ -1073,6 +1121,11 @@ mod tests {
                     ModelId::new("moonshine-tiny-en-int8-onnx"),
                     "Moonshine Tiny — English",
                     "Tiny",
+                ),
+                (
+                    ModelId::new("moonshine-base-en-int8-onnx"),
+                    "Moonshine Base — English",
+                    "Base INT8",
                 ),
                 (
                     ModelId::new("whisper_cpp_base_en"),
@@ -1099,6 +1152,7 @@ mod tests {
             vec![
                 ModelId::new("whisper_cpp_tiny_en"),
                 ModelId::new("moonshine-tiny-en-int8-onnx"),
+                ModelId::new("moonshine-base-en-int8-onnx"),
                 ModelId::new("whisper_cpp_base_en"),
                 ModelId::new("whisper_cpp_small_en"),
                 ModelId::new("whisper_cpp_medium_en"),
@@ -1349,28 +1403,68 @@ mod tests {
     }
 
     #[test]
-    fn moonshine_is_the_only_receipt_backed_onnx_descriptor() {
-        let descriptor = model_descriptor(&ModelId::new("moonshine-tiny-en-int8-onnx")).unwrap();
-        assert_eq!(descriptor.artifact_size_bytes, 44_256_550);
-        assert_eq!(descriptor.languages, vec!["en"]);
-        assert!(!descriptor.capabilities.native_streaming);
-        assert!(!descriptor.capabilities.timestamps);
-        assert!(descriptor.capabilities.cpu);
-        assert!(!descriptor.capabilities.gpu);
+    fn receipt_backed_onnx_descriptors_are_exactly_normalized_and_experimental() {
+        let receipt_backed = [
+            ("moonshine-tiny-en-int8-onnx", 44_256_550),
+            ("moonshine-base-en-int8-onnx", 286_930_831),
+        ];
+
+        for (id, aggregate_size_bytes) in receipt_backed {
+            let descriptor = model_descriptor(&ModelId::new(id)).unwrap();
+            assert_eq!(descriptor.artifact_size_bytes, aggregate_size_bytes);
+            assert_eq!(descriptor.languages, vec!["en"]);
+            assert!(descriptor.capabilities.batch_transcription);
+            assert!(!descriptor.capabilities.native_streaming);
+            assert!(!descriptor.capabilities.timestamps);
+            assert!(!descriptor.capabilities.translation);
+            assert!(!descriptor.capabilities.language_detection);
+            assert!(descriptor.capabilities.cpu);
+            assert!(!descriptor.capabilities.gpu);
+            assert!(!descriptor.recommended);
+            assert!(descriptor.roles.is_empty());
+            assert!(matches!(
+                descriptor.compatibility,
+                CompatibilityStatus::Experimental { .. }
+            ));
+            assert_eq!(
+                normalized_install_artifact(&descriptor.id),
+                Some(NormalizedInstallArtifact::ReceiptBackedBundle {
+                    bundle_id: id,
+                    aggregate_size_bytes,
+                })
+            );
+            assert_eq!(
+                normalized_receipt_backed_bundle_id(&descriptor.id),
+                Some(id)
+            );
+            assert_eq!(runtime_model_manifest(&descriptor.id), None);
+            assert!(!model_uses_embedded_runtime(&descriptor.id));
+            assert_eq!(runtime_model_download_url(&descriptor.id), None);
+        }
+
+        let base = model_descriptor(&ModelId::new("moonshine-base-en-int8-onnx")).unwrap();
+        assert!(!base.capabilities.cancellation);
+        assert_eq!(base.expected_ram, "Not yet measured");
+        assert_eq!(base.speed_guidance, "Not yet measured");
+        assert_eq!(base.accuracy_guidance, "Fixture verified only");
+        let base_manifest = MODELS
+            .iter()
+            .find(|manifest| manifest.id == "moonshine-base-en-int8-onnx")
+            .unwrap();
+        assert_eq!(base_manifest.evidence, MOONSHINE_BASE_ONNX_EXPERIMENTAL);
+        assert!(base_manifest.evidence.load);
+        assert!(base_manifest.evidence.known_fixture);
+        assert!(!base_manifest.evidence.cancellation);
+        assert!(base_manifest.evidence.unload_reload);
+        assert!(!base_manifest.evidence.acceleration);
+        assert!(base_manifest.evidence.platform);
+        assert_eq!(base_manifest.evidence.receipt, None);
         assert!(matches!(
-            descriptor.compatibility,
-            CompatibilityStatus::Experimental { .. }
+            base.compatibility,
+            CompatibilityStatus::Experimental { evidence, reason }
+                if evidence == MOONSHINE_BASE_ONNX_EXPERIMENTAL.link()
+                    && reason.contains("Cancellation")
         ));
-        assert_eq!(
-            normalized_install_artifact(&descriptor.id),
-            Some(NormalizedInstallArtifact::ReceiptBackedBundle {
-                bundle_id: "moonshine-tiny-en-int8-onnx",
-                aggregate_size_bytes: 44_256_550,
-            })
-        );
-        assert_eq!(runtime_model_manifest(&descriptor.id), None);
-        assert!(!model_uses_embedded_runtime(&descriptor.id));
-        assert_eq!(runtime_model_download_url(&descriptor.id), None);
         assert_eq!(
             MODELS
                 .iter()
@@ -1381,7 +1475,31 @@ mod tests {
                     )
                 })
                 .count(),
-            1
+            2
+        );
+    }
+
+    #[test]
+    fn moonshine_base_descriptor_matches_the_available_private_bundle_manifest() {
+        let bundle = crate::onnx_model_bundles::bundle_manifest("moonshine-base-en-int8-onnx")
+            .expect("Moonshine Base private bundle manifest is pinned");
+        assert_eq!(
+            bundle.availability,
+            crate::onnx_model_bundles::BundleAvailability::Available
+        );
+        assert_eq!(
+            bundle
+                .files
+                .iter()
+                .try_fold(0_u64, |total, file| total.checked_add(file.size_bytes)),
+            Some(286_930_831)
+        );
+        assert_eq!(
+            normalized_install_artifact(&ModelId::new("moonshine-base-en-int8-onnx")),
+            Some(NormalizedInstallArtifact::ReceiptBackedBundle {
+                bundle_id: "moonshine-base-en-int8-onnx",
+                aggregate_size_bytes: 286_930_831,
+            })
         );
     }
 
