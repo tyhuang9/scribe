@@ -1,13 +1,10 @@
-#![cfg_attr(not(test), allow(dead_code))]
-
-use std::{collections::HashSet, path::Path};
+use std::{collections::HashSet, path::Path, sync::OnceLock};
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::transcription::ModelId;
 
-const WHISPER_CPP_REVISION: &str = "5359861c739e955e79d9a303bcbc70fb988958b1";
 const HANDY_COMPUTER_TINY_EN_REVISION: &str = "becb8bcb804405dc97b380a523d9975888820986";
 const COMPATIBILITY_EVIDENCE_DOCUMENT: &str = "docs/SCRIBE_REVAMP.md";
 pub(crate) const BUNDLED_BASE_MODEL_ID: &str = "whisper_cpp_base_en";
@@ -146,7 +143,6 @@ struct ModelManifest {
     architecture: ModelArchitecture,
     minimum_runtime_version: RuntimeVersion,
     artifact: ModelArtifactBinding,
-    legacy_ggml_artifact: Option<ArtifactManifest>,
     languages: &'static [&'static str],
     capabilities: ModelCapabilities,
     roles: &'static [ModelRole],
@@ -173,13 +169,13 @@ pub struct EvidenceLink {
 /// Runtime-neutral compatibility exposed to the service and UI.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CompatibilityStatus {
-    Supported {
-        evidence: EvidenceLink,
-    },
+    #[cfg(test)]
+    Supported { evidence: EvidenceLink },
     Experimental {
         evidence: EvidenceLink,
         reason: &'static str,
     },
+    #[cfg(test)]
     Incompatible {
         evidence: EvidenceLink,
         reason: &'static str,
@@ -189,8 +185,10 @@ pub enum CompatibilityStatus {
 impl CompatibilityStatus {
     pub const fn label(self) -> &'static str {
         match self {
+            #[cfg(test)]
             Self::Supported { .. } => "Supported",
             Self::Experimental { .. } => "Experimental",
+            #[cfg(test)]
             Self::Incompatible { .. } => "Incompatible",
         }
     }
@@ -199,9 +197,13 @@ impl CompatibilityStatus {
 /// Curated user-facing roles. A role is valid only for a Supported model.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ModelRole {
+    #[cfg(test)]
     FastEnglish,
+    #[cfg(test)]
     BalancedMultilingual,
+    #[cfg(test)]
     HighAccuracy,
+    #[cfg(test)]
     LowMemory,
 }
 
@@ -251,14 +253,12 @@ pub(crate) struct RuntimeModelManifest {
     pub(crate) artifact_size_bytes: u64,
     pub(crate) artifact_storage_estimate: &'static str,
     pub(crate) artifact_sha256: &'static str,
-    pub(crate) legacy_ggml_artifact: Option<RuntimeArtifactManifest>,
 }
 
 /// Trusted runtime artifact format, assigned by catalog/provenance resolution.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ArtifactFormat {
     Gguf,
-    LegacyGgml,
 }
 
 /// Immutable integrity facts for an artifact the runtime may resolve.
@@ -366,13 +366,6 @@ const MODELS: &[ModelManifest] = &[
             size_bytes: 84_886_208,
             sha256: "3b46ca40bccbf7609c68d88a36d96077a04ca7c87f2060ede06f129fac3e7652",
         },
-        ArtifactManifest {
-            repository: "ggerganov/whisper.cpp",
-            revision: WHISPER_CPP_REVISION,
-            filename: "ggml-base.en.bin",
-            size_bytes: 147_964_211,
-            sha256: "a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002",
-        },
         true,
         PHASE_TWO_BASE_SMOKE,
     ),
@@ -394,13 +387,6 @@ const MODELS: &[ModelManifest] = &[
             size_bytes: 269_674_144,
             sha256: "9614e6b7fda2d26018e4f268aece8ca25a83296ea0b534169a585b740bfd71ef",
         },
-        ArtifactManifest {
-            repository: "ggerganov/whisper.cpp",
-            revision: WHISPER_CPP_REVISION,
-            filename: "ggml-small.en.bin",
-            size_bytes: 487_614_201,
-            sha256: "c6138d6d58ecc8322097e0f987c32f1be8bb0a18532a3f88f734d1bbf9c41e5d",
-        },
         false,
         PHASE_ZERO_SMOKE,
     ),
@@ -421,13 +407,6 @@ const MODELS: &[ModelManifest] = &[
             filename: "whisper-medium.en-Q8_0.gguf",
             size_bytes: 831_460_928,
             sha256: "03d7257fef498750ce272631bc6a34de322fc2b438aab5c268ff49dfd1b64c49",
-        },
-        ArtifactManifest {
-            repository: "ggerganov/whisper.cpp",
-            revision: WHISPER_CPP_REVISION,
-            filename: "ggml-medium.en.bin",
-            size_bytes: 1_533_774_781,
-            sha256: "cc37e93478338ec7700281a7ac30a10128929eb8f427dda2e865faa8f6da4356",
         },
         false,
         PHASE_ZERO_SMOKE,
@@ -454,7 +433,6 @@ const fn handy_computer_tiny_en_manifest() -> ModelManifest {
             size_bytes: 43_545_248,
             sha256: "3bfa6200aa12a21409445401f7871b5c733546dc45a29eb4871fcb3c7954e08b",
         }),
-        legacy_ggml_artifact: None,
         languages: &["en"],
         capabilities: BATCH_ENGLISH_CAPABILITIES,
         recommended: false,
@@ -485,7 +463,6 @@ const fn moonshine_tiny_en_int8_onnx_manifest() -> ModelManifest {
             bundle_id: "moonshine-tiny-en-int8-onnx",
             aggregate_size_bytes: 44_256_550,
         },
-        legacy_ggml_artifact: None,
         languages: &["en"],
         capabilities: MOONSHINE_TINY_CAPABILITIES,
         roles: NO_ROLES,
@@ -504,7 +481,6 @@ const fn whisper_manifest(
     variant_label: &'static str,
     guidance: ModelGuidance,
     artifact: ArtifactManifest,
-    legacy_ggml_artifact: ArtifactManifest,
     recommended: bool,
     evidence: CompatibilityEvidence,
 ) -> ModelManifest {
@@ -522,7 +498,6 @@ const fn whisper_manifest(
         architecture: ModelArchitecture::EncoderDecoder,
         minimum_runtime_version: TRANSCRIBE_CPP_VERSION,
         artifact: ModelArtifactBinding::SingleGguf(artifact),
-        legacy_ggml_artifact: Some(legacy_ggml_artifact),
         languages: &["en"],
         capabilities: BATCH_ENGLISH_CAPABILITIES,
         roles: NO_ROLES,
@@ -574,9 +549,6 @@ pub(crate) fn runtime_model_manifest(id: &ModelId) -> Option<RuntimeModelManifes
                     artifact_size_bytes: artifact.size_bytes,
                     artifact_storage_estimate: manifest.storage_guidance,
                     artifact_sha256: artifact.sha256,
-                    legacy_ggml_artifact: manifest
-                        .legacy_ggml_artifact
-                        .map(|artifact| runtime_artifact(artifact, ArtifactFormat::LegacyGgml)),
                 })
         })
 }
@@ -600,12 +572,24 @@ pub(crate) fn normalized_install_artifact(id: &ModelId) -> Option<NormalizedInst
         })
 }
 
-pub(crate) fn normalized_model_storage_estimate(id: &ModelId) -> Option<&'static str> {
-    assert_catalog_valid();
-    MODELS
-        .iter()
-        .find(|manifest| manifest.id == id.as_str())
-        .map(|manifest| manifest.storage_guidance)
+/// Returns a catalog-authorized receipt-backed bundle ID only when the
+/// descriptor's typed receipt binding is self-consistent.
+pub(crate) fn normalized_receipt_backed_bundle_id(id: &ModelId) -> Option<&'static str> {
+    receipt_backed_bundle_id_for_artifact(id.as_str(), normalized_install_artifact(id)?)
+}
+
+fn receipt_backed_bundle_id_for_artifact(
+    model_id: &str,
+    artifact: NormalizedInstallArtifact,
+) -> Option<&'static str> {
+    match artifact {
+        NormalizedInstallArtifact::ReceiptBackedBundle { bundle_id, .. }
+            if bundle_id == model_id =>
+        {
+            Some(bundle_id)
+        }
+        _ => None,
+    }
 }
 
 pub(crate) fn runtime_artifact_manifest_for_path(
@@ -624,9 +608,7 @@ pub(crate) fn runtime_artifact_manifest_for_path(
             format: ArtifactFormat::Gguf,
         });
     }
-    manifest
-        .legacy_ggml_artifact
-        .filter(|artifact| artifact.filename == filename)
+    None
 }
 
 const fn runtime_artifact(
@@ -684,8 +666,18 @@ pub(crate) fn validate_catalog() -> Result<(), String> {
     validate_manifests(MODELS)
 }
 
+fn cached_validation(
+    cache: &OnceLock<Result<(), String>>,
+    validate: impl FnOnce() -> Result<(), String>,
+) -> &Result<(), String> {
+    cache.get_or_init(validate)
+}
+
 fn assert_catalog_valid() {
-    validate_catalog().expect("normalized model catalog must satisfy evidence and integrity rules");
+    static VALIDATION: OnceLock<Result<(), String>> = OnceLock::new();
+    cached_validation(&VALIDATION, validate_catalog)
+        .as_ref()
+        .expect("normalized model catalog must satisfy evidence and integrity rules");
 }
 
 impl ModelManifest {
@@ -708,12 +700,14 @@ impl ModelManifest {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EvidenceGateDecision {
     Go,
     NoGo,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EvidenceGateCriterion {
     pub name: &'static str,
@@ -722,6 +716,7 @@ pub struct EvidenceGateCriterion {
     pub finding: &'static str,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StreamingCandidateGate {
     pub runtime_version: &'static str,
@@ -730,6 +725,7 @@ pub struct StreamingCandidateGate {
     pub criteria: &'static [EvidenceGateCriterion],
 }
 
+#[cfg(test)]
 impl StreamingCandidateGate {
     pub fn decision(self) -> EvidenceGateDecision {
         if self.criteria.iter().all(|criterion| criterion.met) {
@@ -740,6 +736,7 @@ impl StreamingCandidateGate {
     }
 }
 
+#[cfg(test)]
 const ZIPFORMER_CRITERIA: &[EvidenceGateCriterion] = &[
     EvidenceGateCriterion {
         name: "pinned-package-and-model",
@@ -797,6 +794,7 @@ const ZIPFORMER_CRITERIA: &[EvidenceGateCriterion] = &[
     },
 ];
 
+#[cfg(test)]
 pub const ZIPFORMER_STREAMING_GATE: StreamingCandidateGate = StreamingCandidateGate {
     runtime_version: "1.13.4",
     runtime_commit: "142807252687d81b40d6315f23470a1512a00de3",
@@ -844,15 +842,6 @@ fn validate_manifests(manifests: &[ModelManifest]) -> Result<(), String> {
                 validate_receipt_backed_bundle(bundle_id, aggregate_size_bytes)?;
             }
         }
-        if let Some(legacy_ggml_artifact) = manifest.legacy_ggml_artifact {
-            validate_artifact(legacy_ggml_artifact)?;
-            if !legacy_ggml_artifact.filename.ends_with(".bin") {
-                return Err(format!(
-                    "{} has a non-GGML legacy compatibility artifact",
-                    manifest.id
-                ));
-            }
-        }
         if manifest.languages.is_empty()
             || manifest
                 .languages
@@ -871,9 +860,11 @@ fn validate_manifests(manifests: &[ModelManifest]) -> Result<(), String> {
             return Err(format!("{} has empty variant label", manifest.id));
         }
         let (status_evidence, reason) = match manifest.compatibility {
+            CompatibilityStatus::Experimental { evidence, reason } => (evidence, Some(reason)),
+            #[cfg(test)]
             CompatibilityStatus::Supported { evidence } => (evidence, None),
-            CompatibilityStatus::Experimental { evidence, reason }
-            | CompatibilityStatus::Incompatible { evidence, reason } => (evidence, Some(reason)),
+            #[cfg(test)]
+            CompatibilityStatus::Incompatible { evidence, reason } => (evidence, Some(reason)),
         };
         if status_evidence != manifest.evidence.link() {
             return Err(format!(
@@ -887,10 +878,14 @@ fn validate_manifests(manifests: &[ModelManifest]) -> Result<(), String> {
                 manifest.id
             ));
         }
-        if matches!(
-            manifest.compatibility,
-            CompatibilityStatus::Supported { .. }
-        ) {
+        let supported = match manifest.compatibility {
+            CompatibilityStatus::Experimental { .. } => false,
+            #[cfg(test)]
+            CompatibilityStatus::Supported { .. } => true,
+            #[cfg(test)]
+            CompatibilityStatus::Incompatible { .. } => false,
+        };
+        if supported {
             if !manifest.evidence.complete() {
                 return Err(format!(
                     "{} cannot be Supported without complete evidence and a receipt",
@@ -899,12 +894,7 @@ fn validate_manifests(manifests: &[ModelManifest]) -> Result<(), String> {
             }
             validate_compatibility_receipt(manifest)?;
         }
-        if !manifest.roles.is_empty()
-            && !matches!(
-                manifest.compatibility,
-                CompatibilityStatus::Supported { .. }
-            )
-        {
+        if !manifest.roles.is_empty() && !supported {
             return Err(format!(
                 "{} cannot receive a curated role before Supported status",
                 manifest.id
@@ -1025,6 +1015,26 @@ fn validate_artifact(artifact: ArtifactManifest) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn immutable_catalog_validation_is_cached_once_per_once_lock() {
+        let cache = OnceLock::new();
+        let calls = Cell::new(0);
+
+        let first = cached_validation(&cache, || {
+            calls.set(calls.get() + 1);
+            Ok(())
+        });
+        let second = cached_validation(&cache, || {
+            calls.set(calls.get() + 1);
+            Err("second validation must not run".to_owned())
+        });
+
+        assert!(first.is_ok());
+        assert!(second.is_ok());
+        assert_eq!(calls.get(), 1);
+    }
 
     #[test]
     fn production_catalog_is_valid_and_has_unique_ids() {
@@ -1099,59 +1109,6 @@ mod tests {
                 artifact.repository,
                 artifact.revision,
                 "another-quantization.gguf",
-            )
-            .is_none()
-        );
-    }
-
-    #[test]
-    fn resolved_artifact_path_selects_the_exact_q8_or_legacy_integrity_pin() {
-        for (id, filename, size_bytes, sha256) in [
-            (
-                "whisper_cpp_base_en",
-                "ggml-base.en.bin",
-                147_964_211,
-                "a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002",
-            ),
-            (
-                "whisper_cpp_small_en",
-                "ggml-small.en.bin",
-                487_614_201,
-                "c6138d6d58ecc8322097e0f987c32f1be8bb0a18532a3f88f734d1bbf9c41e5d",
-            ),
-            (
-                "whisper_cpp_medium_en",
-                "ggml-medium.en.bin",
-                1_533_774_781,
-                "cc37e93478338ec7700281a7ac30a10128929eb8f427dda2e865faa8f6da4356",
-            ),
-        ] {
-            let artifact =
-                runtime_artifact_manifest_for_path(&ModelId::new(id), Path::new(filename)).unwrap();
-            assert_eq!(artifact.format, ArtifactFormat::LegacyGgml);
-            assert_eq!(
-                (artifact.filename, artifact.size_bytes, artifact.sha256),
-                (filename, size_bytes, sha256)
-            );
-            assert_eq!(artifact.repository, "ggerganov/whisper.cpp");
-            assert_eq!(artifact.revision, WHISPER_CPP_REVISION);
-        }
-
-        let artifact = runtime_artifact_manifest_for_path(
-            &ModelId::new("whisper_cpp_base_en"),
-            Path::new("whisper-base.en-Q8_0.gguf"),
-        )
-        .unwrap();
-        assert_eq!(artifact.format, ArtifactFormat::Gguf);
-        assert_eq!(artifact.size_bytes, 84_886_208);
-        assert_eq!(
-            artifact.sha256,
-            "3b46ca40bccbf7609c68d88a36d96077a04ca7c87f2060ede06f129fac3e7652"
-        );
-        assert!(
-            runtime_artifact_manifest_for_path(
-                &ModelId::new("whisper_cpp_base_en"),
-                Path::new("untrusted.bin"),
             )
             .is_none()
         );
@@ -1357,58 +1314,6 @@ mod tests {
     }
 
     #[test]
-    fn runtime_manifests_pin_q8_gguf_artifacts_and_retain_legacy_ggml_aliases() {
-        let expected = [
-            (
-                "whisper_cpp_base_en",
-                "handy-computer/whisper-base.en-gguf",
-                "cf0804db15fb341d00c9274b90da9cbb4fe2e5c6",
-                "whisper-base.en-Q8_0.gguf",
-                84_886_208,
-                "3b46ca40bccbf7609c68d88a36d96077a04ca7c87f2060ede06f129fac3e7652",
-                "ggml-base.en.bin",
-            ),
-            (
-                "whisper_cpp_small_en",
-                "handy-computer/whisper-small.en-gguf",
-                "41b0f75fd44415ba127a5356c5ba9ed450c1debd",
-                "whisper-small.en-Q8_0.gguf",
-                269_674_144,
-                "9614e6b7fda2d26018e4f268aece8ca25a83296ea0b534169a585b740bfd71ef",
-                "ggml-small.en.bin",
-            ),
-            (
-                "whisper_cpp_medium_en",
-                "handy-computer/whisper-medium.en-gguf",
-                "f25c70d9095dcfdad187ebb3b113d157b414aee8",
-                "whisper-medium.en-Q8_0.gguf",
-                831_460_928,
-                "03d7257fef498750ce272631bc6a34de322fc2b438aab5c268ff49dfd1b64c49",
-                "ggml-medium.en.bin",
-            ),
-        ];
-
-        for (id, repository, revision, filename, size_bytes, sha256, legacy_filename) in expected {
-            let manifest = runtime_model_manifest(&ModelId::new(id)).unwrap();
-            assert_eq!(manifest.id, id);
-            assert!(model_uses_embedded_runtime(&ModelId::new(id)));
-            assert_eq!(manifest.runtime, RuntimeRequirement::PrimaryNative);
-            assert_eq!(manifest.minimum_runtime_version, TRANSCRIBE_CPP_VERSION);
-            assert_eq!(manifest.artifact_repository, repository);
-            assert_eq!(manifest.artifact_revision, revision);
-            assert_eq!(manifest.artifact_filename, filename);
-            assert_eq!(manifest.artifact_size_bytes, size_bytes);
-            assert_eq!(manifest.artifact_sha256, sha256);
-            assert_eq!(
-                manifest
-                    .legacy_ggml_artifact
-                    .map(|artifact| artifact.filename),
-                Some(legacy_filename)
-            );
-        }
-    }
-
-    #[test]
     fn q8_gguf_download_urls_are_derived_from_the_authoritative_manifests() {
         assert_eq!(
             runtime_model_download_url(&ModelId::new("whisper_cpp_base_en")).as_deref(),
@@ -1428,24 +1333,6 @@ mod tests {
                 "https://huggingface.co/handy-computer/whisper-medium.en-gguf/resolve/f25c70d9095dcfdad187ebb3b113d157b414aee8/whisper-medium.en-Q8_0.gguf"
             ),
         );
-    }
-
-    #[test]
-    fn tiny_embedded_gguf_manifest_is_unchanged() {
-        let manifest = runtime_model_manifest(&ModelId::new("whisper_cpp_tiny_en")).unwrap();
-
-        assert_eq!(
-            manifest.artifact_repository,
-            "handy-computer/whisper-tiny.en-gguf"
-        );
-        assert_eq!(manifest.artifact_revision, HANDY_COMPUTER_TINY_EN_REVISION);
-        assert_eq!(manifest.artifact_filename, "whisper-tiny.en-Q4_K_M.gguf");
-        assert_eq!(manifest.artifact_size_bytes, 43_545_248);
-        assert_eq!(
-            manifest.artifact_sha256,
-            "3bfa6200aa12a21409445401f7871b5c733546dc45a29eb4871fcb3c7954e08b"
-        );
-        assert_eq!(manifest.legacy_ggml_artifact, None);
     }
 
     #[test]
@@ -1482,6 +1369,41 @@ mod tests {
                 })
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn receipt_backed_bundle_authorization_comes_from_catalog_metadata() {
+        assert_eq!(
+            receipt_backed_bundle_id_for_artifact(
+                "synthetic-receipt-backed-bundle",
+                NormalizedInstallArtifact::ReceiptBackedBundle {
+                    bundle_id: "synthetic-receipt-backed-bundle",
+                    aggregate_size_bytes: 1,
+                },
+            ),
+            Some("synthetic-receipt-backed-bundle")
+        );
+        assert_eq!(
+            receipt_backed_bundle_id_for_artifact(
+                "synthetic-receipt-backed-bundle",
+                NormalizedInstallArtifact::ReceiptBackedBundle {
+                    bundle_id: "different-bundle",
+                    aggregate_size_bytes: 1,
+                },
+            ),
+            None
+        );
+        assert_eq!(
+            receipt_backed_bundle_id_for_artifact(
+                "synthetic-receipt-backed-bundle",
+                normalized_install_artifact(&ModelId::new("whisper_cpp_tiny_en")).unwrap(),
+            ),
+            None
+        );
+        assert_eq!(
+            normalized_receipt_backed_bundle_id(&ModelId::new("unknown-receipt-backed-bundle")),
+            None
         );
     }
 

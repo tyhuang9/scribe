@@ -24,7 +24,7 @@ jobs:
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Test Windows release packaging contracts
         shell: pwsh
@@ -37,7 +37,9 @@ jobs:
           & .\scripts\test-windows-installer-maintenance.ps1
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@1.96.0
+        # Official dtolnay/rust-toolchain branch 1.96.0 resolved on 2026-08-27;
+        # the immutable revision is guarded by the packaging and Rust tests.
+        uses: dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e # 1.96.0 branch reviewed 2026-08-27
         with:
           # The toolchain action installs only rustc and cargo unless requested.
           # Keep the CI formatting and linting tools available for this pinned Rust release.
@@ -90,38 +92,119 @@ jobs:
           "APP_VERSION=$version" >> $env:GITHUB_ENV
           & .\scripts\build-windows-release.ps1 `
             -ModelSource .ci-release-inputs\model\whisper-base.en-Q8_0.gguf `
-            -RuntimeSource .ci-release-inputs\runtime `
             -BundlePath dist\portable
 
-      - name: Install Inno Setup
+      - name: Acquire digest-pinned Inno Setup
         shell: pwsh
-        run: choco install innosetup --no-progress --yes
+        # Reviewed source, size, digest, embedded-installer digest, and trust
+        # scope are recorded in installer/inno-setup-6.7.1-provenance.json.
+        env:
+          INNO_NUPKG_SHA256: a0dad33db33099d9cd2b89ac2d08b5d70c589b15118ced3b95f469f044f99950
+          INNO_NUPKG_SIZE: '10017031'
+          INNO_INSTALLER_SHA256: 4d11e8050b6185e0d49bd9e8cc661a7a59f44959a621d31d11033124c4e8a7b0
+          INNO_INSTALLER_SIZE: '10619024'
+          INNO_COMPILER_SHA256: eb6f4410c8db367a5f74127e8025ad2ccacc0afabbe783959d237df3050f97fb
+          INNO_COMPILER_SIZE: '1455248'
+        run: |
+          $packageRoot = Join-Path $env:GITHUB_WORKSPACE '.ci-tools\inno-package'
+          $installRoot = Join-Path $env:GITHUB_WORKSPACE '.ci-tools\inno-setup'
+          $packagePath = Join-Path $packageRoot 'InnoSetup.6.7.1.nupkg'
+          New-Item -ItemType Directory -Path $packageRoot | Out-Null
+          curl.exe --fail --location --retry 3 --retry-delay 2 `
+            --output $packagePath `
+            'https://community.chocolatey.org/api/v2/package/InnoSetup/6.7.1'
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to download InnoSetup.6.7.1.nupkg' }
+          $package = Get-Item -LiteralPath $packagePath
+          if ($package.Length -ne [int64]$env:INNO_NUPKG_SIZE) {
+            throw "Unexpected Inno Setup nupkg size: $($package.Length)"
+          }
+          $packageHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $packagePath).Hash.ToLowerInvariant()
+          if ($packageHash -cne $env:INNO_NUPKG_SHA256) {
+            throw "Unexpected Inno Setup nupkg SHA-256: $packageHash"
+          }
+          $expandedRoot = Join-Path $packageRoot 'expanded'
+          Expand-Archive -LiteralPath $packagePath -DestinationPath $expandedRoot
+          $installerPath = Join-Path $expandedRoot 'tools\innosetup-6.7.1.exe'
+          $installer = Get-Item -LiteralPath $installerPath
+          if ($installer.Length -ne [int64]$env:INNO_INSTALLER_SIZE) {
+            throw "Unexpected embedded Inno Setup installer size: $($installer.Length)"
+          }
+          $installerHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $installerPath).Hash.ToLowerInvariant()
+          if ($installerHash -cne $env:INNO_INSTALLER_SHA256) {
+            throw "Unexpected embedded Inno Setup installer SHA-256: $installerHash"
+          }
+          $installArguments = @(
+            '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', '/NOICONS', '/CURRENTUSER',
+            ('"/DIR={0}"' -f $installRoot)
+          )
+          $installProcess = Start-Process -FilePath $installerPath `
+            -ArgumentList $installArguments `
+            -Wait -PassThru -WindowStyle Hidden
+          if ($installProcess.ExitCode -ne 0) { throw "Inno Setup installation failed with exit code $($installProcess.ExitCode)" }
+          $iscc = Join-Path $installRoot 'ISCC.exe'
+          $isccFile = Get-Item -LiteralPath $iscc
+          if (-not $isccFile.PSIsContainer -and ($isccFile.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq 0) {
+            if ($isccFile.Length -ne [int64]$env:INNO_COMPILER_SIZE) {
+              throw "Unexpected Inno Setup compiler size: $($isccFile.Length)"
+            }
+          } else {
+            throw "Inno Setup compiler is not a regular non-reparse file at $iscc"
+          }
+          $isccHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $iscc).Hash.ToLowerInvariant()
+          if ($isccHash -cne $env:INNO_COMPILER_SHA256) {
+            throw "Unexpected Inno Setup compiler SHA-256: $isccHash"
+          }
+          "INNO_ISCC=$iscc" >> $env:GITHUB_ENV
+          "INNO_ISCC_SHA256=$($env:INNO_COMPILER_SHA256)" >> $env:GITHUB_ENV
+          "INNO_ISCC_SIZE=$($env:INNO_COMPILER_SIZE)" >> $env:GITHUB_ENV
 
       - name: Build and normalize Windows installer
         shell: pwsh
         run: |
-          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          $iscc = $env:INNO_ISCC
           if (-not (Test-Path $iscc)) { throw "Inno Setup compiler not found at $iscc" }
+          $isccFile = Get-Item -LiteralPath $iscc
+          if ($isccFile.PSIsContainer -or ($isccFile.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Inno Setup compiler is not a regular non-reparse file at $iscc"
+          }
+          if ($isccFile.Length -ne [int64]$env:INNO_ISCC_SIZE) {
+            throw "Unexpected Inno Setup compiler size before use: $($isccFile.Length)"
+          }
+          $isccHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $iscc).Hash.ToLowerInvariant()
+          if ($isccHash -cne $env:INNO_ISCC_SHA256) {
+            throw "Unexpected Inno Setup compiler SHA-256 before use: $isccHash"
+          }
           & $iscc "/DAppVersion=$env:APP_VERSION" installer\scribe.iss
           if ($LASTEXITCODE -ne 0) { throw "Inno Setup compilation failed with exit code $LASTEXITCODE" }
           $generated = @(Get-ChildItem -Path dist -Filter "Scribe-Setup-$env:APP_VERSION.exe" -File)
           if ($generated.Count -ne 1) { throw "Expected exactly one versioned installer; found $($generated.Count)" }
           Copy-Item -LiteralPath $generated[0].FullName -Destination dist\Scribe-Setup.exe -Force
 
-      - name: Verify complete installer payload
-        shell: pwsh
-        run: |
-          & .\scripts\verify-windows-release-package.ps1 `
-            -BundlePath dist\portable `
-            -InstallerPath dist\Scribe-Setup.exe
-
-      - name: Package verified portable ZIP
+      - name: Package portable ZIP
         shell: pwsh
         run: |
           Compress-Archive -Path dist\portable\* -DestinationPath dist\Scribe-windows-x64.zip -Force
 
+      - name: Verify portable and installer payload parity
+        shell: pwsh
+        run: |
+          & .\scripts\verify-windows-release-package.ps1 `
+            -BundlePath dist\portable `
+            -PortableZipPath dist\Scribe-windows-x64.zip `
+            -InstallerPath dist\Scribe-Setup.exe `
+            -ExerciseStableUpgrade `
+            -EvidenceDirectory dist\installer-verification-logs
+
+      - name: Upload installer verification evidence
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: windows-installer-verification-logs
+          path: dist/installer-verification-logs
+          if-no-files-found: warn
+
       - name: Upload Windows release assets
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: windows-release-assets
           path: |

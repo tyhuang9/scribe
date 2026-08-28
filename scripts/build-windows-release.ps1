@@ -1,21 +1,32 @@
 param(
     [Parameter(Mandatory = $true)]
     [string]$ModelSource,
-    [Parameter(Mandatory = $true)]
-    [string]$RuntimeSource,
     [string]$BundlePath
 )
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
+. (Join-Path $PSScriptRoot "windows-pe-imports.ps1")
+
 $targetTriple = "x86_64-pc-windows-msvc"
 $expectedPeMachine = 0x8664
 $repositoryRoot = [System.IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
-$runtimeManifestPath = Join-Path $repositoryRoot "runtime-manifests\whisper-cpp-v1.9.1-windows-x64.json"
 $modelManifestPath = Join-Path $repositoryRoot "runtime-manifests\whisper-base-en-q8_0-windows-x64.json"
-$runtimeManifest = Get-Content -LiteralPath $runtimeManifestPath -Raw | ConvertFrom-Json
 $modelManifest = Get-Content -LiteralPath $modelManifestPath -Raw | ConvertFrom-Json
+$legalFiles = @(
+    [pscustomobject]@{ Source = "resources/licenses/Apache-2.0.txt"; Destination = "licenses/Apache-2.0.txt" },
+    [pscustomobject]@{ Source = "resources/licenses/OpenAI-Whisper-MIT.txt"; Destination = "licenses/OpenAI-Whisper-MIT.txt" },
+    [pscustomobject]@{ Source = "resources/licenses/Whisper-Base-En-NOTICE.txt"; Destination = "licenses/Whisper-Base-En-NOTICE.txt" },
+    [pscustomobject]@{ Source = "resources/licenses/THIRD-PARTY-NOTICES.txt"; Destination = "licenses/THIRD-PARTY-NOTICES.txt" },
+    [pscustomobject]@{ Source = "native/transcribe-cpp-v0.1.3/LICENSE"; Destination = "licenses/transcribe.cpp-MIT.txt" },
+    [pscustomobject]@{ Source = "native/transcribe-cpp-v0.1.3/PROVENANCE.md"; Destination = "licenses/transcribe.cpp-PROVENANCE.md" },
+    [pscustomobject]@{ Source = "native/whisper-f049fff/LICENSE"; Destination = "licenses/whisper.cpp-MIT.txt" },
+    [pscustomobject]@{ Source = "native/whisper-f049fff/PROVENANCE.md"; Destination = "licenses/whisper.cpp-PROVENANCE.md" },
+    [pscustomobject]@{ Source = "native/sherpa-onnx-v1.13.5/PROVENANCE.md"; Destination = "licenses/sherpa-onnx-PROVENANCE.md" },
+    [pscustomobject]@{ Source = "resources/silero-vad/LICENSE"; Destination = "licenses/Silero-VAD-MIT.txt" },
+    [pscustomobject]@{ Source = "resources/silero-vad/PROVENANCE.md"; Destination = "licenses/Silero-VAD-PROVENANCE.md" }
+)
 
 function Get-NormalizedFullPath([string]$Path) {
     $full = [System.IO.Path]::GetFullPath($Path)
@@ -225,14 +236,98 @@ function Get-RelativeBundlePath([string]$Root, [string]$Path) {
     return [System.Uri]::UnescapeDataString($rootUri.MakeRelativeUri($pathUri).ToString()).Replace('\', '/')
 }
 
+function Assert-SafeRelativePayloadPath([string]$RelativePath) {
+    if ([string]::IsNullOrWhiteSpace($RelativePath) -or
+        [System.IO.Path]::IsPathRooted($RelativePath) -or
+        $RelativePath.Contains('\') -or
+        $RelativePath.Contains(':')) {
+        throw "Release payload contains an unsafe relative path: $RelativePath"
+    }
+    $segments = @($RelativePath.Split('/'))
+    if ($segments.Count -eq 0 -or @($segments | Where-Object { $_ -in @('', '.', '..') }).Count -gt 0) {
+        throw "Release payload contains an unsafe path segment: $RelativePath"
+    }
+}
+
+function Assert-AllowedPayloadFile([string]$RelativePath) {
+    Assert-SafeRelativePayloadPath $RelativePath
+    $lower = $RelativePath.ToLowerInvariant()
+    $segments = @($lower.Split('/'))
+    $leaf = $segments[-1]
+    $extension = [System.IO.Path]::GetExtension($leaf)
+
+    if ($segments -contains 'runtimes' -or
+        $leaf -match '^runtime-manifest(?:\..+)?$' -or
+        $lower -match '(^|/)(?:\.?venv|__pycache__|python(?:\d+(?:\.\d+)*)?|runner)(/|$)' -or
+        $leaf -match '^(?:python(?:\d+(?:\.\d+)*)?|runner)(?:\..+)?$' -or
+        $extension -in @('.pyd', '.py', '.pyc', '.onnx', '.ort')) {
+        throw "Release payload contains a forbidden runtime, Python, runner, or loose ONNX artifact: $RelativePath"
+    }
+    if ($extension -in @('.dll', '.exe') -and $RelativePath -cne 'local-transcriber.exe') {
+        throw "Release payload contains an unallowlisted executable or DLL: $RelativePath"
+    }
+}
+
 function Assert-ExactAllowlist([string]$Root, [string[]]$ExpectedPaths) {
     Assert-TreeHasNoReparsePoints $Root
+    $expectedCaseFolded = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($path in $ExpectedPaths) {
+        Assert-AllowedPayloadFile $path
+        if (-not $expectedCaseFolded.Add($path)) {
+            throw "Release allowlist contains duplicate case-insensitive paths: $path"
+        }
+    }
     $actual = @(Get-ChildItem -LiteralPath $Root -Recurse -File -Force | ForEach-Object {
         Get-RelativeBundlePath $Root $_.FullName
     } | Sort-Object)
+    $actualCaseFolded = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($path in $actual) {
+        Assert-AllowedPayloadFile $path
+        if (-not $actualCaseFolded.Add($path)) {
+            throw "Release payload contains duplicate case-insensitive paths: $path"
+        }
+    }
     $expected = @($ExpectedPaths | Sort-Object)
-    if ($actual.Count -ne $expected.Count -or (Compare-Object -ReferenceObject $expected -DifferenceObject $actual)) {
+    if ($actual.Count -ne $expected.Count -or
+        (Compare-Object -ReferenceObject $expected -DifferenceObject $actual -CaseSensitive)) {
         throw "Release bundle contains files outside the explicit allowlist."
+    }
+
+    $expectedDirectories = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+    foreach ($path in $ExpectedPaths) {
+        $segments = $path.Split('/')
+        for ($index = 1; $index -lt $segments.Count; $index++) {
+            $null = $expectedDirectories.Add(($segments[0..($index - 1)] -join '/'))
+        }
+    }
+    $actualDirectories = @(Get-ChildItem -LiteralPath $Root -Recurse -Directory -Force | ForEach-Object {
+        Get-RelativeBundlePath $Root $_.FullName
+    } | Sort-Object)
+    $expectedDirectoryPaths = @($expectedDirectories | Sort-Object)
+    if ($actualDirectories.Count -ne $expectedDirectoryPaths.Count -or
+        (Compare-Object -ReferenceObject $expectedDirectoryPaths -DifferenceObject $actualDirectories -CaseSensitive)) {
+        throw "Release bundle contains directories outside the explicit allowlist."
+    }
+}
+
+function Assert-ReleaseSmokeDiagnostics([psobject]$Smoke) {
+    if ($null -eq $Smoke) {
+        throw "Offline staged-bundle smoke diagnostics are missing."
+    }
+    $smokeProperties = @($Smoke.PSObject.Properties.Name)
+    foreach ($requiredProperty in @("cancellation_verified", "capabilities", "detected_architecture")) {
+        if ($requiredProperty -notin $smokeProperties) {
+            throw "Offline staged-bundle smoke diagnostics are missing '$requiredProperty'."
+        }
+    }
+    if ($null -eq $Smoke.capabilities -or "cancellation" -notin @($Smoke.capabilities.PSObject.Properties.Name)) {
+        throw "Offline staged-bundle smoke diagnostics are missing 'capabilities.cancellation'."
+    }
+    if (-not $Smoke.cancellation_verified -or -not $Smoke.capabilities.cancellation) {
+        throw "Offline staged-bundle smoke did not verify cancellation."
+    }
+    if ([string]$Smoke.detected_architecture -cne "whisper") {
+        throw "Offline staged-bundle smoke expected detected architecture 'whisper'; received '$($Smoke.detected_architecture)'."
     }
 }
 
@@ -240,8 +335,28 @@ if (-not [Environment]::Is64BitOperatingSystem -or
     [Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
     throw "The release bundle is qualified only for Windows x64."
 }
-if ($runtimeManifest.platform_triple -ne $targetTriple -or $modelManifest.platform_triple -ne $targetTriple) {
-    throw "Release manifests do not match the qualified Windows x64 target triple."
+if ($modelManifest.platform_triple -ne $targetTriple) {
+    throw "The bundled model manifest does not match the qualified Windows x64 target triple."
+}
+$expectedModelAttribution = @(
+    "resources/licenses/Apache-2.0.txt",
+    "resources/licenses/OpenAI-Whisper-MIT.txt",
+    "resources/licenses/Whisper-Base-En-NOTICE.txt"
+)
+$actualModelAttribution = @($modelManifest.attribution_files)
+if ($actualModelAttribution.Count -ne $expectedModelAttribution.Count -or
+    (Compare-Object -ReferenceObject $expectedModelAttribution -DifferenceObject $actualModelAttribution -CaseSensitive)) {
+    throw "The bundled model attribution allowlist changed without release review."
+}
+$legalDestinationNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+foreach ($legalFile in $legalFiles) {
+    Assert-AllowedPayloadFile $legalFile.Destination
+    if (-not $legalDestinationNames.Add($legalFile.Destination)) {
+        throw "The release legal inventory contains a duplicate destination: $($legalFile.Destination)"
+    }
+    $legalSource = Join-Path $repositoryRoot ($legalFile.Source -replace '/', '\')
+    Assert-NoReparseAncestors $legalSource
+    $null = Assert-RegularFile $legalSource
 }
 if (-not $BundlePath) {
     $BundlePath = Join-Path $repositoryRoot "artifacts\Scribe-windows-x64"
@@ -253,10 +368,22 @@ $finalName = Split-Path -Leaf $finalBundle
 if (-not $bundleParent -or -not $finalName) {
     throw "Final release bundle must be a named directory below an existing filesystem root."
 }
-$cargoTargetRoot = Get-NormalizedFullPath (Join-Path $repositoryRoot "target")
-if ([string]::Equals($finalBundle, $cargoTargetRoot, [System.StringComparison]::OrdinalIgnoreCase) -or
-    $finalBundle.StartsWith($cargoTargetRoot + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)) {
-    throw "Cargo target directories are build inputs and cannot be used as distributable release bundles."
+$defaultCargoTargetRoot = Get-NormalizedFullPath (Join-Path $repositoryRoot "target")
+$cargoTargetRoot = if ([string]::IsNullOrWhiteSpace($env:CARGO_TARGET_DIR)) {
+    $defaultCargoTargetRoot
+} else {
+    $cargoTargetCandidate = if ([System.IO.Path]::IsPathFullyQualified($env:CARGO_TARGET_DIR)) {
+        $env:CARGO_TARGET_DIR
+    } else {
+        Join-Path $repositoryRoot $env:CARGO_TARGET_DIR
+    }
+    Get-NormalizedFullPath $cargoTargetCandidate
+}
+foreach ($protectedCargoTargetRoot in @($defaultCargoTargetRoot, $cargoTargetRoot)) {
+    if ([string]::Equals($finalBundle, $protectedCargoTargetRoot, [System.StringComparison]::OrdinalIgnoreCase) -or
+        $finalBundle.StartsWith($protectedCargoTargetRoot + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Cargo target directories are build inputs and cannot be used as distributable release bundles."
+    }
 }
 Assert-NoReparseAncestors $bundleParent
 if (Test-Path -LiteralPath $finalBundle) {
@@ -281,20 +408,8 @@ if (Test-Path -LiteralPath $stagingBundle) {
 }
 
 $modelSourcePath = Get-NormalizedFullPath $ModelSource
-$runtimeSourceRoot = Get-NormalizedFullPath $RuntimeSource
 Assert-NoReparseAncestors $modelSourcePath
-Assert-NoReparseAncestors $runtimeSourceRoot
 Assert-ExactFile $modelSourcePath ([int64]$modelManifest.size_bytes) $modelManifest.sha256
-if (-not (Test-Path -LiteralPath $runtimeSourceRoot -PathType Container)) {
-    throw "Pinned runtime source does not exist: $runtimeSourceRoot"
-}
-foreach ($file in $runtimeManifest.files) {
-    $runtimeSourcePath = Join-Path $runtimeSourceRoot ($file.path -replace '/', '\')
-    Assert-ExactFile $runtimeSourcePath ([int64]$file.size_bytes) $file.sha256
-    if ([System.IO.Path]::GetExtension($runtimeSourcePath) -in @('.dll', '.exe')) {
-        Assert-Amd64Pe $runtimeSourcePath
-    }
-}
 
 Push-Location $repositoryRoot
 try {
@@ -307,10 +422,11 @@ finally {
     Pop-Location
 }
 
-$cargoReleaseRoot = Join-Path $repositoryRoot "target\$targetTriple\release"
+$cargoReleaseRoot = Join-Path $cargoTargetRoot "$targetTriple\release"
 $sourceExecutable = Join-Path $cargoReleaseRoot "local-transcriber.exe"
 Assert-Amd64Pe $sourceExecutable
 Assert-WindowsGuiSubsystem $sourceExecutable
+$null = Assert-ReviewedWindowsPe $sourceExecutable
 
 try {
     New-Item -ItemType Directory -Path $stagingBundle | Out-Null
@@ -318,24 +434,13 @@ try {
     $stagedExecutable = Join-Path $stagingBundle "local-transcriber.exe"
     Copy-Item -LiteralPath $sourceExecutable -Destination $stagedExecutable
 
-    $stagedRuntimeRoot = Join-Path $stagingBundle "runtimes\whisper_cpp"
-    foreach ($file in $runtimeManifest.files) {
-        $relative = $file.path -replace '/', '\'
-        $sourcePath = Join-Path $runtimeSourceRoot $relative
-        $destinationPath = Join-Path $stagedRuntimeRoot $relative
-        New-Item -ItemType Directory -Path (Split-Path -Parent $destinationPath) -Force | Out-Null
-        Copy-Item -LiteralPath $sourcePath -Destination $destinationPath
-    }
-    Copy-Item -LiteralPath $runtimeManifestPath -Destination (Join-Path $stagedRuntimeRoot "runtime-manifest.json")
-
     $stagedModel = Join-Path $stagingBundle $modelManifest.artifact_filename
     Copy-Item -LiteralPath $modelSourcePath -Destination $stagedModel
-    $stagedLicenses = Join-Path $stagingBundle "licenses"
-    New-Item -ItemType Directory -Path $stagedLicenses | Out-Null
-    foreach ($relativePath in $modelManifest.attribution_files) {
-        $sourcePath = Join-Path $repositoryRoot ($relativePath -replace '/', '\')
-        $null = Assert-RegularFile $sourcePath
-        Copy-Item -LiteralPath $sourcePath -Destination $stagedLicenses
+    foreach ($legalFile in $legalFiles) {
+        $sourcePath = Join-Path $repositoryRoot ($legalFile.Source -replace '/', '\')
+        $destinationPath = Join-Path $stagingBundle ($legalFile.Destination -replace '/', '\')
+        New-Item -ItemType Directory -Path (Split-Path -Parent $destinationPath) -Force | Out-Null
+        Copy-Item -LiteralPath $sourcePath -Destination $destinationPath
     }
     $stagedModelManifest = Join-Path $stagingBundle "bundled-model-manifest.json"
     Copy-Item -LiteralPath $modelManifestPath -Destination $stagedModelManifest
@@ -345,41 +450,55 @@ try {
         throw "Could not read the Scribe version from Cargo.toml."
     }
     $portableReadme = Join-Path $stagingBundle "README.txt"
+    $portableReadmeText = @(
+        "Scribe $($versionMatch.Groups[1].Value) - Windows x64 self-contained package",
+        "",
+        "RUN",
+        "Portable: extract the entire archive into a new directory, then run local-transcriber.exe. Keep every packaged file together.",
+        "Installer: the installer copies this exact portable payload into the per-user Scribe program directory and adds only its uninstaller pair.",
+        "",
+        "CONTENTS",
+        "The package contains one Scribe executable, the pinned English Base GGUF, its manifest, a hash inventory, this README, and reviewed license/provenance notices. Native transcribe.cpp, whisper.cpp, sherpa-onnx, and Silero VAD support are statically linked or embedded; there is no runtime folder, helper inference executable, loose DLL, or loose ONNX model.",
+        "Moonshine ONNX weights are not packaged. When requested, Scribe downloads them separately as receipt-backed per-user app-data artifacts.",
+        "",
+        "MANUAL VERIFICATION",
+        "1. Confirm the extracted tree contains no files beyond bundle-inventory.json and every exact path listed in its files array.",
+        "2. For every listed file, compare its byte length and SHA-256 with bundle-inventory.json.",
+        "3. Confirm bundled-model-manifest.json identifies whisper-base.en-Q8_0.gguf as 84,886,208 bytes with SHA-256 3b46ca40bccbf7609c68d88a36d96077a04ca7c87f2060ede06f129fac3e7652.",
+        "4. Confirm local-transcriber.exe is an AMD64 Windows GUI PE and that no additional EXE, DLL, .onnx, .ort, Python, venv, runner, or runtimes directory is present.",
+        "5. For an installer, compare every installed payload file and hash with the portable tree; only unins000.exe and unins000.dat may be additional files in the program directory.",
+        "This release workflow does not claim Authenticode signing. Obtain artifacts from a trusted release channel and verify hashes before running them.",
+        "",
+        "UPGRADES, USER DATA, AND ROLLBACK",
+        "Installing, uninstalling, or replacing the portable program directory is not intended to delete Scribe app-data settings, history, downloaded receipt-backed ONNX bundles, or managed model receipts. Imported GGUF files and external sentinel files remain outside the packaged payload and must not be removed by an upgrade.",
+        "The installer checks an existing Scribe program directory before copying. If it contains an unexpected, legacy, case-colliding, or reparse-point entry, setup refuses safely and does not delete or change that content. You choose whether to back up the program directory, uninstall the previous version, or remove the unexpected entry before retrying.",
+        "To roll back the installer, close Scribe, uninstall the current program payload, and install a previously verified installer. To roll back portable use, close Scribe and launch a previously verified complete portable folder. Do not delete per-user app data or external/imported models as part of rollback.",
+        ""
+    ) -join "`r`n"
     [System.IO.File]::WriteAllText(
         $portableReadme,
-        "Scribe $($versionMatch.Groups[1].Value)`r`n`r`nExtract this entire folder before running local-transcriber.exe. This portable Windows x64 package includes the verified English Base model and compatibility runtime; do not distribute the executable by itself.`r`n",
+        $portableReadmeText,
         [System.Text.UTF8Encoding]::new($false)
     )
 
     Assert-NoReparseAncestors $stagingBundle
     Assert-TreeHasNoReparsePoints $stagingBundle
     Assert-CopyMatchesSource $sourceExecutable $stagedExecutable
-    Assert-CopyMatchesSource $runtimeManifestPath (Join-Path $stagedRuntimeRoot "runtime-manifest.json")
     Assert-CopyMatchesSource $modelManifestPath $stagedModelManifest
-    foreach ($relativePath in $modelManifest.attribution_files) {
-        $sourcePath = Join-Path $repositoryRoot ($relativePath -replace '/', '\')
-        Assert-CopyMatchesSource $sourcePath (Join-Path $stagedLicenses (Split-Path -Leaf $relativePath))
+    foreach ($legalFile in $legalFiles) {
+        $sourcePath = Join-Path $repositoryRoot ($legalFile.Source -replace '/', '\')
+        $destinationPath = Join-Path $stagingBundle ($legalFile.Destination -replace '/', '\')
+        Assert-CopyMatchesSource $sourcePath $destinationPath
     }
     Assert-Amd64Pe $stagedExecutable
     Assert-WindowsGuiSubsystem $stagedExecutable
+    $null = Assert-ReviewedWindowsPe $stagedExecutable
     Assert-ExactFile $stagedModel ([int64]$modelManifest.size_bytes) $modelManifest.sha256
-    foreach ($file in $runtimeManifest.files) {
-        $path = Join-Path $stagedRuntimeRoot ($file.path -replace '/', '\')
-        Assert-ExactFile $path ([int64]$file.size_bytes) $file.sha256
-        if ([System.IO.Path]::GetExtension($path) -in @('.dll', '.exe')) {
-            Assert-Amd64Pe $path
-        }
-    }
-
     $expectedPaths = [System.Collections.Generic.List[string]]::new()
     $null = $expectedPaths.Add("local-transcriber.exe")
-    foreach ($file in $runtimeManifest.files) {
-        $null = $expectedPaths.Add("runtimes/whisper_cpp/$($file.path)")
-    }
-    $null = $expectedPaths.Add("runtimes/whisper_cpp/runtime-manifest.json")
     $null = $expectedPaths.Add($modelManifest.artifact_filename)
-    foreach ($relativePath in $modelManifest.attribution_files) {
-        $null = $expectedPaths.Add("licenses/$(Split-Path -Leaf $relativePath)")
+    foreach ($legalFile in $legalFiles) {
+        $null = $expectedPaths.Add($legalFile.Destination)
     }
     $null = $expectedPaths.Add("bundled-model-manifest.json")
     $null = $expectedPaths.Add("README.txt")
@@ -395,7 +514,6 @@ try {
             [string]$modelManifest.model_id,
             $stagedModel,
             "gguf",
-            "-",
             [string]$modelManifest.size_bytes,
             [string]$modelManifest.sha256,
             "cpu"
@@ -417,21 +535,7 @@ try {
     catch {
         throw "Offline staged-bundle smoke returned invalid JSON: $($_.Exception.Message). Stderr: $($smokeProcess.Stderr.Trim())"
     }
-    $smokeProperties = @($smoke.PSObject.Properties.Name)
-    foreach ($requiredProperty in @("cancellation_verified", "capabilities", "detected_architecture")) {
-        if ($requiredProperty -notin $smokeProperties) {
-            throw "Offline staged-bundle smoke diagnostics are missing '$requiredProperty'."
-        }
-    }
-    if ($null -eq $smoke.capabilities -or "cancellation" -notin @($smoke.capabilities.PSObject.Properties.Name)) {
-        throw "Offline staged-bundle smoke diagnostics are missing 'capabilities.cancellation'."
-    }
-    if (-not $smoke.cancellation_verified -or -not $smoke.capabilities.cancellation) {
-        throw "Offline staged-bundle smoke did not verify cancellation."
-    }
-    if ([string]::IsNullOrWhiteSpace([string]$smoke.detected_architecture)) {
-        throw "Offline staged-bundle smoke did not report the detected model architecture."
-    }
+    Assert-ReleaseSmokeDiagnostics $smoke
 
     $inventoryEntries = @($expectedPaths.ToArray() | Sort-Object | ForEach-Object {
         $path = Join-Path $stagingBundle ($_ -replace '/', '\')

@@ -8,7 +8,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::super::normalize_config;
-use super::{AppConfig, parse_settings_value_with_diagnostics};
+use super::{AppConfig, discard_retired_config_values, parse_settings_value_with_diagnostics};
 
 pub struct SettingsStore {
     path: PathBuf,
@@ -81,9 +81,16 @@ pub(crate) fn load_from_path(path: &Path) -> Result<AppConfig> {
     };
 
     let original = value.clone();
+    let future_schema = original
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        .is_some_and(|version| version > u64::from(super::super::CURRENT_SCHEMA_VERSION));
     let (mut config, diagnostics) = parse_settings_value_with_diagnostics(value);
     normalize_config(&mut config);
-    let rewritten = serde_json::to_value(&config)? != original;
+    // A newer build may attach semantics to fields this build only knows as
+    // flattened JSON. Keep the runtime projection safe, but never rewrite a
+    // future-schema document during load.
+    let rewritten = !future_schema && serde_json::to_value(&config)? != original;
     if rewritten {
         if diagnostics.invalid_values_salvaged {
             backup_corrupt(path)?;
@@ -106,7 +113,6 @@ pub(crate) fn artifact_config_fingerprint(config: &AppConfig) -> Result<String> 
         "managed_models": normalized.general.managed_models,
         "managed_remote_models": normalized.general.managed_remote_models,
         "imported_gguf_models": normalized.general.imported_gguf_models,
-        "managed_runtimes": normalized.general.managed_runtimes,
         "model_paths": normalized.general.model_paths,
     });
     // Preserve fingerprints produced by schema-v2 builds when there is no
@@ -129,6 +135,7 @@ fn serialized_config_bytes(config: &AppConfig) -> Result<Vec<u8>> {
 
 fn normalized_config(config: &AppConfig) -> AppConfig {
     let mut normalized = config.clone();
+    discard_retired_config_values(&mut normalized);
     normalize_config(&mut normalized);
     if normalized.schema_version <= super::super::CURRENT_SCHEMA_VERSION {
         normalized.schema_version = super::super::CURRENT_SCHEMA_VERSION;
@@ -158,6 +165,8 @@ fn backup_corrupt(path: &Path) -> Result<PathBuf> {
 }
 
 fn backup_before_migration(path: &Path) -> Result<PathBuf> {
+    // Keep the historical suffix as a user-visible recovery convention and
+    // for compatibility with existing support tooling documented by Scribe.
     backup_original(path, "pre-v1-migration")
 }
 
@@ -442,6 +451,284 @@ mod tests {
     }
 
     #[test]
+    fn copied_profile_discards_retired_runtime_settings_without_touching_artifacts() {
+        let dir = test_dir("retired-provider-profile");
+        let path = dir.join("config.json");
+        let artifact = dir.join("copied-profile").join("legacy-model.bin");
+        let runtime = dir.join("copied-profile").join("legacy-runner.py");
+        let sentinel = b"legacy-provider-artifact-sentinel\0\xff";
+        fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        fs::write(&artifact, sentinel).unwrap();
+        fs::write(&runtime, b"legacy runner sentinel").unwrap();
+        let artifact_modified = fs::metadata(&artifact).unwrap().modified().unwrap();
+        let runtime_modified = fs::metadata(&runtime).unwrap().modified().unwrap();
+        let original = serde_json::json!({
+            "schema_version": 3,
+            "general": {
+                "selected_default_model": "faster_whisper",
+                "model_storage_dir": dir.join("isolated-model-storage"),
+                "excluded_bundled_model_ids": [crate::model_catalog::BUNDLED_BASE_MODEL_ID],
+                "playground_selected_models": [
+                    "faster_whisper_tiny_en",
+                    "whisper_cpp_small_en"
+                ],
+                "playground_model_order": [
+                    "faster_whisper_tiny_en",
+                    "whisper_cpp_small_en"
+                ],
+                "model_paths": {
+                    "faster_whisper": artifact
+                },
+                "managed_models": {
+                    "faster_whisper_tiny_en": {
+                        "path": artifact,
+                        "source": "copied-profile",
+                        "future_receipt": {"preserved": true}
+                    }
+                },
+                "managed_runtimes": {
+                    "faster_whisper": {
+                        "path": runtime,
+                        "source": "copied-profile",
+                        "future_runtime_receipt": {"preserved": true}
+                    }
+                },
+                "future_general": {"preserved": true}
+            },
+            "future_root": {"preserved": true}
+        });
+        fs::write(&path, serde_json::to_vec_pretty(&original).unwrap()).unwrap();
+
+        let config = load_from_path(&path).unwrap();
+
+        assert!(config.general.selected_default_model.is_empty());
+        assert_eq!(
+            config.general.playground_selected_models,
+            ["whisper_cpp_small_en"]
+        );
+        assert!(!config.general.model_paths.contains_key("faster_whisper"));
+        assert!(
+            !config
+                .general
+                .managed_models
+                .contains_key("faster_whisper_tiny_en")
+        );
+        assert!(!config.general.unknown.contains_key("managed_runtimes"));
+        assert_eq!(
+            config.general.unknown["future_general"],
+            serde_json::json!({"preserved": true})
+        );
+        assert_eq!(
+            config.unknown["future_root"],
+            serde_json::json!({"preserved": true})
+        );
+        assert_eq!(fs::read(&artifact).unwrap(), sentinel);
+        assert_eq!(fs::read(&runtime).unwrap(), b"legacy runner sentinel");
+
+        let rewritten: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(
+            rewritten["general"]["model_paths"]
+                .get("faster_whisper")
+                .is_none()
+        );
+        assert!(
+            rewritten["general"]["managed_models"]
+                .get("faster_whisper_tiny_en")
+                .is_none()
+        );
+        assert!(rewritten["general"].get("managed_runtimes").is_none());
+        assert_eq!(fs::read(&artifact).unwrap(), sentinel);
+        assert_eq!(fs::read(&runtime).unwrap(), b"legacy runner sentinel");
+        assert_eq!(
+            fs::metadata(&artifact).unwrap().modified().unwrap(),
+            artifact_modified
+        );
+        assert_eq!(
+            fs::metadata(&runtime).unwrap().modified().unwrap(),
+            runtime_modified
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn version_three_runtime_retirement_backup_is_exact_and_fields_are_removed() {
+        let dir = test_dir("v3-runtime-retirement-backup");
+        let path = dir.join("config.json");
+        let artifact = dir.join("sentinels").join("legacy-model.bin");
+        let runtime = dir.join("sentinels").join("legacy-runtime.dll");
+        let executable = dir.join("sentinels").join("legacy-whisper-cli.exe");
+        fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        fs::write(&artifact, b"artifact sentinel").unwrap();
+        fs::write(&runtime, b"runtime sentinel").unwrap();
+        fs::write(&executable, b"executable sentinel").unwrap();
+        let artifact_modified = fs::metadata(&artifact).unwrap().modified().unwrap();
+        let runtime_modified = fs::metadata(&runtime).unwrap().modified().unwrap();
+        let executable_modified = fs::metadata(&executable).unwrap().modified().unwrap();
+
+        let managed_runtimes = serde_json::json!({
+            "retired-provider": {
+                "path": runtime,
+                "source": "copied-v3",
+                "opaque": [1, {"sentinel": true}]
+            }
+        });
+        let last_used_backend = serde_json::json!({"id": "retired-provider", "future": [3, 2, 1]});
+        let gpu_device = serde_json::json!({"ordinal": 7, "opaque": true});
+        let cuda_backend = serde_json::json!(runtime);
+        let cuda_libraries = serde_json::json!([runtime.parent().unwrap(), {"future": "value"}]);
+        let executable_value =
+            serde_json::json!({"path": executable, "opaque": {"preserve": true}});
+        let original_value = serde_json::json!({
+            "schema_version": 3,
+            "general": {
+                "selected_default_model": "retired-provider",
+                "model_storage_dir": dir.join("isolated-storage"),
+                "model_paths": {"retired-provider": artifact},
+                "managed_runtimes": managed_runtimes.clone(),
+                "last_used_backend": last_used_backend.clone(),
+                "future_general": {"preserved": true}
+            },
+            "performance": {
+                "whisper_gpu_device": gpu_device.clone(),
+                "whisper_cuda_backend_path": cuda_backend.clone(),
+                "whisper_cuda_library_paths": cuda_libraries.clone(),
+                "future_performance": [1, 2, 3]
+            },
+            "developer": {
+                "whisper_executable_path": executable_value.clone(),
+                "future_developer": "preserved"
+            },
+            "future_root": {"preserved": true}
+        });
+        let original_bytes = serde_json::to_vec_pretty(&original_value).unwrap();
+        fs::write(&path, &original_bytes).unwrap();
+
+        let config = load_from_path(&path).unwrap();
+
+        let backup = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.starts_with("config.json.pre-v1-migration-") && name.ends_with(".bak")
+                    })
+            })
+            .expect("exact v3 pre-migration backup");
+        assert_eq!(fs::read(backup).unwrap(), original_bytes);
+
+        assert_eq!(config.schema_version, super::super::CURRENT_SCHEMA_VERSION);
+        for key in ["managed_runtimes", "last_used_backend"] {
+            assert!(!config.general.unknown.contains_key(key));
+        }
+        for key in [
+            "whisper_gpu_device",
+            "whisper_cuda_backend_path",
+            "whisper_cuda_library_paths",
+        ] {
+            assert!(!config.performance.unknown.contains_key(key));
+        }
+        assert!(
+            !config
+                .developer
+                .unknown
+                .contains_key("whisper_executable_path")
+        );
+        assert_eq!(
+            config.general.unknown["future_general"],
+            serde_json::json!({"preserved": true})
+        );
+        assert_eq!(
+            config.performance.unknown["future_performance"],
+            serde_json::json!([1, 2, 3])
+        );
+        assert_eq!(
+            config.developer.unknown["future_developer"],
+            serde_json::json!("preserved")
+        );
+        assert_eq!(
+            config.unknown["future_root"],
+            serde_json::json!({"preserved": true})
+        );
+
+        let live: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            live["schema_version"],
+            Value::from(super::super::CURRENT_SCHEMA_VERSION)
+        );
+        for key in ["managed_runtimes", "last_used_backend"] {
+            assert!(live["general"].get(key).is_none(), "general.{key}");
+        }
+        for key in [
+            "whisper_gpu_device",
+            "whisper_cuda_backend_path",
+            "whisper_cuda_library_paths",
+        ] {
+            assert!(live["performance"].get(key).is_none(), "performance.{key}");
+        }
+        assert!(
+            live["developer"].get("whisper_executable_path").is_none(),
+            "developer.whisper_executable_path"
+        );
+        assert_eq!(
+            live["general"]["future_general"],
+            serde_json::json!({"preserved": true})
+        );
+        assert_eq!(live["future_root"], serde_json::json!({"preserved": true}));
+
+        assert_eq!(fs::read(&artifact).unwrap(), b"artifact sentinel");
+        assert_eq!(fs::read(&runtime).unwrap(), b"runtime sentinel");
+        assert_eq!(fs::read(&executable).unwrap(), b"executable sentinel");
+        assert_eq!(
+            fs::metadata(&artifact).unwrap().modified().unwrap(),
+            artifact_modified
+        );
+        assert_eq!(
+            fs::metadata(&runtime).unwrap().modified().unwrap(),
+            runtime_modified
+        );
+        assert_eq!(
+            fs::metadata(&executable).unwrap().modified().unwrap(),
+            executable_modified
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn future_schema_load_is_runtime_safe_without_rewriting_the_document() {
+        let dir = test_dir("future-schema");
+        let path = dir.join("config.json");
+        let original = serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": super::super::CURRENT_SCHEMA_VERSION + 1,
+            "general": {
+                "selected_default_model": "retired-provider-model",
+                "managed_runtimes": {"future": {"opaque": [1, 2, 3]}},
+                "future_general": {"preserved": true}
+            },
+            "future_root": {"format": "new"}
+        }))
+        .unwrap();
+        fs::write(&path, &original).unwrap();
+
+        let config = load_from_path(&path).unwrap();
+
+        assert_ne!(
+            config.general.selected_default_model,
+            "retired-provider-model"
+        );
+        assert!(!config.general.unknown.contains_key("managed_runtimes"));
+        assert_eq!(
+            config.general.unknown["future_general"],
+            serde_json::json!({"preserved": true})
+        );
+        assert_eq!(fs::read(&path).unwrap(), original);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn version_two_voice_detection_settings_are_rewritten_and_reload_cleanly() {
         let dir = test_dir("version-two-voice-detection");
         let path = dir.join("config.json");
@@ -602,11 +889,11 @@ mod tests {
         let mut config = AppConfig::default();
         config.general.model_paths.insert(
             "whisper_cpp_small_en".to_owned(),
-            PathBuf::from("models/small.bin"),
+            PathBuf::from("models/small.gguf"),
         );
         config.general.model_paths.insert(
             "whisper_cpp_base_en".to_owned(),
-            PathBuf::from("models/base.bin"),
+            PathBuf::from("models/base.gguf"),
         );
         config.general.unknown.insert(
             "future_z".to_owned(),
@@ -634,7 +921,7 @@ mod tests {
         assert_eq!(artifact_config_fingerprint(&changed).unwrap(), expected);
         changed.general.model_paths.insert(
             "whisper_cpp_tiny_en".to_owned(),
-            PathBuf::from("models/tiny.bin"),
+            PathBuf::from("models/tiny.gguf"),
         );
         assert_ne!(artifact_config_fingerprint(&changed).unwrap(), expected);
 

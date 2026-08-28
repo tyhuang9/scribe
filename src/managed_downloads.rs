@@ -13,9 +13,8 @@ use crate::disk_space::{CanonicalTargetIdentity, DiskSpacePreflight};
 use crate::huggingface_catalog::TrustedArtifact;
 use crate::installations::{
     DownloadedArtifact, InstallCancellation, InstallError, InstallProgress, PinnedArtifact,
-    RetainedPartial, StagedRuntime, discard_pinned_artifact_partial,
-    download_pinned_artifact_for_target, pinned_artifact_disk_space_preflight,
-    pinned_artifact_retained_partial, stage_runtime_archive_for_target,
+    RetainedPartial, discard_pinned_artifact_partial, download_pinned_artifact_for_target,
+    pinned_artifact_disk_space_preflight, pinned_artifact_retained_partial,
 };
 use crate::transcription::ModelId;
 
@@ -58,18 +57,10 @@ pub(crate) fn normalized_onnx_bundle_admission(
     config: &AppConfig,
     model_id: &ModelId,
 ) -> Result<Option<OnnxBundleDownloadAdmission>, InstallError> {
-    let Some(crate::model_catalog::NormalizedInstallArtifact::ReceiptBackedBundle {
-        bundle_id,
-        ..
-    }) = crate::model_catalog::normalized_install_artifact(model_id)
+    let Some(bundle_id) = crate::model_catalog::normalized_receipt_backed_bundle_id(model_id)
     else {
         return Ok(None);
     };
-    if bundle_id != model_id.as_str() || bundle_id != "moonshine-tiny-en-int8-onnx" {
-        return Err(InstallError::Failed(
-            "normalized ONNX bundle identity did not match the supported catalog entry".to_owned(),
-        ));
-    }
     let storage_root = config::onnx_bundle_storage_dir(config);
     let disk = crate::onnx_model_bundles::bundle_disk_space_preflight(bundle_id, &storage_root)?;
     Ok(Some(OnnxBundleDownloadAdmission {
@@ -314,67 +305,6 @@ fn is_safe_relative_gguf(value: &str) -> bool {
                     .to_str()
                     .is_some_and(is_safe_identifier)
         })
-}
-
-#[derive(Debug)]
-pub(crate) struct PreparedRuntimeInstall {
-    pub(crate) staged: StagedRuntime,
-    pub(crate) installed_entrypoint: PathBuf,
-    pub(crate) version: String,
-    pub(crate) package_id: String,
-    pub(crate) archive_sha256: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RuntimePreparationAdmission {
-    pub(crate) archive: ModelDownloadAdmission,
-    pub(crate) staging: DiskSpacePreflight,
-}
-
-pub(crate) fn primary_runtime_preparation_admission(
-    target_root: &Path,
-) -> Result<RuntimePreparationAdmission, InstallError> {
-    let downloads = config::runtime_storage_dir().join(".downloads");
-    let archive_path = downloads.join("whisper-cpp-v1.9.1-windows-x64-cpu.zip");
-    let spec = crate::runtime_catalog::primary_runtime_install_spec(archive_path)
-        .map_err(InstallError::Failed)?;
-    let expanded_bytes = spec.archive.files.iter().try_fold(0_u64, |total, file| {
-        total
-            .checked_add(file.size_bytes)
-            .ok_or_else(|| InstallError::Failed("runtime staging size overflowed".to_owned()))
-    })?;
-    Ok(RuntimePreparationAdmission {
-        archive: download_admission(&spec.archive.artifact)?,
-        staging: crate::disk_space::preflight_download_destination(target_root, expanded_bytes)
-            .map_err(InstallError::Failed)?,
-    })
-}
-
-pub(crate) fn prepare_primary_runtime(
-    target_root: &Path,
-    expected_archive_target_identity: &CanonicalTargetIdentity,
-    cancellation: &InstallCancellation,
-    progress: &dyn Fn(InstallProgress),
-) -> Result<PreparedRuntimeInstall, InstallError> {
-    let downloads = config::runtime_storage_dir().join(".downloads");
-    let archive_path = downloads.join("whisper-cpp-v1.9.1-windows-x64-cpu.zip");
-    let spec = crate::runtime_catalog::primary_runtime_install_spec(archive_path)
-        .map_err(InstallError::Failed)?;
-    let staged = stage_runtime_archive_for_target(
-        &spec.archive,
-        target_root,
-        &spec.compatibility_entrypoint,
-        expected_archive_target_identity,
-        cancellation,
-        progress,
-    )?;
-    Ok(PreparedRuntimeInstall {
-        installed_entrypoint: target_root.join(&spec.compatibility_entrypoint),
-        staged,
-        version: spec.version,
-        package_id: spec.package_id,
-        archive_sha256: spec.archive.artifact.sha256,
-    })
 }
 
 #[cfg(test)]

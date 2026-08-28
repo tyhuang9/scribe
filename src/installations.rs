@@ -4,13 +4,17 @@
 //! selection and smoke testing stay behind `TranscriptionService` and
 //! `RuntimeRouter`.
 
-use std::collections::{HashMap, HashSet};
+#[cfg(test)]
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
+#[cfg(test)]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -281,14 +285,6 @@ pub(crate) struct RuntimeFileSpec {
     pub(crate) sha256: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RuntimeArchiveSpec {
-    pub(crate) package_id: String,
-    pub(crate) artifact: PinnedArtifact,
-    pub(crate) manifest_json: String,
-    pub(crate) files: Vec<RuntimeFileSpec>,
-}
-
 /// One already downloaded, exact file copied into a freshly assembled bundle.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct BundleAssemblyFile {
@@ -309,7 +305,6 @@ pub(crate) struct GeneratedBundleFile {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ActivationPhase {
     Prepared,
-    RuntimeActivated,
     ModelActivated,
     ConfigPersisted,
 }
@@ -324,14 +319,15 @@ struct ActivationJournalDocument {
     manifest_target: Option<PathBuf>,
     #[serde(default)]
     manifest_had_previous: bool,
-    runtime_target: Option<PathBuf>,
-    runtime_had_previous: bool,
-    #[serde(default)]
-    retain_runtime_as_previous: bool,
     #[serde(default)]
     prior_config_fingerprint: Option<String>,
     #[serde(default)]
     expected_config_fingerprint: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+struct ActivationJournalHeader {
+    schema_version: u16,
 }
 
 #[derive(Debug)]
@@ -344,8 +340,6 @@ impl ActivationJournal {
     pub(crate) fn begin(
         path: PathBuf,
         model_target: PathBuf,
-        runtime_target: Option<PathBuf>,
-        retain_runtime_as_previous: bool,
         prior_config_fingerprint: String,
     ) -> Result<Self, InstallError> {
         if path.exists() {
@@ -358,15 +352,12 @@ impl ActivationJournal {
         let journal = Self {
             path,
             document: ActivationJournalDocument {
-                schema_version: 2,
+                schema_version: 3,
                 phase: ActivationPhase::Prepared,
                 model_had_previous: model_target.exists(),
                 manifest_target: None,
                 manifest_had_previous: false,
-                runtime_had_previous: runtime_target.as_ref().is_some_and(|path| path.exists()),
                 model_target,
-                runtime_target,
-                retain_runtime_as_previous,
                 prior_config_fingerprint: Some(prior_config_fingerprint),
                 expected_config_fingerprint: None,
             },
@@ -378,12 +369,7 @@ impl ActivationJournal {
     pub(crate) fn mark(&mut self, phase: ActivationPhase) -> Result<(), InstallError> {
         let legal = matches!(
             (self.document.phase, phase),
-            (ActivationPhase::Prepared, ActivationPhase::RuntimeActivated)
-                | (ActivationPhase::Prepared, ActivationPhase::ModelActivated)
-                | (
-                    ActivationPhase::RuntimeActivated,
-                    ActivationPhase::ModelActivated
-                )
+            (ActivationPhase::Prepared, ActivationPhase::ModelActivated)
                 | (
                     ActivationPhase::ModelActivated,
                     ActivationPhase::ConfigPersisted
@@ -455,7 +441,6 @@ pub(crate) fn reconcile_activation_journal(
     path: &Path,
     allowed_model_targets: &[PathBuf],
     allowed_manifest_targets: &[PathBuf],
-    allowed_runtime_targets: &[PathBuf],
     durable_config_fingerprint: Option<&str>,
 ) -> Result<bool, InstallError> {
     if !path.exists() {
@@ -463,15 +448,23 @@ pub(crate) fn reconcile_activation_journal(
     }
     let bytes = fs::read(path)
         .map_err(|error| failed(format!("failed to read {}: {error}", path.display())))?;
+    let header: ActivationJournalHeader = serde_json::from_slice(&bytes).map_err(|error| {
+        failed(format!(
+            "invalid activation journal {}: {error}",
+            path.display()
+        ))
+    })?;
+    if header.schema_version != 3 {
+        return Err(InstallError::RecoveryRequired(
+            "unsupported activation journal schema".to_owned(),
+        ));
+    }
     let document: ActivationJournalDocument = serde_json::from_slice(&bytes).map_err(|error| {
         failed(format!(
             "invalid activation journal {}: {error}",
             path.display()
         ))
     })?;
-    if document.schema_version != 2 {
-        return Err(failed("unsupported activation journal schema"));
-    }
     if let Some(fingerprint) = document.prior_config_fingerprint.as_deref() {
         validate_sha256(fingerprint)?;
     }
@@ -485,9 +478,6 @@ pub(crate) fn reconcile_activation_journal(
             allowed_manifest_targets,
             "installed-model manifest",
         )?;
-    }
-    if let Some(runtime_target) = document.runtime_target.as_ref() {
-        validate_reconciliation_target(runtime_target, allowed_runtime_targets, "runtime")?;
     }
     let prior_config_is_durable = document
         .prior_config_fingerprint
@@ -504,17 +494,11 @@ pub(crate) fn reconcile_activation_journal(
         if let Some(manifest) = document.manifest_target.as_ref() {
             finalize_file_replacement(manifest)?;
         }
-        if let Some(runtime) = document.runtime_target.as_ref() {
-            finalize_directory_replacement(runtime, document.retain_runtime_as_previous)?;
-        }
     } else if prior_config_is_durable {
         if let Some(manifest) = document.manifest_target.as_ref() {
             restore_file_replacement(manifest, document.manifest_had_previous)?;
         }
         restore_file_replacement(&document.model_target, document.model_had_previous)?;
-        if let Some(runtime) = document.runtime_target.as_ref() {
-            restore_directory_replacement(runtime, document.runtime_had_previous)?;
-        }
     } else {
         return Err(InstallError::RecoveryRequired(format!(
             "durable artifact settings match neither the pre-install nor expected post-install fingerprint for {}; refusing to mutate artifacts",
@@ -1135,6 +1119,7 @@ impl DirectoryReplacement {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn rollback(mut self) -> Result<(), InstallError> {
         remove_path_if_exists(&self.target_root)?;
         if let Some(rollback) = self.rollback_path.take() {
@@ -2363,57 +2348,6 @@ impl DownloadedArtifact {
     }
 }
 
-pub(crate) fn stage_runtime_archive_for_target(
-    spec: &RuntimeArchiveSpec,
-    target_root: &Path,
-    entrypoint_relative: &Path,
-    expected_archive_target_identity: &CanonicalTargetIdentity,
-    cancellation: &InstallCancellation,
-    progress: &dyn Fn(InstallProgress),
-) -> Result<StagedRuntime, InstallError> {
-    let archive = download_pinned_artifact_for_target(
-        &spec.artifact,
-        expected_archive_target_identity,
-        None,
-        cancellation,
-        progress,
-    )?;
-    let stage_root = transaction_path(target_root, "installing")?;
-    remove_path_if_exists(&stage_root)?;
-    fs::create_dir_all(&stage_root).map_err(|error| {
-        failed(format!(
-            "failed to create {}: {error}",
-            stage_root.display()
-        ))
-    })?;
-    let preparation = (|| {
-        extract_runtime_archive(
-            &archive.path,
-            &stage_root,
-            &spec.files,
-            cancellation,
-            progress,
-        )?;
-        verify_runtime_tree(&stage_root, &spec.files)?;
-        let entrypoint = stage_root.join(entrypoint_relative);
-        if !entrypoint.is_file() {
-            return Err(failed(format!(
-                "staged runtime has no entrypoint at {}",
-                entrypoint.display()
-            )));
-        }
-        Ok(())
-    })();
-    if let Err(error) = preparation {
-        let _ = remove_path_if_exists(&stage_root);
-        return Err(error);
-    }
-    Ok(StagedRuntime {
-        root: stage_root,
-        target_root: target_root.to_path_buf(),
-    })
-}
-
 /// Assembles exact, individually verified files into a fresh same-volume
 /// staging directory. A prior crash can leave only the reserved staging path;
 /// the next explicit installation safely replaces that path before doing any
@@ -2677,156 +2611,6 @@ fn write_new_bundle_file(
         .map_err(|error| failed(format!("failed to sync {}: {error}", output.display())))
 }
 
-fn extract_runtime_archive(
-    archive_path: &Path,
-    stage_root: &Path,
-    files: &[RuntimeFileSpec],
-    cancellation: &InstallCancellation,
-    progress: &dyn Fn(InstallProgress),
-) -> Result<(), InstallError> {
-    let file = File::open(archive_path).map_err(|error| {
-        failed(format!(
-            "failed to open {}: {error}",
-            archive_path.display()
-        ))
-    })?;
-    let mut archive = zip::ZipArchive::new(file)
-        .map_err(|error| failed(format!("invalid runtime ZIP: {error}")))?;
-    if archive
-        .has_overlapping_files()
-        .map_err(|error| failed(format!("failed to validate runtime ZIP layout: {error}")))?
-    {
-        return Err(failed("runtime ZIP contains overlapping entries"));
-    }
-    let expected = files
-        .iter()
-        .map(|file| (file.archive_path.clone(), file))
-        .collect::<HashMap<_, _>>();
-    if archive.len() > 256 {
-        return Err(failed("runtime ZIP exceeds the 256-entry safety limit"));
-    }
-    let total = files.iter().try_fold(0_u64, |total, file| {
-        total
-            .checked_add(file.size_bytes)
-            .ok_or_else(|| failed("runtime manifest expanded size overflow"))
-    })?;
-    let mut extracted = 0_u64;
-    let mut found = HashSet::new();
-    for index in 0..archive.len() {
-        if cancellation.is_cancelled() {
-            return Err(InstallError::Cancelled {
-                partial_path: archive_path.to_path_buf(),
-                downloaded_bytes: fs::metadata(archive_path)
-                    .map(|metadata| metadata.len())
-                    .unwrap_or(0),
-            });
-        }
-        let mut entry = archive
-            .by_index(index)
-            .map_err(|error| failed(format!("failed to read runtime ZIP entry: {error}")))?;
-        let enclosed = entry
-            .enclosed_name()
-            .ok_or_else(|| failed(format!("unsafe runtime ZIP path: {}", entry.name())))?;
-        validate_relative_path(&enclosed)?;
-        if entry.unix_mode().is_some_and(|mode| {
-            let file_type = mode & 0o170000;
-            file_type != 0 && file_type != 0o100000 && file_type != 0o040000
-        }) {
-            return Err(failed(format!(
-                "runtime ZIP entry {} is not a regular file or directory",
-                entry.name()
-            )));
-        }
-        if entry.is_dir() {
-            continue;
-        }
-        let Some(file_spec) = expected.get(&enclosed) else {
-            continue;
-        };
-        if !found.insert(enclosed.clone()) {
-            return Err(failed(format!(
-                "runtime ZIP contains duplicate entry {}",
-                enclosed.display()
-            )));
-        }
-        if entry.size() != file_spec.size_bytes {
-            return Err(failed(format!(
-                "runtime ZIP entry {} size mismatch: expected {}, got {}",
-                enclosed.display(),
-                file_spec.size_bytes,
-                entry.size()
-            )));
-        }
-        validate_relative_path(&file_spec.install_path)?;
-        let output = stage_root.join(&file_spec.install_path);
-        ensure_no_symlink_components(stage_root, &file_spec.install_path)?;
-        if let Some(parent) = output.parent() {
-            fs::create_dir_all(parent).map_err(|error| {
-                failed(format!("failed to create {}: {error}", parent.display()))
-            })?;
-        }
-        let mut destination = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&output)
-            .map_err(|error| failed(format!("failed to create {}: {error}", output.display())))?;
-        let mut copied = 0_u64;
-        let mut buffer = [0_u8; BUFFER_BYTES];
-        loop {
-            if cancellation.is_cancelled() {
-                return Err(InstallError::Cancelled {
-                    partial_path: archive_path.to_path_buf(),
-                    downloaded_bytes: copied,
-                });
-            }
-            let count = entry.read(&mut buffer).map_err(|error| {
-                failed(format!("failed to extract {}: {error}", enclosed.display()))
-            })?;
-            if count == 0 {
-                break;
-            }
-            copied = copied
-                .checked_add(count as u64)
-                .ok_or_else(|| failed("runtime extraction size overflow"))?;
-            if copied > file_spec.size_bytes {
-                return Err(failed(format!(
-                    "runtime ZIP entry {} exceeded its pinned size",
-                    enclosed.display()
-                )));
-            }
-            destination.write_all(&buffer[..count]).map_err(|error| {
-                failed(format!("failed to write {}: {error}", output.display()))
-            })?;
-        }
-        if copied != file_spec.size_bytes {
-            return Err(failed(format!(
-                "runtime ZIP entry {} extracted length mismatch",
-                enclosed.display()
-            )));
-        }
-        destination
-            .sync_all()
-            .map_err(|error| failed(format!("failed to finish {}: {error}", output.display())))?;
-        extracted = extracted.saturating_add(copied);
-        progress(InstallProgress {
-            stage: InstallStage::Extracting,
-            completed_bytes: extracted,
-            total_bytes: total,
-            bytes_per_second: None,
-            download_activity: None,
-        });
-    }
-    for file in files {
-        if !found.contains(&file.archive_path) {
-            return Err(failed(format!(
-                "runtime ZIP is missing {}",
-                file.archive_path.display()
-            )));
-        }
-    }
-    Ok(())
-}
-
 pub(crate) fn verify_runtime_tree(
     root: &Path,
     files: &[RuntimeFileSpec],
@@ -3044,6 +2828,7 @@ pub(crate) fn activate_directory(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn rollback_to_previous_runtime(target_root: &Path) -> Result<bool, InstallError> {
     let previous = previous_runtime_root(target_root);
     if !previous.exists() {
@@ -3520,25 +3305,6 @@ pub(crate) fn previous_runtime_root(target_root: &Path) -> PathBuf {
     target_root.with_file_name(format!("{name}.previous"))
 }
 
-pub(crate) fn remove_previous_runtime_if_exists(target_root: &Path) -> Result<bool, InstallError> {
-    let previous = previous_runtime_root(target_root);
-    if !previous.exists() {
-        return Ok(false);
-    }
-    remove_path_if_exists(&previous)?;
-    Ok(true)
-}
-
-pub(crate) fn reconcile_orphaned_previous_runtime(
-    target_root: &Path,
-    runtime_is_configured: bool,
-) -> Result<bool, InstallError> {
-    if runtime_is_configured {
-        return Ok(false);
-    }
-    remove_previous_runtime_if_exists(target_root)
-}
-
 fn directory_rollback_path(target_root: &Path) -> PathBuf {
     let name = target_root
         .file_name()
@@ -3649,6 +3415,7 @@ fn finalize_directory_replacement(
     })
 }
 
+#[cfg(test)]
 fn transaction_path(target: &Path, phase: &str) -> Result<PathBuf, InstallError> {
     let name = target
         .file_name()
@@ -5376,18 +5143,6 @@ mod tests {
         }
     }
 
-    fn write_zip(path: &Path, entries: &[(&str, &[u8])]) {
-        let file = File::create(path).unwrap();
-        let mut archive = zip::ZipWriter::new(file);
-        let options = zip::write::SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Stored);
-        for (name, bytes) in entries {
-            archive.start_file(*name, options).unwrap();
-            archive.write_all(bytes).unwrap();
-        }
-        archive.finish().unwrap();
-    }
-
     #[test]
     fn valid_range_resume_appends_only_the_requested_suffix() {
         let root = unique_root("resume");
@@ -6113,8 +5868,6 @@ mod tests {
         let error = ActivationJournal::begin(
             path.clone(),
             root.join("model.bin"),
-            Some(root.join("runtime")),
-            true,
             format!("{:x}", Sha256::digest(b"prior-config")),
         )
         .unwrap_err();
@@ -6132,15 +5885,12 @@ mod tests {
         let outside = root.join("outside-model.bin");
         fs::write(&outside, b"sentinel").unwrap();
         let document = ActivationJournalDocument {
-            schema_version: 2,
+            schema_version: 3,
             phase: ActivationPhase::Prepared,
             model_target: outside.clone(),
             model_had_previous: false,
             manifest_target: None,
             manifest_had_previous: false,
-            runtime_target: None,
-            runtime_had_previous: false,
-            retain_runtime_as_previous: false,
             prior_config_fingerprint: Some(format!("{:x}", Sha256::digest(b"prior-config"))),
             expected_config_fingerprint: None,
         };
@@ -6149,7 +5899,6 @@ mod tests {
         let error = reconcile_activation_journal(
             &journal_path,
             &[root.join("allowed-model.bin")],
-            &[],
             &[],
             None,
         )
@@ -6166,115 +5915,59 @@ mod tests {
     }
 
     #[test]
-    fn repair_reconciliation_preserves_known_good_previous_runtime() {
-        let root = unique_root("journal-repair-policy");
+    fn legacy_runtime_journal_schema_is_rejected_without_touching_referenced_artifacts() {
+        let root = unique_root("journal-legacy-runtime-schema");
+        fs::create_dir_all(&root).unwrap();
         let journal_path = root.join("activation-journal.json");
-        let model = root.join("model.bin");
-        let runtime = root.join("runtime");
-        let rollback = directory_rollback_path(&runtime);
-        let previous = previous_runtime_root(&runtime);
+        let model = root.join("legacy-model.bin");
+        let runtime = root.join("legacy-runtime");
+        fs::write(&model, b"model-sentinel").unwrap();
         fs::create_dir_all(&runtime).unwrap();
-        fs::create_dir_all(&rollback).unwrap();
-        fs::create_dir_all(&previous).unwrap();
-        fs::write(&model, b"new-model").unwrap();
-        fs::write(runtime.join("version"), b"repaired").unwrap();
-        fs::write(rollback.join("version"), b"unhealthy").unwrap();
-        fs::write(previous.join("version"), b"known-good").unwrap();
-        let durable_new = format!("{:x}", Sha256::digest(b"new-config"));
-        let document = ActivationJournalDocument {
-            schema_version: 2,
-            phase: ActivationPhase::ConfigPersisted,
-            model_target: model.clone(),
-            model_had_previous: false,
-            manifest_target: None,
-            manifest_had_previous: false,
-            runtime_target: Some(runtime.clone()),
-            runtime_had_previous: true,
-            retain_runtime_as_previous: false,
-            prior_config_fingerprint: Some(format!("{:x}", Sha256::digest(b"old-config"))),
-            expected_config_fingerprint: Some(durable_new.clone()),
-        };
-        fs::write(&journal_path, serde_json::to_vec(&document).unwrap()).unwrap();
+        let runtime_sentinel = runtime.join("sentinel.bin");
+        fs::write(&runtime_sentinel, b"runtime-sentinel").unwrap();
+        let model_modified = fs::metadata(&model).unwrap().modified().unwrap();
+        let runtime_modified = fs::metadata(&runtime_sentinel).unwrap().modified().unwrap();
+        let legacy_document = serde_json::json!({
+            "schema_version": 2,
+            "phase": "runtime_activated",
+            "model_target": model,
+            "model_had_previous": true,
+            "manifest_target": null,
+            "manifest_had_previous": false,
+            "runtime_target": runtime,
+            "runtime_had_previous": true,
+            "retain_runtime_as_previous": true,
+            "prior_config_fingerprint": format!("{:x}", Sha256::digest(b"old-config")),
+            "expected_config_fingerprint": format!("{:x}", Sha256::digest(b"new-config")),
+        });
+        let journal_bytes = serde_json::to_vec_pretty(&legacy_document).unwrap();
+        fs::write(&journal_path, &journal_bytes).unwrap();
 
-        assert!(
-            reconcile_activation_journal(
-                &journal_path,
-                std::slice::from_ref(&model),
-                &[],
-                std::slice::from_ref(&runtime),
-                Some(&durable_new),
-            )
-            .unwrap()
-        );
-
-        assert!(!rollback.exists());
-        assert_eq!(fs::read(previous.join("version")).unwrap(), b"known-good");
-        assert!(!journal_path.exists());
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn update_reconciliation_promotes_replaced_runtime_to_previous() {
-        let root = unique_root("journal-update-policy");
-        let journal_path = root.join("activation-journal.json");
-        let model = root.join("model.bin");
-        let runtime = root.join("runtime");
-        let rollback = directory_rollback_path(&runtime);
-        let previous = previous_runtime_root(&runtime);
-        fs::create_dir_all(&runtime).unwrap();
-        fs::create_dir_all(&rollback).unwrap();
-        fs::create_dir_all(&previous).unwrap();
-        fs::write(&model, b"new-model").unwrap();
-        fs::write(runtime.join("version"), b"new").unwrap();
-        fs::write(rollback.join("version"), b"replaced-good").unwrap();
-        fs::write(previous.join("version"), b"older-good").unwrap();
-        let durable_new = format!("{:x}", Sha256::digest(b"new-config"));
-        let document = ActivationJournalDocument {
-            schema_version: 2,
-            phase: ActivationPhase::ConfigPersisted,
-            model_target: model.clone(),
-            model_had_previous: false,
-            manifest_target: None,
-            manifest_had_previous: false,
-            runtime_target: Some(runtime.clone()),
-            runtime_had_previous: true,
-            retain_runtime_as_previous: true,
-            prior_config_fingerprint: Some(format!("{:x}", Sha256::digest(b"old-config"))),
-            expected_config_fingerprint: Some(durable_new.clone()),
-        };
-        fs::write(&journal_path, serde_json::to_vec(&document).unwrap()).unwrap();
-
-        reconcile_activation_journal(
+        let error = reconcile_activation_journal(
             &journal_path,
             std::slice::from_ref(&model),
             &[],
-            std::slice::from_ref(&runtime),
-            Some(&durable_new),
+            Some(&format!("{:x}", Sha256::digest(b"old-config"))),
         )
-        .unwrap();
+        .unwrap_err();
 
-        assert!(!rollback.exists());
-        assert_eq!(
-            fs::read(previous.join("version")).unwrap(),
-            b"replaced-good"
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported activation journal schema")
         );
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn orphaned_previous_runtime_is_preserved_only_while_runtime_is_configured() {
-        let root = unique_root("orphaned-previous");
-        let target = root.join("transcribe-cpp");
-        let previous = previous_runtime_root(&target);
-        fs::create_dir_all(&previous).unwrap();
-        fs::write(previous.join("version"), b"known-good").unwrap();
-
-        assert!(!reconcile_orphaned_previous_runtime(&target, true).unwrap());
-        assert!(previous.exists());
-        assert!(reconcile_orphaned_previous_runtime(&target, false).unwrap());
-        assert!(!previous.exists());
-        assert!(!reconcile_orphaned_previous_runtime(&target, false).unwrap());
-
+        assert!(error.requires_recovery());
+        assert_eq!(fs::read(&journal_path).unwrap(), journal_bytes);
+        assert_eq!(fs::read(&model).unwrap(), b"model-sentinel");
+        assert_eq!(fs::read(&runtime_sentinel).unwrap(), b"runtime-sentinel");
+        assert_eq!(
+            fs::metadata(&model).unwrap().modified().unwrap(),
+            model_modified
+        );
+        assert_eq!(
+            fs::metadata(&runtime_sentinel).unwrap().modified().unwrap(),
+            runtime_modified
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -6290,15 +5983,12 @@ mod tests {
         let expected_new = format!("{:x}", Sha256::digest(b"new-config"));
         let durable_old = format!("{:x}", Sha256::digest(b"old-config"));
         let document = ActivationJournalDocument {
-            schema_version: 2,
+            schema_version: 3,
             phase: ActivationPhase::ModelActivated,
             model_target: model.clone(),
             model_had_previous: true,
             manifest_target: None,
             manifest_had_previous: false,
-            runtime_target: None,
-            runtime_had_previous: false,
-            retain_runtime_as_previous: false,
             prior_config_fingerprint: Some(durable_old.clone()),
             expected_config_fingerprint: Some(expected_new),
         };
@@ -6307,7 +5997,6 @@ mod tests {
         reconcile_activation_journal(
             &journal_path,
             std::slice::from_ref(&model),
-            &[],
             &[],
             Some(&durable_old),
         )
@@ -6333,15 +6022,12 @@ mod tests {
         fs::write(&manifest_rollback, b"old-manifest").unwrap();
         let durable_old = format!("{:x}", Sha256::digest(b"old-config"));
         let document = ActivationJournalDocument {
-            schema_version: 2,
+            schema_version: 3,
             phase: ActivationPhase::ModelActivated,
             model_target: model.clone(),
             model_had_previous: true,
             manifest_target: Some(manifest.clone()),
             manifest_had_previous: true,
-            runtime_target: None,
-            runtime_had_previous: false,
-            retain_runtime_as_previous: false,
             prior_config_fingerprint: Some(durable_old.clone()),
             expected_config_fingerprint: Some(format!("{:x}", Sha256::digest(b"new-config"))),
         };
@@ -6351,7 +6037,6 @@ mod tests {
             &journal_path,
             std::slice::from_ref(&model),
             std::slice::from_ref(&manifest),
-            &[],
             Some(&durable_old),
         )
         .unwrap();
@@ -6373,15 +6058,12 @@ mod tests {
         fs::write(&model_rollback, b"old-model").unwrap();
         let durable_new = format!("{:x}", Sha256::digest(b"new-config"));
         let document = ActivationJournalDocument {
-            schema_version: 2,
+            schema_version: 3,
             phase: ActivationPhase::ModelActivated,
             model_target: model.clone(),
             model_had_previous: true,
             manifest_target: None,
             manifest_had_previous: false,
-            runtime_target: None,
-            runtime_had_previous: false,
-            retain_runtime_as_previous: false,
             prior_config_fingerprint: Some(format!("{:x}", Sha256::digest(b"old-config"))),
             expected_config_fingerprint: Some(durable_new.clone()),
         };
@@ -6390,7 +6072,6 @@ mod tests {
         reconcile_activation_journal(
             &journal_path,
             std::slice::from_ref(&model),
-            &[],
             &[],
             Some(&durable_new),
         )
@@ -6412,15 +6093,12 @@ mod tests {
         fs::write(&model, b"new-model").unwrap();
         fs::write(&model_rollback, b"old-model").unwrap();
         let document = ActivationJournalDocument {
-            schema_version: 2,
+            schema_version: 3,
             phase: ActivationPhase::ModelActivated,
             model_target: model.clone(),
             model_had_previous: true,
             manifest_target: None,
             manifest_had_previous: false,
-            runtime_target: None,
-            runtime_had_previous: false,
-            retain_runtime_as_previous: false,
             prior_config_fingerprint: Some(format!("{:x}", Sha256::digest(b"prior"))),
             expected_config_fingerprint: Some(format!("{:x}", Sha256::digest(b"expected"))),
         };
@@ -6430,7 +6108,6 @@ mod tests {
         let error = reconcile_activation_journal(
             &journal_path,
             std::slice::from_ref(&model),
-            &[],
             &[],
             Some(&unrelated),
         )
@@ -6651,38 +6328,6 @@ mod tests {
     }
 
     #[test]
-    fn actual_zip_traversal_is_rejected_without_writing_outside_stage() {
-        let root = unique_root("zip-traversal");
-        let stage = root.join("stage");
-        fs::create_dir_all(&stage).unwrap();
-        let archive = root.join("runtime.zip");
-        write_zip(
-            &archive,
-            &[("../escape.dll", b"escape"), ("Release/allowed.dll", b"ok")],
-        );
-        let files = [RuntimeFileSpec {
-            archive_path: PathBuf::from("Release/allowed.dll"),
-            install_path: PathBuf::from("bin/allowed.dll"),
-            size_bytes: 2,
-            sha256: format!("{:x}", Sha256::digest(b"ok")),
-        }];
-
-        let error = extract_runtime_archive(
-            &archive,
-            &stage,
-            &files,
-            &InstallCancellation::default(),
-            &|_| {},
-        )
-        .unwrap_err();
-
-        assert!(error.to_string().contains("unsafe runtime ZIP path"));
-        assert!(!root.join("escape.dll").exists());
-        assert!(!stage.join("bin/allowed.dll").exists());
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
     fn local_file_fingerprint_is_canonical_and_exact() {
         let root = unique_root("local-fingerprint");
         fs::create_dir_all(&root).unwrap();
@@ -6754,51 +6399,6 @@ mod tests {
 
         assert!(error.to_string().contains("symbolic link, reparse point"));
         fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn runtime_extraction_requires_every_allowlisted_file_and_honors_cancel() {
-        let missing_root = unique_root("zip-missing");
-        let missing_stage = missing_root.join("stage");
-        fs::create_dir_all(&missing_stage).unwrap();
-        let missing_archive = missing_root.join("runtime.zip");
-        write_zip(&missing_archive, &[("Release/other.dll", b"other")]);
-        let files = [RuntimeFileSpec {
-            archive_path: PathBuf::from("Release/required.dll"),
-            install_path: PathBuf::from("bin/required.dll"),
-            size_bytes: 8,
-            sha256: format!("{:x}", Sha256::digest(b"required")),
-        }];
-        let error = extract_runtime_archive(
-            &missing_archive,
-            &missing_stage,
-            &files,
-            &InstallCancellation::default(),
-            &|_| {},
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("is missing"));
-
-        let cancelled_root = unique_root("zip-cancelled");
-        let cancelled_stage = cancelled_root.join("stage");
-        fs::create_dir_all(&cancelled_stage).unwrap();
-        let cancelled_archive = cancelled_root.join("runtime.zip");
-        write_zip(&cancelled_archive, &[("Release/required.dll", b"required")]);
-        let cancellation = InstallCancellation::default();
-        cancellation.cancel();
-        let error = extract_runtime_archive(
-            &cancelled_archive,
-            &cancelled_stage,
-            &files,
-            &cancellation,
-            &|_| {},
-        )
-        .unwrap_err();
-        assert!(error.is_cancelled());
-        assert!(!cancelled_stage.join("bin/required.dll").exists());
-
-        fs::remove_dir_all(missing_root).unwrap();
-        fs::remove_dir_all(cancelled_root).unwrap();
     }
 
     #[test]

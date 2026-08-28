@@ -6,14 +6,12 @@ use serde_json::Value;
 
 use super::super::{
     HotkeyMode, ImportedGgufModelInstall, ManagedModelInstall, ManagedRemoteModelInstall,
-    ManagedRuntimeInstall, ThemeMode, default_model_storage_dir, default_paste_delay_ms,
-    default_playground_model_order, default_whisper_cuda_backend_path,
-    default_whisper_cuda_library_paths,
+    ThemeMode, default_model_storage_dir, default_paste_delay_ms, default_playground_model_order,
 };
 use crate::model_catalog::BUNDLED_BASE_MODEL_ID;
 use crate::transcription::AccelerationPreference;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 3;
+pub const CURRENT_SCHEMA_VERSION: u32 = 4;
 pub const DEFAULT_SPEECH_CONFIRMATION_MS: u32 = 150;
 pub const DEFAULT_INTERNAL_PAUSE_MS: u32 = 450;
 pub const DEFAULT_ENDPOINT_SILENCE_MS: u32 = 900;
@@ -51,10 +49,8 @@ pub struct GeneralSettings {
     pub managed_models: HashMap<String, ManagedModelInstall>,
     pub managed_remote_models: HashMap<String, ManagedRemoteModelInstall>,
     pub imported_gguf_models: HashMap<String, ImportedGgufModelInstall>,
-    pub managed_runtimes: HashMap<String, ManagedRuntimeInstall>,
     pub model_storage_dir: PathBuf,
     pub model_paths: HashMap<String, PathBuf>,
-    pub last_used_backend: String,
     pub theme_mode: ThemeMode,
     pub close_to_tray: bool,
     #[serde(flatten)]
@@ -98,9 +94,6 @@ pub enum StreamingMode {
 }
 
 impl StreamingMode {
-    #[allow(dead_code)]
-    pub const ALL: [Self; 3] = [Self::Auto, Self::Rolling, Self::FinalOnly];
-
     pub fn label(self) -> &'static str {
         match self {
             Self::Auto => "Auto",
@@ -156,9 +149,6 @@ pub enum OverlayPosition {
 }
 
 impl OverlayPosition {
-    #[allow(dead_code)]
-    pub const ALL: [Self; 2] = [Self::Top, Self::Bottom];
-
     pub fn label(self) -> &'static str {
         match self {
             Self::Top => "Top",
@@ -186,9 +176,6 @@ pub enum HistoryMode {
 }
 
 impl HistoryMode {
-    #[allow(dead_code)]
-    pub const ALL: [Self; 3] = [Self::Off, Self::TranscriptOnly, Self::TranscriptAndAudio];
-
     pub fn label(self) -> &'static str {
         match self {
             Self::Off => "Off",
@@ -235,9 +222,6 @@ impl Default for HistorySettings {
 #[serde(default)]
 pub struct PerformanceSettings {
     pub acceleration_preference: AccelerationPreference,
-    pub whisper_gpu_device: u32,
-    pub whisper_cuda_backend_path: Option<PathBuf>,
-    pub whisper_cuda_library_paths: Vec<PathBuf>,
     #[serde(flatten)]
     pub unknown: UnknownFields,
 }
@@ -245,7 +229,6 @@ pub struct PerformanceSettings {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DeveloperSettings {
-    pub whisper_executable_path: Option<PathBuf>,
     pub debug_mode: bool,
     #[serde(flatten)]
     pub unknown: UnknownFields,
@@ -278,10 +261,8 @@ impl Default for GeneralSettings {
             managed_models: HashMap::new(),
             managed_remote_models: HashMap::new(),
             imported_gguf_models: HashMap::new(),
-            managed_runtimes: HashMap::new(),
             model_storage_dir: default_model_storage_dir(),
             model_paths: HashMap::new(),
-            last_used_backend: "whisper.cpp".to_owned(),
             theme_mode: ThemeMode::Light,
             close_to_tray: true,
             unknown: UnknownFields::new(),
@@ -343,9 +324,6 @@ impl Default for PerformanceSettings {
     fn default() -> Self {
         Self {
             acceleration_preference: AccelerationPreference::Auto,
-            whisper_gpu_device: 0,
-            whisper_cuda_backend_path: default_whisper_cuda_backend_path(),
-            whisper_cuda_library_paths: default_whisper_cuda_library_paths(),
             unknown: UnknownFields::new(),
         }
     }

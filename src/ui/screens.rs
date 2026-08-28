@@ -27,12 +27,12 @@ use super::{
     },
     state::{
         ComparisonPhase, ComparisonResultPhase, ModelCardKey, ModelComparisonState, ModelDialog,
-        ModelDownloadState, ModelLanguageFilter, ModelManagementState, ModelSizeTier,
-        ModelSpeedTier, ModelViewModel, RecordingMode, RemoteCatalogActionKind,
-        RemoteCatalogActionView, RemoteCatalogEntryView, RemoteCatalogStatusKind,
-        RemoteCatalogVariantView, RemoteCatalogView, ResolvedTheme, SettingsSaveState, SettingsTab,
-        TranscribeNotice, TranscribeNoticeTone, TranscribeRecoveryAction, TranscriptionPhase,
-        TranscriptionState, UiRoute,
+        ModelDownloadState, ModelLanguageFilter, ModelManagementState, ModelSpeedTier,
+        ModelViewModel, RecordingMode, RemoteCatalogActionKind, RemoteCatalogActionView,
+        RemoteCatalogEntryView, RemoteCatalogStatusKind, RemoteCatalogVariantView,
+        RemoteCatalogView, ResolvedTheme, SettingsSaveState, SettingsTab, TranscribeNotice,
+        TranscribeNoticeTone, TranscribeRecoveryAction, TranscriptionPhase, TranscriptionState,
+        UiRoute,
     },
     ui_palette,
 };
@@ -516,11 +516,8 @@ pub(crate) enum ScreenAction {
     ClearComparisonReference,
     SelectModel(String),
     InstallModel(String),
-    UpgradeModel(String),
     CancelModelInstall(String),
     DiscardModelPartial(String),
-    RepairModelRuntime(String),
-    MaintainModelRuntime(String),
     ToggleModelCardDetails(ModelCardKey),
     RequestModelRemoval(String),
     ConfirmModelRemoval(String),
@@ -598,11 +595,6 @@ pub(crate) fn render_screen(ui: &mut egui::Ui, view: &ScreenView<'_>) -> ScreenA
             ui,
             "History",
             "Local dictation history remains available in production.",
-        ),
-        UiRoute::About => placeholder(
-            ui,
-            "About",
-            "Scribe keeps audio and transcripts on this device.",
         ),
         UiRoute::Debug => placeholder(
             ui,
@@ -717,8 +709,7 @@ fn route_auto_id_offset(route: UiRoute) -> usize {
         // route-level range.
         UiRoute::Settings(_) => ROUTE_AUTO_ID_STRIDE * 2,
         UiRoute::History => ROUTE_AUTO_ID_STRIDE * 3,
-        UiRoute::About => ROUTE_AUTO_ID_STRIDE * 4,
-        UiRoute::Debug => ROUTE_AUTO_ID_STRIDE * 5,
+        UiRoute::Debug => ROUTE_AUTO_ID_STRIDE * 4,
     }
 }
 
@@ -1735,15 +1726,6 @@ fn transcribe(
     }
 }
 
-#[allow(dead_code)]
-fn metadata(ui: &mut egui::Ui, icon: Icon, text: &str) {
-    ui.label(
-        RichText::new(format!("{}  {text}", icon_glyph(icon)))
-            .small()
-            .color(ui_palette(ui).muted_text),
-    );
-}
-
 fn installed_model_badge_size(ui: &egui::Ui, text: &str, text_color: Color32) -> Vec2 {
     let font = egui::FontId::proportional(12.0);
     let text_width = ui
@@ -2279,49 +2261,13 @@ fn model_row_description(card: ModelCard<'_>) -> String {
     }
 }
 
-fn collapsed_local_model_facts(card: ModelCard<'_>) -> Option<&'static str> {
-    matches!(
-        card,
-        ModelCard::Local(model) if model.id == "moonshine-tiny-en-int8-onnx"
-    )
-    .then_some("Experimental · CPU only · Final text only")
-}
-
-fn render_collapsed_local_model_facts(ui: &mut egui::Ui, card: ModelCard<'_>, expanded: bool) {
-    let _ = expanded;
-    if let Some(facts) = collapsed_local_model_facts(card) {
-        let colors = ui_palette(ui);
-        ui.horizontal(|ui| {
-            for fact in facts.split(" · ") {
-                let response = Frame::none()
-                    .fill(colors.panel_bg)
-                    .stroke(Stroke::new(1.0, colors.border))
-                    .rounding(Rounding::same(6.0))
-                    .inner_margin(Margin::symmetric(6.0, 2.0))
-                    .show(ui, |ui| {
-                        ui.label(RichText::new(fact).small().color(colors.muted_text))
-                    })
-                    .inner;
-                ui.ctx().accesskit_node_builder(response.id, |builder| {
-                    builder.set_name(fact);
-                });
-            }
-        });
-    }
-}
-
 fn model_card_accessible_description(card: ModelCard<'_>, expanded: bool) -> Option<String> {
     let _ = expanded;
-    let description = match card {
+    match card {
         ModelCard::Local(model) if model.included && model.installed && model.ready => {
             Some("Installed with Scribe; this model cannot be removed.".to_owned())
         }
         _ => model_download_progress_presentation(card).map(|progress| progress.accessible_text),
-    };
-    match (description, collapsed_local_model_facts(card)) {
-        (Some(description), Some(facts)) => Some(format!("{description}. {facts}")),
-        (None, Some(facts)) => Some(facts.to_owned()),
-        (description, None) => description,
     }
 }
 
@@ -2332,16 +2278,6 @@ fn remote_primary_action(variant: &RemoteCatalogVariantView) -> Option<&RemoteCa
             RemoteCatalogActionKind::Install { .. } | RemoteCatalogActionKind::Use { .. }
         )
     })
-}
-
-fn local_model_primary_action(model: &ModelViewModel) -> ScreenAction {
-    if model.primary_action_installs_upgrade {
-        ScreenAction::UpgradeModel(model.id.clone())
-    } else if model.primary_action_repairs_runtime {
-        ScreenAction::RepairModelRuntime(model.id.clone())
-    } else {
-        ScreenAction::SelectModel(model.id.clone())
-    }
 }
 
 fn remote_variant_accessible_name(
@@ -2465,10 +2401,7 @@ fn model_lifecycle_presentation<'a>(
             }
         }
         ModelCard::Local(model)
-            if matches!(
-                model.download_state,
-                ModelDownloadState::Verifying | ModelDownloadState::Extracting
-            ) =>
+            if matches!(model.download_state, ModelDownloadState::Verifying) =>
         {
             ModelLifecyclePresentation {
                 action: ScreenAction::None,
@@ -2495,65 +2428,35 @@ fn model_lifecycle_presentation<'a>(
             tone: ModelLifecycleTone::DestructiveOutline,
         },
         ModelCard::Local(model) if model.installed => {
-            if model.primary_action_installs_upgrade || model.primary_action_repairs_runtime {
-                let upgrade = model.primary_action_installs_upgrade;
-                ModelLifecyclePresentation {
-                    action: local_model_primary_action(model),
-                    icon: if upgrade {
-                        Icon::Download
-                    } else {
-                        Icon::Refresh
-                    },
-                    label: if upgrade { "Upgrade" } else { "Repair" }.into(),
-                    accessible_name: format!(
-                        "{} {}",
-                        if upgrade { "Upgrade" } else { "Repair" },
-                        model.display_name
-                    ),
-                    enabled: model.primary_action_enabled,
-                    disabled_reason: model.primary_action_disabled_reason.as_deref(),
-                    visible_status: None,
-                    compact_size: None,
-                    tone: ModelLifecycleTone::Standard,
-                }
-            } else {
-                let reason = (!model.removal_supported)
-                    .then_some(
-                        "This model is not an app-managed download and cannot be removed here.",
+            let reason = (!model.removal_supported)
+                .then_some("This model is not an app-managed download and cannot be removed here.")
+                .or_else(|| {
+                    (model.selected && !can_replace_active).then_some(
+                        "Install another ready model before removing the selected model.",
                     )
-                    .or_else(|| {
-                        (model.selected && !model.legacy_cleanup_pending && !can_replace_active)
-                            .then_some(
-                                "Install another ready model before removing the selected model.",
-                            )
-                    });
-                ModelLifecyclePresentation {
-                    action: ScreenAction::RequestModelRemoval(model.id.clone()),
-                    icon: Icon::Trash,
-                    label: "Delete".into(),
-                    accessible_name: format!("Delete {}", model.display_name),
-                    enabled: reason.is_none(),
-                    disabled_reason: reason,
-                    visible_status: None,
-                    compact_size: None,
-                    tone: ModelLifecycleTone::DestructiveOutline,
-                }
+                });
+            ModelLifecyclePresentation {
+                action: ScreenAction::RequestModelRemoval(model.id.clone()),
+                icon: Icon::Trash,
+                label: "Delete".into(),
+                accessible_name: format!("Delete {}", model.display_name),
+                enabled: reason.is_none(),
+                disabled_reason: reason,
+                visible_status: None,
+                compact_size: None,
+                tone: ModelLifecycleTone::DestructiveOutline,
             }
         }
         ModelCard::Local(model) => {
-            let receipt_needs_repair = model.id == "moonshine-tiny-en-int8-onnx"
-                && model.download_state == ModelDownloadState::Failed
+            let receipt_needs_repair = model.download_state == ModelDownloadState::Failed
                 && model.primary_action_label == "Repair model";
             let (action, label) = if model.bundled || receipt_needs_repair {
                 (ScreenAction::InstallModel(model.id.clone()), "Repair")
-            } else if model.primary_action_installs_upgrade {
-                (ScreenAction::UpgradeModel(model.id.clone()), "Upgrade")
             } else {
                 (
                     ScreenAction::InstallModel(model.id.clone()),
                     match model.download_state {
                         ModelDownloadState::Failed
-                        | ModelDownloadState::Cancelled
                         | ModelDownloadState::Paused
                         | ModelDownloadState::PartialRetained
                             if model.partial_cleanup_available =>
@@ -2568,8 +2471,7 @@ fn model_lifecycle_presentation<'a>(
                 action,
                 icon: if matches!(
                     model.download_state,
-                    ModelDownloadState::Cancelled
-                        | ModelDownloadState::Failed
+                    ModelDownloadState::Failed
                         | ModelDownloadState::Paused
                         | ModelDownloadState::PartialRetained
                 ) && model.partial_cleanup_available
@@ -2580,11 +2482,7 @@ fn model_lifecycle_presentation<'a>(
                 },
                 label: label.into(),
                 accessible_name: format!("{label} {}", model.display_name),
-                enabled: if model.primary_action_installs_upgrade {
-                    model.primary_action_enabled
-                } else {
-                    model.install_action_enabled
-                },
+                enabled: model.install_action_enabled,
                 disabled_reason: model.primary_action_disabled_reason.as_deref().or_else(|| {
                     (!model.install_supported)
                         .then_some("This model has no supported managed download in this build.")
@@ -2724,8 +2622,7 @@ fn model_lifecycle_controls<'a>(
                 || paused_transfer
                 || (matches!(
                     model.download_state,
-                    ModelDownloadState::Cancelled
-                        | ModelDownloadState::Failed
+                    ModelDownloadState::Failed
                         | ModelDownloadState::Paused
                         | ModelDownloadState::PartialRetained
                 ) && model.partial_cleanup_available) =>
@@ -4367,7 +4264,6 @@ fn render_unified_model_card(
             let description_width = card_content_width;
             description_fade_rect =
                 render_model_description(ui, &description, description_width, 26.0, expanded);
-            render_collapsed_local_model_facts(ui, card, expanded);
             ui.horizontal(|ui| {
                 rating_meter(
                     ui,
@@ -4439,7 +4335,6 @@ fn render_unified_model_card(
                                 26.0,
                                 expanded,
                             );
-                            render_collapsed_local_model_facts(ui, card, expanded);
                             ui.add_space(4.0);
                             let metadata_group_width = identity_width * 0.60;
                             let metadata_cell_width = identity_width * 0.30;
@@ -4757,13 +4652,13 @@ fn render_unified_model_card(
 fn render_inline_model_details(
     ui: &mut egui::Ui,
     card: ModelCard<'_>,
-    can_replace_active: bool,
-    restore_remove_focus: bool,
-    focus_within: &mut bool,
-    action: &mut ScreenAction,
-    activation_exclusions: &mut Vec<egui::Rect>,
+    _can_replace_active: bool,
+    _restore_remove_focus: bool,
+    _focus_within: &mut bool,
+    _action: &mut ScreenAction,
+    _activation_exclusions: &mut Vec<egui::Rect>,
 ) -> bool {
-    let mut restored_remove_focus = false;
+    let restored_remove_focus = false;
     ui.vertical(|ui| {
         ui.spacing_mut().item_spacing.y = 0.0;
         let colors = ui_palette(ui);
@@ -4792,70 +4687,7 @@ fn render_inline_model_details(
         #[cfg(test)]
         register_model_layout_rect(ui, model_name, "requirements content", _requirements.rect);
         match card {
-            ModelCard::Local(model) => {
-                let maintenance =
-                    model.runtime_action_label.is_some() || model.legacy_cleanup_pending;
-                if maintenance {
-                    render_model_layout_gap(ui, model_name, "requirements maintenance gap", 12.0);
-                    let _maintenance_heading = detail_heading(ui, "MAINTENANCE", colors);
-                    #[cfg(test)]
-                    register_model_layout_rect(
-                        ui,
-                        model_name,
-                        "maintenance heading",
-                        _maintenance_heading.rect,
-                    );
-                    render_model_layout_gap(ui, model_name, "maintenance heading content gap", 6.0);
-                }
-                if let Some(label) = model.runtime_action_label.as_deref() {
-                    let runtime_name = format!("{label} runtime for {}", model.display_name);
-                    let response = model_lifecycle_button(
-                        ui,
-                        label,
-                        &runtime_name,
-                        model.runtime_action_enabled,
-                        model.runtime_action_disabled_reason.as_deref(),
-                        ModelLifecycleTone::Standard,
-                        None,
-                    );
-                    *focus_within |= response.has_focus();
-                    activation_exclusions.push(response.rect);
-                    if response.clicked() && model.runtime_action_enabled {
-                        *action = ScreenAction::MaintainModelRuntime(model.id.clone());
-                    }
-                }
-                if model.legacy_cleanup_pending {
-                    let removal_reason = (!model.removal_supported)
-                        .then_some(
-                            "This model is not an app-managed download and cannot be removed here.",
-                        )
-                        .or_else(|| {
-                            (model.selected && !model.legacy_cleanup_pending && !can_replace_active)
-                                .then_some(
-                                "Install another ready model before removing the selected model.",
-                            )
-                        });
-                    let removal_name = format!("Delete {}", model.display_name);
-                    let removal = model_lifecycle_button(
-                        ui,
-                        "Delete",
-                        &removal_name,
-                        removal_reason.is_none(),
-                        removal_reason,
-                        ModelLifecycleTone::DestructiveOutline,
-                        None,
-                    );
-                    *focus_within |= removal.has_focus();
-                    activation_exclusions.push(removal.rect);
-                    if restore_remove_focus {
-                        removal.request_focus();
-                        restored_remove_focus = true;
-                    }
-                    if removal.clicked() && removal_reason.is_none() {
-                        *action = ScreenAction::RequestModelRemoval(model.id.clone());
-                    }
-                }
-            }
+            ModelCard::Local(_) => {}
             ModelCard::Remote(entry, variant) => {
                 render_model_layout_gap(ui, model_name, "requirements provenance gap", 12.0);
                 let provenance_heading = detail_heading(ui, "PROVENANCE", colors);
@@ -5846,9 +5678,7 @@ fn model_download_progress_presentation(
                     | ModelDownloadState::Paused
             ) || (matches!(
                 model.download_state,
-                ModelDownloadState::Cancelled
-                    | ModelDownloadState::Failed
-                    | ModelDownloadState::PartialRetained
+                ModelDownloadState::Failed | ModelDownloadState::PartialRetained
             ) && model.partial_cleanup_available) =>
         {
             (model.downloaded_bytes, model.total_bytes)
@@ -5939,12 +5769,7 @@ fn model_download_activity_visible_status(state: ModelDownloadState) -> Option<S
 
 fn model_download_semantic_status(card: ModelCard<'_>) -> Option<String> {
     match card {
-        ModelCard::Local(model)
-            if matches!(
-                model.download_state,
-                ModelDownloadState::Verifying | ModelDownloadState::Extracting
-            ) =>
-        {
+        ModelCard::Local(model) if model.download_state == ModelDownloadState::Verifying => {
             Some("Installing…".to_owned())
         }
         ModelCard::Local(model) if model.download_state == ModelDownloadState::Paused => {
@@ -6594,7 +6419,6 @@ fn settings(
         let status = match settings.save_state {
             SettingsSaveState::Saving => "Saving…",
             SettingsSaveState::Failed => "Couldn’t save changes",
-            SettingsSaveState::Saved => "Changes saved",
             _ => "Changes save automatically",
         };
         let response = ui.label(
@@ -6602,7 +6426,7 @@ fn settings(
         );
         if matches!(
             settings.save_state,
-            SettingsSaveState::Saving | SettingsSaveState::Saved | SettingsSaveState::Failed
+            SettingsSaveState::Saving | SettingsSaveState::Failed
         ) {
             ui.ctx().accesskit_node_builder(response.id, |builder| {
                 builder.set_live(egui::accesskit::Live::Polite);
@@ -8608,28 +8432,6 @@ fn format_elapsed(elapsed_ms: u64) -> String {
         (elapsed_ms / 1_000) % 60
     )
 }
-#[allow(dead_code)]
-fn speed_label(tier: ModelSpeedTier) -> &'static str {
-    match tier {
-        ModelSpeedTier::VeryFast => "Very Fast",
-        ModelSpeedTier::Fast => "Fast",
-        ModelSpeedTier::Balanced => "Balanced Speed",
-        ModelSpeedTier::AccurateSlow => "Accurate, slower",
-        ModelSpeedTier::Unknown => "Speed unknown",
-    }
-}
-#[allow(dead_code)]
-fn size_label(tier: ModelSizeTier) -> &'static str {
-    match tier {
-        ModelSizeTier::Tiny => "Tiny Size",
-        ModelSizeTier::Small => "Small Size",
-        ModelSizeTier::Base => "Base Size",
-        ModelSizeTier::Medium => "Medium Size",
-        ModelSizeTier::Large => "Large Size",
-        ModelSizeTier::Unknown => "Size unknown",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -9426,42 +9228,33 @@ mod tests {
         let bounds = delete.bounds().expect("Delete target bounds");
         assert!(bounds.width() >= 44.0 && bounds.height() >= 44.0);
 
-        for model in [
-            ModelViewModel {
-                installed: true,
-                download_state: ModelDownloadState::Installed,
-                primary_action_installs_upgrade: true,
-                ..Default::default()
+        for download_state in [
+            ModelDownloadState::Downloading,
+            ModelDownloadState::Stalled,
+            ModelDownloadState::Retrying {
+                attempt: 1,
+                max_attempts: 3,
             },
-            ModelViewModel {
-                installed: true,
-                download_state: ModelDownloadState::Installed,
-                primary_action_repairs_runtime: true,
-                ..Default::default()
-            },
-            ModelViewModel {
-                download_state: ModelDownloadState::Downloading,
-                ..Default::default()
-            },
-            ModelViewModel {
-                download_state: ModelDownloadState::Downloading,
-                ..Default::default()
-            },
+            ModelDownloadState::Queued,
+            ModelDownloadState::WaitingForVerification,
+            ModelDownloadState::Verifying,
         ] {
+            let model = ModelViewModel {
+                download_state,
+                ..Default::default()
+            };
             assert_eq!(
                 model_lifecycle_presentation(ModelCard::Local(&model), true).tone,
                 ModelLifecycleTone::Standard
             );
         }
 
-        for state in [ModelDownloadState::Failed, ModelDownloadState::Cancelled] {
-            let model = ModelViewModel {
-                download_state: state,
-                ..Default::default()
-            };
-            let presentation = model_lifecycle_presentation(ModelCard::Local(&model), true);
-            assert_eq!(presentation.tone, ModelLifecycleTone::InverseFilled);
-        }
+        let model = ModelViewModel {
+            download_state: ModelDownloadState::Failed,
+            ..Default::default()
+        };
+        let presentation = model_lifecycle_presentation(ModelCard::Local(&model), true);
+        assert_eq!(presentation.tone, ModelLifecycleTone::InverseFilled);
     }
 
     #[test]
@@ -9523,7 +9316,7 @@ mod tests {
     }
 
     #[test]
-    fn moonshine_collapsed_facts_and_receipt_repair_are_runtime_neutral() {
+    fn moonshine_badges_are_absent_and_receipt_repair_remains_generic() {
         let moonshine = ModelViewModel {
             id: "moonshine-tiny-en-int8-onnx".into(),
             display_name: "Moonshine Tiny — English".into(),
@@ -9534,21 +9327,50 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            collapsed_local_model_facts(ModelCard::Local(&moonshine)),
-            Some("Experimental · CPU only · Final text only")
-        );
-        assert_eq!(
             model_card_accessible_description(ModelCard::Local(&moonshine), false).as_deref(),
-            Some("Experimental · CPU only · Final text only")
+            None
         );
         assert_eq!(
             model_card_accessible_description(ModelCard::Local(&moonshine), true).as_deref(),
-            Some("Experimental · CPU only · Final text only")
+            None
         );
         let presentation = model_lifecycle_presentation(ModelCard::Local(&moonshine), true);
+        assert_eq!(
+            presentation.action,
+            ScreenAction::InstallModel(moonshine.id.clone())
+        );
         assert_eq!(presentation.label, "Repair");
+        assert_eq!(
+            presentation.accessible_name,
+            "Repair Moonshine Tiny — English"
+        );
         assert_eq!(presentation.visible_status.as_deref(), Some("Needs repair"));
         assert!(presentation.enabled);
+
+        let controls = model_lifecycle_controls(ModelCard::Local(&moonshine), true);
+        let primary = controls.primary.expect("receipt repair stays visible");
+        assert_eq!(primary.label, "Repair");
+        assert_eq!(primary.accessible_name, "Repair Moonshine Tiny — English");
+        assert_eq!(primary.visible_status.as_deref(), Some("Needs repair"));
+        assert!(primary.enabled);
+
+        let another_receipt_bundle = ModelViewModel {
+            id: "catalog-receipt-bundle-fixture".into(),
+            display_name: "Catalog Receipt Bundle".into(),
+            install_supported: true,
+            install_action_enabled: true,
+            primary_action_label: "Repair model".into(),
+            download_state: ModelDownloadState::Failed,
+            ..Default::default()
+        };
+        let presentation =
+            model_lifecycle_presentation(ModelCard::Local(&another_receipt_bundle), true);
+        assert_eq!(presentation.label, "Repair");
+        assert_eq!(
+            presentation.accessible_name,
+            "Repair Catalog Receipt Bundle"
+        );
+        assert_eq!(presentation.visible_status.as_deref(), Some("Needs repair"));
     }
 
     #[test]
@@ -9649,18 +9471,16 @@ mod tests {
 
     #[test]
     fn settled_download_without_partial_keeps_install_primary_and_never_uses_play_or_warning() {
-        for download_state in [ModelDownloadState::Failed, ModelDownloadState::Cancelled] {
-            let model = ModelViewModel {
-                display_name: "Settled local model".into(),
-                download_state,
-                partial_cleanup_available: false,
-                ..Default::default()
-            };
-            let primary = model_lifecycle_presentation(ModelCard::Local(&model), true);
-            assert_eq!(primary.label, "Install");
-            assert_eq!(primary.icon, Icon::Download);
-            assert_eq!(primary.tone, ModelLifecycleTone::InverseFilled);
-        }
+        let model = ModelViewModel {
+            display_name: "Settled local model".into(),
+            download_state: ModelDownloadState::Failed,
+            partial_cleanup_available: false,
+            ..Default::default()
+        };
+        let primary = model_lifecycle_presentation(ModelCard::Local(&model), true);
+        assert_eq!(primary.label, "Install");
+        assert_eq!(primary.icon, Icon::Download);
+        assert_eq!(primary.tone, ModelLifecycleTone::InverseFilled);
     }
 
     #[test]
@@ -10941,21 +10761,19 @@ mod tests {
     }
 
     #[test]
-    fn local_retained_partial_bytes_project_after_failed_and_cancelled_restarts() {
-        for state in [ModelDownloadState::Failed, ModelDownloadState::Cancelled] {
-            let model = ModelViewModel {
-                download_state: state,
-                partial_cleanup_available: true,
-                downloaded_bytes: 82_000_000,
-                total_bytes: Some(100_000_000),
-                ..Default::default()
-            };
-            let progress = model_download_progress_presentation(ModelCard::Local(&model))
-                .expect("retained local partial projects after restart");
-            assert_eq!(progress.downloaded_bytes, 82_000_000);
-            assert_eq!(progress.total_bytes, Some(100_000_000));
-            assert_eq!(progress.display_text, "82.0MB / 100.0MB");
-        }
+    fn local_retained_partial_bytes_project_after_failed_restart() {
+        let model = ModelViewModel {
+            download_state: ModelDownloadState::Failed,
+            partial_cleanup_available: true,
+            downloaded_bytes: 82_000_000,
+            total_bytes: Some(100_000_000),
+            ..Default::default()
+        };
+        let progress = model_download_progress_presentation(ModelCard::Local(&model))
+            .expect("retained local partial projects after restart");
+        assert_eq!(progress.downloaded_bytes, 82_000_000);
+        assert_eq!(progress.total_bytes, Some(100_000_000));
+        assert_eq!(progress.display_text, "82.0MB / 100.0MB");
     }
 
     #[test]
@@ -13387,51 +13205,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_model_upgrade_primary_dispatches_upgrade_action() {
-        let model = ModelViewModel {
-            id: "whisper_cpp_small_en".into(),
-            display_name: "Whisper Small — English".into(),
-            installed: false,
-            legacy_cleanup_pending: true,
-            download_state: ModelDownloadState::NotInstalled,
-            primary_action_label: "Upgrade model".into(),
-            primary_action_enabled: true,
-            primary_action_installs_upgrade: true,
-            removal_supported: true,
-            ..Default::default()
-        };
-        let current = ModelViewModel {
-            id: "whisper_cpp_tiny_en".into(),
-            installed: true,
-            ready: true,
-            ..Default::default()
-        };
-        let catalog = vec![current, model.clone()];
-        let remote_catalog = RemoteCatalogView::default();
-        let (installed, available) = build_model_card_lists(
-            &catalog,
-            &catalog,
-            &remote_catalog,
-            ModelLanguageFilter::All,
-        );
-
-        assert_eq!(installed.len(), 1);
-        assert_eq!(available.len(), 1);
-        assert_eq!(
-            installed[0].key(),
-            ModelCardKey::Local("whisper_cpp_tiny_en".into())
-        );
-        assert_eq!(
-            available[0].key(),
-            ModelCardKey::Local("whisper_cpp_small_en".into())
-        );
-        assert_eq!(
-            local_model_primary_action(&model),
-            ScreenAction::UpgradeModel("whisper_cpp_small_en".into())
-        );
-    }
-
-    #[test]
     fn remote_catalog_cards_apply_query_language_and_duplicate_filters() {
         let known_local = ModelViewModel {
             id: "known-local".into(),
@@ -13883,9 +13656,8 @@ mod tests {
         let routes = [
             UiRoute::Transcribe,
             UiRoute::Models,
-            UiRoute::Settings(SettingsTab::General),
+            UiRoute::Settings(SettingsTab::About),
             UiRoute::History,
-            UiRoute::About,
             UiRoute::Debug,
         ];
         for (index, route) in routes.iter().enumerate() {
@@ -14247,7 +14019,7 @@ mod tests {
             UiRoute::Transcribe,
             UiRoute::Models,
             UiRoute::Settings(SettingsTab::Advanced),
-            UiRoute::About,
+            UiRoute::Settings(SettingsTab::About),
             UiRoute::Debug,
         ] {
             for (state_name, records, loading, expected_status) in history_states {
