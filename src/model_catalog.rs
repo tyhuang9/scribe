@@ -662,10 +662,10 @@ pub(crate) fn validate_catalog() -> Result<(), String> {
     validate_manifests(MODELS)
 }
 
-fn cached_validation<'a>(
-    cache: &'a OnceLock<Result<(), String>>,
+fn cached_validation(
+    cache: &OnceLock<Result<(), String>>,
     validate: impl FnOnce() -> Result<(), String>,
-) -> &'a Result<(), String> {
+) -> &Result<(), String> {
     cache.get_or_init(validate)
 }
 

@@ -8481,15 +8481,14 @@ impl LocalTranscriberApp {
             model_id.to_owned(),
             ModelInstallStatus::Error(message.clone()),
         );
-        if !self.remote_catalog.local_models_dirty {
-            if let Some(model) = Arc::make_mut(&mut self.remote_catalog.local_models)
+        if !self.remote_catalog.local_models_dirty
+            && let Some(model) = Arc::make_mut(&mut self.remote_catalog.local_models)
                 .iter_mut()
                 .find(|model| model.id == model_id)
-            {
-                model.download_state = ModelDownloadState::Failed;
-                model.error_message = Some(message.clone());
-                model.cancel_supported = false;
-            }
+        {
+            model.download_state = ModelDownloadState::Failed;
+            model.error_message = Some(message.clone());
+            model.cancel_supported = false;
         }
         self.status = TranscriptionStatus::Error;
         self.status_message = message;
@@ -9910,8 +9909,8 @@ impl LocalTranscriberApp {
             .collect::<HashMap<_, _>>();
         let mut models = Vec::new();
         for model in inventory {
-            let effective_status = self.effective_install_status(&model);
-            let artifact_present = model_artifact_remains_manageable(&model, &effective_status);
+            let effective_status = self.effective_install_status(model);
+            let artifact_present = model_artifact_remains_manageable(model, &effective_status);
             let descriptor = descriptors.get(&model.id).cloned().or_else(|| {
                 // Retained compatibility models stay out of discovery, but an existing
                 // installed model must remain visible so it can be selected or removed.
@@ -9929,7 +9928,7 @@ impl LocalTranscriberApp {
                     ),
                 );
                 models.push(self.model_management_view_model(
-                    &model,
+                    model,
                     descriptor.as_ref(),
                     &partial_inspection,
                 ));
