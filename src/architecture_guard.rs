@@ -824,13 +824,15 @@ fn retired_python_provider_stack_stays_absent_without_crossing_native_boundaries
     for retained_path in [
         "vendor/sherpa-onnx-sys/LICENSE",
         "native/sherpa-onnx-v1.13.5/PROVENANCE.md",
+        "native/transcribe-cpp-v0.1.3/LICENSE",
+        "native/transcribe-cpp-v0.1.3/PROVENANCE.md",
         "native/whisper-f049fff/LICENSE",
         "native/whisper-f049fff/PROVENANCE.md",
         "resources/licenses/Moonshine-MIT.txt",
     ] {
         assert!(
             root.join(retained_path).is_file(),
-            "native Sherpa/Moonshine evidence was removed: {retained_path}"
+            "native transcription/Sherpa/Moonshine evidence was removed: {retained_path}"
         );
     }
 }
@@ -1233,6 +1235,16 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
         r#"artifacts\Scribe-windows-x64"#,
         "Final release bundle already exists",
         "A stale release staging sibling exists",
+        "licenses/THIRD-PARTY-NOTICES.txt",
+        "licenses/transcribe.cpp-MIT.txt",
+        "licenses/transcribe.cpp-PROVENANCE.md",
+        "licenses/whisper.cpp-MIT.txt",
+        "licenses/whisper.cpp-PROVENANCE.md",
+        "licenses/sherpa-onnx-PROVENANCE.md",
+        "licenses/Silero-VAD-MIT.txt",
+        "licenses/Silero-VAD-PROVENANCE.md",
+        "This release workflow does not claim Authenticode signing",
+        "Do not delete per-user app data or external/imported models as part of rollback",
     ] {
         assert!(
             release.contains(required),
