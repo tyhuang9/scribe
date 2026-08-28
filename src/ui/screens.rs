@@ -11,6 +11,7 @@ use eframe::egui::{
 };
 
 use crate::config::SpeechDetectionMode;
+use crate::system_preferences::client_area_animations_enabled;
 
 #[cfg(test)]
 use crate::model_catalog::BUNDLED_BASE_MODEL_ID;
@@ -1865,6 +1866,8 @@ impl ModelCard<'_> {
 struct ModelCardRenderResult {
     action: ScreenAction,
     restored_remove_focus: bool,
+    #[cfg(test)]
+    primary_control_id: Option<egui::Id>,
 }
 
 struct ModelSectionFocus<'a> {
@@ -3083,9 +3086,40 @@ fn compact_model_icon_action(
     disabled_reason: Option<&str>,
     progress: Option<f32>,
 ) -> egui::Response {
+    compact_model_icon_action_with_id(
+        ui,
+        icon,
+        accessible_name,
+        enabled,
+        disabled_reason,
+        progress,
+        None,
+    )
+}
+
+fn compact_model_icon_action_with_id(
+    ui: &mut egui::Ui,
+    icon: Icon,
+    accessible_name: &str,
+    enabled: bool,
+    disabled_reason: Option<&str>,
+    progress: Option<f32>,
+    id: Option<egui::Id>,
+) -> egui::Response {
     let colors = ui_palette(ui);
     let enabled = enabled && ui.is_enabled();
-    let (target, response) = ui.allocate_exact_size(Vec2::splat(44.0), Sense::click());
+    let (target, response) = if let Some(id) = id {
+        let (target, _) = ui.allocate_exact_size(Vec2::splat(44.0), Sense::hover());
+        let response = if enabled {
+            ui.interact(target, id, Sense::click())
+        } else {
+            ui.add_enabled_ui(false, |ui| ui.interact(target, id, Sense::click()))
+                .inner
+        };
+        (target, response)
+    } else {
+        ui.allocate_exact_size(Vec2::splat(44.0), Sense::click())
+    };
     let hovered = response.hovered() && enabled;
     if hovered || response.has_focus() {
         ui.painter()
@@ -3110,11 +3144,22 @@ fn compact_model_icon_action(
             colors.muted_text,
         );
     }
+    decorate_model_lifecycle_button(ui, &response, accessible_name, enabled, disabled_reason);
+    response
+}
+
+fn decorate_model_lifecycle_button(
+    ui: &mut egui::Ui,
+    response: &egui::Response,
+    accessible_name: &str,
+    enabled: bool,
+    disabled_reason: Option<&str>,
+) {
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, accessible_name));
     ui.ctx().accesskit_node_builder(response.id, |builder| {
         builder.set_role(egui::accesskit::Role::Button);
         builder.set_name(accessible_name);
-        builder.set_bounds(accesskit_rect(target));
+        builder.set_bounds(accesskit_rect(response.rect));
         if !enabled {
             builder.set_disabled();
         }
@@ -3123,14 +3168,13 @@ fn compact_model_icon_action(
         }
     });
     if let Some(reason) = disabled_reason {
-        focus_tooltip(ui, &response, reason);
+        focus_tooltip(ui, response, reason);
         response.clone().on_hover_text(reason);
     } else {
-        focus_tooltip(ui, &response, accessible_name);
+        focus_tooltip(ui, response, accessible_name);
         response.clone().on_hover_text(accessible_name);
     }
-    paint_focus_ring(ui, &response, Rounding::same(7.0));
-    response
+    paint_focus_ring(ui, response, Rounding::same(7.0));
 }
 
 fn model_language_filter_control(
@@ -3425,19 +3469,6 @@ fn model_toolbar(
     }
 }
 
-fn model_lifecycle_button_width(ui: &egui::Ui, label: &str, tone: ModelLifecycleTone) -> f32 {
-    let text = match tone {
-        ModelLifecycleTone::DestructiveOutline => format!("{}  {label}", icon_glyph(Icon::Trash)),
-        _ => label.to_owned(),
-    };
-    let galley = ui.painter().layout_no_wrap(
-        text,
-        egui::TextStyle::Button.resolve(ui.style()),
-        ui_palette(ui).text,
-    );
-    (galley.size().x + 24.0).max(44.0)
-}
-
 fn model_lifecycle_button(
     ui: &mut egui::Ui,
     label: &str,
@@ -3528,38 +3559,140 @@ fn model_lifecycle_button(
     response
 }
 
+const INSTALLING_SPINNER_REPAINT_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(33);
+
+fn installing_spinner_phase(time_seconds: f64) -> f32 {
+    ((time_seconds * 1.6).rem_euclid(1.0) as f32) * std::f32::consts::TAU
+}
+
+fn installing_spinner_repaint_interval(animations_enabled: bool) -> Option<std::time::Duration> {
+    animations_enabled.then_some(INSTALLING_SPINNER_REPAINT_INTERVAL)
+}
+
+fn paint_installing_spinner(ui: &mut egui::Ui, rect: egui::Rect) {
+    paint_installing_spinner_with_motion(ui, rect, client_area_animations_enabled());
+}
+
+fn paint_installing_spinner_with_motion(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    animations_enabled: bool,
+) {
+    const SEGMENTS: usize = 18;
+    const ARC_SEGMENTS: usize = 12;
+    const RADIUS: f32 = 6.0;
+
+    let center = egui::pos2(rect.left() + 19.0, rect.center().y);
+    let stroke = Stroke::new(1.75, ui_palette(ui).muted_text);
+    if !animations_enabled {
+        ui.painter().circle_stroke(center, RADIUS, stroke);
+        return;
+    }
+    let phase = installing_spinner_phase(ui.input(|input| input.time));
+    let points = (0..=ARC_SEGMENTS)
+        .map(|index| {
+            let angle = phase + std::f32::consts::TAU * index as f32 / SEGMENTS as f32;
+            center + Vec2::angled(angle) * RADIUS
+        })
+        .collect::<Vec<_>>();
+    ui.painter().add(egui::Shape::line(points, stroke));
+    // This is only requested while an installing lifecycle control is visible.
+    // Keeping it local prevents idle model screens from consuming redraws.
+    if let Some(interval) = installing_spinner_repaint_interval(animations_enabled) {
+        ui.ctx().request_repaint_after(interval);
+    }
+}
+
+fn model_lifecycle_installing_button(
+    ui: &mut egui::Ui,
+    label: &str,
+    accessible_name: &str,
+    disabled_reason: Option<&str>,
+    id: egui::Id,
+) -> egui::Response {
+    // Reserve the icon slot in the label instead of drawing the static font
+    // glyph used by the regular lifecycle control.
+    let label = format!("    {label}");
+    let galley = ui.painter().layout_no_wrap(
+        label,
+        egui::TextStyle::Button.resolve(ui.style()),
+        ui.visuals().weak_text_color(),
+    );
+    let padding = ui.spacing().button_padding;
+    let desired_size = galley.size() + 2.0 * padding;
+    let desired_size = Vec2::new(desired_size.x.max(44.0), desired_size.y.max(44.0));
+    let (rect, _) = ui.allocate_exact_size(desired_size, Sense::hover());
+    let retain_focus = ui.memory(|memory| memory.focused()) == Some(id);
+    let response = ui
+        .add_enabled_ui(false, |ui| ui.interact(rect, id, Sense::click()))
+        .inner;
+    if retain_focus {
+        response.request_focus();
+    }
+    let visuals = ui.style().interact(&response);
+    ui.painter().rect(
+        rect.expand2(Vec2::splat(visuals.expansion)),
+        visuals.rounding,
+        visuals.weak_bg_fill,
+        visuals.bg_stroke,
+    );
+    let text_rect = rect.shrink2(padding);
+    ui.painter().galley(
+        ui.layout()
+            .align_size_within_rect(galley.size(), text_rect)
+            .min,
+        galley,
+        visuals.text_color(),
+    );
+    decorate_model_lifecycle_button(ui, &response, accessible_name, false, disabled_reason);
+    paint_installing_spinner(ui, response.rect);
+    response
+}
+
 struct ModelDownloadModuleResponse {
     response: egui::Response,
     cancel_clicked: bool,
     cancel_has_focus: bool,
     discard_clicked: bool,
     discard_has_focus: bool,
+    #[cfg(test)]
+    primary_id: egui::Id,
+}
+
+struct ModelDownloadModuleParams<'a> {
+    progress: &'a ModelDownloadProgressPresentation,
+    primary_id: egui::Id,
+    primary_icon: Icon,
+    cancel_name: &'a str,
+    cancel_enabled: bool,
+    cancel_reason: Option<&'a str>,
+    discard_name: Option<&'a str>,
 }
 
 fn render_model_download_module(
     ui: &mut egui::Ui,
-    progress: &ModelDownloadProgressPresentation,
-    primary_icon: Icon,
-    cancel_name: &str,
-    cancel_enabled: bool,
-    cancel_reason: Option<&str>,
-    discard_name: Option<&str>,
+    params: ModelDownloadModuleParams<'_>,
 ) -> ModelDownloadModuleResponse {
+    let ModelDownloadModuleParams {
+        progress,
+        primary_id,
+        primary_icon,
+        cancel_name,
+        cancel_enabled,
+        cancel_reason,
+        discard_name,
+    } = params;
     let colors = ui_palette(ui);
     let mut cancel_clicked = false;
     let mut cancel_has_focus = false;
     let mut discard_clicked = false;
     let mut discard_has_focus = false;
+    #[cfg(test)]
+    let mut rendered_primary_id = None;
     let available_width = ui.available_width();
-    let discard_width = discard_name.map_or(0.0, |_| {
-        model_lifecycle_button_width(
-            ui,
-            "Discard partial",
-            ModelLifecycleTone::DestructiveOutline,
-        )
-    });
     let controls_width = 44.0
-        + discard_width
+        + if discard_name.is_some() { 44.0 } else { 0.0 }
         + if discard_name.is_some() {
             ui.spacing().item_spacing.x
         } else {
@@ -3623,24 +3756,29 @@ fn render_model_download_module(
                     );
                 };
                 let mut render_controls = |ui: &mut egui::Ui| {
-                    let cancel = compact_model_icon_action(
+                    let cancel = compact_model_icon_action_with_id(
                         ui,
                         primary_icon,
                         cancel_name,
                         cancel_enabled,
                         cancel_reason,
                         None,
+                        Some(primary_id),
                     );
                     cancel_clicked = cancel.clicked();
                     cancel_has_focus = cancel.has_focus();
+                    #[cfg(test)]
+                    {
+                        rendered_primary_id = Some(cancel.id);
+                    }
                     if let Some(discard_name) = discard_name {
-                        let discard = model_lifecycle_button(
+                        let discard = compact_model_icon_action(
                             ui,
-                            "Discard partial",
+                            Icon::Close,
                             discard_name,
                             true,
                             None,
-                            ModelLifecycleTone::DestructiveOutline,
+                            None,
                         );
                         discard_clicked = discard.clicked();
                         discard_has_focus = discard.has_focus();
@@ -3690,6 +3828,9 @@ fn render_model_download_module(
         cancel_has_focus,
         discard_clicked,
         discard_has_focus,
+        #[cfg(test)]
+        primary_id: rendered_primary_id
+            .expect("download module always renders its primary control"),
     }
 }
 
@@ -3949,6 +4090,8 @@ fn render_unified_model_card(
     });
     let mut action = ScreenAction::None;
     let mut restored_remove_focus = false;
+    #[cfg(test)]
+    let primary_control_id = std::cell::Cell::new(None);
     let mut focus_within = false;
     let mut description_fade_rect = None;
     let mut activation_exclusions = Vec::new();
@@ -3974,6 +4117,8 @@ fn render_unified_model_card(
             "{} details for {accessible_card_name}",
             if expanded { "Collapse" } else { "Expand" }
         );
+        let lifecycle_primary_id =
+            ui.make_persistent_id(("model-card-lifecycle-primary", card_key.clone()));
         let render_details =
             |ui: &mut egui::Ui, action: &mut ScreenAction, focus_within: &mut bool| {
                 let details = compact_model_icon_action(
@@ -4003,6 +4148,10 @@ fn render_unified_model_card(
             let Some(primary) = lifecycle.primary.as_ref() else {
                 return ui.allocate_exact_size(Vec2::ZERO, Sense::hover()).1;
             };
+            #[cfg(test)]
+            {
+                primary_control_id.set(Some(lifecycle_primary_id));
+            }
             if let Some(status) = primary.visible_status.as_deref() {
                 let response = ui.label(RichText::new(status).small().color(colors.muted_text));
                 if model_download_semantic_status(card).is_some() {
@@ -4015,6 +4164,18 @@ fn render_unified_model_card(
                     });
                 }
                 ui.add_space(6.0);
+            } else if let Some(status) = model_download_semantic_status(card) {
+                // Installing has a clear button label already; expose its
+                // transition separately to assistive technology without
+                // duplicating that label on the visible card.
+                let response = ui.allocate_response(Vec2::ZERO, Sense::hover());
+                let accessible_status = format!("{accessible_card_name}: {status}");
+                ui.ctx().accesskit_node_builder(response.id, |builder| {
+                    builder.set_role(egui::accesskit::Role::Status);
+                    builder.set_name(accessible_status);
+                    builder.set_live(egui::accesskit::Live::Polite);
+                    builder.set_live_atomic();
+                });
             }
             if (matches!(
                 primary.action,
@@ -4024,12 +4185,15 @@ fn render_unified_model_card(
             {
                 let download = render_model_download_module(
                     ui,
-                    &progress,
-                    primary.icon,
-                    &primary.accessible_name,
-                    primary.enabled,
-                    primary.disabled_reason,
-                    lifecycle.discard_name.as_deref(),
+                    ModelDownloadModuleParams {
+                        progress: &progress,
+                        primary_id: lifecycle_primary_id,
+                        primary_icon: primary.icon,
+                        cancel_name: &primary.accessible_name,
+                        cancel_enabled: primary.enabled,
+                        cancel_reason: primary.disabled_reason,
+                        discard_name: lifecycle.discard_name.as_deref(),
+                    },
                 );
                 *focus_within |= download.cancel_has_focus || download.discard_has_focus;
                 if download.cancel_clicked && primary.enabled {
@@ -4051,7 +4215,9 @@ fn render_unified_model_card(
                 }
                 return response;
             }
-            let label = if primary.tone == ModelLifecycleTone::DestructiveOutline {
+            let label = if primary.icon == Icon::Spinner
+                || primary.tone == ModelLifecycleTone::DestructiveOutline
+            {
                 primary.label.clone()
             } else {
                 primary.compact_size.as_ref().map_or_else(
@@ -4059,14 +4225,24 @@ fn render_unified_model_card(
                     |size| format!("{}  {size}", icon_glyph(primary.icon)),
                 )
             };
-            let mut lifecycle_response = model_lifecycle_button(
-                ui,
-                &label,
-                &primary.accessible_name,
-                primary.enabled,
-                primary.disabled_reason,
-                primary.tone,
-            );
+            let mut lifecycle_response = if primary.icon == Icon::Spinner {
+                model_lifecycle_installing_button(
+                    ui,
+                    &label,
+                    &primary.accessible_name,
+                    primary.disabled_reason,
+                    lifecycle_primary_id,
+                )
+            } else {
+                model_lifecycle_button(
+                    ui,
+                    &label,
+                    &primary.accessible_name,
+                    primary.enabled,
+                    primary.disabled_reason,
+                    primary.tone,
+                )
+            };
             *focus_within |= lifecycle_response.has_focus();
             if restore_remove_focus
                 && matches!(primary.action, ScreenAction::RequestModelRemoval(_))
@@ -4499,6 +4675,8 @@ fn render_unified_model_card(
     ModelCardRenderResult {
         action,
         restored_remove_focus,
+        #[cfg(test)]
+        primary_control_id: primary_control_id.get(),
     }
 }
 
@@ -5684,7 +5862,18 @@ fn model_download_activity_visible_status(state: ModelDownloadState) -> Option<S
 
 fn model_download_semantic_status(card: ModelCard<'_>) -> Option<String> {
     match card {
+        ModelCard::Local(model)
+            if matches!(
+                model.download_state,
+                ModelDownloadState::Verifying | ModelDownloadState::Extracting
+            ) =>
+        {
+            Some("Installing…".to_owned())
+        }
         ModelCard::Local(model) => model_download_activity_visible_status(model.download_state),
+        ModelCard::Remote(_, variant) if variant.finalizing => {
+            Some("Verifying and activating".to_owned())
+        }
         ModelCard::Remote(_, variant) => remote_download_activity_visible_status(variant),
     }
 }
@@ -9488,12 +9677,15 @@ mod tests {
                             ui.set_max_width(120.0);
                             render_model_download_module(
                                 ui,
-                                &progress,
-                                Icon::Pause,
-                                "Pause Narrow download",
-                                true,
-                                None,
-                                Some("Discard partial for Narrow download"),
+                                ModelDownloadModuleParams {
+                                    progress: &progress,
+                                    primary_id: egui::Id::new("narrow-download-test-primary"),
+                                    primary_icon: Icon::Pause,
+                                    cancel_name: "Pause Narrow download",
+                                    cancel_enabled: true,
+                                    cancel_reason: None,
+                                    discard_name: Some("Discard partial for Narrow download"),
+                                },
                             );
                         },
                     );
@@ -9983,6 +10175,235 @@ mod tests {
     }
 
     #[test]
+    fn installing_spinner_advances_and_requests_only_a_bounded_repaint() {
+        assert_ne!(installing_spinner_phase(0.0), installing_spinner_phase(0.2));
+        assert_eq!(
+            installing_spinner_phase(0.0),
+            installing_spinner_phase(1.25),
+            "the spinner phase loops predictably"
+        );
+        assert_eq!(
+            installing_spinner_repaint_interval(true),
+            Some(INSTALLING_SPINNER_REPAINT_INTERVAL)
+        );
+        assert_eq!(
+            installing_spinner_repaint_interval(false),
+            None,
+            "reduced motion renders a static ring without scheduling animation work"
+        );
+
+        let ctx = egui::Context::default();
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                model_lifecycle_installing_button(
+                    ui,
+                    "Installing…",
+                    "Installing spinner test",
+                    Some("Scribe is preparing the model."),
+                    egui::Id::new("installing-spinner-test"),
+                );
+            });
+        });
+        assert!(ctx.has_requested_repaint());
+        assert!(INSTALLING_SPINNER_REPAINT_INTERVAL <= std::time::Duration::from_millis(33));
+    }
+
+    #[test]
+    fn installing_status_is_polite_and_atomic_for_local_and_remote_cards() {
+        let local = ModelViewModel {
+            id: "installing-status-local".into(),
+            display_name: "Installing status local".into(),
+            download_state: ModelDownloadState::Verifying,
+            ..Default::default()
+        };
+        let entry = RemoteCatalogEntryView {
+            id: "installing-status-remote".into(),
+            display_name: "Installing status remote".into(),
+            ..Default::default()
+        };
+        let variant = RemoteCatalogVariantView {
+            id: "q5".into(),
+            filename: "installing-status-remote-q5.gguf".into(),
+            finalizing: true,
+            ..Default::default()
+        };
+
+        for (output, status_name) in [
+            (
+                render_model_card_at(&local, 960.0, 680.0, Vec::new()),
+                "Installing status local: Installing…",
+            ),
+            (
+                render_remote_model_card_at(&entry, &variant, 960.0, 680.0),
+                "Installing status remote (installing-status-remote-q5.gguf): Verifying and activating",
+            ),
+        ] {
+            let status = output
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .and_then(|update| {
+                    update.nodes.iter().find_map(|(_, node)| {
+                        (node.role() == egui::accesskit::Role::Status
+                            && node.name() == Some(status_name))
+                        .then_some(node)
+                    })
+                })
+                .expect("installing status should be exposed to assistive technology");
+            assert_eq!(status.live(), Some(egui::accesskit::Live::Polite));
+            assert!(status.is_live_atomic());
+        }
+    }
+
+    #[test]
+    fn paused_download_keeps_focus_on_the_stable_resume_control_across_frames() {
+        let ctx = egui::Context::default();
+        let progress = ModelDownloadProgressPresentation {
+            downloaded_bytes: 42,
+            total_bytes: Some(100),
+            fraction: Some(0.42),
+            total_is_unknown: false,
+            display_text: "42B / 100B".into(),
+            accessible_text: "Downloading 42B of 100B, 42% complete".into(),
+        };
+        let mut pause_id = None;
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                pause_id = Some(
+                    render_model_download_module(
+                        ui,
+                        ModelDownloadModuleParams {
+                            progress: &progress,
+                            primary_id: egui::Id::new("focus-test-primary"),
+                            primary_icon: Icon::Pause,
+                            cancel_name: "Pause focus test download",
+                            cancel_enabled: true,
+                            cancel_reason: None,
+                            discard_name: None,
+                        },
+                    )
+                    .primary_id,
+                );
+            });
+        });
+        let pause_id = pause_id.expect("pause control id");
+        ctx.memory_mut(|memory| memory.request_focus(pause_id));
+
+        let mut resume_id = None;
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                resume_id = Some(
+                    render_model_download_module(
+                        ui,
+                        ModelDownloadModuleParams {
+                            progress: &progress,
+                            primary_id: egui::Id::new("focus-test-primary"),
+                            primary_icon: Icon::Play,
+                            cancel_name: "Resume focus test download",
+                            cancel_enabled: true,
+                            cancel_reason: None,
+                            discard_name: Some("Discard partial for focus test download"),
+                        },
+                    )
+                    .primary_id,
+                );
+            });
+        });
+        let resume_id = resume_id.expect("resume control id");
+        assert_eq!(
+            pause_id, resume_id,
+            "the compact primary control keeps its id"
+        );
+        assert_eq!(ctx.memory(|memory| memory.focused()), Some(resume_id));
+    }
+
+    #[test]
+    fn pause_to_installing_keeps_card_primary_focus_and_announces_installing() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        crate::ui::controls::configure_accessible_style(&ctx);
+        let downloading = ModelViewModel {
+            id: "pause-to-installing".into(),
+            display_name: "Pause to installing".into(),
+            download_state: ModelDownloadState::Downloading,
+            cancel_supported: true,
+            downloaded_bytes: 42,
+            total_bytes: Some(100),
+            ..Default::default()
+        };
+        let mut pause_id = None;
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(960.0, 680.0),
+                )),
+                focused: true,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    pause_id = render_unified_model_card(
+                        ui,
+                        ModelCard::Local(&downloading),
+                        false,
+                        true,
+                        false,
+                    )
+                    .primary_control_id;
+                });
+            },
+        );
+        let pause_id = pause_id.expect("active download has a primary control");
+        ctx.memory_mut(|memory| memory.request_focus(pause_id));
+
+        let installing = ModelViewModel {
+            download_state: ModelDownloadState::Verifying,
+            ..downloading
+        };
+        let mut installing_id = None;
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(960.0, 680.0),
+                )),
+                focused: true,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    installing_id = render_unified_model_card(
+                        ui,
+                        ModelCard::Local(&installing),
+                        false,
+                        true,
+                        false,
+                    )
+                    .primary_control_id;
+                });
+            },
+        );
+        let installing_id = installing_id.expect("installing card has a primary control");
+        assert_eq!(pause_id, installing_id);
+        assert_eq!(ctx.memory(|memory| memory.focused()), Some(installing_id));
+        let status = output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .and_then(|update| {
+                update.nodes.iter().find_map(|(_, node)| {
+                    (node.role() == egui::accesskit::Role::Status
+                        && node.name() == Some("Pause to installing: Installing…"))
+                    .then_some(node)
+                })
+            })
+            .expect("installing transition status");
+        assert_eq!(status.live(), Some(egui::accesskit::Live::Polite));
+        assert!(status.is_live_atomic());
+    }
+
+    #[test]
     fn remote_retained_states_keep_resume_discard_and_error_controls_at_375px() {
         let entry = RemoteCatalogEntryView {
             id: "remote-retained".into(),
@@ -10036,6 +10457,19 @@ mod tests {
                 assert!(bounds.width() >= 44.0 && bounds.height() >= 44.0, "{name}");
                 assert!(bounds.x0 >= 0.0 && bounds.x1 <= 375.0, "{name}: {bounds:?}");
             }
+            let resume = named_role_bounds(
+                &output,
+                &format!("Resume {remote_name} download"),
+                egui::accesskit::Role::Button,
+            );
+            let discard = named_role_bounds(
+                &output,
+                &format!("Discard partial for {remote_name}"),
+                egui::accesskit::Role::Button,
+            );
+            assert!(resume.width() <= 44.1 && discard.width() <= 44.1);
+            assert!((discard.x0 - resume.x1).abs() <= 8.1);
+            assert!((discard.y0 - resume.y0).abs() <= 0.1);
             if let Some(error) = error_message {
                 assert!(
                     output

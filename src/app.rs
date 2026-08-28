@@ -1946,6 +1946,7 @@ impl ArtifactInstallCoordinator {
         &mut self,
         model_id: &str,
         job_id: u64,
+        completed_bytes: u64,
         total_bytes: Option<u64>,
     ) -> bool {
         let Some(job) = self.jobs.get_mut(model_id) else {
@@ -1954,6 +1955,7 @@ impl ArtifactInstallCoordinator {
         if job.handle.0 != job_id {
             return false;
         }
+        job.download_diagnostic.completed_bytes = completed_bytes;
         job.download_diagnostic.total_bytes = total_bytes;
         true
     }
@@ -6873,6 +6875,17 @@ impl LocalTranscriberApp {
                             *active_job == job_id && active_model == &model_id
                         },
                     ) {
+                        // A resumed multi-file ONNX bundle can begin working
+                        // through an earlier file while another file already
+                        // has a validated retained partial. Keep that
+                        // admission-time total visible until the worker's
+                        // aggregate progress catches up.
+                        let prior_downloaded_bytes = self
+                            .model_downloads
+                            .get(&model_id)
+                            .and_then(model_install_download_bytes)
+                            .map_or(0, |(downloaded_bytes, _)| downloaded_bytes);
+                        let downloaded_bytes = progress.completed_bytes.max(prior_downloaded_bytes);
                         if let Some(activity) = progress.download_activity {
                             let previous = self.onnx_download_activity;
                             if previous != Some(activity) {
@@ -6882,7 +6895,7 @@ impl LocalTranscriberApp {
                                     job_id,
                                     previous,
                                     activity,
-                                    progress.completed_bytes,
+                                    downloaded_bytes,
                                     Some(progress.total_bytes),
                                 );
                             }
@@ -6890,7 +6903,7 @@ impl LocalTranscriberApp {
                         self.model_downloads.insert(
                             model_id,
                             ModelInstallStatus::Downloading {
-                                downloaded_bytes: progress.completed_bytes,
+                                downloaded_bytes,
                                 total_bytes: Some(progress.total_bytes),
                                 bytes_per_second: progress.bytes_per_second,
                             },
@@ -9299,6 +9312,13 @@ impl LocalTranscriberApp {
         }
 
         let model_id = ModelId::new(&model.id);
+        let expected_total_bytes = model_download_total_bytes(model);
+        let prior_install_status = self.model_downloads.get(&model.id).cloned();
+        let retained_bytes = resume_download_bytes(
+            managed_downloads::normalized_model_retained_partial(&self.config, &model_id),
+            prior_install_status.as_ref(),
+            expected_total_bytes,
+        );
         match managed_downloads::normalized_onnx_bundle_admission(&self.config, &model_id) {
             Ok(Some(admission)) => {
                 if self.onnx_bundle_install.is_some() {
@@ -9315,8 +9335,8 @@ impl LocalTranscriberApp {
                 self.model_downloads.insert(
                     model.id.clone(),
                     ModelInstallStatus::Downloading {
-                        downloaded_bytes: 0,
-                        total_bytes: model_download_total_bytes(model),
+                        downloaded_bytes: retained_bytes,
+                        total_bytes: expected_total_bytes,
                         bytes_per_second: None,
                     },
                 );
@@ -9325,8 +9345,8 @@ impl LocalTranscriberApp {
                 self.record_download_diagnostic(
                     &model.id,
                     job_id,
-                    0,
-                    model_download_total_bytes(model),
+                    retained_bytes,
+                    expected_total_bytes,
                     |run, job, artifact, source, _, total| {
                         DownloadDiagnosticEvent::admission(run, job, artifact, source, total)
                     },
@@ -9415,11 +9435,10 @@ impl LocalTranscriberApp {
                     return;
                 }
             };
-        let expected_total_bytes = model_download_total_bytes(model);
         self.model_downloads.insert(
             model.id.clone(),
             ModelInstallStatus::Downloading {
-                downloaded_bytes: 0,
+                downloaded_bytes: retained_bytes,
                 total_bytes: expected_total_bytes,
                 bytes_per_second: None,
             },
@@ -9445,12 +9464,13 @@ impl LocalTranscriberApp {
         self.artifact_installations.initialize_download_diagnostic(
             &model.id,
             job_id,
+            retained_bytes,
             expected_total_bytes,
         );
         self.record_download_diagnostic(
             &model.id,
             job_id,
-            0,
+            retained_bytes,
             expected_total_bytes,
             |run, job, artifact, source, _, total| {
                 DownloadDiagnosticEvent::admission(run, job, artifact, source, total)
@@ -9497,19 +9517,25 @@ impl LocalTranscriberApp {
                 return;
             }
         };
+        let expected_total_bytes = Some(request.artifact.size_bytes);
+        let prior_install_status = self.model_downloads.get(&model_id).cloned();
+        let retained_bytes = resume_download_bytes(
+            managed_downloads::trusted_gguf_retained_partial(&self.config, &request.artifact),
+            prior_install_status.as_ref(),
+            expected_total_bytes,
+        );
 
         self.model_downloads.insert(
             model_id.clone(),
             ModelInstallStatus::Downloading {
-                downloaded_bytes: 0,
-                total_bytes: Some(request.artifact.size_bytes),
+                downloaded_bytes: retained_bytes,
+                total_bytes: expected_total_bytes,
                 bytes_per_second: None,
             },
         );
         self.remote_catalog.invalidate_local_models();
         self.status = TranscriptionStatus::Idle;
         self.status_message = format!("Downloading {}...", request.display_name);
-        let expected_total_bytes = Some(request.artifact.size_bytes);
 
         self.discard_partial_after_install.remove(&model_id);
         let job_id = match self.artifact_installations.admit(
@@ -9529,12 +9555,13 @@ impl LocalTranscriberApp {
         self.artifact_installations.initialize_download_diagnostic(
             &model_id,
             job_id,
+            retained_bytes,
             expected_total_bytes,
         );
         self.record_download_diagnostic(
             &model_id,
             job_id,
-            0,
+            retained_bytes,
             expected_total_bytes,
             |run, job, artifact, source, _, total| {
                 DownloadDiagnosticEvent::admission(run, job, artifact, source, total)
@@ -11727,6 +11754,15 @@ impl LocalTranscriberApp {
                         downloaded_bytes = Some(*progress_downloaded_bytes);
                         total_bytes = *progress_total_bytes;
                     }
+                    if matches!(status, ModelInstallStatus::InstallingRuntime)
+                        && let Some((job_id, _)) = self.artifact_installations.get(download_id)
+                        && let Some(progress) = self
+                            .artifact_installations
+                            .download_diagnostic_progress(download_id, *job_id)
+                    {
+                        downloaded_bytes = Some(progress.completed_bytes);
+                        total_bytes = progress.total_bytes.or(total_bytes);
+                    }
                     if let ModelInstallStatus::Error(message)
                     | ModelInstallStatus::RuntimeError(message) = status
                     {
@@ -12046,6 +12082,19 @@ impl LocalTranscriberApp {
         if self.remote_catalog.local_models_dirty {
             return;
         }
+        let cached_progress = self
+            .remote_catalog
+            .local_models
+            .iter()
+            .find(|model| model.id == model_id)
+            .map(|model| (model.downloaded_bytes, model.total_bytes));
+        let diagnostic_progress =
+            self.artifact_installations
+                .get(model_id)
+                .and_then(|(job_id, _)| {
+                    self.artifact_installations
+                        .download_diagnostic_progress(model_id, *job_id)
+                });
         let Some(status) = self.model_downloads.get(model_id) else {
             return;
         };
@@ -12059,7 +12108,20 @@ impl LocalTranscriberApp {
                 *downloaded_bytes,
                 *total_bytes,
             ),
-            ModelInstallStatus::InstallingRuntime => (ModelDownloadState::Verifying, 0, None),
+            ModelInstallStatus::InstallingRuntime => {
+                let (cached_bytes, cached_total) = cached_progress.unwrap_or((0, None));
+                let total_bytes = diagnostic_progress
+                    .and_then(|progress| progress.total_bytes)
+                    .or(cached_total);
+                let downloaded_bytes = diagnostic_progress
+                    .map(|progress| progress.completed_bytes)
+                    .unwrap_or(cached_bytes);
+                (
+                    ModelDownloadState::Verifying,
+                    total_bytes.map_or(downloaded_bytes, |total| downloaded_bytes.min(total)),
+                    total_bytes,
+                )
+            }
             _ => return,
         };
         let phase = self.artifact_installations.phase_for_model(model_id);
@@ -12088,7 +12150,8 @@ impl LocalTranscriberApp {
             .find(|model| model.id == model_id)
         {
             model.download_state = download_state;
-            model.downloaded_bytes = downloaded_bytes;
+            model.downloaded_bytes =
+                total_bytes.map_or(downloaded_bytes, |total| downloaded_bytes.min(total));
             model.total_bytes = total_bytes.or(model.total_bytes);
             model.error_message = None;
             model.cancel_supported = phase.is_some_and(ArtifactInstallPhase::allows_cancellation);
@@ -12096,12 +12159,28 @@ impl LocalTranscriberApp {
     }
 
     fn update_remote_download_progress_projection(&mut self, model_id: &str) {
-        let Some(ModelInstallStatus::Downloading {
-            downloaded_bytes,
-            total_bytes,
-            ..
-        }) = self.model_downloads.get(model_id)
-        else {
+        let diagnostic_progress =
+            self.artifact_installations
+                .get(model_id)
+                .and_then(|(job_id, _)| {
+                    self.artifact_installations
+                        .download_diagnostic_progress(model_id, *job_id)
+                });
+        let Some(status) = self.model_downloads.get(model_id) else {
+            return;
+        };
+        let progress = match status {
+            ModelInstallStatus::Downloading {
+                downloaded_bytes,
+                total_bytes,
+                ..
+            } => Some((*downloaded_bytes, *total_bytes)),
+            ModelInstallStatus::InstallingRuntime => {
+                diagnostic_progress.map(|progress| (progress.completed_bytes, progress.total_bytes))
+            }
+            _ => None,
+        };
+        let Some((downloaded_bytes, total_bytes)) = progress else {
             return;
         };
         let Some(projection) = self.remote_catalog.projection.as_mut() else {
@@ -12116,8 +12195,10 @@ impl LocalTranscriberApp {
                     || variant.managed_model_id.as_deref() == Some(model_id)
             })
         {
-            variant.downloaded_bytes = Some(*downloaded_bytes);
-            variant.total_bytes = *total_bytes;
+            let total_bytes = total_bytes.or(variant.total_bytes);
+            variant.downloaded_bytes =
+                Some(total_bytes.map_or(downloaded_bytes, |total| downloaded_bytes.min(total)));
+            variant.total_bytes = total_bytes;
             if let Some(activity) = self
                 .artifact_installations
                 .download_activity_for_model(model_id)
@@ -12284,6 +12365,32 @@ impl LocalTranscriberApp {
                 downloaded_bytes,
                 total_bytes,
             } => (*downloaded_bytes, *total_bytes),
+            ModelInstallStatus::InstallingRuntime => self
+                .artifact_installations
+                .get(&model.id)
+                .and_then(|(job_id, _)| {
+                    self.artifact_installations
+                        .download_diagnostic_progress(&model.id, *job_id)
+                })
+                .map(|progress| {
+                    (
+                        progress
+                            .total_bytes
+                            .map_or(progress.completed_bytes, |total| {
+                                progress.completed_bytes.min(total)
+                            }),
+                        progress.total_bytes,
+                    )
+                })
+                .unwrap_or_else(|| {
+                    (
+                        match partial_inspection {
+                            PartialInspection::Present(partial) => partial.bytes,
+                            _ => 0,
+                        },
+                        descriptor.map(|descriptor| descriptor.artifact_size_bytes),
+                    )
+                }),
             _ => (
                 match partial_inspection {
                     PartialInspection::Present(partial) => partial.bytes,
@@ -15348,6 +15455,30 @@ fn model_install_download_bytes(status: &ModelInstallStatus) -> Option<(u64, Opt
         } => Some((*downloaded_bytes, *total_bytes)),
         _ => None,
     }
+}
+
+fn resume_download_bytes(
+    retained_partial: Result<Option<crate::installations::RetainedPartial>, InstallError>,
+    prior_status: Option<&ModelInstallStatus>,
+    total_bytes: Option<u64>,
+) -> u64 {
+    let bytes = match retained_partial {
+        // A validated sidecar is the authoritative source on resume.
+        Ok(Some(partial)) => partial.bytes,
+        // A successful inspection showing no sidecar means a stale paused
+        // value must not be presented as real progress.
+        Ok(None) => 0,
+        // If the sidecar cannot be inspected, a paused value is the only
+        // correlated in-memory fallback. Do not borrow bytes from any other
+        // lifecycle state.
+        Err(_) => match prior_status {
+            Some(ModelInstallStatus::Paused {
+                downloaded_bytes, ..
+            }) => *downloaded_bytes,
+            _ => 0,
+        },
+    };
+    total_bytes.map_or(bytes, |total| bytes.min(total))
 }
 
 fn runtime_chip_tone(status: &ModelRuntimeStatus) -> ChipTone {
@@ -24775,6 +24906,44 @@ mod layout_tests {
     }
 
     #[test]
+    fn resume_progress_prefers_validated_partials_and_only_uses_paused_fallback_on_probe_error() {
+        let paused = ModelInstallStatus::Paused {
+            downloaded_bytes: 61,
+            total_bytes: Some(100),
+        };
+        assert_eq!(
+            resume_download_bytes(
+                Ok(Some(crate::installations::RetainedPartial { bytes: 73 })),
+                Some(&paused),
+                Some(100),
+            ),
+            73
+        );
+        assert_eq!(
+            resume_download_bytes(Ok(None), Some(&paused), Some(100)),
+            0,
+            "a successful empty probe must not revive stale paused bytes"
+        );
+        assert_eq!(
+            resume_download_bytes(
+                Err(InstallError::Failed("probe unavailable".to_owned())),
+                Some(&paused),
+                Some(100),
+            ),
+            61
+        );
+        assert_eq!(
+            resume_download_bytes(
+                Ok(Some(crate::installations::RetainedPartial { bytes: 173 })),
+                Some(&paused),
+                Some(100),
+            ),
+            100,
+            "the UI must never present more bytes than the known artifact total"
+        );
+    }
+
+    #[test]
     fn download_faults_keep_distinct_sanitized_diagnostic_categories() {
         for (fault, expected) in [
             (DownloadFaultKind::TimedOut, DownloadFaultCategory::Timeout),
@@ -24821,7 +24990,7 @@ mod layout_tests {
                 false,
             )
             .unwrap();
-        coordinator.initialize_download_diagnostic("diagnostic-progress", job_id, Some(100));
+        coordinator.initialize_download_diagnostic("diagnostic-progress", job_id, 0, Some(100));
         coordinator.take_ready_transfers();
         assert!(coordinator.update_download_diagnostic_progress(
             "diagnostic-progress",
@@ -24965,6 +25134,181 @@ mod layout_tests {
     }
 
     #[test]
+    fn installing_projection_rebuild_keeps_correlated_download_bytes() {
+        let mut app = test_app();
+        let model_id = "whisper_cpp_tiny_en".to_owned();
+        let total_bytes = 100;
+        app.artifact_installations
+            .insert(model_id.clone(), (8_901, InstallCancellation::default()));
+        app.artifact_installations.initialize_download_diagnostic(
+            &model_id,
+            8_901,
+            73,
+            Some(total_bytes),
+        );
+        app.model_downloads
+            .insert(model_id.clone(), ModelInstallStatus::InstallingRuntime);
+        app.remote_catalog.invalidate_local_models();
+        app.rebuild_model_inventory_projection();
+
+        let projected = app
+            .model_management_catalog()
+            .into_iter()
+            .find(|model| model.id == model_id)
+            .expect("normalized model remains visible while finalizing");
+        assert_eq!(projected.downloaded_bytes, 73);
+        assert_eq!(projected.total_bytes, Some(total_bytes));
+    }
+
+    #[test]
+    fn remote_finalizing_projection_rebuild_keeps_correlated_download_bytes() {
+        let mut app = test_app();
+        let model_id = ModelId::new("whisper_cpp_tiny_en");
+        let manifest = crate::model_catalog::runtime_model_manifest(&model_id).unwrap();
+        let remote = RemoteModel {
+            id: manifest.artifact_repository.to_owned(),
+            revision: manifest.artifact_revision.to_owned(),
+            display_name: "Exact normalized remote".to_owned(),
+            description: "fixture".to_owned(),
+            languages: vec!["en".to_owned()],
+            recommended: false,
+            trust: crate::huggingface_catalog::ModelTrust::TrustedPublisher,
+            compatibility: crate::huggingface_catalog::ModelCompatibility::Experimental(
+                "fixture".to_owned(),
+            ),
+            variants: vec![crate::huggingface_catalog::RemoteModelVariant {
+                id: "exact".to_owned(),
+                filename: manifest.artifact_filename.to_owned(),
+                size_bytes: manifest.artifact_size_bytes,
+                expected_sha256: manifest.artifact_sha256.to_owned(),
+            }],
+        };
+        app.remote_catalog.snapshot = Some(
+            ModelInventorySnapshot::from_trusted_records(99, CatalogSource::Network, vec![remote])
+                .unwrap(),
+        );
+        app.artifact_installations.insert(
+            model_id.as_str().to_owned(),
+            (8_902, InstallCancellation::default()),
+        );
+        app.artifact_installations.initialize_download_diagnostic(
+            model_id.as_str(),
+            8_902,
+            73,
+            Some(manifest.artifact_size_bytes),
+        );
+        app.model_downloads.insert(
+            model_id.as_str().to_owned(),
+            ModelInstallStatus::InstallingRuntime,
+        );
+        app.remote_catalog.invalidate_projection();
+
+        let view = app.remote_catalog_view();
+        let variant = &view.entries[0].variants[0];
+        assert_eq!(variant.downloaded_bytes, Some(73));
+        assert_eq!(variant.total_bytes, Some(manifest.artifact_size_bytes));
+    }
+
+    #[test]
+    fn generic_resumed_download_progress_and_finalizing_never_clear_retained_bytes() {
+        let mut app = test_app();
+        let model_id = ModelId::new("whisper_cpp_tiny_en");
+        let manifest = crate::model_catalog::runtime_model_manifest(&model_id).unwrap();
+        let retained_bytes = 73;
+        let job_id = 8_903;
+        let remote = RemoteModel {
+            id: manifest.artifact_repository.to_owned(),
+            revision: manifest.artifact_revision.to_owned(),
+            display_name: "Resumable generic remote".to_owned(),
+            description: "fixture".to_owned(),
+            languages: vec!["en".to_owned()],
+            recommended: false,
+            trust: crate::huggingface_catalog::ModelTrust::TrustedPublisher,
+            compatibility: crate::huggingface_catalog::ModelCompatibility::Experimental(
+                "fixture".to_owned(),
+            ),
+            variants: vec![crate::huggingface_catalog::RemoteModelVariant {
+                id: "exact".to_owned(),
+                filename: manifest.artifact_filename.to_owned(),
+                size_bytes: manifest.artifact_size_bytes,
+                expected_sha256: manifest.artifact_sha256.to_owned(),
+            }],
+        };
+        app.remote_catalog.snapshot = Some(
+            ModelInventorySnapshot::from_trusted_records(99, CatalogSource::Network, vec![remote])
+                .unwrap(),
+        );
+        app.artifact_installations.insert(
+            model_id.as_str().to_owned(),
+            (job_id, InstallCancellation::default()),
+        );
+        app.artifact_installations.initialize_download_diagnostic(
+            model_id.as_str(),
+            job_id,
+            retained_bytes,
+            Some(manifest.artifact_size_bytes),
+        );
+        app.model_downloads.insert(
+            model_id.as_str().to_owned(),
+            ModelInstallStatus::Downloading {
+                downloaded_bytes: retained_bytes,
+                total_bytes: Some(manifest.artifact_size_bytes),
+                bytes_per_second: None,
+            },
+        );
+
+        app.tx
+            .send(AppEvent::ModelDownloadProgress {
+                job_id,
+                model_id: model_id.as_str().to_owned(),
+                progress: InstallProgress {
+                    stage: InstallStage::Downloading,
+                    completed_bytes: retained_bytes,
+                    total_bytes: manifest.artifact_size_bytes,
+                    bytes_per_second: None,
+                    download_activity: Some(DownloadActivity::Active),
+                },
+            })
+            .unwrap();
+        app.poll_events();
+
+        let assert_retained_projection = |app: &mut LocalTranscriberApp| {
+            let local = app
+                .model_management_catalog()
+                .into_iter()
+                .find(|model| model.id == model_id.as_str())
+                .expect("normalized local model remains visible");
+            assert_eq!(local.downloaded_bytes, retained_bytes);
+            assert_eq!(local.total_bytes, Some(manifest.artifact_size_bytes));
+
+            app.remote_catalog.invalidate_projection();
+            let remote = app.remote_catalog_view();
+            let variant = &remote.entries[0].variants[0];
+            assert_eq!(variant.downloaded_bytes, Some(retained_bytes));
+            assert_eq!(variant.total_bytes, Some(manifest.artifact_size_bytes));
+        };
+        assert_retained_projection(&mut app);
+
+        assert!(app.artifact_installations.mark_prepared(
+            model_id.as_str(),
+            job_id,
+            coordinator_prepared(model_id.as_str()),
+        ));
+        app.model_downloads.insert(
+            model_id.as_str().to_owned(),
+            ModelInstallStatus::InstallingRuntime,
+        );
+        app.update_model_download_progress_projection(model_id.as_str());
+        app.update_remote_download_progress_projection(model_id.as_str());
+        assert_retained_projection(&mut app);
+
+        assert!(app.artifact_installations.take_next_finalizer().is_some());
+        app.remote_catalog.invalidate_local_models();
+        app.rebuild_model_inventory_projection();
+        assert_retained_projection(&mut app);
+    }
+
+    #[test]
     fn exhausted_retry_event_uses_retained_bytes_and_typed_failure_diagnostics() {
         let mut app = test_app();
         let run = DownloadRunId::new("retry-failure-test").unwrap();
@@ -25033,7 +25377,7 @@ mod layout_tests {
         app.artifact_installations
             .insert(model_id.clone(), (883, InstallCancellation::default()));
         app.artifact_installations
-            .initialize_download_diagnostic(&model_id, 883, Some(100));
+            .initialize_download_diagnostic(&model_id, 883, 0, Some(100));
         app.artifact_installations
             .update_download_diagnostic_progress(&model_id, 883, 100, Some(100));
         app.artifact_installations.update_download_activity(
@@ -25086,7 +25430,7 @@ mod layout_tests {
         app.artifact_installations
             .insert(model_id.clone(), (job_id, InstallCancellation::default()));
         app.artifact_installations
-            .initialize_download_diagnostic(&model_id, job_id, Some(100));
+            .initialize_download_diagnostic(&model_id, job_id, 0, Some(100));
         app.artifact_installations
             .update_download_diagnostic_progress(&model_id, job_id, 73, Some(100));
         app.artifact_installations.update_download_activity(
@@ -25160,7 +25504,7 @@ mod layout_tests {
         app.artifact_installations
             .insert(model_id.clone(), (884, InstallCancellation::default()));
         app.artifact_installations
-            .initialize_download_diagnostic(&model_id, 884, Some(100));
+            .initialize_download_diagnostic(&model_id, 884, 0, Some(100));
         app.artifact_installations
             .update_download_diagnostic_progress(&model_id, 884, 55, Some(100));
         app.model_downloads.insert(
@@ -28132,6 +28476,44 @@ mod layout_tests {
         assert_eq!(view.download_state, ModelDownloadState::Downloading);
         assert_eq!(view.downloaded_bytes, 17);
         assert!(view.cancel_supported);
+    }
+
+    #[test]
+    fn resumed_onnx_progress_never_regresses_to_zero_while_files_reenter_in_order() {
+        let mut app = test_app();
+        let model_id = "moonshine-tiny-en-int8-onnx".to_owned();
+        app.onnx_bundle_install = Some((42, model_id.clone(), InstallCancellation::default()));
+        app.model_downloads.insert(
+            model_id.clone(),
+            ModelInstallStatus::Downloading {
+                downloaded_bytes: 17,
+                total_bytes: Some(44_256_550),
+                bytes_per_second: None,
+            },
+        );
+        app.tx
+            .send(AppEvent::OnnxBundleInstallProgress {
+                job_id: 42,
+                model_id: model_id.clone(),
+                progress: InstallProgress {
+                    stage: InstallStage::Downloading,
+                    completed_bytes: 0,
+                    total_bytes: 44_256_550,
+                    bytes_per_second: None,
+                    download_activity: Some(DownloadActivity::Active),
+                },
+            })
+            .unwrap();
+        app.poll_events();
+
+        assert_eq!(
+            app.model_downloads.get(&model_id),
+            Some(&ModelInstallStatus::Downloading {
+                downloaded_bytes: 17,
+                total_bytes: Some(44_256_550),
+                bytes_per_second: None,
+            })
+        );
     }
 
     #[test]

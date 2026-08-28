@@ -241,7 +241,9 @@ pub(super) fn phase_status_label_with_motion(
     if !phase.is_progressing() {
         return phase.status_text().to_owned();
     }
-    let glyph = if progress_animation_enabled && overlay_animations_enabled() {
+    let glyph = if progress_animation_enabled
+        && crate::system_preferences::client_area_animations_enabled()
+    {
         let elapsed = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -251,30 +253,6 @@ pub(super) fn phase_status_label_with_motion(
         "○"
     };
     format!("{glyph} {}", phase.status_text())
-}
-
-#[cfg(target_os = "windows")]
-fn overlay_animations_enabled() -> bool {
-    use std::ffi::c_void;
-
-    use windows_sys::Win32::UI::WindowsAndMessaging::SystemParametersInfoW;
-
-    const SPI_GETCLIENTAREAANIMATION: u32 = 0x1042;
-    let mut enabled = 0i32;
-    unsafe {
-        SystemParametersInfoW(
-            SPI_GETCLIENTAREAANIMATION,
-            0,
-            &mut enabled as *mut i32 as *mut c_void,
-            0,
-        ) != 0
-            && enabled != 0
-    }
-}
-
-#[cfg(not(target_os = "windows"))]
-fn overlay_animations_enabled() -> bool {
-    true
 }
 
 pub(super) fn control_window_bounds(
