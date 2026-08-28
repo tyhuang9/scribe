@@ -5,12 +5,15 @@ description: Understand local model selection, runtime discovery, and storage.
 
 ## Current catalog and status
 
-The normal Models experience always includes five static catalog entries:
+The normal Models experience always includes six static catalog entries:
 Experimental GGUF models `whisper_cpp_tiny_en`, `whisper_cpp_base_en`,
 `whisper_cpp_small_en`, and `whisper_cpp_medium_en`, plus the receipt-backed
-Experimental `moonshine-tiny-en-int8-onnx` bundle. The GGUF artifacts are
-pinned by repository revision, filename, size, and SHA-256; the ONNX model is
-installed only as its verified receipt-backed bundle.
+Experimental `moonshine-tiny-en-int8-onnx` and `moonshine-base-en-int8-onnx`
+bundles. The GGUF artifacts are pinned by repository revision, filename, size,
+and SHA-256; the ONNX models are installed only as their verified receipt-backed
+bundles. Moonshine Base is a 286,930,831-byte converted five-file INT8 artifact
+(including its MIT / Useful Sensors 2024 license file); its source and converter
+revisions are unrecorded.
 
 When a trusted catalog response is available, Models can also discover and
 display additional non-duplicate remote GGUF variants. Those variants are not
@@ -19,11 +22,18 @@ listing becomes usable only after its exact source facts are verified and its
 artifact is installed; listing it does not authorize execution or make it
 Supported.
 
-The five static entries are all **Experimental** and the Supported count is
+The six static entries are all **Experimental** and the Supported count is
 **zero**. A model must pass load, fixture transcription, cancellation,
 unload/reload, acceleration, and platform checks before promotion. You can also
 validate a local GGUF in place; Scribe fingerprints and smoke-tests it without
 copying, uploading, or deleting it.
+
+Moonshine Base's scoped Windows gate used Sherpa 1.13.5 and passed child
+load/health/silence, normalized known-WAV equality, and unload/reload in 140.40
+seconds total. That duration is diagnostic elapsed time, not a latency or
+quality claim. It remains a CPU-only English final-text model with no timestamps
+or native streaming; cancellation, supervisor restart recovery, latency,
+resource use, accelerators, and non-Windows behavior are not yet measured.
 
 Legacy user configuration and artifact files are preserved for migration, but
 they are no longer recognized or executed by a production inference route. An
