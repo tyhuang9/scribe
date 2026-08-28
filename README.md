@@ -63,7 +63,7 @@ For a guided first run, platform notes, troubleshooting, and model help, visit t
 
 ## How it works
 
-Scribe is a native Rust desktop app built with egui/eframe. It captures microphone audio locally, prepares it in native workers, runs the selected model through a private local runtime boundary, and only sends the completed transcript to copy, history, overlay, or optional insertion.
+Scribe is a native Rust desktop app built with egui/eframe. It captures microphone audio locally, prepares it in native workers, and runs the selected model in a private persistent inference child. The overlay can show committed and tentative preview text while you speak; only the finalized transcript reaches copy, history, or optional insertion.
 
 ```mermaid
 flowchart LR

@@ -1,5 +1,11 @@
 # Scribe runtime-consolidated revamp: implementation report
 
+> **Historical record (superseded 2026-08-28):** This report preserves the
+> original dated implementation evidence verbatim. It is not the current
+> architecture or qualification contract. Use the checked-in source,
+> [technical overview](TECHNICAL_OVERVIEW.md), and live
+> [manual test matrix](MANUAL_TEST_MATRIX.md) for current truth.
+
 Initial report date: 2026-08-04
 Evidence updated through: 2026-08-05
 Integration base: `536a85f`

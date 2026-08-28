@@ -4,11 +4,12 @@ mod schema;
 
 pub use repository::SettingsStore;
 pub use schema::{
-    AppConfig, CURRENT_SCHEMA_VERSION, DEFAULT_INPUT_THRESHOLD_DBFS, DeveloperSettings,
-    GeneralSettings, HistoryMode, HistorySettings, MAX_INPUT_THRESHOLD_DBFS,
-    MIN_INPUT_THRESHOLD_DBFS, OutputSettings, OverlayMode, OverlayPosition, OverlaySettings,
-    PerformanceSettings, RecordingSettings, SpeechDetectionMode, StreamingMode, StreamingSettings,
+    AppConfig, CURRENT_SCHEMA_VERSION, DEFAULT_INPUT_THRESHOLD_DBFS, HistoryMode,
+    MAX_INPUT_THRESHOLD_DBFS, MIN_INPUT_THRESHOLD_DBFS, OverlayMode, OverlayPosition,
+    SpeechDetectionMode, StreamingMode,
 };
+#[cfg(test)]
+pub use schema::{GeneralSettings, RecordingSettings};
 
 pub(crate) use migrations::parse_settings_value_with_diagnostics;
 pub(crate) use repository::{

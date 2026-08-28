@@ -9,8 +9,6 @@
 //! owned output into Scribe's neutral transcript contract. No caller above
 //! `RuntimeRouter` can observe a model family, FFI handle, or native backend.
 
-#![allow(dead_code)]
-
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -32,7 +30,6 @@ use crate::transcription::{
 pub(crate) const TRANSCRIBE_CPP_VERSION: &str = "0.1.3";
 
 static BACKENDS: OnceLock<std::result::Result<(), String>> = OnceLock::new();
-static UNCANCELLED_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 /// Stable categories translated from the safe wrapper's native errors.
 #[derive(Debug, Error)]
@@ -41,14 +38,10 @@ pub(crate) enum EmbeddedRuntimeError {
     RuntimeInitializationFailed(String),
     #[error("ModelNotInstalled: {0}")]
     ModelNotInstalled(PathBuf),
-    #[error("ModelLoadFailed: {0}")]
-    ModelLoadFailed(String),
     #[error("ModelIncompatible: {0}")]
     ModelIncompatible(String),
     #[error("ModelRequiresNewerRuntime: {0}")]
     ModelRequiresNewerRuntime(String),
-    #[error("StreamUnsupported: {0}")]
-    StreamUnsupported(String),
     #[error("DecodeFailed: {0}")]
     DecodeFailed(String),
     #[error("Cancelled")]
@@ -204,25 +197,8 @@ impl SpeechEngine for EmbeddedRuntime {
         self.load_model()
     }
 
-    fn transcribe(
-        &mut self,
-        audio: &PreparedAudio,
-        options: &TranscriptionOptions,
-    ) -> Result<Transcript> {
-        self.transcribe_with_cancellation(audio, options, &UNCANCELLED_GENERATION, 0)
-    }
-
     fn capabilities(&self) -> RuntimeCapabilities {
         self.capabilities.clone()
-    }
-
-    fn health_check(&mut self) -> Result<()> {
-        self.load_model()
-    }
-
-    fn cancel(&mut self) -> Result<()> {
-        self.cancellation.cancel();
-        Ok(())
     }
 
     fn unload(&mut self) -> Result<()> {
@@ -501,8 +477,9 @@ mod tests {
         let audio = PreparedAudio::from_wav_path(audio_path).unwrap();
         let mut runtime = EmbeddedRuntime::new(model_path, AccelerationPreference::Cpu);
 
+        let generation = AtomicU64::new(0);
         let transcript = runtime
-            .transcribe(&audio, &TranscriptionOptions::default())
+            .transcribe_with_cancellation(&audio, &TranscriptionOptions::default(), &generation, 0)
             .unwrap();
 
         assert!(!transcript.text.trim().is_empty());
