@@ -1412,7 +1412,7 @@ pub(crate) fn stage_onnx_bundle_install(
                 completed_bytes: base.saturating_add(event.completed_bytes),
                 total_bytes: total_download_bytes,
                 bytes_per_second: event.bytes_per_second,
-                download_activity: None,
+                download_activity: event.download_activity,
             });
         };
         let downloaded = download_pinned_artifact_for_target(

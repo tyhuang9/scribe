@@ -266,6 +266,13 @@ pub(crate) enum ModelDownloadState {
     NotInstalled,
     Queued,
     Downloading,
+    Stalled,
+    Retrying {
+        attempt: u8,
+        max_attempts: u8,
+    },
+    Paused,
+    PartialRetained,
     WaitingForVerification,
     Verifying,
     Extracting,

@@ -2381,7 +2381,14 @@ fn model_lifecycle_presentation<'a>(
     can_replace_active: bool,
 ) -> ModelLifecyclePresentation<'a> {
     match card {
-        ModelCard::Local(model) if model.download_state == ModelDownloadState::Downloading => {
+        ModelCard::Local(model)
+            if matches!(
+                model.download_state,
+                ModelDownloadState::Downloading
+                    | ModelDownloadState::Stalled
+                    | ModelDownloadState::Retrying { .. }
+            ) =>
+        {
             ModelLifecyclePresentation {
                 action: ScreenAction::CancelModelInstall(model.id.clone()),
                 icon: Icon::Pause,
@@ -2389,9 +2396,34 @@ fn model_lifecycle_presentation<'a>(
                 accessible_name: format!("Pause {} download", model.display_name),
                 enabled: model.cancel_supported,
                 disabled_reason: model.primary_action_disabled_reason.as_deref(),
-                visible_status: None,
+                visible_status: model_download_activity_visible_status(model.download_state),
                 compact_size: None,
                 tone: ModelLifecycleTone::Standard,
+            }
+        }
+        ModelCard::Local(model)
+            if matches!(
+                model.download_state,
+                ModelDownloadState::Paused | ModelDownloadState::PartialRetained
+            ) =>
+        {
+            ModelLifecyclePresentation {
+                action: ScreenAction::InstallModel(model.id.clone()),
+                icon: Icon::Play,
+                label: "Resume".into(),
+                accessible_name: format!("Resume {} download", model.display_name),
+                enabled: model.install_action_enabled,
+                disabled_reason: model.primary_action_disabled_reason.as_deref(),
+                visible_status: Some(
+                    if model.download_state == ModelDownloadState::Paused {
+                        "Paused"
+                    } else {
+                        "Partial download retained"
+                    }
+                    .to_owned(),
+                ),
+                compact_size: None,
+                tone: ModelLifecycleTone::InverseFilled,
             }
         }
         ModelCard::Local(model)
@@ -2518,7 +2550,10 @@ fn model_lifecycle_presentation<'a>(
                 (
                     ScreenAction::InstallModel(model.id.clone()),
                     match model.download_state {
-                        ModelDownloadState::Failed | ModelDownloadState::Cancelled
+                        ModelDownloadState::Failed
+                        | ModelDownloadState::Cancelled
+                        | ModelDownloadState::Paused
+                        | ModelDownloadState::PartialRetained
                             if model.partial_cleanup_available =>
                         {
                             "Resume"
@@ -2531,7 +2566,10 @@ fn model_lifecycle_presentation<'a>(
                 action,
                 icon: if matches!(
                     model.download_state,
-                    ModelDownloadState::Cancelled | ModelDownloadState::Failed
+                    ModelDownloadState::Cancelled
+                        | ModelDownloadState::Failed
+                        | ModelDownloadState::Paused
+                        | ModelDownloadState::PartialRetained
                 ) && model.partial_cleanup_available
                 {
                     Icon::Play
@@ -2638,19 +2676,27 @@ fn model_lifecycle_controls<'a>(
     let mut primary = Some(model_lifecycle_presentation(card, can_replace_active));
     let discard = match card {
         ModelCard::Local(model)
-            if model.download_state == ModelDownloadState::Downloading
-                || (matches!(
-                    model.download_state,
-                    ModelDownloadState::Cancelled | ModelDownloadState::Failed
-                ) && model.partial_cleanup_available) =>
+            if matches!(
+                model.download_state,
+                ModelDownloadState::Downloading
+                    | ModelDownloadState::Stalled
+                    | ModelDownloadState::Retrying { .. }
+            ) || (matches!(
+                model.download_state,
+                ModelDownloadState::Cancelled
+                    | ModelDownloadState::Failed
+                    | ModelDownloadState::Paused
+                    | ModelDownloadState::PartialRetained
+            ) && model.partial_cleanup_available) =>
         {
             Some(ScreenAction::DiscardModelPartial(model.id.clone()))
         }
         ModelCard::Remote(entry, variant)
-            if matches!(
-                variant.status_label.as_deref(),
-                Some("Downloading") | Some("Cancelled") | Some("Failed")
-            ) =>
+            if remote_has_download_progress(variant.status_label.as_deref())
+                || matches!(
+                    variant.status_label.as_deref(),
+                    Some("Partial download retained") | Some("Cancelled") | Some("Failed")
+                ) =>
         {
             variant
                 .actions
@@ -2732,15 +2778,10 @@ fn model_lifecycle_controls<'a>(
 
 fn model_download_error(card: ModelCard<'_>) -> Option<&str> {
     match card {
-        ModelCard::Local(model)
-            if model.download_state == ModelDownloadState::Failed
-                && !model.partial_cleanup_available =>
-        {
+        ModelCard::Local(model) if model.download_state == ModelDownloadState::Failed => {
             model.error_message.as_deref()
         }
-        ModelCard::Remote(_, variant) if variant.downloaded_bytes.is_none() => {
-            variant.error_message.as_deref()
-        }
+        ModelCard::Remote(_, variant) => variant.error_message.as_deref(),
         _ => None,
     }
 }
@@ -5485,17 +5526,24 @@ fn model_download_progress_presentation(
 ) -> Option<ModelDownloadProgressPresentation> {
     let (downloaded_bytes, total_bytes) = match card {
         ModelCard::Local(model)
-            if model.download_state == ModelDownloadState::Downloading
-                || (matches!(
-                    model.download_state,
-                    ModelDownloadState::Cancelled | ModelDownloadState::Failed
-                ) && model.partial_cleanup_available) =>
+            if matches!(
+                model.download_state,
+                ModelDownloadState::Downloading
+                    | ModelDownloadState::Stalled
+                    | ModelDownloadState::Retrying { .. }
+            ) || (matches!(
+                model.download_state,
+                ModelDownloadState::Cancelled
+                    | ModelDownloadState::Failed
+                    | ModelDownloadState::Paused
+                    | ModelDownloadState::PartialRetained
+            ) && model.partial_cleanup_available) =>
         {
             (model.downloaded_bytes, model.total_bytes)
         }
-        // Retained byte counts can exist while queued or waiting; only an
-        // actively transferring variant owns a truthful progress meter.
-        ModelCard::Remote(_, variant) if variant.status_label.as_deref() == Some("Downloading") => {
+        ModelCard::Remote(_, variant)
+            if remote_has_download_progress(variant.status_label.as_deref()) =>
+        {
             (variant.downloaded_bytes?, variant.total_bytes)
         }
         _ => return None,
@@ -5538,6 +5586,26 @@ fn model_download_progress_presentation(
         display_text,
         accessible_text,
     })
+}
+
+fn model_download_activity_visible_status(state: ModelDownloadState) -> Option<String> {
+    match state {
+        ModelDownloadState::Stalled => Some("Waiting for connection…".to_owned()),
+        ModelDownloadState::Retrying {
+            attempt,
+            max_attempts,
+        } => Some(format!(
+            "Connection interrupted — retrying {attempt} of {max_attempts}"
+        )),
+        _ => None,
+    }
+}
+
+fn remote_has_download_progress(status: Option<&str>) -> bool {
+    matches!(
+        status,
+        Some("Downloading") | Some("Waiting for connection…")
+    ) || status.is_some_and(|status| status.starts_with("Connection interrupted — retrying "))
 }
 
 /// Consume Tab before egui's document-wide navigation sees it, then route it
@@ -9445,6 +9513,155 @@ mod tests {
         assert_eq!(
             warning.description(),
             Some("TLS certificate validation failed.")
+        );
+    }
+
+    #[test]
+    fn resilient_download_states_keep_their_distinct_controls_and_errors() {
+        for (state, expected_status) in [
+            (ModelDownloadState::Stalled, Some("Waiting for connection…")),
+            (
+                ModelDownloadState::Retrying {
+                    attempt: 2,
+                    max_attempts: 3,
+                },
+                Some("Connection interrupted — retrying 2 of 3"),
+            ),
+        ] {
+            let model = ModelViewModel {
+                id: "resilient".into(),
+                display_name: "Resilient download".into(),
+                download_state: state,
+                cancel_supported: true,
+                downloaded_bytes: 42,
+                total_bytes: Some(100),
+                ..Default::default()
+            };
+            let lifecycle = model_lifecycle_presentation(ModelCard::Local(&model), true);
+            assert_eq!(lifecycle.label, "Pause");
+            assert_eq!(lifecycle.visible_status.as_deref(), expected_status);
+            assert!(
+                model_lifecycle_controls(ModelCard::Local(&model), true)
+                    .discard
+                    .is_some()
+            );
+        }
+
+        for state in [
+            ModelDownloadState::Paused,
+            ModelDownloadState::PartialRetained,
+        ] {
+            let model = ModelViewModel {
+                id: "retained".into(),
+                display_name: "Retained download".into(),
+                download_state: state,
+                install_action_enabled: true,
+                partial_cleanup_available: true,
+                downloaded_bytes: 42,
+                total_bytes: Some(100),
+                ..Default::default()
+            };
+            let controls = model_lifecycle_controls(ModelCard::Local(&model), true);
+            assert_eq!(controls.primary.unwrap().label, "Resume");
+            assert!(controls.discard.is_some());
+            assert_eq!(controls.error_message, None);
+        }
+
+        let failed = ModelViewModel {
+            id: "failed-retained".into(),
+            display_name: "Failed retained download".into(),
+            download_state: ModelDownloadState::Failed,
+            install_action_enabled: true,
+            partial_cleanup_available: true,
+            downloaded_bytes: 42,
+            total_bytes: Some(100),
+            error_message: Some("Connection retries were exhausted.".into()),
+            ..Default::default()
+        };
+        let controls = model_lifecycle_controls(ModelCard::Local(&failed), true);
+        assert_eq!(controls.primary.unwrap().label, "Resume");
+        assert!(controls.discard.is_some());
+        assert_eq!(
+            controls.error_message,
+            Some("Connection retries were exhausted.")
+        );
+        assert_eq!(
+            controls.error_accessible_name.as_deref(),
+            Some("Show download error for Failed retained download")
+        );
+        let failed_output = render_model_card_at(&failed, 375.0, 680.0, Vec::new());
+        for name in [
+            "Resume Failed retained download download",
+            "Discard partial for Failed retained download",
+        ] {
+            let bounds = named_role_bounds(&failed_output, name, egui::accesskit::Role::Button);
+            assert!(bounds.width() >= 44.0 && bounds.height() >= 44.0, "{name}");
+        }
+    }
+
+    #[test]
+    fn local_and_remote_retry_labels_keep_pause_and_retained_controls_at_375px() {
+        let local = ModelViewModel {
+            id: "compact-retry".into(),
+            display_name: "Compact retry".into(),
+            download_state: ModelDownloadState::Retrying {
+                attempt: 1,
+                max_attempts: 3,
+            },
+            cancel_supported: true,
+            downloaded_bytes: 42,
+            total_bytes: Some(100),
+            ..Default::default()
+        };
+        let local_lifecycle = model_lifecycle_presentation(ModelCard::Local(&local), true);
+        assert_eq!(local_lifecycle.label, "Pause");
+        assert_eq!(
+            local_lifecycle.visible_status.as_deref(),
+            Some("Connection interrupted — retrying 1 of 3")
+        );
+        let output = render_model_card_at(&local, 375.0, 680.0, Vec::new());
+        let pause = named_role_bounds(
+            &output,
+            "Pause Compact retry download",
+            egui::accesskit::Role::Button,
+        );
+        let discard = named_role_bounds(
+            &output,
+            "Discard partial for Compact retry",
+            egui::accesskit::Role::Button,
+        );
+        assert!(pause.width() >= 44.0 && discard.width() >= 44.0);
+        assert!(pause.x1 <= discard.x0 + 0.1);
+
+        let entry = RemoteCatalogEntryView {
+            id: "remote".into(),
+            display_name: "Remote retry".into(),
+            ..Default::default()
+        };
+        let variant = RemoteCatalogVariantView {
+            status_label: Some("Connection interrupted — retrying 1 of 3".into()),
+            downloaded_bytes: Some(42),
+            total_bytes: Some(100),
+            actions: vec![RemoteCatalogActionView {
+                label: "Cancel".into(),
+                kind: RemoteCatalogActionKind::Cancel {
+                    model_id: "remote-download".into(),
+                },
+                enabled: true,
+                disabled_reason: None,
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            model_lifecycle_presentation(ModelCard::Remote(&entry, &variant), true).label,
+            "Pause"
+        );
+        assert_eq!(
+            variant.status_label.as_deref(),
+            local_lifecycle.visible_status.as_deref()
+        );
+        assert!(
+            model_download_progress_presentation(ModelCard::Remote(&entry, &variant)).is_some()
         );
     }
 

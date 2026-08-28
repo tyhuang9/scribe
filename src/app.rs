@@ -34,8 +34,10 @@ use crate::config::{
 };
 use crate::core::{DictationPhase, SessionCoordinator, SessionPurpose, StopReason};
 use crate::diagnostics::{
-    self, DiagnosticsStore, FailureStage as DiagnosticFailureStage, SessionDiagnostic,
-    SessionMetrics as DiagnosticSessionMetrics, SessionOutcome as DiagnosticSessionOutcome,
+    self, DiagnosticsStore, DownloadDiagnosticEvent, DownloadDiagnostics, DownloadFaultCategory,
+    DownloadJobId, DownloadRunId, DownloadSourceClass, FailureStage as DiagnosticFailureStage,
+    PublicArtifactId, SessionDiagnostic, SessionMetrics as DiagnosticSessionMetrics,
+    SessionOutcome as DiagnosticSessionOutcome,
 };
 use crate::history::{
     CompletedHistoryEntry, HistoryCursor, HistoryError, HistoryMetrics, HistoryPage, HistoryQuery,
@@ -47,10 +49,10 @@ use crate::huggingface_catalog::{
     CatalogSource, HuggingFaceCatalogService, ModelInventorySnapshot, RemoteModel, TrustedArtifact,
 };
 use crate::installations::{
-    ActivationJournal, ActivationPhase, DirectoryReplacement, FileReplacement, InstallCancellation,
-    InstallError, InstallProgress, InstallStage, ManagedRemoval, discover_managed_removal_targets,
-    fingerprint_file_cancellable, reconcile_activation_journal, reconcile_managed_removal,
-    remove_exact_regular_file,
+    ActivationJournal, ActivationPhase, DirectoryReplacement, DownloadActivity, DownloadFaultKind,
+    FileReplacement, InstallCancellation, InstallError, InstallProgress, InstallStage,
+    ManagedRemoval, discover_managed_removal_targets, fingerprint_file_cancellable,
+    reconcile_activation_journal, reconcile_managed_removal, remove_exact_regular_file,
 };
 use crate::installed_manifest;
 use crate::managed_downloads;
@@ -1587,6 +1589,7 @@ impl ArtifactInstallPhase {
 struct ArtifactInstallJob {
     handle: (u64, InstallCancellation),
     phase: ArtifactInstallPhase,
+    download_activity: Option<DownloadActivity>,
     source: Option<VerifiedInstallSource>,
     download_config: Option<AppConfig>,
     force_runtime_package: bool,
@@ -1729,6 +1732,7 @@ impl ArtifactInstallCoordinator {
             ArtifactInstallJob {
                 handle,
                 phase: ArtifactInstallPhase::Transferring,
+                download_activity: None,
                 source: None,
                 download_config: None,
                 force_runtime_package: false,
@@ -1794,6 +1798,7 @@ impl ArtifactInstallCoordinator {
             ArtifactInstallJob {
                 handle: (job_id, InstallCancellation::default()),
                 phase: ArtifactInstallPhase::QueuedTransfer,
+                download_activity: None,
                 source: Some(source),
                 download_config: Some(config),
                 force_runtime_package,
@@ -1894,6 +1899,34 @@ impl ArtifactInstallCoordinator {
             self.reserved_by_volume.remove(&reservation.volume);
         }
         true
+    }
+
+    /// Returns the preceding activity only when this is a correlated transfer
+    /// transition. Byte-only events carry `None` and intentionally do not
+    /// clear the retained activity state.
+    fn update_download_activity(
+        &mut self,
+        model_id: &str,
+        job_id: u64,
+        activity: DownloadActivity,
+    ) -> Option<Option<DownloadActivity>> {
+        let job = self.jobs.get_mut(model_id)?;
+        if job.handle.0 != job_id || job.phase != ArtifactInstallPhase::Transferring {
+            return None;
+        }
+        if job.download_activity == Some(activity) {
+            return None;
+        }
+        Some(std::mem::replace(
+            &mut job.download_activity,
+            Some(activity),
+        ))
+    }
+
+    fn download_activity_for_model(&self, model_id: &str) -> Option<DownloadActivity> {
+        self.jobs
+            .get(model_id)
+            .and_then(|job| job.download_activity)
     }
 
     fn next_finalizer_requirement(&self) -> Option<(String, bool)> {
@@ -2310,6 +2343,7 @@ fn run_verified_install_finalizer(
                 completed_bytes: model.size_bytes,
                 total_bytes: model.size_bytes,
                 bytes_per_second: None,
+                download_activity: None,
             });
             InstallationCandidate::normalized(
                 model_id.clone(),
@@ -2334,6 +2368,7 @@ fn run_verified_install_finalizer(
             completed_bytes: model.size_bytes,
             total_bytes: model.size_bytes,
             bytes_per_second: None,
+            download_activity: None,
         });
         service
             .verify_installation_candidate_for_activation(
@@ -2371,6 +2406,7 @@ fn run_verified_install_finalizer(
             completed_bytes: model.size_bytes,
             total_bytes: model.size_bytes,
             bytes_per_second: None,
+            download_activity: None,
         });
         let smoke = service
             .verify_installation_candidate_for_activation(
@@ -2401,6 +2437,7 @@ fn run_verified_install_finalizer(
         completed_bytes: model.size_bytes,
         total_bytes: model.size_bytes,
         bytes_per_second: None,
+        download_activity: None,
     });
 
     let runtime_target = staged_runtime.as_ref().map(|_| target_root.clone());
@@ -3401,6 +3438,9 @@ pub struct LocalTranscriberApp {
     playground_runs: HashMap<SessionId, PlaygroundRunState>,
     latest_latency: Option<LatencyTrace>,
     diagnostics: DiagnosticsStore,
+    download_diagnostics: Option<DownloadDiagnostics>,
+    download_diagnostic_run: Option<DownloadRunId>,
+    onnx_download_activity: Option<DownloadActivity>,
     #[cfg(test)]
     test_gguf_fixture: Option<PathBuf>,
     captured_targets: HashMap<SessionId, CapturedTarget>,
@@ -3470,6 +3510,25 @@ impl LocalTranscriberApp {
             }
         };
         let history_playback = PlaybackService::new().ok();
+        let download_diagnostic_run = DownloadRunId::new(format!(
+            "run-{}-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+            std::process::id()
+        ))
+        .ok();
+        let download_diagnostics = download_diagnostic_run.as_ref().and_then(|run| {
+            config::history_storage_dir().ok().map(|history| {
+                let directory = history
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or(history)
+                    .join("diagnostics");
+                DownloadDiagnostics::start(directory, run)
+            })
+        });
         let settings_store = config_path
             .clone()
             .map(|path| SettingsStore::new(path, SETTINGS_SAVE_DEBOUNCE));
@@ -3578,6 +3637,9 @@ impl LocalTranscriberApp {
             playground_runs: HashMap::new(),
             latest_latency: None,
             diagnostics: DiagnosticsStore::default(),
+            download_diagnostics,
+            download_diagnostic_run,
+            onnx_download_activity: None,
             #[cfg(test)]
             test_gguf_fixture: None,
             captured_targets: HashMap::new(),
@@ -3591,6 +3653,10 @@ impl LocalTranscriberApp {
             window_hidden_to_tray: false,
             quit_requested: false,
         };
+        if let Some(download_diagnostics) = app.download_diagnostics.as_ref() {
+            app.diagnostics
+                .attach_download_diagnostics(download_diagnostics);
+        }
 
         let allowed_model_targets = config::configured_models(&app.config)
             .into_iter()
@@ -6664,6 +6730,20 @@ impl LocalTranscriberApp {
                             *active_job == job_id && active_model == &model_id
                         },
                     ) {
+                        if let Some(activity) = progress.download_activity {
+                            let previous = self.onnx_download_activity;
+                            if previous != Some(activity) {
+                                self.onnx_download_activity = Some(activity);
+                                self.record_download_activity(
+                                    &model_id,
+                                    job_id,
+                                    previous,
+                                    activity,
+                                    progress.completed_bytes,
+                                    Some(progress.total_bytes),
+                                );
+                            }
+                        }
                         self.model_downloads.insert(
                             model_id,
                             ModelInstallStatus::Downloading {
@@ -6689,9 +6769,26 @@ impl LocalTranscriberApp {
                         continue;
                     }
                     self.onnx_bundle_install = None;
+                    self.onnx_download_activity = None;
                     self.remote_catalog.invalidate_local_models();
+                    let (downloaded_bytes, total_bytes) = self
+                        .model_downloads
+                        .get(&model_id)
+                        .and_then(model_install_download_bytes)
+                        .unwrap_or((0, None));
                     match result {
                         Ok(smoke) => {
+                            self.record_download_diagnostic(
+                                &model_id,
+                                job_id,
+                                downloaded_bytes,
+                                total_bytes,
+                                |run, job, artifact, source, completed, total| {
+                                    DownloadDiagnosticEvent::completion(
+                                        run, job, artifact, source, completed, total, None,
+                                    )
+                                },
+                            );
                             self.model_downloads
                                 .insert(model_id, ModelInstallStatus::Installed);
                             self.status = TranscriptionStatus::Idle;
@@ -6705,14 +6802,53 @@ impl LocalTranscriberApp {
                             self.rebuild_local_models_after_committed_change();
                         }
                         Err(message) => {
+                            if paused {
+                                self.record_download_diagnostic(
+                                    &model_id,
+                                    job_id,
+                                    downloaded_bytes,
+                                    total_bytes,
+                                    |run, job, artifact, source, completed, total| {
+                                        DownloadDiagnosticEvent::pause(
+                                            run, job, artifact, source, completed, total,
+                                        )
+                                    },
+                                );
+                            } else {
+                                self.record_download_diagnostic(
+                                    &model_id,
+                                    job_id,
+                                    downloaded_bytes,
+                                    total_bytes,
+                                    |run, job, artifact, source, completed, total| {
+                                        DownloadDiagnosticEvent::failure(
+                                            run,
+                                            job,
+                                            artifact,
+                                            source,
+                                            completed,
+                                            total,
+                                            None,
+                                            DownloadFaultCategory::RemoteUnavailable,
+                                        )
+                                    },
+                                );
+                            }
+                            let (downloaded_bytes, total_bytes) = self
+                                .model_downloads
+                                .get(&model_id)
+                                .and_then(model_install_download_bytes)
+                                .unwrap_or((0, None));
                             self.model_downloads.insert(
                                 model_id,
-                                ModelInstallStatus::Error(if paused {
-                                    "Paused. Downloaded partials were retained for Resume."
-                                        .to_owned()
+                                if paused {
+                                    ModelInstallStatus::Paused {
+                                        downloaded_bytes,
+                                        total_bytes,
+                                    }
                                 } else {
-                                    message.clone()
-                                }),
+                                    ModelInstallStatus::Error(message.clone())
+                                },
                             );
                             self.status = if paused {
                                 TranscriptionStatus::Idle
@@ -7569,6 +7705,22 @@ impl LocalTranscriberApp {
                     {
                         continue;
                     }
+                    let prior_status = self.model_downloads.get(&model_id).cloned();
+                    let activity_transition = progress.download_activity.and_then(|activity| {
+                        self.artifact_installations
+                            .update_download_activity(&model_id, job_id, activity)
+                            .map(|previous| (previous, activity))
+                    });
+                    if let Some((previous, activity)) = activity_transition {
+                        self.record_download_activity(
+                            &model_id,
+                            job_id,
+                            previous,
+                            activity,
+                            progress.completed_bytes,
+                            Some(progress.total_bytes),
+                        );
+                    }
                     if matches!(
                         progress.stage,
                         InstallStage::Downloading | InstallStage::Verifying
@@ -7604,10 +7756,28 @@ impl LocalTranscriberApp {
                     );
                     self.update_model_download_progress_projection(&model_id);
                     self.update_remote_download_progress_projection(&model_id);
-                    self.status_message = self
-                        .artifact_installations
-                        .aggregate_status()
-                        .unwrap_or_else(|| format!("{stage_label} for {model_id}..."));
+                    if progress.stage != InstallStage::Downloading
+                        && matches!(prior_status, Some(ModelInstallStatus::Downloading { .. }))
+                    {
+                        self.record_download_diagnostic(
+                            &model_id,
+                            job_id,
+                            progress.completed_bytes,
+                            Some(progress.total_bytes),
+                            |run, job, artifact, source, completed, total| {
+                                DownloadDiagnosticEvent::phase_transition(
+                                    run, job, artifact, source, completed, total,
+                                )
+                            },
+                        );
+                    }
+                    if progress.stage != InstallStage::Downloading || activity_transition.is_some()
+                    {
+                        self.status_message = self
+                            .artifact_installations
+                            .aggregate_status()
+                            .unwrap_or_else(|| format!("{stage_label} for {model_id}..."));
+                    }
                 }
                 AppEvent::VerifiedInstallPrepared {
                     job_id,
@@ -7891,6 +8061,17 @@ impl LocalTranscriberApp {
                     } else {
                         self.status = TranscriptionStatus::Idle;
                         self.status_message = message;
+                        self.record_download_diagnostic(
+                            &model_id,
+                            job_id,
+                            0,
+                            None,
+                            |run, job, artifact, source, completed, total| {
+                                DownloadDiagnosticEvent::completion(
+                                    run, job, artifact, source, completed, total, None,
+                                )
+                            },
+                        );
                     }
                     self.finish_artifact_install(&model_id, job_id);
                 }
@@ -7900,13 +8081,20 @@ impl LocalTranscriberApp {
                     message,
                     recovery_required,
                 } => {
-                    if self
-                        .artifact_installations
-                        .get(&model_id)
-                        .is_none_or(|(active_job, _)| *active_job != job_id)
-                    {
+                    let Some((active_job, cancellation)) =
+                        self.artifact_installations.get(&model_id)
+                    else {
+                        continue;
+                    };
+                    if *active_job != job_id {
                         continue;
                     }
+                    let paused = cancellation.is_cancelled() && !recovery_required;
+                    let (downloaded_bytes, total_bytes) = self
+                        .model_downloads
+                        .get(&model_id)
+                        .and_then(model_install_download_bytes)
+                        .unwrap_or((0, None));
                     self.remote_catalog.invalidate_local_models();
                     let discard_result = self
                         .take_requested_partial_discard(&model_id, job_id)
@@ -7915,8 +8103,35 @@ impl LocalTranscriberApp {
                         self.artifact_recovery_error = Some(message.clone());
                         self.freeze_artifact_installs_for_recovery(Some(job_id));
                     }
-                    self.model_downloads
-                        .insert(model_id.clone(), ModelInstallStatus::Error(message.clone()));
+                    self.model_downloads.insert(
+                        model_id.clone(),
+                        if paused {
+                            ModelInstallStatus::Paused {
+                                downloaded_bytes,
+                                total_bytes,
+                            }
+                        } else {
+                            self.record_download_diagnostic(
+                                &model_id,
+                                job_id,
+                                downloaded_bytes,
+                                total_bytes,
+                                |run, job, artifact, source, completed, total| {
+                                    DownloadDiagnosticEvent::failure(
+                                        run,
+                                        job,
+                                        artifact,
+                                        source,
+                                        completed,
+                                        total,
+                                        None,
+                                        DownloadFaultCategory::RemoteUnavailable,
+                                    )
+                                },
+                            );
+                            ModelInstallStatus::Error(message.clone())
+                        },
+                    );
                     if let Some(result) = discard_result {
                         let cleanup_succeeded = result.is_ok();
                         self.finish_partial_discard(&model_id, result);
@@ -7925,8 +8140,17 @@ impl LocalTranscriberApp {
                             self.status_message = format!("Installation failed: {message}");
                         }
                     } else if self.artifact_recovery_error.is_none() {
-                        self.status = TranscriptionStatus::Error;
-                        self.status_message = format!("Installation failed: {message}");
+                        self.status = if paused {
+                            TranscriptionStatus::Idle
+                        } else {
+                            TranscriptionStatus::Error
+                        };
+                        self.status_message = if paused {
+                            "Paused model download. Downloaded partials were retained; choose Resume to continue."
+                                .to_owned()
+                        } else {
+                            format!("Installation failed: {message}")
+                        };
                     }
                     self.finish_artifact_install(&model_id, job_id);
                 }
@@ -8902,6 +9126,7 @@ impl LocalTranscriberApp {
                 let job_id = INSTALL_JOB_SEQUENCE.fetch_add(1, Ordering::Relaxed);
                 let cancellation = InstallCancellation::default();
                 self.onnx_bundle_install = Some((job_id, model.id.clone(), cancellation.clone()));
+                self.onnx_download_activity = None;
                 self.model_downloads.insert(
                     model.id.clone(),
                     ModelInstallStatus::Downloading {
@@ -8912,6 +9137,15 @@ impl LocalTranscriberApp {
                 );
                 self.status = TranscriptionStatus::Idle;
                 self.status_message = format!("Downloading {}...", model.name);
+                self.record_download_diagnostic(
+                    &model.id,
+                    job_id,
+                    0,
+                    model_download_total_bytes(model),
+                    |run, job, artifact, source, _, total| {
+                        DownloadDiagnosticEvent::admission(run, job, artifact, source, total)
+                    },
+                );
                 self.rebuild_model_inventory_projection();
                 let tx = self.tx.clone();
                 let service = self.current_transcription_service();
@@ -9010,16 +9244,28 @@ impl LocalTranscriberApp {
         self.status_message = format!("Downloading {}...", model.name);
 
         self.discard_partial_after_install.remove(&model.id);
-        if let Err(message) = self.artifact_installations.admit(
+        let job_id = match self.artifact_installations.admit(
             model.id.clone(),
             admission,
             self.config.clone(),
             VerifiedInstallSource::NormalizedCatalog,
             force_runtime_package,
         ) {
-            self.fail_model_install(&model.id, message);
-            return;
-        }
+            Ok(job_id) => job_id,
+            Err(message) => {
+                self.fail_model_install(&model.id, message);
+                return;
+            }
+        };
+        self.record_download_diagnostic(
+            &model.id,
+            job_id,
+            0,
+            expected_total_bytes,
+            |run, job, artifact, source, _, total| {
+                DownloadDiagnosticEvent::admission(run, job, artifact, source, total)
+            },
+        );
         self.launch_ready_artifact_transfers();
         if let Some(status) = self.artifact_installations.aggregate_status() {
             self.status_message = status;
@@ -9073,19 +9319,32 @@ impl LocalTranscriberApp {
         self.remote_catalog.invalidate_local_models();
         self.status = TranscriptionStatus::Idle;
         self.status_message = format!("Downloading {}...", request.display_name);
+        let expected_total_bytes = Some(request.artifact.size_bytes);
 
         self.discard_partial_after_install.remove(&model_id);
-        if let Err(message) = self.artifact_installations.admit(
+        let job_id = match self.artifact_installations.admit(
             model_id.clone(),
             admission,
             self.config.clone(),
             VerifiedInstallSource::TrustedRemote(request),
             false,
         ) {
-            self.status = TranscriptionStatus::Error;
-            self.status_message = message;
-            return;
-        }
+            Ok(job_id) => job_id,
+            Err(message) => {
+                self.status = TranscriptionStatus::Error;
+                self.status_message = message;
+                return;
+            }
+        };
+        self.record_download_diagnostic(
+            &model_id,
+            job_id,
+            0,
+            expected_total_bytes,
+            |run, job, artifact, source, _, total| {
+                DownloadDiagnosticEvent::admission(run, job, artifact, source, total)
+            },
+        );
         self.launch_ready_artifact_transfers();
         if let Some(status) = self.artifact_installations.aggregate_status() {
             self.status_message = status;
@@ -9209,6 +9468,124 @@ impl LocalTranscriberApp {
         }
     }
 
+    fn download_diagnostic_ids(
+        &self,
+        model_id: &str,
+        job_id: u64,
+    ) -> Option<(DownloadRunId, DownloadJobId, PublicArtifactId)> {
+        Some((
+            self.download_diagnostic_run.clone()?,
+            DownloadJobId::new(format!("install-{job_id}")).ok()?,
+            PublicArtifactId::new(model_id).ok()?,
+        ))
+    }
+
+    fn record_download_diagnostic(
+        &self,
+        model_id: &str,
+        job_id: u64,
+        completed: u64,
+        total: Option<u64>,
+        event: impl FnOnce(
+            DownloadRunId,
+            DownloadJobId,
+            PublicArtifactId,
+            DownloadSourceClass,
+            u64,
+            Option<u64>,
+        ) -> DownloadDiagnosticEvent,
+    ) {
+        let Some(diagnostics) = self.download_diagnostics.as_ref() else {
+            return;
+        };
+        let Some((run, job, artifact)) = self.download_diagnostic_ids(model_id, job_id) else {
+            return;
+        };
+        let _ = diagnostics.record(event(
+            run,
+            job,
+            artifact,
+            DownloadSourceClass::ModelRepository,
+            completed,
+            total,
+        ));
+    }
+
+    fn record_download_activity(
+        &self,
+        model_id: &str,
+        job_id: u64,
+        previous: Option<DownloadActivity>,
+        activity: DownloadActivity,
+        completed: u64,
+        total: Option<u64>,
+    ) {
+        match activity {
+            DownloadActivity::Stalled => self.record_download_diagnostic(
+                model_id,
+                job_id,
+                completed,
+                total,
+                |run, job, artifact, source, completed, total| {
+                    DownloadDiagnosticEvent::first_stall(
+                        run,
+                        job,
+                        artifact,
+                        source,
+                        completed,
+                        total,
+                        DownloadFaultCategory::Timeout,
+                    )
+                },
+            ),
+            DownloadActivity::RetryScheduled { attempt, cause, .. } => self
+                .record_download_diagnostic(
+                    model_id,
+                    job_id,
+                    completed,
+                    total,
+                    |run, job, artifact, source, completed, total| {
+                        DownloadDiagnosticEvent::retry_scheduled(
+                            run,
+                            job,
+                            artifact,
+                            source,
+                            completed,
+                            total,
+                            u32::from(attempt),
+                            download_fault_category(cause),
+                        )
+                    },
+                ),
+            DownloadActivity::Active
+                if matches!(previous, Some(DownloadActivity::RetryScheduled { .. })) =>
+            {
+                let attempt = match previous {
+                    Some(DownloadActivity::RetryScheduled { attempt, .. }) => attempt,
+                    _ => unreachable!(),
+                };
+                self.record_download_diagnostic(
+                    model_id,
+                    job_id,
+                    completed,
+                    total,
+                    |run, job, artifact, source, completed, total| {
+                        DownloadDiagnosticEvent::reconnection(
+                            run,
+                            job,
+                            artifact,
+                            source,
+                            completed,
+                            total,
+                            u32::from(attempt),
+                        )
+                    },
+                );
+            }
+            DownloadActivity::Active => {}
+        }
+    }
+
     fn cancel_artifact_install(&mut self, model_id: &str) {
         if let Some((_, active_model_id, cancellation)) = &self.onnx_bundle_install
             && active_model_id == model_id
@@ -9244,18 +9621,50 @@ impl LocalTranscriberApp {
         match self.artifact_installations.cancel(model_id) {
             ArtifactCancellationOutcome::Missing => {}
             ArtifactCancellationOutcome::SignalledTransfer { .. } => {
+                if let Some((job_id, _)) = self.artifact_installations.get(model_id) {
+                    let (completed, total) = self
+                        .model_downloads
+                        .get(model_id)
+                        .and_then(model_install_download_bytes)
+                        .unwrap_or((0, None));
+                    self.record_download_diagnostic(
+                        model_id,
+                        *job_id,
+                        completed,
+                        total,
+                        |run, job, artifact, source, completed, total| {
+                            DownloadDiagnosticEvent::pause(
+                                run, job, artifact, source, completed, total,
+                            )
+                        },
+                    );
+                }
                 self.status_message = format!(
                     "Cancelling {display_name}. Downloaded partials will be kept for Resume."
                 );
             }
-            ArtifactCancellationOutcome::SettledBeforeFinalizer { .. } => {
+            ArtifactCancellationOutcome::SettledBeforeFinalizer { job_id } => {
                 self.discard_partial_after_install.remove(model_id);
+                let (downloaded_bytes, total_bytes) = self
+                    .model_downloads
+                    .get(model_id)
+                    .and_then(model_install_download_bytes)
+                    .unwrap_or((0, None));
                 self.model_downloads.insert(
                     model_id.to_owned(),
-                    ModelInstallStatus::Error(
-                        "Installation cancelled. Downloaded partials were retained for Resume."
-                            .to_owned(),
-                    ),
+                    ModelInstallStatus::Paused {
+                        downloaded_bytes,
+                        total_bytes,
+                    },
+                );
+                self.record_download_diagnostic(
+                    model_id,
+                    job_id,
+                    downloaded_bytes,
+                    total_bytes,
+                    |run, job, artifact, source, completed, total| {
+                        DownloadDiagnosticEvent::pause(run, job, artifact, source, completed, total)
+                    },
                 );
                 self.remote_catalog.invalidate_local_models();
                 self.status = TranscriptionStatus::Idle;
@@ -10094,6 +10503,9 @@ impl LocalTranscriberApp {
             eprintln!(
                 "local GGUF import exceeded the shutdown deadline; detaching cancelled worker"
             );
+        }
+        if let Some(diagnostics) = self.download_diagnostics.as_ref() {
+            let _ = diagnostics.flush(Duration::from_millis(150));
         }
     }
 }
@@ -11024,14 +11436,31 @@ impl LocalTranscriberApp {
                     && let Some(status) = self.model_downloads.get(download_id)
                 {
                     status_label = Some(
-                        install_phase
-                            .map(|phase| phase.status_label().to_owned())
+                        self.artifact_installations
+                            .download_activity_for_model(download_id)
+                            .or_else(|| {
+                                self.onnx_bundle_install
+                                    .as_ref()
+                                    .is_some_and(|(_, active_model_id, _)| active_model_id == download_id)
+                                    .then_some(self.onnx_download_activity)
+                                    .flatten()
+                            })
+                            .map(download_activity_label)
+                            .or_else(|| install_phase.map(|phase| phase.status_label().to_owned()))
                             .unwrap_or_else(|| status.label())
                     );
                     if let ModelInstallStatus::Downloading {
                         downloaded_bytes: progress_downloaded_bytes,
                         total_bytes: progress_total_bytes,
                         ..
+                    } = status
+                    {
+                        downloaded_bytes = Some(*progress_downloaded_bytes);
+                        total_bytes = *progress_total_bytes;
+                    }
+                    if let ModelInstallStatus::Paused {
+                        downloaded_bytes: progress_downloaded_bytes,
+                        total_bytes: progress_total_bytes,
                     } = status
                     {
                         downloaded_bytes = Some(*progress_downloaded_bytes);
@@ -11061,7 +11490,7 @@ impl LocalTranscriberApp {
                                         .to_owned()
                                 }),
                         });
-                    } else if matches!(status, ModelInstallStatus::Error(_)) {
+                    } else if matches!(status, ModelInstallStatus::Error(_) | ModelInstallStatus::Paused { .. }) {
                         actions.push(install_action("Resume"));
                     }
                 } else if let Some(installed_id) = installed_id {
@@ -11379,6 +11808,18 @@ impl LocalTranscriberApp {
             Some(ArtifactInstallPhase::Finalizing) => ModelDownloadState::Verifying,
             Some(ArtifactInstallPhase::Transferring) | None => download_state,
         };
+        let download_state = self
+            .artifact_installations
+            .download_activity_for_model(model_id)
+            .or_else(|| {
+                self.onnx_bundle_install
+                    .as_ref()
+                    .is_some_and(|(_, active_model_id, _)| active_model_id == model_id)
+                    .then_some(self.onnx_download_activity)
+                    .flatten()
+            })
+            .map(model_download_state_for_activity)
+            .unwrap_or(download_state);
         if let Some(model) = Arc::make_mut(&mut self.remote_catalog.local_models)
             .iter_mut()
             .find(|model| model.id == model_id)
@@ -11414,6 +11855,19 @@ impl LocalTranscriberApp {
         {
             variant.downloaded_bytes = Some(*downloaded_bytes);
             variant.total_bytes = *total_bytes;
+            if let Some(activity) = self
+                .artifact_installations
+                .download_activity_for_model(model_id)
+                .or_else(|| {
+                    self.onnx_bundle_install
+                        .as_ref()
+                        .is_some_and(|(_, active_model_id, _)| active_model_id == model_id)
+                        .then_some(self.onnx_download_activity)
+                        .flatten()
+                })
+            {
+                variant.status_label = Some(download_activity_label(activity));
+            }
         }
     }
 
@@ -11522,12 +11976,8 @@ impl LocalTranscriberApp {
             }
             ModelInstallStatus::Installed => ModelDownloadState::Installed,
             ModelInstallStatus::Downloading { .. } => ModelDownloadState::Downloading,
+            ModelInstallStatus::Paused { .. } => ModelDownloadState::Paused,
             ModelInstallStatus::InstallingRuntime => ModelDownloadState::Verifying,
-            ModelInstallStatus::Error(message) | ModelInstallStatus::RuntimeError(message)
-                if message.contains("cancelled") || message.contains("Cancelled") =>
-            {
-                ModelDownloadState::Cancelled
-            }
             ModelInstallStatus::Error(_)
             | ModelInstallStatus::RuntimeError(_)
             | ModelInstallStatus::Missing => ModelDownloadState::Failed,
@@ -11541,6 +11991,17 @@ impl LocalTranscriberApp {
             Some(ArtifactInstallPhase::Finalizing) => ModelDownloadState::Verifying,
             Some(ArtifactInstallPhase::Transferring) | None => download_state,
         };
+        if let Some(activity) = self
+            .artifact_installations
+            .download_activity_for_model(&model.id)
+            .or_else(|| {
+                onnx_install_active
+                    .then_some(self.onnx_download_activity)
+                    .flatten()
+            })
+        {
+            download_state = model_download_state_for_activity(activity);
+        }
         if has_partial
             && !self.model_downloads.contains_key(&model.id)
             && matches!(
@@ -11548,13 +12009,17 @@ impl LocalTranscriberApp {
                 ModelDownloadState::NotInstalled | ModelDownloadState::Failed
             )
         {
-            download_state = ModelDownloadState::Cancelled;
+            download_state = ModelDownloadState::PartialRetained;
         }
         let (downloaded_bytes, total_bytes) = match &install_status {
             ModelInstallStatus::Downloading {
                 downloaded_bytes,
                 total_bytes,
                 ..
+            } => (*downloaded_bytes, *total_bytes),
+            ModelInstallStatus::Paused {
+                downloaded_bytes,
+                total_bytes,
             } => (*downloaded_bytes, *total_bytes),
             _ => (
                 match partial_inspection {
@@ -12887,6 +13352,13 @@ impl LocalTranscriberApp {
         }
         if let Some(diagnostic) = self.overlay_diagnostic {
             diagnostics.push(diagnostic.settings_diagnostic());
+        }
+        if let Some(diagnostic) = self
+            .download_diagnostics
+            .as_ref()
+            .and_then(DownloadDiagnostics::take_new_nonfatal_error)
+        {
+            diagnostics.push(diagnostic.settings_diagnostic().to_owned());
         }
         diagnostics
     }
@@ -14542,10 +15014,64 @@ fn install_chip_tone(status: &ModelInstallStatus) -> ChipTone {
         ModelInstallStatus::Downloading { .. } | ModelInstallStatus::InstallingRuntime => {
             ChipTone::Active
         }
+        ModelInstallStatus::Paused { .. } => ChipTone::Warning,
         ModelInstallStatus::Missing
         | ModelInstallStatus::Error(_)
         | ModelInstallStatus::RuntimeError(_) => ChipTone::Error,
         ModelInstallStatus::NotInstalled => ChipTone::Warning,
+    }
+}
+
+fn download_fault_category(fault: DownloadFaultKind) -> DownloadFaultCategory {
+    match fault {
+        DownloadFaultKind::TimedOut
+        | DownloadFaultKind::Stalled
+        | DownloadFaultKind::HttpStatus(408) => DownloadFaultCategory::Timeout,
+        DownloadFaultKind::ConnectionReset
+        | DownloadFaultKind::ConnectionFailed
+        | DownloadFaultKind::Dns
+        | DownloadFaultKind::PrematureEof => DownloadFaultCategory::Connectivity,
+        DownloadFaultKind::HttpStatus(_) => DownloadFaultCategory::RemoteUnavailable,
+    }
+}
+
+fn model_download_state_for_activity(activity: DownloadActivity) -> ModelDownloadState {
+    match activity {
+        DownloadActivity::Active => ModelDownloadState::Downloading,
+        DownloadActivity::Stalled => ModelDownloadState::Stalled,
+        DownloadActivity::RetryScheduled {
+            attempt,
+            max_attempts,
+            ..
+        } => ModelDownloadState::Retrying {
+            attempt,
+            max_attempts,
+        },
+    }
+}
+
+fn download_activity_label(activity: DownloadActivity) -> String {
+    match activity {
+        DownloadActivity::Active => "Downloading".to_owned(),
+        DownloadActivity::Stalled => "Waiting for connection…".to_owned(),
+        DownloadActivity::RetryScheduled { attempt, .. } => {
+            format!("Connection interrupted — retrying {attempt} of 3")
+        }
+    }
+}
+
+fn model_install_download_bytes(status: &ModelInstallStatus) -> Option<(u64, Option<u64>)> {
+    match status {
+        ModelInstallStatus::Downloading {
+            downloaded_bytes,
+            total_bytes,
+            ..
+        }
+        | ModelInstallStatus::Paused {
+            downloaded_bytes,
+            total_bytes,
+        } => Some((*downloaded_bytes, *total_bytes)),
+        _ => None,
     }
 }
 
@@ -15348,9 +15874,9 @@ fn runtime_status_for_model(config: &AppConfig, model: &SttModelInfo) -> ModelRu
     ) {
         return match &model.install_status {
             ModelInstallStatus::Installed => ModelRuntimeStatus::Ready,
-            ModelInstallStatus::Downloading { .. } | ModelInstallStatus::InstallingRuntime => {
-                ModelRuntimeStatus::Downloading
-            }
+            ModelInstallStatus::Downloading { .. }
+            | ModelInstallStatus::Paused { .. }
+            | ModelInstallStatus::InstallingRuntime => ModelRuntimeStatus::Downloading,
             ModelInstallStatus::NotInstalled => ModelRuntimeStatus::NotInstalled,
             ModelInstallStatus::Missing => ModelRuntimeStatus::MissingConfiguration,
             ModelInstallStatus::Error(message) | ModelInstallStatus::RuntimeError(message) => {
@@ -15369,9 +15895,9 @@ fn runtime_status_for_model(config: &AppConfig, model: &SttModelInfo) -> ModelRu
     {
         return match model.install_status {
             ModelInstallStatus::Installed => ModelRuntimeStatus::Ready,
-            ModelInstallStatus::Downloading { .. } | ModelInstallStatus::InstallingRuntime => {
-                ModelRuntimeStatus::Downloading
-            }
+            ModelInstallStatus::Downloading { .. }
+            | ModelInstallStatus::Paused { .. }
+            | ModelInstallStatus::InstallingRuntime => ModelRuntimeStatus::Downloading,
             ModelInstallStatus::NotInstalled => ModelRuntimeStatus::NotInstalled,
             ModelInstallStatus::Missing => ModelRuntimeStatus::MissingConfiguration,
             ModelInstallStatus::Error(ref message)
@@ -15386,7 +15912,9 @@ fn runtime_status_for_model(config: &AppConfig, model: &SttModelInfo) -> ModelRu
 
     match provider.model_install_status(model) {
         ModelInstallStatus::Installed => provider.runtime_status(config),
-        ModelInstallStatus::Downloading { .. } => ModelRuntimeStatus::Downloading,
+        ModelInstallStatus::Downloading { .. } | ModelInstallStatus::Paused { .. } => {
+            ModelRuntimeStatus::Downloading
+        }
         ModelInstallStatus::InstallingRuntime => ModelRuntimeStatus::Downloading,
         ModelInstallStatus::NotInstalled => ModelRuntimeStatus::NotInstalled,
         ModelInstallStatus::Missing => ModelRuntimeStatus::MissingConfiguration,
@@ -15568,6 +16096,7 @@ mod layout_tests {
                     completed_bytes: 512,
                     total_bytes: 1_024,
                     bytes_per_second: Some(256),
+                    download_activity: None,
                 },
             })
         });
@@ -21257,6 +21786,9 @@ mod layout_tests {
             playground_runs: HashMap::new(),
             latest_latency: None,
             diagnostics: DiagnosticsStore::default(),
+            download_diagnostics: None,
+            download_diagnostic_run: None,
+            onnx_download_activity: None,
             test_gguf_fixture: Some(fixture),
             captured_targets: HashMap::new(),
             overlay_controller: OverlayController::new(),
@@ -21942,7 +22474,10 @@ mod layout_tests {
             .into_iter()
             .find(|model| model.id == model_id.as_str())
             .unwrap();
-        assert_eq!(restarted_view.download_state, ModelDownloadState::Cancelled);
+        assert_eq!(
+            restarted_view.download_state,
+            ModelDownloadState::PartialRetained
+        );
         assert!(restarted_view.partial_cleanup_available);
         assert!(restarted_view.partial_cleanup_enabled);
         let _ = app.remote_catalog_view();
@@ -23976,6 +24511,162 @@ mod layout_tests {
         let next = coordinator.take_ready_transfers();
         assert_eq!(next.len(), 1);
         assert_eq!(next[0].model_id, "model-3");
+    }
+
+    #[test]
+    fn correlated_activity_survives_byte_updates_and_rejects_stale_jobs() {
+        let mut coordinator = ArtifactInstallCoordinator::default();
+        let job_id = coordinator
+            .admit(
+                "activity-model".to_owned(),
+                coordinator_admission(
+                    "activity-model.gguf",
+                    "activity-volume",
+                    crate::disk_space::SAFETY_HEADROOM_BYTES + 1_000,
+                    100,
+                ),
+                AppConfig::default(),
+                VerifiedInstallSource::NormalizedCatalog,
+                false,
+            )
+            .unwrap();
+        coordinator.take_ready_transfers();
+        assert_eq!(
+            coordinator.update_download_activity(
+                "activity-model",
+                job_id,
+                DownloadActivity::Stalled,
+            ),
+            Some(None)
+        );
+        assert!(coordinator.update_download_reservation("activity-model", job_id, 75));
+
+        // Byte-only updates intentionally do not call update_download_activity;
+        // the latest transition remains the projection truth.
+        assert_eq!(
+            coordinator.download_activity_for_model("activity-model"),
+            Some(DownloadActivity::Stalled)
+        );
+        assert_eq!(
+            coordinator.update_download_activity(
+                "activity-model",
+                job_id.saturating_add(1),
+                DownloadActivity::Active,
+            ),
+            None
+        );
+        assert_eq!(
+            coordinator.download_activity_for_model("activity-model"),
+            Some(DownloadActivity::Stalled)
+        );
+        assert_eq!(
+            coordinator.get_job("activity-model").unwrap().phase,
+            ArtifactInstallPhase::Transferring
+        );
+        assert_eq!(coordinator.active_transfers, 1);
+        assert_eq!(
+            coordinator.reserved_by_volume.get("activity-volume"),
+            Some(&75)
+        );
+    }
+
+    #[test]
+    fn stalled_and_retrying_transfers_keep_their_slot_and_reservation() {
+        let mut coordinator = ArtifactInstallCoordinator::default();
+        let job_id = coordinator
+            .admit(
+                "retry-model".to_owned(),
+                coordinator_admission(
+                    "retry-model.gguf",
+                    "retry-volume",
+                    crate::disk_space::SAFETY_HEADROOM_BYTES + 1_000,
+                    100,
+                ),
+                AppConfig::default(),
+                VerifiedInstallSource::NormalizedCatalog,
+                false,
+            )
+            .unwrap();
+        coordinator.take_ready_transfers();
+        coordinator.update_download_activity("retry-model", job_id, DownloadActivity::Stalled);
+        coordinator.update_download_activity(
+            "retry-model",
+            job_id,
+            DownloadActivity::RetryScheduled {
+                attempt: 1,
+                max_attempts: 3,
+                delay_ms: 1_000,
+                cause: DownloadFaultKind::ConnectionReset,
+            },
+        );
+
+        let job = coordinator.get_job("retry-model").unwrap();
+        assert_eq!(job.phase, ArtifactInstallPhase::Transferring);
+        assert!(matches!(
+            job.download_activity,
+            Some(DownloadActivity::RetryScheduled {
+                attempt: 1,
+                max_attempts: 3,
+                ..
+            })
+        ));
+        assert_eq!(coordinator.active_transfers, 1);
+        assert_eq!(
+            coordinator.reserved_by_volume.get("retry-volume"),
+            Some(&100)
+        );
+    }
+
+    #[test]
+    fn byte_progress_does_not_replace_a_transition_status_announcement() {
+        let mut app = test_app();
+        let model_id = "whisper_cpp_tiny_en".to_owned();
+        app.artifact_installations
+            .insert(model_id.clone(), (91, InstallCancellation::default()));
+        app.model_downloads.insert(
+            model_id.clone(),
+            ModelInstallStatus::Downloading {
+                downloaded_bytes: 10,
+                total_bytes: Some(100),
+                bytes_per_second: Some(10),
+            },
+        );
+        app.tx
+            .send(AppEvent::ModelDownloadProgress {
+                job_id: 91,
+                model_id: model_id.clone(),
+                progress: InstallProgress {
+                    stage: InstallStage::Downloading,
+                    completed_bytes: 10,
+                    total_bytes: 100,
+                    bytes_per_second: None,
+                    download_activity: Some(DownloadActivity::Stalled),
+                },
+            })
+            .unwrap();
+        app.poll_events();
+        assert_eq!(
+            app.artifact_installations
+                .download_activity_for_model(&model_id),
+            Some(DownloadActivity::Stalled)
+        );
+
+        app.status_message = "waiting announcement".to_owned();
+        app.tx
+            .send(AppEvent::ModelDownloadProgress {
+                job_id: 91,
+                model_id,
+                progress: InstallProgress {
+                    stage: InstallStage::Downloading,
+                    completed_bytes: 11,
+                    total_bytes: 100,
+                    bytes_per_second: Some(5),
+                    download_activity: None,
+                },
+            })
+            .unwrap();
+        app.poll_events();
+        assert_eq!(app.status_message, "waiting announcement");
     }
 
     #[test]

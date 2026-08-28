@@ -294,7 +294,7 @@ impl Fixture {
                 transcription.phase = TranscriptionPhase::Ready;
                 let mut partial = model("Whisper Moonshine", "moonshine.base", false, false, 190);
                 partial.installed = false;
-                partial.download_state = ModelDownloadState::Cancelled;
+                partial.download_state = ModelDownloadState::PartialRetained;
                 partial.downloaded_bytes = 129_000_000;
                 partial.total_bytes = Some(190_000_000);
                 partial.partial_cleanup_available = true;
