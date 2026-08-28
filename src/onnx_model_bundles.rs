@@ -2770,7 +2770,11 @@ mod tests {
     #[test]
     fn local_catalog_and_receipt_paths_cannot_start_http() {
         let source = include_str!("onnx_model_bundles.rs");
-        let production = source.split("\n#[cfg(test)]\nmod tests").next().unwrap();
+        let normalized = source.replace("\r\n", "\n");
+        let production = normalized
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .unwrap();
         assert_eq!(
             production
                 .matches("download_pinned_artifact_for_target(")
