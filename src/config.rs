@@ -996,6 +996,13 @@ fn default_playground_model_order() -> Vec<String> {
 }
 
 fn apply_managed_model_metadata(config: &mut AppConfig) {
+    apply_managed_model_metadata_with_path_probe(config, Path::exists);
+}
+
+fn apply_managed_model_metadata_with_path_probe(
+    config: &mut AppConfig,
+    mut path_exists: impl FnMut(&Path) -> bool,
+) {
     let expected_paths = default_model_catalog()
         .into_iter()
         .filter_map(|model| {
@@ -1021,20 +1028,20 @@ fn apply_managed_model_metadata(config: &mut AppConfig) {
     });
 
     for (id, path) in &config.general.model_paths {
-        if path.exists()
-            && expected_paths
-                .get(id)
-                .is_some_and(|paths| paths.contains(path))
-            && safe_managed_model_path(&storage_dir, path)
-        {
-            config
-                .general
-                .managed_models
-                .entry(id.clone())
-                .or_insert_with(|| {
-                    ManagedModelInstall::app_managed(path.clone(), "legacy-model-path")
-                });
+        let Some(paths) = expected_paths.get(id) else {
+            continue;
+        };
+        if !paths.contains(path) {
+            continue;
         }
+        if !path_exists(path) || !safe_managed_model_path(&storage_dir, path) {
+            continue;
+        }
+        config
+            .general
+            .managed_models
+            .entry(id.clone())
+            .or_insert_with(|| ManagedModelInstall::app_managed(path.clone(), "legacy-model-path"));
     }
 
     for install in config.general.managed_models.values_mut() {
@@ -1774,6 +1781,49 @@ mod tests {
             config.general.managed_runtimes.get("faster_whisper"),
             Some(&retired_runtime)
         );
+    }
+
+    #[test]
+    fn retired_and_unauthorized_model_paths_are_not_probed() {
+        let mut config = AppConfig::default();
+        config.general.model_storage_dir = PathBuf::from("test-model-storage");
+        let catalog = default_model_catalog();
+        let authorized_model = catalog
+            .iter()
+            .find(|model| model.id == "whisper_cpp_tiny_en")
+            .unwrap();
+        let authorized_path = downloaded_model_path(&config, authorized_model).unwrap();
+        let unauthorized_path = PathBuf::from("copied-profile/unmanaged-supported-model.gguf");
+        let retired_path = PathBuf::from("copied-profile/retired-provider-model.bin");
+        config
+            .general
+            .model_paths
+            .insert(authorized_model.id.clone(), authorized_path.clone());
+        config
+            .general
+            .model_paths
+            .insert("whisper_cpp_small_en".to_owned(), unauthorized_path.clone());
+        config
+            .general
+            .model_paths
+            .insert("faster_whisper".to_owned(), retired_path.clone());
+
+        let mut probed = Vec::new();
+        apply_managed_model_metadata_with_path_probe(&mut config, |path| {
+            probed.push(path.to_path_buf());
+            false
+        });
+
+        assert_eq!(probed, [authorized_path]);
+        assert_eq!(
+            config.general.model_paths.get("faster_whisper"),
+            Some(&retired_path)
+        );
+        assert_eq!(
+            config.general.model_paths.get("whisper_cpp_small_en"),
+            Some(&unauthorized_path)
+        );
+        assert!(config.general.managed_models.is_empty());
     }
 
     #[test]
