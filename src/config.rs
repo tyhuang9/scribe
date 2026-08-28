@@ -307,9 +307,11 @@ pub(crate) fn installed_onnx_bundle_root(
 ) -> Option<PathBuf> {
     crate::model_catalog::normalized_receipt_backed_bundle_id(model_id)?;
     let root = onnx_bundle_target_root(config, model_id)?;
-    crate::onnx_model_bundles::current_executable_receipt_at(&root)
-        .ok()
-        .map(|_| root)
+    // This is routing metadata only. Receipt/tree integrity is established by
+    // `TranscriptionService::onnx_artifact_from_receipt` immediately before
+    // native dispatch; inventory construction must not become an execution
+    // authorization cache or perform a second full tree verification.
+    (root.is_dir() && root.join("install-receipt.json").is_file()).then_some(root)
 }
 
 pub(crate) fn onnx_bundle_target_root(config: &AppConfig, model_id: &ModelId) -> Option<PathBuf> {
@@ -571,12 +573,6 @@ fn imported_gguf_model_info(id: &str, install: &ImportedGgufModelInstall) -> Stt
         install_status: ModelInstallStatus::Installed,
         download_model: None,
     }
-}
-
-pub fn selected_model(config: &AppConfig) -> Option<SttModelInfo> {
-    configured_models(config)
-        .into_iter()
-        .find(|model| model.id == config.general.selected_default_model)
 }
 
 pub fn playground_selected_installed_models(config: &AppConfig) -> Vec<SttModelInfo> {
