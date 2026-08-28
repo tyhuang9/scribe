@@ -1480,19 +1480,16 @@ mod tests {
     }
 
     #[test]
-    fn moonshine_base_descriptor_matches_the_available_private_bundle_manifest() {
-        let bundle = crate::onnx_model_bundles::bundle_manifest("moonshine-base-en-int8-onnx")
-            .expect("Moonshine Base private bundle manifest is pinned");
+    fn moonshine_base_descriptor_matches_the_available_bundle_aggregate() {
         assert_eq!(
-            bundle.availability,
-            crate::onnx_model_bundles::BundleAvailability::Available
+            crate::receipt_bundle_catalog::available_bundle_aggregate_size_bytes(
+                "moonshine-base-en-int8-onnx"
+            ),
+            Some(286_930_831)
         );
         assert_eq!(
-            bundle
-                .files
-                .iter()
-                .try_fold(0_u64, |total, file| total.checked_add(file.size_bytes)),
-            Some(286_930_831)
+            validate_receipt_backed_bundle("moonshine-base-en-int8-onnx", 286_930_831),
+            Ok(())
         );
         assert_eq!(
             normalized_install_artifact(&ModelId::new("moonshine-base-en-int8-onnx")),
