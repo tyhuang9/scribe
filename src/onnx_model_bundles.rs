@@ -1360,6 +1360,7 @@ pub(crate) fn stage_onnx_bundle_install(
         });
     }
     let target_guard = acquire_bundle_target(&target_root)?;
+    recover_onnx_bundle_installation_locked(&target_root)?;
     let disk_reservation = acquire_bundle_disk_reservation(&target_root, required_bytes)?;
     let total_download_bytes = artifacts.iter().try_fold(0_u64, |total, artifact| {
         total
@@ -1378,6 +1379,7 @@ pub(crate) fn stage_onnx_bundle_install(
                 completed_bytes: base.saturating_add(event.completed_bytes),
                 total_bytes: total_download_bytes,
                 bytes_per_second: event.bytes_per_second,
+                download_activity: event.download_activity,
             });
         };
         let downloaded = download_pinned_artifact_for_target(
@@ -1770,7 +1772,6 @@ pub(crate) fn rollback_to_previous_onnx_bundle(target_root: &Path) -> Result<boo
     crate::installations::rollback_to_previous_runtime(target_root)
 }
 
-#[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct OnnxBundleRecovery {
     pub(crate) restored_interrupted_previous: bool,
@@ -1786,6 +1787,12 @@ pub(crate) fn recover_onnx_bundle_installation(
     target_root: &Path,
 ) -> Result<OnnxBundleRecovery, InstallError> {
     let _guard = acquire_bundle_target(target_root)?;
+    recover_onnx_bundle_installation_locked(target_root)
+}
+
+fn recover_onnx_bundle_installation_locked(
+    target_root: &Path,
+) -> Result<OnnxBundleRecovery, InstallError> {
     let rollback = crate::installations::directory_activation_rollback_root(target_root);
     let mut recovery = OnnxBundleRecovery::default();
     if crate::installations::path_entry_exists_no_follow(&rollback)? {
@@ -2764,6 +2771,29 @@ mod tests {
         );
         assert!(target.exists());
         assert!(rollback.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn production_stage_entrypoint_blocks_corrupt_interrupted_activation_before_http() {
+        let root = unique_root("stage-crash-recovery");
+        let target = bundle_target_root(&root, "moonshine-tiny-en-int8-onnx").unwrap();
+        let rollback = crate::installations::directory_activation_rollback_root(&target);
+        fs::create_dir_all(&rollback).unwrap();
+        fs::write(rollback.join("corrupt"), b"not a verified receipt").unwrap();
+
+        let error = stage_onnx_bundle_install(
+            "moonshine-tiny-en-int8-onnx",
+            &root,
+            &InstallCancellation::default(),
+            &|_| {},
+        )
+        .unwrap_err();
+
+        assert!(error.requires_recovery());
+        assert!(rollback.exists());
+        assert!(!target.exists());
+        assert!(!root.join(".downloads").exists());
         fs::remove_dir_all(root).unwrap();
     }
 

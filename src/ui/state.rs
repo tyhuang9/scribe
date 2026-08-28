@@ -140,11 +140,17 @@ pub(crate) enum ModelDownloadState {
     NotInstalled,
     Queued,
     Downloading,
+    Stalled,
+    Retrying {
+        attempt: u8,
+        max_attempts: u8,
+    },
+    Paused,
+    PartialRetained,
     WaitingForVerification,
     Verifying,
     Installed,
     Failed,
-    Cancelled,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -198,7 +204,6 @@ pub(crate) struct ModelViewModel {
     pub display_name: String,
     pub variant_label: String,
     pub description: Option<String>,
-    pub runtime_group: String,
     pub architecture: Option<String>,
     /// These are copied from the verified local manifest only when known.
     pub artifact_repository: Option<String>,
@@ -226,10 +231,6 @@ pub(crate) struct ModelViewModel {
     pub partial_cleanup_available: bool,
     pub partial_cleanup_enabled: bool,
     pub partial_cleanup_disabled_reason: Option<String>,
-    pub runtime_status_label: String,
-    pub runtime_detail: Option<String>,
-    pub runtime_version_label: Option<String>,
-    pub runtime_storage_label: Option<String>,
     pub download_state: ModelDownloadState,
     pub downloaded_bytes: u64,
     pub total_bytes: Option<u64>,
@@ -459,6 +460,8 @@ pub(crate) struct RemoteCatalogVariantView {
     pub total_bytes: Option<u64>,
     /// The installer-reported failure retained for the model-card error alert.
     pub error_message: Option<String>,
+    /// True after transfer completion when verification and activation are no longer cancellable.
+    pub finalizing: bool,
     pub size_tier: ModelSizeTier,
     pub speed_tier: ModelSpeedTier,
     pub accuracy_guidance: String,

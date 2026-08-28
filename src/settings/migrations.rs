@@ -11,6 +11,14 @@ use super::schema::{
 };
 use crate::transcription::AccelerationPreference;
 
+const RETIRED_GENERAL_FIELDS: &[&str] = &["managed_runtimes", "last_used_backend"];
+const RETIRED_PERFORMANCE_FIELDS: &[&str] = &[
+    "whisper_gpu_device",
+    "whisper_cuda_backend_path",
+    "whisper_cuda_library_paths",
+];
+const RETIRED_DEVELOPER_FIELDS: &[&str] = &["whisper_executable_path"];
+
 impl<'de> Deserialize<'de> for AppConfig {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -27,6 +35,7 @@ pub(crate) fn parse_settings_value(value: Value) -> AppConfig {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ParseDiagnostics {
     pub invalid_values_salvaged: bool,
+    pub retired_fields_discarded: bool,
 }
 
 pub(crate) fn parse_settings_value_with_diagnostics(value: Value) -> (AppConfig, ParseDiagnostics) {
@@ -36,7 +45,7 @@ pub(crate) fn parse_settings_value_with_diagnostics(value: Value) -> (AppConfig,
         return (AppConfig::default(), diagnostics);
     };
 
-    let config = if root.keys().any(|key| {
+    let mut config = if root.keys().any(|key| {
         matches!(
             key.as_str(),
             "general"
@@ -54,7 +63,96 @@ pub(crate) fn parse_settings_value_with_diagnostics(value: Value) -> (AppConfig,
     } else {
         migrate_legacy_flat(root, &mut diagnostics)
     };
+    if discard_retired_config_values(&mut config) {
+        diagnostics.retired_fields_discarded = true;
+    }
     (config, diagnostics)
+}
+
+pub(crate) fn discard_retired_config_values(config: &mut AppConfig) -> bool {
+    let mut discarded = false;
+    for key in RETIRED_GENERAL_FIELDS {
+        discarded |= config.general.unknown.remove(*key).is_some();
+    }
+    for key in RETIRED_PERFORMANCE_FIELDS {
+        discarded |= config.performance.unknown.remove(*key).is_some();
+    }
+    for key in RETIRED_DEVELOPER_FIELDS {
+        discarded |= config.developer.unknown.remove(*key).is_some();
+    }
+    for key in RETIRED_GENERAL_FIELDS
+        .iter()
+        .chain(RETIRED_PERFORMANCE_FIELDS)
+        .chain(RETIRED_DEVELOPER_FIELDS)
+    {
+        discarded |= config.unknown.remove(*key).is_some();
+    }
+
+    let model_path_count = config.general.model_paths.len();
+    config
+        .general
+        .model_paths
+        .retain(|id, path| current_model_binding(id, path));
+    discarded |= config.general.model_paths.len() != model_path_count;
+
+    let managed_model_count = config.general.managed_models.len();
+    config
+        .general
+        .managed_models
+        .retain(|id, install| current_model_binding(id, &install.path));
+    discarded |= config.general.managed_models.len() != managed_model_count;
+
+    let mut current_model_ids = crate::model_catalog::model_descriptors()
+        .into_iter()
+        .map(|descriptor| descriptor.id.into_inner())
+        .collect::<Vec<_>>();
+    current_model_ids.extend(config.general.managed_remote_models.keys().cloned());
+    current_model_ids.extend(config.general.imported_gguf_models.keys().cloned());
+    let is_current_id = |id: &str| current_model_ids.iter().any(|current| current == id);
+
+    if !config.general.selected_default_model.is_empty()
+        && !is_current_id(&config.general.selected_default_model)
+    {
+        config.general.selected_default_model = if config
+            .general
+            .excluded_bundled_model_ids
+            .iter()
+            .any(|id| id == crate::model_catalog::BUNDLED_BASE_MODEL_ID)
+        {
+            String::new()
+        } else {
+            crate::model_catalog::BUNDLED_BASE_MODEL_ID.to_owned()
+        };
+        discarded = true;
+    }
+
+    let selected_count = config.general.playground_selected_models.len();
+    config
+        .general
+        .playground_selected_models
+        .retain(|id| is_current_id(id));
+    discarded |= config.general.playground_selected_models.len() != selected_count;
+
+    let order_count = config.general.playground_model_order.len();
+    config
+        .general
+        .playground_model_order
+        .retain(|id| is_current_id(id));
+    discarded |= config.general.playground_model_order.len() != order_count;
+    discarded
+}
+
+fn current_model_binding(id: &str, path: &std::path::Path) -> bool {
+    let id = crate::transcription::ModelId::new(id);
+    match crate::model_catalog::normalized_install_artifact(&id) {
+        Some(crate::model_catalog::NormalizedInstallArtifact::SingleGguf(_)) => path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf")),
+        Some(crate::model_catalog::NormalizedInstallArtifact::ReceiptBackedBundle { .. }) => !path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("bin")),
+        None => false,
+    }
 }
 
 fn parse_sectioned(mut root: Map<String, Value>, diagnostics: &mut ParseDiagnostics) -> AppConfig {
@@ -327,25 +425,9 @@ fn migrate_legacy_flat(
         config.developer.debug_mode,
         diagnostics,
     );
-    move_unknown_fields(
-        &mut root,
-        &mut config.general.unknown,
-        &["managed_runtimes", "last_used_backend"],
-    );
-    move_unknown_fields(
-        &mut root,
-        &mut config.performance.unknown,
-        &[
-            "whisper_gpu_device",
-            "whisper_cuda_backend_path",
-            "whisper_cuda_library_paths",
-        ],
-    );
-    move_unknown_fields(
-        &mut root,
-        &mut config.developer.unknown,
-        &["whisper_executable_path"],
-    );
+    discard_retired_fields(&mut root, RETIRED_GENERAL_FIELDS, diagnostics);
+    discard_retired_fields(&mut root, RETIRED_PERFORMANCE_FIELDS, diagnostics);
+    discard_retired_fields(&mut root, RETIRED_DEVELOPER_FIELDS, diagnostics);
     root.remove("schema_version");
     config.unknown = into_unknown(root);
     config
@@ -355,6 +437,7 @@ fn parse_general(
     mut section: Map<String, Value>,
     diagnostics: &mut ParseDiagnostics,
 ) -> GeneralSettings {
+    discard_retired_fields(&mut section, RETIRED_GENERAL_FIELDS, diagnostics);
     let defaults = GeneralSettings::default();
     GeneralSettings {
         selected_default_model: take(
@@ -681,6 +764,7 @@ fn parse_performance(
     mut section: Map<String, Value>,
     diagnostics: &mut ParseDiagnostics,
 ) -> PerformanceSettings {
+    discard_retired_fields(&mut section, RETIRED_PERFORMANCE_FIELDS, diagnostics);
     let defaults = PerformanceSettings::default();
     PerformanceSettings {
         acceleration_preference: take(
@@ -698,6 +782,7 @@ fn parse_developer(
     mut section: Map<String, Value>,
     diagnostics: &mut ParseDiagnostics,
 ) -> DeveloperSettings {
+    discard_retired_fields(&mut section, RETIRED_DEVELOPER_FIELDS, diagnostics);
     let defaults = DeveloperSettings::default();
     DeveloperSettings {
         debug_mode: take(
@@ -711,10 +796,14 @@ fn parse_developer(
     }
 }
 
-fn move_unknown_fields(root: &mut Map<String, Value>, unknown: &mut UnknownFields, keys: &[&str]) {
+fn discard_retired_fields(
+    root: &mut Map<String, Value>,
+    keys: &[&str],
+    diagnostics: &mut ParseDiagnostics,
+) {
     for key in keys {
-        if let Some(value) = root.remove(*key) {
-            unknown.insert((*key).to_owned(), value);
+        if root.remove(*key).is_some() {
+            diagnostics.retired_fields_discarded = true;
         }
     }
 }
@@ -882,66 +971,144 @@ mod tests {
     }
 
     #[test]
-    fn version_three_retired_runtime_fields_become_exact_inert_unknown_values() {
-        let retired_runtimes = json!({
-            "faster_whisper": {
-                "path": "legacy/runtime.py",
-                "source": "copied-profile",
-                "opaque": [1, {"sentinel": true}]
-            }
-        });
-        let cuda_backend = json!("legacy/cuda/whisper.dll");
-        let cuda_libraries = json!(["legacy/cuda", {"future": "value"}]);
-        let executable = json!({"path": "legacy/whisper-cli", "opaque": 7});
-        let config = parse_settings_value(json!({
+    fn version_three_retired_runtime_fields_are_discarded_with_diagnostics() {
+        let (config, diagnostics) = parse_settings_value_with_diagnostics(json!({
             "schema_version": 3,
             "general": {
-                "managed_runtimes": retired_runtimes.clone(),
-                "last_used_backend": {"id": "faster_whisper", "opaque": true}
+                "managed_runtimes": {"provider": {"path": "legacy/runtime.py"}},
+                "last_used_backend": {"id": "retired-provider", "opaque": true},
+                "future_general": {"kept": true}
             },
             "performance": {
                 "whisper_gpu_device": {"ordinal": 4},
-                "whisper_cuda_backend_path": cuda_backend.clone(),
-                "whisper_cuda_library_paths": cuda_libraries.clone()
+                "whisper_cuda_backend_path": "legacy/cuda/whisper.dll",
+                "whisper_cuda_library_paths": ["legacy/cuda", {"future": "value"}],
+                "future_performance": [1, 2, 3]
             },
             "developer": {
-                "whisper_executable_path": executable.clone()
-            }
+                "whisper_executable_path": {"path": "legacy/whisper-cli", "opaque": 7},
+                "future_developer": "kept"
+            },
+            "future_root": {"kept": true}
         }));
 
         assert_eq!(config.schema_version, CURRENT_SCHEMA_VERSION);
-        assert_eq!(config.general.unknown["managed_runtimes"], retired_runtimes);
+        assert!(diagnostics.retired_fields_discarded);
+        assert!(!diagnostics.invalid_values_salvaged);
+        for key in RETIRED_GENERAL_FIELDS {
+            assert!(!config.general.unknown.contains_key(*key));
+        }
+        for key in RETIRED_PERFORMANCE_FIELDS {
+            assert!(!config.performance.unknown.contains_key(*key));
+        }
+        for key in RETIRED_DEVELOPER_FIELDS {
+            assert!(!config.developer.unknown.contains_key(*key));
+        }
         assert_eq!(
-            config.general.unknown["last_used_backend"],
-            json!({"id": "faster_whisper", "opaque": true})
+            config.general.unknown["future_general"],
+            json!({"kept": true})
         );
         assert_eq!(
-            config.performance.unknown["whisper_gpu_device"],
-            json!({"ordinal": 4})
+            config.performance.unknown["future_performance"],
+            json!([1, 2, 3])
         );
-        assert_eq!(
-            config.performance.unknown["whisper_cuda_backend_path"],
-            cuda_backend
-        );
-        assert_eq!(
-            config.performance.unknown["whisper_cuda_library_paths"],
-            cuda_libraries
-        );
-        assert_eq!(
-            config.developer.unknown["whisper_executable_path"],
-            executable
-        );
+        assert_eq!(config.developer.unknown["future_developer"], json!("kept"));
+        assert_eq!(config.unknown["future_root"], json!({"kept": true}));
 
         let serialized = serde_json::to_value(config).unwrap();
         assert_eq!(serialized["schema_version"], json!(4));
-        assert_eq!(serialized["general"]["managed_runtimes"], retired_runtimes);
+        for (section, keys) in [
+            ("general", RETIRED_GENERAL_FIELDS),
+            ("performance", RETIRED_PERFORMANCE_FIELDS),
+            ("developer", RETIRED_DEVELOPER_FIELDS),
+        ] {
+            for key in keys {
+                assert!(serialized[section].get(*key).is_none(), "{section}.{key}");
+            }
+        }
         assert_eq!(
-            serialized["performance"]["whisper_cuda_library_paths"],
-            cuda_libraries
+            serialized["general"]["future_general"],
+            json!({"kept": true})
+        );
+        assert_eq!(serialized["future_root"], json!({"kept": true}));
+    }
+
+    #[test]
+    fn legacy_flat_retired_runtime_fields_are_discarded_without_losing_unknowns() {
+        let (config, diagnostics) = parse_settings_value_with_diagnostics(json!({
+            "selected_default_model": "whisper_cpp_base_en",
+            "managed_runtimes": {"provider": {"path": "legacy/runtime.py"}},
+            "last_used_backend": "retired-provider",
+            "whisper_gpu_device": 2,
+            "whisper_cuda_backend_path": "legacy/whisper.dll",
+            "whisper_cuda_library_paths": ["legacy"],
+            "whisper_executable_path": "legacy/whisper-cli",
+            "future_flat": {"kept": true}
+        }));
+
+        assert!(diagnostics.retired_fields_discarded);
+        assert!(!diagnostics.invalid_values_salvaged);
+        assert_eq!(config.unknown["future_flat"], json!({"kept": true}));
+        let serialized = serde_json::to_value(config).unwrap();
+        for key in RETIRED_GENERAL_FIELDS
+            .iter()
+            .chain(RETIRED_PERFORMANCE_FIELDS)
+            .chain(RETIRED_DEVELOPER_FIELDS)
+        {
+            assert!(serialized.get(*key).is_none(), "{key}");
+            assert!(serialized["general"].get(*key).is_none(), "general.{key}");
+            assert!(
+                serialized["performance"].get(*key).is_none(),
+                "performance.{key}"
+            );
+            assert!(
+                serialized["developer"].get(*key).is_none(),
+                "developer.{key}"
+            );
+        }
+        assert_eq!(serialized["future_flat"], json!({"kept": true}));
+    }
+
+    #[test]
+    fn retired_provider_ids_are_removed_but_current_replacement_ids_survive() {
+        let (config, diagnostics) = parse_settings_value_with_diagnostics(json!({
+            "schema_version": 3,
+            "general": {
+                "selected_default_model": "faster_whisper_tiny_en",
+                "playground_selected_models": [
+                    "faster_whisper_tiny_en",
+                    "whisper_cpp_tiny_en"
+                ],
+                "playground_model_order": [
+                    "faster_whisper_tiny_en",
+                    "whisper_cpp_tiny_en"
+                ],
+                "model_paths": {
+                    "faster_whisper_tiny_en": "legacy/provider-model.bin",
+                    "whisper_cpp_tiny_en": "legacy/whisper-model.bin"
+                }
+            }
+        }));
+
+        assert!(diagnostics.retired_fields_discarded);
+        assert_eq!(
+            config.general.selected_default_model,
+            crate::model_catalog::BUNDLED_BASE_MODEL_ID
         );
         assert_eq!(
-            serialized["developer"]["whisper_executable_path"],
-            executable
+            config.general.playground_selected_models,
+            ["whisper_cpp_tiny_en"]
+        );
+        assert_eq!(
+            config.general.playground_model_order,
+            ["whisper_cpp_tiny_en"]
+        );
+        assert!(config.general.model_paths.is_empty());
+        let serialized = serde_json::to_value(config).unwrap();
+        assert!(
+            serialized["general"]["model_paths"]
+                .as_object()
+                .is_some_and(serde_json::Map::is_empty)
         );
     }
 
@@ -1243,11 +1410,11 @@ mod tests {
             "general": {
                 "selected_default_model": "whisper_cpp_base_en",
                 "managed_models": {
-                    "valid": {"path": "valid-model.bin"},
+                    "whisper_cpp_base_en": {"path": "valid-model.gguf"},
                     "invalid": {"path": 42}
                 },
                 "model_paths": {
-                    "valid": "valid-model.bin",
+                    "whisper_cpp_base_en": "valid-model.gguf",
                     "invalid": 42
                 }
             },
@@ -1270,9 +1437,19 @@ mod tests {
         }));
 
         assert_eq!(config.general.selected_default_model, "whisper_cpp_base_en");
-        assert!(config.general.managed_models.contains_key("valid"));
+        assert!(
+            config
+                .general
+                .managed_models
+                .contains_key("whisper_cpp_base_en")
+        );
         assert!(!config.general.managed_models.contains_key("invalid"));
-        assert!(config.general.model_paths.contains_key("valid"));
+        assert!(
+            config
+                .general
+                .model_paths
+                .contains_key("whisper_cpp_base_en")
+        );
         assert!(!config.general.model_paths.contains_key("invalid"));
         assert_eq!(config.recording.hotkey, "Ctrl+Alt+R");
         assert_eq!(config.recording.hotkey_mode, HotkeyMode::HoldToTalk);
@@ -1291,8 +1468,14 @@ mod tests {
             config.performance.acceleration_preference,
             AccelerationPreference::Auto
         );
-        assert_eq!(config.performance.unknown["whisper_gpu_device"], json!(4));
+        assert!(
+            !config
+                .performance
+                .unknown
+                .contains_key("whisper_gpu_device")
+        );
         assert!(diagnostics.invalid_values_salvaged);
+        assert!(diagnostics.retired_fields_discarded);
     }
 
     #[test]
@@ -1399,8 +1582,8 @@ mod tests {
             "schema_version": CURRENT_SCHEMA_VERSION,
             "general": {
                 "managed_models": {
-                    "fixture": {
-                        "path": "fixture.bin",
+                    "whisper_cpp_base_en": {
+                        "path": "fixture.gguf",
                         "source": "test",
                         "installed_at_unix_seconds": "invalid",
                         "future_receipt": {"signature": "kept"}
@@ -1409,8 +1592,8 @@ mod tests {
             }
         }));
 
-        let install = &config.general.managed_models["fixture"];
-        assert_eq!(install.path, std::path::PathBuf::from("fixture.bin"));
+        let install = &config.general.managed_models["whisper_cpp_base_en"];
+        assert_eq!(install.path, std::path::PathBuf::from("fixture.gguf"));
         assert_eq!(install.source.as_deref(), Some("test"));
         assert_eq!(install.installed_at_unix_seconds, None);
         assert_eq!(
@@ -1420,7 +1603,7 @@ mod tests {
         assert!(diagnostics.invalid_values_salvaged);
         let serialized = serde_json::to_value(config).unwrap();
         assert_eq!(
-            serialized["general"]["managed_models"]["fixture"]["future_receipt"],
+            serialized["general"]["managed_models"]["whisper_cpp_base_en"]["future_receipt"],
             json!({"signature": "kept"})
         );
     }

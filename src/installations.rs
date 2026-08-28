@@ -45,12 +45,77 @@ pub(crate) enum InstallStage {
     Activating,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DownloadFaultKind {
+    TimedOut,
+    Stalled,
+    PrematureEof,
+    ConnectionReset,
+    ConnectionFailed,
+    Dns,
+    HttpStatus(u16),
+}
+
+impl std::fmt::Display for DownloadFaultKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TimedOut => formatter.write_str("network timeout"),
+            Self::Stalled => formatter.write_str("download stalled"),
+            Self::PrematureEof => formatter.write_str("response ended early"),
+            Self::ConnectionReset => formatter.write_str("connection interrupted"),
+            Self::ConnectionFailed => formatter.write_str("connection failed"),
+            Self::Dns => formatter.write_str("DNS lookup failed"),
+            Self::HttpStatus(status) => write!(formatter, "HTTP {status}"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DownloadActivity {
+    Active,
+    Stalled,
+    RetryScheduled {
+        attempt: u8,
+        max_attempts: u8,
+        delay_ms: u64,
+        cause: DownloadFaultKind,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DownloadRetryPolicy {
+    read_poll_interval: Duration,
+    stalled_after: Duration,
+    reconnect_after: Duration,
+    retry_backoffs: [Duration; 3],
+    cancellation_poll_interval: Duration,
+}
+
+impl DownloadRetryPolicy {
+    const STANDARD: Self = Self {
+        read_poll_interval: Duration::from_millis(750),
+        stalled_after: Duration::from_secs(3),
+        reconnect_after: Duration::from_secs(15),
+        retry_backoffs: [
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            Duration::from_secs(4),
+        ],
+        cancellation_poll_interval: Duration::from_millis(100),
+    };
+
+    fn max_retries(self) -> u8 {
+        self.retry_backoffs.len() as u8
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct InstallProgress {
     pub(crate) stage: InstallStage,
     pub(crate) completed_bytes: u64,
     pub(crate) total_bytes: u64,
     pub(crate) bytes_per_second: Option<u64>,
+    pub(crate) download_activity: Option<DownloadActivity>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -124,6 +189,15 @@ pub(crate) enum InstallError {
     Cancelled {
         partial_path: PathBuf,
         downloaded_bytes: u64,
+    },
+    #[error(
+        "download failed after {retry_count} ranged retries ({category}); {retained_bytes} bytes retained"
+    )]
+    DownloadFailed {
+        category: DownloadFaultKind,
+        retry_count: u8,
+        retained_bytes: u64,
+        partial_path: PathBuf,
     },
     #[error("{0}")]
     Failed(String),
@@ -1473,6 +1547,9 @@ fn require_pinned_artifact_disk_space(
     )))
 }
 
+type DownloadReaderSpawner =
+    fn(Box<dyn Read + Send + Sync>) -> Result<PendingDownloadReader, InstallError>;
+
 #[cfg(test)]
 fn download_pinned_artifact_with(
     source: &dyn HttpSource,
@@ -1495,6 +1572,56 @@ fn download_pinned_artifact_with(
     )
 }
 
+#[cfg(test)]
+fn download_pinned_artifact_with_policy(
+    source: &dyn HttpSource,
+    artifact: &PinnedArtifact,
+    cancellation: &InstallCancellation,
+    progress: &dyn Fn(InstallProgress),
+    policy: DownloadRetryPolicy,
+) -> Result<DownloadedArtifact, InstallError> {
+    if cancellation.is_cancelled() {
+        return Err(cancelled_before_artifact_inspection(artifact)?);
+    }
+    let expected_target_identity = disk_space::canonical_target_identity(&artifact.destination)
+        .map_err(InstallError::Failed)?;
+    download_pinned_artifact_with_target_and_policy(
+        source,
+        artifact,
+        &expected_target_identity,
+        true,
+        cancellation,
+        progress,
+        policy,
+    )
+}
+
+#[cfg(test)]
+fn download_pinned_artifact_with_policy_and_reader_spawner(
+    source: &dyn HttpSource,
+    artifact: &PinnedArtifact,
+    cancellation: &InstallCancellation,
+    progress: &dyn Fn(InstallProgress),
+    policy: DownloadRetryPolicy,
+    reader_spawner: DownloadReaderSpawner,
+) -> Result<DownloadedArtifact, InstallError> {
+    if cancellation.is_cancelled() {
+        return Err(cancelled_before_artifact_inspection(artifact)?);
+    }
+    let expected_target_identity = disk_space::canonical_target_identity(&artifact.destination)
+        .map_err(InstallError::Failed)?;
+    download_pinned_artifact_with_target_and_policy_and_reader_spawner(
+        source,
+        artifact,
+        &expected_target_identity,
+        true,
+        cancellation,
+        progress,
+        policy,
+        reader_spawner,
+    )
+}
+
 fn download_pinned_artifact_with_target(
     source: &dyn HttpSource,
     artifact: &PinnedArtifact,
@@ -1502,6 +1629,49 @@ fn download_pinned_artifact_with_target(
     verify_existing_destination: bool,
     cancellation: &InstallCancellation,
     progress: &dyn Fn(InstallProgress),
+) -> Result<DownloadedArtifact, InstallError> {
+    download_pinned_artifact_with_target_and_policy(
+        source,
+        artifact,
+        expected_target_identity,
+        verify_existing_destination,
+        cancellation,
+        progress,
+        DownloadRetryPolicy::STANDARD,
+    )
+}
+
+fn download_pinned_artifact_with_target_and_policy(
+    source: &dyn HttpSource,
+    artifact: &PinnedArtifact,
+    expected_target_identity: &CanonicalTargetIdentity,
+    verify_existing_destination: bool,
+    cancellation: &InstallCancellation,
+    progress: &dyn Fn(InstallProgress),
+    policy: DownloadRetryPolicy,
+) -> Result<DownloadedArtifact, InstallError> {
+    download_pinned_artifact_with_target_and_policy_and_reader_spawner(
+        source,
+        artifact,
+        expected_target_identity,
+        verify_existing_destination,
+        cancellation,
+        progress,
+        policy,
+        spawn_download_reader,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn download_pinned_artifact_with_target_and_policy_and_reader_spawner(
+    source: &dyn HttpSource,
+    artifact: &PinnedArtifact,
+    expected_target_identity: &CanonicalTargetIdentity,
+    verify_existing_destination: bool,
+    cancellation: &InstallCancellation,
+    progress: &dyn Fn(InstallProgress),
+    policy: DownloadRetryPolicy,
+    reader_spawner: DownloadReaderSpawner,
 ) -> Result<DownloadedArtifact, InstallError> {
     validate_artifact_spec(artifact)?;
     let partial = partial_path(&artifact.destination)?;
@@ -1599,10 +1769,283 @@ fn download_pinned_artifact_with_target(
 
     require_pinned_artifact_disk_space(artifact, offset)?;
 
-    let mut response = source.get(&artifact.url, (offset > 0).then_some(offset))?;
-    let disposition = validate_download_response(&response, offset, artifact.size_bytes)?;
-    revalidate_artifact_target(&artifact.destination, expected_target_identity)?;
-    if disposition == ResponseDisposition::CompletePartial {
+    let mut retry_count = 0_u8;
+    let mut downloaded = offset;
+    loop {
+        if cancellation.is_cancelled() {
+            sync_partial_for_pause(&partial)?;
+            return Err(InstallError::Cancelled {
+                partial_path: partial,
+                downloaded_bytes: downloaded,
+            });
+        }
+
+        revalidate_artifact_target(&artifact.destination, expected_target_identity)?;
+        if let Some((partial_file, actual_offset)) = reopen_partial_no_follow(&partial)? {
+            partial_file.sync_all().map_err(|error| {
+                failed(format!("failed to preserve {}: {error}", partial.display()))
+            })?;
+            downloaded = actual_offset;
+        } else {
+            downloaded = 0;
+        }
+        if downloaded > artifact.size_bytes {
+            return Err(failed(
+                "resumable partial exceeded the pinned artifact size",
+            ));
+        }
+        let request_offset = downloaded;
+        let response = match source.get(
+            &artifact.url,
+            (request_offset > 0).then_some(request_offset),
+            policy.read_poll_interval,
+        ) {
+            Ok(response) => response,
+            Err(HttpSourceError::Fatal(error)) => {
+                sync_partial_for_pause(&partial)?;
+                return Err(error);
+            }
+            Err(HttpSourceError::Retryable(cause)) => {
+                schedule_download_retry(
+                    progress,
+                    cancellation,
+                    policy,
+                    &partial,
+                    artifact.size_bytes,
+                    downloaded,
+                    &mut retry_count,
+                    cause,
+                )?;
+                continue;
+            }
+        };
+        if let Some(cause) = retryable_http_status(response.status) {
+            drop(response);
+            schedule_download_retry(
+                progress,
+                cancellation,
+                policy,
+                &partial,
+                artifact.size_bytes,
+                downloaded,
+                &mut retry_count,
+                cause,
+            )?;
+            continue;
+        }
+        let disposition =
+            match validate_download_response(&response, request_offset, artifact.size_bytes) {
+                Ok(disposition) => disposition,
+                Err(error) => {
+                    sync_partial_for_pause(&partial)?;
+                    return Err(error);
+                }
+            };
+        revalidate_artifact_target(&artifact.destination, expected_target_identity)?;
+        if disposition == ResponseDisposition::CompletePartial {
+            verify_file_cancellable(
+                &partial,
+                artifact.size_bytes,
+                &artifact.sha256,
+                cancellation,
+            )?;
+            return Ok(downloaded_candidate(
+                artifact,
+                partial,
+                expected_target_identity,
+            ));
+        }
+
+        // The reader thread is created while the verified response remains
+        // gated. A server that ignored Range must not cost the caller its
+        // retained bytes merely because the local reader thread cannot start.
+        let pending_reader = reader_spawner(response.reader)?;
+        if cancellation.is_cancelled() {
+            sync_partial_for_pause(&partial)?;
+            return Err(InstallError::Cancelled {
+                partial_path: partial,
+                downloaded_bytes: downloaded,
+            });
+        }
+        let append = disposition == ResponseDisposition::Append;
+        let mut options = OpenOptions::new();
+        options.create(true).write(true);
+        configure_no_follow(&mut options);
+        if append {
+            options.append(true);
+        }
+        revalidate_artifact_target(&artifact.destination, expected_target_identity)?;
+        let mut file = options
+            .open(&partial)
+            .map_err(|error| failed(format!("failed to open {}: {error}", partial.display())))?;
+        let opened_metadata = validate_opened_regular_file(&file, &partial)?;
+        if append && opened_metadata.len() != request_offset {
+            return Err(failed(
+                "resumable partial changed while its ranged response was in flight",
+            ));
+        }
+        if !append {
+            file.set_len(0).map_err(|error| {
+                failed(format!("failed to reset {}: {error}", partial.display()))
+            })?;
+            downloaded = 0;
+        }
+
+        let started_at = Instant::now();
+        let mut last_progress = started_at;
+        let mut last_byte_at = started_at;
+        let mut stalled = false;
+        emit_progress_activity(
+            progress,
+            InstallStage::Downloading,
+            downloaded,
+            artifact.size_bytes,
+            None,
+            DownloadActivity::Active,
+        );
+        let attempt_start_bytes = downloaded;
+        let reader_events = pending_reader.start();
+        let retry_cause = loop {
+            if cancellation.is_cancelled() {
+                file.sync_all().map_err(|error| {
+                    failed(format!("failed to preserve {}: {error}", partial.display()))
+                })?;
+                return Err(InstallError::Cancelled {
+                    partial_path: partial,
+                    downloaded_bytes: downloaded,
+                });
+            }
+            let inactive_for = last_byte_at.elapsed();
+            if inactive_for >= policy.reconnect_after {
+                break Some(DownloadFaultKind::Stalled);
+            }
+            if !stalled && inactive_for >= policy.stalled_after {
+                stalled = true;
+                emit_progress_activity(
+                    progress,
+                    InstallStage::Downloading,
+                    downloaded,
+                    artifact.size_bytes,
+                    None,
+                    DownloadActivity::Stalled,
+                );
+            }
+            let bytes = match reader_events.recv_timeout(
+                policy
+                    .cancellation_poll_interval
+                    .min(Duration::from_millis(100)),
+            ) {
+                Ok(Ok(bytes)) => bytes,
+                Ok(Err(error))
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    continue;
+                }
+                Ok(Err(error)) => {
+                    if let Some(cause) = retryable_read_fault(&error) {
+                        break Some(cause);
+                    }
+                    file.sync_all().map_err(|sync_error| {
+                        failed(format!(
+                            "failed to preserve {}: {sync_error}",
+                            partial.display()
+                        ))
+                    })?;
+                    return Err(failed(
+                        "download response could not be read; resumable partial was preserved",
+                    ));
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    break Some(DownloadFaultKind::ConnectionReset);
+                }
+            };
+            if bytes.is_empty() {
+                if downloaded == artifact.size_bytes {
+                    break None;
+                }
+                break Some(DownloadFaultKind::PrematureEof);
+            }
+            if stalled {
+                stalled = false;
+                emit_progress_activity(
+                    progress,
+                    InstallStage::Downloading,
+                    downloaded,
+                    artifact.size_bytes,
+                    None,
+                    DownloadActivity::Active,
+                );
+            }
+            last_byte_at = Instant::now();
+            downloaded = downloaded.saturating_add(bytes.len() as u64);
+            if downloaded > artifact.size_bytes {
+                file.sync_all().map_err(|error| {
+                    failed(format!("failed to preserve {}: {error}", partial.display()))
+                })?;
+                return Err(failed(format!(
+                    "download for {} exceeded the pinned size of {} bytes; partial retained at {}",
+                    artifact.id,
+                    artifact.size_bytes,
+                    partial.display()
+                )));
+            }
+            if let Err(error) = file.write_all(&bytes) {
+                file.sync_all().map_err(|sync_error| {
+                    failed(format!(
+                        "failed to preserve {} after a write fault: {sync_error}",
+                        partial.display()
+                    ))
+                })?;
+                return Err(failed(format!(
+                    "failed to write {}: {error}",
+                    partial.display()
+                )));
+            }
+            let now = Instant::now();
+            if now.duration_since(last_progress) >= PROGRESS_INTERVAL {
+                last_progress = now;
+                emit_progress(
+                    progress,
+                    InstallStage::Downloading,
+                    downloaded,
+                    artifact.size_bytes,
+                    started_at,
+                    now,
+                    attempt_start_bytes,
+                );
+            }
+        };
+
+        file.sync_all()
+            .map_err(|error| failed(format!("failed to finish {}: {error}", partial.display())))?;
+        drop(file);
+        if let Some(retry_cause) = retry_cause {
+            schedule_download_retry(
+                progress,
+                cancellation,
+                policy,
+                &partial,
+                artifact.size_bytes,
+                downloaded,
+                &mut retry_count,
+                retry_cause,
+            )?;
+            continue;
+        }
+        emit_progress(
+            progress,
+            InstallStage::Verifying,
+            downloaded,
+            artifact.size_bytes,
+            started_at,
+            Instant::now(),
+            attempt_start_bytes,
+        );
+        revalidate_artifact_target(&artifact.destination, expected_target_identity)?;
         verify_file_cancellable(
             &partial,
             artifact.size_bytes,
@@ -1615,118 +2058,204 @@ fn download_pinned_artifact_with_target(
             expected_target_identity,
         ));
     }
-    let append = disposition == ResponseDisposition::Append;
-    if !append {
-        offset = 0;
+}
+
+struct PendingDownloadReader {
+    state: Arc<AtomicU8>,
+    thread: Option<std::thread::Thread>,
+    receiver: Option<std::sync::mpsc::Receiver<io::Result<Vec<u8>>>>,
+}
+
+impl PendingDownloadReader {
+    fn start(mut self) -> std::sync::mpsc::Receiver<io::Result<Vec<u8>>> {
+        let receiver = self
+            .receiver
+            .take()
+            .expect("pending download reader always owns its receiver");
+        self.state.store(DOWNLOAD_READER_STARTED, Ordering::Release);
+        self.thread
+            .take()
+            .expect("pending download reader always owns its thread")
+            .unpark();
+        receiver
+    }
+}
+
+impl Drop for PendingDownloadReader {
+    fn drop(&mut self) {
+        let Some(thread) = self.thread.take() else {
+            return;
+        };
+        self.state.store(DOWNLOAD_READER_ABORTED, Ordering::Release);
+        thread.unpark();
+    }
+}
+
+const DOWNLOAD_READER_WAITING: u8 = 0;
+const DOWNLOAD_READER_STARTED: u8 = 1;
+const DOWNLOAD_READER_ABORTED: u8 = 2;
+
+fn spawn_download_reader(
+    mut reader: Box<dyn Read + Send + Sync>,
+) -> Result<PendingDownloadReader, InstallError> {
+    // Production invariant: every reader passed here comes from
+    // `UreqHttpSource`, which applies `DownloadRetryPolicy::read_poll_interval`
+    // as the socket's per-read timeout. Once the receiver is dropped, a worker
+    // therefore reaches its next send and exits after at most one bounded read
+    // (plus normal scheduler/OS timer latency). Private test `HttpSource`
+    // implementations are not production readers and may choose other blocking
+    // behavior for deterministic fault injection.
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let state = Arc::new(AtomicU8::new(DOWNLOAD_READER_WAITING));
+    let reader_state = Arc::clone(&state);
+    let handle = std::thread::Builder::new()
+        .name("scribe-download-reader".to_owned())
+        .spawn(move || {
+            loop {
+                match reader_state.load(Ordering::Acquire) {
+                    DOWNLOAD_READER_WAITING => std::thread::park(),
+                    DOWNLOAD_READER_STARTED => break,
+                    DOWNLOAD_READER_ABORTED => return,
+                    _ => unreachable!("download reader gate state is invalid"),
+                }
+            }
+            loop {
+                let mut buffer = vec![0_u8; BUFFER_BYTES];
+                let event = reader.read(&mut buffer).map(|count| {
+                    buffer.truncate(count);
+                    buffer
+                });
+                let terminal = match &event {
+                    Ok(bytes) => bytes.is_empty(),
+                    Err(error) => !matches!(
+                        error.kind(),
+                        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                    ),
+                };
+                if sender.send(event).is_err() || terminal {
+                    break;
+                }
+            }
+        })
+        .map_err(|_| failed("failed to start the download response reader"))?;
+    let thread = handle.thread().clone();
+    drop(handle);
+    Ok(PendingDownloadReader {
+        state,
+        thread: Some(thread),
+        receiver: Some(receiver),
+    })
+}
+
+fn reopen_partial_no_follow(partial: &Path) -> Result<Option<(File, u64)>, InstallError> {
+    if !partial_file_exists(partial)? {
+        return Ok(None);
     }
     let mut options = OpenOptions::new();
-    options.create(true).write(true);
+    options.read(true).write(true);
     configure_no_follow(&mut options);
-    if append {
-        options.append(true);
-    } else {
-        options.truncate(true);
+    let file = options
+        .open(partial)
+        .map_err(|error| failed(format!("failed to reopen {}: {error}", partial.display())))?;
+    let metadata = validate_opened_regular_file(&file, partial)?;
+    let length = metadata.len();
+    Ok(Some((file, length)))
+}
+
+fn sync_partial_for_pause(partial: &Path) -> Result<u64, InstallError> {
+    let Some((file, length)) = reopen_partial_no_follow(partial)? else {
+        return Ok(0);
+    };
+    file.sync_all()
+        .map_err(|error| failed(format!("failed to preserve {}: {error}", partial.display())))?;
+    Ok(length)
+}
+
+fn retryable_read_fault(error: &io::Error) -> Option<DownloadFaultKind> {
+    match error.kind() {
+        io::ErrorKind::UnexpectedEof => Some(DownloadFaultKind::PrematureEof),
+        io::ErrorKind::ConnectionReset
+        | io::ErrorKind::ConnectionAborted
+        | io::ErrorKind::BrokenPipe => Some(DownloadFaultKind::ConnectionReset),
+        _ => None,
     }
-    revalidate_artifact_target(&artifact.destination, expected_target_identity)?;
-    let mut file = options
-        .open(&partial)
-        .map_err(|error| failed(format!("failed to open {}: {error}", partial.display())))?;
-    validate_opened_regular_file(&file, &partial)?;
-    let started_at = Instant::now();
-    let mut last_progress = started_at;
-    emit_progress(
+}
+
+#[allow(clippy::too_many_arguments)]
+fn schedule_download_retry(
+    progress: &dyn Fn(InstallProgress),
+    cancellation: &InstallCancellation,
+    policy: DownloadRetryPolicy,
+    partial: &Path,
+    total_bytes: u64,
+    retained_bytes: u64,
+    retry_count: &mut u8,
+    cause: DownloadFaultKind,
+) -> Result<(), InstallError> {
+    let actual_retained_bytes = sync_partial_for_pause(partial)?;
+    debug_assert_eq!(retained_bytes, actual_retained_bytes);
+    let retained_bytes = actual_retained_bytes;
+    if *retry_count >= policy.max_retries() {
+        return Err(InstallError::DownloadFailed {
+            category: cause,
+            retry_count: *retry_count,
+            retained_bytes,
+            partial_path: partial.to_path_buf(),
+        });
+    }
+    let attempt = retry_count.saturating_add(1);
+    let delay = policy.retry_backoffs[*retry_count as usize];
+    emit_progress_activity(
         progress,
         InstallStage::Downloading,
-        offset,
-        artifact.size_bytes,
-        started_at,
-        started_at,
-        offset,
+        retained_bytes,
+        total_bytes,
+        None,
+        DownloadActivity::RetryScheduled {
+            attempt,
+            max_attempts: policy.max_retries(),
+            delay_ms: delay.as_millis().min(u128::from(u64::MAX)) as u64,
+            cause,
+        },
     );
-    let mut downloaded = offset;
-    let mut buffer = [0_u8; BUFFER_BYTES];
+    sleep_cancellable(
+        delay,
+        policy.cancellation_poll_interval,
+        cancellation,
+        partial,
+        retained_bytes,
+    )?;
+    *retry_count = attempt;
+    Ok(())
+}
+
+fn sleep_cancellable(
+    delay: Duration,
+    poll_interval: Duration,
+    cancellation: &InstallCancellation,
+    partial: &Path,
+    retained_bytes: u64,
+) -> Result<(), InstallError> {
+    let started_at = Instant::now();
     loop {
         if cancellation.is_cancelled() {
-            file.sync_all().map_err(|error| {
-                failed(format!("failed to preserve {}: {error}", partial.display()))
-            })?;
+            sync_partial_for_pause(partial)?;
             return Err(InstallError::Cancelled {
-                partial_path: partial,
-                downloaded_bytes: downloaded,
+                partial_path: partial.to_path_buf(),
+                downloaded_bytes: retained_bytes,
             });
         }
-        let count = match response.reader.read(&mut buffer) {
-            Ok(count) => count,
-            Err(_) if cancellation.is_cancelled() => {
-                file.sync_all().map_err(|error| {
-                    failed(format!("failed to preserve {}: {error}", partial.display()))
-                })?;
-                return Err(InstallError::Cancelled {
-                    partial_path: partial,
-                    downloaded_bytes: downloaded,
-                });
-            }
-            Err(error) => {
-                return Err(failed(format!(
-                    "download read failed for {}: {error}; partial retained at {}",
-                    artifact.id,
-                    partial.display()
-                )));
-            }
-        };
-        if count == 0 {
-            break;
+        let remaining = delay.saturating_sub(started_at.elapsed());
+        if remaining.is_zero() {
+            return Ok(());
         }
-        downloaded = downloaded.saturating_add(count as u64);
-        if downloaded > artifact.size_bytes {
-            drop(file);
-            return Err(failed(format!(
-                "download for {} exceeded the pinned size of {} bytes; partial retained at {}",
-                artifact.id,
-                artifact.size_bytes,
-                partial.display()
-            )));
-        }
-        file.write_all(&buffer[..count])
-            .map_err(|error| failed(format!("failed to write {}: {error}", partial.display())))?;
-        let now = Instant::now();
-        if now.duration_since(last_progress) >= PROGRESS_INTERVAL {
-            last_progress = now;
-            emit_progress(
-                progress,
-                InstallStage::Downloading,
-                downloaded,
-                artifact.size_bytes,
-                started_at,
-                now,
-                offset,
-            );
-        }
+        std::thread::sleep(remaining.min(poll_interval).min(Duration::from_millis(100)));
     }
-    file.sync_all()
-        .map_err(|error| failed(format!("failed to finish {}: {error}", partial.display())))?;
-    drop(file);
-    emit_progress(
-        progress,
-        InstallStage::Verifying,
-        downloaded,
-        artifact.size_bytes,
-        started_at,
-        Instant::now(),
-        offset,
-    );
-    revalidate_artifact_target(&artifact.destination, expected_target_identity)?;
-    verify_file_cancellable(
-        &partial,
-        artifact.size_bytes,
-        &artifact.sha256,
-        cancellation,
-    )?;
-    Ok(downloaded_candidate(
-        artifact,
-        partial,
-        expected_target_identity,
-    ))
+}
+
+fn retryable_http_status(status: u16) -> Option<DownloadFaultKind> {
+    matches!(status, 408 | 429 | 500 | 502 | 503 | 504)
+        .then_some(DownloadFaultKind::HttpStatus(status))
 }
 
 fn downloaded_candidate(
@@ -1875,6 +2404,7 @@ pub(crate) fn stage_file_bundle_for_target(
                 completed_bytes,
                 total_bytes,
                 bytes_per_second: None,
+                download_activity: None,
             });
         }
         for file in generated_files {
@@ -1916,12 +2446,10 @@ fn stable_staging_path(target_root: &Path) -> Result<PathBuf, InstallError> {
     Ok(target_root.with_file_name(format!(".{name}.installing")))
 }
 
-#[cfg(test)]
 pub(crate) fn directory_activation_rollback_root(target_root: &Path) -> PathBuf {
     directory_rollback_path(target_root)
 }
 
-#[cfg(test)]
 pub(crate) fn path_entry_exists_no_follow(path: &Path) -> Result<bool, InstallError> {
     match fs::symlink_metadata(path) {
         Ok(_) => Ok(true),
@@ -1933,7 +2461,6 @@ pub(crate) fn path_entry_exists_no_follow(path: &Path) -> Result<bool, InstallEr
     }
 }
 
-#[cfg(test)]
 pub(crate) fn discard_file_bundle_staging(target_root: &Path) -> Result<bool, InstallError> {
     let staging = stable_staging_path(target_root)?;
     if !path_entry_exists_no_follow(&staging)? {
@@ -1943,7 +2470,6 @@ pub(crate) fn discard_file_bundle_staging(target_root: &Path) -> Result<bool, In
     Ok(true)
 }
 
-#[cfg(test)]
 pub(crate) fn restore_interrupted_directory_replacement(
     target_root: &Path,
 ) -> Result<(), InstallError> {
@@ -1963,7 +2489,6 @@ pub(crate) fn restore_interrupted_directory_replacement(
     restore_directory_replacement(target_root, true)
 }
 
-#[cfg(test)]
 pub(crate) fn retain_interrupted_directory_replacement(
     target_root: &Path,
 ) -> Result<(), InstallError> {
@@ -2837,7 +3362,6 @@ fn restore_file_replacement(target: &Path, had_previous: bool) -> Result<(), Ins
     Ok(())
 }
 
-#[cfg(test)]
 fn restore_directory_replacement(target: &Path, had_previous: bool) -> Result<(), InstallError> {
     let rollback = directory_rollback_path(target);
     if rollback.exists() {
@@ -2864,7 +3388,6 @@ fn finalize_file_replacement(target: &Path) -> Result<(), InstallError> {
     remove_path_if_exists(&file_rollback_path(target)?)
 }
 
-#[cfg(test)]
 fn finalize_directory_replacement(
     target: &Path,
     retain_replaced_as_previous: bool,
@@ -3048,6 +3571,24 @@ fn emit_progress(
         } else {
             Some((transferred as f64 / elapsed).round() as u64)
         },
+        download_activity: None,
+    });
+}
+
+fn emit_progress_activity(
+    progress: &dyn Fn(InstallProgress),
+    stage: InstallStage,
+    completed_bytes: u64,
+    total_bytes: u64,
+    bytes_per_second: Option<u64>,
+    download_activity: DownloadActivity,
+) {
+    progress(InstallProgress {
+        stage,
+        completed_bytes,
+        total_bytes,
+        bytes_per_second,
+        download_activity: Some(download_activity),
     });
 }
 
@@ -3168,16 +3709,41 @@ struct HttpResponse {
     reader: Box<dyn Read + Send + Sync>,
 }
 
+#[derive(Debug)]
+enum HttpSourceError {
+    Retryable(DownloadFaultKind),
+    Fatal(InstallError),
+}
+
+impl std::fmt::Display for HttpSourceError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Retryable(cause) => cause.fmt(formatter),
+            Self::Fatal(error) => error.fmt(formatter),
+        }
+    }
+}
+
 trait HttpSource {
-    fn get(&self, url: &str, range_start: Option<u64>) -> Result<HttpResponse, InstallError>;
+    fn get(
+        &self,
+        url: &str,
+        range_start: Option<u64>,
+        read_poll_interval: Duration,
+    ) -> Result<HttpResponse, HttpSourceError>;
 }
 
 struct UreqHttpSource;
 
 impl HttpSource for UreqHttpSource {
-    fn get(&self, url: &str, range_start: Option<u64>) -> Result<HttpResponse, InstallError> {
-        let policy = redirect_policy_for_initial_url(url)?;
-        self.get_with_redirect_policy(url, range_start, policy)
+    fn get(
+        &self,
+        url: &str,
+        range_start: Option<u64>,
+        read_poll_interval: Duration,
+    ) -> Result<HttpResponse, HttpSourceError> {
+        let policy = redirect_policy_for_initial_url(url).map_err(HttpSourceError::Fatal)?;
+        self.get_with_redirect_policy(url, range_start, policy, read_poll_interval)
     }
 }
 
@@ -3193,15 +3759,22 @@ impl UreqHttpSource {
         url: &str,
         range_start: Option<u64>,
         policy: RedirectPolicy,
-    ) -> Result<HttpResponse, InstallError> {
+        read_poll_interval: Duration,
+    ) -> Result<HttpResponse, HttpSourceError> {
+        // TCP connection attempts are bounded independently of response-body
+        // reads and happen before `spawn_download_reader`. ureq 2.x performs
+        // synchronous DNS resolution before applying this connect deadline, so
+        // the 10-second limit must not be described as a DNS timeout.
         let agent = ureq::AgentBuilder::new()
             .timeout_connect(Duration::from_secs(10))
-            .timeout_read(Duration::from_millis(750))
+            // This setting is copied onto the response stream by
+            // `Response::into_reader`, bounding every production body read.
+            .timeout_read(read_poll_interval)
             .redirects(0)
             .https_only(!cfg!(test))
             .build();
         let mut current = Url::parse(url)
-            .map_err(|error| failed(format!("invalid pinned download URL: {error}")))?;
+            .map_err(|_| HttpSourceError::Fatal(failed("invalid pinned download URL")))?;
         for redirects in 0..=MAX_DOWNLOAD_REDIRECTS {
             let mut request = agent.get(current.as_str());
             request = request.set("Accept-Encoding", "identity");
@@ -3211,24 +3784,26 @@ impl UreqHttpSource {
             let response = match request.call() {
                 Ok(response) => response,
                 Err(ureq::Error::Status(_, response)) => response,
-                Err(error) => {
-                    return Err(failed(format!(
-                        "request failed for {}: {error}",
-                        current.as_str()
-                    )));
+                Err(ureq::Error::Transport(error)) => {
+                    return Err(classify_ureq_transport(&error));
                 }
             };
             let status = response.status();
             if is_redirect_status(status) {
                 if redirects == MAX_DOWNLOAD_REDIRECTS {
-                    return Err(failed(format!(
+                    return Err(HttpSourceError::Fatal(failed(format!(
                         "download exceeded {MAX_DOWNLOAD_REDIRECTS} validated redirects"
-                    )));
+                    ))));
                 }
-                let location = strict_ureq_header(&response, "Location")?;
-                let location = location
-                    .ok_or_else(|| failed("download redirect response has no Location header"))?;
-                current = validated_redirect_url(&current, location, policy)?;
+                let location =
+                    strict_ureq_header(&response, "Location").map_err(HttpSourceError::Fatal)?;
+                let location = location.ok_or_else(|| {
+                    HttpSourceError::Fatal(failed(
+                        "download redirect response has no Location header",
+                    ))
+                })?;
+                current = validated_redirect_url(&current, location, policy)
+                    .map_err(HttpSourceError::Fatal)?;
                 continue;
             }
             let content_lengths = response
@@ -3254,8 +3829,42 @@ impl UreqHttpSource {
                 reader: response.into_reader(),
             });
         }
-        Err(failed("download redirect handling ended unexpectedly"))
+        Err(HttpSourceError::Fatal(failed(
+            "download redirect handling ended unexpectedly",
+        )))
     }
+}
+
+fn classify_ureq_transport(error: &ureq::Transport) -> HttpSourceError {
+    use std::error::Error as _;
+
+    let retryable = match error.kind() {
+        ureq::ErrorKind::Dns => Some(DownloadFaultKind::Dns),
+        ureq::ErrorKind::ConnectionFailed | ureq::ErrorKind::ProxyConnect => {
+            Some(DownloadFaultKind::ConnectionFailed)
+        }
+        ureq::ErrorKind::Io => error
+            .source()
+            .and_then(|source| source.downcast_ref::<io::Error>())
+            .and_then(|source| match source.kind() {
+                io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => {
+                    Some(DownloadFaultKind::TimedOut)
+                }
+                io::ErrorKind::ConnectionReset
+                | io::ErrorKind::ConnectionAborted
+                | io::ErrorKind::BrokenPipe => Some(DownloadFaultKind::ConnectionReset),
+                _ => None,
+            }),
+        _ => None,
+    };
+    retryable.map_or_else(
+        || {
+            HttpSourceError::Fatal(failed(
+                "download request was rejected before a trusted response was received",
+            ))
+        },
+        HttpSourceError::Retryable,
+    )
 }
 
 fn redirect_policy_for_initial_url(url: &str) -> Result<RedirectPolicy, InstallError> {
@@ -3337,6 +3946,7 @@ fn failed(message: impl Into<String>) -> InstallError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
     use std::io::Cursor;
     use std::net::TcpListener;
     use std::sync::{Mutex, mpsc};
@@ -3355,7 +3965,12 @@ mod tests {
     }
 
     impl HttpSource for FakeHttp {
-        fn get(&self, _url: &str, range_start: Option<u64>) -> Result<HttpResponse, InstallError> {
+        fn get(
+            &self,
+            _url: &str,
+            range_start: Option<u64>,
+            _read_poll_interval: Duration,
+        ) -> Result<HttpResponse, HttpSourceError> {
             self.requested_ranges.lock().unwrap().push(range_start);
             Ok(HttpResponse {
                 status: self.reply.status,
@@ -3372,8 +3987,700 @@ mod tests {
         hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     }
 
+    enum ReadAction {
+        Bytes(Vec<u8>),
+        Error(io::ErrorKind),
+        ErrorAfter(Duration, io::ErrorKind),
+        Eof,
+    }
+
+    struct ScriptedReader {
+        actions: VecDeque<ReadAction>,
+    }
+
+    impl Read for ScriptedReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            match self.actions.pop_front().unwrap_or(ReadAction::Eof) {
+                ReadAction::Bytes(bytes) => {
+                    assert!(bytes.len() <= buffer.len());
+                    buffer[..bytes.len()].copy_from_slice(&bytes);
+                    Ok(bytes.len())
+                }
+                ReadAction::Error(kind) => Err(io::Error::from(kind)),
+                ReadAction::ErrorAfter(delay, kind) => {
+                    thread::sleep(delay);
+                    Err(io::Error::from(kind))
+                }
+                ReadAction::Eof => Ok(0),
+            }
+        }
+    }
+
+    enum ScriptedAttempt {
+        Response {
+            status: u16,
+            content_length: Option<u64>,
+            content_range: Option<String>,
+            actions: Vec<ReadAction>,
+        },
+        Retryable(DownloadFaultKind),
+        Fatal(&'static str),
+    }
+
+    struct ScriptedHttp {
+        attempts: Mutex<VecDeque<ScriptedAttempt>>,
+        requested_ranges: Mutex<Vec<Option<u64>>>,
+    }
+
+    impl ScriptedHttp {
+        fn new(attempts: impl IntoIterator<Item = ScriptedAttempt>) -> Self {
+            Self {
+                attempts: Mutex::new(attempts.into_iter().collect()),
+                requested_ranges: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl HttpSource for ScriptedHttp {
+        fn get(
+            &self,
+            _url: &str,
+            range_start: Option<u64>,
+            _read_poll_interval: Duration,
+        ) -> Result<HttpResponse, HttpSourceError> {
+            self.requested_ranges.lock().unwrap().push(range_start);
+            match self
+                .attempts
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("scripted HTTP attempt")
+            {
+                ScriptedAttempt::Response {
+                    status,
+                    content_length,
+                    content_range,
+                    actions,
+                } => Ok(HttpResponse {
+                    status,
+                    content_lengths: content_length
+                        .map(|length| length.to_string())
+                        .into_iter()
+                        .collect(),
+                    content_ranges: content_range.into_iter().collect(),
+                    content_encodings: Vec::new(),
+                    reader: Box::new(ScriptedReader {
+                        actions: actions.into(),
+                    }),
+                }),
+                ScriptedAttempt::Retryable(cause) => Err(HttpSourceError::Retryable(cause)),
+                ScriptedAttempt::Fatal(message) => Err(HttpSourceError::Fatal(failed(message))),
+            }
+        }
+    }
+
+    fn fast_retry_policy() -> DownloadRetryPolicy {
+        DownloadRetryPolicy {
+            read_poll_interval: Duration::from_millis(1),
+            stalled_after: Duration::from_millis(1),
+            reconnect_after: Duration::from_millis(20),
+            retry_backoffs: [Duration::ZERO; 3],
+            cancellation_poll_interval: Duration::from_millis(1),
+        }
+    }
+
+    fn fail_download_reader_spawn(
+        reader: Box<dyn Read + Send + Sync>,
+    ) -> Result<PendingDownloadReader, InstallError> {
+        drop(reader);
+        Err(failed("injected download reader spawn failure"))
+    }
+
+    #[test]
+    fn standard_retry_policy_matches_the_bounded_transport_contract() {
+        let policy = DownloadRetryPolicy::STANDARD;
+        assert_eq!(policy.read_poll_interval, Duration::from_millis(750));
+        assert_eq!(policy.stalled_after, Duration::from_secs(3));
+        assert_eq!(policy.reconnect_after, Duration::from_secs(15));
+        assert_eq!(
+            policy.retry_backoffs,
+            [
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(4),
+            ]
+        );
+        assert_eq!(
+            policy.cancellation_poll_interval,
+            Duration::from_millis(100)
+        );
+        assert_eq!(policy.max_retries(), 3);
+    }
+
+    #[test]
+    fn stalled_download_emits_transition_only_activity_and_recovers_with_a_range() {
+        let root = unique_root("stalled-transition");
+        fs::create_dir_all(&root).unwrap();
+        let bytes = b"complete artifact";
+        let prefix = 5;
+        let spec = artifact(&root, bytes);
+        let mut first_actions = vec![ReadAction::Bytes(bytes[..prefix].to_vec())];
+        first_actions.extend([
+            ReadAction::ErrorAfter(Duration::from_millis(2), io::ErrorKind::TimedOut),
+            ReadAction::ErrorAfter(Duration::from_millis(2), io::ErrorKind::WouldBlock),
+            ReadAction::ErrorAfter(Duration::from_millis(2), io::ErrorKind::TimedOut),
+        ]);
+        let source = ScriptedHttp::new([
+            ScriptedAttempt::Response {
+                status: 200,
+                content_length: Some(bytes.len() as u64),
+                content_range: None,
+                actions: first_actions,
+            },
+            ScriptedAttempt::Response {
+                status: 206,
+                content_length: Some((bytes.len() - prefix) as u64),
+                content_range: Some(format!(
+                    "bytes {prefix}-{}/{}",
+                    bytes.len() - 1,
+                    bytes.len()
+                )),
+                actions: vec![ReadAction::Bytes(bytes[prefix..].to_vec()), ReadAction::Eof],
+            },
+        ]);
+        let updates = Mutex::new(Vec::new());
+        let mut policy = fast_retry_policy();
+        policy.reconnect_after = Duration::from_millis(5);
+
+        let candidate = download_pinned_artifact_with_policy(
+            &source,
+            &spec,
+            &InstallCancellation::default(),
+            &|update| updates.lock().unwrap().push(update),
+            policy,
+        )
+        .unwrap();
+
+        let activities = updates
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|update| update.download_activity)
+            .collect::<Vec<_>>();
+        assert_eq!(activities.first(), Some(&DownloadActivity::Active));
+        assert!(
+            activities.windows(2).all(|pair| pair[0] != pair[1]),
+            "activity transitions must not contain adjacent duplicates: {activities:?}"
+        );
+        let stalled_index = activities
+            .iter()
+            .position(|activity| *activity == DownloadActivity::Stalled)
+            .expect("the inactive response must transition to Stalled");
+        let retry_indexes = activities
+            .iter()
+            .enumerate()
+            .filter_map(|(index, activity)| {
+                matches!(
+                    activity,
+                    DownloadActivity::RetryScheduled {
+                        attempt: 1,
+                        max_attempts: 3,
+                        cause: DownloadFaultKind::Stalled,
+                        ..
+                    }
+                )
+                .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(retry_indexes.len(), 1, "unexpected retries: {activities:?}");
+        let retry_index = retry_indexes[0];
+        assert!(stalled_index < retry_index);
+        assert_eq!(
+            activities.get(retry_index + 1),
+            Some(&DownloadActivity::Active),
+            "a reconnect must explicitly reset activity: {activities:?}"
+        );
+        assert_eq!(activities.last(), Some(&DownloadActivity::Active));
+        assert_eq!(
+            source.requested_ranges.lock().unwrap().as_slice(),
+            &[None, Some(prefix as u64)]
+        );
+        assert_eq!(fs::read(candidate.path).unwrap(), bytes);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn subthreshold_timeouts_continue_on_the_same_response_without_stalling() {
+        let root = unique_root("subthreshold-timeouts");
+        fs::create_dir_all(&root).unwrap();
+        let bytes = b"complete artifact";
+        let spec = artifact(&root, bytes);
+        let source = ScriptedHttp::new([ScriptedAttempt::Response {
+            status: 200,
+            content_length: Some(bytes.len() as u64),
+            content_range: None,
+            actions: vec![
+                ReadAction::Error(io::ErrorKind::TimedOut),
+                ReadAction::Error(io::ErrorKind::WouldBlock),
+                ReadAction::Bytes(bytes.to_vec()),
+                ReadAction::Eof,
+            ],
+        }]);
+        let updates = Mutex::new(Vec::new());
+        let mut policy = fast_retry_policy();
+        policy.stalled_after = Duration::from_secs(60);
+        policy.reconnect_after = Duration::from_secs(120);
+
+        let candidate = download_pinned_artifact_with_policy(
+            &source,
+            &spec,
+            &InstallCancellation::default(),
+            &|update| updates.lock().unwrap().push(update),
+            policy,
+        )
+        .unwrap();
+
+        assert_eq!(source.requested_ranges.lock().unwrap().as_slice(), &[None]);
+        let activities = updates
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|update| update.download_activity)
+            .collect::<Vec<_>>();
+        assert_eq!(activities, [DownloadActivity::Active]);
+        assert_eq!(fs::read(candidate.path).unwrap(), bytes);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn dns_and_connect_failures_reconnect_and_complete() {
+        for cause in [DownloadFaultKind::Dns, DownloadFaultKind::ConnectionFailed] {
+            let root = unique_root(&format!("retry-admission-{cause:?}"));
+            fs::create_dir_all(&root).unwrap();
+            let bytes = b"complete artifact";
+            let spec = artifact(&root, bytes);
+            let source = ScriptedHttp::new([
+                ScriptedAttempt::Retryable(cause),
+                ScriptedAttempt::Response {
+                    status: 200,
+                    content_length: Some(bytes.len() as u64),
+                    content_range: None,
+                    actions: vec![ReadAction::Bytes(bytes.to_vec()), ReadAction::Eof],
+                },
+            ]);
+            let updates = Mutex::new(Vec::new());
+
+            let candidate = download_pinned_artifact_with_policy(
+                &source,
+                &spec,
+                &InstallCancellation::default(),
+                &|update| updates.lock().unwrap().push(update),
+                fast_retry_policy(),
+            )
+            .unwrap();
+
+            assert_eq!(
+                source.requested_ranges.lock().unwrap().as_slice(),
+                &[None, None]
+            );
+            let activities = updates
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|update| update.download_activity)
+                .collect::<Vec<_>>();
+            assert!(matches!(
+                activities.first(),
+                Some(DownloadActivity::RetryScheduled {
+                    attempt: 1,
+                    max_attempts: 3,
+                    cause: actual,
+                    ..
+                }) if *actual == cause
+            ));
+            assert_eq!(activities.last(), Some(&DownloadActivity::Active));
+            assert_eq!(fs::read(candidate.path).unwrap(), bytes);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn throughput_measurement_restarts_from_the_reconnected_attempt() {
+        let root = unique_root("reconnected-throughput");
+        fs::create_dir_all(&root).unwrap();
+        let bytes = vec![b'x'; 4_096];
+        let prefix = 4_080;
+        let spec = artifact(&root, &bytes);
+        let source = ScriptedHttp::new([
+            ScriptedAttempt::Response {
+                status: 200,
+                content_length: Some(bytes.len() as u64),
+                content_range: None,
+                actions: vec![
+                    ReadAction::Bytes(bytes[..prefix].to_vec()),
+                    ReadAction::Error(io::ErrorKind::ConnectionReset),
+                ],
+            },
+            ScriptedAttempt::Response {
+                status: 206,
+                content_length: Some((bytes.len() - prefix) as u64),
+                content_range: Some(format!(
+                    "bytes {prefix}-{}/{}",
+                    bytes.len() - 1,
+                    bytes.len()
+                )),
+                actions: vec![
+                    ReadAction::ErrorAfter(Duration::from_millis(300), io::ErrorKind::TimedOut),
+                    ReadAction::Bytes(bytes[prefix..].to_vec()),
+                    ReadAction::Eof,
+                ],
+            },
+        ]);
+        let updates = Mutex::new(Vec::new());
+        let mut policy = fast_retry_policy();
+        policy.stalled_after = Duration::from_secs(5);
+        policy.reconnect_after = Duration::from_secs(10);
+
+        let candidate = download_pinned_artifact_with_policy(
+            &source,
+            &spec,
+            &InstallCancellation::default(),
+            &|update| updates.lock().unwrap().push(update),
+            policy,
+        )
+        .unwrap();
+
+        let updates = updates.lock().unwrap();
+        let completed_reconnect = updates
+            .iter()
+            .find(|update| {
+                update.stage == InstallStage::Downloading
+                    && update.completed_bytes == bytes.len() as u64
+                    && update.bytes_per_second.is_some()
+            })
+            .expect("the reconnected attempt must report its own transfer rate");
+        let rate = completed_reconnect.bytes_per_second.unwrap();
+        assert!(
+            rate <= 500,
+            "rate must count only the 16-byte suffix after reconnect, got {rate} B/s"
+        );
+        assert_eq!(fs::read(&candidate.path).unwrap(), bytes);
+        drop(updates);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ranged_retry_exhaustion_returns_sanitized_typed_failure() {
+        let root = unique_root("retry-exhaustion-username-marker-alice");
+        fs::create_dir_all(&root).unwrap();
+        let bytes = b"complete artifact";
+        let prefix = 4;
+        let spec = artifact(&root, bytes);
+        let source = ScriptedHttp::new([
+            ScriptedAttempt::Response {
+                status: 200,
+                content_length: Some(bytes.len() as u64),
+                content_range: None,
+                actions: vec![
+                    ReadAction::Bytes(bytes[..prefix].to_vec()),
+                    ReadAction::Error(io::ErrorKind::ConnectionReset),
+                ],
+            },
+            ScriptedAttempt::Retryable(DownloadFaultKind::ConnectionFailed),
+            ScriptedAttempt::Retryable(DownloadFaultKind::ConnectionFailed),
+            ScriptedAttempt::Retryable(DownloadFaultKind::ConnectionFailed),
+        ]);
+
+        let error = download_pinned_artifact_with_policy(
+            &source,
+            &spec,
+            &InstallCancellation::default(),
+            &|_| {},
+            fast_retry_policy(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            InstallError::DownloadFailed {
+                category: DownloadFaultKind::ConnectionFailed,
+                retry_count: 3,
+                retained_bytes,
+                partial_path: ref retained_path,
+            } if retained_bytes == prefix as u64
+                && retained_path == &partial_path(&spec.destination).unwrap()
+        ));
+        let message = error.to_string();
+        assert_eq!(
+            message,
+            "download failed after 3 ranged retries (connection failed); 4 bytes retained"
+        );
+        assert!(message.contains("connection failed"));
+        assert!(!message.contains(&spec.url));
+        assert!(!message.contains('?'));
+        let retained_path = partial_path(&spec.destination).unwrap();
+        assert!(!message.contains(retained_path.to_string_lossy().as_ref()));
+        assert!(!message.contains("username-marker-alice"));
+        assert_eq!(
+            source.requested_ranges.lock().unwrap().as_slice(),
+            &[None, Some(4), Some(4), Some(4)]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ignored_range_preserves_existing_partial_when_reader_spawn_fails() {
+        let root = unique_root("ignored-range-reader-spawn-failure");
+        fs::create_dir_all(&root).unwrap();
+        let bytes = b"complete artifact";
+        let retained = &bytes[..7];
+        let spec = artifact(&root, bytes);
+        let partial = partial_path(&spec.destination).unwrap();
+        fs::write(&partial, retained).unwrap();
+        let source = ScriptedHttp::new([ScriptedAttempt::Response {
+            status: 200,
+            content_length: Some(bytes.len() as u64),
+            content_range: None,
+            actions: vec![ReadAction::Bytes(bytes.to_vec()), ReadAction::Eof],
+        }]);
+
+        let error = download_pinned_artifact_with_policy_and_reader_spawner(
+            &source,
+            &spec,
+            &InstallCancellation::default(),
+            &|_| {},
+            fast_retry_policy(),
+            fail_download_reader_spawn,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "injected download reader spawn failure");
+        assert_eq!(fs::read(&partial).unwrap(), retained);
+        assert_eq!(
+            source.requested_ranges.lock().unwrap().as_slice(),
+            &[Some(retained.len() as u64)]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn retryable_http_statuses_reconnect_and_complete() {
+        for status in [408, 429, 500, 502, 503, 504] {
+            let root = unique_root(&format!("retry-status-{status}"));
+            fs::create_dir_all(&root).unwrap();
+            let bytes = b"complete artifact";
+            let spec = artifact(&root, bytes);
+            let source = ScriptedHttp::new([
+                ScriptedAttempt::Response {
+                    status,
+                    content_length: None,
+                    content_range: None,
+                    actions: vec![ReadAction::Eof],
+                },
+                ScriptedAttempt::Response {
+                    status: 200,
+                    content_length: Some(bytes.len() as u64),
+                    content_range: None,
+                    actions: vec![ReadAction::Bytes(bytes.to_vec()), ReadAction::Eof],
+                },
+            ]);
+            let updates = Mutex::new(Vec::new());
+
+            let candidate = download_pinned_artifact_with_policy(
+                &source,
+                &spec,
+                &InstallCancellation::default(),
+                &|update| updates.lock().unwrap().push(update),
+                fast_retry_policy(),
+            )
+            .unwrap();
+
+            assert!(updates.lock().unwrap().iter().any(|update| matches!(
+                update.download_activity,
+                Some(DownloadActivity::RetryScheduled {
+                    cause: DownloadFaultKind::HttpStatus(actual),
+                    ..
+                }) if actual == status
+            )));
+            assert_eq!(fs::read(candidate.path).unwrap(), bytes);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn premature_eof_retries_from_the_exact_retained_offset() {
+        let root = unique_root("premature-eof");
+        fs::create_dir_all(&root).unwrap();
+        let bytes = b"complete artifact";
+        let prefix = 6;
+        let spec = artifact(&root, bytes);
+        let source = ScriptedHttp::new([
+            ScriptedAttempt::Response {
+                status: 200,
+                content_length: Some(bytes.len() as u64),
+                content_range: None,
+                actions: vec![ReadAction::Bytes(bytes[..prefix].to_vec()), ReadAction::Eof],
+            },
+            ScriptedAttempt::Response {
+                status: 206,
+                content_length: Some((bytes.len() - prefix) as u64),
+                content_range: Some(format!(
+                    "bytes {prefix}-{}/{}",
+                    bytes.len() - 1,
+                    bytes.len()
+                )),
+                actions: vec![ReadAction::Bytes(bytes[prefix..].to_vec()), ReadAction::Eof],
+            },
+        ]);
+
+        let candidate = download_pinned_artifact_with_policy(
+            &source,
+            &spec,
+            &InstallCancellation::default(),
+            &|_| {},
+            fast_retry_policy(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            source.requested_ranges.lock().unwrap().as_slice(),
+            &[None, Some(prefix as u64)]
+        );
+        assert_eq!(fs::read(candidate.path).unwrap(), bytes);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn retryable_read_interruptions_resume_without_losing_bytes() {
+        for kind in [
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::BrokenPipe,
+        ] {
+            let root = unique_root(&format!("retry-read-{kind:?}"));
+            fs::create_dir_all(&root).unwrap();
+            let bytes = b"complete artifact";
+            let prefix = 3;
+            let spec = artifact(&root, bytes);
+            let source = ScriptedHttp::new([
+                ScriptedAttempt::Response {
+                    status: 200,
+                    content_length: Some(bytes.len() as u64),
+                    content_range: None,
+                    actions: vec![
+                        ReadAction::Bytes(bytes[..prefix].to_vec()),
+                        ReadAction::Error(kind),
+                    ],
+                },
+                ScriptedAttempt::Response {
+                    status: 206,
+                    content_length: Some((bytes.len() - prefix) as u64),
+                    content_range: Some(format!(
+                        "bytes {prefix}-{}/{}",
+                        bytes.len() - 1,
+                        bytes.len()
+                    )),
+                    actions: vec![ReadAction::Bytes(bytes[prefix..].to_vec()), ReadAction::Eof],
+                },
+            ]);
+
+            let candidate = download_pinned_artifact_with_policy(
+                &source,
+                &spec,
+                &InstallCancellation::default(),
+                &|_| {},
+                fast_retry_policy(),
+            )
+            .unwrap();
+
+            assert_eq!(
+                source.requested_ranges.lock().unwrap().as_slice(),
+                &[None, Some(prefix as u64)]
+            );
+            assert_eq!(fs::read(candidate.path).unwrap(), bytes);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn nonretryable_status_and_request_validation_faults_fail_once() {
+        let root = unique_root("fatal-no-retry");
+        fs::create_dir_all(&root).unwrap();
+        let bytes = b"complete artifact";
+        let spec = artifact(&root, bytes);
+        let status_source = ScriptedHttp::new([ScriptedAttempt::Response {
+            status: 404,
+            content_length: None,
+            content_range: None,
+            actions: vec![ReadAction::Eof],
+        }]);
+
+        let error = download_pinned_artifact_with_policy(
+            &status_source,
+            &spec,
+            &InstallCancellation::default(),
+            &|_| {},
+            fast_retry_policy(),
+        )
+        .unwrap_err();
+        assert!(matches!(error, InstallError::Failed(_)));
+        assert_eq!(status_source.requested_ranges.lock().unwrap().len(), 1);
+
+        let fatal_source = ScriptedHttp::new([ScriptedAttempt::Fatal("request rejected")]);
+        let error = download_pinned_artifact_with_policy(
+            &fatal_source,
+            &spec,
+            &InstallCancellation::default(),
+            &|_| {},
+            fast_retry_policy(),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "request rejected");
+        assert_eq!(fatal_source.requested_ranges.lock().unwrap().len(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cancellation_interrupts_retry_backoff_without_another_request() {
+        let root = unique_root("cancel-backoff");
+        fs::create_dir_all(&root).unwrap();
+        let spec = artifact(&root, b"complete artifact");
+        let source = ScriptedHttp::new([ScriptedAttempt::Retryable(DownloadFaultKind::Dns)]);
+        let cancellation = InstallCancellation::default();
+        let mut policy = fast_retry_policy();
+        policy.retry_backoffs = [Duration::from_secs(1); 3];
+        policy.cancellation_poll_interval = Duration::from_millis(5);
+        let started_at = Instant::now();
+
+        let error = download_pinned_artifact_with_policy(
+            &source,
+            &spec,
+            &cancellation,
+            &|update| {
+                if matches!(
+                    update.download_activity,
+                    Some(DownloadActivity::RetryScheduled { .. })
+                ) {
+                    cancellation.cancel();
+                }
+            },
+            policy,
+        )
+        .unwrap_err();
+
+        assert!(error.is_cancelled());
+        assert!(started_at.elapsed() < Duration::from_millis(100));
+        assert_eq!(source.requested_ranges.lock().unwrap().len(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     impl HttpSource for HookHttp {
-        fn get(&self, _url: &str, _range_start: Option<u64>) -> Result<HttpResponse, InstallError> {
+        fn get(
+            &self,
+            _url: &str,
+            _range_start: Option<u64>,
+            _read_poll_interval: Duration,
+        ) -> Result<HttpResponse, HttpSourceError> {
             if let Some(hook) = self.hook.lock().unwrap().take() {
                 hook();
             }
@@ -3786,6 +5093,7 @@ mod tests {
             &url,
             None,
             RedirectPolicy::HuggingFace,
+            DownloadRetryPolicy::STANDARD.read_poll_interval,
         ) {
             Ok(_) => panic!("disallowed redirect must not return a download response"),
             Err(error) => error,
@@ -4060,6 +5368,75 @@ mod tests {
     }
 
     #[test]
+    fn real_ureq_body_reader_times_out_and_detached_worker_exits() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (connection_closed_tx, connection_closed_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(4)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let count = stream.read(&mut buffer).unwrap();
+                if count == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..count]);
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            stream.flush().unwrap();
+
+            // Withhold the declared body and observe when the detached client
+            // reader is dropped after its receiver disappears.
+            let waiting_since = Instant::now();
+            let closed = stream.read(&mut [0_u8; 1]).map_err(|error| error.kind());
+            connection_closed_tx
+                .send((closed, waiting_since.elapsed()))
+                .unwrap();
+        });
+        let url = format!("http://{address}/artifact");
+        let policy = DownloadRetryPolicy::STANDARD;
+        let response = UreqHttpSource
+            .get(&url, None, policy.read_poll_interval)
+            .unwrap();
+        let pending_reader = spawn_download_reader(response.reader).unwrap();
+        let events = pending_reader.start();
+        let read_started_at = Instant::now();
+
+        let read_error = events
+            .recv_timeout(Duration::from_secs(3))
+            .expect("production reader must report its per-read timeout")
+            .unwrap_err();
+        assert!(matches!(
+            read_error.kind(),
+            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+        ));
+        assert!(read_started_at.elapsed() < Duration::from_secs(3));
+
+        // The worker may already be inside one more read. Dropping its bounded
+        // channel makes the next send fail, which drops the real ureq reader.
+        drop(events);
+        let (server_read, detached_for) = connection_closed_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("detached production reader must close its connection");
+        assert!(
+            matches!(server_read, Ok(0))
+                || matches!(
+                    server_read,
+                    Err(io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted)
+                ),
+            "server did not observe the detached reader closing: {server_read:?}"
+        );
+        assert!(detached_for < Duration::from_secs(3));
+        server.join().unwrap();
+    }
+
+    #[test]
     fn stalled_http_body_acknowledges_cancellation_after_read_timeout() {
         let root = unique_root("real-http-stall-cancel");
         fs::create_dir_all(&root).unwrap();
@@ -4235,7 +5612,12 @@ mod tests {
     }
 
     impl HttpSource for CancellingHttp {
-        fn get(&self, _url: &str, _range_start: Option<u64>) -> Result<HttpResponse, InstallError> {
+        fn get(
+            &self,
+            _url: &str,
+            _range_start: Option<u64>,
+            _read_poll_interval: Duration,
+        ) -> Result<HttpResponse, HttpSourceError> {
             Ok(HttpResponse {
                 status: 200,
                 content_lengths: vec![self.bytes.len().to_string()],

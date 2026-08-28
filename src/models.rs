@@ -39,6 +39,12 @@ pub enum ModelInstallStatus {
         #[serde(default)]
         bytes_per_second: Option<u64>,
     },
+    /// A user-initiated pause preserves resumable bytes without treating the
+    /// expected cancellation as an installation failure.
+    Paused {
+        downloaded_bytes: u64,
+        total_bytes: Option<u64>,
+    },
     InstallingRuntime,
     Installed,
     Missing,
@@ -72,6 +78,7 @@ impl ModelInstallStatus {
                     None => progress,
                 }
             }
+            Self::Paused { .. } => "Paused".to_owned(),
             Self::InstallingRuntime => "Verifying and installing artifacts".to_owned(),
             Self::Installed => "Installed".to_owned(),
             Self::Missing => "Missing file".to_owned(),

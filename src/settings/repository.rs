@@ -8,7 +8,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::super::normalize_config;
-use super::{AppConfig, parse_settings_value_with_diagnostics};
+use super::{AppConfig, discard_retired_config_values, parse_settings_value_with_diagnostics};
 
 pub struct SettingsStore {
     path: PathBuf,
@@ -135,6 +135,7 @@ fn serialized_config_bytes(config: &AppConfig) -> Result<Vec<u8>> {
 
 fn normalized_config(config: &AppConfig) -> AppConfig {
     let mut normalized = config.clone();
+    discard_retired_config_values(&mut normalized);
     normalize_config(&mut normalized);
     if normalized.schema_version <= super::super::CURRENT_SCHEMA_VERSION {
         normalized.schema_version = super::super::CURRENT_SCHEMA_VERSION;
@@ -450,7 +451,7 @@ mod tests {
     }
 
     #[test]
-    fn copied_profile_preserves_retired_settings_unknown_fields_and_artifact_bytes() {
+    fn copied_profile_discards_retired_runtime_settings_without_touching_artifacts() {
         let dir = test_dir("retired-provider-profile");
         let path = dir.join("config.json");
         let artifact = dir.join("copied-profile").join("legacy-model.bin");
@@ -505,15 +506,14 @@ mod tests {
             config.general.playground_selected_models,
             ["whisper_cpp_small_en"]
         );
-        assert_eq!(config.general.model_paths["faster_whisper"], artifact);
-        assert_eq!(
-            config.general.managed_models["faster_whisper_tiny_en"].unknown["future_receipt"],
-            serde_json::json!({"preserved": true})
+        assert!(!config.general.model_paths.contains_key("faster_whisper"));
+        assert!(
+            !config
+                .general
+                .managed_models
+                .contains_key("faster_whisper_tiny_en")
         );
-        assert_eq!(
-            config.general.unknown["managed_runtimes"]["faster_whisper"]["future_runtime_receipt"],
-            serde_json::json!({"preserved": true})
-        );
+        assert!(!config.general.unknown.contains_key("managed_runtimes"));
         assert_eq!(
             config.general.unknown["future_general"],
             serde_json::json!({"preserved": true})
@@ -526,18 +526,17 @@ mod tests {
         assert_eq!(fs::read(&runtime).unwrap(), b"legacy runner sentinel");
 
         let rewritten: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(
-            rewritten["general"]["model_paths"]["faster_whisper"],
-            serde_json::json!(artifact)
+        assert!(
+            rewritten["general"]["model_paths"]
+                .get("faster_whisper")
+                .is_none()
         );
-        assert_eq!(
-            rewritten["general"]["managed_models"]["faster_whisper_tiny_en"]["future_receipt"],
-            serde_json::json!({"preserved": true})
+        assert!(
+            rewritten["general"]["managed_models"]
+                .get("faster_whisper_tiny_en")
+                .is_none()
         );
-        assert_eq!(
-            rewritten["general"]["managed_runtimes"]["faster_whisper"]["future_runtime_receipt"],
-            serde_json::json!({"preserved": true})
-        );
+        assert!(rewritten["general"].get("managed_runtimes").is_none());
         assert_eq!(fs::read(&artifact).unwrap(), sentinel);
         assert_eq!(fs::read(&runtime).unwrap(), b"legacy runner sentinel");
         assert_eq!(
@@ -552,7 +551,7 @@ mod tests {
     }
 
     #[test]
-    fn version_three_runtime_retirement_backup_is_exact_and_migration_is_inert() {
+    fn version_three_runtime_retirement_backup_is_exact_and_fields_are_removed() {
         let dir = test_dir("v3-runtime-retirement-backup");
         let path = dir.join("config.json");
         let artifact = dir.join("sentinels").join("legacy-model.bin");
@@ -586,16 +585,20 @@ mod tests {
                 "model_storage_dir": dir.join("isolated-storage"),
                 "model_paths": {"retired-provider": artifact},
                 "managed_runtimes": managed_runtimes.clone(),
-                "last_used_backend": last_used_backend.clone()
+                "last_used_backend": last_used_backend.clone(),
+                "future_general": {"preserved": true}
             },
             "performance": {
                 "whisper_gpu_device": gpu_device.clone(),
                 "whisper_cuda_backend_path": cuda_backend.clone(),
-                "whisper_cuda_library_paths": cuda_libraries.clone()
+                "whisper_cuda_library_paths": cuda_libraries.clone(),
+                "future_performance": [1, 2, 3]
             },
             "developer": {
-                "whisper_executable_path": executable_value.clone()
-            }
+                "whisper_executable_path": executable_value.clone(),
+                "future_developer": "preserved"
+            },
+            "future_root": {"preserved": true}
         });
         let original_bytes = serde_json::to_vec_pretty(&original_value).unwrap();
         fs::write(&path, &original_bytes).unwrap();
@@ -618,23 +621,37 @@ mod tests {
         assert_eq!(fs::read(backup).unwrap(), original_bytes);
 
         assert_eq!(config.schema_version, super::super::CURRENT_SCHEMA_VERSION);
-        assert_eq!(config.general.unknown["managed_runtimes"], managed_runtimes);
-        assert_eq!(
-            config.general.unknown["last_used_backend"],
-            last_used_backend
+        for key in ["managed_runtimes", "last_used_backend"] {
+            assert!(!config.general.unknown.contains_key(key));
+        }
+        for key in [
+            "whisper_gpu_device",
+            "whisper_cuda_backend_path",
+            "whisper_cuda_library_paths",
+        ] {
+            assert!(!config.performance.unknown.contains_key(key));
+        }
+        assert!(
+            !config
+                .developer
+                .unknown
+                .contains_key("whisper_executable_path")
         );
-        assert_eq!(config.performance.unknown["whisper_gpu_device"], gpu_device);
         assert_eq!(
-            config.performance.unknown["whisper_cuda_backend_path"],
-            cuda_backend
+            config.general.unknown["future_general"],
+            serde_json::json!({"preserved": true})
         );
         assert_eq!(
-            config.performance.unknown["whisper_cuda_library_paths"],
-            cuda_libraries
+            config.performance.unknown["future_performance"],
+            serde_json::json!([1, 2, 3])
         );
         assert_eq!(
-            config.developer.unknown["whisper_executable_path"],
-            executable_value
+            config.developer.unknown["future_developer"],
+            serde_json::json!("preserved")
+        );
+        assert_eq!(
+            config.unknown["future_root"],
+            serde_json::json!({"preserved": true})
         );
 
         let live: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
@@ -642,21 +659,25 @@ mod tests {
             live["schema_version"],
             Value::from(super::super::CURRENT_SCHEMA_VERSION)
         );
-        assert_eq!(live["general"]["managed_runtimes"], managed_runtimes);
-        assert_eq!(live["general"]["last_used_backend"], last_used_backend);
-        assert_eq!(live["performance"]["whisper_gpu_device"], gpu_device);
-        assert_eq!(
-            live["performance"]["whisper_cuda_backend_path"],
-            cuda_backend
+        for key in ["managed_runtimes", "last_used_backend"] {
+            assert!(live["general"].get(key).is_none(), "general.{key}");
+        }
+        for key in [
+            "whisper_gpu_device",
+            "whisper_cuda_backend_path",
+            "whisper_cuda_library_paths",
+        ] {
+            assert!(live["performance"].get(key).is_none(), "performance.{key}");
+        }
+        assert!(
+            live["developer"].get("whisper_executable_path").is_none(),
+            "developer.whisper_executable_path"
         );
         assert_eq!(
-            live["performance"]["whisper_cuda_library_paths"],
-            cuda_libraries
+            live["general"]["future_general"],
+            serde_json::json!({"preserved": true})
         );
-        assert_eq!(
-            live["developer"]["whisper_executable_path"],
-            executable_value
-        );
+        assert_eq!(live["future_root"], serde_json::json!({"preserved": true}));
 
         assert_eq!(fs::read(&artifact).unwrap(), b"artifact sentinel");
         assert_eq!(fs::read(&runtime).unwrap(), b"runtime sentinel");
@@ -698,9 +719,10 @@ mod tests {
             config.general.selected_default_model,
             "retired-provider-model"
         );
+        assert!(!config.general.unknown.contains_key("managed_runtimes"));
         assert_eq!(
-            config.general.unknown["managed_runtimes"],
-            serde_json::json!({"future": {"opaque": [1, 2, 3]}})
+            config.general.unknown["future_general"],
+            serde_json::json!({"preserved": true})
         );
         assert_eq!(fs::read(&path).unwrap(), original);
         fs::remove_dir_all(dir).unwrap();
@@ -867,11 +889,11 @@ mod tests {
         let mut config = AppConfig::default();
         config.general.model_paths.insert(
             "whisper_cpp_small_en".to_owned(),
-            PathBuf::from("models/small.bin"),
+            PathBuf::from("models/small.gguf"),
         );
         config.general.model_paths.insert(
             "whisper_cpp_base_en".to_owned(),
-            PathBuf::from("models/base.bin"),
+            PathBuf::from("models/base.gguf"),
         );
         config.general.unknown.insert(
             "future_z".to_owned(),
@@ -899,7 +921,7 @@ mod tests {
         assert_eq!(artifact_config_fingerprint(&changed).unwrap(), expected);
         changed.general.model_paths.insert(
             "whisper_cpp_tiny_en".to_owned(),
-            PathBuf::from("models/tiny.bin"),
+            PathBuf::from("models/tiny.gguf"),
         );
         assert_ne!(artifact_config_fingerprint(&changed).unwrap(), expected);
 

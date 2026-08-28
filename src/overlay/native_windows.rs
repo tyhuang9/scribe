@@ -1654,7 +1654,7 @@ fn run_native_overlay_thread(mailbox: Arc<SnapshotMailbox>, event_sink: NativeEv
     let mut last_failure = None;
     let mut last_health_check = Instant::now();
     let mut last_animation_tick = Instant::now();
-    let mut animations_enabled = overlay_animations_enabled();
+    let mut animations_enabled = crate::system_preferences::client_area_animations_enabled();
 
     while !mailbox.shutdown.load(Ordering::Acquire) {
         pump_overlay_messages();
@@ -1703,7 +1703,7 @@ fn run_native_overlay_thread(mailbox: Arc<SnapshotMailbox>, event_sink: NativeEv
 
         if now.duration_since(last_health_check) >= OVERLAY_HEALTH_INTERVAL {
             last_health_check = now;
-            animations_enabled = overlay_animations_enabled();
+            animations_enabled = crate::system_preferences::client_area_animations_enabled();
             if let (Some(host), Some(snapshot)) = (host.as_mut(), current_snapshot.as_ref())
                 && snapshot.requested_visible
                 && let Err(failure) = host.health_check(snapshot)
@@ -1830,22 +1830,6 @@ fn pump_overlay_messages() {
             TranslateMessage(&message);
             DispatchMessageW(&message);
         }
-    }
-}
-
-fn overlay_animations_enabled() -> bool {
-    use windows_sys::Win32::UI::WindowsAndMessaging::SystemParametersInfoW;
-
-    const SPI_GETCLIENTAREAANIMATION: u32 = 0x1042;
-    let mut enabled = 0i32;
-    unsafe {
-        SystemParametersInfoW(
-            SPI_GETCLIENTAREAANIMATION,
-            0,
-            (&mut enabled as *mut i32).cast::<c_void>(),
-            0,
-        ) != 0
-            && enabled != 0
     }
 }
 

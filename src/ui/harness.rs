@@ -294,7 +294,7 @@ impl Fixture {
                 transcription.phase = TranscriptionPhase::Ready;
                 let mut partial = model("Whisper Moonshine", "moonshine.base", false, false, 190);
                 partial.installed = false;
-                partial.download_state = ModelDownloadState::Cancelled;
+                partial.download_state = ModelDownloadState::PartialRetained;
                 partial.downloaded_bytes = 129_000_000;
                 partial.total_bytes = Some(190_000_000);
                 partial.partial_cleanup_available = true;
@@ -547,7 +547,6 @@ fn model(
         primary_action_enabled: !active,
         primary_action_disabled_reason: active.then(|| "This model is already active.".to_owned()),
         removal_supported: true,
-        runtime_status_label: "Ready".into(),
         download_state: ModelDownloadState::Installed,
         description: Some(
             if active {
@@ -3241,31 +3240,28 @@ mod tests {
         for (fixture, expected_controls) in [
             (
                 Fixture::ModelsDownloadDownloading,
-                [
-                    "Pause Whisper Parakeet download",
-                    "Discard partial for Whisper Parakeet",
-                ],
+                &["Pause Whisper Parakeet download"][..],
             ),
             (
                 Fixture::ModelsDownloadRetained,
-                [
+                &[
                     "Resume Whisper Moonshine download",
                     "Discard partial for Whisper Moonshine",
-                ],
+                ][..],
             ),
             (
                 Fixture::ModelsDownloadFailedPartial,
-                [
+                &[
                     "Resume Whisper Medium retained download",
                     "Discard partial for Whisper Medium retained",
-                ],
+                ][..],
             ),
             (
                 Fixture::ModelsDownloadFailedAlert,
-                [
+                &[
                     "Install Whisper Medium",
                     "Show download error for Whisper Medium",
-                ],
+                ][..],
             ),
         ] {
             for (width, height) in [(1180.0, 815.0), (960.0, 680.0)] {
@@ -5696,17 +5692,14 @@ mod tests {
             ScreenAction::CancelModelInstall("progress".into()),
             "Pause must retain the partial and win over the selectable card target",
         );
+        let discard_name = "Cancel and discard partial for Progress";
+        let discard = named_node_bounds(&output, discard_name);
+        assert_near(discard.width(), 44.0, "cancel-and-discard target width");
+        assert_near(discard.height(), 44.0, "cancel-and-discard target height");
         assert_eq!(
-            click_named_control(
-                &ctx,
-                &mut data,
-                &mut page,
-                1180.0,
-                815.0,
-                "Discard partial for Progress",
-            ),
+            click_named_control(&ctx, &mut data, &mut page, 1180.0, 815.0, discard_name),
             ScreenAction::DiscardModelPartial("progress".into()),
-            "X must request the exact partial cleanup without selecting the card",
+            "active X must use the correlated cancel-then-discard action",
         );
 
         data.models[0].downloaded_bytes = 42;
@@ -5747,6 +5740,64 @@ mod tests {
                 .any(|name| name.starts_with("Downloading 42B")),
             "progress must disappear once the model is no longer downloading",
         );
+    }
+
+    #[test]
+    fn active_download_cancel_and_discard_is_keyboard_operable() {
+        for key in [egui::Key::Enter, egui::Key::Space] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            configure_accessible_style(&ctx);
+            let mut data = Fixture::ModelsInstalled.data();
+            data.models = vec![ModelViewModel {
+                id: "keyboard-discard".into(),
+                display_name: "Keyboard discard".into(),
+                installed: true,
+                ready: true,
+                download_state: ModelDownloadState::Downloading,
+                downloaded_bytes: 42,
+                total_bytes: Some(100),
+                cancel_supported: true,
+                ..Default::default()
+            }];
+            data.model_catalog.clear();
+            data.remote_catalog.entries.clear();
+            let mut page = AppPage::Models;
+            let initial =
+                render_with_input(&ctx, &mut data, &mut page, 1180.0, 815.0, Vec::new()).0;
+            let target = named_node_id(&initial, "Cancel and discard partial for Keyboard discard");
+            assert_eq!(
+                render_with_input(
+                    &ctx,
+                    &mut data,
+                    &mut page,
+                    1180.0,
+                    815.0,
+                    vec![egui::Event::AccessKitActionRequest(
+                        egui::accesskit::ActionRequest {
+                            action: egui::accesskit::Action::Focus,
+                            target,
+                            data: None,
+                        }
+                    )],
+                )
+                .1,
+                ScreenAction::None
+            );
+            assert_eq!(
+                render_with_input(
+                    &ctx,
+                    &mut data,
+                    &mut page,
+                    1180.0,
+                    815.0,
+                    vec![page_event(key)],
+                )
+                .1,
+                ScreenAction::DiscardModelPartial("keyboard-discard".into()),
+                "{key:?} must operate the focused cancel-and-discard control",
+            );
+        }
     }
 
     #[test]
@@ -5808,6 +5859,8 @@ mod tests {
             enabled: true,
             disabled_reason: None,
         }];
+        let remote_model_id = data.remote_catalog.entries[0].id.clone();
+        let variant_id = data.remote_catalog.entries[0].variants[0].id.clone();
         let mut page = AppPage::Models;
         let output = render_with_input(&ctx, &mut data, &mut page, 1180.0, 815.0, Vec::new()).0;
         let accessible_progress = "Downloading 40B of 100B, 40% complete";
@@ -5841,20 +5894,18 @@ mod tests {
             ScreenAction::CancelRemoteCatalogInstall("managed-compact-english".into())
         );
         assert!(!matches!(action, ScreenAction::SelectModel(_)));
+        let discard_name =
+            "Cancel and discard partial for Compact English (compact-english-q5.gguf)";
+        let discard = named_node_bounds(&output, discard_name);
+        assert_near(discard.width(), 44.0, "remote X target width");
+        assert_near(discard.height(), 44.0, "remote X target height");
         assert_eq!(
-            click_named_control(
-                &ctx,
-                &mut data,
-                &mut page,
-                1180.0,
-                815.0,
-                "Discard partial for Compact English (compact-english-q5.gguf)",
-            ),
+            click_named_control(&ctx, &mut data, &mut page, 1180.0, 815.0, discard_name),
             ScreenAction::DiscardRemoteCatalogPartial {
-                remote_model_id: "trusted-speech/compact-english".into(),
-                variant_id: "compact-english-q5".into(),
+                remote_model_id,
+                variant_id,
             },
-            "remote X must request cleanup for the exact trusted artifact",
+            "remote active X must exist even before a partial-probe action is projected",
         );
     }
 
@@ -6605,7 +6656,18 @@ mod tests {
                 .iter()
                 .any(|name| name == "Resume Whisper Moonshine download")
         );
-        let discard = named_node_id(&initial, "Discard partial for Whisper Moonshine");
+        let discard_name = "Discard partial for Whisper Moonshine";
+        let discard_bounds = named_node_bounds(&initial, discard_name);
+        assert!(
+            discard_bounds.width() >= 44.0 && discard_bounds.height() >= 44.0,
+            "the explicitly named destructive control remains pointer reachable"
+        );
+        assert_eq!(
+            click_named_control(&ctx, &mut data, &mut page, 1180.0, 815.0, discard_name),
+            ScreenAction::DiscardModelPartial("moonshine.base".into()),
+            "the named destructive control dispatches partial cleanup without selecting the card",
+        );
+        let discard = named_node_id(&initial, discard_name);
         let (_, action) = render_with_input(
             &ctx,
             &mut data,
@@ -6662,7 +6724,7 @@ mod tests {
         });
         assert!(
             !discard.is_disabled(),
-            "the always-available X delegates safety checks to the app mutation barrier"
+            "the always-available destructive control delegates safety checks to the app mutation barrier"
         );
 
         let mut remote = Fixture::ModelsInstalled.data();
@@ -6689,6 +6751,14 @@ mod tests {
         let discard = named_node_id(
             &initial,
             "Discard partial for Compact English (compact-english-q5.gguf)",
+        );
+        let discard_bounds = named_node_bounds(
+            &initial,
+            "Discard partial for Compact English (compact-english-q5.gguf)",
+        );
+        assert!(
+            discard_bounds.width() >= 44.0 && discard_bounds.height() >= 44.0,
+            "the remote destructive control remains keyboard reachable",
         );
         let (_, action) = render_with_input(
             &ctx,

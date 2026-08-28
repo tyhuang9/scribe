@@ -30,7 +30,6 @@ ureq = "2"
 unicode-segmentation = "1.12"
 url = "2"
 winit = "0.29"
-zip = { version = "=8.6.0", default-features = false, features = ["deflate"] }
 
 [target.'cfg(windows)'.dependencies]
 accesskit_windows = "=0.15.1"

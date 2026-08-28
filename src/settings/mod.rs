@@ -11,7 +11,7 @@ pub use schema::{
 #[cfg(test)]
 pub use schema::{GeneralSettings, RecordingSettings};
 
-pub(crate) use migrations::parse_settings_value_with_diagnostics;
+pub(crate) use migrations::{discard_retired_config_values, parse_settings_value_with_diagnostics};
 pub(crate) use repository::{
     artifact_config_fingerprint, atomic_write_bytes, load_from_path, save_to_path,
 };
