@@ -5,16 +5,25 @@ description: Understand local model selection, runtime discovery, and storage.
 
 ## Current catalog and status
 
-The normal Models experience exposes five static catalog entries: Experimental
-GGUF models `whisper_cpp_tiny_en`, `whisper_cpp_base_en`,
+The normal Models experience always includes five static catalog entries:
+Experimental GGUF models `whisper_cpp_tiny_en`, `whisper_cpp_base_en`,
 `whisper_cpp_small_en`, and `whisper_cpp_medium_en`, plus the receipt-backed
 Experimental `moonshine-tiny-en-int8-onnx` bundle. The GGUF artifacts are
 pinned by repository revision, filename, size, and SHA-256; the ONNX model is
-installed only as its verified receipt-backed bundle. You can also validate a
-local GGUF in place; Scribe fingerprints and smoke-tests it without copying,
-uploading, or deleting it.
+installed only as its verified receipt-backed bundle.
 
-All normal catalog and imported models are **Experimental** and the Supported count is **zero**. A model must pass load, fixture transcription, cancellation, unload/reload, acceleration, and platform checks before promotion.
+When a trusted catalog response is available, Models can also discover and
+display additional non-duplicate remote GGUF variants. Those variants are not
+bundled, are not static catalog entries, and may be unavailable. A remote
+listing becomes usable only after its exact source facts are verified and its
+artifact is installed; listing it does not authorize execution or make it
+Supported.
+
+The five static entries are all **Experimental** and the Supported count is
+**zero**. A model must pass load, fixture transcription, cancellation,
+unload/reload, acceleration, and platform checks before promotion. You can also
+validate a local GGUF in place; Scribe fingerprints and smoke-tests it without
+copying, uploading, or deleting it.
 
 Legacy user configuration and artifact files are preserved for migration, but
 they are no longer recognized or executed by a production inference route. An
