@@ -417,97 +417,6 @@ try {
         }
     }
 
-    if (-not (Test-TransientWindowsLockError 32) -or
-        -not (Test-TransientWindowsLockError 33) -or
-        (Test-TransientWindowsLockError 5)) {
-        throw 'Stable-upgrade readiness retries must classify only Win32 sharing and lock violations as transient.'
-    }
-    $readinessToken = [guid]::NewGuid().ToString('N')
-    $readinessContainer = Join-Path ([System.IO.Path]::GetTempPath()) "scribe-release-stable-test-$readinessToken"
-    $readinessRoot = Join-Path $readinessContainer 'installed'
-    $readinessUninstaller = Join-Path $readinessRoot 'unins000.exe'
-    $readinessReady = Join-Path $readinessContainer 'holder-ready'
-    New-Item -ItemType Directory -Path $readinessRoot | Out-Null
-    [System.IO.File]::WriteAllBytes($readinessUninstaller, [byte[]](0x4D, 0x5A))
-    $readinessHolder = $null
-    try {
-        $readinessHolder = Start-TestLogHandleHolder $pwshPath $readinessUninstaller $readinessReady 500
-        Wait-TestLogHandleHolderReady $readinessHolder $readinessReady
-        Wait-ForStableUninstallerReplacementReadiness `
-            $readinessRoot $readinessUninstaller -MaximumAttempts 8 -MaximumRetryMilliseconds 2000
-    }
-    finally {
-        if ($null -ne $readinessHolder) {
-            $null = $readinessHolder.WaitForExit(5000)
-            $readinessHolder.Dispose()
-        }
-        if (Test-Path -LiteralPath $readinessContainer) {
-            Remove-ValidatedTemporaryRoot $readinessContainer
-        }
-    }
-
-    $readinessExhaustionToken = [guid]::NewGuid().ToString('N')
-    $readinessExhaustionContainer = Join-Path ([System.IO.Path]::GetTempPath()) "scribe-release-stable-test-$readinessExhaustionToken"
-    $readinessExhaustionRoot = Join-Path $readinessExhaustionContainer 'installed'
-    $readinessExhaustionUninstaller = Join-Path $readinessExhaustionRoot 'unins000.exe'
-    $readinessExhaustionReady = Join-Path $readinessExhaustionContainer 'holder-ready'
-    New-Item -ItemType Directory -Path $readinessExhaustionRoot | Out-Null
-    [System.IO.File]::WriteAllBytes($readinessExhaustionUninstaller, [byte[]](0x4D, 0x5A))
-    $readinessExhaustionHolder = $null
-    try {
-        $readinessExhaustionHolder = Start-TestLogHandleHolder `
-            $pwshPath $readinessExhaustionUninstaller $readinessExhaustionReady 1500
-        Wait-TestLogHandleHolderReady $readinessExhaustionHolder $readinessExhaustionReady
-        Invoke-ExpectedFailure {
-            Wait-ForStableUninstallerReplacementReadiness `
-                $readinessExhaustionRoot $readinessExhaustionUninstaller -MaximumAttempts 2 -MaximumRetryMilliseconds 250
-        } 'Win32 error 32'
-        if (-not (Test-Path -LiteralPath $readinessExhaustionContainer)) {
-            throw 'Stable-upgrade readiness unexpectedly bypassed a held synthetic uninstaller.'
-        }
-    }
-    finally {
-        if ($null -ne $readinessExhaustionHolder) {
-            $null = $readinessExhaustionHolder.WaitForExit(5000)
-            $readinessExhaustionHolder.Dispose()
-        }
-        if (Test-Path -LiteralPath $readinessExhaustionContainer) {
-            Remove-ValidatedTemporaryRoot $readinessExhaustionContainer
-        }
-    }
-
-    $accessDeniedToken = [guid]::NewGuid().ToString('N')
-    $accessDeniedContainer = Join-Path ([System.IO.Path]::GetTempPath()) "scribe-release-stable-test-$accessDeniedToken"
-    $accessDeniedRoot = Join-Path $accessDeniedContainer 'installed'
-    $accessDeniedUninstaller = Join-Path $accessDeniedRoot 'unins000.exe'
-    New-Item -ItemType Directory -Path $accessDeniedRoot | Out-Null
-    [System.IO.File]::WriteAllBytes($accessDeniedUninstaller, [byte[]](0x4D, 0x5A))
-    $originalReadinessProbe = ${function:Get-StableUninstallerReplacementProbeHandle}
-    $accessDeniedProbeCalls = [System.Collections.Generic.List[int]]::new()
-    function Get-StableUninstallerReplacementProbeHandle([string]$Uninstaller) {
-        $null = $accessDeniedProbeCalls.Add(1)
-        return [pscustomobject]@{
-            Handle = $null
-            ErrorCode = 5
-        }
-    }
-    try {
-        Invoke-ExpectedFailure {
-            Wait-ForStableUninstallerReplacementReadiness $accessDeniedRoot $accessDeniedUninstaller
-        } 'Win32 error 5'
-        if ($accessDeniedProbeCalls.Count -ne 1) {
-            throw 'Stable-upgrade readiness retried a synthetic permanent access-denied result.'
-        }
-    }
-    finally {
-        Set-Item -Path Function:\Get-StableUninstallerReplacementProbeHandle -Value $originalReadinessProbe
-        Remove-ValidatedTemporaryRoot $accessDeniedContainer
-    }
-
-    Invoke-ExpectedFailure {
-        Wait-ForStableUninstallerReplacementReadiness $testRoot (Join-Path $testRoot 'unins000.exe')
-    } 'Refused stable-upgrade readiness probe outside its token-bound temporary install root'
-
     $validSmoke = [pscustomobject]@{
         cancellation_verified = $true
         capabilities = [pscustomobject]@{ cancellation = $true }
@@ -1087,11 +996,8 @@ Set-StrictMode -Version Latest
     ) 'Native verifier process lifetime'
 
     $temporaryCleanupClassifierStart = $verifierSource.IndexOf('function Test-TemporaryCleanupSharingViolation')
-    $temporaryCleanupClassifierEnd = $verifierSource.IndexOf('function Test-TransientWindowsLockError', $temporaryCleanupClassifierStart)
-    $temporaryCleanupClassifierSource = $verifierSource.Substring(
-        $temporaryCleanupClassifierStart,
-        $temporaryCleanupClassifierEnd - $temporaryCleanupClassifierStart
-    )
+    $temporaryCleanupClassifierEnd = $verifierSource.IndexOf('function Remove-ValidatedTemporaryRoot', $temporaryCleanupClassifierStart)
+    $temporaryCleanupClassifierSource = $verifierSource.Substring($temporaryCleanupClassifierStart, $temporaryCleanupClassifierEnd - $temporaryCleanupClassifierStart)
     $cleanupStart = $verifierSource.IndexOf('function Remove-ValidatedTemporaryRoot')
     $cleanupEnd = $verifierSource.IndexOf('function New-TestShellFixture', $cleanupStart)
     $cleanupSource = $verifierSource.Substring($cleanupStart, $cleanupEnd - $cleanupStart)
@@ -1117,53 +1023,28 @@ Set-StrictMode -Version Latest
         $cleanupSource -match 'ErrorAction\s+SilentlyContinue') {
         throw 'Temporary cleanup retries must be limited to sharing or lock violations and fail closed otherwise.'
     }
-
-    $stableUninstallerStart = $verifierSource.IndexOf('function Assert-TokenBoundStableUninstaller')
-    $stableUninstallerEnd = $verifierSource.IndexOf('function Remove-ValidatedTemporaryRoot', $stableUninstallerStart)
-    $stableUninstallerSource = $verifierSource.Substring($stableUninstallerStart, $stableUninstallerEnd - $stableUninstallerStart)
-    Assert-OrderedWorkflowTokens $stableUninstallerSource @(
-        'Split-Path -Leaf $resolvedRoot) -cne ''installed''',
-        '^scribe-release-stable-test-[0-9a-f]{32}$',
-        'Assert-NoReparseAncestors $resolvedRoot',
-        '$rootItem = Get-Item -LiteralPath $resolvedRoot -Force',
-        '[System.IO.FileAttributes]::ReparsePoint',
-        'Split-Path -Leaf $resolvedUninstaller) -cne ''unins000.exe''',
-        'Assert-NoReparseAncestors $resolvedUninstaller',
-        'Assert-RegularFile $resolvedUninstaller'
-    ) 'Stable uninstaller readiness confinement and identity'
-    if ($stableUninstallerSource -notmatch 'CreateFileW' -or
-        $stableUninstallerSource -notmatch '\[uint32\]0x00010000' -or
-        $stableUninstallerSource -notmatch 'ERROR_SHARING_VIOLATION \(32\)' -or
-        $stableUninstallerSource -notmatch 'ERROR_ACCESS_DENIED \(5\)') {
-        throw 'Stable uninstaller readiness must use a non-mutating DELETE-access probe with documented Win32 error mapping.'
-    }
-    $readinessStart = $verifierSource.IndexOf('function Wait-ForStableUninstallerReplacementReadiness')
-    $readinessEnd = $verifierSource.IndexOf('function Remove-ValidatedTemporaryRoot', $readinessStart)
-    $readinessSource = $verifierSource.Substring($readinessStart, $readinessEnd - $readinessStart)
-    Assert-OrderedWorkflowTokens $readinessSource @(
-        '[ValidateRange(1, 20)]',
-        '$MaximumAttempts = 8',
-        '[ValidateRange(1, 10000)]',
-        '$MaximumRetryMilliseconds = 5000',
-        '$stopwatch = [System.Diagnostics.Stopwatch]::StartNew()',
-        'while ($true) {',
-        'Assert-TokenBoundStableUninstaller $StableRoot $Uninstaller',
-        'Get-StableUninstallerReplacementProbeHandle $resolvedUninstaller',
-        'Test-TransientWindowsLockError $probe.ErrorCode',
-        '$attempt -ge $MaximumAttempts',
-        '$stopwatch.ElapsedMilliseconds -ge $MaximumRetryMilliseconds',
-        'Start-Sleep -Milliseconds'
-    ) 'Stable uninstaller readiness retry safety'
-    $stableUpgradeStart = $verifierSource.IndexOf('$stableInstall = Invoke-IsolatedInstallerProcess')
-    $stableUpgradeEnd = $verifierSource.IndexOf('$canonicalReadme =', $stableUpgradeStart)
+    $stableUpgradeStart = $verifierSource.IndexOf('$stableUpgrade = Invoke-IsolatedInstallerProcess')
+    $stableUpgradeEnd = $verifierSource.IndexOf('$legacyDirectory =', $stableUpgradeStart)
     $stableUpgradeSource = $verifierSource.Substring($stableUpgradeStart, $stableUpgradeEnd - $stableUpgradeStart)
     Assert-OrderedWorkflowTokens $stableUpgradeSource @(
-        '$stableUninstaller = Join-Path $stableRoot "unins000.exe"',
+        '$stableUpgrade = Invoke-IsolatedInstallerProcess',
         'Assert-Bundle -Root $stableRoot -AllowedAdditionalFiles $InnoSetupUninstallerArtifacts',
-        'Assert-PayloadParity $bundle $stableRoot "Initial stable install"',
-        'Wait-ForStableUninstallerReplacementReadiness $stableRoot $stableUninstaller',
-        '$stableUpgrade = Invoke-IsolatedInstallerProcess'
-    ) 'Stable upgrade readiness ordering'
+        'Assert-PayloadParity $bundle $stableRoot "Stable upgrade"',
+        '$caseCollisionToken = [guid]::NewGuid().ToString(''N'')',
+        '$caseCollisionContainer = Join-Path ([System.IO.Path]::GetTempPath()) "scribe-release-stable-test-$caseCollisionToken"',
+        'New-Item -ItemType Directory -Path $caseCollisionRoot',
+        '"file", "setCaseSensitiveInfo", $caseCollisionRoot, "enable"',
+        'Get-ChildItem -LiteralPath $stableRoot -Force',
+        'Assert-Bundle -Root $caseCollisionRoot -AllowedAdditionalFiles $InnoSetupUninstallerArtifacts',
+        'Assert-PayloadParity $bundle $caseCollisionRoot "Case-collision fixture"',
+        'Copy-Item -LiteralPath $canonicalReadme -Destination $caseCollision',
+        '"/SCRIBESTABLETEST=$caseCollisionToken"',
+        '$installer $caseCollisionInstallArguments'
+    ) 'Case-sensitive collision fixture isolation'
+    if ($verifierSource.Contains('"file", "setCaseSensitiveInfo", $stableRoot, "enable"') -or
+        -not $verifierSource.Contains('Remove-ValidatedTemporaryRoot $caseCollisionContainer')) {
+        throw 'Canonical stable upgrades must remain case-insensitive and the isolated case-collision fixture must be token-root cleaned.'
+    }
 
     $verificationBundle = Join-Path $testRoot "verification-bundle"
     New-Item -ItemType Directory -Path $verificationBundle | Out-Null

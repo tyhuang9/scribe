@@ -475,124 +475,6 @@ function Test-TemporaryCleanupSharingViolation([System.Exception]$Exception) {
     return $false
 }
 
-function Test-TransientWindowsLockError([int]$ErrorCode) {
-    return $ErrorCode -in @(32, 33)
-}
-
-function Assert-TokenBoundStableUninstaller(
-    [string]$StableRoot,
-    [string]$Uninstaller
-) {
-    $tempRoot = Get-NormalizedPath ([System.IO.Path]::GetTempPath())
-    $resolvedRoot = Get-NormalizedPath $StableRoot
-    $container = Split-Path -Parent $resolvedRoot
-    if ((Split-Path -Leaf $resolvedRoot) -cne 'installed' -or
-        -not [string]::Equals((Split-Path -Parent $container), $tempRoot, [System.StringComparison]::OrdinalIgnoreCase) -or
-        (Split-Path -Leaf $container) -cnotmatch '^scribe-release-stable-test-[0-9a-f]{32}$') {
-        throw 'Refused stable-upgrade readiness probe outside its token-bound temporary install root.'
-    }
-    Assert-NoReparseAncestors $resolvedRoot
-    if (-not (Test-Path -LiteralPath $resolvedRoot -PathType Container)) {
-        throw "Stable-upgrade readiness install root is missing: $resolvedRoot"
-    }
-    $rootItem = Get-Item -LiteralPath $resolvedRoot -Force
-    if (($rootItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
-        throw "Stable-upgrade readiness install root cannot be a symbolic link or reparse point: $resolvedRoot"
-    }
-
-    $resolvedUninstaller = Get-NormalizedPath $Uninstaller
-    if (-not [string]::Equals((Split-Path -Parent $resolvedUninstaller), $resolvedRoot, [System.StringComparison]::OrdinalIgnoreCase) -or
-        (Split-Path -Leaf $resolvedUninstaller) -cne 'unins000.exe') {
-        throw 'Refused stable-upgrade readiness probe outside the exact stable uninstaller path.'
-    }
-    Assert-NoReparseAncestors $resolvedUninstaller
-    $null = Assert-RegularFile $resolvedUninstaller
-    return $resolvedUninstaller
-}
-
-function Get-StableUninstallerReplacementProbeHandle([string]$Uninstaller) {
-    if ($null -eq ('ScribeStableUninstallerReadinessNative' -as [type])) {
-        Add-Type @'
-using System;
-using System.Runtime.InteropServices;
-using Microsoft.Win32.SafeHandles;
-
-public static class ScribeStableUninstallerReadinessNative
-{
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    public static extern SafeFileHandle CreateFileW(
-        string fileName,
-        uint desiredAccess,
-        uint shareMode,
-        IntPtr securityAttributes,
-        uint creationDisposition,
-        uint flagsAndAttributes,
-        IntPtr templateFile);
-}
-'@
-    }
-    # DELETE access is the non-mutating replacement-readiness probe. Existing handles
-    # that deny DELETE produce ERROR_SHARING_VIOLATION (32) or ERROR_LOCK_VIOLATION (33);
-    # ERROR_ACCESS_DENIED (5) remains an immediate, fail-closed ACL/path failure.
-    $handle = [ScribeStableUninstallerReadinessNative]::CreateFileW(
-        $Uninstaller,
-        [uint32]0x00010000,
-        [uint32]0x00000003,
-        [IntPtr]::Zero,
-        [uint32]3,
-        [uint32]0,
-        [IntPtr]::Zero
-    )
-    if ($handle.IsInvalid) {
-        $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
-        $handle.Dispose()
-        return [pscustomobject]@{
-            Handle = $null
-            ErrorCode = $errorCode
-        }
-    }
-    return [pscustomobject]@{
-        Handle = $handle
-        ErrorCode = 0
-    }
-}
-
-function Wait-ForStableUninstallerReplacementReadiness(
-    [string]$StableRoot,
-    [string]$Uninstaller,
-    [ValidateRange(1, 20)]
-    [int]$MaximumAttempts = 8,
-    [ValidateRange(1, 10000)]
-    [int]$MaximumRetryMilliseconds = 5000
-) {
-    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-    $attempt = 0
-    while ($true) {
-        $resolvedUninstaller = Assert-TokenBoundStableUninstaller $StableRoot $Uninstaller
-        $probe = Get-StableUninstallerReplacementProbeHandle $resolvedUninstaller
-        if ($null -ne $probe.Handle) {
-            try {
-                return
-            }
-            finally {
-                $probe.Handle.Dispose()
-            }
-        }
-        $attempt += 1
-        if (-not (Test-TransientWindowsLockError $probe.ErrorCode) -or
-            $attempt -ge $MaximumAttempts -or
-            $stopwatch.ElapsedMilliseconds -ge $MaximumRetryMilliseconds) {
-            throw "Stable uninstaller replacement readiness probe failed with Win32 error $($probe.ErrorCode)."
-        }
-        $remainingMilliseconds = $MaximumRetryMilliseconds - [int]$stopwatch.ElapsedMilliseconds
-        if ($remainingMilliseconds -le 0) {
-            throw "Stable uninstaller replacement readiness probe timed out."
-        }
-        $backoffMilliseconds = [Math]::Min(500, 100 * [Math]::Pow(2, $attempt - 1))
-        Start-Sleep -Milliseconds ([int][Math]::Min($backoffMilliseconds, $remainingMilliseconds))
-    }
-}
-
 function Remove-ValidatedTemporaryRoot(
     [string]$Path,
     [ValidateRange(1, 20)]
@@ -915,6 +797,7 @@ $verificationRoot = Join-Path ([System.IO.Path]::GetTempPath()) "scribe-release-
 $verificationUninstaller = $null
 $stableUninstaller = $null
 $stableContainer = $null
+$caseCollisionContainer = $null
 $stableShellRoot = $null
 $evidenceRoot = $null
 Assert-NoReparseAncestors $temporaryRoot
@@ -1010,13 +893,6 @@ try {
             New-Item -ItemType Directory -Path $stableRoot | Out-Null
             $stableShellRoot = New-TestShellFixture $stableToken
             $stableShellSnapshot = Get-ExactTreeSnapshot $stableShellRoot
-            $fsutil = Join-Path $env:SystemRoot "System32\fsutil.exe"
-            $caseSensitiveProcess = Invoke-NativeProcess $fsutil @(
-                "file", "setCaseSensitiveInfo", $stableRoot, "enable"
-            )
-            if ($caseSensitiveProcess.ExitCode -ne 0) {
-                throw "Could not enable the isolated stable-upgrade case-collision fixture: $($caseSensitiveProcess.Stderr.Trim())"
-            }
 
             $stableInstallArguments = @(
                 "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-",
@@ -1032,7 +908,6 @@ try {
             $stableUninstaller = Join-Path $stableRoot "unins000.exe"
             $null = Assert-Bundle -Root $stableRoot -AllowedAdditionalFiles $InnoSetupUninstallerArtifacts
             Assert-PayloadParity $bundle $stableRoot "Initial stable install"
-            Wait-ForStableUninstallerReplacementReadiness $stableRoot $stableUninstaller
 
             $stableUpgrade = Invoke-IsolatedInstallerProcess `
                 $installer $stableInstallArguments `
@@ -1044,16 +919,38 @@ try {
             $null = Assert-Bundle -Root $stableRoot -AllowedAdditionalFiles $InnoSetupUninstallerArtifacts
             Assert-PayloadParity $bundle $stableRoot "Stable upgrade"
 
-            $canonicalReadme = Join-Path $stableRoot "README.txt"
-            $caseCollision = Join-Path $stableRoot "readme.txt"
+            $caseCollisionToken = [guid]::NewGuid().ToString('N')
+            $caseCollisionContainer = Join-Path ([System.IO.Path]::GetTempPath()) "scribe-release-stable-test-$caseCollisionToken"
+            $caseCollisionRoot = Join-Path $caseCollisionContainer "installed"
+            Assert-NoReparseAncestors $caseCollisionContainer
+            New-Item -ItemType Directory -Path $caseCollisionRoot | Out-Null
+            $fsutil = Join-Path $env:SystemRoot "System32\fsutil.exe"
+            $caseSensitiveProcess = Invoke-NativeProcess $fsutil @(
+                "file", "setCaseSensitiveInfo", $caseCollisionRoot, "enable"
+            )
+            if ($caseSensitiveProcess.ExitCode -ne 0) {
+                throw "Could not enable the isolated case-collision fixture: $($caseSensitiveProcess.Stderr.Trim())"
+            }
+            foreach ($item in @(Get-ChildItem -LiteralPath $stableRoot -Force)) {
+                Copy-Item -LiteralPath $item.FullName -Destination (Join-Path $caseCollisionRoot $item.Name) -Recurse -Force
+            }
+            $null = Assert-Bundle -Root $caseCollisionRoot -AllowedAdditionalFiles $InnoSetupUninstallerArtifacts
+            Assert-PayloadParity $bundle $caseCollisionRoot "Case-collision fixture"
+
+            $canonicalReadme = Join-Path $caseCollisionRoot "README.txt"
+            $caseCollision = Join-Path $caseCollisionRoot "readme.txt"
             Copy-Item -LiteralPath $canonicalReadme -Destination $caseCollision
-            if (@(Get-ChildItem -LiteralPath $stableRoot -File | Where-Object { $_.Name -ieq "README.txt" }).Count -ne 2) {
+            if (@(Get-ChildItem -LiteralPath $caseCollisionRoot -File | Where-Object { $_.Name -ieq "README.txt" }).Count -ne 2) {
                 throw "Could not create the isolated case-collision fixture."
             }
+            $caseCollisionInstallArguments = @(
+                "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-",
+                "/SCRIBESTABLETEST=$caseCollisionToken"
+            )
             Invoke-ExpectedInstallerRefusal `
-                $installer $stableInstallArguments `
+                $installer $caseCollisionInstallArguments `
                 (Join-Path $temporaryRoot "stable-case-collision.log") `
-                $stableShellRoot $stableShellSnapshot $stableRoot `
+                $stableShellRoot $stableShellSnapshot $caseCollisionRoot `
                 "Stable case-insensitive path collision"
             Remove-Item -LiteralPath $caseCollision
 
@@ -1256,6 +1153,9 @@ finally {
     }
     if ($null -ne $stableShellRoot) {
         Remove-ValidatedTemporaryRoot $stableShellRoot
+    }
+    if ($null -ne $caseCollisionContainer) {
+        Remove-ValidatedTemporaryRoot $caseCollisionContainer
     }
     if ($null -ne $stableContainer) {
         Remove-ValidatedTemporaryRoot $stableContainer
