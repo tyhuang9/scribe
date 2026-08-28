@@ -2338,19 +2338,6 @@ impl ArtifactInstallCoordinator {
         let handle = self.jobs.get(model_id)?.handle.clone();
         self.finish(model_id, job_id).then_some(handle)
     }
-
-    #[cfg(test)]
-    fn clear(&mut self) {
-        self.jobs.clear();
-        self.transfer_queue.clear();
-        self.finalizer_queue.clear();
-        self.active_transfers = 0;
-        self.active_finalizer = None;
-        self.active_finalizer_may_write_runtime = false;
-        self.target_owners.clear();
-        self.reserved_by_volume.clear();
-        self.recovery_frozen = false;
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -6875,6 +6862,14 @@ impl LocalTranscriberApp {
                             *active_job == job_id && active_model == &model_id
                         },
                     ) {
+                        // Cancel-and-discard is presented as logically
+                        // uninstalled as soon as the user clicks X. The
+                        // correlated worker still owns the target until its
+                        // terminal event, so do not let late progress make the
+                        // download controls flash back into view.
+                        if self.partial_discard_requested_for_job(&model_id, job_id) {
+                            continue;
+                        }
                         // A resumed multi-file ONNX bundle can begin working
                         // through an earlier file while another file already
                         // has a validated retained partial. Keep that
@@ -6924,7 +6919,6 @@ impl LocalTranscriberApp {
                     ) {
                         continue;
                     }
-                    self.onnx_bundle_install = None;
                     self.onnx_download_activity = None;
                     self.remote_catalog.invalidate_local_models();
                     let (downloaded_bytes, total_bytes) = self
@@ -6963,17 +6957,19 @@ impl LocalTranscriberApp {
                         }
                         Err(message) => {
                             if paused {
-                                self.record_download_diagnostic(
-                                    &model_id,
-                                    job_id,
-                                    downloaded_bytes,
-                                    total_bytes,
-                                    |run, job, artifact, source, completed, total| {
-                                        DownloadDiagnosticEvent::pause(
-                                            run, job, artifact, source, completed, total,
-                                        )
-                                    },
-                                );
+                                if discard_source.is_none() {
+                                    self.record_download_diagnostic(
+                                        &model_id,
+                                        job_id,
+                                        downloaded_bytes,
+                                        total_bytes,
+                                        |run, job, artifact, source, completed, total| {
+                                            DownloadDiagnosticEvent::pause(
+                                                run, job, artifact, source, completed, total,
+                                            )
+                                        },
+                                    );
+                                }
                             } else {
                                 self.record_download_diagnostic(
                                     &model_id,
@@ -7029,6 +7025,11 @@ impl LocalTranscriberApp {
                             }
                         }
                     }
+                    // Keep the ONNX job's admission slot until correlated
+                    // cancel-and-discard cleanup has finished. The worker has
+                    // acknowledged termination, but a replacement install
+                    // must not race the synchronous partial deletion above.
+                    self.onnx_bundle_install = None;
                 }
                 AppEvent::MicrophoneTestReady { request_id, result } => {
                     let state = std::mem::take(&mut self.microphone_test);
@@ -7868,6 +7869,9 @@ impl LocalTranscriberApp {
                         .artifact_installations
                         .accepts_progress(&model_id, job_id)
                     {
+                        continue;
+                    }
+                    if self.partial_discard_requested_for_job(&model_id, job_id) {
                         continue;
                     }
                     self.artifact_installations
@@ -11668,6 +11672,9 @@ impl LocalTranscriberApp {
                 let exact_install_active = download_id
                     .as_deref()
                     .is_some_and(|id| self.artifact_installations.contains_key(id));
+                let partial_discard_pending = download_id
+                    .as_deref()
+                    .is_some_and(|id| self.discard_partial_after_install.contains_key(id));
                 let install_phase = download_id
                     .as_deref()
                     .and_then(|id| self.artifact_installations.phase_for_model(id));
@@ -11707,8 +11714,12 @@ impl LocalTranscriberApp {
                         },
                     )
                 });
-                let install_disabled_reason = partial_inspection_block_reason
-                    .clone()
+                let install_disabled_reason = partial_discard_pending
+                    .then(|| {
+                        "Finishing cancellation and removing the partial download before this model can be installed again."
+                            .to_owned()
+                    })
+                    .or_else(|| partial_inspection_block_reason.clone())
                     .or_else(|| install_admission_block_reason.clone());
                 let install_action = |label: &str| RemoteCatalogActionView {
                     label: label.to_owned(),
@@ -11730,7 +11741,8 @@ impl LocalTranscriberApp {
                 let mut total_bytes = None;
                 let mut error_message = None;
                 let mut actions = Vec::new();
-                if let Some(download_id) = download_id.as_deref()
+                if !partial_discard_pending
+                    && let Some(download_id) = download_id.as_deref()
                     && let Some(status) = self.model_downloads.get(download_id)
                 {
                     status_label = Some(
@@ -11838,14 +11850,17 @@ impl LocalTranscriberApp {
                     status_label = Some("Pinned GGUF".to_owned());
                     actions.push(install_action("Install"));
                 }
-                if downloaded_bytes.is_none()
+                if !partial_discard_pending
+                    && downloaded_bytes.is_none()
                     && let PartialInspection::Present(partial) = partial_inspection
                     && partial.bytes > 0
                 {
                     downloaded_bytes = Some(partial.bytes);
                     total_bytes = Some(variant.size_bytes);
                 }
-                if has_partial || partial_inspection_error.is_some() {
+                if !partial_discard_pending
+                    && (has_partial || partial_inspection_error.is_some())
+                {
                     actions.push(RemoteCatalogActionView {
                         label: "Discard partial".to_owned(),
                         kind: RemoteCatalogActionKind::DiscardPartial {
@@ -12323,6 +12338,7 @@ impl LocalTranscriberApp {
             .is_some_and(|(_, active_model_id, _)| active_model_id == &model.id);
         let exact_install_active =
             self.artifact_installations.contains_key(&model.id) || onnx_install_active;
+        let partial_discard_pending = self.discard_partial_after_install.contains_key(&model.id);
         let install_phase = self.artifact_installations.phase_for_model(&model.id);
         let mut download_state = match &install_status {
             ModelInstallStatus::Installed if legacy_cleanup_pending => {
@@ -12356,6 +12372,9 @@ impl LocalTranscriberApp {
         {
             download_state = model_download_state_for_activity(activity);
         }
+        if partial_discard_pending {
+            download_state = ModelDownloadState::NotInstalled;
+        }
         if has_partial
             && !self.model_downloads.contains_key(&model.id)
             && matches!(
@@ -12365,49 +12384,56 @@ impl LocalTranscriberApp {
         {
             download_state = ModelDownloadState::PartialRetained;
         }
-        let (downloaded_bytes, total_bytes) = match &install_status {
-            ModelInstallStatus::Downloading {
-                downloaded_bytes,
-                total_bytes,
-                ..
-            } => (*downloaded_bytes, *total_bytes),
-            ModelInstallStatus::Paused {
-                downloaded_bytes,
-                total_bytes,
-            } => (*downloaded_bytes, *total_bytes),
-            ModelInstallStatus::InstallingRuntime => self
-                .artifact_installations
-                .get(&model.id)
-                .and_then(|(job_id, _)| {
-                    self.artifact_installations
-                        .download_diagnostic_progress(&model.id, *job_id)
-                })
-                .map(|progress| {
-                    (
-                        progress
-                            .total_bytes
-                            .map_or(progress.completed_bytes, |total| {
-                                progress.completed_bytes.min(total)
-                            }),
-                        progress.total_bytes,
-                    )
-                })
-                .unwrap_or_else(|| {
-                    (
-                        match partial_inspection {
-                            PartialInspection::Present(partial) => partial.bytes,
-                            _ => 0,
-                        },
-                        descriptor.map(|descriptor| descriptor.artifact_size_bytes),
-                    )
-                }),
-            _ => (
-                match partial_inspection {
-                    PartialInspection::Present(partial) => partial.bytes,
-                    _ => 0,
-                },
+        let (downloaded_bytes, total_bytes) = if partial_discard_pending {
+            (
+                0,
                 descriptor.map(|descriptor| descriptor.artifact_size_bytes),
-            ),
+            )
+        } else {
+            match &install_status {
+                ModelInstallStatus::Downloading {
+                    downloaded_bytes,
+                    total_bytes,
+                    ..
+                } => (*downloaded_bytes, *total_bytes),
+                ModelInstallStatus::Paused {
+                    downloaded_bytes,
+                    total_bytes,
+                } => (*downloaded_bytes, *total_bytes),
+                ModelInstallStatus::InstallingRuntime => self
+                    .artifact_installations
+                    .get(&model.id)
+                    .and_then(|(job_id, _)| {
+                        self.artifact_installations
+                            .download_diagnostic_progress(&model.id, *job_id)
+                    })
+                    .map(|progress| {
+                        (
+                            progress
+                                .total_bytes
+                                .map_or(progress.completed_bytes, |total| {
+                                    progress.completed_bytes.min(total)
+                                }),
+                            progress.total_bytes,
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        (
+                            match partial_inspection {
+                                PartialInspection::Present(partial) => partial.bytes,
+                                _ => 0,
+                            },
+                            descriptor.map(|descriptor| descriptor.artifact_size_bytes),
+                        )
+                    }),
+                _ => (
+                    match partial_inspection {
+                        PartialInspection::Present(partial) => partial.bytes,
+                        _ => 0,
+                    },
+                    descriptor.map(|descriptor| descriptor.artifact_size_bytes),
+                ),
+            }
         };
         let mutation_block_reason = self.artifact_mutation_block_reason();
         let mutation_blocked = mutation_block_reason.is_some();
@@ -12571,7 +12597,8 @@ impl LocalTranscriberApp {
             recommended: descriptor.is_some_and(|descriptor| descriptor.recommended),
             custom,
             install_supported: supports_managed_install(model),
-            install_action_enabled: !install_admission_blocked
+            install_action_enabled: !partial_discard_pending
+                && !install_admission_blocked
                 && partial_inspection_error.is_none()
                 && !installed
                 && !matches!(
@@ -12583,7 +12610,12 @@ impl LocalTranscriberApp {
             primary_action_enabled,
             primary_action_installs_upgrade,
             primary_action_repairs_runtime,
-            primary_action_disabled_reason,
+            primary_action_disabled_reason: partial_discard_pending
+                .then(|| {
+                    "Finishing cancellation and removing the partial download before this model can be installed again."
+                        .to_owned()
+                })
+                .or(primary_action_disabled_reason),
             cancel_supported: onnx_install_active
                 || install_phase.is_some_and(ArtifactInstallPhase::allows_cancellation),
             removal_supported: (bundled && model.id == BUNDLED_BASE_MODEL_ID && installed)
@@ -13141,9 +13173,13 @@ impl LocalTranscriberApp {
         {
             self.discard_partial_after_install.insert(
                 model_id.as_str().to_owned(),
-                (*job_id, RemotePartialProbeSource::Normalized(model_id)),
+                (
+                    *job_id,
+                    RemotePartialProbeSource::Normalized(model_id.clone()),
+                ),
             );
             cancellation.cancel();
+            self.project_pending_partial_discard(model_id.as_str());
             self.status_message =
                 "Cancelling ONNX download; retained exact partials will be discarded after it exits."
                     .to_owned();
@@ -13154,9 +13190,13 @@ impl LocalTranscriberApp {
         {
             self.discard_partial_after_install.insert(
                 model_id.as_str().to_owned(),
-                (job_id, RemotePartialProbeSource::Normalized(model_id)),
+                (
+                    job_id,
+                    RemotePartialProbeSource::Normalized(model_id.clone()),
+                ),
             );
             cancellation.cancel();
+            self.project_pending_partial_discard(model_id.as_str());
             self.status_message =
                 "Cancelling download; retained partial bytes will be discarded after it exits."
                     .to_owned();
@@ -13191,10 +13231,11 @@ impl LocalTranscriberApp {
         };
         if let Some((job_id, cancellation)) = self.artifact_installations.get(&model_id).cloned() {
             self.discard_partial_after_install.insert(
-                model_id,
+                model_id.clone(),
                 (job_id, RemotePartialProbeSource::Trusted(artifact)),
             );
             cancellation.cancel();
+            self.project_pending_partial_discard(&model_id);
             self.status_message =
                 "Cancelling download; retained partial bytes will be discarded after it exits."
                     .to_owned();
@@ -13224,6 +13265,13 @@ impl LocalTranscriberApp {
                     "No retained partial download was found. No files were changed.".to_owned();
             }
             Err(error) => {
+                let error_message = format!(
+                    "The partial download could not be confirmed discarded and may have been retained: {error}"
+                );
+                self.model_downloads.insert(
+                    model_id.to_owned(),
+                    ModelInstallStatus::Error(error_message),
+                );
                 if error.requires_recovery() {
                     let recovery_error = error.to_string();
                     self.artifact_recovery_error = Some(
@@ -13239,8 +13287,9 @@ impl LocalTranscriberApp {
                     );
                 }
                 self.status = TranscriptionStatus::Error;
-                self.status_message =
-                    format!("Could not finish discarding the retained partial: {error}");
+                self.status_message = format!(
+                    "Could not confirm that the retained partial was fully discarded: {error}"
+                );
             }
         }
         self.remote_catalog.invalidate_local_models();
@@ -13261,6 +13310,19 @@ impl LocalTranscriberApp {
         Some(source)
     }
 
+    fn partial_discard_requested_for_job(&self, model_id: &str, job_id: u64) -> bool {
+        self.discard_partial_after_install
+            .get(model_id)
+            .is_some_and(|(requested_job_id, _)| *requested_job_id == job_id)
+    }
+
+    fn project_pending_partial_discard(&mut self, model_id: &str) {
+        self.model_downloads
+            .insert(model_id.to_owned(), ModelInstallStatus::NotInstalled);
+        self.remote_catalog.invalidate_local_models();
+        self.rebuild_model_inventory_projection();
+    }
+
     fn discard_partial_source(
         &self,
         source: &RemotePartialProbeSource,
@@ -13271,7 +13333,16 @@ impl LocalTranscriberApp {
         }
         match source {
             RemotePartialProbeSource::Normalized(model_id) => {
-                managed_downloads::discard_normalized_model_partial(&self.config, model_id)
+                match managed_downloads::discard_normalized_onnx_bundle_partials(
+                    &self.config,
+                    model_id,
+                ) {
+                    Ok(Some(count)) => Ok(count != 0),
+                    Ok(None) => {
+                        managed_downloads::discard_normalized_model_partial(&self.config, model_id)
+                    }
+                    Err(error) => Err(error),
+                }
             }
             RemotePartialProbeSource::Trusted(artifact) => {
                 managed_downloads::discard_trusted_gguf_partial(&self.config, artifact)
@@ -22621,9 +22692,52 @@ mod layout_tests {
         app.artifact_installations
             .insert(model_id.as_str().to_owned(), (42, cancellation.clone()));
 
-        app.discard_normalized_model_partial(model_id.clone());
+        app.apply_model_management_action(ScreenAction::DiscardModelPartial(
+            model_id.as_str().to_owned(),
+        ));
         assert!(cancellation.is_cancelled());
         assert!(partial.exists());
+        assert_eq!(
+            app.model_downloads.get(model_id.as_str()),
+            Some(&ModelInstallStatus::NotInstalled)
+        );
+        let pending_view = app
+            .model_management_catalog()
+            .into_iter()
+            .find(|model| model.id == model_id.as_str())
+            .unwrap();
+        assert_eq!(
+            pending_view.download_state,
+            ModelDownloadState::NotInstalled
+        );
+        assert!(!pending_view.install_action_enabled);
+        assert!(
+            pending_view
+                .primary_action_disabled_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("removing the partial download"))
+        );
+        assert!(!pending_view.partial_cleanup_available);
+
+        app.tx
+            .send(AppEvent::ModelDownloadProgress {
+                job_id: 42,
+                model_id: model_id.as_str().to_owned(),
+                progress: InstallProgress {
+                    stage: InstallStage::Downloading,
+                    completed_bytes: 7,
+                    total_bytes: 14,
+                    bytes_per_second: Some(1),
+                    download_activity: Some(DownloadActivity::Active),
+                },
+            })
+            .unwrap();
+        app.poll_events();
+        assert_eq!(
+            app.model_downloads.get(model_id.as_str()),
+            Some(&ModelInstallStatus::NotInstalled),
+            "late correlated progress must not restore the progress UI"
+        );
         app.tx
             .send(AppEvent::VerifiedInstallFailed {
                 job_id: 42,
@@ -22675,7 +22789,16 @@ mod layout_tests {
         assert!(recovery_error.contains("partial cleanup durability failed"));
         assert!(app.artifact_mutation_block_reason().is_some());
         assert_eq!(app.status, TranscriptionStatus::Error);
-        assert!(app.status_message.contains("Could not finish discarding"));
+        assert!(
+            app.status_message
+                .contains("Could not confirm that the retained partial was fully discarded")
+        );
+        assert!(matches!(
+            app.model_downloads.get(model_id.as_str()),
+            Some(ModelInstallStatus::Error(message))
+                if message.contains("could not be confirmed discarded")
+                    && message.contains("may have been retained")
+        ));
     }
 
     #[test]
@@ -23201,14 +23324,48 @@ mod layout_tests {
             Some(3)
         );
         assert!(app.status_message.contains("after it exits"));
-        app.artifact_installations.clear();
-        app.discard_partial_after_install.clear();
+        let pending = &app.remote_catalog_view().entries[0].variants[0];
+        assert!(pending.downloaded_bytes.is_none());
+        assert!(pending.total_bytes.is_none());
+        assert!(pending.status_label.as_deref() != Some("Paused"));
+        assert!(pending.status_label.as_deref() != Some("Downloading"));
+        assert_eq!(pending.actions.len(), 1);
+        assert!(matches!(
+            pending.actions[0].kind,
+            RemoteCatalogActionKind::Install { .. }
+        ));
+        assert!(!pending.actions[0].enabled);
+        assert!(
+            pending.actions[0]
+                .disabled_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("removing the partial download"))
+        );
+
+        app.tx
+            .send(AppEvent::VerifiedInstallFailed {
+                job_id: 3,
+                model_id: managed_id.clone(),
+                message: "installation cancelled".to_owned(),
+                recovery_required: false,
+                download_failure: None,
+            })
+            .unwrap();
+        app.poll_events();
+        assert!(!partial.exists());
+        let cleaned = &app.remote_catalog_view().entries[0].variants[0];
+        assert_eq!(cleaned.actions.len(), 1);
+        assert!(matches!(
+            cleaned.actions[0].kind,
+            RemoteCatalogActionKind::Install { .. }
+        ));
+        assert!(cleaned.actions[0].enabled);
 
         app.apply_model_management_action(ScreenAction::DiscardRemoteCatalogPartial {
             remote_model_id: "handy-computer/partial-fixture".to_owned(),
             variant_id: "stale".to_owned(),
         });
-        assert_eq!(fs::read(&partial).unwrap(), b"retained again");
+        assert!(!partial.exists());
         assert!(
             app.status_message
                 .contains("no longer in the validated snapshot")
@@ -23290,7 +23447,10 @@ mod layout_tests {
         );
         assert!(app.artifact_mutation_block_reason().is_some());
         assert_eq!(app.status, TranscriptionStatus::Error);
-        assert!(app.status_message.contains("Could not finish discarding"));
+        assert!(
+            app.status_message
+                .contains("Could not confirm that the retained partial was fully discarded")
+        );
     }
 
     #[test]
@@ -25370,6 +25530,50 @@ mod layout_tests {
         assert!(debug.contains("retry_number: Some(3)"));
         assert!(debug.contains("Connection"));
         assert!(!debug.contains("C:\\Users\\private"));
+        drop(app);
+        drop(diagnostics);
+        let _ = fs::remove_dir_all(diagnostics_dir);
+    }
+
+    #[test]
+    fn cancel_and_discard_does_not_emit_a_pause_diagnostic() {
+        let mut app = test_app();
+        let run = DownloadRunId::new("cancel-discard-diagnostic-test").unwrap();
+        let diagnostics_dir = std::env::temp_dir().join(format!(
+            "scribe-cancel-discard-diagnostics-{}-{}",
+            std::process::id(),
+            NEXT_TEST_SESSION.fetch_add(1, Ordering::Relaxed)
+        ));
+        let diagnostics = DownloadDiagnostics::start(&diagnostics_dir, &run);
+        app.download_diagnostics = Some(diagnostics.clone());
+        app.download_diagnostic_run = Some(run);
+        let model_id = "whisper_cpp_tiny_en".to_owned();
+        let cancellation = InstallCancellation::default();
+        app.artifact_installations
+            .insert(model_id.clone(), (882, cancellation.clone()));
+        app.artifact_installations
+            .initialize_download_diagnostic(&model_id, 882, 31, Some(100));
+
+        app.apply_model_management_action(ScreenAction::DiscardModelPartial(model_id.clone()));
+        assert!(cancellation.is_cancelled());
+        app.tx
+            .send(AppEvent::VerifiedInstallFailed {
+                job_id: 882,
+                model_id,
+                message: "installation cancelled".to_owned(),
+                recovery_required: false,
+                download_failure: None,
+            })
+            .unwrap();
+        app.poll_events();
+
+        assert!(
+            diagnostics
+                .snapshot()
+                .iter()
+                .all(|event| !format!("{event:?}").contains("outcome: Pause")),
+            "cancel-and-discard must not be recorded as a resumable pause"
+        );
         drop(app);
         drop(diagnostics);
         let _ = fs::remove_dir_all(diagnostics_dir);
@@ -28498,6 +28702,10 @@ mod layout_tests {
         let mut app = test_app();
         app.config.general.model_storage_dir = root.clone();
         config::normalize_config(&mut app.config);
+        let run = DownloadRunId::new("onnx-cancel-discard-diagnostic-test").unwrap();
+        let diagnostics = DownloadDiagnostics::start(root.join("diagnostics"), &run);
+        app.download_diagnostics = Some(diagnostics.clone());
+        app.download_diagnostic_run = Some(run);
         let model_id = "moonshine-tiny-en-int8-onnx".to_owned();
         let cancellation = InstallCancellation::default();
         app.onnx_bundle_install = Some((71, model_id.clone(), cancellation.clone()));
@@ -28519,7 +28727,38 @@ mod layout_tests {
                 .map(|(job_id, _)| *job_id),
             Some(71)
         );
-        assert!(app.model_downloads.contains_key(&model_id));
+        assert_eq!(
+            app.model_downloads.get(&model_id),
+            Some(&ModelInstallStatus::NotInstalled)
+        );
+        let pending = app
+            .model_management_catalog()
+            .into_iter()
+            .find(|model| model.id == model_id)
+            .unwrap();
+        assert_eq!(pending.download_state, ModelDownloadState::NotInstalled);
+        assert!(!pending.install_action_enabled);
+        assert!(!pending.partial_cleanup_available);
+
+        app.tx
+            .send(AppEvent::OnnxBundleInstallProgress {
+                job_id: 71,
+                model_id: model_id.clone(),
+                progress: InstallProgress {
+                    stage: InstallStage::Downloading,
+                    completed_bytes: 29,
+                    total_bytes: 44_256_550,
+                    bytes_per_second: Some(4),
+                    download_activity: Some(DownloadActivity::Active),
+                },
+            })
+            .unwrap();
+        app.poll_events();
+        assert_eq!(
+            app.model_downloads.get(&model_id),
+            Some(&ModelInstallStatus::NotInstalled),
+            "late ONNX progress must not restore the progress UI"
+        );
 
         app.tx
             .send(AppEvent::OnnxBundleInstallFinished {
@@ -28538,6 +28777,12 @@ mod layout_tests {
             app.status_message
                 .contains("No retained partial download was found")
         );
+        assert!(diagnostics.snapshot().iter().all(|event| {
+            let debug = format!("{event:?}");
+            !debug.contains("outcome: Pause") && !debug.contains("outcome: Failure")
+        }));
+        drop(app);
+        drop(diagnostics);
         let _ = fs::remove_dir_all(root);
     }
 

@@ -1868,6 +1868,8 @@ struct ModelCardRenderResult {
     restored_remove_focus: bool,
     #[cfg(test)]
     primary_control_id: Option<egui::Id>,
+    #[cfg(test)]
+    discard_control_id: Option<egui::Id>,
 }
 
 struct ModelSectionFocus<'a> {
@@ -3504,6 +3506,7 @@ fn model_lifecycle_button(
     enabled: bool,
     disabled_reason: Option<&str>,
     tone: ModelLifecycleTone,
+    id: Option<egui::Id>,
 ) -> egui::Response {
     let enabled = enabled && ui.is_enabled();
     let response = match tone {
@@ -3524,8 +3527,13 @@ fn model_lifecycle_button(
                 color,
             );
             let visual_size = Vec2::new(galley.size().x + 24.0, 32.0);
-            let (target, response) =
-                ui.allocate_exact_size(Vec2::new(visual_size.x.max(44.0), 44.0), Sense::click());
+            let desired_size = Vec2::new(visual_size.x.max(44.0), 44.0);
+            let (target, response) = if let Some(id) = id {
+                let (target, _) = ui.allocate_exact_size(desired_size, Sense::hover());
+                (target, ui.interact(target, id, Sense::click()))
+            } else {
+                ui.allocate_exact_size(desired_size, Sense::click())
+            };
             let visual = egui::Rect::from_center_size(target.center(), visual_size);
             let fill = if enabled {
                 colors.inverse_neutral_bg
@@ -3546,8 +3554,13 @@ fn model_lifecycle_button(
                 colors.error_text,
             );
             let visual_size = Vec2::new(galley.size().x + 24.0, 32.0);
-            let (target, response) =
-                ui.allocate_exact_size(Vec2::new(visual_size.x.max(44.0), 44.0), Sense::click());
+            let desired_size = Vec2::new(visual_size.x.max(44.0), 44.0);
+            let (target, response) = if let Some(id) = id {
+                let (target, _) = ui.allocate_exact_size(desired_size, Sense::hover());
+                (target, ui.interact(target, id, Sense::click()))
+            } else {
+                ui.allocate_exact_size(desired_size, Sense::click())
+            };
             let visual = egui::Rect::from_center_size(target.center(), visual_size);
             let color = if enabled {
                 colors.error_text
@@ -3686,6 +3699,8 @@ struct ModelDownloadModuleResponse {
     discard_has_focus: bool,
     #[cfg(test)]
     primary_id: egui::Id,
+    #[cfg(test)]
+    discard_id: Option<egui::Id>,
 }
 
 struct ModelDownloadModuleParams<'a> {
@@ -3718,6 +3733,8 @@ fn render_model_download_module(
     let mut discard_has_focus = false;
     #[cfg(test)]
     let mut rendered_primary_id = None;
+    #[cfg(test)]
+    let mut rendered_discard_id = None;
     let available_width = ui.available_width();
     let controls_width = 44.0
         + if discard_name.is_some() { 44.0 } else { 0.0 }
@@ -3810,6 +3827,10 @@ fn render_model_download_module(
                         );
                         discard_clicked = discard.clicked();
                         discard_has_focus = discard.has_focus();
+                        #[cfg(test)]
+                        {
+                            rendered_discard_id = Some(discard.id);
+                        }
                     }
                 };
                 let (label_slot, _) = ui.allocate_exact_size(
@@ -3859,6 +3880,8 @@ fn render_model_download_module(
         #[cfg(test)]
         primary_id: rendered_primary_id
             .expect("download module always renders its primary control"),
+        #[cfg(test)]
+        discard_id: rendered_discard_id,
     }
 }
 
@@ -4120,6 +4143,8 @@ fn render_unified_model_card(
     let mut restored_remove_focus = false;
     #[cfg(test)]
     let primary_control_id = std::cell::Cell::new(None);
+    #[cfg(test)]
+    let discard_control_id = std::cell::Cell::new(None);
     let mut focus_within = false;
     let mut description_fade_rect = None;
     let mut activation_exclusions = Vec::new();
@@ -4232,11 +4257,16 @@ fn render_unified_model_card(
                     },
                 );
                 *focus_within |= download.cancel_has_focus || download.discard_has_focus;
+                #[cfg(test)]
+                discard_control_id.set(download.discard_id);
                 if download.cancel_clicked && primary.enabled {
                     *action = primary.action.clone();
                 } else if download.discard_clicked
                     && let Some(discard) = lifecycle.discard.as_ref()
                 {
+                    if download.discard_has_focus {
+                        ui.memory_mut(|memory| memory.request_focus(lifecycle_primary_id));
+                    }
                     *action = discard.clone();
                 }
                 let mut response = download.response;
@@ -4277,6 +4307,7 @@ fn render_unified_model_card(
                     primary.enabled,
                     primary.disabled_reason,
                     primary.tone,
+                    Some(lifecycle_primary_id),
                 )
             };
             *focus_within |= lifecycle_response.has_focus();
@@ -4295,8 +4326,13 @@ fn render_unified_model_card(
             ) {
                 let discard_response =
                     compact_model_icon_action(ui, Icon::Close, discard_name, true, None, None);
+                #[cfg(test)]
+                discard_control_id.set(Some(discard_response.id));
                 *focus_within |= discard_response.has_focus();
                 if discard_response.clicked() {
+                    if discard_response.has_focus() {
+                        ui.memory_mut(|memory| memory.request_focus(lifecycle_primary_id));
+                    }
                     *action = discard.clone();
                 }
                 lifecycle_response = lifecycle_response.union(discard_response);
@@ -4713,6 +4749,8 @@ fn render_unified_model_card(
         restored_remove_focus,
         #[cfg(test)]
         primary_control_id: primary_control_id.get(),
+        #[cfg(test)]
+        discard_control_id: discard_control_id.get(),
     }
 }
 
@@ -4778,6 +4816,7 @@ fn render_inline_model_details(
                         model.runtime_action_enabled,
                         model.runtime_action_disabled_reason.as_deref(),
                         ModelLifecycleTone::Standard,
+                        None,
                     );
                     *focus_within |= response.has_focus();
                     activation_exclusions.push(response.rect);
@@ -4804,6 +4843,7 @@ fn render_inline_model_details(
                         removal_reason.is_none(),
                         removal_reason,
                         ModelLifecycleTone::DestructiveOutline,
+                        None,
                     );
                     *focus_within |= removal.has_focus();
                     activation_exclusions.push(removal.rect);
@@ -9344,6 +9384,7 @@ mod tests {
                     true,
                     None,
                     ModelLifecycleTone::DestructiveOutline,
+                    None,
                 );
             });
         });
@@ -9620,6 +9661,65 @@ mod tests {
             assert_eq!(primary.icon, Icon::Download);
             assert_eq!(primary.tone, ModelLifecycleTone::InverseFilled);
         }
+    }
+
+    #[test]
+    fn pending_cancel_and_discard_uses_the_ordinary_disabled_install_ui_at_375px() {
+        let model = ModelViewModel {
+            id: "cleanup-pending".into(),
+            display_name: "Cleanup pending".into(),
+            install_supported: true,
+            install_action_enabled: false,
+            primary_action_disabled_reason: Some(
+                "Finishing cancellation and removing the partial download before this model can be installed again."
+                    .into(),
+            ),
+            download_state: ModelDownloadState::NotInstalled,
+            downloaded_bytes: 0,
+            total_bytes: Some(100),
+            ..Default::default()
+        };
+
+        let controls = model_lifecycle_controls(ModelCard::Local(&model), true);
+        let primary = controls.primary.expect("install presentation");
+        assert_eq!(primary.label, "Install");
+        assert_eq!(primary.icon, Icon::Download);
+        assert!(!primary.enabled);
+        assert!(controls.discard.is_none());
+
+        let output = render_model_card_at(&model, 375.0, 680.0, Vec::new());
+        let install = output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .and_then(|update| {
+                update.nodes.iter().find_map(|(_, node)| {
+                    (node.role() == egui::accesskit::Role::Button
+                        && node.name() == Some("Install Cleanup pending"))
+                    .then_some(node)
+                })
+            })
+            .expect("disabled install button");
+        assert!(install.is_disabled());
+        assert!(install.bounds().expect("install bounds").width() >= 44.0);
+        assert_eq!(
+            install.description(),
+            Some(
+                "Finishing cancellation and removing the partial download before this model can be installed again."
+            )
+        );
+        let update = output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .expect("accessibility tree");
+        assert!(!update.nodes.iter().any(|(_, node)| {
+            node.name().is_some_and(|name| {
+                name.contains("Pause")
+                    || name.contains("Resume")
+                    || name.contains("Discard partial")
+            })
+        }));
     }
 
     #[test]
@@ -10519,6 +10619,117 @@ mod tests {
     }
 
     #[test]
+    fn focused_discard_transfers_to_disabled_then_enabled_install() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        crate::ui::controls::configure_accessible_style(&ctx);
+        let downloading = ModelViewModel {
+            id: "discard-focus-transfer".into(),
+            display_name: "Discard focus transfer".into(),
+            download_state: ModelDownloadState::Downloading,
+            cancel_supported: true,
+            downloaded_bytes: 42,
+            total_bytes: Some(100),
+            ..Default::default()
+        };
+        let render = |model: &ModelViewModel, events: Vec<egui::Event>| {
+            let mut result = None;
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        Vec2::new(960.0, 680.0),
+                    )),
+                    focused: true,
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        result = Some(render_unified_model_card(
+                            ui,
+                            ModelCard::Local(model),
+                            false,
+                            true,
+                            false,
+                        ));
+                    });
+                },
+            );
+            (output, result.expect("model card result"))
+        };
+
+        let (initial, initial_result) = render(&downloading, Vec::new());
+        let discard_id = initial_result
+            .discard_control_id
+            .expect("active download discard control");
+        let discard_bounds = named_role_bounds(
+            &initial,
+            "Cancel and discard partial for Discard focus transfer",
+            egui::accesskit::Role::Button,
+        );
+        let point = egui::pos2(
+            ((discard_bounds.x0 + discard_bounds.x1) * 0.5) as f32,
+            ((discard_bounds.y0 + discard_bounds.y1) * 0.5) as f32,
+        );
+        ctx.memory_mut(|memory| memory.request_focus(discard_id));
+        let _ = render(
+            &downloading,
+            vec![
+                egui::Event::PointerMoved(point),
+                egui::Event::PointerButton {
+                    pos: point,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        let (_, clicked) = render(
+            &downloading,
+            vec![
+                egui::Event::PointerMoved(point),
+                egui::Event::PointerButton {
+                    pos: point,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        assert_eq!(
+            clicked.action,
+            ScreenAction::DiscardModelPartial("discard-focus-transfer".into())
+        );
+
+        let mut pending = downloading.clone();
+        pending.download_state = ModelDownloadState::NotInstalled;
+        pending.cancel_supported = false;
+        pending.downloaded_bytes = 0;
+        pending.install_supported = true;
+        pending.install_action_enabled = false;
+        pending.primary_action_disabled_reason = Some(
+            "Finishing cancellation and removing the partial download before this model can be installed again."
+                .into(),
+        );
+        let (_, pending_result) = render(&pending, Vec::new());
+        let install_id = pending_result
+            .primary_control_id
+            .expect("pending install control");
+        assert_eq!(
+            ctx.memory(|memory| memory.focused()),
+            Some(install_id),
+            "focus moves from the removed X to the replacement Install button"
+        );
+
+        pending.install_action_enabled = true;
+        pending.primary_action_disabled_reason = None;
+        let (_, enabled_result) = render(&pending, Vec::new());
+        assert_eq!(enabled_result.primary_control_id, Some(install_id));
+        assert_eq!(ctx.memory(|memory| memory.focused()), Some(install_id));
+    }
+
+    #[test]
     fn pause_to_installing_keeps_card_primary_focus_and_announces_installing() {
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
@@ -10957,6 +11168,7 @@ mod tests {
                     install.enabled,
                     install.disabled_reason,
                     install.tone,
+                    None,
                 );
             });
         });
@@ -11004,6 +11216,7 @@ mod tests {
                     false,
                     Some("The download is unavailable."),
                     ModelLifecycleTone::InverseFilled,
+                    None,
                 );
             });
         });
