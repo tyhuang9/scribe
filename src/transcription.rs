@@ -3374,6 +3374,31 @@ mod tests {
         assert_eq!(tampered_stats.durations.len(), 1);
         assert_eq!(worker_dispatches.load(Ordering::SeqCst), 3);
 
+        let (tampered_health, tampered_health_stats) =
+            crate::onnx_model_bundles::observe_receipt_verifications_for_test(|| {
+                service.health_check(&model_id, None)
+            });
+        assert!(tampered_health.is_err());
+        assert_eq!(tampered_health_stats.calls, 1);
+        assert_eq!(tampered_health_stats.verified_bytes, 0);
+        assert_eq!(tampered_health_stats.durations.len(), 1);
+        assert_eq!(worker_dispatches.load(Ordering::SeqCst), 3);
+
+        let (tampered_transcribe, tampered_transcribe_stats) =
+            crate::onnx_model_bundles::observe_receipt_verifications_for_test(|| {
+                service.transcribe(TranscriptionRequest::new(
+                    SessionId(732),
+                    RequestId(733),
+                    prepared_audio(),
+                    model_id.clone(),
+                ))
+            });
+        assert!(tampered_transcribe.is_err());
+        assert_eq!(tampered_transcribe_stats.calls, 1);
+        assert_eq!(tampered_transcribe_stats.verified_bytes, 0);
+        assert_eq!(tampered_transcribe_stats.durations.len(), 1);
+        assert_eq!(worker_dispatches.load(Ordering::SeqCst), 3);
+
         drop(service);
         fs::remove_dir_all(storage).unwrap();
     }
