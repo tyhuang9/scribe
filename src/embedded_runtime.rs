@@ -16,8 +16,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::{Result, anyhow};
 use thiserror::Error;
 use transcribe_cpp::{
-    Backend, CancelToken, Error as NativeError, Feature, Model, ModelOptions, RunOptions, Session,
-    Task, TimestampKind,
+    Backend, CancelToken, Device, DeviceType, Error as NativeError, Feature, Model, ModelOptions,
+    RunOptions, Session, Task, TimestampKind,
 };
 
 use crate::prepared_audio::{PREPARED_SAMPLE_RATE, PreparedAudio};
@@ -169,7 +169,9 @@ impl EmbeddedRuntime {
         let detected_architecture = model.arch();
         let native_capabilities = model.capabilities();
         let resolved_backend = model.backend();
-        let resolved_acceleration = resolved_acceleration(self.preference, &resolved_backend);
+        let resolved_device = model.device().map_err(map_native_error)?;
+        let resolved_acceleration =
+            resolved_acceleration(self.preference, &resolved_backend, &resolved_device);
         let capabilities = RuntimeCapabilities {
             streaming: native_capabilities.supports_streaming,
             cancellation: model.supports(Feature::Cancellation),
@@ -241,34 +243,54 @@ fn requested_backend(preference: AccelerationPreference) -> Backend {
     match preference {
         AccelerationPreference::Auto => Backend::Auto,
         AccelerationPreference::Cpu => Backend::Cpu,
-        // This first packaged build is CPU-only. Vulkan is a strict request,
-        // so a GPU preference fails explicitly instead of silently claiming a
-        // fallback. Target-specific packaged GPU features are added only after
-        // their release smoke tests pass.
         AccelerationPreference::Gpu => Backend::Vulkan,
     }
 }
 
-fn resolved_acceleration(requested: AccelerationPreference, backend: &str) -> ResolvedAcceleration {
-    let backend = backend.trim();
-    let lowered = backend.to_ascii_lowercase();
-    let resolved = if lowered == "cpu" || lowered == "cpu_accel" {
-        ComputeDevice::Cpu
-    } else {
-        ComputeDevice::Gpu {
-            name: backend.to_owned(),
+fn resolved_acceleration(
+    requested: AccelerationPreference,
+    backend: &str,
+    device: &Device,
+) -> ResolvedAcceleration {
+    let resolved = match device.device_type {
+        DeviceType::Cpu | DeviceType::Accel => ComputeDevice::Cpu,
+        DeviceType::Gpu | DeviceType::Igpu => ComputeDevice::Gpu {
+            name: resolved_gpu_name(backend, device),
+        },
+        DeviceType::Unknown => {
+            let backend = backend.trim();
+            if matches!(backend.to_ascii_lowercase().as_str(), "cpu" | "cpu_accel") {
+                ComputeDevice::Cpu
+            } else {
+                ComputeDevice::Gpu {
+                    name: resolved_gpu_name(backend, device),
+                }
+            }
         }
     };
-    let diagnostic = matches!(
-        (&requested, &resolved),
-        (AccelerationPreference::Gpu, ComputeDevice::Cpu)
-    )
-    .then(|| "The requested GPU backend was unavailable; CPU was selected.".to_owned());
+    let diagnostic = match (&requested, &resolved) {
+        (AccelerationPreference::Auto, ComputeDevice::Cpu) => {
+            Some("No compatible GPU was available; Auto fell back to CPU.".to_owned())
+        }
+        (AccelerationPreference::Gpu, ComputeDevice::Cpu) => {
+            Some("The strict GPU request unexpectedly resolved to CPU.".to_owned())
+        }
+        _ => None,
+    };
     ResolvedAcceleration {
         requested,
         resolved,
         diagnostic,
     }
+}
+
+fn resolved_gpu_name(backend: &str, device: &Device) -> String {
+    [&device.description, &device.name]
+        .into_iter()
+        .map(|value| value.trim())
+        .find(|value| !value.is_empty())
+        .unwrap_or_else(|| backend.trim())
+        .to_owned()
 }
 
 fn validate_audio(audio: &PreparedAudio) -> Result<()> {
@@ -445,6 +467,71 @@ mod tests {
         let native = run_options(&preview.transcription_options());
 
         assert_eq!(native.timestamps, TimestampKind::Segment);
+    }
+
+    #[test]
+    fn acceleration_preferences_preserve_native_fallback_and_strictness() {
+        assert_eq!(
+            requested_backend(AccelerationPreference::Auto),
+            Backend::Auto
+        );
+        assert_eq!(requested_backend(AccelerationPreference::Cpu), Backend::Cpu);
+        assert_eq!(
+            requested_backend(AccelerationPreference::Gpu),
+            Backend::Vulkan
+        );
+    }
+
+    #[test]
+    fn resolved_device_type_drives_truthful_acceleration_reporting() {
+        let cpu = resolved_acceleration(
+            AccelerationPreference::Auto,
+            "cpu",
+            &device(DeviceType::Cpu, "CPU", ""),
+        );
+        assert_eq!(cpu.resolved, ComputeDevice::Cpu);
+        assert_eq!(
+            cpu.diagnostic.as_deref(),
+            Some("No compatible GPU was available; Auto fell back to CPU.")
+        );
+
+        let gpu = resolved_acceleration(
+            AccelerationPreference::Gpu,
+            "Vulkan0",
+            &device(DeviceType::Gpu, "Vulkan0", "NVIDIA GeForce RTX test device"),
+        );
+        assert_eq!(
+            gpu.resolved,
+            ComputeDevice::Gpu {
+                name: "NVIDIA GeForce RTX test device".to_owned()
+            }
+        );
+        assert_eq!(gpu.diagnostic, None);
+    }
+
+    #[test]
+    fn host_memory_accelerators_are_reported_as_cpu_compute() {
+        let resolved = resolved_acceleration(
+            AccelerationPreference::Cpu,
+            "cpu_accel",
+            &device(DeviceType::Accel, "AMX", "Host accelerator"),
+        );
+
+        assert_eq!(resolved.resolved, ComputeDevice::Cpu);
+        assert_eq!(resolved.diagnostic, None);
+    }
+
+    fn device(device_type: DeviceType, name: &str, description: &str) -> Device {
+        Device {
+            name: name.to_owned(),
+            description: description.to_owned(),
+            kind: String::new(),
+            device_type,
+            device_id: None,
+            memory_total: 0,
+            memory_free: 0,
+            index: None,
+        }
     }
 
     #[test]

@@ -289,7 +289,7 @@ const TRANSCRIBE_CPP_VERSION: RuntimeVersion = RuntimeVersion {
     patch: 1,
 };
 
-const BATCH_ENGLISH_CAPABILITIES: ModelCapabilities = ModelCapabilities {
+const GGUF_BATCH_ENGLISH_CAPABILITIES: ModelCapabilities = ModelCapabilities {
     batch_transcription: true,
     native_streaming: false,
     cancellation: true,
@@ -299,12 +299,13 @@ const BATCH_ENGLISH_CAPABILITIES: ModelCapabilities = ModelCapabilities {
     confidence_scores: false,
     custom_vocabulary: false,
     cpu: true,
-    gpu: false,
+    gpu: cfg!(feature = "vulkan-acceleration"),
 };
 
 const MOONSHINE_TINY_CAPABILITIES: ModelCapabilities = ModelCapabilities {
     timestamps: false,
-    ..BATCH_ENGLISH_CAPABILITIES
+    gpu: false,
+    ..GGUF_BATCH_ENGLISH_CAPABILITIES
 };
 
 const NO_ROLES: &[ModelRole] = &[];
@@ -434,7 +435,7 @@ const fn handy_computer_tiny_en_manifest() -> ModelManifest {
             sha256: "3bfa6200aa12a21409445401f7871b5c733546dc45a29eb4871fcb3c7954e08b",
         }),
         languages: &["en"],
-        capabilities: BATCH_ENGLISH_CAPABILITIES,
+        capabilities: GGUF_BATCH_ENGLISH_CAPABILITIES,
         recommended: false,
         roles: NO_ROLES,
         compatibility: CompatibilityStatus::Experimental {
@@ -499,7 +500,7 @@ const fn whisper_manifest(
         minimum_runtime_version: TRANSCRIBE_CPP_VERSION,
         artifact: ModelArtifactBinding::SingleGguf(artifact),
         languages: &["en"],
-        capabilities: BATCH_ENGLISH_CAPABILITIES,
+        capabilities: GGUF_BATCH_ENGLISH_CAPABILITIES,
         roles: NO_ROLES,
         compatibility: CompatibilityStatus::Experimental {
             evidence: evidence.link(),
@@ -1121,6 +1122,21 @@ mod tests {
 
         assert!(base.recommended);
         assert!(!tiny.recommended);
+    }
+
+    #[test]
+    fn gguf_gpu_capability_matches_the_compiled_backend() {
+        for descriptor in model_descriptors()
+            .into_iter()
+            .filter(|descriptor| model_uses_embedded_runtime(&descriptor.id))
+        {
+            assert_eq!(
+                descriptor.capabilities.gpu,
+                cfg!(feature = "vulkan-acceleration"),
+                "{} advertised the wrong GPU capability",
+                descriptor.id
+            );
+        }
     }
 
     #[test]
