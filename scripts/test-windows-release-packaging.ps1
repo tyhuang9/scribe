@@ -1009,6 +1009,11 @@ Set-StrictMode -Version Latest
             throw "Windows package verifier is missing compiled-installer contract: $requiredVerifierContract"
         }
     }
+    if (-not $verifierSource.Contains('[System.IO.File]::Delete("$canonicalReadme`:scribe-test")') -or
+        -not $verifierSource.Contains('[System.IO.File]::Delete("$licensesRoot`:scribe-test")') -or
+        $verifierSource -match 'Remove-Item\s+-LiteralPath\s+\$(canonicalReadme|licensesRoot)\s+-Stream\s+"scribe-test"') {
+        throw 'Alternate-stream fixtures must clean up their exact stream through System.IO rather than the PowerShell provider.'
+    }
     $nativeProcessStart = $verifierSource.IndexOf('function Invoke-NativeProcess')
     $nativeProcessEnd = $verifierSource.IndexOf('function Assert-NoReparseAncestors', $nativeProcessStart)
     $nativeProcessSource = $verifierSource.Substring($nativeProcessStart, $nativeProcessEnd - $nativeProcessStart)

@@ -990,7 +990,7 @@ try {
                 (Join-Path $temporaryRoot "stable-file-ads.log") `
                 $stableShellRoot $stableShellSnapshot $stableRoot `
                 "Stable payload file with alternate data stream"
-            Remove-Item -LiteralPath $canonicalReadme -Stream "scribe-test"
+            [System.IO.File]::Delete("$canonicalReadme`:scribe-test")
 
             $licensesRoot = Join-Path $stableRoot "licenses"
             [System.IO.File]::WriteAllBytes("$licensesRoot`:scribe-test", [byte[]](65, 68, 83))
@@ -999,7 +999,7 @@ try {
                 (Join-Path $temporaryRoot "stable-directory-ads.log") `
                 $stableShellRoot $stableShellSnapshot $stableRoot `
                 "Stable payload directory with alternate data stream"
-            Remove-Item -LiteralPath $licensesRoot -Stream "scribe-test"
+            [System.IO.File]::Delete("$licensesRoot`:scribe-test")
 
             $sharingSnapshot = Get-ExactTreeSnapshot $stableRoot
             $exclusiveHandle = [System.IO.File]::Open(
