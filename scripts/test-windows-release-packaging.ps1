@@ -988,7 +988,7 @@ Set-StrictMode -Version Latest
         throw 'Could not isolate the per-file payload handle release contract.'
     }
     $payloadReleaseSource = $installer.Substring($payloadReleaseStart, $payloadReleaseEnd - $payloadReleaseStart)
-    if ($payloadReleaseSource -notmatch 'CurrentPath := RemoveBackslashUnlessRoot\(ExpandFileName\(CurrentFilename\)\)' -or
+    if ($payloadReleaseSource -notmatch 'CurrentPath := RemoveBackslashUnlessRoot\(ExpandFileName\(ExpandConstant\(CurrentFilename\)\)\)' -or
         $payloadReleaseSource -notmatch 'SameStr\(BoundHandlePaths\[I\], CurrentPath\)' -or
         $payloadReleaseSource -notmatch 'if BoundHandleReleaseBeforeInnoReplacement\[I\] then\s+RaiseException' -or
         $payloadReleaseSource -notmatch 'if MatchingHandleIndex <> -1 then\s+RaiseException' -or

@@ -330,7 +330,7 @@ var
   I: Integer;
   ErrorCode: LongInt;
 begin
-  CurrentPath := RemoveBackslashUnlessRoot(ExpandFileName(CurrentFilename));
+  CurrentPath := RemoveBackslashUnlessRoot(ExpandFileName(ExpandConstant(CurrentFilename)));
   MatchingHandleIndex := -1;
   for I := 0 to BoundHandleCount - 1 do
   begin

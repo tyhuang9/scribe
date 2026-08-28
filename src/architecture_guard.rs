@@ -1551,7 +1551,7 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
                 .contains("if BoundHandleReleaseBeforeInnoReplacement[I] then")
             && uninstaller_release_source.contains("CloseHandle(BoundHandles[I])")
             && payload_release_source.contains(
-                "CurrentPath := RemoveBackslashUnlessRoot(ExpandFileName(CurrentFilename))"
+                "CurrentPath := RemoveBackslashUnlessRoot(ExpandFileName(ExpandConstant(CurrentFilename)))"
             )
             && payload_release_source.contains("SameStr(BoundHandlePaths[I], CurrentPath)")
             && payload_release_source
