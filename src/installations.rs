@@ -249,6 +249,11 @@ struct ActivationJournalDocument {
     expected_config_fingerprint: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+struct ActivationJournalHeader {
+    schema_version: u16,
+}
+
 #[derive(Debug)]
 pub(crate) struct ActivationJournal {
     path: PathBuf,
@@ -367,15 +372,23 @@ pub(crate) fn reconcile_activation_journal(
     }
     let bytes = fs::read(path)
         .map_err(|error| failed(format!("failed to read {}: {error}", path.display())))?;
+    let header: ActivationJournalHeader = serde_json::from_slice(&bytes).map_err(|error| {
+        failed(format!(
+            "invalid activation journal {}: {error}",
+            path.display()
+        ))
+    })?;
+    if header.schema_version != 3 {
+        return Err(InstallError::RecoveryRequired(
+            "unsupported activation journal schema".to_owned(),
+        ));
+    }
     let document: ActivationJournalDocument = serde_json::from_slice(&bytes).map_err(|error| {
         failed(format!(
             "invalid activation journal {}: {error}",
             path.display()
         ))
     })?;
-    if document.schema_version != 3 {
-        return Err(failed("unsupported activation journal schema"));
-    }
     if let Some(fingerprint) = document.prior_config_fingerprint.as_deref() {
         validate_sha256(fingerprint)?;
     }
@@ -4522,7 +4535,7 @@ mod tests {
         let runtime_modified = fs::metadata(&runtime_sentinel).unwrap().modified().unwrap();
         let legacy_document = serde_json::json!({
             "schema_version": 2,
-            "phase": "model_activated",
+            "phase": "runtime_activated",
             "model_target": model,
             "model_had_previous": true,
             "manifest_target": null,
@@ -4549,6 +4562,7 @@ mod tests {
                 .to_string()
                 .contains("unsupported activation journal schema")
         );
+        assert!(error.requires_recovery());
         assert_eq!(fs::read(&journal_path).unwrap(), journal_bytes);
         assert_eq!(fs::read(&model).unwrap(), b"model-sentinel");
         assert_eq!(fs::read(&runtime_sentinel).unwrap(), b"runtime-sentinel");

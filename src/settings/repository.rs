@@ -164,6 +164,8 @@ fn backup_corrupt(path: &Path) -> Result<PathBuf> {
 }
 
 fn backup_before_migration(path: &Path) -> Result<PathBuf> {
+    // Keep the historical suffix as a user-visible recovery convention and
+    // for compatibility with existing support tooling documented by Scribe.
     backup_original(path, "pre-v1-migration")
 }
 
@@ -542,6 +544,131 @@ mod tests {
         assert_eq!(
             fs::metadata(&runtime).unwrap().modified().unwrap(),
             runtime_modified
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn version_three_runtime_retirement_backup_is_exact_and_migration_is_inert() {
+        let dir = test_dir("v3-runtime-retirement-backup");
+        let path = dir.join("config.json");
+        let artifact = dir.join("sentinels").join("legacy-model.bin");
+        let runtime = dir.join("sentinels").join("legacy-runtime.dll");
+        let executable = dir.join("sentinels").join("legacy-whisper-cli.exe");
+        fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        fs::write(&artifact, b"artifact sentinel").unwrap();
+        fs::write(&runtime, b"runtime sentinel").unwrap();
+        fs::write(&executable, b"executable sentinel").unwrap();
+        let artifact_modified = fs::metadata(&artifact).unwrap().modified().unwrap();
+        let runtime_modified = fs::metadata(&runtime).unwrap().modified().unwrap();
+        let executable_modified = fs::metadata(&executable).unwrap().modified().unwrap();
+
+        let managed_runtimes = serde_json::json!({
+            "retired-provider": {
+                "path": runtime,
+                "source": "copied-v3",
+                "opaque": [1, {"sentinel": true}]
+            }
+        });
+        let last_used_backend = serde_json::json!({"id": "retired-provider", "future": [3, 2, 1]});
+        let gpu_device = serde_json::json!({"ordinal": 7, "opaque": true});
+        let cuda_backend = serde_json::json!(runtime);
+        let cuda_libraries = serde_json::json!([runtime.parent().unwrap(), {"future": "value"}]);
+        let executable_value =
+            serde_json::json!({"path": executable, "opaque": {"preserve": true}});
+        let original_value = serde_json::json!({
+            "schema_version": 3,
+            "general": {
+                "selected_default_model": "retired-provider",
+                "model_storage_dir": dir.join("isolated-storage"),
+                "model_paths": {"retired-provider": artifact},
+                "managed_runtimes": managed_runtimes.clone(),
+                "last_used_backend": last_used_backend.clone()
+            },
+            "performance": {
+                "whisper_gpu_device": gpu_device.clone(),
+                "whisper_cuda_backend_path": cuda_backend.clone(),
+                "whisper_cuda_library_paths": cuda_libraries.clone()
+            },
+            "developer": {
+                "whisper_executable_path": executable_value.clone()
+            }
+        });
+        let original_bytes = serde_json::to_vec_pretty(&original_value).unwrap();
+        fs::write(&path, &original_bytes).unwrap();
+
+        let config = load_from_path(&path).unwrap();
+
+        let backup = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.starts_with("config.json.pre-v1-migration-") && name.ends_with(".bak")
+                    })
+            })
+            .expect("exact v3 pre-migration backup");
+        assert_eq!(fs::read(backup).unwrap(), original_bytes);
+
+        assert_eq!(config.schema_version, super::super::CURRENT_SCHEMA_VERSION);
+        assert_eq!(config.general.unknown["managed_runtimes"], managed_runtimes);
+        assert_eq!(
+            config.general.unknown["last_used_backend"],
+            last_used_backend
+        );
+        assert_eq!(config.performance.unknown["whisper_gpu_device"], gpu_device);
+        assert_eq!(
+            config.performance.unknown["whisper_cuda_backend_path"],
+            cuda_backend
+        );
+        assert_eq!(
+            config.performance.unknown["whisper_cuda_library_paths"],
+            cuda_libraries
+        );
+        assert_eq!(
+            config.developer.unknown["whisper_executable_path"],
+            executable_value
+        );
+
+        let live: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            live["schema_version"],
+            Value::from(super::super::CURRENT_SCHEMA_VERSION)
+        );
+        assert_eq!(live["general"]["managed_runtimes"], managed_runtimes);
+        assert_eq!(live["general"]["last_used_backend"], last_used_backend);
+        assert_eq!(live["performance"]["whisper_gpu_device"], gpu_device);
+        assert_eq!(
+            live["performance"]["whisper_cuda_backend_path"],
+            cuda_backend
+        );
+        assert_eq!(
+            live["performance"]["whisper_cuda_library_paths"],
+            cuda_libraries
+        );
+        assert_eq!(
+            live["developer"]["whisper_executable_path"],
+            executable_value
+        );
+
+        assert_eq!(fs::read(&artifact).unwrap(), b"artifact sentinel");
+        assert_eq!(fs::read(&runtime).unwrap(), b"runtime sentinel");
+        assert_eq!(fs::read(&executable).unwrap(), b"executable sentinel");
+        assert_eq!(
+            fs::metadata(&artifact).unwrap().modified().unwrap(),
+            artifact_modified
+        );
+        assert_eq!(
+            fs::metadata(&runtime).unwrap().modified().unwrap(),
+            runtime_modified
+        );
+        assert_eq!(
+            fs::metadata(&executable).unwrap().modified().unwrap(),
+            executable_modified
         );
         fs::remove_dir_all(dir).unwrap();
     }

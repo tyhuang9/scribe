@@ -867,6 +867,8 @@ struct WireRuntimeError {
     code: WireRuntimeErrorCode,
     fatal: bool,
     message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    artifact_path: Option<PathBuf>,
     sample_rate_hz: Option<u32>,
     channels: Option<u16>,
     model_id: Option<String>,
@@ -906,6 +908,10 @@ impl WireRuntimeError {
                 RuntimeError::Poisoned | RuntimeError::WorkerUnavailable(_)
             ),
             message: error.to_string(),
+            artifact_path: match error {
+                RuntimeError::ArtifactIntegrity { path, .. } => Some(path.clone()),
+                _ => None,
+            },
             sample_rate_hz: match error {
                 RuntimeError::InvalidAudio { sample_rate_hz, .. } => Some(*sample_rate_hz),
                 _ => None,
@@ -931,7 +937,9 @@ impl WireRuntimeError {
             },
             WireRuntimeErrorCode::Engine => RuntimeError::Engine(self.message),
             WireRuntimeErrorCode::ArtifactIntegrity => RuntimeError::ArtifactIntegrity {
-                path: PathBuf::from("<inference-worker artifact>"),
+                path: self
+                    .artifact_path
+                    .unwrap_or_else(|| PathBuf::from("<inference-worker artifact>")),
                 message: self.message,
             },
             WireRuntimeErrorCode::OnnxUnavailable => RuntimeError::OnnxUnavailable(self.message),
@@ -5994,6 +6002,37 @@ mod tests {
                 sample_rate_hz: 48_000,
                 channels: 2
             }
+        ));
+
+        let artifact_path = PathBuf::from("models").join("fixture.gguf");
+        let integrity = WireRuntimeError::from_runtime(&RuntimeError::ArtifactIntegrity {
+            path: artifact_path.clone(),
+            message: "digest mismatch".to_owned(),
+        });
+        let encoded = serde_json::to_vec(&integrity).unwrap();
+        let decoded: WireRuntimeError = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(
+            decoded.artifact_path.as_deref(),
+            Some(artifact_path.as_path())
+        );
+        assert!(matches!(
+            decoded.into_runtime(),
+            RuntimeError::ArtifactIntegrity { path, .. } if path == artifact_path
+        ));
+
+        let legacy: WireRuntimeError = serde_json::from_value(serde_json::json!({
+            "code": "artifact_integrity",
+            "fatal": false,
+            "message": "legacy integrity failure",
+            "sample_rate_hz": null,
+            "channels": null,
+            "model_id": null
+        }))
+        .unwrap();
+        assert!(matches!(
+            legacy.into_runtime(),
+            RuntimeError::ArtifactIntegrity { path, .. }
+                if path == Path::new("<inference-worker artifact>")
         ));
     }
 

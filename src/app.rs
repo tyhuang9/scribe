@@ -6780,6 +6780,10 @@ impl LocalTranscriberApp {
                     }
                     self.model_downloads
                         .insert(model_id.clone(), ModelInstallStatus::Error(message.clone()));
+                    if recovery_required || self.artifact_recovery_error.is_none() {
+                        self.status = TranscriptionStatus::Error;
+                        self.status_message = format!("Installation failed: {message}");
+                    }
                     if let Some(result) = discard_result {
                         let cleanup_succeeded = result.is_ok();
                         self.finish_partial_discard(&model_id, result);
@@ -6787,9 +6791,6 @@ impl LocalTranscriberApp {
                             self.status = TranscriptionStatus::Error;
                             self.status_message = format!("Installation failed: {message}");
                         }
-                    } else if self.artifact_recovery_error.is_none() {
-                        self.status = TranscriptionStatus::Error;
-                        self.status_message = format!("Installation failed: {message}");
                     }
                     self.finish_artifact_install(&model_id, job_id);
                 }
@@ -19055,6 +19056,37 @@ mod layout_tests {
         assert!(app.artifact_mutation_block_reason().is_some());
         assert_eq!(app.status, TranscriptionStatus::Error);
         assert!(app.status_message.contains("Could not finish discarding"));
+    }
+
+    #[test]
+    fn matching_recovery_failure_without_discard_is_terminal_and_visible() {
+        let mut app = test_app();
+        let model_id = "whisper_cpp_tiny_en";
+        app.artifact_installations
+            .insert(model_id.to_owned(), (44, InstallCancellation::default()));
+
+        app.tx
+            .send(AppEvent::VerifiedInstallFailed {
+                job_id: 44,
+                model_id: model_id.to_owned(),
+                message: "activation recovery required".to_owned(),
+                recovery_required: true,
+            })
+            .unwrap();
+        app.poll_events();
+
+        assert_eq!(app.status, TranscriptionStatus::Error);
+        assert_eq!(
+            app.status_message,
+            "Installation failed: activation recovery required"
+        );
+        assert_eq!(
+            app.artifact_recovery_error.as_deref(),
+            Some("activation recovery required")
+        );
+        assert!(app.artifact_installations.recovery_is_frozen());
+        assert!(!app.artifact_installations.contains_key(model_id));
+        assert!(!app.discard_partial_after_install.contains_key(model_id));
     }
 
     #[test]
