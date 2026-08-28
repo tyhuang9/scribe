@@ -379,46 +379,6 @@ pub(crate) fn keycap(ui: &mut Ui, text: &str) {
 }
 
 #[allow(dead_code)]
-pub(crate) fn notice(ui: &mut Ui, text: &str, error: bool) -> Response {
-    let colors = ui_palette(ui);
-    let (fill, stroke, color, icon) = if error {
-        (
-            colors.error_pale,
-            colors.error_border,
-            colors.error_text,
-            Icon::MicrophoneOff,
-        )
-    } else {
-        (
-            colors.panel_bg,
-            colors.border,
-            colors.neutral_notice_text,
-            Icon::Info,
-        )
-    };
-    let width = ui.available_width();
-    ui.allocate_ui_with_layout(Vec2::new(width, 0.0), Layout::top_down(Align::LEFT), |ui| {
-        Frame::none()
-            .fill(fill)
-            .stroke(Stroke::new(1.0, stroke))
-            .rounding(Rounding::same(5.0))
-            .inner_margin(Margin::same(12.0))
-            .show(ui, |ui| {
-                ui.set_min_width((width - 24.0).max(0.0));
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(
-                        egui::RichText::new(icon_glyph(icon))
-                            .size(18.0)
-                            .color(color),
-                    );
-                    ui.label(egui::RichText::new(text).color(color));
-                });
-            });
-    })
-    .response
-}
-
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Icon {
     Waveform,
@@ -563,11 +523,10 @@ mod tests {
     }
 
     #[test]
-    fn cards_and_notices_allocate_the_available_content_width() {
+    fn cards_allocate_the_available_content_width() {
         let ctx = egui::Context::default();
         let mut available_width = 0.0;
         let mut card_width = 0.0;
-        let mut notice_width = 0.0;
         let _ = ctx.run(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
@@ -580,17 +539,12 @@ mod tests {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     available_width = ui.available_width();
                     card_width = card(ui, |_| {}).rect.width();
-                    notice_width = notice(ui, "A full-width notice", false).rect.width();
                 });
             },
         );
         assert!(
             card_width >= available_width - 1.0,
             "card={card_width}, available={available_width}"
-        );
-        assert!(
-            notice_width >= available_width - 1.0,
-            "notice={notice_width}, available={available_width}"
         );
     }
 

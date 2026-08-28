@@ -138,127 +138,6 @@ pub(crate) enum ResolvedTheme {
     Dark,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[allow(dead_code)]
-pub(crate) enum TranscriptionEvent {
-    ModelReady(String),
-    StartRequested,
-    MicrophoneGranted,
-    MicrophoneFailed,
-    Partial(String),
-    StopRequested,
-    FinalText(String),
-    NoSpeech,
-    ModelFailed,
-    Retry,
-    ModelRemoved,
-}
-
-impl TranscriptionState {
-    #[allow(dead_code)]
-    pub(crate) fn apply(&mut self, event: TranscriptionEvent) {
-        match event {
-            TranscriptionEvent::ModelReady(id)
-                if matches!(
-                    self.phase,
-                    TranscriptionPhase::NoModel
-                        | TranscriptionPhase::ModelLoading
-                        | TranscriptionPhase::ModelError
-                ) =>
-            {
-                self.selected_model_id = Some(id);
-                self.phase = TranscriptionPhase::Ready;
-                self.notice = None;
-            }
-            TranscriptionEvent::StartRequested
-                if matches!(
-                    self.phase,
-                    TranscriptionPhase::Ready
-                        | TranscriptionPhase::NoSpeech
-                        | TranscriptionPhase::MicrophoneError
-                ) =>
-            {
-                self.phase = TranscriptionPhase::RequestingMicrophone;
-                self.notice = None;
-            }
-            TranscriptionEvent::MicrophoneGranted
-                if self.phase == TranscriptionPhase::RequestingMicrophone =>
-            {
-                self.phase = TranscriptionPhase::Listening;
-                self.microphone_permission = MicrophonePermission::Granted;
-            }
-            TranscriptionEvent::MicrophoneFailed
-                if self.phase == TranscriptionPhase::RequestingMicrophone =>
-            {
-                self.phase = TranscriptionPhase::MicrophoneError;
-                self.microphone_permission = MicrophonePermission::Denied;
-                self.notice = Some(TranscribeNotice::error(
-                    "Scribe couldn\u{2019}t access your microphone.",
-                    TranscribeRecoveryAction::RetryMicrophone,
-                ));
-            }
-            TranscriptionEvent::Partial(text) if self.phase == TranscriptionPhase::Listening => {
-                self.provisional_transcript = text;
-            }
-            TranscriptionEvent::StopRequested if self.phase == TranscriptionPhase::Listening => {
-                self.phase = TranscriptionPhase::Finalizing;
-            }
-            TranscriptionEvent::FinalText(text) if self.phase == TranscriptionPhase::Finalizing => {
-                append_transcript(&mut self.committed_transcript, &text);
-                self.provisional_transcript.clear();
-                self.phase = TranscriptionPhase::Ready;
-            }
-            TranscriptionEvent::NoSpeech
-                if matches!(
-                    self.phase,
-                    TranscriptionPhase::Listening | TranscriptionPhase::Finalizing
-                ) =>
-            {
-                self.provisional_transcript.clear();
-                self.phase = TranscriptionPhase::NoSpeech;
-                self.notice = Some(TranscribeNotice::information(
-                    "No speech detected — nothing was added.",
-                ));
-            }
-            TranscriptionEvent::ModelFailed if self.phase == TranscriptionPhase::ModelLoading => {
-                self.provisional_transcript.clear();
-                self.phase = TranscriptionPhase::ModelError;
-            }
-            TranscriptionEvent::Retry if self.phase == TranscriptionPhase::MicrophoneError => {
-                self.phase = TranscriptionPhase::RequestingMicrophone;
-                self.notice = None;
-            }
-            TranscriptionEvent::ModelRemoved
-                if matches!(
-                    self.phase,
-                    TranscriptionPhase::Ready
-                        | TranscriptionPhase::NoSpeech
-                        | TranscriptionPhase::MicrophoneError
-                        | TranscriptionPhase::ModelError
-                        | TranscriptionPhase::NoModel
-                ) =>
-            {
-                self.selected_model_id = None;
-                self.provisional_transcript.clear();
-                self.phase = TranscriptionPhase::NoModel;
-            }
-            _ => {}
-        }
-    }
-}
-
-#[allow(dead_code)]
-fn append_transcript(transcript: &mut String, text: &str) {
-    let text = text.trim();
-    if text.is_empty() {
-        return;
-    }
-    if !transcript.trim().is_empty() {
-        transcript.push(' ');
-    }
-    transcript.push_str(text);
-}
-
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[allow(dead_code)]
 pub(crate) enum ModelDownloadState {
@@ -272,17 +151,6 @@ pub(crate) enum ModelDownloadState {
     Installed,
     Failed,
     Cancelled,
-}
-
-impl ModelDownloadState {
-    #[allow(dead_code)]
-    pub(crate) fn normalize(self, next: Self) -> Self {
-        if self == Self::Installed && next != Self::Installed {
-            Self::Installed
-        } else {
-            next
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -384,19 +252,6 @@ pub(crate) struct ModelViewModel {
     pub capabilities: ModelCapabilities,
     pub compatibility: ModelCompatibility,
     pub error_message: Option<String>,
-}
-
-impl ModelViewModel {
-    #[allow(dead_code)]
-    pub(crate) fn normalize(mut self) -> Self {
-        if self.active {
-            self.installed = true;
-            self.download_state = ModelDownloadState::Installed;
-        } else if self.download_state == ModelDownloadState::Installed {
-            self.installed = true;
-        }
-        self
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -508,8 +363,6 @@ pub(crate) enum RemoteCatalogSizeTier {
 
 #[allow(dead_code)]
 impl RemoteCatalogSizeTier {
-    pub(crate) const ALL: [Self; 4] = [Self::Any, Self::Compact, Self::Standard, Self::Large];
-
     pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::Any => "Any size",
@@ -547,9 +400,6 @@ pub(crate) enum RemoteCatalogSort {
 
 #[allow(dead_code)]
 impl RemoteCatalogSort {
-    pub(crate) const ALL: [Self; 4] =
-        [Self::Recommended, Self::Smallest, Self::Largest, Self::Name];
-
     pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::Recommended => "Recommended first",
@@ -751,23 +601,6 @@ pub(crate) enum SettingsSaveState {
     Failed,
 }
 
-impl SettingsSaveState {
-    #[allow(dead_code)]
-    pub(crate) fn changed(self) -> Self {
-        Self::Dirty
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn saving(self) -> Self {
-        Self::Saving
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn completed(self, success: bool) -> Self {
-        if success { Self::Saved } else { Self::Failed }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -789,112 +622,6 @@ mod tests {
         assert!(!ModelLanguageFilter::English.matches(&spanish));
         assert!(!ModelLanguageFilter::Multilingual.matches(&spanish));
         assert!(ModelLanguageFilter::All.matches(&spanish));
-    }
-
-    #[test]
-    fn finalization_appends_once_and_discards_provisional_text() {
-        let mut state = TranscriptionState {
-            phase: TranscriptionPhase::Listening,
-            committed_transcript: "Earlier text.".into(),
-            ..Default::default()
-        };
-        state.apply(TranscriptionEvent::Partial("unfinished".into()));
-        state.apply(TranscriptionEvent::StopRequested);
-        state.apply(TranscriptionEvent::FinalText("Final words.".into()));
-        state.apply(TranscriptionEvent::FinalText("Final words.".into()));
-
-        assert_eq!(state.phase, TranscriptionPhase::Ready);
-        assert_eq!(state.committed_transcript, "Earlier text. Final words.");
-        assert!(state.provisional_transcript.is_empty());
-    }
-
-    #[test]
-    fn no_speech_preserves_committed_transcript() {
-        let mut state = TranscriptionState {
-            phase: TranscriptionPhase::Finalizing,
-            committed_transcript: "Keep this.".into(),
-            provisional_transcript: "discard this".into(),
-            ..Default::default()
-        };
-        state.apply(TranscriptionEvent::NoSpeech);
-
-        assert_eq!(state.phase, TranscriptionPhase::NoSpeech);
-        assert_eq!(state.committed_transcript, "Keep this.");
-        assert!(state.provisional_transcript.is_empty());
-    }
-
-    #[test]
-    fn model_normalization_prevents_contradictory_active_state() {
-        let model = ModelViewModel {
-            active: true,
-            download_state: ModelDownloadState::Downloading,
-            ..Default::default()
-        }
-        .normalize();
-
-        assert!(model.installed);
-        assert_eq!(model.download_state, ModelDownloadState::Installed);
-        assert_eq!(
-            ModelDownloadState::Installed.normalize(ModelDownloadState::Downloading),
-            ModelDownloadState::Installed
-        );
-    }
-
-    #[test]
-    fn settings_save_state_reducer_has_a_simple_retry_path() {
-        assert_eq!(
-            SettingsSaveState::Clean.changed().saving().completed(false),
-            SettingsSaveState::Failed
-        );
-        assert_eq!(
-            SettingsSaveState::Failed.changed().saving().completed(true),
-            SettingsSaveState::Saved
-        );
-    }
-
-    #[test]
-    fn stale_model_events_do_not_interrupt_recording_or_finalization() {
-        for phase in [
-            TranscriptionPhase::Listening,
-            TranscriptionPhase::Finalizing,
-        ] {
-            let mut state = TranscriptionState {
-                phase,
-                selected_model_id: Some("base.en".into()),
-                provisional_transcript: "keep this".into(),
-                ..Default::default()
-            };
-
-            state.apply(TranscriptionEvent::ModelReady("stale-model".into()));
-            state.apply(TranscriptionEvent::ModelFailed);
-
-            assert_eq!(state.phase, phase);
-            assert_eq!(state.selected_model_id.as_deref(), Some("base.en"));
-            assert_eq!(state.provisional_transcript, "keep this");
-        }
-    }
-
-    #[test]
-    fn model_removal_fails_closed_while_capture_or_model_loading_is_active() {
-        for phase in [
-            TranscriptionPhase::RequestingMicrophone,
-            TranscriptionPhase::Listening,
-            TranscriptionPhase::Finalizing,
-            TranscriptionPhase::ModelLoading,
-        ] {
-            let mut state = TranscriptionState {
-                phase,
-                selected_model_id: Some("base.en".into()),
-                provisional_transcript: "keep this".into(),
-                ..Default::default()
-            };
-
-            state.apply(TranscriptionEvent::ModelRemoved);
-
-            assert_eq!(state.phase, phase);
-            assert_eq!(state.selected_model_id.as_deref(), Some("base.en"));
-            assert_eq!(state.provisional_transcript, "keep this");
-        }
     }
 
     #[test]
@@ -957,20 +684,6 @@ mod tests {
             assert!(!comparison.begin());
             assert_eq!(comparison.phase, phase);
         }
-    }
-
-    #[test]
-    fn model_events_only_apply_during_model_setup() {
-        let mut loading = TranscriptionState {
-            phase: TranscriptionPhase::ModelLoading,
-            ..Default::default()
-        };
-        loading.apply(TranscriptionEvent::ModelFailed);
-        assert_eq!(loading.phase, TranscriptionPhase::ModelError);
-
-        loading.apply(TranscriptionEvent::ModelReady("base.en".into()));
-        assert_eq!(loading.phase, TranscriptionPhase::Ready);
-        assert_eq!(loading.selected_model_id.as_deref(), Some("base.en"));
     }
 
     #[test]

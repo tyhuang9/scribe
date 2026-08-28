@@ -398,19 +398,6 @@ impl RawBenchmarkMetrics {
             BenchmarkMetric::Vram => self.vram_mb,
         }
     }
-
-    fn set_value(&mut self, metric: BenchmarkMetric, value: Option<f64>) {
-        match metric {
-            BenchmarkMetric::Wer => self.wer = value,
-            BenchmarkMetric::Cer => self.cer = value,
-            BenchmarkMetric::Wip => self.wip = value,
-            BenchmarkMetric::Wil => self.wil = value,
-            BenchmarkMetric::Latency => self.latency_ms = value,
-            BenchmarkMetric::Rtf => self.rtf = value,
-            BenchmarkMetric::Ram => self.ram_mb = value,
-            BenchmarkMetric::Vram => self.vram_mb = value,
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -427,22 +414,6 @@ pub struct BenchmarkModelResult {
     pub raw_metrics: RawBenchmarkMetrics,
     pub normalized_scores: HashMap<BenchmarkMetric, f64>,
     pub overall_scores: HashMap<RankingMode, f64>,
-}
-
-#[derive(Clone, Debug)]
-#[allow(dead_code)]
-pub struct BenchmarkSampleResult {
-    pub sample_id: String,
-    pub model_results: Vec<BenchmarkModelResult>,
-}
-
-#[derive(Clone, Debug)]
-#[allow(dead_code)]
-pub struct AggregatedModelMetrics {
-    pub model_name: String,
-    pub per_sample_metrics: Vec<RawBenchmarkMetrics>,
-    pub average_metrics: RawBenchmarkMetrics,
-    pub worst_case_metrics: RawBenchmarkMetrics,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -635,33 +606,6 @@ pub fn calculate_overall_score(
     }
 }
 
-#[allow(dead_code)]
-pub fn aggregate_metrics_by_model(
-    samples: &[BenchmarkSampleResult],
-) -> Vec<AggregatedModelMetrics> {
-    let mut grouped: HashMap<String, Vec<RawBenchmarkMetrics>> = HashMap::new();
-    for sample in samples {
-        for result in &sample.model_results {
-            grouped
-                .entry(result.model_name.clone())
-                .or_default()
-                .push(result.raw_metrics.clone());
-        }
-    }
-
-    let mut aggregated = grouped
-        .into_iter()
-        .map(|(model_name, per_sample_metrics)| AggregatedModelMetrics {
-            model_name,
-            average_metrics: aggregate_metrics(&per_sample_metrics, aggregate_average),
-            worst_case_metrics: aggregate_metrics(&per_sample_metrics, aggregate_worst_case),
-            per_sample_metrics,
-        })
-        .collect::<Vec<_>>();
-    aggregated.sort_by(|a, b| a.model_name.cmp(&b.model_name));
-    aggregated
-}
-
 pub fn format_metric_value(metric: BenchmarkMetric, value: Option<f64>) -> String {
     let Some(value) = value else {
         return "n/a".to_owned();
@@ -815,47 +759,6 @@ fn levenshtein_distance<T: Eq>(left: &[T], right: &[T]) -> usize {
     }
 
     table[left.len()][right.len()]
-}
-
-fn aggregate_metrics(
-    metrics: &[RawBenchmarkMetrics],
-    aggregate: fn(BenchmarkMetric, &[f64]) -> Option<f64>,
-) -> RawBenchmarkMetrics {
-    let mut result = RawBenchmarkMetrics::default();
-    for metric in [
-        BenchmarkMetric::Wer,
-        BenchmarkMetric::Cer,
-        BenchmarkMetric::Wip,
-        BenchmarkMetric::Wil,
-        BenchmarkMetric::Latency,
-        BenchmarkMetric::Rtf,
-        BenchmarkMetric::Ram,
-        BenchmarkMetric::Vram,
-    ] {
-        let values = metrics
-            .iter()
-            .filter_map(|raw| raw.value(metric))
-            .collect::<Vec<_>>();
-        result.set_value(metric, aggregate(metric, &values));
-    }
-    result
-}
-
-fn aggregate_average(_metric: BenchmarkMetric, values: &[f64]) -> Option<f64> {
-    if values.is_empty() {
-        return None;
-    }
-    Some(values.iter().sum::<f64>() / values.len() as f64)
-}
-
-fn aggregate_worst_case(metric: BenchmarkMetric, values: &[f64]) -> Option<f64> {
-    if values.is_empty() {
-        return None;
-    }
-    match metric.direction() {
-        MetricDirection::LowerIsBetter => values.iter().copied().reduce(f64::max),
-        MetricDirection::HigherIsBetter => values.iter().copied().reduce(f64::min),
-    }
 }
 
 fn format_duration_ms(value: f64) -> String {

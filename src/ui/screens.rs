@@ -1731,15 +1731,6 @@ fn transcribe(
     }
 }
 
-#[allow(dead_code)]
-fn metadata(ui: &mut egui::Ui, icon: Icon, text: &str) {
-    ui.label(
-        RichText::new(format!("{}  {text}", icon_glyph(icon)))
-            .small()
-            .color(ui_palette(ui).muted_text),
-    );
-}
-
 fn installed_model_badge_size(ui: &egui::Ui, text: &str, text_color: Color32) -> Vec2 {
     let font = egui::FontId::proportional(12.0);
     let text_width = ui
@@ -7980,28 +7971,6 @@ fn format_elapsed(elapsed_ms: u64) -> String {
         (elapsed_ms / 1_000) % 60
     )
 }
-#[allow(dead_code)]
-fn speed_label(tier: ModelSpeedTier) -> &'static str {
-    match tier {
-        ModelSpeedTier::VeryFast => "Very Fast",
-        ModelSpeedTier::Fast => "Fast",
-        ModelSpeedTier::Balanced => "Balanced Speed",
-        ModelSpeedTier::AccurateSlow => "Accurate, slower",
-        ModelSpeedTier::Unknown => "Speed unknown",
-    }
-}
-#[allow(dead_code)]
-fn size_label(tier: ModelSizeTier) -> &'static str {
-    match tier {
-        ModelSizeTier::Tiny => "Tiny Size",
-        ModelSizeTier::Small => "Small Size",
-        ModelSizeTier::Base => "Base Size",
-        ModelSizeTier::Medium => "Medium Size",
-        ModelSizeTier::Large => "Large Size",
-        ModelSizeTier::Unknown => "Size unknown",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
