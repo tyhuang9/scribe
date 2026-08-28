@@ -365,6 +365,12 @@ impl RankingMode {
 pub struct BenchmarkModelInput {
     pub model_id: String,
     pub model_name: String,
+    pub predicted_transcript: String,
+    pub reference_transcript: String,
+    pub elapsed_ms: Option<u128>,
+    pub audio_duration_ms: Option<u128>,
+    pub peak_ram_mb: Option<f64>,
+    pub peak_vram_mb: Option<f64>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -398,12 +404,6 @@ impl RawBenchmarkMetrics {
 pub struct BenchmarkModelResult {
     pub model_id: String,
     pub model_name: String,
-    pub predicted_transcript: String,
-    pub reference_transcript: String,
-    pub elapsed_ms: Option<u128>,
-    pub audio_duration_ms: Option<u128>,
-    pub peak_ram_mb: Option<f64>,
-    pub peak_vram_mb: Option<f64>,
     pub raw_metrics: RawBenchmarkMetrics,
     pub normalized_scores: HashMap<BenchmarkMetric, f64>,
     pub overall_scores: HashMap<RankingMode, f64>,
