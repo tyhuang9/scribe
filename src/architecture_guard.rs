@@ -1483,10 +1483,13 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
                 .count()
                 == 2
             && file_probe_source.contains("ReleaseBeforeInnoReplacement: Boolean")
+            && file_probe_source.contains("IdentityAccess := 0")
+            && file_probe_source.contains("if not ReleaseBeforeInnoReplacement then")
+            && file_probe_source.contains("IdentityAccess := GenericRead")
             && file_probe_source
                 .contains("IdentityHandle, Path, ReleaseBeforeInnoReplacement, ErrorText",)
             && file_probe_source
-                .contains("Path, 0, FileShareRead or FileShareWrite, 0, OpenExisting")
+                .contains("Path, IdentityAccess, FileShareRead or FileShareWrite, 0, OpenExisting")
             && file_probe_source
                 .contains("Path, GenericRead or GenericWrite, FileShareRead or FileShareWrite"),
         "installer must keep normal file bindings delete-denying and tag only the exact Inno uninstaller pair for release"

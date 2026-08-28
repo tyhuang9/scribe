@@ -963,6 +963,7 @@ Set-StrictMode -Version Latest
     if ($installer -match 'FileShareDelete' -or
         $uninstallerLifecycleSource -notmatch 'function IsInnoUninstallerArtifact[\s\S]*SameStr\(RelativePath, ''unins000\.exe''\)[\s\S]*SameStr\(RelativePath, ''unins000\.dat''\)' -or
         $uninstallerLifecycleSource -notmatch 'function BindFileForUpdate\([\s\S]*ReleaseBeforeInnoReplacement: Boolean' -or
+        $uninstallerLifecycleSource -notmatch 'IdentityAccess := 0;[\s\S]*if not ReleaseBeforeInnoReplacement then[\s\S]*IdentityAccess := GenericRead;[\s\S]*Path, IdentityAccess, FileShareRead or FileShareWrite, 0, OpenExisting' -or
         $uninstallerLifecycleSource -notmatch 'RetainBoundHandle\([\s\S]*IdentityHandle, Path, ReleaseBeforeInnoReplacement, ErrorText\)' -or
         $uninstallerLifecycleSource -notmatch 'if BoundHandleReleaseBeforeInnoReplacement\[I\] then[\s\S]*CloseHandle\(BoundHandles\[I\]\)' -or
         $installer -notmatch 'if CurStep = ssInstall then[\s\S]*ReleaseInnoUninstallerHandles\(\);[\s\S]*WaitAtTestBoundary\(\)' -or

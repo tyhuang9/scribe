@@ -537,13 +537,17 @@ function BindFileForUpdate(
 var
   IdentityHandle: THandle;
   UpdateProbe: THandle;
+  IdentityAccess: LongWord;
   Attributes: LongWord;
   PathExists: Boolean;
   ErrorCode: LongInt;
 begin
   Result := False;
+  IdentityAccess := 0;
+  if not ReleaseBeforeInnoReplacement then
+    IdentityAccess := GenericRead;
   IdentityHandle := CreateFileW(
-    Path, 0, FileShareRead or FileShareWrite, 0, OpenExisting,
+    Path, IdentityAccess, FileShareRead or FileShareWrite, 0, OpenExisting,
     FileFlagOpenReparsePoint, 0);
   if IdentityHandle = InvalidHandleValue then
   begin
