@@ -583,6 +583,169 @@ fn retired_download_helpers_and_private_descriptor_fields_stay_removed() {
 }
 
 #[test]
+fn retired_python_provider_stack_stays_absent_without_crossing_native_boundaries() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    for retired_path in [
+        "src/stt/faster_whisper.rs",
+        "src/stt/vosk.rs",
+        "src/stt/sherpa_onnx.rs",
+        "scripts/faster_whisper_runner.py",
+        "scripts/vosk_runner.py",
+        "scripts/sherpa_onnx_runner.py",
+        "scripts/bundle-faster-whisper-runtime.sh",
+        "scripts/bundle-vosk-runtime.sh",
+        "scripts/bundle-sherpa-onnx-runtime.sh",
+        "scripts/bundle-moonshine-runtime.sh",
+        "scripts/bundle-parakeet-runtime.sh",
+    ] {
+        assert!(
+            !root.join(retired_path).exists(),
+            "retired provider file was restored: {retired_path}"
+        );
+    }
+
+    let retired_ids_and_aliases = [
+        "vosk_small_en",
+        "faster_whisper_tiny_en",
+        "faster_whisper_base_en",
+        "faster_whisper_small_en_gpu",
+        "faster_whisper_medium_en_gpu",
+        "faster_whisper_large_v3",
+        "faster_whisper_turbo",
+        "faster_whisper_distil_large_v3",
+        "sherpa_onnx_zipformer_small",
+        "parakeet_0_6b",
+        "faster_whisper",
+        "faster_whisper_small_en",
+        "faster_whisper_medium_en",
+        "sherpa_onnx_streaming",
+    ];
+    let retired_runner_invocations = [
+        "faster_whisper_runner.py",
+        "vosk_runner.py",
+        "sherpa_onnx_runner.py",
+        "scribe-faster-whisper",
+        "scribe-vosk",
+        "scribe-sherpa-onnx",
+        "SCRIBE_FAST_WHISPER_RUNTIME_DEST",
+        "SCRIBE_VOSK_RUNTIME_DEST",
+        "SCRIBE_SHERPA_ONNX_RUNTIME_DEST",
+    ];
+    for (path, source) in rust_sources() {
+        if path == Path::new("architecture_guard.rs") {
+            continue;
+        }
+        let production = production_source_for(&path, &source);
+        for retired in retired_ids_and_aliases {
+            assert!(
+                !production.contains(&format!("\"{retired}\"")),
+                "retired provider ID/alias {retired:?} remains recognized by {}",
+                path.display()
+            );
+        }
+        for invocation in retired_runner_invocations {
+            assert!(
+                !production.contains(invocation),
+                "retired runner invocation {invocation:?} remains in {}",
+                path.display()
+            );
+        }
+        if ![
+            Path::new("model_catalog.rs"),
+            Path::new("onnx_model_bundles.rs"),
+            Path::new("onnx_worker.rs"),
+            Path::new("runtime_artifact.rs"),
+            Path::new("runtime_router.rs"),
+        ]
+        .contains(&path.as_path())
+        {
+            assert!(
+                !production.contains("\"moonshine\""),
+                "retired bare Moonshine provider ID escaped the native allowlist into {}",
+                path.display()
+            );
+        }
+    }
+
+    let scripts = fs::read_dir(root.join("scripts")).expect("scripts directory must be readable");
+    for entry in scripts {
+        let path = entry.expect("script entry must be readable").path();
+        if !path.is_file() {
+            continue;
+        }
+        let source = fs::read_to_string(&path).expect("maintainer scripts must be UTF-8");
+        for invocation in retired_runner_invocations {
+            assert!(
+                !source.contains(invocation),
+                "retired runner invocation {invocation:?} remains in {}",
+                path.display()
+            );
+        }
+    }
+    let dependency_defaults = fs::read_to_string(root.join("scripts/runtime-dependencies.env"))
+        .expect("runtime dependency defaults must be readable");
+    assert!(
+        dependency_defaults
+            .lines()
+            .all(|line| line.trim().is_empty() || line.trim_start().starts_with('#')),
+        "retired Python dependency pins were restored"
+    );
+    let dependency_checker =
+        fs::read_to_string(root.join("scripts/check-runtime-dependency-updates.py"))
+            .expect("dependency checker must be readable");
+    assert!(dependency_checker.contains("PINNED_PACKAGES: dict[str, str] = {}"));
+
+    let stt = fs::read_to_string(root.join("src/stt/mod.rs"))
+        .expect("STT compatibility module must be readable");
+    let direct_dispatch = production_source(&stt)
+        .split("pub fn transcribe_with_config")
+        .nth(1)
+        .expect("direct compatibility dispatch exists")
+        .to_owned();
+    assert!(direct_dispatch.contains("\"whisper.cpp\""));
+    assert!(
+        !direct_dispatch.contains("provider_for_backend"),
+        "direct compatibility dispatch must not perform provider lookup"
+    );
+
+    let bridge = fs::read_to_string(root.join("src/compatibility_bridge.rs"))
+        .expect("compatibility bridge must be readable");
+    for boundary in [
+        "normalized_install_artifact(&model_id).is_some()",
+        "remote_gguf_artifact(config, &model.id).is_some()",
+        "imported_gguf_artifact(config, &model.id).is_some()",
+    ] {
+        assert!(
+            bridge.contains(boundary),
+            "compatibility bridge must reject native model ownership via {boundary:?}"
+        );
+    }
+
+    let catalog = fs::read_to_string(root.join("src/model_catalog.rs"))
+        .expect("native model catalog must be readable");
+    let bundles = fs::read_to_string(root.join("src/onnx_model_bundles.rs"))
+        .expect("native bundle manager must be readable");
+    let worker = fs::read_to_string(root.join("src/onnx_worker.rs"))
+        .expect("native worker must be readable");
+    let cargo = fs::read_to_string(root.join("Cargo.toml")).expect("Cargo manifest is readable");
+    assert!(catalog.contains("id: \"moonshine-tiny-en-int8-onnx\""));
+    assert!(catalog.contains("bundle_id: \"moonshine-tiny-en-int8-onnx\""));
+    assert!(bundles.contains("runtime.name != \"sherpa-onnx\""));
+    assert!(worker.contains("use sherpa_onnx::"));
+    assert!(cargo.contains("sherpa-onnx = \"=1.13.5\""));
+    for retained_path in [
+        "vendor/sherpa-onnx-sys/LICENSE",
+        "native/sherpa-onnx-v1.13.5/PROVENANCE.md",
+        "resources/licenses/Moonshine-MIT.txt",
+    ] {
+        assert!(
+            root.join(retained_path).is_file(),
+            "native Sherpa/Moonshine evidence was removed: {retained_path}"
+        );
+    }
+}
+
+#[test]
 fn private_onnx_runtime_contract_does_not_leak_into_product_surfaces() {
     let sources = rust_sources();
     let protected = [
