@@ -152,7 +152,7 @@ impl DownloadDiagnosticOutcome {
     fn is_terminal(self) -> bool {
         matches!(
             self,
-            Self::Failure | Self::Completion | Self::PriorRunInterruption
+            Self::Pause | Self::Failure | Self::Completion | Self::PriorRunInterruption
         )
     }
 }
@@ -1488,6 +1488,49 @@ mod tests {
         assert_eq!(interrupted[0].job_id, "unfinished");
         wait_lines(&root.join(DOWNLOAD_LOG_NAME), 3);
         drop(d);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn startup_preserves_persisted_pause_without_synthesizing_interruption() {
+        let root = temp("persisted-pause");
+        fs::create_dir_all(&root).unwrap();
+        let paused = DownloadDiagnosticEvent::pause(
+            run("prior"),
+            job("paused"),
+            artifact(),
+            DownloadSourceClass::ModelRepository,
+            25,
+            Some(100),
+        );
+        fs::write(
+            root.join(DOWNLOAD_LOG_NAME),
+            format!("{}\n", serde_json::to_string(&paused).unwrap()),
+        )
+        .unwrap();
+
+        let diagnostics = DownloadDiagnostics::start(&root, &run("current"));
+        let snapshot = diagnostics.snapshot();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].job_id, "paused");
+        assert_eq!(snapshot[0].outcome, DownloadDiagnosticOutcome::Pause);
+        assert!(
+            !snapshot
+                .iter()
+                .any(|event| { event.outcome == DownloadDiagnosticOutcome::PriorRunInterruption })
+        );
+        assert_eq!(
+            diagnostics.flush(Duration::from_secs(2)),
+            DownloadDiagnosticFlush::Flushed
+        );
+        assert_eq!(
+            fs::read_to_string(root.join(DOWNLOAD_LOG_NAME))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        drop(diagnostics);
         let _ = fs::remove_dir_all(root);
     }
 

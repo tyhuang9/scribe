@@ -1306,6 +1306,7 @@ enum AppEvent {
         model_id: String,
         message: String,
         recovery_required: bool,
+        download_failure: Option<DownloadFailureMetadata>,
     },
     LocalGgufImportFinished {
         job_id: u64,
@@ -1388,6 +1389,14 @@ struct ValidatedLocalGgufImport {
 struct InstallJobFailure {
     message: String,
     recovery_required: bool,
+    download_failure: Option<DownloadFailureMetadata>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DownloadFailureMetadata {
+    category: DownloadFaultKind,
+    retry_count: u8,
+    retained_bytes: u64,
 }
 
 impl InstallJobFailure {
@@ -1395,6 +1404,7 @@ impl InstallJobFailure {
         Self {
             message: message.into(),
             recovery_required: false,
+            download_failure: None,
         }
     }
 
@@ -1402,6 +1412,7 @@ impl InstallJobFailure {
         Self {
             message: message.into(),
             recovery_required: true,
+            download_failure: None,
         }
     }
 }
@@ -1414,10 +1425,27 @@ impl From<String> for InstallJobFailure {
 
 impl From<InstallError> for InstallJobFailure {
     fn from(error: InstallError) -> Self {
+        let download_failure = match &error {
+            InstallError::DownloadFailed {
+                category,
+                retry_count,
+                retained_bytes,
+                ..
+            } => Some(DownloadFailureMetadata {
+                category: *category,
+                retry_count: *retry_count,
+                retained_bytes: *retained_bytes,
+            }),
+            _ => None,
+        };
         if error.requires_recovery() {
-            Self::recovery_required(error.to_string())
+            let mut failure = Self::recovery_required(error.to_string());
+            failure.download_failure = download_failure;
+            failure
         } else {
-            Self::normal(error.to_string())
+            let mut failure = Self::normal(error.to_string());
+            failure.download_failure = download_failure;
+            failure
         }
     }
 }
@@ -1455,6 +1483,7 @@ fn send_verified_install_result(
                 model_id,
                 message: failure.message,
                 recovery_required: failure.recovery_required,
+                download_failure: failure.download_failure,
             });
         }
     }
@@ -1480,6 +1509,7 @@ fn send_verified_install_preparation(
                 model_id,
                 message: failure.message,
                 recovery_required: failure.recovery_required,
+                download_failure: failure.download_failure,
             });
         }
     }
@@ -1923,6 +1953,7 @@ impl ArtifactInstallCoordinator {
     fn download_activity_for_model(&self, model_id: &str) -> Option<DownloadActivity> {
         self.jobs
             .get(model_id)
+            .filter(|job| job.phase == ArtifactInstallPhase::Transferring)
             .and_then(|job| job.download_activity)
     }
 
@@ -2053,6 +2084,7 @@ impl ArtifactInstallCoordinator {
         }
         self.active_transfers = self.active_transfers.saturating_sub(1);
         let reservation = job.reservation.take();
+        job.download_activity = None;
         job.phase = ArtifactInstallPhase::WaitingForFinalizer;
         job.prepared = Some(prepared);
         self.finalizer_queue.push_back(model_id.to_owned());
@@ -8077,6 +8109,7 @@ impl LocalTranscriberApp {
                     model_id,
                     message,
                     recovery_required,
+                    download_failure,
                 } => {
                     let Some((active_job, cancellation)) =
                         self.artifact_installations.get(&model_id)
@@ -8087,11 +8120,14 @@ impl LocalTranscriberApp {
                         continue;
                     }
                     let paused = cancellation.is_cancelled() && !recovery_required;
-                    let (downloaded_bytes, total_bytes) = self
+                    let (prior_downloaded_bytes, total_bytes) = self
                         .model_downloads
                         .get(&model_id)
                         .and_then(model_install_download_bytes)
                         .unwrap_or((0, None));
+                    let downloaded_bytes = download_failure
+                        .map(|failure| failure.retained_bytes)
+                        .unwrap_or(prior_downloaded_bytes);
                     self.remote_catalog.invalidate_local_models();
                     let discard_result = self
                         .take_requested_partial_discard(&model_id, job_id)
@@ -8121,8 +8157,12 @@ impl LocalTranscriberApp {
                                         source,
                                         completed,
                                         total,
-                                        None,
-                                        DownloadFaultCategory::RemoteUnavailable,
+                                        download_failure
+                                            .map(|failure| u32::from(failure.retry_count)),
+                                        download_failure.map_or(
+                                            DownloadFaultCategory::RemoteUnavailable,
+                                            |failure| download_fault_category(failure.category),
+                                        ),
                                     )
                                 },
                             );
@@ -15051,8 +15091,12 @@ fn download_activity_label(activity: DownloadActivity) -> String {
     match activity {
         DownloadActivity::Active => "Downloading".to_owned(),
         DownloadActivity::Stalled => "Waiting for connection…".to_owned(),
-        DownloadActivity::RetryScheduled { attempt, .. } => {
-            format!("Connection interrupted — retrying {attempt} of 3")
+        DownloadActivity::RetryScheduled {
+            attempt,
+            max_attempts,
+            ..
+        } => {
+            format!("Connection interrupted — retrying {attempt} of {max_attempts}")
         }
     }
 }
@@ -16135,6 +16179,7 @@ mod layout_tests {
                 model_id: "wake-fixture".to_owned(),
                 message: "fixture failure".to_owned(),
                 recovery_required: false,
+                download_failure: None,
             })
         });
 
@@ -22205,6 +22250,7 @@ mod layout_tests {
                 model_id: model_id.as_str().to_owned(),
                 message: "installation cancelled".to_owned(),
                 recovery_required: false,
+                download_failure: None,
             })
             .unwrap();
         app.poll_events();
@@ -22239,6 +22285,7 @@ mod layout_tests {
                 model_id: model_id.as_str().to_owned(),
                 message: "worker recovery failed".to_owned(),
                 recovery_required: true,
+                download_failure: None,
             })
             .unwrap();
         app.poll_events();
@@ -22271,6 +22318,7 @@ mod layout_tests {
                 model_id: model_id.as_str().to_owned(),
                 message: "stale failure".to_owned(),
                 recovery_required: false,
+                download_failure: None,
             })
             .unwrap();
         app.poll_events();
@@ -24472,6 +24520,181 @@ mod layout_tests {
     }
 
     #[test]
+    fn exhausted_download_failure_keeps_only_sanitized_retry_metadata() {
+        let failure = InstallJobFailure::from(InstallError::DownloadFailed {
+            category: DownloadFaultKind::ConnectionReset,
+            retry_count: 3,
+            retained_bytes: 42,
+            partial_path: PathBuf::from("C:\\Users\\private\\model.gguf.partial"),
+        });
+
+        assert!(!failure.message.contains("C:\\Users\\private"));
+        assert_eq!(
+            failure.download_failure,
+            Some(DownloadFailureMetadata {
+                category: DownloadFaultKind::ConnectionReset,
+                retry_count: 3,
+                retained_bytes: 42,
+            })
+        );
+    }
+
+    #[test]
+    fn stalled_activity_is_cleared_before_waiting_and_finalizing_projection() {
+        let mut coordinator = ArtifactInstallCoordinator::default();
+        let job_id = coordinator
+            .admit(
+                "prepared-activity".to_owned(),
+                coordinator_admission(
+                    "prepared-activity.gguf",
+                    "prepared-activity-volume",
+                    crate::disk_space::SAFETY_HEADROOM_BYTES + 1_000,
+                    100,
+                ),
+                AppConfig::default(),
+                VerifiedInstallSource::NormalizedCatalog,
+                false,
+            )
+            .unwrap();
+        coordinator.take_ready_transfers();
+        coordinator.update_download_activity(
+            "prepared-activity",
+            job_id,
+            DownloadActivity::Stalled,
+        );
+        assert!(coordinator.mark_prepared(
+            "prepared-activity",
+            job_id,
+            coordinator_prepared("whisper_cpp_tiny_en"),
+        ));
+        assert_eq!(
+            coordinator.phase_for_model("prepared-activity"),
+            Some(ArtifactInstallPhase::WaitingForFinalizer)
+        );
+        assert_eq!(
+            coordinator.download_activity_for_model("prepared-activity"),
+            None
+        );
+        assert!(coordinator.take_next_finalizer().is_some());
+        assert_eq!(
+            coordinator.phase_for_model("prepared-activity"),
+            Some(ArtifactInstallPhase::Finalizing)
+        );
+        assert_eq!(
+            coordinator.download_activity_for_model("prepared-activity"),
+            None
+        );
+    }
+
+    #[test]
+    fn stalled_transfer_projects_waiting_then_verifying_after_preparation() {
+        let mut app = test_app();
+        let model_id = "whisper_cpp_tiny_en".to_owned();
+        app.artifact_installations
+            .insert(model_id.clone(), (882, InstallCancellation::default()));
+        app.model_downloads.insert(
+            model_id.clone(),
+            ModelInstallStatus::Downloading {
+                downloaded_bytes: 42,
+                total_bytes: Some(100),
+                bytes_per_second: None,
+            },
+        );
+        app.artifact_installations.update_download_activity(
+            &model_id,
+            882,
+            DownloadActivity::Stalled,
+        );
+        app.update_model_download_progress_projection(&model_id);
+        assert_eq!(
+            app.model_management_catalog()
+                .iter()
+                .find(|model| model.id == model_id)
+                .map(|model| model.download_state),
+            Some(ModelDownloadState::Stalled)
+        );
+
+        assert!(app.artifact_installations.mark_prepared(
+            &model_id,
+            882,
+            coordinator_prepared(&model_id),
+        ));
+        app.model_downloads
+            .insert(model_id.clone(), ModelInstallStatus::InstallingRuntime);
+        app.update_model_download_progress_projection(&model_id);
+        assert_eq!(
+            app.model_management_catalog()
+                .iter()
+                .find(|model| model.id == model_id)
+                .map(|model| model.download_state),
+            Some(ModelDownloadState::WaitingForVerification)
+        );
+
+        assert!(app.artifact_installations.take_next_finalizer().is_some());
+        app.update_model_download_progress_projection(&model_id);
+        assert_eq!(
+            app.model_management_catalog()
+                .iter()
+                .find(|model| model.id == model_id)
+                .map(|model| model.download_state),
+            Some(ModelDownloadState::Verifying)
+        );
+    }
+
+    #[test]
+    fn exhausted_retry_event_uses_retained_bytes_and_typed_failure_diagnostics() {
+        let mut app = test_app();
+        let run = DownloadRunId::new("retry-failure-test").unwrap();
+        let diagnostics_dir = std::env::temp_dir().join(format!(
+            "scribe-retry-failure-diagnostics-{}-{}",
+            std::process::id(),
+            NEXT_TEST_SESSION.fetch_add(1, Ordering::Relaxed)
+        ));
+        let diagnostics = DownloadDiagnostics::start(&diagnostics_dir, &run);
+        app.download_diagnostics = Some(diagnostics.clone());
+        app.download_diagnostic_run = Some(run);
+        let model_id = "whisper_cpp_tiny_en".to_owned();
+        app.artifact_installations
+            .insert(model_id.clone(), (881, InstallCancellation::default()));
+        app.model_downloads.insert(
+            model_id.clone(),
+            ModelInstallStatus::Downloading {
+                downloaded_bytes: 7,
+                total_bytes: Some(100),
+                bytes_per_second: None,
+            },
+        );
+        let failure = InstallJobFailure::from(InstallError::DownloadFailed {
+            category: DownloadFaultKind::ConnectionReset,
+            retry_count: 3,
+            retained_bytes: 42,
+            partial_path: PathBuf::from("C:\\Users\\private\\model.gguf.partial"),
+        });
+        send_verified_install_preparation(&app.tx, 881, model_id.clone(), Err(failure));
+        app.poll_events();
+
+        assert!(matches!(
+            app.model_downloads.get(&model_id),
+            Some(ModelInstallStatus::Error(message))
+                if message.contains("download failed after 3 ranged retries")
+                    && !message.contains("C:\\Users\\private")
+        ));
+        let snapshot = diagnostics.snapshot();
+        let failure_event = snapshot
+            .iter()
+            .find(|event| format!("{event:?}").contains("Failure"))
+            .expect("typed download failure diagnostic");
+        let debug = format!("{failure_event:?}");
+        assert!(debug.contains("completed_bytes: 42"));
+        assert!(debug.contains("retry_number: Some(3)"));
+        assert!(debug.contains("Connectivity"));
+        assert!(!debug.contains("C:\\Users\\private"));
+        drop(app);
+        drop(diagnostics);
+        let _ = fs::remove_dir_all(diagnostics_dir);
+    }
+
+    #[test]
     fn artifact_coordinator_admits_three_transfers_and_queues_the_fourth_fifo() {
         let mut coordinator = ArtifactInstallCoordinator::default();
         for index in 0..4 {
@@ -25052,6 +25275,7 @@ mod layout_tests {
                 model_id: "first".to_owned(),
                 message: "retryable failure".to_owned(),
                 recovery_required: false,
+                download_failure: None,
             })
             .unwrap();
 
@@ -25076,6 +25300,7 @@ mod layout_tests {
                 model_id: "recovery".to_owned(),
                 message: "ambiguous activation".to_owned(),
                 recovery_required: true,
+                download_failure: None,
             })
             .unwrap();
         app.poll_events();
@@ -25088,6 +25313,7 @@ mod layout_tests {
                 model_id: "sibling".to_owned(),
                 message: "installation cancelled".to_owned(),
                 recovery_required: false,
+                download_failure: None,
             })
             .unwrap();
         app.poll_events();
@@ -25157,6 +25383,7 @@ mod layout_tests {
                     model_id: "whisper_cpp_base_en".to_owned(),
                     message: message.to_owned(),
                     recovery_required: false,
+                    download_failure: None,
                 })
                 .unwrap();
             app.poll_events();

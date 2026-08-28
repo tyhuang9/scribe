@@ -5905,20 +5905,11 @@ mod tests {
             ScreenAction::CancelRemoteCatalogInstall("managed-compact-english".into())
         );
         assert!(!matches!(action, ScreenAction::SelectModel(_)));
-        assert_eq!(
-            click_named_control(
-                &ctx,
-                &mut data,
-                &mut page,
-                1180.0,
-                815.0,
-                "Discard partial for Compact English (compact-english-q5.gguf)",
-            ),
-            ScreenAction::DiscardRemoteCatalogPartial {
-                remote_model_id: "trusted-speech/compact-english".into(),
-                variant_id: "compact-english-q5".into(),
-            },
-            "remote X must request cleanup for the exact trusted artifact",
+        assert!(
+            !node_names(&output)
+                .iter()
+                .any(|name| name == "Discard partial for Compact English (compact-english-q5.gguf)"),
+            "active remote transfers only expose Discard when their typed actions include DiscardPartial"
         );
     }
 

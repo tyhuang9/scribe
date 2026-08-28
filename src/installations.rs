@@ -2113,6 +2113,13 @@ const DOWNLOAD_READER_ABORTED: u8 = 2;
 fn spawn_download_reader(
     mut reader: Box<dyn Read + Send + Sync>,
 ) -> Result<PendingDownloadReader, InstallError> {
+    // Production invariant: every reader passed here comes from
+    // `UreqHttpSource`, which applies `DownloadRetryPolicy::read_poll_interval`
+    // as the socket's per-read timeout. Once the receiver is dropped, a worker
+    // therefore reaches its next send and exits after at most one bounded read
+    // (plus normal scheduler/OS timer latency). Private test `HttpSource`
+    // implementations are not production readers and may choose other blocking
+    // behavior for deterministic fault injection.
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     let state = Arc::new(AtomicU8::new(DOWNLOAD_READER_WAITING));
     let reader_state = Arc::clone(&state);
@@ -3987,8 +3994,14 @@ impl UreqHttpSource {
         policy: RedirectPolicy,
         read_poll_interval: Duration,
     ) -> Result<HttpResponse, HttpSourceError> {
+        // TCP connection attempts are bounded independently of response-body
+        // reads and happen before `spawn_download_reader`. ureq 2.x performs
+        // synchronous DNS resolution before applying this connect deadline, so
+        // the 10-second limit must not be described as a DNS timeout.
         let agent = ureq::AgentBuilder::new()
             .timeout_connect(Duration::from_secs(10))
+            // This setting is copied onto the response stream by
+            // `Response::into_reader`, bounding every production body read.
             .timeout_read(read_poll_interval)
             .redirects(0)
             .https_only(!cfg!(test))
@@ -4387,19 +4400,40 @@ mod tests {
             .iter()
             .filter_map(|update| update.download_activity)
             .collect::<Vec<_>>();
-        assert_eq!(activities[0], DownloadActivity::Active);
-        assert_eq!(activities[1], DownloadActivity::Stalled);
-        assert!(matches!(
-            activities[2],
-            DownloadActivity::RetryScheduled {
-                attempt: 1,
-                max_attempts: 3,
-                cause: DownloadFaultKind::Stalled,
-                ..
-            }
-        ));
-        assert_eq!(activities[3], DownloadActivity::Active);
-        assert_eq!(activities.len(), 4);
+        assert_eq!(activities.first(), Some(&DownloadActivity::Active));
+        assert!(
+            activities.windows(2).all(|pair| pair[0] != pair[1]),
+            "activity transitions must not contain adjacent duplicates: {activities:?}"
+        );
+        let stalled_index = activities
+            .iter()
+            .position(|activity| *activity == DownloadActivity::Stalled)
+            .expect("the inactive response must transition to Stalled");
+        let retry_indexes = activities
+            .iter()
+            .enumerate()
+            .filter_map(|(index, activity)| {
+                matches!(
+                    activity,
+                    DownloadActivity::RetryScheduled {
+                        attempt: 1,
+                        max_attempts: 3,
+                        cause: DownloadFaultKind::Stalled,
+                        ..
+                    }
+                )
+                .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(retry_indexes.len(), 1, "unexpected retries: {activities:?}");
+        let retry_index = retry_indexes[0];
+        assert!(stalled_index < retry_index);
+        assert_eq!(
+            activities.get(retry_index + 1),
+            Some(&DownloadActivity::Active),
+            "a reconnect must explicitly reset activity: {activities:?}"
+        );
+        assert_eq!(activities.last(), Some(&DownloadActivity::Active));
         assert_eq!(
             source.requested_ranges.lock().unwrap().as_slice(),
             &[None, Some(prefix as u64)]
@@ -5416,6 +5450,75 @@ mod tests {
         assert!(error.to_string().contains("valid Content-Range"));
         assert_eq!(fs::read(partial).unwrap(), &bytes[..offset]);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn real_ureq_body_reader_times_out_and_detached_worker_exits() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (connection_closed_tx, connection_closed_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(4)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let count = stream.read(&mut buffer).unwrap();
+                if count == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..count]);
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            stream.flush().unwrap();
+
+            // Withhold the declared body and observe when the detached client
+            // reader is dropped after its receiver disappears.
+            let waiting_since = Instant::now();
+            let closed = stream.read(&mut [0_u8; 1]).map_err(|error| error.kind());
+            connection_closed_tx
+                .send((closed, waiting_since.elapsed()))
+                .unwrap();
+        });
+        let url = format!("http://{address}/artifact");
+        let policy = DownloadRetryPolicy::STANDARD;
+        let response = UreqHttpSource
+            .get(&url, None, policy.read_poll_interval)
+            .unwrap();
+        let pending_reader = spawn_download_reader(response.reader).unwrap();
+        let events = pending_reader.start();
+        let read_started_at = Instant::now();
+
+        let read_error = events
+            .recv_timeout(Duration::from_secs(3))
+            .expect("production reader must report its per-read timeout")
+            .unwrap_err();
+        assert!(matches!(
+            read_error.kind(),
+            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+        ));
+        assert!(read_started_at.elapsed() < Duration::from_secs(3));
+
+        // The worker may already be inside one more read. Dropping its bounded
+        // channel makes the next send fail, which drops the real ureq reader.
+        drop(events);
+        let (server_read, detached_for) = connection_closed_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("detached production reader must close its connection");
+        assert!(
+            matches!(server_read, Ok(0))
+                || matches!(
+                    server_read,
+                    Err(io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted)
+                ),
+            "server did not observe the detached reader closing: {server_read:?}"
+        );
+        assert!(detached_for < Duration::from_secs(3));
+        server.join().unwrap();
     }
 
     #[test]

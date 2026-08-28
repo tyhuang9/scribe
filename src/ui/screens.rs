@@ -2652,11 +2652,11 @@ fn model_lifecycle_presentation<'a>(
                 ),
                 enabled: remote.is_some_and(|action| action.enabled),
                 disabled_reason: remote.and_then(|action| action.disabled_reason.as_deref()),
-                visible_status: if cancel_waiting {
-                    variant.status_label.clone()
-                } else {
-                    None
-                },
+                visible_status: remote_download_activity_visible_status(variant).or_else(|| {
+                    cancel_waiting
+                        .then(|| variant.status_label.clone())
+                        .flatten()
+                }),
                 compact_size: (label == "Install")
                     .then(|| format_compact_artifact_size(variant.size_bytes)),
                 tone: match label {
@@ -2691,13 +2691,7 @@ fn model_lifecycle_controls<'a>(
         {
             Some(ScreenAction::DiscardModelPartial(model.id.clone()))
         }
-        ModelCard::Remote(entry, variant)
-            if remote_has_download_progress(variant.status_label.as_deref())
-                || matches!(
-                    variant.status_label.as_deref(),
-                    Some("Partial download retained") | Some("Cancelled") | Some("Failed")
-                ) =>
-        {
+        ModelCard::Remote(_, variant) => {
             variant
                 .actions
                 .iter()
@@ -2710,14 +2704,6 @@ fn model_lifecycle_controls<'a>(
                         variant_id: variant_id.clone(),
                     }),
                     _ => None,
-                })
-                .or_else(|| {
-                    (variant.status_label.as_deref() == Some("Downloading")).then(|| {
-                        ScreenAction::DiscardRemoteCatalogPartial {
-                            remote_model_id: entry.id.clone(),
-                            variant_id: variant.id.clone(),
-                        }
-                    })
                 })
         }
         _ => None,
@@ -3971,9 +3957,15 @@ fn render_unified_model_card(
             };
             if let Some(status) = primary.visible_status.as_deref() {
                 let response = ui.label(RichText::new(status).small().color(colors.muted_text));
-                ui.ctx().accesskit_node_builder(response.id, |builder| {
-                    builder.set_name(status);
-                });
+                if model_download_semantic_status(card).is_some() {
+                    let accessible_status = format!("{accessible_card_name}: {status}");
+                    ui.ctx().accesskit_node_builder(response.id, |builder| {
+                        builder.set_role(egui::accesskit::Role::Status);
+                        builder.set_name(accessible_status);
+                        builder.set_live(egui::accesskit::Live::Polite);
+                        builder.set_live_atomic();
+                    });
+                }
                 ui.add_space(6.0);
             }
             if (matches!(
@@ -3999,7 +3991,17 @@ fn render_unified_model_card(
                 {
                     *action = discard.clone();
                 }
-                return download.response;
+                let mut response = download.response;
+                if let (Some(error_name), Some(error_message)) = (
+                    lifecycle.error_accessible_name.as_deref(),
+                    lifecycle.error_message,
+                ) {
+                    let alert =
+                        model_download_error_affordance(ui, card.key(), error_name, error_message);
+                    *focus_within |= alert.has_focus();
+                    response = response.union(alert);
+                }
+                return response;
             }
             let label = if primary.tone == ModelLifecycleTone::DestructiveOutline {
                 primary.label.clone()
@@ -5542,7 +5544,8 @@ fn model_download_progress_presentation(
             (model.downloaded_bytes, model.total_bytes)
         }
         ModelCard::Remote(_, variant)
-            if remote_has_download_progress(variant.status_label.as_deref()) =>
+            if remote_has_download_progress(variant.status_label.as_deref())
+                || remote_has_retained_partial(variant) =>
         {
             (variant.downloaded_bytes?, variant.total_bytes)
         }
@@ -5551,6 +5554,7 @@ fn model_download_progress_presentation(
     let total_bytes = total_bytes.filter(|total| *total > 0);
     let fraction =
         total_bytes.map(|total| (downloaded_bytes as f64 / total as f64).clamp(0.0, 1.0) as f32);
+    let activity_description = model_download_progress_activity_description(card);
     let (display_text, accessible_text) = match total_bytes {
         Some(total) => {
             let percent = fraction.expect("known totals always have a fraction") * 100.0;
@@ -5560,10 +5564,21 @@ fn model_download_progress_presentation(
                     format_download_bytes(downloaded_bytes),
                     format_download_bytes(total)
                 ),
-                format!(
-                    "Downloading {} of {}, {percent:.0}% complete",
-                    format_download_bytes(downloaded_bytes),
-                    format_download_bytes(total)
+                activity_description.as_ref().map_or_else(
+                    || {
+                        format!(
+                            "Downloading {} of {}, {percent:.0}% complete",
+                            format_download_bytes(downloaded_bytes),
+                            format_download_bytes(total)
+                        )
+                    },
+                    |description| {
+                        format!(
+                            "Retained {} of {}, {percent:.0}% complete; {description}",
+                            format_download_bytes(downloaded_bytes),
+                            format_download_bytes(total)
+                        )
+                    },
                 ),
             )
         }
@@ -5572,9 +5587,19 @@ fn model_download_progress_presentation(
                 "{} / Total unknown",
                 format_download_bytes(downloaded_bytes)
             ),
-            format!(
-                "Downloading {}; total download size unknown",
-                format_download_bytes(downloaded_bytes)
+            activity_description.as_ref().map_or_else(
+                || {
+                    format!(
+                        "Downloading {}; total download size unknown",
+                        format_download_bytes(downloaded_bytes)
+                    )
+                },
+                |description| {
+                    format!(
+                        "Retained {}; total download size unknown; {description}",
+                        format_download_bytes(downloaded_bytes)
+                    )
+                },
             ),
         ),
     };
@@ -5601,11 +5626,57 @@ fn model_download_activity_visible_status(state: ModelDownloadState) -> Option<S
     }
 }
 
+fn model_download_semantic_status(card: ModelCard<'_>) -> Option<String> {
+    match card {
+        ModelCard::Local(model) => model_download_activity_visible_status(model.download_state),
+        ModelCard::Remote(_, variant) => remote_download_activity_visible_status(variant),
+    }
+}
+
+fn remote_download_activity_visible_status(variant: &RemoteCatalogVariantView) -> Option<String> {
+    let status = variant.status_label.as_deref()?;
+    (status == "Waiting for connection…"
+        || status.starts_with("Connection interrupted — retrying "))
+    .then(|| status.to_owned())
+}
+
+fn model_download_progress_activity_description(card: ModelCard<'_>) -> Option<String> {
+    match card {
+        ModelCard::Local(model) => match model.download_state {
+            ModelDownloadState::Stalled => Some("transfer stalled".to_owned()),
+            ModelDownloadState::Retrying {
+                attempt,
+                max_attempts,
+            } => Some(format!("retrying attempt {attempt} of {max_attempts}")),
+            _ => None,
+        },
+        ModelCard::Remote(_, variant) => {
+            let status = remote_download_activity_visible_status(variant)?;
+            if status == "Waiting for connection…" {
+                Some("transfer stalled".to_owned())
+            } else {
+                status
+                    .strip_prefix("Connection interrupted — ")
+                    .map(|retry| {
+                        format!("retrying attempt {}", retry.trim_start_matches("retrying "))
+                    })
+            }
+        }
+    }
+}
+
 fn remote_has_download_progress(status: Option<&str>) -> bool {
     matches!(
         status,
         Some("Downloading") | Some("Waiting for connection…")
     ) || status.is_some_and(|status| status.starts_with("Connection interrupted — retrying "))
+}
+
+fn remote_has_retained_partial(variant: &RemoteCatalogVariantView) -> bool {
+    variant
+        .actions
+        .iter()
+        .any(|action| matches!(action.kind, RemoteCatalogActionKind::DiscardPartial { .. }))
 }
 
 /// Consume Tab before egui's document-wide navigation sees it, then route it
@@ -9593,10 +9664,124 @@ mod tests {
         for name in [
             "Resume Failed retained download download",
             "Discard partial for Failed retained download",
+            "Show download error for Failed retained download",
         ] {
             let bounds = named_role_bounds(&failed_output, name, egui::accesskit::Role::Button);
             assert!(bounds.width() >= 44.0 && bounds.height() >= 44.0, "{name}");
         }
+        let warning = failed_output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .and_then(|update| {
+                update.nodes.iter().find_map(|(_, node)| {
+                    (node.role() == egui::accesskit::Role::Button
+                        && node.name() == Some("Show download error for Failed retained download"))
+                    .then_some(node)
+                })
+            })
+            .expect("failed retained warning");
+        assert_eq!(
+            warning.description(),
+            Some("Connection retries were exhausted.")
+        );
+    }
+
+    #[test]
+    fn stalled_and_retrying_cards_expose_one_polite_atomic_semantic_status_per_transition() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        crate::ui::controls::configure_accessible_style(&ctx);
+        let stalled = ModelViewModel {
+            id: "semantic-status".into(),
+            display_name: "Semantic status model".into(),
+            download_state: ModelDownloadState::Stalled,
+            cancel_supported: true,
+            downloaded_bytes: 42,
+            total_bytes: Some(100),
+            ..Default::default()
+        };
+        let initial = render_model_card_with_context(&ctx, &stalled, Vec::new()).0;
+        let stalled_name = "Semantic status model: Waiting for connection…";
+        let initial_statuses = initial
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .expect("initial semantic status update")
+            .nodes
+            .iter()
+            .filter(|(_, node)| {
+                node.role() == egui::accesskit::Role::Status && node.name() == Some(stalled_name)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(initial_statuses.len(), 1);
+        assert_eq!(
+            initial_statuses[0].1.live(),
+            Some(egui::accesskit::Live::Polite)
+        );
+        assert!(initial_statuses[0].1.is_live_atomic());
+
+        let byte_tick = ModelViewModel {
+            downloaded_bytes: 43,
+            ..stalled.clone()
+        };
+        let byte_output = render_model_card_with_context(&ctx, &byte_tick, Vec::new()).0;
+        let byte_statuses = byte_output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .expect("byte-only accessibility update")
+            .nodes
+            .iter()
+            .filter(|(_, node)| node.role() == egui::accesskit::Role::Status)
+            .collect::<Vec<_>>();
+        assert_eq!(byte_statuses.len(), 1);
+        // AccessKit live regions announce changed text. The byte-only frame
+        // preserves the exact live-region identity and name, so it cannot
+        // enqueue another status announcement.
+        assert_eq!(byte_statuses[0].1.name(), Some(stalled_name));
+        assert_eq!(
+            byte_statuses[0].1.live(),
+            Some(egui::accesskit::Live::Polite)
+        );
+        assert!(byte_statuses[0].1.is_live_atomic());
+
+        let retrying = ModelViewModel {
+            download_state: ModelDownloadState::Retrying {
+                attempt: 2,
+                max_attempts: 3,
+            },
+            ..byte_tick
+        };
+        let transition = render_model_card_with_context(&ctx, &retrying, Vec::new()).0;
+        let retry_name = "Semantic status model: Connection interrupted — retrying 2 of 3";
+        let retry_statuses = transition
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .expect("retry semantic status update")
+            .nodes
+            .iter()
+            .filter(|(_, node)| {
+                node.role() == egui::accesskit::Role::Status && node.name() == Some(retry_name)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(retry_statuses.len(), 1);
+        let meter = transition
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .and_then(|update| {
+                update.nodes.iter().find_map(|(_, node)| {
+                    (node.role() == egui::accesskit::Role::Meter).then_some(node)
+                })
+            })
+            .expect("retry meter");
+        assert!(
+            meter
+                .name()
+                .is_some_and(|name| name.contains("retrying attempt 2 of 3"))
+        );
     }
 
     #[test]
@@ -9663,6 +9848,117 @@ mod tests {
         assert!(
             model_download_progress_presentation(ModelCard::Remote(&entry, &variant)).is_some()
         );
+        let remote_output = render_remote_model_card_at(&entry, &variant, 375.0, 680.0);
+        let remote_name = "Remote retry (): Connection interrupted — retrying 1 of 3";
+        let remote_statuses = remote_output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .expect("remote retry accessibility update")
+            .nodes
+            .iter()
+            .filter(|(_, node)| {
+                node.role() == egui::accesskit::Role::Status && node.name() == Some(remote_name)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(remote_statuses.len(), 1);
+        assert_eq!(
+            remote_statuses[0].1.live(),
+            Some(egui::accesskit::Live::Polite)
+        );
+        assert!(remote_statuses[0].1.is_live_atomic());
+        let pause = named_role_bounds(
+            &remote_output,
+            "Pause Remote retry ()",
+            egui::accesskit::Role::Button,
+        );
+        assert!(pause.width() >= 44.0 && pause.x1 <= 375.0);
+    }
+
+    #[test]
+    fn remote_retained_states_keep_resume_discard_and_error_controls_at_375px() {
+        let entry = RemoteCatalogEntryView {
+            id: "remote-retained".into(),
+            display_name: "Remote retained".into(),
+            ..Default::default()
+        };
+        let retained_action = |label: &str| RemoteCatalogActionView {
+            label: label.into(),
+            kind: RemoteCatalogActionKind::DiscardPartial {
+                remote_model_id: entry.id.clone(),
+                variant_id: "remote-q5".into(),
+            },
+            enabled: true,
+            disabled_reason: None,
+        };
+        for (status_label, error_message) in [
+            ("Paused", None),
+            (
+                "Error: retries exhausted",
+                Some("Connection retries were exhausted."),
+            ),
+        ] {
+            let variant = RemoteCatalogVariantView {
+                id: "remote-q5".into(),
+                filename: "remote-q5.gguf".into(),
+                status_label: Some(status_label.into()),
+                downloaded_bytes: Some(42),
+                total_bytes: Some(100),
+                error_message: error_message.map(str::to_owned),
+                actions: vec![
+                    RemoteCatalogActionView {
+                        label: "Resume".into(),
+                        kind: RemoteCatalogActionKind::Install {
+                            remote_model_id: entry.id.clone(),
+                            variant_id: "remote-q5".into(),
+                        },
+                        enabled: true,
+                        disabled_reason: None,
+                    },
+                    retained_action("Discard partial"),
+                ],
+                ..Default::default()
+            };
+            let output = render_remote_model_card_at(&entry, &variant, 375.0, 680.0);
+            let remote_name = "Remote retained (remote-q5.gguf)";
+            for name in [
+                format!("Resume {remote_name} download"),
+                format!("Discard partial for {remote_name}"),
+            ] {
+                let bounds = named_role_bounds(&output, &name, egui::accesskit::Role::Button);
+                assert!(bounds.width() >= 44.0 && bounds.height() >= 44.0, "{name}");
+                assert!(bounds.x0 >= 0.0 && bounds.x1 <= 375.0, "{name}");
+            }
+            if let Some(error) = error_message {
+                let error_name = format!("Show download error for {remote_name}");
+                let warning = output
+                    .platform_output
+                    .accesskit_update
+                    .as_ref()
+                    .and_then(|update| {
+                        update.nodes.iter().find_map(|(_, node)| {
+                            (node.role() == egui::accesskit::Role::Button
+                                && node.name() == Some(error_name.as_str()))
+                            .then_some(node)
+                        })
+                    })
+                    .expect("remote failed warning");
+                let bounds = warning.bounds().expect("remote failed warning bounds");
+                assert!(bounds.width() >= 44.0 && bounds.height() >= 44.0);
+                assert_eq!(warning.description(), Some(error));
+            } else {
+                assert!(
+                    !output
+                        .platform_output
+                        .accesskit_update
+                        .as_ref()
+                        .is_some_and(|update| update.nodes.iter().any(|(_, node)| {
+                            node.name()
+                                .is_some_and(|name| name.starts_with("Show download error for"))
+                        }))
+                );
+            }
+        }
     }
 
     #[test]
@@ -14572,6 +14868,38 @@ mod tests {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     let _ =
                         render_unified_model_card(ui, ModelCard::Local(model), false, true, false);
+                });
+            },
+        )
+    }
+
+    fn render_remote_model_card_at(
+        entry: &RemoteCatalogEntryView,
+        variant: &RemoteCatalogVariantView,
+        width: f32,
+        height: f32,
+    ) -> egui::FullOutput {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        crate::ui::controls::configure_accessible_style(&ctx);
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(width, height),
+                )),
+                focused: true,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let _ = render_unified_model_card(
+                        ui,
+                        ModelCard::Remote(entry, variant),
+                        false,
+                        true,
+                        false,
+                    );
                 });
             },
         )
