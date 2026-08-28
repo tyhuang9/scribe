@@ -24,8 +24,7 @@ egui UI / tray / global hotkey
             |
             +--> worker-local RuntimeRouter
             |       +--> transcribe-cpp GGUF
-            |       +--> legacy GGML compatibility
-            |       +--> sherpa-onnx models
+            |       +--> native Sherpa ONNX receipt-backed bundles
             |
  separate child: Scribe --scribe-vad-worker
         (VAD only; never an STT runtime)
@@ -34,11 +33,11 @@ egui UI / tray / global hotkey
  final transcript -> overlay, clipboard, optional Windows insertion, history
 ```
 
-The UI does not select or invoke a runtime directly. The application-facing `TranscriptionService` owns only the runtime-neutral dispatch boundary and worker supervisor in the desktop process. Native GGUF/GGML model objects, transcribe-cpp sessions, sherpa-onnx recognizers, and native FFI handles are constructed only by the persistent hidden `--scribe-inference-worker` child. The desktop process never constructs those native objects.
+The UI does not select or invoke a runtime directly. The application-facing `TranscriptionService` owns only the runtime-neutral dispatch boundary and worker supervisor in the desktop process. Native GGUF model objects, transcribe-cpp sessions, Sherpa ONNX recognizers, and native FFI handles are constructed only by the persistent hidden `--scribe-inference-worker` child. The desktop process never constructs those native objects.
 
-The inference child is the single persistent STT process: it directly owns the worker-local router and all three native runtime families (GGUF, legacy GGML, and sherpa-onnx). VAD is intentionally a separate worker instance launched with `--scribe-vad-worker`; it has no STT commands. The two workers communicate only through private anonymous stdin/stdout pipes using the SCIF v3 framed protocol. Worker stdout is protocol-only and diagnostics go to stderr. There is no localhost listener, TCP/HTTP inference transport, or nested ONNX worker.
+The inference child is the single persistent STT process: it directly owns the worker-local router and both native runtime families (GGUF and receipt-backed Sherpa ONNX). VAD is intentionally a separate worker instance launched with `--scribe-vad-worker`; it has no STT commands. The workers communicate only through private anonymous stdin/stdout pipes using the SCIF v3 framed protocol. Worker stdout is protocol-only and diagnostics go to stderr. There is no localhost listener, TCP/HTTP inference transport, nested ONNX worker, Python runtime, dynamic runtime package, GGML/DLL path, or CLI fallback.
 
-Normal GGUF remains local, native, CPU-only in the currently verified package, and Python-free, but it is now process-isolated rather than in-process. The exceptional verified legacy CLI remains an external fallback only after native bootstrap failure and CLI hash verification. Installation smoke runs in a fresh disposable worker process and is not the normal dictation worker.
+Normal GGUF remains local, native, CPU-only, and Python-free, but it is process-isolated rather than in-process. Receipt-backed ONNX inference uses the same private persistent STT child. Installation smoke runs in a fresh disposable worker process and is not the normal dictation worker.
 
 ## Data, output, and privacy boundaries
 
@@ -49,7 +48,7 @@ Normal GGUF remains local, native, CPU-only in the currently verified package, a
 
 ## Models and installation
 
-The normal **Models** experience exposes five checked-in Experimental entries: four transcribe.cpp artifacts and the receipt-backed `moonshine-tiny-en-int8-onnx` bundle. Managed downloads use pinned source facts, resumable transfers, exact size and SHA-256 checks, a native subprocess smoke test, and atomic activation. Moonshine is CPU-only and final-text-only. Local GGUF imports remain in place: Scribe fingerprints and validates them without copying, uploading, moving, or deleting the source file.
+The normal **Models** experience exposes five checked-in Experimental entries: `whisper_cpp_tiny_en`, `whisper_cpp_base_en`, `whisper_cpp_small_en`, `whisper_cpp_medium_en`, and the receipt-backed `moonshine-tiny-en-int8-onnx` bundle. The four Whisper entries use static pinned GGUF artifacts through `transcribe-cpp`; Moonshine uses native Sherpa ONNX. Managed downloads use pinned source facts, resumable transfers, exact size and SHA-256 checks, a native subprocess smoke test, and atomic activation. Moonshine is CPU-only and final-text-only. Local GGUF imports remain in place: Scribe fingerprints and validates them without copying, uploading, moving, or deleting the source file. Legacy user files are preserved but are no longer recognized or executed by a production inference route.
 
 All normal catalog models are currently Experimental. The exact catalog, runtime details, compatibility boundaries, and known legacy migration paths are maintained in the [embedded STT and models record](EMBEDDED_STT_AND_MODELS.md).
 

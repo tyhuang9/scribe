@@ -20,13 +20,12 @@ use crate::transcription::ModelId;
 #[path = "settings/mod.rs"]
 pub mod settings;
 
-#[allow(unused_imports)]
 pub use settings::{
-    AppConfig, CURRENT_SCHEMA_VERSION, DEFAULT_INPUT_THRESHOLD_DBFS, DeveloperSettings,
-    GeneralSettings, HistoryMode, HistorySettings, OutputSettings, OverlayMode, OverlayPosition,
-    OverlaySettings, PerformanceSettings, RecordingSettings, SettingsStore, SpeechDetectionMode,
-    StreamingMode, StreamingSettings,
+    AppConfig, CURRENT_SCHEMA_VERSION, HistoryMode, OverlayMode, OverlayPosition, SettingsStore,
+    SpeechDetectionMode, StreamingMode,
 };
+#[cfg(test)]
+pub use settings::{GeneralSettings, RecordingSettings};
 
 pub const MAX_RECORDING_SECONDS: u32 = 600;
 pub(crate) const RECORDING_CAPTURE_SAFETY_ALLOWANCE_SECONDS: u32 = 2;

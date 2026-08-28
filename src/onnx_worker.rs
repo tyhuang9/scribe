@@ -35,7 +35,7 @@ use crate::runtime_router::{
 use crate::silero_vad_native::{SileroVadModel, VadThreshold, WINDOW_SAMPLES};
 use crate::transcription::{
     AccelerationPreference, ComputeDevice, ModelId, ResolvedAcceleration, RuntimeCapabilities,
-    SpeechStream, StreamUpdate, Transcript, TranscriptSegment, TranscriptionOptions,
+    Transcript, TranscriptSegment, TranscriptionOptions,
 };
 
 #[cfg(unix)]
@@ -1172,8 +1172,8 @@ impl WorkerLauncher for OsWorkerLauncher {
             stdout: Box::new(stdout),
             process: Arc::new(OsWorkerProcess {
                 child: Mutex::new(child),
-                process_guard,
-                parent_liveness,
+                _process_guard: process_guard,
+                _parent_liveness: parent_liveness,
             }),
         })
     }
@@ -1488,10 +1488,8 @@ fn bind_worker_process_tree(child: &Child) -> Result<ProcessTreeGuard> {
 
 struct OsWorkerProcess {
     child: Mutex<Child>,
-    #[allow(dead_code)]
-    process_guard: ProcessTreeGuard,
-    #[allow(dead_code)]
-    parent_liveness: ParentLivenessChannel,
+    _process_guard: ProcessTreeGuard,
+    _parent_liveness: ParentLivenessChannel,
 }
 
 impl WorkerProcess for OsWorkerProcess {
@@ -1505,7 +1503,7 @@ impl WorkerProcess for OsWorkerProcess {
     }
 
     fn request_cooperative_cancel(&self) -> Result<bool> {
-        self.parent_liveness.request_cancel()
+        self._parent_liveness.request_cancel()
     }
 
     fn terminate(&self) -> Result<()> {
@@ -1604,6 +1602,7 @@ impl ProcessWorkerSupervisor {
         Self::with_launcher_and_deadlines(launcher, SupervisorDeadlines::default())
     }
 
+    #[cfg(test)]
     fn with_launcher_and_deadlines(
         launcher: Arc<dyn WorkerLauncher>,
         deadlines: SupervisorDeadlines,
@@ -1630,6 +1629,7 @@ impl ProcessWorkerSupervisor {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn start_stream(&self, session_id: u64, request_id: u64) -> Result<()> {
         let generation = self.ensure_generation()?;
         if self
@@ -1675,6 +1675,7 @@ impl ProcessWorkerSupervisor {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn audio_chunk(
         &self,
         session_id: u64,
@@ -1721,6 +1722,7 @@ impl ProcessWorkerSupervisor {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn end_stream(&self, session_id: u64, request_id: u64) -> Result<String> {
         let generation = self.require_stream(session_id)?.generation;
         let frame = control_frame(session_id, request_id, &Control::EndStream)?;
@@ -1743,6 +1745,7 @@ impl ProcessWorkerSupervisor {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn cancel_stream(&self, session_id: u64, request_id: u64) -> Result<()> {
         self.cancel_stream_with_timeout(session_id, request_id, self.inner.deadlines.cancel)
     }
@@ -2610,29 +2613,12 @@ pub(crate) struct SileroVadDecision {
 /// Dedicated VAD-only supervisor. Each instance owns a separate hidden worker
 /// process and cannot submit transcription commands through this API.
 #[derive(Clone)]
-#[allow(dead_code)]
 pub(crate) struct SileroVadWorkerSupervisor {
     transport: ProcessWorkerSupervisor,
     deadlines: VadDeadlines,
 }
 
-#[allow(dead_code)]
 impl SileroVadWorkerSupervisor {
-    pub(crate) fn spawn() -> Result<Self> {
-        let deadlines = VadDeadlines::default();
-        let transport_deadlines = SupervisorDeadlines {
-            hello: deadlines.acquisition,
-            ..SupervisorDeadlines::default()
-        };
-        Ok(Self {
-            transport: ProcessWorkerSupervisor::with_launcher_and_deadlines(
-                Arc::new(OsWorkerLauncher::vad()),
-                transport_deadlines,
-            )?,
-            deadlines,
-        })
-    }
-
     /// Starts a dedicated worker and establishes a ready VAD session within one
     /// aggregate monotonic budget. The returned request id is the first id that
     /// may be used for a window; ids before it belong to acquisition controls.
@@ -2754,6 +2740,7 @@ impl SileroVadWorkerSupervisor {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn load(&self, session_id: u64, request_id: u64, num_threads: u16) -> Result<bool> {
         let generation = self.transport.ensure_generation()?;
         self.load_on_generation(
@@ -2829,6 +2816,7 @@ impl SileroVadWorkerSupervisor {
         Ok(false)
     }
 
+    #[cfg(test)]
     pub(crate) fn start_session(
         &self,
         session_id: u64,
@@ -2998,6 +2986,7 @@ impl SileroVadWorkerSupervisor {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn reset(&self, session_id: u64, request_id: u64) -> Result<()> {
         let stream = self.transport.require_stream(session_id)?;
         let result = self.transport.round_trip_on_generation(
@@ -3060,6 +3049,7 @@ impl SileroVadWorkerSupervisor {
         self.transport.abandon_stream(session_id);
     }
 
+    #[cfg(test)]
     pub(crate) fn health(&self, session_id: u64, request_id: u64) -> Result<()> {
         let generation = self.transport.ensure_generation()?;
         self.health_on_generation(
@@ -3495,30 +3485,6 @@ impl InferenceWorkerSupervisor {
         self.transport.health(id, id).map_err(worker_unavailable)
     }
 
-    pub(crate) fn start_stream(
-        &self,
-        artifact: RuntimeArtifact,
-        preference: AccelerationPreference,
-        options: TranscriptionOptions,
-    ) -> Result<Box<dyn SpeechStream>, RuntimeError> {
-        if options != TranscriptionOptions::default() {
-            return Err(RuntimeError::OnnxUnavailable(
-                "native ONNX streaming currently accepts only default options".to_owned(),
-            ));
-        }
-        self.load(artifact, preference)?;
-        let session_id = self.next_id();
-        let request_id = self.next_id();
-        self.transport
-            .start_stream(session_id, request_id)
-            .map_err(worker_unavailable)?;
-        Ok(Box::new(InferenceWorkerStream {
-            supervisor: self.clone(),
-            session_id,
-            closed: false,
-        }))
-    }
-
     pub(crate) fn unload(&self) -> Result<(), RuntimeError> {
         self.transport.unload().map_err(worker_unavailable)
     }
@@ -3585,70 +3551,6 @@ impl InferenceWorkerSupervisor {
 
 fn worker_unavailable(error: impl std::fmt::Display) -> RuntimeError {
     RuntimeError::WorkerUnavailable(error.to_string())
-}
-
-struct InferenceWorkerStream {
-    supervisor: InferenceWorkerSupervisor,
-    session_id: u64,
-    closed: bool,
-}
-
-impl SpeechStream for InferenceWorkerStream {
-    fn push_audio(&mut self, samples: &[f32]) -> Result<StreamUpdate> {
-        if self.closed {
-            bail!("the inference stream is closed");
-        }
-        let request_id = self.supervisor.next_id();
-        let text = self
-            .supervisor
-            .transport
-            .audio_chunk(self.session_id, request_id, samples)?;
-        Ok(StreamUpdate {
-            committed: String::new(),
-            tentative: text,
-        })
-    }
-
-    fn finalize(mut self: Box<Self>) -> Result<Transcript> {
-        let request_id = self.supervisor.next_id();
-        let text = self
-            .supervisor
-            .transport
-            .end_stream(self.session_id, request_id)?;
-        self.closed = true;
-        Ok(Transcript {
-            segments: if text.is_empty() {
-                Vec::new()
-            } else {
-                vec![TranscriptSegment {
-                    text: text.clone(),
-                    start_ms: None,
-                    end_ms: None,
-                    confidence: None,
-                }]
-            },
-            text,
-            detected_language: None,
-            duration_ms: None,
-        })
-    }
-
-    fn cancel(mut self: Box<Self>) -> Result<()> {
-        let request_id = self.supervisor.next_id();
-        self.supervisor
-            .transport
-            .cancel_stream(self.session_id, request_id)?;
-        self.closed = true;
-        Ok(())
-    }
-}
-
-impl Drop for InferenceWorkerStream {
-    fn drop(&mut self) {
-        if !self.closed {
-            self.supervisor.transport.abandon_stream(self.session_id);
-        }
-    }
 }
 
 #[cfg(test)]

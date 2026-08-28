@@ -25,7 +25,7 @@ use crate::prepared_audio::{PREPARED_SAMPLE_RATE, PreparedAudio};
 use crate::runtime_artifact::{RuntimeArtifact, RuntimeModel};
 use crate::transcription::{
     AccelerationPreference, ModelId, ResolvedAcceleration, RuntimeCapabilities, SpeechEngine,
-    SpeechStream, Transcript, TranscriptionOptions,
+    Transcript, TranscriptionOptions,
 };
 
 pub(crate) const WARM_MODEL_TTL: Duration = Duration::from_secs(5 * 60);
@@ -116,17 +116,20 @@ fn embedded_runtime_location() -> PathBuf {
     ))
 }
 
+#[cfg(test)]
 #[derive(Clone)]
 pub(crate) struct RuntimeActivity {
     inner: Arc<Mutex<RuntimeActivityState>>,
 }
 
+#[cfg(test)]
 struct RuntimeActivityState {
     active_requests: usize,
     generation: u64,
     idle_since: Instant,
 }
 
+#[cfg(test)]
 impl Default for RuntimeActivity {
     fn default() -> Self {
         Self {
@@ -139,12 +142,14 @@ impl Default for RuntimeActivity {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum IdleTimeoutAction {
     Unload,
     Defer(Duration),
 }
 
+#[cfg(test)]
 impl RuntimeActivity {
     pub(crate) fn acquire_request(&self) -> Result<RuntimeActivityLease, RuntimeError> {
         let mut state = self.inner.lock().map_err(|_| RuntimeError::Poisoned)?;
@@ -197,6 +202,7 @@ impl RuntimeActivity {
     }
 }
 
+#[cfg(test)]
 pub(crate) struct RuntimeActivityLease {
     activity: RuntimeActivity,
     generation: u64,
@@ -204,6 +210,7 @@ pub(crate) struct RuntimeActivityLease {
     released: bool,
 }
 
+#[cfg(test)]
 impl RuntimeActivityLease {
     pub(crate) fn complete_successfully(&mut self) {
         self.refresh_idle_on_release = true;
@@ -226,6 +233,7 @@ impl RuntimeActivityLease {
     }
 }
 
+#[cfg(test)]
 impl Drop for RuntimeActivityLease {
     fn drop(&mut self) {
         self.release_at(Instant::now());
@@ -237,6 +245,7 @@ pub(crate) struct RuntimeRouter {
     inner: Arc<Mutex<RouterState>>,
     cancel_generation: Arc<AtomicU64>,
     embedded_cancellation: Arc<Mutex<Option<CancelToken>>>,
+    #[cfg(test)]
     runtime_activity: RuntimeActivity,
 }
 
@@ -252,6 +261,7 @@ impl RuntimeRouter {
             inner: Arc::new(Mutex::new(RouterState::default())),
             cancel_generation: Arc::new(AtomicU64::new(0)),
             embedded_cancellation: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
             runtime_activity: RuntimeActivity::default(),
         }
     }
@@ -334,21 +344,13 @@ impl RuntimeRouter {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn health_check(
         &self,
         artifact: RuntimeArtifact,
         preference: AccelerationPreference,
     ) -> Result<(), RuntimeError> {
         self.load(artifact, preference).map(|_| ())
-    }
-
-    pub(crate) fn start_stream(
-        &self,
-        artifact: RuntimeArtifact,
-        _preference: AccelerationPreference,
-        _options: &TranscriptionOptions,
-    ) -> Result<Box<dyn SpeechStream>, RuntimeError> {
-        Err(RuntimeError::UnsupportedModel(artifact.model_id()))
     }
 
     pub(crate) fn cancel_active(&self) {
@@ -364,6 +366,7 @@ impl RuntimeRouter {
         self.cancel_generation.load(Ordering::Acquire)
     }
 
+    #[cfg(test)]
     pub(crate) fn runtime_activity(&self) -> RuntimeActivity {
         self.runtime_activity.clone()
     }
@@ -377,6 +380,7 @@ impl RuntimeRouter {
             Ok(())
         };
         state.discard_embedded_runtime(&self.embedded_cancellation);
+        #[cfg(test)]
         self.runtime_activity.force_release_requests();
         result
     }

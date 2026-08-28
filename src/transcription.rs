@@ -7,8 +7,6 @@
 
 // Phase 1 establishes the complete stable contract before native streaming,
 // lifecycle wiring, and capability UI are introduced in later phases.
-#![allow(dead_code)]
-
 use std::fmt;
 #[cfg(test)]
 use std::fs;
@@ -30,19 +28,17 @@ use crate::installations::InstallCancellation;
 use crate::model_catalog::{
     ArtifactFormat, model_descriptor, normal_model_descriptors, runtime_artifact_manifest_for_path,
 };
-#[allow(unused_imports)]
-pub use crate::model_catalog::{
-    CompatibilityStatus, ModelCapabilities, ModelDescriptor, ModelRole,
-};
+pub use crate::model_catalog::{CompatibilityStatus, ModelDescriptor};
 use crate::models::SttModelInfo;
 #[cfg(test)]
 use crate::onnx_model_bundles::OnnxBundleManifest;
 use crate::onnx_worker::InferenceWorkerSupervisor;
 use crate::prepared_audio::{PREPARED_SAMPLE_RATE, PreparedAudio};
 use crate::runtime_artifact::{OnnxModelSpec, RuntimeArtifact, RuntimeModel};
+#[cfg(test)]
+use crate::runtime_router::IdleTimeoutAction;
 use crate::runtime_router::{
-    IdleTimeoutAction, RuntimeError, RuntimeExecution, RuntimeLoadExecution, RuntimeRouter,
-    WARM_MODEL_TTL,
+    RuntimeError, RuntimeExecution, RuntimeLoadExecution, RuntimeRouter, WARM_MODEL_TTL,
 };
 use crate::streaming::{
     HypothesisWord, PreviewAudioPublisher, PreviewEvent, RollingPreviewSession, StreamIdentity,
@@ -94,6 +90,7 @@ pub enum AccelerationPreference {
 }
 
 impl AccelerationPreference {
+    #[cfg(test)]
     pub const ALL: [Self; 3] = [Self::Auto, Self::Gpu, Self::Cpu];
 
     pub fn label(self) -> &'static str {
@@ -321,6 +318,7 @@ pub(crate) struct InstallationCandidate {
 }
 
 impl InstallationCandidate {
+    #[cfg(test)]
     pub(crate) fn normalized(model_id: ModelId, model_path: PathBuf) -> Result<Self> {
         let manifest =
             runtime_artifact_manifest_for_path(&model_id, &model_path).ok_or_else(|| {
@@ -471,33 +469,9 @@ pub struct StreamUpdate {
 pub trait SpeechEngine: Send {
     fn load(&mut self) -> Result<()>;
 
-    fn transcribe(
-        &mut self,
-        audio: &PreparedAudio,
-        options: &TranscriptionOptions,
-    ) -> Result<Transcript>;
-
     fn capabilities(&self) -> RuntimeCapabilities;
 
-    fn health_check(&mut self) -> Result<()>;
-
-    fn cancel(&mut self) -> Result<()>;
-
     fn unload(&mut self) -> Result<()>;
-}
-
-/// Optional extension for engines that can decode incrementally.
-pub trait StreamingSpeechEngine: SpeechEngine {
-    fn start_stream(&mut self, options: &TranscriptionOptions) -> Result<Box<dyn SpeechStream>>;
-}
-
-/// A live speech-decoding session.
-pub trait SpeechStream: Send {
-    fn push_audio(&mut self, samples: &[f32]) -> Result<StreamUpdate>;
-
-    fn finalize(self: Box<Self>) -> Result<Transcript>;
-
-    fn cancel(self: Box<Self>) -> Result<()>;
 }
 
 /// A prepared-audio request that preserves application correlation IDs.
@@ -660,12 +634,6 @@ enum RuntimeCommand {
         preference: AccelerationPreference,
         reply: SyncSender<Result<(), RuntimeError>>,
     },
-    StartStream {
-        artifact: RuntimeArtifact,
-        preference: AccelerationPreference,
-        options: TranscriptionOptions,
-        reply: SyncSender<Result<Box<dyn SpeechStream>, RuntimeError>>,
-    },
     Unload {
         reply: SyncSender<Result<(), RuntimeError>>,
     },
@@ -692,6 +660,7 @@ struct RuntimeWorkerInner {
 }
 
 impl RuntimeWorker {
+    #[cfg(test)]
     fn new(router: RuntimeRouter) -> Self {
         let (commands, receiver) = sync_channel(1);
         let worker_router = router.clone();
@@ -844,27 +813,6 @@ impl RuntimeWorker {
             .map_err(|error| RuntimeError::WorkerUnavailable(error.to_string()))?
     }
 
-    fn start_stream(
-        &self,
-        artifact: impl Into<RuntimeArtifact>,
-        preference: AccelerationPreference,
-        options: TranscriptionOptions,
-    ) -> Result<Box<dyn SpeechStream>, RuntimeError> {
-        let (reply, response) = sync_channel(1);
-        self.inner
-            .commands
-            .send(RuntimeCommand::StartStream {
-                artifact: artifact.into(),
-                preference,
-                options,
-                reply,
-            })
-            .map_err(|error| RuntimeError::WorkerUnavailable(error.to_string()))?;
-        response
-            .recv()
-            .map_err(|error| RuntimeError::WorkerUnavailable(error.to_string()))?
-    }
-
     fn unload(&self) -> Result<(), RuntimeError> {
         let (reply, response) = sync_channel(1);
         self.inner
@@ -976,6 +924,7 @@ impl fmt::Debug for RuntimeWorker {
     }
 }
 
+#[cfg(test)]
 fn runtime_worker_loop(router: RuntimeRouter, commands: Receiver<RuntimeCommand>) {
     let activity = router.runtime_activity();
     let mut idle_wait = WARM_MODEL_TTL;
@@ -1019,18 +968,6 @@ fn runtime_worker_loop(router: RuntimeRouter, commands: Receiver<RuntimeCommand>
             }) => {
                 let request_activity = activity.acquire_request().ok();
                 let result = router.health_check(artifact, preference);
-                let succeeded = result.is_ok();
-                let _ = reply.send(result);
-                (succeeded, request_activity)
-            }
-            Ok(RuntimeCommand::StartStream {
-                artifact,
-                preference,
-                options,
-                reply,
-            }) => {
-                let request_activity = activity.acquire_request().ok();
-                let result = router.start_stream(artifact, preference, &options);
                 let succeeded = result.is_ok();
                 let _ = reply.send(result);
                 (succeeded, request_activity)
@@ -1137,17 +1074,6 @@ fn inference_worker_dispatch_loop(
                 let _ = reply.send(result);
                 succeeded
             }
-            Ok(RuntimeCommand::StartStream {
-                artifact,
-                preference,
-                options,
-                reply,
-            }) => {
-                let result = inference.start_stream(artifact, preference, options);
-                let succeeded = result.is_ok();
-                let _ = reply.send(result);
-                succeeded
-            }
             Ok(RuntimeCommand::Unload { reply }) => {
                 let result = inference.unload();
                 let succeeded = result.is_ok();
@@ -1225,16 +1151,6 @@ impl TranscriptionService {
     }
 
     #[cfg(test)]
-    pub(crate) fn with_runtime_router(config: AppConfig, router: RuntimeRouter) -> Self {
-        Self {
-            config,
-            worker: RuntimeWorker::new(router.clone()),
-            router,
-            current_receipt_manifest: None,
-        }
-    }
-
-    #[cfg(test)]
     pub(crate) fn with_process_executable(config: AppConfig, executable: PathBuf) -> Self {
         Self {
             config,
@@ -1250,52 +1166,7 @@ impl TranscriptionService {
         self
     }
 
-    pub(crate) fn preload_runtime_artifact(
-        &self,
-        artifact: RuntimeArtifact,
-    ) -> Result<RuntimeLoadExecution> {
-        self.worker
-            .load(artifact, self.config.performance.acceleration_preference)
-            .map_err(Into::into)
-    }
-
-    pub(crate) fn transcribe_runtime_artifact(
-        &self,
-        artifact: RuntimeArtifact,
-        audio: Arc<PreparedAudio>,
-        options: TranscriptionOptions,
-    ) -> Result<RuntimeExecution> {
-        self.worker
-            .transcribe(
-                artifact,
-                self.config.performance.acceleration_preference,
-                audio,
-                options,
-                self.worker.cancellation_snapshot(),
-            )
-            .map_err(Into::into)
-    }
-
-    pub(crate) fn health_check_runtime_artifact(&self, artifact: RuntimeArtifact) -> Result<()> {
-        self.worker
-            .health_check(artifact, self.config.performance.acceleration_preference)
-            .map_err(Into::into)
-    }
-
-    pub(crate) fn start_runtime_stream(
-        &self,
-        artifact: RuntimeArtifact,
-        options: TranscriptionOptions,
-    ) -> Result<Box<dyn SpeechStream>> {
-        self.worker
-            .start_stream(
-                artifact,
-                self.config.performance.acceleration_preference,
-                options,
-            )
-            .map_err(Into::into)
-    }
-
+    #[cfg(test)]
     pub(crate) fn unload_runtime_artifacts(&self) -> Result<()> {
         self.worker.unload().map_err(Into::into)
     }
@@ -1338,6 +1209,7 @@ impl TranscriptionService {
             .map_err(Into::into)
     }
 
+    #[cfg(test)]
     pub(crate) fn transcribe_onnx_bundle_from_receipt(
         &self,
         root: &Path,
@@ -2055,6 +1927,7 @@ impl TranscriptionService {
         Ok(map_native_execution(request, model, execution))
     }
 
+    #[cfg(test)]
     pub fn transcribe_with_ticket(
         &self,
         request: TranscriptionRequest,
@@ -2319,6 +2192,7 @@ fn verify_runtime_model_artifact(runtime_model: &RuntimeModel) -> Result<()> {
     .map_err(|error| anyhow!("model integrity verification failed: {error}"))
 }
 
+#[cfg(test)]
 fn model_uses_embedded_gguf(model_id: &ModelId) -> bool {
     crate::model_catalog::model_uses_embedded_runtime(model_id)
 }
@@ -3427,9 +3301,6 @@ mod tests {
                     RuntimeCommand::Shutdown { reply } => {
                         reply.send(Ok(())).unwrap();
                         break;
-                    }
-                    RuntimeCommand::StartStream { .. } => {
-                        panic!("staged offline smoke must not start a stream")
                     }
                 }
             }

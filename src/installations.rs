@@ -12,7 +12,9 @@ use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
+#[cfg(test)]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1043,6 +1045,7 @@ impl DirectoryReplacement {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn rollback(mut self) -> Result<(), InstallError> {
         remove_path_if_exists(&self.target_root)?;
         if let Some(rollback) = self.rollback_path.take() {
@@ -1913,10 +1916,12 @@ fn stable_staging_path(target_root: &Path) -> Result<PathBuf, InstallError> {
     Ok(target_root.with_file_name(format!(".{name}.installing")))
 }
 
+#[cfg(test)]
 pub(crate) fn directory_activation_rollback_root(target_root: &Path) -> PathBuf {
     directory_rollback_path(target_root)
 }
 
+#[cfg(test)]
 pub(crate) fn path_entry_exists_no_follow(path: &Path) -> Result<bool, InstallError> {
     match fs::symlink_metadata(path) {
         Ok(_) => Ok(true),
@@ -1928,6 +1933,7 @@ pub(crate) fn path_entry_exists_no_follow(path: &Path) -> Result<bool, InstallEr
     }
 }
 
+#[cfg(test)]
 pub(crate) fn discard_file_bundle_staging(target_root: &Path) -> Result<bool, InstallError> {
     let staging = stable_staging_path(target_root)?;
     if !path_entry_exists_no_follow(&staging)? {
@@ -1937,6 +1943,7 @@ pub(crate) fn discard_file_bundle_staging(target_root: &Path) -> Result<bool, In
     Ok(true)
 }
 
+#[cfg(test)]
 pub(crate) fn restore_interrupted_directory_replacement(
     target_root: &Path,
 ) -> Result<(), InstallError> {
@@ -1956,6 +1963,7 @@ pub(crate) fn restore_interrupted_directory_replacement(
     restore_directory_replacement(target_root, true)
 }
 
+#[cfg(test)]
 pub(crate) fn retain_interrupted_directory_replacement(
     target_root: &Path,
 ) -> Result<(), InstallError> {
@@ -2295,6 +2303,7 @@ pub(crate) fn activate_directory(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn rollback_to_previous_runtime(target_root: &Path) -> Result<bool, InstallError> {
     let previous = previous_runtime_root(target_root);
     if !previous.exists() {
@@ -2828,6 +2837,7 @@ fn restore_file_replacement(target: &Path, had_previous: bool) -> Result<(), Ins
     Ok(())
 }
 
+#[cfg(test)]
 fn restore_directory_replacement(target: &Path, had_previous: bool) -> Result<(), InstallError> {
     let rollback = directory_rollback_path(target);
     if rollback.exists() {
@@ -2854,6 +2864,7 @@ fn finalize_file_replacement(target: &Path) -> Result<(), InstallError> {
     remove_path_if_exists(&file_rollback_path(target)?)
 }
 
+#[cfg(test)]
 fn finalize_directory_replacement(
     target: &Path,
     retain_replaced_as_previous: bool,
@@ -2881,6 +2892,7 @@ fn finalize_directory_replacement(
     })
 }
 
+#[cfg(test)]
 fn transaction_path(target: &Path, phase: &str) -> Result<PathBuf, InstallError> {
     let name = target
         .file_name()

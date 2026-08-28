@@ -22,12 +22,9 @@ use crate::disk_space::{
 use crate::installations::{
     BundleAssemblyFile, DirectoryReplacement, GeneratedBundleFile, InstallCancellation,
     InstallError, InstallProgress, PinnedArtifact, PinnedArtifactInspectionPlan, RuntimeFileSpec,
-    StagedRuntime, directory_activation_rollback_root, discard_file_bundle_staging,
-    discard_pinned_artifact_partial, download_pinned_artifact_for_target,
-    inspect_pinned_artifact_for_target, path_entry_exists_no_follow,
-    pinned_artifact_retained_partial, read_regular_file_no_follow,
-    restore_interrupted_directory_replacement, retain_interrupted_directory_replacement,
-    rollback_to_previous_runtime, stage_file_bundle_for_target, verify_regular_directory_root,
+    StagedRuntime, discard_pinned_artifact_partial, download_pinned_artifact_for_target,
+    inspect_pinned_artifact_for_target, pinned_artifact_retained_partial,
+    read_regular_file_no_follow, stage_file_bundle_for_target, verify_regular_directory_root,
     verify_runtime_tree,
 };
 use crate::runtime_artifact::{OnnxFileRole, OnnxModelFamily, OnnxModelSpec};
@@ -223,6 +220,7 @@ pub(crate) fn bundle_manifest(model_id: &str) -> Option<&'static OnnxBundleManif
         .find(|bundle| bundle.id == model_id)
 }
 
+#[cfg(test)]
 pub(crate) fn available_bundle_manifests() -> impl Iterator<Item = &'static OnnxBundleManifest> {
     catalog()
         .bundles
@@ -1045,6 +1043,7 @@ pub(crate) struct VerifiedStagedOnnxBundle {
 }
 
 impl VerifiedStagedOnnxBundle {
+    #[cfg(test)]
     pub(crate) fn root(&self) -> &Path {
         self.staged.root()
     }
@@ -1075,19 +1074,9 @@ impl VerifiedStagedOnnxBundle {
                     failed("ONNX bundle activation authorization was already consumed")
                 }
             })?;
-        let target_root = staged.staged.target_root.clone();
         let replacement = staged.staged.activate()?;
-        let spec = spec_from_parts(
-            &staged.receipt.model_id,
-            target_root,
-            staged.receipt.family,
-            staged.receipt.num_threads,
-            &staged.receipt.files,
-        )?;
         Ok(ActivatedOnnxBundle {
             replacement,
-            receipt: staged.receipt,
-            spec,
             retain_previous: staged.retain_previous,
             target_guard: staged.target_guard,
             disk_reservation: staged.disk_reservation,
@@ -1096,7 +1085,7 @@ impl VerifiedStagedOnnxBundle {
 
     #[cfg(test)]
     pub(crate) fn discard(self) -> Result<(), InstallError> {
-        discard_file_bundle_staging(&self.staged.staged.target_root)?;
+        crate::installations::discard_file_bundle_staging(&self.staged.staged.target_root)?;
         Ok(())
     }
 }
@@ -1104,22 +1093,12 @@ impl VerifiedStagedOnnxBundle {
 #[derive(Debug)]
 pub(crate) struct ActivatedOnnxBundle {
     replacement: DirectoryReplacement,
-    receipt: OnnxBundleReceipt,
-    spec: OnnxModelSpec,
     retain_previous: bool,
     target_guard: BundleTargetGuard,
     disk_reservation: BundleDiskReservation,
 }
 
 impl ActivatedOnnxBundle {
-    pub(crate) fn receipt(&self) -> &OnnxBundleReceipt {
-        &self.receipt
-    }
-
-    pub(crate) fn spec(&self) -> &OnnxModelSpec {
-        &self.spec
-    }
-
     pub(crate) fn commit(self) -> Result<(), InstallError> {
         let Self {
             replacement,
@@ -1129,19 +1108,6 @@ impl ActivatedOnnxBundle {
             ..
         } = self;
         replacement.commit_with_previous_policy(retain_previous)?;
-        drop(target_guard);
-        drop(disk_reservation);
-        Ok(())
-    }
-
-    pub(crate) fn rollback(self) -> Result<(), InstallError> {
-        let Self {
-            replacement,
-            target_guard,
-            disk_reservation,
-            ..
-        } = self;
-        replacement.rollback()?;
         drop(target_guard);
         drop(disk_reservation);
         Ok(())
@@ -1729,6 +1695,7 @@ pub(crate) fn verified_receipt_at(
     Ok((receipt, spec))
 }
 
+#[cfg(test)]
 pub(crate) fn current_verified_receipt_at(
     model_id: &str,
     root: &Path,
@@ -1787,6 +1754,7 @@ pub(crate) fn current_executable_receipt_at_with_manifest_for_test(
     Ok((receipt, spec))
 }
 
+#[cfg(test)]
 pub(crate) fn rollback_to_previous_onnx_bundle(target_root: &Path) -> Result<bool, InstallError> {
     let _target_guard = acquire_bundle_target(target_root)?;
     let previous = crate::installations::previous_runtime_root(target_root);
@@ -1799,9 +1767,10 @@ pub(crate) fn rollback_to_previous_onnx_bundle(target_root: &Path) -> Result<boo
             previous.display()
         ))
     })?;
-    rollback_to_previous_runtime(target_root)
+    crate::installations::rollback_to_previous_runtime(target_root)
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct OnnxBundleRecovery {
     pub(crate) restored_interrupted_previous: bool,
@@ -1812,34 +1781,36 @@ pub(crate) struct OnnxBundleRecovery {
 /// Reconciles only transaction-owned directory names and never contacts the
 /// network. Active or previous bundles are mutated only after their complete
 /// self-contained receipts and exact trees verify.
+#[cfg(test)]
 pub(crate) fn recover_onnx_bundle_installation(
     target_root: &Path,
 ) -> Result<OnnxBundleRecovery, InstallError> {
     let _guard = acquire_bundle_target(target_root)?;
-    let rollback = directory_activation_rollback_root(target_root);
+    let rollback = crate::installations::directory_activation_rollback_root(target_root);
     let mut recovery = OnnxBundleRecovery::default();
-    if path_entry_exists_no_follow(&rollback)? {
+    if crate::installations::path_entry_exists_no_follow(&rollback)? {
         current_executable_receipt_at(&rollback).map_err(|error| {
             InstallError::RecoveryRequired(format!(
                 "interrupted ONNX bundle rollback is not exact at {}: {error}",
                 rollback.display()
             ))
         })?;
-        if path_entry_exists_no_follow(target_root)? {
+        if crate::installations::path_entry_exists_no_follow(target_root)? {
             current_executable_receipt_at(target_root).map_err(|error| {
                 InstallError::RecoveryRequired(format!(
                     "interrupted ONNX bundle target is not exact at {}: {error}",
                     target_root.display()
                 ))
             })?;
-            retain_interrupted_directory_replacement(target_root)?;
+            crate::installations::retain_interrupted_directory_replacement(target_root)?;
             recovery.retained_interrupted_previous = true;
         } else {
-            restore_interrupted_directory_replacement(target_root)?;
+            crate::installations::restore_interrupted_directory_replacement(target_root)?;
             recovery.restored_interrupted_previous = true;
         }
     }
-    recovery.discarded_incomplete_staging = discard_file_bundle_staging(target_root)?;
+    recovery.discarded_incomplete_staging =
+        crate::installations::discard_file_bundle_staging(target_root)?;
     Ok(recovery)
 }
 
@@ -2761,7 +2732,7 @@ mod tests {
         let error = recover_onnx_bundle_installation(&target).unwrap_err();
         assert!(error.requires_recovery());
         assert_eq!(verified_receipt_at(&target).unwrap().0, new_receipt);
-        let rollback = directory_activation_rollback_root(&target);
+        let rollback = crate::installations::directory_activation_rollback_root(&target);
         assert_eq!(verified_receipt_at(&rollback).unwrap().0, old_receipt);
         assert!(target.exists());
         assert!(rollback.exists());
@@ -2784,7 +2755,7 @@ mod tests {
         )
         .unwrap();
         drop(staged.activate().unwrap());
-        let rollback = directory_activation_rollback_root(&target);
+        let rollback = crate::installations::directory_activation_rollback_root(&target);
         fs::write(rollback.join("unexpected"), b"corrupt").unwrap();
         assert!(
             recover_onnx_bundle_installation(&target)
@@ -2799,7 +2770,11 @@ mod tests {
     #[test]
     fn local_catalog_and_receipt_paths_cannot_start_http() {
         let source = include_str!("onnx_model_bundles.rs");
-        let production = source.split("\n#[cfg(test)]").next().unwrap();
+        let normalized = source.replace("\r\n", "\n");
+        let production = normalized
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .unwrap();
         assert_eq!(
             production
                 .matches("download_pinned_artifact_for_target(")
