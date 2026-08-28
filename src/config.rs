@@ -786,102 +786,10 @@ pub fn managed_model_path(config: &AppConfig, model: &SttModelInfo) -> Option<Pa
 pub fn is_valid_model_install_path(model: &SttModelInfo, path: &Path) -> bool {
     match model.backend.as_str() {
         "whisper.cpp" | "transcribe-cpp" => path.is_file(),
-        "faster-whisper" => is_faster_whisper_model_dir(path),
-        "Vosk" => is_vosk_model_dir(path),
-        "sherpa-onnx" => is_sherpa_onnx_model_dir(path),
-        "Moonshine" => is_moonshine_model_dir(path),
-        "Parakeet" => is_parakeet_model_dir(path),
-        _ => path.exists(),
+        // Receipt-backed ONNX bundles are validated before reaching this
+        // compatibility helper; unsupported legacy providers stay inert.
+        _ => false,
     }
-}
-
-pub fn is_faster_whisper_model_dir(path: &Path) -> bool {
-    path.is_dir() && path.join("model.bin").is_file() && path.join("config.json").is_file()
-}
-
-pub fn is_vosk_model_dir(path: &Path) -> bool {
-    let graph = path.join("graph");
-    let has_graph = graph.join("HCLG.fst").is_file()
-        || (graph.join("HCLr.fst").is_file() && graph.join("Gr.fst").is_file());
-    path.is_dir()
-        && path.join("am").join("final.mdl").is_file()
-        && path.join("conf").join("model.conf").is_file()
-        && has_graph
-}
-
-pub fn is_sherpa_onnx_model_dir(path: &Path) -> bool {
-    path.is_dir()
-        && path.join("tokens.txt").is_file()
-        && first_matching_file(
-            path,
-            &[
-                "encoder-epoch-99-avg-1.int8.onnx",
-                "encoder-epoch-99-avg-1.onnx",
-                "encoder*.onnx",
-            ],
-        )
-        .is_some()
-        && first_matching_file(
-            path,
-            &[
-                "decoder-epoch-99-avg-1.onnx",
-                "decoder-epoch-99-avg-1.int8.onnx",
-                "decoder*.onnx",
-            ],
-        )
-        .is_some()
-        && first_matching_file(
-            path,
-            &[
-                "joiner-epoch-99-avg-1.int8.onnx",
-                "joiner-epoch-99-avg-1.onnx",
-                "joiner*.onnx",
-            ],
-        )
-        .is_some()
-}
-
-pub fn is_moonshine_model_dir(path: &Path) -> bool {
-    path.is_dir()
-        && path.join("tokens.txt").is_file()
-        && path.join("encoder_model.ort").is_file()
-        && path.join("decoder_model_merged.ort").is_file()
-}
-
-pub fn is_parakeet_model_dir(path: &Path) -> bool {
-    path.is_dir()
-        && path.join("tokens.txt").is_file()
-        && path.join("encoder.int8.onnx").is_file()
-        && path.join("decoder.int8.onnx").is_file()
-        && path.join("joiner.int8.onnx").is_file()
-}
-
-fn first_matching_file(root: &Path, patterns: &[&str]) -> Option<PathBuf> {
-    for pattern in patterns {
-        let literal = root.join(pattern);
-        if literal.is_file() {
-            return Some(literal);
-        }
-        if !pattern.contains('*') {
-            continue;
-        }
-        let Some((prefix, suffix)) = pattern.split_once('*') else {
-            continue;
-        };
-        let Ok(entries) = fs::read_dir(root) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
-                continue;
-            };
-            if path.is_file() && file_name.starts_with(prefix) && file_name.ends_with(suffix) {
-                return Some(path);
-            }
-        }
-    }
-    None
 }
 
 pub fn downloaded_model_path(config: &AppConfig, model: &SttModelInfo) -> Option<PathBuf> {
@@ -895,23 +803,18 @@ pub fn downloaded_model_path(config: &AppConfig, model: &SttModelInfo) -> Option
         )
         .ok();
     }
-    model
-        .download_model
-        .as_ref()
-        .map(|download_model| match model.backend.as_str() {
-            "whisper.cpp" if download_model.ends_with(".gguf") => {
-                model_storage_dir(config).join("gguf").join(download_model)
-            }
-            "whisper.cpp" => model_storage_dir(config)
+    let download_model = model.download_model.as_ref()?;
+    match model.backend.as_str() {
+        "whisper.cpp" if download_model.ends_with(".gguf") => {
+            Some(model_storage_dir(config).join("gguf").join(download_model))
+        }
+        "whisper.cpp" => Some(
+            model_storage_dir(config)
                 .join("whisper.cpp")
                 .join(download_model),
-            "faster-whisper" => model_storage_dir(config)
-                .join("faster-whisper")
-                .join(&model.id),
-            _ => model_storage_dir(config)
-                .join(runtime_id_for_backend(&model.backend))
-                .join(&model.id),
-        })
+        ),
+        _ => None,
+    }
 }
 
 /// Legacy GGML files remain readable for the same logical model ID. New
@@ -1960,16 +1863,6 @@ mod tests {
             legacy_downloaded_model_path(&config, &model).unwrap(),
             PathBuf::from("/tmp/scribe-models/whisper.cpp/ggml-base.en.bin")
         );
-
-        let faster_model = default_model_catalog()
-            .into_iter()
-            .find(|model| model.id == "faster_whisper_tiny_en")
-            .unwrap();
-
-        assert_eq!(
-            downloaded_model_path(&config, &faster_model).unwrap(),
-            PathBuf::from("/tmp/scribe-models/faster-whisper/faster_whisper_tiny_en")
-        );
     }
 
     #[test]
@@ -2160,61 +2053,6 @@ mod tests {
         );
         assert!(model_needs_pinned_gguf_migration(&config, &model));
         assert!(legacy.is_file());
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn vosk_directory_accepts_official_small_model_layout() {
-        let root = std::env::temp_dir().join(format!("scribe-vosk-model-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(root.join("am")).unwrap();
-        fs::create_dir_all(root.join("conf")).unwrap();
-        fs::create_dir_all(root.join("graph")).unwrap();
-        fs::write(root.join("am").join("final.mdl"), b"model").unwrap();
-        fs::write(root.join("conf").join("model.conf"), b"conf").unwrap();
-
-        assert!(!is_vosk_model_dir(&root));
-
-        fs::write(root.join("graph").join("HCLr.fst"), b"hclr").unwrap();
-        assert!(!is_vosk_model_dir(&root));
-
-        fs::write(root.join("graph").join("Gr.fst"), b"gr").unwrap();
-
-        assert!(is_vosk_model_dir(&root));
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn sherpa_family_directories_require_backend_specific_model_files() {
-        let root = std::env::temp_dir().join(format!("scribe-sherpa-model-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        let sherpa = root.join("sherpa");
-        let moonshine = root.join("moonshine");
-        let parakeet = root.join("parakeet");
-        fs::create_dir_all(&sherpa).unwrap();
-        fs::create_dir_all(&moonshine).unwrap();
-        fs::create_dir_all(&parakeet).unwrap();
-
-        fs::write(sherpa.join("tokens.txt"), b"tokens").unwrap();
-        fs::write(sherpa.join("encoder-epoch-99-avg-1.int8.onnx"), b"encoder").unwrap();
-        fs::write(sherpa.join("decoder-epoch-99-avg-1.onnx"), b"decoder").unwrap();
-        assert!(!is_sherpa_onnx_model_dir(&sherpa));
-        fs::write(sherpa.join("joiner-epoch-99-avg-1.int8.onnx"), b"joiner").unwrap();
-        assert!(is_sherpa_onnx_model_dir(&sherpa));
-
-        fs::write(moonshine.join("tokens.txt"), b"tokens").unwrap();
-        fs::write(moonshine.join("encoder_model.ort"), b"encoder").unwrap();
-        assert!(!is_moonshine_model_dir(&moonshine));
-        fs::write(moonshine.join("decoder_model_merged.ort"), b"decoder").unwrap();
-        assert!(is_moonshine_model_dir(&moonshine));
-
-        fs::write(parakeet.join("tokens.txt"), b"tokens").unwrap();
-        fs::write(parakeet.join("encoder.int8.onnx"), b"encoder").unwrap();
-        fs::write(parakeet.join("decoder.int8.onnx"), b"decoder").unwrap();
-        assert!(!is_parakeet_model_dir(&parakeet));
-        fs::write(parakeet.join("joiner.int8.onnx"), b"joiner").unwrap();
-        assert!(is_parakeet_model_dir(&parakeet));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -2574,44 +2412,6 @@ mod tests {
 
         assert_eq!(managed_model_path(&config, &model), None);
         assert_eq!(model.local_path.as_deref(), Some(external_path.as_path()));
-        assert_eq!(model.install_status, ModelInstallStatus::Installed);
-
-        let _ = fs::remove_dir_all(&temp_dir);
-    }
-
-    #[test]
-    fn faster_whisper_directory_requires_ctranslate2_payload() {
-        let temp_dir =
-            std::env::temp_dir().join(format!("scribe-fw-config-test-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&temp_dir);
-        let model_dir = temp_dir
-            .join("faster-whisper")
-            .join("faster_whisper_small_en_gpu");
-        fs::create_dir_all(&model_dir).unwrap();
-        fs::write(model_dir.join("config.json"), b"{}").unwrap();
-
-        let config = AppConfig {
-            general: GeneralSettings {
-                model_storage_dir: temp_dir.clone(),
-                ..Default::default()
-            },
-            ..AppConfig::default()
-        };
-        let model = configured_models(&config)
-            .into_iter()
-            .find(|model| model.id == "faster_whisper_small_en_gpu")
-            .unwrap();
-
-        assert_eq!(model.local_path.as_deref(), Some(model_dir.as_path()));
-        assert_eq!(model.install_status, ModelInstallStatus::Missing);
-
-        fs::write(model_dir.join("model.bin"), b"model").unwrap();
-        let model = configured_models(&config)
-            .into_iter()
-            .find(|model| model.id == "faster_whisper_small_en_gpu")
-            .unwrap();
-
-        assert_eq!(model.local_path.as_deref(), Some(model_dir.as_path()));
         assert_eq!(model.install_status, ModelInstallStatus::Installed);
 
         let _ = fs::remove_dir_all(&temp_dir);

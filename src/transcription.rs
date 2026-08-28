@@ -1651,7 +1651,9 @@ impl TranscriptionService {
                 .ok_or_else(|| anyhow!("unknown normalized transcription model: {model_id}"))?;
             return Ok(intersect_capabilities(&runtime_capabilities, &descriptor));
         }
-        Ok(capabilities_for_legacy_model(&model))
+        Err(anyhow!(
+            "model {model_id} has no supported native transcription runtime"
+        ))
     }
 
     fn effective_descriptor(&self, mut descriptor: ModelDescriptor) -> ModelDescriptor {
@@ -2286,7 +2288,10 @@ impl TranscriptionService {
             return self.transcribe_primary(request, model, ticket);
         }
 
-        self.transcribe_legacy(request, model, ticket)
+        Err(anyhow!(
+            "model {} has no supported native transcription runtime",
+            request.model_id
+        ))
     }
 
     fn transcribe_primary(
@@ -2312,15 +2317,6 @@ impl TranscriptionService {
             }
             Err(error) => Err(anyhow!(error)),
         }
-    }
-
-    fn transcribe_legacy(
-        &self,
-        request: TranscriptionRequest,
-        model: SttModelInfo,
-        ticket: TranscriptionTicket,
-    ) -> Result<TranscriptionOutcome> {
-        self.transcribe_legacy_inner(request, model, None, ticket)
     }
 
     fn transcribe_legacy_with_fallback_reason(
@@ -2784,11 +2780,8 @@ fn map_native_execution(
     }
 }
 
-/// The sole Phase 1 adapter for the pre-existing command-line backend path.
-///
-/// It intentionally delegates to `stt::transcribe_with_config` unchanged so
-/// all existing configured model paths and runtime resolution behavior remain
-/// intact during extraction.
+/// The retained verified whisper.cpp CLI fallback for native bootstrap errors.
+/// Unsupported provider models never reach this adapter.
 struct LegacyBatchAdapter {
     config: AppConfig,
     model: SttModelInfo,
@@ -2817,8 +2810,13 @@ impl LegacyBatchAdapter {
 
 impl SpeechEngine for LegacyBatchAdapter {
     fn load(&mut self) -> Result<()> {
-        // The legacy route starts a fresh child process for each request, so
-        // there is no persistent engine to preload or validate here.
+        if self.model.backend != "whisper.cpp" {
+            return Err(anyhow!(
+                "the compatibility CLI accepts only whisper.cpp models"
+            ));
+        }
+        // The fallback starts a fresh child process for each request, so there
+        // is no persistent engine to preload or validate here.
         Ok(())
     }
 
@@ -2842,7 +2840,10 @@ impl SpeechEngine for LegacyBatchAdapter {
     }
 
     fn capabilities(&self) -> RuntimeCapabilities {
-        capabilities_for_legacy_model(&self.model)
+        RuntimeCapabilities {
+            cancellation: true,
+            ..RuntimeCapabilities::default()
+        }
     }
 
     fn health_check(&mut self) -> Result<()> {
@@ -3082,17 +3083,6 @@ fn validate_preview_options(options: &TranscriptionOptions) -> Result<()> {
         ..options.clone()
     };
     validate_default_options(&options_without_timestamps)
-}
-
-fn capabilities_for_legacy_model(model: &SttModelInfo) -> RuntimeCapabilities {
-    RuntimeCapabilities {
-        // Only the current Vosk and faster-whisper adapters reliably expose
-        // timestamp values. whisper.cpp strips its text timing and the sherpa
-        // family currently reports null segment bounds.
-        timestamps: matches!(model.backend.as_str(), "faster-whisper" | "Vosk"),
-        cancellation: true,
-        ..RuntimeCapabilities::default()
-    }
 }
 
 fn intersect_capabilities(
@@ -3594,9 +3584,9 @@ mod tests {
 
     fn legacy_result() -> LegacyTranscriptResult {
         LegacyTranscriptResult {
-            model_id: "faster_whisper_tiny_en".to_owned(),
-            model_name: "faster-whisper tiny.en".to_owned(),
-            backend: "faster-whisper".to_owned(),
+            model_id: "whisper_cpp_tiny_en".to_owned(),
+            model_name: "whisper.cpp tiny.en".to_owned(),
+            backend: "whisper.cpp".to_owned(),
             text: "hello world".to_owned(),
             segments: vec![LegacyTranscriptSegment {
                 start_ms: Some(12),
@@ -3625,9 +3615,9 @@ mod tests {
                 confidence: None,
             }]
         );
-        assert_eq!(diagnostics.model_id, ModelId::new("faster_whisper_tiny_en"));
-        assert_eq!(diagnostics.model_name, "faster-whisper tiny.en");
-        assert_eq!(diagnostics.backend_label, "faster-whisper");
+        assert_eq!(diagnostics.model_id, ModelId::new("whisper_cpp_tiny_en"));
+        assert_eq!(diagnostics.model_name, "whisper.cpp tiny.en");
+        assert_eq!(diagnostics.backend_label, "whisper.cpp");
         assert_eq!(diagnostics.processing_duration_ms, Some(678));
         assert_eq!(diagnostics.stdout, "runner output");
         assert_eq!(diagnostics.stderr, "runner diagnostic");
@@ -3688,39 +3678,6 @@ mod tests {
 
         for options in unsupported_options {
             assert!(validate_default_options(&options).is_err());
-        }
-    }
-
-    #[test]
-    fn capabilities_are_conservative_for_every_legacy_backend() {
-        for model in config::configured_models(&AppConfig::default()) {
-            let capabilities = capabilities_for_legacy_model(&model);
-            let timestamps_expected = matches!(model.backend.as_str(), "faster-whisper" | "Vosk");
-
-            assert_eq!(
-                capabilities.timestamps, timestamps_expected,
-                "{} timestamp capability",
-                model.backend
-            );
-            assert!(capabilities.cancellation, "{} cancellation", model.backend);
-            assert!(!capabilities.streaming, "{} streaming", model.backend);
-            assert!(!capabilities.translation, "{} translation", model.backend);
-            assert!(
-                !capabilities.language_detection,
-                "{} language detection",
-                model.backend
-            );
-            assert!(
-                !capabilities.confidence_scores,
-                "{} confidence scores",
-                model.backend
-            );
-            assert!(
-                !capabilities.custom_vocabulary,
-                "{} custom vocabulary",
-                model.backend
-            );
-            assert!(capabilities.supported_languages.is_empty());
         }
     }
 
@@ -3833,12 +3790,12 @@ mod tests {
     }
 
     #[test]
-    fn rolling_preview_rejects_legacy_models_instead_of_using_cli_fallback() {
+    fn rolling_preview_rejects_unknown_models_instead_of_using_cli_fallback() {
         let service = TranscriptionService::new(AppConfig::default());
         let result = service.start_rolling_preview(
             SessionId(1),
             RequestId(1),
-            ModelId::new("faster_whisper_tiny_en"),
+            ModelId::new("unsupported-provider-model"),
             None,
         );
 
@@ -4046,11 +4003,11 @@ mod tests {
     #[test]
     fn legacy_response_model_must_match_the_requested_model() {
         let (_, diagnostics) = map_legacy_result(legacy_result());
-        let error = validate_response_model_id(&ModelId::new("whisper_cpp_tiny_en"), &diagnostics)
+        let error = validate_response_model_id(&ModelId::new("whisper_cpp_base_en"), &diagnostics)
             .unwrap_err();
 
         assert!(error.to_string().contains("returned model"));
-        assert!(error.to_string().contains("faster_whisper_tiny_en"));
+        assert!(error.to_string().contains("whisper_cpp_tiny_en"));
     }
 
     #[test]

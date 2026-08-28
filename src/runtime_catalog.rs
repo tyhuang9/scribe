@@ -173,12 +173,6 @@ fn validate_runtime_package(document: &RuntimePackageDocument) -> Result<(), Str
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DeviceSupport {
-    CpuOnly,
-    CpuAndGpu,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DevelopmentRuntimeSpec {
     pub script_name: &'static str,
     pub destination_env: &'static str,
@@ -190,11 +184,7 @@ pub struct BackendSpec {
     pub backend: &'static str,
     pub runtime_id: &'static str,
     pub runtime_version: Option<&'static str>,
-    pub model_install_supported: bool,
     pub runtime_install_supported: bool,
-    pub transcription_supported: bool,
-    pub device_detection_supported: bool,
-    pub device_support: DeviceSupport,
     pub runtime_storage_estimate: &'static str,
     pub runtime_storage_detail: &'static str,
     pub development_runtime: Option<DevelopmentRuntimeSpec>,
@@ -209,145 +199,19 @@ pub struct ModelArtifactSpec {
     pub sha256: Option<&'static str>,
 }
 
-const MIB: u64 = 1024 * 1024;
-const GIB: u64 = 1024 * 1024 * 1024;
-
-const BACKENDS: &[BackendSpec] = &[
-    BackendSpec {
-        backend: "whisper.cpp",
-        runtime_id: "whisper_cpp",
-        runtime_version: None,
-        model_install_supported: true,
-        runtime_install_supported: true,
-        transcription_supported: true,
-        device_detection_supported: false,
-        device_support: DeviceSupport::CpuOnly,
-        runtime_storage_estimate: "~20 MB+",
-        runtime_storage_detail: "~20 MB for the verified CPU-only runtime package",
-        development_runtime: Some(DevelopmentRuntimeSpec {
-            script_name: "bundle-whisper-runtime.sh",
-            destination_env: "SCRIBE_RUNTIME_DEST",
-            executable_relative_path: "bin/whisper-cli",
-        }),
-    },
-    BackendSpec {
-        backend: "Vosk",
-        runtime_id: "vosk",
-        runtime_version: Some("0.3.45"),
-        model_install_supported: true,
-        runtime_install_supported: true,
-        transcription_supported: true,
-        device_detection_supported: false,
-        device_support: DeviceSupport::CpuOnly,
-        runtime_storage_estimate: "~20 MB+",
-        runtime_storage_detail: "~20 MB for the pinned Python Vosk runtime",
-        development_runtime: Some(DevelopmentRuntimeSpec {
-            script_name: "bundle-vosk-runtime.sh",
-            destination_env: "SCRIBE_VOSK_RUNTIME_DEST",
-            executable_relative_path: "bin/scribe-vosk",
-        }),
-    },
-    BackendSpec {
-        backend: "sherpa-onnx",
-        runtime_id: "sherpa_onnx",
-        runtime_version: Some("1.13.3"),
-        model_install_supported: true,
-        runtime_install_supported: true,
-        transcription_supported: true,
-        device_detection_supported: false,
-        device_support: DeviceSupport::CpuOnly,
-        runtime_storage_estimate: "~100 MB+",
-        runtime_storage_detail: "~100 MB+ for the sherpa-onnx Python runtime; model archives are separate",
-        development_runtime: Some(DevelopmentRuntimeSpec {
-            script_name: "bundle-sherpa-onnx-runtime.sh",
-            destination_env: "SCRIBE_SHERPA_ONNX_RUNTIME_DEST",
-            executable_relative_path: "bin/scribe-sherpa-onnx",
-        }),
-    },
-    BackendSpec {
-        backend: "faster-whisper",
-        runtime_id: "faster_whisper",
-        runtime_version: Some("1.2.1"),
-        model_install_supported: true,
-        runtime_install_supported: true,
-        transcription_supported: true,
-        device_detection_supported: false,
-        device_support: DeviceSupport::CpuAndGpu,
-        runtime_storage_estimate: "~450 MB+",
-        runtime_storage_detail: "~450 MB for the CPU Python runtime; CUDA bundles are larger",
-        development_runtime: Some(DevelopmentRuntimeSpec {
-            script_name: "bundle-faster-whisper-runtime.sh",
-            destination_env: "SCRIBE_FAST_WHISPER_RUNTIME_DEST",
-            executable_relative_path: "bin/scribe-faster-whisper",
-        }),
-    },
-    BackendSpec {
-        backend: "Moonshine",
-        runtime_id: "moonshine",
-        runtime_version: Some("1.13.3"),
-        model_install_supported: true,
-        runtime_install_supported: true,
-        transcription_supported: true,
-        device_detection_supported: false,
-        device_support: DeviceSupport::CpuOnly,
-        runtime_storage_estimate: "~100 MB+",
-        runtime_storage_detail: "~100 MB+ for the sherpa-onnx Python runtime; model archives are separate",
-        development_runtime: Some(DevelopmentRuntimeSpec {
-            script_name: "bundle-moonshine-runtime.sh",
-            destination_env: "SCRIBE_MOONSHINE_RUNTIME_DEST",
-            executable_relative_path: "bin/scribe-moonshine",
-        }),
-    },
-    BackendSpec {
-        backend: "Parakeet",
-        runtime_id: "parakeet",
-        runtime_version: Some("1.13.3"),
-        model_install_supported: true,
-        runtime_install_supported: true,
-        transcription_supported: true,
-        device_detection_supported: false,
-        device_support: DeviceSupport::CpuOnly,
-        runtime_storage_estimate: "~100 MB+",
-        runtime_storage_detail: "~100 MB+ for the sherpa-onnx Python runtime; model archives are separate",
-        development_runtime: Some(DevelopmentRuntimeSpec {
-            script_name: "bundle-parakeet-runtime.sh",
-            destination_env: "SCRIBE_PARAKEET_RUNTIME_DEST",
-            executable_relative_path: "bin/scribe-parakeet",
-        }),
-    },
-];
-
-const MODEL_ARTIFACTS: &[ModelArtifactSpec] = &[
-    model_artifact("faster_whisper_tiny_en", "~75 MB", Some(75 * MIB)),
-    model_artifact("faster_whisper_base_en", "~150 MB", Some(150 * MIB)),
-    model_artifact("faster_whisper_small_en_gpu", "~470 MB", Some(470 * MIB)),
-    model_artifact("faster_whisper_medium_en_gpu", "~1.5 GB", Some(1536 * MIB)),
-    model_artifact("faster_whisper_large_v3", "~3.1 GB", Some((31 * GIB) / 10)),
-    model_artifact("faster_whisper_turbo", "~1.6 GB", Some((16 * GIB) / 10)),
-    model_artifact(
-        "faster_whisper_distil_large_v3",
-        "~1.5 GB",
-        Some(1536 * MIB),
-    ),
-    model_artifact("vosk_small_en", "~50 MB", Some(40 * MIB)),
-    model_artifact("sherpa_onnx_zipformer_small", "~80 MB", Some(85 * MIB)),
-    model_artifact("moonshine", "~35 MB", Some(35 * MIB)),
-    model_artifact("parakeet_0_6b", "~640 MB", Some(650 * MIB)),
-];
-
-const fn model_artifact(
-    model_id: &'static str,
-    storage_estimate: &'static str,
-    download_bytes: Option<u64>,
-) -> ModelArtifactSpec {
-    ModelArtifactSpec {
-        model_id,
-        storage_estimate,
-        download_bytes,
-        version: None,
-        sha256: None,
-    }
-}
+const BACKENDS: &[BackendSpec] = &[BackendSpec {
+    backend: "whisper.cpp",
+    runtime_id: "whisper_cpp",
+    runtime_version: None,
+    runtime_install_supported: true,
+    runtime_storage_estimate: "~20 MB+",
+    runtime_storage_detail: "~20 MB for the verified CPU-only runtime package",
+    development_runtime: Some(DevelopmentRuntimeSpec {
+        script_name: "bundle-whisper-runtime.sh",
+        destination_env: "SCRIBE_RUNTIME_DEST",
+        executable_relative_path: "bin/whisper-cli",
+    }),
+}];
 
 pub fn backend_specs() -> &'static [BackendSpec] {
     BACKENDS
@@ -451,17 +315,7 @@ pub fn model_artifact_spec(model_id: &str) -> Option<ModelArtifactSpec> {
             sha256: None,
         });
     }
-    MODEL_ARTIFACTS
-        .iter()
-        .find(|artifact| artifact.model_id == model_id)
-        .copied()
-}
-
-#[cfg(test)]
-pub fn model_storage_estimate(model_id: &str) -> &'static str {
-    model_artifact_spec(model_id)
-        .map(|artifact| artifact.storage_estimate)
-        .unwrap_or("varies")
+    None
 }
 
 pub fn model_download_total_bytes(model_id: &str) -> Option<u64> {
@@ -489,16 +343,18 @@ fn slug_runtime_id(backend: &str) -> String {
 mod tests {
     use super::*;
     use crate::models;
-    use std::collections::HashMap;
-
     #[test]
-    fn catalog_backends_have_registry_specs() {
+    fn compatibility_registry_contains_only_whisper_cpp() {
+        assert_eq!(backend_specs().len(), 1);
+        assert_eq!(backend_specs()[0].backend, "whisper.cpp");
         for model in models::default_model_catalog() {
-            assert!(
-                backend_spec(&model.backend).is_some(),
-                "missing backend spec for {}",
-                model.backend
-            );
+            if model.backend == "whisper.cpp" {
+                assert!(backend_spec(&model.backend).is_some());
+            } else {
+                assert_eq!(model.id, "moonshine-tiny-en-int8-onnx");
+                assert_eq!(model.backend, "sherpa-onnx");
+                assert!(backend_spec(&model.backend).is_none());
+            }
         }
     }
 
@@ -506,47 +362,30 @@ mod tests {
     fn runtime_ids_stay_stable_for_known_backends() {
         assert_eq!(runtime_id_for_backend("whisper.cpp"), "whisper_cpp");
         assert_eq!(runtime_id_for_backend("sherpa-onnx"), "sherpa_onnx");
-        assert_eq!(runtime_id_for_backend("faster-whisper"), "faster_whisper");
     }
 
     #[test]
-    fn runtime_versions_follow_script_dependency_defaults() {
-        let defaults = dependency_defaults();
-
-        assert_eq!(
-            runtime_version_for_runtime_id("faster_whisper"),
-            defaults
-                .get("SCRIBE_FASTER_WHISPER_VERSION_DEFAULT")
-                .map(String::as_str)
-        );
-        assert_eq!(
-            runtime_version_for_runtime_id("vosk"),
-            defaults
-                .get("SCRIBE_VOSK_VERSION_DEFAULT")
-                .map(String::as_str)
-        );
-        for runtime_id in ["sherpa_onnx", "moonshine", "parakeet"] {
-            assert_eq!(
-                runtime_version_for_runtime_id(runtime_id),
-                defaults
-                    .get("SCRIBE_SHERPA_ONNX_VERSION_DEFAULT")
-                    .map(String::as_str)
+    fn retired_python_runtime_metadata_is_absent() {
+        for runtime_id in [
+            "faster_whisper",
+            "vosk",
+            "sherpa_onnx",
+            "moonshine",
+            "parakeet",
+        ] {
+            assert!(
+                backend_spec_for_runtime_id(runtime_id).is_none(),
+                "{runtime_id}"
+            );
+            assert!(
+                runtime_version_for_runtime_id(runtime_id).is_none(),
+                "{runtime_id}"
+            );
+            assert!(
+                development_runtime_spec(runtime_id).is_none(),
+                "{runtime_id}"
             );
         }
-    }
-
-    fn dependency_defaults() -> HashMap<String, String> {
-        include_str!("../scripts/runtime-dependencies.env")
-            .lines()
-            .filter_map(|line| {
-                let line = line.trim();
-                if line.is_empty() || line.starts_with('#') {
-                    return None;
-                }
-                let (key, value) = line.split_once('=')?;
-                Some((key.to_owned(), value.to_owned()))
-            })
-            .collect()
     }
 
     #[test]
@@ -576,10 +415,6 @@ mod tests {
             assert!(artifact.version.is_some());
             assert!(artifact.sha256.is_some_and(|hash| hash.len() == 64));
         }
-        assert_eq!(
-            backend_spec("whisper.cpp").unwrap().device_support,
-            DeviceSupport::CpuOnly
-        );
     }
 
     #[test]
@@ -591,10 +426,7 @@ mod tests {
         assert_eq!(artifact.download_bytes, Some(44_256_550));
         assert_eq!(artifact.version, None);
         assert_eq!(artifact.sha256, None);
-        assert_eq!(
-            backend_spec("sherpa-onnx").unwrap().device_support,
-            DeviceSupport::CpuOnly
-        );
+        assert!(backend_spec("sherpa-onnx").is_none());
     }
 
     #[test]

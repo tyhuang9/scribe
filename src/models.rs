@@ -150,41 +150,6 @@ impl fmt::Display for ModelRuntimeStatus {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct BackendCapabilities {
-    pub runnable: bool,
-    pub supports_local_files: bool,
-    pub supports_downloads: bool,
-    pub streaming: bool,
-    pub experimental: bool,
-}
-
-pub fn backend_capabilities(backend: &str) -> BackendCapabilities {
-    match backend {
-        "whisper.cpp" => BackendCapabilities {
-            runnable: true,
-            supports_local_files: true,
-            supports_downloads: true,
-            streaming: false,
-            experimental: false,
-        },
-        "sherpa-onnx" => BackendCapabilities {
-            runnable: true,
-            supports_local_files: false,
-            supports_downloads: true,
-            streaming: false,
-            experimental: true,
-        },
-        _ => BackendCapabilities {
-            runnable: false,
-            supports_local_files: false,
-            supports_downloads: false,
-            streaming: false,
-            experimental: true,
-        },
-    }
-}
-
 pub fn default_model_catalog() -> Vec<SttModelInfo> {
     crate::model_catalog::model_descriptors()
         .into_iter()
@@ -261,18 +226,6 @@ mod tests {
         };
 
         assert_eq!(status.label(), "Downloading 1 MB · 2 MB/s");
-    }
-
-    #[test]
-    fn supported_backends_are_native_only() {
-        assert!(backend_capabilities("whisper.cpp").runnable);
-        assert!(backend_capabilities("sherpa-onnx").runnable);
-        assert!(backend_capabilities("sherpa-onnx").supports_downloads);
-        assert!(!backend_capabilities("sherpa-onnx").supports_local_files);
-        assert!(!backend_capabilities("sherpa-onnx").streaming);
-        for retired in ["faster-whisper", "Vosk", "Moonshine", "Parakeet"] {
-            assert!(!backend_capabilities(retired).runnable, "{retired}");
-        }
     }
 
     #[test]

@@ -2939,7 +2939,7 @@ fn model_download_uses_runtime(
             model_downloads.get(&model.id),
             Some(ModelInstallStatus::Downloading { .. })
         ) && !uses_artifact_only_install(config, &model)
-            && compatibility_bridge::provider_for_model(&model)
+            && compatibility_bridge::provider_for_legacy_model(config, &model)
                 .is_some_and(|provider| provider.id() == runtime_id)
     })
 }
@@ -2965,7 +2965,7 @@ fn runtime_action_state_inner(config: &AppConfig, model: &SttModelInfo) -> Runti
             ),
         };
     }
-    let Some(provider) = compatibility_bridge::provider_for_model(model) else {
+    let Some(provider) = compatibility_bridge::provider_for_legacy_model(config, model) else {
         return RuntimeActionState {
             kind: RuntimeActionKind::Install,
             enabled: false,
@@ -3085,16 +3085,12 @@ fn supports_managed_install(model: &SttModelInfo) -> bool {
     if let Some(capability) = verified_installation_capability(&ModelId::new(&model.id)) {
         return matches!(capability, VerifiedInstallationCapability::Available { .. });
     }
-    compatibility_bridge::provider_for_model(model)
-        .is_some_and(|provider| provider.can_install_model(model))
+    false
 }
 
 fn supports_managed_uninstall(model: &SttModelInfo, install_status: &ModelInstallStatus) -> bool {
-    compatibility_bridge::provider_for_model(model).is_some_and(|provider| {
-        let mut model = model.clone();
-        model.install_status = install_status.clone();
-        provider.can_uninstall_model(&model)
-    })
+    crate::model_catalog::normalized_install_artifact(&ModelId::new(&model.id)).is_some()
+        && install_status.is_runnable()
 }
 
 fn has_managed_runtime_install(config: &AppConfig, provider: ProviderHandle) -> bool {
@@ -3143,7 +3139,7 @@ fn resolve_managed_runtime_executable(
 }
 
 fn packaged_runtime_path(config: &AppConfig, model: &SttModelInfo) -> Option<PathBuf> {
-    let provider = compatibility_bridge::provider_for_model(model)?;
+    let provider = compatibility_bridge::provider_for_legacy_model(config, model)?;
     let bundled_root = env::current_exe()
         .ok()
         .and_then(|path| path.parent().map(Path::to_path_buf));
@@ -3183,7 +3179,7 @@ fn runtime_source_is_staged(config: &AppConfig, model: &SttModelInfo, path: &Pat
         return false;
     };
 
-    let Some(provider) = compatibility_bridge::provider_for_model(model) else {
+    let Some(provider) = compatibility_bridge::provider_for_legacy_model(config, model) else {
         return false;
     };
     let Some(current) = config.general.managed_runtimes.get(provider.id()) else {
@@ -3201,10 +3197,10 @@ fn path_is_within(path: &Path, root: &Path) -> bool {
 }
 
 fn development_runtime_package(
-    _config: &AppConfig,
+    config: &AppConfig,
     model: &SttModelInfo,
 ) -> Option<DevelopmentRuntimePackage> {
-    let provider = compatibility_bridge::provider_for_model(model)?;
+    let provider = compatibility_bridge::provider_for_legacy_model(config, model)?;
     let spec = provider.development_package()?;
     let script = find_development_bundle_script(spec.script_name)?;
     let destination_root = config::runtime_storage_dir().join(provider.id());
@@ -8810,7 +8806,8 @@ impl LocalTranscriberApp {
             self.start_model_download_only(model);
             return;
         }
-        let Some(provider) = compatibility_bridge::provider_for_model(model) else {
+        let Some(provider) = compatibility_bridge::provider_for_legacy_model(&self.config, model)
+        else {
             self.fail_model_install(&model.id, "Model provider is not available.".to_owned());
             return;
         };
@@ -9755,7 +9752,8 @@ impl LocalTranscriberApp {
             }
             return;
         }
-        let Some(provider) = compatibility_bridge::provider_for_model(model) else {
+        let Some(provider) = compatibility_bridge::provider_for_legacy_model(&self.config, model)
+        else {
             self.status = TranscriptionStatus::Error;
             self.status_message = "Model provider is not available.".to_owned();
             return;
@@ -10020,7 +10018,8 @@ impl LocalTranscriberApp {
             };
             return;
         }
-        let Some(provider) = compatibility_bridge::provider_for_model(model) else {
+        let Some(provider) = compatibility_bridge::provider_for_legacy_model(&self.config, model)
+        else {
             self.status = TranscriptionStatus::Error;
             self.status_message = "Model provider is not available.".to_owned();
             return;
@@ -11624,13 +11623,13 @@ impl LocalTranscriberApp {
                 mutation_block_reason.clone(),
             )
         } else if installed {
-            let runtime_busy = compatibility_bridge::provider_for_model(model)
+            let runtime_busy = compatibility_bridge::provider_for_legacy_model(&self.config, model)
                 .is_some_and(|provider| self.runtime_jobs.contains_key(provider.id()));
             let runtime_action = runtime_action_state_with_activity(
                 &self.config,
                 model,
                 runtime_busy,
-                compatibility_bridge::provider_for_model(model)
+                compatibility_bridge::provider_for_legacy_model(&self.config, model)
                     .map_or_else(RuntimeConsumerActivity::default, |provider| {
                         self.runtime_consumer_activity(provider.id())
                     }),
@@ -12098,7 +12097,8 @@ impl LocalTranscriberApp {
                 if let Some(model) = config::configured_models(&self.config)
                     .into_iter()
                     .find(|model| model.id == id)
-                    && let Some(provider) = compatibility_bridge::provider_for_model(&model)
+                    && let Some(provider) =
+                        compatibility_bridge::provider_for_legacy_model(&self.config, &model)
                 {
                     let state = runtime_action_state_with_activity(
                         &self.config,
@@ -14678,11 +14678,6 @@ fn stitch_visuals(theme_mode: ThemeMode) -> egui::Visuals {
     ThemePalette::visuals(matches!(theme_mode, ThemeMode::Dark))
 }
 
-#[cfg(test)]
-fn model_storage_estimate(model: &SttModelInfo) -> &'static str {
-    compatibility_bridge::model_storage_estimate(model)
-}
-
 fn model_ui_labels(model: &SttModelInfo, descriptor: Option<&ModelDescriptor>) -> (String, String) {
     let variant = model_variant_label(model, descriptor);
     let name = descriptor.map_or(model.name.as_str(), |value| value.display_name);
@@ -15388,7 +15383,7 @@ fn runtime_status_for_model(config: &AppConfig, model: &SttModelInfo) -> ModelRu
             }
         };
     }
-    let Some(provider) = compatibility_bridge::provider_for_model(model) else {
+    let Some(provider) = compatibility_bridge::provider_for_legacy_model(config, model) else {
         return ModelRuntimeStatus::Error("Model provider is not available.".to_owned());
     };
 
@@ -19972,86 +19967,6 @@ mod layout_tests {
     }
 
     #[test]
-    fn descriptorless_installed_compatibility_model_remains_manageable_and_selectable() {
-        let mut app = test_app();
-        let id = "vosk_small_en";
-        let root = std::env::temp_dir().join(format!(
-            "scribe-app-vosk-{}-{}",
-            std::process::id(),
-            NEXT_TEST_SESSION.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = fs::remove_dir_all(&root);
-        for directory in ["am", "conf", "graph"] {
-            fs::create_dir_all(root.join(directory)).unwrap();
-        }
-        fs::write(root.join("am").join("final.mdl"), b"model").unwrap();
-        fs::write(root.join("conf").join("model.conf"), b"conf").unwrap();
-        fs::write(root.join("graph").join("HCLG.fst"), b"graph").unwrap();
-        app.config
-            .general
-            .model_paths
-            .insert(id.to_owned(), root.clone());
-        config::normalize_config(&mut app.config);
-        app.remote_catalog.invalidate_local_models();
-        app.rebuild_model_inventory_projection();
-        assert!(
-            app.transcription_service
-                .model_descriptor(&ModelId::new(id))
-                .is_err(),
-            "the fixture must exercise the descriptor-less compatibility path"
-        );
-
-        let projected = app
-            .model_management_catalog()
-            .into_iter()
-            .find(|model| model.id == id)
-            .expect("installed compatibility model must remain visible");
-        assert!(projected.installed);
-        assert_eq!(projected.display_name, "Vosk small English");
-        assert_eq!(projected.variant_label, "small.en");
-        assert_eq!(projected.compatibility, ModelCompatibility::Incompatible);
-        assert!(!projected.capabilities.capabilities_known);
-
-        app.model_downloads
-            .insert(id.to_owned(), ModelInstallStatus::InstallingRuntime);
-        app.remote_catalog.invalidate_local_models();
-        app.rebuild_model_inventory_projection();
-        let repairing = app
-            .model_management_catalog()
-            .into_iter()
-            .find(|model| model.id == id)
-            .expect("compatibility model must remain visible during runtime repair");
-        assert!(repairing.installed);
-        assert!(!repairing.ready);
-        assert_eq!(repairing.download_state, ModelDownloadState::Verifying);
-        assert_eq!(repairing.primary_action_label, "Repair runtime");
-
-        app.model_downloads.insert(
-            id.to_owned(),
-            ModelInstallStatus::RuntimeError("runtime repair failed".into()),
-        );
-        app.remote_catalog.invalidate_local_models();
-        app.rebuild_model_inventory_projection();
-        let failed = app
-            .model_management_catalog()
-            .into_iter()
-            .find(|model| model.id == id)
-            .expect("compatibility model must remain visible after runtime repair fails");
-        assert!(failed.installed);
-        assert!(!failed.ready);
-        assert_eq!(failed.download_state, ModelDownloadState::Failed);
-        assert_eq!(failed.primary_action_label, "Repair runtime");
-
-        app.config.general.selected_default_model = id.to_owned();
-        assert_eq!(app.selected_model_ui_label(), "Vosk small English");
-        let selected = app.transcribe_screen_models();
-        assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].id, id);
-        assert_eq!(selected[0].display_name, "Vosk small English");
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
     fn settings_model_projection_reuses_one_resolved_model_value() {
         let mut app = test_app();
         let resolved = app.selected_model().expect("test app has a selected model");
@@ -23757,8 +23672,8 @@ mod layout_tests {
 
     fn test_model() -> SttModelInfo {
         SttModelInfo {
-            id: "whisper_cpp_base_en".to_owned(),
-            name: "whisper.cpp base.en".to_owned(),
+            id: "legacy_whisper_ggml".to_owned(),
+            name: "Legacy whisper.cpp GGML".to_owned(),
             backend: "whisper.cpp".to_owned(),
             description:
                 "Recommended first-run local English model with a better speed/quality balance."
@@ -23775,77 +23690,20 @@ mod layout_tests {
         }
     }
 
-    fn write_vosk_runtime(root: &Path) -> PathBuf {
-        write_vosk_runtime_with_revision(root, 3)
-    }
-
-    fn write_vosk_runtime_with_revision(root: &Path, runner_revision: u32) -> PathBuf {
-        let executable = root.join("bin").join(runtime_wrapper_name("scribe-vosk"));
-        let runner = root.join("bin").join("vosk_runner.py");
+    fn write_whisper_cli_runtime(root: &Path) -> PathBuf {
+        let executable = root.join("bin").join(whisper_cli_name());
         let manifest = root.join("runtime-manifest.json");
-        let python = if cfg!(windows) {
-            root.join("venv").join("Scripts").join("python.exe")
-        } else {
-            root.join("venv").join("bin").join("python")
-        };
         fs::create_dir_all(executable.parent().unwrap()).unwrap();
-        fs::create_dir_all(python.parent().unwrap()).unwrap();
-        fs::write(&executable, b"vosk runtime").unwrap();
-        fs::write(runner, b"runner").unwrap();
-        fs::write(
-            manifest,
-            format!(r#"{{"runner_revision":{runner_revision}}}"#),
-        )
-        .unwrap();
-        fs::write(python, b"python").unwrap();
+        fs::write(&executable, b"whisper compatibility runtime").unwrap();
+        fs::write(manifest, r#"{"version":"v1.9.1"}"#).unwrap();
         executable
     }
 
-    fn write_sherpa_family_runtime(root: &Path, runtime_id: &str, wrapper: &str) -> PathBuf {
-        let executable = root.join("bin").join(runtime_wrapper_name(wrapper));
-        let runner = root.join("bin").join("sherpa_onnx_runner.py");
-        let manifest = root.join("runtime-manifest.json");
-        let python = if cfg!(windows) {
-            root.join("venv").join("Scripts").join("python.exe")
-        } else {
-            root.join("venv").join("bin").join("python")
-        };
-        fs::create_dir_all(executable.parent().unwrap()).unwrap();
-        fs::create_dir_all(python.parent().unwrap()).unwrap();
-        fs::write(&executable, b"sherpa runtime").unwrap();
-        fs::write(runner, b"runner").unwrap();
-        fs::write(
-            manifest,
-            format!(
-                r#"{{"runtime_id":"{runtime_id}","runner_revision":2,"versions":{{"numpy":"2.3.2"}}}}"#
-            ),
-        )
-        .unwrap();
-        fs::write(python, b"python").unwrap();
-        executable
-    }
-
-    fn runtime_wrapper_name(wrapper: &str) -> String {
+    fn whisper_cli_name() -> &'static str {
         if cfg!(windows) {
-            format!("{wrapper}.bat")
+            "whisper-cli.exe"
         } else {
-            wrapper.to_owned()
-        }
-    }
-
-    fn expected_runtime_install_action(_backend: &str) -> RuntimeActionState {
-        if cfg!(unix) {
-            RuntimeActionState {
-                kind: RuntimeActionKind::Install,
-                enabled: true,
-                disabled_tooltip: None,
-            }
-        } else {
-            RuntimeActionState {
-                kind: RuntimeActionKind::Install,
-                enabled: false,
-                disabled_tooltip: Some(missing_runtime_source_message()),
-            }
+            "whisper-cli"
         }
     }
 
@@ -24651,11 +24509,8 @@ mod layout_tests {
             std::process::id()
         ));
         let _ = fs::remove_dir_all(&root);
-        let packaged = root
-            .join("package")
-            .join("bin")
-            .join(runtime_wrapper_name("scribe-vosk"));
-        let direct_directory = root.join("scribe-vosk-directory");
+        let packaged = root.join("package").join("bin").join(whisper_cli_name());
+        let direct_directory = root.join("whisper-cli-directory");
         fs::create_dir_all(packaged.parent().unwrap()).unwrap();
         fs::create_dir_all(&direct_directory).unwrap();
         fs::write(&packaged, b"runtime").unwrap();
@@ -24673,13 +24528,13 @@ mod layout_tests {
         ));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
-        let executable = root.join(runtime_wrapper_name("scribe-vosk"));
+        let executable = root.join(whisper_cli_name());
         let unrelated = root.join("unrelated.marker");
         let target = root.join("managed");
         fs::write(&executable, b"standalone executable").unwrap();
         fs::write(&unrelated, b"unrelated").unwrap();
 
-        let err = install_runtime_files_to("vosk", &executable, &target).unwrap_err();
+        let err = install_runtime_files_to("whisper_cpp", &executable, &target).unwrap_err();
 
         assert!(err.contains("determine runtime package root"));
         assert_eq!(fs::read(unrelated).unwrap(), b"unrelated");
@@ -24702,7 +24557,7 @@ mod layout_tests {
         ));
         let _ = fs::remove_dir_all(&root);
         let source_root = root.join("package");
-        let executable = write_vosk_runtime(&source_root);
+        let executable = write_whisper_cli_runtime(&source_root);
         let package_marker = source_root.join("package.marker");
         let target = source_root.join("managed");
         let previous_marker = target.join("previous.marker");
@@ -24710,7 +24565,7 @@ mod layout_tests {
         fs::write(&package_marker, b"package").unwrap();
         fs::write(&previous_marker, b"previous").unwrap();
 
-        let err = install_runtime_files_to("vosk", &executable, &target).unwrap_err();
+        let err = install_runtime_files_to("whisper_cpp", &executable, &target).unwrap_err();
 
         assert!(err.contains("cannot overlap the managed runtime"));
         assert!(executable.is_file());
@@ -24737,7 +24592,8 @@ mod layout_tests {
         let missing = source_root.join("missing");
         fs::create_dir_all(&missing).unwrap();
         let aliased_target = missing.join("..").join("aliased-managed");
-        let alias_err = install_runtime_files_to("vosk", &executable, &aliased_target).unwrap_err();
+        let alias_err =
+            install_runtime_files_to("whisper_cpp", &executable, &aliased_target).unwrap_err();
         assert!(alias_err.contains("cannot overlap the managed runtime"));
         assert_eq!(fs::read(&package_marker).unwrap(), b"package");
         assert_eq!(fs::read(&previous_marker).unwrap(), b"previous");
@@ -24759,13 +24615,13 @@ mod layout_tests {
         ));
         let _ = fs::remove_dir_all(&target);
         let source_root = target.join("package");
-        let executable = write_vosk_runtime(&source_root);
+        let executable = write_whisper_cli_runtime(&source_root);
         let package_marker = source_root.join("package.marker");
         let sibling_marker = target.join("sibling.marker");
         fs::write(&package_marker, b"package").unwrap();
         fs::write(&sibling_marker, b"sibling").unwrap();
 
-        let err = match install_runtime_files_to("vosk", &executable, &target) {
+        let err = match install_runtime_files_to("whisper_cpp", &executable, &target) {
             Err(err) => err,
             Ok(replacement) => {
                 replacement.rollback().unwrap();
@@ -24799,15 +24655,15 @@ mod layout_tests {
             std::env::temp_dir().join(format!("scribe-runtime-bin-package-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let source_root = root.join("package");
-        let executable = write_vosk_runtime(&source_root);
+        let executable = write_whisper_cli_runtime(&source_root);
         fs::write(source_root.join("package.marker"), b"package").unwrap();
         let target = root.join("managed");
 
-        let replacement = install_runtime_files_to("vosk", &executable, &target).unwrap();
+        let replacement = install_runtime_files_to("whisper_cpp", &executable, &target).unwrap();
 
         assert_eq!(
             replacement.installed_path,
-            target.join("bin").join(runtime_wrapper_name("scribe-vosk"))
+            target.join("bin").join(whisper_cli_name())
         );
         assert_eq!(fs::read(target.join("package.marker")).unwrap(), b"package");
         replacement.commit().unwrap();
@@ -24825,73 +24681,64 @@ mod layout_tests {
         ));
         let _ = fs::remove_dir_all(&root);
         let source_root = root.join("package");
-        let executable = write_vosk_runtime(&source_root);
+        let executable = write_whisper_cli_runtime(&source_root);
         let linked_root = root.join("linked-package");
         symlink(&source_root, &linked_root).unwrap();
-        let linked_executable = linked_root
-            .join("bin")
-            .join(runtime_wrapper_name("scribe-vosk"));
+        let linked_executable = linked_root.join("bin").join(whisper_cli_name());
 
-        let root_err =
-            install_runtime_files_to("vosk", &linked_executable, &root.join("managed-from-link"))
-                .unwrap_err();
+        let root_err = install_runtime_files_to(
+            "whisper_cpp",
+            &linked_executable,
+            &root.join("managed-from-link"),
+        )
+        .unwrap_err();
         assert!(root_err.contains("symbolic link or reparse point"));
 
         symlink(&executable, source_root.join("linked-entry")).unwrap();
-        let entry_err =
-            install_runtime_files_to("vosk", &executable, &root.join("managed")).unwrap_err();
+        let entry_err = install_runtime_files_to("whisper_cpp", &executable, &root.join("managed"))
+            .unwrap_err();
         assert!(entry_err.contains("symbolic link or reparse point"));
         assert!(!root.join("managed").exists());
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
-    fn managed_runtime_is_never_selected_as_packaged_source_across_backends() {
+    fn managed_whisper_runtime_is_never_selected_as_its_own_packaged_source() {
         let root = std::env::temp_dir().join(format!(
             "scribe-runtime-source-selection-{}",
             std::process::id()
         ));
         let _ = fs::remove_dir_all(&root);
-        for (backend, runtime_id, executable) in [
-            ("whisper.cpp", "whisper_cpp", "bin/whisper-cli"),
-            (
-                "faster-whisper",
-                "faster_whisper",
-                "bin/scribe-faster-whisper",
-            ),
-            ("Vosk", "vosk", "bin/scribe-vosk"),
-            ("sherpa-onnx", "sherpa_onnx", "bin/scribe-sherpa-onnx"),
-        ] {
-            let current = root
-                .join("managed-runtimes")
-                .join(runtime_id)
-                .join(executable);
-            let staged = root
-                .join("staged-runtimes")
-                .join(runtime_id)
-                .join(executable);
-            fs::create_dir_all(current.parent().unwrap()).unwrap();
-            fs::create_dir_all(staged.parent().unwrap()).unwrap();
-            fs::write(&current, b"current").unwrap();
-            fs::write(&staged, b"staged").unwrap();
-            let mut config = AppConfig::default();
-            config.general.managed_runtimes.insert(
-                runtime_id.to_owned(),
-                config::ManagedRuntimeInstall::new(current.clone()),
-            );
-            let mut model = test_model();
-            model.backend = backend.to_owned();
+        let runtime_id = "whisper_cpp";
+        let executable = Path::new("bin").join(whisper_cli_name());
+        let current = root
+            .join("managed-runtimes")
+            .join(runtime_id)
+            .join(&executable);
+        let staged = root
+            .join("staged-runtimes")
+            .join(runtime_id)
+            .join(&executable);
+        fs::create_dir_all(current.parent().unwrap()).unwrap();
+        fs::create_dir_all(staged.parent().unwrap()).unwrap();
+        fs::write(&current, b"current").unwrap();
+        fs::write(&staged, b"staged").unwrap();
+        let mut config = AppConfig::default();
+        config.general.managed_runtimes.insert(
+            runtime_id.to_owned(),
+            config::ManagedRuntimeInstall::new(current.clone()),
+        );
+        let model = test_model();
 
-            assert_eq!(
-                runtime_install_source_from_candidates(&config, &model, Some(current), None),
-                None,
-                "{backend} must not update from its managed install"
-            );
-            assert!(matches!(
-                runtime_install_source_from_candidates(&config, &model, Some(staged), None),
-                Some(RuntimeInstallSource::Packaged(_))
-            ));
-        }
+        assert_eq!(
+            runtime_install_source_from_candidates(&config, &model, Some(current), None),
+            None,
+            "managed runtime must not be its own update source"
+        );
+        assert!(matches!(
+            runtime_install_source_from_candidates(&config, &model, Some(staged), None),
+            Some(RuntimeInstallSource::Packaged(_))
+        ));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -24902,15 +24749,14 @@ mod layout_tests {
             std::process::id()
         ));
         let _ = fs::remove_dir_all(&runtime_root);
-        let executable = write_vosk_runtime(&runtime_root.join("vosk"));
+        let executable = write_whisper_cli_runtime(&runtime_root.join("whisper_cpp"));
         let mut config = AppConfig::default();
         config.general.managed_runtimes.insert(
-            "vosk".to_owned(),
-            managed_runtime_with_version(executable, Some("0.3.44")),
+            "whisper_cpp".to_owned(),
+            managed_runtime_with_version(executable, Some("v1.8.0")),
         );
-        let mut model = test_model();
-        model.backend = "Vosk".to_owned();
-        let provider = compatibility_bridge::provider_for_model(&model).unwrap();
+        let model = test_model();
+        let provider = compatibility_bridge::provider_for_legacy_model(&config, &model).unwrap();
 
         let action = runtime_action_state_for_source(&config, &model, provider, false);
 
@@ -24926,21 +24772,21 @@ mod layout_tests {
             std::process::id()
         ));
         let _ = fs::remove_dir_all(&root);
-        let target_root = root.join("managed-vosk");
-        let previous_executable = write_vosk_runtime(&target_root);
+        let target_root = root.join("managed-whisper");
+        let previous_executable = write_whisper_cli_runtime(&target_root);
         fs::write(target_root.join("previous.marker"), b"previous").unwrap();
         let invalid_source = root.join("invalid-source");
-        let invalid_executable = invalid_source
-            .join("bin")
-            .join(runtime_wrapper_name("scribe-vosk"));
+        let invalid_executable = invalid_source.join("bin").join(whisper_cli_name());
         fs::create_dir_all(invalid_executable.parent().unwrap()).unwrap();
         fs::write(&invalid_executable, b"invalid").unwrap();
 
-        let result = install_runtime_files_to("vosk", &invalid_executable, &target_root);
+        let result =
+            install_runtime_files_to("unsupported_runtime", &invalid_executable, &target_root);
 
         assert!(result.is_err());
         assert!(target_root.join("previous.marker").is_file());
-        assert!(crate::stt::vosk::is_vosk_runtime_usable(
+        assert!(compatibility_bridge::entrypoint_is_usable(
+            "whisper_cpp",
             &previous_executable
         ));
         let _ = fs::remove_dir_all(root);
@@ -24953,33 +24799,41 @@ mod layout_tests {
             std::process::id()
         ));
         let _ = fs::remove_dir_all(&root);
-        let target_root = root.join("managed-vosk");
-        let previous_executable = write_vosk_runtime(&target_root);
+        let target_root = root.join("managed-whisper");
+        let previous_executable = write_whisper_cli_runtime(&target_root);
         fs::write(target_root.join("previous.marker"), b"previous").unwrap();
-        let source_root = root.join("staged-vosk");
-        let source_executable = write_vosk_runtime(&source_root);
+        let source_root = root.join("staged-whisper");
+        let source_executable = write_whisper_cli_runtime(&source_root);
         fs::write(source_root.join("new.marker"), b"new").unwrap();
 
         let replacement =
-            install_runtime_files_to("vosk", &source_executable, &target_root).unwrap();
+            install_runtime_files_to("whisper_cpp", &source_executable, &target_root).unwrap();
         let mut config = AppConfig::default();
         let mut previous_record = config::ManagedRuntimeInstall::new(previous_executable.clone());
         previous_record.source = Some("previous".to_owned());
         config
             .general
             .managed_runtimes
-            .insert("vosk".to_owned(), previous_record.clone());
+            .insert("whisper_cpp".to_owned(), previous_record.clone());
         let mut new_record = config::ManagedRuntimeInstall::new(replacement.installed_path.clone());
         new_record.source = Some("replacement".to_owned());
-        assert!(!runtime_metadata_matches(&config, "vosk", &new_record));
-        let replaced = apply_runtime_record(&mut config, "vosk", new_record.clone());
-        assert!(runtime_metadata_matches(&config, "vosk", &new_record));
+        assert!(!runtime_metadata_matches(
+            &config,
+            "whisper_cpp",
+            &new_record
+        ));
+        let replaced = apply_runtime_record(&mut config, "whisper_cpp", new_record.clone());
+        assert!(runtime_metadata_matches(
+            &config,
+            "whisper_cpp",
+            &new_record
+        ));
 
-        rollback_runtime_record(&mut config, "vosk", replaced);
+        rollback_runtime_record(&mut config, "whisper_cpp", replaced);
         replacement.rollback().unwrap();
 
         assert_eq!(
-            config.general.managed_runtimes.get("vosk"),
+            config.general.managed_runtimes.get("whisper_cpp"),
             Some(&previous_record)
         );
         assert!(target_root.join("previous.marker").is_file());
@@ -24994,7 +24848,7 @@ mod layout_tests {
         config
             .general
             .managed_runtimes
-            .insert("vosk".to_owned(), previous.clone());
+            .insert("whisper_cpp".to_owned(), previous.clone());
         let replacement = config::ManagedRuntimeInstall::new(PathBuf::from("replacement-runtime"));
         let job = RuntimeInstallJob {
             download_model_ids: vec!["queued-model".to_owned()],
@@ -25004,18 +24858,21 @@ mod layout_tests {
 
         let failed = persist_runtime_install(
             &mut config,
-            "vosk",
+            "whisper_cpp",
             replacement.clone(),
             job.clone(),
             |saved| {
                 persistence_attempted.set(true);
-                assert!(runtime_metadata_matches(saved, "vosk", &replacement));
+                assert!(runtime_metadata_matches(saved, "whisper_cpp", &replacement));
                 Err("disk full".to_owned())
             },
         );
 
         assert!(persistence_attempted.get());
-        assert_eq!(config.general.managed_runtimes.get("vosk"), Some(&previous));
+        assert_eq!(
+            config.general.managed_runtimes.get("whisper_cpp"),
+            Some(&previous)
+        );
         assert!(matches!(
             failed,
             RuntimePersistenceTransition::Failed {
@@ -25028,12 +24885,17 @@ mod layout_tests {
         ));
 
         persistence_attempted.set(false);
-        let persisted =
-            persist_runtime_install(&mut config, "vosk", replacement.clone(), job, |saved| {
-                assert!(runtime_metadata_matches(saved, "vosk", &replacement));
+        let persisted = persist_runtime_install(
+            &mut config,
+            "whisper_cpp",
+            replacement.clone(),
+            job,
+            |saved| {
+                assert!(runtime_metadata_matches(saved, "whisper_cpp", &replacement));
                 persistence_attempted.set(true);
                 Ok(())
-            });
+            },
+        );
         assert!(persistence_attempted.get());
         assert!(matches!(
             persisted,
@@ -25051,23 +24913,26 @@ mod layout_tests {
         config
             .general
             .managed_runtimes
-            .insert("vosk".to_owned(), install.clone());
+            .insert("whisper_cpp".to_owned(), install.clone());
 
         assert!(
             apply_runtime_uninstall_result(
                 &mut config,
-                "vosk",
+                "whisper_cpp",
                 Err("runtime is locked".to_owned()),
             )
             .is_err()
         );
-        assert_eq!(config.general.managed_runtimes.get("vosk"), Some(&install));
+        assert_eq!(
+            config.general.managed_runtimes.get("whisper_cpp"),
+            Some(&install)
+        );
 
         assert_eq!(
-            apply_runtime_uninstall_result(&mut config, "vosk", Ok(false)),
+            apply_runtime_uninstall_result(&mut config, "whisper_cpp", Ok(false)),
             Ok(false)
         );
-        assert!(!config.general.managed_runtimes.contains_key("vosk"));
+        assert!(!config.general.managed_runtimes.contains_key("whisper_cpp"));
     }
 
     #[test]
@@ -26048,20 +25913,6 @@ mod layout_tests {
     }
 
     #[test]
-    fn faster_whisper_large_v3_has_progress_total() {
-        let model = config::configured_models(&AppConfig::default())
-            .into_iter()
-            .find(|model| model.id == "faster_whisper_large_v3")
-            .unwrap();
-
-        assert_eq!(model_storage_estimate(&model), "~3.1 GB");
-        assert_eq!(
-            model_download_total_bytes(&model),
-            Some((3.1_f64 * 1024.0 * 1024.0 * 1024.0).round() as u64)
-        );
-    }
-
-    #[test]
     fn normalized_descriptors_expose_only_evidence_backed_device_capabilities() {
         let service = TranscriptionService::new(AppConfig::default());
         let descriptors = service.model_descriptors();
@@ -26085,14 +25936,9 @@ mod layout_tests {
             std::env::temp_dir().join(format!("scribe-neutral-playground-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let primary = root.join("primary.gguf");
-        let legacy = root.join("legacy");
-        fs::create_dir_all(legacy.join("am")).unwrap();
-        fs::create_dir_all(legacy.join("conf")).unwrap();
-        fs::create_dir_all(legacy.join("graph")).unwrap();
+        let retired = root.join("retired-provider-artifact");
         fs::write(&primary, b"model").unwrap();
-        fs::write(legacy.join("am/final.mdl"), b"model").unwrap();
-        fs::write(legacy.join("conf/model.conf"), b"config").unwrap();
-        fs::write(legacy.join("graph/HCLG.fst"), b"graph").unwrap();
+        fs::write(&retired, b"retired provider artifact").unwrap();
 
         let mut config = AppConfig::default();
         config
@@ -26102,9 +25948,11 @@ mod layout_tests {
         config
             .general
             .model_paths
-            .insert("vosk_small_en".to_owned(), legacy);
-        config.general.playground_selected_models =
-            vec!["whisper_cpp_tiny_en".to_owned(), "vosk_small_en".to_owned()];
+            .insert("retired-provider-id".to_owned(), retired);
+        config.general.playground_selected_models = vec![
+            "whisper_cpp_tiny_en".to_owned(),
+            "retired-provider-id".to_owned(),
+        ];
         let service = TranscriptionService::new(config.clone());
 
         let cards = cards_from_config(&config, &service);
@@ -26116,61 +25964,9 @@ mod layout_tests {
     }
 
     #[test]
-    fn vosk_small_en_has_progress_total_and_managed_download() {
-        let model = config::configured_models(&AppConfig::default())
-            .into_iter()
-            .find(|model| model.id == "vosk_small_en")
-            .unwrap();
-
-        assert_eq!(model_storage_estimate(&model), "~50 MB");
-        assert_eq!(
-            model.download_model.as_deref(),
-            Some("vosk-model-small-en-us-0.15")
-        );
-        assert_eq!(model_download_total_bytes(&model), Some(40 * 1024 * 1024));
-    }
-
-    #[test]
-    fn sherpa_family_models_have_progress_totals_and_managed_downloads() {
-        let models = config::configured_models(&AppConfig::default());
-        let sherpa = models
-            .iter()
-            .find(|model| model.id == "sherpa_onnx_zipformer_small")
-            .unwrap();
-        let moonshine = models.iter().find(|model| model.id == "moonshine").unwrap();
-        let parakeet = models
-            .iter()
-            .find(|model| model.id == "parakeet_0_6b")
-            .unwrap();
-
-        assert_eq!(
-            sherpa.download_model.as_deref(),
-            Some("sherpa-onnx-zipformer-small-en-2023-06-26")
-        );
-        assert_eq!(model_download_total_bytes(sherpa), Some(85 * 1024 * 1024));
-        assert_eq!(
-            moonshine.download_model.as_deref(),
-            Some("sherpa-onnx-moonshine-tiny-en-quantized-2026-02-27")
-        );
-        assert_eq!(model_storage_estimate(moonshine), "~35 MB");
-        assert_eq!(
-            model_download_total_bytes(moonshine),
-            Some(35 * 1024 * 1024)
-        );
-        assert_eq!(
-            parakeet.download_model.as_deref(),
-            Some("sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-non-streaming")
-        );
-        assert_eq!(model_storage_estimate(parakeet), "~640 MB");
-        assert_eq!(
-            model_download_total_bytes(parakeet),
-            Some(650 * 1024 * 1024)
-        );
-    }
-
-    #[test]
     fn runtime_action_state_explains_supported_and_unsupported_runtimes() {
-        let normalized_gguf = config::configured_models(&AppConfig::default())
+        let configured = config::configured_models(&AppConfig::default());
+        let normalized_gguf = configured
             .into_iter()
             .find(|model| model.id == "whisper_cpp_tiny_en")
             .unwrap();
@@ -26191,6 +25987,26 @@ mod layout_tests {
                 ),
             }
         );
+        assert!(
+            compatibility_bridge::provider_for_legacy_model(&config, &normalized_gguf).is_none()
+        );
+
+        let receipt_onnx = config::configured_models(&config)
+            .into_iter()
+            .find(|model| model.id == "moonshine-tiny-en-int8-onnx")
+            .unwrap();
+        assert_eq!(
+            runtime_action_state(&config, &receipt_onnx),
+            RuntimeActionState {
+                kind: RuntimeActionKind::Install,
+                enabled: false,
+                disabled_tooltip: Some(
+                    "This verified model artifact does not use a managed runtime package."
+                        .to_owned(),
+                ),
+            }
+        );
+        assert!(compatibility_bridge::provider_for_legacy_model(&config, &receipt_onnx).is_none());
 
         let mut unsupported = test_model();
         unsupported.id = "unsupported-model".to_owned();
@@ -26207,243 +26023,19 @@ mod layout_tests {
     }
 
     #[test]
-    fn legacy_runtime_action_state_preserves_compatibility_provider_actions() {
-        let runtime_root =
-            std::env::temp_dir().join(format!("scribe-runtime-action-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&runtime_root);
-
-        let mut faster_whisper = test_model();
-        faster_whisper.id = "faster_whisper_tiny_en".to_owned();
-        faster_whisper.backend = "faster-whisper".to_owned();
-        faster_whisper.download_model = Some("tiny.en".to_owned());
-        let action = runtime_action_state(&AppConfig::default(), &faster_whisper);
-
-        assert_eq!(
-            action,
-            expected_runtime_install_action(&faster_whisper.backend)
-        );
-
-        let mut vosk = test_model();
-        vosk.id = "vosk_small_en".to_owned();
-        vosk.name = "Vosk small English".to_owned();
-        vosk.backend = "Vosk".to_owned();
-        vosk.download_model = Some("vosk-model-small-en-us-0.15".to_owned());
-
-        assert_eq!(
-            runtime_action_state(&AppConfig::default(), &vosk),
-            expected_runtime_install_action(&vosk.backend)
-        );
-
-        let mut config = AppConfig::default();
-        config.general.managed_runtimes.insert(
-            "vosk".to_owned(),
-            managed_runtime_with_version(
-                write_vosk_runtime(&runtime_root.join("vosk")),
-                Some("0.3.45"),
-            ),
-        );
-
-        assert_eq!(
-            runtime_action_state(&config, &vosk),
-            RuntimeActionState {
-                kind: RuntimeActionKind::Uninstall,
-                enabled: true,
-                disabled_tooltip: None,
-            }
-        );
-
-        let managed_models = [
-            (
-                "sherpa_onnx_zipformer_small",
-                "sherpa-onnx",
-                "sherpa_onnx",
-                "scribe-sherpa-onnx",
-                "sherpa-onnx-zipformer-small-en-2023-06-26",
-            ),
-            (
-                "moonshine",
-                "Moonshine",
-                "moonshine",
-                "scribe-moonshine",
-                "sherpa-onnx-moonshine-tiny-en-quantized-2026-02-27",
-            ),
-            (
-                "parakeet_0_6b",
-                "Parakeet",
-                "parakeet",
-                "scribe-parakeet",
-                "sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-non-streaming",
-            ),
-        ];
-        for (model_id, backend, runtime_id, wrapper, download_model) in managed_models {
-            let mut model = test_model();
-            model.id = model_id.to_owned();
-            model.backend = backend.to_owned();
-            model.download_model = Some(download_model.to_owned());
-
-            assert_eq!(
-                runtime_action_state(&AppConfig::default(), &model),
-                expected_runtime_install_action(&model.backend),
-                "{backend} should be installable"
-            );
-
-            config.general.managed_runtimes.clear();
-            config.general.managed_runtimes.insert(
-                runtime_id.to_owned(),
-                managed_runtime_with_version(
-                    write_sherpa_family_runtime(
-                        &runtime_root.join(runtime_id),
-                        runtime_id,
-                        wrapper,
-                    ),
-                    Some("1.13.3"),
-                ),
-            );
-
-            assert_eq!(
-                runtime_action_state(&config, &model),
-                RuntimeActionState {
-                    kind: RuntimeActionKind::Uninstall,
-                    enabled: true,
-                    disabled_tooltip: None,
-                },
-                "{backend} should detect installed runtime"
-            );
-        }
-
-        let _ = fs::remove_dir_all(runtime_root);
-    }
-
-    #[test]
-    fn runtime_action_state_ignores_stale_runtime_metadata() {
-        let runtime_root =
-            std::env::temp_dir().join(format!("scribe-stale-runtime-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&runtime_root);
-
-        let mut config = AppConfig::default();
-        config.general.managed_runtimes.insert(
-            "faster_whisper".to_owned(),
-            config::ManagedRuntimeInstall::new(PathBuf::from(
-                "/tmp/scribe-runtimes/missing/bin/scribe-faster-whisper",
-            )),
-        );
-        let mut model = test_model();
-        model.id = "faster_whisper_tiny_en".to_owned();
-        model.backend = "faster-whisper".to_owned();
-        model.download_model = Some("tiny.en".to_owned());
-
-        let action = runtime_action_state(&config, &model);
-
-        assert_eq!(action.kind, RuntimeActionKind::Install);
-        assert_eq!(action, expected_runtime_install_action(&model.backend));
-
-        config.general.managed_runtimes.clear();
-        config.general.managed_runtimes.insert(
-            "vosk".to_owned(),
-            config::ManagedRuntimeInstall::new(write_vosk_runtime_with_revision(
-                &runtime_root.join("vosk"),
-                2,
-            )),
-        );
-        model.backend = "Vosk".to_owned();
-        model.id = "vosk_small_en".to_owned();
-        model.download_model = Some("vosk-model-small-en-us-0.15".to_owned());
-
-        let action = runtime_action_state(&config, &model);
-
-        assert_eq!(action.kind, RuntimeActionKind::Install);
-        assert_eq!(action, expected_runtime_install_action(&model.backend));
-        let _ = fs::remove_dir_all(runtime_root);
-    }
-
-    #[test]
-    fn runtime_version_state_detects_current_stale_and_unknown_installs() {
-        let mut model = test_model();
-        model.backend = "Vosk".to_owned();
-        let provider = compatibility_bridge::provider_for_model(&model).unwrap();
-        let mut config = AppConfig::default();
-
-        config.general.managed_runtimes.insert(
-            "vosk".to_owned(),
-            managed_runtime_with_version(PathBuf::from("/tmp/scribe/vosk"), Some("0.3.45")),
-        );
-        assert_eq!(
-            runtime_version_state(&config, provider),
-            RuntimeVersionState::Current("0.3.45".to_owned())
-        );
-
-        config.general.managed_runtimes.insert(
-            "vosk".to_owned(),
-            managed_runtime_with_version(PathBuf::from("/tmp/scribe/vosk"), Some("0.3.44")),
-        );
-        assert_eq!(
-            runtime_version_state(&config, provider),
-            RuntimeVersionState::UpdateAvailable {
-                installed: Some("0.3.44".to_owned()),
-                available: "0.3.45".to_owned(),
-            }
-        );
-
-        config.general.managed_runtimes.insert(
-            "vosk".to_owned(),
-            managed_runtime_with_version(PathBuf::from("/tmp/scribe/vosk"), None),
-        );
-        assert_eq!(
-            runtime_version_state(&config, provider),
-            RuntimeVersionState::UpdateAvailable {
-                installed: None,
-                available: "0.3.45".to_owned(),
-            }
-        );
-    }
-
-    #[test]
-    fn runtime_action_state_offers_update_for_stale_version_when_source_exists() {
-        let runtime_root =
-            std::env::temp_dir().join(format!("scribe-runtime-update-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&runtime_root);
-        let mut config = AppConfig::default();
-        let mut model = test_model();
-        model.id = "vosk_small_en".to_owned();
-        model.backend = "Vosk".to_owned();
-        model.download_model = Some("vosk-model-small-en-us-0.15".to_owned());
-        config.general.managed_runtimes.insert(
-            "vosk".to_owned(),
-            managed_runtime_with_version(
-                write_vosk_runtime(&runtime_root.join("vosk")),
-                Some("0.3.44"),
-            ),
-        );
-
-        let action = runtime_action_state(&config, &model);
-
-        if runtime_install_source(&config, &model).is_some() {
-            assert_eq!(action.kind, RuntimeActionKind::Update);
-        } else {
-            assert_eq!(action.kind, RuntimeActionKind::Uninstall);
-        }
-        assert!(action.enabled);
-        let _ = fs::remove_dir_all(runtime_root);
-    }
-
-    #[test]
     fn managed_runtime_install_record_reads_manifest_metadata() {
         let runtime_root =
             std::env::temp_dir().join(format!("scribe-runtime-manifest-{}", std::process::id()));
         let _ = fs::remove_dir_all(&runtime_root);
-        let executable = runtime_root.join("bin").join("scribe-vosk");
+        let executable = runtime_root.join("bin").join(whisper_cli_name());
         let manifest = runtime_root.join("runtime-manifest.json");
         fs::create_dir_all(executable.parent().unwrap()).unwrap();
         fs::write(&executable, b"runtime").unwrap();
-        fs::write(
-            manifest,
-            r#"{"version":"0.3.45","sha256":"abc123","dependencies":{"vosk":"0.3.45"}}"#,
-        )
-        .unwrap();
+        fs::write(manifest, r#"{"version":"v1.9.1","sha256":"abc123"}"#).unwrap();
 
         let install = managed_runtime_install_record(executable, "packaged-runtime");
 
-        assert_eq!(install.version.as_deref(), Some("0.3.45"));
+        assert_eq!(install.version.as_deref(), Some("v1.9.1"));
         assert_eq!(install.sha256.as_deref(), Some("abc123"));
         assert_eq!(install.source.as_deref(), Some("packaged-runtime"));
         let _ = fs::remove_dir_all(runtime_root);
@@ -26498,64 +26090,6 @@ mod layout_tests {
         assert!(installed.installed_path.exists());
         installed.commit().unwrap();
         let _ = fs::remove_dir_all(root);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn development_runtime_script_rejects_broken_python_sidecar() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let root = std::env::temp_dir().join(format!(
-            "scribe-broken-python-runtime-test-{}",
-            std::process::id()
-        ));
-        let script = root.join("bundle-broken-runtime.sh");
-        let destination = root.join("runtime");
-        let executable = destination.join("bin").join("scribe-faster-whisper");
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
-        fs::create_dir_all(executable.parent().unwrap()).unwrap();
-        fs::write(&executable, b"runtime").unwrap();
-        fs::write(
-            destination.join("bin").join("faster_whisper_runner.py"),
-            b"runner",
-        )
-        .unwrap();
-        fs::write(&script, "#!/usr/bin/env bash\nexit 0\n").unwrap();
-        let mut permissions = fs::metadata(&script).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script, permissions).unwrap();
-
-        let err = build_development_runtime_package(
-            "faster_whisper",
-            "faster-whisper",
-            DevelopmentRuntimePackage {
-                script,
-                destination_env: "SCRIBE_TEST_RUNTIME_DEST",
-                destination_root: destination,
-                executable_path: executable,
-            },
-        )
-        .unwrap_err();
-
-        assert!(err.contains("usable runtime"));
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn faster_whisper_model_needs_runtime_instead_of_placeholder_backend_message() {
-        let mut model = test_model();
-        model.id = "faster_whisper_tiny_en".to_owned();
-        model.name = "faster-whisper tiny.en".to_owned();
-        model.backend = "faster-whisper".to_owned();
-        model.local_path = Some(PathBuf::from("/tmp/scribe-fw-tiny"));
-        model.install_status = ModelInstallStatus::Installed;
-        model.download_model = Some("tiny.en".to_owned());
-
-        let status = runtime_status_for_model(&AppConfig::default(), &model);
-
-        assert_eq!(status, ModelRuntimeStatus::MissingConfiguration);
-        assert!(!setup_message_for_status(&status).contains("choose a whisper.cpp model"));
     }
 
     #[test]
@@ -26624,7 +26158,7 @@ mod layout_tests {
                     bytes_per_second: None,
                 },
             )]),
-            "moonshine",
+            "retired-runtime",
         ));
         assert_eq!(
             runtime_action_state(&AppConfig::default(), &moonshine),
@@ -26698,22 +26232,6 @@ mod layout_tests {
             app.status_message
                 .starts_with("Paused ONNX model download.")
         );
-    }
-
-    #[test]
-    fn vosk_model_needs_runtime_instead_of_placeholder_backend_message() {
-        let mut model = test_model();
-        model.id = "vosk_small_en".to_owned();
-        model.name = "Vosk small English".to_owned();
-        model.backend = "Vosk".to_owned();
-        model.local_path = Some(PathBuf::from("/tmp/scribe-vosk-small"));
-        model.install_status = ModelInstallStatus::Installed;
-        model.download_model = Some("vosk-model-small-en-us-0.15".to_owned());
-
-        let status = runtime_status_for_model(&AppConfig::default(), &model);
-
-        assert_eq!(status, ModelRuntimeStatus::MissingConfiguration);
-        assert!(!setup_message_for_status(&status).contains("choose a whisper.cpp model"));
     }
 
     #[test]

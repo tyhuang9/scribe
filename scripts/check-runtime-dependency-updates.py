@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Check pinned runtime dependency defaults against PyPI.
+"""Check any remaining generated-runtime dependency defaults against PyPI.
 
-This is intentionally a maintainer/release check. The desktop app should update
-managed runtimes from signed/bundled artifacts, not install arbitrary latest
-packages from PyPI on user machines.
+The retired Python model-provider runtimes intentionally leave this registry
+empty. Keep the checker as a maintainer hook for any future generated runtime;
+native runtime and model artifacts are pinned and verified in Rust manifests.
 """
 
 from __future__ import annotations
@@ -19,18 +19,7 @@ from urllib.request import urlopen
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_ENV = SCRIPT_DIR / "runtime-dependencies.env"
 
-PINNED_PACKAGES = {
-    "SCRIBE_PIP_VERSION_DEFAULT": "pip",
-    "SCRIBE_SETUPTOOLS_VERSION_DEFAULT": "setuptools",
-    "SCRIBE_WHEEL_VERSION_DEFAULT": "wheel",
-    "SCRIBE_FASTER_WHISPER_VERSION_DEFAULT": "faster-whisper",
-    "SCRIBE_NVIDIA_CUBLAS_CU12_VERSION_DEFAULT": "nvidia-cublas-cu12",
-    "SCRIBE_NVIDIA_CUDNN_CU12_VERSION_DEFAULT": "nvidia-cudnn-cu12",
-    "SCRIBE_VOSK_VERSION_DEFAULT": "vosk",
-    "SCRIBE_SHERPA_ONNX_VERSION_DEFAULT": "sherpa-onnx",
-    "SCRIBE_SHERPA_ONNX_BIN_VERSION_DEFAULT": "sherpa-onnx-bin",
-    "SCRIBE_NUMPY_VERSION_DEFAULT": "numpy",
-}
+PINNED_PACKAGES: dict[str, str] = {}
 
 
 def parse_env(path: Path) -> dict[str, str]:
@@ -92,9 +81,9 @@ def collect_updates(env_path: Path, timeout: float) -> list[dict[str, str | bool
 def print_table(rows: list[dict[str, str | bool]]) -> None:
     headers = ("package", "pinned", "latest", "status")
     widths = {
-        "package": max(len(headers[0]), *(len(str(row["package"])) for row in rows)),
-        "pinned": max(len(headers[1]), *(len(str(row["pinned"])) for row in rows)),
-        "latest": max(len(headers[2]), *(len(str(row["latest"])) for row in rows)),
+        "package": max([len(headers[0]), *(len(str(row["package"])) for row in rows)]),
+        "pinned": max([len(headers[1]), *(len(str(row["pinned"])) for row in rows)]),
+        "latest": max([len(headers[2]), *(len(str(row["latest"])) for row in rows)]),
     }
     print(
         f"{headers[0]:<{widths['package']}}  "

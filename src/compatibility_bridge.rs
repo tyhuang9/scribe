@@ -1,13 +1,15 @@
-//! Private bridge for pre-revamp model/runtime management.
+//! Private bridge for the retained whisper.cpp compatibility runtime.
 //!
-//! Application UI receives opaque provider handles and neutral status data.
-//! Concrete legacy adapters remain confined here and in `stt` until their
-//! artifacts are migrated or retired in Phase 11.
+//! Normalized GGUF, receipt-backed ONNX, remote GGUF, and imported GGUF models
+//! are owned by the common native runtime and never enter this bridge. The
+//! opaque provider handle remains only for legacy GGML/DLL/CLI maintenance
+//! until that final compatibility surface is retired.
 
 use std::path::{Path, PathBuf};
 
 use crate::config::{self, AppConfig};
 use crate::models::{ModelInstallStatus, ModelRuntimeStatus, SttModelInfo};
+use crate::transcription::ModelId;
 use crate::{runtime_catalog, stt};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -22,7 +24,17 @@ pub(crate) struct DevelopmentPackageSpec {
     pub(crate) executable_relative_path: &'static str,
 }
 
-pub(crate) fn provider_for_model(model: &SttModelInfo) -> Option<ProviderHandle> {
+pub(crate) fn provider_for_legacy_model(
+    config: &AppConfig,
+    model: &SttModelInfo,
+) -> Option<ProviderHandle> {
+    let model_id = ModelId::new(&model.id);
+    if crate::model_catalog::normalized_install_artifact(&model_id).is_some()
+        || config::remote_gguf_artifact(config, &model.id).is_some()
+        || config::imported_gguf_artifact(config, &model.id).is_some()
+    {
+        return None;
+    }
     stt::provider_for_backend(&model.backend).map(|adapter| ProviderHandle { adapter })
 }
 
@@ -41,14 +53,6 @@ impl ProviderHandle {
 
     pub(crate) fn model_install_status(self, model: &SttModelInfo) -> ModelInstallStatus {
         self.adapter.model_install_status(model)
-    }
-
-    pub(crate) fn can_install_model(self, model: &SttModelInfo) -> bool {
-        self.adapter.can_install_model(model)
-    }
-
-    pub(crate) fn can_uninstall_model(self, model: &SttModelInfo) -> bool {
-        self.adapter.can_uninstall_model(model)
     }
 
     pub(crate) fn managed_root(self, config: &AppConfig) -> Option<PathBuf> {
@@ -85,11 +89,6 @@ pub(crate) fn primary_runtime_entrypoint(config: &AppConfig) -> Option<PathBuf> 
 
 pub(crate) fn primary_bundled_runtime_package_root() -> Option<PathBuf> {
     stt::whisper_cpp::bundled_runtime_package_root()
-}
-
-#[cfg(test)]
-pub(crate) fn model_storage_estimate(model: &SttModelInfo) -> &'static str {
-    runtime_catalog::model_storage_estimate(&model.id)
 }
 
 pub(crate) fn model_download_total_bytes(model: &SttModelInfo) -> Option<u64> {
