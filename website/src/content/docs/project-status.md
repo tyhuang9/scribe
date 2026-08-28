@@ -11,15 +11,24 @@ Scribe is a local-first Rust desktop application with Transcribe, General, Model
 
 The final application has exactly one logical runtime boundary, selected only by
 `RuntimeRouter` in the private persistent inference child. The normal UI always
-includes six static Experimental entries: four pinned GGUF artifacts and the
-receipt-backed `moonshine-tiny-en-int8-onnx` and `moonshine-base-en-int8-onnx`
-bundles; the Supported count is zero. Moonshine Base is a 286,930,831-byte
-converted five-file INT8 artifact, including its MIT / Useful Sensors 2024
-license file; source and converter revisions are unrecorded. Its scoped
-Windows/Sherpa 1.13.5 fixture gate passed load/health/silence, normalized
-known-WAV equality, and unload/reload in 140.40 seconds total—not a latency
-measurement. Cancellation, restart recovery, latency, resource use,
-accelerators, and non-Windows behavior remain unverified. When a trusted catalog
+includes seven static Experimental entries: four pinned GGUF artifacts and the
+receipt-backed `moonshine-tiny-en-int8-onnx`, `moonshine-base-en-int8-onnx`, and
+`parakeet-tdt-06b-v2-en-int8-onnx` bundles; the Supported count is zero.
+Moonshine Base is a 286,930,831-byte converted five-file INT8 artifact,
+including its MIT / Useful Sensors 2024 license file; source and converter
+revisions are unrecorded. Its scoped Windows/Sherpa 1.13.5 fixture gate passed
+load/health/silence, normalized known-WAV equality, and unload/reload in 140.40
+seconds total—not a latency measurement. Cancellation, restart recovery,
+latency, resource use, accelerators, and non-Windows behavior remain unverified.
+Parakeet is a 661,190,513-byte (~631 MiB), CPU-only English final/batch-text
+bundle with no native streaming or timestamps. Its scoped Windows/Sherpa 1.13.5
+gate passed load/health/silence, exact normalized known-WAV equality,
+unload/reload, and activation; cancellation, restart recovery, accelerators,
+non-Windows support, latency, RAM, and other resource use remain unverified.
+It retains CC-BY-4.0 attribution to NVIDIA Corporation, the
+[license legal URL](https://creativecommons.org/licenses/by/4.0/legalcode), and
+notice that this sherpa-onnx int8 conversion is not the unmodified NVIDIA
+checkpoint and has no recorded source/converter revision. When a trusted catalog
 response is available, Models can additionally
 display non-duplicate remote GGUF variants. These variants are neither bundled
 nor static entries, and they cannot execute until their source facts are
