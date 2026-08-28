@@ -179,7 +179,7 @@ All desktop rows remain NOT VERIFIED. Five catalog models
 remain Experimental, zero are Supported, native streaming remains false, and
 the Zipformer/second-handler decision remains NO-GO.
 
-For the real Moonshine subprocess smoke, build Scribe and set `SCRIBE_ONNX_WORKER_EXE` to the built executable. Run the ignored `transcription::tests::diagnostic_real_hugging_face_bundle_install_load_and_decode` test with `SCRIBE_ONNX_BUNDLE_TEST=1`, a dedicated `SCRIBE_ONNX_BUNDLE_STORAGE_DIR`, `SCRIBE_ONNX_BUNDLE_WAV` and its exact lowercase `SCRIBE_ONNX_BUNDLE_WAV_SHA256`, plus `SCRIBE_ONNX_BUNDLE_EXPECTED_TRANSCRIPT`. Verify stage, child Hello/load/health/silence smoke, known spoken-WAV decode, unload/reload, and activation. This remains manual evidence until the exact fixture and result are versioned.
+For the real ONNX subprocess smoke, build Scribe and set `SCRIBE_ONNX_WORKER_EXE` to the built executable. Run the ignored `transcription::tests::diagnostic_real_hugging_face_bundle_install_load_and_decode` test with `SCRIBE_ONNX_BUNDLE_TEST=1`, `SCRIBE_ONNX_BUNDLE_MODEL_ID`, a dedicated `SCRIBE_ONNX_BUNDLE_STORAGE_DIR`, and `SCRIBE_ONNX_BUNDLE_WAV`. The versioned fixture selected by model ID fixes the artifact revision, WAV size/SHA-256, and normalized expected transcript; callers cannot weaken those assertions. Verify stage, child Hello/load/health/silence smoke, known spoken-WAV decode, unload/reload, and activation.
 
 ## Historical automated Phase 8 checkpoint
 
