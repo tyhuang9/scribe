@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "product": "Inno Setup",
+  "product_version": "6.7.1",
+  "reviewed_utc_date": "2026-08-27",
+  "package_url": "https://community.chocolatey.org/api/v2/package/InnoSetup/6.7.1",
+  "package_size_bytes": 10017031,
+  "package_sha256": "a0dad33db33099d9cd2b89ac2d08b5d70c589b15118ced3b95f469f044f99950",
+  "embedded_installer_path": "tools/innosetup-6.7.1.exe",
+  "embedded_installer_size_bytes": 10619024,
+  "embedded_installer_sha256": "4d11e8050b6185e0d49bd9e8cc661a7a59f44959a621d31d11033124c4e8a7b0",
+  "embedded_package_verification_path": "legal/VERIFICATION.txt",
+  "upstream_installer_url": "https://files.jrsoftware.org/is/6/innosetup-6.7.1.exe",
+  "verification_method": "SHA-256 and byte length were recomputed for the downloaded package and embedded installer; the embedded installer ProductVersion was read from its Windows version resource.",
+  "trust_scope": "These digests pin the exact reviewed bytes used by CI. They do not independently prove publisher identity or provide code-signing verification."
+}

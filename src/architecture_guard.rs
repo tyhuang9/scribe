@@ -1376,6 +1376,29 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
         "Windows release workflow must not publish a bare executable"
     );
 
+    let inno_provenance = fs::read_to_string(
+        repository
+            .join("installer")
+            .join("inno-setup-6.7.1-provenance.json"),
+    )
+    .expect("Inno Setup provenance must be readable");
+    for required in [
+        "\"product_version\": \"6.7.1\"",
+        "https://community.chocolatey.org/api/v2/package/InnoSetup/6.7.1",
+        "\"package_size_bytes\": 10017031",
+        "a0dad33db33099d9cd2b89ac2d08b5d70c589b15118ced3b95f469f044f99950",
+        "\"embedded_installer_path\": \"tools/innosetup-6.7.1.exe\"",
+        "\"embedded_installer_size_bytes\": 10619024",
+        "4d11e8050b6185e0d49bd9e8cc661a7a59f44959a621d31d11033124c4e8a7b0",
+        "https://files.jrsoftware.org/is/6/innosetup-6.7.1.exe",
+        "do not independently prove publisher identity",
+    ] {
+        assert!(
+            inno_provenance.contains(required),
+            "Inno Setup provenance must retain {required}"
+        );
+    }
+
     let installer = fs::read_to_string(repository.join("installer").join("scribe.iss"))
         .expect("Windows installer script must be readable");
     assert!(
@@ -1389,12 +1412,70 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
             && installer.contains("{param:SCRIBEVERIFY|}")
             && installer.contains("function PrepareToInstall")
             && installer.contains("function ValidateStableInstallTree")
+            && installer.contains("function QueryExistingAttributes")
+            && installer.contains("function OpenDirectoryForInspection")
+            && installer.contains("function ProbeExistingFileForUpdate")
+            && installer.contains("FileListDirectory")
+            && installer.contains("FileShareRead or FileShareWrite")
+            && installer.contains("GenericRead or GenericWrite or DeleteAccess")
+            && installer.contains("FileFlagBackupSemantics or FileFlagOpenReparsePoint")
+            && installer.contains("DLLGetLastError")
+            && installer.contains("GetLastError()")
+            && installer.contains("ErrorFileNotFound")
+            && installer.contains("ErrorPathNotFound")
+            && installer.contains("ErrorNoMoreFiles")
             && installer.contains("FILE_ATTRIBUTE_REPARSE_POINT")
             && installer.contains("case-insensitive path collision")
             && installer.contains("Setup did not delete or change any existing content")
             && installer.contains("VerificationInstallDir(Token)")
             && installer.contains("WizardDirValue"),
         "Windows installer must preflight and recursively copy only the validated portable payload"
+    );
+    assert_eq!(
+        installer.matches("GetFileAttributesW(").count(),
+        2,
+        "every installer attribute query must use the fail-closed error-classifying helper"
+    );
+    let directory_probe_start = installer
+        .find("function OpenDirectoryForInspection")
+        .expect("installer directory probe must exist");
+    let directory_probe_end = installer[directory_probe_start..]
+        .find("function ProbeExistingFileForUpdate")
+        .map(|offset| directory_probe_start + offset)
+        .expect("installer file probe must follow the directory probe");
+    assert!(
+        !installer[directory_probe_start..directory_probe_end].contains("FileShareDelete"),
+        "installer must keep enumerated directories from being renamed during preflight"
+    );
+    let inspect_start = installer
+        .find("function InspectExistingTree")
+        .expect("installer tree inspector must exist");
+    let inspect_end = installer[inspect_start..]
+        .find("function ValidateStableInstallTree")
+        .map(|offset| inspect_start + offset)
+        .expect("stable tree validator must follow tree inspector");
+    let inspect_source = &installer[inspect_start..inspect_end];
+    let first_probe = inspect_source
+        .find("OpenDirectoryForInspection(")
+        .expect("installer enumeration must have a leading access probe");
+    let enumeration_start = inspect_source
+        .find("FindFirst(")
+        .expect("installer tree inspection must enumerate entries");
+    let enumeration_end = inspect_source
+        .rfind("FindNext(")
+        .expect("installer tree inspection must continue enumeration");
+    assert!(
+        first_probe < enumeration_start && enumeration_start < enumeration_end,
+        "installer enumeration must retain a reparse-aware directory handle while reading entries"
+    );
+    assert!(
+        inspect_source.contains("if EnumerationError <> ErrorNoMoreFiles")
+            && inspect_source.contains("if EnumerationError <> ErrorFileNotFound")
+            && inspect_source
+                .matches("EnumerationError := GetLastError();")
+                .count()
+                == 2,
+        "installer enumeration must fail closed on start and continuation errors"
     );
     assert!(
         !installer.contains("[InstallDelete]"),

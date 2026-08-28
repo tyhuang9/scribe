@@ -602,6 +602,29 @@ Set-StrictMode -Version Latest
         $workflow -notmatch '-ExerciseStableUpgrade') {
         throw "Windows release workflow must pin Rust and exercise the compiled stable-upgrade contract."
     }
+    $innoProvenancePath = Join-Path $repositoryRoot 'installer\inno-setup-6.7.1-provenance.json'
+    $innoProvenance = Get-Content -LiteralPath $innoProvenancePath -Raw | ConvertFrom-Json
+    if ($innoProvenance.schema_version -ne 1 -or
+        $innoProvenance.product_version -cne '6.7.1' -or
+        $innoProvenance.package_url -cne 'https://community.chocolatey.org/api/v2/package/InnoSetup/6.7.1' -or
+        $innoProvenance.package_size_bytes -ne 10017031 -or
+        $innoProvenance.package_sha256 -cne 'a0dad33db33099d9cd2b89ac2d08b5d70c589b15118ced3b95f469f044f99950' -or
+        $innoProvenance.embedded_installer_path -cne 'tools/innosetup-6.7.1.exe' -or
+        $innoProvenance.embedded_installer_size_bytes -ne 10619024 -or
+        $innoProvenance.embedded_installer_sha256 -cne '4d11e8050b6185e0d49bd9e8cc661a7a59f44959a621d31d11033124c4e8a7b0' -or
+        $innoProvenance.upstream_installer_url -cne 'https://files.jrsoftware.org/is/6/innosetup-6.7.1.exe') {
+        throw "Inno Setup provenance must retain the reviewed source, version, sizes, and digests."
+    }
+    foreach ($pinnedInnoValue in @(
+        "INNO_NUPKG_SHA256: $($innoProvenance.package_sha256)",
+        "INNO_NUPKG_SIZE: '$($innoProvenance.package_size_bytes)'",
+        "INNO_INSTALLER_SHA256: $($innoProvenance.embedded_installer_sha256)",
+        "INNO_INSTALLER_SIZE: '$($innoProvenance.embedded_installer_size_bytes)'"
+    )) {
+        if (-not $workflow.Contains($pinnedInnoValue)) {
+            throw "Windows release workflow differs from reviewed Inno provenance: $pinnedInnoValue"
+        }
+    }
     $installer = Get-Content -LiteralPath (Join-Path $repositoryRoot "installer\scribe.iss") -Raw
     if ($installer -notmatch 'Source: "\.\.\\dist\\portable\\\*"' -or
         $installer -notmatch "recursesubdirs" -or
@@ -613,6 +636,18 @@ Set-StrictMode -Version Latest
         $installer -notmatch '\{param:SCRIBEVERIFY\|\}' -or
         $installer -notmatch 'function PrepareToInstall' -or
         $installer -notmatch 'function ValidateStableInstallTree' -or
+        $installer -notmatch 'function QueryExistingAttributes' -or
+        $installer -notmatch 'function OpenDirectoryForInspection' -or
+        $installer -notmatch 'function ProbeExistingFileForUpdate' -or
+        $installer -notmatch 'FileListDirectory' -or
+        $installer -notmatch 'FileListDirectory,\s+FileShareRead or FileShareWrite,' -or
+        $installer -notmatch 'GenericRead or GenericWrite or DeleteAccess' -or
+        $installer -notmatch 'FileFlagBackupSemantics or FileFlagOpenReparsePoint' -or
+        $installer -notmatch 'DLLGetLastError' -or
+        $installer -notmatch 'GetLastError\(\)' -or
+        $installer -notmatch 'ErrorFileNotFound' -or
+        $installer -notmatch 'ErrorPathNotFound' -or
+        $installer -notmatch 'ErrorNoMoreFiles' -or
         $installer -notmatch 'FILE_ATTRIBUTE_REPARSE_POINT' -or
         $installer -notmatch 'case-insensitive path collision' -or
         $installer -notmatch 'Setup did not delete or change any existing content' -or
@@ -620,6 +655,22 @@ Set-StrictMode -Version Latest
         $installer -notmatch 'WizardDirValue' -or
         $installer -match '(?m)^\[InstallDelete\]') {
         throw "Windows installer must preflight and recursively install only the validated portable payload."
+    }
+    if ([regex]::Matches($installer, 'GetFileAttributesW\(').Count -ne 2) {
+        throw "Every installer attribute query must use the fail-closed error-classifying helper."
+    }
+    $inspectStart = $installer.IndexOf('function InspectExistingTree')
+    $inspectEnd = $installer.IndexOf('function ValidateStableInstallTree', $inspectStart)
+    $inspectSource = $installer.Substring($inspectStart, $inspectEnd - $inspectStart)
+    $firstInspectionProbe = $inspectSource.IndexOf('OpenDirectoryForInspection(')
+    $enumerationStart = $inspectSource.IndexOf('FindFirst(')
+    $enumerationEnd = $inspectSource.LastIndexOf('FindNext(')
+    if ($firstInspectionProbe -lt 0 -or
+        $enumerationStart -le $firstInspectionProbe -or
+        $enumerationEnd -le $enumerationStart -or
+        $inspectSource -notmatch 'EnumerationError := GetLastError\(\);\s+if EnumerationError <> ErrorNoMoreFiles' -or
+        $inspectSource -notmatch 'else\s+begin\s+EnumerationError := GetLastError\(\);\s+if EnumerationError <> ErrorFileNotFound') {
+        throw "Installer enumeration must hold a reparse-aware directory handle and classify every termination."
     }
     foreach ($existingAllowedPath in @($expectedPortablePayloadPaths) + @('unins000.exe', 'unins000.dat')) {
         $innoPath = $existingAllowedPath.Replace('/', '\')

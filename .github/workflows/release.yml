@@ -32,6 +32,8 @@ jobs:
           & .\scripts\test-windows-release-packaging.ps1
 
       - name: Install Rust
+        # Official dtolnay/rust-toolchain branch 1.96.0 resolved on 2026-08-27;
+        # the immutable revision is guarded by the packaging and Rust tests.
         uses: dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e # 1.96.0 branch reviewed 2026-08-27
         with:
           # The toolchain action installs only rustc and cargo unless requested.
@@ -89,6 +91,8 @@ jobs:
 
       - name: Acquire digest-pinned Inno Setup
         shell: pwsh
+        # Reviewed source, size, digest, embedded-installer digest, and trust
+        # scope are recorded in installer/inno-setup-6.7.1-provenance.json.
         env:
           INNO_NUPKG_SHA256: a0dad33db33099d9cd2b89ac2d08b5d70c589b15118ced3b95f469f044f99950
           INNO_NUPKG_SIZE: '10017031'
