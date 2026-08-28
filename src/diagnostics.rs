@@ -125,13 +125,21 @@ pub(crate) enum DownloadSourceClass {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum DownloadFaultCategory {
+    Connection,
     Connectivity,
+    Dns,
     Timeout,
+    RateLimited,
+    ServerError,
+    PrematureEof,
     RemoteUnavailable,
+    RemoteRejected,
     RangeRejected,
+    Security,
     Integrity,
     LocalStorage,
     ProcessInterrupted,
+    Unknown,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1300,6 +1308,44 @@ mod tests {
             DownloadSourceClass::ModelRepository,
             Some(75_000_000),
         )
+    }
+
+    #[test]
+    fn sanitized_fault_categories_serialize_as_distinct_allowlisted_values() {
+        for (category, expected) in [
+            (DownloadFaultCategory::Connection, "connection"),
+            (DownloadFaultCategory::Dns, "dns"),
+            (DownloadFaultCategory::Timeout, "timeout"),
+            (DownloadFaultCategory::RateLimited, "rate_limited"),
+            (DownloadFaultCategory::ServerError, "server_error"),
+            (DownloadFaultCategory::PrematureEof, "premature_eof"),
+            (DownloadFaultCategory::RemoteRejected, "remote_rejected"),
+            (DownloadFaultCategory::RangeRejected, "range_rejected"),
+            (DownloadFaultCategory::Security, "security"),
+            (DownloadFaultCategory::Integrity, "integrity"),
+            (DownloadFaultCategory::LocalStorage, "local_storage"),
+            (
+                DownloadFaultCategory::ProcessInterrupted,
+                "process_interrupted",
+            ),
+            (DownloadFaultCategory::Unknown, "unknown"),
+        ] {
+            let event = DownloadDiagnosticEvent::failure(
+                run("category-test"),
+                job("job"),
+                artifact(),
+                DownloadSourceClass::ModelRepository,
+                12,
+                Some(100),
+                Some(1),
+                category,
+            );
+            let value = serde_json::to_value(event).unwrap();
+            assert_eq!(value["fault_category"], expected, "{category:?}");
+            assert!(value.get("url").is_none());
+            assert!(value.get("path").is_none());
+            assert!(value.get("raw_error").is_none());
+        }
     }
     fn wait_lines(path: &Path, expected: usize) {
         let deadline = Instant::now() + Duration::from_secs(10);
