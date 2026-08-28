@@ -22409,13 +22409,18 @@ mod layout_tests {
         let root =
             std::env::temp_dir().join(format!("scribe-neutral-playground-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
-        let primary = root.join("primary.gguf");
         let retired = root.join("retired-provider-artifact");
-        fs::create_dir_all(&root).unwrap();
+        let mut config = AppConfig::default();
+        config.general.model_storage_dir = root.join("model-storage");
+        let tiny = crate::models::default_model_catalog()
+            .into_iter()
+            .find(|model| model.id == "whisper_cpp_tiny_en")
+            .unwrap();
+        let primary = config::downloaded_model_path(&config, &tiny).unwrap();
+        fs::create_dir_all(primary.parent().unwrap()).unwrap();
         fs::write(&primary, b"model").unwrap();
         fs::write(&retired, b"retired provider artifact").unwrap();
 
-        let mut config = AppConfig::default();
         config
             .general
             .model_paths
