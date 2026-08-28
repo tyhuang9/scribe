@@ -28,6 +28,21 @@ function Assert-Matches {
     }
 }
 
+function Get-InstallerSection {
+    param(
+        [Parameter(Mandatory)] [string] $StartMarker,
+        [Parameter(Mandatory)] [string] $EndMarker,
+        [Parameter(Mandatory)] [string] $Description
+    )
+
+    $start = $installer.IndexOf($StartMarker, [System.StringComparison]::Ordinal)
+    $end = $installer.IndexOf($EndMarker, $start + $StartMarker.Length, [System.StringComparison]::Ordinal)
+    if ($start -lt 0 -or $end -le $start) {
+        throw "Could not isolate installer $Description."
+    }
+    return $installer.Substring($start, $end - $start)
+}
+
 function Test-CanonicalFixedDirectory {
     param(
         [Parameter(Mandatory)] [string] $Path,
@@ -81,8 +96,11 @@ $appGuid = '8E0F1935-8E3D-4B1D-9A42-7C7D7C3D5E7A'
 $uninstallKey = "Software\Microsoft\Windows\CurrentVersion\Uninstall\{$appGuid}_is1"
 
 # Identity and current installer payload contracts from main must remain stable.
-Assert-Contains "AppId={{$appGuid}" 'stable AppId'
-Assert-Contains 'DefaultDirName={localappdata}\Programs\Scribe' 'current-user install path'
+Assert-Contains "#define StableAppIdGuid `"$appGuid`"" 'stable AppId constant'
+Assert-Contains 'AppId={code:ResolveAppId}' 'test-aware AppId resolver'
+Assert-Contains "Result := '{' + '{#StableAppIdGuid}' + '}'" 'normal stable AppId result'
+Assert-Contains 'DefaultDirName={code:ResolveDefaultDir}' 'test-aware install-path resolver'
+Assert-Contains "Result := ExpandConstant('{localappdata}\Programs\Scribe')" 'current-user install path'
 Assert-Contains 'Source: "..\dist\portable\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs' 'recursive portable payload'
 Assert-Contains "'$uninstallKey'" 'stable Inno current-user uninstall identity'
 Assert-Contains 'RegKeyExists(HKCU, ScribeUninstallRegKey)' 'registry identity detection'
@@ -112,12 +130,34 @@ if ($installer.Contains('CompareVersion(', [System.StringComparison]::Ordinal)) 
 Assert-Contains 'UsePreviousAppDir=yes' 'preserved install path for update and repair'
 Assert-Contains 'UsePreviousTasks=yes' 'preserved task choices for update and repair'
 Assert-Contains 'CloseApplications=yes' 'supported running-process handling'
+if ([regex]::Matches($installer, '(?m)^UsePreviousAppDir=').Count -ne 1 -or
+    [regex]::Matches($installer, '(?m)^UsePreviousTasks=').Count -ne 1) {
+    throw 'Installer must declare each previous-install preservation directive exactly once.'
+}
+$initializeWizard = Get-InstallerSection 'procedure InitializeWizard;' 'function ShouldSkipPage' 'InitializeWizard callback'
+$shouldSkipPage = Get-InstallerSection 'function ShouldSkipPage' 'function NextButtonClick' 'ShouldSkipPage callback'
+$nextButtonClick = Get-InstallerSection 'function NextButtonClick' 'procedure CancelButtonClick' 'NextButtonClick callback'
+$installRootRouting = Get-InstallerSection 'function IsAllowedNormalInstallRoot' 'function InitializeSetup' 'install-root routing function'
+if ($initializeWizard -notmatch 'if not IsNormalInstall\(\) then\s+Exit;\s+LoadExistingInstallation' -or
+    $shouldSkipPage -notmatch 'if not IsNormalInstall\(\) then\s+Exit;\s+Result := \(PageID = MaintenancePage\.ID\)' -or
+    $nextButtonClick -notmatch 'if not IsNormalInstall\(\) then\s+Exit;\s+if CurPageID <> MaintenancePage\.ID then') {
+    throw 'Every maintenance callback must bypass verification and stable-test AppIds before touching MaintenancePage or the stable registry.'
+}
+if ($installRootRouting -notmatch 'if not ExistingInstallDetected then begin\s+Result := SameStr\(InstallRoot, RemoveBackslashUnlessRoot\(StableInstallDir\(\)\)\);\s+Exit;\s+end;' -or
+    $installRootRouting -notmatch 'ExistingInstallUsable and[\s\S]*\(CompareText\(InstallRoot, ExistingInstallPath\) = 0\);') {
+    throw 'Fresh installs must use the canonical stable root, while Update and Repair must use the exact validated registered root.'
+}
 foreach ($actionLabel in @('Install Scribe', 'Update Scribe from ', 'Repair Scribe {#AppVersion}')) {
     $actionPosition = $installer.IndexOf("MaintenancePage.Add('$actionLabel", [System.StringComparison]::Ordinal)
     $selectionPosition = $installer.IndexOf('MaintenancePage.SelectedValueIndex := 0;', $actionPosition, [System.StringComparison]::Ordinal)
     if ($actionPosition -lt 0 -or $selectionPosition -le $actionPosition) {
         throw "Installer must explicitly select the safe default action for $actionLabel."
     }
+}
+$maintenancePageRouting = Get-InstallerSection 'procedure AddMaintenancePage;' 'function RequestedMaintenanceAction' 'maintenance-page routing'
+if ($maintenancePageRouting -notmatch 'else if not ExistingInstallUsable then begin[\s\S]*?MaintenancePage\.Add\(''Cancel''\);\s+MaintenancePage\.SelectedValueIndex := 1;\s+SelectedMaintenanceAction := maBlocked;' -or
+    $maintenancePageRouting -notmatch 'else begin\s+AddRemoveAction;\s+MaintenancePage\.Add\(''Cancel \(do not downgrade\)''\);\s+MaintenancePage\.SelectedValueIndex := 1;\s+SelectedMaintenanceAction := maBlocked;') {
+    throw 'Invalid registrations and downgrade attempts must default to Cancel and remain blocked.'
 }
 
 # A repairable product registration is independent from the old uninstaller.

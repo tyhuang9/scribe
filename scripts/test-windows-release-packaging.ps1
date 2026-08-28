@@ -914,7 +914,8 @@ Set-StrictMode -Version Latest
         $installer -notmatch 'SizeOf\(StreamDataLayoutProbe\) <> 600' -or
         $installer -notmatch 'CreateUninstallRegKey=IsNormalInstall' -or
         $installer -notmatch 'Check: IsNormalInstall' -or
-        $installer -notmatch 'UsePreviousAppDir=no' -or
+        $installer -notmatch 'UsePreviousAppDir=yes' -or
+        $installer -notmatch 'UsePreviousTasks=yes' -or
         $installer -notmatch 'UsePreviousLanguage=no' -or
         $installer -notmatch 'Setup did not delete or change any existing content' -or
         $installer -notmatch 'VerificationInstallDir\(Token\)' -or
