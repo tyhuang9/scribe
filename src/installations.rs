@@ -207,7 +207,7 @@ pub(crate) enum InstallError {
         downloaded_bytes: u64,
     },
     #[error(
-        "download failed after {retry_count} ranged retries ({category}); {retained_bytes} bytes retained at {partial_path}"
+        "download failed after {retry_count} ranged retries ({category}); {retained_bytes} bytes retained"
     )]
     DownloadFailed {
         category: DownloadFaultKind,
@@ -1582,6 +1582,9 @@ fn require_pinned_artifact_disk_space(
     )))
 }
 
+type DownloadReaderSpawner =
+    fn(Box<dyn Read + Send + Sync>) -> Result<PendingDownloadReader, InstallError>;
+
 #[cfg(test)]
 fn download_pinned_artifact_with(
     source: &dyn HttpSource,
@@ -1628,6 +1631,32 @@ fn download_pinned_artifact_with_policy(
     )
 }
 
+#[cfg(test)]
+fn download_pinned_artifact_with_policy_and_reader_spawner(
+    source: &dyn HttpSource,
+    artifact: &PinnedArtifact,
+    cancellation: &InstallCancellation,
+    progress: &dyn Fn(InstallProgress),
+    policy: DownloadRetryPolicy,
+    reader_spawner: DownloadReaderSpawner,
+) -> Result<DownloadedArtifact, InstallError> {
+    if cancellation.is_cancelled() {
+        return Err(cancelled_before_artifact_inspection(artifact)?);
+    }
+    let expected_target_identity = disk_space::canonical_target_identity(&artifact.destination)
+        .map_err(InstallError::Failed)?;
+    download_pinned_artifact_with_target_and_policy_and_reader_spawner(
+        source,
+        artifact,
+        &expected_target_identity,
+        true,
+        cancellation,
+        progress,
+        policy,
+        reader_spawner,
+    )
+}
+
 fn download_pinned_artifact_with_target(
     source: &dyn HttpSource,
     artifact: &PinnedArtifact,
@@ -1655,6 +1684,29 @@ fn download_pinned_artifact_with_target_and_policy(
     cancellation: &InstallCancellation,
     progress: &dyn Fn(InstallProgress),
     policy: DownloadRetryPolicy,
+) -> Result<DownloadedArtifact, InstallError> {
+    download_pinned_artifact_with_target_and_policy_and_reader_spawner(
+        source,
+        artifact,
+        expected_target_identity,
+        verify_existing_destination,
+        cancellation,
+        progress,
+        policy,
+        spawn_download_reader,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn download_pinned_artifact_with_target_and_policy_and_reader_spawner(
+    source: &dyn HttpSource,
+    artifact: &PinnedArtifact,
+    expected_target_identity: &CanonicalTargetIdentity,
+    verify_existing_destination: bool,
+    cancellation: &InstallCancellation,
+    progress: &dyn Fn(InstallProgress),
+    policy: DownloadRetryPolicy,
+    reader_spawner: DownloadReaderSpawner,
 ) -> Result<DownloadedArtifact, InstallError> {
     validate_artifact_spec(artifact)?;
     let partial = partial_path(&artifact.destination)?;
@@ -1839,14 +1891,23 @@ fn download_pinned_artifact_with_target_and_policy(
             ));
         }
 
+        // The reader thread is created while the verified response remains
+        // gated. A server that ignored Range must not cost the caller its
+        // retained bytes merely because the local reader thread cannot start.
+        let pending_reader = reader_spawner(response.reader)?;
+        if cancellation.is_cancelled() {
+            sync_partial_for_pause(&partial)?;
+            return Err(InstallError::Cancelled {
+                partial_path: partial,
+                downloaded_bytes: downloaded,
+            });
+        }
         let append = disposition == ResponseDisposition::Append;
         let mut options = OpenOptions::new();
         options.create(true).write(true);
         configure_no_follow(&mut options);
         if append {
             options.append(true);
-        } else {
-            options.truncate(true);
         }
         revalidate_artifact_target(&artifact.destination, expected_target_identity)?;
         let mut file = options
@@ -1859,6 +1920,9 @@ fn download_pinned_artifact_with_target_and_policy(
             ));
         }
         if !append {
+            file.set_len(0).map_err(|error| {
+                failed(format!("failed to reset {}: {error}", partial.display()))
+            })?;
             downloaded = 0;
         }
 
@@ -1875,7 +1939,7 @@ fn download_pinned_artifact_with_target_and_policy(
             DownloadActivity::Active,
         );
         let attempt_start_bytes = downloaded;
-        let reader_events = spawn_download_reader(response.reader)?;
+        let reader_events = pending_reader.start();
         let retry_cause = loop {
             if cancellation.is_cancelled() {
                 file.sync_all().map_err(|error| {
@@ -2031,13 +2095,58 @@ fn download_pinned_artifact_with_target_and_policy(
     }
 }
 
+struct PendingDownloadReader {
+    state: Arc<AtomicU8>,
+    thread: Option<std::thread::Thread>,
+    receiver: Option<std::sync::mpsc::Receiver<io::Result<Vec<u8>>>>,
+}
+
+impl PendingDownloadReader {
+    fn start(mut self) -> std::sync::mpsc::Receiver<io::Result<Vec<u8>>> {
+        let receiver = self
+            .receiver
+            .take()
+            .expect("pending download reader always owns its receiver");
+        self.state.store(DOWNLOAD_READER_STARTED, Ordering::Release);
+        self.thread
+            .take()
+            .expect("pending download reader always owns its thread")
+            .unpark();
+        receiver
+    }
+}
+
+impl Drop for PendingDownloadReader {
+    fn drop(&mut self) {
+        let Some(thread) = self.thread.take() else {
+            return;
+        };
+        self.state.store(DOWNLOAD_READER_ABORTED, Ordering::Release);
+        thread.unpark();
+    }
+}
+
+const DOWNLOAD_READER_WAITING: u8 = 0;
+const DOWNLOAD_READER_STARTED: u8 = 1;
+const DOWNLOAD_READER_ABORTED: u8 = 2;
+
 fn spawn_download_reader(
     mut reader: Box<dyn Read + Send + Sync>,
-) -> Result<std::sync::mpsc::Receiver<io::Result<Vec<u8>>>, InstallError> {
+) -> Result<PendingDownloadReader, InstallError> {
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-    std::thread::Builder::new()
+    let state = Arc::new(AtomicU8::new(DOWNLOAD_READER_WAITING));
+    let reader_state = Arc::clone(&state);
+    let handle = std::thread::Builder::new()
         .name("scribe-download-reader".to_owned())
         .spawn(move || {
+            loop {
+                match reader_state.load(Ordering::Acquire) {
+                    DOWNLOAD_READER_WAITING => std::thread::park(),
+                    DOWNLOAD_READER_STARTED => break,
+                    DOWNLOAD_READER_ABORTED => return,
+                    _ => unreachable!("download reader gate state is invalid"),
+                }
+            }
             loop {
                 let mut buffer = vec![0_u8; BUFFER_BYTES];
                 let event = reader.read(&mut buffer).map(|count| {
@@ -2057,7 +2166,13 @@ fn spawn_download_reader(
             }
         })
         .map_err(|_| failed("failed to start the download response reader"))?;
-    Ok(receiver)
+    let thread = handle.thread().clone();
+    drop(handle);
+    Ok(PendingDownloadReader {
+        state,
+        thread: Some(thread),
+        receiver: Some(receiver),
+    })
 }
 
 fn reopen_partial_no_follow(partial: &Path) -> Result<Option<(File, u64)>, InstallError> {
@@ -4214,6 +4329,13 @@ mod tests {
         }
     }
 
+    fn fail_download_reader_spawn(
+        reader: Box<dyn Read + Send + Sync>,
+    ) -> Result<PendingDownloadReader, InstallError> {
+        drop(reader);
+        Err(failed("injected download reader spawn failure"))
+    }
+
     #[test]
     fn standard_retry_policy_matches_the_bounded_transport_contract() {
         let policy = DownloadRetryPolicy::STANDARD;
@@ -4308,7 +4430,7 @@ mod tests {
 
     #[test]
     fn ranged_retry_exhaustion_returns_sanitized_typed_failure() {
-        let root = unique_root("retry-exhaustion");
+        let root = unique_root("retry-exhaustion-username-marker-alice");
         fs::create_dir_all(&root).unwrap();
         let bytes = b"complete artifact";
         let prefix = 4;
@@ -4348,9 +4470,16 @@ mod tests {
                 && retained_path == &partial_path(&spec.destination).unwrap()
         ));
         let message = error.to_string();
+        assert_eq!(
+            message,
+            "download failed after 3 ranged retries (connection failed); 4 bytes retained"
+        );
         assert!(message.contains("connection failed"));
         assert!(!message.contains(&spec.url));
         assert!(!message.contains('?'));
+        let retained_path = partial_path(&spec.destination).unwrap();
+        assert!(!message.contains(retained_path.to_string_lossy().as_ref()));
+        assert!(!message.contains("username-marker-alice"));
         assert_eq!(
             source.requested_ranges.lock().unwrap().as_slice(),
             &[None, Some(4), Some(4), Some(4)]
@@ -4358,6 +4487,41 @@ mod tests {
         assert_eq!(
             DownloadFaultKind::ConnectionFailed.diagnostic_label(),
             "connection_failed"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ignored_range_preserves_existing_partial_when_reader_spawn_fails() {
+        let root = unique_root("ignored-range-reader-spawn-failure");
+        fs::create_dir_all(&root).unwrap();
+        let bytes = b"complete artifact";
+        let retained = &bytes[..7];
+        let spec = artifact(&root, bytes);
+        let partial = partial_path(&spec.destination).unwrap();
+        fs::write(&partial, retained).unwrap();
+        let source = ScriptedHttp::new([ScriptedAttempt::Response {
+            status: 200,
+            content_length: Some(bytes.len() as u64),
+            content_range: None,
+            actions: vec![ReadAction::Bytes(bytes.to_vec()), ReadAction::Eof],
+        }]);
+
+        let error = download_pinned_artifact_with_policy_and_reader_spawner(
+            &source,
+            &spec,
+            &InstallCancellation::default(),
+            &|_| {},
+            fast_retry_policy(),
+            fail_download_reader_spawn,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "injected download reader spawn failure");
+        assert_eq!(fs::read(&partial).unwrap(), retained);
+        assert_eq!(
+            source.requested_ranges.lock().unwrap().as_slice(),
+            &[Some(retained.len() as u64)]
         );
         fs::remove_dir_all(root).unwrap();
     }

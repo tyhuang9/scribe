@@ -1,12 +1,12 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crossbeam_channel::{Receiver, Sender, TrySendError};
+use crossbeam_channel::{Receiver, SendTimeoutError, Sender, TrySendError};
 use serde::{Deserialize, Serialize};
 
 const DIAGNOSTIC_SCHEMA_VERSION: u32 = 3;
@@ -15,6 +15,7 @@ const MAX_SESSION_SNAPSHOTS: usize = 50;
 const MAX_DOWNLOAD_SNAPSHOTS: usize = 100;
 const DOWNLOAD_CHANNEL_CAPACITY: usize = 128;
 const DOWNLOAD_LOG_MAX_BYTES: u64 = 1024 * 1024;
+const DOWNLOAD_LOG_LINE_MAX_BYTES: usize = 16 * 1024;
 const DOWNLOAD_LOG_NAME: &str = "downloads.jsonl";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -404,6 +405,20 @@ pub(crate) enum DownloadDiagnosticEnqueue {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DownloadDiagnosticFlush {
+    Flushed,
+    TimedOut,
+    StorageUnavailable,
+    WriterUnavailable,
+}
+
+#[derive(Debug)]
+enum DownloadWriterCommand {
+    Event(DownloadDiagnosticEvent),
+    Flush(Sender<bool>),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DownloadDiagnosticsError {
     StorageUnavailable,
     WriterUnavailable,
@@ -454,11 +469,14 @@ impl DownloadDiagnosticsState {
             events.pop_front();
         }
     }
+    fn nonfatal_error(&self) -> Option<DownloadDiagnosticsError> {
+        *self.error.lock().unwrap_or_else(|e| e.into_inner())
+    }
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct DownloadDiagnostics {
-    sender: Sender<DownloadDiagnosticEvent>,
+    sender: Sender<DownloadWriterCommand>,
     state: Arc<DownloadDiagnosticsState>,
 }
 
@@ -466,7 +484,20 @@ impl DownloadDiagnostics {
     pub(crate) fn start(directory: impl Into<PathBuf>, current_run: &DownloadRunId) -> Self {
         let directory = directory.into();
         let state = Arc::new(DownloadDiagnosticsState::default());
-        let loaded = load_download_events(&directory, &state);
+        let mut secure_directory = match ensure_private_directory(&directory) {
+            Ok(directory) => Some(directory),
+            Err(_) => {
+                state.report_error(DownloadDiagnosticsError::StorageUnavailable);
+                None
+            }
+        };
+        let loaded = secure_directory
+            .as_deref()
+            .map(|directory| load_download_events(directory, &state))
+            .unwrap_or_default();
+        if state.nonfatal_error() == Some(DownloadDiagnosticsError::StorageUnavailable) {
+            secure_directory = None;
+        }
         let interruptions = classify_prior_run_interruptions(&loaded, current_run);
         for event in loaded.into_iter().chain(interruptions.iter().cloned()) {
             state.append(event);
@@ -475,14 +506,14 @@ impl DownloadDiagnostics {
         let writer_state = Arc::clone(&state);
         if std::thread::Builder::new()
             .name("download-diagnostics".into())
-            .spawn(move || run_download_writer(directory, receiver, writer_state))
+            .spawn(move || run_download_writer(secure_directory, receiver, writer_state))
             .is_err()
         {
             state.report_error(DownloadDiagnosticsError::WriterUnavailable);
         }
         let result = Self { sender, state };
         for event in interruptions {
-            let _ = result.sender.try_send(event);
+            let _ = result.sender.try_send(DownloadWriterCommand::Event(event));
         }
         result
     }
@@ -497,7 +528,10 @@ impl DownloadDiagnostics {
         {
             return DownloadDiagnosticEnqueue::IgnoredDuplicate;
         }
-        match self.sender.try_send(event.clone()) {
+        match self
+            .sender
+            .try_send(DownloadWriterCommand::Event(event.clone()))
+        {
             Ok(()) => {
                 if event.outcome == DownloadDiagnosticOutcome::FirstStall {
                     first_stalls.insert((event.run_id.clone(), event.job_id.clone()));
@@ -522,11 +556,35 @@ impl DownloadDiagnostics {
             .collect()
     }
     pub(crate) fn nonfatal_error(&self) -> Option<DownloadDiagnosticsError> {
-        *self.state.error.lock().unwrap_or_else(|e| e.into_inner())
+        self.state.nonfatal_error()
     }
     pub(crate) fn take_new_nonfatal_error(&self) -> Option<DownloadDiagnosticsError> {
         let error = self.nonfatal_error()?;
         (!self.state.error_observed.swap(true, Ordering::AcqRel)).then_some(error)
+    }
+
+    pub(crate) fn flush(&self, timeout: Duration) -> DownloadDiagnosticFlush {
+        let started = Instant::now();
+        let (acknowledge, acknowledged) = crossbeam_channel::bounded(1);
+        match self
+            .sender
+            .send_timeout(DownloadWriterCommand::Flush(acknowledge), timeout)
+        {
+            Ok(()) => {}
+            Err(SendTimeoutError::Timeout(_)) => return DownloadDiagnosticFlush::TimedOut,
+            Err(SendTimeoutError::Disconnected(_)) => {
+                return DownloadDiagnosticFlush::WriterUnavailable;
+            }
+        }
+        let remaining = timeout.saturating_sub(started.elapsed());
+        match acknowledged.recv_timeout(remaining) {
+            Ok(true) => DownloadDiagnosticFlush::Flushed,
+            Ok(false) => DownloadDiagnosticFlush::StorageUnavailable,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => DownloadDiagnosticFlush::TimedOut,
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                DownloadDiagnosticFlush::WriterUnavailable
+            }
+        }
     }
 }
 
@@ -534,17 +592,13 @@ fn load_download_events(
     directory: &Path,
     state: &DownloadDiagnosticsState,
 ) -> Vec<DownloadDiagnosticEvent> {
-    if fs::create_dir_all(directory).is_err() {
-        state.report_error(DownloadDiagnosticsError::StorageUnavailable);
-        return Vec::new();
-    }
     let mut events = VecDeque::new();
     for path in [
         directory.join(format!("{DOWNLOAD_LOG_NAME}.2")),
         directory.join(format!("{DOWNLOAD_LOG_NAME}.1")),
         directory.join(DOWNLOAD_LOG_NAME),
     ] {
-        let file = match File::open(path) {
+        let file = match open_existing_log(&path) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(_) => {
@@ -552,24 +606,95 @@ fn load_download_events(
                 continue;
             }
         };
-        for line in BufReader::new(file).lines() {
-            let Ok(line) = line else {
-                state.report_error(DownloadDiagnosticsError::StorageUnavailable);
-                break;
-            };
-            let Ok(event) = serde_json::from_str::<DownloadDiagnosticEvent>(&line) else {
-                continue;
-            };
-            if !event.is_valid_for_load() {
-                continue;
-            }
-            events.push_back(event);
-            while events.len() > MAX_DOWNLOAD_SNAPSHOTS {
-                events.pop_front();
+        let mut reader = BufReader::new(file.take(DOWNLOAD_LOG_MAX_BYTES));
+        loop {
+            match read_bounded_jsonl_line(&mut reader) {
+                Ok(BoundedLine::Complete(line)) => {
+                    let Ok(line) = std::str::from_utf8(&line) else {
+                        continue;
+                    };
+                    let Ok(event) = serde_json::from_str::<DownloadDiagnosticEvent>(line) else {
+                        continue;
+                    };
+                    if !event.is_valid_for_load() {
+                        continue;
+                    }
+                    events.push_back(event);
+                    while events.len() > MAX_DOWNLOAD_SNAPSHOTS {
+                        events.pop_front();
+                    }
+                }
+                Ok(BoundedLine::Overlong) => continue,
+                Ok(BoundedLine::Unterminated | BoundedLine::End) => break,
+                Err(_) => {
+                    state.report_error(DownloadDiagnosticsError::StorageUnavailable);
+                    break;
+                }
             }
         }
     }
     events.into_iter().collect()
+}
+
+enum BoundedLine {
+    Complete(Vec<u8>),
+    Overlong,
+    Unterminated,
+    End,
+}
+
+fn read_bounded_jsonl_line(reader: &mut impl BufRead) -> io::Result<BoundedLine> {
+    let mut line = Vec::with_capacity(512);
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok(if line.is_empty() {
+                BoundedLine::End
+            } else {
+                BoundedLine::Unterminated
+            });
+        }
+        if let Some(newline) = available.iter().position(|byte| *byte == b'\n') {
+            if line.len().saturating_add(newline) > DOWNLOAD_LOG_LINE_MAX_BYTES {
+                reader.consume(newline + 1);
+                return Ok(BoundedLine::Overlong);
+            }
+            line.extend_from_slice(&available[..newline]);
+            reader.consume(newline + 1);
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            return Ok(BoundedLine::Complete(line));
+        }
+        if line.len().saturating_add(available.len()) > DOWNLOAD_LOG_LINE_MAX_BYTES {
+            let consumed = available.len();
+            reader.consume(consumed);
+            discard_through_newline(reader)?;
+            return Ok(BoundedLine::Overlong);
+        }
+        line.extend_from_slice(available);
+        let consumed = available.len();
+        reader.consume(consumed);
+    }
+}
+
+fn discard_through_newline(reader: &mut impl BufRead) -> io::Result<()> {
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok(());
+        }
+        let consumed = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |newline| newline + 1);
+        let found_newline =
+            consumed <= available.len() && available.get(consumed - 1) == Some(&b'\n');
+        reader.consume(consumed);
+        if found_newline {
+            return Ok(());
+        }
+    }
 }
 
 fn classify_prior_run_interruptions(
@@ -593,75 +718,412 @@ fn classify_prior_run_interruptions(
 }
 
 fn run_download_writer(
-    directory: PathBuf,
-    receiver: Receiver<DownloadDiagnosticEvent>,
+    directory: Option<PathBuf>,
+    receiver: Receiver<DownloadWriterCommand>,
     state: Arc<DownloadDiagnosticsState>,
 ) {
     let mut writer = None;
-    for event in receiver {
-        let Ok(mut line) = serde_json::to_vec(&event) else {
-            continue;
-        };
-        line.push(b'\n');
-        if write_download_line(&directory, &mut writer, &line).is_err() {
-            state.report_error(DownloadDiagnosticsError::StorageUnavailable);
-            writer = None;
+    for command in receiver {
+        match command {
+            DownloadWriterCommand::Event(event) => {
+                let Some(directory) = directory.as_deref() else {
+                    continue;
+                };
+                let Ok(mut line) = serde_json::to_vec(&event) else {
+                    continue;
+                };
+                line.push(b'\n');
+                if write_download_line(directory, &mut writer, &line).is_err() {
+                    state.report_error(DownloadDiagnosticsError::StorageUnavailable);
+                    writer = None;
+                }
+            }
+            DownloadWriterCommand::Flush(acknowledge) => {
+                let storage_available = *state.error.lock().unwrap_or_else(|e| e.into_inner())
+                    != Some(DownloadDiagnosticsError::StorageUnavailable);
+                let directory_secure = directory
+                    .as_deref()
+                    .is_some_and(|directory| ensure_private_directory(directory).is_ok());
+                let succeeded = directory_secure
+                    && storage_available
+                    && writer.as_mut().is_none_or(|writer| {
+                        writer
+                            .file
+                            .flush()
+                            .and_then(|()| writer.file.sync_data())
+                            .is_ok()
+                    });
+                if !succeeded {
+                    state.report_error(DownloadDiagnosticsError::StorageUnavailable);
+                    writer = None;
+                }
+                let _ = acknowledge.try_send(succeeded);
+            }
         }
     }
-    if let Some(mut file) = writer {
-        let _ = file.flush();
+    if let Some(mut writer) = writer {
+        let _ = writer.file.flush();
     }
 }
 
-fn write_download_line(directory: &Path, writer: &mut Option<File>, line: &[u8]) -> io::Result<()> {
-    fs::create_dir_all(directory)?;
-    if writer.is_none() {
-        *writer = Some(open_download_log(directory)?);
+fn write_download_line(
+    directory: &Path,
+    writer: &mut Option<SecureLogWriter>,
+    line: &[u8],
+) -> io::Result<()> {
+    if line.len() > DOWNLOAD_LOG_LINE_MAX_BYTES || line.len() as u64 > DOWNLOAD_LOG_MAX_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "download diagnostic event exceeds the bounded line size",
+        ));
     }
-    let length = writer
-        .as_ref()
-        .expect("writer initialized")
-        .metadata()?
-        .len();
+    let directory = ensure_private_directory(directory)?;
+    if writer.is_none() {
+        *writer = Some(open_download_log(&directory)?);
+    }
+    let active = writer.as_ref().expect("writer initialized");
+    validate_log_identity(&directory.join(DOWNLOAD_LOG_NAME), &active.identity)?;
+    let length = active.file.metadata()?.len();
     if length.saturating_add(line.len() as u64) > DOWNLOAD_LOG_MAX_BYTES {
         *writer = None;
-        rotate_download_logs(directory)?;
-        *writer = Some(open_download_log(directory)?);
+        rotate_download_logs(&directory)?;
+        *writer = Some(open_download_log(&directory)?);
     }
-    writer.as_mut().expect("writer initialized").write_all(line)
+    writer
+        .as_mut()
+        .expect("writer initialized")
+        .file
+        .write_all(line)
 }
 
-fn open_download_log(directory: &Path) -> io::Result<File> {
+#[derive(Debug)]
+struct SecureLogWriter {
+    file: File,
+    identity: FileIdentity,
+}
+
+fn open_download_log(directory: &Path) -> io::Result<SecureLogWriter> {
     let mut options = OpenOptions::new();
     options.append(true).create(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    options.open(directory.join(DOWNLOAD_LOG_NAME))
+    configure_no_follow_file_open(&mut options, 0o600);
+    let path = directory.join(DOWNLOAD_LOG_NAME);
+    let file = options.open(&path)?;
+    apply_private_file_permissions(&file)?;
+    let identity = validated_file_identity(&file, true)?;
+    validate_log_identity(&path, &identity)?;
+    Ok(SecureLogWriter { file, identity })
+}
+
+fn open_existing_log(path: &Path) -> io::Result<File> {
+    open_existing_regular_file(path, true)
+}
+
+fn open_existing_regular_file(path: &Path, enforce_size_cap: bool) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    configure_no_follow_file_open(&mut options, 0);
+    let file = options.open(path)?;
+    apply_private_file_permissions(&file)?;
+    validated_file_identity(&file, enforce_size_cap)?;
+    Ok(file)
 }
 
 fn rotate_download_logs(directory: &Path) -> io::Result<()> {
+    let directory = ensure_private_directory(directory)?;
     let oldest = directory.join(format!("{DOWNLOAD_LOG_NAME}.2"));
-    match fs::remove_file(&oldest) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
-    }
-    rename_if_present(&directory.join(format!("{DOWNLOAD_LOG_NAME}.1")), &oldest)?;
-    rename_if_present(
+    remove_log_if_present(&oldest)?;
+    rename_log_if_present(&directory.join(format!("{DOWNLOAD_LOG_NAME}.1")), &oldest)?;
+    rename_log_if_present(
         &directory.join(DOWNLOAD_LOG_NAME),
         &directory.join(format!("{DOWNLOAD_LOG_NAME}.1")),
-    )
+    )?;
+    ensure_private_directory(&directory)?;
+    Ok(())
 }
 
-fn rename_if_present(from: &Path, to: &Path) -> io::Result<()> {
-    match fs::rename(from, to) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e),
+fn remove_log_if_present(path: &Path) -> io::Result<()> {
+    let identity = match log_identity_from_path(path) {
+        Ok(identity) => identity,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    validate_log_identity(path, &identity)?;
+    fs::remove_file(path)
+}
+
+fn rename_log_if_present(from: &Path, to: &Path) -> io::Result<()> {
+    let identity = match log_identity_from_path(from) {
+        Ok(identity) => identity,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    validate_log_identity(from, &identity)?;
+    match log_identity_from_path(to) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "download diagnostic rotation destination unexpectedly exists",
+            ));
+        }
+        Err(error) => return Err(error),
     }
+    validate_log_identity(from, &identity)?;
+    fs::rename(from, to)?;
+    validate_log_identity(to, &identity)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FileIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(windows)]
+    volume: u32,
+    #[cfg(windows)]
+    index: u64,
+    #[cfg(not(any(unix, windows)))]
+    length: u64,
+    #[cfg(not(any(unix, windows)))]
+    modified: Option<SystemTime>,
+}
+
+fn ensure_private_directory(directory: &Path) -> io::Result<PathBuf> {
+    if directory.as_os_str().is_empty()
+        || directory
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "diagnostics directory must not contain parent traversal",
+        ));
+    }
+    let absolute = if directory.is_absolute() {
+        directory.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(directory)
+    };
+    let mut current = PathBuf::new();
+    for component in absolute.components() {
+        current.push(component.as_os_str());
+        if matches!(component, std::path::Component::Prefix(_)) {
+            continue;
+        }
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) => validate_directory_metadata(&metadata)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                create_private_directory_component(&current)?;
+                validate_directory_metadata(&fs::symlink_metadata(&current)?)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    let handle = open_directory_no_follow(&absolute)?;
+    let metadata = handle.metadata()?;
+    validate_directory_metadata(&metadata)?;
+    let identity = object_identity(&handle, &metadata)?;
+    apply_private_directory_permissions(&handle)?;
+    validate_directory_components(&absolute)?;
+    let reopened = open_directory_no_follow(&absolute)?;
+    let reopened_metadata = reopened.metadata()?;
+    validate_directory_metadata(&reopened_metadata)?;
+    if object_identity(&reopened, &reopened_metadata)? != identity {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "diagnostics directory identity changed during validation",
+        ));
+    }
+    Ok(absolute)
+}
+
+#[cfg(unix)]
+fn create_private_directory_component(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    let mut builder = fs::DirBuilder::new();
+    builder.mode(0o700).create(path)
+}
+
+#[cfg(not(unix))]
+fn create_private_directory_component(path: &Path) -> io::Result<()> {
+    fs::create_dir(path)
+}
+
+fn validate_directory_components(directory: &Path) -> io::Result<()> {
+    let mut current = PathBuf::new();
+    for component in directory.components() {
+        current.push(component.as_os_str());
+        if !matches!(component, std::path::Component::Prefix(_)) {
+            validate_directory_metadata(&fs::symlink_metadata(&current)?)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_directory_metadata(metadata: &fs::Metadata) -> io::Result<()> {
+    if !metadata.is_dir() || metadata.file_type().is_symlink() || metadata_is_reparse(metadata) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "diagnostics directory contains a link, reparse point, or non-directory component",
+        ));
+    }
+    Ok(())
+}
+
+fn open_directory_no_follow(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    options.open(path)
+}
+
+fn configure_no_follow_file_open(options: &mut OpenOptions, unix_mode: u32) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+        if unix_mode != 0 {
+            options.mode(unix_mode);
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        let _ = unix_mode;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    #[cfg(not(any(unix, windows)))]
+    let _ = (options, unix_mode);
+}
+
+fn validated_file_identity(file: &File, enforce_size_cap: bool) -> io::Result<FileIdentity> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata_is_reparse(&metadata) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "download diagnostic log is not a regular no-follow file",
+        ));
+    }
+    if enforce_size_cap && metadata.len() > DOWNLOAD_LOG_MAX_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "download diagnostic log exceeds its rotation bound",
+        ));
+    }
+    object_identity(file, &metadata)
+}
+
+fn object_identity(file: &File, _metadata: &fs::Metadata) -> io::Result<FileIdentity> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(FileIdentity {
+            device: _metadata.dev(),
+            inode: _metadata.ino(),
+        })
+    }
+    #[cfg(windows)]
+    {
+        use std::mem::MaybeUninit;
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+        };
+        let mut information = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+        // SAFETY: `file` owns a valid handle and `information` points to writable storage
+        // for the exact structure required by GetFileInformationByHandle.
+        let succeeded =
+            unsafe { GetFileInformationByHandle(file.as_raw_handle(), information.as_mut_ptr()) };
+        if succeeded == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: the successful call above initialized the whole output structure.
+        let information = unsafe { information.assume_init() };
+        Ok(FileIdentity {
+            volume: information.dwVolumeSerialNumber,
+            index: (u64::from(information.nFileIndexHigh) << 32)
+                | u64::from(information.nFileIndexLow),
+        })
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Ok(FileIdentity {
+            length: _metadata.len(),
+            modified: _metadata.modified().ok(),
+        })
+    }
+}
+
+fn log_identity_from_path(path: &Path) -> io::Result<FileIdentity> {
+    let file = open_existing_log(path)?;
+    validated_file_identity(&file, true)
+}
+
+fn validate_log_identity(path: &Path, expected: &FileIdentity) -> io::Result<()> {
+    validate_regular_file_identity(path, expected, true)
+}
+
+fn validate_regular_file_identity(
+    path: &Path,
+    expected: &FileIdentity,
+    enforce_size_cap: bool,
+) -> io::Result<()> {
+    let file = open_existing_regular_file(path, enforce_size_cap)?;
+    let actual = validated_file_identity(&file, enforce_size_cap)?;
+    if actual != *expected {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "download diagnostic log identity changed during a path operation",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn metadata_is_reparse(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn metadata_is_reparse(_metadata: &fs::Metadata) -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn apply_private_directory_permissions(directory: &File) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    directory.set_permissions(fs::Permissions::from_mode(0o700))
+}
+
+#[cfg(not(unix))]
+fn apply_private_directory_permissions(_directory: &File) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn apply_private_file_permissions(file: &File) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(not(unix))]
+fn apply_private_file_permissions(_file: &File) -> io::Result<()> {
+    Ok(())
 }
 
 #[derive(Clone, Debug, Default)]
@@ -746,7 +1208,7 @@ pub(crate) fn export_redacted(
     directory: &Path,
     diagnostics: &DiagnosticsStore,
 ) -> io::Result<PathBuf> {
-    fs::create_dir_all(directory)?;
+    let directory = ensure_private_directory(directory)?;
     let timestamp = unix_time_ms();
     let mut attempt = 0_u32;
     loop {
@@ -758,17 +1220,16 @@ pub(crate) fn export_redacted(
         let path = directory.join(format!("scribe-diagnostics-{timestamp}{suffix}.json"));
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
+        configure_no_follow_file_open(&mut options, 0o600);
         match options.open(&path) {
             Ok(mut file) => {
+                apply_private_file_permissions(&file)?;
+                let identity = validated_file_identity(&file, false)?;
                 serde_json::to_writer_pretty(&mut file, &diagnostics.report())
                     .map_err(io::Error::other)?;
                 file.write_all(b"\n")?;
                 file.sync_all()?;
+                validate_regular_file_identity(&path, &identity, false)?;
                 return Ok(path);
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
@@ -853,6 +1314,36 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[cfg(unix)]
+    fn create_directory_link(target: &Path, link: &Path) -> io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(windows)]
+    fn create_directory_link(target: &Path, link: &Path) -> io::Result<()> {
+        std::os::windows::fs::symlink_dir(target, link)
+    }
+
+    #[cfg(unix)]
+    fn create_file_link(target: &Path, link: &Path) -> io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(windows)]
+    fn create_file_link(target: &Path, link: &Path) -> io::Result<()> {
+        std::os::windows::fs::symlink_file(target, link)
+    }
+
+    #[cfg(unix)]
+    fn remove_directory_link(link: &Path) -> io::Result<()> {
+        fs::remove_file(link)
+    }
+
+    #[cfg(windows)]
+    fn remove_directory_link(link: &Path) -> io::Result<()> {
+        fs::remove_dir(link)
     }
 
     #[test]
@@ -1020,6 +1511,204 @@ mod tests {
         assert!(snapshot.iter().any(|e| e.job_id == "valid"));
         assert!(!snapshot.iter().any(|e| e.job_id == "unknown"));
         drop(d);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn oversized_rotation_is_rejected_without_scanning() {
+        let root = temp("oversized-log");
+        fs::create_dir_all(&root).unwrap();
+        let oversized = File::create(root.join(DOWNLOAD_LOG_NAME)).unwrap();
+        oversized.set_len(DOWNLOAD_LOG_MAX_BYTES + 1).unwrap();
+        drop(oversized);
+
+        let diagnostics = DownloadDiagnostics::start(&root, &run("current"));
+        assert!(diagnostics.snapshot().is_empty());
+        assert_eq!(
+            diagnostics.nonfatal_error(),
+            Some(DownloadDiagnosticsError::StorageUnavailable)
+        );
+        assert_eq!(
+            diagnostics.record(admission("current", "blocked-by-oversize")),
+            DownloadDiagnosticEnqueue::Queued
+        );
+        assert_eq!(
+            diagnostics.flush(Duration::from_secs(2)),
+            DownloadDiagnosticFlush::StorageUnavailable
+        );
+        drop(diagnostics);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn overlong_and_unterminated_lines_are_discarded_with_bounded_work() {
+        let root = temp("bounded-lines");
+        fs::create_dir_all(&root).unwrap();
+        let first = DownloadDiagnosticEvent::completion(
+            run("prior"),
+            job("first"),
+            artifact(),
+            DownloadSourceClass::ModelRepository,
+            10,
+            Some(10),
+            None,
+        );
+        let second = DownloadDiagnosticEvent::completion(
+            run("prior"),
+            job("second"),
+            artifact(),
+            DownloadSourceClass::ModelRepository,
+            10,
+            Some(10),
+            None,
+        );
+        let unterminated = DownloadDiagnosticEvent::completion(
+            run("prior"),
+            job("unterminated"),
+            artifact(),
+            DownloadSourceClass::ModelRepository,
+            10,
+            Some(10),
+            None,
+        );
+        let mut contents = format!("{}\n", serde_json::to_string(&first).unwrap()).into_bytes();
+        contents.extend(std::iter::repeat_n(b'x', DOWNLOAD_LOG_LINE_MAX_BYTES + 1));
+        contents.push(b'\n');
+        contents
+            .extend_from_slice(format!("{}\n", serde_json::to_string(&second).unwrap()).as_bytes());
+        contents.extend_from_slice(serde_json::to_string(&unterminated).unwrap().as_bytes());
+        fs::write(root.join(DOWNLOAD_LOG_NAME), contents).unwrap();
+
+        let diagnostics = DownloadDiagnostics::start(&root, &run("current"));
+        let snapshot = diagnostics.snapshot();
+        assert_eq!(snapshot.len(), 2);
+        assert_eq!(snapshot[0].job_id, "first");
+        assert_eq!(snapshot[1].job_id, "second");
+        drop(diagnostics);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn explicit_flush_persists_queued_events_within_the_timeout() {
+        let root = temp("flush");
+        let diagnostics = DownloadDiagnostics::start(&root, &run("current"));
+        assert_eq!(
+            diagnostics.record(admission("current", "flush-job")),
+            DownloadDiagnosticEnqueue::Queued
+        );
+        assert_eq!(
+            diagnostics.flush(Duration::from_secs(2)),
+            DownloadDiagnosticFlush::Flushed
+        );
+        assert_eq!(
+            fs::read_to_string(root.join(DOWNLOAD_LOG_NAME))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        drop(diagnostics);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn linked_diagnostics_directory_is_rejected() {
+        let root = temp("linked-directory");
+        let target = root.join("target");
+        let linked = root.join("linked");
+        fs::create_dir_all(&target).unwrap();
+        if create_directory_link(&target, &linked).is_err() {
+            let _ = fs::remove_dir_all(root);
+            return;
+        }
+
+        let diagnostics = DownloadDiagnostics::start(&linked, &run("current"));
+        assert_eq!(
+            diagnostics.nonfatal_error(),
+            Some(DownloadDiagnosticsError::StorageUnavailable)
+        );
+        assert_eq!(
+            diagnostics.flush(Duration::from_secs(2)),
+            DownloadDiagnosticFlush::StorageUnavailable
+        );
+        assert!(!target.join(DOWNLOAD_LOG_NAME).exists());
+        drop(diagnostics);
+        remove_directory_link(&linked).unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn linked_log_generations_are_rejected_without_touching_targets() {
+        let root = temp("linked-logs");
+        for (index, generation) in [
+            DOWNLOAD_LOG_NAME.to_owned(),
+            format!("{DOWNLOAD_LOG_NAME}.1"),
+            format!("{DOWNLOAD_LOG_NAME}.2"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let directory = root.join(index.to_string());
+            fs::create_dir_all(&directory).unwrap();
+            let target = directory.join("outside-target");
+            fs::write(&target, b"unchanged").unwrap();
+            let linked = directory.join(generation);
+            if create_file_link(&target, &linked).is_err() {
+                let _ = fs::remove_dir_all(root);
+                return;
+            }
+
+            let diagnostics = DownloadDiagnostics::start(&directory, &run("current"));
+            assert_eq!(
+                diagnostics.nonfatal_error(),
+                Some(DownloadDiagnosticsError::StorageUnavailable)
+            );
+            assert_eq!(
+                diagnostics.record(admission("current", "linked-log-job")),
+                DownloadDiagnosticEnqueue::Queued
+            );
+            assert_eq!(
+                diagnostics.flush(Duration::from_secs(2)),
+                DownloadDiagnosticFlush::StorageUnavailable
+            );
+            assert_eq!(fs::read(&target).unwrap(), b"unchanged");
+            if linked.file_name() != Some(std::ffi::OsStr::new(DOWNLOAD_LOG_NAME)) {
+                assert!(!directory.join(DOWNLOAD_LOG_NAME).exists());
+            }
+            drop(diagnostics);
+            let _ = fs::remove_file(linked);
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn diagnostics_permissions_are_private_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp("private-permissions");
+        let diagnostics = DownloadDiagnostics::start(&root, &run("current"));
+        assert_eq!(
+            diagnostics.record(admission("current", "private-job")),
+            DownloadDiagnosticEnqueue::Queued
+        );
+        assert_eq!(
+            diagnostics.flush(Duration::from_secs(2)),
+            DownloadDiagnosticFlush::Flushed
+        );
+        assert_eq!(
+            fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(root.join(DOWNLOAD_LOG_NAME))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        drop(diagnostics);
         let _ = fs::remove_dir_all(root);
     }
 
