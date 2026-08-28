@@ -66,26 +66,6 @@ impl std::fmt::Display for DownloadFaultKind {
     }
 }
 
-impl DownloadFaultKind {
-    pub(crate) fn diagnostic_label(self) -> &'static str {
-        match self {
-            Self::TimedOut => "network_timeout",
-            Self::Stalled => "download_stalled",
-            Self::PrematureEof => "premature_eof",
-            Self::ConnectionReset => "connection_interrupted",
-            Self::ConnectionFailed => "connection_failed",
-            Self::Dns => "dns_lookup_failed",
-            Self::HttpStatus(408) => "http_408",
-            Self::HttpStatus(429) => "http_429",
-            Self::HttpStatus(500) => "http_500",
-            Self::HttpStatus(502) => "http_502",
-            Self::HttpStatus(503) => "http_503",
-            Self::HttpStatus(504) => "http_504",
-            Self::HttpStatus(_) => "http_retryable_status",
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DownloadActivity {
     Active,
@@ -4483,10 +4463,6 @@ mod tests {
         assert_eq!(
             source.requested_ranges.lock().unwrap().as_slice(),
             &[None, Some(4), Some(4), Some(4)]
-        );
-        assert_eq!(
-            DownloadFaultKind::ConnectionFailed.diagnostic_label(),
-            "connection_failed"
         );
         fs::remove_dir_all(root).unwrap();
     }

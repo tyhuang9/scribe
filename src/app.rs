@@ -1917,10 +1917,7 @@ impl ArtifactInstallCoordinator {
         if job.download_activity == Some(activity) {
             return None;
         }
-        Some(std::mem::replace(
-            &mut job.download_activity,
-            Some(activity),
-        ))
+        Some(job.download_activity.replace(activity))
     }
 
     fn download_activity_for_model(&self, model_id: &str) -> Option<DownloadActivity> {
