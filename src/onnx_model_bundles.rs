@@ -6,11 +6,15 @@
 //! verified and inventoried without catalog or network access. Executing or
 //! activating a bundle additionally requires the current embedded catalog.
 
+#[cfg(test)]
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
+#[cfg(test)]
+use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -55,6 +59,73 @@ const MOONSHINE_MIT_LICENSE_BYTES: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/resources/licenses/Moonshine-MIT.txt"
 ));
+
+#[cfg(test)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ReceiptVerificationStats {
+    pub(crate) calls: usize,
+    /// Sum of the declared bytes hashed by successful exact-tree verification.
+    pub(crate) verified_bytes: u64,
+    /// Samples are diagnostic evidence only; tests must not make timing claims.
+    pub(crate) durations: Vec<Duration>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static RECEIPT_VERIFICATION_OBSERVER: RefCell<Option<ReceiptVerificationStats>> = const {
+        RefCell::new(None)
+    };
+}
+
+#[cfg(test)]
+pub(crate) fn observe_receipt_verifications_for_test<T>(
+    operation: impl FnOnce() -> T,
+) -> (T, ReceiptVerificationStats) {
+    RECEIPT_VERIFICATION_OBSERVER.with(|observer| {
+        assert!(
+            observer.borrow().is_none(),
+            "receipt verification observers cannot be nested"
+        );
+        *observer.borrow_mut() = Some(ReceiptVerificationStats::default());
+    });
+    let result = operation();
+    let stats = RECEIPT_VERIFICATION_OBSERVER.with(|observer| {
+        observer
+            .borrow_mut()
+            .take()
+            .expect("receipt verification observer remains installed")
+    });
+    (result, stats)
+}
+
+#[cfg(test)]
+struct ReceiptVerificationSample {
+    started: Instant,
+    verified_bytes: u64,
+}
+
+#[cfg(test)]
+impl ReceiptVerificationSample {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            verified_bytes: 0,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for ReceiptVerificationSample {
+    fn drop(&mut self) {
+        RECEIPT_VERIFICATION_OBSERVER.with(|observer| {
+            if let Some(stats) = observer.borrow_mut().as_mut() {
+                stats.calls += 1;
+                stats.verified_bytes += self.verified_bytes;
+                stats.durations.push(self.started.elapsed());
+            }
+        });
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -1572,6 +1643,8 @@ pub(crate) fn verified_receipt_at(
     root: &Path,
 ) -> Result<(OnnxBundleReceipt, OnnxModelSpec), InstallError> {
     const MAX_RECEIPT_BYTES: u64 = 256 * 1024;
+    #[cfg(test)]
+    let mut verification_sample = ReceiptVerificationSample::new();
     verify_regular_directory_root(root)?;
     let receipt_path = root.join(RECEIPT_FILE_NAME);
     let bytes = read_regular_file_no_follow(&receipt_path, MAX_RECEIPT_BYTES)?;
@@ -1612,6 +1685,10 @@ pub(crate) fn verified_receipt_at(
         size_bytes: expected_notice.len() as u64,
         sha256: format!("{:x}", Sha256::digest(&expected_notice)),
     });
+    #[cfg(test)]
+    {
+        verification_sample.verified_bytes = exact_files.iter().map(|file| file.size_bytes).sum();
+    }
     verify_runtime_tree(root, &exact_files)?;
     let spec = spec_from_parts(
         &receipt.model_id,
@@ -2155,6 +2232,20 @@ mod tests {
         fs::write(root.join(NOTICE_FILE_NAME), b"wrong notice").unwrap();
         assert!(verified_receipt_at(&root).is_err());
         assert!(!receipt.files.is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scoped_receipt_observer_reports_one_full_tree_verification() {
+        let root = unique_root("receipt-observer");
+        write_fixture_bundle(&root, "fixture-moonshine", "observer");
+
+        let (result, stats) = observe_receipt_verifications_for_test(|| verified_receipt_at(&root));
+
+        assert!(result.is_ok());
+        assert_eq!(stats.calls, 1);
+        assert!(stats.verified_bytes > 0);
+        assert_eq!(stats.durations.len(), 1);
         fs::remove_dir_all(root).unwrap();
     }
 

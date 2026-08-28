@@ -1,6 +1,6 @@
 #![cfg_attr(not(test), allow(dead_code))]
 
-use std::{collections::HashSet, path::Path};
+use std::{collections::HashSet, path::Path, sync::OnceLock};
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -662,8 +662,18 @@ pub(crate) fn validate_catalog() -> Result<(), String> {
     validate_manifests(MODELS)
 }
 
+fn cached_validation<'a>(
+    cache: &'a OnceLock<Result<(), String>>,
+    validate: impl FnOnce() -> Result<(), String>,
+) -> &'a Result<(), String> {
+    cache.get_or_init(validate)
+}
+
 fn assert_catalog_valid() {
-    validate_catalog().expect("normalized model catalog must satisfy evidence and integrity rules");
+    static VALIDATION: OnceLock<Result<(), String>> = OnceLock::new();
+    cached_validation(&VALIDATION, validate_catalog)
+        .as_ref()
+        .expect("normalized model catalog must satisfy evidence and integrity rules");
 }
 
 impl ModelManifest {
@@ -994,6 +1004,26 @@ fn validate_artifact(artifact: ArtifactManifest) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn immutable_catalog_validation_is_cached_once_per_once_lock() {
+        let cache = OnceLock::new();
+        let calls = Cell::new(0);
+
+        let first = cached_validation(&cache, || {
+            calls.set(calls.get() + 1);
+            Ok(())
+        });
+        let second = cached_validation(&cache, || {
+            calls.set(calls.get() + 1);
+            Err("second validation must not run".to_owned())
+        });
+
+        assert!(first.is_ok());
+        assert!(second.is_ok());
+        assert_eq!(calls.get(), 1);
+    }
 
     #[test]
     fn production_catalog_is_valid_and_has_unique_ids() {
