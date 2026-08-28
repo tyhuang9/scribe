@@ -1534,21 +1534,49 @@ thread_local! {
 pub(crate) fn observe_receipt_verifications_for_test<T>(
     operation: impl FnOnce() -> T,
 ) -> (T, ReceiptVerificationStats) {
-    RECEIPT_VERIFICATION_OBSERVER.with(|observer| {
-        assert!(
-            observer.borrow().is_none(),
-            "receipt verification observers cannot be nested"
-        );
-        *observer.borrow_mut() = Some(ReceiptVerificationStats::default());
-    });
+    let observer = ReceiptVerificationObserver::install();
     let result = operation();
-    let stats = RECEIPT_VERIFICATION_OBSERVER.with(|observer| {
-        observer
-            .borrow_mut()
-            .take()
-            .expect("receipt verification observer remains installed")
-    });
+    let stats = observer.finish();
     (result, stats)
+}
+
+#[cfg(test)]
+struct ReceiptVerificationObserver {
+    previous: Option<ReceiptVerificationStats>,
+    active: bool,
+}
+
+#[cfg(test)]
+impl ReceiptVerificationObserver {
+    fn install() -> Self {
+        let previous = RECEIPT_VERIFICATION_OBSERVER
+            .with(|observer| observer.replace(Some(ReceiptVerificationStats::default())));
+        Self {
+            previous,
+            active: true,
+        }
+    }
+
+    fn finish(mut self) -> ReceiptVerificationStats {
+        let stats = self
+            .restore()
+            .expect("receipt verification observer remains installed");
+        self.active = false;
+        stats
+    }
+
+    fn restore(&mut self) -> Option<ReceiptVerificationStats> {
+        RECEIPT_VERIFICATION_OBSERVER.with(|observer| observer.replace(self.previous.take()))
+    }
+}
+
+#[cfg(test)]
+impl Drop for ReceiptVerificationObserver {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = self.restore();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1681,11 +1709,11 @@ pub(crate) fn verified_receipt_at(
         size_bytes: expected_notice.len() as u64,
         sha256: format!("{:x}", Sha256::digest(&expected_notice)),
     });
+    verify_runtime_tree(root, &exact_files)?;
     #[cfg(test)]
     {
         verification_sample.verified_bytes = exact_files.iter().map(|file| file.size_bytes).sum();
     }
-    verify_runtime_tree(root, &exact_files)?;
     let spec = spec_from_parts(
         &receipt.model_id,
         root.to_path_buf(),
@@ -2241,6 +2269,51 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(stats.calls, 1);
         assert!(stats.verified_bytes > 0);
+        assert_eq!(stats.durations.len(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn receipt_observer_restores_nested_scopes_and_panics() {
+        let root = unique_root("receipt-observer-nested");
+        write_fixture_bundle(&root, "fixture-moonshine", "nested");
+
+        let (inner_stats, outer_stats) = observe_receipt_verifications_for_test(|| {
+            assert!(verified_receipt_at(&root).is_ok());
+            let (_, inner_stats) =
+                observe_receipt_verifications_for_test(|| verified_receipt_at(&root));
+            assert!(verified_receipt_at(&root).is_ok());
+            inner_stats
+        });
+        assert_eq!(inner_stats.calls, 1);
+        assert_eq!(outer_stats.calls, 2);
+        assert!(inner_stats.verified_bytes > 0);
+        assert!(outer_stats.verified_bytes > inner_stats.verified_bytes);
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = observe_receipt_verifications_for_test(|| {
+                assert!(verified_receipt_at(&root).is_ok());
+                panic!("receipt observer panic fixture");
+            });
+        }));
+        assert!(panic.is_err());
+        let (_, stats) = observe_receipt_verifications_for_test(|| verified_receipt_at(&root));
+        assert_eq!(stats.calls, 1);
+        assert!(stats.verified_bytes > 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn receipt_observer_counts_bytes_only_after_a_successful_tree_verification() {
+        let root = unique_root("receipt-observer-failure");
+        let receipt = write_fixture_bundle(&root, "fixture-moonshine", "failure");
+        fs::write(root.join(&receipt.files[0].path), b"tampered").unwrap();
+
+        let (result, stats) = observe_receipt_verifications_for_test(|| verified_receipt_at(&root));
+
+        assert!(result.is_err());
+        assert_eq!(stats.calls, 1);
+        assert_eq!(stats.verified_bytes, 0);
         assert_eq!(stats.durations.len(), 1);
         fs::remove_dir_all(root).unwrap();
     }

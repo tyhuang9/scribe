@@ -3242,6 +3242,143 @@ mod tests {
     }
 
     #[test]
+    fn public_moonshine_operations_verify_each_receipt_once_before_dispatch() {
+        let model_id = ModelId::new("moonshine-tiny-en-int8-onnx");
+        let (fixture_root, mut spec) = service_onnx_spec_with(
+            "public-receipt-observer",
+            model_id.as_str(),
+            OnnxModelFamily::Moonshine,
+            4,
+            &[
+                OnnxFileRole::Encoder,
+                OnnxFileRole::MergedDecoder,
+                OnnxFileRole::Tokens,
+            ],
+        );
+        let storage = fixture_root.with_file_name(format!(
+            "scribe-service-public-receipt-storage-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let root = storage.join("onnx-bundles").join(model_id.as_str());
+        fs::create_dir_all(root.parent().unwrap()).unwrap();
+        fs::rename(&fixture_root, &root).unwrap();
+        spec.root = root.clone();
+        let current_manifest =
+            crate::onnx_model_bundles::write_test_receipt_for_spec(&spec).unwrap();
+
+        let expected = spec.clone();
+        let worker_dispatches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let worker_dispatches_for_thread = Arc::clone(&worker_dispatches);
+        let worker = simulated_runtime_worker(move |receiver| {
+            while let Ok(command) = receiver.recv() {
+                match command {
+                    RuntimeCommand::Load {
+                        artifact: RuntimeArtifact::OnnxBundle(actual),
+                        preference,
+                        reply,
+                    } => {
+                        worker_dispatches_for_thread.fetch_add(1, Ordering::SeqCst);
+                        assert_eq!(actual, expected);
+                        assert_eq!(preference, AccelerationPreference::Cpu);
+                        reply.send(Ok(test_load_execution())).unwrap();
+                    }
+                    RuntimeCommand::Health {
+                        artifact: RuntimeArtifact::OnnxBundle(actual),
+                        preference,
+                        reply,
+                    } => {
+                        worker_dispatches_for_thread.fetch_add(1, Ordering::SeqCst);
+                        assert_eq!(actual, expected);
+                        assert_eq!(preference, AccelerationPreference::Cpu);
+                        reply.send(Ok(())).unwrap();
+                    }
+                    RuntimeCommand::Transcribe {
+                        artifact: RuntimeArtifact::OnnxBundle(actual),
+                        preference,
+                        reply,
+                        ..
+                    } => {
+                        worker_dispatches_for_thread.fetch_add(1, Ordering::SeqCst);
+                        assert_eq!(actual, expected);
+                        assert_eq!(preference, AccelerationPreference::Cpu);
+                        reply
+                            .send(Ok(RuntimeExecution {
+                                transcript: Transcript {
+                                    text: "public-operation".to_owned(),
+                                    segments: Vec::new(),
+                                    detected_language: None,
+                                    duration_ms: None,
+                                },
+                                diagnostics: test_load_execution().diagnostics,
+                                processing_duration_ms: 1,
+                            }))
+                            .unwrap();
+                    }
+                    RuntimeCommand::Shutdown { reply } => {
+                        reply.send(Ok(())).unwrap();
+                        break;
+                    }
+                    _ => panic!("unexpected public ONNX command"),
+                }
+            }
+        });
+        let mut config = AppConfig::default();
+        config.general.model_storage_dir = storage.clone();
+        let service = TranscriptionService {
+            config,
+            router: RuntimeRouter::new(),
+            current_receipt_manifest: None,
+            worker,
+        }
+        .with_test_current_receipt_manifest(current_manifest);
+
+        let (preload, preload_stats) =
+            crate::onnx_model_bundles::observe_receipt_verifications_for_test(|| {
+                service.preload_model(&model_id, None)
+            });
+        let (health, health_stats) =
+            crate::onnx_model_bundles::observe_receipt_verifications_for_test(|| {
+                service.health_check(&model_id, None)
+            });
+        let (transcribe, transcribe_stats) =
+            crate::onnx_model_bundles::observe_receipt_verifications_for_test(|| {
+                service.transcribe(TranscriptionRequest::new(
+                    SessionId(730),
+                    RequestId(731),
+                    prepared_audio(),
+                    model_id.clone(),
+                ))
+            });
+        preload.unwrap();
+        health.unwrap();
+        transcribe.unwrap();
+        for stats in [&preload_stats, &health_stats, &transcribe_stats] {
+            assert_eq!(stats.calls, 1);
+            assert!(stats.verified_bytes > 0);
+            assert_eq!(stats.durations.len(), 1);
+        }
+        assert_eq!(worker_dispatches.load(Ordering::SeqCst), 3);
+
+        fs::write(root.join(&spec.files[&OnnxFileRole::Encoder]), b"tampered").unwrap();
+        let (tampered, tampered_stats) =
+            crate::onnx_model_bundles::observe_receipt_verifications_for_test(|| {
+                service.preload_model(&model_id, None)
+            });
+        assert!(tampered.is_err());
+        assert_eq!(tampered_stats.calls, 1);
+        assert_eq!(tampered_stats.verified_bytes, 0);
+        assert_eq!(tampered_stats.durations.len(), 1);
+        assert_eq!(worker_dispatches.load(Ordering::SeqCst), 3);
+
+        drop(service);
+        fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[test]
     fn staged_smoke_preserves_decode_failure_and_unloads_across_worker_boundary() {
         let (root, spec) = service_onnx_spec("decode-cleanup");
         let unloads = Arc::new(std::sync::atomic::AtomicUsize::new(0));

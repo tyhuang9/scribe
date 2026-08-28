@@ -10702,20 +10702,21 @@ impl LocalTranscriberApp {
     }
 
     fn finish_partial_discard(&mut self, model_id: &str, result: Result<bool, InstallError>) {
-        match result {
+        let inventory_changed = match result {
             Ok(true) => {
                 self.model_downloads.remove(model_id);
-                self.remote_catalog.invalidate_local_models();
                 self.status = TranscriptionStatus::Idle;
                 self.status_message =
                     "Discarded the retained partial download. The next download will start from zero."
                         .to_owned();
+                true
             }
             Ok(false) => {
                 self.model_downloads.remove(model_id);
                 self.status = TranscriptionStatus::Idle;
                 self.status_message =
                     "No retained partial download was found. No files were changed.".to_owned();
+                false
             }
             Err(error) => {
                 if error.requires_recovery() {
@@ -10735,10 +10736,13 @@ impl LocalTranscriberApp {
                 self.status = TranscriptionStatus::Error;
                 self.status_message =
                     format!("Could not finish discarding the retained partial: {error}");
+                false
             }
+        };
+        if inventory_changed {
+            self.remote_catalog.invalidate_local_models();
+            self.rebuild_model_inventory_projection();
         }
-        self.remote_catalog.invalidate_local_models();
-        self.rebuild_model_inventory_projection();
     }
 
     fn take_requested_partial_discard(
@@ -11071,12 +11075,14 @@ impl LocalTranscriberApp {
             .into_iter()
             .map(|descriptor| (descriptor.id.as_str().to_owned(), descriptor))
             .collect::<HashMap<_, _>>();
-        let installed_models = config::configured_models(&self.config)
-            .into_iter()
+        let installed_models = self
+            .remote_catalog
+            .local_model_inventory
+            .iter()
             .filter(|model| model.install_status.is_runnable())
             .filter_map(|model| {
                 let descriptor = descriptors.get(&model.id)?.clone();
-                Some((model, descriptor))
+                Some((model.clone(), descriptor))
             })
             .collect::<Vec<_>>();
         let request_initial_focus =
@@ -18993,6 +18999,39 @@ mod layout_tests {
     }
 
     #[test]
+    fn playground_selector_paints_use_the_cached_local_inventory() {
+        let ctx = egui::Context::default();
+        configure_stitch_style(&ctx);
+        let mut app = test_app();
+        let inventory = Arc::clone(&app.remote_catalog.local_model_inventory);
+        let inventory_builds = app.remote_catalog.local_model_inventory_build_count;
+        let local_models = Arc::clone(&app.remote_catalog.local_models);
+        let local_builds = app.remote_catalog.local_models_build_count;
+
+        app.open_playground_selector(None);
+        let (_, receipt_stats) =
+            crate::onnx_model_bundles::observe_receipt_verifications_for_test(|| {
+                for _ in 0..3 {
+                    render_selector(&ctx, &mut app, Vec::new());
+                }
+            });
+
+        assert_eq!(receipt_stats.calls, 0);
+        assert_eq!(receipt_stats.verified_bytes, 0);
+        assert!(receipt_stats.durations.is_empty());
+        assert_eq!(
+            app.remote_catalog.local_model_inventory_build_count,
+            inventory_builds
+        );
+        assert_eq!(app.remote_catalog.local_models_build_count, local_builds);
+        assert!(Arc::ptr_eq(
+            &inventory,
+            &app.remote_catalog.local_model_inventory
+        ));
+        assert!(Arc::ptr_eq(&local_models, &app.remote_catalog.local_models));
+    }
+
+    #[test]
     fn progress_updates_do_not_rebuild_the_local_inventory_or_view() {
         let mut app = test_app();
         let inventory_builds = app.remote_catalog.local_model_inventory_build_count;
@@ -19801,6 +19840,60 @@ mod layout_tests {
         assert!(app.artifact_mutation_block_reason().is_some());
         assert_eq!(app.status, TranscriptionStatus::Error);
         assert!(app.status_message.contains("Could not finish discarding"));
+    }
+
+    #[test]
+    fn partial_discard_noop_and_failure_keep_cached_inventory() {
+        let mut app = test_app();
+        let inventory = Arc::clone(&app.remote_catalog.local_model_inventory);
+        let local_models = Arc::clone(&app.remote_catalog.local_models);
+        let inventory_builds = app.remote_catalog.local_model_inventory_build_count;
+        let local_builds = app.remote_catalog.local_models_build_count;
+
+        app.finish_partial_discard("synthetic-model", Ok(false));
+        app.finish_partial_discard(
+            "synthetic-model",
+            Err(InstallError::Failed("discard fixture failure".to_owned())),
+        );
+
+        assert_eq!(
+            app.remote_catalog.local_model_inventory_build_count,
+            inventory_builds
+        );
+        assert_eq!(app.remote_catalog.local_models_build_count, local_builds);
+        assert!(Arc::ptr_eq(
+            &inventory,
+            &app.remote_catalog.local_model_inventory
+        ));
+        assert!(Arc::ptr_eq(&local_models, &app.remote_catalog.local_models));
+    }
+
+    #[test]
+    fn partial_discard_rebuilds_cached_inventory_only_after_a_change() {
+        let mut app = test_app();
+        let inventory = Arc::clone(&app.remote_catalog.local_model_inventory);
+        let local_models = Arc::clone(&app.remote_catalog.local_models);
+        let inventory_builds = app.remote_catalog.local_model_inventory_build_count;
+        let local_builds = app.remote_catalog.local_models_build_count;
+
+        app.finish_partial_discard("synthetic-model", Ok(true));
+
+        assert_eq!(
+            app.remote_catalog.local_model_inventory_build_count,
+            inventory_builds + 1
+        );
+        assert_eq!(
+            app.remote_catalog.local_models_build_count,
+            local_builds + 1
+        );
+        assert!(!Arc::ptr_eq(
+            &inventory,
+            &app.remote_catalog.local_model_inventory
+        ));
+        assert!(!Arc::ptr_eq(
+            &local_models,
+            &app.remote_catalog.local_models
+        ));
     }
 
     #[test]
@@ -21878,6 +21971,8 @@ mod layout_tests {
         app.config.general.managed_models.clear();
         app.config.general.model_paths.clear();
         app.config.general.playground_selected_models.clear();
+        app.remote_catalog.invalidate_local_models();
+        app.rebuild_model_inventory_projection();
         app.open_playground_selector(None);
 
         let output = render_selector(&ctx, &mut app, Vec::new());
