@@ -375,8 +375,6 @@ impl Fixture {
                         cpu: true,
                         gpu: true,
                     };
-                    expanded.runtime_action_label = Some("Repair".into());
-                    expanded.runtime_action_enabled = true;
                 }
             }
             Self::ModelsCompareExpanded => {
@@ -1103,10 +1101,7 @@ fn apply_action(data: &mut FixtureData, page: &mut AppPage, action: ScreenAction
     match action {
         ScreenAction::None
         | ScreenAction::InstallModel(_)
-        | ScreenAction::UpgradeModel(_)
         | ScreenAction::CancelModelInstall(_)
-        | ScreenAction::RepairModelRuntime(_)
-        | ScreenAction::MaintainModelRuntime(_)
         | ScreenAction::RetryRemoteCatalog => {}
         ScreenAction::DiscardModelPartial(id) => {
             if let Some(model) = data
@@ -4656,7 +4651,6 @@ mod tests {
             "GPU",
             "Supported",
             "FEATURES",
-            "MAINTENANCE",
         ] {
             assert!(node_names(&expanded).iter().any(|name| name == detail));
         }
@@ -4823,11 +4817,7 @@ mod tests {
                 "hidden feature {hidden}"
             );
         }
-        assert!(
-            names
-                .iter()
-                .any(|name| name == "Repair runtime for whisper.cpp tiny.en")
-        );
+        assert!(!names.iter().any(|name| name.contains("runtime")));
     }
 
     #[test]
@@ -5193,8 +5183,6 @@ mod tests {
             ("expanded feature row gap 1", 4.0),
             ("features requirements gap", 12.0),
             ("requirements heading content gap", 6.0),
-            ("requirements maintenance gap", 12.0),
-            ("maintenance heading content gap", 6.0),
         ] {
             assert_near(
                 rect(name).height(),
@@ -5222,11 +5210,9 @@ mod tests {
         let features_content = rect("features content");
         let requirements_heading = rect("requirements heading");
         let requirements_content = rect("requirements content");
-        let maintenance_heading = rect("maintenance heading");
         assert!(features_heading.y1 <= features_content.y0);
         assert!(features_content.y1 <= requirements_heading.y0);
         assert!(requirements_heading.y1 <= requirements_content.y0);
-        assert!(requirements_content.y1 <= maintenance_heading.y0);
         assert!(
             requirements_content.height() <= 44.0 + LAYOUT_TOLERANCE,
             "requirement cells should keep their natural compact height"

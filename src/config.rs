@@ -188,14 +188,6 @@ impl<'de> Deserialize<'de> for ManagedModelInstall {
 }
 
 impl ManagedModelInstall {
-    #[cfg(test)]
-    pub fn new(path: PathBuf) -> Self {
-        Self {
-            path,
-            ..Self::default()
-        }
-    }
-
     pub fn app_managed(path: PathBuf, source: &str) -> Self {
         Self {
             path,
@@ -639,10 +631,10 @@ fn bundled_model_path_for_executable(executable: &Path) -> Option<PathBuf> {
         .map(|directory| directory.join(manifest.artifact_filename))
 }
 
-pub fn runtime_storage_dir() -> PathBuf {
+pub fn artifact_state_storage_dir() -> PathBuf {
     scribe_project_dirs()
-        .map(|dirs| dirs.data_dir().join("runtimes"))
-        .unwrap_or_else(|_| PathBuf::from("runtimes"))
+        .map(|dirs| dirs.data_dir().join("artifact-state"))
+        .unwrap_or_else(|_| PathBuf::from("artifact-state"))
 }
 
 pub fn history_storage_dir() -> Result<PathBuf> {

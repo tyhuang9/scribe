@@ -8,9 +8,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-#[cfg(test)]
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use arboard::Clipboard;
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use eframe::egui::{
@@ -1464,7 +1461,7 @@ fn send_verified_install_preparation(
 }
 
 fn activation_journal_path() -> PathBuf {
-    config::runtime_storage_dir().join("activation-journal.json")
+    config::artifact_state_storage_dir().join("activation-journal.json")
 }
 
 fn failure_after_safe_rollback(
@@ -1808,11 +1805,6 @@ impl ArtifactInstallCoordinator {
         launches
     }
 
-    #[cfg(test)]
-    fn live_download_writer_count(&self) -> usize {
-        self.active_transfers
-    }
-
     fn update_download_reservation(
         &mut self,
         model_id: &str,
@@ -1998,13 +1990,6 @@ impl ArtifactInstallCoordinator {
     }
 
     #[cfg(test)]
-    fn remove(&mut self, model_id: &str) -> Option<(u64, InstallCancellation)> {
-        let job_id = self.jobs.get(model_id)?.handle.0;
-        let handle = self.jobs.get(model_id)?.handle.clone();
-        self.finish(model_id, job_id).then_some(handle)
-    }
-
-    #[cfg(test)]
     fn clear(&mut self) {
         self.jobs.clear();
         self.transfer_queue.clear();
@@ -2152,8 +2137,6 @@ fn run_verified_install_finalizer(
     let mut journal = ActivationJournal::begin(
         activation_journal_path(),
         model.destination.clone(),
-        None,
-        false,
         prior_config_fingerprint,
     )
     .map_err(|error| {
@@ -2810,7 +2793,6 @@ impl LocalTranscriberApp {
                 &activation_journal_path(),
                 &allowed_model_targets,
                 &allowed_manifest_targets,
-                &[],
                 Some(&fingerprint),
             )
         });
@@ -8776,7 +8758,6 @@ impl LocalTranscriberApp {
             }
             ModelRuntimeStatus::MissingConfiguration
             | ModelRuntimeStatus::NotInstalled
-            | ModelRuntimeStatus::NotImplemented
             | ModelRuntimeStatus::Error(_) => ModelReadiness::Error,
         };
         (Some(model.id.clone()), readiness)
@@ -9968,7 +9949,7 @@ impl LocalTranscriberApp {
                 )
             } else if installed {
                 (
-                "Packaged runtime unavailable".to_owned(),
+                "Packaged engine unavailable".to_owned(),
                 false,
                 Some(
                     "Reinstall Scribe if a model repair does not restore the packaged static inference engine."
@@ -12810,8 +12791,7 @@ fn runtime_chip_tone(status: &ModelRuntimeStatus) -> ChipTone {
     match status {
         ModelRuntimeStatus::Ready => ChipTone::Success,
         ModelRuntimeStatus::Running => ChipTone::Active,
-        ModelRuntimeStatus::NotImplemented
-        | ModelRuntimeStatus::NotInstalled
+        ModelRuntimeStatus::NotInstalled
         | ModelRuntimeStatus::MissingConfiguration
         | ModelRuntimeStatus::Downloading => ChipTone::Warning,
         ModelRuntimeStatus::Error(_) => ChipTone::Error,
@@ -12898,7 +12878,7 @@ fn setup_message_for_status(status: &ModelRuntimeStatus) -> String {
     match status {
         ModelRuntimeStatus::Ready => "Ready to transcribe.".to_owned(),
         ModelRuntimeStatus::MissingConfiguration => {
-            "Install the selected model and managed runtime from Models before transcribing."
+            "Repair or download the selected model before transcribing. If repair cannot restore a GGUF model, reinstall Scribe to restore the packaged inference engine."
                 .to_owned()
         }
         ModelRuntimeStatus::NotInstalled => {
@@ -12906,9 +12886,6 @@ fn setup_message_for_status(status: &ModelRuntimeStatus) -> String {
         }
         ModelRuntimeStatus::Downloading => "The selected model is still downloading.".to_owned(),
         ModelRuntimeStatus::Running => "A transcription is already running.".to_owned(),
-        ModelRuntimeStatus::NotImplemented => {
-            "No verified local runtime is bundled for this model.".to_owned()
-        }
         ModelRuntimeStatus::Error(message) => message.clone(),
     }
 }
@@ -13924,7 +13901,7 @@ mod layout_tests {
     }
 
     #[test]
-    fn active_model_can_stay_pinned_when_removed_from_playground_selection() {
+    fn empty_playground_selection_is_reseeded_from_the_ready_active_model() {
         let mut config = AppConfig::default();
         let active_model = config.general.selected_default_model.clone();
 
@@ -13932,13 +13909,7 @@ mod layout_tests {
         config::normalize_config(&mut config);
 
         assert_eq!(config.general.selected_default_model, active_model);
-        assert!(
-            !config
-                .general
-                .playground_selected_models
-                .iter()
-                .any(|id| id == &active_model)
-        );
+        assert_eq!(config.general.playground_selected_models, [active_model]);
     }
 
     #[test]
@@ -18488,12 +18459,15 @@ mod layout_tests {
         // happens to be installed on the developer machine. The default
         // catalog artifact is now GGUF, so a tiny local test file is enough
         // to exercise card/session state without invoking native loading.
-        let fixture = std::env::temp_dir().join(format!(
-            "scribe-app-default-tiny-{}-{}.gguf",
+        let storage = std::env::temp_dir().join(format!(
+            "scribe-app-default-tiny-{}-{}",
             std::process::id(),
             NEXT_TEST_SESSION.fetch_add(1, Ordering::Relaxed)
         ));
+        let fixture = storage.join("gguf").join("whisper-tiny.en-Q4_K_M.gguf");
+        fs::create_dir_all(fixture.parent().unwrap()).unwrap();
         fs::write(&fixture, b"test-only placeholder").unwrap();
+        config.general.model_storage_dir = storage;
         config
             .general
             .model_paths
@@ -18624,11 +18598,13 @@ mod layout_tests {
     }
 
     fn install_test_catalog_model(app: &mut LocalTranscriberApp, model_id: &str) -> PathBuf {
-        let fixture = std::env::temp_dir().join(format!(
-            "scribe-app-{model_id}-{}-{}.gguf",
-            std::process::id(),
-            NEXT_TEST_SESSION.fetch_add(1, Ordering::Relaxed)
-        ));
+        let model = crate::models::default_model_catalog()
+            .into_iter()
+            .find(|model| model.id == model_id)
+            .expect("test catalog model");
+        let fixture = config::downloaded_model_path(&app.config, &model)
+            .expect("test catalog model has a canonical install path");
+        fs::create_dir_all(fixture.parent().unwrap()).unwrap();
         fs::write(&fixture, b"test-only placeholder").unwrap();
         app.config
             .general
@@ -18678,6 +18654,14 @@ mod layout_tests {
     #[test]
     fn bundled_removal_config_allows_active_last_model_and_persists_exclusion() {
         let mut config = AppConfig::default();
+        let storage = std::env::temp_dir().join(format!(
+            "scribe-bundled-removal-config-{}-{}",
+            std::process::id(),
+            NEXT_TEST_SESSION.fetch_add(1, Ordering::Relaxed)
+        ));
+        config.general.model_storage_dir = storage.clone();
+        config.general.model_paths.clear();
+        config.general.managed_models.clear();
 
         apply_removed_model_config(&mut config, BUNDLED_BASE_MODEL_ID, None, true);
 
@@ -18693,6 +18677,7 @@ mod layout_tests {
                 .iter()
                 .any(|id| id == BUNDLED_BASE_MODEL_ID)
         );
+        let _ = fs::remove_dir_all(storage);
     }
 
     #[test]
@@ -18726,8 +18711,8 @@ mod layout_tests {
         fs::create_dir_all(&storage).unwrap();
         app.config.general.model_storage_dir = storage.clone();
         app.config.general.model_paths.clear();
-        app.config.general.selected_default_model = "faster_whisper_tiny_en".to_owned();
         let small = install_test_catalog_model(&mut app, "whisper_cpp_small_en");
+        app.config.general.selected_default_model = "faster_whisper_tiny_en".to_owned();
 
         app.reconcile_startup_model_selection();
 
@@ -19176,8 +19161,6 @@ mod layout_tests {
         let mut journal = ActivationJournal::begin(
             root.join("activation-journal.json"),
             destination.clone(),
-            None,
-            false,
             config::settings::artifact_config_fingerprint(&app.config)
                 .expect("fixture settings fingerprint"),
         )
@@ -20908,26 +20891,6 @@ mod layout_tests {
         }
     }
 
-    fn test_model() -> SttModelInfo {
-        SttModelInfo {
-            id: "legacy_whisper_ggml".to_owned(),
-            name: "Legacy whisper.cpp GGML".to_owned(),
-            backend: "whisper.cpp".to_owned(),
-            description:
-                "Recommended first-run local English model with a better speed/quality balance."
-                    .to_owned(),
-            expected_ram: "1 GB".to_owned(),
-            accuracy_tier: "Good accuracy".to_owned(),
-            speed_tier: "Fast speed".to_owned(),
-            local_path: Some(PathBuf::from(
-                "/home/tyhuang/Projects/whisper.cpp/models/ggml-base.en.bin",
-            )),
-            artifact_origin: ModelArtifactOrigin::External,
-            install_status: ModelInstallStatus::Installed,
-            download_model: Some("base.en".to_owned()),
-        }
-    }
-
     fn coordinator_admission(
         target_name: &str,
         volume: &str,
@@ -21670,6 +21633,12 @@ mod layout_tests {
             "scribe-missing-selector-models-{}",
             std::process::id()
         ));
+        app.config.general.model_paths.clear();
+        app.config.general.managed_models.clear();
+        app.config
+            .general
+            .excluded_bundled_model_ids
+            .push(BUNDLED_BASE_MODEL_ID.to_owned());
         app.config.general.playground_selected_models = vec!["whisper_cpp_base_en".to_owned()];
         app.open_playground_selector(None);
 
@@ -21760,7 +21729,6 @@ mod layout_tests {
         app.config.general.managed_models.clear();
         app.config.general.model_paths.clear();
         app.config.general.playground_selected_models.clear();
-        config::normalize_config(&mut app.config);
         app.refresh_playground_cards_from_config();
 
         let output = render_playground(&ctx, &mut app, Vec::new());
@@ -21869,7 +21837,7 @@ mod layout_tests {
     }
 
     #[test]
-    fn playground_run_requires_a_selection_and_ready_cards() {
+    fn playground_run_requires_a_selection_and_accepts_ready_gguf_cards() {
         let mut app = test_app();
         app.config.general.playground_selected_models.clear();
         app.playground_cards.clear();
@@ -21878,19 +21846,7 @@ mod layout_tests {
                 .is_some_and(|message| message.contains("Choose models"))
         );
 
-        let base_path = std::env::temp_dir()
-            .join(format!(
-                "scribe-playground-not-ready-{}-{}",
-                std::process::id(),
-                NEXT_TEST_SESSION.fetch_add(1, Ordering::Relaxed)
-            ))
-            .join("ggml-base.en.bin");
-        fs::create_dir_all(base_path.parent().unwrap()).unwrap();
-        fs::write(&base_path, b"test-only installed model").unwrap();
-        app.config
-            .general
-            .model_paths
-            .insert("whisper_cpp_base_en".to_owned(), base_path.clone());
+        let base_path = install_test_catalog_model(&mut app, "whisper_cpp_base_en");
         app.config.general.playground_selected_models = vec!["whisper_cpp_base_en".to_owned()];
         app.config.general.playground_model_order = vec!["whisper_cpp_base_en".to_owned()];
         config::normalize_config(&mut app.config);
@@ -21899,14 +21855,11 @@ mod layout_tests {
         let selected = app.playground_selected_models();
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].install_status, ModelInstallStatus::Installed);
-        assert_ne!(
+        assert_eq!(
             runtime_status_for_model(&app.config, &selected[0]),
             ModelRuntimeStatus::Ready
         );
-        assert!(
-            app.playground_run_block_reason()
-                .is_some_and(|message| message.contains("not ready"))
-        );
+        assert!(app.playground_run_block_reason().is_none());
         let _ = fs::remove_file(base_path);
     }
 
@@ -22607,10 +22560,10 @@ mod layout_tests {
         let temp_dir =
             std::env::temp_dir().join(format!("scribe-uninstall-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&temp_dir);
-        let model_dir = temp_dir.join("whisper.cpp");
+        let model_dir = temp_dir.join("gguf");
         fs::create_dir_all(&model_dir).unwrap();
-        let base_path = model_dir.join("ggml-base.en.bin");
-        let small_path = model_dir.join("ggml-small.en.bin");
+        let base_path = model_dir.join("whisper-base.en-Q8_0.gguf");
+        let small_path = model_dir.join("whisper-small.en-Q8_0.gguf");
         fs::write(&base_path, b"base").unwrap();
         fs::write(&small_path, b"small").unwrap();
 
@@ -22619,11 +22572,11 @@ mod layout_tests {
         config.general.model_storage_dir = temp_dir.clone();
         config.general.managed_models.insert(
             "whisper_cpp_base_en".to_owned(),
-            config::ManagedModelInstall::new(base_path.clone()),
+            config::ManagedModelInstall::app_managed(base_path.clone(), "test"),
         );
         config.general.managed_models.insert(
             "whisper_cpp_small_en".to_owned(),
-            config::ManagedModelInstall::new(small_path.clone()),
+            config::ManagedModelInstall::app_managed(small_path.clone(), "test"),
         );
 
         let removal =
@@ -23020,25 +22973,6 @@ mod layout_tests {
                     .find("self.rebuild_local_models_after_committed_change();")
                     .unwrap()
         );
-    }
-
-    #[test]
-    fn successful_runtime_removal_paths_rebuild_inventory_only_after_commit() {
-        let source = include_str!("app.rs");
-        let start = source.find("    fn uninstall_runtime(").unwrap();
-        let end = source[start..]
-            .find("\n    fn refresh_playground_runtime_statuses(")
-            .map(|offset| start + offset)
-            .unwrap();
-        let uninstall = &source[start..end];
-        let legacy_start = uninstall.find("        let Some(provider)").unwrap();
-        let (managed, legacy) = uninstall.split_at(legacy_start);
-        let refresh = "self.rebuild_local_models_after_committed_change();";
-
-        assert_eq!(uninstall.matches(refresh).count(), 2);
-        assert!(managed.find("removal.commit()").unwrap() < managed.find(refresh).unwrap());
-        assert!(managed.find("config::save_config").unwrap() < managed.find(refresh).unwrap());
-        assert!(legacy.find("config::save_config").unwrap() < legacy.find(refresh).unwrap());
     }
 
     #[test]

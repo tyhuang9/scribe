@@ -236,6 +236,126 @@ fn runtime_artifact_module_is_a_leaf_value_boundary() {
     }
 }
 
+#[test]
+fn static_gguf_and_native_onnx_are_the_only_inference_architectures() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let artifacts = fs::read_to_string(root.join("src/runtime_artifact.rs"))
+        .expect("runtime artifact source must be readable");
+    assert!(artifacts.contains("enum RuntimeArtifact"));
+    assert!(artifacts.contains("Gguf(RuntimeModel)"));
+    assert!(artifacts.contains("OnnxBundle(OnnxModelSpec)"));
+
+    let catalog = fs::read_to_string(root.join("src/model_catalog.rs"))
+        .expect("model catalog source must be readable");
+    assert!(catalog.contains("enum ArtifactFormat"));
+    assert!(catalog.contains("Gguf,"));
+
+    let worker = fs::read_to_string(root.join("src/onnx_worker.rs"))
+        .expect("inference worker source must be readable");
+    assert!(worker.contains("enum WireRuntimeArtifact"));
+    assert!(worker.contains("Gguf(WireRuntimeModel)"));
+    assert!(worker.contains("OnnxBundle(OnnxModelSpec)"));
+    assert!(worker.contains("OfflineRecognizer::create("));
+    assert!(worker.contains("OnlineRecognizer::create("));
+    assert!(worker.contains("std::env::current_exe()?"));
+    assert!(worker.contains("INFERENCE_WORKER_FLAG"));
+
+    let router = fs::read_to_string(root.join("src/runtime_router.rs"))
+        .expect("runtime router source must be readable");
+    assert!(router.contains("enum RuntimeKind"));
+    assert!(router.contains("TranscribeCpp,"));
+    assert!(router.contains("EmbeddedRuntime::new("));
+    assert!(!router.contains("Command::new"));
+
+    let manifest =
+        fs::read_to_string(root.join("Cargo.toml")).expect("Cargo manifest must be readable");
+    assert!(
+        manifest.contains("transcribe-cpp = { version = \"=0.1.3\", default-features = false }")
+    );
+}
+
+#[test]
+fn dynamic_whisper_and_standalone_runtime_paths_stay_removed() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let obsolete_paths = [
+        "src/compatibility_bridge.rs",
+        "src/runtime_catalog.rs",
+        "src/stt/whisper_cpp.rs",
+        "native/whisper_shim.c",
+    ];
+    for relative in obsolete_paths {
+        assert!(
+            !root.join(relative).exists(),
+            "retired runtime path was restored: {relative}"
+        );
+    }
+
+    let forbidden = [
+        "LegacyGgml",
+        "LegacyCompatibility",
+        "LegacyBatchAdapter",
+        "transcribe_legacy",
+        "whisper_cli",
+        "whisper-cli",
+        "whisper.dll",
+        "ggml.dll",
+        "SCRIBE_WHISPER_",
+        "SCRIBE_RUNTIME_DEST",
+        "RepairModelRuntime",
+        "MaintainModelRuntime",
+        "libloading::",
+        "scribe_whisper_",
+    ];
+    for (path, source) in rust_sources() {
+        if path == Path::new("architecture_guard.rs") {
+            continue;
+        }
+        let production = production_source_for(&path, &source);
+        for retired in forbidden {
+            assert!(
+                !production.contains(retired),
+                "retired runtime token {retired:?} remains in production source {}",
+                path.display()
+            );
+        }
+    }
+
+    let build = fs::read_to_string(root.join("build.rs")).expect("build script must be readable");
+    for retired in [
+        "whisper_shim",
+        "scribe_whisper",
+        "LoadLibrary",
+        "GetProcAddress",
+    ] {
+        assert!(
+            !build.contains(retired),
+            "dynamic Whisper build token {retired:?} was restored"
+        );
+    }
+
+    let manifest =
+        fs::read_to_string(root.join("Cargo.toml")).expect("Cargo manifest must be readable");
+    assert!(
+        !manifest
+            .lines()
+            .any(|line| line.trim_start().starts_with("libloading =")),
+        "libloading must not be a direct production dependency"
+    );
+
+    let tray = fs::read_to_string(root.join("src/tray.rs")).expect("tray source must be readable");
+    for required in [
+        "CString::new(name)",
+        "libc::dlopen",
+        "libc::RTLD_LAZY | libc::RTLD_LOCAL",
+        "libc::dlclose(handle)",
+    ] {
+        assert!(
+            tray.contains(required),
+            "Linux tray availability probe must retain {required:?}"
+        );
+    }
+}
+
 const WORKER_RUNTIME_MARKER: &str = "worker-only native runtime";
 const NATIVE_RUNTIME_OWNER_PATHS: [&str; 3] =
     ["embedded_runtime.rs", "onnx_worker.rs", "runtime_router.rs"];
@@ -702,20 +822,19 @@ fn retired_python_provider_stack_stays_absent_without_crossing_native_boundaries
     );
 
     let stt = fs::read_to_string(root.join("src/stt/mod.rs"))
-        .expect("STT compatibility module must be readable");
-    let direct_dispatch = production_source(&stt)
-        .split("pub fn transcribe_with_config")
-        .nth(1)
-        .expect("direct compatibility dispatch exists")
-        .to_owned();
+        .expect("STT cancellation module must be readable");
+    let direct_dispatch = production_source(&stt);
     assert!(
         !direct_dispatch.contains("provider_for_backend"),
-        "direct compatibility dispatch must not perform provider lookup"
+        "STT cancellation boundary must not perform provider lookup"
     );
+    assert!(!direct_dispatch.contains("Command::new"));
 
     for retained_path in [
         "vendor/sherpa-onnx-sys/LICENSE",
         "native/sherpa-onnx-v1.13.5/PROVENANCE.md",
+        "native/whisper-f049fff/LICENSE",
+        "native/whisper-f049fff/PROVENANCE.md",
         "resources/licenses/Moonshine-MIT.txt",
     ] {
         assert!(
@@ -732,7 +851,6 @@ fn private_onnx_runtime_contract_does_not_leak_into_product_surfaces() {
         Path::new("app.rs"),
         Path::new("config.rs"),
         Path::new("model_catalog.rs"),
-        Path::new("runtime_catalog.rs"),
     ];
     let forbidden = [
         "OnnxModelSpec",
@@ -816,7 +934,6 @@ fn application_and_ui_sources_are_runtime_neutral() {
 fn model_family_logic_is_confined_to_private_adapters_and_catalog_validation() {
     let sources = rust_sources();
     let allowed_files = [
-        "compatibility_bridge.rs",
         "config.rs",
         "installations.rs",
         "managed_downloads.rs",
@@ -824,7 +941,6 @@ fn model_family_logic_is_confined_to_private_adapters_and_catalog_validation() {
         "models.rs",
         "onnx_model_bundles.rs",
         "runtime_artifact.rs",
-        "runtime_catalog.rs",
         "runtime_router.rs",
         "settings/schema.rs",
         "silero_vad_native.rs",
@@ -888,11 +1004,7 @@ fn onnx_bundle_http_and_typed_receipts_stay_below_the_service_boundary() {
     assert!(bundles.contains("fn verified_receipt_at("));
     assert!(bundles.contains("OnnxModelSpec"));
 
-    for protected in [
-        Path::new("model_catalog.rs"),
-        Path::new("models.rs"),
-        Path::new("runtime_catalog.rs"),
-    ] {
+    for protected in [Path::new("model_catalog.rs"), Path::new("models.rs")] {
         let production = sources
             .iter()
             .find(|(path, _)| path == protected)

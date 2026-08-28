@@ -7,7 +7,6 @@ use sha2::{Digest, Sha256};
 
 use crate::transcription::ModelId;
 
-const WHISPER_CPP_REVISION: &str = "5359861c739e955e79d9a303bcbc70fb988958b1";
 const HANDY_COMPUTER_TINY_EN_REVISION: &str = "becb8bcb804405dc97b380a523d9975888820986";
 const COMPATIBILITY_EVIDENCE_DOCUMENT: &str = "docs/SCRIBE_REVAMP.md";
 pub(crate) const BUNDLED_BASE_MODEL_ID: &str = "whisper_cpp_base_en";
@@ -587,14 +586,6 @@ fn receipt_backed_bundle_id_for_artifact(
         }
         _ => None,
     }
-}
-
-pub(crate) fn normalized_model_storage_estimate(id: &ModelId) -> Option<&'static str> {
-    assert_catalog_valid();
-    MODELS
-        .iter()
-        .find(|manifest| manifest.id == id.as_str())
-        .map(|manifest| manifest.storage_guidance)
 }
 
 pub(crate) fn runtime_artifact_manifest_for_path(

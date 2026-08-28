@@ -4,7 +4,9 @@
 //! selection and smoke testing stay behind `TranscriptionService` and
 //! `RuntimeRouter`.
 
-use std::collections::{HashMap, HashSet};
+#[cfg(test)]
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -227,7 +229,6 @@ pub(crate) struct GeneratedBundleFile {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ActivationPhase {
     Prepared,
-    RuntimeActivated,
     ModelActivated,
     ConfigPersisted,
 }
@@ -242,10 +243,6 @@ struct ActivationJournalDocument {
     manifest_target: Option<PathBuf>,
     #[serde(default)]
     manifest_had_previous: bool,
-    runtime_target: Option<PathBuf>,
-    runtime_had_previous: bool,
-    #[serde(default)]
-    retain_runtime_as_previous: bool,
     #[serde(default)]
     prior_config_fingerprint: Option<String>,
     #[serde(default)]
@@ -262,8 +259,6 @@ impl ActivationJournal {
     pub(crate) fn begin(
         path: PathBuf,
         model_target: PathBuf,
-        runtime_target: Option<PathBuf>,
-        retain_runtime_as_previous: bool,
         prior_config_fingerprint: String,
     ) -> Result<Self, InstallError> {
         if path.exists() {
@@ -276,15 +271,12 @@ impl ActivationJournal {
         let journal = Self {
             path,
             document: ActivationJournalDocument {
-                schema_version: 2,
+                schema_version: 3,
                 phase: ActivationPhase::Prepared,
                 model_had_previous: model_target.exists(),
                 manifest_target: None,
                 manifest_had_previous: false,
-                runtime_had_previous: runtime_target.as_ref().is_some_and(|path| path.exists()),
                 model_target,
-                runtime_target,
-                retain_runtime_as_previous,
                 prior_config_fingerprint: Some(prior_config_fingerprint),
                 expected_config_fingerprint: None,
             },
@@ -296,12 +288,7 @@ impl ActivationJournal {
     pub(crate) fn mark(&mut self, phase: ActivationPhase) -> Result<(), InstallError> {
         let legal = matches!(
             (self.document.phase, phase),
-            (ActivationPhase::Prepared, ActivationPhase::RuntimeActivated)
-                | (ActivationPhase::Prepared, ActivationPhase::ModelActivated)
-                | (
-                    ActivationPhase::RuntimeActivated,
-                    ActivationPhase::ModelActivated
-                )
+            (ActivationPhase::Prepared, ActivationPhase::ModelActivated)
                 | (
                     ActivationPhase::ModelActivated,
                     ActivationPhase::ConfigPersisted
@@ -373,7 +360,6 @@ pub(crate) fn reconcile_activation_journal(
     path: &Path,
     allowed_model_targets: &[PathBuf],
     allowed_manifest_targets: &[PathBuf],
-    allowed_runtime_targets: &[PathBuf],
     durable_config_fingerprint: Option<&str>,
 ) -> Result<bool, InstallError> {
     if !path.exists() {
@@ -387,7 +373,7 @@ pub(crate) fn reconcile_activation_journal(
             path.display()
         ))
     })?;
-    if document.schema_version != 2 {
+    if document.schema_version != 3 {
         return Err(failed("unsupported activation journal schema"));
     }
     if let Some(fingerprint) = document.prior_config_fingerprint.as_deref() {
@@ -404,9 +390,6 @@ pub(crate) fn reconcile_activation_journal(
             "installed-model manifest",
         )?;
     }
-    if let Some(runtime_target) = document.runtime_target.as_ref() {
-        validate_reconciliation_target(runtime_target, allowed_runtime_targets, "runtime")?;
-    }
     let prior_config_is_durable = document
         .prior_config_fingerprint
         .as_deref()
@@ -422,17 +405,11 @@ pub(crate) fn reconcile_activation_journal(
         if let Some(manifest) = document.manifest_target.as_ref() {
             finalize_file_replacement(manifest)?;
         }
-        if let Some(runtime) = document.runtime_target.as_ref() {
-            finalize_directory_replacement(runtime, document.retain_runtime_as_previous)?;
-        }
     } else if prior_config_is_durable {
         if let Some(manifest) = document.manifest_target.as_ref() {
             restore_file_replacement(manifest, document.manifest_had_previous)?;
         }
         restore_file_replacement(&document.model_target, document.model_had_previous)?;
-        if let Some(runtime) = document.runtime_target.as_ref() {
-            restore_directory_replacement(runtime, document.runtime_had_previous)?;
-        }
     } else {
         return Err(InstallError::RecoveryRequired(format!(
             "durable artifact settings match neither the pre-install nor expected post-install fingerprint for {}; refusing to mutate artifacts",
@@ -3833,18 +3810,6 @@ mod tests {
         }
     }
 
-    fn write_zip(path: &Path, entries: &[(&str, &[u8])]) {
-        let file = File::create(path).unwrap();
-        let mut archive = zip::ZipWriter::new(file);
-        let options = zip::write::SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Stored);
-        for (name, bytes) in entries {
-            archive.start_file(*name, options).unwrap();
-            archive.write_all(bytes).unwrap();
-        }
-        archive.finish().unwrap();
-    }
-
     #[test]
     fn valid_range_resume_appends_only_the_requested_suffix() {
         let root = unique_root("resume");
@@ -4496,8 +4461,6 @@ mod tests {
         let error = ActivationJournal::begin(
             path.clone(),
             root.join("model.bin"),
-            Some(root.join("runtime")),
-            true,
             format!("{:x}", Sha256::digest(b"prior-config")),
         )
         .unwrap_err();
@@ -4515,15 +4478,12 @@ mod tests {
         let outside = root.join("outside-model.bin");
         fs::write(&outside, b"sentinel").unwrap();
         let document = ActivationJournalDocument {
-            schema_version: 2,
+            schema_version: 3,
             phase: ActivationPhase::Prepared,
             model_target: outside.clone(),
             model_had_previous: false,
             manifest_target: None,
             manifest_had_previous: false,
-            runtime_target: None,
-            runtime_had_previous: false,
-            retain_runtime_as_previous: false,
             prior_config_fingerprint: Some(format!("{:x}", Sha256::digest(b"prior-config"))),
             expected_config_fingerprint: None,
         };
@@ -4532,7 +4492,6 @@ mod tests {
         let error = reconcile_activation_journal(
             &journal_path,
             &[root.join("allowed-model.bin")],
-            &[],
             &[],
             None,
         )
@@ -4549,97 +4508,57 @@ mod tests {
     }
 
     #[test]
-    fn repair_reconciliation_preserves_known_good_previous_runtime() {
-        let root = unique_root("journal-repair-policy");
+    fn legacy_runtime_journal_schema_is_rejected_without_touching_referenced_artifacts() {
+        let root = unique_root("journal-legacy-runtime-schema");
+        fs::create_dir_all(&root).unwrap();
         let journal_path = root.join("activation-journal.json");
-        let model = root.join("model.bin");
-        let runtime = root.join("runtime");
-        let rollback = directory_rollback_path(&runtime);
-        let previous = previous_runtime_root(&runtime);
+        let model = root.join("legacy-model.bin");
+        let runtime = root.join("legacy-runtime");
+        fs::write(&model, b"model-sentinel").unwrap();
         fs::create_dir_all(&runtime).unwrap();
-        fs::create_dir_all(&rollback).unwrap();
-        fs::create_dir_all(&previous).unwrap();
-        fs::write(&model, b"new-model").unwrap();
-        fs::write(runtime.join("version"), b"repaired").unwrap();
-        fs::write(rollback.join("version"), b"unhealthy").unwrap();
-        fs::write(previous.join("version"), b"known-good").unwrap();
-        let durable_new = format!("{:x}", Sha256::digest(b"new-config"));
-        let document = ActivationJournalDocument {
-            schema_version: 2,
-            phase: ActivationPhase::ConfigPersisted,
-            model_target: model.clone(),
-            model_had_previous: false,
-            manifest_target: None,
-            manifest_had_previous: false,
-            runtime_target: Some(runtime.clone()),
-            runtime_had_previous: true,
-            retain_runtime_as_previous: false,
-            prior_config_fingerprint: Some(format!("{:x}", Sha256::digest(b"old-config"))),
-            expected_config_fingerprint: Some(durable_new.clone()),
-        };
-        fs::write(&journal_path, serde_json::to_vec(&document).unwrap()).unwrap();
+        let runtime_sentinel = runtime.join("sentinel.bin");
+        fs::write(&runtime_sentinel, b"runtime-sentinel").unwrap();
+        let model_modified = fs::metadata(&model).unwrap().modified().unwrap();
+        let runtime_modified = fs::metadata(&runtime_sentinel).unwrap().modified().unwrap();
+        let legacy_document = serde_json::json!({
+            "schema_version": 2,
+            "phase": "model_activated",
+            "model_target": model,
+            "model_had_previous": true,
+            "manifest_target": null,
+            "manifest_had_previous": false,
+            "runtime_target": runtime,
+            "runtime_had_previous": true,
+            "retain_runtime_as_previous": true,
+            "prior_config_fingerprint": format!("{:x}", Sha256::digest(b"old-config")),
+            "expected_config_fingerprint": format!("{:x}", Sha256::digest(b"new-config")),
+        });
+        let journal_bytes = serde_json::to_vec_pretty(&legacy_document).unwrap();
+        fs::write(&journal_path, &journal_bytes).unwrap();
 
-        assert!(
-            reconcile_activation_journal(
-                &journal_path,
-                std::slice::from_ref(&model),
-                &[],
-                std::slice::from_ref(&runtime),
-                Some(&durable_new),
-            )
-            .unwrap()
-        );
-
-        assert!(!rollback.exists());
-        assert_eq!(fs::read(previous.join("version")).unwrap(), b"known-good");
-        assert!(!journal_path.exists());
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn update_reconciliation_promotes_replaced_runtime_to_previous() {
-        let root = unique_root("journal-update-policy");
-        let journal_path = root.join("activation-journal.json");
-        let model = root.join("model.bin");
-        let runtime = root.join("runtime");
-        let rollback = directory_rollback_path(&runtime);
-        let previous = previous_runtime_root(&runtime);
-        fs::create_dir_all(&runtime).unwrap();
-        fs::create_dir_all(&rollback).unwrap();
-        fs::create_dir_all(&previous).unwrap();
-        fs::write(&model, b"new-model").unwrap();
-        fs::write(runtime.join("version"), b"new").unwrap();
-        fs::write(rollback.join("version"), b"replaced-good").unwrap();
-        fs::write(previous.join("version"), b"older-good").unwrap();
-        let durable_new = format!("{:x}", Sha256::digest(b"new-config"));
-        let document = ActivationJournalDocument {
-            schema_version: 2,
-            phase: ActivationPhase::ConfigPersisted,
-            model_target: model.clone(),
-            model_had_previous: false,
-            manifest_target: None,
-            manifest_had_previous: false,
-            runtime_target: Some(runtime.clone()),
-            runtime_had_previous: true,
-            retain_runtime_as_previous: true,
-            prior_config_fingerprint: Some(format!("{:x}", Sha256::digest(b"old-config"))),
-            expected_config_fingerprint: Some(durable_new.clone()),
-        };
-        fs::write(&journal_path, serde_json::to_vec(&document).unwrap()).unwrap();
-
-        reconcile_activation_journal(
+        let error = reconcile_activation_journal(
             &journal_path,
             std::slice::from_ref(&model),
             &[],
-            std::slice::from_ref(&runtime),
-            Some(&durable_new),
+            Some(&format!("{:x}", Sha256::digest(b"old-config"))),
         )
-        .unwrap();
+        .unwrap_err();
 
-        assert!(!rollback.exists());
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported activation journal schema")
+        );
+        assert_eq!(fs::read(&journal_path).unwrap(), journal_bytes);
+        assert_eq!(fs::read(&model).unwrap(), b"model-sentinel");
+        assert_eq!(fs::read(&runtime_sentinel).unwrap(), b"runtime-sentinel");
         assert_eq!(
-            fs::read(previous.join("version")).unwrap(),
-            b"replaced-good"
+            fs::metadata(&model).unwrap().modified().unwrap(),
+            model_modified
+        );
+        assert_eq!(
+            fs::metadata(&runtime_sentinel).unwrap().modified().unwrap(),
+            runtime_modified
         );
         fs::remove_dir_all(root).unwrap();
     }
@@ -4656,15 +4575,12 @@ mod tests {
         let expected_new = format!("{:x}", Sha256::digest(b"new-config"));
         let durable_old = format!("{:x}", Sha256::digest(b"old-config"));
         let document = ActivationJournalDocument {
-            schema_version: 2,
+            schema_version: 3,
             phase: ActivationPhase::ModelActivated,
             model_target: model.clone(),
             model_had_previous: true,
             manifest_target: None,
             manifest_had_previous: false,
-            runtime_target: None,
-            runtime_had_previous: false,
-            retain_runtime_as_previous: false,
             prior_config_fingerprint: Some(durable_old.clone()),
             expected_config_fingerprint: Some(expected_new),
         };
@@ -4673,7 +4589,6 @@ mod tests {
         reconcile_activation_journal(
             &journal_path,
             std::slice::from_ref(&model),
-            &[],
             &[],
             Some(&durable_old),
         )
@@ -4699,15 +4614,12 @@ mod tests {
         fs::write(&manifest_rollback, b"old-manifest").unwrap();
         let durable_old = format!("{:x}", Sha256::digest(b"old-config"));
         let document = ActivationJournalDocument {
-            schema_version: 2,
+            schema_version: 3,
             phase: ActivationPhase::ModelActivated,
             model_target: model.clone(),
             model_had_previous: true,
             manifest_target: Some(manifest.clone()),
             manifest_had_previous: true,
-            runtime_target: None,
-            runtime_had_previous: false,
-            retain_runtime_as_previous: false,
             prior_config_fingerprint: Some(durable_old.clone()),
             expected_config_fingerprint: Some(format!("{:x}", Sha256::digest(b"new-config"))),
         };
@@ -4717,7 +4629,6 @@ mod tests {
             &journal_path,
             std::slice::from_ref(&model),
             std::slice::from_ref(&manifest),
-            &[],
             Some(&durable_old),
         )
         .unwrap();
@@ -4739,15 +4650,12 @@ mod tests {
         fs::write(&model_rollback, b"old-model").unwrap();
         let durable_new = format!("{:x}", Sha256::digest(b"new-config"));
         let document = ActivationJournalDocument {
-            schema_version: 2,
+            schema_version: 3,
             phase: ActivationPhase::ModelActivated,
             model_target: model.clone(),
             model_had_previous: true,
             manifest_target: None,
             manifest_had_previous: false,
-            runtime_target: None,
-            runtime_had_previous: false,
-            retain_runtime_as_previous: false,
             prior_config_fingerprint: Some(format!("{:x}", Sha256::digest(b"old-config"))),
             expected_config_fingerprint: Some(durable_new.clone()),
         };
@@ -4756,7 +4664,6 @@ mod tests {
         reconcile_activation_journal(
             &journal_path,
             std::slice::from_ref(&model),
-            &[],
             &[],
             Some(&durable_new),
         )
@@ -4778,15 +4685,12 @@ mod tests {
         fs::write(&model, b"new-model").unwrap();
         fs::write(&model_rollback, b"old-model").unwrap();
         let document = ActivationJournalDocument {
-            schema_version: 2,
+            schema_version: 3,
             phase: ActivationPhase::ModelActivated,
             model_target: model.clone(),
             model_had_previous: true,
             manifest_target: None,
             manifest_had_previous: false,
-            runtime_target: None,
-            runtime_had_previous: false,
-            retain_runtime_as_previous: false,
             prior_config_fingerprint: Some(format!("{:x}", Sha256::digest(b"prior"))),
             expected_config_fingerprint: Some(format!("{:x}", Sha256::digest(b"expected"))),
         };
@@ -4796,7 +4700,6 @@ mod tests {
         let error = reconcile_activation_journal(
             &journal_path,
             std::slice::from_ref(&model),
-            &[],
             &[],
             Some(&unrelated),
         )

@@ -4,6 +4,7 @@
 //! same-executable inference child. GGUF models are owned by the statically
 //! linked `transcribe-cpp` adapter; receipt-backed ONNX bundles are owned by
 //! native Sherpa in `onnx_worker`.
+//! worker-only native runtime
 
 use std::fs::File;
 use std::io::{self, Read};

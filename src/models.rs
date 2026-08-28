@@ -87,25 +87,6 @@ impl fmt::Display for ModelInstallStatus {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct TranscriptSegment {
-    pub start_ms: Option<u64>,
-    pub end_ms: Option<u64>,
-    pub text: String,
-}
-
-#[derive(Clone, Debug)]
-pub struct TranscriptResult {
-    pub model_id: String,
-    pub model_name: String,
-    pub backend: String,
-    pub text: String,
-    pub segments: Vec<TranscriptSegment>,
-    pub duration_ms: Option<u128>,
-    pub stdout: String,
-    pub stderr: String,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TranscriptionStatus {
     Idle,
@@ -132,7 +113,6 @@ pub enum ModelRuntimeStatus {
     NotInstalled,
     Downloading,
     Running,
-    NotImplemented,
     Error(String),
 }
 
@@ -144,7 +124,6 @@ impl fmt::Display for ModelRuntimeStatus {
             Self::NotInstalled => write!(f, "Not installed"),
             Self::Downloading => write!(f, "Downloading"),
             Self::Running => write!(f, "Running"),
-            Self::NotImplemented => write!(f, "Runtime unavailable"),
             Self::Error(message) => write!(f, "Error: {message}"),
         }
     }
