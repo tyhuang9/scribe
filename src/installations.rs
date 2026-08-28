@@ -207,14 +207,6 @@ pub(crate) struct RuntimeFileSpec {
     pub(crate) sha256: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RuntimeArchiveSpec {
-    pub(crate) package_id: String,
-    pub(crate) artifact: PinnedArtifact,
-    pub(crate) manifest_json: String,
-    pub(crate) files: Vec<RuntimeFileSpec>,
-}
-
 /// One already downloaded, exact file copied into a freshly assembled bundle.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct BundleAssemblyFile {
@@ -1834,57 +1826,6 @@ impl DownloadedArtifact {
     }
 }
 
-pub(crate) fn stage_runtime_archive_for_target(
-    spec: &RuntimeArchiveSpec,
-    target_root: &Path,
-    entrypoint_relative: &Path,
-    expected_archive_target_identity: &CanonicalTargetIdentity,
-    cancellation: &InstallCancellation,
-    progress: &dyn Fn(InstallProgress),
-) -> Result<StagedRuntime, InstallError> {
-    let archive = download_pinned_artifact_for_target(
-        &spec.artifact,
-        expected_archive_target_identity,
-        None,
-        cancellation,
-        progress,
-    )?;
-    let stage_root = transaction_path(target_root, "installing")?;
-    remove_path_if_exists(&stage_root)?;
-    fs::create_dir_all(&stage_root).map_err(|error| {
-        failed(format!(
-            "failed to create {}: {error}",
-            stage_root.display()
-        ))
-    })?;
-    let preparation = (|| {
-        extract_runtime_archive(
-            &archive.path,
-            &stage_root,
-            &spec.files,
-            cancellation,
-            progress,
-        )?;
-        verify_runtime_tree(&stage_root, &spec.files)?;
-        let entrypoint = stage_root.join(entrypoint_relative);
-        if !entrypoint.is_file() {
-            return Err(failed(format!(
-                "staged runtime has no entrypoint at {}",
-                entrypoint.display()
-            )));
-        }
-        Ok(())
-    })();
-    if let Err(error) = preparation {
-        let _ = remove_path_if_exists(&stage_root);
-        return Err(error);
-    }
-    Ok(StagedRuntime {
-        root: stage_root,
-        target_root: target_root.to_path_buf(),
-    })
-}
-
 /// Assembles exact, individually verified files into a fresh same-volume
 /// staging directory. A prior crash can leave only the reserved staging path;
 /// the next explicit installation safely replaces that path before doing any
@@ -2145,155 +2086,6 @@ fn write_new_bundle_file(
         .map_err(|error| failed(format!("failed to write {}: {error}", output.display())))?;
     file.sync_all()
         .map_err(|error| failed(format!("failed to sync {}: {error}", output.display())))
-}
-
-fn extract_runtime_archive(
-    archive_path: &Path,
-    stage_root: &Path,
-    files: &[RuntimeFileSpec],
-    cancellation: &InstallCancellation,
-    progress: &dyn Fn(InstallProgress),
-) -> Result<(), InstallError> {
-    let file = File::open(archive_path).map_err(|error| {
-        failed(format!(
-            "failed to open {}: {error}",
-            archive_path.display()
-        ))
-    })?;
-    let mut archive = zip::ZipArchive::new(file)
-        .map_err(|error| failed(format!("invalid runtime ZIP: {error}")))?;
-    if archive
-        .has_overlapping_files()
-        .map_err(|error| failed(format!("failed to validate runtime ZIP layout: {error}")))?
-    {
-        return Err(failed("runtime ZIP contains overlapping entries"));
-    }
-    let expected = files
-        .iter()
-        .map(|file| (file.archive_path.clone(), file))
-        .collect::<HashMap<_, _>>();
-    if archive.len() > 256 {
-        return Err(failed("runtime ZIP exceeds the 256-entry safety limit"));
-    }
-    let total = files.iter().try_fold(0_u64, |total, file| {
-        total
-            .checked_add(file.size_bytes)
-            .ok_or_else(|| failed("runtime manifest expanded size overflow"))
-    })?;
-    let mut extracted = 0_u64;
-    let mut found = HashSet::new();
-    for index in 0..archive.len() {
-        if cancellation.is_cancelled() {
-            return Err(InstallError::Cancelled {
-                partial_path: archive_path.to_path_buf(),
-                downloaded_bytes: fs::metadata(archive_path)
-                    .map(|metadata| metadata.len())
-                    .unwrap_or(0),
-            });
-        }
-        let mut entry = archive
-            .by_index(index)
-            .map_err(|error| failed(format!("failed to read runtime ZIP entry: {error}")))?;
-        let enclosed = entry
-            .enclosed_name()
-            .ok_or_else(|| failed(format!("unsafe runtime ZIP path: {}", entry.name())))?;
-        validate_relative_path(&enclosed)?;
-        if entry.unix_mode().is_some_and(|mode| {
-            let file_type = mode & 0o170000;
-            file_type != 0 && file_type != 0o100000 && file_type != 0o040000
-        }) {
-            return Err(failed(format!(
-                "runtime ZIP entry {} is not a regular file or directory",
-                entry.name()
-            )));
-        }
-        if entry.is_dir() {
-            continue;
-        }
-        let Some(file_spec) = expected.get(&enclosed) else {
-            continue;
-        };
-        if !found.insert(enclosed.clone()) {
-            return Err(failed(format!(
-                "runtime ZIP contains duplicate entry {}",
-                enclosed.display()
-            )));
-        }
-        if entry.size() != file_spec.size_bytes {
-            return Err(failed(format!(
-                "runtime ZIP entry {} size mismatch: expected {}, got {}",
-                enclosed.display(),
-                file_spec.size_bytes,
-                entry.size()
-            )));
-        }
-        validate_relative_path(&file_spec.install_path)?;
-        let output = stage_root.join(&file_spec.install_path);
-        ensure_no_symlink_components(stage_root, &file_spec.install_path)?;
-        if let Some(parent) = output.parent() {
-            fs::create_dir_all(parent).map_err(|error| {
-                failed(format!("failed to create {}: {error}", parent.display()))
-            })?;
-        }
-        let mut destination = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&output)
-            .map_err(|error| failed(format!("failed to create {}: {error}", output.display())))?;
-        let mut copied = 0_u64;
-        let mut buffer = [0_u8; BUFFER_BYTES];
-        loop {
-            if cancellation.is_cancelled() {
-                return Err(InstallError::Cancelled {
-                    partial_path: archive_path.to_path_buf(),
-                    downloaded_bytes: copied,
-                });
-            }
-            let count = entry.read(&mut buffer).map_err(|error| {
-                failed(format!("failed to extract {}: {error}", enclosed.display()))
-            })?;
-            if count == 0 {
-                break;
-            }
-            copied = copied
-                .checked_add(count as u64)
-                .ok_or_else(|| failed("runtime extraction size overflow"))?;
-            if copied > file_spec.size_bytes {
-                return Err(failed(format!(
-                    "runtime ZIP entry {} exceeded its pinned size",
-                    enclosed.display()
-                )));
-            }
-            destination.write_all(&buffer[..count]).map_err(|error| {
-                failed(format!("failed to write {}: {error}", output.display()))
-            })?;
-        }
-        if copied != file_spec.size_bytes {
-            return Err(failed(format!(
-                "runtime ZIP entry {} extracted length mismatch",
-                enclosed.display()
-            )));
-        }
-        destination
-            .sync_all()
-            .map_err(|error| failed(format!("failed to finish {}: {error}", output.display())))?;
-        extracted = extracted.saturating_add(copied);
-        progress(InstallProgress {
-            stage: InstallStage::Extracting,
-            completed_bytes: extracted,
-            total_bytes: total,
-            bytes_per_second: None,
-        });
-    }
-    for file in files {
-        if !found.contains(&file.archive_path) {
-            return Err(failed(format!(
-                "runtime ZIP is missing {}",
-                file.archive_path.display()
-            )));
-        }
-    }
-    Ok(())
 }
 
 pub(crate) fn verify_runtime_tree(
@@ -2987,25 +2779,6 @@ pub(crate) fn previous_runtime_root(target_root: &Path) -> PathBuf {
         .and_then(|name| name.to_str())
         .unwrap_or("runtime");
     target_root.with_file_name(format!("{name}.previous"))
-}
-
-pub(crate) fn remove_previous_runtime_if_exists(target_root: &Path) -> Result<bool, InstallError> {
-    let previous = previous_runtime_root(target_root);
-    if !previous.exists() {
-        return Ok(false);
-    }
-    remove_path_if_exists(&previous)?;
-    Ok(true)
-}
-
-pub(crate) fn reconcile_orphaned_previous_runtime(
-    target_root: &Path,
-    runtime_is_configured: bool,
-) -> Result<bool, InstallError> {
-    if runtime_is_configured {
-        return Ok(false);
-    }
-    remove_previous_runtime_if_exists(target_root)
 }
 
 fn directory_rollback_path(target_root: &Path) -> PathBuf {
@@ -4872,23 +4645,6 @@ mod tests {
     }
 
     #[test]
-    fn orphaned_previous_runtime_is_preserved_only_while_runtime_is_configured() {
-        let root = unique_root("orphaned-previous");
-        let target = root.join("transcribe-cpp");
-        let previous = previous_runtime_root(&target);
-        fs::create_dir_all(&previous).unwrap();
-        fs::write(previous.join("version"), b"known-good").unwrap();
-
-        assert!(!reconcile_orphaned_previous_runtime(&target, true).unwrap());
-        assert!(previous.exists());
-        assert!(reconcile_orphaned_previous_runtime(&target, false).unwrap());
-        assert!(!previous.exists());
-        assert!(!reconcile_orphaned_previous_runtime(&target, false).unwrap());
-
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
     fn model_activated_journal_rolls_back_when_old_config_is_durable() {
         let root = unique_root("journal-old-config");
         fs::create_dir_all(&root).unwrap();
@@ -5261,38 +5017,6 @@ mod tests {
     }
 
     #[test]
-    fn actual_zip_traversal_is_rejected_without_writing_outside_stage() {
-        let root = unique_root("zip-traversal");
-        let stage = root.join("stage");
-        fs::create_dir_all(&stage).unwrap();
-        let archive = root.join("runtime.zip");
-        write_zip(
-            &archive,
-            &[("../escape.dll", b"escape"), ("Release/allowed.dll", b"ok")],
-        );
-        let files = [RuntimeFileSpec {
-            archive_path: PathBuf::from("Release/allowed.dll"),
-            install_path: PathBuf::from("bin/allowed.dll"),
-            size_bytes: 2,
-            sha256: format!("{:x}", Sha256::digest(b"ok")),
-        }];
-
-        let error = extract_runtime_archive(
-            &archive,
-            &stage,
-            &files,
-            &InstallCancellation::default(),
-            &|_| {},
-        )
-        .unwrap_err();
-
-        assert!(error.to_string().contains("unsafe runtime ZIP path"));
-        assert!(!root.join("escape.dll").exists());
-        assert!(!stage.join("bin/allowed.dll").exists());
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
     fn local_file_fingerprint_is_canonical_and_exact() {
         let root = unique_root("local-fingerprint");
         fs::create_dir_all(&root).unwrap();
@@ -5364,51 +5088,6 @@ mod tests {
 
         assert!(error.to_string().contains("symbolic link, reparse point"));
         fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn runtime_extraction_requires_every_allowlisted_file_and_honors_cancel() {
-        let missing_root = unique_root("zip-missing");
-        let missing_stage = missing_root.join("stage");
-        fs::create_dir_all(&missing_stage).unwrap();
-        let missing_archive = missing_root.join("runtime.zip");
-        write_zip(&missing_archive, &[("Release/other.dll", b"other")]);
-        let files = [RuntimeFileSpec {
-            archive_path: PathBuf::from("Release/required.dll"),
-            install_path: PathBuf::from("bin/required.dll"),
-            size_bytes: 8,
-            sha256: format!("{:x}", Sha256::digest(b"required")),
-        }];
-        let error = extract_runtime_archive(
-            &missing_archive,
-            &missing_stage,
-            &files,
-            &InstallCancellation::default(),
-            &|_| {},
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("is missing"));
-
-        let cancelled_root = unique_root("zip-cancelled");
-        let cancelled_stage = cancelled_root.join("stage");
-        fs::create_dir_all(&cancelled_stage).unwrap();
-        let cancelled_archive = cancelled_root.join("runtime.zip");
-        write_zip(&cancelled_archive, &[("Release/required.dll", b"required")]);
-        let cancellation = InstallCancellation::default();
-        cancellation.cancel();
-        let error = extract_runtime_archive(
-            &cancelled_archive,
-            &cancelled_stage,
-            &files,
-            &cancellation,
-            &|_| {},
-        )
-        .unwrap_err();
-        assert!(error.is_cancelled());
-        assert!(!cancelled_stage.join("bin/required.dll").exists());
-
-        fs::remove_dir_all(missing_root).unwrap();
-        fs::remove_dir_all(cancelled_root).unwrap();
     }
 
     #[test]

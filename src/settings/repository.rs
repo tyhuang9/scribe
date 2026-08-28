@@ -81,9 +81,16 @@ pub(crate) fn load_from_path(path: &Path) -> Result<AppConfig> {
     };
 
     let original = value.clone();
+    let future_schema = original
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        .is_some_and(|version| version > u64::from(super::super::CURRENT_SCHEMA_VERSION));
     let (mut config, diagnostics) = parse_settings_value_with_diagnostics(value);
     normalize_config(&mut config);
-    let rewritten = serde_json::to_value(&config)? != original;
+    // A newer build may attach semantics to fields this build only knows as
+    // flattened JSON. Keep the runtime projection safe, but never rewrite a
+    // future-schema document during load.
+    let rewritten = !future_schema && serde_json::to_value(&config)? != original;
     if rewritten {
         if diagnostics.invalid_values_salvaged {
             backup_corrupt(path)?;
@@ -106,7 +113,6 @@ pub(crate) fn artifact_config_fingerprint(config: &AppConfig) -> Result<String> 
         "managed_models": normalized.general.managed_models,
         "managed_remote_models": normalized.general.managed_remote_models,
         "imported_gguf_models": normalized.general.imported_gguf_models,
-        "managed_runtimes": normalized.general.managed_runtimes,
         "model_paths": normalized.general.model_paths,
     });
     // Preserve fingerprints produced by schema-v2 builds when there is no
@@ -451,10 +457,14 @@ mod tests {
         fs::create_dir_all(artifact.parent().unwrap()).unwrap();
         fs::write(&artifact, sentinel).unwrap();
         fs::write(&runtime, b"legacy runner sentinel").unwrap();
+        let artifact_modified = fs::metadata(&artifact).unwrap().modified().unwrap();
+        let runtime_modified = fs::metadata(&runtime).unwrap().modified().unwrap();
         let original = serde_json::json!({
-            "schema_version": super::super::CURRENT_SCHEMA_VERSION,
+            "schema_version": 3,
             "general": {
                 "selected_default_model": "faster_whisper",
+                "model_storage_dir": dir.join("isolated-model-storage"),
+                "excluded_bundled_model_ids": [crate::model_catalog::BUNDLED_BASE_MODEL_ID],
                 "playground_selected_models": [
                     "faster_whisper_tiny_en",
                     "whisper_cpp_small_en"
@@ -488,21 +498,15 @@ mod tests {
 
         let config = load_from_path(&path).unwrap();
 
-        assert_eq!(
-            config.general.selected_default_model,
-            crate::model_catalog::BUNDLED_BASE_MODEL_ID
-        );
-        assert_eq!(
-            config.general.playground_selected_models,
-            ["whisper_cpp_small_en"]
-        );
+        assert!(config.general.selected_default_model.is_empty());
+        assert!(config.general.playground_selected_models.is_empty());
         assert_eq!(config.general.model_paths["faster_whisper"], artifact);
         assert_eq!(
             config.general.managed_models["faster_whisper_tiny_en"].unknown["future_receipt"],
             serde_json::json!({"preserved": true})
         );
         assert_eq!(
-            config.general.managed_runtimes["faster_whisper"].unknown["future_runtime_receipt"],
+            config.general.unknown["managed_runtimes"]["faster_whisper"]["future_runtime_receipt"],
             serde_json::json!({"preserved": true})
         );
         assert_eq!(
@@ -531,6 +535,44 @@ mod tests {
         );
         assert_eq!(fs::read(&artifact).unwrap(), sentinel);
         assert_eq!(fs::read(&runtime).unwrap(), b"legacy runner sentinel");
+        assert_eq!(
+            fs::metadata(&artifact).unwrap().modified().unwrap(),
+            artifact_modified
+        );
+        assert_eq!(
+            fs::metadata(&runtime).unwrap().modified().unwrap(),
+            runtime_modified
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn future_schema_load_is_runtime_safe_without_rewriting_the_document() {
+        let dir = test_dir("future-schema");
+        let path = dir.join("config.json");
+        let original = serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": super::super::CURRENT_SCHEMA_VERSION + 1,
+            "general": {
+                "selected_default_model": "retired-provider-model",
+                "managed_runtimes": {"future": {"opaque": [1, 2, 3]}},
+                "future_general": {"preserved": true}
+            },
+            "future_root": {"format": "new"}
+        }))
+        .unwrap();
+        fs::write(&path, &original).unwrap();
+
+        let config = load_from_path(&path).unwrap();
+
+        assert_ne!(
+            config.general.selected_default_model,
+            "retired-provider-model"
+        );
+        assert_eq!(
+            config.general.unknown["managed_runtimes"],
+            serde_json::json!({"future": {"opaque": [1, 2, 3]}})
+        );
+        assert_eq!(fs::read(&path).unwrap(), original);
         fs::remove_dir_all(dir).unwrap();
     }
 

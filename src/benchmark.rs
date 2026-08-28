@@ -12,7 +12,6 @@ use crate::config;
 use crate::prepared_audio::PreparedAudio;
 use crate::transcription::{
     ModelId, RequestId, SessionId, TranscriptionRequest, TranscriptionService,
-    VerifiedInstallationCapability, verified_installation_capability,
 };
 
 #[derive(Serialize)]
@@ -106,13 +105,7 @@ fn run_local_command(args: Vec<std::ffi::OsString>) -> Result<LocalBenchmarkRepo
     let descriptor = service
         .model_descriptor(&model_id)
         .with_context(|| format!("benchmark model is unavailable: {model_id}"))?;
-    let package_version = match verified_installation_capability(&model_id) {
-        Some(VerifiedInstallationCapability::Available { package_version }) => package_version,
-        Some(VerifiedInstallationCapability::Unavailable { reason }) => {
-            bail!("benchmark requires the pinned local runtime package: {reason}")
-        }
-        None => bail!("benchmark model has no verified local runtime package: {model_id}"),
-    };
+    let package_version = crate::embedded_runtime::TRANSCRIBE_CPP_VERSION.to_owned();
     let capabilities = service.capabilities_for(&model_id).with_context(|| {
         format!("benchmark could not resolve runtime capabilities for {model_id}")
     })?;

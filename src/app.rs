@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::env;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
@@ -7,7 +6,10 @@ use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
+
+#[cfg(test)]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use arboard::Clipboard;
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
@@ -17,7 +19,6 @@ use eframe::egui::{
 };
 #[cfg(target_os = "windows")]
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use serde::Deserialize;
 
 use crate::audio::{
     self, CaptureCancellation, CaptureCompletion, CaptureError, CaptureIntent, CaptureMetrics,
@@ -27,7 +28,6 @@ use crate::audio::{
 use crate::benchmark::{
     self, BenchmarkMetric, BenchmarkModelInput, BenchmarkModelResult, RankingMode,
 };
-use crate::compatibility_bridge::{self, ProviderHandle};
 use crate::config::{
     self, AppConfig, HistoryMode, HotkeyMode, OverlayMode, OverlayPosition, SettingsStore,
     SpeechDetectionMode, StreamingMode, ThemeMode,
@@ -47,8 +47,8 @@ use crate::huggingface_catalog::{
     CatalogSource, HuggingFaceCatalogService, ModelInventorySnapshot, RemoteModel, TrustedArtifact,
 };
 use crate::installations::{
-    ActivationJournal, ActivationPhase, DirectoryReplacement, FileReplacement, InstallCancellation,
-    InstallError, InstallProgress, InstallStage, ManagedRemoval, discover_managed_removal_targets,
+    ActivationJournal, ActivationPhase, FileReplacement, InstallCancellation, InstallError,
+    InstallProgress, InstallStage, ManagedRemoval, discover_managed_removal_targets,
     fingerprint_file_cancellable, reconcile_activation_journal, reconcile_managed_removal,
     remove_exact_regular_file,
 };
@@ -70,7 +70,6 @@ use crate::transcription::{
     AccelerationPreference, CompatibilityStatus, InstallSmoke, InstallationCandidate,
     ModelDescriptor, ModelId, RequestId, RollingPreviewHandle, SessionId, TranscriptionOptions,
     TranscriptionOutcome, TranscriptionRequest, TranscriptionService,
-    VerifiedInstallationCapability, verified_installation_capability,
 };
 use crate::tray::{TrayCommand, TrayService};
 use crate::ui::{
@@ -1309,16 +1308,6 @@ enum AppEvent {
         job_id: u64,
         result: Result<Box<ValidatedLocalGgufImport>, String>,
     },
-    RuntimeInstallDone {
-        runtime_id: String,
-        runtime_label: String,
-        replacement: RuntimeReplacement,
-        source_label: &'static str,
-    },
-    RuntimeInstallFailed {
-        runtime_id: String,
-        message: String,
-    },
 }
 
 /// Delivers background work back to the UI and wakes eframe after the event is
@@ -1349,13 +1338,6 @@ impl AppEventSink {
 struct VerifiedInstallResult {
     model: FileReplacement,
     manifest: FileReplacement,
-    runtime: Option<DirectoryReplacement>,
-    runtime_id: String,
-    runtime_entrypoint: Option<PathBuf>,
-    runtime_version: Option<String>,
-    runtime_package_id: Option<String>,
-    runtime_archive_sha256: Option<String>,
-    retain_runtime_as_previous: bool,
     model_sha256: String,
     smoke: InstallSmoke,
     journal: ActivationJournal,
@@ -1366,10 +1348,8 @@ struct VerifiedInstallResult {
 struct PreparedVerifiedInstall {
     model_id: ModelId,
     model: crate::installations::DownloadedArtifact,
-    model_uses_embedded_runtime: bool,
     manifest_source: installed_manifest::ArtifactSource,
     remote_install_request: Option<TrustedRemoteInstallRequest>,
-    force_runtime_package: bool,
 }
 
 /// A local source has been fully re-hashed and exercised by the isolated
@@ -1504,18 +1484,16 @@ fn failure_after_activated_artifact_rollback(
     journal: ActivationJournal,
     model: FileReplacement,
     manifest: Option<FileReplacement>,
-    runtime: Option<DirectoryReplacement>,
     message: impl Into<String>,
 ) -> InstallJobFailure {
     let manifest_rollback = manifest.and_then(|replacement| replacement.rollback().err());
     let model_rollback = model.rollback().err();
-    let runtime_rollback = runtime.and_then(|replacement| replacement.rollback().err());
-    if manifest_rollback.is_none() && model_rollback.is_none() && runtime_rollback.is_none() {
+    if manifest_rollback.is_none() && model_rollback.is_none() {
         return failure_after_safe_rollback(journal, message);
     }
     let message = message.into();
     InstallJobFailure::recovery_required(format!(
-        "{message}{}{}{}",
+        "{message}{}{}",
         manifest_rollback
             .as_ref()
             .map(|error| format!(". Installed-model manifest rollback also failed: {error}"))
@@ -1524,17 +1502,12 @@ fn failure_after_activated_artifact_rollback(
             .as_ref()
             .map(|error| format!(". Model rollback also failed: {error}"))
             .unwrap_or_default(),
-        runtime_rollback
-            .as_ref()
-            .map(|error| format!(". Runtime rollback also failed: {error}"))
-            .unwrap_or_default(),
     ))
 }
 
 struct VerifiedInstallPreparationRequest {
     config: AppConfig,
     model_id: ModelId,
-    force_runtime_package: bool,
     cancellation: InstallCancellation,
     source: VerifiedInstallSource,
     expected_target_identity: crate::disk_space::CanonicalTargetIdentity,
@@ -1589,11 +1562,8 @@ struct ArtifactInstallJob {
     phase: ArtifactInstallPhase,
     source: Option<VerifiedInstallSource>,
     download_config: Option<AppConfig>,
-    force_runtime_package: bool,
     target_identity: Option<crate::disk_space::CanonicalTargetIdentity>,
     reservation: Option<ArtifactDiskReservation>,
-    finalizer_reservations: Vec<ArtifactDiskReservation>,
-    runtime_archive_target_identity: Option<crate::disk_space::CanonicalTargetIdentity>,
     prepared: Option<PreparedVerifiedInstall>,
 }
 
@@ -1607,8 +1577,6 @@ struct ArtifactDiskReservation {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ArtifactDiskReservationKind {
     ModelArtifact,
-    RuntimeArchive,
-    RuntimeStaging,
 }
 
 #[derive(Debug)]
@@ -1618,7 +1586,6 @@ struct ArtifactTransferLaunch {
     config: AppConfig,
     cancellation: InstallCancellation,
     source: VerifiedInstallSource,
-    force_runtime_package: bool,
     expected_target_identity: crate::disk_space::CanonicalTargetIdentity,
 }
 
@@ -1628,7 +1595,6 @@ struct ArtifactFinalizerLaunch {
     model_id: String,
     cancellation: InstallCancellation,
     prepared: PreparedVerifiedInstall,
-    runtime_archive_target_identity: Option<crate::disk_space::CanonicalTargetIdentity>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1646,7 +1612,6 @@ struct ArtifactInstallCoordinator {
     finalizer_queue: VecDeque<String>,
     active_transfers: usize,
     active_finalizer: Option<u64>,
-    active_finalizer_may_write_runtime: bool,
     target_owners: HashMap<crate::disk_space::CanonicalTargetIdentity, u64>,
     reserved_by_volume: HashMap<String, u64>,
     recovery_frozen: bool,
@@ -1731,11 +1696,8 @@ impl ArtifactInstallCoordinator {
                 phase: ArtifactInstallPhase::Transferring,
                 source: None,
                 download_config: None,
-                force_runtime_package: false,
                 target_identity: None,
                 reservation: None,
-                finalizer_reservations: Vec::new(),
-                runtime_archive_target_identity: None,
                 prepared: None,
             },
         );
@@ -1748,7 +1710,6 @@ impl ArtifactInstallCoordinator {
         admission: managed_downloads::ModelDownloadAdmission,
         config: AppConfig,
         source: VerifiedInstallSource,
-        force_runtime_package: bool,
     ) -> Result<u64, String> {
         if self.recovery_frozen {
             return Err(
@@ -1796,15 +1757,12 @@ impl ArtifactInstallCoordinator {
                 phase: ArtifactInstallPhase::QueuedTransfer,
                 source: Some(source),
                 download_config: Some(config),
-                force_runtime_package,
                 target_identity: Some(admission.target_identity),
                 reservation: Some(ArtifactDiskReservation {
                     volume: admission.disk.volume,
                     remaining_bytes: admission.disk.additional_bytes,
                     kind: ArtifactDiskReservationKind::ModelArtifact,
                 }),
-                finalizer_reservations: Vec::new(),
-                runtime_archive_target_identity: None,
                 prepared: None,
             },
         );
@@ -1814,7 +1772,7 @@ impl ArtifactInstallCoordinator {
 
     fn take_ready_transfers(&mut self) -> Vec<ArtifactTransferLaunch> {
         let mut launches = Vec::new();
-        if self.recovery_frozen || self.active_finalizer_may_write_runtime {
+        if self.recovery_frozen {
             return launches;
         }
         while self.active_transfers < MAX_CONCURRENT_MODEL_TRANSFERS {
@@ -1841,7 +1799,6 @@ impl ArtifactInstallCoordinator {
                 config,
                 cancellation: job.handle.1.clone(),
                 source,
-                force_runtime_package: job.force_runtime_package,
                 expected_target_identity: job
                     .target_identity
                     .clone()
@@ -1853,7 +1810,7 @@ impl ArtifactInstallCoordinator {
 
     #[cfg(test)]
     fn live_download_writer_count(&self) -> usize {
-        self.active_transfers + usize::from(self.active_finalizer_may_write_runtime)
+        self.active_transfers
     }
 
     fn update_download_reservation(
@@ -1870,11 +1827,7 @@ impl ArtifactInstallCoordinator {
         }
         let reservation = match job.phase {
             ArtifactInstallPhase::Transferring => job.reservation.as_mut(),
-            ArtifactInstallPhase::Finalizing => {
-                job.finalizer_reservations.iter_mut().find(|reservation| {
-                    reservation.kind == ArtifactDiskReservationKind::RuntimeArchive
-                })
-            }
+            ArtifactInstallPhase::Finalizing => None,
             ArtifactInstallPhase::QueuedTransfer | ArtifactInstallPhase::WaitingForFinalizer => {
                 None
             }
@@ -1896,108 +1849,16 @@ impl ArtifactInstallCoordinator {
         true
     }
 
-    fn next_finalizer_requirement(&self) -> Option<(String, bool)> {
+    fn next_finalizer_model(&self) -> Option<String> {
         if self.recovery_frozen || self.active_finalizer.is_some() {
             return None;
         }
         let model_id = self.finalizer_queue.front()?;
-        let job = self.jobs.get(model_id)?;
-        if job.phase != ArtifactInstallPhase::WaitingForFinalizer {
-            return None;
-        }
-        let may_write_runtime = job
-            .prepared
-            .as_ref()
-            .is_some_and(|prepared| !prepared.model_uses_embedded_runtime);
-        if may_write_runtime && self.active_transfers > 0 {
-            return None;
-        }
-        Some((model_id.clone(), may_write_runtime))
+        self.jobs
+            .get(model_id)
+            .is_some_and(|job| job.phase == ArtifactInstallPhase::WaitingForFinalizer)
+            .then(|| model_id.clone())
     }
-
-    fn reserve_next_finalizer_runtime(
-        &mut self,
-        admission: managed_downloads::RuntimePreparationAdmission,
-    ) -> Result<(), String> {
-        let model_id = self
-            .finalizer_queue
-            .front()
-            .ok_or_else(|| "no artifact finalizer is waiting".to_owned())?
-            .clone();
-        let job = self
-            .jobs
-            .get(&model_id)
-            .ok_or_else(|| "the waiting artifact finalizer no longer exists".to_owned())?;
-        if job.phase != ArtifactInstallPhase::WaitingForFinalizer
-            || job
-                .prepared
-                .as_ref()
-                .is_none_or(|prepared| prepared.model_uses_embedded_runtime)
-        {
-            return Err(
-                "the waiting artifact finalizer does not need a runtime reservation".to_owned(),
-            );
-        }
-        if !job.finalizer_reservations.is_empty() {
-            return Ok(());
-        }
-
-        let components = [
-            (
-                admission.archive.disk,
-                ArtifactDiskReservationKind::RuntimeArchive,
-            ),
-            (
-                admission.staging,
-                ArtifactDiskReservationKind::RuntimeStaging,
-            ),
-        ];
-        let mut additions = HashMap::<String, (u64, u64)>::new();
-        for (disk, _) in &components {
-            let entry = additions
-                .entry(disk.volume.clone())
-                .or_insert((0, disk.available_bytes));
-            entry.0 = entry
-                .0
-                .checked_add(disk.additional_bytes)
-                .ok_or_else(|| "runtime download-space reservation overflowed".to_owned())?;
-            entry.1 = entry.1.min(disk.available_bytes);
-        }
-        for (volume, (additional, available)) in &additions {
-            let already_reserved = self.reserved_by_volume.get(volume).copied().unwrap_or(0);
-            let required = already_reserved
-                .checked_add(*additional)
-                .and_then(|bytes| bytes.checked_add(crate::disk_space::SAFETY_HEADROOM_BYTES))
-                .ok_or_else(|| {
-                    "aggregate runtime download-space reservation overflowed".to_owned()
-                })?;
-            if required > *available {
-                return Err(format!(
-                    "Install disabled: {} free is required on {volume} for runtime download and staging (including Scribe's {} safety headroom); only {} is available.",
-                    format_bytes(required),
-                    format_bytes(crate::disk_space::SAFETY_HEADROOM_BYTES),
-                    format_bytes(*available),
-                ));
-            }
-        }
-
-        for (volume, (additional, _)) in additions {
-            let total = self.reserved_by_volume.get(&volume).copied().unwrap_or(0);
-            self.reserved_by_volume.insert(volume, total + additional);
-        }
-        let job = self.jobs.get_mut(&model_id).expect("waiting job vanished");
-        job.finalizer_reservations = components
-            .into_iter()
-            .map(|(disk, kind)| ArtifactDiskReservation {
-                volume: disk.volume,
-                remaining_bytes: disk.additional_bytes,
-                kind,
-            })
-            .collect();
-        job.runtime_archive_target_identity = Some(admission.archive.target_identity);
-        Ok(())
-    }
-
     fn release_reservation(&mut self, reservation: ArtifactDiskReservation) {
         let mut remove_volume = false;
         if let Some(total) = self.reserved_by_volume.get_mut(&reservation.volume) {
@@ -2043,30 +1904,14 @@ impl ArtifactInstallCoordinator {
             if job.phase != ArtifactInstallPhase::WaitingForFinalizer {
                 continue;
             }
-            let may_write_runtime = job
-                .prepared
-                .as_ref()
-                .is_some_and(|prepared| !prepared.model_uses_embedded_runtime);
-            if may_write_runtime
-                && (self.active_transfers > 0 || job.finalizer_reservations.is_empty())
-            {
-                self.finalizer_queue.push_front(model_id);
-                return None;
-            }
             let prepared = job.prepared.take()?;
             job.phase = ArtifactInstallPhase::Finalizing;
             self.active_finalizer = Some(job.handle.0);
-            self.active_finalizer_may_write_runtime = may_write_runtime;
-            debug_assert!(
-                self.active_transfers + usize::from(may_write_runtime)
-                    <= MAX_CONCURRENT_MODEL_TRANSFERS
-            );
             return Some(ArtifactFinalizerLaunch {
                 job_id: job.handle.0,
                 model_id,
                 cancellation: job.handle.1.clone(),
                 prepared,
-                runtime_archive_target_identity: job.runtime_archive_target_identity.clone(),
             });
         }
         None
@@ -2083,7 +1928,6 @@ impl ArtifactInstallCoordinator {
         let was_finalizer = job.phase == ArtifactInstallPhase::Finalizing;
         let target = job.target_identity.clone();
         let reservation = job.reservation.clone();
-        let finalizer_reservations = job.finalizer_reservations.clone();
         self.jobs.remove(model_id);
         self.transfer_queue.retain(|queued| queued != model_id);
         self.finalizer_queue.retain(|queued| queued != model_id);
@@ -2092,15 +1936,11 @@ impl ArtifactInstallCoordinator {
         }
         if was_finalizer && self.active_finalizer == Some(job_id) {
             self.active_finalizer = None;
-            self.active_finalizer_may_write_runtime = false;
         }
         if let Some(target) = target {
             self.target_owners.remove(&target);
         }
         if let Some(reservation) = reservation {
-            self.release_reservation(reservation);
-        }
-        for reservation in finalizer_reservations {
             self.release_reservation(reservation);
         }
         true
@@ -2171,7 +2011,6 @@ impl ArtifactInstallCoordinator {
         self.finalizer_queue.clear();
         self.active_transfers = 0;
         self.active_finalizer = None;
-        self.active_finalizer_may_write_runtime = false;
         self.target_owners.clear();
         self.reserved_by_volume.clear();
         self.recovery_frozen = false;
@@ -2196,13 +2035,11 @@ fn prepare_verified_install(
     let VerifiedInstallPreparationRequest {
         config,
         model_id,
-        force_runtime_package,
         cancellation,
         source,
         expected_target_identity,
     } = request;
-    let (model, model_uses_embedded_runtime, manifest_source, remote_install_request) = match source
-    {
+    let (model, manifest_source, remote_install_request) = match source {
         VerifiedInstallSource::NormalizedCatalog => {
             let model = managed_downloads::prepare_model(
                 &config,
@@ -2214,12 +2051,7 @@ fn prepare_verified_install(
             .map_err(InstallJobFailure::from)?;
             let source = installed_manifest::ArtifactSource::normalized(&model_id)
                 .map_err(|error| error.to_string())?;
-            (
-                model,
-                crate::model_catalog::model_uses_embedded_runtime(&model_id),
-                source,
-                None,
-            )
+            (model, source, None)
         }
         VerifiedInstallSource::TrustedRemote(request) => {
             let model = managed_downloads::prepare_trusted_gguf_model(
@@ -2237,7 +2069,7 @@ fn prepare_verified_install(
                 request.artifact.size_bytes,
                 request.artifact.expected_sha256.clone(),
             );
-            (model, true, source, Some(request))
+            (model, source, Some(request))
         }
     };
     if cancellation.is_cancelled() {
@@ -2249,10 +2081,8 @@ fn prepare_verified_install(
     Ok(PreparedVerifiedInstall {
         model_id,
         model,
-        model_uses_embedded_runtime,
         manifest_source,
         remote_install_request,
-        force_runtime_package,
     })
 }
 
@@ -2261,136 +2091,42 @@ fn run_verified_install_finalizer(
     service: TranscriptionService,
     cancellation: InstallCancellation,
     prepared: PreparedVerifiedInstall,
-    runtime_archive_target_identity: Option<crate::disk_space::CanonicalTargetIdentity>,
     progress: &dyn Fn(InstallProgress),
 ) -> Result<VerifiedInstallResult, InstallJobFailure> {
     let PreparedVerifiedInstall {
         model_id,
         model,
-        model_uses_embedded_runtime,
         manifest_source,
         remote_install_request,
-        force_runtime_package,
     } = prepared;
     if cancellation.is_cancelled() {
         return Err(InstallJobFailure::normal(
             "Installation cancelled while waiting for verification. The verified partial was retained for Resume.",
         ));
     }
-    if !model_uses_embedded_runtime && service.install_plan(&model_id).is_none() {
-        return Err(InstallJobFailure::normal(format!(
-            "model {model_id} has no verified normalized install plan"
-        )));
-    }
-    let (runtime_id, existing_runtime_root) = ("artifact-only".to_owned(), None);
-    let model_uses_embedded_runtime =
-        model_uses_embedded_runtime || service.install_plan(&model_id).is_some();
     service.unload_runtime().map_err(|error| {
         InstallJobFailure::normal(format!(
             "Could not release the active speech artifact before install: {error}"
         ))
     })?;
-
-    let target_root = config::runtime_storage_dir().join(&runtime_id);
-    let mut staged_runtime = None;
-    let mut runtime_entrypoint = None;
-    let mut runtime_version = None;
-    let mut runtime_package_id = None;
-    let mut runtime_archive_sha256 = None;
-    let mut candidate_root: Option<PathBuf> = (!model_uses_embedded_runtime)
-        .then_some(existing_runtime_root)
-        .flatten();
-
-    let smoke_current = (!model_uses_embedded_runtime)
-        .then_some(candidate_root.as_ref())
-        .flatten()
-        .and_then(|root| {
-            progress(InstallProgress {
-                stage: InstallStage::HealthChecking,
-                completed_bytes: model.size_bytes,
-                total_bytes: model.size_bytes,
-                bytes_per_second: None,
-            });
-            InstallationCandidate::normalized(
+    progress(InstallProgress {
+        stage: InstallStage::HealthChecking,
+        completed_bytes: model.size_bytes,
+        total_bytes: model.size_bytes,
+        bytes_per_second: None,
+    });
+    let verified_smoke = service
+        .verify_installation_candidate_for_activation(
+            InstallationCandidate::pinned(
                 model_id.clone(),
                 model.path.clone(),
-                Some(root.clone()),
-            )
-            .ok()
-            .and_then(|candidate| {
-                service
-                    .verify_installation_candidate_for_activation(candidate, &cancellation)
-                    .ok()
-            })
-        });
-    let current_runtime_known_good = smoke_current.is_some()
-        && candidate_root
-            .as_ref()
-            .is_some_and(|root| fs::canonicalize(root).ok() == fs::canonicalize(&target_root).ok());
-
-    let verified_smoke = if model_uses_embedded_runtime {
-        progress(InstallProgress {
-            stage: InstallStage::HealthChecking,
-            completed_bytes: model.size_bytes,
-            total_bytes: model.size_bytes,
-            bytes_per_second: None,
-        });
-        service
-            .verify_installation_candidate_for_activation(
-                InstallationCandidate::pinned(
-                    model_id.clone(),
-                    model.path.clone(),
-                    ArtifactFormat::Gguf,
-                    None,
-                    manifest_source.expected_size_bytes,
-                    manifest_source.expected_sha256.clone(),
-                ),
-                &cancellation,
-            )
-            .map_err(|error| InstallJobFailure::normal(error.to_string()))?
-    } else if !force_runtime_package && let Some(smoke) = smoke_current {
-        smoke
-    } else {
-        let runtime_archive_target_identity = runtime_archive_target_identity.ok_or_else(|| {
-            InstallJobFailure::normal("runtime preparation has no reserved archive identity")
-        })?;
-        let prepared = managed_downloads::prepare_primary_runtime(
-            &target_root,
-            &runtime_archive_target_identity,
+                ArtifactFormat::Gguf,
+                manifest_source.expected_size_bytes,
+                manifest_source.expected_sha256.clone(),
+            ),
             &cancellation,
-            progress,
         )
-        .map_err(InstallJobFailure::from)?;
-        candidate_root = Some(prepared.staged.root.clone());
-        runtime_entrypoint = Some(prepared.installed_entrypoint.clone());
-        runtime_version = Some(prepared.version.clone());
-        runtime_package_id = Some(prepared.package_id.clone());
-        runtime_archive_sha256 = Some(prepared.archive_sha256.clone());
-        progress(InstallProgress {
-            stage: InstallStage::HealthChecking,
-            completed_bytes: model.size_bytes,
-            total_bytes: model.size_bytes,
-            bytes_per_second: None,
-        });
-        let smoke = service
-            .verify_installation_candidate_for_activation(
-                InstallationCandidate::normalized(
-                    model_id.clone(),
-                    model.path.clone(),
-                    Some(
-                        candidate_root
-                            .clone()
-                            .ok_or_else(|| "staged runtime root was lost".to_owned())?,
-                    ),
-                )
-                .map_err(|error| error.to_string())?,
-                &cancellation,
-            )
-            .map_err(|error| InstallJobFailure::normal(error.to_string()))?;
-        staged_runtime = Some(prepared.staged);
-        smoke
-    };
-
+        .map_err(|error| InstallJobFailure::normal(error.to_string()))?;
     if cancellation.is_cancelled() {
         return Err(InstallJobFailure::normal(
             "Installation cancelled after smoke testing; no artifacts were activated.",
@@ -2402,8 +2138,6 @@ fn run_verified_install_finalizer(
         total_bytes: model.size_bytes,
         bytes_per_second: None,
     });
-
-    let runtime_target = staged_runtime.as_ref().map(|_| target_root.clone());
     let prior_config_fingerprint = config::settings::artifact_config_fingerprint(&config)
         .map_err(|error| format!("could not fingerprint pre-install artifact settings: {error}"))?;
     let smoke = verified_smoke
@@ -2418,8 +2152,8 @@ fn run_verified_install_finalizer(
     let mut journal = ActivationJournal::begin(
         activation_journal_path(),
         model.destination.clone(),
-        runtime_target,
-        current_runtime_known_good,
+        None,
+        false,
         prior_config_fingerprint,
     )
     .map_err(|error| {
@@ -2429,74 +2163,26 @@ fn run_verified_install_finalizer(
             InstallJobFailure::normal(error.to_string())
         }
     })?;
-
-    let runtime = if let Some(staged) = staged_runtime {
-        let replacement = match staged.activate() {
-            Ok(replacement) => replacement,
-            Err(error) => {
-                if !error.requires_recovery() {
-                    return Err(failure_after_safe_rollback(journal, error.to_string()));
-                }
-                return Err(InstallJobFailure::recovery_required(error.to_string()));
-            }
-        };
-        if let Err(error) = journal.mark(ActivationPhase::RuntimeActivated) {
-            let rollback = replacement.rollback().err();
-            if rollback.is_none() && !error.requires_recovery() {
-                return Err(failure_after_safe_rollback(journal, error.to_string()));
-            }
-            return Err(rollback.map_or_else(
-                || InstallJobFailure::normal(error.to_string()),
-                |rollback| {
-                    InstallJobFailure::recovery_required(format!(
-                        "{error}. Runtime rollback also failed: {rollback}"
-                    ))
-                },
-            ));
-        }
-        Some(replacement)
-    } else {
-        None
-    };
-
     let model_sha256 = model.sha256.clone();
     let model = match model.activate() {
-        Ok(committed) => committed,
-        Err(error) => {
-            let rollback = runtime.and_then(|replacement| replacement.rollback().err());
-            if rollback.is_none() && !error.requires_recovery() {
-                return Err(failure_after_safe_rollback(journal, error.to_string()));
-            }
-            return Err(rollback.map_or_else(
-                || {
-                    if error.requires_recovery() {
-                        InstallJobFailure::recovery_required(error.to_string())
-                    } else {
-                        InstallJobFailure::normal(error.to_string())
-                    }
-                },
-                |rollback| {
-                    InstallJobFailure::recovery_required(format!(
-                        "{error}. Runtime rollback also failed: {rollback}"
-                    ))
-                },
-            ));
+        Ok(model) => model,
+        Err(error) if error.requires_recovery() => {
+            return Err(InstallJobFailure::recovery_required(error.to_string()));
         }
+        Err(error) => return Err(failure_after_safe_rollback(journal, error.to_string())),
     };
     if let Err(error) = journal.mark(ActivationPhase::ModelActivated) {
         return Err(failure_after_activated_artifact_rollback(
             journal,
             model,
             None,
-            runtime,
             error.to_string(),
         ));
     }
-
     let manifest_document = match installed_manifest::build_manifest(
         &model_id,
         manifest_source,
-        model_uses_embedded_runtime,
+        true,
         model.destination(),
         &model_sha256,
         &smoke,
@@ -2507,7 +2193,6 @@ fn run_verified_install_finalizer(
                 journal,
                 model,
                 None,
-                runtime,
                 error.to_string(),
             ));
         }
@@ -2519,12 +2204,11 @@ fn run_verified_install_finalizer(
             journal,
             model,
             None,
-            runtime,
             error.to_string(),
         ));
     }
     let manifest = match installed_manifest::stage_manifest(&manifest_document) {
-        Ok(replacement) => replacement,
+        Ok(manifest) => manifest,
         Err(error) if error.requires_recovery() => {
             return Err(InstallJobFailure::recovery_required(error.to_string()));
         }
@@ -2533,12 +2217,10 @@ fn run_verified_install_finalizer(
                 journal,
                 model,
                 None,
-                runtime,
                 error.to_string(),
             ));
         }
     };
-
     let remote_install = remote_install_request.map(|request| {
         config::ManagedRemoteModelInstall::trusted(
             config::RemoteGgufArtifact {
@@ -2555,24 +2237,15 @@ fn run_verified_install_finalizer(
             request.recommended,
         )
     });
-
     Ok(VerifiedInstallResult {
         model,
         manifest,
-        runtime,
-        runtime_id,
-        runtime_entrypoint,
-        runtime_version,
-        runtime_package_id,
-        runtime_archive_sha256,
-        retain_runtime_as_previous: current_runtime_known_good,
         model_sha256,
         smoke,
         journal,
         remote_install,
     })
 }
-
 fn validate_local_gguf_import(
     source_path: PathBuf,
     model_storage_dir: PathBuf,
@@ -2610,7 +2283,6 @@ fn validate_local_gguf_import(
                 model_id.clone(),
                 fingerprint.canonical_path.clone(),
                 ArtifactFormat::Gguf,
-                None,
                 fingerprint.size_bytes,
                 fingerprint.sha256.clone(),
             ),
@@ -2704,332 +2376,8 @@ fn local_gguf_import_error(error: anyhow::Error) -> String {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RuntimeActionKind {
-    Install,
-    Update,
-    Uninstall,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct RuntimeActionState {
-    kind: RuntimeActionKind,
-    enabled: bool,
-    disabled_tooltip: Option<String>,
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-struct RuntimeInstallJob {
-    download_model_ids: Vec<String>,
-    repair_model_ids: Vec<String>,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct RuntimeConsumerActivity {
-    recording: bool,
-    transcribing: bool,
-    playground_jobs: bool,
-    model_download: bool,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum RuntimePersistenceTransition {
-    Persisted(RuntimeInstallJob),
-    Failed {
-        job: RuntimeInstallJob,
-        message: String,
-    },
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum RuntimeJobIntent {
-    DownloadModel(String),
-    RepairModel(String),
-    Maintenance,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct RuntimeReplacement {
-    installed_path: PathBuf,
-    target_root: PathBuf,
-    backup_root: Option<PathBuf>,
-}
-
-fn queue_runtime_model(model_ids: &mut Vec<String>, model_id: String) -> bool {
-    if model_ids.iter().any(|queued| queued == &model_id) {
-        false
-    } else {
-        model_ids.push(model_id);
-        true
-    }
-}
-
-fn apply_runtime_record(
-    config: &mut AppConfig,
-    runtime_id: &str,
-    install: config::ManagedRuntimeInstall,
-) -> Option<config::ManagedRuntimeInstall> {
-    config
-        .general
-        .managed_runtimes
-        .insert(runtime_id.to_owned(), install)
-}
-
-fn rollback_runtime_record(
-    config: &mut AppConfig,
-    runtime_id: &str,
-    previous: Option<config::ManagedRuntimeInstall>,
-) {
-    match previous {
-        Some(install) => {
-            config
-                .general
-                .managed_runtimes
-                .insert(runtime_id.to_owned(), install);
-        }
-        None => {
-            config.general.managed_runtimes.remove(runtime_id);
-        }
-    }
-}
-
-fn persist_runtime_install(
-    config: &mut AppConfig,
-    runtime_id: &str,
-    install: config::ManagedRuntimeInstall,
-    job: RuntimeInstallJob,
-    persist: impl FnOnce(&AppConfig) -> Result<(), String>,
-) -> RuntimePersistenceTransition {
-    let previous_runtime = apply_runtime_record(config, runtime_id, install);
-    config::normalize_config(config);
-    match persist(config) {
-        Ok(()) => RuntimePersistenceTransition::Persisted(job),
-        Err(err) => {
-            rollback_runtime_record(config, runtime_id, previous_runtime);
-            RuntimePersistenceTransition::Failed {
-                job,
-                message: format!("Failed to persist the installed runtime: {err}"),
-            }
-        }
-    }
-}
-
-fn runtime_metadata_matches(
-    app_config: &AppConfig,
-    runtime_id: &str,
-    install: &config::ManagedRuntimeInstall,
-) -> bool {
-    app_config.general.managed_runtimes.get(runtime_id) == Some(install)
-}
-
-fn missing_runtime_source_message() -> String {
-    "This build does not include the required local speech runtime. Install a packaged or staged build that includes it."
-        .to_owned()
-}
-
 fn should_activate_installed_model(active_model_is_runnable: bool) -> bool {
     !active_model_is_runnable
-}
-
-fn runtime_needs_preparation(status: &ModelRuntimeStatus) -> bool {
-    status != &ModelRuntimeStatus::Ready
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum RuntimeVersionState {
-    NotTracked,
-    Current(String),
-    UpdateAvailable {
-        installed: Option<String>,
-        available: String,
-    },
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum RuntimeInstallSource {
-    Packaged(PathBuf),
-    DevelopmentScript(DevelopmentRuntimePackage),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct DevelopmentRuntimePackage {
-    script: PathBuf,
-    destination_env: &'static str,
-    destination_root: PathBuf,
-    executable_path: PathBuf,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct RuntimeManifestMetadata {
-    version: Option<String>,
-    sha256: Option<String>,
-    checksum: Option<String>,
-}
-
-#[cfg(test)]
-fn runtime_action_state(config: &AppConfig, model: &SttModelInfo) -> RuntimeActionState {
-    runtime_action_state_with_busy(config, model, false)
-}
-
-#[cfg(test)]
-fn runtime_action_state_with_busy(
-    config: &AppConfig,
-    model: &SttModelInfo,
-    busy: bool,
-) -> RuntimeActionState {
-    runtime_action_state_with_activity(config, model, busy, RuntimeConsumerActivity::default())
-}
-
-fn runtime_action_state_with_activity(
-    config: &AppConfig,
-    model: &SttModelInfo,
-    busy: bool,
-    activity: RuntimeConsumerActivity,
-) -> RuntimeActionState {
-    let state = runtime_action_state_inner(config, model);
-    restrict_runtime_action(state, busy, activity)
-}
-
-fn restrict_runtime_action(
-    mut state: RuntimeActionState,
-    busy: bool,
-    activity: RuntimeConsumerActivity,
-) -> RuntimeActionState {
-    if busy {
-        state.enabled = false;
-        state.disabled_tooltip =
-            Some("The shared local runtime is already being prepared.".to_owned());
-    } else if matches!(
-        state.kind,
-        RuntimeActionKind::Update | RuntimeActionKind::Uninstall
-    ) && let Some(reason) = runtime_consumer_block_reason(activity)
-    {
-        state.enabled = false;
-        state.disabled_tooltip = Some(reason);
-    }
-    state
-}
-
-fn runtime_consumer_block_reason(activity: RuntimeConsumerActivity) -> Option<String> {
-    if activity.recording {
-        Some("Stop the active recording before changing the shared local runtime.".to_owned())
-    } else if activity.transcribing {
-        Some(
-            "Wait for transcription to finish before changing the shared local runtime.".to_owned(),
-        )
-    } else if activity.playground_jobs {
-        Some(
-            "Wait for Playground jobs to finish before changing the shared local runtime."
-                .to_owned(),
-        )
-    } else if activity.model_download {
-        Some("Wait for the model download to finish before changing its runtime.".to_owned())
-    } else {
-        None
-    }
-}
-
-fn model_download_uses_runtime(
-    config: &AppConfig,
-    model_downloads: &HashMap<String, ModelInstallStatus>,
-    runtime_id: &str,
-) -> bool {
-    config::configured_models(config).into_iter().any(|model| {
-        matches!(
-            model_downloads.get(&model.id),
-            Some(ModelInstallStatus::Downloading { .. })
-        ) && !uses_artifact_only_install(config, &model)
-            && compatibility_bridge::provider_for_legacy_model(config, &model)
-                .is_some_and(|provider| provider.id() == runtime_id)
-    })
-}
-
-#[cfg(test)]
-fn apply_runtime_uninstall_result(
-    config: &mut AppConfig,
-    runtime_id: &str,
-    removal: Result<bool, String>,
-) -> Result<bool, String> {
-    let removed_files = removal?;
-    config.general.managed_runtimes.remove(runtime_id);
-    Ok(removed_files)
-}
-
-fn runtime_action_state_inner(config: &AppConfig, model: &SttModelInfo) -> RuntimeActionState {
-    if uses_artifact_only_install(config, model) {
-        return RuntimeActionState {
-            kind: RuntimeActionKind::Install,
-            enabled: false,
-            disabled_tooltip: Some(
-                "This verified model artifact does not use a managed runtime package.".to_owned(),
-            ),
-        };
-    }
-    let Some(provider) = compatibility_bridge::provider_for_legacy_model(config, model) else {
-        return RuntimeActionState {
-            kind: RuntimeActionKind::Install,
-            enabled: false,
-            disabled_tooltip: Some("This model has no compatible local provider.".to_owned()),
-        };
-    };
-
-    if !provider.runtime_install_supported() {
-        return RuntimeActionState {
-            kind: RuntimeActionKind::Install,
-            enabled: false,
-            disabled_tooltip: Some(
-                "The managed local runtime installer is not bundled in this build.".to_owned(),
-            ),
-        };
-    }
-
-    if let Some(capability) = verified_installation_capability(&ModelId::new(&model.id)) {
-        let package_version = match capability {
-            VerifiedInstallationCapability::Available { package_version } => package_version,
-            VerifiedInstallationCapability::Unavailable { reason } => {
-                return RuntimeActionState {
-                    kind: RuntimeActionKind::Install,
-                    enabled: false,
-                    disabled_tooltip: Some(reason),
-                };
-            }
-        };
-        let source_available = model.local_path.as_ref().is_some_and(|path| path.is_file());
-        if has_managed_runtime_install(config, provider) {
-            let installed = config
-                .general
-                .managed_runtimes
-                .get(provider.id())
-                .and_then(|install| install.version.as_deref());
-            if installed != Some(package_version.as_str()) && source_available {
-                return RuntimeActionState {
-                    kind: RuntimeActionKind::Update,
-                    enabled: true,
-                    disabled_tooltip: None,
-                };
-            }
-            return RuntimeActionState {
-                kind: RuntimeActionKind::Uninstall,
-                enabled: true,
-                disabled_tooltip: None,
-            };
-        }
-        return RuntimeActionState {
-            kind: RuntimeActionKind::Install,
-            enabled: source_available,
-            disabled_tooltip: (!source_available).then(|| {
-                "Install a pinned model before installing or updating its native runtime."
-                    .to_owned()
-            }),
-        };
-    }
-
-    runtime_action_state_for_source(
-        config,
-        model,
-        provider,
-        runtime_install_source(config, model).is_some(),
-    )
 }
 
 fn uses_artifact_only_install(config: &AppConfig, model: &SttModelInfo) -> bool {
@@ -3038,229 +2386,13 @@ fn uses_artifact_only_install(config: &AppConfig, model: &SttModelInfo) -> bool 
         || config::imported_gguf_artifact(config, &model.id).is_some()
 }
 
-fn runtime_action_state_for_source(
-    config: &AppConfig,
-    _model: &SttModelInfo,
-    provider: ProviderHandle,
-    source_available: bool,
-) -> RuntimeActionState {
-    if has_managed_runtime_install(config, provider) {
-        if runtime_needs_update(config, provider) && source_available {
-            return RuntimeActionState {
-                kind: RuntimeActionKind::Update,
-                enabled: true,
-                disabled_tooltip: None,
-            };
-        }
-
-        return RuntimeActionState {
-            kind: RuntimeActionKind::Uninstall,
-            enabled: true,
-            disabled_tooltip: None,
-        };
-    }
-
-    if source_available {
-        RuntimeActionState {
-            kind: RuntimeActionKind::Install,
-            enabled: true,
-            disabled_tooltip: None,
-        }
-    } else {
-        RuntimeActionState {
-            kind: RuntimeActionKind::Install,
-            enabled: false,
-            disabled_tooltip: Some(missing_runtime_source_message()),
-        }
-    }
-}
-
-fn supports_managed_install(model: &SttModelInfo) -> bool {
-    if model.download_model.is_none() {
-        return false;
-    }
-    if crate::model_catalog::normalized_install_artifact(&ModelId::new(&model.id)).is_some() {
-        return true;
-    }
-    if let Some(capability) = verified_installation_capability(&ModelId::new(&model.id)) {
-        return matches!(capability, VerifiedInstallationCapability::Available { .. });
-    }
-    false
+fn supports_managed_install(config: &AppConfig, model: &SttModelInfo) -> bool {
+    model.download_model.is_some() && uses_artifact_only_install(config, model)
 }
 
 fn supports_managed_uninstall(model: &SttModelInfo, install_status: &ModelInstallStatus) -> bool {
     crate::model_catalog::normalized_install_artifact(&ModelId::new(&model.id)).is_some()
         && install_status.is_runnable()
-}
-
-fn has_managed_runtime_install(config: &AppConfig, provider: ProviderHandle) -> bool {
-    resolve_managed_runtime_executable(config, provider).is_some()
-}
-
-fn runtime_needs_update(config: &AppConfig, provider: ProviderHandle) -> bool {
-    matches!(
-        runtime_version_state(config, provider),
-        RuntimeVersionState::UpdateAvailable { .. }
-    )
-}
-
-fn runtime_version_state(config: &AppConfig, provider: ProviderHandle) -> RuntimeVersionState {
-    let Some(available) = provider.available_version() else {
-        return RuntimeVersionState::NotTracked;
-    };
-    let Some(install) = config.general.managed_runtimes.get(provider.id()) else {
-        return RuntimeVersionState::NotTracked;
-    };
-    let installed = install
-        .version
-        .as_deref()
-        .map(str::trim)
-        .filter(|version| !version.is_empty());
-
-    match installed {
-        Some(version) if version == available => RuntimeVersionState::Current(version.to_owned()),
-        Some(version) => RuntimeVersionState::UpdateAvailable {
-            installed: Some(version.to_owned()),
-            available: available.to_owned(),
-        },
-        None => RuntimeVersionState::UpdateAvailable {
-            installed: None,
-            available: available.to_owned(),
-        },
-    }
-}
-
-fn resolve_managed_runtime_executable(
-    config: &AppConfig,
-    provider: ProviderHandle,
-) -> Option<PathBuf> {
-    let root = provider.managed_root(config)?;
-    provider.resolve_entrypoint([root])
-}
-
-fn packaged_runtime_path(config: &AppConfig, model: &SttModelInfo) -> Option<PathBuf> {
-    let provider = compatibility_bridge::provider_for_legacy_model(config, model)?;
-    let bundled_root = env::current_exe()
-        .ok()
-        .and_then(|path| path.parent().map(Path::to_path_buf));
-    let managed_root = provider.managed_root(config);
-    provider.resolve_entrypoint(bundled_root.into_iter().chain(managed_root))
-}
-
-fn runtime_install_source(
-    config: &AppConfig,
-    model: &SttModelInfo,
-) -> Option<RuntimeInstallSource> {
-    runtime_install_source_from_candidates(
-        config,
-        model,
-        packaged_runtime_path(config, model),
-        development_runtime_package(config, model),
-    )
-}
-
-fn runtime_install_source_from_candidates(
-    config: &AppConfig,
-    model: &SttModelInfo,
-    packaged: Option<PathBuf>,
-    development: Option<DevelopmentRuntimePackage>,
-) -> Option<RuntimeInstallSource> {
-    packaged
-        .filter(|path| runtime_source_is_staged(config, model, path))
-        .map(RuntimeInstallSource::Packaged)
-        .or_else(|| development.map(RuntimeInstallSource::DevelopmentScript))
-}
-
-fn runtime_source_is_staged(config: &AppConfig, model: &SttModelInfo, path: &Path) -> bool {
-    if path_is_within(path, &config::runtime_storage_dir()) {
-        return false;
-    }
-    let Some(package_root) = runtime_package_root(path) else {
-        return false;
-    };
-
-    let Some(provider) = compatibility_bridge::provider_for_legacy_model(config, model) else {
-        return false;
-    };
-    let Some(current) = config.general.managed_runtimes.get(provider.id()) else {
-        return true;
-    };
-
-    Some(package_root) != runtime_package_root(&current.path)
-}
-
-fn path_is_within(path: &Path, root: &Path) -> bool {
-    match (path.canonicalize(), root.canonicalize()) {
-        (Ok(path), Ok(root)) => path.starts_with(root),
-        _ => path.starts_with(root),
-    }
-}
-
-fn development_runtime_package(
-    config: &AppConfig,
-    model: &SttModelInfo,
-) -> Option<DevelopmentRuntimePackage> {
-    let provider = compatibility_bridge::provider_for_legacy_model(config, model)?;
-    let spec = provider.development_package()?;
-    let script = find_development_bundle_script(spec.script_name)?;
-    let destination_root = config::runtime_storage_dir().join(provider.id());
-    Some(DevelopmentRuntimePackage {
-        script,
-        destination_env: spec.destination_env,
-        executable_path: destination_root.join(spec.executable_relative_path),
-        destination_root,
-    })
-}
-
-fn find_development_bundle_script(script_name: &str) -> Option<PathBuf> {
-    if !cfg!(unix) {
-        return None;
-    }
-    if !development_runtime_installs_enabled() {
-        return None;
-    }
-
-    let mut roots = Vec::new();
-    if let Ok(executable) = env::current_exe()
-        && let Some(parent) = executable.parent()
-    {
-        roots.extend(parent.ancestors().map(Path::to_path_buf));
-    }
-    if let Ok(cwd) = env::current_dir() {
-        roots.extend(cwd.ancestors().map(Path::to_path_buf));
-    }
-
-    let mut seen = Vec::<PathBuf>::new();
-    for root in roots {
-        if seen.iter().any(|seen_root| seen_root == &root) {
-            continue;
-        }
-        seen.push(root.clone());
-        let script = root.join("scripts").join(script_name);
-        if root.join("Cargo.toml").is_file() && script.is_file() {
-            return Some(script);
-        }
-    }
-    None
-}
-
-fn development_runtime_installs_enabled() -> bool {
-    let opt_in = env::var("SCRIBE_ALLOW_DEV_RUNTIME_INSTALL").ok();
-    development_runtime_installs_enabled_for(cfg!(debug_assertions), opt_in.as_deref())
-}
-
-fn development_runtime_installs_enabled_for(
-    debug_assertions: bool,
-    opt_in_value: Option<&str>,
-) -> bool {
-    debug_assertions || opt_in_value.is_some_and(env_flag_value_enabled)
-}
-
-fn env_flag_value_enabled(value: &str) -> bool {
-    matches!(
-        value.trim().to_ascii_lowercase().as_str(),
-        "1" | "true" | "yes" | "on"
-    )
 }
 
 fn cleanup_excluded_bundled_model(config: &AppConfig) -> Result<bool, InstallError> {
@@ -3299,9 +2431,6 @@ fn apply_removed_model_config(
     if config.general.selected_default_model == model_id {
         config.general.selected_default_model =
             replacement.map_or_else(String::new, |model| model.id.clone());
-        if let Some(replacement) = replacement {
-            compatibility_bridge::record_selected_provider(config, replacement);
-        }
     }
     if exclude_bundled {
         config
@@ -3358,7 +2487,6 @@ pub struct LocalTranscriberApp {
     capturing_hotkey: bool,
     transcribe_record_focus_pending: bool,
     model_downloads: HashMap<String, ModelInstallStatus>,
-    runtime_jobs: HashMap<String, RuntimeInstallJob>,
     artifact_installations: ArtifactInstallCoordinator,
     onnx_bundle_install: Option<(u64, String, InstallCancellation)>,
     discard_partial_after_install: HashMap<String, (u64, RemotePartialProbeSource)>,
@@ -3507,7 +2635,6 @@ impl LocalTranscriberApp {
             capturing_hotkey: false,
             transcribe_record_focus_pending: false,
             model_downloads: HashMap::new(),
-            runtime_jobs: HashMap::new(),
             artifact_installations: ArtifactInstallCoordinator::default(),
             onnx_bundle_install: None,
             discard_partial_after_install: HashMap::new(),
@@ -3645,25 +2772,6 @@ impl LocalTranscriberApp {
                 )
             }))
             .collect::<Vec<_>>();
-        let allowed_runtime_bindings = app
-            .transcription_service
-            .model_descriptors()
-            .into_iter()
-            .filter_map(|descriptor| {
-                app.transcription_service
-                    .recovery_installation_binding(&descriptor.id)
-                    .ok()
-                    .map(|binding| {
-                        let target =
-                            config::runtime_storage_dir().join(&binding.managed_runtime_id);
-                        (binding.managed_runtime_id, target)
-                    })
-            })
-            .collect::<Vec<_>>();
-        let allowed_runtime_targets = allowed_runtime_bindings
-            .iter()
-            .map(|(_, target)| target.clone())
-            .collect::<Vec<_>>();
         let durable_artifact_fingerprint =
             config::settings::artifact_config_fingerprint(&app.config).map_err(|error| {
                 crate::installations::InstallError::RecoveryRequired(format!(
@@ -3680,33 +2788,16 @@ impl LocalTranscriberApp {
                 if let Some(target) = bundled_removal_target.as_ref() {
                     reconcile_managed_removal(target, std::slice::from_ref(target), fingerprint)?;
                 }
-                let removal_roots = vec![
-                    config::model_storage_dir(&app.config),
-                    config::runtime_storage_dir(),
-                ];
-                discover_managed_removal_targets(&removal_roots)
-                    .and_then(|discovered| {
-                        let mut allowed_targets = allowed_removal_targets.clone();
-                        allowed_targets.extend(allowed_runtime_targets.iter().cloned());
-                        allowed_targets.extend(discovered);
-                        allowed_targets.sort();
-                        allowed_targets.dedup();
-                        allowed_targets.iter().try_for_each(|target| {
-                            reconcile_managed_removal(target, &allowed_targets, fingerprint)
-                                .map(|_| ())
-                        })
+                let removal_roots = vec![config::model_storage_dir(&app.config)];
+                discover_managed_removal_targets(&removal_roots).and_then(|discovered| {
+                    let mut allowed_targets = allowed_removal_targets.clone();
+                    allowed_targets.extend(discovered);
+                    allowed_targets.sort();
+                    allowed_targets.dedup();
+                    allowed_targets.iter().try_for_each(|target| {
+                        reconcile_managed_removal(target, &allowed_targets, fingerprint).map(|_| ())
                     })
-                    .and_then(|_| {
-                        allowed_runtime_bindings
-                            .iter()
-                            .try_for_each(|(runtime_id, target)| {
-                                crate::installations::reconcile_orphaned_previous_runtime(
-                                    target,
-                                    app.config.general.managed_runtimes.contains_key(runtime_id),
-                                )
-                                .map(|_| ())
-                            })
-                    })
+                })
             });
         if let Err(error) = removal_recovery {
             let message = format!("Could not reconcile an interrupted artifact removal: {error}");
@@ -3719,14 +2810,14 @@ impl LocalTranscriberApp {
                 &activation_journal_path(),
                 &allowed_model_targets,
                 &allowed_manifest_targets,
-                &allowed_runtime_targets,
+                &[],
                 Some(&fingerprint),
             )
         });
         match activation_recovery {
             Ok(true) => {
                 app.status_message =
-                    "Recovered an interrupted model/runtime activation transaction.".to_owned();
+                    "Recovered an interrupted model activation transaction.".to_owned();
             }
             Ok(false) => {}
             Err(error) => {
@@ -3835,9 +2926,6 @@ impl LocalTranscriberApp {
 
         let previous = self.config.clone();
         self.config.general.selected_default_model = next_id;
-        if let Some(model) = replacement.as_ref() {
-            compatibility_bridge::record_selected_provider(&mut self.config, model);
-        }
         config::normalize_config(&mut self.config);
         #[cfg(test)]
         let persistence = if self.config_path.is_none() {
@@ -3885,225 +2973,55 @@ impl LocalTranscriberApp {
             Some(crate::model_catalog::NormalizedInstallArtifact::ReceiptBackedBundle { .. })
         ) {
             let Some(root) = config::installed_onnx_bundle_root(&self.config, &model_id) else {
-                let message = "The selected ONNX model receipt or bundle tree is missing, tampered, or no longer matches this Scribe catalog. Choose Repair before transcription."
-                    .to_owned();
+                let message = "The selected ONNX model receipt or bundle tree is missing or invalid. Choose Repair before transcription.".to_owned();
                 self.model_downloads
                     .insert(model.id.clone(), ModelInstallStatus::Error(message.clone()));
                 self.status = TranscriptionStatus::Error;
                 self.status_message = message;
                 return;
             };
-            if model.local_path.as_deref() != Some(root.as_path()) {
-                self.status = TranscriptionStatus::Error;
-                self.status_message =
-                    "The selected ONNX model does not resolve to its canonical receipt root. Repair or remove it before transcription."
-                        .to_owned();
-                return;
-            }
             if let Err(error) = self
                 .transcription_service
                 .health_check(&model_id, Some(root))
             {
-                self.model_downloads.insert(
-                    model.id.clone(),
-                    ModelInstallStatus::Error(format!(
-                        "The selected ONNX bundle failed startup receipt and worker validation: {error}"
-                    )),
-                );
-                self.status = TranscriptionStatus::Error;
-                self.status_message = format!(
+                let message = format!(
                     "The selected ONNX bundle failed startup validation; choose Repair: {error}"
                 );
+                self.model_downloads
+                    .insert(model.id.clone(), ModelInstallStatus::Error(message.clone()));
+                self.status = TranscriptionStatus::Error;
+                self.status_message = message;
             }
             return;
         }
-        let artifact_only = self.transcription_service.install_plan(&model_id).is_some()
-            || config::remote_gguf_artifact(&self.config, &model.id).is_some()
-            || config::imported_gguf_artifact(&self.config, &model.id).is_some();
-        if !artifact_only
-            && self
-                .transcription_service
-                .model_descriptor(&model_id)
-                .is_err()
-        {
+        let Some(path) = model.local_path.clone().filter(|path| path.is_file()) else {
             return;
-        }
-        if model.local_path.as_ref().is_none_or(|path| !path.is_file()) {
+        };
+        if let Err(error) = self
+            .transcription_service
+            .verify_model_artifact_for_installation(&model_id, Some(path.clone()))
+        {
+            let message =
+                format!("The selected GGUF failed integrity verification; choose Repair: {error}");
+            self.model_downloads
+                .insert(model.id.clone(), ModelInstallStatus::Error(message.clone()));
+            self.status = TranscriptionStatus::Error;
+            self.status_message = message;
             return;
         }
         if let Err(error) = self
             .transcription_service
-            .verify_model_artifact_for_installation(&model_id, model.local_path.clone())
+            .startup_runtime_health_and_load(&model_id, Some(path))
         {
             let message = format!(
-                "The selected model failed integrity verification; repair the model without replacing the runtime: {error}"
+                "The selected GGUF could not be loaded by Scribe's packaged static inference engine. Reinstall Scribe if model repair does not resolve this: {error}"
             );
             self.model_downloads
                 .insert(model.id.clone(), ModelInstallStatus::Error(message.clone()));
             self.status = TranscriptionStatus::Error;
             self.status_message = message;
-            return;
-        }
-        let current = self
-            .transcription_service
-            .startup_runtime_health_and_load(&model_id, model.local_path.clone());
-        if current.is_ok() {
-            return;
-        }
-        let current_error = current.unwrap_err();
-        let _ = self.transcription_service.unload_runtime();
-        if artifact_only {
-            let message = format!(
-                "The selected GGUF could not be loaded by the embedded runtime: {current_error}"
-            );
-            self.model_downloads
-                .insert(model.id.clone(), ModelInstallStatus::Error(message.clone()));
-            self.status = TranscriptionStatus::Error;
-            self.status_message = message;
-            return;
-        }
-        let binding = match self
-            .transcription_service
-            .recovery_installation_binding(&model_id)
-        {
-            Ok(binding) => binding,
-            Err(error) => {
-                let message = format!(
-                    "The managed runtime settings record is unsafe or unavailable; repair or remove it before transcription: {error}"
-                );
-                self.artifact_recovery_error = Some(message.clone());
-                self.status = TranscriptionStatus::Error;
-                self.status_message = message;
-                return;
-            }
-        };
-        let recovery = match self
-            .transcription_service
-            .rollback_to_previous_runtime(&model_id)
-        {
-            Ok(Some(recovery)) => recovery,
-            Ok(None) => {
-                match self.restore_bundled_runtime_fallback(
-                    &model,
-                    &binding.managed_runtime_id,
-                    "Managed runtime failed; restored and verified the immutable bundled runtime.",
-                ) {
-                    Ok(()) => return,
-                    Err(fallback_error) => {
-                        let message = format!(
-                            "Installed speech runtime failed startup health/load checks and no previous or bundled known-good package is available: {current_error}. {fallback_error}"
-                        );
-                        self.artifact_recovery_error = Some(message.clone());
-                        self.status = TranscriptionStatus::Error;
-                        self.status_message = message;
-                        return;
-                    }
-                }
-            }
-            Err(error) => {
-                match self.restore_bundled_runtime_fallback(
-                    &model,
-                    &binding.managed_runtime_id,
-                    "Managed runtime and its previous package failed verification; restored and verified the immutable bundled runtime.",
-                ) {
-                    Ok(()) => return,
-                    Err(fallback_error) => {
-                        let message = format!(
-                            "Installed speech runtime failed and neither previous nor bundled recovery succeeded: {current_error}. Previous runtime: {error}. Bundled fallback: {fallback_error}"
-                        );
-                        self.artifact_recovery_error = Some(message.clone());
-                        self.status = TranscriptionStatus::Error;
-                        self.status_message = message;
-                        return;
-                    }
-                }
-            }
-        };
-        let mut install = config::ManagedRuntimeInstall::app_managed(
-            recovery.entrypoint,
-            "startup-previous-known-good-rollback",
-        );
-        install.version = Some(recovery.version);
-        install.sha256 = Some(recovery.archive_sha256);
-        self.config
-            .general
-            .managed_runtimes
-            .insert(recovery.managed_runtime_id, install);
-        if let Err(error) = config::save_config(&self.config) {
-            let message = format!(
-                "Previous runtime was restored, but its settings record could not be persisted: {error}"
-            );
-            self.artifact_recovery_error = Some(message.clone());
-            self.status = TranscriptionStatus::Error;
-            self.status_message = message;
-            return;
-        }
-        self.transcription_service = self.transcription_service.with_config(self.config.clone());
-        let recovered = self
-            .transcription_service
-            .startup_runtime_health_and_load(&model_id, model.local_path.clone());
-        match recovered {
-            Ok(()) => {
-                self.status = TranscriptionStatus::Idle;
-                self.status_message =
-                    "Restored and verified the previous known-good speech runtime.".to_owned();
-            }
-            Err(error) => {
-                match self.restore_bundled_runtime_fallback(
-                    &model,
-                    &binding.managed_runtime_id,
-                    "The previous runtime failed verification; restored and verified the immutable bundled runtime.",
-                ) {
-                    Ok(()) => {}
-                    Err(fallback_error) => {
-                        let message = format!(
-                            "The previous runtime was restored but failed native smoke verification, and bundled fallback also failed: {error}. Bundled fallback: {fallback_error}"
-                        );
-                        self.artifact_recovery_error = Some(message.clone());
-                        self.status = TranscriptionStatus::Error;
-                        self.status_message = message;
-                    }
-                }
-            }
         }
     }
-
-    fn restore_bundled_runtime_fallback(
-        &mut self,
-        model: &SttModelInfo,
-        managed_runtime_id: &str,
-        success_message: &str,
-    ) -> Result<(), String> {
-        let mut fallback_config = self.config.clone();
-        if fallback_config
-            .general
-            .managed_runtimes
-            .remove(managed_runtime_id)
-            .is_none()
-        {
-            return Err("managed runtime settings record was already absent".to_owned());
-        }
-        let fallback_service = self
-            .transcription_service
-            .with_config(fallback_config.clone());
-        fallback_service
-            .startup_bundled_runtime_health_and_load(
-                &ModelId::new(&model.id),
-                model.local_path.clone(),
-            )
-            .map_err(|error| format!("bundled runtime health/load failed: {error}"))?;
-        config::save_config(&fallback_config)
-            .map_err(|error| format!("bundled fallback settings could not be saved: {error}"))?;
-        self.config = fallback_config;
-        self.transcription_service = fallback_service;
-        if let Some(store) = self.settings_store.as_mut() {
-            store.mark_current_persisted();
-        }
-        self.status = TranscriptionStatus::Idle;
-        self.status_message = success_message.to_owned();
-        Ok(())
-    }
-
     fn playground_selected_models(&self) -> Vec<SttModelInfo> {
         let Some(selected_ids) = self.comparison_run_model_ids.as_ref() else {
             return config::playground_selected_installed_models(&self.config);
@@ -4347,7 +3265,6 @@ impl LocalTranscriberApp {
                     ModelInstallStatus::Downloading { .. } | ModelInstallStatus::InstallingRuntime
                 )
             })
-            || !self.runtime_jobs.is_empty()
     }
 
     fn capture_is_active(&self) -> bool {
@@ -5242,10 +4159,10 @@ impl LocalTranscriberApp {
             }
             return;
         }
-        if !self.artifact_installations.is_empty() || !self.runtime_jobs.is_empty() {
+        if !self.artifact_installations.is_empty() {
             self.status = TranscriptionStatus::Error;
             self.status_message =
-                "Wait for the active model/runtime installation to finish or cancel it before transcribing."
+                "Wait for the active model installation to finish or cancel it before transcribing."
                     .to_owned();
             if source == RecordingSource::Transcribe {
                 self.transcribe_notice = Some(TranscribeNotice::error(
@@ -7667,19 +6584,14 @@ impl LocalTranscriberApp {
                     {
                         let manifest_rollback = result.manifest.rollback().err();
                         let model_rollback = result.model.rollback().err();
-                        let runtime_rollback =
-                            result.runtime.and_then(|runtime| runtime.rollback().err());
-                        let journal_clear = if manifest_rollback.is_none()
-                            && model_rollback.is_none()
-                            && runtime_rollback.is_none()
-                        {
-                            result.journal.clear().err()
-                        } else {
-                            None
-                        };
+                        let journal_clear =
+                            if manifest_rollback.is_none() && model_rollback.is_none() {
+                                result.journal.clear().err()
+                            } else {
+                                None
+                            };
                         if manifest_rollback.is_some()
                             || model_rollback.is_some()
-                            || runtime_rollback.is_some()
                             || journal_clear.is_some()
                         {
                             let message = "A stale installation result could not be rolled back; startup recovery is required."
@@ -7703,9 +6615,9 @@ impl LocalTranscriberApp {
                             .managed_remote_models
                             .insert(model_id.clone(), remote_install.clone());
                     }
-                    if let Some(model) = config::configured_models(&self.config)
+                    if config::configured_models(&self.config)
                         .into_iter()
-                        .find(|model| model.id == model_id)
+                        .any(|model| model.id == model_id)
                     {
                         let active_model_is_runnable =
                             self.selected_model().is_some_and(|active| {
@@ -7735,29 +6647,7 @@ impl LocalTranscriberApp {
                         set_model_selected(&mut self.config, &model_id, true);
                         if should_activate_installed_model(active_model_is_runnable) {
                             self.config.general.selected_default_model = model_id.clone();
-                            compatibility_bridge::record_selected_provider(
-                                &mut self.config,
-                                &model,
-                            );
                         }
-                    }
-                    if let Some(entrypoint) = result.runtime_entrypoint.as_ref() {
-                        let mut install = config::ManagedRuntimeInstall::app_managed(
-                            entrypoint.clone(),
-                            "verified-pinned-runtime-package",
-                        );
-                        install.version = result.runtime_version.clone();
-                        install.sha256 = result.runtime_archive_sha256.clone();
-                        if let Some(package_id) = result.runtime_package_id.as_ref() {
-                            install.unknown.insert(
-                                "package_id".to_owned(),
-                                serde_json::Value::String(package_id.clone()),
-                            );
-                        }
-                        self.config
-                            .general
-                            .managed_runtimes
-                            .insert(result.runtime_id.clone(), install);
                     }
                     config::normalize_config(&mut self.config);
                     let journal_preparation =
@@ -7773,11 +6663,8 @@ impl LocalTranscriberApp {
                         self.config = previous_config;
                         let manifest_rollback = result.manifest.rollback().err();
                         let model_rollback = result.model.rollback().err();
-                        let runtime_rollback =
-                            result.runtime.and_then(|runtime| runtime.rollback().err());
-                        let recovery_required = manifest_rollback.is_some()
-                            || model_rollback.is_some()
-                            || runtime_rollback.is_some();
+                        let recovery_required =
+                            manifest_rollback.is_some() || model_rollback.is_some();
                         let journal_clear = if recovery_required {
                             None
                         } else {
@@ -7785,7 +6672,7 @@ impl LocalTranscriberApp {
                         };
                         let recovery_required = recovery_required || journal_clear.is_some();
                         let message = format!(
-                            "Could not prepare the durable settings commit: {error}{}{}{}",
+                            "Could not prepare the durable settings commit: {error}{}{}",
                             manifest_rollback
                                 .as_ref()
                                 .map(|error| format!(
@@ -7795,10 +6682,6 @@ impl LocalTranscriberApp {
                             model_rollback
                                 .as_ref()
                                 .map(|error| format!(". Model rollback failed: {error}"))
-                                .unwrap_or_default(),
-                            runtime_rollback
-                                .as_ref()
-                                .map(|error| format!(". Runtime rollback failed: {error}"))
                                 .unwrap_or_default(),
                         ) + &journal_clear
                             .as_ref()
@@ -7845,22 +6728,13 @@ impl LocalTranscriberApp {
                     }
                     let model_cleanup = result.model.commit().err();
                     let manifest_cleanup = result.manifest.commit().err();
-                    let runtime_cleanup = result.runtime.and_then(|runtime| {
-                        runtime
-                            .commit_with_previous_policy(result.retain_runtime_as_previous)
-                            .err()
-                    });
-                    let journal_cleanup = if model_cleanup.is_none()
-                        && manifest_cleanup.is_none()
-                        && runtime_cleanup.is_none()
-                    {
+                    let journal_cleanup = if model_cleanup.is_none() && manifest_cleanup.is_none() {
                         result.journal.clear().err()
                     } else {
                         None
                     };
                     let cleanup_requires_recovery = model_cleanup.is_some()
                         || manifest_cleanup.is_some()
-                        || runtime_cleanup.is_some()
                         || journal_cleanup.is_some();
                     if let Some(store) = self.settings_store.as_mut() {
                         store.mark_current_persisted();
@@ -7869,7 +6743,7 @@ impl LocalTranscriberApp {
                         self.transcription_service.with_config(self.config.clone());
                     self.refresh_playground_cards_from_config();
                     let message = format!(
-                        "Model installed and smoke-tested (health {} ms, load {} ms, decode {} ms, reload {} ms, {}).{}{}{}{}",
+                        "Model installed and smoke-tested (health {} ms, load {} ms, decode {} ms, reload {} ms, {}).{}{}{}",
                         result.smoke.health_duration_ms,
                         result.smoke.load_duration_ms,
                         result.smoke.decode_duration_ms,
@@ -7883,16 +6757,13 @@ impl LocalTranscriberApp {
                                 " Installed-model manifest cleanup warning: {error}."
                             ))
                             .unwrap_or_default(),
-                        runtime_cleanup
-                            .map(|error| format!(" Runtime backup warning: {error}."))
-                            .unwrap_or_default(),
                         journal_cleanup
                             .map(|error| format!(" Journal cleanup warning: {error}."))
                             .unwrap_or_default(),
                     );
                     if cleanup_requires_recovery {
                         let message = format!(
-                            "{message} Artifact cleanup is incomplete; restart Scribe to reconcile the retained transaction before another install, update, repair, removal, or runtime switch."
+                            "{message} Artifact cleanup is incomplete; restart Scribe to reconcile the retained transaction before another install, repair, or removal."
                         );
                         self.artifact_recovery_error = Some(message.clone());
                         self.freeze_artifact_installs_for_recovery(Some(job_id));
@@ -7940,84 +6811,6 @@ impl LocalTranscriberApp {
                     }
                     self.finish_artifact_install(&model_id, job_id);
                 }
-                AppEvent::RuntimeInstallDone {
-                    runtime_id,
-                    runtime_label,
-                    replacement,
-                    source_label,
-                } => {
-                    self.remote_catalog.invalidate_local_models();
-                    let installed_path = replacement.installed_path.clone();
-                    let new_runtime = managed_runtime_install_record(installed_path, source_label);
-                    let job = self.runtime_jobs.remove(&runtime_id).unwrap_or_default();
-                    let job = match persist_runtime_install(
-                        &mut self.config,
-                        &runtime_id,
-                        new_runtime.clone(),
-                        job,
-                        |config| config::save_config(config).map_err(|err| err.to_string()),
-                    ) {
-                        RuntimePersistenceTransition::Persisted(job) => job,
-                        RuntimePersistenceTransition::Failed { job, message } => {
-                            let rollback_message = match replacement.rollback() {
-                                Ok(()) => message,
-                                Err(rollback_err) => format!("{message}. {rollback_err}"),
-                            };
-                            for model_id in job.download_model_ids {
-                                self.model_downloads.insert(
-                                    model_id,
-                                    ModelInstallStatus::Error(rollback_message.clone()),
-                                );
-                            }
-                            for model_id in job.repair_model_ids {
-                                self.model_downloads.insert(
-                                    model_id,
-                                    ModelInstallStatus::RuntimeError(rollback_message.clone()),
-                                );
-                            }
-                            self.status = TranscriptionStatus::Error;
-                            self.status_message = rollback_message;
-                            continue;
-                        }
-                    };
-                    if let Some(store) = self.settings_store.as_mut() {
-                        store.mark_current_persisted();
-                    }
-                    let cleanup_warning = replacement.commit().err();
-                    if self.config_path.is_none() {
-                        self.config_path = config::config_file_path().ok();
-                    }
-                    debug_assert!(runtime_metadata_matches(
-                        &self.config,
-                        &runtime_id,
-                        &new_runtime,
-                    ));
-                    self.refresh_playground_runtime_statuses();
-                    for model_id in job.repair_model_ids {
-                        self.model_downloads.remove(&model_id);
-                    }
-                    for model_id in job.download_model_ids {
-                        if let Some(model) = config::configured_models(&self.config)
-                            .into_iter()
-                            .find(|model| model.id == model_id)
-                        {
-                            self.start_model_download_only(&model);
-                        }
-                    }
-                    self.status = TranscriptionStatus::Idle;
-                    self.status_message = cleanup_warning.map_or_else(
-                        || format!("{runtime_label} runtime is ready."),
-                        |warning| {
-                            format!(
-                                "{runtime_label} runtime is ready. Old runtime backup cleanup warning: {warning}"
-                            )
-                        },
-                    );
-                }
-                AppEvent::RuntimeInstallFailed {
-                    runtime_id,
-                    message,
-                } => self.fail_runtime_job(&runtime_id, message),
             }
         }
         self.rebuild_model_inventory_projection();
@@ -8652,7 +7445,6 @@ impl LocalTranscriberApp {
             return false;
         }
         self.config.general.selected_default_model = model.id.clone();
-        compatibility_bridge::record_selected_provider(&mut self.config, model);
         self.save_config();
         self.remote_catalog.invalidate_local_models();
         true
@@ -8747,7 +7539,6 @@ impl LocalTranscriberApp {
         }
         let previous = self.config.clone();
         self.config.general.selected_default_model = replacement.id.clone();
-        compatibility_bridge::record_selected_provider(&mut self.config, replacement);
         config::normalize_config(&mut self.config);
         if let Err(error) = config::save_config(&self.config) {
             self.config = previous;
@@ -8775,27 +7566,8 @@ impl LocalTranscriberApp {
             .unwrap_or_else(|| model.install_status.clone())
     }
 
-    fn runtime_consumer_activity(&self, runtime_id: &str) -> RuntimeConsumerActivity {
-        RuntimeConsumerActivity {
-            recording: self.capture_is_active(),
-            transcribing: self.effective_status() == TranscriptionStatus::Transcribing,
-            playground_jobs: self.playground_pending > 0,
-            model_download: model_download_uses_runtime(
-                &self.config,
-                &self.model_downloads,
-                runtime_id,
-            ),
-        }
-    }
-
     fn start_model_download(&mut self, model: &SttModelInfo) {
-        if self.artifact_installations.contains_key(&model.id)
-            || self.runtime_jobs.values().any(|job| {
-                job.download_model_ids
-                    .iter()
-                    .any(|queued_model_id| queued_model_id == &model.id)
-            })
-        {
+        if self.artifact_installations.contains_key(&model.id) {
             self.status_message = format!("{} is already being installed.", model.name);
             return;
         }
@@ -8806,22 +7578,14 @@ impl LocalTranscriberApp {
             self.start_model_download_only(model);
             return;
         }
-        let Some(provider) = compatibility_bridge::provider_for_legacy_model(&self.config, model)
-        else {
-            self.fail_model_install(&model.id, "Model provider is not available.".to_owned());
-            return;
-        };
-
-        if !runtime_needs_preparation(&provider.runtime_status(&self.config)) {
-            self.start_model_download_only(model);
-            return;
-        }
-
-        self.request_runtime_install(model, RuntimeJobIntent::DownloadModel(model.id.clone()));
+        self.fail_model_install(
+            &model.id,
+            "This model is not supported by the packaged static inference runtime.".to_owned(),
+        );
     }
 
     fn start_model_download_only(&mut self, model: &SttModelInfo) {
-        self.start_model_download_with_runtime_policy(model, false);
+        self.start_verified_model_download(model);
     }
 
     fn reinstate_verified_bundled_model(&mut self, model: &SttModelInfo) -> bool {
@@ -8881,11 +7645,7 @@ impl LocalTranscriberApp {
         true
     }
 
-    fn start_model_download_with_runtime_policy(
-        &mut self,
-        model: &SttModelInfo,
-        force_runtime_package: bool,
-    ) {
+    fn start_verified_model_download(&mut self, model: &SttModelInfo) {
         if let Some(reason) = self.install_admission_block_reason() {
             self.fail_model_install(&model.id, reason);
             return;
@@ -8970,7 +7730,7 @@ impl LocalTranscriberApp {
             }
         }
 
-        if !supports_managed_install(model) {
+        if !supports_managed_install(&self.config, model) {
             self.status = TranscriptionStatus::Error;
             self.status_message = format!(
                 "Managed installer for {} is not available in this build.",
@@ -9022,7 +7782,6 @@ impl LocalTranscriberApp {
             admission,
             self.config.clone(),
             VerifiedInstallSource::NormalizedCatalog,
-            force_runtime_package,
         ) {
             self.fail_model_install(&model.id, message);
             return;
@@ -9087,7 +7846,6 @@ impl LocalTranscriberApp {
             admission,
             self.config.clone(),
             VerifiedInstallSource::TrustedRemote(request),
-            false,
         ) {
             self.status = TranscriptionStatus::Error;
             self.status_message = message;
@@ -9116,7 +7874,6 @@ impl LocalTranscriberApp {
                     VerifiedInstallPreparationRequest {
                         config: launch.config,
                         model_id,
-                        force_runtime_package: launch.force_runtime_package,
                         cancellation: launch.cancellation,
                         source: launch.source,
                         expected_target_identity: launch.expected_target_identity,
@@ -9129,65 +7886,9 @@ impl LocalTranscriberApp {
     }
 
     fn launch_next_artifact_finalizer(&mut self) {
-        let Some((waiting_model_id, may_write_runtime)) =
-            self.artifact_installations.next_finalizer_requirement()
-        else {
+        let Some(_waiting_model_id) = self.artifact_installations.next_finalizer_model() else {
             return;
         };
-        if may_write_runtime {
-            let runtime_admission = self
-                .transcription_service
-                .with_config(self.config.clone())
-                .install_plan(&ModelId::new(&waiting_model_id))
-                .ok_or_else(|| {
-                    InstallError::Failed(
-                        "legacy install unexpectedly requested runtime preparation".to_owned(),
-                    )
-                })
-                .and(Err(InstallError::Failed(
-                    "artifact-only install unexpectedly requested runtime preparation".to_owned(),
-                )));
-            let runtime_admission = match runtime_admission {
-                Ok(admission) => admission,
-                Err(error) => {
-                    let job_id = self
-                        .artifact_installations
-                        .get(&waiting_model_id)
-                        .map(|(job_id, _)| *job_id);
-                    let message =
-                        format!("Could not reserve verified runtime preparation space: {error}");
-                    self.model_downloads.insert(
-                        waiting_model_id.clone(),
-                        ModelInstallStatus::Error(message.clone()),
-                    );
-                    self.status = TranscriptionStatus::Error;
-                    self.status_message = message;
-                    if let Some(job_id) = job_id {
-                        self.finish_artifact_install(&waiting_model_id, job_id);
-                    }
-                    return;
-                }
-            };
-            if let Err(message) = self
-                .artifact_installations
-                .reserve_next_finalizer_runtime(runtime_admission)
-            {
-                let job_id = self
-                    .artifact_installations
-                    .get(&waiting_model_id)
-                    .map(|(job_id, _)| *job_id);
-                self.model_downloads.insert(
-                    waiting_model_id.clone(),
-                    ModelInstallStatus::Error(message.clone()),
-                );
-                self.status = TranscriptionStatus::Error;
-                self.status_message = message;
-                if let Some(job_id) = job_id {
-                    self.finish_artifact_install(&waiting_model_id, job_id);
-                }
-                return;
-            }
-        }
         let Some(launch) = self.artifact_installations.take_next_finalizer() else {
             return;
         };
@@ -9204,7 +7905,6 @@ impl LocalTranscriberApp {
                 service,
                 launch.cancellation,
                 launch.prepared,
-                launch.runtime_archive_target_identity,
                 &progress,
             );
             send_verified_install_result(&tx, launch.job_id, launch.model_id, result);
@@ -9511,9 +8211,6 @@ impl LocalTranscriberApp {
         let onnx_bundle_target =
             config::onnx_bundle_target_root(&self.config, &ModelId::new(&model.id))
                 .filter(|path| is_app_managed_model_path(&self.config, path));
-        let legacy_catalog_target = app_owned_legacy_catalog_artifact(&self.config, model)
-            .then(|| model.local_path.clone())
-            .flatten();
         // Each trusted remote artifact owns an opaque leaf directory. Staging
         // that directory removes the generated provenance manifest together
         // with the model, without affecting another variant in the same Hub
@@ -9539,8 +8236,7 @@ impl LocalTranscriberApp {
             .or(static_managed_target)
             .or(onnx_bundle_target)
             .or(remote_managed_target)
-            .or(imported_receipt_target)
-            .or(legacy_catalog_target);
+            .or(imported_receipt_target);
         let prior_fingerprint = match config::settings::artifact_config_fingerprint(&self.config) {
             Ok(fingerprint) => fingerprint,
             Err(error) => {
@@ -9732,136 +8428,6 @@ impl LocalTranscriberApp {
         true
     }
 
-    fn request_runtime_install(&mut self, model: &SttModelInfo, intent: RuntimeJobIntent) {
-        self.remote_catalog.invalidate_local_models();
-        if uses_artifact_only_install(&self.config, model) {
-            match intent {
-                RuntimeJobIntent::DownloadModel(_) => self.start_model_download_only(model),
-                RuntimeJobIntent::RepairModel(_) | RuntimeJobIntent::Maintenance
-                    if model.local_path.as_ref().is_some_and(|path| path.is_file()) =>
-                {
-                    self.start_model_download_with_runtime_policy(model, true);
-                }
-                RuntimeJobIntent::RepairModel(_) | RuntimeJobIntent::Maintenance => {
-                    self.fail_model_install(
-                        &model.id,
-                        "Install this model to verify a runtime update against an exact pinned artifact before activation."
-                            .to_owned(),
-                    );
-                }
-            }
-            return;
-        }
-        let Some(provider) = compatibility_bridge::provider_for_legacy_model(&self.config, model)
-        else {
-            self.status = TranscriptionStatus::Error;
-            self.status_message = "Model provider is not available.".to_owned();
-            return;
-        };
-
-        if !provider.runtime_install_supported() {
-            self.status = TranscriptionStatus::Error;
-            self.status_message =
-                "Managed local runtime installation is not available in this build.".to_owned();
-            return;
-        }
-
-        if let Some(job) = self.runtime_jobs.get_mut(provider.id()) {
-            let queued_model_id = match intent {
-                RuntimeJobIntent::DownloadModel(model_id) => {
-                    queue_runtime_model(&mut job.download_model_ids, model_id.clone())
-                        .then_some(model_id)
-                }
-                RuntimeJobIntent::RepairModel(model_id) => {
-                    queue_runtime_model(&mut job.repair_model_ids, model_id.clone())
-                        .then_some(model_id)
-                }
-                RuntimeJobIntent::Maintenance => None,
-            };
-            if let Some(model_id) = queued_model_id {
-                self.model_downloads
-                    .insert(model_id, ModelInstallStatus::InstallingRuntime);
-            }
-            return;
-        }
-
-        if let Some(reason) = self.artifact_mutation_block_reason() {
-            self.status_message = reason;
-            return;
-        }
-
-        let Some(source) = runtime_install_source(&self.config, model) else {
-            let message = missing_runtime_source_message();
-            match intent {
-                RuntimeJobIntent::DownloadModel(model_id) => {
-                    self.model_downloads
-                        .insert(model_id, ModelInstallStatus::Error(message.clone()));
-                }
-                RuntimeJobIntent::RepairModel(model_id) => {
-                    self.model_downloads
-                        .insert(model_id, ModelInstallStatus::RuntimeError(message.clone()));
-                }
-                RuntimeJobIntent::Maintenance => {}
-            }
-            self.status = TranscriptionStatus::Error;
-            self.status_message = message;
-            return;
-        };
-
-        let mut job = RuntimeInstallJob::default();
-        let queued_model_id = match intent {
-            RuntimeJobIntent::DownloadModel(model_id) => {
-                queue_runtime_model(&mut job.download_model_ids, model_id.clone());
-                Some(model_id)
-            }
-            RuntimeJobIntent::RepairModel(model_id) => {
-                queue_runtime_model(&mut job.repair_model_ids, model_id.clone());
-                Some(model_id)
-            }
-            RuntimeJobIntent::Maintenance => None,
-        };
-        if let Some(model_id) = queued_model_id {
-            self.model_downloads
-                .insert(model_id.clone(), ModelInstallStatus::InstallingRuntime);
-            self.remote_catalog.invalidate_projection();
-        }
-        self.runtime_jobs.insert(provider.id().to_owned(), job);
-        self.status = TranscriptionStatus::Idle;
-        self.status_message = "Preparing local speech runtime...".to_owned();
-
-        let tx = self.tx.clone();
-        let runtime_id = provider.id().to_owned();
-        let runtime_label = "Local speech".to_owned();
-        thread::spawn(move || {
-            let (result, source_label) = match source {
-                RuntimeInstallSource::Packaged(packaged_path) => (
-                    install_runtime_files(&runtime_id, &packaged_path),
-                    "packaged-runtime",
-                ),
-                RuntimeInstallSource::DevelopmentScript(package) => (
-                    build_development_runtime_package(&runtime_id, &runtime_label, package),
-                    "development-script",
-                ),
-            };
-            match result {
-                Ok(replacement) => {
-                    let _ = tx.send(AppEvent::RuntimeInstallDone {
-                        runtime_id,
-                        runtime_label,
-                        replacement,
-                        source_label,
-                    });
-                }
-                Err(message) => {
-                    let _ = tx.send(AppEvent::RuntimeInstallFailed {
-                        runtime_id,
-                        message,
-                    });
-                }
-            }
-        });
-    }
-
     fn fail_model_install(&mut self, model_id: &str, message: String) {
         self.remote_catalog.invalidate_local_models();
         self.model_downloads.insert(
@@ -9870,180 +8436,6 @@ impl LocalTranscriberApp {
         );
         self.status = TranscriptionStatus::Error;
         self.status_message = message;
-    }
-
-    fn fail_runtime_job(&mut self, runtime_id: &str, message: String) {
-        self.remote_catalog.invalidate_local_models();
-        if let Some(job) = self.runtime_jobs.remove(runtime_id) {
-            for model_id in job.download_model_ids {
-                self.model_downloads
-                    .insert(model_id, ModelInstallStatus::Error(message.clone()));
-            }
-            for model_id in job.repair_model_ids {
-                self.model_downloads
-                    .insert(model_id, ModelInstallStatus::RuntimeError(message.clone()));
-            }
-        }
-        self.status = TranscriptionStatus::Error;
-        self.status_message = format!("Runtime installation failed: {message}");
-    }
-
-    fn uninstall_runtime(&mut self, model: &SttModelInfo) {
-        if let Some(reason) = self.artifact_mutation_block_reason() {
-            self.status_message = reason;
-            return;
-        }
-        if let Err(error) = self.transcription_service.unload_runtime() {
-            self.status_message = format!("Could not unload the local runtime: {error}");
-            return;
-        }
-        if let Ok(binding) = self
-            .transcription_service
-            .recovery_installation_binding(&ModelId::new(&model.id))
-        {
-            let target = config::runtime_storage_dir().join(&binding.managed_runtime_id);
-            let owns_target = self
-                .config
-                .general
-                .managed_runtimes
-                .get(&binding.managed_runtime_id)
-                .and_then(|install| {
-                    runtime_uninstall_target(
-                        &config::runtime_storage_dir(),
-                        &binding.managed_runtime_id,
-                        &install.path,
-                    )
-                })
-                .is_some_and(|candidate| candidate == target);
-            let prior_fingerprint =
-                match config::settings::artifact_config_fingerprint(&self.config) {
-                    Ok(fingerprint) => fingerprint,
-                    Err(error) => {
-                        self.status = TranscriptionStatus::Error;
-                        self.status_message =
-                            format!("Could not prepare runtime removal settings witness: {error}");
-                        return;
-                    }
-                };
-            let mut staged_removal = if owns_target {
-                match ManagedRemoval::stage(
-                    &target,
-                    std::slice::from_ref(&target),
-                    prior_fingerprint,
-                ) {
-                    Ok(removal) => Some(removal),
-                    Err(error) => {
-                        if error.requires_recovery() {
-                            self.artifact_recovery_error = Some(error.to_string());
-                        }
-                        self.status = TranscriptionStatus::Error;
-                        self.status_message = format!("Could not stage runtime removal: {error}");
-                        return;
-                    }
-                }
-            } else {
-                None
-            };
-            let removed_files = staged_removal
-                .as_ref()
-                .is_some_and(ManagedRemoval::removed_files);
-            let previous_config = self.config.clone();
-            self.config
-                .general
-                .managed_runtimes
-                .remove(&binding.managed_runtime_id);
-            config::normalize_config(&mut self.config);
-            let removal_preparation = config::settings::artifact_config_fingerprint(&self.config)
-                .map_err(|error| error.to_string())
-                .and_then(|fingerprint| {
-                    staged_removal.as_mut().map_or(Ok(()), |removal| {
-                        removal
-                            .prepare_config_commit(fingerprint)
-                            .map_err(|error| error.to_string())
-                    })
-                });
-            if let Err(error) = removal_preparation {
-                self.config = previous_config;
-                let rollback = staged_removal.and_then(|removal| removal.rollback().err());
-                let message = format!(
-                    "Could not prepare runtime removal transaction: {error}{}",
-                    rollback
-                        .as_ref()
-                        .map(|error| format!(". Restoring the runtime also failed: {error}"))
-                        .unwrap_or_default()
-                );
-                if rollback.is_some() {
-                    self.artifact_recovery_error = Some(message.clone());
-                }
-                self.status = TranscriptionStatus::Error;
-                self.status_message = message;
-                return;
-            }
-            if let Err(error) = config::save_config(&self.config) {
-                self.config = previous_config;
-                let message = format!(
-                    "Could not confirm runtime removal settings persistence: {error}. The runtime tombstone and removal journal were retained; restart Scribe to reconcile the durable settings witness."
-                );
-                if staged_removal.is_some() {
-                    self.artifact_recovery_error = Some(message.clone());
-                }
-                self.status = TranscriptionStatus::Error;
-                self.status_message = message;
-                return;
-            }
-            let cleanup = staged_removal
-                .and_then(|removal| removal.commit().err())
-                .or_else(|| crate::installations::remove_previous_runtime_if_exists(&target).err());
-            if let Some(store) = self.settings_store.as_mut() {
-                store.mark_current_persisted();
-            }
-            self.transcription_service =
-                self.transcription_service.with_config(self.config.clone());
-            self.refresh_playground_runtime_statuses();
-            self.rebuild_local_models_after_committed_change();
-            if let Some(error) = cleanup {
-                let message = format!(
-                    "Runtime was removed, but cleanup is incomplete; restart Scribe before changing artifacts again: {error}"
-                );
-                self.artifact_recovery_error = Some(message.clone());
-                self.status = TranscriptionStatus::Error;
-                self.status_message = message;
-                return;
-            }
-            self.status = TranscriptionStatus::Idle;
-            self.status_message = if removed_files {
-                "Uninstalled verified local speech runtime.".to_owned()
-            } else {
-                "Removed verified local speech runtime from Scribe.".to_owned()
-            };
-            return;
-        }
-        let Some(provider) = compatibility_bridge::provider_for_legacy_model(&self.config, model)
-        else {
-            self.status = TranscriptionStatus::Error;
-            self.status_message = "Model provider is not available.".to_owned();
-            return;
-        };
-
-        let previous_config = self.config.clone();
-        self.config.general.managed_runtimes.remove(provider.id());
-        config::normalize_config(&mut self.config);
-        if let Err(error) = config::save_config(&self.config) {
-            self.config = previous_config;
-            self.status = TranscriptionStatus::Error;
-            self.status_message = format!(
-                "Could not persist legacy runtime settings removal: {error}. Unmanaged files were left untouched."
-            );
-            return;
-        }
-        if let Some(store) = self.settings_store.as_mut() {
-            store.mark_current_persisted();
-        }
-        self.transcription_service = self.transcription_service.with_config(self.config.clone());
-        self.refresh_playground_runtime_statuses();
-        self.rebuild_local_models_after_committed_change();
-        self.status = TranscriptionStatus::Idle;
-        self.status_message = "Removed the legacy runtime from Scribe settings. Its files were preserved because they are not governed by the normalized manifest transaction.".to_owned();
     }
 
     fn refresh_playground_runtime_statuses(&mut self) {
@@ -10063,10 +8455,7 @@ impl LocalTranscriberApp {
             Some("Wait for final transcription and output to finish before changing speech artifacts.".to_owned())
         } else if self.playground_pending > 0 {
             Some("Wait for Playground jobs to finish before changing speech artifacts.".to_owned())
-        } else if !self.artifact_installations.is_empty()
-            || !self.runtime_jobs.is_empty()
-            || self.local_gguf_import.is_some()
-        {
+        } else if !self.artifact_installations.is_empty() || self.local_gguf_import.is_some() {
             Some("Wait for the active installation to finish or cancel it first.".to_owned())
         } else {
             None
@@ -10084,7 +8473,7 @@ impl LocalTranscriberApp {
             Some("Wait for final transcription and output to finish before changing speech artifacts.".to_owned())
         } else if self.playground_pending > 0 {
             Some("Wait for Playground jobs to finish before changing speech artifacts.".to_owned())
-        } else if !self.runtime_jobs.is_empty() || self.local_gguf_import.is_some() {
+        } else if self.local_gguf_import.is_some() {
             Some("Wait for the active installation to finish or cancel it first.".to_owned())
         } else {
             None
@@ -10463,7 +8852,6 @@ impl LocalTranscriberApp {
             | ScreenAction::AcknowledgeModelRemovalFocus
             | ScreenAction::SelectModel(_)
             | ScreenAction::InstallModel(_)
-            | ScreenAction::UpgradeModel(_)
             | ScreenAction::CancelModelInstall(_)
             | ScreenAction::DiscardModelPartial(_)
             | ScreenAction::ToggleModelCardDetails(_)
@@ -10487,8 +8875,6 @@ impl LocalTranscriberApp {
             | ScreenAction::SetAudioDevice(_)
             | ScreenAction::SetVoiceDetectionMode(_)
             | ScreenAction::SetInputThresholdDbfs(_)
-            | ScreenAction::RepairModelRuntime(_)
-            | ScreenAction::MaintainModelRuntime(_)
             | ScreenAction::SetRemoteCatalogQuery(_)
             | ScreenAction::SetModelLanguageFilter(_)
             | ScreenAction::ToggleInstalledModels
@@ -11493,19 +9879,12 @@ impl LocalTranscriberApp {
             .general
             .imported_gguf_models
             .contains_key(&model.id);
-        // Scribe versions before the verified GGUF catalog stored known GGML
-        // compatibility artifacts directly below the app's model directory,
-        // without a managed-install receipt. This exact, canonical path is
-        // still Scribe-owned; an arbitrary configured path is not.
-        let app_owned_legacy_artifact = app_owned_legacy_catalog_artifact(&self.config, model);
-        let legacy_cleanup_pending = app_owned_legacy_cleanup_artifact(&self.config, model);
         let bundled = model.artifact_origin == ModelArtifactOrigin::Bundled;
         let receipt_backed = matches!(
             crate::model_catalog::normalized_install_artifact(&ModelId::new(&model.id)),
             Some(crate::model_catalog::NormalizedInstallArtifact::ReceiptBackedBundle { .. })
         );
-        let installed =
-            manageable && !legacy_cleanup_pending && (!bundled || install_status.is_runnable());
+        let installed = manageable && (!bundled || install_status.is_runnable());
         let custom = model.local_path.is_some()
             && !self.config.general.managed_models.contains_key(&model.id)
             && !self
@@ -11514,7 +9893,6 @@ impl LocalTranscriberApp {
                 .managed_remote_models
                 .contains_key(&model.id)
             && !imported_gguf
-            && !app_owned_legacy_artifact
             && !bundled;
         let onnx_install_active = self
             .onnx_bundle_install
@@ -11524,9 +9902,6 @@ impl LocalTranscriberApp {
             self.artifact_installations.contains_key(&model.id) || onnx_install_active;
         let install_phase = self.artifact_installations.phase_for_model(&model.id);
         let mut download_state = match &install_status {
-            ModelInstallStatus::Installed if legacy_cleanup_pending => {
-                ModelDownloadState::NotInstalled
-            }
             ModelInstallStatus::Installed => ModelDownloadState::Installed,
             ModelInstallStatus::Downloading { .. } => ModelDownloadState::Downloading,
             ModelInstallStatus::InstallingRuntime => ModelDownloadState::Verifying,
@@ -11578,90 +9953,32 @@ impl LocalTranscriberApp {
         let selected = manageable && self.config.general.selected_default_model == model.id;
         let active = installed && selected && runtime_ready;
         let included = bundled && installed && runtime_ready;
-        let migration_pending =
-            manageable && config::model_needs_pinned_gguf_migration(&self.config, model);
-        let (
-            primary_action_label,
-            primary_action_enabled,
-            primary_action_installs_upgrade,
-            primary_action_repairs_runtime,
-            primary_action_disabled_reason,
-        ) = if migration_pending {
-            let installing = matches!(
-                install_status,
-                ModelInstallStatus::Downloading { .. } | ModelInstallStatus::InstallingRuntime
-            );
-            (
-                "Upgrade model".to_owned(),
-                partial_inspection_error.is_none()
-                    && !install_admission_blocked
-                    && !installing
-                    && supports_managed_install(model),
-                true,
+        let (primary_action_label, primary_action_enabled, primary_action_disabled_reason) =
+            if active {
+                (
+                    "Active".to_owned(),
+                    false,
+                    Some("This model is already active.".to_owned()),
+                )
+            } else if installed && runtime_ready {
+                (
+                    "Use this model".to_owned(),
+                    !mutation_blocked,
+                    mutation_block_reason.clone(),
+                )
+            } else if installed {
+                (
+                "Packaged runtime unavailable".to_owned(),
                 false,
-                partial_inspection_error
-                    .clone()
-                    .or_else(|| install_admission_block_reason.clone())
-                    .or_else(|| {
-                        installing.then(|| "This model upgrade is already in progress.".to_owned())
-                    }),
+                Some(
+                    "Reinstall Scribe if a model repair does not restore the packaged static inference engine."
+                        .to_owned(),
+                ),
             )
-        } else if active {
-            (
-                "Active".to_owned(),
-                false,
-                false,
-                false,
-                Some("This model is already active.".to_owned()),
-            )
-        } else if installed && runtime_ready {
-            (
-                "Use this model".to_owned(),
-                !mutation_blocked,
-                false,
-                false,
-                mutation_block_reason.clone(),
-            )
-        } else if installed {
-            let runtime_busy = compatibility_bridge::provider_for_legacy_model(&self.config, model)
-                .is_some_and(|provider| self.runtime_jobs.contains_key(provider.id()));
-            let runtime_action = runtime_action_state_with_activity(
-                &self.config,
-                model,
-                runtime_busy,
-                compatibility_bridge::provider_for_legacy_model(&self.config, model)
-                    .map_or_else(RuntimeConsumerActivity::default, |provider| {
-                        self.runtime_consumer_activity(provider.id())
-                    }),
-            );
-            let repairable = matches!(
-                runtime_action.kind,
-                RuntimeActionKind::Install | RuntimeActionKind::Update
-            );
-            (
-                if repairable {
-                    "Repair runtime"
-                } else {
-                    "Runtime unavailable"
-                }
-                .to_owned(),
-                repairable && runtime_action.enabled && !mutation_blocked,
-                false,
-                repairable,
-                mutation_block_reason
-                    .clone()
-                    .or(runtime_action.disabled_tooltip)
-                    .or_else(|| {
-                        (!repairable)
-                            .then(|| "This model does not have a repairable runtime.".to_owned())
-                    }),
-            )
-        } else if receipt_backed && matches!(install_status, ModelInstallStatus::Missing) {
-            (
+            } else if receipt_backed && matches!(install_status, ModelInstallStatus::Missing) {
+                (
                 "Repair model".to_owned(),
-                !install_admission_blocked && supports_managed_install(model),
-                false,
-                false,
+                !install_admission_blocked && supports_managed_install(&self.config, model),
                 install_admission_block_reason.clone().or_else(|| {
                     Some(
                         "The canonical ONNX bundle is incomplete or failed receipt validation. Repair downloads and verifies the exact pinned bundle."
@@ -11669,8 +9986,8 @@ impl LocalTranscriberApp {
                     )
                 }),
             )
-        } else {
-            (
+            } else {
+                (
                 // Preparing the runtime is not evidence that this bundled model's
                 // artifact was installed. Avoid presenting a repair action until
                 // the installer has actually established that state.
@@ -11680,8 +9997,6 @@ impl LocalTranscriberApp {
                     "Not installed"
                 }
                 .to_owned(),
-                false,
-                false,
                 false,
                 partial_inspection_error
                     .clone()
@@ -11694,7 +10009,7 @@ impl LocalTranscriberApp {
                         }.to_owned())
                     }),
             )
-        };
+            };
         let manifest = crate::model_catalog::runtime_model_manifest(&ModelId::new(&model.id));
         let partial_cleanup_available =
             !exact_install_active && (has_partial || partial_inspection_error.is_some());
@@ -11710,15 +10025,7 @@ impl LocalTranscriberApp {
             architecture: None,
             artifact_repository: manifest.map(|manifest| manifest.artifact_repository.to_owned()),
             artifact_revision: manifest.map(|manifest| manifest.artifact_revision.to_owned()),
-            artifact_filename: if legacy_cleanup_pending {
-                model
-                    .local_path
-                    .as_deref()
-                    .and_then(Path::file_name)
-                    .map(|filename| filename.to_string_lossy().into_owned())
-            } else {
-                manifest.map(|manifest| manifest.artifact_filename.to_owned())
-            },
+            artifact_filename: manifest.map(|manifest| manifest.artifact_filename.to_owned()),
             artifact_path: model
                 .local_path
                 .as_ref()
@@ -11726,13 +10033,12 @@ impl LocalTranscriberApp {
             bundled,
             included,
             installed,
-            legacy_cleanup_pending,
             selected,
             active,
             ready: installed && runtime_ready,
             recommended: descriptor.is_some_and(|descriptor| descriptor.recommended),
             custom,
-            install_supported: supports_managed_install(model),
+            install_supported: supports_managed_install(&self.config, model),
             install_action_enabled: !install_admission_blocked
                 && partial_inspection_error.is_none()
                 && !installed
@@ -11740,20 +10046,16 @@ impl LocalTranscriberApp {
                     install_status,
                     ModelInstallStatus::Downloading { .. } | ModelInstallStatus::InstallingRuntime
                 )
-                && supports_managed_install(model),
+                && supports_managed_install(&self.config, model),
             primary_action_label,
             primary_action_enabled,
-            primary_action_installs_upgrade,
-            primary_action_repairs_runtime,
             primary_action_disabled_reason,
             cancel_supported: onnx_install_active
                 || install_phase.is_some_and(ArtifactInstallPhase::allows_cancellation),
             removal_supported: (bundled && model.id == BUNDLED_BASE_MODEL_ID && installed)
                 || (!bundled
                     && !custom
-                    && (imported_gguf
-                        || app_owned_legacy_artifact
-                        || supports_managed_uninstall(model, &install_status))),
+                    && (imported_gguf || supports_managed_uninstall(model, &install_status))),
             partial_cleanup_available,
             partial_cleanup_enabled: partial_cleanup_available && has_partial && !mutation_blocked,
             partial_cleanup_disabled_reason: if partial_cleanup_available {
@@ -11761,11 +10063,7 @@ impl LocalTranscriberApp {
             } else {
                 None
             },
-            runtime_status_label: if legacy_cleanup_pending {
-                "Legacy model — upgrade available".to_owned()
-            } else {
-                String::new()
-            },
+            runtime_status_label: String::new(),
             download_state,
             downloaded_bytes,
             total_bytes,
@@ -11862,9 +10160,7 @@ impl LocalTranscriberApp {
                         model.id == BUNDLED_BASE_MODEL_ID
                             && model.artifact_origin == ModelArtifactOrigin::Bundled
                     });
-                let replacement_required = active
-                    && !bundled
-                    && !app_owned_legacy_cleanup_artifact_for_id(&self.config, &id);
+                let replacement_required = active && !bundled;
                 let replacement = active
                     .then(|| self.active_model_removal_replacement(&id))
                     .flatten();
@@ -11994,15 +10290,6 @@ impl LocalTranscriberApp {
                     self.start_model_download(&model);
                 }
             }
-            ScreenAction::UpgradeModel(id) => {
-                if let Some(model) = config::configured_models(&self.config)
-                    .into_iter()
-                    .find(|model| model.id == id)
-                    && config::model_needs_pinned_gguf_migration(&self.config, &model)
-                {
-                    self.start_model_download(&model);
-                }
-            }
             ScreenAction::CancelModelInstall(id) => {
                 self.cancel_artifact_install(&id);
             }
@@ -12030,13 +10317,11 @@ impl LocalTranscriberApp {
                         model.id == BUNDLED_BASE_MODEL_ID
                             && model.artifact_origin == ModelArtifactOrigin::Bundled
                     });
-                let legacy_cleanup_pending =
-                    app_owned_legacy_cleanup_artifact_for_id(&self.config, &id);
                 let mut replacement_name = None;
                 if bundled {
                     self.model_management.removal_replacement = None;
                 }
-                if active && !legacy_cleanup_pending && !bundled {
+                if active && !bundled {
                     let expected = self.model_management.removal_replacement.take();
                     let replacement = expected.as_deref().and_then(|expected_id| {
                         self.active_model_removal_replacement(&id)
@@ -12082,37 +10367,6 @@ impl LocalTranscriberApp {
                             );
                         }
                         self.model_management.restore_remove_focus = Some(id);
-                    }
-                }
-            }
-            ScreenAction::RepairModelRuntime(id) => {
-                if let Some(model) = config::configured_models(&self.config)
-                    .into_iter()
-                    .find(|model| model.id == id)
-                {
-                    self.request_runtime_install(&model, RuntimeJobIntent::RepairModel(id));
-                }
-            }
-            ScreenAction::MaintainModelRuntime(id) => {
-                if let Some(model) = config::configured_models(&self.config)
-                    .into_iter()
-                    .find(|model| model.id == id)
-                    && let Some(provider) =
-                        compatibility_bridge::provider_for_legacy_model(&self.config, &model)
-                {
-                    let state = runtime_action_state_with_activity(
-                        &self.config,
-                        &model,
-                        self.runtime_jobs.contains_key(provider.id()),
-                        self.runtime_consumer_activity(provider.id()),
-                    );
-                    if state.enabled {
-                        match state.kind {
-                            RuntimeActionKind::Install | RuntimeActionKind::Update => {
-                                self.request_runtime_install(&model, RuntimeJobIntent::Maintenance)
-                            }
-                            RuntimeActionKind::Uninstall => self.uninstall_runtime(&model),
-                        }
                     }
                 }
             }
@@ -13307,7 +11561,6 @@ impl LocalTranscriberApp {
             | ScreenAction::SelectModel(_)
             | ScreenAction::SelectQuickModel(_)
             | ScreenAction::InstallModel(_)
-            | ScreenAction::UpgradeModel(_)
             | ScreenAction::CancelModelInstall(_)
             | ScreenAction::DiscardModelPartial(_)
             | ScreenAction::ToggleModelCardDetails(_)
@@ -13341,9 +11594,7 @@ impl LocalTranscriberApp {
             | ScreenAction::UseRemoteCatalogModel(_)
             | ScreenAction::RemoveRemoteCatalogModel(_)
             | ScreenAction::DiscardRemoteCatalogPartial { .. } => {}
-            ScreenAction::RepairModelRuntime(_)
-            | ScreenAction::MaintainModelRuntime(_)
-            | ScreenAction::SetLocalGgufImportPath(_)
+            ScreenAction::SetLocalGgufImportPath(_)
             | ScreenAction::ValidateAndImportLocalGguf
             | ScreenAction::CancelLocalGgufImport => {}
         }
@@ -13640,9 +11891,7 @@ fn installed_remote_artifacts(
         })
         .collect::<InstalledRemoteArtifacts>();
 
-    for model in models.iter().filter(|model| {
-        model.installed && !model.legacy_cleanup_pending && !model.primary_action_installs_upgrade
-    }) {
+    for model in models.iter().filter(|model| model.installed) {
         let model_id = ModelId::new(&model.id);
         let Some(manifest) = crate::model_catalog::runtime_model_manifest(&model_id) else {
             continue;
@@ -14717,448 +12966,8 @@ fn model_variant_label(model: &SttModelInfo, descriptor: Option<&ModelDescriptor
 }
 
 fn model_download_total_bytes(model: &SttModelInfo) -> Option<u64> {
-    compatibility_bridge::model_download_total_bytes(model)
-}
-
-fn build_development_runtime_package(
-    runtime_id: &str,
-    runtime_label: &str,
-    package: DevelopmentRuntimePackage,
-) -> Result<RuntimeReplacement, String> {
-    let relative_executable = package
-        .executable_path
-        .strip_prefix(&package.destination_root)
-        .map_err(|_| {
-            format!(
-                "Runtime executable {} is outside destination {}.",
-                package.executable_path.display(),
-                package.destination_root.display()
-            )
-        })?
-        .to_path_buf();
-    let stage_root = runtime_transaction_path(&package.destination_root, "installing");
-    let staged_package = DevelopmentRuntimePackage {
-        script: package.script,
-        destination_env: package.destination_env,
-        executable_path: stage_root.join(&relative_executable),
-        destination_root: stage_root.clone(),
-    };
-    remove_path_if_exists(&stage_root)?;
-    if let Err(message) = build_development_runtime_into(runtime_id, runtime_label, &staged_package)
-    {
-        let _ = remove_path_if_exists(&stage_root);
-        return Err(message);
-    }
-    activate_staged_runtime(&package.destination_root, &stage_root, &relative_executable)
-}
-
-fn build_development_runtime_into(
-    runtime_id: &str,
-    runtime_label: &str,
-    package: &DevelopmentRuntimePackage,
-) -> Result<(), String> {
-    if let Some(parent) = package.destination_root.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|err| format!("Could not create {}: {err}", parent.display()))?;
-    }
-
-    let output = Command::new(&package.script)
-        .env(package.destination_env, &package.destination_root)
-        .output()
-        .map_err(|err| format!("Could not run {}: {err}", package.script.display()))?;
-
-    if !output.status.success() {
-        return Err(format!(
-            "Could not build {} runtime with {}: {}",
-            runtime_label,
-            package.script.display(),
-            command_output_message(&output.stdout, &output.stderr)
-        ));
-    }
-
-    if !compatibility_bridge::entrypoint_is_usable(runtime_id, &package.executable_path) {
-        return Err(format!(
-            "{} runtime build finished but did not create a usable runtime at {}.",
-            runtime_label,
-            package.executable_path.display()
-        ));
-    }
-
-    Ok(())
-}
-
-fn install_runtime_files(
-    runtime_id: &str,
-    packaged_executable: &Path,
-) -> Result<RuntimeReplacement, String> {
-    install_runtime_files_to(
-        runtime_id,
-        packaged_executable,
-        &config::runtime_storage_dir().join(runtime_id),
-    )
-}
-
-fn install_runtime_files_to(
-    runtime_id: &str,
-    packaged_executable: &Path,
-    target_root: &Path,
-) -> Result<RuntimeReplacement, String> {
-    let Some(source_root) = runtime_package_root(packaged_executable) else {
-        return Err(format!(
-            "Could not determine runtime package root for {}.",
-            packaged_executable.display()
-        ));
-    };
-    let relative_executable = packaged_executable
-        .strip_prefix(&source_root)
-        .map_err(|_| {
-            format!(
-                "Runtime executable {} is outside package root {}.",
-                packaged_executable.display(),
-                source_root.display()
-            )
-        })?
-        .to_path_buf();
-    if source_root == target_root {
-        return Err("The managed runtime cannot be used as its own update source.".to_owned());
-    }
-
-    let stage_root = runtime_transaction_path(target_root, "installing");
-    validate_runtime_copy_paths(&source_root, target_root, &stage_root)?;
-    remove_path_if_exists(&stage_root)?;
-    if let Err(message) = copy_dir_all(&source_root, &stage_root) {
-        let _ = remove_path_if_exists(&stage_root);
-        return Err(message);
-    }
-    let staged_executable = stage_root.join(&relative_executable);
-    if !compatibility_bridge::entrypoint_is_usable(runtime_id, &staged_executable) {
-        let _ = remove_path_if_exists(&stage_root);
-        return Err(format!(
-            "Runtime install did not create a usable runtime at {}.",
-            staged_executable.display()
-        ));
-    }
-    activate_staged_runtime(target_root, &stage_root, &relative_executable)
-}
-
-fn activate_staged_runtime(
-    target_root: &Path,
-    stage_root: &Path,
-    relative_executable: &Path,
-) -> Result<RuntimeReplacement, String> {
-    let parent = target_root
-        .parent()
-        .ok_or_else(|| format!("Runtime target {} has no parent.", target_root.display()))?;
-    fs::create_dir_all(parent)
-        .map_err(|err| format!("Could not create {}: {err}", parent.display()))?;
-
-    let backup_root = runtime_transaction_path(target_root, "backup");
-    remove_path_if_exists(&backup_root)?;
-    let previous = if target_root.exists() {
-        fs::rename(target_root, &backup_root).map_err(|err| {
-            format!(
-                "Could not preserve existing runtime {}: {err}",
-                target_root.display()
-            )
-        })?;
-        Some(backup_root)
-    } else {
-        None
-    };
-
-    if let Err(err) = fs::rename(stage_root, target_root) {
-        let restore_error = previous.as_ref().and_then(|backup_root| {
-            fs::rename(backup_root, target_root)
-                .err()
-                .map(|restore_err| format!(" Previous runtime restore also failed: {restore_err}"))
-        });
-        let _ = remove_path_if_exists(stage_root);
-        return Err(format!(
-            "Could not activate staged runtime {}: {err}",
-            stage_root.display()
-        ) + restore_error.as_deref().unwrap_or_default());
-    }
-
-    Ok(RuntimeReplacement {
-        installed_path: target_root.join(relative_executable),
-        target_root: target_root.to_path_buf(),
-        backup_root: previous,
-    })
-}
-
-impl RuntimeReplacement {
-    fn commit(self) -> Result<(), String> {
-        if let Some(backup_root) = self.backup_root {
-            remove_path_if_exists(&backup_root)?;
-        }
-        Ok(())
-    }
-
-    fn rollback(self) -> Result<(), String> {
-        remove_path_if_exists(&self.target_root)?;
-        if let Some(backup_root) = self.backup_root {
-            fs::rename(&backup_root, &self.target_root).map_err(|err| {
-                format!(
-                    "Could not restore previous runtime {}: {err}",
-                    self.target_root.display()
-                )
-            })?;
-        }
-        Ok(())
-    }
-}
-
-fn runtime_transaction_path(target_root: &Path, phase: &str) -> PathBuf {
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let name = target_root
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("runtime");
-    target_root.with_file_name(format!(".{name}.{phase}-{}-{nonce}", std::process::id()))
-}
-
-fn remove_path_if_exists(path: &Path) -> Result<(), String> {
-    if !path.exists() {
-        return Ok(());
-    }
-    let result = if path.is_dir() {
-        fs::remove_dir_all(path)
-    } else {
-        fs::remove_file(path)
-    };
-    result.map_err(|err| format!("Could not remove {}: {err}", path.display()))
-}
-
-fn managed_runtime_install_record(path: PathBuf, source: &str) -> config::ManagedRuntimeInstall {
-    let mut install = config::ManagedRuntimeInstall::app_managed(path.clone(), source);
-    if let Some(metadata) = runtime_manifest_metadata(&path) {
-        install.version = metadata
-            .version
-            .map(|version| version.trim().to_owned())
-            .filter(|version| !version.is_empty());
-        install.sha256 = metadata
-            .sha256
-            .or(metadata.checksum)
-            .map(|sha256| sha256.trim().to_owned())
-            .filter(|sha256| !sha256.is_empty());
-    }
-    install
-}
-
-fn runtime_manifest_metadata(executable: &Path) -> Option<RuntimeManifestMetadata> {
-    let manifest = runtime_package_root(executable)?.join("runtime-manifest.json");
-    let contents = fs::read_to_string(manifest).ok()?;
-    serde_json::from_str(&contents).ok()
-}
-
-fn command_output_message(stdout: &[u8], stderr: &[u8]) -> String {
-    let stderr = String::from_utf8_lossy(stderr).trim().to_owned();
-    if !stderr.is_empty() {
-        return stderr;
-    }
-    let stdout = String::from_utf8_lossy(stdout).trim().to_owned();
-    if stdout.is_empty() {
-        "process exited without an error message".to_owned()
-    } else {
-        stdout
-    }
-}
-
-fn runtime_package_root(executable: &Path) -> Option<PathBuf> {
-    let metadata = fs::symlink_metadata(executable).ok()?;
-    if runtime_entry_is_link(&metadata) || !metadata.is_file() {
-        return None;
-    }
-    let parent = executable.parent()?;
-    if parent.file_name().is_some_and(|name| name == "bin") {
-        parent.parent().map(Path::to_path_buf)
-    } else {
-        None
-    }
-}
-
-fn validate_runtime_copy_paths(
-    source_root: &Path,
-    target_root: &Path,
-    stage_root: &Path,
-) -> Result<(), String> {
-    let metadata = fs::symlink_metadata(source_root)
-        .map_err(|err| format!("Could not inspect {}: {err}", source_root.display()))?;
-    if runtime_entry_is_link(&metadata) {
-        return Err(format!(
-            "Runtime package root {} cannot be a symbolic link or reparse point.",
-            source_root.display()
-        ));
-    }
-    if !metadata.is_dir() {
-        return Err(format!(
-            "Runtime package root {} is not a directory.",
-            source_root.display()
-        ));
-    }
-
-    let canonical_source = canonicalize_runtime_path(source_root)?;
-    for (label, path) in [("target", target_root), ("staging target", stage_root)] {
-        let canonical_path = canonicalize_runtime_path(path)?;
-        if canonical_path == canonical_source
-            || canonical_path.starts_with(&canonical_source)
-            || canonical_source.starts_with(&canonical_path)
-        {
-            return Err(format!(
-                "Runtime package {} cannot overlap the managed runtime {label} {}.",
-                source_root.display(),
-                path.display()
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn canonicalize_runtime_path(path: &Path) -> Result<PathBuf, String> {
-    let mut unresolved = Vec::new();
-    let mut current = path;
-    loop {
-        match current.canonicalize() {
-            Ok(mut canonical) => {
-                for component in unresolved.iter().rev() {
-                    canonical.push(component);
-                }
-                return Ok(canonical);
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                let name = current.file_name().ok_or_else(|| {
-                    format!("Could not resolve runtime path {}: {err}", path.display())
-                })?;
-                unresolved.push(name.to_os_string());
-                current = current.parent().ok_or_else(|| {
-                    format!("Could not resolve runtime path {}: {err}", path.display())
-                })?;
-            }
-            Err(err) => {
-                return Err(format!(
-                    "Could not resolve runtime path {}: {err}",
-                    path.display()
-                ));
-            }
-        }
-    }
-}
-
-fn runtime_entry_is_link(metadata: &fs::Metadata) -> bool {
-    if metadata.file_type().is_symlink() {
-        return true;
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-
-        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-    }
-    #[cfg(not(windows))]
-    {
-        false
-    }
-}
-
-fn copy_dir_all(source: &Path, target: &Path) -> Result<(), String> {
-    fs::create_dir_all(target)
-        .map_err(|err| format!("Could not create {}: {err}", target.display()))?;
-    for entry in
-        fs::read_dir(source).map_err(|err| format!("Could not read {}: {err}", source.display()))?
-    {
-        let entry = entry.map_err(|err| format!("Could not read {}: {err}", source.display()))?;
-        let source_path = entry.path();
-        let target_path = target.join(entry.file_name());
-        let metadata = fs::symlink_metadata(&source_path)
-            .map_err(|err| format!("Could not inspect {}: {err}", source_path.display()))?;
-        if runtime_entry_is_link(&metadata) {
-            return Err(format!(
-                "Runtime package entry {} cannot be a symbolic link or reparse point.",
-                source_path.display()
-            ));
-        }
-        if metadata.is_dir() {
-            copy_dir_all(&source_path, &target_path)?;
-        } else if metadata.is_file() {
-            fs::copy(&source_path, &target_path).map_err(|err| {
-                format!(
-                    "Could not copy {} to {}: {err}",
-                    source_path.display(),
-                    target_path.display()
-                )
-            })?;
-        } else {
-            return Err(format!(
-                "Runtime package entry {} is not a regular file or directory.",
-                source_path.display()
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn runtime_uninstall_target(
-    storage_dir: &Path,
-    runtime_id: &str,
-    installed_path: &Path,
-) -> Option<PathBuf> {
-    let mut runtime_components = Path::new(runtime_id).components();
-    if installed_path.as_os_str().is_empty()
-        || installed_path
-            .components()
-            .any(|component| matches!(component, std::path::Component::ParentDir))
-        || !matches!(
-            runtime_components.next(),
-            Some(std::path::Component::Normal(_))
-        )
-        || runtime_components.next().is_some()
-    {
-        return None;
-    }
-
-    let runtime_dir = storage_dir.join(runtime_id);
-    let storage_canonical = storage_dir.canonicalize().ok()?;
-    let installed_canonical = installed_path.canonicalize().ok()?;
-    if !installed_canonical.starts_with(&storage_canonical)
-        || path_has_link_below(storage_dir, installed_path)
-    {
-        return None;
-    }
-    if let Ok(runtime_canonical) = runtime_dir.canonicalize()
-        && installed_canonical.starts_with(&runtime_canonical)
-        && runtime_canonical.starts_with(&storage_canonical)
-        && !path_has_link_below(storage_dir, &runtime_dir)
-    {
-        Some(runtime_dir)
-    } else if installed_path.starts_with(storage_dir) {
-        Some(installed_path.to_path_buf())
-    } else {
-        None
-    }
-}
-
-fn path_has_link_below(root: &Path, path: &Path) -> bool {
-    let Ok(relative) = path.strip_prefix(root) else {
-        return true;
-    };
-    let mut current = root.to_path_buf();
-    for component in relative.components() {
-        if !matches!(component, std::path::Component::Normal(_)) {
-            return true;
-        }
-        current.push(component.as_os_str());
-        let Ok(metadata) = fs::symlink_metadata(&current) else {
-            return true;
-        };
-        if runtime_entry_is_link(&metadata) {
-            return true;
-        }
-    }
-    false
+    crate::model_catalog::runtime_model_manifest(&ModelId::new(&model.id))
+        .map(|manifest| manifest.artifact_size_bytes)
 }
 
 fn is_app_managed_model_path(config: &AppConfig, path: &Path) -> bool {
@@ -15174,42 +12983,6 @@ fn is_app_managed_model_path(config: &AppConfig, path: &Path) -> bool {
         .ok()
         .zip(storage.canonicalize().ok())
         .is_some_and(|(path, storage)| path.starts_with(storage))
-}
-
-/// Returns true only for a retained GGML filename at Scribe's own canonical
-/// legacy catalog location. It deliberately excludes `model_paths` and any
-/// outside-storage path so an imported or user-owned artifact can never be
-/// staged for deletion merely because it shares a catalog model ID.
-fn app_owned_legacy_catalog_artifact(config: &AppConfig, model: &SttModelInfo) -> bool {
-    let Some(path) = model.local_path.as_deref() else {
-        return false;
-    };
-    let Some(legacy_path) = config::legacy_downloaded_model_path(config, model) else {
-        return false;
-    };
-    path == legacy_path && is_app_managed_model_path(config, path)
-}
-
-fn app_owned_legacy_cleanup_artifact(config: &AppConfig, model: &SttModelInfo) -> bool {
-    app_owned_legacy_catalog_artifact(config, model)
-        && model
-            .local_path
-            .as_deref()
-            .and_then(Path::file_name)
-            .and_then(|filename| filename.to_str())
-            .is_some_and(|filename| {
-                matches!(
-                    filename,
-                    "ggml-base.en.bin" | "ggml-small.en.bin" | "ggml-medium.en.bin"
-                )
-            })
-}
-
-fn app_owned_legacy_cleanup_artifact_for_id(config: &AppConfig, model_id: &str) -> bool {
-    config::configured_models(config)
-        .into_iter()
-        .find(|model| model.id == model_id)
-        .is_some_and(|model| app_owned_legacy_cleanup_artifact(config, &model))
 }
 
 #[cfg(test)]
@@ -15383,19 +13156,9 @@ fn runtime_status_for_model(config: &AppConfig, model: &SttModelInfo) -> ModelRu
             }
         };
     }
-    let Some(provider) = compatibility_bridge::provider_for_legacy_model(config, model) else {
-        return ModelRuntimeStatus::Error("Model provider is not available.".to_owned());
-    };
-
-    match provider.model_install_status(model) {
-        ModelInstallStatus::Installed => provider.runtime_status(config),
-        ModelInstallStatus::Downloading { .. } => ModelRuntimeStatus::Downloading,
-        ModelInstallStatus::InstallingRuntime => ModelRuntimeStatus::Downloading,
-        ModelInstallStatus::NotInstalled => ModelRuntimeStatus::NotInstalled,
-        ModelInstallStatus::Missing => ModelRuntimeStatus::MissingConfiguration,
-        ModelInstallStatus::Error(message) => ModelRuntimeStatus::Error(message),
-        ModelInstallStatus::RuntimeError(message) => ModelRuntimeStatus::Error(message),
-    }
+    ModelRuntimeStatus::Error(
+        "Model is not supported by the packaged inference engines.".to_owned(),
+    )
 }
 
 fn runtime_status_for_id(config: &AppConfig, model_id: &str) -> ModelRuntimeStatus {
@@ -19530,60 +17293,6 @@ mod layout_tests {
     }
 
     #[test]
-    fn live_model_projection_exposes_details_actions_for_ready_models() {
-        let mut app = test_app();
-        let base_fixture = install_test_catalog_model(&mut app, "whisper_cpp_base_en");
-
-        let selected = app.transcribe_screen_models();
-        assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].display_name, "Whisper Tiny — English");
-        assert_eq!(selected[0].variant_label, "tiny.en");
-
-        app.config.general.selected_default_model = "not-selected".to_owned();
-        app.remote_catalog.invalidate_local_models();
-        app.rebuild_model_inventory_projection();
-
-        let ready = app
-            .model_management_catalog()
-            .into_iter()
-            .find(|model| model.id == "whisper_cpp_tiny_en")
-            .expect("tiny model should be projected");
-        assert!(ready.installed);
-        assert!(ready.ready);
-        assert!(!ready.active);
-        assert_eq!(ready.primary_action_label, "Use this model");
-        assert!(ready.primary_action_enabled);
-        assert!(!ready.primary_action_repairs_runtime);
-        assert_eq!(ready.primary_action_disabled_reason, None);
-        assert_eq!(ready.display_name, "Whisper Tiny — English");
-        assert_eq!(ready.variant_label, "tiny.en");
-
-        assert!(
-            app.model_management_catalog()
-                .iter()
-                .any(|model| model.id == "whisper_cpp_base_en" && model.installed),
-            "an installed retained-compatibility model must remain manageable"
-        );
-
-        app.config.general.selected_default_model = "whisper_cpp_tiny_en".to_owned();
-        app.remote_catalog.invalidate_local_models();
-        app.rebuild_model_inventory_projection();
-        let active = app
-            .model_management_catalog()
-            .into_iter()
-            .find(|model| model.id == "whisper_cpp_tiny_en")
-            .expect("active tiny model should be projected");
-        assert!(active.active);
-        assert_eq!(active.primary_action_label, "Active");
-        assert!(!active.primary_action_enabled);
-        assert_eq!(
-            active.primary_action_disabled_reason.as_deref(),
-            Some("This model is already active.")
-        );
-        let _ = fs::remove_file(base_fixture);
-    }
-
-    #[test]
     fn bundled_model_projection_is_included_ready_and_non_removable() {
         let app = test_app();
         let mut model = config::configured_models(&app.config)
@@ -19683,287 +17392,6 @@ mod layout_tests {
         assert!(app.status_message.contains("did not match"));
         assert!(app.status_message.contains("no file was removed"));
         fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn legacy_model_projection_exposes_upgrade_without_changing_its_stable_id() {
-        let root = std::env::temp_dir().join(format!(
-            "scribe-app-legacy-upgrade-{}-{}",
-            std::process::id(),
-            NEXT_TEST_SESSION.fetch_add(1, Ordering::Relaxed)
-        ));
-        let legacy = root.join("external").join("ggml-small.en.bin");
-        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
-        fs::write(&legacy, b"legacy GGML").unwrap();
-
-        let mut app = test_app();
-        app.config.general.model_storage_dir = root.clone();
-        app.config.general.selected_default_model = "whisper_cpp_small_en".to_owned();
-        app.config
-            .general
-            .model_paths
-            .insert("whisper_cpp_small_en".to_owned(), legacy.clone());
-        config::normalize_config(&mut app.config);
-        let model = config::selected_model(&app.config).unwrap();
-
-        let projected = app.model_management_view_model(&model, None, &PartialInspection::Missing);
-
-        assert_eq!(projected.id, "whisper_cpp_small_en");
-        assert_eq!(projected.primary_action_label, "Upgrade model");
-        assert!(projected.primary_action_enabled);
-        assert!(projected.primary_action_installs_upgrade);
-        assert!(!projected.primary_action_repairs_runtime);
-        assert!(projected.installed);
-        assert!(!projected.legacy_cleanup_pending);
-        assert!(projected.custom);
-        assert!(!projected.removal_supported);
-        assert!(legacy.is_file());
-        assert_eq!(
-            app.config.general.selected_default_model,
-            "whisper_cpp_small_en"
-        );
-        let blocked = app.model_management_view_model(
-            &model,
-            None,
-            &PartialInspection::Error(
-                "Scribe can't safely manage this partial file. Remove it from model storage, then retry."
-                    .to_owned(),
-            ),
-        );
-        assert!(blocked.primary_action_installs_upgrade);
-        assert!(!blocked.primary_action_enabled);
-        assert!(
-            blocked
-                .primary_action_disabled_reason
-                .as_deref()
-                .is_some_and(|reason| reason.contains("Remove it from model storage"))
-        );
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn app_owned_legacy_model_is_selected_but_unavailable_and_removable() {
-        let root = std::env::temp_dir().join(format!(
-            "scribe-app-owned-legacy-{}-{}",
-            std::process::id(),
-            NEXT_TEST_SESSION.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = fs::remove_dir_all(&root);
-
-        let mut app = test_app();
-        app.config.general.model_storage_dir = root.clone();
-        app.config.general.selected_default_model = "whisper_cpp_base_en".to_owned();
-        let catalog_model = config::configured_models(&app.config)
-            .into_iter()
-            .find(|model| model.id == "whisper_cpp_base_en")
-            .expect("base catalog model");
-        let legacy = config::legacy_downloaded_model_path(&app.config, &catalog_model)
-            .expect("base legacy path");
-        fs::create_dir_all(legacy.parent().expect("legacy parent")).unwrap();
-        fs::write(&legacy, b"legacy GGML").unwrap();
-        config::normalize_config(&mut app.config);
-        let model = config::selected_model(&app.config).expect("selected base model");
-
-        let projected = app.model_management_view_model(&model, None, &PartialInspection::Missing);
-
-        assert!(app_owned_legacy_catalog_artifact(&app.config, &model));
-        assert!(app_owned_legacy_cleanup_artifact(&app.config, &model));
-        assert!(!projected.installed);
-        assert!(projected.legacy_cleanup_pending);
-        assert!(projected.selected);
-        assert!(!projected.ready);
-        assert!(!projected.active);
-        assert_eq!(projected.download_state, ModelDownloadState::NotInstalled);
-        assert_eq!(projected.primary_action_label, "Upgrade model");
-        assert!(projected.primary_action_installs_upgrade);
-        assert!(projected.removal_supported);
-        assert_eq!(
-            projected.artifact_filename.as_deref(),
-            Some("ggml-base.en.bin")
-        );
-        assert_eq!(
-            projected.description.as_deref(),
-            Some(catalog_model.description.as_str()),
-            "legacy lifecycle state must preserve the catalog description"
-        );
-        assert_eq!(
-            projected.runtime_status_label,
-            "Legacy model — upgrade available"
-        );
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn canonical_legacy_base_small_and_medium_are_available_cleanup_rows() {
-        let root = std::env::temp_dir().join(format!(
-            "scribe-app-legacy-cleanup-{}-{}",
-            std::process::id(),
-            NEXT_TEST_SESSION.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = fs::remove_dir_all(&root);
-        let mut app = test_app();
-        app.config.general.model_storage_dir = root.clone();
-        let legacy_ids = [
-            "whisper_cpp_base_en",
-            "whisper_cpp_small_en",
-            "whisper_cpp_medium_en",
-        ];
-        let mut legacy_paths = Vec::new();
-
-        for id in legacy_ids {
-            let model = config::configured_models(&app.config)
-                .into_iter()
-                .find(|model| model.id == id)
-                .expect("legacy catalog model");
-            let path = config::legacy_downloaded_model_path(&app.config, &model)
-                .expect("canonical legacy path");
-            fs::create_dir_all(path.parent().expect("legacy parent")).unwrap();
-            fs::write(&path, b"legacy GGML").unwrap();
-            legacy_paths.push(path);
-        }
-        config::normalize_config(&mut app.config);
-        app.remote_catalog.invalidate_local_models();
-        app.rebuild_model_inventory_projection();
-
-        let rows = app
-            .model_management_catalog()
-            .into_iter()
-            .filter(|model| legacy_ids.contains(&model.id.as_str()))
-            .collect::<Vec<_>>();
-        assert_eq!(rows.len(), 3);
-        assert_eq!(rows.iter().filter(|model| model.installed).count(), 0);
-        assert_eq!(rows.iter().filter(|model| !model.installed).count(), 3);
-        assert_eq!(
-            rows.iter()
-                .map(|model| model.id.as_str())
-                .collect::<Vec<_>>(),
-            legacy_ids
-        );
-        assert!(rows.iter().all(|model| {
-            model.legacy_cleanup_pending
-                && model.primary_action_installs_upgrade
-                && model.primary_action_label == "Upgrade model"
-                && model.removal_supported
-                && model.description.as_deref().is_some_and(|description| {
-                    !description.is_empty()
-                        && !description.contains("retained for cleanup")
-                        && !description.contains("Legacy GGML")
-                })
-        }));
-        assert!(legacy_paths.iter().all(|path| path.is_file()));
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn verified_managed_gguf_supersedes_the_retained_legacy_cleanup_row() {
-        let root = std::env::temp_dir().join(format!(
-            "scribe-app-legacy-superseded-{}-{}",
-            std::process::id(),
-            NEXT_TEST_SESSION.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = fs::remove_dir_all(&root);
-        let mut app = test_app();
-        app.config.general.model_storage_dir = root.clone();
-        let catalog_model = config::configured_models(&app.config)
-            .into_iter()
-            .find(|model| model.id == "whisper_cpp_base_en")
-            .expect("base catalog model");
-        let legacy = config::legacy_downloaded_model_path(&app.config, &catalog_model)
-            .expect("base legacy path");
-        let gguf =
-            config::downloaded_model_path(&app.config, &catalog_model).expect("base GGUF path");
-        fs::create_dir_all(legacy.parent().expect("legacy parent")).unwrap();
-        fs::create_dir_all(gguf.parent().expect("GGUF parent")).unwrap();
-        fs::write(&legacy, b"legacy GGML").unwrap();
-        fs::write(&gguf, b"verified GGUF").unwrap();
-        let manifest =
-            crate::model_catalog::runtime_model_manifest(&ModelId::new("whisper_cpp_base_en"))
-                .expect("base manifest");
-        let mut install =
-            config::ManagedModelInstall::app_managed(gguf.clone(), "verified-manifest-download");
-        install.sha256 = Some(manifest.artifact_sha256.to_owned());
-        app.config
-            .general
-            .managed_models
-            .insert("whisper_cpp_base_en".to_owned(), install);
-        config::normalize_config(&mut app.config);
-        app.remote_catalog.invalidate_local_models();
-        app.rebuild_model_inventory_projection();
-
-        let configured = config::configured_models(&app.config)
-            .into_iter()
-            .find(|model| model.id == "whisper_cpp_base_en")
-            .expect("configured base model");
-        let projected = app
-            .model_management_catalog()
-            .into_iter()
-            .find(|model| model.id == "whisper_cpp_base_en")
-            .expect("projected base model");
-        assert_eq!(configured.local_path.as_deref(), Some(gguf.as_path()));
-        assert!(projected.installed);
-        assert!(!projected.legacy_cleanup_pending);
-        assert!(!projected.primary_action_installs_upgrade);
-        assert_eq!(
-            projected.artifact_filename.as_deref(),
-            Some(manifest.artifact_filename)
-        );
-        assert!(legacy.is_file(), "superseding GGUF must not delete legacy");
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn live_model_projection_exposes_repair_for_an_installed_runtime_failure() {
-        let app = test_app();
-        let descriptor = app
-            .transcription_service
-            .model_descriptor(&ModelId::new("whisper_cpp_tiny_en"))
-            .unwrap();
-        let model = SttModelInfo {
-            id: "installed-without-provider".to_owned(),
-            name: "Local compatibility model".to_owned(),
-            backend: "Unavailable runtime".to_owned(),
-            description: "Installed model with a missing runtime provider.".to_owned(),
-            expected_ram: "1 GB".to_owned(),
-            accuracy_tier: "Unknown".to_owned(),
-            speed_tier: "Unknown".to_owned(),
-            local_path: None,
-            artifact_origin: ModelArtifactOrigin::Catalog,
-            install_status: ModelInstallStatus::Installed,
-            download_model: None,
-        };
-
-        let projected =
-            app.model_management_view_model(&model, Some(&descriptor), &PartialInspection::Missing);
-
-        assert!(projected.installed);
-        assert!(!projected.ready);
-        assert_eq!(projected.primary_action_label, "Repair runtime");
-        assert!(projected.primary_action_repairs_runtime);
-        assert!(!projected.primary_action_enabled);
-        assert!(projected.capabilities.capabilities_known);
-        assert_eq!(
-            projected.capabilities,
-            ui_model_capabilities(Some(&descriptor))
-        );
-        assert_eq!(
-            projected.primary_action_disabled_reason.as_deref(),
-            Some("This model has no compatible local provider.")
-        );
-        let inspection_error = app.model_management_view_model(
-            &model,
-            Some(&descriptor),
-            &PartialInspection::Error("unsafe retained partial".to_owned()),
-        );
-        assert_eq!(inspection_error.primary_action_label, "Repair runtime");
-        assert_eq!(
-            inspection_error.primary_action_disabled_reason,
-            projected.primary_action_disabled_reason
-        );
-        assert!(inspection_error.partial_cleanup_available);
-        assert!(!inspection_error.partial_cleanup_enabled);
     }
 
     #[test]
@@ -21097,7 +18525,6 @@ mod layout_tests {
             capturing_hotkey: false,
             transcribe_record_focus_pending: false,
             model_downloads: HashMap::new(),
-            runtime_jobs: HashMap::new(),
             artifact_installations: ArtifactInstallCoordinator::default(),
             onnx_bundle_install: None,
             discard_partial_after_install: HashMap::new(),
@@ -21796,13 +19223,6 @@ mod layout_tests {
                 result: Box::new(VerifiedInstallResult {
                     model: model_replacement,
                     manifest: manifest_replacement,
-                    runtime: None,
-                    runtime_id: "fixture-runtime".into(),
-                    runtime_entrypoint: None,
-                    runtime_version: None,
-                    runtime_package_id: None,
-                    runtime_archive_sha256: None,
-                    retain_runtime_as_previous: false,
                     model_sha256,
                     smoke,
                     journal,
@@ -21896,67 +19316,6 @@ mod layout_tests {
         ));
         assert!(app.status_message.contains("No retained partial"));
         assert!(!destination.exists());
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn active_artifact_and_runtime_jobs_block_partial_cleanup() {
-        let root = partial_cleanup_test_root("active-jobs");
-        let mut app = test_app();
-        app.config.general.model_storage_dir = root.clone();
-        let model_id = ModelId::new("whisper_cpp_tiny_en");
-        let model = config::configured_models(&app.config)
-            .into_iter()
-            .find(|model| model.id == model_id.as_str())
-            .unwrap();
-        let destination = config::downloaded_model_path(&app.config, &model).unwrap();
-        let partial = partial_sidecar(&destination);
-        fs::create_dir_all(partial.parent().unwrap()).unwrap();
-        fs::write(&partial, b"retained partial").unwrap();
-        let active_cancellation = InstallCancellation::default();
-        app.artifact_installations.insert(
-            model_id.as_str().to_owned(),
-            (1, active_cancellation.clone()),
-        );
-        app.remote_catalog.invalidate_local_models();
-        app.rebuild_model_inventory_projection();
-
-        let active_view = app
-            .model_management_catalog()
-            .into_iter()
-            .find(|model| model.id == model_id.as_str())
-            .unwrap();
-        assert!(!active_view.partial_cleanup_available);
-        app.apply_model_management_action(ScreenAction::DiscardModelPartial(
-            model_id.as_str().to_owned(),
-        ));
-        assert_eq!(fs::read(&partial).unwrap(), b"retained partial");
-        assert!(active_cancellation.is_cancelled());
-        assert_eq!(
-            app.discard_partial_after_install
-                .get(model_id.as_str())
-                .map(|(job_id, _)| *job_id),
-            Some(1)
-        );
-        assert!(app.status_message.contains("after it exits"));
-
-        app.artifact_installations.remove(model_id.as_str());
-        app.discard_partial_after_install.remove(model_id.as_str());
-        app.runtime_jobs
-            .insert("queued-runtime".to_owned(), RuntimeInstallJob::default());
-        app.remote_catalog.invalidate_local_models();
-        app.rebuild_model_inventory_projection();
-        let runtime_blocked_view = app
-            .model_management_catalog()
-            .into_iter()
-            .find(|model| model.id == model_id.as_str())
-            .unwrap();
-        assert!(runtime_blocked_view.partial_cleanup_available);
-        assert!(!runtime_blocked_view.partial_cleanup_enabled);
-        app.apply_model_management_action(ScreenAction::DiscardModelPartial(
-            model_id.as_str().to_owned(),
-        ));
-        assert_eq!(fs::read(&partial).unwrap(), b"retained partial");
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -22542,127 +19901,6 @@ mod layout_tests {
         }));
         assert!(installed_variant.actions.iter().any(|action| {
             matches!(action.kind, RemoteCatalogActionKind::Remove { ref model_id } if model_id == &id)
-        }));
-
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn normalized_remote_identity_requires_verified_current_artifact_provenance() {
-        let root = partial_cleanup_test_root("normalized-remote-identity");
-        let _ = fs::remove_dir_all(&root);
-        let mut app = test_app();
-        app.config.general.model_storage_dir = root.clone();
-        let model_id = ModelId::new("whisper_cpp_small_en");
-        let manifest = crate::model_catalog::runtime_model_manifest(&model_id).unwrap();
-        let remote = RemoteModel {
-            id: manifest.artifact_repository.to_owned(),
-            revision: manifest.artifact_revision.to_owned(),
-            display_name: "Normalized provenance fixture".to_owned(),
-            description: "fixture".to_owned(),
-            languages: vec!["en".to_owned()],
-            recommended: false,
-            trust: crate::huggingface_catalog::ModelTrust::TrustedPublisher,
-            compatibility: crate::huggingface_catalog::ModelCompatibility::Experimental(
-                "fixture".to_owned(),
-            ),
-            variants: vec![crate::huggingface_catalog::RemoteModelVariant {
-                id: "exact".to_owned(),
-                filename: manifest.artifact_filename.to_owned(),
-                size_bytes: manifest.artifact_size_bytes,
-                expected_sha256: manifest.artifact_sha256.to_owned(),
-            }],
-        };
-        app.remote_catalog.partial_inspections.insert(
-            (remote.id.clone(), "exact".to_owned()),
-            PartialInspection::Missing,
-        );
-        let identity = remote_artifact_identity(
-            manifest.artifact_repository,
-            manifest.artifact_revision,
-            manifest.artifact_filename,
-        );
-
-        let legacy = root.join("external").join("ggml-small.en.bin");
-        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
-        fs::write(&legacy, b"legacy GGML").unwrap();
-        app.config
-            .general
-            .model_paths
-            .insert(model_id.to_string(), legacy);
-        config::normalize_config(&mut app.config);
-        app.remote_catalog.invalidate_local_models();
-        app.rebuild_model_inventory_projection();
-
-        let legacy_row = app
-            .remote_catalog
-            .local_models
-            .iter()
-            .find(|model| model.id == model_id.as_str())
-            .unwrap();
-        assert!(legacy_row.installed);
-        assert!(legacy_row.primary_action_installs_upgrade);
-        let legacy_artifacts =
-            installed_remote_artifacts(&app.remote_catalog.local_models, &app.config);
-        assert!(!legacy_artifacts.contains_key(&identity));
-        assert!(
-            filtered_remote_models(
-                std::slice::from_ref(&remote),
-                &legacy_artifacts,
-                "",
-                RemoteCatalogFilters {
-                    installed_only: true,
-                    ..Default::default()
-                },
-                RemoteCatalogSort::Name,
-                ModelLanguageFilter::All,
-            )
-            .is_empty()
-        );
-        let legacy_view = app.remote_catalog_entry_view(&remote, &legacy_artifacts);
-        assert_ne!(
-            legacy_view.variants[0].status_label.as_deref(),
-            Some("Installed and verified")
-        );
-        assert!(!legacy_view.variants[0].actions.iter().any(|action| {
-            matches!(
-                action.kind,
-                RemoteCatalogActionKind::Use { .. } | RemoteCatalogActionKind::Remove { .. }
-            )
-        }));
-
-        let primary = config::downloaded_model_path(
-            &app.config,
-            &config::configured_models(&app.config)
-                .into_iter()
-                .find(|model| model.id == model_id.as_str())
-                .unwrap(),
-        )
-        .unwrap();
-        fs::create_dir_all(primary.parent().unwrap()).unwrap();
-        fs::write(&primary, b"verified GGUF").unwrap();
-        let mut receipt =
-            config::ManagedModelInstall::app_managed(primary, "verified-manifest-download");
-        receipt.sha256 = Some(manifest.artifact_sha256.to_owned());
-        app.config
-            .general
-            .managed_models
-            .insert(model_id.to_string(), receipt);
-        config::normalize_config(&mut app.config);
-        app.remote_catalog.invalidate_local_models();
-        app.rebuild_model_inventory_projection();
-
-        let verified_artifacts =
-            installed_remote_artifacts(&app.remote_catalog.local_models, &app.config);
-        assert_eq!(verified_artifacts.get(&identity), Some(&model_id));
-        let view = app.remote_catalog_entry_view(&remote, &verified_artifacts);
-        let variant = &view.variants[0];
-        assert_eq!(
-            variant.status_label.as_deref(),
-            Some("Installed and verified")
-        );
-        assert!(variant.actions.iter().any(|action| {
-            matches!(action.kind, RemoteCatalogActionKind::Use { model_id: ref installed } if installed == model_id.as_str())
         }));
 
         fs::remove_dir_all(root).unwrap();
@@ -23690,32 +20928,6 @@ mod layout_tests {
         }
     }
 
-    fn write_whisper_cli_runtime(root: &Path) -> PathBuf {
-        let executable = root.join("bin").join(whisper_cli_name());
-        let manifest = root.join("runtime-manifest.json");
-        fs::create_dir_all(executable.parent().unwrap()).unwrap();
-        fs::write(&executable, b"whisper compatibility runtime").unwrap();
-        fs::write(manifest, r#"{"version":"v1.9.1"}"#).unwrap();
-        executable
-    }
-
-    fn whisper_cli_name() -> &'static str {
-        if cfg!(windows) {
-            "whisper-cli.exe"
-        } else {
-            "whisper-cli"
-        }
-    }
-
-    fn managed_runtime_with_version(
-        path: PathBuf,
-        version: Option<&str>,
-    ) -> config::ManagedRuntimeInstall {
-        let mut install = config::ManagedRuntimeInstall::new(path);
-        install.version = version.map(str::to_owned);
-        install
-    }
-
     fn coordinator_admission(
         target_name: &str,
         volume: &str,
@@ -23737,13 +20949,6 @@ mod layout_tests {
     }
 
     fn coordinator_prepared(model_id: &str) -> PreparedVerifiedInstall {
-        coordinator_prepared_with_runtime(model_id, true)
-    }
-
-    fn coordinator_prepared_with_runtime(
-        model_id: &str,
-        model_uses_embedded_runtime: bool,
-    ) -> PreparedVerifiedInstall {
         let model_id = ModelId::new(model_id);
         let destination = std::env::temp_dir().join("fixture.gguf");
         PreparedVerifiedInstall {
@@ -23756,44 +20961,11 @@ mod layout_tests {
                 target_identity: crate::disk_space::canonical_target_identity(&destination)
                     .unwrap(),
             },
-            model_uses_embedded_runtime,
             manifest_source: installed_manifest::ArtifactSource::normalized(&model_id).unwrap(),
             model_id,
             remote_install_request: None,
-            force_runtime_package: false,
         }
     }
-
-    fn coordinator_runtime_admission(
-        volume: &str,
-        available_bytes: u64,
-        archive_bytes: u64,
-        staging_bytes: u64,
-    ) -> managed_downloads::RuntimePreparationAdmission {
-        let archive_target = std::env::temp_dir().join("runtime-fixture.zip");
-        managed_downloads::RuntimePreparationAdmission {
-            archive: managed_downloads::ModelDownloadAdmission {
-                target_identity: crate::disk_space::canonical_target_identity(&archive_target)
-                    .unwrap(),
-                target: archive_target,
-                disk: crate::disk_space::DiskSpacePreflight {
-                    volume: volume.to_owned(),
-                    available_bytes,
-                    additional_bytes: archive_bytes,
-                    required_bytes: archive_bytes
-                        .saturating_add(crate::disk_space::SAFETY_HEADROOM_BYTES),
-                },
-            },
-            staging: crate::disk_space::DiskSpacePreflight {
-                volume: volume.to_owned(),
-                available_bytes,
-                additional_bytes: staging_bytes,
-                required_bytes: staging_bytes
-                    .saturating_add(crate::disk_space::SAFETY_HEADROOM_BYTES),
-            },
-        }
-    }
-
     #[test]
     fn installation_failures_preserve_recovery_required_classification() {
         let normal = InstallJobFailure::from(InstallError::Failed("retryable".to_owned()));
@@ -23820,7 +20992,6 @@ mod layout_tests {
                     ),
                     AppConfig::default(),
                     VerifiedInstallSource::NormalizedCatalog,
-                    false,
                 )
                 .unwrap();
         }
@@ -23858,7 +21029,6 @@ mod layout_tests {
                 ),
                 AppConfig::default(),
                 VerifiedInstallSource::NormalizedCatalog,
-                false,
             )
             .unwrap();
 
@@ -23874,7 +21044,6 @@ mod layout_tests {
                     ),
                     AppConfig::default(),
                     VerifiedInstallSource::NormalizedCatalog,
-                    false,
                 )
                 .unwrap_err()
                 .contains("already being installed")
@@ -23891,7 +21060,6 @@ mod layout_tests {
                     ),
                     AppConfig::default(),
                     VerifiedInstallSource::NormalizedCatalog,
-                    false,
                 )
                 .unwrap_err()
                 .contains("already owns the target")
@@ -23908,7 +21076,6 @@ mod layout_tests {
                 coordinator_admission("reserve-first.gguf", "volume", available, 100),
                 AppConfig::default(),
                 VerifiedInstallSource::NormalizedCatalog,
-                false,
             )
             .unwrap();
         assert!(
@@ -23918,7 +21085,6 @@ mod layout_tests {
                     coordinator_admission("reserve-blocked.gguf", "volume", available, 1),
                     AppConfig::default(),
                     VerifiedInstallSource::NormalizedCatalog,
-                    false,
                 )
                 .unwrap_err()
                 .contains("active downloads")
@@ -23932,7 +21098,6 @@ mod layout_tests {
                 coordinator_admission("reserve-second.gguf", "volume", available, 80),
                 AppConfig::default(),
                 VerifiedInstallSource::NormalizedCatalog,
-                false,
             )
             .unwrap();
         assert_eq!(coordinator.reserved_by_volume.get("volume"), Some(&100));
@@ -23957,7 +21122,6 @@ mod layout_tests {
                 coordinator_admission("overflow.gguf", "overflow-volume", u64::MAX, u64::MAX),
                 AppConfig::default(),
                 VerifiedInstallSource::NormalizedCatalog,
-                false,
             )
             .unwrap_err();
         assert!(error.contains("overflowed"));
@@ -23980,7 +21144,6 @@ mod layout_tests {
                     ),
                     AppConfig::default(),
                     VerifiedInstallSource::NormalizedCatalog,
-                    false,
                 )
                 .unwrap();
         }
@@ -24021,7 +21184,6 @@ mod layout_tests {
                     ),
                     AppConfig::default(),
                     VerifiedInstallSource::NormalizedCatalog,
-                    false,
                 )
                 .unwrap();
         }
@@ -24071,7 +21233,6 @@ mod layout_tests {
                     ),
                     AppConfig::default(),
                     VerifiedInstallSource::NormalizedCatalog,
-                    false,
                 )
                 .unwrap();
         }
@@ -24101,72 +21262,6 @@ mod layout_tests {
     }
 
     #[test]
-    fn runtime_capable_finalizer_never_exceeds_three_live_download_writers() {
-        let mut coordinator = ArtifactInstallCoordinator::default();
-        let available = crate::disk_space::SAFETY_HEADROOM_BYTES + 10_000;
-        for index in 0..4 {
-            coordinator
-                .admit(
-                    format!("runtime-cap-{index}"),
-                    coordinator_admission(
-                        &format!("runtime-cap-{index}.gguf"),
-                        "shared-volume",
-                        available,
-                        100,
-                    ),
-                    AppConfig::default(),
-                    VerifiedInstallSource::NormalizedCatalog,
-                    false,
-                )
-                .unwrap();
-        }
-        let launches = coordinator.take_ready_transfers();
-        assert_eq!(coordinator.live_download_writer_count(), 3);
-        assert!(coordinator.mark_prepared(
-            &launches[0].model_id,
-            launches[0].job_id,
-            coordinator_prepared_with_runtime("whisper_cpp_tiny_en", false),
-        ));
-        assert!(coordinator.next_finalizer_requirement().is_none());
-        for launch in &launches[1..] {
-            assert!(coordinator.mark_prepared(
-                &launch.model_id,
-                launch.job_id,
-                coordinator_prepared("whisper_cpp_tiny_en"),
-            ));
-        }
-        assert_eq!(
-            coordinator.next_finalizer_requirement(),
-            Some(("runtime-cap-0".to_owned(), true))
-        );
-        coordinator
-            .reserve_next_finalizer_runtime(coordinator_runtime_admission(
-                "shared-volume",
-                available,
-                200,
-                300,
-            ))
-            .unwrap();
-        let finalizer = coordinator.take_next_finalizer().unwrap();
-        assert_eq!(coordinator.live_download_writer_count(), 1);
-        assert_eq!(
-            coordinator.reserved_by_volume.get("shared-volume"),
-            Some(&600)
-        );
-        assert!(coordinator.take_ready_transfers().is_empty());
-        assert!(
-            coordinator.update_download_reservation(&finalizer.model_id, finalizer.job_id, 50,)
-        );
-        assert_eq!(
-            coordinator.reserved_by_volume.get("shared-volume"),
-            Some(&450)
-        );
-        assert!(coordinator.finish(&finalizer.model_id, finalizer.job_id));
-        assert_eq!(coordinator.live_download_writer_count(), 0);
-        assert_eq!(coordinator.take_ready_transfers().len(), 1);
-    }
-
-    #[test]
     fn queued_and_waiting_cancellation_settle_without_launching_workers() {
         let mut coordinator = ArtifactInstallCoordinator::default();
         let available = crate::disk_space::SAFETY_HEADROOM_BYTES + 1_000;
@@ -24182,7 +21277,6 @@ mod layout_tests {
                     ),
                     AppConfig::default(),
                     VerifiedInstallSource::NormalizedCatalog,
-                    false,
                 )
                 .unwrap();
         }
@@ -24289,7 +21383,6 @@ mod layout_tests {
                 coordinator_admission("stale-current.gguf", "stale-volume", available, 100),
                 AppConfig::default(),
                 VerifiedInstallSource::NormalizedCatalog,
-                false,
             )
             .unwrap();
         app.artifact_installations.take_ready_transfers();
@@ -24386,7 +21479,7 @@ mod layout_tests {
             let q8 = root.join("whisper-base.en-Q8_0.gguf");
             let model_id = ModelId::new("whisper_cpp_base_en");
             let candidate =
-                InstallationCandidate::normalized(model_id.clone(), q8.clone(), None).unwrap();
+                InstallationCandidate::normalized(model_id.clone(), q8.clone()).unwrap();
             let expected_size_bytes = candidate.expected_size_bytes;
             let expected_sha256 = candidate.expected_sha256.clone();
             let service = TranscriptionService::new(config.clone());
@@ -24478,463 +21571,7 @@ mod layout_tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    #[test]
-    fn runtime_jobs_dedupe_queued_models_and_failure_message_explains_packaging() {
-        let mut job = RuntimeInstallJob::default();
-        assert!(queue_runtime_model(
-            &mut job.download_model_ids,
-            "model-a".to_owned()
-        ));
-        assert!(!queue_runtime_model(
-            &mut job.download_model_ids,
-            "model-a".to_owned()
-        ));
-        assert!(queue_runtime_model(
-            &mut job.download_model_ids,
-            "model-b".to_owned()
-        ));
-        assert_eq!(job.download_model_ids, ["model-a", "model-b"]);
-        assert!(queue_runtime_model(
-            &mut job.repair_model_ids,
-            "installed-model".to_owned()
-        ));
-        assert_eq!(job.repair_model_ids, ["installed-model"]);
-        assert!(missing_runtime_source_message().contains("packaged or staged build"));
-    }
-
-    #[test]
-    fn runtime_package_root_requires_an_explicit_bin_layout() {
-        let root = std::env::temp_dir().join(format!(
-            "scribe-runtime-package-root-layout-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&root);
-        let packaged = root.join("package").join("bin").join(whisper_cli_name());
-        let direct_directory = root.join("whisper-cli-directory");
-        fs::create_dir_all(packaged.parent().unwrap()).unwrap();
-        fs::create_dir_all(&direct_directory).unwrap();
-        fs::write(&packaged, b"runtime").unwrap();
-
-        assert_eq!(runtime_package_root(&packaged), Some(root.join("package")));
-        assert_eq!(runtime_package_root(&direct_directory), None);
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn runtime_install_rejects_a_direct_sibling_executable_without_copying_its_parent() {
-        let root = std::env::temp_dir().join(format!(
-            "scribe-runtime-direct-sibling-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
-        let executable = root.join(whisper_cli_name());
-        let unrelated = root.join("unrelated.marker");
-        let target = root.join("managed");
-        fs::write(&executable, b"standalone executable").unwrap();
-        fs::write(&unrelated, b"unrelated").unwrap();
-
-        let err = install_runtime_files_to("whisper_cpp", &executable, &target).unwrap_err();
-
-        assert!(err.contains("determine runtime package root"));
-        assert_eq!(fs::read(unrelated).unwrap(), b"unrelated");
-        assert!(!target.exists());
-        assert!(!fs::read_dir(&root).unwrap().any(|entry| {
-            entry
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .starts_with(".managed.installing-")
-        }));
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn runtime_install_rejects_target_and_stage_nested_in_source_package() {
-        let root = std::env::temp_dir().join(format!(
-            "scribe-runtime-nested-target-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&root);
-        let source_root = root.join("package");
-        let executable = write_whisper_cli_runtime(&source_root);
-        let package_marker = source_root.join("package.marker");
-        let target = source_root.join("managed");
-        let previous_marker = target.join("previous.marker");
-        fs::create_dir_all(&target).unwrap();
-        fs::write(&package_marker, b"package").unwrap();
-        fs::write(&previous_marker, b"previous").unwrap();
-
-        let err = install_runtime_files_to("whisper_cpp", &executable, &target).unwrap_err();
-
-        assert!(err.contains("cannot overlap the managed runtime"));
-        assert!(executable.is_file());
-        assert_eq!(fs::read(&package_marker).unwrap(), b"package");
-        assert_eq!(fs::read(&previous_marker).unwrap(), b"previous");
-        assert!(!fs::read_dir(&source_root).unwrap().any(|entry| {
-            entry
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .starts_with(".managed.installing-")
-        }));
-
-        let missing_stage = source_root.join(".outside-managed.installing-test");
-        let stage_err = validate_runtime_copy_paths(
-            &source_root,
-            &root.join("outside-managed"),
-            &missing_stage,
-        )
-        .unwrap_err();
-        assert!(stage_err.contains("staging target"));
-        assert!(!missing_stage.exists());
-
-        let missing = source_root.join("missing");
-        fs::create_dir_all(&missing).unwrap();
-        let aliased_target = missing.join("..").join("aliased-managed");
-        let alias_err =
-            install_runtime_files_to("whisper_cpp", &executable, &aliased_target).unwrap_err();
-        assert!(alias_err.contains("cannot overlap the managed runtime"));
-        assert_eq!(fs::read(&package_marker).unwrap(), b"package");
-        assert_eq!(fs::read(&previous_marker).unwrap(), b"previous");
-        assert!(!source_root.join("aliased-managed").exists());
-        assert!(!fs::read_dir(&source_root).unwrap().any(|entry| {
-            let name = entry.unwrap().file_name();
-            let name = name.to_string_lossy();
-            name.starts_with(".aliased-managed.installing-")
-                || name.starts_with(".aliased-managed.backup-")
-        }));
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn runtime_install_rejects_target_ancestor_before_mutating_its_tree() {
-        let target = std::env::temp_dir().join(format!(
-            "scribe-runtime-target-ancestor-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&target);
-        let source_root = target.join("package");
-        let executable = write_whisper_cli_runtime(&source_root);
-        let package_marker = source_root.join("package.marker");
-        let sibling_marker = target.join("sibling.marker");
-        fs::write(&package_marker, b"package").unwrap();
-        fs::write(&sibling_marker, b"sibling").unwrap();
-
-        let err = match install_runtime_files_to("whisper_cpp", &executable, &target) {
-            Err(err) => err,
-            Ok(replacement) => {
-                replacement.rollback().unwrap();
-                let _ = fs::remove_dir_all(&target);
-                panic!("ancestor target was activated before overlap rejection");
-            }
-        };
-
-        assert!(err.contains("cannot overlap the managed runtime"));
-        assert!(target.is_dir());
-        assert!(executable.is_file());
-        assert_eq!(fs::read(package_marker).unwrap(), b"package");
-        assert_eq!(fs::read(sibling_marker).unwrap(), b"sibling");
-        let transaction_prefix = format!(".{}.", target.file_name().unwrap().to_string_lossy());
-        assert!(
-            !fs::read_dir(target.parent().unwrap())
-                .unwrap()
-                .any(|entry| {
-                    let name = entry.unwrap().file_name();
-                    let name = name.to_string_lossy();
-                    name.starts_with(&transaction_prefix)
-                        && (name.contains(".installing-") || name.contains(".backup-"))
-                })
-        );
-        let _ = fs::remove_dir_all(target);
-    }
-
-    #[test]
-    fn runtime_install_copies_an_explicit_bin_package_layout() {
-        let root =
-            std::env::temp_dir().join(format!("scribe-runtime-bin-package-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        let source_root = root.join("package");
-        let executable = write_whisper_cli_runtime(&source_root);
-        fs::write(source_root.join("package.marker"), b"package").unwrap();
-        let target = root.join("managed");
-
-        let replacement = install_runtime_files_to("whisper_cpp", &executable, &target).unwrap();
-
-        assert_eq!(
-            replacement.installed_path,
-            target.join("bin").join(whisper_cli_name())
-        );
-        assert_eq!(fs::read(target.join("package.marker")).unwrap(), b"package");
-        replacement.commit().unwrap();
-        let _ = fs::remove_dir_all(root);
-    }
-
     #[cfg(unix)]
-    #[test]
-    fn runtime_install_rejects_package_root_and_recursive_entry_symlinks() {
-        use std::os::unix::fs::symlink;
-
-        let root = std::env::temp_dir().join(format!(
-            "scribe-runtime-package-symlink-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&root);
-        let source_root = root.join("package");
-        let executable = write_whisper_cli_runtime(&source_root);
-        let linked_root = root.join("linked-package");
-        symlink(&source_root, &linked_root).unwrap();
-        let linked_executable = linked_root.join("bin").join(whisper_cli_name());
-
-        let root_err = install_runtime_files_to(
-            "whisper_cpp",
-            &linked_executable,
-            &root.join("managed-from-link"),
-        )
-        .unwrap_err();
-        assert!(root_err.contains("symbolic link or reparse point"));
-
-        symlink(&executable, source_root.join("linked-entry")).unwrap();
-        let entry_err = install_runtime_files_to("whisper_cpp", &executable, &root.join("managed"))
-            .unwrap_err();
-        assert!(entry_err.contains("symbolic link or reparse point"));
-        assert!(!root.join("managed").exists());
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn managed_whisper_runtime_is_never_selected_as_its_own_packaged_source() {
-        let root = std::env::temp_dir().join(format!(
-            "scribe-runtime-source-selection-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&root);
-        let runtime_id = "whisper_cpp";
-        let executable = Path::new("bin").join(whisper_cli_name());
-        let current = root
-            .join("managed-runtimes")
-            .join(runtime_id)
-            .join(&executable);
-        let staged = root
-            .join("staged-runtimes")
-            .join(runtime_id)
-            .join(&executable);
-        fs::create_dir_all(current.parent().unwrap()).unwrap();
-        fs::create_dir_all(staged.parent().unwrap()).unwrap();
-        fs::write(&current, b"current").unwrap();
-        fs::write(&staged, b"staged").unwrap();
-        let mut config = AppConfig::default();
-        config.general.managed_runtimes.insert(
-            runtime_id.to_owned(),
-            config::ManagedRuntimeInstall::new(current.clone()),
-        );
-        let model = test_model();
-
-        assert_eq!(
-            runtime_install_source_from_candidates(&config, &model, Some(current), None),
-            None,
-            "managed runtime must not be its own update source"
-        );
-        assert!(matches!(
-            runtime_install_source_from_candidates(&config, &model, Some(staged), None),
-            Some(RuntimeInstallSource::Packaged(_))
-        ));
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn stale_runtime_without_newer_source_does_not_offer_update() {
-        let runtime_root = std::env::temp_dir().join(format!(
-            "scribe-runtime-no-update-source-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&runtime_root);
-        let executable = write_whisper_cli_runtime(&runtime_root.join("whisper_cpp"));
-        let mut config = AppConfig::default();
-        config.general.managed_runtimes.insert(
-            "whisper_cpp".to_owned(),
-            managed_runtime_with_version(executable, Some("v1.8.0")),
-        );
-        let model = test_model();
-        let provider = compatibility_bridge::provider_for_legacy_model(&config, &model).unwrap();
-
-        let action = runtime_action_state_for_source(&config, &model, provider, false);
-
-        assert_eq!(action.kind, RuntimeActionKind::Uninstall);
-        assert!(action.enabled);
-        let _ = fs::remove_dir_all(runtime_root);
-    }
-
-    #[test]
-    fn failed_staged_validation_preserves_previous_runtime() {
-        let root = std::env::temp_dir().join(format!(
-            "scribe-runtime-transaction-failure-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&root);
-        let target_root = root.join("managed-whisper");
-        let previous_executable = write_whisper_cli_runtime(&target_root);
-        fs::write(target_root.join("previous.marker"), b"previous").unwrap();
-        let invalid_source = root.join("invalid-source");
-        let invalid_executable = invalid_source.join("bin").join(whisper_cli_name());
-        fs::create_dir_all(invalid_executable.parent().unwrap()).unwrap();
-        fs::write(&invalid_executable, b"invalid").unwrap();
-
-        let result =
-            install_runtime_files_to("unsupported_runtime", &invalid_executable, &target_root);
-
-        assert!(result.is_err());
-        assert!(target_root.join("previous.marker").is_file());
-        assert!(compatibility_bridge::entrypoint_is_usable(
-            "whisper_cpp",
-            &previous_executable
-        ));
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn runtime_record_and_files_roll_back_together_before_continuation() {
-        let root = std::env::temp_dir().join(format!(
-            "scribe-runtime-transaction-rollback-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&root);
-        let target_root = root.join("managed-whisper");
-        let previous_executable = write_whisper_cli_runtime(&target_root);
-        fs::write(target_root.join("previous.marker"), b"previous").unwrap();
-        let source_root = root.join("staged-whisper");
-        let source_executable = write_whisper_cli_runtime(&source_root);
-        fs::write(source_root.join("new.marker"), b"new").unwrap();
-
-        let replacement =
-            install_runtime_files_to("whisper_cpp", &source_executable, &target_root).unwrap();
-        let mut config = AppConfig::default();
-        let mut previous_record = config::ManagedRuntimeInstall::new(previous_executable.clone());
-        previous_record.source = Some("previous".to_owned());
-        config
-            .general
-            .managed_runtimes
-            .insert("whisper_cpp".to_owned(), previous_record.clone());
-        let mut new_record = config::ManagedRuntimeInstall::new(replacement.installed_path.clone());
-        new_record.source = Some("replacement".to_owned());
-        assert!(!runtime_metadata_matches(
-            &config,
-            "whisper_cpp",
-            &new_record
-        ));
-        let replaced = apply_runtime_record(&mut config, "whisper_cpp", new_record.clone());
-        assert!(runtime_metadata_matches(
-            &config,
-            "whisper_cpp",
-            &new_record
-        ));
-
-        rollback_runtime_record(&mut config, "whisper_cpp", replaced);
-        replacement.rollback().unwrap();
-
-        assert_eq!(
-            config.general.managed_runtimes.get("whisper_cpp"),
-            Some(&previous_record)
-        );
-        assert!(target_root.join("previous.marker").is_file());
-        assert!(!target_root.join("new.marker").exists());
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn runtime_persistence_gates_download_continuation() {
-        let mut config = AppConfig::default();
-        let previous = config::ManagedRuntimeInstall::new(PathBuf::from("previous-runtime"));
-        config
-            .general
-            .managed_runtimes
-            .insert("whisper_cpp".to_owned(), previous.clone());
-        let replacement = config::ManagedRuntimeInstall::new(PathBuf::from("replacement-runtime"));
-        let job = RuntimeInstallJob {
-            download_model_ids: vec!["queued-model".to_owned()],
-            repair_model_ids: Vec::new(),
-        };
-        let persistence_attempted = std::cell::Cell::new(false);
-
-        let failed = persist_runtime_install(
-            &mut config,
-            "whisper_cpp",
-            replacement.clone(),
-            job.clone(),
-            |saved| {
-                persistence_attempted.set(true);
-                assert!(runtime_metadata_matches(saved, "whisper_cpp", &replacement));
-                Err("disk full".to_owned())
-            },
-        );
-
-        assert!(persistence_attempted.get());
-        assert_eq!(
-            config.general.managed_runtimes.get("whisper_cpp"),
-            Some(&previous)
-        );
-        assert!(matches!(
-            failed,
-            RuntimePersistenceTransition::Failed {
-                job: RuntimeInstallJob {
-                    download_model_ids,
-                    ..
-                },
-                ..
-            } if download_model_ids == ["queued-model"]
-        ));
-
-        persistence_attempted.set(false);
-        let persisted = persist_runtime_install(
-            &mut config,
-            "whisper_cpp",
-            replacement.clone(),
-            job,
-            |saved| {
-                assert!(runtime_metadata_matches(saved, "whisper_cpp", &replacement));
-                persistence_attempted.set(true);
-                Ok(())
-            },
-        );
-        assert!(persistence_attempted.get());
-        assert!(matches!(
-            persisted,
-            RuntimePersistenceTransition::Persisted(RuntimeInstallJob {
-                download_model_ids,
-                ..
-            }) if download_model_ids == ["queued-model"]
-        ));
-    }
-
-    #[test]
-    fn runtime_uninstall_error_preserves_managed_metadata() {
-        let mut config = AppConfig::default();
-        let install = config::ManagedRuntimeInstall::new(PathBuf::from("managed-runtime"));
-        config
-            .general
-            .managed_runtimes
-            .insert("whisper_cpp".to_owned(), install.clone());
-
-        assert!(
-            apply_runtime_uninstall_result(
-                &mut config,
-                "whisper_cpp",
-                Err("runtime is locked".to_owned()),
-            )
-            .is_err()
-        );
-        assert_eq!(
-            config.general.managed_runtimes.get("whisper_cpp"),
-            Some(&install)
-        );
-
-        assert_eq!(
-            apply_runtime_uninstall_result(&mut config, "whisper_cpp", Ok(false)),
-            Ok(false)
-        );
-        assert!(!config.general.managed_runtimes.contains_key("whisper_cpp"));
-    }
-
     #[test]
     fn model_install_activation_only_replaces_an_unrunnable_active_model() {
         assert!(!should_activate_installed_model(true));
@@ -25271,154 +21908,6 @@ mod layout_tests {
                 .is_some_and(|message| message.contains("not ready"))
         );
         let _ = fs::remove_file(base_path);
-    }
-
-    #[test]
-    fn runtime_ready_bypasses_preparation_and_failures_fan_out_to_queued_models() {
-        assert!(!runtime_needs_preparation(&ModelRuntimeStatus::Ready));
-        assert!(runtime_needs_preparation(
-            &ModelRuntimeStatus::MissingConfiguration
-        ));
-
-        let mut app = test_app();
-        app.runtime_jobs.insert(
-            "whisper_cpp".to_owned(),
-            RuntimeInstallJob {
-                download_model_ids: vec!["model-a".to_owned(), "model-b".to_owned()],
-                repair_model_ids: vec!["installed-model".to_owned()],
-            },
-        );
-        app.fail_runtime_job("whisper_cpp", "runtime copy failed".to_owned());
-        assert_eq!(
-            app.model_downloads.get("model-a"),
-            Some(&ModelInstallStatus::Error("runtime copy failed".to_owned()))
-        );
-        assert_eq!(
-            app.model_downloads.get("model-b"),
-            Some(&ModelInstallStatus::Error("runtime copy failed".to_owned()))
-        );
-        assert_eq!(
-            app.model_downloads.get("installed-model"),
-            Some(&ModelInstallStatus::RuntimeError(
-                "runtime copy failed".to_owned()
-            ))
-        );
-        assert!(!app.runtime_jobs.contains_key("whisper_cpp"));
-    }
-
-    #[test]
-    fn busy_runtime_disables_maintenance() {
-        let model = test_model();
-        let busy = runtime_action_state_with_busy(&AppConfig::default(), &model, true);
-        assert!(!busy.enabled);
-        assert!(
-            busy.disabled_tooltip
-                .as_deref()
-                .is_some_and(|message| message.contains("already being prepared"))
-        );
-    }
-
-    #[test]
-    fn active_runtime_consumers_disable_update_and_remove_actions() {
-        let update = RuntimeActionState {
-            kind: RuntimeActionKind::Update,
-            enabled: true,
-            disabled_tooltip: None,
-        };
-        for (activity, expected) in [
-            (
-                RuntimeConsumerActivity {
-                    recording: true,
-                    ..Default::default()
-                },
-                "active recording",
-            ),
-            (
-                RuntimeConsumerActivity {
-                    transcribing: true,
-                    ..Default::default()
-                },
-                "transcription",
-            ),
-            (
-                RuntimeConsumerActivity {
-                    playground_jobs: true,
-                    ..Default::default()
-                },
-                "Playground jobs",
-            ),
-            (
-                RuntimeConsumerActivity {
-                    model_download: true,
-                    ..Default::default()
-                },
-                "model download",
-            ),
-        ] {
-            let blocked = restrict_runtime_action(update.clone(), false, activity);
-            assert!(!blocked.enabled);
-            assert!(
-                blocked
-                    .disabled_tooltip
-                    .as_deref()
-                    .is_some_and(|tooltip| tooltip.contains(expected))
-            );
-        }
-
-        let remove = RuntimeActionState {
-            kind: RuntimeActionKind::Uninstall,
-            ..update.clone()
-        };
-        assert!(
-            !restrict_runtime_action(
-                remove,
-                false,
-                RuntimeConsumerActivity {
-                    recording: true,
-                    ..Default::default()
-                },
-            )
-            .enabled
-        );
-        let install = RuntimeActionState {
-            kind: RuntimeActionKind::Install,
-            ..update
-        };
-        assert!(
-            restrict_runtime_action(
-                install,
-                false,
-                RuntimeConsumerActivity {
-                    recording: true,
-                    ..Default::default()
-                },
-            )
-            .enabled
-        );
-    }
-
-    #[test]
-    fn model_download_activity_matches_the_shared_runtime() {
-        let config = AppConfig::default();
-        let model = config::configured_models(&config)
-            .into_iter()
-            .find(|model| model.id == "whisper_cpp_tiny_en")
-            .unwrap();
-        let mut downloads = HashMap::new();
-        downloads.insert(
-            model.id,
-            ModelInstallStatus::Downloading {
-                downloaded_bytes: 1,
-                total_bytes: None,
-                bytes_per_second: None,
-            },
-        );
-
-        assert!(!model_download_uses_runtime(
-            &config,
-            &downloads,
-            "whisper_cpp"
-        ));
     }
 
     #[test]
@@ -25964,96 +22453,6 @@ mod layout_tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    #[test]
-    fn runtime_action_state_explains_supported_and_unsupported_runtimes() {
-        let configured = config::configured_models(&AppConfig::default());
-        let normalized_gguf = configured
-            .into_iter()
-            .find(|model| model.id == "whisper_cpp_tiny_en")
-            .unwrap();
-        let mut config = AppConfig::default();
-        config.general.managed_runtimes.insert(
-            "whisper_cpp".to_owned(),
-            managed_runtime_with_version(PathBuf::from("C:/unused/whisper-cli"), None),
-        );
-
-        assert_eq!(
-            runtime_action_state(&config, &normalized_gguf),
-            RuntimeActionState {
-                kind: RuntimeActionKind::Install,
-                enabled: false,
-                disabled_tooltip: Some(
-                    "This verified model artifact does not use a managed runtime package."
-                        .to_owned(),
-                ),
-            }
-        );
-        assert!(
-            compatibility_bridge::provider_for_legacy_model(&config, &normalized_gguf).is_none()
-        );
-
-        let receipt_onnx = config::configured_models(&config)
-            .into_iter()
-            .find(|model| model.id == "moonshine-tiny-en-int8-onnx")
-            .unwrap();
-        assert_eq!(
-            runtime_action_state(&config, &receipt_onnx),
-            RuntimeActionState {
-                kind: RuntimeActionKind::Install,
-                enabled: false,
-                disabled_tooltip: Some(
-                    "This verified model artifact does not use a managed runtime package."
-                        .to_owned(),
-                ),
-            }
-        );
-        assert!(compatibility_bridge::provider_for_legacy_model(&config, &receipt_onnx).is_none());
-
-        let mut unsupported = test_model();
-        unsupported.id = "unsupported-model".to_owned();
-        unsupported.backend = "Unsupported".to_owned();
-        let unsupported_action = runtime_action_state(&AppConfig::default(), &unsupported);
-        assert_eq!(unsupported_action.kind, RuntimeActionKind::Install);
-        assert!(!unsupported_action.enabled);
-        assert!(
-            unsupported_action
-                .disabled_tooltip
-                .as_deref()
-                .is_some_and(|tooltip| tooltip.contains("no compatible local provider"))
-        );
-    }
-
-    #[test]
-    fn managed_runtime_install_record_reads_manifest_metadata() {
-        let runtime_root =
-            std::env::temp_dir().join(format!("scribe-runtime-manifest-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&runtime_root);
-        let executable = runtime_root.join("bin").join(whisper_cli_name());
-        let manifest = runtime_root.join("runtime-manifest.json");
-        fs::create_dir_all(executable.parent().unwrap()).unwrap();
-        fs::write(&executable, b"runtime").unwrap();
-        fs::write(manifest, r#"{"version":"v1.9.1","sha256":"abc123"}"#).unwrap();
-
-        let install = managed_runtime_install_record(executable, "packaged-runtime");
-
-        assert_eq!(install.version.as_deref(), Some("v1.9.1"));
-        assert_eq!(install.sha256.as_deref(), Some("abc123"));
-        assert_eq!(install.source.as_deref(), Some("packaged-runtime"));
-        let _ = fs::remove_dir_all(runtime_root);
-    }
-
-    #[test]
-    fn development_runtime_installs_require_debug_build_or_opt_in() {
-        assert!(development_runtime_installs_enabled_for(true, None));
-        assert!(!development_runtime_installs_enabled_for(false, None));
-        assert!(development_runtime_installs_enabled_for(false, Some("1")));
-        assert!(development_runtime_installs_enabled_for(
-            false,
-            Some("true")
-        ));
-        assert!(!development_runtime_installs_enabled_for(false, Some("0")));
-    }
-
     #[cfg(unix)]
     #[test]
     fn development_runtime_script_installs_expected_executable() {
@@ -26142,39 +22541,6 @@ mod layout_tests {
     }
 
     #[test]
-    fn normalized_moonshine_install_is_artifact_only_and_never_offers_runtime_actions() {
-        let moonshine = config::configured_models(&AppConfig::default())
-            .into_iter()
-            .find(|model| model.id == "moonshine-tiny-en-int8-onnx")
-            .unwrap();
-
-        assert!(supports_managed_install(&moonshine));
-        assert!(!model_download_uses_runtime(
-            &AppConfig::default(),
-            &HashMap::from([(
-                moonshine.id.clone(),
-                ModelInstallStatus::Downloading {
-                    downloaded_bytes: 1,
-                    total_bytes: Some(44_256_550),
-                    bytes_per_second: None,
-                },
-            )]),
-            "retired-runtime",
-        ));
-        assert_eq!(
-            runtime_action_state(&AppConfig::default(), &moonshine),
-            RuntimeActionState {
-                kind: RuntimeActionKind::Install,
-                enabled: false,
-                disabled_tooltip: Some(
-                    "This verified model artifact does not use a managed runtime package."
-                        .to_owned(),
-                ),
-            }
-        );
-    }
-
-    #[test]
     fn active_onnx_bundle_job_projects_downloading_progress_and_cancel() {
         let mut app = test_app();
         let model_id = "moonshine-tiny-en-int8-onnx".to_owned();
@@ -26235,80 +22601,7 @@ mod layout_tests {
         );
     }
 
-    #[test]
-    fn runtime_uninstall_target_only_allows_app_runtime_storage() {
-        let root = std::env::temp_dir().join(format!(
-            "scribe-runtime-uninstall-{}-{}",
-            std::process::id(),
-            NEXT_TEST_SESSION.fetch_add(1, Ordering::Relaxed)
-        ));
-        let storage_dir = root.join("runtimes");
-        let runtime_dir = storage_dir.join("whisper_cpp");
-        let runtime_executable = runtime_dir.join("bin").join("whisper-cli");
-        let sibling_runtime_file = storage_dir.join("legacy-whisper-cli");
-        let external_runtime = root.join("external").join("whisper-cli");
-        fs::create_dir_all(runtime_executable.parent().unwrap()).unwrap();
-        fs::create_dir_all(external_runtime.parent().unwrap()).unwrap();
-        fs::write(&runtime_executable, b"runtime").unwrap();
-        fs::write(&sibling_runtime_file, b"legacy").unwrap();
-        fs::write(&external_runtime, b"external").unwrap();
-
-        assert_eq!(
-            runtime_uninstall_target(&storage_dir, "whisper_cpp", &runtime_executable),
-            Some(runtime_dir.clone())
-        );
-        assert_eq!(
-            runtime_uninstall_target(&storage_dir, "whisper_cpp", &sibling_runtime_file),
-            Some(sibling_runtime_file)
-        );
-        assert_eq!(
-            runtime_uninstall_target(&storage_dir, "whisper_cpp", &external_runtime),
-            None
-        );
-        assert_eq!(
-            runtime_uninstall_target(
-                &storage_dir,
-                "whisper_cpp",
-                &runtime_dir.join("bin").join("..").join("whisper-cli")
-            ),
-            None
-        );
-        assert_eq!(
-            runtime_uninstall_target(&storage_dir, "../external", &runtime_executable),
-            None
-        );
-        fs::remove_dir_all(root).unwrap();
-    }
-
     #[cfg(unix)]
-    #[test]
-    fn runtime_uninstall_target_rejects_symlink_escape() {
-        use std::os::unix::fs::symlink;
-
-        let root = std::env::temp_dir().join(format!(
-            "scribe-runtime-uninstall-link-{}-{}",
-            std::process::id(),
-            NEXT_TEST_SESSION.fetch_add(1, Ordering::Relaxed)
-        ));
-        let storage_dir = root.join("runtimes");
-        let external = root.join("external");
-        fs::create_dir_all(&storage_dir).unwrap();
-        fs::create_dir_all(&external).unwrap();
-        fs::write(external.join("whisper-cli"), b"external").unwrap();
-        let linked_runtime = storage_dir.join("whisper_cpp");
-        symlink(&external, &linked_runtime).unwrap();
-
-        assert_eq!(
-            runtime_uninstall_target(
-                &storage_dir,
-                "whisper_cpp",
-                &linked_runtime.join("whisper-cli")
-            ),
-            None
-        );
-        fs::remove_dir_all(root).unwrap();
-    }
-
     #[test]
     fn uninstall_removes_managed_model_file_and_selects_next_installed_model() {
         let temp_dir =
@@ -26466,56 +22759,6 @@ mod layout_tests {
             Some(id.as_str())
         );
         assert!(app.model_management.removal_replacement.is_none());
-    }
-
-    #[test]
-    fn selected_canonical_legacy_cleanup_can_be_removed_without_a_replacement() {
-        let root = std::env::temp_dir().join(format!(
-            "scribe-selected-legacy-cleanup-{}-{}",
-            std::process::id(),
-            NEXT_TEST_SESSION.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = fs::remove_dir_all(&root);
-        let mut app = test_app();
-        let default_fixture = app
-            .config
-            .general
-            .model_paths
-            .remove("whisper_cpp_tiny_en")
-            .expect("default test fixture");
-        app.config.general.model_storage_dir = root.clone();
-        app.config.general.selected_default_model = "whisper_cpp_base_en".to_owned();
-        let catalog_model = config::configured_models(&app.config)
-            .into_iter()
-            .find(|model| model.id == "whisper_cpp_base_en")
-            .expect("base catalog model");
-        let legacy = config::legacy_downloaded_model_path(&app.config, &catalog_model)
-            .expect("canonical legacy path");
-        fs::create_dir_all(legacy.parent().expect("legacy parent")).unwrap();
-        fs::write(&legacy, b"legacy GGML").unwrap();
-        config::normalize_config(&mut app.config);
-
-        app.apply_model_management_action(ScreenAction::RequestModelRemoval(
-            "whisper_cpp_base_en".to_owned(),
-        ));
-
-        assert_eq!(
-            app.model_management.dialog,
-            Some(ModelDialog::Remove("whisper_cpp_base_en".to_owned()))
-        );
-        assert!(app.model_management.removal_replacement.is_none());
-
-        app.apply_model_management_action(ScreenAction::ConfirmModelRemoval(
-            "whisper_cpp_base_en".to_owned(),
-        ));
-
-        assert!(app.config.general.selected_default_model.is_empty());
-        assert!(!legacy.exists());
-        assert!(app.model_management.restore_after_removal_focus);
-        assert!(app.status_message.contains("Uninstalled"));
-
-        let _ = fs::remove_file(default_fixture);
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

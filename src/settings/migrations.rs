@@ -179,14 +179,6 @@ fn migrate_legacy_flat(
         diagnostics,
         None,
     );
-    config.general.managed_runtimes = take_map(
-        &mut root,
-        "managed_runtimes",
-        &[],
-        config.general.managed_runtimes,
-        diagnostics,
-        Some(managed_install_value_is_valid),
-    );
     config.general.model_storage_dir = take(
         &mut root,
         "model_storage_dir",
@@ -201,13 +193,6 @@ fn migrate_legacy_flat(
         config.general.model_paths,
         diagnostics,
         None,
-    );
-    config.general.last_used_backend = take(
-        &mut root,
-        "last_used_backend",
-        &[],
-        config.general.last_used_backend,
-        diagnostics,
     );
     config.general.theme_mode = take(
         &mut root,
@@ -335,40 +320,31 @@ fn migrate_legacy_flat(
         config.performance.acceleration_preference,
         diagnostics,
     );
-    config.performance.whisper_gpu_device = take(
-        &mut root,
-        "whisper_gpu_device",
-        &[],
-        config.performance.whisper_gpu_device,
-        diagnostics,
-    );
-    config.performance.whisper_cuda_backend_path = take(
-        &mut root,
-        "whisper_cuda_backend_path",
-        &[],
-        config.performance.whisper_cuda_backend_path,
-        diagnostics,
-    );
-    config.performance.whisper_cuda_library_paths = take(
-        &mut root,
-        "whisper_cuda_library_paths",
-        &[],
-        config.performance.whisper_cuda_library_paths,
-        diagnostics,
-    );
-    config.developer.whisper_executable_path = take(
-        &mut root,
-        "whisper_executable_path",
-        &[],
-        config.developer.whisper_executable_path,
-        diagnostics,
-    );
     config.developer.debug_mode = take(
         &mut root,
         "debug_mode",
         &[],
         config.developer.debug_mode,
         diagnostics,
+    );
+    move_unknown_fields(
+        &mut root,
+        &mut config.general.unknown,
+        &["managed_runtimes", "last_used_backend"],
+    );
+    move_unknown_fields(
+        &mut root,
+        &mut config.performance.unknown,
+        &[
+            "whisper_gpu_device",
+            "whisper_cuda_backend_path",
+            "whisper_cuda_library_paths",
+        ],
+    );
+    move_unknown_fields(
+        &mut root,
+        &mut config.developer.unknown,
+        &["whisper_executable_path"],
     );
     root.remove("schema_version");
     config.unknown = into_unknown(root);
@@ -433,14 +409,6 @@ fn parse_general(
             diagnostics,
             None,
         ),
-        managed_runtimes: take_map(
-            &mut section,
-            "managed_runtimes",
-            &[],
-            defaults.managed_runtimes,
-            diagnostics,
-            Some(managed_install_value_is_valid),
-        ),
         model_storage_dir: take(
             &mut section,
             "model_storage_dir",
@@ -455,13 +423,6 @@ fn parse_general(
             defaults.model_paths,
             diagnostics,
             None,
-        ),
-        last_used_backend: take(
-            &mut section,
-            "last_used_backend",
-            &[],
-            defaults.last_used_backend,
-            diagnostics,
         ),
         theme_mode: take(
             &mut section,
@@ -729,27 +690,6 @@ fn parse_performance(
             defaults.acceleration_preference,
             diagnostics,
         ),
-        whisper_gpu_device: take(
-            &mut section,
-            "whisper_gpu_device",
-            &[],
-            defaults.whisper_gpu_device,
-            diagnostics,
-        ),
-        whisper_cuda_backend_path: take(
-            &mut section,
-            "whisper_cuda_backend_path",
-            &[],
-            defaults.whisper_cuda_backend_path,
-            diagnostics,
-        ),
-        whisper_cuda_library_paths: take(
-            &mut section,
-            "whisper_cuda_library_paths",
-            &[],
-            defaults.whisper_cuda_library_paths,
-            diagnostics,
-        ),
         unknown: into_unknown(section),
     }
 }
@@ -760,13 +700,6 @@ fn parse_developer(
 ) -> DeveloperSettings {
     let defaults = DeveloperSettings::default();
     DeveloperSettings {
-        whisper_executable_path: take(
-            &mut section,
-            "whisper_executable_path",
-            &[],
-            defaults.whisper_executable_path,
-            diagnostics,
-        ),
         debug_mode: take(
             &mut section,
             "debug_mode",
@@ -775,6 +708,14 @@ fn parse_developer(
             diagnostics,
         ),
         unknown: into_unknown(section),
+    }
+}
+
+fn move_unknown_fields(root: &mut Map<String, Value>, unknown: &mut UnknownFields, keys: &[&str]) {
+    for key in keys {
+        if let Some(value) = root.remove(*key) {
+            unknown.insert((*key).to_owned(), value);
+        }
     }
 }
 
@@ -938,6 +879,70 @@ mod tests {
         assert!(config.general.playground_model_order.is_empty());
         assert!(config.output.auto_insert_transcript);
         assert_eq!(config.unknown["future_legacy_key"], json!({"kept": true}));
+    }
+
+    #[test]
+    fn version_three_retired_runtime_fields_become_exact_inert_unknown_values() {
+        let retired_runtimes = json!({
+            "faster_whisper": {
+                "path": "legacy/runtime.py",
+                "source": "copied-profile",
+                "opaque": [1, {"sentinel": true}]
+            }
+        });
+        let cuda_backend = json!("legacy/cuda/whisper.dll");
+        let cuda_libraries = json!(["legacy/cuda", {"future": "value"}]);
+        let executable = json!({"path": "legacy/whisper-cli", "opaque": 7});
+        let config = parse_settings_value(json!({
+            "schema_version": 3,
+            "general": {
+                "managed_runtimes": retired_runtimes.clone(),
+                "last_used_backend": {"id": "faster_whisper", "opaque": true}
+            },
+            "performance": {
+                "whisper_gpu_device": {"ordinal": 4},
+                "whisper_cuda_backend_path": cuda_backend.clone(),
+                "whisper_cuda_library_paths": cuda_libraries.clone()
+            },
+            "developer": {
+                "whisper_executable_path": executable.clone()
+            }
+        }));
+
+        assert_eq!(config.schema_version, CURRENT_SCHEMA_VERSION);
+        assert_eq!(config.general.unknown["managed_runtimes"], retired_runtimes);
+        assert_eq!(
+            config.general.unknown["last_used_backend"],
+            json!({"id": "faster_whisper", "opaque": true})
+        );
+        assert_eq!(
+            config.performance.unknown["whisper_gpu_device"],
+            json!({"ordinal": 4})
+        );
+        assert_eq!(
+            config.performance.unknown["whisper_cuda_backend_path"],
+            cuda_backend
+        );
+        assert_eq!(
+            config.performance.unknown["whisper_cuda_library_paths"],
+            cuda_libraries
+        );
+        assert_eq!(
+            config.developer.unknown["whisper_executable_path"],
+            executable
+        );
+
+        let serialized = serde_json::to_value(config).unwrap();
+        assert_eq!(serialized["schema_version"], json!(4));
+        assert_eq!(serialized["general"]["managed_runtimes"], retired_runtimes);
+        assert_eq!(
+            serialized["performance"]["whisper_cuda_library_paths"],
+            cuda_libraries
+        );
+        assert_eq!(
+            serialized["developer"]["whisper_executable_path"],
+            executable
+        );
     }
 
     #[test]
@@ -1286,7 +1291,7 @@ mod tests {
             config.performance.acceleration_preference,
             AccelerationPreference::Auto
         );
-        assert_eq!(config.performance.whisper_gpu_device, 4);
+        assert_eq!(config.performance.unknown["whisper_gpu_device"], json!(4));
         assert!(diagnostics.invalid_values_salvaged);
     }
 

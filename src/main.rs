@@ -7,7 +7,6 @@ mod app;
 mod audio;
 mod benchmark;
 mod branding;
-mod compatibility_bridge;
 mod config;
 mod core;
 #[cfg(all(feature = "ui-harness", debug_assertions))]
@@ -32,7 +31,6 @@ mod onnx_worker;
 mod overlay;
 mod prepared_audio;
 mod runtime_artifact;
-mod runtime_catalog;
 mod runtime_router;
 mod silero_vad_native;
 mod streaming;

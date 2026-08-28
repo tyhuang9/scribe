@@ -30,8 +30,7 @@ use crate::runtime_artifact::{
     OnnxFileRole, OnnxModelFamily, OnnxModelSpec, RuntimeArtifact, RuntimeModel,
 };
 use crate::runtime_router::{
-    NativeBootstrapFailure, NativeRuntimeDiagnostics, RuntimeError, RuntimeExecution,
-    RuntimeLoadExecution, RuntimeRouter,
+    NativeRuntimeDiagnostics, RuntimeError, RuntimeExecution, RuntimeLoadExecution, RuntimeRouter,
 };
 use crate::silero_vad_native::{SileroVadModel, VadThreshold, WINDOW_SAMPLES};
 use crate::transcription::{
@@ -707,7 +706,6 @@ enum WorkerRole {
 #[serde(rename_all = "snake_case")]
 enum WireArtifactFormat {
     Gguf,
-    LegacyGgml,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -716,7 +714,6 @@ struct WireRuntimeModel {
     id: String,
     path: PathBuf,
     format: WireArtifactFormat,
-    package_root: Option<PathBuf>,
     expected_size_bytes: u64,
     expected_sha256: String,
 }
@@ -730,7 +727,6 @@ struct WireRuntimeModel {
 )]
 enum WireRuntimeArtifact {
     Gguf(WireRuntimeModel),
-    LegacyCompatibility(WireRuntimeModel),
     OnnxBundle(OnnxModelSpec),
 }
 
@@ -738,7 +734,6 @@ impl From<RuntimeArtifact> for WireRuntimeArtifact {
     fn from(artifact: RuntimeArtifact) -> Self {
         match artifact {
             RuntimeArtifact::Gguf(model) => Self::Gguf(model.into()),
-            RuntimeArtifact::LegacyCompatibility(model) => Self::LegacyCompatibility(model.into()),
             RuntimeArtifact::OnnxBundle(model) => Self::OnnxBundle(model),
         }
     }
@@ -751,9 +746,6 @@ impl TryFrom<WireRuntimeArtifact> for RuntimeArtifact {
         artifact.validate()?;
         Ok(match artifact {
             WireRuntimeArtifact::Gguf(model) => Self::Gguf(model.try_into()?),
-            WireRuntimeArtifact::LegacyCompatibility(model) => {
-                Self::LegacyCompatibility(model.try_into()?)
-            }
             WireRuntimeArtifact::OnnxBundle(model) => Self::OnnxBundle(model),
         })
     }
@@ -766,18 +758,6 @@ impl WireRuntimeArtifact {
                 validate_wire_runtime_model(model)?;
                 if model.format != WireArtifactFormat::Gguf {
                     bail!("GGUF runtime tag does not match its artifact format");
-                }
-                if model.package_root.is_some() {
-                    bail!("GGUF runtime artifacts must not carry a native package root");
-                }
-            }
-            Self::LegacyCompatibility(model) => {
-                validate_wire_runtime_model(model)?;
-                if model.format != WireArtifactFormat::LegacyGgml {
-                    bail!("legacy runtime tag does not match its artifact format");
-                }
-                if model.package_root.is_none() {
-                    bail!("legacy runtime artifacts require a verified package root");
                 }
             }
             Self::OnnxBundle(model) => model.validate()?,
@@ -804,13 +784,6 @@ fn validate_wire_runtime_model(model: &WireRuntimeModel) -> Result<()> {
     {
         bail!("runtime model SHA-256 must contain exactly 64 hexadecimal characters");
     }
-    if model
-        .package_root
-        .as_ref()
-        .is_some_and(|root| root.as_os_str().is_empty() || root.to_string_lossy().len() > 32 * 1024)
-    {
-        bail!("runtime package root is empty or oversized");
-    }
     Ok(())
 }
 
@@ -821,9 +794,7 @@ impl From<RuntimeModel> for WireRuntimeModel {
             path: model.path,
             format: match model.format {
                 ArtifactFormat::Gguf => WireArtifactFormat::Gguf,
-                ArtifactFormat::LegacyGgml => WireArtifactFormat::LegacyGgml,
             },
-            package_root: model.package_root,
             expected_size_bytes: model.expected_size_bytes,
             expected_sha256: model.expected_sha256,
         }
@@ -836,13 +807,11 @@ impl TryFrom<WireRuntimeModel> for RuntimeModel {
     fn try_from(model: WireRuntimeModel) -> Result<Self> {
         let format = match model.format {
             WireArtifactFormat::Gguf => ArtifactFormat::Gguf,
-            WireArtifactFormat::LegacyGgml => ArtifactFormat::LegacyGgml,
         };
         Ok(Self {
             id: ModelId::new(model.id),
             path: model.path,
             format,
-            package_root: model.package_root,
             expected_size_bytes: model.expected_size_bytes,
             expected_sha256: model.expected_sha256,
         })
@@ -853,7 +822,7 @@ impl TryFrom<WireRuntimeModel> for RuntimeModel {
 #[serde(deny_unknown_fields)]
 struct WireRuntimeDiagnostics {
     resolved_acceleration: ResolvedAcceleration,
-    native_library_path: PathBuf,
+    runtime_location: PathBuf,
     warm_reused: bool,
     model_load_duration_ms: u64,
 }
@@ -898,17 +867,15 @@ struct WireRuntimeError {
     code: WireRuntimeErrorCode,
     fatal: bool,
     message: String,
-    compatibility_cli_path: Option<PathBuf>,
     sample_rate_hz: Option<u32>,
     channels: Option<u16>,
     model_id: Option<String>,
-    path: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum WireRuntimeErrorCode {
-    Bootstrap,
+    ArtifactIntegrity,
     InvalidAudio,
     Inference,
     Callback,
@@ -917,30 +884,20 @@ enum WireRuntimeErrorCode {
     UnsupportedModel,
     WorkerUnavailable,
     OnnxUnavailable,
-    MissingLegacyPackageRoot,
 }
 
 impl WireRuntimeError {
     fn from_runtime(error: &RuntimeError) -> Self {
-        let compatibility_cli_path = match error {
-            RuntimeError::Bootstrap(failure) if failure.cli_fallback_eligible() => {
-                failure.compatibility_cli_path()
-            }
-            _ => None,
-        };
         let code = match error {
-            RuntimeError::Bootstrap(_) => WireRuntimeErrorCode::Bootstrap,
             RuntimeError::InvalidAudio { .. } => WireRuntimeErrorCode::InvalidAudio,
             RuntimeError::Inference(_) => WireRuntimeErrorCode::Inference,
             RuntimeError::Callback(_) => WireRuntimeErrorCode::Callback,
             RuntimeError::Engine(_) => WireRuntimeErrorCode::Engine,
+            RuntimeError::ArtifactIntegrity { .. } => WireRuntimeErrorCode::ArtifactIntegrity,
             RuntimeError::Poisoned => WireRuntimeErrorCode::Poisoned,
             RuntimeError::UnsupportedModel(_) => WireRuntimeErrorCode::UnsupportedModel,
             RuntimeError::WorkerUnavailable(_) => WireRuntimeErrorCode::WorkerUnavailable,
             RuntimeError::OnnxUnavailable(_) => WireRuntimeErrorCode::OnnxUnavailable,
-            RuntimeError::MissingLegacyPackageRoot { .. } => {
-                WireRuntimeErrorCode::MissingLegacyPackageRoot
-            }
         };
         Self {
             code,
@@ -949,7 +906,6 @@ impl WireRuntimeError {
                 RuntimeError::Poisoned | RuntimeError::WorkerUnavailable(_)
             ),
             message: error.to_string(),
-            compatibility_cli_path,
             sample_rate_hz: match error {
                 RuntimeError::InvalidAudio { sample_rate_hz, .. } => Some(*sample_rate_hz),
                 _ => None,
@@ -959,54 +915,33 @@ impl WireRuntimeError {
                 _ => None,
             },
             model_id: match error {
-                RuntimeError::UnsupportedModel(model_id)
-                | RuntimeError::MissingLegacyPackageRoot { model_id, .. } => {
-                    Some(model_id.as_str().to_owned())
-                }
-                _ => None,
-            },
-            path: match error {
-                RuntimeError::MissingLegacyPackageRoot { path, .. } => Some(path.clone()),
+                RuntimeError::UnsupportedModel(model_id) => Some(model_id.as_str().to_owned()),
                 _ => None,
             },
         }
     }
 
     fn into_runtime(self) -> RuntimeError {
-        match self.compatibility_cli_path {
-            Some(compatibility_cli_path) => {
-                RuntimeError::Bootstrap(NativeBootstrapFailure::NativeLibrary {
-                    message: self.message,
-                    compatibility_cli_path,
-                })
-            }
-            None => match self.code {
-                WireRuntimeErrorCode::Inference => RuntimeError::Inference(self.message),
-                WireRuntimeErrorCode::Callback => RuntimeError::Callback(self.message),
-                WireRuntimeErrorCode::InvalidAudio => RuntimeError::InvalidAudio {
-                    sample_rate_hz: self.sample_rate_hz.unwrap_or_default(),
-                    channels: self.channels.unwrap_or_default(),
-                },
-                WireRuntimeErrorCode::Engine => RuntimeError::Engine(self.message),
-                WireRuntimeErrorCode::OnnxUnavailable => {
-                    RuntimeError::OnnxUnavailable(self.message)
-                }
-                WireRuntimeErrorCode::Poisoned => RuntimeError::Poisoned,
-                WireRuntimeErrorCode::UnsupportedModel => RuntimeError::UnsupportedModel(
-                    ModelId::new(self.model_id.unwrap_or_else(|| self.message.clone())),
-                ),
-                WireRuntimeErrorCode::MissingLegacyPackageRoot => {
-                    RuntimeError::MissingLegacyPackageRoot {
-                        model_id: ModelId::new(
-                            self.model_id.unwrap_or_else(|| self.message.clone()),
-                        ),
-                        path: self.path.unwrap_or_default(),
-                    }
-                }
-                WireRuntimeErrorCode::WorkerUnavailable | WireRuntimeErrorCode::Bootstrap => {
-                    RuntimeError::WorkerUnavailable(self.message)
-                }
+        match self.code {
+            WireRuntimeErrorCode::Inference => RuntimeError::Inference(self.message),
+            WireRuntimeErrorCode::Callback => RuntimeError::Callback(self.message),
+            WireRuntimeErrorCode::InvalidAudio => RuntimeError::InvalidAudio {
+                sample_rate_hz: self.sample_rate_hz.unwrap_or_default(),
+                channels: self.channels.unwrap_or_default(),
             },
+            WireRuntimeErrorCode::Engine => RuntimeError::Engine(self.message),
+            WireRuntimeErrorCode::ArtifactIntegrity => RuntimeError::ArtifactIntegrity {
+                path: PathBuf::from("<inference-worker artifact>"),
+                message: self.message,
+            },
+            WireRuntimeErrorCode::OnnxUnavailable => RuntimeError::OnnxUnavailable(self.message),
+            WireRuntimeErrorCode::Poisoned => RuntimeError::Poisoned,
+            WireRuntimeErrorCode::UnsupportedModel => RuntimeError::UnsupportedModel(ModelId::new(
+                self.model_id.unwrap_or_else(|| self.message.clone()),
+            )),
+            WireRuntimeErrorCode::WorkerUnavailable => {
+                RuntimeError::WorkerUnavailable(self.message)
+            }
         }
     }
 
@@ -1030,7 +965,7 @@ impl From<NativeRuntimeDiagnostics> for WireRuntimeDiagnostics {
     fn from(value: NativeRuntimeDiagnostics) -> Self {
         Self {
             resolved_acceleration: value.resolved_acceleration,
-            native_library_path: value.native_library_path,
+            runtime_location: value.runtime_location,
             warm_reused: value.warm_reused,
             model_load_duration_ms: u64::try_from(value.model_load_duration_ms).unwrap_or(u64::MAX),
         }
@@ -1041,7 +976,7 @@ impl From<WireRuntimeDiagnostics> for NativeRuntimeDiagnostics {
     fn from(value: WireRuntimeDiagnostics) -> Self {
         Self {
             resolved_acceleration: value.resolved_acceleration,
-            native_library_path: value.native_library_path,
+            runtime_location: value.runtime_location,
             warm_reused: value.warm_reused,
             model_load_duration_ms: u128::from(value.model_load_duration_ms),
         }
@@ -4263,11 +4198,6 @@ fn wire_artifact_identity(
         WireRuntimeArtifact::Gguf(model) => {
             serde_json::to_vec(&("gguf", canonical_wire_runtime_model(model)?, preference))?
         }
-        WireRuntimeArtifact::LegacyCompatibility(model) => serde_json::to_vec(&(
-            "legacy_compatibility",
-            canonical_wire_runtime_model(model)?,
-            preference,
-        ))?,
     };
     Ok(format!("{:x}", Sha256::digest(material)))
 }
@@ -4277,14 +4207,6 @@ fn canonical_wire_runtime_model(model: &WireRuntimeModel) -> Result<WireRuntimeM
     canonical.path = std::fs::canonicalize(&model.path).map_err(|error| {
         anyhow!("runtime model path cannot be canonicalized for warm identity: {error}")
     })?;
-    canonical.package_root = model
-        .package_root
-        .as_ref()
-        .map(std::fs::canonicalize)
-        .transpose()
-        .map_err(|error| {
-            anyhow!("runtime package root cannot be canonicalized for warm identity: {error}")
-        })?;
     Ok(canonical)
 }
 
@@ -4371,7 +4293,7 @@ fn load_worker_runtime<F: WorkerRecognizerFactory>(
             WireRuntimeLoadExecution {
                 diagnostics: WireRuntimeDiagnostics {
                     resolved_acceleration: acceleration,
-                    native_library_path: PathBuf::from("<worker-local sherpa-onnx>"),
+                    runtime_location: PathBuf::from("<worker-local native sherpa-onnx>"),
                     warm_reused: false,
                     model_load_duration_ms: u64::try_from(load_started.elapsed().as_millis())
                         .unwrap_or(u64::MAX),
@@ -4380,7 +4302,7 @@ fn load_worker_runtime<F: WorkerRecognizerFactory>(
                 capabilities: onnx_runtime_capabilities(model.family),
             }
         }
-        WireRuntimeArtifact::Gguf(_) | WireRuntimeArtifact::LegacyCompatibility(_) => {
+        WireRuntimeArtifact::Gguf(_) => {
             let runtime_artifact = RuntimeArtifact::try_from(artifact.clone())?;
             runtime_router
                 .load(runtime_artifact, preference)
@@ -4452,18 +4374,16 @@ fn execute_worker_batch<R: WorkerRecognizer>(
                 processing_duration_ms,
             })
         }
-        WireRuntimeArtifact::Gguf(_) | WireRuntimeArtifact::LegacyCompatibility(_) => {
-            runtime_router
-                .transcribe(
-                    RuntimeArtifact::try_from(batch.artifact)?,
-                    batch.preference,
-                    &audio,
-                    &batch.options,
-                    runtime_router.cancellation_snapshot(),
-                )
-                .map(WireRuntimeExecution::from)
-                .map_err(anyhow::Error::new)
-        }
+        WireRuntimeArtifact::Gguf(_) => runtime_router
+            .transcribe(
+                RuntimeArtifact::try_from(batch.artifact)?,
+                batch.preference,
+                &audio,
+                &batch.options,
+                runtime_router.cancellation_snapshot(),
+            )
+            .map(WireRuntimeExecution::from)
+            .map_err(anyhow::Error::new),
     }
 }
 
@@ -4563,13 +4483,6 @@ fn validate_worker_response(response: &Control) -> Result<()> {
             if let Some(model_id) = &error.model_id {
                 validate_bounded_string("runtime error model id", model_id, 512)?;
             }
-            if error.compatibility_cli_path.as_ref().is_some_and(|path| {
-                path.as_os_str().is_empty() || path.to_string_lossy().len() > 32 * 1024
-            }) || error.path.as_ref().is_some_and(|path| {
-                path.as_os_str().is_empty() || path.to_string_lossy().len() > 32 * 1024
-            }) {
-                bail!("runtime fallback path is empty or oversized");
-            }
             Ok(())
         }
         Control::Text { text, .. } => {
@@ -4618,10 +4531,10 @@ fn validate_wire_load(load: &WireRuntimeLoadExecution) -> Result<()> {
 }
 
 fn validate_wire_diagnostics(diagnostics: &WireRuntimeDiagnostics) -> Result<()> {
-    if diagnostics.native_library_path.as_os_str().is_empty()
-        || diagnostics.native_library_path.to_string_lossy().len() > 32 * 1024
+    if diagnostics.runtime_location.as_os_str().is_empty()
+        || diagnostics.runtime_location.to_string_lossy().len() > 32 * 1024
     {
-        bail!("worker native-library path is empty or oversized");
+        bail!("worker runtime location is empty or oversized");
     }
     if let Some(diagnostic) = &diagnostics.resolved_acceleration.diagnostic {
         validate_bounded_string("acceleration diagnostic", diagnostic, MAX_DIAGNOSTIC_BYTES)?;
@@ -5935,7 +5848,6 @@ mod tests {
                     id: "fixture".to_owned(),
                     path: PathBuf::from("fixture.gguf"),
                     format: WireArtifactFormat::Gguf,
-                    package_root: None,
                     expected_size_bytes: 1,
                     expected_sha256: "0".repeat(64),
                 }),
@@ -6405,7 +6317,6 @@ mod tests {
                     id: "missing-gguf".to_owned(),
                     path: missing_gguf,
                     format: WireArtifactFormat::Gguf,
-                    package_root: None,
                     expected_size_bytes: 1,
                     expected_sha256: "0".repeat(64),
                 }),

@@ -350,10 +350,7 @@ pub(crate) struct ModelViewModel {
     /// A verified bundled asset whose embedded runtime is ready.
     pub included: bool,
     pub installed: bool,
-    /// A canonical app-owned GGML artifact retained for explicit migration or removal.
-    pub legacy_cleanup_pending: bool,
-    /// The model selected in Settings. A selected model can be temporarily
-    /// unavailable while its runtime or a legacy artifact is being repaired.
+    /// The model selected in Settings.
     pub selected: bool,
     pub active: bool,
     pub ready: bool,
@@ -363,8 +360,6 @@ pub(crate) struct ModelViewModel {
     pub install_action_enabled: bool,
     pub primary_action_label: String,
     pub primary_action_enabled: bool,
-    pub primary_action_installs_upgrade: bool,
-    pub primary_action_repairs_runtime: bool,
     pub primary_action_disabled_reason: Option<String>,
     pub cancel_supported: bool,
     pub removal_supported: bool,
@@ -375,9 +370,6 @@ pub(crate) struct ModelViewModel {
     pub runtime_detail: Option<String>,
     pub runtime_version_label: Option<String>,
     pub runtime_storage_label: Option<String>,
-    pub runtime_action_label: Option<String>,
-    pub runtime_action_enabled: bool,
-    pub runtime_action_disabled_reason: Option<String>,
     pub download_state: ModelDownloadState,
     pub downloaded_bytes: u64,
     pub total_bytes: Option<u64>,
