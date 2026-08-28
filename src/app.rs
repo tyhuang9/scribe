@@ -13902,7 +13902,7 @@ mod layout_tests {
     }
 
     #[test]
-    fn empty_playground_selection_is_reseeded_from_the_ready_active_model() {
+    fn explicit_empty_playground_selection_stays_empty() {
         let mut config = AppConfig::default();
         let active_model = config.general.selected_default_model.clone();
 
@@ -13910,7 +13910,7 @@ mod layout_tests {
         config::normalize_config(&mut config);
 
         assert_eq!(config.general.selected_default_model, active_model);
-        assert_eq!(config.general.playground_selected_models, [active_model]);
+        assert!(config.general.playground_selected_models.is_empty());
     }
 
     #[test]

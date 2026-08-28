@@ -701,44 +701,29 @@ pub fn normalize_config(config: &mut AppConfig) {
     {
         config.recording.audio_input_device_name = None;
     }
-    let ready_ids = catalog
+    let bundled_base_is_excluded = config
+        .general
+        .excluded_bundled_model_ids
         .iter()
-        .filter(|model| model.install_status.is_runnable())
-        .map(|model| model.id.clone())
-        .collect::<Vec<_>>();
-    let selected_is_ready = ready_ids
+        .any(|id| id == BUNDLED_BASE_MODEL_ID);
+    let selected_is_current = catalog_ids
         .iter()
-        .any(|id| id == &config.general.selected_default_model);
-    if !selected_is_ready {
-        config.general.selected_default_model = catalog
-            .iter()
-            .find(|model| {
-                model.id == BUNDLED_BASE_MODEL_ID
-                    && model.artifact_origin == ModelArtifactOrigin::Bundled
-                    && model.install_status.is_runnable()
-            })
-            .or_else(|| {
-                catalog
-                    .iter()
-                    .find(|model| model.install_status.is_runnable())
-            })
-            .map(|model| model.id.clone())
-            .unwrap_or_default();
+        .any(|id| id == &config.general.selected_default_model)
+        && !(bundled_base_is_excluded
+            && config.general.selected_default_model == BUNDLED_BASE_MODEL_ID);
+    if !config.general.selected_default_model.is_empty() && !selected_is_current {
+        config.general.selected_default_model = if bundled_base_is_excluded {
+            String::new()
+        } else {
+            BUNDLED_BASE_MODEL_ID.to_owned()
+        };
     }
 
-    config
-        .general
-        .playground_selected_models
-        .retain(|id| ready_ids.iter().any(|ready_id| ready_id == id));
+    config.general.playground_selected_models.retain(|id| {
+        catalog_ids.iter().any(|catalog_id| catalog_id == id)
+            && !(bundled_base_is_excluded && id == BUNDLED_BASE_MODEL_ID)
+    });
     dedup_preserving_order(&mut config.general.playground_selected_models);
-    if config.general.playground_selected_models.is_empty()
-        && !config.general.selected_default_model.is_empty()
-    {
-        config
-            .general
-            .playground_selected_models
-            .push(config.general.selected_default_model.clone());
-    }
 
     normalize_playground_order(config, &catalog_ids);
 
@@ -1251,10 +1236,14 @@ mod tests {
 
     #[test]
     fn fresh_default_is_base_and_normalization_preserves_an_explicit_existing_selection() {
-        let fresh = AppConfig::default();
+        let root = unique_bundled_root("identity-normalization");
+        let mut fresh = AppConfig::default();
+        fresh.general.model_storage_dir = root.clone();
+        normalize_config(&mut fresh);
         assert_eq!(fresh.general.selected_default_model, BUNDLED_BASE_MODEL_ID);
 
         let mut existing = AppConfig::default();
+        existing.general.model_storage_dir = root;
         existing.general.selected_default_model = "whisper_cpp_small_en".to_owned();
         normalize_config(&mut existing);
         assert_eq!(
@@ -1365,7 +1354,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_playground_selection_is_seeded_only_from_the_resolved_default() {
+    fn explicit_empty_playground_selection_is_preserved() {
         let mut config = AppConfig {
             general: GeneralSettings {
                 playground_selected_models: Vec::new(),
@@ -1377,10 +1366,7 @@ mod tests {
         normalize_config(&mut config);
 
         assert_eq!(config.general.selected_default_model, BUNDLED_BASE_MODEL_ID);
-        assert_eq!(
-            config.general.playground_selected_models,
-            [BUNDLED_BASE_MODEL_ID]
-        );
+        assert!(config.general.playground_selected_models.is_empty());
     }
 
     #[test]

@@ -501,7 +501,10 @@ mod tests {
         let config = load_from_path(&path).unwrap();
 
         assert!(config.general.selected_default_model.is_empty());
-        assert!(config.general.playground_selected_models.is_empty());
+        assert_eq!(
+            config.general.playground_selected_models,
+            ["whisper_cpp_small_en"]
+        );
         assert_eq!(config.general.model_paths["faster_whisper"], artifact);
         assert_eq!(
             config.general.managed_models["faster_whisper_tiny_en"].unknown["future_receipt"],
