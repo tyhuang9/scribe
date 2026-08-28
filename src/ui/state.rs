@@ -22,7 +22,6 @@ pub(crate) enum UiRoute {
     // These routes remain part of the shared renderer contract even though
     // this native shell currently routes the pages outside `ScreenView`.
     History,
-    About,
     Debug,
 }
 
@@ -143,7 +142,6 @@ pub(crate) enum ModelDownloadState {
     Downloading,
     WaitingForVerification,
     Verifying,
-    Extracting,
     Installed,
     Failed,
     Cancelled,
@@ -361,33 +359,29 @@ pub(crate) struct RemoteCatalogFilters {
 pub(crate) enum RemoteCatalogSizeTier {
     #[default]
     Any,
+    #[cfg(test)]
     Compact,
+    #[cfg(test)]
     Standard,
-    Large,
 }
 
 impl RemoteCatalogSizeTier {
-    pub(crate) const fn label(self) -> &'static str {
-        match self {
-            Self::Any => "Any size",
-            Self::Compact => "Compact (up to 512 MiB)",
-            Self::Standard => "Standard (512 MiB to 1 GiB)",
-            Self::Large => "Large (over 1 GiB)",
-        }
-    }
-
-    pub(crate) fn matches(self, size_bytes: Option<u64>) -> bool {
+    pub(crate) fn matches(self, _size_bytes: Option<u64>) -> bool {
+        #[cfg(test)]
         const MIB: u64 = 1024 * 1024;
+        #[cfg(test)]
         const COMPACT_MAX: u64 = 512 * MIB;
+        #[cfg(test)]
         const STANDARD_MAX: u64 = 1024 * MIB;
 
         match self {
             Self::Any => true,
-            Self::Compact => size_bytes.is_some_and(|size| size <= COMPACT_MAX),
+            #[cfg(test)]
+            Self::Compact => _size_bytes.is_some_and(|size| size <= COMPACT_MAX),
+            #[cfg(test)]
             Self::Standard => {
-                size_bytes.is_some_and(|size| size > COMPACT_MAX && size <= STANDARD_MAX)
+                _size_bytes.is_some_and(|size| size > COMPACT_MAX && size <= STANDARD_MAX)
             }
-            Self::Large => size_bytes.is_some_and(|size| size > STANDARD_MAX),
         }
     }
 }
@@ -396,20 +390,12 @@ impl RemoteCatalogSizeTier {
 pub(crate) enum RemoteCatalogSort {
     #[default]
     Recommended,
+    #[cfg(test)]
     Smallest,
+    #[cfg(test)]
     Largest,
+    #[cfg(test)]
     Name,
-}
-
-impl RemoteCatalogSort {
-    pub(crate) const fn label(self) -> &'static str {
-        match self {
-            Self::Recommended => "Recommended first",
-            Self::Smallest => "Smallest first",
-            Self::Largest => "Largest first",
-            Self::Name => "Name",
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -595,9 +581,7 @@ impl ModelComparisonState {
 pub(crate) enum SettingsSaveState {
     #[default]
     Clean,
-    Dirty,
     Saving,
-    Saved,
     Failed,
 }
 

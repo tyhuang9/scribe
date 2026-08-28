@@ -90,6 +90,7 @@ pub enum AccelerationPreference {
 }
 
 impl AccelerationPreference {
+    #[cfg(test)]
     pub const ALL: [Self; 3] = [Self::Auto, Self::Gpu, Self::Cpu];
 
     pub fn label(self) -> &'static str {
@@ -317,6 +318,7 @@ pub(crate) struct InstallationCandidate {
 }
 
 impl InstallationCandidate {
+    #[cfg(test)]
     pub(crate) fn normalized(model_id: ModelId, model_path: PathBuf) -> Result<Self> {
         let manifest =
             runtime_artifact_manifest_for_path(&model_id, &model_path).ok_or_else(|| {

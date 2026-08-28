@@ -21,9 +21,11 @@ use crate::transcription::ModelId;
 pub mod settings;
 
 pub use settings::{
-    AppConfig, CURRENT_SCHEMA_VERSION, GeneralSettings, HistoryMode, OverlayMode, OverlayPosition,
-    RecordingSettings, SettingsStore, SpeechDetectionMode, StreamingMode,
+    AppConfig, CURRENT_SCHEMA_VERSION, HistoryMode, OverlayMode, OverlayPosition, SettingsStore,
+    SpeechDetectionMode, StreamingMode,
 };
+#[cfg(test)]
+pub use settings::{GeneralSettings, RecordingSettings};
 
 pub const MAX_RECORDING_SECONDS: u32 = 600;
 pub(crate) const RECORDING_CAPTURE_SAFETY_ALLOWANCE_SECONDS: u32 = 2;

@@ -10189,8 +10189,10 @@ impl LocalTranscriberApp {
             capabilities: ui_model_capabilities(descriptor),
             compatibility: descriptor.map_or(ModelCompatibility::Incompatible, |descriptor| {
                 match descriptor.compatibility {
+                    #[cfg(test)]
                     CompatibilityStatus::Supported { .. } => ModelCompatibility::Supported,
                     CompatibilityStatus::Experimental { .. } => ModelCompatibility::Experimental,
+                    #[cfg(test)]
                     CompatibilityStatus::Incompatible { .. } => ModelCompatibility::Incompatible,
                 }
             }),
@@ -12081,16 +12083,19 @@ fn filtered_remote_models<'model>(
             .cmp(&left.recommended)
             .then_with(|| left.display_name.cmp(&right.display_name))
             .then_with(|| left.id.cmp(&right.id)),
+        #[cfg(test)]
         RemoteCatalogSort::Smallest => remote_model_smallest_variant_size(left)
             .unwrap_or(u64::MAX)
             .cmp(&remote_model_smallest_variant_size(right).unwrap_or(u64::MAX))
             .then_with(|| left.display_name.cmp(&right.display_name))
             .then_with(|| left.id.cmp(&right.id)),
+        #[cfg(test)]
         RemoteCatalogSort::Largest => remote_model_smallest_variant_size(right)
             .unwrap_or(0)
             .cmp(&remote_model_smallest_variant_size(left).unwrap_or(0))
             .then_with(|| left.display_name.cmp(&right.display_name))
             .then_with(|| left.id.cmp(&right.id)),
+        #[cfg(test)]
         RemoteCatalogSort::Name => left
             .display_name
             .cmp(&right.display_name)

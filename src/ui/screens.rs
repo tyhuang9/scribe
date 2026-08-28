@@ -595,11 +595,6 @@ pub(crate) fn render_screen(ui: &mut egui::Ui, view: &ScreenView<'_>) -> ScreenA
             "History",
             "Local dictation history remains available in production.",
         ),
-        UiRoute::About => placeholder(
-            ui,
-            "About",
-            "Scribe keeps audio and transcripts on this device.",
-        ),
         UiRoute::Debug => placeholder(
             ui,
             "Debug",
@@ -713,8 +708,7 @@ fn route_auto_id_offset(route: UiRoute) -> usize {
         // route-level range.
         UiRoute::Settings(_) => ROUTE_AUTO_ID_STRIDE * 2,
         UiRoute::History => ROUTE_AUTO_ID_STRIDE * 3,
-        UiRoute::About => ROUTE_AUTO_ID_STRIDE * 4,
-        UiRoute::Debug => ROUTE_AUTO_ID_STRIDE * 5,
+        UiRoute::Debug => ROUTE_AUTO_ID_STRIDE * 4,
     }
 }
 
@@ -2373,10 +2367,7 @@ fn model_lifecycle_presentation<'a>(
             }
         }
         ModelCard::Local(model)
-            if matches!(
-                model.download_state,
-                ModelDownloadState::Verifying | ModelDownloadState::Extracting
-            ) =>
+            if matches!(model.download_state, ModelDownloadState::Verifying) =>
         {
             ModelLifecyclePresentation {
                 action: ScreenAction::None,
@@ -5957,7 +5948,6 @@ fn settings(
         let status = match settings.save_state {
             SettingsSaveState::Saving => "Saving…",
             SettingsSaveState::Failed => "Couldn’t save changes",
-            SettingsSaveState::Saved => "Changes saved",
             _ => "Changes save automatically",
         };
         let response = ui.label(
@@ -5965,7 +5955,7 @@ fn settings(
         );
         if matches!(
             settings.save_state,
-            SettingsSaveState::Saving | SettingsSaveState::Saved | SettingsSaveState::Failed
+            SettingsSaveState::Saving | SettingsSaveState::Failed
         ) {
             ui.ctx().accesskit_node_builder(response.id, |builder| {
                 builder.set_live(egui::accesskit::Live::Polite);
@@ -12071,9 +12061,8 @@ mod tests {
         let routes = [
             UiRoute::Transcribe,
             UiRoute::Models,
-            UiRoute::Settings(SettingsTab::General),
+            UiRoute::Settings(SettingsTab::About),
             UiRoute::History,
-            UiRoute::About,
             UiRoute::Debug,
         ];
         for (index, route) in routes.iter().enumerate() {
@@ -12435,7 +12424,7 @@ mod tests {
             UiRoute::Transcribe,
             UiRoute::Models,
             UiRoute::Settings(SettingsTab::Advanced),
-            UiRoute::About,
+            UiRoute::Settings(SettingsTab::About),
             UiRoute::Debug,
         ] {
             for (state_name, records, loading, expected_status) in history_states {
