@@ -345,10 +345,17 @@ $finalName = Split-Path -Leaf $finalBundle
 if (-not $bundleParent -or -not $finalName) {
     throw "Final release bundle must be a named directory below an existing filesystem root."
 }
-$cargoTargetRoot = Get-NormalizedFullPath (Join-Path $repositoryRoot "target")
-if ([string]::Equals($finalBundle, $cargoTargetRoot, [System.StringComparison]::OrdinalIgnoreCase) -or
-    $finalBundle.StartsWith($cargoTargetRoot + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)) {
-    throw "Cargo target directories are build inputs and cannot be used as distributable release bundles."
+$defaultCargoTargetRoot = Get-NormalizedFullPath (Join-Path $repositoryRoot "target")
+$cargoTargetRoot = if ([string]::IsNullOrWhiteSpace($env:CARGO_TARGET_DIR)) {
+    $defaultCargoTargetRoot
+} else {
+    Get-NormalizedFullPath $env:CARGO_TARGET_DIR
+}
+foreach ($protectedCargoTargetRoot in @($defaultCargoTargetRoot, $cargoTargetRoot)) {
+    if ([string]::Equals($finalBundle, $protectedCargoTargetRoot, [System.StringComparison]::OrdinalIgnoreCase) -or
+        $finalBundle.StartsWith($protectedCargoTargetRoot + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Cargo target directories are build inputs and cannot be used as distributable release bundles."
+    }
 }
 Assert-NoReparseAncestors $bundleParent
 if (Test-Path -LiteralPath $finalBundle) {
@@ -387,7 +394,7 @@ finally {
     Pop-Location
 }
 
-$cargoReleaseRoot = Join-Path $repositoryRoot "target\$targetTriple\release"
+$cargoReleaseRoot = Join-Path $cargoTargetRoot "$targetTriple\release"
 $sourceExecutable = Join-Path $cargoReleaseRoot "local-transcriber.exe"
 Assert-Amd64Pe $sourceExecutable
 Assert-WindowsGuiSubsystem $sourceExecutable

@@ -218,6 +218,21 @@ try {
         throw "Rejected Cargo-target bundle path was mutated."
     }
 
+    $previousCargoTargetDirectory = $env:CARGO_TARGET_DIR
+    $externalCargoTarget = Join-Path $testRoot "external-cargo-target"
+    try {
+        $env:CARGO_TARGET_DIR = $externalCargoTarget
+        Invoke-ExpectedFailure {
+            & $releaseScript -ModelSource "missing-model" -BundlePath (Join-Path $externalCargoTarget "portable")
+        } "Cargo target directories"
+    }
+    finally {
+        $env:CARGO_TARGET_DIR = $previousCargoTargetDirectory
+    }
+    if (Test-Path -LiteralPath $externalCargoTarget) {
+        throw "Rejected external Cargo-target bundle path was mutated."
+    }
+
     $existingFinal = Join-Path $testRoot "existing-final"
     New-Item -ItemType Directory -Path $existingFinal | Out-Null
     $existingMarker = Join-Path $existingFinal "keep.bin"

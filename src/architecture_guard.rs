@@ -1212,13 +1212,18 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
             "release packaging must not download the bundled model via {forbidden}"
         );
     }
+    assert!(
+        !bundler.contains("\"-\","),
+        "bundled model smoke must use the current self-contained helper protocol"
+    );
 
     let release = fs::read_to_string(repository.join("scripts").join("build-windows-release.ps1"))
         .expect("Windows release script must be readable");
     for required in [
         "cargo build --locked --offline --release --all-features --target $targetTriple",
         "x86_64-pc-windows-msvc",
-        r#"target\$targetTriple\release"#,
+        "CARGO_TARGET_DIR",
+        r#"$cargoTargetRoot "$targetTriple\release""#,
         "Assert-Amd64Pe",
         "0x8664",
         "Assert-SafeStagingPath",
@@ -1296,7 +1301,12 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
             "obsolete dynamic runtime release artifact must stay removed: {removed_runtime_path}"
         );
     }
-    for forbidden in ["RuntimeSource", "runtimes/whisper_cpp", "runtime-manifest.json"] {
+    for forbidden in [
+        "RuntimeSource",
+        "runtimes/whisper_cpp",
+        "runtime-manifest.json",
+        "\"-\",",
+    ] {
         assert!(
             !release.contains(forbidden),
             "self-contained release build must not stage dynamic runtime artifact {forbidden}"
@@ -1316,10 +1326,18 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
         "verify-windows-release-package.ps1",
         "-BundlePath dist\\portable",
         "-PortableZipPath dist\\Scribe-windows-x64.zip",
+        "actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09",
+        "actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f",
     ] {
         assert!(
             workflow.contains(required),
             "Windows release workflow must retain {required}"
+        );
+    }
+    for floating_action in ["actions/checkout@v5", "actions/upload-artifact@v6"] {
+        assert!(
+            !workflow.contains(floating_action),
+            "Windows release workflow must pin {floating_action} to a reviewed commit"
         );
     }
     assert!(
@@ -1397,6 +1415,7 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
         "RedirectStandardOutput",
         "WaitForExit",
         "/VERYSILENT",
+        "/NOICONS",
         "Assert-SafePortableZip",
         "Assert-PayloadParity $bundle $zipRoot \"Portable ZIP\"",
         "Assert-PayloadParity $bundle $installedRoot \"Installed\"",
