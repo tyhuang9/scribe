@@ -694,12 +694,14 @@ impl ModelManifest {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EvidenceGateDecision {
     Go,
     NoGo,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EvidenceGateCriterion {
     pub name: &'static str,
@@ -708,6 +710,7 @@ pub struct EvidenceGateCriterion {
     pub finding: &'static str,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StreamingCandidateGate {
     pub runtime_version: &'static str,
@@ -716,6 +719,7 @@ pub struct StreamingCandidateGate {
     pub criteria: &'static [EvidenceGateCriterion],
 }
 
+#[cfg(test)]
 impl StreamingCandidateGate {
     pub fn decision(self) -> EvidenceGateDecision {
         if self.criteria.iter().all(|criterion| criterion.met) {
@@ -726,6 +730,7 @@ impl StreamingCandidateGate {
     }
 }
 
+#[cfg(test)]
 const ZIPFORMER_CRITERIA: &[EvidenceGateCriterion] = &[
     EvidenceGateCriterion {
         name: "pinned-package-and-model",
@@ -783,6 +788,7 @@ const ZIPFORMER_CRITERIA: &[EvidenceGateCriterion] = &[
     },
 ];
 
+#[cfg(test)]
 pub const ZIPFORMER_STREAMING_GATE: StreamingCandidateGate = StreamingCandidateGate {
     runtime_version: "1.13.4",
     runtime_commit: "142807252687d81b40d6315f23470a1512a00de3",
