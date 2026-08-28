@@ -38,6 +38,8 @@ pub use crate::model_catalog::{
     CompatibilityStatus, ModelCapabilities, ModelDescriptor, ModelRole,
 };
 use crate::models::{SttModelInfo, TranscriptResult as LegacyTranscriptResult};
+#[cfg(test)]
+use crate::onnx_model_bundles::OnnxBundleManifest;
 use crate::onnx_worker::InferenceWorkerSupervisor;
 use crate::prepared_audio::{PREPARED_SAMPLE_RATE, PreparedAudio};
 use crate::runtime_artifact::{OnnxModelSpec, RuntimeArtifact, RuntimeModel};
@@ -1241,6 +1243,8 @@ pub struct TranscriptionService {
     config: AppConfig,
     #[cfg(test)]
     router: RuntimeRouter,
+    #[cfg(test)]
+    current_receipt_manifest: Option<OnnxBundleManifest>,
     worker: RuntimeWorker,
 }
 
@@ -1257,6 +1261,8 @@ impl TranscriptionService {
             worker,
             #[cfg(test)]
             router,
+            #[cfg(test)]
+            current_receipt_manifest: None,
         }
     }
 
@@ -1267,6 +1273,8 @@ impl TranscriptionService {
             config,
             #[cfg(test)]
             router: self.router.clone(),
+            #[cfg(test)]
+            current_receipt_manifest: self.current_receipt_manifest.clone(),
             worker: self.worker.clone(),
         }
     }
@@ -1277,6 +1285,7 @@ impl TranscriptionService {
             config,
             worker: RuntimeWorker::new(router.clone()),
             router,
+            current_receipt_manifest: None,
         }
     }
 
@@ -1286,7 +1295,14 @@ impl TranscriptionService {
             config,
             worker: RuntimeWorker::new_process_for_executable(executable),
             router: RuntimeRouter::new(),
+            current_receipt_manifest: None,
         }
+    }
+
+    #[cfg(test)]
+    fn with_test_current_receipt_manifest(mut self, manifest: OnnxBundleManifest) -> Self {
+        self.current_receipt_manifest = Some(manifest);
+        self
     }
 
     pub(crate) fn preload_runtime_artifact(
@@ -1344,7 +1360,23 @@ impl TranscriptionService {
     /// manifest. This path is local-only and never grants a self-authored or
     /// retired receipt executable trust.
     fn onnx_artifact_from_receipt(&self, root: &Path) -> Result<RuntimeArtifact> {
-        let (_, spec) = crate::onnx_model_bundles::current_executable_receipt_at(root)
+        #[cfg(not(test))]
+        let spec = crate::onnx_model_bundles::current_executable_receipt_at(root)
+            .map(|(_, spec)| spec)
+            .map_err(|error| anyhow!("installed ONNX bundle verification failed: {error}"))?;
+        #[cfg(test)]
+        let spec = self
+            .current_receipt_manifest
+            .as_ref()
+            .map_or_else(
+                || crate::onnx_model_bundles::current_executable_receipt_at(root),
+                |manifest| {
+                    crate::onnx_model_bundles::current_executable_receipt_at_with_manifest_for_test(
+                        root, manifest,
+                    )
+                },
+            )
+            .map(|(_, spec)| spec)
             .map_err(|error| anyhow!("installed ONNX bundle verification failed: {error}"))?;
         Ok(RuntimeArtifact::OnnxBundle(spec))
     }
@@ -1357,41 +1389,6 @@ impl TranscriptionService {
             .load(
                 self.onnx_artifact_from_receipt(root)?,
                 AccelerationPreference::Cpu,
-            )
-            .map_err(Into::into)
-    }
-
-    #[cfg(test)]
-    fn preload_onnx_bundle_from_verified_test_receipt(
-        &self,
-        root: &Path,
-    ) -> Result<RuntimeLoadExecution> {
-        let spec = crate::onnx_model_bundles::verified_test_receipt_at(root)
-            .map_err(|error| anyhow!("test ONNX receipt verification failed: {error}"))?;
-        self.worker
-            .load(
-                RuntimeArtifact::OnnxBundle(spec),
-                AccelerationPreference::Cpu,
-            )
-            .map_err(Into::into)
-    }
-
-    #[cfg(test)]
-    fn transcribe_onnx_bundle_from_verified_test_receipt(
-        &self,
-        root: &Path,
-        audio: Arc<PreparedAudio>,
-        options: TranscriptionOptions,
-    ) -> Result<RuntimeExecution> {
-        let spec = crate::onnx_model_bundles::verified_test_receipt_at(root)
-            .map_err(|error| anyhow!("test ONNX receipt verification failed: {error}"))?;
-        self.worker
-            .transcribe(
-                RuntimeArtifact::OnnxBundle(spec),
-                AccelerationPreference::Cpu,
-                audio,
-                options,
-                self.worker.cancellation_snapshot(),
             )
             .map_err(Into::into)
     }
@@ -4155,7 +4152,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_receipt_backed_moonshine_dispatch_crosses_the_runtime_worker_boundary() {
+    fn exact_current_receipt_dispatches_and_self_authored_receipt_is_rejected() {
         let (root, spec) = service_onnx_spec_with(
             "receipt-dispatch",
             "moonshine-tiny-en-int8-onnx",
@@ -4167,7 +4164,28 @@ mod tests {
                 OnnxFileRole::Tokens,
             ],
         );
-        crate::onnx_model_bundles::write_test_receipt_for_spec(&spec).unwrap();
+        let current_manifest =
+            crate::onnx_model_bundles::write_test_receipt_for_spec(&spec).unwrap();
+        let (self_authored_root, self_authored_spec) = service_onnx_spec_with(
+            "self-authored-receipt",
+            "moonshine-tiny-en-int8-onnx",
+            OnnxModelFamily::Moonshine,
+            4,
+            &[
+                OnnxFileRole::Encoder,
+                OnnxFileRole::MergedDecoder,
+                OnnxFileRole::Tokens,
+            ],
+        );
+        crate::onnx_model_bundles::write_test_receipt_for_spec(&self_authored_spec).unwrap();
+        let production_error =
+            crate::onnx_model_bundles::current_executable_receipt_at(&self_authored_root)
+                .unwrap_err();
+        assert!(
+            production_error
+                .to_string()
+                .contains("does not match the current embedded manifest")
+        );
         let expected = spec.clone();
         let worker = simulated_runtime_worker(move |receiver| {
             match receiver.recv().unwrap() {
@@ -4213,14 +4231,23 @@ mod tests {
         let service = TranscriptionService {
             config: AppConfig::default(),
             router: RuntimeRouter::new(),
+            current_receipt_manifest: None,
             worker,
-        };
+        }
+        .with_test_current_receipt_manifest(current_manifest);
 
-        service
-            .preload_onnx_bundle_from_verified_test_receipt(&root)
-            .unwrap();
+        let error = service
+            .preload_onnx_bundle_from_receipt(&self_authored_root)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not match the controlled current manifest")
+        );
+
+        service.preload_onnx_bundle_from_receipt(&root).unwrap();
         let execution = service
-            .transcribe_onnx_bundle_from_verified_test_receipt(
+            .transcribe_onnx_bundle_from_receipt(
                 &root,
                 prepared_audio(),
                 TranscriptionOptions::default(),
@@ -4229,6 +4256,7 @@ mod tests {
         assert_eq!(execution.transcript.text, "service-boundary");
         drop(service);
         fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(self_authored_root).unwrap();
     }
 
     #[test]
@@ -4265,6 +4293,7 @@ mod tests {
         let service = TranscriptionService {
             config: AppConfig::default(),
             router: RuntimeRouter::new(),
+            current_receipt_manifest: None,
             worker,
         };
 
@@ -4312,6 +4341,7 @@ mod tests {
         let service = TranscriptionService {
             config: AppConfig::default(),
             router: RuntimeRouter::new(),
+            current_receipt_manifest: None,
             worker,
         };
 

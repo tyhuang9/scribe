@@ -1670,8 +1670,20 @@ pub(crate) fn current_executable_receipt_at(
 }
 
 #[cfg(test)]
-pub(crate) fn verified_test_receipt_at(root: &Path) -> Result<OnnxModelSpec, InstallError> {
-    verified_receipt_at(root).map(|(_, spec)| spec)
+pub(crate) fn current_executable_receipt_at_with_manifest_for_test(
+    root: &Path,
+    manifest: &OnnxBundleManifest,
+) -> Result<(OnnxBundleReceipt, OnnxModelSpec), InstallError> {
+    let (receipt, spec) = verified_receipt_at(root)?;
+    if manifest.availability != BundleAvailability::Available
+        || !receipt_matches_manifest(&receipt, manifest)
+    {
+        return Err(failed(format!(
+            "installed ONNX bundle {} does not match the controlled current manifest",
+            receipt.model_id
+        )));
+    }
+    Ok((receipt, spec))
 }
 
 pub(crate) fn rollback_to_previous_onnx_bundle(target_root: &Path) -> Result<bool, InstallError> {
@@ -1731,7 +1743,9 @@ pub(crate) fn recover_onnx_bundle_installation(
 }
 
 #[cfg(test)]
-pub(crate) fn write_test_receipt_for_spec(spec: &OnnxModelSpec) -> Result<(), InstallError> {
+pub(crate) fn write_test_receipt_for_spec(
+    spec: &OnnxModelSpec,
+) -> Result<OnnxBundleManifest, InstallError> {
     let template = catalog()
         .bundles
         .iter()
@@ -1772,7 +1786,7 @@ pub(crate) fn write_test_receipt_for_spec(spec: &OnnxModelSpec) -> Result<(), In
         std::fs::write(&path, material.bytes)
             .map_err(|error| failed(format!("failed to write test license material: {error}")))?;
     }
-    Ok(())
+    Ok(manifest)
 }
 
 #[cfg(test)]
