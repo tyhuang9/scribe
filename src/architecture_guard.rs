@@ -1220,7 +1220,7 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
     let release = fs::read_to_string(repository.join("scripts").join("build-windows-release.ps1"))
         .expect("Windows release script must be readable");
     for required in [
-        "cargo build --locked --offline --release --all-features --target $targetTriple",
+        "cargo build --locked --offline --release --features ui-harness --target $targetTriple",
         "x86_64-pc-windows-msvc",
         "CARGO_TARGET_DIR",
         "[System.IO.Path]::IsPathFullyQualified($env:CARGO_TARGET_DIR)",
@@ -1261,6 +1261,12 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
         assert!(
             release.contains(required),
             "Windows release packaging must retain {required}"
+        );
+    }
+    for forbidden in ["--all-features", "vulkan-acceleration"] {
+        assert!(
+            !release.contains(forbidden),
+            "Windows release packaging must not enable {forbidden}"
         );
     }
     assert!(

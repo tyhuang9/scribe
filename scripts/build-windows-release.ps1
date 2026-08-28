@@ -413,7 +413,7 @@ Assert-ExactFile $modelSourcePath ([int64]$modelManifest.size_bytes) $modelManif
 
 Push-Location $repositoryRoot
 try {
-    & cargo build --locked --offline --release --all-features --target $targetTriple --manifest-path (Join-Path $repositoryRoot "Cargo.toml")
+    & cargo build --locked --offline --release --features ui-harness --target $targetTriple --manifest-path (Join-Path $repositoryRoot "Cargo.toml")
     if ($LASTEXITCODE -ne 0) {
         throw "The locked offline Windows x64 release build failed."
     }

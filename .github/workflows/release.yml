@@ -45,6 +45,60 @@ jobs:
           # Keep the CI formatting and linting tools available for this pinned Rust release.
           components: rustfmt, clippy
 
+      - name: Install and verify pinned Vulkan SDK for all-feature checks
+        shell: pwsh
+        # Version, URL, and digest match the reviewed KhronosGroup.VulkanSDK
+        # 1.4.357.0 WinGet manifest; the installer is served by LunarG.
+        env:
+          VULKAN_SDK_VERSION: 1.4.357.0
+          VULKAN_SDK_INSTALLER_SHA256: 81f474711e9042f4cd22b31b2f7a8870db2e428b21586fb43dd80150be97310d
+          VULKAN_SDK_INSTALLER_SIZE: '287971024'
+        run: |
+          $packageRoot = Join-Path $env:GITHUB_WORKSPACE '.ci-tools\vulkan-sdk'
+          $installerPath = Join-Path $packageRoot "vulkansdk-windows-X64-$env:VULKAN_SDK_VERSION.exe"
+          New-Item -ItemType Directory -Force -Path $packageRoot | Out-Null
+          $url = "https://sdk.lunarg.com/sdk/download/$env:VULKAN_SDK_VERSION/windows/vulkansdk-windows-X64-$env:VULKAN_SDK_VERSION.exe"
+          curl.exe --fail --location --retry 3 --retry-delay 2 --output $installerPath $url
+          if ($LASTEXITCODE -ne 0) { throw "Failed to download Vulkan SDK $env:VULKAN_SDK_VERSION" }
+          $installer = Get-Item -LiteralPath $installerPath
+          if ($installer.PSIsContainer -or ($installer.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Vulkan SDK installer is not a regular non-reparse file at $installerPath"
+          }
+          if ($installer.Length -ne [int64]$env:VULKAN_SDK_INSTALLER_SIZE) {
+            throw "Unexpected Vulkan SDK installer size: $($installer.Length)"
+          }
+          $installerHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $installerPath).Hash.ToLowerInvariant()
+          if ($installerHash -cne $env:VULKAN_SDK_INSTALLER_SHA256) {
+            throw "Unexpected Vulkan SDK installer SHA-256: $installerHash"
+          }
+          $installArguments = @('install', '--accept-licenses', '--default-answer', '--confirm-command')
+          $installProcess = Start-Process -FilePath $installerPath `
+            -ArgumentList $installArguments `
+            -Wait -PassThru -WindowStyle Hidden
+          if ($installProcess.ExitCode -ne 0) {
+            throw "Vulkan SDK installation failed with exit code $($installProcess.ExitCode)"
+          }
+          $sdkRoot = "C:\VulkanSDK\$env:VULKAN_SDK_VERSION"
+          $requiredFiles = @(
+            (Join-Path $sdkRoot 'Bin\glslc.exe'),
+            (Join-Path $sdkRoot 'Include\vulkan\vulkan.h'),
+            (Join-Path $sdkRoot 'Lib\vulkan-1.lib')
+          )
+          foreach ($requiredFile in $requiredFiles) {
+            $file = Get-Item -LiteralPath $requiredFile
+            if ($file.PSIsContainer -or ($file.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+              throw "Vulkan SDK input is not a regular non-reparse file at $requiredFile"
+            }
+          }
+          $glslc = Join-Path $sdkRoot 'Bin\glslc.exe'
+          $glslcVersion = @(& $glslc --version 2>&1)
+          if ($LASTEXITCODE -ne 0 -or $glslcVersion.Count -eq 0) {
+            throw "Pinned Vulkan SDK glslc verification failed"
+          }
+          $glslcVersion | ForEach-Object { Write-Host $_ }
+          "VULKAN_SDK=$sdkRoot" >> $env:GITHUB_ENV
+          (Join-Path $sdkRoot 'Bin') >> $env:GITHUB_PATH
+
       - name: Fetch locked Rust dependencies
         run: cargo fetch --locked
 

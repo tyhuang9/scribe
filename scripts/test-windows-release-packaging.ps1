@@ -138,6 +138,53 @@ function Assert-OrderedWorkflowTokens(
     }
 }
 
+function Assert-ReleaseCargoFeatureContract([string]$ReleaseSource) {
+    $expectedBuild = '& cargo build --locked --offline --release --features ui-harness --target $targetTriple --manifest-path (Join-Path $repositoryRoot "Cargo.toml")'
+    $cargoBuilds = @([regex]::Matches($ReleaseSource, '(?m)^\s*& cargo build\b'))
+    if ($cargoBuilds.Count -ne 1 -or
+        -not $ReleaseSource.Contains($expectedBuild) -or
+        $ReleaseSource.Contains('--all-features') -or
+        $ReleaseSource.Contains('vulkan-acceleration')) {
+        throw 'Windows release packaging must preserve the pre-Vulkan ui-harness feature set without enabling every Cargo feature.'
+    }
+}
+
+function Assert-VulkanSdkWorkflowContract([string]$Workflow) {
+    $sdk = Get-WorkflowStepBlock $Workflow 'Install and verify pinned Vulkan SDK for all-feature checks' 'Fetch locked Rust dependencies'
+    Assert-OrderedWorkflowTokens $sdk @(
+        'VULKAN_SDK_VERSION: 1.4.357.0',
+        'VULKAN_SDK_INSTALLER_SHA256: 81f474711e9042f4cd22b31b2f7a8870db2e428b21586fb43dd80150be97310d',
+        "VULKAN_SDK_INSTALLER_SIZE: '287971024'",
+        '$url = "https://sdk.lunarg.com/sdk/download/$env:VULKAN_SDK_VERSION/windows/vulkansdk-windows-X64-$env:VULKAN_SDK_VERSION.exe"',
+        'curl.exe --fail --location --retry 3 --retry-delay 2 --output $installerPath $url',
+        '$installer = Get-Item -LiteralPath $installerPath',
+        '[System.IO.FileAttributes]::ReparsePoint',
+        '$installer.Length -ne [int64]$env:VULKAN_SDK_INSTALLER_SIZE',
+        'Get-FileHash -Algorithm SHA256 -LiteralPath $installerPath',
+        '$installerHash -cne $env:VULKAN_SDK_INSTALLER_SHA256',
+        '$installArguments = @(''install'', ''--accept-licenses'', ''--default-answer'', ''--confirm-command'')',
+        'Start-Process -FilePath $installerPath',
+        '-Wait -PassThru -WindowStyle Hidden',
+        '$sdkRoot = "C:\VulkanSDK\$env:VULKAN_SDK_VERSION"',
+        "(Join-Path `$sdkRoot 'Bin\glslc.exe')",
+        "(Join-Path `$sdkRoot 'Include\vulkan\vulkan.h')",
+        "(Join-Path `$sdkRoot 'Lib\vulkan-1.lib')",
+        '$glslcVersion = @(& $glslc --version 2>&1)',
+        '"VULKAN_SDK=$sdkRoot" >> $env:GITHUB_ENV',
+        "(Join-Path `$sdkRoot 'Bin') >> `$env:GITHUB_PATH"
+    ) 'Vulkan SDK acquisition'
+    if ($sdk -match '(?i)\b(?:winget|choco)\s+install\b') {
+        throw 'Vulkan SDK acquisition must verify the pinned upstream installer instead of delegating trust to a mutable package-manager command.'
+    }
+
+    $lint = Get-WorkflowStepBlock $Workflow 'Lint' 'Test'
+    $test = Get-WorkflowStepBlock $Workflow 'Test' 'Download and verify pinned release inputs'
+    if (-not $lint.Contains('cargo clippy --locked --all-targets --all-features -- -D warnings') -or
+        -not $test.Contains('cargo test --locked --all-features')) {
+        throw 'Windows lint and test jobs must continue exercising all Cargo features after verified Vulkan SDK setup.'
+    }
+}
+
 function Assert-InnoCompilerWorkflowContract([string]$Workflow) {
     $acquire = Get-WorkflowStepBlock $Workflow 'Acquire digest-pinned Inno Setup' 'Build and normalize Windows installer'
     $build = Get-WorkflowStepBlock $Workflow 'Build and normalize Windows installer' 'Package portable ZIP'
@@ -559,6 +606,8 @@ try {
     } "reparse point"
 
     $workflow = Get-Content -LiteralPath (Join-Path $repositoryRoot ".github\workflows\release.yml") -Raw
+    Assert-ReleaseCargoFeatureContract $source
+    Assert-VulkanSdkWorkflowContract $workflow
     if ($workflow -notmatch "prepare-windows-release-inputs\.ps1" -or
         $workflow -notmatch "build-windows-release\.ps1" -or
         $workflow -notmatch "INNO_NUPKG_SHA256: a0dad33db33099d9cd2b89ac2d08b5d70c589b15118ced3b95f469f044f99950" -or
@@ -829,6 +878,7 @@ Set-StrictMode -Version Latest
         }
     }
     Assert-InnoCompilerWorkflowContract $workflow
+    $acquireStepAnchor = '      - name: Acquire digest-pinned Inno Setup'
     $buildStepAnchor = '      - name: Build and normalize Windows installer'
     $compilerHashLine = '          $isccHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $iscc).Hash.ToLowerInvariant()'
     $compilerInvocationLine = '          & $iscc "/DAppVersion=$env:APP_VERSION" installer\scribe.iss'
@@ -838,7 +888,7 @@ Set-StrictMode -Version Latest
             Expected = 'acquisition'
             Action = {
                 param($text)
-                Replace-FirstExact $text '-Wait -PassThru -WindowStyle Hidden' '-PassThru -WindowStyle Hidden'
+                Replace-ExactAfter $text $acquireStepAnchor '-Wait -PassThru -WindowStyle Hidden' '-PassThru -WindowStyle Hidden'
             }
         },
         @{
