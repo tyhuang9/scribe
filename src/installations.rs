@@ -4443,6 +4443,166 @@ mod tests {
     }
 
     #[test]
+    fn subthreshold_timeouts_continue_on_the_same_response_without_stalling() {
+        let root = unique_root("subthreshold-timeouts");
+        fs::create_dir_all(&root).unwrap();
+        let bytes = b"complete artifact";
+        let spec = artifact(&root, bytes);
+        let source = ScriptedHttp::new([ScriptedAttempt::Response {
+            status: 200,
+            content_length: Some(bytes.len() as u64),
+            content_range: None,
+            actions: vec![
+                ReadAction::Error(io::ErrorKind::TimedOut),
+                ReadAction::Error(io::ErrorKind::WouldBlock),
+                ReadAction::Bytes(bytes.to_vec()),
+                ReadAction::Eof,
+            ],
+        }]);
+        let updates = Mutex::new(Vec::new());
+        let mut policy = fast_retry_policy();
+        policy.stalled_after = Duration::from_secs(60);
+        policy.reconnect_after = Duration::from_secs(120);
+
+        let candidate = download_pinned_artifact_with_policy(
+            &source,
+            &spec,
+            &InstallCancellation::default(),
+            &|update| updates.lock().unwrap().push(update),
+            policy,
+        )
+        .unwrap();
+
+        assert_eq!(source.requested_ranges.lock().unwrap().as_slice(), &[None]);
+        let activities = updates
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|update| update.download_activity)
+            .collect::<Vec<_>>();
+        assert_eq!(activities, [DownloadActivity::Active]);
+        assert_eq!(fs::read(candidate.path).unwrap(), bytes);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn dns_and_connect_failures_reconnect_and_complete() {
+        for cause in [DownloadFaultKind::Dns, DownloadFaultKind::ConnectionFailed] {
+            let root = unique_root(&format!("retry-admission-{cause:?}"));
+            fs::create_dir_all(&root).unwrap();
+            let bytes = b"complete artifact";
+            let spec = artifact(&root, bytes);
+            let source = ScriptedHttp::new([
+                ScriptedAttempt::Retryable(cause),
+                ScriptedAttempt::Response {
+                    status: 200,
+                    content_length: Some(bytes.len() as u64),
+                    content_range: None,
+                    actions: vec![ReadAction::Bytes(bytes.to_vec()), ReadAction::Eof],
+                },
+            ]);
+            let updates = Mutex::new(Vec::new());
+
+            let candidate = download_pinned_artifact_with_policy(
+                &source,
+                &spec,
+                &InstallCancellation::default(),
+                &|update| updates.lock().unwrap().push(update),
+                fast_retry_policy(),
+            )
+            .unwrap();
+
+            assert_eq!(
+                source.requested_ranges.lock().unwrap().as_slice(),
+                &[None, None]
+            );
+            let activities = updates
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|update| update.download_activity)
+                .collect::<Vec<_>>();
+            assert!(matches!(
+                activities.first(),
+                Some(DownloadActivity::RetryScheduled {
+                    attempt: 1,
+                    max_attempts: 3,
+                    cause: actual,
+                    ..
+                }) if *actual == cause
+            ));
+            assert_eq!(activities.last(), Some(&DownloadActivity::Active));
+            assert_eq!(fs::read(candidate.path).unwrap(), bytes);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn throughput_measurement_restarts_from_the_reconnected_attempt() {
+        let root = unique_root("reconnected-throughput");
+        fs::create_dir_all(&root).unwrap();
+        let bytes = vec![b'x'; 4_096];
+        let prefix = 4_080;
+        let spec = artifact(&root, &bytes);
+        let source = ScriptedHttp::new([
+            ScriptedAttempt::Response {
+                status: 200,
+                content_length: Some(bytes.len() as u64),
+                content_range: None,
+                actions: vec![
+                    ReadAction::Bytes(bytes[..prefix].to_vec()),
+                    ReadAction::Error(io::ErrorKind::ConnectionReset),
+                ],
+            },
+            ScriptedAttempt::Response {
+                status: 206,
+                content_length: Some((bytes.len() - prefix) as u64),
+                content_range: Some(format!(
+                    "bytes {prefix}-{}/{}",
+                    bytes.len() - 1,
+                    bytes.len()
+                )),
+                actions: vec![
+                    ReadAction::ErrorAfter(Duration::from_millis(300), io::ErrorKind::TimedOut),
+                    ReadAction::Bytes(bytes[prefix..].to_vec()),
+                    ReadAction::Eof,
+                ],
+            },
+        ]);
+        let updates = Mutex::new(Vec::new());
+        let mut policy = fast_retry_policy();
+        policy.stalled_after = Duration::from_secs(5);
+        policy.reconnect_after = Duration::from_secs(10);
+
+        let candidate = download_pinned_artifact_with_policy(
+            &source,
+            &spec,
+            &InstallCancellation::default(),
+            &|update| updates.lock().unwrap().push(update),
+            policy,
+        )
+        .unwrap();
+
+        let updates = updates.lock().unwrap();
+        let completed_reconnect = updates
+            .iter()
+            .find(|update| {
+                update.stage == InstallStage::Downloading
+                    && update.completed_bytes == bytes.len() as u64
+                    && update.bytes_per_second.is_some()
+            })
+            .expect("the reconnected attempt must report its own transfer rate");
+        let rate = completed_reconnect.bytes_per_second.unwrap();
+        assert!(
+            rate <= 500,
+            "rate must count only the 16-byte suffix after reconnect, got {rate} B/s"
+        );
+        assert_eq!(fs::read(&candidate.path).unwrap(), bytes);
+        drop(updates);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn ranged_retry_exhaustion_returns_sanitized_typed_failure() {
         let root = unique_root("retry-exhaustion-username-marker-alice");
         fs::create_dir_all(&root).unwrap();
