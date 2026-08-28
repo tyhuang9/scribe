@@ -2501,10 +2501,10 @@ mod tests {
         }
     }
 
-    fn compatibility_fixture_for_model_id(
-        catalog: &CompatibilityFixtureCatalog,
+    fn compatibility_fixture_for_model_id<'catalog>(
+        catalog: &'catalog CompatibilityFixtureCatalog,
         model_id: &str,
-    ) -> Result<&CompatibilityFixture, String> {
+    ) -> Result<&'catalog CompatibilityFixture, String> {
         catalog
             .fixtures
             .iter()
