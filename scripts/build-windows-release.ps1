@@ -395,7 +395,6 @@ try {
             [string]$modelManifest.model_id,
             $stagedModel,
             "gguf",
-            "-",
             [string]$modelManifest.size_bytes,
             [string]$modelManifest.sha256,
             "cpu"
