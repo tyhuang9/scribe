@@ -83,6 +83,7 @@ const
   ErrorHandleEof = 38;
   FileShareRead = $00000001;
   FileShareWrite = $00000002;
+  FileShareDelete = $00000004;
   GenericWrite = $40000000;
   GenericRead = $80000000;
   OpenExisting = 3;
@@ -351,6 +352,12 @@ begin
     SameStr(RelativePath, 'unins000.dat');
 end;
 
+function IsInnoUninstallerArtifact(RelativePath: String): Boolean;
+begin
+  Result := SameStr(RelativePath, 'unins000.exe') or
+    SameStr(RelativePath, 'unins000.dat');
+end;
+
 function QueryExistingAttributes(
   Path: String;
   var Attributes: LongWord;
@@ -502,17 +509,27 @@ begin
   Result := True;
 end;
 
-function BindFileForUpdate(Path: String; var ErrorText: String): Boolean;
+function BindFileForUpdate(
+  Path: String;
+  AllowDeleteSharing: Boolean;
+  var ErrorText: String
+): Boolean;
 var
   IdentityHandle: THandle;
   UpdateProbe: THandle;
+  ShareMode: LongWord;
   Attributes: LongWord;
   PathExists: Boolean;
   ErrorCode: LongInt;
 begin
   Result := False;
+  ShareMode := FileShareRead or FileShareWrite;
+  { Inno Setup replaces only its own uninstaller pair with MoveFileEx. Keep
+    payload files delete-denying, but allow replacement of this metadata pair. }
+  if AllowDeleteSharing then
+    ShareMode := ShareMode or FileShareDelete;
   IdentityHandle := CreateFileW(
-    Path, 0, FileShareRead or FileShareWrite, 0, OpenExisting,
+    Path, 0, ShareMode, 0, OpenExisting,
     FileFlagOpenReparsePoint, 0);
   if IdentityHandle = InvalidHandleValue then
   begin
@@ -540,7 +557,7 @@ begin
   if not RejectAlternateStreams(Path, False, ErrorText) then
     Exit;
   UpdateProbe := CreateFileW(
-    Path, GenericRead or GenericWrite, FileShareRead or FileShareWrite,
+    Path, GenericRead or GenericWrite, ShareMode,
     0, OpenExisting, FileFlagOpenReparsePoint, 0);
   if UpdateProbe = InvalidHandleValue then
   begin
@@ -719,7 +736,8 @@ begin
             ErrorText := 'Scribe Setup refused the destination because it contains an unexpected or legacy file: ' + RelativePath;
             Exit;
           end;
-          if not BindFileForUpdate(ChildPath, ErrorText) then
+          if not BindFileForUpdate(
+            ChildPath, IsInnoUninstallerArtifact(RelativePath), ErrorText) then
             Exit;
           if SameStr(RelativePath, 'unins000.exe') then
             HasUninstallerExe := True;

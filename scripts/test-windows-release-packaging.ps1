@@ -952,6 +952,26 @@ Set-StrictMode -Version Latest
         $lifecycleSource -notmatch 'procedure DeinitializeSetup\(\);\s+begin\s+ReleaseBoundHandles\(\)') {
         throw "Installer identity handles must remain bound through file installation and close on every completion path."
     }
+    $uninstallerSharingStart = $installer.IndexOf('function IsInnoUninstallerArtifact')
+    $uninstallerSharingEnd = $installer.IndexOf('function ValidateNoReparseAncestors', $uninstallerSharingStart)
+    if ($uninstallerSharingStart -lt 0 -or $uninstallerSharingEnd -le $uninstallerSharingStart) {
+        throw 'Could not isolate the Inno uninstaller sharing contract.'
+    }
+    $uninstallerSharingSource = $installer.Substring($uninstallerSharingStart, $uninstallerSharingEnd - $uninstallerSharingStart)
+    if ($installer -notmatch 'FileShareDelete = \$00000004' -or
+        $uninstallerSharingSource -notmatch "function IsInnoUninstallerArtifact[\s\S]*SameStr\(RelativePath, 'unins000\.exe'\)[\s\S]*SameStr\(RelativePath, 'unins000\.dat'\)" -or
+        $uninstallerSharingSource -notmatch 'function BindFileForUpdate\([\s\S]*AllowDeleteSharing: Boolean' -or
+        $uninstallerSharingSource -notmatch 'ShareMode := FileShareRead or FileShareWrite;[\s\S]*if AllowDeleteSharing then[\s\S]*ShareMode := ShareMode or FileShareDelete' -or
+        $uninstallerSharingSource -notmatch 'Path, 0, ShareMode, 0, OpenExisting' -or
+        $uninstallerSharingSource -notmatch 'Path, GenericRead or GenericWrite, ShareMode,' -or
+        $installer -notmatch 'BindFileForUpdate\(\s*ChildPath, IsInnoUninstallerArtifact\(RelativePath\), ErrorText\)') {
+        throw 'Installer must permit delete sharing only for the validated Inno uninstaller pair while retaining payload identity handles.'
+    }
+    $payloadSharingSource = $installer.Substring($installer.IndexOf('function IsAllowedExistingFile'), $uninstallerSharingStart - $installer.IndexOf('function IsAllowedExistingFile'))
+    if ($payloadSharingSource -notmatch "SameStr\(RelativePath, 'local-transcriber\.exe'\)" -or
+        $uninstallerSharingSource -match 'IsInnoUninstallerArtifact\(Path\)') {
+        throw 'Installer uninstaller delete sharing must be selected only from the validated relative path, never an untrusted full path.'
+    }
     foreach ($existingAllowedPath in @($expectedPortablePayloadPaths) + @('unins000.exe', 'unins000.dat')) {
         $innoPath = $existingAllowedPath.Replace('/', '\')
         if (-not $installer.Contains("'$innoPath'")) {
