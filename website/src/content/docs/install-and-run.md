@@ -9,7 +9,8 @@ description: Install Scribe on Windows or prepare a desktop development environm
 
 The installer is for Windows x64 and installs Scribe for the current user, with
 a Start menu entry and uninstaller. It includes the pinned English Base model,
-its attribution notices, the compatible runtime files, and a hash inventory.
+its attribution notices, the native application components, and a hash
+inventory.
 Older installers remain on the [Scribe Releases page](https://github.com/tyhuang9/scribe/releases).
 
 The installer is currently unsigned. Windows may show a SmartScreen or unknown
@@ -50,4 +51,10 @@ Some distributions use the older `libappindicator3` package names. Scribe can ru
 
 ## Runtime requirement
 
-A normal transcription needs only an installed compatible GGUF model. Scribe's `transcribe-cpp` 0.1.3 CPU adapter is statically linked and runs in-process, so it does not download a runtime package or start a sidecar process. The pinned Windows whisper.cpp package serves retained legacy GGML and a narrowly scoped bootstrap fallback when the primary native GGUF adapter cannot initialize. Development fallbacks are compatibility tools, not evidence of Supported status. Read [Models and runtimes](../models-and-runtimes/) before installing a model.
+A normal transcription needs an installed Experimental catalog model: one of the
+pinned GGUF artifacts or the receipt-backed Moonshine ONNX bundle. GGUF uses
+Scribe's statically linked `transcribe-cpp` 0.1.3 CPU backend, and the ONNX
+bundle uses native Sherpa ONNX. Both execute in Scribe's private persistent
+inference child, so they do not download a runtime package or start a localhost
+service. Read [Models and runtimes](../models-and-runtimes/) before installing a
+model.

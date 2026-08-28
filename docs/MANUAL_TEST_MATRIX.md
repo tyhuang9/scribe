@@ -1,6 +1,8 @@
 # Scribe manual test matrix
 
-**Status:** living Phase 11 matrix (2026-08-04). No manual desktop, microphone,
+**Status:** living qualification checklist. The dated Phase 0-11 automated
+snapshots in this document are historical evidence, not a current rebaseline.
+No manual desktop, microphone,
 model-runtime, tray, hotkey, overlay, accessibility, or paste test was executed
 during the Phase 0-11 automated work. Every manual row below therefore remains **NOT VERIFIED** until
 an operator records evidence. Automated Rust checks are listed separately and
@@ -33,7 +35,7 @@ Status values:
 - **BLOCKED** — prerequisite unavailable; record why.
 - **NOT VERIFIED** — not yet run (the Phase 0 status for all manual rows).
 
-## Automated baseline (verified in Phase 0)
+## Historical automated baseline (verified in Phase 0)
 
 | Check | Command | Result |
 | --- | --- | --- |
@@ -48,7 +50,7 @@ The final source gate was run at HEAD `536a85f813943dbc8beaa684fc5901ff281f6577`
 2026-08-03 14:20:24.998–14:20:30.146 `-05:00`). All commands emitted the same
 non-fatal warning: `could not canonicalize path C:\Users\huang`.
 
-## Automated Phase 1 checkpoint
+## Historical automated Phase 1 checkpoint
 
 | Check | Command | Result |
 | --- | --- | --- |
@@ -68,7 +70,7 @@ do not prove that a real microphone/runtime/target application works on a
 desktop. Execute `REC-04`, `STT-01`, `STT-02`, `STT-05`, and `OUT-01` manually
 on Windows before treating the wrapped path as release-verified.
 
-## Automated Phase 2 checkpoint
+## Historical automated Phase 2 checkpoint
 
 | Check | Command | Result |
 | --- | --- | --- |
@@ -86,7 +88,7 @@ not verify a live desktop, microphone, hotkey, overlay, target window, paste,
 memory/idle CPU, non-ASCII Unicode model path, live-session cancellation, or any other model. All
 manual rows remain NOT VERIFIED.
 
-## Automated Phase 3 checkpoint
+## Historical automated Phase 3 checkpoint
 
 | Check | Command | Result |
 | --- | --- | --- |
@@ -102,7 +104,7 @@ These automated results verify catalog truthfulness and retain the Phase 2
 primary vertical runtime slice. They do not promote a model, prove live desktop
 behavior, or satisfy native streaming. All manual rows remain NOT VERIFIED.
 
-## Automated Phase 4 checkpoint
+## Historical automated Phase 4 checkpoint
 
 | Check | Command | Result |
 | --- | --- | --- |
@@ -118,7 +120,7 @@ inputs. They do not prove real desktop focus, microphone driver shutdown,
 process termination during OS shutdown, or live paste behavior. Those rows
 remain NOT VERIFIED.
 
-## Automated Phase 5 checkpoint
+## Historical automated Phase 5 checkpoint
 
 | Check | Command | Result |
 | --- | --- | --- |
@@ -136,7 +138,7 @@ placement, AccessKit announcements, and safe interaction with real target
 applications. Non-Windows overlay and automatic paste intentionally fail
 closed in the current implementation.
 
-## Automated Phase 6 checkpoint
+## Historical automated Phase 6 checkpoint
 
 | Check | Command | Result |
 | --- | --- | --- |
@@ -156,7 +158,7 @@ prove real device recovery, acoustic VAD quality, first-syllable retention,
 meter cadence on a physical driver, or any desktop output behavior. Those rows
 remain NOT VERIFIED.
 
-## Automated Phase 7 checkpoint
+## Historical automated Phase 7 checkpoint
 
 | Check | Command | Result |
 | --- | --- | --- |
@@ -179,7 +181,7 @@ the Zipformer/second-handler decision remains NO-GO.
 
 For the real Moonshine subprocess smoke, build Scribe and set `SCRIBE_ONNX_WORKER_EXE` to the built executable. Run the ignored `transcription::tests::diagnostic_real_hugging_face_bundle_install_load_and_decode` test with `SCRIBE_ONNX_BUNDLE_TEST=1`, a dedicated `SCRIBE_ONNX_BUNDLE_STORAGE_DIR`, `SCRIBE_ONNX_BUNDLE_WAV` and its exact lowercase `SCRIBE_ONNX_BUNDLE_WAV_SHA256`, plus `SCRIBE_ONNX_BUNDLE_EXPECTED_TRANSCRIPT`. Verify stage, child Hello/load/health/silence smoke, known spoken-WAV decode, unload/reload, and activation. This remains manual evidence until the exact fixture and result are versioned.
 
-## Automated Phase 8 checkpoint
+## Historical automated Phase 8 checkpoint
 
 | Check | Command | Result |
 | --- | --- | --- |
@@ -192,7 +194,7 @@ For the real Moonshine subprocess smoke, build Scribe and set `SCRIBE_ONNX_WORKE
 | Runtime/PCM boundary | Catalog boundary script and existing source guards | PASS - one logical handler and native-only PCM remain unchanged |
 | Pinned native smoke | Exact ignored base.en/JFK service fixture | PASS - debug-harness first load 4,367 ms, first decode 801 ms, warm decode 792 ms; retained release numbers remain the comparable evidence |
 
-## Automated Phase 9 checkpoint
+## Historical automated Phase 9 checkpoint
 
 | Check | Command | Result |
 | --- | --- | --- |
@@ -201,7 +203,7 @@ For the real Moonshine subprocess smoke, build Scribe and set `SCRIBE_ONNX_WORKE
 | Exact pinned package | Bounded parent smoke against exact 13-file whisper.cpp v1.9.1 Windows x64 package | PASS - no fault dialog; health/load/decode/unload-reload completed |
 | Architecture | Boundary guard and release package checks | PASS - exactly one logical runtime handler |
 
-## Automated Phase 10 checkpoint
+## Historical automated Phase 10 checkpoint
 
 | Check | Command | Result |
 | --- | --- | --- |
@@ -272,8 +274,8 @@ new activation/paste latency timestamps remain NOT VERIFIED on a desktop.
 | STT-06 | Win/Linux/macOS | P1, P2 | Remain silent, then repeat with audible non-speech/noise until endpoint or stop. | Empty/no-speech results never paste. Exact sequential 512-sample Silero decisions alone classify speech in a separate VAD-only worker; that worker never receives STT controls. RMS remains a meter/diagnostic: after Silero reports no speech, only a capture whose maximum diagnostic RMS stayed below the low-input guidance floor receives silent/too-low hardware guidance. | **NOT VERIFIED** |
 | STT-07 | Win/Linux/macOS | P1, P2, P3 | In Advanced, run Auto, Rolling preview, and Final text only against the same utterance; repeat once in Playground. Capture the committed/tentative overlay states and first-partial latency. | Auto and Rolling use bounded batch preview only for the primary native model; Final text only and Playground emit no partials. Tentative text stays in the overlay, corrections do not backspace another app, and the final result replaces the preview once. No model advertises native streaming. | **NOT VERIFIED** |
 | STT-08 | Win/Linux/macOS | P1, P2, P3 | Change Auto/GPU/CPU-only acceleration preference where supported; run fixture on each available mode. | Auto resolves to a health-validated device, explicit CPU is honored, and unavailable GPU fails clearly without silent fallback. Record resolved backend/device and errors. | **NOT VERIFIED** |
-| STT-09 | Windows | P1, P3 | Record the exact sherpa-onnx v1.13.4 and streaming Zipformer prerequisites; attempt the evidence harness only after a native package, pinned model, shared corpus, and Phase 7 comparator exist. | Any missing measurement remains NO-GO. A second logical handler appears only if every first-partial, 30% improvement, RTF, cancellation, WER, lifecycle, crash, memory, and platform threshold passes. | **NOT VERIFIED / CURRENT NO-GO** |
-| STT-10 | Windows | P1, P3, P7 | With Scribe running, inspect the process tree and worker launch arguments during a GGUF transcription and an AI-VAD capture. Inspect stdout/stderr capture for each child and confirm no local listener is opened. | The desktop process owns no native model/session/recognizer handles. One persistent `--scribe-inference-worker` child owns GGUF, legacy GGML, and sherpa-onnx inference; a separate `--scribe-vad-worker` instance owns VAD only. Both use private SCIF v3 stdin/stdout pipes, stdout contains protocol frames only, diagnostics use stderr, and no localhost/TCP/HTTP transport or nested ONNX worker appears. Use a disposable profile and terminate the workers after the run. | **NOT VERIFIED** |
+| STT-09 | Windows | P1, P3 | Install and select the receipt-backed `moonshine-tiny-en-int8-onnx` bundle; transcribe the approved fixture and record its receipt, model identity, worker generation, cancellation behavior, and final-text output. | The installed receipt validates before activation; native Sherpa ONNX inference runs in the persistent `--scribe-inference-worker` child, produces a final transcript, and does not claim native streaming. Record all failures and the exact build/model/fixture evidence. | **NOT VERIFIED** |
+| STT-10 | Windows | P1, P3, P7 | With Scribe running, inspect the process tree and worker launch arguments during a GGUF transcription, a receipt-backed ONNX transcription, and an AI-VAD capture. Inspect stdout/stderr capture for each child and confirm no local listener is opened. | The desktop process owns no native model/session/recognizer handles. One persistent `--scribe-inference-worker` child owns GGUF and native Sherpa ONNX inference; a separate `--scribe-vad-worker` instance owns VAD only. Both use private SCIF v3 stdin/stdout pipes, stdout contains protocol frames only, diagnostics use stderr, and no localhost/TCP/HTTP transport or nested ONNX worker appears. No Python, dynamic runtime package, GGML/DLL route, or CLI fallback appears. Use a disposable profile and terminate the workers after the run. | **NOT VERIFIED** |
 
 ## Output, clipboard, and target safety
 
@@ -357,7 +359,7 @@ report. Do not change a manual row to PASS based solely on compilation or a unit
 test. Rows that cannot be run on a platform remain **NOT VERIFIED** and are
 listed as release risks until an explicit support decision is made.
 
-## Automated Phase 11 checkpoint
+## Historical automated Phase 11 checkpoint
 
 Recorded 2026-08-04 on Windows x64. Automated evidence does not change any
 manual row above to PASS.
@@ -397,7 +399,7 @@ Windows rows above, desktop median/p95 phase metrics, memory/idle CPU, physical
 shutdown soak, complete Supported-model compatibility suites, native-streaming
 Definition of Done, and macOS/Linux fallback exercises.
 
-## Tray wakeup regression checkpoint
+## Historical tray wakeup regression checkpoint
 
 Recorded 2026-08-05 on Windows x64. The initial repaint-callback fix failed its
 physical retest. A live native probe proved the tray Show command was queued and
@@ -422,7 +424,7 @@ Quit from the real Windows notification area. Record whether each command acts
 exactly once, whether Show restores and focuses the primary window, whether a
 hidden recording reaches a terminal state, and the hidden idle CPU percentage.
 
-## Low-input diagnostic regression checkpoint
+## Historical low-input diagnostic regression checkpoint
 
 The 2026-08-05 Windows x64 no-save CPAL probe remains valid hardware evidence:
 the selected FIFINE A8 delivered healthy 48 kHz stereo callbacks but near-silent

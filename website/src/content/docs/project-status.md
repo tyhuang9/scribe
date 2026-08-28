@@ -9,7 +9,13 @@ Scribe is a local-first Rust desktop application with Transcribe, General, Model
 
 ## Backends and models
 
-The final application has exactly one logical runtime kind, selected only by `RuntimeRouter`. The normal UI exposes a package-free embedded GGUF catalog with one pinned fallback plus trusted discovered or imported variants. Every normal model is Experimental and the Supported count is zero. Three GGML records remain resolution-only migration compatibility. No model advertises native streaming; preview uses shared rolling batch decoding. `OnnxSpeechRuntime` is omitted because its exact evidence gate has not passed.
+The final application has exactly one logical runtime boundary, selected only by
+`RuntimeRouter` in the private persistent inference child. The normal UI exposes
+five static Experimental entries: four pinned GGUF artifacts and the
+receipt-backed `moonshine-tiny-en-int8-onnx` bundle; the Supported count is
+zero. GGUF uses statically linked native `transcribe-cpp`; ONNX uses native
+Sherpa ONNX in the same child. VAD has a separate worker/process path. No model
+advertises native streaming; preview uses shared rolling batch decoding.
 
 The current release decision is **NO-GO** pending the dated Windows manual matrix, physical shutdown/restart soak, complete compatibility suites, desktop latency/resource measurements, and conservative Linux/macOS exercises. Automated gates passing does not promote a model or replace those manual results.
 
