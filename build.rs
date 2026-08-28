@@ -10,20 +10,8 @@ fn main() {
     require_windows_static_crt();
     verify_silero_vad_asset();
 
-    println!("cargo:rerun-if-changed=native/whisper_shim.c");
-    println!("cargo:rerun-if-changed=native/whisper-f049fff/whisper.h");
-    println!("cargo:rerun-if-changed=native/whisper-f049fff/ggml.h");
-    println!("cargo:rerun-if-changed=native/whisper-f049fff/ggml-cpu.h");
-    println!("cargo:rerun-if-changed=native/whisper-f049fff/ggml-backend.h");
-    println!("cargo:rerun-if-changed=native/whisper-f049fff/ggml-alloc.h");
     println!("cargo:rerun-if-changed=native/sherpa_vad_shim.cc");
     println!("cargo:rerun-if-changed=native/sherpa-onnx-v1.13.5/voice_activity_detector_abi.h");
-
-    cc::Build::new()
-        .file("native/whisper_shim.c")
-        .include("native")
-        .warnings(true)
-        .compile("scribe_whisper_shim");
 
     cc::Build::new()
         .cpp(true)

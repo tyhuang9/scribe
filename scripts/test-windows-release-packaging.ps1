@@ -5,6 +5,7 @@ $repositoryRoot = [System.IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoo
 $releaseScript = Join-Path $PSScriptRoot "build-windows-release.ps1"
 $modelScript = Join-Path $PSScriptRoot "bundle-base-model.ps1"
 $packageVerifier = Join-Path $PSScriptRoot "verify-windows-release-package.ps1"
+. (Join-Path $PSScriptRoot "windows-pe-imports.ps1")
 $source = Get-Content -LiteralPath $releaseScript -Raw
 $helpersStart = $source.IndexOf("function Get-NormalizedFullPath")
 $helpersEnd = $source.IndexOf("if (-not [Environment]::Is64BitOperatingSystem")
@@ -15,11 +16,18 @@ $expectedPeMachine = 0x8664
 Invoke-Expression $source.Substring($helpersStart, $helpersEnd - $helpersStart)
 
 $verifierSource = Get-Content -LiteralPath $packageVerifier -Raw
+$verifierPreambleStart = $verifierSource.IndexOf("`$targetTriple =")
 $verifierHelpersStart = $verifierSource.IndexOf("function Get-NormalizedPath")
 $verifierHelpersEnd = $verifierSource.IndexOf("`$bundle = Get-NormalizedPath")
-if ($verifierHelpersStart -lt 0 -or $verifierHelpersEnd -le $verifierHelpersStart) {
+if ($verifierPreambleStart -lt 0 -or
+    $verifierHelpersStart -le $verifierPreambleStart -or
+    $verifierHelpersEnd -le $verifierHelpersStart) {
     throw "Could not isolate Windows release package verifier helpers for testing."
 }
+$verifierPreamble = $verifierSource.Substring($verifierPreambleStart, $verifierHelpersStart - $verifierPreambleStart)
+$quotedScriptRoot = $PSScriptRoot.Replace("'", "''")
+$verifierPreamble = $verifierPreamble.Replace('$PSScriptRoot', "'$quotedScriptRoot'")
+Invoke-Expression $verifierPreamble
 Invoke-Expression $verifierSource.Substring($verifierHelpersStart, $verifierHelpersEnd - $verifierHelpersStart)
 
 function Invoke-ExpectedFailure([scriptblock]$Action, [string]$ExpectedText) {
@@ -35,15 +43,186 @@ function Invoke-ExpectedFailure([scriptblock]$Action, [string]$ExpectedText) {
     throw "Expected failure containing '$ExpectedText', but the action succeeded."
 }
 
-function Write-TestPe([string]$Path, [uint16]$Machine) {
-    $bytes = [byte[]]::new(256)
+function Start-TestLogHandleHolder(
+    [string]$PowerShellPath,
+    [string]$LogPath,
+    [string]$ReadyPath,
+    [int]$HoldMilliseconds
+) {
+    $escapedLogPath = $LogPath.Replace("'", "''")
+    $escapedReadyPath = $ReadyPath.Replace("'", "''")
+    $holderScript = @"
+`$logHandle = [System.IO.File]::Open('$escapedLogPath', [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+try {
+    [System.IO.File]::WriteAllText('$escapedReadyPath', 'ready')
+    Start-Sleep -Milliseconds $HoldMilliseconds
+}
+finally {
+    `$logHandle.Dispose()
+}
+"@
+    $encodedHolderScript = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($holderScript))
+    Start-Process -FilePath $PowerShellPath -ArgumentList @(
+        '-NoProfile', '-NonInteractive', '-EncodedCommand', $encodedHolderScript
+    ) -PassThru
+}
+
+function Wait-TestLogHandleHolderReady(
+    [System.Diagnostics.Process]$Process,
+    [string]$ReadyPath
+) {
+    $deadline = [DateTime]::UtcNow.AddSeconds(5)
+    while (-not (Test-Path -LiteralPath $ReadyPath -PathType Leaf)) {
+        if ($Process.HasExited) {
+            throw "Synthetic log-handle holder exited before acquiring its handle."
+        }
+        if ([DateTime]::UtcNow -ge $deadline) {
+            throw "Timed out waiting for synthetic log-handle holder readiness."
+        }
+        Start-Sleep -Milliseconds 20
+    }
+}
+
+function Replace-FirstExact([string]$Text, [string]$Old, [string]$New) {
+    $index = $Text.IndexOf($Old, [StringComparison]::Ordinal)
+    if ($index -lt 0) {
+        throw "Could not find the exact workflow fixture text to mutate: $Old"
+    }
+    $Text.Substring(0, $index) + $New + $Text.Substring($index + $Old.Length)
+}
+
+function Replace-ExactAfter(
+    [string]$Text,
+    [string]$Anchor,
+    [string]$Old,
+    [string]$New
+) {
+    $anchorIndex = $Text.IndexOf($Anchor, [StringComparison]::Ordinal)
+    if ($anchorIndex -lt 0) {
+        throw "Could not find the exact workflow fixture anchor: $Anchor"
+    }
+    $index = $Text.IndexOf($Old, $anchorIndex, [StringComparison]::Ordinal)
+    if ($index -lt 0) {
+        throw "Could not find the exact workflow fixture text after '$Anchor': $Old"
+    }
+    $Text.Substring(0, $index) + $New + $Text.Substring($index + $Old.Length)
+}
+
+function Get-WorkflowStepBlock(
+    [string]$Workflow,
+    [string]$StepName,
+    [string]$NextStepName
+) {
+    $startMarker = "      - name: $StepName"
+    $endMarker = "      - name: $NextStepName"
+    $start = $Workflow.IndexOf($startMarker, [StringComparison]::Ordinal)
+    $end = $Workflow.IndexOf($endMarker, $start + $startMarker.Length, [StringComparison]::Ordinal)
+    if ($start -lt 0 -or $end -le $start) {
+        throw "Could not isolate workflow step '$StepName'."
+    }
+    $Workflow.Substring($start, $end - $start)
+}
+
+function Assert-OrderedWorkflowTokens(
+    [string]$Block,
+    [string[]]$Tokens,
+    [string]$ContractName
+) {
+    $previous = -1
+    foreach ($token in $Tokens) {
+        $position = $Block.IndexOf($token, [StringComparison]::Ordinal)
+        if ($position -le $previous) {
+            throw "$ContractName is missing or reorders required control: $token"
+        }
+        $previous = $position
+    }
+}
+
+function Assert-InnoCompilerWorkflowContract([string]$Workflow) {
+    $acquire = Get-WorkflowStepBlock $Workflow 'Acquire digest-pinned Inno Setup' 'Build and normalize Windows installer'
+    $build = Get-WorkflowStepBlock $Workflow 'Build and normalize Windows installer' 'Package portable ZIP'
+    $quotedDirectoryArgument = '(''"/DIR={0}"'' -f $installRoot)'
+    if (-not $acquire.Contains($quotedDirectoryArgument)) {
+        throw 'Inno Setup /DIR must remain an explicitly quoted argument so workspace paths with spaces are preserved.'
+    }
+    $spaceContainingRoot = 'C:\CI workspace\inno setup'
+    $formattedDirectoryArgument = ('"/DIR={0}"' -f $spaceContainingRoot)
+    if ($formattedDirectoryArgument -cne '"/DIR=C:\CI workspace\inno setup"') {
+        throw 'Inno Setup /DIR quoting does not preserve a workspace path containing spaces.'
+    }
+    Assert-OrderedWorkflowTokens $acquire @(
+        '$installArguments = @(',
+        $quotedDirectoryArgument,
+        'Start-Process -FilePath $installerPath',
+        '-ArgumentList $installArguments',
+        '-Wait -PassThru -WindowStyle Hidden',
+        'if ($installProcess.ExitCode -ne 0)',
+        '$iscc = Join-Path $installRoot ''ISCC.exe''',
+        '$isccFile = Get-Item -LiteralPath $iscc',
+        '[System.IO.FileAttributes]::ReparsePoint',
+        '$isccFile.Length -ne [int64]$env:INNO_COMPILER_SIZE',
+        'Get-FileHash -Algorithm SHA256 -LiteralPath $iscc',
+        '$isccHash -cne $env:INNO_COMPILER_SHA256',
+        '"INNO_ISCC=$iscc" >> $env:GITHUB_ENV'
+    ) 'Inno compiler acquisition'
+    Assert-OrderedWorkflowTokens $build @(
+        '$isccFile = Get-Item -LiteralPath $iscc',
+        '[System.IO.FileAttributes]::ReparsePoint',
+        '$isccFile.Length -ne [int64]$env:INNO_ISCC_SIZE',
+        'Get-FileHash -Algorithm SHA256 -LiteralPath $iscc',
+        '$isccHash -cne $env:INNO_ISCC_SHA256',
+        '& $iscc "/DAppVersion=$env:APP_VERSION" installer\scribe.iss'
+    ) 'Inno compiler pre-invocation verification'
+    if ($acquire -match 'VersionInfo\.ProductVersion' -or $build -match 'VersionInfo\.ProductVersion') {
+        throw 'Inno compiler verification must use pinned bytes instead of unreliable PE version fields.'
+    }
+}
+
+function Write-TestPe(
+    [string]$Path,
+    [uint16]$Machine,
+    [string]$NormalImport = "kernel32.dll",
+    [string]$DelayImport = "user32.dll",
+    [uint16]$Subsystem = 2
+) {
+    $bytes = [byte[]]::new(0x600)
     $bytes[0] = 0x4D
     $bytes[1] = 0x5A
-    [BitConverter]::GetBytes([uint32]0x40).CopyTo($bytes, 0x3C)
-    [BitConverter]::GetBytes([uint32]0x00004550).CopyTo($bytes, 0x40)
-    [BitConverter]::GetBytes($Machine).CopyTo($bytes, 0x44)
-    [BitConverter]::GetBytes([uint16]0x20B).CopyTo($bytes, 0x58)
-    [BitConverter]::GetBytes([uint16]2).CopyTo($bytes, 0x9C)
+    [BitConverter]::GetBytes([uint32]0x80).CopyTo($bytes, 0x3C)
+    [BitConverter]::GetBytes([uint32]0x00004550).CopyTo($bytes, 0x80)
+    [BitConverter]::GetBytes($Machine).CopyTo($bytes, 0x84)
+    [BitConverter]::GetBytes([uint16]1).CopyTo($bytes, 0x86)
+    [BitConverter]::GetBytes([uint16]0xF0).CopyTo($bytes, 0x94)
+    $optionalOffset = 0x98
+    [BitConverter]::GetBytes([uint16]0x20B).CopyTo($bytes, $optionalOffset)
+    [BitConverter]::GetBytes([uint64]0x140000000).CopyTo($bytes, $optionalOffset + 24)
+    [BitConverter]::GetBytes([uint32]0x1000).CopyTo($bytes, $optionalOffset + 32)
+    [BitConverter]::GetBytes([uint32]0x200).CopyTo($bytes, $optionalOffset + 36)
+    [BitConverter]::GetBytes([uint32]0x2000).CopyTo($bytes, $optionalOffset + 56)
+    [BitConverter]::GetBytes([uint32]0x200).CopyTo($bytes, $optionalOffset + 60)
+    [BitConverter]::GetBytes($Subsystem).CopyTo($bytes, $optionalOffset + 68)
+    [BitConverter]::GetBytes([uint32]16).CopyTo($bytes, $optionalOffset + 108)
+    [BitConverter]::GetBytes([uint32]0x1000).CopyTo($bytes, $optionalOffset + 120)
+    [BitConverter]::GetBytes([uint32]40).CopyTo($bytes, $optionalOffset + 124)
+    [BitConverter]::GetBytes([uint32]0x1040).CopyTo($bytes, $optionalOffset + 216)
+    [BitConverter]::GetBytes([uint32]64).CopyTo($bytes, $optionalOffset + 220)
+
+    $sectionOffset = $optionalOffset + 0xF0
+    [System.Text.Encoding]::ASCII.GetBytes('.rdata').CopyTo($bytes, $sectionOffset)
+    [BitConverter]::GetBytes([uint32]0x400).CopyTo($bytes, $sectionOffset + 8)
+    [BitConverter]::GetBytes([uint32]0x1000).CopyTo($bytes, $sectionOffset + 12)
+    [BitConverter]::GetBytes([uint32]0x400).CopyTo($bytes, $sectionOffset + 16)
+    [BitConverter]::GetBytes([uint32]0x200).CopyTo($bytes, $sectionOffset + 20)
+
+    [BitConverter]::GetBytes([uint32]0x1100).CopyTo($bytes, 0x200)
+    [BitConverter]::GetBytes([uint32]0x1080).CopyTo($bytes, 0x20C)
+    [BitConverter]::GetBytes([uint32]0x1110).CopyTo($bytes, 0x210)
+    [BitConverter]::GetBytes([uint32]1).CopyTo($bytes, 0x240)
+    [BitConverter]::GetBytes([uint32]0x10A0).CopyTo($bytes, 0x244)
+    [BitConverter]::GetBytes([uint32]0x1120).CopyTo($bytes, 0x24C)
+    [BitConverter]::GetBytes([uint32]0x1130).CopyTo($bytes, 0x250)
+    ([System.Text.Encoding]::ASCII.GetBytes($NormalImport + [char]0)).CopyTo($bytes, 0x280)
+    ([System.Text.Encoding]::ASCII.GetBytes($DelayImport + [char]0)).CopyTo($bytes, 0x2A0)
     [System.IO.File]::WriteAllBytes($Path, $bytes)
 }
 
@@ -144,13 +323,26 @@ try {
     Write-TestPe $x86 0x014C
     Assert-Amd64Pe $amd64
     Assert-WindowsGuiSubsystem $amd64
+    $syntheticImportReport = Assert-ReviewedWindowsPe $amd64
+    if ($syntheticImportReport.NormalImports -cnotcontains "kernel32.dll" -or
+        $syntheticImportReport.DelayImports -cnotcontains "user32.dll") {
+        throw "Synthetic PE fixture did not prove both normal and delay import parsing."
+    }
     Invoke-ExpectedFailure { Assert-Amd64Pe $x86 } "PE Machine mismatch"
     $consoleSubsystem = Join-Path $testRoot "console-subsystem.exe"
-    Write-TestPe $consoleSubsystem 0x8664
-    $consoleBytes = [System.IO.File]::ReadAllBytes($consoleSubsystem)
-    [BitConverter]::GetBytes([uint16]3).CopyTo($consoleBytes, 0x9C)
-    [System.IO.File]::WriteAllBytes($consoleSubsystem, $consoleBytes)
+    Write-TestPe $consoleSubsystem 0x8664 "kernel32.dll" "user32.dll" 3
     Invoke-ExpectedFailure { Assert-WindowsGuiSubsystem $consoleSubsystem } "PE subsystem mismatch"
+
+    $forbiddenNormalImport = Join-Path $testRoot "forbidden-normal-import.exe"
+    Write-TestPe $forbiddenNormalImport 0x8664 "whisper.dll" "user32.dll"
+    Invoke-ExpectedFailure {
+        Assert-ReviewedWindowsPe $forbiddenNormalImport
+    } "unreviewed normal import DLL: whisper.dll"
+    $forbiddenDelayImport = Join-Path $testRoot "forbidden-delay-import.exe"
+    Write-TestPe $forbiddenDelayImport 0x8664 "kernel32.dll" "onnxruntime.dll"
+    Invoke-ExpectedFailure {
+        Assert-ReviewedWindowsPe $forbiddenDelayImport
+    } "unreviewed delay import DLL: onnxruntime.dll"
 
     $pwshPath = (Get-Process -Id $PID).Path
     $nativeProcess = Invoke-NativeProcess $pwshPath @(
@@ -163,6 +355,79 @@ try {
         $nativeProcess.Stderr -ne "captured-error") {
         throw "Synchronous native-process capture did not preserve exit, stdout, and stderr evidence."
     }
+
+    $sharingViolation = [System.IO.IOException]::new('synthetic sharing violation', -2147024864)
+    $accessDenied = [System.IO.IOException]::new('synthetic access denied', -2147024891)
+    if (-not (Test-TemporaryCleanupSharingViolation $sharingViolation)) {
+        throw 'Temporary cleanup did not classify Win32 sharing violations as retryable.'
+    }
+    if (Test-TemporaryCleanupSharingViolation $accessDenied) {
+        throw 'Temporary cleanup must not retry non-sharing failures.'
+    }
+
+    $cleanupSuccessToken = [guid]::NewGuid().ToString('N')
+    $cleanupSuccessRoot = Join-Path ([System.IO.Path]::GetTempPath()) "scribe-release-package-verifier-$cleanupSuccessToken"
+    $cleanupSuccessLog = Join-Path $cleanupSuccessRoot 'stable-emergency-uninstall.log'
+    $cleanupSuccessReady = Join-Path $cleanupSuccessRoot 'holder-ready'
+    New-Item -ItemType Directory -Path $cleanupSuccessRoot | Out-Null
+    [System.IO.File]::WriteAllText($cleanupSuccessLog, 'synthetic held log')
+    $cleanupSuccessHolder = $null
+    try {
+        $cleanupSuccessHolder = Start-TestLogHandleHolder $pwshPath $cleanupSuccessLog $cleanupSuccessReady 500
+        Wait-TestLogHandleHolderReady $cleanupSuccessHolder $cleanupSuccessReady
+        Remove-ValidatedTemporaryRoot $cleanupSuccessRoot -MaximumAttempts 8 -MaximumRetryMilliseconds 2000
+        if (Test-Path -LiteralPath $cleanupSuccessRoot) {
+            throw 'Temporary cleanup did not remove the synthetic token-bound root after the held log was released.'
+        }
+    }
+    finally {
+        if ($null -ne $cleanupSuccessHolder) {
+            $null = $cleanupSuccessHolder.WaitForExit(5000)
+            $cleanupSuccessHolder.Dispose()
+        }
+        if (Test-Path -LiteralPath $cleanupSuccessRoot) {
+            Remove-ValidatedTemporaryRoot $cleanupSuccessRoot
+        }
+    }
+
+    $cleanupExhaustionToken = [guid]::NewGuid().ToString('N')
+    $cleanupExhaustionRoot = Join-Path ([System.IO.Path]::GetTempPath()) "scribe-release-package-verifier-$cleanupExhaustionToken"
+    $cleanupExhaustionLog = Join-Path $cleanupExhaustionRoot 'stable-emergency-uninstall.log'
+    $cleanupExhaustionReady = Join-Path $cleanupExhaustionRoot 'holder-ready'
+    New-Item -ItemType Directory -Path $cleanupExhaustionRoot | Out-Null
+    [System.IO.File]::WriteAllText($cleanupExhaustionLog, 'synthetic held log')
+    $cleanupExhaustionHolder = $null
+    try {
+        $cleanupExhaustionHolder = Start-TestLogHandleHolder $pwshPath $cleanupExhaustionLog $cleanupExhaustionReady 1500
+        Wait-TestLogHandleHolderReady $cleanupExhaustionHolder $cleanupExhaustionReady
+        Invoke-ExpectedFailure {
+            Remove-ValidatedTemporaryRoot $cleanupExhaustionRoot -MaximumAttempts 2 -MaximumRetryMilliseconds 250
+        } 'being used by another process'
+        if (-not (Test-Path -LiteralPath $cleanupExhaustionRoot)) {
+            throw 'Temporary cleanup unexpectedly removed the synthetic root while its log remained held.'
+        }
+    }
+    finally {
+        if ($null -ne $cleanupExhaustionHolder) {
+            $null = $cleanupExhaustionHolder.WaitForExit(5000)
+            $cleanupExhaustionHolder.Dispose()
+        }
+        if (Test-Path -LiteralPath $cleanupExhaustionRoot) {
+            Remove-ValidatedTemporaryRoot $cleanupExhaustionRoot
+        }
+    }
+
+    $validSmoke = [pscustomobject]@{
+        cancellation_verified = $true
+        capabilities = [pscustomobject]@{ cancellation = $true }
+        detected_architecture = "whisper"
+    }
+    Assert-ReleaseSmokeDiagnostics $validSmoke
+    $wrongArchitectureSmoke = $validSmoke.PSObject.Copy()
+    $wrongArchitectureSmoke.detected_architecture = "whisper-compatible"
+    Invoke-ExpectedFailure {
+        Assert-ReleaseSmokeDiagnostics $wrongArchitectureSmoke
+    } "expected detected architecture 'whisper'"
 
     $final = Join-Path $testRoot "Scribe-windows-x64"
     $validStaging = "$final.staging-$PID-$([guid]::NewGuid().ToString('N'))"
@@ -196,7 +461,7 @@ try {
 
     $inventoryFile = Join-Path $allowlist "one.bin"
     $inventoryItem = Get-Item -LiteralPath $inventoryFile
-    $inventoryHash = (Get-FileHash -LiteralPath $inventoryFile -Algorithm SHA256).Hash
+    $inventoryHash = (Get-FileHash -LiteralPath $inventoryFile -Algorithm SHA256).Hash.ToLowerInvariant()
     Assert-ExactFile $inventoryFile $inventoryItem.Length $inventoryHash
     [System.IO.File]::WriteAllBytes($inventoryFile, [byte[]](9))
     Invoke-ExpectedFailure {
@@ -205,10 +470,50 @@ try {
 
     $targetBundle = Join-Path $repositoryRoot "target\scribe-release-probe-$PID"
     Invoke-ExpectedFailure {
-        & $releaseScript -ModelSource "missing-model" -RuntimeSource "missing-runtime" -BundlePath $targetBundle
+        & $releaseScript -ModelSource "missing-model" -BundlePath $targetBundle
     } "Cargo target directories"
     if (Test-Path -LiteralPath $targetBundle) {
         throw "Rejected Cargo-target bundle path was mutated."
+    }
+
+    $previousCargoTargetDirectory = $env:CARGO_TARGET_DIR
+    $externalCargoTarget = Join-Path $testRoot "external-cargo-target"
+    try {
+        $env:CARGO_TARGET_DIR = $externalCargoTarget
+        Invoke-ExpectedFailure {
+            & $releaseScript -ModelSource "missing-model" -BundlePath (Join-Path $externalCargoTarget "portable")
+        } "Cargo target directories"
+    }
+    finally {
+        $env:CARGO_TARGET_DIR = $previousCargoTargetDirectory
+    }
+    if (Test-Path -LiteralPath $externalCargoTarget) {
+        throw "Rejected external Cargo-target bundle path was mutated."
+    }
+
+    $relativeCargoTarget = "relative-cargo-target-$PID"
+    $resolvedRelativeCargoTarget = Join-Path $repositoryRoot $relativeCargoTarget
+    $differentWorkingDirectory = Join-Path $testRoot "different-cwd"
+    New-Item -ItemType Directory -Path $differentWorkingDirectory | Out-Null
+    try {
+        $env:CARGO_TARGET_DIR = $relativeCargoTarget
+        Push-Location $differentWorkingDirectory
+        try {
+            Invoke-ExpectedFailure {
+                & $releaseScript `
+                    -ModelSource "missing-model" `
+                    -BundlePath (Join-Path $resolvedRelativeCargoTarget "portable")
+            } "Cargo target directories"
+        }
+        finally {
+            Pop-Location
+        }
+    }
+    finally {
+        $env:CARGO_TARGET_DIR = $previousCargoTargetDirectory
+    }
+    if (Test-Path -LiteralPath $resolvedRelativeCargoTarget) {
+        throw "Rejected repository-relative Cargo target was mutated."
     }
 
     $existingFinal = Join-Path $testRoot "existing-final"
@@ -216,7 +521,7 @@ try {
     $existingMarker = Join-Path $existingFinal "keep.bin"
     [System.IO.File]::WriteAllBytes($existingMarker, [byte[]](7))
     Invoke-ExpectedFailure {
-        & $releaseScript -ModelSource "missing-model" -RuntimeSource "missing-runtime" -BundlePath $existingFinal
+        & $releaseScript -ModelSource "missing-model" -BundlePath $existingFinal
     } "already exists"
     if (-not (Test-Path -LiteralPath $existingMarker -PathType Leaf)) {
         throw "Existing final bundle was mutated."
@@ -228,7 +533,7 @@ try {
     $staleMarker = Join-Path $stale "keep.bin"
     [System.IO.File]::WriteAllBytes($staleMarker, [byte[]](8))
     Invoke-ExpectedFailure {
-        & $releaseScript -ModelSource "missing-model" -RuntimeSource "missing-runtime" -BundlePath $staleFinal
+        & $releaseScript -ModelSource "missing-model" -BundlePath $staleFinal
     } "stale release staging sibling"
     if (-not (Test-Path -LiteralPath $staleMarker -PathType Leaf)) {
         throw "Stale staging refusal mutated the stale directory."
@@ -256,6 +561,11 @@ try {
     $workflow = Get-Content -LiteralPath (Join-Path $repositoryRoot ".github\workflows\release.yml") -Raw
     if ($workflow -notmatch "prepare-windows-release-inputs\.ps1" -or
         $workflow -notmatch "build-windows-release\.ps1" -or
+        $workflow -notmatch "INNO_NUPKG_SHA256: a0dad33db33099d9cd2b89ac2d08b5d70c589b15118ced3b95f469f044f99950" -or
+        $workflow -notmatch "INNO_INSTALLER_SHA256: 4d11e8050b6185e0d49bd9e8cc661a7a59f44959a621d31d11033124c4e8a7b0" -or
+        $workflow -match "choco install innosetup" -or
+        $workflow -notmatch "-PortableZipPath dist\\Scribe-windows-x64\.zip" -or
+        $workflow -match "-RuntimeSource" -or
         $workflow -match "Copy-Item target\\release\\local-transcriber\.exe") {
         throw "Windows release workflow must package the validated full bundle, not a bare executable."
     }
@@ -457,6 +767,12 @@ Set-StrictMode -Version Latest
         $contractTestPosition -ge $releaseBuildPosition) {
         throw "Windows release packaging contracts must run before release input preparation and build."
     }
+    $portableZipPosition = $workflow.IndexOf('Compress-Archive -Path dist\portable\*')
+    $payloadParityPosition = $workflow.IndexOf('-PortableZipPath dist\Scribe-windows-x64.zip')
+    if ($portableZipPosition -lt 0 -or
+        $payloadParityPosition -le $portableZipPosition) {
+        throw "Portable ZIP creation must precede portable/installer parity verification."
+    }
     $assetValidationPosition = $workflow.IndexOf("`$assetRoot =")
     $rulesetPreflightPosition = $workflow.IndexOf("`$requiredRulesetName = 'Protect release tags'")
     $atomicTagPosition = $workflow.IndexOf('gh api --method POST')
@@ -472,25 +788,362 @@ Set-StrictMode -Version Latest
         $workflow -notmatch '(?ms)^permissions:\s+contents: read') {
         throw "GitHub contents write permission must remain scoped to the release job."
     }
+    $usesLines = @($workflow -split "`r?`n" | Where-Object { $_ -match '^\s*uses:\s*' })
+    foreach ($usesLine in $usesLines) {
+        if ($usesLine -notmatch '^\s*uses:\s*[^@\s]+@[0-9a-f]{40}(?:\s+#.*)?$') {
+            throw "Every GitHub Action reference must use an immutable full commit SHA: $usesLine"
+        }
+    }
+    if ($workflow -notmatch 'dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e\s+# 1\.96\.0' -or
+        $workflow -notmatch '-ExerciseStableUpgrade' -or
+        $workflow -notmatch '-EvidenceDirectory dist\\installer-verification-logs' -or
+        $workflow -notmatch '(?ms)name: Upload installer verification evidence\s+if: always\(\).*?name: windows-installer-verification-logs') {
+        throw "Windows release workflow must pin Rust, exercise compiled installer contracts, and retain their logs."
+    }
+    $innoProvenancePath = Join-Path $repositoryRoot 'installer\inno-setup-6.7.1-provenance.json'
+    $innoProvenance = Get-Content -LiteralPath $innoProvenancePath -Raw | ConvertFrom-Json
+    if ($innoProvenance.schema_version -ne 1 -or
+        $innoProvenance.product_version -cne '6.7.1' -or
+        $innoProvenance.package_url -cne 'https://community.chocolatey.org/api/v2/package/InnoSetup/6.7.1' -or
+        $innoProvenance.package_size_bytes -ne 10017031 -or
+        $innoProvenance.package_sha256 -cne 'a0dad33db33099d9cd2b89ac2d08b5d70c589b15118ced3b95f469f044f99950' -or
+        $innoProvenance.embedded_installer_path -cne 'tools/innosetup-6.7.1.exe' -or
+        $innoProvenance.embedded_installer_size_bytes -ne 10619024 -or
+        $innoProvenance.embedded_installer_sha256 -cne '4d11e8050b6185e0d49bd9e8cc661a7a59f44959a621d31d11033124c4e8a7b0' -or
+        $innoProvenance.compiler_relative_path -cne 'ISCC.exe' -or
+        $innoProvenance.compiler_size_bytes -ne 1455248 -or
+        $innoProvenance.compiler_sha256 -cne 'eb6f4410c8db367a5f74127e8025ad2ccacc0afabbe783959d237df3050f97fb' -or
+        $innoProvenance.upstream_installer_url -cne 'https://files.jrsoftware.org/is/6/innosetup-6.7.1.exe') {
+        throw "Inno Setup provenance must retain the reviewed source, version, sizes, and digests."
+    }
+    foreach ($pinnedInnoValue in @(
+        "INNO_NUPKG_SHA256: $($innoProvenance.package_sha256)",
+        "INNO_NUPKG_SIZE: '$($innoProvenance.package_size_bytes)'",
+        "INNO_INSTALLER_SHA256: $($innoProvenance.embedded_installer_sha256)",
+        "INNO_INSTALLER_SIZE: '$($innoProvenance.embedded_installer_size_bytes)'",
+        "INNO_COMPILER_SHA256: $($innoProvenance.compiler_sha256)",
+        "INNO_COMPILER_SIZE: '$($innoProvenance.compiler_size_bytes)'"
+    )) {
+        if (-not $workflow.Contains($pinnedInnoValue)) {
+            throw "Windows release workflow differs from reviewed Inno provenance: $pinnedInnoValue"
+        }
+    }
+    Assert-InnoCompilerWorkflowContract $workflow
+    $buildStepAnchor = '      - name: Build and normalize Windows installer'
+    $compilerHashLine = '          $isccHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $iscc).Hash.ToLowerInvariant()'
+    $compilerInvocationLine = '          & $iscc "/DAppVersion=$env:APP_VERSION" installer\scribe.iss'
+    foreach ($mutation in @(
+        @{
+            Name = 'missing installer wait'
+            Expected = 'acquisition'
+            Action = {
+                param($text)
+                Replace-FirstExact $text '-Wait -PassThru -WindowStyle Hidden' '-PassThru -WindowStyle Hidden'
+            }
+        },
+        @{
+            Name = 'missing compiler size pin'
+            Expected = 'acquisition'
+            Action = {
+                param($text)
+                Replace-FirstExact $text '$isccFile.Length -ne [int64]$env:INNO_COMPILER_SIZE' '$false'
+            }
+        },
+        @{
+            Name = 'wrong compiler hash source'
+            Expected = 'acquisition'
+            Action = {
+                param($text)
+                Replace-FirstExact $text 'Get-FileHash -Algorithm SHA256 -LiteralPath $iscc' 'Get-FileHash -Algorithm SHA256 -LiteralPath $installerPath'
+            }
+        },
+        @{
+            Name = 'compiler invocation before final hash'
+            Expected = 'pre-invocation'
+            Action = {
+                param($text)
+                $withoutInvocation = Replace-ExactAfter $text $buildStepAnchor $compilerInvocationLine ''
+                Replace-ExactAfter $withoutInvocation $buildStepAnchor $compilerHashLine "$compilerInvocationLine`n$compilerHashLine"
+            }
+        },
+        @{
+            Name = 'unquoted installer directory'
+            Expected = '/DIR'
+            Action = {
+                param($text)
+                Replace-FirstExact $text '(''"/DIR={0}"'' -f $installRoot)' '("/DIR={0}" -f $installRoot)'
+            }
+        }
+    )) {
+        $mutatedWorkflow = & $mutation.Action $workflow
+        Invoke-ExpectedFailure {
+            Assert-InnoCompilerWorkflowContract $mutatedWorkflow
+        } $mutation.Expected
+    }
     $installer = Get-Content -LiteralPath (Join-Path $repositoryRoot "installer\scribe.iss") -Raw
     if ($installer -notmatch 'Source: "\.\.\\dist\\portable\\\*"' -or
         $installer -notmatch "recursesubdirs" -or
-        $installer -notmatch "createallsubdirs") {
-        throw "Windows installer must recursively install the validated portable payload."
+        $installer -notmatch "createallsubdirs" -or
+        $installer -notmatch 'BeforeInstall: ReleasePayloadHandleForCurrentFile' -or
+        $installer -notmatch '#define StableAppIdGuid "8E0F1935-8E3D-4B1D-9A42-7C7D7C3D5E7A"' -or
+        $installer -notmatch 'DefaultDirName=\{code:ResolveDefaultDir\}' -or
+        $installer -notmatch '\{localappdata\}\\Programs\\Scribe' -or
+        $installer -notmatch 'AppId=\{code:ResolveAppId\}' -or
+        $installer -notmatch "ReadBoundedToken\('SCRIBEVERIFY'\)" -or
+        $installer -notmatch 'function PrepareToInstall' -or
+        $installer -notmatch 'function ValidateAndBindInstallTree' -or
+        $installer -notmatch 'function QueryExistingAttributes' -or
+        $installer -notmatch 'function BindDirectory' -or
+        $installer -notmatch 'function BindFileForUpdate' -or
+        $installer -notmatch 'FindFirstFileW' -or
+        $installer -notmatch 'FindNextFileW' -or
+        $installer -notmatch 'FindFirstStreamW' -or
+        $installer -notmatch 'FindNextStreamW' -or
+        $installer -notmatch 'FileShareRead or FileShareWrite' -or
+        $installer -notmatch 'GenericRead or GenericWrite' -or
+        $installer -notmatch 'FileFlagBackupSemantics or FileFlagOpenReparsePoint' -or
+        $installer -notmatch 'DLLGetLastError' -or
+        $installer -notmatch 'ErrorFileNotFound' -or
+        $installer -notmatch 'ErrorPathNotFound' -or
+        $installer -notmatch 'ErrorNoMoreFiles' -or
+        $installer -notmatch 'ErrorHandleEof' -or
+        $installer -notmatch 'FILE_ATTRIBUTE_REPARSE_POINT' -or
+        $installer -notmatch 'case-insensitive path collision' -or
+        $installer -notmatch 'alternate NTFS data stream' -or
+        $installer -notmatch 'SizeOf\(FindDataLayoutProbe\) <> 592' -or
+        $installer -notmatch 'SizeOf\(StreamDataLayoutProbe\) <> 600' -or
+        $installer -notmatch 'CreateUninstallRegKey=IsNormalInstall' -or
+        $installer -notmatch 'Check: IsNormalInstall' -or
+        $installer -notmatch 'UsePreviousAppDir=no' -or
+        $installer -notmatch 'UsePreviousLanguage=no' -or
+        $installer -notmatch 'Setup did not delete or change any existing content' -or
+        $installer -notmatch 'VerificationInstallDir\(Token\)' -or
+        $installer -notmatch 'WizardDirValue' -or
+        $installer -match '(?m)^\[(?:InstallDelete|UninstallDelete|Registry|INI)\]') {
+        throw "Windows installer must preflight and recursively install only the validated portable payload."
+    }
+    if ([regex]::Matches($installer, 'GetFileAttributesW\(').Count -ne 2) {
+        throw "Every installer attribute query must use the fail-closed error-classifying helper."
+    }
+    $inspectStart = $installer.IndexOf('function InspectExistingTree')
+    $inspectEnd = $installer.IndexOf('function ValidateAndBindInstallTree', $inspectStart)
+    $inspectSource = $installer.Substring($inspectStart, $inspectEnd - $inspectStart)
+    $firstInspectionProbe = $inspectSource.IndexOf('BindDirectory(')
+    $enumerationStart = $inspectSource.IndexOf('FindFirstFileW(')
+    $enumerationEnd = $inspectSource.LastIndexOf('FindNextFileW(')
+    if ($inspectStart -lt 0 -or
+        $inspectEnd -le $inspectStart -or
+        $firstInspectionProbe -lt 0 -or
+        $enumerationStart -le $firstInspectionProbe -or
+        $enumerationEnd -le $enumerationStart -or
+        $inspectSource -notmatch 'ErrorCode := DLLGetLastError;\s+if ErrorCode = ErrorFileNotFound' -or
+        $inspectSource -notmatch 'ErrorCode := DLLGetLastError;\s+if ErrorCode <> ErrorNoMoreFiles') {
+        throw "Installer enumeration must bind directory identity and classify native enumeration errors immediately."
+    }
+    $prepareStart = $installer.IndexOf('function PrepareToInstall')
+    $prepareEnd = $installer.IndexOf('procedure CurStepChanged', $prepareStart)
+    $lifecycleSource = $installer.Substring($prepareStart)
+    if ($prepareStart -lt 0 -or
+        $prepareEnd -le $prepareStart -or
+        $installer -notmatch 'procedure ReleaseBoundHandles' -or
+        $installer -notmatch 'procedure ReleaseInnoUninstallerHandles' -or
+        $installer -notmatch 'BoundHandles: array\[0\.\.31\] of THandle' -or
+        $installer -notmatch 'BoundHandleReleaseBeforeInnoReplacement: array\[0\.\.31\] of Boolean' -or
+        $installer -notmatch 'RetainBoundHandle\(\s*IdentityHandle' -or
+        $installer -notmatch 'RetainBoundHandle\(DirectoryHandle' -or
+        $lifecycleSource -notmatch 'if CurStep = ssPostInstall then\s+ReleaseBoundHandles\(\)' -or
+        $lifecycleSource -notmatch 'procedure DeinitializeSetup\(\);\s+begin\s+ReleaseBoundHandles\(\)') {
+        throw "Installer identity handles must remain bound through file installation and close on every completion path."
+    }
+    $uninstallerLifecycleStart = $installer.IndexOf('procedure ReleaseInnoUninstallerHandles')
+    $uninstallerLifecycleEnd = $installer.IndexOf('function ValidateNoReparseAncestors', $uninstallerLifecycleStart)
+    if ($uninstallerLifecycleStart -lt 0 -or $uninstallerLifecycleEnd -le $uninstallerLifecycleStart) {
+        throw 'Could not isolate the Inno uninstaller release contract.'
+    }
+    $uninstallerLifecycleSource = $installer.Substring($uninstallerLifecycleStart, $uninstallerLifecycleEnd - $uninstallerLifecycleStart)
+    if ($installer -match 'FileShareDelete' -or
+        $uninstallerLifecycleSource -notmatch 'function IsInnoUninstallerArtifact[\s\S]*SameStr\(RelativePath, ''unins000\.exe''\)[\s\S]*SameStr\(RelativePath, ''unins000\.dat''\)' -or
+        $uninstallerLifecycleSource -notmatch 'function BindFileForUpdate\([\s\S]*ReleaseBeforeInnoReplacement: Boolean' -or
+        $uninstallerLifecycleSource -notmatch 'IdentityAccess := 0;[\s\S]*if not ReleaseBeforeInnoReplacement then[\s\S]*IdentityAccess := GenericRead;[\s\S]*Path, IdentityAccess, FileShareRead or FileShareWrite, 0, OpenExisting' -or
+        $uninstallerLifecycleSource -notmatch 'RetainBoundHandle\([\s\S]*IdentityHandle, Path, ReleaseBeforeInnoReplacement, ErrorText\)' -or
+        $uninstallerLifecycleSource -notmatch 'if BoundHandleReleaseBeforeInnoReplacement\[I\] then[\s\S]*CloseHandle\(BoundHandles\[I\]\)' -or
+        $installer -notmatch 'if CurStep = ssInstall then[\s\S]*ReleaseInnoUninstallerHandles\(\);[\s\S]*WaitAtTestBoundary\(\)' -or
+        $installer -notmatch 'BindFileForUpdate\(\s*ChildPath, IsInnoUninstallerArtifact\(RelativePath\), ErrorText\)') {
+        throw 'Installer must release only validated Inno uninstaller handles before Inno begins file replacement while retaining payload identity handles.'
+    }
+    $uninstallerArtifactStart = $installer.IndexOf('function IsInnoUninstallerArtifact')
+    $payloadBindingStart = $installer.IndexOf('function IsAllowedExistingFile')
+    if ($payloadBindingStart -lt 0 -or $uninstallerArtifactStart -le $payloadBindingStart) {
+        throw 'Could not isolate the payload binding policy.'
+    }
+    $payloadBindingSource = $installer.Substring($payloadBindingStart, $uninstallerArtifactStart - $payloadBindingStart)
+    if ($payloadBindingSource -notmatch "SameStr\(RelativePath, 'local-transcriber\.exe'\)" -or
+        $uninstallerLifecycleSource -match 'IsInnoUninstallerArtifact\(Path\)' -or
+        $uninstallerLifecycleSource -notmatch 'RetainBoundHandle\(DirectoryHandle, Path, False, ErrorText\)') {
+        throw 'Installer uninstaller release must be selected only from the validated relative path; directories and payload bindings must remain delete-denying.'
+    }
+    $payloadReleaseStart = $installer.IndexOf('procedure ReleasePayloadHandleForCurrentFile')
+    $payloadReleaseEnd = $installer.IndexOf('function RetainBoundHandle', $payloadReleaseStart)
+    if ($payloadReleaseStart -lt 0 -or $payloadReleaseEnd -le $payloadReleaseStart) {
+        throw 'Could not isolate the per-file payload handle release contract.'
+    }
+    $payloadReleaseSource = $installer.Substring($payloadReleaseStart, $payloadReleaseEnd - $payloadReleaseStart)
+    if ($payloadReleaseSource -notmatch 'CurrentPath := RemoveBackslashUnlessRoot\(ExpandFileName\(ExpandConstant\(CurrentFilename\)\)\)' -or
+        $payloadReleaseSource -notmatch 'SameStr\(BoundHandlePaths\[I\], CurrentPath\)' -or
+        $payloadReleaseSource -notmatch 'if BoundHandleReleaseBeforeInnoReplacement\[I\] then\s+RaiseException' -or
+        $payloadReleaseSource -notmatch 'if MatchingHandleIndex <> -1 then\s+RaiseException' -or
+        $payloadReleaseSource -notmatch 'if FileExists\(CurrentPath\) then[\s\S]*if MatchingHandleIndex = -1 then\s+RaiseException' -or
+        $payloadReleaseSource -notmatch 'if not CloseHandle\(BoundHandles\[MatchingHandleIndex\]\) then' -or
+        $payloadReleaseSource -notmatch 'BoundHandles\[MatchingHandleIndex\] := InvalidHandleValue' -or
+        $payloadReleaseSource -notmatch 'else if MatchingHandleIndex <> -1 then\s+RaiseException') {
+        throw 'Payload BeforeInstall handling must release exactly one retained payload handle immediately before replacement and fail closed on absent, ambiguous, metadata, or changed paths.'
+    }
+    foreach ($existingAllowedPath in @($expectedPortablePayloadPaths) + @('unins000.exe', 'unins000.dat')) {
+        $innoPath = $existingAllowedPath.Replace('/', '\')
+        if (-not $installer.Contains("'$innoPath'")) {
+            throw "Windows installer existing-tree preflight is missing canonical path $existingAllowedPath."
+        }
+    }
+    foreach ($requiredVerifierContract in @(
+        '[switch]$ExerciseStableUpgrade',
+        '[string]$EvidenceDirectory',
+        'scribe-release-verification-$verificationToken',
+        'accepted an override outside its derived temporary destination',
+        'setCaseSensitiveInfo',
+        'Stable case-insensitive path collision',
+        'Stable unexpected legacy runtime tree',
+        'Stable payload file with alternate data stream',
+        'Stable payload directory with alternate data stream',
+        'Stable incompatible file sharing',
+        'Stable access-denied enumeration',
+        'Stable access-denied update',
+        'Stable root rename race',
+        'Stable child-directory rename race',
+        'Stable file rename race',
+        'Invoke-ReparseRefusalFixture',
+        'mutated controlled paths, bytes, metadata, entries, or streams'
+    )) {
+        if (-not $verifierSource.Contains($requiredVerifierContract)) {
+            throw "Windows package verifier is missing compiled-installer contract: $requiredVerifierContract"
+        }
+    }
+    if (-not $verifierSource.Contains('[System.IO.File]::Delete("$canonicalReadme`:scribe-test")') -or
+        -not $verifierSource.Contains('[System.IO.File]::Delete("$licensesRoot`:scribe-test")') -or
+        $verifierSource -match 'Remove-Item\s+-LiteralPath\s+\$(canonicalReadme|licensesRoot)\s+-Stream\s+"scribe-test"') {
+        throw 'Alternate-stream fixtures must clean up their exact stream through System.IO rather than the PowerShell provider.'
+    }
+    $nativeProcessStart = $verifierSource.IndexOf('function Invoke-NativeProcess')
+    $nativeProcessEnd = $verifierSource.IndexOf('function Assert-NoReparseAncestors', $nativeProcessStart)
+    $nativeProcessSource = $verifierSource.Substring($nativeProcessStart, $nativeProcessEnd - $nativeProcessStart)
+    Assert-OrderedWorkflowTokens $nativeProcessSource @(
+        '$process.Start()',
+        '$process.StandardOutput.ReadToEndAsync()',
+        '$process.StandardError.ReadToEndAsync()',
+        '$process.WaitForExit()',
+        '$stdout.GetAwaiter().GetResult()',
+        '$stderr.GetAwaiter().GetResult()',
+        'finally {',
+        '$process.Dispose()'
+    ) 'Native verifier process lifetime'
+
+    $temporaryCleanupClassifierStart = $verifierSource.IndexOf('function Test-TemporaryCleanupSharingViolation')
+    $temporaryCleanupClassifierEnd = $verifierSource.IndexOf('function Remove-ValidatedTemporaryRoot', $temporaryCleanupClassifierStart)
+    $temporaryCleanupClassifierSource = $verifierSource.Substring($temporaryCleanupClassifierStart, $temporaryCleanupClassifierEnd - $temporaryCleanupClassifierStart)
+    $cleanupStart = $verifierSource.IndexOf('function Remove-ValidatedTemporaryRoot')
+    $cleanupEnd = $verifierSource.IndexOf('function New-TestShellFixture', $cleanupStart)
+    $cleanupSource = $verifierSource.Substring($cleanupStart, $cleanupEnd - $cleanupStart)
+    Assert-OrderedWorkflowTokens $cleanupSource @(
+        '[ValidateRange(1, 20)]',
+        '$MaximumAttempts = 6',
+        '[ValidateRange(1, 5000)]',
+        '$MaximumRetryMilliseconds = 1000',
+        '$cleanupStopwatch = [System.Diagnostics.Stopwatch]::StartNew()',
+        'while ($true) {',
+        'Split-Path -Parent $resolved',
+        '^scribe-release-(?:verification|stable-test|shell-test|package-verifier)-[0-9a-f]{32}$',
+        'Assert-NoReparseAncestors $resolved',
+        'Assert-TreeHasNoReparsePoints $resolved',
+        'Remove-Item -LiteralPath $resolved -Recurse -Force',
+        'Test-TemporaryCleanupSharingViolation $_.Exception',
+        '$attempt -ge $MaximumAttempts',
+        '$cleanupStopwatch.ElapsedMilliseconds -ge $MaximumRetryMilliseconds',
+        'Start-Sleep -Milliseconds'
+    ) 'Temporary cleanup retry safety'
+    if ($temporaryCleanupClassifierSource -notmatch '\$nativeErrorCode -in @\(32, 33\)' -or
+        $cleanupSource -notmatch 'if \(-not \(Test-TemporaryCleanupSharingViolation \$_.Exception\)' -or
+        $cleanupSource -match 'ErrorAction\s+SilentlyContinue') {
+        throw 'Temporary cleanup retries must be limited to sharing or lock violations and fail closed otherwise.'
+    }
+    $stableUpgradeStart = $verifierSource.IndexOf('$stableUpgrade = Invoke-IsolatedInstallerProcess')
+    $stableUpgradeEnd = $verifierSource.IndexOf('$legacyDirectory =', $stableUpgradeStart)
+    $stableUpgradeSource = $verifierSource.Substring($stableUpgradeStart, $stableUpgradeEnd - $stableUpgradeStart)
+    Assert-OrderedWorkflowTokens $stableUpgradeSource @(
+        '$stableUpgrade = Invoke-IsolatedInstallerProcess',
+        'Assert-Bundle -Root $stableRoot -AllowedAdditionalFiles $InnoSetupUninstallerArtifacts',
+        'Assert-PayloadParity $bundle $stableRoot "Stable upgrade"',
+        '$caseCollisionToken = [guid]::NewGuid().ToString(''N'')',
+        '$caseCollisionContainer = Join-Path ([System.IO.Path]::GetTempPath()) "scribe-release-stable-test-$caseCollisionToken"',
+        'New-Item -ItemType Directory -Path $caseCollisionRoot',
+        '"file", "setCaseSensitiveInfo", $caseCollisionRoot, "enable"',
+        'Get-ChildItem -LiteralPath $stableRoot -Force',
+        'Assert-Bundle -Root $caseCollisionRoot -AllowedAdditionalFiles $InnoSetupUninstallerArtifacts',
+        'Assert-PayloadParity $bundle $caseCollisionRoot "Case-collision fixture"',
+        'Copy-Item -LiteralPath $canonicalReadme -Destination $caseCollision',
+        '"/SCRIBESTABLETEST=$caseCollisionToken"',
+        '$installer $caseCollisionInstallArguments'
+    ) 'Case-sensitive collision fixture isolation'
+    if ($verifierSource.Contains('"file", "setCaseSensitiveInfo", $stableRoot, "enable"') -or
+        -not $verifierSource.Contains('Remove-ValidatedTemporaryRoot $caseCollisionContainer')) {
+        throw 'Canonical stable upgrades must remain case-insensitive and the isolated case-collision fixture must be token-root cleaned.'
     }
 
     $verificationBundle = Join-Path $testRoot "verification-bundle"
     New-Item -ItemType Directory -Path $verificationBundle | Out-Null
-    $verificationReadme = Join-Path $verificationBundle "README.txt"
-    [System.IO.File]::WriteAllText($verificationReadme, "verified portable payload", [System.Text.UTF8Encoding]::new($false))
-    $verificationItem = Get-Item -LiteralPath $verificationReadme
+    $fixtureModelBytes = [byte[]](0x47, 0x47, 0x55, 0x46, 1, 2, 3, 4)
+    $fixtureModelHash = [Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($fixtureModelBytes)).ToLowerInvariant()
+    $fixtureModelManifest = [pscustomobject]@{
+        schema_version = 1
+        platform_triple = "x86_64-pc-windows-msvc"
+        artifact_filename = "whisper-base.en-Q8_0.gguf"
+        size_bytes = [int64]$fixtureModelBytes.Length
+        sha256 = $fixtureModelHash
+    }
+    $fixtureManifestSource = Join-Path $testRoot "fixture-model-manifest.json"
+    [System.IO.File]::WriteAllText(
+        $fixtureManifestSource,
+        ($fixtureModelManifest | ConvertTo-Json -Depth 5),
+        [System.Text.UTF8Encoding]::new($false)
+    )
+
+    foreach ($relativePath in $expectedInventoryPaths) {
+        $path = Join-Path $verificationBundle ($relativePath -replace '/', '\')
+        New-Item -ItemType Directory -Path (Split-Path -Parent $path) -Force | Out-Null
+        switch ($relativePath) {
+            "local-transcriber.exe" { Write-TestPe $path 0x8664 }
+            "whisper-base.en-Q8_0.gguf" { [System.IO.File]::WriteAllBytes($path, $fixtureModelBytes) }
+            "bundled-model-manifest.json" { Copy-Item -LiteralPath $fixtureManifestSource -Destination $path }
+            default {
+                [System.IO.File]::WriteAllText(
+                    $path,
+                    "verified fixture for $relativePath",
+                    [System.Text.UTF8Encoding]::new($false)
+                )
+            }
+        }
+    }
+
     $verificationInventory = [ordered]@{
         schema_version = 1
         platform_triple = "x86_64-pc-windows-msvc"
-        files = @([ordered]@{
-            path = "README.txt"
-            size_bytes = [int64]$verificationItem.Length
-            sha256 = (Get-FileHash -LiteralPath $verificationReadme -Algorithm SHA256).Hash.ToLowerInvariant()
+        files = @($expectedInventoryPaths | Sort-Object | ForEach-Object {
+            $relativePath = $_
+            $path = Join-Path $verificationBundle ($relativePath -replace '/', '\')
+            $item = Get-Item -LiteralPath $path
+            [ordered]@{
+                path = $relativePath
+                size_bytes = [int64]$item.Length
+                sha256 = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+            }
         })
     }
     [System.IO.File]::WriteAllText(
@@ -498,18 +1151,95 @@ Set-StrictMode -Version Latest
         ($verificationInventory | ConvertTo-Json -Depth 5),
         [System.Text.UTF8Encoding]::new($false)
     )
-    & $packageVerifier -BundlePath $verificationBundle
+    Assert-Bundle `
+        -Root $verificationBundle `
+        -ExpectedModelManifest $fixtureModelManifest `
+        -ExpectedModelManifestPath $fixtureManifestSource `
+        -ExpectedLegalFiles @()
+
+    foreach ($forbiddenPath in @(
+        "RUNTIMES/whisper/whisper.dll",
+        "nested/runtime-manifest.JSON",
+        "nested/GGML.DLL",
+        "nested/SHERPA-helper.exe",
+        "nested/onnxruntime.dll",
+        "WHISPER-CLI.EXE",
+        "main.exe",
+        "python/runner.py",
+        ".venv/module.pyd",
+        "nested/model.ONNX",
+        "nested/model.ORT"
+    )) {
+        Invoke-ExpectedFailure {
+            Assert-AllowedPayloadFile $forbiddenPath
+        } "Release payload contains"
+    }
+    foreach ($unsafePath in @("../escape.txt", "nested/../escape.txt", "C:/escape.txt", "nested\escape.txt")) {
+        Invoke-ExpectedFailure {
+            Assert-SafeRelativePayloadPath $unsafePath
+        } "unsafe"
+    }
+
+    $portableZip = Join-Path $testRoot "verification-portable.zip"
+    Compress-Archive -Path (Join-Path $verificationBundle '*') -DestinationPath $portableZip
+    Assert-SafePortableZip $portableZip
+
+    $traversalZip = Join-Path $testRoot "traversal.zip"
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $zip = [System.IO.Compression.ZipFile]::Open($traversalZip, [System.IO.Compression.ZipArchiveMode]::Create)
+    try {
+        $null = $zip.CreateEntry("../escape.txt")
+    }
+    finally {
+        $zip.Dispose()
+    }
+    Invoke-ExpectedFailure {
+        Assert-SafePortableZip $traversalZip
+    } "unsafe"
+
+    $caseCollisionZip = Join-Path $testRoot "case-collision.zip"
+    $zip = [System.IO.Compression.ZipFile]::Open($caseCollisionZip, [System.IO.Compression.ZipArchiveMode]::Create)
+    try {
+        $null = $zip.CreateEntry("README.txt")
+        $null = $zip.CreateEntry("readme.txt")
+    }
+    finally {
+        $zip.Dispose()
+    }
+    Invoke-ExpectedFailure {
+        Assert-SafePortableZip $caseCollisionZip
+    } "duplicate case-insensitive"
 
     $installedVerificationBundle = Join-Path $testRoot "installed-verification-bundle"
     Copy-Item -LiteralPath $verificationBundle -Destination $installedVerificationBundle -Recurse
     [System.IO.File]::WriteAllBytes((Join-Path $installedVerificationBundle "unins000.exe"), [byte[]](0x4D, 0x5A))
     [System.IO.File]::WriteAllBytes((Join-Path $installedVerificationBundle "unins000.dat"), [byte[]](1, 2, 3))
-    Assert-Bundle -Root $installedVerificationBundle -AllowedAdditionalFiles $InnoSetupUninstallerArtifacts
+    Assert-Bundle `
+        -Root $installedVerificationBundle `
+        -AllowedAdditionalFiles $InnoSetupUninstallerArtifacts `
+        -ExpectedModelManifest $fixtureModelManifest `
+        -ExpectedModelManifestPath $fixtureManifestSource `
+        -ExpectedLegalFiles @()
+    Assert-PayloadParity $verificationBundle $installedVerificationBundle "Installed fixture"
 
     [System.IO.File]::WriteAllBytes((Join-Path $installedVerificationBundle "unexpected-installer-payload.bin"), [byte[]](4))
     Invoke-ExpectedFailure {
-        Assert-Bundle -Root $installedVerificationBundle -AllowedAdditionalFiles $InnoSetupUninstallerArtifacts
+        Assert-Bundle `
+            -Root $installedVerificationBundle `
+            -AllowedAdditionalFiles $InnoSetupUninstallerArtifacts `
+            -ExpectedModelManifest $fixtureModelManifest `
+            -ExpectedModelManifestPath $fixtureManifestSource `
+            -ExpectedLegalFiles @()
     } "Release payload differs from its explicit inventory"
+
+    Remove-Item -LiteralPath (Join-Path $installedVerificationBundle "unexpected-installer-payload.bin")
+    $installedReadme = Join-Path $installedVerificationBundle "README.txt"
+    $readmeBytes = [System.IO.File]::ReadAllBytes($installedReadme)
+    $readmeBytes[0] = $readmeBytes[0] -bxor 0x01
+    [System.IO.File]::WriteAllBytes($installedReadme, $readmeBytes)
+    Invoke-ExpectedFailure {
+        Assert-PayloadParity $verificationBundle $installedVerificationBundle "Installed fixture"
+    } "payload parity mismatch"
 
     Write-Output "Windows release packaging fail-closed tests passed."
 }

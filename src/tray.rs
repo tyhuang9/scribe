@@ -352,7 +352,7 @@ fn ensure_tray_runtime_available() -> Result<()> {
 
     if candidates
         .iter()
-        .any(|name| unsafe { libloading::Library::new(name).is_ok() })
+        .any(|name| linux_shared_object_is_loadable(name))
     {
         Ok(())
     } else {
@@ -360,6 +360,25 @@ fn ensure_tray_runtime_available() -> Result<()> {
             "system tray unavailable: install libayatana-appindicator3-1 or libappindicator3-1"
         ))
     }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_shared_object_is_loadable(name: &str) -> bool {
+    let Ok(name) = std::ffi::CString::new(name) else {
+        return false;
+    };
+    // SAFETY: `name` is a live NUL-terminated string. We retain no symbols or
+    // pointers from the handle and immediately balance every successful open.
+    let handle = unsafe { libc::dlopen(name.as_ptr(), libc::RTLD_LAZY | libc::RTLD_LOCAL) };
+    if handle.is_null() {
+        return false;
+    }
+    // SAFETY: `handle` came from the successful `dlopen` immediately above
+    // and has not been closed or exposed elsewhere.
+    unsafe {
+        libc::dlclose(handle);
+    }
+    true
 }
 
 #[cfg(not(target_os = "linux"))]

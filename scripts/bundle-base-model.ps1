@@ -237,7 +237,6 @@ try {
             [string]$manifest.model_id,
             $destinationModel,
             "gguf",
-            "-",
             [string]$manifest.size_bytes,
             [string]$manifest.sha256,
             "cpu"

@@ -236,6 +236,126 @@ fn runtime_artifact_module_is_a_leaf_value_boundary() {
     }
 }
 
+#[test]
+fn static_gguf_and_native_onnx_are_the_only_inference_architectures() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let artifacts = fs::read_to_string(root.join("src/runtime_artifact.rs"))
+        .expect("runtime artifact source must be readable");
+    assert!(artifacts.contains("enum RuntimeArtifact"));
+    assert!(artifacts.contains("Gguf(RuntimeModel)"));
+    assert!(artifacts.contains("OnnxBundle(OnnxModelSpec)"));
+
+    let catalog = fs::read_to_string(root.join("src/model_catalog.rs"))
+        .expect("model catalog source must be readable");
+    assert!(catalog.contains("enum ArtifactFormat"));
+    assert!(catalog.contains("Gguf,"));
+
+    let worker = fs::read_to_string(root.join("src/onnx_worker.rs"))
+        .expect("inference worker source must be readable");
+    assert!(worker.contains("enum WireRuntimeArtifact"));
+    assert!(worker.contains("Gguf(WireRuntimeModel)"));
+    assert!(worker.contains("OnnxBundle(OnnxModelSpec)"));
+    assert!(worker.contains("OfflineRecognizer::create("));
+    assert!(worker.contains("OnlineRecognizer::create("));
+    assert!(worker.contains("std::env::current_exe()?"));
+    assert!(worker.contains("INFERENCE_WORKER_FLAG"));
+
+    let router = fs::read_to_string(root.join("src/runtime_router.rs"))
+        .expect("runtime router source must be readable");
+    assert!(router.contains("enum RuntimeKind"));
+    assert!(router.contains("TranscribeCpp,"));
+    assert!(router.contains("EmbeddedRuntime::new("));
+    assert!(!router.contains("Command::new"));
+
+    let manifest =
+        fs::read_to_string(root.join("Cargo.toml")).expect("Cargo manifest must be readable");
+    assert!(
+        manifest.contains("transcribe-cpp = { version = \"=0.1.3\", default-features = false }")
+    );
+}
+
+#[test]
+fn dynamic_whisper_and_standalone_runtime_paths_stay_removed() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let obsolete_paths = [
+        "src/compatibility_bridge.rs",
+        "src/runtime_catalog.rs",
+        "src/stt/whisper_cpp.rs",
+        "native/whisper_shim.c",
+    ];
+    for relative in obsolete_paths {
+        assert!(
+            !root.join(relative).exists(),
+            "retired runtime path was restored: {relative}"
+        );
+    }
+
+    let forbidden = [
+        "LegacyGgml",
+        "LegacyCompatibility",
+        "LegacyBatchAdapter",
+        "transcribe_legacy",
+        "whisper_cli",
+        "whisper-cli",
+        "whisper.dll",
+        "ggml.dll",
+        "SCRIBE_WHISPER_",
+        "SCRIBE_RUNTIME_DEST",
+        "RepairModelRuntime",
+        "MaintainModelRuntime",
+        "libloading::",
+        "scribe_whisper_",
+    ];
+    for (path, source) in rust_sources() {
+        if path == Path::new("architecture_guard.rs") {
+            continue;
+        }
+        let production = production_source_for(&path, &source);
+        for retired in forbidden {
+            assert!(
+                !production.contains(retired),
+                "retired runtime token {retired:?} remains in production source {}",
+                path.display()
+            );
+        }
+    }
+
+    let build = fs::read_to_string(root.join("build.rs")).expect("build script must be readable");
+    for retired in [
+        "whisper_shim",
+        "scribe_whisper",
+        "LoadLibrary",
+        "GetProcAddress",
+    ] {
+        assert!(
+            !build.contains(retired),
+            "dynamic Whisper build token {retired:?} was restored"
+        );
+    }
+
+    let manifest =
+        fs::read_to_string(root.join("Cargo.toml")).expect("Cargo manifest must be readable");
+    assert!(
+        !manifest
+            .lines()
+            .any(|line| line.trim_start().starts_with("libloading =")),
+        "libloading must not be a direct production dependency"
+    );
+
+    let tray = fs::read_to_string(root.join("src/tray.rs")).expect("tray source must be readable");
+    for required in [
+        "CString::new(name)",
+        "libc::dlopen",
+        "libc::RTLD_LAZY | libc::RTLD_LOCAL",
+        "libc::dlclose(handle)",
+    ] {
+        assert!(
+            tray.contains(required),
+            "Linux tray availability probe must retain {required:?}"
+        );
+    }
+}
+
 const WORKER_RUNTIME_MARKER: &str = "worker-only native runtime";
 const NATIVE_RUNTIME_OWNER_PATHS: [&str; 3] =
     ["embedded_runtime.rs", "onnx_worker.rs", "runtime_router.rs"];
@@ -682,45 +802,37 @@ fn retired_python_provider_stack_stays_absent_without_crossing_native_boundaries
             );
         }
     }
-    let dependency_defaults = fs::read_to_string(root.join("scripts/runtime-dependencies.env"))
-        .expect("runtime dependency defaults must be readable");
-    assert!(
-        dependency_defaults
-            .lines()
-            .all(|line| line.trim().is_empty() || line.trim_start().starts_with('#')),
-        "retired Python dependency pins were restored"
-    );
-    let dependency_checker =
-        fs::read_to_string(root.join("scripts/check-runtime-dependency-updates.py"))
-            .expect("dependency checker must be readable");
-    assert_eq!(
-        dependency_checker
-            .lines()
-            .find(|line| line.trim_start().starts_with("PINNED_PACKAGES:"))
-            .map(str::trim),
-        Some("PINNED_PACKAGES: dict[str, str] = {}")
-    );
+    for removed_runtime_maintenance_path in [
+        "scripts/runtime-dependencies.env",
+        "scripts/check-runtime-dependency-updates.py",
+    ] {
+        assert!(
+            !root.join(removed_runtime_maintenance_path).exists(),
+            "retired dynamic runtime maintenance tool was restored: {removed_runtime_maintenance_path}"
+        );
+    }
 
     let stt = fs::read_to_string(root.join("src/stt/mod.rs"))
-        .expect("STT compatibility module must be readable");
-    let direct_dispatch = production_source(&stt)
-        .split("pub fn transcribe_with_config")
-        .nth(1)
-        .expect("direct compatibility dispatch exists")
-        .to_owned();
+        .expect("STT cancellation module must be readable");
+    let direct_dispatch = production_source(&stt);
     assert!(
         !direct_dispatch.contains("provider_for_backend"),
-        "direct compatibility dispatch must not perform provider lookup"
+        "STT cancellation boundary must not perform provider lookup"
     );
+    assert!(!direct_dispatch.contains("Command::new"));
 
     for retained_path in [
         "vendor/sherpa-onnx-sys/LICENSE",
         "native/sherpa-onnx-v1.13.5/PROVENANCE.md",
+        "native/transcribe-cpp-v0.1.3/LICENSE",
+        "native/transcribe-cpp-v0.1.3/PROVENANCE.md",
+        "native/whisper-f049fff/LICENSE",
+        "native/whisper-f049fff/PROVENANCE.md",
         "resources/licenses/Moonshine-MIT.txt",
     ] {
         assert!(
             root.join(retained_path).is_file(),
-            "native Sherpa/Moonshine evidence was removed: {retained_path}"
+            "native transcription/Sherpa/Moonshine evidence was removed: {retained_path}"
         );
     }
 }
@@ -732,7 +844,6 @@ fn private_onnx_runtime_contract_does_not_leak_into_product_surfaces() {
         Path::new("app.rs"),
         Path::new("config.rs"),
         Path::new("model_catalog.rs"),
-        Path::new("runtime_catalog.rs"),
     ];
     let forbidden = [
         "OnnxModelSpec",
@@ -816,7 +927,6 @@ fn application_and_ui_sources_are_runtime_neutral() {
 fn model_family_logic_is_confined_to_private_adapters_and_catalog_validation() {
     let sources = rust_sources();
     let allowed_files = [
-        "compatibility_bridge.rs",
         "config.rs",
         "installations.rs",
         "managed_downloads.rs",
@@ -824,7 +934,6 @@ fn model_family_logic_is_confined_to_private_adapters_and_catalog_validation() {
         "models.rs",
         "onnx_model_bundles.rs",
         "runtime_artifact.rs",
-        "runtime_catalog.rs",
         "runtime_router.rs",
         "settings/schema.rs",
         "silero_vad_native.rs",
@@ -888,11 +997,7 @@ fn onnx_bundle_http_and_typed_receipts_stay_below_the_service_boundary() {
     assert!(bundles.contains("fn verified_receipt_at("));
     assert!(bundles.contains("OnnxModelSpec"));
 
-    for protected in [
-        Path::new("model_catalog.rs"),
-        Path::new("models.rs"),
-        Path::new("runtime_catalog.rs"),
-    ] {
+    for protected in [Path::new("model_catalog.rs"), Path::new("models.rs")] {
         let production = sources
             .iter()
             .find(|(path, _)| path == protected)
@@ -1107,21 +1212,30 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
             "release packaging must not download the bundled model via {forbidden}"
         );
     }
+    assert!(
+        !bundler.contains("\"-\","),
+        "bundled model smoke must use the current self-contained helper protocol"
+    );
 
     let release = fs::read_to_string(repository.join("scripts").join("build-windows-release.ps1"))
         .expect("Windows release script must be readable");
     for required in [
         "cargo build --locked --offline --release --all-features --target $targetTriple",
         "x86_64-pc-windows-msvc",
-        r#"target\$targetTriple\release"#,
+        "CARGO_TARGET_DIR",
+        "[System.IO.Path]::IsPathFullyQualified($env:CARGO_TARGET_DIR)",
+        "Join-Path $repositoryRoot $env:CARGO_TARGET_DIR",
+        r#"$cargoTargetRoot "$targetTriple\release""#,
         "Assert-Amd64Pe",
         "0x8664",
         "Assert-SafeStagingPath",
         "Remove-ValidatedStaging",
         "Assert-ExactAllowlist",
+        "Assert-AllowedPayloadFile",
         "bundle-inventory.json",
         "README.txt",
         "Assert-WindowsGuiSubsystem",
+        "Assert-ReviewedWindowsPe",
         "Windows GUI (2)",
         "Invoke-NativeProcess",
         "RedirectStandardOutput",
@@ -1130,6 +1244,19 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
         r#"artifacts\Scribe-windows-x64"#,
         "Final release bundle already exists",
         "A stale release staging sibling exists",
+        "licenses/THIRD-PARTY-NOTICES.txt",
+        "licenses/transcribe.cpp-MIT.txt",
+        "licenses/transcribe.cpp-PROVENANCE.md",
+        "licenses/whisper.cpp-MIT.txt",
+        "licenses/whisper.cpp-PROVENANCE.md",
+        "licenses/sherpa-onnx-PROVENANCE.md",
+        "licenses/Silero-VAD-MIT.txt",
+        "licenses/Silero-VAD-PROVENANCE.md",
+        "This release workflow does not claim Authenticode signing",
+        "setup refuses safely and does not delete or change that content",
+        "Do not delete per-user app data or external/imported models as part of rollback",
+        "Assert-ReleaseSmokeDiagnostics",
+        r#"detected architecture 'whisper'"#,
     ] {
         assert!(
             release.contains(required),
@@ -1148,16 +1275,47 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
     )
     .expect("release input preparation script must be readable");
     for required in [
-        "whisper-cpp-v1.9.1-windows-x64.json",
         "whisper-base-en-q8_0-windows-x64.json",
         "Get-FileHash",
-        "Expand-Archive",
         "huggingface.co/$modelRepository/resolve/$modelRevision/$modelFilename",
         "Release input SHA-256 mismatch",
     ] {
         assert!(
             release_inputs.contains(required),
             "release input preparation must retain {required}"
+        );
+    }
+    for forbidden in ["RuntimeSource", "runtime-manifest.json", "Expand-Archive"] {
+        assert!(
+            !release_inputs.contains(forbidden),
+            "release input preparation must not retain dynamic runtime contract {forbidden}"
+        );
+    }
+
+    for removed_runtime_path in [
+        "runtime-manifests/whisper-cpp-v1.9.1-windows-x64.json",
+        "scripts/build-release-bundle.sh",
+        "scripts/build-whisper-cuda.sh",
+        "scripts/build-whisper-ollama-cuda-backend.sh",
+        "scripts/bundle-whisper-runtime.ps1",
+        "scripts/bundle-whisper-runtime.sh",
+        "scripts/check-runtime-dependency-updates.py",
+        "scripts/runtime-dependencies.env",
+    ] {
+        assert!(
+            !repository.join(removed_runtime_path).exists(),
+            "obsolete dynamic runtime release artifact must stay removed: {removed_runtime_path}"
+        );
+    }
+    for forbidden in [
+        "RuntimeSource",
+        "runtimes/whisper_cpp",
+        "runtime-manifest.json",
+        "\"-\",",
+    ] {
+        assert!(
+            !release.contains(forbidden),
+            "self-contained release build must not stage dynamic runtime artifact {forbidden}"
         );
     }
 
@@ -1173,24 +1331,285 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
         "build-windows-release.ps1",
         "verify-windows-release-package.ps1",
         "-BundlePath dist\\portable",
+        "-PortableZipPath dist\\Scribe-windows-x64.zip",
+        "actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09",
+        "actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f",
+        "dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e",
+        "INNO_NUPKG_SHA256: a0dad33db33099d9cd2b89ac2d08b5d70c589b15118ced3b95f469f044f99950",
+        "INNO_INSTALLER_SHA256: 4d11e8050b6185e0d49bd9e8cc661a7a59f44959a621d31d11033124c4e8a7b0",
+        "-ExerciseStableUpgrade",
+        "-EvidenceDirectory dist\\installer-verification-logs",
+        "name: windows-installer-verification-logs",
     ] {
         assert!(
             workflow.contains(required),
             "Windows release workflow must retain {required}"
         );
     }
+    for uses_line in workflow
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("uses:"))
+    {
+        let reference = uses_line
+            .strip_prefix("uses:")
+            .expect("uses line prefix checked")
+            .split('#')
+            .next()
+            .expect("action reference must exist")
+            .trim();
+        let (_, revision) = reference
+            .rsplit_once('@')
+            .expect("GitHub Action reference must contain @");
+        assert!(
+            revision.len() == 40
+                && revision
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+            "GitHub Action reference must use a lowercase immutable full SHA: {uses_line}"
+        );
+    }
+    assert!(
+        !workflow.contains("choco install innosetup"),
+        "Inno Setup acquisition must not trust a mutable network-only Chocolatey install"
+    );
     assert!(
         !workflow.contains("Copy-Item target\\release\\local-transcriber.exe"),
         "Windows release workflow must not publish a bare executable"
     );
+
+    let inno_provenance = fs::read_to_string(
+        repository
+            .join("installer")
+            .join("inno-setup-6.7.1-provenance.json"),
+    )
+    .expect("Inno Setup provenance must be readable");
+    for required in [
+        "\"product_version\": \"6.7.1\"",
+        "https://community.chocolatey.org/api/v2/package/InnoSetup/6.7.1",
+        "\"package_size_bytes\": 10017031",
+        "a0dad33db33099d9cd2b89ac2d08b5d70c589b15118ced3b95f469f044f99950",
+        "\"embedded_installer_path\": \"tools/innosetup-6.7.1.exe\"",
+        "\"embedded_installer_size_bytes\": 10619024",
+        "4d11e8050b6185e0d49bd9e8cc661a7a59f44959a621d31d11033124c4e8a7b0",
+        "https://files.jrsoftware.org/is/6/innosetup-6.7.1.exe",
+        "do not independently prove publisher identity",
+    ] {
+        assert!(
+            inno_provenance.contains(required),
+            "Inno Setup provenance must retain {required}"
+        );
+    }
 
     let installer = fs::read_to_string(repository.join("installer").join("scribe.iss"))
         .expect("Windows installer script must be readable");
     assert!(
         installer.contains("Source: \"..\\dist\\portable\\*\"")
             && installer.contains("recursesubdirs")
-            && installer.contains("createallsubdirs"),
-        "Windows installer must recursively copy the validated portable payload"
+            && installer.contains("createallsubdirs")
+            && installer.contains("BeforeInstall: ReleasePayloadHandleForCurrentFile")
+            && installer.contains("StableAppIdGuid \"8E0F1935-8E3D-4B1D-9A42-7C7D7C3D5E7A\"")
+            && installer.contains("DefaultDirName={code:ResolveDefaultDir}")
+            && installer.contains("{localappdata}\\Programs\\Scribe")
+            && installer.contains("AppId={code:ResolveAppId}")
+            && installer.contains("ReadBoundedToken('SCRIBEVERIFY')")
+            && installer.contains("function PrepareToInstall")
+            && installer.contains("function ValidateAndBindInstallTree")
+            && installer.contains("function QueryExistingAttributes")
+            && installer.contains("function BindDirectory")
+            && installer.contains("function BindFileForUpdate")
+            && installer.contains("function IsInnoUninstallerArtifact")
+            && installer.contains("FindFirstFileW")
+            && installer.contains("FindNextFileW")
+            && installer.contains("FindFirstStreamW")
+            && installer.contains("FindNextStreamW")
+            && installer.contains("FileShareRead or FileShareWrite")
+            && installer.contains("GenericRead or GenericWrite")
+            && installer.contains("FileFlagBackupSemantics or FileFlagOpenReparsePoint")
+            && installer.contains("DLLGetLastError")
+            && installer.contains("ErrorFileNotFound")
+            && installer.contains("ErrorPathNotFound")
+            && installer.contains("ErrorNoMoreFiles")
+            && installer.contains("ErrorHandleEof")
+            && installer.contains("FILE_ATTRIBUTE_REPARSE_POINT")
+            && installer.contains("case-insensitive path collision")
+            && installer.contains("alternate NTFS data stream")
+            && installer.contains("SizeOf(FindDataLayoutProbe) <> 592")
+            && installer.contains("SizeOf(StreamDataLayoutProbe) <> 600")
+            && installer.contains("CreateUninstallRegKey=IsNormalInstall")
+            && installer.contains("Check: IsNormalInstall")
+            && installer.contains("UsePreviousAppDir=no")
+            && installer.contains("UsePreviousLanguage=no")
+            && installer.contains("Setup did not delete or change any existing content")
+            && installer.contains("VerificationInstallDir(Token)")
+            && installer.contains("WizardDirValue"),
+        "Windows installer must preflight and recursively copy only the validated portable payload"
+    );
+    assert_eq!(
+        installer.matches("GetFileAttributesW(").count(),
+        2,
+        "every installer attribute query must use the fail-closed error-classifying helper"
+    );
+    let directory_probe_start = installer
+        .find("function BindDirectory")
+        .expect("installer directory identity binding must exist");
+    let directory_probe_end = installer[directory_probe_start..]
+        .find("function BindFileForUpdate")
+        .map(|offset| directory_probe_start + offset)
+        .expect("installer file identity binding must follow directory binding");
+    assert!(
+        !installer[directory_probe_start..directory_probe_end].contains("FileShareDelete"),
+        "installer must keep enumerated directories from being renamed after preflight"
+    );
+    let file_probe_end = installer[directory_probe_end..]
+        .find("function ValidateNoReparseAncestors")
+        .map(|offset| directory_probe_end + offset)
+        .expect("installer ancestor validator must follow file identity binding");
+    let file_probe_source = &installer[directory_probe_end..file_probe_end];
+    let uninstaller_artifact_start = installer
+        .find("function IsInnoUninstallerArtifact")
+        .expect("installer uninstaller artifact predicate must exist");
+    let uninstaller_artifact_end = installer[uninstaller_artifact_start..]
+        .find("function QueryExistingAttributes")
+        .map(|offset| uninstaller_artifact_start + offset)
+        .expect("installer attribute helper must follow uninstaller artifact predicate");
+    let uninstaller_artifact_source =
+        &installer[uninstaller_artifact_start..uninstaller_artifact_end];
+    assert!(
+        !installer.contains("FileShareDelete")
+            && uninstaller_artifact_source.contains("SameStr(RelativePath, 'unins000.exe')")
+            && uninstaller_artifact_source.contains("SameStr(RelativePath, 'unins000.dat')")
+            && uninstaller_artifact_source
+                .matches("SameStr(RelativePath,")
+                .count()
+                == 2
+            && file_probe_source.contains("ReleaseBeforeInnoReplacement: Boolean")
+            && file_probe_source.contains("IdentityAccess := 0")
+            && file_probe_source.contains("if not ReleaseBeforeInnoReplacement then")
+            && file_probe_source.contains("IdentityAccess := GenericRead")
+            && file_probe_source
+                .contains("IdentityHandle, Path, ReleaseBeforeInnoReplacement, ErrorText",)
+            && file_probe_source
+                .contains("Path, IdentityAccess, FileShareRead or FileShareWrite, 0, OpenExisting")
+            && file_probe_source
+                .contains("Path, GenericRead or GenericWrite, FileShareRead or FileShareWrite"),
+        "installer must keep normal file bindings delete-denying and tag only the exact Inno uninstaller pair for release"
+    );
+    let inspect_start = installer
+        .find("function InspectExistingTree")
+        .expect("installer tree inspector must exist");
+    let inspect_end = installer[inspect_start..]
+        .find("function ValidateAndBindInstallTree")
+        .map(|offset| inspect_start + offset)
+        .expect("stable tree validator must follow tree inspector");
+    let inspect_source = &installer[inspect_start..inspect_end];
+    let bind_file_call_start = inspect_source
+        .find("BindFileForUpdate(")
+        .expect("installer tree inspection must bind existing files");
+    let bind_file_call_end = inspect_source[bind_file_call_start..]
+        .find(") then")
+        .map(|offset| bind_file_call_start + offset)
+        .expect("installer file binding call must close before its failure branch");
+    let bind_file_call_source = &inspect_source[bind_file_call_start..bind_file_call_end];
+    let child_path_argument = bind_file_call_source
+        .find("ChildPath")
+        .expect("installer file binding must use the enumerated child path");
+    let uninstaller_argument = bind_file_call_source
+        .find("IsInnoUninstallerArtifact(RelativePath)")
+        .expect("installer file binding must classify the validated relative path");
+    let error_argument = bind_file_call_source
+        .find("ErrorText")
+        .expect("installer file binding must preserve its fail-closed error result");
+    let uninstaller_release_start = installer
+        .find("procedure ReleaseInnoUninstallerHandles")
+        .expect("installer must release Inno uninstaller handles before replacement");
+    let uninstaller_release_end = installer[uninstaller_release_start..]
+        .find("function RetainBoundHandle")
+        .map(|offset| uninstaller_release_start + offset)
+        .expect("installer retained-handle helper must follow uninstaller release helper");
+    let uninstaller_release_source = &installer[uninstaller_release_start..uninstaller_release_end];
+    let payload_release_start = installer
+        .find("procedure ReleasePayloadHandleForCurrentFile")
+        .expect("installer must release each payload handle at its BeforeInstall boundary");
+    let payload_release_end = installer[payload_release_start..]
+        .find("function RetainBoundHandle")
+        .map(|offset| payload_release_start + offset)
+        .expect("installer retained-handle helper must follow payload release helper");
+    let payload_release_source = &installer[payload_release_start..payload_release_end];
+    let lifecycle_start = installer
+        .find("function PrepareToInstall")
+        .expect("installer preflight lifecycle must exist");
+    let lifecycle_source = &installer[lifecycle_start..];
+    assert!(
+        child_path_argument < uninstaller_argument
+            && uninstaller_argument < error_argument
+            && file_probe_source.contains("RetainBoundHandle(")
+            && file_probe_source.contains("IdentityHandle, Path, ReleaseBeforeInnoReplacement")
+            && file_probe_source.contains("RejectAlternateStreams(Path, False")
+            && file_probe_source.contains("GenericRead or GenericWrite")
+            && uninstaller_release_source
+                .contains("if BoundHandleReleaseBeforeInnoReplacement[I] then")
+            && uninstaller_release_source.contains("CloseHandle(BoundHandles[I])")
+            && payload_release_source.contains(
+                "CurrentPath := RemoveBackslashUnlessRoot(ExpandFileName(ExpandConstant(CurrentFilename)))"
+            )
+            && payload_release_source.contains("SameStr(BoundHandlePaths[I], CurrentPath)")
+            && payload_release_source
+                .contains("if BoundHandleReleaseBeforeInnoReplacement[I] then")
+            && payload_release_source.contains("if MatchingHandleIndex <> -1 then")
+            && payload_release_source.contains("if FileExists(CurrentPath) then")
+            && payload_release_source.contains("if MatchingHandleIndex = -1 then")
+            && payload_release_source
+                .contains("if not CloseHandle(BoundHandles[MatchingHandleIndex]) then")
+            && payload_release_source
+                .contains("BoundHandles[MatchingHandleIndex] := InvalidHandleValue")
+            && payload_release_source.contains("else if MatchingHandleIndex <> -1 then")
+            && lifecycle_source.contains("ReleaseInnoUninstallerHandles();")
+            && matches!(
+                (
+                    lifecycle_source.find("ReleaseInnoUninstallerHandles();"),
+                    lifecycle_source.find("WaitAtTestBoundary();")
+                ),
+                (Some(release), Some(pause)) if release < pause
+            ),
+        "installer must retain delete-denying payload identity handles while releasing only the validated Inno metadata handles before file replacement"
+    );
+    let first_probe = inspect_source
+        .find("BindDirectory(")
+        .expect("installer enumeration must first bind directory identity");
+    let enumeration_start = inspect_source
+        .find("FindFirstFileW(")
+        .expect("installer tree inspection must use native enumeration");
+    let enumeration_end = inspect_source
+        .rfind("FindNextFileW(")
+        .expect("installer tree inspection must continue native enumeration");
+    assert!(
+        first_probe < enumeration_start && enumeration_start < enumeration_end,
+        "installer enumeration must retain a reparse-aware directory handle while reading entries"
+    );
+    assert!(
+        inspect_source.contains("if ErrorCode <> ErrorNoMoreFiles")
+            && inspect_source.contains("if ErrorCode = ErrorFileNotFound")
+            && inspect_source
+                .matches("ErrorCode := DLLGetLastError;")
+                .count()
+                == 2,
+        "installer enumeration must fail closed on start and continuation errors"
+    );
+    assert!(
+        installer.contains("BoundHandles: array[0..31] of THandle")
+            && installer.contains("procedure ReleaseBoundHandles()")
+            && lifecycle_source.contains("if CurStep = ssPostInstall then")
+            && lifecycle_source.contains("procedure DeinitializeSetup();")
+            && lifecycle_source.matches("ReleaseBoundHandles();").count() >= 4,
+        "installer must retain identity handles through installation and release them on every exit"
+    );
+    assert!(
+        !installer.contains("[InstallDelete]")
+            && !installer.contains("[UninstallDelete]")
+            && !installer.contains("[Registry]")
+            && !installer.contains("[INI]"),
+        "Windows installer must not broadly delete an existing program directory"
     );
 
     let main = fs::read_to_string(repository.join("src").join("main.rs"))
@@ -1214,6 +1633,8 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
         "Out-of-bounds cleanup",
         "outside the explicit allowlist",
         "Cargo-target bundle path",
+        "repository-relative Cargo target",
+        "expected detected architecture 'whisper'",
         "Existing final bundle",
         "Stale staging refusal",
         "exact executable name",
@@ -1221,6 +1642,15 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
         "PE subsystem mismatch",
         "Windows release workflow",
         "Windows installer",
+        "duplicate case-insensitive",
+        "Assert-SafePortableZip",
+        "Assert-PayloadParity",
+        "RUNTIMES/whisper/whisper.dll",
+        "nested/model.ONNX",
+        "python/runner.py",
+        "unreviewed normal import DLL: whisper.dll",
+        "unreviewed delay import DLL: onnxruntime.dll",
+        "setCaseSensitiveInfo",
     ] {
         assert!(
             packaging_tests.contains(required),
@@ -1240,11 +1670,53 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
         "RedirectStandardOutput",
         "WaitForExit",
         "/VERYSILENT",
-        "Assert-Bundle -Root $installedRoot -AllowedAdditionalFiles $InnoSetupUninstallerArtifacts",
+        "Assert-SafePortableZip",
+        "Assert-PayloadParity $bundle $zipRoot \"Portable ZIP\"",
+        "Assert-PayloadParity $bundle $installedRoot \"Installed\"",
+        "AllowedAdditionalFiles $InnoSetupUninstallerArtifacts",
+        "/SCRIBEVERIFY=$verificationToken",
+        "Assert-IsolatedInstallerLog",
+        "Assert-ExactTreeSnapshot",
+        "Invoke-ProtectedRenameRace",
+        "Invoke-ReparseRefusalFixture",
+        "Assert-Amd64GuiPe",
+        "Assert-ReviewedWindowsPe",
+        "[switch]$ExerciseStableUpgrade",
+        "[string]$EvidenceDirectory",
+        "accepted an override outside its derived temporary destination",
+        "Stable case-insensitive path collision",
+        "Stable unexpected legacy runtime tree",
+        "Stable payload file with alternate data stream",
+        "Stable payload directory with alternate data stream",
+        "Stable root rename race",
+        "Stable child-directory rename race",
+        "Stable file rename race",
+        "Bundle inventory paths differ from the canonical self-contained payload allowlist",
     ] {
         assert!(
             package_verifier.contains(required),
             "release payload verifier must retain {required}"
+        );
+    }
+
+    let pe_imports = fs::read_to_string(repository.join("scripts").join("windows-pe-imports.ps1"))
+        .expect("self-contained Windows PE import parser must be readable");
+    for required in [
+        "Read-PeImportDirectory",
+        r#"[ValidateSet("normal", "delay")]"#,
+        "normalDirectoryOffset",
+        "delayDirectoryOffset",
+        "Convert-PeRvaToFileOffset",
+        "Assert-ReviewedWindowsPe",
+        "unreviewed normal import DLL",
+        "unreviewed delay import DLL",
+        "api-ms-win-core-path-l1-1-0.dll",
+        "kernel32.dll",
+        "user32.dll",
+    ] {
+        assert!(
+            pe_imports.contains(required),
+            "self-contained Windows PE import parser must retain {required}"
         );
     }
 

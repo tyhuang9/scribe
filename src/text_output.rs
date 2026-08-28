@@ -416,7 +416,7 @@ pub trait ForegroundTargetVerifier {
     fn reactivate_and_verify_captured_target(&mut self, target: &CapturedTarget) -> bool;
 }
 
-#[cfg_attr(not(test), allow(dead_code))] // Retained for the existing injected-driver test API.
+#[cfg(test)]
 pub fn write_text_with_drivers<C, P>(
     clipboard: &mut C,
     paste: &mut P,
@@ -440,7 +440,7 @@ where
     )
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub fn write_text_to_captured_target_with_drivers<C, P, V>(
     clipboard: &mut C,
     paste: &mut P,

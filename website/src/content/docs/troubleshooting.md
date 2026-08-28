@@ -5,7 +5,11 @@ description: Resolve common environment and runtime issues without losing your t
 
 ## No transcript appears
 
-Confirm that a microphone is visible to the host OS and an Experimental GGUF model is installed and selected. Normal GGUF cards are runtime-ready without a separate package. Try the in-app recording control before diagnosing global hotkeys. Keep any visible transcript and copy it before changing settings.
+Confirm that a microphone is visible to the host OS and an Experimental catalog
+model is installed and selected. Normal GGUF and receipt-backed ONNX catalog
+entries are runtime-ready without a separate package. Try the in-app recording
+control before diagnosing global hotkeys. Keep any visible transcript and copy
+it before changing settings.
 
 ## “No speech was detected”
 
@@ -15,7 +19,12 @@ If normal speech does not cross a manual threshold even at `−72 dBFS`, test th
 
 ## Runtime fails or a terminal appears
 
-The default GGUF path uses statically linked `transcribe-cpp` 0.1.3 in-process and requires no Python, JSON PCM sidecar, localhost server, downloaded runtime package, or inference executable. Private legacy compatibility paths can still start short-lived CLI/Python processes and may create a console; they are not the normal UI path. If a normal GGUF fails, revalidate or reinstall the model rather than looking for a runtime package.
+The normal GGUF path uses statically linked `transcribe-cpp` 0.1.3 in Scribe's
+private persistent inference child; receipt-backed ONNX uses native Sherpa ONNX
+there too. Neither path requires Python, a JSON-PCM sidecar, localhost server,
+downloaded runtime package, GGML/DLL route, or inference CLI. VAD has its own
+separate worker/process path. If a model fails, revalidate or reinstall that
+model rather than looking for a runtime package.
 
 ## Linux tray or startup issue
 

@@ -1,5 +1,10 @@
 # Settings navigation redesign — Branch 3 evidence
 
+> **Historical evidence (superseded 2026-08-28):** This file retains dated UI
+> evidence verbatim and does not describe the current runtime or release
+> qualification state. Use the checked-in source, `docs/TECHNICAL_OVERVIEW.md`,
+> and `docs/MANUAL_TEST_MATRIX.md` for current truth.
+
 Final result: passed.
 
 ## Scope verified
