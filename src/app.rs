@@ -25937,6 +25937,7 @@ mod layout_tests {
         let _ = fs::remove_dir_all(&root);
         let primary = root.join("primary.gguf");
         let retired = root.join("retired-provider-artifact");
+        fs::create_dir_all(&root).unwrap();
         fs::write(&primary, b"model").unwrap();
         fs::write(&retired, b"retired provider artifact").unwrap();
 
