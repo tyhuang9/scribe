@@ -2885,7 +2885,7 @@ mod tests {
         };
         let actual = normalize_fixture_transcript(&execution.transcript.text);
         let expected = &fixture.transcript.normalized_text;
-        if actual != expected {
+        if actual.as_str() != expected.as_str() {
             let _ = verified.discard();
             panic!(
                 "fixture transcript must equal the required normalized expected text before activation: expected {expected:?}, got {actual:?}"
