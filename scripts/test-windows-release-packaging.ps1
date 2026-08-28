@@ -43,6 +43,46 @@ function Invoke-ExpectedFailure([scriptblock]$Action, [string]$ExpectedText) {
     throw "Expected failure containing '$ExpectedText', but the action succeeded."
 }
 
+function Start-TestLogHandleHolder(
+    [string]$PowerShellPath,
+    [string]$LogPath,
+    [string]$ReadyPath,
+    [int]$HoldMilliseconds
+) {
+    $escapedLogPath = $LogPath.Replace("'", "''")
+    $escapedReadyPath = $ReadyPath.Replace("'", "''")
+    $holderScript = @"
+`$logHandle = [System.IO.File]::Open('$escapedLogPath', [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+try {
+    [System.IO.File]::WriteAllText('$escapedReadyPath', 'ready')
+    Start-Sleep -Milliseconds $HoldMilliseconds
+}
+finally {
+    `$logHandle.Dispose()
+}
+"@
+    $encodedHolderScript = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($holderScript))
+    Start-Process -FilePath $PowerShellPath -ArgumentList @(
+        '-NoProfile', '-NonInteractive', '-EncodedCommand', $encodedHolderScript
+    ) -PassThru
+}
+
+function Wait-TestLogHandleHolderReady(
+    [System.Diagnostics.Process]$Process,
+    [string]$ReadyPath
+) {
+    $deadline = [DateTime]::UtcNow.AddSeconds(5)
+    while (-not (Test-Path -LiteralPath $ReadyPath -PathType Leaf)) {
+        if ($Process.HasExited) {
+            throw "Synthetic log-handle holder exited before acquiring its handle."
+        }
+        if ([DateTime]::UtcNow -ge $deadline) {
+            throw "Timed out waiting for synthetic log-handle holder readiness."
+        }
+        Start-Sleep -Milliseconds 20
+    }
+}
+
 function Replace-FirstExact([string]$Text, [string]$Old, [string]$New) {
     $index = $Text.IndexOf($Old, [StringComparison]::Ordinal)
     if ($index -lt 0) {
@@ -314,6 +354,67 @@ try {
         $nativeProcess.Stdout -ne "captured-output" -or
         $nativeProcess.Stderr -ne "captured-error") {
         throw "Synchronous native-process capture did not preserve exit, stdout, and stderr evidence."
+    }
+
+    $sharingViolation = [System.IO.IOException]::new('synthetic sharing violation', -2147024864)
+    $accessDenied = [System.IO.IOException]::new('synthetic access denied', -2147024891)
+    if (-not (Test-TemporaryCleanupSharingViolation $sharingViolation)) {
+        throw 'Temporary cleanup did not classify Win32 sharing violations as retryable.'
+    }
+    if (Test-TemporaryCleanupSharingViolation $accessDenied) {
+        throw 'Temporary cleanup must not retry non-sharing failures.'
+    }
+
+    $cleanupSuccessToken = [guid]::NewGuid().ToString('N')
+    $cleanupSuccessRoot = Join-Path ([System.IO.Path]::GetTempPath()) "scribe-release-package-verifier-$cleanupSuccessToken"
+    $cleanupSuccessLog = Join-Path $cleanupSuccessRoot 'stable-emergency-uninstall.log'
+    $cleanupSuccessReady = Join-Path $cleanupSuccessRoot 'holder-ready'
+    New-Item -ItemType Directory -Path $cleanupSuccessRoot | Out-Null
+    [System.IO.File]::WriteAllText($cleanupSuccessLog, 'synthetic held log')
+    $cleanupSuccessHolder = $null
+    try {
+        $cleanupSuccessHolder = Start-TestLogHandleHolder $pwshPath $cleanupSuccessLog $cleanupSuccessReady 500
+        Wait-TestLogHandleHolderReady $cleanupSuccessHolder $cleanupSuccessReady
+        Remove-ValidatedTemporaryRoot $cleanupSuccessRoot -MaximumAttempts 8 -MaximumRetryMilliseconds 2000
+        if (Test-Path -LiteralPath $cleanupSuccessRoot) {
+            throw 'Temporary cleanup did not remove the synthetic token-bound root after the held log was released.'
+        }
+    }
+    finally {
+        if ($null -ne $cleanupSuccessHolder) {
+            $null = $cleanupSuccessHolder.WaitForExit(5000)
+            $cleanupSuccessHolder.Dispose()
+        }
+        if (Test-Path -LiteralPath $cleanupSuccessRoot) {
+            Remove-ValidatedTemporaryRoot $cleanupSuccessRoot
+        }
+    }
+
+    $cleanupExhaustionToken = [guid]::NewGuid().ToString('N')
+    $cleanupExhaustionRoot = Join-Path ([System.IO.Path]::GetTempPath()) "scribe-release-package-verifier-$cleanupExhaustionToken"
+    $cleanupExhaustionLog = Join-Path $cleanupExhaustionRoot 'stable-emergency-uninstall.log'
+    $cleanupExhaustionReady = Join-Path $cleanupExhaustionRoot 'holder-ready'
+    New-Item -ItemType Directory -Path $cleanupExhaustionRoot | Out-Null
+    [System.IO.File]::WriteAllText($cleanupExhaustionLog, 'synthetic held log')
+    $cleanupExhaustionHolder = $null
+    try {
+        $cleanupExhaustionHolder = Start-TestLogHandleHolder $pwshPath $cleanupExhaustionLog $cleanupExhaustionReady 1500
+        Wait-TestLogHandleHolderReady $cleanupExhaustionHolder $cleanupExhaustionReady
+        Invoke-ExpectedFailure {
+            Remove-ValidatedTemporaryRoot $cleanupExhaustionRoot -MaximumAttempts 2 -MaximumRetryMilliseconds 250
+        } 'being used by another process'
+        if (-not (Test-Path -LiteralPath $cleanupExhaustionRoot)) {
+            throw 'Temporary cleanup unexpectedly removed the synthetic root while its log remained held.'
+        }
+    }
+    finally {
+        if ($null -ne $cleanupExhaustionHolder) {
+            $null = $cleanupExhaustionHolder.WaitForExit(5000)
+            $cleanupExhaustionHolder.Dispose()
+        }
+        if (Test-Path -LiteralPath $cleanupExhaustionRoot) {
+            Remove-ValidatedTemporaryRoot $cleanupExhaustionRoot
+        }
     }
 
     $validSmoke = [pscustomobject]@{
@@ -879,6 +980,45 @@ Set-StrictMode -Version Latest
         if (-not $verifierSource.Contains($requiredVerifierContract)) {
             throw "Windows package verifier is missing compiled-installer contract: $requiredVerifierContract"
         }
+    }
+    $nativeProcessStart = $verifierSource.IndexOf('function Invoke-NativeProcess')
+    $nativeProcessEnd = $verifierSource.IndexOf('function Assert-NoReparseAncestors', $nativeProcessStart)
+    $nativeProcessSource = $verifierSource.Substring($nativeProcessStart, $nativeProcessEnd - $nativeProcessStart)
+    Assert-OrderedWorkflowTokens $nativeProcessSource @(
+        '$process.Start()',
+        '$process.StandardOutput.ReadToEndAsync()',
+        '$process.StandardError.ReadToEndAsync()',
+        '$process.WaitForExit()',
+        '$stdout.GetAwaiter().GetResult()',
+        '$stderr.GetAwaiter().GetResult()',
+        'finally {',
+        '$process.Dispose()'
+    ) 'Native verifier process lifetime'
+
+    $cleanupStart = $verifierSource.IndexOf('function Test-TemporaryCleanupSharingViolation')
+    $cleanupEnd = $verifierSource.IndexOf('function New-TestShellFixture', $cleanupStart)
+    $cleanupSource = $verifierSource.Substring($cleanupStart, $cleanupEnd - $cleanupStart)
+    Assert-OrderedWorkflowTokens $cleanupSource @(
+        '[ValidateRange(1, 20)]',
+        '$MaximumAttempts = 6',
+        '[ValidateRange(1, 5000)]',
+        '$MaximumRetryMilliseconds = 1000',
+        '$cleanupStopwatch = [System.Diagnostics.Stopwatch]::StartNew()',
+        'while ($true) {',
+        'Split-Path -Parent $resolved',
+        '^scribe-release-(?:verification|stable-test|shell-test|package-verifier)-[0-9a-f]{32}$',
+        'Assert-NoReparseAncestors $resolved',
+        'Assert-TreeHasNoReparsePoints $resolved',
+        'Remove-Item -LiteralPath $resolved -Recurse -Force',
+        'Test-TemporaryCleanupSharingViolation $_.Exception',
+        '$attempt -ge $MaximumAttempts',
+        '$cleanupStopwatch.ElapsedMilliseconds -ge $MaximumRetryMilliseconds',
+        'Start-Sleep -Milliseconds'
+    ) 'Temporary cleanup retry safety'
+    if ($cleanupSource -notmatch '\$nativeErrorCode -in @\(32, 33\)' -or
+        $cleanupSource -notmatch 'if \(-not \(Test-TemporaryCleanupSharingViolation \$_.Exception\)' -or
+        $cleanupSource -match 'ErrorAction\s+SilentlyContinue') {
+        throw 'Temporary cleanup retries must be limited to sharing or lock violations and fail closed otherwise.'
     }
 
     $verificationBundle = Join-Path $testRoot "verification-bundle"

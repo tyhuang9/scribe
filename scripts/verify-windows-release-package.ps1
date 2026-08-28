@@ -463,19 +463,58 @@ function Assert-SafePortableZip([string]$Path) {
     }
 }
 
-function Remove-ValidatedTemporaryRoot([string]$Path) {
-    if (-not (Test-Path -LiteralPath $Path)) {
-        return
+function Test-TemporaryCleanupSharingViolation([System.Exception]$Exception) {
+    $current = $Exception
+    while ($null -ne $current) {
+        $nativeErrorCode = ([int64]$current.HResult) -band 0xFFFF
+        if ($nativeErrorCode -in @(32, 33)) {
+            return $true
+        }
+        $current = $current.InnerException
     }
-    $tempRoot = Get-NormalizedPath ([System.IO.Path]::GetTempPath())
-    $resolved = Get-NormalizedPath $Path
-    if (-not [string]::Equals((Split-Path -Parent $resolved), $tempRoot, [System.StringComparison]::OrdinalIgnoreCase) -or
-        (Split-Path -Leaf $resolved) -cnotmatch '^scribe-release-(?:verification|stable-test|shell-test|package-verifier)-[0-9a-f]{32}$') {
-        throw "Refused release verification cleanup outside its bounded temporary directory."
+    return $false
+}
+
+function Remove-ValidatedTemporaryRoot(
+    [string]$Path,
+    [ValidateRange(1, 20)]
+    [int]$MaximumAttempts = 6,
+    [ValidateRange(1, 5000)]
+    [int]$MaximumRetryMilliseconds = 1000
+) {
+    $cleanupStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $attempt = 0
+    while ($true) {
+        $tempRoot = Get-NormalizedPath ([System.IO.Path]::GetTempPath())
+        $resolved = Get-NormalizedPath $Path
+        if (-not [string]::Equals((Split-Path -Parent $resolved), $tempRoot, [System.StringComparison]::OrdinalIgnoreCase) -or
+            (Split-Path -Leaf $resolved) -cnotmatch '^scribe-release-(?:verification|stable-test|shell-test|package-verifier)-[0-9a-f]{32}$') {
+            throw "Refused release verification cleanup outside its bounded temporary directory."
+        }
+        if (-not (Test-Path -LiteralPath $resolved)) {
+            return
+        }
+        Assert-NoReparseAncestors $resolved
+        Assert-TreeHasNoReparsePoints $resolved
+        try {
+            Remove-Item -LiteralPath $resolved -Recurse -Force
+            return
+        }
+        catch {
+            $attempt += 1
+            if (-not (Test-TemporaryCleanupSharingViolation $_.Exception) -or
+                $attempt -ge $MaximumAttempts -or
+                $cleanupStopwatch.ElapsedMilliseconds -ge $MaximumRetryMilliseconds) {
+                throw
+            }
+            $remainingMilliseconds = $MaximumRetryMilliseconds - [int]$cleanupStopwatch.ElapsedMilliseconds
+            if ($remainingMilliseconds -le 0) {
+                throw
+            }
+            $backoffMilliseconds = [Math]::Min(250, 50 * [Math]::Pow(2, $attempt - 1))
+            Start-Sleep -Milliseconds ([int][Math]::Min($backoffMilliseconds, $remainingMilliseconds))
+        }
     }
-    Assert-NoReparseAncestors $resolved
-    Assert-TreeHasNoReparsePoints $resolved
-    Remove-Item -LiteralPath $resolved -Recurse -Force
 }
 
 function New-TestShellFixture([string]$Token) {
