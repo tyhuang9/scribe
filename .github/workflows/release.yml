@@ -31,6 +31,11 @@ jobs:
         run: |
           & .\scripts\test-windows-release-packaging.ps1
 
+      - name: Test Windows installer maintenance contracts
+        shell: pwsh
+        run: |
+          & .\scripts\test-windows-installer-maintenance.ps1
+
       - name: Install Rust
         # Official dtolnay/rust-toolchain branch 1.96.0 resolved on 2026-08-27;
         # the immutable revision is guarded by the packaging and Rust tests.
