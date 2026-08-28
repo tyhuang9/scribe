@@ -1,9 +1,8 @@
-<h1 align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/branding/scribe-header-dark.svg" />
-    <img src="docs/assets/branding/scribe-header-light.svg" width="300" alt="Scribe" />
-  </picture>
-</h1>
+<p align="center">
+  <img src="assets/branding/scribe-app-icon.png" width="128" alt="Scribe app icon" />
+</p>
+
+<h1 align="center">scribe</h1>
 
 <p align="center"><strong>Lightning-fast local transcription that stays out of your way.</strong></p>
 
