@@ -9,8 +9,11 @@
   "embedded_installer_path": "tools/innosetup-6.7.1.exe",
   "embedded_installer_size_bytes": 10619024,
   "embedded_installer_sha256": "4d11e8050b6185e0d49bd9e8cc661a7a59f44959a621d31d11033124c4e8a7b0",
+  "compiler_relative_path": "ISCC.exe",
+  "compiler_size_bytes": 1455248,
+  "compiler_sha256": "eb6f4410c8db367a5f74127e8025ad2ccacc0afabbe783959d237df3050f97fb",
   "embedded_package_verification_path": "legal/VERIFICATION.txt",
   "upstream_installer_url": "https://files.jrsoftware.org/is/6/innosetup-6.7.1.exe",
-  "verification_method": "SHA-256 and byte length were recomputed for the downloaded package and embedded installer; the embedded installer ProductVersion was read from its Windows version resource.",
+  "verification_method": "SHA-256 and byte length were recomputed for the downloaded package, embedded installer, and installed ISCC.exe compiler; CI waits for the pinned installer to exit before verifying and invoking the compiler.",
   "trust_scope": "These digests pin the exact reviewed bytes used by CI. They do not independently prove publisher identity or provide code-signing verification."
 }

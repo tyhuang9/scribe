@@ -43,6 +43,101 @@ function Invoke-ExpectedFailure([scriptblock]$Action, [string]$ExpectedText) {
     throw "Expected failure containing '$ExpectedText', but the action succeeded."
 }
 
+function Replace-FirstExact([string]$Text, [string]$Old, [string]$New) {
+    $index = $Text.IndexOf($Old, [StringComparison]::Ordinal)
+    if ($index -lt 0) {
+        throw "Could not find the exact workflow fixture text to mutate: $Old"
+    }
+    $Text.Substring(0, $index) + $New + $Text.Substring($index + $Old.Length)
+}
+
+function Replace-ExactAfter(
+    [string]$Text,
+    [string]$Anchor,
+    [string]$Old,
+    [string]$New
+) {
+    $anchorIndex = $Text.IndexOf($Anchor, [StringComparison]::Ordinal)
+    if ($anchorIndex -lt 0) {
+        throw "Could not find the exact workflow fixture anchor: $Anchor"
+    }
+    $index = $Text.IndexOf($Old, $anchorIndex, [StringComparison]::Ordinal)
+    if ($index -lt 0) {
+        throw "Could not find the exact workflow fixture text after '$Anchor': $Old"
+    }
+    $Text.Substring(0, $index) + $New + $Text.Substring($index + $Old.Length)
+}
+
+function Get-WorkflowStepBlock(
+    [string]$Workflow,
+    [string]$StepName,
+    [string]$NextStepName
+) {
+    $startMarker = "      - name: $StepName"
+    $endMarker = "      - name: $NextStepName"
+    $start = $Workflow.IndexOf($startMarker, [StringComparison]::Ordinal)
+    $end = $Workflow.IndexOf($endMarker, $start + $startMarker.Length, [StringComparison]::Ordinal)
+    if ($start -lt 0 -or $end -le $start) {
+        throw "Could not isolate workflow step '$StepName'."
+    }
+    $Workflow.Substring($start, $end - $start)
+}
+
+function Assert-OrderedWorkflowTokens(
+    [string]$Block,
+    [string[]]$Tokens,
+    [string]$ContractName
+) {
+    $previous = -1
+    foreach ($token in $Tokens) {
+        $position = $Block.IndexOf($token, [StringComparison]::Ordinal)
+        if ($position -le $previous) {
+            throw "$ContractName is missing or reorders required control: $token"
+        }
+        $previous = $position
+    }
+}
+
+function Assert-InnoCompilerWorkflowContract([string]$Workflow) {
+    $acquire = Get-WorkflowStepBlock $Workflow 'Acquire digest-pinned Inno Setup' 'Build and normalize Windows installer'
+    $build = Get-WorkflowStepBlock $Workflow 'Build and normalize Windows installer' 'Package portable ZIP'
+    $quotedDirectoryArgument = '(''"/DIR={0}"'' -f $installRoot)'
+    if (-not $acquire.Contains($quotedDirectoryArgument)) {
+        throw 'Inno Setup /DIR must remain an explicitly quoted argument so workspace paths with spaces are preserved.'
+    }
+    $spaceContainingRoot = 'C:\CI workspace\inno setup'
+    $formattedDirectoryArgument = ('"/DIR={0}"' -f $spaceContainingRoot)
+    if ($formattedDirectoryArgument -cne '"/DIR=C:\CI workspace\inno setup"') {
+        throw 'Inno Setup /DIR quoting does not preserve a workspace path containing spaces.'
+    }
+    Assert-OrderedWorkflowTokens $acquire @(
+        '$installArguments = @(',
+        $quotedDirectoryArgument,
+        'Start-Process -FilePath $installerPath',
+        '-ArgumentList $installArguments',
+        '-Wait -PassThru -WindowStyle Hidden',
+        'if ($installProcess.ExitCode -ne 0)',
+        '$iscc = Join-Path $installRoot ''ISCC.exe''',
+        '$isccFile = Get-Item -LiteralPath $iscc',
+        '[System.IO.FileAttributes]::ReparsePoint',
+        '$isccFile.Length -ne [int64]$env:INNO_COMPILER_SIZE',
+        'Get-FileHash -Algorithm SHA256 -LiteralPath $iscc',
+        '$isccHash -cne $env:INNO_COMPILER_SHA256',
+        '"INNO_ISCC=$iscc" >> $env:GITHUB_ENV'
+    ) 'Inno compiler acquisition'
+    Assert-OrderedWorkflowTokens $build @(
+        '$isccFile = Get-Item -LiteralPath $iscc',
+        '[System.IO.FileAttributes]::ReparsePoint',
+        '$isccFile.Length -ne [int64]$env:INNO_ISCC_SIZE',
+        'Get-FileHash -Algorithm SHA256 -LiteralPath $iscc',
+        '$isccHash -cne $env:INNO_ISCC_SHA256',
+        '& $iscc "/DAppVersion=$env:APP_VERSION" installer\scribe.iss'
+    ) 'Inno compiler pre-invocation verification'
+    if ($acquire -match 'VersionInfo\.ProductVersion' -or $build -match 'VersionInfo\.ProductVersion') {
+        throw 'Inno compiler verification must use pinned bytes instead of unreliable PE version fields.'
+    }
+}
+
 function Write-TestPe(
     [string]$Path,
     [uint16]$Machine,
@@ -614,6 +709,9 @@ Set-StrictMode -Version Latest
         $innoProvenance.embedded_installer_path -cne 'tools/innosetup-6.7.1.exe' -or
         $innoProvenance.embedded_installer_size_bytes -ne 10619024 -or
         $innoProvenance.embedded_installer_sha256 -cne '4d11e8050b6185e0d49bd9e8cc661a7a59f44959a621d31d11033124c4e8a7b0' -or
+        $innoProvenance.compiler_relative_path -cne 'ISCC.exe' -or
+        $innoProvenance.compiler_size_bytes -ne 1455248 -or
+        $innoProvenance.compiler_sha256 -cne 'eb6f4410c8db367a5f74127e8025ad2ccacc0afabbe783959d237df3050f97fb' -or
         $innoProvenance.upstream_installer_url -cne 'https://files.jrsoftware.org/is/6/innosetup-6.7.1.exe') {
         throw "Inno Setup provenance must retain the reviewed source, version, sizes, and digests."
     }
@@ -621,11 +719,65 @@ Set-StrictMode -Version Latest
         "INNO_NUPKG_SHA256: $($innoProvenance.package_sha256)",
         "INNO_NUPKG_SIZE: '$($innoProvenance.package_size_bytes)'",
         "INNO_INSTALLER_SHA256: $($innoProvenance.embedded_installer_sha256)",
-        "INNO_INSTALLER_SIZE: '$($innoProvenance.embedded_installer_size_bytes)'"
+        "INNO_INSTALLER_SIZE: '$($innoProvenance.embedded_installer_size_bytes)'",
+        "INNO_COMPILER_SHA256: $($innoProvenance.compiler_sha256)",
+        "INNO_COMPILER_SIZE: '$($innoProvenance.compiler_size_bytes)'"
     )) {
         if (-not $workflow.Contains($pinnedInnoValue)) {
             throw "Windows release workflow differs from reviewed Inno provenance: $pinnedInnoValue"
         }
+    }
+    Assert-InnoCompilerWorkflowContract $workflow
+    $buildStepAnchor = '      - name: Build and normalize Windows installer'
+    $compilerHashLine = '          $isccHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $iscc).Hash.ToLowerInvariant()'
+    $compilerInvocationLine = '          & $iscc "/DAppVersion=$env:APP_VERSION" installer\scribe.iss'
+    foreach ($mutation in @(
+        @{
+            Name = 'missing installer wait'
+            Expected = 'acquisition'
+            Action = {
+                param($text)
+                Replace-FirstExact $text '-Wait -PassThru -WindowStyle Hidden' '-PassThru -WindowStyle Hidden'
+            }
+        },
+        @{
+            Name = 'missing compiler size pin'
+            Expected = 'acquisition'
+            Action = {
+                param($text)
+                Replace-FirstExact $text '$isccFile.Length -ne [int64]$env:INNO_COMPILER_SIZE' '$false'
+            }
+        },
+        @{
+            Name = 'wrong compiler hash source'
+            Expected = 'acquisition'
+            Action = {
+                param($text)
+                Replace-FirstExact $text 'Get-FileHash -Algorithm SHA256 -LiteralPath $iscc' 'Get-FileHash -Algorithm SHA256 -LiteralPath $installerPath'
+            }
+        },
+        @{
+            Name = 'compiler invocation before final hash'
+            Expected = 'pre-invocation'
+            Action = {
+                param($text)
+                $withoutInvocation = Replace-ExactAfter $text $buildStepAnchor $compilerInvocationLine ''
+                Replace-ExactAfter $withoutInvocation $buildStepAnchor $compilerHashLine "$compilerInvocationLine`n$compilerHashLine"
+            }
+        },
+        @{
+            Name = 'unquoted installer directory'
+            Expected = '/DIR'
+            Action = {
+                param($text)
+                Replace-FirstExact $text '(''"/DIR={0}"'' -f $installRoot)' '("/DIR={0}" -f $installRoot)'
+            }
+        }
+    )) {
+        $mutatedWorkflow = & $mutation.Action $workflow
+        Invoke-ExpectedFailure {
+            Assert-InnoCompilerWorkflowContract $mutatedWorkflow
+        } $mutation.Expected
     }
     $installer = Get-Content -LiteralPath (Join-Path $repositoryRoot "installer\scribe.iss") -Raw
     if ($installer -notmatch 'Source: "\.\.\\dist\\portable\\\*"' -or

@@ -98,6 +98,8 @@ jobs:
           INNO_NUPKG_SIZE: '10017031'
           INNO_INSTALLER_SHA256: 4d11e8050b6185e0d49bd9e8cc661a7a59f44959a621d31d11033124c4e8a7b0
           INNO_INSTALLER_SIZE: '10619024'
+          INNO_COMPILER_SHA256: eb6f4410c8db367a5f74127e8025ad2ccacc0afabbe783959d237df3050f97fb
+          INNO_COMPILER_SIZE: '1455248'
         run: |
           $packageRoot = Join-Path $env:GITHUB_WORKSPACE '.ci-tools\inno-package'
           $installRoot = Join-Path $env:GITHUB_WORKSPACE '.ci-tools\inno-setup'
@@ -126,20 +128,47 @@ jobs:
           if ($installerHash -cne $env:INNO_INSTALLER_SHA256) {
             throw "Unexpected embedded Inno Setup installer SHA-256: $installerHash"
           }
-          & $installerPath /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP- /NOICONS /CURRENTUSER "/DIR=$installRoot"
-          if ($LASTEXITCODE -ne 0) { throw "Inno Setup installation failed with exit code $LASTEXITCODE" }
+          $installArguments = @(
+            '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', '/NOICONS', '/CURRENTUSER',
+            ('"/DIR={0}"' -f $installRoot)
+          )
+          $installProcess = Start-Process -FilePath $installerPath `
+            -ArgumentList $installArguments `
+            -Wait -PassThru -WindowStyle Hidden
+          if ($installProcess.ExitCode -ne 0) { throw "Inno Setup installation failed with exit code $($installProcess.ExitCode)" }
           $iscc = Join-Path $installRoot 'ISCC.exe'
-          $isccVersion = (Get-Item -LiteralPath $iscc).VersionInfo.ProductVersion
-          if ($isccVersion -notlike '6.7.1*') { throw "Expected Inno Setup 6.7.1; found $isccVersion" }
+          $isccFile = Get-Item -LiteralPath $iscc
+          if (-not $isccFile.PSIsContainer -and ($isccFile.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq 0) {
+            if ($isccFile.Length -ne [int64]$env:INNO_COMPILER_SIZE) {
+              throw "Unexpected Inno Setup compiler size: $($isccFile.Length)"
+            }
+          } else {
+            throw "Inno Setup compiler is not a regular non-reparse file at $iscc"
+          }
+          $isccHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $iscc).Hash.ToLowerInvariant()
+          if ($isccHash -cne $env:INNO_COMPILER_SHA256) {
+            throw "Unexpected Inno Setup compiler SHA-256: $isccHash"
+          }
           "INNO_ISCC=$iscc" >> $env:GITHUB_ENV
+          "INNO_ISCC_SHA256=$($env:INNO_COMPILER_SHA256)" >> $env:GITHUB_ENV
+          "INNO_ISCC_SIZE=$($env:INNO_COMPILER_SIZE)" >> $env:GITHUB_ENV
 
       - name: Build and normalize Windows installer
         shell: pwsh
         run: |
           $iscc = $env:INNO_ISCC
           if (-not (Test-Path $iscc)) { throw "Inno Setup compiler not found at $iscc" }
-          $isccVersion = (Get-Item -LiteralPath $iscc).VersionInfo.ProductVersion
-          if ($isccVersion -notlike '6.7.1*') { throw "Expected Inno Setup 6.7.1; found $isccVersion" }
+          $isccFile = Get-Item -LiteralPath $iscc
+          if ($isccFile.PSIsContainer -or ($isccFile.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Inno Setup compiler is not a regular non-reparse file at $iscc"
+          }
+          if ($isccFile.Length -ne [int64]$env:INNO_ISCC_SIZE) {
+            throw "Unexpected Inno Setup compiler size before use: $($isccFile.Length)"
+          }
+          $isccHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $iscc).Hash.ToLowerInvariant()
+          if ($isccHash -cne $env:INNO_ISCC_SHA256) {
+            throw "Unexpected Inno Setup compiler SHA-256 before use: $isccHash"
+          }
           & $iscc "/DAppVersion=$env:APP_VERSION" installer\scribe.iss
           if ($LASTEXITCODE -ne 0) { throw "Inno Setup compilation failed with exit code $LASTEXITCODE" }
           $generated = @(Get-ChildItem -Path dist -Filter "Scribe-Setup-$env:APP_VERSION.exe" -File)
