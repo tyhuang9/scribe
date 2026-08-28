@@ -1,6 +1,4 @@
-#![cfg_attr(not(test), allow(dead_code))]
-
-use std::{collections::HashSet, path::Path};
+use std::{collections::HashSet, path::Path, sync::OnceLock};
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -171,13 +169,13 @@ pub struct EvidenceLink {
 /// Runtime-neutral compatibility exposed to the service and UI.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CompatibilityStatus {
-    Supported {
-        evidence: EvidenceLink,
-    },
+    #[cfg(test)]
+    Supported { evidence: EvidenceLink },
     Experimental {
         evidence: EvidenceLink,
         reason: &'static str,
     },
+    #[cfg(test)]
     Incompatible {
         evidence: EvidenceLink,
         reason: &'static str,
@@ -187,8 +185,10 @@ pub enum CompatibilityStatus {
 impl CompatibilityStatus {
     pub const fn label(self) -> &'static str {
         match self {
+            #[cfg(test)]
             Self::Supported { .. } => "Supported",
             Self::Experimental { .. } => "Experimental",
+            #[cfg(test)]
             Self::Incompatible { .. } => "Incompatible",
         }
     }
@@ -197,9 +197,13 @@ impl CompatibilityStatus {
 /// Curated user-facing roles. A role is valid only for a Supported model.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ModelRole {
+    #[cfg(test)]
     FastEnglish,
+    #[cfg(test)]
     BalancedMultilingual,
+    #[cfg(test)]
     HighAccuracy,
+    #[cfg(test)]
     LowMemory,
 }
 
@@ -662,8 +666,18 @@ pub(crate) fn validate_catalog() -> Result<(), String> {
     validate_manifests(MODELS)
 }
 
+fn cached_validation(
+    cache: &OnceLock<Result<(), String>>,
+    validate: impl FnOnce() -> Result<(), String>,
+) -> &Result<(), String> {
+    cache.get_or_init(validate)
+}
+
 fn assert_catalog_valid() {
-    validate_catalog().expect("normalized model catalog must satisfy evidence and integrity rules");
+    static VALIDATION: OnceLock<Result<(), String>> = OnceLock::new();
+    cached_validation(&VALIDATION, validate_catalog)
+        .as_ref()
+        .expect("normalized model catalog must satisfy evidence and integrity rules");
 }
 
 impl ModelManifest {
@@ -686,12 +700,14 @@ impl ModelManifest {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EvidenceGateDecision {
     Go,
     NoGo,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EvidenceGateCriterion {
     pub name: &'static str,
@@ -700,6 +716,7 @@ pub struct EvidenceGateCriterion {
     pub finding: &'static str,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StreamingCandidateGate {
     pub runtime_version: &'static str,
@@ -708,6 +725,7 @@ pub struct StreamingCandidateGate {
     pub criteria: &'static [EvidenceGateCriterion],
 }
 
+#[cfg(test)]
 impl StreamingCandidateGate {
     pub fn decision(self) -> EvidenceGateDecision {
         if self.criteria.iter().all(|criterion| criterion.met) {
@@ -718,6 +736,7 @@ impl StreamingCandidateGate {
     }
 }
 
+#[cfg(test)]
 const ZIPFORMER_CRITERIA: &[EvidenceGateCriterion] = &[
     EvidenceGateCriterion {
         name: "pinned-package-and-model",
@@ -775,6 +794,7 @@ const ZIPFORMER_CRITERIA: &[EvidenceGateCriterion] = &[
     },
 ];
 
+#[cfg(test)]
 pub const ZIPFORMER_STREAMING_GATE: StreamingCandidateGate = StreamingCandidateGate {
     runtime_version: "1.13.4",
     runtime_commit: "142807252687d81b40d6315f23470a1512a00de3",
@@ -840,9 +860,11 @@ fn validate_manifests(manifests: &[ModelManifest]) -> Result<(), String> {
             return Err(format!("{} has empty variant label", manifest.id));
         }
         let (status_evidence, reason) = match manifest.compatibility {
+            CompatibilityStatus::Experimental { evidence, reason } => (evidence, Some(reason)),
+            #[cfg(test)]
             CompatibilityStatus::Supported { evidence } => (evidence, None),
-            CompatibilityStatus::Experimental { evidence, reason }
-            | CompatibilityStatus::Incompatible { evidence, reason } => (evidence, Some(reason)),
+            #[cfg(test)]
+            CompatibilityStatus::Incompatible { evidence, reason } => (evidence, Some(reason)),
         };
         if status_evidence != manifest.evidence.link() {
             return Err(format!(
@@ -856,10 +878,14 @@ fn validate_manifests(manifests: &[ModelManifest]) -> Result<(), String> {
                 manifest.id
             ));
         }
-        if matches!(
-            manifest.compatibility,
-            CompatibilityStatus::Supported { .. }
-        ) {
+        let supported = match manifest.compatibility {
+            CompatibilityStatus::Experimental { .. } => false,
+            #[cfg(test)]
+            CompatibilityStatus::Supported { .. } => true,
+            #[cfg(test)]
+            CompatibilityStatus::Incompatible { .. } => false,
+        };
+        if supported {
             if !manifest.evidence.complete() {
                 return Err(format!(
                     "{} cannot be Supported without complete evidence and a receipt",
@@ -868,12 +894,7 @@ fn validate_manifests(manifests: &[ModelManifest]) -> Result<(), String> {
             }
             validate_compatibility_receipt(manifest)?;
         }
-        if !manifest.roles.is_empty()
-            && !matches!(
-                manifest.compatibility,
-                CompatibilityStatus::Supported { .. }
-            )
-        {
+        if !manifest.roles.is_empty() && !supported {
             return Err(format!(
                 "{} cannot receive a curated role before Supported status",
                 manifest.id
@@ -994,6 +1015,26 @@ fn validate_artifact(artifact: ArtifactManifest) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn immutable_catalog_validation_is_cached_once_per_once_lock() {
+        let cache = OnceLock::new();
+        let calls = Cell::new(0);
+
+        let first = cached_validation(&cache, || {
+            calls.set(calls.get() + 1);
+            Ok(())
+        });
+        let second = cached_validation(&cache, || {
+            calls.set(calls.get() + 1);
+            Err("second validation must not run".to_owned())
+        });
+
+        assert!(first.is_ok());
+        assert!(second.is_ok());
+        assert_eq!(calls.get(), 1);
+    }
 
     #[test]
     fn production_catalog_is_valid_and_has_unique_ids() {

@@ -1,5 +1,11 @@
 # Scribe revamp implementation record
 
+> **Historical record (superseded 2026-08-28):** This report preserves the
+> original dated implementation evidence verbatim. It is not the current
+> architecture or qualification contract. Use the checked-in source,
+> [technical overview](TECHNICAL_OVERVIEW.md), and live
+> [manual test matrix](MANUAL_TEST_MATRIX.md) for current truth.
+
 **Status:** Phases 0-11 are implemented on `main`, with post-Phase-11 tray and
 microphone-input checkpoints recorded through 2026-08-05. The release decision
 remains **NO-GO** pending the manual, compatibility, streaming, soak, and

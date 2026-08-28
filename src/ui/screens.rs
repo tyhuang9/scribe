@@ -26,12 +26,12 @@ use super::{
     },
     state::{
         ComparisonPhase, ComparisonResultPhase, ModelCardKey, ModelComparisonState, ModelDialog,
-        ModelDownloadState, ModelLanguageFilter, ModelManagementState, ModelSizeTier,
-        ModelSpeedTier, ModelViewModel, RecordingMode, RemoteCatalogActionKind,
-        RemoteCatalogActionView, RemoteCatalogEntryView, RemoteCatalogStatusKind,
-        RemoteCatalogVariantView, RemoteCatalogView, ResolvedTheme, SettingsSaveState, SettingsTab,
-        TranscribeNotice, TranscribeNoticeTone, TranscribeRecoveryAction, TranscriptionPhase,
-        TranscriptionState, UiRoute,
+        ModelDownloadState, ModelLanguageFilter, ModelManagementState, ModelSpeedTier,
+        ModelViewModel, RecordingMode, RemoteCatalogActionKind, RemoteCatalogActionView,
+        RemoteCatalogEntryView, RemoteCatalogStatusKind, RemoteCatalogVariantView,
+        RemoteCatalogView, ResolvedTheme, SettingsSaveState, SettingsTab, TranscribeNotice,
+        TranscribeNoticeTone, TranscribeRecoveryAction, TranscriptionPhase, TranscriptionState,
+        UiRoute,
     },
     ui_palette,
 };
@@ -595,11 +595,6 @@ pub(crate) fn render_screen(ui: &mut egui::Ui, view: &ScreenView<'_>) -> ScreenA
             "History",
             "Local dictation history remains available in production.",
         ),
-        UiRoute::About => placeholder(
-            ui,
-            "About",
-            "Scribe keeps audio and transcripts on this device.",
-        ),
         UiRoute::Debug => placeholder(
             ui,
             "Debug",
@@ -713,8 +708,7 @@ fn route_auto_id_offset(route: UiRoute) -> usize {
         // route-level range.
         UiRoute::Settings(_) => ROUTE_AUTO_ID_STRIDE * 2,
         UiRoute::History => ROUTE_AUTO_ID_STRIDE * 3,
-        UiRoute::About => ROUTE_AUTO_ID_STRIDE * 4,
-        UiRoute::Debug => ROUTE_AUTO_ID_STRIDE * 5,
+        UiRoute::Debug => ROUTE_AUTO_ID_STRIDE * 4,
     }
 }
 
@@ -1731,15 +1725,6 @@ fn transcribe(
     }
 }
 
-#[allow(dead_code)]
-fn metadata(ui: &mut egui::Ui, icon: Icon, text: &str) {
-    ui.label(
-        RichText::new(format!("{}  {text}", icon_glyph(icon)))
-            .small()
-            .color(ui_palette(ui).muted_text),
-    );
-}
-
 fn installed_model_badge_size(ui: &egui::Ui, text: &str, text_color: Color32) -> Vec2 {
     let font = egui::FontId::proportional(12.0);
     let text_width = ui
@@ -2382,10 +2367,7 @@ fn model_lifecycle_presentation<'a>(
             }
         }
         ModelCard::Local(model)
-            if matches!(
-                model.download_state,
-                ModelDownloadState::Verifying | ModelDownloadState::Extracting
-            ) =>
+            if matches!(model.download_state, ModelDownloadState::Verifying) =>
         {
             ModelLifecyclePresentation {
                 action: ScreenAction::None,
@@ -5966,7 +5948,6 @@ fn settings(
         let status = match settings.save_state {
             SettingsSaveState::Saving => "Saving…",
             SettingsSaveState::Failed => "Couldn’t save changes",
-            SettingsSaveState::Saved => "Changes saved",
             _ => "Changes save automatically",
         };
         let response = ui.label(
@@ -5974,7 +5955,7 @@ fn settings(
         );
         if matches!(
             settings.save_state,
-            SettingsSaveState::Saving | SettingsSaveState::Saved | SettingsSaveState::Failed
+            SettingsSaveState::Saving | SettingsSaveState::Failed
         ) {
             ui.ctx().accesskit_node_builder(response.id, |builder| {
                 builder.set_live(egui::accesskit::Live::Polite);
@@ -7980,28 +7961,6 @@ fn format_elapsed(elapsed_ms: u64) -> String {
         (elapsed_ms / 1_000) % 60
     )
 }
-#[allow(dead_code)]
-fn speed_label(tier: ModelSpeedTier) -> &'static str {
-    match tier {
-        ModelSpeedTier::VeryFast => "Very Fast",
-        ModelSpeedTier::Fast => "Fast",
-        ModelSpeedTier::Balanced => "Balanced Speed",
-        ModelSpeedTier::AccurateSlow => "Accurate, slower",
-        ModelSpeedTier::Unknown => "Speed unknown",
-    }
-}
-#[allow(dead_code)]
-fn size_label(tier: ModelSizeTier) -> &'static str {
-    match tier {
-        ModelSizeTier::Tiny => "Tiny Size",
-        ModelSizeTier::Small => "Small Size",
-        ModelSizeTier::Base => "Base Size",
-        ModelSizeTier::Medium => "Medium Size",
-        ModelSizeTier::Large => "Large Size",
-        ModelSizeTier::Unknown => "Size unknown",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -12102,9 +12061,8 @@ mod tests {
         let routes = [
             UiRoute::Transcribe,
             UiRoute::Models,
-            UiRoute::Settings(SettingsTab::General),
+            UiRoute::Settings(SettingsTab::About),
             UiRoute::History,
-            UiRoute::About,
             UiRoute::Debug,
         ];
         for (index, route) in routes.iter().enumerate() {
@@ -12466,7 +12424,7 @@ mod tests {
             UiRoute::Transcribe,
             UiRoute::Models,
             UiRoute::Settings(SettingsTab::Advanced),
-            UiRoute::About,
+            UiRoute::Settings(SettingsTab::About),
             UiRoute::Debug,
         ] {
             for (state_name, records, loading, expected_status) in history_states {

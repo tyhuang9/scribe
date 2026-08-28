@@ -1,0 +1,35 @@
+Scribe Windows x64 third-party notices
+======================================
+
+This inventory identifies the native code and model evidence shipped with the
+self-contained Windows payload. It records provenance; it does not replace or
+reinterpret the accompanying license texts.
+
+Whisper Base English GGUF model
+- Artifact: whisper-base.en-Q8_0.gguf
+- Evidence: bundled-model-manifest.json and licenses/Whisper-Base-En-NOTICE.txt
+- License texts retained for the model's recorded upstream metadata:
+  licenses/Apache-2.0.txt and licenses/OpenAI-Whisper-MIT.txt
+
+transcribe.cpp 0.1.3
+- Statically linked inference implementation; no separate runtime is shipped.
+- Evidence: licenses/transcribe.cpp-PROVENANCE.md
+- License: licenses/transcribe.cpp-MIT.txt
+
+whisper.cpp v1.9.1, commit f049fff95a089aa9969deb009cdd4892b3e74916
+- ABI header provenance used by the static transcription integration.
+- Evidence: licenses/whisper.cpp-PROVENANCE.md
+- License: licenses/whisper.cpp-MIT.txt
+
+sherpa-onnx v1.13.5
+- Linked from the separately size- and SHA-256-reviewed static Windows archive.
+- Evidence: licenses/sherpa-onnx-PROVENANCE.md
+- License: licenses/Apache-2.0.txt
+
+Silero VAD support model
+- Embedded into local-transcriber.exe at build time; no loose ONNX file is shipped.
+- Evidence: licenses/Silero-VAD-PROVENANCE.md
+- License: licenses/Silero-VAD-MIT.txt
+
+Moonshine ONNX model weights are not part of this package. Scribe obtains those
+models separately as receipt-backed per-user app-data artifacts when requested.

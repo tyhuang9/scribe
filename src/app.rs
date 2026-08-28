@@ -1060,6 +1060,8 @@ enum RemotePartialProbeSource {
 
 struct RemoteCatalogState {
     snapshot: Option<ModelInventorySnapshot>,
+    local_model_inventory: Arc<[SttModelInfo]>,
+    local_model_inventory_dirty: bool,
     local_models: Arc<[ModelViewModel]>,
     local_models_dirty: bool,
     loading: bool,
@@ -1084,6 +1086,8 @@ struct RemoteCatalogState {
     #[cfg(test)]
     partial_probe_request_count: usize,
     #[cfg(test)]
+    local_model_inventory_build_count: usize,
+    #[cfg(test)]
     local_models_build_count: usize,
     #[cfg(test)]
     catalog_io_request_count: usize,
@@ -1093,6 +1097,8 @@ impl Default for RemoteCatalogState {
     fn default() -> Self {
         Self {
             snapshot: Some(ModelInventorySnapshot::bundled()),
+            local_model_inventory: Arc::default(),
+            local_model_inventory_dirty: true,
             local_models: Arc::default(),
             local_models_dirty: true,
             loading: false,
@@ -1114,6 +1120,8 @@ impl Default for RemoteCatalogState {
             #[cfg(test)]
             partial_probe_request_count: 0,
             #[cfg(test)]
+            local_model_inventory_build_count: 0,
+            #[cfg(test)]
             local_models_build_count: 0,
             #[cfg(test)]
             catalog_io_request_count: 0,
@@ -1128,6 +1136,7 @@ impl RemoteCatalogState {
     }
 
     fn invalidate_local_models(&mut self) {
+        self.local_model_inventory_dirty = true;
         self.local_models_dirty = true;
         self.invalidate_projection();
     }
@@ -2810,6 +2819,10 @@ impl LocalTranscriberApp {
                 app.artifact_recovery_error = Some(message);
             }
         }
+        // Build the initial immutable UI inventory after durable recovery, but
+        // before selection/runtime recovery. It is display metadata only;
+        // startup and execution establish fresh artifact trust separately.
+        app.refresh_local_model_inventory();
         if app.artifact_recovery_error.is_none() {
             app.reconcile_startup_model_selection();
             app.validate_startup_runtime_or_recover();
@@ -2856,12 +2869,35 @@ impl LocalTranscriberApp {
     }
 
     fn selected_model(&self) -> Option<SttModelInfo> {
-        config::selected_model(&self.config)
+        self.remote_catalog
+            .local_model_inventory
+            .iter()
+            .find(|model| model.id == self.config.general.selected_default_model)
+            .cloned()
+    }
+
+    fn runtime_status_for_id(&self, model_id: &str) -> ModelRuntimeStatus {
+        self.remote_catalog
+            .local_model_inventory
+            .iter()
+            .find(|model| model.id == model_id)
+            .map_or_else(
+                || ModelRuntimeStatus::Error("Model is no longer configured.".to_owned()),
+                |model| runtime_status_for_model(&self.config, model),
+            )
     }
 
     fn startup_model_is_ready(&self, model: &SttModelInfo) -> bool {
         if runtime_status_for_model(&self.config, model) != ModelRuntimeStatus::Ready {
             return false;
+        }
+        if matches!(
+            crate::model_catalog::normalized_install_artifact(&ModelId::new(&model.id)),
+            Some(crate::model_catalog::NormalizedInstallArtifact::ReceiptBackedBundle { .. })
+        ) {
+            return model.local_path.as_ref().is_some_and(|root| {
+                crate::onnx_model_bundles::current_executable_receipt_at(root).is_ok()
+            });
         }
         model.artifact_origin != ModelArtifactOrigin::Bundled
             || model.local_path.as_ref().is_some_and(|path| {
@@ -2878,7 +2914,7 @@ impl LocalTranscriberApp {
     /// never replaced. Catalog order is stable, making the final fallback
     /// deterministic across launches.
     fn reconcile_startup_model_selection(&mut self) {
-        let models = config::configured_models(&self.config);
+        let models = self.remote_catalog.local_model_inventory.to_vec();
         if models.iter().any(|model| {
             model.id == self.config.general.selected_default_model
                 && self.startup_model_is_ready(model)
@@ -3006,13 +3042,33 @@ impl LocalTranscriberApp {
     }
     fn playground_selected_models(&self) -> Vec<SttModelInfo> {
         let Some(selected_ids) = self.comparison_run_model_ids.as_ref() else {
-            return config::playground_selected_installed_models(&self.config);
+            let mut configured = self
+                .remote_catalog
+                .local_model_inventory
+                .iter()
+                .filter(|model| model.install_status.is_runnable())
+                .map(|model| (model.id.clone(), model.clone()))
+                .collect::<HashMap<_, _>>();
+            return self
+                .config
+                .general
+                .playground_model_order
+                .iter()
+                .filter(|id| {
+                    self.config
+                        .general
+                        .playground_selected_models
+                        .iter()
+                        .any(|selected| selected == *id)
+                })
+                .filter_map(|id| configured.remove(id))
+                .collect();
         };
-        let configured = config::configured_models(&self.config);
         selected_ids
             .iter()
             .filter_map(|id| {
-                configured
+                self.remote_catalog
+                    .local_model_inventory
                     .iter()
                     .find(|model| &model.id == id && model.install_status.is_runnable())
                     .cloned()
@@ -3187,21 +3243,24 @@ impl LocalTranscriberApp {
             .map(|card| (card.descriptor.id.as_str().to_owned(), card))
             .collect::<HashMap<_, _>>();
 
-        self.playground_cards = cards_from_config(&self.config, &self.transcription_service)
-            .into_iter()
-            .map(|mut card| {
-                if let Some(mut existing) = existing_by_id.remove(card.descriptor.id.as_str()) {
-                    existing.descriptor = card.descriptor;
-                    existing.install_status = card.install_status;
-                    existing.status =
-                        runtime_status_for_id(&self.config, existing.descriptor.id.as_str());
-                    existing
-                } else {
-                    card.status = runtime_status_for_id(&self.config, card.descriptor.id.as_str());
-                    card
-                }
-            })
-            .collect();
+        self.playground_cards = cards_for_models(
+            &self.config,
+            &self.transcription_service,
+            self.playground_selected_models(),
+        )
+        .into_iter()
+        .map(|mut card| {
+            if let Some(mut existing) = existing_by_id.remove(card.descriptor.id.as_str()) {
+                existing.descriptor = card.descriptor;
+                existing.install_status = card.install_status;
+                existing.status = self.runtime_status_for_id(existing.descriptor.id.as_str());
+                existing
+            } else {
+                card.status = self.runtime_status_for_id(card.descriptor.id.as_str());
+                card
+            }
+        })
+        .collect();
         let removed_outputs = existing_by_id
             .into_iter()
             .filter_map(|(model_id, card)| (!card.transcript.is_empty()).then_some(model_id))
@@ -5574,14 +5633,14 @@ impl LocalTranscriberApp {
                         },
                     ) {
                         self.model_downloads.insert(
-                            model_id,
+                            model_id.clone(),
                             ModelInstallStatus::Downloading {
                                 downloaded_bytes: progress.completed_bytes,
                                 total_bytes: Some(progress.total_bytes),
                                 bytes_per_second: progress.bytes_per_second,
                             },
                         );
-                        self.rebuild_model_inventory_projection();
+                        self.update_model_download_progress_projection(&model_id);
                     }
                 }
                 AppEvent::OnnxBundleInstallFinished {
@@ -5598,11 +5657,11 @@ impl LocalTranscriberApp {
                         continue;
                     }
                     self.onnx_bundle_install = None;
-                    self.remote_catalog.invalidate_local_models();
                     match result {
                         Ok(smoke) => {
                             self.model_downloads
                                 .insert(model_id, ModelInstallStatus::Installed);
+                            self.remote_catalog.invalidate_local_models();
                             self.status = TranscriptionStatus::Idle;
                             self.status_message = format!(
                                 "ONNX model installed and smoke-tested (health {} ms, load {} ms, decode {} ms, reload {} ms, CPU).",
@@ -5614,15 +5673,12 @@ impl LocalTranscriberApp {
                             self.rebuild_local_models_after_committed_change();
                         }
                         Err(message) => {
-                            self.model_downloads.insert(
-                                model_id,
-                                ModelInstallStatus::Error(if paused {
-                                    "Paused. Downloaded partials were retained for Resume."
-                                        .to_owned()
-                                } else {
-                                    message.clone()
-                                }),
-                            );
+                            let failure = if paused {
+                                "Paused. Downloaded partials were retained for Resume.".to_owned()
+                            } else {
+                                message.clone()
+                            };
+                            self.fail_model_install(&model_id, failure);
                             self.status = if paused {
                                 TranscriptionStatus::Idle
                             } else {
@@ -5634,7 +5690,6 @@ impl LocalTranscriberApp {
                             } else {
                                 format!("ONNX model installation failed: {message}")
                             };
-                            self.rebuild_model_inventory_projection();
                         }
                     }
                 }
@@ -6586,7 +6641,6 @@ impl LocalTranscriberApp {
                         continue;
                     }
                     self.take_requested_partial_discard(&model_id, job_id);
-                    self.remote_catalog.invalidate_local_models();
                     let previous_config = self.config.clone();
                     self.model_downloads
                         .insert(model_id.clone(), ModelInstallStatus::Installed);
@@ -6695,6 +6749,7 @@ impl LocalTranscriberApp {
                         self.finish_artifact_install(&model_id, job_id);
                         continue;
                     }
+                    self.remote_catalog.invalidate_local_models();
                     if let Err(error) = result.journal.mark(ActivationPhase::ConfigPersisted) {
                         let message = format!(
                             "Could not advance the installation journal after settings persistence: {error}. Artifacts and the journal were retained unchanged; restart Scribe to reconcile against the durable settings fingerprint."
@@ -6770,7 +6825,6 @@ impl LocalTranscriberApp {
                     {
                         continue;
                     }
-                    self.remote_catalog.invalidate_local_models();
                     let discard_result = self
                         .take_requested_partial_discard(&model_id, job_id)
                         .map(|source| self.discard_partial_source(&source));
@@ -6778,11 +6832,13 @@ impl LocalTranscriberApp {
                         self.artifact_recovery_error = Some(message.clone());
                         self.freeze_artifact_installs_for_recovery(Some(job_id));
                     }
-                    self.model_downloads
-                        .insert(model_id.clone(), ModelInstallStatus::Error(message.clone()));
                     if recovery_required || self.artifact_recovery_error.is_none() {
+                        self.fail_model_install(&model_id, message.clone());
                         self.status = TranscriptionStatus::Error;
                         self.status_message = format!("Installation failed: {message}");
+                    } else {
+                        self.model_downloads
+                            .insert(model_id.clone(), ModelInstallStatus::Error(message.clone()));
                     }
                     if let Some(result) = discard_result {
                         let cleanup_succeeded = result.is_ok();
@@ -7119,8 +7175,13 @@ impl LocalTranscriberApp {
             &self.transcription_service,
             self.playground_selected_models(),
         );
-        for card in &mut self.playground_cards {
-            card.status = runtime_status_for_id(&self.config, card.descriptor.id.as_str());
+        let statuses = self
+            .playground_cards
+            .iter()
+            .map(|card| self.runtime_status_for_id(card.descriptor.id.as_str()))
+            .collect::<Vec<_>>();
+        for (card, status) in self.playground_cards.iter_mut().zip(statuses) {
+            card.status = status;
             card.transcript.clear();
             card.latency_ms = None;
             card.audio_duration_ms = None;
@@ -7159,13 +7220,18 @@ impl LocalTranscriberApp {
 
     fn clear_playground_results(&mut self, clear_reference: bool) {
         self.reset_comparison_output_projection();
-        for card in &mut self.playground_cards {
+        let statuses = self
+            .playground_cards
+            .iter()
+            .map(|card| self.runtime_status_for_id(card.descriptor.id.as_str()))
+            .collect::<Vec<_>>();
+        for (card, status) in self.playground_cards.iter_mut().zip(statuses) {
             card.transcript.clear();
             card.latency_ms = None;
             card.audio_duration_ms = None;
             card.peak_ram_mb = None;
             card.peak_vram_mb = None;
-            card.status = runtime_status_for_id(&self.config, card.descriptor.id.as_str());
+            card.status = status;
         }
         if clear_reference {
             self.playground_reference_transcript.clear();
@@ -7662,7 +7728,7 @@ impl LocalTranscriberApp {
                 );
                 self.status = TranscriptionStatus::Idle;
                 self.status_message = format!("Downloading {}...", model.name);
-                self.rebuild_model_inventory_projection();
+                self.update_model_download_progress_projection(&model.id);
                 let tx = self.tx.clone();
                 let service = self.current_transcription_service();
                 let event_model_id = model.id.clone();
@@ -7755,7 +7821,7 @@ impl LocalTranscriberApp {
                 bytes_per_second: None,
             },
         );
-        self.remote_catalog.invalidate_local_models();
+        self.update_model_download_progress_projection(&model.id);
         self.status = TranscriptionStatus::Idle;
         self.status_message = format!("Downloading {}...", model.name);
 
@@ -7819,7 +7885,7 @@ impl LocalTranscriberApp {
                 bytes_per_second: None,
             },
         );
-        self.remote_catalog.invalidate_local_models();
+        self.update_model_download_progress_projection(&model_id);
         self.status = TranscriptionStatus::Idle;
         self.status_message = format!("Downloading {}...", request.display_name);
 
@@ -7830,8 +7896,7 @@ impl LocalTranscriberApp {
             self.config.clone(),
             VerifiedInstallSource::TrustedRemote(request),
         ) {
-            self.status = TranscriptionStatus::Error;
-            self.status_message = message;
+            self.fail_model_install(&model_id, message);
             return;
         }
         self.launch_ready_artifact_transfers();
@@ -7909,7 +7974,7 @@ impl LocalTranscriberApp {
             self.status_message =
                 "Pausing ONNX model download. Exact partials will be retained for Resume."
                     .to_owned();
-            self.rebuild_model_inventory_projection();
+            self.update_model_download_progress_projection(model_id);
             return;
         }
         let display_name = self
@@ -8260,7 +8325,6 @@ impl LocalTranscriberApp {
             .as_ref()
             .is_some_and(ManagedRemoval::removed_files);
         let previous_config = self.config.clone();
-        self.remote_catalog.invalidate_local_models();
         self.model_downloads.remove(&model.id);
         apply_removed_model_config(
             &mut self.config,
@@ -8346,6 +8410,7 @@ impl LocalTranscriberApp {
             self.status_message = message;
             return false;
         }
+        self.remote_catalog.invalidate_local_models();
         let cleanup = staged_removal.and_then(|removal| removal.commit().err());
         if let Some(store) = self.settings_store.as_mut() {
             store.mark_current_persisted();
@@ -8412,18 +8477,31 @@ impl LocalTranscriberApp {
     }
 
     fn fail_model_install(&mut self, model_id: &str, message: String) {
-        self.remote_catalog.invalidate_local_models();
         self.model_downloads.insert(
             model_id.to_owned(),
             ModelInstallStatus::Error(message.clone()),
         );
+        if !self.remote_catalog.local_models_dirty
+            && let Some(model) = Arc::make_mut(&mut self.remote_catalog.local_models)
+                .iter_mut()
+                .find(|model| model.id == model_id)
+        {
+            model.download_state = ModelDownloadState::Failed;
+            model.error_message = Some(message.clone());
+            model.cancel_supported = false;
+        }
         self.status = TranscriptionStatus::Error;
         self.status_message = message;
     }
 
     fn refresh_playground_runtime_statuses(&mut self) {
-        for card in &mut self.playground_cards {
-            card.status = runtime_status_for_id(&self.config, card.descriptor.id.as_str());
+        let statuses = self
+            .playground_cards
+            .iter()
+            .map(|card| self.runtime_status_for_id(card.descriptor.id.as_str()))
+            .collect::<Vec<_>>();
+        for (card, status) in self.playground_cards.iter_mut().zip(statuses) {
+            card.status = status;
         }
     }
 
@@ -9712,12 +9790,29 @@ impl LocalTranscriberApp {
         if !self.remote_catalog.local_models_dirty {
             return;
         }
+        self.refresh_local_model_inventory();
         self.refresh_remote_partial_inspection_cache();
-        self.remote_catalog.local_models = self.build_model_management_catalog().into();
+        let inventory = Arc::clone(&self.remote_catalog.local_model_inventory);
+        self.remote_catalog.local_models = self.build_model_management_catalog(&inventory).into();
         self.remote_catalog.local_models_dirty = false;
         #[cfg(test)]
         {
             self.remote_catalog.local_models_build_count += 1;
+        }
+    }
+
+    /// Refreshes the durable local inventory only after an artifact or model
+    /// configuration lifecycle change. UI paints project this immutable
+    /// snapshot and never use it as an execution authorization decision.
+    fn refresh_local_model_inventory(&mut self) {
+        if !self.remote_catalog.local_model_inventory_dirty {
+            return;
+        }
+        self.remote_catalog.local_model_inventory = config::configured_models(&self.config).into();
+        self.remote_catalog.local_model_inventory_dirty = false;
+        #[cfg(test)]
+        {
+            self.remote_catalog.local_model_inventory_build_count += 1;
         }
     }
 
@@ -9802,7 +9897,10 @@ impl LocalTranscriberApp {
         self.remote_catalog.local_models.to_vec()
     }
 
-    fn build_model_management_catalog(&mut self) -> Vec<ModelViewModel> {
+    fn build_model_management_catalog(
+        &mut self,
+        inventory: &[SttModelInfo],
+    ) -> Vec<ModelViewModel> {
         let descriptors = self
             .transcription_service
             .model_descriptors()
@@ -9810,9 +9908,9 @@ impl LocalTranscriberApp {
             .map(|descriptor| (descriptor.id.as_str().to_owned(), descriptor))
             .collect::<HashMap<_, _>>();
         let mut models = Vec::new();
-        for model in config::configured_models(&self.config) {
-            let effective_status = self.effective_install_status(&model);
-            let artifact_present = model_artifact_remains_manageable(&model, &effective_status);
+        for model in inventory {
+            let effective_status = self.effective_install_status(model);
+            let artifact_present = model_artifact_remains_manageable(model, &effective_status);
             let descriptor = descriptors.get(&model.id).cloned().or_else(|| {
                 // Retained compatibility models stay out of discovery, but an existing
                 // installed model must remain visible so it can be selected or removed.
@@ -9830,7 +9928,7 @@ impl LocalTranscriberApp {
                     ),
                 );
                 models.push(self.model_management_view_model(
-                    &model,
+                    model,
                     descriptor.as_ref(),
                     &partial_inspection,
                 ));
@@ -10091,8 +10189,10 @@ impl LocalTranscriberApp {
             capabilities: ui_model_capabilities(descriptor),
             compatibility: descriptor.map_or(ModelCompatibility::Incompatible, |descriptor| {
                 match descriptor.compatibility {
+                    #[cfg(test)]
                     CompatibilityStatus::Supported { .. } => ModelCompatibility::Supported,
                     CompatibilityStatus::Experimental { .. } => ModelCompatibility::Experimental,
+                    #[cfg(test)]
                     CompatibilityStatus::Incompatible { .. } => ModelCompatibility::Incompatible,
                 }
             }),
@@ -10604,19 +10704,21 @@ impl LocalTranscriberApp {
     }
 
     fn finish_partial_discard(&mut self, model_id: &str, result: Result<bool, InstallError>) {
-        match result {
+        let inventory_changed = match result {
             Ok(true) => {
                 self.model_downloads.remove(model_id);
                 self.status = TranscriptionStatus::Idle;
                 self.status_message =
                     "Discarded the retained partial download. The next download will start from zero."
                         .to_owned();
+                true
             }
             Ok(false) => {
                 self.model_downloads.remove(model_id);
                 self.status = TranscriptionStatus::Idle;
                 self.status_message =
                     "No retained partial download was found. No files were changed.".to_owned();
+                false
             }
             Err(error) => {
                 if error.requires_recovery() {
@@ -10636,10 +10738,13 @@ impl LocalTranscriberApp {
                 self.status = TranscriptionStatus::Error;
                 self.status_message =
                     format!("Could not finish discarding the retained partial: {error}");
+                false
             }
+        };
+        if inventory_changed {
+            self.remote_catalog.invalidate_local_models();
+            self.rebuild_model_inventory_projection();
         }
-        self.remote_catalog.invalidate_local_models();
-        self.rebuild_model_inventory_projection();
     }
 
     fn take_requested_partial_discard(
@@ -10972,12 +11077,14 @@ impl LocalTranscriberApp {
             .into_iter()
             .map(|descriptor| (descriptor.id.as_str().to_owned(), descriptor))
             .collect::<HashMap<_, _>>();
-        let installed_models = config::configured_models(&self.config)
-            .into_iter()
+        let installed_models = self
+            .remote_catalog
+            .local_model_inventory
+            .iter()
             .filter(|model| model.install_status.is_runnable())
             .filter_map(|model| {
                 let descriptor = descriptors.get(&model.id)?.clone();
-                Some((model, descriptor))
+                Some((model.clone(), descriptor))
             })
             .collect::<Vec<_>>();
         let request_initial_focus =
@@ -11976,16 +12083,19 @@ fn filtered_remote_models<'model>(
             .cmp(&left.recommended)
             .then_with(|| left.display_name.cmp(&right.display_name))
             .then_with(|| left.id.cmp(&right.id)),
+        #[cfg(test)]
         RemoteCatalogSort::Smallest => remote_model_smallest_variant_size(left)
             .unwrap_or(u64::MAX)
             .cmp(&remote_model_smallest_variant_size(right).unwrap_or(u64::MAX))
             .then_with(|| left.display_name.cmp(&right.display_name))
             .then_with(|| left.id.cmp(&right.id)),
+        #[cfg(test)]
         RemoteCatalogSort::Largest => remote_model_smallest_variant_size(right)
             .unwrap_or(0)
             .cmp(&remote_model_smallest_variant_size(left).unwrap_or(0))
             .then_with(|| left.display_name.cmp(&right.display_name))
             .then_with(|| left.id.cmp(&right.id)),
+        #[cfg(test)]
         RemoteCatalogSort::Name => left
             .display_name
             .cmp(&right.display_name)
@@ -13137,16 +13247,6 @@ fn runtime_status_for_model(config: &AppConfig, model: &SttModelInfo) -> ModelRu
     ModelRuntimeStatus::Error(
         "Model is not supported by the packaged inference engines.".to_owned(),
     )
-}
-
-fn runtime_status_for_id(config: &AppConfig, model_id: &str) -> ModelRuntimeStatus {
-    config::configured_models(config)
-        .into_iter()
-        .find(|model| model.id == model_id)
-        .map_or_else(
-            || ModelRuntimeStatus::Error("Model is no longer configured.".to_owned()),
-            |model| runtime_status_for_model(config, &model),
-        )
 }
 
 fn captured_hotkey_spec(input: &egui::InputState) -> Option<String> {
@@ -18742,6 +18842,8 @@ mod layout_tests {
         app.config.general.model_paths.clear();
         app.config.general.managed_models.clear();
         app.config.general.selected_default_model = "vosk_small_en".to_owned();
+        app.remote_catalog.invalidate_local_models();
+        app.rebuild_model_inventory_projection();
 
         app.reconcile_startup_model_selection();
 
@@ -18849,27 +18951,48 @@ mod layout_tests {
         let ctx = egui::Context::default();
         configure_stitch_style(&ctx);
         let mut app = test_app();
+        let initial_inventory_builds = app.remote_catalog.local_model_inventory_build_count;
+        let initial_inventory = Arc::clone(&app.remote_catalog.local_model_inventory);
         let initial_local_builds = app.remote_catalog.local_models_build_count;
         let initial_local_models = Arc::clone(&app.remote_catalog.local_models);
         let initial_revision = app.remote_catalog.snapshot.as_ref().unwrap().revision();
 
-        for _ in 0..3 {
-            let _ = ctx.run(Default::default(), |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| app.ui_models(ui));
+        let (_, receipt_stats) =
+            crate::onnx_model_bundles::observe_receipt_verifications_for_test(|| {
+                for _ in 0..3 {
+                    let _ = ctx.run(Default::default(), |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| app.ui_models(ui));
+                    });
+                }
+                app.apply_model_management_action(ScreenAction::SetRemoteCatalogQuery(
+                    "tiny".into(),
+                ));
+                app.remote_catalog_filters.recommended_only = true;
+                app.remote_catalog_sort = RemoteCatalogSort::Smallest;
+                let _ = app.remote_catalog_view();
+                let _ = app.remote_catalog_view();
+                let _ = app.selected_model();
+                let _ = app.playground_selected_models();
+                let _ = app.runtime_status_for_id("whisper_cpp_tiny_en");
             });
-        }
-        app.apply_model_management_action(ScreenAction::SetRemoteCatalogQuery("tiny".into()));
-        app.remote_catalog_filters.recommended_only = true;
-        app.remote_catalog_sort = RemoteCatalogSort::Smallest;
-        let _ = app.remote_catalog_view();
-        let _ = app.remote_catalog_view();
 
         assert_eq!(app.remote_catalog.catalog_io_request_count, 0);
         assert_eq!(app.remote_catalog.disk_probe_count, 0);
+        assert_eq!(receipt_stats.calls, 0);
+        assert_eq!(receipt_stats.verified_bytes, 0);
+        assert!(receipt_stats.durations.is_empty());
+        assert_eq!(
+            app.remote_catalog.local_model_inventory_build_count,
+            initial_inventory_builds
+        );
         assert_eq!(
             app.remote_catalog.local_models_build_count,
             initial_local_builds
         );
+        assert!(Arc::ptr_eq(
+            &initial_inventory,
+            &app.remote_catalog.local_model_inventory
+        ));
         assert!(Arc::ptr_eq(
             &initial_local_models,
             &app.remote_catalog.local_models
@@ -18877,6 +19000,100 @@ mod layout_tests {
         assert_eq!(
             app.remote_catalog.snapshot.as_ref().unwrap().revision(),
             initial_revision
+        );
+    }
+
+    #[test]
+    fn playground_selector_paints_use_the_cached_local_inventory() {
+        let ctx = egui::Context::default();
+        configure_stitch_style(&ctx);
+        let mut app = test_app();
+        let inventory = Arc::clone(&app.remote_catalog.local_model_inventory);
+        let inventory_builds = app.remote_catalog.local_model_inventory_build_count;
+        let local_models = Arc::clone(&app.remote_catalog.local_models);
+        let local_builds = app.remote_catalog.local_models_build_count;
+
+        app.open_playground_selector(None);
+        let (_, receipt_stats) =
+            crate::onnx_model_bundles::observe_receipt_verifications_for_test(|| {
+                for _ in 0..3 {
+                    render_selector(&ctx, &mut app, Vec::new());
+                }
+            });
+
+        assert_eq!(receipt_stats.calls, 0);
+        assert_eq!(receipt_stats.verified_bytes, 0);
+        assert!(receipt_stats.durations.is_empty());
+        assert_eq!(
+            app.remote_catalog.local_model_inventory_build_count,
+            inventory_builds
+        );
+        assert_eq!(app.remote_catalog.local_models_build_count, local_builds);
+        assert!(Arc::ptr_eq(
+            &inventory,
+            &app.remote_catalog.local_model_inventory
+        ));
+        assert!(Arc::ptr_eq(&local_models, &app.remote_catalog.local_models));
+    }
+
+    #[test]
+    fn progress_updates_do_not_rebuild_the_local_inventory_or_view() {
+        let mut app = test_app();
+        let inventory_builds = app.remote_catalog.local_model_inventory_build_count;
+        let view_builds = app.remote_catalog.local_models_build_count;
+        app.model_downloads.insert(
+            "whisper_cpp_tiny_en".to_owned(),
+            ModelInstallStatus::Downloading {
+                downloaded_bytes: 17,
+                total_bytes: Some(42),
+                bytes_per_second: Some(1),
+            },
+        );
+
+        app.update_model_download_progress_projection("whisper_cpp_tiny_en");
+        app.rebuild_model_inventory_projection();
+
+        assert_eq!(
+            app.remote_catalog.local_model_inventory_build_count,
+            inventory_builds
+        );
+        assert_eq!(app.remote_catalog.local_models_build_count, view_builds);
+        assert_eq!(
+            app.remote_catalog
+                .local_models
+                .iter()
+                .find(|model| model.id == "whisper_cpp_tiny_en")
+                .map(|model| model.downloaded_bytes),
+            Some(17)
+        );
+    }
+
+    #[test]
+    fn failed_model_admission_keeps_the_raw_inventory_cached() {
+        let mut app = test_app();
+        let inventory = Arc::clone(&app.remote_catalog.local_model_inventory);
+        let inventory_builds = app.remote_catalog.local_model_inventory_build_count;
+        let view_builds = app.remote_catalog.local_models_build_count;
+
+        app.fail_model_install("whisper_cpp_tiny_en", "admission rejected".to_owned());
+        app.rebuild_model_inventory_projection();
+
+        assert!(Arc::ptr_eq(
+            &inventory,
+            &app.remote_catalog.local_model_inventory
+        ));
+        assert_eq!(
+            app.remote_catalog.local_model_inventory_build_count,
+            inventory_builds
+        );
+        assert_eq!(app.remote_catalog.local_models_build_count, view_builds);
+        assert_eq!(
+            app.remote_catalog
+                .local_models
+                .iter()
+                .find(|model| model.id == "whisper_cpp_tiny_en")
+                .and_then(|model| model.error_message.as_deref()),
+            Some("admission rejected")
         );
     }
 
@@ -19628,6 +19845,60 @@ mod layout_tests {
         assert!(app.artifact_mutation_block_reason().is_some());
         assert_eq!(app.status, TranscriptionStatus::Error);
         assert!(app.status_message.contains("Could not finish discarding"));
+    }
+
+    #[test]
+    fn partial_discard_noop_and_failure_keep_cached_inventory() {
+        let mut app = test_app();
+        let inventory = Arc::clone(&app.remote_catalog.local_model_inventory);
+        let local_models = Arc::clone(&app.remote_catalog.local_models);
+        let inventory_builds = app.remote_catalog.local_model_inventory_build_count;
+        let local_builds = app.remote_catalog.local_models_build_count;
+
+        app.finish_partial_discard("synthetic-model", Ok(false));
+        app.finish_partial_discard(
+            "synthetic-model",
+            Err(InstallError::Failed("discard fixture failure".to_owned())),
+        );
+
+        assert_eq!(
+            app.remote_catalog.local_model_inventory_build_count,
+            inventory_builds
+        );
+        assert_eq!(app.remote_catalog.local_models_build_count, local_builds);
+        assert!(Arc::ptr_eq(
+            &inventory,
+            &app.remote_catalog.local_model_inventory
+        ));
+        assert!(Arc::ptr_eq(&local_models, &app.remote_catalog.local_models));
+    }
+
+    #[test]
+    fn partial_discard_rebuilds_cached_inventory_only_after_a_change() {
+        let mut app = test_app();
+        let inventory = Arc::clone(&app.remote_catalog.local_model_inventory);
+        let local_models = Arc::clone(&app.remote_catalog.local_models);
+        let inventory_builds = app.remote_catalog.local_model_inventory_build_count;
+        let local_builds = app.remote_catalog.local_models_build_count;
+
+        app.finish_partial_discard("synthetic-model", Ok(true));
+
+        assert_eq!(
+            app.remote_catalog.local_model_inventory_build_count,
+            inventory_builds + 1
+        );
+        assert_eq!(
+            app.remote_catalog.local_models_build_count,
+            local_builds + 1
+        );
+        assert!(!Arc::ptr_eq(
+            &inventory,
+            &app.remote_catalog.local_model_inventory
+        ));
+        assert!(!Arc::ptr_eq(
+            &local_models,
+            &app.remote_catalog.local_models
+        ));
     }
 
     #[test]
@@ -21705,6 +21976,8 @@ mod layout_tests {
         app.config.general.managed_models.clear();
         app.config.general.model_paths.clear();
         app.config.general.playground_selected_models.clear();
+        app.remote_catalog.invalidate_local_models();
+        app.rebuild_model_inventory_projection();
         app.open_playground_selector(None);
 
         let output = render_selector(&ctx, &mut app, Vec::new());
@@ -22544,8 +22817,9 @@ mod layout_tests {
             },
         );
 
+        let inventory = Arc::clone(&app.remote_catalog.local_model_inventory);
         let view = app
-            .build_model_management_catalog()
+            .build_model_management_catalog(&inventory)
             .into_iter()
             .find(|model| model.id == model_id)
             .unwrap();
@@ -23015,12 +23289,22 @@ mod layout_tests {
     #[test]
     fn committed_inventory_change_replaces_the_cached_local_projection() {
         let mut app = test_app();
+        let before_inventory = Arc::clone(&app.remote_catalog.local_model_inventory);
+        let inventory_builds = app.remote_catalog.local_model_inventory_build_count;
         let before = Arc::clone(&app.remote_catalog.local_models);
         let builds = app.remote_catalog.local_models_build_count;
         app.config.general.selected_default_model = "not-selected".to_owned();
 
         app.rebuild_local_models_after_committed_change();
 
+        assert_eq!(
+            app.remote_catalog.local_model_inventory_build_count,
+            inventory_builds + 1
+        );
+        assert!(!Arc::ptr_eq(
+            &before_inventory,
+            &app.remote_catalog.local_model_inventory
+        ));
         assert_eq!(app.remote_catalog.local_models_build_count, builds + 1);
         assert!(!Arc::ptr_eq(&before, &app.remote_catalog.local_models));
         assert!(

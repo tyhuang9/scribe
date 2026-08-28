@@ -12,6 +12,6 @@ Scribe asks for OS-sensitive capabilities at the feature level rather than while
 | Clipboard | Used for explicit copying or focused-app insertion. |
 | Paste automation | Windows only, after target revalidation. Unsafe target/paste failures use copy-only output; a concurrent external clipboard change is preserved and leaves the final text in Scribe. Other platforms are clipboard-only. |
 
-Scribe does not provide cloud STT, accounts, sync, an always-on listener, a reasoning-cleanup pipeline, or plugins. The normal GGUF path is in-process with no Python or localhost server; private legacy process adapters remain only for configuration/artifact migration. Those boundaries are deliberate.
+Scribe does not provide cloud STT, accounts, sync, an always-on listener, a reasoning-cleanup pipeline, or plugins. Normal GGUF and receipt-backed ONNX inference run in a private persistent local child process, with no Python or localhost server; VAD has its own local process path. Legacy user files remain preserved but are no longer recognized or executed. Those boundaries are deliberate.
 
 For platform-specific permission behavior, read the relevant page under **Platforms**.
