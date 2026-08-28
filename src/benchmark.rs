@@ -11,7 +11,8 @@ use serde::Serialize;
 use crate::config;
 use crate::prepared_audio::PreparedAudio;
 use crate::transcription::{
-    ModelId, RequestId, SessionId, TranscriptionRequest, TranscriptionService,
+    AccelerationPreference, ModelId, RequestId, SessionId, TranscriptionRequest,
+    TranscriptionService,
 };
 
 #[derive(Serialize)]
@@ -44,6 +45,7 @@ struct BenchmarkModelReport {
 struct RuntimeReport {
     runtime_package_version: String,
     resolved_backend: String,
+    requested_acceleration: String,
     resolved_acceleration: String,
     native_streaming_supported: bool,
 }
@@ -91,8 +93,9 @@ fn run_local_command(args: Vec<std::ffi::OsString>) -> Result<LocalBenchmarkRepo
         .context("benchmark fixture is unavailable or invalid; expected a non-empty WAV")?;
     let fixture_prepare = fixture_started.elapsed().as_millis();
 
-    let (config, _) = config::load_config()
+    let (mut config, _) = config::load_config()
         .map_err(|_| anyhow!("failed to load local benchmark configuration"))?;
+    apply_acceleration_override(&mut config, options.acceleration);
     let model_id = options
         .model_id
         .unwrap_or_else(|| config.general.selected_default_model.clone());
@@ -137,6 +140,11 @@ fn run_local_command(args: Vec<std::ffi::OsString>) -> Result<LocalBenchmarkRepo
         runtime: RuntimeReport {
             runtime_package_version: package_version,
             resolved_backend: outcome.resolved_backend_label().to_owned(),
+            requested_acceleration: config
+                .performance
+                .acceleration_preference
+                .label()
+                .to_owned(),
             resolved_acceleration: outcome
                 .resolved_acceleration
                 .as_ref()
@@ -184,20 +192,26 @@ struct LocalBenchmarkOptions {
     fixture: PathBuf,
     model_id: Option<String>,
     output: Option<PathBuf>,
+    acceleration: Option<AccelerationPreference>,
 }
 
 fn parse_local_command(args: &[std::ffi::OsString]) -> Result<LocalBenchmarkOptions> {
     let mut fixture = None;
     let mut model_id = None;
     let mut output = None;
+    let mut acceleration = None;
     let mut index = 0;
     while index < args.len() {
         match args[index].to_string_lossy().as_ref() {
             "--benchmark" => fixture = Some(next_option(args, &mut index, "--benchmark")?),
             "--model" => model_id = Some(next_option(args, &mut index, "--model")?),
             "--output" => output = Some(PathBuf::from(next_option(args, &mut index, "--output")?)),
+            "--acceleration" => {
+                let value = next_option(args, &mut index, "--acceleration")?;
+                acceleration = Some(parse_acceleration(&value)?);
+            }
             value => bail!(
-                "unknown benchmark argument: {value}; use --benchmark <fixture.wav> [--model <model-id>] [--output <report.json>]"
+                "unknown benchmark argument: {value}; use --benchmark <fixture.wav> [--model <model-id>] [--acceleration <auto|gpu|cpu>] [--output <report.json>]"
             ),
         }
         index += 1;
@@ -208,7 +222,26 @@ fn parse_local_command(args: &[std::ffi::OsString]) -> Result<LocalBenchmarkOpti
         ),
         model_id,
         output,
+        acceleration,
     })
+}
+
+fn parse_acceleration(value: &str) -> Result<AccelerationPreference> {
+    match value {
+        "auto" => Ok(AccelerationPreference::Auto),
+        "gpu" => Ok(AccelerationPreference::Gpu),
+        "cpu" => Ok(AccelerationPreference::Cpu),
+        _ => bail!("--acceleration must be one of auto, gpu, or cpu"),
+    }
+}
+
+fn apply_acceleration_override(
+    config: &mut config::AppConfig,
+    acceleration: Option<AccelerationPreference>,
+) {
+    if let Some(acceleration) = acceleration {
+        config.performance.acceleration_preference = acceleration;
+    }
 }
 
 fn next_option(args: &[std::ffi::OsString], index: &mut usize, flag: &str) -> Result<String> {
@@ -885,6 +918,77 @@ mod tests {
         assert_eq!(options.fixture, PathBuf::from("fixture.wav"));
         assert_eq!(options.model_id.as_deref(), Some("whisper_cpp_tiny_en"));
         assert_eq!(options.output, Some(PathBuf::from("report.json")));
+        assert_eq!(options.acceleration, None);
+    }
+
+    #[test]
+    fn benchmark_command_parses_each_acceleration_override() {
+        for (value, expected) in [
+            ("auto", AccelerationPreference::Auto),
+            ("gpu", AccelerationPreference::Gpu),
+            ("cpu", AccelerationPreference::Cpu),
+        ] {
+            let options = parse_local_command(&[
+                "--benchmark".into(),
+                "fixture.wav".into(),
+                "--acceleration".into(),
+                value.into(),
+            ])
+            .unwrap();
+
+            assert_eq!(options.acceleration, Some(expected));
+        }
+    }
+
+    #[test]
+    fn benchmark_command_rejects_missing_or_invalid_acceleration() {
+        let missing = parse_local_command(&[
+            "--benchmark".into(),
+            "fixture.wav".into(),
+            "--acceleration".into(),
+        ])
+        .unwrap_err();
+        assert!(
+            missing
+                .to_string()
+                .contains("--acceleration requires a value")
+        );
+
+        let invalid = parse_local_command(&[
+            "--benchmark".into(),
+            "fixture.wav".into(),
+            "--acceleration".into(),
+            "cuda".into(),
+        ])
+        .unwrap_err();
+        assert_eq!(
+            invalid.to_string(),
+            "--acceleration must be one of auto, gpu, or cpu"
+        );
+    }
+
+    #[test]
+    fn acceleration_override_changes_only_the_in_memory_config() {
+        let mut config = config::AppConfig::default();
+        config.performance.acceleration_preference = AccelerationPreference::Cpu;
+
+        apply_acceleration_override(&mut config, None);
+        assert_eq!(
+            config.performance.acceleration_preference,
+            AccelerationPreference::Cpu
+        );
+
+        apply_acceleration_override(&mut config, Some(AccelerationPreference::Gpu));
+        assert_eq!(
+            config.performance.acceleration_preference,
+            AccelerationPreference::Gpu
+        );
+
+        let service = TranscriptionService::new(config);
+        assert_eq!(
+            service.configured_acceleration_preference(),
+            AccelerationPreference::Gpu
+        );
     }
 
     #[test]
@@ -901,6 +1005,7 @@ mod tests {
             runtime: RuntimeReport {
                 runtime_package_version: "version".to_owned(),
                 resolved_backend: "backend".to_owned(),
+                requested_acceleration: "GPU".to_owned(),
                 resolved_acceleration: "CPU".to_owned(),
                 native_streaming_supported: false,
             },
@@ -946,6 +1051,7 @@ mod tests {
                 runtime: RuntimeReport {
                     runtime_package_version: "version".to_owned(),
                     resolved_backend: "backend".to_owned(),
+                    requested_acceleration: "Auto".to_owned(),
                     resolved_acceleration: "CPU".to_owned(),
                     native_streaming_supported: false,
                 },
