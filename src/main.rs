@@ -5,6 +5,7 @@
 
 mod app;
 mod audio;
+mod backend_policy;
 mod benchmark;
 mod branding;
 mod config;

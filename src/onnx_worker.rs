@@ -298,11 +298,13 @@ pub(crate) fn resolve_cpu_only_acceleration(
             diagnostic: Some(
                 "sherpa-onnx runs in an isolated CPU-only worker; Auto selected CPU".to_owned(),
             ),
+            selection: None,
         }),
         AccelerationPreference::Cpu => Ok(ResolvedAcceleration {
             requested,
             resolved: ComputeDevice::Cpu,
             diagnostic: None,
+            selection: None,
         }),
         AccelerationPreference::Gpu => bail!(
             "GPU acceleration is unavailable for sherpa-onnx because the isolated runtime is CPU-only; select Auto or CPU only"

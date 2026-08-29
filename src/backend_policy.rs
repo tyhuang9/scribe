@@ -1,0 +1,939 @@
+//! Runtime-neutral compute-backend selection policy.
+//!
+//! The policy operates only on an injected [`BackendSnapshot`]. Native runtime
+//! discovery stays in the adapter that owns that runtime, which keeps policy
+//! tests deterministic and lets future worker packs provide the same facts
+//! without exposing provider-specific handles above the worker boundary.
+
+use std::cmp::Ordering;
+
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+use crate::transcription::AccelerationPreference;
+
+/// Compute implementation selected for a model load.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum BackendKind {
+    Cpu,
+    Cuda,
+    Vulkan,
+    Metal,
+}
+
+impl BackendKind {
+    pub(crate) fn is_gpu(self) -> bool {
+        !matches!(self, Self::Cpu)
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Cpu => "CPU",
+            Self::Cuda => "CUDA",
+            Self::Vulkan => "Vulkan",
+            Self::Metal => "Metal",
+        }
+    }
+}
+
+/// Hardware vendor used by the fixed backend priority policy.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum GpuVendor {
+    Nvidia,
+    Amd,
+    Intel,
+    Apple,
+    Other,
+    Unknown,
+}
+
+/// Backend-reported memory and power class.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum DeviceClass {
+    Cpu,
+    Accelerator,
+    DiscreteGpu,
+    IntegratedGpu,
+    UnifiedGpu,
+    Unknown,
+}
+
+impl DeviceClass {
+    fn is_gpu(self) -> bool {
+        matches!(
+            self,
+            Self::DiscreteGpu | Self::IntegratedGpu | Self::UnifiedGpu | Self::Unknown
+        )
+    }
+
+    fn is_battery_eligible_gpu(self) -> bool {
+        matches!(self, Self::IntegratedGpu | Self::UnifiedGpu)
+    }
+}
+
+/// Power source observed immediately before selecting a backend.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PowerSource {
+    Ac,
+    Battery,
+    Unknown,
+}
+
+impl PowerSource {
+    pub(crate) fn current() -> Self {
+        current_power_source()
+    }
+}
+
+/// Operating-system family used by the fixed backend compatibility table.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OperatingSystem {
+    Windows,
+    MacOs,
+    Linux,
+    Other,
+}
+
+impl OperatingSystem {
+    pub(crate) const fn current() -> Self {
+        if cfg!(target_os = "windows") {
+            Self::Windows
+        } else if cfg!(target_os = "macos") {
+            Self::MacOs
+        } else if cfg!(target_os = "linux") {
+            Self::Linux
+        } else {
+            Self::Other
+        }
+    }
+}
+
+/// Stable device identity used across enumeration-order and driver changes.
+///
+/// A provider should use its OS/native stable identifier when one is
+/// available. If it has none, it may supply a deterministic provider/name
+/// fingerprint. The registry index is deliberately not part of this value.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(transparent)]
+pub(crate) struct DeviceIdentity(String);
+
+impl DeviceIdentity {
+    pub(crate) fn new(stable_id: impl Into<String>) -> Self {
+        let stable_id = stable_id.into();
+        let trimmed = stable_id.trim();
+        debug_assert!(!trimmed.is_empty(), "device identity must not be empty");
+        Self(if trimmed.is_empty() {
+            "unknown-device".to_owned()
+        } else {
+            trimmed.to_owned()
+        })
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    fn canonical_key(&self) -> String {
+        self.0.to_ascii_lowercase()
+    }
+}
+
+/// One backend/device pair that can be selected in the current process.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct BackendTarget {
+    pub(crate) backend: BackendKind,
+    pub(crate) device_id: DeviceIdentity,
+    pub(crate) display_name: String,
+    pub(crate) vendor: GpuVendor,
+    pub(crate) device_class: DeviceClass,
+    pub(crate) memory_total_bytes: u64,
+    pub(crate) memory_available_bytes: u64,
+    /// Provider registry index for this process only. It is rediscovered from
+    /// `device_id` for every fresh snapshot and must never become durable.
+    #[serde(skip)]
+    pub(crate) process_index: Option<usize>,
+}
+
+impl BackendTarget {
+    pub(crate) fn cpu() -> Self {
+        Self {
+            backend: BackendKind::Cpu,
+            device_id: DeviceIdentity::new("cpu:system"),
+            display_name: "CPU".to_owned(),
+            vendor: GpuVendor::Unknown,
+            device_class: DeviceClass::Cpu,
+            memory_total_bytes: 0,
+            memory_available_bytes: 0,
+            process_index: None,
+        }
+    }
+
+    fn is_structurally_valid(&self) -> bool {
+        if self.backend.is_gpu() {
+            self.device_class.is_gpu()
+        } else {
+            matches!(
+                self.device_class,
+                DeviceClass::Cpu | DeviceClass::Accelerator
+            )
+        }
+    }
+
+    fn dedup_key(&self) -> (BackendKind, String) {
+        (self.backend, self.device_id.canonical_key())
+    }
+}
+
+/// Current usability of one discovered backend target.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CandidateAvailability {
+    Available,
+    Incompatible,
+    Unhealthy,
+    Quarantined,
+}
+
+impl CandidateAvailability {
+    fn rank(self) -> u8 {
+        match self {
+            Self::Available => 0,
+            Self::Quarantined => 1,
+            Self::Unhealthy => 2,
+            Self::Incompatible => 3,
+        }
+    }
+}
+
+/// Provider-supplied selection input for one target.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BackendCandidate {
+    pub(crate) target: BackendTarget,
+    pub(crate) availability: CandidateAvailability,
+    /// Release qualification may keep a working backend opt-in only.
+    pub(crate) auto_eligible: bool,
+}
+
+impl BackendCandidate {
+    pub(crate) fn available(target: BackendTarget) -> Self {
+        Self {
+            target,
+            availability: CandidateAvailability::Available,
+            auto_eligible: true,
+        }
+    }
+}
+
+/// Injectable view of the machine at selection time.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BackendSnapshot {
+    pub(crate) operating_system: OperatingSystem,
+    pub(crate) power_source: PowerSource,
+    pub(crate) candidates: Vec<BackendCandidate>,
+}
+
+/// Why the selected target won.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum BackendSelectionReason {
+    RequestedCpu,
+    RequestedGpu,
+    AutoPriority,
+    AutoCpuFallback,
+}
+
+/// Power constraint applied while resolving the request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PowerPolicyDecision {
+    NotApplied,
+    Unrestricted,
+    BatteryEfficientGpuOnly,
+}
+
+/// Stable failure category recorded after a future bounded fallback.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum BackendFailureCategory {
+    BackendUnavailable,
+    InitializationFailed,
+    OutOfMemory,
+    DeviceLost,
+    WorkerFailed,
+}
+
+/// One failed target from a bounded fallback chain.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct BackendFallback {
+    pub(crate) target: BackendTarget,
+    pub(crate) category: BackendFailureCategory,
+}
+
+/// Deterministic backend resolution for one model load.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct BackendSelection {
+    pub(crate) requested: AccelerationPreference,
+    pub(crate) target: BackendTarget,
+    pub(crate) reason: BackendSelectionReason,
+    pub(crate) power_source: PowerSource,
+    pub(crate) power_policy: PowerPolicyDecision,
+    /// Remaining eligible targets in deterministic retry order. Stage 1 does
+    /// not execute these fallbacks; the list is the contract for later worker
+    /// supervision without silently widening strict-GPU semantics.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) fallback_targets: Vec<BackendTarget>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) fallback_history: Vec<BackendFallback>,
+}
+
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub(crate) enum BackendSelectionError {
+    #[error("no compatible CPU backend is available")]
+    CpuUnavailable,
+    #[error("no compatible GPU backend is available for the current system")]
+    GpuUnavailable,
+    #[error("no compatible backend is available for Auto; the required CPU fallback is missing")]
+    AutoUnavailable,
+}
+
+/// Resolves a preference without probing hardware or mutating runtime state.
+pub(crate) fn select_backend(
+    requested: AccelerationPreference,
+    snapshot: &BackendSnapshot,
+) -> Result<BackendSelection, BackendSelectionError> {
+    let normalized = normalize_candidates(&snapshot.candidates);
+    let power_policy = match requested {
+        AccelerationPreference::Auto if snapshot.power_source == PowerSource::Battery => {
+            PowerPolicyDecision::BatteryEfficientGpuOnly
+        }
+        AccelerationPreference::Auto => PowerPolicyDecision::Unrestricted,
+        AccelerationPreference::Cpu | AccelerationPreference::Gpu => {
+            PowerPolicyDecision::NotApplied
+        }
+    };
+
+    let mut eligible = normalized
+        .into_iter()
+        .filter(|candidate| candidate_is_eligible(candidate, requested, snapshot, power_policy))
+        .map(|candidate| candidate.target)
+        .collect::<Vec<_>>();
+    eligible.sort_by(|left, right| target_order(left, right, requested, snapshot.operating_system));
+
+    if requested == AccelerationPreference::Auto
+        && !eligible
+            .iter()
+            .any(|target| target.backend == BackendKind::Cpu)
+    {
+        return Err(BackendSelectionError::AutoUnavailable);
+    }
+
+    let Some(target) = eligible.first().cloned() else {
+        return Err(match requested {
+            AccelerationPreference::Cpu => BackendSelectionError::CpuUnavailable,
+            AccelerationPreference::Gpu => BackendSelectionError::GpuUnavailable,
+            AccelerationPreference::Auto => BackendSelectionError::AutoUnavailable,
+        });
+    };
+    let reason = match requested {
+        AccelerationPreference::Cpu => BackendSelectionReason::RequestedCpu,
+        AccelerationPreference::Gpu => BackendSelectionReason::RequestedGpu,
+        AccelerationPreference::Auto if target.backend == BackendKind::Cpu => {
+            BackendSelectionReason::AutoCpuFallback
+        }
+        AccelerationPreference::Auto => BackendSelectionReason::AutoPriority,
+    };
+
+    Ok(BackendSelection {
+        requested,
+        target,
+        reason,
+        power_source: snapshot.power_source,
+        power_policy,
+        fallback_targets: eligible.into_iter().skip(1).collect(),
+        fallback_history: Vec::new(),
+    })
+}
+
+fn normalize_candidates(candidates: &[BackendCandidate]) -> Vec<BackendCandidate> {
+    let mut normalized = candidates.to_vec();
+    normalized.sort_by(|left, right| {
+        left.target
+            .dedup_key()
+            .cmp(&right.target.dedup_key())
+            .then_with(|| left.availability.rank().cmp(&right.availability.rank()))
+            .then_with(|| right.auto_eligible.cmp(&left.auto_eligible))
+            .then_with(|| {
+                left.target
+                    .process_index
+                    .unwrap_or(usize::MAX)
+                    .cmp(&right.target.process_index.unwrap_or(usize::MAX))
+            })
+            .then_with(|| {
+                right
+                    .target
+                    .memory_available_bytes
+                    .cmp(&left.target.memory_available_bytes)
+            })
+    });
+    normalized.dedup_by(|right, left| right.target.dedup_key() == left.target.dedup_key());
+    normalized
+}
+
+fn candidate_is_eligible(
+    candidate: &BackendCandidate,
+    requested: AccelerationPreference,
+    snapshot: &BackendSnapshot,
+    power_policy: PowerPolicyDecision,
+) -> bool {
+    if candidate.availability != CandidateAvailability::Available
+        || !candidate.target.is_structurally_valid()
+        || !platform_supports(&candidate.target, snapshot.operating_system)
+    {
+        return false;
+    }
+    match requested {
+        AccelerationPreference::Cpu => candidate.target.backend == BackendKind::Cpu,
+        AccelerationPreference::Gpu => candidate.target.backend.is_gpu(),
+        AccelerationPreference::Auto => {
+            if candidate.target.backend == BackendKind::Cpu {
+                return true;
+            }
+            candidate.auto_eligible
+                && (power_policy != PowerPolicyDecision::BatteryEfficientGpuOnly
+                    || candidate.target.device_class.is_battery_eligible_gpu())
+        }
+    }
+}
+
+fn platform_supports(target: &BackendTarget, operating_system: OperatingSystem) -> bool {
+    match operating_system {
+        OperatingSystem::Windows | OperatingSystem::Linux => match target.backend {
+            BackendKind::Cpu | BackendKind::Vulkan => true,
+            BackendKind::Cuda => target.vendor == GpuVendor::Nvidia,
+            BackendKind::Metal => false,
+        },
+        OperatingSystem::MacOs => match target.backend {
+            BackendKind::Cpu => true,
+            BackendKind::Metal => target.vendor == GpuVendor::Apple,
+            BackendKind::Cuda | BackendKind::Vulkan => false,
+        },
+        OperatingSystem::Other => target.backend == BackendKind::Cpu,
+    }
+}
+
+fn target_order(
+    left: &BackendTarget,
+    right: &BackendTarget,
+    requested: AccelerationPreference,
+    operating_system: OperatingSystem,
+) -> Ordering {
+    backend_rank(left.backend, requested, operating_system)
+        .cmp(&backend_rank(right.backend, requested, operating_system))
+        .then_with(|| {
+            device_class_rank(left.device_class).cmp(&device_class_rank(right.device_class))
+        })
+        .then_with(|| vendor_rank(left.vendor).cmp(&vendor_rank(right.vendor)))
+        .then_with(|| {
+            left.device_id
+                .canonical_key()
+                .cmp(&right.device_id.canonical_key())
+        })
+        .then_with(|| {
+            left.process_index
+                .unwrap_or(usize::MAX)
+                .cmp(&right.process_index.unwrap_or(usize::MAX))
+        })
+}
+
+fn backend_rank(
+    backend: BackendKind,
+    requested: AccelerationPreference,
+    operating_system: OperatingSystem,
+) -> u8 {
+    if requested == AccelerationPreference::Cpu {
+        return u8::from(backend != BackendKind::Cpu);
+    }
+    match operating_system {
+        OperatingSystem::Windows | OperatingSystem::Linux => match backend {
+            BackendKind::Cuda => 0,
+            BackendKind::Vulkan => 1,
+            BackendKind::Metal => 2,
+            BackendKind::Cpu => 3,
+        },
+        OperatingSystem::MacOs => match backend {
+            BackendKind::Metal => 0,
+            BackendKind::Cuda => 1,
+            BackendKind::Vulkan => 2,
+            BackendKind::Cpu => 3,
+        },
+        OperatingSystem::Other => match backend {
+            BackendKind::Cpu => 0,
+            BackendKind::Cuda | BackendKind::Vulkan | BackendKind::Metal => 1,
+        },
+    }
+}
+
+fn device_class_rank(class: DeviceClass) -> u8 {
+    match class {
+        DeviceClass::DiscreteGpu => 0,
+        DeviceClass::UnifiedGpu => 1,
+        DeviceClass::IntegratedGpu => 2,
+        DeviceClass::Unknown => 3,
+        DeviceClass::Accelerator => 4,
+        DeviceClass::Cpu => 5,
+    }
+}
+
+fn vendor_rank(vendor: GpuVendor) -> u8 {
+    match vendor {
+        GpuVendor::Nvidia => 0,
+        GpuVendor::Amd => 1,
+        GpuVendor::Intel => 2,
+        GpuVendor::Apple => 3,
+        GpuVendor::Other => 4,
+        GpuVendor::Unknown => 5,
+    }
+}
+
+#[cfg(windows)]
+fn current_power_source() -> PowerSource {
+    use windows_sys::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
+
+    let mut status: SYSTEM_POWER_STATUS = unsafe { std::mem::zeroed() };
+    if unsafe { GetSystemPowerStatus(&mut status) } == 0 {
+        return PowerSource::Unknown;
+    }
+    match status.ACLineStatus {
+        0 => PowerSource::Battery,
+        1 => PowerSource::Ac,
+        _ => PowerSource::Unknown,
+    }
+}
+
+#[cfg(not(windows))]
+fn current_power_source() -> PowerSource {
+    // Platform-native probes arrive with their qualified backend packs. An
+    // unknown source is deliberately unrestricted rather than guessing that a
+    // desktop or a charging laptop is on battery.
+    PowerSource::Unknown
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transcription::{ComputeDevice, ResolvedAcceleration};
+
+    fn target(
+        backend: BackendKind,
+        vendor: GpuVendor,
+        class: DeviceClass,
+        id: &str,
+        index: usize,
+    ) -> BackendTarget {
+        BackendTarget {
+            backend,
+            device_id: DeviceIdentity::new(id),
+            display_name: id.to_owned(),
+            vendor,
+            device_class: class,
+            memory_total_bytes: 8 * 1024 * 1024 * 1024,
+            memory_available_bytes: 6 * 1024 * 1024 * 1024,
+            process_index: Some(index),
+        }
+    }
+
+    fn candidate(target: BackendTarget) -> BackendCandidate {
+        BackendCandidate::available(target)
+    }
+
+    fn cpu() -> BackendCandidate {
+        candidate(BackendTarget::cpu())
+    }
+
+    fn snapshot(
+        operating_system: OperatingSystem,
+        power_source: PowerSource,
+        candidates: Vec<BackendCandidate>,
+    ) -> BackendSnapshot {
+        BackendSnapshot {
+            operating_system,
+            power_source,
+            candidates,
+        }
+    }
+
+    #[test]
+    fn fixed_platform_vendor_priority_matrix_is_deterministic() {
+        let cases = [
+            (
+                OperatingSystem::Windows,
+                GpuVendor::Nvidia,
+                vec![BackendKind::Vulkan, BackendKind::Cuda],
+                BackendKind::Cuda,
+            ),
+            (
+                OperatingSystem::Windows,
+                GpuVendor::Amd,
+                vec![BackendKind::Cuda, BackendKind::Vulkan],
+                BackendKind::Vulkan,
+            ),
+            (
+                OperatingSystem::Windows,
+                GpuVendor::Intel,
+                vec![BackendKind::Vulkan],
+                BackendKind::Vulkan,
+            ),
+            (
+                OperatingSystem::MacOs,
+                GpuVendor::Apple,
+                vec![BackendKind::Vulkan, BackendKind::Metal],
+                BackendKind::Metal,
+            ),
+            (
+                OperatingSystem::Linux,
+                GpuVendor::Nvidia,
+                vec![BackendKind::Vulkan, BackendKind::Cuda],
+                BackendKind::Cuda,
+            ),
+            (
+                OperatingSystem::Linux,
+                GpuVendor::Amd,
+                vec![BackendKind::Vulkan],
+                BackendKind::Vulkan,
+            ),
+            (
+                OperatingSystem::Linux,
+                GpuVendor::Intel,
+                vec![BackendKind::Vulkan],
+                BackendKind::Vulkan,
+            ),
+        ];
+
+        for (os, vendor, backends, expected) in cases {
+            let gpu_class = if vendor == GpuVendor::Apple {
+                DeviceClass::UnifiedGpu
+            } else {
+                DeviceClass::DiscreteGpu
+            };
+            let mut candidates = backends
+                .into_iter()
+                .enumerate()
+                .map(|(index, backend)| {
+                    candidate(target(backend, vendor, gpu_class, backend.label(), index))
+                })
+                .collect::<Vec<_>>();
+            candidates.push(cpu());
+            let selected = select_backend(
+                AccelerationPreference::Auto,
+                &snapshot(os, PowerSource::Ac, candidates),
+            )
+            .unwrap();
+
+            assert_eq!(selected.target.backend, expected, "{os:?} {vendor:?}");
+            assert_eq!(selected.reason, BackendSelectionReason::AutoPriority);
+        }
+    }
+
+    #[test]
+    fn auto_on_battery_excludes_discrete_and_unknown_gpus() {
+        let candidates = vec![
+            candidate(target(
+                BackendKind::Cuda,
+                GpuVendor::Nvidia,
+                DeviceClass::DiscreteGpu,
+                "nvidia-discrete",
+                1,
+            )),
+            candidate(target(
+                BackendKind::Vulkan,
+                GpuVendor::Other,
+                DeviceClass::Unknown,
+                "unknown-gpu",
+                2,
+            )),
+            cpu(),
+        ];
+        let selected = select_backend(
+            AccelerationPreference::Auto,
+            &snapshot(OperatingSystem::Windows, PowerSource::Battery, candidates),
+        )
+        .unwrap();
+
+        assert_eq!(selected.target.backend, BackendKind::Cpu);
+        assert_eq!(selected.reason, BackendSelectionReason::AutoCpuFallback);
+        assert_eq!(
+            selected.power_policy,
+            PowerPolicyDecision::BatteryEfficientGpuOnly
+        );
+    }
+
+    #[test]
+    fn auto_on_battery_keeps_integrated_and_unified_gpus_eligible() {
+        for class in [DeviceClass::IntegratedGpu, DeviceClass::UnifiedGpu] {
+            let vendor = if class == DeviceClass::UnifiedGpu {
+                GpuVendor::Apple
+            } else {
+                GpuVendor::Intel
+            };
+            let (os, backend) = if vendor == GpuVendor::Apple {
+                (OperatingSystem::MacOs, BackendKind::Metal)
+            } else {
+                (OperatingSystem::Windows, BackendKind::Vulkan)
+            };
+            let selected = select_backend(
+                AccelerationPreference::Auto,
+                &snapshot(
+                    os,
+                    PowerSource::Battery,
+                    vec![
+                        candidate(target(backend, vendor, class, "efficient-gpu", 1)),
+                        cpu(),
+                    ],
+                ),
+            )
+            .unwrap();
+
+            assert_eq!(selected.target.backend, backend);
+        }
+    }
+
+    #[test]
+    fn explicit_gpu_ignores_power_and_auto_qualification_but_never_uses_cpu() {
+        let mut opt_in_only = candidate(target(
+            BackendKind::Vulkan,
+            GpuVendor::Amd,
+            DeviceClass::DiscreteGpu,
+            "amd-gpu",
+            1,
+        ));
+        opt_in_only.auto_eligible = false;
+        let selected = select_backend(
+            AccelerationPreference::Gpu,
+            &snapshot(
+                OperatingSystem::Windows,
+                PowerSource::Battery,
+                vec![cpu(), opt_in_only],
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(selected.target.backend, BackendKind::Vulkan);
+        assert_eq!(selected.reason, BackendSelectionReason::RequestedGpu);
+        assert_eq!(selected.power_policy, PowerPolicyDecision::NotApplied);
+
+        let error = select_backend(
+            AccelerationPreference::Gpu,
+            &snapshot(OperatingSystem::Windows, PowerSource::Ac, vec![cpu()]),
+        )
+        .unwrap_err();
+        assert_eq!(error, BackendSelectionError::GpuUnavailable);
+    }
+
+    #[test]
+    fn explicit_cpu_never_selects_a_gpu() {
+        let selected = select_backend(
+            AccelerationPreference::Cpu,
+            &snapshot(
+                OperatingSystem::Windows,
+                PowerSource::Ac,
+                vec![
+                    candidate(target(
+                        BackendKind::Cuda,
+                        GpuVendor::Nvidia,
+                        DeviceClass::DiscreteGpu,
+                        "gpu",
+                        1,
+                    )),
+                    cpu(),
+                ],
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(selected.target.backend, BackendKind::Cpu);
+        assert_eq!(selected.reason, BackendSelectionReason::RequestedCpu);
+        assert!(selected.fallback_targets.is_empty());
+    }
+
+    #[test]
+    fn auto_requires_its_guaranteed_cpu_fallback() {
+        let only_gpu = candidate(target(
+            BackendKind::Vulkan,
+            GpuVendor::Amd,
+            DeviceClass::DiscreteGpu,
+            "gpu",
+            1,
+        ));
+
+        let error = select_backend(
+            AccelerationPreference::Auto,
+            &snapshot(OperatingSystem::Windows, PowerSource::Ac, vec![only_gpu]),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, BackendSelectionError::AutoUnavailable);
+    }
+
+    #[test]
+    fn auto_uses_cpu_when_gpu_is_unqualified_unhealthy_or_quarantined() {
+        for availability in [
+            CandidateAvailability::Available,
+            CandidateAvailability::Unhealthy,
+            CandidateAvailability::Quarantined,
+            CandidateAvailability::Incompatible,
+        ] {
+            let mut gpu = candidate(target(
+                BackendKind::Vulkan,
+                GpuVendor::Amd,
+                DeviceClass::DiscreteGpu,
+                "gpu",
+                1,
+            ));
+            gpu.availability = availability;
+            gpu.auto_eligible = availability != CandidateAvailability::Available;
+            if availability == CandidateAvailability::Available {
+                gpu.auto_eligible = false;
+            }
+            let selected = select_backend(
+                AccelerationPreference::Auto,
+                &snapshot(OperatingSystem::Windows, PowerSource::Ac, vec![gpu, cpu()]),
+            )
+            .unwrap();
+
+            assert_eq!(selected.target.backend, BackendKind::Cpu);
+            assert_eq!(selected.reason, BackendSelectionReason::AutoCpuFallback);
+        }
+    }
+
+    #[test]
+    fn ordering_and_dedup_do_not_depend_on_provider_enumeration_order() {
+        let duplicate_unhealthy = BackendCandidate {
+            target: target(
+                BackendKind::Vulkan,
+                GpuVendor::Nvidia,
+                DeviceClass::DiscreteGpu,
+                "GPU-B",
+                7,
+            ),
+            availability: CandidateAvailability::Unhealthy,
+            auto_eligible: true,
+        };
+        let first = vec![
+            candidate(target(
+                BackendKind::Vulkan,
+                GpuVendor::Nvidia,
+                DeviceClass::DiscreteGpu,
+                "gpu-b",
+                4,
+            )),
+            candidate(target(
+                BackendKind::Vulkan,
+                GpuVendor::Nvidia,
+                DeviceClass::DiscreteGpu,
+                "gpu-a",
+                9,
+            )),
+            duplicate_unhealthy.clone(),
+            cpu(),
+        ];
+        let mut reversed = first.clone();
+        reversed.reverse();
+
+        let first_selection = select_backend(
+            AccelerationPreference::Auto,
+            &snapshot(OperatingSystem::Windows, PowerSource::Ac, first),
+        )
+        .unwrap();
+        let reversed_selection = select_backend(
+            AccelerationPreference::Auto,
+            &snapshot(OperatingSystem::Windows, PowerSource::Ac, reversed),
+        )
+        .unwrap();
+
+        assert_eq!(first_selection.target.device_id.as_str(), "gpu-a");
+        assert_eq!(
+            first_selection.target.device_id,
+            reversed_selection.target.device_id
+        );
+        assert_eq!(first_selection.fallback_targets.len(), 2);
+        assert_eq!(
+            first_selection.fallback_targets[0].device_id.as_str(),
+            "gpu-b"
+        );
+        assert_eq!(
+            first_selection.fallback_targets[1].backend,
+            BackendKind::Cpu
+        );
+    }
+
+    #[test]
+    fn process_index_is_never_serialized_or_restored() {
+        let target = target(
+            BackendKind::Cuda,
+            GpuVendor::Nvidia,
+            DeviceClass::DiscreteGpu,
+            "pci:01:00.0",
+            17,
+        );
+
+        let value = serde_json::to_value(&target).unwrap();
+        assert!(value.get("process_index").is_none());
+        let restored: BackendTarget = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.device_id, target.device_id);
+        assert_eq!(restored.process_index, None);
+    }
+
+    #[test]
+    fn legacy_resolved_acceleration_json_remains_compatible() {
+        let legacy = r#"{
+            "requested":"auto",
+            "resolved":{"Gpu":{"name":"Test GPU"}},
+            "diagnostic":null
+        }"#;
+
+        let resolved: ResolvedAcceleration = serde_json::from_str(legacy).unwrap();
+        assert_eq!(
+            resolved.resolved,
+            ComputeDevice::Gpu {
+                name: "Test GPU".to_owned()
+            }
+        );
+        assert_eq!(resolved.selection, None);
+
+        let cpu = ResolvedAcceleration {
+            requested: AccelerationPreference::Cpu,
+            resolved: ComputeDevice::Cpu,
+            diagnostic: None,
+            selection: None,
+        };
+        let serialized = serde_json::to_value(cpu).unwrap();
+        assert!(serialized.get("selection").is_none());
+    }
+
+    #[test]
+    fn unknown_operating_system_conservatively_uses_cpu() {
+        let selected = select_backend(
+            AccelerationPreference::Auto,
+            &snapshot(
+                OperatingSystem::Other,
+                PowerSource::Unknown,
+                vec![
+                    candidate(target(
+                        BackendKind::Vulkan,
+                        GpuVendor::Other,
+                        DeviceClass::IntegratedGpu,
+                        "gpu",
+                        1,
+                    )),
+                    cpu(),
+                ],
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(selected.target.backend, BackendKind::Cpu);
+    }
+}

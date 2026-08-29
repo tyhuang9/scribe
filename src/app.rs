@@ -19706,6 +19706,7 @@ mod layout_tests {
                 requested: AccelerationPreference::Cpu,
                 resolved: crate::transcription::ComputeDevice::Cpu,
                 diagnostic: None,
+                selection: None,
             },
             detected_architecture: "whisper".to_owned(),
             capabilities: crate::transcription::RuntimeCapabilities::default(),
