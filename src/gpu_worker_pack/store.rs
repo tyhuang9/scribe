@@ -1,7 +1,5 @@
 use std::collections::BTreeMap;
-#[cfg(not(windows))]
-use std::fs::File;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -15,6 +13,7 @@ use super::manifest::{
 
 const STATE_SCHEMA_VERSION: u16 = 1;
 const MAX_STATE_BYTES: u64 = 256 * 1024;
+const STORE_LOCK_NAME: &str = ".worker-pack-store.lock";
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -39,6 +38,27 @@ impl ActivationState {
 struct EpochState {
     schema_version: u16,
     epochs: BTreeMap<String, u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PendingActivation {
+    schema_version: u16,
+    target: VerifiedPack,
+    prior_activation: ActivationState,
+    next_activation: ActivationState,
+    prior_epochs: EpochState,
+    next_epochs: EpochState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PublishOutcome {
+    Published,
+    DestinationExists,
+}
+
+pub(super) struct ExclusiveFileLock {
+    file: File,
 }
 
 impl EpochState {
@@ -74,7 +94,10 @@ impl<'a> PackStore<'a> {
         signed_source: &Path,
     ) -> Result<VerifiedPack, PackStoreError> {
         let source = self.verifier.verify(signed_source)?;
-        self.require_epoch(&source)?;
+        let _lock = self.acquire_lock()?;
+        self.recover_pending_activation_locked()?;
+        let epochs = self.load_epochs_strict()?;
+        require_epoch_from(&source, &epochs)?;
         let parent = self
             .packs_root
             .join(&source.pack_id)
@@ -98,7 +121,9 @@ impl<'a> PackStore<'a> {
             let staged = self.verifier.verify(&staging)?;
             require_same_pack(&source, &staged)?;
             make_payload_readonly(&staging)?;
-            durable_rename_new(&staging, &final_root)?;
+            if durable_rename_new(&staging, &final_root)? == PublishOutcome::DestinationExists {
+                remove_staging_tree(&staging)?;
+            }
             let installed = self.verifier.verify(&final_root)?;
             require_same_pack(&source, &installed)?;
             Ok(installed)
@@ -110,38 +135,76 @@ impl<'a> PackStore<'a> {
     }
 
     pub(crate) fn activate(&self, descriptor: &VerifiedPack) -> Result<(), PackStoreError> {
+        let _lock = self.acquire_lock()?;
+        self.recover_pending_activation_locked()?;
+        self.activate_locked(descriptor, None)
+    }
+
+    fn activate_locked(
+        &self,
+        descriptor: &VerifiedPack,
+        #[cfg(test)] interrupt_after: Option<ActivationBoundary>,
+        #[cfg(not(test))] _interrupt_after: Option<()>,
+    ) -> Result<(), PackStoreError> {
         let verified = self.reverify_descriptor(descriptor)?;
-        self.require_epoch(&verified)?;
-        let mut epochs = self.load_epochs_strict()?;
-        let old_floor = epochs
+        let prior_epochs = self.load_epochs_strict()?;
+        require_epoch_from(&verified, &prior_epochs)?;
+        let prior_activation = self.load_activation_strict()?;
+        let mut next_epochs = prior_epochs.clone();
+        let old_floor = next_epochs
             .epochs
             .get(&verified.pack_id)
             .copied()
             .unwrap_or(EMBEDDED_MINIMUM_SECURITY_EPOCH);
-        epochs.epochs.insert(
+        next_epochs.epochs.insert(
             verified.pack_id.clone(),
             old_floor.max(verified.security_epoch),
         );
-        self.persist_epochs(&epochs)?;
-
-        let old = self.load_activation_fail_closed();
-        self.persist_activation(&ActivationState {
+        let next_activation = ActivationState {
             schema_version: STATE_SCHEMA_VERSION,
-            current: Some(verified),
-            previous: old.current,
-        })
+            current: Some(verified.clone()),
+            previous: prior_activation.current.clone(),
+        };
+        let pending = PendingActivation {
+            schema_version: STATE_SCHEMA_VERSION,
+            target: verified,
+            prior_activation,
+            next_activation: next_activation.clone(),
+            prior_epochs,
+            next_epochs: next_epochs.clone(),
+        };
+        self.persist_pending(&pending)?;
+        #[cfg(test)]
+        if interrupt_after == Some(ActivationBoundary::Journal) {
+            return Err(PackStoreError::InjectedInterruption);
+        }
+        self.persist_epochs(&next_epochs)?;
+        #[cfg(test)]
+        if interrupt_after == Some(ActivationBoundary::Epochs) {
+            return Err(PackStoreError::InjectedInterruption);
+        }
+        self.persist_activation(&next_activation)?;
+        #[cfg(test)]
+        if interrupt_after == Some(ActivationBoundary::Activation) {
+            return Err(PackStoreError::InjectedInterruption);
+        }
+        self.remove_pending()?;
+        Ok(())
     }
 
     pub(crate) fn rollback(&self) -> Result<VerifiedPack, PackStoreError> {
+        let _lock = self.acquire_lock()?;
+        self.recover_pending_activation_locked()?;
         let state = self.load_activation_strict()?;
         let previous = state.previous.ok_or(PackStoreError::NoRollbackPack)?;
         let rollback = self.reverify_descriptor(&previous)?;
-        self.require_epoch(&rollback)?;
+        let epochs = self.load_epochs_strict()?;
+        require_epoch_from(&rollback, &epochs)?;
         let prior_current = state
             .current
             .as_ref()
             .and_then(|current| self.reverify_descriptor(current).ok())
-            .filter(|current| self.require_epoch(current).is_ok());
+            .filter(|current| require_epoch_from(current, &epochs).is_ok());
         self.persist_activation(&ActivationState {
             schema_version: STATE_SCHEMA_VERSION,
             current: Some(rollback.clone()),
@@ -153,15 +216,24 @@ impl<'a> PackStore<'a> {
     /// Corrupt state or invalid packs project to no GPU pack and cannot affect
     /// the separately compiled CPU route.
     pub(crate) fn current_fail_closed(&self) -> Option<VerifiedPack> {
-        let descriptor = self.load_activation_fail_closed().current?;
+        let _lock = self.acquire_lock().ok()?;
+        self.recover_pending_activation_locked().ok()?;
+        let descriptor = self.load_activation_strict().ok()?.current?;
+        let epochs = self.load_epochs_strict().ok()?;
         self.reverify_descriptor(&descriptor)
             .ok()
-            .filter(|pack| self.require_epoch(pack).is_ok())
+            .filter(|pack| require_epoch_from(pack, &epochs).is_ok())
     }
 
     /// Only uniquely named incomplete staging directories and state temporary
     /// files are removed. Final digest trees and state records are untouched.
     pub(crate) fn recover_interrupted_work(&self) -> Result<(), PackStoreError> {
+        let _lock = self.acquire_lock()?;
+        self.recover_pending_activation_locked()?;
+        self.recover_interrupted_work_locked()
+    }
+
+    fn recover_interrupted_work_locked(&self) -> Result<(), PackStoreError> {
         if self.packs_root.exists() {
             for pack_id in read_regular_directory(&self.packs_root)? {
                 for version in read_regular_directory(&pack_id)? {
@@ -213,21 +285,8 @@ impl<'a> PackStore<'a> {
         Ok(verified)
     }
 
-    fn require_epoch(&self, descriptor: &VerifiedPack) -> Result<(), PackStoreError> {
-        let epochs = self.load_epochs_strict()?;
-        let floor = epochs
-            .epochs
-            .get(&descriptor.pack_id)
-            .copied()
-            .unwrap_or(EMBEDDED_MINIMUM_SECURITY_EPOCH)
-            .max(EMBEDDED_MINIMUM_SECURITY_EPOCH);
-        if descriptor.security_epoch < floor {
-            return Err(PackStoreError::SecurityEpochDowngrade {
-                observed: descriptor.security_epoch,
-                floor,
-            });
-        }
-        Ok(())
+    fn acquire_lock(&self) -> Result<ExclusiveFileLock, PackStoreError> {
+        exclusive_file_lock(&self.state_root.join(STORE_LOCK_NAME))
     }
 
     fn activation_path(&self) -> PathBuf {
@@ -238,14 +297,13 @@ impl<'a> PackStore<'a> {
         self.state_root.join("security-epochs.json")
     }
 
-    fn load_activation_fail_closed(&self) -> ActivationState {
-        self.load_activation_strict()
-            .unwrap_or_else(|_| ActivationState::empty())
+    fn pending_path(&self) -> PathBuf {
+        self.state_root.join("pending-activation.json")
     }
 
     fn load_activation_strict(&self) -> Result<ActivationState, PackStoreError> {
         let path = self.activation_path();
-        if !path.exists() {
+        if !entry_exists(&path)? {
             return Ok(ActivationState::empty());
         }
         let state: ActivationState = read_canonical_state(&path)?;
@@ -257,7 +315,7 @@ impl<'a> PackStore<'a> {
 
     fn load_epochs_strict(&self) -> Result<EpochState, PackStoreError> {
         let path = self.epoch_path();
-        if !path.exists() {
+        if !entry_exists(&path)? {
             return Ok(EpochState::empty());
         }
         let state: EpochState = read_canonical_state(&path)?;
@@ -280,6 +338,115 @@ impl<'a> PackStore<'a> {
     fn persist_epochs(&self, state: &EpochState) -> Result<(), PackStoreError> {
         atomic_write_canonical(&self.epoch_path(), state)
     }
+
+    fn persist_pending(&self, pending: &PendingActivation) -> Result<(), PackStoreError> {
+        atomic_write_canonical(&self.pending_path(), pending)
+    }
+
+    fn remove_pending(&self) -> Result<(), PackStoreError> {
+        remove_regular_state_file(&self.pending_path())
+    }
+
+    fn recover_pending_activation_locked(&self) -> Result<(), PackStoreError> {
+        let path = self.pending_path();
+        if !entry_exists(&path)? {
+            return Ok(());
+        }
+        let pending: PendingActivation = read_canonical_state(&path)?;
+        validate_pending_activation(&pending)?;
+        let target = self.reverify_descriptor(&pending.target)?;
+        if target != pending.target {
+            return Err(PackStoreError::DescriptorChanged);
+        }
+        let observed_epochs = self.load_epochs_strict()?;
+        if observed_epochs != pending.prior_epochs && observed_epochs != pending.next_epochs {
+            return Err(PackStoreError::CorruptState(
+                "pending activation epoch witness",
+            ));
+        }
+        if let Ok(observed_activation) = self.load_activation_strict()
+            && observed_activation != pending.prior_activation
+            && observed_activation != pending.next_activation
+        {
+            return Err(PackStoreError::CorruptState(
+                "pending activation state witness",
+            ));
+        }
+        // The journal is durable before the floor is raised. A valid pending
+        // target is therefore always completed; this never lowers an observed
+        // security epoch and repairs a torn/corrupt activation pointer.
+        self.persist_epochs(&pending.next_epochs)?;
+        self.persist_activation(&pending.next_activation)?;
+        self.remove_pending()?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActivationBoundary {
+    Journal,
+    Epochs,
+    Activation,
+}
+
+fn require_epoch_from(
+    descriptor: &VerifiedPack,
+    epochs: &EpochState,
+) -> Result<(), PackStoreError> {
+    let floor = epochs
+        .epochs
+        .get(&descriptor.pack_id)
+        .copied()
+        .unwrap_or(EMBEDDED_MINIMUM_SECURITY_EPOCH)
+        .max(EMBEDDED_MINIMUM_SECURITY_EPOCH);
+    if descriptor.security_epoch < floor {
+        return Err(PackStoreError::SecurityEpochDowngrade {
+            observed: descriptor.security_epoch,
+            floor,
+        });
+    }
+    Ok(())
+}
+
+fn validate_pending_activation(pending: &PendingActivation) -> Result<(), PackStoreError> {
+    if pending.schema_version != STATE_SCHEMA_VERSION
+        || pending.prior_activation.schema_version != STATE_SCHEMA_VERSION
+        || pending.next_activation.schema_version != STATE_SCHEMA_VERSION
+        || pending.prior_epochs.schema_version != STATE_SCHEMA_VERSION
+        || pending.next_epochs.schema_version != STATE_SCHEMA_VERSION
+        || pending.next_activation.current.as_ref() != Some(&pending.target)
+        || pending.next_activation.previous != pending.prior_activation.current
+    {
+        return Err(PackStoreError::CorruptState(
+            "pending activation transaction",
+        ));
+    }
+    let prior_floor = pending
+        .prior_epochs
+        .epochs
+        .get(&pending.target.pack_id)
+        .copied()
+        .unwrap_or(EMBEDDED_MINIMUM_SECURITY_EPOCH);
+    let next_floor = pending
+        .next_epochs
+        .epochs
+        .get(&pending.target.pack_id)
+        .copied()
+        .unwrap_or(EMBEDDED_MINIMUM_SECURITY_EPOCH);
+    let mut expected_epochs = pending.prior_epochs.clone();
+    expected_epochs.epochs.insert(
+        pending.target.pack_id.clone(),
+        prior_floor.max(pending.target.security_epoch),
+    );
+    if next_floor != prior_floor.max(pending.target.security_epoch)
+        || pending.next_epochs != expected_epochs
+    {
+        return Err(PackStoreError::CorruptState(
+            "pending activation epoch transition",
+        ));
+    }
+    Ok(())
 }
 
 fn require_same_pack(
@@ -519,6 +686,47 @@ pub(super) fn atomic_write_canonical<T: Serialize>(
     result
 }
 
+pub(super) fn exclusive_file_lock(path: &Path) -> Result<ExclusiveFileLock, PackStoreError> {
+    let parent = path
+        .parent()
+        .ok_or(PackStoreError::CorruptState("lock parent"))?;
+    ensure_regular_directories(parent)?;
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+    configure_private_create(&mut options);
+    configure_no_follow(&mut options);
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || is_link_or_reparse(&metadata) {
+        return Err(PackStoreError::UnsafeFilesystemEntry(path.to_path_buf()));
+    }
+    super::manifest::reject_named_streams(path)?;
+    lock_file(&file)?;
+    Ok(ExclusiveFileLock { file })
+}
+
+fn remove_regular_state_file(path: &Path) -> Result<(), PackStoreError> {
+    if !entry_exists(path)? {
+        return Ok(());
+    }
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_file() || is_link_or_reparse(&metadata) {
+        return Err(PackStoreError::UnsafeFilesystemEntry(path.to_path_buf()));
+    }
+    super::manifest::reject_named_streams(path)?;
+    fs::remove_file(path)?;
+    sync_parent_if_supported(path)?;
+    Ok(())
+}
+
+fn entry_exists(path: &Path) -> Result<bool, PackStoreError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(PackStoreError::Io(error)),
+    }
+}
+
 fn random_suffix() -> Result<String, PackStoreError> {
     let mut bytes = [0_u8; 16];
     fill(&mut bytes).map_err(|error| PackStoreError::Random(error.to_string()))?;
@@ -564,31 +772,99 @@ fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
 }
 
 #[cfg(windows)]
-fn durable_rename_new(source: &Path, destination: &Path) -> Result<(), PackStoreError> {
-    move_file(source, destination, false)
+fn durable_rename_new(source: &Path, destination: &Path) -> Result<PublishOutcome, PackStoreError> {
+    match move_file(source, destination, false) {
+        Ok(()) => Ok(PublishOutcome::Published),
+        Err(_error) if destination.symlink_metadata().is_ok() => {
+            Ok(PublishOutcome::DestinationExists)
+        }
+        Err(error) => Err(PackStoreError::Io(error)),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn durable_rename_new(source: &Path, destination: &Path) -> Result<PublishOutcome, PackStoreError> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let source = CString::new(source.as_os_str().as_bytes())
+        .map_err(|_| PackStoreError::CorruptState("publish source path"))?;
+    let destination_raw = CString::new(destination.as_os_str().as_bytes())
+        .map_err(|_| PackStoreError::CorruptState("publish destination path"))?;
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            source.as_ptr(),
+            libc::AT_FDCWD,
+            destination_raw.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result != 0 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EEXIST) {
+            return Ok(PublishOutcome::DestinationExists);
+        }
+        if error.raw_os_error() == Some(libc::ENOSYS) {
+            return Err(PackStoreError::UnsupportedAtomicPublish);
+        }
+        return Err(PackStoreError::Io(error));
+    }
+    sync_parent(destination)?;
+    Ok(PublishOutcome::Published)
+}
+
+#[cfg(target_os = "macos")]
+fn durable_rename_new(source: &Path, destination: &Path) -> Result<PublishOutcome, PackStoreError> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let source = CString::new(source.as_os_str().as_bytes())
+        .map_err(|_| PackStoreError::CorruptState("publish source path"))?;
+    let destination_raw = CString::new(destination.as_os_str().as_bytes())
+        .map_err(|_| PackStoreError::CorruptState("publish destination path"))?;
+    if unsafe { libc::renamex_np(source.as_ptr(), destination_raw.as_ptr(), libc::RENAME_EXCL) }
+        != 0
+    {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EEXIST) {
+            return Ok(PublishOutcome::DestinationExists);
+        }
+        return Err(PackStoreError::Io(error));
+    }
+    sync_parent(destination)?;
+    Ok(PublishOutcome::Published)
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn durable_rename_new(
+    _source: &Path,
+    _destination: &Path,
+) -> Result<PublishOutcome, PackStoreError> {
+    Err(PackStoreError::UnsupportedAtomicPublish)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn durable_rename_new(
+    _source: &Path,
+    _destination: &Path,
+) -> Result<PublishOutcome, PackStoreError> {
+    Err(PackStoreError::UnsupportedAtomicPublish)
+}
+
+#[cfg(windows)]
+fn durable_replace(source: &Path, destination: &Path) -> Result<(), PackStoreError> {
+    move_file(source, destination, true).map_err(PackStoreError::Io)
 }
 
 #[cfg(not(windows))]
-fn durable_rename_new(source: &Path, destination: &Path) -> Result<(), PackStoreError> {
+fn durable_replace(source: &Path, destination: &Path) -> Result<(), PackStoreError> {
     fs::rename(source, destination)?;
     sync_parent(destination)?;
     Ok(())
 }
 
 #[cfg(windows)]
-fn durable_replace(source: &Path, destination: &Path) -> Result<(), PackStoreError> {
-    move_file(source, destination, true)
-}
-
-#[cfg(not(windows))]
-fn durable_replace(source: &Path, destination: &Path) -> Result<(), PackStoreError> {
-    fs::rename(source, destination)?;
-    sync_parent(destination)?;
-    Ok(())
-}
-
-#[cfg(windows)]
-fn move_file(source: &Path, destination: &Path, replace: bool) -> Result<(), PackStoreError> {
+fn move_file(source: &Path, destination: &Path, replace: bool) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{
         MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
@@ -610,8 +886,82 @@ fn move_file(source: &Path, destination: &Path, replace: bool) -> Result<(), Pac
             0
         };
     if unsafe { MoveFileExW(source.as_ptr(), destination.as_ptr(), flags) } == 0 {
-        return Err(PackStoreError::Io(io::Error::last_os_error()));
+        return Err(io::Error::last_os_error());
     }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn lock_file(file: &File) -> Result<(), PackStoreError> {
+    use std::os::fd::AsRawFd;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+        Ok(())
+    } else {
+        Err(PackStoreError::Io(io::Error::last_os_error()))
+    }
+}
+
+#[cfg(windows)]
+fn lock_file(file: &File) -> Result<(), PackStoreError> {
+    use std::mem::zeroed;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{LOCKFILE_EXCLUSIVE_LOCK, LockFileEx};
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+    let mut overlapped: OVERLAPPED = unsafe { zeroed() };
+    if unsafe {
+        LockFileEx(
+            file.as_raw_handle(),
+            LOCKFILE_EXCLUSIVE_LOCK,
+            0,
+            1,
+            0,
+            &mut overlapped,
+        )
+    } != 0
+    {
+        Ok(())
+    } else {
+        Err(PackStoreError::Io(io::Error::last_os_error()))
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn lock_file(_file: &File) -> Result<(), PackStoreError> {
+    Err(PackStoreError::UnsupportedFileLock)
+}
+
+#[cfg(unix)]
+fn unlock_file(file: &File) {
+    use std::os::fd::AsRawFd;
+    let _ = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+}
+
+#[cfg(windows)]
+fn unlock_file(file: &File) {
+    use std::mem::zeroed;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::UnlockFileEx;
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+    let mut overlapped: OVERLAPPED = unsafe { zeroed() };
+    let _ = unsafe { UnlockFileEx(file.as_raw_handle(), 0, 1, 0, &mut overlapped) };
+}
+
+#[cfg(not(any(unix, windows)))]
+fn unlock_file(_file: &File) {}
+
+impl Drop for ExclusiveFileLock {
+    fn drop(&mut self) {
+        unlock_file(&self.file);
+    }
+}
+
+fn sync_parent_if_supported(path: &Path) -> Result<(), PackStoreError> {
+    #[cfg(not(windows))]
+    {
+        sync_parent(path)?;
+    }
+    #[cfg(windows)]
+    let _ = path;
     Ok(())
 }
 
@@ -634,6 +984,10 @@ pub(crate) enum PackStoreError {
     Json(#[from] serde_json::Error),
     #[error("worker-pack store randomness failed: {0}")]
     Random(String),
+    #[error("this platform has no supported atomic no-replace directory publication primitive")]
+    UnsupportedAtomicPublish,
+    #[error("this platform has no supported OS-backed file lock")]
+    UnsupportedFileLock,
     #[error("worker-pack descriptor changed")]
     DescriptorChanged,
     #[error("worker-pack descriptor points outside the immutable store")]
@@ -648,6 +1002,9 @@ pub(crate) enum PackStoreError {
     UnsafeFilesystemEntry(PathBuf),
     #[error("refused unsafe worker-pack recovery target: {0}")]
     UnsafeRecoveryTarget(PathBuf),
+    #[cfg(test)]
+    #[error("injected activation interruption")]
+    InjectedInterruption,
 }
 
 #[cfg(test)]
@@ -808,6 +1165,147 @@ mod tests {
             Err(PackStoreError::DescriptorOutsideStore)
         ));
         assert_eq!(store.current_fail_closed(), Some(second));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn atomic_publish_never_replaces_an_existing_digest_directory() {
+        let root = temp_root("store-no-replace");
+        let source = root.join("source-directory");
+        let destination = root.join("digest-directory");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&destination).unwrap();
+        fs::write(source.join("new"), b"new").unwrap();
+        fs::write(destination.join("immutable"), b"original").unwrap();
+        assert_eq!(
+            durable_rename_new(&source, &destination).unwrap(),
+            PublishOutcome::DestinationExists
+        );
+        assert_eq!(
+            fs::read(destination.join("immutable")).unwrap(),
+            b"original"
+        );
+        assert!(source.join("new").is_file());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn activation_journal_recovers_every_persistence_boundary() {
+        for boundary in [
+            ActivationBoundary::Journal,
+            ActivationBoundary::Epochs,
+            ActivationBoundary::Activation,
+        ] {
+            let nonce = random_suffix().unwrap();
+            let (root, workers, state, verifier, _) =
+                store_fixture(&format!("ab-{boundary:?}-{}", &nonce[..8]));
+            let store = PackStore::new(&workers, &state, &verifier);
+            let first = store.stage_and_install(&root.join("source")).unwrap();
+            store.activate(&first).unwrap();
+            let (next_source, _) = additional_source(&root, "2.0.0", 2);
+            let next = store.stage_and_install(&next_source).unwrap();
+            {
+                let _lock = store.acquire_lock().unwrap();
+                assert!(matches!(
+                    store.activate_locked(&next, Some(boundary)),
+                    Err(PackStoreError::InjectedInterruption)
+                ));
+            }
+            assert_eq!(store.current_fail_closed(), Some(next.clone()));
+            let activation = store.load_activation_strict().unwrap();
+            assert_eq!(activation.previous, Some(first));
+            assert!(!store.pending_path().exists());
+            assert_eq!(
+                store
+                    .load_epochs_strict()
+                    .unwrap()
+                    .epochs
+                    .get(&next.pack_id),
+                Some(&2)
+            );
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn corrupt_pending_activation_fails_closed_without_lowering_epoch() {
+        let (root, workers, state, verifier, _) = store_fixture("corrupt-pending");
+        let store = PackStore::new(&workers, &state, &verifier);
+        let first = store.stage_and_install(&root.join("source")).unwrap();
+        store.activate(&first).unwrap();
+        fs::write(store.pending_path(), b"{corrupt").unwrap();
+        assert_eq!(store.current_fail_closed(), None);
+        assert!(store.activate(&first).is_err());
+        assert_eq!(
+            store
+                .load_epochs_strict()
+                .unwrap()
+                .epochs
+                .get(&first.pack_id),
+            Some(&1)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn concurrent_activations_preserve_the_immediate_predecessor() {
+        let (root, workers, state, verifier, _) = store_fixture("concurrent-activation");
+        let store = PackStore::new(&workers, &state, &verifier);
+        let first = store.stage_and_install(&root.join("source")).unwrap();
+        let (second_source, _) = additional_source(&root, "2.0.0", 1);
+        let (third_source, _) = additional_source(&root, "3.0.0", 1);
+        let second = store.stage_and_install(&second_source).unwrap();
+        let third = store.stage_and_install(&third_source).unwrap();
+        store.activate(&first).unwrap();
+        std::thread::scope(|scope| {
+            let left = PackStore::new(&workers, &state, &verifier);
+            let right = PackStore::new(&workers, &state, &verifier);
+            let second = second.clone();
+            let third = third.clone();
+            scope.spawn(move || left.activate(&second).unwrap());
+            scope.spawn(move || right.activate(&third).unwrap());
+        });
+        let activation = store.load_activation_strict().unwrap();
+        let current = activation.current.unwrap();
+        let previous = activation.previous.unwrap();
+        assert!(
+            (current == second && previous == third) || (current == third && previous == second)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn concurrent_epoch_raises_never_lose_the_highest_floor() {
+        let (root, workers, state, verifier, _) = store_fixture("concurrent-epochs");
+        let store = PackStore::new(&workers, &state, &verifier);
+        let first = store.stage_and_install(&root.join("source")).unwrap();
+        let (epoch_two_source, _) = additional_source(&root, "2.0.0", 2);
+        let (epoch_three_source, _) = additional_source(&root, "3.0.0", 3);
+        let epoch_two = store.stage_and_install(&epoch_two_source).unwrap();
+        let epoch_three = store.stage_and_install(&epoch_three_source).unwrap();
+        store.activate(&first).unwrap();
+        std::thread::scope(|scope| {
+            let left = PackStore::new(&workers, &state, &verifier);
+            let right = PackStore::new(&workers, &state, &verifier);
+            let epoch_two = epoch_two.clone();
+            let epoch_three = epoch_three.clone();
+            let lower = scope.spawn(move || left.activate(&epoch_two));
+            let higher = scope.spawn(move || right.activate(&epoch_three));
+            let lower = lower.join().unwrap();
+            higher.join().unwrap().unwrap();
+            if let Err(error) = lower {
+                assert!(matches!(
+                    error,
+                    PackStoreError::SecurityEpochDowngrade {
+                        observed: 2,
+                        floor: 3
+                    }
+                ));
+            }
+        });
+        let epochs = store.load_epochs_strict().unwrap();
+        assert_eq!(epochs.epochs.get(&epoch_three.pack_id), Some(&3));
+        assert_eq!(store.current_fail_closed(), Some(epoch_three));
         fs::remove_dir_all(root).unwrap();
     }
 }
