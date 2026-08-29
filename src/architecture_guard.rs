@@ -859,6 +859,19 @@ fn verified_worker_pack_stage_four_remains_trust_closed_and_auto_inert() {
             "typed Stage 4 production provisioning gate lost {required:?}"
         );
     }
+    let production_worker = production_source(worker);
+    assert!(
+        production_worker.contains(
+            "fn resolver_unix_launch_authority(\n        &self,\n    ) -> Option<Arc<crate::gpu_worker_pack::UnixPackExecAuthority>>"
+        ),
+        "Stage 4 Unix pack binding must expose a fallible authority boundary"
+    );
+    assert!(
+        !production_worker.contains(
+            "unreachable!(\"production verified-pack launch is Windows-only in Stage 4\")"
+        ),
+        "unsupported Unix production pack binding must fail closed without a panic"
+    );
     for required in [
         "struct LaunchableWorker<'lease>",
         "_lease: &'lease VerifiedPackLease",

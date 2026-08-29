@@ -2129,8 +2129,10 @@ impl ResolverHelloBindingBridge for BoundPackHelloBridge<'_> {
     }
 
     #[cfg(unix)]
-    fn resolver_unix_launch_authority(&self) -> Arc<crate::gpu_worker_pack::UnixPackExecAuthority> {
-        unreachable!("production verified-pack launch is Windows-only in Stage 4")
+    fn resolver_unix_launch_authority(
+        &self,
+    ) -> Option<Arc<crate::gpu_worker_pack::UnixPackExecAuthority>> {
+        None
     }
 
     fn hello_pack_id(&self) -> &str {

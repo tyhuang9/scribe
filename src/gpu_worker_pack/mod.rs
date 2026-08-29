@@ -44,7 +44,7 @@ mod launch_binding {
     pub(crate) trait ResolverHelloBindingBridge {
         fn resolver_verified_pack_lease(&self) -> Arc<VerifiedPackLease>;
         #[cfg(unix)]
-        fn resolver_unix_launch_authority(&self) -> Arc<UnixPackExecAuthority>;
+        fn resolver_unix_launch_authority(&self) -> Option<Arc<UnixPackExecAuthority>>;
         fn hello_pack_id(&self) -> &str;
         fn hello_pack_version(&self) -> &str;
         fn hello_pack_digest(&self) -> &str;
@@ -127,7 +127,7 @@ mod launch_binding {
         ) -> Option<Self> {
             let lease = bridge.resolver_verified_pack_lease();
             #[cfg(unix)]
-            let unix_exec_authority = bridge.resolver_unix_launch_authority();
+            let unix_exec_authority = bridge.resolver_unix_launch_authority()?;
             #[cfg(unix)]
             let unix_authority_matches_lease =
                 Arc::ptr_eq(&lease, unix_exec_authority.verified_pack_lease());
@@ -869,7 +869,7 @@ mod tests {
         #[cfg(unix)]
         fn resolver_unix_launch_authority(
             &self,
-        ) -> Arc<super::launch_binding::UnixPackExecAuthority> {
+        ) -> Option<Arc<super::launch_binding::UnixPackExecAuthority>> {
             use std::os::unix::fs::OpenOptionsExt;
             let executable = std::fs::OpenOptions::new()
                 .read(true)
@@ -881,10 +881,12 @@ mod tests {
                 .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
                 .open(&self.lease.verified_pack().root)
                 .unwrap();
-            Arc::new(super::launch_binding::UnixPackExecAuthority::fixture(
-                Arc::clone(&self.lease),
-                executable,
-                dependency_root,
+            Some(Arc::new(
+                super::launch_binding::UnixPackExecAuthority::fixture(
+                    Arc::clone(&self.lease),
+                    executable,
+                    dependency_root,
+                ),
             ))
         }
 
