@@ -11,70 +11,26 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+#[cfg(test)]
+use std::time::Duration;
+use std::time::Instant;
 
 use sha2::{Digest, Sha256};
-use thiserror::Error;
 use transcribe_cpp::CancelToken;
 
-use crate::embedded_runtime::{EmbeddedRuntime, TRANSCRIBE_CPP_VERSION};
+use crate::embedded_runtime::EmbeddedRuntime;
 use crate::model_catalog::{
     ArtifactFormat, RuntimeRequirement, RuntimeVersion, runtime_model_manifest,
 };
 use crate::prepared_audio::{PREPARED_SAMPLE_RATE, PreparedAudio};
 use crate::runtime_artifact::{RuntimeArtifact, RuntimeModel};
-use crate::transcription::{
-    AccelerationPreference, ModelId, ResolvedAcceleration, RuntimeCapabilities, SpeechEngine,
-    Transcript, TranscriptionOptions,
+use crate::runtime_contract::TRANSCRIBE_CPP_VERSION;
+pub(crate) use crate::runtime_contract::{
+    NativeRuntimeDiagnostics, RuntimeError, RuntimeExecution, RuntimeLoadExecution,
 };
-
-pub(crate) const WARM_MODEL_TTL: Duration = Duration::from_secs(5 * 60);
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct NativeRuntimeDiagnostics {
-    pub resolved_acceleration: ResolvedAcceleration,
-    pub runtime_location: PathBuf,
-    pub warm_reused: bool,
-    pub model_load_duration_ms: u128,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct RuntimeExecution {
-    pub transcript: Transcript,
-    pub diagnostics: NativeRuntimeDiagnostics,
-    pub processing_duration_ms: u128,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RuntimeLoadExecution {
-    pub diagnostics: NativeRuntimeDiagnostics,
-    pub detected_architecture: String,
-    pub capabilities: RuntimeCapabilities,
-}
-
-#[derive(Debug, Error)]
-pub(crate) enum RuntimeError {
-    #[error(
-        "runtime audio must be mono 16 kHz; received {channels} channel(s) at {sample_rate_hz} Hz"
-    )]
-    InvalidAudio { sample_rate_hz: u32, channels: u16 },
-    #[error("native inference failed: {0}")]
-    Inference(String),
-    #[error("native callback failed: {0}")]
-    Callback(String),
-    #[error("native speech engine failed: {0}")]
-    Engine(String),
-    #[error("GGUF artifact integrity check failed for {path}: {message}")]
-    ArtifactIntegrity { path: PathBuf, message: String },
-    #[error("native speech runtime lock was poisoned")]
-    Poisoned,
-    #[error("the model is not handled by the static GGUF runtime: {0}")]
-    UnsupportedModel(ModelId),
-    #[error("dedicated native runtime worker is unavailable: {0}")]
-    WorkerUnavailable(String),
-    #[error("isolated ONNX speech runtime is unavailable: {0}")]
-    OnnxUnavailable(String),
-}
+use crate::transcription::{
+    AccelerationPreference, ModelId, RuntimeCapabilities, SpeechEngine, TranscriptionOptions,
+};
 
 /// Deliberately private: concrete runtime selection never crosses the router.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -30,9 +30,10 @@ use crate::prepared_audio::{PREPARED_SAMPLE_RATE, PreparedAudio};
 use crate::runtime_artifact::{
     OnnxFileRole, OnnxModelFamily, OnnxModelSpec, RuntimeArtifact, RuntimeModel,
 };
-use crate::runtime_router::{
-    NativeRuntimeDiagnostics, RuntimeError, RuntimeExecution, RuntimeLoadExecution, RuntimeRouter,
+use crate::runtime_contract::{
+    NativeRuntimeDiagnostics, RuntimeError, RuntimeExecution, RuntimeLoadExecution,
 };
+use crate::runtime_router::RuntimeRouter;
 use crate::silero_vad_native::{SileroVadModel, VadThreshold, WINDOW_SAMPLES};
 use crate::transcription::{
     AccelerationPreference, ComputeDevice, ModelId, ResolvedAcceleration, RuntimeCapabilities,
@@ -47,9 +48,12 @@ use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt;
 
 pub(crate) const PROTOCOL_MAGIC: [u8; 4] = *b"SCIF";
-pub(crate) const PROTOCOL_VERSION: u8 = 4;
+pub(crate) const PROTOCOL_VERSION: u8 = 5;
 pub(crate) const INFERENCE_WORKER_FLAG: &str = "--scribe-inference-worker";
 pub(crate) const VAD_WORKER_FLAG: &str = "--scribe-vad-worker";
+const WORKER_ABI_VERSION: u16 = 1;
+const APP_BUILD_ID: &str = concat!("local-transcriber@", env!("CARGO_PKG_VERSION"));
+const WORKER_BUILD_ID: &str = concat!("scribe-inference-worker@", env!("CARGO_PKG_VERSION"));
 const PARENT_LIVENESS_ENV: &str = "SCRIBE_PRIVATE_PARENT_LIVENESS";
 const PARENT_CONTROL_CANCEL: u8 = b'C';
 const HEADER_LEN: usize = 26;
@@ -531,7 +535,10 @@ fn reserve_batch_samples(declared_samples: usize) -> Result<Vec<f32>> {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 enum Control {
-    Hello,
+    Hello {
+        challenge: String,
+        expected: WorkerExpectation,
+    },
     LoadRuntime {
         artifact: WireRuntimeArtifact,
         preference: AccelerationPreference,
@@ -565,7 +572,9 @@ enum Control {
     Unload,
     Health,
     Shutdown,
-    Ready,
+    Ready {
+        capability: WorkerCapability,
+    },
     RuntimeLoaded {
         execution: WireRuntimeLoadExecution,
     },
@@ -593,7 +602,7 @@ impl Control {
     fn is_parent_command(&self) -> bool {
         matches!(
             self,
-            Self::Hello
+            Self::Hello { .. }
                 | Self::LoadRuntime { .. }
                 | Self::BeginBatch { .. }
                 | Self::EndBatch
@@ -615,7 +624,7 @@ impl Control {
     fn is_worker_response(&self) -> bool {
         matches!(
             self,
-            Self::Ready
+            Self::Ready { .. }
                 | Self::RuntimeLoaded { .. }
                 | Self::RuntimeTranscript { .. }
                 | Self::RuntimeFailed { .. }
@@ -701,10 +710,161 @@ trait WorkerLauncher: Send + Sync {
     fn launch(&self) -> Result<SpawnedWorker>;
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 enum WorkerRole {
     Inference,
     Vad,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WorkerProvider {
+    Cpu,
+    Cuda,
+    Vulkan,
+    Metal,
+}
+
+impl WorkerProvider {
+    fn is_gpu(self) -> bool {
+        !matches!(self, Self::Cpu)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WorkerArtifactKind {
+    Gguf,
+    OnnxAsr,
+    SileroVad,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkerArtifactTarget {
+    artifact: WorkerArtifactKind,
+    target: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkerExpectation {
+    app_build: String,
+    worker_build: String,
+    abi: u16,
+    role: WorkerRole,
+    provider: WorkerProvider,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkerCapability {
+    challenge: String,
+    app_build: String,
+    worker_build: String,
+    abi: u16,
+    role: WorkerRole,
+    provider: WorkerProvider,
+    artifacts: Vec<WorkerArtifactTarget>,
+}
+
+fn expected_worker(role: WorkerRole) -> WorkerExpectation {
+    WorkerExpectation {
+        app_build: APP_BUILD_ID.to_owned(),
+        worker_build: WORKER_BUILD_ID.to_owned(),
+        abi: WORKER_ABI_VERSION,
+        role,
+        provider: WorkerProvider::Cpu,
+    }
+}
+
+fn worker_capability(role: WorkerRole, challenge: String) -> WorkerCapability {
+    let target = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
+    let artifacts = match role {
+        WorkerRole::Inference => vec![
+            WorkerArtifactTarget {
+                artifact: WorkerArtifactKind::Gguf,
+                target: target.clone(),
+            },
+            WorkerArtifactTarget {
+                artifact: WorkerArtifactKind::OnnxAsr,
+                target,
+            },
+        ],
+        WorkerRole::Vad => vec![WorkerArtifactTarget {
+            artifact: WorkerArtifactKind::SileroVad,
+            target,
+        }],
+    };
+    WorkerCapability {
+        challenge,
+        app_build: APP_BUILD_ID.to_owned(),
+        worker_build: WORKER_BUILD_ID.to_owned(),
+        abi: WORKER_ABI_VERSION,
+        role,
+        provider: WorkerProvider::Cpu,
+        artifacts,
+    }
+}
+
+fn random_challenge() -> Result<String> {
+    let mut bytes = [0_u8; 32];
+    getrandom::fill(&mut bytes)
+        .map_err(|error| anyhow!("could not obtain worker handshake randomness: {error}"))?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn validate_worker_capability(
+    capability: &WorkerCapability,
+    challenge: &str,
+    expected: &WorkerExpectation,
+) -> Result<()> {
+    if challenge.len() != 64
+        || !challenge.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || capability.challenge != challenge
+    {
+        bail!("worker capability challenge did not bind to this process generation");
+    }
+    if capability.app_build != expected.app_build
+        || capability.worker_build != expected.worker_build
+        || capability.abi != expected.abi
+        || capability.role != expected.role
+        || capability.provider != expected.provider
+    {
+        bail!("worker capability is incompatible with the requesting application");
+    }
+    let expected_artifacts = match expected.role {
+        WorkerRole::Inference => [WorkerArtifactKind::Gguf, WorkerArtifactKind::OnnxAsr].as_slice(),
+        WorkerRole::Vad => [WorkerArtifactKind::SileroVad].as_slice(),
+    };
+    if capability.artifacts.len() != expected_artifacts.len()
+        || !expected_artifacts.iter().all(|kind| {
+            capability.artifacts.iter().any(|target| {
+                target.artifact == *kind
+                    && target.target
+                        == format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
+            })
+        })
+    {
+        bail!("worker capability does not advertise the required artifact targets");
+    }
+    Ok(())
+}
+
+fn validate_worker_hello(
+    role: Option<WorkerRole>,
+    challenge: &str,
+    expected: &WorkerExpectation,
+) -> Result<WorkerRole> {
+    if challenge.len() != 64 || !challenge.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("worker handshake challenge must be 32 random bytes encoded as hexadecimal");
+    }
+    let actual_role = role.unwrap_or(expected.role);
+    if *expected != expected_worker(actual_role) {
+        bail!("worker handshake expectation is incompatible with this worker");
+    }
+    Ok(actual_role)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1086,7 +1246,7 @@ fn control_allowed_for_role(control: &Control, role: WorkerRole) -> bool {
     match role {
         WorkerRole::Inference => matches!(
             control,
-            Control::Hello
+            Control::Hello { .. }
                 | Control::LoadRuntime { .. }
                 | Control::BeginBatch { .. }
                 | Control::EndBatch
@@ -1100,7 +1260,7 @@ fn control_allowed_for_role(control: &Control, role: WorkerRole) -> bool {
         ),
         WorkerRole::Vad => matches!(
             control,
-            Control::Hello
+            Control::Hello { .. }
                 | Control::LoadVad { .. }
                 | Control::StartVad { .. }
                 | Control::VadWindow
@@ -1114,23 +1274,78 @@ fn control_allowed_for_role(control: &Control, role: WorkerRole) -> bool {
     }
 }
 
+trait WorkerExecutableResolver: Send + Sync {
+    fn resolve(&self, role: WorkerRole) -> Result<PathBuf>;
+}
+
+struct InstalledWorkerExecutableResolver;
+
+fn resolve_adjacent_inference_worker(current_executable: &Path) -> Result<PathBuf> {
+    let current = std::fs::canonicalize(current_executable)
+        .context("could not canonicalize the running Scribe executable")?;
+    let install_dir = current
+        .parent()
+        .ok_or_else(|| anyhow!("running Scribe executable has no parent directory"))?;
+    let candidate = install_dir.join(format!(
+        "scribe-inference-worker{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    let resolved = std::fs::canonicalize(&candidate).with_context(|| {
+        format!(
+            "dedicated inference worker is missing at {}",
+            candidate.display()
+        )
+    })?;
+    if !resolved.is_file() || resolved.parent() != Some(install_dir) || resolved == current {
+        bail!("dedicated inference worker resolved outside the canonical Scribe install directory");
+    }
+    Ok(resolved)
+}
+
+impl WorkerExecutableResolver for InstalledWorkerExecutableResolver {
+    fn resolve(&self, role: WorkerRole) -> Result<PathBuf> {
+        let current = std::fs::canonicalize(std::env::current_exe()?)
+            .context("could not canonicalize the running Scribe executable")?;
+        if role == WorkerRole::Vad {
+            return Ok(current);
+        }
+        resolve_adjacent_inference_worker(&current)
+    }
+}
+
+#[cfg(test)]
+struct FixedWorkerExecutableResolver(PathBuf);
+
+#[cfg(test)]
+impl WorkerExecutableResolver for FixedWorkerExecutableResolver {
+    fn resolve(&self, _role: WorkerRole) -> Result<PathBuf> {
+        let resolved = std::fs::canonicalize(&self.0).with_context(|| {
+            format!("test worker cannot be canonicalized: {}", self.0.display())
+        })?;
+        if !resolved.is_file() {
+            bail!("test worker is not a regular file: {}", resolved.display());
+        }
+        Ok(resolved)
+    }
+}
+
 struct OsWorkerLauncher {
     role: WorkerRole,
-    executable: Option<PathBuf>,
+    resolver: Arc<dyn WorkerExecutableResolver>,
 }
 
 impl OsWorkerLauncher {
-    const fn inference() -> Self {
+    fn inference() -> Self {
         Self {
             role: WorkerRole::Inference,
-            executable: None,
+            resolver: Arc::new(InstalledWorkerExecutableResolver),
         }
     }
 
-    const fn vad() -> Self {
+    fn vad() -> Self {
         Self {
             role: WorkerRole::Vad,
-            executable: None,
+            resolver: Arc::new(InstalledWorkerExecutableResolver),
         }
     }
 
@@ -1138,17 +1353,14 @@ impl OsWorkerLauncher {
     fn for_executable(role: WorkerRole, executable: PathBuf) -> Self {
         Self {
             role,
-            executable: Some(executable),
+            resolver: Arc::new(FixedWorkerExecutableResolver(executable)),
         }
     }
 }
 
 impl WorkerLauncher for OsWorkerLauncher {
     fn launch(&self) -> Result<SpawnedWorker> {
-        let executable = match &self.executable {
-            Some(executable) => executable.clone(),
-            None => std::env::current_exe()?,
-        };
+        let executable = self.resolver.resolve(self.role)?;
         let worker_flag = match self.role {
             WorkerRole::Inference => INFERENCE_WORKER_FLAG,
             WorkerRole::Vad => VAD_WORKER_FLAG,
@@ -1585,6 +1797,7 @@ struct SupervisorInner {
     // sequentially, never nested. Invalidation uses writer.try_lock so process
     // termination never depends on pipe progress.
     launcher: Arc<dyn WorkerLauncher>,
+    role: WorkerRole,
     deadlines: SupervisorDeadlines,
     spawn_gate: Mutex<()>,
     retirement_changed: Condvar,
@@ -1621,9 +1834,22 @@ impl ProcessWorkerSupervisor {
         launcher: Arc<dyn WorkerLauncher>,
         deadlines: SupervisorDeadlines,
     ) -> Self {
+        Self::unstarted_for_role_with_launcher_and_deadlines(
+            WorkerRole::Inference,
+            launcher,
+            deadlines,
+        )
+    }
+
+    fn unstarted_for_role_with_launcher_and_deadlines(
+        role: WorkerRole,
+        launcher: Arc<dyn WorkerLauncher>,
+        deadlines: SupervisorDeadlines,
+    ) -> Self {
         Self {
             inner: Arc::new(SupervisorInner {
                 launcher,
+                role,
                 deadlines,
                 spawn_gate: Mutex::new(()),
                 retirement_changed: Condvar::new(),
@@ -2061,11 +2287,26 @@ impl ProcessWorkerSupervisor {
             },
             None => self.inner.deadlines.hello,
         };
+        let challenge = match random_challenge() {
+            Ok(challenge) => challenge,
+            Err(error) => {
+                self.invalidate_generation(
+                    generation,
+                    "could not create process worker handshake challenge",
+                    true,
+                )?;
+                return Err(error);
+            }
+        };
+        let expected = expected_worker(self.inner.role);
         if let Err(error) = self.round_trip_on_generation_with_cancellation(
             generation,
             0,
             0,
-            Control::Hello,
+            Control::Hello {
+                challenge,
+                expected,
+            },
             hello_timeout,
             cancelled,
         ) {
@@ -2366,7 +2607,13 @@ impl ProcessWorkerSupervisor {
         if !command.is_parent_command() {
             bail!("cannot send a response-only control to the process worker");
         }
-        let expects_ready = matches!(command, Control::Hello);
+        let hello = match &command {
+            Control::Hello {
+                challenge,
+                expected,
+            } => Some((challenge.clone(), expected.clone())),
+            _ => None,
+        };
         let correlation = Correlation {
             generation,
             session_id,
@@ -2386,8 +2633,11 @@ impl ProcessWorkerSupervisor {
             return Err(error);
         }
         match self.await_response_with_cancellation(correlation, response, timeout, cancelled)? {
-            Control::Ready if expects_ready => Ok(()),
-            Control::Ok if !expects_ready => Ok(()),
+            Control::Ready { capability } if hello.is_some() => {
+                let (challenge, expected) = hello.expect("checked above");
+                validate_worker_capability(&capability, &challenge, &expected)
+            }
+            Control::Ok if hello.is_none() => Ok(()),
             Control::Error { message } => bail!("process worker: {message}"),
             _ => {
                 self.invalidate_generation(
@@ -2661,7 +2911,8 @@ impl SileroVadWorkerSupervisor {
             ..SupervisorDeadlines::default()
         };
         let supervisor = Self {
-            transport: ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+            transport: ProcessWorkerSupervisor::unstarted_for_role_with_launcher_and_deadlines(
+                WorkerRole::Vad,
                 launcher,
                 transport_deadlines,
             ),
@@ -3191,11 +3442,15 @@ impl Drop for SupervisorInner {
     }
 }
 
-/// Dispatches the private worker before any eframe initialization.
-pub(crate) fn maybe_run_worker() -> Option<i32> {
+/// Dispatches only the VAD role retained in the desktop executable.
+pub(crate) fn maybe_run_vad_worker() -> Option<i32> {
     let args = std::env::args_os().skip(1).collect::<Vec<_>>();
     let role = match worker_role_from_args(&args) {
-        Ok(Some(role)) => role,
+        Ok(Some(WorkerRole::Vad)) => WorkerRole::Vad,
+        Ok(Some(WorkerRole::Inference)) => {
+            eprintln!("the inference role is available only in scribe-inference-worker");
+            return Some(2);
+        }
         Ok(None) => return None,
         Err(error) => {
             eprintln!("invalid private Scribe worker invocation: {error}");
@@ -3223,6 +3478,46 @@ pub(crate) fn maybe_run_worker() -> Option<i32> {
             }
         },
     )
+}
+
+/// Entrypoint for the separately packaged inference executable.
+#[cfg(feature = "inference-worker")]
+pub(crate) fn run_dedicated_inference_worker() -> i32 {
+    let args = std::env::args_os().skip(1).collect::<Vec<_>>();
+    match worker_role_from_args(&args) {
+        Ok(Some(WorkerRole::Inference)) => {}
+        Ok(Some(WorkerRole::Vad)) => {
+            eprintln!("the dedicated inference executable cannot run the VAD role");
+            return 2;
+        }
+        Ok(None) => {
+            eprintln!("the dedicated inference executable requires {INFERENCE_WORKER_FLAG}");
+            return 2;
+        }
+        Err(error) => {
+            eprintln!("invalid private Scribe inference worker invocation: {error}");
+            return 2;
+        }
+    }
+    let parent_control = match take_parent_control_reader_from_env() {
+        Ok(reader) => reader,
+        Err(error) => {
+            eprintln!("Scribe inference worker liveness setup failed: {error:#}");
+            return 1;
+        }
+    };
+    match worker_loop_for_role(
+        std::io::stdin().lock(),
+        std::io::stdout().lock(),
+        WorkerRole::Inference,
+        parent_control,
+    ) {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("Scribe inference worker failed: {error:#}");
+            1
+        }
+    }
 }
 
 fn worker_role_from_args(args: &[std::ffi::OsString]) -> Result<Option<WorkerRole>> {
@@ -3558,6 +3853,174 @@ fn worker_unavailable(error: impl std::fmt::Display) -> RuntimeError {
     RuntimeError::WorkerUnavailable(error.to_string())
 }
 
+#[derive(Clone)]
+struct InferenceWorkerRoute {
+    provider: WorkerProvider,
+    supervisor: InferenceWorkerSupervisor,
+}
+
+/// Bounded provider registry above the process supervisor.
+///
+/// A route may be retried only before any transcript has crossed the worker
+/// boundary. Stage 2 ships one CPU route, but keeping this contract here means
+/// later verified GPU packs do not have to weaken strict GPU semantics or add
+/// replay logic in application/UI code.
+#[derive(Clone)]
+pub(crate) struct InferenceWorkerRegistry {
+    routes: Arc<Vec<InferenceWorkerRoute>>,
+}
+
+impl InferenceWorkerRegistry {
+    pub(crate) fn cpu_only() -> Self {
+        Self {
+            routes: Arc::new(vec![InferenceWorkerRoute {
+                provider: WorkerProvider::Cpu,
+                supervisor: InferenceWorkerSupervisor::unstarted(),
+            }]),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_cpu_supervisor(supervisor: InferenceWorkerSupervisor) -> Self {
+        Self {
+            routes: Arc::new(vec![InferenceWorkerRoute {
+                provider: WorkerProvider::Cpu,
+                supervisor,
+            }]),
+        }
+    }
+
+    fn eligible_routes(
+        &self,
+        preference: AccelerationPreference,
+    ) -> impl Iterator<Item = &InferenceWorkerRoute> {
+        self.routes.iter().filter(move |route| match preference {
+            AccelerationPreference::Gpu => route.provider.is_gpu(),
+            AccelerationPreference::Cpu => !route.provider.is_gpu(),
+            AccelerationPreference::Auto => true,
+        })
+    }
+
+    fn no_route_error(preference: AccelerationPreference) -> RuntimeError {
+        RuntimeError::WorkerUnavailable(match preference {
+            AccelerationPreference::Gpu => {
+                "no GPU inference worker is registered; CPU fallback is forbidden for explicit GPU"
+                    .to_owned()
+            }
+            AccelerationPreference::Auto | AccelerationPreference::Cpu => {
+                "no compatible inference worker is registered".to_owned()
+            }
+        })
+    }
+
+    pub(crate) fn load(
+        &self,
+        artifact: RuntimeArtifact,
+        preference: AccelerationPreference,
+    ) -> Result<RuntimeLoadExecution, RuntimeError> {
+        let mut last_retryable = None;
+        let mut attempted = false;
+        for route in self.eligible_routes(preference).take(4) {
+            attempted = true;
+            match route.supervisor.load(artifact.clone(), preference) {
+                Ok(execution) => return Ok(execution),
+                Err(error @ (RuntimeError::WorkerUnavailable(_) | RuntimeError::Poisoned)) => {
+                    last_retryable = Some(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last_retryable.unwrap_or_else(|| {
+            debug_assert!(!attempted);
+            Self::no_route_error(preference)
+        }))
+    }
+
+    pub(crate) fn transcribe(
+        &self,
+        artifact: RuntimeArtifact,
+        preference: AccelerationPreference,
+        audio: &PreparedAudio,
+        options: TranscriptionOptions,
+        cancellation_snapshot: u64,
+        cancellation_generation: &std::sync::atomic::AtomicU64,
+    ) -> Result<RuntimeExecution, RuntimeError> {
+        let mut last_retryable = None;
+        let mut attempted = false;
+        for route in self.eligible_routes(preference).take(4) {
+            attempted = true;
+            match route.supervisor.transcribe(
+                artifact.clone(),
+                preference,
+                audio,
+                options.clone(),
+                cancellation_snapshot,
+                cancellation_generation,
+            ) {
+                Ok(execution) => return Ok(execution),
+                Err(error @ (RuntimeError::WorkerUnavailable(_) | RuntimeError::Poisoned)) => {
+                    last_retryable = Some(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last_retryable.unwrap_or_else(|| {
+            debug_assert!(!attempted);
+            Self::no_route_error(preference)
+        }))
+    }
+
+    pub(crate) fn health(
+        &self,
+        artifact: RuntimeArtifact,
+        preference: AccelerationPreference,
+    ) -> Result<(), RuntimeError> {
+        let mut last_retryable = None;
+        let mut attempted = false;
+        for route in self.eligible_routes(preference).take(4) {
+            attempted = true;
+            match route.supervisor.health(artifact.clone(), preference) {
+                Ok(()) => return Ok(()),
+                Err(error @ (RuntimeError::WorkerUnavailable(_) | RuntimeError::Poisoned)) => {
+                    last_retryable = Some(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last_retryable.unwrap_or_else(|| {
+            debug_assert!(!attempted);
+            Self::no_route_error(preference)
+        }))
+    }
+
+    pub(crate) fn unload(&self) -> Result<(), RuntimeError> {
+        for route in self.routes.iter() {
+            route.supervisor.unload()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn unload_if_idle(&self) -> Result<(), RuntimeError> {
+        for route in self.routes.iter() {
+            route.supervisor.unload_if_idle()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn cancel_active(&self) {
+        for route in self.routes.iter() {
+            route.supervisor.cancel_active();
+        }
+    }
+
+    pub(crate) fn shutdown(&self) -> Result<(), RuntimeError> {
+        for route in self.routes.iter() {
+            route.supervisor.shutdown()?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 fn worker_loop(mut input: impl Read, mut output: impl Write) -> Result<()> {
     worker_loop_with_factories(
@@ -3722,8 +4185,19 @@ fn worker_loop_with_factories<F: WorkerRecognizerFactory, V: WorkerVadFactory>(
             continue;
         }
         match control {
-            Control::Hello => {
-                write_worker_response(&mut output, session_id, request_id, Control::Ready)?;
+            Control::Hello {
+                challenge,
+                expected,
+            } => {
+                let actual_role = validate_worker_hello(role, &challenge, &expected)?;
+                write_worker_response(
+                    &mut output,
+                    session_id,
+                    request_id,
+                    Control::Ready {
+                        capability: worker_capability(actual_role, challenge),
+                    },
+                )?;
             }
             Control::LoadRuntime {
                 artifact,
@@ -4076,7 +4550,7 @@ fn worker_loop_with_factories<F: WorkerRecognizerFactory, V: WorkerVadFactory>(
                 })();
                 write_worker_result(&mut output, session_id, request_id, result)?;
             }
-            Control::Ready
+            Control::Ready { .. }
             | Control::RuntimeLoaded { .. }
             | Control::RuntimeTranscript { .. }
             | Control::RuntimeFailed { .. }
@@ -4412,7 +4886,25 @@ fn validate_worker_response(response: &Control) -> Result<()> {
         Control::Error { message } => {
             validate_bounded_string("worker error", message, MAX_WORKER_ERROR_BYTES)
         }
-        Control::Ready | Control::Ok => Ok(()),
+        Control::Ready { capability } => {
+            validate_nonempty_bounded_string(
+                "worker capability challenge",
+                &capability.challenge,
+                64,
+            )?;
+            if capability.artifacts.len() > 8 {
+                bail!("worker capability advertises too many artifact targets");
+            }
+            for target in &capability.artifacts {
+                validate_nonempty_bounded_string(
+                    "worker artifact target",
+                    &target.target,
+                    MAX_BACKEND_IDENTITY_BYTES,
+                )?;
+            }
+            Ok(())
+        }
+        Control::Ok => Ok(()),
         _ => bail!("attempted to serialize a command-only worker response"),
     }?;
     let serialized = serde_json::to_vec(response)?;
@@ -5175,8 +5667,19 @@ mod tests {
         Cancel,
     }
 
+    #[derive(Clone, Copy, Debug)]
+    enum CapabilityMismatch {
+        Challenge,
+        AppBuild,
+        WorkerBuild,
+        Abi,
+        Role,
+        ProviderArtifacts,
+    }
+
     enum TestMode {
         Normal,
+        CapabilityMismatch(CapabilityMismatch),
         DelayedLaunch {
             started: TestSender<()>,
             release: TestReceiver<()>,
@@ -5319,13 +5822,34 @@ mod tests {
         );
     }
 
+    fn test_hello(role: WorkerRole) -> Control {
+        Control::Hello {
+            challenge: "ab".repeat(32),
+            expected: expected_worker(role),
+        }
+    }
+
     fn handshake(input: &mut impl Read, output: &mut impl Write) -> bool {
         let Ok(frame) = read_frame(input) else {
             return false;
         };
         let (session_id, request_id, control) = parse_parent_control(frame).unwrap();
-        assert!(matches!(control, Control::Hello));
-        respond(output, session_id, request_id, Control::Ready);
+        let Control::Hello {
+            challenge,
+            expected,
+        } = control
+        else {
+            panic!("expected worker Hello");
+        };
+        let role = validate_worker_hello(None, &challenge, &expected).unwrap();
+        respond(
+            output,
+            session_id,
+            request_id,
+            Control::Ready {
+                capability: worker_capability(role, challenge),
+            },
+        );
         true
     }
 
@@ -5340,9 +5864,10 @@ mod tests {
                     respond(output, session_id, request_id, Control::Ok);
                     return;
                 }
-                Control::Hello | Control::Cancel { .. } | Control::Unload | Control::Health => {
-                    respond(output, session_id, request_id, Control::Ok)
-                }
+                Control::Hello { .. }
+                | Control::Cancel { .. }
+                | Control::Unload
+                | Control::Health => respond(output, session_id, request_id, Control::Ok),
                 Control::LoadRuntime { .. } | Control::BeginBatch { .. } | Control::EndBatch => {
                     respond(
                         output,
@@ -5385,7 +5910,7 @@ mod tests {
                         message: "VAD unavailable".to_owned(),
                     },
                 ),
-                Control::Ready
+                Control::Ready { .. }
                 | Control::RuntimeLoaded { .. }
                 | Control::RuntimeTranscript { .. }
                 | Control::RuntimeFailed { .. }
@@ -5401,12 +5926,43 @@ mod tests {
 
     fn run_test_worker(mut input: impl Read, mut output: impl Write, mode: TestMode) {
         let mode = match mode {
+            TestMode::CapabilityMismatch(mismatch) => {
+                let (session_id, request_id, control) = read_parent_control(&mut input);
+                let Control::Hello {
+                    challenge,
+                    expected,
+                } = control
+                else {
+                    panic!("expected worker Hello");
+                };
+                let mut capability = worker_capability(expected.role, challenge);
+                match mismatch {
+                    CapabilityMismatch::Challenge => capability.challenge = "cd".repeat(32),
+                    CapabilityMismatch::AppBuild => capability.app_build.push_str("-wrong"),
+                    CapabilityMismatch::WorkerBuild => capability.worker_build.push_str("-wrong"),
+                    CapabilityMismatch::Abi => capability.abi = capability.abi.saturating_add(1),
+                    CapabilityMismatch::Role => {
+                        capability.role = match capability.role {
+                            WorkerRole::Inference => WorkerRole::Vad,
+                            WorkerRole::Vad => WorkerRole::Inference,
+                        };
+                    }
+                    CapabilityMismatch::ProviderArtifacts => capability.artifacts.clear(),
+                }
+                respond(
+                    &mut output,
+                    session_id,
+                    request_id,
+                    Control::Ready { capability },
+                );
+                return;
+            }
             TestMode::BlockedHello { started } => {
                 let Ok(frame) = read_frame(&mut input) else {
                     return;
                 };
                 let (_, _, control) = parse_parent_control(frame).unwrap();
-                assert!(matches!(control, Control::Hello));
+                assert!(matches!(control, Control::Hello { .. }));
                 started.send(()).unwrap();
                 let _ = read_frame(&mut input);
                 return;
@@ -5417,7 +5973,9 @@ mod tests {
             return;
         }
         match mode {
-            TestMode::DelayedLaunch { .. } | TestMode::BlockedHello { .. } => {
+            TestMode::DelayedLaunch { .. }
+            | TestMode::CapabilityMismatch(_)
+            | TestMode::BlockedHello { .. } => {
                 unreachable!("launch-only test mode reached a worker")
             }
             TestMode::Normal => run_normal_worker(&mut input, &mut output),
@@ -5813,9 +6371,9 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v4_has_distinct_inference_and_vad_roles() {
+    fn protocol_v5_has_distinct_inference_and_vad_roles() {
         assert_eq!(PROTOCOL_MAGIC, *b"SCIF");
-        assert_eq!(PROTOCOL_VERSION, 4);
+        assert_eq!(PROTOCOL_VERSION, 5);
         assert_eq!(INFERENCE_WORKER_FLAG, "--scribe-inference-worker");
         assert_eq!(VAD_WORKER_FLAG, "--scribe-vad-worker");
         assert!(!control_allowed_for_role(
@@ -5884,6 +6442,53 @@ mod tests {
             worker_role_from_args(&[OsString::from("--ordinary-app-argument")]).unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn capability_handshake_binds_generation_build_abi_role_provider_and_targets() {
+        for mismatch in [
+            CapabilityMismatch::Challenge,
+            CapabilityMismatch::AppBuild,
+            CapabilityMismatch::WorkerBuild,
+            CapabilityMismatch::Abi,
+            CapabilityMismatch::Role,
+            CapabilityMismatch::ProviderArtifacts,
+        ] {
+            let launcher = Arc::new(TestLauncher::new([TestMode::CapabilityMismatch(mismatch)]));
+            let supervisor = ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+                launcher,
+                short_deadlines(),
+            );
+            let error = supervisor.ensure_generation().unwrap_err().to_string();
+            assert!(
+                error.contains("capability"),
+                "unexpected {mismatch:?} handshake error: {error}"
+            );
+            assert_eq!(supervisor.current_generation().unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn adjacent_inference_worker_resolution_is_exact_and_canonical() {
+        let root = test_root("worker-resolution");
+        let desktop = root.join(format!("local-transcriber{}", std::env::consts::EXE_SUFFIX));
+        let worker = root.join(format!(
+            "scribe-inference-worker{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        std::fs::write(&desktop, b"desktop").unwrap();
+        assert!(
+            resolve_adjacent_inference_worker(&desktop)
+                .unwrap_err()
+                .to_string()
+                .contains("missing")
+        );
+        std::fs::write(&worker, b"worker").unwrap();
+        assert_eq!(
+            resolve_adjacent_inference_worker(&desktop).unwrap(),
+            std::fs::canonicalize(&worker).unwrap()
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -6236,6 +6841,64 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    fn missing_gguf_artifact() -> RuntimeArtifact {
+        RuntimeArtifact::Gguf(RuntimeModel {
+            id: ModelId::new("missing-worker-fixture"),
+            path: PathBuf::from("missing-worker-fixture.gguf"),
+            format: ArtifactFormat::Gguf,
+            expected_size_bytes: 1,
+            expected_sha256: "0".repeat(64),
+        })
+    }
+
+    #[test]
+    fn cpu_only_registry_never_silently_serves_explicit_gpu() {
+        let launcher = Arc::new(TestLauncher::new([TestMode::Normal]));
+        let registry = InferenceWorkerRegistry::with_cpu_supervisor(InferenceWorkerSupervisor {
+            transport: ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+                launcher.clone(),
+                short_deadlines(),
+            ),
+            next_correlation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        });
+        let error = registry
+            .load(missing_gguf_artifact(), AccelerationPreference::Gpu)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("CPU fallback is forbidden"));
+        assert_eq!(launcher.launches.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn registry_fallback_is_bounded_to_registered_pre_output_failures() {
+        let first = Arc::new(TestLauncher::new([TestMode::CapabilityMismatch(
+            CapabilityMismatch::Challenge,
+        )]));
+        let second = Arc::new(TestLauncher::new([TestMode::CapabilityMismatch(
+            CapabilityMismatch::Abi,
+        )]));
+        let route = |launcher: Arc<TestLauncher>| InferenceWorkerRoute {
+            provider: WorkerProvider::Cpu,
+            supervisor: InferenceWorkerSupervisor {
+                transport: ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+                    launcher,
+                    short_deadlines(),
+                ),
+                next_correlation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            },
+        };
+        let registry = InferenceWorkerRegistry {
+            routes: Arc::new(vec![route(first.clone()), route(second.clone())]),
+        };
+        assert!(
+            registry
+                .load(missing_gguf_artifact(), AccelerationPreference::Cpu)
+                .is_err()
+        );
+        assert_eq!(first.launches.load(Ordering::Acquire), 1);
+        assert_eq!(second.launches.load(Ordering::Acquire), 1);
+    }
+
     #[test]
     fn stale_batch_cancellation_is_rejected_before_worker_launch() {
         let root = test_root("stale-batch-cancellation");
@@ -6366,7 +7029,7 @@ mod tests {
         spec.id = "moonshine-tiny-en-int8-onnx".to_owned();
         let artifact = WireRuntimeArtifact::OnnxBundle(spec);
         let mut input = Vec::new();
-        append_control(&mut input, 0, 0, Control::Hello);
+        append_control(&mut input, 0, 0, test_hello(WorkerRole::Inference));
         append_control(
             &mut input,
             7,
@@ -6418,7 +7081,7 @@ mod tests {
                     .2,
             );
         }
-        assert!(matches!(responses[0], Control::Ready));
+        assert!(matches!(responses[0], Control::Ready { .. }));
         assert!(matches!(responses[1], Control::RuntimeLoaded { .. }));
         assert!(matches!(responses[2], Control::Ok));
         assert!(matches!(responses[3], Control::Ok));
@@ -6447,7 +7110,7 @@ mod tests {
             &[OnnxFileRole::Model, OnnxFileRole::Tokens],
         ));
         let mut input = Vec::new();
-        append_control(&mut input, 0, 0, Control::Hello);
+        append_control(&mut input, 0, 0, test_hello(WorkerRole::Inference));
         append_control(
             &mut input,
             1,
@@ -6484,7 +7147,7 @@ mod tests {
 
         let factory = FakeRecognizerFactory::new();
         let responses = run_framed_fake_worker(&factory, input);
-        assert!(matches!(responses[0].2, Control::Ready));
+        assert!(matches!(responses[0].2, Control::Ready { .. }));
         assert!(matches!(
             responses[1].2,
             Control::RuntimeFailed { .. } | Control::Error { .. }
@@ -6506,7 +7169,7 @@ mod tests {
             &[OnnxFileRole::Model, OnnxFileRole::Tokens],
         ));
         let mut input = Vec::new();
-        append_control(&mut input, 0, 0, Control::Hello);
+        append_control(&mut input, 0, 0, test_hello(WorkerRole::Inference));
         append_control(
             &mut input,
             7,
@@ -6551,7 +7214,7 @@ mod tests {
         spec.id = "decode-failure-model".to_owned();
         let artifact = WireRuntimeArtifact::OnnxBundle(spec);
         let mut input = Vec::new();
-        append_control(&mut input, 0, 0, Control::Hello);
+        append_control(&mut input, 0, 0, test_hello(WorkerRole::Inference));
         for (session, request) in [(7, 1), (8, 4)] {
             append_control(
                 &mut input,
@@ -6652,7 +7315,7 @@ mod tests {
         let vad_factory = FakeVadFactory::new();
         let window = [0.1; WINDOW_SAMPLES];
         let mut input = Vec::new();
-        append_control(&mut input, 0, 1, Control::Hello);
+        append_control(&mut input, 0, 1, test_hello(WorkerRole::Vad));
         append_control(&mut input, 0, 2, Control::LoadVad { num_threads: 1 });
         append_control(&mut input, 41, 3, Control::StartVad { threshold: 0.5 });
         append_control(&mut input, 41, 4, Control::VadWindow);
@@ -6701,7 +7364,7 @@ mod tests {
         let recognizer_factory = FakeRecognizerFactory::new();
         let vad_factory = FakeVadFactory::new();
         let mut input = Vec::new();
-        append_control(&mut input, 0, 1, Control::Hello);
+        append_control(&mut input, 0, 1, test_hello(WorkerRole::Vad));
         append_control(&mut input, 0, 2, Control::LoadVad { num_threads: 0 });
         append_control(&mut input, 0, 3, Control::LoadVad { num_threads: 1 });
         append_control(&mut input, 51, 4, Control::StartVad { threshold: 0.19 });
@@ -6729,7 +7392,7 @@ mod tests {
             .map(|index| ((index as f32 * 0.071).sin() * 0.25).clamp(-1.0, 1.0))
             .collect::<Vec<_>>();
         let mut input = Vec::new();
-        append_control(&mut input, 0, 1, Control::Hello);
+        append_control(&mut input, 0, 1, test_hello(WorkerRole::Vad));
         append_control(&mut input, 0, 2, Control::LoadVad { num_threads: 1 });
         append_control(&mut input, 61, 3, Control::StartVad { threshold: 0.2 });
         append_control(&mut input, 61, 4, Control::VadWindow);
@@ -6758,9 +7421,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires SCRIBE_ONNX_WORKER_EXE to name a built Scribe executable; runs the hidden worker protocol without downloading"]
+    #[ignore = "requires SCRIBE_INFERENCE_WORKER_EXE to name the built dedicated CPU worker; runs SCIF v5 without downloading"]
     fn hidden_inference_worker_manual_protocol_smoke() {
-        let executable = required_fixture_path("SCRIBE_ONNX_WORKER_EXE");
+        let executable = required_fixture_path("SCRIBE_INFERENCE_WORKER_EXE");
         let SpawnedWorker {
             mut stdin,
             mut stdout,
@@ -6769,7 +7432,7 @@ mod tests {
             .launch()
             .expect("spawn hidden inference worker executable");
         for (request_id, control, expected) in [
-            (1, Control::Hello, "ready"),
+            (1, test_hello(WorkerRole::Inference), "ready"),
             (2, Control::Health, "ok"),
             (3, Control::Shutdown, "ok"),
         ] {
@@ -6778,7 +7441,7 @@ mod tests {
                 parse_worker_control(read_frame(&mut stdout).unwrap()).unwrap();
             assert_eq!(received_request, request_id);
             match expected {
-                "ready" => assert!(matches!(response, Control::Ready)),
+                "ready" => assert!(matches!(response, Control::Ready { .. })),
                 "ok" => assert!(matches!(response, Control::Ok)),
                 _ => unreachable!(),
             }
@@ -6788,9 +7451,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires SCRIBE_ONNX_WORKER_EXE to name a built Scribe executable; runs the hidden worker protocol without downloading"]
+    #[ignore = "requires SCRIBE_DESKTOP_EXE to name the built desktop executable; runs the same-executable VAD protocol without downloading"]
     fn hidden_vad_worker_manual_protocol_smoke() {
-        let executable = required_fixture_path("SCRIBE_ONNX_WORKER_EXE");
+        let executable = required_fixture_path("SCRIBE_DESKTOP_EXE");
         let SpawnedWorker {
             mut stdin,
             mut stdout,
@@ -6799,7 +7462,7 @@ mod tests {
             .launch()
             .expect("spawn hidden VAD worker executable");
         for (request_id, control, expected) in [
-            (1, Control::Hello, "ready"),
+            (1, test_hello(WorkerRole::Vad), "ready"),
             (2, Control::Health, "ok"),
             (3, Control::LoadVad { num_threads: 1 }, "ok"),
             (4, Control::StartVad { threshold: 0.5 }, "ok"),
@@ -6814,7 +7477,7 @@ mod tests {
                 parse_worker_control(read_frame(&mut stdout).unwrap()).unwrap();
             assert_eq!(received_request, request_id);
             match expected {
-                "ready" => assert!(matches!(response, Control::Ready)),
+                "ready" => assert!(matches!(response, Control::Ready { .. })),
                 "ok" => assert!(matches!(response, Control::Ok)),
                 _ => unreachable!(),
             }
@@ -7675,9 +8338,9 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v4_rejects_v3_and_removed_direct_commands() {
-        let v3 = raw_header(3, FrameKind::Control as u8, 0);
-        assert!(read_frame(&mut Cursor::new(v3)).is_err());
+    fn protocol_v5_rejects_v4_and_removed_direct_commands() {
+        let v4 = raw_header(4, FrameKind::Control as u8, 0);
+        assert!(read_frame(&mut Cursor::new(v4)).is_err());
 
         for removed in [
             br#"{"command":"load","model":{}}"#.as_slice(),

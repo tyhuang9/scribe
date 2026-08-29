@@ -1,0 +1,43 @@
+//! Dedicated native inference process.
+//!
+//! This binary is the only production target that includes GGUF and ASR ONNX
+//! execution code. The desktop retains its existing same-executable VAD role.
+
+#[path = "../backend_policy.rs"]
+mod backend_policy;
+mod config {
+    use anyhow::{Result, anyhow};
+    use directories::ProjectDirs;
+
+    pub const MAX_RECORDING_SECONDS: u32 = 600;
+    pub(crate) const RECORDING_CAPTURE_SAFETY_ALLOWANCE_SECONDS: u32 = 2;
+
+    pub(crate) fn project_dirs() -> Result<ProjectDirs> {
+        ProjectDirs::from("com", "Scribe", "Scribe")
+            .ok_or_else(|| anyhow!("could not resolve Scribe application directories"))
+    }
+}
+#[path = "../embedded_runtime.rs"]
+mod embedded_runtime;
+#[path = "../model_catalog.rs"]
+mod model_catalog;
+#[path = "../onnx_worker.rs"]
+mod onnx_worker;
+#[path = "../prepared_audio.rs"]
+mod prepared_audio;
+#[path = "../runtime_artifact.rs"]
+mod runtime_artifact;
+#[path = "../runtime_contract.rs"]
+mod runtime_contract;
+#[path = "../runtime_router.rs"]
+mod runtime_router;
+#[path = "../silero_vad_native.rs"]
+mod silero_vad_native;
+#[path = "../support_assets.rs"]
+mod support_assets;
+#[path = "../worker_contracts.rs"]
+mod transcription;
+
+fn main() {
+    std::process::exit(onnx_worker::run_dedicated_inference_worker());
+}

@@ -32,14 +32,18 @@ pub use crate::model_catalog::{CompatibilityStatus, ModelDescriptor};
 use crate::models::SttModelInfo;
 #[cfg(test)]
 use crate::onnx_model_bundles::OnnxBundleManifest;
+use crate::onnx_worker::InferenceWorkerRegistry;
+#[cfg(test)]
 use crate::onnx_worker::InferenceWorkerSupervisor;
 use crate::prepared_audio::{PREPARED_SAMPLE_RATE, PreparedAudio};
 use crate::runtime_artifact::{OnnxModelSpec, RuntimeArtifact, RuntimeModel};
+use crate::runtime_contract::{
+    RuntimeError, RuntimeExecution, RuntimeLoadExecution, WARM_MODEL_TTL,
+};
 #[cfg(test)]
 use crate::runtime_router::IdleTimeoutAction;
-use crate::runtime_router::{
-    RuntimeError, RuntimeExecution, RuntimeLoadExecution, RuntimeRouter, WARM_MODEL_TTL,
-};
+#[cfg(test)]
+use crate::runtime_router::RuntimeRouter;
 use crate::streaming::{
     HypothesisWord, PreviewAudioPublisher, PreviewEvent, RollingPreviewSession, StreamIdentity,
     TranscriptHypothesis, TranscriptStabilizer,
@@ -659,8 +663,9 @@ struct RuntimeWorkerInner {
     worker: Mutex<Option<std::thread::JoinHandle<()>>>,
     shutdown_gate: Mutex<()>,
     cancellation_generation: Arc<AtomicU64>,
+    #[cfg(test)]
     in_process_router: Option<RuntimeRouter>,
-    inference: Option<InferenceWorkerSupervisor>,
+    inference: Option<InferenceWorkerRegistry>,
 }
 
 impl RuntimeWorker {
@@ -685,7 +690,7 @@ impl RuntimeWorker {
     }
 
     fn new_process() -> Self {
-        let inference = InferenceWorkerSupervisor::unstarted();
+        let inference = InferenceWorkerRegistry::cpu_only();
         let worker_inference = inference.clone();
         let cancellation_generation = Arc::new(AtomicU64::new(0));
         let worker_cancellation = cancellation_generation.clone();
@@ -702,6 +707,7 @@ impl RuntimeWorker {
                 worker: Mutex::new(Some(worker)),
                 shutdown_gate: Mutex::new(()),
                 cancellation_generation,
+                #[cfg(test)]
                 in_process_router: None,
                 inference: Some(inference),
             }),
@@ -710,7 +716,9 @@ impl RuntimeWorker {
 
     #[cfg(test)]
     fn new_process_for_executable(executable: PathBuf) -> Self {
-        let inference = InferenceWorkerSupervisor::unstarted_for_executable(executable);
+        let inference = InferenceWorkerRegistry::with_cpu_supervisor(
+            InferenceWorkerSupervisor::unstarted_for_executable(executable),
+        );
         let worker_inference = inference.clone();
         let cancellation_generation = Arc::new(AtomicU64::new(0));
         let worker_cancellation = cancellation_generation.clone();
@@ -737,6 +745,7 @@ impl RuntimeWorker {
         self.inner
             .cancellation_generation
             .fetch_add(1, Ordering::AcqRel);
+        #[cfg(test)]
         if let Some(router) = &self.inner.in_process_router {
             router.cancel_active();
         }
@@ -836,6 +845,7 @@ impl RuntimeWorker {
 impl RuntimeWorkerInner {
     fn shutdown_and_join(&self, timeout: Duration) -> bool {
         self.cancellation_generation.fetch_add(1, Ordering::AcqRel);
+        #[cfg(test)]
         if let Some(router) = &self.in_process_router {
             router.cancel_active();
         }
@@ -1023,7 +1033,7 @@ fn runtime_worker_loop(router: RuntimeRouter, commands: Receiver<RuntimeCommand>
 }
 
 fn inference_worker_dispatch_loop(
-    inference: InferenceWorkerSupervisor,
+    inference: InferenceWorkerRegistry,
     cancellation_generation: Arc<AtomicU64>,
     commands: Receiver<RuntimeCommand>,
 ) {
@@ -1408,13 +1418,12 @@ impl TranscriptionService {
         if config::remote_gguf_artifact(&self.config, model_id.as_str()).is_some()
             || config::imported_gguf_artifact(&self.config, model_id.as_str()).is_some()
         {
-            return Ok(
-                persisted_capabilities.unwrap_or_else(RuntimeRouter::embedded_runtime_capabilities)
-            );
+            return Ok(persisted_capabilities
+                .unwrap_or_else(crate::runtime_contract::embedded_runtime_capabilities));
         }
-        if RuntimeRouter::handles_model_id(model_id) {
+        if crate::runtime_contract::handles_model_id(model_id) {
             let runtime_capabilities = persisted_capabilities
-                .or_else(|| RuntimeRouter::capabilities_for_model(model_id))
+                .or_else(|| crate::runtime_contract::capabilities_for_model(model_id))
                 .ok_or_else(|| anyhow!("runtime router rejected its own selected model"))?;
             let descriptor = model_descriptor(model_id)
                 .ok_or_else(|| anyhow!("unknown normalized transcription model: {model_id}"))?;
@@ -1831,7 +1840,7 @@ impl TranscriptionService {
         model_id: ModelId,
         model_path: Option<PathBuf>,
     ) -> Result<(PreviewAudioPublisher, RollingPreviewHandle)> {
-        if !RuntimeRouter::handles_model_id(&model_id)
+        if !crate::runtime_contract::handles_model_id(&model_id)
             && config::remote_gguf_artifact(&self.config, model_id.as_str()).is_none()
             && config::imported_gguf_artifact(&self.config, model_id.as_str()).is_none()
         {
@@ -1907,7 +1916,7 @@ impl TranscriptionService {
                 "rolling preview was cancelled before native dispatch"
             ));
         }
-        if !RuntimeRouter::handles_model_id(&request.model_id)
+        if !crate::runtime_contract::handles_model_id(&request.model_id)
             && config::remote_gguf_artifact(&self.config, request.model_id.as_str()).is_none()
             && config::imported_gguf_artifact(&self.config, request.model_id.as_str()).is_none()
         {
@@ -1984,7 +1993,7 @@ impl TranscriptionService {
                 .map_err(|error| anyhow!(error))?;
             return Ok(map_native_execution(request, model, execution));
         }
-        if RuntimeRouter::handles_model_id(&request.model_id)
+        if crate::runtime_contract::handles_model_id(&request.model_id)
             || config::remote_gguf_artifact(&self.config, request.model_id.as_str()).is_some()
             || config::imported_gguf_artifact(&self.config, request.model_id.as_str()).is_some()
         {

@@ -14,6 +14,7 @@ mod core;
 mod debug_demo;
 mod diagnostics;
 mod disk_space;
+#[cfg(test)]
 mod embedded_runtime;
 mod history;
 mod history_playback;
@@ -31,6 +32,11 @@ mod onnx_worker;
 mod overlay;
 mod prepared_audio;
 mod runtime_artifact;
+mod runtime_contract;
+#[cfg(test)]
+mod runtime_router;
+#[cfg(not(test))]
+#[path = "runtime_router_stub.rs"]
 mod runtime_router;
 mod silero_vad_native;
 mod streaming;
@@ -56,7 +62,7 @@ enum LinuxDisplayBackend {
 }
 
 fn main() -> eframe::Result<()> {
-    if let Some(exit_code) = onnx_worker::maybe_run_worker() {
+    if let Some(exit_code) = onnx_worker::maybe_run_vad_worker() {
         std::process::exit(exit_code);
     }
     if let Some(exit_code) = transcription::maybe_run_installation_smoke_helper() {

@@ -108,7 +108,7 @@ fn run_local_command(args: Vec<std::ffi::OsString>) -> Result<LocalBenchmarkRepo
     let descriptor = service
         .model_descriptor(&model_id)
         .with_context(|| format!("benchmark model is unavailable: {model_id}"))?;
-    let package_version = crate::embedded_runtime::TRANSCRIBE_CPP_VERSION.to_owned();
+    let package_version = crate::runtime_contract::TRANSCRIBE_CPP_VERSION.to_owned();
     let capabilities = service.capabilities_for(&model_id).with_context(|| {
         format!("benchmark could not resolve runtime capabilities for {model_id}")
     })?;
