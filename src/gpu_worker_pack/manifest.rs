@@ -624,7 +624,7 @@ fn decode_hex_exact(value: &str, bytes: usize) -> Option<Vec<u8>> {
 }
 
 #[cfg(windows)]
-fn reject_named_streams(path: &Path) -> Result<(), PackVerificationError> {
+pub(super) fn reject_named_streams(path: &Path) -> Result<(), PackVerificationError> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
     use windows_sys::Win32::Storage::FileSystem::{
@@ -668,7 +668,7 @@ fn reject_named_streams(path: &Path) -> Result<(), PackVerificationError> {
 }
 
 #[cfg(not(windows))]
-fn reject_named_streams(_path: &Path) -> Result<(), PackVerificationError> {
+pub(super) fn reject_named_streams(_path: &Path) -> Result<(), PackVerificationError> {
     Ok(())
 }
 
@@ -746,7 +746,7 @@ pub(super) mod test_support {
 
     const TEST_SEED: [u8; 32] = [7; 32];
 
-    pub(super) struct FixtureTrustRoot {
+    pub(crate) struct FixtureTrustRoot {
         public_key: Vec<u8>,
     }
 
@@ -756,7 +756,7 @@ pub(super) mod test_support {
         }
     }
 
-    pub(super) fn temp_root(label: &str) -> PathBuf {
+    pub(crate) fn temp_root(label: &str) -> PathBuf {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -769,7 +769,7 @@ pub(super) mod test_support {
         root
     }
 
-    pub(super) fn base_manifest() -> PackManifest {
+    pub(crate) fn base_manifest() -> PackManifest {
         PackManifest {
             schema_version: 1,
             pack_id: "scribe-vulkan".to_owned(),
@@ -794,7 +794,7 @@ pub(super) mod test_support {
         }
     }
 
-    pub(super) fn write_signed(
+    pub(crate) fn write_signed(
         root: &Path,
         mut manifest: PackManifest,
     ) -> &'static FixtureTrustRoot {
@@ -824,7 +824,7 @@ pub(super) mod test_support {
         }))
     }
 
-    pub(super) fn fixture(root: &Path) -> (PackVerifier<'static>, VerifiedPack) {
+    pub(crate) fn fixture(root: &Path) -> (PackVerifier<'static>, VerifiedPack) {
         let trust = write_signed(root, base_manifest());
         let verifier = PackVerifier::new(
             trust,
