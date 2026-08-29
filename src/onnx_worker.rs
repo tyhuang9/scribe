@@ -10015,128 +10015,145 @@ mod tests {
         let model_size = exact_file(&model_path, &model_sha256);
         exact_file(&wav_path, &wav_sha256);
 
-        let (lease_owner, lease) =
-            crate::gpu_worker_pack::manifest::test_support::lease_existing_fixture(&pack_root)
-                .expect("fixture pack must verify into an immutable retained lease");
-        let probe = InferenceWorkerSupervisor::for_pack_probe(Arc::new(lease));
-        let bindings = probe
-            .verified_pack_bindings()
-            .expect("Vulkan pack probe must complete its challenge-bound SCIF Hello");
-        probe.shutdown().unwrap();
-        let expected_identity = std::env::var("SCRIBE_GPU_FIXTURE_STABLE_DEVICE_ID").ok();
-        let binding = bindings
-            .into_iter()
-            .find(|candidate| {
-                let target = candidate.backend_target();
-                target.backend == BackendKind::Vulkan
-                    && expected_identity.as_ref().map_or_else(
-                        || {
-                            target.vendor == GpuVendor::Nvidia
-                                && target.device_class == DeviceClass::DiscreteGpu
-                        },
-                        |identity| target.device_id.as_str() == identity,
-                    )
-            })
-            .expect("fixture pack must advertise a Vulkan device");
-        let target = binding.backend_target();
-        assert!(
-            target
-                .driver_version
-                .as_ref()
-                .is_some_and(|value| !value.is_empty())
-        );
-        assert!(target.memory_total_bytes > 0);
-        if let Some(expected_identity) = expected_identity {
-            assert_eq!(target.device_id.as_str(), expected_identity);
-        }
-        let gpu_route = InferenceWorkerRoute {
-            provider: WorkerProvider::Vulkan,
-            supervisor: InferenceWorkerSupervisor::for_pack_binding(binding),
-            target: Some(target.clone()),
-            health_key: None,
-            consume_retry_bypass: false,
-        };
-        let gpu_routes = Arc::new(vec![gpu_route]);
-        let cpu_launcher = Arc::new(TestLauncher::new([]));
-        let registry = InferenceWorkerRegistry {
-            routes: Arc::new(vec![InferenceWorkerRoute {
-                provider: WorkerProvider::Cpu,
-                supervisor: InferenceWorkerSupervisor {
-                    transport: ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
-                        cpu_launcher.clone(),
-                        short_deadlines(),
-                    ),
-                    next_correlation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-                },
-                target: Some(BackendTarget::cpu()),
+        let lease_owner = {
+            let (lease_owner, lease) =
+                crate::gpu_worker_pack::manifest::test_support::lease_existing_fixture(&pack_root)
+                    .expect("fixture pack must verify into an immutable retained lease");
+            let probe = InferenceWorkerSupervisor::for_pack_probe(Arc::new(lease));
+            let bindings = probe
+                .verified_pack_bindings()
+                .expect("Vulkan pack probe must complete its challenge-bound SCIF Hello");
+            probe.shutdown().unwrap();
+            drop(probe);
+            let expected_identity = std::env::var("SCRIBE_GPU_FIXTURE_STABLE_DEVICE_ID").ok();
+            let binding = bindings
+                .into_iter()
+                .find(|candidate| {
+                    let target = candidate.backend_target();
+                    target.backend == BackendKind::Vulkan
+                        && expected_identity.as_ref().map_or_else(
+                            || {
+                                target.vendor == GpuVendor::Nvidia
+                                    && target.device_class == DeviceClass::DiscreteGpu
+                            },
+                            |identity| target.device_id.as_str() == identity,
+                        )
+                })
+                .expect("fixture pack must advertise a Vulkan device");
+            let target = binding.backend_target();
+            assert!(
+                target
+                    .driver_version
+                    .as_ref()
+                    .is_some_and(|value| !value.is_empty())
+            );
+            assert!(target.memory_total_bytes > 0);
+            if let Some(expected_identity) = expected_identity {
+                assert_eq!(target.device_id.as_str(), expected_identity);
+            }
+            let gpu_route = InferenceWorkerRoute {
+                provider: WorkerProvider::Vulkan,
+                supervisor: InferenceWorkerSupervisor::for_pack_binding(binding),
+                target: Some(target.clone()),
                 health_key: None,
                 consume_retry_bypass: false,
-            }]),
-            gpu_routes: Arc::new(Mutex::new(None)),
-            gpu_health_path: None,
-            active_route: Arc::new(Mutex::new(None)),
-            route_execution: Arc::new(Mutex::new(())),
-            gpu_routes_for_testing: Some(VerifiedGpuRouteCatalog {
-                device_set_digest: verified_gpu_device_set_digest(&gpu_routes),
-                routes: gpu_routes,
-                diagnostic: Some("fixture-only hardware smoke".to_owned()),
-                discovery_fingerprint: "fixture-hardware-smoke".to_owned(),
-            }),
+            };
+            let gpu_routes = Arc::new(vec![gpu_route]);
+            let cpu_launcher = Arc::new(TestLauncher::new([]));
+            let registry = InferenceWorkerRegistry {
+                routes: Arc::new(vec![InferenceWorkerRoute {
+                    provider: WorkerProvider::Cpu,
+                    supervisor: InferenceWorkerSupervisor {
+                        transport: ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+                            cpu_launcher.clone(),
+                            short_deadlines(),
+                        ),
+                        next_correlation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                    },
+                    target: Some(BackendTarget::cpu()),
+                    health_key: None,
+                    consume_retry_bypass: false,
+                }]),
+                gpu_routes: Arc::new(Mutex::new(None)),
+                gpu_health_path: None,
+                active_route: Arc::new(Mutex::new(None)),
+                route_execution: Arc::new(Mutex::new(())),
+                gpu_routes_for_testing: Some(VerifiedGpuRouteCatalog {
+                    device_set_digest: verified_gpu_device_set_digest(&gpu_routes),
+                    routes: gpu_routes,
+                    diagnostic: Some("fixture-only hardware smoke".to_owned()),
+                    discovery_fingerprint: "fixture-hardware-smoke".to_owned(),
+                }),
+            };
+            let artifact = RuntimeArtifact::Gguf(RuntimeModel {
+                id: ModelId::new("whisper_cpp_base_en"),
+                path: model_path,
+                format: ArtifactFormat::Gguf,
+                expected_size_bytes: model_size,
+                expected_sha256: model_sha256,
+            });
+            let loaded = registry
+                .load(artifact.clone(), AccelerationPreference::Gpu)
+                .expect("explicit GPU load must succeed through the verified Vulkan worker");
+            assert_eq!(
+                loaded
+                    .diagnostics
+                    .resolved_acceleration
+                    .selection
+                    .as_ref()
+                    .expect("GPU load must report typed selection")
+                    .target,
+                target
+            );
+            let audio = PreparedAudio::from_wav_path(wav_path).unwrap();
+            let cancellation = std::sync::atomic::AtomicU64::new(0);
+            let execution = registry
+                .transcribe(
+                    artifact,
+                    AccelerationPreference::Gpu,
+                    &audio,
+                    TranscriptionOptions::default(),
+                    0,
+                    &cancellation,
+                )
+                .expect("explicit GPU transcription must succeed through SCIF");
+            assert!(execution.diagnostics.warm_reused);
+            assert!(
+                execution
+                    .transcript
+                    .text
+                    .to_ascii_lowercase()
+                    .contains(&expected_text),
+                "Vulkan transcript did not contain the known fixture phrase: {:?}",
+                execution.transcript.text
+            );
+            assert_eq!(cpu_launcher.launches.load(Ordering::Acquire), 0);
+            println!(
+                "verified Vulkan SCIF smoke: device={} driver={} memory={} transcript_bytes={} warm_reused={}",
+                target.device_id.as_str(),
+                target.driver_version.as_deref().unwrap(),
+                target.memory_total_bytes,
+                execution.transcript.text.len(),
+                execution.diagnostics.warm_reused
+            );
+            registry.shutdown().unwrap();
+            lease_owner
         };
-        let artifact = RuntimeArtifact::Gguf(RuntimeModel {
-            id: ModelId::new("whisper_cpp_base_en"),
-            path: model_path,
-            format: ArtifactFormat::Gguf,
-            expected_size_bytes: model_size,
-            expected_sha256: model_sha256,
-        });
-        let loaded = registry
-            .load(artifact.clone(), AccelerationPreference::Gpu)
-            .expect("explicit GPU load must succeed through the verified Vulkan worker");
-        assert_eq!(
-            loaded
-                .diagnostics
-                .resolved_acceleration
-                .selection
-                .as_ref()
-                .expect("GPU load must report typed selection")
-                .target,
-            target
-        );
-        let audio = PreparedAudio::from_wav_path(wav_path).unwrap();
-        let cancellation = std::sync::atomic::AtomicU64::new(0);
-        let execution = registry
-            .transcribe(
-                artifact,
-                AccelerationPreference::Gpu,
-                &audio,
-                TranscriptionOptions::default(),
-                0,
-                &cancellation,
-            )
-            .expect("explicit GPU transcription must succeed through SCIF");
-        assert!(execution.diagnostics.warm_reused);
-        assert!(
-            execution
-                .transcript
-                .text
-                .to_ascii_lowercase()
-                .contains(&expected_text),
-            "Vulkan transcript did not contain the known fixture phrase: {:?}",
-            execution.transcript.text
-        );
-        assert_eq!(cpu_launcher.launches.load(Ordering::Acquire), 0);
-        println!(
-            "verified Vulkan SCIF smoke: device={} driver={} memory={} transcript_bytes={} warm_reused={}",
-            target.device_id.as_str(),
-            target.driver_version.as_deref().unwrap(),
-            target.memory_total_bytes,
-            execution.transcript.text.len(),
-            execution.diagnostics.warm_reused
-        );
-        registry.shutdown().unwrap();
-        drop(registry);
-        std::fs::remove_dir_all(lease_owner).unwrap();
+        let cleanup_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match std::fs::remove_dir_all(&lease_owner) {
+                Ok(()) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                Err(error)
+                    if (error.kind() == std::io::ErrorKind::PermissionDenied
+                        || error.raw_os_error() == Some(32))
+                        && Instant::now() < cleanup_deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                Err(error) => panic!("could not remove reaped fixture-pack lease: {error}"),
+            }
+        }
     }
 
     #[test]
