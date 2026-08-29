@@ -21,9 +21,10 @@ use transcribe_cpp::{
 };
 
 use crate::backend_policy::{
-    BackendCandidate, BackendKind, BackendSelection, BackendSelectionError, BackendSnapshot,
-    BackendTarget, CandidateAvailability, DeviceClass, DeviceIdentity, GpuVendor, OperatingSystem,
-    PowerSource, select_backend,
+    BackendCandidate, BackendEnvironmentFingerprint, BackendKind, BackendQualificationPolicy,
+    BackendSelection, BackendSelectionError, BackendSnapshot, BackendTarget, CandidateAvailability,
+    DeviceClass, DeviceIdentity, GpuVendor, OperatingSystem, PowerSource, ProviderIdentity,
+    select_backend,
 };
 use crate::prepared_audio::{PREPARED_SAMPLE_RATE, PreparedAudio};
 use crate::transcription::{
@@ -73,6 +74,13 @@ pub(crate) struct EmbeddedRuntime {
     capabilities: RuntimeCapabilities,
     detected_architecture: Option<String>,
     resolved_acceleration: Option<ResolvedAcceleration>,
+    backend_environment: Option<BackendEnvironmentFingerprint>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RuntimeBackendEnvironment {
+    selection: BackendSelection,
+    fingerprint: BackendEnvironmentFingerprint,
 }
 
 impl EmbeddedRuntime {
@@ -86,6 +94,7 @@ impl EmbeddedRuntime {
             capabilities: RuntimeCapabilities::default(),
             detected_architecture: None,
             resolved_acceleration: None,
+            backend_environment: None,
         }
     }
 
@@ -103,6 +112,10 @@ impl EmbeddedRuntime {
 
     pub(crate) fn is_loaded(&self) -> bool {
         self.session.is_some()
+            && self.backend_environment.as_ref().is_some_and(|loaded| {
+                current_runtime_backend_environment(self.preference)
+                    .is_ok_and(|current| backend_environment_matches(loaded, &current.fingerprint))
+            })
     }
 
     /// Returns the `general.architecture` string supplied by the loaded GGUF.
@@ -153,9 +166,6 @@ impl EmbeddedRuntime {
     }
 
     fn load_model(&mut self) -> Result<()> {
-        if self.session.is_some() {
-            return Ok(());
-        }
         Self::ensure_backends()?;
         if !self.model_path.is_file() {
             return Err(anyhow!(EmbeddedRuntimeError::ModelNotInstalled(
@@ -163,7 +173,27 @@ impl EmbeddedRuntime {
             )));
         }
 
-        let mut selection = select_runtime_backend(self.preference)?;
+        let environment = match current_runtime_backend_environment(self.preference) {
+            Ok(environment) => environment,
+            Err(error) => {
+                self.clear_loaded_state();
+                return Err(error);
+            }
+        };
+        if self.session.is_some()
+            && self
+                .backend_environment
+                .as_ref()
+                .is_some_and(|loaded| backend_environment_matches(loaded, &environment.fingerprint))
+        {
+            return Ok(());
+        }
+        self.clear_loaded_state();
+
+        let RuntimeBackendEnvironment {
+            mut selection,
+            fingerprint,
+        } = environment;
         let gpu_device = selected_process_index(&selection)?;
 
         let model = Model::load_with(
@@ -201,9 +231,22 @@ impl EmbeddedRuntime {
         self.capabilities = capabilities;
         self.detected_architecture = Some(detected_architecture);
         self.resolved_acceleration = Some(resolved_acceleration);
+        self.backend_environment = Some(fingerprint);
         self.model = Some(model);
         self.session = Some(session);
         Ok(())
+    }
+
+    fn clear_loaded_state(&mut self) {
+        // Dropping the session first guarantees that the safe wrapper retains
+        // the model only until no native session can still reference it.
+        self.session = None;
+        self.model = None;
+        self.cancellation.reset();
+        self.capabilities = RuntimeCapabilities::default();
+        self.detected_architecture = None;
+        self.resolved_acceleration = None;
+        self.backend_environment = None;
     }
 }
 
@@ -217,14 +260,7 @@ impl SpeechEngine for EmbeddedRuntime {
     }
 
     fn unload(&mut self) -> Result<()> {
-        // Dropping the session first guarantees that the safe wrapper retains
-        // the model only until no native session can still reference it.
-        self.session = None;
-        self.model = None;
-        self.cancellation.reset();
-        self.capabilities = RuntimeCapabilities::default();
-        self.detected_architecture = None;
-        self.resolved_acceleration = None;
+        self.clear_loaded_state();
         Ok(())
     }
 }
@@ -252,11 +288,19 @@ fn validate_options(options: &TranscriptionOptions) -> Result<()> {
     Ok(())
 }
 
-fn select_runtime_backend(preference: AccelerationPreference) -> Result<BackendSelection> {
+fn current_runtime_backend_environment(
+    preference: AccelerationPreference,
+) -> Result<RuntimeBackendEnvironment> {
+    let snapshot = runtime_backend_snapshot();
+    select_backend_environment(preference, &snapshot)
+}
+
+fn runtime_backend_snapshot() -> BackendSnapshot {
     let mut candidates = transcribe_cpp::devices()
         .into_iter()
         .filter_map(native_backend_candidate)
         .collect::<Vec<_>>();
+    mark_ambiguous_derived_devices(&mut candidates);
     if !candidates
         .iter()
         .any(|candidate| candidate.target.backend == BackendKind::Cpu)
@@ -264,15 +308,53 @@ fn select_runtime_backend(preference: AccelerationPreference) -> Result<BackendS
     {
         candidates.push(BackendCandidate::available(BackendTarget::cpu()));
     }
-    select_backend(
-        preference,
-        &BackendSnapshot {
-            operating_system: OperatingSystem::current(),
-            power_source: PowerSource::current(),
-            candidates,
-        },
-    )
-    .map_err(|error| anyhow!(map_selection_error(error)))
+    BackendSnapshot {
+        operating_system: OperatingSystem::current(),
+        power_source: PowerSource::current(),
+        candidates,
+        // Stage 1 intentionally keeps all production GPU providers opt-in.
+        // Versioned qualification entries arrive only with verified packs and
+        // release qualification in later stages.
+        qualification_policy: BackendQualificationPolicy::stage_one_default_deny(),
+    }
+}
+
+fn select_backend_environment(
+    preference: AccelerationPreference,
+    snapshot: &BackendSnapshot,
+) -> Result<RuntimeBackendEnvironment> {
+    let selection = select_backend(preference, snapshot)
+        .map_err(|error| anyhow!(map_selection_error(error)))?;
+    Ok(RuntimeBackendEnvironment {
+        selection,
+        fingerprint: snapshot.environment_fingerprint(),
+    })
+}
+
+fn backend_environment_matches(
+    loaded: &BackendEnvironmentFingerprint,
+    current: &BackendEnvironmentFingerprint,
+) -> bool {
+    loaded == current
+}
+
+fn mark_ambiguous_derived_devices(candidates: &mut [BackendCandidate]) {
+    for index in 0..candidates.len() {
+        if !candidates[index].target.device_id.is_derived() {
+            continue;
+        }
+        let duplicate_count = candidates
+            .iter()
+            .filter(|candidate| {
+                candidate.target.backend == candidates[index].target.backend
+                    && candidate.target.provider_id == candidates[index].target.provider_id
+                    && candidate.target.device_id == candidates[index].target.device_id
+            })
+            .count();
+        if duplicate_count > 1 {
+            candidates[index].availability = CandidateAvailability::Unaddressable;
+        }
+    }
 }
 
 fn map_selection_error(error: BackendSelectionError) -> EmbeddedRuntimeError {
@@ -281,21 +363,29 @@ fn map_selection_error(error: BackendSelectionError) -> EmbeddedRuntimeError {
 
 fn native_backend_candidate(device: Device) -> Option<BackendCandidate> {
     let backend = backend_kind(&device.kind, device.device_type)?;
-    let vendor = if backend.is_gpu() {
-        infer_gpu_vendor(&device)
-    } else {
-        GpuVendor::Unknown
+    native_backend_candidate_for_backend(device, backend)
+}
+
+fn native_backend_candidate_for_backend(
+    device: Device,
+    backend: BackendKind,
+) -> Option<BackendCandidate> {
+    let provider_id = ProviderIdentity::new(format!(
+        "transcribe-cpp:{}",
+        backend.label().to_ascii_lowercase()
+    ));
+    let vendor = match backend {
+        BackendKind::Cuda => GpuVendor::Nvidia,
+        BackendKind::Metal => GpuVendor::Apple,
+        BackendKind::Vulkan => infer_gpu_vendor(&device),
+        BackendKind::Cpu => GpuVendor::Unknown,
     };
     let device_class = match device.device_type {
         DeviceType::Cpu => DeviceClass::Cpu,
         DeviceType::Accel => DeviceClass::Accelerator,
-        DeviceType::Gpu if backend == BackendKind::Metal && vendor == GpuVendor::Apple => {
-            DeviceClass::UnifiedGpu
-        }
+        DeviceType::Gpu if backend == BackendKind::Metal => DeviceClass::UnifiedGpu,
         DeviceType::Gpu => DeviceClass::DiscreteGpu,
-        DeviceType::Igpu if backend == BackendKind::Metal && vendor == GpuVendor::Apple => {
-            DeviceClass::UnifiedGpu
-        }
+        DeviceType::Igpu if backend == BackendKind::Metal => DeviceClass::UnifiedGpu,
         DeviceType::Igpu => DeviceClass::IntegratedGpu,
         DeviceType::Unknown if backend == BackendKind::Cpu => DeviceClass::Cpu,
         DeviceType::Unknown => DeviceClass::Unknown,
@@ -306,22 +396,31 @@ fn native_backend_candidate(device: Device) -> Option<BackendCandidate> {
         .find(|value| !value.is_empty())
         .unwrap_or_else(|| backend.label())
         .to_owned();
-    let device_id = device
-        .device_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| DeviceIdentity::new(format!("native:{value}")))
-        .unwrap_or_else(|| {
-            DeviceIdentity::new(format!(
-                "name:{}:{}",
-                backend.label().to_ascii_lowercase(),
-                normalized_identity_component(&display_name)
-            ))
-        });
+    let device_id = if backend == BackendKind::Cpu {
+        DeviceIdentity::new("cpu:system")
+    } else {
+        device
+            .device_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| DeviceIdentity::new(format!("native:{value}")))
+            .unwrap_or_else(|| {
+                DeviceIdentity::new(format!(
+                    "derived:{}:{}:{vendor:?}:{device_class:?}:{}:{}:{}",
+                    provider_id.as_str(),
+                    backend.label().to_ascii_lowercase(),
+                    device.memory_total,
+                    normalized_identity_component(&device.name),
+                    normalized_identity_component(&device.description)
+                ))
+            })
+    };
     Some(BackendCandidate {
         target: BackendTarget {
             backend,
+            provider_id,
+            driver_version: None,
             device_id,
             display_name,
             vendor,
@@ -331,10 +430,6 @@ fn native_backend_candidate(device: Device) -> Option<BackendCandidate> {
             process_index: device.index,
         },
         availability: CandidateAvailability::Available,
-        // The current opt-in Vulkan feature already permits native Auto. The
-        // release build has no GPU backend, so this preserves the experiment
-        // without enabling a GPU in the CPU-only payload.
-        auto_eligible: true,
     })
 }
 
@@ -454,19 +549,33 @@ fn reconcile_observed_target(
         ))));
     }
     let process_index = selection.target.process_index;
-    let observed = native_backend_candidate(device.clone())
+    let observed = native_backend_candidate_for_backend(device.clone(), observed_backend)
         .map(|candidate| candidate.target)
         .ok_or_else(|| {
             anyhow!(EmbeddedRuntimeError::BackendUnavailable(
                 "native runtime did not report a selectable compute device".to_owned()
             ))
         })?;
-    if selection.target.backend.is_gpu() && observed.device_id != selection.target.device_id {
+    if observed.backend != selection.target.backend
+        || observed.backend.is_gpu() != selection.target.backend.is_gpu()
+        || observed.device_class != selection.target.device_class
+        || observed.provider_id != selection.target.provider_id
+        || observed.driver_version != selection.target.driver_version
+        || observed.vendor != selection.target.vendor
+        || observed.device_id != selection.target.device_id
+    {
         return Err(anyhow!(EmbeddedRuntimeError::BackendUnavailable(format!(
-            "selected {} device {}, but the native runtime resolved {}",
+            "selected {} device {} ({:?}, {}, {:?}), but the native runtime resolved {} device {} ({:?}, {}, {:?})",
             selection.target.backend.label(),
             selection.target.device_id.as_str(),
-            observed.device_id.as_str()
+            selection.target.device_class,
+            selection.target.provider_id.as_str(),
+            selection.target.vendor,
+            observed.backend.label(),
+            observed.device_id.as_str(),
+            observed.device_class,
+            observed.provider_id.as_str(),
+            observed.vendor
         ))));
     }
     selection.target = BackendTarget {
@@ -498,10 +607,12 @@ fn resolved_acceleration(
             }
         }
     };
+    let typed_auto_diagnostic = selection
+        .as_ref()
+        .and_then(BackendSelection::auto_cpu_diagnostic);
     let diagnostic = match (&requested, &resolved) {
-        (AccelerationPreference::Auto, ComputeDevice::Cpu) => {
-            Some("No compatible GPU was available; Auto fell back to CPU.".to_owned())
-        }
+        (AccelerationPreference::Auto, ComputeDevice::Cpu) => typed_auto_diagnostic
+            .or_else(|| Some("No compatible GPU was available; Auto fell back to CPU.".to_owned())),
         (AccelerationPreference::Gpu, ComputeDevice::Cpu) => {
             Some("The strict GPU request unexpectedly resolved to CPU.".to_owned())
         }
@@ -768,6 +879,34 @@ mod tests {
         }
     }
 
+    fn snapshot(
+        operating_system: OperatingSystem,
+        power_source: PowerSource,
+        candidates: Vec<BackendCandidate>,
+    ) -> BackendSnapshot {
+        BackendSnapshot {
+            operating_system,
+            power_source,
+            candidates,
+            qualification_policy: BackendQualificationPolicy::stage_one_default_deny(),
+        }
+    }
+
+    fn qualified_snapshot(
+        operating_system: OperatingSystem,
+        power_source: PowerSource,
+        candidates: Vec<BackendCandidate>,
+    ) -> BackendSnapshot {
+        let qualification_policy =
+            BackendQualificationPolicy::qualify_all_for_testing(operating_system, &candidates);
+        BackendSnapshot {
+            operating_system,
+            power_source,
+            candidates,
+            qualification_policy,
+        }
+    }
+
     #[test]
     fn native_device_candidates_keep_stable_identity_separate_from_process_index() {
         let native = Device {
@@ -775,7 +914,7 @@ mod tests {
             description: "NVIDIA GeForce RTX test device".to_owned(),
             kind: "vulkan".to_owned(),
             device_type: DeviceType::Gpu,
-            device_id: Some("0000:01:00.0".to_owned()),
+            device_id: Some("PCI:0000:01:00.0".to_owned()),
             memory_total: 8 * 1024 * 1024 * 1024,
             memory_free: 6 * 1024 * 1024 * 1024,
             index: Some(3),
@@ -786,7 +925,10 @@ mod tests {
         assert_eq!(candidate.target.backend, BackendKind::Vulkan);
         assert_eq!(candidate.target.vendor, GpuVendor::Nvidia);
         assert_eq!(candidate.target.device_class, DeviceClass::DiscreteGpu);
-        assert_eq!(candidate.target.device_id.as_str(), "native:0000:01:00.0");
+        assert_eq!(
+            candidate.target.device_id.as_str(),
+            "native:pci:0000:01:00.0"
+        );
         assert_eq!(candidate.target.process_index, Some(3));
     }
 
@@ -805,7 +947,54 @@ mod tests {
         assert_eq!(first.device_id, second.device_id);
         assert_eq!(first.vendor, GpuVendor::Intel);
         assert_eq!(first.device_class, DeviceClass::IntegratedGpu);
-        assert!(first.device_id.as_str().starts_with("name:vulkan:"));
+        assert!(first.device_id.as_str().starts_with("derived:"));
+    }
+
+    #[test]
+    fn ambiguous_derived_devices_fail_closed_without_using_process_indices_as_identity() {
+        let mut first = device(DeviceType::Gpu, "Vulkan0", "Same unnamed GPU");
+        first.memory_total = 8 * 1024 * 1024 * 1024;
+        first.index = Some(2);
+        let mut second = first.clone();
+        second.index = Some(7);
+        let mut candidates = vec![
+            native_backend_candidate(first).unwrap(),
+            native_backend_candidate(second).unwrap(),
+        ];
+
+        assert_eq!(
+            candidates[0].target.device_id,
+            candidates[1].target.device_id
+        );
+        mark_ambiguous_derived_devices(&mut candidates);
+        assert!(
+            candidates
+                .iter()
+                .all(|candidate| candidate.availability == CandidateAvailability::Unaddressable)
+        );
+        let error = select_backend(
+            AccelerationPreference::Gpu,
+            &snapshot(OperatingSystem::Windows, PowerSource::Ac, candidates),
+        )
+        .unwrap_err();
+        assert_eq!(error, BackendSelectionError::NoGpuTarget);
+    }
+
+    #[test]
+    fn derived_identity_uses_stable_disambiguating_device_facts() {
+        let mut first = device(DeviceType::Gpu, "Vulkan0", "Same unnamed GPU");
+        first.memory_total = 8 * 1024 * 1024 * 1024;
+        first.index = Some(2);
+        let mut second = first.clone();
+        second.memory_total = 12 * 1024 * 1024 * 1024;
+        second.index = Some(7);
+
+        let first = native_backend_candidate(first).unwrap().target;
+        let second = native_backend_candidate(second).unwrap().target;
+
+        assert_ne!(first.device_id, second.device_id);
+        assert!(!first.device_id.as_str().contains(":2:"));
+        assert!(!second.device_id.as_str().contains(":7:"));
     }
 
     #[test]
@@ -861,6 +1050,154 @@ mod tests {
                 "{name:?} {description:?}"
             );
         }
+
+        let cuda = Device {
+            kind: "cuda".to_owned(),
+            ..device(DeviceType::Gpu, "Provider0", "Misleading AMD label")
+        };
+        let metal = Device {
+            kind: "metal".to_owned(),
+            ..device(DeviceType::Igpu, "Provider0", "Misleading Intel label")
+        };
+        let vulkan = device(DeviceType::Gpu, "Provider0", "AMD Radeon");
+        assert_eq!(
+            native_backend_candidate(cuda).unwrap().target.vendor,
+            GpuVendor::Nvidia
+        );
+        assert_eq!(
+            native_backend_candidate(metal).unwrap().target.vendor,
+            GpuVendor::Apple
+        );
+        assert_eq!(
+            native_backend_candidate(vulkan).unwrap().target.vendor,
+            GpuVendor::Amd
+        );
+    }
+
+    fn fake_vulkan_candidates(class: DeviceClass) -> Vec<BackendCandidate> {
+        let device_type = match class {
+            DeviceClass::IntegratedGpu => DeviceType::Igpu,
+            _ => DeviceType::Gpu,
+        };
+        let mut gpu = device(device_type, "Vulkan0", "NVIDIA test GPU");
+        gpu.device_id = Some("PCI:0000:01:00.0".to_owned());
+        gpu.memory_total = 8 * 1024 * 1024 * 1024;
+        gpu.memory_free = 6 * 1024 * 1024 * 1024;
+        gpu.index = Some(1);
+        vec![
+            native_backend_candidate(gpu).unwrap(),
+            BackendCandidate::available(BackendTarget::cpu()),
+        ]
+    }
+
+    #[test]
+    fn warm_environment_is_invalidated_in_both_ac_battery_directions() {
+        let candidates = fake_vulkan_candidates(DeviceClass::DiscreteGpu);
+        let ac = qualified_snapshot(
+            OperatingSystem::Windows,
+            PowerSource::Ac,
+            candidates.clone(),
+        );
+        let battery =
+            qualified_snapshot(OperatingSystem::Windows, PowerSource::Battery, candidates);
+        let ac_environment = select_backend_environment(AccelerationPreference::Auto, &ac).unwrap();
+        let battery_environment =
+            select_backend_environment(AccelerationPreference::Auto, &battery).unwrap();
+
+        assert_eq!(ac_environment.selection.target.backend, BackendKind::Vulkan);
+        assert_eq!(
+            battery_environment.selection.target.backend,
+            BackendKind::Cpu
+        );
+        assert!(!backend_environment_matches(
+            &ac_environment.fingerprint,
+            &battery_environment.fingerprint
+        ));
+        assert!(!backend_environment_matches(
+            &battery_environment.fingerprint,
+            &ac_environment.fingerprint
+        ));
+    }
+
+    #[test]
+    fn warm_environment_tracks_device_provider_driver_and_qualification_facts() {
+        let candidates = fake_vulkan_candidates(DeviceClass::DiscreteGpu);
+        let base = qualified_snapshot(
+            OperatingSystem::Windows,
+            PowerSource::Ac,
+            candidates.clone(),
+        );
+        let loaded = select_backend_environment(AccelerationPreference::Auto, &base)
+            .unwrap()
+            .fingerprint;
+
+        let mut changed_snapshots = Vec::new();
+
+        let mut identity_changed = base.clone();
+        identity_changed.candidates[0].target.device_id =
+            DeviceIdentity::new("native:pci:0000:02:00.0");
+        identity_changed.qualification_policy = BackendQualificationPolicy::qualify_all_for_testing(
+            identity_changed.operating_system,
+            &identity_changed.candidates,
+        );
+        changed_snapshots.push(identity_changed);
+
+        let mut provider_changed = base.clone();
+        provider_changed.candidates[0].target.provider_id =
+            ProviderIdentity::new("transcribe-cpp:alternate-vulkan");
+        provider_changed.qualification_policy = BackendQualificationPolicy::qualify_all_for_testing(
+            provider_changed.operating_system,
+            &provider_changed.candidates,
+        );
+        changed_snapshots.push(provider_changed);
+
+        let mut driver_changed = base.clone();
+        driver_changed.candidates[0].target.driver_version = Some("driver-2".to_owned());
+        changed_snapshots.push(driver_changed);
+
+        let mut class_changed = base.clone();
+        class_changed.candidates[0].target.device_class = DeviceClass::IntegratedGpu;
+        changed_snapshots.push(class_changed);
+
+        let mut availability_changed = base.clone();
+        availability_changed.candidates[0].availability = CandidateAvailability::Unhealthy;
+        changed_snapshots.push(availability_changed);
+
+        let mut backend_changed = base.clone();
+        backend_changed.candidates[0].target.backend = BackendKind::Cuda;
+        backend_changed.candidates[0].target.provider_id =
+            ProviderIdentity::new("transcribe-cpp:cuda");
+        backend_changed.qualification_policy = BackendQualificationPolicy::qualify_all_for_testing(
+            backend_changed.operating_system,
+            &backend_changed.candidates,
+        );
+        changed_snapshots.push(backend_changed);
+
+        let mut qualification_changed = base.clone();
+        qualification_changed.qualification_policy =
+            BackendQualificationPolicy::stage_one_default_deny();
+        changed_snapshots.push(qualification_changed);
+
+        for changed in changed_snapshots {
+            let current = select_backend_environment(AccelerationPreference::Auto, &changed)
+                .unwrap()
+                .fingerprint;
+            assert!(!backend_environment_matches(&loaded, &current));
+        }
+    }
+
+    #[test]
+    fn volatile_memory_and_process_index_do_not_invalidate_a_stable_loaded_device() {
+        let candidates = fake_vulkan_candidates(DeviceClass::DiscreteGpu);
+        let base = qualified_snapshot(OperatingSystem::Windows, PowerSource::Ac, candidates);
+        let mut changed = base.clone();
+        changed.candidates[0].target.memory_available_bytes = 2 * 1024 * 1024 * 1024;
+        changed.candidates[0].target.process_index = Some(9);
+
+        assert!(backend_environment_matches(
+            &base.environment_fingerprint(),
+            &changed.environment_fingerprint()
+        ));
     }
 
     #[test]
@@ -871,11 +1208,11 @@ mod tests {
             native.index = process_index;
             select_backend(
                 AccelerationPreference::Gpu,
-                &BackendSnapshot {
-                    operating_system: OperatingSystem::Windows,
-                    power_source: PowerSource::Ac,
-                    candidates: vec![native_backend_candidate(native).unwrap()],
-                },
+                &snapshot(
+                    OperatingSystem::Windows,
+                    PowerSource::Ac,
+                    vec![native_backend_candidate(native).unwrap()],
+                ),
             )
             .unwrap()
         };
@@ -909,11 +1246,7 @@ mod tests {
         let candidate = native_backend_candidate(enumerated).unwrap();
         let mut selection = select_backend(
             AccelerationPreference::Gpu,
-            &BackendSnapshot {
-                operating_system: OperatingSystem::Windows,
-                power_source: PowerSource::Ac,
-                candidates: vec![candidate],
-            },
+            &snapshot(OperatingSystem::Windows, PowerSource::Ac, vec![candidate]),
         )
         .unwrap();
         let observed = Device {
@@ -937,6 +1270,44 @@ mod tests {
     }
 
     #[test]
+    fn observed_device_reconciliation_selects_the_stable_identity_from_multiple_devices() {
+        let first = Device {
+            name: "Vulkan0".to_owned(),
+            description: "NVIDIA GPU A".to_owned(),
+            kind: "vulkan".to_owned(),
+            device_type: DeviceType::Gpu,
+            device_id: Some("0000:02:00.0".to_owned()),
+            memory_total: 8 * 1024 * 1024 * 1024,
+            memory_free: 6 * 1024 * 1024 * 1024,
+            index: Some(4),
+        };
+        let second = Device {
+            name: "Vulkan1".to_owned(),
+            description: "NVIDIA GPU B".to_owned(),
+            device_id: Some("0000:01:00.0".to_owned()),
+            index: Some(9),
+            ..first.clone()
+        };
+        let mut selection = select_backend(
+            AccelerationPreference::Gpu,
+            &snapshot(
+                OperatingSystem::Windows,
+                PowerSource::Ac,
+                vec![
+                    native_backend_candidate(first).unwrap(),
+                    native_backend_candidate(second.clone()).unwrap(),
+                ],
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(selection.target.device_id.as_str(), "native:0000:01:00.0");
+        reconcile_observed_target(&mut selection, "vulkan", &second).unwrap();
+        assert_eq!(selection.target.device_id.as_str(), "native:0000:01:00.0");
+        assert_eq!(selection.target.process_index, Some(9));
+    }
+
+    #[test]
     fn observed_device_reconciliation_rejects_backend_or_identity_drift() {
         let enumerated = Device {
             name: "Vulkan0".to_owned(),
@@ -951,11 +1322,11 @@ mod tests {
         let selection = || {
             select_backend(
                 AccelerationPreference::Gpu,
-                &BackendSnapshot {
-                    operating_system: OperatingSystem::Windows,
-                    power_source: PowerSource::Ac,
-                    candidates: vec![native_backend_candidate(enumerated.clone()).unwrap()],
-                },
+                &snapshot(
+                    OperatingSystem::Windows,
+                    PowerSource::Ac,
+                    vec![native_backend_candidate(enumerated.clone()).unwrap()],
+                ),
             )
             .unwrap()
         };
@@ -988,6 +1359,26 @@ mod tests {
             .to_string();
         assert!(backend_error.starts_with("BackendUnavailable:"));
         assert!(backend_error.contains("requested Vulkan"));
+
+        let mut wrong_class = enumerated.clone();
+        wrong_class.device_type = DeviceType::Igpu;
+        let mut wrong_class_selection = selection();
+        let class_error =
+            reconcile_observed_target(&mut wrong_class_selection, "vulkan", &wrong_class)
+                .unwrap_err()
+                .to_string();
+        assert!(class_error.starts_with("BackendUnavailable:"));
+        assert!(class_error.contains("IntegratedGpu"));
+
+        let mut wrong_provider_selection = selection();
+        wrong_provider_selection.target.provider_id =
+            ProviderIdentity::new("transcribe-cpp:alternate-vulkan");
+        let provider_error =
+            reconcile_observed_target(&mut wrong_provider_selection, "vulkan", &enumerated)
+                .unwrap_err()
+                .to_string();
+        assert!(provider_error.starts_with("BackendUnavailable:"));
+        assert!(provider_error.contains("alternate-vulkan"));
     }
 
     #[test]

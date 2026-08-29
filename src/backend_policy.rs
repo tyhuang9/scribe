@@ -4,6 +4,10 @@
 //! discovery stays in the adapter that owns that runtime, which keeps policy
 //! tests deterministic and lets future worker packs provide the same facts
 //! without exposing provider-specific handles above the worker boundary.
+//!
+//! Device-memory observations are diagnostic facts only. Model-aware memory
+//! admission is intentionally deferred until model requirements and qualified
+//! provider packs are available; this policy does not claim to preflight VRAM.
 
 use std::cmp::Ordering;
 
@@ -90,7 +94,7 @@ impl PowerSource {
 }
 
 /// Operating-system family used by the fixed backend compatibility table.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) enum OperatingSystem {
     Windows,
     MacOs,
@@ -129,7 +133,7 @@ impl DeviceIdentity {
         Self(if trimmed.is_empty() {
             "unknown-device".to_owned()
         } else {
-            trimmed.to_owned()
+            trimmed.to_ascii_lowercase()
         })
     }
 
@@ -138,7 +142,33 @@ impl DeviceIdentity {
     }
 
     fn canonical_key(&self) -> String {
-        self.0.to_ascii_lowercase()
+        self.0.clone()
+    }
+
+    pub(crate) fn is_derived(&self) -> bool {
+        self.0.starts_with("derived:")
+    }
+}
+
+/// Versioned provider identity used by qualification and warm invalidation.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(transparent)]
+pub(crate) struct ProviderIdentity(String);
+
+impl ProviderIdentity {
+    pub(crate) fn new(value: impl Into<String>) -> Self {
+        let value = value.into();
+        let trimmed = value.trim();
+        debug_assert!(!trimmed.is_empty(), "provider identity must not be empty");
+        Self(if trimmed.is_empty() {
+            "unknown-provider".to_owned()
+        } else {
+            trimmed.to_ascii_lowercase()
+        })
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
@@ -146,11 +176,16 @@ impl DeviceIdentity {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct BackendTarget {
     pub(crate) backend: BackendKind,
+    pub(crate) provider_id: ProviderIdentity,
+    /// Provider/driver build fact when the discovery API exposes it. The
+    /// pinned transcribe-cpp API does not currently report a driver version.
+    pub(crate) driver_version: Option<String>,
     pub(crate) device_id: DeviceIdentity,
     pub(crate) display_name: String,
     pub(crate) vendor: GpuVendor,
     pub(crate) device_class: DeviceClass,
     pub(crate) memory_total_bytes: u64,
+    /// Live telemetry only; not used for admission or warm invalidation.
     pub(crate) memory_available_bytes: u64,
     /// Provider registry index for this process only. It is rediscovered from
     /// `device_id` for every fresh snapshot and must never become durable.
@@ -162,6 +197,8 @@ impl BackendTarget {
     pub(crate) fn cpu() -> Self {
         Self {
             backend: BackendKind::Cpu,
+            provider_id: ProviderIdentity::new("transcribe-cpp:cpu"),
+            driver_version: None,
             device_id: DeviceIdentity::new("cpu:system"),
             display_name: "CPU".to_owned(),
             vendor: GpuVendor::Unknown,
@@ -183,15 +220,20 @@ impl BackendTarget {
         }
     }
 
-    fn dedup_key(&self) -> (BackendKind, String) {
-        (self.backend, self.device_id.canonical_key())
+    fn dedup_key(&self) -> (BackendKind, ProviderIdentity, String) {
+        (
+            self.backend,
+            self.provider_id.clone(),
+            self.device_id.canonical_key(),
+        )
     }
 }
 
 /// Current usability of one discovered backend target.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) enum CandidateAvailability {
     Available,
+    Unaddressable,
     Incompatible,
     Unhealthy,
     Quarantined,
@@ -201,9 +243,10 @@ impl CandidateAvailability {
     fn rank(self) -> u8 {
         match self {
             Self::Available => 0,
-            Self::Quarantined => 1,
-            Self::Unhealthy => 2,
-            Self::Incompatible => 3,
+            Self::Unaddressable => 1,
+            Self::Quarantined => 2,
+            Self::Unhealthy => 3,
+            Self::Incompatible => 4,
         }
     }
 }
@@ -213,8 +256,6 @@ impl CandidateAvailability {
 pub(crate) struct BackendCandidate {
     pub(crate) target: BackendTarget,
     pub(crate) availability: CandidateAvailability,
-    /// Release qualification may keep a working backend opt-in only.
-    pub(crate) auto_eligible: bool,
 }
 
 impl BackendCandidate {
@@ -222,7 +263,65 @@ impl BackendCandidate {
         Self {
             target,
             availability: CandidateAvailability::Available,
-            auto_eligible: true,
+        }
+    }
+}
+
+/// Auto qualification is deliberately an explicit, versioned allowlist.
+/// Stage 1 ships no entries: discovered GPUs remain available to explicit GPU
+/// mode while Auto stays on the guaranteed CPU path.
+pub(crate) const BACKEND_QUALIFICATION_POLICY_VERSION: u16 = 1;
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct BackendQualification {
+    pub(crate) operating_system: OperatingSystem,
+    pub(crate) backend: BackendKind,
+    pub(crate) provider_id: ProviderIdentity,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BackendQualificationPolicy {
+    pub(crate) version: u16,
+    qualified: Vec<BackendQualification>,
+}
+
+impl BackendQualificationPolicy {
+    pub(crate) fn stage_one_default_deny() -> Self {
+        Self {
+            version: BACKEND_QUALIFICATION_POLICY_VERSION,
+            qualified: Vec::new(),
+        }
+    }
+
+    fn qualifies(&self, operating_system: OperatingSystem, target: &BackendTarget) -> bool {
+        self.qualified
+            .binary_search(&BackendQualification {
+                operating_system,
+                backend: target.backend,
+                provider_id: target.provider_id.clone(),
+            })
+            .is_ok()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn qualify_all_for_testing(
+        operating_system: OperatingSystem,
+        candidates: &[BackendCandidate],
+    ) -> Self {
+        let mut qualified = candidates
+            .iter()
+            .filter(|candidate| candidate.target.backend.is_gpu())
+            .map(|candidate| BackendQualification {
+                operating_system,
+                backend: candidate.target.backend,
+                provider_id: candidate.target.provider_id.clone(),
+            })
+            .collect::<Vec<_>>();
+        qualified.sort();
+        qualified.dedup();
+        Self {
+            version: BACKEND_QUALIFICATION_POLICY_VERSION,
+            qualified,
         }
     }
 }
@@ -233,6 +332,75 @@ pub(crate) struct BackendSnapshot {
     pub(crate) operating_system: OperatingSystem,
     pub(crate) power_source: PowerSource,
     pub(crate) candidates: Vec<BackendCandidate>,
+    pub(crate) qualification_policy: BackendQualificationPolicy,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BackendEnvironmentFingerprint {
+    operating_system: OperatingSystem,
+    power_source: PowerSource,
+    qualification_policy_version: u16,
+    candidates: Vec<BackendCandidateFingerprint>,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct BackendCandidateFingerprint {
+    backend: BackendKind,
+    provider_id: ProviderIdentity,
+    driver_version: Option<String>,
+    device_id: DeviceIdentity,
+    display_name: String,
+    vendor: GpuVendor,
+    device_class: DeviceClass,
+    availability: CandidateAvailability,
+    auto_qualified: bool,
+    memory_total_bytes: u64,
+}
+
+impl BackendSnapshot {
+    /// Facts which make an already-loaded model safe to reuse. Volatile free
+    /// memory is excluded because model-aware memory preflight is deferred.
+    pub(crate) fn environment_fingerprint(&self) -> BackendEnvironmentFingerprint {
+        let mut candidates = self
+            .candidates
+            .iter()
+            .map(|candidate| BackendCandidateFingerprint {
+                backend: candidate.target.backend,
+                provider_id: candidate.target.provider_id.clone(),
+                driver_version: candidate.target.driver_version.clone(),
+                device_id: candidate.target.device_id.clone(),
+                display_name: candidate.target.display_name.trim().to_ascii_lowercase(),
+                vendor: candidate.target.vendor,
+                device_class: candidate.target.device_class,
+                availability: candidate.availability,
+                auto_qualified: self
+                    .qualification_policy
+                    .qualifies(self.operating_system, &candidate.target),
+                memory_total_bytes: candidate.target.memory_total_bytes,
+            })
+            .collect::<Vec<_>>();
+        candidates.sort();
+        Self::fingerprint(
+            self.operating_system,
+            self.power_source,
+            self.qualification_policy.version,
+            candidates,
+        )
+    }
+
+    fn fingerprint(
+        operating_system: OperatingSystem,
+        power_source: PowerSource,
+        qualification_policy_version: u16,
+        candidates: Vec<BackendCandidateFingerprint>,
+    ) -> BackendEnvironmentFingerprint {
+        BackendEnvironmentFingerprint {
+            operating_system,
+            power_source,
+            qualification_policy_version,
+            candidates,
+        }
+    }
 }
 
 /// Why the selected target won.
@@ -252,6 +420,26 @@ pub(crate) enum PowerPolicyDecision {
     NotApplied,
     Unrestricted,
     BatteryEfficientGpuOnly,
+}
+
+/// Typed reason an otherwise discovered target was not eligible.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum BackendSkipReason {
+    PlatformUnsupported,
+    StructurallyInvalid,
+    Unaddressable,
+    Incompatible,
+    Unhealthy,
+    Quarantined,
+    BatteryPolicy,
+    NotAutoQualified,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct SkippedBackend {
+    pub(crate) target: BackendTarget,
+    pub(crate) reason: BackendSkipReason,
 }
 
 /// Stable failure category recorded after a future bounded fallback.
@@ -280,6 +468,7 @@ pub(crate) struct BackendSelection {
     pub(crate) reason: BackendSelectionReason,
     pub(crate) power_source: PowerSource,
     pub(crate) power_policy: PowerPolicyDecision,
+    pub(crate) qualification_policy_version: u16,
     /// Remaining eligible targets in deterministic retry order. Stage 1 does
     /// not execute these fallbacks; the list is the contract for later worker
     /// supervision without silently widening strict-GPU semantics.
@@ -287,6 +476,54 @@ pub(crate) struct BackendSelection {
     pub(crate) fallback_targets: Vec<BackendTarget>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) fallback_history: Vec<BackendFallback>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) skipped_targets: Vec<SkippedBackend>,
+}
+
+impl BackendSelection {
+    pub(crate) fn auto_cpu_diagnostic(&self) -> Option<String> {
+        if self.requested != AccelerationPreference::Auto
+            || self.reason != BackendSelectionReason::AutoCpuFallback
+        {
+            return None;
+        }
+        let skipped = self
+            .skipped_targets
+            .iter()
+            .filter(|skipped| skipped.target.backend.is_gpu())
+            .map(|skipped| skipped.reason)
+            .collect::<Vec<_>>();
+        if skipped.contains(&BackendSkipReason::BatteryPolicy) {
+            Some(
+                "Auto selected CPU because discrete or unclassified GPUs are disabled on battery."
+                    .to_owned(),
+            )
+        } else if skipped.contains(&BackendSkipReason::NotAutoQualified) {
+            Some(
+                "Auto selected CPU because available GPU backends are not qualified for automatic use."
+                    .to_owned(),
+            )
+        } else if skipped.contains(&BackendSkipReason::Unaddressable) {
+            Some(
+                "Auto selected CPU because the available GPU could not be addressed stably."
+                    .to_owned(),
+            )
+        } else if skipped.iter().any(|reason| {
+            matches!(
+                reason,
+                BackendSkipReason::Incompatible
+                    | BackendSkipReason::Unhealthy
+                    | BackendSkipReason::Quarantined
+            )
+        }) {
+            Some(
+                "Auto selected CPU because compatible GPU backends are currently unavailable."
+                    .to_owned(),
+            )
+        } else {
+            Some("No compatible GPU was available; Auto selected CPU.".to_owned())
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
@@ -315,12 +552,30 @@ pub(crate) fn select_backend(
         }
     };
 
-    let mut eligible = normalized
-        .into_iter()
-        .filter(|candidate| candidate_is_eligible(candidate, requested, snapshot, power_policy))
-        .map(|candidate| candidate.target)
-        .collect::<Vec<_>>();
+    let mut eligible = Vec::new();
+    let mut skipped_targets = Vec::new();
+    for candidate in normalized {
+        if !candidate_matches_preference(&candidate, requested) {
+            continue;
+        }
+        if let Some(reason) = candidate_skip_reason(&candidate, requested, snapshot, power_policy) {
+            skipped_targets.push(SkippedBackend {
+                target: candidate.target,
+                reason,
+            });
+        } else {
+            eligible.push(candidate.target);
+        }
+    }
     eligible.sort_by(|left, right| target_order(left, right, requested, snapshot.operating_system));
+    skipped_targets.sort_by(|left, right| {
+        target_order(
+            &left.target,
+            &right.target,
+            requested,
+            snapshot.operating_system,
+        )
+    });
 
     if requested == AccelerationPreference::Auto
         && !eligible
@@ -352,8 +607,10 @@ pub(crate) fn select_backend(
         reason,
         power_source: snapshot.power_source,
         power_policy,
+        qualification_policy_version: snapshot.qualification_policy.version,
         fallback_targets: eligible.into_iter().skip(1).collect(),
         fallback_history: Vec::new(),
+        skipped_targets,
     })
 }
 
@@ -364,7 +621,6 @@ fn normalize_candidates(candidates: &[BackendCandidate]) -> Vec<BackendCandidate
             .dedup_key()
             .cmp(&right.target.dedup_key())
             .then_with(|| left.availability.rank().cmp(&right.availability.rank()))
-            .then_with(|| right.auto_eligible.cmp(&left.auto_eligible))
             .then_with(|| {
                 left.target
                     .process_index
@@ -382,30 +638,53 @@ fn normalize_candidates(candidates: &[BackendCandidate]) -> Vec<BackendCandidate
     normalized
 }
 
-fn candidate_is_eligible(
+fn candidate_matches_preference(
+    candidate: &BackendCandidate,
+    requested: AccelerationPreference,
+) -> bool {
+    match requested {
+        AccelerationPreference::Cpu => candidate.target.backend == BackendKind::Cpu,
+        AccelerationPreference::Gpu => candidate.target.backend.is_gpu(),
+        AccelerationPreference::Auto => true,
+    }
+}
+
+fn candidate_skip_reason(
     candidate: &BackendCandidate,
     requested: AccelerationPreference,
     snapshot: &BackendSnapshot,
     power_policy: PowerPolicyDecision,
-) -> bool {
-    if candidate.availability != CandidateAvailability::Available
-        || !candidate.target.is_structurally_valid()
-        || !platform_supports(&candidate.target, snapshot.operating_system)
-    {
-        return false;
+) -> Option<BackendSkipReason> {
+    if !candidate.target.is_structurally_valid() {
+        return Some(BackendSkipReason::StructurallyInvalid);
     }
-    match requested {
-        AccelerationPreference::Cpu => candidate.target.backend == BackendKind::Cpu,
-        AccelerationPreference::Gpu => candidate.target.backend.is_gpu(),
-        AccelerationPreference::Auto => {
-            if candidate.target.backend == BackendKind::Cpu {
-                return true;
-            }
-            candidate.auto_eligible
-                && (power_policy != PowerPolicyDecision::BatteryEfficientGpuOnly
-                    || candidate.target.device_class.is_battery_eligible_gpu())
+    if !platform_supports(&candidate.target, snapshot.operating_system) {
+        return Some(BackendSkipReason::PlatformUnsupported);
+    }
+    let availability = match candidate.availability {
+        CandidateAvailability::Available => None,
+        CandidateAvailability::Unaddressable => Some(BackendSkipReason::Unaddressable),
+        CandidateAvailability::Incompatible => Some(BackendSkipReason::Incompatible),
+        CandidateAvailability::Unhealthy => Some(BackendSkipReason::Unhealthy),
+        CandidateAvailability::Quarantined => Some(BackendSkipReason::Quarantined),
+    };
+    if availability.is_some() {
+        return availability;
+    }
+    if requested == AccelerationPreference::Auto && candidate.target.backend.is_gpu() {
+        if power_policy == PowerPolicyDecision::BatteryEfficientGpuOnly
+            && !candidate.target.device_class.is_battery_eligible_gpu()
+        {
+            return Some(BackendSkipReason::BatteryPolicy);
+        }
+        if !snapshot
+            .qualification_policy
+            .qualifies(snapshot.operating_system, &candidate.target)
+        {
+            return Some(BackendSkipReason::NotAutoQualified);
         }
     }
+    None
 }
 
 fn platform_supports(target: &BackendTarget, operating_system: OperatingSystem) -> bool {
@@ -500,12 +779,18 @@ fn vendor_rank(vendor: GpuVendor) -> u8 {
 
 #[cfg(windows)]
 fn current_power_source() -> PowerSource {
+    use std::mem::MaybeUninit;
     use windows_sys::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
 
-    let mut status: SYSTEM_POWER_STATUS = unsafe { std::mem::zeroed() };
-    if unsafe { GetSystemPowerStatus(&mut status) } == 0 {
+    let mut status = MaybeUninit::<SYSTEM_POWER_STATUS>::uninit();
+    // SAFETY: `status` is valid writable storage for the API's output. A
+    // nonzero return guarantees the structure was initialized, and failure is
+    // handled before `assume_init`.
+    if unsafe { GetSystemPowerStatus(status.as_mut_ptr()) } == 0 {
         return PowerSource::Unknown;
     }
+    // SAFETY: the successful API call above initialized the output structure.
+    let status = unsafe { status.assume_init() };
     match status.ACLineStatus {
         0 => PowerSource::Battery,
         1 => PowerSource::Ac,
@@ -535,6 +820,8 @@ mod tests {
     ) -> BackendTarget {
         BackendTarget {
             backend,
+            provider_id: ProviderIdentity::new(format!("test:{}", backend.label())),
+            driver_version: Some("test-driver-1".to_owned()),
             device_id: DeviceIdentity::new(id),
             display_name: id.to_owned(),
             vendor,
@@ -558,10 +845,26 @@ mod tests {
         power_source: PowerSource,
         candidates: Vec<BackendCandidate>,
     ) -> BackendSnapshot {
+        let qualification_policy =
+            BackendQualificationPolicy::qualify_all_for_testing(operating_system, &candidates);
         BackendSnapshot {
             operating_system,
             power_source,
             candidates,
+            qualification_policy,
+        }
+    }
+
+    fn default_deny_snapshot(
+        operating_system: OperatingSystem,
+        power_source: PowerSource,
+        candidates: Vec<BackendCandidate>,
+    ) -> BackendSnapshot {
+        BackendSnapshot {
+            operating_system,
+            power_source,
+            candidates,
+            qualification_policy: BackendQualificationPolicy::stage_one_default_deny(),
         }
     }
 
@@ -634,6 +937,52 @@ mod tests {
 
             assert_eq!(selected.target.backend, expected, "{os:?} {vendor:?}");
             assert_eq!(selected.reason, BackendSelectionReason::AutoPriority);
+        }
+    }
+
+    #[test]
+    fn stage_one_default_deny_keeps_all_production_auto_paths_on_cpu() {
+        for (os, backend, vendor, class) in [
+            (
+                OperatingSystem::Windows,
+                BackendKind::Cuda,
+                GpuVendor::Nvidia,
+                DeviceClass::DiscreteGpu,
+            ),
+            (
+                OperatingSystem::MacOs,
+                BackendKind::Metal,
+                GpuVendor::Apple,
+                DeviceClass::UnifiedGpu,
+            ),
+            (
+                OperatingSystem::Linux,
+                BackendKind::Vulkan,
+                GpuVendor::Amd,
+                DeviceClass::DiscreteGpu,
+            ),
+        ] {
+            let candidates = vec![
+                candidate(target(backend, vendor, class, "production-gpu", 1)),
+                cpu(),
+            ];
+            let production = default_deny_snapshot(os, PowerSource::Ac, candidates.clone());
+
+            let automatic = select_backend(AccelerationPreference::Auto, &production).unwrap();
+            assert_eq!(automatic.target.backend, BackendKind::Cpu, "{os:?}");
+            assert_eq!(
+                automatic.auto_cpu_diagnostic().as_deref(),
+                Some(
+                    "Auto selected CPU because available GPU backends are not qualified for automatic use."
+                )
+            );
+            assert_eq!(
+                automatic.skipped_targets[0].reason,
+                BackendSkipReason::NotAutoQualified
+            );
+
+            let explicit = select_backend(AccelerationPreference::Gpu, &production).unwrap();
+            assert_eq!(explicit.target.backend, backend, "{os:?}");
         }
     }
 
@@ -763,6 +1112,12 @@ mod tests {
         assert_eq!(selected.target.backend, BackendKind::Cpu);
         assert_eq!(selected.reason, BackendSelectionReason::AutoCpuFallback);
         assert_eq!(
+            selected.auto_cpu_diagnostic().as_deref(),
+            Some(
+                "Auto selected CPU because discrete or unclassified GPUs are disabled on battery."
+            )
+        );
+        assert_eq!(
             selected.power_policy,
             PowerPolicyDecision::BatteryEfficientGpuOnly
         );
@@ -800,17 +1155,16 @@ mod tests {
 
     #[test]
     fn explicit_gpu_ignores_power_and_auto_qualification_but_never_uses_cpu() {
-        let mut opt_in_only = candidate(target(
+        let opt_in_only = candidate(target(
             BackendKind::Vulkan,
             GpuVendor::Amd,
             DeviceClass::DiscreteGpu,
             "amd-gpu",
             1,
         ));
-        opt_in_only.auto_eligible = false;
         let selected = select_backend(
             AccelerationPreference::Gpu,
-            &snapshot(
+            &default_deny_snapshot(
                 OperatingSystem::Windows,
                 PowerSource::Battery,
                 vec![cpu(), opt_in_only],
@@ -876,9 +1230,8 @@ mod tests {
     }
 
     #[test]
-    fn auto_uses_cpu_when_gpu_is_unqualified_unhealthy_or_quarantined() {
+    fn auto_uses_cpu_when_gpu_is_unhealthy_quarantined_or_incompatible() {
         for availability in [
-            CandidateAvailability::Available,
             CandidateAvailability::Unhealthy,
             CandidateAvailability::Quarantined,
             CandidateAvailability::Incompatible,
@@ -891,10 +1244,6 @@ mod tests {
                 1,
             ));
             gpu.availability = availability;
-            gpu.auto_eligible = availability != CandidateAvailability::Available;
-            if availability == CandidateAvailability::Available {
-                gpu.auto_eligible = false;
-            }
             let selected = select_backend(
                 AccelerationPreference::Auto,
                 &snapshot(OperatingSystem::Windows, PowerSource::Ac, vec![gpu, cpu()]),
@@ -917,7 +1266,6 @@ mod tests {
                 7,
             ),
             availability: CandidateAvailability::Unhealthy,
-            auto_eligible: true,
         };
         let first = vec![
             candidate(target(
