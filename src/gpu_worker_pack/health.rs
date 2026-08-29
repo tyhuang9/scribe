@@ -675,7 +675,7 @@ pub(crate) enum HealthCacheError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
+    use std::fs::{self, OpenOptions};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use crate::backend_policy::{
@@ -1036,6 +1036,55 @@ mod tests {
             reopened.decision(&blocked_key),
             HealthDecision::InvalidOrUnprobed
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn concurrent_health_state_growth_is_bounded_and_cpu_remains_available() {
+        let root = temp_root("health-concurrent-growth");
+        let path = root.join("health.json");
+        let clock = ManualClock::new(4_600_000);
+        let context = key("growth");
+        let expected_witnesses = witnesses("growth");
+        let mut cache = HealthCache::open(&path, expected_witnesses.clone(), &clock);
+        cache
+            .record_provider_failure(context.clone(), FailureCode::WorkerCrash)
+            .unwrap();
+        drop(cache);
+
+        let writer_start = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let writer_finished = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let writer_start_thread = std::sync::Arc::clone(&writer_start);
+        let writer_finished_thread = std::sync::Arc::clone(&writer_finished);
+        let writer_path = path.clone();
+        let writer = std::thread::spawn(move || {
+            writer_start_thread.wait();
+            OpenOptions::new()
+                .write(true)
+                .open(writer_path)
+                .unwrap()
+                .set_len(crate::gpu_worker_pack::store::MAX_STATE_BYTES + 1)
+                .unwrap();
+            writer_finished_thread.wait();
+        });
+        crate::gpu_worker_pack::store::set_state_read_hook(move |_| {
+            writer_start.wait();
+            writer_finished.wait();
+        });
+        let cache = HealthCache::open(&path, expected_witnesses, &clock);
+        writer.join().unwrap();
+        assert_eq!(cache.decision(&context), HealthDecision::InvalidOrUnprobed);
+        let projection = cache.quarantine_projection_for(&context);
+        let mut candidates = vec![
+            gpu(&context),
+            BackendCandidate::available(BackendTarget::cpu()),
+        ];
+        apply_quarantine_projection(&mut candidates, &projection);
+        assert_eq!(
+            candidates[0].availability,
+            CandidateAvailability::Quarantined
+        );
+        assert_eq!(candidates[1].availability, CandidateAvailability::Available);
         fs::remove_dir_all(root).unwrap();
     }
 

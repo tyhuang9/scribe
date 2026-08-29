@@ -29,6 +29,29 @@ pub(crate) const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub(crate) const MAX_AGGREGATE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const PACK_DIGEST_DOMAIN: &[u8] = b"scribe-gpu-worker-pack-digest-v1\0";
 
+#[cfg(test)]
+type PackReadHook = Box<dyn FnMut(&Path)>;
+
+#[cfg(test)]
+thread_local! {
+    static PACK_READ_HOOK: std::cell::RefCell<Option<PackReadHook>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn set_pack_read_hook(hook: Option<PackReadHook>) {
+    PACK_READ_HOOK.with(|slot| *slot.borrow_mut() = hook);
+}
+
+#[cfg(test)]
+fn run_pack_read_hook(path: &Path) {
+    PACK_READ_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().as_mut() {
+            hook(path);
+        }
+    });
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum PackBackend {
@@ -805,16 +828,9 @@ fn verify_payload(
             return Err(PackVerificationError::SizeMismatch(entry.path.clone()));
         }
         reject_hardlink(&file, &metadata, &path)?;
-        let mut hasher = Sha256::new();
-        let mut buffer = [0_u8; 64 * 1024];
-        loop {
-            let read = file.read(&mut buffer).map_err(PackVerificationError::Io)?;
-            if read == 0 {
-                break;
-            }
-            hasher.update(&buffer[..read]);
-        }
-        if format!("{:x}", hasher.finalize()) != entry.sha256 {
+        #[cfg(test)]
+        run_pack_read_hook(&path);
+        if hash_exact_length(&mut file, entry.size_bytes, &entry.path)? != entry.sha256 {
             return Err(PackVerificationError::PayloadDigestMismatch(
                 entry.path.clone(),
             ));
@@ -841,10 +857,67 @@ fn read_bounded_regular_from(
     }
     reject_hardlink(&file, &metadata, &path)?;
     reject_named_streams(&path)?;
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.read_to_end(&mut bytes)
-        .map_err(PackVerificationError::Io)?;
+    #[cfg(test)]
+    run_pack_read_hook(&path);
+    let bytes = read_capped(&mut file, max_bytes).map_err(PackVerificationError::Io)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(PackVerificationError::EnvelopeTooLarge);
+    }
     Ok((bytes, file))
+}
+
+fn hash_exact_length(
+    reader: &mut impl Read,
+    expected_bytes: u64,
+    path: &str,
+) -> Result<String, PackVerificationError> {
+    let mut hasher = Sha256::new();
+    let mut remaining = expected_bytes;
+    let mut buffer = [0_u8; 64 * 1024];
+    while remaining != 0 {
+        let maximum = usize::try_from(remaining.min(buffer.len() as u64))
+            .map_err(|_| PackVerificationError::SizeMismatch(path.to_owned()))?;
+        let read = reader
+            .read(&mut buffer[..maximum])
+            .map_err(PackVerificationError::Io)?;
+        if read == 0 {
+            return Err(PackVerificationError::SizeMismatch(path.to_owned()));
+        }
+        hasher.update(&buffer[..read]);
+        remaining -= read as u64;
+    }
+    if reader
+        .read(&mut buffer[..1])
+        .map_err(PackVerificationError::Io)?
+        != 0
+    {
+        return Err(PackVerificationError::SizeMismatch(path.to_owned()));
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+pub(super) fn read_capped(
+    reader: &mut impl Read,
+    maximum_bytes: u64,
+) -> Result<Vec<u8>, io::Error> {
+    let limit = maximum_bytes
+        .checked_add(1)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "read cap overflow"))?;
+    let capacity = usize::try_from(limit)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "read cap exceeds usize"))?;
+    let mut bytes = Vec::with_capacity(capacity);
+    let mut remaining = limit;
+    let mut buffer = [0_u8; 64 * 1024];
+    while remaining != 0 {
+        let maximum = usize::try_from(remaining.min(buffer.len() as u64)).unwrap_or(buffer.len());
+        let read = reader.read(&mut buffer[..maximum])?;
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buffer[..read]);
+        remaining -= read as u64;
+    }
+    Ok(bytes)
 }
 
 fn open_regular_no_follow(path: &Path) -> Result<File, PackVerificationError> {
@@ -1407,6 +1480,103 @@ pub(super) mod test_support {
 mod tests {
     use super::test_support::*;
     use super::*;
+
+    struct EndlessReader {
+        consumed: usize,
+    }
+
+    impl Read for EndlessReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            buffer.fill(b'x');
+            self.consumed += buffer.len();
+            Ok(buffer.len())
+        }
+    }
+
+    #[test]
+    fn capped_and_exact_length_readers_stop_after_one_growth_byte() {
+        let mut endless = EndlessReader { consumed: 0 };
+        let bytes = read_capped(&mut endless, 32).unwrap();
+        assert_eq!(bytes.len(), 33);
+        assert_eq!(endless.consumed, 33);
+
+        let mut growing_payload = EndlessReader { consumed: 0 };
+        assert!(matches!(
+            hash_exact_length(&mut growing_payload, 32, "bin/worker.exe"),
+            Err(PackVerificationError::SizeMismatch(path)) if path == "bin/worker.exe"
+        ));
+        assert_eq!(growing_payload.consumed, 33);
+
+        let mut legitimate = io::Cursor::new(b"signed worker".to_vec());
+        assert_eq!(
+            hash_exact_length(&mut legitimate, 13, "bin/worker.exe").unwrap(),
+            format!("{:x}", Sha256::digest(b"signed worker"))
+        );
+        let mut truncated = io::Cursor::new(b"signed worker".to_vec());
+        assert!(matches!(
+            hash_exact_length(&mut truncated, 14, "bin/worker.exe"),
+            Err(PackVerificationError::SizeMismatch(path)) if path == "bin/worker.exe"
+        ));
+    }
+
+    #[test]
+    fn concurrent_envelope_and_payload_growth_is_bounded_or_os_denied() {
+        for (label, target_name, growth) in [
+            ("grow-manifest", MANIFEST_NAME, MAX_MANIFEST_BYTES + 1),
+            ("grow-signature", SIGNATURE_NAME, MAX_SIGNATURE_BYTES + 1),
+            ("grow-payload", "worker.exe", 14),
+        ] {
+            let root = temp_root(label);
+            let (verifier, _) = fixture(&root);
+            let mutation_succeeded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let attempted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let writer_start = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let writer_finished = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let mutation_result = std::sync::Arc::clone(&mutation_succeeded);
+            let writer_start_thread = std::sync::Arc::clone(&writer_start);
+            let writer_finished_thread = std::sync::Arc::clone(&writer_finished);
+            let target = root.join(target_name);
+            let writer = std::thread::spawn(move || {
+                writer_start_thread.wait();
+                let result = OpenOptions::new()
+                    .append(true)
+                    .open(target)
+                    .and_then(|file| file.set_len(growth));
+                mutation_result.store(result.is_ok(), std::sync::atomic::Ordering::SeqCst);
+                writer_finished_thread.wait();
+            });
+            let attempted_result = std::sync::Arc::clone(&attempted);
+            let hook_start = std::sync::Arc::clone(&writer_start);
+            let hook_finished = std::sync::Arc::clone(&writer_finished);
+            set_pack_read_hook(Some(Box::new(move |path| {
+                if path.file_name().and_then(|name| name.to_str()) == Some(target_name)
+                    && !attempted_result.swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    hook_start.wait();
+                    hook_finished.wait();
+                }
+            })));
+            let result = verifier.verify(&root);
+            set_pack_read_hook(None);
+            writer.join().unwrap();
+            assert!(attempted.load(std::sync::atomic::Ordering::SeqCst));
+            if mutation_succeeded.load(std::sync::atomic::Ordering::SeqCst) {
+                assert!(matches!(
+                    result,
+                    Err(PackVerificationError::EnvelopeTooLarge)
+                        | Err(PackVerificationError::SizeMismatch(_))
+                ));
+            } else {
+                // Windows intentionally denies mutation while the verified
+                // no-share-write handle is retained.
+                #[cfg(windows)]
+                assert!(result.is_ok());
+                #[cfg(not(windows))]
+                panic!("concurrent mutation was unexpectedly denied: {result:?}");
+            }
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
 
     #[test]
     fn signed_exact_tree_verifies_and_is_reverified_for_launch() {

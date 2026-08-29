@@ -20,10 +20,33 @@ use super::manifest::{
 };
 
 const STATE_SCHEMA_VERSION: u16 = 1;
-const MAX_STATE_BYTES: u64 = 256 * 1024;
+pub(super) const MAX_STATE_BYTES: u64 = 256 * 1024;
 const STORE_LOCK_NAME: &str = ".worker-pack-store.lock";
 #[cfg(windows)]
 const PRIVATE_STATE_AUTHORITY_LOCK_NAME: &str = ".scribe-private-state.lock";
+
+#[cfg(test)]
+type StateReadHook = Box<dyn FnOnce(&Path)>;
+
+#[cfg(test)]
+thread_local! {
+    static STATE_READ_HOOK: std::cell::RefCell<Option<StateReadHook>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+pub(super) fn set_state_read_hook(hook: impl FnOnce(&Path) + 'static) {
+    STATE_READ_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+fn run_state_read_hook(path: &Path) {
+    STATE_READ_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook(path);
+        }
+    });
+}
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1736,8 +1759,12 @@ where
         return Err(PackStoreError::CorruptState("state file bounds"));
     }
     super::manifest::reject_named_streams(&root.path.join(name))?;
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.read_to_end(&mut bytes)?;
+    #[cfg(test)]
+    run_state_read_hook(&root.path.join(name));
+    let bytes = super::manifest::read_capped(&mut file, MAX_STATE_BYTES)?;
+    if bytes.len() as u64 > MAX_STATE_BYTES {
+        return Err(PackStoreError::CorruptState("state file bounds"));
+    }
     let value = serde_json::from_slice::<T>(&bytes)?;
     if serde_json::to_vec(&value)? != bytes {
         return Err(PackStoreError::CorruptState("noncanonical state"));
@@ -2414,6 +2441,7 @@ pub(crate) enum PackStoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     fn current_descriptor(store: &PackStore<'_>) -> Option<VerifiedPack> {
         store
@@ -3249,5 +3277,90 @@ mod tests {
             fs::rename(&moved, &source).unwrap();
         }
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn preexisting_source_ancestor_link_is_rejected_before_pack_reads() {
+        let (root, workers, state, verifier, _) = store_fixture("prelinked-source-root");
+        let external = root.join("outside-source-parent");
+        fs::create_dir(&external).unwrap();
+        let external_pack = external.join("pack");
+        fs::rename(root.join("source"), &external_pack).unwrap();
+        let sentinel = external.join("sentinel.txt");
+        fs::write(&sentinel, b"outside remains unchanged").unwrap();
+        let linked_parent = root.join("linked-source-parent");
+        create_directory_link(&linked_parent, &external);
+        let store = PackStore::new(&workers, &state, &verifier);
+
+        assert!(
+            store
+                .stage_and_install(&linked_parent.join("pack"))
+                .is_err()
+        );
+        assert_eq!(fs::read(&sentinel).unwrap(), b"outside remains unchanged");
+        assert!(!workers.join("packs").exists());
+
+        remove_directory_link(&linked_parent);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn concurrent_activation_epoch_and_pending_growth_fail_state_bounds() {
+        for (label, state_name) in [
+            ("grow-activation-state", "activation.json"),
+            ("grow-epoch-state", "security-epochs.json"),
+            ("grow-pending-state", "pending-activation.json"),
+        ] {
+            let (root, workers, state, verifier, _) = store_fixture(label);
+            let store = PackStore::new(&workers, &state, &verifier);
+            let installed = store.stage_and_install(&root.join("source")).unwrap();
+            if state_name == "pending-activation.json" {
+                assert!(matches!(
+                    store.activate_locked(&installed, Some(ActivationBoundary::Journal)),
+                    Err(PackStoreError::InjectedInterruption)
+                ));
+            } else {
+                store.activate(&installed).unwrap();
+            }
+            let writer_start = Arc::new(std::sync::Barrier::new(2));
+            let writer_finished = Arc::new(std::sync::Barrier::new(2));
+            let writer_start_thread = Arc::clone(&writer_start);
+            let writer_finished_thread = Arc::clone(&writer_finished);
+            let state_path = state.join(state_name);
+            let writer = std::thread::spawn(move || {
+                writer_start_thread.wait();
+                OpenOptions::new()
+                    .write(true)
+                    .open(state_path)
+                    .unwrap()
+                    .set_len(MAX_STATE_BYTES + 1)
+                    .unwrap();
+                writer_finished_thread.wait();
+            });
+            let expected_name = state_name.to_owned();
+            let hook_start = Arc::clone(&writer_start);
+            let hook_finished = Arc::clone(&writer_finished);
+            set_state_read_hook(move |path| {
+                assert_eq!(
+                    path.file_name().and_then(|name| name.to_str()),
+                    Some(expected_name.as_str())
+                );
+                hook_start.wait();
+                hook_finished.wait();
+            });
+            let result = match state_name {
+                "activation.json" => store.load_activation_strict().map(|_| ()),
+                "security-epochs.json" => store.load_epochs_strict().map(|_| ()),
+                "pending-activation.json" => store.recover_pending_activation_locked(),
+                _ => unreachable!(),
+            };
+            writer.join().unwrap();
+            assert!(matches!(
+                result,
+                Err(PackStoreError::CorruptState("state file bounds"))
+            ));
+            assert!(store.current_fail_closed().is_none());
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 }
