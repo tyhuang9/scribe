@@ -337,8 +337,9 @@ pub(crate) trait TrustRoot: Send + Sync {
     fn public_key(&self, key_id: &str) -> Option<&[u8]>;
 }
 
-/// Intentionally empty in Stage 3. Adding a production key is an explicit
-/// release-security event, not a build-time fallback.
+/// Intentionally empty until a production public key and key ID complete a
+/// separate release-security review. The build-time author rejects every
+/// external private key that does not match an entry exposed here.
 pub(crate) struct ProductionTrustRoot;
 
 impl TrustRoot for ProductionTrustRoot {
@@ -599,7 +600,7 @@ where
     Ok(parsed)
 }
 
-fn validate_inventory(payload: &[PayloadEntry]) -> Result<(), PackVerificationError> {
+pub(crate) fn validate_inventory(payload: &[PayloadEntry]) -> Result<(), PackVerificationError> {
     if payload.is_empty() || payload.len() > MAX_FILES {
         return Err(PackVerificationError::InvalidFileCount);
     }
@@ -629,7 +630,10 @@ fn validate_inventory(payload: &[PayloadEntry]) -> Result<(), PackVerificationEr
     Ok(())
 }
 
-fn validate_identifier(value: &str, label: &'static str) -> Result<(), PackVerificationError> {
+pub(crate) fn validate_identifier(
+    value: &str,
+    label: &'static str,
+) -> Result<(), PackVerificationError> {
     if value.is_empty()
         || value.len() > 96
         || !value
@@ -669,7 +673,10 @@ fn is_canonical_store_component(value: &str) -> bool {
         && !is_reserved_windows_name(value)
 }
 
-fn validate_build_identity(value: &str, label: &'static str) -> Result<(), PackVerificationError> {
+pub(crate) fn validate_build_identity(
+    value: &str,
+    label: &'static str,
+) -> Result<(), PackVerificationError> {
     if value.len() < 12
         || value.len() > 192
         || !value.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
@@ -693,7 +700,7 @@ pub(super) fn is_canonical_sha256(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-fn validate_relative_path(value: &str) -> Result<(), PackVerificationError> {
+pub(crate) fn validate_relative_path(value: &str) -> Result<(), PackVerificationError> {
     if value.is_empty() || value.contains('\\') || value.contains(':') || value.starts_with('/') {
         return Err(PackVerificationError::UnsafePath(value.to_owned()));
     }
@@ -731,7 +738,7 @@ fn is_reserved_windows_name(name: &str) -> bool {
             && matches!(stem.as_bytes()[3], b'1'..=b'9'))
 }
 
-fn validate_root(root: &Path) -> Result<(), PackVerificationError> {
+pub(crate) fn validate_root(root: &Path) -> Result<(), PackVerificationError> {
     let metadata = fs::symlink_metadata(root).map_err(PackVerificationError::Io)?;
     if !metadata.is_dir() || is_link_or_reparse(&metadata) {
         return Err(PackVerificationError::NonRegularEntry(root.to_path_buf()));
@@ -866,7 +873,7 @@ fn read_bounded_regular_from(
     Ok((bytes, file))
 }
 
-fn hash_exact_length(
+pub(crate) fn hash_exact_length(
     reader: &mut impl Read,
     expected_bytes: u64,
     path: &str,
@@ -920,7 +927,7 @@ pub(super) fn read_capped(
     Ok(bytes)
 }
 
-fn open_regular_no_follow(path: &Path) -> Result<File, PackVerificationError> {
+pub(crate) fn open_regular_no_follow(path: &Path) -> Result<File, PackVerificationError> {
     let mut options = OpenOptions::new();
     options.read(true);
     configure_no_follow(&mut options);
@@ -1007,7 +1014,7 @@ fn open_regular_at(directory_fd: i32, relative: &Path) -> Result<File, PackVerif
 }
 
 #[cfg(windows)]
-fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
+pub(crate) fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;
     metadata.file_type().is_symlink()
         || metadata.file_attributes()
@@ -1016,12 +1023,12 @@ fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
 }
 
 #[cfg(not(windows))]
-fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
+pub(crate) fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
     metadata.file_type().is_symlink()
 }
 
 #[cfg(unix)]
-fn reject_hardlink(
+pub(crate) fn reject_hardlink(
     _file: &File,
     metadata: &fs::Metadata,
     path: &Path,
@@ -1034,7 +1041,7 @@ fn reject_hardlink(
 }
 
 #[cfg(windows)]
-fn reject_hardlink(
+pub(crate) fn reject_hardlink(
     file: &File,
     _metadata: &fs::Metadata,
     path: &Path,
@@ -1055,7 +1062,7 @@ fn reject_hardlink(
 }
 
 #[cfg(not(any(unix, windows)))]
-fn reject_hardlink(
+pub(crate) fn reject_hardlink(
     _file: &File,
     _metadata: &fs::Metadata,
     _path: &Path,

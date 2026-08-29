@@ -1,5 +1,7 @@
 /target
 /target-*/
+/artifacts/gpu-worker-packs/
+/tools/worker-pack-author/target/
 /NUL
 /.stitch/
 

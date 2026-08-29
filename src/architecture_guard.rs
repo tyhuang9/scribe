@@ -904,6 +904,86 @@ fn verified_worker_pack_stage_remains_fail_closed_and_provider_inert() {
 }
 
 #[test]
+fn worker_pack_authoring_is_isolated_pinned_and_production_closed() {
+    let root_manifest = include_str!("../Cargo.toml");
+    let desktop = include_str!("main.rs");
+    let production_manifest = include_str!("gpu_worker_pack/manifest.rs");
+    let author_manifest = include_str!("../tools/worker-pack-author/Cargo.toml");
+    let author_lock = include_str!("../tools/worker-pack-author/Cargo.lock");
+    let author_entrypoint = include_str!("../tools/worker-pack-author/src/main.rs");
+    let authoring = include_str!("worker_pack_authoring.rs");
+    let build = include_str!("../scripts/build-windows-gpu-worker-pack.ps1");
+    let contract = include_str!("../runtime-manifests/gpu-worker-toolchain-windows-x64.json");
+
+    assert!(!root_manifest.contains("scribe-worker-pack-tool"));
+    assert!(!root_manifest.contains("pack-authoring"));
+    assert!(!desktop.contains("worker_pack_authoring"));
+    assert!(author_manifest.contains("publish = false"));
+    assert!(author_manifest.contains("path = \"src/main.rs\""));
+    assert!(author_lock.contains("name = \"scribe-worker-pack-tool\""));
+    for required in [
+        "check-production-key",
+        "--fixture-signing",
+        "SigningMode::Production",
+        "production_key_pair",
+        "TrustRoot::public_key(&ProductionTrustRoot, key_id)",
+        "Ed25519KeyPair::from_pkcs8",
+        "external production signing key does not match",
+        "no separately reviewed public key embedded",
+    ] {
+        assert!(
+            author_entrypoint.contains(required) || authoring.contains(required),
+            "isolated pack authoring lost {required:?}"
+        );
+    }
+    for forbidden in [
+        "BEGIN PRIVATE KEY",
+        "production_signing_seed",
+        "PRODUCTION_SEED",
+    ] {
+        assert!(!authoring.contains(forbidden));
+        assert!(!production_manifest.contains(forbidden));
+        assert!(!contract.contains(forbidden));
+    }
+    for required in [
+        "1.96.0",
+        "ac68faa20c58cbccd01ee7208bf3b6e93a7d7f96",
+        "transcribe_cpp_checksum",
+        "transcribe_cpp_sys_checksum",
+        "a94e021ef658dc7c788837341a13f6acea3baf3c",
+        "b7080b6f470bac96ef0afe56b25ae9b2f9f0ca82d10dad19bf3a2fc5ffd6cffc",
+        "1.4.357.0",
+        "f8c97ee2c8bfcd31da87b602622c6e742389f98a83693b504cf538de4c75d3fa",
+        "12.8.93",
+        "14.44.35207",
+        "MultiThreaded",
+        "/Brepro",
+    ] {
+        assert!(
+            contract.contains(required),
+            "toolchain contract lost {required:?}"
+        );
+    }
+    for required in [
+        "--locked",
+        "--offline",
+        "SCRIBE_BUILD_REVISION",
+        "SCRIBE_BUILDING_WORKER = '1'",
+        "SOURCE_DATE_EPOCH",
+        "check-production-key",
+        "windows-pe-imports.ps1",
+        "Copy-ReviewedGpuWorkerDependencyClosure",
+        "GPU pack contains an undeclared native dependency",
+        "target-gpu-pack-build-",
+    ] {
+        assert!(
+            build.contains(required),
+            "pack build gate lost {required:?}"
+        );
+    }
+}
+
+#[test]
 fn worker_pack_health_persistence_stays_bounded_and_content_free() {
     let source = include_str!("gpu_worker_pack/health.rs");
     let production = source
@@ -974,6 +1054,7 @@ fn release_packaging_accepts_only_compiled_verified_declared_pack_roots() {
 #[test]
 fn worker_roles_use_private_pipes_and_protocol_only_stdout() {
     let sources = rust_sources();
+    let identity = include_str!("worker_identity.rs");
     let worker = sources
         .iter()
         .find(|(path, _)| path == Path::new("onnx_worker.rs"))
@@ -981,7 +1062,8 @@ fn worker_roles_use_private_pipes_and_protocol_only_stdout() {
         .expect("worker entrypoint exists");
 
     assert!(worker.contains("PROTOCOL_MAGIC: [u8; 4] = *b\"SCIF\""));
-    assert!(worker.contains("PROTOCOL_VERSION: u8 = 5"));
+    assert!(worker.contains("crate::worker_identity"));
+    assert!(identity.contains("PROTOCOL_VERSION: u8 = 5"));
     for bound_capability in [
         "challenge",
         "app_build",

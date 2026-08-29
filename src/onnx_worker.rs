@@ -38,6 +38,10 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+pub(crate) use crate::worker_identity::{
+    DESKTOP_BUILD_ID, INFERENCE_WORKER_BUILD_ID, PROTOCOL_VERSION, WORKER_ABI_VERSION,
+};
+
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 #[cfg(windows)]
@@ -46,22 +50,8 @@ use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt;
 
 pub(crate) const PROTOCOL_MAGIC: [u8; 4] = *b"SCIF";
-pub(crate) const PROTOCOL_VERSION: u8 = 5;
 pub(crate) const INFERENCE_WORKER_FLAG: &str = "--scribe-inference-worker";
 pub(crate) const VAD_WORKER_FLAG: &str = "--scribe-vad-worker";
-pub(crate) const WORKER_ABI_VERSION: u16 = 1;
-pub(crate) const DESKTOP_BUILD_ID: &str = concat!(
-    "local-transcriber@",
-    env!("CARGO_PKG_VERSION"),
-    "#",
-    env!("SCRIBE_BUILD_REVISION")
-);
-pub(crate) const INFERENCE_WORKER_BUILD_ID: &str = concat!(
-    "scribe-inference-worker@",
-    env!("CARGO_PKG_VERSION"),
-    "#",
-    env!("SCRIBE_BUILD_REVISION")
-);
 const VAD_WORKER_BUILD_ID: &str = concat!(
     "scribe-vad-worker@",
     env!("CARGO_PKG_VERSION"),

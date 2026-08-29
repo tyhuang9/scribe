@@ -75,6 +75,8 @@ mod support_assets;
 )]
 #[path = "../worker_contracts.rs"]
 mod worker_contracts;
+#[path = "../worker_identity.rs"]
+mod worker_identity;
 mod transcription {
     pub(crate) use crate::worker_contracts::*;
 }

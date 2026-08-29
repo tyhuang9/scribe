@@ -1,0 +1,73 @@
+{
+  "schema_version": 1,
+  "app_version": "0.1.0",
+  "target_triple": "x86_64-pc-windows-msvc",
+  "rust": {
+    "release": "1.96.0",
+    "commit": "ac68faa20c58cbccd01ee7208bf3b6e93a7d7f96",
+    "host": "x86_64-pc-windows-msvc"
+  },
+  "native_source": {
+    "transcribe_cpp_version": "0.1.3",
+    "transcribe_cpp_checksum": "4c3c4d6136eeccf56cfe8a6669e2d63770d1ef051c7cafd2cb9226218c66cded",
+    "transcribe_cpp_sys_version": "0.1.3",
+    "transcribe_cpp_sys_checksum": "278fd6a6da4d9d8d5f2716bd6761a76ea55c129fda6ba57856b80249a8570ed4",
+    "source_revision": "a94e021ef658dc7c788837341a13f6acea3baf3c",
+    "sherpa_onnx_archive": {
+      "filename": "sherpa-onnx-v1.13.5-win-x64-static-MT-Release-lib.tar.bz2",
+      "size_bytes": 120217991,
+      "sha256": "b7080b6f470bac96ef0afe56b25ae9b2f9f0ca82d10dad19bf3a2fc5ffd6cffc"
+    }
+  },
+  "msvc": {
+    "visual_studio_installation_version": "17.14.37314.3",
+    "toolset_version": "14.44.35207",
+    "platform_toolset": "v143",
+    "cmake_version": "4.4.2",
+    "runtime": "MultiThreaded",
+    "reproducible_flag": "/Brepro"
+  },
+  "build": {
+    "profile": "release",
+    "static_cpu_scheduling": true,
+    "dynamic_backends": false,
+    "openmp": false
+  },
+  "vulkan": {
+    "sdk_version": "1.4.357.0",
+    "provider": "transcribe-cpp-ggml-vulkan",
+    "required_files": [
+      {
+        "path": "Bin/glslc.exe",
+        "sha256": "f8c97ee2c8bfcd31da87b602622c6e742389f98a83693b504cf538de4c75d3fa"
+      },
+      {
+        "path": "Lib/vulkan-1.lib",
+        "sha256": "02caa31b8665a79f327cbfe97286fd7d0017c0b1f9b39eb78687b7a509de52b3"
+      }
+    ],
+    "system_driver_imports": [
+      "vulkan-1.dll"
+    ],
+    "packaged_runtime_imports": []
+  },
+  "cuda": {
+    "sdk_directory_version": "12.8",
+    "nvcc_version": "12.8.93",
+    "provider": "transcribe-cpp-ggml-cuda",
+    "cmake_architectures": "61;75;80;86;89",
+    "required_files": [
+      "bin/nvcc.exe",
+      "include/cuda.h",
+      "lib/x64/cuda.lib"
+    ],
+    "system_driver_imports": [
+      "nvcuda.dll"
+    ],
+    "packaged_runtime_imports": [
+      "cublas64_12.dll",
+      "cublaslt64_12.dll",
+      "cudart64_12.dll"
+    ]
+  }
+}

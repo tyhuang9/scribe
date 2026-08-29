@@ -57,6 +57,7 @@ mod transcription;
 mod tray;
 mod ui;
 mod worker_contracts;
+mod worker_identity;
 
 #[cfg(test)]
 mod architecture_guard;
