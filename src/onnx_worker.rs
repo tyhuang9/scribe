@@ -68,7 +68,7 @@ const PACK_DIGEST_ENV: &str = "SCRIBE_PRIVATE_PACK_DIGEST";
 const PACK_SECURITY_EPOCH_ENV: &str = "SCRIBE_PRIVATE_PACK_SECURITY_EPOCH";
 const PACK_RUNTIME_ABI_ENV: &str = "SCRIBE_PRIVATE_PACK_RUNTIME_ABI";
 const PACK_BACKEND_ENV: &str = "SCRIBE_PRIVATE_PACK_BACKEND";
-const PACK_PROVIDER_ENV: &str = "SCRIBE_PRIVATE_PACK_PROVIDER";
+pub(crate) const PACK_PROVIDER_ENV: &str = "SCRIBE_PRIVATE_PACK_PROVIDER";
 pub(crate) const PACK_DEVICE_ID_ENV: &str = "SCRIBE_PRIVATE_PACK_DEVICE_ID";
 pub(crate) const PACK_DRIVER_ID_ENV: &str = "SCRIBE_PRIVATE_PACK_DRIVER_ID";
 const PARENT_CONTROL_CANCEL: u8 = b'C';
@@ -5402,19 +5402,40 @@ fn reconcile_verified_pack_target(
         )
     })?;
     let observed = &selection.target;
-    if observed.backend != expected.backend
-        || observed.provider_id != expected.provider_id
-        || observed.device_id != expected.device_id
-        || observed.driver_version != expected.driver_version
-        || observed.device_class != expected.device_class
-        || observed.vendor != expected.vendor
-        || observed.memory_total_bytes != expected.memory_total_bytes
-        || observed.process_index != expected.process_index
-    {
-        return Err(RuntimeError::WorkerUnavailable(
-            "GPU worker runtime diagnostics differ from the verified launch binding".to_owned(),
-        ));
+    let mut mismatches = Vec::new();
+    for (matches, field) in [
+        (observed.backend == expected.backend, "backend"),
+        (observed.provider_id == expected.provider_id, "provider"),
+        (observed.device_id == expected.device_id, "device identity"),
+        (
+            observed.driver_version == expected.driver_version,
+            "driver identity",
+        ),
+        (
+            observed.device_class == expected.device_class,
+            "device class",
+        ),
+        (observed.vendor == expected.vendor, "vendor"),
+        (
+            observed.memory_total_bytes == expected.memory_total_bytes,
+            "total memory",
+        ),
+    ] {
+        if !matches {
+            mismatches.push(field);
+        }
     }
+    if !mismatches.is_empty() {
+        return Err(RuntimeError::WorkerUnavailable(format!(
+            "GPU worker runtime diagnostics differ from the verified launch binding: {}",
+            mismatches.join(", ")
+        )));
+    }
+    // BackendTarget deliberately excludes the volatile provider index from
+    // serde so it can never be persisted as device identity. The current
+    // index was already challenge-bound and validated in the fresh Hello;
+    // restore that resolver-owned value when projecting private diagnostics.
+    debug_assert!(observed.process_index.is_none());
     selection.target = expected;
     Ok(())
 }
@@ -9749,6 +9770,7 @@ mod tests {
             .unwrap();
         observed.target.driver_version = Some("windows-display:32.0.15.8088".to_owned());
         let mut expected = observed.target.clone();
+        observed.target.process_index = None;
         expected.pack = Some(crate::backend_policy::BackendPackIdentity {
             pack_id: "scribe-cuda-windows-x64".to_owned(),
             pack_version: "1.0.0".to_owned(),

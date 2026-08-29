@@ -328,13 +328,20 @@ fn runtime_backend_snapshot() -> BackendSnapshot {
 fn apply_verified_pack_device_override(candidates: &mut [BackendCandidate]) {
     let stable_id = std::env::var(crate::onnx_worker::PACK_DEVICE_ID_ENV).ok();
     let driver = std::env::var(crate::onnx_worker::PACK_DRIVER_ID_ENV).ok();
-    apply_verified_pack_device_override_values(candidates, stable_id.as_deref(), driver.as_deref());
+    let provider = std::env::var(crate::onnx_worker::PACK_PROVIDER_ENV).ok();
+    apply_verified_pack_device_override_values(
+        candidates,
+        stable_id.as_deref(),
+        driver.as_deref(),
+        provider.as_deref(),
+    );
 }
 
 fn apply_verified_pack_device_override_values(
     candidates: &mut [BackendCandidate],
     stable_id: Option<&str>,
     driver: Option<&str>,
+    provider: Option<&str>,
 ) {
     let Some(stable_id) = stable_id.filter(|value| {
         !value.is_empty()
@@ -351,6 +358,14 @@ fn apply_verified_pack_device_override_values(
                 && value.bytes().all(|byte| (0x20..=0x7e).contains(&byte))
         })
         .map(str::to_owned);
+    let provider = provider
+        .filter(|value| {
+            !value.is_empty()
+                && value.len() <= 128
+                && *value == value.to_ascii_lowercase()
+                && value.bytes().all(|byte| (0x20..=0x7e).contains(&byte))
+        })
+        .map(ProviderIdentity::new);
     for candidate in candidates.iter_mut().filter(|candidate| {
         candidate.target.backend.is_gpu() && candidate.target.device_id.as_str() != stable_id
     }) {
@@ -360,6 +375,9 @@ fn apply_verified_pack_device_override_values(
         candidate.target.backend.is_gpu() && candidate.target.device_id.as_str() == stable_id
     }) {
         candidate.target.driver_version = driver;
+        if let Some(provider) = provider {
+            candidate.target.provider_id = provider;
+        }
     }
 }
 
@@ -999,6 +1017,7 @@ mod tests {
             &mut candidates,
             Some("native:0000:01:00.0"),
             Some("windows-display:32.0.15.8088"),
+            Some("transcribe-cpp-ggml-vulkan"),
         );
         assert_eq!(
             candidates[0].availability,
@@ -1008,6 +1027,10 @@ mod tests {
         assert_eq!(
             candidates[1].target.driver_version.as_deref(),
             Some("windows-display:32.0.15.8088")
+        );
+        assert_eq!(
+            candidates[1].target.provider_id.as_str(),
+            "transcribe-cpp-ggml-vulkan"
         );
         let selected = select_backend(
             AccelerationPreference::Gpu,
