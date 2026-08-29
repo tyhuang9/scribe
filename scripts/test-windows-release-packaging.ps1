@@ -151,8 +151,7 @@ function Assert-ReleaseCargoFeatureContract([string]$ReleaseSource) {
     }
     Assert-OrderedWorkflowTokens $ReleaseSource @(
         $expectedWorkerBuild,
-        'Get-FileHash -Algorithm SHA256 -LiteralPath $sourceInferenceWorker',
-        '$env:SCRIBE_BUNDLED_WORKER_SHA256',
+        '$env:SCRIBE_BUNDLED_WORKER_SHA256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $sourceInferenceWorker)',
         $expectedDesktopBuild
     ) 'bundled worker trust-anchor build order'
 }
