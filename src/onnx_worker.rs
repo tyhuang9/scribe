@@ -5800,6 +5800,7 @@ fn health_filtered_gpu_route_plan(
     catalog: VerifiedGpuRouteCatalog,
     model_digest: &str,
     health_path: Option<&Arc<PathBuf>>,
+    allow_unprobed_idle_health: bool,
 ) -> InferenceWorkerRoutePlan {
     if catalog.routes.is_empty() {
         return InferenceWorkerRoutePlan {
@@ -5852,6 +5853,9 @@ fn health_filtered_gpu_route_plan(
             }
             HealthDecision::InvalidOrUnprobed => {
                 awaiting_probe = awaiting_probe.saturating_add(1);
+                if allow_unprobed_idle_health {
+                    routes.push(route);
+                }
             }
         }
     }
@@ -6036,6 +6040,15 @@ impl InferenceWorkerRegistry {
         preference: AccelerationPreference,
         artifact: &RuntimeArtifact,
     ) -> Result<InferenceWorkerRoutePlan, RuntimeError> {
+        self.routes_for_preference_with_idle_health(preference, artifact, false)
+    }
+
+    fn routes_for_preference_with_idle_health(
+        &self,
+        preference: AccelerationPreference,
+        artifact: &RuntimeArtifact,
+        allow_unprobed_idle_health: bool,
+    ) -> Result<InferenceWorkerRoutePlan, RuntimeError> {
         if preference == AccelerationPreference::Cpu {
             return Ok(InferenceWorkerRoutePlan {
                 routes: Arc::clone(&self.routes),
@@ -6065,6 +6078,14 @@ impl InferenceWorkerRegistry {
 
         #[cfg(test)]
         if let Some(catalog) = self.gpu_routes_for_testing.as_ref() {
+            if self.gpu_health_path.is_some() {
+                return Ok(health_filtered_gpu_route_plan(
+                    catalog.clone(),
+                    &model.expected_sha256,
+                    self.gpu_health_path.as_ref(),
+                    allow_unprobed_idle_health,
+                ));
+            }
             return Ok(InferenceWorkerRoutePlan {
                 routes: Arc::clone(&catalog.routes),
                 diagnostic: catalog.diagnostic.clone(),
@@ -6102,6 +6123,7 @@ impl InferenceWorkerRegistry {
             catalog,
             &model.expected_sha256,
             self.gpu_health_path.as_ref(),
+            allow_unprobed_idle_health,
         ))
     }
 
@@ -6325,7 +6347,14 @@ impl InferenceWorkerRegistry {
         let _route_execution = self.lock_route_execution()?;
         let mut last_retryable = None;
         let mut attempted = false;
-        let plan = self.routes_for_preference(preference, &artifact)?;
+        // A health request is the only execution path allowed to exercise an
+        // exact InvalidOrUnprobed route. Normal load/transcription selection
+        // remains fail-closed until two successful health probes persist.
+        let plan = self.routes_for_preference_with_idle_health(
+            preference,
+            &artifact,
+            preference == AccelerationPreference::Gpu,
+        )?;
         if plan.routes.is_empty() {
             self.retire_active_worker()?;
         }
@@ -9514,7 +9543,8 @@ mod tests {
             HealthDecision::Quarantined { .. }
         ));
 
-        let blocked = health_filtered_gpu_route_plan(catalog.clone(), &"b".repeat(64), Some(&path));
+        let blocked =
+            health_filtered_gpu_route_plan(catalog.clone(), &"b".repeat(64), Some(&path), false);
         assert!(blocked.routes.is_empty());
         assert!(
             blocked
@@ -9525,8 +9555,12 @@ mod tests {
 
         for expected_cleared in [false, true] {
             assert!(health.grant_explicit_retry(&key));
-            let probe =
-                health_filtered_gpu_route_plan(catalog.clone(), &"b".repeat(64), Some(&path));
+            let probe = health_filtered_gpu_route_plan(
+                catalog.clone(),
+                &"b".repeat(64),
+                Some(&path),
+                false,
+            );
             assert_eq!(probe.routes.len(), 1);
             assert!(
                 probe
@@ -9547,6 +9581,138 @@ mod tests {
         }
         assert_eq!(health.cache().decision(&key), HealthDecision::Available);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn invalid_health_state_allows_only_two_step_idle_probe_recovery() {
+        #[derive(Clone, Copy, Debug)]
+        enum InvalidFixture {
+            Corrupt,
+            OversizedUnreadable,
+            WitnessMismatch,
+        }
+
+        for fixture in [
+            InvalidFixture::Corrupt,
+            InvalidFixture::OversizedUnreadable,
+            InvalidFixture::WitnessMismatch,
+        ] {
+            let root = test_root(&format!("gpu-health-recovery-{fixture:?}"));
+            let path = Arc::new(root.join("health.json"));
+            let route = verified_gpu_route(
+                BackendKind::Vulkan,
+                "native:pci:0000:01:00.0",
+                "windows-display:32.0.16.1088",
+                'a',
+            );
+            let catalog = verified_gpu_catalog(vec![route.clone()]);
+            let artifact = missing_gguf_artifact();
+            let RuntimeArtifact::Gguf(model) = &artifact else {
+                unreachable!("fixture is GGUF")
+            };
+            let key = route_health_key(&route, &model.expected_sha256).unwrap();
+            let witnesses = HealthWitnesses {
+                app_build: DESKTOP_BUILD_ID.to_owned(),
+                device_set_digest: catalog.device_set_digest.clone(),
+            };
+
+            match fixture {
+                InvalidFixture::Corrupt => {
+                    std::fs::write(&*path, b"{not-canonical-health-state").unwrap();
+                }
+                InvalidFixture::OversizedUnreadable => {
+                    std::fs::write(&*path, vec![b'x'; 256 * 1024 + 1]).unwrap();
+                }
+                InvalidFixture::WitnessMismatch => {
+                    let mut stale = HealthCache::open(
+                        &*path,
+                        HealthWitnesses {
+                            app_build: "different-app-build".to_owned(),
+                            device_set_digest: catalog.device_set_digest.clone(),
+                        },
+                        &GPU_HEALTH_CLOCK,
+                    );
+                    stale
+                        .record_provider_failure(
+                            key.clone(),
+                            crate::gpu_worker_pack::health::FailureCode::WorkerCrash,
+                        )
+                        .unwrap();
+                }
+            }
+
+            let registry = InferenceWorkerRegistry {
+                routes: Arc::new(Vec::new()),
+                gpu_routes: Arc::new(Mutex::new(None)),
+                gpu_health_path: Some(Arc::clone(&path)),
+                active_route: Arc::new(Mutex::new(None)),
+                route_execution: Arc::new(Mutex::new(())),
+                gpu_routes_for_testing: Some(catalog),
+            };
+
+            let inference = registry
+                .routes_for_preference(AccelerationPreference::Gpu, &artifact)
+                .unwrap();
+            assert!(inference.routes.is_empty());
+            assert_eq!(
+                HealthCache::open(&*path, witnesses.clone(), &GPU_HEALTH_CLOCK).decision(&key),
+                HealthDecision::InvalidOrUnprobed
+            );
+
+            let first_probe = registry
+                .routes_for_preference_with_idle_health(
+                    AccelerationPreference::Gpu,
+                    &artifact,
+                    true,
+                )
+                .unwrap();
+            assert_eq!(first_probe.routes.len(), 1);
+            first_probe
+                .health
+                .as_ref()
+                .unwrap()
+                .record_idle_probe_success(&first_probe.routes[0]);
+            assert_eq!(
+                HealthCache::open(&*path, witnesses.clone(), &GPU_HEALTH_CLOCK).decision(&key),
+                HealthDecision::InvalidOrUnprobed
+            );
+            assert!(
+                registry
+                    .routes_for_preference(AccelerationPreference::Gpu, &artifact)
+                    .unwrap()
+                    .routes
+                    .is_empty(),
+                "normal inference must remain blocked after the first idle probe"
+            );
+
+            let second_probe = registry
+                .routes_for_preference_with_idle_health(
+                    AccelerationPreference::Gpu,
+                    &artifact,
+                    true,
+                )
+                .unwrap();
+            assert_eq!(second_probe.routes.len(), 1);
+            second_probe
+                .health
+                .as_ref()
+                .unwrap()
+                .record_idle_probe_success(&second_probe.routes[0]);
+            assert_eq!(
+                HealthCache::open(&*path, witnesses, &GPU_HEALTH_CLOCK).decision(&key),
+                HealthDecision::Available
+            );
+            assert_eq!(
+                registry
+                    .routes_for_preference(AccelerationPreference::Gpu, &artifact)
+                    .unwrap()
+                    .routes
+                    .len(),
+                1,
+                "normal inference becomes eligible only after the second idle probe"
+            );
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]
@@ -9640,7 +9806,7 @@ mod tests {
                 .grant_explicit_gpu_retry(&artifact, &wrong_target)
                 .unwrap()
         );
-        let plan = health_filtered_gpu_route_plan(catalog, &"b".repeat(64), Some(&path));
+        let plan = health_filtered_gpu_route_plan(catalog, &"b".repeat(64), Some(&path), false);
         assert_eq!(plan.routes.len(), 1);
         assert!(plan.routes[0].consume_retry_bypass);
         assert!(plan.health.as_ref().unwrap().consume_retry(&plan.routes[0]));
