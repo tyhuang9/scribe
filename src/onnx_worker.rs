@@ -5887,6 +5887,7 @@ fn health_filtered_gpu_route_plan(
         },
     };
     let mut diagnostic = catalog.diagnostic;
+    let mut recovery_routes = Vec::with_capacity(catalog.routes.len());
     let mut routes = Vec::with_capacity(catalog.routes.len());
     let mut quarantined = 0_usize;
     let mut awaiting_probe = 0_usize;
@@ -5912,10 +5913,14 @@ fn health_filtered_gpu_route_plan(
             HealthDecision::InvalidOrUnprobed => {
                 awaiting_probe = awaiting_probe.saturating_add(1);
                 if allow_unprobed_idle_health {
-                    routes.push(route);
+                    recovery_routes.push(route);
                 }
             }
         }
+    }
+    if allow_unprobed_idle_health && !recovery_routes.is_empty() {
+        recovery_routes.extend(routes);
+        routes = recovery_routes;
     }
     if quarantined != 0 {
         append_route_plan_diagnostic(
@@ -9802,6 +9807,108 @@ mod tests {
             );
             std::fs::remove_dir_all(root).unwrap();
         }
+    }
+
+    #[test]
+    fn two_invalid_health_routes_recover_without_starvation_or_early_inference() {
+        let root = test_root("gpu-health-two-route-recovery");
+        let path = Arc::new(root.join("health.json"));
+        let first_identity = "native:pci:0000:01:00.0";
+        let second_identity = "native:pci:0000:02:00.0";
+        let first = verified_gpu_route(
+            BackendKind::Vulkan,
+            first_identity,
+            "windows-display:32.0.16.1088",
+            'a',
+        );
+        let second = verified_gpu_route(
+            BackendKind::Vulkan,
+            second_identity,
+            "windows-display:32.0.16.1088",
+            'b',
+        );
+        let catalog = verified_gpu_catalog(vec![first.clone(), second.clone()]);
+        let artifact = missing_gguf_artifact();
+        let RuntimeArtifact::Gguf(model) = &artifact else {
+            unreachable!("fixture is GGUF")
+        };
+        let first_key = route_health_key(&first, &model.expected_sha256).unwrap();
+        let second_key = route_health_key(&second, &model.expected_sha256).unwrap();
+        let witnesses = HealthWitnesses {
+            app_build: DESKTOP_BUILD_ID.to_owned(),
+            device_set_digest: catalog.device_set_digest.clone(),
+        };
+        std::fs::write(&*path, b"{corrupt-health-state").unwrap();
+
+        let registry = InferenceWorkerRegistry {
+            routes: Arc::new(Vec::new()),
+            gpu_routes: Arc::new(Mutex::new(GpuRouteCatalogCache::default())),
+            gpu_health_path: Some(Arc::clone(&path)),
+            active_route: Arc::new(Mutex::new(None)),
+            route_execution: Arc::new(Mutex::new(())),
+            gpu_routes_for_testing: Some(catalog),
+        };
+        let eligible_identities = || {
+            registry
+                .routes_for_preference(AccelerationPreference::Gpu, &artifact)
+                .unwrap()
+                .routes
+                .iter()
+                .map(|route| route.target.as_ref().unwrap().device_id.as_str().to_owned())
+                .collect::<Vec<_>>()
+        };
+
+        for (probe_number, expected_identity, eligible_before, eligible_after) in [
+            (
+                1,
+                first_identity,
+                Vec::<String>::new(),
+                Vec::<String>::new(),
+            ),
+            (
+                2,
+                first_identity,
+                Vec::new(),
+                vec![first_identity.to_owned()],
+            ),
+            (
+                3,
+                second_identity,
+                vec![first_identity.to_owned()],
+                vec![first_identity.to_owned()],
+            ),
+            (
+                4,
+                second_identity,
+                vec![first_identity.to_owned()],
+                vec![first_identity.to_owned(), second_identity.to_owned()],
+            ),
+        ] {
+            assert_eq!(eligible_identities(), eligible_before);
+            let probe = registry
+                .routes_for_preference_with_idle_health(
+                    AccelerationPreference::Gpu,
+                    &artifact,
+                    true,
+                )
+                .unwrap();
+            let selected_identity = probe.routes[0].target.as_ref().unwrap().device_id.as_str();
+            assert_eq!(
+                selected_identity, expected_identity,
+                "idle probe {probe_number}"
+            );
+            probe
+                .health
+                .as_ref()
+                .unwrap()
+                .record_idle_probe_success(&probe.routes[0]);
+            assert_eq!(eligible_identities(), eligible_after);
+        }
+
+        let cache = HealthCache::open(&*path, witnesses, &GPU_HEALTH_CLOCK);
+        assert_eq!(cache.decision(&first_key), HealthDecision::Available);
+        assert_eq!(cache.decision(&second_key), HealthDecision::Available);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
