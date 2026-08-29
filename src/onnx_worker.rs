@@ -1283,18 +1283,28 @@ impl VulkanDeviceCatalog {
     ) -> Result<(String, String)> {
         let normalized = normalize_gpu_display_name(display_name)
             .ok_or_else(|| anyhow!("GPU provider device name is empty or malformed"))?;
-        let device = self
+        let matching = self
             .devices
-            .iter_mut()
-            .find(|device| {
+            .iter()
+            .enumerate()
+            .filter(|(_, device)| {
                 !device.claimed
                     && device.normalized_display_name == normalized
                     && device.device_class == device_class
                     && device.vendor == vendor
             })
-            .ok_or_else(|| {
-                anyhow!("GPU provider device has no matching Vulkan LUID/UUID identity")
-            })?;
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        let [index] = matching.as_slice() else {
+            if matching.is_empty() {
+                bail!("GPU provider device has no matching Vulkan LUID/UUID identity");
+            }
+            bail!(
+                "GPU provider device identity is ambiguous across {} Vulkan physical devices",
+                matching.len()
+            );
+        };
+        let device = &mut self.devices[*index];
         device.claimed = true;
         Ok((
             device.stable_device_identity.clone(),
@@ -8952,7 +8962,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn vulkan_identity_catalog_remaps_duplicate_names_and_driver_changes() {
+    fn vulkan_identity_catalog_rejects_ambiguity_and_tracks_driver_changes() {
         let device = |identity: &str, driver: &str| VulkanDeviceIdentity {
             normalized_display_name: "fixture duplicate gpu".to_owned(),
             device_class: DeviceClass::DiscreteGpu,
@@ -8967,39 +8977,15 @@ mod tests {
                 device("native:luid:0000000000000002", "vulkan:10de:1:1:b"),
             ],
         };
-        assert_eq!(
-            catalog
-                .claim(
-                    " Fixture   Duplicate GPU ",
-                    DeviceClass::DiscreteGpu,
-                    GpuVendor::Nvidia,
-                )
-                .unwrap(),
-            (
-                "native:luid:0000000000000001".to_owned(),
-                "vulkan:10de:1:1:a".to_owned(),
+        let ambiguity = catalog
+            .claim(
+                " Fixture   Duplicate GPU ",
+                DeviceClass::DiscreteGpu,
+                GpuVendor::Nvidia,
             )
-        );
-        assert_eq!(
-            catalog
-                .claim(
-                    "fixture duplicate gpu",
-                    DeviceClass::DiscreteGpu,
-                    GpuVendor::Nvidia,
-                )
-                .unwrap()
-                .0,
-            "native:luid:0000000000000002"
-        );
-        assert!(
-            catalog
-                .claim(
-                    "fixture duplicate gpu",
-                    DeviceClass::DiscreteGpu,
-                    GpuVendor::Nvidia,
-                )
-                .is_err()
-        );
+            .unwrap_err();
+        assert!(ambiguity.to_string().contains("ambiguous"));
+        assert!(catalog.devices.iter().all(|device| !device.claimed));
 
         let mut changed = VulkanDeviceCatalog {
             devices: vec![device(
@@ -10015,9 +10001,20 @@ mod tests {
             .verified_pack_bindings()
             .expect("Vulkan pack probe must complete its challenge-bound SCIF Hello");
         probe.shutdown().unwrap();
+        let expected_identity = std::env::var("SCRIBE_GPU_FIXTURE_STABLE_DEVICE_ID").ok();
         let binding = bindings
             .into_iter()
-            .find(|candidate| candidate.backend_target().backend == BackendKind::Vulkan)
+            .find(|candidate| {
+                let target = candidate.backend_target();
+                target.backend == BackendKind::Vulkan
+                    && expected_identity.as_ref().map_or_else(
+                        || {
+                            target.vendor == GpuVendor::Nvidia
+                                && target.device_class == DeviceClass::DiscreteGpu
+                        },
+                        |identity| target.device_id.as_str() == identity,
+                    )
+            })
             .expect("fixture pack must advertise a Vulkan device");
         let target = binding.backend_target();
         assert!(
@@ -10027,7 +10024,7 @@ mod tests {
                 .is_some_and(|value| !value.is_empty())
         );
         assert!(target.memory_total_bytes > 0);
-        if let Ok(expected_identity) = std::env::var("SCRIBE_GPU_FIXTURE_STABLE_DEVICE_ID") {
+        if let Some(expected_identity) = expected_identity {
             assert_eq!(target.device_id.as_str(), expected_identity);
         }
         let gpu_route = InferenceWorkerRoute {
