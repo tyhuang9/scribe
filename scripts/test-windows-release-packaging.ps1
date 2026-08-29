@@ -519,6 +519,15 @@ try {
         $syntheticImportReport.DelayImports -cnotcontains "user32.dll") {
         throw "Synthetic PE fixture did not prove both normal and delay import parsing."
     }
+    $mixedCaseImports = Join-Path $testRoot "mixed-case-imports.exe"
+    Write-TestPe $mixedCaseImports 0x8664 "KeRnEl32.DlL" "UsEr32.DLL"
+    $mixedCaseImportReport = Assert-ReviewedWindowsPe $mixedCaseImports
+    if ($mixedCaseImportReport.NormalImports -cnotcontains "kernel32.dll" -or
+        $mixedCaseImportReport.DelayImports -cnotcontains "user32.dll") {
+        throw "Windows PE import comparison did not use ASCII case-insensitive identities."
+    }
+    Assert-AllowedPayloadFile "LOCAL-TRANSCRIBER.EXE"
+    Assert-AllowedPayloadFile "SCRIBE-INFERENCE-WORKER.EXE"
     Invoke-ExpectedFailure { Assert-Amd64Pe $x86 } "PE Machine mismatch"
     $consoleSubsystem = Join-Path $testRoot "console-subsystem.exe"
     Write-TestPe $consoleSubsystem 0x8664 "kernel32.dll" "user32.dll" 3

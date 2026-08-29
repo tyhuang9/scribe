@@ -419,11 +419,15 @@ function Copy-ReviewedGpuWorkerDependencyClosure(
 ) {
     . (Join-Path $PSScriptRoot 'windows-pe-imports.ps1')
     $system = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $systemDrivers = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     foreach ($name in @($ReviewedWindowsSystemDlls) + @($SystemDriverImports)) {
         if ([string]$name -cnotmatch '^[a-z0-9._-]+\.dll$') {
             throw "System dependency allowlist contains an unsafe DLL name: $name"
         }
         $null = $system.Add([string]$name)
+    }
+    foreach ($name in $SystemDriverImports) {
+        $null = $systemDrivers.Add([string]$name)
     }
     $packaged = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     foreach ($name in $PackagedRuntimeImports) {
@@ -454,7 +458,7 @@ function Copy-ReviewedGpuWorkerDependencyClosure(
         }
         foreach ($import in @($report.NormalImports) + @($report.DelayImports)) {
             if ($system.Contains([string]$import)) {
-                if (@($SystemDriverImports).Contains([string]$import)) {
+                if ($systemDrivers.Contains([string]$import)) {
                     $observedProviderDependency = $true
                 }
                 continue

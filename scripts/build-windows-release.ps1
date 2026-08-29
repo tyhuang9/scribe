@@ -268,8 +268,10 @@ function Assert-AllowedPayloadFile([string]$RelativePath) {
         $extension -in @('.pyd', '.py', '.pyc', '.onnx', '.ort')) {
         throw "Release payload contains a forbidden runtime, Python, runner, or loose ONNX artifact: $RelativePath"
     }
-    if ($extension -in @('.dll', '.exe') -and
-        $RelativePath -cnotin @('local-transcriber.exe', 'scribe-inference-worker.exe')) {
+    $allowedExecutable = @(@('local-transcriber.exe', 'scribe-inference-worker.exe') | Where-Object {
+        [string]::Equals($_, $RelativePath, [System.StringComparison]::OrdinalIgnoreCase)
+    })
+    if ($extension -in @('.dll', '.exe') -and $allowedExecutable.Count -eq 0) {
         throw "Release payload contains an unallowlisted executable or DLL: $RelativePath"
     }
 }
@@ -293,13 +295,12 @@ function Assert-ExactAllowlist([string]$Root, [string[]]$ExpectedPaths) {
             throw "Release payload contains duplicate case-insensitive paths: $path"
         }
     }
-    $expected = @($ExpectedPaths | Sort-Object)
-    if ($actual.Count -ne $expected.Count -or
-        (Compare-Object -ReferenceObject $expected -DifferenceObject $actual -CaseSensitive)) {
+    if ($actual.Count -ne $ExpectedPaths.Count -or
+        -not $expectedCaseFolded.SetEquals($actualCaseFolded)) {
         throw "Release bundle contains files outside the explicit allowlist."
     }
 
-    $expectedDirectories = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+    $expectedDirectories = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     foreach ($path in $ExpectedPaths) {
         $segments = $path.Split('/')
         for ($index = 1; $index -lt $segments.Count; $index++) {
@@ -309,9 +310,14 @@ function Assert-ExactAllowlist([string]$Root, [string[]]$ExpectedPaths) {
     $actualDirectories = @(Get-ChildItem -LiteralPath $Root -Recurse -Directory -Force | ForEach-Object {
         Get-RelativeBundlePath $Root $_.FullName
     } | Sort-Object)
-    $expectedDirectoryPaths = @($expectedDirectories | Sort-Object)
-    if ($actualDirectories.Count -ne $expectedDirectoryPaths.Count -or
-        (Compare-Object -ReferenceObject $expectedDirectoryPaths -DifferenceObject $actualDirectories -CaseSensitive)) {
+    $actualDirectorySet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($path in $actualDirectories) {
+        if (-not $actualDirectorySet.Add($path)) {
+            throw "Release bundle contains duplicate case-insensitive directories: $path"
+        }
+    }
+    if ($actualDirectories.Count -ne $expectedDirectories.Count -or
+        -not $expectedDirectories.SetEquals($actualDirectorySet)) {
         throw "Release bundle contains directories outside the explicit allowlist."
     }
 }
