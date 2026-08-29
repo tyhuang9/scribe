@@ -685,10 +685,66 @@ try {
     & (Join-Path $repositoryRoot 'scripts\report-windows-worker-pack-sizes.ps1') `
         -CatalogPath (Join-Path $emptyPackBundle 'worker-pack-catalog.json') `
         -OutputPath $emptySizeReport
-    $emptySizeEvidence = Get-Content -LiteralPath $emptySizeReport -Raw | ConvertFrom-Json
+    $emptySizeReportJson = Get-Content -LiteralPath $emptySizeReport -Raw
+    $emptySizeEvidence = $emptySizeReportJson | ConvertFrom-Json
     Assert-ExactObjectProperties $emptySizeEvidence @('schema_version', 'packs') 'Empty worker-pack size report'
     if ($emptySizeEvidence.schema_version -ne 1 -or @($emptySizeEvidence.packs).Count -ne 0) {
         throw 'CPU-only release must produce explicit empty GPU size evidence.'
+    }
+    if ($emptySizeReportJson -cnotmatch '"packs"\s*:\s*\[\s*\]') {
+        throw 'CPU-only release size evidence must serialize packs as an explicit empty array.'
+    }
+
+    $sizeReportFixtures = @(
+        [ordered]@{
+            pack_id = 'scribe-cuda-windows-x64'
+            pack_version = '1.0.0'
+            pack_digest = ('a' * 64)
+            backend = 'cuda'
+            installed_size_bytes = 101
+            compressed_size_bytes = 51
+            files = @('workers/packs/cuda/manifest.json', 'workers/packs/cuda/signature.json', 'workers/packs/cuda/worker.exe')
+        },
+        [ordered]@{
+            pack_id = 'scribe-vulkan-windows-x64'
+            pack_version = '1.0.0'
+            pack_digest = ('b' * 64)
+            backend = 'vulkan'
+            installed_size_bytes = 202
+            compressed_size_bytes = 102
+            files = @('workers/packs/vulkan/manifest.json', 'workers/packs/vulkan/signature.json', 'workers/packs/vulkan/worker.exe')
+        }
+    )
+    foreach ($packCount in @(1, 2)) {
+        $catalogPath = Join-Path $testRoot "worker-pack-size-catalog-$packCount.json"
+        $reportPath = Join-Path $testRoot "worker-pack-size-report-$packCount.json"
+        $catalogJson = [ordered]@{
+            schema_version = 1
+            packs = [object[]]@($sizeReportFixtures | Select-Object -First $packCount)
+        } | ConvertTo-Json -Depth 8
+        [System.IO.File]::WriteAllText(
+            $catalogPath,
+            $catalogJson,
+            [System.Text.UTF8Encoding]::new($false)
+        )
+        & (Join-Path $repositoryRoot 'scripts\report-windows-worker-pack-sizes.ps1') `
+            -CatalogPath $catalogPath `
+            -OutputPath $reportPath
+        $reportJson = Get-Content -LiteralPath $reportPath -Raw
+        $evidence = $reportJson | ConvertFrom-Json
+        Assert-ExactObjectProperties $evidence @('schema_version', 'packs') "$packCount-pack size report"
+        if ($evidence.schema_version -ne 1 -or @($evidence.packs).Count -ne $packCount -or
+            $reportJson -cnotmatch '"packs"\s*:\s*\[') {
+            throw "$packCount-pack size evidence did not preserve a deterministic JSON array."
+        }
+        for ($index = 0; $index -lt $packCount; $index++) {
+            if ($evidence.packs[$index].pack_id -cne $sizeReportFixtures[$index].pack_id -or
+                $evidence.packs[$index].installed_size_bytes -ne $sizeReportFixtures[$index].installed_size_bytes -or
+                $evidence.packs[$index].compressed_size_bytes -ne $sizeReportFixtures[$index].compressed_size_bytes -or
+                $evidence.packs[$index].file_count -ne 3) {
+                throw "$packCount-pack size evidence changed pack order or values."
+            }
+        }
     }
 
     $targetBundle = Join-Path $repositoryRoot "target\scribe-release-probe-$PID"

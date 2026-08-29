@@ -20,7 +20,8 @@ $catalog = Get-Content -LiteralPath $catalogFile -Raw | ConvertFrom-Json
 if ($catalog.schema_version -ne 1 -or @($catalog.packs).Count -gt 8) {
     throw 'Worker-pack catalog has an unsupported schema or pack count.'
 }
-$reportPacks = foreach ($pack in @($catalog.packs)) {
+$reportPacks = [System.Collections.Generic.List[object]]::new()
+foreach ($pack in @($catalog.packs)) {
     if ([string]$pack.pack_id -cnotmatch '^[a-z0-9][a-z0-9._-]{0,95}$' -or
         [string]$pack.pack_version -cnotmatch '^[a-z0-9][a-z0-9._-]{0,95}$' -or
         [string]$pack.pack_digest -cnotmatch '^[0-9a-f]{64}$' -or
@@ -39,7 +40,7 @@ $reportPacks = foreach ($pack in @($catalog.packs)) {
         $pack.compressed_size_bytes,
         @($pack.files).Count
     )
-    [ordered]@{
+    [void]$reportPacks.Add([ordered]@{
         pack_id = [string]$pack.pack_id
         pack_version = [string]$pack.pack_version
         pack_digest = [string]$pack.pack_digest
@@ -47,11 +48,11 @@ $reportPacks = foreach ($pack in @($catalog.packs)) {
         installed_size_bytes = [int64]$pack.installed_size_bytes
         compressed_size_bytes = [int64]$pack.compressed_size_bytes
         file_count = [int]@($pack.files).Count
-    }
+    })
 }
 $report = [ordered]@{
     schema_version = 1
-    packs = @($reportPacks)
+    packs = [object[]]$reportPacks.ToArray()
 }
 $destination = [System.IO.Path]::GetFullPath($OutputPath)
 $parent = Split-Path -Parent $destination
