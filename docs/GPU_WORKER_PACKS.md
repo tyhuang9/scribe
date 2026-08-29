@@ -85,3 +85,14 @@ Publication must remain disabled until a persistent production public key is
 reviewed into the application and the matching private key is supplied only
 through an explicit external signing path or masked CI secret. Test keys are
 fixture-only and must never be promoted.
+
+## Stage 4 launch binding prerequisite
+
+Stage 4 must add one typed launch descriptor that carries the verified pack
+ID/version/digest, backend/provider, runtime ABI, target OS/architecture, and
+stable device identity through `WorkerExecutableResolver`. The same facts must
+be challenge-bound into the worker `Hello` exchange and compared with the
+reverified executable and final process image before the worker can advertise a
+capability. This binding is required before any production trust root or catalog
+may be provisioned. Merely verifying a pack directory or adding a public key is
+not sufficient to make a provider discoverable or launchable.

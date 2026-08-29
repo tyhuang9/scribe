@@ -649,15 +649,55 @@ fn native_runtime_ownership_is_confined_to_exact_owner_paths() {
 fn verified_worker_pack_stage_remains_fail_closed_and_provider_inert() {
     let module = include_str!("gpu_worker_pack/mod.rs");
     let manifest = include_str!("gpu_worker_pack/manifest.rs");
+    let worker = include_str!("onnx_worker.rs");
+    let documentation = include_str!("../docs/GPU_WORKER_PACKS.md");
     let production_manifest = manifest
         .split("#[cfg(test)]")
         .next()
         .expect("manifest has a production section");
-    assert!(module.contains("pub(crate) fn production_registry() -> Vec<VerifiedPack>"));
-    assert!(module.contains("Vec::new()"));
+    let registry_is_empty = module
+        .split("pub(crate) fn production_registry() -> Vec<VerifiedPack>")
+        .nth(1)
+        .and_then(|source| source.split('}').next())
+        .is_some_and(|body| body.contains("Vec::new()"));
     assert!(production_manifest.contains("struct ProductionTrustRoot"));
     assert!(production_manifest.contains("fn public_key(&self, _key_id: &str) -> Option<&[u8]>"));
-    assert!(production_manifest.contains("None"));
+    let trust_root_is_empty = production_manifest
+        .split("impl TrustRoot for ProductionTrustRoot")
+        .nth(1)
+        .and_then(|source| source.split('}').next())
+        .is_some_and(|body| body.contains("None"));
+    let stage_four_binding_exists = [
+        "VerifiedPackLaunchBinding",
+        "pack_id",
+        "pack_version",
+        "pack_digest",
+        "backend",
+        "provider",
+        "stable_device_identity",
+    ]
+    .iter()
+    .all(|marker| worker.contains(marker))
+        && worker.contains("trait WorkerExecutableResolver")
+        && worker.contains("Hello");
+    assert!(
+        stage_four_binding_exists || (registry_is_empty && trust_root_is_empty),
+        "production pack trust/catalog cannot be provisioned before Stage 4 binds the exact verified pack and stable device through WorkerExecutableResolver and Hello"
+    );
+    for required in [
+        "Stage 4",
+        "WorkerExecutableResolver",
+        "Hello",
+        "ID/version/digest",
+        "backend/provider",
+        "stable device",
+        "before any production trust root or catalog",
+    ] {
+        assert!(
+            documentation.contains(required),
+            "Stage 4 pack-launch binding documentation lost {required}"
+        );
+    }
     for forbidden in ["Ed25519KeyPair", "private_key", "signing_seed"] {
         assert!(
             !production_manifest.contains(forbidden),

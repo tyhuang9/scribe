@@ -419,6 +419,7 @@ fn validate_root(root: &Path) -> Result<(), PackVerificationError> {
     if !metadata.is_dir() || is_link_or_reparse(&metadata) {
         return Err(PackVerificationError::NonRegularEntry(root.to_path_buf()));
     }
+    reject_named_streams(root)?;
     Ok(())
 }
 
@@ -465,6 +466,7 @@ fn verify_exact_tree(root: &Path, inventory: &[PayloadEntry]) -> Result<(), Pack
                 return Err(PackVerificationError::CaseCollision);
             }
             if metadata.is_dir() {
+                reject_named_streams(&path)?;
                 validate_relative_path(&relative)?;
                 if !expected_directories.contains(&relative) {
                     return Err(PackVerificationError::TreeMismatch);
@@ -647,22 +649,36 @@ pub(super) fn reject_named_streams(path: &Path) -> Result<(), PackVerificationEr
         )
     };
     if handle == INVALID_HANDLE_VALUE {
-        return Err(PackVerificationError::Io(io::Error::last_os_error()));
+        let error = io::Error::last_os_error();
+        // Directories with no streams report ERROR_HANDLE_EOF immediately.
+        return if error.raw_os_error() == Some(38) {
+            Ok(())
+        } else {
+            Err(PackVerificationError::Io(error))
+        };
     }
-    let mut count = 1_usize;
-    while unsafe { FindNextStreamW(handle, &mut data as *mut _ as *mut _) } != 0 {
-        count += 1;
+    let has_named_stream = |stream: &WIN32_FIND_STREAM_DATA| {
+        let length = stream
+            .cStreamName
+            .iter()
+            .position(|character| *character == 0)
+            .unwrap_or(stream.cStreamName.len());
+        String::from_utf16_lossy(&stream.cStreamName[..length]) != "::$DATA"
+    };
+    let mut named_stream = has_named_stream(&data);
+    while !named_stream && unsafe { FindNextStreamW(handle, &mut data as *mut _ as *mut _) } != 0 {
+        named_stream = has_named_stream(&data);
     }
     let final_error = io::Error::last_os_error();
     unsafe { FindClose(handle) };
-    // ERROR_HANDLE_EOF (38) is the only successful enumeration terminator.
-    if final_error.raw_os_error() != Some(38) {
-        return Err(PackVerificationError::Io(final_error));
-    }
-    if count != 1 {
+    if named_stream {
         return Err(PackVerificationError::AlternateDataStream(
             path.to_path_buf(),
         ));
+    }
+    // ERROR_HANDLE_EOF (38) is the only successful enumeration terminator.
+    if final_error.raw_os_error() != Some(38) {
+        return Err(PackVerificationError::Io(final_error));
     }
     Ok(())
 }
@@ -1063,6 +1079,34 @@ mod tests {
         ));
         fs::remove_dir_all(root).unwrap();
         fs::remove_file(external).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn root_and_nested_directory_alternate_data_streams_are_rejected() {
+        let root = temp_root("windows-directory-streams");
+        let (verifier, _) = fixture(&root);
+        let mut root_stream = root.as_os_str().to_os_string();
+        root_stream.push(":untrusted-root");
+        let root_stream = PathBuf::from(root_stream);
+        fs::write(&root_stream, b"hidden").unwrap();
+        assert!(matches!(
+            verifier.verify(&root),
+            Err(PackVerificationError::AlternateDataStream(path)) if path == root
+        ));
+        fs::remove_file(&root_stream).unwrap();
+
+        let directory = root.join("bin");
+        let mut directory_stream = directory.as_os_str().to_os_string();
+        directory_stream.push(":untrusted-directory");
+        let directory_stream = PathBuf::from(directory_stream);
+        fs::write(&directory_stream, b"hidden").unwrap();
+        assert!(matches!(
+            verifier.verify(&root),
+            Err(PackVerificationError::AlternateDataStream(path)) if path == directory
+        ));
+        fs::remove_file(directory_stream).unwrap();
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]
