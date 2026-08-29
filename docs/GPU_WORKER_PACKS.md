@@ -226,10 +226,14 @@ CMake 4.4.2, MSVC 14.44.35207, the reviewed Sherpa archive, Vulkan SDK
 gate; the scripts never download an unapproved SDK. Pack payload outputs use
 the ignored `artifacts/gpu-worker-packs` tree. Native Cargo targets must be
 fresh direct children of the validated short `LocalApplicationData\sgp` build
-root. The script temporarily binds `LOCALAPPDATA` to the authoritative Windows
-shell folder so `transcribe-cpp-sys` creates its MAX_PATH junction there rather
-than under an ambient override. This keeps CMake/MSBuild paths bounded in deep
-worktrees and prevents CUDA and Vulkan feature outputs from being confused.
+root. Each build also receives a separate fresh physical `LOCALAPPDATA` child,
+so `transcribe-cpp-sys` never reads, replaces, or reuses the user's shared
+`tcs` junction namespace. If the dependency's first CMake configure encounters
+its known Windows junction bootstrap failure, the script validates the one
+build-local junction and its exact Cargo OUT_DIR, replaces only that fresh
+partial `out\build` directory with an isolated short junction, and retries
+once. This keeps CMake/MSBuild paths bounded in deep worktrees and prevents
+CUDA and Vulkan feature outputs from being confused.
 
 `scripts/test-windows-gpu-worker-pack-tools.ps1` exercises deterministic
 fixture authoring plus signature, key, tamper, unexpected-file/DLL, ADS,

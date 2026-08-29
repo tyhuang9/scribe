@@ -96,7 +96,7 @@ function Resolve-ShortCargoTargetDirectory(
     $cacheRoot = Get-NormalizedFullPath (Join-Path $localAppData 'sgp')
     Assert-NoReparseAncestors $cacheRoot
     $candidate = if ([string]::IsNullOrWhiteSpace($RequestedPath)) {
-        Join-Path $cacheRoot "$BackendName-$PackVersion"
+        Join-Path $cacheRoot "$BackendName-$PackVersion-cargo"
     } else {
         Get-NormalizedFullPath $RequestedPath
     }
@@ -118,8 +118,18 @@ function Resolve-ShortCargoTargetDirectory(
     if (Test-Path -LiteralPath $target) {
         throw "GPU worker Cargo target must be fresh to prevent feature/output reuse: $target"
     }
+    $buildEnvironment = Get-NormalizedFullPath (
+        Join-Path $cacheRoot "$BackendName-$PackVersion-env"
+    )
+    if ($buildEnvironment.Length -gt 96) {
+        throw 'GPU worker native build environment path exceeds the bounded short-path contract.'
+    }
+    Assert-NoReparseAncestors $buildEnvironment
+    if (Test-Path -LiteralPath $buildEnvironment) {
+        throw "GPU worker native build environment must be fresh: $buildEnvironment"
+    }
     return [pscustomobject]@{
-        LocalAppData = Get-NormalizedFullPath $localAppData
+        BuildEnvironment = $buildEnvironment
         Target = $target
     }
 }
@@ -163,6 +173,74 @@ function Invoke-NativeProcess(
     }
     finally {
         $process.Dispose()
+    }
+}
+
+function Enable-ValidatedCmakeBuildJunction(
+    [string]$BuildEnvironment,
+    [string]$CargoTarget
+) {
+    $tcsRoot = Join-Path $BuildEnvironment 'tcs'
+    if (-not (Test-Path -LiteralPath $tcsRoot -PathType Container)) {
+        throw 'The isolated transcribe-cpp native-build junction root was not created.'
+    }
+    $entries = @(Get-ChildItem -LiteralPath $tcsRoot -Force)
+    if ($entries.Count -ne 1) {
+        throw 'The isolated transcribe-cpp native-build root has an unexpected inventory.'
+    }
+    $shortOut = $entries[0]
+    if (-not $shortOut.PSIsContainer -or
+        ($shortOut.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq 0 -or
+        $shortOut.LinkType -cne 'Junction' -or
+        @($shortOut.Target).Count -ne 1) {
+        throw 'The transcribe-cpp short OUT_DIR is not one exact NTFS junction.'
+    }
+    $outDirectory = Get-NormalizedFullPath ([string]@($shortOut.Target)[0])
+    $relativeOut = [System.IO.Path]::GetRelativePath($CargoTarget, $outDirectory).Replace('\', '/')
+    if ($relativeOut -cnotmatch '^release/build/transcribe-cpp-sys-[0-9a-f]{16}/out$') {
+        throw 'The transcribe-cpp short OUT_DIR junction escaped the exact fresh Cargo target.'
+    }
+    $outItem = Get-Item -LiteralPath $outDirectory -Force
+    if (-not $outItem.PSIsContainer -or
+        ($outItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw 'The transcribe-cpp OUT_DIR target is not a physical directory.'
+    }
+    $buildDirectory = Join-Path $outDirectory 'build'
+    if (Test-Path -LiteralPath $buildDirectory) {
+        $buildItem = Get-Item -LiteralPath $buildDirectory -Force
+        if (-not $buildItem.PSIsContainer -or
+            ($buildItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+            -not [string]::Equals(
+                (Split-Path -Parent $buildItem.FullName),
+                $outDirectory,
+                [System.StringComparison]::OrdinalIgnoreCase
+            )) {
+            throw 'Refusing to replace an unexpected transcribe-cpp native build path.'
+        }
+        Remove-Item -LiteralPath $buildDirectory -Recurse -Force
+    }
+    $nativeBuild = Join-Path $BuildEnvironment 'native'
+    if (Test-Path -LiteralPath $nativeBuild) {
+        throw 'The isolated short native build directory was unexpectedly preexisting.'
+    }
+    New-Item -ItemType Directory -Path $nativeBuild | Out-Null
+    $nativeItem = Get-Item -LiteralPath $nativeBuild -Force
+    if (-not $nativeItem.PSIsContainer -or
+        ($nativeItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw 'The isolated short native build directory is not physical.'
+    }
+    New-Item -ItemType Junction -Path $buildDirectory -Target $nativeBuild | Out-Null
+    $junction = Get-Item -LiteralPath $buildDirectory -Force
+    if (-not $junction.PSIsContainer -or
+        ($junction.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq 0 -or
+        $junction.LinkType -cne 'Junction' -or
+        @($junction.Target).Count -ne 1 -or
+        -not [string]::Equals(
+            (Get-NormalizedFullPath ([string]@($junction.Target)[0])),
+            $nativeBuild,
+            [System.StringComparison]::OrdinalIgnoreCase
+        )) {
+        throw 'Could not verify the isolated transcribe-cpp native build junction.'
     }
 }
 
@@ -491,11 +569,17 @@ $stagingRoot = "$outputRoot.staging-$([guid]::NewGuid().ToString('N'))"
 $stagingCreated = $false
 
 try {
+    New-Item -ItemType Directory -Path $shortBuild.BuildEnvironment | Out-Null
+    $buildEnvironmentItem = Get-Item -LiteralPath $shortBuild.BuildEnvironment -Force
+    if (-not $buildEnvironmentItem.PSIsContainer -or
+        ($buildEnvironmentItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw 'GPU worker native build environment is not a physical directory.'
+    }
     $env:CARGO_TARGET_DIR = $cargoTarget
     # transcribe-cpp-sys creates its bounded native-build junction beneath this
-    # authoritative shell-folder path. Keeping both the junction and its target
-    # short avoids CMake/MSBuild path failures in deep repository worktrees.
-    $env:LOCALAPPDATA = $shortBuild.LocalAppData
+    # fresh build-specific shell-folder path. It never shares or reclaims the
+    # user's ambient tcs junction namespace.
+    $env:LOCALAPPDATA = $shortBuild.BuildEnvironment
     $env:SCRIBE_BUILD_REVISION = $revision
     $env:SCRIBE_BUNDLED_WORKER_SHA256 = $null
     $env:SCRIBE_BUILDING_WORKER = '1'
@@ -529,11 +613,27 @@ try {
     }
 
     $feature = "$backendName-acceleration"
-    $null = Invoke-NativeProcess $cargo @(
+    $workerBuildArguments = @(
         'build', '--locked', '--offline', '--release',
         '--bin', 'scribe-inference-worker', '--features', $feature,
         '--manifest-path', $manifestPath
-    ) "$Backend inference worker build failed."
+    )
+    try {
+        $null = Invoke-NativeProcess $cargo $workerBuildArguments "$Backend inference worker build failed."
+    }
+    catch {
+        $failure = $_.Exception.Message
+        $isKnownShortPathBootstrap = $failure.Contains('transcribe-cpp-sys') -and (
+            $failure.Contains('The directory name is invalid. (os error 267)') -or
+            $failure.Contains('Could not open file for write in copy operation')
+        )
+        if (-not $isKnownShortPathBootstrap) {
+            throw
+        }
+        Enable-ValidatedCmakeBuildJunction $shortBuild.BuildEnvironment $cargoTarget
+        Write-Warning 'Retrying the pinned native build through its validated isolated CMake build junction.'
+        $null = Invoke-NativeProcess $cargo $workerBuildArguments "$Backend inference worker build failed after short-path bootstrap."
+    }
     $worker = Join-Path $cargoTarget 'release\scribe-inference-worker.exe'
     $null = Assert-RegularNonReparseFile $worker "$Backend inference worker"
 
