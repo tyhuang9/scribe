@@ -5464,6 +5464,74 @@ struct VerifiedGpuRouteCatalog {
     discovery_fingerprint: String,
 }
 
+const GPU_PROVIDER_PROBE_BACKOFF: Duration = Duration::from_secs(15);
+
+#[derive(Clone)]
+struct FailedGpuProbe {
+    discovery_fingerprint: String,
+    retry_not_before: Instant,
+    diagnostic: Option<String>,
+    explicit_retry_available: bool,
+}
+
+#[derive(Default)]
+struct GpuRouteCatalogCache {
+    successful: Option<VerifiedGpuRouteCatalog>,
+    failed: Option<FailedGpuProbe>,
+}
+
+enum GpuRouteCatalogLookup {
+    Successful(VerifiedGpuRouteCatalog),
+    Backoff(Option<String>),
+    Probe,
+}
+
+impl GpuRouteCatalogCache {
+    fn lookup(&self, discovery_fingerprint: &str, now: Instant) -> GpuRouteCatalogLookup {
+        if let Some(catalog) = self.successful.as_ref().filter(|catalog| {
+            !catalog.routes.is_empty() && catalog.discovery_fingerprint == discovery_fingerprint
+        }) {
+            return GpuRouteCatalogLookup::Successful(catalog.clone());
+        }
+        if let Some(failed) = self.failed.as_ref().filter(|failed| {
+            failed.discovery_fingerprint == discovery_fingerprint && now < failed.retry_not_before
+        }) {
+            return GpuRouteCatalogLookup::Backoff(failed.diagnostic.clone());
+        }
+        GpuRouteCatalogLookup::Probe
+    }
+
+    fn record_probe(&mut self, catalog: VerifiedGpuRouteCatalog, now: Instant) {
+        if catalog.routes.is_empty() {
+            self.successful = None;
+            self.failed = Some(FailedGpuProbe {
+                discovery_fingerprint: catalog.discovery_fingerprint,
+                retry_not_before: now + GPU_PROVIDER_PROBE_BACKOFF,
+                diagnostic: catalog.diagnostic,
+                explicit_retry_available: true,
+            });
+        } else {
+            self.successful = Some(catalog);
+            self.failed = None;
+        }
+    }
+
+    fn grant_explicit_probe_retry(&mut self, discovery_fingerprint: &str, now: Instant) -> bool {
+        let Some(failed) = self.failed.as_mut().filter(|failed| {
+            failed.discovery_fingerprint == discovery_fingerprint && failed.explicit_retry_available
+        }) else {
+            return false;
+        };
+        failed.explicit_retry_available = false;
+        failed.retry_not_before = now;
+        true
+    }
+
+    fn successful(&self) -> Option<&VerifiedGpuRouteCatalog> {
+        self.successful.as_ref()
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct InferenceRouteIdentity {
     provider: WorkerProvider,
@@ -5534,7 +5602,7 @@ impl GpuRouteHealth {
 #[derive(Clone)]
 pub(crate) struct InferenceWorkerRegistry {
     routes: Arc<Vec<InferenceWorkerRoute>>,
-    gpu_routes: Arc<Mutex<Option<VerifiedGpuRouteCatalog>>>,
+    gpu_routes: Arc<Mutex<GpuRouteCatalogCache>>,
     gpu_health_path: Option<Arc<PathBuf>>,
     active_route: Arc<Mutex<Option<ActiveInferenceRoute>>>,
     route_execution: Arc<Mutex<()>>,
@@ -5786,16 +5854,6 @@ fn verified_gpu_route_catalog(
     }
 }
 
-fn matching_cached_gpu_catalog(
-    cached: &Option<VerifiedGpuRouteCatalog>,
-    discovery_fingerprint: &str,
-) -> Option<VerifiedGpuRouteCatalog> {
-    cached
-        .as_ref()
-        .filter(|catalog| catalog.discovery_fingerprint == discovery_fingerprint)
-        .cloned()
-}
-
 fn health_filtered_gpu_route_plan(
     catalog: VerifiedGpuRouteCatalog,
     model_digest: &str,
@@ -5897,7 +5955,7 @@ impl InferenceWorkerRegistry {
                 health_key: None,
                 consume_retry_bypass: false,
             }]),
-            gpu_routes: Arc::new(Mutex::new(None)),
+            gpu_routes: Arc::new(Mutex::new(GpuRouteCatalogCache::default())),
             gpu_health_path: config::project_dirs().ok().map(|directories| {
                 Arc::new(
                     directories
@@ -5925,7 +5983,7 @@ impl InferenceWorkerRegistry {
                 health_key: None,
                 consume_retry_bypass: false,
             }]),
-            gpu_routes: Arc::new(Mutex::new(None)),
+            gpu_routes: Arc::new(Mutex::new(GpuRouteCatalogCache::default())),
             gpu_health_path: config::project_dirs().ok().map(|directories| {
                 Arc::new(
                     directories
@@ -5950,7 +6008,7 @@ impl InferenceWorkerRegistry {
                 health_key: None,
                 consume_retry_bypass: false,
             }]),
-            gpu_routes: Arc::new(Mutex::new(None)),
+            gpu_routes: Arc::new(Mutex::new(GpuRouteCatalogCache::default())),
             gpu_health_path: None,
             active_route: Arc::new(Mutex::new(None)),
             route_execution: Arc::new(Mutex::new(())),
@@ -6099,24 +6157,37 @@ impl InferenceWorkerRegistry {
         // before any provider probe can start.
         let lease_discovery = crate::gpu_worker_pack::discover_production_pack_leases();
         let discovery_fingerprint = explicit_gpu_discovery_fingerprint(&lease_discovery);
+        let now = Instant::now();
         let cached_catalog = {
             let cached = self.gpu_routes.lock().map_err(|_| {
                 RuntimeError::WorkerUnavailable("GPU worker registry lock poisoned".to_owned())
             })?;
-            matching_cached_gpu_catalog(&cached, &discovery_fingerprint)
+            cached.lookup(&discovery_fingerprint, now)
         };
-        let catalog = if let Some(cached) = cached_catalog {
-            cached
-        } else {
-            self.retire_active_worker()?;
-            let discovered = verified_gpu_route_catalog(
-                discover_production_pack_launch_bindings(lease_discovery),
+        let catalog = match cached_catalog {
+            GpuRouteCatalogLookup::Successful(cached) => cached,
+            GpuRouteCatalogLookup::Backoff(diagnostic) => VerifiedGpuRouteCatalog {
+                routes: Arc::new(Vec::new()),
+                diagnostic,
+                device_set_digest: verified_gpu_device_set_digest(&[]),
                 discovery_fingerprint,
-            );
-            *self.gpu_routes.lock().map_err(|_| {
-                RuntimeError::WorkerUnavailable("GPU worker registry lock poisoned".to_owned())
-            })? = Some(discovered.clone());
-            discovered
+            },
+            GpuRouteCatalogLookup::Probe => {
+                self.retire_active_worker()?;
+                let discovered = verified_gpu_route_catalog(
+                    discover_production_pack_launch_bindings(lease_discovery),
+                    discovery_fingerprint,
+                );
+                self.gpu_routes
+                    .lock()
+                    .map_err(|_| {
+                        RuntimeError::WorkerUnavailable(
+                            "GPU worker registry lock poisoned".to_owned(),
+                        )
+                    })?
+                    .record_probe(discovered.clone(), now);
+                discovered
+            }
         };
 
         Ok(health_filtered_gpu_route_plan(
@@ -6145,7 +6216,7 @@ impl InferenceWorkerRegistry {
         let cached = self.gpu_routes.lock().map_err(|_| {
             RuntimeError::WorkerUnavailable("GPU worker registry lock poisoned".to_owned())
         })?;
-        let Some(catalog) = cached.as_ref() else {
+        let Some(catalog) = cached.successful() else {
             return Ok(false);
         };
         let health = GpuRouteHealth {
@@ -6165,6 +6236,23 @@ impl InferenceWorkerRegistry {
                 .flatten()
         });
         Ok(key.is_some_and(|key| health.grant_explicit_retry(&key)))
+    }
+
+    #[allow(
+        dead_code,
+        reason = "Stage 5 connects this bounded provider-reprobe action to diagnostics UI"
+    )]
+    pub(crate) fn grant_explicit_gpu_provider_probe_retry(&self) -> Result<bool, RuntimeError> {
+        let discovery = crate::gpu_worker_pack::discover_production_pack_leases();
+        let fingerprint = explicit_gpu_discovery_fingerprint(&discovery);
+        let granted = self
+            .gpu_routes
+            .lock()
+            .map_err(|_| {
+                RuntimeError::WorkerUnavailable("GPU worker registry lock poisoned".to_owned())
+            })?
+            .grant_explicit_probe_retry(&fingerprint, Instant::now());
+        Ok(granted)
     }
 
     fn no_route_error(preference: AccelerationPreference) -> RuntimeError {
@@ -6450,7 +6538,7 @@ impl InferenceWorkerRegistry {
             route.supervisor.shutdown()?;
         }
         if let Ok(routes) = self.gpu_routes.lock()
-            && let Some(routes) = routes.as_ref()
+            && let Some(routes) = routes.successful()
         {
             for route in routes.routes.iter() {
                 route.supervisor.shutdown()?;
@@ -9643,7 +9731,7 @@ mod tests {
 
             let registry = InferenceWorkerRegistry {
                 routes: Arc::new(Vec::new()),
-                gpu_routes: Arc::new(Mutex::new(None)),
+                gpu_routes: Arc::new(Mutex::new(GpuRouteCatalogCache::default())),
                 gpu_health_path: Some(Arc::clone(&path)),
                 active_route: Arc::new(Mutex::new(None)),
                 route_execution: Arc::new(Mutex::new(())),
@@ -9788,7 +9876,10 @@ mod tests {
         let target = observed_route.target.as_ref().unwrap().clone();
         let registry = InferenceWorkerRegistry {
             routes: Arc::new(Vec::new()),
-            gpu_routes: Arc::new(Mutex::new(Some(catalog.clone()))),
+            gpu_routes: Arc::new(Mutex::new(GpuRouteCatalogCache {
+                successful: Some(catalog.clone()),
+                failed: None,
+            })),
             gpu_health_path: Some(Arc::clone(&path)),
             active_route: Arc::new(Mutex::new(None)),
             route_execution: Arc::new(Mutex::new(())),
@@ -10240,7 +10331,7 @@ mod tests {
                     health_key: None,
                     consume_retry_bypass: false,
                 }]),
-                gpu_routes: Arc::new(Mutex::new(None)),
+                gpu_routes: Arc::new(Mutex::new(GpuRouteCatalogCache::default())),
                 gpu_health_path: None,
                 active_route: Arc::new(Mutex::new(None)),
                 route_execution: Arc::new(Mutex::new(())),
@@ -10358,19 +10449,58 @@ mod tests {
         assert_eq!(plan.routes[0].provider, WorkerProvider::Cpu);
         assert!(plan.diagnostic.is_some_and(|value| !value.is_empty()));
         assert_eq!(launcher.launches.load(Ordering::Acquire), 0);
-        assert!(registry.gpu_routes.lock().unwrap().is_none());
+        let cache = registry.gpu_routes.lock().unwrap();
+        assert!(cache.successful.is_none());
+        assert!(cache.failed.is_none());
     }
 
     #[test]
-    fn unchanged_gpu_discovery_fingerprint_reuses_the_cached_catalog() {
-        let catalog = verified_gpu_catalog(vec![verified_gpu_route(
+    fn failed_gpu_probe_backoff_allows_same_fingerprint_recovery_and_warm_reuse() {
+        let now = Instant::now();
+        let mut cache = GpuRouteCatalogCache::default();
+        let mut failed = verified_gpu_catalog(Vec::new());
+        failed.diagnostic = Some("verified provider probe failed".to_owned());
+        cache.record_probe(failed.clone(), now);
+        assert!(cache.successful.is_none());
+        assert!(matches!(
+            cache.lookup("test-catalog", now),
+            GpuRouteCatalogLookup::Backoff(Some(message))
+                if message == "verified provider probe failed"
+        ));
+
+        assert!(!cache.grant_explicit_probe_retry("changed-catalog", now));
+        assert!(cache.grant_explicit_probe_retry("test-catalog", now));
+        assert!(
+            !cache.grant_explicit_probe_retry("test-catalog", now),
+            "an explicit provider reprobe grant is one-shot"
+        );
+        assert!(matches!(
+            cache.lookup("test-catalog", now),
+            GpuRouteCatalogLookup::Probe
+        ));
+
+        cache.record_probe(failed, now);
+        let later = now + GPU_PROVIDER_PROBE_BACKOFF;
+        assert!(matches!(
+            cache.lookup("test-catalog", later),
+            GpuRouteCatalogLookup::Probe
+        ));
+
+        let successful = verified_gpu_catalog(vec![verified_gpu_route(
             BackendKind::Vulkan,
             "native:pci:0000:01:00.0",
             "windows-display:32.0.16.1088",
             'a',
         )]);
-        assert!(matching_cached_gpu_catalog(&Some(catalog.clone()), "test-catalog").is_some());
-        assert!(matching_cached_gpu_catalog(&Some(catalog), "changed-catalog").is_none());
+        cache.record_probe(successful, later);
+        assert!(matches!(
+            cache.lookup("test-catalog", later + GPU_PROVIDER_PROBE_BACKOFF),
+            GpuRouteCatalogLookup::Successful(catalog) if catalog.routes.len() == 1
+        ));
+        assert!(matches!(
+            cache.lookup("changed-catalog", later),
+            GpuRouteCatalogLookup::Probe
+        ));
     }
 
     #[test]
@@ -10472,7 +10602,7 @@ mod tests {
         };
         let registry = InferenceWorkerRegistry {
             routes: Arc::new(vec![route(first.clone()), route(second.clone())]),
-            gpu_routes: Arc::new(Mutex::new(None)),
+            gpu_routes: Arc::new(Mutex::new(GpuRouteCatalogCache::default())),
             gpu_health_path: None,
             active_route: Arc::new(Mutex::new(None)),
             route_execution: Arc::new(Mutex::new(())),
@@ -10541,7 +10671,7 @@ mod tests {
                 health_key: None,
                 consume_retry_bypass: false,
             }]),
-            gpu_routes: Arc::new(Mutex::new(None)),
+            gpu_routes: Arc::new(Mutex::new(GpuRouteCatalogCache::default())),
             gpu_health_path: None,
             active_route: Arc::new(Mutex::new(None)),
             route_execution: Arc::new(Mutex::new(())),
