@@ -7,9 +7,11 @@ use thiserror::Error;
 
 use crate::backend_policy::{BackendTarget, CandidateQuarantineProjection};
 
-use super::store::{PackStoreError, atomic_write_canonical, read_canonical_state};
+use super::store::{
+    PackStoreError, atomic_write_canonical, exclusive_file_lock, read_canonical_state,
+};
 
-const HEALTH_SCHEMA_VERSION: u16 = 1;
+const HEALTH_SCHEMA_VERSION: u16 = 2;
 const MAX_RECORDS: usize = 128;
 const MAX_TEXT_BYTES: usize = 256;
 const RETRY_GRANT_SECONDS: u64 = 10 * 60;
@@ -53,14 +55,30 @@ pub(crate) struct HealthWitnesses {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum FailureCode {
-    WorkerStart,
-    Handshake,
-    RuntimeLoad,
+    WorkerCrash,
+    WorkerHang,
+    ProviderInitialization,
+    DriverFailure,
     DeviceLost,
     OutOfMemory,
-    Decode,
-    Timeout,
     Protocol,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FailureObservation {
+    WorkerCrash,
+    WorkerHang,
+    ProviderInitialization,
+    DriverFailure,
+    DeviceLost,
+    OutOfMemory,
+    Protocol,
+    InvalidInput,
+    ArtifactCorruption,
+    ModelCorruption,
+    DecodeContent,
+    Cancellation,
+    PartialOutput,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -83,6 +101,15 @@ struct HealthEnvelope {
     schema_version: u16,
     witnesses: HealthWitnesses,
     records: Vec<HealthRecord>,
+    recovery_probes: Vec<RecoveryProbe>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecoveryProbe {
+    key: HealthKey,
+    successful_idle_probes: u8,
+    last_probe_unix_seconds: u64,
 }
 
 impl HealthEnvelope {
@@ -91,20 +118,30 @@ impl HealthEnvelope {
             schema_version: HEALTH_SCHEMA_VERSION,
             witnesses,
             records: Vec::new(),
+            recovery_probes: Vec::new(),
         }
     }
+}
+
+enum CacheLoad {
+    Missing,
+    Valid(HealthEnvelope),
+    Invalid,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HealthDecision {
     Available,
     RetryBypass,
+    InvalidOrUnprobed,
     Quarantined { until_unix_seconds: u64 },
 }
 
 pub(crate) struct HealthCache<'a> {
     path: PathBuf,
+    witnesses: HealthWitnesses,
     envelope: HealthEnvelope,
+    invalid: bool,
     clock: &'a dyn Clock,
 }
 
@@ -115,43 +152,54 @@ impl<'a> HealthCache<'a> {
         clock: &'a dyn Clock,
     ) -> Self {
         let path = path.into();
-        let envelope =
-            load_fail_closed(&path, &witnesses).unwrap_or_else(|| HealthEnvelope::empty(witnesses));
+        let (envelope, invalid) = match load_cache(&path, &witnesses) {
+            CacheLoad::Missing => (HealthEnvelope::empty(witnesses.clone()), false),
+            CacheLoad::Valid(envelope) => (envelope, false),
+            CacheLoad::Invalid => (HealthEnvelope::empty(witnesses.clone()), true),
+        };
         Self {
             path,
+            witnesses,
             envelope,
+            invalid,
             clock,
         }
     }
 
     pub(crate) fn decision(&self, key: &HealthKey) -> HealthDecision {
-        let now = self.clock.now_unix_seconds();
-        let Some(record) = self.record(key) else {
-            return HealthDecision::Available;
-        };
-        if record.retry_grant_remaining
-            && record
-                .retry_grant_expires_unix_seconds
-                .is_some_and(|expires| now <= expires)
-        {
-            return HealthDecision::RetryBypass;
-        }
-        if now < record.quarantined_until_unix_seconds {
-            HealthDecision::Quarantined {
-                until_unix_seconds: record.quarantined_until_unix_seconds,
+        match load_cache(&self.path, &self.witnesses) {
+            CacheLoad::Missing => HealthDecision::Available,
+            CacheLoad::Invalid => HealthDecision::InvalidOrUnprobed,
+            CacheLoad::Valid(envelope) => {
+                decision_from_envelope(&envelope, key, self.clock.now_unix_seconds())
             }
-        } else {
-            HealthDecision::Available
         }
     }
 
-    pub(crate) fn record_failure(
+    pub(crate) fn record_observed_failure(
+        &mut self,
+        key: HealthKey,
+        observation: FailureObservation,
+    ) -> Result<Option<HealthDecision>, HealthCacheError> {
+        let Some(code) = quarantine_eligible_code(observation) else {
+            return Ok(None);
+        };
+        self.record_provider_failure(key, code).map(Some)
+    }
+
+    pub(crate) fn record_provider_failure(
         &mut self,
         key: HealthKey,
         code: FailureCode,
     ) -> Result<HealthDecision, HealthCacheError> {
+        let _lock = exclusive_file_lock(&self.lock_path())?;
+        self.reload_locked();
         validate_key(&key)?;
         let now = self.clock.now_unix_seconds();
+        self.invalid = false;
+        self.envelope
+            .recovery_probes
+            .retain(|probe| probe.key != key);
         let record = match self.record_mut(&key) {
             Some(record) => {
                 record.failure_count = record.failure_count.saturating_add(1).min(3);
@@ -192,6 +240,11 @@ impl<'a> HealthCache<'a> {
         &mut self,
         key: &HealthKey,
     ) -> Result<bool, HealthCacheError> {
+        let _lock = exclusive_file_lock(&self.lock_path())?;
+        self.reload_locked();
+        if self.invalid || self.recovery_probe(key).is_some() {
+            return Ok(false);
+        }
         let now = self.clock.now_unix_seconds();
         let Some(record) = self.record_mut(key) else {
             return Ok(false);
@@ -212,6 +265,11 @@ impl<'a> HealthCache<'a> {
         &mut self,
         key: &HealthKey,
     ) -> Result<bool, HealthCacheError> {
+        let _lock = exclusive_file_lock(&self.lock_path())?;
+        self.reload_locked();
+        if self.invalid || self.recovery_probe(key).is_some() {
+            return Ok(false);
+        }
         let now = self.clock.now_unix_seconds();
         let Some(record) = self.record_mut(key) else {
             return Ok(false);
@@ -233,6 +291,34 @@ impl<'a> HealthCache<'a> {
         &mut self,
         key: &HealthKey,
     ) -> Result<bool, HealthCacheError> {
+        let _lock = exclusive_file_lock(&self.lock_path())?;
+        self.reload_locked();
+        validate_key(key)?;
+        let now = self.clock.now_unix_seconds();
+        if self.invalid {
+            self.envelope = HealthEnvelope::empty(self.witnesses.clone());
+            self.envelope.recovery_probes.push(RecoveryProbe {
+                key: key.clone(),
+                successful_idle_probes: 1,
+                last_probe_unix_seconds: now,
+            });
+            self.invalid = false;
+            self.persist()?;
+            return Ok(false);
+        }
+        if let Some(probe) = self.recovery_probe_mut(key) {
+            probe.successful_idle_probes = probe.successful_idle_probes.saturating_add(1).min(2);
+            probe.last_probe_unix_seconds = now;
+            if probe.successful_idle_probes == 2 {
+                self.envelope
+                    .recovery_probes
+                    .retain(|probe| &probe.key != key);
+                self.persist()?;
+                return Ok(true);
+            }
+            self.persist()?;
+            return Ok(false);
+        }
         let Some(record) = self.record_mut(key) else {
             return Ok(false);
         };
@@ -249,21 +335,17 @@ impl<'a> HealthCache<'a> {
     /// Builds a projection for one exact pack/runtime/platform/model context.
     /// Driver and device identity are matched again at the candidate boundary.
     pub(crate) fn quarantine_projection_for(&self, key: &HealthKey) -> HealthQuarantineProjection {
-        let quarantined =
-            matches!(self.decision(key), HealthDecision::Quarantined { .. }).then(|| {
-                (
-                    key.driver_version.clone(),
-                    key.stable_device_identity.clone(),
-                )
-            });
+        let quarantined = matches!(
+            self.decision(key),
+            HealthDecision::Quarantined { .. } | HealthDecision::InvalidOrUnprobed
+        )
+        .then(|| {
+            (
+                key.driver_version.clone(),
+                key.stable_device_identity.clone(),
+            )
+        });
         HealthQuarantineProjection { quarantined }
-    }
-
-    fn record(&self, key: &HealthKey) -> Option<&HealthRecord> {
-        self.envelope
-            .records
-            .iter()
-            .find(|record| &record.key == key)
     }
 
     fn record_mut(&mut self, key: &HealthKey) -> Option<&mut HealthRecord> {
@@ -271,6 +353,20 @@ impl<'a> HealthCache<'a> {
             .records
             .iter_mut()
             .find(|record| &record.key == key)
+    }
+
+    fn recovery_probe(&self, key: &HealthKey) -> Option<&RecoveryProbe> {
+        self.envelope
+            .recovery_probes
+            .iter()
+            .find(|probe| &probe.key == key)
+    }
+
+    fn recovery_probe_mut(&mut self, key: &HealthKey) -> Option<&mut RecoveryProbe> {
+        self.envelope
+            .recovery_probes
+            .iter_mut()
+            .find(|probe| &probe.key == key)
     }
 
     fn evict_if_full(&mut self) {
@@ -288,10 +384,37 @@ impl<'a> HealthCache<'a> {
         }
     }
 
-    fn persist(&self) -> Result<(), HealthCacheError> {
+    fn persist(&mut self) -> Result<(), HealthCacheError> {
         validate_envelope(&self.envelope)?;
         atomic_write_canonical(&self.path, &self.envelope)?;
+        self.invalid = false;
         Ok(())
+    }
+
+    fn reload_locked(&mut self) {
+        match load_cache(&self.path, &self.witnesses) {
+            CacheLoad::Missing => {
+                self.envelope = HealthEnvelope::empty(self.witnesses.clone());
+                self.invalid = false;
+            }
+            CacheLoad::Valid(envelope) => {
+                self.envelope = envelope;
+                self.invalid = false;
+            }
+            CacheLoad::Invalid => {
+                self.envelope = HealthEnvelope::empty(self.witnesses.clone());
+                self.invalid = true;
+            }
+        }
+    }
+
+    fn lock_path(&self) -> PathBuf {
+        let name = self
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("gpu-health");
+        self.path.with_file_name(format!(".{name}.lock"))
     }
 }
 
@@ -307,20 +430,69 @@ impl CandidateQuarantineProjection for HealthQuarantineProjection {
     }
 }
 
-fn load_fail_closed(path: &Path, witnesses: &HealthWitnesses) -> Option<HealthEnvelope> {
-    if !path.exists() {
-        return Some(HealthEnvelope::empty(witnesses.clone()));
+fn load_cache(path: &Path, witnesses: &HealthWitnesses) -> CacheLoad {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return CacheLoad::Missing,
+        Err(_) => return CacheLoad::Invalid,
+        Ok(_) => {}
     }
-    let envelope = read_canonical_state::<HealthEnvelope>(path).ok()?;
+    let Ok(envelope) = read_canonical_state::<HealthEnvelope>(path) else {
+        return CacheLoad::Invalid;
+    };
     if envelope.witnesses != *witnesses || validate_envelope(&envelope).is_err() {
-        return None;
+        return CacheLoad::Invalid;
     }
-    Some(envelope)
+    CacheLoad::Valid(envelope)
+}
+
+fn decision_from_envelope(envelope: &HealthEnvelope, key: &HealthKey, now: u64) -> HealthDecision {
+    if envelope
+        .recovery_probes
+        .iter()
+        .any(|probe| &probe.key == key)
+    {
+        return HealthDecision::InvalidOrUnprobed;
+    }
+    let Some(record) = envelope.records.iter().find(|record| &record.key == key) else {
+        return HealthDecision::Available;
+    };
+    if record.retry_grant_remaining
+        && record
+            .retry_grant_expires_unix_seconds
+            .is_some_and(|expires| now <= expires)
+    {
+        return HealthDecision::RetryBypass;
+    }
+    if now < record.quarantined_until_unix_seconds {
+        HealthDecision::Quarantined {
+            until_unix_seconds: record.quarantined_until_unix_seconds,
+        }
+    } else {
+        HealthDecision::Available
+    }
+}
+
+fn quarantine_eligible_code(observation: FailureObservation) -> Option<FailureCode> {
+    match observation {
+        FailureObservation::WorkerCrash => Some(FailureCode::WorkerCrash),
+        FailureObservation::WorkerHang => Some(FailureCode::WorkerHang),
+        FailureObservation::ProviderInitialization => Some(FailureCode::ProviderInitialization),
+        FailureObservation::DriverFailure => Some(FailureCode::DriverFailure),
+        FailureObservation::DeviceLost => Some(FailureCode::DeviceLost),
+        FailureObservation::OutOfMemory => Some(FailureCode::OutOfMemory),
+        FailureObservation::Protocol => Some(FailureCode::Protocol),
+        FailureObservation::InvalidInput
+        | FailureObservation::ArtifactCorruption
+        | FailureObservation::ModelCorruption
+        | FailureObservation::DecodeContent
+        | FailureObservation::Cancellation
+        | FailureObservation::PartialOutput => None,
+    }
 }
 
 fn validate_envelope(envelope: &HealthEnvelope) -> Result<(), HealthCacheError> {
     if envelope.schema_version != HEALTH_SCHEMA_VERSION
-        || envelope.records.len() > MAX_RECORDS
+        || envelope.records.len() + envelope.recovery_probes.len() > MAX_RECORDS
         || envelope.witnesses.app_build.is_empty()
         || envelope.witnesses.app_build.len() > MAX_TEXT_BYTES
         || !valid_sha256(&envelope.witnesses.device_set_digest)
@@ -336,6 +508,12 @@ fn validate_envelope(envelope: &HealthEnvelope) -> Result<(), HealthCacheError> 
             || record.quarantined_until_unix_seconds < record.last_failure_unix_seconds
             || record.retry_grant_remaining != record.retry_grant_expires_unix_seconds.is_some()
         {
+            return Err(HealthCacheError::InvalidCache);
+        }
+    }
+    for probe in &envelope.recovery_probes {
+        validate_key(&probe.key)?;
+        if !keys.insert(&probe.key) || probe.successful_idle_probes != 1 {
             return Err(HealthCacheError::InvalidCache);
         }
     }
@@ -460,7 +638,7 @@ mod tests {
 
         assert_eq!(
             cache
-                .record_failure(key.clone(), FailureCode::WorkerStart)
+                .record_provider_failure(key.clone(), FailureCode::ProviderInitialization)
                 .unwrap(),
             HealthDecision::Quarantined {
                 until_unix_seconds: 1_000_000 + FIRST_QUARANTINE_SECONDS
@@ -470,7 +648,7 @@ mod tests {
         assert_eq!(cache.decision(&key), HealthDecision::Available);
         assert_eq!(
             cache
-                .record_failure(key.clone(), FailureCode::Handshake)
+                .record_provider_failure(key.clone(), FailureCode::Protocol)
                 .unwrap(),
             HealthDecision::Quarantined {
                 until_unix_seconds: 1_000_000
@@ -481,7 +659,7 @@ mod tests {
         clock.advance(SECOND_QUARANTINE_SECONDS);
         assert_eq!(
             cache
-                .record_failure(key.clone(), FailureCode::DeviceLost)
+                .record_provider_failure(key.clone(), FailureCode::DeviceLost)
                 .unwrap(),
             HealthDecision::Quarantined {
                 until_unix_seconds: 1_000_000
@@ -492,7 +670,7 @@ mod tests {
         );
         clock.advance(THIRD_QUARANTINE_SECONDS);
         let fourth = cache
-            .record_failure(key.clone(), FailureCode::OutOfMemory)
+            .record_provider_failure(key.clone(), FailureCode::OutOfMemory)
             .unwrap();
         assert_eq!(
             fourth,
@@ -511,7 +689,7 @@ mod tests {
         let mut cache = HealthCache::open(&path, witnesses("retry"), &clock);
         let retry_key = key("retry");
         cache
-            .record_failure(retry_key.clone(), FailureCode::RuntimeLoad)
+            .record_provider_failure(retry_key.clone(), FailureCode::ProviderInitialization)
             .unwrap();
         assert!(cache.grant_explicit_retry(&retry_key).unwrap());
         assert_eq!(cache.decision(&retry_key), HealthDecision::RetryBypass);
@@ -522,7 +700,7 @@ mod tests {
             HealthDecision::Quarantined { .. }
         ));
         let second = cache
-            .record_failure(retry_key.clone(), FailureCode::RuntimeLoad)
+            .record_provider_failure(retry_key.clone(), FailureCode::ProviderInitialization)
             .unwrap();
         assert_eq!(
             second,
@@ -533,7 +711,7 @@ mod tests {
 
         let expiring = key("expiring-retry");
         cache
-            .record_failure(expiring.clone(), FailureCode::Timeout)
+            .record_provider_failure(expiring.clone(), FailureCode::WorkerHang)
             .unwrap();
         assert!(cache.grant_explicit_retry(&expiring).unwrap());
         clock.advance(RETRY_GRANT_SECONDS + 1);
@@ -553,18 +731,18 @@ mod tests {
         let mut cache = HealthCache::open(&path, witnesses("probe"), &clock);
         let key = key("probe");
         cache
-            .record_failure(key.clone(), FailureCode::Decode)
+            .record_provider_failure(key.clone(), FailureCode::WorkerCrash)
             .unwrap();
         assert!(!cache.record_idle_probe_success(&key).unwrap());
         cache
-            .record_failure(key.clone(), FailureCode::Decode)
+            .record_provider_failure(key.clone(), FailureCode::WorkerCrash)
             .unwrap();
         assert_eq!(cache.envelope.records[0].failure_count, 2);
         assert!(!cache.record_idle_probe_success(&key).unwrap());
         assert!(cache.record_idle_probe_success(&key).unwrap());
         assert_eq!(cache.decision(&key), HealthDecision::Available);
         cache
-            .record_failure(key.clone(), FailureCode::Decode)
+            .record_provider_failure(key.clone(), FailureCode::WorkerCrash)
             .unwrap();
         assert_eq!(cache.envelope.records[0].failure_count, 1);
         fs::remove_dir_all(root).unwrap();
@@ -578,7 +756,7 @@ mod tests {
         let original_key = key("original");
         let mut cache = HealthCache::open(&path, witnesses("app-a"), &clock);
         cache
-            .record_failure(original_key.clone(), FailureCode::Protocol)
+            .record_provider_failure(original_key.clone(), FailureCode::Protocol)
             .unwrap();
         assert!(matches!(
             cache.decision(&original_key),
@@ -608,18 +786,21 @@ mod tests {
         let changed_app = HealthCache::open(&path, witnesses("app-b"), &clock);
         assert_eq!(
             changed_app.decision(&original_key),
-            HealthDecision::Available
+            HealthDecision::InvalidOrUnprobed
         );
         let mut changed_device_set_witness = witnesses("app-a");
         changed_device_set_witness.device_set_digest = "f".repeat(64);
         let changed_device_set = HealthCache::open(&path, changed_device_set_witness, &clock);
         assert_eq!(
             changed_device_set.decision(&original_key),
-            HealthDecision::Available
+            HealthDecision::InvalidOrUnprobed
         );
         fs::write(&path, b"{raw-error-and-path:C:\\private}").unwrap();
-        let corrupt = HealthCache::open(&path, witnesses("app-a"), &clock);
-        assert_eq!(corrupt.decision(&original_key), HealthDecision::Available);
+        let mut corrupt = HealthCache::open(&path, witnesses("app-a"), &clock);
+        assert_eq!(
+            corrupt.decision(&original_key),
+            HealthDecision::InvalidOrUnprobed
+        );
 
         let projection = corrupt.quarantine_projection_for(&original_key);
         let mut candidates = vec![
@@ -627,8 +808,18 @@ mod tests {
             BackendCandidate::available(BackendTarget::cpu()),
         ];
         apply_quarantine_projection(&mut candidates, &projection);
-        assert_eq!(candidates[0].availability, CandidateAvailability::Available);
+        assert_eq!(
+            candidates[0].availability,
+            CandidateAvailability::Quarantined
+        );
         assert_eq!(candidates[1].availability, CandidateAvailability::Available);
+        assert!(!corrupt.record_idle_probe_success(&original_key).unwrap());
+        assert_eq!(
+            corrupt.decision(&original_key),
+            HealthDecision::InvalidOrUnprobed
+        );
+        assert!(corrupt.record_idle_probe_success(&original_key).unwrap());
+        assert_eq!(corrupt.decision(&original_key), HealthDecision::Available);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -640,7 +831,7 @@ mod tests {
         let key = key("projection");
         let mut cache = HealthCache::open(&path, witnesses("projection"), &clock);
         cache
-            .record_failure(key.clone(), FailureCode::DeviceLost)
+            .record_provider_failure(key.clone(), FailureCode::DeviceLost)
             .unwrap();
         let projection = cache.quarantine_projection_for(&key);
         let mut other = gpu(&key);
@@ -666,6 +857,156 @@ mod tests {
         let mut fresh = vec![gpu(&key)];
         apply_quarantine_projection(&mut fresh, &retry_projection);
         assert_eq!(fresh[0].availability, CandidateAvailability::Available);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn content_and_caller_failures_cannot_mutate_quarantine_history() {
+        let root = temp_root("health-ineligible");
+        let path = root.join("health.json");
+        let clock = ManualClock::new(6_000_000);
+        let mut cache = HealthCache::open(&path, witnesses("ineligible"), &clock);
+        let key = key("ineligible");
+        assert_eq!(cache.decision(&key), HealthDecision::Available);
+        for observation in [
+            FailureObservation::InvalidInput,
+            FailureObservation::ArtifactCorruption,
+            FailureObservation::ModelCorruption,
+            FailureObservation::DecodeContent,
+            FailureObservation::Cancellation,
+            FailureObservation::PartialOutput,
+        ] {
+            assert_eq!(
+                cache
+                    .record_observed_failure(key.clone(), observation)
+                    .unwrap(),
+                None
+            );
+        }
+        assert!(!path.exists());
+        assert_eq!(cache.decision(&key), HealthDecision::Available);
+        for observation in [
+            FailureObservation::WorkerCrash,
+            FailureObservation::WorkerHang,
+            FailureObservation::ProviderInitialization,
+            FailureObservation::DriverFailure,
+            FailureObservation::DeviceLost,
+            FailureObservation::OutOfMemory,
+            FailureObservation::Protocol,
+        ] {
+            assert!(quarantine_eligible_code(observation).is_some());
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn two_instances_consume_exactly_one_retry_grant() {
+        let root = temp_root("health-concurrent-retry");
+        let path = root.join("health.json");
+        let clock = ManualClock::new(7_000_000);
+        let key = key("concurrent-retry");
+        let mut setup = HealthCache::open(&path, witnesses("concurrent-retry"), &clock);
+        setup
+            .record_provider_failure(key.clone(), FailureCode::WorkerCrash)
+            .unwrap();
+        assert!(setup.grant_explicit_retry(&key).unwrap());
+        let mut left = HealthCache::open(&path, witnesses("concurrent-retry"), &clock);
+        let mut right = HealthCache::open(&path, witnesses("concurrent-retry"), &clock);
+        let results = std::thread::scope(|scope| {
+            let left_key = key.clone();
+            let right_key = key.clone();
+            let left = scope.spawn(move || left.consume_explicit_retry(&left_key).unwrap());
+            let right = scope.spawn(move || right.consume_explicit_retry(&right_key).unwrap());
+            [left.join().unwrap(), right.join().unwrap()]
+        });
+        assert_eq!(results.into_iter().filter(|consumed| *consumed).count(), 1);
+        let observed = HealthCache::open(&path, witnesses("concurrent-retry"), &clock);
+        assert!(matches!(
+            observed.decision(&key),
+            HealthDecision::Quarantined { .. }
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn two_instances_do_not_lose_failure_or_probe_updates() {
+        let root = temp_root("health-concurrent-updates");
+        let path = root.join("health.json");
+        let clock = ManualClock::new(8_000_000);
+        let key = key("concurrent-updates");
+        let mut left = HealthCache::open(&path, witnesses("concurrent-updates"), &clock);
+        let mut right = HealthCache::open(&path, witnesses("concurrent-updates"), &clock);
+        std::thread::scope(|scope| {
+            let left_key = key.clone();
+            let right_key = key.clone();
+            scope.spawn(move || {
+                left.record_provider_failure(left_key, FailureCode::WorkerCrash)
+                    .unwrap()
+            });
+            scope.spawn(move || {
+                right
+                    .record_provider_failure(right_key, FailureCode::DriverFailure)
+                    .unwrap()
+            });
+        });
+        let observed = HealthCache::open(&path, witnesses("concurrent-updates"), &clock);
+        assert_eq!(observed.envelope.records[0].failure_count, 2);
+
+        let mut left = HealthCache::open(&path, witnesses("concurrent-updates"), &clock);
+        let mut right = HealthCache::open(&path, witnesses("concurrent-updates"), &clock);
+        let results = std::thread::scope(|scope| {
+            let left_key = key.clone();
+            let right_key = key.clone();
+            let left = scope.spawn(move || left.record_idle_probe_success(&left_key).unwrap());
+            let right = scope.spawn(move || right.record_idle_probe_success(&right_key).unwrap());
+            [left.join().unwrap(), right.join().unwrap()]
+        });
+        assert_eq!(results.into_iter().filter(|cleared| *cleared).count(), 1);
+        let observed = HealthCache::open(&path, witnesses("concurrent-updates"), &clock);
+        assert_eq!(observed.decision(&key), HealthDecision::Available);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn quarantine_projection_preserves_non_available_candidate_states() {
+        let root = temp_root("health-projection-composition");
+        let path = root.join("health.json");
+        let clock = ManualClock::new(9_000_000);
+        let key = key("composition");
+        let mut cache = HealthCache::open(&path, witnesses("composition"), &clock);
+        cache
+            .record_provider_failure(key.clone(), FailureCode::DeviceLost)
+            .unwrap();
+        let projection = cache.quarantine_projection_for(&key);
+        let states = [
+            CandidateAvailability::Available,
+            CandidateAvailability::Unaddressable,
+            CandidateAvailability::Incompatible,
+            CandidateAvailability::Unhealthy,
+            CandidateAvailability::Quarantined,
+        ];
+        let mut candidates = states
+            .into_iter()
+            .map(|availability| {
+                let mut candidate = gpu(&key);
+                candidate.availability = availability;
+                candidate
+            })
+            .collect::<Vec<_>>();
+        apply_quarantine_projection(&mut candidates, &projection);
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.availability)
+                .collect::<Vec<_>>(),
+            vec![
+                CandidateAvailability::Quarantined,
+                CandidateAvailability::Unaddressable,
+                CandidateAvailability::Incompatible,
+                CandidateAvailability::Unhealthy,
+                CandidateAvailability::Quarantined,
+            ]
+        );
         fs::remove_dir_all(root).unwrap();
     }
 }

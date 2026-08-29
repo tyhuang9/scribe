@@ -278,7 +278,10 @@ pub(crate) fn apply_quarantine_projection(
     projection: &dyn CandidateQuarantineProjection,
 ) {
     for candidate in candidates {
-        if candidate.target.backend.is_gpu() && projection.is_quarantined(&candidate.target) {
+        if candidate.availability == CandidateAvailability::Available
+            && candidate.target.backend.is_gpu()
+            && projection.is_quarantined(&candidate.target)
+        {
             candidate.availability = CandidateAvailability::Quarantined;
         }
     }
