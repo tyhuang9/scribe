@@ -257,6 +257,8 @@ fn static_gguf_and_native_onnx_are_the_only_inference_architectures() {
     assert!(worker.contains("OnnxBundle(OnnxModelSpec)"));
     assert!(worker.contains("OfflineRecognizer::create("));
     assert!(worker.contains("OnlineRecognizer::create("));
+    assert!(worker.contains("#[cfg(any(test, feature = \"inference-worker\"))]\nuse sherpa_onnx"));
+    assert!(worker.contains("ASR recognizers are unavailable in the desktop executable"));
     assert!(worker.contains("resolve_adjacent_inference_worker"));
     assert!(worker.contains("scribe-inference-worker{}"));
     assert!(worker.contains("INFERENCE_WORKER_FLAG"));
@@ -617,6 +619,7 @@ fn worker_roles_use_private_pipes_and_protocol_only_stdout() {
         "challenge",
         "app_build",
         "worker_build",
+        "bundled_worker_sha256",
         "abi",
         "role",
         "provider",
@@ -630,6 +633,20 @@ fn worker_roles_use_private_pipes_and_protocol_only_stdout() {
     assert!(worker.contains("Stdio::piped()"));
     assert!(worker.contains("std::io::stdout().lock()"));
     assert!(worker.contains("stderr(Stdio::inherit())"));
+    for launch_hardening in [
+        "configure_worker_environment(&mut command)",
+        "command.env_clear()",
+        "harden_windows_dll_search",
+        "SetDefaultDllDirectories",
+        "FILE_FLAG_OPEN_REPARSE_POINT",
+        "worker executable must not be a hardlink",
+        "executable.revalidate()",
+    ] {
+        assert!(
+            worker.contains(launch_hardening),
+            "worker launch hardening must retain {launch_hardening}"
+        );
+    }
     assert!(
         !worker
             .lines()
@@ -1252,6 +1269,8 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
     for required in [
         "cargo build --locked --offline --release --bin local-transcriber --features ui-harness --target $targetTriple",
         "cargo build --locked --offline --release --bin scribe-inference-worker --features inference-worker --target $targetTriple",
+        "Get-FileHash -Algorithm SHA256 -LiteralPath $sourceInferenceWorker",
+        "SCRIBE_BUNDLED_WORKER_SHA256",
         "scribe-inference-worker.exe",
         "x86_64-pc-windows-msvc",
         "CARGO_TARGET_DIR",

@@ -149,6 +149,12 @@ function Assert-ReleaseCargoFeatureContract([string]$ReleaseSource) {
         $ReleaseSource.Contains('vulkan-acceleration')) {
         throw 'Windows release packaging must build the desktop and CPU inference worker independently without enabling GPU or every Cargo feature.'
     }
+    Assert-OrderedWorkflowTokens $ReleaseSource @(
+        $expectedWorkerBuild,
+        'Get-FileHash -Algorithm SHA256 -LiteralPath $sourceInferenceWorker',
+        '$env:SCRIBE_BUNDLED_WORKER_SHA256',
+        $expectedDesktopBuild
+    ) 'bundled worker trust-anchor build order'
 }
 
 function Assert-VulkanSdkWorkflowContract([string]$Workflow) {

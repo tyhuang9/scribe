@@ -412,24 +412,34 @@ $modelSourcePath = Get-NormalizedFullPath $ModelSource
 Assert-NoReparseAncestors $modelSourcePath
 Assert-ExactFile $modelSourcePath ([int64]$modelManifest.size_bytes) $modelManifest.sha256
 
+$cargoReleaseRoot = Join-Path $cargoTargetRoot "$targetTriple\release"
+$sourceExecutable = Join-Path $cargoReleaseRoot "local-transcriber.exe"
+$sourceInferenceWorker = Join-Path $cargoReleaseRoot "scribe-inference-worker.exe"
+$previousWorkerSha256 = $env:SCRIBE_BUNDLED_WORKER_SHA256
 Push-Location $repositoryRoot
 try {
-    & cargo build --locked --offline --release --bin local-transcriber --features ui-harness --target $targetTriple --manifest-path (Join-Path $repositoryRoot "Cargo.toml")
-    if ($LASTEXITCODE -ne 0) {
-        throw "The locked offline Windows x64 desktop release build failed."
-    }
+    # The worker is built and hashed first. The desktop then embeds that exact
+    # SHA-256 as its bundled-worker trust anchor; this is intentionally separate
+    # from the future signed GPU pack catalog.
     & cargo build --locked --offline --release --bin scribe-inference-worker --features inference-worker --target $targetTriple --manifest-path (Join-Path $repositoryRoot "Cargo.toml")
     if ($LASTEXITCODE -ne 0) {
         throw "The locked offline Windows x64 CPU inference worker release build failed."
     }
+    Assert-Amd64Pe $sourceInferenceWorker
+    $env:SCRIBE_BUNDLED_WORKER_SHA256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $sourceInferenceWorker).Hash.ToLowerInvariant()
+    if ($env:SCRIBE_BUNDLED_WORKER_SHA256 -cnotmatch '^[0-9a-f]{64}$') {
+        throw "The CPU inference worker did not produce a valid SHA-256 trust anchor."
+    }
+    & cargo build --locked --offline --release --bin local-transcriber --features ui-harness --target $targetTriple --manifest-path (Join-Path $repositoryRoot "Cargo.toml")
+    if ($LASTEXITCODE -ne 0) {
+        throw "The locked offline Windows x64 desktop release build failed."
+    }
 }
 finally {
+    $env:SCRIBE_BUNDLED_WORKER_SHA256 = $previousWorkerSha256
     Pop-Location
 }
 
-$cargoReleaseRoot = Join-Path $cargoTargetRoot "$targetTriple\release"
-$sourceExecutable = Join-Path $cargoReleaseRoot "local-transcriber.exe"
-$sourceInferenceWorker = Join-Path $cargoReleaseRoot "scribe-inference-worker.exe"
 Assert-Amd64Pe $sourceExecutable
 Assert-WindowsGuiSubsystem $sourceExecutable
 $null = Assert-ReviewedWindowsPe $sourceExecutable
