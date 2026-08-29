@@ -2414,10 +2414,22 @@ pub(crate) enum PackStoreError {
     #[error("worker-pack store randomness failed: {0}")]
     Random(String),
     #[error("this platform has no supported atomic no-replace directory publication primitive")]
+    #[allow(
+        dead_code,
+        reason = "constructed only on platforms outside the supported Windows and Unix publish implementations"
+    )]
     UnsupportedAtomicPublish,
     #[error("this platform has no supported OS-backed file lock")]
+    #[allow(
+        dead_code,
+        reason = "constructed only on platforms outside the supported Windows and Unix lock implementations"
+    )]
     UnsupportedFileLock,
     #[error("this platform has no supported anchored filesystem operations")]
+    #[allow(
+        dead_code,
+        reason = "constructed only on platforms outside the supported Windows and Unix anchored filesystem implementations"
+    )]
     UnsupportedAnchoredFilesystem,
     #[error("worker-pack descriptor changed")]
     DescriptorChanged,

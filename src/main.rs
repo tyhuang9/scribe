@@ -5,6 +5,10 @@
 
 mod app;
 mod audio;
+#[allow(
+    dead_code,
+    reason = "provider-neutral qualification policy remains dormant until a production GPU provider ships"
+)]
 mod backend_policy;
 mod benchmark;
 mod branding;
@@ -16,6 +20,10 @@ mod diagnostics;
 mod disk_space;
 #[cfg(test)]
 mod embedded_runtime;
+#[allow(
+    dead_code,
+    reason = "Stage 3 compiles the sealed verifier and store before Stage 4 provisions production trust or discovery"
+)]
 mod gpu_worker_pack;
 mod history;
 mod history_playback;

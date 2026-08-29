@@ -797,8 +797,11 @@ fn native_runtime_ownership_is_confined_to_exact_owner_paths() {
 
 #[test]
 fn verified_worker_pack_stage_remains_fail_closed_and_provider_inert() {
+    let desktop = include_str!("main.rs");
     let module = include_str!("gpu_worker_pack/mod.rs");
+    let health = include_str!("gpu_worker_pack/health.rs");
     let manifest = include_str!("gpu_worker_pack/manifest.rs");
+    let store = include_str!("gpu_worker_pack/store.rs");
     let worker = include_str!("onnx_worker.rs");
     let documentation = include_str!("../docs/GPU_WORKER_PACKS.md");
     let production_manifest = production_source(manifest);
@@ -814,6 +817,20 @@ fn verified_worker_pack_stage_remains_fail_closed_and_provider_inert() {
         .nth(1)
         .and_then(|source| source.split('}').next())
         .is_some_and(|body| body.contains("None"));
+    for dormant_lint_reason in [
+        "provider-neutral qualification policy remains dormant until a production GPU provider ships",
+        "Stage 3 compiles the sealed verifier and store before Stage 4 provisions production trust or discovery",
+    ] {
+        assert!(desktop.contains(dormant_lint_reason));
+    }
+    assert!(registry_body.contains("ProductionPackRegistry::empty()"));
+    assert!(trust_root_is_empty);
+    for source in [desktop, module, health, manifest, store] {
+        assert!(
+            !source.contains("#![allow"),
+            "Stage 3 lint exceptions must remain module-scoped, never crate-wide"
+        );
+    }
     for required in [
         "trait ResolverHelloBindingBridge",
         "struct VerifiedPackLaunchBinding",
