@@ -1,3 +1,6 @@
+#![cfg(not(test))]
+#![allow(dead_code)]
+
 //! Dedicated native inference process.
 //!
 //! This binary is the only production target that includes GGUF and ASR ONNX
