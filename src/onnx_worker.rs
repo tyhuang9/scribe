@@ -23,6 +23,7 @@ use sherpa_onnx::{
     OnlineRecognizerConfig, OnlineStream, OnlineTransducerModelConfig,
 };
 
+use crate::backend_policy::{BackendSelection, BackendTarget};
 use crate::config;
 use crate::model_catalog::ArtifactFormat;
 use crate::prepared_audio::{PREPARED_SAMPLE_RATE, PreparedAudio};
@@ -63,6 +64,8 @@ const MAX_SUPPORTED_LANGUAGES: usize = 512;
 const MAX_DIAGNOSTIC_BYTES: usize = 16 * 1024;
 const MAX_ARCHITECTURE_BYTES: usize = 512;
 const MAX_WORKER_ERROR_BYTES: usize = 16 * 1024;
+const MAX_BACKEND_SELECTION_TARGETS: usize = 128;
+const MAX_BACKEND_IDENTITY_BYTES: usize = 1024;
 
 #[derive(Clone, Copy)]
 struct SupervisorDeadlines {
@@ -4454,6 +4457,65 @@ fn validate_wire_diagnostics(diagnostics: &WireRuntimeDiagnostics) -> Result<()>
     if let ComputeDevice::Gpu { name } = &diagnostics.resolved_acceleration.resolved {
         validate_bounded_string("GPU name", name, MAX_DIAGNOSTIC_BYTES)?;
     }
+    if let Some(selection) = &diagnostics.resolved_acceleration.selection {
+        validate_backend_selection(selection)?;
+    }
+    Ok(())
+}
+
+fn validate_backend_selection(selection: &BackendSelection) -> Result<()> {
+    let target_count = 1_usize
+        .checked_add(selection.fallback_targets.len())
+        .and_then(|count| count.checked_add(selection.fallback_history.len()))
+        .and_then(|count| count.checked_add(selection.skipped_targets.len()))
+        .ok_or_else(|| anyhow!("worker backend selection target count overflowed"))?;
+    if target_count > MAX_BACKEND_SELECTION_TARGETS {
+        bail!("worker backend selection contains too many targets");
+    }
+    validate_backend_target(&selection.target)?;
+    for target in &selection.fallback_targets {
+        validate_backend_target(target)?;
+    }
+    for fallback in &selection.fallback_history {
+        validate_backend_target(&fallback.target)?;
+    }
+    for skipped in &selection.skipped_targets {
+        validate_backend_target(&skipped.target)?;
+    }
+    Ok(())
+}
+
+fn validate_backend_target(target: &BackendTarget) -> Result<()> {
+    validate_nonempty_bounded_string(
+        "backend provider identity",
+        target.provider_id.as_str(),
+        MAX_BACKEND_IDENTITY_BYTES,
+    )?;
+    validate_nonempty_bounded_string(
+        "backend device identity",
+        target.device_id.as_str(),
+        MAX_BACKEND_IDENTITY_BYTES,
+    )?;
+    validate_nonempty_bounded_string(
+        "backend display name",
+        &target.display_name,
+        MAX_DIAGNOSTIC_BYTES,
+    )?;
+    if let Some(driver_version) = &target.driver_version {
+        validate_bounded_string(
+            "backend driver version",
+            driver_version,
+            MAX_BACKEND_IDENTITY_BYTES,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_nonempty_bounded_string(label: &str, value: &str, max_bytes: usize) -> Result<()> {
+    validate_bounded_string(label, value, max_bytes)?;
+    if value.trim().is_empty() {
+        bail!("{label} is empty");
+    }
     Ok(())
 }
 
@@ -4727,6 +4789,12 @@ fn offline_recognizer_config(model: &ValidatedOnnxModel) -> Result<OfflineRecogn
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend_policy::{
+        BackendCandidate, BackendFailureCategory, BackendFallback, BackendKind,
+        BackendQualificationPolicy, BackendSnapshot, BackendTarget, CandidateAvailability,
+        DeviceClass, DeviceIdentity, GpuVendor, OperatingSystem, PowerSource, ProviderIdentity,
+        select_backend,
+    };
     use crate::prepared_audio::PreparedAudio;
     use std::collections::VecDeque;
     use std::io::Cursor;
@@ -5870,6 +5938,135 @@ mod tests {
             Control::Error { message }
                 if message == "worker response exceeded the private protocol limit"
         ));
+    }
+
+    fn backend_target(backend: BackendKind, id: &str, index: Option<usize>) -> BackendTarget {
+        BackendTarget {
+            backend,
+            provider_id: ProviderIdentity::new(format!("test:{}", backend.label())),
+            driver_version: Some("test-driver-1".to_owned()),
+            device_id: DeviceIdentity::new(id),
+            display_name: format!("Test {} device", backend.label()),
+            vendor: if backend == BackendKind::Cuda {
+                GpuVendor::Nvidia
+            } else {
+                GpuVendor::Unknown
+            },
+            device_class: if backend.is_gpu() {
+                DeviceClass::DiscreteGpu
+            } else {
+                DeviceClass::Cpu
+            },
+            memory_total_bytes: 8 * 1024 * 1024 * 1024,
+            memory_available_bytes: 6 * 1024 * 1024 * 1024,
+            process_index: index,
+        }
+    }
+
+    fn diagnostics_with_typed_backend_selection() -> WireRuntimeDiagnostics {
+        let mut unhealthy = BackendCandidate::available(backend_target(
+            BackendKind::Vulkan,
+            "vulkan-unhealthy",
+            Some(3),
+        ));
+        unhealthy.availability = CandidateAvailability::Unhealthy;
+        let candidates = vec![
+            BackendCandidate::available(backend_target(BackendKind::Cuda, "cuda-primary", Some(1))),
+            BackendCandidate::available(backend_target(
+                BackendKind::Vulkan,
+                "vulkan-fallback",
+                Some(2),
+            )),
+            BackendCandidate::available(BackendTarget::cpu()),
+            unhealthy,
+        ];
+        let qualification_policy = BackendQualificationPolicy::qualify_all_for_testing(
+            OperatingSystem::Windows,
+            &candidates,
+        );
+        let mut selection = select_backend(
+            AccelerationPreference::Auto,
+            &BackendSnapshot {
+                operating_system: OperatingSystem::Windows,
+                power_source: PowerSource::Ac,
+                candidates,
+                qualification_policy,
+            },
+        )
+        .unwrap();
+        selection.fallback_history.push(BackendFallback {
+            target: backend_target(BackendKind::Cuda, "cuda-failed", Some(4)),
+            category: BackendFailureCategory::WorkerFailed,
+        });
+
+        WireRuntimeDiagnostics {
+            resolved_acceleration: ResolvedAcceleration {
+                requested: AccelerationPreference::Auto,
+                resolved: ComputeDevice::Gpu {
+                    name: "Test CUDA device".to_owned(),
+                },
+                diagnostic: None,
+                selection: Some(selection),
+            },
+            runtime_location: PathBuf::from("worker-runtime"),
+            warm_reused: false,
+            model_load_duration_ms: 42,
+        }
+    }
+
+    #[test]
+    fn typed_backend_selection_round_trips_within_worker_wire_bounds() {
+        let diagnostics = diagnostics_with_typed_backend_selection();
+        let durable_diagnostics: WireRuntimeDiagnostics =
+            serde_json::from_slice(&serde_json::to_vec(&diagnostics).unwrap()).unwrap();
+        validate_wire_diagnostics(&diagnostics).unwrap();
+        let response = Control::RuntimeLoaded {
+            execution: WireRuntimeLoadExecution {
+                diagnostics: diagnostics.clone(),
+                detected_architecture: "whisper".to_owned(),
+                capabilities: RuntimeCapabilities::default(),
+            },
+        };
+        validate_worker_response(&response).unwrap();
+        let frame = control_frame(7, 9, &response).unwrap();
+        assert!(frame.body.len() < MAX_CONTROL_BYTES);
+
+        let (session_id, request_id, decoded) = parse_worker_control(frame).unwrap();
+        assert_eq!((session_id, request_id), (7, 9));
+        let Control::RuntimeLoaded { execution } = decoded else {
+            panic!("expected a runtime-loaded worker response");
+        };
+        assert_eq!(execution.diagnostics, durable_diagnostics);
+        assert_eq!(
+            execution
+                .diagnostics
+                .resolved_acceleration
+                .selection
+                .as_ref()
+                .unwrap()
+                .target
+                .process_index,
+            None
+        );
+
+        let mut oversized_identity = diagnostics.clone();
+        oversized_identity
+            .resolved_acceleration
+            .selection
+            .as_mut()
+            .unwrap()
+            .target
+            .device_id = DeviceIdentity::new("x".repeat(MAX_BACKEND_IDENTITY_BYTES + 1));
+        assert!(validate_wire_diagnostics(&oversized_identity).is_err());
+
+        let mut too_many_targets = diagnostics;
+        let selection = too_many_targets
+            .resolved_acceleration
+            .selection
+            .as_mut()
+            .unwrap();
+        selection.fallback_targets = vec![selection.target.clone(); MAX_BACKEND_SELECTION_TARGETS];
+        assert!(validate_wire_diagnostics(&too_many_targets).is_err());
     }
 
     #[test]
