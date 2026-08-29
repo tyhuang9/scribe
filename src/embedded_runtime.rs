@@ -435,10 +435,12 @@ fn native_backend_candidate_for_backend(
     device: Device,
     backend: BackendKind,
 ) -> Option<BackendCandidate> {
-    let provider_id = ProviderIdentity::new(format!(
-        "transcribe-cpp:{}",
-        backend.label().to_ascii_lowercase()
-    ));
+    let provider_id = ProviderIdentity::new(match backend {
+        BackendKind::Cuda => "transcribe-cpp-ggml-cuda",
+        BackendKind::Vulkan => "transcribe-cpp-ggml-vulkan",
+        BackendKind::Metal => "transcribe-cpp-ggml-metal",
+        BackendKind::Cpu => "transcribe-cpp:cpu",
+    });
     let vendor = match backend {
         BackendKind::Cuda => GpuVendor::Nvidia,
         BackendKind::Metal => GpuVendor::Apple,
@@ -995,6 +997,10 @@ mod tests {
         let candidate = native_backend_candidate(native).unwrap();
 
         assert_eq!(candidate.target.backend, BackendKind::Vulkan);
+        assert_eq!(
+            candidate.target.provider_id.as_str(),
+            "transcribe-cpp-ggml-vulkan"
+        );
         assert_eq!(candidate.target.vendor, GpuVendor::Nvidia);
         assert_eq!(candidate.target.device_class, DeviceClass::DiscreteGpu);
         assert_eq!(
@@ -1275,7 +1281,7 @@ mod tests {
         let mut backend_changed = base.clone();
         backend_changed.candidates[0].target.backend = BackendKind::Cuda;
         backend_changed.candidates[0].target.provider_id =
-            ProviderIdentity::new("transcribe-cpp:cuda");
+            ProviderIdentity::new("transcribe-cpp-ggml-cuda");
         backend_changed.qualification_policy = BackendQualificationPolicy::qualify_all_for_testing(
             backend_changed.operating_system,
             &backend_changed.candidates,
