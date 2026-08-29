@@ -87,6 +87,8 @@ const MAX_WORKER_ERROR_BYTES: usize = 16 * 1024;
 const MAX_BACKEND_SELECTION_TARGETS: usize = 128;
 const MAX_BACKEND_IDENTITY_BYTES: usize = 1024;
 const MAX_PACK_DEVICES: usize = 16;
+const MAX_GPU_PROVIDER_PROBES: usize = 8;
+const GPU_PROVIDER_DISCOVERY_BUDGET: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Copy)]
 struct SupervisorDeadlines {
@@ -134,25 +136,35 @@ impl Default for VadDeadlines {
 struct MonotonicDeadline {
     expires_at: Instant,
     budget: Duration,
+    label: &'static str,
 }
 
 impl MonotonicDeadline {
     fn after(budget: Duration) -> Result<Self> {
+        Self::after_for(budget, "Silero VAD acquisition")
+    }
+
+    fn after_for(budget: Duration, label: &'static str) -> Result<Self> {
         if budget.is_zero() {
-            bail!("Silero VAD acquisition budget must be positive");
+            bail!("{label} budget must be positive");
         }
         let started = Instant::now();
         let expires_at = started
             .checked_add(budget)
-            .ok_or_else(|| anyhow!("Silero VAD acquisition deadline overflowed"))?;
-        Ok(Self { expires_at, budget })
+            .ok_or_else(|| anyhow!("{label} deadline overflowed"))?;
+        Ok(Self {
+            expires_at,
+            budget,
+            label,
+        })
     }
 
     fn remaining(self) -> Result<Duration> {
         let remaining = self.expires_at.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             bail!(
-                "Silero VAD acquisition deadline exceeded after {} ms",
+                "{} deadline exceeded after {} ms",
+                self.label,
                 self.budget.as_millis()
             );
         }
@@ -3698,7 +3710,7 @@ impl ProcessWorkerSupervisor {
                 Err(error) => {
                     self.invalidate_generation(
                         generation,
-                        "Silero VAD acquisition deadline expired before Hello",
+                        &format!("{} deadline expired before Hello", deadline.label),
                         true,
                     )?;
                     return Err(error);
@@ -4100,15 +4112,23 @@ impl ProcessWorkerSupervisor {
     }
 
     fn current_pack_bindings(&self) -> Result<Vec<VerifiedPackLaunchBinding>> {
-        self.ensure_generation()?;
+        let generation = self.ensure_generation()?;
+        self.pack_bindings_for_generation(generation)
+    }
+
+    fn pack_bindings_for_generation(
+        &self,
+        generation: u64,
+    ) -> Result<Vec<VerifiedPackLaunchBinding>> {
         self.inner
             .state
             .lock()
             .map_err(|_| anyhow!("process worker supervisor state lock was poisoned"))?
             .current
             .as_ref()
+            .filter(|current| current.generation == generation)
             .map(|current| current.pack_bindings.clone())
-            .ok_or_else(|| anyhow!("process worker generation is unavailable"))
+            .ok_or_else(|| anyhow!("process worker generation {generation} is unavailable"))
     }
 
     fn write_frames(&self, generation: u64, frames: &[Frame]) -> Result<()> {
@@ -5058,6 +5078,20 @@ impl InferenceWorkerSupervisor {
         Ok(bindings)
     }
 
+    fn verified_pack_bindings_before(
+        &self,
+        deadline: MonotonicDeadline,
+    ) -> Result<Vec<VerifiedPackLaunchBinding>> {
+        let generation = self
+            .transport
+            .ensure_generation_before(Some(deadline), None)?;
+        let bindings = self.transport.pack_bindings_for_generation(generation)?;
+        if bindings.is_empty() {
+            bail!("inference worker did not produce a verified pack binding");
+        }
+        Ok(bindings)
+    }
+
     fn reconcile_verified_pack_diagnostics(
         &self,
         resolved: &mut ResolvedAcceleration,
@@ -5621,25 +5655,47 @@ pub(crate) struct InferenceWorkerRegistry {
     gpu_routes_for_testing: Option<VerifiedGpuRouteCatalog>,
 }
 
-fn discover_production_pack_launch_bindings(
-    discovery: crate::gpu_worker_pack::PackLeaseDiscovery,
+struct PendingPackProbe {
+    pack_id: crate::gpu_worker_pack::manifest::StoreComponent,
+    backend: crate::gpu_worker_pack::manifest::PackBackend,
+    supervisor: InferenceWorkerSupervisor,
+}
+
+fn discover_pack_launch_bindings_with_budget(
+    probes: Vec<PendingPackProbe>,
+    mut diagnostics: Vec<crate::gpu_worker_pack::PackDiscoveryDiagnostic>,
+    budget: Duration,
 ) -> crate::gpu_worker_pack::ProductionPackRegistry {
     use crate::gpu_worker_pack::{PackDiscoveryDiagnostic, PackDiscoveryIssue};
 
-    let mut diagnostics = discovery.diagnostics;
+    let deadline = match MonotonicDeadline::after_for(budget, "GPU provider discovery") {
+        Ok(deadline) => deadline,
+        Err(_) => {
+            diagnostics.push(PackDiscoveryDiagnostic::catalog(
+                PackDiscoveryIssue::ProviderProbeRejected,
+            ));
+            return crate::gpu_worker_pack::ProductionPackRegistry::empty()
+                .with_diagnostics(diagnostics);
+        }
+    };
     let mut bindings = Vec::new();
-    for lease in discovery.leases.into_iter().take(8) {
-        let pack_id = lease.verified_pack().pack_id.clone();
-        let backend = lease.verified_pack().backend;
-        let supervisor = InferenceWorkerSupervisor::for_pack_probe(lease);
-        match supervisor.verified_pack_bindings() {
+    for probe in probes.into_iter().take(MAX_GPU_PROVIDER_PROBES) {
+        if deadline.remaining().is_err() {
+            diagnostics.push(PackDiscoveryDiagnostic::pack(
+                PackDiscoveryIssue::ProviderProbeRejected,
+                &probe.pack_id,
+                probe.backend,
+            ));
+            continue;
+        }
+        match probe.supervisor.verified_pack_bindings_before(deadline) {
             Ok(observed) => {
                 for binding in observed {
                     if binding.backend_target().driver_version.is_none() {
                         diagnostics.push(PackDiscoveryDiagnostic::pack(
                             PackDiscoveryIssue::DriverVersionUnavailable,
-                            &pack_id,
-                            backend,
+                            &probe.pack_id,
+                            probe.backend,
                         ));
                     } else {
                         bindings.push(binding);
@@ -5648,14 +5704,40 @@ fn discover_production_pack_launch_bindings(
             }
             Err(_) => diagnostics.push(PackDiscoveryDiagnostic::pack(
                 PackDiscoveryIssue::ProviderProbeRejected,
-                &pack_id,
-                backend,
+                &probe.pack_id,
+                probe.backend,
             )),
         }
-        let _ = supervisor.shutdown();
+        if probe.supervisor.retire().is_err() {
+            diagnostics.push(PackDiscoveryDiagnostic::pack(
+                PackDiscoveryIssue::ProviderProbeRejected,
+                &probe.pack_id,
+                probe.backend,
+            ));
+        }
     }
     crate::gpu_worker_pack::ProductionPackRegistry::from_launch_bindings(bindings)
         .with_diagnostics(diagnostics)
+}
+
+fn discover_production_pack_launch_bindings(
+    discovery: crate::gpu_worker_pack::PackLeaseDiscovery,
+) -> crate::gpu_worker_pack::ProductionPackRegistry {
+    let probes = discovery
+        .leases
+        .into_iter()
+        .take(MAX_GPU_PROVIDER_PROBES)
+        .map(|lease| PendingPackProbe {
+            pack_id: lease.verified_pack().pack_id.clone(),
+            backend: lease.verified_pack().backend,
+            supervisor: InferenceWorkerSupervisor::for_pack_probe(lease),
+        })
+        .collect();
+    discover_pack_launch_bindings_with_budget(
+        probes,
+        discovery.diagnostics,
+        GPU_PROVIDER_DISCOVERY_BUDGET,
+    )
 }
 
 fn append_pack_diagnostic(resolved: &mut ResolvedAcceleration, diagnostic: Option<&str>) {
@@ -10743,6 +10825,79 @@ mod tests {
             ),
             GpuRouteCatalogLookup::Successful(catalog) if catalog.routes.len() == 2
         ));
+    }
+
+    #[test]
+    fn provider_discovery_uses_one_budget_and_retires_a_hung_probe() {
+        let (hello_started_tx, hello_started_rx) = channel();
+        let (kill_started_tx, kill_started_rx) = channel();
+        let (reaped_tx, reaped_rx) = channel();
+        let first_launcher = Arc::new(
+            TestLauncher::new([TestMode::BlockedHello {
+                started: hello_started_tx,
+            }])
+            .with_process_events(kill_started_tx, reaped_tx),
+        );
+        let (second_started_tx, _second_started_rx) = channel();
+        let second_launcher = Arc::new(TestLauncher::new([TestMode::BlockedHello {
+            started: second_started_tx,
+        }]));
+        let supervisor = |launcher: Arc<TestLauncher>| InferenceWorkerSupervisor {
+            transport: ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+                launcher,
+                short_deadlines(),
+            ),
+            next_correlation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        };
+        let probes = vec![
+            PendingPackProbe {
+                pack_id: crate::gpu_worker_pack::manifest::StoreComponent::new(
+                    "scribe-cuda-windows-x64",
+                )
+                .unwrap(),
+                backend: PackBackend::Cuda,
+                supervisor: supervisor(Arc::clone(&first_launcher)),
+            },
+            PendingPackProbe {
+                pack_id: crate::gpu_worker_pack::manifest::StoreComponent::new(
+                    "scribe-vulkan-windows-x64",
+                )
+                .unwrap(),
+                backend: PackBackend::Vulkan,
+                supervisor: supervisor(Arc::clone(&second_launcher)),
+            },
+        ];
+        let budget = Duration::from_millis(80);
+        let started_at = Instant::now();
+
+        let registry = discover_pack_launch_bindings_with_budget(probes, Vec::new(), budget);
+
+        let elapsed = started_at.elapsed();
+        assert!(elapsed >= budget);
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "aggregate discovery exceeded its bounded cleanup allowance: {elapsed:?}"
+        );
+        hello_started_rx.try_recv().unwrap();
+        kill_started_rx
+            .recv_timeout(Duration::from_millis(100))
+            .unwrap();
+        reaped_rx.recv_timeout(Duration::from_millis(100)).unwrap();
+        assert_eq!(first_launcher.launches.load(Ordering::Acquire), 1);
+        assert_eq!(second_launcher.launches.load(Ordering::Acquire), 0);
+        let (bindings, diagnostics) = registry.into_parts();
+        assert!(bindings.is_empty());
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|diagnostic| {
+                    diagnostic.issue
+                        == crate::gpu_worker_pack::PackDiscoveryIssue::ProviderProbeRejected
+                })
+                .count(),
+            2,
+            "the timed-out active probe and skipped remaining probe are both diagnosed"
+        );
     }
 
     #[test]
