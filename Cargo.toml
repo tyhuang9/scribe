@@ -6,6 +6,7 @@ edition = "2024"
 [features]
 ui-harness = []
 inference-worker = ["dep:transcribe-cpp"]
+cuda-acceleration = ["inference-worker", "transcribe-cpp/cuda"]
 vulkan-acceleration = ["inference-worker", "transcribe-cpp/vulkan"]
 
 [dependencies]

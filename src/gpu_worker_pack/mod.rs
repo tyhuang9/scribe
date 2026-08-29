@@ -8,8 +8,15 @@ pub(crate) mod health;
 pub(crate) mod manifest;
 pub(crate) mod store;
 
+use std::fs;
+use std::sync::Arc;
+
+use serde::Deserialize;
+
 // Stage 4 consumes the bridge re-export; Stage 3's production registry is
 // deliberately empty, so the non-test binary has no implementation yet.
+#[cfg(unix)]
+pub(crate) use launch_binding::UnixPackExecAuthority;
 #[allow(unused_imports)]
 pub(crate) use launch_binding::{ResolverHelloBindingBridge, VerifiedPackLaunchBinding};
 
@@ -193,6 +200,10 @@ mod launch_binding {
             &self.verified_pack_lease
         }
 
+        pub(crate) fn verified_pack_lease_arc(&self) -> Arc<VerifiedPackLease> {
+            Arc::clone(&self.verified_pack_lease)
+        }
+
         pub(crate) fn stable_device_identity(&self) -> &str {
             &self.stable_device_identity
         }
@@ -252,12 +263,142 @@ impl ProductionPackRegistry {
     pub(crate) fn is_empty(&self) -> bool {
         self.bindings.is_empty()
     }
+
+    pub(crate) fn into_bindings(self) -> Vec<VerifiedPackLaunchBinding> {
+        self.bindings
+    }
 }
 
 /// Production discovery remains fail closed until a persistent signing key and
 /// declared pack catalog are provisioned by a later release stage.
 pub(crate) fn production_registry() -> ProductionPackRegistry {
     ProductionPackRegistry::empty()
+}
+
+const PACK_CATALOG_NAME: &str = "worker-pack-catalog.json";
+const MAX_PACK_CATALOG_BYTES: u64 = 512 * 1024;
+const MAX_PRODUCTION_PACKS: usize = 8;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PackCatalog {
+    schema_version: u16,
+    packs: Vec<PackCatalogEntry>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PackCatalogEntry {
+    pack_id: manifest::StoreComponent,
+    pack_version: manifest::StoreComponent,
+    pack_digest: String,
+    security_epoch: u64,
+    runtime_abi_version: u16,
+    backend: manifest::PackBackend,
+    provider: String,
+    target_os: String,
+    target_arch: String,
+    worker_relative_path: String,
+    root: String,
+    installed_size_bytes: u64,
+    compressed_size_bytes: u64,
+    files: Vec<String>,
+}
+
+/// Verifies the bounded installed catalog and returns retained pack leases.
+/// It never loads a provider or creates launch authority. A malformed catalog,
+/// absent production trust key, or incompatible pack projects to no GPU route.
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub(crate) fn discover_production_pack_leases() -> Vec<Arc<manifest::VerifiedPackLease>> {
+    discover_pack_leases_from_current_install().unwrap_or_default()
+}
+
+#[cfg(not(all(windows, target_arch = "x86_64")))]
+pub(crate) fn discover_production_pack_leases() -> Vec<Arc<manifest::VerifiedPackLease>> {
+    Vec::new()
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn discover_pack_leases_from_current_install()
+-> Result<Vec<Arc<manifest::VerifiedPackLease>>, String> {
+    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    let install_root = executable
+        .parent()
+        .ok_or_else(|| "Scribe executable has no install root".to_owned())?;
+    let catalog_path = install_root.join(PACK_CATALOG_NAME);
+    let metadata = fs::symlink_metadata(&catalog_path).map_err(|error| error.to_string())?;
+    if !metadata.is_file() || metadata.len() > MAX_PACK_CATALOG_BYTES {
+        return Err("worker-pack catalog is absent, linked, or oversized".to_owned());
+    }
+    let bytes = fs::read(&catalog_path).map_err(|error| error.to_string())?;
+    let catalog: PackCatalog = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    if catalog.schema_version != 1 || catalog.packs.len() > MAX_PRODUCTION_PACKS {
+        return Err("worker-pack catalog schema or count is invalid".to_owned());
+    }
+    let packs_root = install_root.join("workers").join("packs");
+    let verifier = manifest::PackVerifier::new(
+        &manifest::ProductionTrustRoot,
+        manifest::Compatibility::current(&[
+            manifest::PackBackend::Cuda,
+            manifest::PackBackend::Vulkan,
+        ]),
+    );
+    let mut leases = Vec::new();
+    for entry in catalog.packs {
+        if entry.target_os != "windows"
+            || entry.target_arch != "x86_64"
+            || entry.runtime_abi_version != manifest::RUNTIME_ABI_VERSION
+            || entry.installed_size_bytes == 0
+            || entry.compressed_size_bytes == 0
+            || entry.files.len() < 3
+            || entry.files.len() > manifest::MAX_FILES + 2
+        {
+            continue;
+        }
+        let relative_root = format!(
+            "workers/packs/{}/{}/{}",
+            entry.pack_id.as_str(),
+            entry.pack_version.as_str(),
+            entry.pack_digest
+        );
+        if entry.root != relative_root {
+            continue;
+        }
+        let Ok(pinned) = manifest::PinnedPackRoot::open(
+            &packs_root,
+            [&entry.pack_id, &entry.pack_version],
+            &entry.pack_digest,
+        ) else {
+            continue;
+        };
+        let Ok(lease) = verifier.verify_pinned(pinned) else {
+            continue;
+        };
+        let observed = lease.verified_pack();
+        let expected_files = lease
+            .copy_entries()
+            .iter()
+            .map(|file| format!("{relative_root}/{}", file.path))
+            .collect::<Vec<_>>();
+        let mut catalog_files = entry.files;
+        catalog_files.sort();
+        if observed.pack_id != entry.pack_id
+            || observed.pack_version != entry.pack_version
+            || observed.pack_digest != entry.pack_digest
+            || observed.security_epoch != entry.security_epoch
+            || observed.runtime_abi_version != entry.runtime_abi_version
+            || observed.backend != entry.backend
+            || observed.provider != entry.provider
+            || observed.target_os != entry.target_os
+            || observed.target_arch != entry.target_arch
+            || observed.worker_relative_path != entry.worker_relative_path
+            || catalog_files != expected_files
+        {
+            continue;
+        }
+        leases.push(Arc::new(lease));
+    }
+    Ok(leases)
 }
 
 /// Private packaging entrypoint. Stage 3's empty production trust root means a

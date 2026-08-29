@@ -1354,7 +1354,7 @@ pub(crate) enum PackVerificationError {
 }
 
 #[cfg(test)]
-pub(super) mod test_support {
+pub(crate) mod test_support {
     use super::*;
     use ring::signature::{Ed25519KeyPair, KeyPair};
     use std::time::{SystemTime, UNIX_EPOCH};

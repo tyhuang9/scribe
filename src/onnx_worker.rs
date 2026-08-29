@@ -14,8 +14,12 @@ use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 
-use crate::backend_policy::{BackendSelection, BackendTarget};
+use crate::backend_policy::{BackendKind, BackendSelection, BackendTarget, DeviceClass, GpuVendor};
 use crate::config;
+use crate::gpu_worker_pack::manifest::{
+    PackBackend, PackVerifier, ProductionTrustRoot, VerifiedPackLease,
+};
+use crate::gpu_worker_pack::{ResolverHelloBindingBridge, VerifiedPackLaunchBinding};
 use crate::model_catalog::ArtifactFormat;
 use crate::prepared_audio::{PREPARED_SAMPLE_RATE, PreparedAudio};
 use crate::runtime_artifact::{
@@ -65,6 +69,14 @@ const VAD_WORKER_BUILD_ID: &str = concat!(
     env!("SCRIBE_BUILD_REVISION")
 );
 const PARENT_LIVENESS_ENV: &str = "SCRIBE_PRIVATE_PARENT_LIVENESS";
+const PACK_ID_ENV: &str = "SCRIBE_PRIVATE_PACK_ID";
+const PACK_VERSION_ENV: &str = "SCRIBE_PRIVATE_PACK_VERSION";
+const PACK_DIGEST_ENV: &str = "SCRIBE_PRIVATE_PACK_DIGEST";
+const PACK_SECURITY_EPOCH_ENV: &str = "SCRIBE_PRIVATE_PACK_SECURITY_EPOCH";
+const PACK_RUNTIME_ABI_ENV: &str = "SCRIBE_PRIVATE_PACK_RUNTIME_ABI";
+const PACK_BACKEND_ENV: &str = "SCRIBE_PRIVATE_PACK_BACKEND";
+const PACK_PROVIDER_ENV: &str = "SCRIBE_PRIVATE_PACK_PROVIDER";
+const PACK_DEVICE_ID_ENV: &str = "SCRIBE_PRIVATE_PACK_DEVICE_ID";
 const PARENT_CONTROL_CANCEL: u8 = b'C';
 const HEADER_LEN: usize = 26;
 const MAX_CONTROL_BYTES: usize = 256 * 1024;
@@ -718,6 +730,8 @@ struct SpawnedWorker {
     stdin: Box<dyn Write + Send>,
     stdout: Box<dyn Read + Send>,
     process: Arc<dyn WorkerProcess>,
+    expectation: WorkerExpectation,
+    pack_launch: Option<PackLaunchContext>,
 }
 
 trait WorkerLauncher: Send + Sync {
@@ -750,7 +764,9 @@ fn compiled_worker_provider(role: WorkerRole) -> WorkerProvider {
     if role == WorkerRole::Vad {
         return WorkerProvider::Cpu;
     }
-    if cfg!(feature = "vulkan-acceleration") {
+    if cfg!(feature = "cuda-acceleration") {
+        WorkerProvider::Cuda
+    } else if cfg!(feature = "vulkan-acceleration") {
         WorkerProvider::Vulkan
     } else {
         WorkerProvider::Cpu
@@ -781,6 +797,34 @@ struct WorkerExpectation {
     abi: u16,
     role: WorkerRole,
     provider: WorkerProvider,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pack: Option<WorkerPackExpectation>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkerPackExpectation {
+    pack_id: String,
+    pack_version: String,
+    pack_digest: String,
+    security_epoch: u64,
+    runtime_abi: u16,
+    backend: WorkerProvider,
+    provider: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkerPackCapability {
+    expectation: WorkerPackExpectation,
+    stable_device_identity: String,
+    process_index: usize,
+    display_name: String,
+    driver_version: Option<String>,
+    device_class: DeviceClass,
+    vendor: GpuVendor,
+    memory_total_bytes: u64,
+    memory_available_bytes: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -794,6 +838,8 @@ struct WorkerCapability {
     role: WorkerRole,
     provider: WorkerProvider,
     artifacts: Vec<WorkerArtifactTarget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pack: Option<WorkerPackCapability>,
 }
 
 fn expected_worker(role: WorkerRole) -> WorkerExpectation {
@@ -812,6 +858,7 @@ fn expected_worker(role: WorkerRole) -> WorkerExpectation {
         abi: WORKER_ABI_VERSION,
         role,
         provider: compiled_worker_provider(role),
+        pack: None,
     }
 }
 
@@ -862,6 +909,154 @@ fn worker_capability(role: WorkerRole, challenge: String) -> Result<WorkerCapabi
         role,
         provider: compiled_worker_provider(role),
         artifacts,
+        pack: worker_pack_capability(role)?,
+    })
+}
+
+fn worker_pack_expectation_from_private_env() -> Result<Option<WorkerPackExpectation>> {
+    let names = [
+        PACK_ID_ENV,
+        PACK_VERSION_ENV,
+        PACK_DIGEST_ENV,
+        PACK_SECURITY_EPOCH_ENV,
+        PACK_RUNTIME_ABI_ENV,
+        PACK_BACKEND_ENV,
+        PACK_PROVIDER_ENV,
+    ];
+    let fields = names
+        .iter()
+        .map(std::env::var)
+        .collect::<Vec<std::result::Result<String, std::env::VarError>>>();
+    if fields.iter().all(|field| field.is_err()) {
+        return Ok(None);
+    }
+    if fields.iter().any(Result::is_err) {
+        bail!("GPU worker pack build identity is incomplete");
+    }
+    let fields = fields
+        .into_iter()
+        .map(|field| field.expect("checked above"))
+        .collect::<Vec<_>>();
+    let backend = match fields[5].as_str() {
+        "cuda" => WorkerProvider::Cuda,
+        "vulkan" => WorkerProvider::Vulkan,
+        "metal" => WorkerProvider::Metal,
+        _ => bail!("GPU worker pack backend is invalid"),
+    };
+    if backend != compiled_worker_provider(WorkerRole::Inference) {
+        bail!("GPU worker pack backend does not match the compiled provider");
+    }
+    Ok(Some(WorkerPackExpectation {
+        pack_id: fields[0].clone(),
+        pack_version: fields[1].clone(),
+        pack_digest: fields[2].clone(),
+        security_epoch: fields[3]
+            .parse()
+            .context("GPU worker pack security epoch is invalid")?,
+        runtime_abi: fields[4]
+            .parse()
+            .context("GPU worker pack runtime ABI is invalid")?,
+        backend,
+        provider: fields[6].clone(),
+    }))
+}
+
+#[cfg(feature = "inference-worker")]
+fn worker_pack_capability(role: WorkerRole) -> Result<Option<WorkerPackCapability>> {
+    use transcribe_cpp::DeviceType;
+
+    let Some(expectation) = worker_pack_expectation_from_private_env()? else {
+        return Ok(None);
+    };
+    if role != WorkerRole::Inference {
+        bail!("only the inference role may advertise a GPU worker pack");
+    }
+    transcribe_cpp::init_backends_default()
+        .context("could not initialize the compiled GPU provider for Hello")?;
+    let expected_kind = match expectation.backend {
+        WorkerProvider::Cuda => "cuda",
+        WorkerProvider::Vulkan => "vulkan",
+        WorkerProvider::Metal => "metal",
+        WorkerProvider::Cpu => bail!("CPU is not a GPU worker-pack backend"),
+    };
+    let expected_device_id = std::env::var(PACK_DEVICE_ID_ENV).ok();
+    let mut devices = transcribe_cpp::devices()
+        .into_iter()
+        .filter(|device| device.kind.trim().eq_ignore_ascii_case(expected_kind))
+        .filter_map(|device| {
+            let process_index = device.index?;
+            let native_id = device.device_id.as_deref()?.trim();
+            if native_id.is_empty() || !native_id.is_ascii() {
+                return None;
+            }
+            let stable_device_identity = format!("native:{}", native_id.to_ascii_lowercase());
+            let display_name = [&device.description, &device.name]
+                .into_iter()
+                .map(|value| value.trim())
+                .find(|value| !value.is_empty() && value.is_ascii())?
+                .to_owned();
+            let device_class = match device.device_type {
+                DeviceType::Gpu if expectation.backend == WorkerProvider::Metal => {
+                    DeviceClass::UnifiedGpu
+                }
+                DeviceType::Gpu => DeviceClass::DiscreteGpu,
+                DeviceType::Igpu if expectation.backend == WorkerProvider::Metal => {
+                    DeviceClass::UnifiedGpu
+                }
+                DeviceType::Igpu => DeviceClass::IntegratedGpu,
+                DeviceType::Unknown => DeviceClass::Unknown,
+                DeviceType::Cpu | DeviceType::Accel => return None,
+            };
+            let normalized = format!("{} {}", device.name, device.description).to_ascii_lowercase();
+            let vendor = match expectation.backend {
+                WorkerProvider::Cuda => GpuVendor::Nvidia,
+                WorkerProvider::Metal => GpuVendor::Apple,
+                WorkerProvider::Vulkan if normalized.contains("nvidia") => GpuVendor::Nvidia,
+                WorkerProvider::Vulkan
+                    if normalized.contains("amd") || normalized.contains("radeon") =>
+                {
+                    GpuVendor::Amd
+                }
+                WorkerProvider::Vulkan if normalized.contains("intel") => GpuVendor::Intel,
+                WorkerProvider::Vulkan => GpuVendor::Other,
+                WorkerProvider::Cpu => GpuVendor::Unknown,
+            };
+            Some(WorkerPackCapability {
+                expectation: expectation.clone(),
+                stable_device_identity,
+                process_index,
+                display_name,
+                driver_version: None,
+                device_class,
+                vendor,
+                memory_total_bytes: device.memory_total,
+                memory_available_bytes: device.memory_free.min(device.memory_total),
+            })
+        })
+        .filter(|device| {
+            expected_device_id
+                .as_deref()
+                .is_none_or(|expected| expected == device.stable_device_identity)
+        })
+        .collect::<Vec<_>>();
+    devices.sort_by(|left, right| {
+        left.stable_device_identity
+            .cmp(&right.stable_device_identity)
+    });
+    devices
+        .into_iter()
+        .next()
+        .map(Some)
+        .ok_or_else(|| anyhow!("compiled GPU provider reported no addressable stable device"))
+}
+
+#[cfg(not(feature = "inference-worker"))]
+fn worker_pack_capability(_role: WorkerRole) -> Result<Option<WorkerPackCapability>> {
+    worker_pack_expectation_from_private_env().and_then(|pack| {
+        if pack.is_some() {
+            bail!("desktop process cannot advertise a GPU worker pack")
+        }
+        Ok(None)
     })
 }
 
@@ -904,6 +1099,7 @@ fn validate_worker_capability(
         || capability.abi != expected.abi
         || capability.role != expected.role
         || capability.provider != expected.provider
+        || capability.pack.as_ref().map(|pack| &pack.expectation) != expected.pack.as_ref()
     {
         bail!("worker capability is incompatible with the requesting application");
     }
@@ -934,7 +1130,8 @@ fn validate_worker_hello(
         bail!("worker handshake challenge must be 32 random bytes encoded as hexadecimal");
     }
     let actual_role = role.unwrap_or(expected.role);
-    let local = expected_worker(actual_role);
+    let mut local = expected_worker(actual_role);
+    local.pack = worker_pack_expectation_from_private_env()?;
     // Final-image verification is directional: the parent owns the verified
     // executable descriptor and digest. The child validates the protocol and
     // build contract but does not compare the parent-supplied digest against a
@@ -944,6 +1141,7 @@ fn validate_worker_hello(
         || expected.abi != local.abi
         || expected.role != local.role
         || expected.provider != local.provider
+        || expected.pack != local.pack
     {
         bail!("worker handshake expectation is incompatible with this worker");
     }
@@ -1435,6 +1633,124 @@ struct WorkerExecutableIdentity {
     inode: u64,
 }
 
+#[derive(Clone, Debug)]
+struct PackLaunchContext {
+    lease: Arc<VerifiedPackLease>,
+    expectation: WorkerPackExpectation,
+    expected_device: Option<BackendTarget>,
+}
+
+struct BoundPackHelloBridge<'a> {
+    context: &'a PackLaunchContext,
+    capability: &'a WorkerPackCapability,
+}
+
+impl ResolverHelloBindingBridge for BoundPackHelloBridge<'_> {
+    fn resolver_verified_pack_lease(&self) -> Arc<VerifiedPackLease> {
+        Arc::clone(&self.context.lease)
+    }
+
+    #[cfg(unix)]
+    fn resolver_unix_launch_authority(&self) -> Arc<crate::gpu_worker_pack::UnixPackExecAuthority> {
+        unreachable!("production verified-pack launch is Windows-only in Stage 4")
+    }
+
+    fn hello_pack_id(&self) -> &str {
+        &self.capability.expectation.pack_id
+    }
+
+    fn hello_pack_version(&self) -> &str {
+        &self.capability.expectation.pack_version
+    }
+
+    fn hello_pack_digest(&self) -> &str {
+        &self.capability.expectation.pack_digest
+    }
+
+    fn hello_security_epoch(&self) -> u64 {
+        self.capability.expectation.security_epoch
+    }
+
+    fn hello_runtime_abi(&self) -> u16 {
+        self.capability.expectation.runtime_abi
+    }
+
+    fn hello_backend(&self) -> PackBackend {
+        pack_backend_from_worker_provider(self.capability.expectation.backend)
+            .expect("a worker-pack capability is always a GPU backend")
+    }
+
+    fn hello_provider(&self) -> &str {
+        &self.capability.expectation.provider
+    }
+
+    fn hello_stable_device_identity(&self) -> &str {
+        &self.capability.stable_device_identity
+    }
+
+    fn hello_process_index(&self) -> Option<usize> {
+        Some(self.capability.process_index)
+    }
+
+    fn hello_display_name(&self) -> &str {
+        &self.capability.display_name
+    }
+
+    fn hello_driver_version(&self) -> Option<&str> {
+        self.capability.driver_version.as_deref()
+    }
+
+    fn hello_device_class(&self) -> DeviceClass {
+        self.capability.device_class
+    }
+
+    fn hello_vendor(&self) -> GpuVendor {
+        self.capability.vendor
+    }
+
+    fn hello_memory_total_bytes(&self) -> u64 {
+        self.capability.memory_total_bytes
+    }
+
+    fn hello_memory_available_bytes(&self) -> u64 {
+        self.capability.memory_available_bytes
+    }
+}
+
+fn bind_pack_hello(
+    context: &PackLaunchContext,
+    capability: &WorkerPackCapability,
+) -> Result<VerifiedPackLaunchBinding> {
+    if capability.expectation != context.expectation {
+        bail!("GPU worker Hello pack identity differs from resolver authority");
+    }
+    if let Some(expected) = &context.expected_device {
+        let observed_backend = match capability.expectation.backend {
+            WorkerProvider::Cuda => BackendKind::Cuda,
+            WorkerProvider::Vulkan => BackendKind::Vulkan,
+            WorkerProvider::Metal => BackendKind::Metal,
+            WorkerProvider::Cpu => bail!("GPU worker Hello advertised CPU"),
+        };
+        if observed_backend != expected.backend
+            || capability.stable_device_identity != expected.device_id.as_str()
+            || capability.vendor != expected.vendor
+            || capability.device_class != expected.device_class
+            || capability.memory_total_bytes != expected.memory_total_bytes
+            || (expected.driver_version.is_some()
+                && capability.driver_version != expected.driver_version)
+        {
+            bail!("GPU worker Hello device facts differ from the parent-observed target");
+        }
+        // The enumeration index is deliberately refreshed from this Hello.
+        // Stable identity, rather than a persisted index, is the authority.
+    }
+    VerifiedPackLaunchBinding::try_from_resolver_hello_bridge(&BoundPackHelloBridge {
+        context,
+        capability,
+    })
+    .ok_or_else(|| anyhow!("GPU worker resolver/Hello binding was rejected"))
+}
+
 #[derive(Debug)]
 struct VerifiedWorkerExecutable {
     path: PathBuf,
@@ -1442,6 +1758,7 @@ struct VerifiedWorkerExecutable {
     expected_name: std::ffi::OsString,
     expected_sha256: String,
     identity: WorkerExecutableIdentity,
+    pack_launch: Option<PackLaunchContext>,
     // On Windows this read-only, non-delete-sharing handle prevents replacement
     // between verification and CreateProcess. Other platforms still retain the
     // open inode while the immediate identity recheck closes ordinary races.
@@ -1450,7 +1767,7 @@ struct VerifiedWorkerExecutable {
 
 impl VerifiedWorkerExecutable {
     fn revalidate(&self) -> Result<Self> {
-        let verified = verify_worker_executable(
+        let mut verified = verify_worker_executable(
             &self.path,
             &self.root,
             &self.expected_name,
@@ -1459,6 +1776,7 @@ impl VerifiedWorkerExecutable {
         if verified.identity != self.identity {
             bail!("worker executable identity changed before process creation");
         }
+        verified.pack_launch = self.pack_launch.clone();
         Ok(verified)
     }
 }
@@ -1579,8 +1897,124 @@ fn verify_worker_executable(
         expected_name: expected_name.to_owned(),
         expected_sha256: expected_sha256.to_owned(),
         identity,
+        pack_launch: None,
         _open_file: open_file,
     })
+}
+
+fn worker_provider_from_pack_backend(backend: PackBackend) -> WorkerProvider {
+    match backend {
+        PackBackend::Cuda => WorkerProvider::Cuda,
+        PackBackend::Vulkan => WorkerProvider::Vulkan,
+        PackBackend::Metal => WorkerProvider::Metal,
+    }
+}
+
+fn pack_backend_from_worker_provider(provider: WorkerProvider) -> Option<PackBackend> {
+    match provider {
+        WorkerProvider::Cuda => Some(PackBackend::Cuda),
+        WorkerProvider::Vulkan => Some(PackBackend::Vulkan),
+        WorkerProvider::Metal => Some(PackBackend::Metal),
+        WorkerProvider::Cpu => None,
+    }
+}
+
+fn pack_expectation(lease: &VerifiedPackLease) -> WorkerPackExpectation {
+    let pack = lease.verified_pack();
+    WorkerPackExpectation {
+        pack_id: pack.pack_id.as_str().to_owned(),
+        pack_version: pack.pack_version.as_str().to_owned(),
+        pack_digest: pack.pack_digest.clone(),
+        security_epoch: pack.security_epoch,
+        runtime_abi: pack.runtime_abi_version,
+        backend: worker_provider_from_pack_backend(pack.backend),
+        provider: pack.provider.clone(),
+    }
+}
+
+struct VerifiedPackWorkerExecutableResolver {
+    binding: VerifiedPackLaunchBinding,
+}
+
+impl WorkerExecutableResolver for VerifiedPackWorkerExecutableResolver {
+    fn resolve(&self, role: WorkerRole) -> Result<VerifiedWorkerExecutable> {
+        if role != WorkerRole::Inference {
+            bail!("verified GPU worker packs can launch only the inference role");
+        }
+        let lease = self.binding.verified_pack_lease_arc();
+        let expected_device = self.binding.backend_target();
+        let pack = lease.verified_pack();
+        if expected_device.pack.as_ref().is_none_or(|identity| {
+            identity.pack_digest != pack.pack_digest
+                || identity.runtime_abi != pack.runtime_abi_version
+                || identity.security_epoch != pack.security_epoch
+        }) {
+            bail!("verified GPU launch binding no longer matches its retained pack");
+        }
+        resolve_verified_pack_executable(lease, Some(expected_device))
+    }
+}
+
+/// Bootstrap is deliberately separate from an execution route. It can launch
+/// only a bounded Hello probe from a retained, freshly reverified pack lease;
+/// the resulting opaque binding is required before any model command route is
+/// constructed.
+struct VerifiedPackProbeExecutableResolver {
+    lease: Arc<VerifiedPackLease>,
+}
+
+impl WorkerExecutableResolver for VerifiedPackProbeExecutableResolver {
+    fn resolve(&self, role: WorkerRole) -> Result<VerifiedWorkerExecutable> {
+        if role != WorkerRole::Inference {
+            bail!("verified GPU worker probes can launch only the inference role");
+        }
+        resolve_verified_pack_executable(Arc::clone(&self.lease), None)
+    }
+}
+
+fn resolve_verified_pack_executable(
+    lease: Arc<VerifiedPackLease>,
+    expected_device: Option<BackendTarget>,
+) -> Result<VerifiedWorkerExecutable> {
+    let pack = lease.verified_pack();
+    let allowed = match pack.backend {
+        PackBackend::Cuda => &[PackBackend::Cuda][..],
+        PackBackend::Vulkan => &[PackBackend::Vulkan][..],
+        PackBackend::Metal => &[PackBackend::Metal][..],
+    };
+    let verifier = PackVerifier::new(
+        &ProductionTrustRoot,
+        crate::gpu_worker_pack::manifest::Compatibility {
+            app_build: DESKTOP_BUILD_ID,
+            worker_build: INFERENCE_WORKER_BUILD_ID,
+            target_os: std::env::consts::OS,
+            target_arch: std::env::consts::ARCH,
+            allowed_backends: allowed,
+        },
+    );
+    let launchable = verifier
+        .launchable_worker(&lease)
+        .context("GPU worker pack changed before launch")?;
+    let worker_path = launchable.path();
+    let expected_sha256 = lease
+        .copy_entries()
+        .iter()
+        .find(|entry| entry.path == pack.worker_relative_path)
+        .map(|entry| entry.sha256.as_str())
+        .ok_or_else(|| anyhow!("GPU worker pack inventory omitted its worker"))?;
+    let root = worker_path
+        .parent()
+        .ok_or_else(|| anyhow!("GPU worker pack executable has no parent directory"))?;
+    let name = worker_path
+        .file_name()
+        .ok_or_else(|| anyhow!("GPU worker pack executable has no filename"))?;
+    let mut executable = verify_worker_executable(worker_path, root, name, expected_sha256)?;
+    executable.pack_launch = Some(PackLaunchContext {
+        expectation: pack_expectation(&lease),
+        lease,
+        expected_device,
+    });
+    Ok(executable)
 }
 
 #[allow(
@@ -1681,6 +2115,20 @@ impl OsWorkerLauncher {
         }
     }
 
+    fn for_pack_binding(binding: VerifiedPackLaunchBinding) -> Self {
+        Self {
+            role: WorkerRole::Inference,
+            resolver: Arc::new(VerifiedPackWorkerExecutableResolver { binding }),
+        }
+    }
+
+    fn for_pack_probe(lease: Arc<VerifiedPackLease>) -> Self {
+        Self {
+            role: WorkerRole::Inference,
+            resolver: Arc::new(VerifiedPackProbeExecutableResolver { lease }),
+        }
+    }
+
     #[cfg(test)]
     fn for_executable(role: WorkerRole, executable: PathBuf) -> Self {
         Self {
@@ -1693,6 +2141,12 @@ impl OsWorkerLauncher {
 impl WorkerLauncher for OsWorkerLauncher {
     fn launch(&self) -> Result<SpawnedWorker> {
         let executable = self.resolver.resolve(self.role)?;
+        let mut expectation = expected_worker(self.role);
+        if let Some(pack) = &executable.pack_launch {
+            expectation.provider = pack.expectation.backend;
+            expectation.pack = Some(pack.expectation.clone());
+            expectation.bundled_worker_sha256 = executable.identity.sha256.clone();
+        }
         let worker_flag = match self.role {
             WorkerRole::Inference => INFERENCE_WORKER_FLAG,
             WorkerRole::Vad => VAD_WORKER_FLAG,
@@ -1710,6 +2164,9 @@ impl WorkerLauncher for OsWorkerLauncher {
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
         configure_worker_environment(&mut command);
+        if let Some(pack) = &executable.pack_launch {
+            configure_worker_pack_environment(&mut command, pack);
+        }
         let mut parent_liveness = ParentLivenessChannel::attach(&mut command)?;
         configure_hidden_worker_command(&mut command);
         let _immediate_identity_check = executable.revalidate()?;
@@ -1733,6 +2190,8 @@ impl WorkerLauncher for OsWorkerLauncher {
                 _process_guard: process_guard,
                 _parent_liveness: parent_liveness,
             }),
+            expectation,
+            pack_launch: executable.pack_launch,
         })
     }
 }
@@ -1792,6 +2251,29 @@ fn configure_worker_environment(command: &mut Command) {
         if let Some(value) = std::env::var_os(name) {
             command.env(name, value);
         }
+    }
+}
+
+fn configure_worker_pack_environment(command: &mut Command, context: &PackLaunchContext) {
+    let pack = &context.expectation;
+    command
+        .env(PACK_ID_ENV, &pack.pack_id)
+        .env(PACK_VERSION_ENV, &pack.pack_version)
+        .env(PACK_DIGEST_ENV, &pack.pack_digest)
+        .env(PACK_SECURITY_EPOCH_ENV, pack.security_epoch.to_string())
+        .env(PACK_RUNTIME_ABI_ENV, pack.runtime_abi.to_string())
+        .env(
+            PACK_BACKEND_ENV,
+            match pack.backend {
+                WorkerProvider::Cuda => "cuda",
+                WorkerProvider::Vulkan => "vulkan",
+                WorkerProvider::Metal => "metal",
+                WorkerProvider::Cpu => "cpu",
+            },
+        )
+        .env(PACK_PROVIDER_ENV, &pack.provider);
+    if let Some(device) = &context.expected_device {
+        command.env(PACK_DEVICE_ID_ENV, device.device_id.as_str());
     }
 }
 
@@ -2198,6 +2680,9 @@ struct WriterSlot {
 struct CurrentGeneration {
     generation: u64,
     process: Arc<dyn WorkerProcess>,
+    expectation: WorkerExpectation,
+    pack_launch: Option<PackLaunchContext>,
+    pack_binding: Option<VerifiedPackLaunchBinding>,
 }
 
 #[derive(Clone, Copy)]
@@ -2223,7 +2708,6 @@ struct SupervisorInner {
     // sequentially, never nested. Invalidation uses writer.try_lock so process
     // termination never depends on pipe progress.
     launcher: Arc<dyn WorkerLauncher>,
-    role: WorkerRole,
     deadlines: SupervisorDeadlines,
     spawn_gate: Mutex<()>,
     retirement_changed: Condvar,
@@ -2268,14 +2752,13 @@ impl ProcessWorkerSupervisor {
     }
 
     fn unstarted_for_role_with_launcher_and_deadlines(
-        role: WorkerRole,
+        _role: WorkerRole,
         launcher: Arc<dyn WorkerLauncher>,
         deadlines: SupervisorDeadlines,
     ) -> Self {
         Self {
             inner: Arc::new(SupervisorInner {
                 launcher,
-                role,
                 deadlines,
                 spawn_gate: Mutex::new(()),
                 retirement_changed: Condvar::new(),
@@ -2672,6 +3155,8 @@ impl ProcessWorkerSupervisor {
             stdin,
             stdout,
             process,
+            expectation,
+            pack_launch,
         } = spawned;
         let generation = {
             let mut state = self
@@ -2684,6 +3169,9 @@ impl ProcessWorkerSupervisor {
             state.current = Some(CurrentGeneration {
                 generation,
                 process: Arc::clone(&process),
+                expectation: expectation.clone(),
+                pack_launch,
+                pack_binding: None,
             });
             state.active_stream = None;
             state.active_model = None;
@@ -2724,7 +3212,7 @@ impl ProcessWorkerSupervisor {
                 return Err(error);
             }
         };
-        let expected = expected_worker(self.inner.role);
+        let expected = expectation;
         if let Err(error) = self.round_trip_on_generation_with_cancellation(
             generation,
             0,
@@ -3061,7 +3549,8 @@ impl ProcessWorkerSupervisor {
         match self.await_response_with_cancellation(correlation, response, timeout, cancelled)? {
             Control::Ready { capability } if hello.is_some() => {
                 let (challenge, expected) = hello.expect("checked above");
-                validate_worker_capability(&capability, &challenge, &expected)
+                validate_worker_capability(&capability, &challenge, &expected)?;
+                self.bind_generation_pack_capability(generation, &expected, &capability)
             }
             Control::Ok if hello.is_none() => Ok(()),
             Control::Error { message } => bail!("process worker: {message}"),
@@ -3074,6 +3563,47 @@ impl ProcessWorkerSupervisor {
                 bail!("unexpected process worker control response")
             }
         }
+    }
+
+    fn bind_generation_pack_capability(
+        &self,
+        generation: u64,
+        expected: &WorkerExpectation,
+        capability: &WorkerCapability,
+    ) -> Result<()> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| anyhow!("process worker supervisor state lock was poisoned"))?;
+        let current = state
+            .current
+            .as_mut()
+            .filter(|current| current.generation == generation)
+            .ok_or_else(|| anyhow!("process worker generation changed during Hello"))?;
+        if current.expectation != *expected {
+            bail!("process worker launch expectation changed during Hello");
+        }
+        match (&current.pack_launch, &capability.pack) {
+            (None, None) => Ok(()),
+            (Some(context), Some(pack)) => {
+                current.pack_binding = Some(bind_pack_hello(context, pack)?);
+                Ok(())
+            }
+            _ => bail!("process worker pack capability did not match launch authority"),
+        }
+    }
+
+    fn current_pack_binding(&self) -> Result<Option<VerifiedPackLaunchBinding>> {
+        self.ensure_generation()?;
+        self.inner
+            .state
+            .lock()
+            .map_err(|_| anyhow!("process worker supervisor state lock was poisoned"))?
+            .current
+            .as_ref()
+            .map(|current| current.pack_binding.clone())
+            .ok_or_else(|| anyhow!("process worker generation is unavailable"))
     }
 
     fn write_frames(&self, generation: u64, frames: &[Frame]) -> Result<()> {
@@ -3795,6 +4325,7 @@ fn retire_unpublished_worker(worker: SpawnedWorker) {
         stdin,
         stdout,
         process,
+        ..
     } = worker;
     drop(stdin);
     drop(stdout);
@@ -3811,6 +4342,7 @@ fn retire_unpublished_worker_synchronously(worker: SpawnedWorker) {
         stdin,
         stdout,
         process,
+        ..
     } = worker;
     drop(stdin);
     drop(stdout);
@@ -3991,6 +4523,32 @@ impl InferenceWorkerSupervisor {
             ),
             next_correlation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
+    }
+
+    fn for_pack_binding(binding: VerifiedPackLaunchBinding) -> Self {
+        Self {
+            transport: ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+                Arc::new(OsWorkerLauncher::for_pack_binding(binding)),
+                SupervisorDeadlines::default(),
+            ),
+            next_correlation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
+    fn for_pack_probe(lease: Arc<VerifiedPackLease>) -> Self {
+        Self {
+            transport: ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+                Arc::new(OsWorkerLauncher::for_pack_probe(lease)),
+                SupervisorDeadlines::default(),
+            ),
+            next_correlation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
+    fn verified_pack_binding(&self) -> Result<VerifiedPackLaunchBinding> {
+        self.transport
+            .current_pack_binding()?
+            .ok_or_else(|| anyhow!("inference worker did not produce a verified pack binding"))
     }
 
     /// Test-only process launcher for diagnostics that must exercise the real
@@ -4293,6 +4851,7 @@ fn worker_unavailable(error: impl std::fmt::Display) -> RuntimeError {
 struct InferenceWorkerRoute {
     provider: WorkerProvider,
     supervisor: InferenceWorkerSupervisor,
+    target: Option<BackendTarget>,
 }
 
 /// Bounded provider registry above the process supervisor.
@@ -4304,20 +4863,33 @@ struct InferenceWorkerRoute {
 #[derive(Clone)]
 pub(crate) struct InferenceWorkerRegistry {
     routes: Arc<Vec<InferenceWorkerRoute>>,
+    gpu_routes: Arc<Mutex<Option<Arc<Vec<InferenceWorkerRoute>>>>>,
+}
+
+fn discover_production_pack_launch_bindings() -> crate::gpu_worker_pack::ProductionPackRegistry {
+    let bindings = crate::gpu_worker_pack::discover_production_pack_leases()
+        .into_iter()
+        .take(8)
+        .filter_map(|lease| {
+            let supervisor = InferenceWorkerSupervisor::for_pack_probe(lease);
+            let binding = supervisor.verified_pack_binding().ok();
+            let _ = supervisor.shutdown();
+            binding
+        })
+        .collect();
+    crate::gpu_worker_pack::ProductionPackRegistry::from_launch_bindings(bindings)
 }
 
 impl InferenceWorkerRegistry {
     pub(crate) fn for_current_build() -> Self {
-        let provider = if cfg!(feature = "vulkan-acceleration") {
-            WorkerProvider::Vulkan
-        } else {
-            WorkerProvider::Cpu
-        };
+        let provider = WorkerProvider::Cpu;
         Self {
             routes: Arc::new(vec![InferenceWorkerRoute {
                 provider,
                 supervisor: InferenceWorkerSupervisor::unstarted(),
+                target: Some(BackendTarget::cpu()),
             }]),
+            gpu_routes: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -4330,7 +4902,9 @@ impl InferenceWorkerRegistry {
             routes: Arc::new(vec![InferenceWorkerRoute {
                 provider: WorkerProvider::Cpu,
                 supervisor: InferenceWorkerSupervisor::unstarted(),
+                target: Some(BackendTarget::cpu()),
             }]),
+            gpu_routes: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -4340,19 +4914,63 @@ impl InferenceWorkerRegistry {
             routes: Arc::new(vec![InferenceWorkerRoute {
                 provider: WorkerProvider::Cpu,
                 supervisor,
+                target: Some(BackendTarget::cpu()),
             }]),
+            gpu_routes: Arc::new(Mutex::new(None)),
         }
     }
 
-    fn eligible_routes(
+    fn routes_for_preference(
         &self,
         preference: AccelerationPreference,
-    ) -> impl Iterator<Item = &InferenceWorkerRoute> {
-        self.routes.iter().filter(move |route| match preference {
-            AccelerationPreference::Gpu => route.provider.is_gpu(),
-            AccelerationPreference::Cpu => !route.provider.is_gpu(),
-            AccelerationPreference::Auto => true,
-        })
+    ) -> Result<Arc<Vec<InferenceWorkerRoute>>, RuntimeError> {
+        if preference != AccelerationPreference::Gpu {
+            // Auto remains deliberately default-denied for Stage 4. It does
+            // not launch a provider merely to calibrate or probe the machine.
+            return Ok(Arc::clone(&self.routes));
+        }
+        let mut cached = self.gpu_routes.lock().map_err(|_| {
+            RuntimeError::WorkerUnavailable("GPU worker registry lock poisoned".to_owned())
+        })?;
+        if let Some(routes) = cached.as_ref() {
+            return Ok(Arc::clone(routes));
+        }
+        let mut routes = discover_production_pack_launch_bindings()
+            .into_bindings()
+            .into_iter()
+            .map(|binding| {
+                let target = binding.backend_target();
+                InferenceWorkerRoute {
+                    provider: match target.backend {
+                        BackendKind::Cuda => WorkerProvider::Cuda,
+                        BackendKind::Vulkan => WorkerProvider::Vulkan,
+                        BackendKind::Metal => WorkerProvider::Metal,
+                        BackendKind::Cpu => WorkerProvider::Cpu,
+                    },
+                    supervisor: InferenceWorkerSupervisor::for_pack_binding(binding),
+                    target: Some(target),
+                }
+            })
+            .filter(|route| route.provider.is_gpu())
+            .collect::<Vec<_>>();
+        routes.sort_by(|left, right| {
+            let key = |route: &InferenceWorkerRoute| {
+                let target = route.target.as_ref().expect("GPU route target");
+                (
+                    match target.backend {
+                        BackendKind::Cuda => 0,
+                        BackendKind::Vulkan => 1,
+                        BackendKind::Metal => 2,
+                        BackendKind::Cpu => 3,
+                    },
+                    target.device_id.as_str().to_owned(),
+                )
+            };
+            key(left).cmp(&key(right))
+        });
+        let routes = Arc::new(routes);
+        *cached = Some(Arc::clone(&routes));
+        Ok(routes)
     }
 
     fn no_route_error(preference: AccelerationPreference) -> RuntimeError {
@@ -4374,7 +4992,8 @@ impl InferenceWorkerRegistry {
     ) -> Result<RuntimeLoadExecution, RuntimeError> {
         let mut last_retryable = None;
         let mut attempted = false;
-        for route in self.eligible_routes(preference).take(4) {
+        let routes = self.routes_for_preference(preference)?;
+        for route in routes.iter().take(4) {
             attempted = true;
             match route.supervisor.load(artifact.clone(), preference) {
                 Ok(execution) => return Ok(execution),
@@ -4401,7 +5020,8 @@ impl InferenceWorkerRegistry {
     ) -> Result<RuntimeExecution, RuntimeError> {
         let mut last_retryable = None;
         let mut attempted = false;
-        for route in self.eligible_routes(preference).take(4) {
+        let routes = self.routes_for_preference(preference)?;
+        for route in routes.iter().take(4) {
             attempted = true;
             match route.supervisor.transcribe(
                 artifact.clone(),
@@ -4431,7 +5051,8 @@ impl InferenceWorkerRegistry {
     ) -> Result<(), RuntimeError> {
         let mut last_retryable = None;
         let mut attempted = false;
-        for route in self.eligible_routes(preference).take(4) {
+        let routes = self.routes_for_preference(preference)?;
+        for route in routes.iter().take(4) {
             attempted = true;
             match route.supervisor.health(artifact.clone(), preference) {
                 Ok(()) => return Ok(()),
@@ -4451,12 +5072,26 @@ impl InferenceWorkerRegistry {
         for route in self.routes.iter() {
             route.supervisor.unload()?;
         }
+        if let Ok(routes) = self.gpu_routes.lock()
+            && let Some(routes) = routes.as_ref()
+        {
+            for route in routes.iter() {
+                route.supervisor.unload()?;
+            }
+        }
         Ok(())
     }
 
     pub(crate) fn unload_if_idle(&self) -> Result<(), RuntimeError> {
         for route in self.routes.iter() {
             route.supervisor.unload_if_idle()?;
+        }
+        if let Ok(routes) = self.gpu_routes.lock()
+            && let Some(routes) = routes.as_ref()
+        {
+            for route in routes.iter() {
+                route.supervisor.unload_if_idle()?;
+            }
         }
         Ok(())
     }
@@ -4465,11 +5100,25 @@ impl InferenceWorkerRegistry {
         for route in self.routes.iter() {
             route.supervisor.cancel_active();
         }
+        if let Ok(routes) = self.gpu_routes.lock()
+            && let Some(routes) = routes.as_ref()
+        {
+            for route in routes.iter() {
+                route.supervisor.cancel_active();
+            }
+        }
     }
 
     pub(crate) fn shutdown(&self) -> Result<(), RuntimeError> {
         for route in self.routes.iter() {
             route.supervisor.shutdown()?;
+        }
+        if let Ok(routes) = self.gpu_routes.lock()
+            && let Some(routes) = routes.as_ref()
+        {
+            for route in routes.iter() {
+                route.supervisor.shutdown()?;
+            }
         }
         Ok(())
     }
@@ -6143,6 +6792,8 @@ mod tests {
                 }),
                 stdout: Box::new(ChannelReader::new(parent_output)),
                 process,
+                expectation: expected_worker(WorkerRole::Inference),
+                pack_launch: None,
             })
         }
     }
@@ -6833,7 +7484,9 @@ mod tests {
 
     #[test]
     fn compiled_inference_route_matches_the_worker_provider() {
-        let expected = if cfg!(feature = "vulkan-acceleration") {
+        let expected = if cfg!(feature = "cuda-acceleration") {
+            WorkerProvider::Cuda
+        } else if cfg!(feature = "vulkan-acceleration") {
             WorkerProvider::Vulkan
         } else {
             WorkerProvider::Cpu
@@ -6845,8 +7498,53 @@ mod tests {
         );
         assert_eq!(
             InferenceWorkerRegistry::for_current_build().routes[0].provider,
-            expected
+            WorkerProvider::Cpu
         );
+    }
+
+    #[test]
+    fn verified_pack_hello_remaps_index_by_exact_stable_identity() {
+        let root = crate::gpu_worker_pack::manifest::test_support::temp_root("pack-hello-remap");
+        let (_, lease) = crate::gpu_worker_pack::manifest::test_support::leased_fixture(&root);
+        let lease = Arc::new(lease);
+        let expectation = pack_expectation(&lease);
+        let mut expected = backend_target(BackendKind::Vulkan, "native:pci:0000:01:00.0", Some(9));
+        expected.vendor = GpuVendor::Nvidia;
+        expected.driver_version = Some("fixture-driver-1".to_owned());
+        let context = PackLaunchContext {
+            lease,
+            expectation: expectation.clone(),
+            expected_device: Some(expected.clone()),
+        };
+        let capability = WorkerPackCapability {
+            expectation,
+            stable_device_identity: "native:pci:0000:01:00.0".to_owned(),
+            process_index: 2,
+            display_name: "Fixture NVIDIA GPU".to_owned(),
+            driver_version: Some("fixture-driver-1".to_owned()),
+            device_class: DeviceClass::DiscreteGpu,
+            vendor: GpuVendor::Nvidia,
+            memory_total_bytes: 8 * 1024 * 1024 * 1024,
+            memory_available_bytes: 6 * 1024 * 1024 * 1024,
+        };
+        assert_eq!(capability.expectation.backend, WorkerProvider::Vulkan);
+        assert_eq!(
+            capability.stable_device_identity,
+            expected.device_id.as_str()
+        );
+        assert_eq!(capability.vendor, expected.vendor);
+        assert_eq!(capability.device_class, expected.device_class);
+        assert_eq!(capability.driver_version, expected.driver_version);
+        assert_eq!(capability.memory_total_bytes, expected.memory_total_bytes);
+        let binding = bind_pack_hello(&context, &capability).expect("stable identity remaps index");
+        assert_eq!(binding.backend_target().process_index, Some(2));
+
+        let mut wrong_device = capability;
+        wrong_device.stable_device_identity = "native:pci:0000:02:00.0".to_owned();
+        assert!(bind_pack_hello(&context, &wrong_device).is_err());
+        drop(binding);
+        drop(context);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(windows)]
@@ -7468,9 +8166,11 @@ mod tests {
                 ),
                 next_correlation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             },
+            target: Some(BackendTarget::cpu()),
         };
         let registry = InferenceWorkerRegistry {
             routes: Arc::new(vec![route(first.clone()), route(second.clone())]),
+            gpu_routes: Arc::new(Mutex::new(None)),
         };
         assert!(
             registry
@@ -7564,6 +8264,9 @@ mod tests {
         state.current = Some(CurrentGeneration {
             generation: correlation.generation,
             process: process_trait,
+            expectation: expected_worker(WorkerRole::Inference),
+            pack_launch: None,
+            pack_binding: None,
         });
         state.active_request = Some(correlation);
         drop(state);
@@ -8046,6 +8749,7 @@ mod tests {
             mut stdin,
             mut stdout,
             process,
+            ..
         } = OsWorkerLauncher::for_executable(WorkerRole::Inference, executable)
             .launch()
             .expect("spawn hidden inference worker executable");
@@ -8076,6 +8780,7 @@ mod tests {
             mut stdin,
             mut stdout,
             process,
+            ..
         } = OsWorkerLauncher::for_executable(WorkerRole::Vad, executable)
             .launch()
             .expect("spawn hidden VAD worker executable");
