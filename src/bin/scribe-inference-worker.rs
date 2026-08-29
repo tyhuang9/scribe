@@ -1,5 +1,4 @@
 #![cfg(not(test))]
-#![allow(dead_code)]
 
 //! Dedicated native inference process.
 //!
@@ -39,8 +38,15 @@ mod silero_vad_native;
 #[path = "../support_assets.rs"]
 mod support_assets;
 #[path = "../worker_contracts.rs"]
-mod transcription;
+mod worker_contracts;
+mod transcription {
+    pub(crate) use crate::worker_contracts::*;
+}
 
 fn main() {
+    if let Err(error) = onnx_worker::harden_windows_dll_search() {
+        eprintln!("Scribe inference worker could not harden native library loading: {error:#}");
+        std::process::exit(1);
+    }
     std::process::exit(onnx_worker::run_dedicated_inference_worker());
 }

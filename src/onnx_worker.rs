@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+#[cfg(any(test, feature = "inference-worker"))]
 use sherpa_onnx::{
     OfflineCanaryModelConfig, OfflineMoonshineModelConfig, OfflineNemoEncDecCtcModelConfig,
     OfflineRecognizer, OfflineRecognizerConfig, OfflineTransducerModelConfig, OnlineRecognizer,
@@ -52,8 +53,24 @@ pub(crate) const PROTOCOL_VERSION: u8 = 5;
 pub(crate) const INFERENCE_WORKER_FLAG: &str = "--scribe-inference-worker";
 pub(crate) const VAD_WORKER_FLAG: &str = "--scribe-vad-worker";
 const WORKER_ABI_VERSION: u16 = 1;
-const APP_BUILD_ID: &str = concat!("local-transcriber@", env!("CARGO_PKG_VERSION"));
-const WORKER_BUILD_ID: &str = concat!("scribe-inference-worker@", env!("CARGO_PKG_VERSION"));
+const DESKTOP_BUILD_ID: &str = concat!(
+    "local-transcriber@",
+    env!("CARGO_PKG_VERSION"),
+    "#",
+    env!("SCRIBE_BUILD_REVISION")
+);
+const INFERENCE_WORKER_BUILD_ID: &str = concat!(
+    "scribe-inference-worker@",
+    env!("CARGO_PKG_VERSION"),
+    "#",
+    env!("SCRIBE_BUILD_REVISION")
+);
+const VAD_WORKER_BUILD_ID: &str = concat!(
+    "scribe-vad-worker@",
+    env!("CARGO_PKG_VERSION"),
+    "#",
+    env!("SCRIBE_BUILD_REVISION")
+);
 const PARENT_LIVENESS_ENV: &str = "SCRIBE_PRIVATE_PARENT_LIVENESS";
 const PARENT_CONTROL_CANCEL: u8 = b'C';
 const HEADER_LEN: usize = 26;
@@ -752,6 +769,7 @@ struct WorkerArtifactTarget {
 struct WorkerExpectation {
     app_build: String,
     worker_build: String,
+    bundled_worker_sha256: String,
     abi: u16,
     role: WorkerRole,
     provider: WorkerProvider,
@@ -763,6 +781,7 @@ struct WorkerCapability {
     challenge: String,
     app_build: String,
     worker_build: String,
+    bundled_worker_sha256: String,
     abi: u16,
     role: WorkerRole,
     provider: WorkerProvider,
@@ -771,15 +790,24 @@ struct WorkerCapability {
 
 fn expected_worker(role: WorkerRole) -> WorkerExpectation {
     WorkerExpectation {
-        app_build: APP_BUILD_ID.to_owned(),
-        worker_build: WORKER_BUILD_ID.to_owned(),
+        app_build: DESKTOP_BUILD_ID.to_owned(),
+        worker_build: match role {
+            WorkerRole::Inference => INFERENCE_WORKER_BUILD_ID,
+            WorkerRole::Vad => VAD_WORKER_BUILD_ID,
+        }
+        .to_owned(),
+        bundled_worker_sha256: match role {
+            WorkerRole::Inference => option_env!("SCRIBE_BUNDLED_WORKER_SHA256").unwrap_or(""),
+            WorkerRole::Vad => "same-executable",
+        }
+        .to_owned(),
         abi: WORKER_ABI_VERSION,
         role,
         provider: WorkerProvider::Cpu,
     }
 }
 
-fn worker_capability(role: WorkerRole, challenge: String) -> WorkerCapability {
+fn worker_capability(role: WorkerRole, challenge: String) -> Result<WorkerCapability> {
     let target = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
     let artifacts = match role {
         WorkerRole::Inference => vec![
@@ -797,15 +825,36 @@ fn worker_capability(role: WorkerRole, challenge: String) -> WorkerCapability {
             target,
         }],
     };
-    WorkerCapability {
+    let bundled_worker_sha256 = match role {
+        WorkerRole::Inference => {
+            #[cfg(test)]
+            {
+                String::new()
+            }
+            #[cfg(not(test))]
+            {
+                let executable = std::env::current_exe()
+                    .context("could not locate inference worker for capability fingerprint")?;
+                sha256_file(&executable)
+                    .context("could not fingerprint inference worker for capability handshake")?
+            }
+        }
+        WorkerRole::Vad => "same-executable".to_owned(),
+    };
+    Ok(WorkerCapability {
         challenge,
-        app_build: APP_BUILD_ID.to_owned(),
-        worker_build: WORKER_BUILD_ID.to_owned(),
+        app_build: DESKTOP_BUILD_ID.to_owned(),
+        worker_build: match role {
+            WorkerRole::Inference => INFERENCE_WORKER_BUILD_ID,
+            WorkerRole::Vad => VAD_WORKER_BUILD_ID,
+        }
+        .to_owned(),
+        bundled_worker_sha256,
         abi: WORKER_ABI_VERSION,
         role,
         provider: WorkerProvider::Cpu,
         artifacts,
-    }
+    })
 }
 
 fn random_challenge() -> Result<String> {
@@ -813,6 +862,20 @@ fn random_challenge() -> Result<String> {
     getrandom::fill(&mut bytes)
         .map_err(|error| anyhow!("could not obtain worker handshake randomness: {error}"))?;
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    let mut file = std::fs::File::open(path)?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
 }
 
 fn validate_worker_capability(
@@ -828,6 +891,8 @@ fn validate_worker_capability(
     }
     if capability.app_build != expected.app_build
         || capability.worker_build != expected.worker_build
+        || (!expected.bundled_worker_sha256.is_empty()
+            && capability.bundled_worker_sha256 != expected.bundled_worker_sha256)
         || capability.abi != expected.abi
         || capability.role != expected.role
         || capability.provider != expected.provider
@@ -1030,6 +1095,10 @@ struct WireRuntimeLoadExecution {
 #[serde(deny_unknown_fields)]
 struct WireRuntimeError {
     code: WireRuntimeErrorCode,
+    #[serde(default)]
+    category: WireFailureCategory,
+    #[serde(default)]
+    retry: WireRetryDisposition,
     fatal: bool,
     message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1051,6 +1120,40 @@ enum WireRuntimeErrorCode {
     UnsupportedModel,
     WorkerUnavailable,
     OnnxUnavailable,
+    RetryableWorkerFailure,
+    Cancelled,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WireFailureCategory {
+    Artifact,
+    InvalidInput,
+    Decode,
+    Callback,
+    Worker,
+    Unsupported,
+    Cancellation,
+    Provider,
+}
+
+impl Default for WireFailureCategory {
+    fn default() -> Self {
+        Self::Worker
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WireRetryDisposition {
+    Never,
+    NextProviderBeforeOutput,
+}
+
+impl Default for WireRetryDisposition {
+    fn default() -> Self {
+        Self::Never
+    }
 }
 
 impl WireRuntimeError {
@@ -1065,9 +1168,31 @@ impl WireRuntimeError {
             RuntimeError::UnsupportedModel(_) => WireRuntimeErrorCode::UnsupportedModel,
             RuntimeError::WorkerUnavailable(_) => WireRuntimeErrorCode::WorkerUnavailable,
             RuntimeError::OnnxUnavailable(_) => WireRuntimeErrorCode::OnnxUnavailable,
+            RuntimeError::RetryableWorkerFailure(_) => WireRuntimeErrorCode::RetryableWorkerFailure,
+            RuntimeError::Cancelled(_) => WireRuntimeErrorCode::Cancelled,
+        };
+        let category = match error {
+            RuntimeError::ArtifactIntegrity { .. } => WireFailureCategory::Artifact,
+            RuntimeError::InvalidAudio { .. } => WireFailureCategory::InvalidInput,
+            RuntimeError::Inference(_) | RuntimeError::Engine(_) => WireFailureCategory::Decode,
+            RuntimeError::Callback(_) => WireFailureCategory::Callback,
+            RuntimeError::Poisoned
+            | RuntimeError::WorkerUnavailable(_)
+            | RuntimeError::RetryableWorkerFailure(_) => WireFailureCategory::Worker,
+            RuntimeError::UnsupportedModel(_) | RuntimeError::OnnxUnavailable(_) => {
+                WireFailureCategory::Unsupported
+            }
+            RuntimeError::Cancelled(_) => WireFailureCategory::Cancellation,
+        };
+        let retry = if matches!(error, RuntimeError::RetryableWorkerFailure(_)) {
+            WireRetryDisposition::NextProviderBeforeOutput
+        } else {
+            WireRetryDisposition::Never
         };
         Self {
             code,
+            category,
+            retry,
             fatal: matches!(
                 error,
                 RuntimeError::Poisoned | RuntimeError::WorkerUnavailable(_)
@@ -1115,6 +1240,14 @@ impl WireRuntimeError {
             WireRuntimeErrorCode::WorkerUnavailable => {
                 RuntimeError::WorkerUnavailable(self.message)
             }
+            WireRuntimeErrorCode::RetryableWorkerFailure => {
+                if self.retry == WireRetryDisposition::NextProviderBeforeOutput {
+                    RuntimeError::RetryableWorkerFailure(self.message)
+                } else {
+                    RuntimeError::WorkerUnavailable(self.message)
+                }
+            }
+            WireRuntimeErrorCode::Cancelled => RuntimeError::Cancelled(self.message),
         }
     }
 
@@ -1275,10 +1408,172 @@ fn control_allowed_for_role(control: &Control, role: WorkerRole) -> bool {
 }
 
 trait WorkerExecutableResolver: Send + Sync {
-    fn resolve(&self, role: WorkerRole) -> Result<PathBuf>;
+    fn resolve(&self, role: WorkerRole) -> Result<VerifiedWorkerExecutable>;
 }
 
 struct InstalledWorkerExecutableResolver;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct WorkerExecutableIdentity {
+    length: u64,
+    sha256: String,
+    #[cfg(windows)]
+    volume_serial: u32,
+    #[cfg(windows)]
+    file_index: u64,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+#[derive(Debug)]
+struct VerifiedWorkerExecutable {
+    path: PathBuf,
+    root: PathBuf,
+    expected_name: std::ffi::OsString,
+    expected_sha256: String,
+    identity: WorkerExecutableIdentity,
+    // On Windows this read-only, non-delete-sharing handle prevents replacement
+    // between verification and CreateProcess. Other platforms still retain the
+    // open inode while the immediate identity recheck closes ordinary races.
+    _open_file: std::fs::File,
+}
+
+impl VerifiedWorkerExecutable {
+    fn revalidate(&self) -> Result<Self> {
+        let verified = verify_worker_executable(
+            &self.path,
+            &self.root,
+            &self.expected_name,
+            &self.expected_sha256,
+        )?;
+        if verified.identity != self.identity {
+            bail!("worker executable identity changed before process creation");
+        }
+        Ok(verified)
+    }
+}
+
+fn directory_contains_exact_name(root: &Path, expected_name: &std::ffi::OsStr) -> Result<bool> {
+    let mut exact = false;
+    let expected_lossy = expected_name.to_string_lossy();
+    for entry in std::fs::read_dir(root)? {
+        let name = entry?.file_name();
+        if name == expected_name {
+            exact = true;
+        } else if name.to_string_lossy().eq_ignore_ascii_case(&expected_lossy) {
+            bail!("worker executable name differs from the packaged case");
+        }
+    }
+    Ok(exact)
+}
+
+fn open_worker_no_follow(path: &Path) -> Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+        };
+        options
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    options.open(path).with_context(|| {
+        format!(
+            "could not open worker executable through a no-follow handle: {}",
+            path.display()
+        )
+    })
+}
+
+fn worker_identity(file: &std::fs::File, path: &Path) -> Result<WorkerExecutableIdentity> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata_is_link_or_reparse(&metadata) {
+        bail!("worker executable is not a regular, non-reparse file");
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+        };
+        let mut information = unsafe { std::mem::zeroed::<BY_HANDLE_FILE_INFORMATION>() };
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut information) } == 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("could not read worker file identity from its verified handle");
+        }
+        if information.nNumberOfLinks != 1 {
+            bail!("worker executable must not be a hardlink");
+        }
+        return Ok(WorkerExecutableIdentity {
+            length: metadata.len(),
+            sha256: sha256_file(path)?,
+            volume_serial: information.dwVolumeSerialNumber,
+            file_index: (u64::from(information.nFileIndexHigh) << 32)
+                | u64::from(information.nFileIndexLow),
+        });
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() != 1 {
+            bail!("worker executable must not be a hardlink");
+        }
+        return Ok(WorkerExecutableIdentity {
+            length: metadata.len(),
+            sha256: sha256_file(path)?,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        });
+    }
+    #[cfg(not(any(windows, unix)))]
+    Ok(WorkerExecutableIdentity {
+        length: metadata.len(),
+        sha256: sha256_file(path)?,
+    })
+}
+
+fn verify_worker_executable(
+    candidate: &Path,
+    expected_root: &Path,
+    expected_name: &std::ffi::OsStr,
+    expected_sha256: &str,
+) -> Result<VerifiedWorkerExecutable> {
+    if candidate.file_name() != Some(expected_name)
+        || candidate
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().contains(':'))
+    {
+        bail!("worker executable path has an unexpected name or alternate data stream");
+    }
+    reject_link_components(expected_root)?;
+    reject_link_components(candidate)?;
+    let root = std::fs::canonicalize(expected_root)
+        .context("could not canonicalize the worker install directory")?;
+    let path =
+        std::fs::canonicalize(candidate).context("could not canonicalize the worker executable")?;
+    if path.parent() != Some(root.as_path())
+        || !directory_contains_exact_name(&root, expected_name)?
+    {
+        bail!("worker executable resolved outside its exact canonical install directory");
+    }
+    let open_file = open_worker_no_follow(&path)?;
+    let identity = worker_identity(&open_file, &path)?;
+    if !expected_sha256.is_empty() && identity.sha256 != expected_sha256 {
+        bail!("bundled inference worker SHA-256 does not match the desktop trust anchor");
+    }
+    Ok(VerifiedWorkerExecutable {
+        path,
+        root,
+        expected_name: expected_name.to_owned(),
+        expected_sha256: expected_sha256.to_owned(),
+        identity,
+        _open_file: open_file,
+    })
+}
 
 fn resolve_adjacent_inference_worker(current_executable: &Path) -> Result<PathBuf> {
     let current = std::fs::canonicalize(current_executable)
@@ -1290,26 +1585,42 @@ fn resolve_adjacent_inference_worker(current_executable: &Path) -> Result<PathBu
         "scribe-inference-worker{}",
         std::env::consts::EXE_SUFFIX
     ));
-    let resolved = std::fs::canonicalize(&candidate).with_context(|| {
-        format!(
-            "dedicated inference worker is missing at {}",
-            candidate.display()
-        )
-    })?;
-    if !resolved.is_file() || resolved.parent() != Some(install_dir) || resolved == current {
-        bail!("dedicated inference worker resolved outside the canonical Scribe install directory");
-    }
-    Ok(resolved)
+    let expected_name = candidate
+        .file_name()
+        .ok_or_else(|| anyhow!("dedicated inference worker has no file name"))?;
+    verify_worker_executable(&candidate, install_dir, expected_name, "")
+        .map(|verified| verified.path)
 }
 
 impl WorkerExecutableResolver for InstalledWorkerExecutableResolver {
-    fn resolve(&self, role: WorkerRole) -> Result<PathBuf> {
+    fn resolve(&self, role: WorkerRole) -> Result<VerifiedWorkerExecutable> {
         let current = std::fs::canonicalize(std::env::current_exe()?)
             .context("could not canonicalize the running Scribe executable")?;
         if role == WorkerRole::Vad {
-            return Ok(current);
+            let root = current
+                .parent()
+                .ok_or_else(|| anyhow!("running Scribe executable has no parent directory"))?;
+            let name = current
+                .file_name()
+                .ok_or_else(|| anyhow!("running Scribe executable has no file name"))?;
+            return verify_worker_executable(&current, root, name, "");
         }
-        resolve_adjacent_inference_worker(&current)
+        let root = current
+            .parent()
+            .ok_or_else(|| anyhow!("running Scribe executable has no parent directory"))?;
+        let candidate = root.join(format!(
+            "scribe-inference-worker{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        let name = candidate
+            .file_name()
+            .ok_or_else(|| anyhow!("dedicated inference worker has no file name"))?;
+        verify_worker_executable(
+            &candidate,
+            root,
+            name,
+            option_env!("SCRIBE_BUNDLED_WORKER_SHA256").unwrap_or(""),
+        )
     }
 }
 
@@ -1318,14 +1629,16 @@ struct FixedWorkerExecutableResolver(PathBuf);
 
 #[cfg(test)]
 impl WorkerExecutableResolver for FixedWorkerExecutableResolver {
-    fn resolve(&self, _role: WorkerRole) -> Result<PathBuf> {
-        let resolved = std::fs::canonicalize(&self.0).with_context(|| {
-            format!("test worker cannot be canonicalized: {}", self.0.display())
-        })?;
-        if !resolved.is_file() {
-            bail!("test worker is not a regular file: {}", resolved.display());
-        }
-        Ok(resolved)
+    fn resolve(&self, _role: WorkerRole) -> Result<VerifiedWorkerExecutable> {
+        let root = self
+            .0
+            .parent()
+            .ok_or_else(|| anyhow!("test worker has no parent directory"))?;
+        let name = self
+            .0
+            .file_name()
+            .ok_or_else(|| anyhow!("test worker has no file name"))?;
+        verify_worker_executable(&self.0, root, name, "")
     }
 }
 
@@ -1365,14 +1678,22 @@ impl WorkerLauncher for OsWorkerLauncher {
             WorkerRole::Inference => INFERENCE_WORKER_FLAG,
             WorkerRole::Vad => VAD_WORKER_FLAG,
         };
-        let mut command = Command::new(executable);
+        let mut command = Command::new(&executable.path);
         command
             .arg(worker_flag)
+            .current_dir(
+                executable
+                    .path
+                    .parent()
+                    .ok_or_else(|| anyhow!("worker executable has no trusted parent directory"))?,
+            )
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
+        configure_worker_environment(&mut command);
         let mut parent_liveness = ParentLivenessChannel::attach(&mut command)?;
         configure_hidden_worker_command(&mut command);
+        let _immediate_identity_check = executable.revalidate()?;
         let mut child = command.spawn()?;
         parent_liveness.child_spawned();
         let process_guard = bind_worker_process_tree(&child)?;
@@ -1394,6 +1715,63 @@ impl WorkerLauncher for OsWorkerLauncher {
             }),
         })
     }
+}
+
+fn configure_worker_environment(command: &mut Command) {
+    command.env_clear();
+    #[cfg(windows)]
+    const REQUIRED: &[&str] = &[
+        "SystemRoot",
+        "WINDIR",
+        "TEMP",
+        "TMP",
+        "USERPROFILE",
+        "LOCALAPPDATA",
+        "APPDATA",
+    ];
+    #[cfg(unix)]
+    const REQUIRED: &[&str] = &[
+        "HOME",
+        "TMPDIR",
+        "XDG_CACHE_HOME",
+        "XDG_CONFIG_HOME",
+        "LANG",
+        "LC_ALL",
+    ];
+    #[cfg(not(any(windows, unix)))]
+    const REQUIRED: &[&str] = &[];
+
+    for name in REQUIRED {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn harden_windows_dll_search() -> Result<()> {
+    use windows_sys::Win32::System::LibraryLoader::{
+        LOAD_LIBRARY_SEARCH_APPLICATION_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32,
+        SetDefaultDllDirectories, SetDllDirectoryW,
+    };
+
+    if unsafe {
+        SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_APPLICATION_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32)
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error())
+            .context("could not restrict Windows default DLL search directories");
+    }
+    if unsafe { SetDllDirectoryW(std::ptr::null()) } == 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("could not remove the current directory from Windows DLL search");
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub(crate) fn harden_windows_dll_search() -> Result<()> {
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -3646,11 +4024,12 @@ impl InferenceWorkerSupervisor {
     ) -> Result<RuntimeExecution, RuntimeError> {
         let cancelled = || cancellation_generation.load(Ordering::Acquire) != cancellation_snapshot;
         if cancelled() {
-            return Err(RuntimeError::Engine(
+            return Err(RuntimeError::Cancelled(
                 "transcription request was cancelled before inference dispatch".to_owned(),
             ));
         }
-        validate_cumulative_pcm_samples(&audio.samples).map_err(worker_unavailable)?;
+        validate_cumulative_pcm_samples(&audio.samples)
+            .map_err(|error| RuntimeError::Engine(error.to_string()))?;
         let generation = self
             .transport
             .ensure_generation()
@@ -3661,7 +4040,7 @@ impl InferenceWorkerSupervisor {
                 "inference request cancelled before batch begin",
                 true,
             );
-            return Err(RuntimeError::Engine(
+            return Err(RuntimeError::Cancelled(
                 "transcription request was cancelled".to_owned(),
             ));
         }
@@ -3717,7 +4096,7 @@ impl InferenceWorkerSupervisor {
                     "inference request cancelled while sending batch audio",
                     true,
                 );
-                return Err(RuntimeError::Engine(
+                return Err(RuntimeError::Cancelled(
                     "transcription request was cancelled".to_owned(),
                 ));
             }
@@ -3745,7 +4124,7 @@ impl InferenceWorkerSupervisor {
                 "inference request cancelled before batch decode",
                 true,
             );
-            return Err(RuntimeError::Engine(
+            return Err(RuntimeError::Cancelled(
                 "transcription request was cancelled".to_owned(),
             ));
         }
@@ -3850,7 +4229,7 @@ impl InferenceWorkerSupervisor {
 }
 
 fn worker_unavailable(error: impl std::fmt::Display) -> RuntimeError {
-    RuntimeError::WorkerUnavailable(error.to_string())
+    RuntimeError::RetryableWorkerFailure(error.to_string())
 }
 
 #[derive(Clone)]
@@ -3924,7 +4303,7 @@ impl InferenceWorkerRegistry {
             attempted = true;
             match route.supervisor.load(artifact.clone(), preference) {
                 Ok(execution) => return Ok(execution),
-                Err(error @ (RuntimeError::WorkerUnavailable(_) | RuntimeError::Poisoned)) => {
+                Err(error @ RuntimeError::RetryableWorkerFailure(_)) => {
                     last_retryable = Some(error);
                 }
                 Err(error) => return Err(error),
@@ -3958,7 +4337,7 @@ impl InferenceWorkerRegistry {
                 cancellation_generation,
             ) {
                 Ok(execution) => return Ok(execution),
-                Err(error @ (RuntimeError::WorkerUnavailable(_) | RuntimeError::Poisoned)) => {
+                Err(error @ RuntimeError::RetryableWorkerFailure(_)) => {
                     last_retryable = Some(error);
                 }
                 Err(error) => return Err(error),
@@ -3981,7 +4360,7 @@ impl InferenceWorkerRegistry {
             attempted = true;
             match route.supervisor.health(artifact.clone(), preference) {
                 Ok(()) => return Ok(()),
-                Err(error @ (RuntimeError::WorkerUnavailable(_) | RuntimeError::Poisoned)) => {
+                Err(error @ RuntimeError::RetryableWorkerFailure(_)) => {
                     last_retryable = Some(error);
                 }
                 Err(error) => return Err(error),
@@ -4039,14 +4418,29 @@ fn worker_loop_for_role(
     role: WorkerRole,
     parent_control: Option<std::fs::File>,
 ) -> Result<()> {
-    worker_loop_with_factories(
-        &mut input,
-        &mut output,
-        &NativeRecognizerFactory,
-        &NativeVadFactory,
-        Some(role),
-        parent_control,
-    )
+    #[cfg(any(test, feature = "inference-worker"))]
+    {
+        return worker_loop_with_factories(
+            &mut input,
+            &mut output,
+            &NativeRecognizerFactory,
+            &NativeVadFactory,
+            Some(role),
+            parent_control,
+        );
+    }
+    #[cfg(not(any(test, feature = "inference-worker")))]
+    {
+        debug_assert_eq!(role, WorkerRole::Vad);
+        worker_loop_with_factories(
+            &mut input,
+            &mut output,
+            &DisabledRecognizerFactory,
+            &NativeVadFactory,
+            Some(role),
+            parent_control,
+        )
+    }
 }
 
 trait WorkerRecognizerFactory {
@@ -4160,6 +4554,7 @@ fn worker_loop_with_factories<F: WorkerRecognizerFactory, V: WorkerVadFactory>(
     }
     let mut loaded_runtime: Option<LoadedRuntimeMetadata> = None;
     let mut pending_batch: Option<PendingWorkerBatch> = None;
+    let mut handshake_complete = false;
     loop {
         let frame = match read_frame(&mut input) {
             Ok(frame) => frame,
@@ -4173,6 +4568,16 @@ fn worker_loop_with_factories<F: WorkerRecognizerFactory, V: WorkerVadFactory>(
             Err(error) => return Err(error),
         };
         let (session_id, request_id, control) = parse_parent_control(frame)?;
+        match (&control, handshake_complete) {
+            (Control::Hello { .. }, false) => {}
+            (Control::Hello { .. }, true) => {
+                bail!("worker protocol permits Hello exactly once");
+            }
+            (_, false) => {
+                bail!("worker protocol requires Hello before any command");
+            }
+            (_, true) => {}
+        }
         if role.is_some_and(|role| !control_allowed_for_role(&control, role)) {
             write_worker_response(
                 &mut output,
@@ -4190,12 +4595,13 @@ fn worker_loop_with_factories<F: WorkerRecognizerFactory, V: WorkerVadFactory>(
                 expected,
             } => {
                 let actual_role = validate_worker_hello(role, &challenge, &expected)?;
+                handshake_complete = true;
                 write_worker_response(
                     &mut output,
                     session_id,
                     request_id,
                     Control::Ready {
-                        capability: worker_capability(actual_role, challenge),
+                        capability: worker_capability(actual_role, challenge)?,
                     },
                 )?;
             }
@@ -4288,6 +4694,7 @@ fn worker_loop_with_factories<F: WorkerRecognizerFactory, V: WorkerVadFactory>(
                         Ok(())
                     });
                 if let Err(error) = validation {
+                    pending_batch = None;
                     write_worker_result(&mut output, session_id, request_id, Err(error))?;
                     continue;
                 }
@@ -4410,6 +4817,9 @@ fn worker_loop_with_factories<F: WorkerRecognizerFactory, V: WorkerVadFactory>(
                         batch.last_request_id = request_id;
                         Ok(Control::Ok)
                     });
+                    if result.is_err() {
+                        pending_batch = None;
+                    }
                     write_worker_result(&mut output, session_id, request_id, result)?;
                     continue;
                 }
@@ -5073,8 +5483,8 @@ fn write_runtime_result(
             Some(runtime) => Control::RuntimeFailed {
                 error: WireRuntimeError::from_runtime(runtime),
             },
-            None => Control::Error {
-                message: error.to_string(),
+            None => Control::RuntimeFailed {
+                error: WireRuntimeError::from_runtime(&RuntimeError::Engine(error.to_string())),
             },
         },
     };
@@ -5083,7 +5493,17 @@ fn write_runtime_result(
 
 /// Real sherpa recognizers stay entirely inside the child process so a native
 /// failure cannot take down the eframe process.
+#[cfg(any(test, feature = "inference-worker"))]
 struct NativeRecognizerFactory;
+
+#[cfg(not(any(test, feature = "inference-worker")))]
+struct DisabledRecognizerFactory;
+
+#[cfg(not(any(test, feature = "inference-worker")))]
+struct DisabledRecognizer;
+
+#[cfg(not(any(test, feature = "inference-worker")))]
+struct DisabledRecognizerStream;
 
 struct NativeVadFactory;
 
@@ -5105,11 +5525,13 @@ impl WorkerVad for SileroVadModel {
     }
 }
 
+#[cfg(any(test, feature = "inference-worker"))]
 enum NativeRecognizer {
     Offline { recognizer: OfflineRecognizer },
     Online { recognizer: OnlineRecognizer },
 }
 
+#[cfg(any(test, feature = "inference-worker"))]
 impl WorkerRecognizerFactory for NativeRecognizerFactory {
     type Recognizer = NativeRecognizer;
 
@@ -5128,6 +5550,45 @@ impl WorkerRecognizerFactory for NativeRecognizerFactory {
     }
 }
 
+#[cfg(not(any(test, feature = "inference-worker")))]
+impl WorkerRecognizerFactory for DisabledRecognizerFactory {
+    type Recognizer = DisabledRecognizer;
+
+    fn create(&self, _model: &ValidatedOnnxModel) -> Result<Self::Recognizer> {
+        bail!("ASR recognizers are unavailable in the desktop executable")
+    }
+}
+
+#[cfg(not(any(test, feature = "inference-worker")))]
+impl WorkerRecognizer for DisabledRecognizer {
+    type Stream = DisabledRecognizerStream;
+
+    fn transcribe(&self, _samples: &[f32]) -> Result<String> {
+        bail!("ASR recognizers are unavailable in the desktop executable")
+    }
+
+    fn start_stream(&self) -> Result<Self::Stream> {
+        bail!("ASR recognizers are unavailable in the desktop executable")
+    }
+
+    fn accept_chunk(&self, _stream: &mut Self::Stream, _samples: &[f32]) -> Result<()> {
+        bail!("ASR recognizers are unavailable in the desktop executable")
+    }
+
+    fn input_finished(&self, _stream: &mut Self::Stream) -> Result<()> {
+        bail!("ASR recognizers are unavailable in the desktop executable")
+    }
+
+    fn drain_ready(&self, _stream: &mut Self::Stream) -> Result<()> {
+        bail!("ASR recognizers are unavailable in the desktop executable")
+    }
+
+    fn stream_result(&self, _stream: &Self::Stream) -> Result<String> {
+        bail!("ASR recognizers are unavailable in the desktop executable")
+    }
+}
+
+#[cfg(any(test, feature = "inference-worker"))]
 impl WorkerRecognizer for NativeRecognizer {
     type Stream = OnlineStream;
 
@@ -5199,12 +5660,14 @@ impl WorkerRecognizer for NativeRecognizer {
     }
 }
 
+#[cfg(any(test, feature = "inference-worker"))]
 fn decode_online_ready(recognizer: &OnlineRecognizer, stream: &OnlineStream) {
     while recognizer.is_ready(stream) {
         recognizer.decode(stream);
     }
 }
 
+#[cfg(any(test, feature = "inference-worker"))]
 fn online_recognizer_config(model: &ValidatedOnnxModel) -> Result<OnlineRecognizerConfig> {
     let mut config = OnlineRecognizerConfig::default();
     config.model_config.provider = Some("cpu".into());
@@ -5218,6 +5681,7 @@ fn online_recognizer_config(model: &ValidatedOnnxModel) -> Result<OnlineRecogniz
     Ok(config)
 }
 
+#[cfg(any(test, feature = "inference-worker"))]
 fn offline_recognizer_config(model: &ValidatedOnnxModel) -> Result<OfflineRecognizerConfig> {
     let mut config = OfflineRecognizerConfig::default();
     config.model_config.provider = Some("cpu".into());
@@ -5847,7 +6311,7 @@ mod tests {
             session_id,
             request_id,
             Control::Ready {
-                capability: worker_capability(role, challenge),
+                capability: worker_capability(role, challenge).unwrap(),
             },
         );
         true
@@ -5935,7 +6399,7 @@ mod tests {
                 else {
                     panic!("expected worker Hello");
                 };
-                let mut capability = worker_capability(expected.role, challenge);
+                let mut capability = worker_capability(expected.role, challenge).unwrap();
                 match mismatch {
                     CapabilityMismatch::Challenge => capability.challenge = "cd".repeat(32),
                     CapabilityMismatch::AppBuild => capability.app_build.push_str("-wrong"),
@@ -6469,6 +6933,68 @@ mod tests {
     }
 
     #[test]
+    fn capability_compatible_wrong_worker_digest_is_rejected() {
+        let challenge = "ef".repeat(32);
+        let mut expected = expected_worker(WorkerRole::Inference);
+        expected.bundled_worker_sha256 = "11".repeat(32);
+        let mut capability = worker_capability(WorkerRole::Inference, challenge.clone()).unwrap();
+        capability.bundled_worker_sha256 = "22".repeat(32);
+        let error = validate_worker_capability(&capability, &challenge, &expected).unwrap_err();
+        assert!(error.to_string().contains("incompatible"));
+    }
+
+    #[test]
+    fn worker_protocol_requires_one_hello_before_commands() {
+        let factory = FakeRecognizerFactory::new();
+        let vad_factory = FakeVadFactory::new();
+
+        let health = control_frame(1, 1, &Control::Health).unwrap();
+        let mut health_bytes = Vec::new();
+        write_frame(&mut health_bytes, &health).unwrap();
+        let error = worker_loop_with_factories(
+            &mut Cursor::new(health_bytes),
+            &mut Vec::new(),
+            &factory,
+            &vad_factory,
+            Some(WorkerRole::Inference),
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("requires Hello"));
+
+        let challenge = "ab".repeat(32);
+        let hello = control_frame(
+            2,
+            1,
+            &Control::Hello {
+                challenge,
+                expected: expected_worker(WorkerRole::Inference),
+            },
+        )
+        .unwrap();
+        let mut duplicate_bytes = Vec::new();
+        write_frame(&mut duplicate_bytes, &hello).unwrap();
+        write_frame(&mut duplicate_bytes, &hello).unwrap();
+        let mut output = Vec::new();
+        let error = worker_loop_with_factories(
+            &mut Cursor::new(duplicate_bytes),
+            &mut output,
+            &factory,
+            &vad_factory,
+            Some(WorkerRole::Inference),
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("exactly once"));
+        assert!(matches!(
+            parse_worker_control(read_frame(&mut Cursor::new(output)).unwrap())
+                .unwrap()
+                .2,
+            Control::Ready { .. }
+        ));
+    }
+
+    #[test]
     fn adjacent_inference_worker_resolution_is_exact_and_canonical() {
         let root = test_root("worker-resolution");
         let desktop = root.join(format!("local-transcriber{}", std::env::consts::EXE_SUFFIX));
@@ -6481,13 +7007,134 @@ mod tests {
             resolve_adjacent_inference_worker(&desktop)
                 .unwrap_err()
                 .to_string()
-                .contains("missing")
+                .contains("canonicalize")
         );
         std::fs::write(&worker, b"worker").unwrap();
         assert_eq!(
             resolve_adjacent_inference_worker(&desktop).unwrap(),
             std::fs::canonicalize(&worker).unwrap()
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn worker_environment_is_allowlisted_and_backend_overrides_are_stripped() {
+        let mut command = Command::new("worker-fixture");
+        for (name, value) in [
+            ("GGML_VK_VISIBLE_DEVICES", "1"),
+            ("VULKAN_SDK", "untrusted"),
+            ("VK_LAYER_PATH", "untrusted"),
+            ("CUDA_VISIBLE_DEVICES", "1"),
+            ("LD_LIBRARY_PATH", "untrusted"),
+            ("LD_PRELOAD", "untrusted"),
+            ("DYLD_LIBRARY_PATH", "untrusted"),
+            ("PATH", "untrusted"),
+        ] {
+            command.env(name, value);
+        }
+        configure_worker_environment(&mut command);
+        let environment = command
+            .get_envs()
+            .map(|(name, value)| (name.to_string_lossy().to_string(), value))
+            .collect::<Vec<_>>();
+        for stripped in [
+            "GGML_VK_VISIBLE_DEVICES",
+            "VULKAN_SDK",
+            "VK_LAYER_PATH",
+            "CUDA_VISIBLE_DEVICES",
+            "LD_LIBRARY_PATH",
+            "LD_PRELOAD",
+            "DYLD_LIBRARY_PATH",
+            "PATH",
+        ] {
+            assert!(
+                environment
+                    .iter()
+                    .all(|(name, value)| name != stripped || value.is_none()),
+                "worker inherited forbidden environment variable {stripped}"
+            );
+        }
+    }
+
+    #[test]
+    fn worker_identity_rejects_hardlinks_and_detects_replacement() {
+        let root = test_root("worker-file-identity");
+        let worker = root.join(format!("worker{}", std::env::consts::EXE_SUFFIX));
+        let alias = root.join(format!("worker-alias{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(&worker, b"trusted-worker").unwrap();
+        std::fs::hard_link(&worker, &alias).unwrap();
+        let name = worker.file_name().unwrap();
+        assert!(
+            verify_worker_executable(&worker, &root, name, "")
+                .unwrap_err()
+                .to_string()
+                .contains("hardlink")
+        );
+        std::fs::remove_file(&alias).unwrap();
+        let verified = verify_worker_executable(&worker, &root, name, "").unwrap();
+        match std::fs::write(&worker, b"replacement") {
+            Ok(()) => assert!(verified.revalidate().is_err()),
+            Err(_) => {
+                // Windows holds a non-delete/non-write-sharing handle through
+                // process creation, so replacement itself must fail.
+                assert!(cfg!(windows));
+            }
+        }
+        drop(verified);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn worker_identity_rejects_case_ads_and_reparse_paths() {
+        use std::os::windows::fs::{symlink_dir, symlink_file};
+
+        let root = test_root("worker-windows-identity");
+        let actual = root.join("Scribe-Inference-Worker.exe");
+        std::fs::write(&actual, b"worker").unwrap();
+        let packaged_name = std::ffi::OsStr::new("scribe-inference-worker.exe");
+        assert!(
+            verify_worker_executable(&root.join(packaged_name), &root, packaged_name, "")
+                .unwrap_err()
+                .to_string()
+                .contains("case")
+        );
+        let ads = root.join("Scribe-Inference-Worker.exe:payload");
+        assert!(
+            verify_worker_executable(&ads, &root, ads.file_name().unwrap(), "")
+                .unwrap_err()
+                .to_string()
+                .contains("alternate data stream")
+        );
+
+        let file_link = root.join("linked-worker.exe");
+        if symlink_file(&actual, &file_link).is_ok() {
+            assert!(
+                verify_worker_executable(&file_link, &root, file_link.file_name().unwrap(), "")
+                    .unwrap_err()
+                    .to_string()
+                    .contains("reparse")
+            );
+        }
+        let linked_root = root.with_file_name(format!(
+            "{}-link",
+            root.file_name().unwrap().to_string_lossy()
+        ));
+        if symlink_dir(&root, &linked_root).is_ok() {
+            let linked_worker = linked_root.join(actual.file_name().unwrap());
+            assert!(
+                verify_worker_executable(
+                    &linked_worker,
+                    &linked_root,
+                    actual.file_name().unwrap(),
+                    ""
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("reparse")
+            );
+            std::fs::remove_dir(&linked_root).unwrap();
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -6927,7 +7574,7 @@ mod tests {
                 1,
                 &cancellation,
             ),
-            Err(RuntimeError::Engine(_))
+            Err(RuntimeError::Cancelled(_))
         ));
         assert_eq!(launcher.launches.load(Ordering::Acquire), 0);
         std::fs::remove_dir_all(root).unwrap();
@@ -7044,7 +7691,7 @@ mod tests {
             7,
             2,
             Control::BeginBatch {
-                artifact,
+                artifact: artifact.clone(),
                 preference: AccelerationPreference::Cpu,
                 options: TranscriptionOptions::default(),
                 source_sample_rate: PREPARED_SAMPLE_RATE,
@@ -7175,7 +7822,7 @@ mod tests {
             7,
             1,
             Control::BeginBatch {
-                artifact,
+                artifact: artifact.clone(),
                 preference: AccelerationPreference::Cpu,
                 options: TranscriptionOptions::default(),
                 source_sample_rate: PREPARED_SAMPLE_RATE,
@@ -7186,20 +7833,51 @@ mod tests {
         );
         append_control(&mut input, 8, 2, Control::AudioChunk);
         append_pcm(&mut input, 8, 2, &[0.1]);
-        append_control(&mut input, 7, 3, Control::AudioChunk);
-        append_pcm(&mut input, 7, 3, &[0.1]);
-        append_control(&mut input, 7, 4, Control::EndBatch);
-        append_control(&mut input, 7, 5, Control::AudioChunk);
-        append_pcm(&mut input, 7, 5, &[0.2]);
-        append_control(&mut input, 7, 6, Control::EndBatch);
-        append_control(&mut input, 0, 7, Control::Shutdown);
+        append_control(
+            &mut input,
+            7,
+            3,
+            Control::BeginBatch {
+                artifact: artifact.clone(),
+                preference: AccelerationPreference::Cpu,
+                options: TranscriptionOptions::default(),
+                source_sample_rate: PREPARED_SAMPLE_RATE,
+                source_channels: 1,
+                source_frames: 2,
+                declared_samples: 2,
+            },
+        );
+        append_control(&mut input, 7, 4, Control::AudioChunk);
+        append_pcm(&mut input, 7, 4, &[0.1]);
+        append_control(&mut input, 7, 5, Control::EndBatch);
+        append_control(
+            &mut input,
+            7,
+            6,
+            Control::BeginBatch {
+                artifact,
+                preference: AccelerationPreference::Cpu,
+                options: TranscriptionOptions::default(),
+                source_sample_rate: PREPARED_SAMPLE_RATE,
+                source_channels: 1,
+                source_frames: 1,
+                declared_samples: 1,
+            },
+        );
+        append_control(&mut input, 7, 7, Control::AudioChunk);
+        append_pcm(&mut input, 7, 7, &[0.2]);
+        append_control(&mut input, 7, 8, Control::EndBatch);
+        append_control(&mut input, 0, 9, Control::Shutdown);
 
         let responses = run_framed_fake_worker(&FakeRecognizerFactory::new(), input);
         assert_error(&responses[2], "different session");
-        assert_error(&responses[4], "sample count mismatch");
-        assert!(matches!(responses[5].2, Control::Ok));
-        assert!(matches!(responses[6].2, Control::RuntimeTranscript { .. }));
+        assert!(matches!(responses[3].2, Control::Ok));
+        assert!(matches!(responses[4].2, Control::Ok));
+        assert_error(&responses[5], "sample count mismatch");
+        assert!(matches!(responses[6].2, Control::Ok));
         assert!(matches!(responses[7].2, Control::Ok));
+        assert!(matches!(responses[8].2, Control::RuntimeTranscript { .. }));
+        assert!(matches!(responses[9].2, Control::Ok));
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -7287,6 +7965,11 @@ mod tests {
             Control::Error { message } => assert!(
                 message.contains(text),
                 "expected error containing {text:?}, got {message:?}"
+            ),
+            Control::RuntimeFailed { error } => assert!(
+                error.message.contains(text),
+                "expected error containing {text:?}, got {:?}",
+                error.message
             ),
             other => panic!("expected worker error, got {other:?}"),
         }

@@ -1,8 +1,7 @@
-//! Dependency-light copy of the private inference contract.
+//! Dependency-light private contract shared by the desktop and inference worker.
 //!
-//! Keep wire-visible fields aligned with `transcription.rs`. This module is
-//! compiled only by the dedicated worker binary, avoiding a dependency from
-//! the desktop executable back to the native inference runtime.
+//! Wire-visible values live here once so serde compatibility cannot drift
+//! between executables. Application orchestration stays in `transcription.rs`.
 
 use std::fmt;
 
@@ -19,10 +18,32 @@ pub enum AccelerationPreference {
     Gpu,
 }
 
+impl AccelerationPreference {
+    #[cfg(test)]
+    pub const ALL: [Self; 3] = [Self::Auto, Self::Gpu, Self::Cpu];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto",
+            Self::Cpu => "CPU only",
+            Self::Gpu => "GPU",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ComputeDevice {
     Cpu,
     Gpu { name: String },
+}
+
+impl ComputeDevice {
+    pub fn label(&self) -> &str {
+        match self {
+            Self::Cpu => "CPU",
+            Self::Gpu { name } => name,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -52,9 +73,27 @@ impl ModelId {
     }
 }
 
+impl AsRef<str> for ModelId {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
 impl fmt::Display for ModelId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.0)
+    }
+}
+
+impl From<String> for ModelId {
+    fn from(value: String) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<&str> for ModelId {
+    fn from(value: &str) -> Self {
+        Self::new(value)
     }
 }
 

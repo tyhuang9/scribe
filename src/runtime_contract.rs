@@ -59,6 +59,10 @@ pub(crate) enum RuntimeError {
     UnsupportedModel(ModelId),
     #[error("dedicated native runtime worker is unavailable: {0}")]
     WorkerUnavailable(String),
+    #[error("dedicated native runtime worker failed before producing output: {0}")]
+    RetryableWorkerFailure(String),
+    #[error("transcription request was cancelled: {0}")]
+    Cancelled(String),
     #[error("isolated ONNX speech runtime is unavailable: {0}")]
     OnnxUnavailable(String),
 }

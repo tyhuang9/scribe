@@ -47,6 +47,7 @@ mod text_output;
 mod transcription;
 mod tray;
 mod ui;
+mod worker_contracts;
 
 #[cfg(test)]
 mod architecture_guard;
@@ -62,6 +63,10 @@ enum LinuxDisplayBackend {
 }
 
 fn main() -> eframe::Result<()> {
+    if let Err(error) = onnx_worker::harden_windows_dll_search() {
+        eprintln!("Scribe could not harden native library loading: {error:#}");
+        std::process::exit(1);
+    }
     if let Some(exit_code) = onnx_worker::maybe_run_vad_worker() {
         std::process::exit(exit_code);
     }
