@@ -8,7 +8,9 @@ pub(crate) mod health;
 pub(crate) mod manifest;
 pub(crate) mod store;
 
-use std::fs;
+use std::fs::{File, OpenOptions};
+use std::io::Read;
+use std::path::Path;
 use std::sync::Arc;
 
 use serde::Deserialize;
@@ -140,7 +142,7 @@ mod launch_binding {
                 && display_name
                     .bytes()
                     .all(|byte| (0x20..=0x7e).contains(&byte));
-            let driver_is_bounded = driver_version.is_none_or(|value| {
+            let driver_is_bounded = driver_version.is_some_and(|value| {
                 !value.is_empty()
                     && value.len() <= 128
                     && value.bytes().all(|byte| (0x20..=0x7e).contains(&byte))
@@ -246,18 +248,28 @@ mod launch_binding {
 /// raw verified descriptor. Stage 3 deliberately constructs the empty value.
 pub(crate) struct ProductionPackRegistry {
     bindings: Vec<VerifiedPackLaunchBinding>,
+    diagnostics: Vec<PackDiscoveryDiagnostic>,
 }
 
 impl ProductionPackRegistry {
     pub(crate) fn empty() -> Self {
         Self {
             bindings: Vec::new(),
+            diagnostics: Vec::new(),
         }
     }
 
     #[allow(dead_code)]
     pub(crate) fn from_launch_bindings(bindings: Vec<VerifiedPackLaunchBinding>) -> Self {
-        Self { bindings }
+        Self {
+            bindings,
+            diagnostics: Vec::new(),
+        }
+    }
+
+    pub(crate) fn with_diagnostics(mut self, diagnostics: Vec<PackDiscoveryDiagnostic>) -> Self {
+        self.diagnostics = diagnostics;
+        self
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -266,6 +278,12 @@ impl ProductionPackRegistry {
 
     pub(crate) fn into_bindings(self) -> Vec<VerifiedPackLaunchBinding> {
         self.bindings
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (Vec<VerifiedPackLaunchBinding>, Vec<PackDiscoveryDiagnostic>) {
+        (self.bindings, self.diagnostics)
     }
 }
 
@@ -278,6 +296,109 @@ pub(crate) fn production_registry() -> ProductionPackRegistry {
 const PACK_CATALOG_NAME: &str = "worker-pack-catalog.json";
 const MAX_PACK_CATALOG_BYTES: u64 = 512 * 1024;
 const MAX_PRODUCTION_PACKS: usize = 8;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PackDiscoveryIssue {
+    UnsupportedPlatform,
+    CatalogUnavailable,
+    CatalogRejected,
+    EntryIncompatible,
+    PackRootRejected,
+    SignatureOrInventoryRejected,
+    CatalogInventoryMismatch,
+    NotAutoQualified,
+    ProviderProbeRejected,
+    DriverVersionUnavailable,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PackDiscoveryDiagnostic {
+    pub(crate) issue: PackDiscoveryIssue,
+    pub(crate) pack_id: Option<String>,
+    pub(crate) backend: Option<manifest::PackBackend>,
+}
+
+impl PackDiscoveryDiagnostic {
+    pub(crate) fn catalog(issue: PackDiscoveryIssue) -> Self {
+        Self {
+            issue,
+            pack_id: None,
+            backend: None,
+        }
+    }
+
+    pub(crate) fn pack(
+        issue: PackDiscoveryIssue,
+        pack_id: &manifest::StoreComponent,
+        backend: manifest::PackBackend,
+    ) -> Self {
+        Self {
+            issue,
+            pack_id: Some(pack_id.as_str().to_owned()),
+            backend: Some(backend),
+        }
+    }
+
+    pub(crate) fn safe_summary(&self) -> String {
+        let subject = match (&self.pack_id, self.backend) {
+            (Some(pack_id), Some(backend)) => format!("{backend:?} pack {pack_id}"),
+            (Some(pack_id), None) => format!("GPU pack {pack_id}"),
+            _ => "GPU worker packs".to_owned(),
+        };
+        match self.issue {
+            PackDiscoveryIssue::UnsupportedPlatform => {
+                format!("{subject} are unsupported on this platform")
+            }
+            PackDiscoveryIssue::CatalogUnavailable => {
+                format!("{subject} were not found in this installation")
+            }
+            PackDiscoveryIssue::CatalogRejected => {
+                format!("{subject} catalog was rejected")
+            }
+            PackDiscoveryIssue::EntryIncompatible => {
+                format!("{subject} is incompatible with this application build")
+            }
+            PackDiscoveryIssue::PackRootRejected => {
+                format!("{subject} immutable root was rejected")
+            }
+            PackDiscoveryIssue::SignatureOrInventoryRejected => {
+                format!("{subject} signature or installed inventory was rejected")
+            }
+            PackDiscoveryIssue::CatalogInventoryMismatch => {
+                format!("{subject} does not match its catalog entry")
+            }
+            PackDiscoveryIssue::NotAutoQualified => {
+                format!("{subject} is verified but not qualified for Auto")
+            }
+            PackDiscoveryIssue::ProviderProbeRejected => {
+                format!("{subject} provider probe was rejected")
+            }
+            PackDiscoveryIssue::DriverVersionUnavailable => {
+                format!("{subject} driver version is unavailable from the pinned provider API")
+            }
+        }
+    }
+}
+
+pub(crate) struct PackLeaseDiscovery {
+    pub(crate) leases: Vec<Arc<manifest::VerifiedPackLease>>,
+    pub(crate) diagnostics: Vec<PackDiscoveryDiagnostic>,
+}
+
+impl PackLeaseDiscovery {
+    pub(crate) fn diagnostic_summary(&self) -> String {
+        diagnostic_summary(&self.diagnostics)
+    }
+}
+
+pub(crate) fn diagnostic_summary(diagnostics: &[PackDiscoveryDiagnostic]) -> String {
+    diagnostics
+        .iter()
+        .take(MAX_PRODUCTION_PACKS * 2 + 1)
+        .map(PackDiscoveryDiagnostic::safe_summary)
+        .collect::<Vec<_>>()
+        .join("; ")
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -305,35 +426,83 @@ struct PackCatalogEntry {
     files: Vec<String>,
 }
 
-/// Verifies the bounded installed catalog and returns retained pack leases.
+/// Verifies the bounded installed catalog and returns retained pack leases plus
+/// categorical, path-free diagnostics for every skipped entry.
 /// It never loads a provider or creates launch authority. A malformed catalog,
 /// absent production trust key, or incompatible pack projects to no GPU route.
 #[cfg(all(windows, target_arch = "x86_64"))]
-pub(crate) fn discover_production_pack_leases() -> Vec<Arc<manifest::VerifiedPackLease>> {
-    discover_pack_leases_from_current_install().unwrap_or_default()
+pub(crate) fn discover_production_pack_leases() -> PackLeaseDiscovery {
+    discover_pack_leases_from_current_install()
 }
 
 #[cfg(not(all(windows, target_arch = "x86_64")))]
-pub(crate) fn discover_production_pack_leases() -> Vec<Arc<manifest::VerifiedPackLease>> {
-    Vec::new()
+pub(crate) fn discover_production_pack_leases() -> PackLeaseDiscovery {
+    PackLeaseDiscovery {
+        leases: Vec::new(),
+        diagnostics: vec![PackDiscoveryDiagnostic::catalog(
+            PackDiscoveryIssue::UnsupportedPlatform,
+        )],
+    }
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]
-fn discover_pack_leases_from_current_install()
--> Result<Vec<Arc<manifest::VerifiedPackLease>>, String> {
-    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
-    let install_root = executable
-        .parent()
-        .ok_or_else(|| "Scribe executable has no install root".to_owned())?;
+fn discover_pack_leases_from_current_install() -> PackLeaseDiscovery {
+    let Ok(executable) = std::env::current_exe() else {
+        return PackLeaseDiscovery {
+            leases: Vec::new(),
+            diagnostics: vec![PackDiscoveryDiagnostic::catalog(
+                PackDiscoveryIssue::CatalogUnavailable,
+            )],
+        };
+    };
+    let Some(install_root) = executable.parent() else {
+        return PackLeaseDiscovery {
+            leases: Vec::new(),
+            diagnostics: vec![PackDiscoveryDiagnostic::catalog(
+                PackDiscoveryIssue::CatalogUnavailable,
+            )],
+        };
+    };
+    discover_pack_leases_from_install_root(install_root)
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn discover_pack_leases_from_install_root(install_root: &Path) -> PackLeaseDiscovery {
     let catalog_path = install_root.join(PACK_CATALOG_NAME);
-    let metadata = fs::symlink_metadata(&catalog_path).map_err(|error| error.to_string())?;
-    if !metadata.is_file() || metadata.len() > MAX_PACK_CATALOG_BYTES {
-        return Err("worker-pack catalog is absent, linked, or oversized".to_owned());
-    }
-    let bytes = fs::read(&catalog_path).map_err(|error| error.to_string())?;
-    let catalog: PackCatalog = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    let bytes = match read_bounded_catalog(&catalog_path) {
+        Ok(bytes) => bytes,
+        Err(CatalogReadFailure::Unavailable) => {
+            return PackLeaseDiscovery {
+                leases: Vec::new(),
+                diagnostics: vec![PackDiscoveryDiagnostic::catalog(
+                    PackDiscoveryIssue::CatalogUnavailable,
+                )],
+            };
+        }
+        Err(CatalogReadFailure::Rejected) => {
+            return PackLeaseDiscovery {
+                leases: Vec::new(),
+                diagnostics: vec![PackDiscoveryDiagnostic::catalog(
+                    PackDiscoveryIssue::CatalogRejected,
+                )],
+            };
+        }
+    };
+    let Ok(catalog) = serde_json::from_slice::<PackCatalog>(&bytes) else {
+        return PackLeaseDiscovery {
+            leases: Vec::new(),
+            diagnostics: vec![PackDiscoveryDiagnostic::catalog(
+                PackDiscoveryIssue::CatalogRejected,
+            )],
+        };
+    };
     if catalog.schema_version != 1 || catalog.packs.len() > MAX_PRODUCTION_PACKS {
-        return Err("worker-pack catalog schema or count is invalid".to_owned());
+        return PackLeaseDiscovery {
+            leases: Vec::new(),
+            diagnostics: vec![PackDiscoveryDiagnostic::catalog(
+                PackDiscoveryIssue::CatalogRejected,
+            )],
+        };
     }
     let packs_root = install_root.join("workers").join("packs");
     let verifier = manifest::PackVerifier::new(
@@ -344,6 +513,7 @@ fn discover_pack_leases_from_current_install()
         ]),
     );
     let mut leases = Vec::new();
+    let mut diagnostics = Vec::new();
     for entry in catalog.packs {
         if entry.target_os != "windows"
             || entry.target_arch != "x86_64"
@@ -353,6 +523,11 @@ fn discover_pack_leases_from_current_install()
             || entry.files.len() < 3
             || entry.files.len() > manifest::MAX_FILES + 2
         {
+            diagnostics.push(PackDiscoveryDiagnostic::pack(
+                PackDiscoveryIssue::EntryIncompatible,
+                &entry.pack_id,
+                entry.backend,
+            ));
             continue;
         }
         let relative_root = format!(
@@ -362,6 +537,11 @@ fn discover_pack_leases_from_current_install()
             entry.pack_digest
         );
         if entry.root != relative_root {
+            diagnostics.push(PackDiscoveryDiagnostic::pack(
+                PackDiscoveryIssue::PackRootRejected,
+                &entry.pack_id,
+                entry.backend,
+            ));
             continue;
         }
         let Ok(pinned) = manifest::PinnedPackRoot::open(
@@ -369,9 +549,19 @@ fn discover_pack_leases_from_current_install()
             [&entry.pack_id, &entry.pack_version],
             &entry.pack_digest,
         ) else {
+            diagnostics.push(PackDiscoveryDiagnostic::pack(
+                PackDiscoveryIssue::PackRootRejected,
+                &entry.pack_id,
+                entry.backend,
+            ));
             continue;
         };
         let Ok(lease) = verifier.verify_pinned(pinned) else {
+            diagnostics.push(PackDiscoveryDiagnostic::pack(
+                PackDiscoveryIssue::SignatureOrInventoryRejected,
+                &entry.pack_id,
+                entry.backend,
+            ));
             continue;
         };
         let observed = lease.verified_pack();
@@ -394,11 +584,78 @@ fn discover_pack_leases_from_current_install()
             || observed.worker_relative_path != entry.worker_relative_path
             || catalog_files != expected_files
         {
+            diagnostics.push(PackDiscoveryDiagnostic::pack(
+                PackDiscoveryIssue::CatalogInventoryMismatch,
+                &entry.pack_id,
+                entry.backend,
+            ));
             continue;
         }
+        diagnostics.push(PackDiscoveryDiagnostic::pack(
+            PackDiscoveryIssue::NotAutoQualified,
+            &entry.pack_id,
+            entry.backend,
+        ));
         leases.push(Arc::new(lease));
     }
-    Ok(leases)
+    PackLeaseDiscovery {
+        leases,
+        diagnostics,
+    }
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+enum CatalogReadFailure {
+    Unavailable,
+    Rejected,
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn read_bounded_catalog(path: &Path) -> Result<Vec<u8>, CatalogReadFailure> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_SHARE_READ, GetFileInformationByHandle,
+    };
+
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        // Refuse replacement or mutation while the exact opened handle is
+        // parsed; installer activation replaces the complete catalog later.
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    let file = options.open(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            CatalogReadFailure::Unavailable
+        } else {
+            CatalogReadFailure::Rejected
+        }
+    })?;
+    let metadata = file.metadata().map_err(|_| CatalogReadFailure::Rejected)?;
+    if !metadata.is_file()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || metadata.len() > MAX_PACK_CATALOG_BYTES
+    {
+        return Err(CatalogReadFailure::Rejected);
+    }
+    let mut information = unsafe { std::mem::zeroed::<BY_HANDLE_FILE_INFORMATION>() };
+    // SAFETY: file owns a valid live Windows file handle and information is a
+    // correctly sized writable output structure.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) } == 0
+        || information.nNumberOfLinks != 1
+    {
+        return Err(CatalogReadFailure::Rejected);
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    File::take(file, MAX_PACK_CATALOG_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| CatalogReadFailure::Rejected)?;
+    if bytes.len() as u64 > MAX_PACK_CATALOG_BYTES {
+        return Err(CatalogReadFailure::Rejected);
+    }
+    Ok(bytes)
 }
 
 /// Private packaging entrypoint. Stage 3's empty production trust root means a
@@ -447,6 +704,7 @@ mod tests {
 
     use super::manifest::PackBackend;
     use super::manifest::VerifiedPackLease;
+    use super::{PackDiscoveryDiagnostic, PackDiscoveryIssue};
     use super::{ResolverHelloBindingBridge, VerifiedPackLaunchBinding};
 
     struct FixtureBridge {
@@ -587,5 +845,52 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
         drop(mismatched);
         std::fs::remove_dir_all(mismatched_root).unwrap();
+    }
+
+    #[test]
+    fn discovery_diagnostics_are_categorical_path_free_and_bounded() {
+        let pack_id = super::manifest::StoreComponent::new("scribe-vulkan-windows-x64").unwrap();
+        let diagnostics = vec![
+            PackDiscoveryDiagnostic::catalog(PackDiscoveryIssue::CatalogRejected),
+            PackDiscoveryDiagnostic::pack(
+                PackDiscoveryIssue::SignatureOrInventoryRejected,
+                &pack_id,
+                PackBackend::Vulkan,
+            ),
+            PackDiscoveryDiagnostic::pack(
+                PackDiscoveryIssue::NotAutoQualified,
+                &pack_id,
+                PackBackend::Vulkan,
+            ),
+            PackDiscoveryDiagnostic::pack(
+                PackDiscoveryIssue::ProviderProbeRejected,
+                &pack_id,
+                PackBackend::Vulkan,
+            ),
+        ];
+        let summary = super::diagnostic_summary(&diagnostics);
+        assert!(summary.contains("catalog was rejected"));
+        assert!(summary.contains("signature or installed inventory was rejected"));
+        assert!(summary.contains("not qualified for Auto"));
+        assert!(summary.contains("provider probe was rejected"));
+        assert!(!summary.contains(':'));
+        assert!(summary.len() < 2_048);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn catalog_reader_retains_exact_handle_and_rejects_hardlinks() {
+        let root = super::manifest::test_support::temp_root("pack-catalog-reader");
+        let catalog = root.join(super::PACK_CATALOG_NAME);
+        std::fs::write(&catalog, br#"{"schema_version":1,"packs":[]}"#).unwrap();
+        assert!(super::read_bounded_catalog(&catalog).is_ok());
+
+        let alias = root.join("catalog-alias.json");
+        std::fs::hard_link(&catalog, &alias).unwrap();
+        assert!(matches!(
+            super::read_bounded_catalog(&catalog),
+            Err(super::CatalogReadFailure::Rejected)
+        ));
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

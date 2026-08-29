@@ -305,6 +305,7 @@ fn runtime_backend_snapshot() -> BackendSnapshot {
         .filter_map(native_backend_candidate)
         .collect::<Vec<_>>();
     mark_ambiguous_derived_devices(&mut candidates);
+    apply_verified_pack_device_override(&mut candidates);
     if !candidates
         .iter()
         .any(|candidate| candidate.target.backend == BackendKind::Cpu)
@@ -322,6 +323,48 @@ fn runtime_backend_snapshot() -> BackendSnapshot {
         qualification_policy: BackendQualificationPolicy::stage_one_default_deny(),
     }
 }
+
+#[cfg(feature = "inference-worker")]
+fn apply_verified_pack_device_override(candidates: &mut [BackendCandidate]) {
+    let stable_id = std::env::var(crate::onnx_worker::PACK_DEVICE_ID_ENV).ok();
+    let driver = std::env::var(crate::onnx_worker::PACK_DRIVER_ID_ENV).ok();
+    apply_verified_pack_device_override_values(candidates, stable_id.as_deref(), driver.as_deref());
+}
+
+fn apply_verified_pack_device_override_values(
+    candidates: &mut [BackendCandidate],
+    stable_id: Option<&str>,
+    driver: Option<&str>,
+) {
+    let Some(stable_id) = stable_id.filter(|value| {
+        !value.is_empty()
+            && value.len() <= 256
+            && *value == value.to_ascii_lowercase()
+            && value.bytes().all(|byte| (0x20..=0x7e).contains(&byte))
+    }) else {
+        return;
+    };
+    let driver = driver
+        .filter(|value| {
+            !value.is_empty()
+                && value.len() <= 128
+                && value.bytes().all(|byte| (0x20..=0x7e).contains(&byte))
+        })
+        .map(str::to_owned);
+    for candidate in candidates.iter_mut().filter(|candidate| {
+        candidate.target.backend.is_gpu() && candidate.target.device_id.as_str() != stable_id
+    }) {
+        candidate.availability = CandidateAvailability::Incompatible;
+    }
+    if let Some(candidate) = candidates.iter_mut().find(|candidate| {
+        candidate.target.backend.is_gpu() && candidate.target.device_id.as_str() == stable_id
+    }) {
+        candidate.target.driver_version = driver;
+    }
+}
+
+#[cfg(not(feature = "inference-worker"))]
+fn apply_verified_pack_device_override(_candidates: &mut [BackendCandidate]) {}
 
 fn select_backend_environment(
     preference: AccelerationPreference,
@@ -408,7 +451,7 @@ fn native_backend_candidate_for_backend(
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .map(|value| DeviceIdentity::new(format!("native:{value}")))
+            .map(|value| DeviceIdentity::new(format!("native:{}", value.to_ascii_lowercase())))
             .unwrap_or_else(|| {
                 DeviceIdentity::new(format!(
                     "derived:{}:{}:{vendor:?}:{device_class:?}:{}:{}:{}",
@@ -561,11 +604,13 @@ fn reconcile_observed_target(
                 "native runtime did not report a selectable compute device".to_owned()
             ))
         })?;
+    let driver_matches = observed.driver_version.is_none()
+        || observed.driver_version == selection.target.driver_version;
     if observed.backend != selection.target.backend
         || observed.backend.is_gpu() != selection.target.backend.is_gpu()
         || observed.device_class != selection.target.device_class
         || observed.provider_id != selection.target.provider_id
-        || observed.driver_version != selection.target.driver_version
+        || !driver_matches
         || observed.vendor != selection.target.vendor
         || observed.device_id != selection.target.device_id
     {
@@ -584,8 +629,10 @@ fn reconcile_observed_target(
         ))));
     }
     let pack = selection.target.pack.clone();
+    let driver_version = selection.target.driver_version.clone();
     selection.target = BackendTarget {
         pack,
+        driver_version,
         process_index,
         ..observed
     };
@@ -937,6 +984,38 @@ mod tests {
             "native:pci:0000:01:00.0"
         );
         assert_eq!(candidate.target.process_index, Some(3));
+    }
+
+    #[test]
+    fn verified_pack_override_selects_exact_stable_device_and_driver() {
+        let candidate = |identity: &str, index: usize| {
+            let mut native = device(DeviceType::Gpu, "Vulkan", "NVIDIA GPU");
+            native.device_id = Some(identity.to_owned());
+            native.index = Some(index);
+            native_backend_candidate(native).unwrap()
+        };
+        let mut candidates = vec![candidate("0000:02:00.0", 4), candidate("0000:01:00.0", 9)];
+        apply_verified_pack_device_override_values(
+            &mut candidates,
+            Some("native:0000:01:00.0"),
+            Some("windows-display:32.0.15.8088"),
+        );
+        assert_eq!(
+            candidates[0].availability,
+            CandidateAvailability::Incompatible
+        );
+        assert_eq!(candidates[1].availability, CandidateAvailability::Available);
+        assert_eq!(
+            candidates[1].target.driver_version.as_deref(),
+            Some("windows-display:32.0.15.8088")
+        );
+        let selected = select_backend(
+            AccelerationPreference::Gpu,
+            &snapshot(OperatingSystem::Windows, PowerSource::Ac, candidates),
+        )
+        .unwrap();
+        assert_eq!(selected.target.device_id.as_str(), "native:0000:01:00.0");
+        assert_eq!(selected.target.process_index, Some(9));
     }
 
     #[test]
@@ -1439,11 +1518,11 @@ mod tests {
 
         let mut wrong_driver_selection = selection();
         wrong_driver_selection.target.driver_version = Some("driver-2".to_owned());
-        let driver_error =
-            reconcile_observed_target(&mut wrong_driver_selection, "vulkan", &enumerated)
-                .unwrap_err()
-                .to_string();
-        assert!(driver_error.starts_with("BackendUnavailable:"));
+        reconcile_observed_target(&mut wrong_driver_selection, "vulkan", &enumerated).unwrap();
+        assert_eq!(
+            wrong_driver_selection.target.driver_version.as_deref(),
+            Some("driver-2")
+        );
     }
 
     #[test]

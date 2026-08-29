@@ -495,7 +495,9 @@ pub(crate) struct HealthQuarantineProjection {
 
 impl CandidateQuarantineProjection for HealthQuarantineProjection {
     fn is_quarantined(&self, target: &BackendTarget) -> bool {
-        let driver = target.driver_version.as_deref().unwrap_or("unknown");
+        let Some(driver) = target.driver_version.as_deref() else {
+            return false;
+        };
         self.quarantined.as_ref()
             == Some(&(driver.to_owned(), target.device_id.as_str().to_owned()))
     }
@@ -1102,9 +1104,12 @@ mod tests {
         let projection = cache.quarantine_projection_for(&key);
         let mut other = gpu(&key);
         other.target.driver_version = Some("different-driver".to_owned());
+        let mut missing_driver = gpu(&key);
+        missing_driver.target.driver_version = None;
         let mut candidates = vec![
             gpu(&key),
             other,
+            missing_driver,
             BackendCandidate::available(BackendTarget::cpu()),
         ];
         apply_quarantine_projection(&mut candidates, &projection);
@@ -1114,6 +1119,7 @@ mod tests {
         );
         assert_eq!(candidates[1].availability, CandidateAvailability::Available);
         assert_eq!(candidates[2].availability, CandidateAvailability::Available);
+        assert_eq!(candidates[3].availability, CandidateAvailability::Available);
 
         assert!(cache.grant_explicit_retry(&key).unwrap());
         let retry_projection = cache.quarantine_projection_for(&key);

@@ -76,7 +76,8 @@ const PACK_SECURITY_EPOCH_ENV: &str = "SCRIBE_PRIVATE_PACK_SECURITY_EPOCH";
 const PACK_RUNTIME_ABI_ENV: &str = "SCRIBE_PRIVATE_PACK_RUNTIME_ABI";
 const PACK_BACKEND_ENV: &str = "SCRIBE_PRIVATE_PACK_BACKEND";
 const PACK_PROVIDER_ENV: &str = "SCRIBE_PRIVATE_PACK_PROVIDER";
-const PACK_DEVICE_ID_ENV: &str = "SCRIBE_PRIVATE_PACK_DEVICE_ID";
+pub(crate) const PACK_DEVICE_ID_ENV: &str = "SCRIBE_PRIVATE_PACK_DEVICE_ID";
+pub(crate) const PACK_DRIVER_ID_ENV: &str = "SCRIBE_PRIVATE_PACK_DRIVER_ID";
 const PARENT_CONTROL_CANCEL: u8 = b'C';
 const HEADER_LEN: usize = 26;
 const MAX_CONTROL_BYTES: usize = 256 * 1024;
@@ -968,6 +969,201 @@ fn worker_pack_expectation_from_private_env() -> Result<Option<WorkerPackExpecta
     }))
 }
 
+#[cfg(all(windows, feature = "inference-worker"))]
+struct PackDriverCatalog {
+    by_pci_location: BTreeMap<(u32, u32, u32), String>,
+}
+
+#[cfg(all(windows, feature = "inference-worker"))]
+impl PackDriverCatalog {
+    fn discover() -> Result<Self> {
+        use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
+            DIGCF_PRESENT, GUID_DEVCLASS_DISPLAY, SP_DEVINFO_DATA, SetupDiDestroyDeviceInfoList,
+            SetupDiEnumDeviceInfo, SetupDiGetClassDevsW, SetupDiGetDevicePropertyW,
+        };
+        use windows_sys::Win32::Devices::Properties::{
+            DEVPKEY_Device_Address, DEVPKEY_Device_BusNumber, DEVPKEY_Device_DriverVersion,
+            DEVPROP_TYPE_STRING, DEVPROP_TYPE_UINT32, DEVPROPKEY,
+        };
+
+        struct DeviceInfoSet(isize);
+
+        impl Drop for DeviceInfoSet {
+            fn drop(&mut self) {
+                // SAFETY: the handle came from SetupDiGetClassDevsW and is
+                // owned exclusively by this guard.
+                unsafe {
+                    SetupDiDestroyDeviceInfoList(self.0);
+                }
+            }
+        }
+
+        fn property_u32(set: isize, device: &SP_DEVINFO_DATA, key: &DEVPROPKEY) -> Option<u32> {
+            let mut property_type = 0;
+            let mut required_size = 0;
+            let mut bytes = [0_u8; std::mem::size_of::<u32>()];
+            // SAFETY: all pointers reference initialized, correctly sized
+            // buffers for the duration of the synchronous SetupAPI call.
+            let ok = unsafe {
+                SetupDiGetDevicePropertyW(
+                    set,
+                    device,
+                    key,
+                    &mut property_type,
+                    bytes.as_mut_ptr(),
+                    bytes.len() as u32,
+                    &mut required_size,
+                    0,
+                )
+            };
+            (ok != 0 && property_type == DEVPROP_TYPE_UINT32 && required_size == bytes.len() as u32)
+                .then(|| u32::from_ne_bytes(bytes))
+        }
+
+        fn driver_property(
+            set: isize,
+            device: &SP_DEVINFO_DATA,
+            key: &DEVPROPKEY,
+        ) -> Option<String> {
+            let mut property_type = 0;
+            let mut required_size = 0;
+            let mut utf16 = [0_u16; 128];
+            // SAFETY: the UTF-16 output buffer is writable and byte-sized as
+            // required by SetupDiGetDevicePropertyW.
+            let ok = unsafe {
+                SetupDiGetDevicePropertyW(
+                    set,
+                    device,
+                    key,
+                    &mut property_type,
+                    utf16.as_mut_ptr().cast(),
+                    std::mem::size_of_val(&utf16) as u32,
+                    &mut required_size,
+                    0,
+                )
+            };
+            if ok == 0
+                || property_type != DEVPROP_TYPE_STRING
+                || required_size < 2
+                || required_size > std::mem::size_of_val(&utf16) as u32
+                || required_size % 2 != 0
+            {
+                return None;
+            }
+            let units = required_size as usize / 2;
+            let end = utf16[..units]
+                .iter()
+                .position(|unit| *unit == 0)
+                .unwrap_or(units);
+            let value = String::from_utf16(&utf16[..end]).ok()?;
+            let canonical = value.trim().to_ascii_lowercase();
+            (!canonical.is_empty()
+                && canonical.len() <= 96
+                && canonical.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_' | b'+')
+                }))
+            .then(|| format!("windows-display:{canonical}"))
+        }
+
+        // SAFETY: the class GUID is process-static, the enumerator is null,
+        // and no window handle is used. SetupAPI returns a new owned set.
+        let raw_set = unsafe {
+            SetupDiGetClassDevsW(
+                &GUID_DEVCLASS_DISPLAY,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                DIGCF_PRESENT,
+            )
+        };
+        if raw_set == -1_isize {
+            bail!("Windows display-adapter metadata is unavailable");
+        }
+        let set = DeviceInfoSet(raw_set);
+        let mut by_pci_location = BTreeMap::new();
+        for index in 0..64_u32 {
+            let mut device = SP_DEVINFO_DATA {
+                cbSize: std::mem::size_of::<SP_DEVINFO_DATA>() as u32,
+                ClassGuid: windows_sys::core::GUID::from_u128(0),
+                DevInst: 0,
+                Reserved: 0,
+            };
+            // SAFETY: device has the required cbSize and remains writable for
+            // the synchronous enumeration call.
+            if unsafe { SetupDiEnumDeviceInfo(set.0, index, &mut device) } == 0 {
+                break;
+            }
+            let Some(bus) = property_u32(set.0, &device, &DEVPKEY_Device_BusNumber) else {
+                continue;
+            };
+            let Some(address) = property_u32(set.0, &device, &DEVPKEY_Device_Address) else {
+                continue;
+            };
+            let Some(driver) = driver_property(set.0, &device, &DEVPKEY_Device_DriverVersion)
+            else {
+                continue;
+            };
+            let location = (bus, address >> 16, address & 0xffff);
+            if by_pci_location.insert(location, driver).is_some() {
+                bail!("Windows reported duplicate display-adapter PCI locations");
+            }
+        }
+        if by_pci_location.is_empty() {
+            bail!("Windows reported no display adapter with bounded driver metadata");
+        }
+        Ok(Self { by_pci_location })
+    }
+
+    fn identity_for(&self, stable_device_identity: &str) -> Result<String> {
+        let (bus, device, function) = parse_native_pci_location(stable_device_identity)
+            .ok_or_else(|| anyhow!("GPU stable identity is not a canonical PCI location"))?;
+        self.by_pci_location
+            .get(&(bus, device, function))
+            .cloned()
+            .ok_or_else(|| anyhow!("GPU PCI identity has no matching Windows driver metadata"))
+    }
+}
+
+#[cfg(all(not(windows), feature = "inference-worker"))]
+struct PackDriverCatalog;
+
+#[cfg(all(not(windows), feature = "inference-worker"))]
+impl PackDriverCatalog {
+    fn discover() -> Result<Self> {
+        bail!("Stage 4 GPU worker packs require Windows driver metadata")
+    }
+
+    fn identity_for(&self, _stable_device_identity: &str) -> Result<String> {
+        bail!("Stage 4 GPU worker packs require Windows driver metadata")
+    }
+}
+
+#[cfg(any(feature = "inference-worker", test))]
+fn parse_native_pci_location(identity: &str) -> Option<(u32, u32, u32)> {
+    if identity != identity.to_ascii_lowercase() {
+        return None;
+    }
+    let raw = identity
+        .strip_prefix("native:")?
+        .strip_prefix("pci:")
+        .unwrap_or_else(|| identity.strip_prefix("native:").expect("checked above"));
+    let mut colon = raw.split(':');
+    let domain_text = colon.next()?;
+    let bus_text = colon.next()?;
+    let device_function = colon.next()?;
+    if !matches!(domain_text.len(), 4 | 8) || bus_text.len() != 2 || device_function.len() != 4 {
+        return None;
+    }
+    let domain = u32::from_str_radix(domain_text, 16).ok()?;
+    let bus = u32::from_str_radix(bus_text, 16).ok()?;
+    if colon.next().is_some() || domain != 0 {
+        return None;
+    }
+    let (device, function) = device_function.split_once('.')?;
+    let device = u32::from_str_radix(device, 16).ok()?;
+    let function = u32::from_str_radix(function, 16).ok()?;
+    (device <= 0x1f && function <= 7).then_some((bus, device, function))
+}
+
 #[cfg(feature = "inference-worker")]
 fn worker_pack_capability(role: WorkerRole) -> Result<Option<WorkerPackCapability>> {
     use transcribe_cpp::DeviceType;
@@ -987,20 +1183,29 @@ fn worker_pack_capability(role: WorkerRole) -> Result<Option<WorkerPackCapabilit
         WorkerProvider::Cpu => bail!("CPU is not a GPU worker-pack backend"),
     };
     let expected_device_id = std::env::var(PACK_DEVICE_ID_ENV).ok();
-    let mut devices = transcribe_cpp::devices()
+    let driver_catalog = PackDriverCatalog::discover()
+        .context("could not obtain authoritative GPU driver identity")?;
+    let devices = transcribe_cpp::devices()
         .into_iter()
         .filter(|device| device.kind.trim().eq_ignore_ascii_case(expected_kind))
-        .filter_map(|device| {
-            let process_index = device.index?;
-            let native_id = device.device_id.as_deref()?.trim();
+        .map(|device| -> Result<WorkerPackDeviceCapability> {
+            let process_index = device
+                .index
+                .ok_or_else(|| anyhow!("GPU provider device has no live process index"))?;
+            let native_id = device
+                .device_id
+                .as_deref()
+                .ok_or_else(|| anyhow!("GPU provider device has no stable identity"))?
+                .trim();
             if native_id.is_empty() || !native_id.is_ascii() {
-                return None;
+                bail!("GPU provider device stable identity is malformed");
             }
             let stable_device_identity = format!("native:{}", native_id.to_ascii_lowercase());
             let display_name = [&device.description, &device.name]
                 .into_iter()
                 .map(|value| value.trim())
-                .find(|value| !value.is_empty() && value.is_ascii())?
+                .find(|value| !value.is_empty() && value.is_ascii())
+                .ok_or_else(|| anyhow!("GPU provider device has no bounded display name"))?
                 .to_owned();
             let device_class = match device.device_type {
                 DeviceType::Gpu if expectation.backend == WorkerProvider::Metal => {
@@ -1012,7 +1217,9 @@ fn worker_pack_capability(role: WorkerRole) -> Result<Option<WorkerPackCapabilit
                 }
                 DeviceType::Igpu => DeviceClass::IntegratedGpu,
                 DeviceType::Unknown => DeviceClass::Unknown,
-                DeviceType::Cpu | DeviceType::Accel => return None,
+                DeviceType::Cpu | DeviceType::Accel => {
+                    bail!("GPU provider returned a non-GPU device")
+                }
             };
             let normalized = format!("{} {}", device.name, device.description).to_ascii_lowercase();
             let vendor = match expectation.backend {
@@ -1028,17 +1235,21 @@ fn worker_pack_capability(role: WorkerRole) -> Result<Option<WorkerPackCapabilit
                 WorkerProvider::Vulkan => GpuVendor::Other,
                 WorkerProvider::Cpu => GpuVendor::Unknown,
             };
-            Some(WorkerPackDeviceCapability {
+            let driver_version = driver_catalog.identity_for(&stable_device_identity)?;
+            Ok(WorkerPackDeviceCapability {
                 stable_device_identity,
                 process_index,
                 display_name,
-                driver_version: None,
+                driver_version: Some(driver_version),
                 device_class,
                 vendor,
                 memory_total_bytes: device.memory_total,
                 memory_available_bytes: device.memory_free.min(device.memory_total),
             })
         })
+        .collect::<Result<Vec<_>>>()?;
+    let mut devices = devices
+        .into_iter()
         .filter(|device| {
             expected_device_id
                 .as_deref()
@@ -2331,6 +2542,9 @@ fn configure_worker_pack_environment(command: &mut Command, context: &PackLaunch
         .env(PACK_PROVIDER_ENV, &pack.provider);
     if let Some(device) = &context.expected_device {
         command.env(PACK_DEVICE_ID_ENV, device.device_id.as_str());
+        if let Some(driver) = &device.driver_version {
+            command.env(PACK_DRIVER_ID_ENV, driver);
+        }
     }
 }
 
@@ -4610,6 +4824,26 @@ impl InferenceWorkerSupervisor {
         Ok(bindings)
     }
 
+    fn reconcile_verified_pack_diagnostics(
+        &self,
+        resolved: &mut ResolvedAcceleration,
+    ) -> Result<(), RuntimeError> {
+        let bindings = self
+            .transport
+            .current_pack_bindings()
+            .map_err(worker_unavailable)?;
+        if bindings.is_empty() {
+            return Ok(());
+        }
+        if bindings.len() != 1 {
+            return Err(RuntimeError::WorkerUnavailable(
+                "active GPU worker produced an ambiguous device binding".to_owned(),
+            ));
+        }
+        let expected = bindings[0].backend_target();
+        reconcile_verified_pack_target(resolved, expected)
+    }
+
     /// Test-only process launcher for diagnostics that must exercise the real
     /// hidden worker role from a separately built Scribe executable. Production
     /// construction remains pinned to `current_exe()` and cannot be redirected
@@ -4669,7 +4903,13 @@ impl InferenceWorkerSupervisor {
             )
             .map_err(worker_unavailable)?
         {
-            Control::RuntimeLoaded { execution } => Ok(execution.into()),
+            Control::RuntimeLoaded { execution } => {
+                let mut execution: RuntimeLoadExecution = execution.into();
+                self.reconcile_verified_pack_diagnostics(
+                    &mut execution.diagnostics.resolved_acceleration,
+                )?;
+                Ok(execution)
+            }
             Control::RuntimeFailed { error } => {
                 Err(error.into_runtime_for_generation(&self.transport, generation))
             }
@@ -4810,7 +5050,13 @@ impl InferenceWorkerSupervisor {
             .active_round_trip(generation, session_id, end_id, &[end])
             .map_err(worker_unavailable)?
         {
-            Control::RuntimeTranscript { execution } => Ok(execution.into()),
+            Control::RuntimeTranscript { execution } => {
+                let mut execution: RuntimeExecution = execution.into();
+                self.reconcile_verified_pack_diagnostics(
+                    &mut execution.diagnostics.resolved_acceleration,
+                )?;
+                Ok(execution)
+            }
             Control::RuntimeFailed { error } => {
                 Err(error.into_runtime_for_generation(&self.transport, generation))
             }
@@ -4906,11 +5152,44 @@ fn worker_unavailable(error: impl std::fmt::Display) -> RuntimeError {
     RuntimeError::RetryableWorkerFailure(error.to_string())
 }
 
+fn reconcile_verified_pack_target(
+    resolved: &mut ResolvedAcceleration,
+    expected: BackendTarget,
+) -> Result<(), RuntimeError> {
+    let selection = resolved.selection.as_mut().ok_or_else(|| {
+        RuntimeError::WorkerUnavailable(
+            "GPU worker diagnostics omitted the typed backend selection".to_owned(),
+        )
+    })?;
+    let observed = &selection.target;
+    if observed.backend != expected.backend
+        || observed.provider_id != expected.provider_id
+        || observed.device_id != expected.device_id
+        || observed.driver_version != expected.driver_version
+        || observed.device_class != expected.device_class
+        || observed.vendor != expected.vendor
+        || observed.memory_total_bytes != expected.memory_total_bytes
+        || observed.process_index != expected.process_index
+    {
+        return Err(RuntimeError::WorkerUnavailable(
+            "GPU worker runtime diagnostics differ from the verified launch binding".to_owned(),
+        ));
+    }
+    selection.target = expected;
+    Ok(())
+}
+
 #[derive(Clone)]
 struct InferenceWorkerRoute {
     provider: WorkerProvider,
     supervisor: InferenceWorkerSupervisor,
     target: Option<BackendTarget>,
+}
+
+#[derive(Clone)]
+struct InferenceWorkerRoutePlan {
+    routes: Arc<Vec<InferenceWorkerRoute>>,
+    diagnostic: Option<String>,
 }
 
 /// Bounded provider registry above the process supervisor.
@@ -4922,22 +5201,54 @@ struct InferenceWorkerRoute {
 #[derive(Clone)]
 pub(crate) struct InferenceWorkerRegistry {
     routes: Arc<Vec<InferenceWorkerRoute>>,
-    gpu_routes: Arc<Mutex<Option<Arc<Vec<InferenceWorkerRoute>>>>>,
+    gpu_routes: Arc<Mutex<Option<InferenceWorkerRoutePlan>>>,
 }
 
 fn discover_production_pack_launch_bindings() -> crate::gpu_worker_pack::ProductionPackRegistry {
-    let bindings = crate::gpu_worker_pack::discover_production_pack_leases()
-        .into_iter()
-        .take(8)
-        .filter_map(|lease| {
-            let supervisor = InferenceWorkerSupervisor::for_pack_probe(lease);
-            let bindings = supervisor.verified_pack_bindings().ok();
-            let _ = supervisor.shutdown();
-            bindings
-        })
-        .flatten()
-        .collect();
+    use crate::gpu_worker_pack::{PackDiscoveryDiagnostic, PackDiscoveryIssue};
+
+    let discovery = crate::gpu_worker_pack::discover_production_pack_leases();
+    let mut diagnostics = discovery.diagnostics;
+    let mut bindings = Vec::new();
+    for lease in discovery.leases.into_iter().take(8) {
+        let pack_id = lease.verified_pack().pack_id.clone();
+        let backend = lease.verified_pack().backend;
+        let supervisor = InferenceWorkerSupervisor::for_pack_probe(lease);
+        match supervisor.verified_pack_bindings() {
+            Ok(observed) => {
+                for binding in observed {
+                    if binding.backend_target().driver_version.is_none() {
+                        diagnostics.push(PackDiscoveryDiagnostic::pack(
+                            PackDiscoveryIssue::DriverVersionUnavailable,
+                            &pack_id,
+                            backend,
+                        ));
+                    } else {
+                        bindings.push(binding);
+                    }
+                }
+            }
+            Err(_) => diagnostics.push(PackDiscoveryDiagnostic::pack(
+                PackDiscoveryIssue::ProviderProbeRejected,
+                &pack_id,
+                backend,
+            )),
+        }
+        let _ = supervisor.shutdown();
+    }
     crate::gpu_worker_pack::ProductionPackRegistry::from_launch_bindings(bindings)
+        .with_diagnostics(diagnostics)
+}
+
+fn append_pack_diagnostic(resolved: &mut ResolvedAcceleration, diagnostic: Option<&str>) {
+    let Some(diagnostic) = diagnostic.filter(|value| !value.is_empty()) else {
+        return;
+    };
+    let combined = match resolved.diagnostic.take() {
+        Some(existing) => format!("{existing}; {diagnostic}"),
+        None => diagnostic.to_owned(),
+    };
+    resolved.diagnostic = Some(combined.chars().take(MAX_DIAGNOSTIC_BYTES).collect());
 }
 
 impl InferenceWorkerRegistry {
@@ -4983,20 +5294,31 @@ impl InferenceWorkerRegistry {
     fn routes_for_preference(
         &self,
         preference: AccelerationPreference,
-    ) -> Result<Arc<Vec<InferenceWorkerRoute>>, RuntimeError> {
-        if preference != AccelerationPreference::Gpu {
+    ) -> Result<InferenceWorkerRoutePlan, RuntimeError> {
+        if preference == AccelerationPreference::Cpu {
+            return Ok(InferenceWorkerRoutePlan {
+                routes: Arc::clone(&self.routes),
+                diagnostic: None,
+            });
+        }
+        if preference == AccelerationPreference::Auto {
             // Auto remains deliberately default-denied for Stage 4. It does
             // not launch a provider merely to calibrate or probe the machine.
-            return Ok(Arc::clone(&self.routes));
+            let discovery = crate::gpu_worker_pack::discover_production_pack_leases();
+            return Ok(InferenceWorkerRoutePlan {
+                routes: Arc::clone(&self.routes),
+                diagnostic: Some(discovery.diagnostic_summary()),
+            });
         }
         let mut cached = self.gpu_routes.lock().map_err(|_| {
             RuntimeError::WorkerUnavailable("GPU worker registry lock poisoned".to_owned())
         })?;
-        if let Some(routes) = cached.as_ref() {
-            return Ok(Arc::clone(routes));
+        if let Some(plan) = cached.as_ref() {
+            return Ok(plan.clone());
         }
-        let mut routes = discover_production_pack_launch_bindings()
-            .into_bindings()
+        let registry = discover_production_pack_launch_bindings();
+        let (bindings, diagnostics) = registry.into_parts();
+        let mut routes = bindings
             .into_iter()
             .map(|binding| {
                 let target = binding.backend_target();
@@ -5028,9 +5350,23 @@ impl InferenceWorkerRegistry {
             };
             key(left).cmp(&key(right))
         });
+        let mut diagnostic = crate::gpu_worker_pack::diagnostic_summary(&diagnostics);
+        if routes.len() > 4 {
+            let skipped = routes.len() - 4;
+            if !diagnostic.is_empty() {
+                diagnostic.push_str("; ");
+            }
+            diagnostic.push_str(&format!(
+                "{skipped} additional verified GPU route(s) are outside the four-route fallback bound"
+            ));
+        }
         let routes = Arc::new(routes);
-        *cached = Some(Arc::clone(&routes));
-        Ok(routes)
+        let plan = InferenceWorkerRoutePlan {
+            routes,
+            diagnostic: (!diagnostic.is_empty()).then_some(diagnostic),
+        };
+        *cached = Some(plan.clone());
+        Ok(plan)
     }
 
     fn no_route_error(preference: AccelerationPreference) -> RuntimeError {
@@ -5052,11 +5388,19 @@ impl InferenceWorkerRegistry {
     ) -> Result<RuntimeLoadExecution, RuntimeError> {
         let mut last_retryable = None;
         let mut attempted = false;
-        let routes = self.routes_for_preference(preference)?;
-        for route in routes.iter().take(4) {
+        let plan = self.routes_for_preference(preference)?;
+        for route in plan.routes.iter().take(4) {
             attempted = true;
             match route.supervisor.load(artifact.clone(), preference) {
-                Ok(execution) => return Ok(execution),
+                Ok(mut execution) => {
+                    if matches!(artifact, RuntimeArtifact::Gguf(_)) {
+                        append_pack_diagnostic(
+                            &mut execution.diagnostics.resolved_acceleration,
+                            plan.diagnostic.as_deref(),
+                        );
+                    }
+                    return Ok(execution);
+                }
                 Err(error @ RuntimeError::RetryableWorkerFailure(_)) => {
                     last_retryable = Some(error);
                 }
@@ -5065,7 +5409,14 @@ impl InferenceWorkerRegistry {
         }
         Err(last_retryable.unwrap_or_else(|| {
             debug_assert!(!attempted);
-            Self::no_route_error(preference)
+            match plan.diagnostic {
+                Some(diagnostic) if preference == AccelerationPreference::Gpu => {
+                    RuntimeError::WorkerUnavailable(format!(
+                        "no GPU inference worker is registered; CPU fallback is forbidden for explicit GPU; {diagnostic}"
+                    ))
+                }
+                _ => Self::no_route_error(preference),
+            }
         }))
     }
 
@@ -5080,8 +5431,8 @@ impl InferenceWorkerRegistry {
     ) -> Result<RuntimeExecution, RuntimeError> {
         let mut last_retryable = None;
         let mut attempted = false;
-        let routes = self.routes_for_preference(preference)?;
-        for route in routes.iter().take(4) {
+        let plan = self.routes_for_preference(preference)?;
+        for route in plan.routes.iter().take(4) {
             attempted = true;
             match route.supervisor.transcribe(
                 artifact.clone(),
@@ -5091,7 +5442,15 @@ impl InferenceWorkerRegistry {
                 cancellation_snapshot,
                 cancellation_generation,
             ) {
-                Ok(execution) => return Ok(execution),
+                Ok(mut execution) => {
+                    if matches!(artifact, RuntimeArtifact::Gguf(_)) {
+                        append_pack_diagnostic(
+                            &mut execution.diagnostics.resolved_acceleration,
+                            plan.diagnostic.as_deref(),
+                        );
+                    }
+                    return Ok(execution);
+                }
                 Err(error @ RuntimeError::RetryableWorkerFailure(_)) => {
                     last_retryable = Some(error);
                 }
@@ -5100,7 +5459,14 @@ impl InferenceWorkerRegistry {
         }
         Err(last_retryable.unwrap_or_else(|| {
             debug_assert!(!attempted);
-            Self::no_route_error(preference)
+            match plan.diagnostic {
+                Some(diagnostic) if preference == AccelerationPreference::Gpu => {
+                    RuntimeError::WorkerUnavailable(format!(
+                        "no GPU inference worker is registered; CPU fallback is forbidden for explicit GPU; {diagnostic}"
+                    ))
+                }
+                _ => Self::no_route_error(preference),
+            }
         }))
     }
 
@@ -5111,8 +5477,8 @@ impl InferenceWorkerRegistry {
     ) -> Result<(), RuntimeError> {
         let mut last_retryable = None;
         let mut attempted = false;
-        let routes = self.routes_for_preference(preference)?;
-        for route in routes.iter().take(4) {
+        let plan = self.routes_for_preference(preference)?;
+        for route in plan.routes.iter().take(4) {
             attempted = true;
             match route.supervisor.health(artifact.clone(), preference) {
                 Ok(()) => return Ok(()),
@@ -5124,7 +5490,14 @@ impl InferenceWorkerRegistry {
         }
         Err(last_retryable.unwrap_or_else(|| {
             debug_assert!(!attempted);
-            Self::no_route_error(preference)
+            match plan.diagnostic {
+                Some(diagnostic) if preference == AccelerationPreference::Gpu => {
+                    RuntimeError::WorkerUnavailable(format!(
+                        "no GPU inference worker is registered; CPU fallback is forbidden for explicit GPU; {diagnostic}"
+                    ))
+                }
+                _ => Self::no_route_error(preference),
+            }
         }))
     }
 
@@ -5135,7 +5508,7 @@ impl InferenceWorkerRegistry {
         if let Ok(routes) = self.gpu_routes.lock()
             && let Some(routes) = routes.as_ref()
         {
-            for route in routes.iter() {
+            for route in routes.routes.iter() {
                 route.supervisor.unload()?;
             }
         }
@@ -5149,7 +5522,7 @@ impl InferenceWorkerRegistry {
         if let Ok(routes) = self.gpu_routes.lock()
             && let Some(routes) = routes.as_ref()
         {
-            for route in routes.iter() {
+            for route in routes.routes.iter() {
                 route.supervisor.unload_if_idle()?;
             }
         }
@@ -5163,7 +5536,7 @@ impl InferenceWorkerRegistry {
         if let Ok(routes) = self.gpu_routes.lock()
             && let Some(routes) = routes.as_ref()
         {
-            for route in routes.iter() {
+            for route in routes.routes.iter() {
                 route.supervisor.cancel_active();
             }
         }
@@ -5176,7 +5549,7 @@ impl InferenceWorkerRegistry {
         if let Ok(routes) = self.gpu_routes.lock()
             && let Some(routes) = routes.as_ref()
         {
-            for route in routes.iter() {
+            for route in routes.routes.iter() {
                 route.supervisor.shutdown()?;
             }
         }
@@ -7608,6 +7981,9 @@ mod tests {
             bind_pack_hello(&context, &capability).expect("stable identity remaps index");
         assert_eq!(bindings[0].backend_target().process_index, Some(2));
 
+        let mut changed_driver = capability.clone();
+        changed_driver.devices[0].driver_version = Some("fixture-driver-2".to_owned());
+        assert!(bind_pack_hello(&context, &changed_driver).is_err());
         let mut wrong_device = capability;
         wrong_device.devices[0].stable_device_identity = "native:pci:0000:02:00.0".to_owned();
         assert!(bind_pack_hello(&context, &wrong_device).is_err());
@@ -7631,7 +8007,7 @@ mod tests {
             stable_device_identity: identity.to_owned(),
             process_index: index,
             display_name: format!("Fixture GPU {index}"),
-            driver_version: None,
+            driver_version: Some("windows-display:32.0.15.8088".to_owned()),
             device_class: DeviceClass::DiscreteGpu,
             vendor: GpuVendor::Nvidia,
             memory_total_bytes: 8 * 1024 * 1024 * 1024,
@@ -7680,6 +8056,68 @@ mod tests {
         drop(bindings);
         drop(context);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn native_pci_identity_parser_is_canonical_and_bounded() {
+        assert_eq!(
+            parse_native_pci_location("native:pci:0000:01:00.0"),
+            Some((1, 0, 0))
+        );
+        assert_eq!(
+            parse_native_pci_location("native:0000:ff:1f.7"),
+            Some((255, 31, 7))
+        );
+        assert_eq!(
+            parse_native_pci_location("native:pci:00000000:01:00.0"),
+            Some((1, 0, 0))
+        );
+        for invalid in [
+            "pci:0000:01:00.0",
+            "native:pci:0001:01:00.0",
+            "native:pci:0000:100:00.0",
+            "native:pci:0000:01:20.0",
+            "native:pci:0000:01:00.8",
+            "native:pci:0000:01:00",
+            "native:pci:0000:01:00.0:extra",
+            "native:pci:0000:0A:00.0",
+        ] {
+            assert_eq!(parse_native_pci_location(invalid), None, "{invalid}");
+        }
+    }
+
+    #[cfg(all(
+        windows,
+        feature = "inference-worker",
+        any(feature = "cuda-acceleration", feature = "vulkan-acceleration")
+    ))]
+    #[test]
+    #[ignore = "requires a qualified Windows GPU and the pinned provider toolchain"]
+    fn windows_provider_devices_have_authoritative_driver_identity() {
+        transcribe_cpp::init_backends_default().unwrap();
+        let expected_kind = if cfg!(feature = "cuda-acceleration") {
+            "cuda"
+        } else {
+            "vulkan"
+        };
+        let catalog = PackDriverCatalog::discover().unwrap();
+        let devices = transcribe_cpp::devices()
+            .into_iter()
+            .filter(|device| device.kind.eq_ignore_ascii_case(expected_kind))
+            .collect::<Vec<_>>();
+        assert!(!devices.is_empty());
+        for device in devices {
+            let stable = format!(
+                "native:{}",
+                device
+                    .device_id
+                    .expect("provider stable ID")
+                    .to_ascii_lowercase()
+            );
+            let driver = catalog.identity_for(&stable).unwrap();
+            assert!(driver.starts_with("windows-display:"));
+            assert!(driver.len() <= 128);
+        }
     }
 
     #[cfg(windows)]
@@ -8090,6 +8528,43 @@ mod tests {
     }
 
     #[test]
+    fn verified_pack_target_is_projected_into_typed_backend_diagnostics() {
+        let mut diagnostics = diagnostics_with_typed_backend_selection();
+        let observed = diagnostics
+            .resolved_acceleration
+            .selection
+            .as_mut()
+            .unwrap();
+        observed.target.driver_version = Some("windows-display:32.0.15.8088".to_owned());
+        let mut expected = observed.target.clone();
+        expected.pack = Some(crate::backend_policy::BackendPackIdentity {
+            pack_id: "scribe-cuda-windows-x64".to_owned(),
+            pack_version: "1.0.0".to_owned(),
+            pack_digest: "a".repeat(64),
+            security_epoch: 1,
+            runtime_abi: crate::gpu_worker_pack::manifest::RUNTIME_ABI_VERSION,
+        });
+        reconcile_verified_pack_target(&mut diagnostics.resolved_acceleration, expected.clone())
+            .unwrap();
+        assert_eq!(
+            diagnostics
+                .resolved_acceleration
+                .selection
+                .as_ref()
+                .unwrap()
+                .target,
+            expected
+        );
+
+        let mut changed_driver = expected;
+        changed_driver.driver_version = Some("windows-display:32.0.15.9000".to_owned());
+        assert!(
+            reconcile_verified_pack_target(&mut diagnostics.resolved_acceleration, changed_driver)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn runtime_errors_keep_a_stable_typed_wire_category() {
         let mut output = Vec::new();
         write_runtime_result(
@@ -8285,6 +8760,26 @@ mod tests {
     }
 
     #[test]
+    fn auto_reports_pack_discovery_state_without_launching_a_gpu_probe() {
+        let launcher = Arc::new(TestLauncher::new([]));
+        let registry = InferenceWorkerRegistry::with_cpu_supervisor(InferenceWorkerSupervisor {
+            transport: ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+                launcher.clone(),
+                short_deadlines(),
+            ),
+            next_correlation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        });
+        let plan = registry
+            .routes_for_preference(AccelerationPreference::Auto)
+            .unwrap();
+        assert_eq!(plan.routes.len(), 1);
+        assert_eq!(plan.routes[0].provider, WorkerProvider::Cpu);
+        assert!(plan.diagnostic.is_some_and(|value| !value.is_empty()));
+        assert_eq!(launcher.launches.load(Ordering::Acquire), 0);
+        assert!(registry.gpu_routes.lock().unwrap().is_none());
+    }
+
+    #[test]
     fn registry_fallback_is_bounded_to_registered_pre_output_failures() {
         let first = Arc::new(TestLauncher::new([TestMode::CapabilityMismatch(
             CapabilityMismatch::Challenge,
@@ -8346,10 +8841,13 @@ mod tests {
                 },
                 target: Some(BackendTarget::cpu()),
             }]),
-            gpu_routes: Arc::new(Mutex::new(Some(Arc::new(vec![
-                route(first.clone(), "native:pci:0000:01:00.0"),
-                route(second.clone(), "native:pci:0000:02:00.0"),
-            ])))),
+            gpu_routes: Arc::new(Mutex::new(Some(InferenceWorkerRoutePlan {
+                routes: Arc::new(vec![
+                    route(first.clone(), "native:pci:0000:01:00.0"),
+                    route(second.clone(), "native:pci:0000:02:00.0"),
+                ]),
+                diagnostic: None,
+            }))),
         };
         assert!(
             registry
