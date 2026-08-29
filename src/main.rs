@@ -16,6 +16,7 @@ mod diagnostics;
 mod disk_space;
 #[cfg(test)]
 mod embedded_runtime;
+mod gpu_worker_pack;
 mod history;
 mod history_playback;
 mod hotkey;

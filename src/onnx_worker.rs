@@ -45,14 +45,14 @@ pub(crate) const PROTOCOL_MAGIC: [u8; 4] = *b"SCIF";
 pub(crate) const PROTOCOL_VERSION: u8 = 5;
 pub(crate) const INFERENCE_WORKER_FLAG: &str = "--scribe-inference-worker";
 pub(crate) const VAD_WORKER_FLAG: &str = "--scribe-vad-worker";
-const WORKER_ABI_VERSION: u16 = 1;
-const DESKTOP_BUILD_ID: &str = concat!(
+pub(crate) const WORKER_ABI_VERSION: u16 = 1;
+pub(crate) const DESKTOP_BUILD_ID: &str = concat!(
     "local-transcriber@",
     env!("CARGO_PKG_VERSION"),
     "#",
     env!("SCRIBE_BUILD_REVISION")
 );
-const INFERENCE_WORKER_BUILD_ID: &str = concat!(
+pub(crate) const INFERENCE_WORKER_BUILD_ID: &str = concat!(
     "scribe-inference-worker@",
     env!("CARGO_PKG_VERSION"),
     "#",
