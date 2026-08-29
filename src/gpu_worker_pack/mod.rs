@@ -8,9 +8,14 @@ pub(crate) mod health;
 pub(crate) mod manifest;
 pub(crate) mod store;
 
+// Stage 4 consumes the bridge re-export; Stage 3's production registry is
+// deliberately empty, so the non-test binary has no implementation yet.
+#[allow(unused_imports)]
 pub(crate) use launch_binding::{ResolverHelloBindingBridge, VerifiedPackLaunchBinding};
 
 mod launch_binding {
+    #[cfg(unix)]
+    use std::fs::File;
     use std::sync::Arc;
 
     use super::manifest::{PackBackend, VerifiedPack, VerifiedPackLease};
@@ -20,6 +25,8 @@ mod launch_binding {
     /// the opaque binding compares every value with the reverified descriptor.
     pub(crate) trait ResolverHelloBindingBridge {
         fn resolver_verified_pack_lease(&self) -> Arc<VerifiedPackLease>;
+        #[cfg(unix)]
+        fn resolver_unix_launch_authority(&self) -> Arc<UnixPackExecAuthority>;
         fn hello_pack_id(&self) -> &str;
         fn hello_pack_version(&self) -> &str;
         fn hello_pack_digest(&self) -> &str;
@@ -27,6 +34,36 @@ mod launch_binding {
         fn hello_backend(&self) -> PackBackend;
         fn hello_provider(&self) -> &str;
         fn hello_stable_device_identity(&self) -> &str;
+    }
+
+    /// Stage 4's Unix resolver must produce both authorities from no-follow,
+    /// descriptor-relative opens. A path plus a lease is deliberately not a
+    /// substitute: the executable handle must reach `execveat`/`fexecve` and
+    /// the dependency-root handle must remain live through Hello validation.
+    #[cfg(unix)]
+    #[derive(Debug)]
+    pub(crate) struct UnixPackExecAuthority {
+        executable_fd: File,
+        dependency_root_fd: File,
+    }
+
+    #[cfg(unix)]
+    impl UnixPackExecAuthority {
+        pub(crate) fn executable_fd(&self) -> &File {
+            &self.executable_fd
+        }
+
+        pub(crate) fn dependency_root_fd(&self) -> &File {
+            &self.dependency_root_fd
+        }
+
+        #[cfg(test)]
+        fn fixture(executable_fd: File, dependency_root_fd: File) -> Self {
+            Self {
+                executable_fd,
+                dependency_root_fd,
+            }
+        }
     }
 
     /// Opaque proof that a concrete resolver result and worker Hello agreed on
@@ -37,6 +74,8 @@ mod launch_binding {
     pub(crate) struct VerifiedPackLaunchBinding {
         verified_pack_lease: Arc<VerifiedPackLease>,
         stable_device_identity: String,
+        #[cfg(unix)]
+        unix_exec_authority: Arc<UnixPackExecAuthority>,
     }
 
     impl VerifiedPackLaunchBinding {
@@ -44,6 +83,8 @@ mod launch_binding {
             bridge: &impl ResolverHelloBindingBridge,
         ) -> Option<Self> {
             let lease = bridge.resolver_verified_pack_lease();
+            #[cfg(unix)]
+            let unix_exec_authority = bridge.resolver_unix_launch_authority();
             let pack = lease.verified_pack();
             let stable_device_identity = bridge.hello_stable_device_identity();
             let stable_device_is_canonical = !stable_device_identity.is_empty()
@@ -62,6 +103,8 @@ mod launch_binding {
                 .then(|| Self {
                     verified_pack_lease: lease,
                     stable_device_identity: stable_device_identity.to_owned(),
+                    #[cfg(unix)]
+                    unix_exec_authority,
                 })
         }
 
@@ -75,6 +118,11 @@ mod launch_binding {
 
         pub(crate) fn stable_device_identity(&self) -> &str {
             &self.stable_device_identity
+        }
+
+        #[cfg(unix)]
+        pub(crate) fn unix_exec_authority(&self) -> &UnixPackExecAuthority {
+            &self.unix_exec_authority
         }
     }
 }
@@ -165,6 +213,27 @@ mod tests {
     impl ResolverHelloBindingBridge for FixtureBridge {
         fn resolver_verified_pack_lease(&self) -> Arc<VerifiedPackLease> {
             Arc::clone(&self.lease)
+        }
+
+        #[cfg(unix)]
+        fn resolver_unix_launch_authority(
+            &self,
+        ) -> Arc<super::launch_binding::UnixPackExecAuthority> {
+            use std::os::unix::fs::OpenOptionsExt;
+            let executable = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(self.lease.worker_path())
+                .unwrap();
+            let dependency_root = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(&self.lease.verified_pack().root)
+                .unwrap();
+            Arc::new(super::launch_binding::UnixPackExecAuthority::fixture(
+                executable,
+                dependency_root,
+            ))
         }
 
         fn hello_pack_id(&self) -> &str {

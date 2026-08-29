@@ -71,7 +71,11 @@ and require the descriptor root to derive exactly from the immutable store.
 A per-pack-ID security-epoch high-water record is durably raised before
 activation; rollback can select a lower version only at or above that floor.
 All store read-modify-write transitions are serialized across processes with a
-private no-follow OS-backed lock. Epoch-raising activation first writes a
+private no-follow OS-backed lock. The lock is taken against the retained parent
+directory authority before the state root is opened: Unix locks the retained
+directory inode, while Windows retains a non-delete-sharing private lock-file
+handle. A state-root rename or junction swap therefore cannot split the lock
+from the reads and replacements it protects. Epoch-raising activation first writes a
 bounded pending-activation journal containing the verified target and exact
 prior/next state witnesses. Recovery reverifies the target and completes a
 transaction interrupted after the journal, epoch, or activation write without
@@ -145,3 +149,16 @@ must obtain those bindings from a concrete
 `ProductionPackRegistry::from_launch_bindings`; it cannot insert a raw
 `VerifiedPack`. Stage 3 implements neither the bridge nor discovery path and
 constructs only `ProductionPackRegistry::empty()`.
+
+Windows is the first intended production target: its future resolver must keep
+the verified directory/file lease alive through exact-image launch and the
+challenge-bound Hello check. Unix production remains fail closed. Before a
+Unix catalog or trust root can become nonempty, the resolver bridge must also
+produce an opaque `UnixPackExecAuthority` containing an already-open executable
+FD and an anchored dependency-root directory FD. The launch path must consume
+those authorities through `execveat`/`fexecve`-equivalent execution and retain
+the dependency-root authority through Hello validation. `PathBuf`,
+`Arc<VerifiedPackLease>`, and `Command::spawn` are not Unix execution authority
+and cannot satisfy the provisioning guard. Unsupported Unix variants must
+remain fail closed until an equivalent descriptor-relative execution primitive
+is implemented and tested.

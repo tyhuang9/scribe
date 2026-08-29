@@ -199,6 +199,7 @@ fn production_pack_provisioning_allowed(
     registry_body: &str,
     worker: &str,
     trust_root_is_empty: bool,
+    unix_target: bool,
 ) -> bool {
     let registry_is_empty = registry_body.contains("ProductionPackRegistry::empty()")
         && !registry_body.contains("from_launch_bindings");
@@ -213,11 +214,20 @@ fn production_pack_provisioning_allowed(
         && worker.contains("VerifiedPackLaunchBinding::try_from_resolver_hello_bridge")
         && worker.contains("trait WorkerExecutableResolver")
         && worker.contains("Hello");
+    let unix_fd_launch_flow = !unix_target
+        || (worker.contains("UnixPackExecAuthority")
+            && worker.contains("resolver_unix_launch_authority")
+            && worker.contains("executable_fd")
+            && worker.contains("dependency_root_fd")
+            && (worker.contains("execveat") || worker.contains("fexecve"))
+            && !worker.contains("Command::spawn")
+            && !worker.contains("Command::new"));
     (registry_is_empty && trust_root_is_empty)
         || (!registry_is_empty
             && !trust_root_is_empty
             && registry_routes_concrete_bridge
-            && concrete_resolver_hello_flow)
+            && concrete_resolver_hello_flow
+            && unix_fd_launch_flow)
 }
 
 #[test]
@@ -261,6 +271,7 @@ fn stage_four_guard_rejects_dead_binding_declarations() {
         populated_registry,
         dead_declarations,
         false,
+        false,
     ));
 
     let concrete_flow = r#"
@@ -279,10 +290,30 @@ fn stage_four_guard_rejects_dead_binding_declarations() {
         populated_registry,
         concrete_flow,
         false,
+        false,
+    ));
+    let raw_path_spawn_flow = format!(
+        "{concrete_flow}\nfn launch_worker_from_verified_pack_lease(path: PathBuf, lease: Arc<VerifiedPackLease>) {{ Command::new(path).spawn(); }}"
+    );
+    assert!(!production_pack_provisioning_allowed(
+        populated_registry,
+        &raw_path_spawn_flow,
+        false,
+        true,
+    ));
+    let unix_fd_flow = format!(
+        "{concrete_flow}\nstruct UnixPackExecAuthority {{ executable_fd: OwnedFd, dependency_root_fd: OwnedFd }}\nfn resolver_unix_launch_authority() -> UnixPackExecAuthority {{}}\nfn launch_worker_from_verified_pack_lease() {{ execveat(executable_fd, dependency_root_fd); }}"
+    );
+    assert!(production_pack_provisioning_allowed(
+        populated_registry,
+        &unix_fd_flow,
+        false,
+        true,
     ));
     assert!(production_pack_provisioning_allowed(
         "{ ProductionPackRegistry::empty() ",
         "",
+        true,
         true,
     ));
 }
@@ -747,6 +778,10 @@ fn verified_worker_pack_stage_remains_fail_closed_and_provider_inert() {
         "bridge.hello_backend() == pack.backend",
         "bridge.hello_provider() == pack.provider",
         "hello_stable_device_identity",
+        "struct UnixPackExecAuthority",
+        "resolver_unix_launch_authority",
+        "executable_fd",
+        "dependency_root_fd",
     ] {
         assert!(
             module.contains(required),
@@ -763,7 +798,12 @@ fn verified_worker_pack_stage_remains_fail_closed_and_provider_inert() {
         );
     }
     assert!(
-        production_pack_provisioning_allowed(registry_body, worker, trust_root_is_empty),
+        production_pack_provisioning_allowed(
+            registry_body,
+            worker,
+            trust_root_is_empty,
+            cfg!(unix),
+        ),
         "production pack trust/catalog cannot be provisioned before production discovery consumes concrete typed bindings created by WorkerExecutableResolver and Hello validation"
     );
     for required in [
