@@ -490,6 +490,11 @@ try {
         throw "Could not read the Scribe version from Cargo.toml."
     }
     $portableReadme = Join-Path $stagingBundle "README.txt"
+    $packContents = if ($packStage.PackCount -eq 0) {
+        "This Stage 4 package contains no GPU worker packs. CPU remains guaranteed, and explicit GPU returns a clear error. Non-empty pack publication remains fail-closed until a reviewed production public key and matching external CI signing secret are provisioned."
+    } else {
+        "This Stage 4 package contains $($packStage.PackCount) verified Windows x64 GPU worker pack(s) in immutable version-and-digest directories. Explicit GPU may use qualified CUDA/Vulkan routes; Auto remains default-denied to GPU until Stage 5 hardware qualification."
+    }
     $portableReadmeText = @(
         "Scribe $($versionMatch.Groups[1].Value) - Windows x64 self-contained package",
         "",
@@ -498,8 +503,8 @@ try {
         "Installer: the installer copies this exact portable payload into the per-user Scribe program directory and adds only its uninstaller pair.",
         "",
         "CONTENTS",
-        "The package contains the Scribe desktop, its dedicated CPU inference worker, the pinned English Base GGUF, its manifest, an empty verified worker-pack catalog, a hash inventory, this README, and reviewed license/provenance notices. Native transcribe.cpp, whisper.cpp, sherpa-onnx, and Silero VAD support are statically linked into the appropriate executable; there is no runtime folder, loose DLL, or loose ONNX model.",
-        "This Stage 3 release ships no CUDA, Vulkan, or Metal worker pack. Non-empty declared pack roots fail closed until a persistent production public key and matching external CI signing secret are provisioned.",
+        "The package contains the Scribe desktop, its dedicated CPU inference worker, the pinned English Base GGUF, its manifest, a verified worker-pack catalog, a hash inventory, this README, and reviewed license/provenance notices. Native transcribe.cpp, whisper.cpp, sherpa-onnx, and Silero VAD support are statically linked into the appropriate executable; there is no dynamic runtime download, loose ONNX model, or UI-loaded GPU provider.",
+        $packContents,
         "Moonshine ONNX weights are not packaged. When requested, Scribe downloads them separately as receipt-backed per-user app-data artifacts.",
         "",
         "MANUAL VERIFICATION",

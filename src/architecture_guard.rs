@@ -796,7 +796,7 @@ fn native_runtime_ownership_is_confined_to_exact_owner_paths() {
 }
 
 #[test]
-fn verified_worker_pack_stage_remains_fail_closed_and_provider_inert() {
+fn verified_worker_pack_stage_four_remains_trust_closed_and_auto_inert() {
     let desktop = include_str!("main.rs");
     let module = include_str!("gpu_worker_pack/mod.rs");
     let health = include_str!("gpu_worker_pack/health.rs");
@@ -818,8 +818,8 @@ fn verified_worker_pack_stage_remains_fail_closed_and_provider_inert() {
         .and_then(|source| source.split('}').next())
         .is_some_and(|body| body.contains("None"));
     for dormant_lint_reason in [
-        "provider-neutral qualification policy remains dormant until a production GPU provider ships",
-        "Stage 3 compiles the sealed verifier and store before Stage 4 provisions production trust or discovery",
+        "provider qualification policy remains dormant until Stage 5 enables GPU routes for Auto",
+        "Stage 4 retains verified-pack activation and rollback seams beyond bundled catalog discovery",
     ] {
         assert!(desktop.contains(dormant_lint_reason));
     }
@@ -884,7 +884,8 @@ fn verified_worker_pack_stage_remains_fail_closed_and_provider_inert() {
         "ID/version/digest",
         "backend/provider",
         "stable device",
-        "before any production trust root or catalog",
+        "ProductionTrustRoot",
+        "reviewed public key",
     ] {
         assert!(
             documentation.contains(required),
@@ -901,6 +902,20 @@ fn verified_worker_pack_stage_remains_fail_closed_and_provider_inert() {
     assert!(module.contains("PackBackend::Cuda"));
     assert!(module.contains("PackBackend::Vulkan"));
     assert!(module.contains("PackBackend::Metal"));
+    for required in [
+        "fn discover_production_pack_launch_bindings(",
+        "InferenceWorkerSupervisor::for_pack_probe(lease)",
+        "verified_pack_bindings()",
+        "ProductionPackRegistry::from_launch_bindings(bindings)",
+        "preference == AccelerationPreference::Auto",
+        "Auto remains deliberately default-denied for Stage 4",
+        "routes: Arc::clone(&self.routes)",
+    ] {
+        assert!(
+            worker.contains(required),
+            "Stage 4 verified discovery/default-denied Auto contract lost {required:?}"
+        );
+    }
 }
 
 #[test]
@@ -1048,6 +1063,21 @@ fn release_packaging_accepts_only_compiled_verified_declared_pack_roots() {
     assert!(installer.contains("#include WorkerPackAllowlist"));
     assert!(installer.contains("IsGeneratedWorkerPackFile(RelativePath)"));
     assert!(workflow.contains("/DWorkerPackAllowlist=..\\dist\\worker-pack-allowlist.iss"));
+    for required in [
+        "include_gpu_worker_packs:",
+        "default: false",
+        "SCRIBE_GPU_PACK_SIGNING_KEY_PKCS8_BASE64",
+        "prepare-windows-gpu-worker-packs.ps1",
+        "artifacts\\gpu-worker-packs\\production\\cuda",
+        "artifacts\\gpu-worker-packs\\production\\vulkan",
+        "-WorkerPackRoot $workerPackRoots",
+        "report-windows-worker-pack-sizes.ps1",
+    ] {
+        assert!(
+            workflow.contains(required),
+            "Stage 4 release workflow lost {required:?}"
+        );
+    }
     assert!(!build.contains("--features vulkan-acceleration"));
 }
 

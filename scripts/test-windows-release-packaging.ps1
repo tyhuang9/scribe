@@ -195,6 +195,46 @@ function Assert-VulkanSdkWorkflowContract([string]$Workflow) {
     }
 }
 
+function Assert-GpuWorkerPackWorkflowContract([string]$Workflow) {
+    foreach ($required in @(
+        'include_gpu_worker_packs:',
+        'default: false',
+        "if: github.event_name == 'workflow_dispatch' && inputs.include_gpu_worker_packs",
+        'SCRIBE_GPU_PACK_SIGNING_KEY_PKCS8_BASE64',
+        'SCRIBE_GPU_PACK_SIGNING_KEY_ID',
+        '[Convert]::FromBase64String',
+        '$keyBytes.Length -lt 32 -or $keyBytes.Length -gt 16384',
+        '$env:RUNNER_TEMP',
+        '[System.IO.File]::WriteAllBytes($keyPath, $keyBytes)',
+        'prepare-windows-gpu-worker-packs.ps1',
+        '[Array]::Clear($keyBytes, 0, $keyBytes.Length)',
+        'Remove-Item -LiteralPath $keyPath -Force',
+        'artifacts\gpu-worker-packs\production\cuda',
+        'artifacts\gpu-worker-packs\production\vulkan',
+        '-WorkerPackRoot $workerPackRoots',
+        'report-windows-worker-pack-sizes.ps1',
+        'dist/gpu-pack-evidence'
+    )) {
+        if (-not $Workflow.Contains($required)) {
+            throw "Windows GPU worker-pack workflow lost required fail-closed control: $required"
+        }
+    }
+    $gpuBuild = Get-WorkflowStepBlock $Workflow 'Build production-signed CUDA and Vulkan worker packs' 'Build validated portable payload'
+    Assert-OrderedWorkflowTokens $gpuBuild @(
+        'SCRIBE_GPU_PACK_SIGNING_KEY_PKCS8_BASE64',
+        'SCRIBE_GPU_PACK_SIGNING_KEY_ID',
+        '[Convert]::FromBase64String',
+        '[System.IO.File]::WriteAllBytes($keyPath, $keyBytes)',
+        'prepare-windows-gpu-worker-packs.ps1',
+        'finally {',
+        '[Array]::Clear($keyBytes, 0, $keyBytes.Length)',
+        'Remove-Item -LiteralPath $keyPath -Force'
+    ) 'GPU signing secret lifecycle'
+    if ($gpuBuild.Contains('Fixture') -or $gpuBuild.Contains('fixture')) {
+        throw 'Release workflow must never admit fixture signing or fixture trust.'
+    }
+}
+
 function Assert-InnoCompilerWorkflowContract([string]$Workflow) {
     $acquire = Get-WorkflowStepBlock $Workflow 'Acquire digest-pinned Inno Setup' 'Build and normalize Windows installer'
     $build = Get-WorkflowStepBlock $Workflow 'Build and normalize Windows installer' 'Package portable ZIP'
@@ -550,6 +590,15 @@ try {
         @([regex]::Matches($emptyAllowlistSource, 'Result := False;')).Count -ne 2) {
         throw 'Empty worker-pack installer allowlist must fail closed for files and directories.'
     }
+    $emptySizeReport = Join-Path $testRoot 'empty-worker-pack-size-report.json'
+    & (Join-Path $repositoryRoot 'scripts\report-windows-worker-pack-sizes.ps1') `
+        -CatalogPath (Join-Path $emptyPackBundle 'worker-pack-catalog.json') `
+        -OutputPath $emptySizeReport
+    $emptySizeEvidence = Get-Content -LiteralPath $emptySizeReport -Raw | ConvertFrom-Json
+    Assert-ExactObjectProperties $emptySizeEvidence @('schema_version', 'packs') 'Empty worker-pack size report'
+    if ($emptySizeEvidence.schema_version -ne 1 -or @($emptySizeEvidence.packs).Count -ne 0) {
+        throw 'CPU-only release must produce explicit empty GPU size evidence.'
+    }
 
     $targetBundle = Join-Path $repositoryRoot "target\scribe-release-probe-$PID"
     Invoke-ExpectedFailure {
@@ -644,6 +693,7 @@ try {
     $workflow = Get-Content -LiteralPath (Join-Path $repositoryRoot ".github\workflows\release.yml") -Raw
     Assert-ReleaseCargoFeatureContract $source
     Assert-VulkanSdkWorkflowContract $workflow
+    Assert-GpuWorkerPackWorkflowContract $workflow
     if ($workflow -notmatch "prepare-windows-release-inputs\.ps1" -or
         $workflow -notmatch "build-windows-release\.ps1" -or
         $workflow -notmatch "INNO_NUPKG_SHA256: a0dad33db33099d9cd2b89ac2d08b5d70c589b15118ced3b95f469f044f99950" -or

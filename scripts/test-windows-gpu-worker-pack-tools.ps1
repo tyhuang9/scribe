@@ -65,13 +65,19 @@ if ($env:OS -ne 'Windows_NT') {
 
 $repositoryRoot = [System.IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $buildScript = Join-Path $PSScriptRoot 'build-windows-gpu-worker-pack.ps1'
-$parseErrors = $null
-[System.Management.Automation.Language.Parser]::ParseFile(
+foreach ($script in @(
     $buildScript,
-    [ref]$null,
-    [ref]$parseErrors
-) | Out-Null
-Assert-True ($parseErrors.Count -eq 0) 'GPU worker-pack build script has PowerShell parse errors.'
+    (Join-Path $PSScriptRoot 'prepare-windows-gpu-worker-packs.ps1'),
+    (Join-Path $PSScriptRoot 'report-windows-worker-pack-sizes.ps1')
+)) {
+    $parseErrors = $null
+    [System.Management.Automation.Language.Parser]::ParseFile(
+        $script,
+        [ref]$null,
+        [ref]$parseErrors
+    ) | Out-Null
+    Assert-True ($parseErrors.Count -eq 0) "GPU worker-pack script has PowerShell parse errors: $script"
+}
 
 $toolchainOutput = Join-Path ([System.IO.Path]::GetTempPath()) 'scribe-gpu-toolchain-check-unused'
 & $buildScript `
@@ -192,6 +198,63 @@ try {
     )
     $tampered = Invoke-NativeProcess $tool @('verify-fixture', '--pack-root', $second) -AllowFailure
     Assert-True ($tampered.ExitCode -ne 0) 'Tampered fixture pack unexpectedly verified.'
+
+    $unexpectedRoot = Join-Path $testRoot 'unexpected'
+    New-FixturePayload $unexpectedRoot
+    $null = Invoke-NativeProcess $tool ($common[0..6] + @('--pack-root', $unexpectedRoot) + $common[7..($common.Count - 1)])
+    [System.IO.File]::WriteAllBytes(
+        (Join-Path $unexpectedRoot 'bin\unexpected-provider.dll'),
+        [byte[]](1, 2, 3)
+    )
+    $unexpected = Invoke-NativeProcess $tool @('verify-fixture', '--pack-root', $unexpectedRoot) -AllowFailure
+    Assert-True ($unexpected.ExitCode -ne 0) 'Unexpected DLL outside the signed inventory was accepted.'
+
+    $signatureRoot = Join-Path $testRoot 'signature'
+    New-FixturePayload $signatureRoot
+    $null = Invoke-NativeProcess $tool ($common[0..6] + @('--pack-root', $signatureRoot) + $common[7..($common.Count - 1)])
+    $signaturePath = Join-Path $signatureRoot 'pack-manifest.sig'
+    $signature = Get-Content -LiteralPath $signaturePath -Raw | ConvertFrom-Json
+    $replacementNibble = if ($signature.signature_hex.StartsWith('0')) { '1' } else { '0' }
+    $signature.signature_hex = ($replacementNibble + $signature.signature_hex.Substring(1))
+    [System.IO.File]::WriteAllText(
+        $signaturePath,
+        ($signature | ConvertTo-Json -Compress),
+        [System.Text.UTF8Encoding]::new($false)
+    )
+    $badSignature = Invoke-NativeProcess $tool @('verify-fixture', '--pack-root', $signatureRoot) -AllowFailure
+    Assert-True ($badSignature.ExitCode -ne 0) 'Mismatched manifest signature was accepted.'
+
+    $wrongKeyRoot = Join-Path $testRoot 'wrong-key'
+    New-FixturePayload $wrongKeyRoot
+    $null = Invoke-NativeProcess $tool ($common[0..6] + @('--pack-root', $wrongKeyRoot) + $common[7..($common.Count - 1)])
+    $wrongKeyPath = Join-Path $wrongKeyRoot 'pack-manifest.sig'
+    $wrongKey = Get-Content -LiteralPath $wrongKeyPath -Raw | ConvertFrom-Json
+    $wrongKey.key_id = 'fixture-ed25519-v2'
+    [System.IO.File]::WriteAllText(
+        $wrongKeyPath,
+        ($wrongKey | ConvertTo-Json -Compress),
+        [System.Text.UTF8Encoding]::new($false)
+    )
+    $wrongKeyResult = Invoke-NativeProcess $tool @('verify-fixture', '--pack-root', $wrongKeyRoot) -AllowFailure
+    Assert-True ($wrongKeyResult.ExitCode -ne 0) 'Unknown fixture signing key ID was accepted.'
+
+    $adsRoot = Join-Path $testRoot 'ads'
+    New-FixturePayload $adsRoot
+    [System.IO.File]::WriteAllText(
+        "$(Join-Path $adsRoot 'bin\scribe-inference-worker.exe'):hidden",
+        'hidden stream',
+        [System.Text.UTF8Encoding]::new($false)
+    )
+    $ads = Invoke-NativeProcess $tool ($common[0..6] + @('--pack-root', $adsRoot) + $common[7..($common.Count - 1)]) -AllowFailure
+    Assert-True ($ads.ExitCode -ne 0) 'Alternate data stream payload unexpectedly authored.'
+
+    $junctionRoot = Join-Path $testRoot 'junction'
+    $junctionTarget = Join-Path $testRoot 'junction-target'
+    New-FixturePayload $junctionRoot
+    New-Item -ItemType Directory -Path $junctionTarget | Out-Null
+    New-Item -ItemType Junction -Path (Join-Path $junctionRoot 'bin\linked') -Target $junctionTarget | Out-Null
+    $junction = Invoke-NativeProcess $tool ($common[0..6] + @('--pack-root', $junctionRoot) + $common[7..($common.Count - 1)]) -AllowFailure
+    Assert-True ($junction.ExitCode -ne 0) 'Junction payload unexpectedly authored.'
 
     $production = Invoke-NativeProcess $tool @(
         'check-production-key',

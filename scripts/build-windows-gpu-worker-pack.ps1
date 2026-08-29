@@ -20,6 +20,13 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
+if (-not $ToolchainCheckOnly -and
+    $SigningMode -eq 'Production' -and
+    ([string]::IsNullOrWhiteSpace($ProductionPrivateKeyPath) -or
+    [string]::IsNullOrWhiteSpace($ProductionKeyId))) {
+    throw 'Production pack builds require an externally supplied PKCS#8 private key path and reviewed key ID.'
+}
+
 function Get-NormalizedFullPath([string]$Path) {
     $full = [System.IO.Path]::GetFullPath($Path)
     $root = [System.IO.Path]::GetPathRoot($full)
@@ -391,12 +398,6 @@ if ($ToolchainCheckOnly) {
     Write-Output "$Backend worker-pack toolchain matches the pinned contract."
     return
 }
-if ($SigningMode -eq 'Production' -and
-    ([string]::IsNullOrWhiteSpace($ProductionPrivateKeyPath) -or
-    [string]::IsNullOrWhiteSpace($ProductionKeyId))) {
-    throw 'Production pack builds require an externally supplied PKCS#8 private key path and reviewed key ID.'
-}
-
 if ($PackVersion -cnotmatch '^[a-z0-9](?:[a-z0-9._-]{0,94}[a-z0-9])?$') {
     throw 'PackVersion must be a canonical lowercase immutable store component.'
 }

@@ -9,6 +9,11 @@ on:
         required: true
         type: boolean
         default: false
+      include_gpu_worker_packs:
+        description: Build production-signed Windows x64 CUDA and Vulkan worker packs (requires reviewed trust and CI secret)
+        required: true
+        type: boolean
+        default: false
   push:
     branches: [main]
     tags: ["v*"]
@@ -20,7 +25,7 @@ jobs:
   build:
     name: Build and verify Windows installer
     runs-on: windows-latest
-    timeout-minutes: 60
+    timeout-minutes: 120
 
     steps:
       - name: Check out source
@@ -124,6 +129,12 @@ jobs:
           }
           "SHERPA_ONNX_ARCHIVE_DIR=$archiveDir" >> $env:GITHUB_ENV
 
+      - name: Test Windows GPU worker-pack contracts
+        shell: pwsh
+        run: |
+          & .\scripts\test-windows-gpu-worker-pack-tools.ps1 `
+            -CargoTargetDirectory target-gpu-pack-contract-tests
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 
@@ -138,15 +149,77 @@ jobs:
         run: |
           & .\scripts\prepare-windows-release-inputs.ps1 -OutputDirectory .ci-release-inputs
 
+      - name: Build production-signed CUDA and Vulkan worker packs
+        if: github.event_name == 'workflow_dispatch' && inputs.include_gpu_worker_packs
+        shell: pwsh
+        env:
+          GPU_PACK_PRIVATE_KEY_BASE64: ${{ secrets.SCRIBE_GPU_PACK_SIGNING_KEY_PKCS8_BASE64 }}
+          GPU_PACK_KEY_ID: ${{ vars.SCRIBE_GPU_PACK_SIGNING_KEY_ID }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:GPU_PACK_PRIVATE_KEY_BASE64)) {
+            throw 'GPU packs were requested but SCRIBE_GPU_PACK_SIGNING_KEY_PKCS8_BASE64 is unavailable.'
+          }
+          if ([string]::IsNullOrWhiteSpace($env:GPU_PACK_KEY_ID)) {
+            throw 'GPU packs were requested but SCRIBE_GPU_PACK_SIGNING_KEY_ID is unavailable.'
+          }
+          try {
+            $keyBytes = [Convert]::FromBase64String($env:GPU_PACK_PRIVATE_KEY_BASE64)
+          } catch {
+            throw 'GPU pack signing secret is not canonical base64.'
+          }
+          if ($keyBytes.Length -lt 32 -or $keyBytes.Length -gt 16384) {
+            throw 'GPU pack signing secret has an invalid bounded size.'
+          }
+          $secretRoot = Join-Path $env:RUNNER_TEMP "scribe-gpu-signing-$([guid]::NewGuid().ToString('N'))"
+          $keyPath = Join-Path $secretRoot 'production-ed25519.pk8'
+          New-Item -ItemType Directory -Path $secretRoot | Out-Null
+          try {
+            [System.IO.File]::WriteAllBytes($keyPath, $keyBytes)
+            $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches.Groups[1].Value
+            if (-not $version) { throw 'Could not read the package version from Cargo.toml' }
+            & .\scripts\prepare-windows-gpu-worker-packs.ps1 `
+              -PackVersion $version `
+              -OutputDirectory artifacts\gpu-worker-packs\production `
+              -ProductionPrivateKeyPath $keyPath `
+              -ProductionKeyId $env:GPU_PACK_KEY_ID `
+              -NativeArchiveDirectory .ci-native
+          }
+          finally {
+            [Array]::Clear($keyBytes, 0, $keyBytes.Length)
+            if (Test-Path -LiteralPath $keyPath -PathType Leaf) {
+              Remove-Item -LiteralPath $keyPath -Force
+            }
+            if (Test-Path -LiteralPath $secretRoot -PathType Container) {
+              Remove-Item -LiteralPath $secretRoot -Force
+            }
+          }
+
       - name: Build validated portable payload
         shell: pwsh
+        env:
+          INCLUDE_GPU_WORKER_PACKS: ${{ github.event_name == 'workflow_dispatch' && inputs.include_gpu_worker_packs }}
         run: |
           $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches.Groups[1].Value
           if (-not $version) { throw "Could not read the package version from Cargo.toml" }
           "APP_VERSION=$version" >> $env:GITHUB_ENV
+          $workerPackRoots = @()
+          if ($env:INCLUDE_GPU_WORKER_PACKS -ceq 'true') {
+            $workerPackRoots = @(
+              'artifacts\gpu-worker-packs\production\cuda',
+              'artifacts\gpu-worker-packs\production\vulkan'
+            )
+          }
           & .\scripts\build-windows-release.ps1 `
             -ModelSource .ci-release-inputs\model\whisper-base.en-Q8_0.gguf `
-            -BundlePath dist\portable
+            -BundlePath dist\portable `
+            -WorkerPackRoot $workerPackRoots
+
+      - name: Report bundled worker-pack sizes
+        shell: pwsh
+        run: |
+          & .\scripts\report-windows-worker-pack-sizes.ps1 `
+            -CatalogPath dist\portable\worker-pack-catalog.json `
+            -OutputPath dist\gpu-pack-evidence\worker-pack-sizes.json
 
       - name: Acquire digest-pinned Inno Setup
         shell: pwsh
@@ -257,7 +330,9 @@ jobs:
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: windows-installer-verification-logs
-          path: dist/installer-verification-logs
+          path: |
+            dist/installer-verification-logs
+            dist/gpu-pack-evidence
           if-no-files-found: warn
 
       - name: Upload Windows release assets

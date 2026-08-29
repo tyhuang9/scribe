@@ -1481,6 +1481,55 @@ pub(crate) mod test_support {
         let lease = verifier.verify_pinned(pinned).unwrap();
         (verifier, lease)
     }
+
+    pub(crate) fn lease_existing_fixture(
+        source: &Path,
+    ) -> Result<(PathBuf, VerifiedPackLease), PackVerificationError> {
+        let key_pair =
+            Ed25519KeyPair::from_seed_unchecked(&TEST_SEED).expect("fixture Ed25519 seed is valid");
+        let trust = Box::leak(Box::new(FixtureTrustRoot {
+            public_key: key_pair.public_key().as_ref().to_vec(),
+        }));
+        let verifier = PackVerifier::new(
+            trust,
+            Compatibility {
+                app_build: crate::onnx_worker::DESKTOP_BUILD_ID,
+                worker_build: crate::onnx_worker::INFERENCE_WORKER_BUILD_ID,
+                target_os: std::env::consts::OS,
+                target_arch: std::env::consts::ARCH,
+                allowed_backends: &[PackBackend::Cuda, PackBackend::Vulkan],
+            },
+        );
+        let descriptor = verifier.verify(source)?;
+        let manifest_bytes =
+            fs::read(source.join(MANIFEST_NAME)).map_err(PackVerificationError::Io)?;
+        let manifest: PackManifest = parse_canonical_json(&manifest_bytes, "manifest")?;
+        let owner_root = temp_root("existing-fixture-lease");
+        let store_root = owner_root.join("workers").join("packs");
+        let destination = store_root
+            .join(descriptor.pack_id.as_str())
+            .join(descriptor.pack_version.as_str())
+            .join(&descriptor.pack_digest);
+        fs::create_dir_all(&destination).map_err(PackVerificationError::Io)?;
+        for relative in std::iter::once(MANIFEST_NAME)
+            .chain(std::iter::once(SIGNATURE_NAME))
+            .chain(manifest.payload.iter().map(|entry| entry.path.as_str()))
+        {
+            let destination_file = destination.join(relative);
+            if let Some(parent) = destination_file.parent() {
+                fs::create_dir_all(parent).map_err(PackVerificationError::Io)?;
+            }
+            fs::copy(source.join(relative), destination_file).map_err(PackVerificationError::Io)?;
+        }
+        let canonical_store = fs::canonicalize(&store_root).map_err(PackVerificationError::Io)?;
+        let pinned = PinnedPackRoot::open(
+            &canonical_store,
+            [&descriptor.pack_id, &descriptor.pack_version],
+            &descriptor.pack_digest,
+        )?;
+        let lease = verifier.verify_pinned(pinned)?;
+        Ok((owner_root, lease))
+    }
 }
 
 #[cfg(test)]

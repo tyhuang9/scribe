@@ -1,8 +1,9 @@
 //! Verified GPU worker-pack infrastructure.
 //!
-//! Stage 3 deliberately has no production trust root or registry entries. The
-//! types in this module are private infrastructure for accepting externally
-//! signed packs later without making a GPU provider discoverable today.
+//! Stage 4 discovers verified Windows x64 packs and turns only challenge-bound
+//! resolver/Hello results into explicit-GPU candidates. Production trust is
+//! deliberately empty until a separate public-key review is complete, and
+//! Auto remains default-denied to every GPU pack.
 
 pub(crate) mod health;
 pub(crate) mod manifest;
@@ -19,8 +20,7 @@ use serde::Deserialize;
 #[cfg(all(windows, target_arch = "x86_64"))]
 use sha2::{Digest, Sha256};
 
-// Stage 4 consumes the bridge re-export; Stage 3's production registry is
-// deliberately empty, so the non-test binary has no implementation yet.
+// Stage 4 consumes the bridge re-export from the concrete Windows resolver.
 #[cfg(unix)]
 pub(crate) use launch_binding::UnixPackExecAuthority;
 #[allow(unused_imports)]
@@ -249,7 +249,7 @@ mod launch_binding {
 }
 
 /// Production discovery can hold only opaque resolver/Hello bindings, never a
-/// raw verified descriptor. Stage 3 deliberately constructs the empty value.
+/// raw verified descriptor.
 pub(crate) struct ProductionPackRegistry {
     bindings: Vec<VerifiedPackLaunchBinding>,
     diagnostics: Vec<PackDiscoveryDiagnostic>,
@@ -291,8 +291,8 @@ impl ProductionPackRegistry {
     }
 }
 
-/// Production discovery remains fail closed until a persistent signing key and
-/// declared pack catalog are provisioned by a later release stage.
+/// This legacy empty constructor remains a fail-closed compatibility seam.
+/// Stage 4 discovery constructs a registry only from opaque launch bindings.
 pub(crate) fn production_registry() -> ProductionPackRegistry {
     ProductionPackRegistry::empty()
 }
@@ -761,7 +761,7 @@ fn read_bounded_catalog(
     })
 }
 
-/// Private packaging entrypoint. Stage 3's empty production trust root means a
+/// Private packaging entrypoint. Stage 4's empty production trust root means a
 /// non-empty release pack declaration always fails until key provisioning is
 /// deliberately completed in a later stage.
 pub(crate) fn maybe_run_pack_verifier() -> Option<i32> {
@@ -917,7 +917,7 @@ mod tests {
     }
 
     #[test]
-    fn stage_three_production_registry_and_trust_root_are_empty() {
+    fn stage_four_production_trust_root_and_legacy_registry_are_empty() {
         assert!(super::production_registry().is_empty());
         assert!(
             super::manifest::TrustRoot::public_key(
