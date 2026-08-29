@@ -195,6 +195,18 @@ pub(crate) struct PinnedPackRoot {
 }
 
 impl PinnedPackRoot {
+    pub(crate) fn from_anchored_handles(
+        path: PathBuf,
+        handles: Vec<File>,
+    ) -> Result<Self, PackVerificationError> {
+        if handles.is_empty() {
+            return Err(PackVerificationError::UnsafePackStoreAncestor(path));
+        }
+        let lease = Self { path, handles };
+        lease.recheck()?;
+        Ok(lease)
+    }
+
     pub(crate) fn open(
         canonical_store_root: &Path,
         components: [&StoreComponent; 2],
@@ -1073,12 +1085,12 @@ fn open_directory_no_follow(path: &Path) -> Result<File, PackVerificationError> 
     use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
     };
     let mut options = OpenOptions::new();
     options
         .read(true)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
     let file = options.open(path).map_err(PackVerificationError::Io)?;
     let metadata = file.metadata().map_err(PackVerificationError::Io)?;

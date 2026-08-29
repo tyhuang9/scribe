@@ -3,6 +3,11 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 
+#[cfg(unix)]
+use std::ffi::CString;
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, FromRawFd};
+
 use getrandom::fill;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -15,6 +20,8 @@ use super::manifest::{
 const STATE_SCHEMA_VERSION: u16 = 1;
 const MAX_STATE_BYTES: u64 = 256 * 1024;
 const STORE_LOCK_NAME: &str = ".worker-pack-store.lock";
+#[cfg(windows)]
+const PRIVATE_STATE_AUTHORITY_LOCK_NAME: &str = ".scribe-private-state.lock";
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -60,6 +67,7 @@ enum PublishOutcome {
 
 pub(super) struct ExclusiveFileLock {
     file: File,
+    root: AnchoredDirectory,
 }
 
 impl EpochState {
@@ -75,6 +83,189 @@ pub(crate) struct PackStore<'a> {
     packs_root: PathBuf,
     state_root: PathBuf,
     verifier: &'a PackVerifier<'a>,
+}
+
+struct AnchoredDirectory {
+    path: PathBuf,
+    chain: Vec<File>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DirectoryIdentity {
+    volume: u64,
+    file: u64,
+}
+
+impl AnchoredDirectory {
+    fn open_or_create_root(path: &Path) -> Result<Self, PackStoreError> {
+        match Self::open_root(path) {
+            Ok(root) => return Ok(root),
+            Err(PackStoreError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        let parent = path
+            .parent()
+            .ok_or(PackStoreError::CorruptState("anchored root parent"))?;
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or(PackStoreError::CorruptState("anchored root name"))?;
+        let parent = Self::open_or_create_root(parent)?;
+        parent.open_or_create_child(name, false)
+    }
+    fn open_root(path: &Path) -> Result<Self, PackStoreError> {
+        let canonical = fs::canonicalize(path)?;
+        let handle = open_directory_anchor(&canonical, false)?;
+        let anchored = Self {
+            path: canonical,
+            chain: vec![handle],
+        };
+        anchored.recheck()?;
+        Ok(anchored)
+    }
+
+    fn open_or_create_child(&self, name: &str, delete_share: bool) -> Result<Self, PackStoreError> {
+        validate_anchor_name(name)?;
+        create_directory_at(self, name, false)?;
+        self.open_child(name, delete_share)
+    }
+
+    fn create_new_child(&self, name: &str, delete_share: bool) -> Result<Self, PackStoreError> {
+        validate_anchor_name(name)?;
+        create_directory_at(self, name, true)?;
+        self.open_child(name, delete_share)
+    }
+
+    fn open_child(&self, name: &str, delete_share: bool) -> Result<Self, PackStoreError> {
+        validate_anchor_name(name)?;
+        let path = self.path.join(name);
+        let handle = open_directory_at(self, name, delete_share)?;
+        let mut chain = self
+            .chain
+            .iter()
+            .map(File::try_clone)
+            .collect::<io::Result<Vec<_>>>()?;
+        chain.push(handle);
+        let anchored = Self { path, chain };
+        anchored.recheck()?;
+        Ok(anchored)
+    }
+
+    fn verifier_lease(&self) -> Result<PinnedPackRoot, PackStoreError> {
+        let handles = self
+            .chain
+            .iter()
+            .map(File::try_clone)
+            .collect::<io::Result<Vec<_>>>()?;
+        Ok(PinnedPackRoot::from_anchored_handles(
+            self.path.clone(),
+            handles,
+        )?)
+    }
+
+    fn rebound(&self, path: PathBuf) -> Result<Self, PackStoreError> {
+        let anchored = Self {
+            path,
+            chain: self
+                .chain
+                .iter()
+                .map(File::try_clone)
+                .collect::<io::Result<Vec<_>>>()?,
+        };
+        anchored.recheck()?;
+        Ok(anchored)
+    }
+
+    fn recheck(&self) -> Result<(), PackStoreError> {
+        let mut path = self.path.as_path();
+        for handle in self.chain.iter().rev() {
+            if !same_anchored_directory(handle, path)? {
+                return Err(PackStoreError::UnsafeFilesystemEntry(path.to_path_buf()));
+            }
+            path = path
+                .parent()
+                .ok_or(PackStoreError::CorruptState("anchored directory chain"))?;
+        }
+        Ok(())
+    }
+
+    fn leaf(&self) -> &File {
+        self.chain.last().expect("anchored directory handle")
+    }
+
+    #[cfg(unix)]
+    fn parent_leaf(&self) -> Result<&File, PackStoreError> {
+        self.chain
+            .iter()
+            .rev()
+            .nth(1)
+            .ok_or(PackStoreError::CorruptState("anchored directory parent"))
+    }
+
+    fn identity(&self) -> Result<DirectoryIdentity, PackStoreError> {
+        directory_identity(self.leaf())
+    }
+
+    fn verification_path(&self) -> PathBuf {
+        #[cfg(target_os = "linux")]
+        return PathBuf::from(format!("/proc/self/fd/{}", self.leaf().as_raw_fd()));
+        #[cfg(all(unix, not(target_os = "linux")))]
+        return PathBuf::from(format!("/dev/fd/{}", self.leaf().as_raw_fd()));
+        #[cfg(windows)]
+        return self.path.clone();
+        #[cfg(not(any(unix, windows)))]
+        self.path.clone()
+    }
+}
+
+impl ExclusiveFileLock {
+    fn state_name<'a>(&self, path: &'a Path) -> Result<&'a str, PackStoreError> {
+        let parent = path
+            .parent()
+            .ok_or(PackStoreError::CorruptState("state parent"))?;
+        if !same_anchored_directory(self.root.leaf(), parent)? {
+            return Err(PackStoreError::CorruptState("state authority mismatch"));
+        }
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or(PackStoreError::CorruptState("state file name"))?;
+        validate_anchor_name(name)?;
+        Ok(name)
+    }
+
+    pub(super) fn read<T>(&self, path: &Path) -> Result<T, PackStoreError>
+    where
+        T: for<'de> Deserialize<'de> + Serialize,
+    {
+        read_canonical_state_at(&self.root, self.state_name(path)?)
+    }
+
+    pub(super) fn write<T: Serialize>(&self, path: &Path, value: &T) -> Result<(), PackStoreError> {
+        atomic_write_canonical_at(&self.root, self.state_name(path)?, value)
+    }
+
+    pub(super) fn exists(&self, path: &Path) -> Result<bool, PackStoreError> {
+        state_file_exists_at(&self.root, self.state_name(path)?)
+    }
+
+    fn remove(&self, path: &Path) -> Result<(), PackStoreError> {
+        remove_state_file_at(&self.root, self.state_name(path)?)
+    }
+
+    fn remove_temporary(&self, name: &str) -> Result<(), PackStoreError> {
+        validate_anchor_name(name)?;
+        if !name.starts_with('.') || !name.contains(".tmp-") {
+            return Err(PackStoreError::UnsafeRecoveryTarget(
+                self.root.path.join(name),
+            ));
+        }
+        remove_state_file_at(&self.root, name)
+    }
+
+    fn root(&self) -> &AnchoredDirectory {
+        &self.root
+    }
 }
 
 impl<'a> PackStore<'a> {
@@ -94,59 +285,95 @@ impl<'a> PackStore<'a> {
         &self,
         signed_source: &Path,
     ) -> Result<VerifiedPack, PackStoreError> {
+        self.stage_and_install_inner(signed_source, |_| {}, |_| {})
+    }
+
+    fn stage_and_install_inner(
+        &self,
+        signed_source: &Path,
+        after_version_anchor: impl FnOnce(&Path),
+        after_staging_anchor: impl FnOnce(&Path),
+    ) -> Result<VerifiedPack, PackStoreError> {
         let source = self.verifier.verify(signed_source)?;
-        let _lock = self.acquire_lock()?;
-        self.recover_pending_activation_locked()?;
-        let epochs = self.load_epochs_strict()?;
+        let lock = self.acquire_lock()?;
+        self.recover_pending_activation_with_lock(&lock)?;
+        let epochs = self.load_epochs_with_lock(&lock)?;
         require_epoch_from(&source, &epochs)?;
-        let (parent, final_root) = self.store_paths_for(&source, true)?;
-        ensure_regular_directories(&parent)?;
-        if final_root.exists() {
-            let installed = self.verify_installed_identity(&source, false)?;
+        validate_descriptor_identity(&source)?;
+        let packs = AnchoredDirectory::open_or_create_root(&self.packs_root)?;
+        let _ = self.store_paths_for(&source)?;
+        let pack_id = packs.open_or_create_child(source.pack_id.as_str(), false)?;
+        let version = pack_id.open_or_create_child(source.pack_version.as_str(), false)?;
+        after_version_anchor(&version.path);
+        if let Ok(existing) = version.open_child(&source.pack_digest, false) {
+            let installed = self.verify_anchored_identity(&source, &existing, false)?;
             require_same_pack(&source, installed.verified_pack())?;
             return Ok(installed.verified_pack().clone());
         }
 
-        let staging = parent.join(format!(
-            ".{}.staging-{}",
-            source.pack_digest,
-            random_suffix()?
-        ));
-        create_new_private_directory(&staging)?;
-        let result = (|| {
-            copy_verified_tree(signed_source, &staging)?;
-            let staged = self.verifier.verify(&staging)?;
-            require_same_pack(&source, &staged)?;
-            make_payload_readonly(&staging)?;
-            if durable_rename_new(&staging, &final_root)? == PublishOutcome::DestinationExists {
-                remove_staging_tree(&staging)?;
+        let staging_name = format!(".{}.staging-{}", source.pack_digest, random_suffix()?);
+        let staging = version.create_new_child(&staging_name, true)?;
+        after_staging_anchor(&staging.path);
+        let prepared = (|| {
+            copy_verified_tree_anchored(signed_source, &staging)?;
+            let staged = self.verifier.verify_pinned(staging.verifier_lease()?)?;
+            require_same_pack(&source, staged.verified_pack())?;
+            staged.recheck()?;
+            drop(staged);
+            make_payload_readonly_anchored(&staging)?;
+            staging.recheck()?;
+            staging.identity()
+        })();
+        let staging_identity = match prepared {
+            Ok(identity) => identity,
+            Err(error) => {
+                let _ = remove_staging_tree_anchored(&staging);
+                return Err(error);
             }
-            let installed = self.verify_installed_identity(&source, false)?;
+        };
+        if staging.identity()? != staging_identity {
+            return Err(PackStoreError::UnsafeFilesystemEntry(
+                version.path.join(&staging_name),
+            ));
+        }
+        let result = (|| {
+            let installed_root =
+                match durable_rename_new_anchored(&staging, &version, &source.pack_digest)? {
+                    PublishOutcome::Published => {
+                        staging.rebound(version.path.join(&source.pack_digest))?
+                    }
+                    PublishOutcome::DestinationExists => {
+                        remove_staging_tree_anchored(&staging)?;
+                        version.open_child(&source.pack_digest, false)?
+                    }
+                };
+            let installed = self.verify_anchored_identity(&source, &installed_root, false)?;
             require_same_pack(&source, installed.verified_pack())?;
             Ok(installed.verified_pack().clone())
         })();
         if result.is_err() {
-            let _ = remove_staging_tree(&staging);
+            let _ = remove_staging_tree_anchored(&staging);
         }
         result
     }
 
     pub(crate) fn activate(&self, descriptor: &VerifiedPack) -> Result<(), PackStoreError> {
-        let _lock = self.acquire_lock()?;
-        self.recover_pending_activation_locked()?;
-        self.activate_locked(descriptor, None)
+        let lock = self.acquire_lock()?;
+        self.recover_pending_activation_with_lock(&lock)?;
+        self.activate_with_lock(&lock, descriptor, None)
     }
 
-    fn activate_locked(
+    fn activate_with_lock(
         &self,
+        lock: &ExclusiveFileLock,
         descriptor: &VerifiedPack,
         #[cfg(test)] interrupt_after: Option<ActivationBoundary>,
         #[cfg(not(test))] _interrupt_after: Option<()>,
     ) -> Result<(), PackStoreError> {
         let verified = self.reverify_descriptor(descriptor)?;
-        let prior_epochs = self.load_epochs_strict()?;
+        let prior_epochs = self.load_epochs_with_lock(lock)?;
         require_epoch_from(&verified, &prior_epochs)?;
-        let prior_activation = self.load_activation_strict()?;
+        let prior_activation = self.load_activation_with_lock(lock)?;
         let mut next_epochs = prior_epochs.clone();
         let old_floor = next_epochs
             .epochs
@@ -171,53 +398,56 @@ impl<'a> PackStore<'a> {
             prior_epochs,
             next_epochs: next_epochs.clone(),
         };
-        self.persist_pending(&pending)?;
+        self.persist_pending(lock, &pending)?;
         #[cfg(test)]
         if interrupt_after == Some(ActivationBoundary::Journal) {
             return Err(PackStoreError::InjectedInterruption);
         }
-        self.persist_epochs(&next_epochs)?;
+        self.persist_epochs_with_lock(lock, &next_epochs)?;
         #[cfg(test)]
         if interrupt_after == Some(ActivationBoundary::Epochs) {
             return Err(PackStoreError::InjectedInterruption);
         }
-        self.persist_activation(&next_activation)?;
+        self.persist_activation(lock, &next_activation)?;
         #[cfg(test)]
         if interrupt_after == Some(ActivationBoundary::Activation) {
             return Err(PackStoreError::InjectedInterruption);
         }
-        self.remove_pending()?;
+        self.remove_pending(lock)?;
         Ok(())
     }
 
     pub(crate) fn rollback(&self) -> Result<VerifiedPack, PackStoreError> {
-        let _lock = self.acquire_lock()?;
-        self.recover_pending_activation_locked()?;
-        let state = self.load_activation_strict()?;
+        let lock = self.acquire_lock()?;
+        self.recover_pending_activation_with_lock(&lock)?;
+        let state = self.load_activation_with_lock(&lock)?;
         let previous = state.previous.ok_or(PackStoreError::NoRollbackPack)?;
         let rollback = self.reverify_descriptor(&previous)?;
-        let epochs = self.load_epochs_strict()?;
+        let epochs = self.load_epochs_with_lock(&lock)?;
         require_epoch_from(&rollback, &epochs)?;
         let prior_current = state
             .current
             .as_ref()
             .and_then(|current| self.reverify_descriptor(current).ok())
             .filter(|current| require_epoch_from(current, &epochs).is_ok());
-        self.persist_activation(&ActivationState {
-            schema_version: STATE_SCHEMA_VERSION,
-            current: Some(rollback.clone()),
-            previous: prior_current,
-        })?;
+        self.persist_activation(
+            &lock,
+            &ActivationState {
+                schema_version: STATE_SCHEMA_VERSION,
+                current: Some(rollback.clone()),
+                previous: prior_current,
+            },
+        )?;
         Ok(rollback)
     }
 
     /// Corrupt state or invalid packs project to no GPU pack and cannot affect
     /// the separately compiled CPU route.
     pub(crate) fn current_fail_closed(&self) -> Option<VerifiedPackLease> {
-        let _lock = self.acquire_lock().ok()?;
-        self.recover_pending_activation_locked().ok()?;
-        let descriptor = self.load_activation_strict().ok()?.current?;
-        let epochs = self.load_epochs_strict().ok()?;
+        let lock = self.acquire_lock().ok()?;
+        self.recover_pending_activation_with_lock(&lock).ok()?;
+        let descriptor = self.load_activation_with_lock(&lock).ok()?.current?;
+        let epochs = self.load_epochs_with_lock(&lock).ok()?;
         self.reverify_lease_at(&descriptor)
             .ok()
             .filter(|pack| require_epoch_from(pack.verified_pack(), &epochs).is_ok())
@@ -226,39 +456,38 @@ impl<'a> PackStore<'a> {
     /// Only uniquely named incomplete staging directories and state temporary
     /// files are removed. Final digest trees and state records are untouched.
     pub(crate) fn recover_interrupted_work(&self) -> Result<(), PackStoreError> {
-        let _lock = self.acquire_lock()?;
-        self.recover_pending_activation_locked()?;
-        self.recover_interrupted_work_locked()
+        let lock = self.acquire_lock()?;
+        self.recover_pending_activation_with_lock(&lock)?;
+        self.recover_interrupted_work_locked(&lock)
     }
 
-    fn recover_interrupted_work_locked(&self) -> Result<(), PackStoreError> {
+    fn recover_interrupted_work_locked(
+        &self,
+        lock: &ExclusiveFileLock,
+    ) -> Result<(), PackStoreError> {
         if self.packs_root.exists() {
-            for pack_id in read_regular_directory(&self.packs_root)? {
-                for version in read_regular_directory(&pack_id)? {
-                    for entry in read_regular_directory(&version)? {
-                        let name = entry
-                            .file_name()
-                            .and_then(|name| name.to_str())
-                            .unwrap_or("");
+            let packs = AnchoredDirectory::open_root(&self.packs_root)?;
+            for pack_id in anchored_child_names(&packs)? {
+                let pack_id = packs.open_child(&pack_id, false)?;
+                for version in anchored_child_names(&pack_id)? {
+                    let version = pack_id.open_child(&version, false)?;
+                    for name in anchored_child_names(&version)? {
                         if name.starts_with('.') && name.contains(".staging-") {
-                            remove_staging_tree(&entry)?;
+                            let staging = version.open_child(&name, true)?;
+                            remove_staging_tree_anchored(&staging)?;
                         }
                     }
                 }
             }
         }
-        if self.state_root.exists() {
-            for entry in read_regular_directory(&self.state_root)? {
-                let name = entry
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("");
-                if name.starts_with('.') && name.contains(".tmp-") {
-                    let metadata = fs::symlink_metadata(&entry)?;
-                    if metadata.is_file() && !is_link_or_reparse(&metadata) {
-                        fs::remove_file(entry)?;
-                    }
-                }
+        for entry in fs::read_dir(lock.root().verification_path())? {
+            let name = entry?
+                .file_name()
+                .to_str()
+                .ok_or(PackStoreError::CorruptState("state entry name"))?
+                .to_owned();
+            if name.starts_with('.') && name.contains(".tmp-") {
+                lock.remove_temporary(&name)?;
             }
         }
         Ok(())
@@ -283,7 +512,7 @@ impl<'a> PackStore<'a> {
         descriptor: &VerifiedPack,
         require_descriptor_root: bool,
     ) -> Result<VerifiedPackLease, PackStoreError> {
-        let (_, expected_root) = self.store_paths_for(descriptor, false)?;
+        let (_, expected_root) = self.store_paths_for(descriptor)?;
         if require_descriptor_root && descriptor.root.as_os_str() != expected_root.as_os_str() {
             return Err(PackStoreError::DescriptorOutsideStore);
         }
@@ -304,15 +533,34 @@ impl<'a> PackStore<'a> {
         Ok(verified)
     }
 
+    fn verify_anchored_identity(
+        &self,
+        descriptor: &VerifiedPack,
+        directory: &AnchoredDirectory,
+        require_descriptor_root: bool,
+    ) -> Result<VerifiedPackLease, PackStoreError> {
+        let (_, expected_root) = self.store_paths_for(descriptor)?;
+        if directory.path != expected_root
+            || (require_descriptor_root && descriptor.root != expected_root)
+        {
+            return Err(PackStoreError::DescriptorOutsideStore);
+        }
+        let verified = self.verifier.verify_pinned(directory.verifier_lease()?)?;
+        if require_descriptor_root {
+            if verified.verified_pack() != descriptor {
+                return Err(PackStoreError::DescriptorChanged);
+            }
+        } else {
+            require_same_pack(descriptor, verified.verified_pack())?;
+        }
+        Ok(verified)
+    }
+
     fn store_paths_for(
         &self,
         descriptor: &VerifiedPack,
-        create_root: bool,
     ) -> Result<(PathBuf, PathBuf), PackStoreError> {
         validate_descriptor_identity(descriptor)?;
-        if create_root {
-            ensure_regular_directories(&self.packs_root)?;
-        }
         let metadata = fs::symlink_metadata(&self.packs_root)?;
         if !metadata.is_dir() || is_link_or_reparse(&metadata) {
             return Err(PackStoreError::UnsafeFilesystemEntry(
@@ -357,7 +605,7 @@ impl<'a> PackStore<'a> {
         state: &ActivationState,
     ) -> Result<(), PackStoreError> {
         for descriptor in state.current.iter().chain(state.previous.iter()) {
-            let (_, expected_root) = self.store_paths_for(descriptor, false)?;
+            let (_, expected_root) = self.store_paths_for(descriptor)?;
             if descriptor.root.as_os_str() != expected_root.as_os_str() {
                 return Err(PackStoreError::DescriptorOutsideStore);
             }
@@ -384,12 +632,15 @@ impl<'a> PackStore<'a> {
         self.state_root.join("pending-activation.json")
     }
 
-    fn load_activation_strict(&self) -> Result<ActivationState, PackStoreError> {
+    fn load_activation_with_lock(
+        &self,
+        lock: &ExclusiveFileLock,
+    ) -> Result<ActivationState, PackStoreError> {
         let path = self.activation_path();
-        if !entry_exists(&path)? {
+        if !lock.exists(&path)? {
             return Ok(ActivationState::empty());
         }
-        let state: ActivationState = read_canonical_state(&path)?;
+        let state: ActivationState = lock.read(&path)?;
         if state.schema_version != STATE_SCHEMA_VERSION {
             return Err(PackStoreError::CorruptState("activation schema"));
         }
@@ -397,55 +648,73 @@ impl<'a> PackStore<'a> {
         Ok(state)
     }
 
-    fn load_epochs_strict(&self) -> Result<EpochState, PackStoreError> {
+    fn load_epochs_with_lock(
+        &self,
+        lock: &ExclusiveFileLock,
+    ) -> Result<EpochState, PackStoreError> {
         let path = self.epoch_path();
-        if !entry_exists(&path)? {
+        if !lock.exists(&path)? {
             return Ok(EpochState::empty());
         }
-        let state: EpochState = read_canonical_state(&path)?;
+        let state: EpochState = lock.read(&path)?;
         validate_epoch_state(&state)?;
         Ok(state)
     }
 
-    fn persist_activation(&self, state: &ActivationState) -> Result<(), PackStoreError> {
+    fn persist_activation(
+        &self,
+        lock: &ExclusiveFileLock,
+        state: &ActivationState,
+    ) -> Result<(), PackStoreError> {
         self.validate_activation_descriptors(state)?;
-        atomic_write_canonical(&self.activation_path(), state)
+        lock.write(&self.activation_path(), state)
     }
 
-    fn persist_epochs(&self, state: &EpochState) -> Result<(), PackStoreError> {
+    fn persist_epochs_with_lock(
+        &self,
+        lock: &ExclusiveFileLock,
+        state: &EpochState,
+    ) -> Result<(), PackStoreError> {
         validate_epoch_state(state)?;
-        atomic_write_canonical(&self.epoch_path(), state)
+        lock.write(&self.epoch_path(), state)
     }
 
-    fn persist_pending(&self, pending: &PendingActivation) -> Result<(), PackStoreError> {
+    fn persist_pending(
+        &self,
+        lock: &ExclusiveFileLock,
+        pending: &PendingActivation,
+    ) -> Result<(), PackStoreError> {
         self.validate_pending_descriptors(pending)?;
         validate_pending_activation(pending)?;
-        atomic_write_canonical(&self.pending_path(), pending)
+        lock.write(&self.pending_path(), pending)
     }
 
-    fn remove_pending(&self) -> Result<(), PackStoreError> {
-        remove_regular_state_file(&self.pending_path())
+    fn remove_pending(&self, lock: &ExclusiveFileLock) -> Result<(), PackStoreError> {
+        lock.remove(&self.pending_path())
     }
 
-    fn recover_pending_activation_locked(&self) -> Result<(), PackStoreError> {
+    fn recover_pending_activation_with_lock(
+        &self,
+        lock: &ExclusiveFileLock,
+    ) -> Result<(), PackStoreError> {
         let path = self.pending_path();
-        if !entry_exists(&path)? {
+        if !lock.exists(&path)? {
             return Ok(());
         }
-        let pending: PendingActivation = read_canonical_state(&path)?;
+        let pending: PendingActivation = lock.read(&path)?;
         self.validate_pending_descriptors(&pending)?;
         validate_pending_activation(&pending)?;
         let target = self.reverify_descriptor(&pending.target)?;
         if target != pending.target {
             return Err(PackStoreError::DescriptorChanged);
         }
-        let observed_epochs = self.load_epochs_strict()?;
+        let observed_epochs = self.load_epochs_with_lock(lock)?;
         if observed_epochs != pending.prior_epochs && observed_epochs != pending.next_epochs {
             return Err(PackStoreError::CorruptState(
                 "pending activation epoch witness",
             ));
         }
-        if let Ok(observed_activation) = self.load_activation_strict()
+        if let Ok(observed_activation) = self.load_activation_with_lock(lock)
             && observed_activation != pending.prior_activation
             && observed_activation != pending.next_activation
         {
@@ -456,9 +725,9 @@ impl<'a> PackStore<'a> {
         // The journal is durable before the floor is raised. A valid pending
         // target is therefore always completed; this never lowers an observed
         // security epoch and repairs a torn/corrupt activation pointer.
-        self.persist_epochs(&pending.next_epochs)?;
-        self.persist_activation(&pending.next_activation)?;
-        self.remove_pending()?;
+        self.persist_epochs_with_lock(lock, &pending.next_epochs)?;
+        self.persist_activation(lock, &pending.next_activation)?;
+        self.remove_pending(lock)?;
         Ok(())
     }
 
@@ -468,7 +737,7 @@ impl<'a> PackStore<'a> {
     ) -> Result<(), PackStoreError> {
         self.validate_activation_descriptors(&pending.prior_activation)?;
         self.validate_activation_descriptors(&pending.next_activation)?;
-        let (_, expected_root) = self.store_paths_for(&pending.target, false)?;
+        let (_, expected_root) = self.store_paths_for(&pending.target)?;
         if pending.target.root.as_os_str() != expected_root.as_os_str() {
             return Err(PackStoreError::DescriptorOutsideStore);
         }
@@ -476,6 +745,40 @@ impl<'a> PackStore<'a> {
             return Err(PackStoreError::DescriptorChanged);
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn load_activation_strict(&self) -> Result<ActivationState, PackStoreError> {
+        let lock = self.acquire_lock()?;
+        self.load_activation_with_lock(&lock)
+    }
+
+    #[cfg(test)]
+    fn load_epochs_strict(&self) -> Result<EpochState, PackStoreError> {
+        let lock = self.acquire_lock()?;
+        self.load_epochs_with_lock(&lock)
+    }
+
+    #[cfg(test)]
+    fn persist_epochs(&self, state: &EpochState) -> Result<(), PackStoreError> {
+        let lock = self.acquire_lock()?;
+        self.persist_epochs_with_lock(&lock, state)
+    }
+
+    #[cfg(test)]
+    fn activate_locked(
+        &self,
+        descriptor: &VerifiedPack,
+        interrupt_after: Option<ActivationBoundary>,
+    ) -> Result<(), PackStoreError> {
+        let lock = self.acquire_lock()?;
+        self.activate_with_lock(&lock, descriptor, interrupt_after)
+    }
+
+    #[cfg(test)]
+    fn recover_pending_activation_locked(&self) -> Result<(), PackStoreError> {
+        let lock = self.acquire_lock()?;
+        self.recover_pending_activation_with_lock(&lock)
     }
 }
 
@@ -597,31 +900,42 @@ fn require_same_pack(
     Ok(())
 }
 
-fn copy_verified_tree(source: &Path, destination: &Path) -> Result<(), PackStoreError> {
-    let mut pending = vec![(source.to_path_buf(), destination.to_path_buf())];
-    while let Some((source_dir, destination_dir)) = pending.pop() {
-        for entry in fs::read_dir(&source_dir)? {
-            let entry = entry?;
-            let source_path = entry.path();
-            let destination_path = destination_dir.join(entry.file_name());
-            let metadata = fs::symlink_metadata(&source_path)?;
-            if is_link_or_reparse(&metadata) {
-                return Err(PackStoreError::UnsafeFilesystemEntry(source_path));
-            }
-            if metadata.is_dir() {
-                create_new_private_directory(&destination_path)?;
-                pending.push((source_path, destination_path));
-            } else if metadata.is_file() {
-                copy_regular_no_follow(&source_path, &destination_path)?;
-            } else {
-                return Err(PackStoreError::UnsafeFilesystemEntry(source_path));
-            }
+fn copy_verified_tree_anchored(
+    source: &Path,
+    destination: &AnchoredDirectory,
+) -> Result<(), PackStoreError> {
+    destination.recheck()?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let name = entry
+            .file_name()
+            .to_str()
+            .ok_or(PackStoreError::CorruptState("pack source file name"))?
+            .to_owned();
+        validate_anchor_name(&name)?;
+        let source_path = entry.path();
+        let metadata = fs::symlink_metadata(&source_path)?;
+        if is_link_or_reparse(&metadata) {
+            return Err(PackStoreError::UnsafeFilesystemEntry(source_path));
+        }
+        if metadata.is_dir() {
+            let child = destination.create_new_child(&name, false)?;
+            copy_verified_tree_anchored(&source_path, &child)?;
+        } else if metadata.is_file() {
+            copy_regular_to_anchor(&source_path, destination, &name)?;
+        } else {
+            return Err(PackStoreError::UnsafeFilesystemEntry(source_path));
         }
     }
+    destination.recheck()?;
     Ok(())
 }
 
-fn copy_regular_no_follow(source: &Path, destination: &Path) -> Result<(), PackStoreError> {
+fn copy_regular_to_anchor(
+    source: &Path,
+    destination: &AnchoredDirectory,
+    name: &str,
+) -> Result<(), PackStoreError> {
     let mut source_options = OpenOptions::new();
     source_options.read(true);
     configure_no_follow(&mut source_options);
@@ -630,133 +944,557 @@ fn copy_regular_no_follow(source: &Path, destination: &Path) -> Result<(), PackS
     if !metadata.is_file() || is_link_or_reparse(&metadata) {
         return Err(PackStoreError::UnsafeFilesystemEntry(source.to_path_buf()));
     }
-
-    let mut destination_options = OpenOptions::new();
-    destination_options.write(true).create_new(true);
-    configure_private_create(&mut destination_options);
-    configure_no_follow(&mut destination_options);
-    let mut output = destination_options.open(destination)?;
+    let mut output = create_file_at(destination, name, false)?;
     io::copy(&mut input, &mut output)?;
     output.flush()?;
     output.sync_all()?;
+    destination.recheck()?;
     Ok(())
 }
 
-fn make_payload_readonly(root: &Path) -> Result<(), PackStoreError> {
-    let mut pending = vec![root.to_path_buf()];
-    while let Some(directory) = pending.pop() {
-        for entry in fs::read_dir(directory)? {
-            let entry = entry?;
-            let path = entry.path();
-            let metadata = fs::symlink_metadata(&path)?;
-            if metadata.is_dir() {
-                pending.push(path);
-            } else if metadata.is_file() {
-                let mut permissions = metadata.permissions();
-                permissions.set_readonly(true);
-                fs::set_permissions(path, permissions)?;
+#[cfg(unix)]
+fn create_file_at(
+    parent: &AnchoredDirectory,
+    name: &str,
+    delete_access: bool,
+) -> Result<File, PackStoreError> {
+    let name = CString::new(name).expect("validated anchor name");
+    let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let fd = unsafe { libc::openat(parent.leaf().as_raw_fd(), name.as_ptr(), flags, 0o600) };
+    let _ = delete_access;
+    if fd < 0 {
+        return Err(PackStoreError::Io(io::Error::last_os_error()));
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+#[cfg(windows)]
+fn create_file_at(
+    parent: &AnchoredDirectory,
+    name: &str,
+    delete_access: bool,
+) -> Result<File, PackStoreError> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ};
+    parent.recheck()?;
+    let mut options = OpenOptions::new();
+    options
+        .write(true)
+        .access_mode(0x4000_0000 | if delete_access { 0x0001_0000 } else { 0 })
+        .share_mode(FILE_SHARE_READ)
+        .create_new(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    Ok(options.open(parent.path.join(name))?)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn create_file_at(
+    _parent: &AnchoredDirectory,
+    _name: &str,
+    _delete_access: bool,
+) -> Result<File, PackStoreError> {
+    Err(PackStoreError::UnsupportedAnchoredFilesystem)
+}
+
+fn make_payload_readonly_anchored(root: &AnchoredDirectory) -> Result<(), PackStoreError> {
+    root.recheck()?;
+    for entry in fs::read_dir(root.verification_path())? {
+        let entry = entry?;
+        let name = entry
+            .file_name()
+            .to_str()
+            .ok_or(PackStoreError::CorruptState("staging entry name"))?
+            .to_owned();
+        validate_anchor_name(&name)?;
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if is_link_or_reparse(&metadata) {
+            return Err(PackStoreError::UnsafeFilesystemEntry(entry.path()));
+        }
+        if metadata.is_dir() {
+            let child = root.open_child(&name, false)?;
+            make_payload_readonly_anchored(&child)?;
+        } else if metadata.is_file() {
+            let file = open_regular_file_at(root, &name)?;
+            let metadata = file.metadata()?;
+            if !metadata.is_file()
+                || is_link_or_reparse(&metadata)
+                || !regular_file_has_single_link(&file, &metadata)?
+            {
+                return Err(PackStoreError::UnsafeFilesystemEntry(root.path.join(&name)));
             }
+            let mut permissions = metadata.permissions();
+            permissions.set_readonly(true);
+            file.set_permissions(permissions)?;
+        } else {
+            return Err(PackStoreError::UnsafeFilesystemEntry(entry.path()));
         }
     }
+    root.recheck()?;
     Ok(())
 }
 
-fn remove_staging_tree(path: &Path) -> Result<(), PackStoreError> {
-    if !path.exists() {
-        return Ok(());
+#[cfg(unix)]
+fn open_regular_file_at(parent: &AnchoredDirectory, name: &str) -> Result<File, PackStoreError> {
+    let name = CString::new(name).expect("validated anchor name");
+    let fd = unsafe {
+        libc::openat(
+            parent.leaf().as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(PackStoreError::Io(io::Error::last_os_error()));
     }
-    let name = path
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+#[cfg(windows)]
+fn open_regular_file_at(parent: &AnchoredDirectory, name: &str) -> Result<File, PackStoreError> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+    parent.recheck()?;
+    let mut options = OpenOptions::new();
+    options
+        .access_mode(0x8000_0000 | 0x0000_0100)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    Ok(options.open(parent.path.join(name))?)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_regular_file_at(_parent: &AnchoredDirectory, _name: &str) -> Result<File, PackStoreError> {
+    Err(PackStoreError::UnsupportedAnchoredFilesystem)
+}
+
+#[cfg(unix)]
+fn regular_file_has_single_link(
+    _file: &File,
+    metadata: &fs::Metadata,
+) -> Result<bool, PackStoreError> {
+    use std::os::unix::fs::MetadataExt;
+    Ok(metadata.nlink() == 1)
+}
+
+#[cfg(windows)]
+fn regular_file_has_single_link(
+    file: &File,
+    _metadata: &fs::Metadata,
+) -> Result<bool, PackStoreError> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+    let mut information = unsafe { std::mem::zeroed::<BY_HANDLE_FILE_INFORMATION>() };
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) } == 0 {
+        return Err(PackStoreError::Io(io::Error::last_os_error()));
+    }
+    Ok(information.nNumberOfLinks == 1)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn regular_file_has_single_link(
+    _file: &File,
+    _metadata: &fs::Metadata,
+) -> Result<bool, PackStoreError> {
+    Err(PackStoreError::UnsupportedAnchoredFilesystem)
+}
+
+fn remove_staging_tree_anchored(staging: &AnchoredDirectory) -> Result<(), PackStoreError> {
+    let name = staging
+        .path
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("");
     if !name.starts_with('.') || !name.contains(".staging-") {
-        return Err(PackStoreError::UnsafeRecoveryTarget(path.to_path_buf()));
+        return Err(PackStoreError::UnsafeRecoveryTarget(staging.path.clone()));
     }
-    let mut directories = vec![path.to_path_buf()];
-    let mut ordered = Vec::new();
-    while let Some(directory) = directories.pop() {
-        ordered.push(directory.clone());
-        for entry in fs::read_dir(&directory)? {
-            let entry = entry?;
-            let child = entry.path();
-            let metadata = fs::symlink_metadata(&child)?;
-            if is_link_or_reparse(&metadata) {
-                return Err(PackStoreError::UnsafeFilesystemEntry(child));
-            }
-            if metadata.is_dir() {
-                directories.push(child);
-            } else if metadata.is_file() {
-                #[cfg(windows)]
-                clear_windows_readonly(&child, metadata.permissions())?;
-                fs::remove_file(child)?;
-            }
+    staging.recheck()?;
+    remove_anchored_contents(staging)?;
+    remove_anchored_directory(staging)
+}
+
+fn remove_anchored_contents(directory: &AnchoredDirectory) -> Result<(), PackStoreError> {
+    for entry in fs::read_dir(directory.verification_path())? {
+        let entry = entry?;
+        let name = entry
+            .file_name()
+            .to_str()
+            .ok_or(PackStoreError::CorruptState("staging entry name"))?
+            .to_owned();
+        validate_anchor_name(&name)?;
+        let metadata = entry.metadata()?;
+        if is_link_or_reparse(&metadata) {
+            return Err(PackStoreError::UnsafeFilesystemEntry(entry.path()));
+        }
+        if metadata.is_dir() {
+            let child = directory.open_child(&name, true)?;
+            remove_anchored_contents(&child)?;
+            remove_anchored_directory(&child)?;
+        } else if metadata.is_file() {
+            remove_anchored_file(directory, &name)?;
+        } else {
+            return Err(PackStoreError::UnsafeFilesystemEntry(entry.path()));
         }
     }
-    for directory in ordered.into_iter().rev() {
-        fs::remove_dir(directory)?;
+    Ok(())
+}
+
+fn validate_anchor_name(name: &str) -> Result<(), PackStoreError> {
+    if name.is_empty()
+        || name.len() > 160
+        || matches!(name, "." | "..")
+        || name.ends_with(['.', ' '])
+        || name.bytes().any(|byte| {
+            byte < 0x20 || !(byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        })
+    {
+        return Err(PackStoreError::CorruptState("anchored entry name"));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_directory_anchor(path: &Path, _delete_share: bool) -> Result<File, PackStoreError> {
+    use std::os::unix::ffi::OsStrExt;
+    let raw = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| PackStoreError::CorruptState("anchored directory path"))?;
+    let fd = unsafe {
+        libc::open(
+            raw.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(PackStoreError::Io(io::Error::last_os_error()));
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+#[cfg(windows)]
+fn open_directory_anchor(path: &Path, delete_share: bool) -> Result<File, PackStoreError> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+    let mut options = OpenOptions::new();
+    options
+        .access_mode(
+            0x8000_0000 | 0x0000_0002 | 0x0000_0004 | if delete_share { 0x0001_0000 } else { 0 },
+        )
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(PackStoreError::UnsafeFilesystemEntry(path.to_path_buf()));
+    }
+    super::manifest::reject_named_streams(path)?;
+    Ok(file)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_directory_anchor(_path: &Path, _delete_share: bool) -> Result<File, PackStoreError> {
+    Err(PackStoreError::UnsupportedAnchoredFilesystem)
+}
+
+#[cfg(unix)]
+fn open_directory_at(
+    parent: &AnchoredDirectory,
+    name: &str,
+    _delete_share: bool,
+) -> Result<File, PackStoreError> {
+    let name = CString::new(name).expect("validated anchor name");
+    let fd = unsafe {
+        libc::openat(
+            parent.leaf().as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(PackStoreError::Io(io::Error::last_os_error()));
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+#[cfg(windows)]
+fn open_directory_at(
+    parent: &AnchoredDirectory,
+    name: &str,
+    delete_share: bool,
+) -> Result<File, PackStoreError> {
+    parent.recheck()?;
+    open_directory_anchor(&parent.path.join(name), delete_share)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_directory_at(
+    _parent: &AnchoredDirectory,
+    _name: &str,
+    _delete_share: bool,
+) -> Result<File, PackStoreError> {
+    Err(PackStoreError::UnsupportedAnchoredFilesystem)
+}
+
+#[cfg(unix)]
+fn create_directory_at(
+    parent: &AnchoredDirectory,
+    name: &str,
+    require_new: bool,
+) -> Result<(), PackStoreError> {
+    let name = CString::new(name).expect("validated anchor name");
+    if unsafe { libc::mkdirat(parent.leaf().as_raw_fd(), name.as_ptr(), 0o700) } == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if !require_new && error.raw_os_error() == Some(libc::EEXIST) {
+        return Ok(());
+    }
+    Err(PackStoreError::Io(error))
+}
+
+#[cfg(windows)]
+fn create_directory_at(
+    parent: &AnchoredDirectory,
+    name: &str,
+    require_new: bool,
+) -> Result<(), PackStoreError> {
+    parent.recheck()?;
+    match fs::create_dir(parent.path.join(name)) {
+        Ok(()) => Ok(()),
+        Err(error) if !require_new && error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(PackStoreError::Io(error)),
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn create_directory_at(
+    _parent: &AnchoredDirectory,
+    _name: &str,
+    _require_new: bool,
+) -> Result<(), PackStoreError> {
+    Err(PackStoreError::UnsupportedAnchoredFilesystem)
+}
+
+#[cfg(unix)]
+fn same_anchored_directory(handle: &File, path: &Path) -> Result<bool, PackStoreError> {
+    use std::os::unix::fs::MetadataExt;
+    let held = handle.metadata()?;
+    let observed = fs::symlink_metadata(path)?;
+    Ok(observed.is_dir()
+        && !observed.file_type().is_symlink()
+        && held.dev() == observed.dev()
+        && held.ino() == observed.ino())
+}
+
+#[cfg(unix)]
+fn directory_identity(file: &File) -> Result<DirectoryIdentity, PackStoreError> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = file.metadata()?;
+    Ok(DirectoryIdentity {
+        volume: metadata.dev(),
+        file: metadata.ino(),
+    })
+}
+
+#[cfg(windows)]
+fn directory_identity(file: &File) -> Result<DirectoryIdentity, PackStoreError> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+    let mut value = unsafe { std::mem::zeroed::<BY_HANDLE_FILE_INFORMATION>() };
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut value) } == 0 {
+        return Err(PackStoreError::Io(io::Error::last_os_error()));
+    }
+    Ok(DirectoryIdentity {
+        volume: u64::from(value.dwVolumeSerialNumber),
+        file: (u64::from(value.nFileIndexHigh) << 32) | u64::from(value.nFileIndexLow),
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn directory_identity(_file: &File) -> Result<DirectoryIdentity, PackStoreError> {
+    Err(PackStoreError::UnsupportedAnchoredFilesystem)
+}
+
+#[cfg(unix)]
+fn remove_anchored_file(parent: &AnchoredDirectory, name: &str) -> Result<(), PackStoreError> {
+    use std::mem::MaybeUninit;
+    let name = CString::new(name).expect("validated anchor name");
+    let mut stat = MaybeUninit::<libc::stat>::uninit();
+    if unsafe {
+        libc::fstatat(
+            parent.leaf().as_raw_fd(),
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(PackStoreError::Io(io::Error::last_os_error()));
+    }
+    let stat = unsafe { stat.assume_init() };
+    if stat.st_mode & libc::S_IFMT != libc::S_IFREG || stat.st_nlink != 1 {
+        return Err(PackStoreError::UnsafeFilesystemEntry(
+            parent
+                .path
+                .join(name.to_str().expect("validated anchor name")),
+        ));
+    }
+    if unsafe { libc::unlinkat(parent.leaf().as_raw_fd(), name.as_ptr(), 0) } != 0 {
+        return Err(PackStoreError::Io(io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn remove_anchored_directory(directory: &AnchoredDirectory) -> Result<(), PackStoreError> {
+    directory.recheck()?;
+    let name = directory
+        .path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or(PackStoreError::CorruptState("anchored directory name"))?;
+    let name = CString::new(name).expect("validated anchor name");
+    if unsafe {
+        libc::unlinkat(
+            directory.parent_leaf()?.as_raw_fd(),
+            name.as_ptr(),
+            libc::AT_REMOVEDIR,
+        )
+    } != 0
+    {
+        return Err(PackStoreError::Io(io::Error::last_os_error()));
     }
     Ok(())
 }
 
 #[cfg(windows)]
-#[allow(clippy::permissions_set_readonly_false)]
-fn clear_windows_readonly(
-    path: &Path,
-    mut permissions: fs::Permissions,
-) -> Result<(), PackStoreError> {
-    // Windows refuses removal of FILE_ATTRIBUTE_READONLY payloads. This code
-    // does not compile on Unix, where clearing readonly could broaden mode bits.
-    permissions.set_readonly(false);
-    fs::set_permissions(path, permissions)?;
-    Ok(())
+fn remove_anchored_file(parent: &AnchoredDirectory, name: &str) -> Result<(), PackStoreError> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+        FILE_SHARE_WRITE,
+    };
+    parent.recheck()?;
+    let path = parent.path.join(name);
+    let metadata = fs::symlink_metadata(&path)?;
+    if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(PackStoreError::UnsafeFilesystemEntry(path));
+    }
+    let mut options = OpenOptions::new();
+    options
+        .access_mode(0x0001_0000 | 0x0000_0080)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    let file = options.open(&path)?;
+    let observed = file.metadata()?;
+    if !observed.is_file() || observed.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(PackStoreError::UnsafeFilesystemEntry(path));
+    }
+    delete_by_handle(&file)
 }
 
-fn ensure_regular_directories(path: &Path) -> Result<(), PackStoreError> {
-    let existing = path
-        .ancestors()
-        .find(|ancestor| ancestor.exists())
-        .ok_or(PackStoreError::CorruptState("directory root"))?;
-    for ancestor in existing.ancestors() {
-        let metadata = fs::symlink_metadata(ancestor)?;
-        if !metadata.is_dir() || is_link_or_reparse(&metadata) {
-            return Err(PackStoreError::UnsafeFilesystemEntry(
-                ancestor.to_path_buf(),
-            ));
-        }
-    }
-    let missing = path
-        .ancestors()
-        .take_while(|ancestor| *ancestor != existing)
-        .collect::<Vec<_>>();
-    for directory in missing.into_iter().rev() {
-        create_new_private_directory(directory)?;
-        let metadata = fs::symlink_metadata(directory)?;
-        if !metadata.is_dir() || is_link_or_reparse(&metadata) {
-            return Err(PackStoreError::UnsafeFilesystemEntry(
-                directory.to_path_buf(),
-            ));
-        }
-    }
-    Ok(())
+#[cfg(windows)]
+fn remove_anchored_directory(directory: &AnchoredDirectory) -> Result<(), PackStoreError> {
+    directory.recheck()?;
+    delete_by_handle(directory.leaf())
 }
 
-fn create_new_private_directory(path: &Path) -> Result<(), PackStoreError> {
-    fs::create_dir(path)?;
-    #[cfg(unix)]
+#[cfg(windows)]
+fn delete_by_handle(file: &File) -> Result<(), PackStoreError> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
+        FILE_DISPOSITION_INFO_EX, FileDispositionInfoEx, SetFileInformationByHandle,
+    };
+    let mut info = FILE_DISPOSITION_INFO_EX {
+        Flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
+    };
+    if unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle(),
+            FileDispositionInfoEx,
+            (&raw mut info).cast(),
+            u32::try_from(std::mem::size_of::<FILE_DISPOSITION_INFO_EX>())
+                .expect("disposition structure size"),
+        )
+    } == 0
     {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+        return Err(PackStoreError::Io(io::Error::last_os_error()));
     }
     Ok(())
 }
 
-fn read_regular_directory(path: &Path) -> Result<Vec<PathBuf>, PackStoreError> {
-    let metadata = fs::symlink_metadata(path)?;
-    if !metadata.is_dir() || is_link_or_reparse(&metadata) {
-        return Err(PackStoreError::UnsafeFilesystemEntry(path.to_path_buf()));
+#[cfg(not(any(unix, windows)))]
+fn remove_anchored_file(_parent: &AnchoredDirectory, _name: &str) -> Result<(), PackStoreError> {
+    Err(PackStoreError::UnsupportedAnchoredFilesystem)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn remove_anchored_directory(_directory: &AnchoredDirectory) -> Result<(), PackStoreError> {
+    Err(PackStoreError::UnsupportedAnchoredFilesystem)
+}
+
+#[cfg(windows)]
+fn same_anchored_directory(handle: &File, path: &Path) -> Result<bool, PackStoreError> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        GetFileInformationByHandle,
+    };
+    let mut options = OpenOptions::new();
+    options
+        .access_mode(0x8000_0000)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+    let observed = match options.open(path) {
+        Ok(file) => file,
+        Err(_) => return Ok(false),
+    };
+    let metadata = observed.metadata()?;
+    if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Ok(false);
     }
-    fs::read_dir(path)?
-        .map(|entry| entry.map(|entry| entry.path()).map_err(PackStoreError::Io))
+    let identity = |file: &File| -> Result<BY_HANDLE_FILE_INFORMATION, PackStoreError> {
+        let mut value = unsafe { std::mem::zeroed::<BY_HANDLE_FILE_INFORMATION>() };
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut value) } == 0 {
+            return Err(PackStoreError::Io(io::Error::last_os_error()));
+        }
+        Ok(value)
+    };
+    let held = identity(handle)?;
+    let observed = identity(&observed)?;
+    Ok(held.dwVolumeSerialNumber == observed.dwVolumeSerialNumber
+        && held.nFileIndexHigh == observed.nFileIndexHigh
+        && held.nFileIndexLow == observed.nFileIndexLow)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn same_anchored_directory(_handle: &File, _path: &Path) -> Result<bool, PackStoreError> {
+    Err(PackStoreError::UnsupportedAnchoredFilesystem)
+}
+
+fn anchored_child_names(directory: &AnchoredDirectory) -> Result<Vec<String>, PackStoreError> {
+    directory.recheck()?;
+    fs::read_dir(directory.verification_path())?
+        .map(|entry| {
+            let entry = entry?;
+            let name = entry
+                .file_name()
+                .to_str()
+                .ok_or(PackStoreError::CorruptState("anchored child name"))?
+                .to_owned();
+            validate_anchor_name(&name)?;
+            Ok(name)
+        })
         .collect()
 }
 
@@ -764,15 +1502,27 @@ pub(super) fn read_canonical_state<T>(path: &Path) -> Result<T, PackStoreError>
 where
     T: for<'de> Deserialize<'de> + Serialize,
 {
-    let mut options = OpenOptions::new();
-    options.read(true);
-    configure_no_follow(&mut options);
-    let mut file = options.open(path)?;
+    let parent = path
+        .parent()
+        .ok_or(PackStoreError::CorruptState("state parent"))?;
+    let root = AnchoredDirectory::open_root(parent)?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or(PackStoreError::CorruptState("state file name"))?;
+    read_canonical_state_at(&root, name)
+}
+
+fn read_canonical_state_at<T>(root: &AnchoredDirectory, name: &str) -> Result<T, PackStoreError>
+where
+    T: for<'de> Deserialize<'de> + Serialize,
+{
+    let mut file = open_state_file_at(root, name, false)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() || is_link_or_reparse(&metadata) || metadata.len() > MAX_STATE_BYTES {
         return Err(PackStoreError::CorruptState("state file bounds"));
     }
-    super::manifest::reject_named_streams(path)?;
+    super::manifest::reject_named_streams(&root.path.join(name))?;
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
     file.read_to_end(&mut bytes)?;
     let value = serde_json::from_slice::<T>(&bytes)?;
@@ -789,70 +1539,253 @@ pub(super) fn atomic_write_canonical<T: Serialize>(
     let parent = path
         .parent()
         .ok_or(PackStoreError::CorruptState("state parent"))?;
-    ensure_regular_directories(parent)?;
-    let temporary = parent.join(format!(
-        ".{}.tmp-{}",
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("state"),
-        random_suffix()?
-    ));
+    let root = AnchoredDirectory::open_or_create_root(parent)?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or(PackStoreError::CorruptState("state file name"))?;
+    atomic_write_canonical_at(&root, name, value)
+}
+
+fn atomic_write_canonical_at<T: Serialize>(
+    root: &AnchoredDirectory,
+    name: &str,
+    value: &T,
+) -> Result<(), PackStoreError> {
+    validate_anchor_name(name)?;
+    let temporary_name = format!(".{name}.tmp-{}", random_suffix()?);
     let bytes = serde_json::to_vec(value)?;
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    configure_private_create(&mut options);
-    configure_no_follow(&mut options);
-    let mut file = options.open(&temporary)?;
+    let mut file = create_file_at(root, &temporary_name, true)?;
     file.write_all(&bytes)?;
     file.flush()?;
     file.sync_all()?;
-    drop(file);
-    let result = durable_replace(&temporary, path);
+    let result = replace_state_file_at(root, &temporary_name, &file, name);
     if result.is_err() {
-        let _ = fs::remove_file(&temporary);
+        let _ = remove_state_temp_at(root, &temporary_name, &file);
     }
     result
 }
 
 pub(super) fn exclusive_file_lock(path: &Path) -> Result<ExclusiveFileLock, PackStoreError> {
-    let parent = path
+    let state_root = path
         .parent()
         .ok_or(PackStoreError::CorruptState("lock parent"))?;
-    ensure_regular_directories(parent)?;
-    let mut options = OpenOptions::new();
-    options.read(true).write(true).create(true);
-    configure_private_create(&mut options);
-    configure_no_follow(&mut options);
-    let file = options.open(path)?;
-    let metadata = file.metadata()?;
-    if !metadata.is_file() || is_link_or_reparse(&metadata) {
-        return Err(PackStoreError::UnsafeFilesystemEntry(path.to_path_buf()));
-    }
-    super::manifest::reject_named_streams(path)?;
+    let requested_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or(PackStoreError::CorruptState("lock file name"))?;
+    validate_anchor_name(requested_name)?;
+    let authority_parent_path = state_root
+        .parent()
+        .ok_or(PackStoreError::CorruptState("state authority parent"))?;
+    let state_root_name = state_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or(PackStoreError::CorruptState("state root name"))?;
+    validate_anchor_name(state_root_name)?;
+    let authority_parent = AnchoredDirectory::open_or_create_root(authority_parent_path)?;
+    #[cfg(unix)]
+    let file = authority_parent.leaf().try_clone()?;
+    #[cfg(windows)]
+    let file = {
+        let file = open_or_create_lock_at(&authority_parent, PRIVATE_STATE_AUTHORITY_LOCK_NAME)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || is_link_or_reparse(&metadata) {
+            return Err(PackStoreError::UnsafeFilesystemEntry(path.to_path_buf()));
+        }
+        super::manifest::reject_named_streams(
+            &authority_parent
+                .path
+                .join(PRIVATE_STATE_AUTHORITY_LOCK_NAME),
+        )?;
+        file
+    };
+    #[cfg(not(any(unix, windows)))]
+    let file = return Err(PackStoreError::UnsupportedFileLock);
     lock_file(&file)?;
-    Ok(ExclusiveFileLock { file })
+    authority_parent.recheck()?;
+    let root = authority_parent.open_or_create_child(state_root_name, false)?;
+    root.recheck()?;
+    Ok(ExclusiveFileLock { file, root })
 }
 
-fn remove_regular_state_file(path: &Path) -> Result<(), PackStoreError> {
-    if !entry_exists(path)? {
-        return Ok(());
+#[cfg(unix)]
+fn open_state_file_at(
+    root: &AnchoredDirectory,
+    name: &str,
+    write: bool,
+) -> Result<File, PackStoreError> {
+    validate_anchor_name(name)?;
+    let name = CString::new(name).expect("validated state name");
+    let flags =
+        if write { libc::O_RDWR } else { libc::O_RDONLY } | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let fd = unsafe { libc::openat(root.leaf().as_raw_fd(), name.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(PackStoreError::Io(io::Error::last_os_error()));
     }
-    let metadata = fs::symlink_metadata(path)?;
-    if !metadata.is_file() || is_link_or_reparse(&metadata) {
-        return Err(PackStoreError::UnsafeFilesystemEntry(path.to_path_buf()));
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+#[cfg(windows)]
+fn open_state_file_at(
+    root: &AnchoredDirectory,
+    name: &str,
+    write: bool,
+) -> Result<File, PackStoreError> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+    validate_anchor_name(name)?;
+    root.recheck()?;
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .write(write)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    Ok(options.open(root.path.join(name))?)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_state_file_at(
+    _root: &AnchoredDirectory,
+    _name: &str,
+    _write: bool,
+) -> Result<File, PackStoreError> {
+    Err(PackStoreError::UnsupportedAnchoredFilesystem)
+}
+
+#[cfg(windows)]
+fn open_or_create_lock_at(root: &AnchoredDirectory, name: &str) -> Result<File, PackStoreError> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+    validate_anchor_name(name)?;
+    root.recheck()?;
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .create(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    Ok(options.open(root.path.join(name))?)
+}
+
+fn state_file_exists_at(root: &AnchoredDirectory, name: &str) -> Result<bool, PackStoreError> {
+    match open_state_file_at(root, name, false) {
+        Ok(file) => {
+            let metadata = file.metadata()?;
+            if !metadata.is_file() || is_link_or_reparse(&metadata) {
+                return Err(PackStoreError::UnsafeFilesystemEntry(root.path.join(name)));
+            }
+            Ok(true)
+        }
+        Err(PackStoreError::Io(error)) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
     }
-    super::manifest::reject_named_streams(path)?;
-    fs::remove_file(path)?;
-    sync_parent_if_supported(path)?;
+}
+
+#[cfg(unix)]
+fn replace_state_file_at(
+    root: &AnchoredDirectory,
+    temporary_name: &str,
+    _temporary: &File,
+    destination_name: &str,
+) -> Result<(), PackStoreError> {
+    let temporary_name = CString::new(temporary_name).expect("validated temporary name");
+    let destination_name = CString::new(destination_name).expect("validated state name");
+    if unsafe {
+        libc::renameat(
+            root.leaf().as_raw_fd(),
+            temporary_name.as_ptr(),
+            root.leaf().as_raw_fd(),
+            destination_name.as_ptr(),
+        )
+    } != 0
+    {
+        return Err(PackStoreError::Io(io::Error::last_os_error()));
+    }
+    root.leaf().sync_all()?;
     Ok(())
 }
 
-fn entry_exists(path: &Path) -> Result<bool, PackStoreError> {
-    match fs::symlink_metadata(path) {
-        Ok(_) => Ok(true),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(PackStoreError::Io(error)),
+#[cfg(windows)]
+fn replace_state_file_at(
+    root: &AnchoredDirectory,
+    _temporary_name: &str,
+    temporary: &File,
+    destination_name: &str,
+) -> Result<(), PackStoreError> {
+    rename_file_handle_into(temporary, root, destination_name, true)?;
+    root.leaf().sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn replace_state_file_at(
+    _root: &AnchoredDirectory,
+    _temporary_name: &str,
+    _temporary: &File,
+    _destination_name: &str,
+) -> Result<(), PackStoreError> {
+    Err(PackStoreError::UnsupportedAnchoredFilesystem)
+}
+
+#[cfg(unix)]
+fn remove_state_temp_at(
+    root: &AnchoredDirectory,
+    name: &str,
+    _file: &File,
+) -> Result<(), PackStoreError> {
+    remove_anchored_file(root, name)
+}
+
+#[cfg(windows)]
+fn remove_state_temp_at(
+    _root: &AnchoredDirectory,
+    _name: &str,
+    file: &File,
+) -> Result<(), PackStoreError> {
+    delete_by_handle(file)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn remove_state_temp_at(
+    _root: &AnchoredDirectory,
+    _name: &str,
+    _file: &File,
+) -> Result<(), PackStoreError> {
+    Err(PackStoreError::UnsupportedAnchoredFilesystem)
+}
+
+fn remove_state_file_at(root: &AnchoredDirectory, name: &str) -> Result<(), PackStoreError> {
+    if !state_file_exists_at(root, name)? {
+        return Ok(());
     }
+    #[cfg(unix)]
+    {
+        return remove_anchored_file(root, name);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+        root.recheck()?;
+        let mut options = OpenOptions::new();
+        options
+            .access_mode(0x0001_0000 | 0x0000_0080)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        let file = options.open(root.path.join(name))?;
+        delete_by_handle(&file)
+    }
+    #[cfg(not(any(unix, windows)))]
+    Err(PackStoreError::UnsupportedAnchoredFilesystem)
 }
 
 fn random_suffix() -> Result<String, PackStoreError> {
@@ -876,15 +1809,6 @@ fn configure_no_follow(options: &mut OpenOptions) {
 #[cfg(not(any(unix, windows)))]
 fn configure_no_follow(_options: &mut OpenOptions) {}
 
-#[cfg(unix)]
-fn configure_private_create(options: &mut OpenOptions) {
-    use std::os::unix::fs::OpenOptionsExt;
-    options.mode(0o600);
-}
-
-#[cfg(not(unix))]
-fn configure_private_create(_options: &mut OpenOptions) {}
-
 #[cfg(windows)]
 fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;
@@ -892,6 +1816,180 @@ fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
         || metadata.file_attributes()
             & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
             != 0
+}
+
+#[cfg(target_os = "linux")]
+fn durable_rename_new_anchored(
+    source: &AnchoredDirectory,
+    destination_parent: &AnchoredDirectory,
+    destination_name: &str,
+) -> Result<PublishOutcome, PackStoreError> {
+    validate_anchor_name(destination_name)?;
+    let source_name = source
+        .path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or(PackStoreError::CorruptState("staging directory name"))?;
+    let source_name = CString::new(source_name).expect("validated staging name");
+    let destination_name = CString::new(destination_name).expect("validated digest name");
+    let expected = source.identity()?;
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            destination_parent.leaf().as_raw_fd(),
+            source_name.as_ptr(),
+            destination_parent.leaf().as_raw_fd(),
+            destination_name.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result != 0 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EEXIST) {
+            return Ok(PublishOutcome::DestinationExists);
+        }
+        if error.raw_os_error() == Some(libc::ENOSYS) {
+            return Err(PackStoreError::UnsupportedAtomicPublish);
+        }
+        return Err(PackStoreError::Io(error));
+    }
+    let published =
+        destination_parent.open_child(destination_name.to_str().expect("ASCII digest"), false)?;
+    if published.identity()? != expected {
+        return Err(PackStoreError::UnsafeFilesystemEntry(published.path));
+    }
+    published.leaf().sync_all()?;
+    destination_parent.leaf().sync_all()?;
+    Ok(PublishOutcome::Published)
+}
+
+#[cfg(target_os = "macos")]
+fn durable_rename_new_anchored(
+    source: &AnchoredDirectory,
+    destination_parent: &AnchoredDirectory,
+    destination_name: &str,
+) -> Result<PublishOutcome, PackStoreError> {
+    validate_anchor_name(destination_name)?;
+    let source_name = source
+        .path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or(PackStoreError::CorruptState("staging directory name"))?;
+    let source_name = CString::new(source_name).expect("validated staging name");
+    let destination_name = CString::new(destination_name).expect("validated digest name");
+    let expected = source.identity()?;
+    if directory_identity(source.parent_leaf()?)? != destination_parent.identity()? {
+        return Err(PackStoreError::UnsafeFilesystemEntry(source.path.clone()));
+    }
+    let result = unsafe {
+        libc::renameatx_np(
+            destination_parent.leaf().as_raw_fd(),
+            source_name.as_ptr(),
+            destination_parent.leaf().as_raw_fd(),
+            destination_name.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    };
+    if result != 0 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EEXIST) {
+            return Ok(PublishOutcome::DestinationExists);
+        }
+        if error.raw_os_error() == Some(libc::ENOTSUP) {
+            return Err(PackStoreError::UnsupportedAtomicPublish);
+        }
+        return Err(PackStoreError::Io(error));
+    }
+    let destination_name = destination_name.to_str().expect("ASCII digest");
+    let published = destination_parent.open_child(destination_name, false)?;
+    if published.identity()? != expected {
+        return Err(PackStoreError::UnsafeFilesystemEntry(published.path));
+    }
+    published.leaf().sync_all()?;
+    destination_parent.leaf().sync_all()?;
+    Ok(PublishOutcome::Published)
+}
+
+#[cfg(windows)]
+fn durable_rename_new_anchored(
+    source: &AnchoredDirectory,
+    destination_parent: &AnchoredDirectory,
+    destination_name: &str,
+) -> Result<PublishOutcome, PackStoreError> {
+    rename_handle_into(source, destination_parent, destination_name, false)
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+fn durable_rename_new_anchored(
+    _source: &AnchoredDirectory,
+    _destination_parent: &AnchoredDirectory,
+    _destination_name: &str,
+) -> Result<PublishOutcome, PackStoreError> {
+    Err(PackStoreError::UnsupportedAtomicPublish)
+}
+
+#[cfg(windows)]
+fn rename_handle_into(
+    source: &AnchoredDirectory,
+    destination_parent: &AnchoredDirectory,
+    destination_name: &str,
+    replace: bool,
+) -> Result<PublishOutcome, PackStoreError> {
+    source.recheck()?;
+    rename_file_handle_into(source.leaf(), destination_parent, destination_name, replace)
+}
+
+#[cfg(windows)]
+fn rename_file_handle_into(
+    source: &File,
+    destination_parent: &AnchoredDirectory,
+    destination_name: &str,
+    replace: bool,
+) -> Result<PublishOutcome, PackStoreError> {
+    use std::mem::size_of;
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_RENAME_INFO, FILE_RENAME_INFO_0, FileRenameInfo, SetFileInformationByHandle,
+    };
+    validate_anchor_name(destination_name)?;
+    destination_parent.recheck()?;
+    let destination = destination_parent.path.join(destination_name);
+    let wide = destination.as_os_str().encode_wide().collect::<Vec<_>>();
+    let bytes = size_of::<FILE_RENAME_INFO>() + wide.len() * size_of::<u16>();
+    let words = bytes.div_ceil(size_of::<usize>());
+    let mut buffer = vec![0_usize; words];
+    let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    unsafe {
+        (*info).Anonymous = FILE_RENAME_INFO_0 {
+            ReplaceIfExists: u8::from(replace),
+        };
+        (*info).RootDirectory = std::ptr::null_mut();
+        (*info).FileNameLength = u32::try_from(wide.len() * size_of::<u16>())
+            .map_err(|_| PackStoreError::CorruptState("rename target length"))?;
+        std::ptr::copy_nonoverlapping(wide.as_ptr(), (*info).FileName.as_mut_ptr(), wide.len());
+    }
+    if unsafe {
+        SetFileInformationByHandle(
+            source.as_raw_handle(),
+            FileRenameInfo,
+            info.cast(),
+            u32::try_from(bytes)
+                .map_err(|_| PackStoreError::CorruptState("rename buffer length"))?,
+        )
+    } == 0
+    {
+        let error = io::Error::last_os_error();
+        if matches!(
+            error.raw_os_error().map(|value| value as u32),
+            Some(ERROR_ALREADY_EXISTS) | Some(ERROR_FILE_EXISTS)
+        ) {
+            return Ok(PublishOutcome::DestinationExists);
+        }
+        return Err(PackStoreError::Io(error));
+    }
+    Ok(PublishOutcome::Published)
 }
 
 #[cfg(not(windows))]
@@ -977,18 +2075,6 @@ fn durable_rename_new(
     _destination: &Path,
 ) -> Result<PublishOutcome, PackStoreError> {
     Err(PackStoreError::UnsupportedAtomicPublish)
-}
-
-#[cfg(windows)]
-fn durable_replace(source: &Path, destination: &Path) -> Result<(), PackStoreError> {
-    move_file(source, destination, true).map_err(PackStoreError::Io)
-}
-
-#[cfg(not(windows))]
-fn durable_replace(source: &Path, destination: &Path) -> Result<(), PackStoreError> {
-    fs::rename(source, destination)?;
-    sync_parent(destination)?;
-    Ok(())
 }
 
 #[cfg(windows)]
@@ -1083,16 +2169,6 @@ impl Drop for ExclusiveFileLock {
     }
 }
 
-fn sync_parent_if_supported(path: &Path) -> Result<(), PackStoreError> {
-    #[cfg(not(windows))]
-    {
-        sync_parent(path)?;
-    }
-    #[cfg(windows)]
-    let _ = path;
-    Ok(())
-}
-
 #[cfg(not(windows))]
 fn sync_parent(path: &Path) -> Result<(), PackStoreError> {
     let parent = path
@@ -1116,6 +2192,8 @@ pub(crate) enum PackStoreError {
     UnsupportedAtomicPublish,
     #[error("this platform has no supported OS-backed file lock")]
     UnsupportedFileLock,
+    #[error("this platform has no supported anchored filesystem operations")]
+    UnsupportedAnchoredFilesystem,
     #[error("worker-pack descriptor changed")]
     DescriptorChanged,
     #[error("worker-pack descriptor points outside the immutable store")]
@@ -1407,13 +2485,10 @@ mod tests {
         store.activate(&first).unwrap();
         let (next_source, _) = additional_source(&root, "2.0.0", 2);
         let next = store.stage_and_install(&next_source).unwrap();
-        {
-            let _lock = store.acquire_lock().unwrap();
-            assert!(matches!(
-                store.activate_locked(&next, Some(ActivationBoundary::Journal)),
-                Err(PackStoreError::InjectedInterruption)
-            ));
-        }
+        assert!(matches!(
+            store.activate_locked(&next, Some(ActivationBoundary::Journal)),
+            Err(PackStoreError::InjectedInterruption)
+        ));
         let baseline: PendingActivation = read_canonical_state(&store.pending_path()).unwrap();
         for value in [
             ".",
@@ -1512,13 +2587,10 @@ mod tests {
             store.activate(&first).unwrap();
             let (next_source, _) = additional_source(&root, "2.0.0", 2);
             let next = store.stage_and_install(&next_source).unwrap();
-            {
-                let _lock = store.acquire_lock().unwrap();
-                assert!(matches!(
-                    store.activate_locked(&next, Some(boundary)),
-                    Err(PackStoreError::InjectedInterruption)
-                ));
-            }
+            assert!(matches!(
+                store.activate_locked(&next, Some(boundary)),
+                Err(PackStoreError::InjectedInterruption)
+            ));
             assert_eq!(current_descriptor(&store), Some(next.clone()));
             let activation = store.load_activation_strict().unwrap();
             assert_eq!(activation.previous, Some(first));
@@ -1710,6 +2782,145 @@ mod tests {
             Err(PackStoreError::CorruptState("security epoch state"))
         ));
         assert_eq!(store.load_epochs_strict().unwrap(), epochs);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn anchored_stage_rejects_or_outlives_version_ancestor_swap() {
+        let (root, workers, state, verifier, _) = store_fixture("stage-ancestor-swap");
+        let store = PackStore::new(&workers, &state, &verifier);
+        let external = root.join("external-stage-target");
+        fs::create_dir(&external).unwrap();
+        let sentinel = external.join("sentinel.txt");
+        fs::write(&sentinel, b"must remain untouched").unwrap();
+        let moved = root.join("moved-version");
+
+        let result = store.stage_and_install_inner(
+            &root.join("source"),
+            |version| {
+                #[cfg(windows)]
+                assert!(fs::rename(version, &moved).is_err());
+                #[cfg(unix)]
+                {
+                    fs::rename(version, &moved).unwrap();
+                    std::os::unix::fs::symlink(&external, version).unwrap();
+                }
+            },
+            |_| {},
+        );
+
+        #[cfg(windows)]
+        assert!(result.is_ok());
+        #[cfg(unix)]
+        assert!(result.is_err());
+        assert_eq!(fs::read(&sentinel).unwrap(), b"must remain untouched");
+        assert_eq!(fs::read_dir(&external).unwrap().count(), 1);
+        #[cfg(unix)]
+        {
+            let version = workers.join("packs").join("scribe-vulkan").join("1.2.3");
+            fs::remove_file(version).unwrap();
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn anchored_staging_swap_never_redirects_copy_or_cleanup() {
+        let (root, workers, state, verifier, _) = store_fixture("staging-root-swap");
+        let store = PackStore::new(&workers, &state, &verifier);
+        let external = root.join("external-staging-target");
+        fs::create_dir(&external).unwrap();
+        let sentinel = external.join("sentinel.txt");
+        fs::write(&sentinel, b"must remain untouched").unwrap();
+        let moved = root.join("moved-staging");
+
+        let result = store.stage_and_install_inner(
+            &root.join("source"),
+            |_| {},
+            |staging| {
+                #[cfg(windows)]
+                assert!(fs::rename(staging, &moved).is_err());
+                #[cfg(unix)]
+                {
+                    fs::rename(staging, &moved).unwrap();
+                    std::os::unix::fs::symlink(&external, staging).unwrap();
+                }
+            },
+        );
+
+        #[cfg(windows)]
+        assert!(result.is_ok());
+        #[cfg(unix)]
+        assert!(result.is_err());
+        assert_eq!(fs::read(&sentinel).unwrap(), b"must remain untouched");
+        assert_eq!(fs::read_dir(&external).unwrap().count(), 1);
+        #[cfg(unix)]
+        {
+            let version = workers.join("packs").join("scribe-vulkan").join("1.2.3");
+            for entry in fs::read_dir(&version).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_symlink() {
+                    fs::remove_file(entry.path()).unwrap();
+                }
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn state_lock_and_mutation_share_one_anchored_parent() {
+        let (root, workers, state, verifier, _) = store_fixture("state-ancestor-swap");
+        let store = PackStore::new(&workers, &state, &verifier);
+        let lock = store.acquire_lock().unwrap();
+        let moved = root.join("moved-state");
+        let second_lock_path = state.join(STORE_LOCK_NAME);
+        let second_state_path = state.join("second-instance.json");
+        let (attempted_tx, attempted_rx) = std::sync::mpsc::channel();
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        let second = std::thread::spawn(move || {
+            attempted_tx.send(()).unwrap();
+            let lock = exclusive_file_lock(&second_lock_path).unwrap();
+            lock.write(&second_state_path, &EpochState::empty())
+                .unwrap();
+            acquired_tx.send(()).unwrap();
+        });
+        attempted_rx.recv().unwrap();
+        assert!(
+            acquired_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "second instance bypassed the retained parent authority lock"
+        );
+
+        #[cfg(windows)]
+        {
+            assert!(fs::rename(&state, &moved).is_err());
+            lock.write(&store.epoch_path(), &EpochState::empty())
+                .unwrap();
+            assert!(store.epoch_path().is_file());
+        }
+        #[cfg(unix)]
+        {
+            fs::rename(&state, &moved).unwrap();
+            fs::create_dir(&state).unwrap();
+            let sentinel = state.join("sentinel.txt");
+            fs::write(&sentinel, b"must remain untouched").unwrap();
+            assert!(
+                lock.write(&store.epoch_path(), &EpochState::empty())
+                    .is_err()
+            );
+            assert_eq!(fs::read(&sentinel).unwrap(), b"must remain untouched");
+            assert!(!state.join("security-epochs.json").exists());
+        }
+        drop(lock);
+        acquired_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        second.join().unwrap();
+        #[cfg(unix)]
+        assert_eq!(
+            fs::read(state.join("sentinel.txt")).unwrap(),
+            b"must remain untouched"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 }

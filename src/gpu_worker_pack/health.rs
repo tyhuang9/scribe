@@ -7,9 +7,7 @@ use thiserror::Error;
 
 use crate::backend_policy::{BackendTarget, CandidateQuarantineProjection};
 
-use super::store::{
-    PackStoreError, atomic_write_canonical, exclusive_file_lock, read_canonical_state,
-};
+use super::store::{ExclusiveFileLock, PackStoreError, exclusive_file_lock};
 
 const HEALTH_SCHEMA_VERSION: u16 = 3;
 const MAX_RECORDS: usize = 128;
@@ -203,8 +201,8 @@ impl<'a> HealthCache<'a> {
         key: HealthKey,
         code: FailureCode,
     ) -> Result<HealthDecision, HealthCacheError> {
-        let _lock = exclusive_file_lock(&self.lock_path())?;
-        self.reload_locked();
+        let lock = exclusive_file_lock(&self.lock_path())?;
+        self.reload_locked(&lock);
         validate_key(&key)?;
         let now = self.clock.now_unix_seconds();
         self.envelope
@@ -240,7 +238,7 @@ impl<'a> HealthCache<'a> {
         };
         let seconds = quarantine_seconds(record.failure_count);
         record.quarantined_until_unix_seconds = now.saturating_add(seconds);
-        self.persist()?;
+        self.persist(&lock)?;
         Ok(decision_from_envelope(&self.envelope, &key, now))
     }
 
@@ -250,8 +248,8 @@ impl<'a> HealthCache<'a> {
         &mut self,
         key: &HealthKey,
     ) -> Result<bool, HealthCacheError> {
-        let _lock = exclusive_file_lock(&self.lock_path())?;
-        self.reload_locked();
+        let lock = exclusive_file_lock(&self.lock_path())?;
+        self.reload_locked(&lock);
         if self.invalid
             || (self.envelope.recovery_mode && !self.is_recovered(key))
             || self.recovery_probe(key).is_some()
@@ -267,7 +265,7 @@ impl<'a> HealthCache<'a> {
         }
         record.retry_grant_expires_unix_seconds = Some(now.saturating_add(RETRY_GRANT_SECONDS));
         record.retry_grant_remaining = true;
-        self.persist()?;
+        self.persist(&lock)?;
         Ok(true)
     }
 
@@ -278,8 +276,8 @@ impl<'a> HealthCache<'a> {
         &mut self,
         key: &HealthKey,
     ) -> Result<bool, HealthCacheError> {
-        let _lock = exclusive_file_lock(&self.lock_path())?;
-        self.reload_locked();
+        let lock = exclusive_file_lock(&self.lock_path())?;
+        self.reload_locked(&lock);
         if self.invalid
             || (self.envelope.recovery_mode && !self.is_recovered(key))
             || self.recovery_probe(key).is_some()
@@ -299,7 +297,7 @@ impl<'a> HealthCache<'a> {
         }
         record.retry_grant_remaining = false;
         record.retry_grant_expires_unix_seconds = None;
-        self.persist()?;
+        self.persist(&lock)?;
         Ok(true)
     }
 
@@ -307,8 +305,8 @@ impl<'a> HealthCache<'a> {
         &mut self,
         key: &HealthKey,
     ) -> Result<bool, HealthCacheError> {
-        let _lock = exclusive_file_lock(&self.lock_path())?;
-        self.reload_locked();
+        let lock = exclusive_file_lock(&self.lock_path())?;
+        self.reload_locked(&lock);
         validate_key(key)?;
         let now = self.clock.now_unix_seconds();
         if self.invalid {
@@ -322,12 +320,12 @@ impl<'a> HealthCache<'a> {
                 record.successful_idle_probes =
                     record.successful_idle_probes.saturating_add(1).min(2);
                 if record.successful_idle_probes < 2 {
-                    self.persist()?;
+                    self.persist(&lock)?;
                     return Ok(false);
                 }
                 self.envelope.records.retain(|record| &record.key != key);
                 self.envelope.recovered_keys.push(key.clone());
-                self.persist()?;
+                self.persist(&lock)?;
                 return Ok(true);
             }
             if let Some(probe) = self.recovery_probe_mut(key) {
@@ -339,10 +337,10 @@ impl<'a> HealthCache<'a> {
                         .recovery_probes
                         .retain(|probe| &probe.key != key);
                     self.envelope.recovered_keys.push(key.clone());
-                    self.persist()?;
+                    self.persist(&lock)?;
                     return Ok(true);
                 }
-                self.persist()?;
+                self.persist(&lock)?;
                 return Ok(false);
             }
             self.evict_if_full();
@@ -351,7 +349,7 @@ impl<'a> HealthCache<'a> {
                 successful_idle_probes: 1,
                 last_probe_unix_seconds: now,
             });
-            self.persist()?;
+            self.persist(&lock)?;
             return Ok(false);
         }
         if let Some(probe) = self.recovery_probe_mut(key) {
@@ -361,10 +359,10 @@ impl<'a> HealthCache<'a> {
                 self.envelope
                     .recovery_probes
                     .retain(|probe| &probe.key != key);
-                self.persist()?;
+                self.persist(&lock)?;
                 return Ok(true);
             }
-            self.persist()?;
+            self.persist(&lock)?;
             return Ok(false);
         }
         let Some(record) = self.record_mut(key) else {
@@ -373,10 +371,10 @@ impl<'a> HealthCache<'a> {
         record.successful_idle_probes = record.successful_idle_probes.saturating_add(1).min(2);
         if record.successful_idle_probes == 2 {
             self.envelope.records.retain(|record| &record.key != key);
-            self.persist()?;
+            self.persist(&lock)?;
             return Ok(true);
         }
-        self.persist()?;
+        self.persist(&lock)?;
         Ok(false)
     }
 
@@ -457,15 +455,15 @@ impl<'a> HealthCache<'a> {
         }
     }
 
-    fn persist(&mut self) -> Result<(), HealthCacheError> {
+    fn persist(&mut self, lock: &ExclusiveFileLock) -> Result<(), HealthCacheError> {
         validate_envelope(&self.envelope)?;
-        atomic_write_canonical(&self.path, &self.envelope)?;
+        lock.write(&self.path, &self.envelope)?;
         self.invalid = false;
         Ok(())
     }
 
-    fn reload_locked(&mut self) {
-        match load_cache(&self.path, &self.witnesses) {
+    fn reload_locked(&mut self, lock: &ExclusiveFileLock) {
+        match load_cache_locked(lock, &self.path, &self.witnesses) {
             CacheLoad::Missing => {
                 self.envelope = HealthEnvelope::empty(self.witnesses.clone());
                 self.invalid = false;
@@ -504,12 +502,28 @@ impl CandidateQuarantineProjection for HealthQuarantineProjection {
 }
 
 fn load_cache(path: &Path, witnesses: &HealthWitnesses) -> CacheLoad {
-    match std::fs::symlink_metadata(path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return CacheLoad::Missing,
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("gpu-health");
+    let lock_path = path.with_file_name(format!(".{name}.lock"));
+    let Ok(lock) = exclusive_file_lock(&lock_path) else {
+        return CacheLoad::Invalid;
+    };
+    load_cache_locked(&lock, path, witnesses)
+}
+
+fn load_cache_locked(
+    lock: &ExclusiveFileLock,
+    path: &Path,
+    witnesses: &HealthWitnesses,
+) -> CacheLoad {
+    match lock.exists(path) {
+        Ok(false) => return CacheLoad::Missing,
         Err(_) => return CacheLoad::Invalid,
-        Ok(_) => {}
+        Ok(true) => {}
     }
-    let Ok(envelope) = read_canonical_state::<HealthEnvelope>(path) else {
+    let Ok(envelope) = lock.read::<HealthEnvelope>(path) else {
         return CacheLoad::Invalid;
     };
     if envelope.witnesses != *witnesses || validate_envelope(&envelope).is_err() {
