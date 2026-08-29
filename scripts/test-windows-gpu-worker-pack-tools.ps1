@@ -65,9 +65,10 @@ if ($env:OS -ne 'Windows_NT') {
 
 $repositoryRoot = [System.IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $buildScript = Join-Path $PSScriptRoot 'build-windows-gpu-worker-pack.ps1'
+$prepareScript = Join-Path $PSScriptRoot 'prepare-windows-gpu-worker-packs.ps1'
 foreach ($script in @(
     $buildScript,
-    (Join-Path $PSScriptRoot 'prepare-windows-gpu-worker-packs.ps1'),
+    $prepareScript,
     (Join-Path $PSScriptRoot 'report-windows-worker-pack-sizes.ps1')
 )) {
     $parseErrors = $null
@@ -78,6 +79,10 @@ foreach ($script in @(
     ) | Out-Null
     Assert-True ($parseErrors.Count -eq 0) "GPU worker-pack script has PowerShell parse errors: $script"
 }
+$prepareSource = Get-Content -LiteralPath $prepareScript -Raw
+Assert-True `
+    (-not $prepareSource.Contains('-CargoTargetDirectory')) `
+    'Production pack preparation must let each builder allocate its fresh isolated LocalApplicationData target.'
 
 $toolchainOutput = Join-Path ([System.IO.Path]::GetTempPath()) 'scribe-gpu-toolchain-check-unused'
 & $buildScript `

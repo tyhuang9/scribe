@@ -50,12 +50,10 @@ $vulkanRoot = Join-Path $outputRoot 'vulkan'
 $cudaRoot = Join-Path $outputRoot 'cuda'
 $vulkan = & $buildScript @shared `
     -Backend Vulkan `
-    -OutputDirectory $vulkanRoot `
-    -CargoTargetDirectory (Join-Path $repositoryRoot 'target-gpu-pack-release-vulkan')
+    -OutputDirectory $vulkanRoot
 $cuda = & $buildScript @shared `
     -Backend Cuda `
-    -OutputDirectory $cudaRoot `
-    -CargoTargetDirectory (Join-Path $repositoryRoot 'target-gpu-pack-release-cuda')
+    -OutputDirectory $cudaRoot
 
 if ($vulkan.PackRoot -cne $vulkanRoot -or $cuda.PackRoot -cne $cudaRoot) {
     throw 'GPU worker-pack builders returned an unexpected output root.'
