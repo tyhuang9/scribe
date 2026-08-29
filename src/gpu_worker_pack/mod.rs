@@ -1164,7 +1164,6 @@ mod tests {
 
         drop(success);
         drop(fixture_lease);
-        drop(verifier);
         std::fs::remove_dir_all(root).unwrap();
     }
 }
