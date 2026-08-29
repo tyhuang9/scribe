@@ -809,6 +809,102 @@ mod tests {
     }
 
     #[test]
+    fn observed_device_reconciliation_preserves_only_the_fresh_process_index() {
+        let enumerated = Device {
+            name: "Vulkan0".to_owned(),
+            description: "NVIDIA GeForce RTX test device".to_owned(),
+            kind: "vulkan".to_owned(),
+            device_type: DeviceType::Gpu,
+            device_id: Some("0000:01:00.0".to_owned()),
+            memory_total: 8 * 1024 * 1024 * 1024,
+            memory_free: 6 * 1024 * 1024 * 1024,
+            index: Some(3),
+        };
+        let candidate = native_backend_candidate(enumerated).unwrap();
+        let mut selection = select_backend(
+            AccelerationPreference::Gpu,
+            &BackendSnapshot {
+                operating_system: OperatingSystem::Windows,
+                power_source: PowerSource::Ac,
+                candidates: vec![candidate],
+            },
+        )
+        .unwrap();
+        let observed = Device {
+            name: "Vulkan0".to_owned(),
+            description: "NVIDIA GeForce RTX test device".to_owned(),
+            kind: "vulkan".to_owned(),
+            device_type: DeviceType::Gpu,
+            device_id: Some("0000:01:00.0".to_owned()),
+            memory_total: 8 * 1024 * 1024 * 1024,
+            memory_free: 5 * 1024 * 1024 * 1024,
+            index: None,
+        };
+
+        reconcile_observed_target(&mut selection, "vulkan", &observed).unwrap();
+
+        assert_eq!(selection.target.process_index, Some(3));
+        assert_eq!(
+            selection.target.memory_available_bytes,
+            5 * 1024 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn observed_device_reconciliation_rejects_backend_or_identity_drift() {
+        let enumerated = Device {
+            name: "Vulkan0".to_owned(),
+            description: "NVIDIA GPU A".to_owned(),
+            kind: "vulkan".to_owned(),
+            device_type: DeviceType::Gpu,
+            device_id: Some("0000:01:00.0".to_owned()),
+            memory_total: 8 * 1024 * 1024 * 1024,
+            memory_free: 6 * 1024 * 1024 * 1024,
+            index: Some(2),
+        };
+        let selection = || {
+            select_backend(
+                AccelerationPreference::Gpu,
+                &BackendSnapshot {
+                    operating_system: OperatingSystem::Windows,
+                    power_source: PowerSource::Ac,
+                    candidates: vec![native_backend_candidate(enumerated.clone()).unwrap()],
+                },
+            )
+            .unwrap()
+        };
+        let wrong_device = Device {
+            device_id: Some("0000:02:00.0".to_owned()),
+            index: None,
+            ..enumerated.clone()
+        };
+        let mut wrong_device_selection = selection();
+        let identity_error =
+            reconcile_observed_target(&mut wrong_device_selection, "vulkan", &wrong_device)
+                .unwrap_err()
+                .to_string();
+        assert!(identity_error.starts_with("BackendUnavailable:"));
+        assert!(identity_error.contains("native:0000:02:00.0"));
+
+        let cpu = Device {
+            name: "CPU".to_owned(),
+            description: "CPU".to_owned(),
+            kind: "cpu".to_owned(),
+            device_type: DeviceType::Cpu,
+            device_id: None,
+            memory_total: 0,
+            memory_free: 0,
+            index: None,
+        };
+        let mut wrong_backend_selection = selection();
+        let backend_error = reconcile_observed_target(&mut wrong_backend_selection, "cpu", &cpu)
+            .unwrap_err()
+            .to_string();
+        assert!(backend_error.starts_with("BackendUnavailable:"));
+        assert!(backend_error.contains("requested Vulkan"));
+    }
+
+    #[test]
     #[ignore = "requires SCRIBE_TRANSCRIBE_CPP_GGUF to name a compatible local GGUF fixture"]
     fn compatible_gguf_loads_and_reports_runtime_capabilities() {
         let path = PathBuf::from(
