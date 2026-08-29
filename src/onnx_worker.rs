@@ -962,12 +962,12 @@ fn worker_pack_expectation_from_private_env() -> Result<Option<WorkerPackExpecta
     }))
 }
 
-#[cfg(all(windows, feature = "inference-worker"))]
+#[cfg(windows)]
 struct PackDriverCatalog {
     by_pci_location: BTreeMap<(u32, u32, u32), String>,
 }
 
-#[cfg(all(windows, feature = "inference-worker"))]
+#[cfg(windows)]
 impl PackDriverCatalog {
     fn discover() -> Result<Self> {
         use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
@@ -1114,12 +1114,25 @@ impl PackDriverCatalog {
             .cloned()
             .ok_or_else(|| anyhow!("GPU PCI identity has no matching Windows driver metadata"))
     }
+
+    fn fingerprint(&self) -> String {
+        let mut digest = Sha256::new();
+        digest.update((self.by_pci_location.len() as u64).to_le_bytes());
+        for ((bus, device, function), driver) in &self.by_pci_location {
+            digest.update(bus.to_le_bytes());
+            digest.update(device.to_le_bytes());
+            digest.update(function.to_le_bytes());
+            digest.update((driver.len() as u64).to_le_bytes());
+            digest.update(driver.as_bytes());
+        }
+        format!("{:x}", digest.finalize())
+    }
 }
 
-#[cfg(all(not(windows), feature = "inference-worker"))]
+#[cfg(not(windows))]
 struct PackDriverCatalog;
 
-#[cfg(all(not(windows), feature = "inference-worker"))]
+#[cfg(not(windows))]
 impl PackDriverCatalog {
     fn discover() -> Result<Self> {
         bail!("Stage 4 GPU worker packs require Windows driver metadata")
@@ -1127,6 +1140,10 @@ impl PackDriverCatalog {
 
     fn identity_for(&self, _stable_device_identity: &str) -> Result<String> {
         bail!("Stage 4 GPU worker packs require Windows driver metadata")
+    }
+
+    fn fingerprint(&self) -> String {
+        "unsupported".to_owned()
     }
 }
 
@@ -3349,7 +3366,6 @@ impl ProcessWorkerSupervisor {
     /// failed. This is the router's fail-closed boundary for alternate and test
     /// supervisor implementations whose `load` errors do not invalidate their
     /// own process generation.
-    #[cfg(test)]
     pub(crate) fn terminate_current(&self) -> Result<()> {
         let generation = self
             .inner
@@ -5092,6 +5108,12 @@ impl InferenceWorkerSupervisor {
         self.unload()
     }
 
+    fn retire(&self) -> Result<(), RuntimeError> {
+        self.transport
+            .terminate_current()
+            .map_err(worker_unavailable)
+    }
+
     pub(crate) fn cancel_active(&self) {
         let outcome = self.transport.cancel_active_outcome();
         if matches!(
@@ -5193,6 +5215,22 @@ struct VerifiedGpuRouteCatalog {
     routes: Arc<Vec<InferenceWorkerRoute>>,
     diagnostic: Option<String>,
     device_set_digest: String,
+    discovery_fingerprint: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct InferenceRouteIdentity {
+    provider: WorkerProvider,
+    backend: BackendKind,
+    stable_device_identity: String,
+    driver_version: Option<String>,
+    pack_digest: Option<String>,
+}
+
+#[derive(Clone)]
+struct ActiveInferenceRoute {
+    identity: InferenceRouteIdentity,
+    supervisor: InferenceWorkerSupervisor,
 }
 
 #[derive(Clone)]
@@ -5252,14 +5290,17 @@ pub(crate) struct InferenceWorkerRegistry {
     routes: Arc<Vec<InferenceWorkerRoute>>,
     gpu_routes: Arc<Mutex<Option<VerifiedGpuRouteCatalog>>>,
     gpu_health_path: Option<Arc<PathBuf>>,
+    active_route: Arc<Mutex<Option<ActiveInferenceRoute>>>,
+    route_execution: Arc<Mutex<()>>,
     #[cfg(test)]
     gpu_routes_for_testing: Option<VerifiedGpuRouteCatalog>,
 }
 
-fn discover_production_pack_launch_bindings() -> crate::gpu_worker_pack::ProductionPackRegistry {
+fn discover_production_pack_launch_bindings(
+    discovery: crate::gpu_worker_pack::PackLeaseDiscovery,
+) -> crate::gpu_worker_pack::ProductionPackRegistry {
     use crate::gpu_worker_pack::{PackDiscoveryDiagnostic, PackDiscoveryIssue};
 
-    let discovery = crate::gpu_worker_pack::discover_production_pack_leases();
     let mut diagnostics = discovery.diagnostics;
     let mut bindings = Vec::new();
     for lease in discovery.leases.into_iter().take(8) {
@@ -5409,8 +5450,41 @@ fn health_observation_for_runtime_error(
     }
 }
 
+fn explicit_gpu_discovery_fingerprint(
+    discovery: &crate::gpu_worker_pack::PackLeaseDiscovery,
+) -> String {
+    let mut digest = Sha256::new();
+    update_health_digest(
+        &mut digest,
+        discovery
+            .catalog_generation
+            .as_deref()
+            .unwrap_or("catalog-unavailable"),
+    );
+    for diagnostic in &discovery.diagnostics {
+        update_health_digest(&mut digest, &format!("{:?}", diagnostic.issue));
+        update_health_digest(
+            &mut digest,
+            diagnostic.pack_id.as_deref().unwrap_or("no-pack"),
+        );
+        update_health_digest(
+            &mut digest,
+            &diagnostic
+                .backend
+                .map(|backend| format!("{backend:?}"))
+                .unwrap_or_else(|| "no-backend".to_owned()),
+        );
+    }
+    let adapter_fingerprint = PackDriverCatalog::discover()
+        .map(|catalog| catalog.fingerprint())
+        .unwrap_or_else(|_| "adapter-metadata-unavailable".to_owned());
+    update_health_digest(&mut digest, &adapter_fingerprint);
+    format!("{:x}", digest.finalize())
+}
+
 fn verified_gpu_route_catalog(
     registry: crate::gpu_worker_pack::ProductionPackRegistry,
+    discovery_fingerprint: String,
 ) -> VerifiedGpuRouteCatalog {
     let (bindings, diagnostics) = registry.into_parts();
     let mut routes = bindings
@@ -5462,7 +5536,18 @@ fn verified_gpu_route_catalog(
         routes: Arc::new(routes),
         diagnostic: (!diagnostic.is_empty()).then_some(diagnostic),
         device_set_digest,
+        discovery_fingerprint,
     }
+}
+
+fn matching_cached_gpu_catalog(
+    cached: &Option<VerifiedGpuRouteCatalog>,
+    discovery_fingerprint: &str,
+) -> Option<VerifiedGpuRouteCatalog> {
+    cached
+        .as_ref()
+        .filter(|catalog| catalog.discovery_fingerprint == discovery_fingerprint)
+        .cloned()
 }
 
 fn health_filtered_gpu_route_plan(
@@ -5546,6 +5631,12 @@ fn health_filtered_gpu_route_plan(
 }
 
 impl InferenceWorkerRegistry {
+    fn lock_route_execution(&self) -> Result<std::sync::MutexGuard<'_, ()>, RuntimeError> {
+        self.route_execution.lock().map_err(|_| {
+            RuntimeError::WorkerUnavailable("inference route execution lock poisoned".to_owned())
+        })
+    }
+
     pub(crate) fn for_current_build() -> Self {
         let provider = WorkerProvider::Cpu;
         Self {
@@ -5564,6 +5655,8 @@ impl InferenceWorkerRegistry {
                         .join("gpu-worker-health-v3.json"),
                 )
             }),
+            active_route: Arc::new(Mutex::new(None)),
+            route_execution: Arc::new(Mutex::new(())),
             #[cfg(test)]
             gpu_routes_for_testing: None,
         }
@@ -5590,6 +5683,8 @@ impl InferenceWorkerRegistry {
                         .join("gpu-worker-health-v3.json"),
                 )
             }),
+            active_route: Arc::new(Mutex::new(None)),
+            route_execution: Arc::new(Mutex::new(())),
             #[cfg(test)]
             gpu_routes_for_testing: None,
         }
@@ -5607,8 +5702,87 @@ impl InferenceWorkerRegistry {
             }]),
             gpu_routes: Arc::new(Mutex::new(None)),
             gpu_health_path: None,
+            active_route: Arc::new(Mutex::new(None)),
+            route_execution: Arc::new(Mutex::new(())),
             gpu_routes_for_testing: None,
         }
+    }
+
+    fn route_identity(route: &InferenceWorkerRoute) -> InferenceRouteIdentity {
+        let target = route
+            .target
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(BackendTarget::cpu);
+        InferenceRouteIdentity {
+            provider: route.provider,
+            backend: target.backend,
+            stable_device_identity: target.device_id.as_str().to_owned(),
+            driver_version: target.driver_version,
+            pack_digest: target.pack.map(|pack| pack.pack_digest),
+        }
+    }
+
+    fn same_supervisor(
+        left: &InferenceWorkerSupervisor,
+        right: &InferenceWorkerSupervisor,
+    ) -> bool {
+        Arc::ptr_eq(&left.transport.inner, &right.transport.inner)
+    }
+
+    fn retire_active_worker(&self) -> Result<(), RuntimeError> {
+        let active = self
+            .active_route
+            .lock()
+            .map_err(|_| {
+                RuntimeError::WorkerUnavailable("active inference route lock poisoned".to_owned())
+            })?
+            .take();
+        if let Some(active) = active {
+            active.supervisor.retire()?;
+        }
+        Ok(())
+    }
+
+    fn prepare_route(&self, route: &InferenceWorkerRoute) -> Result<(), RuntimeError> {
+        let identity = Self::route_identity(route);
+        let prior = {
+            let mut active = self.active_route.lock().map_err(|_| {
+                RuntimeError::WorkerUnavailable("active inference route lock poisoned".to_owned())
+            })?;
+            if active.as_ref().is_some_and(|current| {
+                current.identity == identity
+                    && Self::same_supervisor(&current.supervisor, &route.supervisor)
+            }) {
+                return Ok(());
+            }
+            active.take()
+        };
+        if let Some(prior) = prior {
+            prior.supervisor.retire()?;
+        }
+        *self.active_route.lock().map_err(|_| {
+            RuntimeError::WorkerUnavailable("active inference route lock poisoned".to_owned())
+        })? = Some(ActiveInferenceRoute {
+            identity,
+            supervisor: route.supervisor.clone(),
+        });
+        Ok(())
+    }
+
+    fn retire_failed_route(&self, route: &InferenceWorkerRoute) -> Result<(), RuntimeError> {
+        route.supervisor.retire()?;
+        let identity = Self::route_identity(route);
+        let mut active = self.active_route.lock().map_err(|_| {
+            RuntimeError::WorkerUnavailable("active inference route lock poisoned".to_owned())
+        })?;
+        if active.as_ref().is_some_and(|current| {
+            current.identity == identity
+                && Self::same_supervisor(&current.supervisor, &route.supervisor)
+        }) {
+            *active = None;
+        }
+        Ok(())
     }
 
     fn routes_for_preference(
@@ -5652,25 +5826,30 @@ impl InferenceWorkerRegistry {
             });
         }
 
-        // Explicit GPU re-probes the provider on every request so driver and
-        // device-set changes are observed before selection. When the stable
-        // context is unchanged, retain the existing supervisors and their
-        // five-minute warm model instead of replacing them with probe results.
-        let discovered = verified_gpu_route_catalog(discover_production_pack_launch_bindings());
-        let catalog = {
-            let mut cached = self.gpu_routes.lock().map_err(|_| {
+        // Catalog activation and Windows SetupAPI adapter metadata provide a
+        // cheap request-bound fingerprint. Reuse the warm winning supervisor
+        // while it is unchanged; a changed fingerprint retires that worker
+        // before any provider probe can start.
+        let lease_discovery = crate::gpu_worker_pack::discover_production_pack_leases();
+        let discovery_fingerprint = explicit_gpu_discovery_fingerprint(&lease_discovery);
+        let cached_catalog = {
+            let cached = self.gpu_routes.lock().map_err(|_| {
                 RuntimeError::WorkerUnavailable("GPU worker registry lock poisoned".to_owned())
             })?;
-            match cached.as_mut() {
-                Some(existing) if existing.device_set_digest == discovered.device_set_digest => {
-                    existing.diagnostic = discovered.diagnostic;
-                    existing.clone()
-                }
-                _ => {
-                    *cached = Some(discovered.clone());
-                    discovered
-                }
-            }
+            matching_cached_gpu_catalog(&cached, &discovery_fingerprint)
+        };
+        let catalog = if let Some(cached) = cached_catalog {
+            cached
+        } else {
+            self.retire_active_worker()?;
+            let discovered = verified_gpu_route_catalog(
+                discover_production_pack_launch_bindings(lease_discovery),
+                discovery_fingerprint,
+            );
+            *self.gpu_routes.lock().map_err(|_| {
+                RuntimeError::WorkerUnavailable("GPU worker registry lock poisoned".to_owned())
+            })? = Some(discovered.clone());
+            discovered
         };
 
         Ok(health_filtered_gpu_route_plan(
@@ -5737,9 +5916,13 @@ impl InferenceWorkerRegistry {
         artifact: RuntimeArtifact,
         preference: AccelerationPreference,
     ) -> Result<RuntimeLoadExecution, RuntimeError> {
+        let _route_execution = self.lock_route_execution()?;
         let mut last_retryable = None;
         let mut attempted = false;
         let plan = self.routes_for_preference(preference, &artifact)?;
+        if plan.routes.is_empty() {
+            self.retire_active_worker()?;
+        }
         for route in plan.routes.iter().take(4) {
             if plan
                 .health
@@ -5749,6 +5932,7 @@ impl InferenceWorkerRegistry {
                 continue;
             }
             attempted = true;
+            self.prepare_route(route)?;
             match route.supervisor.load(artifact.clone(), preference) {
                 Ok(mut execution) => {
                     if matches!(artifact, RuntimeArtifact::Gguf(_)) {
@@ -5766,6 +5950,7 @@ impl InferenceWorkerRegistry {
                             health_observation_for_runtime_error(&error, false, false),
                         );
                     }
+                    self.retire_failed_route(route)?;
                     last_retryable = Some(error);
                 }
                 Err(error) => {
@@ -5775,9 +5960,13 @@ impl InferenceWorkerRegistry {
                             health_observation_for_runtime_error(&error, false, false),
                         );
                     }
+                    self.retire_failed_route(route)?;
                     return Err(error);
                 }
             }
+        }
+        if !attempted {
+            self.retire_active_worker()?;
         }
         Err(last_retryable.unwrap_or_else(|| {
             debug_assert!(!attempted);
@@ -5801,9 +5990,13 @@ impl InferenceWorkerRegistry {
         cancellation_snapshot: u64,
         cancellation_generation: &std::sync::atomic::AtomicU64,
     ) -> Result<RuntimeExecution, RuntimeError> {
+        let _route_execution = self.lock_route_execution()?;
         let mut last_retryable = None;
         let mut attempted = false;
         let plan = self.routes_for_preference(preference, &artifact)?;
+        if plan.routes.is_empty() {
+            self.retire_active_worker()?;
+        }
         for route in plan.routes.iter().take(4) {
             if plan
                 .health
@@ -5813,6 +6006,7 @@ impl InferenceWorkerRegistry {
                 continue;
             }
             attempted = true;
+            self.prepare_route(route)?;
             match route.supervisor.transcribe(
                 artifact.clone(),
                 preference,
@@ -5839,6 +6033,7 @@ impl InferenceWorkerRegistry {
                             health_observation_for_runtime_error(&error, cancelled, false),
                         );
                     }
+                    self.retire_failed_route(route)?;
                     if cancelled {
                         return Err(RuntimeError::Cancelled(
                             "transcription request was cancelled before output".to_owned(),
@@ -5855,9 +6050,13 @@ impl InferenceWorkerRegistry {
                             health_observation_for_runtime_error(&error, cancelled, false),
                         );
                     }
+                    self.retire_failed_route(route)?;
                     return Err(error);
                 }
             }
+        }
+        if !attempted {
+            self.retire_active_worker()?;
         }
         Err(last_retryable.unwrap_or_else(|| {
             debug_assert!(!attempted);
@@ -5877,9 +6076,13 @@ impl InferenceWorkerRegistry {
         artifact: RuntimeArtifact,
         preference: AccelerationPreference,
     ) -> Result<(), RuntimeError> {
+        let _route_execution = self.lock_route_execution()?;
         let mut last_retryable = None;
         let mut attempted = false;
         let plan = self.routes_for_preference(preference, &artifact)?;
+        if plan.routes.is_empty() {
+            self.retire_active_worker()?;
+        }
         for route in plan.routes.iter().take(4) {
             if plan
                 .health
@@ -5889,6 +6092,7 @@ impl InferenceWorkerRegistry {
                 continue;
             }
             attempted = true;
+            self.prepare_route(route)?;
             match route.supervisor.health(artifact.clone(), preference) {
                 Ok(()) => {
                     if let Some(health) = &plan.health {
@@ -5903,6 +6107,7 @@ impl InferenceWorkerRegistry {
                             health_observation_for_runtime_error(&error, false, false),
                         );
                     }
+                    self.retire_failed_route(route)?;
                     last_retryable = Some(error);
                 }
                 Err(error) => {
@@ -5912,9 +6117,13 @@ impl InferenceWorkerRegistry {
                             health_observation_for_runtime_error(&error, false, false),
                         );
                     }
+                    self.retire_failed_route(route)?;
                     return Err(error);
                 }
             }
+        }
+        if !attempted {
+            self.retire_active_worker()?;
         }
         Err(last_retryable.unwrap_or_else(|| {
             debug_assert!(!attempted);
@@ -5930,47 +6139,38 @@ impl InferenceWorkerRegistry {
     }
 
     pub(crate) fn unload(&self) -> Result<(), RuntimeError> {
-        for route in self.routes.iter() {
-            route.supervisor.unload()?;
-        }
-        if let Ok(routes) = self.gpu_routes.lock()
-            && let Some(routes) = routes.as_ref()
-        {
-            for route in routes.routes.iter() {
-                route.supervisor.unload()?;
-            }
+        let _route_execution = self.lock_route_execution()?;
+        let active = self.active_route.lock().map_err(|_| {
+            RuntimeError::WorkerUnavailable("active inference route lock poisoned".to_owned())
+        })?;
+        if let Some(active) = active.as_ref() {
+            active.supervisor.unload()?;
         }
         Ok(())
     }
 
     pub(crate) fn unload_if_idle(&self) -> Result<(), RuntimeError> {
-        for route in self.routes.iter() {
-            route.supervisor.unload_if_idle()?;
-        }
-        if let Ok(routes) = self.gpu_routes.lock()
-            && let Some(routes) = routes.as_ref()
-        {
-            for route in routes.routes.iter() {
-                route.supervisor.unload_if_idle()?;
-            }
+        let _route_execution = self.lock_route_execution()?;
+        let active = self.active_route.lock().map_err(|_| {
+            RuntimeError::WorkerUnavailable("active inference route lock poisoned".to_owned())
+        })?;
+        if let Some(active) = active.as_ref() {
+            active.supervisor.unload_if_idle()?;
         }
         Ok(())
     }
 
     pub(crate) fn cancel_active(&self) {
-        for route in self.routes.iter() {
-            route.supervisor.cancel_active();
-        }
-        if let Ok(routes) = self.gpu_routes.lock()
-            && let Some(routes) = routes.as_ref()
+        if let Ok(active) = self.active_route.lock()
+            && let Some(active) = active.as_ref()
         {
-            for route in routes.routes.iter() {
-                route.supervisor.cancel_active();
-            }
+            active.supervisor.cancel_active();
         }
     }
 
     pub(crate) fn shutdown(&self) -> Result<(), RuntimeError> {
+        let _route_execution = self.lock_route_execution()?;
+        self.retire_active_worker()?;
         for route in self.routes.iter() {
             route.supervisor.shutdown()?;
         }
@@ -8889,6 +9089,7 @@ mod tests {
             device_set_digest: verified_gpu_device_set_digest(&routes),
             routes: Arc::new(routes),
             diagnostic: None,
+            discovery_fingerprint: "test-catalog".to_owned(),
         }
     }
 
@@ -9069,6 +9270,8 @@ mod tests {
             routes: Arc::new(Vec::new()),
             gpu_routes: Arc::new(Mutex::new(Some(catalog.clone()))),
             gpu_health_path: Some(Arc::clone(&path)),
+            active_route: Arc::new(Mutex::new(None)),
+            route_execution: Arc::new(Mutex::new(())),
             gpu_routes_for_testing: None,
         };
         assert!(
@@ -9457,6 +9660,94 @@ mod tests {
     }
 
     #[test]
+    fn unchanged_gpu_discovery_fingerprint_reuses_the_cached_catalog() {
+        let catalog = verified_gpu_catalog(vec![verified_gpu_route(
+            BackendKind::Vulkan,
+            "native:pci:0000:01:00.0",
+            "windows-display:32.0.16.1088",
+            'a',
+        )]);
+        assert!(matching_cached_gpu_catalog(&Some(catalog.clone()), "test-catalog").is_some());
+        assert!(matching_cached_gpu_catalog(&Some(catalog), "changed-catalog").is_none());
+    }
+
+    #[test]
+    fn active_route_ownership_retires_cpu_gpu_and_device_switches() {
+        let cpu_launcher = Arc::new(TestLauncher::new([TestMode::Normal, TestMode::Normal]));
+        let gpu_one_launcher = Arc::new(TestLauncher::new([TestMode::Normal]));
+        let gpu_two_launcher = Arc::new(TestLauncher::new([TestMode::Normal]));
+        let route = |provider: WorkerProvider,
+                     backend: BackendKind,
+                     identity: &str,
+                     launcher: Arc<TestLauncher>| InferenceWorkerRoute {
+            provider,
+            supervisor: InferenceWorkerSupervisor {
+                transport: ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+                    launcher,
+                    short_deadlines(),
+                ),
+                next_correlation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            },
+            target: Some(backend_target(backend, identity, Some(0))),
+            health_key: None,
+            consume_retry_bypass: false,
+        };
+        let cpu = route(
+            WorkerProvider::Cpu,
+            BackendKind::Cpu,
+            "cpu",
+            Arc::clone(&cpu_launcher),
+        );
+        let gpu_one = route(
+            WorkerProvider::Vulkan,
+            BackendKind::Vulkan,
+            "native:pci:0000:01:00.0",
+            Arc::clone(&gpu_one_launcher),
+        );
+        let gpu_two = route(
+            WorkerProvider::Vulkan,
+            BackendKind::Vulkan,
+            "native:pci:0000:02:00.0",
+            Arc::clone(&gpu_two_launcher),
+        );
+        let registry = InferenceWorkerRegistry::with_cpu_supervisor(cpu.supervisor.clone());
+
+        registry.prepare_route(&cpu).unwrap();
+        let cpu_generation = cpu.supervisor.transport.ensure_generation().unwrap();
+        registry.prepare_route(&gpu_one).unwrap();
+        assert_eq!(cpu.supervisor.transport.current_generation().unwrap(), None);
+        let gpu_generation = gpu_one.supervisor.transport.ensure_generation().unwrap();
+
+        registry.prepare_route(&gpu_one).unwrap();
+        assert_eq!(
+            gpu_one.supervisor.transport.ensure_generation().unwrap(),
+            gpu_generation,
+            "the same winning route keeps its warm worker during the idle window"
+        );
+        assert_eq!(gpu_one_launcher.launches.load(Ordering::Acquire), 1);
+
+        registry.prepare_route(&gpu_two).unwrap();
+        assert_eq!(
+            gpu_one.supervisor.transport.current_generation().unwrap(),
+            None
+        );
+        gpu_two.supervisor.transport.ensure_generation().unwrap();
+
+        registry.prepare_route(&cpu).unwrap();
+        assert_eq!(
+            gpu_two.supervisor.transport.current_generation().unwrap(),
+            None
+        );
+        assert_ne!(
+            cpu.supervisor.transport.ensure_generation().unwrap(),
+            cpu_generation,
+            "switching back to CPU starts a new sole owner"
+        );
+        assert_eq!(cpu_launcher.launches.load(Ordering::Acquire), 2);
+        registry.shutdown().unwrap();
+    }
+
+    #[test]
     fn registry_fallback_is_bounded_to_registered_pre_output_failures() {
         let first = Arc::new(TestLauncher::new([TestMode::CapabilityMismatch(
             CapabilityMismatch::Challenge,
@@ -9481,6 +9772,8 @@ mod tests {
             routes: Arc::new(vec![route(first.clone()), route(second.clone())]),
             gpu_routes: Arc::new(Mutex::new(None)),
             gpu_health_path: None,
+            active_route: Arc::new(Mutex::new(None)),
+            route_execution: Arc::new(Mutex::new(())),
             gpu_routes_for_testing: None,
         };
         assert!(
@@ -9490,6 +9783,22 @@ mod tests {
         );
         assert_eq!(first.launches.load(Ordering::Acquire), 1);
         assert_eq!(second.launches.load(Ordering::Acquire), 1);
+        assert_eq!(
+            registry.routes[0]
+                .supervisor
+                .transport
+                .current_generation()
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            registry.routes[1]
+                .supervisor
+                .transport
+                .current_generation()
+                .unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -9532,10 +9841,13 @@ mod tests {
             }]),
             gpu_routes: Arc::new(Mutex::new(None)),
             gpu_health_path: None,
+            active_route: Arc::new(Mutex::new(None)),
+            route_execution: Arc::new(Mutex::new(())),
             gpu_routes_for_testing: Some(VerifiedGpuRouteCatalog {
                 device_set_digest: verified_gpu_device_set_digest(&gpu_routes),
                 routes: gpu_routes,
                 diagnostic: None,
+                discovery_fingerprint: "test-catalog".to_owned(),
             }),
         };
         assert!(
@@ -9546,6 +9858,19 @@ mod tests {
         assert_eq!(first.launches.load(Ordering::Acquire), 1);
         assert_eq!(second.launches.load(Ordering::Acquire), 1);
         assert_eq!(cpu.launches.load(Ordering::Acquire), 0);
+        for route in registry
+            .gpu_routes_for_testing
+            .as_ref()
+            .unwrap()
+            .routes
+            .iter()
+        {
+            assert_eq!(
+                route.supervisor.transport.current_generation().unwrap(),
+                None,
+                "every failed fallback route is retired"
+            );
+        }
     }
 
     #[test]

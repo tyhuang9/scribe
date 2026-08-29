@@ -388,6 +388,7 @@ impl PackDiscoveryDiagnostic {
 pub(crate) struct PackLeaseDiscovery {
     pub(crate) leases: Vec<Arc<manifest::VerifiedPackLease>>,
     pub(crate) diagnostics: Vec<PackDiscoveryDiagnostic>,
+    pub(crate) catalog_generation: Option<String>,
 }
 
 impl PackLeaseDiscovery {
@@ -447,6 +448,7 @@ pub(crate) fn discover_production_pack_leases() -> PackLeaseDiscovery {
         diagnostics: vec![PackDiscoveryDiagnostic::catalog(
             PackDiscoveryIssue::UnsupportedPlatform,
         )],
+        catalog_generation: None,
     }
 }
 
@@ -458,6 +460,7 @@ fn discover_pack_leases_from_current_install() -> PackLeaseDiscovery {
             diagnostics: vec![PackDiscoveryDiagnostic::catalog(
                 PackDiscoveryIssue::CatalogUnavailable,
             )],
+            catalog_generation: None,
         };
     };
     let Some(install_root) = executable.parent() else {
@@ -466,6 +469,7 @@ fn discover_pack_leases_from_current_install() -> PackLeaseDiscovery {
             diagnostics: vec![PackDiscoveryDiagnostic::catalog(
                 PackDiscoveryIssue::CatalogUnavailable,
             )],
+            catalog_generation: None,
         };
     };
     discover_pack_leases_from_install_root(install_root)
@@ -482,6 +486,7 @@ fn discover_pack_leases_from_install_root(install_root: &Path) -> PackLeaseDisco
                 diagnostics: vec![PackDiscoveryDiagnostic::catalog(
                     PackDiscoveryIssue::CatalogUnavailable,
                 )],
+                catalog_generation: None,
             };
         }
         Err(CatalogReadFailure::Rejected) => {
@@ -490,6 +495,7 @@ fn discover_pack_leases_from_install_root(install_root: &Path) -> PackLeaseDisco
                 diagnostics: vec![PackDiscoveryDiagnostic::catalog(
                     PackDiscoveryIssue::CatalogRejected,
                 )],
+                catalog_generation: None,
             };
         }
     };
@@ -501,7 +507,8 @@ fn discover_pack_leases_from_install_root(install_root: &Path) -> PackLeaseDisco
         return discovery;
     }
     let fingerprint = catalog.fingerprint;
-    let discovery = verify_catalog_entries(install_root, &catalog.bytes);
+    let generation = fingerprint.generation_id();
+    let discovery = verify_catalog_entries(install_root, &catalog.bytes, generation);
     if let Ok(mut cache) = cache.lock() {
         cache.replace(fingerprint, discovery.clone());
     }
@@ -509,13 +516,18 @@ fn discover_pack_leases_from_install_root(install_root: &Path) -> PackLeaseDisco
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]
-fn verify_catalog_entries(install_root: &Path, bytes: &[u8]) -> PackLeaseDiscovery {
+fn verify_catalog_entries(
+    install_root: &Path,
+    bytes: &[u8],
+    catalog_generation: String,
+) -> PackLeaseDiscovery {
     let Ok(catalog) = serde_json::from_slice::<PackCatalog>(bytes) else {
         return PackLeaseDiscovery {
             leases: Vec::new(),
             diagnostics: vec![PackDiscoveryDiagnostic::catalog(
                 PackDiscoveryIssue::CatalogRejected,
             )],
+            catalog_generation: Some(catalog_generation),
         };
     };
     if catalog.schema_version != 1 || catalog.packs.len() > MAX_PRODUCTION_PACKS {
@@ -524,6 +536,7 @@ fn verify_catalog_entries(install_root: &Path, bytes: &[u8]) -> PackLeaseDiscove
             diagnostics: vec![PackDiscoveryDiagnostic::catalog(
                 PackDiscoveryIssue::CatalogRejected,
             )],
+            catalog_generation: Some(catalog_generation),
         };
     }
     let packs_root = install_root.join("workers").join("packs");
@@ -623,6 +636,7 @@ fn verify_catalog_entries(install_root: &Path, bytes: &[u8]) -> PackLeaseDiscove
     PackLeaseDiscovery {
         leases,
         diagnostics,
+        catalog_generation: Some(catalog_generation),
     }
 }
 
@@ -633,6 +647,21 @@ struct CatalogFingerprint {
     volume_serial_number: u32,
     file_index: u64,
     content_sha256: [u8; 32],
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+impl CatalogFingerprint {
+    fn generation_id(&self) -> String {
+        format!(
+            "{:08x}{:016x}{}",
+            self.volume_serial_number,
+            self.file_index,
+            self.content_sha256
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        )
+    }
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]
@@ -982,6 +1011,7 @@ mod tests {
             diagnostics: vec![PackDiscoveryDiagnostic::catalog(
                 PackDiscoveryIssue::CatalogUnavailable,
             )],
+            catalog_generation: Some(first.generation_id()),
         };
         let mut cache = super::CatalogDiscoveryCache::default();
         cache.replace(first.clone(), discovery);
@@ -1007,6 +1037,7 @@ mod tests {
                 diagnostics: vec![PackDiscoveryDiagnostic::catalog(
                     PackDiscoveryIssue::CatalogRejected,
                 )],
+                catalog_generation: Some("f".repeat(88)),
             },
         );
         assert!(
