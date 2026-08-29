@@ -7928,10 +7928,12 @@ mod tests {
         let auto = resolve_cpu_only_acceleration(AccelerationPreference::Auto).unwrap();
         assert_eq!(auto.resolved, ComputeDevice::Cpu);
         assert!(auto.diagnostic.is_some());
+        assert_eq!(auto.selection, None);
 
         let cpu = resolve_cpu_only_acceleration(AccelerationPreference::Cpu).unwrap();
         assert_eq!(cpu.resolved, ComputeDevice::Cpu);
         assert_eq!(cpu.diagnostic, None);
+        assert_eq!(cpu.selection, None);
 
         let gpu = resolve_cpu_only_acceleration(AccelerationPreference::Gpu).unwrap_err();
         assert!(gpu.to_string().contains("CPU-only"));

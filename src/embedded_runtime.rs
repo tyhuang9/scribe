@@ -1201,6 +1201,46 @@ mod tests {
     }
 
     #[test]
+    fn enumeration_reordering_preserves_the_environment_fingerprint() {
+        let candidates = fake_vulkan_candidates(DeviceClass::DiscreteGpu);
+        let base = qualified_snapshot(OperatingSystem::Windows, PowerSource::Ac, candidates);
+        let mut reordered = base.clone();
+        reordered.candidates.reverse();
+
+        assert_eq!(
+            base.environment_fingerprint(),
+            reordered.environment_fingerprint()
+        );
+    }
+
+    #[test]
+    fn final_acceleration_diagnostic_uses_the_typed_selection_reason() {
+        let snapshot = snapshot(
+            OperatingSystem::Windows,
+            PowerSource::Ac,
+            fake_vulkan_candidates(DeviceClass::DiscreteGpu),
+        );
+        let selection = select_backend(AccelerationPreference::Auto, &snapshot).unwrap();
+        let expected_diagnostic = selection.auto_cpu_diagnostic();
+
+        let resolved = resolved_acceleration(
+            AccelerationPreference::Auto,
+            "cpu",
+            &device(DeviceType::Cpu, "CPU", ""),
+            Some(selection),
+        );
+
+        assert_eq!(resolved.resolved, ComputeDevice::Cpu);
+        assert_eq!(resolved.diagnostic, expected_diagnostic);
+        assert_eq!(
+            resolved.diagnostic.as_deref(),
+            Some(
+                "Auto selected CPU because available GPU backends are not qualified for automatic use."
+            )
+        );
+    }
+
+    #[test]
     fn selected_gpu_process_index_must_be_present_and_fit_the_native_type() {
         let selection_with_index = |process_index| {
             let mut native = device(DeviceType::Gpu, "Vulkan0", "NVIDIA GPU");
@@ -1379,6 +1419,24 @@ mod tests {
                 .to_string();
         assert!(provider_error.starts_with("BackendUnavailable:"));
         assert!(provider_error.contains("alternate-vulkan"));
+
+        let mut wrong_vendor_selection = selection();
+        wrong_vendor_selection.target.vendor = GpuVendor::Amd;
+        let vendor_error =
+            reconcile_observed_target(&mut wrong_vendor_selection, "vulkan", &enumerated)
+                .unwrap_err()
+                .to_string();
+        assert!(vendor_error.starts_with("BackendUnavailable:"));
+        assert!(vendor_error.contains("Amd"));
+        assert!(vendor_error.contains("Nvidia"));
+
+        let mut wrong_driver_selection = selection();
+        wrong_driver_selection.target.driver_version = Some("driver-2".to_owned());
+        let driver_error =
+            reconcile_observed_target(&mut wrong_driver_selection, "vulkan", &enumerated)
+                .unwrap_err()
+                .to_string();
+        assert!(driver_error.starts_with("BackendUnavailable:"));
     }
 
     #[test]
