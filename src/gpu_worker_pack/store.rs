@@ -1,14 +1,15 @@
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use getrandom::fill;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::manifest::{
-    EMBEDDED_MINIMUM_SECURITY_EPOCH, PackVerificationError, PackVerifier, VerifiedPack,
+    EMBEDDED_MINIMUM_SECURITY_EPOCH, PackVerificationError, PackVerifier, StoreComponent,
+    VerifiedPack, is_canonical_sha256,
 };
 
 const STATE_SCHEMA_VERSION: u16 = 1;
@@ -98,12 +99,8 @@ impl<'a> PackStore<'a> {
         self.recover_pending_activation_locked()?;
         let epochs = self.load_epochs_strict()?;
         require_epoch_from(&source, &epochs)?;
-        let parent = self
-            .packs_root
-            .join(&source.pack_id)
-            .join(&source.pack_version);
+        let (parent, final_root) = self.store_paths_for(&source, true)?;
         ensure_regular_directories(&parent)?;
-        let final_root = parent.join(&source.pack_digest);
         if final_root.exists() {
             let installed = self.verifier.verify(&final_root)?;
             require_same_pack(&source, &installed)?;
@@ -153,11 +150,11 @@ impl<'a> PackStore<'a> {
         let mut next_epochs = prior_epochs.clone();
         let old_floor = next_epochs
             .epochs
-            .get(&verified.pack_id)
+            .get(verified.pack_id.as_str())
             .copied()
             .unwrap_or(EMBEDDED_MINIMUM_SECURITY_EPOCH);
         next_epochs.epochs.insert(
-            verified.pack_id.clone(),
+            verified.pack_id.as_str().to_owned(),
             old_floor.max(verified.security_epoch),
         );
         validate_epoch_state(&next_epochs)?;
@@ -271,12 +268,8 @@ impl<'a> PackStore<'a> {
         &self,
         descriptor: &VerifiedPack,
     ) -> Result<VerifiedPack, PackStoreError> {
-        let expected_root = self
-            .packs_root
-            .join(&descriptor.pack_id)
-            .join(&descriptor.pack_version)
-            .join(&descriptor.pack_digest);
-        if descriptor.root != expected_root {
+        let (_, expected_root) = self.store_paths_for(descriptor, false)?;
+        if descriptor.root.as_os_str() != expected_root.as_os_str() {
             return Err(PackStoreError::DescriptorOutsideStore);
         }
         let verified = self.verifier.verify(&expected_root)?;
@@ -284,6 +277,70 @@ impl<'a> PackStore<'a> {
             return Err(PackStoreError::DescriptorChanged);
         }
         Ok(verified)
+    }
+
+    fn store_paths_for(
+        &self,
+        descriptor: &VerifiedPack,
+        create_root: bool,
+    ) -> Result<(PathBuf, PathBuf), PackStoreError> {
+        validate_descriptor_identity(descriptor)?;
+        if create_root {
+            ensure_regular_directories(&self.packs_root)?;
+        }
+        let metadata = fs::symlink_metadata(&self.packs_root)?;
+        if !metadata.is_dir() || is_link_or_reparse(&metadata) {
+            return Err(PackStoreError::UnsafeFilesystemEntry(
+                self.packs_root.clone(),
+            ));
+        }
+        let canonical_root = fs::canonicalize(&self.packs_root)?;
+        let canonical_metadata = fs::symlink_metadata(&canonical_root)?;
+        if !canonical_metadata.is_dir() || is_link_or_reparse(&canonical_metadata) {
+            return Err(PackStoreError::UnsafeFilesystemEntry(canonical_root));
+        }
+
+        let relative = PathBuf::from(descriptor.pack_id.as_str())
+            .join(descriptor.pack_version.as_str())
+            .join(&descriptor.pack_digest);
+        let components = relative.components().collect::<Vec<_>>();
+        if components.len() != 3
+            || components
+                .iter()
+                .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return Err(PackStoreError::DescriptorOutsideStore);
+        }
+        let final_root = canonical_root.join(&relative);
+        let stripped = final_root
+            .strip_prefix(&canonical_root)
+            .map_err(|_| PackStoreError::DescriptorOutsideStore)?;
+        if stripped.components().count() != 3
+            || final_root.ancestors().nth(3) != Some(canonical_root.as_path())
+        {
+            return Err(PackStoreError::DescriptorOutsideStore);
+        }
+        let parent = final_root
+            .parent()
+            .ok_or(PackStoreError::DescriptorOutsideStore)?
+            .to_path_buf();
+        Ok((parent, final_root))
+    }
+
+    fn validate_activation_descriptors(
+        &self,
+        state: &ActivationState,
+    ) -> Result<(), PackStoreError> {
+        for descriptor in state.current.iter().chain(state.previous.iter()) {
+            let (_, expected_root) = self.store_paths_for(descriptor, false)?;
+            if descriptor.root.as_os_str() != expected_root.as_os_str() {
+                return Err(PackStoreError::DescriptorOutsideStore);
+            }
+            if self.verifier.verify(&expected_root)? != *descriptor {
+                return Err(PackStoreError::DescriptorChanged);
+            }
+        }
+        Ok(())
     }
 
     fn acquire_lock(&self) -> Result<ExclusiveFileLock, PackStoreError> {
@@ -311,6 +368,7 @@ impl<'a> PackStore<'a> {
         if state.schema_version != STATE_SCHEMA_VERSION {
             return Err(PackStoreError::CorruptState("activation schema"));
         }
+        self.validate_activation_descriptors(&state)?;
         Ok(state)
     }
 
@@ -325,14 +383,18 @@ impl<'a> PackStore<'a> {
     }
 
     fn persist_activation(&self, state: &ActivationState) -> Result<(), PackStoreError> {
+        self.validate_activation_descriptors(state)?;
         atomic_write_canonical(&self.activation_path(), state)
     }
 
     fn persist_epochs(&self, state: &EpochState) -> Result<(), PackStoreError> {
+        validate_epoch_state(state)?;
         atomic_write_canonical(&self.epoch_path(), state)
     }
 
     fn persist_pending(&self, pending: &PendingActivation) -> Result<(), PackStoreError> {
+        self.validate_pending_descriptors(pending)?;
+        validate_pending_activation(pending)?;
         atomic_write_canonical(&self.pending_path(), pending)
     }
 
@@ -346,6 +408,7 @@ impl<'a> PackStore<'a> {
             return Ok(());
         }
         let pending: PendingActivation = read_canonical_state(&path)?;
+        self.validate_pending_descriptors(&pending)?;
         validate_pending_activation(&pending)?;
         let target = self.reverify_descriptor(&pending.target)?;
         if target != pending.target {
@@ -373,6 +436,22 @@ impl<'a> PackStore<'a> {
         self.remove_pending()?;
         Ok(())
     }
+
+    fn validate_pending_descriptors(
+        &self,
+        pending: &PendingActivation,
+    ) -> Result<(), PackStoreError> {
+        self.validate_activation_descriptors(&pending.prior_activation)?;
+        self.validate_activation_descriptors(&pending.next_activation)?;
+        let (_, expected_root) = self.store_paths_for(&pending.target, false)?;
+        if pending.target.root.as_os_str() != expected_root.as_os_str() {
+            return Err(PackStoreError::DescriptorOutsideStore);
+        }
+        if self.verifier.verify(&expected_root)? != pending.target {
+            return Err(PackStoreError::DescriptorChanged);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -389,7 +468,7 @@ fn require_epoch_from(
 ) -> Result<(), PackStoreError> {
     let floor = epochs
         .epochs
-        .get(&descriptor.pack_id)
+        .get(descriptor.pack_id.as_str())
         .copied()
         .unwrap_or(EMBEDDED_MINIMUM_SECURITY_EPOCH)
         .max(EMBEDDED_MINIMUM_SECURITY_EPOCH);
@@ -420,18 +499,18 @@ fn validate_pending_activation(pending: &PendingActivation) -> Result<(), PackSt
     let prior_floor = pending
         .prior_epochs
         .epochs
-        .get(&pending.target.pack_id)
+        .get(pending.target.pack_id.as_str())
         .copied()
         .unwrap_or(EMBEDDED_MINIMUM_SECURITY_EPOCH);
     let next_floor = pending
         .next_epochs
         .epochs
-        .get(&pending.target.pack_id)
+        .get(pending.target.pack_id.as_str())
         .copied()
         .unwrap_or(EMBEDDED_MINIMUM_SECURITY_EPOCH);
     let mut expected_epochs = pending.prior_epochs.clone();
     expected_epochs.epochs.insert(
-        pending.target.pack_id.clone(),
+        pending.target.pack_id.as_str().to_owned(),
         prior_floor.max(pending.target.security_epoch),
     );
     if next_floor != prior_floor.max(pending.target.security_epoch)
@@ -451,8 +530,24 @@ fn validate_epoch_state(state: &EpochState) -> Result<(), PackStoreError> {
             .epochs
             .values()
             .any(|epoch| *epoch < EMBEDDED_MINIMUM_SECURITY_EPOCH)
+        || state
+            .epochs
+            .keys()
+            .any(|pack_id| StoreComponent::new(pack_id.clone()).is_none())
     {
         return Err(PackStoreError::CorruptState("security epoch state"));
+    }
+    Ok(())
+}
+
+fn validate_descriptor_identity(descriptor: &VerifiedPack) -> Result<(), PackStoreError> {
+    if !descriptor.pack_id.is_canonical()
+        || !descriptor.pack_version.is_canonical()
+        || !is_canonical_sha256(&descriptor.pack_digest)
+    {
+        return Err(PackStoreError::CorruptState(
+            "worker pack descriptor identity",
+        ));
     }
     Ok(())
 }
@@ -1052,7 +1147,7 @@ mod tests {
         let source = root.join(format!("source-{version}-{epoch}"));
         fs::create_dir(&source).unwrap();
         let mut manifest = base_manifest();
-        manifest.pack_version = version.to_owned();
+        manifest.pack_version = StoreComponent::new(version).unwrap();
         manifest.security_epoch = epoch;
         let trust = write_signed(&source, manifest);
         (source, trust)
@@ -1063,12 +1158,12 @@ mod tests {
         let (root, workers, state, verifier, _) = store_fixture("store-install");
         let store = PackStore::new(&workers, &state, &verifier);
         let installed = store.stage_and_install(&root.join("source")).unwrap();
+        let canonical_packs_root = fs::canonicalize(workers.join("packs")).unwrap();
         assert_eq!(
             installed.root,
-            workers
-                .join("packs")
-                .join(&installed.pack_id)
-                .join(&installed.pack_version)
+            canonical_packs_root
+                .join(installed.pack_id.as_str())
+                .join(installed.pack_version.as_str())
                 .join(&installed.pack_digest)
         );
         store.activate(&installed).unwrap();
@@ -1097,7 +1192,10 @@ mod tests {
         store.activate(&second).unwrap();
         assert_eq!(store.current_fail_closed(), Some(second.clone()));
         assert_eq!(store.rollback().unwrap(), first);
-        assert_eq!(store.current_fail_closed().unwrap().pack_version, "1.2.3");
+        assert_eq!(
+            store.current_fail_closed().unwrap().pack_version.as_str(),
+            "1.2.3"
+        );
 
         let (epoch_two_source, trust) = additional_source(&root, "3.0.0", 2);
         let verifier_two = PackVerifier::new(
@@ -1134,8 +1232,8 @@ mod tests {
 
         let staging = workers
             .join("packs")
-            .join(&installed.pack_id)
-            .join(&installed.pack_version)
+            .join(installed.pack_id.as_str())
+            .join(installed.pack_version.as_str())
             .join(format!(".{}.staging-interrupted", installed.pack_digest));
         fs::create_dir(&staging).unwrap();
         fs::write(staging.join("partial"), b"partial").unwrap();
@@ -1167,12 +1265,146 @@ mod tests {
         store.activate(&second).unwrap();
         let mut activation = store.load_activation_strict().unwrap();
         activation.previous.as_mut().unwrap().root = root.join("outside-store");
-        store.persist_activation(&activation).unwrap();
+        atomic_write_canonical(&store.activation_path(), &activation).unwrap();
         assert!(matches!(
             store.rollback(),
             Err(PackStoreError::DescriptorOutsideStore)
         ));
-        assert_eq!(store.current_fail_closed(), Some(second));
+        assert_eq!(store.current_fail_closed(), None);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn persisted_activation_rejects_hostile_components_and_escape_paths() {
+        let (root, workers, state, verifier, _) = store_fixture("hostile-activation-state");
+        let store = PackStore::new(&workers, &state, &verifier);
+        let installed = store.stage_and_install(&root.join("source")).unwrap();
+        store.activate(&installed).unwrap();
+        let baseline = store.load_activation_strict().unwrap();
+        let hostile = [
+            ".",
+            "..",
+            "a/b",
+            "a\\b",
+            "c:escape",
+            "name:stream",
+            "con",
+            "con.txt",
+            "nul.dll",
+            "com1.sys",
+            "lpt9.log",
+            "trailing.",
+            "trailing ",
+        ];
+        for value in hostile {
+            for mutate_version in [false, true] {
+                let mut corrupt = baseline.clone();
+                let descriptor = corrupt.current.as_mut().unwrap();
+                if mutate_version {
+                    descriptor.pack_version = StoreComponent::test_unchecked(value);
+                } else {
+                    descriptor.pack_id = StoreComponent::test_unchecked(value);
+                }
+                atomic_write_canonical(&store.activation_path(), &corrupt).unwrap();
+                assert!(
+                    store.load_activation_strict().is_err(),
+                    "accepted persisted component {value:?}"
+                );
+                assert_eq!(store.current_fail_closed(), None);
+            }
+        }
+
+        let escaped = root.join("escaped-pack");
+        fs::create_dir(&escaped).unwrap();
+        fs::write(escaped.join("sentinel"), b"outside").unwrap();
+        let mut corrupt = baseline.clone();
+        corrupt.current.as_mut().unwrap().root = escaped.clone();
+        atomic_write_canonical(&store.activation_path(), &corrupt).unwrap();
+        assert!(matches!(
+            store.load_activation_strict(),
+            Err(PackStoreError::DescriptorOutsideStore)
+        ));
+        assert_eq!(fs::read(escaped.join("sentinel")).unwrap(), b"outside");
+
+        atomic_write_canonical(&store.activation_path(), &baseline).unwrap();
+        assert_eq!(store.current_fail_closed(), Some(installed));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn persisted_pending_rejects_hostile_descriptors_before_recovery() {
+        let (root, workers, state, verifier, _) = store_fixture("hostile-pending-state");
+        let store = PackStore::new(&workers, &state, &verifier);
+        let first = store.stage_and_install(&root.join("source")).unwrap();
+        store.activate(&first).unwrap();
+        let (next_source, _) = additional_source(&root, "2.0.0", 2);
+        let next = store.stage_and_install(&next_source).unwrap();
+        {
+            let _lock = store.acquire_lock().unwrap();
+            assert!(matches!(
+                store.activate_locked(&next, Some(ActivationBoundary::Journal)),
+                Err(PackStoreError::InjectedInterruption)
+            ));
+        }
+        let baseline: PendingActivation = read_canonical_state(&store.pending_path()).unwrap();
+        for value in [
+            ".",
+            "..",
+            "a/b",
+            "a\\b",
+            "c:escape",
+            "con.txt",
+            "nul",
+            "lpt9.sys",
+            "trailing.",
+            "trailing ",
+        ] {
+            for mutate_version in [false, true] {
+                let mut corrupt = baseline.clone();
+                let target = if mutate_version {
+                    &mut corrupt.target.pack_version
+                } else {
+                    &mut corrupt.target.pack_id
+                };
+                *target = StoreComponent::test_unchecked(value);
+                corrupt.next_activation.current = Some(corrupt.target.clone());
+                atomic_write_canonical(&store.pending_path(), &corrupt).unwrap();
+                assert!(
+                    store.recover_pending_activation_locked().is_err(),
+                    "accepted pending component {value:?}"
+                );
+            }
+        }
+
+        let escaped = root.join("escaped-pending-pack");
+        fs::create_dir(&escaped).unwrap();
+        fs::write(escaped.join("sentinel"), b"outside").unwrap();
+        let mut corrupt = baseline.clone();
+        corrupt.target.root = escaped.clone();
+        corrupt.next_activation.current = Some(corrupt.target.clone());
+        atomic_write_canonical(&store.pending_path(), &corrupt).unwrap();
+        assert!(matches!(
+            store.recover_pending_activation_locked(),
+            Err(PackStoreError::DescriptorOutsideStore)
+        ));
+        assert_eq!(fs::read(escaped.join("sentinel")).unwrap(), b"outside");
+
+        atomic_write_canonical(&store.pending_path(), &baseline).unwrap();
+        assert_eq!(store.current_fail_closed(), Some(next));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn persisted_epoch_keys_are_canonical_store_components() {
+        let (root, workers, state, verifier, _) = store_fixture("hostile-epoch-state");
+        let store = PackStore::new(&workers, &state, &verifier);
+        fs::create_dir_all(&state).unwrap();
+        for hostile in [".", "..", "a/b", "c:escape", "con.txt", "trailing."] {
+            let mut epochs = EpochState::empty();
+            epochs.epochs.insert(hostile.to_owned(), 1);
+            atomic_write_canonical(&store.epoch_path(), &epochs).unwrap();
+            assert!(store.load_epochs_strict().is_err());
+        }
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1228,7 +1460,7 @@ mod tests {
                     .load_epochs_strict()
                     .unwrap()
                     .epochs
-                    .get(&next.pack_id),
+                    .get(next.pack_id.as_str()),
                 Some(&2)
             );
             fs::remove_dir_all(root).unwrap();
@@ -1249,7 +1481,7 @@ mod tests {
                 .load_epochs_strict()
                 .unwrap()
                 .epochs
-                .get(&first.pack_id),
+                .get(first.pack_id.as_str()),
             Some(&1)
         );
         fs::remove_dir_all(root).unwrap();
@@ -1312,7 +1544,7 @@ mod tests {
             }
         });
         let epochs = store.load_epochs_strict().unwrap();
-        assert_eq!(epochs.epochs.get(&epoch_three.pack_id), Some(&3));
+        assert_eq!(epochs.epochs.get(epoch_three.pack_id.as_str()), Some(&3));
         assert_eq!(store.current_fail_closed(), Some(epoch_three));
         fs::remove_dir_all(root).unwrap();
     }

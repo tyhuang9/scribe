@@ -51,8 +51,8 @@ mod launch_binding {
                     .all(|byte| (0x20..=0x7e).contains(&byte))
                 && stable_device_identity == stable_device_identity.to_ascii_lowercase();
             (stable_device_is_canonical
-                && bridge.hello_pack_id() == pack.pack_id
-                && bridge.hello_pack_version() == pack.pack_version
+                && bridge.hello_pack_id() == pack.pack_id.as_str()
+                && bridge.hello_pack_version() == pack.pack_version.as_str()
                 && bridge.hello_pack_digest() == pack.pack_digest
                 && bridge.hello_runtime_abi() == pack.runtime_abi_version
                 && bridge.hello_backend() == pack.backend
@@ -161,11 +161,11 @@ mod tests {
         }
 
         fn hello_pack_id(&self) -> &str {
-            &self.pack.pack_id
+            self.pack.pack_id.as_str()
         }
 
         fn hello_pack_version(&self) -> &str {
-            &self.pack.pack_version
+            self.pack.pack_version.as_str()
         }
 
         fn hello_pack_digest(&self) -> &str {
@@ -193,8 +193,8 @@ mod tests {
         let digest = "a".repeat(64);
         FixtureBridge {
             pack: VerifiedPack {
-                pack_id: "fixture-pack".to_owned(),
-                pack_version: "1.0.0".to_owned(),
+                pack_id: super::manifest::StoreComponent::new("fixture-pack").unwrap(),
+                pack_version: super::manifest::StoreComponent::new("1.0.0").unwrap(),
                 pack_digest: digest.clone(),
                 security_epoch: 1,
                 runtime_abi_version: 1,

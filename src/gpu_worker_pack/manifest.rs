@@ -32,6 +32,33 @@ pub(crate) enum PackBackend {
     Metal,
 }
 
+/// A canonical single filesystem component suitable for the immutable store
+/// hierarchy. Serde remains transparent so signed and persisted schemas keep
+/// their string representation; every trust boundary revalidates the value.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(transparent)]
+pub(crate) struct StoreComponent(String);
+
+impl StoreComponent {
+    pub(crate) fn new(value: impl Into<String>) -> Option<Self> {
+        let value = value.into();
+        is_canonical_store_component(&value).then_some(Self(value))
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub(crate) fn is_canonical(&self) -> bool {
+        is_canonical_store_component(&self.0)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_unchecked(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PayloadEntry {
@@ -44,8 +71,8 @@ pub(crate) struct PayloadEntry {
 #[serde(deny_unknown_fields)]
 pub(crate) struct PackManifest {
     pub(crate) schema_version: u16,
-    pub(crate) pack_id: String,
-    pub(crate) pack_version: String,
+    pub(crate) pack_id: StoreComponent,
+    pub(crate) pack_version: StoreComponent,
     pub(crate) pack_digest: String,
     pub(crate) security_epoch: u64,
     pub(crate) app_protocol_version: u16,
@@ -91,8 +118,8 @@ struct DigestMaterial<'a> {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct VerifiedPack {
-    pub(crate) pack_id: String,
-    pub(crate) pack_version: String,
+    pub(crate) pack_id: StoreComponent,
+    pub(crate) pack_version: StoreComponent,
     pub(crate) pack_digest: String,
     pub(crate) security_epoch: u64,
     pub(crate) runtime_abi_version: u16,
@@ -217,13 +244,9 @@ impl<'a> PackVerifier<'a> {
         if manifest.schema_version != PACK_SCHEMA_VERSION {
             return Err(PackVerificationError::UnsupportedSchema);
         }
-        for (value, label) in [
-            (&manifest.pack_id, "pack id"),
-            (&manifest.pack_version, "pack version"),
-            (&manifest.provider, "provider"),
-        ] {
-            validate_identifier(value, label)?;
-        }
+        validate_store_component(&manifest.pack_id, "pack id")?;
+        validate_store_component(&manifest.pack_version, "pack version")?;
+        validate_identifier(&manifest.provider, "provider")?;
         validate_build_identity(&manifest.app_build, "app build")?;
         validate_build_identity(&manifest.worker_build, "worker build")?;
         validate_sha256(&manifest.pack_digest)?;
@@ -279,8 +302,8 @@ pub(crate) fn compute_pack_digest(
 ) -> Result<String, PackVerificationError> {
     let material = DigestMaterial {
         schema_version: manifest.schema_version,
-        pack_id: &manifest.pack_id,
-        pack_version: &manifest.pack_version,
+        pack_id: manifest.pack_id.as_str(),
+        pack_version: manifest.pack_version.as_str(),
         security_epoch: manifest.security_epoch,
         app_protocol_version: manifest.app_protocol_version,
         worker_protocol_version: manifest.worker_protocol_version,
@@ -355,6 +378,34 @@ fn validate_identifier(value: &str, label: &'static str) -> Result<(), PackVerif
     Ok(())
 }
 
+fn validate_store_component(
+    value: &StoreComponent,
+    label: &'static str,
+) -> Result<(), PackVerificationError> {
+    if !value.is_canonical() {
+        return Err(PackVerificationError::InvalidIdentifier(label));
+    }
+    Ok(())
+}
+
+fn is_canonical_store_component(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    !value.is_empty()
+        && value.len() <= 96
+        && value != "."
+        && value != ".."
+        && bytes
+            .first()
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        && bytes
+            .last()
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        && bytes.iter().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-')
+        })
+        && !is_reserved_windows_name(value)
+}
+
 fn validate_build_identity(value: &str, label: &'static str) -> Result<(), PackVerificationError> {
     if value.len() < 12
         || value.len() > 192
@@ -366,14 +417,17 @@ fn validate_build_identity(value: &str, label: &'static str) -> Result<(), PackV
 }
 
 fn validate_sha256(value: &str) -> Result<(), PackVerificationError> {
-    if value.len() != 64
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
+    if !is_canonical_sha256(value) {
         return Err(PackVerificationError::InvalidSha256);
     }
     Ok(())
+}
+
+pub(super) fn is_canonical_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn validate_relative_path(value: &str) -> Result<(), PackVerificationError> {
@@ -788,8 +842,8 @@ pub(super) mod test_support {
     pub(crate) fn base_manifest() -> PackManifest {
         PackManifest {
             schema_version: 1,
-            pack_id: "scribe-vulkan".to_owned(),
-            pack_version: "1.2.3".to_owned(),
+            pack_id: StoreComponent::new("scribe-vulkan").unwrap(),
+            pack_version: StoreComponent::new("1.2.3").unwrap(),
             pack_digest: "0".repeat(64),
             security_epoch: 1,
             app_protocol_version: 5,
@@ -973,6 +1027,102 @@ mod tests {
             verifier.validate_manifest(&manifest),
             Err(PackVerificationError::BackendMismatch)
         ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pack_identity_components_reject_store_path_ambiguity() {
+        let root = temp_root("identity-components");
+        let (verifier, _) = fixture(&root);
+        for hostile in [
+            ".",
+            "..",
+            "...",
+            "a/b",
+            "a\\b",
+            "c:escape",
+            "name:stream",
+            "con",
+            "con.txt",
+            "prn.log",
+            "aux.dll",
+            "nul.json",
+            "com1",
+            "com1.dll",
+            "lpt9",
+            "lpt9.sys",
+            "name.",
+            "name ",
+            "Uppercase",
+            "café",
+            "bad\u{1f}",
+            "-leading",
+            "trailing-",
+        ] {
+            let mut manifest = base_manifest();
+            manifest.pack_id = StoreComponent::test_unchecked(hostile);
+            assert!(
+                matches!(
+                    verifier.validate_manifest(&manifest),
+                    Err(PackVerificationError::InvalidIdentifier("pack id"))
+                ),
+                "accepted pack id {hostile:?}"
+            );
+
+            let mut manifest = base_manifest();
+            manifest.pack_version = StoreComponent::test_unchecked(hostile);
+            assert!(
+                matches!(
+                    verifier.validate_manifest(&manifest),
+                    Err(PackVerificationError::InvalidIdentifier("pack version"))
+                ),
+                "accepted pack version {hostile:?}"
+            );
+        }
+
+        let signed_hostile_root = temp_root("signed-hostile-identity");
+        let mut signed_hostile = base_manifest();
+        signed_hostile.pack_id = StoreComponent::test_unchecked("..");
+        let trust = write_signed(&signed_hostile_root, signed_hostile);
+        let signed_hostile_verifier = PackVerifier::new(
+            trust,
+            Compatibility {
+                app_build: crate::onnx_worker::DESKTOP_BUILD_ID,
+                worker_build: crate::onnx_worker::INFERENCE_WORKER_BUILD_ID,
+                target_os: std::env::consts::OS,
+                target_arch: std::env::consts::ARCH,
+                allowed_backends: &[PackBackend::Vulkan],
+            },
+        );
+        assert!(matches!(
+            signed_hostile_verifier.verify(&signed_hostile_root),
+            Err(PackVerificationError::InvalidIdentifier("pack id"))
+        ));
+
+        let semantic_root = temp_root("semantic-version-component");
+        let mut manifest = base_manifest();
+        manifest.pack_version = StoreComponent::new("1.2.3-beta.1").unwrap();
+        let trust = write_signed(&semantic_root, manifest);
+        let semantic_verifier = PackVerifier::new(
+            trust,
+            Compatibility {
+                app_build: crate::onnx_worker::DESKTOP_BUILD_ID,
+                worker_build: crate::onnx_worker::INFERENCE_WORKER_BUILD_ID,
+                target_os: std::env::consts::OS,
+                target_arch: std::env::consts::ARCH,
+                allowed_backends: &[PackBackend::Vulkan],
+            },
+        );
+        assert_eq!(
+            semantic_verifier
+                .verify(&semantic_root)
+                .unwrap()
+                .pack_version
+                .as_str(),
+            "1.2.3-beta.1"
+        );
+        fs::remove_dir_all(signed_hostile_root).unwrap();
+        fs::remove_dir_all(semantic_root).unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 

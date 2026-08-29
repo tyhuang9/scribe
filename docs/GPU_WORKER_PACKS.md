@@ -35,6 +35,14 @@ digest mismatches. The complete tree is verified again immediately before a
 launchable path can be passed to Stage 2's exact-path, file-identity, digest,
 and final-process-image checks.
 
+Pack ID and version are stricter than general signed identifiers because they
+become immutable-store directory names. They are bounded lowercase ASCII
+components that start and end with an alphanumeric character and otherwise use
+only alphanumerics, `.`, `_`, or `-`; separators, colons, dot-only values,
+Unicode/case aliases, and Windows device names including extension forms are
+rejected. Persisted activation, journal, and epoch state is checked again before
+the store constructs an exact three-component path beneath its canonical root.
+
 ## Immutable storage and activation
 
 Pre-signed input is first verified, copied with no-follow opens into a random

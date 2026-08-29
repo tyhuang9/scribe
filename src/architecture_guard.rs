@@ -712,10 +712,7 @@ fn verified_worker_pack_stage_remains_fail_closed_and_provider_inert() {
     let manifest = include_str!("gpu_worker_pack/manifest.rs");
     let worker = include_str!("onnx_worker.rs");
     let documentation = include_str!("../docs/GPU_WORKER_PACKS.md");
-    let production_manifest = manifest
-        .split("#[cfg(test)]")
-        .next()
-        .expect("manifest has a production section");
+    let production_manifest = production_source(manifest);
     let registry_body = module
         .split("pub(crate) fn production_registry() -> ProductionPackRegistry")
         .nth(1)
@@ -734,8 +731,8 @@ fn verified_worker_pack_stage_remains_fail_closed_and_provider_inert() {
         "bindings: Vec<VerifiedPackLaunchBinding>",
         "from_launch_bindings(bindings: Vec<VerifiedPackLaunchBinding>)",
         "try_from_resolver_hello_bridge",
-        "bridge.hello_pack_id() == pack.pack_id",
-        "bridge.hello_pack_version() == pack.pack_version",
+        "bridge.hello_pack_id() == pack.pack_id.as_str()",
+        "bridge.hello_pack_version() == pack.pack_version.as_str()",
         "bridge.hello_pack_digest() == pack.pack_digest",
         "bridge.hello_runtime_abi() == pack.runtime_abi_version",
         "bridge.hello_backend() == pack.backend",
