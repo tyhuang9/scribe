@@ -3203,6 +3203,11 @@ struct CurrentGeneration {
     pack_bindings: Vec<VerifiedPackLaunchBinding>,
 }
 
+struct WorkerGenerationContext {
+    generation: u64,
+    pack_bindings: Vec<VerifiedPackLaunchBinding>,
+}
+
 #[derive(Clone, Copy)]
 struct SupervisorStream {
     generation: u64,
@@ -4111,9 +4116,12 @@ impl ProcessWorkerSupervisor {
         }
     }
 
-    fn current_pack_bindings(&self) -> Result<Vec<VerifiedPackLaunchBinding>> {
+    fn generation_context(&self) -> Result<WorkerGenerationContext> {
         let generation = self.ensure_generation()?;
-        self.pack_bindings_for_generation(generation)
+        Ok(WorkerGenerationContext {
+            generation,
+            pack_bindings: self.pack_bindings_for_generation(generation)?,
+        })
     }
 
     fn pack_bindings_for_generation(
@@ -5070,8 +5078,9 @@ impl InferenceWorkerSupervisor {
         }
     }
 
+    #[cfg(test)]
     fn verified_pack_bindings(&self) -> Result<Vec<VerifiedPackLaunchBinding>> {
-        let bindings = self.transport.current_pack_bindings()?;
+        let bindings = self.transport.generation_context()?.pack_bindings;
         if bindings.is_empty() {
             bail!("inference worker did not produce a verified pack binding");
         }
@@ -5093,13 +5102,9 @@ impl InferenceWorkerSupervisor {
     }
 
     fn reconcile_verified_pack_diagnostics(
-        &self,
+        bindings: &[VerifiedPackLaunchBinding],
         resolved: &mut ResolvedAcceleration,
     ) -> Result<(), RuntimeError> {
-        let bindings = self
-            .transport
-            .current_pack_bindings()
-            .map_err(worker_unavailable)?;
         if bindings.is_empty() {
             return Ok(());
         }
@@ -5146,9 +5151,9 @@ impl InferenceWorkerSupervisor {
             resolve_cpu_only_acceleration(preference)
                 .map_err(|error| RuntimeError::OnnxUnavailable(error.to_string()))?;
         }
-        let generation = self
+        let context = self
             .transport
-            .ensure_generation()
+            .generation_context()
             .map_err(worker_unavailable)?;
         let correlation = self.next_id();
         let frame = control_frame(
@@ -5163,7 +5168,7 @@ impl InferenceWorkerSupervisor {
         match self
             .transport
             .active_round_trip_with_timeout(
-                generation,
+                context.generation,
                 correlation,
                 correlation,
                 &[frame],
@@ -5173,18 +5178,19 @@ impl InferenceWorkerSupervisor {
         {
             Control::RuntimeLoaded { execution } => {
                 let mut execution: RuntimeLoadExecution = execution.into();
-                self.reconcile_verified_pack_diagnostics(
+                Self::reconcile_verified_pack_diagnostics(
+                    &context.pack_bindings,
                     &mut execution.diagnostics.resolved_acceleration,
                 )?;
                 Ok(execution)
             }
             Control::RuntimeFailed { error } => {
-                Err(error.into_runtime_for_generation(&self.transport, generation))
+                Err(error.into_runtime_for_generation(&self.transport, context.generation))
             }
             Control::Error { message } => Err(RuntimeError::WorkerUnavailable(message)),
             _ => {
                 let _ = self.transport.invalidate_generation(
-                    generation,
+                    context.generation,
                     "unexpected inference load response",
                     true,
                 );
@@ -5212,10 +5218,11 @@ impl InferenceWorkerSupervisor {
         }
         validate_cumulative_pcm_samples(&audio.samples)
             .map_err(|error| RuntimeError::Engine(error.to_string()))?;
-        let generation = self
+        let context = self
             .transport
-            .ensure_generation()
+            .generation_context()
             .map_err(worker_unavailable)?;
+        let generation = context.generation;
         if cancelled() {
             let _ = self.transport.invalidate_generation(
                 generation,
@@ -5320,7 +5327,8 @@ impl InferenceWorkerSupervisor {
         {
             Control::RuntimeTranscript { execution } => {
                 let mut execution: RuntimeExecution = execution.into();
-                self.reconcile_verified_pack_diagnostics(
+                Self::reconcile_verified_pack_diagnostics(
+                    &context.pack_bindings,
                     &mut execution.diagnostics.resolved_acceleration,
                 )?;
                 Ok(execution)
@@ -8232,6 +8240,7 @@ mod tests {
         InvalidResponse {
             pcm_kind: bool,
         },
+        RuntimeLoadThenExit,
         VadNormal,
         VadCrashOnWindow,
         VadCrashOnReset,
@@ -8313,7 +8322,7 @@ mod tests {
                 let output = ChannelWriter {
                     sender: worker_output,
                 };
-                run_test_worker(input, output, mode);
+                run_test_worker(input, output, mode, &worker_process.running);
                 worker_process.running.store(false, Ordering::Release);
                 let _ = worker_output_for_exit.send(PipeChunk::Eof);
             });
@@ -8443,7 +8452,12 @@ mod tests {
         }
     }
 
-    fn run_test_worker(mut input: impl Read, mut output: impl Write, mode: TestMode) {
+    fn run_test_worker(
+        mut input: impl Read,
+        mut output: impl Write,
+        mode: TestMode,
+        running: &AtomicBool,
+    ) {
         let mode = match mode {
             TestMode::CapabilityMismatch(mismatch) => {
                 let (session_id, request_id, control) = read_parent_control(&mut input);
@@ -8616,6 +8630,35 @@ mod tests {
                     control_frame(session_id, request_id, &Control::Health).unwrap()
                 };
                 write_frame(&mut output, &frame).unwrap();
+            }
+            TestMode::RuntimeLoadThenExit => {
+                let (session_id, request_id, control) = read_parent_control(&mut input);
+                let Control::LoadRuntime { preference, .. } = control else {
+                    panic!("expected runtime load request");
+                };
+                running.store(false, Ordering::Release);
+                respond(
+                    &mut output,
+                    session_id,
+                    request_id,
+                    Control::RuntimeLoaded {
+                        execution: WireRuntimeLoadExecution {
+                            diagnostics: WireRuntimeDiagnostics {
+                                resolved_acceleration: ResolvedAcceleration {
+                                    requested: preference,
+                                    resolved: ComputeDevice::Cpu,
+                                    diagnostic: None,
+                                    selection: None,
+                                },
+                                runtime_location: PathBuf::from("test-worker-runtime"),
+                                warm_reused: false,
+                                model_load_duration_ms: 1,
+                            },
+                            detected_architecture: "test-runtime".to_owned(),
+                            capabilities: RuntimeCapabilities::default(),
+                        },
+                    },
+                );
             }
         }
     }
@@ -10406,6 +10449,39 @@ mod tests {
         );
         supervisor.unload().unwrap();
         assert_eq!(launcher.launches.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn runtime_response_generation_binding_does_not_respawn_after_exit() {
+        let launcher = Arc::new(TestLauncher::new([
+            TestMode::RuntimeLoadThenExit,
+            TestMode::Normal,
+        ]));
+        let inference = InferenceWorkerSupervisor {
+            transport: ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+                launcher.clone(),
+                short_deadlines(),
+            ),
+            next_correlation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        };
+
+        let loaded = inference
+            .load(missing_gguf_artifact(), AccelerationPreference::Cpu)
+            .unwrap();
+
+        assert_eq!(loaded.detected_architecture, "test-runtime");
+        let wait_until = Instant::now() + Duration::from_millis(250);
+        while inference.transport.current_generation().unwrap().is_some()
+            && Instant::now() < wait_until
+        {
+            std::thread::yield_now();
+        }
+        assert_eq!(inference.transport.current_generation().unwrap(), None);
+        assert_eq!(
+            launcher.launches.load(Ordering::Acquire),
+            1,
+            "post-response reconciliation must not inspect or spawn a replacement generation"
+        );
     }
 
     #[test]
