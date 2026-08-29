@@ -521,6 +521,23 @@ fn verify_catalog_entries(
     bytes: &[u8],
     catalog_generation: String,
 ) -> PackLeaseDiscovery {
+    let verifier = manifest::PackVerifier::new(
+        &manifest::ProductionTrustRoot,
+        manifest::Compatibility::current(&[
+            manifest::PackBackend::Cuda,
+            manifest::PackBackend::Vulkan,
+        ]),
+    );
+    verify_catalog_entries_with_verifier(install_root, bytes, catalog_generation, &verifier)
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn verify_catalog_entries_with_verifier(
+    install_root: &Path,
+    bytes: &[u8],
+    catalog_generation: String,
+    verifier: &manifest::PackVerifier<'_>,
+) -> PackLeaseDiscovery {
     let Ok(catalog) = serde_json::from_slice::<PackCatalog>(bytes) else {
         return PackLeaseDiscovery {
             leases: Vec::new(),
@@ -540,13 +557,6 @@ fn verify_catalog_entries(
         };
     }
     let packs_root = install_root.join("workers").join("packs");
-    let verifier = manifest::PackVerifier::new(
-        &manifest::ProductionTrustRoot,
-        manifest::Compatibility::current(&[
-            manifest::PackBackend::Cuda,
-            manifest::PackBackend::Vulkan,
-        ]),
-    );
     let mut leases = Vec::new();
     let mut diagnostics = Vec::new();
     for entry in catalog.packs {
@@ -600,13 +610,16 @@ fn verify_catalog_entries(
             continue;
         };
         let observed = lease.verified_pack();
-        let expected_files = lease
+        let mut expected_files = lease
             .copy_entries()
             .iter()
             .map(|file| format!("{relative_root}/{}", file.path))
             .collect::<Vec<_>>();
-        let mut catalog_files = entry.files;
-        catalog_files.sort();
+        expected_files.sort();
+        let catalog_files_are_canonical = entry
+            .files
+            .windows(2)
+            .all(|pair| pair[0].as_str() < pair[1].as_str());
         if observed.pack_id != entry.pack_id
             || observed.pack_version != entry.pack_version
             || observed.pack_digest != entry.pack_digest
@@ -617,7 +630,8 @@ fn verify_catalog_entries(
             || observed.target_os != entry.target_os
             || observed.target_arch != entry.target_arch
             || observed.worker_relative_path != entry.worker_relative_path
-            || catalog_files != expected_files
+            || !catalog_files_are_canonical
+            || entry.files != expected_files
         {
             diagnostics.push(PackDiscoveryDiagnostic::pack(
                 PackDiscoveryIssue::CatalogInventoryMismatch,
@@ -809,6 +823,37 @@ mod tests {
     use super::manifest::VerifiedPackLease;
     use super::{PackDiscoveryDiagnostic, PackDiscoveryIssue};
     use super::{ResolverHelloBindingBridge, VerifiedPackLaunchBinding};
+
+    #[cfg(windows)]
+    fn fixture_catalog_bytes(lease: &VerifiedPackLease, files: Vec<String>) -> Vec<u8> {
+        let pack = lease.verified_pack();
+        let relative_root = format!(
+            "workers/packs/{}/{}/{}",
+            pack.pack_id.as_str(),
+            pack.pack_version.as_str(),
+            pack.pack_digest
+        );
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "packs": [{
+                "pack_id": pack.pack_id.as_str(),
+                "pack_version": pack.pack_version.as_str(),
+                "pack_digest": pack.pack_digest,
+                "security_epoch": pack.security_epoch,
+                "runtime_abi_version": pack.runtime_abi_version,
+                "backend": "vulkan",
+                "provider": pack.provider,
+                "target_os": pack.target_os,
+                "target_arch": pack.target_arch,
+                "worker_relative_path": pack.worker_relative_path,
+                "root": relative_root,
+                "installed_size_bytes": 1,
+                "compressed_size_bytes": 1,
+                "files": files,
+            }]
+        }))
+        .unwrap()
+    }
 
     struct FixtureBridge {
         lease: Arc<VerifiedPackLease>,
@@ -1044,6 +1089,82 @@ mod tests {
             cache.lookup(&first).is_none(),
             "the cache remains bounded to one catalog"
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn verified_nonempty_catalog_requires_canonical_exact_inventory() {
+        let root = super::manifest::test_support::temp_root("verified-pack-catalog");
+        let (verifier, fixture_lease) = super::manifest::test_support::leased_fixture(&root);
+        let pack = fixture_lease.verified_pack();
+        let relative_root = format!(
+            "workers/packs/{}/{}/{}",
+            pack.pack_id.as_str(),
+            pack.pack_version.as_str(),
+            pack.pack_digest
+        );
+        let mut canonical_files = fixture_lease
+            .copy_entries()
+            .iter()
+            .map(|entry| format!("{relative_root}/{}", entry.path))
+            .collect::<Vec<_>>();
+        canonical_files.sort();
+
+        let success = super::verify_catalog_entries_with_verifier(
+            &root,
+            &fixture_catalog_bytes(&fixture_lease, canonical_files.clone()),
+            "fixture-generation".to_owned(),
+            &verifier,
+        );
+        assert_eq!(success.leases.len(), 1);
+        assert_eq!(
+            success.diagnostics,
+            vec![PackDiscoveryDiagnostic::pack(
+                PackDiscoveryIssue::NotAutoQualified,
+                &pack.pack_id,
+                PackBackend::Vulkan,
+            )]
+        );
+
+        let assert_inventory_rejected = |files: Vec<String>, issue: PackDiscoveryIssue| {
+            let discovery = super::verify_catalog_entries_with_verifier(
+                &root,
+                &fixture_catalog_bytes(&fixture_lease, files),
+                "fixture-generation".to_owned(),
+                &verifier,
+            );
+            assert!(discovery.leases.is_empty());
+            assert_eq!(
+                discovery.diagnostics,
+                vec![PackDiscoveryDiagnostic::pack(
+                    issue,
+                    &pack.pack_id,
+                    PackBackend::Vulkan,
+                )]
+            );
+        };
+
+        let mut reordered = canonical_files.clone();
+        reordered.swap(0, 1);
+        assert_inventory_rejected(reordered, PackDiscoveryIssue::CatalogInventoryMismatch);
+
+        let mut duplicate = canonical_files.clone();
+        duplicate[1] = duplicate[0].clone();
+        assert_inventory_rejected(duplicate, PackDiscoveryIssue::CatalogInventoryMismatch);
+
+        let mut missing = canonical_files.clone();
+        missing.pop();
+        assert_inventory_rejected(missing, PackDiscoveryIssue::EntryIncompatible);
+
+        let mut unexpected = canonical_files.clone();
+        unexpected.push(format!("{relative_root}/unexpected.dll"));
+        unexpected.sort();
+        assert_inventory_rejected(unexpected, PackDiscoveryIssue::CatalogInventoryMismatch);
+
+        drop(success);
+        drop(fixture_lease);
+        drop(verifier);
         std::fs::remove_dir_all(root).unwrap();
     }
 }
