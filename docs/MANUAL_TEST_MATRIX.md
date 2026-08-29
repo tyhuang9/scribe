@@ -264,6 +264,24 @@ new activation/paste latency timestamps remain NOT VERIFIED on a desktop.
 
 ## Runtime, model, and transcription flows
 
+### Stage 4 Windows GPU worker-pack checkpoint
+
+Recorded 2026-08-29 on Windows x64. This is automated fixture/hardware evidence
+for the private worker path, not a packaged-desktop manual PASS and not Auto
+qualification.
+
+| Area | Evidence | Status |
+| --- | --- | --- |
+| Vulkan fixture build | Clean fixture-only pack from `10d4ec2`, Vulkan SDK 1.4.357.0, `scribe-vulkan-windows-x64` `0.1.0-fixture7`, digest `563e1cf17db85bf02c40dda7d074e981c589931aa890f986446df70428aad62b`; three files, 98,017,192 installed bytes, 31,801,892 compressed bytes, 98,016,256-byte worker payload | **PASS fixture tooling** |
+| Explicit-GPU SCIF/model smoke | RTX 4080 SUPER; stable ID `native:0000:01:00.0`; driver `windows-display:32.0.16.1088`; 16,824,401,920 memory bytes; pinned model SHA-256 `3b46ca40bccbf7609c68d88a36d96077a04ca7c87f2060ede06f129fac3e7652`; pinned WAV SHA-256 `59dfb9a4acb36fe2a2affc14bacbee2920ff435cb13cc314a08c13f66ba7860e`; expected `ask not` phrase present; `warm_reused=true`; CPU launches zero | **PASS isolated hardware smoke** |
+| CUDA provider | Pinned CUDA Toolkit/nvcc 12.8.93 was absent; no download or substitute toolkit was admitted | **BLOCKED locally / CI-gated** |
+| Production trust and release | No reviewed production public key or external CI private key exists; nonempty production pack authoring fails closed. Official publication also requires `SCRIBE_GPU_PACK_RELEASE_POLICY`; the only permitted temporary Stage 4 mode is explicitly CPU-only. | **NOT VERIFIED / fail closed** |
+| Auto/performance qualification | Auto remains CPU/default-denied and does not launch probes. Five-cold/twenty-warm performance, device-loss, suspend/resume, driver-update, and packaged installer lanes were not run. | **NOT VERIFIED** |
+
+Reproduce the hardware smoke only with the exact ignored-test environment
+documented in `GPU_WORKER_PACKS.md`; fixture trust must never be used for a
+release artifact. The production manual rows below remain unchanged.
+
 | ID | Platform | Prereq | Steps | Expected result/evidence | Status |
 | --- | --- | --- | --- | --- | --- |
 | STT-01 | Win/Linux/macOS | P1, P2, P3, P4 | Install/select the known-good model; transcribe fixture through the normal flow. | Non-empty final transcript appears, backend/model identity is visible in diagnostics, and exactly one finalized output is produced. | **NOT VERIFIED** |
@@ -273,7 +291,7 @@ new activation/paste latency timestamps remain NOT VERIFIED on a desktop.
 | STT-05 | Win/Linux/macOS | P1, P2, P3 | Terminate the active STT worker generation or force a non-zero child exit during transcription. | Failure is surfaced, app returns to Idle/Error, the supervisor can create a fresh generation, and retry is safe; no stale result is applied. | **NOT VERIFIED** |
 | STT-06 | Win/Linux/macOS | P1, P2 | Remain silent, then repeat with audible non-speech/noise until endpoint or stop. | Empty/no-speech results never paste. Exact sequential 512-sample Silero decisions alone classify speech in a separate VAD-only worker; that worker never receives STT controls. RMS remains a meter/diagnostic: after Silero reports no speech, only a capture whose maximum diagnostic RMS stayed below the low-input guidance floor receives silent/too-low hardware guidance. | **NOT VERIFIED** |
 | STT-07 | Win/Linux/macOS | P1, P2, P3 | In Advanced, run Auto, Rolling preview, and Final text only against the same utterance; repeat once in Playground. Capture the committed/tentative overlay states and first-partial latency. | Auto and Rolling use bounded batch preview only for the primary native model; Final text only and Playground emit no partials. Tentative text stays in the overlay, corrections do not backspace another app, and the final result replaces the preview once. No model advertises native streaming. | **NOT VERIFIED** |
-| STT-08 | Win/Linux/macOS | P1, P2, P3 | Change Auto/GPU/CPU-only acceleration preference where supported; run fixture on each available mode. | Auto resolves to a health-validated device, explicit CPU is honored, and unavailable GPU fails clearly without silent fallback. Record resolved backend/device and errors. | **NOT VERIFIED** |
+| STT-08 | Win/Linux/macOS | P1, P2, P3 | Change Auto/GPU/CPU-only acceleration preference where supported; run fixture on each available mode. | In Stage 4, Auto remains CPU and diagnoses why verified GPU candidates are default-denied; explicit CPU is honored; explicit GPU uses only a verified compatible pack/device and fails clearly without silent CPU fallback. Record resolved backend/device, pack/driver identity, power policy, quarantine, fallback history, and errors. | **NOT VERIFIED** |
 | STT-09 | Windows | P1, P3 | Install and select the receipt-backed `moonshine-tiny-en-int8-onnx` bundle; transcribe the approved fixture and record its receipt, model identity, worker generation, cancellation behavior, and final-text output. | The installed receipt validates before activation; native Sherpa ONNX inference runs in the persistent `--scribe-inference-worker` child, produces a final transcript, and does not claim native streaming. Record all failures and the exact build/model/fixture evidence. | **NOT VERIFIED** |
 | STT-10 | Windows | P1, P3, P7 | With Scribe running, inspect the process tree, canonical executable paths, and worker launch arguments during a GGUF transcription, a receipt-backed ONNX transcription, and an AI-VAD capture. Inspect stdout/stderr capture for each child and confirm no local listener is opened. Repeat after removing or replacing the adjacent inference worker and with explicit GPU selected. | The desktop process owns no GGUF or ASR ONNX model/session/recognizer handles. One persistent adjacent `scribe-inference-worker.exe --scribe-inference-worker` child owns GGUF and native Sherpa ONNX inference; a separate `local-transcriber.exe --scribe-vad-worker` instance owns VAD only. Both use private SCIF v5 stdin/stdout pipes, complete the expected capability handshake, keep stdout protocol-only, send diagnostics to stderr, and open no localhost/TCP/HTTP transport or nested ONNX worker. A missing/wrong worker fails clearly, and explicit GPU never launches the CPU worker. Use a disposable profile and terminate the workers after the run. | **NOT VERIFIED** |
 

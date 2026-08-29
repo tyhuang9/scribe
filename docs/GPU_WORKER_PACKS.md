@@ -8,7 +8,11 @@ per-device Windows driver mapping. `Auto` remains deliberately default-denied
 to GPU until Stage 5 hardware qualification. The checked-in production trust
 root is still empty, so ordinary releases remain CPU-only and a requested
 nonempty GPU release fails closed until a separately reviewed public key and CI
-signing secret are provisioned.
+signing secret are provisioned. Official releases additionally require the
+reviewed `SCRIBE_GPU_PACK_RELEASE_POLICY` repository variable. Its temporary
+Stage 4 value is `temporary_cpu_only_stage4`; once production trust is
+provisioned it must be changed to `gpu_packs_required`, which forces both packs
+for tag and manual publication without relying on a dispatch checkbox.
 
 ## Current Stage 4 behavior
 
@@ -166,8 +170,12 @@ provisioned. When a release includes packs, the same catalog is inside the
 portable payload and the installer copies that exact tree; CI emits a separate
 per-pack installed and compressed size report from the verified catalog.
 
-Repository tooling contains no production private key. The opt-in release job
-accepts only an externally supplied base64 PKCS#8 CI secret and reviewed key ID,
+Repository tooling contains no production private key. A non-publication
+workflow dispatch can request both packs for release validation. Official
+publication fails when the reviewed repository policy is absent or unknown;
+the temporary Stage 4 policy explicitly forbids packs, while
+`gpu_packs_required` forces both CUDA and Vulkan. The production build accepts
+only an externally supplied base64 PKCS#8 CI secret and reviewed key ID,
 materializes the key under the runner temporary directory for the signing step,
 zeroes its decoded byte buffer, and deletes the file in `finally`. The authoring
 tool verifies that its public key exactly matches the separately reviewed key
@@ -176,6 +184,46 @@ in today, this gate rejects every requested nonempty GPU release. The normal
 CPU-only build remains usable. The deterministic seed and key ID used by
 tooling tests and local hardware smoke are fixture-only and cannot verify under
 production trust.
+
+## Windows Vulkan hardware evidence
+
+On 2026-08-29, a clean fixture-only pack built from `10d4ec2` with the pinned
+Rust/MSVC/CMake contract and Vulkan SDK 1.4.357.0 completed the ignored
+challenge-bound SCIF/model smoke on an NVIDIA GeForce RTX 4080 SUPER. The pack
+was `scribe-vulkan-windows-x64` version `0.1.0-fixture7`, digest
+`563e1cf17db85bf02c40dda7d074e981c589931aa890f986446df70428aad62b`.
+It contained three files totaling 98,017,192 installed bytes; the worker payload
+was 98,016,256 bytes, and the same optimal ZIP method used by staging measured
+31,801,892 compressed bytes.
+
+The worker reported stable identity `native:0000:01:00.0`, bounded SetupAPI
+driver identity `windows-display:32.0.16.1088`, and 16,824,401,920 total-memory
+bytes. It transcribed the pinned `whisper-base.en-Q8_0.gguf`/JFK fixture through
+the verified explicit-GPU route, contained the expected `ask not` phrase,
+reported `warm_reused=true` on the second request, and launched no CPU worker.
+These numbers describe the fixture pack only; they are not CUDA sizes or a
+production installer measurement.
+
+CUDA was not built or run locally because the pinned CUDA Toolkit/nvcc 12.8.93
+is absent. Production signing and packaging remain intentionally unverified and
+fail closed because no reviewed production public key or CI private key exists.
+Auto enablement, five-cold/twenty-warm performance qualification, driver/device
+loss qualification, and portable/installer hardware execution remain later
+release evidence rather than claims established by this smoke.
+
+The passing test used the following command shape with absolute local fixture
+paths and the recorded hashes above:
+
+```powershell
+$env:SCRIBE_GPU_FIXTURE_PACK_ROOT = '<fixture7-pack-root>'
+$env:SCRIBE_GPU_FIXTURE_MODEL = '<whisper-base.en-Q8_0.gguf>'
+$env:SCRIBE_GPU_FIXTURE_MODEL_SHA256 = '3b46ca40bccbf7609c68d88a36d96077a04ca7c87f2060ede06f129fac3e7652'
+$env:SCRIBE_GPU_FIXTURE_WAV = '<pinned-jfk.wav>'
+$env:SCRIBE_GPU_FIXTURE_WAV_SHA256 = '59dfb9a4acb36fe2a2affc14bacbee2920ff435cb13cc314a08c13f66ba7860e'
+$env:SCRIBE_GPU_FIXTURE_EXPECTED_TRANSCRIPT = 'ask not'
+$env:SCRIBE_GPU_FIXTURE_STABLE_DEVICE_ID = 'native:0000:01:00.0'
+cargo test --features inference-worker verified_vulkan_fixture_pack_scif_model_hardware_smoke -- --ignored --nocapture
+```
 
 ## Stage 4 launch binding
 
