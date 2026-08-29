@@ -6157,12 +6157,12 @@ impl InferenceWorkerRegistry {
         // before any provider probe can start.
         let lease_discovery = crate::gpu_worker_pack::discover_production_pack_leases();
         let discovery_fingerprint = explicit_gpu_discovery_fingerprint(&lease_discovery);
-        let now = Instant::now();
+        let lookup_at = Instant::now();
         let cached_catalog = {
             let cached = self.gpu_routes.lock().map_err(|_| {
                 RuntimeError::WorkerUnavailable("GPU worker registry lock poisoned".to_owned())
             })?;
-            cached.lookup(&discovery_fingerprint, now)
+            cached.lookup(&discovery_fingerprint, lookup_at)
         };
         let catalog = match cached_catalog {
             GpuRouteCatalogLookup::Successful(cached) => cached,
@@ -6178,6 +6178,7 @@ impl InferenceWorkerRegistry {
                     discover_production_pack_launch_bindings(lease_discovery),
                     discovery_fingerprint,
                 );
+                let probe_completed_at = Instant::now();
                 self.gpu_routes
                     .lock()
                     .map_err(|_| {
@@ -6185,7 +6186,7 @@ impl InferenceWorkerRegistry {
                             "GPU worker registry lock poisoned".to_owned(),
                         )
                     })?
-                    .record_probe(discovered.clone(), now);
+                    .record_probe(discovered.clone(), probe_completed_at);
                 discovered
             }
         };
@@ -10499,6 +10500,38 @@ mod tests {
         ));
         assert!(matches!(
             cache.lookup("changed-catalog", later),
+            GpuRouteCatalogLookup::Probe
+        ));
+    }
+
+    #[test]
+    fn failed_gpu_probe_backoff_starts_after_a_long_probe_completes() {
+        let probe_started_at = Instant::now();
+        let probe_completed_at =
+            probe_started_at + GPU_PROVIDER_PROBE_BACKOFF + Duration::from_secs(5);
+        let mut cache = GpuRouteCatalogCache::default();
+        let mut failed = verified_gpu_catalog(Vec::new());
+        failed.diagnostic = Some("slow verified provider probe failed".to_owned());
+
+        cache.record_probe(failed, probe_completed_at);
+
+        assert!(matches!(
+            cache.lookup("test-catalog", probe_completed_at),
+            GpuRouteCatalogLookup::Backoff(Some(message))
+                if message == "slow verified provider probe failed"
+        ));
+        assert!(matches!(
+            cache.lookup(
+                "test-catalog",
+                probe_completed_at + GPU_PROVIDER_PROBE_BACKOFF - Duration::from_millis(1),
+            ),
+            GpuRouteCatalogLookup::Backoff(_)
+        ));
+        assert!(matches!(
+            cache.lookup(
+                "test-catalog",
+                probe_completed_at + GPU_PROVIDER_PROBE_BACKOFF,
+            ),
             GpuRouteCatalogLookup::Probe
         ));
     }
