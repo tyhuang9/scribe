@@ -809,6 +809,92 @@ mod tests {
     }
 
     #[test]
+    fn native_backend_and_vendor_parsers_cover_supported_runtime_spellings() {
+        for (kind, device_type, expected) in [
+            (" CUDA ", DeviceType::Gpu, Some(BackendKind::Cuda)),
+            ("VULKAN", DeviceType::Gpu, Some(BackendKind::Vulkan)),
+            ("metal", DeviceType::Igpu, Some(BackendKind::Metal)),
+            ("cpu", DeviceType::Cpu, Some(BackendKind::Cpu)),
+            ("cpu_accel", DeviceType::Accel, Some(BackendKind::Cpu)),
+            ("accel", DeviceType::Accel, Some(BackendKind::Cpu)),
+            ("future-cpu", DeviceType::Cpu, Some(BackendKind::Cpu)),
+            ("future-gpu", DeviceType::Gpu, None),
+        ] {
+            assert_eq!(backend_kind(kind, device_type), expected, "{kind:?}");
+        }
+
+        let mut reported = device(DeviceType::Gpu, "Provider0", "Provider GPU");
+        for (backend, expected) in [
+            ("CUDA0", BackendKind::Cuda),
+            ("ggml-vulkan", BackendKind::Vulkan),
+            ("Metal", BackendKind::Metal),
+        ] {
+            assert_eq!(observed_backend_kind(backend, &reported), Some(expected));
+        }
+        reported.kind = "cpu".to_owned();
+        reported.device_type = DeviceType::Cpu;
+        assert_eq!(
+            observed_backend_kind("cpu_accel", &reported),
+            Some(BackendKind::Cpu)
+        );
+        reported.kind = "vulkan".to_owned();
+        reported.device_type = DeviceType::Gpu;
+        assert_eq!(
+            observed_backend_kind("provider-specific", &reported),
+            Some(BackendKind::Vulkan)
+        );
+
+        for (name, description, expected) in [
+            ("CUDA0", "NVIDIA RTX", GpuVendor::Nvidia),
+            ("GPU", "GeForce RTX", GpuVendor::Nvidia),
+            ("GPU", "Quadro P4000", GpuVendor::Nvidia),
+            ("GPU", "Advanced Micro Devices GPU", GpuVendor::Amd),
+            ("GPU", "AMD Radeon", GpuVendor::Amd),
+            ("GPU", "Intel Arc", GpuVendor::Intel),
+            ("Metal", "Apple M4 Max", GpuVendor::Apple),
+            ("GPU", "Mesa Gallium", GpuVendor::Other),
+            ("", "", GpuVendor::Unknown),
+        ] {
+            assert_eq!(
+                infer_gpu_vendor(&device(DeviceType::Gpu, name, description)),
+                expected,
+                "{name:?} {description:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn selected_gpu_process_index_must_be_present_and_fit_the_native_type() {
+        let selection_with_index = |process_index| {
+            let mut native = device(DeviceType::Gpu, "Vulkan0", "NVIDIA GPU");
+            native.device_id = Some("0000:01:00.0".to_owned());
+            native.index = process_index;
+            select_backend(
+                AccelerationPreference::Gpu,
+                &BackendSnapshot {
+                    operating_system: OperatingSystem::Windows,
+                    power_source: PowerSource::Ac,
+                    candidates: vec![native_backend_candidate(native).unwrap()],
+                },
+            )
+            .unwrap()
+        };
+
+        let missing = selected_process_index(&selection_with_index(None))
+            .unwrap_err()
+            .to_string();
+        assert!(missing.starts_with("BackendUnavailable:"));
+        assert!(missing.contains("has no current process index"));
+
+        let out_of_range = usize::try_from(i32::MAX).unwrap() + 1;
+        let oversized = selected_process_index(&selection_with_index(Some(out_of_range)))
+            .unwrap_err()
+            .to_string();
+        assert!(oversized.starts_with("BackendUnavailable:"));
+        assert!(oversized.contains("device index is out of range"));
+    }
+
+    #[test]
     fn observed_device_reconciliation_preserves_only_the_fresh_process_index() {
         let enumerated = Device {
             name: "Vulkan0".to_owned(),

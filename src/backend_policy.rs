@@ -638,6 +638,104 @@ mod tests {
     }
 
     #[test]
+    fn auto_fallback_order_is_cuda_then_vulkan_then_cpu() {
+        let selected = select_backend(
+            AccelerationPreference::Auto,
+            &snapshot(
+                OperatingSystem::Windows,
+                PowerSource::Ac,
+                vec![
+                    cpu(),
+                    candidate(target(
+                        BackendKind::Vulkan,
+                        GpuVendor::Nvidia,
+                        DeviceClass::DiscreteGpu,
+                        "gpu-vulkan",
+                        2,
+                    )),
+                    candidate(target(
+                        BackendKind::Cuda,
+                        GpuVendor::Nvidia,
+                        DeviceClass::DiscreteGpu,
+                        "gpu-cuda",
+                        1,
+                    )),
+                ],
+            ),
+        )
+        .unwrap();
+
+        let complete_order = std::iter::once(&selected.target)
+            .chain(&selected.fallback_targets)
+            .map(|target| target.backend)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            complete_order,
+            [BackendKind::Cuda, BackendKind::Vulkan, BackendKind::Cpu]
+        );
+    }
+
+    #[test]
+    fn auto_exposes_the_complete_stable_multi_device_chain() {
+        let selected = select_backend(
+            AccelerationPreference::Auto,
+            &snapshot(
+                OperatingSystem::Linux,
+                PowerSource::Ac,
+                vec![
+                    candidate(target(
+                        BackendKind::Vulkan,
+                        GpuVendor::Nvidia,
+                        DeviceClass::DiscreteGpu,
+                        "vulkan-b",
+                        8,
+                    )),
+                    candidate(target(
+                        BackendKind::Cuda,
+                        GpuVendor::Nvidia,
+                        DeviceClass::DiscreteGpu,
+                        "cuda-b",
+                        3,
+                    )),
+                    cpu(),
+                    candidate(target(
+                        BackendKind::Vulkan,
+                        GpuVendor::Nvidia,
+                        DeviceClass::DiscreteGpu,
+                        "vulkan-a",
+                        7,
+                    )),
+                    candidate(target(
+                        BackendKind::Cuda,
+                        GpuVendor::Nvidia,
+                        DeviceClass::DiscreteGpu,
+                        "cuda-a",
+                        2,
+                    )),
+                ],
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(selected.requested, AccelerationPreference::Auto);
+        assert_eq!(selected.reason, BackendSelectionReason::AutoPriority);
+        let complete_order = std::iter::once(&selected.target)
+            .chain(&selected.fallback_targets)
+            .map(|target| (target.backend, target.device_id.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            complete_order,
+            [
+                (BackendKind::Cuda, "cuda-a"),
+                (BackendKind::Cuda, "cuda-b"),
+                (BackendKind::Vulkan, "vulkan-a"),
+                (BackendKind::Vulkan, "vulkan-b"),
+                (BackendKind::Cpu, "cpu:system"),
+            ]
+        );
+    }
+
+    #[test]
     fn auto_on_battery_excludes_discrete_and_unknown_gpus() {
         let candidates = vec![
             candidate(target(
