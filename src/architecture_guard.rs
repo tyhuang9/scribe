@@ -1363,6 +1363,31 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
             "Windows release packaging must not enable {forbidden}"
         );
     }
+
+    let vulkan_developer_build = fs::read_to_string(
+        repository
+            .join("scripts")
+            .join("build-vulkan-worker-dev.ps1"),
+    )
+    .expect("Vulkan developer worker build script must be readable");
+    for required in [
+        "--bin scribe-inference-worker --features vulkan-acceleration",
+        "--bin local-transcriber --features ui-harness,vulkan-acceleration",
+        "$env:SCRIBE_BUILDING_WORKER = '1'",
+        "$env:SCRIBE_BUNDLED_WORKER_SHA256 = $null",
+        "vulkan-dev-bundle-",
+        "Copy-Item -LiteralPath $cargoDesktop -Destination $desktop",
+        "Copy-Item -LiteralPath $cargoWorker -Destination $worker",
+    ] {
+        assert!(
+            vulkan_developer_build.contains(required),
+            "Vulkan developer build must retain {required:?}"
+        );
+    }
+    assert!(
+        !vulkan_developer_build.contains("--release"),
+        "the opt-in Vulkan helper must not claim or create a release build"
+    );
     assert!(
         !release.contains(r#"target\release"#),
         "the unqualified Cargo release directory must not be used as a bundle"
