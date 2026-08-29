@@ -39,7 +39,7 @@ and final-process-image checks.
 
 Pre-signed input is first verified, copied with no-follow opens into a random
 sibling staging directory, and fully reverified there. Only then is it durably
-renamed to:
+published with a native atomic no-replace operation to:
 
 ```text
 workers/packs/<pack-id>/<version>/<pack-digest>/
@@ -51,8 +51,14 @@ private app-data activation record atomically stores current and previous
 and require the descriptor root to derive exactly from the immutable store.
 A per-pack-ID security-epoch high-water record is durably raised before
 activation; rollback can select a lower version only at or above that floor.
-Corrupt activation state, interrupted staging, or an invalid pack produces no
-GPU candidate and cannot disable the compiled CPU route.
+All store read-modify-write transitions are serialized across processes with a
+private no-follow OS-backed lock. Epoch-raising activation first writes a
+bounded pending-activation journal containing the verified target and exact
+prior/next state witnesses. Recovery reverifies the target and completes a
+transaction interrupted after the journal, epoch, or activation write without
+lowering the security floor. Corrupt transaction state, interrupted staging,
+or an invalid pack produces no GPU candidate and cannot disable the compiled
+CPU route.
 
 ## Private health quarantine
 
@@ -70,6 +76,16 @@ attempt for ten minutes without erasing the streak. A failed retry or probe
 escalates normally. Two consecutive successful idle probes delete the record
 and clear history early. Selection sees only an exact-context quarantine
 projection and applies it only to matching GPU candidates.
+
+Only provider-attributable worker crash, hang, provider initialization, driver,
+device-loss, out-of-memory, and protocol categories may update quarantine.
+Invalid input, artifact/model corruption, content/decode failure, cancellation,
+and partial output never do. Mutations take a private OS-backed lock and reload
+state before replacement, so separate app instances cannot lose updates or
+consume one retry twice. A truly missing first-run cache is available; corrupt,
+unreadable, noncanonical, app-build-mismatched, or device-set-mismatched state is
+explicitly invalid/unprobed for GPU while CPU remains eligible. Two successful
+idle probes atomically replace that state and restore availability.
 
 ## Packaging and key provisioning
 

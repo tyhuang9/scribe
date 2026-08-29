@@ -160,6 +160,7 @@ impl<'a> PackStore<'a> {
             verified.pack_id.clone(),
             old_floor.max(verified.security_epoch),
         );
+        validate_epoch_state(&next_epochs)?;
         let next_activation = ActivationState {
             schema_version: STATE_SCHEMA_VERSION,
             current: Some(verified.clone()),
@@ -319,15 +320,7 @@ impl<'a> PackStore<'a> {
             return Ok(EpochState::empty());
         }
         let state: EpochState = read_canonical_state(&path)?;
-        if state.schema_version != STATE_SCHEMA_VERSION
-            || state.epochs.len() > 256
-            || state
-                .epochs
-                .values()
-                .any(|epoch| *epoch < EMBEDDED_MINIMUM_SECURITY_EPOCH)
-        {
-            return Err(PackStoreError::CorruptState("security epoch state"));
-        }
+        validate_epoch_state(&state)?;
         Ok(state)
     }
 
@@ -422,6 +415,8 @@ fn validate_pending_activation(pending: &PendingActivation) -> Result<(), PackSt
             "pending activation transaction",
         ));
     }
+    validate_epoch_state(&pending.prior_epochs)?;
+    validate_epoch_state(&pending.next_epochs)?;
     let prior_floor = pending
         .prior_epochs
         .epochs
@@ -445,6 +440,19 @@ fn validate_pending_activation(pending: &PendingActivation) -> Result<(), PackSt
         return Err(PackStoreError::CorruptState(
             "pending activation epoch transition",
         ));
+    }
+    Ok(())
+}
+
+fn validate_epoch_state(state: &EpochState) -> Result<(), PackStoreError> {
+    if state.schema_version != STATE_SCHEMA_VERSION
+        || state.epochs.len() > 256
+        || state
+            .epochs
+            .values()
+            .any(|epoch| *epoch < EMBEDDED_MINIMUM_SECURITY_EPOCH)
+    {
+        return Err(PackStoreError::CorruptState("security epoch state"));
     }
     Ok(())
 }
@@ -1306,6 +1314,24 @@ mod tests {
         let epochs = store.load_epochs_strict().unwrap();
         assert_eq!(epochs.epochs.get(&epoch_three.pack_id), Some(&3));
         assert_eq!(store.current_fail_closed(), Some(epoch_three));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn activation_cannot_overflow_the_bounded_epoch_map() {
+        let (root, workers, state, verifier, _) = store_fixture("bounded-epochs");
+        let store = PackStore::new(&workers, &state, &verifier);
+        let installed = store.stage_and_install(&root.join("source")).unwrap();
+        let mut epochs = EpochState::empty();
+        for index in 0..256 {
+            epochs.epochs.insert(format!("other-pack-{index}"), 1);
+        }
+        store.persist_epochs(&epochs).unwrap();
+        assert!(matches!(
+            store.activate(&installed),
+            Err(PackStoreError::CorruptState("security epoch state"))
+        ));
+        assert_eq!(store.load_epochs_strict().unwrap(), epochs);
         fs::remove_dir_all(root).unwrap();
     }
 }
