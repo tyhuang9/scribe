@@ -112,3 +112,14 @@ reverified executable and final process image before the worker can advertise a
 capability. This binding is required before any production trust root or catalog
 may be provisioned. Merely verifying a pack directory or adding a public key is
 not sufficient to make a provider discoverable or launchable.
+
+The compile-time seam is `ResolverHelloBindingBridge` followed by
+`VerifiedPackLaunchBinding::try_from_resolver_hello_bridge`. The opaque binding
+can be created only when the resolver's reverified `VerifiedPack` exactly agrees
+with the worker Hello pack ID, version, digest, runtime ABI, backend, and provider,
+and the Hello supplies a canonical stable device identity. Production discovery
+must obtain those bindings from a concrete
+`discover_production_pack_launch_bindings` path and pass only them to
+`ProductionPackRegistry::from_launch_bindings`; it cannot insert a raw
+`VerifiedPack`. Stage 3 implements neither the bridge nor discovery path and
+constructs only `ProductionPackRegistry::empty()`.

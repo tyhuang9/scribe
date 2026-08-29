@@ -11,7 +11,7 @@ use super::store::{
     PackStoreError, atomic_write_canonical, exclusive_file_lock, read_canonical_state,
 };
 
-const HEALTH_SCHEMA_VERSION: u16 = 2;
+const HEALTH_SCHEMA_VERSION: u16 = 3;
 const MAX_RECORDS: usize = 128;
 const MAX_TEXT_BYTES: usize = 256;
 const RETRY_GRANT_SECONDS: u64 = 10 * 60;
@@ -100,8 +100,10 @@ struct HealthRecord {
 struct HealthEnvelope {
     schema_version: u16,
     witnesses: HealthWitnesses,
+    recovery_mode: bool,
     records: Vec<HealthRecord>,
     recovery_probes: Vec<RecoveryProbe>,
+    recovered_keys: Vec<HealthKey>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -117,8 +119,17 @@ impl HealthEnvelope {
         Self {
             schema_version: HEALTH_SCHEMA_VERSION,
             witnesses,
+            recovery_mode: false,
             records: Vec::new(),
             recovery_probes: Vec::new(),
+            recovered_keys: Vec::new(),
+        }
+    }
+
+    fn recovering(witnesses: HealthWitnesses) -> Self {
+        Self {
+            recovery_mode: true,
+            ..Self::empty(witnesses)
         }
     }
 }
@@ -155,7 +166,7 @@ impl<'a> HealthCache<'a> {
         let (envelope, invalid) = match load_cache(&path, &witnesses) {
             CacheLoad::Missing => (HealthEnvelope::empty(witnesses.clone()), false),
             CacheLoad::Valid(envelope) => (envelope, false),
-            CacheLoad::Invalid => (HealthEnvelope::empty(witnesses.clone()), true),
+            CacheLoad::Invalid => (HealthEnvelope::recovering(witnesses.clone()), true),
         };
         Self {
             path,
@@ -196,10 +207,12 @@ impl<'a> HealthCache<'a> {
         self.reload_locked();
         validate_key(&key)?;
         let now = self.clock.now_unix_seconds();
-        self.invalid = false;
         self.envelope
             .recovery_probes
             .retain(|probe| probe.key != key);
+        self.envelope
+            .recovered_keys
+            .retain(|recovered| recovered != &key);
         let record = match self.record_mut(&key) {
             Some(record) => {
                 record.failure_count = record.failure_count.saturating_add(1).min(3);
@@ -227,11 +240,8 @@ impl<'a> HealthCache<'a> {
         };
         let seconds = quarantine_seconds(record.failure_count);
         record.quarantined_until_unix_seconds = now.saturating_add(seconds);
-        let decision = HealthDecision::Quarantined {
-            until_unix_seconds: record.quarantined_until_unix_seconds,
-        };
         self.persist()?;
-        Ok(decision)
+        Ok(decision_from_envelope(&self.envelope, &key, now))
     }
 
     /// Grants one immediate attempt for an exact quarantined key. The grant is
@@ -242,7 +252,10 @@ impl<'a> HealthCache<'a> {
     ) -> Result<bool, HealthCacheError> {
         let _lock = exclusive_file_lock(&self.lock_path())?;
         self.reload_locked();
-        if self.invalid || self.recovery_probe(key).is_some() {
+        if self.invalid
+            || (self.envelope.recovery_mode && !self.is_recovered(key))
+            || self.recovery_probe(key).is_some()
+        {
             return Ok(false);
         }
         let now = self.clock.now_unix_seconds();
@@ -267,7 +280,10 @@ impl<'a> HealthCache<'a> {
     ) -> Result<bool, HealthCacheError> {
         let _lock = exclusive_file_lock(&self.lock_path())?;
         self.reload_locked();
-        if self.invalid || self.recovery_probe(key).is_some() {
+        if self.invalid
+            || (self.envelope.recovery_mode && !self.is_recovered(key))
+            || self.recovery_probe(key).is_some()
+        {
             return Ok(false);
         }
         let now = self.clock.now_unix_seconds();
@@ -296,13 +312,45 @@ impl<'a> HealthCache<'a> {
         validate_key(key)?;
         let now = self.clock.now_unix_seconds();
         if self.invalid {
-            self.envelope = HealthEnvelope::empty(self.witnesses.clone());
+            self.envelope = HealthEnvelope::recovering(self.witnesses.clone());
+        }
+        if self.envelope.recovery_mode {
+            if self.is_recovered(key) {
+                return Ok(true);
+            }
+            if let Some(record) = self.record_mut(key) {
+                record.successful_idle_probes =
+                    record.successful_idle_probes.saturating_add(1).min(2);
+                if record.successful_idle_probes < 2 {
+                    self.persist()?;
+                    return Ok(false);
+                }
+                self.envelope.records.retain(|record| &record.key != key);
+                self.envelope.recovered_keys.push(key.clone());
+                self.persist()?;
+                return Ok(true);
+            }
+            if let Some(probe) = self.recovery_probe_mut(key) {
+                probe.successful_idle_probes =
+                    probe.successful_idle_probes.saturating_add(1).min(2);
+                probe.last_probe_unix_seconds = now;
+                if probe.successful_idle_probes == 2 {
+                    self.envelope
+                        .recovery_probes
+                        .retain(|probe| &probe.key != key);
+                    self.envelope.recovered_keys.push(key.clone());
+                    self.persist()?;
+                    return Ok(true);
+                }
+                self.persist()?;
+                return Ok(false);
+            }
+            self.evict_if_full();
             self.envelope.recovery_probes.push(RecoveryProbe {
                 key: key.clone(),
                 successful_idle_probes: 1,
                 last_probe_unix_seconds: now,
             });
-            self.invalid = false;
             self.persist()?;
             return Ok(false);
         }
@@ -369,8 +417,33 @@ impl<'a> HealthCache<'a> {
             .find(|probe| &probe.key == key)
     }
 
+    fn is_recovered(&self, key: &HealthKey) -> bool {
+        self.envelope
+            .recovered_keys
+            .iter()
+            .any(|recovered| recovered == key)
+    }
+
     fn evict_if_full(&mut self) {
-        if self.envelope.records.len() < MAX_RECORDS {
+        if self.envelope.records.len()
+            + self.envelope.recovery_probes.len()
+            + self.envelope.recovered_keys.len()
+            < MAX_RECORDS
+        {
+            return;
+        }
+        if self.envelope.recovery_mode && !self.envelope.recovered_keys.is_empty() {
+            self.envelope.recovered_keys.remove(0);
+            return;
+        }
+        if let Some((index, _)) = self
+            .envelope
+            .recovery_probes
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, probe)| probe.last_probe_unix_seconds)
+        {
+            self.envelope.recovery_probes.remove(index);
             return;
         }
         if let Some((index, _)) = self
@@ -402,7 +475,7 @@ impl<'a> HealthCache<'a> {
                 self.invalid = false;
             }
             CacheLoad::Invalid => {
-                self.envelope = HealthEnvelope::empty(self.witnesses.clone());
+                self.envelope = HealthEnvelope::recovering(self.witnesses.clone());
                 self.invalid = true;
             }
         }
@@ -446,6 +519,14 @@ fn load_cache(path: &Path, witnesses: &HealthWitnesses) -> CacheLoad {
 }
 
 fn decision_from_envelope(envelope: &HealthEnvelope, key: &HealthKey, now: u64) -> HealthDecision {
+    if envelope.recovery_mode
+        && !envelope
+            .recovered_keys
+            .iter()
+            .any(|recovered| recovered == key)
+    {
+        return HealthDecision::InvalidOrUnprobed;
+    }
     if envelope
         .recovery_probes
         .iter()
@@ -492,10 +573,16 @@ fn quarantine_eligible_code(observation: FailureObservation) -> Option<FailureCo
 
 fn validate_envelope(envelope: &HealthEnvelope) -> Result<(), HealthCacheError> {
     if envelope.schema_version != HEALTH_SCHEMA_VERSION
-        || envelope.records.len() + envelope.recovery_probes.len() > MAX_RECORDS
+        || envelope.records.len() + envelope.recovery_probes.len() + envelope.recovered_keys.len()
+            > MAX_RECORDS
         || envelope.witnesses.app_build.is_empty()
         || envelope.witnesses.app_build.len() > MAX_TEXT_BYTES
         || !valid_sha256(&envelope.witnesses.device_set_digest)
+    {
+        return Err(HealthCacheError::InvalidCache);
+    }
+    if !envelope.recovery_mode
+        && (!envelope.recovery_probes.is_empty() || !envelope.recovered_keys.is_empty())
     {
         return Err(HealthCacheError::InvalidCache);
     }
@@ -514,6 +601,12 @@ fn validate_envelope(envelope: &HealthEnvelope) -> Result<(), HealthCacheError> 
     for probe in &envelope.recovery_probes {
         validate_key(&probe.key)?;
         if !keys.insert(&probe.key) || probe.successful_idle_probes != 1 {
+            return Err(HealthCacheError::InvalidCache);
+        }
+    }
+    for recovered in &envelope.recovered_keys {
+        validate_key(recovered)?;
+        if !keys.insert(recovered) {
             return Err(HealthCacheError::InvalidCache);
         }
     }
@@ -610,6 +703,17 @@ mod tests {
             driver_version: format!("551.23-{suffix}"),
             stable_device_identity: "pci:0000:01:00.0".to_owned(),
             model_digest: "b".repeat(64),
+        }
+    }
+
+    fn distinct_key(suffix: &str) -> HealthKey {
+        HealthKey {
+            pack_digest: "c".repeat(64),
+            runtime_abi: 1,
+            os_arch: "windows-x86_64".to_owned(),
+            driver_version: format!("552.44-{suffix}"),
+            stable_device_identity: "pci:0000:02:00.0".to_owned(),
+            model_digest: "e".repeat(64),
         }
     }
 
@@ -749,7 +853,7 @@ mod tests {
     }
 
     #[test]
-    fn witness_key_and_corrupt_cache_changes_invalidate_without_affecting_cpu() {
+    fn witness_key_changes_invalidate_without_affecting_cpu() {
         let root = temp_root("health-invalidation");
         let path = root.join("health.json");
         let clock = ManualClock::new(4_000_000);
@@ -795,16 +899,68 @@ mod tests {
             changed_device_set.decision(&original_key),
             HealthDecision::InvalidOrUnprobed
         );
-        fs::write(&path, b"{raw-error-and-path:C:\\private}").unwrap();
-        let mut corrupt = HealthCache::open(&path, witnesses("app-a"), &clock);
+        let recovered_key = distinct_key("witness-recovered");
+        let blocked_key = key("witness-blocked");
+        let mut changed_app = HealthCache::open(&path, witnesses("app-b"), &clock);
         assert_eq!(
-            corrupt.decision(&original_key),
+            changed_app.decision(&recovered_key),
+            HealthDecision::InvalidOrUnprobed
+        );
+        assert!(
+            !changed_app
+                .record_idle_probe_success(&recovered_key)
+                .unwrap()
+        );
+        assert!(
+            changed_app
+                .record_idle_probe_success(&recovered_key)
+                .unwrap()
+        );
+        assert_eq!(
+            changed_app.decision(&recovered_key),
+            HealthDecision::Available
+        );
+        assert_eq!(
+            changed_app.decision(&blocked_key),
+            HealthDecision::InvalidOrUnprobed
+        );
+        drop(changed_app);
+
+        let reopened = HealthCache::open(&path, witnesses("app-b"), &clock);
+        assert_eq!(reopened.decision(&recovered_key), HealthDecision::Available);
+        assert_eq!(
+            reopened.decision(&blocked_key),
+            HealthDecision::InvalidOrUnprobed
+        );
+        let reset_by_witness = HealthCache::open(&path, witnesses("app-c"), &clock);
+        assert_eq!(
+            reset_by_witness.decision(&recovered_key),
+            HealthDecision::InvalidOrUnprobed
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn corrupt_cache_recovery_is_persisted_and_exact_key_fail_closed() {
+        let root = temp_root("health-corrupt-exact-recovery");
+        let path = root.join("health.json");
+        let clock = ManualClock::new(4_500_000);
+        let recovered_key = key("recovered-a");
+        let blocked_key = distinct_key("blocked-b");
+        fs::write(&path, b"{raw-error-and-path:C:\\private}").unwrap();
+        let mut corrupt = HealthCache::open(&path, witnesses("corrupt"), &clock);
+        assert_eq!(
+            corrupt.decision(&recovered_key),
+            HealthDecision::InvalidOrUnprobed
+        );
+        assert_eq!(
+            corrupt.decision(&blocked_key),
             HealthDecision::InvalidOrUnprobed
         );
 
-        let projection = corrupt.quarantine_projection_for(&original_key);
+        let projection = corrupt.quarantine_projection_for(&blocked_key);
         let mut candidates = vec![
-            gpu(&original_key),
+            gpu(&blocked_key),
             BackendCandidate::available(BackendTarget::cpu()),
         ];
         apply_quarantine_projection(&mut candidates, &projection);
@@ -813,13 +969,59 @@ mod tests {
             CandidateAvailability::Quarantined
         );
         assert_eq!(candidates[1].availability, CandidateAvailability::Available);
-        assert!(!corrupt.record_idle_probe_success(&original_key).unwrap());
+        assert!(!corrupt.record_idle_probe_success(&recovered_key).unwrap());
         assert_eq!(
-            corrupt.decision(&original_key),
+            corrupt.decision(&recovered_key),
             HealthDecision::InvalidOrUnprobed
         );
-        assert!(corrupt.record_idle_probe_success(&original_key).unwrap());
-        assert_eq!(corrupt.decision(&original_key), HealthDecision::Available);
+        assert_eq!(
+            corrupt.decision(&blocked_key),
+            HealthDecision::InvalidOrUnprobed
+        );
+
+        let mut reopened = HealthCache::open(&path, witnesses("corrupt"), &clock);
+        assert_eq!(
+            reopened.decision(&recovered_key),
+            HealthDecision::InvalidOrUnprobed
+        );
+        assert!(reopened.record_idle_probe_success(&recovered_key).unwrap());
+        assert_eq!(reopened.decision(&recovered_key), HealthDecision::Available);
+        assert_eq!(
+            reopened.decision(&blocked_key),
+            HealthDecision::InvalidOrUnprobed
+        );
+        drop(reopened);
+
+        let mut reopened = HealthCache::open(&path, witnesses("corrupt"), &clock);
+        assert_eq!(reopened.decision(&recovered_key), HealthDecision::Available);
+        assert_eq!(
+            reopened
+                .record_provider_failure(recovered_key.clone(), FailureCode::WorkerCrash)
+                .unwrap(),
+            HealthDecision::InvalidOrUnprobed
+        );
+        assert!(!reopened.grant_explicit_retry(&recovered_key).unwrap());
+        assert!(!reopened.consume_explicit_retry(&recovered_key).unwrap());
+        assert_eq!(
+            reopened.decision(&blocked_key),
+            HealthDecision::InvalidOrUnprobed
+        );
+
+        assert!(!reopened.record_idle_probe_success(&recovered_key).unwrap());
+        reopened
+            .record_provider_failure(recovered_key.clone(), FailureCode::Protocol)
+            .unwrap();
+        assert!(!reopened.record_idle_probe_success(&recovered_key).unwrap());
+        assert_eq!(
+            reopened.decision(&recovered_key),
+            HealthDecision::InvalidOrUnprobed
+        );
+        assert!(reopened.record_idle_probe_success(&recovered_key).unwrap());
+        assert_eq!(reopened.decision(&recovered_key), HealthDecision::Available);
+        assert_eq!(
+            reopened.decision(&blocked_key),
+            HealthDecision::InvalidOrUnprobed
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -195,6 +195,29 @@ fn production_source_for(_path: &Path, source: &str) -> String {
     production_source(source)
 }
 
+fn production_pack_provisioning_allowed(
+    registry_body: &str,
+    worker: &str,
+    trust_root_is_empty: bool,
+) -> bool {
+    let registry_is_empty = registry_body.contains("ProductionPackRegistry::empty()")
+        && !registry_body.contains("from_launch_bindings");
+    let registry_routes_concrete_bridge = registry_body
+        .contains("crate::onnx_worker::discover_production_pack_launch_bindings")
+        && registry_body.contains("ProductionPackRegistry::from_launch_bindings");
+    let concrete_resolver_hello_flow = worker
+        .contains("fn discover_production_pack_launch_bindings(")
+        && worker.contains("impl ResolverHelloBindingBridge for")
+        && worker.contains("VerifiedPackLaunchBinding::try_from_resolver_hello_bridge")
+        && worker.contains("trait WorkerExecutableResolver")
+        && worker.contains("Hello");
+    (registry_is_empty && trust_root_is_empty)
+        || (!registry_is_empty
+            && !trust_root_is_empty
+            && registry_routes_concrete_bridge
+            && concrete_resolver_hello_flow)
+}
+
 #[test]
 fn cfg_test_stripping_preserves_later_production_for_lf_and_crlf() {
     let fixture = r###"fn before() { let _ = "}"; }
@@ -218,6 +241,44 @@ fn after() { let _ = "production-after"; }
         assert!(!production.contains("fn hidden()"));
         assert!(!production.contains("hidden_field"));
     }
+}
+
+#[test]
+fn stage_four_guard_rejects_dead_binding_declarations() {
+    let populated_registry = r#"{
+        ProductionPackRegistry::from_launch_bindings(
+            crate::onnx_worker::discover_production_pack_launch_bindings()
+        )
+    "#;
+    let dead_declarations = r#"
+        struct VerifiedPackLaunchBinding;
+        trait WorkerExecutableResolver {}
+        struct Hello;
+    "#;
+    assert!(!production_pack_provisioning_allowed(
+        populated_registry,
+        dead_declarations,
+        false,
+    ));
+
+    let concrete_flow = r#"
+        trait WorkerExecutableResolver {}
+        struct Hello;
+        impl ResolverHelloBindingBridge for ConcreteResolverHelloBridge {}
+        fn discover_production_pack_launch_bindings() {
+            VerifiedPackLaunchBinding::try_from_resolver_hello_bridge(&bridge);
+        }
+    "#;
+    assert!(production_pack_provisioning_allowed(
+        populated_registry,
+        concrete_flow,
+        false,
+    ));
+    assert!(production_pack_provisioning_allowed(
+        "{ ProductionPackRegistry::empty() ",
+        "",
+        true,
+    ));
 }
 
 #[test]
@@ -655,11 +716,11 @@ fn verified_worker_pack_stage_remains_fail_closed_and_provider_inert() {
         .split("#[cfg(test)]")
         .next()
         .expect("manifest has a production section");
-    let registry_is_empty = module
-        .split("pub(crate) fn production_registry() -> Vec<VerifiedPack>")
+    let registry_body = module
+        .split("pub(crate) fn production_registry() -> ProductionPackRegistry")
         .nth(1)
         .and_then(|source| source.split('}').next())
-        .is_some_and(|body| body.contains("Vec::new()"));
+        .expect("production registry function remains structurally visible");
     assert!(production_manifest.contains("struct ProductionTrustRoot"));
     assert!(production_manifest.contains("fn public_key(&self, _key_id: &str) -> Option<&[u8]>"));
     let trust_root_is_empty = production_manifest
@@ -667,22 +728,28 @@ fn verified_worker_pack_stage_remains_fail_closed_and_provider_inert() {
         .nth(1)
         .and_then(|source| source.split('}').next())
         .is_some_and(|body| body.contains("None"));
-    let stage_four_binding_exists = [
-        "VerifiedPackLaunchBinding",
-        "pack_id",
-        "pack_version",
-        "pack_digest",
-        "backend",
-        "provider",
-        "stable_device_identity",
-    ]
-    .iter()
-    .all(|marker| worker.contains(marker))
-        && worker.contains("trait WorkerExecutableResolver")
-        && worker.contains("Hello");
+    for required in [
+        "trait ResolverHelloBindingBridge",
+        "struct VerifiedPackLaunchBinding",
+        "bindings: Vec<VerifiedPackLaunchBinding>",
+        "from_launch_bindings(bindings: Vec<VerifiedPackLaunchBinding>)",
+        "try_from_resolver_hello_bridge",
+        "bridge.hello_pack_id() == pack.pack_id",
+        "bridge.hello_pack_version() == pack.pack_version",
+        "bridge.hello_pack_digest() == pack.pack_digest",
+        "bridge.hello_runtime_abi() == pack.runtime_abi_version",
+        "bridge.hello_backend() == pack.backend",
+        "bridge.hello_provider() == pack.provider",
+        "hello_stable_device_identity",
+    ] {
+        assert!(
+            module.contains(required),
+            "typed Stage 4 production provisioning gate lost {required:?}"
+        );
+    }
     assert!(
-        stage_four_binding_exists || (registry_is_empty && trust_root_is_empty),
-        "production pack trust/catalog cannot be provisioned before Stage 4 binds the exact verified pack and stable device through WorkerExecutableResolver and Hello"
+        production_pack_provisioning_allowed(registry_body, worker, trust_root_is_empty),
+        "production pack trust/catalog cannot be provisioned before production discovery consumes concrete typed bindings created by WorkerExecutableResolver and Hello validation"
     );
     for required in [
         "Stage 4",
