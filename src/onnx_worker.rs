@@ -5462,6 +5462,7 @@ struct VerifiedGpuRouteCatalog {
     diagnostic: Option<String>,
     device_set_digest: String,
     discovery_fingerprint: String,
+    provider_probe_incomplete: bool,
 }
 
 const GPU_PROVIDER_PROBE_BACKOFF: Duration = Duration::from_secs(15);
@@ -5488,31 +5489,41 @@ enum GpuRouteCatalogLookup {
 
 impl GpuRouteCatalogCache {
     fn lookup(&self, discovery_fingerprint: &str, now: Instant) -> GpuRouteCatalogLookup {
-        if let Some(catalog) = self.successful.as_ref().filter(|catalog| {
+        let successful = self.successful.as_ref().filter(|catalog| {
             !catalog.routes.is_empty() && catalog.discovery_fingerprint == discovery_fingerprint
-        }) {
-            return GpuRouteCatalogLookup::Successful(catalog.clone());
+        });
+        if let Some(failed) = self
+            .failed
+            .as_ref()
+            .filter(|failed| failed.discovery_fingerprint == discovery_fingerprint)
+        {
+            if now >= failed.retry_not_before {
+                return GpuRouteCatalogLookup::Probe;
+            }
+            return successful.map_or_else(
+                || GpuRouteCatalogLookup::Backoff(failed.diagnostic.clone()),
+                |catalog| GpuRouteCatalogLookup::Successful(catalog.clone()),
+            );
         }
-        if let Some(failed) = self.failed.as_ref().filter(|failed| {
-            failed.discovery_fingerprint == discovery_fingerprint && now < failed.retry_not_before
-        }) {
-            return GpuRouteCatalogLookup::Backoff(failed.diagnostic.clone());
+        if let Some(catalog) = successful {
+            return GpuRouteCatalogLookup::Successful(catalog.clone());
         }
         GpuRouteCatalogLookup::Probe
     }
 
     fn record_probe(&mut self, catalog: VerifiedGpuRouteCatalog, now: Instant) {
-        if catalog.routes.is_empty() {
+        let routes_empty = catalog.routes.is_empty();
+        let retry_required = routes_empty || catalog.provider_probe_incomplete;
+        self.failed = retry_required.then(|| FailedGpuProbe {
+            discovery_fingerprint: catalog.discovery_fingerprint.clone(),
+            retry_not_before: now + GPU_PROVIDER_PROBE_BACKOFF,
+            diagnostic: catalog.diagnostic.clone(),
+            explicit_retry_available: true,
+        });
+        if routes_empty {
             self.successful = None;
-            self.failed = Some(FailedGpuProbe {
-                discovery_fingerprint: catalog.discovery_fingerprint,
-                retry_not_before: now + GPU_PROVIDER_PROBE_BACKOFF,
-                diagnostic: catalog.diagnostic,
-                explicit_retry_available: true,
-            });
         } else {
             self.successful = Some(catalog);
-            self.failed = None;
         }
     }
 
@@ -5801,6 +5812,13 @@ fn verified_gpu_route_catalog(
     discovery_fingerprint: String,
 ) -> VerifiedGpuRouteCatalog {
     let (bindings, diagnostics) = registry.into_parts();
+    let provider_probe_incomplete = diagnostics.iter().any(|diagnostic| {
+        matches!(
+            diagnostic.issue,
+            crate::gpu_worker_pack::PackDiscoveryIssue::ProviderProbeRejected
+                | crate::gpu_worker_pack::PackDiscoveryIssue::DriverVersionUnavailable
+        )
+    });
     let mut routes = bindings
         .into_iter()
         .map(|binding| {
@@ -5851,6 +5869,7 @@ fn verified_gpu_route_catalog(
         diagnostic: (!diagnostic.is_empty()).then_some(diagnostic),
         device_set_digest,
         discovery_fingerprint,
+        provider_probe_incomplete,
     }
 }
 
@@ -6176,6 +6195,7 @@ impl InferenceWorkerRegistry {
                 diagnostic,
                 device_set_digest: verified_gpu_device_set_digest(&[]),
                 discovery_fingerprint,
+                provider_probe_incomplete: true,
             },
             GpuRouteCatalogLookup::Probe => {
                 self.retire_active_worker()?;
@@ -9567,6 +9587,7 @@ mod tests {
             routes: Arc::new(routes),
             diagnostic: None,
             discovery_fingerprint: "test-catalog".to_owned(),
+            provider_probe_incomplete: false,
         }
     }
 
@@ -10448,6 +10469,7 @@ mod tests {
                     routes: gpu_routes,
                     diagnostic: Some("fixture-only hardware smoke".to_owned()),
                     discovery_fingerprint: "fixture-hardware-smoke".to_owned(),
+                    provider_probe_incomplete: false,
                 }),
             };
             let artifact = RuntimeArtifact::Gguf(RuntimeModel {
@@ -10644,6 +10666,86 @@ mod tests {
     }
 
     #[test]
+    fn mixed_gpu_probe_failure_retries_without_discarding_healthy_routes() {
+        let first_probe_completed_at = Instant::now();
+        let mut cache = GpuRouteCatalogCache::default();
+        let mut cuda_failed_vulkan_succeeded = verified_gpu_catalog(vec![verified_gpu_route(
+            BackendKind::Vulkan,
+            "native:pci:0000:01:00.0",
+            "windows-display:32.0.16.1088",
+            'a',
+        )]);
+        cuda_failed_vulkan_succeeded.provider_probe_incomplete = true;
+        cuda_failed_vulkan_succeeded.diagnostic =
+            Some("CUDA provider probe was rejected".to_owned());
+
+        cache.record_probe(
+            cuda_failed_vulkan_succeeded.clone(),
+            first_probe_completed_at,
+        );
+        assert!(matches!(
+            cache.lookup("test-catalog", first_probe_completed_at),
+            GpuRouteCatalogLookup::Successful(catalog)
+                if catalog.routes.len() == 1
+                    && catalog.routes[0].provider == WorkerProvider::Vulkan
+        ));
+        assert!(matches!(
+            cache.lookup("changed-catalog", first_probe_completed_at),
+            GpuRouteCatalogLookup::Probe
+        ));
+
+        let explicit_retry_at = first_probe_completed_at + Duration::from_secs(1);
+        assert!(cache.grant_explicit_probe_retry("test-catalog", explicit_retry_at));
+        assert!(!cache.grant_explicit_probe_retry("test-catalog", explicit_retry_at));
+        assert!(matches!(
+            cache.lookup("test-catalog", explicit_retry_at),
+            GpuRouteCatalogLookup::Probe
+        ));
+
+        let retry_completed_at = explicit_retry_at + Duration::from_secs(20);
+        cache.record_probe(cuda_failed_vulkan_succeeded, retry_completed_at);
+        assert!(matches!(
+            cache.lookup(
+                "test-catalog",
+                retry_completed_at + GPU_PROVIDER_PROBE_BACKOFF - Duration::from_millis(1),
+            ),
+            GpuRouteCatalogLookup::Successful(catalog)
+                if catalog.routes.len() == 1
+                    && catalog.routes[0].provider == WorkerProvider::Vulkan
+        ));
+        assert!(matches!(
+            cache.lookup(
+                "test-catalog",
+                retry_completed_at + GPU_PROVIDER_PROBE_BACKOFF,
+            ),
+            GpuRouteCatalogLookup::Probe
+        ));
+
+        let recovered = verified_gpu_catalog(vec![
+            verified_gpu_route(
+                BackendKind::Cuda,
+                "native:pci:0000:01:00.0",
+                "windows-display:32.0.16.1088",
+                'b',
+            ),
+            verified_gpu_route(
+                BackendKind::Vulkan,
+                "native:pci:0000:01:00.0",
+                "windows-display:32.0.16.1088",
+                'a',
+            ),
+        ]);
+        cache.record_probe(recovered, retry_completed_at + GPU_PROVIDER_PROBE_BACKOFF);
+        assert!(matches!(
+            cache.lookup(
+                "test-catalog",
+                retry_completed_at + GPU_PROVIDER_PROBE_BACKOFF * 2,
+            ),
+            GpuRouteCatalogLookup::Successful(catalog) if catalog.routes.len() == 2
+        ));
+    }
+
+    #[test]
     fn active_route_ownership_retires_cpu_gpu_and_device_switches() {
         let cpu_launcher = Arc::new(TestLauncher::new([TestMode::Normal, TestMode::Normal]));
         let gpu_one_launcher = Arc::new(TestLauncher::new([TestMode::Normal]));
@@ -10820,6 +10922,7 @@ mod tests {
                 routes: gpu_routes,
                 diagnostic: None,
                 discovery_fingerprint: "test-catalog".to_owned(),
+                provider_probe_incomplete: false,
             }),
         };
         assert!(
