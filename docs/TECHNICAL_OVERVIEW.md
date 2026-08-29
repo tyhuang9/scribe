@@ -17,7 +17,7 @@ egui UI / tray / global hotkey
   TranscriptionService (runtime-neutral interface)
             |
             v
- InferenceWorkerRegistry (release CPU route; opt-in Vulkan dev route)
+ InferenceWorkerRegistry (CPU plus verified explicit-GPU pack routes)
             |
             v  private anonymous stdin/stdout pipes (SCIF v5)
  dedicated child: scribe-inference-worker --scribe-inference-worker
@@ -37,7 +37,7 @@ The UI does not select or invoke a runtime directly. The application-facing `Tra
 
 The adjacent `scribe-inference-worker` executable is the single persistent STT process: it directly owns the worker-local router and both native runtime families (GGUF and receipt-backed Sherpa ONNX). Before every launch the desktop verifies the exact canonical sibling, rejects links/reparse points, hardlinks, ADS/case aliases and out-of-root paths, and compares the file identity and SHA-256 against the release-compiled trust anchor. Release builds fail closed if that worker-first SHA-256 anchor is absent. VAD intentionally remains a separate instance of the desktop executable launched with `--scribe-vad-worker`; it has no STT commands. The workers communicate only through private anonymous stdin/stdout pipes using SCIF v5. Hello is the first command and occurs exactly once; its capability exchange binds a fresh random challenge, immutable desktop and role-specific worker build revisions, the worker image SHA-256, ABI, role, compiled provider, and supported artifact targets to the process generation. The child validates the build/protocol expectation; the parent exclusively owns exact-path, file-identity, and final-image digest verification and validates the digest echoed by the child. Worker stdout is protocol-only and diagnostics go to stderr. Worker launch clears the environment and restores only required OS variables, and Windows DLL loading is restricted before native runtime initialization. There is no localhost listener, TCP/HTTP inference transport, nested ONNX worker, Python runtime, dynamic runtime package, or CLI fallback.
 
-Official Stage 3 packaging still contains only the CPU route. `Auto` and `CPU` use it; explicit `GPU` returns a clear error and cannot silently fall back to CPU. The private infrastructure now verifies canonical Ed25519-signed GPU worker-pack manifests, stages verified bytes into immutable version/digest directories, maintains atomic current/previous activation with a security-epoch high-water mark, and persists bounded device/model-specific health quarantine. Production has no pack public key and registry discovery is empty, so no CUDA, Vulkan, or Metal pack can become available. Windows developers may still build an adjacent Vulkan worker and matching desktop with `scripts/build-vulkan-worker-dev.ps1`; that opt-in build is not a release package or an Auto-qualification claim. GPU pack publication, provider selection, downloads, and Auto qualification remain later stages. See [Verified GPU worker-pack infrastructure](GPU_WORKER_PACKS.md).
+Stage 4 can discover and launch signed Windows x64 CUDA/Vulkan GGUF workers from the installer’s immutable pack catalog for explicit `GPU`. Discovery produces one opaque candidate per stable PCI device, challenge-binds the exact pack/backend/provider/device/driver/memory facts to SCIF Hello, and remaps the current provider index on each start. Explicit GPU has bounded pre-output fallback across GPU devices/backends and never falls back to CPU. One active route owns the sole warm inference worker; switching CPU/GPU/device or failing a route retires the prior worker. `Auto` continues to use CPU and reports why verified GPU candidates are skipped; it never probes a provider. The production public trust root is intentionally empty, so current ordinary releases contain an empty catalog and an opt-in nonempty release fails closed pending separate public-key review and CI secret provisioning. Windows developers can build fixture-signed Vulkan packs for isolated hardware smoke, but fixture trust cannot enter release packaging. Downloads, telemetry, ONNX GPU, Metal/macOS, Linux, and Auto performance qualification remain out of scope. See [Verified GPU worker-pack infrastructure](GPU_WORKER_PACKS.md).
 
 Normal GGUF remains local, native, CPU-only, and Python-free, but it is process-isolated rather than in-process. Receipt-backed ONNX inference uses the same private persistent STT child. Installation smoke runs in a fresh disposable worker process and is not the normal dictation worker.
 
@@ -78,8 +78,11 @@ cargo build --all-features
 
 On Windows, all-feature checks require the pinned Vulkan SDK. They compile the
 developer backend but do not create a release bundle. Use
-`scripts/build-windows-release.ps1` for the official CPU-only package, or
-`scripts/build-vulkan-worker-dev.ps1` for adjacent debug Vulkan binaries.
+`scripts/build-windows-release.ps1` for the CPU-safe package,
+`scripts/build-windows-gpu-worker-pack.ps1` for one pinned fixture/production
+pack, or `scripts/build-vulkan-worker-dev.ps1` for adjacent debug binaries.
+The release workflow’s GPU-pack input stays off by default and fails closed
+without matching reviewed production trust and an external signing secret.
 
 The documentation site lives in `website/` and is checked independently:
 

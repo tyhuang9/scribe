@@ -1,9 +1,40 @@
 # Verified GPU worker-pack infrastructure
 
-Stage 3 establishes a dormant security and persistence boundary for future
-external GGUF GPU workers. It does not ship a production CUDA, Vulkan, or Metal
-worker, enable downloads, change `Auto`, or make a GPU provider discoverable.
-The production trust root and registry are intentionally empty.
+Stage 4 implements bundled Windows x64 CUDA and Vulkan GGUF worker packs behind
+the verified Stage 3 boundary. A pack becomes an explicit-GPU candidate only
+after signed catalog discovery, retained no-follow verification, a bounded
+provider probe, challenge-bound SCIF Hello reconciliation, and authoritative
+per-device Windows driver mapping. `Auto` remains deliberately default-denied
+to GPU until Stage 5 hardware qualification. The checked-in production trust
+root is still empty, so ordinary releases remain CPU-only and a requested
+nonempty GPU release fails closed until a separately reviewed public key and CI
+signing secret are provisioned.
+
+## Current Stage 4 behavior
+
+- Windows x64 discovers at most eight immutable packs and at most sixteen
+  bounded devices per provider probe. It produces one opaque launch binding per
+  stable device identity and sorts CUDA before Vulkan, then stable identity.
+- Explicit `GPU` tries at most four verified GPU routes, advances only after a
+  pre-output provider/worker failure, and never falls back to CPU. Cancellation,
+  invalid input, model corruption, decode/content failure, and partial output
+  are never replayed.
+- The current process index is remapped from the stable PCI identity on every
+  actual start. Hello must agree with the parent-observed backend, provider,
+  vendor, class, identity, current index, driver, and bounded memory snapshot.
+- Windows SetupAPI supplies the selected device's bounded canonical driver
+  identity without loading a GPU provider into the desktop. Missing driver
+  identity makes the candidate incompatible instead of producing an unbound
+  health key.
+- One registry-wide route owns the sole inference worker/model. CPU/GPU and
+  GPU-device switches retire the previous worker; failed fallback workers are
+  retired; only the winner retains the existing five-minute warm model.
+- Repeated explicit-GPU requests reuse the verified catalog while a cheap
+  signed-catalog generation plus SetupAPI device/driver fingerprint is
+  unchanged. A changed fingerprint retires the warm worker before re-probing.
+- GPU health uses the exact pack/runtime/OS/driver/device/model key described
+  below. `Auto` performs catalog diagnostics only and never launches a provider
+  probe.
 
 ## Signed envelope and digest
 
@@ -123,40 +154,46 @@ roots. It invokes the compiled production verifier before and after copying,
 stages the immutable layout, writes the bounded catalog, reports installed and
 compressed sizes, and generates the installer preflight allowlist. Every pack
 file is also included in the top-level bundle inventory, preserving portable
-and installer parity. The normal catalog is empty.
+and installer parity. The normal catalog is empty until production trust is
+provisioned. When a release includes packs, the same catalog is inside the
+portable payload and the installer copies that exact tree; CI emits a separate
+per-pack installed and compressed size report from the verified catalog.
 
-Repository tooling does not sign packs and contains no production private key.
-Publication must remain disabled until a persistent production public key is
-reviewed into the application and the matching private key is supplied only
-through an explicit external signing path or masked CI secret. Test keys are
-fixture-only and must never be promoted.
+Repository tooling contains no production private key. The opt-in release job
+accepts only an externally supplied base64 PKCS#8 CI secret and reviewed key ID,
+materializes the key under the runner temporary directory for the signing step,
+zeroes its decoded byte buffer, and deletes the file in `finally`. The authoring
+tool verifies that its public key exactly matches the separately reviewed key
+embedded in `ProductionTrustRoot`. Because no production public key is checked
+in today, this gate rejects every requested nonempty GPU release. The normal
+CPU-only build remains usable. The deterministic seed and key ID used by
+tooling tests and local hardware smoke are fixture-only and cannot verify under
+production trust.
 
-## Stage 4 launch binding prerequisite
+## Stage 4 launch binding
 
-Stage 4 must add one typed launch descriptor that carries the verified pack
+Stage 4 adds a typed launch descriptor that carries the verified pack
 ID/version/digest, backend/provider, runtime ABI, target OS/architecture, and
 stable device identity through `WorkerExecutableResolver`. The same facts must
 be challenge-bound into the worker `Hello` exchange and compared with the
 reverified executable and final process image before the worker can advertise a
-capability. This binding is required before any production trust root or catalog
-may be provisioned. Merely verifying a pack directory or adding a public key is
-not sufficient to make a provider discoverable or launchable.
+capability. Merely verifying a pack directory or adding a public key is not
+sufficient to make a provider discoverable or launchable.
 
 The compile-time seam is `ResolverHelloBindingBridge` followed by
 `VerifiedPackLaunchBinding::try_from_resolver_hello_bridge`. The opaque binding
 can be created only from an `Arc<VerifiedPackLease>` retained by the resolver,
 and only when its descriptor exactly agrees with the worker Hello pack ID,
 version, digest, runtime ABI, backend, and provider and the Hello supplies a
-canonical stable device identity. Stage 4 must retain that lease through exact
+canonical stable device identity. The Windows resolver retains that lease through exact
 worker/dependency handle launch and final image/Hello validation; it must never
 reconstruct launch authority from `VerifiedPack::root`. Production discovery
-must obtain those bindings from a concrete
+obtains those bindings from the concrete
 `discover_production_pack_launch_bindings` path and pass only them to
 `ProductionPackRegistry::from_launch_bindings`; it cannot insert a raw
-`VerifiedPack`. Stage 3 implements neither the bridge nor discovery path and
-constructs only `ProductionPackRegistry::empty()`.
+`VerifiedPack`.
 
-Windows is the first intended production target: its future resolver must keep
+Windows is the implemented Stage 4 target: its resolver keeps
 the verified directory/file lease alive through exact-image launch and the
 challenge-bound Hello check. Unix production remains fail closed. Before a
 Unix catalog or trust root can become nonempty, the resolver bridge must also
@@ -176,3 +213,25 @@ remain fail closed until an equivalent descriptor-relative execution primitive
 is implemented and tested. The architecture guard scopes this prohibition to
 the verified-pack provider launch function; unrelated process launches do not
 satisfy or trip the gate.
+
+## Build and verification commands
+
+`scripts/build-windows-gpu-worker-pack.ps1` builds one deterministic fixture or
+production pack from the pinned contract in
+`runtime-manifests/gpu-worker-toolchain-windows-x64.json`.
+`scripts/prepare-windows-gpu-worker-packs.ps1` is the production-only two-pack
+orchestrator used by the opt-in release job. It requires exact Rust 1.96.0,
+CMake 4.4.2, MSVC 14.44.35207, the reviewed Sherpa archive, Vulkan SDK
+1.4.357.0, and CUDA Toolkit/nvcc 12.8.93. Missing tools fail with a specific
+gate; the scripts never download an unapproved SDK. Developer outputs are
+ignored and every pack build requires clean tracked source and a fresh Cargo
+target.
+
+`scripts/test-windows-gpu-worker-pack-tools.ps1` exercises deterministic
+fixture authoring plus signature, key, tamper, unexpected-file/DLL, ADS,
+junction, and hardlink rejection. The Rust suites cover downgrade floors,
+catalog mismatch, challenge/ABI/pack/device identity mismatch, multi-device
+remapping, bounded fallback, quarantine privacy/timing, and no-replay rules.
+`scripts/test-windows-release-packaging.ps1` and
+`scripts/verify-windows-release-package.ps1` enforce exact catalog/inventory,
+installer allowlist, portable/installer parity, and hostile filesystem cases.
