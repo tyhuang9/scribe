@@ -189,6 +189,7 @@ jobs:
           } catch {
             throw 'GPU pack signing secret is not canonical base64.'
           }
+          $env:GPU_PACK_PRIVATE_KEY_BASE64 = $null
           if ($keyBytes.Length -lt 32 -or $keyBytes.Length -gt 16384) {
             throw 'GPU pack signing secret has an invalid bounded size.'
           }
