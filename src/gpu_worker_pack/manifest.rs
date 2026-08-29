@@ -3,6 +3,11 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 
+#[cfg(unix)]
+use std::ffi::CString;
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, FromRawFd};
+
 use ring::signature::{ED25519, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -137,6 +142,131 @@ impl VerifiedPack {
     }
 }
 
+/// Retained filesystem authority for one verified immutable pack.  The
+/// descriptor is metadata only; callers that need executable authority must
+/// retain this value so each immutable-store ancestor remains pinned.
+pub(crate) struct VerifiedPackLease {
+    verified_pack: VerifiedPack,
+    root: PinnedPackRoot,
+    _retained_files: Vec<File>,
+}
+
+impl std::fmt::Debug for VerifiedPackLease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("VerifiedPackLease")
+            .field("verified_pack", &self.verified_pack)
+            .finish_non_exhaustive()
+    }
+}
+
+impl VerifiedPackLease {
+    pub(crate) fn verified_pack(&self) -> &VerifiedPack {
+        &self.verified_pack
+    }
+
+    pub(crate) fn worker_path(&self) -> PathBuf {
+        self.verified_pack.worker_path()
+    }
+
+    pub(crate) fn recheck(&self) -> Result<(), PackVerificationError> {
+        self.root.recheck()
+    }
+}
+
+/// Borrowed launch authority. Its lifetime prevents the retained pack lease
+/// from being dropped before Stage 2 consumes the exact worker target.
+pub(crate) struct LaunchableWorker<'lease> {
+    path: PathBuf,
+    _lease: &'lease VerifiedPackLease,
+}
+
+impl LaunchableWorker<'_> {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// A no-follow handle chain from the canonical pack store root through the
+/// exact pack-id/version/digest components.
+pub(crate) struct PinnedPackRoot {
+    path: PathBuf,
+    handles: Vec<File>,
+}
+
+impl PinnedPackRoot {
+    pub(crate) fn open(
+        canonical_store_root: &Path,
+        components: [&StoreComponent; 2],
+        digest: &str,
+    ) -> Result<Self, PackVerificationError> {
+        if !components.iter().all(|component| component.is_canonical())
+            || !is_canonical_sha256(digest)
+        {
+            return Err(PackVerificationError::UnsafePackStoreAncestor(
+                canonical_store_root.to_path_buf(),
+            ));
+        }
+        open_pinned_pack_root(canonical_store_root, components, digest)
+    }
+
+    fn verification_root(&self) -> PathBuf {
+        #[cfg(target_os = "linux")]
+        {
+            return PathBuf::from(format!(
+                "/proc/self/fd/{}",
+                self.handles.last().expect("digest handle").as_raw_fd()
+            ));
+        }
+        #[cfg(all(unix, not(target_os = "linux")))]
+        {
+            return PathBuf::from(format!(
+                "/dev/fd/{}",
+                self.handles.last().expect("digest handle").as_raw_fd()
+            ));
+        }
+        #[cfg(windows)]
+        {
+            self.path.clone()
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            self.path.clone()
+        }
+    }
+
+    fn open_regular(&self, relative: &Path) -> Result<File, PackVerificationError> {
+        #[cfg(unix)]
+        {
+            return open_regular_at(
+                self.handles.last().expect("digest handle").as_raw_fd(),
+                relative,
+            );
+        }
+        #[cfg(windows)]
+        {
+            open_regular_no_follow(&self.path.join(relative))
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = relative;
+            Err(PackVerificationError::UnsupportedLeasePlatform)
+        }
+    }
+
+    fn recheck(&self) -> Result<(), PackVerificationError> {
+        let mut path = self.path.clone();
+        for handle in self.handles.iter().rev() {
+            if same_directory_identity(handle, &path)? {
+                path.pop();
+            } else {
+                return Err(PackVerificationError::PackStoreAncestorChanged(path));
+            }
+        }
+        Ok(())
+    }
+}
+
 pub(crate) trait TrustRoot: Send + Sync {
     fn public_key(&self, key_id: &str) -> Option<&[u8]>;
 }
@@ -186,10 +316,41 @@ impl<'a> PackVerifier<'a> {
     }
 
     pub(crate) fn verify(&self, root: &Path) -> Result<VerifiedPack, PackVerificationError> {
-        validate_root(root)?;
-        let manifest_bytes = read_bounded_regular(&root.join(MANIFEST_NAME), MAX_MANIFEST_BYTES)?;
-        let signature_bytes =
-            read_bounded_regular(&root.join(SIGNATURE_NAME), MAX_SIGNATURE_BYTES)?;
+        let (verified, _) = self.verify_inner(root, None)?;
+        Ok(verified)
+    }
+
+    pub(crate) fn verify_pinned(
+        &self,
+        root: PinnedPackRoot,
+    ) -> Result<VerifiedPackLease, PackVerificationError> {
+        root.recheck()?;
+        let verification_root = root.verification_root();
+        let (verified_pack, retained_files) = self.verify_inner(&verification_root, Some(&root))?;
+        root.recheck()?;
+        Ok(VerifiedPackLease {
+            verified_pack,
+            root,
+            _retained_files: retained_files,
+        })
+    }
+
+    fn verify_inner(
+        &self,
+        root: &Path,
+        pinned: Option<&PinnedPackRoot>,
+    ) -> Result<(VerifiedPack, Vec<File>), PackVerificationError> {
+        if pinned.is_none() {
+            validate_root(root)?;
+        }
+        let (manifest_bytes, manifest_file) =
+            read_bounded_regular_from(root, pinned, Path::new(MANIFEST_NAME), MAX_MANIFEST_BYTES)?;
+        let (signature_bytes, signature_file) = read_bounded_regular_from(
+            root,
+            pinned,
+            Path::new(SIGNATURE_NAME),
+            MAX_SIGNATURE_BYTES,
+        )?;
 
         // No inventory-controlled payload path is touched before the bounded
         // exact signed envelope authenticates successfully.
@@ -210,34 +371,50 @@ impl<'a> PackVerifier<'a> {
         let manifest: PackManifest = parse_canonical_json(&manifest_bytes, "manifest")?;
         self.validate_manifest(&manifest)?;
         verify_exact_tree(root, &manifest.payload)?;
-        verify_payload(root, &manifest.payload)?;
+        let mut retained_files = verify_payload(root, pinned, &manifest.payload)?;
+        retained_files.push(manifest_file);
+        retained_files.push(signature_file);
 
-        Ok(VerifiedPack {
-            pack_id: manifest.pack_id,
-            pack_version: manifest.pack_version,
-            pack_digest: manifest.pack_digest,
-            security_epoch: manifest.security_epoch,
-            runtime_abi_version: manifest.runtime_abi_version,
-            backend: manifest.backend,
-            provider: manifest.provider,
-            target_os: manifest.target_os,
-            target_arch: manifest.target_arch,
-            worker_relative_path: manifest.worker_path,
-            root: root.to_path_buf(),
-        })
+        let descriptor_root = pinned.map_or_else(|| root.to_path_buf(), |lease| lease.path.clone());
+        Ok((
+            VerifiedPack {
+                pack_id: manifest.pack_id,
+                pack_version: manifest.pack_version,
+                pack_digest: manifest.pack_digest,
+                security_epoch: manifest.security_epoch,
+                runtime_abi_version: manifest.runtime_abi_version,
+                backend: manifest.backend,
+                provider: manifest.provider,
+                target_os: manifest.target_os,
+                target_arch: manifest.target_arch,
+                worker_relative_path: manifest.worker_path,
+                root: descriptor_root,
+            },
+            retained_files,
+        ))
     }
 
     /// Re-verifies the complete signed tree immediately before Stage 2's
     /// exact-path/image-handle launcher receives the worker path.
-    pub(crate) fn launchable_worker(
+    pub(crate) fn launchable_worker<'lease>(
         &self,
-        expected: &VerifiedPack,
-    ) -> Result<PathBuf, PackVerificationError> {
-        let observed = self.verify(&expected.root)?;
-        if &observed != expected {
+        expected: &'lease VerifiedPackLease,
+    ) -> Result<LaunchableWorker<'lease>, PackVerificationError> {
+        expected.recheck()?;
+        let verification_root = expected.root.verification_root();
+        let (observed, _launch_files) =
+            self.verify_inner(&verification_root, Some(&expected.root))?;
+        if &observed != expected.verified_pack() {
             return Err(PackVerificationError::DescriptorChanged);
         }
-        Ok(observed.worker_path())
+        expected.recheck()?;
+        // The original retained worker handle remains part of the lease.
+        // Stage 4 must hand this lease into the exact-image launcher instead
+        // of reconstructing authority from this display path.
+        Ok(LaunchableWorker {
+            path: expected.worker_path(),
+            _lease: expected,
+        })
     }
 
     fn validate_manifest(&self, manifest: &PackManifest) -> Result<(), PackVerificationError> {
@@ -545,10 +722,18 @@ fn verify_exact_tree(root: &Path, inventory: &[PayloadEntry]) -> Result<(), Pack
     Ok(())
 }
 
-fn verify_payload(root: &Path, inventory: &[PayloadEntry]) -> Result<(), PackVerificationError> {
+fn verify_payload(
+    root: &Path,
+    pinned: Option<&PinnedPackRoot>,
+    inventory: &[PayloadEntry],
+) -> Result<Vec<File>, PackVerificationError> {
+    let mut retained = Vec::with_capacity(inventory.len());
     for entry in inventory {
         let path = root.join(&entry.path);
-        let mut file = open_regular_no_follow(&path)?;
+        let mut file = match pinned {
+            Some(lease) => lease.open_regular(Path::new(&entry.path))?,
+            None => open_regular_no_follow(&path)?,
+        };
         let metadata = file.metadata().map_err(PackVerificationError::Io)?;
         if metadata.len() != entry.size_bytes {
             return Err(PackVerificationError::SizeMismatch(entry.path.clone()));
@@ -568,22 +753,32 @@ fn verify_payload(root: &Path, inventory: &[PayloadEntry]) -> Result<(), PackVer
                 entry.path.clone(),
             ));
         }
+        retained.push(file);
     }
-    Ok(())
+    Ok(retained)
 }
 
-fn read_bounded_regular(path: &Path, max_bytes: u64) -> Result<Vec<u8>, PackVerificationError> {
-    let mut file = open_regular_no_follow(path)?;
+fn read_bounded_regular_from(
+    root: &Path,
+    pinned: Option<&PinnedPackRoot>,
+    relative: &Path,
+    max_bytes: u64,
+) -> Result<(Vec<u8>, File), PackVerificationError> {
+    let path = root.join(relative);
+    let mut file = match pinned {
+        Some(lease) => lease.open_regular(relative)?,
+        None => open_regular_no_follow(&path)?,
+    };
     let metadata = file.metadata().map_err(PackVerificationError::Io)?;
     if metadata.len() > max_bytes {
         return Err(PackVerificationError::EnvelopeTooLarge);
     }
-    reject_hardlink(&file, &metadata, path)?;
-    reject_named_streams(path)?;
+    reject_hardlink(&file, &metadata, &path)?;
+    reject_named_streams(&path)?;
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
     file.read_to_end(&mut bytes)
         .map_err(PackVerificationError::Io)?;
-    Ok(bytes)
+    Ok((bytes, file))
 }
 
 fn open_regular_no_follow(path: &Path) -> Result<File, PackVerificationError> {
@@ -607,11 +802,70 @@ fn configure_no_follow(options: &mut OpenOptions) {
 #[cfg(windows)]
 fn configure_no_follow(options: &mut OpenOptions) {
     use std::os::windows::fs::OpenOptionsExt;
-    options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
+    use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ};
+    options
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
 }
 
 #[cfg(not(any(unix, windows)))]
 fn configure_no_follow(_options: &mut OpenOptions) {}
+
+#[cfg(unix)]
+fn open_regular_at(directory_fd: i32, relative: &Path) -> Result<File, PackVerificationError> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let components = relative.components().collect::<Vec<_>>();
+    if components.is_empty()
+        || components
+            .iter()
+            .any(|part| !matches!(part, Component::Normal(_)))
+    {
+        return Err(PackVerificationError::UnsafePath(
+            relative.display().to_string(),
+        ));
+    }
+    let duplicated = unsafe { libc::dup(directory_fd) };
+    if duplicated < 0 {
+        return Err(PackVerificationError::Io(io::Error::last_os_error()));
+    }
+    let mut current = unsafe { File::from_raw_fd(duplicated) };
+    for component in &components[..components.len() - 1] {
+        let name = CString::new(component.as_os_str().as_bytes())
+            .map_err(|_| PackVerificationError::UnsafePath(relative.display().to_string()))?;
+        let fd = unsafe {
+            libc::openat(
+                current.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(PackVerificationError::Io(io::Error::last_os_error()));
+        }
+        current = unsafe { File::from_raw_fd(fd) };
+    }
+    let name = CString::new(components.last().expect("non-empty").as_os_str().as_bytes())
+        .map_err(|_| PackVerificationError::UnsafePath(relative.display().to_string()))?;
+    let fd = unsafe {
+        libc::openat(
+            current.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(PackVerificationError::Io(io::Error::last_os_error()));
+    }
+    let file = unsafe { File::from_raw_fd(fd) };
+    let metadata = file.metadata().map_err(PackVerificationError::Io)?;
+    if !metadata.is_file() {
+        return Err(PackVerificationError::NonRegularEntry(
+            relative.to_path_buf(),
+        ));
+    }
+    Ok(file)
+}
 
 #[cfg(windows)]
 fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
@@ -742,6 +996,143 @@ pub(super) fn reject_named_streams(_path: &Path) -> Result<(), PackVerificationE
     Ok(())
 }
 
+#[cfg(unix)]
+fn open_pinned_pack_root(
+    canonical_store_root: &Path,
+    components: [&StoreComponent; 2],
+    digest: &str,
+) -> Result<PinnedPackRoot, PackVerificationError> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let root_name = CString::new(canonical_store_root.as_os_str().as_bytes()).map_err(|_| {
+        PackVerificationError::UnsafePackStoreAncestor(canonical_store_root.to_path_buf())
+    })?;
+    let root_fd = unsafe {
+        libc::open(
+            root_name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if root_fd < 0 {
+        return Err(PackVerificationError::Io(io::Error::last_os_error()));
+    }
+    let mut handles = vec![unsafe { File::from_raw_fd(root_fd) }];
+    let names = [components[0].as_str(), components[1].as_str(), digest];
+    let mut path = canonical_store_root.to_path_buf();
+    for name in names {
+        let name_c = CString::new(name).expect("canonical store component has no NUL");
+        let fd = unsafe {
+            libc::openat(
+                handles.last().expect("parent handle").as_raw_fd(),
+                name_c.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(PackVerificationError::Io(io::Error::last_os_error()));
+        }
+        handles.push(unsafe { File::from_raw_fd(fd) });
+        path.push(name);
+    }
+    let lease = PinnedPackRoot { path, handles };
+    lease.recheck()?;
+    Ok(lease)
+}
+
+#[cfg(windows)]
+fn open_pinned_pack_root(
+    canonical_store_root: &Path,
+    components: [&StoreComponent; 2],
+    digest: &str,
+) -> Result<PinnedPackRoot, PackVerificationError> {
+    let mut path = canonical_store_root.to_path_buf();
+    let mut handles = Vec::with_capacity(4);
+    handles.push(open_directory_no_follow(&path)?);
+    for name in [components[0].as_str(), components[1].as_str(), digest] {
+        path.push(name);
+        handles.push(open_directory_no_follow(&path)?);
+    }
+    let lease = PinnedPackRoot { path, handles };
+    lease.recheck()?;
+    Ok(lease)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_pinned_pack_root(
+    canonical_store_root: &Path,
+    _components: [&StoreComponent; 2],
+    _digest: &str,
+) -> Result<PinnedPackRoot, PackVerificationError> {
+    Err(PackVerificationError::UnsafePackStoreAncestor(
+        canonical_store_root.to_path_buf(),
+    ))
+}
+
+#[cfg(windows)]
+fn open_directory_no_follow(path: &Path) -> Result<File, PackVerificationError> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+    let file = options.open(path).map_err(PackVerificationError::Io)?;
+    let metadata = file.metadata().map_err(PackVerificationError::Io)?;
+    use std::os::windows::fs::MetadataExt;
+    if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(PackVerificationError::UnsafePackStoreAncestor(
+            path.to_path_buf(),
+        ));
+    }
+    reject_named_streams(path)?;
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn same_directory_identity(handle: &File, path: &Path) -> Result<bool, PackVerificationError> {
+    use std::os::unix::fs::MetadataExt;
+    let held = handle.metadata().map_err(PackVerificationError::Io)?;
+    let observed = fs::symlink_metadata(path).map_err(PackVerificationError::Io)?;
+    Ok(observed.is_dir()
+        && !observed.file_type().is_symlink()
+        && held.dev() == observed.dev()
+        && held.ino() == observed.ino())
+}
+
+#[cfg(windows)]
+fn same_directory_identity(handle: &File, path: &Path) -> Result<bool, PackVerificationError> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT, GetFileInformationByHandle,
+    };
+    let observed = match open_directory_no_follow(path) {
+        Ok(file) => file,
+        Err(_) => return Ok(false),
+    };
+    let information = |file: &File| -> Result<BY_HANDLE_FILE_INFORMATION, PackVerificationError> {
+        let mut value = unsafe { std::mem::zeroed::<BY_HANDLE_FILE_INFORMATION>() };
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut value) } == 0 {
+            return Err(PackVerificationError::Io(io::Error::last_os_error()));
+        }
+        Ok(value)
+    };
+    let held = information(handle)?;
+    let observed = information(&observed)?;
+    Ok(held.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT == 0
+        && held.dwVolumeSerialNumber == observed.dwVolumeSerialNumber
+        && held.nFileIndexHigh == observed.nFileIndexHigh
+        && held.nFileIndexLow == observed.nFileIndexLow)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn same_directory_identity(_handle: &File, _path: &Path) -> Result<bool, PackVerificationError> {
+    Err(PackVerificationError::UnsupportedLeasePlatform)
+}
+
 #[derive(Debug, Error)]
 pub(crate) enum PackVerificationError {
     #[error("worker-pack I/O failed: {0}")]
@@ -806,6 +1197,13 @@ pub(crate) enum PackVerificationError {
     WorkerMissing,
     #[error("verified worker-pack descriptor changed before launch")]
     DescriptorChanged,
+    #[error("worker-pack immutable-store ancestor is unsafe: {0}")]
+    UnsafePackStoreAncestor(PathBuf),
+    #[error("worker-pack immutable-store ancestor identity changed: {0}")]
+    PackStoreAncestorChanged(PathBuf),
+    #[cfg(not(any(unix, windows)))]
+    #[error("verified worker-pack leases are unsupported on this platform")]
+    UnsupportedLeasePlatform,
 }
 
 #[cfg(test)]
@@ -909,6 +1307,26 @@ pub(super) mod test_support {
         let verified = verifier.verify(root).unwrap();
         (verifier, verified)
     }
+
+    pub(crate) fn leased_fixture(root: &Path) -> (PackVerifier<'static>, VerifiedPackLease) {
+        let source = root.join("source");
+        let (verifier, descriptor) = fixture(&source);
+        let store_root = root.join("workers/packs");
+        let parent = store_root
+            .join(descriptor.pack_id.as_str())
+            .join(descriptor.pack_version.as_str());
+        fs::create_dir_all(&parent).unwrap();
+        let final_root = parent.join(&descriptor.pack_digest);
+        fs::rename(source, &final_root).unwrap();
+        let pinned = PinnedPackRoot::open(
+            &fs::canonicalize(&store_root).unwrap(),
+            [&descriptor.pack_id, &descriptor.pack_version],
+            &descriptor.pack_digest,
+        )
+        .unwrap();
+        let lease = verifier.verify_pinned(pinned).unwrap();
+        (verifier, lease)
+    }
 }
 
 #[cfg(test)]
@@ -919,16 +1337,25 @@ mod tests {
     #[test]
     fn signed_exact_tree_verifies_and_is_reverified_for_launch() {
         let root = temp_root("valid");
-        let (verifier, verified) = fixture(&root);
+        let (verifier, verified) = leased_fixture(&root);
         assert_eq!(
-            verifier.launchable_worker(&verified).unwrap(),
-            root.join("bin/worker.exe")
+            verifier.launchable_worker(&verified).unwrap().path(),
+            &verified.verified_pack().root.join("bin/worker.exe")
         );
-        fs::write(root.join("bin/worker.exe"), b"tampered work").unwrap();
-        assert!(matches!(
-            verifier.launchable_worker(&verified),
-            Err(PackVerificationError::PayloadDigestMismatch(_))
-        ));
+        #[cfg(windows)]
+        {
+            assert!(fs::write(verified.worker_path(), b"tampered work").is_err());
+            verifier.launchable_worker(&verified).unwrap();
+        }
+        #[cfg(unix)]
+        {
+            fs::write(verified.worker_path(), b"tampered work").unwrap();
+            assert!(matches!(
+                verifier.launchable_worker(&verified),
+                Err(PackVerificationError::PayloadDigestMismatch(_))
+            ));
+        }
+        drop(verified);
         fs::remove_dir_all(root).unwrap();
     }
 

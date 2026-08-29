@@ -9,16 +9,17 @@ pub(crate) mod manifest;
 pub(crate) mod store;
 
 pub(crate) use launch_binding::{ResolverHelloBindingBridge, VerifiedPackLaunchBinding};
-pub(crate) use manifest::VerifiedPack;
 
 mod launch_binding {
-    use super::manifest::{PackBackend, VerifiedPack};
+    use std::sync::Arc;
+
+    use super::manifest::{PackBackend, VerifiedPack, VerifiedPackLease};
 
     /// Stage 4 must implement this bridge on the concrete resolver/Hello path.
     /// Returning metadata is not sufficient by itself: the only constructor for
     /// the opaque binding compares every value with the reverified descriptor.
     pub(crate) trait ResolverHelloBindingBridge {
-        fn resolver_verified_pack(&self) -> &VerifiedPack;
+        fn resolver_verified_pack_lease(&self) -> Arc<VerifiedPackLease>;
         fn hello_pack_id(&self) -> &str;
         fn hello_pack_version(&self) -> &str;
         fn hello_pack_digest(&self) -> &str;
@@ -32,9 +33,9 @@ mod launch_binding {
     /// the exact verified pack and stable device. Its fields are private to this
     /// child module, so production discovery cannot fabricate one from a raw
     /// `VerifiedPack`.
-    #[derive(Clone, Debug, Eq, PartialEq)]
+    #[derive(Debug)]
     pub(crate) struct VerifiedPackLaunchBinding {
-        verified_pack: VerifiedPack,
+        verified_pack_lease: Arc<VerifiedPackLease>,
         stable_device_identity: String,
     }
 
@@ -42,7 +43,8 @@ mod launch_binding {
         pub(crate) fn try_from_resolver_hello_bridge(
             bridge: &impl ResolverHelloBindingBridge,
         ) -> Option<Self> {
-            let pack = bridge.resolver_verified_pack();
+            let lease = bridge.resolver_verified_pack_lease();
+            let pack = lease.verified_pack();
             let stable_device_identity = bridge.hello_stable_device_identity();
             let stable_device_is_canonical = !stable_device_identity.is_empty()
                 && stable_device_identity.len() <= 256
@@ -58,13 +60,17 @@ mod launch_binding {
                 && bridge.hello_backend() == pack.backend
                 && bridge.hello_provider() == pack.provider)
                 .then(|| Self {
-                    verified_pack: pack.clone(),
+                    verified_pack_lease: lease,
                     stable_device_identity: stable_device_identity.to_owned(),
                 })
         }
 
         pub(crate) fn verified_pack(&self) -> &VerifiedPack {
-            &self.verified_pack
+            self.verified_pack_lease.verified_pack()
+        }
+
+        pub(crate) fn verified_pack_lease(&self) -> &VerifiedPackLease {
+            &self.verified_pack_lease
         }
 
         pub(crate) fn stable_device_identity(&self) -> &str {
@@ -144,28 +150,29 @@ pub(crate) fn maybe_run_pack_verifier() -> Option<i32> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::sync::Arc;
 
     use super::manifest::PackBackend;
-    use super::{ResolverHelloBindingBridge, VerifiedPack, VerifiedPackLaunchBinding};
+    use super::manifest::VerifiedPackLease;
+    use super::{ResolverHelloBindingBridge, VerifiedPackLaunchBinding};
 
     struct FixtureBridge {
-        pack: VerifiedPack,
+        lease: Arc<VerifiedPackLease>,
         hello_digest: String,
         stable_device_identity: String,
     }
 
     impl ResolverHelloBindingBridge for FixtureBridge {
-        fn resolver_verified_pack(&self) -> &VerifiedPack {
-            &self.pack
+        fn resolver_verified_pack_lease(&self) -> Arc<VerifiedPackLease> {
+            Arc::clone(&self.lease)
         }
 
         fn hello_pack_id(&self) -> &str {
-            self.pack.pack_id.as_str()
+            self.lease.verified_pack().pack_id.as_str()
         }
 
         fn hello_pack_version(&self) -> &str {
-            self.pack.pack_version.as_str()
+            self.lease.verified_pack().pack_version.as_str()
         }
 
         fn hello_pack_digest(&self) -> &str {
@@ -173,15 +180,15 @@ mod tests {
         }
 
         fn hello_runtime_abi(&self) -> u16 {
-            self.pack.runtime_abi_version
+            self.lease.verified_pack().runtime_abi_version
         }
 
         fn hello_backend(&self) -> PackBackend {
-            self.pack.backend
+            self.lease.verified_pack().backend
         }
 
         fn hello_provider(&self) -> &str {
-            &self.pack.provider
+            &self.lease.verified_pack().provider
         }
 
         fn hello_stable_device_identity(&self) -> &str {
@@ -189,25 +196,16 @@ mod tests {
         }
     }
 
-    fn fixture_bridge() -> FixtureBridge {
-        let digest = "a".repeat(64);
-        FixtureBridge {
-            pack: VerifiedPack {
-                pack_id: super::manifest::StoreComponent::new("fixture-pack").unwrap(),
-                pack_version: super::manifest::StoreComponent::new("1.0.0").unwrap(),
-                pack_digest: digest.clone(),
-                security_epoch: 1,
-                runtime_abi_version: 1,
-                backend: PackBackend::Vulkan,
-                provider: "fixture:vulkan".to_owned(),
-                target_os: "windows".to_owned(),
-                target_arch: "x86_64".to_owned(),
-                worker_relative_path: "worker.exe".to_owned(),
-                root: PathBuf::from("fixture-root"),
-            },
+    fn fixture_bridge() -> (std::path::PathBuf, FixtureBridge) {
+        let root = super::manifest::test_support::temp_root("launch-binding");
+        let (_, lease) = super::manifest::test_support::leased_fixture(&root);
+        let digest = lease.verified_pack().pack_digest.clone();
+        let bridge = FixtureBridge {
+            lease: Arc::new(lease),
             hello_digest: digest,
             stable_device_identity: "pci:0000:01:00.0".to_owned(),
-        }
+        };
+        (root, bridge)
     }
 
     #[test]
@@ -224,14 +222,23 @@ mod tests {
 
     #[test]
     fn launch_binding_requires_exact_resolver_and_hello_metadata() {
-        let bridge = fixture_bridge();
+        let (root, bridge) = fixture_bridge();
         let binding = VerifiedPackLaunchBinding::try_from_resolver_hello_bridge(&bridge)
             .expect("matching resolver and Hello metadata bind");
-        assert_eq!(binding.verified_pack(), &bridge.pack);
+        assert_eq!(binding.verified_pack(), bridge.lease.verified_pack());
+        assert_eq!(
+            binding.verified_pack_lease().verified_pack(),
+            bridge.lease.verified_pack()
+        );
         assert_eq!(binding.stable_device_identity(), "pci:0000:01:00.0");
 
-        let mut mismatched = fixture_bridge();
+        let (mismatched_root, mut mismatched) = fixture_bridge();
         mismatched.hello_digest = "b".repeat(64);
         assert!(VerifiedPackLaunchBinding::try_from_resolver_hello_bridge(&mismatched).is_none());
+        drop(binding);
+        drop(bridge);
+        std::fs::remove_dir_all(root).unwrap();
+        drop(mismatched);
+        std::fs::remove_dir_all(mismatched_root).unwrap();
     }
 }

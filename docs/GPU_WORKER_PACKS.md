@@ -32,8 +32,19 @@ case-collisions, excessive depth/count/name/file/aggregate size, missing or
 unexpected files/directories, nonregular entries, symlinks, junctions/reparse
 points, hardlinks, incompatible metadata, unknown keys, bad signatures, and
 digest mismatches. The complete tree is verified again immediately before a
-launchable path can be passed to Stage 2's exact-path, file-identity, digest,
-and final-process-image checks.
+borrowed `LaunchableWorker` target can be passed to Stage 2's exact-path,
+file-identity, digest, and final-process-image checks. The target cannot outlive
+its `VerifiedPackLease`.
+
+Installed-pack verification is authorized by a retained `VerifiedPackLease`,
+not by a descriptor path. The store opens the canonical pack root and each
+pack-ID/version/digest directory separately without following links and keeps
+all four directory handles plus verified payload handles alive. Windows opens
+reject reparse points and omit delete sharing so an ancestor or payload cannot
+be renamed out from under verification. Unix opens use `openat` with
+`O_DIRECTORY|O_NOFOLLOW` for ancestors and handle-relative payload access.
+Directory identities are checked again before the lease is returned and before
+launch handoff; unsupported platforms fail closed.
 
 Pack ID and version are stricter than general signed identifiers because they
 become immutable-store directory names. They are bounded lowercase ASCII
@@ -123,9 +134,12 @@ not sufficient to make a provider discoverable or launchable.
 
 The compile-time seam is `ResolverHelloBindingBridge` followed by
 `VerifiedPackLaunchBinding::try_from_resolver_hello_bridge`. The opaque binding
-can be created only when the resolver's reverified `VerifiedPack` exactly agrees
-with the worker Hello pack ID, version, digest, runtime ABI, backend, and provider,
-and the Hello supplies a canonical stable device identity. Production discovery
+can be created only from an `Arc<VerifiedPackLease>` retained by the resolver,
+and only when its descriptor exactly agrees with the worker Hello pack ID,
+version, digest, runtime ABI, backend, and provider and the Hello supplies a
+canonical stable device identity. Stage 4 must retain that lease through exact
+worker/dependency handle launch and final image/Hello validation; it must never
+reconstruct launch authority from `VerifiedPack::root`. Production discovery
 must obtain those bindings from a concrete
 `discover_production_pack_launch_bindings` path and pass only them to
 `ProductionPackRegistry::from_launch_bindings`; it cannot insert a raw

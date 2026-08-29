@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::manifest::{
-    EMBEDDED_MINIMUM_SECURITY_EPOCH, PackVerificationError, PackVerifier, StoreComponent,
-    VerifiedPack, is_canonical_sha256,
+    EMBEDDED_MINIMUM_SECURITY_EPOCH, PackVerificationError, PackVerifier, PinnedPackRoot,
+    StoreComponent, VerifiedPack, VerifiedPackLease, is_canonical_sha256,
 };
 
 const STATE_SCHEMA_VERSION: u16 = 1;
@@ -102,9 +102,9 @@ impl<'a> PackStore<'a> {
         let (parent, final_root) = self.store_paths_for(&source, true)?;
         ensure_regular_directories(&parent)?;
         if final_root.exists() {
-            let installed = self.verifier.verify(&final_root)?;
-            require_same_pack(&source, &installed)?;
-            return Ok(installed);
+            let installed = self.verify_installed_identity(&source, false)?;
+            require_same_pack(&source, installed.verified_pack())?;
+            return Ok(installed.verified_pack().clone());
         }
 
         let staging = parent.join(format!(
@@ -121,9 +121,9 @@ impl<'a> PackStore<'a> {
             if durable_rename_new(&staging, &final_root)? == PublishOutcome::DestinationExists {
                 remove_staging_tree(&staging)?;
             }
-            let installed = self.verifier.verify(&final_root)?;
-            require_same_pack(&source, &installed)?;
-            Ok(installed)
+            let installed = self.verify_installed_identity(&source, false)?;
+            require_same_pack(&source, installed.verified_pack())?;
+            Ok(installed.verified_pack().clone())
         })();
         if result.is_err() {
             let _ = remove_staging_tree(&staging);
@@ -213,14 +213,14 @@ impl<'a> PackStore<'a> {
 
     /// Corrupt state or invalid packs project to no GPU pack and cannot affect
     /// the separately compiled CPU route.
-    pub(crate) fn current_fail_closed(&self) -> Option<VerifiedPack> {
+    pub(crate) fn current_fail_closed(&self) -> Option<VerifiedPackLease> {
         let _lock = self.acquire_lock().ok()?;
         self.recover_pending_activation_locked().ok()?;
         let descriptor = self.load_activation_strict().ok()?.current?;
         let epochs = self.load_epochs_strict().ok()?;
-        self.reverify_descriptor(&descriptor)
+        self.reverify_lease_at(&descriptor)
             .ok()
-            .filter(|pack| require_epoch_from(pack, &epochs).is_ok())
+            .filter(|pack| require_epoch_from(pack.verified_pack(), &epochs).is_ok())
     }
 
     /// Only uniquely named incomplete staging directories and state temporary
@@ -268,13 +268,38 @@ impl<'a> PackStore<'a> {
         &self,
         descriptor: &VerifiedPack,
     ) -> Result<VerifiedPack, PackStoreError> {
+        Ok(self.reverify_lease_at(descriptor)?.verified_pack().clone())
+    }
+
+    fn reverify_lease_at(
+        &self,
+        descriptor: &VerifiedPack,
+    ) -> Result<VerifiedPackLease, PackStoreError> {
+        self.verify_installed_identity(descriptor, true)
+    }
+
+    fn verify_installed_identity(
+        &self,
+        descriptor: &VerifiedPack,
+        require_descriptor_root: bool,
+    ) -> Result<VerifiedPackLease, PackStoreError> {
         let (_, expected_root) = self.store_paths_for(descriptor, false)?;
-        if descriptor.root.as_os_str() != expected_root.as_os_str() {
+        if require_descriptor_root && descriptor.root.as_os_str() != expected_root.as_os_str() {
             return Err(PackStoreError::DescriptorOutsideStore);
         }
-        let verified = self.verifier.verify(&expected_root)?;
-        if &verified != descriptor {
-            return Err(PackStoreError::DescriptorChanged);
+        let canonical_root = fs::canonicalize(&self.packs_root)?;
+        let pinned = PinnedPackRoot::open(
+            &canonical_root,
+            [&descriptor.pack_id, &descriptor.pack_version],
+            &descriptor.pack_digest,
+        )?;
+        let verified = self.verifier.verify_pinned(pinned)?;
+        if require_descriptor_root {
+            if verified.verified_pack() != descriptor {
+                return Err(PackStoreError::DescriptorChanged);
+            }
+        } else {
+            require_same_pack(descriptor, verified.verified_pack())?;
         }
         Ok(verified)
     }
@@ -336,7 +361,7 @@ impl<'a> PackStore<'a> {
             if descriptor.root.as_os_str() != expected_root.as_os_str() {
                 return Err(PackStoreError::DescriptorOutsideStore);
             }
-            if self.verifier.verify(&expected_root)? != *descriptor {
+            if self.reverify_lease_at(descriptor)?.verified_pack() != descriptor {
                 return Err(PackStoreError::DescriptorChanged);
             }
         }
@@ -447,7 +472,7 @@ impl<'a> PackStore<'a> {
         if pending.target.root.as_os_str() != expected_root.as_os_str() {
             return Err(PackStoreError::DescriptorOutsideStore);
         }
-        if self.verifier.verify(&expected_root)? != pending.target {
+        if self.reverify_lease_at(&pending.target)?.verified_pack() != &pending.target {
             return Err(PackStoreError::DescriptorChanged);
         }
         Ok(())
@@ -1113,6 +1138,12 @@ pub(crate) enum PackStoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn current_descriptor(store: &PackStore<'_>) -> Option<VerifiedPack> {
+        store
+            .current_fail_closed()
+            .map(|lease| lease.verified_pack().clone())
+    }
     use crate::gpu_worker_pack::manifest::test_support::{
         base_manifest, fixture, temp_root, write_signed,
     };
@@ -1153,6 +1184,38 @@ mod tests {
         (source, trust)
     }
 
+    fn replace_pack_id_with_directory_link(
+        root: &Path,
+        workers: &Path,
+        descriptor: &VerifiedPack,
+    ) -> (PathBuf, PathBuf) {
+        let link = workers.join("packs").join(descriptor.pack_id.as_str());
+        let external = root.join("external-pack-id");
+        fs::rename(&link, &external).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&external, &link).unwrap();
+        #[cfg(windows)]
+        {
+            let output = std::process::Command::new("cmd.exe")
+                .args(["/d", "/c", "mklink", "/J"])
+                .arg(&link)
+                .arg(&external)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "junction fixture failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        (link, external)
+    }
+
+    fn restore_pack_id_directory(link: &Path, external: &Path) {
+        fs::remove_dir(link).unwrap();
+        fs::rename(external, link).unwrap();
+    }
+
     #[test]
     fn stages_into_digest_layout_and_activates_only_reverified_pack() {
         let (root, workers, state, verifier, _) = store_fixture("store-install");
@@ -1167,7 +1230,7 @@ mod tests {
                 .join(&installed.pack_digest)
         );
         store.activate(&installed).unwrap();
-        assert_eq!(store.current_fail_closed(), Some(installed.clone()));
+        assert_eq!(current_descriptor(&store), Some(installed.clone()));
         assert_eq!(
             store.stage_and_install(&root.join("source")).unwrap(),
             installed
@@ -1190,10 +1253,15 @@ mod tests {
         let second = store.stage_and_install(&second_source).unwrap();
         store.activate(&first).unwrap();
         store.activate(&second).unwrap();
-        assert_eq!(store.current_fail_closed(), Some(second.clone()));
+        assert_eq!(current_descriptor(&store), Some(second.clone()));
         assert_eq!(store.rollback().unwrap(), first);
         assert_eq!(
-            store.current_fail_closed().unwrap().pack_version.as_str(),
+            store
+                .current_fail_closed()
+                .unwrap()
+                .verified_pack()
+                .pack_version
+                .as_str(),
             "1.2.3"
         );
 
@@ -1228,7 +1296,7 @@ mod tests {
         let installed = store.stage_and_install(&root.join("source")).unwrap();
         store.activate(&installed).unwrap();
         fs::write(store.activation_path(), b"{corrupt").unwrap();
-        assert_eq!(store.current_fail_closed(), None);
+        assert!(store.current_fail_closed().is_none());
 
         let staging = workers
             .join("packs")
@@ -1246,7 +1314,7 @@ mod tests {
         assert!(installed.root.exists());
 
         fs::write(store.epoch_path(), b"not-json").unwrap();
-        assert_eq!(store.current_fail_closed(), None);
+        assert!(store.current_fail_closed().is_none());
         assert!(matches!(
             store.activate(&installed),
             Err(PackStoreError::Json(_))
@@ -1270,7 +1338,7 @@ mod tests {
             store.rollback(),
             Err(PackStoreError::DescriptorOutsideStore)
         ));
-        assert_eq!(store.current_fail_closed(), None);
+        assert!(store.current_fail_closed().is_none());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1310,7 +1378,7 @@ mod tests {
                     store.load_activation_strict().is_err(),
                     "accepted persisted component {value:?}"
                 );
-                assert_eq!(store.current_fail_closed(), None);
+                assert!(store.current_fail_closed().is_none());
             }
         }
 
@@ -1327,7 +1395,7 @@ mod tests {
         assert_eq!(fs::read(escaped.join("sentinel")).unwrap(), b"outside");
 
         atomic_write_canonical(&store.activation_path(), &baseline).unwrap();
-        assert_eq!(store.current_fail_closed(), Some(installed));
+        assert_eq!(current_descriptor(&store), Some(installed));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1390,7 +1458,7 @@ mod tests {
         assert_eq!(fs::read(escaped.join("sentinel")).unwrap(), b"outside");
 
         atomic_write_canonical(&store.pending_path(), &baseline).unwrap();
-        assert_eq!(store.current_fail_closed(), Some(next));
+        assert_eq!(current_descriptor(&store), Some(next));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1451,7 +1519,7 @@ mod tests {
                     Err(PackStoreError::InjectedInterruption)
                 ));
             }
-            assert_eq!(store.current_fail_closed(), Some(next.clone()));
+            assert_eq!(current_descriptor(&store), Some(next.clone()));
             let activation = store.load_activation_strict().unwrap();
             assert_eq!(activation.previous, Some(first));
             assert!(!store.pending_path().exists());
@@ -1474,7 +1542,7 @@ mod tests {
         let first = store.stage_and_install(&root.join("source")).unwrap();
         store.activate(&first).unwrap();
         fs::write(store.pending_path(), b"{corrupt").unwrap();
-        assert_eq!(store.current_fail_closed(), None);
+        assert!(store.current_fail_closed().is_none());
         assert!(store.activate(&first).is_err());
         assert_eq!(
             store
@@ -1545,7 +1613,85 @@ mod tests {
         });
         let epochs = store.load_epochs_strict().unwrap();
         assert_eq!(epochs.epochs.get(epoch_three.pack_id.as_str()), Some(&3));
-        assert_eq!(store.current_fail_closed(), Some(epoch_three));
+        assert_eq!(current_descriptor(&store), Some(epoch_three));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn linked_pack_id_ancestor_is_never_accepted_for_current_activation() {
+        let (root, workers, state, verifier, _) = store_fixture("linked-current");
+        let store = PackStore::new(&workers, &state, &verifier);
+        let installed = store.stage_and_install(&root.join("source")).unwrap();
+        store.activate(&installed).unwrap();
+        let (link, external) = replace_pack_id_with_directory_link(&root, &workers, &installed);
+        let sentinel = external.join("sentinel.txt");
+        fs::write(&sentinel, b"must remain untouched").unwrap();
+
+        assert!(store.current_fail_closed().is_none());
+        assert_eq!(fs::read(&sentinel).unwrap(), b"must remain untouched");
+
+        restore_pack_id_directory(&link, &external);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn linked_pack_id_ancestor_blocks_pending_activation_recovery() {
+        let (root, workers, state, verifier, _) = store_fixture("linked-pending");
+        let store = PackStore::new(&workers, &state, &verifier);
+        let first = store.stage_and_install(&root.join("source")).unwrap();
+        let (next_source, _) = additional_source(&root, "2.0.0", 2);
+        let next = store.stage_and_install(&next_source).unwrap();
+        store.activate(&first).unwrap();
+        assert!(matches!(
+            store.activate_locked(&next, Some(ActivationBoundary::Journal)),
+            Err(PackStoreError::InjectedInterruption)
+        ));
+        let (link, external) = replace_pack_id_with_directory_link(&root, &workers, &next);
+        let sentinel = external.join("sentinel.txt");
+        fs::write(&sentinel, b"must remain untouched").unwrap();
+
+        assert!(store.current_fail_closed().is_none());
+        assert_eq!(fs::read(&sentinel).unwrap(), b"must remain untouched");
+
+        fs::remove_file(&sentinel).unwrap();
+        restore_pack_id_directory(&link, &external);
+        store.recover_interrupted_work().unwrap();
+        assert_eq!(current_descriptor(&store), Some(next));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn retained_lease_prevents_or_detects_ancestor_swap_before_launch() {
+        let (root, workers, state, verifier, _) = store_fixture("leased-swap");
+        let store = PackStore::new(&workers, &state, &verifier);
+        let installed = store.stage_and_install(&root.join("source")).unwrap();
+        store.activate(&installed).unwrap();
+        let lease = store.current_fail_closed().unwrap();
+        let pack_id = workers.join("packs").join(installed.pack_id.as_str());
+        let moved = root.join("moved-pack-id");
+
+        #[cfg(windows)]
+        {
+            assert!(fs::rename(&pack_id, &moved).is_err());
+            verifier.launchable_worker(&lease).unwrap();
+        }
+        #[cfg(unix)]
+        {
+            fs::rename(&pack_id, &moved).unwrap();
+            let decoy = root.join("decoy-pack-id");
+            fs::create_dir(&decoy).unwrap();
+            let sentinel = decoy.join("sentinel.txt");
+            fs::write(&sentinel, b"must remain untouched").unwrap();
+            std::os::unix::fs::symlink(&decoy, &pack_id).unwrap();
+            assert!(matches!(
+                verifier.launchable_worker(&lease),
+                Err(PackVerificationError::PackStoreAncestorChanged(_))
+            ));
+            assert_eq!(fs::read(&sentinel).unwrap(), b"must remain untouched");
+            fs::remove_file(&pack_id).unwrap();
+            fs::rename(&moved, &pack_id).unwrap();
+        }
+        drop(lease);
         fs::remove_dir_all(root).unwrap();
     }
 

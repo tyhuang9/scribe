@@ -208,6 +208,8 @@ fn production_pack_provisioning_allowed(
     let concrete_resolver_hello_flow = worker
         .contains("fn discover_production_pack_launch_bindings(")
         && worker.contains("impl ResolverHelloBindingBridge for")
+        && worker.contains("fn resolver_verified_pack_lease(&self) -> Arc<VerifiedPackLease>")
+        && worker.contains("fn launch_worker_from_verified_pack_lease(")
         && worker.contains("VerifiedPackLaunchBinding::try_from_resolver_hello_bridge")
         && worker.contains("trait WorkerExecutableResolver")
         && worker.contains("Hello");
@@ -264,7 +266,11 @@ fn stage_four_guard_rejects_dead_binding_declarations() {
     let concrete_flow = r#"
         trait WorkerExecutableResolver {}
         struct Hello;
+        struct VerifiedPackLease;
+        struct Arc<T>(T);
         impl ResolverHelloBindingBridge for ConcreteResolverHelloBridge {}
+        fn resolver_verified_pack_lease(&self) -> Arc<VerifiedPackLease> {}
+        fn launch_worker_from_verified_pack_lease(lease: Arc<VerifiedPackLease>) {}
         fn discover_production_pack_launch_bindings() {
             VerifiedPackLaunchBinding::try_from_resolver_hello_bridge(&bridge);
         }
@@ -728,6 +734,9 @@ fn verified_worker_pack_stage_remains_fail_closed_and_provider_inert() {
     for required in [
         "trait ResolverHelloBindingBridge",
         "struct VerifiedPackLaunchBinding",
+        "resolver_verified_pack_lease(&self) -> Arc<VerifiedPackLease>",
+        "verified_pack_lease: Arc<VerifiedPackLease>",
+        "pub(crate) fn verified_pack_lease(&self) -> &VerifiedPackLease",
         "bindings: Vec<VerifiedPackLaunchBinding>",
         "from_launch_bindings(bindings: Vec<VerifiedPackLaunchBinding>)",
         "try_from_resolver_hello_bridge",
@@ -742,6 +751,15 @@ fn verified_worker_pack_stage_remains_fail_closed_and_provider_inert() {
         assert!(
             module.contains(required),
             "typed Stage 4 production provisioning gate lost {required:?}"
+        );
+    }
+    for required in [
+        "struct LaunchableWorker<'lease>",
+        "_lease: &'lease VerifiedPackLease",
+    ] {
+        assert!(
+            production_manifest.contains(required),
+            "verified-pack lease launch gate lost {required:?}"
         );
     }
     assert!(
