@@ -916,6 +916,20 @@ fn verified_worker_pack_stage_four_remains_trust_closed_and_auto_inert() {
             "Stage 4 verified discovery/default-denied Auto contract lost {required:?}"
         );
     }
+    for required in [
+        "ash::Entry::load()",
+        "PhysicalDeviceIDProperties",
+        "PhysicalDeviceDriverProperties",
+        "native:luid:",
+        "native:uuid:",
+        "VulkanDeviceCatalog::discover",
+        "GPU provider device has no matching Vulkan LUID/UUID identity",
+    ] {
+        assert!(
+            worker.contains(required),
+            "worker-only Vulkan stable-identity contract lost {required:?}"
+        );
+    }
 }
 
 #[test]
@@ -965,6 +979,8 @@ fn worker_pack_authoring_is_isolated_pinned_and_production_closed() {
         "ac68faa20c58cbccd01ee7208bf3b6e93a7d7f96",
         "transcribe_cpp_checksum",
         "transcribe_cpp_sys_checksum",
+        "ash_checksum",
+        "39e9c3835d686b0a6084ab4234fcd1b07dbf6e4767dce60874b12356a25ecd4a",
         "a94e021ef658dc7c788837341a13f6acea3baf3c",
         "b7080b6f470bac96ef0afe56b25ae9b2f9f0ca82d10dad19bf3a2fc5ffd6cffc",
         "1.4.357.0",
@@ -989,13 +1005,20 @@ fn worker_pack_authoring_is_isolated_pinned_and_production_closed() {
         "windows-pe-imports.ps1",
         "Copy-ReviewedGpuWorkerDependencyClosure",
         "GPU pack contains an undeclared native dependency",
-        "target-gpu-pack-build-",
+        "Resolve-ShortCargoTargetDirectory",
+        "BuildEnvironment",
+        "Enable-ValidatedCmakeBuildJunction",
+        "one exact NTFS junction",
     ] {
         assert!(
             build.contains(required),
             "pack build gate lost {required:?}"
         );
     }
+    assert!(root_manifest.contains(
+        "vulkan-acceleration = [\"inference-worker\", \"transcribe-cpp/vulkan\", \"dep:ash\"]"
+    ));
+    assert!(root_manifest.contains("ash = { version = \"=0.37.3\", optional = true }"));
 }
 
 #[test]

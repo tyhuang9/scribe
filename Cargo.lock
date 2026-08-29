@@ -2575,6 +2575,7 @@ dependencies = [
  "accesskit_windows",
  "anyhow",
  "arboard",
+ "ash",
  "cc",
  "cpal",
  "crossbeam-channel",

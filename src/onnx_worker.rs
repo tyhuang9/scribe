@@ -1129,6 +1129,191 @@ impl PackDriverCatalog {
     }
 }
 
+#[cfg(all(windows, feature = "vulkan-acceleration"))]
+struct VulkanInstanceGuard(ash::Instance);
+
+#[cfg(all(windows, feature = "vulkan-acceleration"))]
+impl Drop for VulkanInstanceGuard {
+    fn drop(&mut self) {
+        // SAFETY: this guard exclusively owns the instance and all physical
+        // device queries have completed before it is dropped.
+        unsafe { self.0.destroy_instance(None) };
+    }
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct VulkanDeviceIdentity {
+    normalized_display_name: String,
+    device_class: DeviceClass,
+    vendor: GpuVendor,
+    stable_device_identity: String,
+    driver_identity: String,
+    claimed: bool,
+}
+
+#[cfg(windows)]
+struct VulkanDeviceCatalog {
+    devices: Vec<VulkanDeviceIdentity>,
+}
+
+#[cfg(windows)]
+impl VulkanDeviceCatalog {
+    #[cfg(feature = "vulkan-acceleration")]
+    fn discover() -> Result<Self> {
+        use ash::vk;
+        use std::ffi::CStr;
+
+        fn hex(bytes: &[u8]) -> String {
+            use std::fmt::Write as _;
+
+            let mut encoded = String::with_capacity(bytes.len() * 2);
+            for byte in bytes {
+                write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
+            }
+            encoded
+        }
+
+        // SAFETY: loading occurs only inside the verified Vulkan worker after
+        // its environment and DLL search path have been sanitized. The desktop
+        // does not compile this feature in production or call this code.
+        let entry =
+            unsafe { ash::Entry::load() }.context("could not load the Windows Vulkan loader")?;
+        let application_name = c"scribe-gpu-worker";
+        let application = vk::ApplicationInfo::builder()
+            .application_name(application_name)
+            .application_version(1)
+            .api_version(vk::API_VERSION_1_1);
+        let create_info = vk::InstanceCreateInfo::builder().application_info(&application);
+        // SAFETY: create_info contains no extension/layer pointers and remains
+        // live for the synchronous loader call.
+        let instance = VulkanInstanceGuard(
+            unsafe { entry.create_instance(&create_info, None) }
+                .context("could not create the Vulkan identity-query instance")?,
+        );
+        // SAFETY: the instance remains live through every returned physical
+        // device query and the bounded vector is consumed before destruction.
+        let physical_devices = unsafe { instance.0.enumerate_physical_devices() }
+            .context("could not enumerate Vulkan physical devices for stable identity")?;
+        if physical_devices.is_empty() || physical_devices.len() > 64 {
+            bail!("Vulkan physical-device identity list is empty or oversized");
+        }
+
+        let mut devices = Vec::with_capacity(physical_devices.len());
+        for physical_device in physical_devices {
+            let mut id = vk::PhysicalDeviceIDProperties::default();
+            let mut driver = vk::PhysicalDeviceDriverProperties::default();
+            let mut properties = vk::PhysicalDeviceProperties2::builder()
+                .push_next(&mut id)
+                .push_next(&mut driver)
+                .build();
+            // SAFETY: all pNext structures are correctly initialized and live
+            // for the synchronous properties query.
+            unsafe {
+                instance
+                    .0
+                    .get_physical_device_properties2(physical_device, &mut properties)
+            };
+            let device_class = match properties.properties.device_type {
+                vk::PhysicalDeviceType::DISCRETE_GPU => DeviceClass::DiscreteGpu,
+                vk::PhysicalDeviceType::INTEGRATED_GPU => DeviceClass::IntegratedGpu,
+                _ => continue,
+            };
+            let vendor = match properties.properties.vendor_id {
+                0x10de => GpuVendor::Nvidia,
+                0x1002 | 0x1022 => GpuVendor::Amd,
+                0x8086 => GpuVendor::Intel,
+                _ => GpuVendor::Other,
+            };
+            // SAFETY: Vulkan guarantees that deviceName is a terminated UTF-8
+            // string within this fixed-size array.
+            let display_name =
+                unsafe { CStr::from_ptr(properties.properties.device_name.as_ptr()) }
+                    .to_str()
+                    .context("Vulkan device name is not UTF-8")?;
+            let normalized_display_name = normalize_gpu_display_name(display_name)
+                .ok_or_else(|| anyhow!("Vulkan device name is empty or malformed"))?;
+            let stable_device_identity = if id.device_luid_valid == vk::TRUE
+                && id.device_luid.iter().any(|byte| *byte != 0)
+            {
+                format!("native:luid:{}", hex(&id.device_luid))
+            } else if id.device_uuid.iter().any(|byte| *byte != 0) {
+                format!("native:uuid:{}", hex(&id.device_uuid))
+            } else {
+                bail!("Vulkan physical device omitted both LUID and UUID identity");
+            };
+            if id.driver_uuid.iter().all(|byte| *byte == 0) {
+                bail!("Vulkan physical device omitted driver UUID identity");
+            }
+            let driver_identity = format!(
+                "vulkan:{:04x}:{:08x}:{:08x}:{}",
+                properties.properties.vendor_id,
+                driver.driver_id.as_raw(),
+                properties.properties.driver_version,
+                hex(&id.driver_uuid)
+            );
+            devices.push(VulkanDeviceIdentity {
+                normalized_display_name,
+                device_class,
+                vendor,
+                stable_device_identity,
+                driver_identity,
+                claimed: false,
+            });
+        }
+        if devices.is_empty() {
+            bail!("Vulkan reported no discrete or integrated physical GPU identity");
+        }
+        let mut identities = devices
+            .iter()
+            .map(|device| device.stable_device_identity.as_str())
+            .collect::<Vec<_>>();
+        identities.sort_unstable();
+        if identities.windows(2).any(|pair| pair[0] == pair[1]) {
+            bail!("Vulkan reported duplicate stable physical-device identities");
+        }
+        Ok(Self { devices })
+    }
+
+    fn claim(
+        &mut self,
+        display_name: &str,
+        device_class: DeviceClass,
+        vendor: GpuVendor,
+    ) -> Result<(String, String)> {
+        let normalized = normalize_gpu_display_name(display_name)
+            .ok_or_else(|| anyhow!("GPU provider device name is empty or malformed"))?;
+        let device = self
+            .devices
+            .iter_mut()
+            .find(|device| {
+                !device.claimed
+                    && device.normalized_display_name == normalized
+                    && device.device_class == device_class
+                    && device.vendor == vendor
+            })
+            .ok_or_else(|| {
+                anyhow!("GPU provider device has no matching Vulkan LUID/UUID identity")
+            })?;
+        device.claimed = true;
+        Ok((
+            device.stable_device_identity.clone(),
+            device.driver_identity.clone(),
+        ))
+    }
+}
+
+#[cfg(windows)]
+fn normalize_gpu_display_name(value: &str) -> Option<String> {
+    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!normalized.is_empty()
+        && normalized.len() <= 256
+        && normalized
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic() || byte == b' '))
+    .then(|| normalized.to_ascii_lowercase())
+}
+
 #[cfg(not(windows))]
 struct PackDriverCatalog;
 
@@ -1195,69 +1380,93 @@ fn worker_pack_capability(role: WorkerRole) -> Result<Option<WorkerPackCapabilit
     let expected_device_id = std::env::var(PACK_DEVICE_ID_ENV).ok();
     let driver_catalog = PackDriverCatalog::discover()
         .context("could not obtain authoritative GPU driver identity")?;
-    let devices = transcribe_cpp::devices()
+    #[cfg(all(windows, feature = "vulkan-acceleration"))]
+    let mut vulkan_catalog = (expectation.backend == WorkerProvider::Vulkan)
+        .then(VulkanDeviceCatalog::discover)
+        .transpose()
+        .context("could not obtain Vulkan LUID/UUID identity")?;
+    let provider_devices = transcribe_cpp::devices()
         .into_iter()
         .filter(|device| device.kind.trim().eq_ignore_ascii_case(expected_kind))
-        .map(|device| -> Result<WorkerPackDeviceCapability> {
-            let process_index = device
-                .index
-                .ok_or_else(|| anyhow!("GPU provider device has no live process index"))?;
-            let native_id = device
-                .device_id
-                .as_deref()
-                .ok_or_else(|| anyhow!("GPU provider device has no stable identity"))?
-                .trim();
-            if native_id.is_empty() || !native_id.is_ascii() {
-                bail!("GPU provider device stable identity is malformed");
+        .collect::<Vec<_>>();
+    if provider_devices.len() > MAX_PACK_DEVICES {
+        bail!("compiled GPU provider exceeded the bounded device-list limit");
+    }
+    let mut devices = Vec::with_capacity(provider_devices.len());
+    for device in provider_devices {
+        let process_index = device
+            .index
+            .ok_or_else(|| anyhow!("GPU provider device has no live process index"))?;
+        let display_name = [&device.description, &device.name]
+            .into_iter()
+            .map(|value| value.trim())
+            .find(|value| !value.is_empty() && value.is_ascii())
+            .ok_or_else(|| anyhow!("GPU provider device has no bounded display name"))?
+            .to_owned();
+        let device_class = match device.device_type {
+            DeviceType::Gpu if expectation.backend == WorkerProvider::Metal => {
+                DeviceClass::UnifiedGpu
             }
-            let stable_device_identity = format!("native:{}", native_id.to_ascii_lowercase());
-            let display_name = [&device.description, &device.name]
-                .into_iter()
-                .map(|value| value.trim())
-                .find(|value| !value.is_empty() && value.is_ascii())
-                .ok_or_else(|| anyhow!("GPU provider device has no bounded display name"))?
-                .to_owned();
-            let device_class = match device.device_type {
-                DeviceType::Gpu if expectation.backend == WorkerProvider::Metal => {
-                    DeviceClass::UnifiedGpu
+            DeviceType::Gpu => DeviceClass::DiscreteGpu,
+            DeviceType::Igpu if expectation.backend == WorkerProvider::Metal => {
+                DeviceClass::UnifiedGpu
+            }
+            DeviceType::Igpu => DeviceClass::IntegratedGpu,
+            DeviceType::Unknown => DeviceClass::Unknown,
+            DeviceType::Cpu | DeviceType::Accel => {
+                bail!("GPU provider returned a non-GPU device")
+            }
+        };
+        let normalized = format!("{} {}", device.name, device.description).to_ascii_lowercase();
+        let vendor = match expectation.backend {
+            WorkerProvider::Cuda => GpuVendor::Nvidia,
+            WorkerProvider::Metal => GpuVendor::Apple,
+            WorkerProvider::Vulkan if normalized.contains("nvidia") => GpuVendor::Nvidia,
+            WorkerProvider::Vulkan
+                if normalized.contains("amd") || normalized.contains("radeon") =>
+            {
+                GpuVendor::Amd
+            }
+            WorkerProvider::Vulkan if normalized.contains("intel") => GpuVendor::Intel,
+            WorkerProvider::Vulkan => GpuVendor::Other,
+            WorkerProvider::Cpu => GpuVendor::Unknown,
+        };
+        let native_id = device.device_id.as_deref().map(str::trim);
+        let (stable_device_identity, driver_version) =
+            if let Some(native_id) = native_id.filter(|native_id| !native_id.is_empty()) {
+                if !native_id.is_ascii() {
+                    bail!("GPU provider device stable identity is malformed");
                 }
-                DeviceType::Gpu => DeviceClass::DiscreteGpu,
-                DeviceType::Igpu if expectation.backend == WorkerProvider::Metal => {
-                    DeviceClass::UnifiedGpu
-                }
-                DeviceType::Igpu => DeviceClass::IntegratedGpu,
-                DeviceType::Unknown => DeviceClass::Unknown,
-                DeviceType::Cpu | DeviceType::Accel => {
-                    bail!("GPU provider returned a non-GPU device")
-                }
-            };
-            let normalized = format!("{} {}", device.name, device.description).to_ascii_lowercase();
-            let vendor = match expectation.backend {
-                WorkerProvider::Cuda => GpuVendor::Nvidia,
-                WorkerProvider::Metal => GpuVendor::Apple,
-                WorkerProvider::Vulkan if normalized.contains("nvidia") => GpuVendor::Nvidia,
-                WorkerProvider::Vulkan
-                    if normalized.contains("amd") || normalized.contains("radeon") =>
+                let stable_device_identity = format!("native:{}", native_id.to_ascii_lowercase());
+                let driver_version = driver_catalog.identity_for(&stable_device_identity)?;
+                (stable_device_identity, driver_version)
+            } else {
+                #[cfg(all(windows, feature = "vulkan-acceleration"))]
                 {
-                    GpuVendor::Amd
+                    if expectation.backend != WorkerProvider::Vulkan {
+                        bail!("GPU provider device has no stable identity");
+                    }
+                    vulkan_catalog
+                        .as_mut()
+                        .expect("Vulkan catalog exists for the compiled Vulkan worker")
+                        .claim(&display_name, device_class, vendor)?
                 }
-                WorkerProvider::Vulkan if normalized.contains("intel") => GpuVendor::Intel,
-                WorkerProvider::Vulkan => GpuVendor::Other,
-                WorkerProvider::Cpu => GpuVendor::Unknown,
+                #[cfg(not(all(windows, feature = "vulkan-acceleration")))]
+                {
+                    bail!("GPU provider device has no stable identity");
+                }
             };
-            let driver_version = driver_catalog.identity_for(&stable_device_identity)?;
-            Ok(WorkerPackDeviceCapability {
-                stable_device_identity,
-                process_index,
-                display_name,
-                driver_version: Some(driver_version),
-                device_class,
-                vendor,
-                memory_total_bytes: device.memory_total,
-                memory_available_bytes: device.memory_free.min(device.memory_total),
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
+        devices.push(WorkerPackDeviceCapability {
+            stable_device_identity,
+            process_index,
+            display_name,
+            driver_version: Some(driver_version),
+            device_class,
+            vendor,
+            memory_total_bytes: device.memory_total,
+            memory_available_bytes: device.memory_free.min(device.memory_total),
+        });
+    }
     let mut devices = devices
         .into_iter()
         .filter(|device| {
@@ -2260,8 +2469,14 @@ fn resolve_verified_pack_executable(
         PackBackend::Vulkan => &[PackBackend::Vulkan][..],
         PackBackend::Metal => &[PackBackend::Metal][..],
     };
+    #[cfg(test)]
+    let trust_root = lease
+        .test_reverification_trust()
+        .unwrap_or(&ProductionTrustRoot);
+    #[cfg(not(test))]
+    let trust_root = &ProductionTrustRoot;
     let verifier = PackVerifier::new(
-        &ProductionTrustRoot,
+        trust_root,
         crate::gpu_worker_pack::manifest::Compatibility {
             app_build: DESKTOP_BUILD_ID,
             worker_build: INFERENCE_WORKER_BUILD_ID,
@@ -8563,6 +8778,27 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn fixture_pack_launch_reverifies_with_fixture_only_trust() {
+        let root =
+            crate::gpu_worker_pack::manifest::test_support::temp_root("pack-fixture-launch-trust");
+        let (_, lease) = crate::gpu_worker_pack::manifest::test_support::leased_fixture(&root);
+        let executable = resolve_verified_pack_executable(Arc::new(lease), None)
+            .expect("fixture launch must reverify with its test-only trust authority");
+        assert_eq!(
+            executable
+                .pack_launch
+                .as_ref()
+                .expect("fixture launch keeps verified pack authority")
+                .expectation
+                .backend,
+            WorkerProvider::Vulkan
+        );
+        drop(executable);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn verified_pack_hello_remaps_index_by_exact_stable_identity() {
         let root = crate::gpu_worker_pack::manifest::test_support::temp_root("pack-hello-remap");
@@ -8714,6 +8950,88 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn vulkan_identity_catalog_remaps_duplicate_names_and_driver_changes() {
+        let device = |identity: &str, driver: &str| VulkanDeviceIdentity {
+            normalized_display_name: "fixture duplicate gpu".to_owned(),
+            device_class: DeviceClass::DiscreteGpu,
+            vendor: GpuVendor::Nvidia,
+            stable_device_identity: identity.to_owned(),
+            driver_identity: driver.to_owned(),
+            claimed: false,
+        };
+        let mut catalog = VulkanDeviceCatalog {
+            devices: vec![
+                device("native:luid:0000000000000001", "vulkan:10de:1:1:a"),
+                device("native:luid:0000000000000002", "vulkan:10de:1:1:b"),
+            ],
+        };
+        assert_eq!(
+            catalog
+                .claim(
+                    " Fixture   Duplicate GPU ",
+                    DeviceClass::DiscreteGpu,
+                    GpuVendor::Nvidia,
+                )
+                .unwrap(),
+            (
+                "native:luid:0000000000000001".to_owned(),
+                "vulkan:10de:1:1:a".to_owned(),
+            )
+        );
+        assert_eq!(
+            catalog
+                .claim(
+                    "fixture duplicate gpu",
+                    DeviceClass::DiscreteGpu,
+                    GpuVendor::Nvidia,
+                )
+                .unwrap()
+                .0,
+            "native:luid:0000000000000002"
+        );
+        assert!(
+            catalog
+                .claim(
+                    "fixture duplicate gpu",
+                    DeviceClass::DiscreteGpu,
+                    GpuVendor::Nvidia,
+                )
+                .is_err()
+        );
+
+        let mut changed = VulkanDeviceCatalog {
+            devices: vec![device(
+                "native:luid:0000000000000001",
+                "vulkan:10de:1:2:changed",
+            )],
+        };
+        assert_eq!(
+            changed
+                .claim(
+                    "fixture duplicate gpu",
+                    DeviceClass::DiscreteGpu,
+                    GpuVendor::Nvidia,
+                )
+                .unwrap()
+                .1,
+            "vulkan:10de:1:2:changed"
+        );
+        let mut mismatch = VulkanDeviceCatalog {
+            devices: vec![device("native:luid:0000000000000001", "vulkan:10de:1:1:a")],
+        };
+        assert!(
+            mismatch
+                .claim(
+                    "fixture duplicate gpu",
+                    DeviceClass::IntegratedGpu,
+                    GpuVendor::Nvidia,
+                )
+                .is_err()
+        );
+    }
+
     #[cfg(all(
         windows,
         feature = "inference-worker",
@@ -8734,16 +9052,45 @@ mod tests {
             .filter(|device| device.kind.eq_ignore_ascii_case(expected_kind))
             .collect::<Vec<_>>();
         assert!(!devices.is_empty());
+        #[cfg(feature = "vulkan-acceleration")]
+        let mut vulkan_catalog = VulkanDeviceCatalog::discover().unwrap();
         for device in devices {
-            let stable = format!(
-                "native:{}",
-                device
-                    .device_id
-                    .expect("provider stable ID")
-                    .to_ascii_lowercase()
+            let (stable, driver) = if let Some(native_id) = device.device_id {
+                let stable = format!("native:{}", native_id.to_ascii_lowercase());
+                let driver = catalog.identity_for(&stable).unwrap();
+                (stable, driver)
+            } else {
+                #[cfg(feature = "vulkan-acceleration")]
+                {
+                    let class = match device.device_type {
+                        transcribe_cpp::DeviceType::Gpu => DeviceClass::DiscreteGpu,
+                        transcribe_cpp::DeviceType::Igpu => DeviceClass::IntegratedGpu,
+                        _ => panic!("provider returned a non-GPU Vulkan device"),
+                    };
+                    let normalized =
+                        format!("{} {}", device.name, device.description).to_ascii_lowercase();
+                    let vendor = if normalized.contains("nvidia") {
+                        GpuVendor::Nvidia
+                    } else if normalized.contains("amd") || normalized.contains("radeon") {
+                        GpuVendor::Amd
+                    } else if normalized.contains("intel") {
+                        GpuVendor::Intel
+                    } else {
+                        GpuVendor::Other
+                    };
+                    vulkan_catalog
+                        .claim(&device.description, class, vendor)
+                        .unwrap()
+                }
+                #[cfg(not(feature = "vulkan-acceleration"))]
+                panic!("CUDA provider omitted its stable identity");
+            };
+            assert!(
+                stable.starts_with("native:pci:")
+                    || stable.starts_with("native:luid:")
+                    || stable.starts_with("native:uuid:")
             );
-            let driver = catalog.identity_for(&stable).unwrap();
-            assert!(driver.starts_with("windows-display:"));
+            assert!(driver.starts_with("windows-display:") || driver.starts_with("vulkan:"));
             assert!(driver.len() <= 128);
         }
     }

@@ -19,13 +19,20 @@ signing secret are provisioned.
   pre-output provider/worker failure, and never falls back to CPU. Cancellation,
   invalid input, model corruption, decode/content failure, and partial output
   are never replayed.
-- The current process index is remapped from the stable PCI identity on every
-  actual start. Hello must agree with the parent-observed backend, provider,
-  vendor, class, identity, current index, driver, and bounded memory snapshot.
-- Windows SetupAPI supplies the selected device's bounded canonical driver
-  identity without loading a GPU provider into the desktop. Missing driver
-  identity makes the candidate incompatible instead of producing an unbound
-  health key.
+- The current process index is remapped from stable PCI, Windows LUID, or device
+  UUID identity on every actual start. Hello must agree with the
+  parent-observed backend, provider, vendor, class, identity, current index,
+  driver, and bounded memory snapshot.
+- CUDA uses the provider PCI identity plus the matching bounded Windows
+  SetupAPI driver version. Windows Vulkan drivers commonly omit
+  `VK_EXT_pci_bus_info`, so the verified Vulkan worker performs a second
+  extension-free loader query and correlates the provider enumeration to
+  `VkPhysicalDeviceIDProperties` in the same live process. It prefers the
+  Windows LUID, falls back to device UUID, and binds the Vulkan driver ID,
+  version, and driver UUID. Duplicate or unmatched facts fail closed. The
+  desktop never loads the Vulkan loader or provider. Missing stable device or
+  driver identity makes the candidate incompatible instead of producing an
+  unbound health key.
 - One registry-wide route owns the sole inference worker/model. CPU/GPU and
   GPU-device switches retire the previous worker; failed fallback workers are
   retired; only the winner retains the existing five-minute warm model.

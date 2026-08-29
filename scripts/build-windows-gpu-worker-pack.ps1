@@ -333,6 +333,9 @@ function Assert-BaseToolchain($Contract, [string]$RepositoryRoot) {
     Assert-LockedPackage $cargoLock 'transcribe-cpp-sys' `
         ([string]$Contract.native_source.transcribe_cpp_sys_version) `
         ([string]$Contract.native_source.transcribe_cpp_sys_checksum)
+    Assert-LockedPackage $cargoLock 'ash' `
+        ([string]$Contract.native_source.ash_version) `
+        ([string]$Contract.native_source.ash_checksum)
     $toolchain = Get-Content -LiteralPath (Join-Path $RepositoryRoot 'rust-toolchain.toml') -Raw
     if ($toolchain -notmatch "channel\s*=\s*`"$([regex]::Escape([string]$Contract.rust.release))`"") {
         throw 'rust-toolchain.toml does not match the worker-pack toolchain contract.'
@@ -350,6 +353,15 @@ function Assert-BaseToolchain($Contract, [string]$RepositoryRoot) {
         $manifestText = Get-Content -LiteralPath $manifest -Raw
         if ($manifestText -notmatch "(?m)^version\s*=\s*`"$([regex]::Escape([string]$Contract.app_version))`"\s*$") {
             throw "Package version in $manifest does not match the worker-pack app version contract."
+        }
+    }
+    $rootManifest = Get-Content -LiteralPath (Join-Path $RepositoryRoot 'Cargo.toml') -Raw
+    foreach ($required in @(
+        'vulkan-acceleration = ["inference-worker", "transcribe-cpp/vulkan", "dep:ash"]',
+        'ash = { version = "=0.37.3", optional = true }'
+    )) {
+        if (-not $rootManifest.Contains($required)) {
+            throw "Cargo.toml lost the pinned worker-only Vulkan identity dependency: $required"
         }
     }
 }
@@ -475,7 +487,7 @@ $null = Assert-RegularNonReparseFile $contractPath 'GPU worker-pack toolchain ma
 $contract = Get-Content -LiteralPath $contractPath -Raw | ConvertFrom-Json
 Assert-ExactProperties $contract @('schema_version', 'app_version', 'target_triple', 'rust', 'native_source', 'msvc', 'build', 'vulkan', 'cuda') 'GPU worker-pack toolchain manifest'
 Assert-ExactProperties $contract.rust @('release', 'commit', 'host') 'Rust toolchain contract'
-Assert-ExactProperties $contract.native_source @('transcribe_cpp_version', 'transcribe_cpp_checksum', 'transcribe_cpp_sys_version', 'transcribe_cpp_sys_checksum', 'source_revision', 'sherpa_onnx_archive') 'Native source contract'
+Assert-ExactProperties $contract.native_source @('transcribe_cpp_version', 'transcribe_cpp_checksum', 'transcribe_cpp_sys_version', 'transcribe_cpp_sys_checksum', 'ash_version', 'ash_checksum', 'source_revision', 'sherpa_onnx_archive') 'Native source contract'
 Assert-ExactProperties $contract.native_source.sherpa_onnx_archive @('filename', 'size_bytes', 'sha256') 'Sherpa ONNX archive contract'
 Assert-ExactProperties $contract.msvc @('visual_studio_installation_version', 'toolset_version', 'platform_toolset', 'cmake_version', 'runtime', 'reproducible_flag') 'MSVC toolchain contract'
 Assert-ExactProperties $contract.build @('profile', 'static_cpu_scheduling', 'dynamic_backends', 'openmp') 'Worker build contract'

@@ -173,6 +173,8 @@ pub(crate) struct VerifiedPackLease {
     root: PinnedPackRoot,
     copy_entries: Vec<VerifiedCopyEntry>,
     _retained_files: Vec<File>,
+    #[cfg(test)]
+    test_reverification_trust: Option<&'static dyn TrustRoot>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -206,6 +208,11 @@ impl VerifiedPackLease {
 
     pub(crate) fn copy_entries(&self) -> &[VerifiedCopyEntry] {
         &self.copy_entries
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_reverification_trust(&self) -> Option<&'static dyn TrustRoot> {
+        self.test_reverification_trust
     }
 
     pub(crate) fn open_copy_file(
@@ -401,6 +408,8 @@ impl<'a> PackVerifier<'a> {
             root,
             copy_entries,
             _retained_files: retained_files,
+            #[cfg(test)]
+            test_reverification_trust: None,
         })
     }
 
@@ -1478,7 +1487,8 @@ pub(crate) mod test_support {
             &descriptor.pack_digest,
         )
         .unwrap();
-        let lease = verifier.verify_pinned(pinned).unwrap();
+        let mut lease = verifier.verify_pinned(pinned).unwrap();
+        lease.test_reverification_trust = Some(verifier.trust_root);
         (verifier, lease)
     }
 
@@ -1527,7 +1537,8 @@ pub(crate) mod test_support {
             [&descriptor.pack_id, &descriptor.pack_version],
             &descriptor.pack_digest,
         )?;
-        let lease = verifier.verify_pinned(pinned)?;
+        let mut lease = verifier.verify_pinned(pinned)?;
+        lease.test_reverification_trust = Some(trust);
         Ok((owner_root, lease))
     }
 }
