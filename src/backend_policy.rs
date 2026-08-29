@@ -267,6 +267,23 @@ impl BackendCandidate {
     }
 }
 
+/// Narrow projection from private health state into runtime-neutral selection.
+/// Implementations must not expose persisted health details or provider paths.
+pub(crate) trait CandidateQuarantineProjection {
+    fn is_quarantined(&self, target: &BackendTarget) -> bool;
+}
+
+pub(crate) fn apply_quarantine_projection(
+    candidates: &mut [BackendCandidate],
+    projection: &dyn CandidateQuarantineProjection,
+) {
+    for candidate in candidates {
+        if candidate.target.backend.is_gpu() && projection.is_quarantined(&candidate.target) {
+            candidate.availability = CandidateAvailability::Quarantined;
+        }
+    }
+}
+
 /// Auto qualification is deliberately an explicit, versioned allowlist.
 /// Stage 1 ships no entries: discovered GPUs remain available to explicit GPU
 /// mode while Auto stays on the guaranteed CPU path.

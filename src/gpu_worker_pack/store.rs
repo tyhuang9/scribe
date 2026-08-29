@@ -453,7 +453,7 @@ fn read_regular_directory(path: &Path) -> Result<Vec<PathBuf>, PackStoreError> {
         .collect()
 }
 
-fn read_canonical_state<T>(path: &Path) -> Result<T, PackStoreError>
+pub(super) fn read_canonical_state<T>(path: &Path) -> Result<T, PackStoreError>
 where
     T: for<'de> Deserialize<'de> + Serialize,
 {
@@ -475,7 +475,10 @@ where
     Ok(value)
 }
 
-fn atomic_write_canonical<T: Serialize>(path: &Path, value: &T) -> Result<(), PackStoreError> {
+pub(super) fn atomic_write_canonical<T: Serialize>(
+    path: &Path,
+    value: &T,
+) -> Result<(), PackStoreError> {
     let parent = path
         .parent()
         .ok_or(PackStoreError::CorruptState("state parent"))?;
