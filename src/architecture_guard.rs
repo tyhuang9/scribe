@@ -1064,6 +1064,7 @@ fn worker_pack_health_persistence_stays_bounded_and_content_free() {
 fn release_packaging_accepts_only_compiled_verified_declared_pack_roots() {
     let build = include_str!("../scripts/build-windows-release.ps1");
     let stage = include_str!("../scripts/stage-verified-worker-packs.ps1");
+    let release_policy = include_str!("../scripts/resolve-windows-gpu-release-policy.ps1");
     let installer = include_str!("../installer/scribe.iss");
     let workflow = include_str!("../.github/workflows/release.yml");
     for required in [
@@ -1089,6 +1090,12 @@ fn release_packaging_accepts_only_compiled_verified_declared_pack_roots() {
     for required in [
         "include_gpu_worker_packs:",
         "default: false",
+        "SCRIBE_GPU_PACK_RELEASE_POLICY",
+        "resolve-windows-gpu-release-policy.ps1",
+        "steps.gpu-release-policy.outputs.include_gpu_worker_packs == 'true'",
+        "temporary_cpu_only_stage4",
+        "gpu_packs_required",
+        "needs.build.outputs.gpu_worker_packs_included",
         "SCRIBE_GPU_PACK_SIGNING_KEY_PKCS8_BASE64",
         "prepare-windows-gpu-worker-packs.ps1",
         "artifacts\\gpu-worker-packs\\production\\cuda",
@@ -1099,6 +1106,17 @@ fn release_packaging_accepts_only_compiled_verified_declared_pack_roots() {
         assert!(
             workflow.contains(required),
             "Stage 4 release workflow lost {required:?}"
+        );
+    }
+    for required in [
+        "Official Windows releases require SCRIBE_GPU_PACK_RELEASE_POLICY",
+        "temporary_cpu_only_stage4",
+        "gpu_packs_required",
+        "include_gpu_worker_packs",
+    ] {
+        assert!(
+            release_policy.contains(required),
+            "GPU release policy gate lost {required:?}"
         );
     }
     assert!(!build.contains("--features vulkan-acceleration"));

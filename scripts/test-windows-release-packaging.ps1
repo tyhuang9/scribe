@@ -5,6 +5,7 @@ $repositoryRoot = [System.IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoo
 $releaseScript = Join-Path $PSScriptRoot "build-windows-release.ps1"
 $modelScript = Join-Path $PSScriptRoot "bundle-base-model.ps1"
 $packageVerifier = Join-Path $PSScriptRoot "verify-windows-release-package.ps1"
+$gpuReleasePolicyScript = Join-Path $PSScriptRoot "resolve-windows-gpu-release-policy.ps1"
 . (Join-Path $PSScriptRoot "windows-pe-imports.ps1")
 $source = Get-Content -LiteralPath $releaseScript -Raw
 $helpersStart = $source.IndexOf("function Get-NormalizedFullPath")
@@ -199,7 +200,14 @@ function Assert-GpuWorkerPackWorkflowContract([string]$Workflow) {
     foreach ($required in @(
         'include_gpu_worker_packs:',
         'default: false',
-        "if: github.event_name == 'workflow_dispatch' && inputs.include_gpu_worker_packs",
+        'SCRIBE_GPU_PACK_RELEASE_POLICY',
+        'resolve-windows-gpu-release-policy.ps1',
+        "if: steps.gpu-release-policy.outputs.include_gpu_worker_packs == 'true'",
+        'gpu_pack_release_policy: ${{ steps.gpu-release-policy.outputs.release_policy }}',
+        'gpu_worker_packs_included: ${{ steps.gpu-release-policy.outputs.include_gpu_worker_packs }}',
+        'temporary_cpu_only_stage4',
+        'gpu_packs_required',
+        'Official GPU-capable publication omitted required CUDA or Vulkan worker packs.',
         'SCRIBE_GPU_PACK_SIGNING_KEY_PKCS8_BASE64',
         'SCRIBE_GPU_PACK_SIGNING_KEY_ID',
         '[Convert]::FromBase64String',
@@ -232,6 +240,87 @@ function Assert-GpuWorkerPackWorkflowContract([string]$Workflow) {
     ) 'GPU signing secret lifecycle'
     if ($gpuBuild.Contains('Fixture') -or $gpuBuild.Contains('fixture')) {
         throw 'Release workflow must never admit fixture signing or fixture trust.'
+    }
+}
+
+function Assert-GpuReleasePolicyScriptContract([string]$Script, [string]$Root) {
+    $nonRelease = & $Script `
+        -EventName 'push' `
+        -Ref 'refs/heads/main' `
+        -Policy ''
+    if ($nonRelease.official_release -or
+        $nonRelease.include_gpu_worker_packs -or
+        $nonRelease.release_policy -cne 'unconfigured') {
+        throw 'Non-release builds must remain CPU-only without requiring repository release policy.'
+    }
+
+    $manualValidation = & $Script `
+        -EventName 'workflow_dispatch' `
+        -Ref 'refs/heads/main' `
+        -Policy '' `
+        -RequestedGpuPacks
+    if ($manualValidation.official_release -or -not $manualValidation.include_gpu_worker_packs) {
+        throw 'Non-publication workflow dispatch must retain explicit GPU pack validation.'
+    }
+
+    $temporaryOfficial = & $Script `
+        -EventName 'push' `
+        -Ref 'refs/tags/v0.1.0' `
+        -Policy 'temporary_cpu_only_stage4'
+    if (-not $temporaryOfficial.official_release -or
+        $temporaryOfficial.include_gpu_worker_packs -or
+        $temporaryOfficial.release_policy -cne 'temporary_cpu_only_stage4') {
+        throw 'Temporary Stage 4 official release policy must be explicit and CPU-only.'
+    }
+
+    $requiredOfficial = & $Script `
+        -EventName 'push' `
+        -Ref 'refs/tags/v0.1.0' `
+        -Policy 'gpu_packs_required'
+    if (-not $requiredOfficial.official_release -or
+        -not $requiredOfficial.include_gpu_worker_packs -or
+        $requiredOfficial.release_policy -cne 'gpu_packs_required') {
+        throw 'GPU-required official tag policy must force pack inclusion without a dispatch input.'
+    }
+
+    Invoke-ExpectedFailure {
+        & $Script `
+            -EventName 'push' `
+            -Ref 'refs/tags/v0.1.0' `
+            -Policy ''
+    } 'Official Windows releases require SCRIBE_GPU_PACK_RELEASE_POLICY'
+    Invoke-ExpectedFailure {
+        & $Script `
+            -EventName 'workflow_dispatch' `
+            -Ref 'refs/heads/main' `
+            -Policy 'temporary_cpu_only_stage4' `
+            -RequestedGpuPacks `
+            -PublishRelease
+    } 'temporary_cpu_only_stage4 official-release policy forbids GPU pack inclusion'
+    Invoke-ExpectedFailure {
+        & $Script `
+            -EventName 'push' `
+            -Ref 'refs/heads/main' `
+            -Policy 'unknown-policy'
+    } 'unsupported value'
+
+    $githubOutput = Join-Path $Root 'gpu-release-policy-output.txt'
+    New-Item -ItemType File -Path $githubOutput | Out-Null
+    $null = & $Script `
+        -EventName 'workflow_dispatch' `
+        -Ref 'refs/heads/main' `
+        -Policy 'gpu_packs_required' `
+        -PublishRelease `
+        -GitHubOutputPath $githubOutput
+    $output = Get-Content -LiteralPath $githubOutput -Raw
+    foreach ($required in @(
+        'official_release=true',
+        'release_policy=gpu_packs_required',
+        'include_gpu_worker_packs=true'
+    )) {
+        if (-not $output.Contains($required)) {
+            throw "GPU release policy GitHub output lost $required"
+        }
     }
 }
 
@@ -694,6 +783,7 @@ try {
     Assert-ReleaseCargoFeatureContract $source
     Assert-VulkanSdkWorkflowContract $workflow
     Assert-GpuWorkerPackWorkflowContract $workflow
+    Assert-GpuReleasePolicyScriptContract $gpuReleasePolicyScript $testRoot
     if ($workflow -notmatch "prepare-windows-release-inputs\.ps1" -or
         $workflow -notmatch "build-windows-release\.ps1" -or
         $workflow -notmatch "INNO_NUPKG_SHA256: a0dad33db33099d9cd2b89ac2d08b5d70c589b15118ced3b95f469f044f99950" -or

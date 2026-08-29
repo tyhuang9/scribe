@@ -10,7 +10,7 @@ on:
         type: boolean
         default: false
       include_gpu_worker_packs:
-        description: Build production-signed Windows x64 CUDA and Vulkan worker packs (requires reviewed trust and CI secret)
+        description: Build production-signed GPU packs for non-publication validation; official releases follow the reviewed repository policy
         required: true
         type: boolean
         default: false
@@ -26,10 +26,32 @@ jobs:
     name: Build and verify Windows installer
     runs-on: windows-latest
     timeout-minutes: 120
+    outputs:
+      gpu_pack_release_policy: ${{ steps.gpu-release-policy.outputs.release_policy }}
+      gpu_worker_packs_included: ${{ steps.gpu-release-policy.outputs.include_gpu_worker_packs }}
+      official_release: ${{ steps.gpu-release-policy.outputs.official_release }}
 
     steps:
       - name: Check out source
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Resolve official GPU worker-pack release policy
+        id: gpu-release-policy
+        shell: pwsh
+        env:
+          GPU_PACK_RELEASE_POLICY: ${{ vars.SCRIBE_GPU_PACK_RELEASE_POLICY }}
+          REQUESTED_GPU_PACKS: ${{ github.event_name == 'workflow_dispatch' && inputs.include_gpu_worker_packs }}
+          PUBLISH_RELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_release }}
+        run: |
+          $requestedGpuPacks = $env:REQUESTED_GPU_PACKS -ceq 'true'
+          $publishRelease = $env:PUBLISH_RELEASE -ceq 'true'
+          & .\scripts\resolve-windows-gpu-release-policy.ps1 `
+            -EventName $env:GITHUB_EVENT_NAME `
+            -Ref $env:GITHUB_REF `
+            -Policy $env:GPU_PACK_RELEASE_POLICY `
+            -RequestedGpuPacks:$requestedGpuPacks `
+            -PublishRelease:$publishRelease `
+            -GitHubOutputPath $env:GITHUB_OUTPUT
 
       - name: Test Windows release packaging contracts
         shell: pwsh
@@ -150,7 +172,7 @@ jobs:
           & .\scripts\prepare-windows-release-inputs.ps1 -OutputDirectory .ci-release-inputs
 
       - name: Build production-signed CUDA and Vulkan worker packs
-        if: github.event_name == 'workflow_dispatch' && inputs.include_gpu_worker_packs
+        if: steps.gpu-release-policy.outputs.include_gpu_worker_packs == 'true'
         shell: pwsh
         env:
           GPU_PACK_PRIVATE_KEY_BASE64: ${{ secrets.SCRIBE_GPU_PACK_SIGNING_KEY_PKCS8_BASE64 }}
@@ -197,7 +219,7 @@ jobs:
       - name: Build validated portable payload
         shell: pwsh
         env:
-          INCLUDE_GPU_WORKER_PACKS: ${{ github.event_name == 'workflow_dispatch' && inputs.include_gpu_worker_packs }}
+          INCLUDE_GPU_WORKER_PACKS: ${{ steps.gpu-release-policy.outputs.include_gpu_worker_packs }}
         run: |
           $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches.Groups[1].Value
           if (-not $version) { throw "Could not read the package version from Cargo.toml" }
@@ -363,6 +385,32 @@ jobs:
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           ref: ${{ github.sha }}
+
+      - name: Revalidate official GPU worker-pack release policy
+        shell: pwsh
+        env:
+          GPU_PACK_RELEASE_POLICY: ${{ needs.build.outputs.gpu_pack_release_policy }}
+          GPU_WORKER_PACKS_INCLUDED: ${{ needs.build.outputs.gpu_worker_packs_included }}
+          OFFICIAL_RELEASE: ${{ needs.build.outputs.official_release }}
+        run: |
+          if ($env:OFFICIAL_RELEASE -cne 'true') {
+            throw 'Release publication requires an official release-policy decision from the build job.'
+          }
+          switch ($env:GPU_PACK_RELEASE_POLICY) {
+            'temporary_cpu_only_stage4' {
+              if ($env:GPU_WORKER_PACKS_INCLUDED -cne 'false') {
+                throw 'Temporary Stage 4 CPU-only publication unexpectedly contains GPU worker packs.'
+              }
+            }
+            'gpu_packs_required' {
+              if ($env:GPU_WORKER_PACKS_INCLUDED -cne 'true') {
+                throw 'Official GPU-capable publication omitted required CUDA or Vulkan worker packs.'
+              }
+            }
+            default {
+              throw 'Release publication received no reviewed GPU worker-pack policy.'
+            }
+          }
 
       - name: Resolve and validate release metadata
         id: release-metadata
