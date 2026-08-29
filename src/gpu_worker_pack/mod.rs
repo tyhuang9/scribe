@@ -18,6 +18,11 @@ mod launch_binding {
     use std::fs::File;
     use std::sync::Arc;
 
+    use crate::backend_policy::{
+        BackendKind, BackendPackIdentity, BackendTarget, DeviceClass, DeviceIdentity, GpuVendor,
+        ProviderIdentity,
+    };
+
     use super::manifest::{PackBackend, VerifiedPack, VerifiedPackLease};
 
     /// Stage 4 must implement this bridge on the concrete resolver/Hello path.
@@ -30,10 +35,18 @@ mod launch_binding {
         fn hello_pack_id(&self) -> &str;
         fn hello_pack_version(&self) -> &str;
         fn hello_pack_digest(&self) -> &str;
+        fn hello_security_epoch(&self) -> u64;
         fn hello_runtime_abi(&self) -> u16;
         fn hello_backend(&self) -> PackBackend;
         fn hello_provider(&self) -> &str;
         fn hello_stable_device_identity(&self) -> &str;
+        fn hello_process_index(&self) -> Option<usize>;
+        fn hello_display_name(&self) -> &str;
+        fn hello_driver_version(&self) -> Option<&str>;
+        fn hello_device_class(&self) -> DeviceClass;
+        fn hello_vendor(&self) -> GpuVendor;
+        fn hello_memory_total_bytes(&self) -> u64;
+        fn hello_memory_available_bytes(&self) -> u64;
     }
 
     /// Stage 4's Unix resolver must produce both authorities from no-follow,
@@ -80,10 +93,17 @@ mod launch_binding {
     /// the exact verified pack and stable device. Its fields are private to this
     /// child module, so production discovery cannot fabricate one from a raw
     /// `VerifiedPack`.
-    #[derive(Debug)]
+    #[derive(Clone, Debug)]
     pub(crate) struct VerifiedPackLaunchBinding {
         verified_pack_lease: Arc<VerifiedPackLease>,
         stable_device_identity: String,
+        process_index: usize,
+        display_name: String,
+        driver_version: Option<String>,
+        device_class: DeviceClass,
+        vendor: GpuVendor,
+        memory_total_bytes: u64,
+        memory_available_bytes: u64,
         #[cfg(unix)]
         unix_exec_authority: Arc<UnixPackExecAuthority>,
     }
@@ -100,13 +120,39 @@ mod launch_binding {
                 Arc::ptr_eq(&lease, unix_exec_authority.verified_pack_lease());
             let pack = lease.verified_pack();
             let stable_device_identity = bridge.hello_stable_device_identity();
+            let display_name = bridge.hello_display_name().trim();
+            let driver_version = bridge.hello_driver_version();
             let stable_device_is_canonical = !stable_device_identity.is_empty()
                 && stable_device_identity.len() <= 256
                 && stable_device_identity
                     .bytes()
                     .all(|byte| (0x20..=0x7e).contains(&byte))
                 && stable_device_identity == stable_device_identity.to_ascii_lowercase();
+            let display_name_is_bounded = !display_name.is_empty()
+                && display_name.len() <= 256
+                && display_name
+                    .bytes()
+                    .all(|byte| (0x20..=0x7e).contains(&byte));
+            let driver_is_bounded = driver_version.is_none_or(|value| {
+                !value.is_empty()
+                    && value.len() <= 128
+                    && value.bytes().all(|byte| (0x20..=0x7e).contains(&byte))
+            });
+            let device_class = bridge.hello_device_class();
+            let process_index = bridge.hello_process_index();
+            let backend_matches_class = matches!(
+                device_class,
+                DeviceClass::DiscreteGpu
+                    | DeviceClass::IntegratedGpu
+                    | DeviceClass::UnifiedGpu
+                    | DeviceClass::Unknown
+            );
             (stable_device_is_canonical
+                && display_name_is_bounded
+                && driver_is_bounded
+                && backend_matches_class
+                && process_index.is_some()
+                && bridge.hello_memory_available_bytes() <= bridge.hello_memory_total_bytes()
                 && {
                     #[cfg(unix)]
                     {
@@ -120,12 +166,20 @@ mod launch_binding {
                 && bridge.hello_pack_id() == pack.pack_id.as_str()
                 && bridge.hello_pack_version() == pack.pack_version.as_str()
                 && bridge.hello_pack_digest() == pack.pack_digest
+                && bridge.hello_security_epoch() == pack.security_epoch
                 && bridge.hello_runtime_abi() == pack.runtime_abi_version
                 && bridge.hello_backend() == pack.backend
                 && bridge.hello_provider() == pack.provider)
                 .then(|| Self {
                     verified_pack_lease: lease,
                     stable_device_identity: stable_device_identity.to_owned(),
+                    process_index: process_index.expect("checked above"),
+                    display_name: display_name.to_owned(),
+                    driver_version: driver_version.map(str::to_owned),
+                    device_class,
+                    vendor: bridge.hello_vendor(),
+                    memory_total_bytes: bridge.hello_memory_total_bytes(),
+                    memory_available_bytes: bridge.hello_memory_available_bytes(),
                     #[cfg(unix)]
                     unix_exec_authority,
                 })
@@ -141,6 +195,33 @@ mod launch_binding {
 
         pub(crate) fn stable_device_identity(&self) -> &str {
             &self.stable_device_identity
+        }
+
+        pub(crate) fn backend_target(&self) -> BackendTarget {
+            let pack = self.verified_pack();
+            BackendTarget {
+                backend: match pack.backend {
+                    PackBackend::Cuda => BackendKind::Cuda,
+                    PackBackend::Vulkan => BackendKind::Vulkan,
+                    PackBackend::Metal => BackendKind::Metal,
+                },
+                provider_id: ProviderIdentity::new(pack.provider.clone()),
+                driver_version: self.driver_version.clone(),
+                device_id: DeviceIdentity::new(self.stable_device_identity.clone()),
+                display_name: self.display_name.clone(),
+                vendor: self.vendor,
+                device_class: self.device_class,
+                memory_total_bytes: self.memory_total_bytes,
+                memory_available_bytes: self.memory_available_bytes,
+                pack: Some(BackendPackIdentity {
+                    pack_id: pack.pack_id.as_str().to_owned(),
+                    pack_version: pack.pack_version.as_str().to_owned(),
+                    pack_digest: pack.pack_digest.clone(),
+                    security_epoch: pack.security_epoch,
+                    runtime_abi: pack.runtime_abi_version,
+                }),
+                process_index: Some(self.process_index),
+            }
         }
 
         #[cfg(unix)]
@@ -272,6 +353,10 @@ mod tests {
             &self.hello_digest
         }
 
+        fn hello_security_epoch(&self) -> u64 {
+            self.lease.verified_pack().security_epoch
+        }
+
         fn hello_runtime_abi(&self) -> u16 {
             self.lease.verified_pack().runtime_abi_version
         }
@@ -286,6 +371,34 @@ mod tests {
 
         fn hello_stable_device_identity(&self) -> &str {
             &self.stable_device_identity
+        }
+
+        fn hello_process_index(&self) -> Option<usize> {
+            Some(0)
+        }
+
+        fn hello_display_name(&self) -> &str {
+            "Fixture GPU"
+        }
+
+        fn hello_driver_version(&self) -> Option<&str> {
+            Some("fixture-driver-1")
+        }
+
+        fn hello_device_class(&self) -> crate::backend_policy::DeviceClass {
+            crate::backend_policy::DeviceClass::DiscreteGpu
+        }
+
+        fn hello_vendor(&self) -> crate::backend_policy::GpuVendor {
+            crate::backend_policy::GpuVendor::Nvidia
+        }
+
+        fn hello_memory_total_bytes(&self) -> u64 {
+            8 * 1024 * 1024 * 1024
+        }
+
+        fn hello_memory_available_bytes(&self) -> u64 {
+            6 * 1024 * 1024 * 1024
         }
     }
 

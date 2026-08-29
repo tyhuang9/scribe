@@ -172,6 +172,19 @@ impl ProviderIdentity {
     }
 }
 
+/// Immutable worker-pack identity attached to GPU targets. Executable paths
+/// are deliberately excluded; only a resolver-owned verified lease authorizes
+/// launch.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BackendPackIdentity {
+    pub(crate) pack_id: String,
+    pub(crate) pack_version: String,
+    pub(crate) pack_digest: String,
+    pub(crate) security_epoch: u64,
+    pub(crate) runtime_abi: u16,
+}
+
 /// One backend/device pair that can be selected in the current process.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct BackendTarget {
@@ -187,6 +200,8 @@ pub(crate) struct BackendTarget {
     pub(crate) memory_total_bytes: u64,
     /// Live telemetry only; not used for admission or warm invalidation.
     pub(crate) memory_available_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) pack: Option<BackendPackIdentity>,
     /// Provider registry index for this process only. It is rediscovered from
     /// `device_id` for every fresh snapshot and must never become durable.
     #[serde(skip)]
@@ -205,6 +220,7 @@ impl BackendTarget {
             device_class: DeviceClass::Cpu,
             memory_total_bytes: 0,
             memory_available_bytes: 0,
+            pack: None,
             process_index: None,
         }
     }
@@ -375,6 +391,7 @@ struct BackendCandidateFingerprint {
     availability: CandidateAvailability,
     auto_qualified: bool,
     memory_total_bytes: u64,
+    pack: Option<BackendPackIdentity>,
 }
 
 impl BackendSnapshot {
@@ -397,6 +414,7 @@ impl BackendSnapshot {
                     .qualification_policy
                     .qualifies(self.operating_system, &candidate.target),
                 memory_total_bytes: candidate.target.memory_total_bytes,
+                pack: candidate.target.pack.clone(),
             })
             .collect::<Vec<_>>();
         candidates.sort();
@@ -848,6 +866,7 @@ mod tests {
             device_class: class,
             memory_total_bytes: 8 * 1024 * 1024 * 1024,
             memory_available_bytes: 6 * 1024 * 1024 * 1024,
+            pack: None,
             process_index: Some(index),
         }
     }

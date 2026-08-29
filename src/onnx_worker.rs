@@ -7145,6 +7145,7 @@ mod tests {
             },
             memory_total_bytes: 8 * 1024 * 1024 * 1024,
             memory_available_bytes: 6 * 1024 * 1024 * 1024,
+            pack: None,
             process_index: index,
         }
     }

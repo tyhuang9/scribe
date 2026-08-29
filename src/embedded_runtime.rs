@@ -431,6 +431,7 @@ fn native_backend_candidate_for_backend(
             device_class,
             memory_total_bytes: device.memory_total,
             memory_available_bytes: device.memory_free,
+            pack: None,
             process_index: device.index,
         },
         availability: CandidateAvailability::Available,
@@ -582,7 +583,9 @@ fn reconcile_observed_target(
             observed.vendor
         ))));
     }
+    let pack = selection.target.pack.clone();
     selection.target = BackendTarget {
+        pack,
         process_index,
         ..observed
     };
