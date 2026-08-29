@@ -105,7 +105,7 @@ $env:CMAKE = 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Com
 $env:CARGO_TARGET_DIR = "$PWD\target\native-layered"
 $env:SCRIBE_UI_HARNESS_VIEWPORT = '960x680'
 $env:SCRIBE_UI_HARNESS = 'overlay/live-dark'
-cargo run --all-features
+cargo run --features ui-harness --bin local-transcriber
 ```
 
 Substitute `overlay/live-light`, `overlay/compact-light`, or

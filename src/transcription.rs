@@ -528,7 +528,7 @@ impl RuntimeWorker {
     }
 
     fn new_process() -> Self {
-        let inference = InferenceWorkerRegistry::cpu_only();
+        let inference = InferenceWorkerRegistry::for_current_build();
         let worker_inference = inference.clone();
         let cancellation_generation = Arc::new(AtomicU64::new(0));
         let worker_cancellation = cancellation_generation.clone();

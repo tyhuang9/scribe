@@ -416,16 +416,20 @@ $cargoReleaseRoot = Join-Path $cargoTargetRoot "$targetTriple\release"
 $sourceExecutable = Join-Path $cargoReleaseRoot "local-transcriber.exe"
 $sourceInferenceWorker = Join-Path $cargoReleaseRoot "scribe-inference-worker.exe"
 $previousWorkerSha256 = $env:SCRIBE_BUNDLED_WORKER_SHA256
+$previousBuildingWorker = $env:SCRIBE_BUILDING_WORKER
 Push-Location $repositoryRoot
 try {
     # The worker is built and hashed first. The desktop then embeds that exact
     # SHA-256 as its bundled-worker trust anchor; this is intentionally separate
     # from the future signed GPU pack catalog.
+    $env:SCRIBE_BUNDLED_WORKER_SHA256 = $null
+    $env:SCRIBE_BUILDING_WORKER = '1'
     & cargo build --locked --offline --release --bin scribe-inference-worker --features inference-worker --target $targetTriple --manifest-path (Join-Path $repositoryRoot "Cargo.toml")
     if ($LASTEXITCODE -ne 0) {
         throw "The locked offline Windows x64 CPU inference worker release build failed."
     }
     Assert-Amd64Pe $sourceInferenceWorker
+    $env:SCRIBE_BUILDING_WORKER = $null
     $env:SCRIBE_BUNDLED_WORKER_SHA256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $sourceInferenceWorker).Hash.ToLowerInvariant()
     if ($env:SCRIBE_BUNDLED_WORKER_SHA256 -cnotmatch '^[0-9a-f]{64}$') {
         throw "The CPU inference worker did not produce a valid SHA-256 trust anchor."
@@ -437,6 +441,7 @@ try {
 }
 finally {
     $env:SCRIBE_BUNDLED_WORKER_SHA256 = $previousWorkerSha256
+    $env:SCRIBE_BUILDING_WORKER = $previousBuildingWorker
     Pop-Location
 }
 

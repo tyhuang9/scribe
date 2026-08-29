@@ -14,16 +14,6 @@ use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow, bail};
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-#[cfg(any(test, feature = "inference-worker"))]
-use sherpa_onnx::{
-    OfflineCanaryModelConfig, OfflineMoonshineModelConfig, OfflineNemoEncDecCtcModelConfig,
-    OfflineRecognizer, OfflineRecognizerConfig, OfflineTransducerModelConfig, OnlineRecognizer,
-    OnlineRecognizerConfig, OnlineStream, OnlineTransducerModelConfig,
-};
-
 use crate::backend_policy::{BackendSelection, BackendTarget};
 use crate::config;
 use crate::model_catalog::ArtifactFormat;
@@ -40,6 +30,9 @@ use crate::transcription::{
     AccelerationPreference, ComputeDevice, ModelId, ResolvedAcceleration, RuntimeCapabilities,
     Transcript, TranscriptSegment, TranscriptionOptions,
 };
+use anyhow::{Context, Result, anyhow, bail};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
@@ -229,16 +222,16 @@ impl OnnxModelSpec {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-struct ValidatedOnnxModel {
-    id: String,
-    root: PathBuf,
-    family: OnnxModelFamily,
-    files: BTreeMap<OnnxFileRole, PathBuf>,
-    num_threads: u16,
+pub(crate) struct ValidatedOnnxModel {
+    pub(crate) id: String,
+    pub(crate) root: PathBuf,
+    pub(crate) family: OnnxModelFamily,
+    pub(crate) files: BTreeMap<OnnxFileRole, PathBuf>,
+    pub(crate) num_threads: u16,
 }
 
 impl ValidatedOnnxModel {
-    fn path(&self, role: OnnxFileRole) -> Result<String> {
+    pub(crate) fn path(&self, role: OnnxFileRole) -> Result<String> {
         let path = self
             .files
             .get(&role)
@@ -475,7 +468,7 @@ fn decode_pcm(body: &[u8]) -> Result<Vec<f32>> {
     Ok(samples)
 }
 
-fn validate_pcm_samples(samples: &[f32]) -> Result<()> {
+pub(crate) fn validate_pcm_samples(samples: &[f32]) -> Result<()> {
     if samples.is_empty() {
         bail!("ONNX PCM must contain at least one sample");
     }
@@ -749,6 +742,17 @@ impl WorkerProvider {
     }
 }
 
+fn compiled_worker_provider(role: WorkerRole) -> WorkerProvider {
+    if role == WorkerRole::Vad {
+        return WorkerProvider::Cpu;
+    }
+    if cfg!(feature = "vulkan-acceleration") {
+        WorkerProvider::Vulkan
+    } else {
+        WorkerProvider::Cpu
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum WorkerArtifactKind {
@@ -803,7 +807,7 @@ fn expected_worker(role: WorkerRole) -> WorkerExpectation {
         .to_owned(),
         abi: WORKER_ABI_VERSION,
         role,
-        provider: WorkerProvider::Cpu,
+        provider: compiled_worker_provider(role),
     }
 }
 
@@ -852,7 +856,7 @@ fn worker_capability(role: WorkerRole, challenge: String) -> Result<WorkerCapabi
         bundled_worker_sha256,
         abi: WORKER_ABI_VERSION,
         role,
-        provider: WorkerProvider::Cpu,
+        provider: compiled_worker_provider(role),
         artifacts,
     })
 }
@@ -926,7 +930,17 @@ fn validate_worker_hello(
         bail!("worker handshake challenge must be 32 random bytes encoded as hexadecimal");
     }
     let actual_role = role.unwrap_or(expected.role);
-    if *expected != expected_worker(actual_role) {
+    let local = expected_worker(actual_role);
+    // Final-image verification is directional: the parent owns the verified
+    // executable descriptor and digest. The child validates the protocol and
+    // build contract but does not compare the parent-supplied digest against a
+    // compile-time environment value.
+    if expected.app_build != local.app_build
+        || expected.worker_build != local.worker_build
+        || expected.abi != local.abi
+        || expected.role != local.role
+        || expected.provider != local.provider
+    {
         bail!("worker handshake expectation is incompatible with this worker");
     }
     Ok(actual_role)
@@ -1594,6 +1608,13 @@ fn resolve_adjacent_inference_worker(current_executable: &Path) -> Result<PathBu
 
 impl WorkerExecutableResolver for InstalledWorkerExecutableResolver {
     fn resolve(&self, role: WorkerRole) -> Result<VerifiedWorkerExecutable> {
+        #[cfg(all(unix, not(debug_assertions)))]
+        {
+            let _ = role;
+            bail!(
+                "release inference workers are unsupported on Unix until launch is bound to the verified executable descriptor"
+            );
+        }
         let current = std::fs::canonicalize(std::env::current_exe()?)
             .context("could not canonicalize the running Scribe executable")?;
         if role == WorkerRole::Vad {
@@ -1696,7 +1717,8 @@ impl WorkerLauncher for OsWorkerLauncher {
         let _immediate_identity_check = executable.revalidate()?;
         let mut child = command.spawn()?;
         parent_liveness.child_spawned();
-        let process_guard = bind_worker_process_tree(&child)?;
+        let process_guard =
+            bind_worker_process_tree_or_terminate(&mut child, bind_worker_process_tree)?;
         let stdin = child
             .stdin
             .take()
@@ -1714,6 +1736,33 @@ impl WorkerLauncher for OsWorkerLauncher {
                 _parent_liveness: parent_liveness,
             }),
         })
+    }
+}
+
+fn bind_worker_process_tree_or_terminate(
+    child: &mut Child,
+    bind: impl FnOnce(&Child) -> Result<ProcessTreeGuard>,
+) -> Result<ProcessTreeGuard> {
+    match bind(child) {
+        Ok(guard) => Ok(guard),
+        Err(bind_error) => {
+            let kill_error = child.kill().err();
+            let wait_error = child.wait().err();
+            match (kill_error, wait_error) {
+                (None, None) => Err(bind_error.context(
+                    "worker process-tree supervision failed; child was terminated and reaped",
+                )),
+                (kill_error, wait_error) => bail!(
+                    "worker process-tree supervision failed: {bind_error:#}; child cleanup failed (kill: {}, reap: {})",
+                    kill_error
+                        .map(|error| error.to_string())
+                        .unwrap_or_else(|| "ok".to_owned()),
+                    wait_error
+                        .map(|error| error.to_string())
+                        .unwrap_or_else(|| "ok".to_owned())
+                ),
+            }
+        }
     }
 }
 
@@ -1762,7 +1811,8 @@ pub(crate) fn harden_windows_dll_search() -> Result<()> {
         return Err(std::io::Error::last_os_error())
             .context("could not restrict Windows default DLL search directories");
     }
-    if unsafe { SetDllDirectoryW(std::ptr::null()) } == 0 {
+    let empty_directory = [0_u16];
+    if unsafe { SetDllDirectoryW(empty_directory.as_ptr()) } == 0 {
         return Err(std::io::Error::last_os_error())
             .context("could not remove the current directory from Windows DLL search");
     }
@@ -3858,9 +3908,12 @@ pub(crate) fn maybe_run_vad_worker() -> Option<i32> {
     )
 }
 
-/// Entrypoint for the separately packaged inference executable.
-#[cfg(feature = "inference-worker")]
-pub(crate) fn run_dedicated_inference_worker() -> i32 {
+/// Entrypoint substrate for the separately packaged inference executable.
+///
+/// The worker-only binary supplies the native recognizer factory. Keeping that
+/// factory out of this module prevents an all-features desktop build from
+/// compiling ASR recognizer/server code into the UI executable.
+pub(crate) fn run_inference_worker_with_factory<F: WorkerRecognizerFactory>(factory: &F) -> i32 {
     let args = std::env::args_os().skip(1).collect::<Vec<_>>();
     match worker_role_from_args(&args) {
         Ok(Some(WorkerRole::Inference)) => {}
@@ -3884,10 +3937,12 @@ pub(crate) fn run_dedicated_inference_worker() -> i32 {
             return 1;
         }
     };
-    match worker_loop_for_role(
+    match worker_loop_with_factories(
         std::io::stdin().lock(),
         std::io::stdout().lock(),
-        WorkerRole::Inference,
+        factory,
+        &NativeVadFactory,
+        Some(WorkerRole::Inference),
         parent_control,
     ) {
         Ok(()) => 0,
@@ -4250,6 +4305,20 @@ pub(crate) struct InferenceWorkerRegistry {
 }
 
 impl InferenceWorkerRegistry {
+    pub(crate) fn for_current_build() -> Self {
+        let provider = if cfg!(feature = "vulkan-acceleration") {
+            WorkerProvider::Vulkan
+        } else {
+            WorkerProvider::Cpu
+        };
+        Self {
+            routes: Arc::new(vec![InferenceWorkerRoute {
+                provider,
+                supervisor: InferenceWorkerSupervisor::unstarted(),
+            }]),
+        }
+    }
+
     pub(crate) fn cpu_only() -> Self {
         Self {
             routes: Arc::new(vec![InferenceWorkerRoute {
@@ -4405,7 +4474,7 @@ fn worker_loop(mut input: impl Read, mut output: impl Write) -> Result<()> {
     worker_loop_with_factories(
         &mut input,
         &mut output,
-        &NativeRecognizerFactory,
+        &DisabledRecognizerFactory,
         &NativeVadFactory,
         None,
         None,
@@ -4418,38 +4487,24 @@ fn worker_loop_for_role(
     role: WorkerRole,
     parent_control: Option<std::fs::File>,
 ) -> Result<()> {
-    #[cfg(any(test, feature = "inference-worker"))]
-    {
-        return worker_loop_with_factories(
-            &mut input,
-            &mut output,
-            &NativeRecognizerFactory,
-            &NativeVadFactory,
-            Some(role),
-            parent_control,
-        );
-    }
-    #[cfg(not(any(test, feature = "inference-worker")))]
-    {
-        debug_assert_eq!(role, WorkerRole::Vad);
-        worker_loop_with_factories(
-            &mut input,
-            &mut output,
-            &DisabledRecognizerFactory,
-            &NativeVadFactory,
-            Some(role),
-            parent_control,
-        )
-    }
+    debug_assert_eq!(role, WorkerRole::Vad);
+    worker_loop_with_factories(
+        &mut input,
+        &mut output,
+        &DisabledRecognizerFactory,
+        &NativeVadFactory,
+        Some(role),
+        parent_control,
+    )
 }
 
-trait WorkerRecognizerFactory {
+pub(crate) trait WorkerRecognizerFactory {
     type Recognizer: WorkerRecognizer;
 
     fn create(&self, model: &ValidatedOnnxModel) -> Result<Self::Recognizer>;
 }
 
-trait WorkerRecognizer {
+pub(crate) trait WorkerRecognizer {
     type Stream;
 
     fn transcribe(&self, samples: &[f32]) -> Result<String>;
@@ -5491,18 +5546,10 @@ fn write_runtime_result(
     write_worker_response(output, session_id, request_id, response)
 }
 
-/// Real sherpa recognizers stay entirely inside the child process so a native
-/// failure cannot take down the eframe process.
-#[cfg(any(test, feature = "inference-worker"))]
-struct NativeRecognizerFactory;
-
-#[cfg(not(any(test, feature = "inference-worker")))]
 struct DisabledRecognizerFactory;
 
-#[cfg(not(any(test, feature = "inference-worker")))]
 struct DisabledRecognizer;
 
-#[cfg(not(any(test, feature = "inference-worker")))]
 struct DisabledRecognizerStream;
 
 struct NativeVadFactory;
@@ -5525,32 +5572,6 @@ impl WorkerVad for SileroVadModel {
     }
 }
 
-#[cfg(any(test, feature = "inference-worker"))]
-enum NativeRecognizer {
-    Offline { recognizer: OfflineRecognizer },
-    Online { recognizer: OnlineRecognizer },
-}
-
-#[cfg(any(test, feature = "inference-worker"))]
-impl WorkerRecognizerFactory for NativeRecognizerFactory {
-    type Recognizer = NativeRecognizer;
-
-    fn create(&self, model: &ValidatedOnnxModel) -> Result<Self::Recognizer> {
-        if model.family == OnnxModelFamily::OnlineTransducer {
-            let config = online_recognizer_config(model)?;
-            return OnlineRecognizer::create(&config)
-                .map(|recognizer| NativeRecognizer::Online { recognizer })
-                .ok_or_else(|| anyhow!("sherpa-onnx failed to create CPU online recognizer"));
-        }
-
-        let config = offline_recognizer_config(model)?;
-        OfflineRecognizer::create(&config)
-            .map(|recognizer| NativeRecognizer::Offline { recognizer })
-            .ok_or_else(|| anyhow!("sherpa-onnx failed to create CPU offline recognizer"))
-    }
-}
-
-#[cfg(not(any(test, feature = "inference-worker")))]
 impl WorkerRecognizerFactory for DisabledRecognizerFactory {
     type Recognizer = DisabledRecognizer;
 
@@ -5559,7 +5580,6 @@ impl WorkerRecognizerFactory for DisabledRecognizerFactory {
     }
 }
 
-#[cfg(not(any(test, feature = "inference-worker")))]
 impl WorkerRecognizer for DisabledRecognizer {
     type Stream = DisabledRecognizerStream;
 
@@ -5586,160 +5606,6 @@ impl WorkerRecognizer for DisabledRecognizer {
     fn stream_result(&self, _stream: &Self::Stream) -> Result<String> {
         bail!("ASR recognizers are unavailable in the desktop executable")
     }
-}
-
-#[cfg(any(test, feature = "inference-worker"))]
-impl WorkerRecognizer for NativeRecognizer {
-    type Stream = OnlineStream;
-
-    fn transcribe(&self, samples: &[f32]) -> Result<String> {
-        validate_pcm_samples(samples)?;
-        match self {
-            Self::Offline { recognizer } => {
-                let stream = recognizer.create_stream();
-                stream.accept_waveform(16_000, samples);
-                recognizer.decode(&stream);
-                stream
-                    .get_result()
-                    .map(|result| result.text)
-                    .ok_or_else(|| anyhow!("sherpa-onnx offline recognizer returned no result"))
-            }
-            Self::Online { recognizer } => {
-                let stream = recognizer.create_stream();
-                stream.accept_waveform(16_000, samples);
-                stream.input_finished();
-                decode_online_ready(recognizer, &stream);
-                Ok(recognizer
-                    .get_result(&stream)
-                    .map(|result| result.text)
-                    .unwrap_or_default())
-            }
-        }
-    }
-
-    fn start_stream(&self) -> Result<Self::Stream> {
-        match self {
-            Self::Online { recognizer } => Ok(recognizer.create_stream()),
-            Self::Offline { .. } => bail!("streaming requires an online ONNX transducer"),
-        }
-    }
-
-    fn accept_chunk(&self, stream: &mut Self::Stream, samples: &[f32]) -> Result<()> {
-        validate_pcm_samples(samples)?;
-        let Self::Online { .. } = self else {
-            bail!("streaming requires an online ONNX transducer");
-        };
-        stream.accept_waveform(16_000, samples);
-        Ok(())
-    }
-
-    fn input_finished(&self, stream: &mut Self::Stream) -> Result<()> {
-        let Self::Online { .. } = self else {
-            bail!("streaming requires an online ONNX transducer");
-        };
-        stream.input_finished();
-        Ok(())
-    }
-
-    fn drain_ready(&self, stream: &mut Self::Stream) -> Result<()> {
-        let Self::Online { recognizer } = self else {
-            bail!("streaming requires an online ONNX transducer");
-        };
-        decode_online_ready(recognizer, stream);
-        Ok(())
-    }
-
-    fn stream_result(&self, stream: &Self::Stream) -> Result<String> {
-        let Self::Online { recognizer } = self else {
-            bail!("streaming requires an online ONNX transducer");
-        };
-        Ok(recognizer
-            .get_result(stream)
-            .map(|result| result.text)
-            .unwrap_or_default())
-    }
-}
-
-#[cfg(any(test, feature = "inference-worker"))]
-fn decode_online_ready(recognizer: &OnlineRecognizer, stream: &OnlineStream) {
-    while recognizer.is_ready(stream) {
-        recognizer.decode(stream);
-    }
-}
-
-#[cfg(any(test, feature = "inference-worker"))]
-fn online_recognizer_config(model: &ValidatedOnnxModel) -> Result<OnlineRecognizerConfig> {
-    let mut config = OnlineRecognizerConfig::default();
-    config.model_config.provider = Some("cpu".into());
-    config.model_config.num_threads = i32::from(model.num_threads);
-    config.model_config.tokens = Some(model.path(OnnxFileRole::Tokens)?);
-    config.model_config.transducer = OnlineTransducerModelConfig {
-        encoder: Some(model.path(OnnxFileRole::Encoder)?),
-        decoder: Some(model.path(OnnxFileRole::Decoder)?),
-        joiner: Some(model.path(OnnxFileRole::Joiner)?),
-    };
-    Ok(config)
-}
-
-#[cfg(any(test, feature = "inference-worker"))]
-fn offline_recognizer_config(model: &ValidatedOnnxModel) -> Result<OfflineRecognizerConfig> {
-    let mut config = OfflineRecognizerConfig::default();
-    config.model_config.provider = Some("cpu".into());
-    config.model_config.num_threads = i32::from(model.num_threads);
-    config.model_config.tokens = Some(model.path(OnnxFileRole::Tokens)?);
-    match model.family {
-        OnnxModelFamily::Moonshine => {
-            config.model_config.moonshine = OfflineMoonshineModelConfig {
-                preprocessor: model
-                    .files
-                    .contains_key(&OnnxFileRole::Preprocessor)
-                    .then(|| model.path(OnnxFileRole::Preprocessor))
-                    .transpose()?,
-                encoder: Some(model.path(OnnxFileRole::Encoder)?),
-                uncached_decoder: model
-                    .files
-                    .contains_key(&OnnxFileRole::UncachedDecoder)
-                    .then(|| model.path(OnnxFileRole::UncachedDecoder))
-                    .transpose()?,
-                cached_decoder: model
-                    .files
-                    .contains_key(&OnnxFileRole::CachedDecoder)
-                    .then(|| model.path(OnnxFileRole::CachedDecoder))
-                    .transpose()?,
-                merged_decoder: model
-                    .files
-                    .contains_key(&OnnxFileRole::MergedDecoder)
-                    .then(|| model.path(OnnxFileRole::MergedDecoder))
-                    .transpose()?,
-            }
-        }
-        OnnxModelFamily::NemoCtc => {
-            config.model_config.nemo_ctc = OfflineNemoEncDecCtcModelConfig {
-                model: Some(model.path(OnnxFileRole::Model)?),
-            }
-        }
-        OnnxModelFamily::Canary => {
-            config.model_config.canary = OfflineCanaryModelConfig {
-                encoder: Some(model.path(OnnxFileRole::Encoder)?),
-                decoder: Some(model.path(OnnxFileRole::Decoder)?),
-                src_lang: Some("en".into()),
-                tgt_lang: Some("en".into()),
-                use_pnc: true,
-            }
-        }
-        OnnxModelFamily::OfflineTransducer => {
-            config.model_config.transducer = OfflineTransducerModelConfig {
-                encoder: Some(model.path(OnnxFileRole::Encoder)?),
-                decoder: Some(model.path(OnnxFileRole::Decoder)?),
-                joiner: Some(model.path(OnnxFileRole::Joiner)?),
-            };
-            config.model_config.model_type = Some("nemo_transducer".into());
-        }
-        OnnxModelFamily::OnlineTransducer => {
-            bail!("online transducers require the online recognizer")
-        }
-    }
-    Ok(config)
 }
 
 #[cfg(test)]
@@ -6941,6 +6807,67 @@ mod tests {
         capability.bundled_worker_sha256 = "22".repeat(32);
         let error = validate_worker_capability(&capability, &challenge, &expected).unwrap_err();
         assert!(error.to_string().contains("incompatible"));
+    }
+
+    #[test]
+    fn directional_digest_handshake_binds_parent_anchor_without_child_compile_time_comparison() {
+        let challenge = "ac".repeat(32);
+        let mut expected = expected_worker(WorkerRole::Inference);
+        expected.bundled_worker_sha256 = "31".repeat(32);
+
+        assert_eq!(
+            validate_worker_hello(Some(WorkerRole::Inference), &challenge, &expected).unwrap(),
+            WorkerRole::Inference
+        );
+
+        let mut capability = worker_capability(WorkerRole::Inference, challenge.clone()).unwrap();
+        capability.bundled_worker_sha256 = expected.bundled_worker_sha256.clone();
+        validate_worker_capability(&capability, &challenge, &expected).unwrap();
+    }
+
+    #[test]
+    fn compiled_inference_route_matches_the_worker_provider() {
+        let expected = if cfg!(feature = "vulkan-acceleration") {
+            WorkerProvider::Vulkan
+        } else {
+            WorkerProvider::Cpu
+        };
+        assert_eq!(compiled_worker_provider(WorkerRole::Inference), expected);
+        assert_eq!(
+            compiled_worker_provider(WorkerRole::Vad),
+            WorkerProvider::Cpu
+        );
+        assert_eq!(
+            InferenceWorkerRegistry::for_current_build().routes[0].provider,
+            expected
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_dll_search_hardening_accepts_an_explicit_empty_directory() {
+        harden_windows_dll_search().unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn failed_job_binding_terminates_and_reaps_the_child() {
+        let mut child = Command::new("cmd.exe")
+            .args(["/d", "/q", "/c", "ping -n 30 127.0.0.1 > NUL"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let error = match bind_worker_process_tree_or_terminate(
+            &mut child,
+            |_| -> Result<ProcessTreeGuard> { bail!("injected job bind failure") },
+        ) {
+            Ok(_) => panic!("injected job bind failure unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("terminated and reaped"));
+        assert!(child.try_wait().unwrap().is_some());
     }
 
     #[test]
@@ -9167,19 +9094,18 @@ mod tests {
     }
 
     #[test]
-    fn recognizer_configs_use_validated_canonical_paths_and_fail_after_removal() {
+    fn validated_model_paths_are_canonical_and_fail_after_removal() {
         let root = test_root("validated-config-paths");
         let spec = spec_with_roles(&root, OnnxModelFamily::NemoCtc, NEMO_CTC_ROLES);
         let validated = spec.validated().unwrap();
         let canonical_model = std::fs::canonicalize(root.join("model.onnx")).unwrap();
-        let config = offline_recognizer_config(&validated).unwrap();
         assert_eq!(
-            config.model_config.nemo_ctc.model.as_deref(),
-            Some(canonical_model.to_string_lossy().as_ref())
+            validated.path(OnnxFileRole::Model).unwrap(),
+            canonical_model.to_string_lossy()
         );
 
         std::fs::remove_file(&canonical_model).unwrap();
-        assert!(offline_recognizer_config(&validated).is_err());
+        assert!(validated.path(OnnxFileRole::Model).is_err());
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -9199,7 +9125,7 @@ mod tests {
         let model_path = root.join("model.onnx");
         std::fs::remove_file(&model_path).unwrap();
         symlink(&external, &model_path).unwrap();
-        assert!(offline_recognizer_config(&validated).is_err());
+        assert!(validated.path(OnnxFileRole::Model).is_err());
         std::fs::remove_dir_all(root).unwrap();
         std::fs::remove_file(external).unwrap();
     }

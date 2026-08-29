@@ -150,7 +150,10 @@ function Assert-ReleaseCargoFeatureContract([string]$ReleaseSource) {
         throw 'Windows release packaging must build the desktop and CPU inference worker independently without enabling GPU or every Cargo feature.'
     }
     Assert-OrderedWorkflowTokens $ReleaseSource @(
+        '$env:SCRIBE_BUNDLED_WORKER_SHA256 = $null',
+        '$env:SCRIBE_BUILDING_WORKER = ''1''',
         $expectedWorkerBuild,
+        '$env:SCRIBE_BUILDING_WORKER = $null',
         '$env:SCRIBE_BUNDLED_WORKER_SHA256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $sourceInferenceWorker)',
         $expectedDesktopBuild
     ) 'bundled worker trust-anchor build order'

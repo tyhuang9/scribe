@@ -17,7 +17,7 @@ egui UI / tray / global hotkey
   TranscriptionService (runtime-neutral interface)
             |
             v
- InferenceWorkerRegistry (CPU route in this stage)
+ InferenceWorkerRegistry (release CPU route; opt-in Vulkan dev route)
             |
             v  private anonymous stdin/stdout pipes (SCIF v5)
  dedicated child: scribe-inference-worker --scribe-inference-worker
@@ -35,9 +35,9 @@ egui UI / tray / global hotkey
 
 The UI does not select or invoke a runtime directly. The application-facing `TranscriptionService` owns only the runtime-neutral dispatch boundary and worker supervisor in the desktop process. Native GGUF model objects, transcribe-cpp sessions, Sherpa ONNX recognizers, and native FFI handles are constructed only by the persistent hidden `--scribe-inference-worker` child. The desktop process never constructs those native objects.
 
-The adjacent `scribe-inference-worker` executable is the single persistent STT process: it directly owns the worker-local router and both native runtime families (GGUF and receipt-backed Sherpa ONNX). Before every launch the desktop verifies the exact canonical sibling, rejects links/reparse points, hardlinks, ADS/case aliases and out-of-root paths, and compares the file identity and SHA-256 against the release-compiled trust anchor. VAD intentionally remains a separate instance of the desktop executable launched with `--scribe-vad-worker`; it has no STT commands. The workers communicate only through private anonymous stdin/stdout pipes using SCIF v5. Hello is the first command and occurs exactly once; its capability exchange binds a fresh random challenge, immutable desktop and role-specific worker build revisions, the bundled worker SHA-256, ABI, role, CPU provider, and supported artifact targets to the process generation. Worker stdout is protocol-only and diagnostics go to stderr. Worker launch clears the environment and restores only required OS variables, and Windows DLL loading is restricted before native runtime initialization. There is no localhost listener, TCP/HTTP inference transport, nested ONNX worker, Python runtime, dynamic runtime package, or CLI fallback.
+The adjacent `scribe-inference-worker` executable is the single persistent STT process: it directly owns the worker-local router and both native runtime families (GGUF and receipt-backed Sherpa ONNX). Before every launch the desktop verifies the exact canonical sibling, rejects links/reparse points, hardlinks, ADS/case aliases and out-of-root paths, and compares the file identity and SHA-256 against the release-compiled trust anchor. Release builds fail closed if that worker-first SHA-256 anchor is absent. VAD intentionally remains a separate instance of the desktop executable launched with `--scribe-vad-worker`; it has no STT commands. The workers communicate only through private anonymous stdin/stdout pipes using SCIF v5. Hello is the first command and occurs exactly once; its capability exchange binds a fresh random challenge, immutable desktop and role-specific worker build revisions, the worker image SHA-256, ABI, role, compiled provider, and supported artifact targets to the process generation. The child validates the build/protocol expectation; the parent exclusively owns exact-path, file-identity, and final-image digest verification and validates the digest echoed by the child. Worker stdout is protocol-only and diagnostics go to stderr. Worker launch clears the environment and restores only required OS variables, and Windows DLL loading is restricted before native runtime initialization. There is no localhost listener, TCP/HTTP inference transport, nested ONNX worker, Python runtime, dynamic runtime package, or CLI fallback.
 
-Stage 2 packages only the CPU route. `Auto` and `CPU` use it; explicit `GPU` returns a clear error and cannot silently fall back to CPU. CUDA, Vulkan, Metal, signed pack manifests, health quarantine, and GPU Auto qualification remain later stages.
+Official Stage 2 packaging contains only the CPU route. `Auto` and `CPU` use it; explicit `GPU` returns a clear error and cannot silently fall back to CPU. Windows developers may build an adjacent Vulkan worker and matching desktop with `scripts/build-vulkan-worker-dev.ps1`; that opt-in build advertises Vulkan, permits explicit GPU for GGUF, and is not a release package or an Auto-qualification claim. CUDA, Metal, signed pack manifests, health quarantine, and GPU Auto qualification remain later stages. Unix release worker launch is intentionally unsupported until process creation can be bound to the already verified executable descriptor; source/debug behavior remains available for development only.
 
 Normal GGUF remains local, native, CPU-only, and Python-free, but it is process-isolated rather than in-process. Receipt-backed ONNX inference uses the same private persistent STT child. Installation smoke runs in a fresh disposable worker process and is not the normal dictation worker.
 
@@ -75,6 +75,11 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --all-features
 cargo build --all-features
 ```
+
+On Windows, all-feature checks require the pinned Vulkan SDK. They compile the
+developer backend but do not create a release bundle. Use
+`scripts/build-windows-release.ps1` for the official CPU-only package, or
+`scripts/build-vulkan-worker-dev.ps1` for adjacent debug Vulkan binaries.
 
 The documentation site lives in `website/` and is checked independently:
 

@@ -74,6 +74,11 @@ impl SileroVadModel {
         if !(1..=64).contains(&num_threads) {
             bail!("Silero VAD thread count must be within [1, 64]");
         }
+        // The C++ VAD shim uses the same reviewed static Sherpa archive as the
+        // Rust binding. Referencing its neutral version API keeps that native
+        // archive linked without compiling any ASR recognizer/server code into
+        // the desktop binary.
+        let _ = sherpa_onnx::version();
         let model_path = model_path
             .to_str()
             .ok_or_else(|| anyhow!("Silero VAD asset path is not valid Unicode"))?;

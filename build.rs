@@ -37,7 +37,27 @@ fn main() {
 
 fn emit_bundled_worker_trust_anchor() {
     println!("cargo:rerun-if-env-changed=SCRIBE_BUNDLED_WORKER_SHA256");
-    let Ok(digest) = std::env::var("SCRIBE_BUNDLED_WORKER_SHA256") else {
+    println!("cargo:rerun-if-env-changed=SCRIBE_BUILDING_WORKER");
+    let profile = std::env::var("PROFILE").unwrap_or_default();
+    let building_worker = std::env::var("SCRIBE_BUILDING_WORKER").ok();
+    if building_worker.as_deref().is_some_and(|value| value != "1") {
+        panic!("SCRIBE_BUILDING_WORKER, when present, must equal 1");
+    }
+    let digest = std::env::var("SCRIBE_BUNDLED_WORKER_SHA256").ok();
+    if building_worker.as_deref() == Some("1") {
+        assert!(
+            digest.is_none(),
+            "release worker build must clear SCRIBE_BUNDLED_WORKER_SHA256 before compilation"
+        );
+        return;
+    }
+    if profile == "release" && digest.is_none() {
+        panic!(
+            "release desktop build requires SCRIBE_BUNDLED_WORKER_SHA256 from the exact previously built worker"
+        );
+    }
+    let Some(digest) = digest else {
+        println!("cargo:warning=development desktop build has no bundled-worker SHA-256 anchor");
         return;
     };
     assert!(

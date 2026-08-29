@@ -21,6 +21,8 @@ mod config {
 }
 #[path = "../embedded_runtime.rs"]
 mod embedded_runtime;
+#[path = "../inference_server.rs"]
+mod inference_server;
 #[path = "../model_catalog.rs"]
 mod model_catalog;
 #[path = "../onnx_worker.rs"]
@@ -48,5 +50,5 @@ fn main() {
         eprintln!("Scribe inference worker could not harden native library loading: {error:#}");
         std::process::exit(1);
     }
-    std::process::exit(onnx_worker::run_dedicated_inference_worker());
+    std::process::exit(inference_server::run());
 }
