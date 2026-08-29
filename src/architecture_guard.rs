@@ -257,7 +257,8 @@ fn static_gguf_and_native_onnx_are_the_only_inference_architectures() {
     assert!(worker.contains("OnnxBundle(OnnxModelSpec)"));
     assert!(worker.contains("OfflineRecognizer::create("));
     assert!(worker.contains("OnlineRecognizer::create("));
-    assert!(worker.contains("std::env::current_exe()?"));
+    assert!(worker.contains("resolve_adjacent_inference_worker"));
+    assert!(worker.contains("scribe-inference-worker{}"));
     assert!(worker.contains("INFERENCE_WORKER_FLAG"));
 
     let router = fs::read_to_string(root.join("src/runtime_router.rs"))
@@ -269,9 +270,12 @@ fn static_gguf_and_native_onnx_are_the_only_inference_architectures() {
 
     let manifest =
         fs::read_to_string(root.join("Cargo.toml")).expect("Cargo manifest must be readable");
-    assert!(
-        manifest.contains("transcribe-cpp = { version = \"=0.1.3\", default-features = false }")
-    );
+    assert!(manifest.contains("inference-worker = [\"dep:transcribe-cpp\"]"));
+    assert!(manifest.contains(
+        "transcribe-cpp = { version = \"=0.1.3\", default-features = false, optional = true }"
+    ));
+    assert!(manifest.contains("name = \"scribe-inference-worker\""));
+    assert!(manifest.contains("required-features = [\"inference-worker\"]"));
 }
 
 #[test]
@@ -446,10 +450,7 @@ fn native_runtime_ownership_is_confined_to_exact_owner_paths() {
     let sources = rust_sources();
     let worker = sources
         .iter()
-        .find(|(path, source)| {
-            path != Path::new("architecture_guard.rs")
-                && source.contains("pub(crate) fn maybe_run_worker()")
-        })
+        .find(|(path, _)| path == Path::new("onnx_worker.rs"))
         .map(|(_, source)| source.as_str())
         .expect("worker entrypoint exists");
 
@@ -460,6 +461,8 @@ fn native_runtime_ownership_is_confined_to_exact_owner_paths() {
         "--scribe-vad-worker",
         "WorkerRole::Inference",
         "WorkerRole::Vad",
+        "pub(crate) fn maybe_run_vad_worker()",
+        "pub(crate) fn run_dedicated_inference_worker()",
         "fn worker_loop_for_role",
         "RuntimeRouter::new()",
         "fn load_worker_runtime",
@@ -581,6 +584,22 @@ fn native_runtime_ownership_is_confined_to_exact_owner_paths() {
         service.contains("let worker = RuntimeWorker::new_process();"),
         "production TranscriptionService must dispatch through the process supervisor"
     );
+
+    let main = sources
+        .iter()
+        .find(|(path, _)| path == Path::new("main.rs"))
+        .map(|(_, source)| production_source(source))
+        .expect("desktop entrypoint exists");
+    assert!(main.contains("onnx_worker::maybe_run_vad_worker()"));
+    assert!(!main.contains("run_dedicated_inference_worker"));
+
+    let dedicated = sources
+        .iter()
+        .find(|(path, _)| path == Path::new("bin/scribe-inference-worker.rs"))
+        .map(|(_, source)| production_source(source))
+        .expect("dedicated inference entrypoint exists");
+    assert!(dedicated.contains("onnx_worker::run_dedicated_inference_worker()"));
+    assert!(!dedicated.contains("maybe_run_vad_worker"));
 }
 
 #[test]
@@ -588,15 +607,26 @@ fn worker_roles_use_private_pipes_and_protocol_only_stdout() {
     let sources = rust_sources();
     let worker = sources
         .iter()
-        .find(|(path, source)| {
-            path != Path::new("architecture_guard.rs")
-                && source.contains("pub(crate) fn maybe_run_worker()")
-        })
+        .find(|(path, _)| path == Path::new("onnx_worker.rs"))
         .map(|(_, source)| production_source(source))
         .expect("worker entrypoint exists");
 
     assert!(worker.contains("PROTOCOL_MAGIC: [u8; 4] = *b\"SCIF\""));
-    assert!(worker.contains("PROTOCOL_VERSION: u8 = 4"));
+    assert!(worker.contains("PROTOCOL_VERSION: u8 = 5"));
+    for bound_capability in [
+        "challenge",
+        "app_build",
+        "worker_build",
+        "abi",
+        "role",
+        "provider",
+        "artifacts",
+    ] {
+        assert!(
+            worker.contains(bound_capability),
+            "SCIF v5 capability must bind {bound_capability}"
+        );
+    }
     assert!(worker.contains("Stdio::piped()"));
     assert!(worker.contains("std::io::stdout().lock()"));
     assert!(worker.contains("stderr(Stdio::inherit())"));
@@ -1220,7 +1250,9 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
     let release = fs::read_to_string(repository.join("scripts").join("build-windows-release.ps1"))
         .expect("Windows release script must be readable");
     for required in [
-        "cargo build --locked --offline --release --features ui-harness --target $targetTriple",
+        "cargo build --locked --offline --release --bin local-transcriber --features ui-harness --target $targetTriple",
+        "cargo build --locked --offline --release --bin scribe-inference-worker --features inference-worker --target $targetTriple",
+        "scribe-inference-worker.exe",
         "x86_64-pc-windows-msvc",
         "CARGO_TARGET_DIR",
         "[System.IO.Path]::IsPathFullyQualified($env:CARGO_TARGET_DIR)",
@@ -1237,6 +1269,7 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
         "Assert-WindowsGuiSubsystem",
         "Assert-ReviewedWindowsPe",
         "Windows GUI (2)",
+        "Windows console PE",
         "Invoke-NativeProcess",
         "RedirectStandardOutput",
         "WaitForExit",

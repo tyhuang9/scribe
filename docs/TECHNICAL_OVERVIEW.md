@@ -17,16 +17,16 @@ egui UI / tray / global hotkey
   TranscriptionService (runtime-neutral interface)
             |
             v
- InferenceWorkerSupervisor
+ InferenceWorkerRegistry (CPU route in this stage)
             |
-            v  private anonymous stdin/stdout pipes (SCIF v3)
- hidden child: Scribe --scribe-inference-worker
+            v  private anonymous stdin/stdout pipes (SCIF v5)
+ dedicated child: scribe-inference-worker --scribe-inference-worker
             |
             +--> worker-local RuntimeRouter
             |       +--> transcribe-cpp GGUF
             |       +--> native Sherpa ONNX receipt-backed bundles
             |
- separate child: Scribe --scribe-vad-worker
+ separate child: local-transcriber --scribe-vad-worker
         (VAD only; never an STT runtime)
             |
             v
@@ -35,7 +35,9 @@ egui UI / tray / global hotkey
 
 The UI does not select or invoke a runtime directly. The application-facing `TranscriptionService` owns only the runtime-neutral dispatch boundary and worker supervisor in the desktop process. Native GGUF model objects, transcribe-cpp sessions, Sherpa ONNX recognizers, and native FFI handles are constructed only by the persistent hidden `--scribe-inference-worker` child. The desktop process never constructs those native objects.
 
-The inference child is the single persistent STT process: it directly owns the worker-local router and both native runtime families (GGUF and receipt-backed Sherpa ONNX). VAD is intentionally a separate worker instance launched with `--scribe-vad-worker`; it has no STT commands. The workers communicate only through private anonymous stdin/stdout pipes using the SCIF v3 framed protocol. Worker stdout is protocol-only and diagnostics go to stderr. There is no localhost listener, TCP/HTTP inference transport, nested ONNX worker, Python runtime, dynamic runtime package, GGML/DLL path, or CLI fallback.
+The adjacent `scribe-inference-worker` executable is the single persistent STT process: it directly owns the worker-local router and both native runtime families (GGUF and receipt-backed Sherpa ONNX). The desktop resolves that worker by its exact canonical sibling path. VAD intentionally remains a separate instance of the desktop executable launched with `--scribe-vad-worker`; it has no STT commands. The workers communicate only through private anonymous stdin/stdout pipes using the SCIF v5 framed protocol. Its initial capability exchange binds a fresh random challenge, application and worker versions, ABI, role, CPU provider, and supported artifact targets to the process generation. Worker stdout is protocol-only and diagnostics go to stderr. There is no localhost listener, TCP/HTTP inference transport, nested ONNX worker, Python runtime, dynamic runtime package, GGML/DLL path, or CLI fallback.
+
+Stage 2 packages only the CPU route. `Auto` and `CPU` use it; explicit `GPU` returns a clear error and cannot silently fall back to CPU. CUDA, Vulkan, Metal, signed pack manifests, health quarantine, and GPU Auto qualification remain later stages.
 
 Normal GGUF remains local, native, CPU-only, and Python-free, but it is process-isolated rather than in-process. Receipt-backed ONNX inference uses the same private persistent STT child. Installation smoke runs in a fresh disposable worker process and is not the normal dictation worker.
 

@@ -45,6 +45,7 @@ $expectedInventoryPaths = @(
     "licenses/whisper.cpp-PROVENANCE.md",
     "local-transcriber.exe",
     "README.txt",
+    "scribe-inference-worker.exe",
     "whisper-base.en-Q8_0.gguf"
 )
 $expectedPortablePayloadPaths = @($expectedInventoryPaths) + @("bundle-inventory.json")
@@ -168,7 +169,7 @@ function Assert-SafeRelativePayloadPath([string]$RelativePath) {
 
 function Assert-AllowedPayloadFile(
     [string]$RelativePath,
-    [string[]]$AllowedExecutablePaths = @("local-transcriber.exe")
+    [string[]]$AllowedExecutablePaths = @("local-transcriber.exe", "scribe-inference-worker.exe")
 ) {
     Assert-SafeRelativePayloadPath $RelativePath
     $lower = $RelativePath.ToLowerInvariant()
@@ -327,7 +328,7 @@ function Assert-Bundle {
         }
     }
 
-    $allowedExecutables = @("local-transcriber.exe") + @($normalizedAllowedAdditionalFiles | Where-Object {
+    $allowedExecutables = @("local-transcriber.exe", "scribe-inference-worker.exe") + @($normalizedAllowedAdditionalFiles | Where-Object {
         [System.IO.Path]::GetExtension($_).Equals('.exe', [System.StringComparison]::OrdinalIgnoreCase)
     })
     $expectedPayloadPaths = @($expectedPortablePayloadPaths) + $normalizedAllowedAdditionalFiles
@@ -400,6 +401,7 @@ function Assert-Bundle {
 
     Assert-Amd64GuiPe (Join-Path $root "local-transcriber.exe")
     $null = Assert-ReviewedWindowsPe (Join-Path $root "local-transcriber.exe")
+    $null = Assert-ReviewedWindowsPe (Join-Path $root "scribe-inference-worker.exe") 3
 }
 
 function Assert-PayloadParity([string]$ReferenceRoot, [string]$CandidateRoot, [string]$Description) {

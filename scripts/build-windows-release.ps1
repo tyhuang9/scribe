@@ -263,7 +263,8 @@ function Assert-AllowedPayloadFile([string]$RelativePath) {
         $extension -in @('.pyd', '.py', '.pyc', '.onnx', '.ort')) {
         throw "Release payload contains a forbidden runtime, Python, runner, or loose ONNX artifact: $RelativePath"
     }
-    if ($extension -in @('.dll', '.exe') -and $RelativePath -cne 'local-transcriber.exe') {
+    if ($extension -in @('.dll', '.exe') -and
+        $RelativePath -cnotin @('local-transcriber.exe', 'scribe-inference-worker.exe')) {
         throw "Release payload contains an unallowlisted executable or DLL: $RelativePath"
     }
 }
@@ -413,9 +414,13 @@ Assert-ExactFile $modelSourcePath ([int64]$modelManifest.size_bytes) $modelManif
 
 Push-Location $repositoryRoot
 try {
-    & cargo build --locked --offline --release --features ui-harness --target $targetTriple --manifest-path (Join-Path $repositoryRoot "Cargo.toml")
+    & cargo build --locked --offline --release --bin local-transcriber --features ui-harness --target $targetTriple --manifest-path (Join-Path $repositoryRoot "Cargo.toml")
     if ($LASTEXITCODE -ne 0) {
-        throw "The locked offline Windows x64 release build failed."
+        throw "The locked offline Windows x64 desktop release build failed."
+    }
+    & cargo build --locked --offline --release --bin scribe-inference-worker --features inference-worker --target $targetTriple --manifest-path (Join-Path $repositoryRoot "Cargo.toml")
+    if ($LASTEXITCODE -ne 0) {
+        throw "The locked offline Windows x64 CPU inference worker release build failed."
     }
 }
 finally {
@@ -424,15 +429,20 @@ finally {
 
 $cargoReleaseRoot = Join-Path $cargoTargetRoot "$targetTriple\release"
 $sourceExecutable = Join-Path $cargoReleaseRoot "local-transcriber.exe"
+$sourceInferenceWorker = Join-Path $cargoReleaseRoot "scribe-inference-worker.exe"
 Assert-Amd64Pe $sourceExecutable
 Assert-WindowsGuiSubsystem $sourceExecutable
 $null = Assert-ReviewedWindowsPe $sourceExecutable
+Assert-Amd64Pe $sourceInferenceWorker
+$null = Assert-ReviewedWindowsPe $sourceInferenceWorker 3
 
 try {
     New-Item -ItemType Directory -Path $stagingBundle | Out-Null
     Assert-NoReparseAncestors $stagingBundle
     $stagedExecutable = Join-Path $stagingBundle "local-transcriber.exe"
+    $stagedInferenceWorker = Join-Path $stagingBundle "scribe-inference-worker.exe"
     Copy-Item -LiteralPath $sourceExecutable -Destination $stagedExecutable
+    Copy-Item -LiteralPath $sourceInferenceWorker -Destination $stagedInferenceWorker
 
     $stagedModel = Join-Path $stagingBundle $modelManifest.artifact_filename
     Copy-Item -LiteralPath $modelSourcePath -Destination $stagedModel
@@ -458,14 +468,14 @@ try {
         "Installer: the installer copies this exact portable payload into the per-user Scribe program directory and adds only its uninstaller pair.",
         "",
         "CONTENTS",
-        "The package contains one Scribe executable, the pinned English Base GGUF, its manifest, a hash inventory, this README, and reviewed license/provenance notices. Native transcribe.cpp, whisper.cpp, sherpa-onnx, and Silero VAD support are statically linked or embedded; there is no runtime folder, helper inference executable, loose DLL, or loose ONNX model.",
+        "The package contains the Scribe desktop, its dedicated CPU inference worker, the pinned English Base GGUF, its manifest, a hash inventory, this README, and reviewed license/provenance notices. Native transcribe.cpp, whisper.cpp, sherpa-onnx, and Silero VAD support are statically linked into the appropriate executable; there is no runtime folder, loose DLL, or loose ONNX model.",
         "Moonshine ONNX weights are not packaged. When requested, Scribe downloads them separately as receipt-backed per-user app-data artifacts.",
         "",
         "MANUAL VERIFICATION",
         "1. Confirm the extracted tree contains no files beyond bundle-inventory.json and every exact path listed in its files array.",
         "2. For every listed file, compare its byte length and SHA-256 with bundle-inventory.json.",
         "3. Confirm bundled-model-manifest.json identifies whisper-base.en-Q8_0.gguf as 84,886,208 bytes with SHA-256 3b46ca40bccbf7609c68d88a36d96077a04ca7c87f2060ede06f129fac3e7652.",
-        "4. Confirm local-transcriber.exe is an AMD64 Windows GUI PE and that no additional EXE, DLL, .onnx, .ort, Python, venv, runner, or runtimes directory is present.",
+        "4. Confirm local-transcriber.exe is an AMD64 Windows GUI PE, scribe-inference-worker.exe is an AMD64 Windows console PE, and no additional EXE, DLL, .onnx, .ort, Python, venv, runner, or runtimes directory is present.",
         "5. For an installer, compare every installed payload file and hash with the portable tree; only unins000.exe and unins000.dat may be additional files in the program directory.",
         "This release workflow does not claim Authenticode signing. Obtain artifacts from a trusted release channel and verify hashes before running them.",
         "",
@@ -484,6 +494,7 @@ try {
     Assert-NoReparseAncestors $stagingBundle
     Assert-TreeHasNoReparsePoints $stagingBundle
     Assert-CopyMatchesSource $sourceExecutable $stagedExecutable
+    Assert-CopyMatchesSource $sourceInferenceWorker $stagedInferenceWorker
     Assert-CopyMatchesSource $modelManifestPath $stagedModelManifest
     foreach ($legalFile in $legalFiles) {
         $sourcePath = Join-Path $repositoryRoot ($legalFile.Source -replace '/', '\')
@@ -493,9 +504,12 @@ try {
     Assert-Amd64Pe $stagedExecutable
     Assert-WindowsGuiSubsystem $stagedExecutable
     $null = Assert-ReviewedWindowsPe $stagedExecutable
+    Assert-Amd64Pe $stagedInferenceWorker
+    $null = Assert-ReviewedWindowsPe $stagedInferenceWorker 3
     Assert-ExactFile $stagedModel ([int64]$modelManifest.size_bytes) $modelManifest.sha256
     $expectedPaths = [System.Collections.Generic.List[string]]::new()
     $null = $expectedPaths.Add("local-transcriber.exe")
+    $null = $expectedPaths.Add("scribe-inference-worker.exe")
     $null = $expectedPaths.Add($modelManifest.artifact_filename)
     foreach ($legalFile in $legalFiles) {
         $null = $expectedPaths.Add($legalFile.Destination)

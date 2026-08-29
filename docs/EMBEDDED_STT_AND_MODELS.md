@@ -11,12 +11,15 @@
 
 ## Current architecture and catalog
 
-Normal GGUF inference and receipt-backed ONNX inference both run in the private
-persistent `--scribe-inference-worker` child over private SCIF v3 stdin/stdout
-pipes. GGUF uses the statically linked native `transcribe-cpp` CPU backend;
-receipt-backed ONNX bundles use native Sherpa ONNX in that same child. VAD has
-its own `--scribe-vad-worker` production process and is not an STT runtime.
-The desktop process does not construct model objects or recognizers.
+Normal GGUF inference and receipt-backed ONNX inference both run in the private,
+adjacent `scribe-inference-worker` executable over private SCIF v5 stdin/stdout
+pipes. The capability handshake binds a fresh process-generation challenge,
+application and worker versions, runtime ABI, role, provider, and artifact
+targets. GGUF uses the statically linked native `transcribe-cpp` CPU backend;
+receipt-backed ONNX bundles use native Sherpa ONNX in that same worker. VAD has
+its own same-desktop-executable `--scribe-vad-worker` production process and is
+not an STT runtime. The desktop process does not construct GGUF or ASR ONNX
+model objects or recognizers.
 
 There is no Python runtime, localhost service, dynamic runtime package,
 GGML/DLL route, or CLI fallback in the production inference path. The normal
@@ -153,7 +156,7 @@ The distinction below is deliberate and must remain explicit in later reports.
 
 | Target | Current package behavior | Current status |
 | --- | --- | --- |
-| Windows x86_64 | One pinned whisper.cpp v1.9.1 CPU compatibility package plus the pinned base.en Q8_0 GGUF beside the executable. `Auto` and `Cpu` resolve to CPU; `Gpu` returns a structured unsupported-GPU error. `build-windows-release.ps1` performs a locked, offline target-triple build, validates AMD64 PE inputs, stages an explicit allowlist in a unique sibling transaction directory, runs the GGUF smoke offline, writes a hash inventory, and only then atomically publishes `artifacts/Scribe-windows-x64`. | **Source/manifests and packaging enforcement are implemented; physical packaged desktop acceptance remains required.** |
+| Windows x86_64 | The desktop and adjacent dedicated CPU inference worker are built independently and packaged with the pinned base.en Q8_0 GGUF. `Auto` and `Cpu` resolve to CPU; `Gpu` returns a structured unsupported-GPU error without CPU fallback. `build-windows-release.ps1` performs locked, offline target-triple builds, validates both AMD64 PE inputs, stages an explicit allowlist in a unique sibling transaction directory, runs the GGUF smoke through the worker offline, writes a hash inventory, and only then atomically publishes `artifacts/Scribe-windows-x64`. | **Source/manifests and packaging enforcement are implemented; physical packaged desktop acceptance remains required.** |
 | macOS | No pinned primary package in the checked-in manifest. No Metal package is verified. | **Unavailable / unverified; do not claim CPU or Metal release support.** |
 | Linux | No pinned primary package in the checked-in manifest. No Vulkan or other GPU package is verified. | **Unavailable / unverified; do not claim CPU or GPU release support.** |
 

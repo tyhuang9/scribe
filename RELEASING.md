@@ -21,7 +21,6 @@ $env:SHERPA_ONNX_ARCHIVE_DIR = $archiveDir
 .\scripts\prepare-windows-release-inputs.ps1 -OutputDirectory .release-inputs
 .\scripts\build-windows-release.ps1 `
   -ModelSource .release-inputs\model\whisper-base.en-Q8_0.gguf `
-  -RuntimeSource .release-inputs\runtime `
   -BundlePath dist\portable
 $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches.Groups[1].Value
 & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DAppVersion=$version" installer\scribe.iss
@@ -31,7 +30,8 @@ Copy-Item "dist\Scribe-Setup-$version.exe" dist\Scribe-Setup.exe -Force
 
 The Inno Setup compiler first writes `dist\Scribe-Setup-<version>.exe`; the
 normalized release asset is `dist\Scribe-Setup.exe`. Do not distribute a bare
-`local-transcriber.exe`: the installer must include the complete staged payload.
+`local-transcriber.exe` or `scribe-inference-worker.exe`: the installer must
+include the complete staged payload, with both executables adjacent.
 The scripts download the exact pinned runtime/model sources and verify their
 sizes and SHA-256 values before they are staged.
 

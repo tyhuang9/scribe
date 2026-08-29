@@ -287,13 +287,18 @@ function Get-WindowsPeImportReport([string]$Path) {
     }
 }
 
-function Assert-ReviewedWindowsPe([string]$Path) {
+function Assert-ReviewedWindowsPe(
+    [string]$Path,
+    [ValidateSet(2, 3)]
+    [uint16]$ExpectedSubsystem = 2
+) {
     $report = Get-WindowsPeImportReport $Path
     if ($report.Machine -ne 0x8664) {
         throw "PE Machine mismatch for ${Path}: expected AMD64 (0x8664), got 0x$($report.Machine.ToString('x4'))."
     }
-    if ($report.Subsystem -ne 2) {
-        throw "PE subsystem mismatch for ${Path}: expected Windows GUI (2), got $($report.Subsystem)."
+    if ($report.Subsystem -ne $ExpectedSubsystem) {
+        $subsystemName = if ($ExpectedSubsystem -eq 2) { "Windows GUI" } else { "Windows console" }
+        throw "PE subsystem mismatch for ${Path}: expected $subsystemName ($ExpectedSubsystem), got $($report.Subsystem)."
     }
     if ($report.NormalImports.Count -eq 0) {
         throw "PE normal import closure is unexpectedly empty for $Path."
