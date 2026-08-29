@@ -292,11 +292,11 @@ pub(crate) struct BackendSelection {
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub(crate) enum BackendSelectionError {
     #[error("no compatible CPU backend is available")]
-    CpuUnavailable,
+    CpuNotFound,
     #[error("no compatible GPU backend is available for the current system")]
-    GpuUnavailable,
+    NoGpuTarget,
     #[error("no compatible backend is available for Auto; the required CPU fallback is missing")]
-    AutoUnavailable,
+    AutoMissingCpuFallback,
 }
 
 /// Resolves a preference without probing hardware or mutating runtime state.
@@ -327,14 +327,14 @@ pub(crate) fn select_backend(
             .iter()
             .any(|target| target.backend == BackendKind::Cpu)
     {
-        return Err(BackendSelectionError::AutoUnavailable);
+        return Err(BackendSelectionError::AutoMissingCpuFallback);
     }
 
     let Some(target) = eligible.first().cloned() else {
         return Err(match requested {
-            AccelerationPreference::Cpu => BackendSelectionError::CpuUnavailable,
-            AccelerationPreference::Gpu => BackendSelectionError::GpuUnavailable,
-            AccelerationPreference::Auto => BackendSelectionError::AutoUnavailable,
+            AccelerationPreference::Cpu => BackendSelectionError::CpuNotFound,
+            AccelerationPreference::Gpu => BackendSelectionError::NoGpuTarget,
+            AccelerationPreference::Auto => BackendSelectionError::AutoMissingCpuFallback,
         });
     };
     let reason = match requested {
@@ -729,7 +729,7 @@ mod tests {
             &snapshot(OperatingSystem::Windows, PowerSource::Ac, vec![cpu()]),
         )
         .unwrap_err();
-        assert_eq!(error, BackendSelectionError::GpuUnavailable);
+        assert_eq!(error, BackendSelectionError::NoGpuTarget);
     }
 
     #[test]
@@ -774,7 +774,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert_eq!(error, BackendSelectionError::AutoUnavailable);
+        assert_eq!(error, BackendSelectionError::AutoMissingCpuFallback);
     }
 
     #[test]
