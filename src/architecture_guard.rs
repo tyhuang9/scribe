@@ -646,6 +646,99 @@ fn native_runtime_ownership_is_confined_to_exact_owner_paths() {
 }
 
 #[test]
+fn verified_worker_pack_stage_remains_fail_closed_and_provider_inert() {
+    let module = include_str!("gpu_worker_pack/mod.rs");
+    let manifest = include_str!("gpu_worker_pack/manifest.rs");
+    let production_manifest = manifest
+        .split("#[cfg(test)]")
+        .next()
+        .expect("manifest has a production section");
+    assert!(module.contains("pub(crate) fn production_registry() -> Vec<VerifiedPack>"));
+    assert!(module.contains("Vec::new()"));
+    assert!(production_manifest.contains("struct ProductionTrustRoot"));
+    assert!(production_manifest.contains("fn public_key(&self, _key_id: &str) -> Option<&[u8]>"));
+    assert!(production_manifest.contains("None"));
+    for forbidden in ["Ed25519KeyPair", "private_key", "signing_seed"] {
+        assert!(
+            !production_manifest.contains(forbidden),
+            "production pack verifier contains signing material/API marker {forbidden}"
+        );
+    }
+    assert!(module.contains("--scribe-verify-worker-pack"));
+    assert!(module.contains("PackBackend::Cuda"));
+    assert!(module.contains("PackBackend::Vulkan"));
+    assert!(module.contains("PackBackend::Metal"));
+}
+
+#[test]
+fn worker_pack_health_persistence_stays_bounded_and_content_free() {
+    let source = include_str!("gpu_worker_pack/health.rs");
+    let production = source
+        .split("#[cfg(test)]")
+        .next()
+        .expect("health cache has a production section");
+    for required in [
+        "pack_digest",
+        "runtime_abi",
+        "os_arch",
+        "driver_version",
+        "stable_device_identity",
+        "model_digest",
+        "app_build",
+        "device_set_digest",
+        "FIRST_QUARANTINE_SECONDS: u64 = 15 * 60",
+        "SECOND_QUARANTINE_SECONDS: u64 = 6 * 60 * 60",
+        "THIRD_QUARANTINE_SECONDS: u64 = 7 * 24 * 60 * 60",
+    ] {
+        assert!(
+            production.contains(required),
+            "health contract lost {required}"
+        );
+    }
+    for forbidden in [
+        "audio_path",
+        "transcript",
+        "raw_error",
+        "diagnostic_text",
+        "error_message",
+    ] {
+        assert!(
+            !production.contains(forbidden),
+            "health cache production schema regained forbidden content: {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn release_packaging_accepts_only_compiled_verified_declared_pack_roots() {
+    let build = include_str!("../scripts/build-windows-release.ps1");
+    let stage = include_str!("../scripts/stage-verified-worker-packs.ps1");
+    let installer = include_str!("../installer/scribe.iss");
+    let workflow = include_str!("../.github/workflows/release.yml");
+    for required in [
+        "WorkerPackRoot",
+        "stage-verified-worker-packs.ps1",
+        "worker-pack-catalog.json",
+        "PackFiles",
+    ] {
+        assert!(
+            build.contains(required),
+            "release pack integration lost {required}"
+        );
+    }
+    assert!(stage.matches("Invoke-PackVerifier $verifier").count() >= 2);
+    assert!(stage.contains("workers/packs/"));
+    assert!(stage.contains("PackRoot.Count -gt 8"));
+    assert!(stage.contains("allPackFiles.Count -gt 1024"));
+    assert!(!stage.contains("Ed25519KeyPair"));
+    assert!(!stage.contains("SIGNING_KEY"));
+    assert!(installer.contains("#include WorkerPackAllowlist"));
+    assert!(installer.contains("IsGeneratedWorkerPackFile(RelativePath)"));
+    assert!(workflow.contains("/DWorkerPackAllowlist=..\\dist\\worker-pack-allowlist.iss"));
+    assert!(!build.contains("--features vulkan-acceleration"));
+}
+
+#[test]
 fn worker_roles_use_private_pipes_and_protocol_only_stdout() {
     let sources = rust_sources();
     let worker = sources
@@ -1761,7 +1854,7 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
         "installer enumeration must fail closed on start and continuation errors"
     );
     assert!(
-        installer.contains("BoundHandles: array[0..31] of THandle")
+        installer.contains("BoundHandles: array[0..2047] of THandle")
             && installer.contains("procedure ReleaseBoundHandles()")
             && lifecycle_source.contains("if CurStep = ssPostInstall then")
             && lifecycle_source.contains("procedure DeinitializeSetup();")

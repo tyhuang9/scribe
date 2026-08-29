@@ -960,6 +960,82 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn schema_protocol_build_worker_digest_and_size_bounds_are_enforced() {
+        let root = temp_root("metadata-bounds");
+        let (verifier, _) = fixture(&root);
+
+        let mut manifest = base_manifest();
+        manifest.schema_version = PACK_SCHEMA_VERSION + 1;
+        assert!(matches!(
+            verifier.validate_manifest(&manifest),
+            Err(PackVerificationError::UnsupportedSchema)
+        ));
+
+        let mut manifest = base_manifest();
+        manifest.worker_protocol_version = APP_PROTOCOL_VERSION - 1;
+        assert!(matches!(
+            verifier.validate_manifest(&manifest),
+            Err(PackVerificationError::ProtocolMismatch)
+        ));
+
+        let mut manifest = base_manifest();
+        manifest.worker_build = "incompatible-worker-build-v1".into();
+        assert!(matches!(
+            verifier.validate_manifest(&manifest),
+            Err(PackVerificationError::BuildMismatch)
+        ));
+
+        let mut manifest = base_manifest();
+        manifest.worker_path = "bin/missing-worker.exe".into();
+        assert!(matches!(
+            verifier.validate_manifest(&manifest),
+            Err(PackVerificationError::WorkerMissing)
+        ));
+
+        let mut manifest = base_manifest();
+        manifest.pack_digest = "f".repeat(64);
+        assert!(matches!(
+            verifier.validate_manifest(&manifest),
+            Err(PackVerificationError::DigestMismatch)
+        ));
+
+        let too_many = (0..=MAX_FILES)
+            .map(|index| PayloadEntry {
+                path: format!("files/{index:03}.bin"),
+                size_bytes: 1,
+                sha256: "a".repeat(64),
+            })
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            validate_inventory(&too_many),
+            Err(PackVerificationError::InvalidFileCount)
+        ));
+
+        let too_large = vec![PayloadEntry {
+            path: "files/large.bin".into(),
+            size_bytes: MAX_FILE_BYTES + 1,
+            sha256: "a".repeat(64),
+        }];
+        assert!(matches!(
+            validate_inventory(&too_large),
+            Err(PackVerificationError::FileTooLarge)
+        ));
+
+        let aggregate_too_large = (0..3)
+            .map(|index| PayloadEntry {
+                path: format!("files/{index}.bin"),
+                size_bytes: MAX_FILE_BYTES,
+                sha256: "a".repeat(64),
+            })
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            validate_inventory(&aggregate_too_large),
+            Err(PackVerificationError::AggregateTooLarge)
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[cfg(windows)]
     #[test]
     fn alternate_data_streams_and_hardlinks_are_rejected() {

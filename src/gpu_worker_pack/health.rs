@@ -588,10 +588,33 @@ mod tests {
             cache.decision(&key("new-driver")),
             HealthDecision::Available
         );
+        for changed_key in [
+            HealthKey {
+                pack_digest: "c".repeat(64),
+                ..original_key.clone()
+            },
+            HealthKey {
+                stable_device_identity: "pci:0000:02:00.0".to_owned(),
+                ..original_key.clone()
+            },
+            HealthKey {
+                model_digest: "e".repeat(64),
+                ..original_key.clone()
+            },
+        ] {
+            assert_eq!(cache.decision(&changed_key), HealthDecision::Available);
+        }
 
         let changed_app = HealthCache::open(&path, witnesses("app-b"), &clock);
         assert_eq!(
             changed_app.decision(&original_key),
+            HealthDecision::Available
+        );
+        let mut changed_device_set_witness = witnesses("app-a");
+        changed_device_set_witness.device_set_digest = "f".repeat(64);
+        let changed_device_set = HealthCache::open(&path, changed_device_set_witness, &clock);
+        assert_eq!(
+            changed_device_set.decision(&original_key),
             HealthDecision::Available
         );
         fs::write(&path, b"{raw-error-and-path:C:\\private}").unwrap();

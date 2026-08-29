@@ -391,9 +391,8 @@ fn remove_staging_tree(path: &Path) -> Result<(), PackStoreError> {
             if metadata.is_dir() {
                 directories.push(child);
             } else if metadata.is_file() {
-                let mut permissions = metadata.permissions();
-                permissions.set_readonly(false);
-                fs::set_permissions(&child, permissions)?;
+                #[cfg(windows)]
+                clear_windows_readonly(&child, metadata.permissions())?;
                 fs::remove_file(child)?;
             }
         }
@@ -401,6 +400,19 @@ fn remove_staging_tree(path: &Path) -> Result<(), PackStoreError> {
     for directory in ordered.into_iter().rev() {
         fs::remove_dir(directory)?;
     }
+    Ok(())
+}
+
+#[cfg(windows)]
+#[allow(clippy::permissions_set_readonly_false)]
+fn clear_windows_readonly(
+    path: &Path,
+    mut permissions: fs::Permissions,
+) -> Result<(), PackStoreError> {
+    // Windows refuses removal of FILE_ATTRIBUTE_READONLY payloads. This code
+    // does not compile on Unix, where clearing readonly could broaden mode bits.
+    permissions.set_readonly(false);
+    fs::set_permissions(path, permissions)?;
     Ok(())
 }
 

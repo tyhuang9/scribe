@@ -1,7 +1,9 @@
 param(
     [Parameter(Mandatory = $true)]
     [string]$ModelSource,
-    [string]$BundlePath
+    [string]$BundlePath,
+    [string[]]$WorkerPackRoot = @(),
+    [string]$InstallerPackAllowlistPath
 )
 
 $ErrorActionPreference = "Stop"
@@ -12,6 +14,9 @@ Set-StrictMode -Version Latest
 $targetTriple = "x86_64-pc-windows-msvc"
 $expectedPeMachine = 0x8664
 $repositoryRoot = [System.IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
+if ([string]::IsNullOrWhiteSpace($InstallerPackAllowlistPath)) {
+    $InstallerPackAllowlistPath = Join-Path $repositoryRoot "dist\worker-pack-allowlist.iss"
+}
 $modelManifestPath = Join-Path $repositoryRoot "runtime-manifests\whisper-base-en-q8_0-windows-x64.json"
 $modelManifest = Get-Content -LiteralPath $modelManifestPath -Raw | ConvertFrom-Json
 $legalFiles = @(
@@ -459,6 +464,16 @@ try {
     Copy-Item -LiteralPath $sourceExecutable -Destination $stagedExecutable
     Copy-Item -LiteralPath $sourceInferenceWorker -Destination $stagedInferenceWorker
 
+    $packStageOutput = @(& (Join-Path $PSScriptRoot "stage-verified-worker-packs.ps1") `
+        -BundleRoot $stagingBundle `
+        -VerifierExecutable $stagedExecutable `
+        -PackRoot $WorkerPackRoot `
+        -InstallerAllowlistPath $InstallerPackAllowlistPath)
+    if ($packStageOutput.Count -ne 1) {
+        throw "Worker-pack staging did not return exactly one bounded result."
+    }
+    $packStage = $packStageOutput[0]
+
     $stagedModel = Join-Path $stagingBundle $modelManifest.artifact_filename
     Copy-Item -LiteralPath $modelSourcePath -Destination $stagedModel
     foreach ($legalFile in $legalFiles) {
@@ -483,7 +498,8 @@ try {
         "Installer: the installer copies this exact portable payload into the per-user Scribe program directory and adds only its uninstaller pair.",
         "",
         "CONTENTS",
-        "The package contains the Scribe desktop, its dedicated CPU inference worker, the pinned English Base GGUF, its manifest, a hash inventory, this README, and reviewed license/provenance notices. Native transcribe.cpp, whisper.cpp, sherpa-onnx, and Silero VAD support are statically linked into the appropriate executable; there is no runtime folder, loose DLL, or loose ONNX model.",
+        "The package contains the Scribe desktop, its dedicated CPU inference worker, the pinned English Base GGUF, its manifest, an empty verified worker-pack catalog, a hash inventory, this README, and reviewed license/provenance notices. Native transcribe.cpp, whisper.cpp, sherpa-onnx, and Silero VAD support are statically linked into the appropriate executable; there is no runtime folder, loose DLL, or loose ONNX model.",
+        "This Stage 3 release ships no CUDA, Vulkan, or Metal worker pack. Non-empty declared pack roots fail closed until a persistent production public key and matching external CI signing secret are provisioned.",
         "Moonshine ONNX weights are not packaged. When requested, Scribe downloads them separately as receipt-backed per-user app-data artifacts.",
         "",
         "MANUAL VERIFICATION",
@@ -530,7 +546,11 @@ try {
         $null = $expectedPaths.Add($legalFile.Destination)
     }
     $null = $expectedPaths.Add("bundled-model-manifest.json")
+    $null = $expectedPaths.Add("worker-pack-catalog.json")
     $null = $expectedPaths.Add("README.txt")
+    foreach ($packFile in @($packStage.PackFiles)) {
+        $null = $expectedPaths.Add([string]$packFile)
+    }
     Assert-ExactAllowlist $stagingBundle $expectedPaths.ToArray()
 
     $previousHubOffline = $env:HF_HUB_OFFLINE

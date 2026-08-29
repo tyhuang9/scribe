@@ -68,6 +68,9 @@ fn main() -> eframe::Result<()> {
         eprintln!("Scribe could not harden native library loading: {error:#}");
         std::process::exit(1);
     }
+    if let Some(exit_code) = gpu_worker_pack::maybe_run_pack_verifier() {
+        std::process::exit(exit_code);
+    }
     if let Some(exit_code) = onnx_worker::maybe_run_vad_worker() {
         std::process::exit(exit_code);
     }
