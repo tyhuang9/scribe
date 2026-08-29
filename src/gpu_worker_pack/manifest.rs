@@ -20,13 +20,13 @@ pub(crate) const APP_PROTOCOL_VERSION: u16 = crate::onnx_worker::PROTOCOL_VERSIO
 pub(crate) const RUNTIME_ABI_VERSION: u16 = crate::onnx_worker::WORKER_ABI_VERSION;
 pub(crate) const EMBEDDED_MINIMUM_SECURITY_EPOCH: u64 = 1;
 
-const MAX_MANIFEST_BYTES: u64 = 256 * 1024;
-const MAX_SIGNATURE_BYTES: u64 = 4 * 1024;
-const MAX_FILES: usize = 256;
+pub(crate) const MAX_MANIFEST_BYTES: u64 = 256 * 1024;
+pub(crate) const MAX_SIGNATURE_BYTES: u64 = 4 * 1024;
+pub(crate) const MAX_FILES: usize = 256;
 const MAX_DEPTH: usize = 12;
 const MAX_NAME_BYTES: usize = 128;
-const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-const MAX_AGGREGATE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+pub(crate) const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+pub(crate) const MAX_AGGREGATE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const PACK_DIGEST_DOMAIN: &[u8] = b"scribe-gpu-worker-pack-digest-v1\0";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -148,7 +148,15 @@ impl VerifiedPack {
 pub(crate) struct VerifiedPackLease {
     verified_pack: VerifiedPack,
     root: PinnedPackRoot,
+    copy_entries: Vec<VerifiedCopyEntry>,
     _retained_files: Vec<File>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct VerifiedCopyEntry {
+    pub(crate) path: String,
+    pub(crate) size_bytes: u64,
+    pub(crate) sha256: String,
 }
 
 impl std::fmt::Debug for VerifiedPackLease {
@@ -171,6 +179,29 @@ impl VerifiedPackLease {
 
     pub(crate) fn recheck(&self) -> Result<(), PackVerificationError> {
         self.root.recheck()
+    }
+
+    pub(crate) fn copy_entries(&self) -> &[VerifiedCopyEntry] {
+        &self.copy_entries
+    }
+
+    pub(crate) fn open_copy_file(
+        &self,
+        entry: &VerifiedCopyEntry,
+    ) -> Result<File, PackVerificationError> {
+        let path = Path::new(&entry.path);
+        let file = self.root.open_regular(path)?;
+        let metadata = file.metadata().map_err(PackVerificationError::Io)?;
+        let display_path = self.root.path.join(path);
+        if !metadata.is_file() || is_link_or_reparse(&metadata) {
+            return Err(PackVerificationError::NonRegularEntry(display_path));
+        }
+        if metadata.len() != entry.size_bytes {
+            return Err(PackVerificationError::SizeMismatch(entry.path.clone()));
+        }
+        reject_hardlink(&file, &metadata, &display_path)?;
+        reject_named_streams(&display_path)?;
+        Ok(file)
     }
 }
 
@@ -328,7 +359,7 @@ impl<'a> PackVerifier<'a> {
     }
 
     pub(crate) fn verify(&self, root: &Path) -> Result<VerifiedPack, PackVerificationError> {
-        let (verified, _) = self.verify_inner(root, None)?;
+        let (verified, _, _) = self.verify_inner(root, None)?;
         Ok(verified)
     }
 
@@ -338,11 +369,13 @@ impl<'a> PackVerifier<'a> {
     ) -> Result<VerifiedPackLease, PackVerificationError> {
         root.recheck()?;
         let verification_root = root.verification_root();
-        let (verified_pack, retained_files) = self.verify_inner(&verification_root, Some(&root))?;
+        let (verified_pack, copy_entries, retained_files) =
+            self.verify_inner(&verification_root, Some(&root))?;
         root.recheck()?;
         Ok(VerifiedPackLease {
             verified_pack,
             root,
+            copy_entries,
             _retained_files: retained_files,
         })
     }
@@ -351,7 +384,7 @@ impl<'a> PackVerifier<'a> {
         &self,
         root: &Path,
         pinned: Option<&PinnedPackRoot>,
-    ) -> Result<(VerifiedPack, Vec<File>), PackVerificationError> {
+    ) -> Result<(VerifiedPack, Vec<VerifiedCopyEntry>, Vec<File>), PackVerificationError> {
         if pinned.is_none() {
             validate_root(root)?;
         }
@@ -388,6 +421,23 @@ impl<'a> PackVerifier<'a> {
         retained_files.push(signature_file);
 
         let descriptor_root = pinned.map_or_else(|| root.to_path_buf(), |lease| lease.path.clone());
+        let mut copy_entries = Vec::with_capacity(manifest.payload.len() + 2);
+        copy_entries.push(VerifiedCopyEntry {
+            path: MANIFEST_NAME.to_owned(),
+            size_bytes: manifest_bytes.len() as u64,
+            sha256: format!("{:x}", Sha256::digest(&manifest_bytes)),
+        });
+        copy_entries.push(VerifiedCopyEntry {
+            path: SIGNATURE_NAME.to_owned(),
+            size_bytes: signature_bytes.len() as u64,
+            sha256: format!("{:x}", Sha256::digest(&signature_bytes)),
+        });
+        copy_entries.extend(manifest.payload.iter().map(|entry| VerifiedCopyEntry {
+            path: entry.path.clone(),
+            size_bytes: entry.size_bytes,
+            sha256: entry.sha256.clone(),
+        }));
+
         Ok((
             VerifiedPack {
                 pack_id: manifest.pack_id,
@@ -402,6 +452,7 @@ impl<'a> PackVerifier<'a> {
                 worker_relative_path: manifest.worker_path,
                 root: descriptor_root,
             },
+            copy_entries,
             retained_files,
         ))
     }
@@ -414,7 +465,7 @@ impl<'a> PackVerifier<'a> {
     ) -> Result<LaunchableWorker<'lease>, PackVerificationError> {
         expected.recheck()?;
         let verification_root = expected.root.verification_root();
-        let (observed, _launch_files) =
+        let (observed, _copy_entries, _launch_files) =
             self.verify_inner(&verification_root, Some(&expected.root))?;
         if &observed != expected.verified_pack() {
             return Err(PackVerificationError::DescriptorChanged);
@@ -718,6 +769,9 @@ fn verify_exact_tree(root: &Path, inventory: &[PayloadEntry]) -> Result<(), Pack
             } else if metadata.is_file() {
                 reject_named_streams(&path)?;
                 observed.insert(relative);
+                if observed.len() > MAX_FILES + 2 {
+                    return Err(PackVerificationError::InvalidFileCount);
+                }
             } else {
                 return Err(PackVerificationError::NonRegularEntry(path));
             }
@@ -1117,11 +1171,19 @@ fn same_directory_identity(handle: &File, path: &Path) -> Result<bool, PackVerif
 
 #[cfg(windows)]
 fn same_directory_identity(handle: &File, path: &Path) -> Result<bool, PackVerificationError> {
+    use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT, GetFileInformationByHandle,
+        BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        GetFileInformationByHandle,
     };
-    let observed = match open_directory_no_follow(path) {
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+    let observed = match options.open(path) {
         Ok(file) => file,
         Err(_) => return Ok(false),
     };

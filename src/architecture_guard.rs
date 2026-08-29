@@ -195,6 +195,37 @@ fn production_source_for(_path: &Path, source: &str) -> String {
     production_source(source)
 }
 
+fn named_function_bodies(source: &str, name: &str) -> Vec<String> {
+    let needle = format!("fn {name}");
+    let mask = rust_code_mask(source);
+    let mut bodies = Vec::new();
+    for (start, _) in source.match_indices(&needle) {
+        if !mask[start] {
+            continue;
+        }
+        let Some(relative_open) = source[start..].find('{') else {
+            continue;
+        };
+        let open = start + relative_open;
+        let mut depth = 1_i32;
+        let mut cursor = open + 1;
+        while cursor < source.len() && depth != 0 {
+            if mask[cursor] {
+                match source.as_bytes()[cursor] {
+                    b'{' => depth += 1,
+                    b'}' => depth -= 1,
+                    _ => {}
+                }
+            }
+            cursor += 1;
+        }
+        if depth == 0 {
+            bodies.push(source[open + 1..cursor - 1].to_owned());
+        }
+    }
+    bodies
+}
+
 fn production_pack_provisioning_allowed(
     registry_body: &str,
     worker: &str,
@@ -214,14 +245,26 @@ fn production_pack_provisioning_allowed(
         && worker.contains("VerifiedPackLaunchBinding::try_from_resolver_hello_bridge")
         && worker.contains("trait WorkerExecutableResolver")
         && worker.contains("Hello");
+    let unix_launch_bodies =
+        named_function_bodies(worker, "launch_worker_from_verified_pack_lease").join("\n");
+    let unix_authority_constructor = named_function_bodies(
+        worker,
+        "open_unix_pack_exec_authority_from_verified_pack_lease",
+    )
+    .join("\n");
     let unix_fd_launch_flow = !unix_target
         || (worker.contains("UnixPackExecAuthority")
             && worker.contains("resolver_unix_launch_authority")
             && worker.contains("executable_fd")
             && worker.contains("dependency_root_fd")
-            && (worker.contains("execveat") || worker.contains("fexecve"))
-            && !worker.contains("Command::spawn")
-            && !worker.contains("Command::new"));
+            && worker.contains(
+                "fn open_unix_pack_exec_authority_from_verified_pack_lease(lease: &VerifiedPackLease)",
+            )
+            && unix_authority_constructor.contains("openat")
+            && (unix_launch_bodies.contains("execveat")
+                || unix_launch_bodies.contains("fexecve"))
+            && !unix_launch_bodies.contains("Command::spawn")
+            && !unix_launch_bodies.contains("Command::new"));
     (registry_is_empty && trust_root_is_empty)
         || (!registry_is_empty
             && !trust_root_is_empty
@@ -302,11 +345,20 @@ fn stage_four_guard_rejects_dead_binding_declarations() {
         true,
     ));
     let unix_fd_flow = format!(
-        "{concrete_flow}\nstruct UnixPackExecAuthority {{ executable_fd: OwnedFd, dependency_root_fd: OwnedFd }}\nfn resolver_unix_launch_authority() -> UnixPackExecAuthority {{}}\nfn launch_worker_from_verified_pack_lease() {{ execveat(executable_fd, dependency_root_fd); }}"
+        "{concrete_flow}\nstruct UnixPackExecAuthority {{ executable_fd: OwnedFd, dependency_root_fd: OwnedFd }}\nfn resolver_unix_launch_authority() -> UnixPackExecAuthority {{}}\nfn open_unix_pack_exec_authority_from_verified_pack_lease(lease: &VerifiedPackLease) {{ openat(lease, executable_fd); }}\nfn launch_worker_from_verified_pack_lease() {{ execveat(executable_fd, dependency_root_fd); }}"
     );
     assert!(production_pack_provisioning_allowed(
         populated_registry,
         &unix_fd_flow,
+        false,
+        true,
+    ));
+    let unrelated_command = format!(
+        "{unix_fd_flow}\nfn unrelated_test_or_cpu_helper() {{ Command::new(\"helper\").spawn(); }}"
+    );
+    assert!(production_pack_provisioning_allowed(
+        populated_registry,
+        &unrelated_command,
         false,
         true,
     ));
@@ -780,6 +832,8 @@ fn verified_worker_pack_stage_remains_fail_closed_and_provider_inert() {
         "hello_stable_device_identity",
         "struct UnixPackExecAuthority",
         "resolver_unix_launch_authority",
+        "verified_pack_lease: Arc<VerifiedPackLease>",
+        "Arc::ptr_eq",
         "executable_fd",
         "dependency_root_fd",
     ] {

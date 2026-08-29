@@ -37,9 +37,11 @@ file-identity, digest, and final-process-image checks. The target cannot outlive
 its `VerifiedPackLease`.
 
 Installed-pack verification is authorized by a retained `VerifiedPackLease`,
-not by a descriptor path. The store opens the canonical pack root and each
-pack-ID/version/digest directory separately without following links and keeps
-all four directory handles plus verified payload handles alive. Windows opens
+not by a descriptor path. The store acquires each configured absolute root from
+the filesystem root one lexical component at a time without canonicalizing or
+following it, then opens each pack-ID/version/digest directory the same way.
+Missing roots are created only beneath an already retained non-reparse parent.
+The complete ancestor chain and verified payload handles remain alive. Windows opens
 reject reparse points and omit delete sharing so an ancestor or payload cannot
 be renamed out from under verification. Unix opens use `openat` with
 `O_DIRECTORY|O_NOFOLLOW` for ancestors and handle-relative payload access.
@@ -56,8 +58,12 @@ the store constructs an exact three-component path beneath its canonical root.
 
 ## Immutable storage and activation
 
-Pre-signed input is first verified, copied with no-follow opens into a random
-sibling staging directory, and fully reverified there. Only then is it durably
+Pre-signed input is first verified through a retained source-root lease. The
+store copies only the two reserved envelope files and the exact signed inventory
+with explicit file/count/directory/aggregate bounds and streaming SHA-256
+checks; it never recursively copies the mutable source namespace. The source is
+fully reverified before and after the bounded copy, and the random sibling
+staging directory is fully reverified as well. Only then is it durably
 published with a native atomic no-replace operation to:
 
 ```text
@@ -155,10 +161,18 @@ the verified directory/file lease alive through exact-image launch and the
 challenge-bound Hello check. Unix production remains fail closed. Before a
 Unix catalog or trust root can become nonempty, the resolver bridge must also
 produce an opaque `UnixPackExecAuthority` containing an already-open executable
-FD and an anchored dependency-root directory FD. The launch path must consume
-those authorities through `execveat`/`fexecve`-equivalent execution and retain
-the dependency-root authority through Hello validation. `PathBuf`,
+FD, an anchored dependency-root directory FD, and the exact same
+`Arc<VerifiedPackLease>` from which both descriptors were opened. The future
+`open_unix_pack_exec_authority_from_verified_pack_lease` constructor must live
+on the provider resolver path, open both descriptors relative to that lease,
+and be the only production constructor; independently opened FDs cannot be
+combined with a lease after the fact. The opaque binding checks lease identity,
+and the launch path must consume those authorities through
+`execveat`/`fexecve`-equivalent execution and retain the dependency-root and
+lease authorities through Hello validation. `PathBuf`,
 `Arc<VerifiedPackLease>`, and `Command::spawn` are not Unix execution authority
 and cannot satisfy the provisioning guard. Unsupported Unix variants must
 remain fail closed until an equivalent descriptor-relative execution primitive
-is implemented and tested.
+is implemented and tested. The architecture guard scopes this prohibition to
+the verified-pack provider launch function; unrelated process launches do not
+satisfy or trip the gate.

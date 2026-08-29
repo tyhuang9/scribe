@@ -43,6 +43,7 @@ mod launch_binding {
     #[cfg(unix)]
     #[derive(Debug)]
     pub(crate) struct UnixPackExecAuthority {
+        verified_pack_lease: Arc<VerifiedPackLease>,
         executable_fd: File,
         dependency_root_fd: File,
     }
@@ -57,9 +58,18 @@ mod launch_binding {
             &self.dependency_root_fd
         }
 
+        pub(crate) fn verified_pack_lease(&self) -> &Arc<VerifiedPackLease> {
+            &self.verified_pack_lease
+        }
+
         #[cfg(test)]
-        fn fixture(executable_fd: File, dependency_root_fd: File) -> Self {
+        fn fixture(
+            verified_pack_lease: Arc<VerifiedPackLease>,
+            executable_fd: File,
+            dependency_root_fd: File,
+        ) -> Self {
             Self {
+                verified_pack_lease,
                 executable_fd,
                 dependency_root_fd,
             }
@@ -85,6 +95,9 @@ mod launch_binding {
             let lease = bridge.resolver_verified_pack_lease();
             #[cfg(unix)]
             let unix_exec_authority = bridge.resolver_unix_launch_authority();
+            #[cfg(unix)]
+            let unix_authority_matches_lease =
+                Arc::ptr_eq(&lease, unix_exec_authority.verified_pack_lease());
             let pack = lease.verified_pack();
             let stable_device_identity = bridge.hello_stable_device_identity();
             let stable_device_is_canonical = !stable_device_identity.is_empty()
@@ -94,6 +107,16 @@ mod launch_binding {
                     .all(|byte| (0x20..=0x7e).contains(&byte))
                 && stable_device_identity == stable_device_identity.to_ascii_lowercase();
             (stable_device_is_canonical
+                && {
+                    #[cfg(unix)]
+                    {
+                        unix_authority_matches_lease
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        true
+                    }
+                }
                 && bridge.hello_pack_id() == pack.pack_id.as_str()
                 && bridge.hello_pack_version() == pack.pack_version.as_str()
                 && bridge.hello_pack_digest() == pack.pack_digest
@@ -231,6 +254,7 @@ mod tests {
                 .open(&self.lease.verified_pack().root)
                 .unwrap();
             Arc::new(super::launch_binding::UnixPackExecAuthority::fixture(
+                Arc::clone(&self.lease),
                 executable,
                 dependency_root,
             ))
