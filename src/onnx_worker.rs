@@ -92,6 +92,7 @@ const MAX_ARCHITECTURE_BYTES: usize = 512;
 const MAX_WORKER_ERROR_BYTES: usize = 16 * 1024;
 const MAX_BACKEND_SELECTION_TARGETS: usize = 128;
 const MAX_BACKEND_IDENTITY_BYTES: usize = 1024;
+const MAX_PACK_DEVICES: usize = 16;
 
 #[derive(Clone, Copy)]
 struct SupervisorDeadlines {
@@ -817,6 +818,12 @@ struct WorkerPackExpectation {
 #[serde(deny_unknown_fields)]
 struct WorkerPackCapability {
     expectation: WorkerPackExpectation,
+    devices: Vec<WorkerPackDeviceCapability>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkerPackDeviceCapability {
     stable_device_identity: String,
     process_index: usize,
     display_name: String,
@@ -1021,8 +1028,7 @@ fn worker_pack_capability(role: WorkerRole) -> Result<Option<WorkerPackCapabilit
                 WorkerProvider::Vulkan => GpuVendor::Other,
                 WorkerProvider::Cpu => GpuVendor::Unknown,
             };
-            Some(WorkerPackCapability {
-                expectation: expectation.clone(),
+            Some(WorkerPackDeviceCapability {
                 stable_device_identity,
                 process_index,
                 display_name,
@@ -1043,11 +1049,30 @@ fn worker_pack_capability(role: WorkerRole) -> Result<Option<WorkerPackCapabilit
         left.stable_device_identity
             .cmp(&right.stable_device_identity)
     });
-    devices
-        .into_iter()
-        .next()
-        .map(Some)
-        .ok_or_else(|| anyhow!("compiled GPU provider reported no addressable stable device"))
+    if devices.is_empty() {
+        bail!("compiled GPU provider reported no addressable stable device");
+    }
+    if devices.len() > MAX_PACK_DEVICES {
+        bail!("compiled GPU provider exceeded the bounded device-list limit");
+    }
+    if devices
+        .windows(2)
+        .any(|pair| pair[0].stable_device_identity == pair[1].stable_device_identity)
+    {
+        bail!("compiled GPU provider reported duplicate stable device identities");
+    }
+    let mut process_indexes = devices
+        .iter()
+        .map(|device| device.process_index)
+        .collect::<Vec<_>>();
+    process_indexes.sort_unstable();
+    if process_indexes.windows(2).any(|pair| pair[0] == pair[1]) {
+        bail!("compiled GPU provider reported duplicate process indexes");
+    }
+    Ok(Some(WorkerPackCapability {
+        expectation,
+        devices,
+    }))
 }
 
 #[cfg(not(feature = "inference-worker"))]
@@ -1643,6 +1668,7 @@ struct PackLaunchContext {
 struct BoundPackHelloBridge<'a> {
     context: &'a PackLaunchContext,
     capability: &'a WorkerPackCapability,
+    device: &'a WorkerPackDeviceCapability,
 }
 
 impl ResolverHelloBindingBridge for BoundPackHelloBridge<'_> {
@@ -1685,70 +1711,101 @@ impl ResolverHelloBindingBridge for BoundPackHelloBridge<'_> {
     }
 
     fn hello_stable_device_identity(&self) -> &str {
-        &self.capability.stable_device_identity
+        &self.device.stable_device_identity
     }
 
     fn hello_process_index(&self) -> Option<usize> {
-        Some(self.capability.process_index)
+        Some(self.device.process_index)
     }
 
     fn hello_display_name(&self) -> &str {
-        &self.capability.display_name
+        &self.device.display_name
     }
 
     fn hello_driver_version(&self) -> Option<&str> {
-        self.capability.driver_version.as_deref()
+        self.device.driver_version.as_deref()
     }
 
     fn hello_device_class(&self) -> DeviceClass {
-        self.capability.device_class
+        self.device.device_class
     }
 
     fn hello_vendor(&self) -> GpuVendor {
-        self.capability.vendor
+        self.device.vendor
     }
 
     fn hello_memory_total_bytes(&self) -> u64 {
-        self.capability.memory_total_bytes
+        self.device.memory_total_bytes
     }
 
     fn hello_memory_available_bytes(&self) -> u64 {
-        self.capability.memory_available_bytes
+        self.device.memory_available_bytes
     }
 }
 
 fn bind_pack_hello(
     context: &PackLaunchContext,
     capability: &WorkerPackCapability,
-) -> Result<VerifiedPackLaunchBinding> {
+) -> Result<Vec<VerifiedPackLaunchBinding>> {
     if capability.expectation != context.expectation {
         bail!("GPU worker Hello pack identity differs from resolver authority");
     }
-    if let Some(expected) = &context.expected_device {
-        let observed_backend = match capability.expectation.backend {
-            WorkerProvider::Cuda => BackendKind::Cuda,
-            WorkerProvider::Vulkan => BackendKind::Vulkan,
-            WorkerProvider::Metal => BackendKind::Metal,
-            WorkerProvider::Cpu => bail!("GPU worker Hello advertised CPU"),
-        };
+    if capability.devices.is_empty() || capability.devices.len() > MAX_PACK_DEVICES {
+        bail!("GPU worker Hello device list is empty or oversized");
+    }
+    let mut prior = None;
+    let mut process_indexes = Vec::with_capacity(capability.devices.len());
+    for device in &capability.devices {
+        if prior
+            .as_ref()
+            .is_some_and(|identity: &String| identity >= &device.stable_device_identity)
+        {
+            bail!("GPU worker Hello device list is not strictly stable-ID sorted");
+        }
+        prior = Some(device.stable_device_identity.clone());
+        process_indexes.push(device.process_index);
+    }
+    process_indexes.sort_unstable();
+    if process_indexes.windows(2).any(|pair| pair[0] == pair[1]) {
+        bail!("GPU worker Hello device list contains duplicate process indexes");
+    }
+    let observed_backend = match capability.expectation.backend {
+        WorkerProvider::Cuda => BackendKind::Cuda,
+        WorkerProvider::Vulkan => BackendKind::Vulkan,
+        WorkerProvider::Metal => BackendKind::Metal,
+        WorkerProvider::Cpu => bail!("GPU worker Hello advertised CPU"),
+    };
+    let devices = if let Some(expected) = &context.expected_device {
+        let device = capability
+            .devices
+            .iter()
+            .find(|device| device.stable_device_identity == expected.device_id.as_str())
+            .ok_or_else(|| anyhow!("GPU worker Hello omitted the parent-selected stable device"))?;
         if observed_backend != expected.backend
-            || capability.stable_device_identity != expected.device_id.as_str()
-            || capability.vendor != expected.vendor
-            || capability.device_class != expected.device_class
-            || capability.memory_total_bytes != expected.memory_total_bytes
-            || (expected.driver_version.is_some()
-                && capability.driver_version != expected.driver_version)
+            || device.vendor != expected.vendor
+            || device.device_class != expected.device_class
+            || device.memory_total_bytes != expected.memory_total_bytes
+            || device.driver_version != expected.driver_version
         {
             bail!("GPU worker Hello device facts differ from the parent-observed target");
         }
         // The enumeration index is deliberately refreshed from this Hello.
         // Stable identity, rather than a persisted index, is the authority.
-    }
-    VerifiedPackLaunchBinding::try_from_resolver_hello_bridge(&BoundPackHelloBridge {
-        context,
-        capability,
-    })
-    .ok_or_else(|| anyhow!("GPU worker resolver/Hello binding was rejected"))
+        std::slice::from_ref(device)
+    } else {
+        capability.devices.as_slice()
+    };
+    devices
+        .iter()
+        .map(|device| {
+            VerifiedPackLaunchBinding::try_from_resolver_hello_bridge(&BoundPackHelloBridge {
+                context,
+                capability,
+                device,
+            })
+            .ok_or_else(|| anyhow!("GPU worker resolver/Hello binding was rejected"))
+        })
+        .collect()
 }
 
 #[derive(Debug)]
@@ -2682,7 +2739,7 @@ struct CurrentGeneration {
     process: Arc<dyn WorkerProcess>,
     expectation: WorkerExpectation,
     pack_launch: Option<PackLaunchContext>,
-    pack_binding: Option<VerifiedPackLaunchBinding>,
+    pack_bindings: Vec<VerifiedPackLaunchBinding>,
 }
 
 #[derive(Clone, Copy)]
@@ -3171,7 +3228,7 @@ impl ProcessWorkerSupervisor {
                 process: Arc::clone(&process),
                 expectation: expectation.clone(),
                 pack_launch,
-                pack_binding: None,
+                pack_bindings: Vec::new(),
             });
             state.active_stream = None;
             state.active_model = None;
@@ -3587,14 +3644,14 @@ impl ProcessWorkerSupervisor {
         match (&current.pack_launch, &capability.pack) {
             (None, None) => Ok(()),
             (Some(context), Some(pack)) => {
-                current.pack_binding = Some(bind_pack_hello(context, pack)?);
+                current.pack_bindings = bind_pack_hello(context, pack)?;
                 Ok(())
             }
             _ => bail!("process worker pack capability did not match launch authority"),
         }
     }
 
-    fn current_pack_binding(&self) -> Result<Option<VerifiedPackLaunchBinding>> {
+    fn current_pack_bindings(&self) -> Result<Vec<VerifiedPackLaunchBinding>> {
         self.ensure_generation()?;
         self.inner
             .state
@@ -3602,7 +3659,7 @@ impl ProcessWorkerSupervisor {
             .map_err(|_| anyhow!("process worker supervisor state lock was poisoned"))?
             .current
             .as_ref()
-            .map(|current| current.pack_binding.clone())
+            .map(|current| current.pack_bindings.clone())
             .ok_or_else(|| anyhow!("process worker generation is unavailable"))
     }
 
@@ -4545,10 +4602,12 @@ impl InferenceWorkerSupervisor {
         }
     }
 
-    fn verified_pack_binding(&self) -> Result<VerifiedPackLaunchBinding> {
-        self.transport
-            .current_pack_binding()?
-            .ok_or_else(|| anyhow!("inference worker did not produce a verified pack binding"))
+    fn verified_pack_bindings(&self) -> Result<Vec<VerifiedPackLaunchBinding>> {
+        let bindings = self.transport.current_pack_bindings()?;
+        if bindings.is_empty() {
+            bail!("inference worker did not produce a verified pack binding");
+        }
+        Ok(bindings)
     }
 
     /// Test-only process launcher for diagnostics that must exercise the real
@@ -4872,10 +4931,11 @@ fn discover_production_pack_launch_bindings() -> crate::gpu_worker_pack::Product
         .take(8)
         .filter_map(|lease| {
             let supervisor = InferenceWorkerSupervisor::for_pack_probe(lease);
-            let binding = supervisor.verified_pack_binding().ok();
+            let bindings = supervisor.verified_pack_bindings().ok();
             let _ = supervisor.shutdown();
-            binding
+            bindings
         })
+        .flatten()
         .collect();
     crate::gpu_worker_pack::ProductionPackRegistry::from_launch_bindings(bindings)
 }
@@ -7518,31 +7578,106 @@ mod tests {
         };
         let capability = WorkerPackCapability {
             expectation,
-            stable_device_identity: "native:pci:0000:01:00.0".to_owned(),
-            process_index: 2,
-            display_name: "Fixture NVIDIA GPU".to_owned(),
-            driver_version: Some("fixture-driver-1".to_owned()),
+            devices: vec![WorkerPackDeviceCapability {
+                stable_device_identity: "native:pci:0000:01:00.0".to_owned(),
+                process_index: 2,
+                display_name: "Fixture NVIDIA GPU".to_owned(),
+                driver_version: Some("fixture-driver-1".to_owned()),
+                device_class: DeviceClass::DiscreteGpu,
+                vendor: GpuVendor::Nvidia,
+                memory_total_bytes: 8 * 1024 * 1024 * 1024,
+                memory_available_bytes: 6 * 1024 * 1024 * 1024,
+            }],
+        };
+        assert_eq!(capability.expectation.backend, WorkerProvider::Vulkan);
+        assert_eq!(
+            capability.devices[0].stable_device_identity,
+            expected.device_id.as_str()
+        );
+        assert_eq!(capability.devices[0].vendor, expected.vendor);
+        assert_eq!(capability.devices[0].device_class, expected.device_class);
+        assert_eq!(
+            capability.devices[0].driver_version,
+            expected.driver_version
+        );
+        assert_eq!(
+            capability.devices[0].memory_total_bytes,
+            expected.memory_total_bytes
+        );
+        let bindings =
+            bind_pack_hello(&context, &capability).expect("stable identity remaps index");
+        assert_eq!(bindings[0].backend_target().process_index, Some(2));
+
+        let mut wrong_device = capability;
+        wrong_device.devices[0].stable_device_identity = "native:pci:0000:02:00.0".to_owned();
+        assert!(bind_pack_hello(&context, &wrong_device).is_err());
+        drop(bindings);
+        drop(context);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn verified_pack_probe_binds_every_sorted_device_and_rejects_bad_lists() {
+        let root = crate::gpu_worker_pack::manifest::test_support::temp_root("pack-device-list");
+        let (_, lease) = crate::gpu_worker_pack::manifest::test_support::leased_fixture(&root);
+        let lease = Arc::new(lease);
+        let expectation = pack_expectation(&lease);
+        let context = PackLaunchContext {
+            lease,
+            expectation: expectation.clone(),
+            expected_device: None,
+        };
+        let device = |identity: &str, index: usize| WorkerPackDeviceCapability {
+            stable_device_identity: identity.to_owned(),
+            process_index: index,
+            display_name: format!("Fixture GPU {index}"),
+            driver_version: None,
             device_class: DeviceClass::DiscreteGpu,
             vendor: GpuVendor::Nvidia,
             memory_total_bytes: 8 * 1024 * 1024 * 1024,
             memory_available_bytes: 6 * 1024 * 1024 * 1024,
         };
-        assert_eq!(capability.expectation.backend, WorkerProvider::Vulkan);
-        assert_eq!(
-            capability.stable_device_identity,
-            expected.device_id.as_str()
-        );
-        assert_eq!(capability.vendor, expected.vendor);
-        assert_eq!(capability.device_class, expected.device_class);
-        assert_eq!(capability.driver_version, expected.driver_version);
-        assert_eq!(capability.memory_total_bytes, expected.memory_total_bytes);
-        let binding = bind_pack_hello(&context, &capability).expect("stable identity remaps index");
-        assert_eq!(binding.backend_target().process_index, Some(2));
+        let first = device("native:pci:0000:01:00.0", 7);
+        let second = device("native:pci:0000:02:00.0", 2);
+        let capability = WorkerPackCapability {
+            expectation: expectation.clone(),
+            devices: vec![first.clone(), second.clone()],
+        };
+        let bindings = bind_pack_hello(&context, &capability).unwrap();
+        assert_eq!(bindings.len(), 2);
+        assert_eq!(bindings[0].backend_target().process_index, Some(7));
+        assert_eq!(bindings[1].backend_target().process_index, Some(2));
 
-        let mut wrong_device = capability;
-        wrong_device.stable_device_identity = "native:pci:0000:02:00.0".to_owned();
-        assert!(bind_pack_hello(&context, &wrong_device).is_err());
-        drop(binding);
+        let reordered = WorkerPackCapability {
+            expectation: expectation.clone(),
+            devices: vec![second.clone(), first.clone()],
+        };
+        assert!(bind_pack_hello(&context, &reordered).is_err());
+        let duplicate = WorkerPackCapability {
+            expectation: expectation.clone(),
+            devices: vec![first.clone(), first.clone()],
+        };
+        assert!(bind_pack_hello(&context, &duplicate).is_err());
+        let mut duplicate_index_second = second.clone();
+        duplicate_index_second.process_index = first.process_index;
+        let duplicate_index = WorkerPackCapability {
+            expectation: expectation.clone(),
+            devices: vec![first.clone(), duplicate_index_second],
+        };
+        assert!(bind_pack_hello(&context, &duplicate_index).is_err());
+        let oversized = WorkerPackCapability {
+            expectation: expectation.clone(),
+            devices: (0..=MAX_PACK_DEVICES)
+                .map(|index| device(&format!("native:pci:0000:{index:02x}:00.0"), index))
+                .collect(),
+        };
+        assert!(bind_pack_hello(&context, &oversized).is_err());
+        let malformed = WorkerPackCapability {
+            expectation,
+            devices: vec![device("NATIVE:PCI:0000:01:00.0", 0)],
+        };
+        assert!(bind_pack_hello(&context, &malformed).is_err());
+        drop(bindings);
         drop(context);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -8182,6 +8317,51 @@ mod tests {
     }
 
     #[test]
+    fn explicit_gpu_fallback_advances_to_the_next_device_without_cpu() {
+        let cpu = Arc::new(TestLauncher::new([]));
+        let first = Arc::new(TestLauncher::new([TestMode::CapabilityMismatch(
+            CapabilityMismatch::Challenge,
+        )]));
+        let second = Arc::new(TestLauncher::new([TestMode::Normal]));
+        let route = |launcher: Arc<TestLauncher>, identity: &str| InferenceWorkerRoute {
+            provider: WorkerProvider::Vulkan,
+            supervisor: InferenceWorkerSupervisor {
+                transport: ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+                    launcher,
+                    short_deadlines(),
+                ),
+                next_correlation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            },
+            target: Some(backend_target(BackendKind::Vulkan, identity, Some(0))),
+        };
+        let registry = InferenceWorkerRegistry {
+            routes: Arc::new(vec![InferenceWorkerRoute {
+                provider: WorkerProvider::Cpu,
+                supervisor: InferenceWorkerSupervisor {
+                    transport: ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+                        cpu.clone(),
+                        short_deadlines(),
+                    ),
+                    next_correlation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                },
+                target: Some(BackendTarget::cpu()),
+            }]),
+            gpu_routes: Arc::new(Mutex::new(Some(Arc::new(vec![
+                route(first.clone(), "native:pci:0000:01:00.0"),
+                route(second.clone(), "native:pci:0000:02:00.0"),
+            ])))),
+        };
+        assert!(
+            registry
+                .load(missing_gguf_artifact(), AccelerationPreference::Gpu)
+                .is_err()
+        );
+        assert_eq!(first.launches.load(Ordering::Acquire), 1);
+        assert_eq!(second.launches.load(Ordering::Acquire), 1);
+        assert_eq!(cpu.launches.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
     fn stale_batch_cancellation_is_rejected_before_worker_launch() {
         let root = test_root("stale-batch-cancellation");
         let launcher = Arc::new(TestLauncher::new([]));
@@ -8266,7 +8446,7 @@ mod tests {
             process: process_trait,
             expectation: expected_worker(WorkerRole::Inference),
             pack_launch: None,
-            pack_binding: None,
+            pack_bindings: Vec::new(),
         });
         state.active_request = Some(correlation);
         drop(state);
