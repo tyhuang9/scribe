@@ -10,10 +10,14 @@ pub(crate) mod store;
 
 use std::fs::{File, OpenOptions};
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(all(windows, target_arch = "x86_64"))]
+use std::sync::{Mutex, OnceLock};
 
 use serde::Deserialize;
+#[cfg(all(windows, target_arch = "x86_64"))]
+use sha2::{Digest, Sha256};
 
 // Stage 4 consumes the bridge re-export; Stage 3's production registry is
 // deliberately empty, so the non-test binary has no implementation yet.
@@ -380,6 +384,7 @@ impl PackDiscoveryDiagnostic {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct PackLeaseDiscovery {
     pub(crate) leases: Vec<Arc<manifest::VerifiedPackLease>>,
     pub(crate) diagnostics: Vec<PackDiscoveryDiagnostic>,
@@ -469,8 +474,8 @@ fn discover_pack_leases_from_current_install() -> PackLeaseDiscovery {
 #[cfg(all(windows, target_arch = "x86_64"))]
 fn discover_pack_leases_from_install_root(install_root: &Path) -> PackLeaseDiscovery {
     let catalog_path = install_root.join(PACK_CATALOG_NAME);
-    let bytes = match read_bounded_catalog(&catalog_path) {
-        Ok(bytes) => bytes,
+    let catalog = match read_bounded_catalog(&catalog_path, install_root) {
+        Ok(catalog) => catalog,
         Err(CatalogReadFailure::Unavailable) => {
             return PackLeaseDiscovery {
                 leases: Vec::new(),
@@ -488,7 +493,24 @@ fn discover_pack_leases_from_install_root(install_root: &Path) -> PackLeaseDisco
             };
         }
     };
-    let Ok(catalog) = serde_json::from_slice::<PackCatalog>(&bytes) else {
+    let cache =
+        PRODUCTION_DISCOVERY_CACHE.get_or_init(|| Mutex::new(CatalogDiscoveryCache::default()));
+    if let Ok(cache) = cache.lock()
+        && let Some(discovery) = cache.lookup(&catalog.fingerprint)
+    {
+        return discovery;
+    }
+    let fingerprint = catalog.fingerprint;
+    let discovery = verify_catalog_entries(install_root, &catalog.bytes);
+    if let Ok(mut cache) = cache.lock() {
+        cache.replace(fingerprint, discovery.clone());
+    }
+    discovery
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn verify_catalog_entries(install_root: &Path, bytes: &[u8]) -> PackLeaseDiscovery {
+    let Ok(catalog) = serde_json::from_slice::<PackCatalog>(bytes) else {
         return PackLeaseDiscovery {
             leases: Vec::new(),
             diagnostics: vec![PackDiscoveryDiagnostic::catalog(
@@ -605,13 +627,55 @@ fn discover_pack_leases_from_install_root(install_root: &Path) -> PackLeaseDisco
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CatalogFingerprint {
+    install_root: PathBuf,
+    volume_serial_number: u32,
+    file_index: u64,
+    content_sha256: [u8; 32],
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+struct CatalogSnapshot {
+    bytes: Vec<u8>,
+    fingerprint: CatalogFingerprint,
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+#[derive(Default)]
+struct CatalogDiscoveryCache {
+    entry: Option<(CatalogFingerprint, PackLeaseDiscovery)>,
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+impl CatalogDiscoveryCache {
+    fn lookup(&self, fingerprint: &CatalogFingerprint) -> Option<PackLeaseDiscovery> {
+        self.entry
+            .as_ref()
+            .filter(|(cached, _)| cached == fingerprint)
+            .map(|(_, discovery)| discovery.clone())
+    }
+
+    fn replace(&mut self, fingerprint: CatalogFingerprint, discovery: PackLeaseDiscovery) {
+        self.entry = Some((fingerprint, discovery));
+    }
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+static PRODUCTION_DISCOVERY_CACHE: OnceLock<Mutex<CatalogDiscoveryCache>> = OnceLock::new();
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+#[derive(Debug)]
 enum CatalogReadFailure {
     Unavailable,
     Rejected,
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]
-fn read_bounded_catalog(path: &Path) -> Result<Vec<u8>, CatalogReadFailure> {
+fn read_bounded_catalog(
+    path: &Path,
+    install_root: &Path,
+) -> Result<CatalogSnapshot, CatalogReadFailure> {
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
@@ -655,7 +719,17 @@ fn read_bounded_catalog(path: &Path) -> Result<Vec<u8>, CatalogReadFailure> {
     if bytes.len() as u64 > MAX_PACK_CATALOG_BYTES {
         return Err(CatalogReadFailure::Rejected);
     }
-    Ok(bytes)
+    let content_sha256: [u8; 32] = Sha256::digest(&bytes).into();
+    Ok(CatalogSnapshot {
+        bytes,
+        fingerprint: CatalogFingerprint {
+            install_root: install_root.to_path_buf(),
+            volume_serial_number: information.dwVolumeSerialNumber,
+            file_index: (u64::from(information.nFileIndexHigh) << 32)
+                | u64::from(information.nFileIndexLow),
+            content_sha256,
+        },
+    })
 }
 
 /// Private packaging entrypoint. Stage 3's empty production trust root means a
@@ -883,14 +957,62 @@ mod tests {
         let root = super::manifest::test_support::temp_root("pack-catalog-reader");
         let catalog = root.join(super::PACK_CATALOG_NAME);
         std::fs::write(&catalog, br#"{"schema_version":1,"packs":[]}"#).unwrap();
-        assert!(super::read_bounded_catalog(&catalog).is_ok());
+        assert!(super::read_bounded_catalog(&catalog, &root).is_ok());
 
         let alias = root.join("catalog-alias.json");
         std::fs::hard_link(&catalog, &alias).unwrap();
         assert!(matches!(
-            super::read_bounded_catalog(&catalog),
+            super::read_bounded_catalog(&catalog, &root),
             Err(super::CatalogReadFailure::Rejected)
         ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn catalog_discovery_cache_is_single_entry_and_fingerprint_bound() {
+        let root = super::manifest::test_support::temp_root("pack-catalog-cache");
+        let catalog = root.join(super::PACK_CATALOG_NAME);
+        std::fs::write(&catalog, br#"{"schema_version":1,"packs":[]}"#).unwrap();
+        let first = super::read_bounded_catalog(&catalog, &root)
+            .unwrap()
+            .fingerprint;
+        let discovery = super::PackLeaseDiscovery {
+            leases: Vec::new(),
+            diagnostics: vec![PackDiscoveryDiagnostic::catalog(
+                PackDiscoveryIssue::CatalogUnavailable,
+            )],
+        };
+        let mut cache = super::CatalogDiscoveryCache::default();
+        cache.replace(first.clone(), discovery);
+        assert_eq!(
+            cache.lookup(&first).unwrap().diagnostics[0].issue,
+            PackDiscoveryIssue::CatalogUnavailable
+        );
+
+        std::fs::write(
+            &catalog,
+            br#"{"schema_version":1,"packs":[],"invalid":true}"#,
+        )
+        .unwrap();
+        let changed = super::read_bounded_catalog(&catalog, &root)
+            .unwrap()
+            .fingerprint;
+        assert_ne!(first, changed);
+        assert!(cache.lookup(&changed).is_none());
+        cache.replace(
+            changed,
+            super::PackLeaseDiscovery {
+                leases: Vec::new(),
+                diagnostics: vec![PackDiscoveryDiagnostic::catalog(
+                    PackDiscoveryIssue::CatalogRejected,
+                )],
+            },
+        );
+        assert!(
+            cache.lookup(&first).is_none(),
+            "the cache remains bounded to one catalog"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 }
