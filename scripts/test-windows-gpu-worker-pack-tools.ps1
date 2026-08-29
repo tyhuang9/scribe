@@ -102,6 +102,23 @@ catch {
 Assert-True $productionArgumentsFailedClosed 'Production pack build did not fail before compilation when signing authority was absent.'
 Assert-True (-not (Test-Path -LiteralPath $toolchainOutput)) 'Failed production signing gate created a pack output.'
 
+$longTargetRejected = $false
+try {
+    & $buildScript `
+        -Backend Vulkan `
+        -PackVersion '0.1.0-fixture' `
+        -OutputDirectory $toolchainOutput `
+        -SigningMode Fixture `
+        -CargoTargetDirectory (Join-Path $repositoryRoot 'target-native-build-not-short') | Out-Null
+}
+catch {
+    $longTargetRejected = $_.Exception.Message.Contains(
+        'one direct child of the short LocalApplicationData build root'
+    )
+}
+Assert-True $longTargetRejected 'Native GPU pack build accepted a repository-local Cargo target.'
+Assert-True (-not (Test-Path -LiteralPath $toolchainOutput)) 'Rejected native build target created a pack output.'
+
 $previousCudaPath = $env:CUDA_PATH
 try {
     $env:CUDA_PATH = Join-Path ([System.IO.Path]::GetTempPath()) 'scribe-absent-cuda-v12.8'

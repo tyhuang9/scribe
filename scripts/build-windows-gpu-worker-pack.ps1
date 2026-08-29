@@ -82,6 +82,48 @@ function Assert-NoReparseAncestors([string]$Path) {
     }
 }
 
+function Resolve-ShortCargoTargetDirectory(
+    [string]$RequestedPath,
+    [string]$BackendName,
+    [string]$PackVersion
+) {
+    $localAppData = [System.Environment]::GetFolderPath(
+        [System.Environment+SpecialFolder]::LocalApplicationData
+    )
+    if ([string]::IsNullOrWhiteSpace($localAppData)) {
+        throw 'Windows LocalApplicationData is unavailable for the bounded native build cache.'
+    }
+    $cacheRoot = Get-NormalizedFullPath (Join-Path $localAppData 'sgp')
+    Assert-NoReparseAncestors $cacheRoot
+    $candidate = if ([string]::IsNullOrWhiteSpace($RequestedPath)) {
+        Join-Path $cacheRoot "$BackendName-$PackVersion"
+    } else {
+        Get-NormalizedFullPath $RequestedPath
+    }
+    $target = Get-NormalizedFullPath $candidate
+    $expectedPrefix = "$cacheRoot\"
+    if (-not $target.StartsWith($expectedPrefix, [System.StringComparison]::OrdinalIgnoreCase) -or
+        -not [string]::Equals(
+            (Split-Path -Parent $target),
+            $cacheRoot,
+            [System.StringComparison]::OrdinalIgnoreCase
+        )) {
+        throw "GPU worker Cargo target must be one direct child of the short LocalApplicationData build root: $cacheRoot"
+    }
+    if ((Split-Path -Leaf $target) -cnotmatch '^[a-z0-9](?:[a-z0-9._-]{0,46}[a-z0-9])?$' -or
+        $target.Length -gt 96) {
+        throw 'GPU worker Cargo target leaf must be a bounded canonical build identifier.'
+    }
+    Assert-NoReparseAncestors $target
+    if (Test-Path -LiteralPath $target) {
+        throw "GPU worker Cargo target must be fresh to prevent feature/output reuse: $target"
+    }
+    return [pscustomobject]@{
+        LocalAppData = Get-NormalizedFullPath $localAppData
+        Target = $target
+    }
+}
+
 function Invoke-NativeProcess(
     [string]$Executable,
     [string[]]$Arguments,
@@ -406,14 +448,8 @@ Assert-NoReparseAncestors $outputRoot
 if (Test-Path -LiteralPath $outputRoot) {
     throw "GPU worker-pack output already exists: $outputRoot"
 }
-if (-not $CargoTargetDirectory) {
-    $CargoTargetDirectory = Join-Path $repositoryRoot "target-gpu-pack-build-$backendName"
-}
-$cargoTarget = Get-NormalizedFullPath $CargoTargetDirectory
-Assert-NoReparseAncestors $cargoTarget
-if (Test-Path -LiteralPath $cargoTarget) {
-    throw "GPU worker Cargo target must be fresh to prevent feature/output reuse: $cargoTarget"
-}
+$shortBuild = Resolve-ShortCargoTargetDirectory $CargoTargetDirectory $backendName $PackVersion
+$cargoTarget = $shortBuild.Target
 
 $git = Get-CommandPath 'git.exe' 'Git is required to bind worker packs to an exact source revision.'
 $revision = (Invoke-NativeProcess $git @('-C', $repositoryRoot, 'rev-parse', '--verify', 'HEAD') 'Could not resolve source revision.').Stdout.Trim()
@@ -450,11 +486,16 @@ $previousCmakeArguments = $env:TRANSCRIBE_CMAKE_ARGS
 $previousSherpaArchiveRoot = $env:SHERPA_ONNX_ARCHIVE_DIR
 $previousSourceDateEpoch = $env:SOURCE_DATE_EPOCH
 $previousMsvcFlags = $env:_CL_
+$previousLocalAppData = $env:LOCALAPPDATA
 $stagingRoot = "$outputRoot.staging-$([guid]::NewGuid().ToString('N'))"
 $stagingCreated = $false
 
 try {
     $env:CARGO_TARGET_DIR = $cargoTarget
+    # transcribe-cpp-sys creates its bounded native-build junction beneath this
+    # authoritative shell-folder path. Keeping both the junction and its target
+    # short avoids CMake/MSBuild path failures in deep repository worktrees.
+    $env:LOCALAPPDATA = $shortBuild.LocalAppData
     $env:SCRIBE_BUILD_REVISION = $revision
     $env:SCRIBE_BUNDLED_WORKER_SHA256 = $null
     $env:SCRIBE_BUILDING_WORKER = '1'
@@ -565,6 +606,7 @@ finally {
     $env:SHERPA_ONNX_ARCHIVE_DIR = $previousSherpaArchiveRoot
     $env:SOURCE_DATE_EPOCH = $previousSourceDateEpoch
     $env:_CL_ = $previousMsvcFlags
+    $env:LOCALAPPDATA = $previousLocalAppData
     if ($stagingCreated -and (Test-Path -LiteralPath $stagingRoot)) {
         $expectedParent = Get-NormalizedFullPath (Split-Path -Parent $outputRoot)
         $observedParent = Get-NormalizedFullPath (Split-Path -Parent $stagingRoot)

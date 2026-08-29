@@ -223,9 +223,13 @@ production pack from the pinned contract in
 orchestrator used by the opt-in release job. It requires exact Rust 1.96.0,
 CMake 4.4.2, MSVC 14.44.35207, the reviewed Sherpa archive, Vulkan SDK
 1.4.357.0, and CUDA Toolkit/nvcc 12.8.93. Missing tools fail with a specific
-gate; the scripts never download an unapproved SDK. Developer outputs are
-ignored and every pack build requires clean tracked source and a fresh Cargo
-target.
+gate; the scripts never download an unapproved SDK. Pack payload outputs use
+the ignored `artifacts/gpu-worker-packs` tree. Native Cargo targets must be
+fresh direct children of the validated short `LocalApplicationData\sgp` build
+root. The script temporarily binds `LOCALAPPDATA` to the authoritative Windows
+shell folder so `transcribe-cpp-sys` creates its MAX_PATH junction there rather
+than under an ambient override. This keeps CMake/MSBuild paths bounded in deep
+worktrees and prevents CUDA and Vulkan feature outputs from being confused.
 
 `scripts/test-windows-gpu-worker-pack-tools.ps1` exercises deterministic
 fixture authoring plus signature, key, tamper, unexpected-file/DLL, ADS,
