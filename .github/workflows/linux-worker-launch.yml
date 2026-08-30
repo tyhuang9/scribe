@@ -1,0 +1,42 @@
+name: Test Linux worker launcher
+
+on:
+  push:
+    paths:
+      - '.github/workflows/linux-worker-launch.yml'
+      - 'runtime-manifests/linux-worker-install-contract-x86_64.json'
+      - 'scripts/linux-worker-launch-fixture.rs'
+      - 'scripts/test-linux-worker-launch.sh'
+      - 'src/linux_worker_architecture_guard.rs'
+      - 'src/linux_worker_launch.rs'
+      - 'src/onnx_worker.rs'
+      - 'src/gpu_worker_pack/mod.rs'
+      - 'src/main.rs'
+      - 'src/bin/scribe-inference-worker.rs'
+  pull_request:
+    paths:
+      - '.github/workflows/linux-worker-launch.yml'
+      - 'runtime-manifests/linux-worker-install-contract-x86_64.json'
+      - 'scripts/linux-worker-launch-fixture.rs'
+      - 'scripts/test-linux-worker-launch.sh'
+      - 'src/linux_worker_architecture_guard.rs'
+      - 'src/linux_worker_launch.rs'
+      - 'src/onnx_worker.rs'
+      - 'src/gpu_worker_pack/mod.rs'
+      - 'src/main.rs'
+      - 'src/bin/scribe-inference-worker.rs'
+
+permissions:
+  contents: read
+
+jobs:
+  launcher:
+    strategy:
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.96.0
+      - name: Test descriptor-bound Linux worker launch
+        run: ./scripts/test-linux-worker-launch.sh

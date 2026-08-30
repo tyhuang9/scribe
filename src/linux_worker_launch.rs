@@ -445,8 +445,30 @@ pub(crate) fn launch_verified_worker(
     worker_flag: &str,
     bindings: &[(String, String)],
 ) -> io::Result<LinuxSpawnedWorker> {
+    launch_verified_worker_inner(
+        authority,
+        worker_flag,
+        bindings,
+        EXEC_HANDSHAKE_TIMEOUT_MS,
+        0,
+    )
+}
+
+fn launch_verified_worker_inner(
+    authority: Arc<dyn LinuxExecAuthority>,
+    worker_flag: &str,
+    bindings: &[(String, String)],
+    timeout_ms: c_int,
+    child_test_action: u32,
+) -> io::Result<LinuxSpawnedWorker> {
     authority.recheck()?;
-    let prepared = PreparedLaunch::new(&*authority, worker_flag, bindings)?;
+    let prepared = PreparedLaunch::new(
+        &*authority,
+        worker_flag,
+        bindings,
+        timeout_ms,
+        child_test_action,
+    )?;
     authority.recheck()?;
     prepared.fork_exec(authority)
 }
@@ -466,6 +488,8 @@ struct PreparedLaunch {
     argv: Vec<*const c_char>,
     environment_storage: Vec<CString>,
     environment: Vec<*const c_char>,
+    timeout_ms: c_int,
+    child_test_action: u32,
 }
 
 impl PreparedLaunch {
@@ -473,7 +497,12 @@ impl PreparedLaunch {
         authority: &dyn LinuxExecAuthority,
         worker_flag: &str,
         bindings: &[(String, String)],
+        timeout_ms: c_int,
+        child_test_action: u32,
     ) -> io::Result<Self> {
+        if timeout_ms <= 0 {
+            return Err(invalid("Linux worker exec timeout must be positive"));
+        }
         let (child_stdin, parent_stdin) = pipe_cloexec()?;
         let (parent_stdout, child_stdout) = pipe_cloexec()?;
         let (child_liveness, parent_liveness) = pipe_cloexec()?;
@@ -523,6 +552,8 @@ impl PreparedLaunch {
             argv,
             environment_storage,
             environment,
+            timeout_ms,
+            child_test_action,
         })
     }
 
@@ -546,7 +577,7 @@ impl PreparedLaunch {
         drop(self.executable);
         drop(self.root);
 
-        if let Err(error) = wait_for_exec(self.error_read.raw()) {
+        if let Err(error) = wait_for_exec(self.error_read.raw(), self.timeout_ms) {
             cleanup_failed_child(pid);
             return Err(error);
         }
@@ -577,6 +608,13 @@ impl PreparedLaunch {
             child_dup(self.error_write.raw(), ERROR_FD, true, 4);
             child_dup(self.child_stdin.raw(), 0, false, 5);
             child_dup(self.child_stdout.raw(), 1, false, 6);
+            if self.child_test_action == 1 {
+                child_fail(90);
+            }
+            if self.child_test_action == 2 {
+                let _ = poll(std::ptr::null_mut(), 0, -1);
+                child_fail(91);
+            }
             if setpgid(0, 0) == -1 {
                 child_fail(7);
             }
@@ -648,7 +686,7 @@ unsafe fn child_fail(stage: u32) -> ! {
     }
 }
 
-fn wait_for_exec(error_fd: RawFd) -> io::Result<()> {
+fn wait_for_exec(error_fd: RawFd, timeout_ms: c_int) -> io::Result<()> {
     let mut record = [0_u8; ERROR_RECORD_LEN];
     let mut offset = 0;
     loop {
@@ -658,7 +696,7 @@ fn wait_for_exec(error_fd: RawFd) -> io::Result<()> {
             revents: 0,
         };
         // SAFETY: descriptor points to one writable pollfd.
-        let result = unsafe { poll(&mut descriptor, 1, EXEC_HANDSHAKE_TIMEOUT_MS) };
+        let result = unsafe { poll(&mut descriptor, 1, timeout_ms) };
         if result == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -936,9 +974,11 @@ fn invalid(message: impl Into<String>) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{BufRead, BufReader};
     use std::os::unix::fs::{PermissionsExt, symlink};
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
 
     static NEXT_ROOT: AtomicU64 = AtomicU64::new(1);
 
@@ -951,6 +991,17 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
+            Self::from_executable(std::env::current_exe().unwrap())
+        }
+
+        fn launcher() -> Self {
+            Self::from_executable(
+                std::env::var_os("SCRIBE_LINUX_WORKER_FIXTURE")
+                    .expect("test script must set SCRIBE_LINUX_WORKER_FIXTURE"),
+            )
+        }
+
+        fn from_executable(executable: impl AsRef<Path>) -> Self {
             let base = std::env::temp_dir().join(format!(
                 "scribe-linux-authority-{}-{}",
                 std::process::id(),
@@ -961,7 +1012,7 @@ mod tests {
             std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
             std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
             let worker = root.join(WORKER_NAME);
-            std::fs::copy(std::env::current_exe().unwrap(), &worker).unwrap();
+            std::fs::copy(executable, &worker).unwrap();
             std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o555)).unwrap();
             let digest = digest(&worker);
             Self {
@@ -1084,6 +1135,238 @@ mod tests {
                 &fixture.digest
             )
             .is_err()
+        );
+    }
+
+    fn launch_fixture(fixture: &Fixture, mode: &str) -> io::Result<LinuxSpawnedWorker> {
+        let authority: Arc<dyn LinuxExecAuthority> = fixture.open()?;
+        launch_verified_worker(
+            authority,
+            "--scribe-inference-worker",
+            &[("SCRIBE_PRIVATE_TEST_MODE".to_owned(), mode.to_owned())],
+        )
+    }
+
+    #[test]
+    fn execveat_success_sanitizes_environment_and_bounds_inherited_fds() {
+        // SAFETY: the standalone script runs these tests on one thread.
+        unsafe {
+            std::env::set_var("LD_PRELOAD", "/tmp/hostile.so");
+            std::env::set_var("SCRIBE_PRIVATE_HOSTILE", "not-inherited");
+        }
+        let fixture = Fixture::launcher();
+        let mut spawned = launch_fixture(&fixture, "inspect").unwrap();
+        spawned.stdin.write_all(b"hello").unwrap();
+        drop(spawned.stdin);
+        let mut output = String::new();
+        spawned.stdout.read_to_string(&mut output).unwrap();
+        spawned.process.wait().unwrap();
+        assert!(output.contains("ARGS=--scribe-inference-worker"));
+        assert!(
+            output
+                .contains("ENV=LANG,PATH,SCRIBE_PRIVATE_PARENT_LIVENESS,SCRIBE_PRIVATE_TEST_MODE")
+        );
+        assert!(!output.contains("LD_PRELOAD"));
+        assert!(!output.contains("SCRIBE_PRIVATE_HOSTILE"));
+        assert!(output.contains(&format!("CWD={}", fixture.root.display())));
+        assert!(output.contains("INPUT=hello"));
+        let fds = output
+            .lines()
+            .find_map(|line| line.strip_prefix("FDS="))
+            .unwrap()
+            .split(',')
+            .map(|value| value.parse::<i32>().unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            fds.iter().all(|fd| *fd <= 5),
+            "unexpected inherited FDs: {fds:?}"
+        );
+        assert!(fds.contains(&LIVENESS_FD));
+    }
+
+    struct RawAuthority {
+        executable: File,
+        root: File,
+        replacement: Option<File>,
+        rechecks: AtomicUsize,
+    }
+
+    impl LinuxExecAuthority for RawAuthority {
+        fn executable_fd(&self) -> RawFd {
+            self.executable.as_raw_fd()
+        }
+
+        fn dependency_root_fd(&self) -> RawFd {
+            self.root.as_raw_fd()
+        }
+
+        fn recheck(&self) -> io::Result<()> {
+            if self.rechecks.fetch_add(1, Ordering::SeqCst) == 1 {
+                if let Some(replacement) = &self.replacement {
+                    // SAFETY: dup3 atomically replaces only the authority's
+                    // externally visible descriptor after preparation.
+                    if unsafe {
+                        dup3(
+                            replacement.as_raw_fd(),
+                            self.executable.as_raw_fd(),
+                            O_CLOEXEC as c_int,
+                        )
+                    } == -1
+                    {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn external_authority_fd_swap_cannot_redirect_prepared_exec_descriptor() {
+        let fixture = Fixture::launcher();
+        let authority: Arc<dyn LinuxExecAuthority> = Arc::new(RawAuthority {
+            executable: File::open(&fixture.worker).unwrap(),
+            root: File::open(&fixture.root).unwrap(),
+            replacement: Some(File::open("/bin/false").unwrap()),
+            rechecks: AtomicUsize::new(0),
+        });
+        let mut spawned = launch_verified_worker(
+            authority,
+            "--scribe-inference-worker",
+            &[("SCRIBE_PRIVATE_TEST_MODE".to_owned(), "inspect".to_owned())],
+        )
+        .unwrap();
+        drop(spawned.stdin);
+        let mut output = String::new();
+        spawned.stdout.read_to_string(&mut output).unwrap();
+        spawned.process.wait().unwrap();
+        assert!(output.contains("ARGS=--scribe-inference-worker"));
+    }
+
+    #[test]
+    fn child_setup_exec_errors_and_hangs_are_bounded_and_reaped() {
+        let fixture = Fixture::launcher();
+        let authority: Arc<dyn LinuxExecAuthority> = fixture.open().unwrap();
+        let forced = launch_verified_worker_inner(
+            Arc::clone(&authority),
+            "--scribe-inference-worker",
+            &[],
+            500,
+            1,
+        )
+        .err()
+        .expect("forced child failure");
+        assert!(forced.to_string().contains("stage 90 (errno"));
+
+        let started = Instant::now();
+        let timeout =
+            launch_verified_worker_inner(authority, "--scribe-inference-worker", &[], 150, 2)
+                .err()
+                .expect("forced child hang");
+        assert_eq!(timeout.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(2));
+
+        let directory_authority: Arc<dyn LinuxExecAuthority> = Arc::new(RawAuthority {
+            executable: File::open(&fixture.root).unwrap(),
+            root: File::open(&fixture.root).unwrap(),
+            replacement: None,
+            rechecks: AtomicUsize::new(0),
+        });
+        let exec_error = launch_verified_worker_inner(
+            directory_authority,
+            "--scribe-inference-worker",
+            &[],
+            500,
+            0,
+        )
+        .err()
+        .expect("directory exec must fail");
+        assert!(exec_error.to_string().contains("stage 13 (errno"));
+
+        let mut status = 0;
+        assert_eq!(unsafe { waitpid(-1, &mut status, WNOHANG) }, -1);
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(ECHILD));
+    }
+
+    #[test]
+    fn cooperative_cancel_and_hung_process_termination_reap_workers() {
+        let fixture = Fixture::launcher();
+        let spawned = launch_fixture(&fixture, "cooperative").unwrap();
+        assert!(spawned.process.request_cooperative_cancel().unwrap());
+        spawned.process.wait().unwrap();
+        assert!(!spawned.process.is_running().unwrap());
+
+        let spawned = launch_fixture(&fixture, "hang").unwrap();
+        assert!(spawned.process.is_running().unwrap());
+        spawned.process.terminate().unwrap();
+        spawned.process.wait().unwrap();
+        assert!(!spawned.process.is_running().unwrap());
+    }
+
+    #[test]
+    fn termination_targets_entire_worker_process_group() {
+        let fixture = Fixture::launcher();
+        let spawned = launch_fixture(&fixture, "process-group").unwrap();
+        let mut reader = BufReader::new(spawned.stdout.try_clone().unwrap());
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let pids = line
+            .trim()
+            .strip_prefix("PIDS=")
+            .unwrap()
+            .split(',')
+            .map(|value| value.parse::<i32>().unwrap())
+            .collect::<Vec<_>>();
+        spawned.process.terminate().unwrap();
+        spawned.process.wait().unwrap();
+        for pid in pids {
+            assert!(
+                wait_until_not_running(pid),
+                "pid {pid} survived process-group termination"
+            );
+        }
+    }
+
+    fn wait_until_not_running(pid: c_int) -> bool {
+        for _ in 0..100 {
+            match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return true,
+                Ok(value) if value.split_whitespace().nth(2) == Some("Z") => return true,
+                _ => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn parent_death_signal_kills_worker_after_launcher_parent_exits() {
+        let fixture = Fixture::launcher();
+        let (read_end, write_end) = pipe_cloexec().unwrap();
+        let launcher_pid = unsafe { fork() };
+        assert!(launcher_pid >= 0);
+        if launcher_pid == 0 {
+            drop(read_end);
+            let spawned = launch_fixture(&fixture, "hang").unwrap();
+            let worker_pid = lock(&spawned.process.state).unwrap().pid;
+            let bytes = worker_pid.to_le_bytes();
+            unsafe {
+                write(write_end.raw(), bytes.as_ptr().cast(), bytes.len());
+                _exit(0);
+            }
+        }
+        drop(write_end);
+        let mut bytes = [0_u8; 4];
+        let count = unsafe { read(read_end.raw(), bytes.as_mut_ptr().cast(), bytes.len()) };
+        assert_eq!(count, 4);
+        let worker_pid = i32::from_le_bytes(bytes);
+        let mut status = 0;
+        assert_eq!(
+            unsafe { waitpid(launcher_pid, &mut status, 0) },
+            launcher_pid
+        );
+        assert!(
+            wait_until_not_running(worker_pid),
+            "worker {worker_pid} survived its launcher's death"
         );
     }
 }
