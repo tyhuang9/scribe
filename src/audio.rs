@@ -188,6 +188,7 @@ pub enum CaptureStopReason {
 pub struct CaptureCancellation {
     stop_requested: Arc<AtomicBool>,
     startup_state: Arc<AtomicU8>,
+    startup_abort_requested: Arc<AtomicBool>,
 }
 
 impl CaptureCancellation {
@@ -196,7 +197,9 @@ impl CaptureCancellation {
     }
 
     pub fn cancel(&self) {
-        self.cancel_startup();
+        if self.cancel_startup() {
+            self.startup_abort_requested.store(true, Ordering::Release);
+        }
         self.stop_requested.store(true, Ordering::Release);
     }
 
@@ -420,10 +423,206 @@ trait SpeechDetectorFactory: Send + Sync {
     ) -> Result<Box<dyn SpeechDetector>, CaptureError>;
 }
 
-struct WorkerSpeechDetectorFactory;
+struct WorkerSpeechDetectorFactory {
+    warm_service: Arc<VadPrewarmService>,
+}
+
+struct WarmVadSession {
+    supervisor: SileroVadWorkerSupervisor,
+    next_request_id: u64,
+}
+
+type VadPrewarmTask =
+    Box<dyn FnOnce(&AtomicBool) -> Result<Option<WarmVadSession>, CaptureError> + Send + 'static>;
+
+pub(crate) struct VadPrewarmService {
+    // Privacy/resource tradeoff: warmup keeps the VAD worker process and model
+    // memory resident, but ends the temporary session. The worker then blocks
+    // on its command pipe with no audio, inference, timer, or CPAL resources.
+    warm: Mutex<Option<WarmVadSession>>,
+    shutdown: Arc<AtomicBool>,
+    prewarm_worker: Mutex<Option<thread::JoinHandle<()>>>,
+    prewarm_task: Mutex<Option<VadPrewarmTask>>,
+    prewarm_error: Mutex<Option<CaptureError>>,
+}
+
+impl VadPrewarmService {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            warm: Mutex::new(None),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            prewarm_worker: Mutex::new(None),
+            prewarm_task: Mutex::new(Some(Box::new(|cancelled| {
+                prepare_warm_vad(cancelled).map(Some)
+            }))),
+            prewarm_error: Mutex::new(None),
+        })
+    }
+
+    #[cfg(test)]
+    fn with_prewarm_task(task: VadPrewarmTask) -> Arc<Self> {
+        Arc::new(Self {
+            warm: Mutex::new(None),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            prewarm_worker: Mutex::new(None),
+            prewarm_task: Mutex::new(Some(task)),
+            prewarm_error: Mutex::new(None),
+        })
+    }
+
+    pub(crate) fn prewarm(self: &Arc<Self>) -> Result<(), CaptureError> {
+        let task = self
+            .prewarm_task
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+            .ok_or_else(|| CaptureError::WorkerSpawn("VAD prewarm already started".to_owned()))?;
+        let service = Arc::clone(self);
+        let worker = thread::Builder::new()
+            .name("scribe-vad-prewarm".to_owned())
+            .spawn(move || match task(service.shutdown.as_ref()) {
+                Ok(Some(warm)) if !service.shutdown.load(Ordering::Acquire) => {
+                    let mut slot = service
+                        .warm
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    *slot = Some(warm);
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    *service
+                        .prewarm_error
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(error);
+                }
+            })
+            .map_err(|error| CaptureError::WorkerSpawn(error.to_string()))?;
+        *self
+            .prewarm_worker
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(worker);
+        Ok(())
+    }
+
+    fn acquire(
+        self: &Arc<Self>,
+        threshold: VadThreshold,
+        startup_cancelled: &AtomicBool,
+        discard_requested: Arc<AtomicBool>,
+    ) -> Result<WorkerSpeechDetector, CaptureError> {
+        if self.shutdown.load(Ordering::Acquire) {
+            return Err(CaptureError::SpeechDetection(
+                "the warmed Silero VAD service has shut down".to_owned(),
+            ));
+        }
+        let session_id = next_vad_session_id();
+        if let Some(mut warm) = self
+            .warm
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            let request_id = warm.next_request_id;
+            warm.next_request_id = next_request_id(request_id);
+            if warm
+                .supervisor
+                .start_session(session_id, request_id, threshold)
+                .is_ok()
+            {
+                return Ok(WorkerSpeechDetector {
+                    supervisor: Some(warm.supervisor),
+                    warm_service: Some(Arc::clone(self)),
+                    session_id,
+                    next_request_id: warm.next_request_id,
+                    active: true,
+                    discard_requested,
+                });
+            }
+        }
+
+        let (supervisor, next_request_id) = SileroVadWorkerSupervisor::acquire_session(
+            session_id,
+            1,
+            1,
+            threshold,
+            startup_cancelled,
+        )
+        .map_err(WorkerSpeechDetector::vad_error)?;
+        Ok(WorkerSpeechDetector {
+            supervisor: Some(supervisor),
+            warm_service: Some(Arc::clone(self)),
+            session_id,
+            next_request_id,
+            active: true,
+            discard_requested,
+        })
+    }
+
+    fn recycle(&self, warm: WarmVadSession) {
+        if self.shutdown.load(Ordering::Acquire) {
+            return;
+        }
+        let mut slot = self
+            .warm
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if slot.is_none() {
+            *slot = Some(warm);
+        }
+    }
+
+    pub(crate) fn shutdown(&self) {
+        self.shutdown.store(true, Ordering::Release);
+        self.warm
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(worker) = self
+            .prewarm_worker
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            let _ = worker.join();
+        }
+    }
+
+    #[cfg(test)]
+    fn prewarm_error(&self) -> Option<CaptureError> {
+        self.prewarm_error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
+
+fn next_request_id(request_id: u64) -> u64 {
+    request_id.wrapping_add(1).max(1)
+}
+
+fn next_vad_session_id() -> u64 {
+    NEXT_VAD_SESSION_ID.fetch_add(1, Ordering::Relaxed).max(1)
+}
+
+fn prepare_warm_vad(cancelled: &AtomicBool) -> Result<WarmVadSession, CaptureError> {
+    let session_id = next_vad_session_id();
+    let threshold = VadThreshold::new(0.5).map_err(WorkerSpeechDetector::vad_error)?;
+    let (supervisor, mut next_request_id) =
+        SileroVadWorkerSupervisor::acquire_session(session_id, 1, 1, threshold, cancelled)
+            .map_err(WorkerSpeechDetector::vad_error)?;
+    supervisor
+        .end_session(session_id, next_request_id)
+        .map_err(WorkerSpeechDetector::vad_error)?;
+    next_request_id = self::next_request_id(next_request_id);
+    Ok(WarmVadSession {
+        supervisor,
+        next_request_id,
+    })
+}
 
 struct WorkerSpeechDetector {
-    supervisor: SileroVadWorkerSupervisor,
+    supervisor: Option<SileroVadWorkerSupervisor>,
+    warm_service: Option<Arc<VadPrewarmService>>,
     session_id: u64,
     next_request_id: u64,
     active: bool,
@@ -461,7 +660,7 @@ impl CaptureStartContext {
 impl WorkerSpeechDetector {
     fn request_id(&mut self) -> u64 {
         let request_id = self.next_request_id;
-        self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
+        self.next_request_id = next_request_id(self.next_request_id);
         request_id
     }
 
@@ -477,23 +676,9 @@ impl SpeechDetectorFactory for WorkerSpeechDetectorFactory {
         startup_cancelled: &AtomicBool,
         discard_requested: Arc<AtomicBool>,
     ) -> Result<Box<dyn SpeechDetector>, CaptureError> {
-        let session_id = NEXT_VAD_SESSION_ID.fetch_add(1, Ordering::Relaxed).max(1);
-        let (supervisor, next_request_id) = SileroVadWorkerSupervisor::acquire_session(
-            session_id,
-            1,
-            1,
-            threshold,
-            startup_cancelled,
-        )
-        .map_err(WorkerSpeechDetector::vad_error)?;
-        let detector = WorkerSpeechDetector {
-            supervisor,
-            session_id,
-            next_request_id,
-            active: true,
-            discard_requested,
-        };
-        Ok(Box::new(detector))
+        self.warm_service
+            .acquire(threshold, startup_cancelled, discard_requested)
+            .map(|detector| Box::new(detector) as Box<dyn SpeechDetector>)
     }
 }
 
@@ -504,6 +689,8 @@ impl SpeechDetector for WorkerSpeechDetector {
     ) -> Result<SileroVadDecision, CaptureError> {
         let request_id = self.request_id();
         self.supervisor
+            .as_ref()
+            .expect("active VAD detector must retain its supervisor")
             .compute_with_cancellation(
                 self.session_id,
                 request_id,
@@ -518,11 +705,22 @@ impl SpeechDetector for WorkerSpeechDetector {
             return Ok(());
         }
         let request_id = self.request_id();
-        let result = self
+        let supervisor = self
             .supervisor
+            .take()
+            .expect("active VAD detector must retain its supervisor");
+        let result = supervisor
             .end_session(self.session_id, request_id)
             .map_err(Self::vad_error);
         self.active = false;
+        if result.is_ok()
+            && let Some(service) = self.warm_service.take()
+        {
+            service.recycle(WarmVadSession {
+                supervisor,
+                next_request_id: self.next_request_id,
+            });
+        }
         result
     }
 
@@ -533,6 +731,8 @@ impl SpeechDetector for WorkerSpeechDetector {
         let request_id = self.request_id();
         let result = self
             .supervisor
+            .as_ref()
+            .expect("active VAD detector must retain its supervisor")
             .cancel_session(self.session_id, request_id)
             .map_err(Self::vad_error);
         self.active = false;
@@ -543,7 +743,9 @@ impl SpeechDetector for WorkerSpeechDetector {
 impl Drop for WorkerSpeechDetector {
     fn drop(&mut self) {
         if self.active {
-            self.supervisor.abandon_session(self.session_id);
+            if let Some(supervisor) = self.supervisor.as_ref() {
+                supervisor.abandon_session(self.session_id);
+            }
             self.active = false;
         }
     }
@@ -808,6 +1010,7 @@ pub fn start_recording(
     options: CaptureOptions,
     preview_publisher: PreviewPublisherSlot,
     cancellation: CaptureCancellation,
+    vad_service: Arc<VadPrewarmService>,
 ) -> Result<RecordingSession, CaptureError> {
     options.vad.validate()?;
     options.detection_mode.validate()?;
@@ -845,6 +1048,7 @@ pub fn start_recording(
                 worker_observed,
                 worker_level_revision,
                 worker_cancellation,
+                vad_service,
                 &started_tx,
             );
             if let Err(error) = &result {
@@ -911,6 +1115,7 @@ fn capture_worker(
     level_observed: Arc<AtomicBool>,
     level_revision: Arc<AtomicU64>,
     cancellation: CaptureCancellation,
+    vad_service: Arc<VadPrewarmService>,
     started_tx: &Sender<Result<(), CaptureError>>,
 ) -> Result<CaptureCompletion, CaptureError> {
     let worker_started = Instant::now();
@@ -955,11 +1160,30 @@ fn capture_worker(
         cancellation.clone(),
     )?);
     let stream_build = stream_build_started.elapsed();
-    let detector = acquire_speech_detector(
-        &options,
-        &WorkerSpeechDetectorFactory,
-        &cancellation.stop_requested,
-        Arc::clone(&discard_requested),
+    cancellation.commit_play()?;
+    let capture_started = Instant::now();
+    let (detector, stream_play) = play_before_capture_setup(
+        || {
+            stream
+                .as_ref()
+                .expect("stream was just built")
+                .play()
+                .map_err(|error| CaptureError::PlayStream(error.to_string()))
+        },
+        || match acquire_speech_detector(
+            &options,
+            &WorkerSpeechDetectorFactory {
+                warm_service: vad_service,
+            },
+            &cancellation.startup_abort_requested,
+            Arc::clone(&discard_requested),
+        ) {
+            Ok(detector) => Ok(detector),
+            Err(_) if cancellation.startup_cancelled_before_first_sample() => {
+                Err(CaptureError::StartupCancelled)
+            }
+            Err(error) => Err(error),
+        },
     )?;
     let mut pipeline = Pipeline::new(
         format.sample_rate,
@@ -972,26 +1196,11 @@ fn capture_worker(
         level_revision,
     )?
     .with_preview_slot(preview_publisher);
-    if let Err(error) = cancellation.ensure_startup_active() {
+    if cancellation.startup_cancelled_before_first_sample() {
+        drop(stream.take());
         pipeline.cancel_speech_detector()?;
-        return Err(error);
+        return Err(CaptureError::StartupCancelled);
     }
-    if let Err(error) = cancellation.commit_play() {
-        pipeline.cancel_speech_detector()?;
-        return Err(error);
-    }
-    let stream_play_started = Instant::now();
-    stream
-        .as_ref()
-        .expect("stream was just built")
-        .play()
-        .map_err(|error| CaptureError::PlayStream(error.to_string()))
-        .or_else(|error| {
-            pipeline.cancel_speech_detector()?;
-            Err(error)
-        })?;
-    let stream_play = stream_play_started.elapsed();
-    let capture_started = Instant::now();
     let maximum_duration = Duration::from_secs(
         max_duration_seconds
             .clamp(1, config::MAX_RECORDING_SECONDS)
@@ -1242,6 +1451,16 @@ fn drain_ring_bounded(
         drained += 1;
     }
     Ok(drained)
+}
+
+fn play_before_capture_setup<T>(
+    play: impl FnOnce() -> Result<(), CaptureError>,
+    setup: impl FnOnce() -> Result<T, CaptureError>,
+) -> Result<(T, Duration), CaptureError> {
+    let play_started = Instant::now();
+    play()?;
+    let play_elapsed = play_started.elapsed();
+    setup().map(|prepared| (prepared, play_elapsed))
 }
 
 fn drain_ring_all(
@@ -1688,6 +1907,149 @@ mod tests {
     }
 
     #[test]
+    fn idle_vad_prewarm_never_enters_the_audio_capture_path() {
+        let prewarm_calls = Arc::new(AtomicUsize::new(0));
+        let worker_prewarm_calls = Arc::clone(&prewarm_calls);
+        let capture_calls = Arc::new(AtomicUsize::new(0));
+        let inference_calls = Arc::new(AtomicUsize::new(0));
+        let cpal_calls = Arc::new(AtomicUsize::new(0));
+        let (warmed_tx, warmed_rx) = bounded(1);
+        let service = VadPrewarmService::with_prewarm_task(Box::new(move |_| {
+            worker_prewarm_calls.fetch_add(1, Ordering::Release);
+            warmed_tx.send(()).unwrap();
+            Ok(None)
+        }));
+
+        service.prewarm().unwrap();
+        warmed_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        thread::sleep(Duration::from_millis(25));
+
+        assert_eq!(prewarm_calls.load(Ordering::Acquire), 1);
+        assert_eq!(capture_calls.load(Ordering::Acquire), 0);
+        assert_eq!(inference_calls.load(Ordering::Acquire), 0);
+        assert_eq!(cpal_calls.load(Ordering::Acquire), 0);
+        service.shutdown();
+
+        assert_eq!(prewarm_calls.load(Ordering::Acquire), 1);
+        assert_eq!(capture_calls.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn stream_play_completes_before_cold_or_warm_vad_setup() {
+        for simulated_setup_delay in [Duration::ZERO, Duration::from_millis(100)] {
+            let (event_tx, event_rx) = bounded(2);
+            let worker_events = event_tx.clone();
+            let worker = thread::spawn(move || {
+                play_before_capture_setup(
+                    || {
+                        worker_events.send("play-returned").unwrap();
+                        Ok(())
+                    },
+                    || {
+                        worker_events.send("vad-setup-started").unwrap();
+                        thread::sleep(simulated_setup_delay);
+                        Ok(())
+                    },
+                )
+                .unwrap();
+            });
+
+            assert_eq!(
+                event_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+                "play-returned"
+            );
+            assert_eq!(
+                event_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+                "vad-setup-started"
+            );
+            worker.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn vad_setup_failure_after_play_drops_the_stream_owner() {
+        struct StreamDrop(Arc<AtomicBool>);
+        impl Drop for StreamDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let result = {
+            let _stream = StreamDrop(Arc::clone(&dropped));
+            play_before_capture_setup(
+                || Ok(()),
+                || {
+                    Err::<(), _>(CaptureError::SpeechDetection(
+                        "injected warm-session failure".to_owned(),
+                    ))
+                },
+            )
+        };
+
+        assert!(matches!(result, Err(CaptureError::SpeechDetection(_))));
+        assert!(dropped.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn release_after_first_sample_does_not_cancel_delayed_vad_setup() {
+        let cancellation = CaptureCancellation::new();
+        cancellation.commit_play().unwrap();
+        assert!(cancellation.observe_first_sample());
+
+        cancellation.cancel();
+
+        assert!(cancellation.is_cancelled());
+        assert!(cancellation.first_sample_observed());
+        assert!(!cancellation.startup_abort_requested.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn vad_prewarm_shutdown_cancels_and_joins_the_worker() {
+        let (entered_tx, entered_rx) = bounded(1);
+        let (exited_tx, exited_rx) = bounded(1);
+        let service = VadPrewarmService::with_prewarm_task(Box::new(move |cancelled| {
+            entered_tx.send(()).unwrap();
+            while !cancelled.load(Ordering::Acquire) {
+                thread::sleep(Duration::from_millis(1));
+            }
+            exited_tx.send(()).unwrap();
+            Ok(None)
+        }));
+        service.prewarm().unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        service.shutdown();
+
+        exited_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    }
+
+    #[test]
+    fn vad_prewarm_failure_is_observable_without_starting_capture() {
+        let capture_calls = Arc::new(AtomicUsize::new(0));
+        let service = VadPrewarmService::with_prewarm_task(Box::new(move |_| {
+            Err(CaptureError::SpeechDetection(
+                "injected prewarm failure".to_owned(),
+            ))
+        }));
+        service.prewarm().unwrap();
+        for _ in 0..100 {
+            if service.prewarm_error().is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        assert!(matches!(
+            service.prewarm_error(),
+            Some(CaptureError::SpeechDetection(message)) if message == "injected prewarm failure"
+        ));
+        assert_eq!(capture_calls.load(Ordering::Acquire), 0);
+        service.shutdown();
+    }
+
+    #[test]
     fn capture_ids_are_monotonic_across_all_audio_flows() {
         let observed_at = Instant::now();
         let first = CaptureStartContext::observed_at(observed_at);
@@ -1807,6 +2169,7 @@ mod tests {
             &CaptureCancellation {
                 stop_requested: Arc::new(AtomicBool::new(false)),
                 startup_state: Arc::new(AtomicU8::new(STARTUP_FIRST_SAMPLE)),
+                startup_abort_requested: Arc::new(AtomicBool::new(false)),
             },
             normalize_i16,
         );

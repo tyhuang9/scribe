@@ -2816,7 +2816,6 @@ impl SileroVadWorkerSupervisor {
         Ok(false)
     }
 
-    #[cfg(test)]
     pub(crate) fn start_session(
         &self,
         session_id: u64,

@@ -6,7 +6,7 @@ use crossbeam_channel::{Receiver, Sender, select, unbounded};
 
 use super::{
     CaptureCancellation, CaptureError, CaptureId, CaptureOptions, CaptureStartContext,
-    PreviewPublisherSlot, RecordingSession,
+    PreviewPublisherSlot, RecordingSession, VadPrewarmService,
 };
 
 pub(crate) type StartCapture = dyn Fn(CaptureRequest, CaptureCancellation) -> Result<RecordingSession, CaptureError>
@@ -179,20 +179,30 @@ pub(crate) struct CaptureController {
     handle: CaptureControlHandle,
     lifecycle_rx: Receiver<CaptureLifecycleEvent>,
     worker: Option<thread::JoinHandle<()>>,
+    vad_service: Option<Arc<VadPrewarmService>>,
 }
 
 impl CaptureController {
     pub(crate) fn new() -> Result<Self, CaptureError> {
-        Self::with_start_capture(Arc::new(|request, cancellation| {
-            super::start_recording(
-                CaptureStartContext::new(request.capture_id, request.observed_at),
-                request.max_duration_seconds,
-                request.input_device_name,
-                request.options,
-                request.preview_slot,
-                cancellation,
-            )
-        }))
+        let vad_service = VadPrewarmService::new();
+        #[cfg(not(test))]
+        vad_service.prewarm()?;
+        let start_vad_service = Arc::clone(&vad_service);
+        Self::with_components(
+            Arc::new(move |request, cancellation| {
+                super::start_recording(
+                    CaptureStartContext::new(request.capture_id, request.observed_at),
+                    request.max_duration_seconds,
+                    request.input_device_name,
+                    request.options,
+                    request.preview_slot,
+                    cancellation,
+                    Arc::clone(&start_vad_service),
+                )
+            }),
+            Arc::new(spawn_release_reaper_thread),
+            Some(vad_service),
+        )
     }
 
     #[cfg(test)]
@@ -207,16 +217,18 @@ impl CaptureController {
         start_capture: Arc<StartCapture>,
         reaper_spawner: Arc<ReleaseReaperSpawner>,
     ) -> Result<Self, CaptureError> {
-        Self::with_components(start_capture, reaper_spawner)
+        Self::with_components(start_capture, reaper_spawner, None)
     }
 
+    #[cfg(test)]
     fn with_start_capture(start_capture: Arc<StartCapture>) -> Result<Self, CaptureError> {
-        Self::with_components(start_capture, Arc::new(spawn_release_reaper_thread))
+        Self::with_components(start_capture, Arc::new(spawn_release_reaper_thread), None)
     }
 
     fn with_components(
         start_capture: Arc<StartCapture>,
         reaper_spawner: Arc<ReleaseReaperSpawner>,
+        vad_service: Option<Arc<VadPrewarmService>>,
     ) -> Result<Self, CaptureError> {
         let state = Arc::new(Mutex::new(SharedState::default()));
         let (command_tx, command_rx) = unbounded();
@@ -245,6 +257,7 @@ impl CaptureController {
             },
             lifecycle_rx,
             worker: Some(worker),
+            vad_service,
         })
     }
 
@@ -266,6 +279,9 @@ impl Drop for CaptureController {
         self.handle.shutdown();
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
+        }
+        if let Some(vad_service) = self.vad_service.take() {
+            vad_service.shutdown();
         }
     }
 }
