@@ -1130,6 +1130,135 @@ pub(crate) fn reconcile_managed_removal(
     Ok(true)
 }
 
+/// Reconciles a directory removal using an already opened stable identity.
+/// The caller is responsible for deriving `target` from trusted catalog data,
+/// validating the exact artifact tree at `capability.path()`, and holding its
+/// cross-process mutation lock for this entire call.
+pub(crate) fn reconcile_stable_directory_removal(
+    target: &Path,
+    durable_config_fingerprint: &str,
+    mut capability: Option<StableManagedDirectory>,
+) -> Result<bool, InstallError> {
+    validate_sha256(durable_config_fingerprint)?;
+    let tombstone = removal_tombstone_path(target)?;
+    let journal_path = removal_journal_path(target)?;
+    let target_exists = path_entry_exists_no_follow(target)?;
+    let tombstone_exists = path_entry_exists_no_follow(&tombstone)?;
+    if !tombstone_exists && !path_entry_exists_no_follow(&journal_path)? {
+        return Ok(false);
+    }
+    if !path_entry_exists_no_follow(&journal_path)? {
+        return Err(InstallError::RecoveryRequired(format!(
+            "artifact removal tombstone {} has no durable settings witness",
+            tombstone.display()
+        )));
+    }
+    let bytes = fs::read(&journal_path).map_err(|error| {
+        failed(format!(
+            "failed to read removal journal {}: {error}",
+            journal_path.display()
+        ))
+    })?;
+    let journal: RemovalJournalDocument = serde_json::from_slice(&bytes).map_err(|error| {
+        failed(format!(
+            "invalid removal journal {}: {error}",
+            journal_path.display()
+        ))
+    })?;
+    if journal.schema_version != 1
+        || canonicalize_missing(&journal.target)? != canonicalize_missing(target)?
+    {
+        return Err(InstallError::RecoveryRequired(format!(
+            "removal journal {} does not describe the exact catalog target {}",
+            journal_path.display(),
+            target.display()
+        )));
+    }
+    validate_sha256(&journal.prior_config_fingerprint)?;
+    if let Some(expected) = journal.expected_config_fingerprint.as_deref() {
+        validate_sha256(expected)?;
+    }
+    let durable_is_prior = journal
+        .prior_config_fingerprint
+        .eq_ignore_ascii_case(durable_config_fingerprint);
+    let durable_is_expected = journal
+        .expected_config_fingerprint
+        .as_deref()
+        .is_some_and(|expected| expected.eq_ignore_ascii_case(durable_config_fingerprint));
+    if !durable_is_prior && !durable_is_expected {
+        return Err(InstallError::RecoveryRequired(format!(
+            "durable artifact settings match neither side of stable removal transaction {}; refusing to mutate artifacts",
+            target.display()
+        )));
+    }
+    if target_exists && tombstone_exists {
+        return Err(InstallError::RecoveryRequired(format!(
+            "both active artifact and removal tombstone exist for {}",
+            target.display()
+        )));
+    }
+
+    if durable_is_prior {
+        if tombstone_exists {
+            let opened = capability.as_mut().ok_or_else(|| {
+                InstallError::RecoveryRequired(format!(
+                    "interrupted stable removal {} has no opened tombstone identity",
+                    target.display()
+                ))
+            })?;
+            if opened.path() != tombstone {
+                return Err(InstallError::RecoveryRequired(format!(
+                    "opened stable removal identity does not match tombstone {}",
+                    tombstone.display()
+                )));
+            }
+            opened.rename_to(target).map_err(|error| {
+                InstallError::RecoveryRequired(format!(
+                    "failed to restore interrupted stable removal {}: {error}",
+                    target.display()
+                ))
+            })?;
+        } else if !target_exists {
+            return Err(InstallError::RecoveryRequired(format!(
+                "interrupted stable removal lost both target and tombstone for {}",
+                target.display()
+            )));
+        }
+    } else if tombstone_exists {
+        let opened = capability.take().ok_or_else(|| {
+            InstallError::RecoveryRequired(format!(
+                "committed stable removal {} has no opened tombstone identity",
+                target.display()
+            ))
+        })?;
+        if opened.path() != tombstone {
+            return Err(InstallError::RecoveryRequired(format!(
+                "opened stable removal identity does not match tombstone {}",
+                tombstone.display()
+            )));
+        }
+        opened.remove_exact_tree().map_err(|error| {
+            InstallError::RecoveryRequired(format!(
+                "failed to finish interrupted stable removal {}: {error}",
+                target.display()
+            ))
+        })?;
+    } else if target_exists {
+        return Err(InstallError::RecoveryRequired(format!(
+            "durable settings removed {}, but the active artifact still exists",
+            target.display()
+        )));
+    }
+    sync_parent(target).map_err(|error| {
+        InstallError::RecoveryRequired(format!(
+            "stable artifact removal reconciliation changed {} but directory sync failed: {error}",
+            target.display()
+        ))
+    })?;
+    remove_path_if_exists(&journal_path)?;
+    Ok(true)
+}
+
 /// Finds durable removal journals below Scribe-owned storage roots so a
 /// transaction remains recoverable after its model/runtime record has already
 /// been removed from the persisted settings. Traversal is bounded and never
@@ -3702,7 +3831,7 @@ fn file_rollback_path(destination: &Path) -> Result<PathBuf, InstallError> {
     Ok(destination.with_file_name(rollback))
 }
 
-fn removal_tombstone_path(target: &Path) -> Result<PathBuf, InstallError> {
+pub(crate) fn removal_tombstone_path(target: &Path) -> Result<PathBuf, InstallError> {
     let name = target
         .file_name()
         .ok_or_else(|| failed(format!("{} has no filename", target.display())))?;

@@ -21,11 +21,12 @@ use crate::disk_space::{
 };
 use crate::installations::{
     BundleAssemblyFile, DirectoryReplacement, GeneratedBundleFile, InstallCancellation,
-    InstallError, InstallProgress, PinnedArtifact, PinnedArtifactInspectionPlan, RuntimeFileSpec,
-    StagedRuntime, discard_pinned_artifact_partial, download_pinned_artifact_for_target,
-    inspect_pinned_artifact_for_target, pinned_artifact_retained_partial,
-    read_regular_file_no_follow, stage_file_bundle_for_target, verify_regular_directory_root,
-    verify_runtime_tree,
+    InstallError, InstallProgress, ManagedRemoval, PinnedArtifact, PinnedArtifactInspectionPlan,
+    RuntimeFileSpec, StableManagedDirectory, StagedRuntime, discard_pinned_artifact_partial,
+    download_pinned_artifact_for_target, inspect_pinned_artifact_for_target,
+    pinned_artifact_retained_partial, read_regular_file_no_follow,
+    reconcile_stable_directory_removal, removal_tombstone_path, stage_file_bundle_for_target,
+    verify_regular_directory_root, verify_runtime_tree,
 };
 use crate::runtime_artifact::{OnnxFileRole, OnnxModelFamily, OnnxModelSpec};
 use crate::transcription::{InstallSmoke, VerifiedOnnxBundleSmoke};
@@ -1758,6 +1759,196 @@ pub(crate) fn current_executable_receipt_at(
     Ok((receipt, spec))
 }
 
+/// Exact, current receipt evidence suitable for authorizing the model-removal
+/// confirmation UI or persisting an ownership witness. This value is only a
+/// snapshot; mutation must use `stage_onnx_bundle_removal`, which reacquires
+/// the target lock and repeats full-tree verification against an opened
+/// stable directory capability.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct VerifiedOnnxRemovalCandidate {
+    model_id: String,
+    target_root: PathBuf,
+    receipt_sha256: String,
+}
+
+impl VerifiedOnnxRemovalCandidate {
+    pub(crate) fn model_id(&self) -> &str {
+        &self.model_id
+    }
+
+    pub(crate) fn target_root(&self) -> &Path {
+        &self.target_root
+    }
+
+    pub(crate) fn receipt_sha256(&self) -> &str {
+        &self.receipt_sha256
+    }
+}
+
+fn verified_removal_candidate_at(
+    expected_model_id: &str,
+    root: &Path,
+) -> Result<VerifiedOnnxRemovalCandidate, InstallError> {
+    let (receipt, _) = current_executable_receipt_at(root)?;
+    removal_candidate_from_receipt(expected_model_id, root, &receipt)
+}
+
+fn removal_candidate_from_receipt(
+    expected_model_id: &str,
+    root: &Path,
+    receipt: &OnnxBundleReceipt,
+) -> Result<VerifiedOnnxRemovalCandidate, InstallError> {
+    if receipt.model_id != expected_model_id {
+        return Err(failed(format!(
+            "ONNX removal target receipt belongs to {} instead of {expected_model_id}",
+            receipt.model_id
+        )));
+    }
+    let receipt_sha256 = format!("{:x}", Sha256::digest(receipt_bytes(&receipt)?));
+    Ok(VerifiedOnnxRemovalCandidate {
+        model_id: expected_model_id.to_owned(),
+        target_root: root.to_path_buf(),
+        receipt_sha256,
+    })
+}
+
+#[cfg(test)]
+fn verified_removal_candidate_at_with_manifest_for_test(
+    expected_model_id: &str,
+    root: &Path,
+    manifest: &OnnxBundleManifest,
+) -> Result<VerifiedOnnxRemovalCandidate, InstallError> {
+    let (receipt, _) = current_executable_receipt_at_with_manifest_for_test(root, manifest)?;
+    removal_candidate_from_receipt(expected_model_id, root, &receipt)
+}
+
+pub(crate) fn verified_onnx_removal_candidate(
+    storage_root: &Path,
+    model_id: &str,
+) -> Result<Option<VerifiedOnnxRemovalCandidate>, InstallError> {
+    let target_root = bundle_target_root(storage_root, model_id)?;
+    if !crate::installations::path_entry_exists_no_follow(&target_root)? {
+        return Ok(None);
+    }
+    verified_removal_candidate_at(model_id, &target_root).map(Some)
+}
+
+/// Receipt-backed ONNX removal transaction. The per-target in-process and OS
+/// file locks plus the opened directory identity remain held through staging,
+/// settings persistence, commit, and rollback.
+#[derive(Debug)]
+pub(crate) struct OnnxBundleRemoval {
+    removal: ManagedRemoval,
+    _target_guard: BundleTargetGuard,
+}
+
+impl OnnxBundleRemoval {
+    pub(crate) fn removed_files(&self) -> bool {
+        self.removal.removed_files()
+    }
+
+    pub(crate) fn prepare_config_commit(
+        &mut self,
+        expected_config_fingerprint: String,
+    ) -> Result<(), InstallError> {
+        self.removal
+            .prepare_config_commit(expected_config_fingerprint)
+    }
+
+    pub(crate) fn commit(self) -> Result<(), InstallError> {
+        self.removal.commit()
+    }
+
+    pub(crate) fn rollback(self) -> Result<(), InstallError> {
+        self.removal.rollback()
+    }
+}
+
+pub(crate) fn stage_onnx_bundle_removal(
+    storage_root: &Path,
+    model_id: &str,
+    prior_config_fingerprint: String,
+) -> Result<OnnxBundleRemoval, InstallError> {
+    stage_onnx_bundle_removal_with(
+        storage_root,
+        model_id,
+        prior_config_fingerprint,
+        verified_removal_candidate_at,
+    )
+}
+
+fn stage_onnx_bundle_removal_with(
+    storage_root: &Path,
+    model_id: &str,
+    prior_config_fingerprint: String,
+    verify: impl FnOnce(&str, &Path) -> Result<VerifiedOnnxRemovalCandidate, InstallError>,
+) -> Result<OnnxBundleRemoval, InstallError> {
+    let target_root = bundle_target_root(storage_root, model_id)?;
+    let target_guard = acquire_bundle_target(&target_root)?;
+    let capability = StableManagedDirectory::open_exact(&target_root, &target_root)?;
+    let candidate = verify(model_id, capability.path())?;
+    if candidate.target_root() != capability.path() {
+        return Err(failed(
+            "ONNX removal receipt did not bind the opened target directory",
+        ));
+    }
+    let removal = ManagedRemoval::stage_stable_directory(capability, prior_config_fingerprint)?;
+    Ok(OnnxBundleRemoval {
+        removal,
+        _target_guard: target_guard,
+    })
+}
+
+/// Startup recovery for one catalog-derived ONNX target. Any target or
+/// tombstone that will be renamed/deleted is fully receipt/tree validated,
+/// opened as a stable capability, and kept under the same target lock for the
+/// entire reconciliation.
+pub(crate) fn reconcile_onnx_bundle_removal(
+    storage_root: &Path,
+    model_id: &str,
+    durable_config_fingerprint: &str,
+) -> Result<bool, InstallError> {
+    reconcile_onnx_bundle_removal_with(
+        storage_root,
+        model_id,
+        durable_config_fingerprint,
+        verified_removal_candidate_at,
+    )
+}
+
+fn reconcile_onnx_bundle_removal_with(
+    storage_root: &Path,
+    model_id: &str,
+    durable_config_fingerprint: &str,
+    verify: impl Fn(&str, &Path) -> Result<VerifiedOnnxRemovalCandidate, InstallError>,
+) -> Result<bool, InstallError> {
+    let target_root = bundle_target_root(storage_root, model_id)?;
+    let _target_guard = acquire_bundle_target(&target_root)?;
+    let tombstone = removal_tombstone_path(&target_root)?;
+    let capability = if crate::installations::path_entry_exists_no_follow(&tombstone)? {
+        let capability = StableManagedDirectory::open_exact(&tombstone, &tombstone)?;
+        verify(model_id, capability.path()).map_err(|error| {
+            InstallError::RecoveryRequired(format!(
+                "interrupted ONNX removal tombstone is not exact at {}: {error}",
+                tombstone.display()
+            ))
+        })?;
+        Some(capability)
+    } else if crate::installations::path_entry_exists_no_follow(&target_root)? {
+        let capability = StableManagedDirectory::open_exact(&target_root, &target_root)?;
+        verify(model_id, capability.path()).map_err(|error| {
+            InstallError::RecoveryRequired(format!(
+                "interrupted ONNX removal target is not exact at {}: {error}",
+                target_root.display()
+            ))
+        })?;
+        Some(capability)
+    } else {
+        None
+    };
+    reconcile_stable_directory_removal(&target_root, durable_config_fingerprint, capability)
+}
+
 #[cfg(test)]
 pub(crate) fn current_executable_receipt_at_with_manifest_for_test(
     root: &Path,
@@ -1953,6 +2144,22 @@ mod tests {
             fs::write(path, material.bytes).unwrap();
         }
         receipt
+    }
+
+    fn manifest_from_fixture_receipt(receipt: &OnnxBundleReceipt) -> OnnxBundleManifest {
+        OnnxBundleManifest {
+            id: receipt.model_id.clone(),
+            availability: BundleAvailability::Available,
+            compatibility: CompatibilityEvidence::Experimental,
+            repository: receipt.repository.clone(),
+            revision: receipt.revision.clone(),
+            family: receipt.family,
+            num_threads: receipt.num_threads,
+            unavailable_reason: None,
+            capability: receipt.capability.clone(),
+            license: receipt.license.clone(),
+            files: receipt.files.clone(),
+        }
     }
 
     fn fixture_assembly(root: &Path, receipt: &OnnxBundleReceipt) -> Vec<BundleAssemblyFile> {
@@ -2421,6 +2628,194 @@ mod tests {
         assert!(verified_receipt_at(&root).is_err());
         assert!(!receipt.files.is_empty());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn removal_authorization_rejects_malformed_wrong_hash_extra_and_symlink_receipts() {
+        use std::os::windows::fs::symlink_file;
+
+        let root = unique_root("removal-receipt-adversarial");
+        let expected_id = "fixture-removal-model";
+
+        let malformed = root.join("malformed");
+        let receipt = write_fixture_bundle(&malformed, expected_id, "malformed");
+        let manifest = manifest_from_fixture_receipt(&receipt);
+        fs::write(malformed.join(RECEIPT_FILE_NAME), b"not-json").unwrap();
+        assert!(
+            verified_removal_candidate_at_with_manifest_for_test(
+                expected_id,
+                &malformed,
+                &manifest
+            )
+            .is_err()
+        );
+
+        let wrong = root.join("wrong");
+        let receipt = write_fixture_bundle(&wrong, "other-model", "wrong");
+        let manifest = manifest_from_fixture_receipt(&receipt);
+        assert!(
+            verified_removal_candidate_at_with_manifest_for_test(expected_id, &wrong, &manifest)
+                .is_err()
+        );
+
+        let hash_mismatch = root.join("hash-mismatch");
+        let receipt = write_fixture_bundle(&hash_mismatch, expected_id, "hash-mismatch");
+        let manifest = manifest_from_fixture_receipt(&receipt);
+        fs::write(hash_mismatch.join(&receipt.files[0].path), b"changed").unwrap();
+        assert!(
+            verified_removal_candidate_at_with_manifest_for_test(
+                expected_id,
+                &hash_mismatch,
+                &manifest
+            )
+            .is_err()
+        );
+
+        let extra = root.join("extra");
+        let receipt = write_fixture_bundle(&extra, expected_id, "extra");
+        let manifest = manifest_from_fixture_receipt(&receipt);
+        fs::write(extra.join("unowned.bin"), b"extra").unwrap();
+        assert!(
+            verified_removal_candidate_at_with_manifest_for_test(expected_id, &extra, &manifest)
+                .is_err()
+        );
+
+        let symlink = root.join("symlink");
+        let receipt = write_fixture_bundle(&symlink, expected_id, "symlink");
+        let manifest = manifest_from_fixture_receipt(&receipt);
+        let receipt_path = symlink.join(RECEIPT_FILE_NAME);
+        let external_receipt = root.join("external-receipt.json");
+        fs::rename(&receipt_path, &external_receipt).unwrap();
+        match symlink_file(&external_receipt, &receipt_path) {
+            Ok(()) => assert!(
+                verified_removal_candidate_at_with_manifest_for_test(
+                    expected_id,
+                    &symlink,
+                    &manifest
+                )
+                .is_err()
+            ),
+            Err(error)
+                if error.kind() == io::ErrorKind::PermissionDenied
+                    || error.raw_os_error() == Some(1314) => {}
+            Err(error) => panic!("could not create receipt symlink fixture: {error}"),
+        }
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn onnx_removal_reverifies_under_lock_and_rejects_os_lock_contention() {
+        let storage = unique_root("removal-lock-and-reverify");
+        fs::create_dir_all(&storage).unwrap();
+        let model_id = "fixture-removal-model";
+        let target = bundle_target_root(&storage, model_id).unwrap();
+        let receipt = write_fixture_bundle(&target, model_id, "remove");
+        let manifest = manifest_from_fixture_receipt(&receipt);
+
+        let (_, stats) = observe_receipt_verifications_for_test(|| {
+            verified_removal_candidate_at_with_manifest_for_test(model_id, &target, &manifest)
+                .unwrap();
+            let removal = stage_onnx_bundle_removal_with(
+                &storage,
+                model_id,
+                format!("{:x}", Sha256::digest(b"prior-config")),
+                |expected, root| {
+                    verified_removal_candidate_at_with_manifest_for_test(expected, root, &manifest)
+                },
+            )
+            .unwrap();
+            removal.rollback().unwrap();
+        });
+        assert_eq!(
+            stats.calls, 2,
+            "UI authorization and mutation must each verify the complete tree"
+        );
+
+        let guard = acquire_bundle_target(&target).unwrap();
+        active_bundle_targets()
+            .lock()
+            .unwrap()
+            .remove(&guard.identity);
+        let error = stage_onnx_bundle_removal_with(
+            &storage,
+            model_id,
+            format!("{:x}", Sha256::digest(b"prior-config")),
+            |expected, root| {
+                verified_removal_candidate_at_with_manifest_for_test(expected, root, &manifest)
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("another process owns"));
+        assert!(target.is_dir());
+        drop(guard);
+        fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn onnx_removal_recovers_crashes_before_and_after_settings_persistence() {
+        let restore_storage = unique_root("removal-crash-before-persistence");
+        fs::create_dir_all(&restore_storage).unwrap();
+        let model_id = "fixture-removal-model";
+        let restore_target = bundle_target_root(&restore_storage, model_id).unwrap();
+        let receipt = write_fixture_bundle(&restore_target, model_id, "restore");
+        let manifest = manifest_from_fixture_receipt(&receipt);
+        let prior = format!("{:x}", Sha256::digest(b"prior-config"));
+        let removal = stage_onnx_bundle_removal_with(
+            &restore_storage,
+            model_id,
+            prior.clone(),
+            |expected, root| {
+                verified_removal_candidate_at_with_manifest_for_test(expected, root, &manifest)
+            },
+        )
+        .unwrap();
+        drop(removal);
+        assert!(!restore_target.exists());
+        assert!(
+            reconcile_onnx_bundle_removal_with(
+                &restore_storage,
+                model_id,
+                &prior,
+                |expected, root| {
+                    verified_removal_candidate_at_with_manifest_for_test(expected, root, &manifest)
+                },
+            )
+            .unwrap()
+        );
+        assert!(restore_target.is_dir());
+
+        let commit_storage = unique_root("removal-crash-after-persistence");
+        fs::create_dir_all(&commit_storage).unwrap();
+        let commit_target = bundle_target_root(&commit_storage, model_id).unwrap();
+        let receipt = write_fixture_bundle(&commit_target, model_id, "commit");
+        let manifest = manifest_from_fixture_receipt(&receipt);
+        let expected = format!("{:x}", Sha256::digest(b"expected-config"));
+        let mut removal =
+            stage_onnx_bundle_removal_with(&commit_storage, model_id, prior, |expected, root| {
+                verified_removal_candidate_at_with_manifest_for_test(expected, root, &manifest)
+            })
+            .unwrap();
+        removal.prepare_config_commit(expected.clone()).unwrap();
+        drop(removal);
+        assert!(
+            reconcile_onnx_bundle_removal_with(
+                &commit_storage,
+                model_id,
+                &expected,
+                |expected, root| {
+                    verified_removal_candidate_at_with_manifest_for_test(expected, root, &manifest)
+                },
+            )
+            .unwrap()
+        );
+        assert!(!commit_target.exists());
+
+        fs::remove_dir_all(restore_storage).unwrap();
+        fs::remove_dir_all(commit_storage).unwrap();
     }
 
     #[test]
