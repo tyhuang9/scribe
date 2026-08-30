@@ -316,7 +316,6 @@ const MOONSHINE_BASE_CAPABILITIES: ModelCapabilities = ModelCapabilities {
 const PARAKEET_TDT_V2_CAPABILITIES: ModelCapabilities = ModelCapabilities {
     cancellation: false,
     timestamps: false,
-    cancellation: false,
     ..BATCH_ENGLISH_CAPABILITIES
 };
 
