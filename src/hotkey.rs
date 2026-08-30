@@ -39,6 +39,7 @@ pub struct HotkeyService {
     hotkey: Option<HotKey>,
     event_rx: Receiver<QueuedGlobalHotkeyEvent>,
     registered_id: Arc<AtomicU32>,
+    capture_control: CaptureControlHandle,
     pub last_error: Option<String>,
 }
 
@@ -74,15 +75,18 @@ impl EventBridge {
         } else {
             HotkeyDispatch::None
         };
-        if self
-            .sender
-            .send(QueuedGlobalHotkeyEvent {
-                event,
-                observed_at,
-                direct_dispatch,
-            })
-            .is_err()
-        {
+        if let Err(error) = self.sender.send(QueuedGlobalHotkeyEvent {
+            event,
+            observed_at,
+            direct_dispatch,
+        }) {
+            terminate_direct_start(
+                &self
+                    .capture_control
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                error.0.direct_dispatch,
+            );
             return;
         }
         (self.native_wake)();
@@ -92,6 +96,7 @@ impl EventBridge {
 
 impl HotkeyService {
     pub fn new(spec: &str, context: &egui::Context, capture_control: CaptureControlHandle) -> Self {
+        let service_capture_control = capture_control.clone();
         let (event_rx, registered_id) = install_event_handler(context, capture_control);
         registered_id.store(0, Ordering::Release);
         let mut service = Self {
@@ -99,6 +104,7 @@ impl HotkeyService {
             hotkey: None,
             event_rx,
             registered_id,
+            capture_control: service_capture_control,
             last_error: None,
         };
         if let Err(err) = global_hotkey_startup_allowed() {
@@ -160,9 +166,23 @@ impl HotkeyService {
                     observed_at: observed.observed_at,
                     direct_dispatch: observed.direct_dispatch,
                 });
+            } else {
+                terminate_direct_start(&self.capture_control, observed.direct_dispatch);
             }
         }
         events
+    }
+
+    pub(crate) fn discard_pending_events(&self) {
+        while let Ok(observed) = self.event_rx.try_recv() {
+            terminate_direct_start(&self.capture_control, observed.direct_dispatch);
+        }
+    }
+}
+
+fn terminate_direct_start(control: &CaptureControlHandle, dispatch: HotkeyDispatch) {
+    if let HotkeyDispatch::Start(ticket) = dispatch {
+        control.terminate_capture(ticket.capture_id);
     }
 }
 
@@ -561,6 +581,71 @@ mod tests {
     }
 
     #[test]
+    fn registration_mismatch_retires_queued_direct_start_ticket() {
+        let previous = parse_hotkey("Ctrl+Shift+Space").unwrap();
+        let current = parse_hotkey("Ctrl+Alt+K").unwrap();
+        let controller = crate::audio::control::CaptureController::with_start_capture_for_test(
+            Arc::new(|_request, cancellation| {
+                while !cancellation.is_cancelled() {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(crate::audio::CaptureError::StartupCancelled)
+            }),
+        )
+        .unwrap();
+        let handle = controller.handle();
+        handle
+            .reconfigure_hotkey(
+                true,
+                crate::audio::control::CaptureHotkeyMode::HoldToTalk,
+                30,
+                None,
+                crate::audio::CaptureOptions::default(),
+            )
+            .unwrap();
+        let direct_dispatch = handle.dispatch_hotkey(true, Instant::now());
+        let HotkeyDispatch::Start(ticket) = &direct_dispatch else {
+            panic!("previous shortcut should issue a direct Start ticket");
+        };
+        let capture_id = ticket.capture_id;
+        let (sender, receiver) = unbounded();
+        let service = HotkeyService {
+            manager: None,
+            hotkey: Some(current),
+            event_rx: receiver,
+            registered_id: Arc::new(AtomicU32::new(current.id())),
+            capture_control: handle.clone(),
+            last_error: None,
+        };
+        sender
+            .send(QueuedGlobalHotkeyEvent {
+                event: GlobalHotKeyEvent {
+                    id: previous.id(),
+                    state: HotKeyState::Pressed,
+                },
+                observed_at: Instant::now(),
+                direct_dispatch,
+            })
+            .unwrap();
+
+        assert!(service.poll_events().is_empty());
+        for _ in 0..100 {
+            if handle.owner().is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(handle.owner().is_none());
+        assert!(controller.poll_events().into_iter().all(|event| !matches!(
+            event,
+            crate::audio::control::CaptureLifecycleEvent::Ready {
+                capture_id: ready_id,
+                ..
+            } if ready_id == capture_id
+        )));
+    }
+
+    #[test]
     fn ignores_events_when_no_hotkey_is_registered() {
         let hotkey = parse_hotkey("Ctrl+Shift+Space").unwrap();
 
@@ -580,11 +665,13 @@ mod tests {
     fn drains_press_and_release_from_the_app_owned_event_channel() {
         let hotkey = parse_hotkey("Ctrl+Shift+Space").unwrap();
         let (sender, receiver) = unbounded();
+        let controller = crate::audio::control::CaptureController::new().unwrap();
         let service = HotkeyService {
             manager: None,
             hotkey: Some(hotkey),
             event_rx: receiver,
             registered_id: Arc::new(AtomicU32::new(hotkey.id())),
+            capture_control: controller.handle(),
             last_error: None,
         };
 

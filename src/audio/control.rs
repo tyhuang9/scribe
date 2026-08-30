@@ -58,6 +58,7 @@ struct HotkeySnapshot {
 pub(crate) struct CaptureTicket {
     pub(crate) capture_id: CaptureId,
     pub(crate) preview_slot: PreviewPublisherSlot,
+    config_revision: u64,
 }
 
 #[derive(Clone)]
@@ -121,6 +122,7 @@ struct OwnerState {
     session: Option<RecordingSession>,
     release_requested: bool,
     reaper_started: bool,
+    adopted: bool,
 }
 
 struct SharedState {
@@ -277,7 +279,7 @@ impl CaptureControlHandle {
         input_device_name: Option<String>,
         options: CaptureOptions,
     ) -> Result<u64, CaptureControlError> {
-        let revision = {
+        let (revision, revoke_capture_id) = {
             let mut state = self.lock_state();
             if state.shutdown {
                 return Err(CaptureControlError::Shutdown);
@@ -294,10 +296,20 @@ impl CaptureControlHandle {
             if state.hotkey == replacement {
                 return Ok(state.config_revision);
             }
-            state.config_revision = state.config_revision.wrapping_add(1).max(1);
+            state.config_revision = state
+                .config_revision
+                .checked_add(1)
+                .ok_or(CaptureControlError::Shutdown)?;
             state.hotkey = replacement;
-            state.config_revision
+            let revoke_capture_id = state.owner.as_ref().and_then(|owner| {
+                (owner.kind == AudioOwnerKind::Capture && !owner.adopted)
+                    .then_some(CaptureId(owner.id))
+            });
+            (state.config_revision, revoke_capture_id)
         };
+        if let Some(capture_id) = revoke_capture_id {
+            self.terminate_capture(capture_id);
+        }
         self.command_tx
             .send(ControlCommand::Reconfigure { revision })
             .map_err(|_| CaptureControlError::Shutdown)?;
@@ -341,7 +353,13 @@ impl CaptureControlHandle {
             let Some(template) = state.hotkey.start.clone() else {
                 return HotkeyDispatch::None;
             };
-            return self.start_locked(&mut state, AudioOwnerKind::Capture, observed_at, template);
+            return self.start_locked(
+                &mut state,
+                AudioOwnerKind::Capture,
+                observed_at,
+                template,
+                false,
+            );
         }
 
         HotkeyDispatch::None
@@ -371,6 +389,7 @@ impl CaptureControlHandle {
                 input_device_name,
                 options,
             },
+            true,
         ) {
             HotkeyDispatch::Start(ticket) => Ok(ticket),
             HotkeyDispatch::None | HotkeyDispatch::Stop { .. } => {
@@ -385,6 +404,7 @@ impl CaptureControlHandle {
         owner: AudioOwnerKind,
         observed_at: Instant,
         template: StartTemplate,
+        adopted: bool,
     ) -> HotkeyDispatch {
         let capture_id = CaptureId(state.next_id);
         let Some(next_id) = state.next_id.checked_add(1) else {
@@ -410,6 +430,7 @@ impl CaptureControlHandle {
             session: None,
             release_requested: false,
             reaper_started: false,
+            adopted,
         });
         if self
             .command_tx
@@ -426,7 +447,34 @@ impl CaptureControlHandle {
         HotkeyDispatch::Start(CaptureTicket {
             capture_id,
             preview_slot,
+            config_revision: state.config_revision,
         })
+    }
+
+    pub(crate) fn adopt_hotkey_capture(
+        &self,
+        ticket: &CaptureTicket,
+    ) -> Result<(), CaptureControlError> {
+        let mut state = self.lock_state();
+        let eligible = state.hotkey.enabled && state.config_revision == ticket.config_revision;
+        let Some(owner) = state.owner.as_mut() else {
+            return Err(CaptureControlError::Stale(ticket.capture_id.0));
+        };
+        if !eligible
+            || owner.id != ticket.capture_id.0
+            || owner.kind != AudioOwnerKind::Capture
+            || owner.adopted
+            || owner.release_requested
+        {
+            return Err(CaptureControlError::Stale(ticket.capture_id.0));
+        }
+        owner.adopted = true;
+        Ok(())
+    }
+
+    pub(crate) fn terminate_capture(&self, capture_id: CaptureId) {
+        let _ = self.abort(capture_id);
+        let _ = self.release(capture_id.0);
     }
 
     pub(crate) fn stop(&self, capture_id: CaptureId) -> Result<(), CaptureControlError> {
@@ -470,6 +518,7 @@ impl CaptureControlHandle {
             session: None,
             release_requested: false,
             reaper_started: false,
+            adopted: true,
         });
         Ok(AudioOwnerLease { id, owner })
     }
@@ -871,6 +920,7 @@ mod tests {
         let HotkeyDispatch::Start(ticket) = handle.dispatch_hotkey(true, Instant::now()) else {
             panic!("initial press should dispatch start");
         };
+        handle.adopt_hotkey_capture(&ticket).unwrap();
         for _ in 0..100 {
             if calls.load(Ordering::Acquire) == 1 {
                 break;
@@ -917,6 +967,83 @@ mod tests {
     #[test]
     fn disabled_reconfiguration_keeps_toggle_stop_eligible() {
         disabled_reconfiguration_still_dispatches_stop(CaptureHotkeyMode::Toggle);
+    }
+
+    #[test]
+    fn stale_unadopted_ticket_is_revoked_before_worker_can_accept_audio() {
+        let (entered_tx, entered_rx) = unbounded();
+        let (cancelled_tx, cancelled_rx) = unbounded();
+        let (retire_tx, retire_rx) = unbounded();
+        let accepted_audio = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_accepted_audio = Arc::clone(&accepted_audio);
+        let controller =
+            CaptureController::with_start_capture(Arc::new(move |_request, cancellation| {
+                entered_tx.send(()).unwrap();
+                while !cancellation.is_cancelled() {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                cancelled_tx.send(()).unwrap();
+                retire_rx.recv().unwrap();
+                if !cancellation.is_cancelled() {
+                    worker_accepted_audio.store(true, Ordering::Release);
+                    return Ok(RecordingSession::simulated(
+                        None,
+                        CaptureStopReason::Explicit,
+                    ));
+                }
+                Err(CaptureError::StartupCancelled)
+            }))
+            .unwrap();
+        let handle = controller.handle();
+        handle
+            .reconfigure_hotkey(
+                true,
+                CaptureHotkeyMode::HoldToTalk,
+                30,
+                None,
+                CaptureOptions::default(),
+            )
+            .unwrap();
+        let HotkeyDispatch::Start(ticket) = handle.dispatch_hotkey(true, Instant::now()) else {
+            panic!("press should issue an unadopted ticket");
+        };
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        handle
+            .reconfigure_hotkey(
+                false,
+                CaptureHotkeyMode::HoldToTalk,
+                30,
+                None,
+                CaptureOptions::default(),
+            )
+            .unwrap();
+        cancelled_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        assert!(handle.adopt_hotkey_capture(&ticket).is_err());
+        assert_eq!(handle.owner(), Some(AudioOwnerKind::Capture));
+        assert!(matches!(
+            handle.reserve_owner(AudioOwnerKind::Playback),
+            Err(CaptureControlError::Owned(AudioOwnerKind::Capture))
+        ));
+        assert!(!accepted_audio.load(Ordering::Acquire));
+
+        retire_tx.send(()).unwrap();
+        for _ in 0..100 {
+            if handle.owner().is_none() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(handle.owner().is_none());
+        assert!(!accepted_audio.load(Ordering::Acquire));
+        let playback = handle.reserve_owner(AudioOwnerKind::Playback).unwrap();
+        handle.release(playback.id).unwrap();
+        assert!(controller.poll_events().into_iter().all(|event| !matches!(
+            event,
+            CaptureLifecycleEvent::Ready { capture_id, .. }
+                if capture_id == ticket.capture_id
+        )));
     }
 
     #[test]

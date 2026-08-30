@@ -4695,7 +4695,24 @@ impl LocalTranscriberApp {
             None
         };
         let ticket = match ticket {
-            Some(ticket) => ticket,
+            Some(ticket) => {
+                if self
+                    .capture_controller
+                    .handle()
+                    .adopt_hotkey_capture(&ticket)
+                    .is_err()
+                {
+                    self.capture_controller
+                        .handle()
+                        .terminate_capture(ticket.capture_id);
+                    let _ = self.session_coordinator.cancel_active();
+                    if let Some(target) = captured_target.as_ref() {
+                        crate::overlay::platform::release_captured_target(target);
+                    }
+                    return;
+                }
+                ticket
+            }
             None => match self.capture_controller.handle().start_capture(
                 audio::control::AudioOwnerKind::Capture,
                 activation_at,
@@ -5359,44 +5376,70 @@ impl LocalTranscriberApp {
     }
 
     fn poll_hotkey(&mut self) {
+        // Reconcile current app eligibility/config before adopting any ticket
+        // that the urgent callback issued while the UI thread was delayed.
+        self.sync_capture_controller_hotkey();
         for observed in self.hotkey_service.poll_events() {
-            if observed.event == HotkeyEvent::Pressed
-                && self.consume_armed_history_repaste(observed.observed_at)
-            {
-                continue;
+            self.process_hotkey_observation(observed);
+        }
+    }
+
+    fn process_hotkey_observation(&mut self, observed: crate::hotkey::ObservedHotkeyEvent) {
+        self.process_hotkey_observation_with(observed, |app, observed_at| {
+            app.consume_armed_history_repaste(observed_at)
+        });
+    }
+
+    fn process_hotkey_observation_with(
+        &mut self,
+        observed: crate::hotkey::ObservedHotkeyEvent,
+        consume_armed_repaste: impl FnOnce(&mut Self, Instant) -> bool,
+    ) {
+        let direct_start_id = match &observed.direct_dispatch {
+            audio::control::HotkeyDispatch::Start(ticket) => Some(ticket.capture_id),
+            audio::control::HotkeyDispatch::Stop { .. } | audio::control::HotkeyDispatch::None => {
+                None
             }
-            match observed.direct_dispatch {
-                audio::control::HotkeyDispatch::Start(ticket) => {
-                    self.pending_direct_capture = Some(ticket);
-                }
-                audio::control::HotkeyDispatch::Stop { capture_id } => {
-                    let _ = capture_id;
-                }
-                audio::control::HotkeyDispatch::None => {}
-            }
-            match hotkey_recording_action(
-                self.config.recording.hotkey_mode,
-                observed.event,
-                self.recording_source(),
-            ) {
-                Some(HotkeyRecordingAction::StartTranscribe) => self.start_recording_at(
-                    RecordingSource::Transcribe,
-                    observed.observed_at,
-                    TriggerObservation::HotkeyPoll,
-                ),
-                Some(HotkeyRecordingAction::Stop) => self.stop_recording(),
-                Some(HotkeyRecordingAction::Toggle) => {
-                    self.toggle_recording_at(observed.observed_at, TriggerObservation::HotkeyPoll)
-                }
-                None => {}
-            }
-            if let Some(ticket) = self.pending_direct_capture.take() {
-                let _ = self.capture_controller.handle().abort(ticket.capture_id);
-                let _ = self
-                    .capture_controller
+        };
+        if observed.event == HotkeyEvent::Pressed && self.armed_history_repaste.is_some() {
+            if let Some(capture_id) = direct_start_id {
+                self.capture_controller
                     .handle()
-                    .release(ticket.capture_id.0);
+                    .terminate_capture(capture_id);
             }
+            if consume_armed_repaste(self, observed.observed_at) {
+                return;
+            }
+        }
+        match observed.direct_dispatch {
+            audio::control::HotkeyDispatch::Start(ticket) => {
+                self.pending_direct_capture = Some(ticket);
+            }
+            audio::control::HotkeyDispatch::Stop { capture_id } => {
+                let _ = capture_id;
+            }
+            audio::control::HotkeyDispatch::None => return,
+        }
+        match hotkey_recording_action(
+            self.config.recording.hotkey_mode,
+            observed.event,
+            self.recording_source(),
+        ) {
+            Some(HotkeyRecordingAction::StartTranscribe) => self.start_recording_at(
+                RecordingSource::Transcribe,
+                observed.observed_at,
+                TriggerObservation::HotkeyPoll,
+            ),
+            Some(HotkeyRecordingAction::Stop) => self.stop_recording(),
+            Some(HotkeyRecordingAction::Toggle) => {
+                self.toggle_recording_at(observed.observed_at, TriggerObservation::HotkeyPoll)
+            }
+            None => {}
+        }
+        if let Some(ticket) = self.pending_direct_capture.take() {
+            self.capture_controller
+                .handle()
+                .terminate_capture(ticket.capture_id);
         }
     }
 
@@ -5754,6 +5797,7 @@ impl LocalTranscriberApp {
                     text,
                     expires_at: Instant::now() + Duration::from_secs(30),
                 });
+                self.sync_capture_controller_hotkey();
                 self.status_message = format!(
                     "Paste armed for history entry {id}. Focus the destination and press {} within 30 seconds.",
                     self.config.recording.hotkey
@@ -8366,6 +8410,13 @@ impl LocalTranscriberApp {
             return;
         }
         self.capturing_hotkey = true;
+        self.sync_capture_controller_hotkey();
+        self.hotkey_service.discard_pending_events();
+        if let Some(ticket) = self.pending_direct_capture.take() {
+            self.capture_controller
+                .handle()
+                .terminate_capture(ticket.capture_id);
+        }
         self.status_message = "Press the new hotkey combination. Press Escape or the recording shortcut card again to cancel.".to_owned();
         self.transcribe_notice = Some(TranscribeNotice::information(
             "Press the new shortcut now. Press Escape or activate the shortcut control again to cancel.",
@@ -8373,6 +8424,7 @@ impl LocalTranscriberApp {
     }
 
     fn cancel_hotkey_capture(&mut self) {
+        self.hotkey_service.discard_pending_events();
         self.capturing_hotkey = false;
         self.hotkey_input = self.config.recording.hotkey.clone();
         self.status_message = "Hotkey capture cancelled.".to_owned();
@@ -12981,12 +13033,11 @@ impl LocalTranscriberApp {
             }
             ScreenAction::OpenAudioSettings => self.open_system_audio_settings(),
             ScreenAction::ChangeShortcut => {
-                self.capturing_hotkey = !self.capturing_hotkey;
-                self.status_message = if self.capturing_hotkey {
-                    "Press the new hotkey combination. Press Capture again to cancel.".to_owned()
+                if self.capturing_hotkey {
+                    self.cancel_hotkey_capture();
                 } else {
-                    "Hotkey capture cancelled.".to_owned()
-                };
+                    self.start_hotkey_capture();
+                }
             }
             ScreenAction::SetAutoInsertTranscript(value) => {
                 self.config.output.auto_insert_transcript = value;
@@ -15636,6 +15687,126 @@ mod layout_tests {
             TriggerObservation::HotkeyPoll,
             HotkeyMode::HoldToTalk,
         ));
+    }
+
+    #[test]
+    fn armed_repaste_consumption_terminates_its_queued_direct_start() {
+        let mut app = test_app();
+        let (ticket, cancelled_rx, retire_tx, accepted_audio) =
+            install_delayed_direct_hotkey_ticket(&mut app);
+        let capture_id = ticket.capture_id;
+        app.apply_history_action(HistoryPageAction::ArmRepaste {
+            id: 42,
+            text: "paste once".to_owned(),
+        });
+        cancelled_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        app.process_hotkey_observation_with(
+            crate::hotkey::ObservedHotkeyEvent {
+                event: HotkeyEvent::Pressed,
+                observed_at: Instant::now(),
+                direct_dispatch: audio::control::HotkeyDispatch::Start(ticket),
+            },
+            |app, _| {
+                app.armed_history_repaste = None;
+                true
+            },
+        );
+
+        assert!(app.pending_direct_capture.is_none());
+        assert!(app.pending_recording.is_none());
+        assert_eq!(app.capture_control_id, None);
+        assert_eq!(
+            app.capture_controller
+                .handle()
+                .owner_id(audio::control::AudioOwnerKind::Capture),
+            Some(capture_id.0)
+        );
+        assert!(!accepted_audio.load(Ordering::Acquire));
+
+        retire_delayed_direct_hotkey_ticket(&mut app, retire_tx);
+        assert_eq!(
+            app.capture_controller
+                .handle()
+                .owner_id(audio::control::AudioOwnerKind::Capture),
+            None
+        );
+        assert!(!accepted_audio.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn stale_direct_start_cannot_be_adopted_after_eligibility_is_disabled() {
+        let mut app = test_app();
+        let (ticket, cancelled_rx, retire_tx, accepted_audio) =
+            install_delayed_direct_hotkey_ticket(&mut app);
+        app.capturing_hotkey = true;
+        app.sync_capture_controller_hotkey();
+        cancelled_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        app.capturing_hotkey = false;
+
+        app.process_hotkey_observation(crate::hotkey::ObservedHotkeyEvent {
+            event: HotkeyEvent::Pressed,
+            observed_at: Instant::now(),
+            direct_dispatch: audio::control::HotkeyDispatch::Start(ticket),
+        });
+
+        assert!(app.pending_direct_capture.is_none());
+        assert!(app.pending_recording.is_none());
+        assert!(app.active_recording.is_none());
+        assert_eq!(app.capture_control_id, None);
+        assert_eq!(app.session_coordinator.active_session_id(), None);
+        assert!(!accepted_audio.load(Ordering::Acquire));
+
+        retire_delayed_direct_hotkey_ticket(&mut app, retire_tx);
+        let playback = app
+            .capture_controller
+            .handle()
+            .reserve_owner(audio::control::AudioOwnerKind::Playback)
+            .unwrap();
+        app.capture_controller
+            .handle()
+            .release(playback.id)
+            .unwrap();
+        assert!(!accepted_audio.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn entering_shortcut_capture_revokes_direct_start_before_accepting_old_shortcut() {
+        let mut app = test_app();
+        let (_ticket, cancelled_rx, retire_tx, accepted_audio) =
+            install_delayed_direct_hotkey_ticket(&mut app);
+
+        app.start_hotkey_capture();
+        cancelled_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        assert!(app.capturing_hotkey);
+        assert!(matches!(
+            app.capture_controller
+                .handle()
+                .dispatch_hotkey(true, Instant::now()),
+            audio::control::HotkeyDispatch::None
+        ));
+        assert!(app.pending_direct_capture.is_none());
+        assert!(app.pending_recording.is_none());
+        assert!(!accepted_audio.load(Ordering::Acquire));
+
+        retire_delayed_direct_hotkey_ticket(&mut app, retire_tx);
+        assert!(
+            app.capture_controller
+                .handle()
+                .owner_id(audio::control::AudioOwnerKind::Capture)
+                .is_none()
+        );
+        let playback = app
+            .capture_controller
+            .handle()
+            .reserve_owner(audio::control::AudioOwnerKind::Playback)
+            .unwrap();
+        app.capture_controller
+            .handle()
+            .release(playback.id)
+            .unwrap();
+        assert!(!accepted_audio.load(Ordering::Acquire));
     }
 
     #[test]
@@ -20362,6 +20533,66 @@ mod layout_tests {
             .unwrap();
         app.capture_control_id = Some(ticket.capture_id);
         ticket.capture_id
+    }
+
+    fn install_delayed_direct_hotkey_ticket(
+        app: &mut LocalTranscriberApp,
+    ) -> (
+        audio::control::CaptureTicket,
+        Receiver<()>,
+        Sender<()>,
+        Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let (entered_tx, entered_rx) = bounded(1);
+        let (cancelled_tx, cancelled_rx) = bounded(1);
+        let (retire_tx, retire_rx) = bounded(1);
+        let accepted_audio = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_accepted_audio = Arc::clone(&accepted_audio);
+        app.capture_controller = audio::control::CaptureController::with_start_capture_for_test(
+            Arc::new(move |_request, cancellation| {
+                entered_tx.send(()).unwrap();
+                while !cancellation.is_cancelled() {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                cancelled_tx.send(()).unwrap();
+                retire_rx.recv().unwrap();
+                if !cancellation.is_cancelled() {
+                    worker_accepted_audio.store(true, Ordering::Release);
+                    return Ok(RecordingSession::simulated(
+                        None,
+                        CaptureStopReason::Explicit,
+                    ));
+                }
+                Err(CaptureError::StartupCancelled)
+            }),
+        )
+        .unwrap();
+        app.sync_capture_controller_hotkey();
+        let audio::control::HotkeyDispatch::Start(ticket) = app
+            .capture_controller
+            .handle()
+            .dispatch_hotkey(true, Instant::now())
+        else {
+            panic!("eligible hotkey should issue a direct Start ticket");
+        };
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        (ticket, cancelled_rx, retire_tx, accepted_audio)
+    }
+
+    fn retire_delayed_direct_hotkey_ticket(app: &mut LocalTranscriberApp, retire_tx: Sender<()>) {
+        retire_tx.send(()).unwrap();
+        for _ in 0..200 {
+            app.poll_capture_controller();
+            if app
+                .capture_controller
+                .handle()
+                .owner_id(audio::control::AudioOwnerKind::Capture)
+                .is_none()
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
     }
 
     fn test_app() -> LocalTranscriberApp {
