@@ -1053,6 +1053,14 @@ impl StableManagedDirectory {
 
     #[cfg(windows)]
     fn remove_exact_tree(self) -> Result<(), InstallError> {
+        self.remove_exact_tree_with_hook(|_| {})
+    }
+
+    #[cfg(windows)]
+    fn remove_exact_tree_with_hook(
+        self,
+        mut after_delete_pending: impl FnMut(&Path),
+    ) -> Result<(), InstallError> {
         self.revalidate_path_identity()?;
         self.revalidate_pinned_tree()?;
         let Self {
@@ -1078,7 +1086,11 @@ impl StableManagedDirectory {
         });
         for entry in pinned_entries {
             let entry_path = path.join(&entry.relative_path);
-            arm_open_windows_entry_for_exact_delete(&entry.file, &entry_path)?;
+            arm_open_windows_entry_for_exact_delete_with_hook(
+                &entry.file,
+                &entry_path,
+                &mut after_delete_pending,
+            )?;
             drop(entry.file);
             if path_entry_exists_no_follow(&entry_path)? {
                 return Err(InstallError::RecoveryRequired(format!(
@@ -1087,7 +1099,11 @@ impl StableManagedDirectory {
                 )));
             }
         }
-        arm_open_windows_entry_for_exact_delete(&directory, &path)?;
+        arm_open_windows_entry_for_exact_delete_with_hook(
+            &directory,
+            &path,
+            &mut after_delete_pending,
+        )?;
         // Delete-on-close applies to the exact opened identity. Keep its
         // parent pinned until the directory handle closes and absence is
         // confirmed, so an ancestor swap cannot redirect the check.
@@ -2618,20 +2634,31 @@ fn rename_open_windows_directory(directory: &File, destination: &Path) -> Result
 fn set_open_windows_entry_delete_pending(entry: &File, delete: bool) -> Result<(), InstallError> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
+        FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_DO_NOT_DELETE,
+        FILE_DISPOSITION_INFO_EX, FileDispositionInfoEx, SetFileInformationByHandle,
     };
 
-    let information = FILE_DISPOSITION_INFO {
-        DeleteFile: u8::from(delete),
+    // Use the extended disposition class deliberately. Unlike legacy
+    // FileDispositionInformation, whose documented contract permits only
+    // closing the handle after arming it, FileDispositionInformationEx
+    // explicitly supports both requesting and cancelling deletion. That lets
+    // the caller validate the stream set after delete-pending closes the ADS
+    // creation window and cancel without relying on undocumented behavior.
+    let information = FILE_DISPOSITION_INFO_EX {
+        Flags: if delete {
+            FILE_DISPOSITION_FLAG_DELETE
+        } else {
+            FILE_DISPOSITION_FLAG_DO_NOT_DELETE
+        },
     };
-    // SAFETY: `entry` owns a DELETE-capable handle and `information` is a
-    // valid fixed-size input structure for FileDispositionInfo.
+    // SAFETY: `entry` owns a DELETE-capable handle and `information` is the
+    // documented fixed-size input structure for FileDispositionInfoEx.
     let succeeded = unsafe {
         SetFileInformationByHandle(
             entry.as_raw_handle(),
-            FileDispositionInfo,
+            FileDispositionInfoEx,
             (&raw const information).cast(),
-            std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+            std::mem::size_of::<FILE_DISPOSITION_INFO_EX>() as u32,
         )
     };
     if succeeded == 0 {
@@ -2647,8 +2674,30 @@ fn set_open_windows_entry_delete_pending(entry: &File, delete: bool) -> Result<(
 
 #[cfg(windows)]
 fn arm_open_windows_entry_for_exact_delete(entry: &File, path: &Path) -> Result<(), InstallError> {
+    arm_open_windows_entry_for_exact_delete_with_hook(entry, path, |_| {})
+}
+
+#[cfg(windows)]
+fn arm_open_windows_entry_for_exact_delete_with_hook(
+    entry: &File,
+    path: &Path,
+    after_delete_pending: impl FnOnce(&Path),
+) -> Result<(), InstallError> {
+    // Retain a second, read-only handle to the same identity before arming.
+    // Stream enumeration after delete-pending uses this observer, never the
+    // handle that changed disposition state.
+    let (observer, metadata) = open_windows_entry_probe(path)?;
+    if runtime_metadata_is_link_or_reparse(&metadata)
+        || opened_file_identity(&observer)? != opened_file_identity(entry)?
+    {
+        return Err(InstallError::RecoveryRequired(format!(
+            "could not bind final named-stream validation to the exact opened identity: {}",
+            path.display()
+        )));
+    }
     set_open_windows_entry_delete_pending(entry, true)?;
-    match opened_windows_entry_has_named_streams(entry) {
+    after_delete_pending(path);
+    match opened_windows_entry_has_named_streams(&observer) {
         Ok(false) => Ok(()),
         Ok(true) => {
             let disarm = set_open_windows_entry_delete_pending(entry, false).err();
@@ -6058,6 +6107,40 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    fn open_held_named_stream(path: &Path, name: &str, bytes: &[u8]) -> Option<File> {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Foundation::{ERROR_INVALID_NAME, ERROR_NOT_SUPPORTED};
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+        let stream = named_stream_path(path, name);
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .write(true)
+            .create_new(true)
+            // Deliberately omit FILE_SHARE_DELETE. Deleting the containing
+            // identity must fail closed while this stream handle is live.
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
+        let mut file = match options.open(&stream) {
+            Ok(file) => file,
+            Err(error)
+                if error.raw_os_error().map(|code| code as u32) == Some(ERROR_INVALID_NAME)
+                    || error.raw_os_error().map(|code| code as u32)
+                        == Some(ERROR_NOT_SUPPORTED) =>
+            {
+                return None;
+            }
+            Err(error) => panic!(
+                "could not open held named-stream fixture {}: {error}",
+                stream.display()
+            ),
+        };
+        file.write_all(bytes).unwrap();
+        file.flush().unwrap();
+        Some(file)
+    }
+
     #[test]
     fn disk_space_preflight_accounts_for_resumable_partial_bytes() {
         assert_eq!(additional_download_bytes(100, 0).unwrap(), 100);
@@ -7806,6 +7889,107 @@ mod tests {
                 fs::read(named_stream_path(&stream_owner, "late-unowned")).unwrap(),
                 b"must survive"
             );
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn delete_pending_closes_the_final_named_stream_race_on_root_and_children() {
+        for stream_on_root in [false, true] {
+            let root = unique_root(if stream_on_root {
+                "stable-post-arm-root-named-stream"
+            } else {
+                "stable-post-arm-child-named-stream"
+            });
+            let target = root.join("managed-onnx");
+            fs::create_dir_all(&target).unwrap();
+            fs::write(target.join("model.onnx"), b"owned-model").unwrap();
+            let capability = StableManagedDirectory::open_exact(&target, &target).unwrap();
+            let mut removal = ManagedRemoval::stage_stable_directory(
+                capability,
+                format!("{:x}", Sha256::digest(b"prior-config")),
+            )
+            .unwrap();
+            let tombstone = removal.pin_stable_tree().unwrap();
+            let stream_owner = if stream_on_root {
+                tombstone.clone()
+            } else {
+                tombstone.join("model.onnx")
+            };
+            let capability = removal.stable_directory.take().unwrap();
+            let mut injection_attempted = false;
+
+            capability
+                .remove_exact_tree_with_hook(|armed_path| {
+                    if armed_path == stream_owner {
+                        injection_attempted = true;
+                        let stream = named_stream_path(armed_path, "post-arm-unowned");
+                        assert!(
+                            fs::write(&stream, b"must not be created").is_err(),
+                            "delete-pending must reject a named stream created in the final validation window"
+                        );
+                    }
+                })
+                .unwrap();
+
+            assert!(injection_attempted);
+            assert!(!tombstone.exists());
+            drop(removal);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn held_named_stream_without_delete_sharing_blocks_exact_deletion() {
+        for stream_on_root in [false, true] {
+            let root = unique_root(if stream_on_root {
+                "stable-held-root-named-stream"
+            } else {
+                "stable-held-child-named-stream"
+            });
+            let target = root.join("managed-onnx");
+            fs::create_dir_all(&target).unwrap();
+            fs::write(target.join("model.onnx"), b"owned-model").unwrap();
+            let stream_owner = if stream_on_root {
+                target.clone()
+            } else {
+                target.join("model.onnx")
+            };
+            let Some(mut held_stream) =
+                open_held_named_stream(&stream_owner, "held-unowned", b"must survive")
+            else {
+                fs::remove_dir_all(root).unwrap();
+                return;
+            };
+            if stream_on_root {
+                assert!(
+                    StableManagedDirectory::open_exact(&target, &target).is_err(),
+                    "a root ADS handle without delete sharing must block deletion authority"
+                );
+            } else {
+                let capability = StableManagedDirectory::open_exact(&target, &target).unwrap();
+                assert!(
+                    ManagedRemoval::stage_stable_directory(
+                        capability,
+                        format!("{:x}", Sha256::digest(b"prior-config")),
+                    )
+                    .is_err(),
+                    "a child ADS handle without delete sharing must block removal staging"
+                );
+            }
+            let active_stream_owner = if stream_on_root {
+                stream_owner
+            } else {
+                target.join("model.onnx")
+            };
+            assert!(active_stream_owner.exists());
+            held_stream.rewind().unwrap();
+            let mut stream_bytes = Vec::new();
+            held_stream.read_to_end(&mut stream_bytes).unwrap();
+            assert_eq!(stream_bytes, b"must survive");
+            drop(held_stream);
             fs::remove_dir_all(root).unwrap();
         }
     }
