@@ -37,6 +37,22 @@ fn main() {
     }
 }
 
+fn validated_macos_keychain_access_group() -> Option<String> {
+    const NAME: &str = "SCRIBE_MACOS_GPU_ROLLBACK_KEYCHAIN_ACCESS_GROUP";
+    println!("cargo:rerun-if-env-changed={NAME}");
+    let value = std::env::var(NAME).ok().filter(|value| !value.is_empty())?;
+    let (team_id, suffix) = value.split_at_checked(10).unwrap_or(("", ""));
+    assert!(
+        suffix == ".com.scribe.local-transcriber"
+            && team_id
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit()),
+        "{NAME} must match TEAMID.com.scribe.local-transcriber with a 10-character uppercase alphanumeric Team ID"
+    );
+    println!("cargo:rustc-env={NAME}={value}");
+    Some(value)
+}
+
 fn embed_gpu_pack_release_authority() {
     const DEFAULT_AUTHORITY: &str = "runtime-manifests/gpu-pack-release-authority-macos-empty.json";
     const MAX_AUTHORITY_BYTES: usize = 512 * 1024;
@@ -103,6 +119,8 @@ fn prepare_macos_native_shims() {
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let metal_enabled = std::env::var_os("CARGO_FEATURE_METAL_ACCELERATION").is_some();
     let building_worker = std::env::var("SCRIBE_BUILDING_WORKER").ok();
+    let _keychain_access_group = validated_macos_keychain_access_group();
+    println!("cargo:rustc-check-cfg=cfg(scribe_macos_keychain_authority)");
     assert!(
         !metal_enabled || target_os == "macos",
         "metal-acceleration requires a macOS target"
@@ -130,6 +148,19 @@ fn prepare_macos_native_shims() {
     println!("cargo:rustc-link-lib=framework=CoreFoundation");
     println!("cargo:rustc-link-lib=framework=IOKit");
     println!("cargo:rustc-link-arg=-mmacosx-version-min={deployment_target}");
+
+    if building_worker.as_deref() != Some("1") {
+        println!("cargo:rerun-if-changed=native/scribe_macos_keychain_epoch.h");
+        println!("cargo:rerun-if-changed=native/scribe_macos_keychain_epoch.c");
+        cc::Build::new()
+            .file("native/scribe_macos_keychain_epoch.c")
+            .include("native")
+            .flag(&format!("-mmacosx-version-min={deployment_target}"))
+            .warnings(true)
+            .compile("scribe_macos_keychain_epoch");
+        println!("cargo:rustc-cfg=scribe_macos_keychain_authority");
+        println!("cargo:rustc-link-lib=framework=Security");
+    }
 
     if !metal_enabled {
         return;
