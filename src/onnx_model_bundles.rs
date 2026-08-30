@@ -2117,6 +2117,12 @@ pub(crate) struct OnnxBundleRemoval {
     settings_guard: Option<crate::config::settings::SettingsTransaction>,
 }
 
+struct OnnxRemovalTransactionWitness {
+    prior_config_fingerprint: String,
+    expected_config_fingerprint: String,
+    transaction_nonce: String,
+}
+
 impl OnnxBundleRemoval {
     pub(crate) fn removed_files(&self) -> bool {
         self.removal.removed_files()
@@ -2194,9 +2200,11 @@ pub(crate) fn stage_onnx_bundle_removal(
         storage_root,
         model_id,
         expected_receipt_sha256,
-        prior_config_fingerprint,
-        expected_config_fingerprint,
-        transaction_nonce,
+        OnnxRemovalTransactionWitness {
+            prior_config_fingerprint,
+            expected_config_fingerprint,
+            transaction_nonce,
+        },
         true,
         verified_owned_removal_candidate_at,
     )
@@ -2206,15 +2214,13 @@ fn stage_onnx_bundle_removal_with(
     storage_root: &Path,
     model_id: &str,
     expected_receipt_sha256: &str,
-    prior_config_fingerprint: String,
-    expected_config_fingerprint: String,
-    transaction_nonce: String,
+    transaction: OnnxRemovalTransactionWitness,
     enforce_durable_settings: bool,
     verify: impl Fn(&str, &Path) -> Result<VerifiedOnnxRemovalCandidate, InstallError>,
 ) -> Result<OnnxBundleRemoval, InstallError> {
     validate_sha256(expected_receipt_sha256)?;
-    validate_sha256(&expected_config_fingerprint)?;
-    validate_sha256(&transaction_nonce)?;
+    validate_sha256(&transaction.expected_config_fingerprint)?;
+    validate_sha256(&transaction.transaction_nonce)?;
     let target_root = bundle_target_root(storage_root, model_id)?;
     let target_guard = acquire_bundle_target(&target_root)?;
     let settings_guard = enforce_durable_settings
@@ -2226,7 +2232,7 @@ fn stage_onnx_bundle_removal_with(
                 .as_ref()
                 .expect("enforced settings must hold its transaction"),
         )?
-        .eq_ignore_ascii_case(&prior_config_fingerprint)
+        .eq_ignore_ascii_case(&transaction.prior_config_fingerprint)
     {
         return Err(failed(
             "durable artifact settings changed before ONNX removal staging; reopen the confirmation",
@@ -2249,10 +2255,10 @@ fn stage_onnx_bundle_removal_with(
     }
     let mut removal = ManagedRemoval::stage_stable_directory_with_ownership(
         capability,
-        prior_config_fingerprint,
-        expected_config_fingerprint,
+        transaction.prior_config_fingerprint,
+        transaction.expected_config_fingerprint,
         candidate.receipt_sha256().to_owned(),
-        transaction_nonce,
+        transaction.transaction_nonce,
     )?;
     let pinned_verification = (|| {
         let pinned_path = removal.pin_stable_tree()?;
@@ -2500,19 +2506,16 @@ fn reconcile_onnx_bundle_removal_with(
         durable_pending
             .as_ref()
             .map(|pending| pending.transaction_nonce.as_str()),
-        true,
     )?;
-    if reconciled
-        && durable_pending.is_some()
+    if let Some(pending) = durable_pending.as_ref()
+        && reconciled
         && !crate::installations::path_entry_exists_no_follow(&target_root)?
         && !crate::installations::path_entry_exists_no_follow(&tombstone)?
         && !crate::installations::path_entry_exists_no_follow(&journal)?
     {
         clear_pending_onnx_removal(
             model_id,
-            durable_pending
-                .as_ref()
-                .expect("pending witness was checked"),
+            pending,
             &locked_fingerprint,
             settings_guard.as_ref(),
             durable_config.as_mut(),
@@ -3441,9 +3444,11 @@ mod tests {
             &storage,
             model_id,
             &"00".repeat(32),
-            format!("{:x}", Sha256::digest(b"prior-config")),
-            format!("{:x}", Sha256::digest(b"expected-config")),
-            nonce.clone(),
+            OnnxRemovalTransactionWitness {
+                prior_config_fingerprint: format!("{:x}", Sha256::digest(b"prior-config")),
+                expected_config_fingerprint: format!("{:x}", Sha256::digest(b"expected-config")),
+                transaction_nonce: nonce.clone(),
+            },
             false,
             |expected, root| {
                 verified_removal_candidate_at_with_manifest_for_test(expected, root, &manifest)
@@ -3460,9 +3465,14 @@ mod tests {
                 &storage,
                 model_id,
                 authorized.receipt_sha256(),
-                format!("{:x}", Sha256::digest(b"prior-config")),
-                format!("{:x}", Sha256::digest(b"expected-config")),
-                nonce.clone(),
+                OnnxRemovalTransactionWitness {
+                    prior_config_fingerprint: format!("{:x}", Sha256::digest(b"prior-config")),
+                    expected_config_fingerprint: format!(
+                        "{:x}",
+                        Sha256::digest(b"expected-config")
+                    ),
+                    transaction_nonce: nonce.clone(),
+                },
                 false,
                 |expected, root| {
                     verified_removal_candidate_at_with_manifest_for_test(expected, root, &manifest)
@@ -3485,9 +3495,11 @@ mod tests {
             &storage,
             model_id,
             authorized.receipt_sha256(),
-            format!("{:x}", Sha256::digest(b"prior-config")),
-            format!("{:x}", Sha256::digest(b"expected-config")),
-            nonce,
+            OnnxRemovalTransactionWitness {
+                prior_config_fingerprint: format!("{:x}", Sha256::digest(b"prior-config")),
+                expected_config_fingerprint: format!("{:x}", Sha256::digest(b"expected-config")),
+                transaction_nonce: nonce,
+            },
             false,
             |expected, root| {
                 verified_removal_candidate_at_with_manifest_for_test(expected, root, &manifest)
@@ -3528,9 +3540,11 @@ mod tests {
             &restore_storage,
             model_id,
             restore_candidate.receipt_sha256(),
-            prior.clone(),
-            expected.clone(),
-            nonce,
+            OnnxRemovalTransactionWitness {
+                prior_config_fingerprint: prior.clone(),
+                expected_config_fingerprint: expected.clone(),
+                transaction_nonce: nonce,
+            },
             false,
             |expected, root| {
                 verified_removal_candidate_at_with_manifest_for_test(expected, root, &manifest)
@@ -3645,9 +3659,11 @@ mod tests {
             &commit_storage,
             model_id,
             commit_candidate.receipt_sha256(),
-            prior,
-            expected.clone(),
-            nonce,
+            OnnxRemovalTransactionWitness {
+                prior_config_fingerprint: prior,
+                expected_config_fingerprint: expected.clone(),
+                transaction_nonce: nonce,
+            },
             false,
             |expected, root| {
                 verified_removal_candidate_at_with_manifest_for_test(expected, root, &manifest)
@@ -3707,9 +3723,11 @@ mod tests {
             &storage,
             model_id,
             candidate.receipt_sha256(),
-            format!("{:x}", Sha256::digest(b"attacker-prior")),
-            durable_fingerprint.clone(),
-            nonce,
+            OnnxRemovalTransactionWitness {
+                prior_config_fingerprint: format!("{:x}", Sha256::digest(b"attacker-prior")),
+                expected_config_fingerprint: durable_fingerprint.clone(),
+                transaction_nonce: nonce,
+            },
             false,
             |expected, root| {
                 verified_removal_candidate_at_with_manifest_for_test(expected, root, &manifest)
@@ -3778,9 +3796,11 @@ mod tests {
                 &storage,
                 model_id,
                 candidate.receipt_sha256(),
-                prior,
-                pending_fingerprint.clone(),
-                nonce,
+                OnnxRemovalTransactionWitness {
+                    prior_config_fingerprint: prior,
+                    expected_config_fingerprint: pending_fingerprint.clone(),
+                    transaction_nonce: nonce,
+                },
                 false,
                 |expected, root| {
                     verified_removal_candidate_at_with_manifest_for_test(expected, root, &manifest)

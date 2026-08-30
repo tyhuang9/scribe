@@ -1599,7 +1599,6 @@ pub(crate) fn reconcile_stable_directory_removal(
     durable_installed_ownership_sha256: Option<&str>,
     durable_pending_ownership_sha256: Option<&str>,
     durable_pending_transaction_nonce: Option<&str>,
-    require_ownership_sha256: bool,
 ) -> Result<bool, InstallError> {
     validate_sha256(durable_config_fingerprint)?;
     let tombstone = removal_tombstone_path(target)?;
@@ -1628,8 +1627,7 @@ pub(crate) fn reconcile_stable_directory_removal(
             journal_path.display()
         ))
     })?;
-    let expected_schema_version = if require_ownership_sha256 { 3 } else { 1 };
-    if journal.schema_version != expected_schema_version
+    if journal.schema_version != 3
         || canonicalize_missing(&journal.target)? != canonicalize_missing(target)?
     {
         return Err(InstallError::RecoveryRequired(format!(
@@ -1648,13 +1646,13 @@ pub(crate) fn reconcile_stable_directory_removal(
     if let Some(transaction_nonce) = journal.transaction_nonce.as_deref() {
         validate_sha256(transaction_nonce)?;
     }
-    if require_ownership_sha256 && journal.ownership_sha256.is_none() {
+    if journal.ownership_sha256.is_none() {
         return Err(InstallError::RecoveryRequired(format!(
             "stable removal journal {} has no exact artifact ownership witness",
             journal_path.display()
         )));
     }
-    if require_ownership_sha256 && journal.transaction_nonce.is_none() {
+    if journal.transaction_nonce.is_none() {
         return Err(InstallError::RecoveryRequired(format!(
             "stable removal journal {} has no transaction nonce",
             journal_path.display()
@@ -1672,7 +1670,7 @@ pub(crate) fn reconcile_stable_directory_removal(
                 journal_path.display()
             )));
         }
-    } else if require_ownership_sha256 && capability.is_some() {
+    } else if capability.is_some() {
         return Err(InstallError::RecoveryRequired(format!(
             "opened stable removal artifact at {} has no verified ownership digest",
             target.display()
@@ -1691,34 +1689,32 @@ pub(crate) fn reconcile_stable_directory_removal(
             target.display()
         )));
     }
-    if require_ownership_sha256 {
-        let journal_ownership = journal
-            .ownership_sha256
-            .as_deref()
-            .expect("required ownership was checked");
-        if durable_is_prior {
-            if !durable_installed_ownership_sha256
-                .is_some_and(|value| value.eq_ignore_ascii_case(journal_ownership))
-            {
-                return Err(InstallError::RecoveryRequired(format!(
-                    "durable settings do not authorize rollback of ONNX removal {}",
-                    target.display()
-                )));
-            }
-        } else if !durable_pending_ownership_sha256
+    let journal_ownership = journal
+        .ownership_sha256
+        .as_deref()
+        .expect("required ownership was checked");
+    if durable_is_prior {
+        if !durable_installed_ownership_sha256
             .is_some_and(|value| value.eq_ignore_ascii_case(journal_ownership))
-            || !durable_pending_transaction_nonce.is_some_and(|value| {
-                journal
-                    .transaction_nonce
-                    .as_deref()
-                    .is_some_and(|nonce| nonce.eq_ignore_ascii_case(value))
-            })
         {
             return Err(InstallError::RecoveryRequired(format!(
-                "durable settings do not authorize committed ONNX removal {}",
+                "durable settings do not authorize rollback of ONNX removal {}",
                 target.display()
             )));
         }
+    } else if !durable_pending_ownership_sha256
+        .is_some_and(|value| value.eq_ignore_ascii_case(journal_ownership))
+        || !durable_pending_transaction_nonce.is_some_and(|value| {
+            journal
+                .transaction_nonce
+                .as_deref()
+                .is_some_and(|nonce| nonce.eq_ignore_ascii_case(value))
+        })
+    {
+        return Err(InstallError::RecoveryRequired(format!(
+            "durable settings do not authorize committed ONNX removal {}",
+            target.display()
+        )));
     }
     if target_exists && tombstone_exists {
         return Err(InstallError::RecoveryRequired(format!(
@@ -1893,7 +1889,7 @@ pub(crate) fn discover_managed_removal_targets(
                             path.display()
                         ))
                     })?;
-                if !matches!(journal.schema_version, 1 | 2 | 3)
+                if !matches!(journal.schema_version, 1..=3)
                     || (journal.schema_version >= 2 && journal.ownership_sha256.is_none())
                     || (journal.schema_version == 3 && journal.transaction_nonce.is_none())
                 {
@@ -8120,7 +8116,6 @@ mod tests {
             None,
             Some(&ownership),
             Some(&nonce),
-            true,
         )
         .unwrap_err();
         assert!(error.to_string().contains("child set changed"));
