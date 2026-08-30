@@ -88,7 +88,13 @@ if [[ -n "${SCRIBE_MACOS_TEST_BUNDLE:-}" ]]; then
     case "$attack" in
       symlink) ln -s /tmp "$app/Contents/Resources/escape" ;;
       hardlink) ln "$app/Contents/MacOS/Scribe" "$app/Contents/Resources/linked-Scribe" ;;
-      case) cp "$app/Contents/Resources/worker-pack-catalog.json" "$app/Contents/Resources/Worker-pack-catalog.json" ;;
+      case)
+        catalog="$app/Contents/Resources/worker-pack-catalog.json"
+        alternate="$app/Contents/Resources/Worker-pack-catalog.json"
+        intermediate="$app/Contents/Resources/worker-pack-catalog.case-test"
+        mv "$catalog" "$intermediate"
+        mv "$intermediate" "$alternate"
+        ;;
       apple-double) : >"$app/Contents/Resources/._worker-pack-catalog.json" ;;
       resource-fork) xattr -w com.apple.ResourceFork test "$app/Contents/Resources/worker-pack-catalog.json" ;;
       tamper) printf x >>"$app/Contents/MacOS/Scribe" ;;
