@@ -5360,6 +5360,22 @@ impl LocalTranscriberApp {
                     }
                 }
             }
+            Err(CaptureError::Discarded) => {
+                capture.latency.capture_finalized_at = Some(Instant::now());
+                self.record_session_diagnostic(
+                    session_id,
+                    &capture.latency,
+                    DiagnosticSessionOutcome::Cancelled,
+                    None,
+                );
+                self.latest_latency =
+                    self.merged_overlay_latency(session_id, Some(capture.latency));
+                let _ = self.session_coordinator.cancel_active();
+                self.retire_captured_target(session_id);
+                let _ = self.overlay_controller.hide(session_id);
+                self.status = TranscriptionStatus::Idle;
+                self.status_message = "Recording cancelled".to_owned();
+            }
             Err(error) => {
                 capture.latency.capture_finalized_at = Some(Instant::now());
                 self.record_session_diagnostic(

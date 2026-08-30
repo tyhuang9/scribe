@@ -838,7 +838,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::audio::CaptureStopReason;
+    use crate::audio::{ABORT_STREAM_DROP_BUDGET, CaptureStopReason};
 
     fn controller_with_counter(calls: Arc<AtomicUsize>) -> CaptureController {
         CaptureController::with_start_capture(Arc::new(move |_request, cancellation| {
@@ -859,6 +859,91 @@ mod tests {
 
         assert_eq!(calls.load(Ordering::Relaxed), 0);
         assert!(controller.handle().owner().is_none());
+    }
+
+    fn assert_abort_bypasses_normal_finalization(during_post_roll: bool) {
+        let (probe_tx, probe_rx) = unbounded();
+        let controller = CaptureController::with_start_capture(Arc::new(move |_request, _| {
+            let (session, probe) = RecordingSession::simulated_with_abort_probe(
+                None,
+                CaptureStopReason::Explicit,
+                Duration::from_secs(2),
+            );
+            probe_tx.send(probe).unwrap();
+            Ok(session)
+        }))
+        .unwrap();
+        let handle = controller.handle();
+        let ticket = handle
+            .start_capture(
+                AudioOwnerKind::Capture,
+                Instant::now(),
+                30,
+                None,
+                CaptureOptions::default(),
+            )
+            .unwrap();
+        let probe = probe_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let ready = (0..200).any(|_| {
+            let ready = controller.poll_events().into_iter().any(|event| {
+                matches!(
+                    event,
+                    CaptureLifecycleEvent::Ready { capture_id, .. }
+                        if capture_id == ticket.capture_id
+                )
+            });
+            if !ready {
+                thread::sleep(Duration::from_millis(1));
+            }
+            ready
+        });
+        assert!(ready);
+
+        if during_post_roll {
+            handle.stop(ticket.capture_id).unwrap();
+            for _ in 0..200 {
+                if probe.post_roll_entered.load(Ordering::Acquire) {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert!(probe.post_roll_entered.load(Ordering::Acquire));
+        }
+
+        let aborted_at = Instant::now();
+        handle.abort(ticket.capture_id).unwrap();
+        assert!(probe.preview_invalidated.load(Ordering::Acquire));
+        handle.release(ticket.capture_id.0).unwrap();
+        if handle.owner().is_some() {
+            assert!(matches!(
+                handle.reserve_owner(AudioOwnerKind::Playback),
+                Err(CaptureControlError::Owned(AudioOwnerKind::Capture))
+            ));
+        }
+        for _ in 0..250 {
+            if handle.owner().is_none() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        assert!(handle.owner().is_none());
+        assert!(aborted_at.elapsed() < ABORT_STREAM_DROP_BUDGET);
+        assert!(probe.stream_dropped.load(Ordering::Acquire));
+        assert!(!probe.finish_called.load(Ordering::Acquire));
+        assert!(!probe.terminal_preview_called.load(Ordering::Acquire));
+        let playback = handle.reserve_owner(AudioOwnerKind::Playback).unwrap();
+        handle.release(playback.id).unwrap();
+    }
+
+    #[test]
+    fn abort_during_active_drain_drops_stream_without_normal_finalization() {
+        assert_abort_bypasses_normal_finalization(false);
+    }
+
+    #[test]
+    fn abort_during_two_second_post_roll_drops_stream_without_normal_finalization() {
+        assert_abort_bypasses_normal_finalization(true);
     }
 
     #[test]
@@ -1138,13 +1223,17 @@ mod tests {
     fn release_before_start_result_admission_emits_terminal_release() {
         let (entered_tx, entered_rx) = unbounded();
         let (continue_tx, continue_rx) = unbounded();
+        let (probe_tx, probe_rx) = unbounded();
         let controller = CaptureController::with_start_capture(Arc::new(move |_request, _| {
             entered_tx.send(()).unwrap();
             continue_rx.recv().unwrap();
-            Ok(RecordingSession::simulated(
+            let (session, probe) = RecordingSession::simulated_with_abort_probe(
                 None,
                 CaptureStopReason::Explicit,
-            ))
+                Duration::from_secs(2),
+            );
+            probe_tx.send(probe).unwrap();
+            Ok(session)
         }))
         .unwrap();
         let handle = controller.handle();
@@ -1162,6 +1251,7 @@ mod tests {
         handle.abort(ticket.capture_id).unwrap();
         handle.release(ticket.capture_id.0).unwrap();
         continue_tx.send(()).unwrap();
+        let probe = probe_rx.recv_timeout(Duration::from_secs(1)).unwrap();
 
         let released = (0..200).find_map(|_| {
             let event = controller.poll_events().into_iter().find(|event| {
@@ -1178,6 +1268,15 @@ mod tests {
         });
         assert!(released.is_some());
         assert!(handle.owner().is_none());
+        assert!(probe.stream_dropped.load(Ordering::Acquire));
+        assert!(probe.preview_invalidated.load(Ordering::Acquire));
+        assert!(!probe.finish_called.load(Ordering::Acquire));
+        assert!(!probe.terminal_preview_called.load(Ordering::Acquire));
+        assert!(controller.poll_events().into_iter().all(|event| !matches!(
+            event,
+            CaptureLifecycleEvent::Ready { capture_id, .. }
+                if capture_id == ticket.capture_id
+        )));
     }
 
     #[test]

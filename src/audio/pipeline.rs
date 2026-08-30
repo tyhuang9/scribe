@@ -391,6 +391,20 @@ impl Pipeline {
         self.vad.cancel_detector()
     }
 
+    pub(super) fn discard(&mut self) {
+        self.invalidate_preview();
+        self.prepared.fill(0.0);
+        self.prepared.clear();
+        self.channel_sum = 0.0;
+        self.channel_samples = 0;
+        self.resampler.previous = 0.0;
+        if let Some(gate) = self.manual_gate.as_mut() {
+            gate.samples.fill(0.0);
+            gate.count = 0;
+        }
+        self.vad.discard();
+    }
+
     pub(super) fn invalidate_preview(&mut self) {
         if let Some(slot) = self.preview_slot.take() {
             slot.close();
@@ -987,6 +1001,14 @@ impl VadTracker {
         }
         self.detector = None;
         Ok(())
+    }
+
+    fn discard(&mut self) {
+        self.window.fill(0.0);
+        self.window_samples = 0;
+        self.detector = None;
+        self.rescue_run = None;
+        self.rescue_candidate = None;
     }
 }
 
@@ -2030,7 +2052,13 @@ mod tests {
         }
         assert!(state.lock().unwrap().windows.is_empty());
 
-        super::super::drain_ring_bounded(&mut consumer, &mut pipeline, WINDOW_SAMPLES).unwrap();
+        super::super::drain_ring_bounded(
+            &mut consumer,
+            &mut pipeline,
+            WINDOW_SAMPLES,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
         assert_eq!(state.lock().unwrap().windows.len(), 1);
     }
 

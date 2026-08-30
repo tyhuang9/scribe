@@ -29,6 +29,8 @@ const MAX_RING_SAMPLES: usize = 2_000_000;
 const MAX_STREAM_RESTARTS: u32 = 2;
 const MAX_DRAIN_SAMPLES_PER_TICK: usize = 4_096;
 const STREAM_RESTART_BACKOFF: Duration = Duration::from_millis(50);
+#[cfg(test)]
+pub(crate) const ABORT_STREAM_DROP_BUDGET: Duration = Duration::from_millis(250);
 const MAX_CAPTURE_PREPARED_FRAMES: usize = 16_000
     * (config::MAX_RECORDING_SECONDS as usize
         + config::RECORDING_CAPTURE_SAFETY_ALLOWANCE_SECONDS as usize);
@@ -384,6 +386,8 @@ pub enum CaptureError {
     StartTimeout(Duration),
     #[error("microphone startup was cancelled")]
     StartupCancelled,
+    #[error("audio capture was discarded")]
+    Discarded,
     #[error("audio recorder did not stop within {0:?}")]
     StopTimeout(Duration),
     #[error("audio recorder worker disconnected unexpectedly")]
@@ -411,7 +415,8 @@ trait SpeechDetectorFactory: Send + Sync {
     fn acquire(
         &self,
         threshold: VadThreshold,
-        cancelled: &AtomicBool,
+        startup_cancelled: &AtomicBool,
+        discard_requested: Arc<AtomicBool>,
     ) -> Result<Box<dyn SpeechDetector>, CaptureError>;
 }
 
@@ -422,6 +427,7 @@ struct WorkerSpeechDetector {
     session_id: u64,
     next_request_id: u64,
     active: bool,
+    discard_requested: Arc<AtomicBool>,
 }
 
 static NEXT_VAD_SESSION_ID: AtomicU64 = AtomicU64::new(1);
@@ -468,17 +474,24 @@ impl SpeechDetectorFactory for WorkerSpeechDetectorFactory {
     fn acquire(
         &self,
         threshold: VadThreshold,
-        cancelled: &AtomicBool,
+        startup_cancelled: &AtomicBool,
+        discard_requested: Arc<AtomicBool>,
     ) -> Result<Box<dyn SpeechDetector>, CaptureError> {
         let session_id = NEXT_VAD_SESSION_ID.fetch_add(1, Ordering::Relaxed).max(1);
-        let (supervisor, next_request_id) =
-            SileroVadWorkerSupervisor::acquire_session(session_id, 1, 1, threshold, cancelled)
-                .map_err(WorkerSpeechDetector::vad_error)?;
+        let (supervisor, next_request_id) = SileroVadWorkerSupervisor::acquire_session(
+            session_id,
+            1,
+            1,
+            threshold,
+            startup_cancelled,
+        )
+        .map_err(WorkerSpeechDetector::vad_error)?;
         let detector = WorkerSpeechDetector {
             supervisor,
             session_id,
             next_request_id,
             active: true,
+            discard_requested,
         };
         Ok(Box::new(detector))
     }
@@ -491,7 +504,12 @@ impl SpeechDetector for WorkerSpeechDetector {
     ) -> Result<SileroVadDecision, CaptureError> {
         let request_id = self.request_id();
         self.supervisor
-            .compute(self.session_id, request_id, samples)
+            .compute_with_cancellation(
+                self.session_id,
+                request_id,
+                samples,
+                Some(self.discard_requested.as_ref()),
+            )
             .map_err(Self::vad_error)
     }
 
@@ -536,9 +554,20 @@ pub struct RecordingSession {
     inner: Arc<RecordingSessionInner>,
 }
 
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct SimulatedCaptureProbe {
+    pub(crate) stream_dropped: Arc<AtomicBool>,
+    pub(crate) finish_called: Arc<AtomicBool>,
+    pub(crate) terminal_preview_called: Arc<AtomicBool>,
+    pub(crate) preview_invalidated: Arc<AtomicBool>,
+    pub(crate) post_roll_entered: Arc<AtomicBool>,
+}
+
 struct RecordingSessionInner {
     stop_requested: Arc<AtomicBool>,
     discard_requested: Arc<AtomicBool>,
+    abort_action: Arc<dyn Fn() + Send + Sync>,
     finished_rx: Receiver<Result<CaptureCompletion, CaptureError>>,
     rms_bits: Arc<AtomicU32>,
     peak_bits: Arc<AtomicU32>,
@@ -554,6 +583,7 @@ impl RecordingSession {
 
     pub(crate) fn abort(&self) {
         self.inner.discard_requested.store(true, Ordering::Release);
+        (self.inner.abort_action)();
         self.stop();
     }
 
@@ -588,6 +618,7 @@ impl RecordingSession {
         self.abort();
         let result = match self.inner.finished_rx.recv_timeout(timeout) {
             Ok(Ok(_completion)) => Ok(()),
+            Ok(Err(CaptureError::Discarded)) => Ok(()),
             Ok(Err(error)) => Err(error),
             Err(_) => Err(CaptureError::StopTimeout(timeout)),
         };
@@ -633,18 +664,54 @@ impl RecordingSession {
         stop_reason: CaptureStopReason,
         stop_delay: Duration,
     ) -> Self {
+        Self::simulated_with_abort_probe(audio, stop_reason, stop_delay).0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn simulated_with_abort_probe(
+        audio: Option<Arc<PreparedAudio>>,
+        stop_reason: CaptureStopReason,
+        stop_delay: Duration,
+    ) -> (Self, SimulatedCaptureProbe) {
         let stop_requested = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop_requested);
+        let discard_requested = Arc::new(AtomicBool::new(false));
+        let worker_discard = Arc::clone(&discard_requested);
+        let probe = SimulatedCaptureProbe::default();
+        let worker_probe = probe.clone();
         let (finished_tx, finished_rx) = bounded(1);
         let worker = thread::spawn(move || {
             let started = Instant::now();
-            while !worker_stop.load(Ordering::Acquire) && started.elapsed() < Duration::from_secs(2)
+            while !worker_stop.load(Ordering::Acquire)
+                && !worker_discard.load(Ordering::Acquire)
+                && started.elapsed() < Duration::from_secs(2)
             {
                 thread::sleep(Duration::from_millis(1));
             }
-            if worker_stop.load(Ordering::Acquire) {
-                thread::sleep(stop_delay);
+            if worker_discard.load(Ordering::Acquire) {
+                worker_probe.stream_dropped.store(true, Ordering::Release);
+                let _ = finished_tx.send(Err(CaptureError::Discarded));
+                return;
             }
+            if worker_stop.load(Ordering::Acquire) && !stop_delay.is_zero() {
+                worker_probe
+                    .post_roll_entered
+                    .store(true, Ordering::Release);
+                let deadline = Instant::now() + stop_delay;
+                while Instant::now() < deadline {
+                    if worker_discard.load(Ordering::Acquire) {
+                        worker_probe.stream_dropped.store(true, Ordering::Release);
+                        let _ = finished_tx.send(Err(CaptureError::Discarded));
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
+            worker_probe.stream_dropped.store(true, Ordering::Release);
+            worker_probe.finish_called.store(true, Ordering::Release);
+            worker_probe
+                .terminal_preview_called
+                .store(true, Ordering::Release);
             let prepared_frames = audio.as_ref().map_or(0, |prepared| prepared.samples.len());
             let source_sample_rate = audio
                 .as_ref()
@@ -676,10 +743,16 @@ impl RecordingSession {
                 },
             }));
         });
-        Self {
+        let abort_probe = probe.clone();
+        let session = Self {
             inner: Arc::new(RecordingSessionInner {
                 stop_requested,
-                discard_requested: Arc::new(AtomicBool::new(false)),
+                discard_requested,
+                abort_action: Arc::new(move || {
+                    abort_probe
+                        .preview_invalidated
+                        .store(true, Ordering::Release);
+                }),
                 finished_rx,
                 rms_bits: Arc::new(AtomicU32::new(0.0_f32.to_bits())),
                 peak_bits: Arc::new(AtomicU32::new(0.0_f32.to_bits())),
@@ -687,7 +760,8 @@ impl RecordingSession {
                 level_revision: Arc::new(AtomicU64::new(0)),
                 worker: Mutex::new(Some(worker)),
             }),
-        }
+        };
+        (session, probe)
     }
 
     #[cfg(test)]
@@ -706,6 +780,7 @@ impl RecordingSession {
 impl Drop for RecordingSessionInner {
     fn drop(&mut self) {
         self.discard_requested.store(true, Ordering::Release);
+        (self.abort_action)();
         self.stop_requested.store(true, Ordering::Release);
         if let Some(worker) = self
             .worker
@@ -738,6 +813,8 @@ pub fn start_recording(
     options.detection_mode.validate()?;
     let stop_requested = Arc::clone(&cancellation.stop_requested);
     let discard_requested = Arc::new(AtomicBool::new(false));
+    let abort_preview = preview_publisher.clone();
+    let abort_action: Arc<dyn Fn() + Send + Sync> = Arc::new(move || abort_preview.close());
     let rms_bits = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
     let peak_bits = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
     let level_observed = Arc::new(AtomicBool::new(false));
@@ -782,6 +859,7 @@ pub fn start_recording(
             inner: Arc::new(RecordingSessionInner {
                 stop_requested,
                 discard_requested,
+                abort_action,
                 finished_rx,
                 rms_bits,
                 peak_bits,
@@ -881,6 +959,7 @@ fn capture_worker(
         &options,
         &WorkerSpeechDetectorFactory,
         &cancellation.stop_requested,
+        Arc::clone(&discard_requested),
     )?;
     let mut pipeline = Pipeline::new(
         format.sample_rate,
@@ -924,7 +1003,23 @@ fn capture_worker(
     let mut first_sample = None;
 
     let (stop_reason, stop_trigger_elapsed) = loop {
-        drain_ring_bounded(&mut consumer, &mut pipeline, MAX_DRAIN_SAMPLES_PER_TICK)?;
+        if discard_requested.load(Ordering::Acquire) {
+            return discard_capture(&mut stream, &mut consumer, &mut pipeline);
+        }
+        if let Err(error) = drain_ring_bounded(
+            &mut consumer,
+            &mut pipeline,
+            MAX_DRAIN_SAMPLES_PER_TICK,
+            &discard_requested,
+        ) {
+            if error == CaptureError::Discarded || discard_requested.load(Ordering::Acquire) {
+                return discard_capture(&mut stream, &mut consumer, &mut pipeline);
+            }
+            return Err(error);
+        }
+        if discard_requested.load(Ordering::Acquire) {
+            return discard_capture(&mut stream, &mut consumer, &mut pipeline);
+        }
         let elapsed = capture_started.elapsed();
         if cancellation.startup_cancelled_before_first_sample() {
             log_capture_drop(
@@ -964,7 +1059,10 @@ fn capture_worker(
             FAULT_STREAM => {
                 drop(stream.take());
                 let restarted =
-                    retry_stream_start(&mut restart_policy, STREAM_RESTART_BACKOFF, || {
+                    match retry_stream_start(&mut restart_policy, STREAM_RESTART_BACKOFF, || {
+                        if discard_requested.load(Ordering::Acquire) {
+                            return Err(CaptureError::Discarded);
+                        }
                         let restarted_device =
                             select_input_device(&host, input_device_name.as_deref())?;
                         let current = restarted_device
@@ -986,16 +1084,28 @@ fn capture_worker(
                             Arc::clone(&dropped_samples),
                             cancellation.clone(),
                         )?;
+                        if discard_requested.load(Ordering::Acquire) {
+                            return Err(CaptureError::Discarded);
+                        }
                         restarted
                             .play()
                             .map_err(|error| CaptureError::PlayStream(error.to_string()))?;
                         Ok(restarted)
-                    })?;
+                    }) {
+                        Ok(restarted) => restarted,
+                        Err(CaptureError::Discarded) => {
+                            return discard_capture(&mut stream, &mut consumer, &mut pipeline);
+                        }
+                        Err(error) => return Err(error),
+                    };
                 stream = Some(restarted);
             }
             _ => {}
         }
 
+        if discard_requested.load(Ordering::Acquire) {
+            return discard_capture(&mut stream, &mut consumer, &mut pipeline);
+        }
         let explicit_post_roll_complete =
             explicit_stop.is_some_and(|(stop_seen, source_frame, _)| {
                 let post_roll_frames =
@@ -1018,9 +1128,17 @@ fn capture_worker(
 
     let finalization_started = Instant::now();
     drop(stream.take());
-    drain_ring_all(&mut consumer, &mut pipeline)?;
     if discard_requested.load(Ordering::Acquire) {
-        pipeline.invalidate_preview();
+        return discard_capture(&mut stream, &mut consumer, &mut pipeline);
+    }
+    if let Err(error) = drain_ring_all(&mut consumer, &mut pipeline, &discard_requested) {
+        if error == CaptureError::Discarded || discard_requested.load(Ordering::Acquire) {
+            return discard_capture(&mut stream, &mut consumer, &mut pipeline);
+        }
+        return Err(error);
+    }
+    if discard_requested.load(Ordering::Acquire) {
+        return discard_capture(&mut stream, &mut consumer, &mut pipeline);
     }
     if fault.load(Ordering::Acquire) == FAULT_OVERFLOW {
         return Err(CaptureError::BufferOverflow {
@@ -1111,26 +1229,52 @@ fn drain_ring_bounded(
     consumer: &mut Consumer,
     pipeline: &mut Pipeline,
     maximum: usize,
+    discard_requested: &AtomicBool,
 ) -> Result<usize, CaptureError> {
     let mut drained = 0;
     while drained < maximum
         && let Some(sample) = consumer.pop()
     {
+        if discard_requested.load(Ordering::Acquire) {
+            return Err(CaptureError::Discarded);
+        }
         pipeline.push_interleaved(sample)?;
         drained += 1;
     }
     Ok(drained)
 }
 
-fn drain_ring_all(consumer: &mut Consumer, pipeline: &mut Pipeline) -> Result<(), CaptureError> {
-    while drain_ring_bounded(consumer, pipeline, MAX_DRAIN_SAMPLES_PER_TICK)? != 0 {}
+fn drain_ring_all(
+    consumer: &mut Consumer,
+    pipeline: &mut Pipeline,
+    discard_requested: &AtomicBool,
+) -> Result<(), CaptureError> {
+    while drain_ring_bounded(
+        consumer,
+        pipeline,
+        MAX_DRAIN_SAMPLES_PER_TICK,
+        discard_requested,
+    )? != 0
+    {}
     Ok(())
+}
+
+fn discard_capture(
+    stream: &mut Option<cpal::Stream>,
+    consumer: &mut Consumer,
+    pipeline: &mut Pipeline,
+) -> Result<CaptureCompletion, CaptureError> {
+    drop(stream.take());
+    consumer.clear();
+    pipeline.discard();
+    Err(CaptureError::Discarded)
 }
 
 fn acquire_speech_detector(
     options: &CaptureOptions,
     factory: &dyn SpeechDetectorFactory,
-    cancelled: &AtomicBool,
+    startup_cancelled: &AtomicBool,
+    discard_requested: Arc<AtomicBool>,
 ) -> Result<Option<Box<dyn SpeechDetector>>, CaptureError> {
     if options.intent == CaptureIntent::MeterOnly
         || !options.vad_enabled
@@ -1139,7 +1283,9 @@ fn acquire_speech_detector(
         return Ok(None);
     }
     let threshold = VadThreshold::new(0.5).map_err(WorkerSpeechDetector::vad_error)?;
-    factory.acquire(threshold, cancelled).map(Some)
+    factory
+        .acquire(threshold, startup_cancelled, discard_requested)
+        .map(Some)
 }
 
 fn duration_to_source_frames(duration: Duration, sample_rate: u32) -> usize {
@@ -1456,6 +1602,7 @@ mod tests {
             &self,
             threshold: VadThreshold,
             _cancelled: &AtomicBool,
+            _discard_requested: Arc<AtomicBool>,
         ) -> Result<Box<dyn SpeechDetector>, CaptureError> {
             self.calls.fetch_add(1, Ordering::Relaxed);
             self.threshold_bits
@@ -1469,6 +1616,7 @@ mod tests {
             &self,
             _threshold: VadThreshold,
             cancelled: &AtomicBool,
+            _discard_requested: Arc<AtomicBool>,
         ) -> Result<Box<dyn SpeechDetector>, CaptureError> {
             self.entered.send(()).unwrap();
             while !cancelled.load(Ordering::Acquire) {
@@ -1512,9 +1660,14 @@ mod tests {
         };
 
         assert!(
-            acquire_speech_detector(&options, &factory, &AtomicBool::new(false))
-                .unwrap()
-                .is_none()
+            acquire_speech_detector(
+                &options,
+                &factory,
+                &AtomicBool::new(false),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .unwrap()
+            .is_none()
         );
         assert_eq!(factory.calls.load(Ordering::Relaxed), 0);
 
@@ -1522,6 +1675,7 @@ mod tests {
             &CaptureOptions::default(),
             &factory,
             &AtomicBool::new(false),
+            Arc::new(AtomicBool::new(false)),
         )
         .unwrap()
         .unwrap();
@@ -1556,9 +1710,14 @@ mod tests {
         };
 
         assert!(
-            acquire_speech_detector(&options, &factory, &AtomicBool::new(false))
-                .unwrap()
-                .is_none()
+            acquire_speech_detector(
+                &options,
+                &factory,
+                &AtomicBool::new(false),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .unwrap()
+            .is_none()
         );
         assert_eq!(factory.calls.load(Ordering::Relaxed), 0);
 
@@ -1567,6 +1726,7 @@ mod tests {
                 &CaptureOptions::default(),
                 &factory,
                 &AtomicBool::new(false),
+                Arc::new(AtomicBool::new(false)),
             )
             .unwrap(),
         );
@@ -1598,6 +1758,7 @@ mod tests {
                 &CaptureOptions::default(),
                 &factory,
                 &worker_cancellation.stop_requested,
+                Arc::new(AtomicBool::new(false)),
             );
             if result.is_ok() {
                 worker_output.store(true, Ordering::Release);
