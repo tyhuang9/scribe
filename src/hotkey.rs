@@ -237,7 +237,7 @@ fn replace_hotkey_registration(
 }
 
 fn event_from_global(event: GlobalHotKeyEvent, registered_id: Option<u32>) -> Option<HotkeyEvent> {
-    if registered_id.is_some_and(|id| id != event.id()) {
+    if registered_id != Some(event.id()) {
         return None;
     }
 
@@ -555,6 +555,22 @@ mod tests {
                     state: HotKeyState::Pressed,
                 },
                 Some(hotkey.id())
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn ignores_events_when_no_hotkey_is_registered() {
+        let hotkey = parse_hotkey("Ctrl+Shift+Space").unwrap();
+
+        assert_eq!(
+            event_from_global(
+                GlobalHotKeyEvent {
+                    id: hotkey.id(),
+                    state: HotKeyState::Pressed,
+                },
+                None,
             ),
             None
         );

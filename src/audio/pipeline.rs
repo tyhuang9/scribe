@@ -899,6 +899,13 @@ impl VadTracker {
         frame_start: usize,
         frame_end: usize,
     ) {
+        let maximum_gap = duration_to_prepared_frames(self.options.pause);
+        if self
+            .rescue_candidate
+            .is_some_and(|candidate| frame_start.saturating_sub(candidate.end_frame) >= maximum_gap)
+        {
+            self.rescue_candidate = None;
+        }
         let complete_manual_window =
             frame_end.saturating_sub(frame_start) == MANUAL_GATE_WINDOW_SAMPLES;
         if !speech
@@ -2424,6 +2431,34 @@ mod tests {
         .unwrap();
         push_mono_ms(&mut pipeline, 64, 0.79);
         push_mono_ms(&mut pipeline, 200, 0.0);
+
+        assert!(
+            pipeline
+                .finish(CaptureStopReason::Explicit)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn hold_release_rejects_strong_transient_after_long_silence() {
+        let (rms, peak, observed, revision) = level_state();
+        let mut pipeline = Pipeline::new(
+            PREPARED_SAMPLE_RATE,
+            1,
+            CaptureOptions {
+                short_speech_rescue: true,
+                ..CaptureOptions::default()
+            },
+            default_detector(),
+            rms,
+            peak,
+            observed,
+            revision,
+        )
+        .unwrap();
+        push_mono_ms(&mut pipeline, 64, 0.90);
+        push_mono_ms(&mut pipeline, 600, 0.0);
 
         assert!(
             pipeline
