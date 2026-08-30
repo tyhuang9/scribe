@@ -53,6 +53,15 @@ impl Argb {
     fn from_color(color: Color32) -> Self {
         Self::new(color.a(), color.r(), color.g(), color.b())
     }
+
+    fn with_alpha(self, alpha: u8) -> Self {
+        Self::new(
+            alpha,
+            ((self.0 >> 16) & 0xff) as u8,
+            ((self.0 >> 8) & 0xff) as u8,
+            (self.0 & 0xff) as u8,
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -134,7 +143,7 @@ pub(super) struct LayeredFrame {
 }
 
 impl LayeredFrame {
-    fn transparent(width: i32, height: i32) -> Result<Self, RasterError> {
+    pub(super) fn transparent(width: i32, height: i32) -> Result<Self, RasterError> {
         if width <= 0 || height <= 0 {
             return Err(RasterError::InvalidDimensions);
         }
@@ -157,6 +166,33 @@ impl LayeredFrame {
             height,
             pixels,
         })
+    }
+
+    /// Composites two fixed-size premultiplied frames. Opacity-only blending
+    /// keeps the native shell and its geometry stable through semantic swaps.
+    pub(super) fn crossfade(
+        previous: &Self,
+        next: &Self,
+        previous_opacity: u8,
+        next_opacity: u8,
+    ) -> Result<Self, RasterError> {
+        if previous.width != next.width || previous.height != next.height {
+            return Err(RasterError::InvalidDimensions);
+        }
+        let mut frame = Self::transparent(next.width, next.height)?;
+        for ((output, old), new) in frame
+            .pixels
+            .chunks_exact_mut(4)
+            .zip(previous.pixels.chunks_exact(4))
+            .zip(next.pixels.chunks_exact(4))
+        {
+            for channel in 0..4 {
+                output[channel] = ((u16::from(old[channel]) * u16::from(previous_opacity)
+                    + u16::from(new[channel]) * u16::from(next_opacity))
+                    / 255) as u8;
+            }
+        }
+        Ok(frame)
     }
 
     #[cfg(test)]
@@ -639,7 +675,7 @@ fn draw_compact_status(
     } else {
         (
             phase_status_label_with_motion(state.phase, state.progress_animation_enabled),
-            phase_status_color(state.phase, colors),
+            phase_status_color(state, colors),
         )
     };
     canvas.draw_text_centered_in_rect(
@@ -669,7 +705,7 @@ fn live_line(state: &OverlayViewState, colors: NativeColors) -> StyledLine {
     if !state.phase.shows_live_transcript() {
         return StyledLine::plain(
             phase_status_label_with_motion(state.phase, state.progress_animation_enabled),
-            phase_status_color(state.phase, colors),
+            phase_status_color(state, colors),
         );
     }
     let committed = &state.transcript.committed;
@@ -715,9 +751,21 @@ fn status_mark_color(state: &OverlayViewState, colors: NativeColors) -> Argb {
     }
 }
 
-fn phase_status_color(phase: OverlayPhase, colors: NativeColors) -> Argb {
-    if phase == OverlayPhase::Success {
+fn phase_status_color(state: &OverlayViewState, colors: NativeColors) -> Argb {
+    if state.phase == OverlayPhase::Success {
         colors.success
+    } else if state.phase.is_progressing()
+        && state.progress_animation_enabled
+        && crate::system_preferences::client_area_animations_enabled()
+    {
+        let elapsed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f32();
+        let alpha = (180.0 + 75.0 * ((elapsed * std::f32::consts::TAU) / 0.8).sin())
+            .round()
+            .clamp(105.0, 255.0) as u8;
+        colors.muted_text.with_alpha(alpha)
     } else {
         colors.muted_text
     }
