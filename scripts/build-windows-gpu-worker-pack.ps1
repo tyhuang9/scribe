@@ -331,29 +331,111 @@ function ConvertFrom-VsWhereInstallationPaths([string]$Output, [string]$Componen
     return $paths.ToArray()
 }
 
-function Assert-PinnedMsvcTool(
+function Get-PinnedMsvcToolIdentity(
     [string]$Path,
-    [psobject]$Expected,
+    [string]$ExpectedFilename,
     [string]$Label
 ) {
-    Assert-ExactProperties $Expected @('filename', 'file_version', 'sha256') "$Label identity contract"
-    if ([string]$Expected.filename -cnotmatch '^[a-z]+\.exe$' -or
-        [string]$Expected.file_version -cnotmatch '^\d+\.\d+\.\d+\.\d+$' -or
-        [string]$Expected.sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+    if ($ExpectedFilename -cnotmatch '^[a-z]+\.exe$' -or
         -not [string]::Equals(
             (Split-Path -Leaf $Path),
-            [string]$Expected.filename,
+            $ExpectedFilename,
             [System.StringComparison]::OrdinalIgnoreCase
         )) {
-        throw "$Label identity contract is not canonical."
+        throw "$Label filename contract is not canonical."
     }
     Assert-NoReparseAncestors $Path
     $item = Assert-RegularNonReparseFile $Path $Label
-    if ([string]$item.VersionInfo.FileVersion -cne [string]$Expected.file_version) {
-        throw "$Label file version mismatch: expected $($Expected.file_version), found $($item.VersionInfo.FileVersion)."
+    $fileVersion = [string]$item.VersionInfo.FileVersion
+    if ($fileVersion -cnotmatch '^\d+\.\d+\.\d+\.\d+$') {
+        throw "$Label has a noncanonical file version."
     }
-    Assert-ExactHash $Path ([string]$Expected.sha256) $Label
-    return Get-NormalizedFullPath $Path
+    return [pscustomobject]@{
+        Path = Get-NormalizedFullPath $Path
+        Filename = $ExpectedFilename
+        FileVersion = $fileVersion
+        Sha256 = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+    }
+}
+
+function Assert-MsvcPayloadProfileContract([psobject]$Profile) {
+    Assert-ExactProperties $Profile @('profile_id', 'tools') 'MSVC payload profile'
+    if ([string]$Profile.profile_id -cnotmatch '^[a-z0-9][a-z0-9._-]{0,63}$') {
+        throw 'MSVC payload profile ID is not canonical.'
+    }
+    Assert-ExactProperties $Profile.tools @('cl', 'link', 'lib', 'nmake') 'MSVC payload profile tools'
+    foreach ($toolName in @('cl', 'link', 'lib', 'nmake')) {
+        $tool = $Profile.tools.$toolName
+        Assert-ExactProperties $tool @('filename', 'file_version', 'sha256') "MSVC $toolName payload identity"
+        if ([string]$tool.filename -cnotmatch '^[a-z]+\.exe$' -or
+            [string]$tool.file_version -cnotmatch '^\d+\.\d+\.\d+\.\d+$' -or
+            [string]$tool.sha256 -cnotmatch '^[0-9a-f]{64}$') {
+            throw "MSVC $toolName payload identity is not canonical."
+        }
+    }
+}
+
+function Resolve-PinnedMsvcPayloadProfile(
+    [string]$ToolBin,
+    [object[]]$Profiles
+) {
+    $profilesArray = @($Profiles)
+    if ($profilesArray.Count -lt 1 -or $profilesArray.Count -gt 8) {
+        throw 'MSVC payload profile count is invalid.'
+    }
+    $profileIds = [System.Collections.Generic.HashSet[string]]::new(
+        [System.StringComparer]::Ordinal
+    )
+    foreach ($profile in $profilesArray) {
+        Assert-MsvcPayloadProfileContract $profile
+        if (-not $profileIds.Add([string]$profile.profile_id)) {
+            throw 'MSVC payload profile IDs must be unique.'
+        }
+    }
+
+    $identities = [ordered]@{
+        cl = Get-PinnedMsvcToolIdentity (Join-Path $ToolBin 'cl.exe') 'cl.exe' 'Pinned MSVC compiler'
+        link = Get-PinnedMsvcToolIdentity (Join-Path $ToolBin 'link.exe') 'link.exe' 'Pinned MSVC linker'
+        lib = Get-PinnedMsvcToolIdentity (Join-Path $ToolBin 'lib.exe') 'lib.exe' 'Pinned MSVC librarian'
+        nmake = Get-PinnedMsvcToolIdentity (Join-Path $ToolBin 'nmake.exe') 'nmake.exe' 'Pinned MSVC build driver'
+    }
+    $matchingProfiles = [System.Collections.Generic.List[psobject]]::new()
+    foreach ($profile in $profilesArray) {
+        $matches = $true
+        foreach ($toolName in @('cl', 'link', 'lib', 'nmake')) {
+            $expected = $profile.tools.$toolName
+            $actual = $identities[$toolName]
+            if (-not [string]::Equals(
+                    [string]$actual.Filename,
+                    [string]$expected.filename,
+                    [System.StringComparison]::OrdinalIgnoreCase
+                ) -or
+                [string]$actual.FileVersion -cne [string]$expected.file_version -or
+                [string]$actual.Sha256 -cne [string]$expected.sha256) {
+                $matches = $false
+                break
+            }
+        }
+        if ($matches) {
+            $matchingProfiles.Add($profile)
+        }
+    }
+    if ($matchingProfiles.Count -ne 1) {
+        $observed = @(
+            foreach ($toolName in @('cl', 'link', 'lib', 'nmake')) {
+                $identity = $identities[$toolName]
+                "$toolName=$($identity.FileVersion):$($identity.Sha256)"
+            }
+        ) -join ','
+        throw "MSVC tool payload does not match exactly one approved profile; observed $observed"
+    }
+    return [pscustomobject]@{
+        ProfileId = [string]$matchingProfiles[0].profile_id
+        Cl = [string]$identities.cl.Path
+        Link = [string]$identities.link.Path
+        Lib = [string]$identities.lib.Path
+        NMake = [string]$identities.nmake.Path
+    }
 }
 
 function ConvertFrom-VcVarsEnvironmentOutput([string]$Output) {
@@ -658,14 +740,9 @@ function Resolve-PinnedMsvcToolchain($Contract) {
             )
             $toolBin = Join-Path $toolRoot 'bin\Hostx64\x64'
             $null = Assert-PhysicalDirectory $toolBin 'Pinned MSVC x64 tool directory'
-            $toolContracts = $Contract.msvc.tools
-            Assert-ExactProperties $toolContracts @('cl', 'link', 'lib', 'nmake') 'MSVC tool identity contract'
-            $tools = [pscustomobject]@{
-                Cl = Assert-PinnedMsvcTool (Join-Path $toolBin ([string]$toolContracts.cl.filename)) $toolContracts.cl 'Pinned MSVC compiler'
-                Link = Assert-PinnedMsvcTool (Join-Path $toolBin ([string]$toolContracts.link.filename)) $toolContracts.link 'Pinned MSVC linker'
-                Lib = Assert-PinnedMsvcTool (Join-Path $toolBin ([string]$toolContracts.lib.filename)) $toolContracts.lib 'Pinned MSVC librarian'
-                NMake = Assert-PinnedMsvcTool (Join-Path $toolBin ([string]$toolContracts.nmake.filename)) $toolContracts.nmake 'Pinned MSVC build driver'
-            }
+            $tools = Resolve-PinnedMsvcPayloadProfile `
+                $toolBin `
+                @($Contract.msvc.payload_profiles)
             $sdkRoot = Get-NormalizedFullPath (([string]$Contract.msvc.windows_sdk_root).Replace('/', '\'))
             $null = Assert-PhysicalDirectory $sdkRoot 'Pinned Windows SDK root'
             $environment = Invoke-PinnedVcVarsEnvironment `
@@ -1021,10 +1098,13 @@ Assert-ExactProperties $contract @('schema_version', 'app_version', 'target_trip
 Assert-ExactProperties $contract.rust @('release', 'commit', 'host') 'Rust toolchain contract'
 Assert-ExactProperties $contract.native_source @('transcribe_cpp_version', 'transcribe_cpp_checksum', 'transcribe_cpp_sys_version', 'transcribe_cpp_sys_checksum', 'ash_version', 'ash_checksum', 'source_revision', 'sherpa_onnx_archive') 'Native source contract'
 Assert-ExactProperties $contract.native_source.sherpa_onnx_archive @('filename', 'size_bytes', 'sha256') 'Sherpa ONNX archive contract'
-Assert-ExactProperties $contract.msvc @('preferred_component_id', 'fallback_discovery_component_id', 'toolset_version', 'platform_toolset', 'windows_sdk_version', 'windows_sdk_root', 'tools', 'cmake_version', 'runtime', 'reproducible_flag') 'MSVC toolchain contract'
-Assert-ExactProperties $contract.msvc.tools @('cl', 'link', 'lib', 'nmake') 'MSVC tool identity contract'
-foreach ($toolName in @('cl', 'link', 'lib', 'nmake')) {
-    Assert-ExactProperties $contract.msvc.tools.$toolName @('filename', 'file_version', 'sha256') "MSVC $toolName identity contract"
+Assert-ExactProperties $contract.msvc @('preferred_component_id', 'fallback_discovery_component_id', 'toolset_version', 'platform_toolset', 'windows_sdk_version', 'windows_sdk_root', 'payload_profiles', 'cmake_version', 'runtime', 'reproducible_flag') 'MSVC toolchain contract'
+$payloadProfiles = @($contract.msvc.payload_profiles)
+if ($payloadProfiles.Count -lt 1 -or $payloadProfiles.Count -gt 8) {
+    throw 'MSVC payload profile count is invalid.'
+}
+foreach ($payloadProfile in $payloadProfiles) {
+    Assert-MsvcPayloadProfileContract $payloadProfile
 }
 Assert-ExactProperties $contract.build @('profile', 'static_cpu_scheduling', 'dynamic_backends', 'openmp') 'Worker build contract'
 Assert-ExactProperties $contract.vulkan @('sdk_version', 'provider', 'required_files', 'system_driver_imports', 'packaged_runtime_imports') 'Vulkan provider contract'

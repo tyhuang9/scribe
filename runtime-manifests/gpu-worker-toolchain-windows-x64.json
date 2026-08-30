@@ -28,28 +28,33 @@
     "platform_toolset": "v143",
     "windows_sdk_version": "10.0.26100.0",
     "windows_sdk_root": "C:/Program Files (x86)/Windows Kits/10",
-    "tools": {
-      "cl": {
-        "filename": "cl.exe",
-        "file_version": "19.44.35227.0",
-        "sha256": "7a154e5136cc538b42e6944997fc5e3bb49112894e41dd88a70940aaff9aa831"
-      },
-      "link": {
-        "filename": "link.exe",
-        "file_version": "14.44.35227.0",
-        "sha256": "359b5861060b8b8899a1ef87385a37b32d8ecb8a81d092866907e7249ab962be"
-      },
-      "lib": {
-        "filename": "lib.exe",
-        "file_version": "14.44.35227.0",
-        "sha256": "82938aa4c8fe38f15783696da89068430a1cdc4779908063410e9515f7e9a879"
-      },
-      "nmake": {
-        "filename": "nmake.exe",
-        "file_version": "14.44.35227.0",
-        "sha256": "9260ff1dfd350bb07e84e9f0d2b7e6ecb8155562f82d14a5cd2c2080952e4ae2"
+    "payload_profiles": [
+      {
+        "profile_id": "msvc-14.44.35227-local",
+        "tools": {
+          "cl": {
+            "filename": "cl.exe",
+            "file_version": "19.44.35227.0",
+            "sha256": "7a154e5136cc538b42e6944997fc5e3bb49112894e41dd88a70940aaff9aa831"
+          },
+          "link": {
+            "filename": "link.exe",
+            "file_version": "14.44.35227.0",
+            "sha256": "359b5861060b8b8899a1ef87385a37b32d8ecb8a81d092866907e7249ab962be"
+          },
+          "lib": {
+            "filename": "lib.exe",
+            "file_version": "14.44.35227.0",
+            "sha256": "82938aa4c8fe38f15783696da89068430a1cdc4779908063410e9515f7e9a879"
+          },
+          "nmake": {
+            "filename": "nmake.exe",
+            "file_version": "14.44.35227.0",
+            "sha256": "9260ff1dfd350bb07e84e9f0d2b7e6ecb8155562f82d14a5cd2c2080952e4ae2"
+          }
+        }
       }
-    },
+    ],
     "cmake_version": "4.4.2",
     "runtime": "MultiThreaded",
     "reproducible_flag": "/Brepro"

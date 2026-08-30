@@ -92,7 +92,7 @@ foreach ($requiredToolchainBinding in @(
     'toolset_version',
     'windows_sdk_version',
     'Invoke-PinnedVcVarsEnvironment',
-    'Assert-PinnedMsvcTool',
+    'Resolve-PinnedMsvcPayloadProfile',
     'CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER',
     "CMAKE_GENERATOR'] = 'NMake Makefiles'"
 )) {
@@ -149,7 +149,7 @@ $toolchainFixtureRoot = Join-Path `
 New-Item -ItemType Directory -Path $toolchainFixtureRoot | Out-Null
 try {
     $wrongHashContract = Get-Content -LiteralPath $toolchainManifest -Raw | ConvertFrom-Json
-    $wrongHashContract.msvc.tools.cl.sha256 = '0' * 64
+    $wrongHashContract.msvc.payload_profiles[0].tools.cl.sha256 = '0' * 64
     $wrongHashPath = Join-Path $toolchainFixtureRoot 'wrong-cl-hash.json'
     [System.IO.File]::WriteAllText(
         $wrongHashPath,
@@ -168,7 +168,7 @@ try {
     }
     catch {
         $wrongHashRejected = $_.Exception.Message.Contains(
-            'Pinned MSVC compiler SHA-256 mismatch'
+            'MSVC tool payload does not match exactly one approved profile'
         )
     }
     Assert-True $wrongHashRejected 'Wrong pinned compiler identity was not rejected.'
