@@ -2,6 +2,7 @@
 
 #include <CoreFoundation/CoreFoundation.h>
 #include <Security/Security.h>
+#include <stdbool.h>
 #include <string.h>
 
 static const char *SCRIBE_EPOCH_SERVICE = "com.scribe.gpu.release-security-epoch.v1";
@@ -166,6 +167,7 @@ int scribe_macos_keychain_epoch_scan(
 
 static int scribe_validate_exact_duplicate(
     CFStringRef access_group, CFStringRef service, CFStringRef account,
+    const uint8_t *account_value, unsigned long account_len,
     const uint8_t *payload, unsigned long payload_len) {
     CFMutableDictionaryRef query = scribe_base_query(access_group, service);
     if (query == NULL) {
@@ -186,7 +188,9 @@ static int scribe_validate_exact_duplicate(
     int validation = scribe_validate_item((CFDictionaryRef)item, access_group,
                                           service, &observed);
     if (validation == SCRIBE_KEYCHAIN_OK &&
-        (observed.payload_len != payload_len ||
+        (observed.account_len != account_len ||
+         memcmp(observed.account, account_value, account_len) != 0 ||
+         observed.payload_len != payload_len ||
          memcmp(observed.payload, payload, payload_len) != 0)) {
         validation = SCRIBE_KEYCHAIN_INVALID_RESULT;
     }
@@ -234,8 +238,9 @@ int scribe_macos_keychain_epoch_append(
 
     int result = SCRIBE_KEYCHAIN_OK;
     if (status == errSecDuplicateItem) {
-        result = scribe_validate_exact_duplicate(access_group, service, account,
-                                                 payload, payload_len);
+        result = scribe_validate_exact_duplicate(
+            access_group, service, account, account_value, account_len, payload,
+            payload_len);
     } else if (status != errSecSuccess) {
         result = SCRIBE_KEYCHAIN_SECURITY_ERROR;
     }
