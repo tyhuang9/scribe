@@ -356,17 +356,47 @@ catalog cache never bypasses this check. CPU routing remains available, and an
 empty production trust result does not create or mutate ledger state.
 
 The signed desktop is the non-resettable release authority for bundled macOS
-packs. Both universal slices embed identical canonical authority bytes that bind
-the application version and build revision, SCIF protocol, exact catalog
-SHA-256, pack identity/digest/security epoch, runtime ABI, backend/provider,
+packs. Both universal slices embed identical canonical schema-v2 authority bytes
+that bind the application version and build revision, SCIF protocol, exact
+catalog SHA-256, the outer `release_security_epoch`, the exact Keychain access
+group, pack identity/digest/security epoch, runtime ABI, backend/provider,
 target, worker path, sizes, and complete inventory. The installed catalog must
-match that authority before verification, cache lookup, or epoch-ledger access.
-Deleting or recreating the private ledger therefore cannot admit an older
-catalog. The ledger remains defense in depth and its lock acquisition is
-nonblocking; contention rejects GPU discovery promptly so Auto can continue to
-CPU. Recovery from authority or epoch-state rejection is reinstalling the
-current signed application and its matching packs. Runtime state is never
-silently reset.
+match that authority before verification, cache lookup, or device-local
+Keychain admission. Deleting or recreating app-data state therefore cannot
+admit an older catalog.
+
+The checked-in authority is the canonical default-deny document: schema version
+2, the SHA-256 of the exact compact empty catalog bytes, release epoch `0`, an
+empty Keychain group, and no entries. Epoch zero is permitted only for that
+empty CPU-only release. Every nonempty Metal catalog requires an explicitly set
+positive canonical `SCRIBE_MACOS_GPU_RELEASE_SECURITY_EPOCH`; the release
+builder passes that same value to every pack author's `--security-epoch` and
+writes it as the outer release epoch. A positive epoch may intentionally carry
+an empty catalog to revoke prior GPU capability, but it remains a protected
+release. The device-local Keychain floor is append-only; no packaging or runtime
+path resets, deletes, or lowers it.
+
+A protected release (a positive epoch or any Metal catalog) requires
+Developer-ID signing, a regular non-symlink distribution provisioning profile,
+and `SCRIBE_MACOS_GPU_ROLLBACK_KEYCHAIN_ACCESS_GROUP` matching exactly
+`^[A-Z0-9]{10}\.com\.scribe\.local-transcriber$`. The profile's application
+identifier and sole `keychain-access-groups` value must both be that exact
+group. The builder generates a protected desktop entitlement from the checked-in
+template, embeds the profile at `Contents/embedded.provisionprofile` before the
+final app signing pass, and verifies that both the desktop executable and outer
+app expose exactly that group. CPU and Metal worker binaries use the base
+entitlements and must not carry the desktop Keychain group. The package verifier
+rechecks the authority/catalog binding, effective entitlements, profile
+authorization, and profile-aware exact inventory.
+
+The hosted pull-request lane is deliberately credential-free and builds only
+the epoch-zero empty catalog. The protected official lane is also CPU-only at
+epoch zero today because the production Metal trust root and provisioning inputs
+have not been provisioned. Before enabling a positive-epoch release, the
+protected environment must supply the reviewed Developer-ID identity, stable
+group, authorized profile path, positive release epoch, and (for Metal) the
+reviewed pack-signing key material. These inputs are requirements for a future
+protected run, not evidence that production Metal trust exists now.
 
 The production authoring CLI must accept `--backend metal --target-os macos
 --target-arch <aarch64|x86_64>` and bind those facts in its signed manifest.
