@@ -9,6 +9,8 @@ const SILERO_VAD_SIZE: usize = 212_860;
 const SILERO_VAD_SHA256: &str = "c36d490aff5ab924ca6c7aeec4d8f6bd3d22db6fa17611b9c5b17eae58ac3a20";
 const MACOS_KEYCHAIN_NAMESPACE_MANIFEST: &str =
     "runtime-manifests/gpu-keychain-namespace-macos-release.json";
+const LINUX_WORKER_INSTALL_CONTRACT: &str =
+    "runtime-manifests/linux-worker-install-contract-x86_64.json";
 
 fn main() {
     reject_multiple_gpu_features();
@@ -19,6 +21,7 @@ fn main() {
     #[cfg(all(windows, feature = "vulkan-acceleration"))]
     prepare_windows_vulkan_import_library();
     prepare_macos_native_shims();
+    verify_linux_worker_install_contract();
     verify_silero_vad_asset();
 
     println!("cargo:rerun-if-changed=native/sherpa_vad_shim.cc");
@@ -37,6 +40,20 @@ fn main() {
     if matches!(target_os.as_str(), "linux" | "android") {
         println!("cargo:rustc-link-lib=dl");
     }
+}
+
+fn verify_linux_worker_install_contract() {
+    const EXPECTED: &str = concat!(
+        r#"{"schema_version":1,"target":"x86_64-unknown-linux-gnu","desktop_path":"/usr/bin/local-transcriber","authority_root":"/usr/lib/scribe","worker_relative_path":"scribe-inference-worker","future_pack_root":"workers/packs"}"#,
+        "\n"
+    );
+    println!("cargo:rerun-if-changed={LINUX_WORKER_INSTALL_CONTRACT}");
+    let contract = fs::read_to_string(LINUX_WORKER_INSTALL_CONTRACT)
+        .expect("could not read the Linux worker install contract");
+    assert_eq!(
+        contract, EXPECTED,
+        "Linux worker install contract must preserve the reviewed canonical FHS layout"
+    );
 }
 
 fn canonical_macos_keychain_access_group(value: &str) -> bool {

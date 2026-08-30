@@ -43,6 +43,13 @@ mod gpu_auto_qualification;
 mod gpu_worker_pack;
 #[path = "../inference_server.rs"]
 mod inference_server;
+#[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
+#[allow(
+    dead_code,
+    reason = "the worker shares Linux entrypoint contracts but never launches another worker"
+)]
+#[path = "../linux_worker_launch.rs"]
+mod linux_worker_launch;
 #[cfg(any(all(target_os = "macos", feature = "metal-acceleration"), test))]
 #[path = "../macos_gpu.rs"]
 mod macos_gpu;
@@ -97,6 +104,10 @@ mod transcription {
 }
 
 fn main() {
+    if let Err(error) = onnx_worker::validate_linux_worker_entrypoint() {
+        eprintln!("Scribe inference worker rejected its Linux launch context: {error:#}");
+        std::process::exit(1);
+    }
     if let Err(error) = onnx_worker::harden_windows_dll_search() {
         eprintln!("Scribe inference worker could not harden native library loading: {error:#}");
         std::process::exit(1);

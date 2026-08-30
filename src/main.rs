@@ -44,10 +44,10 @@ mod installed_manifest;
     reason = "Stage 7 records a fail-closed Linux GPU platform contract before worker routing exists"
 )]
 mod linux_gpu_runtime;
-#[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
-mod linux_worker_launch;
 #[cfg(test)]
 mod linux_worker_architecture_guard;
+#[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
+mod linux_worker_launch;
 #[cfg(test)]
 #[allow(
     dead_code,

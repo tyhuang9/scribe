@@ -172,6 +172,23 @@ mod launch_binding {
         }
     }
 
+    #[cfg(all(test, target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
+    impl crate::linux_worker_launch::LinuxExecAuthority for UnixPackExecAuthority {
+        fn executable_fd(&self) -> std::os::fd::RawFd {
+            use std::os::fd::AsRawFd;
+            self.executable_fd().as_raw_fd()
+        }
+
+        fn dependency_root_fd(&self) -> std::os::fd::RawFd {
+            use std::os::fd::AsRawFd;
+            self.dependency_root_fd().as_raw_fd()
+        }
+
+        fn recheck(&self) -> std::io::Result<()> {
+            self.recheck().map_err(std::io::Error::other)
+        }
+    }
+
     /// Opaque proof that a concrete resolver result and worker Hello agreed on
     /// the exact verified pack and stable device. Its fields are private to this
     /// child module, so production discovery cannot fabricate one from a raw

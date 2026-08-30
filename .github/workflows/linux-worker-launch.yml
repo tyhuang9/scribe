@@ -4,6 +4,7 @@ on:
   push:
     paths:
       - '.github/workflows/linux-worker-launch.yml'
+      - 'build.rs'
       - 'runtime-manifests/linux-worker-install-contract-x86_64.json'
       - 'scripts/linux-worker-launch-fixture.rs'
       - 'scripts/test-linux-worker-launch.sh'
@@ -16,6 +17,7 @@ on:
   pull_request:
     paths:
       - '.github/workflows/linux-worker-launch.yml'
+      - 'build.rs'
       - 'runtime-manifests/linux-worker-install-contract-x86_64.json'
       - 'scripts/linux-worker-launch-fixture.rs'
       - 'scripts/test-linux-worker-launch.sh'

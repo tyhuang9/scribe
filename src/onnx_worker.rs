@@ -2557,7 +2557,6 @@ fn bind_pack_hello(
         .collect()
 }
 
-#[derive(Debug)]
 struct VerifiedWorkerExecutable {
     path: PathBuf,
     root: PathBuf,
@@ -2565,10 +2564,31 @@ struct VerifiedWorkerExecutable {
     expected_sha256: String,
     identity: WorkerExecutableIdentity,
     pack_launch: Option<PackLaunchContext>,
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
+    linux_exec_authority: Option<Arc<dyn crate::linux_worker_launch::LinuxExecAuthority>>,
     // On Windows this read-only, non-delete-sharing handle prevents replacement
     // between verification and CreateProcess. Other platforms still retain the
     // open inode while the immediate identity recheck closes ordinary races.
     _open_file: std::fs::File,
+}
+
+impl std::fmt::Debug for VerifiedWorkerExecutable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut debug = formatter.debug_struct("VerifiedWorkerExecutable");
+        debug
+            .field("path", &self.path)
+            .field("root", &self.root)
+            .field("expected_name", &self.expected_name)
+            .field("expected_sha256", &self.expected_sha256)
+            .field("identity", &self.identity)
+            .field("pack_launch", &self.pack_launch);
+        #[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
+        debug.field(
+            "has_linux_exec_authority",
+            &self.linux_exec_authority.is_some(),
+        );
+        debug.finish_non_exhaustive()
+    }
 }
 
 impl VerifiedWorkerExecutable {
@@ -2583,6 +2603,10 @@ impl VerifiedWorkerExecutable {
             bail!("worker executable identity changed before process creation");
         }
         verified.pack_launch = self.pack_launch.clone();
+        #[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
+        {
+            verified.linux_exec_authority = self.linux_exec_authority.clone();
+        }
         Ok(verified)
     }
 }
@@ -2704,6 +2728,8 @@ fn verify_worker_executable(
         expected_sha256: expected_sha256.to_owned(),
         identity,
         pack_launch: None,
+        #[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
+        linux_exec_authority: None,
         _open_file: open_file,
     })
 }
@@ -2837,6 +2863,10 @@ fn resolve_verified_pack_executable(
     let unix_exec_authority =
         crate::gpu_worker_pack::UnixPackExecAuthority::from_verified_pack_lease(Arc::clone(&lease))
             .context("could not retain verified Unix pack launch authority")?;
+    #[cfg(all(test, target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
+    {
+        executable.linux_exec_authority = Some(unix_exec_authority.clone());
+    }
     executable.pack_launch = Some(PackLaunchContext {
         expectation: pack_expectation(&lease),
         lease,
@@ -2870,12 +2900,45 @@ fn resolve_adjacent_inference_worker(current_executable: &Path) -> Result<PathBu
 
 impl WorkerExecutableResolver for InstalledWorkerExecutableResolver {
     fn resolve(&self, role: WorkerRole) -> Result<VerifiedWorkerExecutable> {
-        #[cfg(all(unix, not(debug_assertions)))]
+        #[cfg(all(
+            unix,
+            not(debug_assertions),
+            not(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))
+        ))]
         {
             let _ = role;
             bail!(
                 "release inference workers are unsupported on Unix until launch is bound to the verified executable descriptor"
             );
+        }
+        #[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
+        if role == WorkerRole::Inference {
+            let authority = crate::linux_worker_launch::InstalledWorkerAuthority::open_production(
+                option_env!("SCRIBE_BUNDLED_WORKER_SHA256").unwrap_or(""),
+            )
+            .context("could not admit the packaged Linux CPU inference worker")?;
+            let identity = authority.identity();
+            let open_file = authority
+                .duplicate_executable()
+                .context("could not retain the packaged Linux worker descriptor")?;
+            let linux_exec_authority: Arc<dyn crate::linux_worker_launch::LinuxExecAuthority> =
+                authority;
+            return Ok(VerifiedWorkerExecutable {
+                path: PathBuf::from(crate::linux_worker_launch::INSTALL_ROOT)
+                    .join(crate::linux_worker_launch::WORKER_NAME),
+                root: PathBuf::from(crate::linux_worker_launch::INSTALL_ROOT),
+                expected_name: crate::linux_worker_launch::WORKER_NAME.into(),
+                expected_sha256: identity.sha256.clone(),
+                identity: WorkerExecutableIdentity {
+                    length: identity.length,
+                    sha256: identity.sha256,
+                    device: identity.device,
+                    inode: identity.inode,
+                },
+                pack_launch: None,
+                linux_exec_authority: Some(linux_exec_authority),
+                _open_file: open_file,
+            });
         }
         let current = std::fs::canonicalize(std::env::current_exe()?)
             .context("could not canonicalize the running Scribe executable")?;
@@ -2981,6 +3044,31 @@ impl WorkerLauncher for OsWorkerLauncher {
             WorkerRole::Inference => INFERENCE_WORKER_FLAG,
             WorkerRole::Vad => VAD_WORKER_FLAG,
         };
+        #[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
+        if let Some(authority) = executable.linux_exec_authority.clone() {
+            let bindings = executable
+                .pack_launch
+                .as_ref()
+                .map(worker_pack_environment_bindings)
+                .unwrap_or_default();
+            let launched = crate::linux_worker_launch::launch_verified_worker(
+                authority,
+                worker_flag,
+                &bindings,
+            )
+            .context("descriptor-bound Linux worker launch failed")?;
+            return Ok(SpawnedWorker {
+                stdin: Box::new(launched.stdin),
+                stdout: Box::new(launched.stdout),
+                process: Arc::new(launched.process),
+                expectation,
+                pack_launch: executable.pack_launch,
+            });
+        }
+        #[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
+        if self.role == WorkerRole::Inference || executable.pack_launch.is_some() {
+            bail!("Linux inference worker resolved without descriptor launch authority");
+        }
         #[cfg(target_os = "macos")]
         if let Some(pack) = executable.pack_launch.as_ref() {
             let launched = crate::macos_worker_launch::launch_verified_worker(
@@ -3162,6 +3250,25 @@ impl WorkerProcess for crate::macos_worker_launch::MacWorkerProcess {
     }
 }
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
+impl WorkerProcess for crate::linux_worker_launch::LinuxWorkerProcess {
+    fn is_running(&self) -> Result<bool> {
+        Ok(self.is_running()?)
+    }
+
+    fn request_cooperative_cancel(&self) -> Result<bool> {
+        Ok(self.request_cooperative_cancel()?)
+    }
+
+    fn terminate(&self) -> Result<()> {
+        Ok(self.terminate()?)
+    }
+
+    fn wait(&self) -> Result<()> {
+        Ok(self.wait()?)
+    }
+}
+
 #[cfg(windows)]
 pub(crate) fn harden_windows_dll_search() -> Result<()> {
     use windows_sys::Win32::System::LibraryLoader::{
@@ -3186,6 +3293,50 @@ pub(crate) fn harden_windows_dll_search() -> Result<()> {
 
 #[cfg(not(windows))]
 pub(crate) fn harden_windows_dll_search() -> Result<()> {
+    Ok(())
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
+#[allow(
+    dead_code,
+    reason = "the shared supervisor module exposes this only to the dedicated worker binary"
+)]
+pub(crate) fn validate_linux_worker_entrypoint() -> Result<()> {
+    let mut arguments = std::env::args_os();
+    let _program = arguments
+        .next()
+        .ok_or_else(|| anyhow!("Linux inference worker received no argv[0]"))?;
+    if arguments.next().as_deref() != Some(std::ffi::OsStr::new(INFERENCE_WORKER_FLAG))
+        || arguments.next().is_some()
+    {
+        bail!("Linux inference worker requires exactly its private inference flag");
+    }
+    if std::env::var(PARENT_LIVENESS_ENV).as_deref() != Ok("5") {
+        bail!("Linux inference worker received an unexpected parent-liveness descriptor");
+    }
+    for (name, _) in std::env::vars_os() {
+        let Some(name) = name.to_str() else {
+            bail!("Linux inference worker environment name is not UTF-8");
+        };
+        if !matches!(name, "PATH" | "LANG") && !name.starts_with("SCRIBE_PRIVATE_") {
+            bail!("Linux inference worker received an unexpected environment field");
+        }
+    }
+    if unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) } != 1 {
+        bail!("Linux inference worker was not launched with no_new_privs");
+    }
+    if unsafe { libc::getpgrp() } != unsafe { libc::getpid() } {
+        bail!("Linux inference worker is not the leader of its private process group");
+    }
+    Ok(())
+}
+
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu")))]
+#[allow(
+    dead_code,
+    reason = "non-Linux desktop tests compile the dedicated worker entrypoint shim"
+)]
+pub(crate) fn validate_linux_worker_entrypoint() -> Result<()> {
     Ok(())
 }
 

@@ -15,8 +15,6 @@ use std::sync::{Arc, Mutex};
 
 pub(crate) const INSTALL_ROOT: &str = "/usr/lib/scribe";
 pub(crate) const WORKER_NAME: &str = "scribe-inference-worker";
-pub(crate) const DESKTOP_PATH: &str = "/usr/bin/local-transcriber";
-pub(crate) const FUTURE_PACK_ROOT: &str = "/usr/lib/scribe/workers/packs";
 
 const INSTALL_COMPONENTS: &[&CStr] = &[c"usr", c"lib", c"scribe"];
 const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
@@ -86,6 +84,8 @@ unsafe extern "C" {
     fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_int;
     fn _exit(status: c_int) -> !;
     fn __errno_location() -> *mut c_int;
+    #[cfg(test)]
+    fn fchown(fd: c_int, owner: c_uint, group: c_uint) -> c_int;
 }
 
 pub(crate) trait LinuxExecAuthority: Send + Sync {
@@ -125,6 +125,13 @@ pub(crate) struct InstalledWorkerAuthority {
     root_identity: FileIdentity,
     executable_identity: FileIdentity,
     expected_sha256: [u8; 32],
+}
+
+pub(crate) struct InstalledWorkerIdentity {
+    pub(crate) length: u64,
+    pub(crate) device: u64,
+    pub(crate) inode: u64,
+    pub(crate) sha256: String,
 }
 
 impl InstalledWorkerAuthority {
@@ -192,6 +199,23 @@ impl InstalledWorkerAuthority {
         });
         authority.recheck()?;
         Ok(authority)
+    }
+
+    pub(crate) fn identity(&self) -> InstalledWorkerIdentity {
+        InstalledWorkerIdentity {
+            length: self.executable_identity.length,
+            device: self.executable_identity.device,
+            inode: self.executable_identity.inode,
+            sha256: self
+                .expected_sha256
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+        }
+    }
+
+    pub(crate) fn duplicate_executable(&self) -> io::Result<File> {
+        self.executable.try_clone()
     }
 }
 
@@ -445,15 +469,27 @@ pub(crate) fn launch_verified_worker(
     worker_flag: &str,
     bindings: &[(String, String)],
 ) -> io::Result<LinuxSpawnedWorker> {
-    launch_verified_worker_inner(
-        authority,
+    authority.recheck()?;
+    #[cfg(not(test))]
+    let prepared = PreparedLaunch::new(
+        &*authority,
+        worker_flag,
+        bindings,
+        EXEC_HANDSHAKE_TIMEOUT_MS,
+    )?;
+    #[cfg(test)]
+    let prepared = PreparedLaunch::new(
+        &*authority,
         worker_flag,
         bindings,
         EXEC_HANDSHAKE_TIMEOUT_MS,
         0,
-    )
+    )?;
+    authority.recheck()?;
+    prepared.fork_exec(authority)
 }
 
+#[cfg(test)]
 fn launch_verified_worker_inner(
     authority: Arc<dyn LinuxExecAuthority>,
     worker_flag: &str,
@@ -489,6 +525,7 @@ struct PreparedLaunch {
     environment_storage: Vec<CString>,
     environment: Vec<*const c_char>,
     timeout_ms: c_int,
+    #[cfg(test)]
     child_test_action: u32,
 }
 
@@ -498,7 +535,7 @@ impl PreparedLaunch {
         worker_flag: &str,
         bindings: &[(String, String)],
         timeout_ms: c_int,
-        child_test_action: u32,
+        #[cfg(test)] child_test_action: u32,
     ) -> io::Result<Self> {
         if timeout_ms <= 0 {
             return Err(invalid("Linux worker exec timeout must be positive"));
@@ -553,6 +590,7 @@ impl PreparedLaunch {
             environment_storage,
             environment,
             timeout_ms,
+            #[cfg(test)]
             child_test_action,
         })
     }
@@ -602,18 +640,21 @@ impl PreparedLaunch {
         // SAFETY: this is the post-fork child. Every referenced descriptor and
         // pointer was prepared before fork and no other Rust code is invoked.
         unsafe {
-            child_dup(self.executable.raw(), EXEC_FD, true, 1);
-            child_dup(self.root.raw(), ROOT_FD, true, 2);
-            child_dup(self.child_liveness.raw(), LIVENESS_FD, false, 3);
-            child_dup(self.error_write.raw(), ERROR_FD, true, 4);
+            child_dup(self.error_write.raw(), ERROR_FD, true, 1);
+            child_dup(self.executable.raw(), EXEC_FD, true, 2);
+            child_dup(self.root.raw(), ROOT_FD, true, 3);
+            child_dup(self.child_liveness.raw(), LIVENESS_FD, false, 4);
             child_dup(self.child_stdin.raw(), 0, false, 5);
             child_dup(self.child_stdout.raw(), 1, false, 6);
-            if self.child_test_action == 1 {
-                child_fail(90);
-            }
-            if self.child_test_action == 2 {
-                let _ = poll(std::ptr::null_mut(), 0, -1);
-                child_fail(91);
+            #[cfg(test)]
+            {
+                if self.child_test_action == 1 {
+                    child_fail(90);
+                }
+                if self.child_test_action == 2 {
+                    let _ = poll(std::ptr::null_mut(), 0, -1);
+                    child_fail(91);
+                }
             }
             if setpgid(0, 0) == -1 {
                 child_fail(7);
@@ -687,16 +728,27 @@ unsafe fn child_fail(stage: u32) -> ! {
 }
 
 fn wait_for_exec(error_fd: RawFd, timeout_ms: c_int) -> io::Result<()> {
+    let deadline = std::time::Instant::now()
+        .checked_add(std::time::Duration::from_millis(timeout_ms as u64))
+        .ok_or_else(|| invalid("Linux worker exec timeout overflowed"))?;
     let mut record = [0_u8; ERROR_RECORD_LEN];
     let mut offset = 0;
     loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "Linux worker exec handshake timed out",
+            ));
+        }
+        let poll_timeout = remaining.as_millis().clamp(1, c_int::MAX as u128) as c_int;
         let mut descriptor = PollFd {
             fd: error_fd,
             events: POLLIN | POLLHUP | POLLERR,
             revents: 0,
         };
         // SAFETY: descriptor points to one writable pollfd.
-        let result = unsafe { poll(&mut descriptor, 1, timeout_ms) };
+        let result = unsafe { poll(&mut descriptor, 1, poll_timeout) };
         if result == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -1136,6 +1188,17 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn non_root_worker_owner_is_rejected() {
+        let fixture = Fixture::new();
+        let worker = File::open(&fixture.worker).unwrap();
+        if worker.metadata().unwrap().uid() == 0 {
+            assert_eq!(unsafe { fchown(worker.as_raw_fd(), 1, 1) }, 0);
+        }
+        assert_ne!(worker.metadata().unwrap().uid(), 0);
+        assert!(validate_executable(&worker, true, "owner fixture").is_err());
     }
 
     fn launch_fixture(fixture: &Fixture, mode: &str) -> io::Result<LinuxSpawnedWorker> {
