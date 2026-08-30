@@ -4,26 +4,6 @@ IFS=$'\n\t'
 trap 'status=$?; echo "macOS release packaging contract check failed at line $LINENO (exit $status)." >&2; exit "$status"' ERR
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
-# GitHub's macOS images do not guarantee ripgrep. Keep the source-contract
-# checks self-contained by translating the small option subset below to the
-# platform grep when rg is unavailable.
-if ! command -v rg >/dev/null 2>&1; then
-  rg() {
-    local mode='-E' argument status
-    local -a arguments=()
-    for argument in "$@"; do
-      if [[ "$argument" == '-F' ]]; then
-        mode='-F'
-      else
-        arguments+=("$argument")
-      fi
-    done
-    command grep "$mode" "${arguments[@]}" || {
-      status=$?
-      return "$status"
-    }
-  }
-fi
 scripts=(build-macos-metal-worker-pack.sh build-macos-release.sh sign-notarize-macos-release.sh verify-macos-release-package.sh report-macos-worker-pack-sizes.sh)
 for script in "${scripts[@]}"; do bash -n "$repo_root/scripts/$script"; done
 for manifest in "$repo_root"/runtime-manifests/gpu-{worker-toolchain,auto-qualification}-macos-{aarch64,x86_64}.json; do jq -e . "$manifest" >/dev/null; done
@@ -31,49 +11,49 @@ jq -e '. == {schema_version:2,catalog_sha256:"c3f19154f1b2265dac92206eae3a35c130
 jq -e '. == {schema_version:1,keychain_access_group:""}' "$repo_root/runtime-manifests/gpu-keychain-namespace-macos-release.json" >/dev/null || { echo 'production Keychain namespace must remain explicitly unprovisioned until reviewed.' >&2; exit 1; }
 jq -e '. == {schema_version:1,mode:"default_deny",target_os:"macos",target_arch:"aarch64",entries:[]}' "$repo_root/runtime-manifests/gpu-auto-qualification-macos-aarch64.json" >/dev/null
 jq -e '. == {schema_version:1,mode:"default_deny",target_os:"macos",target_arch:"x86_64",entries:[]}' "$repo_root/runtime-manifests/gpu-auto-qualification-macos-x86_64.json" >/dev/null
-if rg -n -- '--deep|Ed25519KeyPair|FIXTURE_SEED|SCRIBE_PACK_SIGNING_PRIVATE_KEY=' "$repo_root/scripts"/{build-macos-metal-worker-pack.sh,build-macos-release.sh,sign-notarize-macos-release.sh}; then echo 'macOS release scripts violate the signing-secret contract.' >&2; exit 1; fi
-rg -F 'xcrun notarytool submit "$submission_archive"' "$repo_root/scripts/sign-notarize-macos-release.sh" >/dev/null || { echo 'notarization must submit a private ZIP archive, not an app directory.' >&2; exit 1; }
-rg -F 'mv "$final_archive" "$requested_archive"' "$repo_root/scripts/sign-notarize-macos-release.sh" >/dev/null || { echo 'notarization must publish the requested ZIP only after stapling and verification.' >&2; exit 1; }
-rg -F 'desktop does not embed the final signed CPU worker anchor' "$repo_root/scripts/build-macos-release.sh" >/dev/null || { echo 'release builder must bind the desktop anchor to the signed CPU worker.' >&2; exit 1; }
-rg -F 'SCRIBE_GPU_PACK_RELEASE_AUTHORITY="$release_authority"' "$repo_root/scripts/build-macos-release.sh" >/dev/null || { echo 'both desktop slices must compile against the finalized release authority.' >&2; exit 1; }
-rg -F 'desktop slice does not embed the exact pack-catalog authority' "$repo_root/scripts/build-macos-release.sh" >/dev/null || { echo 'release builder must verify each desktop slice embeds the catalog authority.' >&2; exit 1; }
-rg -F 'desktop does not embed the exact pack-catalog authority' "$repo_root/scripts/verify-macos-release-package.sh" >/dev/null || { echo 'release verifier must bind the installed catalog to desktop authority.' >&2; exit 1; }
-rg -F 'desktop does not embed the exact release authority' "$repo_root/scripts/verify-macos-release-package.sh" >/dev/null || { echo 'release verifier must bind the desktop to the exact release authority.' >&2; exit 1; }
-rg -F 'release_security_epoch:$release_security_epoch' "$repo_root/scripts/build-macos-release.sh" >/dev/null || { echo 'release builder must write the requested release epoch into the authority.' >&2; exit 1; }
-rg -F 'keychain_access_group:$keychain_access_group' "$repo_root/scripts/build-macos-release.sh" >/dev/null || { echo 'release builder must bind the selected Keychain group into the authority.' >&2; exit 1; }
-rg -F -- '--security-epoch "$release_security_epoch"' "$repo_root/scripts/build-macos-release.sh" >/dev/null || { echo 'release builder must pass the release epoch to every Metal pack author invocation.' >&2; exit 1; }
-rg -F -- '--security-epoch "$security_epoch"' "$repo_root/scripts/build-macos-metal-worker-pack.sh" >/dev/null || { echo 'Metal pack author must use the supplied security epoch.' >&2; exit 1; }
-! rg -F -- '--security-epoch 1' "$repo_root/scripts/build-macos-metal-worker-pack.sh" "$repo_root/scripts/build-macos-release.sh" || { echo 'hard-coded Metal security epoch regression detected.' >&2; exit 1; }
-rg -F 'Metal packs require an explicit positive SCRIBE_MACOS_GPU_RELEASE_SECURITY_EPOCH.' "$repo_root/scripts/build-macos-release.sh" >/dev/null || { echo 'epoch-zero Metal catalog rejection is missing.' >&2; exit 1; }
-rg -F '9007199254740991' "$repo_root/scripts/build-macos-release.sh" "$repo_root/scripts/build-macos-metal-worker-pack.sh" "$repo_root/scripts/verify-macos-release-package.sh" >/dev/null || { echo 'exact JSON epoch bound is missing.' >&2; exit 1; }
-rg -F 'SCRIBE_MACOS_GPU_ROLLBACK_KEYCHAIN_ACCESS_GROUP' "$repo_root/scripts/build-macos-release.sh" >/dev/null || { echo 'protected release Keychain group requirement is missing.' >&2; exit 1; }
-rg -F '^[A-Z0-9]{10}\.com\.scribe\.local-transcriber$' "$repo_root/scripts/build-macos-release.sh" >/dev/null || { echo 'protected release must reject wildcard or unexpected Keychain groups.' >&2; exit 1; }
-rg -F 'provisioning profile must be a regular non-symlink file.' "$repo_root/scripts/build-macos-release.sh" >/dev/null || { echo 'protected release must reject unsafe provisioning-profile paths.' >&2; exit 1; }
-rg -F 'provisioning profile keychain groups do not authorize exactly the selected group.' "$repo_root/scripts/build-macos-release.sh" >/dev/null || { echo 'protected release must reject profile/group mismatch.' >&2; exit 1; }
-rg -F 'profile_application_identifier' "$repo_root/scripts/build-macos-release.sh" "$repo_root/scripts/verify-macos-release-package.sh" >/dev/null || { echo 'profile application-identifier authorization check is missing.' >&2; exit 1; }
-rg -F 'profile_team_identifier' "$repo_root/scripts/build-macos-release.sh" "$repo_root/scripts/verify-macos-release-package.sh" >/dev/null || { echo 'profile team-identifier authorization check is missing.' >&2; exit 1; }
-rg -F 'signed target does not expose the exact reviewed application, team, and Keychain identifiers' "$repo_root/scripts/build-macos-release.sh" >/dev/null || { echo 'protected release must verify final effective desktop entitlements.' >&2; exit 1; }
-rg -F 'source-reviewed Keychain namespace' "$repo_root/scripts/build-macos-release.sh" "$repo_root/scripts/verify-macos-release-package.sh" >/dev/null || { echo 'protected release must bind the source-reviewed Keychain namespace.' >&2; exit 1; }
-! rg -F 'Entitlements:' "$repo_root/scripts/build-macos-release.sh" "$repo_root/scripts/verify-macos-release-package.sh" || { echo 'plutil profile extraction must use key paths, not PlistBuddy colon syntax.' >&2; exit 1; }
-rg -F 'worker target must not expose the desktop Keychain access group' "$repo_root/scripts/build-macos-release.sh" >/dev/null || { echo 'release builder must keep workers free of the desktop Keychain entitlement.' >&2; exit 1; }
-rg -F 'worker target exposes malformed entitlement data' "$repo_root/scripts/build-macos-release.sh" >/dev/null || { echo 'release builder must reject malformed worker entitlement data.' >&2; exit 1; }
-rg -F 'embedded provisioning profile keychain groups are not exact.' "$repo_root/scripts/verify-macos-release-package.sh" >/dev/null || { echo 'package verifier must reject profile group mismatch.' >&2; exit 1; }
-rg -F 'application inventory is not exact.' "$repo_root/scripts/verify-macos-release-package.sh" >/dev/null || { echo 'package verifier must enforce profile-aware exact inventory.' >&2; exit 1; }
-rg -F 'worker must not expose the desktop Keychain group' "$repo_root/scripts/verify-macos-release-package.sh" >/dev/null || { echo 'package verifier must reject Keychain-entitled workers.' >&2; exit 1; }
-rg -F 'worker exposes malformed entitlement data' "$repo_root/scripts/verify-macos-release-package.sh" >/dev/null || { echo 'package verifier must reject malformed worker entitlement data.' >&2; exit 1; }
+if grep -En -- '--deep|Ed25519KeyPair|FIXTURE_SEED|SCRIBE_PACK_SIGNING_PRIVATE_KEY=' "$repo_root/scripts"/{build-macos-metal-worker-pack.sh,build-macos-release.sh,sign-notarize-macos-release.sh}; then echo 'macOS release scripts violate the signing-secret contract.' >&2; exit 1; fi
+grep -F 'xcrun notarytool submit "$submission_archive"' "$repo_root/scripts/sign-notarize-macos-release.sh" >/dev/null || { echo 'notarization must submit a private ZIP archive, not an app directory.' >&2; exit 1; }
+grep -F 'mv "$final_archive" "$requested_archive"' "$repo_root/scripts/sign-notarize-macos-release.sh" >/dev/null || { echo 'notarization must publish the requested ZIP only after stapling and verification.' >&2; exit 1; }
+grep -F 'desktop does not embed the final signed CPU worker anchor' "$repo_root/scripts/build-macos-release.sh" >/dev/null || { echo 'release builder must bind the desktop anchor to the signed CPU worker.' >&2; exit 1; }
+grep -F 'SCRIBE_GPU_PACK_RELEASE_AUTHORITY="$release_authority"' "$repo_root/scripts/build-macos-release.sh" >/dev/null || { echo 'both desktop slices must compile against the finalized release authority.' >&2; exit 1; }
+grep -F 'desktop slice does not embed the exact pack-catalog authority' "$repo_root/scripts/build-macos-release.sh" >/dev/null || { echo 'release builder must verify each desktop slice embeds the catalog authority.' >&2; exit 1; }
+grep -F 'desktop does not embed the exact pack-catalog authority' "$repo_root/scripts/verify-macos-release-package.sh" >/dev/null || { echo 'release verifier must bind the installed catalog to desktop authority.' >&2; exit 1; }
+grep -F 'desktop does not embed the exact release authority' "$repo_root/scripts/verify-macos-release-package.sh" >/dev/null || { echo 'release verifier must bind the desktop to the exact release authority.' >&2; exit 1; }
+grep -F 'release_security_epoch:$release_security_epoch' "$repo_root/scripts/build-macos-release.sh" >/dev/null || { echo 'release builder must write the requested release epoch into the authority.' >&2; exit 1; }
+grep -F 'keychain_access_group:$keychain_access_group' "$repo_root/scripts/build-macos-release.sh" >/dev/null || { echo 'release builder must bind the selected Keychain group into the authority.' >&2; exit 1; }
+grep -F -- '--security-epoch "$release_security_epoch"' "$repo_root/scripts/build-macos-release.sh" >/dev/null || { echo 'release builder must pass the release epoch to every Metal pack author invocation.' >&2; exit 1; }
+grep -F -- '--security-epoch "$security_epoch"' "$repo_root/scripts/build-macos-metal-worker-pack.sh" >/dev/null || { echo 'Metal pack author must use the supplied security epoch.' >&2; exit 1; }
+! grep -F -- '--security-epoch 1' "$repo_root/scripts/build-macos-metal-worker-pack.sh" "$repo_root/scripts/build-macos-release.sh" || { echo 'hard-coded Metal security epoch regression detected.' >&2; exit 1; }
+grep -F 'Metal packs require an explicit positive SCRIBE_MACOS_GPU_RELEASE_SECURITY_EPOCH.' "$repo_root/scripts/build-macos-release.sh" >/dev/null || { echo 'epoch-zero Metal catalog rejection is missing.' >&2; exit 1; }
+grep -F '9007199254740991' "$repo_root/scripts/build-macos-release.sh" "$repo_root/scripts/build-macos-metal-worker-pack.sh" "$repo_root/scripts/verify-macos-release-package.sh" >/dev/null || { echo 'exact JSON epoch bound is missing.' >&2; exit 1; }
+grep -F 'SCRIBE_MACOS_GPU_ROLLBACK_KEYCHAIN_ACCESS_GROUP' "$repo_root/scripts/build-macos-release.sh" >/dev/null || { echo 'protected release Keychain group requirement is missing.' >&2; exit 1; }
+grep -F '^[A-Z0-9]{10}\.com\.scribe\.local-transcriber$' "$repo_root/scripts/build-macos-release.sh" >/dev/null || { echo 'protected release must reject wildcard or unexpected Keychain groups.' >&2; exit 1; }
+grep -F 'provisioning profile must be a regular non-symlink file.' "$repo_root/scripts/build-macos-release.sh" >/dev/null || { echo 'protected release must reject unsafe provisioning-profile paths.' >&2; exit 1; }
+grep -F 'provisioning profile keychain groups do not authorize exactly the selected group.' "$repo_root/scripts/build-macos-release.sh" >/dev/null || { echo 'protected release must reject profile/group mismatch.' >&2; exit 1; }
+grep -F 'profile_application_identifier' "$repo_root/scripts/build-macos-release.sh" "$repo_root/scripts/verify-macos-release-package.sh" >/dev/null || { echo 'profile application-identifier authorization check is missing.' >&2; exit 1; }
+grep -F 'profile_team_identifier' "$repo_root/scripts/build-macos-release.sh" "$repo_root/scripts/verify-macos-release-package.sh" >/dev/null || { echo 'profile team-identifier authorization check is missing.' >&2; exit 1; }
+grep -F 'signed target does not expose the exact reviewed application, team, and Keychain identifiers' "$repo_root/scripts/build-macos-release.sh" >/dev/null || { echo 'protected release must verify final effective desktop entitlements.' >&2; exit 1; }
+grep -F 'source-reviewed Keychain namespace' "$repo_root/scripts/build-macos-release.sh" "$repo_root/scripts/verify-macos-release-package.sh" >/dev/null || { echo 'protected release must bind the source-reviewed Keychain namespace.' >&2; exit 1; }
+! grep -F 'Entitlements:' "$repo_root/scripts/build-macos-release.sh" "$repo_root/scripts/verify-macos-release-package.sh" || { echo 'plutil profile extraction must use key paths, not PlistBuddy colon syntax.' >&2; exit 1; }
+grep -F 'worker target must not expose the desktop Keychain access group' "$repo_root/scripts/build-macos-release.sh" >/dev/null || { echo 'release builder must keep workers free of the desktop Keychain entitlement.' >&2; exit 1; }
+grep -F 'worker target exposes malformed entitlement data' "$repo_root/scripts/build-macos-release.sh" >/dev/null || { echo 'release builder must reject malformed worker entitlement data.' >&2; exit 1; }
+grep -F 'embedded provisioning profile keychain groups are not exact.' "$repo_root/scripts/verify-macos-release-package.sh" >/dev/null || { echo 'package verifier must reject profile group mismatch.' >&2; exit 1; }
+grep -F 'application inventory is not exact.' "$repo_root/scripts/verify-macos-release-package.sh" >/dev/null || { echo 'package verifier must enforce profile-aware exact inventory.' >&2; exit 1; }
+grep -F 'worker must not expose the desktop Keychain group' "$repo_root/scripts/verify-macos-release-package.sh" >/dev/null || { echo 'package verifier must reject Keychain-entitled workers.' >&2; exit 1; }
+grep -F 'worker exposes malformed entitlement data' "$repo_root/scripts/verify-macos-release-package.sh" >/dev/null || { echo 'package verifier must reject malformed worker entitlement data.' >&2; exit 1; }
 [[ -f "$repo_root/installer/macos/Scribe.protected.entitlements.template" ]] || { echo 'protected desktop entitlement template is missing.' >&2; exit 1; }
-rg -F '<string>${SCRIBE_MACOS_GPU_ROLLBACK_KEYCHAIN_ACCESS_GROUP}</string>' "$repo_root/installer/macos/Scribe.protected.entitlements.template" >/dev/null || { echo 'protected entitlement template must contain only the generated group placeholder.' >&2; exit 1; }
-rg -F '<key>com.apple.application-identifier</key>' "$repo_root/installer/macos/Scribe.protected.entitlements.template" >/dev/null || { echo 'protected entitlement template must bind the application identifier.' >&2; exit 1; }
-rg -F '<string>${SCRIBE_MACOS_GPU_ROLLBACK_TEAM_IDENTIFIER}</string>' "$repo_root/installer/macos/Scribe.protected.entitlements.template" >/dev/null || { echo 'protected entitlement template must bind the team identifier.' >&2; exit 1; }
-embed_line="$(rg -n 'embedded\.provisionprofile' "$repo_root/scripts/build-macos-release.sh" | head -n 1 | cut -d: -f1)"
-sign_line="$(rg -n 'codesign --force --sign .*"[$]app"' "$repo_root/scripts/build-macos-release.sh" | tail -n 1 | cut -d: -f1)"
+grep -F '<string>${SCRIBE_MACOS_GPU_ROLLBACK_KEYCHAIN_ACCESS_GROUP}</string>' "$repo_root/installer/macos/Scribe.protected.entitlements.template" >/dev/null || { echo 'protected entitlement template must contain only the generated group placeholder.' >&2; exit 1; }
+grep -F '<key>com.apple.application-identifier</key>' "$repo_root/installer/macos/Scribe.protected.entitlements.template" >/dev/null || { echo 'protected entitlement template must bind the application identifier.' >&2; exit 1; }
+grep -F '<string>${SCRIBE_MACOS_GPU_ROLLBACK_TEAM_IDENTIFIER}</string>' "$repo_root/installer/macos/Scribe.protected.entitlements.template" >/dev/null || { echo 'protected entitlement template must bind the team identifier.' >&2; exit 1; }
+embed_line="$(grep -En 'embedded\.provisionprofile' "$repo_root/scripts/build-macos-release.sh" | head -n 1 | cut -d: -f1)"
+sign_line="$(grep -En 'codesign --force --sign .*"[$]app"' "$repo_root/scripts/build-macos-release.sh" | tail -n 1 | cut -d: -f1)"
 [[ "$embed_line" =~ ^[0-9]+$ && "$sign_line" =~ ^[0-9]+$ && "$embed_line" -lt "$sign_line" ]] || { echo 'provisioning profile must be embedded before final app signing.' >&2; exit 1; }
 structural_job="$(sed -n '/^  structural:/,/^  official-sign-notarize:/p' "$repo_root/.github/workflows/macos-release.yml")"
 ! grep -F 'secrets.' <<<"$structural_job" >/dev/null || { echo 'pull-request structural job must not receive production secrets.' >&2; exit 1; }
-rg -F 'lipo -verify_arch "$pack_lipo_arch" "$worker"' "$repo_root/scripts/verify-macos-release-package.sh" >/dev/null || { echo 'catalog Metal workers must have their declared single Mach-O slice verified.' >&2; exit 1; }
-rg -F 'CPU/UI binary must not load Metal.framework' "$repo_root/scripts/verify-macos-release-package.sh" >/dev/null || { echo 'desktop and CPU worker Metal load-command rejection is missing.' >&2; exit 1; }
-rg -F 'catalog Metal worker has no Metal load command' "$repo_root/scripts/verify-macos-release-package.sh" >/dev/null || { echo 'Metal worker load-command requirement is missing.' >&2; exit 1; }
-rg -F 'macOS Metal packs must contain only the manifest, signature, and declared worker.' "$repo_root/scripts/verify-macos-release-package.sh" >/dev/null || { echo 'single-payload macOS Metal pack enforcement is missing.' >&2; exit 1; }
+grep -F 'lipo -verify_arch "$pack_lipo_arch" "$worker"' "$repo_root/scripts/verify-macos-release-package.sh" >/dev/null || { echo 'catalog Metal workers must have their declared single Mach-O slice verified.' >&2; exit 1; }
+grep -F 'CPU/UI binary must not load Metal.framework' "$repo_root/scripts/verify-macos-release-package.sh" >/dev/null || { echo 'desktop and CPU worker Metal load-command rejection is missing.' >&2; exit 1; }
+grep -F 'catalog Metal worker has no Metal load command' "$repo_root/scripts/verify-macos-release-package.sh" >/dev/null || { echo 'Metal worker load-command requirement is missing.' >&2; exit 1; }
+grep -F 'macOS Metal packs must contain only the manifest, signature, and declared worker.' "$repo_root/scripts/verify-macos-release-package.sh" >/dev/null || { echo 'single-payload macOS Metal pack enforcement is missing.' >&2; exit 1; }
 if [[ "$(uname -s)" == Darwin ]]; then
   lipo_temp="$(mktemp -d "${TMPDIR:-/tmp}/scribe-macos-lipo-test.XXXXXX")"; trap 'rm -rf "$lipo_temp"' EXIT
   printf 'int main(void) { return 0; }\n' >"$lipo_temp/thin.c"
