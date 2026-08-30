@@ -18,6 +18,7 @@ pub(super) struct RenderPlan {
     pub target_opacity: u8,
     pub previous_opacity: u8,
     pub animated: bool,
+    pub exit_fade: bool,
     pub reserve_cancel_region: bool,
 }
 
@@ -174,6 +175,7 @@ impl OverlayTransitionEngine {
             target_opacity: 255,
             previous_opacity: 0,
             animated: false,
+            exit_fade: false,
             reserve_cancel_region: false,
         };
         let Some(active) = &self.active else {
@@ -204,6 +206,7 @@ impl OverlayTransitionEngine {
             .is_some_and(|old| old.control_requested)
             && !active.target.control_requested;
         if active.kind == TransitionKind::Exit {
+            plan.exit_fade = true;
             plan.target_opacity = 0;
             plan.previous_opacity = 255 - alpha;
         } else {
@@ -399,6 +402,19 @@ mod tests {
         let success = render(engine.tick(at + Duration::from_millis(141), false));
         assert_eq!(success.target.state.phase, OverlayPhase::Success);
         assert!(!success.animated);
+    }
+
+    #[test]
+    fn success_exit_is_marked_as_a_text_free_fade() {
+        let at = Instant::now();
+        let mut engine = OverlayTransitionEngine::default();
+        let _ = engine.advance(snapshot(OverlayPhase::Success), at, false);
+        let _ = engine.tick(at + Duration::from_millis(140), false);
+        let exit = render(engine.tick(at + Duration::from_millis(790), false));
+        assert!(exit.exit_fade);
+        assert!(exit.animated);
+        assert_eq!(exit.target_opacity, 0);
+        assert_eq!(exit.previous_opacity, 255);
     }
 
     #[test]

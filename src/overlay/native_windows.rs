@@ -983,28 +983,175 @@ impl NativeOverlayHost {
         display_bounds: OverlayWindowBounds,
         plan: Option<&RenderPlan>,
     ) -> Result<(), NativeOverlayFailure> {
-        let display_frame = if let Some(plan) = plan {
-            let target_decorative = self
-                .rasterizer
-                .render_display_decorative(
-                    &snapshot.state,
-                    snapshot.dark_mode,
-                    display_bounds.width,
-                    display_bounds.height,
-                )
-                .map_err(|_| {
-                    NativeOverlayFailure::new(
-                        NativeOverlayFailureStage::Rasterization,
-                        Some(WindowRole::Display),
+        let display_frame =
+            if let Some(plan) = plan {
+                if plan.exit_fade {
+                    // Success exits remove text first, then fade the text-free
+                    // capsule and decoration. No visible text is ever composited
+                    // over a partially transparent shell.
+                    let previous_frame = if let Some(previous) = &plan.previous
+                        && previous.state.mode == snapshot.state.mode
+                    {
+                        let mut frame = self
+                            .rasterizer
+                            .render_display_shell(
+                                &previous.state,
+                                previous.dark_mode,
+                                display_bounds.width,
+                                display_bounds.height,
+                            )
+                            .map_err(|_| {
+                                NativeOverlayFailure::new(
+                                    NativeOverlayFailureStage::Rasterization,
+                                    Some(WindowRole::Display),
+                                )
+                            })?;
+                        let decorative = self
+                            .rasterizer
+                            .render_display_decorative(
+                                &previous.state,
+                                previous.dark_mode,
+                                display_bounds.width,
+                                display_bounds.height,
+                            )
+                            .map_err(|_| {
+                                NativeOverlayFailure::new(
+                                    NativeOverlayFailureStage::Rasterization,
+                                    Some(WindowRole::Display),
+                                )
+                            })?;
+                        frame.composite_over(&decorative).map_err(|_| {
+                            NativeOverlayFailure::new(
+                                NativeOverlayFailureStage::Rasterization,
+                                Some(WindowRole::Display),
+                            )
+                        })?;
+                        frame
+                    } else {
+                        LayeredFrame::transparent(display_bounds.width, display_bounds.height)
+                            .map_err(|_| {
+                                NativeOverlayFailure::new(
+                                    NativeOverlayFailureStage::Rasterization,
+                                    Some(WindowRole::Display),
+                                )
+                            })?
+                    };
+                    let transparent =
+                        LayeredFrame::transparent(display_bounds.width, display_bounds.height)
+                            .map_err(|_| {
+                                NativeOverlayFailure::new(
+                                    NativeOverlayFailureStage::Rasterization,
+                                    Some(WindowRole::Display),
+                                )
+                            })?;
+                    LayeredFrame::crossfade(&previous_frame, &transparent, plan.previous_opacity, 0)
+                        .map_err(|_| {
+                            NativeOverlayFailure::new(
+                                NativeOverlayFailureStage::Rasterization,
+                                Some(WindowRole::Display),
+                            )
+                        })?
+                } else {
+                    // The shell remains fully opaque throughout enter and
+                    // semantic changes; only interior decoration crossfades.
+                    let mut frame = self
+                        .rasterizer
+                        .render_display_shell(
+                            &snapshot.state,
+                            snapshot.dark_mode,
+                            display_bounds.width,
+                            display_bounds.height,
+                        )
+                        .map_err(|_| {
+                            NativeOverlayFailure::new(
+                                NativeOverlayFailureStage::Rasterization,
+                                Some(WindowRole::Display),
+                            )
+                        })?;
+                    let target_decorative = self
+                        .rasterizer
+                        .render_display_decorative(
+                            &snapshot.state,
+                            snapshot.dark_mode,
+                            display_bounds.width,
+                            display_bounds.height,
+                        )
+                        .map_err(|_| {
+                            NativeOverlayFailure::new(
+                                NativeOverlayFailureStage::Rasterization,
+                                Some(WindowRole::Display),
+                            )
+                        })?;
+                    let previous_frame = if let Some(previous) = &plan.previous
+                        && previous.state.mode == snapshot.state.mode
+                    {
+                        self.rasterizer
+                            .render_display_decorative(
+                                &previous.state,
+                                previous.dark_mode,
+                                display_bounds.width,
+                                display_bounds.height,
+                            )
+                            .map_err(|_| {
+                                NativeOverlayFailure::new(
+                                    NativeOverlayFailureStage::Rasterization,
+                                    Some(WindowRole::Display),
+                                )
+                            })?
+                    } else {
+                        LayeredFrame::transparent(display_bounds.width, display_bounds.height)
+                            .map_err(|_| {
+                                NativeOverlayFailure::new(
+                                    NativeOverlayFailureStage::Rasterization,
+                                    Some(WindowRole::Display),
+                                )
+                            })?
+                    };
+                    let interior = LayeredFrame::crossfade(
+                        &previous_frame,
+                        &target_decorative,
+                        plan.previous_opacity,
+                        plan.target_opacity,
                     )
-                })?;
-            let previous_frame = if let Some(previous) = &plan.previous
-                && previous.state.mode == snapshot.state.mode
-            {
+                    .map_err(|_| {
+                        NativeOverlayFailure::new(
+                            NativeOverlayFailureStage::Rasterization,
+                            Some(WindowRole::Display),
+                        )
+                    })?;
+                    frame.composite_over(&interior).map_err(|_| {
+                        NativeOverlayFailure::new(
+                            NativeOverlayFailureStage::Rasterization,
+                            Some(WindowRole::Display),
+                        )
+                    })?;
+                    let target_text = self
+                        .rasterizer
+                        .render_display_text(
+                            &snapshot.state,
+                            snapshot.dark_mode,
+                            display_bounds.width,
+                            display_bounds.height,
+                        )
+                        .map_err(|_| {
+                            NativeOverlayFailure::new(
+                                NativeOverlayFailureStage::Rasterization,
+                                Some(WindowRole::Display),
+                            )
+                        })?;
+                    frame.composite_over(&target_text).map_err(|_| {
+                        NativeOverlayFailure::new(
+                            NativeOverlayFailureStage::Rasterization,
+                            Some(WindowRole::Display),
+                        )
+                    })?;
+                    frame
+                }
+            } else {
                 self.rasterizer
-                    .render_display_decorative(
-                        &previous.state,
-                        previous.dark_mode,
+                    .render_display(
+                        &snapshot.state,
+                        snapshot.dark_mode,
                         display_bounds.width,
                         display_bounds.height,
                     )
@@ -1014,64 +1161,7 @@ impl NativeOverlayHost {
                             Some(WindowRole::Display),
                         )
                     })?
-            } else {
-                LayeredFrame::transparent(display_bounds.width, display_bounds.height).map_err(
-                    |_| {
-                        NativeOverlayFailure::new(
-                            NativeOverlayFailureStage::Rasterization,
-                            Some(WindowRole::Display),
-                        )
-                    },
-                )?
             };
-            let mut frame = LayeredFrame::crossfade(
-                &previous_frame,
-                &target_decorative,
-                plan.previous_opacity,
-                plan.target_opacity,
-            )
-            .map_err(|_| {
-                NativeOverlayFailure::new(
-                    NativeOverlayFailureStage::Rasterization,
-                    Some(WindowRole::Display),
-                )
-            })?;
-            let target_text = self
-                .rasterizer
-                .render_display_text(
-                    &snapshot.state,
-                    snapshot.dark_mode,
-                    display_bounds.width,
-                    display_bounds.height,
-                )
-                .map_err(|_| {
-                    NativeOverlayFailure::new(
-                        NativeOverlayFailureStage::Rasterization,
-                        Some(WindowRole::Display),
-                    )
-                })?;
-            frame.composite_over(&target_text).map_err(|_| {
-                NativeOverlayFailure::new(
-                    NativeOverlayFailureStage::Rasterization,
-                    Some(WindowRole::Display),
-                )
-            })?;
-            frame
-        } else {
-            self.rasterizer
-                .render_display(
-                    &snapshot.state,
-                    snapshot.dark_mode,
-                    display_bounds.width,
-                    display_bounds.height,
-                )
-                .map_err(|_| {
-                    NativeOverlayFailure::new(
-                        NativeOverlayFailureStage::Rasterization,
-                        Some(WindowRole::Display),
-                    )
-                })?
-        };
         let accessibility_key = DisplayAccessibilityKey {
             mode: snapshot.state.mode,
             phase: snapshot.state.phase,

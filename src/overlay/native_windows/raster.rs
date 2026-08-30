@@ -463,9 +463,39 @@ impl NativeRasterizer {
         Ok(frame)
     }
 
-    /// Paints only the non-text layer used during semantic crossfades. The
-    /// caller composites the target text after blending so lifecycle copy
-    /// retains its contrast throughout every transition frame.
+    /// Paints the opaque, contrast-tested capsule beneath lifecycle text.
+    pub(super) fn render_display_shell(
+        &self,
+        state: &OverlayViewState,
+        dark_mode: bool,
+        width: i32,
+        height: i32,
+    ) -> Result<LayeredFrame, RasterError> {
+        let mut frame = LayeredFrame::transparent(width, height)?;
+        let layout = DisplayLayout::from_bounds(
+            state.mode,
+            OverlayWindowBounds {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            },
+        )
+        .ok_or(RasterError::InvalidDimensions)?;
+        let mut canvas = Canvas::new(self, &mut frame.pixels, width, height)?;
+        draw_capsule(
+            &mut canvas,
+            state.mode,
+            layout.scale,
+            NativeColors::for_theme(dark_mode),
+        )?;
+        drop(canvas);
+        Ok(frame)
+    }
+
+    /// Paints only non-text interior decoration used during transitions. The
+    /// caller places it over the stable shell and then composites lifecycle
+    /// text at full opacity.
     pub(super) fn render_display_decorative(
         &self,
         state: &OverlayViewState,
@@ -486,7 +516,6 @@ impl NativeRasterizer {
         .ok_or(RasterError::InvalidDimensions)?;
         let mut canvas = Canvas::new(self, &mut frame.pixels, width, height)?;
         let colors = NativeColors::for_theme(dark_mode);
-        draw_capsule(&mut canvas, state.mode, layout.scale, colors)?;
         draw_live_brand_mark(&mut canvas, state, &layout, colors)?;
         if state.mode == OverlayMode::Live && live_preview_is_visible(state) {
             draw_live_divider(&mut canvas, &layout, colors)?;
@@ -2467,9 +2496,14 @@ mod tests {
                 let target_decorative = rasterizer
                     .render_display_decorative(&target, dark_mode, width, height)
                     .unwrap();
-                let mut midpoint =
+                let target_shell = rasterizer
+                    .render_display_shell(&target, dark_mode, width, height)
+                    .unwrap();
+                let interior =
                     LayeredFrame::crossfade(&previous_decorative, &target_decorative, 127, 128)
                         .unwrap();
+                let mut midpoint = target_shell.clone();
+                midpoint.composite_over(&interior).unwrap();
                 let target_text = rasterizer
                     .render_display_text(&target, dark_mode, width, height)
                     .unwrap();
@@ -2509,9 +2543,7 @@ mod tests {
                 );
 
                 let center = ((height / 2 * width + width / 2) * 4) as usize;
-                let pixel: [u8; 4] = target_decorative.pixels[center..center + 4]
-                    .try_into()
-                    .unwrap();
+                let pixel: [u8; 4] = target_shell.pixels[center..center + 4].try_into().unwrap();
                 let colors = NativeColors::for_theme(dark_mode);
                 for backdrop in [0, 255] {
                     let surface = composite_premultiplied_bgra(pixel, backdrop);
@@ -2521,6 +2553,109 @@ mod tests {
                         "lifecycle text contrast {ratio:.2}:1 failed at the pulse minimum on the {} overlay over a {backdrop} backdrop",
                         if dark_mode { "dark" } else { "light" }
                     );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn enter_and_success_exit_never_place_visible_text_over_a_fading_capsule() {
+        with_rasterizer(|rasterizer| {
+            for mode in [OverlayMode::Minimal, OverlayMode::Live] {
+                for dpi in [96, 120, 144, 192] {
+                    let bounds = production_bounds(mode, dpi);
+                    for dark_mode in [false, true] {
+                        let mut entering = state(mode);
+                        entering.phase = OverlayPhase::Preparing;
+                        entering.progress_animation_enabled = true;
+                        let shell = rasterizer
+                            .render_display_shell(&entering, dark_mode, bounds.width, bounds.height)
+                            .unwrap();
+                        let decoration = rasterizer
+                            .render_display_decorative(
+                                &entering,
+                                dark_mode,
+                                bounds.width,
+                                bounds.height,
+                            )
+                            .unwrap();
+                        let text = rasterizer
+                            .render_display_text(&entering, dark_mode, bounds.width, bounds.height)
+                            .unwrap();
+                        let transparent =
+                            LayeredFrame::transparent(bounds.width, bounds.height).unwrap();
+
+                        for (name, decoration_alpha) in [("enter zero", 0), ("enter first", 1)] {
+                            let interior = LayeredFrame::crossfade(
+                                &transparent,
+                                &decoration,
+                                255 - decoration_alpha,
+                                decoration_alpha,
+                            )
+                            .unwrap();
+                            let mut frame = shell.clone();
+                            frame.composite_over(&interior).unwrap();
+                            frame.composite_over(&text).unwrap();
+
+                            let opaque_text_pixels = text
+                                .pixels
+                                .chunks_exact(4)
+                                .zip(frame.pixels.chunks_exact(4))
+                                .filter(|(text_pixel, frame_pixel)| {
+                                    text_pixel[3] == 255 && text_pixel == frame_pixel
+                                })
+                                .count();
+                            assert!(
+                                opaque_text_pixels > 0,
+                                "{name} must retain opaque lifecycle text at {dpi} DPI"
+                            );
+                            let center = ((bounds.height / 2 * bounds.width + bounds.width / 2) * 4)
+                                as usize;
+                            let shell_pixel: [u8; 4] =
+                                shell.pixels[center..center + 4].try_into().unwrap();
+                            let colors = NativeColors::for_theme(dark_mode);
+                            for backdrop in [0, 255] {
+                                let ratio = contrast_ratio(
+                                    phase_status_color(&entering, colors),
+                                    composite_premultiplied_bgra(shell_pixel, backdrop),
+                                );
+                                assert!(
+                                    ratio >= 4.5,
+                                    "{name} lifecycle text contrast {ratio:.2}:1 failed for {mode:?} at {dpi} DPI over a {backdrop} backdrop"
+                                );
+                            }
+                        }
+
+                        let mut success = entering;
+                        success.phase = OverlayPhase::Success;
+                        let mut exit_frame = rasterizer
+                            .render_display_shell(&success, dark_mode, bounds.width, bounds.height)
+                            .unwrap();
+                        let exit_decoration = rasterizer
+                            .render_display_decorative(
+                                &success,
+                                dark_mode,
+                                bounds.width,
+                                bounds.height,
+                            )
+                            .unwrap();
+                        exit_frame.composite_over(&exit_decoration).unwrap();
+                        let exit_frame =
+                            LayeredFrame::crossfade(&exit_frame, &transparent, 1, 0).unwrap();
+                        let success_text = rasterizer
+                            .render_display_text(&success, dark_mode, bounds.width, bounds.height)
+                            .unwrap();
+                        assert!(
+                            success_text
+                                .pixels
+                                .chunks_exact(4)
+                                .zip(exit_frame.pixels.chunks_exact(4))
+                                .all(|(text_pixel, exit_pixel)| {
+                                    text_pixel[3] != 255 || text_pixel != exit_pixel
+                                }),
+                            "success exit must be text-free before its capsule fades for {mode:?} at {dpi} DPI"
+                        );
+                    }
                 }
             }
         });
