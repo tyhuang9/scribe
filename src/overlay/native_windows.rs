@@ -1836,6 +1836,13 @@ fn run_native_overlay_thread(mailbox: Arc<SnapshotMailbox>, event_sink: NativeEv
 
         let now = Instant::now();
         if let Some(snapshot) = current_snapshot.as_ref() {
+            // Poll while a transition is active so a just-enabled reduced
+            // motion preference can snap the very next animation tick.
+            animations_enabled = refresh_active_transition_motion(
+                &transitions,
+                animations_enabled,
+                crate::system_preferences::client_area_animations_enabled(),
+            );
             let step = transitions.tick(now, !animations_enabled);
             let hidden = matches!(step, TransitionStep::Hidden);
             let progress_active = animations_enabled
@@ -1904,6 +1911,18 @@ fn run_native_overlay_thread(mailbox: Arc<SnapshotMailbox>, event_sink: NativeEv
     }
     pump_overlay_messages();
     emit_presented_if_changed(&event_sink, false, None, &mut last_presented);
+}
+
+fn refresh_active_transition_motion(
+    transitions: &OverlayTransitionEngine,
+    animations_enabled: bool,
+    current_preference: bool,
+) -> bool {
+    if transitions.is_active() {
+        current_preference
+    } else {
+        animations_enabled
+    }
 }
 
 fn process_transition_step(
@@ -2460,6 +2479,33 @@ mod tests {
             control_hit_test(WindowRole::Display, false),
             HTTRANSPARENT as LRESULT
         );
+    }
+
+    #[test]
+    fn worker_motion_refresh_snaps_an_active_transition_before_the_health_interval() {
+        let now = Instant::now();
+        let mut transitions = OverlayTransitionEngine::default();
+        let listening = snapshot_for_test();
+        let _ = transitions.advance(listening.clone(), now, false);
+        let mut finalizing = listening;
+        finalizing.state.phase = super::super::controller::OverlayPhase::Finalizing;
+        finalizing.control_requested = false;
+        let _ = transitions.advance(finalizing, now + Duration::from_millis(1), false);
+        assert!(transitions.is_active());
+
+        let animations_enabled = refresh_active_transition_motion(&transitions, true, false);
+        assert!(!animations_enabled);
+        match transitions.tick(now + Duration::from_millis(2), !animations_enabled) {
+            TransitionStep::Render(plan) => {
+                assert_eq!(
+                    plan.target.state.phase,
+                    super::super::controller::OverlayPhase::Finalizing
+                );
+                assert_eq!(plan.target_opacity, 255);
+                assert!(!plan.animated);
+            }
+            step => panic!("expected a reduced-motion target render, got {step:?}"),
+        }
     }
 
     #[test]

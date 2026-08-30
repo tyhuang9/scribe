@@ -58,6 +58,10 @@ pub(super) struct OverlayTransitionEngine {
 }
 
 impl OverlayTransitionEngine {
+    pub(super) fn is_active(&self) -> bool {
+        self.active.is_some()
+    }
+
     pub(super) fn advance(
         &mut self,
         incoming: OverlaySnapshot,
