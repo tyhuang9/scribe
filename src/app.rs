@@ -1524,8 +1524,8 @@ struct PreparedVerifiedInstall {
 
 #[derive(Debug)]
 enum PreparedArtifactInstall {
-    Gguf(PreparedVerifiedInstall),
-    Onnx(crate::onnx_model_bundles::StagedOnnxBundle),
+    Gguf(Box<PreparedVerifiedInstall>),
+    Onnx(Box<crate::onnx_model_bundles::StagedOnnxBundle>),
 }
 
 /// A local source has been fully re-hashed and exercised by the isolated
@@ -2518,7 +2518,7 @@ fn prepare_verified_install(
                     "Installation cancelled. Exact ONNX partials were retained for Resume.",
                 ));
             }
-            return Ok(PreparedArtifactInstall::Onnx(staged));
+            return Ok(PreparedArtifactInstall::Onnx(Box::new(staged)));
         }
         VerifiedInstallSource::TrustedRemote(request) => {
             let model = managed_downloads::prepare_trusted_gguf_model(
@@ -2545,12 +2545,14 @@ fn prepare_verified_install(
         ));
     }
 
-    Ok(PreparedArtifactInstall::Gguf(PreparedVerifiedInstall {
-        model_id,
-        model,
-        manifest_source,
-        remote_install_request,
-    }))
+    Ok(PreparedArtifactInstall::Gguf(Box::new(
+        PreparedVerifiedInstall {
+            model_id,
+            model,
+            manifest_source,
+            remote_install_request,
+        },
+    )))
 }
 
 fn run_verified_install_finalizer(
@@ -9267,7 +9269,7 @@ impl LocalTranscriberApp {
                         config,
                         service,
                         launch.cancellation,
-                        prepared,
+                        *prepared,
                         &progress,
                     );
                     let _ = completion_tx.send(());
@@ -9275,7 +9277,7 @@ impl LocalTranscriberApp {
                 }
                 PreparedArtifactInstall::Onnx(staged) => {
                     let cancellation = launch.cancellation;
-                    let result = run_onnx_bundle_finalizer(service, cancellation.clone(), staged);
+                    let result = run_onnx_bundle_finalizer(service, cancellation.clone(), *staged);
                     let recovery_required = result
                         .as_ref()
                         .err()
@@ -23812,7 +23814,7 @@ mod layout_tests {
     fn coordinator_prepared(model_id: &str) -> PreparedArtifactInstall {
         let model_id = ModelId::new(model_id);
         let destination = std::env::temp_dir().join("fixture.gguf");
-        PreparedArtifactInstall::Gguf(PreparedVerifiedInstall {
+        PreparedArtifactInstall::Gguf(Box::new(PreparedVerifiedInstall {
             model: crate::installations::DownloadedArtifact {
                 id: model_id.as_str().to_owned(),
                 path: PathBuf::from("fixture.gguf.partial"),
@@ -23825,7 +23827,7 @@ mod layout_tests {
             manifest_source: installed_manifest::ArtifactSource::normalized(&model_id).unwrap(),
             model_id,
             remote_install_request: None,
-        })
+        }))
     }
     #[test]
     fn installation_failures_preserve_recovery_required_classification() {
