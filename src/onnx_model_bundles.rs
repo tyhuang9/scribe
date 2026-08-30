@@ -1115,6 +1115,16 @@ impl VerifiedStagedOnnxBundle {
         &self.smoke
     }
 
+    /// Durable ownership evidence for the exact receipt that is about to be
+    /// activated. Callers must persist this only after activation commits.
+    pub(crate) fn removal_candidate(&self) -> Result<VerifiedOnnxRemovalCandidate, InstallError> {
+        removal_candidate_from_receipt(
+            &self.staged.receipt.model_id,
+            &self.staged.staged.target_root,
+            &self.staged.receipt,
+        )
+    }
+
     pub(crate) fn activate(self) -> Result<ActivatedOnnxBundle, InstallError> {
         let Self {
             staged,
@@ -1926,11 +1936,13 @@ impl OnnxBundleRemoval {
 pub(crate) fn stage_onnx_bundle_removal(
     storage_root: &Path,
     model_id: &str,
+    expected_receipt_sha256: &str,
     prior_config_fingerprint: String,
 ) -> Result<OnnxBundleRemoval, InstallError> {
     stage_onnx_bundle_removal_with(
         storage_root,
         model_id,
+        expected_receipt_sha256,
         prior_config_fingerprint,
         verified_removal_candidate_at,
     )
@@ -1939,9 +1951,11 @@ pub(crate) fn stage_onnx_bundle_removal(
 fn stage_onnx_bundle_removal_with(
     storage_root: &Path,
     model_id: &str,
+    expected_receipt_sha256: &str,
     prior_config_fingerprint: String,
     verify: impl FnOnce(&str, &Path) -> Result<VerifiedOnnxRemovalCandidate, InstallError>,
 ) -> Result<OnnxBundleRemoval, InstallError> {
+    validate_sha256(expected_receipt_sha256)?;
     let target_root = bundle_target_root(storage_root, model_id)?;
     let target_guard = acquire_bundle_target(&target_root)?;
     let capability = StableManagedDirectory::open_exact(&target_root, &target_root)?;
@@ -1949,6 +1963,14 @@ fn stage_onnx_bundle_removal_with(
     if candidate.target_root() != capability.path() {
         return Err(failed(
             "ONNX removal receipt did not bind the opened target directory",
+        ));
+    }
+    if !candidate
+        .receipt_sha256()
+        .eq_ignore_ascii_case(expected_receipt_sha256)
+    {
+        return Err(failed(
+            "ONNX removal receipt no longer matches the durable ownership witness",
         ));
     }
     let removal = ManagedRemoval::stage_stable_directory(capability, prior_config_fingerprint)?;
@@ -2773,6 +2795,9 @@ mod tests {
         let target = bundle_target_root(&storage, model_id).unwrap();
         let receipt = write_fixture_bundle(&target, model_id, "remove");
         let manifest = manifest_from_fixture_receipt(&receipt);
+        let authorized =
+            verified_removal_candidate_at_with_manifest_for_test(model_id, &target, &manifest)
+                .unwrap();
 
         let (_, stats) = observe_receipt_verifications_for_test(|| {
             verified_removal_candidate_at_with_manifest_for_test(model_id, &target, &manifest)
@@ -2780,6 +2805,7 @@ mod tests {
             let removal = stage_onnx_bundle_removal_with(
                 &storage,
                 model_id,
+                authorized.receipt_sha256(),
                 format!("{:x}", Sha256::digest(b"prior-config")),
                 |expected, root| {
                     verified_removal_candidate_at_with_manifest_for_test(expected, root, &manifest)
@@ -2801,6 +2827,7 @@ mod tests {
         let error = stage_onnx_bundle_removal_with(
             &storage,
             model_id,
+            authorized.receipt_sha256(),
             format!("{:x}", Sha256::digest(b"prior-config")),
             |expected, root| {
                 verified_removal_candidate_at_with_manifest_for_test(expected, root, &manifest)
@@ -2822,10 +2849,17 @@ mod tests {
         let restore_target = bundle_target_root(&restore_storage, model_id).unwrap();
         let receipt = write_fixture_bundle(&restore_target, model_id, "restore");
         let manifest = manifest_from_fixture_receipt(&receipt);
+        let restore_candidate = verified_removal_candidate_at_with_manifest_for_test(
+            model_id,
+            &restore_target,
+            &manifest,
+        )
+        .unwrap();
         let prior = format!("{:x}", Sha256::digest(b"prior-config"));
         let removal = stage_onnx_bundle_removal_with(
             &restore_storage,
             model_id,
+            restore_candidate.receipt_sha256(),
             prior.clone(),
             |expected, root| {
                 verified_removal_candidate_at_with_manifest_for_test(expected, root, &manifest)
@@ -2852,12 +2886,23 @@ mod tests {
         let commit_target = bundle_target_root(&commit_storage, model_id).unwrap();
         let receipt = write_fixture_bundle(&commit_target, model_id, "commit");
         let manifest = manifest_from_fixture_receipt(&receipt);
+        let commit_candidate = verified_removal_candidate_at_with_manifest_for_test(
+            model_id,
+            &commit_target,
+            &manifest,
+        )
+        .unwrap();
         let expected = format!("{:x}", Sha256::digest(b"expected-config"));
-        let mut removal =
-            stage_onnx_bundle_removal_with(&commit_storage, model_id, prior, |expected, root| {
+        let mut removal = stage_onnx_bundle_removal_with(
+            &commit_storage,
+            model_id,
+            commit_candidate.receipt_sha256(),
+            prior,
+            |expected, root| {
                 verified_removal_candidate_at_with_manifest_for_test(expected, root, &manifest)
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
         removal.prepare_config_commit(expected.clone()).unwrap();
         drop(removal);
         assert!(
