@@ -1407,6 +1407,25 @@ mod tests {
     }
 
     #[test]
+    fn keychain_access_group_is_bound_to_the_reviewed_app_namespace() {
+        assert!(super::canonical_keychain_access_group(
+            "ABCDE12345.com.scribe.local-transcriber"
+        ));
+        for rejected in [
+            "",
+            "abcde12345.com.scribe.local-transcriber",
+            "ABCDE1234.com.scribe.local-transcriber",
+            "ABCDE12345.com.scribe.other",
+            "ABCDE12345.*",
+        ] {
+            assert!(
+                !super::canonical_keychain_access_group(rejected),
+                "unexpected Keychain namespace accepted: {rejected}"
+            );
+        }
+    }
+
+    #[test]
     fn macos_bundle_executable_maps_to_resources_catalog_root() {
         let executable = std::path::Path::new("/Applications/Scribe.app/Contents/MacOS/Scribe");
         assert_eq!(
