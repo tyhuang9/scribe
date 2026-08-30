@@ -8122,6 +8122,17 @@ impl LocalTranscriberApp {
                         self.finish_artifact_install(&model_id, job_id);
                         continue;
                     }
+                    #[cfg(test)]
+                    let persistence = if self.config_path.is_none() {
+                        Ok(())
+                    } else {
+                        config::settings::artifact_config_fingerprint(&previous_config)
+                            .and_then(|prior_fingerprint| {
+                                config::save_artifact_config(&self.config, &prior_fingerprint)
+                            })
+                            .map_err(|error| error.to_string())
+                    };
+                    #[cfg(not(test))]
                     let persistence =
                         config::settings::artifact_config_fingerprint(&previous_config)
                             .and_then(|prior_fingerprint| {
