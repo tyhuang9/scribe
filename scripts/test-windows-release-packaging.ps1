@@ -197,6 +197,17 @@ function Assert-VulkanSdkWorkflowContract([string]$Workflow) {
         'cargo fetch --locked --manifest-path tools/worker-pack-author/Cargo.toml'
     ) 'locked root and worker-pack author dependency fetch'
 
+    $splitBuild = Get-WorkflowStepBlock $Workflow 'Check CPU-safe split production builds' 'Lint'
+    $expectedDesktopCheck = 'cargo check --locked --bin local-transcriber --features ui-harness'
+    $expectedWorkerCheck = 'cargo check --locked --bin scribe-inference-worker --features inference-worker'
+    if (-not $splitBuild.Contains($expectedDesktopCheck) -or
+        -not $splitBuild.Contains($expectedWorkerCheck) -or
+        $splitBuild.Contains('--all-features') -or
+        $splitBuild.Contains('cuda-acceleration') -or
+        $splitBuild.Contains('vulkan-acceleration')) {
+        throw 'Hosted Windows CI must compile the CPU-safe desktop and CPU inference worker as independent production feature sets.'
+    }
+
     $lint = Get-WorkflowStepBlock $Workflow 'Lint' 'Test'
     $test = Get-WorkflowStepBlock $Workflow 'Test' 'Download and verify pinned release inputs'
     $verifiedHostedFeatures = 'ui-harness,inference-worker,vulkan-acceleration'

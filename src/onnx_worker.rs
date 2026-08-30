@@ -1118,6 +1118,7 @@ impl PackDriverCatalog {
         Ok(Self { by_pci_location })
     }
 
+    #[cfg(any(feature = "inference-worker", test))]
     fn identity_for(&self, stable_device_identity: &str) -> Result<String> {
         let (bus, device, function) = parse_native_pci_location(stable_device_identity)
             .ok_or_else(|| anyhow!("GPU stable identity is not a canonical PCI location"))?;
@@ -1153,7 +1154,7 @@ impl Drop for VulkanInstanceGuard {
     }
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, any(feature = "inference-worker", test)))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct VulkanDeviceIdentity {
     normalized_display_name: String,
@@ -1164,12 +1165,12 @@ struct VulkanDeviceIdentity {
     claimed: bool,
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, any(feature = "inference-worker", test)))]
 struct VulkanDeviceCatalog {
     devices: Vec<VulkanDeviceIdentity>,
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, any(feature = "inference-worker", test)))]
 impl VulkanDeviceCatalog {
     #[cfg(feature = "vulkan-acceleration")]
     fn discover() -> Result<Self> {
@@ -1325,7 +1326,7 @@ impl VulkanDeviceCatalog {
     }
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, any(feature = "inference-worker", test)))]
 fn normalize_gpu_display_name(value: &str) -> Option<String> {
     let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
     (!normalized.is_empty()
@@ -1345,6 +1346,7 @@ impl PackDriverCatalog {
         bail!("Stage 4 GPU worker packs require Windows driver metadata")
     }
 
+    #[cfg(any(feature = "inference-worker", test))]
     fn identity_for(&self, _stable_device_identity: &str) -> Result<String> {
         bail!("Stage 4 GPU worker packs require Windows driver metadata")
     }
@@ -1354,7 +1356,7 @@ impl PackDriverCatalog {
     }
 }
 
-#[cfg(any(feature = "inference-worker", test))]
+#[cfg(any(all(windows, feature = "inference-worker"), test))]
 fn parse_native_pci_location(identity: &str) -> Option<(u32, u32, u32)> {
     if identity != identity.to_ascii_lowercase() {
         return None;

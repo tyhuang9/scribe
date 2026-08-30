@@ -163,6 +163,11 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      - name: Check CPU-safe split production builds
+        run: |
+          cargo check --locked --bin local-transcriber --features ui-harness
+          cargo check --locked --bin scribe-inference-worker --features inference-worker
+
       - name: Lint
         # Hosted PR runners receive the digest-pinned Vulkan SDK above, but do
         # not carry the exact CUDA toolkit required by the release contract.
