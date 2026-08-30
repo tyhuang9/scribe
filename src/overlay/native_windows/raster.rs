@@ -2804,7 +2804,8 @@ mod tests {
                 }
             }
 
-            for (name, state, width, height) in edge_golden_states() {
+            for (name, mut state, width, height) in edge_golden_states() {
+                state.progress_animation_enabled = false;
                 for (dark, theme) in [(false, "light"), (true, "dark")] {
                     let frame = rasterizer
                         .render_display(&state, dark, width, height)
@@ -2891,7 +2892,8 @@ mod tests {
                 }
             }
 
-            for (name, state, width, height) in edge_golden_states() {
+            for (name, mut state, width, height) in edge_golden_states() {
+                state.progress_animation_enabled = false;
                 for (dark, theme) in [(false, "light"), (true, "dark")] {
                     let frame = rasterizer
                         .render_display(&state, dark, width, height)
