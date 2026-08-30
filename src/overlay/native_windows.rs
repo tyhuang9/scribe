@@ -1888,7 +1888,7 @@ fn process_transition_step(
             last_presented,
             last_failure,
             animations_enabled,
-            Some(plan),
+            Some(*plan),
         ),
         TransitionStep::Hidden => {
             if let Some(host) = host.as_mut() {

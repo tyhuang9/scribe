@@ -26,7 +26,7 @@ pub(super) struct RenderPlan {
 /// In particular, a dismissed Success must never fall back to a raw snapshot.
 #[derive(Clone, Debug)]
 pub(super) enum TransitionStep {
-    Render(RenderPlan),
+    Render(Box<RenderPlan>),
     Idle,
     Hidden,
 }
@@ -176,7 +176,7 @@ impl OverlayTransitionEngine {
         };
         let Some(active) = &self.active else {
             return if force_submit {
-                TransitionStep::Render(plan)
+                TransitionStep::Render(Box::new(plan))
             } else {
                 TransitionStep::Idle
             };
@@ -191,7 +191,7 @@ impl OverlayTransitionEngine {
                 self.displayed = None;
                 return TransitionStep::Hidden;
             }
-            return TransitionStep::Render(plan);
+            return TransitionStep::Render(Box::new(plan));
         }
         let alpha = (fraction * 255.0).round() as u8;
         plan.previous = active.previous.clone();
@@ -208,7 +208,7 @@ impl OverlayTransitionEngine {
             plan.target_opacity = alpha;
             plan.previous_opacity = 255 - alpha;
         }
-        TransitionStep::Render(plan)
+        TransitionStep::Render(Box::new(plan))
     }
 
     fn clear(&mut self) {
@@ -318,7 +318,7 @@ mod tests {
 
     fn render(step: TransitionStep) -> RenderPlan {
         match step {
-            TransitionStep::Render(plan) => plan,
+            TransitionStep::Render(plan) => *plan,
             other => panic!("expected render, got {other:?}"),
         }
     }
