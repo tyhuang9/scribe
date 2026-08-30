@@ -229,9 +229,15 @@ impl OverlayTransitionEngine {
         snapshot.state.audio_level.peak = self.smoothed_peak;
     }
 
-    pub(super) fn next_wait(&self, progress_active: bool) -> Duration {
+    pub(super) fn next_wait(&self, now: Instant, progress_active: bool) -> Duration {
         if self.active.is_some() {
             FRAME_INTERVAL
+        } else if let Some(success_since) = self.success_since
+            && !self.success_dismissed
+        {
+            (SEMANTIC_CROSSFADE + SUCCESS_DWELL)
+                .saturating_sub(now.duration_since(success_since))
+                .min(Duration::from_millis(500))
         } else if progress_active {
             METER_INTERVAL
         } else {
@@ -345,7 +351,10 @@ mod tests {
     #[test]
     fn static_worker_waits_without_busy_spinning() {
         let engine = OverlayTransitionEngine::default();
-        assert_eq!(engine.next_wait(false), Duration::from_millis(500));
+        assert_eq!(
+            engine.next_wait(Instant::now(), false),
+            Duration::from_millis(500)
+        );
     }
 
     #[test]

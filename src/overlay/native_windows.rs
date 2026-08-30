@@ -1774,8 +1774,18 @@ fn run_native_overlay_thread(mailbox: Arc<SnapshotMailbox>, event_sink: NativeEv
 
         let now = Instant::now();
         if let Some(plan) = transitions.tick(now, !animations_enabled)
-            && plan.animated
             && let Some(snapshot) = current_snapshot.as_ref()
+            && (plan.animated
+                || (animations_enabled
+                    && snapshot.requested_visible
+                    && matches!(
+                        snapshot.state.phase,
+                        super::controller::OverlayPhase::Listening
+                            | super::controller::OverlayPhase::Preparing
+                            | super::controller::OverlayPhase::Finalizing
+                            | super::controller::OverlayPhase::Processing
+                            | super::controller::OverlayPhase::Pasting
+                    )))
         {
             process_snapshot(
                 &mut host,
@@ -1804,6 +1814,7 @@ fn run_native_overlay_thread(mailbox: Arc<SnapshotMailbox>, event_sink: NativeEv
             .as_ref()
             .map_or(OVERLAY_THREAD_IDLE_INTERVAL, |snapshot| {
                 transitions.next_wait(
+                    now,
                     animations_enabled
                         && snapshot.requested_visible
                         && snapshot.state.phase.is_progressing(),
