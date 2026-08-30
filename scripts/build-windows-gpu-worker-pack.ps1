@@ -258,11 +258,19 @@ function Assert-LockedPackage(
     [string]$Version,
     [string]$Checksum
 ) {
+    if ($CargoLock.IndexOf([char]0) -ge 0) {
+        throw 'Cargo.lock contains a NUL byte.'
+    }
+    # actions/checkout may materialize the text lockfile with CRLF on Windows,
+    # while developer worktrees commonly retain LF. Normalize text newlines
+    # before applying the exact package-block contract; package values remain
+    # byte-for-byte compared below.
+    $normalizedCargoLock = $CargoLock.Replace("`r`n", "`n").Replace("`r", "`n")
     $escapedName = [regex]::Escape($Name)
     $escapedVersion = [regex]::Escape($Version)
     $escapedChecksum = [regex]::Escape($Checksum)
-    $blockPattern = '(?ms)^\[\[package\]\]\r?\n(?<body>.*?)(?=^\[\[package\]\]|\z)'
-    $matches = @([regex]::Matches($CargoLock, $blockPattern) | Where-Object {
+    $blockPattern = '(?ms)^\[\[package\]\]\n(?<body>.*?)(?=^\[\[package\]\]|\z)'
+    $matches = @([regex]::Matches($normalizedCargoLock, $blockPattern) | Where-Object {
         $_.Groups['body'].Value -match "(?m)^name = `"$escapedName`"$" -and
         $_.Groups['body'].Value -match "(?m)^version = `"$escapedVersion`"$" -and
         $_.Groups['body'].Value -match "(?m)^checksum = `"$escapedChecksum`"$"
