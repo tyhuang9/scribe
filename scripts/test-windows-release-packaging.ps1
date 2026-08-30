@@ -199,9 +199,14 @@ function Assert-VulkanSdkWorkflowContract([string]$Workflow) {
 
     $lint = Get-WorkflowStepBlock $Workflow 'Lint' 'Test'
     $test = Get-WorkflowStepBlock $Workflow 'Test' 'Download and verify pinned release inputs'
-    if (-not $lint.Contains('cargo clippy --locked --all-targets --all-features -- -D warnings') -or
-        -not $test.Contains('cargo test --locked --all-features')) {
-        throw 'Windows lint and test jobs must continue exercising all Cargo features after verified Vulkan SDK setup.'
+    $verifiedHostedFeatures = 'ui-harness,inference-worker,vulkan-acceleration'
+    if (-not $lint.Contains("cargo clippy --locked --all-targets --features $verifiedHostedFeatures -- -D warnings") -or
+        -not $test.Contains("cargo test --locked --all-targets --features $verifiedHostedFeatures") -or
+        $lint.Contains('--all-features') -or
+        $test.Contains('--all-features') -or
+        $lint.Contains('cuda-acceleration') -or
+        $test.Contains('cuda-acceleration')) {
+        throw 'Hosted Windows lint and test jobs must exercise the app, worker, and verified Vulkan feature set without claiming unavailable CUDA coverage.'
     }
 }
 

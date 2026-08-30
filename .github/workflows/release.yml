@@ -164,10 +164,15 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Lint
-        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+        # Hosted PR runners receive the digest-pinned Vulkan SDK above, but do
+        # not carry the exact CUDA toolkit required by the release contract.
+        # CUDA is compiled by the production worker-pack build after that
+        # script verifies its pinned toolkit; do not make ordinary CI claim
+        # CUDA coverage by enabling a native feature it cannot satisfy.
+        run: cargo clippy --locked --all-targets --features ui-harness,inference-worker,vulkan-acceleration -- -D warnings
 
       - name: Test
-        run: cargo test --locked --all-features
+        run: cargo test --locked --all-targets --features ui-harness,inference-worker,vulkan-acceleration
 
       - name: Download and verify pinned release inputs
         shell: pwsh
