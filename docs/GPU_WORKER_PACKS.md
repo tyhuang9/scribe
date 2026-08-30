@@ -7,12 +7,14 @@ provider probe, challenge-bound SCIF Hello reconciliation, and authoritative
 per-device Windows driver mapping. `Auto` remains deliberately default-denied
 to GPU until Stage 5 hardware qualification. The checked-in production trust
 root is still empty, so ordinary releases remain CPU-only and a requested
-nonempty GPU release fails closed until a separately reviewed public key and CI
-signing secret are provisioned. Official releases additionally require the
+nonempty GPU release fails closed until a separately reviewed public key and
+protected trusted signing workflow are provisioned. The candidate-ref release
+workflow never receives signing authority. Official releases additionally require the
 reviewed `SCRIBE_GPU_PACK_RELEASE_POLICY` repository variable. Its temporary
 Stage 4 value is `temporary_cpu_only_stage4`; once production trust is
-provisioned it must be changed to `gpu_packs_required`, which forces both packs
-for tag and manual publication without relying on a dispatch checkbox.
+provisioned it may be changed to `gpu_packs_required` only with a separate
+trusted workflow that signs fixed verified unsigned artifacts and returns both
+packs for publication.
 
 ## Current Stage 4 behavior
 
@@ -170,20 +172,20 @@ provisioned. When a release includes packs, the same catalog is inside the
 portable payload and the installer copies that exact tree; CI emits a separate
 per-pack installed and compressed size report from the verified catalog.
 
-Repository tooling contains no production private key. A non-publication
-workflow dispatch can request both packs for release validation. Official
-publication fails when the reviewed repository policy is absent or unknown;
-the temporary Stage 4 policy explicitly forbids packs, while
-`gpu_packs_required` forces both CUDA and Vulkan. The production build accepts
-only an externally supplied base64 PKCS#8 CI secret and reviewed key ID,
-materializes the key under the runner temporary directory for the signing step,
-zeroes its decoded byte buffer, and deletes the file in `finally`. The authoring
-tool verifies that its public key exactly matches the separately reviewed key
-embedded in `ProductionTrustRoot`. Because no production public key is checked
-in today, this gate rejects every requested nonempty GPU release. The normal
-CPU-only build remains usable. The deterministic seed and key ID used by
-tooling tests and local hardware smoke are fixture-only and cannot verify under
-production trust.
+Repository tooling contains no production private key. The candidate-ref
+workflow contains no production-key secret reference, accepts no GPU-pack
+dispatch request, and always creates the CPU-only portable/installer payload.
+Official publication fails when the reviewed repository policy is absent or
+unknown; the temporary Stage 4 policy is explicitly CPU-only, while
+`gpu_packs_required` remains unavailable until a separate protected trusted
+workflow can sign fixed verified unsigned artifacts. That signer must verify the
+approved source/revision and complete unsigned-artifact digests before receiving
+authority; candidate-ref scripts must not run with the key. The authoring tool
+still verifies that a supplied key's public half exactly matches the separately
+reviewed key embedded in `ProductionTrustRoot`. Because no production public key
+or trusted signer exists today, every nonempty production release fails closed.
+The deterministic seed and key ID used by tooling tests and local hardware smoke
+are fixture-only and cannot verify under production trust.
 
 ## Windows Vulkan hardware evidence
 
@@ -219,9 +221,13 @@ the expected `ask not` phrase, warm reuse, and zero CPU launches. This evidence
 verifies compiler-payload selection across Visual Studio shells; it does not
 replace remote CI, CUDA, production-signing, installer, or Auto qualification.
 
-CUDA was not built or run locally because the pinned CUDA Toolkit/nvcc 12.8.93
-is absent. Production signing and packaging remain intentionally unverified and
-fail closed because no reviewed production public key or CI private key exists.
+CUDA was not built or run locally because CUDA Toolkit/nvcc 12.8.93 is absent.
+Fixture mode checks that exact developer-toolkit version. Production mode also
+requires a complete canonical CUDA Toolkit inventory with exact SHA-256 values;
+the checked-in inventory is intentionally empty, so same-version modified inputs
+cannot become production-trusted packs. Production signing and packaging remain
+intentionally unverified and fail closed because no reviewed production public
+key or protected trusted signer exists.
 Auto enablement, five-cold/twenty-warm performance qualification, driver/device
 loss qualification, and portable/installer hardware execution remain later
 release evidence rather than claims established by this smoke.

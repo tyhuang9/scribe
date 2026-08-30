@@ -39,9 +39,10 @@ security-epoch rollback floor, one-active-worker ownership, and private bounded
 health/quarantine state. Explicit GPU can fall back only across verified GPU
 routes before output and never to CPU. `Auto` remains CPU/default-denied to GPU.
 The checked-in production trust root is empty, so ordinary packages still
-contain an empty worker-pack catalog and an opt-in nonempty release fails closed
-until a production public key and matching external CI secret are separately
-provisioned.
+contain an empty worker-pack catalog. The candidate-ref release workflow never
+receives signing authority; a nonempty release remains fail-closed until a
+production public key and a separately protected trusted signing workflow over
+fixed verified unsigned artifacts are provisioned.
 See [Verified GPU worker-pack infrastructure](GPU_WORKER_PACKS.md).
 
 ## How to read this record
