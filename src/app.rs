@@ -539,9 +539,11 @@ struct PendingRecording {
 enum AbandonedCaptureCleanup {
     AwaitingCapture {
         session_id: SessionId,
+        capture_id: audio::CaptureId,
     },
     Draining {
         session_id: SessionId,
+        capture_id: Option<audio::CaptureId>,
         session: RecordingSession,
     },
 }
@@ -549,7 +551,16 @@ enum AbandonedCaptureCleanup {
 impl AbandonedCaptureCleanup {
     fn session_id(&self) -> SessionId {
         match self {
-            Self::AwaitingCapture { session_id } | Self::Draining { session_id, .. } => *session_id,
+            Self::AwaitingCapture { session_id, .. } | Self::Draining { session_id, .. } => {
+                *session_id
+            }
+        }
+    }
+
+    fn capture_id(&self) -> Option<audio::CaptureId> {
+        match self {
+            Self::AwaitingCapture { capture_id, .. } => Some(*capture_id),
+            Self::Draining { capture_id, .. } => *capture_id,
         }
     }
 }
@@ -3510,11 +3521,12 @@ impl LocalTranscriberApp {
             if let Some(capture_id) = self.capture_control_id.take() {
                 let _ = self.capture_controller.handle().abort(capture_id);
                 let _ = self.capture_controller.handle().release(capture_id.0);
+                self.abandoned_capture_cleanups
+                    .push(AbandonedCaptureCleanup::AwaitingCapture {
+                        session_id: pending.session_id,
+                        capture_id,
+                    });
             }
-            self.abandoned_capture_cleanups
-                .push(AbandonedCaptureCleanup::AwaitingCapture {
-                    session_id: pending.session_id,
-                });
             self.record_session_diagnostic(
                 pending.session_id,
                 &pending.latency,
@@ -3675,13 +3687,21 @@ impl LocalTranscriberApp {
         let mut index = 0;
         while index < self.abandoned_capture_cleanups.len() {
             let finished = match &self.abandoned_capture_cleanups[index] {
-                AbandonedCaptureCleanup::AwaitingCapture { .. } => false,
+                AbandonedCaptureCleanup::AwaitingCapture { capture_id, .. } => {
+                    self.capture_controller
+                        .handle()
+                        .owner_id(audio::control::AudioOwnerKind::Capture)
+                        != Some(capture_id.0)
+                }
                 AbandonedCaptureCleanup::Draining { session, .. } => session.try_finish().is_some(),
             };
             if finished {
-                self.abandoned_capture_cleanups.remove(index);
-                if let Some(capture_id) = self.capture_control_id.take() {
+                let cleanup = self.abandoned_capture_cleanups.remove(index);
+                if let Some(capture_id) = cleanup.capture_id() {
                     let _ = self.capture_controller.handle().release(capture_id.0);
+                    if self.capture_control_id == Some(capture_id) {
+                        self.capture_control_id = None;
+                    }
                 }
             } else {
                 index += 1;
@@ -3694,6 +3714,11 @@ impl LocalTranscriberApp {
         session_id: SessionId,
         result: Result<RecordingSession, CaptureError>,
     ) {
+        let capture_id = self
+            .abandoned_capture_cleanups
+            .iter()
+            .find(|cleanup| cleanup.session_id() == session_id)
+            .and_then(AbandonedCaptureCleanup::capture_id);
         self.abandoned_capture_cleanups
             .retain(|cleanup| cleanup.session_id() != session_id);
         if let Ok(session) = result {
@@ -3701,6 +3726,7 @@ impl LocalTranscriberApp {
             self.abandoned_capture_cleanups
                 .push(AbandonedCaptureCleanup::Draining {
                     session_id,
+                    capture_id,
                     session,
                 });
         }
@@ -4036,9 +4062,12 @@ impl LocalTranscriberApp {
             if let Some(capture_id) = self.capture_control_id.take() {
                 let _ = self.capture_controller.handle().abort(capture_id);
                 let _ = self.capture_controller.handle().release(capture_id.0);
+                self.abandoned_capture_cleanups
+                    .push(AbandonedCaptureCleanup::AwaitingCapture {
+                        session_id,
+                        capture_id,
+                    });
             }
-            self.abandoned_capture_cleanups
-                .push(AbandonedCaptureCleanup::AwaitingCapture { session_id });
             self.record_session_diagnostic(
                 session_id,
                 &pending.latency,
@@ -4054,13 +4083,15 @@ impl LocalTranscriberApp {
                 DiagnosticSessionOutcome::Cancelled,
                 None,
             );
-            if let Some(capture_id) = self.controller_capture_id() {
+            let capture_id = self.controller_capture_id();
+            if let Some(capture_id) = capture_id {
                 let _ = self.capture_controller.handle().abort(capture_id);
             }
             active.session.abort();
             self.abandoned_capture_cleanups
                 .push(AbandonedCaptureCleanup::Draining {
                     session_id,
+                    capture_id,
                     session: active.session,
                 });
         } else {
@@ -4825,13 +4856,15 @@ impl LocalTranscriberApp {
             self.fail_history_context(context, "Dictation was superseded");
         }
         if let Some(pending) = self.pending_recording.take() {
-            if let Some(capture_id) = self.controller_capture_id() {
+            if let Some(capture_id) = self.capture_control_id.take() {
                 let _ = self.capture_controller.handle().stop(capture_id);
+                let _ = self.capture_controller.handle().release(capture_id.0);
+                self.abandoned_capture_cleanups
+                    .push(AbandonedCaptureCleanup::AwaitingCapture {
+                        session_id: pending.session_id,
+                        capture_id,
+                    });
             }
-            self.abandoned_capture_cleanups
-                .push(AbandonedCaptureCleanup::AwaitingCapture {
-                    session_id: pending.session_id,
-                });
             self.record_session_diagnostic(
                 pending.session_id,
                 &pending.latency,
@@ -5191,7 +5224,15 @@ impl LocalTranscriberApp {
 
         if let Some((source, session_id, result)) = finished {
             if let Some(capture_id) = self.controller_capture_id() {
-                let _ = self.capture_controller.handle().release(capture_id.0);
+                if self
+                    .capture_controller
+                    .handle()
+                    .release(capture_id.0)
+                    .is_ok()
+                    && self.capture_control_id == Some(capture_id)
+                {
+                    self.capture_control_id = None;
+                }
             }
             let active = self
                 .active_recording
@@ -5409,7 +5450,41 @@ impl LocalTranscriberApp {
                     owner: audio::control::AudioOwnerKind::Capture,
                     error,
                 } => {
+                    if self
+                        .abandoned_capture_cleanups
+                        .iter()
+                        .any(|cleanup| cleanup.capture_id() == Some(capture_id))
+                    {
+                        self.abandoned_capture_cleanups
+                            .retain(|cleanup| cleanup.capture_id() != Some(capture_id));
+                        if self.capture_control_id == Some(capture_id) {
+                            self.capture_control_id = None;
+                        }
+                        continue;
+                    }
                     if self.capture_control_id == Some(capture_id)
+                        && self.pending_recording.as_ref().is_some_and(|pending| {
+                            pending.stop_requested
+                                && matches!(error, CaptureError::StartupCancelled)
+                        })
+                    {
+                        let pending = self
+                            .pending_recording
+                            .take()
+                            .expect("cancelled pending capture should still exist");
+                        self.capture_control_id = None;
+                        self.record_session_diagnostic(
+                            pending.session_id,
+                            &pending.latency,
+                            DiagnosticSessionOutcome::Cancelled,
+                            None,
+                        );
+                        let _ = self.session_coordinator.cancel_active();
+                        self.retire_captured_target(pending.session_id);
+                        let _ = self.overlay_controller.hide(pending.session_id);
+                        self.status = TranscriptionStatus::Idle;
+                        self.status_message = "Recording cancelled".to_owned();
+                    } else if self.capture_control_id == Some(capture_id)
                         && let Some(session_id) = self
                             .pending_recording
                             .as_ref()
@@ -5455,6 +5530,23 @@ impl LocalTranscriberApp {
                 }
                 audio::control::CaptureLifecycleEvent::Reconfigured { revision } => {
                     let _ = revision;
+                }
+                audio::control::CaptureLifecycleEvent::Released { capture_id, owner } => {
+                    match owner {
+                        audio::control::AudioOwnerKind::Capture => {
+                            self.abandoned_capture_cleanups
+                                .retain(|cleanup| cleanup.capture_id() != Some(capture_id));
+                            if self.capture_control_id == Some(capture_id) {
+                                self.capture_control_id = None;
+                            }
+                        }
+                        audio::control::AudioOwnerKind::MicrophoneTest => {
+                            if self.microphone_test_control_id == Some(capture_id) {
+                                self.microphone_test_control_id = None;
+                            }
+                        }
+                        audio::control::AudioOwnerKind::Playback => {}
+                    }
                 }
                 audio::control::CaptureLifecycleEvent::Failed { .. }
                 | audio::control::CaptureLifecycleEvent::Shutdown => {}
@@ -6460,9 +6552,11 @@ impl LocalTranscriberApp {
                         Ok(session) => {
                             if let Err(err) = self.session_coordinator.capture_started(session_id) {
                                 session.stop();
+                                let capture_id = self.capture_control_id.take();
                                 self.abandoned_capture_cleanups.push(
                                     AbandonedCaptureCleanup::Draining {
                                         session_id,
+                                        capture_id,
                                         session,
                                     },
                                 );
@@ -15642,6 +15736,40 @@ mod layout_tests {
     }
 
     #[test]
+    fn expected_startup_cancellation_returns_to_idle_without_failure_ui() {
+        let mut app = test_app();
+        install_cancellable_capture(&mut app);
+        let session_id = app
+            .session_coordinator
+            .begin(SessionPurpose::Dictation)
+            .unwrap();
+        app.pending_recording = Some(PendingRecording {
+            session_id,
+            source: RecordingSource::Transcribe,
+            stop_requested: false,
+            max_duration_seconds: 30,
+            latency: LatencyTrace::started_at(Instant::now(), TriggerObservation::HotkeyPoll),
+            capture_diagnostics: CaptureDiagnosticContext::default(),
+        });
+
+        app.stop_recording();
+        for _ in 0..100 {
+            app.poll_capture_controller();
+            if app.pending_recording.is_none() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        assert!(app.pending_recording.is_none());
+        assert_eq!(app.capture_control_id, None);
+        assert_eq!(app.status, TranscriptionStatus::Idle);
+        assert_eq!(app.status_message, "Recording cancelled");
+        assert!(app.pending_output.is_none());
+        assert!(app.history_requests.is_empty());
+    }
+
+    #[test]
     fn abandon_pending_capture_is_session_correlated_and_cancels_startup() {
         let mut app = test_app();
         install_cancellable_capture(&mut app);
@@ -15668,8 +15796,127 @@ mod layout_tests {
         assert_eq!(app.session_coordinator.active_session_id(), None);
         assert!(matches!(
             app.abandoned_capture_cleanups.as_slice(),
-            [AbandonedCaptureCleanup::AwaitingCapture { session_id: cleanup_id }] if *cleanup_id == session_id
+            [AbandonedCaptureCleanup::AwaitingCapture { session_id: cleanup_id, .. }] if *cleanup_id == session_id
         ));
+        for _ in 0..100 {
+            app.poll_capture_controller();
+            app.poll_abandoned_capture_cleanups();
+            if app.abandoned_capture_cleanups.is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(app.abandoned_capture_cleanups.is_empty());
+        assert!(!app.capture_is_active());
+        assert_eq!(app.capture_control_id, None);
+    }
+
+    #[test]
+    fn abandoned_capture_returning_a_session_retires_after_controller_release() {
+        let mut app = test_app();
+        let (entered_tx, entered_rx) = unbounded();
+        let (continue_tx, continue_rx) = unbounded();
+        app.capture_controller = audio::control::CaptureController::with_start_capture_for_test(
+            Arc::new(move |_, _| {
+                entered_tx.send(()).unwrap();
+                continue_rx.recv().unwrap();
+                Ok(RecordingSession::simulated(
+                    None,
+                    CaptureStopReason::Explicit,
+                ))
+            }),
+        )
+        .unwrap();
+        let ticket = app
+            .capture_controller
+            .handle()
+            .start_capture(
+                audio::control::AudioOwnerKind::Capture,
+                Instant::now(),
+                30,
+                None,
+                audio::CaptureOptions::default(),
+            )
+            .unwrap();
+        app.capture_control_id = Some(ticket.capture_id);
+        let session_id = app
+            .session_coordinator
+            .begin(SessionPurpose::Dictation)
+            .unwrap();
+        app.pending_recording = Some(PendingRecording {
+            session_id,
+            source: RecordingSource::Transcribe,
+            stop_requested: false,
+            max_duration_seconds: 30,
+            latency: LatencyTrace::started_at(Instant::now(), TriggerObservation::AppAction),
+            capture_diagnostics: CaptureDiagnosticContext::default(),
+        });
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        app.abandon_recording(session_id);
+        continue_tx.send(()).unwrap();
+        for _ in 0..200 {
+            app.poll_capture_controller();
+            app.poll_abandoned_capture_cleanups();
+            if app.abandoned_capture_cleanups.is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        assert!(app.abandoned_capture_cleanups.is_empty());
+        assert!(!app.capture_is_active());
+        assert_eq!(app.capture_control_id, None);
+        assert!(app.pending_output.is_none());
+    }
+
+    #[test]
+    fn panicking_capture_start_retires_pending_app_state() {
+        let mut app = test_app();
+        app.capture_controller =
+            audio::control::CaptureController::with_start_capture_for_test(Arc::new(|_, _| {
+                panic!("injected app start panic")
+            }))
+            .unwrap();
+        let ticket = app
+            .capture_controller
+            .handle()
+            .start_capture(
+                audio::control::AudioOwnerKind::Capture,
+                Instant::now(),
+                30,
+                None,
+                audio::CaptureOptions::default(),
+            )
+            .unwrap();
+        app.capture_control_id = Some(ticket.capture_id);
+        let session_id = app
+            .session_coordinator
+            .begin(SessionPurpose::Dictation)
+            .unwrap();
+        app.pending_recording = Some(PendingRecording {
+            session_id,
+            source: RecordingSource::Transcribe,
+            stop_requested: false,
+            max_duration_seconds: 30,
+            latency: LatencyTrace::started_at(Instant::now(), TriggerObservation::AppAction),
+            capture_diagnostics: CaptureDiagnosticContext::default(),
+        });
+
+        for _ in 0..100 {
+            app.poll_capture_controller();
+            app.poll_events();
+            if app.pending_recording.is_none() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        assert!(app.pending_recording.is_none());
+        assert_eq!(app.capture_control_id, None);
+        assert!(app.capture_controller.handle().owner().is_none());
+        assert_eq!(app.status, TranscriptionStatus::Error);
+        assert!(app.status_message.contains("worker panicked"));
     }
 
     #[test]

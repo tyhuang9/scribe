@@ -12,6 +12,9 @@ use super::{
 pub(crate) type StartCapture = dyn Fn(CaptureRequest, CaptureCancellation) -> Result<RecordingSession, CaptureError>
     + Send
     + Sync;
+type ReleaseReaperTask = Box<dyn FnOnce() + Send + 'static>;
+type ReleaseReaperSpawner =
+    dyn Fn(String, ReleaseReaperTask) -> Result<(), String> + Send + Sync + 'static;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CaptureHotkeyMode {
@@ -91,6 +94,10 @@ pub(crate) enum CaptureLifecycleEvent {
         owner: AudioOwnerKind,
         error: CaptureError,
     },
+    Released {
+        capture_id: CaptureId,
+        owner: AudioOwnerKind,
+    },
     Reconfigured {
         revision: u64,
     },
@@ -150,9 +157,6 @@ enum ControlCommand {
     Reconfigure {
         revision: u64,
     },
-    Release {
-        id: u64,
-    },
     Shutdown,
 }
 
@@ -165,6 +169,8 @@ struct StartResult {
 pub(crate) struct CaptureControlHandle {
     state: Arc<Mutex<SharedState>>,
     command_tx: Sender<ControlCommand>,
+    lifecycle_tx: Sender<CaptureLifecycleEvent>,
+    reaper_spawner: Arc<ReleaseReaperSpawner>,
 }
 
 pub(crate) struct CaptureController {
@@ -194,17 +200,47 @@ impl CaptureController {
         Self::with_start_capture(start_capture)
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_reaper_spawner_for_test(
+        start_capture: Arc<StartCapture>,
+        reaper_spawner: Arc<ReleaseReaperSpawner>,
+    ) -> Result<Self, CaptureError> {
+        Self::with_components(start_capture, reaper_spawner)
+    }
+
     fn with_start_capture(start_capture: Arc<StartCapture>) -> Result<Self, CaptureError> {
+        Self::with_components(start_capture, Arc::new(spawn_release_reaper_thread))
+    }
+
+    fn with_components(
+        start_capture: Arc<StartCapture>,
+        reaper_spawner: Arc<ReleaseReaperSpawner>,
+    ) -> Result<Self, CaptureError> {
         let state = Arc::new(Mutex::new(SharedState::default()));
         let (command_tx, command_rx) = unbounded();
         let (lifecycle_tx, lifecycle_rx) = unbounded();
         let worker_state = Arc::clone(&state);
+        let worker_lifecycle_tx = lifecycle_tx.clone();
+        let worker_reaper_spawner = Arc::clone(&reaper_spawner);
         let worker = thread::Builder::new()
             .name("scribe-audio-control".to_owned())
-            .spawn(move || control_loop(worker_state, command_rx, lifecycle_tx, start_capture))
+            .spawn(move || {
+                control_loop(
+                    worker_state,
+                    command_rx,
+                    worker_lifecycle_tx,
+                    start_capture,
+                    worker_reaper_spawner,
+                )
+            })
             .map_err(|error| CaptureError::WorkerSpawn(error.to_string()))?;
         Ok(Self {
-            handle: CaptureControlHandle { state, command_tx },
+            handle: CaptureControlHandle {
+                state,
+                command_tx,
+                lifecycle_tx,
+                reaper_spawner,
+            },
             lifecycle_rx,
             worker: Some(worker),
         })
@@ -351,7 +387,11 @@ impl CaptureControlHandle {
         template: StartTemplate,
     ) -> HotkeyDispatch {
         let capture_id = CaptureId(state.next_id);
-        state.next_id = state.next_id.wrapping_add(1).max(1);
+        let Some(next_id) = state.next_id.checked_add(1) else {
+            state.shutdown = true;
+            return HotkeyDispatch::None;
+        };
+        state.next_id = next_id;
         let cancellation = CaptureCancellation::new();
         let preview_slot = PreviewPublisherSlot::default();
         let request = CaptureRequest {
@@ -419,7 +459,10 @@ impl CaptureControlHandle {
             return Err(CaptureControlError::Owned(active.kind));
         }
         let id = state.next_id;
-        state.next_id = state.next_id.wrapping_add(1).max(1);
+        state.next_id = state
+            .next_id
+            .checked_add(1)
+            .ok_or(CaptureControlError::Shutdown)?;
         state.owner = Some(OwnerState {
             id,
             kind: owner,
@@ -432,7 +475,7 @@ impl CaptureControlHandle {
     }
 
     pub(crate) fn release(&self, id: u64) -> Result<(), CaptureControlError> {
-        let reaper = {
+        let (released, reaper) = {
             let mut state = self.lock_state();
             let Some(owner) = state.owner.as_mut() else {
                 return Err(CaptureControlError::Stale(id));
@@ -446,26 +489,38 @@ impl CaptureControlHandle {
                     .as_ref()
                     .is_some_and(|session| session.try_finish().is_some())
             {
+                let kind = owner.kind;
                 state.owner = None;
-                None
+                (Some(kind), None)
             } else {
                 owner.release_requested = true;
                 if let Some(session) = owner.session.clone()
                     && !owner.reaper_started
                 {
                     owner.reaper_started = true;
-                    Some(session)
+                    (None, Some((owner.kind, session)))
                 } else {
-                    None
+                    (None, None)
                 }
             }
         };
-        if let Some(session) = reaper {
-            spawn_release_reaper(Arc::clone(&self.state), id, session);
+        if let Some(kind) = released {
+            let _ = self.lifecycle_tx.send(CaptureLifecycleEvent::Released {
+                capture_id: CaptureId(id),
+                owner: kind,
+            });
         }
-        self.command_tx
-            .send(ControlCommand::Release { id })
-            .map_err(|_| CaptureControlError::Shutdown)
+        if let Some((kind, session)) = reaper {
+            spawn_release_reaper(
+                Arc::clone(&self.state),
+                CaptureId(id),
+                kind,
+                session,
+                self.lifecycle_tx.clone(),
+                Arc::clone(&self.reaper_spawner),
+            );
+        }
+        Ok(())
     }
 
     pub(crate) fn owner(&self) -> Option<AudioOwnerKind> {
@@ -483,9 +538,6 @@ impl CaptureControlHandle {
     fn shutdown(&self) {
         {
             let mut state = self.lock_state();
-            if state.shutdown {
-                return;
-            }
             state.shutdown = true;
             if let Some(owner) = state.owner.as_ref() {
                 request_abort(owner);
@@ -532,20 +584,62 @@ fn request_abort(owner: &OwnerState) {
     }
 }
 
-fn spawn_release_reaper(state: Arc<Mutex<SharedState>>, id: u64, session: RecordingSession) {
-    let _ = thread::Builder::new()
-        .name(format!("scribe-audio-release-{id}"))
-        .spawn(move || {
-            while session.try_finish().is_none() {
-                thread::sleep(std::time::Duration::from_millis(2));
-            }
-            let mut state = state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if state.owner.as_ref().is_some_and(|owner| owner.id == id) {
-                state.owner = None;
-            }
+fn spawn_release_reaper_thread(name: String, task: ReleaseReaperTask) -> Result<(), String> {
+    thread::Builder::new()
+        .name(name)
+        .spawn(move || task())
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+fn spawn_release_reaper(
+    state: Arc<Mutex<SharedState>>,
+    capture_id: CaptureId,
+    owner: AudioOwnerKind,
+    session: RecordingSession,
+    lifecycle_tx: Sender<CaptureLifecycleEvent>,
+    reaper_spawner: Arc<ReleaseReaperSpawner>,
+) {
+    let recovery_session = session.clone();
+    let reaper_state = Arc::clone(&state);
+    let reaper_lifecycle_tx = lifecycle_tx.clone();
+    let task = Box::new(move || {
+        while session.try_finish().is_none() {
+            thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let mut state = reaper_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state
+            .owner
+            .as_ref()
+            .is_some_and(|active| active.id == capture_id.0)
+        {
+            state.owner = None;
+            drop(state);
+            let _ = reaper_lifecycle_tx.send(CaptureLifecycleEvent::Released { capture_id, owner });
+        }
+    });
+    if let Err(error) = reaper_spawner(format!("scribe-audio-release-{}", capture_id.0), task) {
+        recovery_session.abort();
+        let mut state = state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state
+            .owner
+            .as_ref()
+            .is_some_and(|active| active.id == capture_id.0)
+        {
+            state.owner = None;
+            state.shutdown = true;
+        }
+        drop(state);
+        let _ = lifecycle_tx.send(CaptureLifecycleEvent::Failed {
+            capture_id,
+            owner,
+            error: CaptureError::WorkerSpawn(format!("release reaper: {error}")),
         });
+    }
 }
 
 fn control_loop(
@@ -553,6 +647,7 @@ fn control_loop(
     command_rx: Receiver<ControlCommand>,
     lifecycle_tx: Sender<CaptureLifecycleEvent>,
     start_capture: Arc<StartCapture>,
+    reaper_spawner: Arc<ReleaseReaperSpawner>,
 ) {
     let (start_result_tx, start_result_rx) = unbounded::<StartResult>();
     loop {
@@ -569,7 +664,12 @@ fn control_loop(
                     if let Err(error) = thread::Builder::new()
                         .name(format!("scribe-audio-start-{}", request.capture_id.0))
                         .spawn(move || {
-                            let result = start_capture(request.clone(), cancellation);
+                            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                start_capture(request.clone(), cancellation)
+                            }))
+                            .unwrap_or_else(|panic| {
+                                Err(CaptureError::WorkerPanic(panic_message(panic)))
+                            });
                             let _ = result_tx.send(StartResult { request, result });
                         })
                     {
@@ -598,9 +698,6 @@ fn control_loop(
                 }
                 Ok(ControlCommand::Reconfigure { revision }) => {
                     let _ = lifecycle_tx.send(CaptureLifecycleEvent::Reconfigured { revision });
-                }
-                Ok(ControlCommand::Release { id }) => {
-                    let _ = id;
                 }
                 Ok(ControlCommand::Shutdown) | Err(_) => {
                     let _ = lifecycle_tx.send(CaptureLifecycleEvent::Shutdown);
@@ -642,8 +739,11 @@ fn control_loop(
                         } else if reap {
                             spawn_release_reaper(
                                 Arc::clone(&state),
-                                request.capture_id.0,
+                                request.capture_id,
+                                request.owner,
                                 session,
+                                lifecycle_tx.clone(),
+                                Arc::clone(&reaper_spawner),
                             );
                         } else {
                             session.abort();
@@ -669,6 +769,16 @@ fn control_loop(
                 }
             }
         }
+    }
+}
+
+fn panic_message(panic: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = panic.downcast_ref::<&str>() {
+        (*message).to_owned()
+    } else if let Some(message) = panic.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "non-string panic payload".to_owned()
     }
 }
 
@@ -894,5 +1004,152 @@ mod tests {
             Err(CaptureControlError::Owned(AudioOwnerKind::Capture))
         ));
         handle.abort(capture.capture_id).unwrap();
+    }
+
+    #[test]
+    fn release_before_start_result_admission_emits_terminal_release() {
+        let (entered_tx, entered_rx) = unbounded();
+        let (continue_tx, continue_rx) = unbounded();
+        let controller = CaptureController::with_start_capture(Arc::new(move |_request, _| {
+            entered_tx.send(()).unwrap();
+            continue_rx.recv().unwrap();
+            Ok(RecordingSession::simulated(
+                None,
+                CaptureStopReason::Explicit,
+            ))
+        }))
+        .unwrap();
+        let handle = controller.handle();
+        let ticket = handle
+            .start_capture(
+                AudioOwnerKind::Capture,
+                Instant::now(),
+                30,
+                None,
+                CaptureOptions::default(),
+            )
+            .unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        handle.abort(ticket.capture_id).unwrap();
+        handle.release(ticket.capture_id.0).unwrap();
+        continue_tx.send(()).unwrap();
+
+        let released = (0..200).find_map(|_| {
+            let event = controller.poll_events().into_iter().find(|event| {
+                matches!(
+                    event,
+                    CaptureLifecycleEvent::Released { capture_id, .. }
+                        if *capture_id == ticket.capture_id
+                )
+            });
+            if event.is_none() {
+                thread::sleep(Duration::from_millis(1));
+            }
+            event
+        });
+        assert!(released.is_some());
+        assert!(handle.owner().is_none());
+    }
+
+    #[test]
+    fn panicking_start_worker_emits_failure_and_releases_owner() {
+        let controller = CaptureController::with_start_capture(Arc::new(|_, _| {
+            panic!("injected start panic");
+        }))
+        .unwrap();
+        let handle = controller.handle();
+        let ticket = handle
+            .start_capture(
+                AudioOwnerKind::Capture,
+                Instant::now(),
+                30,
+                None,
+                CaptureOptions::default(),
+            )
+            .unwrap();
+
+        let failed = (0..100).find_map(|_| {
+            let event = controller.poll_events().into_iter().find(|event| {
+                matches!(
+                    event,
+                    CaptureLifecycleEvent::Failed {
+                        capture_id,
+                        error: CaptureError::WorkerPanic(message),
+                        ..
+                    } if *capture_id == ticket.capture_id && message == "injected start panic"
+                )
+            });
+            if event.is_none() {
+                thread::sleep(Duration::from_millis(1));
+            }
+            event
+        });
+        assert!(failed.is_some());
+        assert!(handle.owner().is_none());
+    }
+
+    #[test]
+    fn release_reaper_spawn_failure_fails_closed_without_leaking_owner() {
+        let controller = CaptureController::with_reaper_spawner_for_test(
+            Arc::new(|_, _| {
+                Ok(RecordingSession::simulated_with_stop_delay(
+                    None,
+                    CaptureStopReason::Explicit,
+                    Duration::from_millis(25),
+                ))
+            }),
+            Arc::new(|_, _| Err("injected spawn failure".to_owned())),
+        )
+        .unwrap();
+        let handle = controller.handle();
+        let ticket = handle
+            .start_capture(
+                AudioOwnerKind::Capture,
+                Instant::now(),
+                30,
+                None,
+                CaptureOptions::default(),
+            )
+            .unwrap();
+        let ready = (0..100).find_map(|_| {
+            let event = controller.poll_events().into_iter().find(|event| {
+                matches!(
+                    event,
+                    CaptureLifecycleEvent::Ready { capture_id, .. }
+                        if *capture_id == ticket.capture_id
+                )
+            });
+            if event.is_none() {
+                thread::sleep(Duration::from_millis(1));
+            }
+            event
+        });
+        assert!(ready.is_some());
+
+        handle.abort(ticket.capture_id).unwrap();
+        handle.release(ticket.capture_id.0).unwrap();
+
+        assert!(handle.owner().is_none());
+        assert!(matches!(
+            handle.start_capture(
+                AudioOwnerKind::Capture,
+                Instant::now(),
+                30,
+                None,
+                CaptureOptions::default(),
+            ),
+            Err(CaptureControlError::Shutdown)
+        ));
+        assert!(controller.poll_events().into_iter().any(|event| {
+            matches!(
+                event,
+                CaptureLifecycleEvent::Failed {
+                    capture_id,
+                    error: CaptureError::WorkerSpawn(message),
+                    ..
+                } if capture_id == ticket.capture_id && message.contains("injected spawn failure")
+            )
+        }));
     }
 }

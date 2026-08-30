@@ -390,6 +390,8 @@ pub enum CaptureError {
     WorkerDisconnected,
     #[error("failed to spawn audio recorder worker: {0}")]
     WorkerSpawn(String),
+    #[error("audio recorder worker panicked: {0}")]
+    WorkerPanic(String),
     #[error(
         "Silero speech detection is unavailable; repair the bundled support asset or restart Scribe: {0}"
     )]
