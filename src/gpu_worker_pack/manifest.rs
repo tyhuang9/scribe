@@ -1073,7 +1073,11 @@ fn verify_exact_tree_macos(
             } else {
                 format!("{prefix}/{name}")
             };
-            validate_relative_path(&relative)?;
+            let reserved_root_entry =
+                prefix.is_empty() && matches!(name.as_str(), MANIFEST_NAME | SIGNATURE_NAME);
+            if !reserved_root_entry {
+                validate_relative_path(&relative)?;
+            }
             if !observed_casefolded.insert(relative.to_ascii_lowercase()) {
                 return Err(PackVerificationError::CaseCollision);
             }
@@ -1974,6 +1978,20 @@ mod tests {
         assert!(matches!(
             verifier.launchable_worker(&verified),
             Err(PackVerificationError::TreeMismatch)
+        ));
+        fs::remove_file(verified.verified_pack().root.join("bin/unexpected.dylib")).unwrap();
+        fs::write(
+            verified
+                .verified_pack()
+                .root
+                .join(format!("bin/{MANIFEST_NAME}")),
+            b"nested envelope name",
+        )
+        .unwrap();
+        assert!(matches!(
+            verifier.launchable_worker(&verified),
+            Err(PackVerificationError::UnsafePath(path))
+                if path == format!("bin/{MANIFEST_NAME}")
         ));
 
         drop(verified);
