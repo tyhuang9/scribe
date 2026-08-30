@@ -1,5 +1,4 @@
 use std::fs;
-#[cfg(all(windows, feature = "vulkan-acceleration"))]
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -12,6 +11,7 @@ const SILERO_VAD_SHA256: &str = "c36d490aff5ab924ca6c7aeec4d8f6bd3d22db6fa17611b
 fn main() {
     reject_multiple_gpu_features();
     emit_build_revision();
+    embed_gpu_pack_release_authority();
     emit_bundled_worker_trust_anchor();
     require_windows_static_crt();
     #[cfg(all(windows, feature = "vulkan-acceleration"))]
@@ -35,6 +35,43 @@ fn main() {
     if matches!(target_os.as_str(), "linux" | "android") {
         println!("cargo:rustc-link-lib=dl");
     }
+}
+
+fn embed_gpu_pack_release_authority() {
+    const DEFAULT_AUTHORITY: &str = "runtime-manifests/gpu-pack-release-authority-macos-empty.json";
+    const MAX_AUTHORITY_BYTES: usize = 512 * 1024;
+
+    println!("cargo:rerun-if-env-changed=SCRIBE_GPU_PACK_RELEASE_AUTHORITY");
+    println!("cargo:rerun-if-changed={DEFAULT_AUTHORITY}");
+    let source = std::env::var_os("SCRIBE_GPU_PACK_RELEASE_AUTHORITY")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_AUTHORITY));
+    if source != PathBuf::from(DEFAULT_AUTHORITY) {
+        println!("cargo:rerun-if-changed={}", source.display());
+    }
+    let mut bytes = fs::read(&source).unwrap_or_else(|error| {
+        panic!(
+            "could not read the GPU pack release authority {}: {error}",
+            source.display()
+        )
+    });
+    assert!(
+        !bytes.is_empty() && bytes.len() <= MAX_AUTHORITY_BYTES,
+        "GPU pack release authority is empty or exceeds its build-time bound"
+    );
+    if bytes.last() == Some(&b'\n') {
+        bytes.pop();
+    }
+    assert!(
+        !bytes.is_empty() && bytes.last() != Some(&b'\r') && std::str::from_utf8(&bytes).is_ok(),
+        "GPU pack release authority must be canonical UTF-8 JSON with at most one trailing LF"
+    );
+    let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").expect("Cargo must set OUT_DIR"));
+    fs::write(
+        out_dir.join("scribe_gpu_pack_release_authority.json"),
+        bytes,
+    )
+    .expect("could not embed the GPU pack release authority");
 }
 
 fn reject_multiple_gpu_features() {

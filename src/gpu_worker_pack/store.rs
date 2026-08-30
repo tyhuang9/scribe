@@ -22,7 +22,7 @@ use super::manifest::{
 const STATE_SCHEMA_VERSION: u16 = 1;
 pub(super) const MAX_STATE_BYTES: u64 = 256 * 1024;
 const STORE_LOCK_NAME: &str = ".worker-pack-store.lock";
-const DISCOVERY_EPOCH_LOCK_NAME: &str = ".worker-pack-discovery-epoch.lock";
+pub(super) const DISCOVERY_EPOCH_LOCK_NAME: &str = ".worker-pack-discovery-epoch.lock";
 const DISCOVERY_EPOCH_STATE_NAME: &str = "discovery-security-epochs.json";
 #[cfg(windows)]
 const PRIVATE_STATE_AUTHORITY_LOCK_NAME: &str = ".scribe-private-state.lock";
@@ -2431,27 +2431,53 @@ fn move_file(source: &Path, destination: &Path, replace: bool) -> io::Result<()>
     Ok(())
 }
 
-#[cfg(unix)]
 fn lock_file(file: &File) -> Result<(), PackStoreError> {
+    const MAX_ATTEMPTS: usize = 40;
+    const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(2);
+
+    for attempt in 0..MAX_ATTEMPTS {
+        match try_lock_file(file) {
+            Err(PackStoreError::LockContended) if attempt + 1 < MAX_ATTEMPTS => {
+                std::thread::sleep(RETRY_DELAY);
+            }
+            result => return result,
+        }
+    }
+    Err(PackStoreError::LockContended)
+}
+
+#[cfg(unix)]
+fn try_lock_file(file: &File) -> Result<(), PackStoreError> {
     use std::os::fd::AsRawFd;
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
         Ok(())
     } else {
-        Err(PackStoreError::Io(io::Error::last_os_error()))
+        let error = io::Error::last_os_error();
+        if error
+            .raw_os_error()
+            .is_some_and(|code| code == libc::EAGAIN || code == libc::EWOULDBLOCK)
+        {
+            Err(PackStoreError::LockContended)
+        } else {
+            Err(PackStoreError::Io(error))
+        }
     }
 }
 
 #[cfg(windows)]
-fn lock_file(file: &File) -> Result<(), PackStoreError> {
+fn try_lock_file(file: &File) -> Result<(), PackStoreError> {
     use std::mem::zeroed;
     use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::{LOCKFILE_EXCLUSIVE_LOCK, LockFileEx};
+    use windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION;
+    use windows_sys::Win32::Storage::FileSystem::{
+        LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
+    };
     use windows_sys::Win32::System::IO::OVERLAPPED;
     let mut overlapped: OVERLAPPED = unsafe { zeroed() };
     if unsafe {
         LockFileEx(
             file.as_raw_handle(),
-            LOCKFILE_EXCLUSIVE_LOCK,
+            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
             0,
             1,
             0,
@@ -2461,12 +2487,17 @@ fn lock_file(file: &File) -> Result<(), PackStoreError> {
     {
         Ok(())
     } else {
-        Err(PackStoreError::Io(io::Error::last_os_error()))
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(ERROR_LOCK_VIOLATION as i32) {
+            Err(PackStoreError::LockContended)
+        } else {
+            Err(PackStoreError::Io(error))
+        }
     }
 }
 
 #[cfg(not(any(unix, windows)))]
-fn lock_file(_file: &File) -> Result<(), PackStoreError> {
+fn try_lock_file(_file: &File) -> Result<(), PackStoreError> {
     Err(PackStoreError::UnsupportedFileLock)
 }
 
@@ -2526,6 +2557,8 @@ pub(crate) enum PackStoreError {
         reason = "constructed only on platforms outside the supported Windows and Unix lock implementations"
     )]
     UnsupportedFileLock,
+    #[error("worker-pack state authority lock is contended")]
+    LockContended,
     #[error("this platform has no supported anchored filesystem operations")]
     #[allow(
         dead_code,
@@ -2653,6 +2686,29 @@ mod tests {
             !empty_root.exists(),
             "empty trust/discovery must not mutate state"
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn discovery_epoch_ledger_lock_contention_is_bounded_and_does_not_mutate_state() {
+        let root = temp_root("discovery-epoch-lock-contention");
+        let state = root.join("state");
+        let held = exclusive_file_lock(&state.join(DISCOVERY_EPOCH_LOCK_NAME)).unwrap();
+        let pack = discovery_descriptor("metal-main", 2);
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            DiscoveryEpochLedger::new(&state).admit(&[&pack]),
+            Err(PackStoreError::LockContended)
+        ));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "discovery lock contention exceeded its conservative bound"
+        );
+        assert!(
+            !state.join(DISCOVERY_EPOCH_STATE_NAME).exists(),
+            "contended admission mutated epoch state"
+        );
+        drop(held);
         fs::remove_dir_all(root).unwrap();
     }
     use crate::gpu_worker_pack::manifest::test_support::{
@@ -3096,20 +3152,31 @@ mod tests {
         let second = store.stage_and_install(&second_source).unwrap();
         let third = store.stage_and_install(&third_source).unwrap();
         store.activate(&first).unwrap();
-        std::thread::scope(|scope| {
+        let (second_result, third_result) = std::thread::scope(|scope| {
             let left = PackStore::new(&workers, &state, &verifier);
             let right = PackStore::new(&workers, &state, &verifier);
             let second = second.clone();
             let third = third.clone();
-            scope.spawn(move || left.activate(&second).unwrap());
-            scope.spawn(move || right.activate(&third).unwrap());
+            let left = scope.spawn(move || left.activate(&second));
+            let right = scope.spawn(move || right.activate(&third));
+            (left.join().unwrap(), right.join().unwrap())
         });
         let activation = store.load_activation_strict().unwrap();
         let current = activation.current.unwrap();
         let previous = activation.previous.unwrap();
-        assert!(
-            (current == second && previous == third) || (current == third && previous == second)
-        );
+        match (second_result, third_result) {
+            (Ok(()), Ok(())) => assert!(
+                (current == second && previous == third)
+                    || (current == third && previous == second)
+            ),
+            (Ok(()), Err(PackStoreError::LockContended)) => {
+                assert_eq!((current, previous), (second, first))
+            }
+            (Err(PackStoreError::LockContended), Ok(())) => {
+                assert_eq!((current, previous), (third, first))
+            }
+            results => panic!("unexpected concurrent activation results: {results:?}"),
+        }
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -3123,7 +3190,7 @@ mod tests {
         let epoch_two = store.stage_and_install(&epoch_two_source).unwrap();
         let epoch_three = store.stage_and_install(&epoch_three_source).unwrap();
         store.activate(&first).unwrap();
-        std::thread::scope(|scope| {
+        let higher_succeeded = std::thread::scope(|scope| {
             let left = PackStore::new(&workers, &state, &verifier);
             let right = PackStore::new(&workers, &state, &verifier);
             let epoch_two = epoch_two.clone();
@@ -3131,17 +3198,25 @@ mod tests {
             let lower = scope.spawn(move || left.activate(&epoch_two));
             let higher = scope.spawn(move || right.activate(&epoch_three));
             let lower = lower.join().unwrap();
-            higher.join().unwrap().unwrap();
+            let higher = higher.join().unwrap();
             if let Err(error) = lower {
                 assert!(matches!(
                     error,
                     PackStoreError::SecurityEpochDowngrade {
                         observed: 2,
                         floor: 3
-                    }
+                    } | PackStoreError::LockContended
                 ));
             }
+            match higher {
+                Ok(()) => true,
+                Err(PackStoreError::LockContended) => false,
+                Err(error) => panic!("unexpected higher-epoch activation error: {error}"),
+            }
         });
+        if !higher_succeeded {
+            store.activate(&epoch_three).unwrap();
+        }
         let epochs = store.load_epochs_strict().unwrap();
         assert_eq!(epochs.epochs.get(epoch_three.pack_id.as_str()), Some(&3));
         assert_eq!(current_descriptor(&store), Some(epoch_three));
@@ -3334,22 +3409,14 @@ mod tests {
         let lock = store.acquire_lock().unwrap();
         let moved = root.join("moved-state");
         let second_lock_path = state.join(STORE_LOCK_NAME);
-        let second_state_path = state.join("second-instance.json");
-        let (attempted_tx, attempted_rx) = std::sync::mpsc::channel();
-        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
-        let second = std::thread::spawn(move || {
-            attempted_tx.send(()).unwrap();
-            let lock = exclusive_file_lock(&second_lock_path).unwrap();
-            lock.write(&second_state_path, &EpochState::empty())
-                .unwrap();
-            acquired_tx.send(()).unwrap();
-        });
-        attempted_rx.recv().unwrap();
+        let contention_started = std::time::Instant::now();
+        assert!(matches!(
+            exclusive_file_lock(&second_lock_path),
+            Err(PackStoreError::LockContended)
+        ));
         assert!(
-            acquired_rx
-                .recv_timeout(std::time::Duration::from_millis(100))
-                .is_err(),
-            "second instance bypassed the retained parent authority lock"
+            contention_started.elapsed() < std::time::Duration::from_secs(2),
+            "state authority lock contention was not bounded"
         );
 
         #[cfg(windows)]
@@ -3373,10 +3440,11 @@ mod tests {
             assert!(!state.join("security-epochs.json").exists());
         }
         drop(lock);
-        acquired_rx
-            .recv_timeout(std::time::Duration::from_secs(5))
+        let second = exclusive_file_lock(&second_lock_path).unwrap();
+        second
+            .write(&state.join("second-instance.json"), &EpochState::empty())
             .unwrap();
-        second.join().unwrap();
+        drop(second);
         #[cfg(unix)]
         assert_eq!(
             fs::read(state.join("sentinel.txt")).unwrap(),

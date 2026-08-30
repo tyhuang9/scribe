@@ -355,6 +355,19 @@ corrupt state, or unavailable state authority fails GPU discovery closed. A
 catalog cache never bypasses this check. CPU routing remains available, and an
 empty production trust result does not create or mutate ledger state.
 
+The signed desktop is the non-resettable release authority for bundled macOS
+packs. Both universal slices embed identical canonical authority bytes that bind
+the application version and build revision, SCIF protocol, exact catalog
+SHA-256, pack identity/digest/security epoch, runtime ABI, backend/provider,
+target, worker path, sizes, and complete inventory. The installed catalog must
+match that authority before verification, cache lookup, or epoch-ledger access.
+Deleting or recreating the private ledger therefore cannot admit an older
+catalog. The ledger remains defense in depth and its lock acquisition is
+nonblocking; contention rejects GPU discovery promptly so Auto can continue to
+CPU. Recovery from authority or epoch-state rejection is reinstalling the
+current signed application and its matching packs. Runtime state is never
+silently reset.
+
 The production authoring CLI must accept `--backend metal --target-os macos
 --target-arch <aarch64|x86_64>` and bind those facts in its signed manifest.
 Until that reviewed CLI extension and a persistent production trust root exist,

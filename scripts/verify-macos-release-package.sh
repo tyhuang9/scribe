@@ -23,6 +23,9 @@ codesign --verify --strict --verbose=2 "$app"
 codesign -d --entitlements :- "$app" 2>/dev/null | plutil -extract com.apple.security.device.audio-input raw -o - - | grep -qx true || { echo 'microphone entitlement is missing.' >&2; exit 1; }
 plutil -extract LSMinimumSystemVersion raw -o - "$app/Contents/Info.plist" | grep -qx '13.0' || { echo 'Info.plist must declare macOS 13.0.' >&2; exit 1; }
 jq -e '.schema_version == 1 and (.packs | type == "array") and (.packs | length <= 8)' "$catalog" >/dev/null || { echo 'catalog is invalid.' >&2; exit 1; }
+catalog_digest="$(shasum -a 256 "$catalog" | awk '{print $1}')"
+[[ "$catalog_digest" =~ ^[0-9a-f]{64}$ ]] || { echo 'catalog digest is invalid.' >&2; exit 1; }
+LC_ALL=C strings "$macos/Scribe" | grep -F "$catalog_digest" >/dev/null || { echo 'desktop does not embed the exact pack-catalog authority.' >&2; exit 1; }
 expected_file="$(mktemp "${TMPDIR:-/tmp}/scribe-macos-expected.XXXXXX")"
 actual_file="$(mktemp "${TMPDIR:-/tmp}/scribe-macos-actual.XXXXXX")"
 trap 'rm -f "$expected_file" "$actual_file"' EXIT

@@ -385,6 +385,8 @@ fn stage_six_macos_verified_launch_is_descriptor_bound_and_command_free() {
     let metal_shim = include_str!("../native/scribe_macos_gpu_shim.m");
     let power_shim = include_str!("../native/scribe_macos_power_shim.c");
     let packaging = include_str!("../scripts/verify-macos-release-package.sh");
+    let release_build = include_str!("../scripts/build-macos-release.sh");
+    let store = production_source(include_str!("gpu_worker_pack/store.rs"));
 
     for required in [
         "posix_spawn(",
@@ -456,8 +458,23 @@ fn stage_six_macos_verified_launch_is_descriptor_bound_and_command_free() {
     assert!(pack.contains("single_executable_signed_payload"));
     assert!(pack.contains("enforce_production_discovery_epochs(discovery)"));
     assert!(pack.contains("DiscoveryEpochLedger::new"));
+    assert!(pack.contains("catalog_matches_release_authority"));
+    assert!(pack.contains("EMBEDDED_PACK_RELEASE_AUTHORITY"));
+    assert!(
+        pack.find("catalog_matches_release_authority(&catalog.bytes")
+            < pack.find("PRODUCTION_DISCOVERY_CACHE.get_or_init"),
+        "signed release authority must be checked before catalog cache lookup"
+    );
+    assert!(build.contains("SCRIBE_GPU_PACK_RELEASE_AUTHORITY"));
+    assert!(build.contains("scribe_gpu_pack_release_authority.json"));
+    assert!(store.contains("libc::LOCK_EX | libc::LOCK_NB"));
+    assert!(store.contains("LOCKFILE_FAIL_IMMEDIATELY"));
+    assert!(store.contains("PackStoreError::LockContended"));
+    assert!(release_build.contains("SCRIBE_GPU_PACK_RELEASE_AUTHORITY=\"$release_authority\""));
+    assert!(release_build.contains("catalog_digest"));
     assert!(packaging.contains("CPU/UI binary must not load Metal.framework"));
     assert!(packaging.contains("catalog Metal worker has no Metal load command"));
+    assert!(packaging.contains("desktop does not embed the exact pack-catalog authority"));
 }
 
 #[test]
