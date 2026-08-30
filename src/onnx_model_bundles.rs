@@ -25,8 +25,8 @@ use crate::installations::{
     RuntimeFileSpec, StableManagedDirectory, StagedRuntime, discard_pinned_artifact_partial,
     download_pinned_artifact_for_target, inspect_pinned_artifact_for_target,
     pinned_artifact_retained_partial, read_regular_file_no_follow,
-    reconcile_stable_directory_removal, removal_tombstone_path, stage_file_bundle_for_target,
-    verify_regular_directory_root, verify_runtime_tree,
+    reconcile_stable_directory_removal, removal_journal_path, removal_tombstone_path,
+    stage_file_bundle_for_target, verify_regular_directory_root, verify_runtime_tree,
 };
 use crate::runtime_artifact::{OnnxFileRole, OnnxModelFamily, OnnxModelSpec};
 use crate::transcription::{InstallSmoke, VerifiedOnnxBundleSmoke};
@@ -1852,6 +1852,19 @@ impl VerifiedOnnxRemovalCandidate {
     pub(crate) fn receipt_sha256(&self) -> &str {
         &self.receipt_sha256
     }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        model_id: impl Into<String>,
+        target_root: PathBuf,
+        receipt_sha256: impl Into<String>,
+    ) -> Self {
+        Self {
+            model_id: model_id.into(),
+            target_root,
+            receipt_sha256: receipt_sha256.into(),
+        }
+    }
 }
 
 fn verified_removal_candidate_at(
@@ -1859,6 +1872,18 @@ fn verified_removal_candidate_at(
     root: &Path,
 ) -> Result<VerifiedOnnxRemovalCandidate, InstallError> {
     let (receipt, _) = current_executable_receipt_at(root)?;
+    removal_candidate_from_receipt(expected_model_id, root, &receipt)
+}
+
+/// Exact self-contained receipt evidence used only after a durable receipt
+/// digest already authorizes the transaction. This keeps interrupted removal
+/// recoverable after catalog retirement without allowing a retired receipt to
+/// mint new ownership authority.
+fn verified_owned_removal_candidate_at(
+    expected_model_id: &str,
+    root: &Path,
+) -> Result<VerifiedOnnxRemovalCandidate, InstallError> {
+    let (receipt, _) = verified_receipt_at(root)?;
     removal_candidate_from_receipt(expected_model_id, root, &receipt)
 }
 
@@ -1944,7 +1969,7 @@ pub(crate) fn stage_onnx_bundle_removal(
         model_id,
         expected_receipt_sha256,
         prior_config_fingerprint,
-        verified_removal_candidate_at,
+        verified_owned_removal_candidate_at,
     )
 }
 
@@ -1973,7 +1998,11 @@ fn stage_onnx_bundle_removal_with(
             "ONNX removal receipt no longer matches the durable ownership witness",
         ));
     }
-    let removal = ManagedRemoval::stage_stable_directory(capability, prior_config_fingerprint)?;
+    let removal = ManagedRemoval::stage_stable_directory_with_ownership(
+        capability,
+        prior_config_fingerprint,
+        candidate.receipt_sha256().to_owned(),
+    )?;
     Ok(OnnxBundleRemoval {
         removal,
         _target_guard: target_guard,
@@ -1993,7 +2022,7 @@ pub(crate) fn reconcile_onnx_bundle_removal(
         storage_root,
         model_id,
         durable_config_fingerprint,
-        verified_removal_candidate_at,
+        verified_owned_removal_candidate_at,
     )
 }
 
@@ -2004,30 +2033,62 @@ fn reconcile_onnx_bundle_removal_with(
     verify: impl Fn(&str, &Path) -> Result<VerifiedOnnxRemovalCandidate, InstallError>,
 ) -> Result<bool, InstallError> {
     let target_root = bundle_target_root(storage_root, model_id)?;
-    let _target_guard = acquire_bundle_target(&target_root)?;
     let tombstone = removal_tombstone_path(&target_root)?;
-    let capability = if crate::installations::path_entry_exists_no_follow(&tombstone)? {
-        let capability = StableManagedDirectory::open_exact(&tombstone, &tombstone)?;
-        verify(model_id, capability.path()).map_err(|error| {
-            InstallError::RecoveryRequired(format!(
-                "interrupted ONNX removal tombstone is not exact at {}: {error}",
-                tombstone.display()
-            ))
-        })?;
-        Some(capability)
-    } else if crate::installations::path_entry_exists_no_follow(&target_root)? {
-        let capability = StableManagedDirectory::open_exact(&target_root, &target_root)?;
-        verify(model_id, capability.path()).map_err(|error| {
-            InstallError::RecoveryRequired(format!(
-                "interrupted ONNX removal target is not exact at {}: {error}",
-                target_root.display()
-            ))
-        })?;
-        Some(capability)
-    } else {
-        None
-    };
-    reconcile_stable_directory_removal(&target_root, durable_config_fingerprint, capability)
+    let journal = removal_journal_path(&target_root)?;
+    if !crate::installations::path_entry_exists_no_follow(&tombstone)?
+        && !crate::installations::path_entry_exists_no_follow(&journal)?
+    {
+        return Ok(false);
+    }
+    let _target_guard = acquire_bundle_target(&target_root)?;
+    if !crate::installations::path_entry_exists_no_follow(&tombstone)?
+        && !crate::installations::path_entry_exists_no_follow(&journal)?
+    {
+        return Ok(false);
+    }
+    let (capability, observed_ownership_sha256) =
+        if crate::installations::path_entry_exists_no_follow(&tombstone)? {
+            let capability = StableManagedDirectory::open_exact(&tombstone, &tombstone)?;
+            let candidate = verify(model_id, capability.path()).map_err(|error| {
+                InstallError::RecoveryRequired(format!(
+                    "interrupted ONNX removal tombstone is not exact at {}: {error}",
+                    tombstone.display()
+                ))
+            })?;
+            if candidate.target_root() != capability.path() {
+                return Err(InstallError::RecoveryRequired(format!(
+                    "interrupted ONNX removal receipt did not bind tombstone {}",
+                    tombstone.display()
+                )));
+            }
+            let receipt_sha256 = candidate.receipt_sha256().to_owned();
+            (Some(capability), Some(receipt_sha256))
+        } else if crate::installations::path_entry_exists_no_follow(&target_root)? {
+            let capability = StableManagedDirectory::open_exact(&target_root, &target_root)?;
+            let candidate = verify(model_id, capability.path()).map_err(|error| {
+                InstallError::RecoveryRequired(format!(
+                    "interrupted ONNX removal target is not exact at {}: {error}",
+                    target_root.display()
+                ))
+            })?;
+            if candidate.target_root() != capability.path() {
+                return Err(InstallError::RecoveryRequired(format!(
+                    "interrupted ONNX removal receipt did not bind target {}",
+                    target_root.display()
+                )));
+            }
+            let receipt_sha256 = candidate.receipt_sha256().to_owned();
+            (Some(capability), Some(receipt_sha256))
+        } else {
+            (None, None)
+        };
+    reconcile_stable_directory_removal(
+        &target_root,
+        durable_config_fingerprint,
+        capability,
+        observed_ownership_sha256.as_deref(),
+        true,
+    )
 }
 
 #[cfg(test)]
@@ -2799,6 +2860,19 @@ mod tests {
             verified_removal_candidate_at_with_manifest_for_test(model_id, &target, &manifest)
                 .unwrap();
 
+        let error = stage_onnx_bundle_removal_with(
+            &storage,
+            model_id,
+            &"00".repeat(32),
+            format!("{:x}", Sha256::digest(b"prior-config")),
+            |expected, root| {
+                verified_removal_candidate_at_with_manifest_for_test(expected, root, &manifest)
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("durable ownership witness"));
+        assert!(target.is_dir());
+
         let (_, stats) = observe_receipt_verifications_for_test(|| {
             verified_removal_candidate_at_with_manifest_for_test(model_id, &target, &manifest)
                 .unwrap();
@@ -2868,6 +2942,18 @@ mod tests {
         .unwrap();
         drop(removal);
         assert!(!restore_target.exists());
+        let error =
+            reconcile_onnx_bundle_removal_with(&restore_storage, model_id, &prior, |_, root| {
+                Ok(VerifiedOnnxRemovalCandidate::for_test(
+                    model_id,
+                    root.to_path_buf(),
+                    "00".repeat(32),
+                ))
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("ownership witness"));
+        assert!(!restore_target.exists());
+        assert!(removal_tombstone_path(&restore_target).unwrap().is_dir());
         assert!(
             reconcile_onnx_bundle_removal_with(
                 &restore_storage,
@@ -2920,6 +3006,26 @@ mod tests {
 
         fs::remove_dir_all(restore_storage).unwrap();
         fs::remove_dir_all(commit_storage).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn onnx_removal_recovery_skips_tree_verification_without_a_transaction() {
+        let storage = unique_root("removal-recovery-no-transaction");
+        fs::create_dir_all(&storage).unwrap();
+        let model_id = "fixture-removal-model";
+        let target = bundle_target_root(&storage, model_id).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        let prior = format!("{:x}", Sha256::digest(b"prior-config"));
+
+        let recovered = reconcile_onnx_bundle_removal_with(&storage, model_id, &prior, |_, _| {
+            panic!("normal startup must not hash an ONNX tree without a transaction")
+        })
+        .unwrap();
+
+        assert!(!recovered);
+        assert!(target.is_dir());
+        fs::remove_dir_all(storage).unwrap();
     }
 
     #[test]

@@ -764,6 +764,8 @@ struct RemovalJournalDocument {
     target: PathBuf,
     prior_config_fingerprint: String,
     expected_config_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ownership_sha256: Option<String>,
 }
 
 impl ManagedRemoval {
@@ -832,6 +834,7 @@ impl ManagedRemoval {
             target: target.to_path_buf(),
             prior_config_fingerprint,
             expected_config_fingerprint: None,
+            ownership_sha256: None,
         };
         persist_removal_journal(&journal_path, &journal)?;
         durable_rename(target, &tombstone).map_err(|error| {
@@ -874,9 +877,31 @@ impl ManagedRemoval {
     /// immediately before this call while its higher-level mutation lock is
     /// held. The capability remains owned by the removal transaction through
     /// settings persistence and commit/rollback.
+    #[cfg(test)]
     pub(crate) fn stage_stable_directory(
+        capability: StableManagedDirectory,
+        prior_config_fingerprint: String,
+    ) -> Result<Self, InstallError> {
+        Self::stage_stable_directory_inner(capability, prior_config_fingerprint, None)
+    }
+
+    pub(crate) fn stage_stable_directory_with_ownership(
+        capability: StableManagedDirectory,
+        prior_config_fingerprint: String,
+        ownership_sha256: String,
+    ) -> Result<Self, InstallError> {
+        validate_sha256(&ownership_sha256)?;
+        Self::stage_stable_directory_inner(
+            capability,
+            prior_config_fingerprint,
+            Some(ownership_sha256),
+        )
+    }
+
+    fn stage_stable_directory_inner(
         mut capability: StableManagedDirectory,
         prior_config_fingerprint: String,
+        ownership_sha256: Option<String>,
     ) -> Result<Self, InstallError> {
         validate_sha256(&prior_config_fingerprint)?;
         let target = capability.path().to_path_buf();
@@ -894,6 +919,7 @@ impl ManagedRemoval {
             target: target.clone(),
             prior_config_fingerprint,
             expected_config_fingerprint: None,
+            ownership_sha256,
         };
         persist_removal_journal(&journal_path, &journal)?;
         if let Err(error) = capability.rename_to(&tombstone) {
@@ -1150,6 +1176,8 @@ pub(crate) fn reconcile_stable_directory_removal(
     target: &Path,
     durable_config_fingerprint: &str,
     mut capability: Option<StableManagedDirectory>,
+    observed_ownership_sha256: Option<&str>,
+    require_ownership_sha256: bool,
 ) -> Result<bool, InstallError> {
     validate_sha256(durable_config_fingerprint)?;
     let tombstone = removal_tombstone_path(target)?;
@@ -1189,6 +1217,33 @@ pub(crate) fn reconcile_stable_directory_removal(
     validate_sha256(&journal.prior_config_fingerprint)?;
     if let Some(expected) = journal.expected_config_fingerprint.as_deref() {
         validate_sha256(expected)?;
+    }
+    if let Some(ownership_sha256) = journal.ownership_sha256.as_deref() {
+        validate_sha256(ownership_sha256)?;
+    }
+    if require_ownership_sha256 && journal.ownership_sha256.is_none() {
+        return Err(InstallError::RecoveryRequired(format!(
+            "stable removal journal {} has no exact artifact ownership witness",
+            journal_path.display()
+        )));
+    }
+    if let Some(observed) = observed_ownership_sha256 {
+        validate_sha256(observed)?;
+        if !journal
+            .ownership_sha256
+            .as_deref()
+            .is_some_and(|expected| expected.eq_ignore_ascii_case(observed))
+        {
+            return Err(InstallError::RecoveryRequired(format!(
+                "opened stable removal artifact no longer matches the ownership witness in {}",
+                journal_path.display()
+            )));
+        }
+    } else if require_ownership_sha256 && capability.is_some() {
+        return Err(InstallError::RecoveryRequired(format!(
+            "opened stable removal artifact at {} has no verified ownership digest",
+            target.display()
+        )));
     }
     let durable_is_prior = journal
         .prior_config_fingerprint
@@ -3871,7 +3926,7 @@ pub(crate) fn removal_tombstone_path(target: &Path) -> Result<PathBuf, InstallEr
     Ok(target.with_file_name(tombstone))
 }
 
-fn removal_journal_path(target: &Path) -> Result<PathBuf, InstallError> {
+pub(crate) fn removal_journal_path(target: &Path) -> Result<PathBuf, InstallError> {
     let name = target
         .file_name()
         .ok_or_else(|| failed(format!("{} has no filename", target.display())))?;
@@ -6907,6 +6962,7 @@ mod tests {
             target: outside,
             prior_config_fingerprint: format!("{:x}", Sha256::digest(b"prior-config")),
             expected_config_fingerprint: None,
+            ownership_sha256: None,
         };
         fs::write(&journal_path, serde_json::to_vec_pretty(&journal).unwrap()).unwrap();
 
