@@ -52,6 +52,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e # 1.96.0 branch reviewed 2026-08-27
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - name: Prepare reviewed sherpa-onnx archives
+        run: |
+          archive_dir="$RUNNER_TEMP/scribe-sherpa-onnx"
+          bash scripts/prepare-macos-release-inputs.sh --output-directory "$archive_dir"
+          echo "SHERPA_ONNX_ARCHIVE_DIR=$archive_dir" >> "$GITHUB_ENV"
       - name: Validate canonical packaging inputs
         run: bash scripts/test-macos-release-packaging.sh
       - name: Run macOS runtime and worker-pack authoring tests
@@ -84,6 +89,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e # 1.96.0 branch reviewed 2026-08-27
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - name: Prepare reviewed sherpa-onnx archives
+        run: |
+          archive_dir="$RUNNER_TEMP/scribe-sherpa-onnx"
+          bash scripts/prepare-macos-release-inputs.sh --output-directory "$archive_dir"
+          echo "SHERPA_ONNX_ARCHIVE_DIR=$archive_dir" >> "$GITHUB_ENV"
       - name: Import protected signing material into the ephemeral keychain
         env:
           SCRIBE_MACOS_SIGNING_IDENTITY: ${{ secrets.SCRIBE_MACOS_SIGNING_IDENTITY }}

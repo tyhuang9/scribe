@@ -4,13 +4,15 @@ IFS=$'\n\t'
 trap 'status=$?; echo "macOS release packaging contract check failed at line $LINENO (exit $status)." >&2; exit "$status"' ERR
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
-scripts=(build-macos-metal-worker-pack.sh build-macos-release.sh sign-notarize-macos-release.sh verify-macos-release-package.sh report-macos-worker-pack-sizes.sh)
+scripts=(build-macos-metal-worker-pack.sh build-macos-release.sh prepare-macos-release-inputs.sh sign-notarize-macos-release.sh verify-macos-release-package.sh report-macos-worker-pack-sizes.sh)
 for script in "${scripts[@]}"; do bash -n "$repo_root/scripts/$script"; done
 for manifest in "$repo_root"/runtime-manifests/gpu-{worker-toolchain,auto-qualification}-macos-{aarch64,x86_64}.json; do jq -e . "$manifest" >/dev/null; done
 jq -e '. == {schema_version:2,catalog_sha256:"c3f19154f1b2265dac92206eae3a35c130a078be46705e1be6032bc442c3b9dc",release_security_epoch:0,keychain_access_group:"",entries:[]}' "$repo_root/runtime-manifests/gpu-pack-release-authority-macos-empty.json" >/dev/null || { echo 'default macOS release authority must remain canonical default-deny.' >&2; exit 1; }
 jq -e '. == {schema_version:1,keychain_access_group:""}' "$repo_root/runtime-manifests/gpu-keychain-namespace-macos-release.json" >/dev/null || { echo 'production Keychain namespace must remain explicitly unprovisioned until reviewed.' >&2; exit 1; }
 jq -e '. == {schema_version:1,mode:"default_deny",target_os:"macos",target_arch:"aarch64",entries:[]}' "$repo_root/runtime-manifests/gpu-auto-qualification-macos-aarch64.json" >/dev/null
 jq -e '. == {schema_version:1,mode:"default_deny",target_os:"macos",target_arch:"x86_64",entries:[]}' "$repo_root/runtime-manifests/gpu-auto-qualification-macos-x86_64.json" >/dev/null
+grep -F '339c8fc19bb4b26e118c80792bbc4546eb263040fac36ef0cc027ec29c756b44' "$repo_root/scripts/prepare-macos-release-inputs.sh" >/dev/null || { echo 'reviewed arm64 sherpa-onnx archive digest is missing.' >&2; exit 1; }
+grep -F '689f8167a52dc4dbaf05369705e26c8f203c748a8c342750fdfdcd8ca6bb8699' "$repo_root/scripts/prepare-macos-release-inputs.sh" >/dev/null || { echo 'reviewed x86_64 sherpa-onnx archive digest is missing.' >&2; exit 1; }
 if grep -En -- '--deep|Ed25519KeyPair|FIXTURE_SEED|SCRIBE_PACK_SIGNING_PRIVATE_KEY=' "$repo_root/scripts"/{build-macos-metal-worker-pack.sh,build-macos-release.sh,sign-notarize-macos-release.sh}; then echo 'macOS release scripts violate the signing-secret contract.' >&2; exit 1; fi
 grep -F 'xcrun notarytool submit "$submission_archive"' "$repo_root/scripts/sign-notarize-macos-release.sh" >/dev/null || { echo 'notarization must submit a private ZIP archive, not an app directory.' >&2; exit 1; }
 grep -F 'mv "$final_archive" "$requested_archive"' "$repo_root/scripts/sign-notarize-macos-release.sh" >/dev/null || { echo 'notarization must publish the requested ZIP only after stapling and verification.' >&2; exit 1; }
