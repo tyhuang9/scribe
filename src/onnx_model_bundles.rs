@@ -1396,20 +1396,19 @@ fn inspect_bundle_artifacts(
         .collect()
 }
 
+struct ReservedBundleInspection {
+    target_guard: BundleTargetGuard,
+    inspections: Vec<(CanonicalTargetIdentity, PinnedArtifactInspectionPlan)>,
+    disk_reservation: BundleDiskReservation,
+}
+
 fn inspect_and_reserve_bundle_with_hook(
     manifest: &OnnxBundleManifest,
     artifacts: &[PinnedArtifact],
     target_root: &Path,
     cancellation: &InstallCancellation,
     after_inspection: impl FnOnce(u64),
-) -> Result<
-    (
-        BundleTargetGuard,
-        Vec<(CanonicalTargetIdentity, PinnedArtifactInspectionPlan)>,
-        BundleDiskReservation,
-    ),
-    InstallError,
-> {
+) -> Result<ReservedBundleInspection, InstallError> {
     // Lock ordering is target guard -> artifact inspection -> volume ledger.
     // Discard and recovery take only the target guard, so no actor can mutate
     // partials between the inspection snapshot and its matching reservation.
@@ -1430,7 +1429,11 @@ fn inspect_and_reserve_bundle_with_hook(
         });
     }
     let disk_reservation = acquire_bundle_disk_reservation(target_root, required_bytes)?;
-    Ok((target_guard, inspections, disk_reservation))
+    Ok(ReservedBundleInspection {
+        target_guard,
+        inspections,
+        disk_reservation,
+    })
 }
 
 /// The sole production entry point that may contact Hugging Face for an ONNX
@@ -1452,7 +1455,11 @@ pub(crate) fn stage_onnx_bundle_install(
         .ok_or_else(|| failed(format!("unknown internal ONNX bundle {model_id}")))?;
     let target_root = bundle_target_root(storage_root, model_id)?;
     let artifacts = pinned_files(storage_root, manifest)?;
-    let (target_guard, inspections, mut disk_reservation) = inspect_and_reserve_bundle_with_hook(
+    let ReservedBundleInspection {
+        target_guard,
+        inspections,
+        mut disk_reservation,
+    } = inspect_and_reserve_bundle_with_hook(
         manifest,
         &artifacts,
         &target_root,
@@ -2459,7 +2466,11 @@ mod tests {
         .unwrap();
         let mut observed_required = None;
 
-        let (target_guard, inspections, reservation) = inspect_and_reserve_bundle_with_hook(
+        let ReservedBundleInspection {
+            target_guard,
+            inspections,
+            disk_reservation: reservation,
+        } = inspect_and_reserve_bundle_with_hook(
             manifest,
             &artifacts,
             &target,

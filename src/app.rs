@@ -1536,12 +1536,12 @@ enum PreparedArtifactInstall {
 #[cfg(test)]
 #[derive(Debug)]
 enum PanickingFinalizerTestFault {
-    AfterJournalCreation {
+    JournalCreation {
         journal_path: PathBuf,
         model_target: PathBuf,
     },
-    AfterModelActivation(Box<crate::installations::DownloadedArtifact>),
-    AfterDirectoryActivation(crate::installations::StagedRuntime),
+    ModelActivation(Box<crate::installations::DownloadedArtifact>),
+    DirectoryActivation(crate::installations::StagedRuntime),
 }
 
 /// A local source has been fully re-hashed and exercised by the isolated
@@ -9370,7 +9370,7 @@ impl LocalTranscriberApp {
                         InstallWorkerPanicSafety::RecoveryRequired,
                         || -> Result<VerifiedInstallResult, InstallJobFailure> {
                             match fault {
-                                PanickingFinalizerTestFault::AfterJournalCreation {
+                                PanickingFinalizerTestFault::JournalCreation {
                                     journal_path,
                                     model_target,
                                 } => {
@@ -9384,12 +9384,12 @@ impl LocalTranscriberApp {
                                         "sensitive injected panic after activation journal creation"
                                     );
                                 }
-                                PanickingFinalizerTestFault::AfterModelActivation(model) => {
+                                PanickingFinalizerTestFault::ModelActivation(model) => {
                                     let _activated =
                                         model.activate().map_err(InstallJobFailure::from)?;
                                     panic!("sensitive injected panic after model activation");
                                 }
-                                PanickingFinalizerTestFault::AfterDirectoryActivation(staged) => {
+                                PanickingFinalizerTestFault::DirectoryActivation(staged) => {
                                     let _activated =
                                         staged.activate().map_err(InstallJobFailure::from)?;
                                     panic!("sensitive injected panic after directory activation");
@@ -25553,7 +25553,7 @@ mod layout_tests {
 
         let app = run_panicking_finalizer_fault(
             "panic-after-journal",
-            PanickingFinalizerTestFault::AfterJournalCreation {
+            PanickingFinalizerTestFault::JournalCreation {
                 journal_path: journal_path.clone(),
                 model_target,
             },
@@ -25587,7 +25587,7 @@ mod layout_tests {
 
         let app = run_panicking_finalizer_fault(
             "panic-after-model",
-            PanickingFinalizerTestFault::AfterModelActivation(Box::new(model)),
+            PanickingFinalizerTestFault::ModelActivation(Box::new(model)),
         );
 
         assert!(!staged.exists());
@@ -25610,12 +25610,10 @@ mod layout_tests {
 
         let app = run_panicking_finalizer_fault(
             "panic-after-directory",
-            PanickingFinalizerTestFault::AfterDirectoryActivation(
-                crate::installations::StagedRuntime {
-                    root: staged.clone(),
-                    target_root: target.clone(),
-                },
-            ),
+            PanickingFinalizerTestFault::DirectoryActivation(crate::installations::StagedRuntime {
+                root: staged.clone(),
+                target_root: target.clone(),
+            }),
         );
 
         assert!(!staged.exists());
