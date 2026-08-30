@@ -5,6 +5,10 @@
 
 pub(crate) const LINUX_GPU_RUNTIME_MANIFEST: &str =
     include_str!("../runtime-manifests/gpu-runtime-linux-x86_64.json");
+const LINUX_GPU_TOOLCHAIN_MANIFEST: &str =
+    include_str!("../runtime-manifests/gpu-worker-toolchain-linux-x86_64.json");
+const LINUX_AUTO_QUALIFICATION_MANIFEST: &str =
+    include_str!("../runtime-manifests/gpu-auto-qualification-linux-x86_64.json");
 
 pub(crate) fn supports_linux_gpu_runtime(
     operating_system: &str,
@@ -68,6 +72,14 @@ mod tests {
         assert_eq!(
             LINUX_GPU_RUNTIME_MANIFEST.trim_end(),
             r#"{"schema_version":1,"target_os":"linux","target_arch":"x86_64","abi":"gnu","supported_ubuntu_versions":["22.04","24.04"],"minimum_glibc":"2.35","minimum_kernel":"5.15","cuda":{"toolkit_version":"12.8","nvcc_version":"12.8.93","provider":"transcribe-cpp-ggml-cuda","minimum_driver_version":"570.26"},"vulkan":{"loader_version":"1.4.357.0","minimum_api_version":"1.2","provider":"transcribe-cpp-ggml-vulkan"}}"#
+        );
+        assert_eq!(
+            LINUX_GPU_TOOLCHAIN_MANIFEST.trim_end(),
+            r#"{"schema_version":1,"target_triple":"x86_64-unknown-linux-gnu","rust":{"release":"1.96.0"},"ubuntu_versions":["22.04","24.04"],"glibc_minimum":"2.35","kernel_minimum":"5.15","cuda":{"toolkit_version":"12.8","nvcc_version":"12.8.93","provider":"transcribe-cpp-ggml-cuda","minimum_driver_version":"570.26"},"vulkan":{"loader_toolchain_version":"1.4.357.0","minimum_api_version":"1.2","provider":"transcribe-cpp-ggml-vulkan"},"build":{"profile":"release","dynamic_backends":false,"openmp":false}}"#
+        );
+        assert_eq!(
+            LINUX_AUTO_QUALIFICATION_MANIFEST.trim_end(),
+            r#"{"schema_version":1,"mode":"default_deny","target_os":"linux","target_arch":"x86_64","entries":[]}"#
         );
     }
 }
