@@ -54,7 +54,7 @@ assert_microphone_entitlement() {
   if ! plutil -convert json -o - "$entitlements" |
       jq -e '.["com.apple.security.device.audio-input"] == true' >/dev/null; then
     rm -f "$entitlements"
-    echo 'microphone entitlement is missing.' >&2
+    echo "microphone entitlement is missing from signed target: $target" >&2
     return 1
   fi
   rm -f "$entitlements"
@@ -71,7 +71,7 @@ for binary in "$macos/Scribe" "$macos/scribe-inference-worker"; do
 done
 assert_no_keychain_group "$macos/scribe-inference-worker"
 codesign --verify --strict --verbose=2 "$app"
-assert_microphone_entitlement "$app"
+assert_microphone_entitlement "$macos/Scribe"
 plutil -extract LSMinimumSystemVersion raw -o - "$app/Contents/Info.plist" | grep -qx '13.0' || { echo 'Info.plist must declare macOS 13.0.' >&2; exit 1; }
 jq -e '.schema_version == 1 and (.packs | type == "array") and (.packs | length <= 8)' "$catalog" >/dev/null || { echo 'catalog is invalid.' >&2; exit 1; }
 catalog_digest="$(shasum -a 256 "$catalog" | awk '{print $1}')"
