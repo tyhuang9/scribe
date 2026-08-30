@@ -8140,8 +8140,7 @@ fn settings_help_affordance(
         egui::Id::new("settings-help-state"),
         &format!("{accessible_name} information"),
         description,
-        "?",
-        true,
+        PopupAffordanceVisual::Circle("?"),
     );
 }
 
@@ -8158,9 +8157,13 @@ fn model_download_error_affordance(
         egui::Id::new("model-download-error-state"),
         accessible_name,
         description,
-        icon_glyph(Icon::Warning),
-        false,
+        PopupAffordanceVisual::Bare(icon_glyph(Icon::Warning)),
     )
+}
+
+enum PopupAffordanceVisual<'a> {
+    Circle(&'a str),
+    Bare(&'a str),
 }
 
 fn popup_affordance(
@@ -8170,8 +8173,7 @@ fn popup_affordance(
     state_id: egui::Id,
     accessible_name: &str,
     description: &str,
-    glyph: &str,
-    draw_circle: bool,
+    visual: PopupAffordanceVisual<'_>,
 ) -> egui::Response {
     const HOVER_DELAY_SECONDS: f64 = 0.3;
     let (rect, _) = ui.allocate_exact_size(Vec2::splat(44.0), Sense::hover());
@@ -8264,6 +8266,10 @@ fn popup_affordance(
     let expanded = state.active == Some(response.id);
     let colors = ui_palette(ui);
     let visual_center = rect.center();
+    let (glyph, draw_circle) = match visual {
+        PopupAffordanceVisual::Circle(glyph) => (glyph, true),
+        PopupAffordanceVisual::Bare(glyph) => (glyph, false),
+    };
     if draw_circle {
         let visual = egui::Rect::from_center_size(rect.center(), Vec2::splat(20.0));
         ui.painter()
