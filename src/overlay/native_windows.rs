@@ -1842,9 +1842,9 @@ fn run_native_overlay_thread(mailbox: Arc<SnapshotMailbox>, event_sink: NativeEv
         if now.duration_since(last_health_check) >= OVERLAY_HEALTH_INTERVAL {
             last_health_check = now;
             animations_enabled = crate::system_preferences::client_area_animations_enabled();
-            if let (Some(host), Some(snapshot)) = (host.as_mut(), current_snapshot.as_ref())
+            if let (Some(host), Some(snapshot)) = (host.as_mut(), transitions.health_snapshot())
                 && snapshot.requested_visible
-                && let Err(failure) = host.health_check(snapshot)
+                && let Err(failure) = host.health_check(&snapshot)
             {
                 host.hide();
                 emit_failure_once(&event_sink, failure, &mut last_failure);
@@ -1919,7 +1919,7 @@ fn process_snapshot(
         // crossfade finishes, but revoke both pointer and UIA actions now.
         render_snapshot.control_requested = true;
     }
-    if !render_snapshot.requested_visible || plan.as_ref().is_some_and(|plan| !plan.visible) {
+    if !render_snapshot.requested_visible {
         if let Some(host) = host.as_mut() {
             host.hide();
         }

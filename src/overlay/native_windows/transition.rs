@@ -17,7 +17,6 @@ pub(super) struct RenderPlan {
     pub previous: Option<OverlaySnapshot>,
     pub target_opacity: u8,
     pub previous_opacity: u8,
-    pub visible: bool,
     pub animated: bool,
     pub reserve_cancel_region: bool,
 }
@@ -170,7 +169,6 @@ impl OverlayTransitionEngine {
             previous: None,
             target_opacity: 255,
             previous_opacity: 0,
-            visible: true,
             animated: false,
             reserve_cancel_region: false,
         };
@@ -279,6 +277,23 @@ impl OverlayTransitionEngine {
         } else {
             Duration::from_millis(500)
         }
+    }
+
+    pub(super) fn health_snapshot(&self) -> Option<OverlaySnapshot> {
+        if self.success_dismissed && self.active.is_none() {
+            return None;
+        }
+        let mut snapshot = self.displayed.clone()?;
+        if self.active.as_ref().is_some_and(|active| {
+            active
+                .previous
+                .as_ref()
+                .is_some_and(|previous| previous.control_requested)
+                && !active.target.control_requested
+        }) {
+            snapshot.control_requested = true;
+        }
+        Some(snapshot)
     }
 }
 
@@ -465,6 +480,21 @@ mod tests {
         ));
         assert!(!plan.target.control_requested);
         assert!(plan.reserve_cancel_region);
+    }
+
+    #[test]
+    fn health_snapshot_treats_the_reserved_cancel_surface_as_expected() {
+        let at = Instant::now();
+        let mut engine = OverlayTransitionEngine::default();
+        let _ = engine.advance(snapshot(OverlayPhase::Listening), at, false);
+        let _ = engine.advance(
+            snapshot(OverlayPhase::Finalizing),
+            at + Duration::from_millis(30),
+            false,
+        );
+        let health = engine.health_snapshot().expect("visible transition state");
+        assert!(health.control_requested);
+        assert!(health.requested_visible);
     }
 
     #[test]
