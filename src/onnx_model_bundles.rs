@@ -19,6 +19,8 @@ use sha2::{Digest, Sha256};
 use crate::disk_space::{
     self, CanonicalTargetIdentity, DiskSpacePreflight, PhysicalVolumeIdentity,
 };
+#[cfg(windows)]
+use crate::installations::open_windows_directory_capability;
 use crate::installations::{
     BundleAssemblyFile, DirectoryReplacement, GeneratedBundleFile, InstallCancellation,
     InstallError, InstallProgress, ManagedRemoval, PinnedArtifact, PinnedArtifactInspectionPlan,
@@ -41,7 +43,6 @@ const RECEIPT_FILE_NAME: &str = "install-receipt.json";
 const NOTICE_FILE_NAME: &str = "NOTICE.txt";
 pub(crate) const OWNERSHIP_WITNESS_SOURCE: &str = "verified-onnx-bundle-receipt";
 const LOCK_DIRECTORY_NAME: &str = ".onnx-bundle-locks";
-const ARTIFACT_SETTINGS_LOCK_FILE_NAME: &str = "onnx-artifact-settings.lock";
 const RESERVATION_CONTROL_DIRECTORY_NAME: &str = "onnx-bundle-volume-reservations";
 const APACHE_2_LICENSE_BYTES: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -614,6 +615,8 @@ fn acquire_bundle_target(target: &Path) -> Result<BundleTargetGuard, InstallErro
 #[derive(Debug)]
 struct OsFileLock {
     file: File,
+    #[cfg(windows)]
+    _namespace: Vec<File>,
 }
 
 impl OsFileLock {
@@ -628,6 +631,8 @@ impl OsFileLock {
             ))
         })?;
         verify_regular_directory_root(parent)?;
+        #[cfg(windows)]
+        let namespace = pin_windows_directory_namespace(parent)?;
         let mut options = OpenOptions::new();
         options.create(true).read(true).write(true);
         configure_lock_no_follow(&mut options);
@@ -643,22 +648,46 @@ impl OsFileLock {
                 path.display()
             )));
         }
-        Ok(Self { file })
+        Ok(Self {
+            file,
+            #[cfg(windows)]
+            _namespace: namespace,
+        })
     }
 }
 
-fn acquire_artifact_settings_lock() -> Result<OsFileLock, InstallError> {
+#[cfg(windows)]
+fn pin_windows_directory_namespace(path: &Path) -> Result<Vec<File>, InstallError> {
+    let mut paths = path
+        .ancestors()
+        .filter(|ancestor| !ancestor.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .collect::<Vec<_>>();
+    paths.reverse();
+    paths
+        .into_iter()
+        .map(|ancestor| open_windows_directory_capability(&ancestor, false, true))
+        .collect()
+}
+
+fn acquire_artifact_settings_lock()
+-> Result<crate::config::settings::SettingsTransaction, InstallError> {
     let config_path = crate::config::config_file_path().map_err(|error| {
         failed(format!(
             "could not resolve ONNX artifact settings lock: {error}"
         ))
     })?;
-    let lock_path = config_path.with_file_name(ARTIFACT_SETTINGS_LOCK_FILE_NAME);
-    OsFileLock::acquire(&lock_path, true)
+    crate::config::settings::SettingsTransaction::acquire(&config_path).map_err(|error| {
+        failed(format!(
+            "could not acquire ONNX artifact settings lock: {error}"
+        ))
+    })
 }
 
-fn durable_artifact_config_fingerprint() -> Result<String, InstallError> {
-    let (config, _) = crate::config::load_config().map_err(|error| {
+fn durable_artifact_config_fingerprint(
+    settings: &crate::config::settings::SettingsTransaction,
+) -> Result<String, InstallError> {
+    let config = settings.load().map_err(|error| {
         failed(format!(
             "could not load durable settings under the ONNX artifact lock: {error}"
         ))
@@ -680,8 +709,11 @@ fn configure_lock_no_follow(options: &mut OpenOptions) {
 #[cfg(windows)]
 fn configure_lock_no_follow(options: &mut OpenOptions) {
     use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
 
-    options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
+    options
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
 }
 
 fn verify_open_lock_file(file: &File, path: &Path) -> Result<(), InstallError> {
@@ -1203,7 +1235,7 @@ impl ActivatedOnnxBundle {
         Ok(OnnxOwnershipLease {
             candidate: ownership,
             _target_guard: Some(target_guard),
-            _settings_guard: Some(settings_guard),
+            settings_guard: Some(settings_guard),
             _capability: None,
         })
     }
@@ -1907,7 +1939,7 @@ pub(crate) struct VerifiedOnnxRemovalCandidate {
 pub(crate) struct OnnxOwnershipLease {
     candidate: VerifiedOnnxRemovalCandidate,
     _target_guard: Option<BundleTargetGuard>,
-    _settings_guard: Option<OsFileLock>,
+    settings_guard: Option<crate::config::settings::SettingsTransaction>,
     _capability: Option<StableManagedDirectory>,
 }
 
@@ -1920,14 +1952,54 @@ impl OnnxOwnershipLease {
         self.candidate
     }
 
+    pub(crate) fn durable_artifact_fingerprint(&self) -> Result<Option<String>, InstallError> {
+        self.settings_guard
+            .as_ref()
+            .map(durable_artifact_config_fingerprint)
+            .transpose()
+    }
+
+    pub(crate) fn persist_artifact_config(
+        &self,
+        expected_artifact_fingerprint: &str,
+        config: &crate::config::AppConfig,
+    ) -> Result<(), InstallError> {
+        let Some(settings) = self.settings_guard.as_ref() else {
+            #[cfg(test)]
+            return Ok(());
+            #[cfg(not(test))]
+            return Err(failed(
+                "ONNX ownership lease has no durable settings transaction",
+            ));
+        };
+        settings
+            .compare_and_save_artifacts(expected_artifact_fingerprint, config)
+            .map_err(|error| failed(format!("could not persist ONNX artifact settings: {error}")))
+    }
+
     #[cfg(test)]
     pub(crate) fn for_test(candidate: VerifiedOnnxRemovalCandidate) -> Self {
         Self {
             candidate,
             _target_guard: None,
-            _settings_guard: None,
+            settings_guard: None,
             _capability: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test_with_settings(
+        candidate: VerifiedOnnxRemovalCandidate,
+        path: &Path,
+    ) -> Result<Self, InstallError> {
+        let settings_guard = crate::config::settings::SettingsTransaction::acquire(path)
+            .map_err(|error| failed(format!("could not acquire test settings lock: {error}")))?;
+        Ok(Self {
+            candidate,
+            _target_guard: None,
+            settings_guard: Some(settings_guard),
+            _capability: None,
+        })
     }
 }
 
@@ -2030,7 +2102,7 @@ pub(crate) fn authorize_onnx_bundle_removal(
     Ok(Some(OnnxOwnershipLease {
         candidate,
         _target_guard: Some(target_guard),
-        _settings_guard: Some(settings_guard),
+        settings_guard: Some(settings_guard),
         _capability: Some(capability),
     }))
 }
@@ -2042,7 +2114,7 @@ pub(crate) fn authorize_onnx_bundle_removal(
 pub(crate) struct OnnxBundleRemoval {
     removal: ManagedRemoval,
     _target_guard: BundleTargetGuard,
-    _settings_guard: Option<OsFileLock>,
+    settings_guard: Option<crate::config::settings::SettingsTransaction>,
 }
 
 impl OnnxBundleRemoval {
@@ -2056,6 +2128,24 @@ impl OnnxBundleRemoval {
     ) -> Result<(), InstallError> {
         self.removal
             .prepare_config_commit(expected_config_fingerprint)
+    }
+
+    pub(crate) fn persist_artifact_config(
+        &self,
+        expected_artifact_fingerprint: &str,
+        config: &crate::config::AppConfig,
+    ) -> Result<(), InstallError> {
+        let Some(settings) = self.settings_guard.as_ref() else {
+            #[cfg(test)]
+            return Ok(());
+            #[cfg(not(test))]
+            return Err(failed(
+                "ONNX removal transaction has no durable settings lock",
+            ));
+        };
+        settings
+            .compare_and_save_artifacts(expected_artifact_fingerprint, config)
+            .map_err(|error| failed(format!("could not persist ONNX removal settings: {error}")))
     }
 
     pub(crate) fn commit(self) -> Result<(), InstallError> {
@@ -2098,7 +2188,12 @@ fn stage_onnx_bundle_removal_with(
         .then(acquire_artifact_settings_lock)
         .transpose()?;
     if enforce_durable_settings
-        && !durable_artifact_config_fingerprint()?.eq_ignore_ascii_case(&prior_config_fingerprint)
+        && !durable_artifact_config_fingerprint(
+            settings_guard
+                .as_ref()
+                .expect("enforced settings must hold its transaction"),
+        )?
+        .eq_ignore_ascii_case(&prior_config_fingerprint)
     {
         return Err(failed(
             "durable artifact settings changed before ONNX removal staging; reopen the confirmation",
@@ -2127,7 +2222,7 @@ fn stage_onnx_bundle_removal_with(
     Ok(OnnxBundleRemoval {
         removal,
         _target_guard: target_guard,
-        _settings_guard: settings_guard,
+        settings_guard,
     })
 }
 
@@ -2165,7 +2260,7 @@ fn reconcile_onnx_bundle_removal_with(
         return Ok(false);
     }
     let _target_guard = acquire_bundle_target(&target_root)?;
-    let _settings_guard = enforce_durable_settings
+    let settings_guard = enforce_durable_settings
         .then(acquire_artifact_settings_lock)
         .transpose()?;
     if !crate::installations::path_entry_exists_no_follow(&tombstone)?
@@ -2210,7 +2305,11 @@ fn reconcile_onnx_bundle_removal_with(
             (None, None)
         };
     let durable_config_fingerprint = if enforce_durable_settings {
-        durable_artifact_config_fingerprint()?
+        durable_artifact_config_fingerprint(
+            settings_guard
+                .as_ref()
+                .expect("enforced settings must hold its transaction"),
+        )?
     } else {
         durable_config_fingerprint.to_owned()
     };
@@ -3146,6 +3245,26 @@ mod tests {
         let journal_path = removal_journal_path(&restore_target).unwrap();
         let journal_bytes = fs::read(&journal_path).unwrap();
         let mut legacy_journal: serde_json::Value = serde_json::from_slice(&journal_bytes).unwrap();
+        assert_eq!(legacy_journal["schema_version"], 2);
+        let mut downgraded_schema = legacy_journal.clone();
+        downgraded_schema["schema_version"] = serde_json::json!(1);
+        fs::write(
+            &journal_path,
+            serde_json::to_vec_pretty(&downgraded_schema).unwrap(),
+        )
+        .unwrap();
+        let error = reconcile_onnx_bundle_removal_with(
+            &restore_storage,
+            model_id,
+            &prior,
+            false,
+            |expected, root| {
+                verified_removal_candidate_at_with_manifest_for_test(expected, root, &manifest)
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("exact catalog target"));
+        fs::write(&journal_path, &journal_bytes).unwrap();
         legacy_journal
             .as_object_mut()
             .unwrap()
@@ -3381,6 +3500,29 @@ mod tests {
         assert!(acquire_bundle_target(&target).is_err());
         drop(first);
         assert!(acquire_bundle_target(&target).is_ok());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn target_lock_file_and_namespace_cannot_be_replaced_while_owned() {
+        let root = unique_root("target-lock-namespace");
+        fs::create_dir_all(&root).unwrap();
+        let target = root.join("model");
+        let guard = acquire_bundle_target(&target).unwrap();
+        let lock_root = root.join(LOCK_DIRECTORY_NAME);
+        let lock_path = lock_root.join("model.lock");
+
+        assert!(
+            fs::rename(&lock_path, lock_root.join("replacement.lock")).is_err(),
+            "the locked file identity must deny namespace replacement"
+        );
+        assert!(
+            fs::rename(&lock_root, root.join("replacement-lock-directory")).is_err(),
+            "the pinned lock directory must deny ancestor replacement"
+        );
+
+        drop(guard);
         fs::remove_dir_all(root).unwrap();
     }
 

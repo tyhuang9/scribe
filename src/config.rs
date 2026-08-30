@@ -292,6 +292,14 @@ pub fn save_config(config: &AppConfig) -> Result<()> {
     settings::save_to_path(&path, config)
 }
 
+pub(crate) fn save_artifact_config(
+    config: &AppConfig,
+    expected_artifact_fingerprint: &str,
+) -> Result<()> {
+    let path = config_file_path()?;
+    settings::save_artifacts_to_path(&path, expected_artifact_fingerprint, config)
+}
+
 pub fn configured_models(config: &AppConfig) -> Vec<SttModelInfo> {
     configured_models_with_bundled_path(config, bundled_model_path())
 }

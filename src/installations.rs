@@ -661,31 +661,49 @@ impl StableManagedDirectory {
 
         #[cfg(windows)]
         {
-            let parent_path = target
-                .parent()
-                .ok_or_else(|| failed(format!("{} has no parent", target.display())))?;
-            let parent = open_windows_directory_capability(parent_path, false, true)?;
-            let mut ancestors = Vec::new();
-            let mut ancestor = parent_path.parent();
-            while let Some(path) = ancestor {
-                if path.as_os_str().is_empty() {
-                    break;
-                }
-                ancestors.push(open_windows_directory_capability(path, false, true)?);
-                ancestor = path.parent();
-            }
-            let directory = open_windows_directory_capability(target, true, true)?;
-            let identity = opened_file_identity(&directory)?;
-            let capability = Self {
-                path: target.to_path_buf(),
-                parent,
-                _ancestors: ancestors,
-                directory,
-                identity,
-            };
-            capability.revalidate_path_identity()?;
-            Ok(capability)
+            Self::open_windows_exact_with_hook(target, |_| {})
         }
+    }
+
+    #[cfg(windows)]
+    fn open_windows_exact_with_hook(
+        target: &Path,
+        mut after_ancestor_open: impl FnMut(&Path),
+    ) -> Result<Self, InstallError> {
+        let parent_path = target
+            .parent()
+            .ok_or_else(|| failed(format!("{} has no parent", target.display())))?;
+        // Establish the namespace from the volume root toward the leaf.
+        // Once an ancestor is open without delete sharing, no deeper path can
+        // be redirected by swapping that ancestor during capability
+        // construction. Opening the immediate parent first would leave a
+        // window where a higher ancestor could be exchanged before its own
+        // handle was acquired.
+        let mut ancestor_paths = parent_path
+            .ancestors()
+            .filter(|path| !path.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .collect::<Vec<_>>();
+        ancestor_paths.reverse();
+        let mut ancestors = Vec::with_capacity(ancestor_paths.len());
+        for path in ancestor_paths {
+            ancestors.push(open_windows_directory_capability(&path, false, true)?);
+            after_ancestor_open(&path);
+        }
+        let parent = ancestors
+            .pop()
+            .ok_or_else(|| failed(format!("{} has no open parent", target.display())))?;
+        let directory = open_windows_directory_capability(target, true, true)?;
+        let identity = opened_file_identity(&directory)?;
+        let capability = Self {
+            path: target.to_path_buf(),
+            parent,
+            _ancestors: ancestors,
+            directory,
+            identity,
+        };
+        capability.revalidate_path_identity()?;
+        Ok(capability)
     }
 
     pub(crate) fn path(&self) -> &Path {
@@ -915,7 +933,10 @@ impl ManagedRemoval {
             )));
         }
         let journal = RemovalJournalDocument {
-            schema_version: 1,
+            // Ownership-bearing stable removals use a distinct schema so an
+            // older build cannot ignore the witness and reconcile the
+            // journal through its weaker generic path after a downgrade.
+            schema_version: if ownership_sha256.is_some() { 2 } else { 1 },
             target: target.clone(),
             prior_config_fingerprint,
             expected_config_fingerprint: None,
@@ -1205,7 +1226,8 @@ pub(crate) fn reconcile_stable_directory_removal(
             journal_path.display()
         ))
     })?;
-    if journal.schema_version != 1
+    let expected_schema_version = if require_ownership_sha256 { 2 } else { 1 };
+    if journal.schema_version != expected_schema_version
         || canonicalize_missing(&journal.target)? != canonicalize_missing(target)?
     {
         return Err(InstallError::RecoveryRequired(format!(
@@ -1425,7 +1447,9 @@ pub(crate) fn discover_managed_removal_targets(
                             path.display()
                         ))
                     })?;
-                if journal.schema_version != 1 {
+                if !matches!(journal.schema_version, 1 | 2)
+                    || (journal.schema_version == 2 && journal.ownership_sha256.is_none())
+                {
                     return Err(InstallError::RecoveryRequired(format!(
                         "unsupported managed removal journal schema at {}",
                         path.display()
@@ -1899,7 +1923,7 @@ fn opened_file_identity(file: &File) -> Result<OpenedFileIdentity, InstallError>
 }
 
 #[cfg(windows)]
-fn open_windows_directory_capability(
+pub(crate) fn open_windows_directory_capability(
     path: &Path,
     delete_access: bool,
     deny_delete_sharing: bool,
@@ -6779,6 +6803,42 @@ mod tests {
         assert!(remove_exact_regular_file(&target, &target).unwrap());
         assert!(!target.exists());
         assert!(!remove_exact_regular_file(&target, &target).unwrap());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn stable_directory_capability_fails_closed_on_construction_ancestor_swap() {
+        let root = unique_root("stable-directory-construction-swap");
+        let namespace = root.join("storage");
+        let moved_namespace = root.join("storage-swapped");
+        let target = namespace.join("managed-onnx");
+        fs::create_dir_all(target.join("nested")).unwrap();
+        fs::write(target.join("nested").join("model.onnx"), b"model").unwrap();
+        let mut swapped = false;
+
+        let capability = StableManagedDirectory::open_windows_exact_with_hook(&target, |opened| {
+            if opened == root && !swapped {
+                fs::rename(&namespace, &moved_namespace).unwrap();
+                swapped = true;
+            }
+        });
+
+        assert!(swapped, "the construction-race hook must run");
+        assert!(
+            capability.is_err(),
+            "a namespace changed during root-to-leaf pinning must not yield deletion authority"
+        );
+        assert_eq!(
+            fs::read(
+                moved_namespace
+                    .join("managed-onnx")
+                    .join("nested")
+                    .join("model.onnx")
+            )
+            .unwrap(),
+            b"model"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

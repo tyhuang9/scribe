@@ -1549,6 +1549,20 @@ impl StagedModelRemoval {
         }
     }
 
+    fn persist_artifact_config(
+        &self,
+        expected_artifact_fingerprint: &str,
+        config: &config::AppConfig,
+    ) -> Result<(), InstallError> {
+        match self {
+            Self::Generic(_) => config::save_artifact_config(config, expected_artifact_fingerprint)
+                .map_err(|error| InstallError::Failed(error.to_string())),
+            Self::Onnx(removal) => {
+                removal.persist_artifact_config(expected_artifact_fingerprint, config)
+            }
+        }
+    }
+
     fn commit(self) -> Result<(), InstallError> {
         match self {
             Self::Generic(removal) => removal.commit(),
@@ -8109,7 +8123,11 @@ impl LocalTranscriberApp {
                         continue;
                     }
                     let persistence =
-                        config::save_config(&self.config).map_err(|error| error.to_string());
+                        config::settings::artifact_config_fingerprint(&previous_config)
+                            .and_then(|prior_fingerprint| {
+                                config::save_artifact_config(&self.config, &prior_fingerprint)
+                            })
+                            .map_err(|error| error.to_string());
                     if let Err(message) = persistence {
                         let message = format!(
                             "Could not confirm the verified installation settings commit: {message}. Artifacts and the activation journal were retained unchanged; restart Scribe to reconcile against the durable settings fingerprint."
@@ -9131,10 +9149,14 @@ impl LocalTranscriberApp {
         let persistence = if self.config_path.is_none() {
             Ok(())
         } else {
-            config::save_config(&self.config)
+            config::settings::artifact_config_fingerprint(&previous).and_then(|prior_fingerprint| {
+                config::save_artifact_config(&self.config, &prior_fingerprint)
+            })
         };
         #[cfg(not(test))]
-        let persistence = config::save_config(&self.config);
+        let persistence = config::settings::artifact_config_fingerprint(&previous).and_then(
+            |prior_fingerprint| config::save_artifact_config(&self.config, &prior_fingerprint),
+        );
         if let Err(error) = persistence {
             self.config = previous;
             self.status = TranscriptionStatus::Error;
@@ -10019,7 +10041,20 @@ impl LocalTranscriberApp {
             &config::model_storage_dir(&self.config),
             &imported.model_id,
         );
-        if let Err(error) = config::save_config(&self.config) {
+        let prior_artifact_fingerprint =
+            match config::settings::artifact_config_fingerprint(&previous_config) {
+                Ok(fingerprint) => fingerprint,
+                Err(error) => {
+                    self.config = previous_config;
+                    self.status = TranscriptionStatus::Error;
+                    self.set_local_gguf_import_message(format!(
+                        "Could not prepare the local import settings transaction: {error}."
+                    ));
+                    return;
+                }
+            };
+        if let Err(error) = config::save_artifact_config(&self.config, &prior_artifact_fingerprint)
+        {
             self.config = previous_config;
             self.status = TranscriptionStatus::Error;
             self.set_local_gguf_import_message(format!(
@@ -10030,8 +10065,12 @@ impl LocalTranscriberApp {
         if let Err(error) =
             installed_manifest::persist_manifest_at(&imported.manifest, &receipt_path)
         {
+            let installed_artifact_fingerprint =
+                config::settings::artifact_config_fingerprint(&self.config);
             self.config = previous_config;
-            let config_rollback = config::save_config(&self.config).err();
+            let config_rollback = installed_artifact_fingerprint
+                .and_then(|fingerprint| config::save_artifact_config(&self.config, &fingerprint))
+                .err();
             let message = format!(
                 "Could not persist the local import receipt after saving settings: {error}.{}",
                 config_rollback
@@ -10130,26 +10169,19 @@ impl LocalTranscriberApp {
                 "ONNX ownership evidence did not bind the exact catalog target.".to_owned(),
             );
         }
-        if let Some(path) = self.config_path.as_deref() {
-            let expected_fingerprint = config::settings::artifact_config_fingerprint(&self.config)
-                .map_err(|error| {
-                    format!("Could not fingerprint the current ONNX artifact settings: {error}")
-                })?;
-            let durable_config = config::settings::load_from_path(path).map_err(|error| {
-                format!("Could not reload durable ONNX artifact settings: {error}")
-            })?;
-            let durable_fingerprint = config::settings::artifact_config_fingerprint(
-                &durable_config,
-            )
+        let expected_fingerprint = config::settings::artifact_config_fingerprint(&self.config)
             .map_err(|error| {
-                format!("Could not fingerprint durable ONNX artifact settings: {error}")
+                format!("Could not fingerprint the current ONNX artifact settings: {error}")
             })?;
-            if durable_fingerprint != expected_fingerprint {
-                return Err(
-                    "Durable model artifact settings changed in another process; refresh model state and retry."
-                        .to_owned(),
-                );
-            }
+        if let Some(durable_fingerprint) = ownership
+            .durable_artifact_fingerprint()
+            .map_err(|error| error.to_string())?
+            && durable_fingerprint != expected_fingerprint
+        {
+            return Err(
+                "Durable model artifact settings changed in another process; refresh model state and retry."
+                    .to_owned(),
+            );
         }
         if onnx_ownership_witness_matches(&self.config, candidate) {
             return Ok(());
@@ -10167,19 +10199,7 @@ impl LocalTranscriberApp {
                 "ONNX ownership evidence was rejected by managed-path normalization.".to_owned(),
             );
         }
-        let persistence = match self.config_path.as_deref() {
-            Some(path) => config::settings::save_to_path(path, &self.config),
-            #[cfg(test)]
-            None => Ok(()),
-            #[cfg(not(test))]
-            None => {
-                self.config = previous;
-                return Err(
-                    "Could not resolve the durable settings path for the ONNX ownership witness."
-                        .to_owned(),
-                );
-            }
-        };
+        let persistence = ownership.persist_artifact_config(&expected_fingerprint, &self.config);
         if let Err(error) = persistence {
             self.config = previous;
             return Err(format!(
@@ -10331,7 +10351,7 @@ impl LocalTranscriberApp {
                 &config::onnx_bundle_storage_dir(&self.config),
                 &model.id,
                 candidate.receipt_sha256(),
-                prior_fingerprint,
+                prior_fingerprint.clone(),
             )
             .map(StagedModelRemoval::Onnx)
             .map(Some)
@@ -10344,13 +10364,13 @@ impl LocalTranscriberApp {
                             bundled_target
                                 .as_ref()
                                 .expect("bundled target was established"),
-                            prior_fingerprint,
+                            prior_fingerprint.clone(),
                         )
                     } else {
                         ManagedRemoval::stage(
                             target,
                             std::slice::from_ref(target),
-                            prior_fingerprint,
+                            prior_fingerprint.clone(),
                         )
                     };
                     staged.map(StagedModelRemoval::Generic).map(Some)
@@ -10410,10 +10430,24 @@ impl LocalTranscriberApp {
         let persistence = if self.config_path.is_none() {
             Ok(())
         } else {
-            config::save_config(&self.config)
+            staged_removal.as_ref().map_or_else(
+                || config::save_artifact_config(&self.config, &prior_fingerprint),
+                |removal| {
+                    removal
+                        .persist_artifact_config(&prior_fingerprint, &self.config)
+                        .map_err(anyhow::Error::msg)
+                },
+            )
         };
         #[cfg(not(test))]
-        let persistence = config::save_config(&self.config);
+        let persistence = staged_removal.as_ref().map_or_else(
+            || config::save_artifact_config(&self.config, &prior_fingerprint),
+            |removal| {
+                removal
+                    .persist_artifact_config(&prior_fingerprint, &self.config)
+                    .map_err(anyhow::Error::msg)
+            },
+        );
         if let Err(error) = persistence {
             self.config = previous_config;
             let message = if removing_bundled {
@@ -27472,23 +27506,27 @@ mod layout_tests {
         let model_id = "moonshine-tiny-en-int8-onnx".to_owned();
         let target = config::onnx_bundle_target_root(&app.config, &ModelId::new(&model_id))
             .expect("known ONNX bundle target");
-        let ownership = OnnxOwnershipLease::for_test(VerifiedOnnxRemovalCandidate::for_test(
-            model_id.clone(),
-            target,
-            "ab".repeat(32),
-        ));
         let mut concurrent = app.config.clone();
         concurrent
             .general
             .excluded_bundled_model_ids
             .push(BUNDLED_BASE_MODEL_ID.to_owned());
         config::normalize_config(&mut concurrent);
-        config::settings::save_to_path(&config_path, &concurrent).unwrap();
+        let original_fingerprint =
+            config::settings::artifact_config_fingerprint(&app.config).unwrap();
+        config::settings::save_artifacts_to_path(&config_path, &original_fingerprint, &concurrent)
+            .unwrap();
+        let ownership = OnnxOwnershipLease::for_test_with_settings(
+            VerifiedOnnxRemovalCandidate::for_test(model_id.clone(), target, "ab".repeat(32)),
+            &config_path,
+        )
+        .unwrap();
 
         let error = app.persist_onnx_ownership_witness(&ownership).unwrap_err();
 
         assert!(error.contains("changed in another process"));
         assert!(!app.config.general.managed_models.contains_key(&model_id));
+        drop(ownership);
         let durable = config::settings::load_from_path(&config_path).unwrap();
         assert_eq!(
             durable.general.excluded_bundled_model_ids,

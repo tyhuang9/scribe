@@ -10,6 +10,106 @@ use sha2::{Digest, Sha256};
 use super::super::normalize_config;
 use super::{AppConfig, discard_retired_config_values, parse_settings_value_with_diagnostics};
 
+const SETTINGS_LOCK_EXTENSION: &str = "settings.lock";
+
+#[derive(Debug)]
+pub(crate) struct SettingsTransaction {
+    path: PathBuf,
+    file: File,
+    #[cfg(windows)]
+    _namespace: Vec<File>,
+}
+
+impl SettingsTransaction {
+    pub(crate) fn acquire(path: &Path) -> Result<Self> {
+        let parent = path
+            .parent()
+            .ok_or_else(|| anyhow!("config path has no parent: {}", path.display()))?;
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create config directory {}", parent.display()))?;
+        secure_directory_permissions(parent)?;
+        let parent_metadata = fs::symlink_metadata(parent)
+            .with_context(|| format!("failed to inspect config directory {}", parent.display()))?;
+        if !parent_metadata.is_dir() || metadata_is_link_or_reparse(&parent_metadata) {
+            return Err(anyhow!(
+                "config directory is not a regular non-link directory: {}",
+                parent.display()
+            ));
+        }
+        #[cfg(windows)]
+        let namespace = pin_windows_settings_namespace(parent)?;
+        let lock_path = path.with_extension(SETTINGS_LOCK_EXTENSION);
+        let mut options = OpenOptions::new();
+        options.create(true).read(true).write(true);
+        configure_lock_no_follow(&mut options);
+        let file = options
+            .open(&lock_path)
+            .with_context(|| format!("failed to open settings lock {}", lock_path.display()))?;
+        let metadata = file
+            .metadata()
+            .with_context(|| format!("failed to inspect settings lock {}", lock_path.display()))?;
+        if !metadata.is_file() || metadata_is_link_or_reparse(&metadata) {
+            return Err(anyhow!(
+                "settings lock is not a regular non-link file: {}",
+                lock_path.display()
+            ));
+        }
+        lock_settings_file(&file)
+            .with_context(|| format!("failed to lock settings file {}", lock_path.display()))?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            file,
+            #[cfg(windows)]
+            _namespace: namespace,
+        })
+    }
+
+    pub(crate) fn load(&self) -> Result<AppConfig> {
+        load_from_transaction(self)
+    }
+
+    pub(crate) fn save_preserving_artifacts(&self, config: &AppConfig) -> Result<()> {
+        if self.path.exists() {
+            let durable = self.load()?;
+            let durable_fingerprint = artifact_config_fingerprint(&durable)?;
+            let proposed_fingerprint = artifact_config_fingerprint(config)?;
+            if durable_fingerprint != proposed_fingerprint {
+                return Err(anyhow!(
+                    "durable model artifact settings changed; refresh model state before saving settings"
+                ));
+            }
+        }
+        self.save_unchecked(config)
+    }
+
+    pub(crate) fn compare_and_save_artifacts(
+        &self,
+        expected_artifact_fingerprint: &str,
+        config: &AppConfig,
+    ) -> Result<()> {
+        validate_fingerprint(expected_artifact_fingerprint)?;
+        let durable = self.load()?;
+        let durable_fingerprint = artifact_config_fingerprint(&durable)?;
+        if !durable_fingerprint.eq_ignore_ascii_case(expected_artifact_fingerprint) {
+            return Err(anyhow!(
+                "durable model artifact settings changed; refresh model state before committing the artifact transaction"
+            ));
+        }
+        self.save_unchecked(config)
+    }
+
+    fn save_unchecked(&self, config: &AppConfig) -> Result<()> {
+        let content = serialized_config_bytes(config)?;
+        atomic_write_bytes(&self.path, &content)
+    }
+}
+
+impl Drop for SettingsTransaction {
+    fn drop(&mut self) {
+        let _ = unlock_settings_file(&self.file);
+    }
+}
+
 pub struct SettingsStore {
     path: PathBuf,
     debounce: Duration,
@@ -62,9 +162,14 @@ impl SettingsStore {
 }
 
 pub(crate) fn load_from_path(path: &Path) -> Result<AppConfig> {
+    SettingsTransaction::acquire(path)?.load()
+}
+
+fn load_from_transaction(transaction: &SettingsTransaction) -> Result<AppConfig> {
+    let path = &transaction.path;
     if !path.exists() {
         let config = AppConfig::default();
-        save_to_path(path, &config)?;
+        transaction.save_unchecked(&config)?;
         return Ok(config);
     }
 
@@ -75,7 +180,7 @@ pub(crate) fn load_from_path(path: &Path) -> Result<AppConfig> {
         Err(_) => {
             backup_corrupt(path)?;
             let config = AppConfig::default();
-            save_to_path(path, &config)?;
+            transaction.save_unchecked(&config)?;
             return Ok(config);
         }
     };
@@ -97,14 +202,22 @@ pub(crate) fn load_from_path(path: &Path) -> Result<AppConfig> {
         } else {
             backup_before_migration(path)?;
         }
-        save_to_path(path, &config)?;
+        transaction.save_unchecked(&config)?;
     }
     Ok(config)
 }
 
 pub(crate) fn save_to_path(path: &Path, config: &AppConfig) -> Result<()> {
-    let content = serialized_config_bytes(config)?;
-    atomic_write_bytes(path, &content)
+    SettingsTransaction::acquire(path)?.save_preserving_artifacts(config)
+}
+
+pub(crate) fn save_artifacts_to_path(
+    path: &Path,
+    expected_artifact_fingerprint: &str,
+    config: &AppConfig,
+) -> Result<()> {
+    SettingsTransaction::acquire(path)?
+        .compare_and_save_artifacts(expected_artifact_fingerprint, config)
 }
 
 pub(crate) fn artifact_config_fingerprint(config: &AppConfig) -> Result<String> {
@@ -141,6 +254,16 @@ fn normalized_config(config: &AppConfig) -> AppConfig {
         normalized.schema_version = super::super::CURRENT_SCHEMA_VERSION;
     }
     normalized
+}
+
+fn validate_fingerprint(value: &str) -> Result<()> {
+    if value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "artifact settings fingerprint is not a SHA-256 digest"
+        ))
+    }
 }
 
 fn canonical_json(value: Value) -> Value {
@@ -257,6 +380,146 @@ fn create_temp_file(path: &Path) -> Result<(PathBuf, File)> {
         }
     }
     Err(anyhow!("could not create a unique config temporary file"))
+}
+
+#[cfg(unix)]
+fn configure_lock_no_follow(options: &mut OpenOptions) {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    options.custom_flags(libc::O_NOFOLLOW);
+}
+
+#[cfg(windows)]
+fn pin_windows_settings_namespace(path: &Path) -> Result<Vec<File>> {
+    let mut paths = path
+        .ancestors()
+        .filter(|ancestor| !ancestor.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .collect::<Vec<_>>();
+    paths.reverse();
+    paths
+        .into_iter()
+        .map(|ancestor| open_windows_settings_directory(&ancestor))
+        .collect()
+}
+
+#[cfg(windows)]
+fn open_windows_settings_directory(path: &Path) -> Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY,
+        FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, SYNCHRONIZE,
+    };
+
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .access_mode(FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | SYNCHRONIZE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+    let directory = options.open(path).with_context(|| {
+        format!(
+            "failed to pin settings directory namespace {}",
+            path.display()
+        )
+    })?;
+    let metadata = directory.metadata().with_context(|| {
+        format!(
+            "failed to inspect pinned settings directory {}",
+            path.display()
+        )
+    })?;
+    if !metadata.is_dir() || metadata_is_link_or_reparse(&metadata) {
+        return Err(anyhow!(
+            "settings path crosses a link, reparse point, or non-directory ancestor: {}",
+            path.display()
+        ));
+    }
+    Ok(directory)
+}
+
+#[cfg(windows)]
+fn configure_lock_no_follow(options: &mut OpenOptions) {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+    options
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
+}
+
+#[cfg(windows)]
+fn metadata_is_link_or_reparse(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    metadata.file_attributes() & 0x400 != 0
+}
+
+#[cfg(not(windows))]
+fn metadata_is_link_or_reparse(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+#[cfg(unix)]
+fn lock_settings_file(file: &File) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(unix)]
+fn unlock_settings_file(file: &File) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(windows)]
+fn lock_settings_file(file: &File) -> io::Result<()> {
+    use std::mem::zeroed;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{LOCKFILE_EXCLUSIVE_LOCK, LockFileEx};
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+
+    let mut overlapped: OVERLAPPED = unsafe { zeroed() };
+    if unsafe {
+        LockFileEx(
+            file.as_raw_handle(),
+            LOCKFILE_EXCLUSIVE_LOCK,
+            0,
+            1,
+            0,
+            &mut overlapped,
+        )
+    } != 0
+    {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(windows)]
+fn unlock_settings_file(file: &File) -> io::Result<()> {
+    use std::mem::zeroed;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::UnlockFileEx;
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+
+    let mut overlapped: OVERLAPPED = unsafe { zeroed() };
+    if unsafe { UnlockFileEx(file.as_raw_handle(), 0, 1, 0, &mut overlapped) } != 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
 }
 
 #[cfg(unix)]
@@ -879,6 +1142,66 @@ mod tests {
         assert!(!store.flush().unwrap());
         let persisted: AppConfig = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(persisted.recording.hotkey, "Persisted transaction");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn stale_ordinary_save_cannot_restore_removed_artifact_state() {
+        let dir = test_dir("stale-artifact-save");
+        let path = dir.join("config.json");
+        let stale = AppConfig::default();
+        save_to_path(&path, &stale).unwrap();
+        let prior = artifact_config_fingerprint(&stale).unwrap();
+        let mut removed = stale.clone();
+        removed
+            .general
+            .excluded_bundled_model_ids
+            .push(crate::model_catalog::BUNDLED_BASE_MODEL_ID.to_owned());
+        save_artifacts_to_path(&path, &prior, &removed).unwrap();
+
+        let mut stale_ordinary_update = stale;
+        stale_ordinary_update.recording.hotkey = "Stale ordinary update".to_owned();
+        let error = save_to_path(&path, &stale_ordinary_update).unwrap_err();
+
+        assert!(error.to_string().contains("artifact settings changed"));
+        let durable = load_from_path(&path).unwrap();
+        assert_eq!(
+            durable.general.excluded_bundled_model_ids,
+            vec![crate::model_catalog::BUNDLED_BASE_MODEL_ID.to_owned()]
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn settings_transaction_blocks_a_second_writer_until_release() {
+        use std::sync::mpsc;
+
+        let dir = test_dir("cross-writer-lock");
+        let path = dir.join("config.json");
+        save_to_path(&path, &AppConfig::default()).unwrap();
+        let transaction = SettingsTransaction::acquire(&path).unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let writer_path = path.clone();
+        let writer = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = save_to_path(&writer_path, &AppConfig::default());
+            finished_tx.send(result.map(|_| ())).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(
+            finished_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "the second writer must wait while the cross-process lock is held"
+        );
+
+        drop(transaction);
+        finished_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("writer must resume after lock release")
+            .unwrap();
+        writer.join().unwrap();
         fs::remove_dir_all(dir).unwrap();
     }
 
