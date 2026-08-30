@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -1526,6 +1527,10 @@ struct PreparedVerifiedInstall {
 enum PreparedArtifactInstall {
     Gguf(Box<PreparedVerifiedInstall>),
     Onnx(Box<crate::onnx_model_bundles::StagedOnnxBundle>),
+    #[cfg(test)]
+    PanickingTestFinalizer,
+    #[cfg(test)]
+    WaitingTestFinalizer(Receiver<()>),
 }
 
 /// A local source has been fully re-hashed and exercised by the isolated
@@ -1614,6 +1619,17 @@ fn send_install_progress(
         model_id: model_id.to_owned(),
         progress,
     });
+}
+
+fn catch_install_worker_panic<T>(
+    phase: &str,
+    work: impl FnOnce() -> Result<T, InstallJobFailure>,
+) -> Result<T, InstallJobFailure> {
+    catch_unwind(AssertUnwindSafe(work)).unwrap_or_else(|_| {
+        Err(InstallJobFailure::normal(format!(
+            "{phase} worker stopped unexpectedly."
+        )))
+    })
 }
 
 fn send_verified_install_result(
@@ -1734,6 +1750,10 @@ enum VerifiedInstallSource {
     NormalizedCatalog,
     NormalizedOnnxBundle(managed_downloads::OnnxBundleDownloadAdmission),
     TrustedRemote(TrustedRemoteInstallRequest),
+    #[cfg(test)]
+    PanickingTestTransfer,
+    #[cfg(test)]
+    WaitingTestTransfer(Receiver<()>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2537,6 +2557,17 @@ fn prepare_verified_install(
                 request.artifact.expected_sha256.clone(),
             );
             (model, source, Some(request))
+        }
+        #[cfg(test)]
+        VerifiedInstallSource::PanickingTestTransfer => {
+            panic!("sensitive injected transfer panic payload")
+        }
+        #[cfg(test)]
+        VerifiedInstallSource::WaitingTestTransfer(release) => {
+            let _ = release.recv();
+            return Err(InstallJobFailure::normal(
+                "Test transfer worker released.".to_owned(),
+            ));
         }
     };
     if cancellation.is_cancelled() {
@@ -9206,16 +9237,18 @@ impl LocalTranscriberApp {
                     let progress = |progress| {
                         send_install_progress(&tx, launch.job_id, &launch.model_id, progress)
                     };
-                    let result = prepare_verified_install(
-                        VerifiedInstallPreparationRequest {
-                            config: launch.config,
-                            model_id,
-                            cancellation: launch.cancellation,
-                            source: launch.source,
-                            expected_target_identity: launch.expected_target_identity,
-                        },
-                        &progress,
-                    );
+                    let result = catch_install_worker_panic("Model transfer", || {
+                        prepare_verified_install(
+                            VerifiedInstallPreparationRequest {
+                                config: launch.config,
+                                model_id,
+                                cancellation: launch.cancellation,
+                                source: launch.source,
+                                expected_target_identity: launch.expected_target_identity,
+                            },
+                            &progress,
+                        )
+                    });
                     let _ = completion_tx.send(());
                     send_verified_install_preparation(&tx, launch.job_id, launch.model_id, result);
                 });
@@ -9265,19 +9298,23 @@ impl LocalTranscriberApp {
                     let progress = |progress| {
                         send_install_progress(&tx, launch.job_id, &launch.model_id, progress)
                     };
-                    let result = run_verified_install_finalizer(
-                        config,
-                        service,
-                        launch.cancellation,
-                        *prepared,
-                        &progress,
-                    );
+                    let result = catch_install_worker_panic("Model finalization", || {
+                        run_verified_install_finalizer(
+                            config,
+                            service,
+                            launch.cancellation,
+                            *prepared,
+                            &progress,
+                        )
+                    });
                     let _ = completion_tx.send(());
                     send_verified_install_result(&tx, launch.job_id, launch.model_id, result);
                 }
                 PreparedArtifactInstall::Onnx(staged) => {
                     let cancellation = launch.cancellation;
-                    let result = run_onnx_bundle_finalizer(service, cancellation.clone(), *staged);
+                    let result = catch_install_worker_panic("Model finalization", || {
+                        run_onnx_bundle_finalizer(service, cancellation.clone(), *staged)
+                    });
                     let recovery_required = result
                         .as_ref()
                         .err()
@@ -9293,6 +9330,25 @@ impl LocalTranscriberApp {
                         recovery_required,
                         result,
                     });
+                }
+                #[cfg(test)]
+                PreparedArtifactInstall::PanickingTestFinalizer => {
+                    let result = catch_install_worker_panic("Model finalization", || {
+                        panic!("sensitive injected finalizer panic payload")
+                    });
+                    let _ = completion_tx.send(());
+                    send_verified_install_result(&tx, launch.job_id, launch.model_id, result);
+                }
+                #[cfg(test)]
+                PreparedArtifactInstall::WaitingTestFinalizer(release) => {
+                    let result = catch_install_worker_panic("Model finalization", || {
+                        let _ = release.recv();
+                        Err(InstallJobFailure::normal(
+                            "Test finalizer worker released.".to_owned(),
+                        ))
+                    });
+                    let _ = completion_tx.send(());
+                    send_verified_install_result(&tx, launch.job_id, launch.model_id, result);
                 }
             });
         match worker {
@@ -25233,6 +25289,195 @@ mod layout_tests {
             coordinator.get_job("overlap-3").unwrap().phase,
             ArtifactInstallPhase::QueuedTransfer
         );
+    }
+
+    #[test]
+    fn panicking_transfer_releases_resources_and_advances_the_fifo() {
+        let mut app = test_app();
+        let available = crate::disk_space::SAFETY_HEADROOM_BYTES + 1_000;
+        let mut releases = Vec::new();
+        let mut panicking_target = None;
+        for index in 0..4 {
+            let admission = coordinator_admission(
+                &format!("panic-transfer-{index}.gguf"),
+                &format!("panic-transfer-volume-{index}"),
+                available,
+                100,
+            );
+            if index == 0 {
+                panicking_target = Some(admission.target_identity.clone());
+            }
+            let source = if index == 0 {
+                VerifiedInstallSource::PanickingTestTransfer
+            } else {
+                let (release, wait) = bounded(1);
+                releases.push(release);
+                VerifiedInstallSource::WaitingTestTransfer(wait)
+            };
+            app.artifact_installations
+                .admit(
+                    format!("panic-transfer-{index}"),
+                    admission,
+                    AppConfig::default(),
+                    source,
+                )
+                .unwrap();
+        }
+
+        app.launch_ready_artifact_transfers();
+        assert_eq!(app.artifact_installations.active_transfers, 3);
+        assert_eq!(
+            app.artifact_installations
+                .get_job("panic-transfer-3")
+                .unwrap()
+                .phase,
+            ArtifactInstallPhase::QueuedTransfer
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            app.poll_events();
+            if !app.artifact_installations.contains_key("panic-transfer-0")
+                && app
+                    .artifact_installations
+                    .phase_for_model("panic-transfer-3")
+                    == Some(ArtifactInstallPhase::Transferring)
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        assert!(!app.artifact_installations.contains_key("panic-transfer-0"));
+        assert_eq!(app.artifact_installations.active_transfers, 3);
+        assert!(
+            !app.artifact_installations
+                .reserved_by_volume
+                .contains_key("panic-transfer-volume-0")
+        );
+        assert!(
+            !app.artifact_installations
+                .target_owners
+                .contains_key(&panicking_target.unwrap())
+        );
+        assert_eq!(app.artifact_installations.target_owners.len(), 3);
+        assert!(
+            app.status_message
+                .contains("Model transfer worker stopped unexpectedly.")
+        );
+        assert!(!app.status_message.contains("sensitive injected"));
+
+        for release in releases {
+            release.send(()).unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline && !app.artifact_installations.is_empty() {
+            app.poll_events();
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(app.artifact_installations.is_empty());
+        assert_eq!(app.artifact_installations.active_transfers, 0);
+        assert!(app.artifact_installations.reserved_by_volume.is_empty());
+        assert!(app.artifact_installations.target_owners.is_empty());
+    }
+
+    #[test]
+    fn panicking_finalizer_releases_ownership_and_advances_the_queue() {
+        let mut app = test_app();
+        let available = crate::disk_space::SAFETY_HEADROOM_BYTES + 1_000;
+        let first_admission = coordinator_admission(
+            "panic-finalizer-0.gguf",
+            "panic-finalizer-volume-0",
+            available,
+            100,
+        );
+        let first_target = first_admission.target_identity.clone();
+        let first_job = app
+            .artifact_installations
+            .admit(
+                "panic-finalizer-0".to_owned(),
+                first_admission,
+                AppConfig::default(),
+                VerifiedInstallSource::NormalizedCatalog,
+            )
+            .unwrap();
+        let second_admission = coordinator_admission(
+            "panic-finalizer-1.gguf",
+            "panic-finalizer-volume-1",
+            available,
+            100,
+        );
+        let second_target = second_admission.target_identity.clone();
+        let second_job = app
+            .artifact_installations
+            .admit(
+                "panic-finalizer-1".to_owned(),
+                second_admission,
+                AppConfig::default(),
+                VerifiedInstallSource::NormalizedCatalog,
+            )
+            .unwrap();
+        let launches = app.artifact_installations.take_ready_transfers();
+        assert_eq!(launches.len(), 2);
+        assert!(app.artifact_installations.mark_prepared(
+            "panic-finalizer-0",
+            first_job,
+            PreparedArtifactInstall::PanickingTestFinalizer,
+        ));
+        let (release, wait) = bounded(1);
+        assert!(app.artifact_installations.mark_prepared(
+            "panic-finalizer-1",
+            second_job,
+            PreparedArtifactInstall::WaitingTestFinalizer(wait),
+        ));
+        assert!(app.artifact_installations.reserved_by_volume.is_empty());
+
+        app.launch_next_artifact_finalizer();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            app.poll_events();
+            if !app.artifact_installations.contains_key("panic-finalizer-0")
+                && app
+                    .artifact_installations
+                    .phase_for_model("panic-finalizer-1")
+                    == Some(ArtifactInstallPhase::Finalizing)
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        assert!(!app.artifact_installations.contains_key("panic-finalizer-0"));
+        assert_eq!(
+            app.artifact_installations.active_finalizer,
+            Some(second_job)
+        );
+        assert!(
+            !app.artifact_installations
+                .target_owners
+                .contains_key(&first_target)
+        );
+        assert!(
+            app.artifact_installations
+                .target_owners
+                .contains_key(&second_target)
+        );
+        assert!(app.artifact_installations.reserved_by_volume.is_empty());
+        assert!(
+            app.status_message
+                .contains("Model finalization worker stopped unexpectedly.")
+        );
+        assert!(!app.status_message.contains("sensitive injected"));
+
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline && !app.artifact_installations.is_empty() {
+            app.poll_events();
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(app.artifact_installations.is_empty());
+        assert_eq!(app.artifact_installations.active_finalizer, None);
+        assert!(app.artifact_installations.target_owners.is_empty());
     }
 
     #[test]
