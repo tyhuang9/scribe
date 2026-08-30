@@ -19,6 +19,11 @@ assert_no_keychain_group() {
     echo "could not inspect worker entitlements: $target" >&2
     return 1
   fi
+  if [[ -s "$entitlements" ]] && ! plutil -lint "$entitlements" >/dev/null 2>&1; then
+    rm -f "$entitlements"
+    echo "worker exposes malformed entitlement data: $target" >&2
+    return 1
+  fi
   if plutil -extract keychain-access-groups json -o - "$entitlements" >/dev/null 2>&1; then
     rm -f "$entitlements"
     echo "worker must not expose the desktop Keychain group: $target" >&2
