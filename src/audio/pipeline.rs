@@ -9,9 +9,9 @@ use crate::silero_vad_native::WINDOW_SAMPLES;
 use crate::streaming::{DECODE_INTERVAL_MS, PreviewAudioPublisher, ROLLING_WINDOW_MS};
 
 use super::{
-    CaptureError, CaptureIntent, CaptureOptions, CaptureStopReason, LevelSnapshot,
-    MAX_CAPTURE_PREPARED_FRAMES, SpeechDetectionMode, SpeechDetector, VadOptions,
-    input_format_is_credible,
+    CaptureError, CaptureIntent, CaptureOptions, CaptureStopReason, LOW_INPUT_DIAGNOSTIC_RMS,
+    LevelSnapshot, MAX_CAPTURE_PREPARED_FRAMES, PreviewPublisherSlot, SpeechDetectionMode,
+    SpeechDetector, VadOptions, input_format_is_credible,
 };
 
 const LEVEL_WINDOW_SAMPLES: usize = (PREPARED_SAMPLE_RATE as usize) * 30 / 1_000;
@@ -38,9 +38,11 @@ pub(super) struct Pipeline {
     limit_exceeded: bool,
     levels: LevelTracker,
     vad_enabled: bool,
+    short_speech_rescue: bool,
     vad: VadTracker,
     manual_gate: Option<ManualThresholdGate>,
     preview_publisher: Option<PreviewAudioPublisher>,
+    preview_slot: Option<PreviewPublisherSlot>,
     next_preview_frame: usize,
 }
 
@@ -90,19 +92,40 @@ impl Pipeline {
             limit_exceeded: false,
             levels: LevelTracker::new(level_bits, peak_bits, level_observed, level_revision),
             vad_enabled,
-            vad: VadTracker::new(options.vad, options.endpointing_enabled, detector),
+            short_speech_rescue: options.short_speech_rescue,
+            vad: VadTracker::new(
+                options.vad,
+                options.endpointing_enabled,
+                detector,
+                options.detection_mode,
+            ),
             manual_gate,
             preview_publisher: None,
+            preview_slot: None,
             next_preview_frame: PREVIEW_INTERVAL_FRAMES,
         })
     }
 
+    #[cfg(test)]
     pub(super) fn with_preview_publisher(
         mut self,
         publisher: Option<PreviewAudioPublisher>,
     ) -> Self {
         self.preview_publisher = publisher;
         self
+    }
+
+    pub(super) fn with_preview_slot(mut self, slot: PreviewPublisherSlot) -> Self {
+        self.preview_slot = Some(slot);
+        self
+    }
+
+    fn attach_preview_if_ready(&mut self) {
+        if self.preview_publisher.is_none()
+            && let Some(slot) = self.preview_slot.as_ref()
+        {
+            self.preview_publisher = slot.take();
+        }
     }
 
     pub(super) fn push_interleaved(&mut self, sample: f32) -> Result<(), CaptureError> {
@@ -164,6 +187,7 @@ impl Pipeline {
     /// Clones and normalizes only completed rolling windows. The full capture
     /// buffer remains untouched so enabling preview cannot alter final audio.
     pub(super) fn publish_due_previews(&mut self) {
+        self.attach_preview_if_ready();
         let Some(publisher) = self.preview_publisher.as_ref() else {
             return;
         };
@@ -302,15 +326,30 @@ impl Pipeline {
             return audio.map(Some);
         }
 
-        let Some(speech_start) = self.vad.speech_start_frame else {
+        let rescued = (stop_reason == CaptureStopReason::Explicit && self.short_speech_rescue)
+            .then(|| self.vad.strongest_rescue_candidate())
+            .flatten();
+        let Some(speech_start) = self
+            .vad
+            .speech_start_frame
+            .or_else(|| rescued.map(|candidate| candidate.start_frame))
+        else {
             self.invalidate_preview();
             return Ok(None);
         };
         let start =
             speech_start.saturating_sub(duration_to_prepared_frames(self.vad.options.pre_roll));
-        let end = match stop_reason {
-            CaptureStopReason::Explicit => self.prepared.len(),
-            CaptureStopReason::Endpoint | CaptureStopReason::MaximumDuration => self
+        let end = match (stop_reason, rescued) {
+            (CaptureStopReason::Explicit, Some(candidate))
+                if self.vad.speech_start_frame.is_none() =>
+            {
+                candidate
+                    .end_frame
+                    .saturating_add(duration_to_prepared_frames(self.vad.options.post_roll))
+                    .min(self.prepared.len())
+            }
+            (CaptureStopReason::Explicit, _) => self.prepared.len(),
+            (CaptureStopReason::Endpoint | CaptureStopReason::MaximumDuration, _) => self
                 .vad
                 .last_voice_frame
                 .saturating_add(duration_to_prepared_frames(self.vad.options.post_roll))
@@ -353,13 +392,31 @@ impl Pipeline {
         self.vad.cancel_detector()
     }
 
+    pub(super) fn discard(&mut self) {
+        self.invalidate_preview();
+        self.prepared.fill(0.0);
+        self.prepared.clear();
+        self.channel_sum = 0.0;
+        self.channel_samples = 0;
+        self.resampler.previous = 0.0;
+        if let Some(gate) = self.manual_gate.as_mut() {
+            gate.samples.fill(0.0);
+            gate.count = 0;
+        }
+        self.vad.discard();
+    }
+
     pub(super) fn invalidate_preview(&mut self) {
+        if let Some(slot) = self.preview_slot.take() {
+            slot.close();
+        }
         if let Some(publisher) = self.preview_publisher.take() {
             publisher.invalidate();
         }
     }
 
     fn publish_terminal_preview(&mut self, audio: &PreparedAudio, utterance_start: usize) {
+        self.attach_preview_if_ready();
         let Some(publisher) = self.preview_publisher.take() else {
             return;
         };
@@ -675,6 +732,25 @@ enum VadState {
     Paused,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct RescueCandidate {
+    start_frame: usize,
+    end_frame: usize,
+    score: f32,
+    peak: f32,
+    rms: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RescueRun {
+    start_frame: usize,
+    end_frame: usize,
+    windows: usize,
+    score: f32,
+    peak: f32,
+    rms: f32,
+}
+
 struct VadTracker {
     options: VadOptions,
     endpointing_enabled: bool,
@@ -689,6 +765,9 @@ struct VadTracker {
     last_voice_frame: usize,
     endpoint_frame: Option<usize>,
     detector: Option<Box<dyn SpeechDetector>>,
+    detection_mode: SpeechDetectionMode,
+    rescue_run: Option<RescueRun>,
+    rescue_candidate: Option<RescueCandidate>,
     last_probability: f32,
 }
 
@@ -697,6 +776,7 @@ impl VadTracker {
         options: VadOptions,
         endpointing_enabled: bool,
         detector: Option<Box<dyn SpeechDetector>>,
+        detection_mode: SpeechDetectionMode,
     ) -> Self {
         Self {
             options,
@@ -712,6 +792,9 @@ impl VadTracker {
             last_voice_frame: 0,
             endpoint_frame: None,
             detector,
+            detection_mode,
+            rescue_run: None,
+            rescue_candidate: None,
             last_probability: 0.0,
         }
     }
@@ -722,6 +805,17 @@ impl VadTracker {
         self.window_samples += 1;
         self.processed_samples += 1;
         if self.window_samples == WINDOW_SAMPLES {
+            let peak = self
+                .window
+                .iter()
+                .fold(0.0_f32, |maximum, sample| maximum.max(sample.abs()));
+            let rms = (self
+                .window
+                .iter()
+                .map(|sample| (*sample as f64) * (*sample as f64))
+                .sum::<f64>()
+                / WINDOW_SAMPLES as f64)
+                .sqrt() as f32;
             let decision = self
                 .detector
                 .as_mut()
@@ -729,7 +823,13 @@ impl VadTracker {
                     "Silero VAD session disappeared during capture",
                 ))?
                 .compute(&self.window)?;
-            self.process_window(decision.speech, decision.probability, WINDOW_SAMPLES);
+            self.process_window(
+                decision.speech,
+                decision.probability,
+                peak,
+                rms,
+                WINDOW_SAMPLES,
+            );
             self.window_samples = 0;
         }
         Ok(())
@@ -737,16 +837,30 @@ impl VadTracker {
 
     fn push_manual_window(&mut self, speech: bool, sample_count: usize) {
         self.processed_samples = self.processed_samples.saturating_add(sample_count);
-        self.process_window(speech, if speech { 1.0 } else { 0.0 }, sample_count);
+        self.process_window(
+            speech,
+            if speech { 1.0 } else { 0.0 },
+            0.0,
+            0.0,
+            sample_count,
+        );
     }
 
-    fn process_window(&mut self, speech: bool, probability: f32, sample_count: usize) {
+    fn process_window(
+        &mut self,
+        speech: bool,
+        probability: f32,
+        peak: f32,
+        rms: f32,
+        sample_count: usize,
+    ) {
         if self.endpoint_frame.is_some() {
             return;
         }
         self.last_probability = probability;
         let frame_end = self.processed_samples;
         let frame_start = frame_end.saturating_sub(sample_count);
+        self.track_rescue_window(speech, probability, peak, rms, frame_start, frame_end);
 
         match self.state {
             VadState::Waiting => {
@@ -791,6 +905,89 @@ impl VadTracker {
         }
     }
 
+    fn track_rescue_window(
+        &mut self,
+        speech: bool,
+        probability: f32,
+        peak: f32,
+        rms: f32,
+        frame_start: usize,
+        frame_end: usize,
+    ) {
+        let maximum_gap = duration_to_prepared_frames(self.options.pause);
+        if self
+            .rescue_candidate
+            .is_some_and(|candidate| frame_start.saturating_sub(candidate.end_frame) >= maximum_gap)
+        {
+            self.rescue_candidate = None;
+        }
+        let complete_manual_window =
+            frame_end.saturating_sub(frame_start) == MANUAL_GATE_WINDOW_SAMPLES;
+        if !speech
+            || matches!(
+                self.detection_mode,
+                SpeechDetectionMode::ManualThreshold { .. }
+            ) && !complete_manual_window
+        {
+            self.rescue_run = None;
+            return;
+        }
+        let run = self.rescue_run.get_or_insert(RescueRun {
+            start_frame: frame_start,
+            end_frame: frame_end,
+            windows: 0,
+            score: 0.0,
+            peak: 0.0,
+            rms: 0.0,
+        });
+        run.end_frame = frame_end;
+        run.windows = run.windows.saturating_add(1);
+        run.score = run.score.max(probability);
+        run.peak = run.peak.max(peak);
+        run.rms = run.rms.max(rms);
+
+        let qualifies = match self.detection_mode {
+            SpeechDetectionMode::Ai => {
+                run.windows >= 2
+                    && run.end_frame.saturating_sub(run.start_frame)
+                        >= duration_to_prepared_frames(Duration::from_millis(64))
+                    && run.peak >= 0.80
+                    && run.rms > LOW_INPUT_DIAGNOSTIC_RMS
+            }
+            SpeechDetectionMode::ManualThreshold { .. } => run.windows >= 2,
+        };
+        if !qualifies {
+            return;
+        }
+        let candidate = RescueCandidate {
+            start_frame: run.start_frame,
+            end_frame: run.end_frame,
+            score: run.score,
+            peak: run.peak,
+            rms: run.rms,
+        };
+        let replace = self.rescue_candidate.is_none_or(|strongest| {
+            (
+                candidate.score,
+                candidate.rms,
+                candidate.peak,
+                candidate.end_frame.saturating_sub(candidate.start_frame),
+            ) > (
+                strongest.score,
+                strongest.rms,
+                strongest.peak,
+                strongest.end_frame.saturating_sub(strongest.start_frame),
+            )
+        });
+        if replace {
+            self.rescue_candidate = Some(candidate);
+        }
+    }
+
+    fn strongest_rescue_candidate(&self) -> Option<RescueCandidate> {
+        self.rescue_candidate
+    }
+
     fn finish_detector(&mut self) -> Result<(), CaptureError> {
         if let Some(detector) = self.detector.as_mut() {
             detector.finish()?;
@@ -805,6 +1002,14 @@ impl VadTracker {
         }
         self.detector = None;
         Ok(())
+    }
+
+    fn discard(&mut self) {
+        self.window.fill(0.0);
+        self.window_samples = 0;
+        self.detector = None;
+        self.rescue_run = None;
+        self.rescue_candidate = None;
     }
 }
 
@@ -1187,7 +1392,7 @@ mod tests {
     }
 
     #[test]
-    fn paused_capture_emits_one_bounded_terminal_tail_and_no_repeated_batches() {
+    fn paused_capture_without_a_partial_skips_terminal_preview_decode() {
         let (snapshot_tx, snapshot_rx) = mpsc::channel();
         let mut preview_session = RollingPreviewSession::<()>::new(move |snapshot| {
             snapshot_tx
@@ -1245,21 +1450,17 @@ mod tests {
         }
         assert!(snapshot_rx.try_recv().is_err());
 
-        let audio = pipeline
+        let _audio = pipeline
             .finish(CaptureStopReason::Endpoint)
             .unwrap()
             .unwrap();
         preview_session.close();
         assert!(preview_session.stop_and_join(Duration::from_secs(1)));
-        let (start, end, samples) = snapshot_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        assert_eq!(samples, audio.samples.len().min(PREVIEW_WINDOW_FRAMES));
-        assert_eq!(end - start, samples as u64);
-        assert!(samples <= PREVIEW_WINDOW_FRAMES);
         assert!(snapshot_rx.try_recv().is_err());
     }
 
     #[test]
-    fn explicit_hold_stop_emits_exactly_one_terminal_tail() {
+    fn explicit_hold_stop_without_a_partial_skips_terminal_preview_decode() {
         let (snapshot_tx, snapshot_rx) = mpsc::channel();
         let mut preview_session = RollingPreviewSession::<()>::new(move |snapshot| {
             snapshot_tx
@@ -1317,10 +1518,6 @@ mod tests {
             .unwrap();
         preview_session.close();
         assert!(preview_session.stop_and_join(Duration::from_secs(1)));
-        assert_eq!(
-            snapshot_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
-            (0, audio.samples.len() as u64)
-        );
         assert!(audio.samples.len() <= PREVIEW_WINDOW_FRAMES);
         assert!(snapshot_rx.try_recv().is_err());
     }
@@ -1856,7 +2053,13 @@ mod tests {
         }
         assert!(state.lock().unwrap().windows.is_empty());
 
-        super::super::drain_ring_bounded(&mut consumer, &mut pipeline, WINDOW_SAMPLES).unwrap();
+        super::super::drain_ring_bounded(
+            &mut consumer,
+            &mut pipeline,
+            WINDOW_SAMPLES,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
         assert_eq!(state.lock().unwrap().windows.len(), 1);
     }
 
@@ -2193,6 +2396,194 @@ mod tests {
         assert!(
             pipeline
                 .finish(CaptureStopReason::MaximumDuration)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn hold_release_rescues_exactly_two_complete_strong_silero_windows() {
+        let (rms, peak, observed, revision) = level_state();
+        let mut pipeline = Pipeline::new(
+            PREPARED_SAMPLE_RATE,
+            1,
+            CaptureOptions {
+                short_speech_rescue: true,
+                ..CaptureOptions::default()
+            },
+            default_detector(),
+            rms,
+            peak,
+            observed,
+            revision,
+        )
+        .unwrap();
+        push_mono_ms(&mut pipeline, 256, 0.0);
+        push_mono_ms(&mut pipeline, 64, 0.80);
+        push_mono_ms(&mut pipeline, 200, 0.0);
+
+        assert!(pipeline.vad.speech_start_frame.is_none());
+        let prepared = pipeline
+            .finish(CaptureStopReason::Explicit)
+            .unwrap()
+            .expect("qualified release candidate should be rescued");
+
+        assert_eq!(prepared.duration_ms(), 514);
+        assert!(
+            prepared.samples[..4_000]
+                .iter()
+                .all(|sample| *sample == 0.0)
+        );
+        assert!(
+            prepared.samples[4_000..5_024]
+                .iter()
+                .all(|sample| *sample > 0.0)
+        );
+    }
+
+    #[test]
+    fn hold_release_rejects_silero_candidate_below_peak_floor() {
+        let (rms, peak, observed, revision) = level_state();
+        let mut pipeline = Pipeline::new(
+            PREPARED_SAMPLE_RATE,
+            1,
+            CaptureOptions {
+                short_speech_rescue: true,
+                ..CaptureOptions::default()
+            },
+            default_detector(),
+            rms,
+            peak,
+            observed,
+            revision,
+        )
+        .unwrap();
+        push_mono_ms(&mut pipeline, 64, 0.79);
+        push_mono_ms(&mut pipeline, 200, 0.0);
+
+        assert!(
+            pipeline
+                .finish(CaptureStopReason::Explicit)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn hold_release_rejects_strong_transient_after_long_silence() {
+        let (rms, peak, observed, revision) = level_state();
+        let mut pipeline = Pipeline::new(
+            PREPARED_SAMPLE_RATE,
+            1,
+            CaptureOptions {
+                short_speech_rescue: true,
+                ..CaptureOptions::default()
+            },
+            default_detector(),
+            rms,
+            peak,
+            observed,
+            revision,
+        )
+        .unwrap();
+        push_mono_ms(&mut pipeline, 64, 0.90);
+        push_mono_ms(&mut pipeline, 600, 0.0);
+
+        assert!(
+            pipeline
+                .finish(CaptureStopReason::Explicit)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn non_hold_capture_does_not_apply_short_speech_rescue() {
+        let mut pipeline = pipeline(PREPARED_SAMPLE_RATE, 1);
+        push_mono_ms(&mut pipeline, 64, 0.90);
+        push_mono_ms(&mut pipeline, 200, 0.0);
+
+        assert!(
+            pipeline
+                .finish(CaptureStopReason::Explicit)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn manual_hold_release_requires_two_complete_above_threshold_windows() {
+        let (rms, peak, observed, revision) = level_state();
+        let options = CaptureOptions {
+            short_speech_rescue: true,
+            detection_mode: SpeechDetectionMode::ManualThreshold { threshold_rms: 0.1 },
+            ..CaptureOptions::default()
+        };
+        let mut one_window = Pipeline::new(
+            PREPARED_SAMPLE_RATE,
+            1,
+            options,
+            None,
+            Arc::clone(&rms),
+            Arc::clone(&peak),
+            Arc::clone(&observed),
+            Arc::clone(&revision),
+        )
+        .unwrap();
+        push_mono_ms(&mut one_window, 30, 0.2);
+        assert!(
+            one_window
+                .finish(CaptureStopReason::Explicit)
+                .unwrap()
+                .is_none()
+        );
+
+        let mut two_windows = Pipeline::new(
+            PREPARED_SAMPLE_RATE,
+            1,
+            options,
+            None,
+            rms,
+            peak,
+            observed,
+            revision,
+        )
+        .unwrap();
+        push_mono_ms(&mut two_windows, 240, 0.0);
+        push_mono_ms(&mut two_windows, 60, 0.2);
+        push_mono_ms(&mut two_windows, 200, 0.0);
+        let prepared = two_windows
+            .finish(CaptureStopReason::Explicit)
+            .unwrap()
+            .expect("two complete manual windows should be rescued");
+        assert_eq!(prepared.duration_ms(), 500);
+    }
+
+    #[test]
+    fn manual_hold_release_does_not_count_a_partial_second_window() {
+        let (rms, peak, observed, revision) = level_state();
+        let mut pipeline = Pipeline::new(
+            PREPARED_SAMPLE_RATE,
+            1,
+            CaptureOptions {
+                short_speech_rescue: true,
+                detection_mode: SpeechDetectionMode::ManualThreshold { threshold_rms: 0.1 },
+                ..CaptureOptions::default()
+            },
+            None,
+            rms,
+            peak,
+            observed,
+            revision,
+        )
+        .unwrap();
+        for _ in 0..MANUAL_GATE_WINDOW_SAMPLES + 1 {
+            pipeline.push_interleaved(0.2).unwrap();
+        }
+
+        assert!(
+            pipeline
+                .finish(CaptureStopReason::Explicit)
                 .unwrap()
                 .is_none()
         );
