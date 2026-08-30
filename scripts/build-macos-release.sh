@@ -145,8 +145,10 @@ build_revision="${SCRIBE_BUILD_REVISION:-$(git -C "$repo_root" rev-parse --verif
 [[ "$build_revision" =~ ^[[:graph:]]{12,96}$ ]] || { echo 'build revision must be 12-96 printable non-space ASCII characters.' >&2; exit 1; }
 sed "s/\${SCRIBE_APP_VERSION}/$version/g" "$repo_root/installer/macos/Info.plist" >"$app/Contents/Info.plist"
 plutil -lint "$app/Contents/Info.plist" >/dev/null
-identity='-'; timestamp=()
-if [[ "$signing_mode" == developer-id ]]; then identity="$SCRIBE_MACOS_SIGNING_IDENTITY"; timestamp=(--timestamp); fi
+identity='-'
+if [[ "$signing_mode" == developer-id ]]; then identity="$SCRIBE_MACOS_SIGNING_IDENTITY"; fi
+codesign_args=(--force --sign "$identity" --options runtime)
+if [[ "$signing_mode" == developer-id ]]; then codesign_args+=(--timestamp); fi
 
 for target in aarch64-apple-darwin x86_64-apple-darwin; do
   arch="${target%%-apple-darwin}"
@@ -158,7 +160,7 @@ for target in aarch64-apple-darwin x86_64-apple-darwin; do
   if [[ "$arch" == aarch64 ]]; then cpu_worker_arm="$worker_path"; else cpu_worker_x86="$worker_path"; fi
 done
 lipo -create -output "$macos/scribe-inference-worker" "$cpu_worker_arm" "$cpu_worker_x86"
-codesign --force --sign "$identity" --options runtime "${timestamp[@]}" --entitlements "$repo_root/installer/macos/Scribe.entitlements" "$macos/scribe-inference-worker"
+codesign "${codesign_args[@]}" --entitlements "$repo_root/installer/macos/Scribe.entitlements" "$macos/scribe-inference-worker"
 codesign --verify --strict --verbose=2 "$macos/scribe-inference-worker"
 verify_no_keychain_group "$macos/scribe-inference-worker"
 worker_digest="$(shasum -a 256 "$macos/scribe-inference-worker" | awk '{print $1}')"
@@ -234,10 +236,10 @@ LC_ALL=C strings "$macos/Scribe" | grep -Fqx "$worker_digest" || { echo 'desktop
 LC_ALL=C strings "$macos/Scribe" | grep -F "$catalog_digest" >/dev/null || { echo 'desktop does not embed the exact pack-catalog authority.' >&2; exit 1; }
 LC_ALL=C strings "$macos/Scribe" | grep -Fqx "$authority_json" >/dev/null || { echo 'desktop does not embed the exact release authority.' >&2; exit 1; }
 
-codesign --force --sign "$identity" --options runtime "${timestamp[@]}" --entitlements "$desktop_entitlements" "$macos/Scribe"
+codesign "${codesign_args[@]}" --entitlements "$desktop_entitlements" "$macos/Scribe"
 codesign --verify --strict --verbose=2 "$macos/Scribe"
 if "$protected_release"; then verify_exact_keychain_group "$macos/Scribe" "$keychain_access_group"; else verify_no_keychain_group "$macos/Scribe"; fi
-codesign --force --sign "$identity" --options runtime "${timestamp[@]}" --entitlements "$desktop_entitlements" "$app"
+codesign "${codesign_args[@]}" --entitlements "$desktop_entitlements" "$app"
 codesign --verify --strict --verbose=2 "$app"
 if "$protected_release"; then verify_exact_keychain_group "$app" "$keychain_access_group"; else verify_no_keychain_group "$app"; fi
 [[ "$(shasum -a 256 "$macos/scribe-inference-worker" | awk '{print $1}')" == "$worker_digest" ]] || { echo 'outer application signing changed the anchored CPU worker.' >&2; exit 1; }
