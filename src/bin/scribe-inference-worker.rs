@@ -43,9 +43,12 @@ mod gpu_auto_qualification;
 mod gpu_worker_pack;
 #[path = "../inference_server.rs"]
 mod inference_server;
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(all(target_os = "macos", feature = "metal-acceleration"), test))]
 #[path = "../macos_gpu.rs"]
 mod macos_gpu;
+#[cfg(any(target_os = "macos", test))]
+#[path = "../macos_power.rs"]
+mod macos_power;
 #[cfg(any(target_os = "macos", test))]
 #[path = "../macos_worker_launch.rs"]
 mod macos_worker_launch;

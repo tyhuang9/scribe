@@ -330,6 +330,31 @@ uses `codesign --deep`. It signs the universal CPU worker and desktop binaries,
 then the outer application; the dedicated protected release step verifies,
 notarizes, staples, and verifies again.
 
+Stage 6 macOS Metal packs have a deliberately narrower payload contract than
+the general signed-pack format: the signed payload inventory must contain
+exactly one regular executable, the declared worker path. The manifest and
+detached signature remain the only two control files outside that signed
+payload. Any dylib, framework, resource, helper, or second executable rejects
+the pack before launch authority or a GPU route is constructed. Multi-file
+macOS packs are deferred until descriptor-bound dependency loading or
+ownership-enforced filesystem immutability is separately designed and reviewed.
+
+Metal framework linkage is confined to the per-architecture Metal worker. The
+desktop and universal CPU worker use only an IOKit power-source shim plus the
+`kern.osversion` witness and must have no Metal load command. Stable
+`MTLDevice.registryID` discovery/remapping occurs inside the verified Metal
+worker and reaches the parent only through the challenge-bound capability
+Hello. Release verification checks these Mach-O linkage boundaries with both
+`otool -L` and `otool -l`.
+
+Before a bundled verified lease can become a route, discovery loads the private
+per-platform/backend/pack security-epoch high-water ledger under the same
+anchored lock and atomic durable-replace discipline as activation state. The
+same epoch is accepted, a higher epoch advances the ledger, and a lower epoch,
+corrupt state, or unavailable state authority fails GPU discovery closed. A
+catalog cache never bypasses this check. CPU routing remains available, and an
+empty production trust result does not create or mutate ledger state.
+
 The production authoring CLI must accept `--backend metal --target-os macos
 --target-arch <aarch64|x86_64>` and bind those facts in its signed manifest.
 Until that reviewed CLI extension and a persistent production trust root exist,

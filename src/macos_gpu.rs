@@ -1,10 +1,10 @@
-//! macOS-native Metal and power witnesses.
+//! macOS-native Metal device witnesses for the Metal worker only.
 //!
 //! Stable identity comes only from `MTLDevice.registryID`. Provider registry
 //! indexes remain process-local and are remapped from the current Metal device
 //! set on every worker start.
 
-use crate::backend_policy::{DeviceClass, GpuVendor, PowerSource};
+use crate::backend_policy::{DeviceClass, GpuVendor};
 use anyhow::{Result, bail};
 
 const MAX_METAL_DEVICES: usize = 16;
@@ -39,16 +39,6 @@ pub(crate) fn stable_registry_identity(registry_id: u64) -> String {
 
 pub(crate) fn discover_devices() -> Result<Vec<MetalDevice>> {
     platform::discover_devices()
-}
-
-pub(crate) fn power_source() -> PowerSource {
-    platform::power_source()
-}
-
-/// Darwin's immutable OS build number is the driver/runtime witness for Metal.
-/// It is deliberately not presented as a vendor driver version.
-pub(crate) fn os_build_witness() -> Result<String> {
-    platform::os_build_witness()
 }
 
 pub(crate) fn remap_provider_devices(
@@ -144,9 +134,9 @@ fn device_class(low_power: bool, removable: bool, unified: bool) -> DeviceClass 
 
 #[cfg(target_os = "macos")]
 mod platform {
-    use std::ffi::{CStr, CString, c_char, c_int, c_void};
+    use std::ffi::{CStr, c_char};
 
-    use anyhow::{Context, anyhow};
+    use anyhow::anyhow;
 
     use super::*;
 
@@ -183,14 +173,6 @@ mod platform {
             devices: *mut NativeMetalDevice,
             capacity: usize,
         ) -> usize;
-        fn scribe_macos_power_source() -> i32;
-        fn sysctlbyname(
-            name: *const c_char,
-            oldp: *mut c_void,
-            oldlenp: *mut usize,
-            newp: *mut c_void,
-            newlen: usize,
-        ) -> c_int;
     }
 
     pub(super) fn discover_devices() -> Result<Vec<MetalDevice>> {
@@ -238,68 +220,6 @@ mod platform {
             })
             .collect()
     }
-
-    pub(super) fn power_source() -> PowerSource {
-        // SAFETY: the shim has no pointer arguments or mutable global state.
-        match unsafe { scribe_macos_power_source() } {
-            1 => PowerSource::Ac,
-            2 => PowerSource::Battery,
-            _ => PowerSource::Unknown,
-        }
-    }
-
-    pub(super) fn os_build_witness() -> Result<String> {
-        let name = CString::new("kern.osversion").expect("static sysctl name has no NUL");
-        let mut length = 0_usize;
-        // SAFETY: this is the documented size query for sysctlbyname.
-        if unsafe {
-            sysctlbyname(
-                name.as_ptr(),
-                std::ptr::null_mut(),
-                &mut length,
-                std::ptr::null_mut(),
-                0,
-            )
-        } != 0
-            || !(2..=128).contains(&length)
-        {
-            return Err(std::io::Error::last_os_error())
-                .map_err(anyhow::Error::from)
-                .context("could not size the macOS build witness");
-        }
-        let mut bytes = vec![0_u8; length];
-        // SAFETY: bytes owns the writable buffer and length names its capacity.
-        if unsafe {
-            sysctlbyname(
-                name.as_ptr(),
-                bytes.as_mut_ptr().cast(),
-                &mut length,
-                std::ptr::null_mut(),
-                0,
-            )
-        } != 0
-        {
-            return Err(std::io::Error::last_os_error())
-                .map_err(anyhow::Error::from)
-                .context("could not read the macOS build witness");
-        }
-        bytes.truncate(length);
-        if bytes.last() == Some(&0) {
-            bytes.pop();
-        }
-        let build = std::str::from_utf8(&bytes)
-            .map_err(|_| anyhow!("macOS build witness is not UTF-8"))?
-            .trim();
-        if build.is_empty()
-            || build.len() > 96
-            || !build
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
-        {
-            bail!("macOS build witness is not canonical");
-        }
-        Ok(format!("macos-build:{}", build.to_ascii_lowercase()))
-    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -308,14 +228,6 @@ mod platform {
 
     pub(super) fn discover_devices() -> Result<Vec<MetalDevice>> {
         bail!("Metal device discovery requires macOS")
-    }
-
-    pub(super) fn power_source() -> PowerSource {
-        PowerSource::Unknown
-    }
-
-    pub(super) fn os_build_witness() -> Result<String> {
-        bail!("Metal runtime witness requires macOS")
     }
 }
 

@@ -16,7 +16,7 @@ fn main() {
     require_windows_static_crt();
     #[cfg(all(windows, feature = "vulkan-acceleration"))]
     prepare_windows_vulkan_import_library();
-    prepare_macos_metal_shim();
+    prepare_macos_native_shims();
     verify_silero_vad_asset();
 
     println!("cargo:rerun-if-changed=native/sherpa_vad_shim.cc");
@@ -62,23 +62,43 @@ fn reject_multiple_gpu_features() {
     );
 }
 
-fn prepare_macos_metal_shim() {
+fn prepare_macos_native_shims() {
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let metal_enabled = std::env::var_os("CARGO_FEATURE_METAL_ACCELERATION").is_some();
+    let building_worker = std::env::var("SCRIBE_BUILDING_WORKER").ok();
     assert!(
         !metal_enabled || target_os == "macos",
         "metal-acceleration requires a macOS target"
+    );
+    assert!(
+        !metal_enabled || building_worker.as_deref() == Some("1"),
+        "metal-acceleration may be linked only into the dedicated worker build"
     );
     if target_os != "macos" {
         return;
     }
 
-    println!("cargo:rerun-if-changed=native/scribe_macos_gpu_shim.h");
-    println!("cargo:rerun-if-changed=native/scribe_macos_gpu_shim.m");
+    println!("cargo:rerun-if-changed=native/scribe_macos_power_shim.h");
+    println!("cargo:rerun-if-changed=native/scribe_macos_power_shim.c");
     let deployment_target = std::env::var("MACOSX_DEPLOYMENT_TARGET")
         .ok()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "13.0".to_owned());
+    cc::Build::new()
+        .file("native/scribe_macos_power_shim.c")
+        .include("native")
+        .flag(&format!("-mmacosx-version-min={deployment_target}"))
+        .warnings(true)
+        .compile("scribe_macos_power_shim");
+    println!("cargo:rustc-link-lib=framework=CoreFoundation");
+    println!("cargo:rustc-link-lib=framework=IOKit");
+    println!("cargo:rustc-link-arg=-mmacosx-version-min={deployment_target}");
+
+    if !metal_enabled {
+        return;
+    }
+    println!("cargo:rerun-if-changed=native/scribe_macos_gpu_shim.h");
+    println!("cargo:rerun-if-changed=native/scribe_macos_gpu_shim.m");
     cc::Build::new()
         .file("native/scribe_macos_gpu_shim.m")
         .include("native")
@@ -88,8 +108,6 @@ fn prepare_macos_metal_shim() {
         .compile("scribe_macos_gpu_shim");
     println!("cargo:rustc-link-lib=framework=Metal");
     println!("cargo:rustc-link-lib=framework=Foundation");
-    println!("cargo:rustc-link-lib=framework=IOKit");
-    println!("cargo:rustc-link-arg=-mmacosx-version-min={deployment_target}");
 }
 
 fn emit_bundled_worker_trust_anchor() {

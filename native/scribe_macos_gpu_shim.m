@@ -1,8 +1,6 @@
 #import "scribe_macos_gpu_shim.h"
 
 #import <Foundation/Foundation.h>
-#import <IOKit/ps/IOPowerSources.h>
-#import <IOKit/ps/IOPSKeys.h>
 #import <Metal/Metal.h>
 
 #include <string.h>
@@ -52,42 +50,5 @@ size_t scribe_macos_copy_metal_devices(scribe_macos_metal_device *devices,
             scribe_copy_device(all_devices[index], default_device, &devices[index]);
         }
         return count;
-    }
-}
-
-int32_t scribe_macos_power_source(void) {
-    @autoreleasepool {
-        CFTypeRef info = IOPSCopyPowerSourcesInfo();
-        if (info == NULL) {
-            return SCRIBE_MACOS_POWER_UNKNOWN;
-        }
-        CFArrayRef sources = IOPSCopyPowerSourcesList(info);
-        if (sources == NULL) {
-            CFRelease(info);
-            return SCRIBE_MACOS_POWER_UNKNOWN;
-        }
-        int32_t result = SCRIBE_MACOS_POWER_UNKNOWN;
-        CFIndex count = CFArrayGetCount(sources);
-        for (CFIndex index = 0; index < count; ++index) {
-            CFTypeRef source = CFArrayGetValueAtIndex(sources, index);
-            CFDictionaryRef description = IOPSGetPowerSourceDescription(info, source);
-            if (description == NULL) {
-                continue;
-            }
-            CFStringRef state = CFDictionaryGetValue(description, kIOPSPowerSourceStateKey);
-            if (state == NULL || CFGetTypeID(state) != CFStringGetTypeID()) {
-                continue;
-            }
-            if (CFEqual(state, kIOPSBatteryPowerValue)) {
-                result = SCRIBE_MACOS_POWER_BATTERY;
-                break;
-            }
-            if (CFEqual(state, kIOPSACPowerValue)) {
-                result = SCRIBE_MACOS_POWER_AC;
-            }
-        }
-        CFRelease(sources);
-        CFRelease(info);
-        return result;
     }
 }

@@ -13,7 +13,12 @@ for path in "$app/Contents/Info.plist" "$macos/Scribe" "$macos/scribe-inference-
 find "$app" -xdev \( -type l -o -type f -links +1 -o -name '._*' \) -print -quit | grep -q . && { echo 'application contains a symlink, hardlink, or AppleDouble entry.' >&2; exit 1; }
 find "$resources/workers/packs" -type d -name '.stage.*' -print -quit | grep -q . && { echo 'application contains an interrupted worker-pack staging directory.' >&2; exit 1; }
 if command -v xattr >/dev/null && xattr -lr "$app" 2>/dev/null | grep -E 'com\.apple\.ResourceFork|com\.apple\.FinderInfo' >/dev/null; then echo 'application contains resource-fork metadata.' >&2; exit 1; fi
-for binary in "$macos/Scribe" "$macos/scribe-inference-worker"; do lipo -verify_arch arm64 "$binary"; lipo -verify_arch x86_64 "$binary"; otool -l "$binary" | grep -A3 'LC_BUILD_VERSION' | grep -q 'minos 13\.' || { echo "minimum macOS 13 load command missing: $binary" >&2; exit 1; }; codesign --verify --strict --verbose=2 "$binary"; done
+for binary in "$macos/Scribe" "$macos/scribe-inference-worker"; do
+  lipo -verify_arch arm64 "$binary"; lipo -verify_arch x86_64 "$binary"
+  otool -l "$binary" | grep -A3 'LC_BUILD_VERSION' | grep -q 'minos 13\.' || { echo "minimum macOS 13 load command missing: $binary" >&2; exit 1; }
+  if otool -L "$binary" | grep -F '/Metal.framework/' >/dev/null || otool -l "$binary" | grep -F '/Metal.framework/' >/dev/null; then echo "CPU/UI binary must not load Metal.framework: $binary" >&2; exit 1; fi
+  codesign --verify --strict --verbose=2 "$binary"
+done
 codesign --verify --strict --verbose=2 "$app"
 codesign -d --entitlements :- "$app" 2>/dev/null | plutil -extract com.apple.security.device.audio-input raw -o - - | grep -qx true || { echo 'microphone entitlement is missing.' >&2; exit 1; }
 plutil -extract LSMinimumSystemVersion raw -o - "$app/Contents/Info.plist" | grep -qx '13.0' || { echo 'Info.plist must declare macOS 13.0.' >&2; exit 1; }
@@ -29,15 +34,20 @@ while IFS= read -r entry; do
   pack_lipo_arch="$(jq -r '.target_arch' <<<"$entry")"
   case "$pack_lipo_arch" in aarch64) pack_lipo_arch=arm64 ;; x86_64) pack_lipo_arch=x86_64 ;; *) echo 'catalog pack architecture is unsupported.' >&2; exit 1 ;; esac
   files_file="$(mktemp "${TMPDIR:-/tmp}/scribe-macos-files.XXXXXX")"; jq -r '.files[]' <<<"$entry" >"$files_file"
-  files_count="$(wc -l <"$files_file" | tr -d ' ')"; (( files_count >= 3 )) || { echo 'catalog pack inventory is incomplete.' >&2; exit 1; }
+  files_count="$(wc -l <"$files_file" | tr -d ' ')"; (( files_count == 3 )) || { echo 'macOS Metal packs must contain only the manifest, signature, and declared worker.' >&2; exit 1; }
   [[ "$(LC_ALL=C sort -u "$files_file" | wc -l | tr -d ' ')" == "$files_count" && "$(LC_ALL=C sort "$files_file")" == "$(cat "$files_file")" ]] || { echo 'catalog pack inventory is not sorted and unique.' >&2; exit 1; }
   installed=0
   while IFS= read -r file; do [[ "$file" == "$root/"* && -f "$resources/$file" && ! -L "$resources/$file" ]] || { echo 'catalog file escaped or is unsafe.' >&2; exit 1; }; printf '%s\n' "Contents/Resources/$file" >>"$expected_file"; installed=$((installed + $(stat -f %z "$resources/$file"))); done <"$files_file"
-  rm -f "$files_file"
   [[ "$installed" == "$(jq -r '.installed_size_bytes' <<<"$entry")" ]] || { echo 'catalog installed size mismatch.' >&2; exit 1; }
-  worker="$resources/$root/$(jq -r '.worker_relative_path' <<<"$entry")"; [[ -f "$worker" ]] || { echo 'catalog worker is absent.' >&2; exit 1; }
+  worker_relative="$(jq -r '.worker_relative_path' <<<"$entry")"
+  expected_pack_files="$(printf '%s\n' "$root/pack-manifest.json" "$root/pack-manifest.sig" "$root/$worker_relative" | LC_ALL=C sort)"
+  [[ "$(cat "$files_file")" == "$expected_pack_files" ]] || { echo 'macOS Metal pack contains auxiliary payload.' >&2; exit 1; }
+  rm -f "$files_file"
+  worker="$resources/$root/$worker_relative"; [[ -f "$worker" ]] || { echo 'catalog worker is absent.' >&2; exit 1; }
   lipo -verify_arch "$pack_lipo_arch" "$worker"
   [[ "$(lipo -archs "$worker")" == "$pack_lipo_arch" ]] || { echo 'catalog Metal worker contains an unexpected Mach-O slice.' >&2; exit 1; }
+  otool -L "$worker" | grep -F '/Metal.framework/' >/dev/null || { echo 'catalog Metal worker does not link Metal.framework.' >&2; exit 1; }
+  otool -l "$worker" | grep -F '/Metal.framework/' >/dev/null || { echo 'catalog Metal worker has no Metal load command.' >&2; exit 1; }
   codesign --verify --strict --verbose=2 "$worker"
 done < <(jq -c '.packs[]' "$catalog")
 (cd "$app" && find Contents -type f -print | LC_ALL=C sort) >"$actual_file"

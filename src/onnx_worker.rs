@@ -1481,43 +1481,29 @@ fn normalize_gpu_display_name(value: &str) -> Option<String> {
 
 #[cfg(target_os = "macos")]
 struct PackDriverCatalog {
-    by_registry_identity: BTreeMap<String, String>,
+    os_build_witness: String,
 }
 
 #[cfg(target_os = "macos")]
 impl PackDriverCatalog {
     fn discover() -> Result<Self> {
-        let witness = crate::macos_gpu::os_build_witness()
+        let os_build_witness = crate::macos_power::os_build_witness()
             .context("could not obtain the macOS Metal runtime witness")?;
-        let devices = crate::macos_gpu::discover_devices()
-            .context("could not enumerate the macOS Metal registry")?;
-        let by_registry_identity = devices
-            .into_iter()
-            .map(|device| (device.stable_identity, witness.clone()))
-            .collect::<BTreeMap<_, _>>();
-        if by_registry_identity.is_empty() {
-            bail!("macOS reported no Metal registry identities");
-        }
-        Ok(Self {
-            by_registry_identity,
-        })
+        Ok(Self { os_build_witness })
     }
 
     #[cfg(any(feature = "inference-worker", test))]
     fn identity_for(&self, stable_device_identity: &str) -> Result<String> {
-        self.by_registry_identity
-            .get(stable_device_identity)
-            .cloned()
-            .ok_or_else(|| anyhow!("Metal registry identity has no matching macOS build witness"))
+        if !stable_device_identity.starts_with("metal-registry:") {
+            bail!("Metal registry identity is not canonical");
+        }
+        Ok(self.os_build_witness.clone())
     }
 
     fn fingerprint(&self) -> String {
         let mut digest = Sha256::new();
-        digest.update((self.by_registry_identity.len() as u64).to_le_bytes());
-        for (identity, witness) in &self.by_registry_identity {
-            update_health_digest(&mut digest, identity);
-            update_health_digest(&mut digest, witness);
-        }
+        update_health_digest(&mut digest, "macos-parent-os-build-v1");
+        update_health_digest(&mut digest, &self.os_build_witness);
         format!("{:x}", digest.finalize())
     }
 }
@@ -6436,6 +6422,9 @@ fn verified_gpu_route_catalog(
         };
         key(left).cmp(&key(right))
     });
+    #[cfg(target_os = "macos")]
+    let device_set_digest = verified_gpu_device_set_digest(&routes);
+    #[cfg(not(target_os = "macos"))]
     let device_set_digest = physical_gpu_device_set_digest();
     let mut diagnostic = crate::gpu_worker_pack::diagnostic_summary(&diagnostics);
     if routes.len() > 4 {

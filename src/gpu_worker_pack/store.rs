@@ -22,6 +22,8 @@ use super::manifest::{
 const STATE_SCHEMA_VERSION: u16 = 1;
 pub(super) const MAX_STATE_BYTES: u64 = 256 * 1024;
 const STORE_LOCK_NAME: &str = ".worker-pack-store.lock";
+const DISCOVERY_EPOCH_LOCK_NAME: &str = ".worker-pack-discovery-epoch.lock";
+const DISCOVERY_EPOCH_STATE_NAME: &str = "discovery-security-epochs.json";
 #[cfg(windows)]
 const PRIVATE_STATE_AUTHORITY_LOCK_NAME: &str = ".scribe-private-state.lock";
 
@@ -108,6 +110,13 @@ pub(crate) struct PackStore<'a> {
     packs_root: PathBuf,
     state_root: PathBuf,
     verifier: &'a PackVerifier<'a>,
+}
+
+/// Persistent high-water authority for immutable bundled-catalog discovery.
+/// This is separate from activation state but deliberately reuses the same
+/// anchored lock and atomic durable-replace implementation.
+pub(crate) struct DiscoveryEpochLedger {
+    state_root: PathBuf,
 }
 
 struct AnchoredDirectory {
@@ -790,6 +799,98 @@ impl<'a> PackStore<'a> {
         let lock = self.acquire_lock()?;
         self.recover_pending_activation_with_lock(&lock)
     }
+}
+
+impl DiscoveryEpochLedger {
+    pub(crate) fn new(private_state_root: impl Into<PathBuf>) -> Self {
+        Self {
+            state_root: private_state_root.into(),
+        }
+    }
+
+    pub(crate) fn admit(&self, packs: &[&VerifiedPack]) -> Result<(), PackStoreError> {
+        if packs.is_empty() {
+            return Ok(());
+        }
+        let state_root_preexisting = self.state_root.exists();
+        let lock = exclusive_file_lock(&self.state_root.join(DISCOVERY_EPOCH_LOCK_NAME))?;
+        let path = self.state_root.join(DISCOVERY_EPOCH_STATE_NAME);
+        let state = if lock.exists(&path)? {
+            let state: EpochState = lock.read(&path)?;
+            validate_epoch_state(&state)?;
+            state
+        } else if state_root_preexisting {
+            return Err(PackStoreError::CorruptState(
+                "discovery security epoch state is missing",
+            ));
+        } else {
+            EpochState::empty()
+        };
+        let mut requested = BTreeMap::<String, u64>::new();
+        for pack in packs {
+            let key = discovery_epoch_key(pack)?;
+            requested
+                .entry(key)
+                .and_modify(|epoch| *epoch = (*epoch).max(pack.security_epoch))
+                .or_insert(pack.security_epoch);
+        }
+        for pack in packs {
+            let key = discovery_epoch_key(pack)?;
+            let floor = state
+                .epochs
+                .get(&key)
+                .copied()
+                .unwrap_or(EMBEDDED_MINIMUM_SECURITY_EPOCH)
+                .max(requested[&key])
+                .max(EMBEDDED_MINIMUM_SECURITY_EPOCH);
+            if pack.security_epoch < floor {
+                return Err(PackStoreError::SecurityEpochDowngrade {
+                    observed: pack.security_epoch,
+                    floor,
+                });
+            }
+        }
+        let mut next = state.clone();
+        for (key, epoch) in requested {
+            let prior = next
+                .epochs
+                .get(&key)
+                .copied()
+                .unwrap_or(EMBEDDED_MINIMUM_SECURITY_EPOCH);
+            next.epochs.insert(key, prior.max(epoch));
+        }
+        validate_epoch_state(&next)?;
+        if next != state {
+            lock.write(&path, &next)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn load_strict(&self) -> Result<EpochState, PackStoreError> {
+        let lock = exclusive_file_lock(&self.state_root.join(DISCOVERY_EPOCH_LOCK_NAME))?;
+        let path = self.state_root.join(DISCOVERY_EPOCH_STATE_NAME);
+        let state = lock.read(&path)?;
+        validate_epoch_state(&state)?;
+        Ok(state)
+    }
+}
+
+fn discovery_epoch_key(pack: &VerifiedPack) -> Result<String, PackStoreError> {
+    let backend = match pack.backend {
+        super::manifest::PackBackend::Cuda => "cuda",
+        super::manifest::PackBackend::Vulkan => "vulkan",
+        super::manifest::PackBackend::Metal => "metal",
+    };
+    let key = format!(
+        "{}-{}-{backend}-{}",
+        pack.target_os,
+        pack.target_arch,
+        pack.pack_id.as_str()
+    );
+    StoreComponent::new(key.clone())
+        .map(|_| key)
+        .ok_or(PackStoreError::CorruptState("discovery security epoch key"))
 }
 
 #[cfg(test)]
@@ -2459,6 +2560,100 @@ mod tests {
         store
             .current_fail_closed()
             .map(|lease| lease.verified_pack().clone())
+    }
+
+    fn discovery_descriptor(pack_id: &str, epoch: u64) -> VerifiedPack {
+        let root = temp_root("discovery-epoch-descriptor");
+        let source = root.join("source");
+        fs::create_dir(&source).unwrap();
+        let (_, mut descriptor) = fixture(&source);
+        descriptor.pack_id = StoreComponent::new(pack_id).unwrap();
+        descriptor.security_epoch = epoch;
+        fs::remove_dir_all(root).unwrap();
+        descriptor
+    }
+
+    #[test]
+    fn discovery_epoch_ledger_persists_advances_and_rejects_restart_downgrade() {
+        let root = temp_root("discovery-epoch-ledger");
+        let state = root.join("state");
+        let ledger = DiscoveryEpochLedger::new(&state);
+        let epoch_one = discovery_descriptor("metal-main", 1);
+        ledger.admit(&[&epoch_one]).unwrap();
+        assert!(state.join(DISCOVERY_EPOCH_STATE_NAME).is_file());
+        ledger.admit(&[&epoch_one]).unwrap();
+
+        let epoch_three = discovery_descriptor("metal-main", 3);
+        ledger.admit(&[&epoch_three]).unwrap();
+        assert_eq!(
+            ledger
+                .load_strict()
+                .unwrap()
+                .epochs
+                .get(&discovery_epoch_key(&epoch_three).unwrap()),
+            Some(&3)
+        );
+
+        let restarted = DiscoveryEpochLedger::new(&state);
+        let epoch_two = discovery_descriptor("metal-main", 2);
+        assert!(matches!(
+            restarted.admit(&[&epoch_two]),
+            Err(PackStoreError::SecurityEpochDowngrade {
+                observed: 2,
+                floor: 3
+            })
+        ));
+
+        let distinct = discovery_descriptor("metal-secondary", 1);
+        restarted.admit(&[&distinct]).unwrap();
+        assert_eq!(restarted.load_strict().unwrap().epochs.len(), 2);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn discovery_epoch_ledger_fails_closed_on_batch_rollback_corruption_and_bad_authority() {
+        let root = temp_root("discovery-epoch-fail-closed");
+        let state = root.join("state");
+        let ledger = DiscoveryEpochLedger::new(&state);
+        let high = discovery_descriptor("metal-main", 4);
+        let low = discovery_descriptor("metal-main", 3);
+        assert!(matches!(
+            ledger.admit(&[&high, &low]),
+            Err(PackStoreError::SecurityEpochDowngrade {
+                observed: 3,
+                floor: 4
+            })
+        ));
+        assert!(!state.join(DISCOVERY_EPOCH_STATE_NAME).exists());
+
+        let persisted_state = root.join("persisted-state");
+        let persisted = DiscoveryEpochLedger::new(&persisted_state);
+        persisted.admit(&[&high]).unwrap();
+        fs::write(
+            persisted_state.join(DISCOVERY_EPOCH_STATE_NAME),
+            b"not-json",
+        )
+        .unwrap();
+        assert!(persisted.admit(&[&high]).is_err());
+
+        fs::remove_file(persisted_state.join(DISCOVERY_EPOCH_STATE_NAME)).unwrap();
+        assert!(
+            persisted.admit(&[&low]).is_err(),
+            "a deleted high-water ledger must not reset the floor"
+        );
+
+        let authority_file = root.join("authority-file");
+        fs::write(&authority_file, b"not-a-directory").unwrap();
+        let unavailable = DiscoveryEpochLedger::new(authority_file.join("state"));
+        assert!(unavailable.admit(&[&high]).is_err());
+
+        let empty_root = root.join("empty-state");
+        DiscoveryEpochLedger::new(&empty_root).admit(&[]).unwrap();
+        assert!(
+            !empty_root.exists(),
+            "empty trust/discovery must not mutate state"
+        );
+        fs::remove_dir_all(root).unwrap();
     }
     use crate::gpu_worker_pack::manifest::test_support::{
         base_manifest, fixture, temp_root, write_signed,

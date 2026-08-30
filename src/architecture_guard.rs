@@ -380,6 +380,11 @@ fn stage_six_macos_verified_launch_is_descriptor_bound_and_command_free() {
     let pack = production_source(include_str!("gpu_worker_pack/mod.rs"));
     let manifest = include_str!("../Cargo.toml");
     let build = include_str!("../build.rs");
+    let desktop = production_source(include_str!("main.rs"));
+    let worker_entry = include_str!("bin/scribe-inference-worker.rs");
+    let metal_shim = include_str!("../native/scribe_macos_gpu_shim.m");
+    let power_shim = include_str!("../native/scribe_macos_power_shim.c");
+    let packaging = include_str!("../scripts/verify-macos-release-package.sh");
 
     for required in [
         "posix_spawn(",
@@ -431,6 +436,28 @@ fn stage_six_macos_verified_launch_is_descriptor_bound_and_command_free() {
             "macOS shim lost {framework} framework link"
         );
     }
+    let native_shim = named_function_bodies(build, "prepare_macos_native_shims").join("\n");
+    let metal_gate = native_shim
+        .find("if !metal_enabled")
+        .expect("macOS native build must gate Metal linkage");
+    let metal_link = native_shim
+        .find("framework=Metal")
+        .expect("Metal worker must link Metal.framework");
+    assert!(metal_gate < metal_link);
+    assert!(native_shim.contains("building_worker.as_deref() == Some(\"1\")"));
+    assert!(desktop.contains("mod macos_power"));
+    assert!(!desktop.contains("mod macos_gpu"));
+    assert!(include_str!("main.rs").contains("metal-acceleration is worker-only"));
+    assert!(worker_entry.contains("feature = \"metal-acceleration\""));
+    assert!(metal_shim.contains("<Metal/Metal.h>"));
+    assert!(!metal_shim.contains("IOPowerSources"));
+    assert!(power_shim.contains("IOPowerSources"));
+    assert!(!power_shim.contains("Metal/Metal.h"));
+    assert!(pack.contains("single_executable_signed_payload"));
+    assert!(pack.contains("enforce_production_discovery_epochs(discovery)"));
+    assert!(pack.contains("DiscoveryEpochLedger::new"));
+    assert!(packaging.contains("CPU/UI binary must not load Metal.framework"));
+    assert!(packaging.contains("catalog Metal worker has no Metal load command"));
 }
 
 #[test]

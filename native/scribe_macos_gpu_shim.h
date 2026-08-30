@@ -8,12 +8,6 @@
 extern "C" {
 #endif
 
-enum {
-    SCRIBE_MACOS_POWER_UNKNOWN = 0,
-    SCRIBE_MACOS_POWER_AC = 1,
-    SCRIBE_MACOS_POWER_BATTERY = 2,
-};
-
 typedef struct scribe_macos_metal_device {
     uint64_t registry_id;
     uint64_t memory_total_bytes;
@@ -27,7 +21,6 @@ typedef struct scribe_macos_metal_device {
 
 size_t scribe_macos_copy_metal_devices(scribe_macos_metal_device *devices,
                                        size_t capacity);
-int32_t scribe_macos_power_source(void);
 
 #ifdef __cplusplus
 }

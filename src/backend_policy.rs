@@ -842,7 +842,7 @@ fn current_power_source() -> PowerSource {
 
 #[cfg(target_os = "macos")]
 fn current_power_source() -> PowerSource {
-    crate::macos_gpu::power_source()
+    crate::macos_power::power_source()
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]

@@ -382,6 +382,7 @@ pub(crate) enum PackDiscoveryIssue {
     PackRootRejected,
     SignatureOrInventoryRejected,
     CatalogInventoryMismatch,
+    SecurityEpochStateRejected,
     NotAutoQualified,
     ProviderProbeRejected,
     DriverVersionUnavailable,
@@ -442,6 +443,9 @@ impl PackDiscoveryDiagnostic {
             }
             PackDiscoveryIssue::CatalogInventoryMismatch => {
                 format!("{subject} does not match its catalog entry")
+            }
+            PackDiscoveryIssue::SecurityEpochStateRejected => {
+                format!("{subject} security epoch state was rejected")
             }
             PackDiscoveryIssue::NotAutoQualified => {
                 format!("{subject} is verified but not qualified for Auto")
@@ -623,7 +627,7 @@ fn discover_pack_leases_from_install_root(install_root: &Path) -> PackLeaseDisco
     if let Ok(cache) = cache.lock()
         && let Some(discovery) = cache.lookup(&catalog.fingerprint)
     {
-        return discovery;
+        return enforce_production_discovery_epochs(discovery);
     }
     let fingerprint = catalog.fingerprint;
     let generation = fingerprint.generation_id();
@@ -631,6 +635,59 @@ fn discover_pack_leases_from_install_root(install_root: &Path) -> PackLeaseDisco
     if let Ok(mut cache) = cache.lock() {
         cache.replace(fingerprint, discovery.clone());
     }
+    enforce_production_discovery_epochs(discovery)
+}
+
+#[cfg(any(
+    all(windows, target_arch = "x86_64"),
+    all(
+        target_os = "macos",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    )
+))]
+fn enforce_production_discovery_epochs(discovery: PackLeaseDiscovery) -> PackLeaseDiscovery {
+    let Ok(directories) = crate::config::project_dirs() else {
+        return reject_discovery_epoch_state(discovery);
+    };
+    enforce_discovery_epochs_at(
+        discovery,
+        directories
+            .data_local_dir()
+            .join("gpu-worker-pack-discovery-state"),
+    )
+}
+
+fn enforce_discovery_epochs_at(
+    discovery: PackLeaseDiscovery,
+    state_root: PathBuf,
+) -> PackLeaseDiscovery {
+    if discovery.leases.is_empty() {
+        return discovery;
+    }
+    let ledger = store::DiscoveryEpochLedger::new(state_root);
+    let packs = discovery
+        .leases
+        .iter()
+        .map(|lease| lease.verified_pack())
+        .collect::<Vec<_>>();
+    if ledger.admit(&packs).is_ok() {
+        return discovery;
+    }
+    reject_discovery_epoch_state(discovery)
+}
+
+fn reject_discovery_epoch_state(mut discovery: PackLeaseDiscovery) -> PackLeaseDiscovery {
+    discovery
+        .diagnostics
+        .extend(discovery.leases.iter().map(|lease| {
+            let pack = lease.verified_pack();
+            PackDiscoveryDiagnostic::pack(
+                PackDiscoveryIssue::SecurityEpochStateRejected,
+                &pack.pack_id,
+                pack.backend,
+            )
+        }));
+    discovery.leases.clear();
     discovery
 }
 
@@ -741,6 +798,17 @@ fn verify_catalog_entries_with_verifier(
             ));
             continue;
         };
+        #[cfg(target_os = "macos")]
+        if entry.backend == manifest::PackBackend::Metal
+            && !single_executable_signed_payload(&lease)
+        {
+            diagnostics.push(PackDiscoveryDiagnostic::pack(
+                PackDiscoveryIssue::SignatureOrInventoryRejected,
+                &entry.pack_id,
+                entry.backend,
+            ));
+            continue;
+        }
         let observed = lease.verified_pack();
         let mut expected_files = lease
             .copy_entries()
@@ -779,6 +847,17 @@ fn verify_catalog_entries_with_verifier(
         diagnostics,
         catalog_generation: Some(catalog_generation),
     }
+}
+
+/// Stage 6 macOS packs deliberately carry no auxiliary payload. Retained
+/// executable authority is sufficient for the one signed worker, while
+/// descriptor-bound dependency loading remains a separately deferred design.
+fn single_executable_signed_payload(lease: &manifest::VerifiedPackLease) -> bool {
+    let worker = lease.verified_pack().worker_relative_path.as_str();
+    let mut payload = lease.copy_entries().iter().filter(|entry| {
+        entry.path != manifest::MANIFEST_NAME && entry.path != manifest::SIGNATURE_NAME
+    });
+    payload.next().is_some_and(|entry| entry.path == worker) && payload.next().is_none()
 }
 
 #[cfg(any(
@@ -1230,6 +1309,112 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn stage_six_single_worker_payload_gate_rejects_auxiliary_files_and_replacement() {
+        use sha2::{Digest, Sha256};
+
+        let valid_root = super::manifest::test_support::temp_root("single-worker-payload");
+        let (_, valid) = super::manifest::test_support::leased_fixture(&valid_root);
+        assert!(super::single_executable_signed_payload(&valid));
+
+        let source_root = super::manifest::test_support::temp_root("auxiliary-payload-source");
+        let source = source_root.join("pack");
+        std::fs::create_dir_all(source.join("lib")).unwrap();
+        std::fs::write(source.join("lib/replaceable.dylib"), b"signed auxiliary").unwrap();
+        let mut manifest = super::manifest::test_support::base_manifest();
+        manifest.payload.push(super::manifest::PayloadEntry {
+            path: "lib/replaceable.dylib".to_owned(),
+            size_bytes: b"signed auxiliary".len() as u64,
+            sha256: format!("{:x}", Sha256::digest(b"signed auxiliary")),
+        });
+        manifest
+            .payload
+            .sort_by(|left, right| left.path.cmp(&right.path));
+        super::manifest::test_support::write_signed(&source, manifest);
+        let (owner, auxiliary) =
+            super::manifest::test_support::lease_existing_fixture(&source).unwrap();
+        assert!(!super::single_executable_signed_payload(&auxiliary));
+
+        let auxiliary_path = auxiliary.verified_pack().root.join("lib/replaceable.dylib");
+        if std::fs::remove_file(&auxiliary_path).is_ok() {
+            std::fs::write(&auxiliary_path, b"replacement auxiliary").unwrap();
+        }
+        assert!(
+            !super::single_executable_signed_payload(&auxiliary),
+            "a retained lease with any auxiliary inventory is rejected before route construction"
+        );
+
+        drop(valid);
+        std::fs::remove_dir_all(valid_root).unwrap();
+        drop(auxiliary);
+        std::fs::remove_dir_all(owner).unwrap();
+        std::fs::remove_dir_all(source_root).unwrap();
+    }
+
+    #[test]
+    fn cached_discovery_is_readmitted_against_persistent_epoch_state() {
+        fn lease_at_epoch(
+            label: &str,
+            epoch: u64,
+        ) -> (
+            std::path::PathBuf,
+            std::path::PathBuf,
+            Arc<VerifiedPackLease>,
+        ) {
+            let source_root = super::manifest::test_support::temp_root(label);
+            let source = source_root.join("pack");
+            let mut manifest = super::manifest::test_support::base_manifest();
+            manifest.security_epoch = epoch;
+            super::manifest::test_support::write_signed(&source, manifest);
+            let (owner, lease) =
+                super::manifest::test_support::lease_existing_fixture(&source).unwrap();
+            (source_root, owner, Arc::new(lease))
+        }
+
+        let state_parent = super::manifest::test_support::temp_root("catalog-epoch-state");
+        let state = state_parent.join("private");
+        let (high_source, high_owner, high) = lease_at_epoch("catalog-epoch-high", 3);
+        let high_discovery = super::PackLeaseDiscovery {
+            leases: vec![Arc::clone(&high)],
+            diagnostics: Vec::new(),
+            catalog_generation: Some("high-cache-entry".to_owned()),
+        };
+        assert_eq!(
+            super::enforce_discovery_epochs_at(high_discovery.clone(), state.clone())
+                .leases
+                .len(),
+            1
+        );
+        assert_eq!(
+            super::enforce_discovery_epochs_at(high_discovery, state.clone())
+                .leases
+                .len(),
+            1,
+            "a cached same-epoch lease remains admissible"
+        );
+
+        let (low_source, low_owner, low) = lease_at_epoch("catalog-epoch-low", 2);
+        let rejected = super::enforce_discovery_epochs_at(
+            super::PackLeaseDiscovery {
+                leases: vec![Arc::clone(&low)],
+                diagnostics: Vec::new(),
+                catalog_generation: Some("rolled-back-cache-entry".to_owned()),
+            },
+            state,
+        );
+        assert!(rejected.leases.is_empty());
+        assert_eq!(
+            rejected.diagnostics[0].issue,
+            PackDiscoveryIssue::SecurityEpochStateRejected
+        );
+
+        drop(high);
+        drop(low);
+        for root in [high_source, high_owner, low_source, low_owner, state_parent] {
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]

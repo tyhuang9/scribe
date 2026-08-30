@@ -13,6 +13,9 @@ rg -F 'xcrun notarytool submit "$submission_archive"' "$repo_root/scripts/sign-n
 rg -F 'mv "$final_archive" "$requested_archive"' "$repo_root/scripts/sign-notarize-macos-release.sh" >/dev/null || { echo 'notarization must publish the requested ZIP only after stapling and verification.' >&2; exit 1; }
 rg -F 'desktop does not embed the final signed CPU worker anchor' "$repo_root/scripts/build-macos-release.sh" >/dev/null || { echo 'release builder must bind the desktop anchor to the signed CPU worker.' >&2; exit 1; }
 rg -F 'lipo -verify_arch "$pack_lipo_arch" "$worker"' "$repo_root/scripts/verify-macos-release-package.sh" >/dev/null || { echo 'catalog Metal workers must have their declared single Mach-O slice verified.' >&2; exit 1; }
+rg -F 'CPU/UI binary must not load Metal.framework' "$repo_root/scripts/verify-macos-release-package.sh" >/dev/null || { echo 'desktop and CPU worker Metal load-command rejection is missing.' >&2; exit 1; }
+rg -F 'catalog Metal worker has no Metal load command' "$repo_root/scripts/verify-macos-release-package.sh" >/dev/null || { echo 'Metal worker load-command requirement is missing.' >&2; exit 1; }
+rg -F 'macOS Metal packs must contain only the manifest, signature, and declared worker.' "$repo_root/scripts/verify-macos-release-package.sh" >/dev/null || { echo 'single-payload macOS Metal pack enforcement is missing.' >&2; exit 1; }
 if [[ "$(uname -s)" == Darwin ]]; then
   lipo_temp="$(mktemp -d "${TMPDIR:-/tmp}/scribe-macos-lipo-test.XXXXXX")"; trap 'rm -rf "$lipo_temp"' EXIT
   printf 'int main(void) { return 0; }\n' >"$lipo_temp/thin.c"
