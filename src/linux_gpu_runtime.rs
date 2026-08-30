@@ -41,10 +41,7 @@ fn version_at_least(value: &str, minimum: (u16, u16), suffix_policy: SuffixPolic
         Some((numeric, suffix)) if matches!(suffix_policy, SuffixPolicy::KernelRelease) => {
             if suffix.is_empty()
                 || suffix.len() > 64
-                || !suffix
-                    .as_bytes()
-                    .first()
-                    .is_some_and(u8::is_ascii_alphanumeric)
+                || !suffix.as_bytes().first().is_some_and(u8::is_ascii_digit)
                 || !suffix.bytes().all(|byte| {
                     byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'+' | b'-')
                 })
@@ -152,6 +149,15 @@ mod tests {
                 "22.04",
                 "2.35",
                 "5.15.0-générique",
+            ),
+            ("linux", "x86_64", "ubuntu", "22.04", "2.35", "5.15.0-rc1"),
+            (
+                "linux",
+                "x86_64",
+                "ubuntu",
+                "22.04",
+                "2.35",
+                "5.15.0-generic",
             ),
             ("linux", "x86_64", "ubuntu", "22.04", "65536.35", "5.15"),
             ("linux", "x86_64", "ubuntu", "22.04", "2.35", "5.15.0.1"),
