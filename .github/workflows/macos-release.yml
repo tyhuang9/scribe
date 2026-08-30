@@ -53,7 +53,7 @@ jobs:
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
       - name: Validate canonical packaging inputs
-        run: bash scripts/test-macos-release-packaging.sh
+        run: bash -x scripts/test-macos-release-packaging.sh
       - name: Run macOS runtime and worker-pack authoring tests
         env:
           SCRIBE_BUILD_REVISION: stage6-macos-ci
