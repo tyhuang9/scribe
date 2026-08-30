@@ -654,8 +654,10 @@ fn draw_live_brand_mark(
     layout: &DisplayLayout,
     colors: NativeColors,
 ) -> Result<(), RasterError> {
-    if state.phase == OverlayPhase::Listening
-        || (state.phase == OverlayPhase::Finalizing && state.audio_level.peak > 0.01)
+    if state.mode == OverlayMode::Live
+        && state.progress_animation_enabled
+        && (state.phase == OverlayPhase::Listening
+            || (state.phase == OverlayPhase::Finalizing && state.audio_level.peak > 0.01))
     {
         return draw_level_mark(canvas, state, layout, colors);
     }
@@ -1786,6 +1788,12 @@ mod tests {
         }
     }
 
+    fn reference_state(mode: OverlayMode) -> OverlayViewState {
+        let mut state = state(mode);
+        state.progress_animation_enabled = false;
+        state
+    }
+
     #[test]
     fn reference_contract_state_matches_the_overlay_comparison_harness() {
         for mode in [OverlayMode::Live, OverlayMode::Minimal] {
@@ -2192,7 +2200,7 @@ mod tests {
     #[test]
     fn cached_font_baselines_are_bounded_reused_and_release_evicted_probe_scopes() {
         with_rasterizer(|rasterizer| {
-            let live = state(OverlayMode::Live);
+            let live = reference_state(OverlayMode::Live);
             rasterizer.render_display(&live, true, 600, 62).unwrap();
             let first = rasterizer.baseline_cache_stats();
             assert_eq!(first, (2, 2), "one metric per Live font/style pair");
@@ -2231,6 +2239,7 @@ mod tests {
     #[test]
     fn standalone_preview_separator_renders_without_a_text_ink_probe() {
         let mut live = state(OverlayMode::Live);
+        live.progress_animation_enabled = false;
         live.transcript.committed = "Hello".to_owned();
         live.transcript.tentative = "world".to_owned();
         let line = live_line(&live, NativeColors::for_theme(true));
@@ -2261,7 +2270,7 @@ mod tests {
                     let bounds = production_bounds(mode, dpi);
                     let layout = DisplayLayout::from_bounds(mode, bounds).unwrap();
                     for dark_mode in [false, true] {
-                        let state = state(mode);
+                        let state = reference_state(mode);
                         match mode {
                             OverlayMode::Live => {
                                 let waveform_frame = isolated_component_frame(
@@ -2761,7 +2770,7 @@ mod tests {
                     ] {
                         let frame = rasterizer
                             .render_display(
-                                &state(mode),
+                                &reference_state(mode),
                                 dark,
                                 logical_width * numerator / denominator,
                                 logical_height * numerator / denominator,
@@ -2863,7 +2872,7 @@ mod tests {
                     ] {
                         let frame = rasterizer
                             .render_display(
-                                &state(mode),
+                                &reference_state(mode),
                                 dark,
                                 logical_width * numerator / denominator,
                                 logical_height * numerator / denominator,
@@ -3192,6 +3201,7 @@ mod tests {
     #[test]
     fn live_brand_mark_reflects_audio_levels_with_fixed_bounds() {
         let mut quiet = state(OverlayMode::Live);
+        quiet.progress_animation_enabled = true;
         quiet.audio_level = OverlayAudioLevel::new(0.0, 0.0);
         let mut loud = quiet.clone();
         loud.audio_level = OverlayAudioLevel::new(1.0, 1.0);
