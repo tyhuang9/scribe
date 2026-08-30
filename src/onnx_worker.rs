@@ -4,6 +4,8 @@
 //! installer supplies a verified [`OnnxModelSpec`]; the router remains the only
 //! component allowed to construct a worker client.
 
+#[cfg(any(feature = "inference-worker", test))]
+use std::cell::RefCell;
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{Read, Write};
@@ -840,6 +842,109 @@ struct WorkerPackDeviceCapability {
     memory_available_bytes: u64,
 }
 
+#[derive(Clone, Debug)]
+#[cfg(any(feature = "inference-worker", test))]
+struct CurrentPackRuntimeDeviceCatalog {
+    provider: String,
+    devices: Vec<CurrentPackRuntimeDevice>,
+}
+
+/// Volatile facts obtained from the launched worker's own challenge-bound
+/// Hello. This is worker-local state only; it is never serialized, persisted,
+/// or forwarded to another process as a device selector.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(not(any(feature = "inference-worker", test)), allow(dead_code))]
+pub(crate) struct CurrentPackRuntimeDevice {
+    pub(crate) stable_device_identity: String,
+    pub(crate) process_index: usize,
+    pub(crate) display_name: String,
+    pub(crate) driver_version: Option<String>,
+    pub(crate) device_class: DeviceClass,
+    pub(crate) vendor: GpuVendor,
+    pub(crate) memory_total_bytes: u64,
+    pub(crate) memory_available_bytes: u64,
+}
+
+#[cfg(any(feature = "inference-worker", test))]
+impl From<&WorkerPackDeviceCapability> for CurrentPackRuntimeDevice {
+    fn from(device: &WorkerPackDeviceCapability) -> Self {
+        Self {
+            stable_device_identity: device.stable_device_identity.clone(),
+            process_index: device.process_index,
+            display_name: device.display_name.clone(),
+            driver_version: device.driver_version.clone(),
+            device_class: device.device_class,
+            vendor: device.vendor,
+            memory_total_bytes: device.memory_total_bytes,
+            memory_available_bytes: device.memory_available_bytes,
+        }
+    }
+}
+
+#[cfg(any(feature = "inference-worker", test))]
+thread_local! {
+    // This worker-local cache is populated from the Hello enumeration of the
+    // currently running process. It is intentionally neither serialized nor
+    // inherited by a child process: stable identity is the only cross-process
+    // binding.
+    static CURRENT_PACK_RUNTIME_DEVICES: RefCell<Option<CurrentPackRuntimeDeviceCatalog>> = const { RefCell::new(None) };
+}
+
+#[cfg(any(feature = "inference-worker", test))]
+fn clear_current_pack_runtime_devices() {
+    CURRENT_PACK_RUNTIME_DEVICES.with(|catalog| *catalog.borrow_mut() = None);
+}
+
+#[cfg(not(any(feature = "inference-worker", test)))]
+fn clear_current_pack_runtime_devices() {}
+
+#[cfg(any(feature = "inference-worker", test))]
+fn install_current_pack_runtime_devices(capability: &WorkerPackCapability) {
+    CURRENT_PACK_RUNTIME_DEVICES.with(|catalog| {
+        *catalog.borrow_mut() = Some(CurrentPackRuntimeDeviceCatalog {
+            provider: capability.expectation.provider.clone(),
+            devices: capability
+                .devices
+                .iter()
+                .map(CurrentPackRuntimeDevice::from)
+                .collect(),
+        });
+    });
+}
+
+#[cfg(any(feature = "inference-worker", test))]
+pub(crate) fn current_pack_runtime_device(
+    stable_device_identity: &str,
+    provider: &str,
+) -> Option<CurrentPackRuntimeDevice> {
+    CURRENT_PACK_RUNTIME_DEVICES.with(|catalog| {
+        let catalog = catalog.borrow();
+        let catalog = catalog.as_ref()?;
+        (catalog.provider == provider)
+            .then(|| {
+                catalog
+                    .devices
+                    .iter()
+                    .find(|device| device.stable_device_identity == stable_device_identity)
+                    .cloned()
+            })
+            .flatten()
+    })
+}
+
+#[cfg(any(feature = "inference-worker", test))]
+fn validate_unique_provider_process_indexes(devices: &[WorkerPackDeviceCapability]) -> Result<()> {
+    let mut process_indexes = devices
+        .iter()
+        .map(|device| device.process_index)
+        .collect::<Vec<_>>();
+    process_indexes.sort_unstable();
+    if process_indexes.windows(2).any(|pair| pair[0] == pair[1]) {
+        bail!("compiled GPU provider reported duplicate process indexes");
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WorkerCapability {
@@ -1327,6 +1432,34 @@ impl VulkanDeviceCatalog {
 }
 
 #[cfg(all(windows, any(feature = "inference-worker", test)))]
+fn resolve_vulkan_provider_identity(
+    native_id: Option<&str>,
+    display_name: &str,
+    device_class: DeviceClass,
+    vendor: GpuVendor,
+    driver_catalog: &PackDriverCatalog,
+    vulkan_catalog: &mut VulkanDeviceCatalog,
+) -> Result<(String, String)> {
+    if let Some(native_id) = native_id.filter(|native_id| !native_id.is_empty()) {
+        if !native_id.is_ascii() {
+            bail!("GPU provider device stable identity is malformed");
+        }
+        let stable_device_identity = format!("native:{}", native_id.to_ascii_lowercase());
+        if parse_native_pci_location(&stable_device_identity).is_some() {
+            return Ok((
+                stable_device_identity.clone(),
+                driver_catalog.identity_for(&stable_device_identity)?,
+            ));
+        }
+        // Provider-owned opaque IDs do not identify a Windows display adapter
+        // by PCI address. Reconcile them against the independently enumerated
+        // Vulkan LUID/UUID catalog instead of misclassifying them as malformed
+        // PCI identity. `claim` requires one exact, unclaimed device fact set.
+    }
+    vulkan_catalog.claim(display_name, device_class, vendor)
+}
+
+#[cfg(all(windows, any(feature = "inference-worker", test)))]
 fn normalize_gpu_display_name(value: &str) -> Option<String> {
     let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
     (!normalized.is_empty()
@@ -1387,6 +1520,7 @@ fn parse_native_pci_location(identity: &str) -> Option<(u32, u32, u32)> {
 fn worker_pack_capability(role: WorkerRole) -> Result<Option<WorkerPackCapability>> {
     use transcribe_cpp::DeviceType;
 
+    clear_current_pack_runtime_devices();
     let Some(expectation) = worker_pack_expectation_from_private_env()? else {
         return Ok(None);
     };
@@ -1457,28 +1591,31 @@ fn worker_pack_capability(role: WorkerRole) -> Result<Option<WorkerPackCapabilit
         };
         let native_id = device.device_id.as_deref().map(str::trim);
         let (stable_device_identity, driver_version) =
-            if let Some(native_id) = native_id.filter(|native_id| !native_id.is_empty()) {
-                if !native_id.is_ascii() {
-                    bail!("GPU provider device stable identity is malformed");
-                }
-                let stable_device_identity = format!("native:{}", native_id.to_ascii_lowercase());
-                let driver_version = driver_catalog.identity_for(&stable_device_identity)?;
-                (stable_device_identity, driver_version)
-            } else {
+            if expectation.backend == WorkerProvider::Vulkan {
                 #[cfg(all(windows, feature = "vulkan-acceleration"))]
                 {
-                    if expectation.backend != WorkerProvider::Vulkan {
-                        bail!("GPU provider device has no stable identity");
-                    }
-                    vulkan_catalog
-                        .as_mut()
-                        .expect("Vulkan catalog exists for the compiled Vulkan worker")
-                        .claim(&display_name, device_class, vendor)?
+                    resolve_vulkan_provider_identity(
+                        native_id,
+                        &display_name,
+                        device_class,
+                        vendor,
+                        &driver_catalog,
+                        vulkan_catalog
+                            .as_mut()
+                            .expect("Vulkan catalog exists for the compiled Vulkan worker"),
+                    )?
                 }
                 #[cfg(not(all(windows, feature = "vulkan-acceleration")))]
                 {
-                    bail!("GPU provider device has no stable identity");
+                    bail!("Vulkan GPU worker pack was built without Vulkan acceleration")
                 }
+            } else {
+                let native_id = native_id
+                    .filter(|native_id| !native_id.is_empty() && native_id.is_ascii())
+                    .ok_or_else(|| anyhow!("GPU provider device has no stable identity"))?;
+                let stable_device_identity = format!("native:{}", native_id.to_ascii_lowercase());
+                let driver_version = driver_catalog.identity_for(&stable_device_identity)?;
+                (stable_device_identity, driver_version)
             };
         devices.push(WorkerPackDeviceCapability {
             stable_device_identity,
@@ -1491,6 +1628,10 @@ fn worker_pack_capability(role: WorkerRole) -> Result<Option<WorkerPackCapabilit
             memory_available_bytes: device.memory_free.min(device.memory_total),
         });
     }
+    // Validate before the parent-selected stable ID narrows the list. A
+    // duplicate index in another provider device must not be hidden by that
+    // filter and later make an index-only remap ambiguous.
+    validate_unique_provider_process_indexes(&devices)?;
     let mut devices = devices
         .into_iter()
         .filter(|device| {
@@ -1515,22 +1656,24 @@ fn worker_pack_capability(role: WorkerRole) -> Result<Option<WorkerPackCapabilit
     {
         bail!("compiled GPU provider reported duplicate stable device identities");
     }
-    let mut process_indexes = devices
-        .iter()
-        .map(|device| device.process_index)
-        .collect::<Vec<_>>();
-    process_indexes.sort_unstable();
-    if process_indexes.windows(2).any(|pair| pair[0] == pair[1]) {
-        bail!("compiled GPU provider reported duplicate process indexes");
-    }
-    Ok(Some(WorkerPackCapability {
+    let capability = WorkerPackCapability {
         expectation,
         devices,
-    }))
+    };
+    install_current_pack_runtime_devices(&capability);
+    debug_assert!(capability.devices.iter().all(|device| {
+        current_pack_runtime_device(
+            &device.stable_device_identity,
+            &capability.expectation.provider,
+        )
+        .is_some_and(|current| current.process_index == device.process_index)
+    }));
+    Ok(Some(capability))
 }
 
 #[cfg(not(feature = "inference-worker"))]
 fn worker_pack_capability(_role: WorkerRole) -> Result<Option<WorkerPackCapability>> {
+    clear_current_pack_runtime_devices();
     worker_pack_expectation_from_private_env().and_then(|pack| {
         if pack.is_some() {
             bail!("desktop process cannot advertise a GPU worker pack")
@@ -9160,6 +9303,122 @@ mod tests {
     }
 
     #[test]
+    fn verified_pack_launch_never_exports_a_process_index() {
+        let root = crate::gpu_worker_pack::manifest::test_support::temp_root("pack-index-env");
+        let (_, lease) = crate::gpu_worker_pack::manifest::test_support::leased_fixture(&root);
+        let lease = Arc::new(lease);
+        let expectation = pack_expectation(&lease);
+        let mut expected =
+            backend_target(BackendKind::Vulkan, "native:luid:0000000000000001", Some(7));
+        expected.driver_version = Some("vulkan:10de:1:1:fixture".to_owned());
+        let context = PackLaunchContext {
+            lease,
+            expectation,
+            expected_device: Some(expected),
+        };
+        let mut command = Command::new("scribe-inference-worker.exe");
+
+        configure_worker_pack_environment(&mut command, &context);
+
+        let environment = command
+            .get_envs()
+            .filter_map(|(key, value)| {
+                value.map(|value| {
+                    (
+                        key.to_string_lossy().into_owned(),
+                        value.to_string_lossy().into_owned(),
+                    )
+                })
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            environment.get(PACK_DEVICE_ID_ENV).map(String::as_str),
+            Some("native:luid:0000000000000001")
+        );
+        assert!(!environment.contains_key("SCRIBE_PRIVATE_PACK_DEVICE_PROCESS_INDEX"));
+        drop(context);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn launched_worker_uses_its_own_hello_index_not_a_prior_probe_index() {
+        clear_current_pack_runtime_devices();
+        let probe_process_index = 9;
+        let capability = WorkerPackCapability {
+            expectation: WorkerPackExpectation {
+                pack_id: "scribe-vulkan-windows-x64".to_owned(),
+                pack_version: "fixture".to_owned(),
+                pack_digest: "a".repeat(64),
+                security_epoch: 1,
+                runtime_abi: WORKER_ABI_VERSION,
+                backend: WorkerProvider::Vulkan,
+                provider: "transcribe-cpp-ggml-vulkan".to_owned(),
+            },
+            // The launch worker re-enumerated this device at index two. The
+            // earlier probe used index nine for the same stable LUID.
+            devices: vec![WorkerPackDeviceCapability {
+                stable_device_identity: "native:luid:0000000000000001".to_owned(),
+                process_index: 2,
+                display_name: "Fixture NVIDIA GPU".to_owned(),
+                driver_version: Some("vulkan:10de:1:1:fixture".to_owned()),
+                device_class: DeviceClass::DiscreteGpu,
+                vendor: GpuVendor::Nvidia,
+                memory_total_bytes: 8 * 1024 * 1024 * 1024,
+                memory_available_bytes: 6 * 1024 * 1024 * 1024,
+            }],
+        };
+
+        install_current_pack_runtime_devices(&capability);
+
+        assert_eq!(
+            current_pack_runtime_device(
+                "native:luid:0000000000000001",
+                "transcribe-cpp-ggml-vulkan",
+            )
+            .map(|device| device.process_index),
+            Some(2)
+        );
+        assert_ne!(
+            current_pack_runtime_device(
+                "native:luid:0000000000000001",
+                "transcribe-cpp-ggml-vulkan",
+            )
+            .map(|device| device.process_index),
+            Some(probe_process_index)
+        );
+        assert_eq!(
+            current_pack_runtime_device("native:luid:0000000000000001", "transcribe-cpp-ggml-cuda",),
+            None
+        );
+        clear_current_pack_runtime_devices();
+    }
+
+    #[test]
+    fn full_provider_enumeration_rejects_duplicate_indexes_before_device_filtering() {
+        let device = |identity: &str| WorkerPackDeviceCapability {
+            stable_device_identity: identity.to_owned(),
+            process_index: 2,
+            display_name: format!("Fixture {identity}"),
+            driver_version: Some("vulkan:10de:1:1:fixture".to_owned()),
+            device_class: DeviceClass::DiscreteGpu,
+            vendor: GpuVendor::Nvidia,
+            memory_total_bytes: 8 * 1024 * 1024 * 1024,
+            memory_available_bytes: 6 * 1024 * 1024 * 1024,
+        };
+        let all_provider_devices = vec![
+            device("native:luid:0000000000000001"),
+            device("native:luid:0000000000000002"),
+        ];
+        let selected_only = all_provider_devices
+            .iter()
+            .filter(|device| device.stable_device_identity == "native:luid:0000000000000001")
+            .collect::<Vec<_>>();
+
+        assert_eq!(selected_only.len(), 1);
+        assert!(validate_unique_provider_process_indexes(&all_provider_devices).is_err());
+    }
+
+    #[test]
     fn verified_pack_probe_binds_every_sorted_device_and_rejects_bad_lists() {
         let root = crate::gpu_worker_pack::manifest::test_support::temp_root("pack-device-list");
         let (_, lease) = crate::gpu_worker_pack::manifest::test_support::leased_fixture(&root);
@@ -9251,6 +9510,80 @@ mod tests {
         ] {
             assert_eq!(parse_native_pci_location(invalid), None, "{invalid}");
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn vulkan_identity_catalog_handles_missing_and_opaque_provider_ids() {
+        let catalog_device = |identity: &str| VulkanDeviceIdentity {
+            normalized_display_name: "fixture gpu".to_owned(),
+            device_class: DeviceClass::DiscreteGpu,
+            vendor: GpuVendor::Nvidia,
+            stable_device_identity: identity.to_owned(),
+            driver_identity: "vulkan:10de:1:1:fixture".to_owned(),
+            claimed: false,
+        };
+        let drivers = PackDriverCatalog {
+            by_pci_location: BTreeMap::new(),
+        };
+
+        let mut missing_id_catalog = VulkanDeviceCatalog {
+            devices: vec![catalog_device("native:luid:0000000000000001")],
+        };
+        assert_eq!(
+            resolve_vulkan_provider_identity(
+                None,
+                "Fixture GPU",
+                DeviceClass::DiscreteGpu,
+                GpuVendor::Nvidia,
+                &drivers,
+                &mut missing_id_catalog,
+            )
+            .unwrap(),
+            (
+                "native:luid:0000000000000001".to_owned(),
+                "vulkan:10de:1:1:fixture".to_owned(),
+            )
+        );
+
+        let mut opaque_id_catalog = VulkanDeviceCatalog {
+            devices: vec![catalog_device(
+                "native:uuid:00112233445566778899aabbccddeeff",
+            )],
+        };
+        assert_eq!(
+            resolve_vulkan_provider_identity(
+                Some("opaque-provider-token"),
+                "Fixture GPU",
+                DeviceClass::DiscreteGpu,
+                GpuVendor::Nvidia,
+                &drivers,
+                &mut opaque_id_catalog,
+            )
+            .unwrap(),
+            (
+                "native:uuid:00112233445566778899aabbccddeeff".to_owned(),
+                "vulkan:10de:1:1:fixture".to_owned(),
+            )
+        );
+
+        let mut ambiguous_catalog = VulkanDeviceCatalog {
+            devices: vec![
+                catalog_device("native:luid:0000000000000001"),
+                catalog_device("native:luid:0000000000000002"),
+            ],
+        };
+        assert!(
+            resolve_vulkan_provider_identity(
+                Some("opaque-provider-token"),
+                "Fixture GPU",
+                DeviceClass::DiscreteGpu,
+                GpuVendor::Nvidia,
+                &drivers,
+                &mut ambiguous_catalog,
+            )
+            .is_err()
+        );
     }
 
     #[cfg(windows)]

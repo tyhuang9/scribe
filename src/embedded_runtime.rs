@@ -87,6 +87,18 @@ struct RuntimeBackendEnvironment {
     fingerprint: BackendEnvironmentFingerprint,
 }
 
+/// Private launch facts installed only by the verified pack launcher. These
+/// values do not become persistent selection state: the process index remains
+/// a fresh, per-worker resolver hint while the stable identity is the binding
+/// authority.
+#[derive(Clone, Debug)]
+struct VerifiedPackDeviceOverride {
+    stable_id: DeviceIdentity,
+    driver: Option<String>,
+    provider: ProviderIdentity,
+    runtime_device: crate::onnx_worker::CurrentPackRuntimeDevice,
+}
+
 impl EmbeddedRuntime {
     pub(crate) fn new(model_path: PathBuf, preference: AccelerationPreference) -> Self {
         Self {
@@ -329,11 +341,26 @@ fn apply_verified_pack_device_override(candidates: &mut [BackendCandidate]) {
     let stable_id = std::env::var(crate::onnx_worker::PACK_DEVICE_ID_ENV).ok();
     let driver = std::env::var(crate::onnx_worker::PACK_DRIVER_ID_ENV).ok();
     let provider = std::env::var(crate::onnx_worker::PACK_PROVIDER_ENV).ok();
+    let runtime_device =
+        stable_id
+            .as_deref()
+            .zip(provider.as_deref())
+            .and_then(|(stable_id, provider)| {
+                crate::onnx_worker::current_pack_runtime_device(stable_id, provider)
+            });
+    let Some(runtime_device) = runtime_device else {
+        // A worker-pack stable identity must have been re-enumerated by this
+        // very worker process during its Hello. Do not reuse any index from a
+        // probe process or permit an unbound GPU selection.
+        mark_gpu_candidates_incompatible(candidates);
+        return;
+    };
     apply_verified_pack_device_override_values(
         candidates,
         stable_id.as_deref(),
         driver.as_deref(),
         provider.as_deref(),
+        &runtime_device,
     );
 }
 
@@ -342,15 +369,103 @@ fn apply_verified_pack_device_override_values(
     stable_id: Option<&str>,
     driver: Option<&str>,
     provider: Option<&str>,
+    runtime_device: &crate::onnx_worker::CurrentPackRuntimeDevice,
 ) {
-    let Some(stable_id) = stable_id.filter(|value| {
+    let Some(override_facts) =
+        verified_pack_device_override_values(stable_id, driver, provider, runtime_device)
+    else {
+        mark_gpu_candidates_incompatible(candidates);
+        return;
+    };
+    let provider_index_matches = candidates
+        .iter()
+        .enumerate()
+        .filter(|(_, candidate)| {
+            candidate.target.backend.is_gpu()
+                && candidate.target.provider_id == override_facts.provider
+                && candidate.target.process_index
+                    == Some(override_facts.runtime_device.process_index)
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let stable_id_changed_index = candidates.iter().any(|candidate| {
+        candidate.target.backend.is_gpu()
+            && candidate.target.provider_id == override_facts.provider
+            && candidate.target.device_id == override_facts.stable_id
+            && candidate.target.process_index != Some(override_facts.runtime_device.process_index)
+    });
+    let selected = if provider_index_matches.len() == 1 && !stable_id_changed_index {
+        let index = provider_index_matches[0];
+        candidate_matches_current_pack_device(&candidates[index], &override_facts).then_some(index)
+    } else {
+        None
+    };
+    mark_gpu_candidates_incompatible(candidates);
+    if let Some(index) = selected {
+        let candidate = &mut candidates[index];
+        candidate.target.device_id = override_facts.stable_id;
+        candidate.target.driver_version = override_facts.driver;
+        candidate.target.provider_id = override_facts.provider;
+        // A single challenge-bound process index is usable only alongside the
+        // full Hello fact set. It does not become an identity or escape this
+        // worker process.
+        candidate.availability = CandidateAvailability::Available;
+    }
+}
+
+fn mark_gpu_candidates_incompatible(candidates: &mut [BackendCandidate]) {
+    for candidate in candidates
+        .iter_mut()
+        .filter(|candidate| candidate.target.backend.is_gpu())
+    {
+        candidate.availability = CandidateAvailability::Incompatible;
+    }
+}
+
+fn candidate_matches_current_pack_device(
+    candidate: &BackendCandidate,
+    override_facts: &VerifiedPackDeviceOverride,
+) -> bool {
+    let expected = &override_facts.runtime_device;
+    candidate.target.backend.is_gpu()
+        && candidate.target.provider_id == override_facts.provider
+        && candidate.target.process_index == Some(expected.process_index)
+        && candidate.target.display_name == expected.display_name
+        && candidate.target.device_class == expected.device_class
+        && candidate.target.vendor == expected.vendor
+        && candidate.target.memory_total_bytes == expected.memory_total_bytes
+        && candidate.target.memory_available_bytes == expected.memory_available_bytes
+}
+
+fn observed_target_matches_current_pack_device(
+    observed: &BackendTarget,
+    override_facts: &VerifiedPackDeviceOverride,
+) -> bool {
+    let expected = &override_facts.runtime_device;
+    observed.backend.is_gpu()
+        && observed.provider_id == override_facts.provider
+        && observed
+            .process_index
+            .is_none_or(|index| index == expected.process_index)
+        && observed.display_name == expected.display_name
+        && observed.device_class == expected.device_class
+        && observed.vendor == expected.vendor
+        && observed.memory_total_bytes == expected.memory_total_bytes
+        && observed.memory_available_bytes == expected.memory_available_bytes
+}
+
+fn verified_pack_device_override_values(
+    stable_id: Option<&str>,
+    driver: Option<&str>,
+    provider: Option<&str>,
+    runtime_device: &crate::onnx_worker::CurrentPackRuntimeDevice,
+) -> Option<VerifiedPackDeviceOverride> {
+    let stable_id = stable_id.filter(|value| {
         !value.is_empty()
             && value.len() <= 256
             && *value == value.to_ascii_lowercase()
             && value.bytes().all(|byte| (0x20..=0x7e).contains(&byte))
-    }) else {
-        return;
-    };
+    })?;
     let driver = driver
         .filter(|value| {
             !value.is_empty()
@@ -365,20 +480,44 @@ fn apply_verified_pack_device_override_values(
                 && *value == value.to_ascii_lowercase()
                 && value.bytes().all(|byte| (0x20..=0x7e).contains(&byte))
         })
-        .map(ProviderIdentity::new);
-    for candidate in candidates.iter_mut().filter(|candidate| {
-        candidate.target.backend.is_gpu() && candidate.target.device_id.as_str() != stable_id
-    }) {
-        candidate.availability = CandidateAvailability::Incompatible;
+        .map(ProviderIdentity::new)?;
+    if runtime_device.stable_device_identity != stable_id
+        || runtime_device.driver_version != driver
+        || provider.as_str().is_empty()
+    {
+        return None;
     }
-    if let Some(candidate) = candidates.iter_mut().find(|candidate| {
-        candidate.target.backend.is_gpu() && candidate.target.device_id.as_str() == stable_id
-    }) {
-        candidate.target.driver_version = driver;
-        if let Some(provider) = provider {
-            candidate.target.provider_id = provider;
-        }
-    }
+    Some(VerifiedPackDeviceOverride {
+        stable_id: DeviceIdentity::new(stable_id.to_owned()),
+        driver,
+        provider,
+        runtime_device: runtime_device.clone(),
+    })
+}
+
+#[cfg(feature = "inference-worker")]
+fn verified_pack_device_override_from_environment() -> Option<VerifiedPackDeviceOverride> {
+    let stable_id = std::env::var(crate::onnx_worker::PACK_DEVICE_ID_ENV).ok();
+    let driver = std::env::var(crate::onnx_worker::PACK_DRIVER_ID_ENV).ok();
+    let provider = std::env::var(crate::onnx_worker::PACK_PROVIDER_ENV).ok();
+    let runtime_device =
+        stable_id
+            .as_deref()
+            .zip(provider.as_deref())
+            .and_then(|(stable_id, provider)| {
+                crate::onnx_worker::current_pack_runtime_device(stable_id, provider)
+            })?;
+    verified_pack_device_override_values(
+        stable_id.as_deref(),
+        driver.as_deref(),
+        provider.as_deref(),
+        &runtime_device,
+    )
+}
+
+#[cfg(not(feature = "inference-worker"))]
+fn verified_pack_device_override_from_environment() -> Option<VerifiedPackDeviceOverride> {
+    None
 }
 
 #[cfg(not(feature = "inference-worker"))]
@@ -604,6 +743,16 @@ fn reconcile_observed_target(
     backend: &str,
     device: &Device,
 ) -> Result<()> {
+    let pack_override = verified_pack_device_override_from_environment();
+    reconcile_observed_target_with_pack_override(selection, backend, device, pack_override.as_ref())
+}
+
+fn reconcile_observed_target_with_pack_override(
+    selection: &mut BackendSelection,
+    backend: &str,
+    device: &Device,
+    pack_override: Option<&VerifiedPackDeviceOverride>,
+) -> Result<()> {
     let observed_backend = observed_backend_kind(backend, device).ok_or_else(|| {
         anyhow!(EmbeddedRuntimeError::BackendUnavailable(format!(
             "native runtime reported an unknown backend {backend:?}"
@@ -617,13 +766,28 @@ fn reconcile_observed_target(
         ))));
     }
     let process_index = selection.target.process_index;
-    let observed = native_backend_candidate_for_backend(device.clone(), observed_backend)
+    let mut observed = native_backend_candidate_for_backend(device.clone(), observed_backend)
         .map(|candidate| candidate.target)
         .ok_or_else(|| {
             anyhow!(EmbeddedRuntimeError::BackendUnavailable(
                 "native runtime did not report a selectable compute device".to_owned()
             ))
         })?;
+    let pack_authorizes_remap = pack_override.is_some_and(|override_facts| {
+        override_facts.stable_id == selection.target.device_id
+            && override_facts.provider == selection.target.provider_id
+            && Some(override_facts.runtime_device.process_index) == selection.target.process_index
+            && override_facts.driver == selection.target.driver_version
+            && observed.backend == selection.target.backend
+            && observed_target_matches_current_pack_device(&observed, override_facts)
+    });
+    if pack_authorizes_remap {
+        // The model was loaded with the challenge-bound current index. Some
+        // Vulkan providers omit or expose an opaque ID when reporting the
+        // selected device, so project its result back onto the verified stable
+        // LUID/UUID rather than accepting the provider's transient identity.
+        observed.device_id = selection.target.device_id.clone();
+    }
     let driver_matches = observed.driver_version.is_none()
         || observed.driver_version == selection.target.driver_version;
     if observed.backend != selection.target.backend
@@ -966,6 +1130,26 @@ mod tests {
         }
     }
 
+    fn current_pack_runtime_device(
+        stable_device_identity: &str,
+        process_index: usize,
+        display_name: &str,
+        driver_version: Option<&str>,
+        memory_total_bytes: u64,
+        memory_available_bytes: u64,
+    ) -> crate::onnx_worker::CurrentPackRuntimeDevice {
+        crate::onnx_worker::CurrentPackRuntimeDevice {
+            stable_device_identity: stable_device_identity.to_owned(),
+            process_index,
+            display_name: display_name.to_owned(),
+            driver_version: driver_version.map(str::to_owned),
+            device_class: DeviceClass::DiscreteGpu,
+            vendor: GpuVendor::Nvidia,
+            memory_total_bytes,
+            memory_available_bytes,
+        }
+    }
+
     fn qualified_snapshot(
         operating_system: OperatingSystem,
         power_source: PowerSource,
@@ -1019,11 +1203,20 @@ mod tests {
             native_backend_candidate(native).unwrap()
         };
         let mut candidates = vec![candidate("0000:02:00.0", 4), candidate("0000:01:00.0", 9)];
+        let runtime_device = current_pack_runtime_device(
+            "native:0000:01:00.0",
+            9,
+            "NVIDIA GPU",
+            Some("windows-display:32.0.15.8088"),
+            0,
+            0,
+        );
         apply_verified_pack_device_override_values(
             &mut candidates,
             Some("native:0000:01:00.0"),
             Some("windows-display:32.0.15.8088"),
             Some("transcribe-cpp-ggml-vulkan"),
+            &runtime_device,
         );
         assert_eq!(
             candidates[0].availability,
@@ -1045,6 +1238,276 @@ mod tests {
         .unwrap();
         assert_eq!(selected.target.device_id.as_str(), "native:0000:01:00.0");
         assert_eq!(selected.target.process_index, Some(9));
+    }
+
+    #[test]
+    fn verified_pack_override_remaps_a_missing_provider_identity_by_bound_index() {
+        let mut selected_device = device(DeviceType::Gpu, "Vulkan7", "NVIDIA GPU");
+        selected_device.index = Some(7);
+        let mut other_device = selected_device.clone();
+        other_device.index = Some(3);
+        let stable_id = "native:luid:0000000000000001";
+        let driver = "vulkan:10de:1:1:fixture";
+        let provider = "transcribe-cpp-ggml-vulkan";
+        let mut candidates = vec![
+            native_backend_candidate(other_device).unwrap(),
+            native_backend_candidate(selected_device.clone()).unwrap(),
+        ];
+        let runtime_device =
+            current_pack_runtime_device(stable_id, 7, "NVIDIA GPU", Some(driver), 0, 0);
+
+        apply_verified_pack_device_override_values(
+            &mut candidates,
+            Some(stable_id),
+            Some(driver),
+            Some(provider),
+            &runtime_device,
+        );
+
+        assert_eq!(
+            candidates[0].availability,
+            CandidateAvailability::Incompatible
+        );
+        assert_eq!(candidates[1].availability, CandidateAvailability::Available);
+        assert_eq!(candidates[1].target.device_id.as_str(), stable_id);
+        let mut selection = select_backend(
+            AccelerationPreference::Gpu,
+            &snapshot(OperatingSystem::Windows, PowerSource::Ac, candidates),
+        )
+        .unwrap();
+        let pack_override = verified_pack_device_override_values(
+            Some(stable_id),
+            Some(driver),
+            Some(provider),
+            &runtime_device,
+        )
+        .unwrap();
+
+        reconcile_observed_target_with_pack_override(
+            &mut selection,
+            "vulkan",
+            &selected_device,
+            Some(&pack_override),
+        )
+        .unwrap();
+
+        assert_eq!(selection.target.device_id.as_str(), stable_id);
+        assert_eq!(selection.target.process_index, Some(7));
+        assert_eq!(selection.target.driver_version.as_deref(), Some(driver));
+    }
+
+    #[test]
+    fn verified_pack_override_rejects_a_stable_identity_reordered_to_another_index() {
+        let stable_id = "native:luid:0000000000000001";
+        let driver = "vulkan:10de:1:1:fixture";
+        let provider = "transcribe-cpp-ggml-vulkan";
+        let mut reordered = device(DeviceType::Gpu, "Vulkan7", "NVIDIA GPU A");
+        reordered.device_id = Some("luid:0000000000000001".to_owned());
+        reordered.index = Some(7);
+        reordered.memory_total = 8 * 1024 * 1024 * 1024;
+        reordered.memory_free = 6 * 1024 * 1024 * 1024;
+        let mut candidates = vec![native_backend_candidate(reordered).unwrap()];
+        let runtime_device = current_pack_runtime_device(
+            stable_id,
+            2,
+            "NVIDIA GPU A",
+            Some(driver),
+            8 * 1024 * 1024 * 1024,
+            6 * 1024 * 1024 * 1024,
+        );
+
+        apply_verified_pack_device_override_values(
+            &mut candidates,
+            Some(stable_id),
+            Some(driver),
+            Some(provider),
+            &runtime_device,
+        );
+
+        assert_eq!(
+            candidates[0].availability,
+            CandidateAvailability::Incompatible
+        );
+    }
+
+    #[test]
+    fn verified_pack_override_rejects_same_provider_index_ambiguity() {
+        let stable_id = "native:luid:0000000000000001";
+        let driver = "vulkan:10de:1:1:fixture";
+        let provider = "transcribe-cpp-ggml-vulkan";
+        let mut first = device(DeviceType::Gpu, "Vulkan2", "NVIDIA GPU A");
+        first.index = Some(2);
+        first.memory_total = 8 * 1024 * 1024 * 1024;
+        first.memory_free = 6 * 1024 * 1024 * 1024;
+        let second = first.clone();
+        let mut candidates = vec![
+            native_backend_candidate(first).unwrap(),
+            native_backend_candidate(second).unwrap(),
+        ];
+        let runtime_device = current_pack_runtime_device(
+            stable_id,
+            2,
+            "NVIDIA GPU A",
+            Some(driver),
+            8 * 1024 * 1024 * 1024,
+            6 * 1024 * 1024 * 1024,
+        );
+
+        apply_verified_pack_device_override_values(
+            &mut candidates,
+            Some(stable_id),
+            Some(driver),
+            Some(provider),
+            &runtime_device,
+        );
+
+        assert!(
+            candidates
+                .iter()
+                .all(|candidate| candidate.availability == CandidateAvailability::Incompatible)
+        );
+    }
+
+    #[test]
+    fn verified_pack_override_rejects_a_unique_index_with_inconsistent_hello_facts() {
+        let stable_id = "native:luid:0000000000000001";
+        let driver = "vulkan:10de:1:1:fixture";
+        let provider = "transcribe-cpp-ggml-vulkan";
+        let mut different_gpu = device(DeviceType::Gpu, "Vulkan2", "NVIDIA GPU B");
+        different_gpu.index = Some(2);
+        different_gpu.memory_total = 8 * 1024 * 1024 * 1024;
+        different_gpu.memory_free = 6 * 1024 * 1024 * 1024;
+        let mut candidates = vec![native_backend_candidate(different_gpu).unwrap()];
+        let runtime_device = current_pack_runtime_device(
+            stable_id,
+            2,
+            "NVIDIA GPU A",
+            Some(driver),
+            8 * 1024 * 1024 * 1024,
+            6 * 1024 * 1024 * 1024,
+        );
+
+        apply_verified_pack_device_override_values(
+            &mut candidates,
+            Some(stable_id),
+            Some(driver),
+            Some(provider),
+            &runtime_device,
+        );
+
+        assert_eq!(
+            candidates[0].availability,
+            CandidateAvailability::Incompatible
+        );
+    }
+
+    #[test]
+    fn verified_pack_override_remaps_an_opaque_provider_identity_by_bound_index() {
+        let mut selected_device = device(DeviceType::Gpu, "Vulkan9", "NVIDIA GPU");
+        selected_device.device_id = Some("opaque-provider-device-token".to_owned());
+        selected_device.index = Some(9);
+        let stable_id = "native:uuid:00112233445566778899aabbccddeeff";
+        let driver = "vulkan:10de:1:1:fixture";
+        let provider = "transcribe-cpp-ggml-vulkan";
+        let mut candidates = vec![native_backend_candidate(selected_device.clone()).unwrap()];
+        let runtime_device =
+            current_pack_runtime_device(stable_id, 9, "NVIDIA GPU", Some(driver), 0, 0);
+
+        apply_verified_pack_device_override_values(
+            &mut candidates,
+            Some(stable_id),
+            Some(driver),
+            Some(provider),
+            &runtime_device,
+        );
+
+        let mut selection = select_backend(
+            AccelerationPreference::Gpu,
+            &snapshot(OperatingSystem::Windows, PowerSource::Ac, candidates),
+        )
+        .unwrap();
+        let pack_override = verified_pack_device_override_values(
+            Some(stable_id),
+            Some(driver),
+            Some(provider),
+            &runtime_device,
+        )
+        .unwrap();
+
+        reconcile_observed_target_with_pack_override(
+            &mut selection,
+            "vulkan",
+            &selected_device,
+            Some(&pack_override),
+        )
+        .unwrap();
+
+        assert_eq!(selection.target.device_id.as_str(), stable_id);
+        assert_eq!(selection.target.process_index, Some(9));
+
+        let mut wrong_index = selected_device;
+        wrong_index.index = Some(4);
+        assert!(
+            reconcile_observed_target_with_pack_override(
+                &mut selection,
+                "vulkan",
+                &wrong_index,
+                Some(&pack_override),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn verified_pack_override_rejects_direct_identity_with_wrong_current_index_or_provider() {
+        let mut device = device(DeviceType::Gpu, "Vulkan", "NVIDIA GPU");
+        device.device_id = Some("luid:0000000000000001".to_owned());
+        device.index = Some(2);
+        let stable_id = "native:luid:0000000000000001";
+        let provider = "transcribe-cpp-ggml-vulkan";
+        let mut wrong_index = vec![native_backend_candidate(device.clone()).unwrap()];
+        let wrong_index_runtime_device = current_pack_runtime_device(
+            stable_id,
+            9,
+            "NVIDIA GPU",
+            Some("vulkan:10de:1:1:fixture"),
+            0,
+            0,
+        );
+
+        apply_verified_pack_device_override_values(
+            &mut wrong_index,
+            Some(stable_id),
+            Some("vulkan:10de:1:1:fixture"),
+            Some(provider),
+            &wrong_index_runtime_device,
+        );
+        assert_eq!(
+            wrong_index[0].availability,
+            CandidateAvailability::Incompatible
+        );
+
+        let mut wrong_provider = vec![native_backend_candidate(device).unwrap()];
+        wrong_provider[0].target.provider_id = ProviderIdentity::new("alternate-provider");
+        let wrong_provider_runtime_device = current_pack_runtime_device(
+            stable_id,
+            2,
+            "NVIDIA GPU",
+            Some("vulkan:10de:1:1:fixture"),
+            0,
+            0,
+        );
+        apply_verified_pack_device_override_values(
+            &mut wrong_provider,
+            Some(stable_id),
+            Some("vulkan:10de:1:1:fixture"),
+            Some(provider),
+            &wrong_provider_runtime_device,
+        );
+        assert_eq!(
+            wrong_provider[0].availability,
+            CandidateAvailability::Incompatible
+        );
     }
 
     #[test]
