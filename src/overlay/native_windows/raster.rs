@@ -3216,6 +3216,61 @@ mod tests {
     }
 
     #[test]
+    fn production_meter_ink_is_centered_inside_the_30px_mark_at_every_supported_dpi() {
+        with_rasterizer(|rasterizer| {
+            for dpi in [96, 120, 144, 192] {
+                let bounds = production_bounds(OverlayMode::Live, dpi);
+                let layout = DisplayLayout::from_bounds(OverlayMode::Live, bounds)
+                    .expect("production live layout");
+                assert!(
+                    (layout.recording_mark.width() - 30.0 * layout.scale).abs() <= f32::EPSILON,
+                    "the production mark must retain its fixed 30px logical width at {dpi} DPI"
+                );
+
+                for dark_mode in [false, true] {
+                    let mut quiet = state(OverlayMode::Live);
+                    quiet.progress_animation_enabled = true;
+                    quiet.audio_level = OverlayAudioLevel::new(0.0, 0.0);
+                    let mut loud = quiet.clone();
+                    loud.audio_level = OverlayAudioLevel::new(1.0, 1.0);
+
+                    let quiet_frame = isolated_component_frame(
+                        rasterizer,
+                        &quiet,
+                        &layout,
+                        dark_mode,
+                        IsolatedComponent::BrandMark,
+                    );
+                    let loud_frame = isolated_component_frame(
+                        rasterizer,
+                        &loud,
+                        &layout,
+                        dark_mode,
+                        IsolatedComponent::BrandMark,
+                    );
+                    assert_ne!(
+                        quiet_frame, loud_frame,
+                        "meter-enabled quiet and loud marks must differ at {dpi} DPI (dark_mode={dark_mode})"
+                    );
+
+                    for (level, frame) in [("quiet", &quiet_frame), ("loud", &loud_frame)] {
+                        assert_component_is_contained_and_centered(
+                            &format!(
+                                "{level} production meter at {dpi} DPI (dark_mode={dark_mode})"
+                            ),
+                            frame,
+                            layout.recording_mark,
+                            layout.content_center_y,
+                            0.5,
+                            true,
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
     fn success_renders_the_completion_mark_instead_of_the_recording_waveform() {
         let recording = state(OverlayMode::Live);
         let mut success = recording.clone();

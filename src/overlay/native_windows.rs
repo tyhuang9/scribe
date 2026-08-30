@@ -2665,6 +2665,149 @@ mod tests {
     }
 
     #[test]
+    fn worker_meter_waits_at_33ms_only_for_live_listening_and_finalizing() {
+        let engine = OverlayTransitionEngine::default();
+        let now = Instant::now();
+
+        for phase in [
+            super::super::controller::OverlayPhase::Listening,
+            super::super::controller::OverlayPhase::Finalizing,
+        ] {
+            let mut snapshot = snapshot_for_test();
+            snapshot.state.mode = super::super::controller::OverlayMode::Live;
+            snapshot.state.phase = phase;
+
+            assert!(
+                visual_meter_active(&snapshot),
+                "{phase:?} must advance meter decay"
+            );
+            assert_eq!(
+                engine.next_wait(now, visual_meter_active(&snapshot)),
+                Duration::from_millis(33),
+                "{phase:?} must schedule the 30 fps meter tick"
+            );
+        }
+
+        for (mode, phase) in [
+            (
+                super::super::controller::OverlayMode::Minimal,
+                super::super::controller::OverlayPhase::Listening,
+            ),
+            (
+                super::super::controller::OverlayMode::Live,
+                super::super::controller::OverlayPhase::Preparing,
+            ),
+            (
+                super::super::controller::OverlayMode::Live,
+                super::super::controller::OverlayPhase::Processing,
+            ),
+        ] {
+            let mut snapshot = snapshot_for_test();
+            snapshot.state.mode = mode;
+            snapshot.state.phase = phase;
+
+            assert!(
+                !visual_meter_active(&snapshot),
+                "{mode:?} {phase:?} is static"
+            );
+            assert_eq!(
+                engine.next_wait(now, visual_meter_active(&snapshot)),
+                Duration::from_millis(500),
+                "{mode:?} {phase:?} must not keep the worker awake"
+            );
+        }
+    }
+
+    #[test]
+    fn reduced_motion_applies_one_static_listening_frame_and_keeps_new_audio_static() {
+        let now = Instant::now();
+        let mut transitions = OverlayTransitionEngine::default();
+        let mut listening = snapshot_for_test();
+        listening.state.mode = super::super::controller::OverlayMode::Live;
+        listening.state.progress_animation_enabled = true;
+        listening.state.audio_level.rms = 0.2;
+        listening.state.audio_level.peak = 0.3;
+
+        let _ = transitions.advance(listening.clone(), now, false);
+        let _ = transitions.tick(now + Duration::from_millis(140), false);
+        assert!(
+            !transitions.is_active(),
+            "Listening must be steady before motion changes"
+        );
+        let motion_change_at = now + Duration::from_millis(141);
+
+        // This mirrors the steady-worker branch: an OS preference change is
+        // the single reason to submit a frame after the transition engine is
+        // otherwise idle.
+        let animations_enabled = refresh_active_transition_motion(&transitions, true, false, true);
+        let motion_changed = !animations_enabled;
+        assert!(!animations_enabled);
+        assert!(motion_changed);
+        assert!(matches!(
+            transitions.tick(motion_change_at, true),
+            TransitionStep::Idle
+        ));
+
+        let progress_active = animations_enabled
+            && listening.requested_visible
+            && matches!(
+                listening.state.phase,
+                super::super::controller::OverlayPhase::Listening
+                    | super::super::controller::OverlayPhase::Preparing
+                    | super::super::controller::OverlayPhase::Finalizing
+                    | super::super::controller::OverlayPhase::Processing
+                    | super::super::controller::OverlayPhase::Pasting
+            );
+        let submits_for_preference_change = matches!(
+            transitions.tick(motion_change_at, true),
+            TransitionStep::Idle
+        ) && (progress_active || motion_changed);
+        assert!(submits_for_preference_change);
+
+        let mut applied = listening.clone();
+        applied.state.progress_animation_enabled &= animations_enabled;
+        assert!(!applied.state.progress_animation_enabled);
+        assert_eq!(
+            overlay_animation_frame(&applied, animations_enabled, false),
+            0
+        );
+
+        // Once the preference has been applied, an unchanged worker tick has
+        // neither active progress nor a newly changed preference to submit.
+        assert!(!animations_enabled);
+        let motion_changed_after_application = animations_enabled
+            != refresh_active_transition_motion(&transitions, animations_enabled, false, true);
+        assert!(!motion_changed_after_application);
+        let submits_after_preference_change = matches!(
+            transitions.tick(motion_change_at + Duration::from_millis(33), true),
+            TransitionStep::Idle
+        ) && (progress_active
+            || motion_changed_after_application);
+        assert!(!submits_after_preference_change);
+
+        let mut incoming_audio = listening;
+        incoming_audio.state.audio_level.rms = 0.9;
+        incoming_audio.state.audio_level.peak = 1.0;
+        let plan = match transitions.advance(
+            incoming_audio,
+            motion_change_at + Duration::from_millis(34),
+            true,
+        ) {
+            TransitionStep::Render(plan) => plan,
+            step => panic!("expected a static listening render, got {step:?}"),
+        };
+        assert!(!plan.animated);
+        let mut incoming_audio = plan.target;
+        incoming_audio.state.progress_animation_enabled &= animations_enabled;
+        assert!(!incoming_audio.state.progress_animation_enabled);
+        assert_eq!(
+            overlay_animation_frame(&incoming_audio, animations_enabled, false),
+            0,
+            "incoming audio must not restore an animated meter while reduced motion is enabled"
+        );
+    }
+
+    #[test]
     fn saturated_event_channel_retains_the_latest_cancel_action() {
         let (tx, rx) = bounded(1);
         let retained_action = Arc::new(Mutex::new(None));
