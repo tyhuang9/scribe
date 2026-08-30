@@ -194,6 +194,12 @@ jobs:
             -CatalogPath dist\portable\worker-pack-catalog.json `
             -OutputPath dist\gpu-pack-evidence\worker-pack-sizes.json
 
+      - name: Report Windows GPU Auto qualification evidence
+        shell: pwsh
+        run: |
+          & .\scripts\report-windows-gpu-auto-qualification.ps1 `
+            -OutputPath dist\gpu-pack-evidence\gpu-auto-qualification-windows-x64.txt
+
       - name: Acquire digest-pinned Inno Setup
         shell: pwsh
         # Reviewed source, size, digest, embedded-installer digest, and trust

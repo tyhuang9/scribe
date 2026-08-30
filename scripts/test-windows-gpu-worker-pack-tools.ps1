@@ -67,11 +67,13 @@ $repositoryRoot = [System.IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoo
 $buildScript = Join-Path $PSScriptRoot 'build-windows-gpu-worker-pack.ps1'
 $prepareScript = Join-Path $PSScriptRoot 'prepare-windows-gpu-worker-packs.ps1'
 $cudaInventoryScript = Join-Path $PSScriptRoot 'windows-cuda-sdk-inventory.ps1'
+$autoQualificationReportScript = Join-Path $PSScriptRoot 'report-windows-gpu-auto-qualification.ps1'
 foreach ($script in @(
     $buildScript,
     $prepareScript,
     $cudaInventoryScript,
-    (Join-Path $PSScriptRoot 'report-windows-worker-pack-sizes.ps1')
+    (Join-Path $PSScriptRoot 'report-windows-worker-pack-sizes.ps1'),
+    $autoQualificationReportScript
 )) {
     $parseErrors = $null
     [System.Management.Automation.Language.Parser]::ParseFile(
@@ -82,6 +84,67 @@ foreach ($script in @(
     Assert-True ($parseErrors.Count -eq 0) "GPU worker-pack script has PowerShell parse errors: $script"
 }
 . $cudaInventoryScript
+$autoQualificationReport = Join-Path ([System.IO.Path]::GetTempPath()) "scribe-gpu-auto-qualification-$([guid]::NewGuid().ToString('N')).txt"
+try {
+    & $autoQualificationReportScript -OutputPath $autoQualificationReport | Out-Null
+    $report = [System.IO.File]::ReadAllText($autoQualificationReport)
+    Assert-True ($report.Contains('mode: default_deny')) 'GPU Auto qualification report lost default-deny mode.'
+    Assert-True ($report.Contains('qualified_entries: 0')) 'Checked-in GPU Auto qualification manifest must contain zero production entries.'
+    Assert-True ($report.Contains('no GPU backend is eligible for Auto')) 'GPU Auto qualification report lost CPU-safe default-deny evidence.'
+}
+finally {
+    Remove-Item -LiteralPath $autoQualificationReport -Force -ErrorAction SilentlyContinue
+}
+$autoQualificationFixtureRoot = Join-Path ([System.IO.Path]::GetTempPath()) "scribe-gpu-auto-qualification-fixtures-$([guid]::NewGuid().ToString('N'))"
+New-Item -ItemType Directory -Path $autoQualificationFixtureRoot | Out-Null
+$validAutoQualificationManifest = '{"schema_version":1,"mode":"default_deny","target_os":"windows","target_arch":"x86_64","entries":[{"pack":{"pack_id":"scribe-cuda-windows-x64","pack_version":"1.0.0","pack_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","security_epoch":7,"runtime_abi":3},"model_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","backend":"cuda","provider_id":"transcribe-cpp-ggml-cuda","vendor":"nvidia","device_class":"discrete_gpu","minimum_total_memory_bytes":8589934592,"driver":{"kind":"exact","value":"windows-display:32.0.16.1088"},"evidence":{"id":"windows-nvidia-cuda-fixture-v1","cold_runs":5,"warm_runs":20,"gpu_p95_ms":110,"cpu_p95_ms":100,"correctness_verified":true,"reliability_verified":true,"cold_evidence_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","warm_evidence_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","transcript_parity_evidence_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}}]}'
+try {
+    $fixtureManifest = Join-Path $autoQualificationFixtureRoot 'valid.json'
+    [System.IO.File]::WriteAllText($fixtureManifest, $validAutoQualificationManifest, [System.Text.UTF8Encoding]::new($false))
+    $validReport = Invoke-NativeProcess `
+        (Join-Path $PSHOME 'pwsh.exe') `
+        @('-NoProfile', '-File', $autoQualificationReportScript, '-ManifestPath', $fixtureManifest)
+    Assert-True ($validReport.Stdout.Contains('qualified_entries: 1')) 'Valid GPU Auto qualification evidence was rejected by the CI reporter.'
+    $repeatReport = Invoke-NativeProcess `
+        (Join-Path $PSHOME 'pwsh.exe') `
+        @('-NoProfile', '-File', $autoQualificationReportScript, '-ManifestPath', $fixtureManifest)
+    Assert-True ($validReport.Stdout -ceq $repeatReport.Stdout) 'GPU Auto qualification report output is not deterministic.'
+
+    $invalidAutoQualificationFixtures = [ordered]@{
+        'unknown root field' = $validAutoQualificationManifest.Replace(',"entries":', ',"unexpected":true,"entries":')
+        'string correctness boolean' = $validAutoQualificationManifest.Replace('"correctness_verified":true', '"correctness_verified":"false"')
+        'string cold-run count' = $validAutoQualificationManifest.Replace('"cold_runs":5', '"cold_runs":"5"')
+        'insufficient cold runs' = $validAutoQualificationManifest.Replace('"cold_runs":5', '"cold_runs":4')
+        'insufficient warm runs' = $validAutoQualificationManifest.Replace('"warm_runs":20', '"warm_runs":19')
+        'p95 slower than threshold' = $validAutoQualificationManifest.Replace('"gpu_p95_ms":110', '"gpu_p95_ms":111')
+        'false correctness evidence' = $validAutoQualificationManifest.Replace('"correctness_verified":true', '"correctness_verified":false')
+        'false reliability evidence' = $validAutoQualificationManifest.Replace('"reliability_verified":true', '"reliability_verified":false')
+        'bad evidence digest' = $validAutoQualificationManifest.Replace(('"cold_evidence_sha256":"' + ('c' * 64) + '"'), ('"cold_evidence_sha256":"' + ('C' * 64) + '"'))
+        'backend-provider mismatch' = $validAutoQualificationManifest.Replace('"provider_id":"transcribe-cpp-ggml-cuda"', '"provider_id":"transcribe-cpp-ggml-vulkan"')
+        'CUDA-vendor mismatch' = $validAutoQualificationManifest.Replace('"vendor":"nvidia"', '"vendor":"amd"')
+        'noncanonical pack component' = $validAutoQualificationManifest.Replace('"pack_id":"scribe-cuda-windows-x64"', '"pack_id":"bad:pack"')
+        'unsafe driver identity' = $validAutoQualificationManifest.Replace('windows-display:32.0.16.1088', 'windows-display:\override')
+        'noncanonical document formatting' = (($validAutoQualificationManifest | ConvertFrom-Json -Depth 16) | ConvertTo-Json -Depth 16)
+    }
+    $acceptedInvalidFixtures = [System.Collections.Generic.List[string]]::new()
+    foreach ($fixture in $invalidAutoQualificationFixtures.GetEnumerator()) {
+        $invalidManifest = Join-Path $autoQualificationFixtureRoot (($fixture.Key -replace '[^A-Za-z0-9]', '-') + '.json')
+        [System.IO.File]::WriteAllText($invalidManifest, [string]$fixture.Value, [System.Text.UTF8Encoding]::new($false))
+        $invalidResult = Invoke-NativeProcess `
+            (Join-Path $PSHOME 'pwsh.exe') `
+            @('-NoProfile', '-File', $autoQualificationReportScript, '-ManifestPath', $invalidManifest) `
+            -AllowFailure
+        if ($invalidResult.ExitCode -eq 0) {
+            $acceptedInvalidFixtures.Add([string]$fixture.Key)
+        }
+    }
+    Assert-True `
+        ($acceptedInvalidFixtures.Count -eq 0) `
+        "GPU Auto qualification reporter accepted invalid fixtures: $($acceptedInvalidFixtures -join ', ')"
+}
+finally {
+    Remove-Item -LiteralPath $autoQualificationFixtureRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
 $prepareSource = Get-Content -LiteralPath $prepareScript -Raw
 Assert-True `
     (-not $prepareSource.Contains('-CargoTargetDirectory')) `
