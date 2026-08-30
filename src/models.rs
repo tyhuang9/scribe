@@ -215,25 +215,15 @@ mod tests {
     }
 
     #[test]
-    fn default_catalog_projects_one_receipt_backed_moonshine_model() {
+    fn default_catalog_projects_each_receipt_backed_moonshine_model_once() {
         let catalog = default_model_catalog();
-        let moonshine = catalog
-            .iter()
-            .find(|model| model.id == "moonshine-tiny-en-int8-onnx")
-            .unwrap();
-
-        assert_eq!(moonshine.backend, "sherpa-onnx");
-        assert_eq!(
-            moonshine.download_model.as_deref(),
-            Some("moonshine-tiny-en-int8-onnx")
-        );
-        assert_eq!(
-            catalog
-                .iter()
-                .filter(|model| model.id == "moonshine-tiny-en-int8-onnx")
-                .count(),
-            1
-        );
+        for id in ["moonshine-tiny-en-int8-onnx", "moonshine-base-en-int8-onnx"] {
+            let moonshine = catalog.iter().find(|model| model.id == id).unwrap();
+            assert_eq!(moonshine.backend, "sherpa-onnx");
+            assert_eq!(moonshine.download_model.as_deref(), Some(id));
+            assert_eq!(catalog.iter().filter(|model| model.id == id).count(), 1);
+        }
+        assert_eq!(catalog.len(), 6);
         assert_eq!(
             catalog.len(),
             crate::model_catalog::model_descriptors().len()

@@ -275,6 +275,7 @@ new activation/paste latency timestamps remain NOT VERIFIED on a desktop.
 | STT-07 | Win/Linux/macOS | P1, P2, P3 | In Advanced, run Auto, Rolling preview, and Final text only against the same utterance; repeat once in Playground. Capture the committed/tentative overlay states and first-partial latency. | Auto and Rolling use bounded batch preview only for the primary native model; Final text only and Playground emit no partials. Tentative text stays in the overlay, corrections do not backspace another app, and the final result replaces the preview once. No model advertises native streaming. | **NOT VERIFIED** |
 | STT-08 | Win/Linux/macOS | P1, P2, P3 | Change Auto/GPU/CPU-only acceleration preference where supported; run fixture on each available mode. | Auto resolves to a health-validated device, explicit CPU is honored, and unavailable GPU fails clearly without silent fallback. Record resolved backend/device and errors. | **NOT VERIFIED** |
 | STT-09 | Windows | P1, P3 | Install and select the receipt-backed `moonshine-tiny-en-int8-onnx` bundle; transcribe the approved fixture and record its receipt, model identity, worker generation, cancellation behavior, and final-text output. | The installed receipt validates before activation; native Sherpa ONNX inference runs in the persistent `--scribe-inference-worker` child, produces a final transcript, and does not claim native streaming. Record all failures and the exact build/model/fixture evidence. | **NOT VERIFIED** |
+| STT-09a | Windows x64 | Exact `moonshine-base-en-int8-onnx` private bundle, Sherpa 1.13.5, and its pinned fixture | Run the ignored real-bundle diagnostic against the exact private bundle and fixture. | **PASS — scoped gate only:** stage, child load/health/silence, normalized known-WAV equality, and unload/reload passed in 140.40 seconds total. This is diagnostic elapsed time, not model latency. Cancellation, supervisor restart recovery, latency, resource use, accelerators, and non-Windows behavior remain **NOT VERIFIED**. | **PASS — scoped fixture gate only** |
 | STT-10 | Windows | P1, P3, P7 | With Scribe running, inspect the process tree and worker launch arguments during a GGUF transcription, a receipt-backed ONNX transcription, and an AI-VAD capture. Inspect stdout/stderr capture for each child and confirm no local listener is opened. | The desktop process owns no native model/session/recognizer handles. One persistent `--scribe-inference-worker` child owns GGUF and native Sherpa ONNX inference; a separate `--scribe-vad-worker` instance owns VAD only. Both use private SCIF v3 stdin/stdout pipes, stdout contains protocol frames only, diagnostics use stderr, and no localhost/TCP/HTTP transport or nested ONNX worker appears. No Python, dynamic runtime package, GGML/DLL route, or CLI fallback appears. Use a disposable profile and terminate the workers after the run. | **NOT VERIFIED** |
 
 ## Output, clipboard, and target safety
@@ -388,7 +389,8 @@ Final handler and compatibility state:
 - Logical runtime handlers: **1** (`TranscribeCppRuntime`).
 - Supported models: **0**.
 - Experimental models: `whisper_cpp_tiny_en`, `whisper_cpp_base_en`,
-  `whisper_cpp_small_en`, and `whisper_cpp_medium_en`.
+  `whisper_cpp_small_en`, `whisper_cpp_medium_en`,
+  `moonshine-tiny-en-int8-onnx`, and `moonshine-base-en-int8-onnx`.
 - Native streaming models: **0**. The shared preview is bounded rolling batch
   decoding, not native streaming.
 - `OnnxSpeechRuntime`: omitted; the exact v1.13.4 Zipformer evidence gate is
