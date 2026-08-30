@@ -59,11 +59,9 @@ use crate::models::{
     ModelArtifactOrigin, ModelInstallStatus, ModelRuntimeStatus, SttModelInfo, TranscriptionStatus,
     format_bytes,
 };
-#[cfg(windows)]
-use crate::onnx_model_bundles::verified_onnx_removal_candidate;
 use crate::onnx_model_bundles::{
-    OWNERSHIP_WITNESS_SOURCE, OnnxBundleRemoval, VerifiedOnnxRemovalCandidate,
-    reconcile_onnx_bundle_removal, stage_onnx_bundle_removal,
+    OWNERSHIP_WITNESS_SOURCE, OnnxBundleRemoval, OnnxOwnershipLease, VerifiedOnnxRemovalCandidate,
+    authorize_onnx_bundle_removal, reconcile_onnx_bundle_removal, stage_onnx_bundle_removal,
 };
 use crate::overlay::{
     self, CapturedTarget, OverlayController, OverlayDiagnostic, OverlayMode as NativeOverlayMode,
@@ -1524,7 +1522,7 @@ struct VerifiedInstallResult {
 #[derive(Debug)]
 struct CommittedOnnxBundleInstall {
     smoke: InstallSmoke,
-    ownership: VerifiedOnnxRemovalCandidate,
+    ownership: OnnxOwnershipLease,
 }
 
 #[derive(Debug)]
@@ -2818,9 +2816,6 @@ fn run_onnx_bundle_finalizer(
     }
     let smoke = verified.smoke().clone();
     let ownership = verified
-        .removal_candidate()
-        .map_err(InstallJobFailure::from)?;
-    verified
         .activate()
         .and_then(|activated| activated.commit())
         .map_err(InstallJobFailure::from)?;
@@ -10005,7 +10000,7 @@ impl LocalTranscriberApp {
     fn verified_onnx_removal_candidate_for_model(
         &self,
         model: &SttModelInfo,
-    ) -> Result<Option<VerifiedOnnxRemovalCandidate>, String> {
+    ) -> Result<Option<OnnxOwnershipLease>, String> {
         if !matches!(
             crate::model_catalog::normalized_install_artifact(&ModelId::new(&model.id)),
             Some(crate::model_catalog::NormalizedInstallArtifact::ReceiptBackedBundle { .. })
@@ -10034,7 +10029,7 @@ impl LocalTranscriberApp {
                         .to_owned(),
                 );
             }
-            let candidate = verified_onnx_removal_candidate(
+            let ownership = authorize_onnx_bundle_removal(
                 &config::onnx_bundle_storage_dir(&self.config),
                 &model.id,
             )
@@ -10044,20 +10039,22 @@ impl LocalTranscriberApp {
             .ok_or_else(|| {
                 "The ONNX bundle is no longer present at its exact managed location.".to_owned()
             })?;
+            let candidate = ownership.candidate();
             if candidate.model_id() != model.id || candidate.target_root() != expected_target {
                 return Err(
                     "The ONNX bundle receipt did not authorize the exact catalog target; no files were removed."
                         .to_owned(),
                 );
             }
-            Ok(Some(candidate))
+            Ok(Some(ownership))
         }
     }
 
     fn persist_onnx_ownership_witness(
         &mut self,
-        candidate: &VerifiedOnnxRemovalCandidate,
+        ownership: &OnnxOwnershipLease,
     ) -> Result<(), String> {
+        let candidate = ownership.candidate();
         let expected_target =
             config::onnx_bundle_target_root(&self.config, &ModelId::new(candidate.model_id()))
                 .ok_or_else(|| {
@@ -10067,6 +10064,27 @@ impl LocalTranscriberApp {
             return Err(
                 "ONNX ownership evidence did not bind the exact catalog target.".to_owned(),
             );
+        }
+        if let Some(path) = self.config_path.as_deref() {
+            let expected_fingerprint = config::settings::artifact_config_fingerprint(&self.config)
+                .map_err(|error| {
+                    format!("Could not fingerprint the current ONNX artifact settings: {error}")
+                })?;
+            let durable_config = config::settings::load_from_path(path).map_err(|error| {
+                format!("Could not reload durable ONNX artifact settings: {error}")
+            })?;
+            let durable_fingerprint = config::settings::artifact_config_fingerprint(
+                &durable_config,
+            )
+            .map_err(|error| {
+                format!("Could not fingerprint durable ONNX artifact settings: {error}")
+            })?;
+            if durable_fingerprint != expected_fingerprint {
+                return Err(
+                    "Durable model artifact settings changed in another process; refresh model state and retry."
+                        .to_owned(),
+                );
+            }
         }
         if onnx_ownership_witness_matches(&self.config, candidate) {
             return Ok(());
@@ -10084,14 +10102,19 @@ impl LocalTranscriberApp {
                 "ONNX ownership evidence was rejected by managed-path normalization.".to_owned(),
             );
         }
-        #[cfg(test)]
-        let persistence = if self.config_path.is_none() {
-            Ok(())
-        } else {
-            config::save_config(&self.config)
+        let persistence = match self.config_path.as_deref() {
+            Some(path) => config::settings::save_to_path(path, &self.config),
+            #[cfg(test)]
+            None => Ok(()),
+            #[cfg(not(test))]
+            None => {
+                self.config = previous;
+                return Err(
+                    "Could not resolve the durable settings path for the ONNX ownership witness."
+                        .to_owned(),
+                );
+            }
         };
-        #[cfg(not(test))]
-        let persistence = config::save_config(&self.config);
         if let Err(error) = persistence {
             self.config = previous;
             return Err(format!(
@@ -10108,8 +10131,8 @@ impl LocalTranscriberApp {
 
     fn authorize_model_removal(&mut self, model: &SttModelInfo) -> bool {
         self.pending_onnx_removal = None;
-        let candidate = match self.verified_onnx_removal_candidate_for_model(model) {
-            Ok(Some(candidate)) => candidate,
+        let ownership = match self.verified_onnx_removal_candidate_for_model(model) {
+            Ok(Some(ownership)) => ownership,
             Ok(None) => return true,
             Err(message) => {
                 self.status = TranscriptionStatus::Error;
@@ -10117,14 +10140,14 @@ impl LocalTranscriberApp {
                 return false;
             }
         };
-        if let Err(message) = self.persist_onnx_ownership_witness(&candidate) {
+        if let Err(message) = self.persist_onnx_ownership_witness(&ownership) {
             self.status = TranscriptionStatus::Error;
             self.status_message = format!(
                 "The ONNX bundle was verified, but removal could not be authorized: {message}"
             );
             return false;
         }
-        self.pending_onnx_removal = Some(candidate);
+        self.pending_onnx_removal = Some(ownership.into_candidate());
         true
     }
 
@@ -27264,10 +27287,12 @@ mod layout_tests {
                 recovery_required: false,
                 result: Ok(CommittedOnnxBundleInstall {
                     smoke: test_install_smoke(),
-                    ownership: VerifiedOnnxRemovalCandidate::for_test(
-                        model_id.clone(),
-                        target.clone(),
-                        receipt_sha256.clone(),
+                    ownership: OnnxOwnershipLease::for_test(
+                        VerifiedOnnxRemovalCandidate::for_test(
+                            model_id.clone(),
+                            target.clone(),
+                            receipt_sha256.clone(),
+                        ),
                     ),
                 }),
             })
@@ -27284,6 +27309,47 @@ mod layout_tests {
         assert_eq!(witness.source.as_deref(), Some(OWNERSHIP_WITNESS_SOURCE));
         assert_eq!(witness.sha256.as_deref(), Some(receipt_sha256.as_str()));
         assert!(matches!(app.status, TranscriptionStatus::Idle));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn onnx_ownership_persistence_rejects_stale_durable_artifact_settings() {
+        let root = partial_cleanup_test_root("onnx-ownership-stale-durable-settings");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let config_path = root.join("config.json");
+        let mut app = test_app();
+        app.config.general.model_storage_dir = root.join("models");
+        config::normalize_config(&mut app.config);
+        config::settings::save_to_path(&config_path, &app.config).unwrap();
+        app.config_path = Some(config_path.clone());
+
+        let model_id = "moonshine-tiny-en-int8-onnx".to_owned();
+        let target = config::onnx_bundle_target_root(&app.config, &ModelId::new(&model_id))
+            .expect("known ONNX bundle target");
+        let ownership = OnnxOwnershipLease::for_test(VerifiedOnnxRemovalCandidate::for_test(
+            model_id.clone(),
+            target,
+            "ab".repeat(32),
+        ));
+        let mut concurrent = app.config.clone();
+        concurrent
+            .general
+            .excluded_bundled_model_ids
+            .push(BUNDLED_BASE_MODEL_ID.to_owned());
+        config::normalize_config(&mut concurrent);
+        config::settings::save_to_path(&config_path, &concurrent).unwrap();
+
+        let error = app.persist_onnx_ownership_witness(&ownership).unwrap_err();
+
+        assert!(error.contains("changed in another process"));
+        assert!(!app.config.general.managed_models.contains_key(&model_id));
+        let durable = config::settings::load_from_path(&config_path).unwrap();
+        assert_eq!(
+            durable.general.excluded_bundled_model_ids,
+            concurrent.general.excluded_bundled_model_ids,
+            "stale ownership persistence must not overwrite concurrent artifact settings"
+        );
         let _ = fs::remove_dir_all(root);
     }
 
