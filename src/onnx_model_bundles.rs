@@ -2942,6 +2942,33 @@ mod tests {
         .unwrap();
         drop(removal);
         assert!(!restore_target.exists());
+        let journal_path = removal_journal_path(&restore_target).unwrap();
+        let journal_bytes = fs::read(&journal_path).unwrap();
+        let mut legacy_journal: serde_json::Value = serde_json::from_slice(&journal_bytes).unwrap();
+        legacy_journal
+            .as_object_mut()
+            .unwrap()
+            .remove("ownership_sha256");
+        fs::write(
+            &journal_path,
+            serde_json::to_vec_pretty(&legacy_journal).unwrap(),
+        )
+        .unwrap();
+        let error = reconcile_onnx_bundle_removal_with(
+            &restore_storage,
+            model_id,
+            &prior,
+            |expected, root| {
+                verified_removal_candidate_at_with_manifest_for_test(expected, root, &manifest)
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("no exact artifact ownership witness")
+        );
+        fs::write(&journal_path, journal_bytes).unwrap();
         let error =
             reconcile_onnx_bundle_removal_with(&restore_storage, model_id, &prior, |_, root| {
                 Ok(VerifiedOnnxRemovalCandidate::for_test(
