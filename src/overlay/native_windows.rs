@@ -1934,6 +1934,7 @@ fn run_native_overlay_thread(mailbox: Arc<SnapshotMailbox>, event_sink: NativeEv
                 &transitions,
                 animations_enabled,
                 crate::system_preferences::client_area_animations_enabled(),
+                snapshot.requested_visible && snapshot.state.phase.is_progressing(),
             );
             let step = transitions.tick(now, !animations_enabled);
             let hidden = matches!(step, TransitionStep::Hidden);
@@ -2009,8 +2010,9 @@ fn refresh_active_transition_motion(
     transitions: &OverlayTransitionEngine,
     animations_enabled: bool,
     current_preference: bool,
+    visual_progress_active: bool,
 ) -> bool {
-    if transitions.is_active() {
+    if transitions.is_active() || visual_progress_active {
         current_preference
     } else {
         animations_enabled
@@ -2621,7 +2623,7 @@ mod tests {
         let _ = transitions.advance(finalizing, now + Duration::from_millis(1), false);
         assert!(transitions.is_active());
 
-        let animations_enabled = refresh_active_transition_motion(&transitions, true, false);
+        let animations_enabled = refresh_active_transition_motion(&transitions, true, false, true);
         assert!(!animations_enabled);
         match transitions.tick(now + Duration::from_millis(2), !animations_enabled) {
             TransitionStep::Render(plan) => {
@@ -2634,6 +2636,19 @@ mod tests {
             }
             step => panic!("expected a reduced-motion target render, got {step:?}"),
         }
+    }
+
+    #[test]
+    fn worker_motion_refresh_repaints_steady_progress_without_waiting_for_health_check() {
+        let transitions = OverlayTransitionEngine::default();
+        let mut snapshot = snapshot_for_test();
+        snapshot.state.phase = super::super::controller::OverlayPhase::Processing;
+        let animations_enabled = refresh_active_transition_motion(&transitions, true, false, true);
+        assert!(!animations_enabled);
+        assert_eq!(
+            overlay_animation_frame(&snapshot, animations_enabled, false),
+            0
+        );
     }
 
     #[test]

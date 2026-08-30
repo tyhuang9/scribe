@@ -55,6 +55,8 @@ pub(super) struct OverlayTransitionEngine {
     success_dismissed: bool,
     smoothed_rms: f32,
     smoothed_peak: f32,
+    meter_target_rms: f32,
+    meter_target_peak: f32,
     last_meter_update: Option<Instant>,
 }
 
@@ -137,11 +139,41 @@ impl OverlayTransitionEngine {
             return TransitionStep::Idle;
         }
         if reduced_motion {
+            if self
+                .displayed
+                .as_ref()
+                .is_some_and(|displayed| displayed.state.phase == OverlayPhase::Success)
+                && !self.success_dismissed
+                && self
+                    .success_since
+                    .is_some_and(|since| now.duration_since(since) >= SUCCESS_DWELL)
+            {
+                self.active = None;
+                self.displayed = None;
+                self.success_dismissed = true;
+                return TransitionStep::Hidden;
+            }
             return if self.active.take().is_some() {
                 self.plan_at(now, true)
             } else {
                 TransitionStep::Idle
             };
+        }
+        if self.active.is_none()
+            && self.displayed.as_ref().is_some_and(|displayed| {
+                matches!(
+                    displayed.state.phase,
+                    OverlayPhase::Listening | OverlayPhase::Finalizing
+                )
+            })
+        {
+            let mut displayed = self
+                .displayed
+                .clone()
+                .expect("displayed listening snapshot");
+            self.smooth_meter(&mut displayed, now);
+            self.displayed = Some(displayed);
+            return self.plan_at(now, true);
         }
         if let (Some(success_since), Some(displayed)) = (self.success_since, self.displayed.clone())
             && displayed.state.phase == OverlayPhase::Success
@@ -223,6 +255,8 @@ impl OverlayTransitionEngine {
         self.last_meter_update = None;
         self.smoothed_rms = 0.0;
         self.smoothed_peak = 0.0;
+        self.meter_target_rms = 0.0;
+        self.meter_target_peak = 0.0;
     }
 
     fn smooth_meter(&mut self, snapshot: &mut OverlaySnapshot, now: Instant) {
@@ -232,6 +266,10 @@ impl OverlayTransitionEngine {
             .unwrap_or_default();
         self.last_meter_update = Some(now);
         let recording = snapshot.state.phase == OverlayPhase::Listening;
+        if recording {
+            self.meter_target_rms = snapshot.state.audio_level.rms;
+            self.meter_target_peak = snapshot.state.audio_level.peak;
+        }
         // The first sample intentionally snaps, avoiding a visible empty-meter
         // delay immediately after capture begins.
         let smooth = |current: &mut f32, target: f32| {
@@ -253,7 +291,7 @@ impl OverlayTransitionEngine {
         smooth(
             &mut self.smoothed_rms,
             if recording {
-                snapshot.state.audio_level.rms
+                self.meter_target_rms
             } else {
                 0.0
             },
@@ -261,7 +299,7 @@ impl OverlayTransitionEngine {
         smooth(
             &mut self.smoothed_peak,
             if recording {
-                snapshot.state.audio_level.peak
+                self.meter_target_peak
             } else {
                 0.0
             },
@@ -418,6 +456,29 @@ mod tests {
     }
 
     #[test]
+    fn reduced_motion_success_dwells_then_hides_and_stays_dismissed() {
+        let at = Instant::now();
+        let mut engine = OverlayTransitionEngine::default();
+        let _ = engine.advance(snapshot(OverlayPhase::Success), at, true);
+        assert!(matches!(
+            engine.tick(at + Duration::from_millis(649), true),
+            TransitionStep::Idle
+        ));
+        assert!(matches!(
+            engine.tick(at + Duration::from_millis(650), true),
+            TransitionStep::Hidden
+        ));
+        assert!(matches!(
+            engine.advance(
+                snapshot(OverlayPhase::Success),
+                at + Duration::from_millis(651),
+                true
+            ),
+            TransitionStep::Hidden
+        ));
+    }
+
+    #[test]
     fn dismissed_success_stays_hidden_when_the_app_repeats_success() {
         let at = Instant::now();
         let mut engine = OverlayTransitionEngine::default();
@@ -536,6 +597,26 @@ mod tests {
             false,
         ));
         assert!(plan.target.state.audio_level.rms < 0.5);
+    }
+
+    #[test]
+    fn meter_advances_without_new_snapshots_then_decays_after_capture_stops() {
+        let at = Instant::now();
+        let mut engine = OverlayTransitionEngine::default();
+        let mut listening = snapshot(OverlayPhase::Listening);
+        listening.state.audio_level.rms = 1.0;
+        listening.state.audio_level.peak = 1.0;
+        let _ = engine.advance(listening, at, false);
+        let _ = engine.tick(at + Duration::from_millis(140), false);
+        let attacked = render(engine.tick(at + Duration::from_millis(173), false));
+        assert!(attacked.target.state.audio_level.rms > 0.5);
+
+        let mut finalizing = snapshot(OverlayPhase::Finalizing);
+        finalizing.state.audio_level.rms = 0.0;
+        finalizing.state.audio_level.peak = 0.0;
+        let _ = engine.advance(finalizing, at + Duration::from_millis(174), false);
+        let decayed = render(engine.tick(at + Duration::from_millis(314), false));
+        assert!(decayed.target.state.audio_level.rms < attacked.target.state.audio_level.rms);
     }
 
     #[test]

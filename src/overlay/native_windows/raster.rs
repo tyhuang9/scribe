@@ -654,6 +654,11 @@ fn draw_live_brand_mark(
     layout: &DisplayLayout,
     colors: NativeColors,
 ) -> Result<(), RasterError> {
+    if state.phase == OverlayPhase::Listening
+        || (state.phase == OverlayPhase::Finalizing && state.audio_level.peak > 0.01)
+    {
+        return draw_level_mark(canvas, state, layout, colors);
+    }
     let scale = layout.scale;
     let center_x = layout.recording_mark.center_x();
     canvas.draw_centered_text_in_rect(
@@ -665,6 +670,31 @@ fn draw_live_brand_mark(
         TextStyle::Phosphor,
         status_mark_color(state, colors),
     )
+}
+
+fn draw_level_mark(
+    canvas: &mut Canvas<'_>,
+    state: &OverlayViewState,
+    layout: &DisplayLayout,
+    colors: NativeColors,
+) -> Result<(), RasterError> {
+    let scale = layout.scale;
+    let center_x = layout.recording_mark.center_x();
+    let center_y = layout.recording_mark.center_y();
+    let rms = state.audio_level.rms.clamp(0.0, 1.0);
+    let peak = state.audio_level.peak.clamp(rms, 1.0);
+    for (offset, level) in [(-7.0, rms), (0.0, peak), (7.0, rms)] {
+        let half_height = (3.0 + level * 8.0) * scale;
+        canvas.draw_line(
+            center_x + offset * scale,
+            center_y - half_height,
+            center_x + offset * scale,
+            center_y + half_height,
+            2.0 * scale,
+            status_mark_color(state, colors),
+        )?;
+    }
+    Ok(())
 }
 
 fn draw_live_elapsed(
@@ -3160,13 +3190,13 @@ mod tests {
     }
 
     #[test]
-    fn live_brand_mark_is_static_across_audio_levels() {
+    fn live_brand_mark_reflects_audio_levels_with_fixed_bounds() {
         let mut quiet = state(OverlayMode::Live);
         quiet.audio_level = OverlayAudioLevel::new(0.0, 0.0);
         let mut loud = quiet.clone();
         loud.audio_level = OverlayAudioLevel::new(1.0, 1.0);
         with_rasterizer(|rasterizer| {
-            assert_eq!(
+            assert_ne!(
                 rasterizer.render_display(&quiet, true, 600, 62).unwrap(),
                 rasterizer.render_display(&loud, true, 600, 62).unwrap()
             );
