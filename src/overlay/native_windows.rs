@@ -1934,23 +1934,13 @@ fn run_native_overlay_thread(mailbox: Arc<SnapshotMailbox>, event_sink: NativeEv
                 &transitions,
                 animations_enabled,
                 crate::system_preferences::client_area_animations_enabled(),
-                visual_meter_active(snapshot),
+                snapshot,
             );
             let motion_changed = animations_enabled != refreshed_animations;
             animations_enabled = refreshed_animations;
             let step = transitions.tick(now, !animations_enabled);
             let hidden = matches!(step, TransitionStep::Hidden);
-            let progress_active = animations_enabled
-                && snapshot.requested_visible
-                && matches!(
-                    snapshot.state.phase,
-                    super::controller::OverlayPhase::Listening
-                        | super::controller::OverlayPhase::Preparing
-                        | super::controller::OverlayPhase::Finalizing
-                        | super::controller::OverlayPhase::Processing
-                        | super::controller::OverlayPhase::Pasting
-                );
-            if matches!(step, TransitionStep::Idle) && (progress_active || motion_changed) {
+            if worker_needs_snapshot(&step, snapshot, animations_enabled, motion_changed) {
                 process_snapshot(
                     &mut host,
                     snapshot,
@@ -1991,12 +1981,7 @@ fn run_native_overlay_thread(mailbox: Arc<SnapshotMailbox>, event_sink: NativeEv
         let wait = current_snapshot
             .as_ref()
             .map_or(OVERLAY_THREAD_IDLE_INTERVAL, |snapshot| {
-                transitions.next_wait(
-                    now,
-                    animations_enabled
-                        && snapshot.requested_visible
-                        && visual_meter_active(snapshot),
-                )
+                worker_next_wait(&transitions, now, snapshot, animations_enabled)
             });
         thread::park_timeout(wait);
     }
@@ -2008,23 +1993,44 @@ fn run_native_overlay_thread(mailbox: Arc<SnapshotMailbox>, event_sink: NativeEv
     emit_presented_if_changed(&event_sink, false, None, &mut last_presented);
 }
 
-fn visual_meter_active(snapshot: &OverlaySnapshot) -> bool {
+fn visual_animation_active(snapshot: &OverlaySnapshot) -> bool {
     snapshot.requested_visible
-        && snapshot.state.mode == super::controller::OverlayMode::Live
-        && matches!(
-            snapshot.state.phase,
-            super::controller::OverlayPhase::Listening
-                | super::controller::OverlayPhase::Finalizing
-        )
+        && snapshot.state.progress_animation_enabled
+        && ((snapshot.state.mode == super::controller::OverlayMode::Live
+            && matches!(
+                snapshot.state.phase,
+                super::controller::OverlayPhase::Listening
+                    | super::controller::OverlayPhase::Finalizing
+            ))
+            || snapshot.state.phase.is_progressing())
+}
+
+fn worker_needs_snapshot(
+    step: &TransitionStep,
+    snapshot: &OverlaySnapshot,
+    animations_enabled: bool,
+    motion_changed: bool,
+) -> bool {
+    matches!(step, TransitionStep::Idle)
+        && (animations_enabled && visual_animation_active(snapshot) || motion_changed)
+}
+
+fn worker_next_wait(
+    transitions: &OverlayTransitionEngine,
+    now: Instant,
+    snapshot: &OverlaySnapshot,
+    animations_enabled: bool,
+) -> Duration {
+    transitions.next_wait(now, animations_enabled && visual_animation_active(snapshot))
 }
 
 fn refresh_active_transition_motion(
     transitions: &OverlayTransitionEngine,
     animations_enabled: bool,
     current_preference: bool,
-    visual_progress_active: bool,
+    snapshot: &OverlaySnapshot,
 ) -> bool {
-    if transitions.is_active() || visual_progress_active {
+    if transitions.is_active() || visual_animation_active(snapshot) {
         current_preference
     } else {
         animations_enabled
@@ -2166,7 +2172,10 @@ fn overlay_animation_frame(
     animations_enabled: bool,
     transition_active: bool,
 ) -> u8 {
-    if !animations_enabled || (!snapshot.state.phase.is_progressing() && !transition_active) {
+    if !animations_enabled
+        || !snapshot.state.progress_animation_enabled
+        || (!snapshot.state.phase.is_progressing() && !transition_active)
+    {
         return 0;
     }
     let elapsed = SystemTime::now()
@@ -2633,10 +2642,11 @@ mod tests {
         let mut finalizing = listening;
         finalizing.state.phase = super::super::controller::OverlayPhase::Finalizing;
         finalizing.control_requested = false;
-        let _ = transitions.advance(finalizing, now + Duration::from_millis(1), false);
+        let _ = transitions.advance(finalizing.clone(), now + Duration::from_millis(1), false);
         assert!(transitions.is_active());
 
-        let animations_enabled = refresh_active_transition_motion(&transitions, true, false, true);
+        let animations_enabled =
+            refresh_active_transition_motion(&transitions, true, false, &finalizing);
         assert!(!animations_enabled);
         match transitions.tick(now + Duration::from_millis(2), !animations_enabled) {
             TransitionStep::Render(plan) => {
@@ -2656,7 +2666,9 @@ mod tests {
         let transitions = OverlayTransitionEngine::default();
         let mut snapshot = snapshot_for_test();
         snapshot.state.phase = super::super::controller::OverlayPhase::Processing;
-        let animations_enabled = refresh_active_transition_motion(&transitions, true, false, true);
+        assert!(visual_animation_active(&snapshot));
+        let animations_enabled =
+            refresh_active_transition_motion(&transitions, true, false, &snapshot);
         assert!(!animations_enabled);
         assert_eq!(
             overlay_animation_frame(&snapshot, animations_enabled, false),
@@ -2665,26 +2677,44 @@ mod tests {
     }
 
     #[test]
-    fn worker_meter_waits_at_33ms_only_for_live_listening_and_finalizing() {
+    fn worker_schedules_all_active_visual_animations_at_33ms() {
         let engine = OverlayTransitionEngine::default();
         let now = Instant::now();
 
-        for phase in [
-            super::super::controller::OverlayPhase::Listening,
-            super::super::controller::OverlayPhase::Finalizing,
+        for (mode, phase) in [
+            (
+                super::super::controller::OverlayMode::Live,
+                super::super::controller::OverlayPhase::Listening,
+            ),
+            (
+                super::super::controller::OverlayMode::Live,
+                super::super::controller::OverlayPhase::Finalizing,
+            ),
+            (
+                super::super::controller::OverlayMode::Minimal,
+                super::super::controller::OverlayPhase::Preparing,
+            ),
+            (
+                super::super::controller::OverlayMode::Minimal,
+                super::super::controller::OverlayPhase::Processing,
+            ),
+            (
+                super::super::controller::OverlayMode::Minimal,
+                super::super::controller::OverlayPhase::Pasting,
+            ),
         ] {
             let mut snapshot = snapshot_for_test();
-            snapshot.state.mode = super::super::controller::OverlayMode::Live;
+            snapshot.state.mode = mode;
             snapshot.state.phase = phase;
 
             assert!(
-                visual_meter_active(&snapshot),
-                "{phase:?} must advance meter decay"
+                visual_animation_active(&snapshot),
+                "{mode:?} {phase:?} must advance its visual animation"
             );
             assert_eq!(
-                engine.next_wait(now, visual_meter_active(&snapshot)),
+                worker_next_wait(&engine, now, &snapshot, true),
                 Duration::from_millis(33),
-                "{phase:?} must schedule the 30 fps meter tick"
+                "{mode:?} {phase:?} must schedule the 30 fps worker tick"
             );
         }
 
@@ -2695,11 +2725,7 @@ mod tests {
             ),
             (
                 super::super::controller::OverlayMode::Live,
-                super::super::controller::OverlayPhase::Preparing,
-            ),
-            (
-                super::super::controller::OverlayMode::Live,
-                super::super::controller::OverlayPhase::Processing,
+                super::super::controller::OverlayPhase::Success,
             ),
         ] {
             let mut snapshot = snapshot_for_test();
@@ -2707,13 +2733,88 @@ mod tests {
             snapshot.state.phase = phase;
 
             assert!(
-                !visual_meter_active(&snapshot),
+                !visual_animation_active(&snapshot),
                 "{mode:?} {phase:?} is static"
             );
             assert_eq!(
-                engine.next_wait(now, visual_meter_active(&snapshot)),
+                worker_next_wait(&engine, now, &snapshot, true),
                 Duration::from_millis(500),
                 "{mode:?} {phase:?} must not keep the worker awake"
+            );
+        }
+    }
+
+    #[test]
+    fn worker_refreshes_and_submits_static_frames_for_reduced_motion_in_steady_progress() {
+        let transitions = OverlayTransitionEngine::default();
+        let now = Instant::now();
+
+        for phase in [
+            super::super::controller::OverlayPhase::Processing,
+            super::super::controller::OverlayPhase::Pasting,
+        ] {
+            let mut snapshot = snapshot_for_test();
+            snapshot.state.phase = phase;
+            assert!(visual_animation_active(&snapshot));
+
+            let animations_enabled =
+                refresh_active_transition_motion(&transitions, true, false, &snapshot);
+            assert!(
+                !animations_enabled,
+                "{phase:?} must refresh reduced motion without the health interval"
+            );
+            assert_eq!(
+                worker_next_wait(&transitions, now, &snapshot, animations_enabled),
+                Duration::from_millis(500),
+                "{phase:?} must return to the idle interval under reduced motion"
+            );
+            assert!(
+                worker_needs_snapshot(&TransitionStep::Idle, &snapshot, animations_enabled, true),
+                "{phase:?} must submit one static frame for the preference change"
+            );
+            snapshot.state.progress_animation_enabled &= animations_enabled;
+            assert_eq!(
+                overlay_animation_frame(&snapshot, animations_enabled, false),
+                0,
+                "{phase:?} preference change must submit frame zero"
+            );
+        }
+    }
+
+    #[test]
+    fn disabled_progress_animation_keeps_steady_progress_static() {
+        let engine = OverlayTransitionEngine::default();
+        let transitions = OverlayTransitionEngine::default();
+        let now = Instant::now();
+
+        for phase in [
+            super::super::controller::OverlayPhase::Processing,
+            super::super::controller::OverlayPhase::Pasting,
+        ] {
+            let mut snapshot = snapshot_for_test();
+            snapshot.state.phase = phase;
+            snapshot.state.progress_animation_enabled = false;
+
+            assert!(!visual_animation_active(&snapshot));
+            assert_eq!(
+                worker_next_wait(&engine, now, &snapshot, true),
+                Duration::from_millis(500),
+                "{phase:?} must use the idle interval when the app opts out"
+            );
+            assert!(
+                refresh_active_transition_motion(&transitions, true, false, &snapshot),
+                "{phase:?} must not poll motion preferences when its animation is disabled"
+            );
+            assert!(!worker_needs_snapshot(
+                &TransitionStep::Idle,
+                &snapshot,
+                true,
+                false
+            ));
+            assert_eq!(
+                overlay_animation_frame(&snapshot, true, false),
+                0,
+                "{phase:?} must render statically when the app opts out"
             );
         }
     }
@@ -2739,7 +2840,8 @@ mod tests {
         // This mirrors the steady-worker branch: an OS preference change is
         // the single reason to submit a frame after the transition engine is
         // otherwise idle.
-        let animations_enabled = refresh_active_transition_motion(&transitions, true, false, true);
+        let animations_enabled =
+            refresh_active_transition_motion(&transitions, true, false, &listening);
         let motion_changed = !animations_enabled;
         assert!(!animations_enabled);
         assert!(motion_changed);
@@ -2748,20 +2850,12 @@ mod tests {
             TransitionStep::Idle
         ));
 
-        let progress_active = animations_enabled
-            && listening.requested_visible
-            && matches!(
-                listening.state.phase,
-                super::super::controller::OverlayPhase::Listening
-                    | super::super::controller::OverlayPhase::Preparing
-                    | super::super::controller::OverlayPhase::Finalizing
-                    | super::super::controller::OverlayPhase::Processing
-                    | super::super::controller::OverlayPhase::Pasting
-            );
-        let submits_for_preference_change = matches!(
-            transitions.tick(motion_change_at, true),
-            TransitionStep::Idle
-        ) && (progress_active || motion_changed);
+        let submits_for_preference_change = worker_needs_snapshot(
+            &transitions.tick(motion_change_at, true),
+            &listening,
+            animations_enabled,
+            motion_changed,
+        );
         assert!(submits_for_preference_change);
 
         let mut applied = listening.clone();
@@ -2776,13 +2870,19 @@ mod tests {
         // neither active progress nor a newly changed preference to submit.
         assert!(!animations_enabled);
         let motion_changed_after_application = animations_enabled
-            != refresh_active_transition_motion(&transitions, animations_enabled, false, true);
+            != refresh_active_transition_motion(
+                &transitions,
+                animations_enabled,
+                false,
+                &listening,
+            );
         assert!(!motion_changed_after_application);
-        let submits_after_preference_change = matches!(
-            transitions.tick(motion_change_at + Duration::from_millis(33), true),
-            TransitionStep::Idle
-        ) && (progress_active
-            || motion_changed_after_application);
+        let submits_after_preference_change = worker_needs_snapshot(
+            &transitions.tick(motion_change_at + Duration::from_millis(33), true),
+            &listening,
+            animations_enabled,
+            motion_changed_after_application,
+        );
         assert!(!submits_after_preference_change);
 
         let mut incoming_audio = listening;
