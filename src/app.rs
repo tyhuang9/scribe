@@ -5223,16 +5223,15 @@ impl LocalTranscriberApp {
         });
 
         if let Some((source, session_id, result)) = finished {
-            if let Some(capture_id) = self.controller_capture_id() {
-                if self
+            if let Some(capture_id) = self.controller_capture_id()
+                && self
                     .capture_controller
                     .handle()
                     .release(capture_id.0)
                     .is_ok()
-                    && self.capture_control_id == Some(capture_id)
-                {
-                    self.capture_control_id = None;
-                }
+                && self.capture_control_id == Some(capture_id)
+            {
+                self.capture_control_id = None;
             }
             let active = self
                 .active_recording
@@ -5374,8 +5373,14 @@ impl LocalTranscriberApp {
             {
                 continue;
             }
-            if let audio::control::HotkeyDispatch::Start(ticket) = observed.direct_dispatch {
-                self.pending_direct_capture = Some(ticket);
+            match observed.direct_dispatch {
+                audio::control::HotkeyDispatch::Start(ticket) => {
+                    self.pending_direct_capture = Some(ticket);
+                }
+                audio::control::HotkeyDispatch::Stop { capture_id } => {
+                    let _ = capture_id;
+                }
+                audio::control::HotkeyDispatch::None => {}
             }
             match hotkey_recording_action(
                 self.config.recording.hotkey_mode,

@@ -523,6 +523,7 @@ impl CaptureControlHandle {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn owner(&self) -> Option<AudioOwnerKind> {
         self.lock_state().owner.as_ref().map(|owner| owner.kind)
     }
@@ -587,7 +588,7 @@ fn request_abort(owner: &OwnerState) {
 fn spawn_release_reaper_thread(name: String, task: ReleaseReaperTask) -> Result<(), String> {
     thread::Builder::new()
         .name(name)
-        .spawn(move || task())
+        .spawn(task)
         .map(|_| ())
         .map_err(|error| error.to_string())
 }
