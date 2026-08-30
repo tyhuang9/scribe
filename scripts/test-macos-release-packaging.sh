@@ -9,7 +9,7 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 # platform grep when rg is unavailable.
 if ! command -v rg >/dev/null 2>&1; then
   rg() {
-    local mode='-E' argument
+    local mode='-E' argument status
     local -a arguments=()
     for argument in "$@"; do
       if [[ "$argument" == '-F' ]]; then
@@ -18,7 +18,10 @@ if ! command -v rg >/dev/null 2>&1; then
         arguments+=("$argument")
       fi
     done
-    command grep "$mode" "${arguments[@]}"
+    command grep "$mode" "${arguments[@]}" || {
+      status=$?
+      return "$status"
+    }
   }
 fi
 scripts=(build-macos-metal-worker-pack.sh build-macos-release.sh sign-notarize-macos-release.sh verify-macos-release-package.sh report-macos-worker-pack-sizes.sh)
