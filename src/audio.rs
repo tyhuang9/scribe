@@ -194,7 +194,14 @@ impl CaptureCancellation {
     }
 
     pub fn cancel(&self) {
+        self.cancel_startup();
         self.stop_requested.store(true, Ordering::Release);
+    }
+
+    /// Linearizes cancellation against the audio callback's first-sample
+    /// transition. A successful transition guarantees the callback cannot
+    /// subsequently activate this capture.
+    fn cancel_startup(&self) -> bool {
         let mut state = self.startup_state.load(Ordering::Acquire);
         while matches!(state, STARTUP_PENDING | STARTUP_PLAY_COMMITTED) {
             match self.startup_state.compare_exchange_weak(
@@ -203,10 +210,11 @@ impl CaptureCancellation {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => break,
+                Ok(_) => return true,
                 Err(current) => state = current,
             }
         }
+        state == STARTUP_CANCELLED
     }
 
     pub fn is_cancelled(&self) -> bool {
@@ -1426,6 +1434,8 @@ fn recording_dir() -> Result<std::path::PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Barrier;
+
     use super::*;
 
     struct CountingDetectorFactory {
@@ -1664,6 +1674,42 @@ mod tests {
 
         assert!(cancellation.startup_cancelled_before_first_sample());
         assert_eq!(consumer.pop(), None);
+    }
+
+    #[test]
+    fn concurrent_release_and_first_sample_have_one_atomic_winner() {
+        for _ in 0..1_000 {
+            let cancellation = CaptureCancellation::new();
+            cancellation.commit_play().unwrap();
+            let start = Arc::new(Barrier::new(3));
+
+            let cancel_thread = {
+                let cancellation = cancellation.clone();
+                let start = Arc::clone(&start);
+                thread::spawn(move || {
+                    start.wait();
+                    let cancelled_before_sample = cancellation.cancel_startup();
+                    cancellation.stop_requested.store(true, Ordering::Release);
+                    cancelled_before_sample
+                })
+            };
+            let callback_thread = {
+                let cancellation = cancellation.clone();
+                let start = Arc::clone(&start);
+                thread::spawn(move || {
+                    start.wait();
+                    cancellation.observe_first_sample()
+                })
+            };
+
+            start.wait();
+            let cancelled_before_sample = cancel_thread.join().unwrap();
+            let first_sample_observed = callback_thread.join().unwrap();
+            assert_ne!(
+                cancelled_before_sample, first_sample_observed,
+                "cancellation and first-sample activation must be mutually exclusive"
+            );
+        }
     }
 
     #[test]

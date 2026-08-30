@@ -270,12 +270,33 @@ impl CaptureControlHandle {
 
     pub(crate) fn dispatch_hotkey(&self, pressed: bool, observed_at: Instant) -> HotkeyDispatch {
         let mut state = self.lock_state();
-        if state.shutdown || !state.hotkey.enabled {
+        if state.shutdown {
             return HotkeyDispatch::None;
         }
         let Some(mode) = state.hotkey.mode else {
             return HotkeyDispatch::None;
         };
+        let should_stop = matches!(
+            (mode, pressed),
+            (CaptureHotkeyMode::HoldToTalk, false) | (CaptureHotkeyMode::Toggle, true)
+        );
+        if should_stop
+            && let Some(owner) = state
+                .owner
+                .as_ref()
+                .filter(|owner| owner.kind == AudioOwnerKind::Capture)
+        {
+            let capture_id = CaptureId(owner.id);
+            request_stop(owner);
+            let _ = self.command_tx.send(ControlCommand::Stop { capture_id });
+            return HotkeyDispatch::Stop { capture_id };
+        }
+
+        // Eligibility changes can suppress a new capture, but must never strand
+        // an existing controller-owned capture without its mode-correct Stop.
+        if !state.hotkey.enabled {
+            return HotkeyDispatch::None;
+        }
         let should_start = matches!(
             (mode, pressed, state.owner.as_ref()),
             (CaptureHotkeyMode::HoldToTalk, true, None) | (CaptureHotkeyMode::Toggle, true, None)
@@ -287,23 +308,7 @@ impl CaptureControlHandle {
             return self.start_locked(&mut state, AudioOwnerKind::Capture, observed_at, template);
         }
 
-        let should_stop = matches!(
-            (mode, pressed),
-            (CaptureHotkeyMode::HoldToTalk, false) | (CaptureHotkeyMode::Toggle, true)
-        );
-        if !should_stop {
-            return HotkeyDispatch::None;
-        }
-        let Some(owner) = state.owner.as_ref() else {
-            return HotkeyDispatch::None;
-        };
-        if owner.kind != AudioOwnerKind::Capture {
-            return HotkeyDispatch::None;
-        }
-        let capture_id = CaptureId(owner.id);
-        request_stop(owner);
-        let _ = self.command_tx.send(ControlCommand::Stop { capture_id });
-        HotkeyDispatch::Stop { capture_id }
+        HotkeyDispatch::None
     }
 
     pub(crate) fn start_capture(
@@ -743,6 +748,64 @@ mod tests {
             event
         });
         assert!(failed.is_some(), "release must cancel startup before ready");
+    }
+
+    fn disabled_reconfiguration_still_dispatches_stop(mode: CaptureHotkeyMode) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let controller = controller_with_counter(Arc::clone(&calls));
+        let handle = controller.handle();
+        handle
+            .reconfigure_hotkey(true, mode, 30, None, CaptureOptions::default())
+            .unwrap();
+        let HotkeyDispatch::Start(ticket) = handle.dispatch_hotkey(true, Instant::now()) else {
+            panic!("initial press should dispatch start");
+        };
+        for _ in 0..100 {
+            if calls.load(Ordering::Acquire) == 1 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+
+        handle
+            .reconfigure_hotkey(false, mode, 30, None, CaptureOptions::default())
+            .unwrap();
+        let stop_pressed = matches!(mode, CaptureHotkeyMode::Toggle);
+        assert!(matches!(
+            handle.dispatch_hotkey(stop_pressed, Instant::now()),
+            HotkeyDispatch::Stop { capture_id } if capture_id == ticket.capture_id
+        ));
+        let failed = (0..100).find_map(|_| {
+            let event = controller.poll_events().into_iter().find(|event| {
+                matches!(
+                    event,
+                    CaptureLifecycleEvent::Failed {
+                        capture_id,
+                        error: CaptureError::StartupCancelled,
+                        ..
+                    } if *capture_id == ticket.capture_id
+                )
+            });
+            if event.is_none() {
+                thread::sleep(Duration::from_millis(1));
+            }
+            event
+        });
+        assert!(
+            failed.is_some(),
+            "disabled reconfiguration must not strand capture"
+        );
+    }
+
+    #[test]
+    fn disabled_reconfiguration_keeps_hold_release_stop_eligible() {
+        disabled_reconfiguration_still_dispatches_stop(CaptureHotkeyMode::HoldToTalk);
+    }
+
+    #[test]
+    fn disabled_reconfiguration_keeps_toggle_stop_eligible() {
+        disabled_reconfiguration_still_dispatches_stop(CaptureHotkeyMode::Toggle);
     }
 
     #[test]

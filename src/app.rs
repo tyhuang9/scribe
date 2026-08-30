@@ -534,7 +534,6 @@ struct PendingRecording {
     max_duration_seconds: u32,
     latency: LatencyTrace,
     capture_diagnostics: CaptureDiagnosticContext,
-    cancellation: CaptureCancellation,
 }
 
 enum AbandonedCaptureCleanup {
@@ -4034,7 +4033,6 @@ impl LocalTranscriberApp {
         if let Some(pending) = self.pending_recording.take()
             && pending.session_id == session_id
         {
-            pending.cancellation.cancel();
             if let Some(capture_id) = self.capture_control_id.take() {
                 let _ = self.capture_controller.handle().abort(capture_id);
                 let _ = self.capture_controller.handle().release(capture_id.0);
@@ -4708,7 +4706,6 @@ impl LocalTranscriberApp {
             max_duration_seconds,
             latency,
             capture_diagnostics,
-            cancellation: CaptureCancellation::new(),
         });
         self.status = TranscriptionStatus::Listening;
         self.status_message = "Preparing microphone".to_owned();
@@ -5125,13 +5122,20 @@ impl LocalTranscriberApp {
             self.status_message = "Recording cancelled".to_owned();
             return;
         }
-        if let Some(pending) = self.pending_recording.as_mut()
-            && !pending.stop_requested
-        {
-            // This cancellation is the urgent release path. Before the first
-            // callback sample it prevents activation entirely; after the first
-            // sample it becomes the normal explicit stop with post-roll.
-            pending.cancellation.cancel();
+        let pending_capture_id = self
+            .pending_recording
+            .as_ref()
+            .and_then(|_| self.controller_capture_id());
+        if let Some(pending) = self.pending_recording.as_mut() {
+            // Direct hotkey dispatch may already have requested this Stop. The
+            // controller call is intentionally idempotent so UI/tray paths
+            // always target the same capture ID as the urgent path.
+            if let Some(capture_id) = pending_capture_id {
+                let _ = self.capture_controller.handle().stop(capture_id);
+            }
+            if pending.stop_requested {
+                return;
+            }
             let _ = self
                 .session_coordinator
                 .request_stop(pending.session_id, StopReason::Explicit);
@@ -15587,6 +15591,7 @@ mod layout_tests {
     #[test]
     fn explicit_stop_during_pending_capture_is_preserved() {
         let mut app = test_app();
+        let capture_id = install_cancellable_capture(&mut app);
         let session_id = app
             .session_coordinator
             .begin(SessionPurpose::Dictation)
@@ -15598,7 +15603,6 @@ mod layout_tests {
             max_duration_seconds: 30,
             latency: LatencyTrace::started_at(Instant::now(), TriggerObservation::HotkeyPoll),
             capture_diagnostics: CaptureDiagnosticContext::default(),
-            cancellation: CaptureCancellation::new(),
         });
 
         app.stop_recording();
@@ -15611,16 +15615,40 @@ mod layout_tests {
             Some(StopReason::Explicit)
         );
         assert_eq!(app.status_message, "Cancelling microphone startup");
+        let failed = (0..100).find_map(|_| {
+            let event = app
+                .capture_controller
+                .poll_events()
+                .into_iter()
+                .find(|event| {
+                    matches!(
+                        event,
+                        audio::control::CaptureLifecycleEvent::Failed {
+                            capture_id: failed_id,
+                            error: CaptureError::StartupCancelled,
+                            ..
+                        } if *failed_id == capture_id
+                    )
+                });
+            if event.is_none() {
+                thread::sleep(Duration::from_millis(1));
+            }
+            event
+        });
+        assert!(
+            failed.is_some(),
+            "pending Stop must cancel the controller capture"
+        );
     }
 
     #[test]
     fn abandon_pending_capture_is_session_correlated_and_cancels_startup() {
         let mut app = test_app();
+        install_cancellable_capture(&mut app);
         let session_id = app
             .session_coordinator
             .begin(SessionPurpose::Dictation)
             .unwrap();
-        let cancellation = CaptureCancellation::new();
         app.pending_recording = Some(PendingRecording {
             session_id,
             source: RecordingSource::Transcribe,
@@ -15628,12 +15656,13 @@ mod layout_tests {
             max_duration_seconds: 30,
             latency: LatencyTrace::started_at(Instant::now(), TriggerObservation::AppAction),
             capture_diagnostics: CaptureDiagnosticContext::default(),
-            cancellation: cancellation.clone(),
         });
         app.abandon_recording(SessionId(session_id.0 + 1));
-        assert!(!cancellation.is_cancelled());
+        assert_eq!(
+            app.capture_controller.handle().owner(),
+            Some(audio::control::AudioOwnerKind::Capture)
+        );
         app.abandon_recording(session_id);
-        assert!(cancellation.is_cancelled());
         assert!(app.pending_recording.is_none());
         assert_eq!(app.status_message, "Recording discarded.");
         assert_eq!(app.session_coordinator.active_session_id(), None);
@@ -15652,7 +15681,6 @@ mod layout_tests {
             SessionPurpose::Dictation,
             std::iter::empty(),
         );
-        let cancellation = CaptureCancellation::new();
         app.pending_recording = Some(PendingRecording {
             session_id,
             source: RecordingSource::Transcribe,
@@ -15660,12 +15688,10 @@ mod layout_tests {
             max_duration_seconds: 30,
             latency: LatencyTrace::started_at(Instant::now(), TriggerObservation::AppAction),
             capture_diagnostics: CaptureDiagnosticContext::default(),
-            cancellation: cancellation.clone(),
         });
 
         app.abandon_recording(session_id);
 
-        assert!(!cancellation.is_cancelled());
         assert!(app.pending_recording.is_some());
         assert_eq!(
             app.session_coordinator.phase(),
@@ -15688,7 +15714,6 @@ mod layout_tests {
             max_duration_seconds: 30,
             latency: LatencyTrace::started_at(Instant::now(), TriggerObservation::AppAction),
             capture_diagnostics: CaptureDiagnosticContext::default(),
-            cancellation: CaptureCancellation::new(),
         });
         app.abandon_recording(session_id);
         app.tx
@@ -15868,7 +15893,6 @@ mod layout_tests {
             max_duration_seconds: 30,
             latency: LatencyTrace::started_at(Instant::now(), TriggerObservation::HotkeyPoll),
             capture_diagnostics: CaptureDiagnosticContext::default(),
-            cancellation: CaptureCancellation::new(),
         });
 
         app.stop_recording();
@@ -15939,7 +15963,6 @@ mod layout_tests {
             max_duration_seconds: 30,
             latency: LatencyTrace::started_at(Instant::now(), TriggerObservation::HotkeyPoll),
             capture_diagnostics: CaptureDiagnosticContext::default(),
-            cancellation: CaptureCancellation::new(),
         });
 
         app.tx
@@ -15992,7 +16015,6 @@ mod layout_tests {
                 max_duration_seconds: 30,
                 latency: LatencyTrace::started_at(Instant::now(), TriggerObservation::HotkeyPoll),
                 capture_diagnostics: CaptureDiagnosticContext::default(),
-                cancellation: CaptureCancellation::new(),
             });
             app.tx
                 .send(AppEvent::CaptureReady {
@@ -16235,7 +16257,6 @@ mod layout_tests {
             max_duration_seconds: 30,
             latency: LatencyTrace::started_at(Instant::now(), TriggerObservation::AppAction),
             capture_diagnostics: CaptureDiagnosticContext::default(),
-            cancellation: CaptureCancellation::new(),
         });
         assert_eq!(app.next_repaint_delay(), METER_REPAINT_DELAY);
     }
@@ -16574,7 +16595,6 @@ mod layout_tests {
             max_duration_seconds: 30,
             latency: LatencyTrace::started_at(Instant::now(), TriggerObservation::AppAction),
             capture_diagnostics: CaptureDiagnosticContext::from_config(&app.config),
-            cancellation: CaptureCancellation::new(),
         });
 
         app.apply_settings_screen_action(ScreenAction::SetInputThresholdDbfs(-24));
@@ -16612,7 +16632,6 @@ mod layout_tests {
             max_duration_seconds: 30,
             latency: LatencyTrace::started_at(Instant::now(), TriggerObservation::AppAction),
             capture_diagnostics: CaptureDiagnosticContext::from_config(&app.config),
-            cancellation: CaptureCancellation::new(),
         });
         app.config.recording.speech_detection_mode = SpeechDetectionMode::ManualThreshold;
         app.config.recording.input_threshold_dbfs = -24.0;
@@ -16731,7 +16750,6 @@ mod layout_tests {
                 max_duration_seconds: 30,
                 latency: LatencyTrace::started_at(Instant::now(), TriggerObservation::HotkeyPoll),
                 capture_diagnostics: CaptureDiagnosticContext::default(),
-                cancellation: CaptureCancellation::new(),
             });
             let preload_event = AppEvent::ModelPreloadFinished {
                 session_id,
@@ -19982,6 +20000,31 @@ mod layout_tests {
             reload_duration_ms: 0,
             cancellation_verified: false,
         }
+    }
+
+    fn install_cancellable_capture(app: &mut LocalTranscriberApp) -> audio::CaptureId {
+        app.capture_controller = audio::control::CaptureController::with_start_capture_for_test(
+            Arc::new(|_request, cancellation| {
+                while !cancellation.is_cancelled() {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(CaptureError::StartupCancelled)
+            }),
+        )
+        .unwrap();
+        let ticket = app
+            .capture_controller
+            .handle()
+            .start_capture(
+                audio::control::AudioOwnerKind::Capture,
+                Instant::now(),
+                30,
+                None,
+                audio::CaptureOptions::default(),
+            )
+            .unwrap();
+        app.capture_control_id = Some(ticket.capture_id);
+        ticket.capture_id
     }
 
     fn test_app() -> LocalTranscriberApp {
