@@ -728,7 +728,7 @@ impl StableManagedDirectory {
     #[cfg(windows)]
     fn remove_exact_tree(self) -> Result<(), InstallError> {
         self.revalidate_path_identity()?;
-        remove_open_directory_contents(&self.path)?;
+        remove_open_directory_contents(&self.directory, &self.path)?;
         mark_open_windows_directory_for_delete(&self.directory)?;
         let Self {
             path,
@@ -1982,51 +1982,70 @@ fn mark_open_windows_directory_for_delete(directory: &File) -> Result<(), Instal
 }
 
 #[cfg(windows)]
-fn remove_open_directory_contents(root: &Path) -> Result<(), InstallError> {
-    let entries = fs::read_dir(root).map_err(|error| {
+fn open_windows_entry_for_delete(path: &Path) -> Result<(File, fs::Metadata), InstallError> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, SYNCHRONIZE,
+    };
+
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .access_mode(DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+    let file = options.open(path).map_err(|error| {
         failed(format!(
-            "failed to enumerate opened managed directory {}: {error}",
-            root.display()
+            "failed to open managed deletion entry {}: {error}",
+            path.display()
         ))
     })?;
-    for entry in entries {
-        let path = entry
-            .map_err(|error| {
+    let metadata = file.metadata().map_err(|error| {
+        failed(format!(
+            "failed to inspect opened managed deletion entry {}: {error}",
+            path.display()
+        ))
+    })?;
+    Ok((file, metadata))
+}
+
+#[cfg(windows)]
+fn remove_open_directory_contents(_directory: &File, root: &Path) -> Result<(), InstallError> {
+    let paths = fs::read_dir(root)
+        .map_err(|error| {
+            failed(format!(
+                "failed to enumerate opened managed directory {}: {error}",
+                root.display()
+            ))
+        })?
+        .map(|entry| {
+            entry.map(|entry| entry.path()).map_err(|error| {
                 failed(format!(
                     "failed to enumerate opened managed directory {}: {error}",
                     root.display()
                 ))
-            })?
-            .path();
-        let metadata = fs::symlink_metadata(&path)
-            .map_err(|error| failed(format!("failed to inspect {}: {error}", path.display())))?;
-        if runtime_metadata_is_link_or_reparse(&metadata) {
-            let result = if metadata.is_dir() {
-                fs::remove_dir(&path)
-            } else {
-                fs::remove_file(&path)
-            };
-            result.map_err(|error| {
-                failed(format!(
-                    "failed to remove non-followed link {}: {error}",
-                    path.display()
-                ))
-            })?;
-        } else if metadata.is_dir() {
-            remove_open_directory_contents(&path)?;
-            fs::remove_dir(&path).map_err(|error| {
-                failed(format!(
-                    "failed to remove directory {}: {error}",
-                    path.display()
-                ))
-            })?;
-        } else if metadata.is_file() {
-            fs::remove_file(&path).map_err(|error| {
-                failed(format!("failed to remove file {}: {error}", path.display()))
-            })?;
-        } else {
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    for path in paths {
+        let (entry, metadata) = open_windows_entry_for_delete(&path)?;
+        if metadata.is_dir() && !runtime_metadata_is_link_or_reparse(&metadata) {
+            remove_open_directory_contents(&entry, &path)?;
+        } else if !metadata.is_dir()
+            && !metadata.is_file()
+            && !runtime_metadata_is_link_or_reparse(&metadata)
+        {
             return Err(failed(format!(
                 "opened managed directory contains an unsupported entry: {}",
+                path.display()
+            )));
+        }
+        mark_open_windows_directory_for_delete(&entry)?;
+        drop(entry);
+        if path_entry_exists_no_follow(&path)? {
+            return Err(InstallError::RecoveryRequired(format!(
+                "opened managed deletion entry remained after delete-on-close: {}",
                 path.display()
             )));
         }
