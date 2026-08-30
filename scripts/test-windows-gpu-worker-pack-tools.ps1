@@ -149,7 +149,9 @@ $toolchainFixtureRoot = Join-Path `
 New-Item -ItemType Directory -Path $toolchainFixtureRoot | Out-Null
 try {
     $wrongHashContract = Get-Content -LiteralPath $toolchainManifest -Raw | ConvertFrom-Json
-    $wrongHashContract.msvc.payload_profiles[0].tools.cl.sha256 = '0' * 64
+    foreach ($profile in @($wrongHashContract.msvc.payload_profiles)) {
+        $profile.tools.cl.sha256 = '0' * 64
+    }
     $wrongHashPath = Join-Path $toolchainFixtureRoot 'wrong-cl-hash.json'
     [System.IO.File]::WriteAllText(
         $wrongHashPath,

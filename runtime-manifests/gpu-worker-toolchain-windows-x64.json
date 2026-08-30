@@ -53,6 +53,31 @@
             "sha256": "9260ff1dfd350bb07e84e9f0d2b7e6ecb8155562f82d14a5cd2c2080952e4ae2"
           }
         }
+      },
+      {
+        "profile_id": "msvc-14.44.35228-hosted",
+        "tools": {
+          "cl": {
+            "filename": "cl.exe",
+            "file_version": "19.44.35228.0",
+            "sha256": "88c8344236a27a6e727e0a8edc49aaa2690bdc7a9464b9d18cc7abe70a9f1c0d"
+          },
+          "link": {
+            "filename": "link.exe",
+            "file_version": "14.44.35228.0",
+            "sha256": "ca11e6c45debd34bf652dfe984c5360a531a005ed78bf72852330c9c2590cf0d"
+          },
+          "lib": {
+            "filename": "lib.exe",
+            "file_version": "14.44.35228.0",
+            "sha256": "3d694c782f93e998fec5db0c2df78153565da23a028ee4618561fa0c33408489"
+          },
+          "nmake": {
+            "filename": "nmake.exe",
+            "file_version": "14.44.35228.0",
+            "sha256": "b05f089f67dba8df1d7cc38798b71e62a6ce8881b234dcfc80a657264597626c"
+          }
+        }
       }
     ],
     "cmake_version": "4.4.2",
