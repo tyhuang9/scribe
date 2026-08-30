@@ -461,7 +461,7 @@ fn stage_six_macos_verified_launch_is_descriptor_bound_and_command_free() {
     assert!(pack.contains("catalog_matches_release_authority"));
     assert!(pack.contains("EMBEDDED_PACK_RELEASE_AUTHORITY"));
     assert!(
-        pack.find("catalog_matches_release_authority(&catalog.bytes")
+        pack.find("validated_release_authority(&catalog.bytes")
             < pack.find("PRODUCTION_DISCOVERY_CACHE.get_or_init"),
         "signed release authority must be checked before catalog cache lookup"
     );
@@ -475,6 +475,104 @@ fn stage_six_macos_verified_launch_is_descriptor_bound_and_command_free() {
     assert!(packaging.contains("CPU/UI binary must not load Metal.framework"));
     assert!(packaging.contains("catalog Metal worker has no Metal load command"));
     assert!(packaging.contains("desktop does not embed the exact pack-catalog authority"));
+}
+
+#[test]
+fn macos_device_release_epoch_authority_is_bounded_append_only_and_pre_launch() {
+    let pack = production_source(include_str!("gpu_worker_pack/mod.rs"));
+    let authority = production_source(include_str!("gpu_worker_pack/device_release_epoch.rs"));
+    let native = include_str!("../native/scribe_macos_keychain_epoch.c");
+    let header = include_str!("../native/scribe_macos_keychain_epoch.h");
+    let build = include_str!("../build.rs");
+
+    for required in [
+        "release_security_epoch",
+        "keychain_access_group",
+        "schema_version != 2",
+        "DeviceRollbackAuthorityRejected",
+        "SCRIBE_MACOS_GPU_ROLLBACK_KEYCHAIN_ACCESS_GROUP",
+        "device_release_epoch::admit",
+    ] {
+        assert!(
+            pack.contains(required),
+            "release authority lost {required:?}"
+        );
+    }
+    let authority_validation = pack
+        .find("validated_release_authority(&catalog.bytes")
+        .expect("exact release authority validation must exist");
+    let cache_lookup = pack
+        .find("PRODUCTION_DISCOVERY_CACHE.get_or_init")
+        .expect("bounded discovery cache must exist");
+    let cached_admission = pack
+        .find("enforce_production_discovery_epochs(discovery, &release_authority)")
+        .expect("cached device admission must exist");
+    let fresh_verification = pack
+        .find("verify_catalog_entries(install_root")
+        .expect("fresh pack verification must exist");
+    let fresh_admission = pack
+        .rfind("enforce_production_discovery_epochs(discovery, &release_authority)")
+        .expect("fresh device admission must exist");
+    assert!(
+        authority_validation < cache_lookup
+            && cache_lookup < cached_admission
+            && fresh_verification < fresh_admission,
+        "device authority must follow exact signed authority/pack verification on cached and fresh paths"
+    );
+
+    for required in [
+        "scan_floor(store)",
+        "store.append(&EpochMarker::canonical(candidate))",
+        "let final_floor = scan_floor(store)",
+        "MAX_MARKERS",
+        "OnceLock<Client>",
+        "sync_channel(1)",
+        "try_send",
+        "recv_timeout",
+    ] {
+        assert!(
+            authority.contains(required),
+            "bounded authority lost {required:?}"
+        );
+    }
+    for required in [
+        "kSecUseDataProtectionKeychain",
+        "kSecAttrSynchronizable",
+        "kCFBooleanFalse",
+        "kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly",
+        "kSecAttrAccessGroup",
+        "kSecAttrService",
+        "kSecMatchLimitAll",
+        "kSecReturnAttributes",
+        "kSecReturnData",
+        "errSecItemNotFound",
+        "errSecDuplicateItem",
+        "SecItemCopyMatching",
+        "SecItemAdd",
+    ] {
+        assert!(native.contains(required), "Keychain shim lost {required:?}");
+    }
+    for forbidden in ["SecItemUpdate", "SecItemDelete"] {
+        assert!(
+            !native.contains(forbidden),
+            "Keychain shim regained {forbidden}"
+        );
+        assert!(
+            !header.contains(forbidden),
+            "Keychain API regained {forbidden}"
+        );
+    }
+    for required in [
+        "native/scribe_macos_keychain_epoch.c",
+        "framework=Security",
+        "SCRIBE_MACOS_GPU_ROLLBACK_KEYCHAIN_ACCESS_GROUP",
+        "scribe_macos_keychain_authority",
+    ] {
+        assert!(
+            build.contains(required),
+            "macOS build contract lost {required:?}"
+        );
+    }
 }
 
 #[test]
