@@ -48,7 +48,9 @@ grep -F '<string>${SCRIBE_MACOS_GPU_ROLLBACK_KEYCHAIN_ACCESS_GROUP}</string>' "$
 grep -F '<key>com.apple.application-identifier</key>' "$repo_root/installer/macos/Scribe.protected.entitlements.template" >/dev/null || { echo 'protected entitlement template must bind the application identifier.' >&2; exit 1; }
 grep -F '<string>${SCRIBE_MACOS_GPU_ROLLBACK_TEAM_IDENTIFIER}</string>' "$repo_root/installer/macos/Scribe.protected.entitlements.template" >/dev/null || { echo 'protected entitlement template must bind the team identifier.' >&2; exit 1; }
 embed_line="$(grep -En 'embedded\.provisionprofile' "$repo_root/scripts/build-macos-release.sh" | head -n 1 | cut -d: -f1)"
-sign_line="$(grep -En 'codesign --force --sign .*"[$]app"' "$repo_root/scripts/build-macos-release.sh" | tail -n 1 | cut -d: -f1)"
+grep -F 'codesign_args=(--force --sign "$identity" --options runtime)' "$repo_root/scripts/build-macos-release.sh" >/dev/null || { echo 'release signing arguments must always include the hardened runtime options.' >&2; exit 1; }
+grep -F 'if [[ "$signing_mode" == developer-id ]]; then codesign_args+=(--timestamp); fi' "$repo_root/scripts/build-macos-release.sh" >/dev/null || { echo 'Developer ID signing must request a trusted timestamp.' >&2; exit 1; }
+sign_line="$(grep -Fn 'codesign "${codesign_args[@]}" --entitlements "$desktop_entitlements" "$app"' "$repo_root/scripts/build-macos-release.sh" | tail -n 1 | cut -d: -f1)"
 [[ "$embed_line" =~ ^[0-9]+$ && "$sign_line" =~ ^[0-9]+$ && "$embed_line" -lt "$sign_line" ]] || { echo 'provisioning profile must be embedded before final app signing.' >&2; exit 1; }
 structural_job="$(sed -n '/^  structural:/,/^  official-sign-notarize:/p' "$repo_root/.github/workflows/macos-release.yml")"
 ! grep -F 'secrets.' <<<"$structural_job" >/dev/null || { echo 'pull-request structural job must not receive production secrets.' >&2; exit 1; }
