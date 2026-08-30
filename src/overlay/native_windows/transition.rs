@@ -667,6 +667,14 @@ mod tests {
     }
 
     #[test]
+    fn active_lifecycle_transition_uses_the_frame_interval() {
+        let at = Instant::now();
+        let mut engine = OverlayTransitionEngine::default();
+        let _ = engine.advance(snapshot(OverlayPhase::Preparing), at, false);
+        assert_eq!(engine.next_wait(at, false), FRAME_INTERVAL);
+    }
+
+    #[test]
     fn semantic_transition_never_changes_the_fixed_shell_bounds() {
         let at = Instant::now();
         let mut engine = OverlayTransitionEngine::default();
