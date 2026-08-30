@@ -106,6 +106,7 @@ impl Pipeline {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn with_preview_publisher(
         mut self,
         publisher: Option<PreviewAudioPublisher>,
