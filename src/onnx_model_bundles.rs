@@ -384,34 +384,38 @@ fn validate_family_layout(bundle: &OnnxBundleManifest) -> Result<(), InstallErro
         .iter()
         .filter_map(|file| file.role.runtime_role())
         .collect::<BTreeSet<_>>();
-    let expected = match bundle.family {
-        OnnxModelFamily::Moonshine => [
-            OnnxFileRole::Encoder,
-            OnnxFileRole::MergedDecoder,
-            OnnxFileRole::Tokens,
-        ]
-        .into_iter()
-        .collect(),
-        OnnxModelFamily::NemoCtc => [OnnxFileRole::Model, OnnxFileRole::Tokens]
-            .into_iter()
-            .collect(),
-        OnnxModelFamily::Canary => [
+    let expected_layouts: &[&[OnnxFileRole]] = match bundle.family {
+        OnnxModelFamily::Moonshine => &[
+            &[
+                OnnxFileRole::Encoder,
+                OnnxFileRole::MergedDecoder,
+                OnnxFileRole::Tokens,
+            ],
+            &[
+                OnnxFileRole::Preprocessor,
+                OnnxFileRole::Encoder,
+                OnnxFileRole::UncachedDecoder,
+                OnnxFileRole::CachedDecoder,
+                OnnxFileRole::Tokens,
+            ],
+        ],
+        OnnxModelFamily::NemoCtc => &[&[OnnxFileRole::Model, OnnxFileRole::Tokens]],
+        OnnxModelFamily::Canary => &[&[
             OnnxFileRole::Encoder,
             OnnxFileRole::Decoder,
             OnnxFileRole::Tokens,
-        ]
-        .into_iter()
-        .collect(),
-        OnnxModelFamily::OfflineTransducer | OnnxModelFamily::OnlineTransducer => [
+        ]],
+        OnnxModelFamily::OfflineTransducer | OnnxModelFamily::OnlineTransducer => &[&[
             OnnxFileRole::Encoder,
             OnnxFileRole::Decoder,
             OnnxFileRole::Joiner,
             OnnxFileRole::Tokens,
-        ]
-        .into_iter()
-        .collect(),
+        ]],
     };
-    if roles != expected {
+    if !expected_layouts
+        .iter()
+        .any(|expected| roles == expected.iter().copied().collect())
+    {
         return Err(failed(format!(
             "ONNX bundle {} has the wrong typed role layout for {:?}",
             bundle.id, bundle.family
@@ -1965,10 +1969,10 @@ mod tests {
     }
 
     #[test]
-    fn embedded_catalog_has_exact_first_wave_evidence() {
+    fn embedded_catalog_has_exact_private_bundle_evidence() {
         let catalog = parse_catalog(CATALOG_BYTES).unwrap();
-        assert_eq!(catalog.bundles.len(), 4);
-        assert_eq!(available_bundle_manifests().count(), 3);
+        assert_eq!(catalog.bundles.len(), 6);
+        assert_eq!(available_bundle_manifests().count(), 5);
         let moonshine = bundle_manifest("moonshine-tiny-en-int8-onnx").unwrap();
         assert_eq!(
             moonshine.revision,
@@ -1989,6 +1993,139 @@ mod tests {
         let parakeet = bundle_manifest("parakeet-tdt-ctc-110m-en-int8-onnx").unwrap();
         assert_eq!(parakeet.availability, BundleAvailability::Unavailable);
         assert!(parakeet.files.is_empty());
+
+        let moonshine_base = bundle_manifest("moonshine-base-en-int8-onnx").unwrap();
+        assert_eq!(moonshine_base.availability, BundleAvailability::Available);
+        assert_eq!(
+            moonshine_base.repository,
+            "csukuangfj/sherpa-onnx-moonshine-base-en-int8"
+        );
+        assert_eq!(
+            moonshine_base.revision,
+            "052b0798ad1bf046a140fdd4efcd9426530fa3f5"
+        );
+        assert_eq!(moonshine_base.family, OnnxModelFamily::Moonshine);
+        assert_eq!(moonshine_base.num_threads, 2);
+        assert_eq!(
+            moonshine_base
+                .files
+                .iter()
+                .map(|file| file.role)
+                .collect::<Vec<_>>(),
+            [
+                BundleFileRole::Preprocessor,
+                BundleFileRole::Encoder,
+                BundleFileRole::UncachedDecoder,
+                BundleFileRole::CachedDecoder,
+                BundleFileRole::Tokens,
+                BundleFileRole::License,
+            ]
+        );
+        assert_eq!(
+            moonshine_base
+                .files
+                .iter()
+                .filter(|file| file.role != BundleFileRole::License)
+                .map(|file| file.size_bytes)
+                .sum::<u64>(),
+            286_929_760
+        );
+        assert_eq!(
+            moonshine_base
+                .files
+                .iter()
+                .map(|file| file.size_bytes)
+                .sum::<u64>(),
+            286_930_831
+        );
+        assert_eq!(moonshine_base.license.spdx, "MIT");
+        assert_eq!(moonshine_base.license.copyright, "Useful Sensors, 2024");
+        assert_eq!(
+            moonshine_base.license.source_repository,
+            "usefulsensors/moonshine"
+        );
+        assert_eq!(moonshine_base.license.source_revision, None);
+        let moonshine_base_spec = spec_from_parts(
+            &moonshine_base.id,
+            PathBuf::from("bundle"),
+            moonshine_base.family,
+            moonshine_base.num_threads,
+            &moonshine_base.files,
+        )
+        .unwrap();
+        assert_eq!(moonshine_base_spec.family, OnnxModelFamily::Moonshine);
+        assert_eq!(moonshine_base_spec.files.len(), 5);
+        assert!(
+            moonshine_base_spec
+                .files
+                .contains_key(&OnnxFileRole::Preprocessor)
+        );
+        assert!(
+            moonshine_base_spec
+                .files
+                .contains_key(&OnnxFileRole::UncachedDecoder)
+        );
+        assert!(
+            moonshine_base_spec
+                .files
+                .contains_key(&OnnxFileRole::CachedDecoder)
+        );
+
+        let parakeet_tdt = bundle_manifest("parakeet-tdt-06b-v2-en-int8-onnx").unwrap();
+        assert_eq!(parakeet_tdt.availability, BundleAvailability::Available);
+        assert_eq!(
+            parakeet_tdt.repository,
+            "csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8"
+        );
+        assert_eq!(
+            parakeet_tdt.revision,
+            "1ab9323565ddb038682214b292f588070a538ce2"
+        );
+        assert_eq!(parakeet_tdt.family, OnnxModelFamily::OfflineTransducer);
+        assert_eq!(parakeet_tdt.num_threads, 2);
+        assert_eq!(
+            parakeet_tdt
+                .files
+                .iter()
+                .map(|file| file.role)
+                .collect::<Vec<_>>(),
+            [
+                BundleFileRole::Encoder,
+                BundleFileRole::Decoder,
+                BundleFileRole::Joiner,
+                BundleFileRole::Tokens,
+            ]
+        );
+        assert_eq!(
+            parakeet_tdt
+                .files
+                .iter()
+                .map(|file| file.size_bytes)
+                .sum::<u64>(),
+            661_190_513
+        );
+        assert_eq!(parakeet_tdt.license.spdx, "CC-BY-4.0");
+        assert_eq!(parakeet_tdt.license.copyright, "NVIDIA Corporation");
+        assert_eq!(
+            parakeet_tdt.license.source_repository,
+            "nvidia/parakeet-tdt-0.6b-v2"
+        );
+        assert_eq!(parakeet_tdt.license.source_revision, None);
+        let parakeet_tdt_spec = spec_from_parts(
+            &parakeet_tdt.id,
+            PathBuf::from("bundle"),
+            parakeet_tdt.family,
+            parakeet_tdt.num_threads,
+            &parakeet_tdt.files,
+        )
+        .unwrap();
+        assert_eq!(parakeet_tdt_spec.family, OnnxModelFamily::OfflineTransducer);
+        assert_eq!(parakeet_tdt_spec.files.len(), 4);
+        assert!(parakeet_tdt_spec.files.contains_key(&OnnxFileRole::Encoder));
+        assert!(parakeet_tdt_spec.files.contains_key(&OnnxFileRole::Decoder));
+        assert!(parakeet_tdt_spec.files.contains_key(&OnnxFileRole::Joiner));
+        assert!(parakeet_tdt_spec.files.contains_key(&OnnxFileRole::Tokens));
+
         let canary = bundle_manifest("canary-180m-flash-int8-onnx").unwrap();
         assert_eq!(canary.capability.languages, ["en"]);
         assert!(!canary.capability.native_streaming);
@@ -2017,6 +2154,40 @@ mod tests {
             catalog.runtime.source_revision,
             "3dc7c569f31ca2cd4a20ed6f7db780327e6714c5"
         );
+    }
+
+    #[test]
+    fn moonshine_family_layout_accepts_only_merged_or_v1_roles() {
+        let catalog = parse_catalog(CATALOG_BYTES).unwrap();
+        let merged = catalog
+            .bundles
+            .iter()
+            .find(|bundle| bundle.id == "moonshine-tiny-en-int8-onnx")
+            .unwrap();
+        let v1 = catalog
+            .bundles
+            .iter()
+            .find(|bundle| bundle.id == "moonshine-base-en-int8-onnx")
+            .unwrap();
+        assert!(validate_family_layout(merged).is_ok());
+        assert!(validate_family_layout(v1).is_ok());
+
+        let mut partial = v1.clone();
+        partial
+            .files
+            .retain(|file| file.role != BundleFileRole::CachedDecoder);
+        assert!(validate_family_layout(&partial).is_err());
+
+        let mut hybrid = v1.clone();
+        hybrid.files.push(
+            merged
+                .files
+                .iter()
+                .find(|file| file.role == BundleFileRole::MergedDecoder)
+                .unwrap()
+                .clone(),
+        );
+        assert!(validate_family_layout(&hybrid).is_err());
     }
 
     #[test]
