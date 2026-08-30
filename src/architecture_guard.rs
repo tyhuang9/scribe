@@ -244,28 +244,25 @@ fn production_pack_provisioning_allowed(
         .contains("fn discover_production_pack_launch_bindings(")
         && worker.contains("impl ResolverHelloBindingBridge for")
         && worker.contains("fn resolver_verified_pack_lease(&self) -> Arc<VerifiedPackLease>")
-        && worker.contains("fn launch_worker_from_verified_pack_lease(")
+        && worker.contains("from_verified_pack_lease")
+        && worker.contains("launch_verified_worker")
         && worker.contains("VerifiedPackLaunchBinding::try_from_resolver_hello_bridge")
         && worker.contains("trait WorkerExecutableResolver")
         && worker.contains("Hello");
-    let unix_launch_bodies =
-        named_function_bodies(worker, "launch_worker_from_verified_pack_lease").join("\n");
-    let unix_authority_constructor = named_function_bodies(
-        worker,
-        "open_unix_pack_exec_authority_from_verified_pack_lease",
-    )
-    .join("\n");
+    let unix_launch_bodies = named_function_bodies(worker, "launch_verified_worker").join("\n");
+    let unix_authority_constructor =
+        named_function_bodies(worker, "from_verified_pack_lease").join("\n");
     let unix_fd_launch_flow = !unix_target
         || (worker.contains("UnixPackExecAuthority")
             && worker.contains("resolver_unix_launch_authority")
             && worker.contains("executable_fd")
             && worker.contains("dependency_root_fd")
-            && worker.contains(
-                "fn open_unix_pack_exec_authority_from_verified_pack_lease(lease: &VerifiedPackLease)",
-            )
-            && unix_authority_constructor.contains("openat")
+            && unix_authority_constructor.contains("open_copy_file")
+            && unix_authority_constructor.contains("hash_exact_length")
             && (unix_launch_bodies.contains("execveat")
-                || unix_launch_bodies.contains("fexecve"))
+                || unix_launch_bodies.contains("fexecve")
+                || (unix_launch_bodies.contains("posix_spawn")
+                    && unix_launch_bodies.contains("/dev/fd/")))
             && !unix_launch_bodies.contains("Command::spawn")
             && !unix_launch_bodies.contains("Command::new"));
     (registry_is_empty && trust_root_is_empty)
@@ -329,7 +326,8 @@ fn stage_four_guard_rejects_dead_binding_declarations() {
         struct Arc<T>(T);
         impl ResolverHelloBindingBridge for ConcreteResolverHelloBridge {}
         fn resolver_verified_pack_lease(&self) -> Arc<VerifiedPackLease> {}
-        fn launch_worker_from_verified_pack_lease(lease: Arc<VerifiedPackLease>) {}
+        fn from_verified_pack_lease(lease: Arc<VerifiedPackLease>) { open_copy_file(); hash_exact_length(); }
+        fn launch_verified_worker() {}
         fn discover_production_pack_launch_bindings() {
             VerifiedPackLaunchBinding::try_from_resolver_hello_bridge(&bridge);
         }
@@ -341,7 +339,7 @@ fn stage_four_guard_rejects_dead_binding_declarations() {
         false,
     ));
     let raw_path_spawn_flow = format!(
-        "{concrete_flow}\nfn launch_worker_from_verified_pack_lease(path: PathBuf, lease: Arc<VerifiedPackLease>) {{ Command::new(path).spawn(); }}"
+        "{concrete_flow}\nfn launch_verified_worker(path: PathBuf, lease: Arc<VerifiedPackLease>) {{ Command::new(path).spawn(); }}"
     );
     assert!(!production_pack_provisioning_allowed(
         populated_registry,
@@ -350,7 +348,7 @@ fn stage_four_guard_rejects_dead_binding_declarations() {
         true,
     ));
     let unix_fd_flow = format!(
-        "{concrete_flow}\nstruct UnixPackExecAuthority {{ executable_fd: OwnedFd, dependency_root_fd: OwnedFd }}\nfn resolver_unix_launch_authority() -> UnixPackExecAuthority {{}}\nfn open_unix_pack_exec_authority_from_verified_pack_lease(lease: &VerifiedPackLease) {{ openat(lease, executable_fd); }}\nfn launch_worker_from_verified_pack_lease() {{ execveat(executable_fd, dependency_root_fd); }}"
+        "{concrete_flow}\nstruct UnixPackExecAuthority {{ executable_fd: OwnedFd, dependency_root_fd: OwnedFd }}\nfn resolver_unix_launch_authority() -> UnixPackExecAuthority {{}}\nfn from_verified_pack_lease(lease: &VerifiedPackLease) {{ open_copy_file(); hash_exact_length(); }}\nfn launch_verified_worker() {{ posix_spawn(format!(\"/dev/fd/{{}}\", executable_fd), dependency_root_fd); }}"
     );
     assert!(production_pack_provisioning_allowed(
         populated_registry,
@@ -373,6 +371,66 @@ fn stage_four_guard_rejects_dead_binding_declarations() {
         true,
         true,
     ));
+}
+
+#[test]
+fn stage_six_macos_verified_launch_is_descriptor_bound_and_command_free() {
+    let launcher = production_source(include_str!("macos_worker_launch.rs"));
+    let worker = production_source(include_str!("onnx_worker.rs"));
+    let pack = production_source(include_str!("gpu_worker_pack/mod.rs"));
+    let manifest = include_str!("../Cargo.toml");
+    let build = include_str!("../build.rs");
+
+    for required in [
+        "posix_spawn(",
+        "/dev/fd/",
+        "posix_spawn_file_actions_addchdir_np",
+        "POSIX_SPAWN_CLOEXEC_DEFAULT",
+        "POSIX_SPAWN_SETPGROUP",
+        "killpg",
+        "waitpid",
+        "sanitized_environment",
+        "SCRIBE_PRIVATE_PARENT_LIVENESS",
+    ] {
+        assert!(
+            launcher.contains(required),
+            "macOS launch lost {required:?}"
+        );
+    }
+    assert!(!launcher.contains("Command::new"));
+    assert!(!launcher.contains("std::process::Command"));
+    assert!(!launcher.contains("executable.path"));
+    assert!(launcher.contains("SAFE_PARENT_ENVIRONMENT"));
+    assert!(launcher.contains("SCRIBE_PRIVATE_"));
+    for required in [
+        "UnixPackExecAuthority::from_verified_pack_lease",
+        "launch_verified_worker(",
+        "unix_exec_authority",
+        "unix_exec_authority_arc",
+        "resolver_unix_launch_authority",
+    ] {
+        assert!(
+            worker.contains(required),
+            "worker binding lost {required:?}"
+        );
+    }
+    for required in [
+        "open_copy_file",
+        "hash_exact_length",
+        "open_dependency_root",
+        "Arc::ptr_eq",
+    ] {
+        assert!(pack.contains(required), "pack authority lost {required:?}");
+    }
+    assert!(
+        manifest.contains("metal-acceleration = [\"inference-worker\", \"transcribe-cpp/metal\"]")
+    );
+    for framework in ["Metal", "Foundation", "IOKit"] {
+        assert!(
+            build.contains(&format!("framework={framework}")),
+            "macOS shim lost {framework} framework link"
+        );
+    }
 }
 
 #[test]
@@ -809,6 +867,7 @@ fn verified_worker_pack_stage_five_keeps_auto_evidence_bound_and_trust_closed() 
     let store = include_str!("gpu_worker_pack/store.rs");
     let worker = include_str!("onnx_worker.rs");
     let qualification = include_str!("gpu_auto_qualification.rs");
+    let mac_launcher = include_str!("macos_worker_launch.rs");
     let documentation = include_str!("../docs/GPU_WORKER_PACKS.md");
     let qualification_manifest =
         include_str!("../runtime-manifests/gpu-auto-qualification-windows-x64.json");
@@ -869,6 +928,7 @@ fn verified_worker_pack_stage_five_keeps_auto_evidence_bound_and_trust_closed() 
         );
     }
     let production_worker = production_source(worker);
+    let production_launch_flow = format!("{worker}\n{module}\n{mac_launcher}");
     assert!(
         production_worker.contains(
             "fn resolver_unix_launch_authority(\n        &self,\n    ) -> Option<Arc<crate::gpu_worker_pack::UnixPackExecAuthority>>"
@@ -893,7 +953,7 @@ fn verified_worker_pack_stage_five_keeps_auto_evidence_bound_and_trust_closed() 
     assert!(
         production_pack_provisioning_allowed(
             registry_body,
-            worker,
+            &production_launch_flow,
             trust_root_is_empty,
             cfg!(unix),
         ),
@@ -936,7 +996,7 @@ fn verified_worker_pack_stage_five_keeps_auto_evidence_bound_and_trust_closed() 
         "auto_qualified_pack_discovery",
         "auto_gpu_discovery_fingerprint",
         "auto_qualified_gpu_route_catalog",
-        "AutoQualificationPolicy::embedded_windows_x64",
+        "AutoQualificationPolicy::embedded_current_platform",
         "auto_gpu_routes",
         "Auto selected the guaranteed CPU fallback",
         "worker_preference_for_route",

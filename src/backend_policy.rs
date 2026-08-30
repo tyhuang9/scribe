@@ -735,7 +735,10 @@ fn platform_supports(target: &BackendTarget, operating_system: OperatingSystem) 
         },
         OperatingSystem::MacOs => match target.backend {
             BackendKind::Cpu => true,
-            BackendKind::Metal => target.vendor == GpuVendor::Apple,
+            BackendKind::Metal => matches!(
+                target.vendor,
+                GpuVendor::Apple | GpuVendor::Amd | GpuVendor::Intel
+            ),
             BackendKind::Cuda | BackendKind::Vulkan => false,
         },
         OperatingSystem::Other => target.backend == BackendKind::Cpu,
@@ -837,7 +840,12 @@ fn current_power_source() -> PowerSource {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+fn current_power_source() -> PowerSource {
+    crate::macos_gpu::power_source()
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 fn current_power_source() -> PowerSource {
     // Platform-native probes arrive with their qualified backend packs. An
     // unknown source is deliberately unrestricted rather than guessing that a
@@ -1190,6 +1198,50 @@ mod tests {
             .unwrap();
 
             assert_eq!(selected.target.backend, backend);
+        }
+    }
+
+    #[test]
+    fn macos_metal_accepts_apple_intel_and_amd_but_excludes_discrete_on_battery() {
+        for (vendor, class, power, expected) in [
+            (
+                GpuVendor::Apple,
+                DeviceClass::UnifiedGpu,
+                PowerSource::Battery,
+                BackendKind::Metal,
+            ),
+            (
+                GpuVendor::Intel,
+                DeviceClass::IntegratedGpu,
+                PowerSource::Battery,
+                BackendKind::Metal,
+            ),
+            (
+                GpuVendor::Amd,
+                DeviceClass::DiscreteGpu,
+                PowerSource::Battery,
+                BackendKind::Cpu,
+            ),
+            (
+                GpuVendor::Amd,
+                DeviceClass::DiscreteGpu,
+                PowerSource::Ac,
+                BackendKind::Metal,
+            ),
+        ] {
+            let selected = select_backend(
+                AccelerationPreference::Auto,
+                &snapshot(
+                    OperatingSystem::MacOs,
+                    power,
+                    vec![
+                        candidate(target(BackendKind::Metal, vendor, class, "metal", 1)),
+                        cpu(),
+                    ],
+                ),
+            )
+            .unwrap();
+            assert_eq!(selected.target.backend, expected, "{vendor:?} {power:?}");
         }
     }
 

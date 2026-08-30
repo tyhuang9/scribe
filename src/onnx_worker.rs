@@ -784,6 +784,8 @@ fn compiled_worker_provider(role: WorkerRole) -> WorkerProvider {
         WorkerProvider::Cuda
     } else if cfg!(feature = "vulkan-acceleration") {
         WorkerProvider::Vulkan
+    } else if cfg!(feature = "metal-acceleration") {
+        WorkerProvider::Metal
     } else {
         WorkerProvider::Cpu
     }
@@ -1477,10 +1479,53 @@ fn normalize_gpu_display_name(value: &str) -> Option<String> {
     .then(|| normalized.to_ascii_lowercase())
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+struct PackDriverCatalog {
+    by_registry_identity: BTreeMap<String, String>,
+}
+
+#[cfg(target_os = "macos")]
+impl PackDriverCatalog {
+    fn discover() -> Result<Self> {
+        let witness = crate::macos_gpu::os_build_witness()
+            .context("could not obtain the macOS Metal runtime witness")?;
+        let devices = crate::macos_gpu::discover_devices()
+            .context("could not enumerate the macOS Metal registry")?;
+        let by_registry_identity = devices
+            .into_iter()
+            .map(|device| (device.stable_identity, witness.clone()))
+            .collect::<BTreeMap<_, _>>();
+        if by_registry_identity.is_empty() {
+            bail!("macOS reported no Metal registry identities");
+        }
+        Ok(Self {
+            by_registry_identity,
+        })
+    }
+
+    #[cfg(any(feature = "inference-worker", test))]
+    fn identity_for(&self, stable_device_identity: &str) -> Result<String> {
+        self.by_registry_identity
+            .get(stable_device_identity)
+            .cloned()
+            .ok_or_else(|| anyhow!("Metal registry identity has no matching macOS build witness"))
+    }
+
+    fn fingerprint(&self) -> String {
+        let mut digest = Sha256::new();
+        digest.update((self.by_registry_identity.len() as u64).to_le_bytes());
+        for (identity, witness) in &self.by_registry_identity {
+            update_health_digest(&mut digest, identity);
+            update_health_digest(&mut digest, witness);
+        }
+        format!("{:x}", digest.finalize())
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 struct PackDriverCatalog;
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 impl PackDriverCatalog {
     fn discover() -> Result<Self> {
         bail!("Stage 4 GPU worker packs require Windows driver metadata")
@@ -1556,6 +1601,49 @@ fn worker_pack_capability(role: WorkerRole) -> Result<Option<WorkerPackCapabilit
         .collect::<Vec<_>>();
     if provider_devices.len() > MAX_PACK_DEVICES {
         bail!("compiled GPU provider exceeded the bounded device-list limit");
+    }
+    #[cfg(all(target_os = "macos", feature = "metal-acceleration"))]
+    if expectation.backend == WorkerProvider::Metal {
+        let provider = provider_devices
+            .iter()
+            .map(|device| {
+                let process_index = device
+                    .index
+                    .ok_or_else(|| anyhow!("Metal provider device has no live process index"))?;
+                let display_name = [&device.description, &device.name]
+                    .into_iter()
+                    .map(|value| value.trim())
+                    .find(|value| !value.is_empty() && value.is_ascii())
+                    .ok_or_else(|| anyhow!("Metal provider device has no bounded display name"))?;
+                Ok(crate::macos_gpu::ProviderMetalDevice {
+                    process_index,
+                    display_name: display_name.to_owned(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let metal = crate::macos_gpu::discover_devices()
+            .context("could not obtain MTLDevice registry identities")?;
+        let devices = crate::macos_gpu::remap_provider_devices(&provider, &metal)?
+            .into_iter()
+            .map(|device| {
+                Ok(WorkerPackDeviceCapability {
+                    stable_device_identity: device.metal.stable_identity.clone(),
+                    process_index: device.process_index,
+                    display_name: device.metal.display_name,
+                    driver_version: Some(
+                        driver_catalog.identity_for(&device.metal.stable_identity)?,
+                    ),
+                    device_class: device.metal.device_class,
+                    vendor: device.metal.vendor,
+                    memory_total_bytes: device.metal.memory_total_bytes,
+                    memory_available_bytes: device.metal.memory_available_bytes,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        return finish_worker_pack_capability(expectation, expected_device_id, devices);
+    }
+    if expectation.backend == WorkerProvider::Metal {
+        bail!("Metal GPU worker pack requires macOS Metal acceleration");
     }
     let mut devices = Vec::with_capacity(provider_devices.len());
     for device in provider_devices {
@@ -1635,6 +1723,15 @@ fn worker_pack_capability(role: WorkerRole) -> Result<Option<WorkerPackCapabilit
             memory_available_bytes: device.memory_free.min(device.memory_total),
         });
     }
+    finish_worker_pack_capability(expectation, expected_device_id, devices)
+}
+
+#[cfg(feature = "inference-worker")]
+fn finish_worker_pack_capability(
+    expectation: WorkerPackExpectation,
+    expected_device_id: Option<String>,
+    devices: Vec<WorkerPackDeviceCapability>,
+) -> Result<Option<WorkerPackCapability>> {
     // Validate before the parent-selected stable ID narrows the list. A
     // duplicate index in another provider device must not be hidden by that
     // filter and later make an index-only remap ambiguous.
@@ -2291,6 +2388,8 @@ struct PackLaunchContext {
     lease: Arc<VerifiedPackLease>,
     expectation: WorkerPackExpectation,
     expected_device: Option<BackendTarget>,
+    #[cfg(unix)]
+    unix_exec_authority: Arc<crate::gpu_worker_pack::UnixPackExecAuthority>,
 }
 
 struct BoundPackHelloBridge<'a> {
@@ -2308,7 +2407,7 @@ impl ResolverHelloBindingBridge for BoundPackHelloBridge<'_> {
     fn resolver_unix_launch_authority(
         &self,
     ) -> Option<Arc<crate::gpu_worker_pack::UnixPackExecAuthority>> {
-        None
+        Some(Arc::clone(&self.context.unix_exec_authority))
     }
 
     fn hello_pack_id(&self) -> &str {
@@ -2638,7 +2737,19 @@ impl WorkerExecutableResolver for VerifiedPackWorkerExecutableResolver {
         }) {
             bail!("verified GPU launch binding no longer matches its retained pack");
         }
-        resolve_verified_pack_executable(lease, Some(expected_device))
+        let executable = resolve_verified_pack_executable(lease, Some(expected_device))?;
+        #[cfg(unix)]
+        {
+            let mut executable = executable;
+            if let Some(context) = executable.pack_launch.as_mut() {
+                // Preserve the exact descriptor authority that launched the probe
+                // and survived challenge-bound Hello validation.
+                context.unix_exec_authority = self.binding.unix_exec_authority_arc();
+            }
+            return Ok(executable);
+        }
+        #[cfg(not(unix))]
+        Ok(executable)
     }
 }
 
@@ -2702,10 +2813,16 @@ fn resolve_verified_pack_executable(
         .file_name()
         .ok_or_else(|| anyhow!("GPU worker pack executable has no filename"))?;
     let mut executable = verify_worker_executable(worker_path, root, name, expected_sha256)?;
+    #[cfg(unix)]
+    let unix_exec_authority =
+        crate::gpu_worker_pack::UnixPackExecAuthority::from_verified_pack_lease(Arc::clone(&lease))
+            .context("could not retain verified Unix pack launch authority")?;
     executable.pack_launch = Some(PackLaunchContext {
         expectation: pack_expectation(&lease),
         lease,
         expected_device,
+        #[cfg(unix)]
+        unix_exec_authority,
     });
     Ok(executable)
 }
@@ -2844,6 +2961,21 @@ impl WorkerLauncher for OsWorkerLauncher {
             WorkerRole::Inference => INFERENCE_WORKER_FLAG,
             WorkerRole::Vad => VAD_WORKER_FLAG,
         };
+        #[cfg(target_os = "macos")]
+        if let Some(pack) = executable.pack_launch.as_ref() {
+            let launched = crate::macos_worker_launch::launch_verified_worker(
+                &pack.unix_exec_authority,
+                worker_flag,
+                &worker_pack_environment_bindings(pack),
+            )?;
+            return Ok(SpawnedWorker {
+                stdin: Box::new(launched.stdin),
+                stdout: Box::new(launched.stdout),
+                process: Arc::new(launched.process),
+                expectation,
+                pack_launch: executable.pack_launch,
+            });
+        }
         let mut command = Command::new(&executable.path);
         command
             .arg(worker_flag)
@@ -2948,28 +3080,65 @@ fn configure_worker_environment(command: &mut Command) {
 }
 
 fn configure_worker_pack_environment(command: &mut Command, context: &PackLaunchContext) {
+    for (name, value) in worker_pack_environment_bindings(context) {
+        command.env(name, value);
+    }
+}
+
+fn worker_pack_environment_bindings(context: &PackLaunchContext) -> Vec<(String, String)> {
     let pack = &context.expectation;
-    command
-        .env(PACK_ID_ENV, &pack.pack_id)
-        .env(PACK_VERSION_ENV, &pack.pack_version)
-        .env(PACK_DIGEST_ENV, &pack.pack_digest)
-        .env(PACK_SECURITY_EPOCH_ENV, pack.security_epoch.to_string())
-        .env(PACK_RUNTIME_ABI_ENV, pack.runtime_abi.to_string())
-        .env(
-            PACK_BACKEND_ENV,
+    let mut bindings = vec![
+        (PACK_ID_ENV.to_owned(), pack.pack_id.clone()),
+        (PACK_VERSION_ENV.to_owned(), pack.pack_version.clone()),
+        (PACK_DIGEST_ENV.to_owned(), pack.pack_digest.clone()),
+        (
+            PACK_SECURITY_EPOCH_ENV.to_owned(),
+            pack.security_epoch.to_string(),
+        ),
+        (
+            PACK_RUNTIME_ABI_ENV.to_owned(),
+            pack.runtime_abi.to_string(),
+        ),
+        (
+            PACK_BACKEND_ENV.to_owned(),
             match pack.backend {
                 WorkerProvider::Cuda => "cuda",
                 WorkerProvider::Vulkan => "vulkan",
                 WorkerProvider::Metal => "metal",
                 WorkerProvider::Cpu => "cpu",
-            },
-        )
-        .env(PACK_PROVIDER_ENV, &pack.provider);
+            }
+            .to_owned(),
+        ),
+        (PACK_PROVIDER_ENV.to_owned(), pack.provider.clone()),
+    ];
     if let Some(device) = &context.expected_device {
-        command.env(PACK_DEVICE_ID_ENV, device.device_id.as_str());
+        bindings.push((
+            PACK_DEVICE_ID_ENV.to_owned(),
+            device.device_id.as_str().to_owned(),
+        ));
         if let Some(driver) = &device.driver_version {
-            command.env(PACK_DRIVER_ID_ENV, driver);
+            bindings.push((PACK_DRIVER_ID_ENV.to_owned(), driver.clone()));
         }
+    }
+    bindings
+}
+
+#[cfg(target_os = "macos")]
+impl WorkerProcess for crate::macos_worker_launch::MacWorkerProcess {
+    fn is_running(&self) -> Result<bool> {
+        self.is_running()
+    }
+
+    fn request_cooperative_cancel(&self) -> Result<bool> {
+        self.request_cooperative_cancel()
+    }
+
+    fn terminate(&self) -> Result<()> {
+        self.terminate()
+    }
+
+    fn wait(&self) -> Result<()> {
+        self.wait()
     }
 }
 
@@ -6775,7 +6944,7 @@ impl InferenceWorkerRegistry {
                 reserve_auto_cpu_fallback(&mut plan, &self.routes);
                 return Ok(plan);
             }
-            let policy = match AutoQualificationPolicy::embedded_windows_x64() {
+            let policy = match AutoQualificationPolicy::embedded_current_platform() {
                 Ok(policy) => policy,
                 Err(error) => {
                     return Ok(InferenceWorkerRoutePlan {

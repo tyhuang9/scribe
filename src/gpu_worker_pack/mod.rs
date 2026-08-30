@@ -1,6 +1,6 @@
 //! Verified GPU worker-pack infrastructure.
 //!
-//! Stage 4 discovers verified Windows x64 packs and turns only challenge-bound
+//! Stage 4/6 discovers verified Windows and macOS packs and turns only challenge-bound
 //! resolver/Hello results into explicit-GPU candidates. Production trust is
 //! deliberately empty until a separate public-key review is complete, and
 //! Auto remains default-denied to every GPU pack.
@@ -13,14 +13,26 @@ use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(any(
+    all(windows, target_arch = "x86_64"),
+    all(
+        target_os = "macos",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    )
+))]
 use std::sync::{Mutex, OnceLock};
 
 use serde::Deserialize;
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(any(
+    all(windows, target_arch = "x86_64"),
+    all(
+        target_os = "macos",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    )
+))]
 use sha2::{Digest, Sha256};
 
-// Stage 4 consumes the bridge re-export from the concrete Windows resolver.
+// Platform resolvers consume the bridge through this stable re-export.
 #[cfg(unix)]
 pub(crate) use launch_binding::UnixPackExecAuthority;
 #[allow(unused_imports)]
@@ -76,6 +88,41 @@ mod launch_binding {
 
     #[cfg(unix)]
     impl UnixPackExecAuthority {
+        pub(crate) fn from_verified_pack_lease(
+            verified_pack_lease: Arc<VerifiedPackLease>,
+        ) -> Result<Arc<Self>, super::manifest::PackVerificationError> {
+            use std::io::{Seek, SeekFrom};
+            use std::os::unix::fs::PermissionsExt;
+
+            verified_pack_lease.recheck()?;
+            let worker_path = &verified_pack_lease.verified_pack().worker_relative_path;
+            let entry = verified_pack_lease
+                .copy_entries()
+                .iter()
+                .find(|entry| entry.path == *worker_path)
+                .ok_or(super::manifest::PackVerificationError::WorkerMissing)?;
+            let mut executable_fd = verified_pack_lease.open_copy_file(entry)?;
+            if executable_fd.metadata()?.permissions().mode() & 0o111 == 0 {
+                return Err(super::manifest::PackVerificationError::WorkerNotExecutable);
+            }
+            let digest = super::manifest::hash_exact_length(
+                &mut executable_fd,
+                entry.size_bytes,
+                &entry.path,
+            )?;
+            if digest != entry.sha256 {
+                return Err(super::manifest::PackVerificationError::DigestMismatch);
+            }
+            executable_fd.seek(SeekFrom::Start(0))?;
+            let dependency_root_fd = verified_pack_lease.open_dependency_root()?;
+            verified_pack_lease.recheck()?;
+            Ok(Arc::new(Self {
+                verified_pack_lease,
+                executable_fd,
+                dependency_root_fd,
+            }))
+        }
+
         pub(crate) fn executable_fd(&self) -> &File {
             &self.executable_fd
         }
@@ -86,6 +133,26 @@ mod launch_binding {
 
         pub(crate) fn verified_pack_lease(&self) -> &Arc<VerifiedPackLease> {
             &self.verified_pack_lease
+        }
+
+        pub(crate) fn recheck(&self) -> Result<(), super::manifest::PackVerificationError> {
+            use std::io::Seek;
+            let lease = self.verified_pack_lease();
+            lease.recheck()?;
+            let worker_path = &lease.verified_pack().worker_relative_path;
+            let entry = lease
+                .copy_entries()
+                .iter()
+                .find(|entry| entry.path == *worker_path)
+                .ok_or(super::manifest::PackVerificationError::WorkerMissing)?;
+            let mut executable = self.executable_fd.try_clone()?;
+            executable.rewind()?;
+            let digest =
+                super::manifest::hash_exact_length(&mut executable, entry.size_bytes, &entry.path)?;
+            if digest != entry.sha256 {
+                return Err(super::manifest::PackVerificationError::DigestMismatch);
+            }
+            lease.recheck()
         }
 
         #[cfg(test)]
@@ -244,6 +311,11 @@ mod launch_binding {
         #[cfg(unix)]
         pub(crate) fn unix_exec_authority(&self) -> &UnixPackExecAuthority {
             &self.unix_exec_authority
+        }
+
+        #[cfg(unix)]
+        pub(crate) fn unix_exec_authority_arc(&self) -> Arc<UnixPackExecAuthority> {
+            Arc::clone(&self.unix_exec_authority)
         }
     }
 }
@@ -436,12 +508,24 @@ struct PackCatalogEntry {
 /// categorical, path-free diagnostics for every skipped entry.
 /// It never loads a provider or creates launch authority. A malformed catalog,
 /// absent production trust key, or incompatible pack projects to no GPU route.
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(any(
+    all(windows, target_arch = "x86_64"),
+    all(
+        target_os = "macos",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    )
+))]
 pub(crate) fn discover_production_pack_leases() -> PackLeaseDiscovery {
     discover_pack_leases_from_current_install()
 }
 
-#[cfg(not(all(windows, target_arch = "x86_64")))]
+#[cfg(not(any(
+    all(windows, target_arch = "x86_64"),
+    all(
+        target_os = "macos",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    )
+)))]
 pub(crate) fn discover_production_pack_leases() -> PackLeaseDiscovery {
     PackLeaseDiscovery {
         leases: Vec::new(),
@@ -452,7 +536,13 @@ pub(crate) fn discover_production_pack_leases() -> PackLeaseDiscovery {
     }
 }
 
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(any(
+    all(windows, target_arch = "x86_64"),
+    all(
+        target_os = "macos",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    )
+))]
 fn discover_pack_leases_from_current_install() -> PackLeaseDiscovery {
     let Ok(executable) = std::env::current_exe() else {
         return PackLeaseDiscovery {
@@ -463,7 +553,7 @@ fn discover_pack_leases_from_current_install() -> PackLeaseDiscovery {
             catalog_generation: None,
         };
     };
-    let Some(install_root) = executable.parent() else {
+    let Some(install_root) = production_resource_root_from_executable(&executable) else {
         return PackLeaseDiscovery {
             leases: Vec::new(),
             diagnostics: vec![PackDiscoveryDiagnostic::catalog(
@@ -472,10 +562,39 @@ fn discover_pack_leases_from_current_install() -> PackLeaseDiscovery {
             catalog_generation: None,
         };
     };
-    discover_pack_leases_from_install_root(install_root)
+    discover_pack_leases_from_install_root(&install_root)
 }
 
-#[cfg(all(windows, target_arch = "x86_64"))]
+fn production_resource_root_from_executable(executable: &Path) -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        executable.parent().map(Path::to_path_buf)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos_resource_root_from_executable(executable)
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let _ = executable;
+        None
+    }
+}
+
+fn macos_resource_root_from_executable(executable: &Path) -> Option<PathBuf> {
+    let macos = executable.parent()?;
+    let contents = macos.parent()?;
+    (macos.file_name()? == "MacOS" && contents.file_name()? == "Contents")
+        .then(|| contents.join("Resources"))
+}
+
+#[cfg(any(
+    all(windows, target_arch = "x86_64"),
+    all(
+        target_os = "macos",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    )
+))]
 fn discover_pack_leases_from_install_root(install_root: &Path) -> PackLeaseDiscovery {
     let catalog_path = install_root.join(PACK_CATALOG_NAME);
     let catalog = match read_bounded_catalog(&catalog_path, install_root) {
@@ -515,23 +634,36 @@ fn discover_pack_leases_from_install_root(install_root: &Path) -> PackLeaseDisco
     discovery
 }
 
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(any(
+    all(windows, target_arch = "x86_64"),
+    all(
+        target_os = "macos",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    )
+))]
 fn verify_catalog_entries(
     install_root: &Path,
     bytes: &[u8],
     catalog_generation: String,
 ) -> PackLeaseDiscovery {
+    #[cfg(windows)]
+    let allowed = &[manifest::PackBackend::Cuda, manifest::PackBackend::Vulkan][..];
+    #[cfg(target_os = "macos")]
+    let allowed = &[manifest::PackBackend::Metal][..];
     let verifier = manifest::PackVerifier::new(
         &manifest::ProductionTrustRoot,
-        manifest::Compatibility::current(&[
-            manifest::PackBackend::Cuda,
-            manifest::PackBackend::Vulkan,
-        ]),
+        manifest::Compatibility::current(allowed),
     );
     verify_catalog_entries_with_verifier(install_root, bytes, catalog_generation, &verifier)
 }
 
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(any(
+    all(windows, target_arch = "x86_64"),
+    all(
+        target_os = "macos",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    )
+))]
 fn verify_catalog_entries_with_verifier(
     install_root: &Path,
     bytes: &[u8],
@@ -560,8 +692,8 @@ fn verify_catalog_entries_with_verifier(
     let mut leases = Vec::new();
     let mut diagnostics = Vec::new();
     for entry in catalog.packs {
-        if entry.target_os != "windows"
-            || entry.target_arch != "x86_64"
+        if entry.target_os != std::env::consts::OS
+            || entry.target_arch != std::env::consts::ARCH
             || entry.runtime_abi_version != manifest::RUNTIME_ABI_VERSION
             || entry.installed_size_bytes == 0
             || entry.compressed_size_bytes == 0
@@ -649,43 +781,94 @@ fn verify_catalog_entries_with_verifier(
     }
 }
 
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(any(
+    all(windows, target_arch = "x86_64"),
+    all(
+        target_os = "macos",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    )
+))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct CatalogFingerprint {
     install_root: PathBuf,
+    #[cfg(windows)]
     volume_serial_number: u32,
+    #[cfg(windows)]
     file_index: u64,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
     content_sha256: [u8; 32],
 }
 
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(any(
+    all(windows, target_arch = "x86_64"),
+    all(
+        target_os = "macos",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    )
+))]
 impl CatalogFingerprint {
     fn generation_id(&self) -> String {
-        format!(
-            "{:08x}{:016x}{}",
-            self.volume_serial_number,
-            self.file_index,
-            self.content_sha256
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>()
-        )
+        #[cfg(windows)]
+        {
+            return format!(
+                "{:08x}{:016x}{}",
+                self.volume_serial_number,
+                self.file_index,
+                self.content_sha256
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            );
+        }
+        #[cfg(unix)]
+        {
+            format!(
+                "{:016x}{:016x}{}",
+                self.device,
+                self.inode,
+                self.content_sha256
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            )
+        }
     }
 }
 
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(any(
+    all(windows, target_arch = "x86_64"),
+    all(
+        target_os = "macos",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    )
+))]
 struct CatalogSnapshot {
     bytes: Vec<u8>,
     fingerprint: CatalogFingerprint,
 }
 
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(any(
+    all(windows, target_arch = "x86_64"),
+    all(
+        target_os = "macos",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    )
+))]
 #[derive(Default)]
 struct CatalogDiscoveryCache {
     entry: Option<(CatalogFingerprint, PackLeaseDiscovery)>,
 }
 
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(any(
+    all(windows, target_arch = "x86_64"),
+    all(
+        target_os = "macos",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    )
+))]
 impl CatalogDiscoveryCache {
     fn lookup(&self, fingerprint: &CatalogFingerprint) -> Option<PackLeaseDiscovery> {
         self.entry
@@ -699,10 +882,22 @@ impl CatalogDiscoveryCache {
     }
 }
 
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(any(
+    all(windows, target_arch = "x86_64"),
+    all(
+        target_os = "macos",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    )
+))]
 static PRODUCTION_DISCOVERY_CACHE: OnceLock<Mutex<CatalogDiscoveryCache>> = OnceLock::new();
 
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(any(
+    all(windows, target_arch = "x86_64"),
+    all(
+        target_os = "macos",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    )
+))]
 #[derive(Debug)]
 enum CatalogReadFailure {
     Unavailable,
@@ -770,6 +965,50 @@ fn read_bounded_catalog(
     })
 }
 
+#[cfg(all(
+    target_os = "macos",
+    any(target_arch = "aarch64", target_arch = "x86_64")
+))]
+fn read_bounded_catalog(
+    path: &Path,
+    install_root: &Path,
+) -> Result<CatalogSnapshot, CatalogReadFailure> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let file = options.open(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            CatalogReadFailure::Unavailable
+        } else {
+            CatalogReadFailure::Rejected
+        }
+    })?;
+    let metadata = file.metadata().map_err(|_| CatalogReadFailure::Rejected)?;
+    if !metadata.is_file() || metadata.nlink() != 1 || metadata.len() > MAX_PACK_CATALOG_BYTES {
+        return Err(CatalogReadFailure::Rejected);
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    File::take(file, MAX_PACK_CATALOG_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| CatalogReadFailure::Rejected)?;
+    if bytes.len() as u64 > MAX_PACK_CATALOG_BYTES {
+        return Err(CatalogReadFailure::Rejected);
+    }
+    let content_sha256: [u8; 32] = Sha256::digest(&bytes).into();
+    Ok(CatalogSnapshot {
+        bytes,
+        fingerprint: CatalogFingerprint {
+            install_root: install_root.to_path_buf(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            content_sha256,
+        },
+    })
+}
+
 /// Private packaging entrypoint. Stage 4's empty production trust root means a
 /// non-empty release pack declaration always fails until key provisioning is
 /// deliberately completed in a later stage.
@@ -818,6 +1057,29 @@ mod tests {
     use super::manifest::VerifiedPackLease;
     use super::{PackDiscoveryDiagnostic, PackDiscoveryIssue};
     use super::{ResolverHelloBindingBridge, VerifiedPackLaunchBinding};
+
+    #[test]
+    fn macos_bundle_executable_maps_to_resources_catalog_root() {
+        let executable = std::path::Path::new("/Applications/Scribe.app/Contents/MacOS/Scribe");
+        assert_eq!(
+            super::macos_resource_root_from_executable(executable),
+            Some(std::path::PathBuf::from(
+                "/Applications/Scribe.app/Contents/Resources"
+            ))
+        );
+        assert!(
+            super::macos_resource_root_from_executable(std::path::Path::new(
+                "/Applications/Scribe.app/contents/MacOS/Scribe"
+            ))
+            .is_none()
+        );
+        assert!(
+            super::macos_resource_root_from_executable(std::path::Path::new(
+                "/usr/local/bin/Scribe"
+            ))
+            .is_none()
+        );
+    }
 
     #[cfg(windows)]
     fn fixture_catalog_bytes(lease: &VerifiedPackLease, files: Vec<String>) -> Vec<u8> {

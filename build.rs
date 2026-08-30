@@ -10,11 +10,13 @@ const SILERO_VAD_SIZE: usize = 212_860;
 const SILERO_VAD_SHA256: &str = "c36d490aff5ab924ca6c7aeec4d8f6bd3d22db6fa17611b9c5b17eae58ac3a20";
 
 fn main() {
+    reject_multiple_gpu_features();
     emit_build_revision();
     emit_bundled_worker_trust_anchor();
     require_windows_static_crt();
     #[cfg(all(windows, feature = "vulkan-acceleration"))]
     prepare_windows_vulkan_import_library();
+    prepare_macos_metal_shim();
     verify_silero_vad_asset();
 
     println!("cargo:rerun-if-changed=native/sherpa_vad_shim.cc");
@@ -33,6 +35,61 @@ fn main() {
     if matches!(target_os.as_str(), "linux" | "android") {
         println!("cargo:rustc-link-lib=dl");
     }
+}
+
+fn reject_multiple_gpu_features() {
+    let enabled = [
+        (
+            "cuda-acceleration",
+            std::env::var_os("CARGO_FEATURE_CUDA_ACCELERATION").is_some(),
+        ),
+        (
+            "vulkan-acceleration",
+            std::env::var_os("CARGO_FEATURE_VULKAN_ACCELERATION").is_some(),
+        ),
+        (
+            "metal-acceleration",
+            std::env::var_os("CARGO_FEATURE_METAL_ACCELERATION").is_some(),
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(name, enabled)| enabled.then_some(name))
+    .collect::<Vec<_>>();
+    assert!(
+        enabled.len() <= 1,
+        "GPU acceleration features are mutually exclusive: {}",
+        enabled.join(", ")
+    );
+}
+
+fn prepare_macos_metal_shim() {
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let metal_enabled = std::env::var_os("CARGO_FEATURE_METAL_ACCELERATION").is_some();
+    assert!(
+        !metal_enabled || target_os == "macos",
+        "metal-acceleration requires a macOS target"
+    );
+    if target_os != "macos" {
+        return;
+    }
+
+    println!("cargo:rerun-if-changed=native/scribe_macos_gpu_shim.h");
+    println!("cargo:rerun-if-changed=native/scribe_macos_gpu_shim.m");
+    let deployment_target = std::env::var("MACOSX_DEPLOYMENT_TARGET")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "13.0".to_owned());
+    cc::Build::new()
+        .file("native/scribe_macos_gpu_shim.m")
+        .include("native")
+        .flag("-fobjc-arc")
+        .flag(&format!("-mmacosx-version-min={deployment_target}"))
+        .warnings(true)
+        .compile("scribe_macos_gpu_shim");
+    println!("cargo:rustc-link-lib=framework=Metal");
+    println!("cargo:rustc-link-lib=framework=Foundation");
+    println!("cargo:rustc-link-lib=framework=IOKit");
+    println!("cargo:rustc-link-arg=-mmacosx-version-min={deployment_target}");
 }
 
 fn emit_bundled_worker_trust_anchor() {

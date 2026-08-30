@@ -36,6 +36,18 @@ mod hotkey;
 mod huggingface_catalog;
 mod installations;
 mod installed_manifest;
+#[cfg(any(target_os = "macos", test))]
+#[allow(
+    dead_code,
+    reason = "host-side tests compile the macOS adapter without invoking native platform entrypoints"
+)]
+mod macos_gpu;
+#[cfg(any(target_os = "macos", test))]
+#[allow(
+    dead_code,
+    reason = "host-side tests compile the macOS launcher without invoking posix_spawn"
+)]
+mod macos_worker_launch;
 mod managed_downloads;
 mod model_catalog;
 mod models;

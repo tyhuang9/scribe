@@ -233,6 +233,17 @@ impl VerifiedPackLease {
         reject_named_streams(&display_path)?;
         Ok(file)
     }
+
+    #[cfg(unix)]
+    pub(crate) fn open_dependency_root(&self) -> Result<File, PackVerificationError> {
+        self.recheck()?;
+        self.root
+            .handles
+            .last()
+            .expect("verified pack root retains its digest directory")
+            .try_clone()
+            .map_err(PackVerificationError::Io)
+    }
 }
 
 /// Borrowed launch authority. Its lifetime prevents the retained pack lease
@@ -1358,6 +1369,8 @@ pub(crate) enum PackVerificationError {
     BackendMismatch,
     #[error("worker-pack worker path is absent from the inventory")]
     WorkerMissing,
+    #[error("worker-pack worker file is not executable")]
+    WorkerNotExecutable,
     #[error("verified worker-pack descriptor changed before launch")]
     DescriptorChanged,
     #[error("worker-pack immutable-store ancestor is unsafe: {0}")]
