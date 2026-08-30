@@ -159,7 +159,7 @@ mod launch_binding {
         }
 
         #[cfg(test)]
-        fn fixture(
+        pub(crate) fn fixture(
             verified_pack_lease: Arc<VerifiedPackLease>,
             executable_fd: File,
             dependency_root_fd: File,

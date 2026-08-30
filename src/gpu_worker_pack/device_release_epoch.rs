@@ -284,7 +284,9 @@ mod macos {
 }
 
 #[cfg(all(target_os = "macos", scribe_macos_keychain_authority))]
-pub(super) use macos::admit;
+pub(super) fn admit(epoch: u64) -> Result<(), AdmissionError> {
+    macos::admit(epoch)
+}
 
 #[cfg(all(target_os = "macos", not(scribe_macos_keychain_authority)))]
 pub(super) fn admit(_epoch: u64) -> Result<(), AdmissionError> {

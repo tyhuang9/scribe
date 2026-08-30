@@ -2378,6 +2378,40 @@ struct PackLaunchContext {
     unix_exec_authority: Arc<crate::gpu_worker_pack::UnixPackExecAuthority>,
 }
 
+#[cfg(test)]
+impl PackLaunchContext {
+    fn fixture(lease: Arc<VerifiedPackLease>, expected_device: Option<BackendTarget>) -> Self {
+        #[cfg(unix)]
+        let unix_exec_authority = {
+            use std::os::unix::fs::OpenOptionsExt;
+
+            let executable_fd = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(lease.worker_path())
+                .expect("fixture worker must open without following links");
+            let dependency_root_fd = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(&lease.verified_pack().root)
+                .expect("fixture pack root must open without following links");
+            Arc::new(crate::gpu_worker_pack::UnixPackExecAuthority::fixture(
+                Arc::clone(&lease),
+                executable_fd,
+                dependency_root_fd,
+            ))
+        };
+
+        Self {
+            expectation: pack_expectation(&lease),
+            lease,
+            expected_device,
+            #[cfg(unix)]
+            unix_exec_authority,
+        }
+    }
+}
+
 struct BoundPackHelloBridge<'a> {
     context: &'a PackLaunchContext,
     capability: &'a WorkerPackCapability,
@@ -10257,11 +10291,7 @@ mod tests {
         let mut expected = backend_target(BackendKind::Vulkan, "native:pci:0000:01:00.0", Some(9));
         expected.vendor = GpuVendor::Nvidia;
         expected.driver_version = Some("fixture-driver-1".to_owned());
-        let context = PackLaunchContext {
-            lease,
-            expectation: expectation.clone(),
-            expected_device: Some(expected.clone()),
-        };
+        let context = PackLaunchContext::fixture(lease, Some(expected.clone()));
         let capability = WorkerPackCapability {
             expectation,
             devices: vec![WorkerPackDeviceCapability {
@@ -10310,15 +10340,10 @@ mod tests {
         let root = crate::gpu_worker_pack::manifest::test_support::temp_root("pack-index-env");
         let (_, lease) = crate::gpu_worker_pack::manifest::test_support::leased_fixture(&root);
         let lease = Arc::new(lease);
-        let expectation = pack_expectation(&lease);
         let mut expected =
             backend_target(BackendKind::Vulkan, "native:luid:0000000000000001", Some(7));
         expected.driver_version = Some("vulkan:10de:1:1:fixture".to_owned());
-        let context = PackLaunchContext {
-            lease,
-            expectation,
-            expected_device: Some(expected),
-        };
+        let context = PackLaunchContext::fixture(lease, Some(expected));
         let mut command = Command::new("scribe-inference-worker.exe");
 
         configure_worker_pack_environment(&mut command, &context);
@@ -10427,11 +10452,7 @@ mod tests {
         let (_, lease) = crate::gpu_worker_pack::manifest::test_support::leased_fixture(&root);
         let lease = Arc::new(lease);
         let expectation = pack_expectation(&lease);
-        let context = PackLaunchContext {
-            lease,
-            expectation: expectation.clone(),
-            expected_device: None,
-        };
+        let context = PackLaunchContext::fixture(lease, None);
         let device = |identity: &str, index: usize| WorkerPackDeviceCapability {
             stable_device_identity: identity.to_owned(),
             process_index: index,

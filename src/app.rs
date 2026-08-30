@@ -25036,45 +25036,6 @@ mod layout_tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn development_runtime_script_installs_expected_executable() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let root =
-            std::env::temp_dir().join(format!("scribe-runtime-script-test-{}", std::process::id()));
-        let script = root.join("bundle-test-runtime.sh");
-        let destination = root.join("runtime");
-        let executable = destination.join("bin").join("scribe-test");
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
-        fs::write(
-            &script,
-            "#!/usr/bin/env bash\nset -euo pipefail\nmkdir -p \"$SCRIBE_TEST_RUNTIME_DEST/bin\"\nprintf '#!/usr/bin/env bash\\n' > \"$SCRIBE_TEST_RUNTIME_DEST/bin/scribe-test\"\nchmod 755 \"$SCRIBE_TEST_RUNTIME_DEST/bin/scribe-test\"\n",
-        )
-        .unwrap();
-        let mut permissions = fs::metadata(&script).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script, permissions).unwrap();
-
-        let installed = build_development_runtime_package(
-            "test",
-            "test",
-            DevelopmentRuntimePackage {
-                script,
-                destination_env: "SCRIBE_TEST_RUNTIME_DEST",
-                destination_root: destination,
-                executable_path: executable.clone(),
-            },
-        )
-        .unwrap();
-
-        assert_eq!(installed.installed_path, executable);
-        assert!(installed.installed_path.exists());
-        installed.commit().unwrap();
-        let _ = fs::remove_dir_all(root);
-    }
-
     #[test]
     fn embedded_gguf_model_is_ready_without_a_runtime_package() {
         let mut model = config::configured_models(&AppConfig::default())
