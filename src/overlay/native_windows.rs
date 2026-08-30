@@ -1930,12 +1930,14 @@ fn run_native_overlay_thread(mailbox: Arc<SnapshotMailbox>, event_sink: NativeEv
         if let Some(snapshot) = current_snapshot.as_ref() {
             // Poll while a transition is active so a just-enabled reduced
             // motion preference can snap the very next animation tick.
-            animations_enabled = refresh_active_transition_motion(
+            let refreshed_animations = refresh_active_transition_motion(
                 &transitions,
                 animations_enabled,
                 crate::system_preferences::client_area_animations_enabled(),
-                snapshot.requested_visible && snapshot.state.phase.is_progressing(),
+                visual_meter_active(snapshot),
             );
+            let motion_changed = animations_enabled != refreshed_animations;
+            animations_enabled = refreshed_animations;
             let step = transitions.tick(now, !animations_enabled);
             let hidden = matches!(step, TransitionStep::Hidden);
             let progress_active = animations_enabled
@@ -1948,7 +1950,7 @@ fn run_native_overlay_thread(mailbox: Arc<SnapshotMailbox>, event_sink: NativeEv
                         | super::controller::OverlayPhase::Processing
                         | super::controller::OverlayPhase::Pasting
                 );
-            if matches!(step, TransitionStep::Idle) && progress_active {
+            if matches!(step, TransitionStep::Idle) && (progress_active || motion_changed) {
                 process_snapshot(
                     &mut host,
                     snapshot,
@@ -1993,7 +1995,7 @@ fn run_native_overlay_thread(mailbox: Arc<SnapshotMailbox>, event_sink: NativeEv
                     now,
                     animations_enabled
                         && snapshot.requested_visible
-                        && snapshot.state.phase.is_progressing(),
+                        && visual_meter_active(snapshot),
                 )
             });
         thread::park_timeout(wait);
@@ -2004,6 +2006,16 @@ fn run_native_overlay_thread(mailbox: Arc<SnapshotMailbox>, event_sink: NativeEv
     }
     pump_overlay_messages();
     emit_presented_if_changed(&event_sink, false, None, &mut last_presented);
+}
+
+fn visual_meter_active(snapshot: &OverlaySnapshot) -> bool {
+    snapshot.requested_visible
+        && snapshot.state.mode == super::controller::OverlayMode::Live
+        && matches!(
+            snapshot.state.phase,
+            super::controller::OverlayPhase::Listening
+                | super::controller::OverlayPhase::Finalizing
+        )
 }
 
 fn refresh_active_transition_motion(
@@ -2061,6 +2073,7 @@ fn process_snapshot(
         .as_ref()
         .map(|plan| plan.target.clone())
         .unwrap_or_else(|| snapshot.clone());
+    render_snapshot.state.progress_animation_enabled &= animations_enabled;
     let control_enabled = render_snapshot.control_requested;
     if plan.as_ref().is_some_and(|plan| plan.reserve_cancel_region) {
         // Keep the independent 44px surface in place until the content
