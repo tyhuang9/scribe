@@ -18,8 +18,8 @@ use eframe::egui::{
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 use crate::audio::{
-    self, CaptureCancellation, CaptureCompletion, CaptureError, CaptureIntent, CaptureMetrics,
-    CaptureOptions, CaptureStopReason, LevelSnapshot, RecordingSession,
+    self, CaptureCompletion, CaptureError, CaptureIntent, CaptureMetrics, CaptureOptions,
+    CaptureStopReason, LevelSnapshot, RecordingSession,
     SpeechDetectionMode as CaptureSpeechDetectionMode, VadOptions,
 };
 use crate::benchmark::{
@@ -572,7 +572,6 @@ enum MicrophoneTest {
     Starting {
         request_id: u64,
         stop_requested: bool,
-        cancellation: CaptureCancellation,
     },
     Active {
         session: RecordingSession,
@@ -3820,7 +3819,6 @@ impl LocalTranscriberApp {
         self.microphone_test = MicrophoneTest::Starting {
             request_id,
             stop_requested: false,
-            cancellation: CaptureCancellation::new(),
         };
         self.microphone_test_control_id = Some(ticket.capture_id);
         self.microphone_test_error = None;
@@ -3829,12 +3827,7 @@ impl LocalTranscriberApp {
 
     fn stop_microphone_test(&mut self) {
         self.microphone_test = match std::mem::take(&mut self.microphone_test) {
-            MicrophoneTest::Starting {
-                request_id,
-                cancellation,
-                ..
-            } => {
-                cancellation.cancel();
+            MicrophoneTest::Starting { request_id, .. } => {
                 if let Some(id) = self
                     .capture_controller
                     .handle()
@@ -3845,7 +3838,6 @@ impl LocalTranscriberApp {
                 MicrophoneTest::Starting {
                     request_id,
                     stop_requested: true,
-                    cancellation,
                 }
             }
             MicrophoneTest::Active { session } => {
@@ -6503,7 +6495,6 @@ impl LocalTranscriberApp {
                         MicrophoneTest::Starting {
                             request_id: expected,
                             stop_requested,
-                            cancellation: _,
                         } if expected == request_id => match result {
                             Ok(session)
                                 if stop_requested
@@ -16454,7 +16445,6 @@ mod layout_tests {
         app.microphone_test = MicrophoneTest::Starting {
             request_id,
             stop_requested: false,
-            cancellation: CaptureCancellation::new(),
         };
     }
 
@@ -16519,7 +16509,6 @@ mod layout_tests {
         app.microphone_test = MicrophoneTest::Starting {
             request_id: 2,
             stop_requested: false,
-            cancellation: CaptureCancellation::new(),
         };
         app.tx
             .send(AppEvent::MicrophoneTestReady {
@@ -16550,7 +16539,6 @@ mod layout_tests {
         app.microphone_test = MicrophoneTest::Starting {
             request_id: 1,
             stop_requested: false,
-            cancellation: CaptureCancellation::new(),
         };
         app.tx
             .send(AppEvent::MicrophoneTestReady {
@@ -16589,37 +16577,135 @@ mod layout_tests {
         assert_eq!(app.status_message, "Preparing audio playback");
     }
 
+    fn start_blocked_controller_microphone_test(
+        app: &mut LocalTranscriberApp,
+    ) -> (audio::CaptureId, Sender<()>) {
+        let (entered_tx, entered_rx) = bounded(1);
+        let (retire_tx, retire_rx) = bounded(1);
+        app.capture_controller = audio::control::CaptureController::with_start_capture_for_test(
+            Arc::new(move |request, cancellation| {
+                if request.owner != audio::control::AudioOwnerKind::MicrophoneTest {
+                    return Ok(RecordingSession::simulated(
+                        None,
+                        CaptureStopReason::Explicit,
+                    ));
+                }
+                entered_tx.send(request.capture_id).unwrap();
+                while !cancellation.is_cancelled() {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                retire_rx.recv().unwrap();
+                Err(CaptureError::StartupCancelled)
+            }),
+        )
+        .unwrap();
+        app.start_microphone_test();
+        let capture_id = entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        (capture_id, retire_tx)
+    }
+
+    fn retire_blocked_controller_microphone_test(
+        app: &mut LocalTranscriberApp,
+        retire_tx: Sender<()>,
+    ) {
+        retire_tx.send(()).unwrap();
+        for _ in 0..200 {
+            app.poll_capture_controller();
+            app.poll_events();
+            app.poll_microphone_test();
+            if matches!(app.microphone_test, MicrophoneTest::Idle)
+                && app.microphone_test_control_id.is_none()
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     #[test]
-    fn cancelled_monitor_startup_keeps_audio_owners_excluded_until_confirmation() {
+    fn controller_cancelled_monitor_startup_defers_dictation_until_owner_retirement() {
         let mut app = test_app();
-        let cancellation = CaptureCancellation::new();
-        app.microphone_test = MicrophoneTest::Starting {
-            request_id: 12,
-            stop_requested: false,
-            cancellation: cancellation.clone(),
-        };
+        let (capture_id, retire_tx) = start_blocked_controller_microphone_test(&mut app);
 
         app.stop_microphone_test();
-        assert!(cancellation.is_cancelled());
-        app.apply_history_action(HistoryPageAction::Play(7));
-        assert_eq!(app.deferred_history_playback, Some(7));
         app.start_recording(RecordingSource::Transcribe);
-        assert!(app.deferred_recording_start.is_some());
-        assert!(app.deferred_history_playback.is_none());
-        assert!(app.pending_recording.is_none());
-        assert!(app.active_recording.is_none());
 
-        app.stop_recording();
-        app.tx
-            .send(AppEvent::MicrophoneTestReady {
-                request_id: 12,
-                result: Err(CaptureError::StartupCancelled),
-            })
-            .unwrap();
-        app.poll_events();
+        assert!(app.deferred_recording_start.is_some());
+        assert!(app.pending_recording.is_none());
+        assert_eq!(
+            app.capture_controller
+                .handle()
+                .owner_id(audio::control::AudioOwnerKind::MicrophoneTest),
+            Some(capture_id.0)
+        );
+
+        retire_blocked_controller_microphone_test(&mut app, retire_tx);
 
         assert!(matches!(app.microphone_test, MicrophoneTest::Idle));
         assert!(app.microphone_test_error.is_none());
+        assert!(!app.microphone_monitor_retry_required);
+        assert!(app.deferred_recording_start.is_none());
+        assert!(app.pending_recording.is_some());
+        assert_eq!(
+            app.capture_controller
+                .handle()
+                .owner_id(audio::control::AudioOwnerKind::MicrophoneTest),
+            None
+        );
+        assert_eq!(
+            app.capture_controller
+                .handle()
+                .owner_id(audio::control::AudioOwnerKind::Capture),
+            app.capture_control_id.map(|id| id.0)
+        );
+    }
+
+    #[test]
+    fn controller_cancelled_monitor_startup_defers_playback_until_owner_retirement() {
+        let mut app = test_app();
+        let history_root = std::env::temp_dir().join(format!(
+            "scribe-monitor-playback-{}-{}",
+            std::process::id(),
+            NEXT_TEST_SESSION.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&history_root);
+        app.history_store =
+            Some(HistoryStore::open(&history_root, HistoryRetentionPolicy::default()).unwrap());
+        let (capture_id, retire_tx) = start_blocked_controller_microphone_test(&mut app);
+
+        app.stop_microphone_test();
+        app.apply_history_action(HistoryPageAction::Play(7));
+
+        assert_eq!(app.deferred_history_playback, Some(7));
+        assert!(app.playing_history_id.is_none());
+        assert_eq!(
+            app.capture_controller
+                .handle()
+                .owner_id(audio::control::AudioOwnerKind::MicrophoneTest),
+            Some(capture_id.0)
+        );
+
+        retire_blocked_controller_microphone_test(&mut app, retire_tx);
+
+        assert!(matches!(app.microphone_test, MicrophoneTest::Idle));
+        assert!(app.microphone_test_error.is_none());
+        assert!(!app.microphone_monitor_retry_required);
+        assert!(app.deferred_history_playback.is_none());
+        assert_eq!(app.playing_history_id, Some(7));
+        assert_eq!(
+            app.capture_controller
+                .handle()
+                .owner_id(audio::control::AudioOwnerKind::MicrophoneTest),
+            None
+        );
+        assert_eq!(
+            app.capture_controller
+                .handle()
+                .owner_id(audio::control::AudioOwnerKind::Playback),
+            app.history_playback_lease.as_ref().map(|lease| lease.id)
+        );
+        drop(app);
+        let _ = std::fs::remove_dir_all(history_root);
     }
 
     #[test]
@@ -16698,7 +16784,6 @@ mod layout_tests {
         app.microphone_test = MicrophoneTest::Starting {
             request_id: 3,
             stop_requested: false,
-            cancellation: CaptureCancellation::new(),
         };
         app.tx
             .send(AppEvent::MicrophoneTestReady {
