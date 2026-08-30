@@ -188,6 +188,15 @@ function Assert-VulkanSdkWorkflowContract([string]$Workflow) {
         throw 'Vulkan SDK acquisition must verify the pinned upstream installer instead of delegating trust to a mutable package-manager command.'
     }
 
+    $fetch = Get-WorkflowStepBlock `
+        $Workflow `
+        'Fetch locked Rust dependencies' `
+        'Prepare reviewed sherpa-onnx archive'
+    Assert-OrderedWorkflowTokens $fetch @(
+        'cargo fetch --locked',
+        'cargo fetch --locked --manifest-path tools/worker-pack-author/Cargo.toml'
+    ) 'locked root and worker-pack author dependency fetch'
+
     $lint = Get-WorkflowStepBlock $Workflow 'Lint' 'Test'
     $test = Get-WorkflowStepBlock $Workflow 'Test' 'Download and verify pinned release inputs'
     if (-not $lint.Contains('cargo clippy --locked --all-targets --all-features -- -D warnings') -or

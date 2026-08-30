@@ -127,7 +127,10 @@ jobs:
           (Join-Path $sdkRoot 'Bin') >> $env:GITHUB_PATH
 
       - name: Fetch locked Rust dependencies
-        run: cargo fetch --locked
+        shell: pwsh
+        run: |
+          cargo fetch --locked
+          cargo fetch --locked --manifest-path tools/worker-pack-author/Cargo.toml
 
       - name: Prepare reviewed sherpa-onnx archive
         shell: pwsh
