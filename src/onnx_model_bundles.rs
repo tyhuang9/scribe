@@ -1289,6 +1289,18 @@ pub(crate) fn bundle_disk_space_preflight(
     disk_space::preflight_download_destination(&target, additional).map_err(InstallError::Failed)
 }
 
+pub(crate) fn bundle_download_size_bytes(model_id: &str) -> Result<u64, InstallError> {
+    bundle_manifest(model_id)
+        .ok_or_else(|| failed(format!("unknown internal ONNX bundle {model_id}")))?
+        .files
+        .iter()
+        .try_fold(0_u64, |total, file| {
+            total
+                .checked_add(file.size_bytes)
+                .ok_or_else(|| failed("ONNX bundle download-size total overflowed"))
+        })
+}
+
 fn bundle_required_install_bytes(
     manifest: &OnnxBundleManifest,
     required_download_bytes: impl IntoIterator<Item = u64>,
@@ -1451,6 +1463,9 @@ pub(crate) fn discard_onnx_bundle_partials(
     let target_root = bundle_target_root(storage_root, model_id)?;
     let _target_guard = acquire_bundle_target(&target_root)?;
     let mut discarded = 0_u64;
+    if crate::installations::discard_file_bundle_staging(&target_root)? {
+        discarded += 1;
+    }
     for artifact in pinned_files(storage_root, manifest)? {
         if discard_pinned_artifact_partial(&artifact)? {
             discarded += 1;
