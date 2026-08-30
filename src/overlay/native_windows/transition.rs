@@ -600,6 +600,44 @@ mod tests {
     }
 
     #[test]
+    fn meter_uses_distinct_attack_release_and_capture_stop_decay_rates() {
+        let at = Instant::now();
+        let mut engine = OverlayTransitionEngine::default();
+        let _ = engine.advance(snapshot(OverlayPhase::Listening), at, false);
+
+        let mut loud = snapshot(OverlayPhase::Listening);
+        loud.state.audio_level.rms = 1.0;
+        let attacked = render(engine.advance(loud, at + Duration::from_millis(60), false));
+        let attack_level = attacked.target.state.audio_level.rms;
+        assert!(
+            (0.62..0.64).contains(&attack_level),
+            "a 60ms attack must use the 60ms attack constant, got {attack_level}"
+        );
+
+        let released = render(engine.advance(
+            snapshot(OverlayPhase::Listening),
+            at + Duration::from_millis(120),
+            false,
+        ));
+        let release_level = released.target.state.audio_level.rms;
+        assert!(
+            (0.40..0.43).contains(&release_level),
+            "a 60ms listening release must use the 140ms release constant, got {release_level}"
+        );
+
+        let stopped = render(engine.advance(
+            snapshot(OverlayPhase::Finalizing),
+            at + Duration::from_millis(180),
+            false,
+        ));
+        let stopped_level = stopped.target.state.audio_level.rms;
+        assert!(
+            (0.18..0.21).contains(&stopped_level),
+            "a 60ms capture-stop decay must use the 80ms decay constant, got {stopped_level}"
+        );
+    }
+
+    #[test]
     fn meter_advances_without_new_snapshots_then_decays_after_capture_stops() {
         let at = Instant::now();
         let mut engine = OverlayTransitionEngine::default();
