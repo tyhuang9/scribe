@@ -646,6 +646,171 @@ mod tests {
     }
 
     #[test]
+    fn dropped_event_bridge_receiver_cancels_and_retires_the_exact_direct_owner() {
+        let (started_tx, started_rx) = unbounded();
+        let (cancelled_tx, cancelled_rx) = unbounded();
+        let (retire_tx, retire_rx) = unbounded();
+        let controller = crate::audio::control::CaptureController::with_start_capture_for_test(
+            Arc::new(move |request, cancellation| {
+                started_tx.send(request.capture_id).unwrap();
+                while !cancellation.is_cancelled() {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                cancelled_tx.send(request.capture_id).unwrap();
+                retire_rx.recv().unwrap();
+                Err(crate::audio::CaptureError::StartupCancelled)
+            }),
+        )
+        .unwrap();
+        controller
+            .handle()
+            .reconfigure_hotkey(
+                true,
+                crate::audio::control::CaptureHotkeyMode::HoldToTalk,
+                30,
+                None,
+                crate::audio::CaptureOptions::default(),
+            )
+            .unwrap();
+        let hotkey = parse_hotkey("Ctrl+Shift+Space").unwrap();
+        let (sender, receiver) = unbounded();
+        drop(receiver);
+        let bridge = EventBridge {
+            sender,
+            native_wake: Arc::new(|| {}),
+            repaint_wake: Arc::new(|| {}),
+            capture_control: Arc::new(RwLock::new(controller.handle())),
+            registered_id: Arc::new(AtomicU32::new(hotkey.id())),
+        };
+
+        bridge.send(GlobalHotKeyEvent {
+            id: hotkey.id(),
+            state: HotKeyState::Pressed,
+        });
+
+        let capture_id = started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(
+            cancelled_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap(),
+            capture_id,
+            "the failed enqueue must cancel the same direct-start owner"
+        );
+        assert_eq!(
+            controller
+                .handle()
+                .owner_id(crate::audio::control::AudioOwnerKind::Capture),
+            Some(capture_id.0),
+            "the cancelled owner remains reserved until its startup task retires"
+        );
+        assert!(matches!(
+            controller
+                .handle()
+                .reserve_owner(crate::audio::control::AudioOwnerKind::Playback),
+            Err(crate::audio::control::CaptureControlError::Owned(
+                crate::audio::control::AudioOwnerKind::Capture
+            ))
+        ));
+
+        retire_tx.send(()).unwrap();
+        for _ in 0..100 {
+            if controller.handle().owner().is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(controller.handle().owner().is_none());
+        let playback = controller
+            .handle()
+            .reserve_owner(crate::audio::control::AudioOwnerKind::Playback)
+            .unwrap();
+        controller.handle().release(playback.id).unwrap();
+    }
+
+    #[test]
+    fn discard_pending_events_retires_the_exact_queued_direct_start_ticket() {
+        let (started_tx, started_rx) = unbounded();
+        let (cancelled_tx, cancelled_rx) = unbounded();
+        let (retire_tx, retire_rx) = unbounded();
+        let controller = crate::audio::control::CaptureController::with_start_capture_for_test(
+            Arc::new(move |request, cancellation| {
+                started_tx.send(request.capture_id).unwrap();
+                while !cancellation.is_cancelled() {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                cancelled_tx.send(request.capture_id).unwrap();
+                retire_rx.recv().unwrap();
+                Err(crate::audio::CaptureError::StartupCancelled)
+            }),
+        )
+        .unwrap();
+        let handle = controller.handle();
+        handle
+            .reconfigure_hotkey(
+                true,
+                crate::audio::control::CaptureHotkeyMode::HoldToTalk,
+                30,
+                None,
+                crate::audio::CaptureOptions::default(),
+            )
+            .unwrap();
+        let hotkey = parse_hotkey("Ctrl+Shift+Space").unwrap();
+        let (sender, receiver) = unbounded();
+        let service = HotkeyService {
+            manager: None,
+            hotkey: Some(hotkey),
+            event_rx: receiver,
+            registered_id: Arc::new(AtomicU32::new(hotkey.id())),
+            capture_control: handle.clone(),
+            last_error: None,
+        };
+        let HotkeyDispatch::Start(ticket) = handle.dispatch_hotkey(true, Instant::now()) else {
+            panic!("eligible press should queue a direct Start ticket");
+        };
+        sender
+            .send(QueuedGlobalHotkeyEvent {
+                event: GlobalHotKeyEvent {
+                    id: hotkey.id(),
+                    state: HotKeyState::Pressed,
+                },
+                observed_at: Instant::now(),
+                direct_dispatch: HotkeyDispatch::Start(ticket.clone()),
+            })
+            .unwrap();
+
+        service.discard_pending_events();
+
+        assert_eq!(
+            started_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap(),
+            ticket.capture_id
+        );
+        assert_eq!(
+            cancelled_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap(),
+            ticket.capture_id,
+            "discard must terminate the queued ticket without a revision change"
+        );
+        assert_eq!(
+            handle.owner_id(crate::audio::control::AudioOwnerKind::Capture),
+            Some(ticket.capture_id.0)
+        );
+
+        retire_tx.send(()).unwrap();
+        for _ in 0..100 {
+            if handle.owner().is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(handle.owner().is_none());
+    }
+
+    #[test]
     fn ignores_events_when_no_hotkey_is_registered() {
         let hotkey = parse_hotkey("Ctrl+Shift+Space").unwrap();
 
