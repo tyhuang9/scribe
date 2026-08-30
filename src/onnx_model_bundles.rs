@@ -3685,6 +3685,159 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn onnx_removal_recovery_rejects_a_self_certified_forged_journal() {
+        let root = unique_root("removal-forged-journal");
+        let storage = root.join("onnx-bundles");
+        fs::create_dir_all(&storage).unwrap();
+        let model_id = "fixture-removal-model";
+        let target = bundle_target_root(&storage, model_id).unwrap();
+        let receipt = write_fixture_bundle(&target, model_id, "forged");
+        let manifest = manifest_from_fixture_receipt(&receipt);
+        let candidate =
+            verified_removal_candidate_at_with_manifest_for_test(model_id, &target, &manifest)
+                .unwrap();
+        let nonce = format!("{:x}", Sha256::digest(b"attacker-chosen-nonce"));
+
+        let mut durable_config = crate::config::AppConfig::default();
+        durable_config.general.model_storage_dir = root.clone();
+        crate::config::normalize_config(&mut durable_config);
+        let durable_fingerprint =
+            crate::config::settings::artifact_config_fingerprint(&durable_config).unwrap();
+        let forged = stage_onnx_bundle_removal_with(
+            &storage,
+            model_id,
+            candidate.receipt_sha256(),
+            format!("{:x}", Sha256::digest(b"attacker-prior")),
+            durable_fingerprint.clone(),
+            nonce,
+            false,
+            |expected, root| {
+                verified_removal_candidate_at_with_manifest_for_test(expected, root, &manifest)
+            },
+        )
+        .unwrap();
+        drop(forged);
+
+        let error = reconcile_onnx_bundle_removal_with(
+            &storage,
+            model_id,
+            &durable_fingerprint,
+            false,
+            Some(durable_config),
+            |expected, root| {
+                verified_removal_candidate_at_with_manifest_for_test(expected, root, &manifest)
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("do not authorize committed ONNX removal")
+        );
+        assert!(!target.exists());
+        assert!(removal_tombstone_path(&target).unwrap().is_dir());
+        assert!(removal_journal_path(&target).unwrap().is_file());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pending_onnx_removal_witness_survives_filesystem_crash_points() {
+        let model_id = "fixture-removal-model";
+        for crash_after_journal_cleanup in [false, true] {
+            let root = unique_root(if crash_after_journal_cleanup {
+                "removal-crash-after-journal-cleanup"
+            } else {
+                "removal-crash-after-tree-delete"
+            });
+            let storage = root.join("onnx-bundles");
+            fs::create_dir_all(&storage).unwrap();
+            let target = bundle_target_root(&storage, model_id).unwrap();
+            let receipt = write_fixture_bundle(&target, model_id, "pending-lifetime");
+            let manifest = manifest_from_fixture_receipt(&receipt);
+            let candidate =
+                verified_removal_candidate_at_with_manifest_for_test(model_id, &target, &manifest)
+                    .unwrap();
+            let nonce = format!(
+                "{:x}",
+                Sha256::digest(if crash_after_journal_cleanup {
+                    b"after-journal-cleanup".as_slice()
+                } else {
+                    b"after-tree-delete".as_slice()
+                })
+            );
+            let (_, prior, pending_config, pending_fingerprint) = removal_test_configs(
+                &storage,
+                model_id,
+                &target,
+                candidate.receipt_sha256(),
+                &nonce,
+            );
+            let mut removal = stage_onnx_bundle_removal_with(
+                &storage,
+                model_id,
+                candidate.receipt_sha256(),
+                prior,
+                pending_fingerprint.clone(),
+                nonce,
+                false,
+                |expected, root| {
+                    verified_removal_candidate_at_with_manifest_for_test(expected, root, &manifest)
+                },
+            )
+            .unwrap();
+            removal
+                .prepare_config_commit(pending_fingerprint.clone())
+                .unwrap();
+            assert!(
+                pending_config
+                    .general
+                    .pending_onnx_removals
+                    .contains_key(model_id),
+                "durable authority must exist before filesystem commit"
+            );
+
+            if crash_after_journal_cleanup {
+                let mut final_config = pending_config.clone();
+                final_config.general.pending_onnx_removals.remove(model_id);
+                removal.commit(&pending_fingerprint, &final_config).unwrap();
+                assert!(!removal_journal_path(&target).unwrap().exists());
+            } else {
+                drop(removal);
+                fs::remove_dir_all(removal_tombstone_path(&target).unwrap()).unwrap();
+                assert!(removal_journal_path(&target).unwrap().is_file());
+            }
+            assert!(!target.exists());
+
+            let recovered = reconcile_onnx_bundle_removal_with(
+                &storage,
+                model_id,
+                &pending_fingerprint,
+                false,
+                Some(pending_config),
+                |expected, root| {
+                    verified_removal_candidate_at_with_manifest_for_test(expected, root, &manifest)
+                },
+            )
+            .unwrap();
+            assert!(recovered.reconciled);
+            assert!(
+                recovered
+                    .durable_config
+                    .unwrap()
+                    .general
+                    .pending_onnx_removals
+                    .is_empty(),
+                "recovery may clear authority only after tree and journal are both absent"
+            );
+            assert!(!removal_journal_path(&target).unwrap().exists());
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn onnx_removal_recovery_skips_tree_verification_without_a_transaction() {
         let storage = unique_root("removal-recovery-no-transaction");
         fs::create_dir_all(&storage).unwrap();
