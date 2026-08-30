@@ -8,6 +8,7 @@ while (($#)); do case "$1" in --app) app="${2:-}"; shift 2;; --require-notarizat
 [[ "$(uname -s)" == Darwin ]] || { echo 'macOS release verification requires macOS.' >&2; exit 1; }
 [[ -d "$app" && ! -L "$app" ]] || { echo 'Scribe.app is missing or unsafe.' >&2; exit 1; }
 command -v jq >/dev/null || { echo 'jq is required.' >&2; exit 1; }
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 resources="$app/Contents/Resources"; macos="$app/Contents/MacOS"; catalog="$resources/worker-pack-catalog.json"
 authority="$resources/gpu-pack-release-authority.json"
 assert_no_keychain_group() {
@@ -23,6 +24,16 @@ assert_no_keychain_group() {
     echo "worker must not expose the desktop Keychain group: $target" >&2
     return 1
   fi
+  rm -f "$entitlements"
+}
+assert_exact_protected_entitlements() {
+  local target="$1" expected_group="$2" expected_team="${2%%.*}" entitlements
+  entitlements="$(mktemp "${TMPDIR:-/tmp}/scribe-macos-protected-entitlements.XXXXXX")"
+  codesign -d --entitlements :- "$target" 2>/dev/null >"$entitlements" || { rm -f "$entitlements"; echo "could not inspect protected target entitlements: $target" >&2; return 1; }
+  plutil -extract keychain-access-groups json -o - "$entitlements" |
+    jq -e --arg group "$expected_group" 'type == "array" and . == [$group]' >/dev/null || { rm -f "$entitlements"; echo "protected target Keychain group is not exact: $target" >&2; return 1; }
+  [[ "$(plutil -extract com.apple.application-identifier raw -o - "$entitlements" 2>/dev/null)" == "$expected_group" ]] || { rm -f "$entitlements"; echo "protected target application identifier is not exact: $target" >&2; return 1; }
+  [[ "$(plutil -extract com.apple.developer.team-identifier raw -o - "$entitlements" 2>/dev/null)" == "$expected_team" ]] || { rm -f "$entitlements"; echo "protected target team identifier is not exact: $target" >&2; return 1; }
   rm -f "$entitlements"
 }
 for path in "$app/Contents/Info.plist" "$macos/Scribe" "$macos/scribe-inference-worker" "$catalog" "$authority"; do [[ -f "$path" && ! -L "$path" ]] || { echo "required regular file missing: $path" >&2; exit 1; }; done
@@ -47,7 +58,7 @@ authority_json="$(jq -c . "$authority")"
 release_security_epoch="$(jq -r '.release_security_epoch' "$authority")"
 keychain_access_group="$(jq -r '.keychain_access_group' "$authority")"
 embedded_profile_required=false
-[[ "$release_security_epoch" =~ ^(0|[1-9][0-9]{0,19})$ && ( ${#release_security_epoch} -lt 20 || "$release_security_epoch" < '18446744073709551615' || "$release_security_epoch" == '18446744073709551615' ) ]] || { echo 'release authority epoch is not a canonical u64.' >&2; exit 1; }
+[[ "$release_security_epoch" =~ ^(0|[1-9][0-9]{0,15})$ && ( ${#release_security_epoch} -lt 16 || "$release_security_epoch" < '9007199254740991' || "$release_security_epoch" == '9007199254740991' ) ]] || { echo 'release authority epoch is not a canonical exact JSON integer from 0 through 9007199254740991.' >&2; exit 1; }
 jq -e --arg digest "$catalog_digest" --slurpfile catalog "$catalog" '
   .schema_version == 2 and .catalog_sha256 == $digest and
   (.entries | type == "array") and
@@ -67,6 +78,10 @@ if [[ "$release_security_epoch" == 0 ]]; then
   [[ "$authority_json" == "$(cat "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)/runtime-manifests/gpu-pack-release-authority-macos-empty.json")" ]] || { echo 'epoch-zero authority is not canonical.' >&2; exit 1; }
 else
   [[ "$keychain_access_group" =~ ^[A-Z0-9]{10}\.com\.scribe\.local-transcriber$ ]] || { echo 'positive release authority has an invalid Keychain group.' >&2; exit 1; }
+  reviewed_namespace="$repo_root/runtime-manifests/gpu-keychain-namespace-macos-release.json"
+  [[ "$(jq -c . "$reviewed_namespace")" == "$(cat "$reviewed_namespace")" ]] || { echo 'reviewed macOS Keychain namespace manifest is not canonical.' >&2; exit 1; }
+  reviewed_group="$(jq -r 'select(.schema_version == 1) | .keychain_access_group' "$reviewed_namespace")"
+  [[ -n "$reviewed_group" && "$keychain_access_group" == "$reviewed_group" ]] || { echo 'positive release does not use the exact non-empty source-reviewed Keychain namespace.' >&2; exit 1; }
   jq -e --argjson epoch "$release_security_epoch" 'all(.entries[]; .security_epoch == $epoch)' "$authority" >/dev/null || { echo 'release authority pack epoch differs from release epoch.' >&2; exit 1; }
 fi
 LC_ALL=C strings "$macos/Scribe" | grep -Fqx "$authority_json" >/dev/null || { echo 'desktop does not embed the exact release authority.' >&2; exit 1; }
@@ -78,20 +93,21 @@ if [[ "$release_security_epoch" == 0 ]]; then
   codesign -d --entitlements :- "$macos/Scribe" 2>/dev/null >"$desktop_entitlements"
   ! plutil -extract keychain-access-groups json -o - "$desktop_entitlements" >/dev/null 2>&1 || { echo 'epoch-zero desktop binary must not expose a Keychain group.' >&2; exit 1; }
 else
-  plutil -extract keychain-access-groups json -o - "$desktop_entitlements" |
-    jq -e --arg group "$keychain_access_group" 'type == "array" and . == [$group]' >/dev/null || { echo 'desktop does not expose exactly the authority Keychain group.' >&2; exit 1; }
-  codesign -d --entitlements :- "$macos/Scribe" 2>/dev/null >"$desktop_entitlements"
-  plutil -extract keychain-access-groups json -o - "$desktop_entitlements" |
-    jq -e --arg group "$keychain_access_group" 'type == "array" and . == [$group]' >/dev/null || { echo 'desktop binary does not expose exactly the authority Keychain group.' >&2; exit 1; }
+  assert_exact_protected_entitlements "$app" "$keychain_access_group"
+  assert_exact_protected_entitlements "$macos/Scribe" "$keychain_access_group"
   profile="$app/Contents/embedded.provisionprofile"
   [[ -f "$profile" && ! -L "$profile" ]] || { echo 'positive release is missing a safe embedded provisioning profile.' >&2; exit 1; }
   decoded_profile="$(mktemp "${TMPDIR:-/tmp}/scribe-macos-profile.XXXXXX")"
+  profile_entitlements="$(mktemp "${TMPDIR:-/tmp}/scribe-macos-profile-entitlements.XXXXXX")"
   security cms -D -i "$profile" >"$decoded_profile" || { echo 'embedded provisioning profile could not be decoded.' >&2; exit 1; }
-  profile_application_identifier="$(plutil -extract Entitlements:application-identifier raw -o - "$decoded_profile" 2>/dev/null)" || { echo 'embedded provisioning profile has no application identifier.' >&2; exit 1; }
+  plutil -extract Entitlements xml1 -o "$profile_entitlements" "$decoded_profile" || { echo 'embedded provisioning profile has no entitlement dictionary.' >&2; exit 1; }
+  profile_application_identifier="$(plutil -extract application-identifier raw -o - "$profile_entitlements" 2>/dev/null)" || { echo 'embedded provisioning profile has no application identifier.' >&2; exit 1; }
+  profile_team_identifier="$(plutil -extract com.apple.developer.team-identifier raw -o - "$profile_entitlements" 2>/dev/null)" || { echo 'embedded provisioning profile has no team identifier.' >&2; exit 1; }
   [[ "$profile_application_identifier" == "$keychain_access_group" ]] || { echo 'embedded provisioning profile application identifier does not authorize the authority group.' >&2; exit 1; }
-  plutil -extract Entitlements:keychain-access-groups json -o - "$decoded_profile" |
+  [[ "$profile_team_identifier" == "${keychain_access_group%%.*}" ]] || { echo 'embedded provisioning profile team identifier does not authorize the authority group.' >&2; exit 1; }
+  plutil -extract keychain-access-groups json -o - "$profile_entitlements" |
     jq -e --arg group "$keychain_access_group" 'type == "array" and . == [$group]' >/dev/null || { echo 'embedded provisioning profile keychain groups are not exact.' >&2; exit 1; }
-  rm -f "$decoded_profile"
+  rm -f "$decoded_profile" "$profile_entitlements"
   embedded_profile_required=true
 fi
 expected_file="$(mktemp "${TMPDIR:-/tmp}/scribe-macos-expected.XXXXXX")"

@@ -30,7 +30,7 @@ done
 [[ "$pack_version" =~ ^[a-z0-9]([a-z0-9._-]{0,94}[a-z0-9])?$ ]] || { echo 'pack version must be a canonical immutable-store component.' >&2; exit 2; }
 [[ -n "$output_packs_root" ]] || { echo 'output packs root is required.' >&2; exit 2; }
 [[ "$signing_mode" == adhoc || "$signing_mode" == developer-id ]] || { echo 'signing mode must be adhoc or developer-id.' >&2; exit 2; }
-[[ "$security_epoch" =~ ^[1-9][0-9]{0,19}$ && ( ${#security_epoch} -lt 20 || "$security_epoch" < '18446744073709551615' || "$security_epoch" == '18446744073709551615' ) ]] || { echo 'security epoch must be a positive canonical u64 decimal.' >&2; exit 2; }
+[[ "$security_epoch" =~ ^[1-9][0-9]{0,15}$ && ( ${#security_epoch} -lt 16 || "$security_epoch" < '9007199254740991' || "$security_epoch" == '9007199254740991' ) ]] || { echo 'security epoch must be a positive canonical exact JSON integer no greater than 9007199254740991.' >&2; exit 2; }
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 arch="${target%%-apple-darwin}"

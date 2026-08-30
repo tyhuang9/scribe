@@ -7,6 +7,8 @@ use sha2::{Digest, Sha256};
 const SILERO_VAD_ASSET: &str = "resources/silero-vad/silero_vad.int8.onnx";
 const SILERO_VAD_SIZE: usize = 212_860;
 const SILERO_VAD_SHA256: &str = "c36d490aff5ab924ca6c7aeec4d8f6bd3d22db6fa17611b9c5b17eae58ac3a20";
+const MACOS_KEYCHAIN_NAMESPACE_MANIFEST: &str =
+    "runtime-manifests/gpu-keychain-namespace-macos-release.json";
 
 fn main() {
     reject_multiple_gpu_features();
@@ -37,17 +39,51 @@ fn main() {
     }
 }
 
-fn validated_macos_keychain_access_group() -> Option<String> {
+fn canonical_macos_keychain_access_group(value: &str) -> bool {
+    let (team_id, suffix) = value.split_at_checked(10).unwrap_or(("", ""));
+    suffix == ".com.scribe.local-transcriber"
+        && team_id
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+}
+
+fn reviewed_macos_keychain_access_group() -> String {
+    const PREFIX: &str = r#"{"schema_version":1,"keychain_access_group":""#;
+    const SUFFIX: &str = r#""}"#;
+    const REVIEWED_NAME: &str = "SCRIBE_REVIEWED_MACOS_GPU_ROLLBACK_KEYCHAIN_ACCESS_GROUP";
+
+    println!("cargo:rerun-if-changed={MACOS_KEYCHAIN_NAMESPACE_MANIFEST}");
+    let source = fs::read_to_string(MACOS_KEYCHAIN_NAMESPACE_MANIFEST).unwrap_or_else(|error| {
+        panic!("could not read the reviewed macOS Keychain namespace manifest: {error}")
+    });
+    let canonical = source.strip_suffix('\n').unwrap_or(&source);
+    assert!(
+        !canonical.ends_with('\r') && !canonical.contains('\n'),
+        "reviewed macOS Keychain namespace manifest must be canonical single-line JSON"
+    );
+    let group = canonical
+        .strip_prefix(PREFIX)
+        .and_then(|value| value.strip_suffix(SUFFIX))
+        .expect("reviewed macOS Keychain namespace manifest has an invalid schema or encoding");
+    assert!(
+        group.is_empty() || canonical_macos_keychain_access_group(group),
+        "reviewed macOS Keychain namespace must be empty or the exact Scribe access group"
+    );
+    println!("cargo:rustc-env={REVIEWED_NAME}={group}");
+    group.to_owned()
+}
+
+fn validated_macos_keychain_access_group(reviewed_group: &str) -> Option<String> {
     const NAME: &str = "SCRIBE_MACOS_GPU_ROLLBACK_KEYCHAIN_ACCESS_GROUP";
     println!("cargo:rerun-if-env-changed={NAME}");
     let value = std::env::var(NAME).ok().filter(|value| !value.is_empty())?;
-    let (team_id, suffix) = value.split_at_checked(10).unwrap_or(("", ""));
     assert!(
-        suffix == ".com.scribe.local-transcriber"
-            && team_id
-                .bytes()
-                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit()),
+        canonical_macos_keychain_access_group(&value),
         "{NAME} must match TEAMID.com.scribe.local-transcriber with a 10-character uppercase alphanumeric Team ID"
+    );
+    assert!(
+        !reviewed_group.is_empty() && value == reviewed_group,
+        "{NAME} must exactly match the non-empty source-reviewed macOS Keychain namespace"
     );
     println!("cargo:rustc-env={NAME}={value}");
     Some(value)
@@ -119,7 +155,9 @@ fn prepare_macos_native_shims() {
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let metal_enabled = std::env::var_os("CARGO_FEATURE_METAL_ACCELERATION").is_some();
     let building_worker = std::env::var("SCRIBE_BUILDING_WORKER").ok();
-    let _keychain_access_group = validated_macos_keychain_access_group();
+    let reviewed_keychain_access_group = reviewed_macos_keychain_access_group();
+    let _keychain_access_group =
+        validated_macos_keychain_access_group(&reviewed_keychain_access_group);
     println!("cargo:rustc-check-cfg=cfg(scribe_macos_keychain_authority)");
     assert!(
         !metal_enabled || target_os == "macos",
