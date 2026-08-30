@@ -4,7 +4,7 @@ mod ring_buffer;
 
 use std::fs;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -45,6 +45,39 @@ const STARTUP_PENDING: u8 = 0;
 const STARTUP_PLAY_COMMITTED: u8 = 1;
 const STARTUP_FIRST_SAMPLE: u8 = 2;
 const STARTUP_CANCELLED: u8 = 3;
+
+#[derive(Clone, Copy)]
+enum CaptureTimingLog {
+    DropBeforeFirstSample {
+        capture_id: CaptureId,
+        hotkey_to_worker: Duration,
+        device_lookup: Duration,
+        stream_build: Duration,
+        stream_play: Duration,
+        drop_elapsed: Duration,
+    },
+    Complete {
+        capture_id: CaptureId,
+        timing: CaptureTimingMetrics,
+        dropped_without_audio: bool,
+    },
+}
+
+static CAPTURE_TIMING_LOGGER: OnceLock<Sender<CaptureTimingLog>> = OnceLock::new();
+
+pub(crate) fn initialize_capture_timing_logger() {
+    let _ = CAPTURE_TIMING_LOGGER.get_or_init(|| {
+        let (tx, rx) = bounded(64);
+        let _ = thread::Builder::new()
+            .name("scribe-capture-timing".to_owned())
+            .spawn(move || {
+                while let Ok(event) = rx.recv() {
+                    write_capture_timing_log(event);
+                }
+            });
+        tx
+    });
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct VadOptions {
@@ -189,6 +222,7 @@ pub struct CaptureCancellation {
     stop_requested: Arc<AtomicBool>,
     startup_state: Arc<AtomicU8>,
     startup_abort_requested: Arc<AtomicBool>,
+    stop_observed_us: Arc<AtomicU64>,
 }
 
 impl CaptureCancellation {
@@ -201,6 +235,21 @@ impl CaptureCancellation {
             self.startup_abort_requested.store(true, Ordering::Release);
         }
         self.stop_requested.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn cancel_at(&self, elapsed: Duration) {
+        let encoded_us = encode_elapsed_us(elapsed);
+        let _ = self.stop_observed_us.compare_exchange(
+            0,
+            encoded_us,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        self.cancel();
+    }
+
+    fn stop_observed_elapsed(&self) -> Option<Duration> {
+        decode_elapsed_us(self.stop_observed_us.load(Ordering::Acquire))
     }
 
     /// Linearizes cancellation against the audio callback's first-sample
@@ -303,8 +352,13 @@ pub struct CaptureTimingMetrics {
     pub device_lookup: Duration,
     pub stream_build: Duration,
     pub stream_play: Duration,
+    pub stream_play_requested: Duration,
+    pub stream_play_returned: Duration,
+    pub first_native_callback: Option<Duration>,
     pub first_sample: Duration,
     pub release: Option<Duration>,
+    pub stream_dropped: Duration,
+    pub final_audio_ready: Duration,
     pub finalization: Duration,
 }
 
@@ -1148,6 +1202,14 @@ fn capture_worker(
     let (producer, mut consumer) = ring_buffer(ring_capacity);
     let fault = Arc::new(AtomicU8::new(FAULT_NONE));
     let dropped_samples = Arc::new(AtomicUsize::new(0));
+    let first_callback_us = Arc::new(AtomicU64::new(0));
+    let callback_state = CaptureCallbackState {
+        fault: Arc::clone(&fault),
+        dropped_samples: Arc::clone(&dropped_samples),
+        cancellation: cancellation.clone(),
+        timing_origin: context.observed_at,
+        first_callback_us: Arc::clone(&first_callback_us),
+    };
     cancellation.ensure_startup_active()?;
     let stream_build_started = Instant::now();
     let mut stream = Some(build_stream(
@@ -1155,14 +1217,12 @@ fn capture_worker(
         &config,
         format.sample_format,
         producer,
-        Arc::clone(&fault),
-        Arc::clone(&dropped_samples),
-        cancellation.clone(),
+        callback_state.clone(),
     )?);
     let stream_build = stream_build_started.elapsed();
     cancellation.commit_play()?;
     let capture_started = Instant::now();
-    let (detector, stream_play) = play_before_capture_setup(
+    let (detector, stream_play_timing) = play_before_capture_setup(
         || {
             stream
                 .as_ref()
@@ -1185,6 +1245,13 @@ fn capture_worker(
             Err(error) => Err(error),
         },
     )?;
+    let stream_play = stream_play_timing.duration;
+    let stream_play_requested = stream_play_timing
+        .requested_at
+        .saturating_duration_since(context.observed_at);
+    let stream_play_returned = stream_play_timing
+        .returned_at
+        .saturating_duration_since(context.observed_at);
     let mut pipeline = Pipeline::new(
         format.sample_rate,
         format.channels,
@@ -1206,7 +1273,7 @@ fn capture_worker(
             .clamp(1, config::MAX_RECORDING_SECONDS)
             .into(),
     );
-    let mut explicit_stop: Option<(Instant, usize, Duration)> = None;
+    let mut explicit_stop: Option<(Instant, usize, Duration, Duration)> = None;
     let mut restart_policy = RestartPolicy::new(MAX_STREAM_RESTARTS);
     let mut start_notified = false;
     let mut first_sample = None;
@@ -1248,7 +1315,14 @@ fn capture_worker(
             start_notified = true;
         }
         if explicit_stop.is_none() && stop_requested.load(Ordering::Acquire) {
-            explicit_stop = Some((Instant::now(), pipeline.source_frames(), elapsed));
+            explicit_stop = Some((
+                Instant::now(),
+                pipeline.source_frames(),
+                elapsed,
+                cancellation
+                    .stop_observed_elapsed()
+                    .unwrap_or_else(|| context.observed_at.elapsed()),
+            ));
         }
         if explicit_stop.is_none() {
             pipeline.publish_due_previews();
@@ -1289,9 +1363,7 @@ fn capture_worker(
                             &config,
                             format.sample_format,
                             producer,
-                            Arc::clone(&fault),
-                            Arc::clone(&dropped_samples),
-                            cancellation.clone(),
+                            callback_state.clone(),
                         )?;
                         if discard_requested.load(Ordering::Acquire) {
                             return Err(CaptureError::Discarded);
@@ -1316,7 +1388,7 @@ fn capture_worker(
             return discard_capture(&mut stream, &mut consumer, &mut pipeline);
         }
         let explicit_post_roll_complete =
-            explicit_stop.is_some_and(|(stop_seen, source_frame, _)| {
+            explicit_stop.is_some_and(|(stop_seen, source_frame, _, _)| {
                 let post_roll_frames =
                     duration_to_source_frames(options.vad.post_roll, format.sample_rate);
                 pipeline.source_frames() >= source_frame.saturating_add(post_roll_frames)
@@ -1328,7 +1400,7 @@ fn capture_worker(
             pipeline.endpoint_triggered(),
             elapsed >= maximum_duration,
         ) {
-            let trigger_elapsed = explicit_stop.map_or(elapsed, |(_, _, trigger)| trigger);
+            let trigger_elapsed = explicit_stop.map_or(elapsed, |(_, _, trigger, _)| trigger);
             break (reason, trigger_elapsed);
         }
 
@@ -1337,6 +1409,7 @@ fn capture_worker(
 
     let finalization_started = Instant::now();
     drop(stream.take());
+    let stream_dropped = context.observed_at.elapsed();
     if discard_requested.load(Ordering::Acquire) {
         return discard_capture(&mut stream, &mut consumer, &mut pipeline);
     }
@@ -1358,6 +1431,7 @@ fn capture_worker(
     let source_frames = pipeline.source_frames();
     let speech_trigger_elapsed = pipeline.speech_trigger_elapsed();
     let audio = pipeline.finish(stop_reason)?.map(Arc::new);
+    let final_audio_ready = context.observed_at.elapsed();
     let maximum_levels = pipeline.maximum_levels();
     let manual_threshold_crossed = pipeline.manual_threshold_crossed();
     let prepared_frames = audio.as_ref().map_or(0, |audio| audio.samples.len());
@@ -1366,8 +1440,13 @@ fn capture_worker(
         device_lookup,
         stream_build,
         stream_play,
+        stream_play_requested,
+        stream_play_returned,
+        first_native_callback: decode_elapsed_us(first_callback_us.load(Ordering::Acquire)),
         first_sample: first_sample.unwrap_or_default(),
-        release: explicit_stop.map(|(_, _, release)| release),
+        release: explicit_stop.map(|(_, _, _, release)| release),
+        stream_dropped,
+        final_audio_ready,
         finalization: finalization_started.elapsed(),
     };
     log_capture_completion(context.capture_id, timing, prepared_frames == 0);
@@ -1400,15 +1479,16 @@ fn log_capture_drop(
     stream_play: Duration,
     drop_elapsed: Duration,
 ) {
-    eprintln!(
-        "scribe_capture_timing capture_id={} outcome=drop_before_first_sample hotkey_to_worker_us={} device_lookup_us={} stream_build_us={} stream_play_us={} drop_us={}",
-        capture_id.0,
-        hotkey_to_worker.as_micros(),
-        device_lookup.as_micros(),
-        stream_build.as_micros(),
-        stream_play.as_micros(),
-        drop_elapsed.as_micros(),
-    );
+    if let Some(logger) = CAPTURE_TIMING_LOGGER.get() {
+        let _ = logger.try_send(CaptureTimingLog::DropBeforeFirstSample {
+            capture_id,
+            hotkey_to_worker,
+            device_lookup,
+            stream_build,
+            stream_play,
+            drop_elapsed,
+        });
+    }
 }
 
 fn log_capture_completion(
@@ -1416,22 +1496,59 @@ fn log_capture_completion(
     timing: CaptureTimingMetrics,
     dropped_without_audio: bool,
 ) {
-    eprintln!(
-        "scribe_capture_timing capture_id={} outcome={} hotkey_to_worker_us={} device_lookup_us={} stream_build_us={} stream_play_us={} first_sample_us={} release_us={} finalization_us={}",
-        capture_id.0,
-        if dropped_without_audio {
-            "drop_no_audio"
-        } else {
-            "complete"
-        },
-        timing.hotkey_to_worker.as_micros(),
-        timing.device_lookup.as_micros(),
-        timing.stream_build.as_micros(),
-        timing.stream_play.as_micros(),
-        timing.first_sample.as_micros(),
-        timing.release.map_or(0, |release| release.as_micros()),
-        timing.finalization.as_micros(),
-    );
+    if let Some(logger) = CAPTURE_TIMING_LOGGER.get() {
+        let _ = logger.try_send(CaptureTimingLog::Complete {
+            capture_id,
+            timing,
+            dropped_without_audio,
+        });
+    }
+}
+
+fn write_capture_timing_log(event: CaptureTimingLog) {
+    match event {
+        CaptureTimingLog::DropBeforeFirstSample {
+            capture_id,
+            hotkey_to_worker,
+            device_lookup,
+            stream_build,
+            stream_play,
+            drop_elapsed,
+        } => eprintln!(
+            "scribe_capture_timing capture_id={} outcome=drop_before_first_sample hotkey_to_worker_us={} device_lookup_us={} stream_build_us={} stream_play_us={} drop_us={}",
+            capture_id.0,
+            hotkey_to_worker.as_micros(),
+            device_lookup.as_micros(),
+            stream_build.as_micros(),
+            stream_play.as_micros(),
+            drop_elapsed.as_micros(),
+        ),
+        CaptureTimingLog::Complete {
+            capture_id,
+            timing,
+            dropped_without_audio,
+        } => eprintln!(
+            "scribe_capture_timing capture_id={} outcome={} hotkey_to_worker_us={} device_lookup_us={} stream_build_us={} stream_play_requested_us={} stream_play_returned_us={} first_native_callback_us={} release_us={} stream_dropped_us={} final_audio_ready_us={} finalization_us={}",
+            capture_id.0,
+            if dropped_without_audio {
+                "drop_no_audio"
+            } else {
+                "complete"
+            },
+            timing.hotkey_to_worker.as_micros(),
+            timing.device_lookup.as_micros(),
+            timing.stream_build.as_micros(),
+            timing.stream_play_requested.as_micros(),
+            timing.stream_play_returned.as_micros(),
+            timing
+                .first_native_callback
+                .map_or(0, |callback| callback.as_micros()),
+            timing.release.map_or(0, |release| release.as_micros()),
+            timing.stream_dropped.as_micros(),
+            timing.final_audio_ready.as_micros(),
+            timing.finalization.as_micros(),
+        ),
+    }
 }
 
 fn drain_ring_bounded(
@@ -1453,14 +1570,35 @@ fn drain_ring_bounded(
     Ok(drained)
 }
 
+struct StreamPlayTiming {
+    duration: Duration,
+    requested_at: Instant,
+    returned_at: Instant,
+}
+
 fn play_before_capture_setup<T>(
     play: impl FnOnce() -> Result<(), CaptureError>,
     setup: impl FnOnce() -> Result<T, CaptureError>,
-) -> Result<(T, Duration), CaptureError> {
-    let play_started = Instant::now();
+) -> Result<(T, StreamPlayTiming), CaptureError> {
+    let requested_at = Instant::now();
     play()?;
-    let play_elapsed = play_started.elapsed();
-    setup().map(|prepared| (prepared, play_elapsed))
+    let returned_at = Instant::now();
+    let timing = StreamPlayTiming {
+        duration: returned_at.saturating_duration_since(requested_at),
+        requested_at,
+        returned_at,
+    };
+    setup().map(|prepared| (prepared, timing))
+}
+
+fn decode_elapsed_us(encoded_us: u64) -> Option<Duration> {
+    (encoded_us != 0).then(|| Duration::from_micros(encoded_us - 1))
+}
+
+fn encode_elapsed_us(elapsed: Duration) -> u64 {
+    u64::try_from(elapsed.as_micros())
+        .unwrap_or(u64::MAX - 1)
+        .saturating_add(1)
 }
 
 fn drain_ring_all(
@@ -1612,16 +1750,23 @@ fn retry_stream_start<T>(
     })
 }
 
+#[derive(Clone)]
+struct CaptureCallbackState {
+    fault: Arc<AtomicU8>,
+    dropped_samples: Arc<AtomicUsize>,
+    cancellation: CaptureCancellation,
+    timing_origin: Instant,
+    first_callback_us: Arc<AtomicU64>,
+}
+
 fn build_stream(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
     sample_format: cpal::SampleFormat,
     mut producer: Producer,
-    fault: Arc<AtomicU8>,
-    dropped_samples: Arc<AtomicUsize>,
-    cancellation: CaptureCancellation,
+    callback_state: CaptureCallbackState,
 ) -> Result<cpal::Stream, CaptureError> {
-    let error_fault = Arc::clone(&fault);
+    let error_fault = Arc::clone(&callback_state.fault);
     let error_callback = move |_error| {
         mark_stream_fault(&error_fault);
     };
@@ -1629,14 +1774,7 @@ fn build_stream(
         cpal::SampleFormat::F32 => device.build_input_stream(
             config,
             move |data: &[f32], _| {
-                enqueue_samples(
-                    data,
-                    &mut producer,
-                    &fault,
-                    &dropped_samples,
-                    &cancellation,
-                    normalize_f32,
-                )
+                enqueue_samples(data, &mut producer, &callback_state, normalize_f32)
             },
             error_callback,
             None,
@@ -1644,14 +1782,7 @@ fn build_stream(
         cpal::SampleFormat::I16 => device.build_input_stream(
             config,
             move |data: &[i16], _| {
-                enqueue_samples(
-                    data,
-                    &mut producer,
-                    &fault,
-                    &dropped_samples,
-                    &cancellation,
-                    normalize_i16,
-                )
+                enqueue_samples(data, &mut producer, &callback_state, normalize_i16)
             },
             error_callback,
             None,
@@ -1659,14 +1790,7 @@ fn build_stream(
         cpal::SampleFormat::U16 => device.build_input_stream(
             config,
             move |data: &[u16], _| {
-                enqueue_samples(
-                    data,
-                    &mut producer,
-                    &fault,
-                    &dropped_samples,
-                    &cancellation,
-                    normalize_u16,
-                )
+                enqueue_samples(data, &mut producer, &callback_state, normalize_u16)
             },
             error_callback,
             None,
@@ -1688,22 +1812,34 @@ fn mark_stream_fault(fault: &AtomicU8) {
 fn enqueue_samples<T: Copy>(
     data: &[T],
     producer: &mut Producer,
-    fault: &AtomicU8,
-    dropped_samples: &AtomicUsize,
-    cancellation: &CaptureCancellation,
+    callback_state: &CaptureCallbackState,
     normalize: fn(T) -> f32,
 ) {
-    if data.is_empty() || !cancellation.observe_first_sample() {
+    if data.is_empty() {
         return;
     }
-    if fault.load(Ordering::Relaxed) != FAULT_NONE {
-        dropped_samples.fetch_add(data.len(), Ordering::Relaxed);
+    let encoded_us = encode_elapsed_us(callback_state.timing_origin.elapsed());
+    let _ = callback_state.first_callback_us.compare_exchange(
+        0,
+        encoded_us,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    );
+    if !callback_state.cancellation.observe_first_sample() {
+        return;
+    }
+    if callback_state.fault.load(Ordering::Relaxed) != FAULT_NONE {
+        callback_state
+            .dropped_samples
+            .fetch_add(data.len(), Ordering::Relaxed);
         return;
     }
     for (index, sample) in data.iter().copied().enumerate() {
         if producer.push(normalize(sample)).is_err() {
-            dropped_samples.fetch_add(data.len() - index, Ordering::Relaxed);
-            let _ = fault.compare_exchange(
+            callback_state
+                .dropped_samples
+                .fetch_add(data.len() - index, Ordering::Relaxed);
+            let _ = callback_state.fault.compare_exchange(
                 FAULT_NONE,
                 FAULT_OVERFLOW,
                 Ordering::AcqRel,
@@ -2006,6 +2142,21 @@ mod tests {
     }
 
     #[test]
+    fn first_stop_observation_is_preserved_for_timing() {
+        let cancellation = CaptureCancellation::new();
+        cancellation.commit_play().unwrap();
+        assert!(cancellation.observe_first_sample());
+
+        cancellation.cancel_at(Duration::from_millis(17));
+        cancellation.cancel_at(Duration::from_millis(40));
+
+        assert_eq!(
+            cancellation.stop_observed_elapsed(),
+            Some(Duration::from_millis(17))
+        );
+    }
+
+    #[test]
     fn vad_prewarm_shutdown_cancels_and_joins_the_worker() {
         let (entered_tx, entered_rx) = bounded(1);
         let (exited_tx, exited_rx) = bounded(1);
@@ -2159,18 +2310,24 @@ mod tests {
     #[test]
     fn callback_overflow_sets_a_structured_fault_and_counts_drops() {
         let (mut producer, mut consumer) = ring_buffer(2);
-        let fault = AtomicU8::new(FAULT_NONE);
-        let dropped = AtomicUsize::new(0);
-        enqueue_samples(
-            &[1_i16, 2, 3, 4],
-            &mut producer,
-            &fault,
-            &dropped,
-            &CaptureCancellation {
+        let fault = Arc::new(AtomicU8::new(FAULT_NONE));
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let callback_state = CaptureCallbackState {
+            fault: Arc::clone(&fault),
+            dropped_samples: Arc::clone(&dropped),
+            cancellation: CaptureCancellation {
                 stop_requested: Arc::new(AtomicBool::new(false)),
                 startup_state: Arc::new(AtomicU8::new(STARTUP_FIRST_SAMPLE)),
                 startup_abort_requested: Arc::new(AtomicBool::new(false)),
+                stop_observed_us: Arc::new(AtomicU64::new(0)),
             },
+            timing_origin: Instant::now(),
+            first_callback_us: Arc::new(AtomicU64::new(0)),
+        };
+        enqueue_samples(
+            &[1_i16, 2, 3, 4],
+            &mut producer,
+            &callback_state,
             normalize_i16,
         );
 
@@ -2186,17 +2343,15 @@ mod tests {
         cancellation.commit_play().unwrap();
         cancellation.cancel();
         let (mut producer, mut consumer) = ring_buffer(4);
-        let fault = AtomicU8::new(FAULT_NONE);
-        let dropped = AtomicUsize::new(0);
+        let callback_state = CaptureCallbackState {
+            fault: Arc::new(AtomicU8::new(FAULT_NONE)),
+            dropped_samples: Arc::new(AtomicUsize::new(0)),
+            cancellation: cancellation.clone(),
+            timing_origin: Instant::now(),
+            first_callback_us: Arc::new(AtomicU64::new(0)),
+        };
 
-        enqueue_samples(
-            &[1_i16, 2],
-            &mut producer,
-            &fault,
-            &dropped,
-            &cancellation,
-            normalize_i16,
-        );
+        enqueue_samples(&[1_i16, 2], &mut producer, &callback_state, normalize_i16);
 
         assert!(cancellation.startup_cancelled_before_first_sample());
         assert_eq!(consumer.pop(), None);
@@ -2243,22 +2398,52 @@ mod tests {
         let cancellation = CaptureCancellation::new();
         cancellation.commit_play().unwrap();
         let (mut producer, mut consumer) = ring_buffer(4);
-        let fault = AtomicU8::new(FAULT_NONE);
-        let dropped = AtomicUsize::new(0);
-        enqueue_samples(
-            &[1_i16],
-            &mut producer,
-            &fault,
-            &dropped,
-            &cancellation,
-            normalize_i16,
-        );
+        let callback_state = CaptureCallbackState {
+            fault: Arc::new(AtomicU8::new(FAULT_NONE)),
+            dropped_samples: Arc::new(AtomicUsize::new(0)),
+            cancellation: cancellation.clone(),
+            timing_origin: Instant::now(),
+            first_callback_us: Arc::new(AtomicU64::new(0)),
+        };
+        enqueue_samples(&[1_i16], &mut producer, &callback_state, normalize_i16);
 
         cancellation.cancel();
 
         assert!(cancellation.first_sample_observed());
         assert!(!cancellation.startup_cancelled_before_first_sample());
         assert_eq!(consumer.pop(), Some(normalize_i16(1)));
+    }
+
+    #[test]
+    fn first_native_callback_timing_is_recorded_before_worker_drain() {
+        let cancellation = CaptureCancellation::new();
+        cancellation.commit_play().unwrap();
+        let (mut producer, mut consumer) = ring_buffer(4);
+        let timing_origin = Instant::now();
+        let first_callback_us = Arc::new(AtomicU64::new(0));
+        let callback_state = CaptureCallbackState {
+            fault: Arc::new(AtomicU8::new(FAULT_NONE)),
+            dropped_samples: Arc::new(AtomicUsize::new(0)),
+            cancellation,
+            timing_origin,
+            first_callback_us: Arc::clone(&first_callback_us),
+        };
+
+        thread::sleep(Duration::from_millis(2));
+        enqueue_samples(&[1_i16], &mut producer, &callback_state, normalize_i16);
+        let callback_elapsed = decode_elapsed_us(first_callback_us.load(Ordering::Acquire))
+            .expect("the native callback must publish its timestamp");
+
+        thread::sleep(Duration::from_millis(2));
+        assert_eq!(consumer.pop(), Some(normalize_i16(1)));
+        enqueue_samples(&[2_i16], &mut producer, &callback_state, normalize_i16);
+
+        assert_eq!(
+            decode_elapsed_us(first_callback_us.load(Ordering::Acquire)),
+            Some(callback_elapsed),
+            "later callbacks must not replace the first callback observation"
+        );
+        assert!(callback_elapsed < timing_origin.elapsed());
     }
 
     #[test]

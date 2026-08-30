@@ -118,6 +118,7 @@ pub(crate) enum CaptureControlError {
 struct OwnerState {
     id: u64,
     kind: AudioOwnerKind,
+    observed_at: Instant,
     cancellation: Option<CaptureCancellation>,
     session: Option<RecordingSession>,
     release_requested: bool,
@@ -184,6 +185,7 @@ pub(crate) struct CaptureController {
 
 impl CaptureController {
     pub(crate) fn new() -> Result<Self, CaptureError> {
+        super::initialize_capture_timing_logger();
         let vad_service = VadPrewarmService::new();
         #[cfg(not(test))]
         vad_service.prewarm()?;
@@ -351,7 +353,7 @@ impl CaptureControlHandle {
                 .filter(|owner| owner.kind == AudioOwnerKind::Capture)
         {
             let capture_id = CaptureId(owner.id);
-            request_stop(owner);
+            request_stop(owner, observed_at);
             let _ = self.command_tx.send(ControlCommand::Stop { capture_id });
             return HotkeyDispatch::Stop { capture_id };
         }
@@ -442,6 +444,7 @@ impl CaptureControlHandle {
         state.owner = Some(OwnerState {
             id: capture_id.0,
             kind: owner,
+            observed_at,
             cancellation: Some(cancellation.clone()),
             session: None,
             release_requested: false,
@@ -496,7 +499,7 @@ impl CaptureControlHandle {
     pub(crate) fn stop(&self, capture_id: CaptureId) -> Result<(), CaptureControlError> {
         let state = self.lock_state();
         let owner = matching_capture_owner(&state, capture_id)?;
-        request_stop(owner);
+        request_stop(owner, Instant::now());
         self.command_tx
             .send(ControlCommand::Stop { capture_id })
             .map_err(|_| CaptureControlError::Shutdown)
@@ -530,6 +533,7 @@ impl CaptureControlHandle {
         state.owner = Some(OwnerState {
             id,
             kind: owner,
+            observed_at: Instant::now(),
             cancellation: None,
             session: None,
             release_requested: false,
@@ -632,9 +636,9 @@ fn matching_capture_owner(
     Ok(owner)
 }
 
-fn request_stop(owner: &OwnerState) {
+fn request_stop(owner: &OwnerState, observed_at: Instant) {
     if let Some(cancellation) = owner.cancellation.as_ref() {
-        cancellation.cancel();
+        cancellation.cancel_at(observed_at.saturating_duration_since(owner.observed_at));
     }
     if let Some(session) = owner.session.as_ref() {
         session.stop();

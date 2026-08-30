@@ -725,6 +725,10 @@ struct LatencyTrace {
     activation_at: Instant,
     trigger_observation: TriggerObservation,
     overlay_visible_at: Option<Instant>,
+    capture_worker_started_at: Option<Instant>,
+    stream_play_requested_at: Option<Instant>,
+    stream_play_returned_at: Option<Instant>,
+    first_native_callback_at: Option<Instant>,
     recorder_started_at: Option<Instant>,
     first_meter_update_at: Option<Instant>,
     model_load_started_at: Option<Instant>,
@@ -732,6 +736,9 @@ struct LatencyTrace {
     first_partial_at: Option<Instant>,
     stop_requested_at: Option<Instant>,
     capture_finalized_at: Option<Instant>,
+    stream_dropped_at: Option<Instant>,
+    final_audio_ready_at: Option<Instant>,
+    preview_drained_at: Option<Instant>,
     transcription_dispatched_at: Option<Instant>,
     transcription_job_completed_at: Option<Instant>,
     final_text_ready_at: Option<Instant>,
@@ -760,6 +767,10 @@ impl LatencyTrace {
             activation_at,
             trigger_observation,
             overlay_visible_at: None,
+            capture_worker_started_at: None,
+            stream_play_requested_at: None,
+            stream_play_returned_at: None,
+            first_native_callback_at: None,
             recorder_started_at: None,
             first_meter_update_at: None,
             model_load_started_at: None,
@@ -767,6 +778,9 @@ impl LatencyTrace {
             first_partial_at: None,
             stop_requested_at: None,
             capture_finalized_at: None,
+            stream_dropped_at: None,
+            final_audio_ready_at: None,
+            preview_drained_at: None,
             transcription_dispatched_at: None,
             transcription_job_completed_at: None,
             final_text_ready_at: None,
@@ -833,6 +847,19 @@ impl LatencyTrace {
         self.maximum_input_rms = Some(metrics.maximum_input_rms);
         self.maximum_input_peak = Some(metrics.maximum_input_peak);
         self.manual_threshold_crossed = Some(metrics.manual_threshold_crossed);
+        if metrics.timing == audio::CaptureTimingMetrics::default() {
+            return;
+        }
+        let observed_at = |elapsed| self.activation_at.checked_add(elapsed);
+        self.capture_worker_started_at = observed_at(metrics.timing.hotkey_to_worker);
+        self.stream_play_requested_at = observed_at(metrics.timing.stream_play_requested);
+        self.stream_play_returned_at = observed_at(metrics.timing.stream_play_returned);
+        self.first_native_callback_at = metrics.timing.first_native_callback.and_then(observed_at);
+        self.stop_requested_at = self
+            .stop_requested_at
+            .or_else(|| metrics.timing.release.and_then(observed_at));
+        self.stream_dropped_at = observed_at(metrics.timing.stream_dropped);
+        self.final_audio_ready_at = observed_at(metrics.timing.final_audio_ready);
     }
 
     fn diagnostic_snapshot(
@@ -926,6 +953,23 @@ impl LatencyTrace {
         {
             lines.push(format!("{trigger_label} to overlay visible: {duration}"));
         }
+        if let Some(duration) =
+            duration_between(Some(self.activation_at), self.capture_worker_started_at)
+        {
+            lines.push(format!("Native callback to capture worker: {duration}"));
+        }
+        if let Some(duration) =
+            duration_between(self.stream_play_requested_at, self.stream_play_returned_at)
+        {
+            lines.push(format!("Microphone stream play: {duration}"));
+        }
+        if let Some(duration) =
+            duration_between(Some(self.activation_at), self.first_native_callback_at)
+        {
+            lines.push(format!(
+                "Native callback to first audio callback: {duration}"
+            ));
+        }
         if let Some(duration) = duration_between(Some(self.activation_at), self.recorder_started_at)
         {
             lines.push(format!("{trigger_label} to recorder ready: {duration}"));
@@ -944,6 +988,24 @@ impl LatencyTrace {
         if let Some(duration) = duration_between(self.stop_requested_at, self.capture_finalized_at)
         {
             lines.push(format!("Stop to audio finalized: {duration}"));
+        }
+        if let Some(duration) = duration_between(self.stop_requested_at, self.stream_dropped_at) {
+            lines.push(format!("Stop to microphone stream dropped: {duration}"));
+        }
+        if let Some(duration) = duration_between(self.stream_dropped_at, self.final_audio_ready_at)
+        {
+            lines.push(format!("Stream dropped to final audio ready: {duration}"));
+        }
+        if let Some(duration) = duration_between(self.final_audio_ready_at, self.preview_drained_at)
+        {
+            lines.push(format!("Final audio ready to preview drained: {duration}"));
+        }
+        if let Some(duration) =
+            duration_between(self.preview_drained_at, self.transcription_dispatched_at)
+        {
+            lines.push(format!(
+                "Preview drained to final request dispatch: {duration}"
+            ));
         }
         if let Some(duration) = duration_between(
             self.transcription_dispatched_at,
@@ -5030,7 +5092,10 @@ impl LocalTranscriberApp {
                             .to_owned();
                 }
             }
-            PreviewDrainAction::FinishCapture(capture) => self.finish_capture(*capture),
+            PreviewDrainAction::FinishCapture(mut capture) => {
+                capture.latency.preview_drained_at = Some(Instant::now());
+                self.finish_capture(*capture);
+            }
             PreviewDrainAction::ReapAfterFailure => {}
             PreviewDrainAction::Fail {
                 session_id,
@@ -5246,7 +5311,7 @@ impl LocalTranscriberApp {
                 .active_recording
                 .take()
                 .expect("finished recording should still be active");
-            let capture = FinishedCapture {
+            let mut capture = FinishedCapture {
                 session_id,
                 source,
                 result,
@@ -5286,6 +5351,7 @@ impl LocalTranscriberApp {
                     "Finalizing live preview before the full pass".to_owned()
                 };
             } else {
+                capture.latency.preview_drained_at = Some(Instant::now());
                 self.finish_capture(capture);
             }
         }
@@ -17314,6 +17380,10 @@ mod layout_tests {
             activation_at: base,
             trigger_observation: TriggerObservation::AppAction,
             overlay_visible_at: None,
+            capture_worker_started_at: Some(base + Duration::from_millis(2)),
+            stream_play_requested_at: Some(base + Duration::from_millis(4)),
+            stream_play_returned_at: Some(base + Duration::from_millis(6)),
+            first_native_callback_at: Some(base + Duration::from_millis(8)),
             recorder_started_at: Some(base + Duration::from_millis(10)),
             first_meter_update_at: Some(base + Duration::from_millis(15)),
             model_load_started_at: Some(base + Duration::from_millis(20)),
@@ -17321,6 +17391,9 @@ mod layout_tests {
             first_partial_at: None,
             stop_requested_at: Some(base + Duration::from_millis(100)),
             capture_finalized_at: Some(base + Duration::from_millis(140)),
+            stream_dropped_at: Some(base + Duration::from_millis(120)),
+            final_audio_ready_at: Some(base + Duration::from_millis(135)),
+            preview_drained_at: Some(base + Duration::from_millis(145)),
             transcription_dispatched_at: Some(base + Duration::from_millis(150)),
             transcription_job_completed_at: Some(base + Duration::from_millis(650)),
             final_text_ready_at: Some(base + Duration::from_millis(650)),
@@ -17346,10 +17419,17 @@ mod layout_tests {
         assert_eq!(
             trace.summary_lines(),
             vec![
+                "Native callback to capture worker: 2 ms",
+                "Microphone stream play: 2 ms",
+                "Native callback to first audio callback: 8 ms",
                 "App action to recorder ready: 10 ms",
                 "App action to first meter update: 15 ms",
                 "Model load: 50 ms",
                 "Stop to audio finalized: 40 ms",
+                "Stop to microphone stream dropped: 20 ms",
+                "Stream dropped to final audio ready: 15 ms",
+                "Final audio ready to preview drained: 10 ms",
+                "Preview drained to final request dispatch: 5 ms",
                 "Transcription job: 500 ms",
                 "Stop to final text: 550 ms",
                 "STT done to UI update: 10 ms",
@@ -17425,6 +17505,10 @@ mod layout_tests {
             activation_at: base,
             trigger_observation: TriggerObservation::HotkeyPoll,
             overlay_visible_at: None,
+            capture_worker_started_at: None,
+            stream_play_requested_at: None,
+            stream_play_returned_at: None,
+            first_native_callback_at: None,
             recorder_started_at: Some(base + Duration::from_millis(10)),
             first_meter_update_at: None,
             model_load_started_at: None,
@@ -17432,6 +17516,9 @@ mod layout_tests {
             first_partial_at: None,
             stop_requested_at: Some(base + Duration::from_millis(100)),
             capture_finalized_at: Some(base + Duration::from_millis(140)),
+            stream_dropped_at: None,
+            final_audio_ready_at: None,
+            preview_drained_at: None,
             transcription_dispatched_at: Some(base + Duration::from_millis(150)),
             transcription_job_completed_at: Some(base + Duration::from_millis(650)),
             final_text_ready_at: None,
