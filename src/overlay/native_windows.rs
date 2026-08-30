@@ -912,6 +912,14 @@ impl NativeOverlayHost {
             &display_key,
             &control_key,
         );
+        // Revoke the provider action before publishing an inaccessible or
+        // disabled UIA tree. Conversely, bind an enabled action before that
+        // tree can expose the default invoke pattern.
+        if control_enabled {
+            self.action_bridge.bind(snapshot.state.session_id);
+        } else {
+            self.action_bridge.bind(None);
+        }
         if invalidation.display_pixels {
             self.render_and_submit_display(snapshot, display_bounds, plan)?;
             self.last_display_render_key = Some(display_key);
@@ -924,12 +932,6 @@ impl NativeOverlayHost {
             }
             self.last_control_render_key = Some(control_key);
         }
-        if control_enabled {
-            self.action_bridge.bind(snapshot.state.session_id);
-        } else {
-            self.action_bridge.bind(None);
-        }
-
         let display_visible = self.display.is_visible();
         let control_visible = self.control.is_visible();
         if !display_visible || control_visible != snapshot.control_requested {
@@ -2461,6 +2463,42 @@ mod tests {
 
         bridge.bind(None);
         bridge.emit_abandon();
+        assert!(retained_action.lock().unwrap().is_none());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn default_cancel_action_is_revoked_before_a_disabled_tree_can_invoke_it() {
+        let (tx, rx) = bounded(1);
+        let retained_action = Arc::new(Mutex::new(None));
+        let bridge = Arc::new(ControlActionBridge {
+            session_id: Mutex::new(None),
+            event_sink: NativeEventSink {
+                tx,
+                repaint_context: eframe::egui::Context::default(),
+                presentation: Arc::new(Mutex::new(NativePresentationObservation::default())),
+                retained_action: Arc::clone(&retained_action),
+            },
+        });
+        let state = WindowProcedureState {
+            role: WindowRole::Control,
+            action_bridge: Some(Arc::clone(&bridge)),
+            pair_failure: Arc::new(PairFailureBridge {
+                windows: Mutex::new(OverlayWindowPair::default()),
+                recovery_requested: AtomicBool::new(false),
+                action_bridge: Arc::clone(&bridge),
+                event_sink: bridge.event_sink.clone(),
+            }),
+            pressed: Cell::new(false),
+            accessibility: RefCell::new(None),
+        };
+
+        bridge.bind(Some(SessionId(88)));
+        // This is the ordering apply_snapshot uses before it publishes a
+        // disabled or hidden control accessibility tree.
+        bridge.bind(None);
+        state.on_cancel();
+
         assert!(retained_action.lock().unwrap().is_none());
         assert!(rx.try_recv().is_err());
     }
