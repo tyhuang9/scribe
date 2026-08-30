@@ -10357,12 +10357,31 @@ impl LocalTranscriberApp {
                 return false;
             }
         };
+        let previous_config = self.config.clone();
+        let mut next_config = self.config.clone();
+        apply_removed_model_config(
+            &mut next_config,
+            &model.id,
+            replacement.as_ref(),
+            removing_bundled,
+        );
+        let expected_fingerprint = match config::settings::artifact_config_fingerprint(&next_config)
+        {
+            Ok(fingerprint) => fingerprint,
+            Err(error) => {
+                self.status = TranscriptionStatus::Error;
+                self.status_message =
+                    format!("Could not prepare removed-model settings witness: {error}");
+                return false;
+            }
+        };
         let staged = if let Some(candidate) = onnx_candidate {
             stage_onnx_bundle_removal(
                 &config::onnx_bundle_storage_dir(&self.config),
                 &model.id,
                 candidate.receipt_sha256(),
                 prior_fingerprint.clone(),
+                expected_fingerprint.clone(),
             )
             .map(StagedModelRemoval::Onnx)
             .map(Some)
@@ -10403,14 +10422,8 @@ impl LocalTranscriberApp {
         let removed_files = staged_removal
             .as_ref()
             .is_some_and(StagedModelRemoval::removed_files);
-        let previous_config = self.config.clone();
+        self.config = next_config;
         self.model_downloads.remove(&model.id);
-        apply_removed_model_config(
-            &mut self.config,
-            &model.id,
-            replacement.as_ref(),
-            removing_bundled,
-        );
         let removal_preparation = config::settings::artifact_config_fingerprint(&self.config)
             .map_err(|error| error.to_string())
             .and_then(|fingerprint| {

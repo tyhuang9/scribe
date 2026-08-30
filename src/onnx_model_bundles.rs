@@ -2162,12 +2162,14 @@ pub(crate) fn stage_onnx_bundle_removal(
     model_id: &str,
     expected_receipt_sha256: &str,
     prior_config_fingerprint: String,
+    expected_config_fingerprint: String,
 ) -> Result<OnnxBundleRemoval, InstallError> {
     stage_onnx_bundle_removal_with(
         storage_root,
         model_id,
         expected_receipt_sha256,
         prior_config_fingerprint,
+        expected_config_fingerprint,
         true,
         verified_owned_removal_candidate_at,
     )
@@ -2178,10 +2180,12 @@ fn stage_onnx_bundle_removal_with(
     model_id: &str,
     expected_receipt_sha256: &str,
     prior_config_fingerprint: String,
+    expected_config_fingerprint: String,
     enforce_durable_settings: bool,
     verify: impl Fn(&str, &Path) -> Result<VerifiedOnnxRemovalCandidate, InstallError>,
 ) -> Result<OnnxBundleRemoval, InstallError> {
     validate_sha256(expected_receipt_sha256)?;
+    validate_sha256(&expected_config_fingerprint)?;
     let target_root = bundle_target_root(storage_root, model_id)?;
     let target_guard = acquire_bundle_target(&target_root)?;
     let settings_guard = enforce_durable_settings
@@ -2217,6 +2221,7 @@ fn stage_onnx_bundle_removal_with(
     let mut removal = ManagedRemoval::stage_stable_directory_with_ownership(
         capability,
         prior_config_fingerprint,
+        expected_config_fingerprint,
         candidate.receipt_sha256().to_owned(),
     )?;
     let pinned_verification = (|| {
@@ -3235,6 +3240,7 @@ mod tests {
             model_id,
             &"00".repeat(32),
             format!("{:x}", Sha256::digest(b"prior-config")),
+            format!("{:x}", Sha256::digest(b"expected-config")),
             false,
             |expected, root| {
                 verified_removal_candidate_at_with_manifest_for_test(expected, root, &manifest)
@@ -3252,6 +3258,7 @@ mod tests {
                 model_id,
                 authorized.receipt_sha256(),
                 format!("{:x}", Sha256::digest(b"prior-config")),
+                format!("{:x}", Sha256::digest(b"expected-config")),
                 false,
                 |expected, root| {
                     verified_removal_candidate_at_with_manifest_for_test(expected, root, &manifest)
@@ -3275,6 +3282,7 @@ mod tests {
             model_id,
             authorized.receipt_sha256(),
             format!("{:x}", Sha256::digest(b"prior-config")),
+            format!("{:x}", Sha256::digest(b"expected-config")),
             false,
             |expected, root| {
                 verified_removal_candidate_at_with_manifest_for_test(expected, root, &manifest)
@@ -3303,11 +3311,13 @@ mod tests {
         )
         .unwrap();
         let prior = format!("{:x}", Sha256::digest(b"prior-config"));
+        let expected = format!("{:x}", Sha256::digest(b"expected-config"));
         let removal = stage_onnx_bundle_removal_with(
             &restore_storage,
             model_id,
             restore_candidate.receipt_sha256(),
             prior.clone(),
+            expected.clone(),
             false,
             |expected, root| {
                 verified_removal_candidate_at_with_manifest_for_test(expected, root, &manifest)
@@ -3406,12 +3416,12 @@ mod tests {
             &manifest,
         )
         .unwrap();
-        let expected = format!("{:x}", Sha256::digest(b"expected-config"));
         let mut removal = stage_onnx_bundle_removal_with(
             &commit_storage,
             model_id,
             commit_candidate.receipt_sha256(),
             prior,
+            expected.clone(),
             false,
             |expected, root| {
                 verified_removal_candidate_at_with_manifest_for_test(expected, root, &manifest)
