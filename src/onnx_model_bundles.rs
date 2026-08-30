@@ -1396,6 +1396,43 @@ fn inspect_bundle_artifacts(
         .collect()
 }
 
+fn inspect_and_reserve_bundle_with_hook(
+    manifest: &OnnxBundleManifest,
+    artifacts: &[PinnedArtifact],
+    target_root: &Path,
+    cancellation: &InstallCancellation,
+    after_inspection: impl FnOnce(u64),
+) -> Result<
+    (
+        BundleTargetGuard,
+        Vec<(CanonicalTargetIdentity, PinnedArtifactInspectionPlan)>,
+        BundleDiskReservation,
+    ),
+    InstallError,
+> {
+    // Lock ordering is target guard -> artifact inspection -> volume ledger.
+    // Discard and recovery take only the target guard, so no actor can mutate
+    // partials between the inspection snapshot and its matching reservation.
+    let target_guard = acquire_bundle_target(target_root)?;
+    recover_onnx_bundle_installation_locked(target_root)?;
+    let inspections = inspect_bundle_artifacts(artifacts, cancellation)?;
+    let required_bytes = bundle_required_install_bytes(
+        manifest,
+        inspections
+            .iter()
+            .map(|(_, inspection)| inspection.required_download_bytes()),
+    )?;
+    after_inspection(required_bytes);
+    if cancellation.is_cancelled() {
+        return Err(InstallError::Cancelled {
+            partial_path: target_root.to_path_buf(),
+            downloaded_bytes: 0,
+        });
+    }
+    let disk_reservation = acquire_bundle_disk_reservation(target_root, required_bytes)?;
+    Ok((target_guard, inspections, disk_reservation))
+}
+
 /// The sole production entry point that may contact Hugging Face for an ONNX
 /// bundle. Catalog reads, installed receipt reads, startup resolution, and
 /// rollback validation are all local-only operations.
@@ -1415,22 +1452,13 @@ pub(crate) fn stage_onnx_bundle_install(
         .ok_or_else(|| failed(format!("unknown internal ONNX bundle {model_id}")))?;
     let target_root = bundle_target_root(storage_root, model_id)?;
     let artifacts = pinned_files(storage_root, manifest)?;
-    let inspections = inspect_bundle_artifacts(&artifacts, cancellation)?;
-    let required_bytes = bundle_required_install_bytes(
+    let (target_guard, inspections, mut disk_reservation) = inspect_and_reserve_bundle_with_hook(
         manifest,
-        inspections
-            .iter()
-            .map(|(_, inspection)| inspection.required_download_bytes()),
+        &artifacts,
+        &target_root,
+        cancellation,
+        |_| {},
     )?;
-    if cancellation.is_cancelled() {
-        return Err(InstallError::Cancelled {
-            partial_path: storage_root.to_path_buf(),
-            downloaded_bytes: 0,
-        });
-    }
-    let target_guard = acquire_bundle_target(&target_root)?;
-    recover_onnx_bundle_installation_locked(&target_root)?;
-    let mut disk_reservation = acquire_bundle_disk_reservation(&target_root, required_bytes)?;
     let total_download_bytes = artifacts.iter().try_fold(0_u64, |total, artifact| {
         total
             .checked_add(artifact.size_bytes)
@@ -2405,6 +2433,66 @@ mod tests {
     }
 
     #[test]
+    fn discard_cannot_invalidate_the_locked_inspection_reservation_epoch() {
+        let root = unique_root("inspection-reservation-guard");
+        fs::create_dir_all(&root).unwrap();
+        let model_id = "moonshine-tiny-en-int8-onnx";
+        let manifest = bundle_manifest(model_id).unwrap();
+        let artifacts = pinned_files(&root, manifest).unwrap();
+        let first = &artifacts[0];
+        fs::create_dir_all(first.destination.parent().unwrap()).unwrap();
+        let mut partial_name = first.destination.file_name().unwrap().to_os_string();
+        partial_name.push(".partial");
+        let partial = first.destination.with_file_name(partial_name);
+        fs::write(&partial, b"retained").unwrap();
+        let target = bundle_target_root(&root, model_id).unwrap();
+        let expected_required = bundle_required_install_bytes(
+            manifest,
+            artifacts.iter().enumerate().map(|(index, artifact)| {
+                if index == 0 {
+                    artifact.size_bytes - 8
+                } else {
+                    artifact.size_bytes
+                }
+            }),
+        )
+        .unwrap();
+        let mut observed_required = None;
+
+        let (target_guard, inspections, reservation) = inspect_and_reserve_bundle_with_hook(
+            manifest,
+            &artifacts,
+            &target,
+            &InstallCancellation::default(),
+            |required_bytes| {
+                observed_required = Some(required_bytes);
+                let actor_root = root.clone();
+                let discard =
+                    thread::spawn(move || discard_onnx_bundle_partials(model_id, &actor_root))
+                        .join()
+                        .unwrap();
+                assert!(discard.is_err());
+                assert!(partial.exists());
+            },
+        )
+        .unwrap();
+
+        assert_eq!(observed_required, Some(expected_required));
+        assert_eq!(reservation.remaining_bytes, expected_required);
+        assert_eq!(
+            inspections[0].1.required_download_bytes(),
+            first.size_bytes - 8
+        );
+        assert!(partial.exists());
+
+        drop(reservation);
+        drop(target_guard);
+        assert_eq!(discard_onnx_bundle_partials(model_id, &root).unwrap(), 1);
+        assert!(!partial.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn pre_cancelled_bundle_stage_creates_no_storage_or_coordination_state() {
         let root = unique_root("stage-pre-cancel");
         let cancellation = InstallCancellation::default();
@@ -2441,7 +2529,7 @@ mod tests {
     }
 
     #[test]
-    fn cancellation_during_bundle_cache_inspection_precedes_locks_and_reservations() {
+    fn cancellation_during_locked_bundle_cache_inspection_releases_the_target_guard() {
         let root = unique_root("stage-inspection-cancel");
         let manifest = bundle_manifest("moonshine-tiny-en-int8-onnx").unwrap();
         let artifacts = pinned_files(&root, manifest).unwrap();
@@ -2460,7 +2548,8 @@ mod tests {
 
         assert!(error.is_cancelled());
         assert!(!target.exists());
-        assert!(!target.parent().unwrap().join(LOCK_DIRECTORY_NAME).exists());
+        let reacquired = acquire_bundle_target(&target).unwrap();
+        drop(reacquired);
         assert!(!cached.destination.with_extension("ort.partial").exists());
         fs::remove_dir_all(root).unwrap();
     }
