@@ -2706,9 +2706,18 @@ fn supports_managed_install(config: &AppConfig, model: &SttModelInfo) -> bool {
     model.download_model.is_some() && uses_artifact_only_install(config, model)
 }
 
-fn supports_managed_uninstall(model: &SttModelInfo, install_status: &ModelInstallStatus) -> bool {
-    crate::model_catalog::normalized_install_artifact(&ModelId::new(&model.id)).is_some()
-        && install_status.is_runnable()
+fn supports_managed_uninstall(
+    config: &AppConfig,
+    model: &SttModelInfo,
+    install_status: &ModelInstallStatus,
+) -> bool {
+    match crate::model_catalog::normalized_install_artifact(&ModelId::new(&model.id)) {
+        Some(crate::model_catalog::NormalizedInstallArtifact::ReceiptBackedBundle { .. }) => {
+            receipt_backed_onnx_removal_target(config, model, install_status).is_some()
+        }
+        Some(_) => install_status.is_runnable(),
+        None => false,
+    }
 }
 
 fn cleanup_excluded_bundled_model(config: &AppConfig) -> Result<bool, InstallError> {
@@ -9649,9 +9658,11 @@ impl LocalTranscriberApp {
                 config::downloaded_model_path(&self.config, model).as_ref() == Some(path)
             })
             .filter(|path| is_app_managed_model_path(&self.config, path));
-        let onnx_bundle_target =
-            config::onnx_bundle_target_root(&self.config, &ModelId::new(&model.id))
-                .filter(|path| is_app_managed_model_path(&self.config, path));
+        let onnx_bundle_target = receipt_backed_onnx_removal_target(
+            &self.config,
+            model,
+            &self.effective_install_status(model),
+        );
         // Each trusted remote artifact owns an opaque leaf directory. Staging
         // that directory removes the generated provenance manifest together
         // with the model, without affecting another variant in the same Hub
@@ -11482,6 +11493,8 @@ impl LocalTranscriberApp {
             crate::model_catalog::normalized_install_artifact(&ModelId::new(&model.id)),
             Some(crate::model_catalog::NormalizedInstallArtifact::ReceiptBackedBundle { .. })
         );
+        let receipt_backed_onnx_managed =
+            receipt_backed_onnx_removal_target(&self.config, model, &install_status).is_some();
         let installed = manageable && (!bundled || install_status.is_runnable());
         let custom = model.local_path.is_some()
             && !self.config.general.managed_models.contains_key(&model.id)
@@ -11491,6 +11504,7 @@ impl LocalTranscriberApp {
                 .managed_remote_models
                 .contains_key(&model.id)
             && !imported_gguf
+            && !receipt_backed_onnx_managed
             && !bundled;
         let onnx_install_active = self
             .onnx_bundle_install
@@ -11706,7 +11720,8 @@ impl LocalTranscriberApp {
             removal_supported: (bundled && model.id == BUNDLED_BASE_MODEL_ID && installed)
                 || (!bundled
                     && !custom
-                    && (imported_gguf || supports_managed_uninstall(model, &install_status))),
+                    && (imported_gguf
+                        || supports_managed_uninstall(&self.config, model, &install_status))),
             partial_cleanup_available,
             partial_cleanup_enabled: partial_cleanup_available && has_partial && !mutation_blocked,
             partial_cleanup_disabled_reason: if partial_cleanup_available {
@@ -14779,6 +14794,24 @@ fn is_app_managed_model_path(config: &AppConfig, path: &Path) -> bool {
         .ok()
         .zip(storage.canonicalize().ok())
         .is_some_and(|(path, storage)| path.starts_with(storage))
+}
+
+/// Returns the one directory an installed receipt-backed ONNX model is allowed
+/// to remove. The model projection must name that exact canonical directory;
+/// a matching model id alone never authorizes deletion of an arbitrary path.
+fn receipt_backed_onnx_removal_target(
+    config: &AppConfig,
+    model: &SttModelInfo,
+    install_status: &ModelInstallStatus,
+) -> Option<PathBuf> {
+    if !install_status.is_runnable() {
+        return None;
+    }
+    let model_id = ModelId::new(&model.id);
+    let root = config::installed_onnx_bundle_root(config, &model_id)?;
+    (model.local_path.as_deref() == Some(root.as_path())
+        && is_app_managed_model_path(config, &root))
+    .then_some(root)
 }
 
 #[cfg(test)]
@@ -26722,6 +26755,110 @@ mod layout_tests {
         assert!(external_path.exists());
 
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn receipt_backed_onnx_bundle_is_projected_as_managed_and_removed_transactionally() {
+        let root = partial_cleanup_test_root("receipt-backed-onnx-removal");
+        let _ = fs::remove_dir_all(&root);
+        let mut app = test_app();
+        app.config.general.model_storage_dir = root.clone();
+        app.transcription_service = app.transcription_service.with_config(app.config.clone());
+        let model_id = ModelId::new("moonshine-tiny-en-int8-onnx");
+        let bundle_root = config::onnx_bundle_target_root(&app.config, &model_id)
+            .expect("catalog ONNX model has a canonical bundle root");
+        fs::create_dir_all(&bundle_root).unwrap();
+        fs::write(bundle_root.join("install-receipt.json"), b"test receipt").unwrap();
+
+        let model = config::configured_models(&app.config)
+            .into_iter()
+            .find(|model| model.id == model_id.as_str())
+            .expect("catalog ONNX model");
+        assert_eq!(model.install_status, ModelInstallStatus::Installed);
+        assert_eq!(model.local_path.as_deref(), Some(bundle_root.as_path()));
+        let projection = app.model_management_view_model(&model, None, &PartialInspection::Missing);
+        assert!(
+            !projection.custom,
+            "canonical receipt bundle is app-managed"
+        );
+        assert!(
+            projection.removal_supported,
+            "managed ONNX bundle exposes Delete"
+        );
+
+        assert!(app.uninstall_model(&model));
+        assert!(
+            !bundle_root.exists(),
+            "transaction committed bundle deletion"
+        );
+        let remaining = config::configured_models(&app.config)
+            .into_iter()
+            .find(|model| model.id == model_id.as_str())
+            .expect("catalog ONNX model remains discoverable");
+        assert_eq!(remaining.install_status, ModelInstallStatus::NotInstalled);
+        assert_eq!(app.status_message, format!("Uninstalled {}.", model.name));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn receipt_backed_onnx_uninstall_rejects_external_projection_paths() {
+        let root = partial_cleanup_test_root("external-receipt-backed-onnx-removal");
+        let _ = fs::remove_dir_all(&root);
+        let storage = root.join("model-storage");
+        let canonical_bundle = storage
+            .join("onnx-bundles")
+            .join("moonshine-tiny-en-int8-onnx");
+        let external_bundle = root.join("external").join("moonshine-tiny-en-int8-onnx");
+        fs::create_dir_all(&canonical_bundle).unwrap();
+        fs::write(
+            canonical_bundle.join("install-receipt.json"),
+            b"canonical receipt",
+        )
+        .unwrap();
+        fs::create_dir_all(&external_bundle).unwrap();
+        fs::write(
+            external_bundle.join("install-receipt.json"),
+            b"external receipt",
+        )
+        .unwrap();
+
+        let mut app = test_app();
+        app.config.general.model_storage_dir = storage;
+        let mut external_model = crate::models::default_model_catalog()
+            .into_iter()
+            .find(|model| model.id == "moonshine-tiny-en-int8-onnx")
+            .expect("catalog ONNX model");
+        external_model.local_path = Some(external_bundle.clone());
+        external_model.install_status = ModelInstallStatus::Installed;
+        external_model.artifact_origin = ModelArtifactOrigin::Managed;
+
+        assert!(
+            receipt_backed_onnx_removal_target(
+                &app.config,
+                &external_model,
+                &external_model.install_status
+            )
+            .is_none()
+        );
+        assert!(!supports_managed_uninstall(
+            &app.config,
+            &external_model,
+            &external_model.install_status
+        ));
+        let projection =
+            app.model_management_view_model(&external_model, None, &PartialInspection::Missing);
+        assert!(projection.custom, "external bundle must stay user-managed");
+        assert!(
+            !projection.removal_supported,
+            "external bundle must not expose Delete"
+        );
+        assert!(
+            external_bundle.exists(),
+            "classification performs no deletion"
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
