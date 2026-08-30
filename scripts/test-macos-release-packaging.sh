@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 IFS=$'\n\t'
+trap 'status=$?; echo "macOS release packaging contract check failed at line $LINENO (exit $status)." >&2; exit "$status"' ERR
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 # GitHub's macOS images do not guarantee ripgrep. Keep the source-contract
