@@ -30,6 +30,7 @@ const MAX_PRIVATE_KEY_BYTES: u64 = 16 * 1024;
 pub(crate) enum AuthoringBackend {
     Cuda,
     Vulkan,
+    Metal,
 }
 
 impl AuthoringBackend {
@@ -37,6 +38,7 @@ impl AuthoringBackend {
         match value {
             "cuda" => Some(Self::Cuda),
             "vulkan" => Some(Self::Vulkan),
+            "metal" => Some(Self::Metal),
             _ => None,
         }
     }
@@ -45,9 +47,12 @@ impl AuthoringBackend {
         match self {
             Self::Cuda => PackBackend::Cuda,
             Self::Vulkan => PackBackend::Vulkan,
+            Self::Metal => PackBackend::Metal,
         }
     }
 }
+
+pub(crate) const AUTHOR_TARGET_CONTRACT: &str = "allowed authoring targets are cuda or vulkan on windows/x86_64, or metal on macos/aarch64 or macos/x86_64; backend, OS, and architecture values are lowercase and case-sensitive";
 
 #[derive(Clone, Debug)]
 pub(crate) enum SigningMode {
@@ -66,6 +71,8 @@ pub(crate) struct AuthorRequest {
     pub(crate) security_epoch: u64,
     pub(crate) backend: AuthoringBackend,
     pub(crate) provider: String,
+    pub(crate) target_os: String,
+    pub(crate) target_arch: String,
     pub(crate) worker_path: String,
     pub(crate) signing: SigningMode,
 }
@@ -105,6 +112,7 @@ pub(crate) fn check_production_signing_key(key_id: &str, private_key_path: &Path
 }
 
 pub(crate) fn author_pack(request: &AuthorRequest) -> Result<AuthoredPack> {
+    validate_authoring_target(request.backend, &request.target_os, &request.target_arch)?;
     if request.security_epoch < EMBEDDED_MINIMUM_SECURITY_EPOCH {
         bail!(
             "security epoch {} is below the embedded minimum {}",
@@ -164,8 +172,8 @@ pub(crate) fn author_pack(request: &AuthorRequest) -> Result<AuthoredPack> {
         worker_build: crate::worker_identity::INFERENCE_WORKER_BUILD_ID.to_owned(),
         backend: request.backend.manifest_backend(),
         provider: request.provider.clone(),
-        target_os: "windows".to_owned(),
-        target_arch: "x86_64".to_owned(),
+        target_os: request.target_os.clone(),
+        target_arch: request.target_arch.clone(),
         worker_path: request.worker_path.clone(),
         payload,
     };
@@ -191,14 +199,14 @@ pub(crate) fn author_pack(request: &AuthorRequest) -> Result<AuthoredPack> {
         key_id: key_id.clone(),
         public_key: key_pair.public_key().as_ref().to_vec(),
     };
-    let allowed_backends = [request.backend.manifest_backend()];
+    let allowed_backends = [manifest.backend];
     let verifier = PackVerifier::new(
         &trust,
         Compatibility {
             app_build: crate::worker_identity::DESKTOP_BUILD_ID,
             worker_build: crate::worker_identity::INFERENCE_WORKER_BUILD_ID,
-            target_os: "windows",
-            target_arch: "x86_64",
+            target_os: &request.target_os,
+            target_arch: &request.target_arch,
             allowed_backends: &allowed_backends,
         },
     );
@@ -223,24 +231,32 @@ pub(crate) fn author_pack(request: &AuthorRequest) -> Result<AuthoredPack> {
 }
 
 pub(crate) fn verify_fixture_pack(root: &Path) -> Result<AuthoredPack> {
+    let manifest = manifest_from_root(root)?;
+    let backend = match manifest.backend {
+        PackBackend::Cuda => AuthoringBackend::Cuda,
+        PackBackend::Vulkan => AuthoringBackend::Vulkan,
+        PackBackend::Metal => AuthoringBackend::Metal,
+    };
+    validate_authoring_target(backend, &manifest.target_os, &manifest.target_arch)?;
     let key_pair = Ed25519KeyPair::from_seed_unchecked(&FIXTURE_SEED)
         .map_err(|_| anyhow!("fixture signing key is invalid"))?;
     let trust = ExactTrustRoot {
         key_id: FIXTURE_KEY_ID.to_owned(),
         public_key: key_pair.public_key().as_ref().to_vec(),
     };
+    let allowed_backends = [manifest.backend];
     let verifier = PackVerifier::new(
         &trust,
         Compatibility {
             app_build: crate::worker_identity::DESKTOP_BUILD_ID,
             worker_build: crate::worker_identity::INFERENCE_WORKER_BUILD_ID,
-            target_os: "windows",
-            target_arch: "x86_64",
-            allowed_backends: &[PackBackend::Cuda, PackBackend::Vulkan],
+            target_os: &manifest.target_os,
+            target_arch: &manifest.target_arch,
+            allowed_backends: &allowed_backends,
         },
     );
     let verified = verifier.verify(root)?;
-    let payload = inventory_from_manifest(root)?;
+    let payload = manifest.payload;
     let installed_payload_bytes = payload.iter().try_fold(0_u64, |total, entry| {
         total
             .checked_add(entry.size_bytes)
@@ -254,6 +270,25 @@ pub(crate) fn verify_fixture_pack(root: &Path) -> Result<AuthoredPack> {
         payload_files: payload.len(),
         installed_payload_bytes,
     })
+}
+
+pub(crate) fn validate_authoring_target(
+    backend: AuthoringBackend,
+    target_os: &str,
+    target_arch: &str,
+) -> Result<()> {
+    let accepted = matches!(
+        (backend, target_os, target_arch),
+        (
+            AuthoringBackend::Cuda | AuthoringBackend::Vulkan,
+            "windows",
+            "x86_64"
+        ) | (AuthoringBackend::Metal, "macos", "aarch64" | "x86_64")
+    );
+    if !accepted {
+        bail!("invalid backend/target combination; {AUTHOR_TARGET_CONTRACT}");
+    }
+    Ok(())
 }
 
 fn production_key_pair(key_id: &str, private_key_path: &Path) -> Result<Ed25519KeyPair> {
@@ -370,13 +405,13 @@ fn inventory_payload(root: &Path) -> Result<Vec<PayloadEntry>> {
     Ok(payload)
 }
 
-fn inventory_from_manifest(root: &Path) -> Result<Vec<PayloadEntry>> {
+fn manifest_from_root(root: &Path) -> Result<PackManifest> {
     let bytes = fs::read(root.join(MANIFEST_NAME)).context("could not read fixture manifest")?;
     let manifest: PackManifest = serde_json::from_slice(&bytes)?;
     if serde_json::to_vec(&manifest)? != bytes {
         bail!("fixture manifest is not canonical JSON");
     }
-    Ok(manifest.payload)
+    Ok(manifest)
 }
 
 fn write_new_envelope(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -423,6 +458,8 @@ mod tests {
             security_epoch: 1,
             backend: AuthoringBackend::Vulkan,
             provider: "transcribe-cpp-ggml-vulkan".to_owned(),
+            target_os: "windows".to_owned(),
+            target_arch: "x86_64".to_owned(),
             worker_path: "bin/scribe-inference-worker.exe".to_owned(),
             signing: SigningMode::Fixture,
         }
@@ -461,6 +498,93 @@ mod tests {
         assert!(!root.join(MANIFEST_NAME).exists());
         assert!(!root.join(SIGNATURE_NAME).exists());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn fixture_authoring_accepts_each_production_backend_target() {
+        for (label, backend, provider, target_os, target_arch, worker_path) in [
+            (
+                "windows-cuda",
+                AuthoringBackend::Cuda,
+                "transcribe-cpp-ggml-cuda",
+                "windows",
+                "x86_64",
+                "bin/scribe-inference-worker.exe",
+            ),
+            (
+                "windows-vulkan",
+                AuthoringBackend::Vulkan,
+                "transcribe-cpp-ggml-vulkan",
+                "windows",
+                "x86_64",
+                "bin/scribe-inference-worker.exe",
+            ),
+            (
+                "macos-metal-arm",
+                AuthoringBackend::Metal,
+                "transcribe-cpp-metal",
+                "macos",
+                "aarch64",
+                "bin/scribe-inference-worker.exe",
+            ),
+            (
+                "macos-metal-intel",
+                AuthoringBackend::Metal,
+                "transcribe-cpp-metal",
+                "macos",
+                "x86_64",
+                "bin/scribe-inference-worker.exe",
+            ),
+        ] {
+            let root = temp_root(label);
+            let mut request = fixture_request(&root);
+            request.backend = backend;
+            request.provider = provider.to_owned();
+            request.target_os = target_os.to_owned();
+            request.target_arch = target_arch.to_owned();
+            request.worker_path = worker_path.to_owned();
+            let authored = author_pack(&request).unwrap();
+            let manifest = manifest_from_root(&root).unwrap();
+            assert_eq!(manifest.backend, backend.manifest_backend());
+            assert_eq!(manifest.target_os, target_os);
+            assert_eq!(manifest.target_arch, target_arch);
+            assert_eq!(verify_fixture_pack(&root).unwrap(), authored);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn authoring_rejects_incoherent_or_noncanonical_targets_before_writing() {
+        for (label, backend, target_os, target_arch) in [
+            (
+                "metal-windows",
+                AuthoringBackend::Metal,
+                "windows",
+                "x86_64",
+            ),
+            ("cuda-macos", AuthoringBackend::Cuda, "macos", "aarch64"),
+            ("vulkan-macos", AuthoringBackend::Vulkan, "macos", "x86_64"),
+            ("windows-arm", AuthoringBackend::Cuda, "windows", "aarch64"),
+            ("macos-armv7", AuthoringBackend::Metal, "macos", "armv7"),
+            ("linux", AuthoringBackend::Metal, "linux", "x86_64"),
+            ("case-os", AuthoringBackend::Metal, "MacOS", "aarch64"),
+            ("case-arch", AuthoringBackend::Metal, "macos", "AARCH64"),
+            ("empty-os", AuthoringBackend::Metal, "", "aarch64"),
+            ("empty-arch", AuthoringBackend::Metal, "macos", ""),
+        ] {
+            let root = temp_root(label);
+            let mut request = fixture_request(&root);
+            request.backend = backend;
+            request.target_os = target_os.to_owned();
+            request.target_arch = target_arch.to_owned();
+            let error = author_pack(&request).unwrap_err().to_string();
+            assert!(error.contains(AUTHOR_TARGET_CONTRACT));
+            assert!(!root.join(MANIFEST_NAME).exists());
+            assert!(!root.join(SIGNATURE_NAME).exists());
+            fs::remove_dir_all(root).unwrap();
+        }
+        assert_eq!(AuthoringBackend::parse("Metal"), None);
+        assert_eq!(AuthoringBackend::parse(""), None);
     }
 
     #[cfg(windows)]
