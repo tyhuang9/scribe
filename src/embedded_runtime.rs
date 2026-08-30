@@ -434,7 +434,6 @@ fn candidate_matches_current_pack_device(
         && candidate.target.device_class == expected.device_class
         && candidate.target.vendor == expected.vendor
         && candidate.target.memory_total_bytes == expected.memory_total_bytes
-        && candidate.target.memory_available_bytes == expected.memory_available_bytes
 }
 
 fn observed_target_matches_current_pack_device(
@@ -451,7 +450,6 @@ fn observed_target_matches_current_pack_device(
         && observed.device_class == expected.device_class
         && observed.vendor == expected.vendor
         && observed.memory_total_bytes == expected.memory_total_bytes
-        && observed.memory_available_bytes == expected.memory_available_bytes
 }
 
 fn verified_pack_device_override_values(
@@ -1244,6 +1242,10 @@ mod tests {
     fn verified_pack_override_remaps_a_missing_provider_identity_by_bound_index() {
         let mut selected_device = device(DeviceType::Gpu, "Vulkan7", "NVIDIA GPU");
         selected_device.index = Some(7);
+        selected_device.memory_total = 8 * 1024 * 1024 * 1024;
+        // Available memory is volatile: discovery/selection may see a
+        // different value than the worker Hello or post-load device report.
+        selected_device.memory_free = 5 * 1024 * 1024 * 1024;
         let mut other_device = selected_device.clone();
         other_device.index = Some(3);
         let stable_id = "native:luid:0000000000000001";
@@ -1253,8 +1255,14 @@ mod tests {
             native_backend_candidate(other_device).unwrap(),
             native_backend_candidate(selected_device.clone()).unwrap(),
         ];
-        let runtime_device =
-            current_pack_runtime_device(stable_id, 7, "NVIDIA GPU", Some(driver), 0, 0);
+        let runtime_device = current_pack_runtime_device(
+            stable_id,
+            7,
+            "NVIDIA GPU",
+            Some(driver),
+            8 * 1024 * 1024 * 1024,
+            7 * 1024 * 1024 * 1024,
+        );
 
         apply_verified_pack_device_override_values(
             &mut candidates,
@@ -1283,10 +1291,12 @@ mod tests {
         )
         .unwrap();
 
+        let mut post_load_device = selected_device;
+        post_load_device.memory_free = 2 * 1024 * 1024 * 1024;
         reconcile_observed_target_with_pack_override(
             &mut selection,
             "vulkan",
-            &selected_device,
+            &post_load_device,
             Some(&pack_override),
         )
         .unwrap();
@@ -1406,12 +1416,20 @@ mod tests {
         let mut selected_device = device(DeviceType::Gpu, "Vulkan9", "NVIDIA GPU");
         selected_device.device_id = Some("opaque-provider-device-token".to_owned());
         selected_device.index = Some(9);
+        selected_device.memory_total = 16 * 1024 * 1024 * 1024;
+        selected_device.memory_free = 12 * 1024 * 1024 * 1024;
         let stable_id = "native:uuid:00112233445566778899aabbccddeeff";
         let driver = "vulkan:10de:1:1:fixture";
         let provider = "transcribe-cpp-ggml-vulkan";
         let mut candidates = vec![native_backend_candidate(selected_device.clone()).unwrap()];
-        let runtime_device =
-            current_pack_runtime_device(stable_id, 9, "NVIDIA GPU", Some(driver), 0, 0);
+        let runtime_device = current_pack_runtime_device(
+            stable_id,
+            9,
+            "NVIDIA GPU",
+            Some(driver),
+            16 * 1024 * 1024 * 1024,
+            14 * 1024 * 1024 * 1024,
+        );
 
         apply_verified_pack_device_override_values(
             &mut candidates,
@@ -1434,10 +1452,12 @@ mod tests {
         )
         .unwrap();
 
+        let mut post_load_device = selected_device.clone();
+        post_load_device.memory_free = 4 * 1024 * 1024 * 1024;
         reconcile_observed_target_with_pack_override(
             &mut selection,
             "vulkan",
-            &selected_device,
+            &post_load_device,
             Some(&pack_override),
         )
         .unwrap();
