@@ -41,6 +41,8 @@ version="$(awk -F'"' '/^version[[:space:]]*=/ { print $2; exit }' "$repo_root/Ca
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo 'Cargo.toml version must be an exact semantic version.' >&2; exit 1; }
 sed "s/\${SCRIBE_APP_VERSION}/$version/g" "$repo_root/installer/macos/Info.plist" >"$app/Contents/Info.plist"
 plutil -lint "$app/Contents/Info.plist" >/dev/null
+identity='-'; timestamp=()
+if [[ "$signing_mode" == developer-id ]]; then identity="$SCRIBE_MACOS_SIGNING_IDENTITY"; timestamp=(--timestamp); fi
 
 for target in aarch64-apple-darwin x86_64-apple-darwin; do
   arch="${target%%-apple-darwin}"
@@ -52,7 +54,10 @@ for target in aarch64-apple-darwin x86_64-apple-darwin; do
   if [[ "$arch" == aarch64 ]]; then cpu_worker_arm="$worker_path"; else cpu_worker_x86="$worker_path"; fi
 done
 lipo -create -output "$macos/scribe-inference-worker" "$cpu_worker_arm" "$cpu_worker_x86"
+codesign --force --sign "$identity" --options runtime "${timestamp[@]}" --entitlements "$repo_root/installer/macos/Scribe.entitlements" "$macos/scribe-inference-worker"
+codesign --verify --strict --verbose=2 "$macos/scribe-inference-worker"
 worker_digest="$(shasum -a 256 "$macos/scribe-inference-worker" | awk '{print $1}')"
+[[ "$worker_digest" =~ ^[0-9a-f]{64}$ ]] || { echo 'signed universal CPU worker digest is invalid.' >&2; exit 1; }
 
 for target in aarch64-apple-darwin x86_64-apple-darwin; do
   arch="${target%%-apple-darwin}"
@@ -64,6 +69,7 @@ for target in aarch64-apple-darwin x86_64-apple-darwin; do
   if [[ "$arch" == aarch64 ]]; then desktop_arm="$desktop_path"; else desktop_x86="$desktop_path"; fi
 done
 lipo -create -output "$macos/Scribe" "$desktop_arm" "$desktop_x86"
+LC_ALL=C strings "$macos/Scribe" | grep -Fqx "$worker_digest" || { echo 'desktop does not embed the final signed CPU worker anchor.' >&2; exit 1; }
 
 if "$include_metal_packs"; then
   for target in aarch64-apple-darwin x86_64-apple-darwin; do
@@ -86,11 +92,11 @@ else
   printf '%s\n' '{"schema_version":1,"packs":[]}' >"$resources/worker-pack-catalog.json"
 fi
 
-identity='-'; timestamp=()
-if [[ "$signing_mode" == developer-id ]]; then identity="$SCRIBE_MACOS_SIGNING_IDENTITY"; timestamp=(--timestamp); fi
-for binary in "$macos/scribe-inference-worker" "$macos/Scribe"; do codesign --force --sign "$identity" --options runtime "${timestamp[@]}" --entitlements "$repo_root/installer/macos/Scribe.entitlements" "$binary"; codesign --verify --strict --verbose=2 "$binary"; done
+codesign --force --sign "$identity" --options runtime "${timestamp[@]}" --entitlements "$repo_root/installer/macos/Scribe.entitlements" "$macos/Scribe"
+codesign --verify --strict --verbose=2 "$macos/Scribe"
 codesign --force --sign "$identity" --options runtime "${timestamp[@]}" --entitlements "$repo_root/installer/macos/Scribe.entitlements" "$app"
 codesign --verify --strict --verbose=2 "$app"
+[[ "$(shasum -a 256 "$macos/scribe-inference-worker" | awk '{print $1}')" == "$worker_digest" ]] || { echo 'outer application signing changed the anchored CPU worker.' >&2; exit 1; }
 rm -rf "$output"/cargo-cpu-* "$output"/cargo-desktop-* "$output"/metal-*.json
 ditto -c -k --sequesterRsrc --keepParent "$app" "$output/Scribe-macos-universal.zip"
 echo "$app"

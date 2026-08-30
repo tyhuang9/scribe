@@ -55,6 +55,13 @@ jobs:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
       - name: Validate canonical packaging inputs
         run: bash scripts/test-macos-release-packaging.sh
+      - name: Run macOS runtime and worker-pack authoring tests
+        env:
+          SCRIBE_BUILD_REVISION: stage6-macos-ci
+        run: |
+          cargo test --locked macos_ -- --nocapture
+          cargo test --locked directional_digest_handshake_binds_parent_anchor_without_child_compile_time_comparison -- --nocapture
+          cargo test --manifest-path tools/worker-pack-author/Cargo.toml --locked
       - name: Build ad hoc signed universal structural package
         run: |
           bash scripts/build-macos-release.sh --output-directory dist-macos --pack-version 0.1.0 --signing-mode adhoc

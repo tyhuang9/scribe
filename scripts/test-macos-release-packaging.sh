@@ -9,6 +9,9 @@ for manifest in "$repo_root"/runtime-manifests/gpu-{worker-toolchain,auto-qualif
 jq -e '. == {schema_version:1,mode:"default_deny",target_os:"macos",target_arch:"aarch64",entries:[]}' "$repo_root/runtime-manifests/gpu-auto-qualification-macos-aarch64.json" >/dev/null
 jq -e '. == {schema_version:1,mode:"default_deny",target_os:"macos",target_arch:"x86_64",entries:[]}' "$repo_root/runtime-manifests/gpu-auto-qualification-macos-x86_64.json" >/dev/null
 if rg -n -- '--deep|Ed25519KeyPair|FIXTURE_SEED|SCRIBE_PACK_SIGNING_PRIVATE_KEY=' "$repo_root/scripts"/{build-macos-metal-worker-pack.sh,build-macos-release.sh,sign-notarize-macos-release.sh}; then echo 'macOS release scripts violate the signing-secret contract.' >&2; exit 1; fi
+rg -F 'xcrun notarytool submit "$archive"' "$repo_root/scripts/sign-notarize-macos-release.sh" >/dev/null || { echo 'notarization must submit a ZIP archive, not an app directory.' >&2; exit 1; }
+rg -F 'desktop does not embed the final signed CPU worker anchor' "$repo_root/scripts/build-macos-release.sh" >/dev/null || { echo 'release builder must bind the desktop anchor to the signed CPU worker.' >&2; exit 1; }
+rg -F 'lipo -verify_arch "$pack_lipo_arch" "$worker"' "$repo_root/scripts/verify-macos-release-package.sh" >/dev/null || { echo 'catalog Metal workers must have their declared single Mach-O slice verified.' >&2; exit 1; }
 if [[ -n "${SCRIBE_MACOS_TEST_BUNDLE:-}" ]]; then
   [[ "$(uname -s)" == Darwin ]] || { echo 'bundle mutation tests require macOS.' >&2; exit 1; }
   base="$SCRIBE_MACOS_TEST_BUNDLE"

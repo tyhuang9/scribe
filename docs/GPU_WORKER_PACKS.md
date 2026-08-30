@@ -296,26 +296,18 @@ obtains those bindings from the concrete
 `ProductionPackRegistry::from_launch_bindings`; it cannot insert a raw
 `VerifiedPack`.
 
-Windows is the implemented Stage 4 target: its resolver keeps
-the verified directory/file lease alive through exact-image launch and the
-challenge-bound Hello check. Unix production remains fail closed. Before a
-Unix catalog or trust root can become nonempty, the resolver bridge must also
-produce an opaque `UnixPackExecAuthority` containing an already-open executable
-FD, an anchored dependency-root directory FD, and the exact same
-`Arc<VerifiedPackLease>` from which both descriptors were opened. The future
-`open_unix_pack_exec_authority_from_verified_pack_lease` constructor must live
-on the provider resolver path, open both descriptors relative to that lease,
-and be the only production constructor; independently opened FDs cannot be
-combined with a lease after the fact. The opaque binding checks lease identity,
-and the launch path must consume those authorities through
-`execveat`/`fexecve`-equivalent execution and retain the dependency-root and
-lease authorities through Hello validation. `PathBuf`,
-`Arc<VerifiedPackLease>`, and `Command::spawn` are not Unix execution authority
-and cannot satisfy the provisioning guard. Unsupported Unix variants must
-remain fail closed until an equivalent descriptor-relative execution primitive
-is implemented and tested. The architecture guard scopes this prohibition to
-the verified-pack provider launch function; unrelated process launches do not
-satisfy or trip the gate.
+Windows and macOS are implemented Stage 4 targets. Their resolvers retain the
+verified directory/file lease through exact-image launch and the
+challenge-bound Hello check. macOS uses the opaque descriptor-bound
+`UnixPackExecAuthority` and `posix_spawn` `/dev/fd` bridge; catalog paths are
+not process-creation authority. Production macOS nevertheless remains
+fail-closed today because its trust root and Auto qualification manifests are
+empty/default-deny. Linux remains fail-closed until an equivalent descriptor
+relative execution primitive is implemented and tested. `PathBuf`,
+`Arc<VerifiedPackLease>`, and `Command::spawn` are not Unix pack-execution
+authority and cannot satisfy that provisioning guard. The architecture guard
+scopes this prohibition to the verified-pack provider launch function;
+unrelated process launches do not satisfy or trip the gate.
 
 ## Stage 6 macOS Metal packaging contract
 
@@ -347,6 +339,11 @@ catalog. The checked-in macOS Auto manifests are both canonical zero-entry
 until a separately reviewed release qualification provides five cold runs,
 twenty warm runs, parity/reliability evidence, and GPU end-to-end p95 no more
 than 110% of the matching CPU p95. ONNX and Sherpa remain CPU-only.
+
+The release builder signs the universal CPU worker before hashing it, then
+embeds that final SHA-256 into both desktop slices. It verifies that the final
+package still contains that digest and the runtime's challenge-bound CPU-worker
+handshake checks the same parent expectation before output is accepted.
 
 ## Build and verification commands
 

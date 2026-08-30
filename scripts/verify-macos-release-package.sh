@@ -26,6 +26,8 @@ while IFS= read -r entry; do
   id="$(jq -r '.pack_id' <<<"$entry")"; version="$(jq -r '.pack_version' <<<"$entry")"; digest="$(jq -r '.pack_digest' <<<"$entry")"; root="workers/packs/$id/$version/$digest"
   [[ "$(jq -r '.root' <<<"$entry")" == "$root" ]] || { echo 'catalog root is not immutable.' >&2; exit 1; }
   [[ "$(jq -r '.target_os' <<<"$entry")" == macos && "$(jq -r '.target_arch' <<<"$entry")" =~ ^(aarch64|x86_64)$ && "$(jq -r '.backend' <<<"$entry")" == metal ]] || { echo 'catalog entry is not a macOS Metal pack.' >&2; exit 1; }
+  pack_lipo_arch="$(jq -r '.target_arch' <<<"$entry")"
+  case "$pack_lipo_arch" in aarch64) pack_lipo_arch=arm64 ;; x86_64) pack_lipo_arch=x86_64 ;; *) echo 'catalog pack architecture is unsupported.' >&2; exit 1 ;; esac
   files_file="$(mktemp "${TMPDIR:-/tmp}/scribe-macos-files.XXXXXX")"; jq -r '.files[]' <<<"$entry" >"$files_file"
   files_count="$(wc -l <"$files_file" | tr -d ' ')"; (( files_count >= 3 )) || { echo 'catalog pack inventory is incomplete.' >&2; exit 1; }
   [[ "$(LC_ALL=C sort -u "$files_file" | wc -l | tr -d ' ')" == "$files_count" && "$(LC_ALL=C sort "$files_file")" == "$(cat "$files_file")" ]] || { echo 'catalog pack inventory is not sorted and unique.' >&2; exit 1; }
@@ -33,11 +35,16 @@ while IFS= read -r entry; do
   while IFS= read -r file; do [[ "$file" == "$root/"* && -f "$resources/$file" && ! -L "$resources/$file" ]] || { echo 'catalog file escaped or is unsafe.' >&2; exit 1; }; printf '%s\n' "Contents/Resources/$file" >>"$expected_file"; installed=$((installed + $(stat -f %z "$resources/$file"))); done <"$files_file"
   rm -f "$files_file"
   [[ "$installed" == "$(jq -r '.installed_size_bytes' <<<"$entry")" ]] || { echo 'catalog installed size mismatch.' >&2; exit 1; }
-  worker="$resources/$root/$(jq -r '.worker_relative_path' <<<"$entry")"; [[ -f "$worker" ]] || { echo 'catalog worker is absent.' >&2; exit 1; }; codesign --verify --strict --verbose=2 "$worker"
+  worker="$resources/$root/$(jq -r '.worker_relative_path' <<<"$entry")"; [[ -f "$worker" ]] || { echo 'catalog worker is absent.' >&2; exit 1; }
+  lipo -verify_arch "$pack_lipo_arch" "$worker"
+  [[ "$(lipo -archs "$worker")" == "$pack_lipo_arch" ]] || { echo 'catalog Metal worker contains an unexpected Mach-O slice.' >&2; exit 1; }
+  codesign --verify --strict --verbose=2 "$worker"
 done < <(jq -c '.packs[]' "$catalog")
 (cd "$app" && find Contents -type f -print | LC_ALL=C sort) >"$actual_file"
 LC_ALL=C sort -u "$expected_file" >"$expected_file.sorted"
 cmp -s "$actual_file" "$expected_file.sorted" || { echo 'application inventory is not exact.' >&2; exit 1; }
 rm -f "$expected_file.sorted"
+worker_digest="$(shasum -a 256 "$macos/scribe-inference-worker" | awk '{print $1}')"
+LC_ALL=C strings "$macos/Scribe" | grep -Fqx "$worker_digest" || { echo 'desktop does not embed the final CPU worker SHA-256 anchor.' >&2; exit 1; }
 if "$require_notarization"; then xcrun stapler validate "$app"; fi
 echo 'macOS release package verification passed.'
