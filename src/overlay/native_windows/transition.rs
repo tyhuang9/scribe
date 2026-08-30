@@ -1,6 +1,7 @@
 use std::time::{Duration, Instant};
 
-use super::{OverlaySnapshot, controller::OverlayPhase};
+use super::super::controller::OverlayPhase;
+use super::OverlaySnapshot;
 
 pub(super) const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 pub(super) const METER_INTERVAL: Duration = Duration::from_millis(33);
