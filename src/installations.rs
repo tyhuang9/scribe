@@ -634,6 +634,8 @@ pub(crate) struct StableManagedDirectory {
     #[cfg(windows)]
     parent: File,
     #[cfg(windows)]
+    _ancestors: Vec<File>,
+    #[cfg(windows)]
     directory: File,
     #[cfg(windows)]
     identity: OpenedFileIdentity,
@@ -663,11 +665,21 @@ impl StableManagedDirectory {
                 .parent()
                 .ok_or_else(|| failed(format!("{} has no parent", target.display())))?;
             let parent = open_windows_directory_capability(parent_path, false, true)?;
+            let mut ancestors = Vec::new();
+            let mut ancestor = parent_path.parent();
+            while let Some(path) = ancestor {
+                if path.as_os_str().is_empty() {
+                    break;
+                }
+                ancestors.push(open_windows_directory_capability(path, false, true)?);
+                ancestor = path.parent();
+            }
             let directory = open_windows_directory_capability(target, true, true)?;
             let identity = opened_file_identity(&directory)?;
             let capability = Self {
                 path: target.to_path_buf(),
                 parent,
+                _ancestors: ancestors,
                 directory,
                 identity,
             };
@@ -1909,10 +1921,10 @@ fn rename_open_windows_directory(directory: &File, destination: &Path) -> Result
     // variable trailing UTF-16 name, and remains alive for the syscall.
     unsafe {
         (*information).Anonymous.ReplaceIfExists = 0;
-        // SetFileInformationByHandle accepts an absolute destination with a
-        // null RootDirectory. The separately opened parent handle remains
-        // live and denies delete sharing, so this absolute name cannot be
-        // redirected by replacing the target's immediate parent.
+        // Every existing ancestor from the target's immediate parent through
+        // the volume root is held without delete sharing. The absolute
+        // destination therefore remains bound to that pinned namespace while
+        // the opened target handle is renamed.
         (*information).RootDirectory = std::ptr::null_mut();
         (*information).FileNameLength = name_bytes;
         std::ptr::copy_nonoverlapping(
@@ -6700,7 +6712,8 @@ mod tests {
     #[test]
     fn stable_directory_capability_pins_identity_across_stage_and_rollback() {
         let root = unique_root("stable-directory-rollback");
-        let target = root.join("managed-onnx");
+        let namespace = root.join("storage");
+        let target = namespace.join("managed-onnx");
         fs::create_dir_all(target.join("nested")).unwrap();
         fs::write(target.join("nested").join("model.onnx"), b"model").unwrap();
 
@@ -6710,7 +6723,7 @@ mod tests {
             fs::rename(&root, &moved_ancestor).is_err(),
             "the opened parent must prevent an ancestor swap"
         );
-        let replacement = root.join("replacement");
+        let replacement = namespace.join("replacement");
         fs::create_dir_all(&replacement).unwrap();
         assert!(
             fs::rename(&target, root.join("stolen-target")).is_err(),
