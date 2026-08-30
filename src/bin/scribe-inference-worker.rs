@@ -29,6 +29,8 @@ mod config {
 )]
 #[path = "../embedded_runtime.rs"]
 mod embedded_runtime;
+#[path = "../gpu_auto_qualification.rs"]
+mod gpu_auto_qualification;
 #[allow(
     dead_code,
     reason = "the worker compiles shared verified-pack handshake contracts but never performs discovery"

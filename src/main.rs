@@ -7,7 +7,7 @@ mod app;
 mod audio;
 #[allow(
     dead_code,
-    reason = "provider qualification policy remains dormant until Stage 5 enables GPU routes for Auto"
+    reason = "the desktop retains the target-aware Stage 5 Auto policy types used by its private worker protocol"
 )]
 mod backend_policy;
 mod benchmark;
@@ -20,6 +20,11 @@ mod diagnostics;
 mod disk_space;
 #[cfg(test)]
 mod embedded_runtime;
+#[allow(
+    dead_code,
+    reason = "the desktop embeds Stage 5 qualification evidence for private worker routing without exposing a public settings surface"
+)]
+mod gpu_auto_qualification;
 #[allow(
     dead_code,
     reason = "Stage 4 retains verified-pack activation and rollback seams beyond bundled catalog discovery"

@@ -801,14 +801,17 @@ fn native_runtime_ownership_is_confined_to_exact_owner_paths() {
 }
 
 #[test]
-fn verified_worker_pack_stage_four_remains_trust_closed_and_auto_inert() {
+fn verified_worker_pack_stage_five_keeps_auto_evidence_bound_and_trust_closed() {
     let desktop = include_str!("main.rs");
     let module = include_str!("gpu_worker_pack/mod.rs");
     let health = include_str!("gpu_worker_pack/health.rs");
     let manifest = include_str!("gpu_worker_pack/manifest.rs");
     let store = include_str!("gpu_worker_pack/store.rs");
     let worker = include_str!("onnx_worker.rs");
+    let qualification = include_str!("gpu_auto_qualification.rs");
     let documentation = include_str!("../docs/GPU_WORKER_PACKS.md");
+    let qualification_manifest =
+        include_str!("../runtime-manifests/gpu-auto-qualification-windows-x64.json");
     let production_manifest = production_source(manifest);
     let registry_body = module
         .split("pub(crate) fn production_registry() -> ProductionPackRegistry")
@@ -822,11 +825,12 @@ fn verified_worker_pack_stage_four_remains_trust_closed_and_auto_inert() {
         .nth(1)
         .and_then(|source| source.split('}').next())
         .is_some_and(|body| body.contains("None"));
-    for dormant_lint_reason in [
-        "provider qualification policy remains dormant until Stage 5 enables GPU routes for Auto",
+    for module_lint_reason in [
+        "the desktop retains the target-aware Stage 5 Auto policy types used by its private worker protocol",
+        "the desktop embeds Stage 5 qualification evidence for private worker routing without exposing a public settings surface",
         "Stage 4 retains verified-pack activation and rollback seams beyond bundled catalog discovery",
     ] {
-        assert!(desktop.contains(dormant_lint_reason));
+        assert!(desktop.contains(module_lint_reason));
     }
     assert!(registry_body.contains("ProductionPackRegistry::empty()"));
     assert!(trust_root_is_empty);
@@ -904,6 +908,9 @@ fn verified_worker_pack_stage_four_remains_trust_closed_and_auto_inert() {
         "stable device",
         "ProductionTrustRoot",
         "reviewed public key",
+        "Stage 5 Windows Auto qualification",
+        "default_deny",
+        "five cold and twenty warm",
     ] {
         assert!(
             documentation.contains(required),
@@ -926,14 +933,35 @@ fn verified_worker_pack_stage_four_remains_trust_closed_and_auto_inert() {
         "verified_pack_bindings()",
         "ProductionPackRegistry::from_launch_bindings(bindings)",
         "preference == AccelerationPreference::Auto",
-        "Auto remains deliberately default-denied for Stage 4",
+        "auto_qualified_pack_discovery",
+        "auto_gpu_discovery_fingerprint",
+        "auto_qualified_gpu_route_catalog",
+        "AutoQualificationPolicy::embedded_windows_x64",
+        "auto_gpu_routes",
+        "Auto selected the guaranteed CPU fallback",
+        "worker_preference_for_route",
         "routes: Arc::clone(&self.routes)",
     ] {
         assert!(
             worker.contains(required),
-            "Stage 4 verified discovery/default-denied Auto contract lost {required:?}"
+            "Stage 5 verified discovery/evidence-bound Auto contract lost {required:?}"
         );
     }
+    assert!(qualification.contains("serde(deny_unknown_fields)"));
+    assert!(qualification.contains("cold_runs < 5"));
+    assert!(qualification.contains("warm_runs < 20"));
+    assert!(qualification.contains("* 100 > u128::from(evidence.cpu_p95_ms) * 110"));
+    assert!(qualification.contains("correctness_verified"));
+    assert!(qualification.contains("reliability_verified"));
+    assert!(qualification.contains("fn qualify_pack"));
+    assert!(qualification.contains("fn qualify_target"));
+    let qualification_value: serde_json::Value = serde_json::from_str(qualification_manifest)
+        .expect("Auto qualification manifest is valid JSON");
+    assert_eq!(qualification_value["schema_version"], 1);
+    assert_eq!(qualification_value["mode"], "default_deny");
+    assert_eq!(qualification_value["target_os"], "windows");
+    assert_eq!(qualification_value["target_arch"], "x86_64");
+    assert_eq!(qualification_value["entries"], serde_json::json!([]));
     for required in [
         "ash::Entry::load()",
         "PhysicalDeviceIDProperties",

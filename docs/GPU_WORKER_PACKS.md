@@ -4,8 +4,9 @@ Stage 4 implements bundled Windows x64 CUDA and Vulkan GGUF worker packs behind
 the verified Stage 3 boundary. A pack becomes an explicit-GPU candidate only
 after signed catalog discovery, retained no-follow verification, a bounded
 provider probe, challenge-bound SCIF Hello reconciliation, and authoritative
-per-device Windows driver mapping. `Auto` remains deliberately default-denied
-to GPU until Stage 5 hardware qualification. The checked-in production trust
+per-device Windows driver mapping. `Auto` is governed by Stage 5 release
+qualification evidence and remains default-denied to GPU until an approved
+entry is added. The checked-in production trust
 root is still empty, so ordinary releases remain CPU-only and a requested
 nonempty GPU release fails closed until a separately reviewed public key and
 protected trusted signing workflow are provisioned. The candidate-ref release
@@ -46,8 +47,34 @@ packs for publication.
   signed-catalog generation plus SetupAPI device/driver fingerprint is
   unchanged. A changed fingerprint retires the warm worker before re-probing.
 - GPU health uses the exact pack/runtime/OS/driver/device/model key described
-  below. `Auto` performs catalog diagnostics only and never launches a provider
-  probe.
+  below.
+
+## Stage 5 Windows Auto qualification
+
+`runtime-manifests/gpu-auto-qualification-windows-x64.json` is a compact,
+canonical, deny-unknown policy embedded in both desktop and worker builds. It
+currently has `mode: default_deny` and zero entries, so it is an explicit
+release-safe CPU default rather than an implicit promise that every discovered
+GPU is suitable for Auto.
+
+Before a provider is loaded, Auto compares a verified pack's backend, provider,
+ID/version/digest, security epoch, runtime ABI, and the requested GGUF digest
+with an entry. Only matching packs may be probed. After the challenge-bound
+Hello, it performs a second exact comparison of vendor, device class, and
+driver identity while enforcing the entry's minimum total-memory threshold.
+Free VRAM is live diagnostics only and is
+not qualification input. The worker then applies the existing battery policy
+and private health quarantine before deterministic CUDA → Vulkan ordering; CPU
+is appended as Auto's final fallback. Explicit `GPU` deliberately bypasses this
+Auto evidence gate and never falls back to CPU.
+
+Every future entry must carry immutable evidence ID and SHA-256 digests for
+cold, warm, and transcript-parity evidence, at least five cold and twenty warm
+runs, correctness and reliability assertions, and GPU p95 no more than 110% of
+the matching CPU p95. The application never benchmarks a user's device. The
+report script validates this schema and emits its deterministic evidence summary
+in Windows CI. A malformed, noncanonical, wrong-platform, unknown-field, or
+nonmatching entry denies Auto GPU use.
 
 ## Signed envelope and digest
 

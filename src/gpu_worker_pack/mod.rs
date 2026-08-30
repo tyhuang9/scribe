@@ -640,11 +640,6 @@ fn verify_catalog_entries_with_verifier(
             ));
             continue;
         }
-        diagnostics.push(PackDiscoveryDiagnostic::pack(
-            PackDiscoveryIssue::NotAutoQualified,
-            &entry.pack_id,
-            entry.backend,
-        ));
         leases.push(Arc::new(lease));
     }
     PackLeaseDiscovery {
@@ -1120,13 +1115,9 @@ mod tests {
             &verifier,
         );
         assert_eq!(success.leases.len(), 1);
-        assert_eq!(
-            success.diagnostics,
-            vec![PackDiscoveryDiagnostic::pack(
-                PackDiscoveryIssue::NotAutoQualified,
-                &pack.pack_id,
-                PackBackend::Vulkan,
-            )]
+        assert!(
+            success.diagnostics.is_empty(),
+            "verified catalog discovery must not label an explicit-GPU pack as Auto-ineligible"
         );
 
         let assert_inventory_rejected = |files: Vec<String>, issue: PackDiscoveryIssue| {
