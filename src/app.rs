@@ -104,6 +104,7 @@ const PREVIEW_FINISH_GRACE: Duration = Duration::from_secs(2);
 const PREVIEW_CANCEL_ACK_WARNING: Duration = Duration::from_secs(2);
 const LOCAL_GGUF_IMPORT_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
 const ONNX_BUNDLE_INSTALL_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
+const ARTIFACT_INSTALL_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
 const MAX_CONCURRENT_MODEL_TRANSFERS: usize = 3;
 const REMOTE_CATALOG_VISIBLE_LIMIT: usize = 100;
 const RETRY_RELEASE_ATTEMPTS: usize = 4;
@@ -1356,6 +1357,7 @@ enum PlaygroundAction {
 }
 
 enum AppEvent {
+    #[allow(dead_code)]
     OnnxBundleInstallProgress {
         job_id: u64,
         model_id: String,
@@ -1458,7 +1460,7 @@ enum AppEvent {
     VerifiedInstallPrepared {
         job_id: u64,
         model_id: String,
-        prepared: Box<PreparedVerifiedInstall>,
+        prepared: Box<PreparedArtifactInstall>,
     },
     VerifiedInstallDone {
         job_id: u64,
@@ -1518,6 +1520,12 @@ struct PreparedVerifiedInstall {
     model: crate::installations::DownloadedArtifact,
     manifest_source: installed_manifest::ArtifactSource,
     remote_install_request: Option<TrustedRemoteInstallRequest>,
+}
+
+#[derive(Debug)]
+enum PreparedArtifactInstall {
+    Gguf(PreparedVerifiedInstall),
+    Onnx(crate::onnx_model_bundles::StagedOnnxBundle),
 }
 
 /// A local source has been fully re-hashed and exercised by the isolated
@@ -1638,7 +1646,7 @@ fn send_verified_install_preparation(
     tx: &AppEventSink,
     job_id: u64,
     model_id: String,
-    result: Result<PreparedVerifiedInstall, InstallJobFailure>,
+    result: Result<PreparedArtifactInstall, InstallJobFailure>,
 ) {
     match result {
         Ok(prepared) => {
@@ -1724,6 +1732,7 @@ struct TrustedRemoteInstallRequest {
 #[derive(Clone, Debug)]
 enum VerifiedInstallSource {
     NormalizedCatalog,
+    NormalizedOnnxBundle(managed_downloads::OnnxBundleDownloadAdmission),
     TrustedRemote(TrustedRemoteInstallRequest),
 }
 
@@ -1763,7 +1772,46 @@ struct ArtifactInstallJob {
     download_config: Option<AppConfig>,
     target_identity: Option<crate::disk_space::CanonicalTargetIdentity>,
     reservation: Option<ArtifactDiskReservation>,
-    prepared: Option<PreparedVerifiedInstall>,
+    prepared: Option<PreparedArtifactInstall>,
+    worker: Option<ArtifactInstallWorker>,
+}
+
+#[derive(Debug)]
+struct ArtifactInstallWorker {
+    completion: Receiver<()>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl ArtifactInstallWorker {
+    fn reap_completed(&mut self) {
+        if matches!(
+            self.completion.try_recv(),
+            Ok(()) | Err(crossbeam_channel::TryRecvError::Disconnected)
+        ) {
+            let _ = self.worker.take().map(thread::JoinHandle::join);
+        }
+    }
+
+    fn wait_until(&mut self, deadline: Instant) -> bool {
+        let completed = if let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+            matches!(
+                self.completion.recv_timeout(remaining),
+                Ok(()) | Err(crossbeam_channel::RecvTimeoutError::Disconnected)
+            )
+        } else {
+            matches!(
+                self.completion.try_recv(),
+                Ok(()) | Err(crossbeam_channel::TryRecvError::Disconnected)
+            )
+        };
+        if !completed {
+            self.worker.take();
+            return false;
+        }
+        self.worker
+            .take()
+            .is_none_or(|worker| worker.join().is_ok())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1781,9 +1829,10 @@ struct ArtifactDiskReservation {
     kind: ArtifactDiskReservationKind,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum ArtifactDiskReservationKind {
     ModelArtifact,
+    OnnxBundle { non_transfer_bytes: u64 },
 }
 
 #[derive(Debug)]
@@ -1801,7 +1850,7 @@ struct ArtifactFinalizerLaunch {
     job_id: u64,
     model_id: String,
     cancellation: InstallCancellation,
-    prepared: PreparedVerifiedInstall,
+    prepared: PreparedArtifactInstall,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1885,10 +1934,6 @@ impl ArtifactInstallCoordinator {
         self.jobs.get(model_id)
     }
 
-    fn values(&self) -> impl Iterator<Item = &(u64, InstallCancellation)> {
-        self.jobs.values().map(|job| &job.handle)
-    }
-
     /// Test-only compatibility for fixtures that seed a correlated job.
     #[cfg(test)]
     fn insert(
@@ -1908,6 +1953,7 @@ impl ArtifactInstallCoordinator {
                 target_identity: None,
                 reservation: None,
                 prepared: None,
+                worker: None,
             },
         );
         previous.map(|job| job.handle)
@@ -1919,6 +1965,47 @@ impl ArtifactInstallCoordinator {
         admission: managed_downloads::ModelDownloadAdmission,
         config: AppConfig,
         source: VerifiedInstallSource,
+    ) -> Result<u64, String> {
+        self.admit_with_reservation_kind(
+            model_id,
+            admission,
+            config,
+            source,
+            ArtifactDiskReservationKind::ModelArtifact,
+        )
+    }
+
+    fn admit_onnx(
+        &mut self,
+        model_id: String,
+        admission: managed_downloads::OnnxBundleDownloadAdmission,
+        config: AppConfig,
+    ) -> Result<u64, String> {
+        let non_transfer_bytes = admission
+            .disk
+            .additional_bytes
+            .saturating_sub(admission.download_bytes);
+        let common_admission = managed_downloads::ModelDownloadAdmission {
+            target: admission.target.clone(),
+            target_identity: admission.target_identity.clone(),
+            disk: admission.disk.clone(),
+        };
+        self.admit_with_reservation_kind(
+            model_id,
+            common_admission,
+            config,
+            VerifiedInstallSource::NormalizedOnnxBundle(admission),
+            ArtifactDiskReservationKind::OnnxBundle { non_transfer_bytes },
+        )
+    }
+
+    fn admit_with_reservation_kind(
+        &mut self,
+        model_id: String,
+        admission: managed_downloads::ModelDownloadAdmission,
+        config: AppConfig,
+        source: VerifiedInstallSource,
+        reservation_kind: ArtifactDiskReservationKind,
     ) -> Result<u64, String> {
         if self.recovery_frozen {
             return Err(
@@ -1972,9 +2059,10 @@ impl ArtifactInstallCoordinator {
                 reservation: Some(ArtifactDiskReservation {
                     volume: admission.disk.volume,
                     remaining_bytes: admission.disk.additional_bytes,
-                    kind: ArtifactDiskReservationKind::ModelArtifact,
+                    kind: reservation_kind,
                 }),
                 prepared: None,
+                worker: None,
             },
         );
         self.transfer_queue.push_back(model_id);
@@ -2019,6 +2107,22 @@ impl ArtifactInstallCoordinator {
         launches
     }
 
+    fn register_worker(
+        &mut self,
+        model_id: &str,
+        job_id: u64,
+        worker: ArtifactInstallWorker,
+    ) -> bool {
+        let Some(job) = self.jobs.get_mut(model_id) else {
+            return false;
+        };
+        if job.handle.0 != job_id || job.worker.is_some() {
+            return false;
+        }
+        job.worker = Some(worker);
+        true
+    }
+
     fn update_download_reservation(
         &mut self,
         model_id: &str,
@@ -2041,7 +2145,13 @@ impl ArtifactInstallCoordinator {
         let Some(reservation) = reservation else {
             return false;
         };
-        let remaining_bytes = remaining_bytes.min(reservation.remaining_bytes);
+        let remaining_bytes = match &reservation.kind {
+            ArtifactDiskReservationKind::ModelArtifact => remaining_bytes,
+            ArtifactDiskReservationKind::OnnxBundle { non_transfer_bytes } => {
+                non_transfer_bytes.saturating_add(remaining_bytes)
+            }
+        }
+        .min(reservation.remaining_bytes);
         let released = reservation.remaining_bytes - remaining_bytes;
         reservation.remaining_bytes = remaining_bytes;
         let mut remove_volume = false;
@@ -2208,7 +2318,7 @@ impl ArtifactInstallCoordinator {
         &mut self,
         model_id: &str,
         job_id: u64,
-        prepared: PreparedVerifiedInstall,
+        prepared: PreparedArtifactInstall,
     ) -> bool {
         let Some(job) = self.jobs.get_mut(model_id) else {
             return false;
@@ -2218,6 +2328,10 @@ impl ArtifactInstallCoordinator {
         }
         self.active_transfers = self.active_transfers.saturating_sub(1);
         let reservation = job.reservation.take();
+        if let Some(mut worker) = job.worker.take() {
+            worker.reap_completed();
+            debug_assert!(worker.worker.is_none());
+        }
         job.download_activity = None;
         job.phase = ArtifactInstallPhase::WaitingForFinalizer;
         job.prepared = Some(prepared);
@@ -2259,11 +2373,18 @@ impl ArtifactInstallCoordinator {
         if job.handle.0 != job_id {
             return false;
         }
+        let mut job = self
+            .jobs
+            .remove(model_id)
+            .expect("correlated install job disappeared before finish");
         let was_transfer = job.phase == ArtifactInstallPhase::Transferring;
         let was_finalizer = job.phase == ArtifactInstallPhase::Finalizing;
-        let target = job.target_identity.clone();
-        let reservation = job.reservation.clone();
-        self.jobs.remove(model_id);
+        let target = job.target_identity.take();
+        let reservation = job.reservation.take();
+        if let Some(mut worker) = job.worker.take() {
+            worker.reap_completed();
+            debug_assert!(worker.worker.is_none());
+        }
         self.transfer_queue.retain(|queued| queued != model_id);
         self.finalizer_queue.retain(|queued| queued != model_id);
         if was_transfer {
@@ -2279,6 +2400,21 @@ impl ArtifactInstallCoordinator {
             self.release_reservation(reservation);
         }
         true
+    }
+
+    fn cancel_and_wait_until(&mut self, deadline: Instant) -> bool {
+        for job in self.jobs.values() {
+            job.handle.1.cancel();
+        }
+        let mut completed = true;
+        for job in self.jobs.values_mut() {
+            if let Some(worker) = job.worker.as_mut()
+                && !worker.wait_until(deadline)
+            {
+                completed = false;
+            }
+        }
+        completed
     }
 
     fn cancel(&mut self, model_id: &str) -> ArtifactCancellationOutcome {
@@ -2347,7 +2483,7 @@ enum RemoteModelCardAction {
 fn prepare_verified_install(
     request: VerifiedInstallPreparationRequest,
     progress: &dyn Fn(InstallProgress),
-) -> Result<PreparedVerifiedInstall, InstallJobFailure> {
+) -> Result<PreparedArtifactInstall, InstallJobFailure> {
     let VerifiedInstallPreparationRequest {
         config,
         model_id,
@@ -2368,6 +2504,21 @@ fn prepare_verified_install(
             let source = installed_manifest::ArtifactSource::normalized(&model_id)
                 .map_err(|error| error.to_string())?;
             (model, source, None)
+        }
+        VerifiedInstallSource::NormalizedOnnxBundle(admission) => {
+            let staged = managed_downloads::prepare_onnx_bundle(
+                &admission,
+                &expected_target_identity,
+                &cancellation,
+                progress,
+            )
+            .map_err(InstallJobFailure::from)?;
+            if cancellation.is_cancelled() {
+                return Err(InstallJobFailure::normal(
+                    "Installation cancelled. Exact ONNX partials were retained for Resume.",
+                ));
+            }
+            return Ok(PreparedArtifactInstall::Onnx(staged));
         }
         VerifiedInstallSource::TrustedRemote(request) => {
             let model = managed_downloads::prepare_trusted_gguf_model(
@@ -2394,12 +2545,12 @@ fn prepare_verified_install(
         ));
     }
 
-    Ok(PreparedVerifiedInstall {
+    Ok(PreparedArtifactInstall::Gguf(PreparedVerifiedInstall {
         model_id,
         model,
         manifest_source,
         remote_install_request,
-    })
+    }))
 }
 
 fn run_verified_install_finalizer(
@@ -2561,6 +2712,32 @@ fn run_verified_install_finalizer(
         journal,
         remote_install,
     })
+}
+
+fn run_onnx_bundle_finalizer(
+    service: TranscriptionService,
+    cancellation: InstallCancellation,
+    staged: crate::onnx_model_bundles::StagedOnnxBundle,
+) -> Result<InstallSmoke, InstallJobFailure> {
+    if cancellation.is_cancelled() {
+        return Err(InstallJobFailure::normal(
+            "Installation cancelled while waiting for verification. Exact ONNX partials were retained for Resume.",
+        ));
+    }
+    let verified = service
+        .verify_onnx_bundle_for_installation(staged, &cancellation)
+        .map_err(|error| InstallJobFailure::normal(error.to_string()))?;
+    if cancellation.is_cancelled() {
+        return Err(InstallJobFailure::normal(
+            "Installation cancelled after smoke testing; no ONNX bundle was activated.",
+        ));
+    }
+    let smoke = verified.smoke().clone();
+    verified
+        .activate()
+        .and_then(|activated| activated.commit())
+        .map_err(InstallJobFailure::from)?;
+    Ok(smoke)
 }
 fn validate_local_gguf_import(
     source_path: PathBuf,
@@ -6481,14 +6658,20 @@ impl LocalTranscriberApp {
                     recovery_required,
                     result,
                 } => {
-                    if self
+                    let unified_job = self.artifact_installations.get(&model_id).is_some_and(
+                        |(active_job, _)| {
+                            *active_job == job_id
+                                && self.artifact_installations.phase_for_model(&model_id)
+                                    == Some(ArtifactInstallPhase::Finalizing)
+                        },
+                    );
+                    let legacy_job = self
                         .onnx_bundle_install
                         .as_ref()
-                        .is_none_or(|job| !job.matches(job_id, &model_id))
-                    {
+                        .is_some_and(|job| job.matches(job_id, &model_id));
+                    if !unified_job && !legacy_job {
                         continue;
                     }
-                    self.onnx_download_activity = None;
                     self.remote_catalog.invalidate_local_models();
                     let (downloaded_bytes, total_bytes) = self
                         .model_downloads
@@ -6513,7 +6696,7 @@ impl LocalTranscriberApp {
                                 },
                             );
                             self.model_downloads
-                                .insert(model_id, ModelInstallStatus::Installed);
+                                .insert(model_id.clone(), ModelInstallStatus::Installed);
                             self.remote_catalog.invalidate_local_models();
                             self.status = TranscriptionStatus::Idle;
                             self.status_message = format!(
@@ -6528,7 +6711,7 @@ impl LocalTranscriberApp {
                         Err(message) => {
                             if recovery_required {
                                 self.artifact_recovery_error = Some(message.clone());
-                                self.freeze_artifact_installs_for_recovery(None);
+                                self.freeze_artifact_installs_for_recovery(Some(job_id));
                             }
                             if paused {
                                 if discard_source.is_none() {
@@ -6607,11 +6790,11 @@ impl LocalTranscriberApp {
                             }
                         }
                     }
-                    // Keep the ONNX job's admission slot until correlated
-                    // cancel-and-discard cleanup has finished. The worker has
-                    // acknowledged termination, but a replacement install
-                    // must not race the synchronous partial deletion above.
-                    if let Some(mut job) = self.onnx_bundle_install.take() {
+                    // Keep target ownership until correlated discard cleanup
+                    // finishes; a replacement install must not race deletion.
+                    if unified_job {
+                        self.finish_artifact_install(&model_id, job_id);
+                    } else if let Some(mut job) = self.onnx_bundle_install.take() {
                         job.reap_completed();
                     }
                 }
@@ -8784,25 +8967,7 @@ impl LocalTranscriberApp {
         );
         match managed_downloads::normalized_onnx_bundle_admission(&self.config, &model_id) {
             Ok(Some(admission)) => {
-                if self.onnx_bundle_install.is_some() {
-                    self.fail_model_install(
-                        &model.id,
-                        "An ONNX model installation is already active.".to_owned(),
-                    );
-                    return;
-                }
-                if !self.artifact_installations.is_empty() {
-                    self.fail_model_install(
-                        &model.id,
-                        "Wait for active model downloads and verification to finish before installing an ONNX bundle."
-                            .to_owned(),
-                    );
-                    return;
-                }
-                let job_id = INSTALL_JOB_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-                let cancellation = InstallCancellation::default();
                 self.discard_partial_after_install.remove(&model.id);
-                self.onnx_download_activity = None;
                 self.model_downloads.insert(
                     model.id.clone(),
                     ModelInstallStatus::Downloading {
@@ -8811,8 +8976,26 @@ impl LocalTranscriberApp {
                         bytes_per_second: None,
                     },
                 );
+                self.update_model_download_progress_projection(&model.id);
                 self.status = TranscriptionStatus::Idle;
                 self.status_message = format!("Downloading {}...", model.name);
+                let job_id = match self.artifact_installations.admit_onnx(
+                    model.id.clone(),
+                    admission,
+                    self.config.clone(),
+                ) {
+                    Ok(job_id) => job_id,
+                    Err(message) => {
+                        self.fail_model_install(&model.id, message);
+                        return;
+                    }
+                };
+                self.artifact_installations.initialize_download_diagnostic(
+                    &model.id,
+                    job_id,
+                    retained_bytes,
+                    expected_total_bytes,
+                );
                 self.record_download_diagnostic(
                     &model.id,
                     job_id,
@@ -8822,89 +9005,9 @@ impl LocalTranscriberApp {
                         DownloadDiagnosticEvent::admission(run, job, artifact, source, total)
                     },
                 );
-                let tx = self.tx.clone();
-                let service = self.current_transcription_service();
-                let event_model_id = model.id.clone();
-                let thread_cancellation = cancellation.clone();
-                let (completion_tx, completion) = bounded(1);
-                let worker = thread::Builder::new()
-                    .name("scribe-onnx-bundle-install".to_owned())
-                    .spawn(move || {
-                        let progress = |progress| {
-                            let _ = tx.send(AppEvent::OnnxBundleInstallProgress {
-                                job_id,
-                                model_id: event_model_id.clone(),
-                                progress,
-                            });
-                        };
-                        let result: Result<InstallSmoke, (String, bool)> =
-                            managed_downloads::prepare_onnx_bundle(
-                                &admission,
-                                &thread_cancellation,
-                                &progress,
-                            )
-                            .map_err(|error| {
-                                let recovery_required = error.requires_recovery();
-                                (error.to_string(), recovery_required)
-                            })
-                            .and_then(|staged| {
-                                service
-                                    .verify_onnx_bundle_for_installation(
-                                        staged,
-                                        &thread_cancellation,
-                                    )
-                                    .map_err(|error| (error.to_string(), false))
-                            })
-                            .and_then(|verified| {
-                                let smoke = verified.smoke().clone();
-                                verified
-                                    .activate()
-                                    .and_then(|activated| activated.commit())
-                                    .map_err(|error| {
-                                        let recovery_required = error.requires_recovery();
-                                        (error.to_string(), recovery_required)
-                                    })?;
-                                Ok(smoke)
-                            });
-                        let recovery_required = result
-                            .as_ref()
-                            .err()
-                            .is_some_and(|(_, recovery_required)| *recovery_required);
-                        // Only a failed operation observes pause. Once activation
-                        // commits, a late cancellation signal cannot relabel the
-                        // successful installation as paused.
-                        let paused = result.is_err()
-                            && !recovery_required
-                            && thread_cancellation.is_cancelled();
-                        let result = result.map_err(|(message, _)| message);
-                        // Signal before the unbounded terminal event so the UI
-                        // can reap the worker without racing its final return.
-                        let _ = completion_tx.send(());
-                        let _ = tx.send(AppEvent::OnnxBundleInstallFinished {
-                            job_id,
-                            model_id: event_model_id,
-                            paused,
-                            recovery_required,
-                            result,
-                        });
-                    });
-                match worker {
-                    Ok(worker) => {
-                        self.onnx_bundle_install = Some(OnnxBundleInstallJob {
-                            job_id,
-                            model_id: model.id.clone(),
-                            cancellation,
-                            completion,
-                            worker: Some(worker),
-                        });
-                        self.update_model_download_progress_projection(&model.id);
-                    }
-                    Err(error) => {
-                        self.fail_model_install(
-                            &model.id,
-                            format!("Could not start ONNX bundle installation: {error}"),
-                        );
-                    }
+                self.launch_ready_artifact_transfers();
+                if let Some(status) = self.artifact_installations.aggregate_status() {
+                    self.status_message = status;
                 }
                 return;
             }
@@ -9091,23 +9194,50 @@ impl LocalTranscriberApp {
         for launch in launches {
             self.update_model_download_progress_projection(&launch.model_id);
             let tx = self.tx.clone();
-            thread::spawn(move || {
-                let model_id = ModelId::new(launch.model_id.clone());
-                let progress = |progress| {
-                    send_install_progress(&tx, launch.job_id, &launch.model_id, progress)
-                };
-                let result = prepare_verified_install(
-                    VerifiedInstallPreparationRequest {
-                        config: launch.config,
-                        model_id,
-                        cancellation: launch.cancellation,
-                        source: launch.source,
-                        expected_target_identity: launch.expected_target_identity,
-                    },
-                    &progress,
-                );
-                send_verified_install_preparation(&tx, launch.job_id, launch.model_id, result);
-            });
+            let registered_model_id = launch.model_id.clone();
+            let registered_job_id = launch.job_id;
+            let (completion_tx, completion) = bounded(1);
+            let worker = thread::Builder::new()
+                .name("scribe-model-transfer".to_owned())
+                .spawn(move || {
+                    let model_id = ModelId::new(launch.model_id.clone());
+                    let progress = |progress| {
+                        send_install_progress(&tx, launch.job_id, &launch.model_id, progress)
+                    };
+                    let result = prepare_verified_install(
+                        VerifiedInstallPreparationRequest {
+                            config: launch.config,
+                            model_id,
+                            cancellation: launch.cancellation,
+                            source: launch.source,
+                            expected_target_identity: launch.expected_target_identity,
+                        },
+                        &progress,
+                    );
+                    let _ = completion_tx.send(());
+                    send_verified_install_preparation(&tx, launch.job_id, launch.model_id, result);
+                });
+            match worker {
+                Ok(worker) => {
+                    let registered = self.artifact_installations.register_worker(
+                        &registered_model_id,
+                        registered_job_id,
+                        ArtifactInstallWorker {
+                            completion,
+                            worker: Some(worker),
+                        },
+                    );
+                    debug_assert!(registered);
+                }
+                Err(error) => send_verified_install_preparation(
+                    &self.tx,
+                    registered_job_id,
+                    registered_model_id,
+                    Err(InstallJobFailure::normal(format!(
+                        "Could not start model transfer worker: {error}"
+                    ))),
+                ),
+            }
         }
     }
 
@@ -9123,18 +9253,67 @@ impl LocalTranscriberApp {
         let tx = self.tx.clone();
         let config = self.config.clone();
         let service = self.transcription_service.with_config(config.clone());
-        thread::spawn(move || {
-            let progress =
-                |progress| send_install_progress(&tx, launch.job_id, &launch.model_id, progress);
-            let result = run_verified_install_finalizer(
-                config,
-                service,
-                launch.cancellation,
-                launch.prepared,
-                &progress,
-            );
-            send_verified_install_result(&tx, launch.job_id, launch.model_id, result);
-        });
+        let registered_model_id = launch.model_id.clone();
+        let registered_job_id = launch.job_id;
+        let (completion_tx, completion) = bounded(1);
+        let worker = thread::Builder::new()
+            .name("scribe-model-finalizer".to_owned())
+            .spawn(move || match launch.prepared {
+                PreparedArtifactInstall::Gguf(prepared) => {
+                    let progress = |progress| {
+                        send_install_progress(&tx, launch.job_id, &launch.model_id, progress)
+                    };
+                    let result = run_verified_install_finalizer(
+                        config,
+                        service,
+                        launch.cancellation,
+                        prepared,
+                        &progress,
+                    );
+                    let _ = completion_tx.send(());
+                    send_verified_install_result(&tx, launch.job_id, launch.model_id, result);
+                }
+                PreparedArtifactInstall::Onnx(staged) => {
+                    let cancellation = launch.cancellation;
+                    let result = run_onnx_bundle_finalizer(service, cancellation.clone(), staged);
+                    let recovery_required = result
+                        .as_ref()
+                        .err()
+                        .is_some_and(|failure| failure.recovery_required);
+                    let paused =
+                        result.is_err() && !recovery_required && cancellation.is_cancelled();
+                    let result = result.map_err(|failure| failure.message);
+                    let _ = completion_tx.send(());
+                    let _ = tx.send(AppEvent::OnnxBundleInstallFinished {
+                        job_id: launch.job_id,
+                        model_id: launch.model_id,
+                        paused,
+                        recovery_required,
+                        result,
+                    });
+                }
+            });
+        match worker {
+            Ok(worker) => {
+                let registered = self.artifact_installations.register_worker(
+                    &registered_model_id,
+                    registered_job_id,
+                    ArtifactInstallWorker {
+                        completion,
+                        worker: Some(worker),
+                    },
+                );
+                debug_assert!(registered);
+            }
+            Err(error) => send_verified_install_result(
+                &self.tx,
+                registered_job_id,
+                registered_model_id,
+                Err(InstallJobFailure::normal(format!(
+                    "Could not start model finalizer worker: {error}"
+                ))),
+            ),
+        }
     }
 
     fn finish_artifact_install(&mut self, model_id: &str, job_id: u64) {
@@ -9938,18 +10117,29 @@ impl LocalTranscriberApp {
     }
 
     fn cancel_installations_for_shutdown(&mut self) {
-        for (_, cancellation) in self.artifact_installations.values() {
-            cancellation.cancel();
+        let deadline = Instant::now() + ARTIFACT_INSTALL_SHUTDOWN_TIMEOUT;
+        if !self.artifact_installations.cancel_and_wait_until(deadline) {
+            eprintln!(
+                "model installation workers exceeded the shutdown deadline; detaching cancelled workers"
+            );
         }
         if let Some(mut job) = self.onnx_bundle_install.take()
-            && !job.cancel_and_wait(ONNX_BUNDLE_INSTALL_SHUTDOWN_TIMEOUT)
+            && !job.cancel_and_wait(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(ONNX_BUNDLE_INSTALL_SHUTDOWN_TIMEOUT),
+            )
         {
             eprintln!(
                 "ONNX bundle installation exceeded the shutdown deadline; detaching cancelled worker"
             );
         }
         if let Some(mut job) = self.local_gguf_import.take()
-            && !job.cancel_and_wait(LOCAL_GGUF_IMPORT_SHUTDOWN_TIMEOUT)
+            && !job.cancel_and_wait(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(LOCAL_GGUF_IMPORT_SHUTDOWN_TIMEOUT),
+            )
         {
             eprintln!(
                 "local GGUF import exceeded the shutdown deadline; detaching cancelled worker"
@@ -12231,11 +12421,31 @@ impl LocalTranscriberApp {
                     RemotePartialProbeSource::Normalized(model_id.clone()),
                 ),
             );
-            cancellation.cancel();
-            self.project_pending_partial_discard(model_id.as_str());
-            self.status_message =
-                "Cancelling download; retained partial bytes will be discarded after it exits."
-                    .to_owned();
+            match self.artifact_installations.cancel(model_id.as_str()) {
+                ArtifactCancellationOutcome::SignalledTransfer { .. } => {
+                    cancellation.cancel();
+                    self.project_pending_partial_discard(model_id.as_str());
+                    self.status_message = "Cancelling download; retained partial bytes will be discarded after it exits."
+                        .to_owned();
+                }
+                ArtifactCancellationOutcome::SettledBeforeFinalizer { .. } => {
+                    let source = self
+                        .take_requested_partial_discard(model_id.as_str(), job_id)
+                        .expect("correlated partial-discard intent disappeared");
+                    let result = self.discard_partial_source(&source);
+                    self.finish_partial_discard(model_id.as_str(), result);
+                    self.launch_ready_artifact_transfers();
+                    self.launch_next_artifact_finalizer();
+                }
+                ArtifactCancellationOutcome::FinalizerAlreadyActive { .. } => {
+                    self.discard_partial_after_install.remove(model_id.as_str());
+                    self.status_message = "Verification and activation have started; partials cannot be discarded safely until it finishes."
+                        .to_owned();
+                }
+                ArtifactCancellationOutcome::Missing => {
+                    self.discard_partial_after_install.remove(model_id.as_str());
+                }
+            }
             return;
         }
         if let Some(reason) = self.artifact_mutation_block_reason() {
@@ -12268,13 +12478,33 @@ impl LocalTranscriberApp {
         if let Some((job_id, cancellation)) = self.artifact_installations.get(&model_id).cloned() {
             self.discard_partial_after_install.insert(
                 model_id.clone(),
-                (job_id, RemotePartialProbeSource::Trusted(artifact)),
+                (job_id, RemotePartialProbeSource::Trusted(artifact.clone())),
             );
-            cancellation.cancel();
-            self.project_pending_partial_discard(&model_id);
-            self.status_message =
-                "Cancelling download; retained partial bytes will be discarded after it exits."
-                    .to_owned();
+            match self.artifact_installations.cancel(&model_id) {
+                ArtifactCancellationOutcome::SignalledTransfer { .. } => {
+                    cancellation.cancel();
+                    self.project_pending_partial_discard(&model_id);
+                    self.status_message = "Cancelling download; retained partial bytes will be discarded after it exits."
+                        .to_owned();
+                }
+                ArtifactCancellationOutcome::SettledBeforeFinalizer { .. } => {
+                    let source = self
+                        .take_requested_partial_discard(&model_id, job_id)
+                        .expect("correlated partial-discard intent disappeared");
+                    let result = self.discard_partial_source(&source);
+                    self.finish_partial_discard(&model_id, result);
+                    self.launch_ready_artifact_transfers();
+                    self.launch_next_artifact_finalizer();
+                }
+                ArtifactCancellationOutcome::FinalizerAlreadyActive { .. } => {
+                    self.discard_partial_after_install.remove(&model_id);
+                    self.status_message = "Verification and activation have started; partials cannot be discarded safely until it finishes."
+                        .to_owned();
+                }
+                ArtifactCancellationOutcome::Missing => {
+                    self.discard_partial_after_install.remove(&model_id);
+                }
+            }
             return;
         }
         if let Some(reason) = self.artifact_mutation_block_reason() {
@@ -23552,10 +23782,37 @@ mod layout_tests {
         }
     }
 
-    fn coordinator_prepared(model_id: &str) -> PreparedVerifiedInstall {
+    fn coordinator_onnx_admission(
+        model_id: &str,
+        target_name: &str,
+        volume: &str,
+        available_bytes: u64,
+        download_bytes: u64,
+        non_transfer_bytes: u64,
+    ) -> managed_downloads::OnnxBundleDownloadAdmission {
+        let storage_root = std::env::temp_dir().join("scribe-coordinator-onnx-storage");
+        let target = std::env::temp_dir().join(target_name);
+        let additional_bytes = download_bytes.saturating_add(non_transfer_bytes);
+        managed_downloads::OnnxBundleDownloadAdmission {
+            bundle_id: model_id.to_owned(),
+            storage_root,
+            target_identity: crate::disk_space::canonical_target_identity(&target).unwrap(),
+            target,
+            download_bytes,
+            disk: crate::disk_space::DiskSpacePreflight {
+                volume: volume.to_owned(),
+                available_bytes,
+                additional_bytes,
+                required_bytes: additional_bytes
+                    .saturating_add(crate::disk_space::SAFETY_HEADROOM_BYTES),
+            },
+        }
+    }
+
+    fn coordinator_prepared(model_id: &str) -> PreparedArtifactInstall {
         let model_id = ModelId::new(model_id);
         let destination = std::env::temp_dir().join("fixture.gguf");
-        PreparedVerifiedInstall {
+        PreparedArtifactInstall::Gguf(PreparedVerifiedInstall {
             model: crate::installations::DownloadedArtifact {
                 id: model_id.as_str().to_owned(),
                 path: PathBuf::from("fixture.gguf.partial"),
@@ -23568,7 +23825,7 @@ mod layout_tests {
             manifest_source: installed_manifest::ArtifactSource::normalized(&model_id).unwrap(),
             model_id,
             remote_install_request: None,
-        }
+        })
     }
     #[test]
     fn installation_failures_preserve_recovery_required_classification() {
@@ -24431,6 +24688,157 @@ mod layout_tests {
     }
 
     #[test]
+    fn artifact_coordinator_mixed_gguf_and_onnx_transfers_share_the_three_slot_fifo() {
+        let mut coordinator = ArtifactInstallCoordinator::default();
+        let available = crate::disk_space::SAFETY_HEADROOM_BYTES + 10_000;
+        coordinator
+            .admit(
+                "gguf-0".to_owned(),
+                coordinator_admission("mixed-0.gguf", "mixed-volume", available, 100),
+                AppConfig::default(),
+                VerifiedInstallSource::NormalizedCatalog,
+            )
+            .unwrap();
+        coordinator
+            .admit_onnx(
+                "onnx-1".to_owned(),
+                coordinator_onnx_admission(
+                    "onnx-1",
+                    "mixed-1-onnx",
+                    "mixed-volume",
+                    available,
+                    100,
+                    200,
+                ),
+                AppConfig::default(),
+            )
+            .unwrap();
+        coordinator
+            .admit(
+                "gguf-2".to_owned(),
+                coordinator_admission("mixed-2.gguf", "mixed-volume", available, 100),
+                AppConfig::default(),
+                VerifiedInstallSource::NormalizedCatalog,
+            )
+            .unwrap();
+        coordinator
+            .admit_onnx(
+                "onnx-3".to_owned(),
+                coordinator_onnx_admission(
+                    "onnx-3",
+                    "mixed-3-onnx",
+                    "mixed-volume",
+                    available,
+                    100,
+                    200,
+                ),
+                AppConfig::default(),
+            )
+            .unwrap();
+
+        let first = coordinator.take_ready_transfers();
+        assert_eq!(
+            first
+                .iter()
+                .map(|launch| launch.model_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["gguf-0", "onnx-1", "gguf-2"]
+        );
+        assert!(matches!(
+            first[1].source,
+            VerifiedInstallSource::NormalizedOnnxBundle(_)
+        ));
+        assert_eq!(
+            coordinator.get_job("onnx-3").unwrap().phase,
+            ArtifactInstallPhase::QueuedTransfer
+        );
+
+        assert!(coordinator.finish("gguf-0", first[0].job_id));
+        let next = coordinator.take_ready_transfers();
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].model_id, "onnx-3");
+    }
+
+    #[test]
+    fn artifact_coordinator_onnx_reservation_keeps_staging_floor_during_transfer() {
+        let mut coordinator = ArtifactInstallCoordinator::default();
+        let available = crate::disk_space::SAFETY_HEADROOM_BYTES + 400;
+        let job_id = coordinator
+            .admit_onnx(
+                "onnx-reservation".to_owned(),
+                coordinator_onnx_admission(
+                    "onnx-reservation",
+                    "onnx-reservation-target",
+                    "onnx-volume",
+                    available,
+                    100,
+                    200,
+                ),
+                AppConfig::default(),
+            )
+            .unwrap();
+        coordinator.take_ready_transfers();
+
+        assert!(coordinator.update_download_reservation("onnx-reservation", job_id, 40));
+        assert_eq!(
+            coordinator.reserved_by_volume.get("onnx-volume"),
+            Some(&240)
+        );
+        assert!(
+            coordinator
+                .admit(
+                    "blocked-gguf".to_owned(),
+                    coordinator_admission("blocked-by-onnx.gguf", "onnx-volume", available, 161,),
+                    AppConfig::default(),
+                    VerifiedInstallSource::NormalizedCatalog,
+                )
+                .unwrap_err()
+                .contains("active downloads")
+        );
+        coordinator
+            .admit(
+                "admitted-gguf".to_owned(),
+                coordinator_admission("admitted-after-onnx.gguf", "onnx-volume", available, 160),
+                AppConfig::default(),
+                VerifiedInstallSource::NormalizedCatalog,
+            )
+            .unwrap();
+        assert_eq!(
+            coordinator.reserved_by_volume.get("onnx-volume"),
+            Some(&400)
+        );
+    }
+
+    #[test]
+    fn artifact_coordinator_cancelled_onnx_rejects_late_progress() {
+        let mut coordinator = ArtifactInstallCoordinator::default();
+        let available = crate::disk_space::SAFETY_HEADROOM_BYTES + 1_000;
+        let job_id = coordinator
+            .admit_onnx(
+                "cancelled-onnx".to_owned(),
+                coordinator_onnx_admission(
+                    "cancelled-onnx",
+                    "cancelled-onnx-target",
+                    "cancelled-onnx-volume",
+                    available,
+                    100,
+                    200,
+                ),
+                AppConfig::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            coordinator.cancel("cancelled-onnx"),
+            ArtifactCancellationOutcome::SettledBeforeFinalizer { job_id }
+        );
+        assert!(!coordinator.contains_key("cancelled-onnx"));
+        assert!(!coordinator.accepts_progress("cancelled-onnx", job_id));
+        assert!(!coordinator.update_download_reservation("cancelled-onnx", job_id, 1));
+        assert!(coordinator.target_owners.is_empty());
+        assert!(coordinator.reserved_by_volume.is_empty());
+    }
+
+    #[test]
     fn correlated_activity_survives_byte_updates_and_rejects_stale_jobs() {
         let mut coordinator = ArtifactInstallCoordinator::default();
         let job_id = coordinator
@@ -24732,6 +25140,45 @@ mod layout_tests {
         }
         assert!(coordinator.take_ready_transfers().is_empty());
         assert!(coordinator.take_next_finalizer().is_none());
+    }
+
+    #[test]
+    fn artifact_coordinator_shutdown_uses_one_deadline_for_all_workers() {
+        let mut coordinator = ArtifactInstallCoordinator::default();
+        let first_cancellation = InstallCancellation::default();
+        let second_cancellation = InstallCancellation::default();
+        coordinator.insert(
+            "shutdown-first".to_owned(),
+            (81, first_cancellation.clone()),
+        );
+        coordinator.insert(
+            "shutdown-second".to_owned(),
+            (82, second_cancellation.clone()),
+        );
+        let (_first_tx, first_completion) = bounded::<()>(1);
+        let (_second_tx, second_completion) = bounded::<()>(1);
+        assert!(coordinator.register_worker(
+            "shutdown-first",
+            81,
+            ArtifactInstallWorker {
+                completion: first_completion,
+                worker: None,
+            },
+        ));
+        assert!(coordinator.register_worker(
+            "shutdown-second",
+            82,
+            ArtifactInstallWorker {
+                completion: second_completion,
+                worker: None,
+            },
+        ));
+
+        let started = Instant::now();
+        assert!(!coordinator.cancel_and_wait_until(started + Duration::from_millis(10)));
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert!(first_cancellation.is_cancelled());
+        assert!(second_cancellation.is_cancelled());
     }
 
     #[test]
@@ -26111,14 +26558,32 @@ mod layout_tests {
     }
 
     #[test]
-    fn active_onnx_bundle_job_projects_downloading_progress_and_cancel() {
+    fn coordinated_onnx_bundle_job_projects_downloading_progress_and_cancel() {
         let mut app = test_app();
         let model_id = "moonshine-tiny-en-int8-onnx".to_owned();
-        app.onnx_bundle_install = Some(test_onnx_bundle_install_job(
-            41,
-            model_id.clone(),
-            InstallCancellation::default(),
-        ));
+        let available = crate::disk_space::SAFETY_HEADROOM_BYTES + 100_000_000;
+        app.artifact_installations
+            .admit_onnx(
+                model_id.clone(),
+                coordinator_onnx_admission(
+                    &model_id,
+                    "projected-onnx-target",
+                    "projected-onnx-volume",
+                    available,
+                    44_256_550,
+                    44_256_550,
+                ),
+                app.config.clone(),
+            )
+            .unwrap();
+        let launches = app.artifact_installations.take_ready_transfers();
+        assert_eq!(launches.len(), 1);
+        app.artifact_installations.initialize_download_diagnostic(
+            &model_id,
+            launches[0].job_id,
+            17,
+            Some(44_256_550),
+        );
         app.model_downloads.insert(
             model_id.clone(),
             ModelInstallStatus::Downloading {
@@ -26140,32 +26605,41 @@ mod layout_tests {
     }
 
     #[test]
-    fn onnx_install_is_mutually_exclusive_with_other_artifact_mutations() {
-        let model_id = "moonshine-tiny-en-int8-onnx".to_owned();
-        let mut active_onnx = test_app();
-        active_onnx.onnx_bundle_install = Some(test_onnx_bundle_install_job(
-            43,
-            model_id.clone(),
-            InstallCancellation::default(),
-        ));
-        assert!(active_onnx.artifact_mutation_block_reason().is_some());
-        assert!(active_onnx.install_admission_block_reason().is_some());
+    fn mixed_onnx_and_gguf_installs_allow_more_downloads_but_block_other_mutations() {
+        let mut app = test_app();
+        let available = crate::disk_space::SAFETY_HEADROOM_BYTES + 100_000_000;
+        app.artifact_installations
+            .admit(
+                "whisper_cpp_tiny_en".to_owned(),
+                coordinator_admission("mixed-active.gguf", "mixed-mutation-volume", available, 100),
+                app.config.clone(),
+                VerifiedInstallSource::NormalizedCatalog,
+            )
+            .unwrap();
+        app.artifact_installations
+            .admit_onnx(
+                "moonshine-tiny-en-int8-onnx".to_owned(),
+                coordinator_onnx_admission(
+                    "moonshine-tiny-en-int8-onnx",
+                    "mixed-active-onnx",
+                    "mixed-mutation-volume",
+                    available,
+                    1_000,
+                    2_000,
+                ),
+                app.config.clone(),
+            )
+            .unwrap();
 
-        let mut active_gguf = test_app();
-        active_gguf.artifact_installations.insert(
-            "whisper_cpp_tiny_en".to_owned(),
-            (44, InstallCancellation::default()),
-        );
-        let moonshine = config::configured_models(&active_gguf.config)
-            .into_iter()
-            .find(|model| model.id == model_id)
-            .expect("Moonshine is part of the normalized catalog");
-        active_gguf.start_verified_model_download(&moonshine);
-        assert!(active_gguf.onnx_bundle_install.is_none());
+        assert!(app.install_admission_block_reason().is_none());
+        assert!(app.artifact_mutation_block_reason().is_some());
         assert!(
-            active_gguf
-                .status_message
-                .contains("Wait for active model downloads")
+            app.artifact_installations
+                .contains_key("whisper_cpp_tiny_en")
+        );
+        assert!(
+            app.artifact_installations
+                .contains_key("moonshine-tiny-en-int8-onnx")
         );
     }
 
