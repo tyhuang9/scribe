@@ -639,6 +639,17 @@ pub(crate) struct StableManagedDirectory {
     directory: File,
     #[cfg(windows)]
     identity: OpenedFileIdentity,
+    #[cfg(windows)]
+    pinned_entries: Option<Vec<StableManagedEntry>>,
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+struct StableManagedEntry {
+    relative_path: PathBuf,
+    file: File,
+    identity: OpenedFileIdentity,
+    is_directory: bool,
 }
 
 impl StableManagedDirectory {
@@ -701,6 +712,7 @@ impl StableManagedDirectory {
             _ancestors: ancestors,
             directory,
             identity,
+            pinned_entries: None,
         };
         capability.revalidate_path_identity()?;
         Ok(capability)
@@ -708,6 +720,36 @@ impl StableManagedDirectory {
 
     pub(crate) fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Pins every current non-link child identity with write and delete
+    /// sharing denied. Callers must repeat their exact receipt/tree
+    /// verification after this returns. The retained handles then bind that
+    /// verified snapshot through settings persistence and deletion.
+    pub(crate) fn pin_exact_tree(&mut self) -> Result<(), InstallError> {
+        #[cfg(not(windows))]
+        {
+            return Err(failed(
+                "stable managed-directory capabilities are unavailable on this platform",
+            ));
+        }
+
+        #[cfg(windows)]
+        {
+            if self.pinned_entries.is_some() {
+                return Err(failed("stable managed-directory tree is already pinned"));
+            }
+            self.revalidate_path_identity()?;
+            let mut entries = Vec::new();
+            pin_open_directory_entries(&self.path, Path::new(""), &mut entries)?;
+            self.pinned_entries = Some(entries);
+            self.revalidate_pinned_tree()
+        }
+    }
+
+    #[cfg(windows)]
+    fn release_pinned_tree(&mut self) {
+        self.pinned_entries.take();
     }
 
     #[cfg(windows)]
@@ -718,6 +760,42 @@ impl StableManagedDirectory {
                 "managed directory identity changed at {}",
                 self.path.display()
             )));
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn revalidate_pinned_tree(&self) -> Result<(), InstallError> {
+        let pinned_entries = self.pinned_entries.as_ref().ok_or_else(|| {
+            failed(format!(
+                "managed directory has no pinned child tree: {}",
+                self.path.display()
+            ))
+        })?;
+        let expected_paths = pinned_entries
+            .iter()
+            .map(|entry| entry.relative_path.clone())
+            .collect::<HashSet<_>>();
+        let mut observed_paths = HashSet::new();
+        collect_managed_tree_paths(&self.path, Path::new(""), &mut observed_paths)?;
+        if observed_paths != expected_paths {
+            return Err(InstallError::RecoveryRequired(format!(
+                "managed directory child set changed after receipt verification: {}",
+                self.path.display()
+            )));
+        }
+        for entry in pinned_entries {
+            let entry_path = self.path.join(&entry.relative_path);
+            let (probe, metadata) = open_windows_entry_probe(&entry_path)?;
+            if opened_file_identity(&probe)? != entry.identity
+                || metadata.is_dir() != entry.is_directory
+                || runtime_metadata_is_link_or_reparse(&metadata)
+            {
+                return Err(InstallError::RecoveryRequired(format!(
+                    "managed directory child identity changed after receipt verification: {}",
+                    entry_path.display()
+                )));
+            }
         }
         Ok(())
     }
@@ -746,14 +824,40 @@ impl StableManagedDirectory {
     #[cfg(windows)]
     fn remove_exact_tree(self) -> Result<(), InstallError> {
         self.revalidate_path_identity()?;
-        remove_open_directory_contents(&self.directory, &self.path)?;
-        mark_open_windows_directory_for_delete(&self.directory)?;
+        self.revalidate_pinned_tree()?;
         let Self {
             path,
             parent,
             directory,
+            pinned_entries,
             ..
         } = self;
+        let mut pinned_entries = pinned_entries.ok_or_else(|| {
+            InstallError::RecoveryRequired(format!(
+                "managed directory deletion has no pinned verified child tree: {}",
+                path.display()
+            ))
+        })?;
+        pinned_entries.sort_by(|left, right| {
+            right
+                .relative_path
+                .components()
+                .count()
+                .cmp(&left.relative_path.components().count())
+                .then_with(|| right.relative_path.cmp(&left.relative_path))
+        });
+        for entry in pinned_entries {
+            let entry_path = path.join(&entry.relative_path);
+            mark_open_windows_directory_for_delete(&entry.file)?;
+            drop(entry.file);
+            if path_entry_exists_no_follow(&entry_path)? {
+                return Err(InstallError::RecoveryRequired(format!(
+                    "pinned managed deletion entry remained or was replaced after delete-on-close: {}",
+                    entry_path.display()
+                )));
+            }
+        }
+        mark_open_windows_directory_for_delete(&directory)?;
         // Delete-on-close applies to the exact opened identity. Keep its
         // parent pinned until the directory handle closes and absence is
         // confirmed, so an ancestor swap cannot redirect the check.
@@ -980,6 +1084,14 @@ impl ManagedRemoval {
         persist_removal_journal(journal_path, journal)
     }
 
+    pub(crate) fn pin_stable_tree(&mut self) -> Result<PathBuf, InstallError> {
+        let capability = self.stable_directory.as_mut().ok_or_else(|| {
+            failed("stable managed-directory removal has no opened directory capability")
+        })?;
+        capability.pin_exact_tree()?;
+        Ok(capability.path().to_path_buf())
+    }
+
     pub(crate) fn removed_files(&self) -> bool {
         self.tombstone.is_some()
     }
@@ -1024,7 +1136,11 @@ impl ManagedRemoval {
             )));
         }
         let restore = match self.stable_directory.as_mut() {
-            Some(capability) => capability.rename_to(&self.target),
+            Some(capability) => {
+                #[cfg(windows)]
+                capability.release_pinned_tree();
+                capability.rename_to(&self.target)
+            }
             None => durable_rename(&tombstone, &self.target),
         };
         restore.map_err(|error| {
@@ -1301,6 +1417,8 @@ pub(crate) fn reconcile_stable_directory_removal(
                     tombstone.display()
                 )));
             }
+            #[cfg(windows)]
+            opened.release_pinned_tree();
             opened.rename_to(target).map_err(|error| {
                 InstallError::RecoveryRequired(format!(
                     "failed to restore interrupted stable removal {}: {error}",
@@ -2061,28 +2179,31 @@ fn mark_open_windows_directory_for_delete(directory: &File) -> Result<(), Instal
 }
 
 #[cfg(windows)]
-fn open_windows_entry_for_delete(path: &Path) -> Result<(File, fs::Metadata), InstallError> {
+fn open_windows_entry_for_pinning(path: &Path) -> Result<(File, fs::Metadata), InstallError> {
     use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::Storage::FileSystem::{
         DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
-        FILE_SHARE_READ, FILE_SHARE_WRITE, SYNCHRONIZE,
+        FILE_SHARE_READ, SYNCHRONIZE,
     };
 
     let mut options = OpenOptions::new();
     options
         .read(true)
         .access_mode(DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        // A verified child must not be modified or replaced while its
+        // removal transaction is live. Existing incompatible handles make
+        // capability construction fail closed.
+        .share_mode(FILE_SHARE_READ)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
     let file = options.open(path).map_err(|error| {
         failed(format!(
-            "failed to open managed deletion entry {}: {error}",
+            "failed to pin managed deletion entry {}: {error}",
             path.display()
         ))
     })?;
     let metadata = file.metadata().map_err(|error| {
         failed(format!(
-            "failed to inspect opened managed deletion entry {}: {error}",
+            "failed to inspect pinned managed deletion entry {}: {error}",
             path.display()
         ))
     })?;
@@ -2090,43 +2211,127 @@ fn open_windows_entry_for_delete(path: &Path) -> Result<(File, fs::Metadata), In
 }
 
 #[cfg(windows)]
-fn remove_open_directory_contents(_directory: &File, root: &Path) -> Result<(), InstallError> {
-    let paths = fs::read_dir(root)
+fn open_windows_entry_probe(path: &Path) -> Result<(File, fs::Metadata), InstallError> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, SYNCHRONIZE,
+    };
+
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .access_mode(FILE_READ_ATTRIBUTES | SYNCHRONIZE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+    let file = options.open(path).map_err(|error| {
+        failed(format!(
+            "failed to re-open pinned managed entry {}: {error}",
+            path.display()
+        ))
+    })?;
+    let metadata = file.metadata().map_err(|error| {
+        failed(format!(
+            "failed to inspect re-opened managed entry {}: {error}",
+            path.display()
+        ))
+    })?;
+    Ok((file, metadata))
+}
+
+#[cfg(windows)]
+fn pin_open_directory_entries(
+    root: &Path,
+    relative_root: &Path,
+    pinned: &mut Vec<StableManagedEntry>,
+) -> Result<(), InstallError> {
+    let current = root.join(relative_root);
+    let paths = fs::read_dir(&current)
         .map_err(|error| {
             failed(format!(
-                "failed to enumerate opened managed directory {}: {error}",
-                root.display()
+                "failed to enumerate managed directory for pinning {}: {error}",
+                current.display()
             ))
         })?
         .map(|entry| {
-            entry.map(|entry| entry.path()).map_err(|error| {
+            entry.map(|entry| entry.file_name()).map_err(|error| {
                 failed(format!(
-                    "failed to enumerate opened managed directory {}: {error}",
-                    root.display()
+                    "failed to enumerate managed directory for pinning {}: {error}",
+                    current.display()
                 ))
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    for path in paths {
-        let (entry, metadata) = open_windows_entry_for_delete(&path)?;
-        if metadata.is_dir() && !runtime_metadata_is_link_or_reparse(&metadata) {
-            remove_open_directory_contents(&entry, &path)?;
-        } else if !metadata.is_dir()
-            && !metadata.is_file()
-            && !runtime_metadata_is_link_or_reparse(&metadata)
+    for name in paths {
+        let relative_path = relative_root.join(name);
+        let path = root.join(&relative_path);
+        let (file, metadata) = open_windows_entry_for_pinning(&path)?;
+        if runtime_metadata_is_link_or_reparse(&metadata)
+            || (!metadata.is_dir() && !metadata.is_file())
         {
             return Err(failed(format!(
-                "opened managed directory contains an unsupported entry: {}",
+                "managed directory contains an unsupported or linked entry while pinning: {}",
                 path.display()
             )));
         }
-        mark_open_windows_directory_for_delete(&entry)?;
-        drop(entry);
-        if path_entry_exists_no_follow(&path)? {
+        let is_directory = metadata.is_dir();
+        let identity = opened_file_identity(&file)?;
+        pinned.push(StableManagedEntry {
+            relative_path: relative_path.clone(),
+            file,
+            identity,
+            is_directory,
+        });
+        if is_directory {
+            pin_open_directory_entries(root, &relative_path, pinned)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn collect_managed_tree_paths(
+    root: &Path,
+    relative_root: &Path,
+    paths: &mut HashSet<PathBuf>,
+) -> Result<(), InstallError> {
+    let current = root.join(relative_root);
+    for entry in fs::read_dir(&current).map_err(|error| {
+        failed(format!(
+            "failed to revalidate pinned managed directory {}: {error}",
+            current.display()
+        ))
+    })? {
+        let entry = entry.map_err(|error| {
+            failed(format!(
+                "failed to revalidate pinned managed directory {}: {error}",
+                current.display()
+            ))
+        })?;
+        let relative_path = relative_root.join(entry.file_name());
+        let path = root.join(&relative_path);
+        let metadata = fs::symlink_metadata(&path).map_err(|error| {
+            failed(format!(
+                "failed to inspect pinned managed entry {}: {error}",
+                path.display()
+            ))
+        })?;
+        if runtime_metadata_is_link_or_reparse(&metadata)
+            || (!metadata.is_dir() && !metadata.is_file())
+        {
             return Err(InstallError::RecoveryRequired(format!(
-                "opened managed deletion entry remained after delete-on-close: {}",
+                "pinned managed directory gained an unsupported or linked entry: {}",
                 path.display()
             )));
+        }
+        if !paths.insert(relative_path.clone()) {
+            return Err(failed(format!(
+                "pinned managed directory reported a duplicate entry: {}",
+                path.display()
+            )));
+        }
+        if metadata.is_dir() {
+            collect_managed_tree_paths(root, &relative_path, paths)?;
         }
     }
     Ok(())
@@ -6895,6 +7100,7 @@ mod tests {
             format!("{:x}", Sha256::digest(b"prior-config")),
         )
         .unwrap();
+        removal.pin_stable_tree().unwrap();
         removal
             .prepare_config_commit(format!("{:x}", Sha256::digest(b"expected-config")))
             .unwrap();
@@ -6903,6 +7109,134 @@ mod tests {
         assert!(!target.exists());
         assert!(!removal_tombstone_path(&target).unwrap().exists());
         assert!(!removal_journal_path(&target).unwrap().exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pinned_stable_tree_blocks_child_replacement_and_refuses_added_children() {
+        let root = unique_root("stable-directory-child-swap");
+        let target = root.join("managed-onnx");
+        fs::create_dir_all(target.join("nested")).unwrap();
+        fs::write(target.join("nested").join("model.onnx"), b"owned-model").unwrap();
+        let capability = StableManagedDirectory::open_exact(&target, &target).unwrap();
+        let mut removal = ManagedRemoval::stage_stable_directory(
+            capability,
+            format!("{:x}", Sha256::digest(b"prior-config")),
+        )
+        .unwrap();
+        let tombstone = removal.pin_stable_tree().unwrap();
+
+        let pinned_file = tombstone.join("nested").join("model.onnx");
+        assert!(
+            fs::write(&pinned_file, b"replacement").is_err(),
+            "the exact verified file handle must deny content replacement"
+        );
+        assert!(
+            fs::rename(tombstone.join("nested"), root.join("stolen-nested")).is_err(),
+            "the exact verified directory handle must deny identity replacement"
+        );
+
+        let unowned = tombstone.join("unowned-after-verification.bin");
+        fs::write(&unowned, b"must survive").unwrap();
+        removal
+            .prepare_config_commit(format!("{:x}", Sha256::digest(b"expected-config")))
+            .unwrap();
+        let error = removal.commit().unwrap_err();
+        assert!(error.to_string().contains("child set changed"));
+        assert_eq!(fs::read(&unowned).unwrap(), b"must survive");
+        assert_eq!(fs::read(&pinned_file).unwrap(), b"owned-model");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn recovery_deletes_only_a_pinned_tree_and_refuses_late_additions() {
+        let root = unique_root("stable-directory-recovery-child-addition");
+        let target = root.join("managed-onnx");
+        fs::create_dir_all(target.join("nested")).unwrap();
+        fs::write(target.join("nested").join("model.onnx"), b"owned-model").unwrap();
+        let prior = format!("{:x}", Sha256::digest(b"prior-config"));
+        let expected = format!("{:x}", Sha256::digest(b"expected-config"));
+        let ownership = format!("{:x}", Sha256::digest(b"receipt-ownership"));
+        let capability = StableManagedDirectory::open_exact(&target, &target).unwrap();
+        let mut interrupted = ManagedRemoval::stage_stable_directory_with_ownership(
+            capability,
+            prior,
+            ownership.clone(),
+        )
+        .unwrap();
+        interrupted.prepare_config_commit(expected.clone()).unwrap();
+        drop(interrupted);
+
+        let tombstone = removal_tombstone_path(&target).unwrap();
+        let mut recovered = StableManagedDirectory::open_exact(&tombstone, &tombstone).unwrap();
+        recovered.pin_exact_tree().unwrap();
+        let unowned = tombstone.join("unowned-during-recovery.bin");
+        fs::write(&unowned, b"must survive recovery").unwrap();
+        let error = reconcile_stable_directory_removal(
+            &target,
+            &expected,
+            Some(recovered),
+            Some(&ownership),
+            true,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("child set changed"));
+        assert_eq!(fs::read(&unowned).unwrap(), b"must survive recovery");
+        assert_eq!(
+            fs::read(tombstone.join("nested").join("model.onnx")).unwrap(),
+            b"owned-model"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pinned_stable_tree_refuses_a_late_reparse_child_without_following_it() {
+        use std::os::windows::fs::symlink_file;
+
+        let root = unique_root("stable-directory-late-reparse");
+        let target = root.join("managed-onnx");
+        let external = root.join("external.bin");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("model.onnx"), b"owned-model").unwrap();
+        fs::write(&external, b"external-must-survive").unwrap();
+        let capability = StableManagedDirectory::open_exact(&target, &target).unwrap();
+        let mut removal = ManagedRemoval::stage_stable_directory(
+            capability,
+            format!("{:x}", Sha256::digest(b"prior-config")),
+        )
+        .unwrap();
+        let tombstone = removal.pin_stable_tree().unwrap();
+        let linked = tombstone.join("linked-after-verification.bin");
+        match symlink_file(&external, &linked) {
+            Ok(()) => {}
+            Err(error)
+                if error.kind() == io::ErrorKind::PermissionDenied
+                    || error.raw_os_error() == Some(1314) =>
+            {
+                removal.rollback().unwrap();
+                fs::remove_dir_all(root).unwrap();
+                return;
+            }
+            Err(error) => panic!("could not create late reparse fixture: {error}"),
+        }
+        removal
+            .prepare_config_commit(format!("{:x}", Sha256::digest(b"expected-config")))
+            .unwrap();
+        let error = removal.commit().unwrap_err();
+        assert!(error.to_string().contains("unsupported or linked entry"));
+        assert_eq!(fs::read(&external).unwrap(), b"external-must-survive");
+        assert!(
+            fs::symlink_metadata(&linked)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+
         fs::remove_dir_all(root).unwrap();
     }
 

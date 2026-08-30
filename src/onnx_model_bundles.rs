@@ -2179,7 +2179,7 @@ fn stage_onnx_bundle_removal_with(
     expected_receipt_sha256: &str,
     prior_config_fingerprint: String,
     enforce_durable_settings: bool,
-    verify: impl FnOnce(&str, &Path) -> Result<VerifiedOnnxRemovalCandidate, InstallError>,
+    verify: impl Fn(&str, &Path) -> Result<VerifiedOnnxRemovalCandidate, InstallError>,
 ) -> Result<OnnxBundleRemoval, InstallError> {
     validate_sha256(expected_receipt_sha256)?;
     let target_root = bundle_target_root(storage_root, model_id)?;
@@ -2214,11 +2214,37 @@ fn stage_onnx_bundle_removal_with(
             "ONNX removal receipt no longer matches the durable ownership witness",
         ));
     }
-    let removal = ManagedRemoval::stage_stable_directory_with_ownership(
+    let mut removal = ManagedRemoval::stage_stable_directory_with_ownership(
         capability,
         prior_config_fingerprint,
         candidate.receipt_sha256().to_owned(),
     )?;
+    let pinned_verification = (|| {
+        let pinned_path = removal.pin_stable_tree()?;
+        let pinned_candidate = verify(model_id, &pinned_path)?;
+        if pinned_candidate.target_root() != pinned_path {
+            return Err(failed(
+                "ONNX removal receipt did not bind the staged pinned directory",
+            ));
+        }
+        if !pinned_candidate
+            .receipt_sha256()
+            .eq_ignore_ascii_case(expected_receipt_sha256)
+        {
+            return Err(failed(
+                "ONNX removal receipt changed while pinning the staged child tree",
+            ));
+        }
+        Ok(())
+    })();
+    if let Err(error) = pinned_verification {
+        return Err(match removal.rollback() {
+            Ok(()) => error,
+            Err(rollback) => InstallError::RecoveryRequired(format!(
+                "ONNX removal child-tree pinning failed: {error}; restoring the staged bundle also failed: {rollback}"
+            )),
+        });
+    }
     Ok(OnnxBundleRemoval {
         removal,
         _target_guard: target_guard,
@@ -2242,6 +2268,30 @@ pub(crate) fn reconcile_onnx_bundle_removal(
         true,
         verified_owned_removal_candidate_at,
     )
+}
+
+fn pin_and_reverify_removal_candidate(
+    model_id: &str,
+    capability: &mut StableManagedDirectory,
+    expected_receipt_sha256: &str,
+    verify: &impl Fn(&str, &Path) -> Result<VerifiedOnnxRemovalCandidate, InstallError>,
+) -> Result<(), InstallError> {
+    capability.pin_exact_tree()?;
+    let pinned_candidate = verify(model_id, capability.path())?;
+    if pinned_candidate.target_root() != capability.path() {
+        return Err(failed(
+            "ONNX removal receipt did not bind the pinned recovery directory",
+        ));
+    }
+    if !pinned_candidate
+        .receipt_sha256()
+        .eq_ignore_ascii_case(expected_receipt_sha256)
+    {
+        return Err(failed(
+            "ONNX removal receipt changed while pinning the recovery child tree",
+        ));
+    }
+    Ok(())
 }
 
 fn reconcile_onnx_bundle_removal_with(
@@ -2270,7 +2320,7 @@ fn reconcile_onnx_bundle_removal_with(
     }
     let (capability, observed_ownership_sha256) =
         if crate::installations::path_entry_exists_no_follow(&tombstone)? {
-            let capability = StableManagedDirectory::open_exact(&tombstone, &tombstone)?;
+            let mut capability = StableManagedDirectory::open_exact(&tombstone, &tombstone)?;
             let candidate = verify(model_id, capability.path()).map_err(|error| {
                 InstallError::RecoveryRequired(format!(
                     "interrupted ONNX removal tombstone is not exact at {}: {error}",
@@ -2284,9 +2334,21 @@ fn reconcile_onnx_bundle_removal_with(
                 )));
             }
             let receipt_sha256 = candidate.receipt_sha256().to_owned();
+            pin_and_reverify_removal_candidate(
+                model_id,
+                &mut capability,
+                &receipt_sha256,
+                &verify,
+            )
+            .map_err(|error| {
+                InstallError::RecoveryRequired(format!(
+                    "interrupted ONNX removal tombstone could not be pinned exactly at {}: {error}",
+                    tombstone.display()
+                ))
+            })?;
             (Some(capability), Some(receipt_sha256))
         } else if crate::installations::path_entry_exists_no_follow(&target_root)? {
-            let capability = StableManagedDirectory::open_exact(&target_root, &target_root)?;
+            let mut capability = StableManagedDirectory::open_exact(&target_root, &target_root)?;
             let candidate = verify(model_id, capability.path()).map_err(|error| {
                 InstallError::RecoveryRequired(format!(
                     "interrupted ONNX removal target is not exact at {}: {error}",
@@ -2300,6 +2362,18 @@ fn reconcile_onnx_bundle_removal_with(
                 )));
             }
             let receipt_sha256 = candidate.receipt_sha256().to_owned();
+            pin_and_reverify_removal_candidate(
+                model_id,
+                &mut capability,
+                &receipt_sha256,
+                &verify,
+            )
+            .map_err(|error| {
+                InstallError::RecoveryRequired(format!(
+                    "interrupted ONNX removal target could not be pinned exactly at {}: {error}",
+                    target_root.display()
+                ))
+            })?;
             (Some(capability), Some(receipt_sha256))
         } else {
             (None, None)
@@ -3187,8 +3261,8 @@ mod tests {
             removal.rollback().unwrap();
         });
         assert_eq!(
-            stats.calls, 2,
-            "UI authorization and mutation must each verify the complete tree"
+            stats.calls, 3,
+            "UI authorization, pre-stage mutation, and pinned tombstone validation must each verify the complete tree"
         );
 
         let guard = acquire_bundle_target(&target).unwrap();
