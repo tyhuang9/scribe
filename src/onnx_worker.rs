@@ -2816,6 +2816,7 @@ impl SileroVadWorkerSupervisor {
         Ok(false)
     }
 
+    #[cfg(test)]
     pub(crate) fn start_session(
         &self,
         session_id: u64,
@@ -2830,6 +2831,24 @@ impl SileroVadWorkerSupervisor {
             threshold,
             self.deadlines.acquisition,
             None,
+        )
+    }
+
+    pub(crate) fn start_session_with_cancellation(
+        &self,
+        session_id: u64,
+        request_id: u64,
+        threshold: VadThreshold,
+        cancelled: &AtomicBool,
+    ) -> Result<()> {
+        let generation = self.transport.ensure_generation()?;
+        self.start_session_on_generation(
+            generation,
+            session_id,
+            request_id,
+            threshold,
+            self.deadlines.acquisition,
+            Some(cancelled),
         )
     }
 

@@ -647,7 +647,7 @@ fn request_stop(owner: &OwnerState, observed_at: Instant) {
 
 fn request_abort(owner: &OwnerState) {
     if let Some(cancellation) = owner.cancellation.as_ref() {
-        cancellation.cancel();
+        cancellation.abort();
     }
     if let Some(session) = owner.session.as_ref() {
         session.abort();
@@ -854,8 +854,10 @@ fn panic_message(panic: Box<dyn std::any::Any + Send>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
+
+    use crossbeam_channel::bounded;
 
     use super::*;
     use crate::audio::{ABORT_STREAM_DROP_BUDGET, CaptureStopReason};
@@ -964,6 +966,143 @@ mod tests {
     #[test]
     fn abort_during_two_second_post_roll_drops_stream_without_normal_finalization() {
         assert_abort_bypasses_normal_finalization(true);
+    }
+
+    #[test]
+    fn preadmission_abort_drops_stream_while_vad_acquisition_remains_parked() {
+        struct FakeStream(Arc<AtomicBool>);
+
+        impl Drop for FakeStream {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let worker_calls = Arc::clone(&calls);
+        let stream_dropped = Arc::new(AtomicBool::new(false));
+        let worker_stream_dropped = Arc::clone(&stream_dropped);
+        let downstream_processing = Arc::new(AtomicBool::new(false));
+        let worker_downstream = Arc::clone(&downstream_processing);
+        let vad_unblocked = Arc::new(AtomicBool::new(false));
+        let worker_vad_unblocked = Arc::clone(&vad_unblocked);
+        let (played_tx, played_rx) = unbounded();
+        let (vad_entered_tx, vad_entered_rx) = unbounded();
+        let (vad_unblock_tx, vad_unblock_rx) = unbounded();
+        let (vad_exited_tx, vad_exited_rx) = unbounded();
+        let controller =
+            CaptureController::with_start_capture(Arc::new(move |_request, cancellation| {
+                if worker_calls.fetch_add(1, Ordering::AcqRel) != 0 {
+                    return Ok(RecordingSession::simulated(
+                        None,
+                        CaptureStopReason::Explicit,
+                    ));
+                }
+
+                let mut stream = Some(FakeStream(Arc::clone(&worker_stream_dropped)));
+                cancellation.commit_play().unwrap();
+                assert!(cancellation.observe_first_sample());
+                played_tx.send(()).unwrap();
+
+                let (result_tx, result_rx) = bounded(1);
+                let vad_unblock_rx = vad_unblock_rx.clone();
+                let vad_entered_tx = vad_entered_tx.clone();
+                let vad_exited_tx = vad_exited_tx.clone();
+                let worker_vad_unblocked = Arc::clone(&worker_vad_unblocked);
+                thread::spawn(move || {
+                    vad_entered_tx.send(()).unwrap();
+                    vad_unblock_rx.recv().unwrap();
+                    worker_vad_unblocked.store(true, Ordering::Release);
+                    let _ = result_tx.send(Ok(()));
+                    vad_exited_tx.send(()).unwrap();
+                });
+
+                let result = super::super::await_capture_setup(&result_rx, &cancellation, || {
+                    drop(stream.take());
+                });
+                if result.is_ok() {
+                    worker_downstream.store(true, Ordering::Release);
+                }
+                result?;
+                unreachable!("the parked setup cannot complete before explicit unblocking")
+            }))
+            .unwrap();
+        let handle = controller.handle();
+        let first = handle
+            .start_capture(
+                AudioOwnerKind::Capture,
+                Instant::now(),
+                30,
+                None,
+                CaptureOptions::default(),
+            )
+            .unwrap();
+        played_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        vad_entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let aborted_at = Instant::now();
+        handle.abort(first.capture_id).unwrap();
+        handle.release(first.capture_id.0).unwrap();
+        while !stream_dropped.load(Ordering::Acquire)
+            && aborted_at.elapsed() < ABORT_STREAM_DROP_BUDGET
+        {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(stream_dropped.load(Ordering::Acquire));
+        assert!(aborted_at.elapsed() < ABORT_STREAM_DROP_BUDGET);
+        assert!(!vad_unblocked.load(Ordering::Acquire));
+        assert!(!downstream_processing.load(Ordering::Acquire));
+
+        let mut discarded = false;
+        for _ in 0..200 {
+            for event in controller.poll_events() {
+                if matches!(
+                    event,
+                    CaptureLifecycleEvent::Failed {
+                        capture_id,
+                        error: CaptureError::Discarded,
+                        ..
+                    } if capture_id == first.capture_id
+                ) {
+                    discarded = true;
+                }
+            }
+            if discarded && handle.owner().is_none() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(discarded);
+        assert!(handle.owner().is_none());
+
+        let second = handle
+            .start_capture(
+                AudioOwnerKind::Capture,
+                Instant::now(),
+                30,
+                None,
+                CaptureOptions::default(),
+            )
+            .unwrap();
+        let second_ready = (0..200).any(|_| {
+            let ready = controller.poll_events().into_iter().any(|event| {
+                matches!(
+                    event,
+                    CaptureLifecycleEvent::Ready { capture_id, .. }
+                        if capture_id == second.capture_id
+                )
+            });
+            if !ready {
+                thread::sleep(Duration::from_millis(1));
+            }
+            ready
+        });
+        assert!(second_ready);
+        handle.abort(second.capture_id).unwrap();
+        handle.release(second.capture_id.0).unwrap();
+
+        vad_unblock_tx.send(()).unwrap();
+        vad_exited_rx.recv_timeout(Duration::from_secs(1)).unwrap();
     }
 
     #[test]

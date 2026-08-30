@@ -61,6 +61,10 @@ enum CaptureTimingLog {
         timing: CaptureTimingMetrics,
         dropped_without_audio: bool,
     },
+    Aborted {
+        capture_id: CaptureId,
+        stream_dropped: Duration,
+    },
 }
 
 static CAPTURE_TIMING_LOGGER: OnceLock<Sender<CaptureTimingLog>> = OnceLock::new();
@@ -222,6 +226,7 @@ pub struct CaptureCancellation {
     stop_requested: Arc<AtomicBool>,
     startup_state: Arc<AtomicU8>,
     startup_abort_requested: Arc<AtomicBool>,
+    discard_requested: Arc<AtomicBool>,
     stop_observed_us: Arc<AtomicU64>,
 }
 
@@ -246,6 +251,17 @@ impl CaptureCancellation {
             Ordering::Acquire,
         );
         self.cancel();
+    }
+
+    pub(crate) fn abort(&self) {
+        self.discard_requested.store(true, Ordering::Release);
+        self.startup_abort_requested.store(true, Ordering::Release);
+        let _ = self.cancel_startup();
+        self.stop_requested.store(true, Ordering::Release);
+    }
+
+    fn is_discard_requested(&self) -> bool {
+        self.discard_requested.load(Ordering::Acquire)
     }
 
     fn stop_observed_elapsed(&self) -> Option<Duration> {
@@ -276,7 +292,11 @@ impl CaptureCancellation {
     }
 
     fn ensure_startup_active(&self) -> Result<(), CaptureError> {
-        if self.is_cancelled() || self.startup_state.load(Ordering::Acquire) == STARTUP_CANCELLED {
+        if self.is_discard_requested() {
+            Err(CaptureError::Discarded)
+        } else if self.is_cancelled()
+            || self.startup_state.load(Ordering::Acquire) == STARTUP_CANCELLED
+        {
             Err(CaptureError::StartupCancelled)
         } else {
             Ok(())
@@ -284,6 +304,9 @@ impl CaptureCancellation {
     }
 
     fn commit_play(&self) -> Result<(), CaptureError> {
+        if self.is_discard_requested() {
+            return Err(CaptureError::Discarded);
+        }
         if self.is_cancelled() {
             return Err(CaptureError::StartupCancelled);
         }
@@ -564,6 +587,9 @@ impl VadPrewarmService {
         startup_cancelled: &AtomicBool,
         discard_requested: Arc<AtomicBool>,
     ) -> Result<WorkerSpeechDetector, CaptureError> {
+        if discard_requested.load(Ordering::Acquire) {
+            return Err(CaptureError::Discarded);
+        }
         if self.shutdown.load(Ordering::Acquire) {
             return Err(CaptureError::SpeechDetection(
                 "the warmed Silero VAD service has shut down".to_owned(),
@@ -578,22 +604,35 @@ impl VadPrewarmService {
         {
             let request_id = warm.next_request_id;
             warm.next_request_id = next_request_id(request_id);
-            if warm
-                .supervisor
-                .start_session(session_id, request_id, threshold)
-                .is_ok()
-            {
-                return Ok(WorkerSpeechDetector {
-                    supervisor: Some(warm.supervisor),
-                    warm_service: Some(Arc::clone(self)),
-                    session_id,
-                    next_request_id: warm.next_request_id,
-                    active: true,
-                    discard_requested,
-                });
+            match warm.supervisor.start_session_with_cancellation(
+                session_id,
+                request_id,
+                threshold,
+                startup_cancelled,
+            ) {
+                Ok(()) => {
+                    return Ok(WorkerSpeechDetector {
+                        supervisor: Some(warm.supervisor),
+                        warm_service: Some(Arc::clone(self)),
+                        session_id,
+                        next_request_id: warm.next_request_id,
+                        active: true,
+                        discard_requested,
+                    });
+                }
+                Err(_) if discard_requested.load(Ordering::Acquire) => {
+                    return Err(CaptureError::Discarded);
+                }
+                Err(_) if startup_cancelled.load(Ordering::Acquire) => {
+                    return Err(CaptureError::StartupCancelled);
+                }
+                Err(_) => {}
             }
         }
 
+        if discard_requested.load(Ordering::Acquire) {
+            return Err(CaptureError::Discarded);
+        }
         let (supervisor, next_request_id) = SileroVadWorkerSupervisor::acquire_session(
             session_id,
             1,
@@ -601,7 +640,15 @@ impl VadPrewarmService {
             threshold,
             startup_cancelled,
         )
-        .map_err(WorkerSpeechDetector::vad_error)?;
+        .map_err(|error| {
+            if discard_requested.load(Ordering::Acquire) {
+                CaptureError::Discarded
+            } else if startup_cancelled.load(Ordering::Acquire) {
+                CaptureError::StartupCancelled
+            } else {
+                WorkerSpeechDetector::vad_error(error)
+            }
+        })?;
         Ok(WorkerSpeechDetector {
             supervisor: Some(supervisor),
             warm_service: Some(Arc::clone(self)),
@@ -1069,7 +1116,7 @@ pub fn start_recording(
     options.vad.validate()?;
     options.detection_mode.validate()?;
     let stop_requested = Arc::clone(&cancellation.stop_requested);
-    let discard_requested = Arc::new(AtomicBool::new(false));
+    let discard_requested = Arc::clone(&cancellation.discard_requested);
     let abort_preview = preview_publisher.clone();
     let abort_action: Arc<dyn Fn() + Send + Sync> = Arc::new(move || abort_preview.close());
     let rms_bits = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
@@ -1143,12 +1190,12 @@ fn await_capture_start(
             Err(error)
         }
         Err(RecvTimeoutError::Timeout) => {
-            cancellation.cancel();
+            cancellation.abort();
             spawn_worker_reaper(worker);
             Err(CaptureError::StartTimeout(timeout))
         }
         Err(RecvTimeoutError::Disconnected) => {
-            cancellation.cancel();
+            cancellation.abort();
             spawn_worker_reaper(worker);
             Err(CaptureError::WorkerDisconnected)
         }
@@ -1222,7 +1269,7 @@ fn capture_worker(
     let stream_build = stream_build_started.elapsed();
     cancellation.commit_play()?;
     let capture_started = Instant::now();
-    let (detector, stream_play_timing) = play_before_capture_setup(
+    let (detector_rx, stream_play_timing) = play_before_capture_setup(
         || {
             stream
                 .as_ref()
@@ -1230,19 +1277,13 @@ fn capture_worker(
                 .play()
                 .map_err(|error| CaptureError::PlayStream(error.to_string()))
         },
-        || match acquire_speech_detector(
-            &options,
-            &WorkerSpeechDetectorFactory {
-                warm_service: vad_service,
-            },
-            &cancellation.startup_abort_requested,
-            Arc::clone(&discard_requested),
-        ) {
-            Ok(detector) => Ok(detector),
-            Err(_) if cancellation.startup_cancelled_before_first_sample() => {
-                Err(CaptureError::StartupCancelled)
-            }
-            Err(error) => Err(error),
+        || {
+            start_speech_detector_acquisition(
+                options,
+                cancellation.clone(),
+                Arc::clone(&discard_requested),
+                vad_service,
+            )
         },
     )?;
     let stream_play = stream_play_timing.duration;
@@ -1252,6 +1293,20 @@ fn capture_worker(
     let stream_play_returned = stream_play_timing
         .returned_at
         .saturating_duration_since(context.observed_at);
+    let detector = match await_capture_setup(&detector_rx, &cancellation, || {
+        drop(stream.take());
+        consumer.clear();
+        preview_publisher.close();
+    }) {
+        Ok(detector) => detector,
+        Err(error) => {
+            if error == CaptureError::Discarded {
+                log_capture_abort(context.capture_id, context.observed_at.elapsed());
+            }
+            preview_publisher.close();
+            return Err(error);
+        }
+    };
     let mut pipeline = Pipeline::new(
         format.sample_rate,
         format.channels,
@@ -1548,6 +1603,23 @@ fn write_capture_timing_log(event: CaptureTimingLog) {
             timing.final_audio_ready.as_micros(),
             timing.finalization.as_micros(),
         ),
+        CaptureTimingLog::Aborted {
+            capture_id,
+            stream_dropped,
+        } => eprintln!(
+            "scribe_capture_timing capture_id={} outcome=discarded stream_dropped_us={}",
+            capture_id.0,
+            stream_dropped.as_micros(),
+        ),
+    }
+}
+
+fn log_capture_abort(capture_id: CaptureId, stream_dropped: Duration) {
+    if let Some(logger) = CAPTURE_TIMING_LOGGER.get() {
+        let _ = logger.try_send(CaptureTimingLog::Aborted {
+            capture_id,
+            stream_dropped,
+        });
     }
 }
 
@@ -1589,6 +1661,75 @@ fn play_before_capture_setup<T>(
         returned_at,
     };
     setup().map(|prepared| (prepared, timing))
+}
+
+type SpeechDetectorResult = Result<Option<Box<dyn SpeechDetector>>, CaptureError>;
+
+fn start_speech_detector_acquisition(
+    options: CaptureOptions,
+    cancellation: CaptureCancellation,
+    discard_requested: Arc<AtomicBool>,
+    vad_service: Arc<VadPrewarmService>,
+) -> Result<Receiver<SpeechDetectorResult>, CaptureError> {
+    let (result_tx, result_rx) = bounded(1);
+    thread::Builder::new()
+        .name("scribe-vad-acquire".to_owned())
+        .spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                acquire_speech_detector(
+                    &options,
+                    &WorkerSpeechDetectorFactory {
+                        warm_service: vad_service,
+                    },
+                    &cancellation.startup_abort_requested,
+                    discard_requested,
+                )
+            }))
+            .unwrap_or_else(|_| {
+                Err(CaptureError::WorkerPanic(
+                    "VAD acquisition worker panicked".to_owned(),
+                ))
+            });
+            let _ = result_tx.send(result);
+        })
+        .map_err(|error| CaptureError::WorkerSpawn(error.to_string()))?;
+    Ok(result_rx)
+}
+
+fn await_capture_setup<T>(
+    result_rx: &Receiver<Result<T, CaptureError>>,
+    cancellation: &CaptureCancellation,
+    cleanup: impl FnOnce(),
+) -> Result<T, CaptureError> {
+    let mut cleanup = Some(cleanup);
+    loop {
+        if cancellation.is_discard_requested() {
+            cleanup.take().expect("capture cleanup runs once")();
+            return Err(CaptureError::Discarded);
+        }
+        if cancellation.startup_cancelled_before_first_sample() {
+            cleanup.take().expect("capture cleanup runs once")();
+            return Err(CaptureError::StartupCancelled);
+        }
+        match result_rx.recv_timeout(Duration::from_millis(2)) {
+            Ok(result) => {
+                if cancellation.is_discard_requested() {
+                    drop(result);
+                    cleanup.take().expect("capture cleanup runs once")();
+                    return Err(CaptureError::Discarded);
+                }
+                return result;
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                if cancellation.is_discard_requested() {
+                    cleanup.take().expect("capture cleanup runs once")();
+                    return Err(CaptureError::Discarded);
+                }
+                return Err(CaptureError::WorkerDisconnected);
+            }
+        }
+    }
 }
 
 fn decode_elapsed_us(encoded_us: u64) -> Option<Duration> {
@@ -2157,6 +2298,66 @@ mod tests {
     }
 
     #[test]
+    fn abort_is_typed_discard_while_stop_remains_startup_cancellation() {
+        let aborted = CaptureCancellation::new();
+        aborted.abort();
+        assert_eq!(
+            aborted.ensure_startup_active(),
+            Err(CaptureError::Discarded)
+        );
+        assert!(aborted.is_discard_requested());
+
+        let stopped = CaptureCancellation::new();
+        stopped.cancel();
+        assert_eq!(
+            stopped.ensure_startup_active(),
+            Err(CaptureError::StartupCancelled)
+        );
+        assert!(!stopped.is_discard_requested());
+    }
+
+    #[test]
+    fn stop_after_first_sample_does_not_discard_parked_setup() {
+        let cancellation = CaptureCancellation::new();
+        cancellation.commit_play().unwrap();
+        assert!(cancellation.observe_first_sample());
+        cancellation.cancel();
+        let cleaned = Arc::new(AtomicBool::new(false));
+        let cleanup_probe = Arc::clone(&cleaned);
+        let (result_tx, result_rx) = bounded(1);
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(10));
+            result_tx.send(Ok(7_u8)).unwrap();
+        });
+
+        assert_eq!(
+            await_capture_setup(&result_rx, &cancellation, move || {
+                cleanup_probe.store(true, Ordering::Release);
+            }),
+            Ok(7)
+        );
+        assert!(!cleaned.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn stop_before_first_sample_drops_parked_setup_without_waiting() {
+        let cancellation = CaptureCancellation::new();
+        cancellation.commit_play().unwrap();
+        cancellation.cancel();
+        let cleaned = Arc::new(AtomicBool::new(false));
+        let cleanup_probe = Arc::clone(&cleaned);
+        let (_result_tx, result_rx) = bounded::<Result<(), CaptureError>>(1);
+
+        assert_eq!(
+            await_capture_setup(&result_rx, &cancellation, move || {
+                cleanup_probe.store(true, Ordering::Release);
+            }),
+            Err(CaptureError::StartupCancelled)
+        );
+        assert!(cleaned.load(Ordering::Acquire));
+    }
+
+    #[test]
     fn vad_prewarm_shutdown_cancels_and_joins_the_worker() {
         let (entered_tx, entered_rx) = bounded(1);
         let (exited_tx, exited_rx) = bounded(1);
@@ -2319,6 +2520,7 @@ mod tests {
                 stop_requested: Arc::new(AtomicBool::new(false)),
                 startup_state: Arc::new(AtomicU8::new(STARTUP_FIRST_SAMPLE)),
                 startup_abort_requested: Arc::new(AtomicBool::new(false)),
+                discard_requested: Arc::new(AtomicBool::new(false)),
                 stop_observed_us: Arc::new(AtomicU64::new(0)),
             },
             timing_origin: Instant::now(),
