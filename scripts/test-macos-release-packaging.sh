@@ -9,9 +9,22 @@ for manifest in "$repo_root"/runtime-manifests/gpu-{worker-toolchain,auto-qualif
 jq -e '. == {schema_version:1,mode:"default_deny",target_os:"macos",target_arch:"aarch64",entries:[]}' "$repo_root/runtime-manifests/gpu-auto-qualification-macos-aarch64.json" >/dev/null
 jq -e '. == {schema_version:1,mode:"default_deny",target_os:"macos",target_arch:"x86_64",entries:[]}' "$repo_root/runtime-manifests/gpu-auto-qualification-macos-x86_64.json" >/dev/null
 if rg -n -- '--deep|Ed25519KeyPair|FIXTURE_SEED|SCRIBE_PACK_SIGNING_PRIVATE_KEY=' "$repo_root/scripts"/{build-macos-metal-worker-pack.sh,build-macos-release.sh,sign-notarize-macos-release.sh}; then echo 'macOS release scripts violate the signing-secret contract.' >&2; exit 1; fi
-rg -F 'xcrun notarytool submit "$archive"' "$repo_root/scripts/sign-notarize-macos-release.sh" >/dev/null || { echo 'notarization must submit a ZIP archive, not an app directory.' >&2; exit 1; }
+rg -F 'xcrun notarytool submit "$submission_archive"' "$repo_root/scripts/sign-notarize-macos-release.sh" >/dev/null || { echo 'notarization must submit a private ZIP archive, not an app directory.' >&2; exit 1; }
+rg -F 'mv "$final_archive" "$requested_archive"' "$repo_root/scripts/sign-notarize-macos-release.sh" >/dev/null || { echo 'notarization must publish the requested ZIP only after stapling and verification.' >&2; exit 1; }
 rg -F 'desktop does not embed the final signed CPU worker anchor' "$repo_root/scripts/build-macos-release.sh" >/dev/null || { echo 'release builder must bind the desktop anchor to the signed CPU worker.' >&2; exit 1; }
 rg -F 'lipo -verify_arch "$pack_lipo_arch" "$worker"' "$repo_root/scripts/verify-macos-release-package.sh" >/dev/null || { echo 'catalog Metal workers must have their declared single Mach-O slice verified.' >&2; exit 1; }
+if [[ "$(uname -s)" == Darwin ]]; then
+  lipo_temp="$(mktemp -d "${TMPDIR:-/tmp}/scribe-macos-lipo-test.XXXXXX")"; trap 'rm -rf "$lipo_temp"' EXIT
+  printf 'int main(void) { return 0; }\n' >"$lipo_temp/thin.c"
+  xcrun --sdk macosx clang -arch arm64 "$lipo_temp/thin.c" -o "$lipo_temp/arm64"
+  xcrun --sdk macosx clang -arch x86_64 "$lipo_temp/thin.c" -o "$lipo_temp/x86_64"
+  assert_single_arch() { lipo -verify_arch "$1" "$2" && [[ "$(lipo -archs "$2")" == "$1" ]]; }
+  assert_single_arch arm64 "$lipo_temp/arm64" || { echo 'matching thin Mach-O slice was rejected.' >&2; exit 1; }
+  if assert_single_arch x86_64 "$lipo_temp/arm64"; then echo 'wrong Mach-O slice was accepted.' >&2; exit 1; fi
+  lipo -create "$lipo_temp/arm64" "$lipo_temp/x86_64" -output "$lipo_temp/universal"
+  if assert_single_arch arm64 "$lipo_temp/universal"; then echo 'universal Mach-O was accepted for a single-architecture pack.' >&2; exit 1; fi
+  rm -rf "$lipo_temp"; trap - EXIT
+fi
 if [[ -n "${SCRIBE_MACOS_TEST_BUNDLE:-}" ]]; then
   [[ "$(uname -s)" == Darwin ]] || { echo 'bundle mutation tests require macOS.' >&2; exit 1; }
   base="$SCRIBE_MACOS_TEST_BUNDLE"
