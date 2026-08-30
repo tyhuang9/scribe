@@ -17,6 +17,12 @@ The remaining items below are release evidence or follow-up improvements.
   measurements on the same machine, fixture, model, and resolved backend.
 - Run conservative build checks on macOS and Linux. Their desktop/model
   combinations remain unqualified.
+- Produce reviewed Windows CUDA/Vulkan Auto evidence for each supported
+  pack/model/device/driver lane: at least five cold and twenty warm runs,
+  transcript parity, reliability, and p95 no more than 110% of CPU.
+- Exercise mixed-GPU AC/battery, driver update, suspend/resume, device loss,
+  insufficient VRAM, and clean-installer lanes before adding any production
+  Auto qualification entry.
 
 ## MVP Hardening
 
