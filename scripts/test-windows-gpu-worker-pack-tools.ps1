@@ -66,9 +66,11 @@ if ($env:OS -ne 'Windows_NT') {
 $repositoryRoot = [System.IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $buildScript = Join-Path $PSScriptRoot 'build-windows-gpu-worker-pack.ps1'
 $prepareScript = Join-Path $PSScriptRoot 'prepare-windows-gpu-worker-packs.ps1'
+$cudaInventoryScript = Join-Path $PSScriptRoot 'windows-cuda-sdk-inventory.ps1'
 foreach ($script in @(
     $buildScript,
     $prepareScript,
+    $cudaInventoryScript,
     (Join-Path $PSScriptRoot 'report-windows-worker-pack-sizes.ps1')
 )) {
     $parseErrors = $null
@@ -79,6 +81,7 @@ foreach ($script in @(
     ) | Out-Null
     Assert-True ($parseErrors.Count -eq 0) "GPU worker-pack script has PowerShell parse errors: $script"
 }
+. $cudaInventoryScript
 $prepareSource = Get-Content -LiteralPath $prepareScript -Raw
 Assert-True `
     (-not $prepareSource.Contains('-CargoTargetDirectory')) `
@@ -239,6 +242,23 @@ Assert-True (-not (Test-Path -LiteralPath $toolchainOutput)) 'Rejected native bu
 
 $previousCudaPath = $env:CUDA_PATH
 try {
+    $productionCudaFailedClosed = $false
+    try {
+        & $buildScript `
+            -Backend Cuda `
+            -PackVersion '0.1.0-production-contract' `
+            -OutputDirectory $toolchainOutput `
+            -SigningMode Production `
+            -ToolchainCheckOnly | Out-Null
+    }
+    catch {
+        $productionCudaFailedClosed = $_.Exception.Message.Contains(
+            'Production CUDA inputs are unprovisioned'
+        )
+    }
+    Assert-True $productionCudaFailedClosed 'Production CUDA accepted unauthenticated same-version toolkit inputs.'
+    Assert-True (-not (Test-Path -LiteralPath $toolchainOutput)) 'Rejected unauthenticated CUDA contract created a pack output.'
+
     $env:CUDA_PATH = Join-Path ([System.IO.Path]::GetTempPath()) 'scribe-absent-cuda-v12.8'
     $cudaFailedClosed = $false
     try {
@@ -256,6 +276,155 @@ try {
 }
 finally {
     $env:CUDA_PATH = $previousCudaPath
+}
+
+$cudaInventoryTestRoot = Join-Path `
+    ([System.IO.Path]::GetTempPath()) `
+    "scribe-cuda-inventory-$([guid]::NewGuid().ToString('N'))"
+$cudaSdkRoot = Join-Path $cudaInventoryTestRoot 'v12.8'
+$cudaJunction = Join-Path $cudaSdkRoot 'junction'
+New-Item -ItemType Directory -Path $cudaSdkRoot | Out-Null
+try {
+    $cudaInventoryPaths = @(
+        'bin/nvcc.exe',
+        'include/cuda.h',
+        'lib/x64/cuda.lib',
+        'bin/cublas64_12.dll',
+        'bin/cublaslt64_12.dll',
+        'bin/cudart64_12.dll',
+        'docs/license.txt'
+    )
+    foreach ($relative in $cudaInventoryPaths) {
+        $path = Join-Path $cudaSdkRoot $relative.Replace('/', '\')
+        $null = New-Item -ItemType Directory -Path (Split-Path -Parent $path) -Force
+        [System.IO.File]::WriteAllText(
+            $path,
+            "authenticated CUDA fixture: $relative",
+            [System.Text.UTF8Encoding]::new($false)
+        )
+    }
+    $cudaInventory = @($cudaInventoryPaths | ForEach-Object {
+        $path = Join-Path $cudaSdkRoot $_.Replace('/', '\')
+        [pscustomobject]@{
+            path = $_
+            sha256 = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+        }
+    })
+    $requiredCudaInventoryPaths = $cudaInventoryPaths[0..5]
+
+    Assert-AuthenticatedCudaSdkInventory `
+        $cudaSdkRoot `
+        $cudaInventory `
+        $requiredCudaInventoryPaths
+
+    $wrongHashInventory = @($cudaInventory | ForEach-Object {
+        [pscustomobject]@{
+            path = $_.path
+            sha256 = if ($_.path -ceq 'include/cuda.h') { '0' * 64 } else { $_.sha256 }
+        }
+    })
+    $wrongCudaHashRejected = $false
+    try {
+        Assert-AuthenticatedCudaSdkInventory `
+            $cudaSdkRoot `
+            $wrongHashInventory `
+            $requiredCudaInventoryPaths
+    }
+    catch {
+        $wrongCudaHashRejected = $_.Exception.Message.Contains('SHA-256 mismatch')
+    }
+    Assert-True $wrongCudaHashRejected 'Production CUDA inventory accepted an altered file hash.'
+
+    $missingCudaFile = Join-Path $cudaSdkRoot 'docs\license.txt'
+    Remove-Item -LiteralPath $missingCudaFile -Force
+    $missingCudaFileRejected = $false
+    try {
+        Assert-AuthenticatedCudaSdkInventory `
+            $cudaSdkRoot `
+            $cudaInventory `
+            $requiredCudaInventoryPaths
+    }
+    catch {
+        $missingCudaFileRejected = $_.Exception.Message.Contains(
+            'omitted authenticated inventory entries'
+        )
+    }
+    Assert-True $missingCudaFileRejected 'Production CUDA inventory accepted a missing file.'
+    [System.IO.File]::WriteAllText(
+        $missingCudaFile,
+        'authenticated CUDA fixture: docs/license.txt',
+        [System.Text.UTF8Encoding]::new($false)
+    )
+
+    $unexpectedCudaFile = Join-Path $cudaSdkRoot 'bin\unexpected.dll'
+    [System.IO.File]::WriteAllBytes($unexpectedCudaFile, [byte[]](1, 2, 3))
+    $unexpectedCudaFileRejected = $false
+    try {
+        Assert-AuthenticatedCudaSdkInventory `
+            $cudaSdkRoot `
+            $cudaInventory `
+            $requiredCudaInventoryPaths
+    }
+    catch {
+        $unexpectedCudaFileRejected = $_.Exception.Message.Contains(
+            'unexpected, duplicate, or case-colliding file'
+        )
+    }
+    Assert-True $unexpectedCudaFileRejected 'Production CUDA inventory accepted an unexpected file.'
+    Remove-Item -LiteralPath $unexpectedCudaFile -Force
+
+    $cudaJunctionTarget = Join-Path $cudaInventoryTestRoot 'junction-target'
+    New-Item -ItemType Directory -Path $cudaJunctionTarget | Out-Null
+    New-Item -ItemType Junction -Path $cudaJunction -Target $cudaJunctionTarget | Out-Null
+    $cudaJunctionRejected = $false
+    try {
+        Assert-AuthenticatedCudaSdkInventory `
+            $cudaSdkRoot `
+            $cudaInventory `
+            $requiredCudaInventoryPaths
+    }
+    catch {
+        $cudaJunctionRejected = $_.Exception.Message.Contains('link or reparse point')
+    }
+    Assert-True $cudaJunctionRejected 'Production CUDA inventory accepted a reparse entry.'
+    Remove-Item -LiteralPath $cudaJunction -Force
+
+    $cudaAdsFile = Join-Path $cudaSdkRoot 'include\cuda.h'
+    [System.IO.File]::WriteAllText(
+        "${cudaAdsFile}:scribe-test",
+        'untrusted alternate stream',
+        [System.Text.UTF8Encoding]::new($false)
+    )
+    $cudaAdsRejected = $false
+    try {
+        Assert-AuthenticatedCudaSdkInventory `
+            $cudaSdkRoot `
+            $cudaInventory `
+            $requiredCudaInventoryPaths
+    }
+    catch {
+        $cudaAdsRejected = $_.Exception.Message.Contains('alternate data stream')
+    }
+    Assert-True $cudaAdsRejected 'Production CUDA inventory accepted an alternate data stream.'
+}
+finally {
+    if (Test-Path -LiteralPath $cudaJunction) {
+        $junctionItem = Get-Item -LiteralPath $cudaJunction -Force
+        if (($junctionItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            Remove-Item -LiteralPath $cudaJunction -Force
+        }
+    }
+    $canonicalCudaTestRoot = [System.IO.Path]::GetFullPath($cudaInventoryTestRoot)
+    $expectedCudaTempPrefix = [System.IO.Path]::GetFullPath(
+        (Join-Path ([System.IO.Path]::GetTempPath()) 'scribe-cuda-inventory-')
+    )
+    if (-not $canonicalCudaTestRoot.StartsWith(
+        $expectedCudaTempPrefix,
+        [System.StringComparison]::OrdinalIgnoreCase
+    )) {
+        throw 'Refusing to clean a CUDA inventory test directory outside the dedicated temp prefix.'
+    }
+    Remove-Item -LiteralPath $canonicalCudaTestRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 if (-not $CargoTargetDirectory) {

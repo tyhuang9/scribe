@@ -19,6 +19,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+. (Join-Path $PSScriptRoot 'windows-cuda-sdk-inventory.ps1')
 
 if (-not $ToolchainCheckOnly -and
     $SigningMode -eq 'Production' -and
@@ -999,7 +1000,16 @@ function Resolve-VulkanSdk($Contract) {
     return $root
 }
 
-function Resolve-CudaSdk($Contract) {
+function Resolve-CudaSdk($Contract, [string]$BuildSigningMode) {
+    $requiredAuthenticatedPaths = @(
+        @($Contract.cuda.required_files) +
+        @($Contract.cuda.packaged_runtime_imports | ForEach-Object { "bin/$_" })
+    )
+    if ($BuildSigningMode -ceq 'Production') {
+        $null = ConvertTo-AuthenticatedCudaInventory `
+            @($Contract.cuda.production_inventory) `
+            $requiredAuthenticatedPaths
+    }
     $expectedDirectoryVersion = [string]$Contract.cuda.sdk_directory_version
     $candidate = if (-not [string]::IsNullOrWhiteSpace($env:CUDA_PATH)) {
         $env:CUDA_PATH
@@ -1011,9 +1021,16 @@ function Resolve-CudaSdk($Contract) {
         -not (Test-Path -LiteralPath $root -PathType Container)) {
         throw "Pinned CUDA Toolkit $expectedDirectoryVersion is missing. Install that exact toolkit or set CUDA_PATH to its exact installation root."
     }
+    Assert-NoReparseAncestors $root
     foreach ($required in @($Contract.cuda.required_files)) {
         $path = Join-Path $root (([string]$required).Replace('/', '\'))
         $null = Assert-RegularNonReparseFile $path "Pinned CUDA Toolkit file $required"
+    }
+    if ($BuildSigningMode -ceq 'Production') {
+        Assert-AuthenticatedCudaSdkInventory `
+            $root `
+            @($Contract.cuda.production_inventory) `
+            $requiredAuthenticatedPaths
     }
     $nvcc = Join-Path $root 'bin\nvcc.exe'
     $nvccVersion = (Invoke-NativeProcess $nvcc @('--version') 'Could not inspect the pinned CUDA compiler.').Stdout
@@ -1116,7 +1133,7 @@ foreach ($payloadProfile in $payloadProfiles) {
 }
 Assert-ExactProperties $contract.build @('profile', 'static_cpu_scheduling', 'dynamic_backends', 'openmp') 'Worker build contract'
 Assert-ExactProperties $contract.vulkan @('sdk_version', 'provider', 'required_files', 'system_driver_imports', 'packaged_runtime_imports') 'Vulkan provider contract'
-Assert-ExactProperties $contract.cuda @('sdk_directory_version', 'nvcc_version', 'provider', 'cmake_architectures', 'required_files', 'system_driver_imports', 'packaged_runtime_imports') 'CUDA provider contract'
+Assert-ExactProperties $contract.cuda @('sdk_directory_version', 'nvcc_version', 'provider', 'cmake_architectures', 'required_files', 'production_inventory', 'system_driver_imports', 'packaged_runtime_imports') 'CUDA provider contract'
 if ($contract.schema_version -ne 1 -or
     $contract.app_version -cnotmatch '^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$' -or
     $contract.target_triple -cne 'x86_64-pc-windows-msvc' -or
@@ -1154,7 +1171,7 @@ $providerContract = if ($Backend -eq 'Vulkan') { $contract.vulkan } else { $cont
 $sdkRoot = if ($Backend -eq 'Vulkan') {
     Resolve-VulkanSdk $contract
 } else {
-    Resolve-CudaSdk $contract
+    Resolve-CudaSdk $contract $SigningMode
 }
 if ($ToolchainCheckOnly) {
     $toolchainEnvironmentState = $null
