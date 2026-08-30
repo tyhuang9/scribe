@@ -744,12 +744,12 @@ impl BundleDiskReservation {
         Ok(())
     }
 
-    fn release(&mut self) -> Result<(), InstallError> {
+    fn release_with_ledger_wait(&mut self, wait: bool) -> Result<(), InstallError> {
         if self.entry_lock.is_none() {
             return Ok(());
         }
         let ledger_path = self.reservation_root.join("ledger.lock");
-        let _ledger = OsFileLock::acquire(&ledger_path, false)?;
+        let _ledger = OsFileLock::acquire(&ledger_path, wait)?;
         self.entry_file.take();
         match fs::remove_file(&self.entry_path) {
             Ok(()) => {}
@@ -777,7 +777,7 @@ impl Drop for BundleDiskReservation {
     fn drop(&mut self) {
         // When the ledger is contended, releasing the held entry lock makes
         // this entry stale so the next ledger owner can prune it safely.
-        let _ = self.release();
+        let _ = self.release_with_ledger_wait(false);
     }
 }
 
@@ -1514,7 +1514,7 @@ pub(crate) fn stage_onnx_bundle_install(
     // Every future allocation covered by the ledger now exists on disk. Free
     // space reflects those bytes directly, so retaining the reservation while
     // this bundle waits for serialized verification would double-count it.
-    disk_reservation.release()?;
+    disk_reservation.release_with_ledger_wait(true)?;
     Ok(StagedOnnxBundle {
         staged,
         receipt,
