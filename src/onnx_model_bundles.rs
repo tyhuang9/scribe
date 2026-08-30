@@ -39,6 +39,7 @@ const CATALOG_SCHEMA_VERSION: u16 = 1;
 const RECEIPT_SCHEMA_VERSION: u16 = 1;
 const RECEIPT_FILE_NAME: &str = "install-receipt.json";
 const NOTICE_FILE_NAME: &str = "NOTICE.txt";
+pub(crate) const OWNERSHIP_WITNESS_SOURCE: &str = "verified-onnx-bundle-receipt";
 const LOCK_DIRECTORY_NAME: &str = ".onnx-bundle-locks";
 const RESERVATION_CONTROL_DIRECTORY_NAME: &str = "onnx-bundle-volume-reservations";
 const APACHE_2_LICENSE_BYTES: &[u8] = include_bytes!(concat!(

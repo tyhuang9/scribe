@@ -925,6 +925,30 @@ mod tests {
         );
         assert_ne!(artifact_config_fingerprint(&changed).unwrap(), expected);
 
+        let mut onnx_owned = restarted.clone();
+        let onnx_id = "moonshine-tiny-en-int8-onnx";
+        let onnx_root = crate::config::onnx_bundle_target_root(
+            &onnx_owned,
+            &crate::transcription::ModelId::new(onnx_id),
+        )
+        .expect("catalog ONNX target");
+        let mut witness = crate::config::ManagedModelInstall::app_managed(
+            onnx_root,
+            crate::onnx_model_bundles::OWNERSHIP_WITNESS_SOURCE,
+        );
+        witness.sha256 = Some("d".repeat(64));
+        onnx_owned
+            .general
+            .managed_models
+            .insert(onnx_id.to_owned(), witness);
+        assert_ne!(
+            artifact_config_fingerprint(&onnx_owned).unwrap(),
+            expected,
+            "an ONNX ownership receipt must distinguish installed from removed durable state"
+        );
+        onnx_owned.general.managed_models.remove(onnx_id);
+        assert_eq!(artifact_config_fingerprint(&onnx_owned).unwrap(), expected);
+
         let mut remote_changed = restarted.clone();
         let remote_storage = dir.join("remote-model-storage");
         remote_changed.general.model_storage_dir = remote_storage.clone();
