@@ -21,8 +21,8 @@ use crate::transcription::ModelId;
 pub mod settings;
 
 pub use settings::{
-    AppConfig, CURRENT_SCHEMA_VERSION, HistoryMode, OverlayMode, OverlayPosition, SettingsStore,
-    SpeechDetectionMode, StreamingMode,
+    AppConfig, CURRENT_SCHEMA_VERSION, HistoryMode, OverlayMode, OverlayPosition,
+    PendingOnnxRemoval, SettingsStore, SpeechDetectionMode, StreamingMode,
 };
 #[cfg(test)]
 pub use settings::{GeneralSettings, RecordingSettings};
@@ -691,6 +691,7 @@ pub fn normalize_config(config: &mut AppConfig) {
     if config.general.model_storage_dir.as_os_str().is_empty() {
         config.general.model_storage_dir = default_model_storage_dir();
     }
+    normalize_pending_onnx_removals(config);
     apply_managed_model_metadata(config);
     normalize_managed_remote_models(config);
     normalize_imported_gguf_models(config);
@@ -773,6 +774,29 @@ pub fn normalize_config(config: &mut AppConfig) {
     if config.output.paste_delay_ms == 0 {
         config.output.paste_delay_ms = default_paste_delay_ms();
     }
+}
+
+fn normalize_pending_onnx_removals(config: &mut AppConfig) {
+    let storage_root = onnx_bundle_storage_dir(config);
+    config
+        .general
+        .pending_onnx_removals
+        .retain(|model_id, pending| {
+            let safe_id = !model_id.is_empty()
+                && model_id.len() <= 128
+                && model_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+                && !model_id.starts_with('-')
+                && !model_id.ends_with('-');
+            let valid_digest = |value: &str| {
+                value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+            };
+            safe_id
+                && pending.target == storage_root.join(model_id)
+                && valid_digest(&pending.receipt_sha256)
+                && valid_digest(&pending.transaction_nonce)
+        });
 }
 
 fn default_paste_delay_ms() -> u64 {

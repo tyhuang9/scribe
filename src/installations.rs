@@ -1134,6 +1134,8 @@ struct RemovalJournalDocument {
     expected_config_fingerprint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     ownership_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    transaction_nonce: Option<String>,
 }
 
 impl ManagedRemoval {
@@ -1204,6 +1206,7 @@ impl ManagedRemoval {
             prior_config_fingerprint,
             expected_config_fingerprint: None,
             ownership_sha256: None,
+            transaction_nonce: None,
         };
         persist_removal_journal(&journal_path, &journal)?;
         durable_rename(target, &tombstone).map_err(|error| {
@@ -1252,7 +1255,7 @@ impl ManagedRemoval {
         capability: StableManagedDirectory,
         prior_config_fingerprint: String,
     ) -> Result<Self, InstallError> {
-        Self::stage_stable_directory_inner(capability, prior_config_fingerprint, None, None)
+        Self::stage_stable_directory_inner(capability, prior_config_fingerprint, None, None, None)
     }
 
     pub(crate) fn stage_stable_directory_with_ownership(
@@ -1260,14 +1263,17 @@ impl ManagedRemoval {
         prior_config_fingerprint: String,
         expected_config_fingerprint: String,
         ownership_sha256: String,
+        transaction_nonce: String,
     ) -> Result<Self, InstallError> {
         validate_sha256(&ownership_sha256)?;
         validate_sha256(&expected_config_fingerprint)?;
+        validate_sha256(&transaction_nonce)?;
         Self::stage_stable_directory_inner(
             capability,
             prior_config_fingerprint,
             Some(expected_config_fingerprint),
             Some(ownership_sha256),
+            Some(transaction_nonce),
         )
     }
 
@@ -1276,6 +1282,7 @@ impl ManagedRemoval {
         prior_config_fingerprint: String,
         expected_config_fingerprint: Option<String>,
         ownership_sha256: Option<String>,
+        transaction_nonce: Option<String>,
     ) -> Result<Self, InstallError> {
         validate_sha256(&prior_config_fingerprint)?;
         let target = capability.path().to_path_buf();
@@ -1292,11 +1299,12 @@ impl ManagedRemoval {
             // Ownership-bearing stable removals use a distinct schema so an
             // older build cannot ignore the witness and reconcile the
             // journal through its weaker generic path after a downgrade.
-            schema_version: if ownership_sha256.is_some() { 2 } else { 1 },
+            schema_version: if ownership_sha256.is_some() { 3 } else { 1 },
             target: target.clone(),
             prior_config_fingerprint,
             expected_config_fingerprint,
             ownership_sha256,
+            transaction_nonce,
         };
         let journal_bytes = removal_journal_bytes(&journal)?;
         let stable_journal = StableManagedFile::create_new(&journal_path, &journal_bytes)?;
@@ -1588,6 +1596,9 @@ pub(crate) fn reconcile_stable_directory_removal(
     durable_config_fingerprint: &str,
     mut capability: Option<StableManagedDirectory>,
     observed_ownership_sha256: Option<&str>,
+    durable_installed_ownership_sha256: Option<&str>,
+    durable_pending_ownership_sha256: Option<&str>,
+    durable_pending_transaction_nonce: Option<&str>,
     require_ownership_sha256: bool,
 ) -> Result<bool, InstallError> {
     validate_sha256(durable_config_fingerprint)?;
@@ -1617,7 +1628,7 @@ pub(crate) fn reconcile_stable_directory_removal(
             journal_path.display()
         ))
     })?;
-    let expected_schema_version = if require_ownership_sha256 { 2 } else { 1 };
+    let expected_schema_version = if require_ownership_sha256 { 3 } else { 1 };
     if journal.schema_version != expected_schema_version
         || canonicalize_missing(&journal.target)? != canonicalize_missing(target)?
     {
@@ -1634,9 +1645,18 @@ pub(crate) fn reconcile_stable_directory_removal(
     if let Some(ownership_sha256) = journal.ownership_sha256.as_deref() {
         validate_sha256(ownership_sha256)?;
     }
+    if let Some(transaction_nonce) = journal.transaction_nonce.as_deref() {
+        validate_sha256(transaction_nonce)?;
+    }
     if require_ownership_sha256 && journal.ownership_sha256.is_none() {
         return Err(InstallError::RecoveryRequired(format!(
             "stable removal journal {} has no exact artifact ownership witness",
+            journal_path.display()
+        )));
+    }
+    if require_ownership_sha256 && journal.transaction_nonce.is_none() {
+        return Err(InstallError::RecoveryRequired(format!(
+            "stable removal journal {} has no transaction nonce",
             journal_path.display()
         )));
     }
@@ -1670,6 +1690,35 @@ pub(crate) fn reconcile_stable_directory_removal(
             "durable artifact settings match neither side of stable removal transaction {}; refusing to mutate artifacts",
             target.display()
         )));
+    }
+    if require_ownership_sha256 {
+        let journal_ownership = journal
+            .ownership_sha256
+            .as_deref()
+            .expect("required ownership was checked");
+        if durable_is_prior {
+            if !durable_installed_ownership_sha256
+                .is_some_and(|value| value.eq_ignore_ascii_case(journal_ownership))
+            {
+                return Err(InstallError::RecoveryRequired(format!(
+                    "durable settings do not authorize rollback of ONNX removal {}",
+                    target.display()
+                )));
+            }
+        } else if !durable_pending_ownership_sha256
+            .is_some_and(|value| value.eq_ignore_ascii_case(journal_ownership))
+            || !durable_pending_transaction_nonce.is_some_and(|value| {
+                journal
+                    .transaction_nonce
+                    .as_deref()
+                    .is_some_and(|nonce| nonce.eq_ignore_ascii_case(value))
+            })
+        {
+            return Err(InstallError::RecoveryRequired(format!(
+                "durable settings do not authorize committed ONNX removal {}",
+                target.display()
+            )));
+        }
     }
     if target_exists && tombstone_exists {
         return Err(InstallError::RecoveryRequired(format!(
@@ -1844,8 +1893,9 @@ pub(crate) fn discover_managed_removal_targets(
                             path.display()
                         ))
                     })?;
-                if !matches!(journal.schema_version, 1 | 2)
-                    || (journal.schema_version == 2 && journal.ownership_sha256.is_none())
+                if !matches!(journal.schema_version, 1 | 2 | 3)
+                    || (journal.schema_version >= 2 && journal.ownership_sha256.is_none())
+                    || (journal.schema_version == 3 && journal.transaction_nonce.is_none())
                 {
                     return Err(InstallError::RecoveryRequired(format!(
                         "unsupported managed removal journal schema at {}",
@@ -7711,12 +7761,14 @@ mod tests {
             let prior = format!("{:x}", Sha256::digest(b"prior-config"));
             let expected = format!("{:x}", Sha256::digest(b"expected-config"));
             let ownership = format!("{:x}", Sha256::digest(b"receipt-ownership"));
+            let nonce = format!("{:x}", Sha256::digest(b"removal-transaction"));
             let capability = StableManagedDirectory::open_exact(&target, &target).unwrap();
             let mut removal = ManagedRemoval::stage_stable_directory_with_ownership(
                 capability,
                 prior,
                 expected.clone(),
                 ownership,
+                nonce,
             )
             .unwrap();
             let journal = removal_journal_path(&target).unwrap();
@@ -8042,12 +8094,14 @@ mod tests {
         let prior = format!("{:x}", Sha256::digest(b"prior-config"));
         let expected = format!("{:x}", Sha256::digest(b"expected-config"));
         let ownership = format!("{:x}", Sha256::digest(b"receipt-ownership"));
+        let nonce = format!("{:x}", Sha256::digest(b"removal-transaction"));
         let capability = StableManagedDirectory::open_exact(&target, &target).unwrap();
         let mut interrupted = ManagedRemoval::stage_stable_directory_with_ownership(
             capability,
             prior,
             expected.clone(),
             ownership.clone(),
+            nonce.clone(),
         )
         .unwrap();
         interrupted.prepare_config_commit(expected.clone()).unwrap();
@@ -8063,6 +8117,9 @@ mod tests {
             &expected,
             Some(recovered),
             Some(&ownership),
+            None,
+            Some(&ownership),
+            Some(&nonce),
             true,
         )
         .unwrap_err();
@@ -8240,6 +8297,7 @@ mod tests {
             prior_config_fingerprint: format!("{:x}", Sha256::digest(b"prior-config")),
             expected_config_fingerprint: None,
             ownership_sha256: None,
+            transaction_nonce: None,
         };
         fs::write(&journal_path, serde_json::to_vec_pretty(&journal).unwrap()).unwrap();
 

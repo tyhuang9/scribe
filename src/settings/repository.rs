@@ -224,6 +224,7 @@ pub(crate) fn artifact_config_fingerprint(config: &AppConfig) -> Result<String> 
     let normalized = normalized_config(config);
     let mut witness = serde_json::json!({
         "managed_models": normalized.general.managed_models,
+        "pending_onnx_removals": normalized.general.pending_onnx_removals,
         "managed_remote_models": normalized.general.managed_remote_models,
         "imported_gguf_models": normalized.general.imported_gguf_models,
         "model_paths": normalized.general.model_paths,

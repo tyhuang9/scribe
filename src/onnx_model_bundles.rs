@@ -2148,8 +2148,33 @@ impl OnnxBundleRemoval {
             .map_err(|error| failed(format!("could not persist ONNX removal settings: {error}")))
     }
 
-    pub(crate) fn commit(self) -> Result<(), InstallError> {
-        self.removal.commit()
+    pub(crate) fn commit(
+        self,
+        expected_pending_fingerprint: &str,
+        final_config: &crate::config::AppConfig,
+    ) -> Result<(), InstallError> {
+        let Self {
+            removal,
+            _target_guard,
+            settings_guard,
+        } = self;
+        removal.commit()?;
+        let Some(settings) = settings_guard.as_ref() else {
+            #[cfg(test)]
+            return Ok(());
+            #[cfg(not(test))]
+            return Err(InstallError::RecoveryRequired(
+                "ONNX removal completed, but its durable pending-removal witness could not be cleared because the settings lock was unavailable"
+                    .to_owned(),
+            ));
+        };
+        settings
+            .compare_and_save_artifacts(expected_pending_fingerprint, final_config)
+            .map_err(|error| {
+                InstallError::RecoveryRequired(format!(
+                    "ONNX removal completed, but its durable pending-removal witness could not be cleared: {error}"
+                ))
+            })
     }
 
     pub(crate) fn rollback(self) -> Result<(), InstallError> {
@@ -2163,6 +2188,7 @@ pub(crate) fn stage_onnx_bundle_removal(
     expected_receipt_sha256: &str,
     prior_config_fingerprint: String,
     expected_config_fingerprint: String,
+    transaction_nonce: String,
 ) -> Result<OnnxBundleRemoval, InstallError> {
     stage_onnx_bundle_removal_with(
         storage_root,
@@ -2170,6 +2196,7 @@ pub(crate) fn stage_onnx_bundle_removal(
         expected_receipt_sha256,
         prior_config_fingerprint,
         expected_config_fingerprint,
+        transaction_nonce,
         true,
         verified_owned_removal_candidate_at,
     )
@@ -2181,11 +2208,13 @@ fn stage_onnx_bundle_removal_with(
     expected_receipt_sha256: &str,
     prior_config_fingerprint: String,
     expected_config_fingerprint: String,
+    transaction_nonce: String,
     enforce_durable_settings: bool,
     verify: impl Fn(&str, &Path) -> Result<VerifiedOnnxRemovalCandidate, InstallError>,
 ) -> Result<OnnxBundleRemoval, InstallError> {
     validate_sha256(expected_receipt_sha256)?;
     validate_sha256(&expected_config_fingerprint)?;
+    validate_sha256(&transaction_nonce)?;
     let target_root = bundle_target_root(storage_root, model_id)?;
     let target_guard = acquire_bundle_target(&target_root)?;
     let settings_guard = enforce_durable_settings
@@ -2223,6 +2252,7 @@ fn stage_onnx_bundle_removal_with(
         prior_config_fingerprint,
         expected_config_fingerprint,
         candidate.receipt_sha256().to_owned(),
+        transaction_nonce,
     )?;
     let pinned_verification = (|| {
         let pinned_path = removal.pin_stable_tree()?;
@@ -2265,14 +2295,26 @@ pub(crate) fn reconcile_onnx_bundle_removal(
     storage_root: &Path,
     model_id: &str,
     durable_config_fingerprint: &str,
-) -> Result<bool, InstallError> {
-    reconcile_onnx_bundle_removal_with(
+) -> Result<Option<crate::config::AppConfig>, InstallError> {
+    let outcome = reconcile_onnx_bundle_removal_with(
         storage_root,
         model_id,
         durable_config_fingerprint,
         true,
+        None,
         verified_owned_removal_candidate_at,
-    )
+    )?;
+    Ok(outcome.reconciled.then_some(
+        outcome
+            .durable_config
+            .expect("durable ONNX recovery must retain its loaded config"),
+    ))
+}
+
+#[derive(Debug)]
+struct OnnxRemovalReconciliation {
+    reconciled: bool,
+    durable_config: Option<crate::config::AppConfig>,
 }
 
 fn pin_and_reverify_removal_candidate(
@@ -2304,24 +2346,87 @@ fn reconcile_onnx_bundle_removal_with(
     model_id: &str,
     durable_config_fingerprint: &str,
     enforce_durable_settings: bool,
+    test_durable_config: Option<crate::config::AppConfig>,
     verify: impl Fn(&str, &Path) -> Result<VerifiedOnnxRemovalCandidate, InstallError>,
-) -> Result<bool, InstallError> {
+) -> Result<OnnxRemovalReconciliation, InstallError> {
     let target_root = bundle_target_root(storage_root, model_id)?;
     let tombstone = removal_tombstone_path(&target_root)?;
     let journal = removal_journal_path(&target_root)?;
-    if !crate::installations::path_entry_exists_no_follow(&tombstone)?
-        && !crate::installations::path_entry_exists_no_follow(&journal)?
-    {
-        return Ok(false);
-    }
     let _target_guard = acquire_bundle_target(&target_root)?;
     let settings_guard = enforce_durable_settings
         .then(acquire_artifact_settings_lock)
         .transpose()?;
+    let mut durable_config = if let Some(settings) = settings_guard.as_ref() {
+        Some(settings.load().map_err(|error| {
+            failed(format!(
+                "could not load durable settings under the ONNX removal lock: {error}"
+            ))
+        })?)
+    } else {
+        test_durable_config
+    };
+    let locked_fingerprint = durable_config
+        .as_ref()
+        .map(crate::config::settings::artifact_config_fingerprint)
+        .transpose()
+        .map_err(|error| {
+            failed(format!(
+                "could not fingerprint durable settings under the ONNX removal lock: {error}"
+            ))
+        })?
+        .unwrap_or_else(|| durable_config_fingerprint.to_owned());
+    if enforce_durable_settings
+        && !locked_fingerprint.eq_ignore_ascii_case(durable_config_fingerprint)
+    {
+        return Err(InstallError::RecoveryRequired(
+            "durable artifact settings changed during ONNX removal recovery; restart Scribe to retry from a fresh settings snapshot"
+                .to_owned(),
+        ));
+    }
+
+    let durable_installed_ownership_sha256 = durable_config.as_ref().and_then(|config| {
+        config
+            .general
+            .managed_models
+            .get(model_id)
+            .filter(|witness| {
+                witness.path == target_root
+                    && witness.source.as_deref() == Some(OWNERSHIP_WITNESS_SOURCE)
+            })
+            .and_then(|witness| witness.sha256.clone())
+    });
+    let durable_pending = durable_config
+        .as_ref()
+        .and_then(|config| config.general.pending_onnx_removals.get(model_id))
+        .filter(|pending| pending.target == target_root)
+        .cloned();
+
     if !crate::installations::path_entry_exists_no_follow(&tombstone)?
         && !crate::installations::path_entry_exists_no_follow(&journal)?
     {
-        return Ok(false);
+        let Some(pending) = durable_pending.as_ref() else {
+            return Ok(OnnxRemovalReconciliation {
+                reconciled: false,
+                durable_config,
+            });
+        };
+        if crate::installations::path_entry_exists_no_follow(&target_root)? {
+            return Err(InstallError::RecoveryRequired(format!(
+                "durable settings authorize committed ONNX removal {}, but its active target still exists without a removal journal",
+                target_root.display()
+            )));
+        }
+        clear_pending_onnx_removal(
+            model_id,
+            pending,
+            &locked_fingerprint,
+            settings_guard.as_ref(),
+            durable_config.as_mut(),
+        )?;
+        return Ok(OnnxRemovalReconciliation {
+            reconciled: true,
+            durable_config,
+        });
     }
     let (capability, observed_ownership_sha256) =
         if crate::installations::path_entry_exists_no_follow(&tombstone)? {
@@ -2383,22 +2488,70 @@ fn reconcile_onnx_bundle_removal_with(
         } else {
             (None, None)
         };
-    let durable_config_fingerprint = if enforce_durable_settings {
-        durable_artifact_config_fingerprint(
-            settings_guard
-                .as_ref()
-                .expect("enforced settings must hold its transaction"),
-        )?
-    } else {
-        durable_config_fingerprint.to_owned()
-    };
-    reconcile_stable_directory_removal(
+    let reconciled = reconcile_stable_directory_removal(
         &target_root,
-        &durable_config_fingerprint,
+        &locked_fingerprint,
         capability,
         observed_ownership_sha256.as_deref(),
+        durable_installed_ownership_sha256.as_deref(),
+        durable_pending
+            .as_ref()
+            .map(|pending| pending.receipt_sha256.as_str()),
+        durable_pending
+            .as_ref()
+            .map(|pending| pending.transaction_nonce.as_str()),
         true,
-    )
+    )?;
+    if reconciled
+        && durable_pending.is_some()
+        && !crate::installations::path_entry_exists_no_follow(&target_root)?
+        && !crate::installations::path_entry_exists_no_follow(&tombstone)?
+        && !crate::installations::path_entry_exists_no_follow(&journal)?
+    {
+        clear_pending_onnx_removal(
+            model_id,
+            durable_pending
+                .as_ref()
+                .expect("pending witness was checked"),
+            &locked_fingerprint,
+            settings_guard.as_ref(),
+            durable_config.as_mut(),
+        )?;
+    }
+    Ok(OnnxRemovalReconciliation {
+        reconciled,
+        durable_config,
+    })
+}
+
+fn clear_pending_onnx_removal(
+    model_id: &str,
+    expected: &crate::config::PendingOnnxRemoval,
+    expected_artifact_fingerprint: &str,
+    settings: Option<&crate::config::settings::SettingsTransaction>,
+    config: Option<&mut crate::config::AppConfig>,
+) -> Result<(), InstallError> {
+    let config = config.ok_or_else(|| {
+        InstallError::RecoveryRequired(format!(
+            "durable settings do not contain independent authority for completed ONNX removal {model_id}"
+        ))
+    })?;
+    if config.general.pending_onnx_removals.get(model_id) != Some(expected) {
+        return Err(InstallError::RecoveryRequired(format!(
+            "durable pending-removal authority changed while reconciling ONNX model {model_id}"
+        )));
+    }
+    config.general.pending_onnx_removals.remove(model_id);
+    if let Some(settings) = settings {
+        settings
+            .compare_and_save_artifacts(expected_artifact_fingerprint, config)
+            .map_err(|error| {
+                InstallError::RecoveryRequired(format!(
+                    "ONNX removal completed, but its durable pending-removal witness could not be cleared: {error}"
+                ))
+            })?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2640,6 +2793,54 @@ mod tests {
         ];
         generated.extend(generated_license_materials(&receipt.license));
         generated
+    }
+
+    fn removal_test_configs(
+        storage: &Path,
+        model_id: &str,
+        target: &Path,
+        receipt_sha256: &str,
+        transaction_nonce: &str,
+    ) -> (
+        crate::config::AppConfig,
+        String,
+        crate::config::AppConfig,
+        String,
+    ) {
+        assert_eq!(
+            storage.file_name().and_then(|name| name.to_str()),
+            Some("onnx-bundles")
+        );
+        let mut prior = crate::config::AppConfig::default();
+        prior.general.model_storage_dir = storage.parent().unwrap().to_path_buf();
+        let mut witness = crate::config::ManagedModelInstall::app_managed(
+            target.to_path_buf(),
+            OWNERSHIP_WITNESS_SOURCE,
+        );
+        witness.sha256 = Some(receipt_sha256.to_owned());
+        prior
+            .general
+            .managed_models
+            .insert(model_id.to_owned(), witness);
+        crate::config::normalize_config(&mut prior);
+        let prior_fingerprint =
+            crate::config::settings::artifact_config_fingerprint(&prior).unwrap();
+
+        let mut pending = prior.clone();
+        pending.general.managed_models.remove(model_id);
+        pending.general.pending_onnx_removals.insert(
+            model_id.to_owned(),
+            crate::config::PendingOnnxRemoval {
+                target: target.to_path_buf(),
+                receipt_sha256: receipt_sha256.to_owned(),
+                transaction_nonce: transaction_nonce.to_owned(),
+            },
+        );
+        crate::config::normalize_config(&mut pending);
+        assert!(pending.general.pending_onnx_removals.contains_key(model_id));
+        let pending_fingerprint =
+            crate::config::settings::artifact_config_fingerprint(&pending).unwrap();
+        (prior, prior_fingerprint, pending, pending_fingerprint)
     }
 
     #[test]
@@ -3234,6 +3435,7 @@ mod tests {
         let authorized =
             verified_removal_candidate_at_with_manifest_for_test(model_id, &target, &manifest)
                 .unwrap();
+        let nonce = format!("{:x}", Sha256::digest(b"removal-transaction"));
 
         let error = stage_onnx_bundle_removal_with(
             &storage,
@@ -3241,6 +3443,7 @@ mod tests {
             &"00".repeat(32),
             format!("{:x}", Sha256::digest(b"prior-config")),
             format!("{:x}", Sha256::digest(b"expected-config")),
+            nonce.clone(),
             false,
             |expected, root| {
                 verified_removal_candidate_at_with_manifest_for_test(expected, root, &manifest)
@@ -3259,6 +3462,7 @@ mod tests {
                 authorized.receipt_sha256(),
                 format!("{:x}", Sha256::digest(b"prior-config")),
                 format!("{:x}", Sha256::digest(b"expected-config")),
+                nonce.clone(),
                 false,
                 |expected, root| {
                     verified_removal_candidate_at_with_manifest_for_test(expected, root, &manifest)
@@ -3283,6 +3487,7 @@ mod tests {
             authorized.receipt_sha256(),
             format!("{:x}", Sha256::digest(b"prior-config")),
             format!("{:x}", Sha256::digest(b"expected-config")),
+            nonce,
             false,
             |expected, root| {
                 verified_removal_candidate_at_with_manifest_for_test(expected, root, &manifest)
@@ -3298,7 +3503,8 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn onnx_removal_recovers_crashes_before_and_after_settings_persistence() {
-        let restore_storage = unique_root("removal-crash-before-persistence");
+        let restore_root = unique_root("removal-crash-before-persistence");
+        let restore_storage = restore_root.join("onnx-bundles");
         fs::create_dir_all(&restore_storage).unwrap();
         let model_id = "fixture-removal-model";
         let restore_target = bundle_target_root(&restore_storage, model_id).unwrap();
@@ -3310,14 +3516,21 @@ mod tests {
             &manifest,
         )
         .unwrap();
-        let prior = format!("{:x}", Sha256::digest(b"prior-config"));
-        let expected = format!("{:x}", Sha256::digest(b"expected-config"));
+        let nonce = format!("{:x}", Sha256::digest(b"restore-transaction"));
+        let (prior_config, prior, _, expected) = removal_test_configs(
+            &restore_storage,
+            model_id,
+            &restore_target,
+            restore_candidate.receipt_sha256(),
+            &nonce,
+        );
         let removal = stage_onnx_bundle_removal_with(
             &restore_storage,
             model_id,
             restore_candidate.receipt_sha256(),
             prior.clone(),
             expected.clone(),
+            nonce,
             false,
             |expected, root| {
                 verified_removal_candidate_at_with_manifest_for_test(expected, root, &manifest)
@@ -3329,9 +3542,9 @@ mod tests {
         let journal_path = removal_journal_path(&restore_target).unwrap();
         let journal_bytes = fs::read(&journal_path).unwrap();
         let mut legacy_journal: serde_json::Value = serde_json::from_slice(&journal_bytes).unwrap();
-        assert_eq!(legacy_journal["schema_version"], 2);
+        assert_eq!(legacy_journal["schema_version"], 3);
         let mut downgraded_schema = legacy_journal.clone();
-        downgraded_schema["schema_version"] = serde_json::json!(1);
+        downgraded_schema["schema_version"] = serde_json::json!(2);
         fs::write(
             &journal_path,
             serde_json::to_vec_pretty(&downgraded_schema).unwrap(),
@@ -3342,6 +3555,7 @@ mod tests {
             model_id,
             &prior,
             false,
+            Some(prior_config.clone()),
             |expected, root| {
                 verified_removal_candidate_at_with_manifest_for_test(expected, root, &manifest)
             },
@@ -3363,6 +3577,7 @@ mod tests {
             model_id,
             &prior,
             false,
+            Some(prior_config.clone()),
             |expected, root| {
                 verified_removal_candidate_at_with_manifest_for_test(expected, root, &manifest)
             },
@@ -3379,6 +3594,7 @@ mod tests {
             model_id,
             &prior,
             false,
+            Some(prior_config.clone()),
             |_, root| {
                 Ok(VerifiedOnnxRemovalCandidate::for_test(
                     model_id,
@@ -3391,21 +3607,22 @@ mod tests {
         assert!(error.to_string().contains("ownership witness"));
         assert!(!restore_target.exists());
         assert!(removal_tombstone_path(&restore_target).unwrap().is_dir());
-        assert!(
-            reconcile_onnx_bundle_removal_with(
-                &restore_storage,
-                model_id,
-                &prior,
-                false,
-                |expected, root| {
-                    verified_removal_candidate_at_with_manifest_for_test(expected, root, &manifest)
-                },
-            )
-            .unwrap()
-        );
+        let restored = reconcile_onnx_bundle_removal_with(
+            &restore_storage,
+            model_id,
+            &prior,
+            false,
+            Some(prior_config),
+            |expected, root| {
+                verified_removal_candidate_at_with_manifest_for_test(expected, root, &manifest)
+            },
+        )
+        .unwrap();
+        assert!(restored.reconciled);
         assert!(restore_target.is_dir());
 
-        let commit_storage = unique_root("removal-crash-after-persistence");
+        let commit_root = unique_root("removal-crash-after-persistence");
+        let commit_storage = commit_root.join("onnx-bundles");
         fs::create_dir_all(&commit_storage).unwrap();
         let commit_target = bundle_target_root(&commit_storage, model_id).unwrap();
         let receipt = write_fixture_bundle(&commit_target, model_id, "commit");
@@ -3416,12 +3633,21 @@ mod tests {
             &manifest,
         )
         .unwrap();
+        let nonce = format!("{:x}", Sha256::digest(b"commit-transaction"));
+        let (_, prior, pending_config, expected) = removal_test_configs(
+            &commit_storage,
+            model_id,
+            &commit_target,
+            commit_candidate.receipt_sha256(),
+            &nonce,
+        );
         let mut removal = stage_onnx_bundle_removal_with(
             &commit_storage,
             model_id,
             commit_candidate.receipt_sha256(),
             prior,
             expected.clone(),
+            nonce,
             false,
             |expected, root| {
                 verified_removal_candidate_at_with_manifest_for_test(expected, root, &manifest)
@@ -3430,22 +3656,31 @@ mod tests {
         .unwrap();
         removal.prepare_config_commit(expected.clone()).unwrap();
         drop(removal);
+        let committed = reconcile_onnx_bundle_removal_with(
+            &commit_storage,
+            model_id,
+            &expected,
+            false,
+            Some(pending_config),
+            |expected, root| {
+                verified_removal_candidate_at_with_manifest_for_test(expected, root, &manifest)
+            },
+        )
+        .unwrap();
+        assert!(committed.reconciled);
         assert!(
-            reconcile_onnx_bundle_removal_with(
-                &commit_storage,
-                model_id,
-                &expected,
-                false,
-                |expected, root| {
-                    verified_removal_candidate_at_with_manifest_for_test(expected, root, &manifest)
-                },
-            )
-            .unwrap()
+            committed
+                .durable_config
+                .unwrap()
+                .general
+                .pending_onnx_removals
+                .is_empty(),
+            "the durable authority must be cleared only after exact deletion and journal cleanup"
         );
         assert!(!commit_target.exists());
 
-        fs::remove_dir_all(restore_storage).unwrap();
-        fs::remove_dir_all(commit_storage).unwrap();
+        fs::remove_dir_all(restore_root).unwrap();
+        fs::remove_dir_all(commit_root).unwrap();
     }
 
     #[cfg(windows)]
@@ -3456,15 +3691,20 @@ mod tests {
         let model_id = "fixture-removal-model";
         let target = bundle_target_root(&storage, model_id).unwrap();
         fs::create_dir_all(&target).unwrap();
-        let prior = format!("{:x}", Sha256::digest(b"prior-config"));
+        let durable_config = crate::config::AppConfig::default();
+        let prior = crate::config::settings::artifact_config_fingerprint(&durable_config).unwrap();
 
-        let recovered =
-            reconcile_onnx_bundle_removal_with(&storage, model_id, &prior, false, |_, _| {
-                panic!("normal startup must not hash an ONNX tree without a transaction")
-            })
-            .unwrap();
+        let recovered = reconcile_onnx_bundle_removal_with(
+            &storage,
+            model_id,
+            &prior,
+            false,
+            Some(durable_config),
+            |_, _| panic!("normal startup must not hash an ONNX tree without a transaction"),
+        )
+        .unwrap();
 
-        assert!(!recovered);
+        assert!(!recovered.reconciled);
         assert!(target.is_dir());
         fs::remove_dir_all(storage).unwrap();
     }

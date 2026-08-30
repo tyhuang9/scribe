@@ -6,7 +6,7 @@ pub use repository::SettingsStore;
 pub use schema::{
     AppConfig, CURRENT_SCHEMA_VERSION, DEFAULT_INPUT_THRESHOLD_DBFS, HistoryMode,
     MAX_INPUT_THRESHOLD_DBFS, MIN_INPUT_THRESHOLD_DBFS, OverlayMode, OverlayPosition,
-    SpeechDetectionMode, StreamingMode,
+    PendingOnnxRemoval, SpeechDetectionMode, StreamingMode,
 };
 #[cfg(test)]
 pub use schema::{GeneralSettings, RecordingSettings};

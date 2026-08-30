@@ -1563,10 +1563,14 @@ impl StagedModelRemoval {
         }
     }
 
-    fn commit(self) -> Result<(), InstallError> {
+    fn commit(
+        self,
+        expected_pending_fingerprint: &str,
+        final_config: &config::AppConfig,
+    ) -> Result<(), InstallError> {
         match self {
             Self::Generic(removal) => removal.commit(),
-            Self::Onnx(removal) => removal.commit(),
+            Self::Onnx(removal) => removal.commit(expected_pending_fingerprint, final_config),
         }
     }
 
@@ -3033,6 +3037,13 @@ fn onnx_ownership_witness_matches(
         })
 }
 
+fn generate_onnx_removal_nonce() -> Result<String, String> {
+    let mut bytes = [0_u8; 32];
+    getrandom::fill(&mut bytes)
+        .map_err(|error| format!("Could not create a secure ONNX removal transaction: {error}"))?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
 fn cleanup_excluded_bundled_model(config: &AppConfig) -> Result<bool, InstallError> {
     cleanup_excluded_bundled_model_at(config, config::bundled_model_path())
 }
@@ -3426,7 +3437,7 @@ impl LocalTranscriberApp {
         let onnx_removal_storage = config::onnx_bundle_storage_dir(&app.config);
         let onnx_removal_storage_identity = fs::canonicalize(&onnx_removal_storage)
             .unwrap_or_else(|_| onnx_removal_storage.clone());
-        let onnx_removal_model_ids = config::configured_models(&app.config)
+        let mut onnx_removal_model_ids = config::configured_models(&app.config)
             .into_iter()
             .filter_map(|model| {
                 crate::model_catalog::normalized_receipt_backed_bundle_id(&ModelId::new(&model.id))
@@ -3434,6 +3445,9 @@ impl LocalTranscriberApp {
                     .map(str::to_owned)
             })
             .collect::<Vec<_>>();
+        onnx_removal_model_ids.extend(app.config.general.pending_onnx_removals.keys().cloned());
+        onnx_removal_model_ids.sort();
+        onnx_removal_model_ids.dedup();
         let allowed_model_targets = config::configured_models(&app.config)
             .into_iter()
             .filter(|model| {
@@ -3528,14 +3542,24 @@ impl LocalTranscriberApp {
                 }
                 onnx_recovery_model_ids.sort();
                 onnx_recovery_model_ids.dedup();
-                onnx_recovery_model_ids.iter().try_for_each(|model_id| {
-                    reconcile_onnx_bundle_removal(
+                let mut recovery_fingerprint = fingerprint.to_string();
+                for model_id in &onnx_recovery_model_ids {
+                    if let Some(recovered_config) = reconcile_onnx_bundle_removal(
                         &onnx_removal_storage,
                         model_id,
-                        fingerprint,
-                    )
-                    .map(|_| ())
-                })?;
+                        &recovery_fingerprint,
+                    )? {
+                        app.config = recovered_config;
+                        recovery_fingerprint =
+                            config::settings::artifact_config_fingerprint(&app.config).map_err(
+                                |error| {
+                                    InstallError::RecoveryRequired(format!(
+                                        "could not fingerprint durable settings after ONNX removal recovery: {error}"
+                                    ))
+                                },
+                            )?;
+                    }
+                }
                 let mut allowed_targets = allowed_removal_targets
                     .iter()
                     .filter(|target| {
@@ -3548,7 +3572,8 @@ impl LocalTranscriberApp {
                 allowed_targets.sort();
                 allowed_targets.dedup();
                 allowed_targets.iter().try_for_each(|target| {
-                    reconcile_managed_removal(target, &allowed_targets, fingerprint).map(|_| ())
+                    reconcile_managed_removal(target, &allowed_targets, &recovery_fingerprint)
+                        .map(|_| ())
                 })
             });
         if let Err(error) = removal_recovery {
@@ -3557,6 +3582,14 @@ impl LocalTranscriberApp {
             app.status_message = message.clone();
             app.artifact_recovery_error = Some(message);
         }
+        let durable_artifact_fingerprint = config::settings::artifact_config_fingerprint(
+            &app.config,
+        )
+        .map_err(|error| {
+            InstallError::RecoveryRequired(format!(
+                "could not fingerprint durable settings after artifact removal recovery: {error}"
+            ))
+        });
         let activation_recovery = durable_artifact_fingerprint.and_then(|fingerprint| {
             reconcile_activation_journal(
                 &activation_journal_path(),
@@ -10365,6 +10398,43 @@ impl LocalTranscriberApp {
             replacement.as_ref(),
             removing_bundled,
         );
+        let transaction_nonce = if let Some(candidate) = onnx_candidate.as_ref() {
+            if next_config
+                .general
+                .pending_onnx_removals
+                .contains_key(&model.id)
+            {
+                self.status = TranscriptionStatus::Error;
+                self.status_message = format!(
+                    "An earlier ONNX removal transaction for {} still requires recovery; restart Scribe before retrying.",
+                    model.name
+                );
+                return false;
+            }
+            let nonce = match generate_onnx_removal_nonce() {
+                Ok(nonce) => nonce,
+                Err(error) => {
+                    self.status = TranscriptionStatus::Error;
+                    self.status_message = error;
+                    return false;
+                }
+            };
+            next_config.general.pending_onnx_removals.insert(
+                model.id.clone(),
+                config::PendingOnnxRemoval {
+                    target: candidate.target_root().to_path_buf(),
+                    receipt_sha256: candidate.receipt_sha256().to_owned(),
+                    transaction_nonce: nonce.clone(),
+                },
+            );
+            Some(nonce)
+        } else {
+            None
+        };
+        let mut final_config = next_config.clone();
+        if transaction_nonce.is_some() {
+            final_config.general.pending_onnx_removals.remove(&model.id);
+        }
         let expected_fingerprint = match config::settings::artifact_config_fingerprint(&next_config)
         {
             Ok(fingerprint) => fingerprint,
@@ -10382,6 +10452,9 @@ impl LocalTranscriberApp {
                 candidate.receipt_sha256(),
                 prior_fingerprint.clone(),
                 expected_fingerprint.clone(),
+                transaction_nonce
+                    .clone()
+                    .expect("ONNX removal candidate must have a transaction nonce"),
             )
             .map(StagedModelRemoval::Onnx)
             .map(Some)
@@ -10517,7 +10590,11 @@ impl LocalTranscriberApp {
             return false;
         }
         self.remote_catalog.invalidate_local_models();
-        let cleanup = staged_removal.and_then(|removal| removal.commit().err());
+        let cleanup = staged_removal
+            .and_then(|removal| removal.commit(&expected_fingerprint, &final_config).err());
+        if cleanup.is_none() {
+            self.config = final_config;
+        }
         if let Some(store) = self.settings_store.as_mut() {
             store.mark_current_persisted();
         }

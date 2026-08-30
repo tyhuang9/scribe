@@ -261,6 +261,14 @@ fn migrate_legacy_flat(
         diagnostics,
         Some(managed_install_value_is_valid),
     );
+    config.general.pending_onnx_removals = take_map(
+        &mut root,
+        "pending_onnx_removals",
+        &[],
+        config.general.pending_onnx_removals,
+        diagnostics,
+        None,
+    );
     config.general.managed_remote_models = take_map(
         &mut root,
         "managed_remote_models",
@@ -475,6 +483,14 @@ fn parse_general(
             defaults.managed_models,
             diagnostics,
             Some(managed_install_value_is_valid),
+        ),
+        pending_onnx_removals: take_map(
+            &mut section,
+            "pending_onnx_removals",
+            &[],
+            defaults.pending_onnx_removals,
+            diagnostics,
+            None,
         ),
         managed_remote_models: take_map(
             &mut section,

@@ -2581,6 +2581,7 @@ dependencies = [
  "directories",
  "eframe",
  "egui-phosphor",
+ "getrandom 0.3.4",
  "global-hotkey",
  "hound",
  "libc",
