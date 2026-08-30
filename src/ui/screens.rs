@@ -845,7 +845,7 @@ fn selector_row(
                 name,
             );
             let action_name = if no_model {
-                "Add a model".to_owned()
+                "Active model: No model selected. Choose model".to_owned()
             } else {
                 format!("Choose active model: {name}")
             };
@@ -11929,7 +11929,11 @@ mod tests {
         crate::ui::controls::configure_accessible_style(&ctx);
         let (initial, action) = render_selector_with_events(&ctx, &state, &models, 900.0, vec![]);
         assert_eq!(action, ScreenAction::None);
-        let card = named_role_bounds(&initial, "Add a model", egui::accesskit::Role::Button);
+        let card = named_role_bounds(
+            &initial,
+            "Active model: No model selected. Choose model",
+            egui::accesskit::Role::Button,
+        );
         let point = accesskit_rect_center(card);
 
         let (_, press_action) = render_selector_with_events(
@@ -11954,7 +11958,10 @@ mod tests {
             ],
         );
         assert_eq!(click_action, ScreenAction::None);
-        assert!(button_expanded(&clicked, "Add a model"));
+        assert!(button_expanded(
+            &clicked,
+            "Active model: No model selected. Choose model"
+        ));
         assert!(
             clicked
                 .platform_output
@@ -11986,7 +11993,10 @@ mod tests {
             false,
         );
         assert_eq!(key_action, ScreenAction::None);
-        assert!(button_expanded(&opened, "Add a model"));
+        assert!(button_expanded(
+            &opened,
+            "Active model: No model selected. Choose model"
+        ));
     }
 
     #[test]
@@ -12015,7 +12025,10 @@ mod tests {
             false,
         );
         assert_eq!(action, ScreenAction::None);
-        assert!(button_expanded(&output, "Add a model"));
+        assert!(button_expanded(
+            &output,
+            "Active model: No model selected. Choose model"
+        ));
         let update = output
             .platform_output
             .accesskit_update
