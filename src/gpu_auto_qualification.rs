@@ -229,6 +229,16 @@ impl AutoQualificationPolicy {
             .map_err(ToString::to_string)
     }
 
+    #[cfg(test)]
+    fn embedded_linux_x64() -> Result<&'static Self, String> {
+        static POLICY: OnceLock<Result<AutoQualificationPolicy, AutoQualificationError>> =
+            OnceLock::new();
+        POLICY
+            .get_or_init(|| Self::from_canonical_json(EMBEDDED_LINUX_X64_MANIFEST))
+            .as_ref()
+            .map_err(ToString::to_string)
+    }
+
     pub(crate) fn policy_version(&self) -> u16 {
         AUTO_QUALIFICATION_POLICY_VERSION
     }
@@ -633,6 +643,14 @@ mod tests {
     }
 
     #[test]
+    fn embedded_linux_manifest_is_strict_default_deny_with_no_production_entries() {
+        let policy = AutoQualificationPolicy::embedded_linux_x64().unwrap();
+        assert_eq!(policy.document.target_os, LINUX_X64_OS);
+        assert_eq!(policy.document.target_arch, LINUX_X64_ARCH);
+        assert!(policy.document.entries.is_empty());
+    }
+
+    #[test]
     fn qualified_fixture_requires_every_pack_model_and_target_fact() {
         let policy = fixture_policy();
         // Unit fixtures intentionally exercise the Windows manifest on every
@@ -979,6 +997,76 @@ mod tests {
     }
 
     #[test]
+    fn linux_entries_accept_only_reviewed_cuda_and_vulkan_bindings() {
+        for (backend, provider, vendor) in [
+            (
+                BackendKind::Cuda,
+                "transcribe-cpp-ggml-cuda",
+                GpuVendor::Nvidia,
+            ),
+            (
+                BackendKind::Vulkan,
+                "transcribe-cpp-ggml-vulkan",
+                GpuVendor::Nvidia,
+            ),
+            (
+                BackendKind::Vulkan,
+                "transcribe-cpp-ggml-vulkan",
+                GpuVendor::Amd,
+            ),
+            (
+                BackendKind::Vulkan,
+                "transcribe-cpp-ggml-vulkan",
+                GpuVendor::Intel,
+            ),
+        ] {
+            let mut document = fixture_document();
+            document.target_os = LINUX_X64_OS.to_owned();
+            document.target_arch = LINUX_X64_ARCH.to_owned();
+            document.entries[0].backend = backend;
+            document.entries[0].provider_id = provider.to_owned();
+            document.entries[0].vendor = vendor;
+            assert!(
+                AutoQualificationPolicy::from_fixture_json(
+                    &serde_json::to_string(&document).unwrap()
+                )
+                .is_ok()
+            );
+        }
+
+        for (backend, provider, vendor) in [
+            (
+                BackendKind::Cuda,
+                "transcribe-cpp-ggml-cuda",
+                GpuVendor::Amd,
+            ),
+            (
+                BackendKind::Vulkan,
+                "transcribe-cpp-ggml-cuda",
+                GpuVendor::Nvidia,
+            ),
+            (
+                BackendKind::Metal,
+                "transcribe-cpp-ggml-metal",
+                GpuVendor::Nvidia,
+            ),
+        ] {
+            let mut document = fixture_document();
+            document.target_os = LINUX_X64_OS.to_owned();
+            document.target_arch = LINUX_X64_ARCH.to_owned();
+            document.entries[0].backend = backend;
+            document.entries[0].provider_id = provider.to_owned();
+            document.entries[0].vendor = vendor;
+            assert_eq!(
+                AutoQualificationPolicy::from_fixture_json(
+                    &serde_json::to_string(&document).unwrap()
+                ),
+                Err(AutoQualificationError::InvalidEntry("target binding"))
+            );
+        }
+    }
+
+    #[test]
     fn macos_entries_accept_only_metal_with_supported_hardware_vendors() {
         for (vendor, class) in [
             (GpuVendor::Apple, DeviceClass::UnifiedGpu),
@@ -1019,6 +1107,7 @@ mod tests {
     fn current_platform_manifest_is_canonical_and_default_deny() {
         #[cfg(any(
             all(target_os = "windows", target_arch = "x86_64"),
+            all(target_os = "linux", target_arch = "x86_64"),
             all(target_os = "macos", target_arch = "aarch64"),
             all(target_os = "macos", target_arch = "x86_64")
         ))]
