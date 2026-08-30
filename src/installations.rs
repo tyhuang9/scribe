@@ -616,6 +616,134 @@ pub(crate) struct ManagedRemoval {
     tombstone: Option<PathBuf>,
     journal_path: Option<PathBuf>,
     journal: Option<RemovalJournalDocument>,
+    stable_directory: Option<StableManagedDirectory>,
+}
+
+/// An opened Windows directory capability used when a managed directory is a
+/// security boundary. The open handles deny delete sharing, so neither the
+/// target nor its parent can be renamed or replaced while the capability is
+/// live. Namespace mutation is performed through the opened target handle,
+/// never by treating its mutable path string as deletion authority.
+///
+/// There is intentionally no weaker non-Windows implementation. Receipt-
+/// backed ONNX removal is a Windows product feature and must fail closed on a
+/// platform where this module cannot establish equivalent semantics.
+#[derive(Debug)]
+pub(crate) struct StableManagedDirectory {
+    path: PathBuf,
+    #[cfg(windows)]
+    parent: File,
+    #[cfg(windows)]
+    directory: File,
+    #[cfg(windows)]
+    identity: OpenedFileIdentity,
+}
+
+impl StableManagedDirectory {
+    pub(crate) fn open_exact(target: &Path, allowed_target: &Path) -> Result<Self, InstallError> {
+        let allowed_target = allowed_target.to_path_buf();
+        validate_reconciliation_target(
+            target,
+            std::slice::from_ref(&allowed_target),
+            "stable directory capability",
+        )?;
+        reject_link_or_reparse_ancestors(target)?;
+
+        #[cfg(not(windows))]
+        {
+            let _ = target;
+            return Err(failed(
+                "stable managed-directory capabilities are unavailable on this platform",
+            ));
+        }
+
+        #[cfg(windows)]
+        {
+            let parent_path = target
+                .parent()
+                .ok_or_else(|| failed(format!("{} has no parent", target.display())))?;
+            let parent = open_windows_directory_capability(parent_path, false, true)?;
+            let directory = open_windows_directory_capability(target, true, true)?;
+            let identity = opened_file_identity(&directory)?;
+            let capability = Self {
+                path: target.to_path_buf(),
+                parent,
+                directory,
+                identity,
+            };
+            capability.revalidate_path_identity()?;
+            Ok(capability)
+        }
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    #[cfg(windows)]
+    fn revalidate_path_identity(&self) -> Result<(), InstallError> {
+        let probe = open_windows_directory_capability(&self.path, false, false)?;
+        if opened_file_identity(&probe)? != self.identity {
+            return Err(failed(format!(
+                "managed directory identity changed at {}",
+                self.path.display()
+            )));
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn rename_to(&mut self, destination: &Path) -> Result<(), InstallError> {
+        if destination.parent() != self.path.parent() {
+            return Err(failed(
+                "stable managed-directory rename must stay within its opened parent",
+            ));
+        }
+        self.revalidate_path_identity()?;
+        rename_open_windows_directory(&self.directory, destination)?;
+        self.path = destination.to_path_buf();
+        self.revalidate_path_identity()?;
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    fn rename_to(&mut self, _destination: &Path) -> Result<(), InstallError> {
+        Err(failed(
+            "stable managed-directory capabilities are unavailable on this platform",
+        ))
+    }
+
+    #[cfg(windows)]
+    fn remove_exact_tree(self) -> Result<(), InstallError> {
+        self.revalidate_path_identity()?;
+        remove_open_directory_contents(&self.path)?;
+        mark_open_windows_directory_for_delete(&self.directory)?;
+        let Self {
+            path,
+            parent,
+            directory,
+            ..
+        } = self;
+        // Delete-on-close applies to the exact opened identity. Keep its
+        // parent pinned until the directory handle closes and absence is
+        // confirmed, so an ancestor swap cannot redirect the check.
+        drop(directory);
+        if path_entry_exists_no_follow(&path)? {
+            return Err(InstallError::RecoveryRequired(format!(
+                "opened managed directory remained after delete-on-close: {}",
+                path.display()
+            )));
+        }
+        drop(parent);
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    fn remove_exact_tree(self) -> Result<(), InstallError> {
+        Err(failed(
+            "stable managed-directory capabilities are unavailable on this platform",
+        ))
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -684,6 +812,7 @@ impl ManagedRemoval {
                 tombstone: None,
                 journal_path: None,
                 journal: None,
+                stable_directory: None,
             });
         }
         let journal = RemovalJournalDocument {
@@ -724,6 +853,57 @@ impl ManagedRemoval {
             tombstone: Some(tombstone),
             journal_path: Some(journal_path),
             journal: Some(journal),
+            stable_directory: None,
+        })
+    }
+
+    /// Stages the exact opened directory represented by `capability`. Receipt
+    /// or manifest verification belongs to the caller and must be performed
+    /// immediately before this call while its higher-level mutation lock is
+    /// held. The capability remains owned by the removal transaction through
+    /// settings persistence and commit/rollback.
+    pub(crate) fn stage_stable_directory(
+        mut capability: StableManagedDirectory,
+        prior_config_fingerprint: String,
+    ) -> Result<Self, InstallError> {
+        validate_sha256(&prior_config_fingerprint)?;
+        let target = capability.path().to_path_buf();
+        let tombstone = removal_tombstone_path(&target)?;
+        let journal_path = removal_journal_path(&target)?;
+        if path_entry_exists_no_follow(&tombstone)? || path_entry_exists_no_follow(&journal_path)? {
+            return Err(InstallError::RecoveryRequired(format!(
+                "unresolved artifact removal exists at {} or {}",
+                tombstone.display(),
+                journal_path.display()
+            )));
+        }
+        let journal = RemovalJournalDocument {
+            schema_version: 1,
+            target: target.clone(),
+            prior_config_fingerprint,
+            expected_config_fingerprint: None,
+        };
+        persist_removal_journal(&journal_path, &journal)?;
+        if let Err(error) = capability.rename_to(&tombstone) {
+            let clear_error = remove_path_if_exists(&journal_path).err();
+            return Err(match clear_error {
+                Some(clear_error) => InstallError::RecoveryRequired(format!(
+                    "failed to stage capability-backed artifact removal {}: {error}; the prepared removal journal also could not be cleared: {clear_error}",
+                    target.display()
+                )),
+                None => failed(format!(
+                    "failed to stage capability-backed artifact removal {}: {error}",
+                    target.display()
+                )),
+            });
+        }
+        sync_parent(&target)?;
+        Ok(Self {
+            target,
+            tombstone: Some(tombstone),
+            journal_path: Some(journal_path),
+            journal: Some(journal),
+            stable_directory: Some(capability),
         })
     }
 
@@ -746,13 +926,17 @@ impl ManagedRemoval {
     }
 
     pub(crate) fn commit(mut self) -> Result<(), InstallError> {
-        if let Some(tombstone) = self.tombstone.take()
-            && let Err(error) = remove_path_if_exists(&tombstone)
-        {
-            return Err(InstallError::RecoveryRequired(format!(
-                "settings committed but artifact removal cleanup failed at {}: {error}",
-                tombstone.display()
-            )));
+        if let Some(tombstone) = self.tombstone.take() {
+            let cleanup = match self.stable_directory.take() {
+                Some(capability) => capability.remove_exact_tree(),
+                None => remove_path_if_exists(&tombstone),
+            };
+            if let Err(error) = cleanup {
+                return Err(InstallError::RecoveryRequired(format!(
+                    "settings committed but artifact removal cleanup failed at {}: {error}",
+                    tombstone.display()
+                )));
+            }
         }
         sync_parent(&self.target).map_err(|error| {
             InstallError::RecoveryRequired(format!(
@@ -780,12 +964,17 @@ impl ManagedRemoval {
                 self.target.display()
             )));
         }
-        durable_rename(&tombstone, &self.target).map_err(|error| {
+        let restore = match self.stable_directory.as_mut() {
+            Some(capability) => capability.rename_to(&self.target),
+            None => durable_rename(&tombstone, &self.target),
+        };
+        restore.map_err(|error| {
             InstallError::RecoveryRequired(format!(
                 "failed to restore staged removal {}: {error}",
                 self.target.display()
             ))
         })?;
+        self.stable_directory.take();
         sync_parent(&self.target).map_err(|error| {
             InstallError::RecoveryRequired(format!(
                 "restored staged removal {} but could not sync it: {error}",
@@ -1511,6 +1700,197 @@ fn opened_file_identity(file: &File) -> Result<OpenedFileIdentity, InstallError>
         file_index_high: information.nFileIndexHigh,
         file_index_low: information.nFileIndexLow,
     })
+}
+
+#[cfg(windows)]
+fn open_windows_directory_capability(
+    path: &Path,
+    delete_access: bool,
+    deny_delete_sharing: bool,
+) -> Result<File, InstallError> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY,
+        FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, SYNCHRONIZE,
+    };
+
+    let mut options = OpenOptions::new();
+    let access = FILE_LIST_DIRECTORY
+        | FILE_READ_ATTRIBUTES
+        | SYNCHRONIZE
+        | if delete_access { DELETE } else { 0 };
+    let share_mode = FILE_SHARE_READ
+        | FILE_SHARE_WRITE
+        | if deny_delete_sharing {
+            0
+        } else {
+            FILE_SHARE_DELETE
+        };
+    options
+        .read(true)
+        .access_mode(access)
+        // Deliberately omit FILE_SHARE_DELETE. The opened directory entry
+        // cannot be renamed or replaced while the capability is live.
+        .share_mode(share_mode)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+    let file = options.open(path).map_err(|error| {
+        failed(format!(
+            "failed to open stable managed directory {}: {error}",
+            path.display()
+        ))
+    })?;
+    let metadata = file.metadata().map_err(|error| {
+        failed(format!(
+            "failed to inspect stable managed directory {}: {error}",
+            path.display()
+        ))
+    })?;
+    if !metadata.is_dir() || runtime_metadata_is_link_or_reparse(&metadata) {
+        return Err(failed(format!(
+            "stable managed directory is a link, reparse point, or non-directory: {}",
+            path.display()
+        )));
+    }
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn rename_open_windows_directory(directory: &File, destination: &Path) -> Result<(), InstallError> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_RENAME_INFO, FileRenameInfo, SetFileInformationByHandle,
+    };
+
+    let name = destination.as_os_str().encode_wide().collect::<Vec<_>>();
+    let name_bytes = name
+        .len()
+        .checked_mul(std::mem::size_of::<u16>())
+        .and_then(|bytes| u32::try_from(bytes).ok())
+        .ok_or_else(|| failed("managed-directory rename name is too long"))?;
+    let base_bytes = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
+    let total_bytes = base_bytes
+        .checked_add(name_bytes as usize)
+        .and_then(|bytes| bytes.checked_add(std::mem::size_of::<u16>()))
+        .ok_or_else(|| failed("managed-directory rename buffer overflowed"))?;
+    let words = total_bytes.div_ceil(std::mem::size_of::<usize>());
+    let mut storage = vec![0_usize; words];
+    let information = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    // SAFETY: `storage` is aligned for `FILE_RENAME_INFO`, sized for the
+    // variable trailing UTF-16 name, and remains alive for the syscall.
+    unsafe {
+        (*information).Anonymous.ReplaceIfExists = 0;
+        // SetFileInformationByHandle accepts an absolute destination with a
+        // null RootDirectory. The separately opened parent handle remains
+        // live and denies delete sharing, so this absolute name cannot be
+        // redirected by replacing the target's immediate parent.
+        (*information).RootDirectory = std::ptr::null_mut();
+        (*information).FileNameLength = name_bytes;
+        std::ptr::copy_nonoverlapping(
+            name.as_ptr(),
+            (*information).FileName.as_mut_ptr(),
+            name.len(),
+        );
+    }
+    // SAFETY: both files own valid handles for this call and `information`
+    // points to the initialized variable-size structure described above.
+    let succeeded = unsafe {
+        SetFileInformationByHandle(
+            directory.as_raw_handle(),
+            FileRenameInfo,
+            information.cast(),
+            total_bytes as u32,
+        )
+    };
+    if succeeded == 0 {
+        Err(failed(format!(
+            "failed to rename opened managed directory: {}",
+            io::Error::last_os_error()
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn mark_open_windows_directory_for_delete(directory: &File) -> Result<(), InstallError> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
+    };
+
+    let information = FILE_DISPOSITION_INFO { DeleteFile: 1 };
+    // SAFETY: `directory` owns a DELETE-capable handle and `information` is a
+    // valid fixed-size input structure for FileDispositionInfo.
+    let succeeded = unsafe {
+        SetFileInformationByHandle(
+            directory.as_raw_handle(),
+            FileDispositionInfo,
+            (&raw const information).cast(),
+            std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+        )
+    };
+    if succeeded == 0 {
+        Err(failed(format!(
+            "failed to mark opened managed directory for deletion: {}",
+            io::Error::last_os_error()
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn remove_open_directory_contents(root: &Path) -> Result<(), InstallError> {
+    let entries = fs::read_dir(root).map_err(|error| {
+        failed(format!(
+            "failed to enumerate opened managed directory {}: {error}",
+            root.display()
+        ))
+    })?;
+    for entry in entries {
+        let path = entry
+            .map_err(|error| {
+                failed(format!(
+                    "failed to enumerate opened managed directory {}: {error}",
+                    root.display()
+                ))
+            })?
+            .path();
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| failed(format!("failed to inspect {}: {error}", path.display())))?;
+        if runtime_metadata_is_link_or_reparse(&metadata) {
+            let result = if metadata.is_dir() {
+                fs::remove_dir(&path)
+            } else {
+                fs::remove_file(&path)
+            };
+            result.map_err(|error| {
+                failed(format!(
+                    "failed to remove non-followed link {}: {error}",
+                    path.display()
+                ))
+            })?;
+        } else if metadata.is_dir() {
+            remove_open_directory_contents(&path)?;
+            fs::remove_dir(&path).map_err(|error| {
+                failed(format!(
+                    "failed to remove directory {}: {error}",
+                    path.display()
+                ))
+            })?;
+        } else if metadata.is_file() {
+            fs::remove_file(&path).map_err(|error| {
+                failed(format!("failed to remove file {}: {error}", path.display()))
+            })?;
+        } else {
+            return Err(failed(format!(
+                "opened managed directory contains an unsupported entry: {}",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn additional_download_bytes(
@@ -6184,6 +6564,92 @@ mod tests {
         assert!(remove_exact_regular_file(&target, &target).unwrap());
         assert!(!target.exists());
         assert!(!remove_exact_regular_file(&target, &target).unwrap());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn stable_directory_capability_pins_identity_across_stage_and_rollback() {
+        let root = unique_root("stable-directory-rollback");
+        let target = root.join("managed-onnx");
+        fs::create_dir_all(target.join("nested")).unwrap();
+        fs::write(target.join("nested").join("model.onnx"), b"model").unwrap();
+
+        let capability = StableManagedDirectory::open_exact(&target, &target).unwrap();
+        let moved_ancestor = root.with_extension("swapped");
+        assert!(
+            fs::rename(&root, &moved_ancestor).is_err(),
+            "the opened parent must prevent an ancestor swap"
+        );
+        let replacement = root.join("replacement");
+        fs::create_dir_all(&replacement).unwrap();
+        assert!(
+            fs::rename(&target, root.join("stolen-target")).is_err(),
+            "the opened target must prevent an identity swap"
+        );
+
+        let removal = ManagedRemoval::stage_stable_directory(
+            capability,
+            format!("{:x}", Sha256::digest(b"prior-config")),
+        )
+        .unwrap();
+        let tombstone = removal_tombstone_path(&target).unwrap();
+        assert!(!target.exists());
+        assert!(tombstone.is_dir());
+        removal.rollback().unwrap();
+
+        assert_eq!(
+            fs::read(target.join("nested").join("model.onnx")).unwrap(),
+            b"model"
+        );
+        assert!(!tombstone.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn stable_directory_capability_commits_delete_on_exact_open_handle() {
+        let root = unique_root("stable-directory-commit");
+        let target = root.join("managed-onnx");
+        fs::create_dir_all(target.join("nested")).unwrap();
+        fs::write(target.join("nested").join("model.onnx"), b"model").unwrap();
+        let capability = StableManagedDirectory::open_exact(&target, &target).unwrap();
+        let mut removal = ManagedRemoval::stage_stable_directory(
+            capability,
+            format!("{:x}", Sha256::digest(b"prior-config")),
+        )
+        .unwrap();
+        removal
+            .prepare_config_commit(format!("{:x}", Sha256::digest(b"expected-config")))
+            .unwrap();
+        removal.commit().unwrap();
+
+        assert!(!target.exists());
+        assert!(!removal_tombstone_path(&target).unwrap().exists());
+        assert!(!removal_journal_path(&target).unwrap().exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn stable_directory_capability_rejects_wrong_and_reparse_targets() {
+        use std::os::windows::fs::symlink_dir;
+
+        let root = unique_root("stable-directory-negative");
+        let target = root.join("managed-onnx");
+        let other = root.join("other");
+        fs::create_dir_all(&target).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        assert!(StableManagedDirectory::open_exact(&target, &other).is_err());
+
+        let link = root.join("managed-link");
+        match symlink_dir(&target, &link) {
+            Ok(()) => assert!(StableManagedDirectory::open_exact(&link, &link).is_err()),
+            Err(error)
+                if error.kind() == io::ErrorKind::PermissionDenied
+                    || error.raw_os_error() == Some(1314) => {}
+            Err(error) => panic!("could not create reparse fixture: {error}"),
+        }
         fs::remove_dir_all(root).unwrap();
     }
 
