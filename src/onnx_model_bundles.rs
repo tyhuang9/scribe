@@ -1898,7 +1898,7 @@ fn removal_candidate_from_receipt(
             receipt.model_id
         )));
     }
-    let receipt_sha256 = format!("{:x}", Sha256::digest(receipt_bytes(&receipt)?));
+    let receipt_sha256 = format!("{:x}", Sha256::digest(receipt_bytes(receipt)?));
     Ok(VerifiedOnnxRemovalCandidate {
         model_id: expected_model_id.to_owned(),
         target_root: root.to_path_buf(),
