@@ -1585,6 +1585,18 @@ mod tests {
         use sha2::{Digest, Sha256};
 
         let catalog: super::PackCatalog = serde_json::from_slice(catalog_bytes).unwrap();
+        let release_security_epoch = catalog
+            .packs
+            .first()
+            .map(|entry| entry.security_epoch)
+            .unwrap_or(1);
+        assert!(
+            catalog
+                .packs
+                .iter()
+                .all(|entry| entry.security_epoch == release_security_epoch),
+            "release authority fixtures require one release-wide security epoch"
+        );
         let entries = catalog
             .packs
             .into_iter()
@@ -1611,7 +1623,7 @@ mod tests {
         serde_json::to_vec(&super::PackReleaseAuthority {
             schema_version: 2,
             catalog_sha256: format!("{:x}", Sha256::digest(catalog_bytes)),
-            release_security_epoch: 1,
+            release_security_epoch,
             keychain_access_group: "ABCDE12345.com.scribe.local-transcriber".to_owned(),
             entries,
         })
