@@ -463,3 +463,16 @@ remapping, bounded fallback, quarantine privacy/timing, and no-replay rules.
 `scripts/test-windows-release-packaging.ps1` and
 `scripts/verify-windows-release-package.ps1` enforce exact catalog/inventory,
 installer allowlist, portable/installer parity, and hostile filesystem cases.
+
+## Stage 7 Linux GPU contract
+
+Linux GPU support remains default-deny. The only reviewed future worker target is
+`x86_64-unknown-linux-gnu` on Ubuntu 22.04 or 24.04, with glibc 2.35 or newer
+and kernel 5.15 or newer. The CUDA lane is CUDA 12.8 / nvcc 12.8.93 through
+`transcribe-cpp-ggml-cuda` with an NVIDIA driver floor of 570.26. The Vulkan
+lane is loader/toolchain 1.4.357.0, API 1.2 or newer, through
+`transcribe-cpp-ggml-vulkan`. Unsupported distributions, architectures, ABI,
+glibc, or kernels deny Linux GPU eligibility only; the CPU path remains
+available. `gpu-auto-qualification-linux-x86_64.json` is canonical
+`default_deny` with no entries, so this contract does not enable Auto GPU use or
+introduce production trust.

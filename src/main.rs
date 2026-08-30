@@ -39,6 +39,11 @@ mod hotkey;
 mod huggingface_catalog;
 mod installations;
 mod installed_manifest;
+#[allow(
+    dead_code,
+    reason = "Stage 7 records a fail-closed Linux GPU platform contract before worker routing exists"
+)]
+mod linux_gpu_runtime;
 #[cfg(test)]
 #[allow(
     dead_code,
