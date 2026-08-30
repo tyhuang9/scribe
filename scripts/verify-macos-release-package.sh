@@ -60,19 +60,19 @@ assert_microphone_entitlement() {
   rm -f "$entitlements"
 }
 for path in "$app/Contents/Info.plist" "$macos/Scribe" "$macos/scribe-inference-worker" "$catalog" "$authority"; do [[ -f "$path" && ! -L "$path" ]] || { echo "required regular file missing: $path" >&2; exit 1; }; done
-find "$app" -xdev \( -type l -o -type f -links +1 -o -name '._*' \) -print -quit | grep -q . && { echo 'application contains a symlink, hardlink, or AppleDouble entry.' >&2; exit 1; }
-find "$resources/workers/packs" -type d -name '.stage.*' -print -quit | grep -q . && { echo 'application contains an interrupted worker-pack staging directory.' >&2; exit 1; }
+[[ -z "$(find "$app" -xdev \( -type l -o -type f -links +1 -o -name '._*' \) -print -quit)" ]] || { echo 'application contains a symlink, hardlink, or AppleDouble entry.' >&2; exit 1; }
+[[ -z "$(find "$resources/workers/packs" -type d -name '.stage.*' -print -quit)" ]] || { echo 'application contains an interrupted worker-pack staging directory.' >&2; exit 1; }
 if command -v xattr >/dev/null && xattr -lr "$app" 2>/dev/null | grep -E 'com\.apple\.ResourceFork|com\.apple\.FinderInfo' >/dev/null; then echo 'application contains resource-fork metadata.' >&2; exit 1; fi
 for binary in "$macos/Scribe" "$macos/scribe-inference-worker"; do
   lipo "$binary" -verify_arch arm64; lipo "$binary" -verify_arch x86_64
-  otool -l "$binary" | grep -A3 'LC_BUILD_VERSION' | grep -q 'minos 13\.' || { echo "minimum macOS 13 load command missing: $binary" >&2; exit 1; }
+  otool -l "$binary" | grep -A3 'LC_BUILD_VERSION' | grep -F 'minos 13.' >/dev/null || { echo "minimum macOS 13 load command missing: $binary" >&2; exit 1; }
   if otool -L "$binary" | grep -F '/Metal.framework/' >/dev/null || otool -l "$binary" | grep -F '/Metal.framework/' >/dev/null; then echo "CPU/UI binary must not load Metal.framework: $binary" >&2; exit 1; fi
   codesign --verify --strict --verbose=2 "$binary"
 done
 assert_no_keychain_group "$macos/scribe-inference-worker"
 codesign --verify --strict --verbose=2 "$app"
 assert_microphone_entitlement "$macos/Scribe"
-plutil -extract LSMinimumSystemVersion raw -o - "$app/Contents/Info.plist" | grep -qx '13.0' || { echo 'Info.plist must declare macOS 13.0.' >&2; exit 1; }
+[[ "$(plutil -extract LSMinimumSystemVersion raw -o - "$app/Contents/Info.plist")" == '13.0' ]] || { echo 'Info.plist must declare macOS 13.0.' >&2; exit 1; }
 jq -e '.schema_version == 1 and (.packs | type == "array") and (.packs | length <= 8)' "$catalog" >/dev/null || { echo 'catalog is invalid.' >&2; exit 1; }
 catalog_digest="$(shasum -a 256 "$catalog" | awk '{print $1}')"
 [[ "$catalog_digest" =~ ^[0-9a-f]{64}$ ]] || { echo 'catalog digest is invalid.' >&2; exit 1; }
