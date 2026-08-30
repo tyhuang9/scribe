@@ -204,6 +204,21 @@ reported `warm_reused=true` on the second request, and launched no CPU worker.
 These numbers describe the fixture pack only; they are not CUDA sizes or a
 production installer measurement.
 
+The toolchain-selection repair was reverified from clean commit `94ba0ff` after
+the hosted Windows runner began preferring a Visual Studio 18 shell. The build
+accepted the shell only after locating the reviewed v143 compatibility
+component, then activated MSVC toolset `14.44.35207` and Windows SDK
+`10.0.26100.0` through `vcvarsall`. CMake reported compiler
+`19.44.35227.0` from the exact pinned directory and used the exact hashed
+`cl.exe`, `link.exe`, `lib.exe`, and `nmake.exe` payloads. The resulting
+fixture pack `0.1.0-fixture-toolchain2` had digest
+`edd7cc74481720c19c21decfa4676af8c7b2dfb32abb50e2c5ba9a56c88fd306`
+and the same 98,016,256-byte worker payload. It passed the ignored explicit-GPU
+SCIF/model smoke on the same RTX 4080 SUPER with stable device/driver identity,
+the expected `ask not` phrase, warm reuse, and zero CPU launches. This evidence
+verifies compiler-payload selection across Visual Studio shells; it does not
+replace remote CI, CUDA, production-signing, installer, or Auto qualification.
+
 CUDA was not built or run locally because the pinned CUDA Toolkit/nvcc 12.8.93
 is absent. Production signing and packaging remain intentionally unverified and
 fail closed because no reviewed production public key or CI private key exists.
@@ -276,9 +291,13 @@ production pack from the pinned contract in
 `runtime-manifests/gpu-worker-toolchain-windows-x64.json`.
 `scripts/prepare-windows-gpu-worker-packs.ps1` is the production-only two-pack
 orchestrator used by the opt-in release job. It requires exact Rust 1.96.0,
-CMake 4.4.2, MSVC 14.44.35207, the reviewed Sherpa archive, Vulkan SDK
-1.4.357.0, and CUDA Toolkit/nvcc 12.8.93. Missing tools fail with a specific
-gate; the scripts never download an unapproved SDK. Pack payload outputs use
+CMake 4.4.2, MSVC 14.44.35207 tool payloads, Windows SDK 10.0.26100.0, the
+reviewed Sherpa archive, Vulkan SDK 1.4.357.0, and CUDA Toolkit/nvcc 12.8.93.
+The mutable Visual Studio product-shell version is not the compiler identity:
+the build locates a shell containing the reviewed compatibility component,
+activates the exact toolset/SDK, verifies tool file versions and SHA-256s, and
+exports only the verified build environment. Missing or mismatched payloads
+fail with a specific gate; the scripts never download an unapproved SDK. Pack payload outputs use
 the ignored `artifacts/gpu-worker-packs` tree. Native Cargo targets must be
 fresh direct children of the validated short `LocalApplicationData\sgp` build
 root. Each build also receives a separate fresh physical `LOCALAPPDATA` child,
