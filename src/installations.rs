@@ -4082,8 +4082,11 @@ mod tests {
     fn fast_retry_policy() -> DownloadRetryPolicy {
         DownloadRetryPolicy {
             read_poll_interval: Duration::from_millis(1),
-            stalled_after: Duration::from_millis(1),
-            reconnect_after: Duration::from_millis(20),
+            // Tests that are not specifically exercising inactivity must not
+            // turn normal scheduler delay on a busy CI host into a reconnect.
+            // The dedicated stall test overrides both thresholds below.
+            stalled_after: Duration::from_secs(2),
+            reconnect_after: Duration::from_secs(5),
             retry_backoffs: [Duration::ZERO; 3],
             cancellation_poll_interval: Duration::from_millis(1),
         }
@@ -4150,6 +4153,7 @@ mod tests {
         ]);
         let updates = Mutex::new(Vec::new());
         let mut policy = fast_retry_policy();
+        policy.stalled_after = Duration::from_millis(1);
         policy.reconnect_after = Duration::from_millis(5);
 
         let candidate = download_pinned_artifact_with_policy(
