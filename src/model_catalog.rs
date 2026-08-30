@@ -313,6 +313,12 @@ const MOONSHINE_BASE_CAPABILITIES: ModelCapabilities = ModelCapabilities {
     ..BATCH_ENGLISH_CAPABILITIES
 };
 
+const PARAKEET_TDT_V2_CAPABILITIES: ModelCapabilities = ModelCapabilities {
+    cancellation: false,
+    timestamps: false,
+    ..BATCH_ENGLISH_CAPABILITIES
+};
+
 const NO_ROLES: &[ModelRole] = &[];
 
 const PHASE_ZERO_SMOKE: CompatibilityEvidence = CompatibilityEvidence {
@@ -351,6 +357,18 @@ const MOONSHINE_BASE_ONNX_EXPERIMENTAL: CompatibilityEvidence = CompatibilityEvi
     receipt: None,
 };
 
+const PARAKEET_TDT_V2_ONNX_EXPERIMENTAL: CompatibilityEvidence = CompatibilityEvidence {
+    id: "parakeet-tdt-06b-v2-en-int8-onnx-windows-sherpa-1.13.5-gate",
+    source: "docs/MANUAL_TEST_MATRIX.md",
+    load: true,
+    known_fixture: true,
+    cancellation: false,
+    unload_reload: true,
+    acceleration: false,
+    platform: true,
+    receipt: None,
+};
+
 const PHASE_TWO_BASE_SMOKE: CompatibilityEvidence = CompatibilityEvidence {
     id: "phase-2-native-base-en-jfk-smoke",
     source: COMPATIBILITY_EVIDENCE_DOCUMENT,
@@ -367,6 +385,7 @@ const MODELS: &[ModelManifest] = &[
     handy_computer_tiny_en_manifest(),
     moonshine_tiny_en_int8_onnx_manifest(),
     moonshine_base_en_int8_onnx_manifest(),
+    parakeet_tdt_06b_v2_en_int8_onnx_manifest(),
     whisper_manifest(
         BUNDLED_BASE_MODEL_ID,
         "Whisper Base — English",
@@ -519,6 +538,35 @@ const fn moonshine_base_en_int8_onnx_manifest() -> ModelManifest {
             reason: "Cancellation, restart recovery, latency, resource use, accelerators, and non-Windows support remain unverified.",
         },
         evidence: MOONSHINE_BASE_ONNX_EXPERIMENTAL,
+    }
+}
+
+const fn parakeet_tdt_06b_v2_en_int8_onnx_manifest() -> ModelManifest {
+    ModelManifest {
+        id: "parakeet-tdt-06b-v2-en-int8-onnx",
+        display_name: "Parakeet TDT 0.6B v2 — English",
+        variant_label: "int8",
+        description: "Experimental local English final-text model. Fixture verified only.",
+        storage_guidance: "~631 MiB",
+        expected_ram: "Not measured",
+        speed_guidance: "Not measured",
+        accuracy_guidance: "Not measured",
+        recommended: false,
+        runtime: None,
+        architecture: ModelArchitecture::EncoderDecoder,
+        minimum_runtime_version: TRANSCRIBE_CPP_VERSION,
+        artifact: ModelArtifactBinding::ReceiptBackedBundle {
+            bundle_id: "parakeet-tdt-06b-v2-en-int8-onnx",
+            aggregate_size_bytes: 661_190_513,
+        },
+        languages: &["en"],
+        capabilities: PARAKEET_TDT_V2_CAPABILITIES,
+        roles: NO_ROLES,
+        compatibility: CompatibilityStatus::Experimental {
+            evidence: PARAKEET_TDT_V2_ONNX_EXPERIMENTAL.link(),
+            reason: "Only the Windows Sherpa ONNX load, fixture, and unload/reload gate has passed; cancellation, restart recovery, latency, resource use, accelerators, and non-Windows support remain unverified.",
+        },
+        evidence: PARAKEET_TDT_V2_ONNX_EXPERIMENTAL,
     }
 }
 
@@ -1100,8 +1148,8 @@ mod tests {
     #[test]
     fn production_catalog_is_valid_and_has_unique_ids() {
         assert_eq!(validate_catalog(), Ok(()));
-        assert_eq!(model_descriptors().len(), 6);
-        assert_eq!(normal_model_descriptors().len(), 6);
+        assert_eq!(model_descriptors().len(), 7);
+        assert_eq!(normal_model_descriptors().len(), 7);
         assert_eq!(
             model_descriptors()
                 .into_iter()
@@ -1126,6 +1174,11 @@ mod tests {
                     ModelId::new("moonshine-base-en-int8-onnx"),
                     "Moonshine Base — English",
                     "Base INT8",
+                ),
+                (
+                    ModelId::new("parakeet-tdt-06b-v2-en-int8-onnx"),
+                    "Parakeet TDT 0.6B v2 — English",
+                    "int8",
                 ),
                 (
                     ModelId::new("whisper_cpp_base_en"),
@@ -1153,6 +1206,7 @@ mod tests {
                 ModelId::new("whisper_cpp_tiny_en"),
                 ModelId::new("moonshine-tiny-en-int8-onnx"),
                 ModelId::new("moonshine-base-en-int8-onnx"),
+                ModelId::new("parakeet-tdt-06b-v2-en-int8-onnx"),
                 ModelId::new("whisper_cpp_base_en"),
                 ModelId::new("whisper_cpp_small_en"),
                 ModelId::new("whisper_cpp_medium_en"),
@@ -1407,6 +1461,7 @@ mod tests {
         let receipt_backed = [
             ("moonshine-tiny-en-int8-onnx", 44_256_550),
             ("moonshine-base-en-int8-onnx", 286_930_831),
+            ("parakeet-tdt-06b-v2-en-int8-onnx", 661_190_513),
         ];
 
         for (id, aggregate_size_bytes) in receipt_backed {
@@ -1416,6 +1471,10 @@ mod tests {
             assert!(descriptor.capabilities.batch_transcription);
             assert!(!descriptor.capabilities.native_streaming);
             assert!(!descriptor.capabilities.timestamps);
+            assert_eq!(
+                descriptor.capabilities.cancellation,
+                id != "moonshine-base-en-int8-onnx" && id != "parakeet-tdt-06b-v2-en-int8-onnx"
+            );
             assert!(!descriptor.capabilities.translation);
             assert!(!descriptor.capabilities.language_detection);
             assert!(descriptor.capabilities.cpu);
@@ -1440,6 +1499,10 @@ mod tests {
             assert_eq!(runtime_model_manifest(&descriptor.id), None);
             assert!(!model_uses_embedded_runtime(&descriptor.id));
             assert_eq!(runtime_model_download_url(&descriptor.id), None);
+            assert_eq!(
+                crate::receipt_bundle_catalog::available_bundle_aggregate_size_bytes(id),
+                Some(aggregate_size_bytes)
+            );
         }
 
         let base = model_descriptor(&ModelId::new("moonshine-base-en-int8-onnx")).unwrap();
@@ -1475,7 +1538,7 @@ mod tests {
                     )
                 })
                 .count(),
-            2
+            3
         );
     }
 
@@ -1498,6 +1561,27 @@ mod tests {
                 aggregate_size_bytes: 286_930_831,
             })
         );
+    }
+
+    #[test]
+    fn parakeet_tdt_v2_evidence_records_only_the_observed_windows_gate() {
+        let manifest = MODELS
+            .iter()
+            .find(|manifest| manifest.id == "parakeet-tdt-06b-v2-en-int8-onnx")
+            .unwrap();
+
+        assert_eq!(
+            manifest.evidence.id,
+            "parakeet-tdt-06b-v2-en-int8-onnx-windows-sherpa-1.13.5-gate"
+        );
+        assert_eq!(manifest.evidence.source, "docs/MANUAL_TEST_MATRIX.md");
+        assert!(manifest.evidence.load);
+        assert!(manifest.evidence.known_fixture);
+        assert!(!manifest.evidence.cancellation);
+        assert!(manifest.evidence.unload_reload);
+        assert!(!manifest.evidence.acceleration);
+        assert!(manifest.evidence.platform);
+        assert_eq!(manifest.evidence.receipt, None);
     }
 
     #[test]
@@ -1539,6 +1623,10 @@ mod tests {
     fn receipt_backed_bundles_must_match_available_pinned_bundle_metadata() {
         assert_eq!(
             validate_receipt_backed_bundle("moonshine-tiny-en-int8-onnx", 44_256_550),
+            Ok(())
+        );
+        assert_eq!(
+            validate_receipt_backed_bundle("parakeet-tdt-06b-v2-en-int8-onnx", 661_190_513),
             Ok(())
         );
         assert!(

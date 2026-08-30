@@ -5,15 +5,15 @@ description: Understand local model selection, runtime discovery, and storage.
 
 ## Current catalog and status
 
-The normal Models experience always includes six static catalog entries:
+The normal Models experience always includes seven static catalog entries:
 Experimental GGUF models `whisper_cpp_tiny_en`, `whisper_cpp_base_en`,
 `whisper_cpp_small_en`, and `whisper_cpp_medium_en`, plus the receipt-backed
-Experimental `moonshine-tiny-en-int8-onnx` and `moonshine-base-en-int8-onnx`
-bundles. The GGUF artifacts are pinned by repository revision, filename, size,
-and SHA-256; the ONNX models are installed only as their verified receipt-backed
-bundles. Moonshine Base is a 286,930,831-byte converted five-file INT8 artifact
-(including its MIT / Useful Sensors 2024 license file); its source and converter
-revisions are unrecorded.
+Experimental `moonshine-tiny-en-int8-onnx`, `moonshine-base-en-int8-onnx`, and
+`parakeet-tdt-06b-v2-en-int8-onnx` bundles. The GGUF artifacts are pinned by
+repository revision, filename, size, and SHA-256; the ONNX bundles are installed
+only as their verified receipt-backed bundles. Moonshine Base is a
+286,930,831-byte converted five-file INT8 artifact (including its MIT / Useful
+Sensors 2024 license file); its source and converter revisions are unrecorded.
 
 When a trusted catalog response is available, Models can also discover and
 display additional non-duplicate remote GGUF variants. Those variants are not
@@ -22,7 +22,7 @@ listing becomes usable only after its exact source facts are verified and its
 artifact is installed; listing it does not authorize execution or make it
 Supported.
 
-The six static entries are all **Experimental** and the Supported count is
+The seven static entries are all **Experimental** and the Supported count is
 **zero**. A model must pass load, fixture transcription, cancellation,
 unload/reload, acceleration, and platform checks before promotion. You can also
 validate a local GGUF in place; Scribe fingerprints and smoke-tests it without
@@ -35,6 +35,16 @@ quality claim. It remains a CPU-only English final-text model with no timestamps
 or native streaming; cancellation, supervisor restart recovery, latency,
 resource use, accelerators, and non-Windows behavior are not yet measured.
 
+Parakeet's scoped Windows/Sherpa 1.13.5 gate passed child load/health/silence,
+exact normalized known-WAV equality, unload/reload, and activation. It is a
+661,190,513-byte (~631 MiB), CPU-only, English final/batch-text bundle with no
+native streaming or timestamps; cancellation, restart recovery, accelerators,
+non-Windows support, latency, RAM, and other resource use remain unverified.
+It retains CC-BY-4.0 attribution to NVIDIA Corporation, the
+[license legal URL](https://creativecommons.org/licenses/by/4.0/legalcode), and
+notice that this sherpa-onnx int8 conversion is not the unmodified NVIDIA
+checkpoint and has no recorded source/converter revision.
+
 Legacy user configuration and artifact files are preserved for migration, but
 they are no longer recognized or executed by a production inference route. An
 installer does not need to remove those files for the current catalog to work.
@@ -45,7 +55,7 @@ The application has one logical runtime kind. Only the private `RuntimeRouter` s
 
 Normal GGUF inference uses the safe `transcribe-cpp` 0.1.3 API with a statically
 linked CPU backend in Scribe's private persistent inference child. The
-receipt-backed ONNX bundle uses native Sherpa ONNX in that same child. Neither
+receipt-backed ONNX bundles use native Sherpa ONNX in that same child. Neither
 path requires Python, a localhost service, a dynamic runtime package, a
 GGML/DLL route, or a CLI fallback. Models can remain loaded there for warm reuse.
 
