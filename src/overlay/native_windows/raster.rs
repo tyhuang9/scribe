@@ -195,6 +195,30 @@ impl LayeredFrame {
         Ok(frame)
     }
 
+    /// Places a premultiplied foreground layer over this frame without
+    /// attenuating its fully opaque text pixels.
+    pub(super) fn composite_over(&mut self, foreground: &Self) -> Result<(), RasterError> {
+        if self.width != foreground.width || self.height != foreground.height {
+            return Err(RasterError::InvalidDimensions);
+        }
+        for (background, foreground) in self
+            .pixels
+            .chunks_exact_mut(4)
+            .zip(foreground.pixels.chunks_exact(4))
+        {
+            let remaining_alpha = u16::from(255 - foreground[3]);
+            for channel in 0..3 {
+                background[channel] = (u16::from(foreground[channel])
+                    + u16::from(background[channel]) * remaining_alpha / 255)
+                    .min(255) as u8;
+            }
+            background[3] = (u16::from(foreground[3])
+                + u16::from(background[3]) * remaining_alpha / 255)
+                .min(255) as u8;
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     fn alpha_at(&self, x: i32, y: i32) -> u8 {
         let offset = ((y * self.width + x) * 4 + 3) as usize;
@@ -439,6 +463,73 @@ impl NativeRasterizer {
         Ok(frame)
     }
 
+    /// Paints only the non-text layer used during semantic crossfades. The
+    /// caller composites the target text after blending so lifecycle copy
+    /// retains its contrast throughout every transition frame.
+    pub(super) fn render_display_decorative(
+        &self,
+        state: &OverlayViewState,
+        dark_mode: bool,
+        width: i32,
+        height: i32,
+    ) -> Result<LayeredFrame, RasterError> {
+        let mut frame = LayeredFrame::transparent(width, height)?;
+        let layout = DisplayLayout::from_bounds(
+            state.mode,
+            OverlayWindowBounds {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            },
+        )
+        .ok_or(RasterError::InvalidDimensions)?;
+        let mut canvas = Canvas::new(self, &mut frame.pixels, width, height)?;
+        let colors = NativeColors::for_theme(dark_mode);
+        draw_capsule(&mut canvas, state.mode, layout.scale, colors)?;
+        draw_live_brand_mark(&mut canvas, state, &layout, colors)?;
+        if state.mode == OverlayMode::Live && live_preview_is_visible(state) {
+            draw_live_divider(&mut canvas, &layout, colors)?;
+        }
+        drop(canvas);
+        Ok(frame)
+    }
+
+    pub(super) fn render_display_text(
+        &self,
+        state: &OverlayViewState,
+        dark_mode: bool,
+        width: i32,
+        height: i32,
+    ) -> Result<LayeredFrame, RasterError> {
+        let mut frame = LayeredFrame::transparent(width, height)?;
+        let layout = DisplayLayout::from_bounds(
+            state.mode,
+            OverlayWindowBounds {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            },
+        )
+        .ok_or(RasterError::InvalidDimensions)?;
+        let mut canvas = Canvas::new(self, &mut frame.pixels, width, height)?;
+        let colors = NativeColors::for_theme(dark_mode);
+        match state.mode {
+            OverlayMode::Live => {
+                draw_live_elapsed(&mut canvas, state, &layout, colors)?;
+                if live_preview_is_visible(state) {
+                    draw_live_preview(&mut canvas, state, &layout, colors)?;
+                }
+            }
+            OverlayMode::Minimal | OverlayMode::Off => {
+                draw_compact_status(&mut canvas, state, &layout, colors)?;
+            }
+        }
+        drop(canvas);
+        Ok(frame)
+    }
+
     pub(super) fn render_control(
         &self,
         dark_mode: bool,
@@ -514,15 +605,18 @@ fn draw_live(
 ) -> Result<(), RasterError> {
     draw_live_brand_mark(canvas, state, layout, colors)?;
     draw_live_elapsed(canvas, state, layout, colors)?;
-    if state.phase == OverlayPhase::Listening
-        && !state.shows_live_transcript()
-        && state.error.is_none()
-        && state.notice.is_none()
-    {
+    if !live_preview_is_visible(state) {
         return Ok(());
     }
     draw_live_divider(canvas, layout, colors)?;
     draw_live_preview(canvas, state, layout, colors)
+}
+
+fn live_preview_is_visible(state: &OverlayViewState) -> bool {
+    !(state.phase == OverlayPhase::Listening
+        && !state.shows_live_transcript()
+        && state.error.is_none()
+        && state.notice.is_none())
 }
 
 fn draw_live_brand_mark(
@@ -746,6 +840,11 @@ fn live_line(state: &OverlayViewState, colors: NativeColors) -> StyledLine {
 fn status_mark_color(state: &OverlayViewState, colors: NativeColors) -> Argb {
     if state.phase == OverlayPhase::Success {
         colors.success
+    } else if state.phase.is_progressing()
+        && state.progress_animation_enabled
+        && crate::system_preferences::client_area_animations_enabled()
+    {
+        colors.waveform.with_alpha(progress_pulse_alpha())
     } else {
         colors.waveform
     }
@@ -754,21 +853,21 @@ fn status_mark_color(state: &OverlayViewState, colors: NativeColors) -> Argb {
 fn phase_status_color(state: &OverlayViewState, colors: NativeColors) -> Argb {
     if state.phase == OverlayPhase::Success {
         colors.success
-    } else if state.phase.is_progressing()
-        && state.progress_animation_enabled
-        && crate::system_preferences::client_area_animations_enabled()
-    {
-        let elapsed = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f32();
-        let alpha = (180.0 + 75.0 * ((elapsed * std::f32::consts::TAU) / 0.8).sin())
-            .round()
-            .clamp(105.0, 255.0) as u8;
-        colors.muted_text.with_alpha(alpha)
     } else {
         colors.muted_text
     }
+}
+
+fn progress_pulse_alpha() -> u8 {
+    let elapsed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    progress_pulse_alpha_at(elapsed)
+}
+
+fn progress_pulse_alpha_at(elapsed: Duration) -> u8 {
+    let phase = elapsed.as_secs_f32() * std::f32::consts::TAU / 0.8;
+    (180.0 + 75.0 * phase.sin()).round().clamp(105.0, 255.0) as u8
 }
 
 fn fit_head(
@@ -2341,6 +2440,85 @@ mod tests {
                     assert!(
                         brand_ratio >= 3.0,
                         "brand contrast {brand_ratio:.2}:1 failed on the {} overlay over a {backdrop} backdrop; sampled surface {surface:?}",
+                        if dark_mode { "dark" } else { "light" }
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn lifecycle_text_remains_contrast_safe_at_pulse_minimum_and_crossfade_midpoint() {
+        with_rasterizer(|rasterizer| {
+            assert_eq!(progress_pulse_alpha_at(Duration::from_millis(600)), 105);
+
+            for dark_mode in [false, true] {
+                let width = MINIMAL_WIDTH as i32;
+                let height = LIVE_HEIGHT as i32;
+                let mut previous = state(OverlayMode::Minimal);
+                previous.phase = OverlayPhase::Listening;
+                let mut target = previous.clone();
+                target.phase = OverlayPhase::Processing;
+                target.progress_animation_enabled = true;
+
+                let previous_decorative = rasterizer
+                    .render_display_decorative(&previous, dark_mode, width, height)
+                    .unwrap();
+                let target_decorative = rasterizer
+                    .render_display_decorative(&target, dark_mode, width, height)
+                    .unwrap();
+                let mut midpoint =
+                    LayeredFrame::crossfade(&previous_decorative, &target_decorative, 127, 128)
+                        .unwrap();
+                let target_text = rasterizer
+                    .render_display_text(&target, dark_mode, width, height)
+                    .unwrap();
+                midpoint.composite_over(&target_text).unwrap();
+
+                let layout = DisplayLayout::from_bounds(
+                    OverlayMode::Minimal,
+                    OverlayWindowBounds {
+                        x: 0,
+                        y: 0,
+                        width,
+                        height,
+                    },
+                )
+                .unwrap();
+                let mut opaque_text_pixels = 0;
+                for y in layout.lifecycle_status.y0.ceil() as i32
+                    ..layout.lifecycle_status.y1.ceil() as i32
+                {
+                    for x in layout.lifecycle_status.x0.ceil() as i32
+                        ..layout.lifecycle_status.x1.ceil() as i32
+                    {
+                        let offset = ((y * width + x) * 4) as usize;
+                        if target_text.pixels[offset + 3] == 255 {
+                            opaque_text_pixels += 1;
+                            assert_eq!(
+                                &midpoint.pixels[offset..offset + 4],
+                                &target_text.pixels[offset..offset + 4],
+                                "target lifecycle text must not be dimmed at crossfade midpoint"
+                            );
+                        }
+                    }
+                }
+                assert!(
+                    opaque_text_pixels > 0,
+                    "test state must paint lifecycle text"
+                );
+
+                let center = ((height / 2 * width + width / 2) * 4) as usize;
+                let pixel: [u8; 4] = target_decorative.pixels[center..center + 4]
+                    .try_into()
+                    .unwrap();
+                let colors = NativeColors::for_theme(dark_mode);
+                for backdrop in [0, 255] {
+                    let surface = composite_premultiplied_bgra(pixel, backdrop);
+                    let ratio = contrast_ratio(phase_status_color(&target, colors), surface);
+                    assert!(
+                        ratio >= 4.5,
+                        "lifecycle text contrast {ratio:.2}:1 failed at the pulse minimum on the {} overlay over a {backdrop} backdrop",
                         if dark_mode { "dark" } else { "light" }
                     );
                 }

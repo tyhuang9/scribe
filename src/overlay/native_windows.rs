@@ -981,26 +981,26 @@ impl NativeOverlayHost {
         display_bounds: OverlayWindowBounds,
         plan: Option<&RenderPlan>,
     ) -> Result<(), NativeOverlayFailure> {
-        let mut display_frame = self
-            .rasterizer
-            .render_display(
-                &snapshot.state,
-                snapshot.dark_mode,
-                display_bounds.width,
-                display_bounds.height,
-            )
-            .map_err(|_| {
-                NativeOverlayFailure::new(
-                    NativeOverlayFailureStage::Rasterization,
-                    Some(WindowRole::Display),
+        let display_frame = if let Some(plan) = plan {
+            let target_decorative = self
+                .rasterizer
+                .render_display_decorative(
+                    &snapshot.state,
+                    snapshot.dark_mode,
+                    display_bounds.width,
+                    display_bounds.height,
                 )
-            })?;
-        if let Some(plan) = plan {
+                .map_err(|_| {
+                    NativeOverlayFailure::new(
+                        NativeOverlayFailureStage::Rasterization,
+                        Some(WindowRole::Display),
+                    )
+                })?;
             let previous_frame = if let Some(previous) = &plan.previous
                 && previous.state.mode == snapshot.state.mode
             {
                 self.rasterizer
-                    .render_display(
+                    .render_display_decorative(
                         &previous.state,
                         previous.dark_mode,
                         display_bounds.width,
@@ -1022,9 +1022,9 @@ impl NativeOverlayHost {
                     },
                 )?
             };
-            display_frame = LayeredFrame::crossfade(
+            let mut frame = LayeredFrame::crossfade(
                 &previous_frame,
-                &display_frame,
+                &target_decorative,
                 plan.previous_opacity,
                 plan.target_opacity,
             )
@@ -1034,7 +1034,42 @@ impl NativeOverlayHost {
                     Some(WindowRole::Display),
                 )
             })?;
-        }
+            let target_text = self
+                .rasterizer
+                .render_display_text(
+                    &snapshot.state,
+                    snapshot.dark_mode,
+                    display_bounds.width,
+                    display_bounds.height,
+                )
+                .map_err(|_| {
+                    NativeOverlayFailure::new(
+                        NativeOverlayFailureStage::Rasterization,
+                        Some(WindowRole::Display),
+                    )
+                })?;
+            frame.composite_over(&target_text).map_err(|_| {
+                NativeOverlayFailure::new(
+                    NativeOverlayFailureStage::Rasterization,
+                    Some(WindowRole::Display),
+                )
+            })?;
+            frame
+        } else {
+            self.rasterizer
+                .render_display(
+                    &snapshot.state,
+                    snapshot.dark_mode,
+                    display_bounds.width,
+                    display_bounds.height,
+                )
+                .map_err(|_| {
+                    NativeOverlayFailure::new(
+                        NativeOverlayFailureStage::Rasterization,
+                        Some(WindowRole::Display),
+                    )
+                })?
+        };
         let accessibility_key = DisplayAccessibilityKey {
             mode: snapshot.state.mode,
             phase: snapshot.state.phase,
