@@ -120,13 +120,11 @@ fn vendor_from_name(name: &str) -> GpuVendor {
     }
 }
 
-fn device_class(low_power: bool, removable: bool, unified: bool) -> DeviceClass {
+fn device_class(low_power: bool, _removable: bool, unified: bool) -> DeviceClass {
     if unified {
         DeviceClass::UnifiedGpu
     } else if low_power {
         DeviceClass::IntegratedGpu
-    } else if removable {
-        DeviceClass::DiscreteGpu
     } else {
         DeviceClass::DiscreteGpu
     }

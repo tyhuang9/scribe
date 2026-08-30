@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use sha2::{Digest, Sha256};
@@ -98,7 +98,7 @@ fn embed_gpu_pack_release_authority() {
     let source = std::env::var_os("SCRIBE_GPU_PACK_RELEASE_AUTHORITY")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(DEFAULT_AUTHORITY));
-    if source != PathBuf::from(DEFAULT_AUTHORITY) {
+    if source.as_path() != Path::new(DEFAULT_AUTHORITY) {
         println!("cargo:rerun-if-changed={}", source.display());
     }
     let mut bytes = fs::read(&source).unwrap_or_else(|error| {
@@ -180,7 +180,7 @@ fn prepare_macos_native_shims() {
     cc::Build::new()
         .file("native/scribe_macos_power_shim.c")
         .include("native")
-        .flag(&format!("-mmacosx-version-min={deployment_target}"))
+        .flag(format!("-mmacosx-version-min={deployment_target}"))
         .warnings(true)
         .compile("scribe_macos_power_shim");
     println!("cargo:rustc-link-lib=framework=CoreFoundation");
@@ -193,7 +193,7 @@ fn prepare_macos_native_shims() {
         cc::Build::new()
             .file("native/scribe_macos_keychain_epoch.c")
             .include("native")
-            .flag(&format!("-mmacosx-version-min={deployment_target}"))
+            .flag(format!("-mmacosx-version-min={deployment_target}"))
             .warnings(true)
             .compile("scribe_macos_keychain_epoch");
         println!("cargo:rustc-cfg=scribe_macos_keychain_authority");
@@ -209,7 +209,7 @@ fn prepare_macos_native_shims() {
         .file("native/scribe_macos_gpu_shim.m")
         .include("native")
         .flag("-fobjc-arc")
-        .flag(&format!("-mmacosx-version-min={deployment_target}"))
+        .flag(format!("-mmacosx-version-min={deployment_target}"))
         .warnings(true)
         .compile("scribe_macos_gpu_shim");
     println!("cargo:rustc-link-lib=framework=Metal");

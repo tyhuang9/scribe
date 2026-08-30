@@ -199,10 +199,10 @@ impl AutoQualificationPolicy {
         {
             static POLICY: OnceLock<Result<AutoQualificationPolicy, AutoQualificationError>> =
                 OnceLock::new();
-            return POLICY
+            POLICY
                 .get_or_init(|| Self::from_canonical_json(EMBEDDED_CURRENT_MANIFEST))
                 .as_ref()
-                .map_err(ToString::to_string);
+                .map_err(ToString::to_string)
         }
         #[cfg(not(any(
             all(target_os = "windows", target_arch = "x86_64"),

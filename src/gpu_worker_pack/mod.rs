@@ -1214,7 +1214,7 @@ impl CatalogFingerprint {
     fn generation_id(&self) -> String {
         #[cfg(windows)]
         {
-            return format!(
+            format!(
                 "{:08x}{:016x}{}",
                 self.volume_serial_number,
                 self.file_index,
@@ -1222,7 +1222,7 @@ impl CatalogFingerprint {
                     .iter()
                     .map(|byte| format!("{byte:02x}"))
                     .collect::<String>()
-            );
+            )
         }
         #[cfg(unix)]
         {
