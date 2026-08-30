@@ -50,7 +50,7 @@ sign_line="$(grep -En 'codesign --force --sign .*"[$]app"' "$repo_root/scripts/b
 [[ "$embed_line" =~ ^[0-9]+$ && "$sign_line" =~ ^[0-9]+$ && "$embed_line" -lt "$sign_line" ]] || { echo 'provisioning profile must be embedded before final app signing.' >&2; exit 1; }
 structural_job="$(sed -n '/^  structural:/,/^  official-sign-notarize:/p' "$repo_root/.github/workflows/macos-release.yml")"
 ! grep -F 'secrets.' <<<"$structural_job" >/dev/null || { echo 'pull-request structural job must not receive production secrets.' >&2; exit 1; }
-grep -F 'lipo -verify_arch "$pack_lipo_arch" "$worker"' "$repo_root/scripts/verify-macos-release-package.sh" >/dev/null || { echo 'catalog Metal workers must have their declared single Mach-O slice verified.' >&2; exit 1; }
+grep -F 'lipo "$worker" -verify_arch "$pack_lipo_arch"' "$repo_root/scripts/verify-macos-release-package.sh" >/dev/null || { echo 'catalog Metal workers must have their declared single Mach-O slice verified.' >&2; exit 1; }
 grep -F 'CPU/UI binary must not load Metal.framework' "$repo_root/scripts/verify-macos-release-package.sh" >/dev/null || { echo 'desktop and CPU worker Metal load-command rejection is missing.' >&2; exit 1; }
 grep -F 'catalog Metal worker has no Metal load command' "$repo_root/scripts/verify-macos-release-package.sh" >/dev/null || { echo 'Metal worker load-command requirement is missing.' >&2; exit 1; }
 grep -F 'macOS Metal packs must contain only the manifest, signature, and declared worker.' "$repo_root/scripts/verify-macos-release-package.sh" >/dev/null || { echo 'single-payload macOS Metal pack enforcement is missing.' >&2; exit 1; }
@@ -59,7 +59,7 @@ if [[ "$(uname -s)" == Darwin ]]; then
   printf 'int main(void) { return 0; }\n' >"$lipo_temp/thin.c"
   xcrun --sdk macosx clang -arch arm64 "$lipo_temp/thin.c" -o "$lipo_temp/arm64"
   xcrun --sdk macosx clang -arch x86_64 "$lipo_temp/thin.c" -o "$lipo_temp/x86_64"
-  assert_single_arch() { lipo -verify_arch "$1" "$2" && [[ "$(lipo -archs "$2")" == "$1" ]]; }
+  assert_single_arch() { lipo "$2" -verify_arch "$1" && [[ "$(lipo "$2" -archs)" == "$1" ]]; }
   assert_single_arch arm64 "$lipo_temp/arm64" || { echo 'matching thin Mach-O slice was rejected.' >&2; exit 1; }
   if assert_single_arch x86_64 "$lipo_temp/arm64"; then echo 'wrong Mach-O slice was accepted.' >&2; exit 1; fi
   lipo -create "$lipo_temp/arm64" "$lipo_temp/x86_64" -output "$lipo_temp/universal"

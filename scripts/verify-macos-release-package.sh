@@ -46,7 +46,7 @@ find "$app" -xdev \( -type l -o -type f -links +1 -o -name '._*' \) -print -quit
 find "$resources/workers/packs" -type d -name '.stage.*' -print -quit | grep -q . && { echo 'application contains an interrupted worker-pack staging directory.' >&2; exit 1; }
 if command -v xattr >/dev/null && xattr -lr "$app" 2>/dev/null | grep -E 'com\.apple\.ResourceFork|com\.apple\.FinderInfo' >/dev/null; then echo 'application contains resource-fork metadata.' >&2; exit 1; fi
 for binary in "$macos/Scribe" "$macos/scribe-inference-worker"; do
-  lipo -verify_arch arm64 "$binary"; lipo -verify_arch x86_64 "$binary"
+  lipo "$binary" -verify_arch arm64; lipo "$binary" -verify_arch x86_64
   otool -l "$binary" | grep -A3 'LC_BUILD_VERSION' | grep -q 'minos 13\.' || { echo "minimum macOS 13 load command missing: $binary" >&2; exit 1; }
   if otool -L "$binary" | grep -F '/Metal.framework/' >/dev/null || otool -l "$binary" | grep -F '/Metal.framework/' >/dev/null; then echo "CPU/UI binary must not load Metal.framework: $binary" >&2; exit 1; fi
   codesign --verify --strict --verbose=2 "$binary"
@@ -137,8 +137,8 @@ while IFS= read -r entry; do
   [[ "$(cat "$files_file")" == "$expected_pack_files" ]] || { echo 'macOS Metal pack contains auxiliary payload.' >&2; exit 1; }
   rm -f "$files_file"
   worker="$resources/$root/$worker_relative"; [[ -f "$worker" ]] || { echo 'catalog worker is absent.' >&2; exit 1; }
-  lipo -verify_arch "$pack_lipo_arch" "$worker"
-  [[ "$(lipo -archs "$worker")" == "$pack_lipo_arch" ]] || { echo 'catalog Metal worker contains an unexpected Mach-O slice.' >&2; exit 1; }
+  lipo "$worker" -verify_arch "$pack_lipo_arch"
+  [[ "$(lipo "$worker" -archs)" == "$pack_lipo_arch" ]] || { echo 'catalog Metal worker contains an unexpected Mach-O slice.' >&2; exit 1; }
   otool -L "$worker" | grep -F '/Metal.framework/' >/dev/null || { echo 'catalog Metal worker does not link Metal.framework.' >&2; exit 1; }
   otool -l "$worker" | grep -F '/Metal.framework/' >/dev/null || { echo 'catalog Metal worker has no Metal load command.' >&2; exit 1; }
   codesign --verify --strict --verbose=2 "$worker"
