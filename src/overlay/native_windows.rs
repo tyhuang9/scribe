@@ -62,7 +62,7 @@ use crate::transcription::SessionId;
 use self::{
     accessibility::{CANCEL_RECORDING_LABEL, NativeAccessibility},
     raster::{LayeredFrame, NativeRasterizer},
-    transition::{FRAME_INTERVAL, OverlayTransitionEngine, RenderPlan},
+    transition::{FRAME_INTERVAL, OverlayTransitionEngine, RenderPlan, TransitionStep},
 };
 
 const DISPLAY_CLASS_NAME: &str = "Scribe.NativeOverlay.Display";
@@ -426,6 +426,12 @@ impl ControlActionBridge {
         }
     }
 
+    fn is_bound(&self) -> bool {
+        self.session_id
+            .lock()
+            .is_ok_and(|session_id| session_id.is_some())
+    }
+
     fn emit_abandon(&self) {
         let session_id = self.session_id.lock().ok().and_then(|current| *current);
         if let Some(session_id) = session_id {
@@ -454,6 +460,12 @@ impl WindowProcedureState {
 
     fn cancel_press(&self) {
         self.pressed.set(false);
+    }
+
+    fn control_enabled(&self) -> bool {
+        self.action_bridge
+            .as_ref()
+            .is_some_and(|bridge| bridge.is_bound())
     }
 }
 
@@ -983,24 +995,33 @@ impl NativeOverlayHost {
                     Some(WindowRole::Display),
                 )
             })?;
-        if let Some(plan) = plan
-            && let Some(previous) = &plan.previous
-            && previous.state.mode == snapshot.state.mode
-        {
-            let previous_frame = self
-                .rasterizer
-                .render_display(
-                    &previous.state,
-                    previous.dark_mode,
-                    display_bounds.width,
-                    display_bounds.height,
-                )
-                .map_err(|_| {
-                    NativeOverlayFailure::new(
-                        NativeOverlayFailureStage::Rasterization,
-                        Some(WindowRole::Display),
+        if let Some(plan) = plan {
+            let previous_frame = if let Some(previous) = &plan.previous
+                && previous.state.mode == snapshot.state.mode
+            {
+                self.rasterizer
+                    .render_display(
+                        &previous.state,
+                        previous.dark_mode,
+                        display_bounds.width,
+                        display_bounds.height,
                     )
-                })?;
+                    .map_err(|_| {
+                        NativeOverlayFailure::new(
+                            NativeOverlayFailureStage::Rasterization,
+                            Some(WindowRole::Display),
+                        )
+                    })?
+            } else {
+                LayeredFrame::transparent(display_bounds.width, display_bounds.height).map_err(
+                    |_| {
+                        NativeOverlayFailure::new(
+                            NativeOverlayFailureStage::Rasterization,
+                            Some(WindowRole::Display),
+                        )
+                    },
+                )?
+            };
             display_frame = LayeredFrame::crossfade(
                 &previous_frame,
                 &display_frame,
@@ -1516,11 +1537,8 @@ unsafe fn native_overlay_wnd_proc_inner(
             result.unwrap_or_else(|| unsafe { DefWindowProcW(hwnd, message, wparam, lparam) })
         }
         WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,
-        WM_NCHITTEST => match state.role {
-            WindowRole::Display => HTTRANSPARENT as LRESULT,
-            WindowRole::Control => HTCLIENT as LRESULT,
-        },
-        WM_LBUTTONDOWN if state.role == WindowRole::Control => {
+        WM_NCHITTEST => control_hit_test(state.role, state.control_enabled()),
+        WM_LBUTTONDOWN if state.role == WindowRole::Control && state.control_enabled() => {
             state.pressed.set(true);
             unsafe {
                 SetCapture(hwnd);
@@ -1555,6 +1573,14 @@ unsafe fn native_overlay_wnd_proc_inner(
             DefWindowProcW(hwnd, message, wparam, lparam)
         },
         _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
+    }
+}
+
+fn control_hit_test(role: WindowRole, control_enabled: bool) -> LRESULT {
+    match role {
+        WindowRole::Display => HTTRANSPARENT as LRESULT,
+        WindowRole::Control if control_enabled => HTCLIENT as LRESULT,
+        WindowRole::Control => HTTRANSPARENT as LRESULT,
     }
 }
 
@@ -1756,46 +1782,61 @@ fn run_native_overlay_thread(mailbox: Arc<SnapshotMailbox>, event_sink: NativeEv
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
         if let Some(snapshot) = next_snapshot {
+            let step = transitions.advance(snapshot.clone(), Instant::now(), !animations_enabled);
+            let hidden = matches!(step, TransitionStep::Hidden);
             current_snapshot = Some(snapshot);
-            process_snapshot(
+            process_transition_step(
                 &mut host,
                 current_snapshot.as_ref().expect("snapshot stored"),
                 &event_sink,
                 &mut last_presented,
                 &mut last_failure,
                 animations_enabled,
-                transitions.advance(
-                    current_snapshot.clone(),
-                    Instant::now(),
-                    !animations_enabled,
-                ),
+                step,
             );
+            if hidden {
+                current_snapshot = None;
+            }
         }
 
         let now = Instant::now();
-        if let Some(plan) = transitions.tick(now, !animations_enabled)
-            && let Some(snapshot) = current_snapshot.as_ref()
-            && (plan.animated
-                || (animations_enabled
-                    && snapshot.requested_visible
-                    && matches!(
-                        snapshot.state.phase,
-                        super::controller::OverlayPhase::Listening
-                            | super::controller::OverlayPhase::Preparing
-                            | super::controller::OverlayPhase::Finalizing
-                            | super::controller::OverlayPhase::Processing
-                            | super::controller::OverlayPhase::Pasting
-                    )))
-        {
-            process_snapshot(
-                &mut host,
-                snapshot,
-                &event_sink,
-                &mut last_presented,
-                &mut last_failure,
-                animations_enabled,
-                Some(plan),
-            );
+        if let Some(snapshot) = current_snapshot.as_ref() {
+            let step = transitions.tick(now, !animations_enabled);
+            let hidden = matches!(step, TransitionStep::Hidden);
+            let progress_active = animations_enabled
+                && snapshot.requested_visible
+                && matches!(
+                    snapshot.state.phase,
+                    super::controller::OverlayPhase::Listening
+                        | super::controller::OverlayPhase::Preparing
+                        | super::controller::OverlayPhase::Finalizing
+                        | super::controller::OverlayPhase::Processing
+                        | super::controller::OverlayPhase::Pasting
+                );
+            if matches!(step, TransitionStep::Idle) && progress_active {
+                process_snapshot(
+                    &mut host,
+                    snapshot,
+                    &event_sink,
+                    &mut last_presented,
+                    &mut last_failure,
+                    animations_enabled,
+                    None,
+                );
+            } else if !matches!(step, TransitionStep::Idle) {
+                process_transition_step(
+                    &mut host,
+                    snapshot,
+                    &event_sink,
+                    &mut last_presented,
+                    &mut last_failure,
+                    animations_enabled,
+                    step,
+                );
+            }
+            if hidden {
+                current_snapshot = None;
+            }
         }
 
         if now.duration_since(last_health_check) >= OVERLAY_HEALTH_INTERVAL {
@@ -1828,6 +1869,35 @@ fn run_native_overlay_thread(mailbox: Arc<SnapshotMailbox>, event_sink: NativeEv
     }
     pump_overlay_messages();
     emit_presented_if_changed(&event_sink, false, None, &mut last_presented);
+}
+
+fn process_transition_step(
+    host: &mut Option<NativeOverlayHost>,
+    snapshot: &OverlaySnapshot,
+    event_sink: &NativeEventSink,
+    last_presented: &mut Option<(bool, Option<SessionId>)>,
+    last_failure: &mut Option<NativeOverlayFailure>,
+    animations_enabled: bool,
+    step: TransitionStep,
+) {
+    match step {
+        TransitionStep::Render(plan) => process_snapshot(
+            host,
+            snapshot,
+            event_sink,
+            last_presented,
+            last_failure,
+            animations_enabled,
+            Some(plan),
+        ),
+        TransitionStep::Hidden => {
+            if let Some(host) = host.as_mut() {
+                host.hide();
+            }
+            emit_presented_if_changed(event_sink, false, None, last_presented);
+        }
+        TransitionStep::Idle => {}
+    }
 }
 
 fn process_snapshot(
@@ -2339,6 +2409,22 @@ mod tests {
         bridge.emit_abandon();
         assert!(retained_action.lock().unwrap().is_none());
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn disabled_cancel_surface_is_click_through_while_its_bounds_are_reserved() {
+        assert_eq!(
+            control_hit_test(WindowRole::Control, false),
+            HTTRANSPARENT as LRESULT
+        );
+        assert_eq!(
+            control_hit_test(WindowRole::Control, true),
+            HTCLIENT as LRESULT
+        );
+        assert_eq!(
+            control_hit_test(WindowRole::Display, false),
+            HTTRANSPARENT as LRESULT
+        );
     }
 
     #[test]
