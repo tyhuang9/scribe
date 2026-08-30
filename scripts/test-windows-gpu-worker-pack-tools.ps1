@@ -83,14 +83,125 @@ $prepareSource = Get-Content -LiteralPath $prepareScript -Raw
 Assert-True `
     (-not $prepareSource.Contains('-CargoTargetDirectory')) `
     'Production pack preparation must let each builder allocate its fresh isolated LocalApplicationData target.'
+$buildSource = Get-Content -LiteralPath $buildScript -Raw
+Assert-True `
+    (-not $buildSource.Contains('visual_studio_installation_version')) `
+    'GPU pack builds must pin compiler payloads instead of the mutable Visual Studio shell version.'
+foreach ($requiredToolchainBinding in @(
+    'preferred_component_id',
+    'toolset_version',
+    'windows_sdk_version',
+    'Invoke-PinnedVcVarsEnvironment',
+    'Assert-PinnedMsvcTool',
+    'CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER',
+    "CMAKE_GENERATOR'] = 'NMake Makefiles'"
+)) {
+    Assert-True `
+        ($buildSource.Contains($requiredToolchainBinding)) `
+        "GPU pack build lost exact toolchain binding: $requiredToolchainBinding"
+}
 
 $toolchainOutput = Join-Path ([System.IO.Path]::GetTempPath()) 'scribe-gpu-toolchain-check-unused'
+$toolchainEnvironmentNames = @(
+    'Path', 'INCLUDE', 'LIB', 'LIBPATH', 'VCINSTALLDIR',
+    'VCToolsInstallDir', 'VCToolsVersion', 'VSINSTALLDIR',
+    'WindowsSdkDir', 'WindowsSDKVersion', 'WindowsSdkBinPath',
+    'WindowsSdkVerBinPath', 'UniversalCRTSdkDir', 'UCRTVersion',
+    'Platform', 'VSCMD_ARG_HOST_ARCH', 'VSCMD_ARG_TGT_ARCH',
+    'VSCMD_ARG_VCVARS_VER', 'VSCMD_ARG_winsdk', 'CC', 'CXX', 'AR',
+    'CC_x86_64_pc_windows_msvc', 'CXX_x86_64_pc_windows_msvc',
+    'AR_x86_64_pc_windows_msvc', 'CMAKE_C_COMPILER',
+    'CMAKE_CXX_COMPILER', 'CMAKE_LINKER', 'CMAKE_AR',
+    'CMAKE_MAKE_PROGRAM', 'CMAKE_GENERATOR',
+    'CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER'
+)
+$toolchainEnvironmentBefore = @{}
+foreach ($name in $toolchainEnvironmentNames) {
+    $value = Get-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue
+    $toolchainEnvironmentBefore[$name] = [pscustomobject]@{
+        Exists = $null -ne $value
+        Value = if ($null -eq $value) { $null } else { [string]$value.Value }
+    }
+}
 & $buildScript `
     -Backend Vulkan `
     -PackVersion '0.1.0-fixture' `
     -OutputDirectory $toolchainOutput `
     -SigningMode Fixture `
     -ToolchainCheckOnly | Out-Null
+foreach ($name in $toolchainEnvironmentNames) {
+    $before = $toolchainEnvironmentBefore[$name]
+    $after = Get-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue
+    Assert-True `
+        (($null -ne $after) -eq $before.Exists) `
+        "Toolchain-only validation changed whether process environment variable $name exists."
+    if ($before.Exists) {
+        Assert-True `
+            ([string]$after.Value -ceq [string]$before.Value) `
+            "Toolchain-only validation changed process environment variable $name."
+    }
+}
+
+$toolchainManifest = Join-Path $repositoryRoot 'runtime-manifests\gpu-worker-toolchain-windows-x64.json'
+$toolchainFixtureRoot = Join-Path `
+    ([System.IO.Path]::GetTempPath()) `
+    "scribe-toolchain-contract-$([guid]::NewGuid().ToString('N'))"
+New-Item -ItemType Directory -Path $toolchainFixtureRoot | Out-Null
+try {
+    $wrongHashContract = Get-Content -LiteralPath $toolchainManifest -Raw | ConvertFrom-Json
+    $wrongHashContract.msvc.tools.cl.sha256 = '0' * 64
+    $wrongHashPath = Join-Path $toolchainFixtureRoot 'wrong-cl-hash.json'
+    [System.IO.File]::WriteAllText(
+        $wrongHashPath,
+        ($wrongHashContract | ConvertTo-Json -Depth 16),
+        [System.Text.UTF8Encoding]::new($false)
+    )
+    $wrongHashRejected = $false
+    try {
+        & $buildScript `
+            -Backend Vulkan `
+            -PackVersion '0.1.0-fixture' `
+            -OutputDirectory $toolchainOutput `
+            -SigningMode Fixture `
+            -ToolchainManifestPath $wrongHashPath `
+            -ToolchainCheckOnly | Out-Null
+    }
+    catch {
+        $wrongHashRejected = $_.Exception.Message.Contains(
+            'Pinned MSVC compiler SHA-256 mismatch'
+        )
+    }
+    Assert-True $wrongHashRejected 'Wrong pinned compiler identity was not rejected.'
+
+    $wrongComponentContract = Get-Content -LiteralPath $toolchainManifest -Raw | ConvertFrom-Json
+    $wrongComponentContract.msvc.preferred_component_id = `
+        'Microsoft.VisualStudio.Component.VC.14.43.17.13.x86.x64'
+    $wrongComponentPath = Join-Path $toolchainFixtureRoot 'wrong-component.json'
+    [System.IO.File]::WriteAllText(
+        $wrongComponentPath,
+        ($wrongComponentContract | ConvertTo-Json -Depth 16),
+        [System.Text.UTF8Encoding]::new($false)
+    )
+    $wrongComponentRejected = $false
+    try {
+        & $buildScript `
+            -Backend Vulkan `
+            -PackVersion '0.1.0-fixture' `
+            -OutputDirectory $toolchainOutput `
+            -SigningMode Fixture `
+            -ToolchainManifestPath $wrongComponentPath `
+            -ToolchainCheckOnly | Out-Null
+    }
+    catch {
+        $wrongComponentRejected = $_.Exception.Message.Contains(
+            'violates the reviewed Windows x64 static-runtime contract'
+        )
+    }
+    Assert-True $wrongComponentRejected 'Wrong MSVC compatibility component was not rejected.'
+}
+finally {
+    Remove-Item -LiteralPath $toolchainFixtureRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
 
 $productionArgumentsFailedClosed = $false
 try {

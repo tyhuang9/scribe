@@ -281,6 +281,545 @@ function Get-CommandPath([string]$Name, [string]$FailureMessage) {
     return $command.Source
 }
 
+function Assert-PhysicalDirectory([string]$Path, [string]$Label) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
+        throw "$Label is missing: $Path"
+    }
+    Assert-NoReparseAncestors $Path
+    $item = Get-Item -LiteralPath $Path -Force
+    if (-not $item.PSIsContainer -or
+        ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "$Label must be a physical directory: $Path"
+    }
+    return $item
+}
+
+function Get-PinnedMsvcVsWhereArguments([string]$ComponentId) {
+    if ($ComponentId -cnotmatch '^Microsoft\.VisualStudio\.Component\.VC\.[A-Za-z0-9.]+\.x86\.x64$') {
+        throw 'MSVC component ID is not canonical.'
+    }
+    return @(
+        '-all', '-products', '*', '-requires', $ComponentId,
+        '-property', 'installationPath'
+    )
+}
+
+function ConvertFrom-VsWhereInstallationPaths([string]$Output, [string]$ComponentId) {
+    if ($Output.Length -gt 32768) {
+        throw "Visual Studio locator output for $ComponentId is oversized."
+    }
+    $paths = [System.Collections.Generic.List[string]]::new()
+    foreach ($line in @($Output -split "`r?`n")) {
+        if ([string]::IsNullOrWhiteSpace($line)) {
+            continue
+        }
+        $candidate = $line.Trim()
+        if ($candidate.Length -gt 240 -or
+            -not [System.IO.Path]::IsPathFullyQualified($candidate) -or
+            $candidate -cnotmatch '^[A-Za-z]:[\\/]' -or
+            $candidate.IndexOfAny([char[]]@('"', '&', '|', '<', '>', '^', '%', '!', "`r", "`n")) -ge 0) {
+            throw "Visual Studio locator returned an unsafe installation path for $ComponentId."
+        }
+        $paths.Add((Get-NormalizedFullPath $candidate))
+        if ($paths.Count -gt 16) {
+            throw "Visual Studio locator returned too many installations for $ComponentId."
+        }
+    }
+    if ($paths.Count -eq 0) {
+        return
+    }
+    return $paths.ToArray()
+}
+
+function Assert-PinnedMsvcTool(
+    [string]$Path,
+    [psobject]$Expected,
+    [string]$Label
+) {
+    Assert-ExactProperties $Expected @('filename', 'file_version', 'sha256') "$Label identity contract"
+    if ([string]$Expected.filename -cnotmatch '^[a-z]+\.exe$' -or
+        [string]$Expected.file_version -cnotmatch '^\d+\.\d+\.\d+\.\d+$' -or
+        [string]$Expected.sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        -not [string]::Equals(
+            (Split-Path -Leaf $Path),
+            [string]$Expected.filename,
+            [System.StringComparison]::OrdinalIgnoreCase
+        )) {
+        throw "$Label identity contract is not canonical."
+    }
+    Assert-NoReparseAncestors $Path
+    $item = Assert-RegularNonReparseFile $Path $Label
+    if ([string]$item.VersionInfo.FileVersion -cne [string]$Expected.file_version) {
+        throw "$Label file version mismatch: expected $($Expected.file_version), found $($item.VersionInfo.FileVersion)."
+    }
+    Assert-ExactHash $Path ([string]$Expected.sha256) $Label
+    return Get-NormalizedFullPath $Path
+}
+
+function ConvertFrom-VcVarsEnvironmentOutput([string]$Output) {
+    if ($Output.Length -gt 1048576) {
+        throw 'vcvarsall returned an oversized environment.'
+    }
+    $environment = [System.Collections.Generic.Dictionary[string, string]]::new(
+        [System.StringComparer]::OrdinalIgnoreCase
+    )
+    foreach ($line in @($Output -split "`r?`n")) {
+        if ([string]::IsNullOrWhiteSpace($line) -or $line.StartsWith('=')) {
+            continue
+        }
+        $separator = $line.IndexOf('=')
+        if ($separator -lt 1) {
+            throw 'vcvarsall returned a malformed environment line.'
+        }
+        $name = $line.Substring(0, $separator)
+        $value = $line.Substring($separator + 1)
+        if ($name -cnotmatch '^[^=\x00-\x1f]{1,255}$' -or
+            $value.Length -gt 32767 -or
+            $value.IndexOfAny([char[]]@("`0", "`r", "`n")) -ge 0 -or
+            -not $environment.TryAdd($name, $value)) {
+            throw 'vcvarsall returned a malformed or duplicate environment variable.'
+        }
+        if ($environment.Count -gt 4096) {
+            throw 'vcvarsall returned too many environment variables.'
+        }
+    }
+    return ,$environment
+}
+
+function Get-RequiredEnvironmentValue(
+    [System.Collections.Generic.Dictionary[string, string]]$Environment,
+    [string]$Name
+) {
+    if (-not $Environment.ContainsKey($Name) -or
+        [string]::IsNullOrWhiteSpace($Environment[$Name])) {
+        throw "vcvarsall did not set required environment variable $Name."
+    }
+    return $Environment[$Name]
+}
+
+function Assert-ExactEnvironmentText(
+    [System.Collections.Generic.Dictionary[string, string]]$Environment,
+    [string]$Name,
+    [string]$Expected
+) {
+    $actual = Get-RequiredEnvironmentValue $Environment $Name
+    if ($actual -cne $Expected) {
+        throw "vcvarsall selected unexpected ${Name}: expected $Expected, found $actual."
+    }
+}
+
+function Assert-ExactEnvironmentPath(
+    [System.Collections.Generic.Dictionary[string, string]]$Environment,
+    [string]$Name,
+    [string]$Expected
+) {
+    $actual = Get-NormalizedFullPath (Get-RequiredEnvironmentValue $Environment $Name)
+    if (-not [string]::Equals(
+        $actual,
+        (Get-NormalizedFullPath $Expected),
+        [System.StringComparison]::OrdinalIgnoreCase
+    )) {
+        throw "vcvarsall selected an unexpected path for $Name."
+    }
+}
+
+function Get-EnvironmentPathEntries(
+    [System.Collections.Generic.Dictionary[string, string]]$Environment,
+    [string]$Name
+) {
+    $entries = [System.Collections.Generic.List[string]]::new()
+    foreach ($entry in @((Get-RequiredEnvironmentValue $Environment $Name) -split ';')) {
+        if (-not [string]::IsNullOrWhiteSpace($entry)) {
+            $entries.Add((Get-NormalizedFullPath $entry.Trim()))
+        }
+    }
+    if ($entries.Count -eq 0 -or $entries.Count -gt 256) {
+        throw "vcvarsall returned an invalid $Name path list."
+    }
+    return $entries.ToArray()
+}
+
+function Assert-EnvironmentPathListContains(
+    [System.Collections.Generic.Dictionary[string, string]]$Environment,
+    [string]$Name,
+    [string]$Expected
+) {
+    $normalizedExpected = Get-NormalizedFullPath $Expected
+    $found = @(
+        Get-EnvironmentPathEntries $Environment $Name | Where-Object {
+            [string]::Equals(
+                $_,
+                $normalizedExpected,
+                [System.StringComparison]::OrdinalIgnoreCase
+            )
+        }
+    ).Count -eq 1
+    if (-not $found) {
+        throw "vcvarsall $Name does not contain the exact required path: $normalizedExpected"
+    }
+}
+
+function Resolve-EnvironmentExecutable(
+    [System.Collections.Generic.Dictionary[string, string]]$Environment,
+    [string]$Filename
+) {
+    foreach ($directory in @(Get-EnvironmentPathEntries $Environment 'Path')) {
+        $candidate = Join-Path $directory $Filename
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+            $null = Assert-RegularNonReparseFile $candidate "vcvarsall-selected $Filename"
+            return Get-NormalizedFullPath $candidate
+        }
+    }
+    throw "vcvarsall PATH does not resolve $Filename."
+}
+
+function Invoke-PinnedVcVarsEnvironment(
+    [string]$VcVarsAll,
+    [string]$WindowsSdkVersion,
+    [string]$ToolsetVersion
+) {
+    foreach ($version in @($WindowsSdkVersion, $ToolsetVersion)) {
+        if ($version -cnotmatch '^\d+(?:\.\d+){2,3}$') {
+            throw 'vcvarsall selection contains a noncanonical version.'
+        }
+    }
+    if ($VcVarsAll.IndexOfAny([char[]]@('"', '&', '|', '<', '>', '^', '%', '!', "`r", "`n")) -ge 0) {
+        throw 'vcvarsall path contains a command-shell metacharacter.'
+    }
+    $windowsRoot = [System.Environment]::GetFolderPath(
+        [System.Environment+SpecialFolder]::Windows
+    )
+    $commandProcessor = Join-Path $windowsRoot 'System32\cmd.exe'
+    $null = Assert-RegularNonReparseFile $commandProcessor 'Windows command processor'
+    $commandLine = '/d /s /c ""{0}" x64 {1} -vcvars_ver={2} >nul && set"' -f `
+        $VcVarsAll, $WindowsSdkVersion, $ToolsetVersion
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $commandProcessor
+    $startInfo.Arguments = $commandLine
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    foreach ($name in @($startInfo.Environment.Keys)) {
+        if ($name.StartsWith('VSCMD_', [System.StringComparison]::OrdinalIgnoreCase)) {
+            $null = $startInfo.Environment.Remove($name)
+        }
+    }
+    foreach ($name in @(
+        'CC', 'CXX', 'AR', 'CL', '_CL_', 'LINK', 'LIB', 'LIBPATH', 'INCLUDE',
+        'VCINSTALLDIR', 'VCToolsInstallDir', 'VCToolsVersion', 'VSINSTALLDIR',
+        'WindowsSdkDir', 'WindowsSDKVersion', 'WindowsSdkBinPath',
+        'WindowsSdkVerBinPath', 'UniversalCRTSdkDir', 'UCRTVersion'
+    )) {
+        $null = $startInfo.Environment.Remove($name)
+    }
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    try {
+        if (-not $process.Start()) {
+            throw 'Could not start the pinned vcvarsall environment probe.'
+        }
+        $stdout = $process.StandardOutput.ReadToEndAsync()
+        $stderr = $process.StandardError.ReadToEndAsync()
+        if (-not $process.WaitForExit(30000)) {
+            $process.Kill($true)
+            throw 'Pinned vcvarsall environment probe timed out.'
+        }
+        $output = $stdout.GetAwaiter().GetResult()
+        $errorOutput = $stderr.GetAwaiter().GetResult()
+        if ($process.ExitCode -ne 0) {
+            throw "Pinned vcvarsall environment probe failed with exit code $($process.ExitCode): $($errorOutput.Trim())"
+        }
+        return ConvertFrom-VcVarsEnvironmentOutput $output
+    }
+    finally {
+        $process.Dispose()
+    }
+}
+
+function Assert-PinnedMsvcEnvironment(
+    [System.Collections.Generic.Dictionary[string, string]]$Environment,
+    [string]$InstallationPath,
+    [string]$ToolRoot,
+    [psobject]$Tools,
+    [string]$WindowsSdkRoot,
+    [string]$WindowsSdkVersion
+) {
+    Assert-ExactEnvironmentPath $Environment 'VSINSTALLDIR' $InstallationPath
+    Assert-ExactEnvironmentPath $Environment 'VCINSTALLDIR' (Join-Path $InstallationPath 'VC')
+    Assert-ExactEnvironmentPath $Environment 'VCToolsInstallDir' $ToolRoot
+    Assert-ExactEnvironmentText $Environment 'VCToolsVersion' (Split-Path -Leaf $ToolRoot)
+    Assert-ExactEnvironmentPath $Environment 'WindowsSdkDir' $WindowsSdkRoot
+    Assert-ExactEnvironmentPath $Environment 'UniversalCRTSdkDir' $WindowsSdkRoot
+    Assert-ExactEnvironmentText $Environment 'WindowsSDKVersion' "$WindowsSdkVersion\"
+    Assert-ExactEnvironmentText $Environment 'UCRTVersion' $WindowsSdkVersion
+    Assert-ExactEnvironmentPath $Environment 'WindowsSdkBinPath' (Join-Path $WindowsSdkRoot 'bin')
+    Assert-ExactEnvironmentPath $Environment 'WindowsSdkVerBinPath' (Join-Path $WindowsSdkRoot "bin\$WindowsSdkVersion")
+    foreach ($selection in @(
+        @('Platform', 'x64'),
+        @('VSCMD_ARG_HOST_ARCH', 'x64'),
+        @('VSCMD_ARG_TGT_ARCH', 'x64'),
+        @('VSCMD_ARG_VCVARS_VER', (Split-Path -Leaf $ToolRoot)),
+        @('VSCMD_ARG_winsdk', $WindowsSdkVersion)
+    )) {
+        Assert-ExactEnvironmentText $Environment $selection[0] $selection[1]
+    }
+
+    $toolBin = Get-NormalizedFullPath (Split-Path -Parent $Tools.Cl)
+    $pathEntries = @(Get-EnvironmentPathEntries $Environment 'Path')
+    if (-not [string]::Equals(
+        $pathEntries[0],
+        $toolBin,
+        [System.StringComparison]::OrdinalIgnoreCase
+    )) {
+        throw 'vcvarsall did not place the exact pinned MSVC binary directory first on PATH.'
+    }
+    foreach ($toolName in @('Cl', 'Link', 'Lib', 'NMake')) {
+        $expected = [string]$Tools.$toolName
+        $resolved = Resolve-EnvironmentExecutable $Environment (Split-Path -Leaf $expected)
+        if (-not [string]::Equals(
+            $resolved,
+            $expected,
+            [System.StringComparison]::OrdinalIgnoreCase
+        )) {
+            throw "vcvarsall resolved an unexpected $toolName executable."
+        }
+    }
+
+    foreach ($directory in @(
+        (Join-Path $ToolRoot 'include'),
+        (Join-Path $ToolRoot 'lib\x64'),
+        (Join-Path $WindowsSdkRoot "bin\$WindowsSdkVersion\x64"),
+        (Join-Path $WindowsSdkRoot "include\$WindowsSdkVersion\ucrt"),
+        (Join-Path $WindowsSdkRoot "include\$WindowsSdkVersion\um"),
+        (Join-Path $WindowsSdkRoot "include\$WindowsSdkVersion\shared"),
+        (Join-Path $WindowsSdkRoot "include\$WindowsSdkVersion\winrt"),
+        (Join-Path $WindowsSdkRoot "include\$WindowsSdkVersion\cppwinrt"),
+        (Join-Path $WindowsSdkRoot "lib\$WindowsSdkVersion\ucrt\x64"),
+        (Join-Path $WindowsSdkRoot "lib\$WindowsSdkVersion\um\x64")
+    )) {
+        $null = Assert-PhysicalDirectory $directory 'Pinned MSVC/Windows SDK directory'
+    }
+    foreach ($directory in @(
+        (Join-Path $ToolRoot 'include'),
+        (Join-Path $WindowsSdkRoot "include\$WindowsSdkVersion\ucrt"),
+        (Join-Path $WindowsSdkRoot "include\$WindowsSdkVersion\um"),
+        (Join-Path $WindowsSdkRoot "include\$WindowsSdkVersion\shared"),
+        (Join-Path $WindowsSdkRoot "include\$WindowsSdkVersion\winrt"),
+        (Join-Path $WindowsSdkRoot "include\$WindowsSdkVersion\cppwinrt")
+    )) {
+        Assert-EnvironmentPathListContains $Environment 'INCLUDE' $directory
+    }
+    foreach ($directory in @(
+        (Join-Path $ToolRoot 'lib\x64'),
+        (Join-Path $WindowsSdkRoot "lib\$WindowsSdkVersion\ucrt\x64"),
+        (Join-Path $WindowsSdkRoot "lib\$WindowsSdkVersion\um\x64")
+    )) {
+        Assert-EnvironmentPathListContains $Environment 'LIB' $directory
+    }
+}
+
+function Resolve-PinnedMsvcToolchain($Contract) {
+    $vswhere = 'C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe'
+    Assert-NoReparseAncestors $vswhere
+    $null = Assert-RegularNonReparseFile $vswhere 'Visual Studio locator'
+    $componentIds = @(
+        [string]$Contract.msvc.preferred_component_id,
+        [string]$Contract.msvc.fallback_discovery_component_id
+    )
+    $candidateComponents = [System.Collections.Generic.Dictionary[string, string]]::new(
+        [System.StringComparer]::OrdinalIgnoreCase
+    )
+    foreach ($componentId in $componentIds) {
+        $arguments = @(Get-PinnedMsvcVsWhereArguments $componentId)
+        $output = (Invoke-NativeProcess $vswhere $arguments "Could not query Visual Studio component $componentId.").Stdout
+        foreach ($path in @(ConvertFrom-VsWhereInstallationPaths $output $componentId)) {
+            if ([string]::IsNullOrWhiteSpace([string]$path)) {
+                continue
+            }
+            if (-not $candidateComponents.ContainsKey($path)) {
+                $candidateComponents.Add($path, $componentId)
+            }
+        }
+    }
+    if ($candidateComponents.Count -eq 0) {
+        throw 'No Visual Studio installation exposes the reviewed MSVC compatibility or discovery component.'
+    }
+
+    $failures = [System.Collections.Generic.List[string]]::new()
+    foreach ($installationPath in @($candidateComponents.Keys | Sort-Object)) {
+        try {
+            $null = Assert-PhysicalDirectory $installationPath 'Visual Studio installation'
+            $vcvars = Join-Path $installationPath 'VC\Auxiliary\Build\vcvarsall.bat'
+            Assert-NoReparseAncestors $vcvars
+            $null = Assert-RegularNonReparseFile $vcvars 'Visual Studio vcvarsall'
+            $toolRoot = Get-NormalizedFullPath (
+                Join-Path $installationPath "VC\Tools\MSVC\$($Contract.msvc.toolset_version)"
+            )
+            $toolBin = Join-Path $toolRoot 'bin\Hostx64\x64'
+            $null = Assert-PhysicalDirectory $toolBin 'Pinned MSVC x64 tool directory'
+            $toolContracts = $Contract.msvc.tools
+            Assert-ExactProperties $toolContracts @('cl', 'link', 'lib', 'nmake') 'MSVC tool identity contract'
+            $tools = [pscustomobject]@{
+                Cl = Assert-PinnedMsvcTool (Join-Path $toolBin ([string]$toolContracts.cl.filename)) $toolContracts.cl 'Pinned MSVC compiler'
+                Link = Assert-PinnedMsvcTool (Join-Path $toolBin ([string]$toolContracts.link.filename)) $toolContracts.link 'Pinned MSVC linker'
+                Lib = Assert-PinnedMsvcTool (Join-Path $toolBin ([string]$toolContracts.lib.filename)) $toolContracts.lib 'Pinned MSVC librarian'
+                NMake = Assert-PinnedMsvcTool (Join-Path $toolBin ([string]$toolContracts.nmake.filename)) $toolContracts.nmake 'Pinned MSVC build driver'
+            }
+            $sdkRoot = Get-NormalizedFullPath (([string]$Contract.msvc.windows_sdk_root).Replace('/', '\'))
+            $null = Assert-PhysicalDirectory $sdkRoot 'Pinned Windows SDK root'
+            $environment = Invoke-PinnedVcVarsEnvironment `
+                $vcvars `
+                ([string]$Contract.msvc.windows_sdk_version) `
+                ([string]$Contract.msvc.toolset_version)
+            Assert-PinnedMsvcEnvironment `
+                $environment `
+                $installationPath `
+                $toolRoot `
+                $tools `
+                $sdkRoot `
+                ([string]$Contract.msvc.windows_sdk_version)
+            $buildEnvironment = [ordered]@{}
+            foreach ($name in @(
+                'Path', 'INCLUDE', 'LIB', 'LIBPATH', 'VCINSTALLDIR',
+                'VCToolsInstallDir', 'VCToolsVersion', 'VSINSTALLDIR',
+                'WindowsSdkDir', 'WindowsSDKVersion', 'WindowsSdkBinPath',
+                'WindowsSdkVerBinPath', 'UniversalCRTSdkDir', 'UCRTVersion',
+                'Platform', 'VSCMD_ARG_HOST_ARCH', 'VSCMD_ARG_TGT_ARCH',
+                'VSCMD_ARG_VCVARS_VER', 'VSCMD_ARG_winsdk'
+            )) {
+                $buildEnvironment[$name] = Get-RequiredEnvironmentValue $environment $name
+            }
+            $buildEnvironment['CC'] = $tools.Cl
+            $buildEnvironment['CXX'] = $tools.Cl
+            $buildEnvironment['AR'] = $tools.Lib
+            $buildEnvironment['CC_x86_64_pc_windows_msvc'] = $tools.Cl
+            $buildEnvironment['CXX_x86_64_pc_windows_msvc'] = $tools.Cl
+            $buildEnvironment['AR_x86_64_pc_windows_msvc'] = $tools.Lib
+            $buildEnvironment['CMAKE_C_COMPILER'] = $tools.Cl
+            $buildEnvironment['CMAKE_CXX_COMPILER'] = $tools.Cl
+            $buildEnvironment['CMAKE_LINKER'] = $tools.Link
+            $buildEnvironment['CMAKE_AR'] = $tools.Lib
+            $buildEnvironment['CMAKE_MAKE_PROGRAM'] = $tools.NMake
+            $buildEnvironment['CMAKE_GENERATOR'] = 'NMake Makefiles'
+            $buildEnvironment['CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER'] = $tools.Link
+            return [pscustomobject]@{
+                InstallationPath = $installationPath
+                DiscoveryComponent = $candidateComponents[$installationPath]
+                ToolRoot = $toolRoot
+                Tools = $tools
+                WindowsSdkRoot = $sdkRoot
+                WindowsSdkVersion = [string]$Contract.msvc.windows_sdk_version
+                Environment = $environment
+                BuildEnvironment = $buildEnvironment
+            }
+        }
+        catch {
+            $failures.Add("$installationPath => $($_.Exception.Message)")
+        }
+    }
+    throw "No discovered Visual Studio installation passed the exact MSVC payload and vcvars contract: $($failures -join ' | ')"
+}
+
+function Set-PinnedMsvcBuildEnvironment($Toolchain) {
+    $previous = [System.Collections.Generic.List[psobject]]::new()
+    try {
+        foreach ($entry in $Toolchain.BuildEnvironment.GetEnumerator()) {
+            $current = Get-Item -LiteralPath "Env:$($entry.Key)" -ErrorAction SilentlyContinue
+            $previous.Add([pscustomobject]@{
+                Name = [string]$entry.Key
+                Exists = $null -ne $current
+                Value = if ($null -eq $current) { $null } else { [string]$current.Value }
+            })
+            [System.Environment]::SetEnvironmentVariable(
+                [string]$entry.Key,
+                [string]$entry.Value,
+                [System.EnvironmentVariableTarget]::Process
+            )
+        }
+        return ,$previous.ToArray()
+    }
+    catch {
+        Restore-ProcessEnvironment $previous.ToArray()
+        throw
+    }
+}
+
+function Restore-ProcessEnvironment([psobject[]]$Previous) {
+    foreach ($entry in @($Previous)) {
+        if ($entry.Exists) {
+            [System.Environment]::SetEnvironmentVariable(
+                [string]$entry.Name,
+                [string]$entry.Value,
+                [System.EnvironmentVariableTarget]::Process
+            )
+        }
+        else {
+            Remove-Item -LiteralPath "Env:$($entry.Name)" -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Assert-ActivePinnedMsvcEnvironment($Toolchain) {
+    $active = [System.Collections.Generic.Dictionary[string, string]]::new(
+        [System.StringComparer]::OrdinalIgnoreCase
+    )
+    foreach ($entry in $Toolchain.BuildEnvironment.GetEnumerator()) {
+        $value = [System.Environment]::GetEnvironmentVariable([string]$entry.Key, 'Process')
+        if ([string]::IsNullOrWhiteSpace($value)) {
+            throw "Pinned MSVC build environment is missing $($entry.Key)."
+        }
+        $active.Add([string]$entry.Key, $value)
+        if ($value -cne [string]$entry.Value) {
+            throw "Pinned MSVC build environment changed after activation: $($entry.Key)."
+        }
+    }
+    Assert-PinnedMsvcEnvironment `
+        $active `
+        $Toolchain.InstallationPath `
+        $Toolchain.ToolRoot `
+        $Toolchain.Tools `
+        $Toolchain.WindowsSdkRoot `
+        $Toolchain.WindowsSdkVersion
+    foreach ($toolName in @('Cl', 'Link', 'Lib', 'NMake')) {
+        $resolved = Get-CommandPath (Split-Path -Leaf $Toolchain.Tools.$toolName) "Pinned $toolName is not active."
+        if (-not [string]::Equals(
+            (Get-NormalizedFullPath $resolved),
+            [string]$Toolchain.Tools.$toolName,
+            [System.StringComparison]::OrdinalIgnoreCase
+        )) {
+            throw "Active process resolves an unexpected MSVC $toolName."
+        }
+    }
+}
+
+function Assert-NoAmbientToolchainOverrides {
+    $blocked = @(
+        'RUSTFLAGS', 'CARGO_ENCODED_RUSTFLAGS', 'CMAKE_ARGS', 'CFLAGS', 'CXXFLAGS',
+        'CC', 'CXX', 'AR', 'CL', '_CL_', 'LINK', 'LIB', 'LIBPATH', 'INCLUDE',
+        'CMAKE_C_COMPILER', 'CMAKE_CXX_COMPILER', 'CMAKE_LINKER', 'CMAKE_AR',
+        'CMAKE_MAKE_PROGRAM', 'CMAKE_GENERATOR', 'CMAKE_TOOLCHAIN_FILE',
+        'CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER',
+        'CC_x86_64_pc_windows_msvc', 'CXX_x86_64_pc_windows_msvc',
+        'AR_x86_64_pc_windows_msvc', 'VCINSTALLDIR', 'VCToolsInstallDir',
+        'VCToolsVersion', 'VSINSTALLDIR', 'WindowsSdkDir', 'WindowsSDKVersion',
+        'WindowsSdkBinPath', 'WindowsSdkVerBinPath', 'UniversalCRTSdkDir',
+        'UCRTVersion', 'NVCC_PREPEND_FLAGS', 'NVCC_APPEND_FLAGS'
+    )
+    foreach ($ambientName in $blocked) {
+        $ambient = Get-Item -LiteralPath "Env:$ambientName" -ErrorAction SilentlyContinue
+        if ($null -ne $ambient -and -not [string]::IsNullOrWhiteSpace([string]$ambient.Value)) {
+            throw "GPU worker release builds reject ambient toolchain override $ambientName."
+        }
+    }
+    foreach ($ambient in @(Get-ChildItem Env:)) {
+        if ($ambient.Name.StartsWith('VSCMD_', [System.StringComparison]::OrdinalIgnoreCase) -and
+            -not [string]::IsNullOrWhiteSpace([string]$ambient.Value)) {
+            throw "GPU worker release builds reject ambient toolchain override $($ambient.Name)."
+        }
+    }
+}
+
 function Assert-BaseToolchain($Contract, [string]$RepositoryRoot) {
     if ($env:OS -ne 'Windows_NT' -or
         -not [System.Environment]::Is64BitOperatingSystem -or
@@ -311,19 +850,7 @@ function Assert-BaseToolchain($Contract, [string]$RepositoryRoot) {
         throw "CMake does not match pinned version $($Contract.msvc.cmake_version)."
     }
 
-    $vswhere = 'C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe'
-    $null = Assert-RegularNonReparseFile $vswhere 'Visual Studio locator'
-    $vsArguments = @(
-        '-latest', '-products', '*',
-        '-requires', 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64'
-    )
-    $installationVersion = (Invoke-NativeProcess $vswhere ($vsArguments + @('-property', 'installationVersion')) 'Could not locate MSVC.').Stdout.Trim()
-    if ($installationVersion -cne [string]$Contract.msvc.visual_studio_installation_version) {
-        throw "Visual Studio build tools must be exactly $($Contract.msvc.visual_studio_installation_version); found $installationVersion."
-    }
-    $installationPath = (Invoke-NativeProcess $vswhere ($vsArguments + @('-property', 'installationPath')) 'Could not locate MSVC.').Stdout.Trim()
-    $toolset = Join-Path $installationPath "VC\Tools\MSVC\$($Contract.msvc.toolset_version)\bin\Hostx64\x64\cl.exe"
-    $null = Assert-RegularNonReparseFile $toolset 'Pinned MSVC compiler'
+    $msvcToolchain = Resolve-PinnedMsvcToolchain $Contract
 
     $cargoLockPath = Join-Path $RepositoryRoot 'Cargo.lock'
     $cargoLock = Get-Content -LiteralPath $cargoLockPath -Raw
@@ -364,6 +891,7 @@ function Assert-BaseToolchain($Contract, [string]$RepositoryRoot) {
             throw "Cargo.toml lost the pinned worker-only Vulkan identity dependency: $required"
         }
     }
+    return $msvcToolchain
 }
 
 function Resolve-VulkanSdk($Contract) {
@@ -493,14 +1021,23 @@ Assert-ExactProperties $contract @('schema_version', 'app_version', 'target_trip
 Assert-ExactProperties $contract.rust @('release', 'commit', 'host') 'Rust toolchain contract'
 Assert-ExactProperties $contract.native_source @('transcribe_cpp_version', 'transcribe_cpp_checksum', 'transcribe_cpp_sys_version', 'transcribe_cpp_sys_checksum', 'ash_version', 'ash_checksum', 'source_revision', 'sherpa_onnx_archive') 'Native source contract'
 Assert-ExactProperties $contract.native_source.sherpa_onnx_archive @('filename', 'size_bytes', 'sha256') 'Sherpa ONNX archive contract'
-Assert-ExactProperties $contract.msvc @('visual_studio_installation_version', 'toolset_version', 'platform_toolset', 'cmake_version', 'runtime', 'reproducible_flag') 'MSVC toolchain contract'
+Assert-ExactProperties $contract.msvc @('preferred_component_id', 'fallback_discovery_component_id', 'toolset_version', 'platform_toolset', 'windows_sdk_version', 'windows_sdk_root', 'tools', 'cmake_version', 'runtime', 'reproducible_flag') 'MSVC toolchain contract'
+Assert-ExactProperties $contract.msvc.tools @('cl', 'link', 'lib', 'nmake') 'MSVC tool identity contract'
+foreach ($toolName in @('cl', 'link', 'lib', 'nmake')) {
+    Assert-ExactProperties $contract.msvc.tools.$toolName @('filename', 'file_version', 'sha256') "MSVC $toolName identity contract"
+}
 Assert-ExactProperties $contract.build @('profile', 'static_cpu_scheduling', 'dynamic_backends', 'openmp') 'Worker build contract'
 Assert-ExactProperties $contract.vulkan @('sdk_version', 'provider', 'required_files', 'system_driver_imports', 'packaged_runtime_imports') 'Vulkan provider contract'
 Assert-ExactProperties $contract.cuda @('sdk_directory_version', 'nvcc_version', 'provider', 'cmake_architectures', 'required_files', 'system_driver_imports', 'packaged_runtime_imports') 'CUDA provider contract'
 if ($contract.schema_version -ne 1 -or
     $contract.app_version -cnotmatch '^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$' -or
     $contract.target_triple -cne 'x86_64-pc-windows-msvc' -or
+    $contract.msvc.preferred_component_id -cne 'Microsoft.VisualStudio.Component.VC.14.44.17.14.x86.x64' -or
+    $contract.msvc.fallback_discovery_component_id -cne 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64' -or
+    $contract.msvc.toolset_version -cne '14.44.35207' -or
     $contract.msvc.platform_toolset -cne 'v143' -or
+    $contract.msvc.windows_sdk_version -cne '10.0.26100.0' -or
+    $contract.msvc.windows_sdk_root -cne 'C:/Program Files (x86)/Windows Kits/10' -or
     $contract.msvc.runtime -cne 'MultiThreaded' -or
     $contract.msvc.reproducible_flag -cne '/Brepro' -or
     $contract.build.profile -cne 'release' -or
@@ -510,7 +1047,8 @@ if ($contract.schema_version -ne 1 -or
     throw 'GPU worker-pack toolchain manifest violates the reviewed Windows x64 static-runtime contract.'
 }
 
-Assert-BaseToolchain $contract $repositoryRoot
+Assert-NoAmbientToolchainOverrides
+$msvcToolchain = Assert-BaseToolchain $contract $repositoryRoot
 $archiveContract = $contract.native_source.sherpa_onnx_archive
 if (-not $NativeArchiveDirectory) {
     $NativeArchiveDirectory = Join-Path $repositoryRoot '.ci-native'
@@ -531,7 +1069,17 @@ $sdkRoot = if ($Backend -eq 'Vulkan') {
     Resolve-CudaSdk $contract
 }
 if ($ToolchainCheckOnly) {
-    Write-Output "$Backend worker-pack toolchain matches the pinned contract."
+    $toolchainEnvironmentState = $null
+    try {
+        $toolchainEnvironmentState = Set-PinnedMsvcBuildEnvironment $msvcToolchain
+        Assert-ActivePinnedMsvcEnvironment $msvcToolchain
+        Write-Output "$Backend worker-pack toolchain matches the pinned contract."
+    }
+    finally {
+        if ($null -ne $toolchainEnvironmentState) {
+            Restore-ProcessEnvironment $toolchainEnvironmentState
+        }
+    }
     return
 }
 if ($PackVersion -cnotmatch '^[a-z0-9](?:[a-z0-9._-]{0,94}[a-z0-9])?$') {
@@ -556,16 +1104,6 @@ if ($sourceDateEpoch -cnotmatch '^[1-9][0-9]{8,11}$') {
 }
 $null = Invoke-NativeProcess $git @('-C', $repositoryRoot, 'diff', '--quiet', '--exit-code') 'GPU worker release builds require a clean worktree.'
 $null = Invoke-NativeProcess $git @('-C', $repositoryRoot, 'diff', '--cached', '--quiet', '--exit-code') 'GPU worker release builds require a clean index.'
-foreach ($ambientName in @(
-    'RUSTFLAGS', 'CARGO_ENCODED_RUSTFLAGS', 'CMAKE_ARGS', 'CFLAGS', 'CXXFLAGS',
-    'CC', 'CXX', 'CL', '_CL_', 'LINK', 'CMAKE_GENERATOR', 'CMAKE_TOOLCHAIN_FILE',
-    'NVCC_PREPEND_FLAGS', 'NVCC_APPEND_FLAGS'
-)) {
-    $ambient = Get-Item -LiteralPath "Env:$ambientName" -ErrorAction SilentlyContinue
-    if ($null -ne $ambient -and -not [string]::IsNullOrWhiteSpace([string]$ambient.Value)) {
-        throw "GPU worker release builds reject ambient toolchain override $ambientName."
-    }
-}
 
 $manifestPath = Join-Path $repositoryRoot 'Cargo.toml'
 $authoringManifestPath = Join-Path $repositoryRoot 'tools\worker-pack-author\Cargo.toml'
@@ -581,10 +1119,13 @@ $previousSherpaArchiveRoot = $env:SHERPA_ONNX_ARCHIVE_DIR
 $previousSourceDateEpoch = $env:SOURCE_DATE_EPOCH
 $previousMsvcFlags = $env:_CL_
 $previousLocalAppData = $env:LOCALAPPDATA
+$previousPinnedMsvcEnvironment = $null
 $stagingRoot = "$outputRoot.staging-$([guid]::NewGuid().ToString('N'))"
 $stagingCreated = $false
 
 try {
+    $previousPinnedMsvcEnvironment = Set-PinnedMsvcBuildEnvironment $msvcToolchain
+    Assert-ActivePinnedMsvcEnvironment $msvcToolchain
     New-Item -ItemType Directory -Path $shortBuild.BuildEnvironment | Out-Null
     $buildEnvironmentItem = Get-Item -LiteralPath $shortBuild.BuildEnvironment -Force
     if (-not $buildEnvironmentItem.PSIsContainer -or
@@ -712,6 +1253,9 @@ try {
     }
 }
 finally {
+    if ($null -ne $previousPinnedMsvcEnvironment) {
+        Restore-ProcessEnvironment $previousPinnedMsvcEnvironment
+    }
     $env:CARGO_TARGET_DIR = $previousCargoTarget
     $env:SCRIBE_BUILD_REVISION = $previousRevision
     $env:SCRIBE_BUNDLED_WORKER_SHA256 = $previousWorkerDigest
