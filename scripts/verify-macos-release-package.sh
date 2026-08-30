@@ -35,10 +35,28 @@ assert_exact_protected_entitlements() {
   local target="$1" expected_group="$2" expected_team="${2%%.*}" entitlements
   entitlements="$(mktemp "${TMPDIR:-/tmp}/scribe-macos-protected-entitlements.XXXXXX")"
   codesign -d --entitlements :- "$target" 2>/dev/null >"$entitlements" || { rm -f "$entitlements"; echo "could not inspect protected target entitlements: $target" >&2; return 1; }
-  plutil -extract keychain-access-groups json -o - "$entitlements" |
-    jq -e --arg group "$expected_group" 'type == "array" and . == [$group]' >/dev/null || { rm -f "$entitlements"; echo "protected target Keychain group is not exact: $target" >&2; return 1; }
-  [[ "$(plutil -extract com.apple.application-identifier raw -o - "$entitlements" 2>/dev/null)" == "$expected_group" ]] || { rm -f "$entitlements"; echo "protected target application identifier is not exact: $target" >&2; return 1; }
-  [[ "$(plutil -extract com.apple.developer.team-identifier raw -o - "$entitlements" 2>/dev/null)" == "$expected_team" ]] || { rm -f "$entitlements"; echo "protected target team identifier is not exact: $target" >&2; return 1; }
+  plutil -convert json -o - "$entitlements" |
+    jq -e --arg group "$expected_group" --arg team "$expected_team" '
+      .["keychain-access-groups"] == [$group] and
+      .["com.apple.application-identifier"] == $group and
+      .["com.apple.developer.team-identifier"] == $team
+    ' >/dev/null || { rm -f "$entitlements"; echo "protected target application, team, or Keychain identifier is not exact: $target" >&2; return 1; }
+  rm -f "$entitlements"
+}
+assert_microphone_entitlement() {
+  local target="$1" entitlements
+  entitlements="$(mktemp "${TMPDIR:-/tmp}/scribe-macos-microphone-entitlements.XXXXXX")"
+  if ! codesign -d --entitlements :- "$target" 2>/dev/null >"$entitlements"; then
+    rm -f "$entitlements"
+    echo "could not inspect desktop entitlements: $target" >&2
+    return 1
+  fi
+  if ! plutil -convert json -o - "$entitlements" |
+      jq -e '.["com.apple.security.device.audio-input"] == true' >/dev/null; then
+    rm -f "$entitlements"
+    echo 'microphone entitlement is missing.' >&2
+    return 1
+  fi
   rm -f "$entitlements"
 }
 for path in "$app/Contents/Info.plist" "$macos/Scribe" "$macos/scribe-inference-worker" "$catalog" "$authority"; do [[ -f "$path" && ! -L "$path" ]] || { echo "required regular file missing: $path" >&2; exit 1; }; done
@@ -53,7 +71,7 @@ for binary in "$macos/Scribe" "$macos/scribe-inference-worker"; do
 done
 assert_no_keychain_group "$macos/scribe-inference-worker"
 codesign --verify --strict --verbose=2 "$app"
-codesign -d --entitlements :- "$app" 2>/dev/null | plutil -extract com.apple.security.device.audio-input raw -o - - | grep -qx true || { echo 'microphone entitlement is missing.' >&2; exit 1; }
+assert_microphone_entitlement "$app"
 plutil -extract LSMinimumSystemVersion raw -o - "$app/Contents/Info.plist" | grep -qx '13.0' || { echo 'Info.plist must declare macOS 13.0.' >&2; exit 1; }
 jq -e '.schema_version == 1 and (.packs | type == "array") and (.packs | length <= 8)' "$catalog" >/dev/null || { echo 'catalog is invalid.' >&2; exit 1; }
 catalog_digest="$(shasum -a 256 "$catalog" | awk '{print $1}')"
@@ -107,7 +125,7 @@ else
   security cms -D -i "$profile" >"$decoded_profile" || { echo 'embedded provisioning profile could not be decoded.' >&2; exit 1; }
   plutil -extract Entitlements xml1 -o "$profile_entitlements" "$decoded_profile" || { echo 'embedded provisioning profile has no entitlement dictionary.' >&2; exit 1; }
   profile_application_identifier="$(plutil -extract application-identifier raw -o - "$profile_entitlements" 2>/dev/null)" || { echo 'embedded provisioning profile has no application identifier.' >&2; exit 1; }
-  profile_team_identifier="$(plutil -extract com.apple.developer.team-identifier raw -o - "$profile_entitlements" 2>/dev/null)" || { echo 'embedded provisioning profile has no team identifier.' >&2; exit 1; }
+  profile_team_identifier="$(plutil -convert json -o - "$profile_entitlements" | jq -er '.["com.apple.developer.team-identifier"] | select(type == "string")')" || { echo 'embedded provisioning profile has no team identifier.' >&2; exit 1; }
   [[ "$profile_application_identifier" == "$keychain_access_group" ]] || { echo 'embedded provisioning profile application identifier does not authorize the authority group.' >&2; exit 1; }
   [[ "$profile_team_identifier" == "${keychain_access_group%%.*}" ]] || { echo 'embedded provisioning profile team identifier does not authorize the authority group.' >&2; exit 1; }
   plutil -extract keychain-access-groups json -o - "$profile_entitlements" |

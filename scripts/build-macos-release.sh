@@ -44,10 +44,12 @@ verify_exact_keychain_group() {
     echo "could not inspect signed target entitlements: $target" >&2
     return 1
   fi
-  if ! plutil -extract keychain-access-groups json -o - "$entitlements" |
-      jq -e --arg group "$expected" 'type == "array" and . == [$group]' >/dev/null ||
-    [[ "$(plutil -extract com.apple.application-identifier raw -o - "$entitlements" 2>/dev/null)" != "$expected" ]] ||
-    [[ "$(plutil -extract com.apple.developer.team-identifier raw -o - "$entitlements" 2>/dev/null)" != "$expected_team" ]]; then
+  if ! plutil -convert json -o - "$entitlements" |
+      jq -e --arg group "$expected" --arg team "$expected_team" '
+        .["keychain-access-groups"] == [$group] and
+        .["com.apple.application-identifier"] == $group and
+        .["com.apple.developer.team-identifier"] == $team
+      ' >/dev/null; then
     rm -f "$entitlements"
     echo "signed target does not expose the exact reviewed application, team, and Keychain identifiers: $target" >&2
     return 1
@@ -121,7 +123,7 @@ if "$protected_release"; then
   security cms -D -i "$SCRIBE_MACOS_PROVISIONING_PROFILE" >"$decoded_profile" || { echo 'provisioning profile could not be decoded.' >&2; exit 1; }
   plutil -extract Entitlements xml1 -o "$profile_entitlements" "$decoded_profile" || { echo 'provisioning profile has no entitlement dictionary.' >&2; exit 1; }
   profile_application_identifier="$(plutil -extract application-identifier raw -o - "$profile_entitlements" 2>/dev/null)" || { echo 'provisioning profile has no application identifier entitlement.' >&2; exit 1; }
-  profile_team_identifier="$(plutil -extract com.apple.developer.team-identifier raw -o - "$profile_entitlements" 2>/dev/null)" || { echo 'provisioning profile has no team identifier entitlement.' >&2; exit 1; }
+  profile_team_identifier="$(plutil -convert json -o - "$profile_entitlements" | jq -er '.["com.apple.developer.team-identifier"] | select(type == "string")')" || { echo 'provisioning profile has no team identifier entitlement.' >&2; exit 1; }
   team_identifier="${keychain_access_group%%.*}"
   [[ "$profile_application_identifier" == "$keychain_access_group" ]] || { echo 'provisioning profile application identifier does not authorize the selected Keychain group.' >&2; exit 1; }
   [[ "$profile_team_identifier" == "$team_identifier" ]] || { echo 'provisioning profile team identifier does not authorize the selected Keychain group.' >&2; exit 1; }
