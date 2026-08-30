@@ -1,1 +1,6 @@
 runtime-manifests/gpu-auto-qualification-windows-x64.json text eol=lf
+runtime-manifests/gpu-auto-qualification-macos-aarch64.json text eol=lf
+runtime-manifests/gpu-auto-qualification-macos-x86_64.json text eol=lf
+runtime-manifests/gpu-worker-toolchain-macos-aarch64.json text eol=lf
+runtime-manifests/gpu-worker-toolchain-macos-x86_64.json text eol=lf
+*.sh text eol=lf

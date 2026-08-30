@@ -317,6 +317,37 @@ is implemented and tested. The architecture guard scopes this prohibition to
 the verified-pack provider launch function; unrelated process launches do not
 satisfy or trip the gate.
 
+## Stage 6 macOS Metal packaging contract
+
+macOS packages use a universal `Scribe.app`, with universal desktop and CPU
+worker Mach-O files in `Contents/MacOS`. The CPU worker remains the only
+default path. Metal is available for an explicit GPU request only when a
+verified installed Metal pack is declared by
+`Contents/Resources/worker-pack-catalog.json` and stored exactly at:
+
+```text
+Contents/Resources/workers/packs/<pack-id>/<version>/<digest>/
+```
+
+Each standalone Metal worker is built per architecture from the corresponding
+pinned `runtime-manifests/gpu-worker-toolchain-macos-*.json` contract. It is
+Developer-ID signed with hardened runtime and timestamp before its inventory is
+hashed and before its canonical Ed25519 pack manifest is authored. The release
+assembler never creates signing keys, accepts secret values as arguments, or
+uses `codesign --deep`. It signs the universal CPU worker and desktop binaries,
+then the outer application; the dedicated protected release step verifies,
+notarizes, staples, and verifies again.
+
+The production authoring CLI must accept `--backend metal --target-os macos
+--target-arch <aarch64|x86_64>` and bind those facts in its signed manifest.
+Until that reviewed CLI extension and a persistent production trust root exist,
+the build fails closed for non-empty packs and produces the canonical empty
+catalog. The checked-in macOS Auto manifests are both canonical zero-entry
+`default_deny` documents. No runtime calibration occurs: Auto remains CPU-only
+until a separately reviewed release qualification provides five cold runs,
+twenty warm runs, parity/reliability evidence, and GPU end-to-end p95 no more
+than 110% of the matching CPU p95. ONNX and Sherpa remain CPU-only.
+
 ## Build and verification commands
 
 `scripts/build-windows-gpu-worker-pack.ps1` builds one deterministic fixture or
