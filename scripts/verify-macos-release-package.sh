@@ -59,7 +59,7 @@ assert_microphone_entitlement() {
   fi
   rm -f "$entitlements"
 }
-for path in "$app/Contents/Info.plist" "$macos/Scribe" "$macos/scribe-inference-worker" "$catalog" "$authority"; do [[ -f "$path" && ! -L "$path" ]] || { echo "required regular file missing: $path" >&2; exit 1; }; done
+for path in "$app/Contents/Info.plist" "$app/Contents/_CodeSignature/CodeResources" "$macos/Scribe" "$macos/scribe-inference-worker" "$catalog" "$authority"; do [[ -f "$path" && ! -L "$path" ]] || { echo "required regular file missing: $path" >&2; exit 1; }; done
 [[ -z "$(find "$app" -xdev \( -type l -o -type f -links +1 -o -name '._*' \) -print -quit)" ]] || { echo 'application contains a symlink, hardlink, or AppleDouble entry.' >&2; exit 1; }
 [[ -z "$(find "$resources/workers/packs" -type d -name '.stage.*' -print -quit)" ]] || { echo 'application contains an interrupted worker-pack staging directory.' >&2; exit 1; }
 if command -v xattr >/dev/null && xattr -lr "$app" 2>/dev/null | grep -E 'com\.apple\.ResourceFork|com\.apple\.FinderInfo' >/dev/null; then echo 'application contains resource-fork metadata.' >&2; exit 1; fi
@@ -136,7 +136,7 @@ fi
 expected_file="$(mktemp "${TMPDIR:-/tmp}/scribe-macos-expected.XXXXXX")"
 actual_file="$(mktemp "${TMPDIR:-/tmp}/scribe-macos-actual.XXXXXX")"
 trap 'rm -f "$expected_file" "$actual_file"' EXIT
-printf '%s\n' "Contents/Info.plist" "Contents/MacOS/Scribe" "Contents/MacOS/scribe-inference-worker" "Contents/Resources/worker-pack-catalog.json" "Contents/Resources/gpu-pack-release-authority.json" >"$expected_file"
+printf '%s\n' "Contents/Info.plist" "Contents/MacOS/Scribe" "Contents/MacOS/scribe-inference-worker" "Contents/Resources/worker-pack-catalog.json" "Contents/Resources/gpu-pack-release-authority.json" "Contents/_CodeSignature/CodeResources" >"$expected_file"
 if "$embedded_profile_required"; then printf '%s\n' 'Contents/embedded.provisionprofile' >>"$expected_file"; fi
 while IFS= read -r entry; do
   id="$(jq -r '.pack_id' <<<"$entry")"; version="$(jq -r '.pack_version' <<<"$entry")"; digest="$(jq -r '.pack_digest' <<<"$entry")"; root="workers/packs/$id/$version/$digest"

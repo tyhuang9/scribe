@@ -48,6 +48,7 @@ grep -F 'worker target must not expose the desktop Keychain access group' "$repo
 grep -F 'worker target exposes malformed entitlement data' "$repo_root/scripts/build-macos-release.sh" >/dev/null || { echo 'release builder must reject malformed worker entitlement data.' >&2; exit 1; }
 grep -F 'embedded provisioning profile keychain groups are not exact.' "$repo_root/scripts/verify-macos-release-package.sh" >/dev/null || { echo 'package verifier must reject profile group mismatch.' >&2; exit 1; }
 grep -F 'application inventory is not exact.' "$repo_root/scripts/verify-macos-release-package.sh" >/dev/null || { echo 'package verifier must enforce profile-aware exact inventory.' >&2; exit 1; }
+grep -F 'Contents/_CodeSignature/CodeResources' "$repo_root/scripts/verify-macos-release-package.sh" >/dev/null || { echo 'package verifier must require the signed bundle resource envelope.' >&2; exit 1; }
 grep -F 'worker must not expose the desktop Keychain group' "$repo_root/scripts/verify-macos-release-package.sh" >/dev/null || { echo 'package verifier must reject Keychain-entitled workers.' >&2; exit 1; }
 grep -F 'worker exposes malformed entitlement data' "$repo_root/scripts/verify-macos-release-package.sh" >/dev/null || { echo 'package verifier must reject malformed worker entitlement data.' >&2; exit 1; }
 [[ -f "$repo_root/installer/macos/Scribe.protected.entitlements.template" ]] || { echo 'protected desktop entitlement template is missing.' >&2; exit 1; }
