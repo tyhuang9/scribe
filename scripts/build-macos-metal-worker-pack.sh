@@ -4,7 +4,7 @@ IFS=$'\n\t'
 
 usage() {
   cat <<'EOF'
-Usage: build-macos-metal-worker-pack.sh --target <aarch64-apple-darwin|x86_64-apple-darwin> --pack-version <version> --output-packs-root <directory> [--signing-mode <adhoc|developer-id>]
+Usage: build-macos-metal-worker-pack.sh --target <aarch64-apple-darwin|x86_64-apple-darwin> --pack-version <version> --security-epoch <canonical-u64> --output-packs-root <directory> [--signing-mode <adhoc|developer-id>]
 
 Builds one immutable, signed Metal worker pack. Production signing material is
 read only from SCRIBE_PACK_SIGNING_PRIVATE_KEY_PATH and SCRIBE_PACK_SIGNING_KEY_ID.
@@ -12,11 +12,12 @@ The installed desktop must contain the separately reviewed matching public key.
 EOF
 }
 
-target='' pack_version='' output_packs_root='' signing_mode="${SCRIBE_MACOS_SIGNING_MODE:-developer-id}"
+target='' pack_version='' security_epoch='' output_packs_root='' signing_mode="${SCRIBE_MACOS_SIGNING_MODE:-developer-id}"
 while (($#)); do
   case "$1" in
     --target) target="${2:-}"; shift 2 ;;
     --pack-version) pack_version="${2:-}"; shift 2 ;;
+    --security-epoch) security_epoch="${2:-}"; shift 2 ;;
     --output-packs-root) output_packs_root="${2:-}"; shift 2 ;;
     --signing-mode) signing_mode="${2:-}"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
@@ -29,6 +30,7 @@ done
 [[ "$pack_version" =~ ^[a-z0-9]([a-z0-9._-]{0,94}[a-z0-9])?$ ]] || { echo 'pack version must be a canonical immutable-store component.' >&2; exit 2; }
 [[ -n "$output_packs_root" ]] || { echo 'output packs root is required.' >&2; exit 2; }
 [[ "$signing_mode" == adhoc || "$signing_mode" == developer-id ]] || { echo 'signing mode must be adhoc or developer-id.' >&2; exit 2; }
+[[ "$security_epoch" =~ ^[1-9][0-9]{0,19}$ && ( ${#security_epoch} -lt 20 || "$security_epoch" < '18446744073709551615' || "$security_epoch" == '18446744073709551615' ) ]] || { echo 'security epoch must be a positive canonical u64 decimal.' >&2; exit 2; }
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 arch="${target%%-apple-darwin}"
@@ -76,7 +78,7 @@ mkdir -p "$stage/worker"
 
 target_dir="${SCRIBE_MACOS_CARGO_TARGET_DIR:-$repo_root/target-macos-metal-$arch}"
 [[ ! -e "$target_dir" || ! -L "$target_dir" ]] || { echo 'Cargo target directory must not be a symlink.' >&2; exit 1; }
-MACOSX_DEPLOYMENT_TARGET=13.0 SCRIBE_BUILDING_WORKER=1 CARGO_TARGET_DIR="$target_dir" \
+env -u SCRIBE_MACOS_GPU_ROLLBACK_KEYCHAIN_ACCESS_GROUP MACOSX_DEPLOYMENT_TARGET=13.0 SCRIBE_BUILDING_WORKER=1 CARGO_TARGET_DIR="$target_dir" \
   cargo build --locked --release --target "$target" --bin scribe-inference-worker --features metal-acceleration
 worker="$target_dir/$target/release/scribe-inference-worker"
 [[ -f "$worker" && ! -L "$worker" ]] || { echo 'Metal worker build did not produce a regular Mach-O.' >&2; exit 1; }
@@ -87,7 +89,7 @@ codesign --verify --strict --verbose=2 "$stage/worker/scribe-inference-worker"
 if ! cargo run --locked --quiet --manifest-path "$repo_root/tools/worker-pack-author/Cargo.toml" -- \
   author --backend metal --target-os macos --target-arch "$arch" --pack-id "$pack_id" \
   --pack-version "$pack_version" --pack-root "$stage" --provider transcribe-cpp-metal \
-  --security-epoch 1 --worker-path worker/scribe-inference-worker --key-id "$SCRIBE_PACK_SIGNING_KEY_ID" \
+  --security-epoch "$security_epoch" --worker-path worker/scribe-inference-worker --key-id "$SCRIBE_PACK_SIGNING_KEY_ID" \
   --private-key "$SCRIBE_PACK_SIGNING_PRIVATE_KEY_PATH" >"$author_output"; then
   echo 'Metal pack authoring failed. It requires the bounded author-tool extension for --backend metal, --target-os macos, and --target-arch.' >&2
   exit 1
@@ -99,5 +101,5 @@ find "$stage" -xdev \( -type l -o -type f -links +1 -o -name '._*' \) -print -qu
 mv "$stage" "$final_root"
 rm -f "$author_output"
 trap - EXIT
-jq -cn --arg pack_root "$final_root" --arg pack_id "$pack_id" --arg pack_version "$pack_version" --arg pack_digest "$digest" --arg target_arch "$arch" \
-  '{pack_root:$pack_root,pack_id:$pack_id,pack_version:$pack_version,pack_digest:$pack_digest,target_os:"macos",target_arch:$target_arch,backend:"metal",provider:"transcribe-cpp-metal",worker_relative_path:"worker/scribe-inference-worker"}'
+jq -cn --arg pack_root "$final_root" --arg pack_id "$pack_id" --arg pack_version "$pack_version" --arg pack_digest "$digest" --arg target_arch "$arch" --argjson security_epoch "$security_epoch" \
+  '{pack_root:$pack_root,pack_id:$pack_id,pack_version:$pack_version,pack_digest:$pack_digest,security_epoch:$security_epoch,target_os:"macos",target_arch:$target_arch,backend:"metal",provider:"transcribe-cpp-metal",worker_relative_path:"worker/scribe-inference-worker"}'
