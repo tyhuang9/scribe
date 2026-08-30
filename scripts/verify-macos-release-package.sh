@@ -89,7 +89,7 @@ else
   [[ -n "$reviewed_group" && "$keychain_access_group" == "$reviewed_group" ]] || { echo 'positive release does not use the exact non-empty source-reviewed Keychain namespace.' >&2; exit 1; }
   jq -e --argjson epoch "$release_security_epoch" 'all(.entries[]; .security_epoch == $epoch)' "$authority" >/dev/null || { echo 'release authority pack epoch differs from release epoch.' >&2; exit 1; }
 fi
-LC_ALL=C strings "$macos/Scribe" | grep -Fqx "$authority_json" >/dev/null || { echo 'desktop does not embed the exact release authority.' >&2; exit 1; }
+LC_ALL=C strings "$macos/Scribe" | grep -Fx "$authority_json" >/dev/null || { echo 'desktop does not embed the exact release authority.' >&2; exit 1; }
 desktop_entitlements="$(mktemp "${TMPDIR:-/tmp}/scribe-macos-desktop-entitlements.XXXXXX")"
 trap 'rm -f "$desktop_entitlements"' EXIT
 codesign -d --entitlements :- "$app" 2>/dev/null >"$desktop_entitlements"
@@ -149,6 +149,6 @@ LC_ALL=C sort -u "$expected_file" >"$expected_file.sorted"
 cmp -s "$actual_file" "$expected_file.sorted" || { echo 'application inventory is not exact.' >&2; exit 1; }
 rm -f "$expected_file.sorted"
 worker_digest="$(shasum -a 256 "$macos/scribe-inference-worker" | awk '{print $1}')"
-LC_ALL=C strings "$macos/Scribe" | grep -Fqx "$worker_digest" || { echo 'desktop does not embed the final CPU worker SHA-256 anchor.' >&2; exit 1; }
+LC_ALL=C strings "$macos/Scribe" | grep -Fx "$worker_digest" >/dev/null || { echo 'desktop does not embed the final CPU worker SHA-256 anchor.' >&2; exit 1; }
 if "$require_notarization"; then xcrun stapler validate "$app"; fi
 echo 'macOS release package verification passed.'

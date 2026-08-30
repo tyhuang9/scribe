@@ -228,13 +228,13 @@ for target in aarch64-apple-darwin x86_64-apple-darwin; do
   desktop_path="$target_dir/$target/release/local-transcriber"
   [[ -f "$desktop_path" && ! -L "$desktop_path" ]] || { echo 'desktop build is missing.' >&2; exit 1; }
   LC_ALL=C strings "$desktop_path" | grep -F "$catalog_digest" >/dev/null || { echo 'desktop slice does not embed the exact pack-catalog authority.' >&2; exit 1; }
-  LC_ALL=C strings "$desktop_path" | grep -Fqx "$authority_json" >/dev/null || { echo 'desktop slice does not embed the exact release authority.' >&2; exit 1; }
+  LC_ALL=C strings "$desktop_path" | grep -Fx "$authority_json" >/dev/null || { echo 'desktop slice does not embed the exact release authority.' >&2; exit 1; }
   if [[ "$arch" == aarch64 ]]; then desktop_arm="$desktop_path"; else desktop_x86="$desktop_path"; fi
 done
 lipo -create -output "$macos/Scribe" "$desktop_arm" "$desktop_x86"
-LC_ALL=C strings "$macos/Scribe" | grep -Fqx "$worker_digest" || { echo 'desktop does not embed the final signed CPU worker anchor.' >&2; exit 1; }
+LC_ALL=C strings "$macos/Scribe" | grep -Fx "$worker_digest" >/dev/null || { echo 'desktop does not embed the final signed CPU worker anchor.' >&2; exit 1; }
 LC_ALL=C strings "$macos/Scribe" | grep -F "$catalog_digest" >/dev/null || { echo 'desktop does not embed the exact pack-catalog authority.' >&2; exit 1; }
-LC_ALL=C strings "$macos/Scribe" | grep -Fqx "$authority_json" >/dev/null || { echo 'desktop does not embed the exact release authority.' >&2; exit 1; }
+LC_ALL=C strings "$macos/Scribe" | grep -Fx "$authority_json" >/dev/null || { echo 'desktop does not embed the exact release authority.' >&2; exit 1; }
 
 codesign "${codesign_args[@]}" --entitlements "$desktop_entitlements" "$macos/Scribe"
 codesign --verify --strict --verbose=2 "$macos/Scribe"
