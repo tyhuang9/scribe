@@ -1,0 +1,835 @@
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Instant;
+
+use crossbeam_channel::{Receiver, Sender, select, unbounded};
+
+use super::{
+    CaptureCancellation, CaptureError, CaptureId, CaptureOptions, CaptureStartContext,
+    PreviewPublisherSlot, RecordingSession,
+};
+
+pub(crate) type StartCapture = dyn Fn(CaptureRequest, CaptureCancellation) -> Result<RecordingSession, CaptureError>
+    + Send
+    + Sync;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CaptureHotkeyMode {
+    HoldToTalk,
+    Toggle,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AudioOwnerKind {
+    Capture,
+    MicrophoneTest,
+    Playback,
+}
+
+#[derive(Clone)]
+pub(crate) struct CaptureRequest {
+    pub(crate) capture_id: CaptureId,
+    pub(crate) observed_at: Instant,
+    pub(crate) max_duration_seconds: u32,
+    pub(crate) input_device_name: Option<String>,
+    pub(crate) options: CaptureOptions,
+    pub(crate) preview_slot: PreviewPublisherSlot,
+    pub(crate) owner: AudioOwnerKind,
+}
+
+#[derive(Clone, PartialEq)]
+struct StartTemplate {
+    max_duration_seconds: u32,
+    input_device_name: Option<String>,
+    options: CaptureOptions,
+}
+
+#[derive(Clone, Default, PartialEq)]
+struct HotkeySnapshot {
+    enabled: bool,
+    mode: Option<CaptureHotkeyMode>,
+    start: Option<StartTemplate>,
+}
+
+#[derive(Clone)]
+pub(crate) struct CaptureTicket {
+    pub(crate) capture_id: CaptureId,
+    pub(crate) preview_slot: PreviewPublisherSlot,
+}
+
+#[derive(Clone)]
+pub(crate) struct AudioOwnerLease {
+    pub(crate) id: u64,
+    pub(crate) owner: AudioOwnerKind,
+}
+
+#[derive(Clone)]
+pub(crate) enum HotkeyDispatch {
+    Start(CaptureTicket),
+    Stop { capture_id: CaptureId },
+    None,
+}
+
+pub(crate) enum CaptureLifecycleEvent {
+    Starting {
+        capture_id: CaptureId,
+        owner: AudioOwnerKind,
+    },
+    Ready {
+        capture_id: CaptureId,
+        owner: AudioOwnerKind,
+        session: RecordingSession,
+    },
+    StopRequested {
+        capture_id: CaptureId,
+    },
+    Aborted {
+        capture_id: CaptureId,
+    },
+    Failed {
+        capture_id: CaptureId,
+        owner: AudioOwnerKind,
+        error: CaptureError,
+    },
+    Reconfigured {
+        revision: u64,
+    },
+    Shutdown,
+}
+
+#[derive(Debug, thiserror::Error, Eq, PartialEq)]
+pub(crate) enum CaptureControlError {
+    #[error("audio is already owned by {0:?}")]
+    Owned(AudioOwnerKind),
+    #[error("capture command references stale id {0}")]
+    Stale(u64),
+    #[error("audio controller has shut down")]
+    Shutdown,
+}
+
+struct OwnerState {
+    id: u64,
+    kind: AudioOwnerKind,
+    cancellation: Option<CaptureCancellation>,
+    session: Option<RecordingSession>,
+    release_requested: bool,
+    reaper_started: bool,
+}
+
+struct SharedState {
+    next_id: u64,
+    owner: Option<OwnerState>,
+    hotkey: HotkeySnapshot,
+    config_revision: u64,
+    shutdown: bool,
+}
+
+impl Default for SharedState {
+    fn default() -> Self {
+        Self {
+            next_id: 1,
+            owner: None,
+            hotkey: HotkeySnapshot::default(),
+            config_revision: 0,
+            shutdown: false,
+        }
+    }
+}
+
+enum ControlCommand {
+    Start {
+        request: CaptureRequest,
+        cancellation: CaptureCancellation,
+    },
+    Stop {
+        capture_id: CaptureId,
+    },
+    Abort {
+        capture_id: CaptureId,
+    },
+    Reconfigure {
+        revision: u64,
+    },
+    Release {
+        id: u64,
+    },
+    Shutdown,
+}
+
+struct StartResult {
+    request: CaptureRequest,
+    result: Result<RecordingSession, CaptureError>,
+}
+
+#[derive(Clone)]
+pub(crate) struct CaptureControlHandle {
+    state: Arc<Mutex<SharedState>>,
+    command_tx: Sender<ControlCommand>,
+}
+
+pub(crate) struct CaptureController {
+    handle: CaptureControlHandle,
+    lifecycle_rx: Receiver<CaptureLifecycleEvent>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl CaptureController {
+    pub(crate) fn new() -> Result<Self, CaptureError> {
+        Self::with_start_capture(Arc::new(|request, cancellation| {
+            super::start_recording(
+                CaptureStartContext::new(request.capture_id, request.observed_at),
+                request.max_duration_seconds,
+                request.input_device_name,
+                request.options,
+                request.preview_slot,
+                cancellation,
+            )
+        }))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_start_capture_for_test(
+        start_capture: Arc<StartCapture>,
+    ) -> Result<Self, CaptureError> {
+        Self::with_start_capture(start_capture)
+    }
+
+    fn with_start_capture(start_capture: Arc<StartCapture>) -> Result<Self, CaptureError> {
+        let state = Arc::new(Mutex::new(SharedState::default()));
+        let (command_tx, command_rx) = unbounded();
+        let (lifecycle_tx, lifecycle_rx) = unbounded();
+        let worker_state = Arc::clone(&state);
+        let worker = thread::Builder::new()
+            .name("scribe-audio-control".to_owned())
+            .spawn(move || control_loop(worker_state, command_rx, lifecycle_tx, start_capture))
+            .map_err(|error| CaptureError::WorkerSpawn(error.to_string()))?;
+        Ok(Self {
+            handle: CaptureControlHandle { state, command_tx },
+            lifecycle_rx,
+            worker: Some(worker),
+        })
+    }
+
+    pub(crate) fn handle(&self) -> CaptureControlHandle {
+        self.handle.clone()
+    }
+
+    pub(crate) fn poll_events(&self) -> Vec<CaptureLifecycleEvent> {
+        let mut events = Vec::new();
+        while let Ok(event) = self.lifecycle_rx.try_recv() {
+            events.push(event);
+        }
+        events
+    }
+}
+
+impl Drop for CaptureController {
+    fn drop(&mut self) {
+        self.handle.shutdown();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+impl CaptureControlHandle {
+    pub(crate) fn reconfigure_hotkey(
+        &self,
+        enabled: bool,
+        mode: CaptureHotkeyMode,
+        max_duration_seconds: u32,
+        input_device_name: Option<String>,
+        options: CaptureOptions,
+    ) -> Result<u64, CaptureControlError> {
+        let revision = {
+            let mut state = self.lock_state();
+            if state.shutdown {
+                return Err(CaptureControlError::Shutdown);
+            }
+            let replacement = HotkeySnapshot {
+                enabled,
+                mode: Some(mode),
+                start: Some(StartTemplate {
+                    max_duration_seconds,
+                    input_device_name,
+                    options,
+                }),
+            };
+            if state.hotkey == replacement {
+                return Ok(state.config_revision);
+            }
+            state.config_revision = state.config_revision.wrapping_add(1).max(1);
+            state.hotkey = replacement;
+            state.config_revision
+        };
+        self.command_tx
+            .send(ControlCommand::Reconfigure { revision })
+            .map_err(|_| CaptureControlError::Shutdown)?;
+        Ok(revision)
+    }
+
+    pub(crate) fn dispatch_hotkey(&self, pressed: bool, observed_at: Instant) -> HotkeyDispatch {
+        let mut state = self.lock_state();
+        if state.shutdown || !state.hotkey.enabled {
+            return HotkeyDispatch::None;
+        }
+        let Some(mode) = state.hotkey.mode else {
+            return HotkeyDispatch::None;
+        };
+        let should_start = matches!(
+            (mode, pressed, state.owner.as_ref()),
+            (CaptureHotkeyMode::HoldToTalk, true, None) | (CaptureHotkeyMode::Toggle, true, None)
+        );
+        if should_start {
+            let Some(template) = state.hotkey.start.clone() else {
+                return HotkeyDispatch::None;
+            };
+            return self.start_locked(&mut state, AudioOwnerKind::Capture, observed_at, template);
+        }
+
+        let should_stop = matches!(
+            (mode, pressed),
+            (CaptureHotkeyMode::HoldToTalk, false) | (CaptureHotkeyMode::Toggle, true)
+        );
+        if !should_stop {
+            return HotkeyDispatch::None;
+        }
+        let Some(owner) = state.owner.as_ref() else {
+            return HotkeyDispatch::None;
+        };
+        if owner.kind != AudioOwnerKind::Capture {
+            return HotkeyDispatch::None;
+        }
+        let capture_id = CaptureId(owner.id);
+        request_stop(owner);
+        let _ = self.command_tx.send(ControlCommand::Stop { capture_id });
+        HotkeyDispatch::Stop { capture_id }
+    }
+
+    pub(crate) fn start_capture(
+        &self,
+        owner: AudioOwnerKind,
+        observed_at: Instant,
+        max_duration_seconds: u32,
+        input_device_name: Option<String>,
+        options: CaptureOptions,
+    ) -> Result<CaptureTicket, CaptureControlError> {
+        let mut state = self.lock_state();
+        if state.shutdown {
+            return Err(CaptureControlError::Shutdown);
+        }
+        if let Some(active) = state.owner.as_ref() {
+            return Err(CaptureControlError::Owned(active.kind));
+        }
+        match self.start_locked(
+            &mut state,
+            owner,
+            observed_at,
+            StartTemplate {
+                max_duration_seconds,
+                input_device_name,
+                options,
+            },
+        ) {
+            HotkeyDispatch::Start(ticket) => Ok(ticket),
+            HotkeyDispatch::None | HotkeyDispatch::Stop { .. } => {
+                Err(CaptureControlError::Shutdown)
+            }
+        }
+    }
+
+    fn start_locked(
+        &self,
+        state: &mut SharedState,
+        owner: AudioOwnerKind,
+        observed_at: Instant,
+        template: StartTemplate,
+    ) -> HotkeyDispatch {
+        let capture_id = CaptureId(state.next_id);
+        state.next_id = state.next_id.wrapping_add(1).max(1);
+        let cancellation = CaptureCancellation::new();
+        let preview_slot = PreviewPublisherSlot::default();
+        let request = CaptureRequest {
+            capture_id,
+            observed_at,
+            max_duration_seconds: template.max_duration_seconds,
+            input_device_name: template.input_device_name,
+            options: template.options,
+            preview_slot: preview_slot.clone(),
+            owner,
+        };
+        state.owner = Some(OwnerState {
+            id: capture_id.0,
+            kind: owner,
+            cancellation: Some(cancellation.clone()),
+            session: None,
+            release_requested: false,
+            reaper_started: false,
+        });
+        if self
+            .command_tx
+            .send(ControlCommand::Start {
+                request,
+                cancellation,
+            })
+            .is_err()
+        {
+            state.owner = None;
+            state.shutdown = true;
+            return HotkeyDispatch::None;
+        }
+        HotkeyDispatch::Start(CaptureTicket {
+            capture_id,
+            preview_slot,
+        })
+    }
+
+    pub(crate) fn stop(&self, capture_id: CaptureId) -> Result<(), CaptureControlError> {
+        let state = self.lock_state();
+        let owner = matching_capture_owner(&state, capture_id)?;
+        request_stop(owner);
+        self.command_tx
+            .send(ControlCommand::Stop { capture_id })
+            .map_err(|_| CaptureControlError::Shutdown)
+    }
+
+    pub(crate) fn abort(&self, capture_id: CaptureId) -> Result<(), CaptureControlError> {
+        let state = self.lock_state();
+        let owner = matching_capture_owner(&state, capture_id)?;
+        request_abort(owner);
+        self.command_tx
+            .send(ControlCommand::Abort { capture_id })
+            .map_err(|_| CaptureControlError::Shutdown)
+    }
+
+    pub(crate) fn reserve_owner(
+        &self,
+        owner: AudioOwnerKind,
+    ) -> Result<AudioOwnerLease, CaptureControlError> {
+        let mut state = self.lock_state();
+        if state.shutdown {
+            return Err(CaptureControlError::Shutdown);
+        }
+        if let Some(active) = state.owner.as_ref() {
+            return Err(CaptureControlError::Owned(active.kind));
+        }
+        let id = state.next_id;
+        state.next_id = state.next_id.wrapping_add(1).max(1);
+        state.owner = Some(OwnerState {
+            id,
+            kind: owner,
+            cancellation: None,
+            session: None,
+            release_requested: false,
+            reaper_started: false,
+        });
+        Ok(AudioOwnerLease { id, owner })
+    }
+
+    pub(crate) fn release(&self, id: u64) -> Result<(), CaptureControlError> {
+        let reaper = {
+            let mut state = self.lock_state();
+            let Some(owner) = state.owner.as_mut() else {
+                return Err(CaptureControlError::Stale(id));
+            };
+            if owner.id != id {
+                return Err(CaptureControlError::Stale(id));
+            }
+            if owner.cancellation.is_none()
+                || owner
+                    .session
+                    .as_ref()
+                    .is_some_and(|session| session.try_finish().is_some())
+            {
+                state.owner = None;
+                None
+            } else {
+                owner.release_requested = true;
+                if let Some(session) = owner.session.clone()
+                    && !owner.reaper_started
+                {
+                    owner.reaper_started = true;
+                    Some(session)
+                } else {
+                    None
+                }
+            }
+        };
+        if let Some(session) = reaper {
+            spawn_release_reaper(Arc::clone(&self.state), id, session);
+        }
+        self.command_tx
+            .send(ControlCommand::Release { id })
+            .map_err(|_| CaptureControlError::Shutdown)
+    }
+
+    pub(crate) fn owner(&self) -> Option<AudioOwnerKind> {
+        self.lock_state().owner.as_ref().map(|owner| owner.kind)
+    }
+
+    pub(crate) fn owner_id(&self, kind: AudioOwnerKind) -> Option<u64> {
+        self.lock_state()
+            .owner
+            .as_ref()
+            .filter(|owner| owner.kind == kind)
+            .map(|owner| owner.id)
+    }
+
+    fn shutdown(&self) {
+        {
+            let mut state = self.lock_state();
+            if state.shutdown {
+                return;
+            }
+            state.shutdown = true;
+            if let Some(owner) = state.owner.as_ref() {
+                request_abort(owner);
+            }
+        }
+        let _ = self.command_tx.send(ControlCommand::Shutdown);
+    }
+
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, SharedState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+fn matching_capture_owner(
+    state: &SharedState,
+    capture_id: CaptureId,
+) -> Result<&OwnerState, CaptureControlError> {
+    let Some(owner) = state.owner.as_ref() else {
+        return Err(CaptureControlError::Stale(capture_id.0));
+    };
+    if owner.id != capture_id.0 || owner.cancellation.is_none() {
+        return Err(CaptureControlError::Stale(capture_id.0));
+    }
+    Ok(owner)
+}
+
+fn request_stop(owner: &OwnerState) {
+    if let Some(cancellation) = owner.cancellation.as_ref() {
+        cancellation.cancel();
+    }
+    if let Some(session) = owner.session.as_ref() {
+        session.stop();
+    }
+}
+
+fn request_abort(owner: &OwnerState) {
+    if let Some(cancellation) = owner.cancellation.as_ref() {
+        cancellation.cancel();
+    }
+    if let Some(session) = owner.session.as_ref() {
+        session.abort();
+    }
+}
+
+fn spawn_release_reaper(state: Arc<Mutex<SharedState>>, id: u64, session: RecordingSession) {
+    let _ = thread::Builder::new()
+        .name(format!("scribe-audio-release-{id}"))
+        .spawn(move || {
+            while session.try_finish().is_none() {
+                thread::sleep(std::time::Duration::from_millis(2));
+            }
+            let mut state = state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if state.owner.as_ref().is_some_and(|owner| owner.id == id) {
+                state.owner = None;
+            }
+        });
+}
+
+fn control_loop(
+    state: Arc<Mutex<SharedState>>,
+    command_rx: Receiver<ControlCommand>,
+    lifecycle_tx: Sender<CaptureLifecycleEvent>,
+    start_capture: Arc<StartCapture>,
+) {
+    let (start_result_tx, start_result_rx) = unbounded::<StartResult>();
+    loop {
+        select! {
+            recv(command_rx) -> command => match command {
+                Ok(ControlCommand::Start { request, cancellation }) => {
+                    let _ = lifecycle_tx.send(CaptureLifecycleEvent::Starting {
+                        capture_id: request.capture_id,
+                        owner: request.owner,
+                    });
+                    let result_tx = start_result_tx.clone();
+                    let start_capture = Arc::clone(&start_capture);
+                    let failed_request = request.clone();
+                    if let Err(error) = thread::Builder::new()
+                        .name(format!("scribe-audio-start-{}", request.capture_id.0))
+                        .spawn(move || {
+                            let result = start_capture(request.clone(), cancellation);
+                            let _ = result_tx.send(StartResult { request, result });
+                        })
+                    {
+                        let mut state = state
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        if state.owner.as_ref().is_some_and(|owner| {
+                            owner.id == failed_request.capture_id.0
+                                && owner.kind == failed_request.owner
+                        }) {
+                            state.owner = None;
+                        }
+                        drop(state);
+                        let _ = lifecycle_tx.send(CaptureLifecycleEvent::Failed {
+                            capture_id: failed_request.capture_id,
+                            owner: failed_request.owner,
+                            error: CaptureError::WorkerSpawn(error.to_string()),
+                        });
+                    }
+                }
+                Ok(ControlCommand::Stop { capture_id }) => {
+                    let _ = lifecycle_tx.send(CaptureLifecycleEvent::StopRequested { capture_id });
+                }
+                Ok(ControlCommand::Abort { capture_id }) => {
+                    let _ = lifecycle_tx.send(CaptureLifecycleEvent::Aborted { capture_id });
+                }
+                Ok(ControlCommand::Reconfigure { revision }) => {
+                    let _ = lifecycle_tx.send(CaptureLifecycleEvent::Reconfigured { revision });
+                }
+                Ok(ControlCommand::Release { id }) => {
+                    let _ = id;
+                }
+                Ok(ControlCommand::Shutdown) | Err(_) => {
+                    let _ = lifecycle_tx.send(CaptureLifecycleEvent::Shutdown);
+                    break;
+                }
+            },
+            recv(start_result_rx) -> result => {
+                let Ok(StartResult { request, result }) = result else {
+                    continue;
+                };
+                match result {
+                    Ok(session) => {
+                        let (accepted, reap) = {
+                            let mut state = state
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            if let Some(owner) = state.owner.as_mut()
+                                && owner.id == request.capture_id.0
+                                && owner.kind == request.owner
+                            {
+                                owner.session = Some(session.clone());
+                                if owner.release_requested {
+                                    session.abort();
+                                    owner.reaper_started = true;
+                                    (false, true)
+                                } else {
+                                    (true, false)
+                                }
+                            } else {
+                                (false, false)
+                            }
+                        };
+                        if accepted {
+                            let _ = lifecycle_tx.send(CaptureLifecycleEvent::Ready {
+                                capture_id: request.capture_id,
+                                owner: request.owner,
+                                session,
+                            });
+                        } else if reap {
+                            spawn_release_reaper(
+                                Arc::clone(&state),
+                                request.capture_id.0,
+                                session,
+                            );
+                        } else {
+                            session.abort();
+                        }
+                    }
+                    Err(error) => {
+                        {
+                            let mut state = state
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            if state.owner.as_ref().is_some_and(|owner| {
+                                owner.id == request.capture_id.0 && owner.kind == request.owner
+                            }) {
+                                state.owner = None;
+                            }
+                        }
+                        let _ = lifecycle_tx.send(CaptureLifecycleEvent::Failed {
+                            capture_id: request.capture_id,
+                            owner: request.owner,
+                            error,
+                        });
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use super::*;
+    use crate::audio::CaptureStopReason;
+
+    fn controller_with_counter(calls: Arc<AtomicUsize>) -> CaptureController {
+        CaptureController::with_start_capture(Arc::new(move |_request, cancellation| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            while !cancellation.is_cancelled() {
+                thread::sleep(Duration::from_millis(1));
+            }
+            Err(CaptureError::StartupCancelled)
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn idle_controller_constructs_no_capture_resources() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let controller = controller_with_counter(Arc::clone(&calls));
+        thread::sleep(Duration::from_millis(10));
+
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        assert!(controller.handle().owner().is_none());
+    }
+
+    #[test]
+    fn direct_hotkey_dispatch_sends_start_before_returning_ticket() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let controller = controller_with_counter(Arc::clone(&calls));
+        let handle = controller.handle();
+        handle
+            .reconfigure_hotkey(
+                true,
+                CaptureHotkeyMode::HoldToTalk,
+                30,
+                None,
+                CaptureOptions::default(),
+            )
+            .unwrap();
+        let HotkeyDispatch::Start(ticket) = handle.dispatch_hotkey(true, Instant::now()) else {
+            panic!("press should dispatch start");
+        };
+        assert_eq!(handle.owner(), Some(AudioOwnerKind::Capture));
+        assert!(ticket.capture_id.0 > 0);
+        for _ in 0..100 {
+            if calls.load(Ordering::Relaxed) == 1 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert!(matches!(
+            handle.dispatch_hotkey(false, Instant::now()),
+            HotkeyDispatch::Stop { capture_id } if capture_id == ticket.capture_id
+        ));
+        let failed = (0..100).find_map(|_| {
+            let event = controller.poll_events().into_iter().find(|event| {
+                matches!(
+                    event,
+                    CaptureLifecycleEvent::Failed {
+                        capture_id,
+                        error: CaptureError::StartupCancelled,
+                        ..
+                    } if *capture_id == ticket.capture_id
+                )
+            });
+            if event.is_none() {
+                thread::sleep(Duration::from_millis(1));
+            }
+            event
+        });
+        assert!(failed.is_some(), "release must cancel startup before ready");
+    }
+
+    #[test]
+    fn stale_capture_id_cannot_stop_new_owner() {
+        let controller = CaptureController::with_start_capture(Arc::new(|_request, _| {
+            Ok(RecordingSession::simulated(
+                None,
+                CaptureStopReason::Explicit,
+            ))
+        }))
+        .unwrap();
+        let handle = controller.handle();
+        let first = handle
+            .start_capture(
+                AudioOwnerKind::Capture,
+                Instant::now(),
+                30,
+                None,
+                CaptureOptions::default(),
+            )
+            .unwrap();
+        handle.abort(first.capture_id).unwrap();
+        handle.release(first.capture_id.0).unwrap();
+        assert!(matches!(
+            handle.start_capture(
+                AudioOwnerKind::Capture,
+                Instant::now(),
+                30,
+                None,
+                CaptureOptions::default(),
+            ),
+            Err(CaptureControlError::Owned(AudioOwnerKind::Capture))
+        ));
+        for _ in 0..100 {
+            if handle.owner().is_none() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(handle.owner().is_none());
+        let second = handle
+            .start_capture(
+                AudioOwnerKind::Capture,
+                Instant::now(),
+                30,
+                None,
+                CaptureOptions::default(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            handle.stop(first.capture_id),
+            Err(CaptureControlError::Stale(first.capture_id.0))
+        );
+        assert_eq!(handle.owner(), Some(AudioOwnerKind::Capture));
+        handle.abort(second.capture_id).unwrap();
+    }
+
+    #[test]
+    fn one_owner_blocks_capture_test_and_playback_overlap() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let controller = controller_with_counter(calls);
+        let handle = controller.handle();
+        let capture = handle
+            .start_capture(
+                AudioOwnerKind::Capture,
+                Instant::now(),
+                30,
+                None,
+                CaptureOptions::default(),
+            )
+            .unwrap();
+
+        assert!(matches!(
+            handle.start_capture(
+                AudioOwnerKind::MicrophoneTest,
+                Instant::now(),
+                30,
+                None,
+                CaptureOptions::default(),
+            ),
+            Err(CaptureControlError::Owned(AudioOwnerKind::Capture))
+        ));
+        assert!(matches!(
+            handle.reserve_owner(AudioOwnerKind::Playback),
+            Err(CaptureControlError::Owned(AudioOwnerKind::Capture))
+        ));
+        handle.abort(capture.capture_id).unwrap();
+    }
+}

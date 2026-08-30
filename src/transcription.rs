@@ -587,6 +587,10 @@ impl RollingPreviewHandle {
         self.session.invalidate();
     }
 
+    pub(crate) fn has_emitted_partial(&self) -> bool {
+        self.session.has_emitted_partial()
+    }
+
     pub(crate) fn is_finished(&self) -> bool {
         self.session.is_finished()
     }

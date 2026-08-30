@@ -1,5 +1,8 @@
 use std::{
-    sync::{Arc, OnceLock, RwLock},
+    sync::{
+        Arc, OnceLock, RwLock,
+        atomic::{AtomicU32, Ordering},
+    },
     time::Instant,
 };
 
@@ -9,28 +12,33 @@ use eframe::egui;
 use global_hotkey::hotkey::{Code, HotKey, Modifiers};
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 
+use crate::audio::control::{CaptureControlHandle, HotkeyDispatch};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HotkeyEvent {
     Pressed,
     Released,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone)]
 pub struct ObservedHotkeyEvent {
     pub event: HotkeyEvent,
     pub observed_at: Instant,
+    pub direct_dispatch: HotkeyDispatch,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone)]
 struct QueuedGlobalHotkeyEvent {
     event: GlobalHotKeyEvent,
     observed_at: Instant,
+    direct_dispatch: HotkeyDispatch,
 }
 
 pub struct HotkeyService {
     manager: Option<GlobalHotKeyManager>,
     hotkey: Option<HotKey>,
     event_rx: Receiver<QueuedGlobalHotkeyEvent>,
+    registered_id: Arc<AtomicU32>,
     pub last_error: Option<String>,
 }
 
@@ -41,6 +49,8 @@ pub struct HotkeyService {
 struct EventHandlerState {
     receiver: Receiver<QueuedGlobalHotkeyEvent>,
     wake_context: Arc<RwLock<egui::Context>>,
+    capture_control: Arc<RwLock<CaptureControlHandle>>,
+    registered_id: Arc<AtomicU32>,
 }
 
 #[derive(Clone)]
@@ -48,15 +58,28 @@ struct EventBridge {
     sender: Sender<QueuedGlobalHotkeyEvent>,
     native_wake: Arc<dyn Fn() + Send + Sync>,
     repaint_wake: Arc<dyn Fn() + Send + Sync>,
+    capture_control: Arc<RwLock<CaptureControlHandle>>,
+    registered_id: Arc<AtomicU32>,
 }
 
 impl EventBridge {
     fn send(&self, event: GlobalHotKeyEvent) {
+        let observed_at = Instant::now();
+        let direct_dispatch = if self.registered_id.load(Ordering::Acquire) == event.id() {
+            let pressed = event.state() == HotKeyState::Pressed;
+            self.capture_control
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .dispatch_hotkey(pressed, observed_at)
+        } else {
+            HotkeyDispatch::None
+        };
         if self
             .sender
             .send(QueuedGlobalHotkeyEvent {
                 event,
-                observed_at: Instant::now(),
+                observed_at,
+                direct_dispatch,
             })
             .is_err()
         {
@@ -68,11 +91,14 @@ impl EventBridge {
 }
 
 impl HotkeyService {
-    pub fn new(spec: &str, context: &egui::Context) -> Self {
+    pub fn new(spec: &str, context: &egui::Context, capture_control: CaptureControlHandle) -> Self {
+        let (event_rx, registered_id) = install_event_handler(context, capture_control);
+        registered_id.store(0, Ordering::Release);
         let mut service = Self {
             manager: None,
             hotkey: None,
-            event_rx: install_event_handler(context),
+            event_rx,
+            registered_id,
             last_error: None,
         };
         if let Err(err) = global_hotkey_startup_allowed() {
@@ -118,6 +144,8 @@ impl HotkeyService {
 
         self.manager = Some(replacement_manager);
         self.hotkey = Some(replacement);
+        self.registered_id
+            .store(replacement.id(), Ordering::Release);
         self.last_error = None;
         Ok(())
     }
@@ -130,6 +158,7 @@ impl HotkeyService {
                 events.push(ObservedHotkeyEvent {
                     event,
                     observed_at: observed.observed_at,
+                    direct_dispatch: observed.direct_dispatch,
                 });
             }
         }
@@ -137,12 +166,17 @@ impl HotkeyService {
     }
 }
 
-fn install_event_handler(context: &egui::Context) -> Receiver<QueuedGlobalHotkeyEvent> {
+fn install_event_handler(
+    context: &egui::Context,
+    capture_control: CaptureControlHandle,
+) -> (Receiver<QueuedGlobalHotkeyEvent>, Arc<AtomicU32>) {
     static STATE: OnceLock<EventHandlerState> = OnceLock::new();
 
     let state = STATE.get_or_init(|| {
         let (sender, receiver) = unbounded();
         let wake_context = Arc::new(RwLock::new(context.clone()));
+        let capture_control = Arc::new(RwLock::new(capture_control.clone()));
+        let registered_id = Arc::new(AtomicU32::new(0));
         let repaint_context = Arc::clone(&wake_context);
         let bridge = EventBridge {
             sender,
@@ -154,11 +188,15 @@ fn install_event_handler(context: &egui::Context) -> Receiver<QueuedGlobalHotkey
                     .clone();
                 context.request_repaint();
             }),
+            capture_control: Arc::clone(&capture_control),
+            registered_id: Arc::clone(&registered_id),
         };
         GlobalHotKeyEvent::set_event_handler(Some(move |event| bridge.send(event)));
         EventHandlerState {
             receiver,
             wake_context,
+            capture_control,
+            registered_id,
         }
     });
 
@@ -168,7 +206,11 @@ fn install_event_handler(context: &egui::Context) -> Receiver<QueuedGlobalHotkey
         .wake_context
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = context.clone();
-    state.receiver.clone()
+    *state
+        .capture_control
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = capture_control;
+    (state.receiver.clone(), Arc::clone(&state.registered_id))
 }
 
 fn replace_hotkey_registration(
@@ -526,6 +568,7 @@ mod tests {
             manager: None,
             hotkey: Some(hotkey),
             event_rx: receiver,
+            registered_id: Arc::new(AtomicU32::new(hotkey.id())),
             last_error: None,
         };
 
@@ -536,6 +579,7 @@ mod tests {
                     state: HotKeyState::Pressed,
                 },
                 observed_at: Instant::now(),
+                direct_dispatch: HotkeyDispatch::None,
             })
             .unwrap();
         sender
@@ -545,6 +589,7 @@ mod tests {
                     state: HotKeyState::Released,
                 },
                 observed_at: Instant::now(),
+                direct_dispatch: HotkeyDispatch::None,
             })
             .unwrap();
 
@@ -559,12 +604,33 @@ mod tests {
     }
 
     #[test]
-    fn event_bridge_enqueues_before_waking_the_event_loop() {
+    fn event_bridge_dispatches_capture_before_enqueuing_and_waking() {
         let (sender, receiver) = unbounded();
         let native_wakes = Arc::new(AtomicUsize::new(0));
         let repaint_wakes = Arc::new(AtomicUsize::new(0));
         let native_wake_count = Arc::clone(&native_wakes);
         let repaint_wake_count = Arc::clone(&repaint_wakes);
+        let controller = crate::audio::control::CaptureController::with_start_capture_for_test(
+            Arc::new(|_request, cancellation| {
+                while !cancellation.is_cancelled() {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(crate::audio::CaptureError::StartupCancelled)
+            }),
+        )
+        .unwrap();
+        controller
+            .handle()
+            .reconfigure_hotkey(
+                true,
+                crate::audio::control::CaptureHotkeyMode::HoldToTalk,
+                30,
+                None,
+                crate::audio::CaptureOptions::default(),
+            )
+            .unwrap();
+        let hotkey = parse_hotkey("Ctrl+Shift+Space").unwrap();
+        let registered_id = Arc::new(AtomicU32::new(hotkey.id()));
         let bridge = EventBridge {
             sender,
             native_wake: Arc::new(move || {
@@ -573,15 +639,20 @@ mod tests {
             repaint_wake: Arc::new(move || {
                 repaint_wake_count.fetch_add(1, Ordering::SeqCst);
             }),
+            capture_control: Arc::new(RwLock::new(controller.handle())),
+            registered_id,
         };
-        let hotkey = parse_hotkey("Ctrl+Shift+Space").unwrap();
-
         bridge.send(GlobalHotKeyEvent {
             id: hotkey.id(),
             state: HotKeyState::Pressed,
         });
 
         let queued = receiver.recv().unwrap();
+        assert!(matches!(queued.direct_dispatch, HotkeyDispatch::Start(_)));
+        assert_eq!(
+            controller.handle().owner(),
+            Some(crate::audio::control::AudioOwnerKind::Capture)
+        );
         assert_eq!(queued.event.id(), hotkey.id());
         assert_eq!(queued.event.state(), HotKeyState::Pressed);
         assert_eq!(native_wakes.load(Ordering::SeqCst), 1);
