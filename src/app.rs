@@ -59,6 +59,12 @@ use crate::models::{
     ModelArtifactOrigin, ModelInstallStatus, ModelRuntimeStatus, SttModelInfo, TranscriptionStatus,
     format_bytes,
 };
+#[cfg(windows)]
+use crate::onnx_model_bundles::verified_onnx_removal_candidate;
+use crate::onnx_model_bundles::{
+    OWNERSHIP_WITNESS_SOURCE, OnnxBundleRemoval, VerifiedOnnxRemovalCandidate,
+    reconcile_onnx_bundle_removal, stage_onnx_bundle_removal,
+};
 use crate::overlay::{
     self, CapturedTarget, OverlayController, OverlayDiagnostic, OverlayMode as NativeOverlayMode,
     OverlayPhase, OverlayPosition as NativeOverlayPosition, OverlayRecovery,
@@ -1369,7 +1375,7 @@ enum AppEvent {
         model_id: String,
         paused: bool,
         recovery_required: bool,
-        result: Result<InstallSmoke, String>,
+        result: Result<CommittedOnnxBundleInstall, String>,
     },
     CaptureReady {
         session_id: SessionId,
@@ -1513,6 +1519,51 @@ struct VerifiedInstallResult {
     smoke: InstallSmoke,
     journal: ActivationJournal,
     remote_install: Option<config::ManagedRemoteModelInstall>,
+}
+
+#[derive(Debug)]
+struct CommittedOnnxBundleInstall {
+    smoke: InstallSmoke,
+    ownership: VerifiedOnnxRemovalCandidate,
+}
+
+#[derive(Debug)]
+enum StagedModelRemoval {
+    Generic(ManagedRemoval),
+    Onnx(OnnxBundleRemoval),
+}
+
+impl StagedModelRemoval {
+    fn removed_files(&self) -> bool {
+        match self {
+            Self::Generic(removal) => removal.removed_files(),
+            Self::Onnx(removal) => removal.removed_files(),
+        }
+    }
+
+    fn prepare_config_commit(
+        &mut self,
+        expected_config_fingerprint: String,
+    ) -> Result<(), InstallError> {
+        match self {
+            Self::Generic(removal) => removal.prepare_config_commit(expected_config_fingerprint),
+            Self::Onnx(removal) => removal.prepare_config_commit(expected_config_fingerprint),
+        }
+    }
+
+    fn commit(self) -> Result<(), InstallError> {
+        match self {
+            Self::Generic(removal) => removal.commit(),
+            Self::Onnx(removal) => removal.commit(),
+        }
+    }
+
+    fn rollback(self) -> Result<(), InstallError> {
+        match self {
+            Self::Generic(removal) => removal.rollback(),
+            Self::Onnx(removal) => removal.rollback(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -2751,7 +2802,7 @@ fn run_onnx_bundle_finalizer(
     service: TranscriptionService,
     cancellation: InstallCancellation,
     staged: crate::onnx_model_bundles::StagedOnnxBundle,
-) -> Result<InstallSmoke, InstallJobFailure> {
+) -> Result<CommittedOnnxBundleInstall, InstallJobFailure> {
     if cancellation.is_cancelled() {
         return Err(InstallJobFailure::normal(
             "Installation cancelled while waiting for verification. Exact ONNX partials were retained for Resume.",
@@ -2766,11 +2817,14 @@ fn run_onnx_bundle_finalizer(
         ));
     }
     let smoke = verified.smoke().clone();
+    let ownership = verified
+        .removal_candidate()
+        .map_err(InstallJobFailure::from)?;
     verified
         .activate()
         .and_then(|activated| activated.commit())
         .map_err(InstallJobFailure::from)?;
-    Ok(smoke)
+    Ok(CommittedOnnxBundleInstall { smoke, ownership })
 }
 fn validate_local_gguf_import(
     source_path: PathBuf,
@@ -2921,6 +2975,33 @@ fn supports_managed_uninstall(model: &SttModelInfo, install_status: &ModelInstal
         && install_status.is_runnable()
 }
 
+fn onnx_ownership_witness(candidate: &VerifiedOnnxRemovalCandidate) -> config::ManagedModelInstall {
+    let mut witness = config::ManagedModelInstall::app_managed(
+        candidate.target_root().to_path_buf(),
+        OWNERSHIP_WITNESS_SOURCE,
+    );
+    witness.sha256 = Some(candidate.receipt_sha256().to_owned());
+    witness
+}
+
+fn onnx_ownership_witness_matches(
+    config: &AppConfig,
+    candidate: &VerifiedOnnxRemovalCandidate,
+) -> bool {
+    config
+        .general
+        .managed_models
+        .get(candidate.model_id())
+        .is_some_and(|witness| {
+            witness.path == candidate.target_root()
+                && witness.source.as_deref() == Some(OWNERSHIP_WITNESS_SOURCE)
+                && witness
+                    .sha256
+                    .as_deref()
+                    .is_some_and(|sha256| sha256.eq_ignore_ascii_case(candidate.receipt_sha256()))
+        })
+}
+
 fn cleanup_excluded_bundled_model(config: &AppConfig) -> Result<bool, InstallError> {
     cleanup_excluded_bundled_model_at(config, config::bundled_model_path())
 }
@@ -2988,6 +3069,7 @@ pub struct LocalTranscriberApp {
     #[cfg(test)]
     comparison_output_replacement_count: usize,
     model_management: ModelManagementState,
+    pending_onnx_removal: Option<VerifiedOnnxRemovalCandidate>,
     models_route_focus_pending: bool,
     status: TranscriptionStatus,
     transcript: String,
@@ -3239,6 +3321,7 @@ impl LocalTranscriberApp {
             #[cfg(test)]
             comparison_output_replacement_count: 0,
             model_management: ModelManagementState::default(),
+            pending_onnx_removal: None,
             models_route_focus_pending: false,
             status: TranscriptionStatus::Idle,
             transcript: String::new(),
@@ -3309,6 +3392,17 @@ impl LocalTranscriberApp {
         }
         app.capture_download_diagnostic_warning();
 
+        let onnx_removal_storage = config::onnx_bundle_storage_dir(&app.config);
+        let onnx_removal_storage_identity = fs::canonicalize(&onnx_removal_storage)
+            .unwrap_or_else(|_| onnx_removal_storage.clone());
+        let onnx_removal_model_ids = config::configured_models(&app.config)
+            .into_iter()
+            .filter_map(|model| {
+                crate::model_catalog::normalized_receipt_backed_bundle_id(&ModelId::new(&model.id))
+                    .filter(|bundle_id| *bundle_id == model.id)
+                    .map(str::to_owned)
+            })
+            .collect::<Vec<_>>();
         let allowed_model_targets = config::configured_models(&app.config)
             .into_iter()
             .filter(|model| {
@@ -3364,14 +3458,66 @@ impl LocalTranscriberApp {
                     reconcile_managed_removal(target, std::slice::from_ref(target), fingerprint)?;
                 }
                 let removal_roots = vec![config::model_storage_dir(&app.config)];
-                discover_managed_removal_targets(&removal_roots).and_then(|discovered| {
-                    let mut allowed_targets = allowed_removal_targets.clone();
-                    allowed_targets.extend(discovered);
-                    allowed_targets.sort();
-                    allowed_targets.dedup();
-                    allowed_targets.iter().try_for_each(|target| {
-                        reconcile_managed_removal(target, &allowed_targets, fingerprint).map(|_| ())
+                let discovered = discover_managed_removal_targets(&removal_roots)?;
+                let mut onnx_recovery_model_ids = onnx_removal_model_ids.clone();
+                let mut generic_discovered = Vec::new();
+                for target in discovered {
+                    if target.starts_with(&onnx_removal_storage)
+                        || target.starts_with(&onnx_removal_storage_identity)
+                    {
+                        let model_id = target
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .ok_or_else(|| {
+                                InstallError::RecoveryRequired(format!(
+                                    "ONNX removal journal target has no stable UTF-8 model id: {}",
+                                    target.display()
+                                ))
+                            })?;
+                        let expected = crate::onnx_model_bundles::bundle_target_root(
+                            &onnx_removal_storage_identity,
+                            model_id,
+                        )
+                        .map_err(|error| {
+                            InstallError::RecoveryRequired(format!(
+                                "ONNX removal journal target has an invalid model id at {}: {error}",
+                                target.display()
+                            ))
+                        })?;
+                        if target != expected {
+                            return Err(InstallError::RecoveryRequired(format!(
+                                "ONNX removal journal does not bind a direct catalog storage child: {}",
+                                target.display()
+                            )));
+                        }
+                        onnx_recovery_model_ids.push(model_id.to_owned());
+                    } else {
+                        generic_discovered.push(target);
+                    }
+                }
+                onnx_recovery_model_ids.sort();
+                onnx_recovery_model_ids.dedup();
+                onnx_recovery_model_ids.iter().try_for_each(|model_id| {
+                    reconcile_onnx_bundle_removal(
+                        &onnx_removal_storage,
+                        model_id,
+                        fingerprint,
+                    )
+                    .map(|_| ())
+                })?;
+                let mut allowed_targets = allowed_removal_targets
+                    .iter()
+                    .filter(|target| {
+                        !target.starts_with(&onnx_removal_storage)
+                            && !target.starts_with(&onnx_removal_storage_identity)
                     })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                allowed_targets.extend(generic_discovered);
+                allowed_targets.sort();
+                allowed_targets.dedup();
+                allowed_targets.iter().try_for_each(|target| {
+                    reconcile_managed_removal(target, &allowed_targets, fingerprint).map(|_| ())
                 })
             });
         if let Err(error) = removal_recovery {
@@ -6716,7 +6862,8 @@ impl LocalTranscriberApp {
                     // replacement job because it is rejected above.
                     let discard_source = self.take_requested_partial_discard(&model_id, job_id);
                     match result {
-                        Ok(smoke) => {
+                        Ok(committed) => {
+                            let CommittedOnnxBundleInstall { smoke, ownership } = committed;
                             self.record_download_diagnostic(
                                 &model_id,
                                 job_id,
@@ -6731,14 +6878,24 @@ impl LocalTranscriberApp {
                             self.model_downloads
                                 .insert(model_id.clone(), ModelInstallStatus::Installed);
                             self.remote_catalog.invalidate_local_models();
-                            self.status = TranscriptionStatus::Idle;
-                            self.status_message = format!(
-                                "ONNX model installed and smoke-tested (health {} ms, load {} ms, decode {} ms, reload {} ms, CPU).",
-                                smoke.health_duration_ms,
-                                smoke.load_duration_ms,
-                                smoke.decode_duration_ms,
-                                smoke.reload_duration_ms,
-                            );
+                            match self.persist_onnx_ownership_witness(&ownership) {
+                                Ok(()) => {
+                                    self.status = TranscriptionStatus::Idle;
+                                    self.status_message = format!(
+                                        "ONNX model installed and smoke-tested (health {} ms, load {} ms, decode {} ms, reload {} ms, CPU).",
+                                        smoke.health_duration_ms,
+                                        smoke.load_duration_ms,
+                                        smoke.decode_duration_ms,
+                                        smoke.reload_duration_ms,
+                                    );
+                                }
+                                Err(error) => {
+                                    self.status = TranscriptionStatus::Error;
+                                    self.status_message = format!(
+                                        "The ONNX model was installed and smoke-tested, but Scribe could not persist its removal ownership witness: {error}. The bundle will not be removable until exact verification and settings persistence succeed."
+                                    );
+                                }
+                            }
                             self.rebuild_local_models_after_committed_change();
                         }
                         Err(message) => {
@@ -9845,10 +10002,140 @@ impl LocalTranscriberApp {
         ));
     }
 
+    fn verified_onnx_removal_candidate_for_model(
+        &self,
+        model: &SttModelInfo,
+    ) -> Result<Option<VerifiedOnnxRemovalCandidate>, String> {
+        if !matches!(
+            crate::model_catalog::normalized_install_artifact(&ModelId::new(&model.id)),
+            Some(crate::model_catalog::NormalizedInstallArtifact::ReceiptBackedBundle { .. })
+        ) {
+            return Ok(None);
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = model;
+            return Err(
+                "Receipt-backed ONNX removal is unavailable on this platform because Scribe cannot establish a stable deletion capability."
+                    .to_owned(),
+            );
+        }
+        #[cfg(windows)]
+        {
+            let expected_target =
+                config::onnx_bundle_target_root(&self.config, &ModelId::new(&model.id))
+                    .ok_or_else(|| {
+                        "The ONNX model does not have an exact catalog-derived removal target."
+                            .to_owned()
+                    })?;
+            if model.local_path.as_deref() != Some(expected_target.as_path()) {
+                return Err(
+                    "The ONNX model path is not Scribe's exact catalog-derived bundle location; no files were authorized for removal."
+                        .to_owned(),
+                );
+            }
+            let candidate = verified_onnx_removal_candidate(
+                &config::onnx_bundle_storage_dir(&self.config),
+                &model.id,
+            )
+            .map_err(|error| {
+                format!("The ONNX bundle receipt or file tree failed removal verification: {error}")
+            })?
+            .ok_or_else(|| {
+                "The ONNX bundle is no longer present at its exact managed location.".to_owned()
+            })?;
+            if candidate.model_id() != model.id || candidate.target_root() != expected_target {
+                return Err(
+                    "The ONNX bundle receipt did not authorize the exact catalog target; no files were removed."
+                        .to_owned(),
+                );
+            }
+            Ok(Some(candidate))
+        }
+    }
+
+    fn persist_onnx_ownership_witness(
+        &mut self,
+        candidate: &VerifiedOnnxRemovalCandidate,
+    ) -> Result<(), String> {
+        let expected_target =
+            config::onnx_bundle_target_root(&self.config, &ModelId::new(candidate.model_id()))
+                .ok_or_else(|| {
+                    "ONNX ownership evidence did not identify a current catalog bundle.".to_owned()
+                })?;
+        if candidate.target_root() != expected_target {
+            return Err(
+                "ONNX ownership evidence did not bind the exact catalog target.".to_owned(),
+            );
+        }
+        if onnx_ownership_witness_matches(&self.config, candidate) {
+            return Ok(());
+        }
+
+        let previous = self.config.clone();
+        self.config.general.managed_models.insert(
+            candidate.model_id().to_owned(),
+            onnx_ownership_witness(candidate),
+        );
+        config::normalize_config(&mut self.config);
+        if !onnx_ownership_witness_matches(&self.config, candidate) {
+            self.config = previous;
+            return Err(
+                "ONNX ownership evidence was rejected by managed-path normalization.".to_owned(),
+            );
+        }
+        #[cfg(test)]
+        let persistence = if self.config_path.is_none() {
+            Ok(())
+        } else {
+            config::save_config(&self.config)
+        };
+        #[cfg(not(test))]
+        let persistence = config::save_config(&self.config);
+        if let Err(error) = persistence {
+            self.config = previous;
+            return Err(format!(
+                "Could not persist the exact ONNX ownership witness: {error}"
+            ));
+        }
+        if let Some(store) = self.settings_store.as_mut() {
+            store.mark_current_persisted();
+        }
+        self.transcription_service = self.transcription_service.with_config(self.config.clone());
+        self.remote_catalog.invalidate_local_models();
+        Ok(())
+    }
+
+    fn authorize_model_removal(&mut self, model: &SttModelInfo) -> bool {
+        self.pending_onnx_removal = None;
+        let candidate = match self.verified_onnx_removal_candidate_for_model(model) {
+            Ok(Some(candidate)) => candidate,
+            Ok(None) => return true,
+            Err(message) => {
+                self.status = TranscriptionStatus::Error;
+                self.status_message = message;
+                return false;
+            }
+        };
+        if let Err(message) = self.persist_onnx_ownership_witness(&candidate) {
+            self.status = TranscriptionStatus::Error;
+            self.status_message = format!(
+                "The ONNX bundle was verified, but removal could not be authorized: {message}"
+            );
+            return false;
+        }
+        self.pending_onnx_removal = Some(candidate);
+        true
+    }
+
     /// Returns true after removal settings are durably committed. Cleanup can
     /// still require recovery after that point, so callers must not undo the
     /// newly persisted active-model selection on a committed removal.
-    fn uninstall_model(&mut self, model: &SttModelInfo) -> bool {
+    fn uninstall_model(
+        &mut self,
+        model: &SttModelInfo,
+        authorized_onnx_removal: Option<&VerifiedOnnxRemovalCandidate>,
+    ) -> bool {
         let bundled_target = if model.id == BUNDLED_BASE_MODEL_ID
             && model.artifact_origin == ModelArtifactOrigin::Bundled
         {
@@ -9869,6 +10156,33 @@ impl LocalTranscriberApp {
             self.status_message = reason;
             return false;
         }
+        let receipt_backed = matches!(
+            crate::model_catalog::normalized_install_artifact(&ModelId::new(&model.id)),
+            Some(crate::model_catalog::NormalizedInstallArtifact::ReceiptBackedBundle { .. })
+        );
+        let onnx_candidate = if receipt_backed {
+            let Some(candidate) = authorized_onnx_removal else {
+                self.status = TranscriptionStatus::Error;
+                self.status_message = "The ONNX removal confirmation no longer has its exact receipt authorization; reopen it before removing any files."
+                    .to_owned();
+                return false;
+            };
+            let expected_target =
+                config::onnx_bundle_target_root(&self.config, &ModelId::new(&model.id));
+            if candidate.model_id() != model.id
+                || expected_target.as_deref() != Some(candidate.target_root())
+                || model.local_path.as_deref() != Some(candidate.target_root())
+                || !onnx_ownership_witness_matches(&self.config, candidate)
+            {
+                self.status = TranscriptionStatus::Error;
+                self.status_message = "The ONNX bundle or its durable ownership witness changed after confirmation opened; no files were removed. Reopen the confirmation to verify it again."
+                    .to_owned();
+                return false;
+            }
+            Some(candidate)
+        } else {
+            None
+        };
         if let Err(error) = self.transcription_service.unload_runtime() {
             self.status_message = format!("Could not unload the selected model: {error}");
             return false;
@@ -9876,19 +10190,20 @@ impl LocalTranscriberApp {
         let replacement = (self.config.general.selected_default_model == model.id)
             .then(|| self.active_model_removal_replacement(&model.id))
             .flatten();
-        let static_managed_target = self
-            .config
-            .general
-            .managed_models
-            .get(&model.id)
-            .map(|install| install.path.clone())
-            .filter(|path| {
-                config::downloaded_model_path(&self.config, model).as_ref() == Some(path)
+        let static_managed_target = onnx_candidate
+            .is_none()
+            .then(|| {
+                self.config
+                    .general
+                    .managed_models
+                    .get(&model.id)
+                    .map(|install| install.path.clone())
+                    .filter(|path| {
+                        config::downloaded_model_path(&self.config, model).as_ref() == Some(path)
+                    })
+                    .filter(|path| is_app_managed_model_path(&self.config, path))
             })
-            .filter(|path| is_app_managed_model_path(&self.config, path));
-        let onnx_bundle_target =
-            config::onnx_bundle_target_root(&self.config, &ModelId::new(&model.id))
-                .filter(|path| is_app_managed_model_path(&self.config, path));
+            .flatten();
         // Each trusted remote artifact owns an opaque leaf directory. Staging
         // that directory removes the generated provenance manifest together
         // with the model, without affecting another variant in the same Hub
@@ -9912,7 +10227,6 @@ impl LocalTranscriberApp {
         let managed_target = bundled_target
             .clone()
             .or(static_managed_target)
-            .or(onnx_bundle_target)
             .or(remote_managed_target)
             .or(imported_receipt_target);
         let prior_fingerprint = match config::settings::artifact_config_fingerprint(&self.config) {
@@ -9924,36 +10238,52 @@ impl LocalTranscriberApp {
                 return false;
             }
         };
-        let mut staged_removal = match managed_target.as_ref() {
-            Some(target) => {
-                let staged = if removing_bundled {
-                    ManagedRemoval::stage_exact_regular_file(
-                        target,
-                        bundled_target
-                            .as_ref()
-                            .expect("bundled target was established"),
-                        prior_fingerprint,
-                    )
-                } else {
-                    ManagedRemoval::stage(target, std::slice::from_ref(target), prior_fingerprint)
-                };
-                match staged {
-                    Ok(removal) => Some(removal),
-                    Err(error) => {
-                        if error.requires_recovery() {
-                            self.artifact_recovery_error = Some(error.to_string());
-                        }
-                        self.status = TranscriptionStatus::Error;
-                        self.status_message = format!("Could not stage model removal: {error}");
-                        return false;
-                    }
+        let staged = if let Some(candidate) = onnx_candidate {
+            stage_onnx_bundle_removal(
+                &config::onnx_bundle_storage_dir(&self.config),
+                &model.id,
+                candidate.receipt_sha256(),
+                prior_fingerprint,
+            )
+            .map(StagedModelRemoval::Onnx)
+            .map(Some)
+        } else {
+            match managed_target.as_ref() {
+                Some(target) => {
+                    let staged = if removing_bundled {
+                        ManagedRemoval::stage_exact_regular_file(
+                            target,
+                            bundled_target
+                                .as_ref()
+                                .expect("bundled target was established"),
+                            prior_fingerprint,
+                        )
+                    } else {
+                        ManagedRemoval::stage(
+                            target,
+                            std::slice::from_ref(target),
+                            prior_fingerprint,
+                        )
+                    };
+                    staged.map(StagedModelRemoval::Generic).map(Some)
                 }
+                None => Ok(None),
             }
-            None => None,
+        };
+        let mut staged_removal = match staged {
+            Ok(removal) => removal,
+            Err(error) => {
+                if error.requires_recovery() {
+                    self.artifact_recovery_error = Some(error.to_string());
+                }
+                self.status = TranscriptionStatus::Error;
+                self.status_message = format!("Could not stage model removal: {error}");
+                return false;
+            }
         };
         let removed_files = staged_removal
             .as_ref()
-            .is_some_and(ManagedRemoval::removed_files);
+            .is_some_and(StagedModelRemoval::removed_files);
         let previous_config = self.config.clone();
         self.model_downloads.remove(&model.id);
         apply_removed_model_config(
@@ -11730,6 +12060,10 @@ impl LocalTranscriberApp {
             crate::model_catalog::normalized_install_artifact(&ModelId::new(&model.id)),
             Some(crate::model_catalog::NormalizedInstallArtifact::ReceiptBackedBundle { .. })
         );
+        let exact_receipt_backed_target = receipt_backed
+            && config::onnx_bundle_target_root(&self.config, &ModelId::new(&model.id))
+                .as_ref()
+                .is_some_and(|target| model.local_path.as_ref() == Some(target));
         let installed = manageable && (!bundled || install_status.is_runnable());
         let custom = model.local_path.is_some()
             && !self.config.general.managed_models.contains_key(&model.id)
@@ -11739,6 +12073,7 @@ impl LocalTranscriberApp {
                 .managed_remote_models
                 .contains_key(&model.id)
             && !imported_gguf
+            && !exact_receipt_backed_target
             && !bundled;
         let onnx_install_active = self
             .onnx_bundle_install
@@ -11954,7 +12289,9 @@ impl LocalTranscriberApp {
             removal_supported: (bundled && model.id == BUNDLED_BASE_MODEL_ID && installed)
                 || (!bundled
                     && !custom
-                    && (imported_gguf || supports_managed_uninstall(model, &install_status))),
+                    && (imported_gguf
+                        || (supports_managed_uninstall(model, &install_status)
+                            && (!receipt_backed || exact_receipt_backed_target)))),
             partial_cleanup_available,
             partial_cleanup_enabled: partial_cleanup_available && has_partial && !mutation_blocked,
             partial_cleanup_disabled_reason: if partial_cleanup_available {
@@ -12051,14 +12388,20 @@ impl LocalTranscriberApp {
                 }
             }
             ScreenAction::RequestModelRemoval(id) => {
-                let active = self.config.general.selected_default_model == id;
-                let bundled = config::configured_models(&self.config)
+                self.pending_onnx_removal = None;
+                let Some(model) = config::configured_models(&self.config)
                     .into_iter()
                     .find(|model| model.id == id)
-                    .is_some_and(|model| {
-                        model.id == BUNDLED_BASE_MODEL_ID
-                            && model.artifact_origin == ModelArtifactOrigin::Bundled
-                    });
+                else {
+                    self.status = TranscriptionStatus::Error;
+                    self.status_message =
+                        "The requested model is no longer configured; no removal was authorized."
+                            .to_owned();
+                    return;
+                };
+                let active = self.config.general.selected_default_model == id;
+                let bundled = model.id == BUNDLED_BASE_MODEL_ID
+                    && model.artifact_origin == ModelArtifactOrigin::Bundled;
                 let replacement_required = active && !bundled;
                 let replacement = active
                     .then(|| self.active_model_removal_replacement(&id))
@@ -12066,6 +12409,8 @@ impl LocalTranscriberApp {
                 if replacement_required && replacement.is_none() {
                     self.status_message =
                         "Install another ready model before removing the active model.".to_owned();
+                } else if !self.authorize_model_removal(&model) {
+                    self.model_management.removal_replacement = None;
                 } else {
                     self.model_management.restore_remove_focus = matches!(
                         &self.model_management.expanded_model_card,
@@ -12084,6 +12429,7 @@ impl LocalTranscriberApp {
             ScreenAction::CloseModelDialog => match self.model_management.dialog.take() {
                 Some(ModelDialog::Add) => self.model_management.restore_add_focus = true,
                 Some(ModelDialog::Remove(id)) => {
+                    self.pending_onnx_removal = None;
                     self.model_management.restore_remove_focus = Some(id);
                     self.model_management.removal_replacement = None;
                 }
@@ -12205,6 +12551,7 @@ impl LocalTranscriberApp {
                 }
             }
             ScreenAction::ConfirmModelRemoval(id) => {
+                let authorized_onnx_removal = self.pending_onnx_removal.take();
                 self.model_management.dialog = None;
                 self.model_management.restore_remove_focus = None;
                 self.model_management.restore_after_removal_focus = false;
@@ -12241,7 +12588,8 @@ impl LocalTranscriberApp {
                     .into_iter()
                     .find(|model| model.id == id)
                 {
-                    let removal_committed = self.uninstall_model(&model);
+                    let removal_committed =
+                        self.uninstall_model(&model, authorized_onnx_removal.as_ref());
                     if removal_committed {
                         if self.model_management.expanded_model_card.as_ref()
                             == Some(&ModelCardKey::Local(id.clone()))
@@ -12445,7 +12793,7 @@ impl LocalTranscriberApp {
                     .into_iter()
                     .find(|model| model.id == model_id.as_str())
                 {
-                    self.uninstall_model(&model);
+                    self.uninstall_model(&model, None);
                 }
             }
         }
@@ -19789,7 +20137,7 @@ mod layout_tests {
         model.artifact_origin = ModelArtifactOrigin::Bundled;
         model.install_status = ModelInstallStatus::Installed;
 
-        assert!(!app.uninstall_model(&model));
+        assert!(!app.uninstall_model(&model, None));
         assert!(path.is_file());
         assert_eq!(serde_json::to_value(&app.config).unwrap(), before);
         assert!(app.status_message.contains("did not match"));
@@ -21078,6 +21426,7 @@ mod layout_tests {
             comparison_wer_compute_count: 0,
             comparison_output_replacement_count: 0,
             model_management: ModelManagementState::default(),
+            pending_onnx_removal: None,
             models_route_focus_pending: false,
             status: TranscriptionStatus::Idle,
             transcript: String::new(),
@@ -26888,6 +27237,143 @@ mod layout_tests {
             app.artifact_installations
                 .contains_key("moonshine-tiny-en-int8-onnx")
         );
+    }
+
+    #[test]
+    fn committed_onnx_install_persists_exact_ownership_witness() {
+        let root = partial_cleanup_test_root("onnx-install-ownership-witness");
+        let _ = fs::remove_dir_all(&root);
+        let mut app = test_app();
+        app.config.general.model_storage_dir = root.clone();
+        config::normalize_config(&mut app.config);
+        let model_id = "moonshine-tiny-en-int8-onnx".to_owned();
+        let target = config::onnx_bundle_target_root(&app.config, &ModelId::new(&model_id))
+            .expect("known ONNX bundle target");
+        let receipt_sha256 = "ab".repeat(32);
+        app.onnx_bundle_install = Some(test_onnx_bundle_install_job(
+            70,
+            model_id.clone(),
+            InstallCancellation::default(),
+        ));
+
+        app.tx
+            .send(AppEvent::OnnxBundleInstallFinished {
+                job_id: 70,
+                model_id: model_id.clone(),
+                paused: false,
+                recovery_required: false,
+                result: Ok(CommittedOnnxBundleInstall {
+                    smoke: test_install_smoke(),
+                    ownership: VerifiedOnnxRemovalCandidate::for_test(
+                        model_id.clone(),
+                        target.clone(),
+                        receipt_sha256.clone(),
+                    ),
+                }),
+            })
+            .unwrap();
+        app.poll_events();
+
+        let witness = app
+            .config
+            .general
+            .managed_models
+            .get(&model_id)
+            .expect("successful install must persist ownership");
+        assert_eq!(witness.path, target);
+        assert_eq!(witness.source.as_deref(), Some(OWNERSHIP_WITNESS_SOURCE));
+        assert_eq!(witness.sha256.as_deref(), Some(receipt_sha256.as_str()));
+        assert!(matches!(app.status, TranscriptionStatus::Idle));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn malformed_onnx_receipt_cannot_open_removal_confirmation() {
+        let root = partial_cleanup_test_root("onnx-removal-malformed-receipt");
+        let _ = fs::remove_dir_all(&root);
+        let mut app = test_app();
+        app.config.general.model_storage_dir = root.clone();
+        config::normalize_config(&mut app.config);
+        let model_id = "moonshine-tiny-en-int8-onnx".to_owned();
+        let target = config::onnx_bundle_target_root(&app.config, &ModelId::new(&model_id))
+            .expect("known ONNX bundle target");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("install-receipt.json"), b"not valid json").unwrap();
+
+        app.apply_model_management_action(ScreenAction::RequestModelRemoval(model_id.clone()));
+
+        assert!(app.model_management.dialog.is_none());
+        assert!(!app.config.general.managed_models.contains_key(&model_id));
+        assert!(
+            target.is_dir(),
+            "authorization failure must not mutate files"
+        );
+        assert!(matches!(app.status, TranscriptionStatus::Error));
+        assert!(app.status_message.contains("failed removal verification"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn onnx_removal_confirmation_fails_closed_without_stable_capabilities() {
+        let root = partial_cleanup_test_root("onnx-removal-platform-fail-closed");
+        let _ = fs::remove_dir_all(&root);
+        let mut app = test_app();
+        app.config.general.model_storage_dir = root.clone();
+        config::normalize_config(&mut app.config);
+        let model_id = "moonshine-tiny-en-int8-onnx".to_owned();
+        let target = config::onnx_bundle_target_root(&app.config, &ModelId::new(&model_id))
+            .expect("known ONNX bundle target");
+        fs::create_dir_all(&target).unwrap();
+
+        app.apply_model_management_action(ScreenAction::RequestModelRemoval(model_id));
+
+        assert!(app.model_management.dialog.is_none());
+        assert!(target.is_dir());
+        assert!(app.status_message.contains("unavailable on this platform"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stale_onnx_confirmation_cannot_authorize_a_changed_witness() {
+        let root = partial_cleanup_test_root("onnx-removal-stale-confirmation");
+        let _ = fs::remove_dir_all(&root);
+        let mut app = test_app();
+        app.config.general.model_storage_dir = root.clone();
+        config::normalize_config(&mut app.config);
+        let model_id = "moonshine-tiny-en-int8-onnx".to_owned();
+        let target = config::onnx_bundle_target_root(&app.config, &ModelId::new(&model_id))
+            .expect("known ONNX bundle target");
+        fs::create_dir_all(&target).unwrap();
+        let authorized = VerifiedOnnxRemovalCandidate::for_test(
+            model_id.clone(),
+            target.clone(),
+            "ab".repeat(32),
+        );
+        app.config
+            .general
+            .managed_models
+            .insert(model_id.clone(), onnx_ownership_witness(&authorized));
+        config::normalize_config(&mut app.config);
+        app.pending_onnx_removal = Some(authorized);
+        app.model_management.dialog = Some(ModelDialog::Remove(model_id.clone()));
+        app.config
+            .general
+            .managed_models
+            .get_mut(&model_id)
+            .unwrap()
+            .sha256 = Some("cd".repeat(32));
+
+        app.apply_model_management_action(ScreenAction::ConfirmModelRemoval(model_id));
+
+        assert!(target.is_dir());
+        assert!(app.pending_onnx_removal.is_none());
+        assert!(
+            app.status_message
+                .contains("changed after confirmation opened")
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
