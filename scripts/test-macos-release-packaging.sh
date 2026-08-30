@@ -3,6 +3,23 @@ set -euo pipefail
 IFS=$'\n\t'
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+# GitHub's macOS images do not guarantee ripgrep. Keep the source-contract
+# checks self-contained by translating the small option subset below to the
+# platform grep when rg is unavailable.
+if ! command -v rg >/dev/null 2>&1; then
+  rg() {
+    local mode='-E' argument
+    local -a arguments=()
+    for argument in "$@"; do
+      if [[ "$argument" == '-F' ]]; then
+        mode='-F'
+      else
+        arguments+=("$argument")
+      fi
+    done
+    command grep "$mode" "${arguments[@]}"
+  }
+fi
 scripts=(build-macos-metal-worker-pack.sh build-macos-release.sh sign-notarize-macos-release.sh verify-macos-release-package.sh report-macos-worker-pack-sizes.sh)
 for script in "${scripts[@]}"; do bash -n "$repo_root/scripts/$script"; done
 for manifest in "$repo_root"/runtime-manifests/gpu-{worker-toolchain,auto-qualification}-macos-{aarch64,x86_64}.json; do jq -e . "$manifest" >/dev/null; done
