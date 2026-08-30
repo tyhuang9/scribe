@@ -484,6 +484,9 @@ fn macos_device_release_epoch_authority_is_bounded_append_only_and_pre_launch() 
     let native = include_str!("../native/scribe_macos_keychain_epoch.c");
     let header = include_str!("../native/scribe_macos_keychain_epoch.h");
     let build = include_str!("../build.rs");
+    let routes = production_source(include_str!("onnx_worker.rs"));
+    let reviewed_namespace =
+        include_str!("../runtime-manifests/gpu-keychain-namespace-macos-release.json");
 
     for required in [
         "release_security_epoch",
@@ -491,6 +494,7 @@ fn macos_device_release_epoch_authority_is_bounded_append_only_and_pre_launch() 
         "schema_version != 2",
         "DeviceRollbackAuthorityRejected",
         "SCRIBE_MACOS_GPU_ROLLBACK_KEYCHAIN_ACCESS_GROUP",
+        "SCRIBE_REVIEWED_MACOS_GPU_ROLLBACK_KEYCHAIN_ACCESS_GROUP",
         "device_release_epoch::admit",
     ] {
         assert!(
@@ -521,9 +525,10 @@ fn macos_device_release_epoch_authority_is_bounded_append_only_and_pre_launch() 
     );
 
     for required in [
-        "scan_floor(store)",
-        "store.append(&EpochMarker::canonical(candidate))",
-        "let final_floor = scan_floor(store)",
+        "scan_markers(store)",
+        "store.append(&candidate_marker)",
+        "marker_floor(&scan_markers(store)?)",
+        "CapacityExceeded",
         "MAX_MARKERS",
         "OnceLock<Client>",
         "sync_channel(1)",
@@ -566,6 +571,8 @@ fn macos_device_release_epoch_authority_is_bounded_append_only_and_pre_launch() 
         "native/scribe_macos_keychain_epoch.c",
         "framework=Security",
         "SCRIBE_MACOS_GPU_ROLLBACK_KEYCHAIN_ACCESS_GROUP",
+        "SCRIBE_REVIEWED_MACOS_GPU_ROLLBACK_KEYCHAIN_ACCESS_GROUP",
+        "gpu-keychain-namespace-macos-release.json",
         "scribe_macos_keychain_authority",
     ] {
         assert!(
@@ -573,6 +580,22 @@ fn macos_device_release_epoch_authority_is_bounded_append_only_and_pre_launch() 
             "macOS build contract lost {required:?}"
         );
     }
+    assert_eq!(
+        reviewed_namespace.trim_end(),
+        r#"{"schema_version":1,"keychain_access_group":""}"#,
+        "production Keychain namespace must remain explicitly unprovisioned until reviewed"
+    );
+    let final_recheck = routes
+        .find("revalidate_production_device_epoch")
+        .expect("request-bound device release revalidation must exist");
+    let route_activation = routes[final_recheck..]
+        .find("let identity = Self::route_identity(route)")
+        .map(|offset| final_recheck + offset)
+        .expect("route activation must follow request-bound revalidation");
+    assert!(
+        final_recheck < route_activation,
+        "device release revalidation must precede active GPU route publication"
+    );
 }
 
 #[test]

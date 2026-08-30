@@ -3,7 +3,10 @@ use std::fmt;
 const ACCOUNT_PREFIX: &[u8] = b"release-security-epoch-v1/";
 const PAYLOAD_PREFIX: &[u8] = b"scribe-gpu-release-security-epoch-v1:";
 const EPOCH_DECIMAL_WIDTH: usize = 20;
-pub(super) const MAX_MARKERS: usize = 128;
+// A marker is created only when a release advances the security epoch. This
+// bound supports far more releases than the product lifetime while keeping a
+// corrupt or attacker-expanded Keychain query strictly bounded.
+pub(super) const MAX_MARKERS: usize = 4_096;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct EpochMarker {
@@ -58,6 +61,7 @@ pub(super) enum AdmissionError {
     StoreUnavailable,
     Contended,
     TimedOut,
+    CapacityExceeded,
     Downgrade { candidate: u64, floor: u64 },
 }
 
@@ -67,11 +71,18 @@ impl fmt::Display for AdmissionError {
     }
 }
 
-fn scan_floor(store: &mut impl MarkerStore) -> Result<u64, AdmissionError> {
+fn scan_markers(store: &mut impl MarkerStore) -> Result<Vec<EpochMarker>, AdmissionError> {
     let markers = store.scan()?;
     if markers.len() > MAX_MARKERS {
         return Err(AdmissionError::CorruptStore);
     }
+    markers
+        .iter()
+        .try_for_each(|marker| marker.epoch().map(|_| ()))?;
+    Ok(markers)
+}
+
+fn marker_floor(markers: &[EpochMarker]) -> Result<u64, AdmissionError> {
     markers
         .iter()
         .try_fold(0_u64, |floor, marker| Ok(floor.max(marker.epoch()?)))
@@ -81,7 +92,8 @@ pub(super) fn admit_with_store(
     candidate: u64,
     store: &mut impl MarkerStore,
 ) -> Result<(), AdmissionError> {
-    let observed = scan_floor(store)?;
+    let markers = scan_markers(store)?;
+    let observed = marker_floor(&markers)?;
     if candidate < observed {
         return Err(AdmissionError::Downgrade {
             candidate,
@@ -89,9 +101,15 @@ pub(super) fn admit_with_store(
         });
     }
 
-    store.append(&EpochMarker::canonical(candidate))?;
+    let candidate_marker = EpochMarker::canonical(candidate);
+    if !markers.contains(&candidate_marker) {
+        if markers.len() >= MAX_MARKERS {
+            return Err(AdmissionError::CapacityExceeded);
+        }
+        store.append(&candidate_marker)?;
+    }
 
-    let final_floor = scan_floor(store)?;
+    let final_floor = marker_floor(&scan_markers(store)?)?;
     if candidate < final_floor {
         return Err(AdmissionError::Downgrade {
             candidate,
@@ -376,6 +394,24 @@ mod tests {
             admit_with_store(2, &mut excessive),
             Err(AdmissionError::CorruptStore)
         );
+    }
+
+    #[test]
+    fn full_store_rejects_a_new_epoch_without_mutation_and_readmits_the_floor() {
+        let mut store = FakeStore {
+            markers: (1..=MAX_MARKERS as u64)
+                .map(EpochMarker::canonical)
+                .collect(),
+            ..FakeStore::default()
+        };
+        let before = store.markers.clone();
+        assert_eq!(
+            admit_with_store(MAX_MARKERS as u64 + 1, &mut store),
+            Err(AdmissionError::CapacityExceeded)
+        );
+        assert_eq!(store.markers, before, "capacity denial must not append");
+        assert_eq!(admit_with_store(MAX_MARKERS as u64, &mut store), Ok(()));
+        assert_eq!(store.markers, before, "the current floor stays idempotent");
     }
 
     #[test]

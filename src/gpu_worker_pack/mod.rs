@@ -33,6 +33,8 @@ use serde::{Deserialize, Serialize};
 ))]
 use sha2::{Digest, Sha256};
 
+const MAX_RELEASE_SECURITY_EPOCH: u64 = 9_007_199_254_740_991;
+
 // Platform resolvers consume the bridge through this stable re-export.
 #[cfg(unix)]
 pub(crate) use launch_binding::UnixPackExecAuthority;
@@ -586,13 +588,8 @@ fn validated_release_authority(
     catalog_bytes: &[u8],
     authority_bytes: &[u8],
 ) -> Option<ValidatedReleaseAuthority> {
-    let Ok(authority) = serde_json::from_slice::<PackReleaseAuthority>(authority_bytes) else {
-        return None;
-    };
-    if authority.schema_version != 2
-        || authority.entries.len() > MAX_PRODUCTION_PACKS
-        || serde_json::to_vec(&authority).ok().as_deref() != Some(authority_bytes)
-        || !manifest::is_canonical_sha256(&authority.catalog_sha256)
+    let authority = validated_release_authority_document(authority_bytes)?;
+    if !manifest::is_canonical_sha256(&authority.catalog_sha256)
         || format!("{:x}", Sha256::digest(catalog_bytes)) != authority.catalog_sha256
     {
         return None;
@@ -607,10 +604,6 @@ fn validated_release_authority(
             .iter()
             .zip(&authority.entries)
             .all(|(catalog, authority)| authority.matches_catalog_entry(catalog))
-        || (authority.release_security_epoch == 0
-            && (!authority.entries.is_empty() || !authority.keychain_access_group.is_empty()))
-        || (authority.release_security_epoch > 0
-            && !canonical_keychain_access_group(&authority.keychain_access_group))
     {
         return None;
     }
@@ -618,6 +611,26 @@ fn validated_release_authority(
         release_security_epoch: authority.release_security_epoch,
         keychain_access_group: authority.keychain_access_group,
     })
+}
+
+fn validated_release_authority_document(authority_bytes: &[u8]) -> Option<PackReleaseAuthority> {
+    let authority = serde_json::from_slice::<PackReleaseAuthority>(authority_bytes).ok()?;
+    if authority.schema_version != 2
+        || authority.entries.len() > MAX_PRODUCTION_PACKS
+        || serde_json::to_vec(&authority).ok().as_deref() != Some(authority_bytes)
+        || authority.release_security_epoch > MAX_RELEASE_SECURITY_EPOCH
+        || !authority
+            .entries
+            .iter()
+            .all(|entry| entry.security_epoch == authority.release_security_epoch)
+        || (authority.release_security_epoch == 0
+            && (!authority.entries.is_empty() || !authority.keychain_access_group.is_empty()))
+        || (authority.release_security_epoch > 0
+            && !canonical_keychain_access_group(&authority.keychain_access_group))
+    {
+        return None;
+    }
+    Some(authority)
 }
 
 fn catalog_matches_release_authority(catalog_bytes: &[u8], authority_bytes: &[u8]) -> bool {
@@ -632,6 +645,73 @@ fn canonical_keychain_access_group(group: &str) -> bool {
         && team_id
             .bytes()
             .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+}
+
+fn release_epoch_identity_matches(
+    authority: &ValidatedReleaseAuthority,
+    target_security_epoch: u64,
+    compiled_group: &str,
+    reviewed_group: &str,
+) -> bool {
+    authority.release_security_epoch > 0
+        && authority.release_security_epoch <= MAX_RELEASE_SECURITY_EPOCH
+        && target_security_epoch == authority.release_security_epoch
+        && compiled_group == authority.keychain_access_group
+        && reviewed_group == authority.keychain_access_group
+        && canonical_keychain_access_group(compiled_group)
+}
+
+/// Rechecks the non-resettable macOS release floor at the final request
+/// activation boundary. A higher epoch observed after this succeeds belongs to
+/// a later request; an already active transcription is never migrated.
+#[cfg(all(target_os = "macos", not(test)))]
+pub(crate) fn revalidate_production_device_epoch(
+    target_security_epoch: Option<u64>,
+) -> Result<(), ()> {
+    let target_security_epoch = target_security_epoch.ok_or(())?;
+    let authority = validated_release_authority_document(EMBEDDED_PACK_RELEASE_AUTHORITY)
+        .map(|authority| ValidatedReleaseAuthority {
+            release_security_epoch: authority.release_security_epoch,
+            keychain_access_group: authority.keychain_access_group,
+        })
+        .ok_or(())?;
+    let compiled_group =
+        option_env!("SCRIBE_MACOS_GPU_ROLLBACK_KEYCHAIN_ACCESS_GROUP").unwrap_or("");
+    let reviewed_group =
+        option_env!("SCRIBE_REVIEWED_MACOS_GPU_ROLLBACK_KEYCHAIN_ACCESS_GROUP").unwrap_or("");
+    if !release_epoch_identity_matches(
+        &authority,
+        target_security_epoch,
+        compiled_group,
+        reviewed_group,
+    ) {
+        return Err(());
+    }
+    device_release_epoch::admit(authority.release_security_epoch).map_err(|_| ())
+}
+
+#[cfg(all(not(target_os = "macos"), not(test)))]
+pub(crate) fn revalidate_production_device_epoch(
+    _target_security_epoch: Option<u64>,
+) -> Result<(), ()> {
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_DEVICE_EPOCH_REJECTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn revalidate_production_device_epoch(
+    _target_security_epoch: Option<u64>,
+) -> Result<(), ()> {
+    TEST_DEVICE_EPOCH_REJECTED.with(|rejected| (!rejected.get()).then_some(()).ok_or(()))
+}
+
+#[cfg(test)]
+pub(crate) fn set_test_device_epoch_rejected(rejected: bool) {
+    TEST_DEVICE_EPOCH_REJECTED.with(|value| value.set(rejected));
 }
 
 /// Verifies the bounded installed catalog and returns retained pack leases plus
@@ -811,12 +891,17 @@ fn enforce_production_discovery_epochs(
 ) -> PackLeaseDiscovery {
     let compiled_group =
         option_env!("SCRIBE_MACOS_GPU_ROLLBACK_KEYCHAIN_ACCESS_GROUP").unwrap_or("");
+    let reviewed_group =
+        option_env!("SCRIBE_REVIEWED_MACOS_GPU_ROLLBACK_KEYCHAIN_ACCESS_GROUP").unwrap_or("");
     if authority.release_security_epoch == 0 {
         return discovery;
     }
-    if compiled_group != authority.keychain_access_group
-        || !canonical_keychain_access_group(compiled_group)
-        || device_release_epoch::admit(authority.release_security_epoch).is_err()
+    if !release_epoch_identity_matches(
+        authority,
+        authority.release_security_epoch,
+        compiled_group,
+        reviewed_group,
+    ) || device_release_epoch::admit(authority.release_security_epoch).is_err()
     {
         return reject_device_rollback_authority(discovery);
     }
@@ -908,15 +993,19 @@ fn enforce_device_epoch_with_store(
     discovery: PackLeaseDiscovery,
     authority: &ValidatedReleaseAuthority,
     compiled_group: &str,
+    reviewed_group: &str,
     store: &mut impl device_release_epoch::MarkerStore,
     local_ledger: impl FnOnce(&PackLeaseDiscovery) -> Result<(), ()>,
 ) -> PackLeaseDiscovery {
     if authority.release_security_epoch == 0 {
         return discovery;
     }
-    if compiled_group != authority.keychain_access_group
-        || !canonical_keychain_access_group(compiled_group)
-        || device_release_epoch::admit_with_store(authority.release_security_epoch, store).is_err()
+    if !release_epoch_identity_matches(
+        authority,
+        authority.release_security_epoch,
+        compiled_group,
+        reviewed_group,
+    ) || device_release_epoch::admit_with_store(authority.release_security_epoch, store).is_err()
     {
         return reject_device_rollback_authority(discovery);
     }
@@ -1423,6 +1512,20 @@ mod tests {
                 "unexpected Keychain namespace accepted: {rejected}"
             );
         }
+
+        let authority = release_authority(1);
+        assert!(super::release_epoch_identity_matches(
+            &authority,
+            1,
+            "ABCDE12345.com.scribe.local-transcriber",
+            "ABCDE12345.com.scribe.local-transcriber",
+        ));
+        assert!(!super::release_epoch_identity_matches(
+            &authority,
+            1,
+            "ABCDE12345.com.scribe.local-transcriber",
+            "OTHER12345.com.scribe.local-transcriber",
+        ));
     }
 
     #[test]
@@ -1620,6 +1723,19 @@ mod tests {
         assert!(
             !super::catalog_matches_release_authority(&catalog, &whitespace_tamper),
             "noncanonical authority bytes were accepted"
+        );
+
+        let mut unsafe_epoch: super::PackReleaseAuthority = serde_json::from_slice(&exact).unwrap();
+        unsafe_epoch.release_security_epoch = super::MAX_RELEASE_SECURITY_EPOCH + 1;
+        for entry in &mut unsafe_epoch.entries {
+            entry.security_epoch = unsafe_epoch.release_security_epoch;
+        }
+        assert!(
+            super::validated_release_authority_document(
+                &serde_json::to_vec(&unsafe_epoch).unwrap()
+            )
+            .is_none(),
+            "epochs above the exact JSON integer range were accepted"
         );
 
         let empty_catalog = br#"{"schema_version":1,"packs":[]}"#;
@@ -1992,6 +2108,7 @@ mod tests {
             discovery,
             &release_authority(7),
             "ABCDE12345.com.scribe.local-transcriber",
+            "ABCDE12345.com.scribe.local-transcriber",
             &mut device,
             |_| {
                 local_ledger_called.set(true);
@@ -2025,6 +2142,7 @@ mod tests {
                 discovery.clone(),
                 &release_authority(5),
                 "ABCDE12345.com.scribe.local-transcriber",
+                "ABCDE12345.com.scribe.local-transcriber",
                 &mut device,
                 |_| Err(()),
             );
@@ -2051,6 +2169,7 @@ mod tests {
             empty.clone(),
             &release_authority(12),
             "ABCDE12345.com.scribe.local-transcriber",
+            "ABCDE12345.com.scribe.local-transcriber",
             &mut device,
             |_| Ok(()),
         );
@@ -2058,6 +2177,7 @@ mod tests {
         let rejected = super::enforce_device_epoch_with_store(
             empty,
             &release_authority(11),
+            "ABCDE12345.com.scribe.local-transcriber",
             "ABCDE12345.com.scribe.local-transcriber",
             &mut device,
             |_| Ok(()),
@@ -2081,6 +2201,7 @@ mod tests {
                 discovery.clone(),
                 &release_authority(1),
                 compiled,
+                "ABCDE12345.com.scribe.local-transcriber",
                 &mut device,
                 |_| Ok(()),
             );

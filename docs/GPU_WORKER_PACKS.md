@@ -347,13 +347,16 @@ worker and reaches the parent only through the challenge-bound capability
 Hello. Release verification checks these Mach-O linkage boundaries with both
 `otool -L` and `otool -l`.
 
-Before a bundled verified lease can become a route, discovery loads the private
-per-platform/backend/pack security-epoch high-water ledger under the same
-anchored lock and atomic durable-replace discipline as activation state. The
-same epoch is accepted, a higher epoch advances the ledger, and a lower epoch,
-corrupt state, or unavailable state authority fails GPU discovery closed. A
-catalog cache never bypasses this check. CPU routing remains available, and an
-empty production trust result does not create or mutate ledger state.
+On Windows, before a bundled verified lease can become a route, discovery loads
+the private per-platform/backend/pack security-epoch high-water ledger under the
+same anchored lock and atomic durable-replace discipline as activation state.
+On macOS, the data-protection Keychain release floor is authoritative and the
+app-data ledger is advisory only; deleting application data cannot reset the
+device floor. The same epoch is accepted, a higher epoch advances the relevant
+authority, and a lower epoch, corrupt state, or unavailable authority fails GPU
+admission closed. A catalog cache never bypasses this check. CPU routing remains
+available, and an empty production trust result does not mutate Windows ledger
+state.
 
 The signed desktop is the non-resettable release authority for bundled macOS
 packs. Both universal slices embed identical canonical schema-v2 authority bytes
@@ -374,20 +377,34 @@ builder passes that same value to every pack author's `--security-epoch` and
 writes it as the outer release epoch. A positive epoch may intentionally carry
 an empty catalog to revoke prior GPU capability, but it remains a protected
 release. The device-local Keychain floor is append-only; no packaging or runtime
-path resets, deletes, or lowers it.
+path resets, deletes, or lowers it. Release epochs are canonical exact JSON
+integers from `0` through `9007199254740991`, avoiding loss of precision in the
+packaging toolchain. Runtime admission also requires every authority entry to
+carry the outer release epoch.
 
 A protected release (a positive epoch or any Metal catalog) requires
 Developer-ID signing, a regular non-symlink distribution provisioning profile,
-and `SCRIBE_MACOS_GPU_ROLLBACK_KEYCHAIN_ACCESS_GROUP` matching exactly
-`^[A-Z0-9]{10}\.com\.scribe\.local-transcriber$`. The profile's application
-identifier and sole `keychain-access-groups` value must both be that exact
-group. The builder generates a protected desktop entitlement from the checked-in
-template, embeds the profile at `Contents/embedded.provisionprofile` before the
-final app signing pass, and verifies that both the desktop executable and outer
-app expose exactly that group. CPU and Metal worker binaries use the base
-entitlements and must not carry the desktop Keychain group. The package verifier
-rechecks the authority/catalog binding, effective entitlements, profile
+and `SCRIBE_MACOS_GPU_ROLLBACK_KEYCHAIN_ACCESS_GROUP` matching exactly the
+non-empty value in the source-reviewed
+`runtime-manifests/gpu-keychain-namespace-macos-release.json`. That manifest is
+empty by default, so protected releases fail closed until a separate security
+review pins the production Team ID and access group. The profile's application
+identifier and sole `keychain-access-groups` value must both equal that exact
+group, and its team identifier must equal the group's Team ID. The builder
+generates protected application, team, and Keychain entitlements from the
+checked-in template, embeds the profile before the final signing pass, and
+verifies both the desktop executable and outer app. CPU and Metal workers must
+not carry the desktop Keychain group. The package verifier rechecks the
+authority/catalog binding, reviewed namespace, effective entitlements, profile
 authorization, and profile-aware exact inventory.
+
+Discovery checks the device floor before publishing a verified route, including
+cached discovery. Because provider probing can take several seconds, the parent
+checks the embedded release identity and Keychain floor again immediately before
+making a GPU route active. That final check is the request activation boundary:
+Auto skips a rejected GPU and reaches CPU, explicit GPU reports a clear error,
+and a transcription already active when a newer release advances the floor is
+allowed to finish rather than being migrated.
 
 The hosted pull-request lane is deliberately credential-free and builds only
 the epoch-zero empty catalog. The protected official lane is also CPU-only at

@@ -5825,6 +5825,12 @@ struct InferenceWorkerRoute {
     auto_evidence_id: Option<String>,
 }
 
+#[derive(Debug)]
+enum RoutePreparationError {
+    DeviceRollbackAuthority(RuntimeError),
+    Fatal(RuntimeError),
+}
+
 #[derive(Clone)]
 struct InferenceWorkerRoutePlan {
     routes: Arc<Vec<InferenceWorkerRoute>>,
@@ -6844,25 +6850,104 @@ impl InferenceWorkerRegistry {
         Ok(())
     }
 
-    fn prepare_route(&self, route: &InferenceWorkerRoute) -> Result<(), RuntimeError> {
+    fn retire_gpu_workers_after_authority_rejection(
+        &self,
+        route: &InferenceWorkerRoute,
+    ) -> Result<(), RuntimeError> {
+        let active_gpu = {
+            let mut active = self.active_route.lock().map_err(|_| {
+                RuntimeError::WorkerUnavailable("active inference route lock poisoned".to_owned())
+            })?;
+            active
+                .as_ref()
+                .is_some_and(|current| current.identity.backend != BackendKind::Cpu)
+                .then(|| active.take())
+                .flatten()
+        };
+        let route_retirement = route.supervisor.retire();
+        let active_retirement = if active_gpu
+            .as_ref()
+            .is_some_and(|active| !Self::same_supervisor(&active.supervisor, &route.supervisor))
+        {
+            active_gpu
+                .as_ref()
+                .expect("checked active GPU route")
+                .supervisor
+                .retire()
+        } else {
+            Ok(())
+        };
+        route_retirement.and(active_retirement)
+    }
+
+    fn revalidate_route_activation(
+        &self,
+        route: &InferenceWorkerRoute,
+    ) -> Result<(), RoutePreparationError> {
+        if !route.provider.is_gpu() {
+            return Ok(());
+        }
+        let target_security_epoch = route
+            .target
+            .as_ref()
+            .and_then(|target| target.pack.as_ref())
+            .map(|pack| pack.security_epoch);
+        if crate::gpu_worker_pack::revalidate_production_device_epoch(target_security_epoch).is_ok()
+        {
+            return Ok(());
+        }
+        if self
+            .retire_gpu_workers_after_authority_rejection(route)
+            .is_err()
+        {
+            return Err(RoutePreparationError::Fatal(
+                RuntimeError::WorkerUnavailable(
+                    "GPU route rejected by the device-local release rollback authority; worker retirement was incomplete"
+                        .to_owned(),
+                ),
+            ));
+        }
+        Err(RoutePreparationError::DeviceRollbackAuthority(
+            RuntimeError::WorkerUnavailable(
+                "GPU route rejected by the device-local release rollback authority".to_owned(),
+            ),
+        ))
+    }
+
+    fn prepare_route(&self, route: &InferenceWorkerRoute) -> Result<(), RoutePreparationError> {
         let identity = Self::route_identity(route);
         let prior = {
             let mut active = self.active_route.lock().map_err(|_| {
-                RuntimeError::WorkerUnavailable("active inference route lock poisoned".to_owned())
+                RoutePreparationError::Fatal(RuntimeError::WorkerUnavailable(
+                    "active inference route lock poisoned".to_owned(),
+                ))
             })?;
             if active.as_ref().is_some_and(|current| {
                 current.identity == identity
                     && Self::same_supervisor(&current.supervisor, &route.supervisor)
             }) {
+                drop(active);
+                // Warm-route reuse is still a new request and must recheck the
+                // device authority immediately before use.
+                self.revalidate_route_activation(route)?;
                 return Ok(());
             }
             active.take()
         };
         if let Some(prior) = prior {
-            prior.supervisor.retire()?;
+            prior
+                .supervisor
+                .retire()
+                .map_err(RoutePreparationError::Fatal)?;
         }
+        // Discovery, cache lookup, and retiring a prior route can take time.
+        // Recheck directly before publication. An epoch advanced after this
+        // boundary belongs to the next request; active work is never migrated.
+        self.revalidate_route_activation(route)?;
         *self.active_route.lock().map_err(|_| {
-            RuntimeError::WorkerUnavailable("active inference route lock poisoned".to_owned())
+            RoutePreparationError::Fatal(RuntimeError::WorkerUnavailable(
+                "active inference route lock poisoned".to_owned(),
+            ))
         })? = Some(ActiveInferenceRoute {
             identity,
             supervisor: route.supervisor.clone(),
@@ -7246,7 +7331,23 @@ impl InferenceWorkerRegistry {
                 continue;
             }
             attempted = true;
-            self.prepare_route(route)?;
+            match self.prepare_route(route) {
+                Ok(()) => {}
+                Err(RoutePreparationError::DeviceRollbackAuthority(error)) => {
+                    self.invalidate_gpu_catalog_after_runtime_failure(route)?;
+                    let error = if preference == AccelerationPreference::Gpu {
+                        RuntimeError::WorkerUnavailable(format!(
+                            "{error}; CPU fallback is forbidden for explicit GPU"
+                        ))
+                    } else {
+                        RuntimeError::RetryableWorkerFailure(error.to_string())
+                    };
+                    record_backend_fallback(&mut fallback_history, route, &error);
+                    last_retryable = Some(error);
+                    continue;
+                }
+                Err(RoutePreparationError::Fatal(error)) => return Err(error),
+            }
             match route.supervisor.load(
                 artifact.clone(),
                 Self::worker_preference_for_route(route, preference),
@@ -7382,7 +7483,23 @@ impl InferenceWorkerRegistry {
                 continue;
             }
             attempted = true;
-            self.prepare_route(route)?;
+            match self.prepare_route(route) {
+                Ok(()) => {}
+                Err(RoutePreparationError::DeviceRollbackAuthority(error)) => {
+                    self.invalidate_gpu_catalog_after_runtime_failure(route)?;
+                    let error = if preference == AccelerationPreference::Gpu {
+                        RuntimeError::WorkerUnavailable(format!(
+                            "{error}; CPU fallback is forbidden for explicit GPU"
+                        ))
+                    } else {
+                        RuntimeError::RetryableWorkerFailure(error.to_string())
+                    };
+                    record_backend_fallback(&mut fallback_history, route, &error);
+                    last_retryable = Some(error);
+                    continue;
+                }
+                Err(RoutePreparationError::Fatal(error)) => return Err(error),
+            }
             match route.supervisor.transcribe(
                 artifact.clone(),
                 Self::worker_preference_for_route(route, preference),
@@ -7540,7 +7657,21 @@ impl InferenceWorkerRegistry {
                 continue;
             }
             attempted = true;
-            self.prepare_route(route)?;
+            match self.prepare_route(route) {
+                Ok(()) => {}
+                Err(RoutePreparationError::DeviceRollbackAuthority(error)) => {
+                    self.invalidate_gpu_catalog_after_runtime_failure(route)?;
+                    last_retryable = Some(if preference == AccelerationPreference::Gpu {
+                        RuntimeError::WorkerUnavailable(format!(
+                            "{error}; CPU fallback is forbidden for explicit GPU"
+                        ))
+                    } else {
+                        RuntimeError::RetryableWorkerFailure(error.to_string())
+                    });
+                    continue;
+                }
+                Err(RoutePreparationError::Fatal(error)) => return Err(error),
+            }
             match route.supervisor.health(
                 artifact.clone(),
                 Self::worker_preference_for_route(route, preference),
@@ -12135,6 +12266,104 @@ mod tests {
                 GpuRouteCatalogLookup::Probe
             ));
         }
+    }
+
+    #[test]
+    fn request_bound_device_epoch_rejection_keeps_auto_safe_and_explicit_gpu_strict() {
+        struct ResetDeviceEpochRejection;
+        impl Drop for ResetDeviceEpochRejection {
+            fn drop(&mut self) {
+                crate::gpu_worker_pack::set_test_device_epoch_rejected(false);
+            }
+        }
+
+        crate::gpu_worker_pack::set_test_device_epoch_rejected(true);
+        let _reset = ResetDeviceEpochRejection;
+
+        let auto_gpu_launcher = Arc::new(TestLauncher::new([TestMode::Normal]));
+        let auto_cpu_launcher = Arc::new(TestLauncher::new([TestMode::RuntimeLoadThenExit]));
+        let mut auto_gpu_route = verified_gpu_route(
+            BackendKind::Metal,
+            "native:registry:metal-0",
+            "macos:metal",
+            'a',
+        );
+        auto_gpu_route.supervisor =
+            inference_supervisor_with_launcher(Arc::clone(&auto_gpu_launcher));
+        let mut auto_registry = InferenceWorkerRegistry::with_cpu_supervisor(
+            inference_supervisor_with_launcher(Arc::clone(&auto_cpu_launcher)),
+        );
+        auto_registry.gpu_routes_for_testing = Some(verified_gpu_catalog(vec![auto_gpu_route]));
+
+        let execution = auto_registry
+            .load(missing_gguf_artifact(), AccelerationPreference::Auto)
+            .expect("Auto must skip a request-bound rollback rejection and use CPU");
+        assert_eq!(auto_gpu_launcher.launches.load(Ordering::Acquire), 0);
+        assert_eq!(auto_cpu_launcher.launches.load(Ordering::Acquire), 1);
+        let selection = execution
+            .diagnostics
+            .resolved_acceleration
+            .selection
+            .expect("Auto rollback fallback must retain typed diagnostics");
+        assert_eq!(selection.target.backend, BackendKind::Cpu);
+        assert_eq!(selection.fallback_history.len(), 1);
+
+        let explicit_gpu_launcher = Arc::new(TestLauncher::new([TestMode::Normal]));
+        let explicit_cpu_launcher = Arc::new(TestLauncher::new([TestMode::Normal]));
+        let mut explicit_gpu_route = verified_gpu_route(
+            BackendKind::Metal,
+            "native:registry:metal-0",
+            "macos:metal",
+            'b',
+        );
+        explicit_gpu_route.supervisor =
+            inference_supervisor_with_launcher(Arc::clone(&explicit_gpu_launcher));
+        let mut explicit_registry = InferenceWorkerRegistry::with_cpu_supervisor(
+            inference_supervisor_with_launcher(Arc::clone(&explicit_cpu_launcher)),
+        );
+        explicit_registry.gpu_routes_for_testing =
+            Some(verified_gpu_catalog(vec![explicit_gpu_route]));
+
+        let error = explicit_registry
+            .load(missing_gguf_artifact(), AccelerationPreference::Gpu)
+            .expect_err("explicit GPU must never use CPU after rollback rejection")
+            .to_string();
+        assert!(error.contains("device-local release rollback authority"));
+        assert!(error.contains("CPU fallback is forbidden"));
+        assert_eq!(explicit_gpu_launcher.launches.load(Ordering::Acquire), 0);
+        assert_eq!(explicit_cpu_launcher.launches.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn warm_gpu_route_rechecks_device_epoch_before_reuse() {
+        struct ResetDeviceEpochRejection;
+        impl Drop for ResetDeviceEpochRejection {
+            fn drop(&mut self) {
+                crate::gpu_worker_pack::set_test_device_epoch_rejected(false);
+            }
+        }
+
+        let route = verified_gpu_route(
+            BackendKind::Metal,
+            "native:registry:metal-0",
+            "macos:metal",
+            'c',
+        );
+        let registry =
+            InferenceWorkerRegistry::with_cpu_supervisor(InferenceWorkerSupervisor::unstarted());
+        registry.prepare_route(&route).unwrap();
+        assert!(registry.active_route.lock().unwrap().is_some());
+
+        crate::gpu_worker_pack::set_test_device_epoch_rejected(true);
+        let _reset = ResetDeviceEpochRejection;
+        assert!(matches!(
+            registry.prepare_route(&route),
+            Err(RoutePreparationError::DeviceRollbackAuthority(_))
+        ));
+        assert!(
+            registry.active_route.lock().unwrap().is_none(),
+            "rollback denial must retire the already-warm GPU route"
+        );
     }
 
     #[test]
