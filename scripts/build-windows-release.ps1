@@ -517,7 +517,7 @@ try {
         "1. Confirm the extracted tree contains no files beyond bundle-inventory.json and every exact path listed in its files array.",
         "2. For every listed file, compare its byte length and SHA-256 with bundle-inventory.json.",
         "3. Confirm bundled-model-manifest.json identifies whisper-base.en-Q8_0.gguf as 84,886,208 bytes with SHA-256 3b46ca40bccbf7609c68d88a36d96077a04ca7c87f2060ede06f129fac3e7652.",
-        "4. Confirm local-transcriber.exe is an AMD64 Windows GUI PE, scribe-inference-worker.exe is an AMD64 Windows console PE, and no additional EXE, DLL, .onnx, .ort, Python, venv, runner, or runtimes directory is present.",
+        "4. Confirm local-transcriber.exe is an AMD64 Windows GUI PE, the CPU and any pack worker executables are AMD64 Windows console PEs, every EXE/DLL is present at exactly one path in bundle-inventory.json, and each GPU pack EXE/DLL is additionally covered by worker-pack-catalog.json and its signed pack inventory; no loose .onnx, .ort, Python, venv, runner, or unlisted runtimes directory may be present.",
         "5. For an installer, compare every installed payload file and hash with the portable tree; only unins000.exe and unins000.dat may be additional files in the program directory.",
         "This release workflow does not claim Authenticode signing. Obtain artifacts from a trusted release channel and verify hashes before running them.",
         "",

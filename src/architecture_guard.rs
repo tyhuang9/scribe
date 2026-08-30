@@ -1106,19 +1106,12 @@ fn release_packaging_accepts_only_compiled_verified_declared_pack_roots() {
     assert!(installer.contains("IsGeneratedWorkerPackFile(RelativePath)"));
     assert!(workflow.contains("/DWorkerPackAllowlist=..\\dist\\worker-pack-allowlist.iss"));
     for required in [
-        "include_gpu_worker_packs:",
         "default: false",
         "SCRIBE_GPU_PACK_RELEASE_POLICY",
         "resolve-windows-gpu-release-policy.ps1",
-        "steps.gpu-release-policy.outputs.include_gpu_worker_packs == 'true'",
         "temporary_cpu_only_stage4",
         "gpu_packs_required",
         "needs.build.outputs.gpu_worker_packs_included",
-        "SCRIBE_GPU_PACK_SIGNING_KEY_PKCS8_BASE64",
-        "prepare-windows-gpu-worker-packs.ps1",
-        "artifacts\\gpu-worker-packs\\production\\cuda",
-        "artifacts\\gpu-worker-packs\\production\\vulkan",
-        "-WorkerPackRoot $workerPackRoots",
         "report-windows-worker-pack-sizes.ps1",
     ] {
         assert!(
@@ -1126,11 +1119,27 @@ fn release_packaging_accepts_only_compiled_verified_declared_pack_roots() {
             "Stage 4 release workflow lost {required:?}"
         );
     }
+    for forbidden in [
+        "include_gpu_worker_packs:",
+        "Build production-signed CUDA and Vulkan worker packs",
+        "SCRIBE_GPU_PACK_SIGNING_KEY_PKCS8_BASE64",
+        "SCRIBE_GPU_PACK_SIGNING_KEY_ID",
+        "GPU_PACK_PRIVATE_KEY_BASE64",
+        "artifacts\\gpu-worker-packs\\production",
+        "-WorkerPackRoot",
+    ] {
+        assert!(
+            !workflow.contains(forbidden),
+            "candidate-ref release workflow regained signing authority or production GPU-pack input {forbidden:?}"
+        );
+    }
     for required in [
         "Official Windows releases require SCRIBE_GPU_PACK_RELEASE_POLICY",
         "temporary_cpu_only_stage4",
         "gpu_packs_required",
         "include_gpu_worker_packs",
+        "candidate-ref workflow never receives GPU pack signing authority",
+        "separately protected trusted signing workflow",
     ] {
         assert!(
             release_policy.contains(required),

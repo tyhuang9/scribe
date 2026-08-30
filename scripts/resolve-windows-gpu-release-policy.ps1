@@ -23,19 +23,20 @@ if ($Ref.Length -gt 1024 -or -not $Ref.StartsWith('refs/', [StringComparison]::O
 $isTagRelease = $EventName -ceq 'push' -and $Ref.StartsWith('refs/tags/', [StringComparison]::Ordinal)
 $isManualRelease = $EventName -ceq 'workflow_dispatch' -and $PublishRelease.IsPresent
 $isOfficialRelease = $isTagRelease -or $isManualRelease
-$includeGpuPacks = $RequestedGpuPacks.IsPresent
+$includeGpuPacks = $false
 $resolvedPolicy = if ([string]::IsNullOrEmpty($Policy)) { 'unconfigured' } else { $Policy }
+
+if ($RequestedGpuPacks.IsPresent) {
+    throw 'This candidate-ref workflow never receives GPU pack signing authority. Production GPU packs require a separately protected trusted signing workflow over fixed verified unsigned artifacts.'
+}
 
 if ($isOfficialRelease) {
     switch ($Policy) {
         'temporary_cpu_only_stage4' {
-            if ($RequestedGpuPacks.IsPresent) {
-                throw 'The temporary_cpu_only_stage4 official-release policy forbids GPU pack inclusion; change the reviewed repository policy to gpu_packs_required after production trust is provisioned.'
-            }
             $includeGpuPacks = $false
         }
         'gpu_packs_required' {
-            $includeGpuPacks = $true
+            throw 'The gpu_packs_required policy is not provisioned in this candidate-ref workflow. Production GPU packs require a separately protected trusted signing workflow over fixed verified unsigned artifacts.'
         }
         default {
             throw 'Official Windows releases require SCRIBE_GPU_PACK_RELEASE_POLICY to be exactly temporary_cpu_only_stage4 or gpu_packs_required.'
@@ -67,7 +68,7 @@ if (-not [string]::IsNullOrWhiteSpace($GitHubOutputPath)) {
 }
 
 if ($isOfficialRelease -and $Policy -ceq 'temporary_cpu_only_stage4') {
-    Write-Warning 'Official release is using the explicit temporary Stage 4 CPU-only policy. Provision reviewed production trust before changing the repository policy to gpu_packs_required.'
+    Write-Warning 'Official release is using the explicit temporary Stage 4 CPU-only policy. Provision a separately protected trusted signing workflow before changing the repository policy to gpu_packs_required.'
 }
 
 [pscustomobject]$result

@@ -223,29 +223,14 @@ function Assert-VulkanSdkWorkflowContract([string]$Workflow) {
 
 function Assert-GpuWorkerPackWorkflowContract([string]$Workflow) {
     foreach ($required in @(
-        'include_gpu_worker_packs:',
         'default: false',
         'SCRIBE_GPU_PACK_RELEASE_POLICY',
         'resolve-windows-gpu-release-policy.ps1',
-        "if: steps.gpu-release-policy.outputs.include_gpu_worker_packs == 'true'",
         'gpu_pack_release_policy: ${{ steps.gpu-release-policy.outputs.release_policy }}',
         'gpu_worker_packs_included: ${{ steps.gpu-release-policy.outputs.include_gpu_worker_packs }}',
         'temporary_cpu_only_stage4',
         'gpu_packs_required',
         'Official GPU-capable publication omitted required CUDA or Vulkan worker packs.',
-        'SCRIBE_GPU_PACK_SIGNING_KEY_PKCS8_BASE64',
-        'SCRIBE_GPU_PACK_SIGNING_KEY_ID',
-        '[Convert]::FromBase64String',
-        '$env:GPU_PACK_PRIVATE_KEY_BASE64 = $null',
-        '$keyBytes.Length -lt 32 -or $keyBytes.Length -gt 16384',
-        '$env:RUNNER_TEMP',
-        '[System.IO.File]::WriteAllBytes($keyPath, $keyBytes)',
-        'prepare-windows-gpu-worker-packs.ps1',
-        '[Array]::Clear($keyBytes, 0, $keyBytes.Length)',
-        'Remove-Item -LiteralPath $keyPath -Force',
-        'artifacts\gpu-worker-packs\production\cuda',
-        'artifacts\gpu-worker-packs\production\vulkan',
-        '-WorkerPackRoot $workerPackRoots',
         'report-windows-worker-pack-sizes.ps1',
         'dist/gpu-pack-evidence'
     )) {
@@ -253,20 +238,18 @@ function Assert-GpuWorkerPackWorkflowContract([string]$Workflow) {
             throw "Windows GPU worker-pack workflow lost required fail-closed control: $required"
         }
     }
-    $gpuBuild = Get-WorkflowStepBlock $Workflow 'Build production-signed CUDA and Vulkan worker packs' 'Build validated portable payload'
-    Assert-OrderedWorkflowTokens $gpuBuild @(
+    foreach ($forbidden in @(
+        'include_gpu_worker_packs:',
+        'Build production-signed CUDA and Vulkan worker packs',
         'SCRIBE_GPU_PACK_SIGNING_KEY_PKCS8_BASE64',
         'SCRIBE_GPU_PACK_SIGNING_KEY_ID',
-        '[Convert]::FromBase64String',
-        '$env:GPU_PACK_PRIVATE_KEY_BASE64 = $null',
-        '[System.IO.File]::WriteAllBytes($keyPath, $keyBytes)',
-        'prepare-windows-gpu-worker-packs.ps1',
-        'finally {',
-        '[Array]::Clear($keyBytes, 0, $keyBytes.Length)',
-        'Remove-Item -LiteralPath $keyPath -Force'
-    ) 'GPU signing secret lifecycle'
-    if ($gpuBuild.Contains('Fixture') -or $gpuBuild.Contains('fixture')) {
-        throw 'Release workflow must never admit fixture signing or fixture trust.'
+        'GPU_PACK_PRIVATE_KEY_BASE64',
+        'artifacts\gpu-worker-packs\production',
+        '-WorkerPackRoot'
+    )) {
+        if ($Workflow.Contains($forbidden)) {
+            throw "Candidate-ref Windows release workflow must never receive signing authority or package production GPU packs: $forbidden"
+        }
     }
 }
 
@@ -281,14 +264,20 @@ function Assert-GpuReleasePolicyScriptContract([string]$Script, [string]$Root) {
         throw 'Non-release builds must remain CPU-only without requiring repository release policy.'
     }
 
-    $manualValidation = & $Script `
-        -EventName 'workflow_dispatch' `
-        -Ref 'refs/heads/main' `
-        -Policy '' `
-        -RequestedGpuPacks
-    if ($manualValidation.official_release -or -not $manualValidation.include_gpu_worker_packs) {
-        throw 'Non-publication workflow dispatch must retain explicit GPU pack validation.'
-    }
+    Invoke-ExpectedFailure {
+        & $Script `
+            -EventName 'workflow_dispatch' `
+            -Ref 'refs/heads/main' `
+            -Policy '' `
+            -RequestedGpuPacks
+    } 'candidate-ref workflow never receives GPU pack signing authority'
+    Invoke-ExpectedFailure {
+        & $Script `
+            -EventName 'workflow_dispatch' `
+            -Ref 'refs/heads/untrusted-change' `
+            -Policy '' `
+            -RequestedGpuPacks
+    } 'candidate-ref workflow never receives GPU pack signing authority'
 
     $temporaryOfficial = & $Script `
         -EventName 'push' `
@@ -300,15 +289,12 @@ function Assert-GpuReleasePolicyScriptContract([string]$Script, [string]$Root) {
         throw 'Temporary Stage 4 official release policy must be explicit and CPU-only.'
     }
 
-    $requiredOfficial = & $Script `
-        -EventName 'push' `
-        -Ref 'refs/tags/v0.1.0' `
-        -Policy 'gpu_packs_required'
-    if (-not $requiredOfficial.official_release -or
-        -not $requiredOfficial.include_gpu_worker_packs -or
-        $requiredOfficial.release_policy -cne 'gpu_packs_required') {
-        throw 'GPU-required official tag policy must force pack inclusion without a dispatch input.'
-    }
+    Invoke-ExpectedFailure {
+        & $Script `
+            -EventName 'push' `
+            -Ref 'refs/tags/v0.1.0' `
+            -Policy 'gpu_packs_required'
+    } 'gpu_packs_required policy is not provisioned in this candidate-ref workflow'
 
     Invoke-ExpectedFailure {
         & $Script `
@@ -323,7 +309,7 @@ function Assert-GpuReleasePolicyScriptContract([string]$Script, [string]$Root) {
             -Policy 'temporary_cpu_only_stage4' `
             -RequestedGpuPacks `
             -PublishRelease
-    } 'temporary_cpu_only_stage4 official-release policy forbids GPU pack inclusion'
+    } 'candidate-ref workflow never receives GPU pack signing authority'
     Invoke-ExpectedFailure {
         & $Script `
             -EventName 'push' `
@@ -336,14 +322,14 @@ function Assert-GpuReleasePolicyScriptContract([string]$Script, [string]$Root) {
     $null = & $Script `
         -EventName 'workflow_dispatch' `
         -Ref 'refs/heads/main' `
-        -Policy 'gpu_packs_required' `
+        -Policy 'temporary_cpu_only_stage4' `
         -PublishRelease `
         -GitHubOutputPath $githubOutput
     $output = Get-Content -LiteralPath $githubOutput -Raw
     foreach ($required in @(
         'official_release=true',
-        'release_policy=gpu_packs_required',
-        'include_gpu_worker_packs=true'
+        'release_policy=temporary_cpu_only_stage4',
+        'include_gpu_worker_packs=false'
     )) {
         if (-not $output.Contains($required)) {
             throw "GPU release policy GitHub output lost $required"
