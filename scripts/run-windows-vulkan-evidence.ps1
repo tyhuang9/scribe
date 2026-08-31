@@ -113,6 +113,53 @@ function Invoke-ScribeEvidence([string]$Exe, [string[]]$Arguments, [string]$Fail
     if ($LASTEXITCODE -ne 0) { throw $Failure }
 }
 
+function Enable-ScribeEvidenceCmakeBootstrap([string]$CargoTarget, [string]$BuildEnvironment) {
+    $tcs = Join-Path $BuildEnvironment 'tcs'
+    $entries = @(Get-ChildItem -LiteralPath $tcs -Force)
+    if ($entries.Count -ne 1) { throw 'CMake bootstrap tcs inventory is not exact.' }
+    $outLink = $entries[0]
+    if (-not $outLink.PSIsContainer -or ($outLink.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0 -or $outLink.LinkType -cne 'Junction' -or @($outLink.Target).Count -ne 1) {
+        throw 'CMake bootstrap out directory is not one exact junction.'
+    }
+    $out = (Get-Item -LiteralPath @($outLink.Target)[0] -Force).FullName
+    $relative = [IO.Path]::GetRelativePath($CargoTarget, $out).Replace('\', '/')
+    if ($relative -cnotmatch '^(debug|release)/build/transcribe-cpp-sys-[0-9a-f]{16}/out$') {
+        throw 'CMake bootstrap out junction escaped the exact Cargo target.'
+    }
+    $outItem = Get-Item -LiteralPath $out -Force
+    if (-not $outItem.PSIsContainer -or ($outItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw 'CMake bootstrap out target is not a physical directory.'
+    }
+    $build = Join-Path $out 'build'
+    if (Test-Path -LiteralPath $build) {
+        $buildItem = Get-Item -LiteralPath $build -Force
+        if (-not $buildItem.PSIsContainer -or ($buildItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or (Split-Path -Parent $buildItem.FullName) -cne $out) {
+            throw 'Refusing to replace an unexpected CMake build directory.'
+        }
+        Remove-Item -LiteralPath $build -Recurse -Force
+    }
+    $native = Join-Path $BuildEnvironment 'native'
+    if (Test-Path -LiteralPath $native) { throw 'CMake bootstrap native directory already exists.' }
+    New-Item -ItemType Directory -Path $native | Out-Null
+    New-Item -ItemType Junction -Path $build -Target $native | Out-Null
+    $junction = Get-Item -LiteralPath $build -Force
+    if (-not $junction.PSIsContainer -or ($junction.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0 -or $junction.LinkType -cne 'Junction' -or @($junction.Target).Count -ne 1 -or (Get-Item -LiteralPath @($junction.Target)[0] -Force).FullName -cne (Get-Item -LiteralPath $native -Force).FullName) {
+        throw 'Could not validate the isolated CMake build junction.'
+    }
+}
+
+function Invoke-ScribeEvidenceCargoWithCmakeRetry([string[]]$Arguments, [string]$Failure, [string]$CargoTarget, [string]$BuildEnvironment) {
+    $first = & $cargo @Arguments 2>&1
+    if ($LASTEXITCODE -eq 0) { return }
+    $detail = ($first | Out-String)
+    if (-not ($detail.Contains('transcribe-cpp-sys') -and ($detail.Contains('The directory name is invalid. (os error 267)') -or $detail.Contains('Could not open file for write in copy operation')))) {
+        throw "$Failure $detail"
+    }
+    Enable-ScribeEvidenceCmakeBootstrap $CargoTarget $BuildEnvironment
+    & $cargo @Arguments
+    if ($LASTEXITCODE -ne 0) { throw "$Failure after validated CMake bootstrap retry." }
+}
+
 if (-not $IsWindows) { throw 'Windows Vulkan evidence capture is Windows x64 only.' }
 if ([Environment]::Is64BitOperatingSystem -ne $true) { throw 'Windows Vulkan evidence capture requires x64 Windows.' }
 if ($ExpectedPhrase.Length -eq 0 -or $ExpectedPhrase.Length -gt 256) { throw 'ExpectedPhrase must be 1..=256 characters.' }
@@ -158,6 +205,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Evidence capture requires a clean source index
 $previousRevision = $env:SCRIBE_BUILD_REVISION
 $previousArchive = $env:SHERPA_ONNX_ARCHIVE_DIR
 $previousTarget = $env:CARGO_TARGET_DIR
+$previousLocalAppData = $env:LOCALAPPDATA
 $evidenceEnvironmentNames = @(
     'SCRIBE_VULKAN_EVIDENCE_PACK_ROOT',
     'SCRIBE_VULKAN_EVIDENCE_CPU_WORKER',
@@ -176,7 +224,11 @@ try {
     $env:SCRIBE_BUILD_REVISION = $revision
     $env:SHERPA_ONNX_ARCHIVE_DIR = $nativeArchive
     $env:CARGO_TARGET_DIR = New-ScribeEvidenceShortCargoTarget 'cpu'
-    Invoke-ScribeEvidence $cargo @('build', '--locked', '--offline', '--release', '--bin', 'scribe-inference-worker', '--features', 'inference-worker', '--manifest-path', (Join-Path $repositoryRoot 'Cargo.toml')) 'Fresh isolated CPU worker build failed.'
+    $cpuBuildEnvironment = New-ScribeEvidenceShortCargoTarget 'cpu-env'
+    New-Item -ItemType Directory -Path $cpuBuildEnvironment | Out-Null
+    $env:LOCALAPPDATA = $cpuBuildEnvironment
+    Invoke-ScribeEvidenceCargoWithCmakeRetry @('build', '--locked', '--offline', '--release', '--bin', 'scribe-inference-worker', '--features', 'inference-worker', '--manifest-path', (Join-Path $repositoryRoot 'Cargo.toml')) 'Fresh isolated CPU worker build failed.' $env:CARGO_TARGET_DIR $cpuBuildEnvironment
+    $env:LOCALAPPDATA = $previousLocalAppData
     $cpuBundle = Join-Path $workRoot 'cpu-worker-bundle'
     New-Item -ItemType Directory -Path $cpuBundle | Out-Null
     Copy-Item -LiteralPath (Join-Path $env:CARGO_TARGET_DIR 'release\scribe-inference-worker.exe') -Destination (Join-Path $cpuBundle 'scribe-inference-worker.exe')
@@ -197,7 +249,10 @@ try {
         }
     }
     $env:CARGO_TARGET_DIR = New-ScribeEvidenceShortCargoTarget 'harness'
-    Invoke-ScribeEvidence $cargo @('test', '--locked', '--offline', '--features', 'inference-worker', 'onnx_worker::tests::windows_vulkan_fixture_evidence_captures_five_cold_and_twenty_warm_runs', '--no-run') 'Vulkan evidence test precompilation failed.'
+    $harnessBuildEnvironment = New-ScribeEvidenceShortCargoTarget 'harness-env'
+    New-Item -ItemType Directory -Path $harnessBuildEnvironment | Out-Null
+    $env:LOCALAPPDATA = $harnessBuildEnvironment
+    Invoke-ScribeEvidenceCargoWithCmakeRetry @('test', '--locked', '--offline', '--features', 'inference-worker', 'onnx_worker::tests::windows_vulkan_fixture_evidence_captures_five_cold_and_twenty_warm_runs', '--no-run') 'Vulkan evidence test precompilation failed.' $env:CARGO_TARGET_DIR $harnessBuildEnvironment
     $baseline = Get-ScribeVulkanEvidenceNvidiaBaseline $ExpectedStableDevice $trustedNvidiaSmi
     $env:SCRIBE_VULKAN_EVIDENCE_PACK_ROOT = $packRoot
     $env:SCRIBE_VULKAN_EVIDENCE_CPU_WORKER = $cpuWorker
@@ -215,6 +270,7 @@ finally {
     $env:SCRIBE_BUILD_REVISION = $previousRevision
     $env:SHERPA_ONNX_ARCHIVE_DIR = $previousArchive
     $env:CARGO_TARGET_DIR = $previousTarget
+    $env:LOCALAPPDATA = $previousLocalAppData
     foreach ($name in $evidenceEnvironmentNames) {
         if ($null -eq $previousEvidenceEnvironment[$name]) { Remove-Item "Env:$name" -ErrorAction SilentlyContinue }
         else { Set-Item "Env:$name" $previousEvidenceEnvironment[$name] }
