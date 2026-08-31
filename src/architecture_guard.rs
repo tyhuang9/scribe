@@ -1919,7 +1919,10 @@ fn route_shell_has_no_synthetic_models_scroll_surface() {
     assert!(app.contains("show_route_scroll(ui, UiRoute::Models"));
     assert!(app.contains("show_route_scroll(ui, UiRoute::History"));
     assert!(app.contains("SettingsTab::About"));
-    assert!(app.contains("passive_microphone_monitor_needed"));
+    assert!(
+        !app.contains("sync_passive_microphone_monitor"),
+        "route rendering must not acquire the microphone while idle"
+    );
     assert!(
         !app.contains("page-scroll"),
         "legacy pages must not reintroduce an inner route scroll area"
