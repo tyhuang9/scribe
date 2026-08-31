@@ -49,6 +49,10 @@ mod installed_manifest;
 )]
 mod linux_gpu_runtime;
 #[cfg(test)]
+mod linux_worker_architecture_guard;
+#[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
+mod linux_worker_launch;
+#[cfg(test)]
 #[allow(
     dead_code,
     reason = "host-side tests compile worker-only Metal identity logic without linking Metal"

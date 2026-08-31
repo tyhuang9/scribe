@@ -165,6 +165,51 @@ mod launch_binding {
         }
     }
 
+    #[cfg(all(test, target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
+    impl crate::linux_worker_launch::LinuxExecAuthority for UnixPackExecAuthority {
+        fn executable_fd(&self) -> std::os::fd::RawFd {
+            use std::os::fd::AsRawFd;
+            self.executable_fd().as_raw_fd()
+        }
+
+        fn dependency_root_fd(&self) -> std::os::fd::RawFd {
+            use std::os::fd::AsRawFd;
+            self.dependency_root_fd().as_raw_fd()
+        }
+
+        fn expected_executable_length(&self) -> u64 {
+            let worker = &self
+                .verified_pack_lease()
+                .verified_pack()
+                .worker_relative_path;
+            self.verified_pack_lease()
+                .copy_entries()
+                .iter()
+                .find(|entry| entry.path == *worker)
+                .expect("verified pack authority retains its worker inventory entry")
+                .size_bytes
+        }
+
+        fn expected_executable_sha256(&self) -> std::io::Result<[u8; 32]> {
+            let worker = &self
+                .verified_pack_lease()
+                .verified_pack()
+                .worker_relative_path;
+            let digest = &self
+                .verified_pack_lease()
+                .copy_entries()
+                .iter()
+                .find(|entry| entry.path == *worker)
+                .expect("verified pack authority retains its worker inventory entry")
+                .sha256;
+            crate::linux_worker_launch::parse_sha256(digest)
+        }
+
+        fn recheck(&self) -> std::io::Result<()> {
+            self.recheck().map_err(std::io::Error::other)
+        }
+    }
+
     /// Opaque proof that a concrete resolver result and worker Hello agreed on
     /// the exact verified pack and stable device. Its fields are private to this
     /// child module, so production discovery cannot fabricate one from a raw
