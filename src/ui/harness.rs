@@ -1594,6 +1594,27 @@ mod tests {
         )
     }
 
+    fn render_advanced_diagnostics(width: f32, height: f32) -> egui::FullOutput {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_harness_style(&ctx, false);
+        let mut data = Fixture::SettingsRecording.data();
+        data.route = UiRoute::Settings(SettingsTab::Advanced);
+        let mut page = Fixture::SettingsRecording.page();
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::Vec2::new(width, height),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                let _ = show_harness(ctx, &mut data, &mut page);
+            },
+        )
+    }
+
     fn render_with_input(
         ctx: &egui::Context,
         data: &mut FixtureData,
@@ -6818,7 +6839,7 @@ mod tests {
 
     #[test]
     fn gpu_diagnostics_fixture_exposes_safe_labels_and_retry_action() {
-        let output = render(Fixture::TranscribeReady, 960.0, 680.0);
+        let output = render_advanced_diagnostics(960.0, 680.0);
         let names = node_names(&output);
         for visible in [
             "GPU diagnostics",
@@ -6847,8 +6868,9 @@ mod tests {
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
         configure_accessible_style(&ctx);
-        let mut data = Fixture::TranscribeReady.data();
-        let mut page = Fixture::TranscribeReady.page();
+        let mut data = Fixture::SettingsRecording.data();
+        data.route = UiRoute::Settings(SettingsTab::Advanced);
+        let mut page = Fixture::SettingsRecording.page();
         data.settings
             .acceleration_diagnostics
             .as_mut()
@@ -6891,7 +6913,8 @@ mod tests {
         let retry = node_matching(&output, |node| node.name() == Some("Retry GPU"));
         assert!(retry.is_disabled());
 
-        let mut status_data = Fixture::TranscribeReady.data();
+        let mut status_data = Fixture::SettingsRecording.data();
+        status_data.route = UiRoute::Settings(SettingsTab::Advanced);
         status_data
             .settings
             .acceleration_diagnostics
@@ -6900,7 +6923,7 @@ mod tests {
             .retry_gpu_status = Some(TranscribeNotice::failure(
             "GPU retry could not be completed. The previous selection remains active.",
         ));
-        let mut status_page = Fixture::TranscribeReady.page();
+        let mut status_page = Fixture::SettingsRecording.page();
         let status_output = render_with_input(
             &ctx,
             &mut status_data,
@@ -6917,7 +6940,7 @@ mod tests {
 
     #[test]
     fn gpu_diagnostics_fit_a_narrow_phone_width() {
-        let output = render(Fixture::TranscribeReady, 375.0, 800.0);
+        let output = render_advanced_diagnostics(375.0, 800.0);
         for name in [
             "GPU diagnostics",
             "Selected device",
