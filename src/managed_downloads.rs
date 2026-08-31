@@ -50,6 +50,9 @@ pub(crate) struct ModelDownloadAdmission {
 pub(crate) struct OnnxBundleDownloadAdmission {
     pub(crate) bundle_id: String,
     pub(crate) storage_root: PathBuf,
+    pub(crate) target: PathBuf,
+    pub(crate) target_identity: CanonicalTargetIdentity,
+    pub(crate) download_bytes: u64,
     pub(crate) disk: DiskSpacePreflight,
 }
 
@@ -62,19 +65,34 @@ pub(crate) fn normalized_onnx_bundle_admission(
         return Ok(None);
     };
     let storage_root = config::onnx_bundle_storage_dir(config);
+    let target = crate::onnx_model_bundles::bundle_target_root(&storage_root, bundle_id)?;
+    let target_identity =
+        crate::disk_space::canonical_target_identity(&target).map_err(InstallError::Failed)?;
+    let download_bytes = crate::onnx_model_bundles::bundle_download_size_bytes(bundle_id)?;
     let disk = crate::onnx_model_bundles::bundle_disk_space_preflight(bundle_id, &storage_root)?;
     Ok(Some(OnnxBundleDownloadAdmission {
         bundle_id: bundle_id.to_owned(),
         storage_root,
+        target,
+        target_identity,
+        download_bytes,
         disk,
     }))
 }
 
 pub(crate) fn prepare_onnx_bundle(
     admission: &OnnxBundleDownloadAdmission,
+    expected_target_identity: &CanonicalTargetIdentity,
     cancellation: &InstallCancellation,
     progress: &dyn Fn(InstallProgress),
 ) -> Result<crate::onnx_model_bundles::StagedOnnxBundle, InstallError> {
+    let observed_target_identity = crate::disk_space::canonical_target_identity(&admission.target)
+        .map_err(InstallError::Failed)?;
+    if &observed_target_identity != expected_target_identity {
+        return Err(InstallError::Failed(
+            "ONNX bundle target changed after download admission".to_owned(),
+        ));
+    }
     crate::onnx_model_bundles::stage_onnx_bundle_install(
         &admission.bundle_id,
         &admission.storage_root,
@@ -388,6 +406,40 @@ mod tests {
             artifact.filename = filename.to_owned();
             assert!(trusted_gguf_download_spec(&AppConfig::default(), &artifact).is_err());
         }
+    }
+
+    #[test]
+    fn normalized_onnx_admission_exposes_exact_target_and_full_disk_footprint() {
+        let root = std::env::temp_dir().join(format!(
+            "scribe-onnx-download-admission-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut config = AppConfig::default();
+        config.general.model_storage_dir = root.clone();
+        config::normalize_config(&mut config);
+        let model_id = ModelId::new("moonshine-tiny-en-int8-onnx");
+
+        let admission = normalized_onnx_bundle_admission(&config, &model_id)
+            .unwrap()
+            .expect("Moonshine uses a receipt-backed ONNX bundle");
+
+        assert_eq!(admission.bundle_id, "moonshine-tiny-en-int8-onnx");
+        assert_eq!(
+            admission.target,
+            admission.storage_root.join("moonshine-tiny-en-int8-onnx")
+        );
+        assert_eq!(
+            admission.target_identity,
+            crate::disk_space::canonical_target_identity(&admission.target).unwrap()
+        );
+        assert!(admission.download_bytes > 0);
+        assert!(
+            admission.disk.additional_bytes >= admission.download_bytes.saturating_mul(2),
+            "reservation includes both revision-cache downloads and staged install bytes"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
