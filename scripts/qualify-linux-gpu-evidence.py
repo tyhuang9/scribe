@@ -11,6 +11,7 @@ import json
 import os
 import pathlib
 import re
+import secrets
 import stat
 import sys
 import tempfile
@@ -56,6 +57,16 @@ CONTRACT_PATHS = {
     "toolchain_contract_sha256": "runtime-manifests/gpu-worker-toolchain-linux-x86_64.json",
 }
 PRODUCTION_AUTHORITY_PATH = "runtime-manifests/linux-gpu-qualification-production-authority.json"
+AT_EMPTY_PATH = 0x1000
+RENAME_NOREPLACE = 1
+PRODUCTION_TEMP_COLLISION_RETRIES = 16
+ANONYMOUS_PUBLISH_UNAVAILABLE = {
+    errno.EINVAL,
+    errno.ENOENT,
+    errno.ENOSYS,
+    errno.EOPNOTSUPP,
+    errno.EPERM,
+}
 
 
 class EvidenceError(ValueError):
@@ -1488,57 +1499,198 @@ def open_trusted_output_directory(path: pathlib.Path) -> int:
         fail(f"could not descriptor-open the production output directory: {error}")
 
 
-def write_production_file(path: pathlib.Path, payload: bytes) -> None:
-    parent_descriptor = open_trusted_output_directory(path.parent)
+def write_all(descriptor: int, payload: bytes) -> None:
+    offset = 0
+    while offset < len(payload):
+        written = os.write(descriptor, payload[offset:])
+        if written <= 0:
+            raise OSError(errno.EIO, "production decision write made no progress")
+        offset += written
+
+
+def prepare_production_temporary(descriptor: int, payload: bytes) -> None:
+    write_all(descriptor, payload)
+    os.fchmod(descriptor, 0o644)
+    os.fsync(descriptor)
+
+
+def link_anonymous_file(temporary_descriptor: int, parent_descriptor: int, name: str) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    linkat = libc.linkat
+    linkat.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+    linkat.restype = ctypes.c_int
+    if linkat(
+        temporary_descriptor,
+        b"",
+        parent_descriptor,
+        os.fsencode(name),
+        AT_EMPTY_PATH,
+    ) != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number))
+
+
+def rename_noreplace(parent_descriptor: int, source_name: str, destination_name: str) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    try:
+        renameat2 = libc.renameat2
+    except AttributeError as error:
+        raise OSError(errno.ENOSYS, "renameat2 is unavailable") from error
+    renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    renameat2.restype = ctypes.c_int
+    if renameat2(
+        parent_descriptor,
+        os.fsencode(source_name),
+        parent_descriptor,
+        os.fsencode(destination_name),
+        RENAME_NOREPLACE,
+    ) != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number))
+
+
+def retained_identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_size,
+        stat.S_IMODE(value.st_mode),
+        value.st_nlink,
+    )
+
+
+def verify_descriptor_identity(
+    temporary_descriptor: int,
+    parent_descriptor: int,
+    destination_name: str,
+    payload_size: int,
+) -> None:
+    source_stat = os.fstat(temporary_descriptor)
+    destination_stat = os.stat(destination_name, dir_fd=parent_descriptor, follow_symlinks=False)
+    if (
+        not stat.S_ISREG(destination_stat.st_mode)
+        or retained_identity(source_stat) != retained_identity(destination_stat)
+        or source_stat.st_nlink != 1
+        or source_stat.st_size != payload_size
+        or stat.S_IMODE(source_stat.st_mode) != 0o644
+    ):
+        fail("published production decision identity does not match its retained descriptor")
+
+
+def try_anonymous_production_publish(
+    parent_descriptor: int,
+    destination_name: str,
+    payload: bytes,
+) -> bool:
     temporary_descriptor = -1
     try:
         flags = os.O_WRONLY | os.O_CLOEXEC | os.O_TMPFILE
-        temporary_descriptor = os.open(".", flags, 0o600, dir_fd=parent_descriptor)
-        offset = 0
-        while offset < len(payload):
-            offset += os.write(temporary_descriptor, payload[offset:])
-        os.fchmod(temporary_descriptor, 0o644)
-        os.fsync(temporary_descriptor)
-
-        libc = ctypes.CDLL(None, use_errno=True)
-        linkat = libc.linkat
-        linkat.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
-        linkat.restype = ctypes.c_int
-        result = linkat(
-            temporary_descriptor,
-            b"",
-            parent_descriptor,
-            os.fsencode(path.name),
-            0x1000,  # AT_EMPTY_PATH
-        )
-        if result != 0:
-            error_number = ctypes.get_errno()
-            if error_number == errno.EEXIST:
+        try:
+            temporary_descriptor = os.open(".", flags, 0o600, dir_fd=parent_descriptor)
+        except OSError as error:
+            if error.errno in ANONYMOUS_PUBLISH_UNAVAILABLE:
+                return False
+            raise
+        prepare_production_temporary(temporary_descriptor, payload)
+        try:
+            link_anonymous_file(temporary_descriptor, parent_descriptor, destination_name)
+        except OSError as error:
+            if error.errno == errno.EEXIST:
                 fail("output path already exists")
-            fail(f"could not atomically publish the production decision: {os.strerror(error_number)}")
-
-        source_stat = os.fstat(temporary_descriptor)
-        destination_stat = os.stat(path.name, dir_fd=parent_descriptor, follow_symlinks=False)
-        if (
-            source_stat.st_dev,
-            source_stat.st_ino,
-            source_stat.st_size,
-            stat.S_IMODE(source_stat.st_mode),
-            source_stat.st_nlink,
-        ) != (
-            destination_stat.st_dev,
-            destination_stat.st_ino,
-            destination_stat.st_size,
-            stat.S_IMODE(destination_stat.st_mode),
-            destination_stat.st_nlink,
-        ) or source_stat.st_nlink != 1 or source_stat.st_size != len(payload):
-            fail("published production decision identity does not match its retained descriptor")
+            if error.errno in ANONYMOUS_PUBLISH_UNAVAILABLE:
+                return False
+            raise
+        verify_descriptor_identity(
+            temporary_descriptor,
+            parent_descriptor,
+            destination_name,
+            len(payload),
+        )
         os.fsync(parent_descriptor)
-    except OSError as error:
-        fail(f"could not publish the production decision: {error}")
+        return True
     finally:
         if temporary_descriptor >= 0:
             os.close(temporary_descriptor)
+
+
+def open_named_production_temporary(parent_descriptor: int) -> tuple[int, str]:
+    flags = os.O_WRONLY | os.O_CLOEXEC | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+    for _ in range(PRODUCTION_TEMP_COLLISION_RETRIES):
+        name = f".scribe-gpu-decision-{secrets.token_hex(16)}.tmp"
+        try:
+            return os.open(name, flags, 0o600, dir_fd=parent_descriptor), name
+        except FileExistsError:
+            continue
+    fail("could not allocate a unique production decision temporary")
+
+
+def cleanup_named_production_temporary(
+    parent_descriptor: int,
+    temporary_descriptor: int,
+    temporary_name: str,
+) -> None:
+    try:
+        named_stat = os.stat(temporary_name, dir_fd=parent_descriptor, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    retained_stat = os.fstat(temporary_descriptor)
+    if (named_stat.st_dev, named_stat.st_ino) != (retained_stat.st_dev, retained_stat.st_ino):
+        return
+    os.unlink(temporary_name, dir_fd=parent_descriptor)
+    os.fsync(parent_descriptor)
+
+
+def write_named_production_file(
+    parent_descriptor: int,
+    destination_name: str,
+    payload: bytes,
+) -> None:
+    temporary_descriptor = -1
+    temporary_name = ""
+    try:
+        temporary_descriptor, temporary_name = open_named_production_temporary(parent_descriptor)
+        prepare_production_temporary(temporary_descriptor, payload)
+        verify_descriptor_identity(
+            temporary_descriptor,
+            parent_descriptor,
+            temporary_name,
+            len(payload),
+        )
+        try:
+            rename_noreplace(parent_descriptor, temporary_name, destination_name)
+        except OSError as error:
+            if error.errno == errno.EEXIST:
+                fail("output path already exists")
+            raise
+        temporary_name = ""
+        verify_descriptor_identity(
+            temporary_descriptor,
+            parent_descriptor,
+            destination_name,
+            len(payload),
+        )
+        os.fsync(parent_descriptor)
+    finally:
+        if temporary_descriptor >= 0:
+            if temporary_name:
+                cleanup_named_production_temporary(
+                    parent_descriptor,
+                    temporary_descriptor,
+                    temporary_name,
+                )
+            os.close(temporary_descriptor)
+
+
+def write_production_file(path: pathlib.Path, payload: bytes) -> None:
+    parent_descriptor = open_trusted_output_directory(path.parent)
+    try:
+        try:
+            if try_anonymous_production_publish(parent_descriptor, path.name, payload):
+                return
+            write_named_production_file(parent_descriptor, path.name, payload)
+        except OSError as error:
+            fail(f"could not publish the production decision: {error}")
+    finally:
         os.close(parent_descriptor)
 
 

@@ -4,14 +4,17 @@
 from __future__ import annotations
 
 import copy
+import errno
 import hashlib
 import importlib.util
 import json
+import os
 import pathlib
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from typing import Any
 
 
@@ -966,6 +969,83 @@ class QualificationFixtureTests(unittest.TestCase):
                 b"permissive\n",
                 production=True,
             )
+
+        fallback_parent = self.root / "named-fallback"
+        fallback_parent.mkdir(mode=0o700)
+        fallback_output = fallback_parent / "decision.json"
+        collision_name = f".scribe-gpu-decision-{'00' * 16}.tmp"
+        collision = fallback_parent / collision_name
+        collision.write_bytes(b"preexisting collision\n")
+        with (
+            mock.patch.object(
+                qualification,
+                "link_anonymous_file",
+                side_effect=OSError(errno.ENOENT, "anonymous attach unavailable"),
+            ) as anonymous_link,
+            mock.patch.object(
+                qualification.secrets,
+                "token_hex",
+                side_effect=["00" * 16, "11" * 16],
+            ),
+        ):
+            qualification.write_new_file(fallback_output, b"fallback\n", production=True)
+        self.assertEqual(anonymous_link.call_count, 1)
+        self.assertEqual(fallback_output.read_bytes(), b"fallback\n")
+        self.assertEqual(collision.read_bytes(), b"preexisting collision\n")
+        self.assertEqual(
+            sorted(entry.name for entry in fallback_parent.iterdir()),
+            [collision.name, fallback_output.name],
+        )
+
+        exhausted_parent = self.root / "exhausted-collisions"
+        exhausted_parent.mkdir(mode=0o700)
+        exhausted_name = f".scribe-gpu-decision-{'22' * 16}.tmp"
+        exhausted_collision = exhausted_parent / exhausted_name
+        exhausted_collision.write_bytes(b"must remain unchanged\n")
+        with (
+            mock.patch.object(qualification, "try_anonymous_production_publish", return_value=False),
+            mock.patch.object(qualification.secrets, "token_hex", return_value="22" * 16),
+            self.assertRaisesRegex(qualification.EvidenceError, "unique production decision temporary"),
+        ):
+            qualification.write_new_file(
+                exhausted_parent / "decision.json",
+                b"never published\n",
+                production=True,
+            )
+        self.assertEqual(exhausted_collision.read_bytes(), b"must remain unchanged\n")
+        self.assertEqual(list(exhausted_parent.iterdir()), [exhausted_collision])
+
+        raced_parent = self.root / "raced-destination"
+        raced_parent.mkdir(mode=0o700)
+        raced_output = raced_parent / "decision.json"
+        real_rename_noreplace = qualification.rename_noreplace
+
+        def publish_competing_destination(
+            parent_descriptor: int,
+            source_name: str,
+            destination_name: str,
+        ) -> None:
+            competitor = os.open(
+                destination_name,
+                os.O_WRONLY | os.O_CLOEXEC | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=parent_descriptor,
+            )
+            try:
+                qualification.write_all(competitor, b"competing publisher\n")
+                os.fsync(competitor)
+            finally:
+                os.close(competitor)
+            real_rename_noreplace(parent_descriptor, source_name, destination_name)
+
+        with (
+            mock.patch.object(qualification, "try_anonymous_production_publish", return_value=False),
+            mock.patch.object(qualification, "rename_noreplace", side_effect=publish_competing_destination),
+            self.assertRaisesRegex(qualification.EvidenceError, "already exists"),
+        ):
+            qualification.write_new_file(raced_output, b"must not replace\n", production=True)
+        self.assertEqual(raced_output.read_bytes(), b"competing publisher\n")
+        self.assertEqual(list(raced_parent.iterdir()), [raced_output])
 
     def test_canonical_input_symlink_is_rejected(self) -> None:
         document = self.root / "document.json"

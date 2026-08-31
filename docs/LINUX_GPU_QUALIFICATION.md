@@ -162,11 +162,22 @@ python3 scripts/qualify-linux-gpu-evidence.py \
 The output parent must already exist, be owner-controlled and not group/other
 writable, and the absolute output path must not exist. Production publication
 is Linux-only. It traverses the output directory with retained `O_NOFOLLOW`
-descriptors, writes and fsyncs an anonymous `O_TMPFILE`, publishes it with the
-no-replace `linkat(AT_EMPTY_PATH)` primitive, verifies the published inode
-against the retained file descriptor, and fsyncs the directory. Fixture output
-uses a portable non-authoritative path. A decision is non-authoritative review
-evidence: runtime activation still requires a later change that adds the exact
-one-to-one Auto projections and separately reviewed GPU pack trust. Production
-Linux trust, catalogs, and Auto remain NO-GO until real hardware evidence and
-the release-signing prerequisites are available.
+descriptors. It first writes and fsyncs an anonymous `O_TMPFILE` and attempts
+no-replace `linkat(AT_EMPTY_PATH)` publication. Some supported filesystems can
+create that inode but cannot attach it; for those documented unavailability
+errors, publication creates a cryptographically random name with bounded
+`O_CREAT|O_EXCL|O_NOFOLLOW` retries relative to the same retained parent,
+writes, chmods, and fsyncs that descriptor, then uses
+`renameat2(RENAME_NOREPLACE)` with both source and destination dirfds set to the
+retained authority. The parent is required to be owner-controlled and not
+group/other writable, so no untrusted writer can discover or replace the named
+temporary during that fallback. Both paths verify the destination with
+`fstatat(AT_SYMLINK_NOFOLLOW)` semantics against the still-open source inode and
+fsync the parent directory. Failed named attempts remove only a temporary whose
+device/inode still matches the retained descriptor, using descriptor-relative
+unlink, and fsync that cleanup; production never falls back to path-based link
+or rename. Fixture output uses a portable non-authoritative path. A decision is
+non-authoritative review evidence: runtime activation still requires a later
+change that adds the exact one-to-one Auto projections and separately reviewed
+GPU pack trust. Production Linux trust, catalogs, and Auto remain NO-GO until
+real hardware evidence and the release-signing prerequisites are available.
