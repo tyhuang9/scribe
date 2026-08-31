@@ -30,6 +30,7 @@ desktop="$(realpath -e -- "$desktop")"; cpu_worker="$(realpath -e -- "$cpu_worke
 for input in "$desktop" "$cpu_worker"; do
   [[ -f "$input" && ! -L "$input" ]] || { echo "release input must be a regular non-symlink file: $input" >&2; exit 1; }
   [[ "$(stat -c %h -- "$input")" == 1 ]] || { echo "release input must not be hardlinked: $input" >&2; exit 1; }
+  [[ "$(stat -c %s -- "$input")" -le 2147483648 ]] || { echo "release input exceeds the 2 GiB per-file bound: $input" >&2; exit 1; }
 done
 output_parent="$(dirname -- "$output")"; mkdir -p -- "$output_parent"
 output="$(cd "$output_parent" && pwd -P)/$(basename -- "$output")"
@@ -88,6 +89,7 @@ pathlib.Path(output).write_text(json.dumps(document, sort_keys=True, separators=
 PY
 
 installed_bytes="$(du -sb "$package_root/usr" | awk '{print $1}')"
+[[ "$installed_bytes" -le 4294967296 ]] || { echo 'release package exceeds the 4 GiB aggregate bound.' >&2; exit 1; }
 installed_kib="$(((installed_bytes + 1023) / 1024))"
 cat >"$package_root/DEBIAN/control" <<EOF
 Package: scribe

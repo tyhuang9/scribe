@@ -24,13 +24,23 @@ if tar -tvf "$temp_root/data.tar" | awk 'substr($1,1,1) != "d" && substr($1,1,1)
   echo 'package contains a link or nonregular archive entry.' >&2
   exit 1
 fi
+if tar --numeric-owner -tvf "$temp_root/data.tar" | awk '$2 != "0/0" { found=1 } END { exit(found ? 0 : 1) }'; then
+  echo 'package data archive contains a non-root owner or group.' >&2
+  exit 1
+fi
 mkdir "$temp_root/root"
 tar -xf "$temp_root/data.tar" -C "$temp_root/root" --no-same-owner --no-same-permissions
 root="$temp_root/root"; authority="$root/usr/lib/scribe"; inventory="$authority/linux-release-inventory.json"
 [[ -d "$root/usr/bin" && ! -L "$root/usr/bin" && -d "$authority/workers/packs" && ! -L "$authority/workers/packs" ]] || { echo 'canonical Linux authority directories are missing or unsafe.' >&2; exit 1; }
+expected_directories="$temp_root/expected-directories"; actual_directories="$temp_root/actual-directories"
+printf '%s\n' usr usr/bin usr/lib usr/lib/scribe usr/lib/scribe/workers usr/lib/scribe/workers/packs >"$expected_directories"
+(cd "$root" && find usr -type d -printf '%p\n' | LC_ALL=C sort) >"$actual_directories"
+cmp -s "$expected_directories" "$actual_directories" || { echo 'package directory tree is not exact.' >&2; exit 1; }
+while IFS= read -r directory; do [[ "$(stat -c %a -- "$root/$directory")" == 755 ]] || { echo "directory mode mismatch: $directory" >&2; exit 1; }; done <"$expected_directories"
 for path in "$root/usr/bin/local-transcriber" "$authority/scribe-inference-worker" "$authority/worker-pack-catalog.json" "$authority/linux-release-package.json" "$inventory"; do
   [[ -f "$path" && ! -L "$path" && "$(stat -c %h -- "$path")" == 1 ]] || { echo "required package file is missing or unsafe: $path" >&2; exit 1; }
 done
+[[ "$(stat -c %a -- "$inventory")" == 644 ]] || { echo 'release inventory mode is not 0644.' >&2; exit 1; }
 cmp -s "$authority/linux-release-package.json" "$repo_root/runtime-manifests/linux-release-package-x86_64.json" || { echo 'package release contract differs from the reviewed manifest.' >&2; exit 1; }
 [[ "$(cat "$authority/worker-pack-catalog.json")" == '{"schema_version":1,"packs":[]}' ]] || { echo 'production Linux pack catalog must remain canonical and empty.' >&2; exit 1; }
 [[ -z "$(find "$authority/workers/packs" -mindepth 1 -print -quit)" ]] || { echo 'production Linux package contains an untrusted GPU pack.' >&2; exit 1; }
