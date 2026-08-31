@@ -31,7 +31,7 @@ if [[ "$mode" == --fixture-pack ]]; then verification=verify-fixture; else verif
 "$tool" "$verification" --pack-root "$pack_root" >/dev/null
 if find "$pack_root" -mindepth 1 ! -type d ! -type f -print -quit | grep . >/dev/null; then echo 'pack size report rejects links and nonregular entries.' >&2; exit 1; fi
 installed="$(find "$pack_root" -type f -printf '%s\n' | awk '{ total += $1 } END { print total + 0 }')"
-compressed="$(cd "$pack_root" && LC_ALL=C find . -type f -printf '%P\n' | LC_ALL=C sort | tar --create --files-from=- --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner --format=posix | gzip -n -9 | wc -c)"
+compressed="$(cd "$pack_root" && LC_ALL=C find . -type f -printf '%P\n' | LC_ALL=C sort | tar --create --files-from=- --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner --format=gnu | gzip -n -9 | wc -c)"
 python3 - "$pack_root/pack-manifest.json" "$installed" "$compressed" "$mode" <<'PY'
 import json, pathlib, sys
 manifest = json.loads(pathlib.Path(sys.argv[1]).read_bytes())

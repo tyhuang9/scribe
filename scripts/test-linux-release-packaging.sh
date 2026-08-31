@@ -59,12 +59,14 @@ add_unexpected_directory() { mkdir "$1/usr/lib/scribe/unexpected-directory"; }
 replace_catalog() { printf '%s' '{"schema_version":1,"packs":[{}]}' >"$1/usr/lib/scribe/worker-pack-catalog.json"; }
 replace_contract() { printf '%s\n' '{}' >"$1/usr/lib/scribe/linux-release-package.json"; }
 replace_worker_with_link() { rm "$1/usr/lib/scribe/scribe-inference-worker"; ln -s /bin/true "$1/usr/lib/scribe/scribe-inference-worker"; }
+add_maintainer_script() { printf '#!/bin/sh\nexit 0\n' >"$1/DEBIAN/postinst"; chmod 0755 "$1/DEBIAN/postinst"; }
 attack_package tampered-worker tamper_worker
 attack_package unexpected-file add_unexpected
 attack_package unexpected-directory add_unexpected_directory
 attack_package nonempty-catalog replace_catalog
 attack_package wrong-contract replace_contract
 attack_package worker-symlink replace_worker_with_link
+attack_package maintainer-script add_maintainer_script
 
 if command -v cargo >/dev/null; then
   export SCRIBE_BUILD_REVISION="$revision"

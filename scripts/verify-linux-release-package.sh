@@ -16,6 +16,18 @@ trap 'status=$?; rm -rf -- "$temp_root"; exit "$status"' EXIT
 dpkg-deb --info "$package" >/dev/null
 [[ "$(dpkg-deb -f "$package" Package)" == scribe ]] || { echo 'package name is not scribe.' >&2; exit 1; }
 [[ "$(dpkg-deb -f "$package" Architecture)" == amd64 ]] || { echo 'package architecture is not amd64.' >&2; exit 1; }
+[[ "$(dpkg-deb -f "$package" Version)" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+~-][a-z0-9.+~-]+)?$ ]] || { echo 'package version is not canonical.' >&2; exit 1; }
+[[ "$(dpkg-deb -f "$package" Maintainer)" == 'Scribe Release Engineering <noreply@example.invalid>' ]] || { echo 'package maintainer is unexpected.' >&2; exit 1; }
+[[ "$(dpkg-deb -f "$package" Section)" == sound && "$(dpkg-deb -f "$package" Priority)" == optional ]] || { echo 'package section or priority is unexpected.' >&2; exit 1; }
+[[ "$(dpkg-deb -f "$package" Description)" == 'Scribe local transcription desktop and verified inference workers' ]] || { echo 'package description is unexpected.' >&2; exit 1; }
+dpkg-deb --ctrl-tarfile "$package" >"$temp_root/control.tar"
+printf '%s\n' ./ ./control >"$temp_root/expected-control-names"
+tar -tf "$temp_root/control.tar" >"$temp_root/control-names"
+cmp -s "$temp_root/expected-control-names" "$temp_root/control-names" || { echo 'package control archive contains unexpected metadata or maintainer scripts.' >&2; exit 1; }
+if tar --numeric-owner -tvf "$temp_root/control.tar" | awk '$2 != "0/0" || (substr($1,1,1) != "d" && substr($1,1,1) != "-") { found=1 } END { exit(found ? 0 : 1) }'; then
+  echo 'package control archive contains unsafe ownership or entry types.' >&2
+  exit 1
+fi
 dpkg-deb --fsys-tarfile "$package" >"$temp_root/data.tar"
 tar -tf "$temp_root/data.tar" >"$temp_root/names"
 [[ -z "$(LC_ALL=C sort "$temp_root/names" | uniq -d)" ]] || { echo 'package contains duplicate archive names.' >&2; exit 1; }
@@ -37,6 +49,8 @@ fi
 mkdir "$temp_root/root"
 tar -xf "$temp_root/data.tar" -C "$temp_root/root" --no-same-owner --no-same-permissions
 root="$temp_root/root"; authority="$root/usr/lib/scribe"; inventory="$authority/linux-release-inventory.json"
+installed_bytes="$(du -sb "$root/usr" | awk '{print $1}')"; installed_kib="$(((installed_bytes + 1023) / 1024))"
+[[ "$(dpkg-deb -f "$package" Installed-Size)" == "$installed_kib" ]] || { echo 'package Installed-Size does not match the exact payload.' >&2; exit 1; }
 [[ -d "$root/usr/bin" && ! -L "$root/usr/bin" && -d "$authority/workers/packs" && ! -L "$authority/workers/packs" ]] || { echo 'canonical Linux authority directories are missing or unsafe.' >&2; exit 1; }
 expected_directories="$temp_root/expected-directories"; actual_directories="$temp_root/actual-directories"
 printf '%s\n' usr usr/bin usr/lib usr/lib/scribe usr/lib/scribe/workers usr/lib/scribe/workers/packs >"$expected_directories"
