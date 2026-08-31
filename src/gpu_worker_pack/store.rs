@@ -1827,13 +1827,17 @@ fn anchored_entries(
 ) -> Result<Vec<(String, AnchoredEntryKind)>, PackStoreError> {
     directory.recheck()?;
     let current = c".";
-    let descriptor = unsafe {
-        libc::openat(
-            directory.leaf().as_raw_fd(),
-            current.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-        )
-    };
+    // Darwin rejects reopening an already-held directory with
+    // `openat(dirfd, ".", O_DIRECTORY)` even though the anchor itself is a
+    // directory. The reopened object is still required to match the retained
+    // descriptor identity below before `fdopendir` can consume it. Linux can
+    // keep the additional kernel-side type check.
+    let mut flags = libc::O_RDONLY | libc::O_CLOEXEC;
+    #[cfg(target_os = "linux")]
+    {
+        flags |= libc::O_DIRECTORY;
+    }
+    let descriptor = unsafe { libc::openat(directory.leaf().as_raw_fd(), current.as_ptr(), flags) };
     if descriptor < 0 {
         return Err(PackStoreError::Io(io::Error::last_os_error()));
     }
