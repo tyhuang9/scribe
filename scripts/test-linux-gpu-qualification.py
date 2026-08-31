@@ -613,6 +613,55 @@ class QualificationFixtureTests(unittest.TestCase):
             or "Hello attestation" in result.stderr
         )
 
+    def test_cross_lane_artifact_digest_reuse_is_rejected_with_unique_paths(self) -> None:
+        first = fixture_lane()
+        second = fixture_lane()
+        old_lane_id = second["identity"]["lane_id"]
+        new_lane_id = f"{old_lane_id}-second"
+        second["identity"]["lane_id"] = new_lane_id
+        second["acquisition_artifact_path"] = second["acquisition_artifact_path"].replace(
+            old_lane_id, new_lane_id, 1
+        )
+        for target_sets in second["run_sets"].values():
+            for runs in target_sets.values():
+                for run in runs:
+                    run["artifact_path"] = run["artifact_path"].replace(old_lane_id, new_lane_id, 1)
+        for event in second["lifecycle"]:
+            event["artifact_path"] = event["artifact_path"].replace(old_lane_id, new_lane_id, 1)
+        plan, evidence = fixture_documents_for_lanes([first, second])
+        result = self.run_tool(plan, evidence)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("artifact digest", result.stderr)
+
+    def test_cross_lane_hello_reuse_is_rejected_after_unique_artifacts(self) -> None:
+        first = fixture_lane()
+        second = fixture_lane()
+        old_lane_id = second["identity"]["lane_id"]
+        new_lane_id = f"{old_lane_id}-second"
+        second["identity"]["lane_id"] = new_lane_id
+        second["acquisition_artifact_path"] = second["acquisition_artifact_path"].replace(
+            old_lane_id, new_lane_id, 1
+        )
+        second["identity"]["acquisition"]["machine_id_sha256"] = digest("second-machine")
+        second["identity"]["driver"]["value"] = "linux:nvidia:570.87.00"
+        for target_sets in second["run_sets"].values():
+            for runs in target_sets.values():
+                for run in runs:
+                    run["artifact_path"] = run["artifact_path"].replace(old_lane_id, new_lane_id, 1)
+                    run["machine_id_sha256"] = digest("second-machine")
+        for event in second["lifecycle"]:
+            event["artifact_path"] = event["artifact_path"].replace(old_lane_id, new_lane_id, 1)
+            event["driver_after"] = "linux:nvidia:570.87.00"
+            event["driver_before"] = (
+                "linux:nvidia:570.86.00"
+                if event["event"] == "driver_change"
+                else "linux:nvidia:570.87.00"
+            )
+        plan, evidence = fixture_documents_for_lanes([first, second])
+        result = self.run_tool(plan, evidence)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Hello attestation", result.stderr)
+
     def test_representative_lane_count_is_bounded_before_entry_processing(self) -> None:
         plan, evidence = fixture_documents()
         plan["required_lanes"] = [{} for _ in range(qualification.MAX_LANES + 1)]
