@@ -193,16 +193,6 @@ $builderAst = [System.Management.Automation.Language.Parser]::ParseFile(
     [ref]$builderParseErrors
 )
 Assert-True ($builderParseErrors.Count -eq 0) 'Builder source could not be parsed for native-process retry diagnostics.'
-$nativeProcessFailureType = $builderAst.Find({
-    param($Ast)
-    $Ast -is [System.Management.Automation.Language.TypeDefinitionAst] -and
-    $Ast.Name -ceq 'ScribeGpuWorkerNativeProcessFailure'
-}, $true)
-$nativeProcessCaptureType = $builderAst.Find({
-    param($Ast)
-    $Ast -is [System.Management.Automation.Language.TypeDefinitionAst] -and
-    $Ast.Name -ceq 'ScribeGpuWorkerNativeProcessStreamCapture'
-}, $true)
 $nativeProcessFunction = $builderAst.Find({
     param($Ast)
     $Ast -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
@@ -213,7 +203,6 @@ $retryDiagnosticFunction = $builderAst.Find({
     $Ast -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
     $Ast.Name -ceq 'Get-NativeProcessRetryDiagnostic'
 }, $true)
-Assert-True ($null -ne $nativeProcessFailureType -and $null -ne $nativeProcessCaptureType) 'Builder lost the bounded native-process failure capture types.'
 Assert-True ($null -ne $nativeProcessFunction -and $null -ne $retryDiagnosticFunction) 'Builder lost the native-process retry diagnostic functions.'
 $nativeProcessHarness = Join-Path ([System.IO.Path]::GetTempPath()) "scribe-native-process-retry-$([guid]::NewGuid().ToString('N')).ps1"
 try {
@@ -249,6 +238,53 @@ try {
 catch {
     $oversizedFailure = $_.Exception
 }
+$unterminatedFailure = $null
+try {
+    $null = Invoke-NativeProcess (Join-Path $PSHOME 'pwsh.exe') @('-NoProfile', '-Command', '[Console]::Out.Write(''x'' * 1025); exit 29') 'Unterminated fixture failed.'
+}
+catch {
+    $unterminatedFailure = $_.Exception
+}
+$characterBudgetFailure = $null
+try {
+    $null = Invoke-NativeProcess (Join-Path $PSHOME 'pwsh.exe') @('-NoProfile', '-Command', '$chunk = (''x'' * 1023) + [Environment]::NewLine; 1..1024 | ForEach-Object { [Console]::Out.Write($chunk) }; [Console]::Out.Write(''y''); exit 31') 'Character-budget fixture failed.'
+}
+catch {
+    $characterBudgetFailure = $_.Exception
+}
+$highVolumeCommand = @"
+[Console]::Out.WriteLine('transcribe-cpp-sys: could not create short build junction C:\safe\tcs; building in OUT_DIR (may exceed Windows MAX_PATH in deep checkouts)')
+[Console]::Out.WriteLine('error: failed to run custom build command for ``transcribe-cpp-sys v0.1.3``')
+1..900 | ForEach-Object { [Console]::Out.WriteLine('bounded stdout noise') }
+[Console]::Error.WriteLine('vulkan-shaders-gen: warning: object directory is near the configured limit')
+1..900 | ForEach-Object { [Console]::Error.WriteLine('bounded stderr noise') }
+[Console]::Error.WriteLine('CMAKE_OBJECT_PATH_MAX is in effect for this nested target')
+[Console]::Error.WriteLine("LINK : fatal error LNK1104: cannot open file 'CMakeFiles\cmTC_1a2B3c.dir\intermediate.manifest'")
+exit 37
+"@
+$highVolumeFailure = $null
+try {
+    $null = Invoke-NativeProcess (Join-Path $PSHOME 'pwsh.exe') @('-NoProfile', '-Command', $highVolumeCommand) 'High-volume split-stream fixture failed.'
+}
+catch {
+    $highVolumeFailure = $_.Exception
+}
+$earlyMarkersOverflowCommand = @"
+[Console]::Out.WriteLine('transcribe-cpp-sys: could not create short build junction C:\safe\tcs; building in OUT_DIR (may exceed Windows MAX_PATH in deep checkouts)')
+[Console]::Out.WriteLine('error: failed to run custom build command for ``transcribe-cpp-sys v0.1.3``')
+[Console]::Error.WriteLine('vulkan-shaders-gen: warning: object directory is near the configured limit')
+[Console]::Error.WriteLine('CMAKE_OBJECT_PATH_MAX is in effect for this nested target')
+[Console]::Error.WriteLine("LINK : fatal error LNK1104: cannot open file 'CMakeFiles\cmTC_1a2B3c.dir\intermediate.manifest'")
+[Console]::Error.Write('z' * 1025)
+exit 41
+"@
+$earlyMarkersOverflowFailure = $null
+try {
+    $null = Invoke-NativeProcess (Join-Path $PSHOME 'pwsh.exe') @('-NoProfile', '-Command', $earlyMarkersOverflowCommand) 'Early-marker overflow fixture failed.'
+}
+catch {
+    $earlyMarkersOverflowFailure = $_.Exception
+}
 [pscustomobject]@{
     SplitFailureType = $splitFailure.GetType().FullName
     SplitMessage = $splitFailure.Message
@@ -262,14 +298,19 @@ catch {
     OrdinaryFailureMessage = $ordinaryFailureMessage
     OversizedFailureMessage = $oversizedFailure.Message
     OversizedClassified = Test-ScribeGpuWorkerKnownCmakeBootstrapFailure @(Get-NativeProcessRetryDiagnostic $oversizedFailure)
+    UnterminatedExceeded = $unterminatedFailure.CaptureExceeded
+    UnterminatedClassified = Test-ScribeGpuWorkerKnownCmakeBootstrapFailure @(Get-NativeProcessRetryDiagnostic $unterminatedFailure)
+    CharacterBudgetExceeded = $characterBudgetFailure.CaptureExceeded
+    CharacterBudgetClassified = Test-ScribeGpuWorkerKnownCmakeBootstrapFailure @(Get-NativeProcessRetryDiagnostic $characterBudgetFailure)
+    HighVolumeClassified = Test-ScribeGpuWorkerKnownCmakeBootstrapFailure @(Get-NativeProcessRetryDiagnostic $highVolumeFailure)
+    EarlyMarkersOverflowExceeded = $earlyMarkersOverflowFailure.CaptureExceeded
+    EarlyMarkersOverflowClassified = Test-ScribeGpuWorkerKnownCmakeBootstrapFailure @(Get-NativeProcessRetryDiagnostic $earlyMarkersOverflowFailure)
 } | ConvertTo-Json -Compress
 '@
     [System.IO.File]::WriteAllText(
         $nativeProcessHarness,
         @(
             (Get-Content -LiteralPath $cmakeBootstrapScript -Raw),
-            $nativeProcessFailureType.Extent.Text,
-            $nativeProcessCaptureType.Extent.Text,
             $nativeProcessFunction.Extent.Text,
             $retryDiagnosticFunction.Extent.Text,
             $nativeProcessHarnessTail
@@ -290,6 +331,10 @@ catch {
     Assert-True ($nativeProcessResult.OrdinaryFailureMessage.Contains('Ordinary failure fixture failed. Exit code 19. ordinary failure detail')) 'Ordinary Invoke-NativeProcess failure callers lost the expected failure detail.'
     Assert-True ($nativeProcessResult.OversizedFailureMessage.Contains('Child process output exceeded the bounded in-memory diagnostic capture')) 'Oversized native-process diagnostics were not rejected before retry classification.'
     Assert-True (-not $nativeProcessResult.OversizedClassified) 'Oversized native-process diagnostics were eligible for CMake bootstrap retry classification.'
+    Assert-True ($nativeProcessResult.UnterminatedExceeded -and -not $nativeProcessResult.UnterminatedClassified) 'An overlong unterminated line was not a typed non-retryable overflow.'
+    Assert-True ($nativeProcessResult.CharacterBudgetExceeded -and -not $nativeProcessResult.CharacterBudgetClassified) 'The per-stream character budget was not enforced as a non-retryable overflow.'
+    Assert-True $nativeProcessResult.HighVolumeClassified 'High-volume split-stream output was not drained and classified deterministically.'
+    Assert-True ($nativeProcessResult.EarlyMarkersOverflowExceeded -and -not $nativeProcessResult.EarlyMarkersOverflowClassified) 'Valid early markers remained retryable after a later capture overflow.'
 }
 finally {
     Remove-Item -LiteralPath $nativeProcessHarness -Force -ErrorAction SilentlyContinue
