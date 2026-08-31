@@ -12,6 +12,7 @@ on:
       - 'runtime-manifests/gpu-*-macos-*.json'
       - 'scripts/*macos*'
       - 'src/**'
+      - 'tools/worker-pack-author/**'
   push:
     branches: [main]
     paths:
@@ -24,6 +25,7 @@ on:
       - 'runtime-manifests/gpu-*-macos-*.json'
       - 'scripts/*macos*'
       - 'src/**'
+      - 'tools/worker-pack-author/**'
   workflow_dispatch:
     inputs:
       notarize:
