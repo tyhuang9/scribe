@@ -11,12 +11,8 @@ on:
       - 'runtime-manifests/linux-worker-install-contract-x86_64.json'
       - 'scripts/linux-worker-launch-fixture.rs'
       - 'scripts/test-linux-worker-launch.sh'
-      - 'src/linux_worker_architecture_guard.rs'
-      - 'src/linux_worker_launch.rs'
-      - 'src/onnx_worker.rs'
-      - 'src/gpu_worker_pack/mod.rs'
-      - 'src/main.rs'
-      - 'src/bin/scribe-inference-worker.rs'
+      - 'src/**'
+      - 'vendor/sherpa-onnx-sys/**'
   pull_request:
     paths:
       - '.github/workflows/linux-worker-launch.yml'
@@ -27,12 +23,8 @@ on:
       - 'runtime-manifests/linux-worker-install-contract-x86_64.json'
       - 'scripts/linux-worker-launch-fixture.rs'
       - 'scripts/test-linux-worker-launch.sh'
-      - 'src/linux_worker_architecture_guard.rs'
-      - 'src/linux_worker_launch.rs'
-      - 'src/onnx_worker.rs'
-      - 'src/gpu_worker_pack/mod.rs'
-      - 'src/main.rs'
-      - 'src/bin/scribe-inference-worker.rs'
+      - 'src/**'
+      - 'vendor/sherpa-onnx-sys/**'
 
 permissions:
   contents: read
@@ -48,5 +40,13 @@ jobs:
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e # 1.96.0 branch reviewed 2026-08-27
+      - name: Check actual Linux application and worker crates
+        env:
+          CARGO_INCREMENTAL: 0
+          CARGO_TARGET_DIR: target/linux-application-check
+          DOCS_RS: '1'
+        run: |
+          cargo check --locked --bin local-transcriber --features ui-harness
+          cargo check --locked --bin scribe-inference-worker --features inference-worker
       - name: Test descriptor-bound Linux worker launch
         run: ./scripts/test-linux-worker-launch.sh
