@@ -91,7 +91,7 @@ if (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure $legacyCmakeBootstrapFa
 if (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure @('transcribe-cpp-sys v0.1.3', 'Could not open file for write in copy operation'))) { throw 'Existing copy-operation CMake bootstrap signature regressed.' }
 $vulkanShortJunctionFailure = @(
     'transcribe-cpp-sys: could not create short build junction C:\safe\tcs; building in OUT_DIR (may exceed Windows MAX_PATH in deep checkouts)',
-    'error: failed to run custom build command for `transcribe-cpp-sys v0.1.3 (C:\safe\crate)`',
+    'error: failed to run custom build command for `transcribe-cpp-sys v0.1.3`',
     'vulkan-shaders-gen: warning: object directory is near the configured limit',
     'CMAKE_OBJECT_PATH_MAX is in effect for this nested target',
     "LINK : fatal error LNK1104: cannot open file 'CMakeFiles\cmTC_1a2B3c.dir\intermediate.manifest'"
@@ -110,6 +110,20 @@ foreach ($index in 1..157) {
     $capturedVulkanShortJunctionFailure.Add($line)
 }
 if (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure $capturedVulkanShortJunctionFailure.ToArray())) { throw 'Sanitized 157-line observed Vulkan CMake ordering was not classified.' }
+$wrappedProcessStartInfoVulkanFailure = [System.Collections.Generic.List[object]]::new()
+foreach ($index in 1..153) {
+    $line = switch ($index) {
+        1 { $vulkanShortJunctionFailure[0] }
+        2 { $vulkanShortJunctionFailure[1] }
+        58 { $vulkanShortJunctionFailure[2] }
+        77 { $vulkanShortJunctionFailure[3] }
+        125 { $vulkanShortJunctionFailure[4] }
+        default { 'sanitized ProcessStartInfo Cargo/CMake diagnostic output' }
+    }
+    $wrappedProcessStartInfoVulkanFailure.Add($line)
+}
+$wrappedProcessStartInfoVulkanFailure = $wrappedProcessStartInfoVulkanFailure -join "`r`n"
+if (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure $wrappedProcessStartInfoVulkanFailure)) { throw 'Single-string 153-line ProcessStartInfo Vulkan CMake diagnostic was not classified.' }
 $capturedVulkanShortJunctionCrlf = $capturedVulkanShortJunctionFailure -join "`r`n"
 $capturedVulkanShortJunctionLf = $capturedVulkanShortJunctionFailure -join "`n"
 if (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure $capturedVulkanShortJunctionCrlf) -or
@@ -136,6 +150,7 @@ if (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure $interveningVulkanShort
 foreach ($malformedVulkanShortJunctionFailure in @(
     @($vulkanShortJunctionFailure | Select-Object -Skip 1),
     @($vulkanShortJunctionFailure[1], $vulkanShortJunctionFailure[0], $vulkanShortJunctionFailure[4], $vulkanShortJunctionFailure[2], $vulkanShortJunctionFailure[3]),
+    @($vulkanShortJunctionFailure[0], 'error: failed to run custom build command for `transcribe-cpp-sys v0.1.3', $vulkanShortJunctionFailure[2], $vulkanShortJunctionFailure[3], $vulkanShortJunctionFailure[4]),
     @('transcribe-cpp-sys: could not create short build junction C:\safe\tcs; building in OUT_DIR (unexpected suffix)', $vulkanShortJunctionFailure[1], $vulkanShortJunctionFailure[2], $vulkanShortJunctionFailure[3], $vulkanShortJunctionFailure[4]),
     @($vulkanShortJunctionFailure[0], $vulkanShortJunctionFailure[1], $vulkanShortJunctionFailure[2], $vulkanShortJunctionFailure[3], 'LINK : fatal error LNK1104: cannot open file ''CMakeFiles\cmTC_xyz.dir\intermediate.manifest'''),
     @('unrelated LNK1104')
