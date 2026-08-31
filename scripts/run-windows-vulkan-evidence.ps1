@@ -131,6 +131,10 @@ if ($LASTEXITCODE -ne 0) { throw 'Evidence capture requires a clean source workt
 & $git -C $repositoryRoot diff --cached --quiet --exit-code
 if ($LASTEXITCODE -ne 0) { throw 'Evidence capture requires a clean source index.' }
 
+$nvidiaSmi = Get-Command 'nvidia-smi.exe' -ErrorAction SilentlyContinue
+if ($null -ne $nvidiaSmi -and [string]::IsNullOrWhiteSpace($ExpectedStableDevice)) {
+    throw 'ExpectedStableDevice is required to map an available NVIDIA device to exactly one PCI row.'
+}
 $baseline = if ($ExpectedStableDevice) { Get-ScribeVulkanEvidenceNvidiaBaseline $ExpectedStableDevice } else { $null }
 $previousRevision = $env:SCRIBE_BUILD_REVISION
 $previousArchive = $env:SHERPA_ONNX_ARCHIVE_DIR

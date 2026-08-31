@@ -13,7 +13,7 @@ $runner = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'run-windows-vulkan-
 foreach ($required in @('--locked', '--offline', '-SigningMode Fixture', '--ignored', '--exact', '--test-threads=1', 'onnx_worker::tests::windows_vulkan_fixture_evidence_captures_five_cold_and_twenty_warm_runs', 'gpu-auto-qualification-windows-x64.json', 'Production signing/release input is forbidden', 'Resolve-ScribeEvidenceFreshDirectory', 'Evidence output may not be under source')) {
     if ($runner -notmatch [regex]::Escape($required)) { throw "Runner is missing required source contract: $required" }
 }
-foreach ($required in @('Get-FileHash -LiteralPath $model', 'Get-FileHash -LiteralPath $wav', 'Test-ScribeEvidenceActivationPath', 'Test-ScribeEvidenceWithin', 'fixture-evidence-$($revision.Substring(0, 12))-$([guid]::NewGuid()', 'Fixture-only untrusted Vulkan evidence', 'previousEvidenceEnvironment')) {
+foreach ($required in @('Get-FileHash -LiteralPath $model', 'Get-FileHash -LiteralPath $wav', 'Test-ScribeEvidenceActivationPath', 'Test-ScribeEvidenceWithin', 'ExpectedStableDevice is required to map an available NVIDIA device', 'fixture-evidence-$($revision.Substring(0, 12))-$([guid]::NewGuid()', 'Fixture-only untrusted Vulkan evidence', 'previousEvidenceEnvironment')) {
     if ($runner -notmatch [regex]::Escape($required)) { throw "Runner is missing required safety contract: $required" }
 }
 if ($runner -match 'SigningMode Production|ProductionPrivateKeyPath|ProductionKeyId') { throw 'Fixture runner references a production signing input.' }
