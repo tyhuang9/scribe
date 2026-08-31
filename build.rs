@@ -11,8 +11,7 @@ const MACOS_KEYCHAIN_NAMESPACE_MANIFEST: &str =
     "runtime-manifests/gpu-keychain-namespace-macos-release.json";
 const LINUX_WORKER_INSTALL_CONTRACT: &str =
     "runtime-manifests/linux-worker-install-contract-x86_64.json";
-const LINUX_RELEASE_PACKAGE_CONTRACT: &str =
-    "runtime-manifests/linux-release-package-x86_64.json";
+const LINUX_RELEASE_PACKAGE_CONTRACT: &str = "runtime-manifests/linux-release-package-x86_64.json";
 
 fn main() {
     reject_multiple_gpu_features();
