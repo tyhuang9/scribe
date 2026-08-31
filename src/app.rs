@@ -676,7 +676,7 @@ struct PlaygroundRunState {
     _audio: Arc<PreparedAudio>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct ModelAccelerationState {
     model_id: ModelId,
     resolved: crate::transcription::ResolvedAcceleration,
