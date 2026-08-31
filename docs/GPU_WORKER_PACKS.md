@@ -116,6 +116,10 @@ The complete ancestor chain and verified payload handles remain alive. Windows o
 reject reparse points and omit delete sharing so an ancestor or payload cannot
 be renamed out from under verification. Unix opens use `openat` with
 `O_DIRECTORY|O_NOFOLLOW` for ancestors and handle-relative payload access.
+Directory enumeration opens `.` relative to the retained directory descriptor,
+passes that independent descriptor to `fdopendir`, and classifies each name
+with `fstatat(AT_SYMLINK_NOFOLLOW)`; it never treats `/proc/self/fd` or
+`/dev/fd` as a portable directory namespace.
 Directory identities are checked again before the lease is returned and before
 launch handoff; unsupported platforms fail closed.
 
