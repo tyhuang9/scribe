@@ -10,7 +10,7 @@ use std::ffi::CStr;
 #[cfg(unix)]
 use std::ffi::CString;
 #[cfg(unix)]
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
 
 use getrandom::fill;
 use serde::{Deserialize, Serialize};
@@ -1831,12 +1831,19 @@ fn anchored_entries(
         libc::openat(
             directory.leaf().as_raw_fd(),
             current.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
         )
     };
     if descriptor < 0 {
         return Err(PackStoreError::Io(io::Error::last_os_error()));
     }
+    let reopened = unsafe { File::from_raw_fd(descriptor) };
+    if directory_identity(&reopened)? != directory.identity()? {
+        return Err(PackStoreError::UnsafeFilesystemEntry(
+            directory.path.clone(),
+        ));
+    }
+    let descriptor = reopened.into_raw_fd();
     let stream = unsafe { libc::fdopendir(descriptor) };
     if stream.is_null() {
         let error = io::Error::last_os_error();
@@ -2962,6 +2969,10 @@ mod tests {
                 ("payload.bin".to_owned(), AnchoredEntryKind::File),
             ]
         );
+
+        let mut repeated = anchored_entries(&anchored).unwrap();
+        repeated.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(repeated, entries);
 
         drop(anchored);
         fs::remove_dir_all(root).unwrap();
