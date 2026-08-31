@@ -170,7 +170,9 @@ jobs:
         run: cargo clippy --locked --all-targets --features ui-harness,inference-worker,vulkan-acceleration -- -D warnings
 
       - name: Test
-        run: cargo test --locked --all-targets --features ui-harness,inference-worker,vulkan-acceleration
+        # Store/health tests exercise their own internal concurrency while sharing
+        # one anchored test authority; serialize top-level cases to avoid cross-test contention.
+        run: cargo test --locked --all-targets --features ui-harness,inference-worker,vulkan-acceleration -- --test-threads=1
 
       - name: Download and verify pinned release inputs
         shell: pwsh

@@ -21,8 +21,12 @@ pub(crate) const AUTO_QUALIFICATION_POLICY_VERSION: u16 = 1;
 const QUALIFICATION_SCHEMA_VERSION: u16 = 1;
 const WINDOWS_X64_OS: &str = "windows";
 const WINDOWS_X64_ARCH: &str = "x86_64";
+const LINUX_X64_OS: &str = "linux";
+const LINUX_X64_ARCH: &str = "x86_64";
 const EMBEDDED_WINDOWS_X64_MANIFEST: &str =
     include_str!("../runtime-manifests/gpu-auto-qualification-windows-x64.json");
+const EMBEDDED_LINUX_X64_MANIFEST: &str =
+    include_str!("../runtime-manifests/gpu-auto-qualification-linux-x86_64.json");
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const EMBEDDED_CURRENT_MANIFEST: &str =
     include_str!("../runtime-manifests/gpu-auto-qualification-macos-aarch64.json");
@@ -31,6 +35,8 @@ const EMBEDDED_CURRENT_MANIFEST: &str =
     include_str!("../runtime-manifests/gpu-auto-qualification-macos-x86_64.json");
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 const EMBEDDED_CURRENT_MANIFEST: &str = EMBEDDED_WINDOWS_X64_MANIFEST;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const EMBEDDED_CURRENT_MANIFEST: &str = EMBEDDED_LINUX_X64_MANIFEST;
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub(crate) enum AutoQualificationError {
@@ -193,6 +199,7 @@ impl AutoQualificationPolicy {
     pub(crate) fn embedded_current_platform() -> Result<&'static Self, String> {
         #[cfg(any(
             all(target_os = "windows", target_arch = "x86_64"),
+            all(target_os = "linux", target_arch = "x86_64"),
             all(target_os = "macos", target_arch = "aarch64"),
             all(target_os = "macos", target_arch = "x86_64")
         ))]
@@ -206,6 +213,7 @@ impl AutoQualificationPolicy {
         }
         #[cfg(not(any(
             all(target_os = "windows", target_arch = "x86_64"),
+            all(target_os = "linux", target_arch = "x86_64"),
             all(target_os = "macos", target_arch = "aarch64"),
             all(target_os = "macos", target_arch = "x86_64")
         )))]
@@ -217,6 +225,16 @@ impl AutoQualificationPolicy {
             OnceLock::new();
         POLICY
             .get_or_init(|| Self::from_canonical_json(EMBEDDED_WINDOWS_X64_MANIFEST))
+            .as_ref()
+            .map_err(ToString::to_string)
+    }
+
+    #[cfg(test)]
+    fn embedded_linux_x64() -> Result<&'static Self, String> {
+        static POLICY: OnceLock<Result<AutoQualificationPolicy, AutoQualificationError>> =
+            OnceLock::new();
+        POLICY
+            .get_or_init(|| Self::from_canonical_json(EMBEDDED_LINUX_X64_MANIFEST))
             .as_ref()
             .map_err(ToString::to_string)
     }
@@ -455,16 +473,16 @@ fn validate_entry(
 fn supported_platform(target_os: &str, target_arch: &str) -> bool {
     matches!(
         (target_os, target_arch),
-        ("windows", "x86_64") | ("macos", "aarch64") | ("macos", "x86_64")
+        ("windows", "x86_64") | ("linux", "x86_64") | ("macos", "aarch64") | ("macos", "x86_64")
     )
 }
 
 fn platform_backend_binding_is_valid(entry: &QualificationEntry, target_os: &str) -> bool {
     match (target_os, entry.backend) {
-        ("windows", BackendKind::Cuda) => {
+        ("windows" | "linux", BackendKind::Cuda) => {
             entry.provider_id == "transcribe-cpp-ggml-cuda" && entry.vendor == GpuVendor::Nvidia
         }
-        ("windows", BackendKind::Vulkan) => {
+        ("windows" | "linux", BackendKind::Vulkan) => {
             entry.provider_id == "transcribe-cpp-ggml-vulkan"
                 && matches!(
                     entry.vendor,
@@ -622,6 +640,14 @@ mod tests {
             ),
             QualificationDecision::Denied(QualificationDenial::NoMatchingPackEvidence)
         );
+    }
+
+    #[test]
+    fn embedded_linux_manifest_is_strict_default_deny_with_no_production_entries() {
+        let policy = AutoQualificationPolicy::embedded_linux_x64().unwrap();
+        assert_eq!(policy.document.target_os, LINUX_X64_OS);
+        assert_eq!(policy.document.target_arch, LINUX_X64_ARCH);
+        assert!(policy.document.entries.is_empty());
     }
 
     #[test]
@@ -971,6 +997,76 @@ mod tests {
     }
 
     #[test]
+    fn linux_entries_accept_only_reviewed_cuda_and_vulkan_bindings() {
+        for (backend, provider, vendor) in [
+            (
+                BackendKind::Cuda,
+                "transcribe-cpp-ggml-cuda",
+                GpuVendor::Nvidia,
+            ),
+            (
+                BackendKind::Vulkan,
+                "transcribe-cpp-ggml-vulkan",
+                GpuVendor::Nvidia,
+            ),
+            (
+                BackendKind::Vulkan,
+                "transcribe-cpp-ggml-vulkan",
+                GpuVendor::Amd,
+            ),
+            (
+                BackendKind::Vulkan,
+                "transcribe-cpp-ggml-vulkan",
+                GpuVendor::Intel,
+            ),
+        ] {
+            let mut document = fixture_document();
+            document.target_os = LINUX_X64_OS.to_owned();
+            document.target_arch = LINUX_X64_ARCH.to_owned();
+            document.entries[0].backend = backend;
+            document.entries[0].provider_id = provider.to_owned();
+            document.entries[0].vendor = vendor;
+            assert!(
+                AutoQualificationPolicy::from_fixture_json(
+                    &serde_json::to_string(&document).unwrap()
+                )
+                .is_ok()
+            );
+        }
+
+        for (backend, provider, vendor) in [
+            (
+                BackendKind::Cuda,
+                "transcribe-cpp-ggml-cuda",
+                GpuVendor::Amd,
+            ),
+            (
+                BackendKind::Vulkan,
+                "transcribe-cpp-ggml-cuda",
+                GpuVendor::Nvidia,
+            ),
+            (
+                BackendKind::Metal,
+                "transcribe-cpp-ggml-metal",
+                GpuVendor::Nvidia,
+            ),
+        ] {
+            let mut document = fixture_document();
+            document.target_os = LINUX_X64_OS.to_owned();
+            document.target_arch = LINUX_X64_ARCH.to_owned();
+            document.entries[0].backend = backend;
+            document.entries[0].provider_id = provider.to_owned();
+            document.entries[0].vendor = vendor;
+            assert_eq!(
+                AutoQualificationPolicy::from_fixture_json(
+                    &serde_json::to_string(&document).unwrap()
+                ),
+                Err(AutoQualificationError::InvalidEntry("target binding"))
+            );
+        }
+    }
+
+    #[test]
     fn macos_entries_accept_only_metal_with_supported_hardware_vendors() {
         for (vendor, class) in [
             (GpuVendor::Apple, DeviceClass::UnifiedGpu),
@@ -1011,6 +1107,7 @@ mod tests {
     fn current_platform_manifest_is_canonical_and_default_deny() {
         #[cfg(any(
             all(target_os = "windows", target_arch = "x86_64"),
+            all(target_os = "linux", target_arch = "x86_64"),
             all(target_os = "macos", target_arch = "aarch64"),
             all(target_os = "macos", target_arch = "x86_64")
         ))]
