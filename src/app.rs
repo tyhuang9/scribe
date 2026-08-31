@@ -19991,6 +19991,251 @@ mod layout_tests {
         }
     }
 
+    fn test_gpu_retry_operation(app: &mut LocalTranscriberApp) -> GpuRetryOperation {
+        let operation = GpuRetryOperation {
+            nonce: 41,
+            generation: app.acceleration_generation,
+            model_id: ModelId::new("whisper_cpp_tiny_en"),
+            preference: AccelerationPreference::Cpu,
+            target: BackendTarget::cpu(),
+        };
+        app.active_gpu_retry = Some(operation.clone());
+        operation
+    }
+
+    fn test_gpu_retry_event(
+        nonce: u64,
+        generation: u64,
+        model_id: ModelId,
+        preference: AccelerationPreference,
+        target: BackendTarget,
+    ) -> AppEvent {
+        AppEvent::GpuRetryFinished {
+            nonce,
+            generation,
+            model_id,
+            preference,
+            target,
+            result: Err("stale test completion".to_owned()),
+        }
+    }
+
+    fn assert_stale_gpu_retry_is_non_mutating(
+        mutate: impl FnOnce(&mut LocalTranscriberApp, &GpuRetryOperation),
+        event_mutate: impl FnOnce(
+            &GpuRetryOperation,
+        ) -> (u64, u64, ModelId, AccelerationPreference, BackendTarget),
+        clears_active_retry: bool,
+    ) {
+        let mut app = test_app();
+        let operation = test_gpu_retry_operation(&mut app);
+        app.status = TranscriptionStatus::Error;
+        app.status_message = "sentinel status".to_owned();
+        app.transcribe_notice = Some(TranscribeNotice::information("sentinel notice"));
+        let diagnostic = crate::transcription::ResolvedAcceleration {
+            requested: AccelerationPreference::Cpu,
+            resolved: crate::transcription::ComputeDevice::Cpu,
+            diagnostic: Some("sentinel diagnostic".to_owned()),
+            selection: None,
+        };
+        app.latest_acceleration = Some(ModelAccelerationState {
+            model_id: operation.model_id.clone(),
+            resolved: diagnostic.clone(),
+            retry_target: Some(operation.target.clone()),
+        });
+
+        mutate(&mut app, &operation);
+        let (nonce, generation, model_id, preference, target) = event_mutate(&operation);
+        app.tx
+            .send(test_gpu_retry_event(
+                nonce, generation, model_id, preference, target,
+            ))
+            .unwrap();
+        app.poll_events();
+
+        assert_eq!(app.status, TranscriptionStatus::Error);
+        assert_eq!(app.status_message, "sentinel status");
+        assert_eq!(
+            app.transcribe_notice
+                .as_ref()
+                .map(|notice| notice.message.as_str()),
+            Some("sentinel notice")
+        );
+        assert_eq!(
+            app.latest_acceleration
+                .as_ref()
+                .map(|state| &state.resolved),
+            Some(&diagnostic)
+        );
+        assert_eq!(app.active_gpu_retry.is_some(), !clears_active_retry);
+    }
+
+    #[test]
+    fn stale_gpu_retry_with_wrong_nonce_is_ignored_without_mutation() {
+        assert_stale_gpu_retry_is_non_mutating(
+            |_, _| {},
+            |operation| {
+                (
+                    operation.nonce + 1,
+                    operation.generation,
+                    operation.model_id.clone(),
+                    operation.preference,
+                    operation.target.clone(),
+                )
+            },
+            false,
+        );
+    }
+
+    #[test]
+    fn stale_gpu_retry_with_wrong_generation_is_invalidated_without_mutation() {
+        assert_stale_gpu_retry_is_non_mutating(
+            |_, _| {},
+            |operation| {
+                (
+                    operation.nonce,
+                    operation.generation + 1,
+                    operation.model_id.clone(),
+                    operation.preference,
+                    operation.target.clone(),
+                )
+            },
+            true,
+        );
+    }
+
+    #[test]
+    fn stale_gpu_retry_with_wrong_model_is_invalidated_without_mutation() {
+        assert_stale_gpu_retry_is_non_mutating(
+            |_, _| {},
+            |operation| {
+                (
+                    operation.nonce,
+                    operation.generation,
+                    ModelId::new("whisper_cpp_small_en"),
+                    operation.preference,
+                    operation.target.clone(),
+                )
+            },
+            true,
+        );
+    }
+
+    #[test]
+    fn stale_gpu_retry_with_wrong_preference_is_invalidated_without_mutation() {
+        assert_stale_gpu_retry_is_non_mutating(
+            |_, _| {},
+            |operation| {
+                (
+                    operation.nonce,
+                    operation.generation,
+                    operation.model_id.clone(),
+                    AccelerationPreference::Auto,
+                    operation.target.clone(),
+                )
+            },
+            true,
+        );
+    }
+
+    #[test]
+    fn stale_gpu_retry_with_wrong_target_is_invalidated_without_mutation() {
+        assert_stale_gpu_retry_is_non_mutating(
+            |_, _| {},
+            |operation| {
+                let mut target = operation.target.clone();
+                target.device_id = crate::backend_policy::DeviceIdentity::new("other-device");
+                (
+                    operation.nonce,
+                    operation.generation,
+                    operation.model_id.clone(),
+                    operation.preference,
+                    target,
+                )
+            },
+            true,
+        );
+    }
+
+    #[test]
+    fn duplicate_gpu_retry_completion_does_not_overwrite_terminal_state() {
+        let mut app = test_app();
+        let operation = test_gpu_retry_operation(&mut app);
+        let event = || AppEvent::GpuRetryFinished {
+            nonce: operation.nonce,
+            generation: operation.generation,
+            model_id: operation.model_id.clone(),
+            preference: operation.preference,
+            target: operation.target.clone(),
+            result: Err("retry failed".to_owned()),
+        };
+        app.tx.send(event()).unwrap();
+        app.poll_events();
+        let status = app.status;
+        let status_message = app.status_message.clone();
+        let notice = app.transcribe_notice.clone();
+        let diagnostics = app.latest_acceleration.clone();
+
+        app.tx.send(event()).unwrap();
+        app.poll_events();
+
+        assert_eq!(app.status, status);
+        assert_eq!(app.status_message, status_message);
+        assert_eq!(app.transcribe_notice, notice);
+        assert_eq!(app.latest_acceleration, diagnostics);
+    }
+
+    #[test]
+    fn model_mutation_while_gpu_retry_is_in_flight_rejects_old_completion() {
+        assert_stale_gpu_retry_is_non_mutating(
+            |app, _| app.config.general.selected_default_model = "whisper_cpp_small_en".to_owned(),
+            |operation| {
+                (
+                    operation.nonce,
+                    operation.generation,
+                    operation.model_id.clone(),
+                    operation.preference,
+                    operation.target.clone(),
+                )
+            },
+            true,
+        );
+    }
+
+    #[test]
+    fn preference_mutation_while_gpu_retry_is_in_flight_rejects_old_completion() {
+        assert_stale_gpu_retry_is_non_mutating(
+            |app, _| app.config.performance.acceleration_preference = AccelerationPreference::Auto,
+            |operation| {
+                (
+                    operation.nonce,
+                    operation.generation,
+                    operation.model_id.clone(),
+                    operation.preference,
+                    operation.target.clone(),
+                )
+            },
+            true,
+        );
+    }
+
+    #[test]
+    fn acceleration_artifact_mutation_while_gpu_retry_is_in_flight_rejects_old_completion() {
+        assert_stale_gpu_retry_is_non_mutating(
+            |app, _| app.invalidate_acceleration_state(),
+            |operation| {
+                (
+                    operation.nonce,
+                    operation.generation,
+                    operation.model_id.clone(),
+                    operation.preference,
+                    operation.target.clone(),
+                )
+            },
+            false,
+        );
+    }
+
     fn test_app() -> LocalTranscriberApp {
         let mut config = AppConfig::default();
         // Keep Playground event tests independent from whichever legacy model
