@@ -595,7 +595,7 @@ fn cuda_pci_uuid_identities() -> Result<BTreeMap<PciAddress, String>, String> {
         let bus_id = unsafe { CStr::from_ptr(bus_id.as_ptr()) }
             .to_str()
             .ok()
-            .and_then(PciAddress::parse)
+            .and_then(parse_cuda_pci_bus_id)
             .ok_or_else(|| "Linux CUDA driver returned malformed PCI identity".to_owned())?;
         let mut uuid = CuUuid { bytes: [0; 16] };
         // SAFETY: uuid is a correctly sized writable CUuuid structure.
@@ -610,6 +610,19 @@ fn cuda_pci_uuid_identities() -> Result<BTreeMap<PciAddress, String>, String> {
         }
     }
     Ok(identities)
+}
+
+#[cfg(any(
+    all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_env = "gnu",
+        feature = "cuda-acceleration"
+    ),
+    test
+))]
+fn parse_cuda_pci_bus_id(value: &str) -> Option<PciAddress> {
+    PciAddress::parse(&value.to_ascii_lowercase())
 }
 
 #[cfg(any(
@@ -853,6 +866,13 @@ mod tests {
         assert!(PciAddress::from_provider_id("0000:01:20.0").is_none());
         assert!(PciAddress::from_provider_id("0000:01:00.8").is_none());
         assert!(PciAddress::from_provider_id("000A:01:00.0").is_none());
+    }
+
+    #[test]
+    fn cuda_driver_pci_identity_normalizes_uppercase_hexadecimal() {
+        let parsed = parse_cuda_pci_bus_id("000A:0B:1F.7").unwrap();
+        assert_eq!(parsed.canonical(), "native:pci:000a:0b:1f.7");
+        assert!(parse_cuda_pci_bus_id("000A:0B:20.0").is_none());
     }
 
     #[test]
