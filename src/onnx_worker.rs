@@ -4283,6 +4283,24 @@ impl ProcessWorkerSupervisor {
     }
 
     fn record_active_model(&self, generation: u64, identity: String) -> Result<()> {
+        let process = {
+            let state = self
+                .inner
+                .state
+                .lock()
+                .map_err(|_| anyhow!("process worker supervisor state lock was poisoned"))?;
+            let Some(current) = state
+                .current
+                .as_ref()
+                .filter(|current| current.generation == generation)
+            else {
+                bail!("process worker generation changed before model residency was recorded");
+            };
+            Arc::clone(&current.process)
+        };
+        if !process.is_running()? {
+            bail!("process worker generation exited before model residency was recorded");
+        }
         let mut state = self
             .inner
             .state
@@ -6565,6 +6583,7 @@ impl GpuRouteCatalogCache {
         }) {
             failed.explicit_retry_available = false;
             failed.retry_not_before = now;
+            self.successful = None;
             return true;
         }
         // An exact retry may be requested after a successful catalog was
@@ -6574,6 +6593,7 @@ impl GpuRouteCatalogCache {
         if self.successful.as_ref().is_some_and(|catalog| {
             !catalog.routes.is_empty() && catalog.discovery_fingerprint == discovery_fingerprint
         }) {
+            self.successful = None;
             self.failed = Some(FailedGpuProbe {
                 discovery_fingerprint: discovery_fingerprint.to_owned(),
                 retry_not_before: now,
@@ -11399,6 +11419,7 @@ mod tests {
         let mut wrong_device = capability;
         wrong_device.devices[0].stable_device_identity = "native:pci:0000:02:00.0".to_owned();
         assert!(bind_pack_hello(&context, &wrong_device).is_err());
+        drop(binding);
         drop(bindings);
         drop(context);
         std::fs::remove_dir_all(root).unwrap();
@@ -12110,7 +12131,10 @@ mod tests {
         let mut target = backend_target(backend, identity, Some(0));
         target.driver_version = Some(driver.to_owned());
         target.pack = Some(crate::backend_policy::BackendPackIdentity {
-            pack_id: format!("scribe-{}-windows-x64", backend.label()),
+            pack_id: format!(
+                "scribe-{}-windows-x64",
+                backend.label().to_ascii_lowercase()
+            ),
             pack_version: "1.0.0".to_owned(),
             pack_digest: pack_digest.to_string().repeat(64),
             security_epoch: 1,
@@ -12202,7 +12226,7 @@ mod tests {
             string(vendor),
             string(device_class),
             target.memory_total_bytes,
-            target.memory_available_bytes,
+            target.memory_available_bytes.max(1),
             string(target.driver_version.as_deref().expect("fixture driver")),
             string(evidence_id),
         );
@@ -13002,11 +13026,12 @@ mod tests {
         };
 
         let artifact = gguf_artifact_fixture("runtime-response-generation-binding");
-        let loaded = inference
+        let error = inference
             .load(artifact.artifact.clone(), AccelerationPreference::Cpu)
-            .unwrap();
+            .expect_err("an exited generation cannot own recorded model residency");
 
-        assert_eq!(loaded.detected_architecture, "test-runtime");
+        assert!(matches!(error, RuntimeError::RetryableWorkerFailure(_)));
+        assert!(error.to_string().contains("generation exited"));
         let wait_until = Instant::now() + Duration::from_millis(250);
         while inference.transport.current_generation().unwrap().is_some()
             && Instant::now() < wait_until
@@ -13977,6 +14002,7 @@ mod tests {
             'a',
         );
         let target = route.target.as_mut().unwrap();
+        target.provider_id = ProviderIdentity::new("transcribe-cpp-ggml-cuda");
         target.memory_available_bytes = 0;
         let model_digest = "b".repeat(64);
         let policy = fixture_auto_policy(target, &model_digest, "low-vram-backoff-fixture-v1");
@@ -14035,7 +14061,9 @@ mod tests {
             "windows-display:32.0.16.1088",
             'a',
         );
-        let target = route.target.as_ref().unwrap();
+        let mut route = route;
+        let target = route.target.as_mut().unwrap();
+        target.provider_id = ProviderIdentity::new("transcribe-cpp-ggml-cuda");
         let model_digest = "b".repeat(64);
         let policy = fixture_auto_policy(target, &model_digest, "power-backoff-fixture-v1");
         let qualified = auto_qualified_gpu_route_catalog_with_admission(
