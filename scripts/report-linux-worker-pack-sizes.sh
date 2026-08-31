@@ -3,17 +3,20 @@ set -euo pipefail
 IFS=$'\n\t'
 
 if [[ "${1:-}" == --package && -n "${2:-}" && $# == 2 ]]; then
+  [[ ! -L "$2" ]] || { echo 'package argument must not be a symlink.' >&2; exit 1; }
   package="$(realpath -e -- "$2")"; report="$package.sizes.json"
   [[ -f "$report" && ! -L "$report" ]] || { echo 'deterministic package size report is missing.' >&2; exit 1; }
-  actual="$(stat -c %s -- "$package")"
-  python3 - "$report" "$actual" <<'PY'
+  repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+  verified="$(bash "$repo_root/scripts/verify-linux-release-package.sh" --package "$package")"
+  python3 - "$report" "$verified" <<'PY'
 import json, pathlib, sys
 path = pathlib.Path(sys.argv[1]); raw = path.read_bytes(); document = json.loads(raw)
 canonical = json.dumps(document, sort_keys=True, separators=(",", ":")).encode()
 if raw != canonical:
     raise SystemExit("package size report is not canonical JSON")
+verified = json.loads(sys.argv[2])
 expected = {"schema_version", "target", "package_format", "installed_size_bytes", "compressed_size_bytes", "packs"}
-if set(document) != expected or document["schema_version"] != 1 or document["target"] != "x86_64-unknown-linux-gnu" or document["package_format"] != "deb" or document["compressed_size_bytes"] != int(sys.argv[2]) or not isinstance(document["installed_size_bytes"], int) or isinstance(document["installed_size_bytes"], bool) or document["installed_size_bytes"] < 0 or document["packs"] != []:
+if set(document) != expected or document["schema_version"] != 1 or document["target"] != "x86_64-unknown-linux-gnu" or document["package_format"] != "deb" or document["compressed_size_bytes"] != verified["compressed_size_bytes"] or document["installed_size_bytes"] != verified["installed_size_bytes"] or not isinstance(document["installed_size_bytes"], int) or isinstance(document["installed_size_bytes"], bool) or document["installed_size_bytes"] < 0 or document["packs"] != [] or verified["packs"] != []:
     raise SystemExit("package size report is inconsistent")
 print(raw.decode())
 PY
@@ -25,6 +28,7 @@ fi
   echo '   or: report-linux-worker-pack-sizes.sh <--fixture-pack|--production-pack> <pack-root> --tool <scribe-worker-pack-tool>' >&2
   exit 2
 }
+[[ ! -L "$2" && ! -L "$4" ]] || { echo 'pack-root and tool arguments must not be symlinks.' >&2; exit 1; }
 mode="$1"; pack_root="$(realpath -e -- "$2")"; tool="$(realpath -e -- "$4")"
 [[ -d "$pack_root" && ! -L "$pack_root" && -x "$tool" ]] || { echo 'pack root or verification tool is unsafe.' >&2; exit 1; }
 if [[ "$mode" == --fixture-pack ]]; then verification=verify-fixture; else verification=verify-production-linux; fi

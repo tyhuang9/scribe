@@ -15,20 +15,25 @@ available only to tests and size-report evidence; production assembly and
 production size reporting never accept it. Linux GPU discovery, the runtime
 registry, and Auto qualification remain empty/default-deny.
 
-`build-linux-release-package.sh` refuses links, hardlinked inputs, an existing
-output, a desktop that does not contain the exact CPU-worker SHA-256 anchor, or
-any GPU pack that cannot pass the Rust production verifier and immutable
-`PackStore`. It writes an exact sorted file inventory, normalizes timestamps
-from `SOURCE_DATE_EPOCH`, uses root ownership in the archive, and publishes the
-completed `.deb` by one same-directory rename. The adjacent canonical size
-report records installed and compressed package bytes. The pack size reporter
-first invokes either fixture-only or production Rust verification, labels the
-trust mode, and computes reproducible installed and compressed sizes.
+`build-linux-release-package.sh` refuses symlink arguments, hardlinked inputs,
+non-ELF or non-x86_64 executables, an existing output, a desktop that does not
+contain the exact CPU-worker SHA-256 anchor, or any GPU pack that cannot pass
+the Rust production verifier and immutable `PackStore`. It writes an exact
+sorted file inventory, sets every directory and executable to `0755`, sets all
+metadata to `0644`, normalizes timestamps from `SOURCE_DATE_EPOCH`, uses root
+ownership in the archive, and publishes the completed `.deb` by one
+same-directory rename. The adjacent canonical size report records the sum of
+regular installed-file bytes and compressed package bytes. Package size
+reporting consumes the package verifier's machine-readable result and rejects
+a stale sidecar. Pack-size reporting first invokes either fixture-only or
+production Rust verification and labels the trust mode.
 
 `verify-linux-release-package.sh` inspects the data archive before extraction,
-rejects unsafe names, duplicates, links and nonregular entries, and then checks
-the exact inventory, modes, sizes, hashes, FHS paths, empty pack tree, canonical
-catalog, reviewed release contract, and CPU-worker anchor. This makes the
+rejects unsafe names, duplicates, links, nonregular entries, non-root ownership,
+and unsafe archive modes without normalizing them during extraction. It then
+checks ELF identity, the exact inventory, deterministic regular-file byte sum,
+modes, sizes, hashes, FHS paths, empty pack tree, canonical catalog, reviewed
+release contract, and CPU-worker anchor. This makes the
 installed CPU worker compatible with the descriptor-bound `openat2` plus
 sealed-`memfd` launcher while leaving no mutable path fallback.
 
@@ -38,10 +43,14 @@ Run the native package and attack suite on Ubuntu 22.04 or 24.04:
 ./scripts/test-linux-release-packaging.sh
 ```
 
-The suite builds the CPU-only package twice and requires byte-identical `.deb`
-and size reports. It rejects worker tampering, unexpected files, catalog and
-contract mutation, symlinks, overwrite attempts, fixture trust in production,
-and partial publication. The standalone Rust tool tests additionally cover
+Within each supported Ubuntu CI lane and its pinned release-tool versions, the
+suite builds the CPU-only package under caller umasks `077`, `022`, and `002`
+and requires byte-identical `.deb` and size reports. It does not claim identical
+compression across different `dpkg-deb` or compression-tool versions. It
+rejects unsafe directory modes, invalid ELF inputs, worker tampering, unexpected
+files, stale size reports, catalog and contract mutation, symlink arguments,
+overwrite attempts, fixture trust in production, and partial publication. The
+standalone Rust tool tests additionally cover
 exact manifest/signature/inventory validation, immutable staging, no-replace
 publication, interruption recovery, previous-pack retention, rollback, epoch
 floors, ancestor swaps, and hostile filesystem entries.

@@ -26,12 +26,16 @@ done
 for command in dpkg-deb python3 sha256sum stat tar; do command -v "$command" >/dev/null || { echo "$command is required." >&2; exit 1; }; done
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+source "$repo_root/scripts/linux-release-package-common.sh"
+[[ ! -L "$desktop" && ! -L "$cpu_worker" ]] || { echo 'release input arguments must not be symlinks.' >&2; exit 1; }
 desktop="$(realpath -e -- "$desktop")"; cpu_worker="$(realpath -e -- "$cpu_worker")"
 for input in "$desktop" "$cpu_worker"; do
   [[ -f "$input" && ! -L "$input" ]] || { echo "release input must be a regular non-symlink file: $input" >&2; exit 1; }
   [[ "$(stat -c %h -- "$input")" == 1 ]] || { echo "release input must not be hardlinked: $input" >&2; exit 1; }
   [[ "$(stat -c %s -- "$input")" -le 2147483648 ]] || { echo "release input exceeds the 2 GiB per-file bound: $input" >&2; exit 1; }
 done
+linux_require_x86_64_elf "$desktop" 'desktop input'
+linux_require_x86_64_elf "$cpu_worker" 'CPU worker input'
 output_parent="$(dirname -- "$output")"; mkdir -p -- "$output_parent"
 output="$(cd "$output_parent" && pwd -P)/$(basename -- "$output")"
 [[ "$output" == *.deb ]] || { echo 'output must have a .deb suffix.' >&2; exit 2; }
@@ -54,6 +58,7 @@ cleanup() {
 }
 trap cleanup EXIT
 package_root="$temp_root/root"; authority_root="$package_root/usr/lib/scribe"; packs_root="$authority_root/workers"
+umask 022
 mkdir -p -- "$package_root/DEBIAN" "$package_root/usr/bin" "$packs_root/packs" "$temp_root/pack-state"
 install -m 0755 -- "$desktop" "$package_root/usr/bin/local-transcriber"
 install -m 0755 -- "$cpu_worker" "$authority_root/scribe-inference-worker"
@@ -65,8 +70,12 @@ LC_ALL=C grep -aF -- "$worker_sha256" "$package_root/usr/bin/local-transcriber" 
 }
 
 printf '%s' '{"schema_version":1,"packs":[]}' >"$authority_root/worker-pack-catalog.json"
+chmod 0644 "$authority_root/worker-pack-catalog.json"
 install -m 0644 -- "$repo_root/runtime-manifests/linux-release-package-x86_64.json" "$authority_root/linux-release-package.json"
 
+for pack in "${gpu_packs[@]}"; do
+  [[ ! -L "$pack" ]] || { echo 'GPU pack input argument must not be a symlink.' >&2; exit 1; }
+done
 if ((${#gpu_packs[@]})); then
   command -v cargo >/dev/null || { echo 'cargo is required to verify a requested GPU pack.' >&2; exit 1; }
   export SCRIBE_BUILD_REVISION="$build_revision"
@@ -96,8 +105,9 @@ for line in pathlib.Path(source).read_text(encoding="utf-8").splitlines():
 document = {"schema_version": 1, "target": "x86_64-unknown-linux-gnu", "build_revision": build_revision, "cpu_worker_sha256": worker_sha256, "entries": entries}
 pathlib.Path(output).write_text(json.dumps(document, sort_keys=True, separators=(",", ":")), encoding="utf-8")
 PY
+chmod 0644 "$authority_root/linux-release-inventory.json"
 
-installed_bytes="$(du -sb "$package_root/usr" | awk '{print $1}')"
+installed_bytes="$(linux_regular_file_bytes "$package_root/usr")"
 [[ "$installed_bytes" -le 4294967296 ]] || { echo 'release package exceeds the 4 GiB aggregate bound.' >&2; exit 1; }
 installed_kib="$(((installed_bytes + 1023) / 1024))"
 cat >"$package_root/DEBIAN/control" <<EOF
@@ -110,6 +120,10 @@ Section: sound
 Priority: optional
 Description: Scribe local transcription desktop and verified inference workers
 EOF
+chmod 0644 "$package_root/DEBIAN/control"
+find "$package_root" -type d -exec chmod 0755 -- {} +
+chmod 0755 "$package_root/usr/bin/local-transcriber" "$authority_root/scribe-inference-worker"
+chmod 0644 "$authority_root/worker-pack-catalog.json" "$authority_root/linux-release-package.json" "$authority_root/linux-release-inventory.json" "$package_root/DEBIAN/control"
 
 find "$package_root" -exec touch --no-dereference --date="@$source_date_epoch" -- {} +
 temporary_deb="$(mktemp "$output_parent/.scribe-linux-release.XXXXXX.deb")"

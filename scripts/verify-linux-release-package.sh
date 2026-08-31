@@ -4,12 +4,14 @@ IFS=$'\n\t'
 trap 'status=$?; echo "Linux release package verification failed at line $LINENO (exit $status)." >&2; exit "$status"' ERR
 
 [[ "${1:-}" == --package && -n "${2:-}" && $# == 2 ]] || { echo 'usage: verify-linux-release-package.sh --package <path.deb>' >&2; exit 2; }
+[[ ! -L "$2" ]] || { echo 'package argument must not be a symlink.' >&2; exit 1; }
 package="$(realpath -e -- "$2")"
 [[ -f "$package" && ! -L "$package" ]] || { echo 'package must be a regular non-symlink file.' >&2; exit 1; }
 [[ "$(stat -c %h -- "$package")" == 1 ]] || { echo 'package must not be hardlinked.' >&2; exit 1; }
 [[ "$(stat -c %s -- "$package")" -le 4294967296 ]] || { echo 'compressed package exceeds the 4 GiB bound.' >&2; exit 1; }
 for command in dpkg-deb python3 sha256sum stat tar; do command -v "$command" >/dev/null || { echo "$command is required." >&2; exit 1; }; done
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+source "$repo_root/scripts/linux-release-package-common.sh"
 temp_root="$(mktemp -d "${TMPDIR:-/tmp}/scribe-linux-verify.XXXXXX")"
 trap 'status=$?; rm -rf -- "$temp_root"; exit "$status"' EXIT
 
@@ -42,14 +44,18 @@ if tar --numeric-owner -tvf "$temp_root/data.tar" | awk '$2 != "0/0" { found=1 }
   echo 'package data archive contains a non-root owner or group.' >&2
   exit 1
 fi
+if tar --numeric-owner -tvf "$temp_root/data.tar" | awk 'substr($1,1,1) == "d" && $1 != "drwxr-xr-x" { found=1 } END { exit(found ? 0 : 1) }'; then
+  echo 'package data archive contains an unsafe directory mode.' >&2
+  exit 1
+fi
 if tar --numeric-owner -tvf "$temp_root/data.tar" | awk 'substr($1,1,1) == "-" { if ($3 > 2147483648) found=1; total += $3 } END { if (total > 4294967296) found=1; exit(found ? 0 : 1) }'; then
   echo 'package data archive exceeds file or aggregate size bounds.' >&2
   exit 1
 fi
 mkdir "$temp_root/root"
-tar -xf "$temp_root/data.tar" -C "$temp_root/root" --no-same-owner --no-same-permissions
+tar -xf "$temp_root/data.tar" -C "$temp_root/root" --no-same-owner --same-permissions
 root="$temp_root/root"; authority="$root/usr/lib/scribe"; inventory="$authority/linux-release-inventory.json"
-installed_bytes="$(du -sb "$root/usr" | awk '{print $1}')"; installed_kib="$(((installed_bytes + 1023) / 1024))"
+installed_bytes="$(linux_regular_file_bytes "$root/usr")"; installed_kib="$(((installed_bytes + 1023) / 1024))"
 [[ "$(dpkg-deb -f "$package" Installed-Size)" == "$installed_kib" ]] || { echo 'package Installed-Size does not match the exact payload.' >&2; exit 1; }
 [[ -d "$root/usr/bin" && ! -L "$root/usr/bin" && -d "$authority/workers/packs" && ! -L "$authority/workers/packs" ]] || { echo 'canonical Linux authority directories are missing or unsafe.' >&2; exit 1; }
 expected_directories="$temp_root/expected-directories"; actual_directories="$temp_root/actual-directories"
@@ -60,6 +66,8 @@ while IFS= read -r directory; do [[ "$(stat -c %a -- "$root/$directory")" == 755
 for path in "$root/usr/bin/local-transcriber" "$authority/scribe-inference-worker" "$authority/worker-pack-catalog.json" "$authority/linux-release-package.json" "$inventory"; do
   [[ -f "$path" && ! -L "$path" && "$(stat -c %h -- "$path")" == 1 ]] || { echo "required package file is missing or unsafe: $path" >&2; exit 1; }
 done
+linux_require_x86_64_elf "$root/usr/bin/local-transcriber" 'packaged desktop'
+linux_require_x86_64_elf "$authority/scribe-inference-worker" 'packaged CPU worker'
 [[ "$(stat -c %a -- "$inventory")" == 644 ]] || { echo 'release inventory mode is not 0644.' >&2; exit 1; }
 cmp -s "$authority/linux-release-package.json" "$repo_root/runtime-manifests/linux-release-package-x86_64.json" || { echo 'package release contract differs from the reviewed manifest.' >&2; exit 1; }
 [[ "$(cat "$authority/worker-pack-catalog.json")" == '{"schema_version":1,"packs":[]}' ]] || { echo 'production Linux pack catalog must remain canonical and empty.' >&2; exit 1; }
@@ -118,4 +126,8 @@ worker_digest="$(sha256sum "$authority/scribe-inference-worker" | awk '{print $1
 inventory_worker_digest="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["cpu_worker_sha256"])' "$inventory")"
 [[ "$worker_digest" == "$inventory_worker_digest" ]] || { echo 'CPU worker inventory anchor differs.' >&2; exit 1; }
 LC_ALL=C grep -aF -- "$worker_digest" "$root/usr/bin/local-transcriber" >/dev/null || { echo 'desktop does not embed the packaged CPU worker anchor.' >&2; exit 1; }
-echo 'Linux release package verification passed.'
+package_bytes="$(stat -c %s -- "$package")"
+python3 - "$installed_bytes" "$package_bytes" <<'PY'
+import json, sys
+print(json.dumps({"schema_version": 1, "target": "x86_64-unknown-linux-gnu", "installed_size_bytes": int(sys.argv[1]), "compressed_size_bytes": int(sys.argv[2]), "packs": []}, sort_keys=True, separators=(",", ":")))
+PY
