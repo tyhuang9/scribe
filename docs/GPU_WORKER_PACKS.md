@@ -116,9 +116,13 @@ The complete ancestor chain and verified payload handles remain alive. Windows o
 reject reparse points and omit delete sharing so an ancestor or payload cannot
 be renamed out from under verification. Unix opens use `openat` with
 `O_DIRECTORY|O_NOFOLLOW` for ancestors and handle-relative payload access.
-Directory enumeration opens `.` relative to the retained directory descriptor,
-passes that independent descriptor to `fdopendir`, and classifies each name
-with `fstatat(AT_SYMLINK_NOFOLLOW)`; it never treats `/proc/self/fd` or
+Linux directory enumeration opens an independent `.` descriptor relative to
+the retained directory descriptor. Darwin instead duplicates the already
+validated retained descriptor with `F_DUPFD_CLOEXEC`; because that duplicate
+shares the open-file-description offset, Darwin scans are process-serialized
+and call `rewinddir` before each scan. Both paths pass only the disposable
+descriptor to `fdopendir`, verify its directory identity, and classify each
+name with `fstatat(AT_SYMLINK_NOFOLLOW)`; neither treats `/proc/self/fd` or
 `/dev/fd` as a portable directory namespace.
 Directory identities are checked again before the lease is returned and before
 launch handoff; unsupported platforms fail closed.

@@ -131,6 +131,9 @@ struct AnchoredDirectory {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 struct UnixDirectoryStream(*mut libc::DIR);
 
+#[cfg(target_os = "macos")]
+static MACOS_ANCHORED_DIRECTORY_SCAN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 impl UnixDirectoryStream {
     fn close(mut self) -> io::Result<()> {
@@ -1825,19 +1828,26 @@ fn anchored_child_names(directory: &AnchoredDirectory) -> Result<Vec<String>, Pa
 fn anchored_entries(
     directory: &AnchoredDirectory,
 ) -> Result<Vec<(String, AnchoredEntryKind)>, PackStoreError> {
+    #[cfg(target_os = "macos")]
+    let _scan_guard = MACOS_ANCHORED_DIRECTORY_SCAN_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     directory.recheck()?;
-    let current = c".";
-    // Darwin rejects reopening an already-held directory with
-    // `openat(dirfd, ".", O_DIRECTORY)` even though the anchor itself is a
-    // directory. The reopened object is still required to match the retained
-    // descriptor identity below before `fdopendir` can consume it. Linux can
-    // keep the additional kernel-side type check.
-    let mut flags = libc::O_RDONLY | libc::O_CLOEXEC;
+
     #[cfg(target_os = "linux")]
-    {
-        flags |= libc::O_DIRECTORY;
-    }
-    let descriptor = unsafe { libc::openat(directory.leaf().as_raw_fd(), current.as_ptr(), flags) };
+    let descriptor = unsafe {
+        libc::openat(
+            directory.leaf().as_raw_fd(),
+            c".".as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    // Darwin's directory descriptor cannot be portably reopened through
+    // `openat(dirfd, ".", ...)`. Duplicate the retained authority instead.
+    // The duplicate shares its open-file-description offset, so the process-
+    // wide lock above and the `rewinddir` below must cover the complete scan.
+    #[cfg(target_os = "macos")]
+    let descriptor = unsafe { libc::fcntl(directory.leaf().as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
     if descriptor < 0 {
         return Err(PackStoreError::Io(io::Error::last_os_error()));
     }
@@ -1855,6 +1865,10 @@ fn anchored_entries(
         return Err(PackStoreError::Io(error));
     }
     let stream = UnixDirectoryStream(stream);
+    #[cfg(target_os = "macos")]
+    unsafe {
+        libc::rewinddir(stream.0);
+    }
 
     let mut entries = Vec::new();
     loop {
@@ -2977,6 +2991,47 @@ mod tests {
         let mut repeated = anchored_entries(&anchored).unwrap();
         repeated.sort_by(|left, right| left.0.cmp(&right.0));
         assert_eq!(repeated, entries);
+
+        drop(anchored);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn anchored_directory_enumeration_serializes_and_rewinds_shared_offsets() {
+        const THREADS: usize = 8;
+        const SCANS_PER_THREAD: usize = 32;
+
+        let root = temp_root("descriptor-directory-concurrent-enumeration");
+        let authority = root.join("authority");
+        fs::create_dir(&authority).unwrap();
+        fs::create_dir(authority.join("child")).unwrap();
+        fs::write(authority.join("payload.bin"), b"payload").unwrap();
+        let anchored = Arc::new(AnchoredDirectory::open_root(&authority).unwrap());
+        let barrier = Arc::new(std::sync::Barrier::new(THREADS));
+        let expected = vec![
+            ("child".to_owned(), AnchoredEntryKind::Directory),
+            ("payload.bin".to_owned(), AnchoredEntryKind::File),
+        ];
+
+        let threads = (0..THREADS)
+            .map(|_| {
+                let anchored = Arc::clone(&anchored);
+                let barrier = Arc::clone(&barrier);
+                let expected = expected.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    for _ in 0..SCANS_PER_THREAD {
+                        let mut entries = anchored_entries(&anchored).unwrap();
+                        entries.sort_by(|left, right| left.0.cmp(&right.0));
+                        assert_eq!(entries, expected);
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for thread in threads {
+            thread.join().unwrap();
+        }
 
         drop(anchored);
         fs::remove_dir_all(root).unwrap();
