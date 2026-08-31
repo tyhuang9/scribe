@@ -6086,6 +6086,10 @@ impl InferenceWorkerSupervisor {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "the client-side worker adapter is excluded from the dedicated inference-worker target"
+)]
 fn worker_unavailable(error: impl std::fmt::Display) -> RuntimeError {
     RuntimeError::RetryableWorkerFailure(error.to_string())
 }
@@ -6139,6 +6143,10 @@ fn reconcile_verified_pack_target(
 }
 
 #[derive(Clone)]
+#[allow(
+    dead_code,
+    reason = "the client-side route is excluded from the dedicated inference-worker target"
+)]
 struct InferenceWorkerRoute {
     provider: WorkerProvider,
     supervisor: InferenceWorkerSupervisor,
