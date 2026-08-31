@@ -1,0 +1,75 @@
+Set-StrictMode -Version Latest
+
+function ConvertTo-ScribeVulkanEvidencePci([string]$Value) {
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        throw 'NVIDIA PCI identity is missing.'
+    }
+    if ($Value -cne $Value.Trim()) {
+        throw 'NVIDIA PCI identity must not contain surrounding whitespace.'
+    }
+    $normalized = $Value.ToLowerInvariant()
+    if ($normalized -match '^native:([0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7])$') {
+        return $Matches[1]
+    }
+    if ($normalized -match '^00000000:([0-9a-f]{2}:[0-9a-f]{2}\.[0-7])$') {
+        return "0000:$($Matches[1])"
+    }
+    if ($normalized -match '^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$') {
+        return $normalized
+    }
+    throw 'NVIDIA PCI identity is not canonical.'
+}
+
+function ConvertTo-ScribeVulkanEvidenceUInt64([string]$Value, [string]$Label) {
+    if ($Value -cnotmatch '^[0-9]+$') {
+        throw "$Label must be an unsigned decimal integer."
+    }
+    try {
+        return [UInt64]::Parse($Value, [Globalization.CultureInfo]::InvariantCulture)
+    }
+    catch {
+        throw "$Label is outside UInt64 range."
+    }
+}
+
+function Get-ScribeVulkanEvidenceNvidiaBaseline([string]$ExpectedStableDevice) {
+    $nvidiaSmi = Get-Command 'nvidia-smi.exe' -ErrorAction SilentlyContinue
+    if ($null -eq $nvidiaSmi) {
+        return $null
+    }
+    $query = 'pci.bus_id,name,driver_version,memory.total,memory.used,utilization.gpu'
+    $rows = @(& $nvidiaSmi.Source "--query-gpu=$query" '--format=csv,noheader,nounits')
+    if ($LASTEXITCODE -ne 0) {
+        throw 'nvidia-smi failed during Vulkan evidence preflight.'
+    }
+    $expectedPci = ConvertTo-ScribeVulkanEvidencePci $ExpectedStableDevice
+    $parsed = @($rows | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+        ConvertFrom-Csv -Header 'pci_bus_id', 'product', 'driver', 'memory_total_mib', 'memory_used_mib', 'gpu_utilization_percent')
+    $matching = @($parsed | Where-Object {
+        (ConvertTo-ScribeVulkanEvidencePci ([string]$_.pci_bus_id)) -ceq $expectedPci
+    })
+    if ($matching.Count -ne 1) {
+        throw 'nvidia-smi did not provide exactly one row for the expected Vulkan PCI device.'
+    }
+    $row = $matching[0]
+    $totalMib = ConvertTo-ScribeVulkanEvidenceUInt64 ([string]$row.memory_total_mib) 'NVIDIA total memory'
+    $usedMib = ConvertTo-ScribeVulkanEvidenceUInt64 ([string]$row.memory_used_mib) 'NVIDIA used memory'
+    $utilization = ConvertTo-ScribeVulkanEvidenceUInt64 ([string]$row.gpu_utilization_percent) 'NVIDIA GPU utilization'
+    if ([string]::IsNullOrWhiteSpace([string]$row.product) -or
+        ([string]$row.product).Length -gt 256 -or
+        [string]::IsNullOrWhiteSpace([string]$row.driver) -or
+        ([string]$row.driver).Length -gt 128 -or
+        $totalMib -eq 0 -or
+        $usedMib -gt $totalMib -or
+        $utilization -gt 10 -or
+        $usedMib -gt ($totalMib / 4)) {
+        throw 'NVIDIA Vulkan evidence preflight requires <=10% GPU utilization and <=25% used VRAM.'
+    }
+    [pscustomobject]@{
+        product = ([string]$row.product).Trim()
+        driver = ([string]$row.driver).Trim()
+        memory_total_bytes = $totalMib * 1MB
+        memory_used_bytes = $usedMib * 1MB
+        gpu_utilization_percent = [byte]$utilization
+    }
+}
