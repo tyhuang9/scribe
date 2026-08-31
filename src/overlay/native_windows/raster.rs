@@ -53,6 +53,15 @@ impl Argb {
     fn from_color(color: Color32) -> Self {
         Self::new(color.a(), color.r(), color.g(), color.b())
     }
+
+    fn with_alpha(self, alpha: u8) -> Self {
+        Self::new(
+            alpha,
+            ((self.0 >> 16) & 0xff) as u8,
+            ((self.0 >> 8) & 0xff) as u8,
+            (self.0 & 0xff) as u8,
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -134,7 +143,7 @@ pub(super) struct LayeredFrame {
 }
 
 impl LayeredFrame {
-    fn transparent(width: i32, height: i32) -> Result<Self, RasterError> {
+    pub(super) fn transparent(width: i32, height: i32) -> Result<Self, RasterError> {
         if width <= 0 || height <= 0 {
             return Err(RasterError::InvalidDimensions);
         }
@@ -157,6 +166,57 @@ impl LayeredFrame {
             height,
             pixels,
         })
+    }
+
+    /// Composites two fixed-size premultiplied frames. Opacity-only blending
+    /// keeps the native shell and its geometry stable through semantic swaps.
+    pub(super) fn crossfade(
+        previous: &Self,
+        next: &Self,
+        previous_opacity: u8,
+        next_opacity: u8,
+    ) -> Result<Self, RasterError> {
+        if previous.width != next.width || previous.height != next.height {
+            return Err(RasterError::InvalidDimensions);
+        }
+        let mut frame = Self::transparent(next.width, next.height)?;
+        for ((output, old), new) in frame
+            .pixels
+            .chunks_exact_mut(4)
+            .zip(previous.pixels.chunks_exact(4))
+            .zip(next.pixels.chunks_exact(4))
+        {
+            for channel in 0..4 {
+                output[channel] = ((u16::from(old[channel]) * u16::from(previous_opacity)
+                    + u16::from(new[channel]) * u16::from(next_opacity))
+                    / 255) as u8;
+            }
+        }
+        Ok(frame)
+    }
+
+    /// Places a premultiplied foreground layer over this frame without
+    /// attenuating its fully opaque text pixels.
+    pub(super) fn composite_over(&mut self, foreground: &Self) -> Result<(), RasterError> {
+        if self.width != foreground.width || self.height != foreground.height {
+            return Err(RasterError::InvalidDimensions);
+        }
+        for (background, foreground) in self
+            .pixels
+            .chunks_exact_mut(4)
+            .zip(foreground.pixels.chunks_exact(4))
+        {
+            let remaining_alpha = u16::from(255 - foreground[3]);
+            for channel in 0..3 {
+                background[channel] = (u16::from(foreground[channel])
+                    + u16::from(background[channel]) * remaining_alpha / 255)
+                    .min(255) as u8;
+            }
+            background[3] = (u16::from(foreground[3])
+                + u16::from(background[3]) * remaining_alpha / 255)
+                .min(255) as u8;
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -403,6 +463,102 @@ impl NativeRasterizer {
         Ok(frame)
     }
 
+    /// Paints the opaque, contrast-tested capsule beneath lifecycle text.
+    pub(super) fn render_display_shell(
+        &self,
+        state: &OverlayViewState,
+        dark_mode: bool,
+        width: i32,
+        height: i32,
+    ) -> Result<LayeredFrame, RasterError> {
+        let mut frame = LayeredFrame::transparent(width, height)?;
+        let layout = DisplayLayout::from_bounds(
+            state.mode,
+            OverlayWindowBounds {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            },
+        )
+        .ok_or(RasterError::InvalidDimensions)?;
+        let mut canvas = Canvas::new(self, &mut frame.pixels, width, height)?;
+        draw_capsule(
+            &mut canvas,
+            state.mode,
+            layout.scale,
+            NativeColors::for_theme(dark_mode),
+        )?;
+        drop(canvas);
+        Ok(frame)
+    }
+
+    /// Paints only non-text interior decoration used during transitions. The
+    /// caller places it over the stable shell and then composites lifecycle
+    /// text at full opacity.
+    pub(super) fn render_display_decorative(
+        &self,
+        state: &OverlayViewState,
+        dark_mode: bool,
+        width: i32,
+        height: i32,
+    ) -> Result<LayeredFrame, RasterError> {
+        let mut frame = LayeredFrame::transparent(width, height)?;
+        let layout = DisplayLayout::from_bounds(
+            state.mode,
+            OverlayWindowBounds {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            },
+        )
+        .ok_or(RasterError::InvalidDimensions)?;
+        let mut canvas = Canvas::new(self, &mut frame.pixels, width, height)?;
+        let colors = NativeColors::for_theme(dark_mode);
+        draw_live_brand_mark(&mut canvas, state, &layout, colors)?;
+        if state.mode == OverlayMode::Live && live_preview_is_visible(state) {
+            draw_live_divider(&mut canvas, &layout, colors)?;
+        }
+        drop(canvas);
+        Ok(frame)
+    }
+
+    pub(super) fn render_display_text(
+        &self,
+        state: &OverlayViewState,
+        dark_mode: bool,
+        width: i32,
+        height: i32,
+    ) -> Result<LayeredFrame, RasterError> {
+        let mut frame = LayeredFrame::transparent(width, height)?;
+        let layout = DisplayLayout::from_bounds(
+            state.mode,
+            OverlayWindowBounds {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            },
+        )
+        .ok_or(RasterError::InvalidDimensions)?;
+        let mut canvas = Canvas::new(self, &mut frame.pixels, width, height)?;
+        let colors = NativeColors::for_theme(dark_mode);
+        match state.mode {
+            OverlayMode::Live => {
+                draw_live_elapsed(&mut canvas, state, &layout, colors)?;
+                if live_preview_is_visible(state) {
+                    draw_live_preview(&mut canvas, state, &layout, colors)?;
+                }
+            }
+            OverlayMode::Minimal | OverlayMode::Off => {
+                draw_compact_status(&mut canvas, state, &layout, colors)?;
+            }
+        }
+        drop(canvas);
+        Ok(frame)
+    }
+
     pub(super) fn render_control(
         &self,
         dark_mode: bool,
@@ -478,15 +634,18 @@ fn draw_live(
 ) -> Result<(), RasterError> {
     draw_live_brand_mark(canvas, state, layout, colors)?;
     draw_live_elapsed(canvas, state, layout, colors)?;
-    if state.phase == OverlayPhase::Listening
-        && !state.shows_live_transcript()
-        && state.error.is_none()
-        && state.notice.is_none()
-    {
+    if !live_preview_is_visible(state) {
         return Ok(());
     }
     draw_live_divider(canvas, layout, colors)?;
     draw_live_preview(canvas, state, layout, colors)
+}
+
+fn live_preview_is_visible(state: &OverlayViewState) -> bool {
+    !(state.phase == OverlayPhase::Listening
+        && !state.shows_live_transcript()
+        && state.error.is_none()
+        && state.notice.is_none())
 }
 
 fn draw_live_brand_mark(
@@ -495,6 +654,13 @@ fn draw_live_brand_mark(
     layout: &DisplayLayout,
     colors: NativeColors,
 ) -> Result<(), RasterError> {
+    if state.mode == OverlayMode::Live
+        && state.progress_animation_enabled
+        && (state.phase == OverlayPhase::Listening
+            || (state.phase == OverlayPhase::Finalizing && state.audio_level.peak > 0.01))
+    {
+        return draw_level_mark(canvas, state, layout, colors);
+    }
     let scale = layout.scale;
     let center_x = layout.recording_mark.center_x();
     canvas.draw_centered_text_in_rect(
@@ -506,6 +672,31 @@ fn draw_live_brand_mark(
         TextStyle::Phosphor,
         status_mark_color(state, colors),
     )
+}
+
+fn draw_level_mark(
+    canvas: &mut Canvas<'_>,
+    state: &OverlayViewState,
+    layout: &DisplayLayout,
+    colors: NativeColors,
+) -> Result<(), RasterError> {
+    let scale = layout.scale;
+    let center_x = layout.recording_mark.center_x();
+    let center_y = layout.recording_mark.center_y();
+    let rms = state.audio_level.rms.clamp(0.0, 1.0);
+    let peak = state.audio_level.peak.clamp(rms, 1.0);
+    for (offset, level) in [(-7.0, rms), (0.0, peak), (7.0, rms)] {
+        let half_height = (3.0 + level * 8.0) * scale;
+        canvas.draw_line(
+            center_x + offset * scale,
+            center_y - half_height,
+            center_x + offset * scale,
+            center_y + half_height,
+            2.0 * scale,
+            status_mark_color(state, colors),
+        )?;
+    }
+    Ok(())
 }
 
 fn draw_live_elapsed(
@@ -639,7 +830,7 @@ fn draw_compact_status(
     } else {
         (
             phase_status_label_with_motion(state.phase, state.progress_animation_enabled),
-            phase_status_color(state.phase, colors),
+            phase_status_color(state, colors),
         )
     };
     canvas.draw_text_centered_in_rect(
@@ -669,7 +860,7 @@ fn live_line(state: &OverlayViewState, colors: NativeColors) -> StyledLine {
     if !state.phase.shows_live_transcript() {
         return StyledLine::plain(
             phase_status_label_with_motion(state.phase, state.progress_animation_enabled),
-            phase_status_color(state.phase, colors),
+            phase_status_color(state, colors),
         );
     }
     let committed = &state.transcript.committed;
@@ -710,17 +901,34 @@ fn live_line(state: &OverlayViewState, colors: NativeColors) -> StyledLine {
 fn status_mark_color(state: &OverlayViewState, colors: NativeColors) -> Argb {
     if state.phase == OverlayPhase::Success {
         colors.success
+    } else if state.phase.is_progressing()
+        && state.progress_animation_enabled
+        && crate::system_preferences::client_area_animations_enabled()
+    {
+        colors.waveform.with_alpha(progress_pulse_alpha())
     } else {
         colors.waveform
     }
 }
 
-fn phase_status_color(phase: OverlayPhase, colors: NativeColors) -> Argb {
-    if phase == OverlayPhase::Success {
+fn phase_status_color(state: &OverlayViewState, colors: NativeColors) -> Argb {
+    if state.phase == OverlayPhase::Success {
         colors.success
     } else {
         colors.muted_text
     }
+}
+
+fn progress_pulse_alpha() -> u8 {
+    let elapsed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    progress_pulse_alpha_at(elapsed)
+}
+
+fn progress_pulse_alpha_at(elapsed: Duration) -> u8 {
+    let phase = elapsed.as_secs_f32() * std::f32::consts::TAU / 0.8;
+    (180.0 + 75.0 * phase.sin()).round().clamp(105.0, 255.0) as u8
 }
 
 fn fit_head(
@@ -1580,6 +1788,12 @@ mod tests {
         }
     }
 
+    fn reference_state(mode: OverlayMode) -> OverlayViewState {
+        let mut state = state(mode);
+        state.progress_animation_enabled = false;
+        state
+    }
+
     #[test]
     fn reference_contract_state_matches_the_overlay_comparison_harness() {
         for mode in [OverlayMode::Live, OverlayMode::Minimal] {
@@ -1986,7 +2200,7 @@ mod tests {
     #[test]
     fn cached_font_baselines_are_bounded_reused_and_release_evicted_probe_scopes() {
         with_rasterizer(|rasterizer| {
-            let live = state(OverlayMode::Live);
+            let live = reference_state(OverlayMode::Live);
             rasterizer.render_display(&live, true, 600, 62).unwrap();
             let first = rasterizer.baseline_cache_stats();
             assert_eq!(first, (2, 2), "one metric per Live font/style pair");
@@ -2025,6 +2239,7 @@ mod tests {
     #[test]
     fn standalone_preview_separator_renders_without_a_text_ink_probe() {
         let mut live = state(OverlayMode::Live);
+        live.progress_animation_enabled = false;
         live.transcript.committed = "Hello".to_owned();
         live.transcript.tentative = "world".to_owned();
         let line = live_line(&live, NativeColors::for_theme(true));
@@ -2055,7 +2270,7 @@ mod tests {
                     let bounds = production_bounds(mode, dpi);
                     let layout = DisplayLayout::from_bounds(mode, bounds).unwrap();
                     for dark_mode in [false, true] {
-                        let state = state(mode);
+                        let state = reference_state(mode);
                         match mode {
                             OverlayMode::Live => {
                                 let waveform_frame = isolated_component_frame(
@@ -2301,6 +2516,191 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_text_remains_contrast_safe_at_pulse_minimum_and_crossfade_midpoint() {
+        with_rasterizer(|rasterizer| {
+            assert_eq!(progress_pulse_alpha_at(Duration::from_millis(600)), 105);
+
+            for dark_mode in [false, true] {
+                let width = MINIMAL_WIDTH as i32;
+                let height = LIVE_HEIGHT as i32;
+                let mut previous = state(OverlayMode::Minimal);
+                previous.phase = OverlayPhase::Listening;
+                let mut target = previous.clone();
+                target.phase = OverlayPhase::Processing;
+                target.progress_animation_enabled = true;
+
+                let previous_decorative = rasterizer
+                    .render_display_decorative(&previous, dark_mode, width, height)
+                    .unwrap();
+                let target_decorative = rasterizer
+                    .render_display_decorative(&target, dark_mode, width, height)
+                    .unwrap();
+                let target_shell = rasterizer
+                    .render_display_shell(&target, dark_mode, width, height)
+                    .unwrap();
+                let interior =
+                    LayeredFrame::crossfade(&previous_decorative, &target_decorative, 127, 128)
+                        .unwrap();
+                let mut midpoint = target_shell.clone();
+                midpoint.composite_over(&interior).unwrap();
+                let target_text = rasterizer
+                    .render_display_text(&target, dark_mode, width, height)
+                    .unwrap();
+                midpoint.composite_over(&target_text).unwrap();
+
+                let layout = DisplayLayout::from_bounds(
+                    OverlayMode::Minimal,
+                    OverlayWindowBounds {
+                        x: 0,
+                        y: 0,
+                        width,
+                        height,
+                    },
+                )
+                .unwrap();
+                let mut opaque_text_pixels = 0;
+                for y in layout.lifecycle_status.y0.ceil() as i32
+                    ..layout.lifecycle_status.y1.ceil() as i32
+                {
+                    for x in layout.lifecycle_status.x0.ceil() as i32
+                        ..layout.lifecycle_status.x1.ceil() as i32
+                    {
+                        let offset = ((y * width + x) * 4) as usize;
+                        if target_text.pixels[offset + 3] == 255 {
+                            opaque_text_pixels += 1;
+                            assert_eq!(
+                                &midpoint.pixels[offset..offset + 4],
+                                &target_text.pixels[offset..offset + 4],
+                                "target lifecycle text must not be dimmed at crossfade midpoint"
+                            );
+                        }
+                    }
+                }
+                assert!(
+                    opaque_text_pixels > 0,
+                    "test state must paint lifecycle text"
+                );
+
+                let center = ((height / 2 * width + width / 2) * 4) as usize;
+                let pixel: [u8; 4] = target_shell.pixels[center..center + 4].try_into().unwrap();
+                let colors = NativeColors::for_theme(dark_mode);
+                for backdrop in [0, 255] {
+                    let surface = composite_premultiplied_bgra(pixel, backdrop);
+                    let ratio = contrast_ratio(phase_status_color(&target, colors), surface);
+                    assert!(
+                        ratio >= 4.5,
+                        "lifecycle text contrast {ratio:.2}:1 failed at the pulse minimum on the {} overlay over a {backdrop} backdrop",
+                        if dark_mode { "dark" } else { "light" }
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn enter_and_success_exit_never_place_visible_text_over_a_fading_capsule() {
+        with_rasterizer(|rasterizer| {
+            for mode in [OverlayMode::Minimal, OverlayMode::Live] {
+                for dpi in [96, 120, 144, 192] {
+                    let bounds = production_bounds(mode, dpi);
+                    for dark_mode in [false, true] {
+                        let mut entering = state(mode);
+                        entering.phase = OverlayPhase::Preparing;
+                        entering.progress_animation_enabled = true;
+                        let shell = rasterizer
+                            .render_display_shell(&entering, dark_mode, bounds.width, bounds.height)
+                            .unwrap();
+                        let decoration = rasterizer
+                            .render_display_decorative(
+                                &entering,
+                                dark_mode,
+                                bounds.width,
+                                bounds.height,
+                            )
+                            .unwrap();
+                        let text = rasterizer
+                            .render_display_text(&entering, dark_mode, bounds.width, bounds.height)
+                            .unwrap();
+                        let transparent =
+                            LayeredFrame::transparent(bounds.width, bounds.height).unwrap();
+
+                        for (name, decoration_alpha) in [("enter zero", 0), ("enter first", 1)] {
+                            let interior = LayeredFrame::crossfade(
+                                &transparent,
+                                &decoration,
+                                255 - decoration_alpha,
+                                decoration_alpha,
+                            )
+                            .unwrap();
+                            let mut frame = shell.clone();
+                            frame.composite_over(&interior).unwrap();
+                            frame.composite_over(&text).unwrap();
+
+                            let opaque_text_pixels = text
+                                .pixels
+                                .chunks_exact(4)
+                                .zip(frame.pixels.chunks_exact(4))
+                                .filter(|(text_pixel, frame_pixel)| {
+                                    text_pixel[3] == 255 && text_pixel == frame_pixel
+                                })
+                                .count();
+                            assert!(
+                                opaque_text_pixels > 0,
+                                "{name} must retain opaque lifecycle text at {dpi} DPI"
+                            );
+                            let center = ((bounds.height / 2 * bounds.width + bounds.width / 2) * 4)
+                                as usize;
+                            let shell_pixel: [u8; 4] =
+                                shell.pixels[center..center + 4].try_into().unwrap();
+                            let colors = NativeColors::for_theme(dark_mode);
+                            for backdrop in [0, 255] {
+                                let ratio = contrast_ratio(
+                                    phase_status_color(&entering, colors),
+                                    composite_premultiplied_bgra(shell_pixel, backdrop),
+                                );
+                                assert!(
+                                    ratio >= 4.5,
+                                    "{name} lifecycle text contrast {ratio:.2}:1 failed for {mode:?} at {dpi} DPI over a {backdrop} backdrop"
+                                );
+                            }
+                        }
+
+                        let mut success = entering;
+                        success.phase = OverlayPhase::Success;
+                        let mut exit_frame = rasterizer
+                            .render_display_shell(&success, dark_mode, bounds.width, bounds.height)
+                            .unwrap();
+                        let exit_decoration = rasterizer
+                            .render_display_decorative(
+                                &success,
+                                dark_mode,
+                                bounds.width,
+                                bounds.height,
+                            )
+                            .unwrap();
+                        exit_frame.composite_over(&exit_decoration).unwrap();
+                        let exit_frame =
+                            LayeredFrame::crossfade(&exit_frame, &transparent, 1, 0).unwrap();
+                        let success_text = rasterizer
+                            .render_display_text(&success, dark_mode, bounds.width, bounds.height)
+                            .unwrap();
+                        assert!(
+                            success_text
+                                .pixels
+                                .chunks_exact(4)
+                                .zip(exit_frame.pixels.chunks_exact(4))
+                                .all(|(text_pixel, exit_pixel)| {
+                                    text_pixel[3] != 255 || text_pixel != exit_pixel
+                                }),
+                            "success exit must be text-free before its capsule fades for {mode:?} at {dpi} DPI"
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
     fn control_frame_paints_only_a_transparent_x_surface() {
         let frame = with_rasterizer(|rasterizer| rasterizer.render_control(true, 44, 44).unwrap());
         assert_eq!(frame.alpha_at(0, 0), 0);
@@ -2370,7 +2770,7 @@ mod tests {
                     ] {
                         let frame = rasterizer
                             .render_display(
-                                &state(mode),
+                                &reference_state(mode),
                                 dark,
                                 logical_width * numerator / denominator,
                                 logical_height * numerator / denominator,
@@ -2404,7 +2804,8 @@ mod tests {
                 }
             }
 
-            for (name, state, width, height) in edge_golden_states() {
+            for (name, mut state, width, height) in edge_golden_states() {
+                state.progress_animation_enabled = false;
                 for (dark, theme) in [(false, "light"), (true, "dark")] {
                     let frame = rasterizer
                         .render_display(&state, dark, width, height)
@@ -2472,7 +2873,7 @@ mod tests {
                     ] {
                         let frame = rasterizer
                             .render_display(
-                                &state(mode),
+                                &reference_state(mode),
                                 dark,
                                 logical_width * numerator / denominator,
                                 logical_height * numerator / denominator,
@@ -2491,7 +2892,8 @@ mod tests {
                 }
             }
 
-            for (name, state, width, height) in edge_golden_states() {
+            for (name, mut state, width, height) in edge_golden_states() {
+                state.progress_animation_enabled = false;
                 for (dark, theme) in [(false, "light"), (true, "dark")] {
                     let frame = rasterizer
                         .render_display(&state, dark, width, height)
@@ -2799,16 +3201,72 @@ mod tests {
     }
 
     #[test]
-    fn live_brand_mark_is_static_across_audio_levels() {
+    fn live_brand_mark_reflects_audio_levels_with_fixed_bounds() {
         let mut quiet = state(OverlayMode::Live);
+        quiet.progress_animation_enabled = true;
         quiet.audio_level = OverlayAudioLevel::new(0.0, 0.0);
         let mut loud = quiet.clone();
         loud.audio_level = OverlayAudioLevel::new(1.0, 1.0);
         with_rasterizer(|rasterizer| {
-            assert_eq!(
+            assert_ne!(
                 rasterizer.render_display(&quiet, true, 600, 62).unwrap(),
                 rasterizer.render_display(&loud, true, 600, 62).unwrap()
             );
+        });
+    }
+
+    #[test]
+    fn production_meter_ink_is_centered_inside_the_30px_mark_at_every_supported_dpi() {
+        with_rasterizer(|rasterizer| {
+            for dpi in [96, 120, 144, 192] {
+                let bounds = production_bounds(OverlayMode::Live, dpi);
+                let layout = DisplayLayout::from_bounds(OverlayMode::Live, bounds)
+                    .expect("production live layout");
+                assert!(
+                    (layout.recording_mark.width() - 30.0 * layout.scale).abs() <= f32::EPSILON,
+                    "the production mark must retain its fixed 30px logical width at {dpi} DPI"
+                );
+
+                for dark_mode in [false, true] {
+                    let mut quiet = state(OverlayMode::Live);
+                    quiet.progress_animation_enabled = true;
+                    quiet.audio_level = OverlayAudioLevel::new(0.0, 0.0);
+                    let mut loud = quiet.clone();
+                    loud.audio_level = OverlayAudioLevel::new(1.0, 1.0);
+
+                    let quiet_frame = isolated_component_frame(
+                        rasterizer,
+                        &quiet,
+                        &layout,
+                        dark_mode,
+                        IsolatedComponent::BrandMark,
+                    );
+                    let loud_frame = isolated_component_frame(
+                        rasterizer,
+                        &loud,
+                        &layout,
+                        dark_mode,
+                        IsolatedComponent::BrandMark,
+                    );
+                    assert_ne!(
+                        quiet_frame, loud_frame,
+                        "meter-enabled quiet and loud marks must differ at {dpi} DPI (dark_mode={dark_mode})"
+                    );
+
+                    for (level, frame) in [("quiet", &quiet_frame), ("loud", &loud_frame)] {
+                        assert_component_is_contained_and_centered(
+                            &format!(
+                                "{level} production meter at {dpi} DPI (dark_mode={dark_mode})"
+                            ),
+                            frame,
+                            layout.recording_mark,
+                            layout.content_center_y,
+                            0.5,
+                            true,
+                        );
+                    }
+                }
+            }
         });
     }
 

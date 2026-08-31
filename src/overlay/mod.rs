@@ -8,6 +8,10 @@ mod view;
 
 // Keep one facade for future runtime-neutral event wiring even though Phase 5
 // integration currently names only the controller, mode, and phase directly.
+#[allow(
+    unused_imports,
+    reason = "the optional UI harness consumes the full public overlay facade"
+)]
 pub use controller::{
     OverlayAudioLevel, OverlayController, OverlayMode, OverlayPhase, OverlayPresentation,
     OverlayRecovery, OverlayTranscript, OverlayViewState,
