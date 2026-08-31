@@ -1,4 +1,8 @@
 #![cfg(not(test))]
+#![allow(
+    dead_code,
+    reason = "shared modules include desktop-side APIs that are intentionally excluded from the dedicated worker"
+)]
 
 //! Dedicated native inference process.
 //!

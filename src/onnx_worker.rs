@@ -231,6 +231,10 @@ pub(crate) struct ValidatedOnnxModel {
 }
 
 impl ValidatedOnnxModel {
+    #[allow(
+        dead_code,
+        reason = "native recognizer implementations consume role paths in later stacked stages"
+    )]
     pub(crate) fn path(&self, role: OnnxFileRole) -> Result<String> {
         let path = self
             .files
@@ -1138,36 +1142,26 @@ enum WireRuntimeErrorCode {
     Cancelled,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum WireFailureCategory {
     Artifact,
     InvalidInput,
     Decode,
     Callback,
+    #[default]
     Worker,
     Unsupported,
     Cancellation,
     Provider,
 }
 
-impl Default for WireFailureCategory {
-    fn default() -> Self {
-        Self::Worker
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum WireRetryDisposition {
+    #[default]
     Never,
     NextProviderBeforeOutput,
-}
-
-impl Default for WireRetryDisposition {
-    fn default() -> Self {
-        Self::Never
-    }
 }
 
 impl WireRuntimeError {
@@ -1522,13 +1516,13 @@ fn worker_identity(file: &std::fs::File, path: &Path) -> Result<WorkerExecutable
         if information.nNumberOfLinks != 1 {
             bail!("worker executable must not be a hardlink");
         }
-        return Ok(WorkerExecutableIdentity {
+        Ok(WorkerExecutableIdentity {
             length: metadata.len(),
             sha256: sha256_file(path)?,
             volume_serial: information.dwVolumeSerialNumber,
             file_index: (u64::from(information.nFileIndexHigh) << 32)
                 | u64::from(information.nFileIndexLow),
-        });
+        })
     }
     #[cfg(unix)]
     {
@@ -1536,12 +1530,12 @@ fn worker_identity(file: &std::fs::File, path: &Path) -> Result<WorkerExecutable
         if metadata.nlink() != 1 {
             bail!("worker executable must not be a hardlink");
         }
-        return Ok(WorkerExecutableIdentity {
+        Ok(WorkerExecutableIdentity {
             length: metadata.len(),
             sha256: sha256_file(path)?,
             device: metadata.dev(),
             inode: metadata.ino(),
-        });
+        })
     }
     #[cfg(not(any(windows, unix)))]
     Ok(WorkerExecutableIdentity {
@@ -1589,6 +1583,10 @@ fn verify_worker_executable(
     })
 }
 
+#[allow(
+    dead_code,
+    reason = "desktop exact-path launch becomes active in later stacked integration stages"
+)]
 fn resolve_adjacent_inference_worker(current_executable: &Path) -> Result<PathBuf> {
     let current = std::fs::canonicalize(current_executable)
         .context("could not canonicalize the running Scribe executable")?;
@@ -3945,6 +3943,10 @@ pub(crate) fn maybe_run_vad_worker() -> Option<i32> {
 /// The worker-only binary supplies the native recognizer factory. Keeping that
 /// factory out of this module prevents an all-features desktop build from
 /// compiling ASR recognizer/server code into the UI executable.
+#[allow(
+    dead_code,
+    reason = "test and provider factories are consumed by later stacked integration stages"
+)]
 pub(crate) fn run_inference_worker_with_factory<F: WorkerRecognizerFactory>(factory: &F) -> i32 {
     let args = std::env::args_os().skip(1).collect::<Vec<_>>();
     match worker_role_from_args(&args) {
@@ -4359,6 +4361,10 @@ impl InferenceWorkerRegistry {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "the strict CPU registry constructor is consumed by later desktop integration stages"
+    )]
     pub(crate) fn cpu_only() -> Self {
         Self {
             routes: Arc::new(vec![InferenceWorkerRoute {
@@ -7024,6 +7030,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::assertions_on_constants,
+        reason = "the constant assertion documents the platform-specific write-sharing branch without making non-Windows builds fail at compile time"
+    )]
     fn worker_identity_rejects_hardlinks_and_detects_replacement() {
         let root = test_root("worker-file-identity");
         let worker = root.join(format!("worker{}", std::env::consts::EXE_SUFFIX));

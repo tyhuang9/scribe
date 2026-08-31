@@ -5,6 +5,10 @@
 
 mod app;
 mod audio;
+#[allow(
+    dead_code,
+    reason = "provider integrations consume the complete policy surface in later stacked stages"
+)]
 mod backend_policy;
 mod benchmark;
 mod branding;
@@ -15,6 +19,10 @@ mod debug_demo;
 mod diagnostics;
 mod disk_space;
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "test builds compile the full embedded-runtime surface before later provider integrations"
+)]
 mod embedded_runtime;
 mod history;
 mod history_playback;
@@ -35,6 +43,10 @@ mod prepared_audio;
 mod runtime_artifact;
 mod runtime_contract;
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "test builds compile the full router surface before later provider integrations"
+)]
 mod runtime_router;
 #[cfg(not(test))]
 #[path = "runtime_router_stub.rs"]
@@ -48,6 +60,10 @@ mod text_output;
 mod transcription;
 mod tray;
 mod ui;
+#[allow(
+    dead_code,
+    reason = "the external worker boundary owns contracts used by role-specific targets and later integrations"
+)]
 mod worker_contracts;
 
 #[cfg(test)]
