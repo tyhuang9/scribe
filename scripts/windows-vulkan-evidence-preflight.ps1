@@ -91,6 +91,18 @@ function Restore-ScribeEvidenceProcessEnvironment([psobject[]]$Previous) {
     }
 }
 
+function New-ScribeEvidenceFixturePackVersion([string]$Revision, [string]$Nonce) {
+    if ($Revision -cnotmatch '^[0-9a-f]{40}$' -or $Nonce -cnotmatch '^[0-9a-f]{12}$') {
+        throw 'Fixture pack version inputs are not canonical.'
+    }
+    $version = "fixture-$($Revision.Substring(0, 12))-$Nonce"
+    $cargoLeaf = "vulkan-$version-cargo"
+    if ($version -cnotmatch '^[a-z0-9](?:[a-z0-9._-]{0,94}[a-z0-9])?$' -or $cargoLeaf.Length -gt 48) {
+        throw 'Fixture pack version exceeds the bounded builder Cargo target leaf.'
+    }
+    return $version
+}
+
 if (-not ('ScribeEvidenceNative.SystemDirectory' -as [type])) {
     Add-Type -TypeDefinition @'
 using System;

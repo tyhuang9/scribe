@@ -308,7 +308,7 @@ try {
     Copy-Item -LiteralPath (Join-Path $env:CARGO_TARGET_DIR 'release\scribe-inference-worker.exe') -Destination (Join-Path $cpuBundle 'scribe-inference-worker.exe')
     $cpuWorker = Assert-ScribeEvidenceSingleLinkFile (Join-Path $cpuBundle 'scribe-inference-worker.exe') 'Materialized CPU worker' (512MB) $trustedFsutil
     $packRoot = Join-Path $workRoot 'fixture-vulkan-pack'
-    $packVersion = "fixture-evidence-$($revision.Substring(0, 12))-$([guid]::NewGuid().ToString('N').Substring(0, 12))"
+    $packVersion = New-ScribeEvidenceFixturePackVersion $revision ([guid]::NewGuid().ToString('N').Substring(0, 12))
     & $packBuilder -Backend Vulkan -PackVersion $packVersion -OutputDirectory $packRoot -SigningMode Fixture -NativeArchiveDirectory $nativeArchive
     if ($LASTEXITCODE -ne 0) { throw 'Fresh fixture-signed Vulkan pack build failed.' }
     $packManifest = Get-Content -LiteralPath (Join-Path $packRoot 'manifest.json') -Raw | ConvertFrom-Json

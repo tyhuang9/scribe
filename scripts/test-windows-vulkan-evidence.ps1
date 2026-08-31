@@ -9,6 +9,21 @@ foreach ($value in @('native:0000:01:00.8', 'native:0000:01:00.0 ', 'uuid:secret
     try { $null = ConvertTo-ScribeVulkanEvidencePci $value; $accepted = $true } catch {}
     if ($accepted) { throw "Malformed PCI identity was accepted: $value" }
 }
+$fixturePackVersion = New-ScribeEvidenceFixturePackVersion ('a' * 40 -join '') ('b' * 12 -join '')
+$fixtureCargoLeaf = "vulkan-$fixturePackVersion-cargo"
+if ($fixturePackVersion -cne 'fixture-aaaaaaaaaaaa-bbbbbbbbbbbb' -or
+    $fixtureCargoLeaf.Length -ne 46 -or
+    $fixtureCargoLeaf -cnotmatch '^[a-z0-9](?:[a-z0-9._-]{0,46}[a-z0-9])?$') {
+    throw 'Fixture pack version does not compose into the builder Cargo target bound.'
+}
+foreach ($invalidPackVersionInput in @(
+    @('A' * 40 -join '', 'b' * 12 -join ''),
+    @('a' * 40 -join '', 'b' * 11 -join '')
+)) {
+    $accepted = $false
+    try { $null = New-ScribeEvidenceFixturePackVersion $invalidPackVersionInput[0] $invalidPackVersionInput[1]; $accepted = $true } catch {}
+    if ($accepted) { throw 'Noncanonical fixture pack version input was accepted.' }
+}
 $knownCmakeFailure = @(
     'error: failed to run custom build command for `transcribe-cpp-sys v0.1.3 (C:\\safe\\crate)`',
     '  Error: failed to execute command: cmake -S C:\\safe\\source',
@@ -81,7 +96,7 @@ foreach ($required in @('--locked', '--offline', '-SigningMode Fixture', '--igno
 if ($runner -notmatch 'finally\s*\{\s*if \(\$null -ne \$previous\) \{ Restore-ScribeEvidenceProcessEnvironment \$previous \}') {
     throw 'Pinned toolchain scope does not restore the ambient environment.'
 }
-foreach ($required in @('Get-FileHash -LiteralPath $model', 'Get-FileHash -LiteralPath $wav', 'Test-ScribeEvidenceActivationPath', 'Test-ScribeEvidenceWithin', 'New-ScribeEvidenceShortCargoTarget', 'Assert-ScribeEvidenceSingleLinkFile', 'Get-ScribeVulkanEvidenceActualSystem32', 'fsutil.exe', 'manifest.json', 'Fixture pack build identity is not bound', 'fixture-evidence-$($revision.Substring(0, 12))-$([guid]::NewGuid()', 'Fixture-only untrusted Vulkan evidence', 'previousEvidenceEnvironment')) {
+foreach ($required in @('Get-FileHash -LiteralPath $model', 'Get-FileHash -LiteralPath $wav', 'Test-ScribeEvidenceActivationPath', 'Test-ScribeEvidenceWithin', 'New-ScribeEvidenceShortCargoTarget', 'Assert-ScribeEvidenceSingleLinkFile', 'Get-ScribeVulkanEvidenceActualSystem32', 'fsutil.exe', 'manifest.json', 'Fixture pack build identity is not bound', 'New-ScribeEvidenceFixturePackVersion $revision', 'Fixture-only untrusted Vulkan evidence', 'previousEvidenceEnvironment')) {
     if ($runner -notmatch [regex]::Escape($required)) { throw "Runner is missing required safety contract: $required" }
 }
 $compileAt = $runner.IndexOf("'--no-run'")
