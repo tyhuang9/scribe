@@ -46,6 +46,10 @@ jobs:
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e # 1.96.0 branch reviewed 2026-08-27
+      - name: Install Linux desktop build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes libasound2-dev libglib2.0-dev libgtk-3-dev pkg-config
       - name: Check actual Linux application and worker crates
         env:
           CARGO_INCREMENTAL: 0
