@@ -170,7 +170,7 @@ fn is_safe_supply_name(name: &str) -> bool {
         && name.len() <= 64
         && name
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':'))
 }
 
 #[cfg(test)]

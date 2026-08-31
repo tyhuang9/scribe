@@ -61,12 +61,17 @@ Before a provider is loaded, Auto compares a verified pack's backend, provider,
 ID/version/digest, security epoch, runtime ABI, and the requested GGUF digest
 with an entry. Only matching packs may be probed. After the challenge-bound
 Hello, it performs a second exact comparison of vendor, device class, and
-driver identity while enforcing the entry's minimum total-memory threshold.
-Free VRAM is live diagnostics only and is
-not qualification input. The worker then applies the existing battery policy
-and private health quarantine before deterministic CUDA → Vulkan ordering; CPU
-is appended as Auto's final fallback. Explicit `GPU` deliberately bypasses this
-Auto evidence gate and never falls back to CPU.
+driver identity while enforcing the entry's minimum total-memory and minimum
+available-memory thresholds. Available memory is a live bounded Hello fact:
+zero means unavailable, a value above total is rejected, and a stale successful
+probe is never reused as Auto admission evidence. It is deliberately excluded
+from stable device identity and warm-state fingerprints. The worker applies the
+AC/battery policy after qualification; unknown power is conservative and admits
+only integrated or unified GPUs. CPU is appended as Auto's final fallback.
+Explicit `GPU` deliberately bypasses the Auto evidence and available-memory
+thresholds: it may attempt a verified GPU with low or unknown available memory,
+but it never falls back to CPU and returns a GPU-only error if no GPU route can
+run.
 
 Every future entry must carry immutable evidence ID and SHA-256 digests for
 cold, warm, and transcript-parity evidence, at least five cold and twenty warm

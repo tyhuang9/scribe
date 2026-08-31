@@ -5,9 +5,10 @@
 //! tests deterministic and lets future worker packs provide the same facts
 //! without exposing provider-specific handles above the worker boundary.
 //!
-//! Device-memory observations are diagnostic facts only. Model-aware memory
-//! admission is intentionally deferred until model requirements and qualified
-//! provider packs are available; this policy does not claim to preflight VRAM.
+//! Total memory is a stable target fact. Available memory is volatile and is
+//! deliberately excluded from target identity and warm-state fingerprints;
+//! the verified Auto qualification policy consumes it only as fresh,
+//! evidence-bound admission input.
 
 use std::cmp::Ordering;
 
@@ -198,7 +199,9 @@ pub(crate) struct BackendTarget {
     pub(crate) vendor: GpuVendor,
     pub(crate) device_class: DeviceClass,
     pub(crate) memory_total_bytes: u64,
-    /// Live telemetry only; not used for admission or warm invalidation.
+    /// Live resource fact. Signed Auto qualification may admit it against an
+    /// evidence-bound threshold, but it never enters a stable identity or
+    /// warm-state fingerprint.
     pub(crate) memory_available_bytes: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) pack: Option<BackendPackIdentity>,
