@@ -184,6 +184,45 @@ mod platform {
         }
     }
 
+    impl Drop for MacWorkerProcess {
+        fn drop(&mut self) {
+            let mut state = match self.state.lock() {
+                Ok(state) => state,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if state.reaped {
+                return;
+            }
+
+            // The worker is launched in a private process group. Killing the
+            // group also stops backend subprocesses, while the direct signal
+            // ensures the child itself is terminated if group setup was lost.
+            // Drop cannot report cleanup errors, so every operation is best
+            // effort and the blocking wait is used only for our own child.
+            unsafe {
+                libc::killpg(state.pid, libc::SIGKILL);
+                libc::kill(state.pid, libc::SIGKILL);
+            }
+            loop {
+                let mut status = 0;
+                // SAFETY: state.pid is the child owned by this process object.
+                let result = unsafe { libc::waitpid(state.pid, &mut status, 0) };
+                if result == state.pid {
+                    state.reaped = true;
+                    return;
+                }
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                if error.raw_os_error() == Some(libc::ECHILD) {
+                    state.reaped = true;
+                }
+                return;
+            }
+        }
+    }
+
     pub(crate) fn launch_verified_worker(
         authority: &UnixPackExecAuthority,
         worker_flag: &str,
@@ -437,6 +476,56 @@ mod platform {
             Ok(())
         } else {
             Err(std::io::Error::from_raw_os_error(result)).context(context)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::os::unix::process::CommandExt;
+        use std::panic::AssertUnwindSafe;
+        use std::process::Command;
+
+        use super::*;
+
+        #[test]
+        fn drop_terminates_and_reaps_worker_even_after_state_lock_poisoning() {
+            let mut command = Command::new("/bin/sh");
+            command.args(["-c", "sleep 30"]);
+            // SAFETY: this async-signal-safe call only creates a private
+            // process group in the child immediately before exec.
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::setpgid(0, 0) == -1 {
+                        Err(std::io::Error::last_os_error())
+                    } else {
+                        Ok(())
+                    }
+                });
+            }
+            let child = command.spawn().expect("spawn disposable worker");
+            let pid = child.id() as libc::pid_t;
+            std::mem::forget(child);
+            let process = MacWorkerProcess {
+                state: Mutex::new(ProcessState { pid, reaped: false }),
+                parent_control: Mutex::new(
+                    std::fs::File::open("/dev/null").expect("open worker control fixture"),
+                ),
+            };
+
+            let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                let _guard = process.state.lock().expect("lock worker state");
+                panic!("poison worker state lock");
+            }));
+            drop(process);
+
+            let mut status = 0;
+            // SAFETY: pid names the child that Drop must already have reaped.
+            let result = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+            assert_eq!(result, -1);
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ECHILD)
+            );
         }
     }
 }
