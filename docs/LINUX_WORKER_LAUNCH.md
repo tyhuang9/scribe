@@ -33,9 +33,11 @@ above fixed descriptor 6.
 
 The current Ubuntu host prerequisite is executable-memfd allowance. When the
 host exposes `/proc/sys/vm/memfd_noexec`, its value must be `0`. Older kernels
-without that policy use their legacy executable-memfd behavior. The launcher
-reports a categorized `EACCES` error when this prerequisite is not met; it does
-not require newer `MFD_EXEC` support and remains compatible with kernel 5.15.
+without that policy use their legacy executable-memfd behavior. A denial at
+`execveat` is reported as a categorized `EACCES` error; newer kernels may reject
+the memfd earlier and surface a generic OS error. Every denial fails closed,
+does not fall back to the mutable source inode, and does not require newer
+`MFD_EXEC` support, preserving compatibility with kernel 5.15.
 
 Future GPU packs retain their reserved FHS location under
 `/usr/lib/scribe/workers/packs/<id>/<version>/<digest>/`, but this delivery does
