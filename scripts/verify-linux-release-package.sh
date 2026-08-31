@@ -98,7 +98,7 @@ installed_bytes="$(linux_regular_file_bytes "$root/usr")"; installed_kib="$(((in
 [[ -d "$root/usr/bin" && ! -L "$root/usr/bin" && -d "$authority/workers/packs" && ! -L "$authority/workers/packs" ]] || { echo 'canonical Linux authority directories are missing or unsafe.' >&2; exit 1; }
 expected_directories="$temp_root/expected-directories"; actual_directories="$temp_root/actual-directories"
 printf '%s\n' usr usr/bin usr/lib usr/lib/scribe usr/lib/scribe/workers usr/lib/scribe/workers/packs >"$expected_directories"
-(cd "$root" && find usr -type d -printf '%p\n' | LC_ALL=C sort) >"$actual_directories"
+(cd "$root" && find . -mindepth 1 -type d -printf '%P\n' | LC_ALL=C sort) >"$actual_directories"
 cmp -s "$expected_directories" "$actual_directories" || { echo 'package directory tree is not exact.' >&2; exit 1; }
 while IFS= read -r directory; do [[ "$(stat -c %a -- "$root/$directory")" == 755 ]] || { echo "directory mode mismatch: $directory" >&2; exit 1; }; done <"$expected_directories"
 for path in "$root/usr/bin/local-transcriber" "$authority/scribe-inference-worker" "$authority/worker-pack-catalog.json" "$authority/linux-release-package.json" "$inventory"; do
@@ -111,7 +111,7 @@ printf '%s\n' \
   usr/lib/scribe/linux-release-package.json \
   usr/lib/scribe/scribe-inference-worker \
   usr/lib/scribe/worker-pack-catalog.json >"$expected_package_files"
-(cd "$root" && find usr -type f -printf '%p\n' | LC_ALL=C sort) >"$actual_package_files"
+(cd "$root" && find . -mindepth 1 -type f -printf '%P\n' | LC_ALL=C sort) >"$actual_package_files"
 cmp -s "$expected_package_files" "$actual_package_files" || { echo 'CPU-only package file set is not independently authorized.' >&2; exit 1; }
 [[ "$(stat -c %a -- "$root/usr/bin/local-transcriber")" == 755 ]] || { echo 'packaged desktop mode is not 0755.' >&2; exit 1; }
 [[ "$(stat -c %a -- "$authority/scribe-inference-worker")" == 755 ]] || { echo 'packaged CPU worker mode is not 0755.' >&2; exit 1; }

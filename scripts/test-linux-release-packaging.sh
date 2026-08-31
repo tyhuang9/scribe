@@ -156,6 +156,7 @@ PY
 }
 tamper_worker() { printf 'tampered\n' >>"$1/usr/lib/scribe/scribe-inference-worker"; }
 add_unexpected() { printf 'unexpected\n' >"$1/usr/lib/scribe/unexpected"; }
+add_unexpected_top_level() { mkdir "$1/opt"; printf 'unexpected\n' >"$1/opt/extra-tool"; chmod 0755 "$1/opt/extra-tool"; }
 add_unexpected_directory() { mkdir "$1/usr/lib/scribe/unexpected-directory"; }
 replace_catalog() { printf '%s' '{"schema_version":1,"packs":[{}]}' >"$1/usr/lib/scribe/worker-pack-catalog.json"; }
 replace_contract() { printf '%s\n' '{}' >"$1/usr/lib/scribe/linux-release-package.json"; }
@@ -173,6 +174,7 @@ add_consistent_extra_executable() { add_file_with_consistent_inventory "$1" usr/
 add_consistent_case_collision() { add_file_with_consistent_inventory "$1" usr/bin/Local-Transcriber "$desktop"; }
 attack_package tampered-worker tamper_worker
 attack_package unexpected-file add_unexpected
+attack_package unexpected-top-level-file add_unexpected_top_level
 attack_package unexpected-directory add_unexpected_directory
 attack_package nonempty-catalog replace_catalog
 attack_package wrong-contract replace_contract
