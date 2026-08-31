@@ -187,9 +187,14 @@ function Enable-ValidatedCmakeBuildJunction(
     [string]$BuildEnvironment,
     [string]$CargoTarget
 ) {
-    $tcsRoot = Join-Path $BuildEnvironment 'tcs'
-    if (-not (Test-Path -LiteralPath $tcsRoot -PathType Container)) {
-        throw 'The isolated transcribe-cpp native-build junction root was not created.'
+    $cargoTargetItem = Get-ScribeGpuWorkerPhysicalDirectory $CargoTarget 'The exact fresh Cargo target'
+    $buildEnvironmentItem = Get-ScribeGpuWorkerPhysicalDirectory $BuildEnvironment 'The isolated native build environment'
+    $canonicalCargoTarget = $cargoTargetItem.FullName.TrimEnd([char[]]@('\', '/'))
+    $canonicalBuildEnvironment = $buildEnvironmentItem.FullName.TrimEnd([char[]]@('\', '/'))
+    $tcsRoot = Join-Path $canonicalBuildEnvironment 'tcs'
+    $tcsItem = Get-ScribeGpuWorkerPhysicalDirectory $tcsRoot 'The isolated transcribe-cpp native-build junction root'
+    if ((Split-Path -Parent $tcsItem.FullName) -cne $canonicalBuildEnvironment) {
+        throw 'The isolated transcribe-cpp native-build junction root escaped the exact build environment.'
     }
     $entries = @(Get-ChildItem -LiteralPath $tcsRoot -Force)
     if ($entries.Count -ne 1) {
@@ -202,17 +207,16 @@ function Enable-ValidatedCmakeBuildJunction(
         @($shortOut.Target).Count -ne 1) {
         throw 'The transcribe-cpp short OUT_DIR is not one exact NTFS junction.'
     }
-    $outDirectory = Get-NormalizedFullPath ([string]@($shortOut.Target)[0])
-    $relativeOut = [System.IO.Path]::GetRelativePath($CargoTarget, $outDirectory).Replace('\', '/')
+    $outDirectory = (Get-Item -LiteralPath ([string]@($shortOut.Target)[0]) -Force).FullName
+    $relativeOut = [System.IO.Path]::GetRelativePath($canonicalCargoTarget, $outDirectory).Replace('\', '/')
     if ($relativeOut -cnotmatch '^release/build/transcribe-cpp-sys-[0-9a-f]{16}/out$') {
         throw 'The transcribe-cpp short OUT_DIR junction escaped the exact fresh Cargo target.'
     }
-    $outItem = Get-Item -LiteralPath $outDirectory -Force
-    if (-not $outItem.PSIsContainer -or
-        ($outItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
-        throw 'The transcribe-cpp OUT_DIR target is not a physical directory.'
+    $outItem = Get-ScribeGpuWorkerPhysicalDirectory $outDirectory 'The transcribe-cpp OUT_DIR target'
+    if (-not (Test-ScribeGpuWorkerPathWithin $outItem.FullName $canonicalCargoTarget)) {
+        throw 'The transcribe-cpp OUT_DIR target escaped the exact fresh Cargo target.'
     }
-    $buildDirectory = Join-Path $outDirectory 'build'
+    $buildDirectory = Join-Path $outItem.FullName 'build'
     if (Test-Path -LiteralPath $buildDirectory) {
         $buildItem = Get-Item -LiteralPath $buildDirectory -Force
         if (-not $buildItem.PSIsContainer -or
@@ -224,18 +228,45 @@ function Enable-ValidatedCmakeBuildJunction(
             )) {
             throw 'Refusing to replace an unexpected transcribe-cpp native build path.'
         }
+        # Revalidate all mutable topology immediately before this only permitted deletion.
+        $currentCargoTarget = Get-ScribeGpuWorkerPhysicalDirectory $CargoTarget 'The exact fresh Cargo target'
+        $currentBuildEnvironment = Get-ScribeGpuWorkerPhysicalDirectory $BuildEnvironment 'The isolated native build environment'
+        $currentTcs = Get-ScribeGpuWorkerPhysicalDirectory $tcsRoot 'The isolated transcribe-cpp native-build junction root'
+        $currentOut = Get-ScribeGpuWorkerPhysicalDirectory $outItem.FullName 'The transcribe-cpp OUT_DIR target'
+        if ($currentCargoTarget.FullName -cne $canonicalCargoTarget -or
+            $currentBuildEnvironment.FullName -cne $canonicalBuildEnvironment -or
+            (Split-Path -Parent $currentTcs.FullName) -cne $canonicalBuildEnvironment -or
+            $currentOut.FullName -cne $outItem.FullName -or
+            -not (Test-ScribeGpuWorkerPathWithin $currentOut.FullName $canonicalCargoTarget)) {
+            throw 'The transcribe-cpp CMake bootstrap topology changed before mutation.'
+        }
+        $currentEntries = @(Get-ChildItem -LiteralPath $currentTcs.FullName -Force)
+        if ($currentEntries.Count -ne 1 -or
+            -not [string]::Equals($currentEntries[0].FullName, $shortOut.FullName, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw 'The transcribe-cpp OUT_DIR inventory changed before mutation.'
+        }
+        $currentShortOut = Get-Item -LiteralPath $shortOut.FullName -Force
+        if (($currentShortOut.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0 -or
+            -not $currentShortOut.PSIsContainer -or
+            $currentShortOut.LinkType -cne 'Junction' -or
+            @($currentShortOut.Target).Count -ne 1 -or
+            (Split-Path -Parent $currentShortOut.FullName) -cne $currentTcs.FullName -or
+            (Get-ScribeGpuWorkerPhysicalDirectory ([string]@($currentShortOut.Target)[0]) 'The transcribe-cpp OUT_DIR target').FullName -cne $outItem.FullName) {
+            throw 'The transcribe-cpp OUT_DIR junction changed before mutation.'
+        }
+        $currentBuild = Get-ScribeGpuWorkerPhysicalDirectory $buildDirectory 'The transcribe-cpp native build directory'
+        if ((Split-Path -Parent $currentBuild.FullName) -cne $outItem.FullName) {
+            throw 'The transcribe-cpp native build topology changed before mutation.'
+        }
+        Assert-ScribeGpuWorkerNoReparseDescendants $currentBuild.FullName
         Remove-Item -LiteralPath $buildDirectory -Recurse -Force
     }
-    $nativeBuild = Join-Path $BuildEnvironment 'native'
+    $nativeBuild = Join-Path $canonicalBuildEnvironment 'native'
     if (Test-Path -LiteralPath $nativeBuild) {
         throw 'The isolated short native build directory was unexpectedly preexisting.'
     }
     New-Item -ItemType Directory -Path $nativeBuild | Out-Null
-    $nativeItem = Get-Item -LiteralPath $nativeBuild -Force
-    if (-not $nativeItem.PSIsContainer -or
-        ($nativeItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
-        throw 'The isolated short native build directory is not physical.'
-    }
+    $nativeItem = Get-ScribeGpuWorkerPhysicalDirectory $nativeBuild 'The isolated short native build directory'
     New-Item -ItemType Junction -Path $buildDirectory -Target $nativeBuild | Out-Null
     $junction = Get-Item -LiteralPath $buildDirectory -Force
     if (-not $junction.PSIsContainer -or
@@ -243,8 +274,8 @@ function Enable-ValidatedCmakeBuildJunction(
         $junction.LinkType -cne 'Junction' -or
         @($junction.Target).Count -ne 1 -or
         -not [string]::Equals(
-            (Get-NormalizedFullPath ([string]@($junction.Target)[0])),
-            $nativeBuild,
+            (Get-ScribeGpuWorkerPhysicalDirectory ([string]@($junction.Target)[0]) 'The isolated short native build directory').FullName,
+            $nativeItem.FullName,
             [System.StringComparison]::OrdinalIgnoreCase
         )) {
         throw 'Could not verify the isolated transcribe-cpp native build junction.'

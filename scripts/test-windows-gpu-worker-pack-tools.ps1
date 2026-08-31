@@ -86,9 +86,32 @@ foreach ($script in @(
     Assert-True ($parseErrors.Count -eq 0) "GPU worker-pack script has PowerShell parse errors: $script"
 }
 . $cmakeBootstrapScript
-$legacyCmakeBootstrapFailure = @('transcribe-cpp-sys v0.1.3', 'The directory name is invalid. (os error 267)')
-if (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure $legacyCmakeBootstrapFailure)) { throw 'Existing os-error-267 CMake bootstrap signature regressed.' }
-if (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure @('transcribe-cpp-sys v0.1.3', 'Could not open file for write in copy operation'))) { throw 'Existing copy-operation CMake bootstrap signature regressed.' }
+$legacyOsError267CmakeBootstrapFailure = @(
+    'error: failed to run custom build command for `transcribe-cpp-sys v0.1.3`',
+    '  Error: failed to execute command: cmake -S C:\safe\source',
+    '  The directory name is invalid. (os error 267)'
+)
+$legacyCopyCmakeBootstrapFailure = @(
+    'error: failed to run custom build command for `transcribe-cpp-sys v0.1.3`',
+    '  Error: Could not open file for write in copy operation'
+)
+foreach ($diagnostic in @(
+    ($legacyOsError267CmakeBootstrapFailure -join "`r`n"),
+    ($legacyOsError267CmakeBootstrapFailure -join "`n"),
+    ($legacyCopyCmakeBootstrapFailure -join "`r`n"),
+    ($legacyCopyCmakeBootstrapFailure -join "`n")
+)) {
+    if (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure $diagnostic)) { throw 'Exact legacy CMake bootstrap signature regressed.' }
+}
+foreach ($malformedLegacyCmakeBootstrapFailure in @(
+    @('error: failed to run custom build command for `transcribe-cpp-sys v0.1.4`', $legacyOsError267CmakeBootstrapFailure[1], $legacyOsError267CmakeBootstrapFailure[2]),
+    @($legacyOsError267CmakeBootstrapFailure[1], $legacyOsError267CmakeBootstrapFailure[0], $legacyOsError267CmakeBootstrapFailure[2]),
+    @($legacyOsError267CmakeBootstrapFailure[0], '  Error: failed to execute command:', $legacyOsError267CmakeBootstrapFailure[2]),
+    @('unrelated transcribe-cpp-sys', 'The directory name is invalid. (os error 267)'),
+    @($legacyCopyCmakeBootstrapFailure[0], '  Could not open file for write in copy operation unexpectedly')
+)) {
+    if (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure ($malformedLegacyCmakeBootstrapFailure -join "`r`n")) { throw 'Malformed legacy CMake bootstrap signature was classified.' }
+}
 $vulkanShortJunctionFailure = @(
     'transcribe-cpp-sys: could not create short build junction C:\safe\tcs; building in OUT_DIR (may exceed Windows MAX_PATH in deep checkouts)',
     'error: failed to run custom build command for `transcribe-cpp-sys v0.1.3`',
@@ -161,6 +184,32 @@ $overlongVulkanShortJunctionFailure = [System.Collections.Generic.List[object]]:
 foreach ($unused in 1..2048) { $overlongVulkanShortJunctionFailure.Add('noise') }
 foreach ($line in $vulkanShortJunctionFailure) { $overlongVulkanShortJunctionFailure.Add($line) }
 if (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure $overlongVulkanShortJunctionFailure.ToArray()) { throw 'Overlong Vulkan CMake output was classified outside the bounded window.' }
+$topologyRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("scribe-pack-cmake-topology-$([guid]::NewGuid().ToString('N'))")
+try {
+    $buildDirectory = Join-Path $topologyRoot 'cargo\release\build\transcribe-cpp-sys-0123456789abcdef\out\build'
+    $outsideDirectory = Join-Path $topologyRoot 'outside'
+    New-Item -ItemType Directory -Path $buildDirectory -Force | Out-Null
+    New-Item -ItemType Directory -Path $outsideDirectory -Force | Out-Null
+    $sentinel = Join-Path $outsideDirectory 'must-not-delete.txt'
+    [System.IO.File]::WriteAllText($sentinel, 'sentinel')
+    New-Item -ItemType Junction -Path (Join-Path $buildDirectory 'escaped') -Target $outsideDirectory | Out-Null
+    $rejected = $false
+    try { Assert-ScribeGpuWorkerNoReparseDescendants $buildDirectory } catch { $rejected = $true }
+    Assert-True $rejected 'CMake bootstrap deletion topology accepted a descendant junction.'
+    Assert-True (Test-Path -LiteralPath $sentinel -PathType Leaf) 'CMake bootstrap topology validation deleted outside-scope data.'
+    $regularFileRejected = $false
+    try { $null = Get-ScribeGpuWorkerPhysicalDirectory $sentinel 'test file' } catch { $regularFileRejected = $true }
+    Assert-True $regularFileRejected 'CMake bootstrap topology accepted a regular file as a directory.'
+}
+finally {
+    if (Test-Path -LiteralPath $topologyRoot) { Remove-Item -LiteralPath $topologyRoot -Recurse -Force }
+}
+$buildSource = Get-Content -LiteralPath $buildScript -Raw
+$deletionGuardAt = $buildSource.IndexOf('Assert-ScribeGpuWorkerNoReparseDescendants $currentBuild.FullName')
+$inventoryGuardAt = $buildSource.IndexOf('$currentEntries = @(Get-ChildItem -LiteralPath $currentTcs.FullName -Force)')
+$deletionAt = $buildSource.IndexOf('Remove-Item -LiteralPath $buildDirectory -Recurse -Force')
+Assert-True ($deletionGuardAt -ge 0 -and $deletionGuardAt -lt $deletionAt) 'Builder deletion is not guarded by descendant reparse validation.'
+Assert-True ($inventoryGuardAt -ge 0 -and $inventoryGuardAt -lt $deletionAt) 'Builder deletion is not guarded by current OUT_DIR inventory validation.'
 . $cudaInventoryScript
 $autoQualificationReport = Join-Path ([System.IO.Path]::GetTempPath()) "scribe-gpu-auto-qualification-$([guid]::NewGuid().ToString('N')).txt"
 try {
