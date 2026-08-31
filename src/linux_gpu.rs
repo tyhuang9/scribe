@@ -164,10 +164,10 @@ fn resolve_snapshot(
                 return Err("Linux NVIDIA physical GPU alias is ambiguous".to_owned());
             }
         }
-        if let Some(uuid) = &fact.cuda_runtime_uuid_witness {
-            if !is_canonical_nvidia_physical_uuid(uuid) {
-                return Err("Linux CUDA runtime UUID witness is malformed".to_owned());
-            }
+        if let Some(uuid) = &fact.cuda_runtime_uuid_witness
+            && !is_canonical_nvidia_physical_uuid(uuid)
+        {
+            return Err("Linux CUDA runtime UUID witness is malformed".to_owned());
         }
         if let Some(vulkan) = &fact.vulkan_pci_witness {
             validate_driver_identity(&vulkan.identity)?;
