@@ -17,6 +17,7 @@ use std::thread::JoinHandle;
 
 pub(crate) const INSTALL_ROOT: &str = "/usr/lib/scribe";
 pub(crate) const WORKER_NAME: &str = "scribe-inference-worker";
+pub(crate) const EXECUTABLE_FD_ENV: &str = "SCRIBE_PRIVATE_EXECUTABLE_FD";
 
 const INSTALL_COMPONENTS: &[&CStr] = &[c"usr", c"lib", c"scribe"];
 const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
@@ -44,7 +45,11 @@ const AT_EMPTY_PATH: c_int = 0x1000;
 const PR_SET_PDEATHSIG: c_int = 1;
 const PR_SET_NO_NEW_PRIVS: c_int = 38;
 const SIGKILL: c_int = 9;
+const EACCES: c_int = 13;
 const WNOHANG: c_int = 1;
+const WEXITED: c_int = 4;
+const WNOWAIT: c_int = 0x0100_0000;
+const P_PID: c_int = 1;
 const EINTR: c_int = 4;
 const ESRCH: c_int = 3;
 const ECHILD: c_int = 10;
@@ -79,6 +84,31 @@ struct PollFd {
     revents: i16,
 }
 
+// x86_64 GNU siginfo_t is 128 bytes. For SIGCHLD, the union begins at
+// offset 16 with si_pid; waitid only requires that field here.
+#[repr(C)]
+struct SigInfo {
+    signo: c_int,
+    errno: c_int,
+    code: c_int,
+    _union_alignment: c_int,
+    pid: c_int,
+    uid: c_uint,
+    status: c_int,
+    _status_padding: c_int,
+    utime: i64,
+    stime: i64,
+    _remaining: [u8; 80],
+}
+
+impl SigInfo {
+    fn zeroed() -> Self {
+        // SAFETY: siginfo_t is a plain C data carrier and all-zero is the
+        // specified no-event result for waitid with WNOHANG.
+        unsafe { std::mem::zeroed() }
+    }
+}
+
 unsafe extern "C" {
     fn syscall(number: c_long, ...) -> c_long;
     fn pipe2(pipefd: *mut c_int, flags: c_int) -> c_int;
@@ -96,6 +126,7 @@ unsafe extern "C" {
     fn write(fd: c_int, buffer: *const c_void, count: usize) -> isize;
     fn poll(fds: *mut PollFd, count: usize, timeout: c_int) -> c_int;
     fn kill(pid: c_int, signal: c_int) -> c_int;
+    fn waitid(idtype: c_int, id: c_uint, infop: *mut SigInfo, options: c_int) -> c_int;
     fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_int;
     fn _exit(status: c_int) -> !;
     fn __errno_location() -> *mut c_int;
@@ -404,7 +435,7 @@ struct ProcessState {
 }
 
 struct Guardian {
-    release: SyncSender<()>,
+    release: SyncSender<bool>,
     done: Receiver<()>,
     join: Option<JoinHandle<()>>,
 }
@@ -420,28 +451,14 @@ impl LinuxWorkerProcess {
     pub(crate) fn is_running(&self) -> io::Result<bool> {
         let mut state = lock(&self.state)?;
         if state.leader_reaped {
-            clean_process_group(&mut state)?;
             return Ok(false);
         }
-        let mut status = 0;
-        // SAFETY: pid names this object's child and status is writable.
-        let result = unsafe { waitpid(state.pid, &mut status, WNOHANG) };
-        if result == 0 {
-            Ok(true)
-        } else if result == state.pid {
-            state.leader_reaped = true;
-            clean_process_group(&mut state)?;
-            Ok(false)
-        } else {
-            let error = io::Error::last_os_error();
-            if error.raw_os_error() == Some(ECHILD) {
-                state.leader_reaped = true;
-                clean_process_group(&mut state)?;
-                Ok(false)
-            } else {
-                Err(error)
-            }
+        if !observe_leader_exit(&mut state, true)? {
+            return Ok(true);
         }
+        clean_process_group(&mut state)?;
+        reap_observed_leader(&mut state)?;
+        Ok(false)
     }
 
     pub(crate) fn request_cooperative_cancel(&self) -> io::Result<bool> {
@@ -456,8 +473,7 @@ impl LinuxWorkerProcess {
 
     pub(crate) fn wait(&self) -> io::Result<()> {
         let mut state = lock(&self.state)?;
-        reap_leader(&mut state)?;
-        clean_process_group(&mut state)
+        reap_leader(&mut state)
     }
 }
 
@@ -467,15 +483,17 @@ impl Drop for LinuxWorkerProcess {
             .state
             .get_mut()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _ = clean_process_group(state);
-        let _ = reap_leader_bounded(state, DROP_REAP_TIMEOUT);
+        let cleanup_needed = clean_process_group(state).is_err();
+        if !cleanup_needed {
+            let _ = reap_leader_bounded(state, DROP_REAP_TIMEOUT);
+        }
 
         let guardian = self
             .guardian
             .get_mut()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(mut guardian) = guardian.take() {
-            let _ = guardian.release.send(());
+            let _ = guardian.release.send(cleanup_needed);
             if guardian
                 .done
                 .recv_timeout(GUARDIAN_SHUTDOWN_TIMEOUT)
@@ -509,13 +527,43 @@ fn clean_process_group(state: &mut ProcessState) -> io::Result<()> {
     Ok(())
 }
 
-fn reap_leader(state: &mut ProcessState) -> io::Result<()> {
+fn observe_leader_exit(state: &mut ProcessState, nonblocking: bool) -> io::Result<bool> {
+    if state.leader_reaped {
+        return Ok(true);
+    }
+    let options = WEXITED | WNOWAIT | if nonblocking { WNOHANG } else { 0 };
+    loop {
+        let mut info = SigInfo::zeroed();
+        // SAFETY: pid is the retained child leader and info has the exact
+        // x86_64 GNU siginfo_t layout required by waitid.
+        if unsafe { waitid(P_PID, state.pid as c_uint, &mut info, options) } == 0 {
+            return Ok(info.pid == state.pid);
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(EINTR) {
+            continue;
+        }
+        if error.raw_os_error() == Some(ECHILD) {
+            if !state.process_group_cleaned {
+                return Err(invalid(
+                    "Linux worker leader was reaped before its process group was cleaned",
+                ));
+            }
+            state.leader_reaped = true;
+            return Ok(true);
+        }
+        return Err(error);
+    }
+}
+
+fn reap_observed_leader(state: &mut ProcessState) -> io::Result<()> {
     if state.leader_reaped {
         return Ok(());
     }
     loop {
         let mut status = 0;
-        // SAFETY: pid names this object's child and status is writable.
+        // SAFETY: waitid observed this child without reaping it, so its PID and
+        // process-group identifier remain reserved until this final waitpid.
         let result = unsafe { waitpid(state.pid, &mut status, 0) };
         if result == state.pid {
             state.leader_reaped = true;
@@ -531,6 +579,15 @@ fn reap_leader(state: &mut ProcessState) -> io::Result<()> {
         }
         return Err(error);
     }
+}
+
+fn reap_leader(state: &mut ProcessState) -> io::Result<()> {
+    if state.leader_reaped {
+        return Ok(());
+    }
+    observe_leader_exit(state, false)?;
+    clean_process_group(state)?;
+    reap_observed_leader(state)
 }
 
 fn reap_leader_bounded(state: &mut ProcessState, timeout: std::time::Duration) -> io::Result<()> {
@@ -633,9 +690,8 @@ fn launch_on_guardian(
             match result_tx.send(result) {
                 Ok(()) => {
                     if let Some(pid) = pid {
-                        if release_rx.recv().is_err() {
-                            guardian_cleanup(pid, DROP_REAP_TIMEOUT);
-                        }
+                        let cleanup_needed = release_rx.recv().unwrap_or(true);
+                        guardian_finalize(pid, cleanup_needed);
                     }
                 }
                 Err(send_error) => {
@@ -685,14 +741,15 @@ fn launch_on_guardian(
     })
 }
 
-fn guardian_cleanup(pid: c_int, timeout: std::time::Duration) {
-    unsafe {
-        kill(-pid, SIGKILL);
-        kill(pid, SIGKILL);
+fn guardian_finalize(pid: c_int, cleanup_needed: bool) {
+    if cleanup_needed {
+        unsafe {
+            kill(-pid, SIGKILL);
+            kill(pid, SIGKILL);
+        }
     }
-    let deadline = std::time::Instant::now() + timeout;
     loop {
-        let result = unsafe { waitpid(pid, std::ptr::null_mut(), WNOHANG) };
+        let result = unsafe { waitpid(pid, std::ptr::null_mut(), 0) };
         if result == pid {
             return;
         }
@@ -705,10 +762,6 @@ fn guardian_cleanup(pid: c_int, timeout: std::time::Duration) {
                 return;
             }
         }
-        if std::time::Instant::now() >= deadline {
-            return;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(5));
     }
 }
 
@@ -762,6 +815,7 @@ impl PreparedLaunch {
         let mut fields = vec![
             "PATH=/usr/bin:/bin".to_owned(),
             "LANG=C.UTF-8".to_owned(),
+            format!("{EXECUTABLE_FD_ENV}={EXEC_FD}"),
             format!("SCRIBE_PRIVATE_PARENT_LIVENESS={LIVENESS_FD}"),
         ];
         for (name, value) in bindings {
@@ -843,7 +897,9 @@ impl PreparedLaunch {
         // pointer was prepared before fork and no other Rust code is invoked.
         unsafe {
             child_dup(self.error_write.raw(), ERROR_FD, true, 1);
-            child_dup(self.executable.raw(), EXEC_FD, true, 2);
+            // EXEC_FD deliberately survives exec so the worker can form its
+            // one challenge-bound capability from the exact sealed image.
+            child_dup(self.executable.raw(), EXEC_FD, false, 2);
             child_dup(self.root.raw(), ROOT_FD, true, 3);
             child_dup(self.child_liveness.raw(), LIVENESS_FD, false, 4);
             child_dup(self.child_stdin.raw(), 0, false, 5);
@@ -884,6 +940,10 @@ impl PreparedLaunch {
             if self.child_test_action == 4 {
                 close(EXEC_FD);
             }
+            #[cfg(test)]
+            if self.child_test_action == 5 && fchmod(EXEC_FD, 0) == -1 {
+                child_fail(92);
+            }
             syscall(
                 SYS_EXECVEAT,
                 EXEC_FD,
@@ -899,7 +959,7 @@ impl PreparedLaunch {
 
 fn validate_binding(name: &str, value: &str) -> io::Result<()> {
     if !name.starts_with("SCRIBE_PRIVATE_")
-        || name == "SCRIBE_PRIVATE_PARENT_LIVENESS"
+        || matches!(name, "SCRIBE_PRIVATE_PARENT_LIVENESS" | EXECUTABLE_FD_ENV)
         || name.is_empty()
         || name.len() > 128
         || name.contains(['=', '\0'])
@@ -1019,6 +1079,13 @@ fn wait_for_exec(
             if offset == record.len() {
                 let stage = u32::from_le_bytes(record[..4].try_into().unwrap());
                 let errno = i32::from_le_bytes(record[4..].try_into().unwrap());
+                if stage == 13 && errno == EACCES {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "Linux sealed memfd execution was denied (EACCES); the host must allow executable memfd images (vm.memfd_noexec=0 when that policy exists)",
+                    )
+                    .into());
+                }
                 return Err(io::Error::new(
                     io::ErrorKind::Other,
                     format!("Linux worker child setup failed at stage {stage} (errno {errno})"),
@@ -1199,6 +1266,7 @@ fn create_sealed_snapshot(authority: &dyn LinuxExecAuthority) -> io::Result<File
             "Linux worker execution snapshot is not fully sealed",
         ));
     }
+    snapshot.seek(SeekFrom::Start(0))?;
     Ok(snapshot)
 }
 
@@ -1451,6 +1519,25 @@ mod tests {
     }
 
     #[test]
+    fn waitid_siginfo_layout_matches_x86_64_gnu_abi() {
+        assert_eq!(std::mem::size_of::<SigInfo>(), 128);
+        assert_eq!(std::mem::align_of::<SigInfo>(), 8);
+        assert_eq!(std::mem::offset_of!(SigInfo, pid), 16);
+    }
+
+    #[test]
+    fn host_allows_executable_memfd_images() {
+        let policy = std::fs::read_to_string("/proc/sys/vm/memfd_noexec");
+        if let Ok(policy) = policy {
+            assert_eq!(
+                policy.trim(),
+                "0",
+                "Linux launcher tests require vm.memfd_noexec=0"
+            );
+        }
+    }
+
+    #[test]
     fn exact_descriptor_authority_opens_and_rechecks() {
         let fixture = Fixture::new();
         let authority = fixture.open().unwrap();
@@ -1571,7 +1658,7 @@ mod tests {
         assert!(output.contains("ARGS=--scribe-inference-worker"));
         assert!(
             output
-                .contains("ENV=LANG,PATH,SCRIBE_PRIVATE_PARENT_LIVENESS,SCRIBE_PRIVATE_TEST_MODE")
+                .contains("ENV=LANG,PATH,SCRIBE_PRIVATE_EXECUTABLE_FD,SCRIBE_PRIVATE_PARENT_LIVENESS,SCRIBE_PRIVATE_TEST_MODE")
         );
         assert!(!output.contains("LD_PRELOAD"));
         assert!(!output.contains("SCRIBE_PRIVATE_HOSTILE"));
@@ -1589,6 +1676,8 @@ mod tests {
             "unexpected inherited FDs: {fds:?}"
         );
         assert!(fds.contains(&LIVENESS_FD));
+        assert!(fds.contains(&EXEC_FD));
+        assert!(output.contains(&format!("IMAGE_SHA256={}", fixture.digest)));
     }
 
     struct RawAuthority {
@@ -1789,6 +1878,18 @@ mod tests {
         .expect("directory exec must fail");
         assert!(exec_error.to_string().contains("stage 13 (errno"));
 
+        let denied = launch_verified_worker_inner(
+            fixture.open().unwrap(),
+            "--scribe-inference-worker",
+            &[],
+            500,
+            5,
+        )
+        .err()
+        .expect("non-executable memfd must fail");
+        assert_eq!(denied.kind(), io::ErrorKind::PermissionDenied);
+        assert!(denied.to_string().contains("vm.memfd_noexec=0"));
+
         let mut status = 0;
         assert_eq!(unsafe { waitpid(-1, &mut status, WNOHANG) }, -1);
         assert_eq!(io::Error::last_os_error().raw_os_error(), Some(ECHILD));
@@ -1821,6 +1922,35 @@ mod tests {
         spawned.process.terminate().unwrap();
         spawned.process.wait().unwrap();
         drop(fixture);
+    }
+
+    #[test]
+    fn guardian_retains_eventual_reap_after_bounded_release_wait() {
+        let pid = unsafe { fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            unsafe {
+                let _ = poll(std::ptr::null_mut(), 0, 1_200);
+                _exit(0);
+            }
+        }
+
+        let (release_tx, release_rx) = sync_channel(1);
+        let (done_tx, done_rx) = sync_channel(1);
+        let guardian = std::thread::spawn(move || {
+            let cleanup_needed = release_rx.recv().unwrap_or(true);
+            guardian_finalize(pid, cleanup_needed);
+            done_tx.send(()).unwrap();
+        });
+        release_tx.send(false).unwrap();
+        assert!(
+            done_rx.recv_timeout(GUARDIAN_SHUTDOWN_TIMEOUT).is_err(),
+            "delayed child unexpectedly completed within bounded owner wait"
+        );
+        done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        guardian.join().unwrap();
+        assert_eq!(unsafe { waitpid(pid, std::ptr::null_mut(), WNOHANG) }, -1);
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(ECHILD));
     }
 
     #[test]

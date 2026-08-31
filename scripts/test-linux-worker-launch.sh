@@ -5,6 +5,14 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 test_root="$(mktemp -d)"
 trap 'rm -rf -- "$test_root"' EXIT
 
+if [[ -r /proc/sys/vm/memfd_noexec ]]; then
+  memfd_noexec="$(< /proc/sys/vm/memfd_noexec)"
+  if [[ "$memfd_noexec" != "0" ]]; then
+    echo "Linux worker launch tests require vm.memfd_noexec=0; found $memfd_noexec" >&2
+    exit 1
+  fi
+fi
+
 rustc --edition=2024 \
   "$repo_root/scripts/linux-worker-launch-fixture.rs" \
   -D warnings \

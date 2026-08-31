@@ -71,6 +71,10 @@ const VAD_WORKER_BUILD_ID: &str = concat!(
     env!("SCRIBE_BUILD_REVISION")
 );
 const PARENT_LIVENESS_ENV: &str = "SCRIBE_PRIVATE_PARENT_LIVENESS";
+#[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
+const LINUX_EXECUTABLE_FD_ENV: &str = "SCRIBE_PRIVATE_EXECUTABLE_FD";
+#[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
+const LINUX_EXECUTABLE_FD: i32 = 3;
 const PACK_ID_ENV: &str = "SCRIBE_PRIVATE_PACK_ID";
 const PACK_VERSION_ENV: &str = "SCRIBE_PRIVATE_PACK_VERSION";
 const PACK_DIGEST_ENV: &str = "SCRIBE_PRIVATE_PACK_DIGEST";
@@ -1007,23 +1011,15 @@ fn worker_capability(role: WorkerRole, challenge: String) -> Result<WorkerCapabi
             target,
         }],
     };
-    let bundled_worker_sha256 = match role {
-        WorkerRole::Inference => {
-            #[cfg(test)]
-            {
-                String::new()
-            }
-            #[cfg(not(test))]
-            {
-                let executable = std::env::current_exe()
-                    .context("could not locate inference worker for capability fingerprint")?;
-                sha256_file(&executable)
-                    .context("could not fingerprint inference worker for capability handshake")?
-            }
-        }
-        WorkerRole::Vad => "same-executable".to_owned(),
+    let inference_fingerprint = match role {
+        WorkerRole::Inference => Some(inference_worker_capability_fingerprint()?),
+        WorkerRole::Vad => None,
     };
-    Ok(WorkerCapability {
+    let bundled_worker_sha256 = inference_fingerprint.as_ref().map_or_else(
+        || "same-executable".to_owned(),
+        |value| value.sha256.clone(),
+    );
+    let capability = WorkerCapability {
         challenge,
         app_build: DESKTOP_BUILD_ID.to_owned(),
         worker_build: match role {
@@ -1037,6 +1033,110 @@ fn worker_capability(role: WorkerRole, challenge: String) -> Result<WorkerCapabi
         provider: compiled_worker_provider(role),
         artifacts,
         pack: worker_pack_capability(role)?,
+    };
+    // On Linux this closes inherited FD 3 only after the one Hello capability
+    // has been completely formed from its sealed image digest.
+    drop(inference_fingerprint);
+    Ok(capability)
+}
+
+struct InferenceWorkerFingerprint {
+    sha256: String,
+    #[cfg(all(
+        not(test),
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_env = "gnu"
+    ))]
+    _inherited_image: std::fs::File,
+}
+
+#[cfg(test)]
+fn inference_worker_capability_fingerprint() -> Result<InferenceWorkerFingerprint> {
+    Ok(InferenceWorkerFingerprint {
+        sha256: String::new(),
+    })
+}
+
+#[cfg(all(
+    not(test),
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_env = "gnu"
+))]
+fn inference_worker_capability_fingerprint() -> Result<InferenceWorkerFingerprint> {
+    use std::io::{Seek, SeekFrom};
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::fs::MetadataExt;
+
+    const REQUIRED_SEALS: i32 =
+        libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+    const TMPFS_MAGIC: libc::c_long = 0x0102_1994;
+
+    if std::env::var(LINUX_EXECUTABLE_FD_ENV).as_deref() != Ok("3") {
+        bail!("Linux inference worker received an unexpected executable-image descriptor");
+    }
+
+    // SAFETY: the Linux launcher transfers sole ownership of fixed FD 3 to
+    // this one-Hello capability path. Every return path closes it.
+    let inherited = unsafe { std::fs::File::from_raw_fd(LINUX_EXECUTABLE_FD) };
+    let metadata = inherited
+        .metadata()
+        .context("could not inspect sealed Linux worker image")?;
+    if !metadata.file_type().is_file() || metadata.nlink() != 0 {
+        bail!("Linux worker image descriptor is not an anonymous regular memfd");
+    }
+    let mut filesystem = std::mem::MaybeUninit::<libc::statfs>::zeroed();
+    if unsafe { libc::fstatfs(inherited.as_raw_fd(), filesystem.as_mut_ptr()) } == -1 {
+        return Err(std::io::Error::last_os_error())
+            .context("could not inspect Linux worker image filesystem");
+    }
+    // SAFETY: fstatfs initialized the structure on success.
+    if unsafe { filesystem.assume_init() }.f_type as libc::c_long != TMPFS_MAGIC {
+        bail!("Linux worker image descriptor is not backed by memfd tmpfs");
+    }
+    let seals = unsafe { libc::fcntl(inherited.as_raw_fd(), libc::F_GET_SEALS) };
+    if seals == -1 {
+        return Err(std::io::Error::last_os_error())
+            .context("could not inspect Linux worker image seals");
+    }
+    if seals != REQUIRED_SEALS {
+        bail!("Linux worker image descriptor does not have the exact required seals");
+    }
+    let duplicate = unsafe {
+        libc::fcntl(
+            inherited.as_raw_fd(),
+            libc::F_DUPFD_CLOEXEC,
+            LINUX_EXECUTABLE_FD + 1,
+        )
+    };
+    if duplicate == -1 {
+        return Err(std::io::Error::last_os_error())
+            .context("could not duplicate sealed Linux worker image");
+    }
+    // SAFETY: fcntl returned a new owned descriptor.
+    let mut image = unsafe { std::fs::File::from_raw_fd(duplicate) };
+    image
+        .seek(SeekFrom::Start(0))
+        .context("could not rewind sealed Linux worker image")?;
+    let sha256 = sha256_reader(image)
+        .context("could not fingerprint sealed inference worker for capability handshake")?;
+    Ok(InferenceWorkerFingerprint {
+        sha256,
+        _inherited_image: inherited,
+    })
+}
+
+#[cfg(all(
+    not(test),
+    not(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))
+))]
+fn inference_worker_capability_fingerprint() -> Result<InferenceWorkerFingerprint> {
+    let executable = std::env::current_exe()
+        .context("could not locate inference worker for capability fingerprint")?;
+    Ok(InferenceWorkerFingerprint {
+        sha256: sha256_file(&executable)
+            .context("could not fingerprint inference worker for capability handshake")?,
     })
 }
 
@@ -1780,11 +1880,14 @@ fn random_challenge() -> Result<String> {
 }
 
 fn sha256_file(path: &Path) -> Result<String> {
-    let mut file = std::fs::File::open(path)?;
+    sha256_reader(std::fs::File::open(path)?)
+}
+
+fn sha256_reader(mut reader: impl Read) -> Result<String> {
     let mut digest = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
     loop {
-        let read = file.read(&mut buffer)?;
+        let read = reader.read(&mut buffer)?;
         if read == 0 {
             break;
         }
@@ -3313,6 +3416,9 @@ pub(crate) fn validate_linux_worker_entrypoint() -> Result<()> {
     }
     if std::env::var(PARENT_LIVENESS_ENV).as_deref() != Ok("5") {
         bail!("Linux inference worker received an unexpected parent-liveness descriptor");
+    }
+    if std::env::var(LINUX_EXECUTABLE_FD_ENV).as_deref() != Ok("3") {
+        bail!("Linux inference worker received an unexpected executable-image descriptor");
     }
     for (name, _) in std::env::vars_os() {
         let Some(name) = name.to_str() else {

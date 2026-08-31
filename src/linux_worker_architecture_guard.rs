@@ -32,6 +32,10 @@ fn linux_launcher_is_exactly_scoped_and_has_no_path_spawn_fallback() {
         "cleanup_failed_child(pid)",
         "classify_zero_record_exec_eof(pid)",
         "waitpid(pid, &mut status, WNOHANG)",
+        "const WNOWAIT: c_int = 0x0100_0000",
+        "waitid(P_PID, state.pid as c_uint, &mut info, options)",
+        "child_dup(self.executable.raw(), EXEC_FD, false, 2)",
+        "format!(\"{EXECUTABLE_FD_ENV}={EXEC_FD}\")",
     ] {
         assert!(
             launcher.contains(required),
@@ -62,7 +66,8 @@ fn launcher_retains_creator_guardian_and_cleans_the_process_group_after_leader_e
         "struct Guardian {",
         "name(\"scribe-linux-worker-guardian\".to_owned())",
         ".and_then(|()| prepared.fork_exec())",
-        "release_rx.recv().is_err()",
+        "let cleanup_needed = release_rx.recv().unwrap_or(true)",
+        "guardian_finalize(pid, cleanup_needed)",
         "recv_timeout(GUARDIAN_SHUTDOWN_TIMEOUT)",
         "leader_reaped: bool",
         "process_group_cleaned: bool",
@@ -71,6 +76,7 @@ fn launcher_retains_creator_guardian_and_cleans_the_process_group_after_leader_e
         "guardian_outlives_short_lived_launch_helper_thread",
         "leader_exit_cleanup_kills_reported_descendant",
         "parent_death_signal_kills_worker_after_launcher_parent_exits",
+        "guardian_retains_eventual_reap_after_bounded_release_wait",
     ] {
         assert!(
             launcher.contains(required),
@@ -82,13 +88,119 @@ fn launcher_retains_creator_guardian_and_cleans_the_process_group_after_leader_e
         .split("fn launch_on_guardian(")
         .nth(1)
         .unwrap()
-        .split("fn guardian_cleanup")
+        .split("fn guardian_finalize")
         .next()
         .unwrap();
     assert!(launch.find(".spawn(move ||").unwrap() < launch.find("prepared.fork_exec()").unwrap());
     assert!(
         launch.find("prepared.fork_exec()").unwrap() < launch.find("release_rx.recv()").unwrap()
     );
+}
+
+#[test]
+fn leader_exit_is_observed_before_group_cleanup_and_final_reap() {
+    let launcher = include_str!("linux_worker_launch.rs");
+    let running = launcher
+        .split("pub(crate) fn is_running")
+        .nth(1)
+        .unwrap()
+        .split("pub(crate) fn request_cooperative_cancel")
+        .next()
+        .unwrap();
+    let observed = running
+        .find("observe_leader_exit(&mut state, true)")
+        .unwrap();
+    let cleaned = running.find("clean_process_group(&mut state)").unwrap();
+    let reaped = running.find("reap_observed_leader(&mut state)").unwrap();
+    assert!(observed < cleaned && cleaned < reaped);
+
+    let blocking = launcher
+        .split("fn reap_leader(state")
+        .nth(1)
+        .unwrap()
+        .split("fn reap_leader_bounded")
+        .next()
+        .unwrap();
+    assert!(blocking.contains("observe_leader_exit(state, false)?"));
+    assert!(
+        blocking.find("observe_leader_exit").unwrap()
+            < blocking.find("clean_process_group").unwrap()
+    );
+    assert!(
+        blocking.find("clean_process_group").unwrap()
+            < blocking.find("reap_observed_leader").unwrap()
+    );
+
+    let observation = launcher
+        .split("fn observe_leader_exit")
+        .nth(1)
+        .unwrap()
+        .split("fn reap_observed_leader")
+        .next()
+        .unwrap();
+    assert!(observation.contains("WEXITED | WNOWAIT"));
+    assert!(observation.contains("if nonblocking { WNOHANG } else { 0 }"));
+    assert!(observation.contains("waitid(P_PID, state.pid as c_uint, &mut info, options)"));
+}
+
+#[test]
+fn linux_worker_hashes_and_closes_the_exact_sealed_image_fd_for_hello() {
+    let launcher = include_str!("linux_worker_launch.rs");
+    let supervisor = include_str!("onnx_worker.rs");
+    assert!(
+        launcher.contains(
+            "pub(crate) const EXECUTABLE_FD_ENV: &str = \"SCRIBE_PRIVATE_EXECUTABLE_FD\""
+        )
+    );
+    assert!(launcher.contains("child_dup(self.executable.raw(), EXEC_FD, false, 2)"));
+    assert!(launcher.contains("SYS_CLOSE_RANGE, 7_u32"));
+
+    let capability = supervisor
+        .split("const REQUIRED_SEALS: i32")
+        .nth(1)
+        .unwrap()
+        .split("#[cfg(all(\n    not(test),\n    not(all(target_os")
+        .next()
+        .unwrap();
+    for required in [
+        "std::fs::File::from_raw_fd(LINUX_EXECUTABLE_FD)",
+        "metadata.file_type().is_file()",
+        "metadata.nlink() != 0",
+        "libc::fstatfs",
+        "libc::F_GET_SEALS",
+        "seals != REQUIRED_SEALS",
+        "libc::F_DUPFD_CLOEXEC",
+        "seek(SeekFrom::Start(0))",
+        "sha256_reader(image)",
+        "_inherited_image: inherited",
+    ] {
+        assert!(
+            capability.contains(required),
+            "missing worker image invariant: {required}"
+        );
+    }
+    assert!(!capability.contains("std::env::current_exe()"));
+    assert!(supervisor.contains("worker protocol permits Hello exactly once"));
+    assert!(supervisor.contains("std::env::var(LINUX_EXECUTABLE_FD_ENV).as_deref() != Ok(\"3\")"));
+    let capability_builder = supervisor
+        .split("fn worker_capability(")
+        .nth(1)
+        .unwrap()
+        .split("struct InferenceWorkerFingerprint")
+        .next()
+        .unwrap();
+    assert!(
+        capability_builder
+            .find("let capability = WorkerCapability")
+            .unwrap()
+            < capability_builder
+                .find("drop(inference_fingerprint)")
+                .unwrap()
+    );
+
+    let fixture = include_str!("../scripts/linux-worker-launch-fixture.rs");
+    assert!(fixture.contains("inherited_image_sha256(3)?"));
+    assert!(launcher.contains("IMAGE_SHA256={}"));
 }
 
 #[test]

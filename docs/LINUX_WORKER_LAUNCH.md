@@ -25,7 +25,17 @@ supervisor's short-lived launch helper. The process wrapper terminates/reaps the
 whole process group on failure, including after the group leader exits. The
 actual execution descriptor is a private `memfd_create` snapshot whose length
 and SHA-256 are verified during copying and which is sealed against writes,
-growth, shrinkage, and further seal changes before `fork`.
+growth, shrinkage, and further seal changes before `fork`. Fixed descriptor 3
+deliberately survives `execveat`; the worker verifies its anonymous memfd
+identity and exact seals, hashes a duplicate for its one Hello capability, and
+then closes the inherited image descriptor. Descriptor cleanup remains bounded
+above fixed descriptor 6.
+
+The current Ubuntu host prerequisite is executable-memfd allowance. When the
+host exposes `/proc/sys/vm/memfd_noexec`, its value must be `0`. Older kernels
+without that policy use their legacy executable-memfd behavior. The launcher
+reports a categorized `EACCES` error when this prerequisite is not met; it does
+not require newer `MFD_EXEC` support and remains compatible with kernel 5.15.
 
 Future GPU packs retain their reserved FHS location under
 `/usr/lib/scribe/workers/packs/<id>/<version>/<digest>/`, but this delivery does
