@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "fixtures": [
+    {
+      "model_id": "moonshine-base-en-int8-onnx",
+      "artifact": {
+        "repository": "csukuangfj/sherpa-onnx-moonshine-base-en-int8",
+        "revision": "052b0798ad1bf046a140fdd4efcd9426530fa3f5"
+      },
+      "wav": {
+        "repository": "csukuangfj/sherpa-onnx-moonshine-base-en-int8",
+        "revision": "052b0798ad1bf046a140fdd4efcd9426530fa3f5",
+        "path": "test_wavs/0.wav",
+        "size_bytes": 212044,
+        "sha256": "6bc58a4efdf20daac252b6b1502632601a71efe0308f6757dc1eda34891a7e4f"
+      },
+      "transcript": {
+        "repository": "csukuangfj/sherpa-onnx-moonshine-base-en-int8",
+        "revision": "052b0798ad1bf046a140fdd4efcd9426530fa3f5",
+        "source_path": "test_wavs/trans.txt",
+        "output_path": null,
+        "text": "AFTER EARLY NIGHTFALL THE YELLOW LAMPS WOULD LIGHT UP HERE AND THERE THE SQUALID QUARTER OF THE BROTHELS",
+        "normalized_text": "after early nightfall the yellow lamps would light up here and there the squalid quarter of the brothels"
+      }
+    },
+    {
+      "model_id": "parakeet-tdt-06b-v2-en-int8-onnx",
+      "artifact": {
+        "repository": "csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8",
+        "revision": "1ab9323565ddb038682214b292f588070a538ce2"
+      },
+      "wav": {
+        "repository": "csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8",
+        "revision": "1ab9323565ddb038682214b292f588070a538ce2",
+        "path": "test_wavs/0.wav",
+        "size_bytes": 237964,
+        "sha256": "5fceacff0315d49cb59fcc505bcecf1ed5f2f35c2897b1e65a59f30e5d922150"
+      },
+      "transcript": {
+        "repository": "k2-fsa/sherpa",
+        "revision": "6e00e3b0fc4aba9bc7c49366720e7c1f2e485f65",
+        "source_path": "docs/source/onnx/pretrained_models/offline-transducer/nemo/parakeet-tdt-0.6b-v2.rst",
+        "output_path": "docs/source/onnx/pretrained_models/offline-transducer/code-nemo/sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8.txt",
+        "text": " Well, I don't wish to see it any more, observed Phebe, turning away her eyes. It is certainly very like the old portrait.",
+        "normalized_text": "well i don t wish to see it any more observed phebe turning away her eyes it is certainly very like the old portrait"
+      }
+    }
+  ]
+}

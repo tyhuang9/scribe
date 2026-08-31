@@ -28,9 +28,10 @@ same-state design QA.
   while listening; it replaces the frozen timer with the current lifecycle
   status after recording ends.
 
-The implementation uses the bundled Phosphor `WAVEFORM` glyph as the static
-Scribe brand mark. It does not fabricate a logo or animate the mark from audio
-levels. Elapsed time and transcript use one regular Segoe UI face and the same
+The immutable reference corpus uses the bundled Phosphor `WAVEFORM` glyph as a
+static/reduced-motion Listening mark. Production Live Listening uses a separate
+fixed-bounds level meter, covered by dedicated renderer tests rather than these
+static screenshot fixtures. Elapsed time and transcript use one regular Segoe UI face and the same
 restrained light-gray token. Transcript display stays left-aligned while the
 full line fits. Once it overflows, the visible window follows the newest
 Unicode-grapheme-safe suffix, keeps its right edge fixed, and does not add an
