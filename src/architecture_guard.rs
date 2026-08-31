@@ -260,10 +260,18 @@ fn static_gguf_and_native_onnx_are_the_only_inference_architectures() {
     assert!(worker.contains("enum WireRuntimeArtifact"));
     assert!(worker.contains("Gguf(WireRuntimeModel)"));
     assert!(worker.contains("OnnxBundle(OnnxModelSpec)"));
-    assert!(worker.contains("OfflineRecognizer::create("));
-    assert!(worker.contains("OnlineRecognizer::create("));
-    assert!(worker.contains("std::env::current_exe()?"));
+    assert!(worker.contains("ASR recognizers are unavailable in the desktop executable"));
+    assert!(worker.contains("resolve_adjacent_inference_worker"));
+    assert!(worker.contains("scribe-inference-worker{}"));
     assert!(worker.contains("INFERENCE_WORKER_FLAG"));
+
+    let inference_server = fs::read_to_string(root.join("src/inference_server.rs"))
+        .expect("worker-only inference server source must be readable");
+    assert!(inference_server.contains("OfflineRecognizer::create("));
+    assert!(inference_server.contains("OnlineRecognizer::create("));
+    assert!(inference_server.contains("use sherpa_onnx"));
+    assert!(!worker.contains("OfflineRecognizer::create("));
+    assert!(!worker.contains("OnlineRecognizer::create("));
 
     let router = fs::read_to_string(root.join("src/runtime_router.rs"))
         .expect("runtime router source must be readable");
@@ -274,9 +282,12 @@ fn static_gguf_and_native_onnx_are_the_only_inference_architectures() {
 
     let manifest =
         fs::read_to_string(root.join("Cargo.toml")).expect("Cargo manifest must be readable");
-    assert!(
-        manifest.contains("transcribe-cpp = { version = \"=0.1.3\", default-features = false }")
-    );
+    assert!(manifest.contains("inference-worker = [\"dep:transcribe-cpp\"]"));
+    assert!(manifest.contains(
+        "transcribe-cpp = { version = \"=0.1.3\", default-features = false, optional = true }"
+    ));
+    assert!(manifest.contains("name = \"scribe-inference-worker\""));
+    assert!(manifest.contains("required-features = [\"inference-worker\"]"));
 }
 
 #[test]
@@ -362,8 +373,12 @@ fn dynamic_whisper_and_standalone_runtime_paths_stay_removed() {
 }
 
 const WORKER_RUNTIME_MARKER: &str = "worker-only native runtime";
-const NATIVE_RUNTIME_OWNER_PATHS: [&str; 3] =
-    ["embedded_runtime.rs", "onnx_worker.rs", "runtime_router.rs"];
+const NATIVE_RUNTIME_OWNER_PATHS: [&str; 4] = [
+    "embedded_runtime.rs",
+    "inference_server.rs",
+    "onnx_worker.rs",
+    "runtime_router.rs",
+];
 
 fn is_native_runtime_owner(path: &Path) -> bool {
     NATIVE_RUNTIME_OWNER_PATHS
@@ -451,10 +466,7 @@ fn native_runtime_ownership_is_confined_to_exact_owner_paths() {
     let sources = rust_sources();
     let worker = sources
         .iter()
-        .find(|(path, source)| {
-            path != Path::new("architecture_guard.rs")
-                && source.contains("pub(crate) fn maybe_run_worker()")
-        })
+        .find(|(path, _)| path == Path::new("onnx_worker.rs"))
         .map(|(_, source)| source.as_str())
         .expect("worker entrypoint exists");
 
@@ -465,6 +477,8 @@ fn native_runtime_ownership_is_confined_to_exact_owner_paths() {
         "--scribe-vad-worker",
         "WorkerRole::Inference",
         "WorkerRole::Vad",
+        "pub(crate) fn maybe_run_vad_worker()",
+        "pub(crate) fn run_inference_worker_with_factory",
         "fn worker_loop_for_role",
         "RuntimeRouter::new()",
         "fn load_worker_runtime",
@@ -586,6 +600,54 @@ fn native_runtime_ownership_is_confined_to_exact_owner_paths() {
         service.contains("let worker = RuntimeWorker::new_process();"),
         "production TranscriptionService must dispatch through the process supervisor"
     );
+
+    let main = sources
+        .iter()
+        .find(|(path, _)| path == Path::new("main.rs"))
+        .map(|(_, source)| production_source(source))
+        .expect("desktop entrypoint exists");
+    assert!(main.contains("onnx_worker::maybe_run_vad_worker()"));
+    assert!(!main.contains("inference_server"));
+    assert!(!main.contains("run_inference_worker_with_factory"));
+
+    let inference_server = sources
+        .iter()
+        .find(|(path, _)| path == Path::new("inference_server.rs"))
+        .map(|(_, source)| production_source(source))
+        .expect("worker-only inference server exists");
+    for required in [
+        "OfflineRecognizer::create(",
+        "OnlineRecognizer::create(",
+        "run_inference_worker_with_factory(&NativeRecognizerFactory)",
+    ] {
+        assert!(
+            inference_server.contains(required),
+            "worker-only inference server must retain {required:?}"
+        );
+    }
+    for forbidden in [
+        "OfflineRecognizer",
+        "OnlineRecognizer",
+        "OfflineRecognizer::create(",
+        "OnlineRecognizer::create(",
+        "NativeRecognizerFactory",
+        "offline_recognizer_config",
+        "online_recognizer_config",
+    ] {
+        assert!(
+            !worker.contains(forbidden),
+            "desktop/VAD worker substrate must not compile ASR server token {forbidden:?}"
+        );
+    }
+
+    let dedicated = sources
+        .iter()
+        .find(|(path, _)| path == Path::new("bin/scribe-inference-worker.rs"))
+        .map(|(_, source)| production_source(source))
+        .expect("dedicated inference entrypoint exists");
+    assert!(dedicated.contains("mod inference_server;"));
+    assert!(dedicated.contains("inference_server::run()"));
+    assert!(!dedicated.contains("maybe_run_vad_worker"));
 }
 
 #[test]
@@ -593,18 +655,44 @@ fn worker_roles_use_private_pipes_and_protocol_only_stdout() {
     let sources = rust_sources();
     let worker = sources
         .iter()
-        .find(|(path, source)| {
-            path != Path::new("architecture_guard.rs")
-                && source.contains("pub(crate) fn maybe_run_worker()")
-        })
+        .find(|(path, _)| path == Path::new("onnx_worker.rs"))
         .map(|(_, source)| production_source(source))
         .expect("worker entrypoint exists");
 
     assert!(worker.contains("PROTOCOL_MAGIC: [u8; 4] = *b\"SCIF\""));
-    assert!(worker.contains("PROTOCOL_VERSION: u8 = 4"));
+    assert!(worker.contains("PROTOCOL_VERSION: u8 = 5"));
+    for bound_capability in [
+        "challenge",
+        "app_build",
+        "worker_build",
+        "bundled_worker_sha256",
+        "abi",
+        "role",
+        "provider",
+        "artifacts",
+    ] {
+        assert!(
+            worker.contains(bound_capability),
+            "SCIF v5 capability must bind {bound_capability}"
+        );
+    }
     assert!(worker.contains("Stdio::piped()"));
     assert!(worker.contains("std::io::stdout().lock()"));
     assert!(worker.contains("stderr(Stdio::inherit())"));
+    for launch_hardening in [
+        "configure_worker_environment(&mut command)",
+        "command.env_clear()",
+        "harden_windows_dll_search",
+        "SetDefaultDllDirectories",
+        "FILE_FLAG_OPEN_REPARSE_POINT",
+        "worker executable must not be a hardlink",
+        "executable.revalidate()",
+    ] {
+        assert!(
+            worker.contains(launch_hardening),
+            "worker launch hardening must retain {launch_hardening}"
+        );
+    }
     assert!(
         !worker
             .lines()
@@ -1228,7 +1316,12 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
     let release = fs::read_to_string(repository.join("scripts").join("build-windows-release.ps1"))
         .expect("Windows release script must be readable");
     for required in [
-        "cargo build --locked --offline --release --features ui-harness --target $targetTriple",
+        "cargo build --locked --offline --release --bin local-transcriber --features ui-harness --target $targetTriple",
+        "cargo build --locked --offline --release --bin scribe-inference-worker --features inference-worker --target $targetTriple",
+        "Get-FileHash -Algorithm SHA256 -LiteralPath $sourceInferenceWorker",
+        "SCRIBE_BUNDLED_WORKER_SHA256",
+        "SCRIBE_BUILDING_WORKER",
+        "scribe-inference-worker.exe",
         "x86_64-pc-windows-msvc",
         "CARGO_TARGET_DIR",
         "[System.IO.Path]::IsPathFullyQualified($env:CARGO_TARGET_DIR)",
@@ -1245,6 +1338,7 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
         "Assert-WindowsGuiSubsystem",
         "Assert-ReviewedWindowsPe",
         "Windows GUI (2)",
+        "Windows console PE",
         "Invoke-NativeProcess",
         "RedirectStandardOutput",
         "WaitForExit",
@@ -1277,10 +1371,73 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
             "Windows release packaging must not enable {forbidden}"
         );
     }
+
+    let vulkan_developer_build = fs::read_to_string(
+        repository
+            .join("scripts")
+            .join("build-vulkan-worker-dev.ps1"),
+    )
+    .expect("Vulkan developer worker build script must be readable");
+    for required in [
+        "--bin scribe-inference-worker --features vulkan-acceleration",
+        "--bin local-transcriber --features ui-harness,vulkan-acceleration",
+        "$env:SCRIBE_BUILDING_WORKER = '1'",
+        "$env:SCRIBE_BUNDLED_WORKER_SHA256 = $null",
+        "vulkan-dev-bundle-",
+        "Copy-Item -LiteralPath $cargoDesktop -Destination $desktop",
+        "Copy-Item -LiteralPath $cargoWorker -Destination $worker",
+    ] {
+        assert!(
+            vulkan_developer_build.contains(required),
+            "Vulkan developer build must retain {required:?}"
+        );
+    }
+    assert!(
+        !vulkan_developer_build.contains("--release"),
+        "the opt-in Vulkan helper must not claim or create a release build"
+    );
     assert!(
         !release.contains(r#"target\release"#),
         "the unqualified Cargo release directory must not be used as a bundle"
     );
+
+    let worker_build = release
+        .find("$env:SCRIBE_BUILDING_WORKER = '1'")
+        .expect("release build marks the worker-only compilation");
+    let worker_cargo = release
+        .find("cargo build --locked --offline --release --bin scribe-inference-worker")
+        .expect("release build compiles the worker first");
+    let worker_marker_clear = release[worker_cargo..]
+        .find("$env:SCRIBE_BUILDING_WORKER = $null")
+        .map(|offset| worker_cargo + offset)
+        .expect("release build clears the worker marker before desktop compilation");
+    let worker_hash = release
+        .find("Get-FileHash -Algorithm SHA256 -LiteralPath $sourceInferenceWorker")
+        .expect("release build hashes the completed worker image");
+    let desktop_cargo = release
+        .find("cargo build --locked --offline --release --bin local-transcriber")
+        .expect("release build compiles the anchored desktop second");
+    assert!(
+        worker_build < worker_cargo
+            && worker_cargo < worker_marker_clear
+            && worker_marker_clear < worker_hash
+            && worker_hash < desktop_cargo,
+        "release builds must clear the digest, mark/build the worker, clear the marker, hash the image, then build the desktop"
+    );
+
+    let build_script = fs::read_to_string(repository.join("build.rs"))
+        .expect("Cargo build script must be readable");
+    for required in [
+        "SCRIBE_BUILDING_WORKER",
+        "release desktop build requires SCRIBE_BUNDLED_WORKER_SHA256",
+        "release worker build must clear SCRIBE_BUNDLED_WORKER_SHA256",
+        "cargo:rustc-env=SCRIBE_BUNDLED_WORKER_SHA256={digest}",
+    ] {
+        assert!(
+            build_script.contains(required),
+            "release trust-anchor build script must retain {required:?}"
+        );
+    }
 
     let release_inputs = fs::read_to_string(
         repository

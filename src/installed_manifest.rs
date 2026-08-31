@@ -251,7 +251,7 @@ pub(crate) fn build_manifest(
                 "legacy-native-package".to_owned()
             },
             version: if package_free {
-                crate::embedded_runtime::TRANSCRIBE_CPP_VERSION.to_owned()
+                crate::runtime_contract::TRANSCRIBE_CPP_VERSION.to_owned()
             } else {
                 "1.9.1".to_owned()
             },

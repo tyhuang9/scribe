@@ -32,17 +32,25 @@ pub use crate::model_catalog::{CompatibilityStatus, ModelDescriptor};
 use crate::models::SttModelInfo;
 #[cfg(test)]
 use crate::onnx_model_bundles::OnnxBundleManifest;
+use crate::onnx_worker::InferenceWorkerRegistry;
+#[cfg(test)]
 use crate::onnx_worker::InferenceWorkerSupervisor;
 use crate::prepared_audio::{PREPARED_SAMPLE_RATE, PreparedAudio};
 use crate::runtime_artifact::{OnnxModelSpec, RuntimeArtifact, RuntimeModel};
+use crate::runtime_contract::{
+    RuntimeError, RuntimeExecution, RuntimeLoadExecution, WARM_MODEL_TTL,
+};
 #[cfg(test)]
 use crate::runtime_router::IdleTimeoutAction;
-use crate::runtime_router::{
-    RuntimeError, RuntimeExecution, RuntimeLoadExecution, RuntimeRouter, WARM_MODEL_TTL,
-};
+#[cfg(test)]
+use crate::runtime_router::RuntimeRouter;
 use crate::streaming::{
     HypothesisWord, PreviewAudioPublisher, PreviewEvent, RollingPreviewSession, StreamIdentity,
     TranscriptHypothesis, TranscriptStabilizer,
+};
+pub use crate::worker_contracts::{
+    AccelerationPreference, ComputeDevice, ModelId, ResolvedAcceleration, RuntimeCapabilities,
+    SpeechEngine, Transcript, TranscriptSegment, TranscriptionOptions,
 };
 
 const INSTALL_SMOKE_TIMEOUT: Duration = Duration::from_secs(120);
@@ -73,131 +81,6 @@ pub struct SessionId(pub u64);
 /// carries the value through its outcome so callers can reject stale work.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
 pub struct RequestId(pub u64);
-
-/// Application-facing acceleration preference.
-///
-/// Concrete accelerator APIs and runtime-specific device names stay below the
-/// service boundary. `Auto` is resolved by the selected runtime's health
-/// check and the resolved choice is returned in diagnostics.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AccelerationPreference {
-    #[default]
-    Auto,
-    Cpu,
-    #[serde(alias = "cuda", alias = "prefer_gpu")]
-    Gpu,
-}
-
-impl AccelerationPreference {
-    #[cfg(test)]
-    pub const ALL: [Self; 3] = [Self::Auto, Self::Gpu, Self::Cpu];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Auto => "Auto",
-            Self::Cpu => "CPU only",
-            Self::Gpu => "GPU",
-        }
-    }
-}
-
-/// Runtime-neutral compute device selected for one request.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum ComputeDevice {
-    Cpu,
-    Gpu { name: String },
-}
-
-impl ComputeDevice {
-    pub fn label(&self) -> &str {
-        match self {
-            Self::Cpu => "CPU",
-            Self::Gpu { name } => name,
-        }
-    }
-}
-
-/// Observable result of resolving an acceleration preference.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ResolvedAcceleration {
-    pub requested: AccelerationPreference,
-    pub resolved: ComputeDevice,
-    /// Explains an automatic fallback or other material resolution decision.
-    pub diagnostic: Option<String>,
-    /// Typed GGUF selection details. Older receipts and CPU-only runtimes omit
-    /// this field and continue to deserialize without migration.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) selection: Option<crate::backend_policy::BackendSelection>,
-}
-
-/// A runtime-neutral reference to a configured model catalog entry.
-#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct ModelId(String);
-
-impl ModelId {
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-
-    pub fn into_inner(self) -> String {
-        self.0
-    }
-}
-
-impl AsRef<str> for ModelId {
-    fn as_ref(&self) -> &str {
-        self.as_str()
-    }
-}
-
-impl fmt::Display for ModelId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl From<String> for ModelId {
-    fn from(value: String) -> Self {
-        Self::new(value)
-    }
-}
-
-impl From<&str> for ModelId {
-    fn from(value: &str) -> Self {
-        Self::new(value)
-    }
-}
-
-/// Normalized final transcript returned by a speech engine.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Transcript {
-    pub text: String,
-    pub segments: Vec<TranscriptSegment>,
-    /// `None` means the selected legacy backend did not report a language.
-    pub detected_language: Option<String>,
-    /// `None` means the selected runtime did not report audio-timeline
-    /// duration. Phase 1 legacy adapters report only decode wall-clock time,
-    /// which is retained separately on [`TranscriptionOutcome`].
-    pub duration_ms: Option<u128>,
-}
-
-/// A portion of a normalized transcript.
-///
-/// Timing and confidence are optional because the current command-line
-/// adapters do not consistently provide them for every configured backend.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct TranscriptSegment {
-    pub text: String,
-    pub start_ms: Option<u64>,
-    pub end_ms: Option<u64>,
-    pub confidence: Option<f32>,
-}
 
 fn transcript_hypothesis(
     identity: StreamIdentity,
@@ -254,20 +137,6 @@ fn transcript_hypothesis(
     }
 }
 
-/// Caller-selected decoding behavior.
-///
-///
-/// Phase 1 represents the options needed by the future common contract, but
-/// the legacy command-line route only accepts its default behavior. The
-/// service rejects an unsupported non-default option instead of ignoring it.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-pub struct TranscriptionOptions {
-    pub language: Option<String>,
-    pub translate_to_english: bool,
-    pub enable_timestamps: bool,
-    pub initial_prompt: Option<String>,
-}
-
 /// Internal rolling-preview policy. It is converted to decoder options only
 /// inside the preview worker, leaving caller-facing final transcription
 /// options and their default behavior unchanged.
@@ -289,24 +158,6 @@ impl PreviewDecodeOptions {
             ..TranscriptionOptions::default()
         }
     }
-}
-
-/// Features that the selected model/backend can currently expose.
-///
-/// `timestamps` means final results may include timestamp metadata; it does
-/// not mean that the Phase 1 legacy bridge can enable timestamps on request.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-pub struct RuntimeCapabilities {
-    pub streaming: bool,
-    pub cancellation: bool,
-    pub translation: bool,
-    pub timestamps: bool,
-    pub language_detection: bool,
-    pub confidence_scores: bool,
-    pub custom_vocabulary: bool,
-    /// Empty until a backend's language support is verified through this
-    /// common contract rather than inferred from catalog prose.
-    pub supported_languages: Vec<String>,
 }
 
 /// A fully staged model artifact that has not yet been activated.
@@ -467,15 +318,6 @@ pub(crate) enum InstallPlan {
 pub struct StreamUpdate {
     pub committed: String,
     pub tentative: String,
-}
-
-/// Common synchronous native-audio speech engine contract.
-pub trait SpeechEngine: Send {
-    fn load(&mut self) -> Result<()>;
-
-    fn capabilities(&self) -> RuntimeCapabilities;
-
-    fn unload(&mut self) -> Result<()>;
 }
 
 /// A prepared-audio request that preserves application correlation IDs.
@@ -663,8 +505,9 @@ struct RuntimeWorkerInner {
     worker: Mutex<Option<std::thread::JoinHandle<()>>>,
     shutdown_gate: Mutex<()>,
     cancellation_generation: Arc<AtomicU64>,
+    #[cfg(test)]
     in_process_router: Option<RuntimeRouter>,
-    inference: Option<InferenceWorkerSupervisor>,
+    inference: Option<InferenceWorkerRegistry>,
 }
 
 impl RuntimeWorker {
@@ -689,7 +532,7 @@ impl RuntimeWorker {
     }
 
     fn new_process() -> Self {
-        let inference = InferenceWorkerSupervisor::unstarted();
+        let inference = InferenceWorkerRegistry::for_current_build();
         let worker_inference = inference.clone();
         let cancellation_generation = Arc::new(AtomicU64::new(0));
         let worker_cancellation = cancellation_generation.clone();
@@ -706,6 +549,7 @@ impl RuntimeWorker {
                 worker: Mutex::new(Some(worker)),
                 shutdown_gate: Mutex::new(()),
                 cancellation_generation,
+                #[cfg(test)]
                 in_process_router: None,
                 inference: Some(inference),
             }),
@@ -714,7 +558,9 @@ impl RuntimeWorker {
 
     #[cfg(test)]
     fn new_process_for_executable(executable: PathBuf) -> Self {
-        let inference = InferenceWorkerSupervisor::unstarted_for_executable(executable);
+        let inference = InferenceWorkerRegistry::with_cpu_supervisor(
+            InferenceWorkerSupervisor::unstarted_for_executable(executable),
+        );
         let worker_inference = inference.clone();
         let cancellation_generation = Arc::new(AtomicU64::new(0));
         let worker_cancellation = cancellation_generation.clone();
@@ -741,6 +587,7 @@ impl RuntimeWorker {
         self.inner
             .cancellation_generation
             .fetch_add(1, Ordering::AcqRel);
+        #[cfg(test)]
         if let Some(router) = &self.inner.in_process_router {
             router.cancel_active();
         }
@@ -840,6 +687,7 @@ impl RuntimeWorker {
 impl RuntimeWorkerInner {
     fn shutdown_and_join(&self, timeout: Duration) -> bool {
         self.cancellation_generation.fetch_add(1, Ordering::AcqRel);
+        #[cfg(test)]
         if let Some(router) = &self.in_process_router {
             router.cancel_active();
         }
@@ -1027,7 +875,7 @@ fn runtime_worker_loop(router: RuntimeRouter, commands: Receiver<RuntimeCommand>
 }
 
 fn inference_worker_dispatch_loop(
-    inference: InferenceWorkerSupervisor,
+    inference: InferenceWorkerRegistry,
     cancellation_generation: Arc<AtomicU64>,
     commands: Receiver<RuntimeCommand>,
 ) {
@@ -1412,13 +1260,12 @@ impl TranscriptionService {
         if config::remote_gguf_artifact(&self.config, model_id.as_str()).is_some()
             || config::imported_gguf_artifact(&self.config, model_id.as_str()).is_some()
         {
-            return Ok(
-                persisted_capabilities.unwrap_or_else(RuntimeRouter::embedded_runtime_capabilities)
-            );
+            return Ok(persisted_capabilities
+                .unwrap_or_else(crate::runtime_contract::embedded_runtime_capabilities));
         }
-        if RuntimeRouter::handles_model_id(model_id) {
+        if crate::runtime_contract::handles_model_id(model_id) {
             let runtime_capabilities = persisted_capabilities
-                .or_else(|| RuntimeRouter::capabilities_for_model(model_id))
+                .or_else(|| crate::runtime_contract::capabilities_for_model(model_id))
                 .ok_or_else(|| anyhow!("runtime router rejected its own selected model"))?;
             let descriptor = model_descriptor(model_id)
                 .ok_or_else(|| anyhow!("unknown normalized transcription model: {model_id}"))?;
@@ -1835,7 +1682,7 @@ impl TranscriptionService {
         model_id: ModelId,
         model_path: Option<PathBuf>,
     ) -> Result<(PreviewAudioPublisher, RollingPreviewHandle)> {
-        if !RuntimeRouter::handles_model_id(&model_id)
+        if !crate::runtime_contract::handles_model_id(&model_id)
             && config::remote_gguf_artifact(&self.config, model_id.as_str()).is_none()
             && config::imported_gguf_artifact(&self.config, model_id.as_str()).is_none()
         {
@@ -1911,7 +1758,7 @@ impl TranscriptionService {
                 "rolling preview was cancelled before native dispatch"
             ));
         }
-        if !RuntimeRouter::handles_model_id(&request.model_id)
+        if !crate::runtime_contract::handles_model_id(&request.model_id)
             && config::remote_gguf_artifact(&self.config, request.model_id.as_str()).is_none()
             && config::imported_gguf_artifact(&self.config, request.model_id.as_str()).is_none()
         {
@@ -1988,7 +1835,7 @@ impl TranscriptionService {
                 .map_err(|error| anyhow!(error))?;
             return Ok(map_native_execution(request, model, execution));
         }
-        if RuntimeRouter::handles_model_id(&request.model_id)
+        if crate::runtime_contract::handles_model_id(&request.model_id)
             || config::remote_gguf_artifact(&self.config, request.model_id.as_str()).is_some()
             || config::imported_gguf_artifact(&self.config, request.model_id.as_str()).is_some()
         {

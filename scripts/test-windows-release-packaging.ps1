@@ -139,14 +139,24 @@ function Assert-OrderedWorkflowTokens(
 }
 
 function Assert-ReleaseCargoFeatureContract([string]$ReleaseSource) {
-    $expectedBuild = '& cargo build --locked --offline --release --features ui-harness --target $targetTriple --manifest-path (Join-Path $repositoryRoot "Cargo.toml")'
+    $expectedDesktopBuild = '& cargo build --locked --offline --release --bin local-transcriber --features ui-harness --target $targetTriple --manifest-path (Join-Path $repositoryRoot "Cargo.toml")'
+    $expectedWorkerBuild = '& cargo build --locked --offline --release --bin scribe-inference-worker --features inference-worker --target $targetTriple --manifest-path (Join-Path $repositoryRoot "Cargo.toml")'
     $cargoBuilds = @([regex]::Matches($ReleaseSource, '(?m)^\s*& cargo build\b'))
-    if ($cargoBuilds.Count -ne 1 -or
-        -not $ReleaseSource.Contains($expectedBuild) -or
+    if ($cargoBuilds.Count -ne 2 -or
+        -not $ReleaseSource.Contains($expectedDesktopBuild) -or
+        -not $ReleaseSource.Contains($expectedWorkerBuild) -or
         $ReleaseSource.Contains('--all-features') -or
         $ReleaseSource.Contains('vulkan-acceleration')) {
-        throw 'Windows release packaging must preserve the pre-Vulkan ui-harness feature set without enabling every Cargo feature.'
+        throw 'Windows release packaging must build the desktop and CPU inference worker independently without enabling GPU or every Cargo feature.'
     }
+    Assert-OrderedWorkflowTokens $ReleaseSource @(
+        '$env:SCRIBE_BUNDLED_WORKER_SHA256 = $null',
+        '$env:SCRIBE_BUILDING_WORKER = ''1''',
+        $expectedWorkerBuild,
+        '$env:SCRIBE_BUILDING_WORKER = $null',
+        '$env:SCRIBE_BUNDLED_WORKER_SHA256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $sourceInferenceWorker)',
+        $expectedDesktopBuild
+    ) 'bundled worker trust-anchor build order'
 }
 
 function Assert-VulkanSdkWorkflowContract([string]$Workflow) {
@@ -1171,6 +1181,7 @@ Set-StrictMode -Version Latest
         New-Item -ItemType Directory -Path (Split-Path -Parent $path) -Force | Out-Null
         switch ($relativePath) {
             "local-transcriber.exe" { Write-TestPe $path 0x8664 }
+            "scribe-inference-worker.exe" { Write-TestPe $path 0x8664 "kernel32.dll" "user32.dll" 3 }
             "whisper-base.en-Q8_0.gguf" { [System.IO.File]::WriteAllBytes($path, $fixtureModelBytes) }
             "bundled-model-manifest.json" { Copy-Item -LiteralPath $fixtureManifestSource -Destination $path }
             default {

@@ -1,6 +1,7 @@
 use std::fs;
 #[cfg(all(windows, feature = "vulkan-acceleration"))]
 use std::path::PathBuf;
+use std::process::Command;
 
 use sha2::{Digest, Sha256};
 
@@ -9,6 +10,8 @@ const SILERO_VAD_SIZE: usize = 212_860;
 const SILERO_VAD_SHA256: &str = "c36d490aff5ab924ca6c7aeec4d8f6bd3d22db6fa17611b9c5b17eae58ac3a20";
 
 fn main() {
+    emit_build_revision();
+    emit_bundled_worker_trust_anchor();
     require_windows_static_crt();
     #[cfg(all(windows, feature = "vulkan-acceleration"))]
     prepare_windows_vulkan_import_library();
@@ -30,6 +33,75 @@ fn main() {
     if matches!(target_os.as_str(), "linux" | "android") {
         println!("cargo:rustc-link-lib=dl");
     }
+}
+
+fn emit_bundled_worker_trust_anchor() {
+    println!("cargo:rerun-if-env-changed=SCRIBE_BUNDLED_WORKER_SHA256");
+    println!("cargo:rerun-if-env-changed=SCRIBE_BUILDING_WORKER");
+    let profile = std::env::var("PROFILE").unwrap_or_default();
+    let building_worker = std::env::var("SCRIBE_BUILDING_WORKER").ok();
+    if building_worker.as_deref().is_some_and(|value| value != "1") {
+        panic!("SCRIBE_BUILDING_WORKER, when present, must equal 1");
+    }
+    let digest = std::env::var("SCRIBE_BUNDLED_WORKER_SHA256").ok();
+    if building_worker.as_deref() == Some("1") {
+        assert!(
+            digest.is_none(),
+            "release worker build must clear SCRIBE_BUNDLED_WORKER_SHA256 before compilation"
+        );
+        return;
+    }
+    if profile == "release" && digest.is_none() {
+        panic!(
+            "release desktop build requires SCRIBE_BUNDLED_WORKER_SHA256 from the exact previously built worker"
+        );
+    }
+    let Some(digest) = digest else {
+        println!("cargo:warning=development desktop build has no bundled-worker SHA-256 anchor");
+        return;
+    };
+    assert!(
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')),
+        "SCRIBE_BUNDLED_WORKER_SHA256 must be a lowercase SHA-256 digest"
+    );
+    println!("cargo:rustc-env=SCRIBE_BUNDLED_WORKER_SHA256={digest}");
+}
+
+fn emit_build_revision() {
+    println!("cargo:rerun-if-env-changed=SCRIBE_BUILD_REVISION");
+    println!("cargo:rerun-if-changed=.git/HEAD");
+    let revision = std::env::var("SCRIBE_BUILD_REVISION")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            Command::new("git")
+                .args(["rev-parse", "--verify", "HEAD"])
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .and_then(|output| String::from_utf8(output.stdout).ok())
+                .map(|value| value.trim().to_owned())
+        })
+        .unwrap_or_else(|| {
+            let mut digest = Sha256::new();
+            for path in [
+                "Cargo.lock",
+                "build.rs",
+                "src/onnx_worker.rs",
+                "src/worker_contracts.rs",
+            ] {
+                digest.update(fs::read(path).unwrap_or_default());
+            }
+            format!("source-{:x}", digest.finalize())
+        });
+    assert!(
+        revision.len() >= 12 && revision.len() <= 96 && revision.is_ascii(),
+        "SCRIBE_BUILD_REVISION must be a 12-96 character ASCII build identity"
+    );
+    println!("cargo:rustc-env=SCRIBE_BUILD_REVISION={revision}");
 }
 
 #[cfg(all(windows, feature = "vulkan-acceleration"))]

@@ -745,6 +745,7 @@ begin
     SameStr(RelativePath, 'bundle-inventory.json') or
     SameStr(RelativePath, 'bundled-model-manifest.json') or
     SameStr(RelativePath, 'local-transcriber.exe') or
+    SameStr(RelativePath, 'scribe-inference-worker.exe') or
     SameStr(RelativePath, 'README.txt') or
     SameStr(RelativePath, 'whisper-base.en-Q8_0.gguf') or
     SameStr(RelativePath, 'licenses\Apache-2.0.txt') or

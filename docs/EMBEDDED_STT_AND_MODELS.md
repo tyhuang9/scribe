@@ -11,12 +11,16 @@
 
 ## Current architecture and catalog
 
-Normal GGUF inference and receipt-backed ONNX inference both run in the private
-persistent `--scribe-inference-worker` child over private SCIF v3 stdin/stdout
-pipes. GGUF uses the statically linked native `transcribe-cpp` CPU backend;
-receipt-backed ONNX bundles use native Sherpa ONNX in that same child. VAD has
-its own `--scribe-vad-worker` production process and is not an STT runtime.
-The desktop process does not construct model objects or recognizers.
+Normal GGUF inference and receipt-backed ONNX inference both run in the private,
+adjacent `scribe-inference-worker` executable over private SCIF v5 stdin/stdout
+pipes. The capability handshake binds a fresh process-generation challenge,
+immutable application and role-specific worker build revisions, the bundled
+worker SHA-256, runtime ABI, role, provider, and artifact
+targets. GGUF uses the statically linked native `transcribe-cpp` CPU backend;
+receipt-backed ONNX bundles use native Sherpa ONNX in that same worker. VAD has
+its own same-desktop-executable `--scribe-vad-worker` production process and is
+not an STT runtime. The desktop process does not construct GGUF or ASR ONNX
+model objects or recognizers.
 
 There is no Python runtime, localhost service, dynamic runtime package,
 GGML/DLL route, or CLI fallback in the production inference path. The normal
@@ -83,7 +87,7 @@ TranscriptionService (runtime-neutral API)
         v
 InferenceWorkerSupervisor -> one persistent hidden STT child
         |                    `--scribe-inference-worker`
-        |                    (private SCIF v3 stdin/stdout pipes)
+        |                    (private SCIF v5 stdin/stdout pipes)
         v
 worker-local RuntimeRouter
         |
@@ -105,7 +109,7 @@ final Transcript -> overlay/history/output (only finalized text can paste)
 
 **Historical snapshot:** `src/transcription.rs` owns the application-facing `TranscriptionService`, `SpeechEngine`, optional `StreamingSpeechEngine`, `SpeechStream`, normalized `Transcript`, `TranscriptionOptions`, `RuntimeCapabilities`, acceleration preference, and session/request correlation types. In production, `TranscriptionService` owns the process supervisor and no native model/session/recognizer or FFI handle. The architecture-guard tests prevent UI/application modules from naming `RuntimeRouter`, `TranscribeCppRuntime`, or model-family terms, and fail if native construction escapes the marked worker-runtime modules.
 
-**Historical snapshot:** the persistent `--scribe-inference-worker` child is the only production owner of the worker-local router and native runtime state. It directly owns the GGUF `EmbeddedRuntime`, legacy GGML `TranscribeCppRuntime`, and sherpa-onnx recognizers. The separate `--scribe-vad-worker` instance owns VAD state and accepts only VAD controls. The supervisor uses framed SCIF v3 messages over private anonymous stdin/stdout pipes; it does not use localhost, HTTP, or another network transport. Native model/session/recognizer construction is limited to marked child-runtime modules.
+**Current worker boundary:** the persistent adjacent `scribe-inference-worker --scribe-inference-worker` child is the only production owner of the worker-local router and native STT runtime state. It directly owns the GGUF `EmbeddedRuntime`, legacy GGML `TranscribeCppRuntime`, and sherpa-onnx recognizers. The separate `local-transcriber --scribe-vad-worker` instance owns VAD state and accepts only VAD controls. The supervisor uses framed SCIF v5 messages over private anonymous stdin/stdout pipes; it does not use localhost, HTTP, or another network transport. Native model/session/recognizer construction is limited to marked child-runtime modules.
 
 **Historical snapshot:** the STT worker retains a loaded model for five minutes of inactivity (`WARM_MODEL_TTL`), unloads after that timeout, on an explicit unload, or at shutdown, and can be invalidated/restarted when cancellation or a native failure requires process recovery. A failed native decode discards the child-owned context so the next request cannot be falsely reported as warm. Normal GGUF remains local/native/Python-free, but it is process-isolated rather than in-process.
 
@@ -125,7 +129,7 @@ The distinction below is deliberate and must remain explicit in later reports.
 | `--scribe-install-smoke` child mode | Fresh disposable health/load/decode/unload/reload validation before activation | **No** | This process is intentionally separate from the persistent dictation worker and is discarded after the smoke. |
 | Local HTTP listeners | Test fixtures only | **No** | Loopback listeners in `src/installations.rs` are behind `#[cfg(test)]`; source inspection found no production STT listener, localhost setting, or health-polling client. |
 
-**Current default-path statement:** fresh Windows x64 profiles select the release-bundled `whisper_cpp_base_en` GGUF model and transcribe through the safe Rust-owned adapter in the persistent `--scribe-inference-worker` child. Existing explicit selections are preserved. Scribe does not install or start a runtime package, Python, or localhost server for this GGUF route; the same executable is launched as the private worker process. Retained GGML models use the compatibility native package in that child. The verified legacy CLI remains an exceptional fallback after native bootstrap failure and hash verification; other legacy process bridges remain non-default migration debt.
+**Current default-path statement:** fresh Windows x64 profiles select the release-bundled `whisper_cpp_base_en` GGUF model and transcribe through the safe Rust-owned adapter in the adjacent `scribe-inference-worker` child. Existing explicit selections are preserved. Scribe does not install or start a runtime package, Python, or localhost server for this GGUF route. Retained GGML models use the compatibility native package in that child. The verified legacy CLI remains an exceptional fallback after native bootstrap failure and hash verification; other legacy process bridges remain non-default migration debt.
 
 `README.md` still uses the phrase “bundled sidecar” in one requirements sentence. That wording should be corrected in a separate documentation-consistency change; it does not change the private worker boundary described here.
 
@@ -134,7 +138,7 @@ The distinction below is deliberate and must remain explicit in later reports.
 - The desktop process owns UI/session coordination, microphone capture, bounded audio preparation, output, history, and the supervisor. It does not construct native GGUF/GGML/sherpa model objects, sessions, recognizers, or native FFI handles.
 - One persistent `--scribe-inference-worker` child directly owns the STT router and the GGUF, legacy GGML, and sherpa-onnx runtime state. It must not spawn a nested ONNX worker.
 - VAD uses a separate `--scribe-vad-worker` instance and role. VAD controls and STT controls are rejected across that role boundary.
-- STT and VAD use private anonymous stdin/stdout pipes with SCIF v3 framing. stdout carries protocol frames only; diagnostics use stderr. There is no localhost or network inference transport.
+- STT and VAD use private anonymous stdin/stdout pipes with SCIF v5 framing. Hello is required exactly once before all other commands. stdout carries protocol frames only; diagnostics use stderr. There is no localhost or network inference transport.
 - `--scribe-install-smoke` is a disposable validation process. It is not the persistent dictation worker and its success does not establish desktop-process native ownership.
 
 ## Runtime implementation and platform constraints
@@ -154,7 +158,7 @@ The distinction below is deliberate and must remain explicit in later reports.
 
 | Target | Current package behavior | Current status |
 | --- | --- | --- |
-| Windows x86_64 | One pinned whisper.cpp v1.9.1 CPU compatibility package plus the pinned base.en Q8_0 GGUF beside the executable. `Auto` and `Cpu` resolve to CPU; `Gpu` returns a structured unsupported-GPU error. `build-windows-release.ps1` performs a locked, offline target-triple build, validates AMD64 PE inputs, stages an explicit allowlist in a unique sibling transaction directory, runs the GGUF smoke offline, writes a hash inventory, and only then atomically publishes `artifacts/Scribe-windows-x64`. | **Source/manifests and packaging enforcement are implemented; physical packaged desktop acceptance remains required.** |
+| Windows x86_64 | The desktop and adjacent dedicated CPU inference worker are built independently and packaged with the pinned base.en Q8_0 GGUF. `Auto` and `Cpu` resolve to CPU; `Gpu` returns a structured unsupported-GPU error without CPU fallback. `build-windows-release.ps1` performs locked, offline target-triple builds, validates both AMD64 PE inputs, stages an explicit allowlist in a unique sibling transaction directory, runs the GGUF smoke through the worker offline, writes a hash inventory, and only then atomically publishes `artifacts/Scribe-windows-x64`. | **Source/manifests and packaging enforcement are implemented; physical packaged desktop acceptance remains required.** |
 | macOS | No pinned primary package in the checked-in manifest. No Metal package is verified. | **Unavailable / unverified; do not claim CPU or Metal release support.** |
 | Linux | No pinned primary package in the checked-in manifest. No Vulkan or other GPU package is verified. | **Unavailable / unverified; do not claim CPU or GPU release support.** |
 
