@@ -9,8 +9,48 @@ foreach ($value in @('native:0000:01:00.8', 'native:0000:01:00.0 ', 'uuid:secret
     try { $null = ConvertTo-ScribeVulkanEvidencePci $value; $accepted = $true } catch {}
     if ($accepted) { throw "Malformed PCI identity was accepted: $value" }
 }
+$knownCmakeFailure = @(
+    'error: failed to run custom build command for `transcribe-cpp-sys v0.1.3 (C:\\safe\\crate)`',
+    '  Error: failed to execute command: cmake -S C:\\safe\\source',
+    '  The directory name is invalid. (os error 267)'
+)
+if (-not (Test-ScribeEvidenceKnownCmakeBootstrapFailure $knownCmakeFailure)) { throw 'Known bounded CMake failure was not classified.' }
+foreach ($malformedCmakeFailure in @(
+    @('transcribe-cpp-sys v0.1.3', 'failed to execute command:', 'The directory name is invalid. (os error 267)'),
+    @('error: failed to run custom build command for `transcribe-cpp-sys v0.1.4 (C:\\safe\\crate)`', '  Error: failed to execute command: cmake', '  The directory name is invalid. (os error 267)'),
+    @('error: failed to run custom build command for `transcribe-cpp-sys v0.1.3 (C:\\safe\\crate)`', '  Error: failed to execute command: cmake', '  access denied'),
+    @('  The directory name is invalid. (os error 267)', '  Error: failed to execute command: cmake', 'error: failed to run custom build command for `transcribe-cpp-sys v0.1.3 (C:\\safe\\crate)`')
+)) {
+    if (Test-ScribeEvidenceKnownCmakeBootstrapFailure $malformedCmakeFailure) { throw 'Malformed CMake failure was classified.' }
+}
+$sanitizedClassifierResult = Test-ScribeEvidenceKnownCmakeBootstrapFailure @('secret-token', 'unrelated failure')
+if ($sanitizedClassifierResult -isnot [bool] -or $sanitizedClassifierResult) { throw 'CMake classifier exposed or accepted unrelated output.' }
+$overlongCmakeFailure = [System.Collections.Generic.List[object]]::new()
+foreach ($unused in 1..64) { $overlongCmakeFailure.Add('noise') }
+foreach ($line in $knownCmakeFailure) { $overlongCmakeFailure.Add($line) }
+if (Test-ScribeEvidenceKnownCmakeBootstrapFailure -Output $overlongCmakeFailure.ToArray()) { throw 'Unbounded CMake output was classified outside the bounded window.' }
+$topologyRoot = Join-Path ([IO.Path]::GetTempPath()) ("scribe-evidence-topology-$([guid]::NewGuid().ToString('N'))")
+try {
+    $buildDirectory = Join-Path $topologyRoot 'cargo\\debug\\build\\transcribe-cpp-sys-0123456789abcdef\\out\\build'
+    $outsideDirectory = Join-Path $topologyRoot 'outside'
+    New-Item -ItemType Directory -Path $buildDirectory -Force | Out-Null
+    New-Item -ItemType Directory -Path $outsideDirectory -Force | Out-Null
+    $sentinel = Join-Path $outsideDirectory 'must-not-delete.txt'
+    [IO.File]::WriteAllText($sentinel, 'sentinel')
+    New-Item -ItemType Junction -Path (Join-Path $buildDirectory 'escaped') -Target $outsideDirectory | Out-Null
+    $rejected = $false
+    try { Assert-ScribeEvidenceNoReparseDescendants $buildDirectory } catch { $rejected = $true }
+    if (-not $rejected) { throw 'CMake deletion topology accepted a descendant junction.' }
+    if (-not (Test-Path -LiteralPath $sentinel -PathType Leaf)) { throw 'CMake topology validation deleted outside-scope data.' }
+    $regularFileRejected = $false
+    try { $null = Get-ScribeEvidencePhysicalDirectory $sentinel 'test file' } catch { $regularFileRejected = $true }
+    if (-not $regularFileRejected) { throw 'CMake topology validation accepted a regular file as a directory.' }
+}
+finally {
+    if (Test-Path -LiteralPath $topologyRoot) { Remove-Item -LiteralPath $topologyRoot -Recurse -Force }
+}
 $runner = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'run-windows-vulkan-evidence.ps1') -Raw
-foreach ($required in @('--locked', '--offline', '-SigningMode Fixture', '--ignored', '--exact', '--test-threads=1', '--no-run', 'Invoke-ScribeEvidenceCargoWithCmakeRetry', 'Enable-ScribeEvidenceCmakeBootstrap', 'transcribe-cpp-sys-[0-9a-f]{16}', 'The directory name is invalid. (os error 267)', 'onnx_worker::tests::windows_vulkan_fixture_evidence_captures_five_cold_and_twenty_warm_runs', 'gpu-auto-qualification-windows-x64.json', 'Production signing/release input is forbidden', 'Resolve-ScribeEvidenceFreshDirectory', 'Evidence output may not be under source')) {
+foreach ($required in @('--locked', '--offline', '-SigningMode Fixture', '--ignored', '--exact', '--test-threads=1', '--no-run', 'Invoke-ScribeEvidenceCargoWithCmakeRetry', 'Enable-ScribeEvidenceCmakeBootstrap', 'Assert-ScribeEvidenceNoReparseDescendants', 'transcribe-cpp-sys-[0-9a-f]{16}', 'onnx_worker::tests::windows_vulkan_fixture_evidence_captures_five_cold_and_twenty_warm_runs', 'gpu-auto-qualification-windows-x64.json', 'Production signing/release input is forbidden', 'Resolve-ScribeEvidenceFreshDirectory', 'Evidence output may not be under source')) {
     if ($runner -notmatch [regex]::Escape($required)) { throw "Runner is missing required source contract: $required" }
 }
 foreach ($required in @('Get-FileHash -LiteralPath $model', 'Get-FileHash -LiteralPath $wav', 'Test-ScribeEvidenceActivationPath', 'Test-ScribeEvidenceWithin', 'New-ScribeEvidenceShortCargoTarget', 'Assert-ScribeEvidenceSingleLinkFile', 'Get-ScribeVulkanEvidenceActualSystem32', 'fsutil.exe', 'manifest.json', 'Fixture pack build identity is not bound', 'fixture-evidence-$($revision.Substring(0, 12))-$([guid]::NewGuid()', 'Fixture-only untrusted Vulkan evidence', 'previousEvidenceEnvironment')) {
@@ -20,6 +60,7 @@ $compileAt = $runner.IndexOf("'--no-run'")
 $baselineAt = $runner.IndexOf('Get-ScribeVulkanEvidenceNvidiaBaseline')
 if ($compileAt -lt 0 -or $baselineAt -lt 0 -or $compileAt -ge $baselineAt) { throw 'Runner must precompile before NVIDIA baseline capture.' }
 if ($runner -match 'SigningMode Production|ProductionPrivateKeyPath|ProductionKeyId') { throw 'Fixture runner references a production signing input.' }
+if ($runner -match '\$detail\s*=\s*\(\$first\s*\|\s*Out-String\)|throw\s+"\$Failure\s+\$detail"') { throw 'Runner can throw raw Cargo child output.' }
 $preflight = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'windows-vulkan-evidence-preflight.ps1') -Raw
 foreach ($required in @('GetSystemDirectory', 'nvidia-smi.exe', 'matching.Count -ne 1', '$utilization -gt 10', '$usedMib -gt ($totalMib / 4)', 'pci.bus_id')) {
     if ($preflight -notmatch [regex]::Escape($required)) { throw "Preflight is missing required source contract: $required" }

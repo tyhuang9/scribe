@@ -72,24 +72,6 @@ function New-ScribeEvidenceShortCargoTarget([string]$Label) {
     return $target
 }
 
-function Assert-ScribeEvidenceNoReparse([string]$Path) {
-    $current = Resolve-ScribeEvidencePath $Path
-    while (-not (Test-Path -LiteralPath $current)) {
-        $parent = Split-Path -Parent $current
-        if (-not $parent -or $parent -eq $current) { throw "Could not find an existing ancestor for $Path" }
-        $current = $parent
-    }
-    while ($current) {
-        $item = Get-Item -LiteralPath $current -Force
-        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-            throw "Evidence path crosses a reparse point: $current"
-        }
-        $parent = Split-Path -Parent $current
-        if (-not $parent -or $parent -eq $current) { break }
-        $current = $parent
-    }
-}
-
 function Assert-ScribeEvidenceFile([string]$Path, [string]$Label, [UInt64]$MaxBytes) {
     $full = Resolve-ScribeEvidencePath $Path
     Assert-ScribeEvidenceNoReparse $full
@@ -114,7 +96,15 @@ function Invoke-ScribeEvidence([string]$Exe, [string[]]$Arguments, [string]$Fail
 }
 
 function Enable-ScribeEvidenceCmakeBootstrap([string]$CargoTarget, [string]$BuildEnvironment) {
+    $cargoTargetItem = Get-ScribeEvidencePhysicalDirectory $CargoTarget 'CMake bootstrap Cargo target'
+    $buildEnvironmentItem = Get-ScribeEvidencePhysicalDirectory $BuildEnvironment 'CMake bootstrap build environment'
+    $canonicalCargoTarget = $cargoTargetItem.FullName.TrimEnd([char[]]@('\', '/'))
+    $canonicalBuildEnvironment = $buildEnvironmentItem.FullName.TrimEnd([char[]]@('\', '/'))
     $tcs = Join-Path $BuildEnvironment 'tcs'
+    $tcsItem = Get-ScribeEvidencePhysicalDirectory $tcs 'CMake bootstrap tcs inventory'
+    if ((Split-Path -Parent $tcsItem.FullName) -cne $canonicalBuildEnvironment) {
+        throw 'CMake bootstrap tcs inventory escaped the exact build environment.'
+    }
     $entries = @(Get-ChildItem -LiteralPath $tcs -Force)
     if ($entries.Count -ne 1) { throw 'CMake bootstrap tcs inventory is not exact.' }
     $outLink = $entries[0]
@@ -122,13 +112,13 @@ function Enable-ScribeEvidenceCmakeBootstrap([string]$CargoTarget, [string]$Buil
         throw 'CMake bootstrap out directory is not one exact junction.'
     }
     $out = (Get-Item -LiteralPath @($outLink.Target)[0] -Force).FullName
-    $relative = [IO.Path]::GetRelativePath($CargoTarget, $out).Replace('\', '/')
+    $relative = [IO.Path]::GetRelativePath($canonicalCargoTarget, $out).Replace('\', '/')
     if ($relative -cnotmatch '^(debug|release)/build/transcribe-cpp-sys-[0-9a-f]{16}/out$') {
         throw 'CMake bootstrap out junction escaped the exact Cargo target.'
     }
-    $outItem = Get-Item -LiteralPath $out -Force
-    if (-not $outItem.PSIsContainer -or ($outItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-        throw 'CMake bootstrap out target is not a physical directory.'
+    $outItem = Get-ScribeEvidencePhysicalDirectory $out 'CMake bootstrap out target'
+    if (-not (Test-ScribeEvidenceWithin $outItem.FullName $canonicalCargoTarget)) {
+        throw 'CMake bootstrap out target is outside the exact Cargo target.'
     }
     $build = Join-Path $out 'build'
     if (Test-Path -LiteralPath $build) {
@@ -136,6 +126,27 @@ function Enable-ScribeEvidenceCmakeBootstrap([string]$CargoTarget, [string]$Buil
         if (-not $buildItem.PSIsContainer -or ($buildItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or (Split-Path -Parent $buildItem.FullName) -cne $out) {
             throw 'Refusing to replace an unexpected CMake build directory.'
         }
+        # Revalidate all mutable topology immediately before this only permitted deletion.
+        $currentCargoTarget = Get-ScribeEvidencePhysicalDirectory $CargoTarget 'CMake bootstrap Cargo target'
+        $currentBuildEnvironment = Get-ScribeEvidencePhysicalDirectory $BuildEnvironment 'CMake bootstrap build environment'
+        $currentTcs = Get-ScribeEvidencePhysicalDirectory $tcs 'CMake bootstrap tcs inventory'
+        $currentOut = Get-ScribeEvidencePhysicalDirectory $out 'CMake bootstrap out target'
+        if ($currentCargoTarget.FullName -cne $canonicalCargoTarget -or
+            $currentBuildEnvironment.FullName -cne $canonicalBuildEnvironment -or
+            (Split-Path -Parent $currentTcs.FullName) -cne $canonicalBuildEnvironment -or
+            $currentOut.FullName -cne $outItem.FullName -or
+            -not (Test-ScribeEvidenceWithin $currentOut.FullName $canonicalCargoTarget)) {
+            throw 'CMake bootstrap topology changed before mutation.'
+        }
+        $currentOutLink = Get-Item -LiteralPath $outLink.FullName -Force
+        if (($currentOutLink.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0 -or @($currentOutLink.Target).Count -ne 1 -or (Get-Item -LiteralPath @($currentOutLink.Target)[0] -Force).FullName -cne $outItem.FullName) {
+            throw 'CMake bootstrap out junction changed before mutation.'
+        }
+        $currentBuild = Get-Item -LiteralPath $build -Force
+        if (($currentBuild.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or -not $currentBuild.PSIsContainer -or (Split-Path -Parent $currentBuild.FullName) -cne $outItem.FullName) {
+            throw 'CMake bootstrap build topology changed before mutation.'
+        }
+        Assert-ScribeEvidenceNoReparseDescendants $currentBuild.FullName
         Remove-Item -LiteralPath $build -Recurse -Force
     }
     $native = Join-Path $BuildEnvironment 'native'
@@ -151,9 +162,8 @@ function Enable-ScribeEvidenceCmakeBootstrap([string]$CargoTarget, [string]$Buil
 function Invoke-ScribeEvidenceCargoWithCmakeRetry([string[]]$Arguments, [string]$Failure, [string]$CargoTarget, [string]$BuildEnvironment) {
     $first = & $cargo @Arguments 2>&1
     if ($LASTEXITCODE -eq 0) { return }
-    $detail = ($first | Out-String)
-    if (-not ($detail.Contains('transcribe-cpp-sys') -and ($detail.Contains('The directory name is invalid. (os error 267)') -or $detail.Contains('Could not open file for write in copy operation')))) {
-        throw "$Failure $detail"
+    if (-not (Test-ScribeEvidenceKnownCmakeBootstrapFailure $first)) {
+        throw $Failure
     }
     Enable-ScribeEvidenceCmakeBootstrap $CargoTarget $BuildEnvironment
     & $cargo @Arguments

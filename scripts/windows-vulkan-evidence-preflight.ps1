@@ -1,5 +1,47 @@
 Set-StrictMode -Version Latest
 
+function Assert-ScribeEvidenceNoReparse([string]$Path) {
+    $current = [IO.Path]::GetFullPath($Path).TrimEnd([char[]]@('\', '/'))
+    while (-not (Test-Path -LiteralPath $current)) {
+        $parent = Split-Path -Parent $current
+        if (-not $parent -or $parent -eq $current) { throw 'Could not find an existing non-reparse ancestor.' }
+        $current = $parent
+    }
+    while ($current) {
+        $item = Get-Item -LiteralPath $current -Force
+        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw 'Evidence path crosses a reparse point.'
+        }
+        $parent = Split-Path -Parent $current
+        if (-not $parent -or $parent -eq $current) { break }
+        $current = $parent
+    }
+}
+
+function Get-ScribeEvidencePhysicalDirectory([string]$Path, [string]$Label) {
+    Assert-ScribeEvidenceNoReparse $Path
+    $item = Get-Item -LiteralPath $Path -Force
+    if (-not $item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "$Label must be a physical non-reparse directory."
+    }
+    return $item
+}
+
+function Assert-ScribeEvidenceNoReparseDescendants([string]$Path) {
+    $root = Get-ScribeEvidencePhysicalDirectory $Path 'CMake bootstrap build directory'
+    $pending = [System.Collections.Generic.Stack[IO.DirectoryInfo]]::new()
+    $pending.Push($root)
+    while ($pending.Count -gt 0) {
+        $directory = $pending.Pop()
+        foreach ($entry in $directory.EnumerateFileSystemInfos()) {
+            if (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw 'CMake bootstrap build directory contains a reparse point.'
+            }
+            if ($entry -is [IO.DirectoryInfo]) { $pending.Push($entry) }
+        }
+    }
+}
+
 if (-not ('ScribeEvidenceNative.SystemDirectory' -as [type])) {
     Add-Type -TypeDefinition @'
 using System;
@@ -62,6 +104,27 @@ function Assert-ScribeVulkanEvidenceTrustedNvidiaSmi([string]$Path) {
         throw 'Required trusted nvidia-smi.exe must be a regular non-reparse file.'
     }
     return $item.FullName
+}
+
+function Test-ScribeEvidenceKnownCmakeBootstrapFailure([object[]]$Output) {
+    $lines = [System.Collections.Generic.List[string]]::new()
+    foreach ($entry in @($Output)) {
+        if ($lines.Count -ge 64) { break }
+        $line = [string]$entry
+        if ($line.Length -gt 1024) { $line = $line.Substring(0, 1024) }
+        $lines.Add($line)
+    }
+
+    $crateLine = [regex]::new('^error: failed to run custom build command for `transcribe-cpp-sys v0\.1\.3(?: .*)?$', [Text.RegularExpressions.RegexOptions]::CultureInvariant)
+    $commandLine = [regex]::new('^\s*Error: failed to execute command: .+$', [Text.RegularExpressions.RegexOptions]::CultureInvariant)
+    $osErrorLine = [regex]::new('^\s*The directory name is invalid\. \(os error 267\)\s*$', [Text.RegularExpressions.RegexOptions]::CultureInvariant)
+    $state = 0
+    foreach ($line in $lines) {
+        if ($state -eq 0 -and $crateLine.IsMatch($line)) { $state = 1; continue }
+        if ($state -eq 1 -and $commandLine.IsMatch($line)) { $state = 2; continue }
+        if ($state -eq 2 -and $osErrorLine.IsMatch($line)) { return $true }
+    }
+    return $false
 }
 
 function Get-ScribeVulkanEvidenceNvidiaBaseline([string]$ExpectedStableDevice, [string]$NvidiaSmiPath) {
