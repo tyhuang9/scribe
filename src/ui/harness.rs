@@ -1834,6 +1834,24 @@ mod tests {
         );
     }
 
+    fn assert_focus_ring_at(output: &egui::FullOutput, name: &str) {
+        let bounds = named_node_bounds(output, name);
+        let center = egui::pos2(
+            ((bounds.x0 + bounds.x1) / 2.0) as f32,
+            ((bounds.y0 + bounds.y1) / 2.0) as f32,
+        );
+        for width in [3.0, 1.0] {
+            assert!(
+                output.shapes.iter().any(|shape| matches!(
+                    shape.shape,
+                    egui::epaint::Shape::Rect(rect)
+                        if rect.stroke.width == width && rect.rect.contains(center)
+                )),
+                "missing {width}px focus ring around {name}"
+            );
+        }
+    }
+
     fn assert_near(actual: f64, expected: f64, label: &str) {
         assert!(
             (actual - expected).abs() <= LAYOUT_TOLERANCE,
@@ -6988,24 +7006,23 @@ mod tests {
         let mut page = Fixture::SettingsRecording.page();
         let initial = render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
         let retry_id = named_node_id(&initial, "Retry GPU");
-        assert_eq!(
-            render_with_input(
-                &ctx,
-                &mut data,
-                &mut page,
-                width,
-                height,
-                vec![egui::Event::AccessKitActionRequest(
-                    egui::accesskit::ActionRequest {
-                        action: egui::accesskit::Action::Focus,
-                        target: retry_id,
-                        data: None,
-                    },
-                )],
-            )
-            .1,
-            ScreenAction::None
+        let (focused, focus_action) = render_with_input(
+            &ctx,
+            &mut data,
+            &mut page,
+            width,
+            height,
+            vec![egui::Event::AccessKitActionRequest(
+                egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Focus,
+                    target: retry_id,
+                    data: None,
+                },
+            )],
         );
+        assert_eq!(focus_action, ScreenAction::None);
+        assert_eq!(focused_node(&focused).name(), Some("Retry GPU"));
+        assert_focus_ring_at(&focused, "Retry GPU");
         assert_eq!(
             render_with_input(
                 &ctx,

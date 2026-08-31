@@ -7121,6 +7121,7 @@ fn acceleration_diagnostics_panel(
                     });
                 });
             }
+            paint_focus_ring(ui, &retry, Rounding::same(5.0));
             if retry.clicked() {
                 *action = ScreenAction::RetryGpu;
             }
