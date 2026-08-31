@@ -7,7 +7,7 @@ mod app;
 mod audio;
 #[allow(
     dead_code,
-    reason = "provider-neutral qualification policy remains dormant until a production GPU provider ships"
+    reason = "provider qualification policy remains dormant until Stage 5 enables GPU routes for Auto"
 )]
 mod backend_policy;
 mod benchmark;
@@ -26,7 +26,7 @@ mod disk_space;
 mod embedded_runtime;
 #[allow(
     dead_code,
-    reason = "Stage 3 compiles the sealed verifier and store before Stage 4 provisions production trust or discovery"
+    reason = "Stage 4 retains verified-pack activation and rollback seams beyond bundled catalog discovery"
 )]
 mod gpu_worker_pack;
 mod history;
@@ -70,6 +70,7 @@ mod ui;
     reason = "the external worker boundary owns contracts used by role-specific targets and later integrations"
 )]
 mod worker_contracts;
+mod worker_identity;
 
 #[cfg(test)]
 mod architecture_guard;

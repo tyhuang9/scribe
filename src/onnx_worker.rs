@@ -4,6 +4,8 @@
 //! installer supplies a verified [`OnnxModelSpec`]; the router remains the only
 //! component allowed to construct a worker client.
 
+#[cfg(any(feature = "inference-worker", test))]
+use std::cell::RefCell;
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{Read, Write};
@@ -14,8 +16,15 @@ use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 
-use crate::backend_policy::{BackendSelection, BackendTarget};
+use crate::backend_policy::{BackendKind, BackendSelection, BackendTarget, DeviceClass, GpuVendor};
 use crate::config;
+use crate::gpu_worker_pack::health::{
+    FailureObservation, HealthCache, HealthDecision, HealthKey, HealthWitnesses, SystemClock,
+};
+use crate::gpu_worker_pack::manifest::{
+    PackBackend, PackVerifier, ProductionTrustRoot, VerifiedPackLease,
+};
+use crate::gpu_worker_pack::{ResolverHelloBindingBridge, VerifiedPackLaunchBinding};
 use crate::model_catalog::ArtifactFormat;
 use crate::prepared_audio::{PREPARED_SAMPLE_RATE, PreparedAudio};
 use crate::runtime_artifact::{
@@ -34,6 +43,10 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+pub(crate) use crate::worker_identity::{
+    DESKTOP_BUILD_ID, INFERENCE_WORKER_BUILD_ID, PROTOCOL_VERSION, WORKER_ABI_VERSION,
+};
+
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 #[cfg(windows)]
@@ -42,22 +55,8 @@ use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt;
 
 pub(crate) const PROTOCOL_MAGIC: [u8; 4] = *b"SCIF";
-pub(crate) const PROTOCOL_VERSION: u8 = 5;
 pub(crate) const INFERENCE_WORKER_FLAG: &str = "--scribe-inference-worker";
 pub(crate) const VAD_WORKER_FLAG: &str = "--scribe-vad-worker";
-pub(crate) const WORKER_ABI_VERSION: u16 = 1;
-pub(crate) const DESKTOP_BUILD_ID: &str = concat!(
-    "local-transcriber@",
-    env!("CARGO_PKG_VERSION"),
-    "#",
-    env!("SCRIBE_BUILD_REVISION")
-);
-pub(crate) const INFERENCE_WORKER_BUILD_ID: &str = concat!(
-    "scribe-inference-worker@",
-    env!("CARGO_PKG_VERSION"),
-    "#",
-    env!("SCRIBE_BUILD_REVISION")
-);
 const VAD_WORKER_BUILD_ID: &str = concat!(
     "scribe-vad-worker@",
     env!("CARGO_PKG_VERSION"),
@@ -65,6 +64,15 @@ const VAD_WORKER_BUILD_ID: &str = concat!(
     env!("SCRIBE_BUILD_REVISION")
 );
 const PARENT_LIVENESS_ENV: &str = "SCRIBE_PRIVATE_PARENT_LIVENESS";
+const PACK_ID_ENV: &str = "SCRIBE_PRIVATE_PACK_ID";
+const PACK_VERSION_ENV: &str = "SCRIBE_PRIVATE_PACK_VERSION";
+const PACK_DIGEST_ENV: &str = "SCRIBE_PRIVATE_PACK_DIGEST";
+const PACK_SECURITY_EPOCH_ENV: &str = "SCRIBE_PRIVATE_PACK_SECURITY_EPOCH";
+const PACK_RUNTIME_ABI_ENV: &str = "SCRIBE_PRIVATE_PACK_RUNTIME_ABI";
+const PACK_BACKEND_ENV: &str = "SCRIBE_PRIVATE_PACK_BACKEND";
+pub(crate) const PACK_PROVIDER_ENV: &str = "SCRIBE_PRIVATE_PACK_PROVIDER";
+pub(crate) const PACK_DEVICE_ID_ENV: &str = "SCRIBE_PRIVATE_PACK_DEVICE_ID";
+pub(crate) const PACK_DRIVER_ID_ENV: &str = "SCRIBE_PRIVATE_PACK_DRIVER_ID";
 const PARENT_CONTROL_CANCEL: u8 = b'C';
 const HEADER_LEN: usize = 26;
 const MAX_CONTROL_BYTES: usize = 256 * 1024;
@@ -80,6 +88,9 @@ const MAX_ARCHITECTURE_BYTES: usize = 512;
 const MAX_WORKER_ERROR_BYTES: usize = 16 * 1024;
 const MAX_BACKEND_SELECTION_TARGETS: usize = 128;
 const MAX_BACKEND_IDENTITY_BYTES: usize = 1024;
+const MAX_PACK_DEVICES: usize = 16;
+const MAX_GPU_PROVIDER_PROBES: usize = 8;
+const GPU_PROVIDER_DISCOVERY_BUDGET: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Copy)]
 struct SupervisorDeadlines {
@@ -127,25 +138,35 @@ impl Default for VadDeadlines {
 struct MonotonicDeadline {
     expires_at: Instant,
     budget: Duration,
+    label: &'static str,
 }
 
 impl MonotonicDeadline {
     fn after(budget: Duration) -> Result<Self> {
+        Self::after_for(budget, "Silero VAD acquisition")
+    }
+
+    fn after_for(budget: Duration, label: &'static str) -> Result<Self> {
         if budget.is_zero() {
-            bail!("Silero VAD acquisition budget must be positive");
+            bail!("{label} budget must be positive");
         }
         let started = Instant::now();
         let expires_at = started
             .checked_add(budget)
-            .ok_or_else(|| anyhow!("Silero VAD acquisition deadline overflowed"))?;
-        Ok(Self { expires_at, budget })
+            .ok_or_else(|| anyhow!("{label} deadline overflowed"))?;
+        Ok(Self {
+            expires_at,
+            budget,
+            label,
+        })
     }
 
     fn remaining(self) -> Result<Duration> {
         let remaining = self.expires_at.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             bail!(
-                "Silero VAD acquisition deadline exceeded after {} ms",
+                "{} deadline exceeded after {} ms",
+                self.label,
                 self.budget.as_millis()
             );
         }
@@ -718,6 +739,8 @@ struct SpawnedWorker {
     stdin: Box<dyn Write + Send>,
     stdout: Box<dyn Read + Send>,
     process: Arc<dyn WorkerProcess>,
+    expectation: WorkerExpectation,
+    pack_launch: Option<PackLaunchContext>,
 }
 
 trait WorkerLauncher: Send + Sync {
@@ -750,7 +773,9 @@ fn compiled_worker_provider(role: WorkerRole) -> WorkerProvider {
     if role == WorkerRole::Vad {
         return WorkerProvider::Cpu;
     }
-    if cfg!(feature = "vulkan-acceleration") {
+    if cfg!(feature = "cuda-acceleration") {
+        WorkerProvider::Cuda
+    } else if cfg!(feature = "vulkan-acceleration") {
         WorkerProvider::Vulkan
     } else {
         WorkerProvider::Cpu
@@ -781,6 +806,143 @@ struct WorkerExpectation {
     abi: u16,
     role: WorkerRole,
     provider: WorkerProvider,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pack: Option<WorkerPackExpectation>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkerPackExpectation {
+    pack_id: String,
+    pack_version: String,
+    pack_digest: String,
+    security_epoch: u64,
+    runtime_abi: u16,
+    backend: WorkerProvider,
+    provider: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkerPackCapability {
+    expectation: WorkerPackExpectation,
+    devices: Vec<WorkerPackDeviceCapability>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkerPackDeviceCapability {
+    stable_device_identity: String,
+    process_index: usize,
+    display_name: String,
+    driver_version: Option<String>,
+    device_class: DeviceClass,
+    vendor: GpuVendor,
+    memory_total_bytes: u64,
+    memory_available_bytes: u64,
+}
+
+#[derive(Clone, Debug)]
+#[cfg(any(feature = "inference-worker", test))]
+struct CurrentPackRuntimeDeviceCatalog {
+    provider: String,
+    devices: Vec<CurrentPackRuntimeDevice>,
+}
+
+/// Volatile facts obtained from the launched worker's own challenge-bound
+/// Hello. This is worker-local state only; it is never serialized, persisted,
+/// or forwarded to another process as a device selector.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(not(any(feature = "inference-worker", test)), allow(dead_code))]
+pub(crate) struct CurrentPackRuntimeDevice {
+    pub(crate) stable_device_identity: String,
+    pub(crate) process_index: usize,
+    pub(crate) display_name: String,
+    pub(crate) driver_version: Option<String>,
+    pub(crate) device_class: DeviceClass,
+    pub(crate) vendor: GpuVendor,
+    pub(crate) memory_total_bytes: u64,
+    pub(crate) memory_available_bytes: u64,
+}
+
+#[cfg(any(feature = "inference-worker", test))]
+impl From<&WorkerPackDeviceCapability> for CurrentPackRuntimeDevice {
+    fn from(device: &WorkerPackDeviceCapability) -> Self {
+        Self {
+            stable_device_identity: device.stable_device_identity.clone(),
+            process_index: device.process_index,
+            display_name: device.display_name.clone(),
+            driver_version: device.driver_version.clone(),
+            device_class: device.device_class,
+            vendor: device.vendor,
+            memory_total_bytes: device.memory_total_bytes,
+            memory_available_bytes: device.memory_available_bytes,
+        }
+    }
+}
+
+#[cfg(any(feature = "inference-worker", test))]
+thread_local! {
+    // This worker-local cache is populated from the Hello enumeration of the
+    // currently running process. It is intentionally neither serialized nor
+    // inherited by a child process: stable identity is the only cross-process
+    // binding.
+    static CURRENT_PACK_RUNTIME_DEVICES: RefCell<Option<CurrentPackRuntimeDeviceCatalog>> = const { RefCell::new(None) };
+}
+
+#[cfg(any(feature = "inference-worker", test))]
+fn clear_current_pack_runtime_devices() {
+    CURRENT_PACK_RUNTIME_DEVICES.with(|catalog| *catalog.borrow_mut() = None);
+}
+
+#[cfg(not(any(feature = "inference-worker", test)))]
+fn clear_current_pack_runtime_devices() {}
+
+#[cfg(any(feature = "inference-worker", test))]
+fn install_current_pack_runtime_devices(capability: &WorkerPackCapability) {
+    CURRENT_PACK_RUNTIME_DEVICES.with(|catalog| {
+        *catalog.borrow_mut() = Some(CurrentPackRuntimeDeviceCatalog {
+            provider: capability.expectation.provider.clone(),
+            devices: capability
+                .devices
+                .iter()
+                .map(CurrentPackRuntimeDevice::from)
+                .collect(),
+        });
+    });
+}
+
+#[cfg(any(feature = "inference-worker", test))]
+pub(crate) fn current_pack_runtime_device(
+    stable_device_identity: &str,
+    provider: &str,
+) -> Option<CurrentPackRuntimeDevice> {
+    CURRENT_PACK_RUNTIME_DEVICES.with(|catalog| {
+        let catalog = catalog.borrow();
+        let catalog = catalog.as_ref()?;
+        (catalog.provider == provider)
+            .then(|| {
+                catalog
+                    .devices
+                    .iter()
+                    .find(|device| device.stable_device_identity == stable_device_identity)
+                    .cloned()
+            })
+            .flatten()
+    })
+}
+
+#[cfg(any(feature = "inference-worker", test))]
+fn validate_unique_provider_process_indexes(devices: &[WorkerPackDeviceCapability]) -> Result<()> {
+    let mut process_indexes = devices
+        .iter()
+        .map(|device| device.process_index)
+        .collect::<Vec<_>>();
+    process_indexes.sort_unstable();
+    if process_indexes.windows(2).any(|pair| pair[0] == pair[1]) {
+        bail!("compiled GPU provider reported duplicate process indexes");
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -794,6 +956,8 @@ struct WorkerCapability {
     role: WorkerRole,
     provider: WorkerProvider,
     artifacts: Vec<WorkerArtifactTarget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pack: Option<WorkerPackCapability>,
 }
 
 fn expected_worker(role: WorkerRole) -> WorkerExpectation {
@@ -812,6 +976,7 @@ fn expected_worker(role: WorkerRole) -> WorkerExpectation {
         abi: WORKER_ABI_VERSION,
         role,
         provider: compiled_worker_provider(role),
+        pack: None,
     }
 }
 
@@ -862,6 +1027,658 @@ fn worker_capability(role: WorkerRole, challenge: String) -> Result<WorkerCapabi
         role,
         provider: compiled_worker_provider(role),
         artifacts,
+        pack: worker_pack_capability(role)?,
+    })
+}
+
+fn worker_pack_expectation_from_private_env() -> Result<Option<WorkerPackExpectation>> {
+    let names = [
+        PACK_ID_ENV,
+        PACK_VERSION_ENV,
+        PACK_DIGEST_ENV,
+        PACK_SECURITY_EPOCH_ENV,
+        PACK_RUNTIME_ABI_ENV,
+        PACK_BACKEND_ENV,
+        PACK_PROVIDER_ENV,
+    ];
+    let fields = names
+        .iter()
+        .map(std::env::var)
+        .collect::<Vec<std::result::Result<String, std::env::VarError>>>();
+    if fields.iter().all(|field| field.is_err()) {
+        return Ok(None);
+    }
+    if fields.iter().any(Result::is_err) {
+        bail!("GPU worker pack build identity is incomplete");
+    }
+    let fields = fields
+        .into_iter()
+        .map(|field| field.expect("checked above"))
+        .collect::<Vec<_>>();
+    let backend = match fields[5].as_str() {
+        "cuda" => WorkerProvider::Cuda,
+        "vulkan" => WorkerProvider::Vulkan,
+        "metal" => WorkerProvider::Metal,
+        _ => bail!("GPU worker pack backend is invalid"),
+    };
+    if backend != compiled_worker_provider(WorkerRole::Inference) {
+        bail!("GPU worker pack backend does not match the compiled provider");
+    }
+    Ok(Some(WorkerPackExpectation {
+        pack_id: fields[0].clone(),
+        pack_version: fields[1].clone(),
+        pack_digest: fields[2].clone(),
+        security_epoch: fields[3]
+            .parse()
+            .context("GPU worker pack security epoch is invalid")?,
+        runtime_abi: fields[4]
+            .parse()
+            .context("GPU worker pack runtime ABI is invalid")?,
+        backend,
+        provider: fields[6].clone(),
+    }))
+}
+
+#[cfg(windows)]
+struct PackDriverCatalog {
+    by_pci_location: BTreeMap<(u32, u32, u32), String>,
+}
+
+#[cfg(windows)]
+impl PackDriverCatalog {
+    fn discover() -> Result<Self> {
+        use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
+            DIGCF_PRESENT, GUID_DEVCLASS_DISPLAY, SP_DEVINFO_DATA, SetupDiDestroyDeviceInfoList,
+            SetupDiEnumDeviceInfo, SetupDiGetClassDevsW, SetupDiGetDevicePropertyW,
+        };
+        use windows_sys::Win32::Devices::Properties::{
+            DEVPKEY_Device_Address, DEVPKEY_Device_BusNumber, DEVPKEY_Device_DriverVersion,
+            DEVPROP_TYPE_STRING, DEVPROP_TYPE_UINT32, DEVPROPKEY,
+        };
+
+        struct DeviceInfoSet(isize);
+
+        impl Drop for DeviceInfoSet {
+            fn drop(&mut self) {
+                // SAFETY: the handle came from SetupDiGetClassDevsW and is
+                // owned exclusively by this guard.
+                unsafe {
+                    SetupDiDestroyDeviceInfoList(self.0);
+                }
+            }
+        }
+
+        fn property_u32(set: isize, device: &SP_DEVINFO_DATA, key: &DEVPROPKEY) -> Option<u32> {
+            let mut property_type = 0;
+            let mut required_size = 0;
+            let mut bytes = [0_u8; std::mem::size_of::<u32>()];
+            // SAFETY: all pointers reference initialized, correctly sized
+            // buffers for the duration of the synchronous SetupAPI call.
+            let ok = unsafe {
+                SetupDiGetDevicePropertyW(
+                    set,
+                    device,
+                    key,
+                    &mut property_type,
+                    bytes.as_mut_ptr(),
+                    bytes.len() as u32,
+                    &mut required_size,
+                    0,
+                )
+            };
+            (ok != 0 && property_type == DEVPROP_TYPE_UINT32 && required_size == bytes.len() as u32)
+                .then(|| u32::from_ne_bytes(bytes))
+        }
+
+        fn driver_property(
+            set: isize,
+            device: &SP_DEVINFO_DATA,
+            key: &DEVPROPKEY,
+        ) -> Option<String> {
+            let mut property_type = 0;
+            let mut required_size = 0;
+            let mut utf16 = [0_u16; 128];
+            // SAFETY: the UTF-16 output buffer is writable and byte-sized as
+            // required by SetupDiGetDevicePropertyW.
+            let ok = unsafe {
+                SetupDiGetDevicePropertyW(
+                    set,
+                    device,
+                    key,
+                    &mut property_type,
+                    utf16.as_mut_ptr().cast(),
+                    std::mem::size_of_val(&utf16) as u32,
+                    &mut required_size,
+                    0,
+                )
+            };
+            if ok == 0
+                || property_type != DEVPROP_TYPE_STRING
+                || required_size < 2
+                || required_size > std::mem::size_of_val(&utf16) as u32
+                || required_size % 2 != 0
+            {
+                return None;
+            }
+            let units = required_size as usize / 2;
+            let end = utf16[..units]
+                .iter()
+                .position(|unit| *unit == 0)
+                .unwrap_or(units);
+            let value = String::from_utf16(&utf16[..end]).ok()?;
+            let canonical = value.trim().to_ascii_lowercase();
+            (!canonical.is_empty()
+                && canonical.len() <= 96
+                && canonical.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_' | b'+')
+                }))
+            .then(|| format!("windows-display:{canonical}"))
+        }
+
+        // SAFETY: the class GUID is process-static, the enumerator is null,
+        // and no window handle is used. SetupAPI returns a new owned set.
+        let raw_set = unsafe {
+            SetupDiGetClassDevsW(
+                &GUID_DEVCLASS_DISPLAY,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                DIGCF_PRESENT,
+            )
+        };
+        if raw_set == -1_isize {
+            bail!("Windows display-adapter metadata is unavailable");
+        }
+        let set = DeviceInfoSet(raw_set);
+        let mut by_pci_location = BTreeMap::new();
+        for index in 0..64_u32 {
+            let mut device = SP_DEVINFO_DATA {
+                cbSize: std::mem::size_of::<SP_DEVINFO_DATA>() as u32,
+                ClassGuid: windows_sys::core::GUID::from_u128(0),
+                DevInst: 0,
+                Reserved: 0,
+            };
+            // SAFETY: device has the required cbSize and remains writable for
+            // the synchronous enumeration call.
+            if unsafe { SetupDiEnumDeviceInfo(set.0, index, &mut device) } == 0 {
+                break;
+            }
+            let Some(bus) = property_u32(set.0, &device, &DEVPKEY_Device_BusNumber) else {
+                continue;
+            };
+            let Some(address) = property_u32(set.0, &device, &DEVPKEY_Device_Address) else {
+                continue;
+            };
+            let Some(driver) = driver_property(set.0, &device, &DEVPKEY_Device_DriverVersion)
+            else {
+                continue;
+            };
+            let location = (bus, address >> 16, address & 0xffff);
+            if by_pci_location.insert(location, driver).is_some() {
+                bail!("Windows reported duplicate display-adapter PCI locations");
+            }
+        }
+        if by_pci_location.is_empty() {
+            bail!("Windows reported no display adapter with bounded driver metadata");
+        }
+        Ok(Self { by_pci_location })
+    }
+
+    #[cfg(any(feature = "inference-worker", test))]
+    fn identity_for(&self, stable_device_identity: &str) -> Result<String> {
+        let (bus, device, function) = parse_native_pci_location(stable_device_identity)
+            .ok_or_else(|| anyhow!("GPU stable identity is not a canonical PCI location"))?;
+        self.by_pci_location
+            .get(&(bus, device, function))
+            .cloned()
+            .ok_or_else(|| anyhow!("GPU PCI identity has no matching Windows driver metadata"))
+    }
+
+    fn fingerprint(&self) -> String {
+        let mut digest = Sha256::new();
+        digest.update((self.by_pci_location.len() as u64).to_le_bytes());
+        for ((bus, device, function), driver) in &self.by_pci_location {
+            digest.update(bus.to_le_bytes());
+            digest.update(device.to_le_bytes());
+            digest.update(function.to_le_bytes());
+            digest.update((driver.len() as u64).to_le_bytes());
+            digest.update(driver.as_bytes());
+        }
+        format!("{:x}", digest.finalize())
+    }
+}
+
+#[cfg(all(windows, feature = "vulkan-acceleration"))]
+struct VulkanInstanceGuard(ash::Instance);
+
+#[cfg(all(windows, feature = "vulkan-acceleration"))]
+impl Drop for VulkanInstanceGuard {
+    fn drop(&mut self) {
+        // SAFETY: this guard exclusively owns the instance and all physical
+        // device queries have completed before it is dropped.
+        unsafe { self.0.destroy_instance(None) };
+    }
+}
+
+#[cfg(all(windows, any(feature = "inference-worker", test)))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct VulkanDeviceIdentity {
+    normalized_display_name: String,
+    device_class: DeviceClass,
+    vendor: GpuVendor,
+    stable_device_identity: String,
+    driver_identity: String,
+    claimed: bool,
+}
+
+#[cfg(all(windows, any(feature = "inference-worker", test)))]
+struct VulkanDeviceCatalog {
+    devices: Vec<VulkanDeviceIdentity>,
+}
+
+#[cfg(all(windows, any(feature = "inference-worker", test)))]
+impl VulkanDeviceCatalog {
+    #[cfg(feature = "vulkan-acceleration")]
+    fn discover() -> Result<Self> {
+        use ash::vk;
+        use std::ffi::CStr;
+
+        fn hex(bytes: &[u8]) -> String {
+            use std::fmt::Write as _;
+
+            let mut encoded = String::with_capacity(bytes.len() * 2);
+            for byte in bytes {
+                write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
+            }
+            encoded
+        }
+
+        // SAFETY: loading occurs only inside the verified Vulkan worker after
+        // its environment and DLL search path have been sanitized. The desktop
+        // does not compile this feature in production or call this code.
+        let entry =
+            unsafe { ash::Entry::load() }.context("could not load the Windows Vulkan loader")?;
+        let application_name = c"scribe-gpu-worker";
+        let application = vk::ApplicationInfo::builder()
+            .application_name(application_name)
+            .application_version(1)
+            .api_version(vk::API_VERSION_1_1);
+        let create_info = vk::InstanceCreateInfo::builder().application_info(&application);
+        // SAFETY: create_info contains no extension/layer pointers and remains
+        // live for the synchronous loader call.
+        let instance = VulkanInstanceGuard(
+            unsafe { entry.create_instance(&create_info, None) }
+                .context("could not create the Vulkan identity-query instance")?,
+        );
+        // SAFETY: the instance remains live through every returned physical
+        // device query and the bounded vector is consumed before destruction.
+        let physical_devices = unsafe { instance.0.enumerate_physical_devices() }
+            .context("could not enumerate Vulkan physical devices for stable identity")?;
+        if physical_devices.is_empty() || physical_devices.len() > 64 {
+            bail!("Vulkan physical-device identity list is empty or oversized");
+        }
+
+        let mut devices = Vec::with_capacity(physical_devices.len());
+        for physical_device in physical_devices {
+            let mut id = vk::PhysicalDeviceIDProperties::default();
+            let mut driver = vk::PhysicalDeviceDriverProperties::default();
+            let mut properties = vk::PhysicalDeviceProperties2::builder()
+                .push_next(&mut id)
+                .push_next(&mut driver)
+                .build();
+            // SAFETY: all pNext structures are correctly initialized and live
+            // for the synchronous properties query.
+            unsafe {
+                instance
+                    .0
+                    .get_physical_device_properties2(physical_device, &mut properties)
+            };
+            let device_class = match properties.properties.device_type {
+                vk::PhysicalDeviceType::DISCRETE_GPU => DeviceClass::DiscreteGpu,
+                vk::PhysicalDeviceType::INTEGRATED_GPU => DeviceClass::IntegratedGpu,
+                _ => continue,
+            };
+            let vendor = match properties.properties.vendor_id {
+                0x10de => GpuVendor::Nvidia,
+                0x1002 | 0x1022 => GpuVendor::Amd,
+                0x8086 => GpuVendor::Intel,
+                _ => GpuVendor::Other,
+            };
+            // SAFETY: Vulkan guarantees that deviceName is a terminated UTF-8
+            // string within this fixed-size array.
+            let display_name =
+                unsafe { CStr::from_ptr(properties.properties.device_name.as_ptr()) }
+                    .to_str()
+                    .context("Vulkan device name is not UTF-8")?;
+            let normalized_display_name = normalize_gpu_display_name(display_name)
+                .ok_or_else(|| anyhow!("Vulkan device name is empty or malformed"))?;
+            let stable_device_identity = if id.device_luid_valid == vk::TRUE
+                && id.device_luid.iter().any(|byte| *byte != 0)
+            {
+                format!("native:luid:{}", hex(&id.device_luid))
+            } else if id.device_uuid.iter().any(|byte| *byte != 0) {
+                format!("native:uuid:{}", hex(&id.device_uuid))
+            } else {
+                bail!("Vulkan physical device omitted both LUID and UUID identity");
+            };
+            if id.driver_uuid.iter().all(|byte| *byte == 0) {
+                bail!("Vulkan physical device omitted driver UUID identity");
+            }
+            let driver_identity = format!(
+                "vulkan:{:04x}:{:08x}:{:08x}:{}",
+                properties.properties.vendor_id,
+                driver.driver_id.as_raw(),
+                properties.properties.driver_version,
+                hex(&id.driver_uuid)
+            );
+            devices.push(VulkanDeviceIdentity {
+                normalized_display_name,
+                device_class,
+                vendor,
+                stable_device_identity,
+                driver_identity,
+                claimed: false,
+            });
+        }
+        if devices.is_empty() {
+            bail!("Vulkan reported no discrete or integrated physical GPU identity");
+        }
+        let mut identities = devices
+            .iter()
+            .map(|device| device.stable_device_identity.as_str())
+            .collect::<Vec<_>>();
+        identities.sort_unstable();
+        if identities.windows(2).any(|pair| pair[0] == pair[1]) {
+            bail!("Vulkan reported duplicate stable physical-device identities");
+        }
+        Ok(Self { devices })
+    }
+
+    fn claim(
+        &mut self,
+        display_name: &str,
+        device_class: DeviceClass,
+        vendor: GpuVendor,
+    ) -> Result<(String, String)> {
+        let normalized = normalize_gpu_display_name(display_name)
+            .ok_or_else(|| anyhow!("GPU provider device name is empty or malformed"))?;
+        let matching = self
+            .devices
+            .iter()
+            .enumerate()
+            .filter(|(_, device)| {
+                !device.claimed
+                    && device.normalized_display_name == normalized
+                    && device.device_class == device_class
+                    && device.vendor == vendor
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        let [index] = matching.as_slice() else {
+            if matching.is_empty() {
+                bail!("GPU provider device has no matching Vulkan LUID/UUID identity");
+            }
+            bail!(
+                "GPU provider device identity is ambiguous across {} Vulkan physical devices",
+                matching.len()
+            );
+        };
+        let device = &mut self.devices[*index];
+        device.claimed = true;
+        Ok((
+            device.stable_device_identity.clone(),
+            device.driver_identity.clone(),
+        ))
+    }
+}
+
+#[cfg(all(windows, any(feature = "inference-worker", test)))]
+fn resolve_vulkan_provider_identity(
+    native_id: Option<&str>,
+    display_name: &str,
+    device_class: DeviceClass,
+    vendor: GpuVendor,
+    driver_catalog: &PackDriverCatalog,
+    vulkan_catalog: &mut VulkanDeviceCatalog,
+) -> Result<(String, String)> {
+    if let Some(native_id) = native_id.filter(|native_id| !native_id.is_empty()) {
+        if !native_id.is_ascii() {
+            bail!("GPU provider device stable identity is malformed");
+        }
+        let stable_device_identity = format!("native:{}", native_id.to_ascii_lowercase());
+        if parse_native_pci_location(&stable_device_identity).is_some() {
+            return Ok((
+                stable_device_identity.clone(),
+                driver_catalog.identity_for(&stable_device_identity)?,
+            ));
+        }
+        // Provider-owned opaque IDs do not identify a Windows display adapter
+        // by PCI address. Reconcile them against the independently enumerated
+        // Vulkan LUID/UUID catalog instead of misclassifying them as malformed
+        // PCI identity. `claim` requires one exact, unclaimed device fact set.
+    }
+    vulkan_catalog.claim(display_name, device_class, vendor)
+}
+
+#[cfg(all(windows, any(feature = "inference-worker", test)))]
+fn normalize_gpu_display_name(value: &str) -> Option<String> {
+    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!normalized.is_empty()
+        && normalized.len() <= 256
+        && normalized
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic() || byte == b' '))
+    .then(|| normalized.to_ascii_lowercase())
+}
+
+#[cfg(not(windows))]
+struct PackDriverCatalog;
+
+#[cfg(not(windows))]
+impl PackDriverCatalog {
+    fn discover() -> Result<Self> {
+        bail!("Stage 4 GPU worker packs require Windows driver metadata")
+    }
+
+    #[cfg(any(feature = "inference-worker", test))]
+    fn identity_for(&self, _stable_device_identity: &str) -> Result<String> {
+        bail!("Stage 4 GPU worker packs require Windows driver metadata")
+    }
+
+    fn fingerprint(&self) -> String {
+        "unsupported".to_owned()
+    }
+}
+
+#[cfg(any(all(windows, feature = "inference-worker"), test))]
+fn parse_native_pci_location(identity: &str) -> Option<(u32, u32, u32)> {
+    if identity != identity.to_ascii_lowercase() {
+        return None;
+    }
+    let raw = identity
+        .strip_prefix("native:")?
+        .strip_prefix("pci:")
+        .unwrap_or_else(|| identity.strip_prefix("native:").expect("checked above"));
+    let mut colon = raw.split(':');
+    let domain_text = colon.next()?;
+    let bus_text = colon.next()?;
+    let device_function = colon.next()?;
+    if !matches!(domain_text.len(), 4 | 8) || bus_text.len() != 2 || device_function.len() != 4 {
+        return None;
+    }
+    let domain = u32::from_str_radix(domain_text, 16).ok()?;
+    let bus = u32::from_str_radix(bus_text, 16).ok()?;
+    if colon.next().is_some() || domain != 0 {
+        return None;
+    }
+    let (device, function) = device_function.split_once('.')?;
+    let device = u32::from_str_radix(device, 16).ok()?;
+    let function = u32::from_str_radix(function, 16).ok()?;
+    (device <= 0x1f && function <= 7).then_some((bus, device, function))
+}
+
+#[cfg(feature = "inference-worker")]
+fn worker_pack_capability(role: WorkerRole) -> Result<Option<WorkerPackCapability>> {
+    use transcribe_cpp::DeviceType;
+
+    clear_current_pack_runtime_devices();
+    let Some(expectation) = worker_pack_expectation_from_private_env()? else {
+        return Ok(None);
+    };
+    if role != WorkerRole::Inference {
+        bail!("only the inference role may advertise a GPU worker pack");
+    }
+    transcribe_cpp::init_backends_default()
+        .context("could not initialize the compiled GPU provider for Hello")?;
+    let expected_kind = match expectation.backend {
+        WorkerProvider::Cuda => "cuda",
+        WorkerProvider::Vulkan => "vulkan",
+        WorkerProvider::Metal => "metal",
+        WorkerProvider::Cpu => bail!("CPU is not a GPU worker-pack backend"),
+    };
+    let expected_device_id = std::env::var(PACK_DEVICE_ID_ENV).ok();
+    let driver_catalog = PackDriverCatalog::discover()
+        .context("could not obtain authoritative GPU driver identity")?;
+    #[cfg(all(windows, feature = "vulkan-acceleration"))]
+    let mut vulkan_catalog = (expectation.backend == WorkerProvider::Vulkan)
+        .then(VulkanDeviceCatalog::discover)
+        .transpose()
+        .context("could not obtain Vulkan LUID/UUID identity")?;
+    let provider_devices = transcribe_cpp::devices()
+        .into_iter()
+        .filter(|device| device.kind.trim().eq_ignore_ascii_case(expected_kind))
+        .collect::<Vec<_>>();
+    if provider_devices.len() > MAX_PACK_DEVICES {
+        bail!("compiled GPU provider exceeded the bounded device-list limit");
+    }
+    let mut devices = Vec::with_capacity(provider_devices.len());
+    for device in provider_devices {
+        let process_index = device
+            .index
+            .ok_or_else(|| anyhow!("GPU provider device has no live process index"))?;
+        let display_name = [&device.description, &device.name]
+            .into_iter()
+            .map(|value| value.trim())
+            .find(|value| !value.is_empty() && value.is_ascii())
+            .ok_or_else(|| anyhow!("GPU provider device has no bounded display name"))?
+            .to_owned();
+        let device_class = match device.device_type {
+            DeviceType::Gpu if expectation.backend == WorkerProvider::Metal => {
+                DeviceClass::UnifiedGpu
+            }
+            DeviceType::Gpu => DeviceClass::DiscreteGpu,
+            DeviceType::Igpu if expectation.backend == WorkerProvider::Metal => {
+                DeviceClass::UnifiedGpu
+            }
+            DeviceType::Igpu => DeviceClass::IntegratedGpu,
+            DeviceType::Unknown => DeviceClass::Unknown,
+            DeviceType::Cpu | DeviceType::Accel => {
+                bail!("GPU provider returned a non-GPU device")
+            }
+        };
+        let normalized = format!("{} {}", device.name, device.description).to_ascii_lowercase();
+        let vendor = match expectation.backend {
+            WorkerProvider::Cuda => GpuVendor::Nvidia,
+            WorkerProvider::Metal => GpuVendor::Apple,
+            WorkerProvider::Vulkan if normalized.contains("nvidia") => GpuVendor::Nvidia,
+            WorkerProvider::Vulkan
+                if normalized.contains("amd") || normalized.contains("radeon") =>
+            {
+                GpuVendor::Amd
+            }
+            WorkerProvider::Vulkan if normalized.contains("intel") => GpuVendor::Intel,
+            WorkerProvider::Vulkan => GpuVendor::Other,
+            WorkerProvider::Cpu => GpuVendor::Unknown,
+        };
+        let native_id = device.device_id.as_deref().map(str::trim);
+        let (stable_device_identity, driver_version) =
+            if expectation.backend == WorkerProvider::Vulkan {
+                #[cfg(all(windows, feature = "vulkan-acceleration"))]
+                {
+                    resolve_vulkan_provider_identity(
+                        native_id,
+                        &display_name,
+                        device_class,
+                        vendor,
+                        &driver_catalog,
+                        vulkan_catalog
+                            .as_mut()
+                            .expect("Vulkan catalog exists for the compiled Vulkan worker"),
+                    )?
+                }
+                #[cfg(not(all(windows, feature = "vulkan-acceleration")))]
+                {
+                    bail!("Vulkan GPU worker pack was built without Vulkan acceleration")
+                }
+            } else {
+                let native_id = native_id
+                    .filter(|native_id| !native_id.is_empty() && native_id.is_ascii())
+                    .ok_or_else(|| anyhow!("GPU provider device has no stable identity"))?;
+                let stable_device_identity = format!("native:{}", native_id.to_ascii_lowercase());
+                let driver_version = driver_catalog.identity_for(&stable_device_identity)?;
+                (stable_device_identity, driver_version)
+            };
+        devices.push(WorkerPackDeviceCapability {
+            stable_device_identity,
+            process_index,
+            display_name,
+            driver_version: Some(driver_version),
+            device_class,
+            vendor,
+            memory_total_bytes: device.memory_total,
+            memory_available_bytes: device.memory_free.min(device.memory_total),
+        });
+    }
+    // Validate before the parent-selected stable ID narrows the list. A
+    // duplicate index in another provider device must not be hidden by that
+    // filter and later make an index-only remap ambiguous.
+    validate_unique_provider_process_indexes(&devices)?;
+    let mut devices = devices
+        .into_iter()
+        .filter(|device| {
+            expected_device_id
+                .as_deref()
+                .is_none_or(|expected| expected == device.stable_device_identity)
+        })
+        .collect::<Vec<_>>();
+    devices.sort_by(|left, right| {
+        left.stable_device_identity
+            .cmp(&right.stable_device_identity)
+    });
+    if devices.is_empty() {
+        bail!("compiled GPU provider reported no addressable stable device");
+    }
+    if devices.len() > MAX_PACK_DEVICES {
+        bail!("compiled GPU provider exceeded the bounded device-list limit");
+    }
+    if devices
+        .windows(2)
+        .any(|pair| pair[0].stable_device_identity == pair[1].stable_device_identity)
+    {
+        bail!("compiled GPU provider reported duplicate stable device identities");
+    }
+    let capability = WorkerPackCapability {
+        expectation,
+        devices,
+    };
+    install_current_pack_runtime_devices(&capability);
+    debug_assert!(capability.devices.iter().all(|device| {
+        current_pack_runtime_device(
+            &device.stable_device_identity,
+            &capability.expectation.provider,
+        )
+        .is_some_and(|current| current.process_index == device.process_index)
+    }));
+    Ok(Some(capability))
+}
+
+#[cfg(not(feature = "inference-worker"))]
+fn worker_pack_capability(_role: WorkerRole) -> Result<Option<WorkerPackCapability>> {
+    clear_current_pack_runtime_devices();
+    worker_pack_expectation_from_private_env().and_then(|pack| {
+        if pack.is_some() {
+            bail!("desktop process cannot advertise a GPU worker pack")
+        }
+        Ok(None)
     })
 }
 
@@ -904,6 +1721,7 @@ fn validate_worker_capability(
         || capability.abi != expected.abi
         || capability.role != expected.role
         || capability.provider != expected.provider
+        || capability.pack.as_ref().map(|pack| &pack.expectation) != expected.pack.as_ref()
     {
         bail!("worker capability is incompatible with the requesting application");
     }
@@ -934,7 +1752,8 @@ fn validate_worker_hello(
         bail!("worker handshake challenge must be 32 random bytes encoded as hexadecimal");
     }
     let actual_role = role.unwrap_or(expected.role);
-    let local = expected_worker(actual_role);
+    let mut local = expected_worker(actual_role);
+    local.pack = worker_pack_expectation_from_private_env()?;
     // Final-image verification is directional: the parent owns the verified
     // executable descriptor and digest. The child validates the protocol and
     // build contract but does not compare the parent-supplied digest against a
@@ -944,6 +1763,7 @@ fn validate_worker_hello(
         || expected.abi != local.abi
         || expected.role != local.role
         || expected.provider != local.provider
+        || expected.pack != local.pack
     {
         bail!("worker handshake expectation is incompatible with this worker");
     }
@@ -1435,6 +2255,158 @@ struct WorkerExecutableIdentity {
     inode: u64,
 }
 
+#[derive(Clone, Debug)]
+struct PackLaunchContext {
+    lease: Arc<VerifiedPackLease>,
+    expectation: WorkerPackExpectation,
+    expected_device: Option<BackendTarget>,
+}
+
+struct BoundPackHelloBridge<'a> {
+    context: &'a PackLaunchContext,
+    capability: &'a WorkerPackCapability,
+    device: &'a WorkerPackDeviceCapability,
+}
+
+impl ResolverHelloBindingBridge for BoundPackHelloBridge<'_> {
+    fn resolver_verified_pack_lease(&self) -> Arc<VerifiedPackLease> {
+        Arc::clone(&self.context.lease)
+    }
+
+    #[cfg(unix)]
+    fn resolver_unix_launch_authority(
+        &self,
+    ) -> Option<Arc<crate::gpu_worker_pack::UnixPackExecAuthority>> {
+        None
+    }
+
+    fn hello_pack_id(&self) -> &str {
+        &self.capability.expectation.pack_id
+    }
+
+    fn hello_pack_version(&self) -> &str {
+        &self.capability.expectation.pack_version
+    }
+
+    fn hello_pack_digest(&self) -> &str {
+        &self.capability.expectation.pack_digest
+    }
+
+    fn hello_security_epoch(&self) -> u64 {
+        self.capability.expectation.security_epoch
+    }
+
+    fn hello_runtime_abi(&self) -> u16 {
+        self.capability.expectation.runtime_abi
+    }
+
+    fn hello_backend(&self) -> PackBackend {
+        pack_backend_from_worker_provider(self.capability.expectation.backend)
+            .expect("a worker-pack capability is always a GPU backend")
+    }
+
+    fn hello_provider(&self) -> &str {
+        &self.capability.expectation.provider
+    }
+
+    fn hello_stable_device_identity(&self) -> &str {
+        &self.device.stable_device_identity
+    }
+
+    fn hello_process_index(&self) -> Option<usize> {
+        Some(self.device.process_index)
+    }
+
+    fn hello_display_name(&self) -> &str {
+        &self.device.display_name
+    }
+
+    fn hello_driver_version(&self) -> Option<&str> {
+        self.device.driver_version.as_deref()
+    }
+
+    fn hello_device_class(&self) -> DeviceClass {
+        self.device.device_class
+    }
+
+    fn hello_vendor(&self) -> GpuVendor {
+        self.device.vendor
+    }
+
+    fn hello_memory_total_bytes(&self) -> u64 {
+        self.device.memory_total_bytes
+    }
+
+    fn hello_memory_available_bytes(&self) -> u64 {
+        self.device.memory_available_bytes
+    }
+}
+
+fn bind_pack_hello(
+    context: &PackLaunchContext,
+    capability: &WorkerPackCapability,
+) -> Result<Vec<VerifiedPackLaunchBinding>> {
+    if capability.expectation != context.expectation {
+        bail!("GPU worker Hello pack identity differs from resolver authority");
+    }
+    if capability.devices.is_empty() || capability.devices.len() > MAX_PACK_DEVICES {
+        bail!("GPU worker Hello device list is empty or oversized");
+    }
+    let mut prior = None;
+    let mut process_indexes = Vec::with_capacity(capability.devices.len());
+    for device in &capability.devices {
+        if prior
+            .as_ref()
+            .is_some_and(|identity: &String| identity >= &device.stable_device_identity)
+        {
+            bail!("GPU worker Hello device list is not strictly stable-ID sorted");
+        }
+        prior = Some(device.stable_device_identity.clone());
+        process_indexes.push(device.process_index);
+    }
+    process_indexes.sort_unstable();
+    if process_indexes.windows(2).any(|pair| pair[0] == pair[1]) {
+        bail!("GPU worker Hello device list contains duplicate process indexes");
+    }
+    let observed_backend = match capability.expectation.backend {
+        WorkerProvider::Cuda => BackendKind::Cuda,
+        WorkerProvider::Vulkan => BackendKind::Vulkan,
+        WorkerProvider::Metal => BackendKind::Metal,
+        WorkerProvider::Cpu => bail!("GPU worker Hello advertised CPU"),
+    };
+    let devices = if let Some(expected) = &context.expected_device {
+        let device = capability
+            .devices
+            .iter()
+            .find(|device| device.stable_device_identity == expected.device_id.as_str())
+            .ok_or_else(|| anyhow!("GPU worker Hello omitted the parent-selected stable device"))?;
+        if observed_backend != expected.backend
+            || device.vendor != expected.vendor
+            || device.device_class != expected.device_class
+            || device.memory_total_bytes != expected.memory_total_bytes
+            || device.driver_version != expected.driver_version
+        {
+            bail!("GPU worker Hello device facts differ from the parent-observed target");
+        }
+        // The enumeration index is deliberately refreshed from this Hello.
+        // Stable identity, rather than a persisted index, is the authority.
+        std::slice::from_ref(device)
+    } else {
+        capability.devices.as_slice()
+    };
+    devices
+        .iter()
+        .map(|device| {
+            VerifiedPackLaunchBinding::try_from_resolver_hello_bridge(&BoundPackHelloBridge {
+                context,
+                capability,
+                device,
+            })
+            .ok_or_else(|| anyhow!("GPU worker resolver/Hello binding was rejected"))
+        })
+        .collect()
+}
+
 #[derive(Debug)]
 struct VerifiedWorkerExecutable {
     path: PathBuf,
@@ -1442,6 +2414,7 @@ struct VerifiedWorkerExecutable {
     expected_name: std::ffi::OsString,
     expected_sha256: String,
     identity: WorkerExecutableIdentity,
+    pack_launch: Option<PackLaunchContext>,
     // On Windows this read-only, non-delete-sharing handle prevents replacement
     // between verification and CreateProcess. Other platforms still retain the
     // open inode while the immediate identity recheck closes ordinary races.
@@ -1450,7 +2423,7 @@ struct VerifiedWorkerExecutable {
 
 impl VerifiedWorkerExecutable {
     fn revalidate(&self) -> Result<Self> {
-        let verified = verify_worker_executable(
+        let mut verified = verify_worker_executable(
             &self.path,
             &self.root,
             &self.expected_name,
@@ -1459,6 +2432,7 @@ impl VerifiedWorkerExecutable {
         if verified.identity != self.identity {
             bail!("worker executable identity changed before process creation");
         }
+        verified.pack_launch = self.pack_launch.clone();
         Ok(verified)
     }
 }
@@ -1579,8 +2553,130 @@ fn verify_worker_executable(
         expected_name: expected_name.to_owned(),
         expected_sha256: expected_sha256.to_owned(),
         identity,
+        pack_launch: None,
         _open_file: open_file,
     })
+}
+
+fn worker_provider_from_pack_backend(backend: PackBackend) -> WorkerProvider {
+    match backend {
+        PackBackend::Cuda => WorkerProvider::Cuda,
+        PackBackend::Vulkan => WorkerProvider::Vulkan,
+        PackBackend::Metal => WorkerProvider::Metal,
+    }
+}
+
+fn pack_backend_from_worker_provider(provider: WorkerProvider) -> Option<PackBackend> {
+    match provider {
+        WorkerProvider::Cuda => Some(PackBackend::Cuda),
+        WorkerProvider::Vulkan => Some(PackBackend::Vulkan),
+        WorkerProvider::Metal => Some(PackBackend::Metal),
+        WorkerProvider::Cpu => None,
+    }
+}
+
+fn pack_expectation(lease: &VerifiedPackLease) -> WorkerPackExpectation {
+    let pack = lease.verified_pack();
+    WorkerPackExpectation {
+        pack_id: pack.pack_id.as_str().to_owned(),
+        pack_version: pack.pack_version.as_str().to_owned(),
+        pack_digest: pack.pack_digest.clone(),
+        security_epoch: pack.security_epoch,
+        runtime_abi: pack.runtime_abi_version,
+        backend: worker_provider_from_pack_backend(pack.backend),
+        provider: pack.provider.clone(),
+    }
+}
+
+struct VerifiedPackWorkerExecutableResolver {
+    binding: VerifiedPackLaunchBinding,
+}
+
+impl WorkerExecutableResolver for VerifiedPackWorkerExecutableResolver {
+    fn resolve(&self, role: WorkerRole) -> Result<VerifiedWorkerExecutable> {
+        if role != WorkerRole::Inference {
+            bail!("verified GPU worker packs can launch only the inference role");
+        }
+        let lease = self.binding.verified_pack_lease_arc();
+        let expected_device = self.binding.backend_target();
+        let pack = lease.verified_pack();
+        if expected_device.pack.as_ref().is_none_or(|identity| {
+            identity.pack_digest != pack.pack_digest
+                || identity.runtime_abi != pack.runtime_abi_version
+                || identity.security_epoch != pack.security_epoch
+        }) {
+            bail!("verified GPU launch binding no longer matches its retained pack");
+        }
+        resolve_verified_pack_executable(lease, Some(expected_device))
+    }
+}
+
+/// Bootstrap is deliberately separate from an execution route. It can launch
+/// only a bounded Hello probe from a retained, freshly reverified pack lease;
+/// the resulting opaque binding is required before any model command route is
+/// constructed.
+struct VerifiedPackProbeExecutableResolver {
+    lease: Arc<VerifiedPackLease>,
+}
+
+impl WorkerExecutableResolver for VerifiedPackProbeExecutableResolver {
+    fn resolve(&self, role: WorkerRole) -> Result<VerifiedWorkerExecutable> {
+        if role != WorkerRole::Inference {
+            bail!("verified GPU worker probes can launch only the inference role");
+        }
+        resolve_verified_pack_executable(Arc::clone(&self.lease), None)
+    }
+}
+
+fn resolve_verified_pack_executable(
+    lease: Arc<VerifiedPackLease>,
+    expected_device: Option<BackendTarget>,
+) -> Result<VerifiedWorkerExecutable> {
+    let pack = lease.verified_pack();
+    let allowed = match pack.backend {
+        PackBackend::Cuda => &[PackBackend::Cuda][..],
+        PackBackend::Vulkan => &[PackBackend::Vulkan][..],
+        PackBackend::Metal => &[PackBackend::Metal][..],
+    };
+    #[cfg(test)]
+    let trust_root = lease
+        .test_reverification_trust()
+        .unwrap_or(&ProductionTrustRoot);
+    #[cfg(not(test))]
+    let trust_root = &ProductionTrustRoot;
+    let verifier = PackVerifier::new(
+        trust_root,
+        crate::gpu_worker_pack::manifest::Compatibility {
+            app_build: DESKTOP_BUILD_ID,
+            worker_build: INFERENCE_WORKER_BUILD_ID,
+            target_os: std::env::consts::OS,
+            target_arch: std::env::consts::ARCH,
+            allowed_backends: allowed,
+        },
+    );
+    let launchable = verifier
+        .launchable_worker(&lease)
+        .context("GPU worker pack changed before launch")?;
+    let worker_path = launchable.path();
+    let expected_sha256 = lease
+        .copy_entries()
+        .iter()
+        .find(|entry| entry.path == pack.worker_relative_path)
+        .map(|entry| entry.sha256.as_str())
+        .ok_or_else(|| anyhow!("GPU worker pack inventory omitted its worker"))?;
+    let root = worker_path
+        .parent()
+        .ok_or_else(|| anyhow!("GPU worker pack executable has no parent directory"))?;
+    let name = worker_path
+        .file_name()
+        .ok_or_else(|| anyhow!("GPU worker pack executable has no filename"))?;
+    let mut executable = verify_worker_executable(worker_path, root, name, expected_sha256)?;
+    executable.pack_launch = Some(PackLaunchContext {
+        expectation: pack_expectation(&lease),
+        lease,
+        expected_device,
+    });
+    Ok(executable)
 }
 
 #[allow(
@@ -1681,6 +2777,20 @@ impl OsWorkerLauncher {
         }
     }
 
+    fn for_pack_binding(binding: VerifiedPackLaunchBinding) -> Self {
+        Self {
+            role: WorkerRole::Inference,
+            resolver: Arc::new(VerifiedPackWorkerExecutableResolver { binding }),
+        }
+    }
+
+    fn for_pack_probe(lease: Arc<VerifiedPackLease>) -> Self {
+        Self {
+            role: WorkerRole::Inference,
+            resolver: Arc::new(VerifiedPackProbeExecutableResolver { lease }),
+        }
+    }
+
     #[cfg(test)]
     fn for_executable(role: WorkerRole, executable: PathBuf) -> Self {
         Self {
@@ -1693,6 +2803,12 @@ impl OsWorkerLauncher {
 impl WorkerLauncher for OsWorkerLauncher {
     fn launch(&self) -> Result<SpawnedWorker> {
         let executable = self.resolver.resolve(self.role)?;
+        let mut expectation = expected_worker(self.role);
+        if let Some(pack) = &executable.pack_launch {
+            expectation.provider = pack.expectation.backend;
+            expectation.pack = Some(pack.expectation.clone());
+            expectation.bundled_worker_sha256 = executable.identity.sha256.clone();
+        }
         let worker_flag = match self.role {
             WorkerRole::Inference => INFERENCE_WORKER_FLAG,
             WorkerRole::Vad => VAD_WORKER_FLAG,
@@ -1710,6 +2826,9 @@ impl WorkerLauncher for OsWorkerLauncher {
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
         configure_worker_environment(&mut command);
+        if let Some(pack) = &executable.pack_launch {
+            configure_worker_pack_environment(&mut command, pack);
+        }
         let mut parent_liveness = ParentLivenessChannel::attach(&mut command)?;
         configure_hidden_worker_command(&mut command);
         let _immediate_identity_check = executable.revalidate()?;
@@ -1733,6 +2852,8 @@ impl WorkerLauncher for OsWorkerLauncher {
                 _process_guard: process_guard,
                 _parent_liveness: parent_liveness,
             }),
+            expectation,
+            pack_launch: executable.pack_launch,
         })
     }
 }
@@ -1791,6 +2912,32 @@ fn configure_worker_environment(command: &mut Command) {
     for name in REQUIRED {
         if let Some(value) = std::env::var_os(name) {
             command.env(name, value);
+        }
+    }
+}
+
+fn configure_worker_pack_environment(command: &mut Command, context: &PackLaunchContext) {
+    let pack = &context.expectation;
+    command
+        .env(PACK_ID_ENV, &pack.pack_id)
+        .env(PACK_VERSION_ENV, &pack.pack_version)
+        .env(PACK_DIGEST_ENV, &pack.pack_digest)
+        .env(PACK_SECURITY_EPOCH_ENV, pack.security_epoch.to_string())
+        .env(PACK_RUNTIME_ABI_ENV, pack.runtime_abi.to_string())
+        .env(
+            PACK_BACKEND_ENV,
+            match pack.backend {
+                WorkerProvider::Cuda => "cuda",
+                WorkerProvider::Vulkan => "vulkan",
+                WorkerProvider::Metal => "metal",
+                WorkerProvider::Cpu => "cpu",
+            },
+        )
+        .env(PACK_PROVIDER_ENV, &pack.provider);
+    if let Some(device) = &context.expected_device {
+        command.env(PACK_DEVICE_ID_ENV, device.device_id.as_str());
+        if let Some(driver) = &device.driver_version {
+            command.env(PACK_DRIVER_ID_ENV, driver);
         }
     }
 }
@@ -2198,6 +3345,14 @@ struct WriterSlot {
 struct CurrentGeneration {
     generation: u64,
     process: Arc<dyn WorkerProcess>,
+    expectation: WorkerExpectation,
+    pack_launch: Option<PackLaunchContext>,
+    pack_bindings: Vec<VerifiedPackLaunchBinding>,
+}
+
+struct WorkerGenerationContext {
+    generation: u64,
+    pack_bindings: Vec<VerifiedPackLaunchBinding>,
 }
 
 #[derive(Clone, Copy)]
@@ -2223,7 +3378,6 @@ struct SupervisorInner {
     // sequentially, never nested. Invalidation uses writer.try_lock so process
     // termination never depends on pipe progress.
     launcher: Arc<dyn WorkerLauncher>,
-    role: WorkerRole,
     deadlines: SupervisorDeadlines,
     spawn_gate: Mutex<()>,
     retirement_changed: Condvar,
@@ -2268,14 +3422,13 @@ impl ProcessWorkerSupervisor {
     }
 
     fn unstarted_for_role_with_launcher_and_deadlines(
-        role: WorkerRole,
+        _role: WorkerRole,
         launcher: Arc<dyn WorkerLauncher>,
         deadlines: SupervisorDeadlines,
     ) -> Self {
         Self {
             inner: Arc::new(SupervisorInner {
                 launcher,
-                role,
                 deadlines,
                 spawn_gate: Mutex::new(()),
                 retirement_changed: Condvar::new(),
@@ -2602,7 +3755,6 @@ impl ProcessWorkerSupervisor {
     /// failed. This is the router's fail-closed boundary for alternate and test
     /// supervisor implementations whose `load` errors do not invalidate their
     /// own process generation.
-    #[cfg(test)]
     pub(crate) fn terminate_current(&self) -> Result<()> {
         let generation = self
             .inner
@@ -2672,6 +3824,8 @@ impl ProcessWorkerSupervisor {
             stdin,
             stdout,
             process,
+            expectation,
+            pack_launch,
         } = spawned;
         let generation = {
             let mut state = self
@@ -2684,6 +3838,9 @@ impl ProcessWorkerSupervisor {
             state.current = Some(CurrentGeneration {
                 generation,
                 process: Arc::clone(&process),
+                expectation: expectation.clone(),
+                pack_launch,
+                pack_bindings: Vec::new(),
             });
             state.active_stream = None;
             state.active_model = None;
@@ -2705,7 +3862,7 @@ impl ProcessWorkerSupervisor {
                 Err(error) => {
                     self.invalidate_generation(
                         generation,
-                        "Silero VAD acquisition deadline expired before Hello",
+                        &format!("{} deadline expired before Hello", deadline.label),
                         true,
                     )?;
                     return Err(error);
@@ -2724,7 +3881,7 @@ impl ProcessWorkerSupervisor {
                 return Err(error);
             }
         };
-        let expected = expected_worker(self.inner.role);
+        let expected = expectation;
         if let Err(error) = self.round_trip_on_generation_with_cancellation(
             generation,
             0,
@@ -3061,7 +4218,8 @@ impl ProcessWorkerSupervisor {
         match self.await_response_with_cancellation(correlation, response, timeout, cancelled)? {
             Control::Ready { capability } if hello.is_some() => {
                 let (challenge, expected) = hello.expect("checked above");
-                validate_worker_capability(&capability, &challenge, &expected)
+                validate_worker_capability(&capability, &challenge, &expected)?;
+                self.bind_generation_pack_capability(generation, &expected, &capability)
             }
             Control::Ok if hello.is_none() => Ok(()),
             Control::Error { message } => bail!("process worker: {message}"),
@@ -3074,6 +4232,58 @@ impl ProcessWorkerSupervisor {
                 bail!("unexpected process worker control response")
             }
         }
+    }
+
+    fn bind_generation_pack_capability(
+        &self,
+        generation: u64,
+        expected: &WorkerExpectation,
+        capability: &WorkerCapability,
+    ) -> Result<()> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| anyhow!("process worker supervisor state lock was poisoned"))?;
+        let current = state
+            .current
+            .as_mut()
+            .filter(|current| current.generation == generation)
+            .ok_or_else(|| anyhow!("process worker generation changed during Hello"))?;
+        if current.expectation != *expected {
+            bail!("process worker launch expectation changed during Hello");
+        }
+        match (&current.pack_launch, &capability.pack) {
+            (None, None) => Ok(()),
+            (Some(context), Some(pack)) => {
+                current.pack_bindings = bind_pack_hello(context, pack)?;
+                Ok(())
+            }
+            _ => bail!("process worker pack capability did not match launch authority"),
+        }
+    }
+
+    fn generation_context(&self) -> Result<WorkerGenerationContext> {
+        let generation = self.ensure_generation()?;
+        Ok(WorkerGenerationContext {
+            generation,
+            pack_bindings: self.pack_bindings_for_generation(generation)?,
+        })
+    }
+
+    fn pack_bindings_for_generation(
+        &self,
+        generation: u64,
+    ) -> Result<Vec<VerifiedPackLaunchBinding>> {
+        self.inner
+            .state
+            .lock()
+            .map_err(|_| anyhow!("process worker supervisor state lock was poisoned"))?
+            .current
+            .as_ref()
+            .filter(|current| current.generation == generation)
+            .map(|current| current.pack_bindings.clone())
+            .ok_or_else(|| anyhow!("process worker generation {generation} is unavailable"))
     }
 
     fn write_frames(&self, generation: u64, frames: &[Frame]) -> Result<()> {
@@ -3827,6 +5037,7 @@ fn retire_unpublished_worker(worker: SpawnedWorker) {
         stdin,
         stdout,
         process,
+        ..
     } = worker;
     drop(stdin);
     drop(stdout);
@@ -3843,6 +5054,7 @@ fn retire_unpublished_worker_synchronously(worker: SpawnedWorker) {
         stdin,
         stdout,
         process,
+        ..
     } = worker;
     drop(stdin);
     drop(stdout);
@@ -4025,6 +5237,65 @@ impl InferenceWorkerSupervisor {
         }
     }
 
+    fn for_pack_binding(binding: VerifiedPackLaunchBinding) -> Self {
+        Self {
+            transport: ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+                Arc::new(OsWorkerLauncher::for_pack_binding(binding)),
+                SupervisorDeadlines::default(),
+            ),
+            next_correlation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
+    fn for_pack_probe(lease: Arc<VerifiedPackLease>) -> Self {
+        Self {
+            transport: ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+                Arc::new(OsWorkerLauncher::for_pack_probe(lease)),
+                SupervisorDeadlines::default(),
+            ),
+            next_correlation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
+    #[cfg(test)]
+    fn verified_pack_bindings(&self) -> Result<Vec<VerifiedPackLaunchBinding>> {
+        let bindings = self.transport.generation_context()?.pack_bindings;
+        if bindings.is_empty() {
+            bail!("inference worker did not produce a verified pack binding");
+        }
+        Ok(bindings)
+    }
+
+    fn verified_pack_bindings_before(
+        &self,
+        deadline: MonotonicDeadline,
+    ) -> Result<Vec<VerifiedPackLaunchBinding>> {
+        let generation = self
+            .transport
+            .ensure_generation_before(Some(deadline), None)?;
+        let bindings = self.transport.pack_bindings_for_generation(generation)?;
+        if bindings.is_empty() {
+            bail!("inference worker did not produce a verified pack binding");
+        }
+        Ok(bindings)
+    }
+
+    fn reconcile_verified_pack_diagnostics(
+        bindings: &[VerifiedPackLaunchBinding],
+        resolved: &mut ResolvedAcceleration,
+    ) -> Result<(), RuntimeError> {
+        if bindings.is_empty() {
+            return Ok(());
+        }
+        if bindings.len() != 1 {
+            return Err(RuntimeError::WorkerUnavailable(
+                "active GPU worker produced an ambiguous device binding".to_owned(),
+            ));
+        }
+        let expected = bindings[0].backend_target();
+        reconcile_verified_pack_target(resolved, expected)
+    }
+
     /// Test-only process launcher for diagnostics that must exercise the real
     /// hidden worker role from a separately built Scribe executable. Production
     /// construction remains pinned to `current_exe()` and cannot be redirected
@@ -4059,9 +5330,9 @@ impl InferenceWorkerSupervisor {
             resolve_cpu_only_acceleration(preference)
                 .map_err(|error| RuntimeError::OnnxUnavailable(error.to_string()))?;
         }
-        let generation = self
+        let context = self
             .transport
-            .ensure_generation()
+            .generation_context()
             .map_err(worker_unavailable)?;
         let correlation = self.next_id();
         let frame = control_frame(
@@ -4076,7 +5347,7 @@ impl InferenceWorkerSupervisor {
         match self
             .transport
             .active_round_trip_with_timeout(
-                generation,
+                context.generation,
                 correlation,
                 correlation,
                 &[frame],
@@ -4084,14 +5355,21 @@ impl InferenceWorkerSupervisor {
             )
             .map_err(worker_unavailable)?
         {
-            Control::RuntimeLoaded { execution } => Ok(execution.into()),
+            Control::RuntimeLoaded { execution } => {
+                let mut execution: RuntimeLoadExecution = execution.into();
+                Self::reconcile_verified_pack_diagnostics(
+                    &context.pack_bindings,
+                    &mut execution.diagnostics.resolved_acceleration,
+                )?;
+                Ok(execution)
+            }
             Control::RuntimeFailed { error } => {
-                Err(error.into_runtime_for_generation(&self.transport, generation))
+                Err(error.into_runtime_for_generation(&self.transport, context.generation))
             }
             Control::Error { message } => Err(RuntimeError::WorkerUnavailable(message)),
             _ => {
                 let _ = self.transport.invalidate_generation(
-                    generation,
+                    context.generation,
                     "unexpected inference load response",
                     true,
                 );
@@ -4119,10 +5397,11 @@ impl InferenceWorkerSupervisor {
         }
         validate_cumulative_pcm_samples(&audio.samples)
             .map_err(|error| RuntimeError::Engine(error.to_string()))?;
-        let generation = self
+        let context = self
             .transport
-            .ensure_generation()
+            .generation_context()
             .map_err(worker_unavailable)?;
+        let generation = context.generation;
         if cancelled() {
             let _ = self.transport.invalidate_generation(
                 generation,
@@ -4225,7 +5504,14 @@ impl InferenceWorkerSupervisor {
             .active_round_trip(generation, session_id, end_id, &[end])
             .map_err(worker_unavailable)?
         {
-            Control::RuntimeTranscript { execution } => Ok(execution.into()),
+            Control::RuntimeTranscript { execution } => {
+                let mut execution: RuntimeExecution = execution.into();
+                Self::reconcile_verified_pack_diagnostics(
+                    &context.pack_bindings,
+                    &mut execution.diagnostics.resolved_acceleration,
+                )?;
+                Ok(execution)
+            }
             Control::RuntimeFailed { error } => {
                 Err(error.into_runtime_for_generation(&self.transport, generation))
             }
@@ -4266,6 +5552,12 @@ impl InferenceWorkerSupervisor {
             return Ok(());
         }
         self.unload()
+    }
+
+    fn retire(&self) -> Result<(), RuntimeError> {
+        self.transport
+            .terminate_current()
+            .map_err(worker_unavailable)
     }
 
     pub(crate) fn cancel_active(&self) {
@@ -4325,6 +5617,54 @@ fn worker_unavailable(error: impl std::fmt::Display) -> RuntimeError {
     RuntimeError::RetryableWorkerFailure(error.to_string())
 }
 
+fn reconcile_verified_pack_target(
+    resolved: &mut ResolvedAcceleration,
+    expected: BackendTarget,
+) -> Result<(), RuntimeError> {
+    let selection = resolved.selection.as_mut().ok_or_else(|| {
+        RuntimeError::WorkerUnavailable(
+            "GPU worker diagnostics omitted the typed backend selection".to_owned(),
+        )
+    })?;
+    let observed = &selection.target;
+    let mut mismatches = Vec::new();
+    for (matches, field) in [
+        (observed.backend == expected.backend, "backend"),
+        (observed.provider_id == expected.provider_id, "provider"),
+        (observed.device_id == expected.device_id, "device identity"),
+        (
+            observed.driver_version == expected.driver_version,
+            "driver identity",
+        ),
+        (
+            observed.device_class == expected.device_class,
+            "device class",
+        ),
+        (observed.vendor == expected.vendor, "vendor"),
+        (
+            observed.memory_total_bytes == expected.memory_total_bytes,
+            "total memory",
+        ),
+    ] {
+        if !matches {
+            mismatches.push(field);
+        }
+    }
+    if !mismatches.is_empty() {
+        return Err(RuntimeError::WorkerUnavailable(format!(
+            "GPU worker runtime diagnostics differ from the verified launch binding: {}",
+            mismatches.join(", ")
+        )));
+    }
+    // BackendTarget deliberately excludes the volatile provider index from
+    // serde so it can never be persisted as device identity. The current
+    // index was already challenge-bound and validated in the fresh Hello;
+    // restore that resolver-owned value when projecting private diagnostics.
+    debug_assert!(observed.process_index.is_none());
+    selection.target = expected;
+    Ok(())
+}
+
 #[derive(Clone)]
 #[allow(
     dead_code,
@@ -4333,6 +5673,164 @@ fn worker_unavailable(error: impl std::fmt::Display) -> RuntimeError {
 struct InferenceWorkerRoute {
     provider: WorkerProvider,
     supervisor: InferenceWorkerSupervisor,
+    target: Option<BackendTarget>,
+    health_key: Option<HealthKey>,
+    consume_retry_bypass: bool,
+}
+
+#[derive(Clone)]
+struct InferenceWorkerRoutePlan {
+    routes: Arc<Vec<InferenceWorkerRoute>>,
+    diagnostic: Option<String>,
+    health: Option<GpuRouteHealth>,
+}
+
+#[derive(Clone)]
+struct VerifiedGpuRouteCatalog {
+    routes: Arc<Vec<InferenceWorkerRoute>>,
+    diagnostic: Option<String>,
+    device_set_digest: String,
+    discovery_fingerprint: String,
+    provider_probe_incomplete: bool,
+}
+
+const GPU_PROVIDER_PROBE_BACKOFF: Duration = Duration::from_secs(15);
+
+#[derive(Clone)]
+struct FailedGpuProbe {
+    discovery_fingerprint: String,
+    retry_not_before: Instant,
+    diagnostic: Option<String>,
+    explicit_retry_available: bool,
+}
+
+#[derive(Default)]
+struct GpuRouteCatalogCache {
+    successful: Option<VerifiedGpuRouteCatalog>,
+    failed: Option<FailedGpuProbe>,
+}
+
+enum GpuRouteCatalogLookup {
+    Successful(VerifiedGpuRouteCatalog),
+    Backoff(Option<String>),
+    Probe,
+}
+
+impl GpuRouteCatalogCache {
+    fn lookup(&self, discovery_fingerprint: &str, now: Instant) -> GpuRouteCatalogLookup {
+        let successful = self.successful.as_ref().filter(|catalog| {
+            !catalog.routes.is_empty() && catalog.discovery_fingerprint == discovery_fingerprint
+        });
+        if let Some(failed) = self
+            .failed
+            .as_ref()
+            .filter(|failed| failed.discovery_fingerprint == discovery_fingerprint)
+        {
+            if now >= failed.retry_not_before {
+                return GpuRouteCatalogLookup::Probe;
+            }
+            return successful.map_or_else(
+                || GpuRouteCatalogLookup::Backoff(failed.diagnostic.clone()),
+                |catalog| GpuRouteCatalogLookup::Successful(catalog.clone()),
+            );
+        }
+        if let Some(catalog) = successful {
+            return GpuRouteCatalogLookup::Successful(catalog.clone());
+        }
+        GpuRouteCatalogLookup::Probe
+    }
+
+    fn record_probe(&mut self, catalog: VerifiedGpuRouteCatalog, now: Instant) {
+        let routes_empty = catalog.routes.is_empty();
+        let retry_required = routes_empty || catalog.provider_probe_incomplete;
+        self.failed = retry_required.then(|| FailedGpuProbe {
+            discovery_fingerprint: catalog.discovery_fingerprint.clone(),
+            retry_not_before: now + GPU_PROVIDER_PROBE_BACKOFF,
+            diagnostic: catalog.diagnostic.clone(),
+            explicit_retry_available: true,
+        });
+        if routes_empty {
+            self.successful = None;
+        } else {
+            self.successful = Some(catalog);
+        }
+    }
+
+    fn grant_explicit_probe_retry(&mut self, discovery_fingerprint: &str, now: Instant) -> bool {
+        let Some(failed) = self.failed.as_mut().filter(|failed| {
+            failed.discovery_fingerprint == discovery_fingerprint && failed.explicit_retry_available
+        }) else {
+            return false;
+        };
+        failed.explicit_retry_available = false;
+        failed.retry_not_before = now;
+        true
+    }
+
+    fn successful(&self) -> Option<&VerifiedGpuRouteCatalog> {
+        self.successful.as_ref()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct InferenceRouteIdentity {
+    provider: WorkerProvider,
+    backend: BackendKind,
+    stable_device_identity: String,
+    driver_version: Option<String>,
+    pack_digest: Option<String>,
+}
+
+#[derive(Clone)]
+struct ActiveInferenceRoute {
+    identity: InferenceRouteIdentity,
+    supervisor: InferenceWorkerSupervisor,
+}
+
+#[derive(Clone)]
+struct GpuRouteHealth {
+    path: Arc<PathBuf>,
+    witnesses: HealthWitnesses,
+}
+
+static GPU_HEALTH_CLOCK: SystemClock = SystemClock;
+
+impl GpuRouteHealth {
+    fn cache(&self) -> HealthCache<'static> {
+        HealthCache::open(&*self.path, self.witnesses.clone(), &GPU_HEALTH_CLOCK)
+    }
+
+    fn consume_retry(&self, route: &InferenceWorkerRoute) -> bool {
+        if !route.consume_retry_bypass {
+            return true;
+        }
+        let Some(key) = route.health_key.as_ref() else {
+            return false;
+        };
+        self.cache().consume_explicit_retry(key).unwrap_or(false)
+    }
+
+    fn record_failure(&self, route: &InferenceWorkerRoute, observation: FailureObservation) {
+        let Some(key) = route.health_key.clone() else {
+            return;
+        };
+        let _ = self.cache().record_observed_failure(key, observation);
+    }
+
+    fn record_idle_probe_success(&self, route: &InferenceWorkerRoute) {
+        let Some(key) = route.health_key.as_ref() else {
+            return;
+        };
+        let _ = self.cache().record_idle_probe_success(key);
+    }
+
+    #[allow(
+        dead_code,
+        reason = "Stage 5 exposes the existing internal explicit-retry action in the UI"
+    )]
+    fn grant_explicit_retry(&self, key: &HealthKey) -> bool {
+        self.cache().grant_explicit_retry(key).unwrap_or(false)
+    }
 }
 
 /// Bounded provider registry above the process supervisor.
@@ -4344,20 +5842,432 @@ struct InferenceWorkerRoute {
 #[derive(Clone)]
 pub(crate) struct InferenceWorkerRegistry {
     routes: Arc<Vec<InferenceWorkerRoute>>,
+    gpu_routes: Arc<Mutex<GpuRouteCatalogCache>>,
+    gpu_health_path: Option<Arc<PathBuf>>,
+    active_route: Arc<Mutex<Option<ActiveInferenceRoute>>>,
+    route_execution: Arc<Mutex<()>>,
+    #[cfg(test)]
+    gpu_routes_for_testing: Option<VerifiedGpuRouteCatalog>,
+}
+
+struct PendingPackProbe {
+    pack_id: crate::gpu_worker_pack::manifest::StoreComponent,
+    backend: crate::gpu_worker_pack::manifest::PackBackend,
+    supervisor: InferenceWorkerSupervisor,
+}
+
+fn discover_pack_launch_bindings_with_budget(
+    probes: Vec<PendingPackProbe>,
+    mut diagnostics: Vec<crate::gpu_worker_pack::PackDiscoveryDiagnostic>,
+    budget: Duration,
+) -> crate::gpu_worker_pack::ProductionPackRegistry {
+    use crate::gpu_worker_pack::{PackDiscoveryDiagnostic, PackDiscoveryIssue};
+
+    let deadline = match MonotonicDeadline::after_for(budget, "GPU provider discovery") {
+        Ok(deadline) => deadline,
+        Err(_) => {
+            diagnostics.push(PackDiscoveryDiagnostic::catalog(
+                PackDiscoveryIssue::ProviderProbeRejected,
+            ));
+            return crate::gpu_worker_pack::ProductionPackRegistry::empty()
+                .with_diagnostics(diagnostics);
+        }
+    };
+    let mut bindings = Vec::new();
+    for probe in probes.into_iter().take(MAX_GPU_PROVIDER_PROBES) {
+        if deadline.remaining().is_err() {
+            diagnostics.push(PackDiscoveryDiagnostic::pack(
+                PackDiscoveryIssue::ProviderProbeRejected,
+                &probe.pack_id,
+                probe.backend,
+            ));
+            continue;
+        }
+        match probe.supervisor.verified_pack_bindings_before(deadline) {
+            Ok(observed) => {
+                for binding in observed {
+                    if binding.backend_target().driver_version.is_none() {
+                        diagnostics.push(PackDiscoveryDiagnostic::pack(
+                            PackDiscoveryIssue::DriverVersionUnavailable,
+                            &probe.pack_id,
+                            probe.backend,
+                        ));
+                    } else {
+                        bindings.push(binding);
+                    }
+                }
+            }
+            Err(_) => diagnostics.push(PackDiscoveryDiagnostic::pack(
+                PackDiscoveryIssue::ProviderProbeRejected,
+                &probe.pack_id,
+                probe.backend,
+            )),
+        }
+        if probe.supervisor.retire().is_err() {
+            diagnostics.push(PackDiscoveryDiagnostic::pack(
+                PackDiscoveryIssue::ProviderProbeRejected,
+                &probe.pack_id,
+                probe.backend,
+            ));
+        }
+    }
+    crate::gpu_worker_pack::ProductionPackRegistry::from_launch_bindings(bindings)
+        .with_diagnostics(diagnostics)
+}
+
+fn discover_production_pack_launch_bindings(
+    discovery: crate::gpu_worker_pack::PackLeaseDiscovery,
+) -> crate::gpu_worker_pack::ProductionPackRegistry {
+    let probes = discovery
+        .leases
+        .into_iter()
+        .take(MAX_GPU_PROVIDER_PROBES)
+        .map(|lease| PendingPackProbe {
+            pack_id: lease.verified_pack().pack_id.clone(),
+            backend: lease.verified_pack().backend,
+            supervisor: InferenceWorkerSupervisor::for_pack_probe(lease),
+        })
+        .collect();
+    discover_pack_launch_bindings_with_budget(
+        probes,
+        discovery.diagnostics,
+        GPU_PROVIDER_DISCOVERY_BUDGET,
+    )
+}
+
+fn append_pack_diagnostic(resolved: &mut ResolvedAcceleration, diagnostic: Option<&str>) {
+    let Some(diagnostic) = diagnostic.filter(|value| !value.is_empty()) else {
+        return;
+    };
+    let combined = match resolved.diagnostic.take() {
+        Some(existing) => format!("{existing}; {diagnostic}"),
+        None => diagnostic.to_owned(),
+    };
+    resolved.diagnostic = Some(combined.chars().take(MAX_DIAGNOSTIC_BYTES).collect());
+}
+
+fn update_health_digest(hasher: &mut Sha256, value: &str) {
+    hasher.update((value.len() as u64).to_le_bytes());
+    hasher.update(value.as_bytes());
+}
+
+fn verified_gpu_device_set_digest(routes: &[InferenceWorkerRoute]) -> String {
+    let mut identities = routes
+        .iter()
+        .filter_map(|route| {
+            let target = route.target.as_ref()?;
+            let pack = target.pack.as_ref()?;
+            let driver = target.driver_version.as_deref()?;
+            Some((
+                target.backend.label(),
+                target.provider_id.as_str(),
+                target.device_id.as_str(),
+                driver,
+                format!("{:?}", target.vendor),
+                format!("{:?}", target.device_class),
+                target.memory_total_bytes,
+                pack.pack_id.as_str(),
+                pack.pack_version.as_str(),
+                pack.pack_digest.as_str(),
+                pack.security_epoch,
+                pack.runtime_abi,
+            ))
+        })
+        .collect::<Vec<_>>();
+    identities.sort();
+    let mut digest = Sha256::new();
+    digest.update((identities.len() as u64).to_le_bytes());
+    for identity in identities {
+        update_health_digest(&mut digest, identity.0);
+        update_health_digest(&mut digest, identity.1);
+        update_health_digest(&mut digest, identity.2);
+        update_health_digest(&mut digest, identity.3);
+        update_health_digest(&mut digest, &identity.4);
+        update_health_digest(&mut digest, &identity.5);
+        digest.update(identity.6.to_le_bytes());
+        update_health_digest(&mut digest, identity.7);
+        update_health_digest(&mut digest, identity.8);
+        update_health_digest(&mut digest, identity.9);
+        digest.update(identity.10.to_le_bytes());
+        digest.update(identity.11.to_le_bytes());
+    }
+    format!("{:x}", digest.finalize())
+}
+
+fn route_health_key(route: &InferenceWorkerRoute, model_digest: &str) -> Option<HealthKey> {
+    let target = route.target.as_ref()?;
+    let pack = target.pack.as_ref()?;
+    let driver = target.driver_version.as_ref()?;
+    let canonical_model_digest = model_digest.to_ascii_lowercase();
+    if canonical_model_digest.len() != 64
+        || !canonical_model_digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return None;
+    }
+    Some(HealthKey {
+        pack_digest: pack.pack_digest.clone(),
+        runtime_abi: pack.runtime_abi,
+        os_arch: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+        driver_version: driver.clone(),
+        stable_device_identity: target.device_id.as_str().to_owned(),
+        model_digest: canonical_model_digest,
+    })
+}
+
+fn append_route_plan_diagnostic(diagnostic: &mut Option<String>, message: &str) {
+    let mut combined = diagnostic.take().unwrap_or_default();
+    if !combined.is_empty() {
+        combined.push_str("; ");
+    }
+    combined.push_str(message);
+    *diagnostic = Some(combined.chars().take(MAX_DIAGNOSTIC_BYTES).collect());
+}
+
+fn health_observation_for_runtime_error(
+    error: &RuntimeError,
+    cancelled: bool,
+    output_published: bool,
+) -> FailureObservation {
+    if output_published {
+        return FailureObservation::PartialOutput;
+    }
+    if cancelled {
+        return FailureObservation::Cancellation;
+    }
+    match error {
+        RuntimeError::InvalidAudio { .. } => FailureObservation::InvalidInput,
+        RuntimeError::ArtifactIntegrity { .. }
+        | RuntimeError::UnsupportedModel(_)
+        | RuntimeError::OnnxUnavailable(_) => FailureObservation::ModelCorruption,
+        RuntimeError::Inference(_) | RuntimeError::Callback(_) | RuntimeError::Engine(_) => {
+            FailureObservation::DecodeContent
+        }
+        RuntimeError::Cancelled(_) => FailureObservation::Cancellation,
+        RuntimeError::RetryableWorkerFailure(_) | RuntimeError::Poisoned => {
+            FailureObservation::WorkerCrash
+        }
+        RuntimeError::WorkerUnavailable(_) => FailureObservation::Protocol,
+    }
+}
+
+fn explicit_gpu_discovery_fingerprint(
+    discovery: &crate::gpu_worker_pack::PackLeaseDiscovery,
+) -> String {
+    let mut digest = Sha256::new();
+    update_health_digest(
+        &mut digest,
+        discovery
+            .catalog_generation
+            .as_deref()
+            .unwrap_or("catalog-unavailable"),
+    );
+    for diagnostic in &discovery.diagnostics {
+        update_health_digest(&mut digest, &format!("{:?}", diagnostic.issue));
+        update_health_digest(
+            &mut digest,
+            diagnostic.pack_id.as_deref().unwrap_or("no-pack"),
+        );
+        update_health_digest(
+            &mut digest,
+            &diagnostic
+                .backend
+                .map(|backend| format!("{backend:?}"))
+                .unwrap_or_else(|| "no-backend".to_owned()),
+        );
+    }
+    let adapter_fingerprint = PackDriverCatalog::discover()
+        .map(|catalog| catalog.fingerprint())
+        .unwrap_or_else(|_| "adapter-metadata-unavailable".to_owned());
+    update_health_digest(&mut digest, &adapter_fingerprint);
+    format!("{:x}", digest.finalize())
+}
+
+fn verified_gpu_route_catalog(
+    registry: crate::gpu_worker_pack::ProductionPackRegistry,
+    discovery_fingerprint: String,
+) -> VerifiedGpuRouteCatalog {
+    let (bindings, diagnostics) = registry.into_parts();
+    let provider_probe_incomplete = diagnostics.iter().any(|diagnostic| {
+        matches!(
+            diagnostic.issue,
+            crate::gpu_worker_pack::PackDiscoveryIssue::ProviderProbeRejected
+                | crate::gpu_worker_pack::PackDiscoveryIssue::DriverVersionUnavailable
+        )
+    });
+    let mut routes = bindings
+        .into_iter()
+        .map(|binding| {
+            let target = binding.backend_target();
+            InferenceWorkerRoute {
+                provider: match target.backend {
+                    BackendKind::Cuda => WorkerProvider::Cuda,
+                    BackendKind::Vulkan => WorkerProvider::Vulkan,
+                    BackendKind::Metal => WorkerProvider::Metal,
+                    BackendKind::Cpu => WorkerProvider::Cpu,
+                },
+                supervisor: InferenceWorkerSupervisor::for_pack_binding(binding),
+                target: Some(target),
+                health_key: None,
+                consume_retry_bypass: false,
+            }
+        })
+        .filter(|route| route.provider.is_gpu())
+        .collect::<Vec<_>>();
+    routes.sort_by(|left, right| {
+        let key = |route: &InferenceWorkerRoute| {
+            let target = route.target.as_ref().expect("GPU route target");
+            (
+                match target.backend {
+                    BackendKind::Cuda => 0,
+                    BackendKind::Vulkan => 1,
+                    BackendKind::Metal => 2,
+                    BackendKind::Cpu => 3,
+                },
+                target.device_id.as_str().to_owned(),
+            )
+        };
+        key(left).cmp(&key(right))
+    });
+    let device_set_digest = verified_gpu_device_set_digest(&routes);
+    let mut diagnostic = crate::gpu_worker_pack::diagnostic_summary(&diagnostics);
+    if routes.len() > 4 {
+        let skipped = routes.len() - 4;
+        if !diagnostic.is_empty() {
+            diagnostic.push_str("; ");
+        }
+        diagnostic.push_str(&format!(
+            "{skipped} additional verified GPU route(s) are outside the four-route fallback bound"
+        ));
+    }
+    VerifiedGpuRouteCatalog {
+        routes: Arc::new(routes),
+        diagnostic: (!diagnostic.is_empty()).then_some(diagnostic),
+        device_set_digest,
+        discovery_fingerprint,
+        provider_probe_incomplete,
+    }
+}
+
+fn health_filtered_gpu_route_plan(
+    catalog: VerifiedGpuRouteCatalog,
+    model_digest: &str,
+    health_path: Option<&Arc<PathBuf>>,
+    allow_unprobed_idle_health: bool,
+) -> InferenceWorkerRoutePlan {
+    if catalog.routes.is_empty() {
+        return InferenceWorkerRoutePlan {
+            routes: catalog.routes,
+            diagnostic: catalog.diagnostic,
+            health: None,
+        };
+    }
+    let Some(path) = health_path else {
+        let mut diagnostic = catalog.diagnostic;
+        append_route_plan_diagnostic(
+            &mut diagnostic,
+            "private GPU health state is unavailable; verified GPU routes were denied",
+        );
+        return InferenceWorkerRoutePlan {
+            routes: Arc::new(Vec::new()),
+            diagnostic,
+            health: None,
+        };
+    };
+    let health = GpuRouteHealth {
+        path: Arc::clone(path),
+        witnesses: HealthWitnesses {
+            app_build: DESKTOP_BUILD_ID.to_owned(),
+            device_set_digest: catalog.device_set_digest,
+        },
+    };
+    let mut diagnostic = catalog.diagnostic;
+    let mut recovery_routes = Vec::with_capacity(catalog.routes.len());
+    let mut routes = Vec::with_capacity(catalog.routes.len());
+    let mut quarantined = 0_usize;
+    let mut awaiting_probe = 0_usize;
+    for base in catalog.routes.iter() {
+        let Some(key) = route_health_key(base, model_digest) else {
+            append_route_plan_diagnostic(
+                &mut diagnostic,
+                "a verified GPU route lacked a complete bounded health identity",
+            );
+            continue;
+        };
+        let mut route = base.clone();
+        route.health_key = Some(key.clone());
+        match health.cache().decision(&key) {
+            HealthDecision::Available => routes.push(route),
+            HealthDecision::RetryBypass => {
+                route.consume_retry_bypass = true;
+                routes.push(route);
+            }
+            HealthDecision::Quarantined { .. } => {
+                quarantined = quarantined.saturating_add(1);
+            }
+            HealthDecision::InvalidOrUnprobed => {
+                awaiting_probe = awaiting_probe.saturating_add(1);
+                if allow_unprobed_idle_health {
+                    recovery_routes.push(route);
+                }
+            }
+        }
+    }
+    if allow_unprobed_idle_health && !recovery_routes.is_empty() {
+        recovery_routes.extend(routes);
+        routes = recovery_routes;
+    }
+    if quarantined != 0 {
+        append_route_plan_diagnostic(
+            &mut diagnostic,
+            &format!("{quarantined} verified GPU route(s) are quarantined"),
+        );
+    }
+    if awaiting_probe != 0 {
+        append_route_plan_diagnostic(
+            &mut diagnostic,
+            &format!(
+                "{awaiting_probe} verified GPU route(s) require successful explicit idle probes"
+            ),
+        );
+    }
+    InferenceWorkerRoutePlan {
+        routes: Arc::new(routes),
+        diagnostic,
+        health: Some(health),
+    }
 }
 
 impl InferenceWorkerRegistry {
+    fn lock_route_execution(&self) -> Result<std::sync::MutexGuard<'_, ()>, RuntimeError> {
+        self.route_execution.lock().map_err(|_| {
+            RuntimeError::WorkerUnavailable("inference route execution lock poisoned".to_owned())
+        })
+    }
+
     pub(crate) fn for_current_build() -> Self {
-        let provider = if cfg!(feature = "vulkan-acceleration") {
-            WorkerProvider::Vulkan
-        } else {
-            WorkerProvider::Cpu
-        };
+        let provider = WorkerProvider::Cpu;
         Self {
             routes: Arc::new(vec![InferenceWorkerRoute {
                 provider,
                 supervisor: InferenceWorkerSupervisor::unstarted(),
+                target: Some(BackendTarget::cpu()),
+                health_key: None,
+                consume_retry_bypass: false,
             }]),
+            gpu_routes: Arc::new(Mutex::new(GpuRouteCatalogCache::default())),
+            gpu_health_path: config::project_dirs().ok().map(|directories| {
+                Arc::new(
+                    directories
+                        .data_local_dir()
+                        .join("gpu-worker-health-v3.json"),
+                )
+            }),
+            active_route: Arc::new(Mutex::new(None)),
+            route_execution: Arc::new(Mutex::new(())),
+            #[cfg(test)]
+            gpu_routes_for_testing: None,
         }
     }
 
@@ -4370,7 +6280,22 @@ impl InferenceWorkerRegistry {
             routes: Arc::new(vec![InferenceWorkerRoute {
                 provider: WorkerProvider::Cpu,
                 supervisor: InferenceWorkerSupervisor::unstarted(),
+                target: Some(BackendTarget::cpu()),
+                health_key: None,
+                consume_retry_bypass: false,
             }]),
+            gpu_routes: Arc::new(Mutex::new(GpuRouteCatalogCache::default())),
+            gpu_health_path: config::project_dirs().ok().map(|directories| {
+                Arc::new(
+                    directories
+                        .data_local_dir()
+                        .join("gpu-worker-health-v3.json"),
+                )
+            }),
+            active_route: Arc::new(Mutex::new(None)),
+            route_execution: Arc::new(Mutex::new(())),
+            #[cfg(test)]
+            gpu_routes_for_testing: None,
         }
     }
 
@@ -4380,19 +6305,257 @@ impl InferenceWorkerRegistry {
             routes: Arc::new(vec![InferenceWorkerRoute {
                 provider: WorkerProvider::Cpu,
                 supervisor,
+                target: Some(BackendTarget::cpu()),
+                health_key: None,
+                consume_retry_bypass: false,
             }]),
+            gpu_routes: Arc::new(Mutex::new(GpuRouteCatalogCache::default())),
+            gpu_health_path: None,
+            active_route: Arc::new(Mutex::new(None)),
+            route_execution: Arc::new(Mutex::new(())),
+            gpu_routes_for_testing: None,
         }
     }
 
-    fn eligible_routes(
+    fn route_identity(route: &InferenceWorkerRoute) -> InferenceRouteIdentity {
+        let target = route
+            .target
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(BackendTarget::cpu);
+        InferenceRouteIdentity {
+            provider: route.provider,
+            backend: target.backend,
+            stable_device_identity: target.device_id.as_str().to_owned(),
+            driver_version: target.driver_version,
+            pack_digest: target.pack.map(|pack| pack.pack_digest),
+        }
+    }
+
+    fn same_supervisor(
+        left: &InferenceWorkerSupervisor,
+        right: &InferenceWorkerSupervisor,
+    ) -> bool {
+        Arc::ptr_eq(&left.transport.inner, &right.transport.inner)
+    }
+
+    fn retire_active_worker(&self) -> Result<(), RuntimeError> {
+        let active = self
+            .active_route
+            .lock()
+            .map_err(|_| {
+                RuntimeError::WorkerUnavailable("active inference route lock poisoned".to_owned())
+            })?
+            .take();
+        if let Some(active) = active {
+            active.supervisor.retire()?;
+        }
+        Ok(())
+    }
+
+    fn prepare_route(&self, route: &InferenceWorkerRoute) -> Result<(), RuntimeError> {
+        let identity = Self::route_identity(route);
+        let prior = {
+            let mut active = self.active_route.lock().map_err(|_| {
+                RuntimeError::WorkerUnavailable("active inference route lock poisoned".to_owned())
+            })?;
+            if active.as_ref().is_some_and(|current| {
+                current.identity == identity
+                    && Self::same_supervisor(&current.supervisor, &route.supervisor)
+            }) {
+                return Ok(());
+            }
+            active.take()
+        };
+        if let Some(prior) = prior {
+            prior.supervisor.retire()?;
+        }
+        *self.active_route.lock().map_err(|_| {
+            RuntimeError::WorkerUnavailable("active inference route lock poisoned".to_owned())
+        })? = Some(ActiveInferenceRoute {
+            identity,
+            supervisor: route.supervisor.clone(),
+        });
+        Ok(())
+    }
+
+    fn retire_failed_route(&self, route: &InferenceWorkerRoute) -> Result<(), RuntimeError> {
+        route.supervisor.retire()?;
+        let identity = Self::route_identity(route);
+        let mut active = self.active_route.lock().map_err(|_| {
+            RuntimeError::WorkerUnavailable("active inference route lock poisoned".to_owned())
+        })?;
+        if active.as_ref().is_some_and(|current| {
+            current.identity == identity
+                && Self::same_supervisor(&current.supervisor, &route.supervisor)
+        }) {
+            *active = None;
+        }
+        Ok(())
+    }
+
+    fn routes_for_preference(
         &self,
         preference: AccelerationPreference,
-    ) -> impl Iterator<Item = &InferenceWorkerRoute> {
-        self.routes.iter().filter(move |route| match preference {
-            AccelerationPreference::Gpu => route.provider.is_gpu(),
-            AccelerationPreference::Cpu => !route.provider.is_gpu(),
-            AccelerationPreference::Auto => true,
-        })
+        artifact: &RuntimeArtifact,
+    ) -> Result<InferenceWorkerRoutePlan, RuntimeError> {
+        self.routes_for_preference_with_idle_health(preference, artifact, false)
+    }
+
+    fn routes_for_preference_with_idle_health(
+        &self,
+        preference: AccelerationPreference,
+        artifact: &RuntimeArtifact,
+        allow_unprobed_idle_health: bool,
+    ) -> Result<InferenceWorkerRoutePlan, RuntimeError> {
+        if preference == AccelerationPreference::Cpu {
+            return Ok(InferenceWorkerRoutePlan {
+                routes: Arc::clone(&self.routes),
+                diagnostic: None,
+                health: None,
+            });
+        }
+        if preference == AccelerationPreference::Auto {
+            // Auto remains deliberately default-denied for Stage 4. It does
+            // not launch a provider merely to calibrate or probe the machine.
+            let discovery = crate::gpu_worker_pack::discover_production_pack_leases();
+            return Ok(InferenceWorkerRoutePlan {
+                routes: Arc::clone(&self.routes),
+                diagnostic: Some(discovery.diagnostic_summary()),
+                health: None,
+            });
+        }
+        let RuntimeArtifact::Gguf(model) = artifact else {
+            return Ok(InferenceWorkerRoutePlan {
+                routes: Arc::new(Vec::new()),
+                diagnostic: Some(
+                    "verified GPU worker packs support only pinned GGUF artifacts".to_owned(),
+                ),
+                health: None,
+            });
+        };
+
+        #[cfg(test)]
+        if let Some(catalog) = self.gpu_routes_for_testing.as_ref() {
+            if self.gpu_health_path.is_some() {
+                return Ok(health_filtered_gpu_route_plan(
+                    catalog.clone(),
+                    &model.expected_sha256,
+                    self.gpu_health_path.as_ref(),
+                    allow_unprobed_idle_health,
+                ));
+            }
+            return Ok(InferenceWorkerRoutePlan {
+                routes: Arc::clone(&catalog.routes),
+                diagnostic: catalog.diagnostic.clone(),
+                health: None,
+            });
+        }
+
+        // Catalog activation and Windows SetupAPI adapter metadata provide a
+        // cheap request-bound fingerprint. Reuse the warm winning supervisor
+        // while it is unchanged; a changed fingerprint retires that worker
+        // before any provider probe can start.
+        let lease_discovery = crate::gpu_worker_pack::discover_production_pack_leases();
+        let discovery_fingerprint = explicit_gpu_discovery_fingerprint(&lease_discovery);
+        let lookup_at = Instant::now();
+        let cached_catalog = {
+            let cached = self.gpu_routes.lock().map_err(|_| {
+                RuntimeError::WorkerUnavailable("GPU worker registry lock poisoned".to_owned())
+            })?;
+            cached.lookup(&discovery_fingerprint, lookup_at)
+        };
+        let catalog = match cached_catalog {
+            GpuRouteCatalogLookup::Successful(cached) => cached,
+            GpuRouteCatalogLookup::Backoff(diagnostic) => VerifiedGpuRouteCatalog {
+                routes: Arc::new(Vec::new()),
+                diagnostic,
+                device_set_digest: verified_gpu_device_set_digest(&[]),
+                discovery_fingerprint,
+                provider_probe_incomplete: true,
+            },
+            GpuRouteCatalogLookup::Probe => {
+                self.retire_active_worker()?;
+                let discovered = verified_gpu_route_catalog(
+                    discover_production_pack_launch_bindings(lease_discovery),
+                    discovery_fingerprint,
+                );
+                let probe_completed_at = Instant::now();
+                self.gpu_routes
+                    .lock()
+                    .map_err(|_| {
+                        RuntimeError::WorkerUnavailable(
+                            "GPU worker registry lock poisoned".to_owned(),
+                        )
+                    })?
+                    .record_probe(discovered.clone(), probe_completed_at);
+                discovered
+            }
+        };
+
+        Ok(health_filtered_gpu_route_plan(
+            catalog,
+            &model.expected_sha256,
+            self.gpu_health_path.as_ref(),
+            allow_unprobed_idle_health,
+        ))
+    }
+
+    #[allow(
+        dead_code,
+        reason = "Stage 5 connects this exact-target retry authority to diagnostics UI"
+    )]
+    pub(crate) fn grant_explicit_gpu_retry(
+        &self,
+        artifact: &RuntimeArtifact,
+        target: &BackendTarget,
+    ) -> Result<bool, RuntimeError> {
+        let RuntimeArtifact::Gguf(model) = artifact else {
+            return Ok(false);
+        };
+        let Some(path) = self.gpu_health_path.as_ref() else {
+            return Ok(false);
+        };
+        let cached = self.gpu_routes.lock().map_err(|_| {
+            RuntimeError::WorkerUnavailable("GPU worker registry lock poisoned".to_owned())
+        })?;
+        let Some(catalog) = cached.successful() else {
+            return Ok(false);
+        };
+        let health = GpuRouteHealth {
+            path: Arc::clone(path),
+            witnesses: HealthWitnesses {
+                app_build: DESKTOP_BUILD_ID.to_owned(),
+                device_set_digest: catalog.device_set_digest.clone(),
+            },
+        };
+        let key = catalog.routes.iter().find_map(|route| {
+            let candidate = route.target.as_ref()?;
+            (candidate.backend == target.backend
+                && candidate.device_id == target.device_id
+                && candidate.driver_version == target.driver_version
+                && candidate.pack == target.pack)
+                .then(|| route_health_key(route, &model.expected_sha256))
+                .flatten()
+        });
+        Ok(key.is_some_and(|key| health.grant_explicit_retry(&key)))
+    }
+
+    #[allow(
+        dead_code,
+        reason = "Stage 5 connects this bounded provider-reprobe action to diagnostics UI"
+    )]
+    pub(crate) fn grant_explicit_gpu_provider_probe_retry(&self) -> Result<bool, RuntimeError> {
+        let discovery = crate::gpu_worker_pack::discover_production_pack_leases();
+        let fingerprint = explicit_gpu_discovery_fingerprint(&discovery);
+        let granted = self
+            .gpu_routes
+            .lock()
+            .map_err(|_| {
+                RuntimeError::WorkerUnavailable("GPU worker registry lock poisoned".to_owned())
+            })?
+            .grant_explicit_probe_retry(&fingerprint, Instant::now());
+        Ok(granted)
     }
 
     fn no_route_error(preference: AccelerationPreference) -> RuntimeError {
@@ -4412,21 +6575,68 @@ impl InferenceWorkerRegistry {
         artifact: RuntimeArtifact,
         preference: AccelerationPreference,
     ) -> Result<RuntimeLoadExecution, RuntimeError> {
+        let _route_execution = self.lock_route_execution()?;
         let mut last_retryable = None;
         let mut attempted = false;
-        for route in self.eligible_routes(preference).take(4) {
+        let plan = self.routes_for_preference(preference, &artifact)?;
+        if plan.routes.is_empty() {
+            self.retire_active_worker()?;
+        }
+        for route in plan.routes.iter().take(4) {
+            if plan
+                .health
+                .as_ref()
+                .is_some_and(|health| !health.consume_retry(route))
+            {
+                continue;
+            }
             attempted = true;
+            self.prepare_route(route)?;
             match route.supervisor.load(artifact.clone(), preference) {
-                Ok(execution) => return Ok(execution),
+                Ok(mut execution) => {
+                    if matches!(artifact, RuntimeArtifact::Gguf(_)) {
+                        append_pack_diagnostic(
+                            &mut execution.diagnostics.resolved_acceleration,
+                            plan.diagnostic.as_deref(),
+                        );
+                    }
+                    return Ok(execution);
+                }
                 Err(error @ RuntimeError::RetryableWorkerFailure(_)) => {
+                    if let Some(health) = &plan.health {
+                        health.record_failure(
+                            route,
+                            health_observation_for_runtime_error(&error, false, false),
+                        );
+                    }
+                    self.retire_failed_route(route)?;
                     last_retryable = Some(error);
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    if let Some(health) = &plan.health {
+                        health.record_failure(
+                            route,
+                            health_observation_for_runtime_error(&error, false, false),
+                        );
+                    }
+                    self.retire_failed_route(route)?;
+                    return Err(error);
+                }
             }
+        }
+        if !attempted {
+            self.retire_active_worker()?;
         }
         Err(last_retryable.unwrap_or_else(|| {
             debug_assert!(!attempted);
-            Self::no_route_error(preference)
+            match plan.diagnostic {
+                Some(diagnostic) if preference == AccelerationPreference::Gpu => {
+                    RuntimeError::WorkerUnavailable(format!(
+                        "no GPU inference worker is registered; CPU fallback is forbidden for explicit GPU; {diagnostic}"
+                    ))
+                }
+                _ => Self::no_route_error(preference),
+            }
         }))
     }
 
@@ -4439,10 +6649,23 @@ impl InferenceWorkerRegistry {
         cancellation_snapshot: u64,
         cancellation_generation: &std::sync::atomic::AtomicU64,
     ) -> Result<RuntimeExecution, RuntimeError> {
+        let _route_execution = self.lock_route_execution()?;
         let mut last_retryable = None;
         let mut attempted = false;
-        for route in self.eligible_routes(preference).take(4) {
+        let plan = self.routes_for_preference(preference, &artifact)?;
+        if plan.routes.is_empty() {
+            self.retire_active_worker()?;
+        }
+        for route in plan.routes.iter().take(4) {
+            if plan
+                .health
+                .as_ref()
+                .is_some_and(|health| !health.consume_retry(route))
+            {
+                continue;
+            }
             attempted = true;
+            self.prepare_route(route)?;
             match route.supervisor.transcribe(
                 artifact.clone(),
                 preference,
@@ -4451,16 +6674,59 @@ impl InferenceWorkerRegistry {
                 cancellation_snapshot,
                 cancellation_generation,
             ) {
-                Ok(execution) => return Ok(execution),
+                Ok(mut execution) => {
+                    if matches!(artifact, RuntimeArtifact::Gguf(_)) {
+                        append_pack_diagnostic(
+                            &mut execution.diagnostics.resolved_acceleration,
+                            plan.diagnostic.as_deref(),
+                        );
+                    }
+                    return Ok(execution);
+                }
                 Err(error @ RuntimeError::RetryableWorkerFailure(_)) => {
+                    let cancelled =
+                        cancellation_generation.load(Ordering::Acquire) != cancellation_snapshot;
+                    if let Some(health) = &plan.health {
+                        health.record_failure(
+                            route,
+                            health_observation_for_runtime_error(&error, cancelled, false),
+                        );
+                    }
+                    self.retire_failed_route(route)?;
+                    if cancelled {
+                        return Err(RuntimeError::Cancelled(
+                            "transcription request was cancelled before output".to_owned(),
+                        ));
+                    }
                     last_retryable = Some(error);
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    let cancelled =
+                        cancellation_generation.load(Ordering::Acquire) != cancellation_snapshot;
+                    if let Some(health) = &plan.health {
+                        health.record_failure(
+                            route,
+                            health_observation_for_runtime_error(&error, cancelled, false),
+                        );
+                    }
+                    self.retire_failed_route(route)?;
+                    return Err(error);
+                }
             }
+        }
+        if !attempted {
+            self.retire_active_worker()?;
         }
         Err(last_retryable.unwrap_or_else(|| {
             debug_assert!(!attempted);
-            Self::no_route_error(preference)
+            match plan.diagnostic {
+                Some(diagnostic) if preference == AccelerationPreference::Gpu => {
+                    RuntimeError::WorkerUnavailable(format!(
+                        "no GPU inference worker is registered; CPU fallback is forbidden for explicit GPU; {diagnostic}"
+                    ))
+                }
+                _ => Self::no_route_error(preference),
+            }
         }))
     }
 
@@ -4469,47 +6735,117 @@ impl InferenceWorkerRegistry {
         artifact: RuntimeArtifact,
         preference: AccelerationPreference,
     ) -> Result<(), RuntimeError> {
+        let _route_execution = self.lock_route_execution()?;
         let mut last_retryable = None;
         let mut attempted = false;
-        for route in self.eligible_routes(preference).take(4) {
+        // A health request is the only execution path allowed to exercise an
+        // exact InvalidOrUnprobed route. Normal load/transcription selection
+        // remains fail-closed until two successful health probes persist.
+        let plan = self.routes_for_preference_with_idle_health(
+            preference,
+            &artifact,
+            preference == AccelerationPreference::Gpu,
+        )?;
+        if plan.routes.is_empty() {
+            self.retire_active_worker()?;
+        }
+        for route in plan.routes.iter().take(4) {
+            if plan
+                .health
+                .as_ref()
+                .is_some_and(|health| !health.consume_retry(route))
+            {
+                continue;
+            }
             attempted = true;
+            self.prepare_route(route)?;
             match route.supervisor.health(artifact.clone(), preference) {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    if let Some(health) = &plan.health {
+                        health.record_idle_probe_success(route);
+                    }
+                    return Ok(());
+                }
                 Err(error @ RuntimeError::RetryableWorkerFailure(_)) => {
+                    if let Some(health) = &plan.health {
+                        health.record_failure(
+                            route,
+                            health_observation_for_runtime_error(&error, false, false),
+                        );
+                    }
+                    self.retire_failed_route(route)?;
                     last_retryable = Some(error);
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    if let Some(health) = &plan.health {
+                        health.record_failure(
+                            route,
+                            health_observation_for_runtime_error(&error, false, false),
+                        );
+                    }
+                    self.retire_failed_route(route)?;
+                    return Err(error);
+                }
             }
+        }
+        if !attempted {
+            self.retire_active_worker()?;
         }
         Err(last_retryable.unwrap_or_else(|| {
             debug_assert!(!attempted);
-            Self::no_route_error(preference)
+            match plan.diagnostic {
+                Some(diagnostic) if preference == AccelerationPreference::Gpu => {
+                    RuntimeError::WorkerUnavailable(format!(
+                        "no GPU inference worker is registered; CPU fallback is forbidden for explicit GPU; {diagnostic}"
+                    ))
+                }
+                _ => Self::no_route_error(preference),
+            }
         }))
     }
 
     pub(crate) fn unload(&self) -> Result<(), RuntimeError> {
-        for route in self.routes.iter() {
-            route.supervisor.unload()?;
+        let _route_execution = self.lock_route_execution()?;
+        let active = self.active_route.lock().map_err(|_| {
+            RuntimeError::WorkerUnavailable("active inference route lock poisoned".to_owned())
+        })?;
+        if let Some(active) = active.as_ref() {
+            active.supervisor.unload()?;
         }
         Ok(())
     }
 
     pub(crate) fn unload_if_idle(&self) -> Result<(), RuntimeError> {
-        for route in self.routes.iter() {
-            route.supervisor.unload_if_idle()?;
+        let _route_execution = self.lock_route_execution()?;
+        let active = self.active_route.lock().map_err(|_| {
+            RuntimeError::WorkerUnavailable("active inference route lock poisoned".to_owned())
+        })?;
+        if let Some(active) = active.as_ref() {
+            active.supervisor.unload_if_idle()?;
         }
         Ok(())
     }
 
     pub(crate) fn cancel_active(&self) {
-        for route in self.routes.iter() {
-            route.supervisor.cancel_active();
+        if let Ok(active) = self.active_route.lock()
+            && let Some(active) = active.as_ref()
+        {
+            active.supervisor.cancel_active();
         }
     }
 
     pub(crate) fn shutdown(&self) -> Result<(), RuntimeError> {
+        let _route_execution = self.lock_route_execution()?;
+        self.retire_active_worker()?;
         for route in self.routes.iter() {
             route.supervisor.shutdown()?;
+        }
+        if let Ok(routes) = self.gpu_routes.lock()
+            && let Some(routes) = routes.successful()
+        {
+            for route in routes.routes.iter() {
+                route.supervisor.shutdown()?;
+            }
         }
         Ok(())
     }
@@ -6091,6 +8427,7 @@ mod tests {
         InvalidResponse {
             pcm_kind: bool,
         },
+        RuntimeLoadThenExit,
         VadNormal,
         VadCrashOnWindow,
         VadCrashOnReset,
@@ -6172,7 +8509,7 @@ mod tests {
                 let output = ChannelWriter {
                     sender: worker_output,
                 };
-                run_test_worker(input, output, mode);
+                run_test_worker(input, output, mode, &worker_process.running);
                 worker_process.running.store(false, Ordering::Release);
                 let _ = worker_output_for_exit.send(PipeChunk::Eof);
             });
@@ -6183,6 +8520,8 @@ mod tests {
                 }),
                 stdout: Box::new(ChannelReader::new(parent_output)),
                 process,
+                expectation: expected_worker(WorkerRole::Inference),
+                pack_launch: None,
             })
         }
     }
@@ -6300,7 +8639,12 @@ mod tests {
         }
     }
 
-    fn run_test_worker(mut input: impl Read, mut output: impl Write, mode: TestMode) {
+    fn run_test_worker(
+        mut input: impl Read,
+        mut output: impl Write,
+        mode: TestMode,
+        running: &AtomicBool,
+    ) {
         let mode = match mode {
             TestMode::CapabilityMismatch(mismatch) => {
                 let (session_id, request_id, control) = read_parent_control(&mut input);
@@ -6473,6 +8817,35 @@ mod tests {
                     control_frame(session_id, request_id, &Control::Health).unwrap()
                 };
                 write_frame(&mut output, &frame).unwrap();
+            }
+            TestMode::RuntimeLoadThenExit => {
+                let (session_id, request_id, control) = read_parent_control(&mut input);
+                let Control::LoadRuntime { preference, .. } = control else {
+                    panic!("expected runtime load request");
+                };
+                running.store(false, Ordering::Release);
+                respond(
+                    &mut output,
+                    session_id,
+                    request_id,
+                    Control::RuntimeLoaded {
+                        execution: WireRuntimeLoadExecution {
+                            diagnostics: WireRuntimeDiagnostics {
+                                resolved_acceleration: ResolvedAcceleration {
+                                    requested: preference,
+                                    resolved: ComputeDevice::Cpu,
+                                    diagnostic: None,
+                                    selection: None,
+                                },
+                                runtime_location: PathBuf::from("test-worker-runtime"),
+                                warm_reused: false,
+                                model_load_duration_ms: 1,
+                            },
+                            detected_architecture: "test-runtime".to_owned(),
+                            capabilities: RuntimeCapabilities::default(),
+                        },
+                    },
+                );
             }
         }
     }
@@ -6873,7 +9246,9 @@ mod tests {
 
     #[test]
     fn compiled_inference_route_matches_the_worker_provider() {
-        let expected = if cfg!(feature = "vulkan-acceleration") {
+        let expected = if cfg!(feature = "cuda-acceleration") {
+            WorkerProvider::Cuda
+        } else if cfg!(feature = "vulkan-acceleration") {
             WorkerProvider::Vulkan
         } else {
             WorkerProvider::Cpu
@@ -6885,8 +9260,491 @@ mod tests {
         );
         assert_eq!(
             InferenceWorkerRegistry::for_current_build().routes[0].provider,
-            expected
+            WorkerProvider::Cpu
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn fixture_pack_launch_reverifies_with_fixture_only_trust() {
+        let root =
+            crate::gpu_worker_pack::manifest::test_support::temp_root("pack-fixture-launch-trust");
+        let (_, lease) = crate::gpu_worker_pack::manifest::test_support::leased_fixture(&root);
+        let executable = resolve_verified_pack_executable(Arc::new(lease), None)
+            .expect("fixture launch must reverify with its test-only trust authority");
+        assert_eq!(
+            executable
+                .pack_launch
+                .as_ref()
+                .expect("fixture launch keeps verified pack authority")
+                .expectation
+                .backend,
+            WorkerProvider::Vulkan
+        );
+        drop(executable);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn verified_pack_hello_remaps_index_by_exact_stable_identity() {
+        let root = crate::gpu_worker_pack::manifest::test_support::temp_root("pack-hello-remap");
+        let (_, lease) = crate::gpu_worker_pack::manifest::test_support::leased_fixture(&root);
+        let lease = Arc::new(lease);
+        let expectation = pack_expectation(&lease);
+        let mut expected = backend_target(BackendKind::Vulkan, "native:pci:0000:01:00.0", Some(9));
+        expected.vendor = GpuVendor::Nvidia;
+        expected.driver_version = Some("fixture-driver-1".to_owned());
+        let context = PackLaunchContext {
+            lease,
+            expectation: expectation.clone(),
+            expected_device: Some(expected.clone()),
+        };
+        let capability = WorkerPackCapability {
+            expectation,
+            devices: vec![WorkerPackDeviceCapability {
+                stable_device_identity: "native:pci:0000:01:00.0".to_owned(),
+                process_index: 2,
+                display_name: "Fixture NVIDIA GPU".to_owned(),
+                driver_version: Some("fixture-driver-1".to_owned()),
+                device_class: DeviceClass::DiscreteGpu,
+                vendor: GpuVendor::Nvidia,
+                memory_total_bytes: 8 * 1024 * 1024 * 1024,
+                memory_available_bytes: 6 * 1024 * 1024 * 1024,
+            }],
+        };
+        assert_eq!(capability.expectation.backend, WorkerProvider::Vulkan);
+        assert_eq!(
+            capability.devices[0].stable_device_identity,
+            expected.device_id.as_str()
+        );
+        assert_eq!(capability.devices[0].vendor, expected.vendor);
+        assert_eq!(capability.devices[0].device_class, expected.device_class);
+        assert_eq!(
+            capability.devices[0].driver_version,
+            expected.driver_version
+        );
+        assert_eq!(
+            capability.devices[0].memory_total_bytes,
+            expected.memory_total_bytes
+        );
+        let bindings =
+            bind_pack_hello(&context, &capability).expect("stable identity remaps index");
+        assert_eq!(bindings[0].backend_target().process_index, Some(2));
+
+        let mut changed_driver = capability.clone();
+        changed_driver.devices[0].driver_version = Some("fixture-driver-2".to_owned());
+        assert!(bind_pack_hello(&context, &changed_driver).is_err());
+        let mut wrong_device = capability;
+        wrong_device.devices[0].stable_device_identity = "native:pci:0000:02:00.0".to_owned();
+        assert!(bind_pack_hello(&context, &wrong_device).is_err());
+        drop(bindings);
+        drop(context);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn verified_pack_launch_never_exports_a_process_index() {
+        let root = crate::gpu_worker_pack::manifest::test_support::temp_root("pack-index-env");
+        let (_, lease) = crate::gpu_worker_pack::manifest::test_support::leased_fixture(&root);
+        let lease = Arc::new(lease);
+        let expectation = pack_expectation(&lease);
+        let mut expected =
+            backend_target(BackendKind::Vulkan, "native:luid:0000000000000001", Some(7));
+        expected.driver_version = Some("vulkan:10de:1:1:fixture".to_owned());
+        let context = PackLaunchContext {
+            lease,
+            expectation,
+            expected_device: Some(expected),
+        };
+        let mut command = Command::new("scribe-inference-worker.exe");
+
+        configure_worker_pack_environment(&mut command, &context);
+
+        let environment = command
+            .get_envs()
+            .filter_map(|(key, value)| {
+                value.map(|value| {
+                    (
+                        key.to_string_lossy().into_owned(),
+                        value.to_string_lossy().into_owned(),
+                    )
+                })
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            environment.get(PACK_DEVICE_ID_ENV).map(String::as_str),
+            Some("native:luid:0000000000000001")
+        );
+        assert!(!environment.contains_key("SCRIBE_PRIVATE_PACK_DEVICE_PROCESS_INDEX"));
+        drop(context);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn launched_worker_uses_its_own_hello_index_not_a_prior_probe_index() {
+        clear_current_pack_runtime_devices();
+        let probe_process_index = 9;
+        let capability = WorkerPackCapability {
+            expectation: WorkerPackExpectation {
+                pack_id: "scribe-vulkan-windows-x64".to_owned(),
+                pack_version: "fixture".to_owned(),
+                pack_digest: "a".repeat(64),
+                security_epoch: 1,
+                runtime_abi: WORKER_ABI_VERSION,
+                backend: WorkerProvider::Vulkan,
+                provider: "transcribe-cpp-ggml-vulkan".to_owned(),
+            },
+            // The launch worker re-enumerated this device at index two. The
+            // earlier probe used index nine for the same stable LUID.
+            devices: vec![WorkerPackDeviceCapability {
+                stable_device_identity: "native:luid:0000000000000001".to_owned(),
+                process_index: 2,
+                display_name: "Fixture NVIDIA GPU".to_owned(),
+                driver_version: Some("vulkan:10de:1:1:fixture".to_owned()),
+                device_class: DeviceClass::DiscreteGpu,
+                vendor: GpuVendor::Nvidia,
+                memory_total_bytes: 8 * 1024 * 1024 * 1024,
+                memory_available_bytes: 6 * 1024 * 1024 * 1024,
+            }],
+        };
+
+        install_current_pack_runtime_devices(&capability);
+
+        assert_eq!(
+            current_pack_runtime_device(
+                "native:luid:0000000000000001",
+                "transcribe-cpp-ggml-vulkan",
+            )
+            .map(|device| device.process_index),
+            Some(2)
+        );
+        assert_ne!(
+            current_pack_runtime_device(
+                "native:luid:0000000000000001",
+                "transcribe-cpp-ggml-vulkan",
+            )
+            .map(|device| device.process_index),
+            Some(probe_process_index)
+        );
+        assert_eq!(
+            current_pack_runtime_device("native:luid:0000000000000001", "transcribe-cpp-ggml-cuda",),
+            None
+        );
+        clear_current_pack_runtime_devices();
+    }
+
+    #[test]
+    fn full_provider_enumeration_rejects_duplicate_indexes_before_device_filtering() {
+        let device = |identity: &str| WorkerPackDeviceCapability {
+            stable_device_identity: identity.to_owned(),
+            process_index: 2,
+            display_name: format!("Fixture {identity}"),
+            driver_version: Some("vulkan:10de:1:1:fixture".to_owned()),
+            device_class: DeviceClass::DiscreteGpu,
+            vendor: GpuVendor::Nvidia,
+            memory_total_bytes: 8 * 1024 * 1024 * 1024,
+            memory_available_bytes: 6 * 1024 * 1024 * 1024,
+        };
+        let all_provider_devices = vec![
+            device("native:luid:0000000000000001"),
+            device("native:luid:0000000000000002"),
+        ];
+        let selected_only = all_provider_devices
+            .iter()
+            .filter(|device| device.stable_device_identity == "native:luid:0000000000000001")
+            .collect::<Vec<_>>();
+
+        assert_eq!(selected_only.len(), 1);
+        assert!(validate_unique_provider_process_indexes(&all_provider_devices).is_err());
+    }
+
+    #[test]
+    fn verified_pack_probe_binds_every_sorted_device_and_rejects_bad_lists() {
+        let root = crate::gpu_worker_pack::manifest::test_support::temp_root("pack-device-list");
+        let (_, lease) = crate::gpu_worker_pack::manifest::test_support::leased_fixture(&root);
+        let lease = Arc::new(lease);
+        let expectation = pack_expectation(&lease);
+        let context = PackLaunchContext {
+            lease,
+            expectation: expectation.clone(),
+            expected_device: None,
+        };
+        let device = |identity: &str, index: usize| WorkerPackDeviceCapability {
+            stable_device_identity: identity.to_owned(),
+            process_index: index,
+            display_name: format!("Fixture GPU {index}"),
+            driver_version: Some("windows-display:32.0.15.8088".to_owned()),
+            device_class: DeviceClass::DiscreteGpu,
+            vendor: GpuVendor::Nvidia,
+            memory_total_bytes: 8 * 1024 * 1024 * 1024,
+            memory_available_bytes: 6 * 1024 * 1024 * 1024,
+        };
+        let first = device("native:pci:0000:01:00.0", 7);
+        let second = device("native:pci:0000:02:00.0", 2);
+        let capability = WorkerPackCapability {
+            expectation: expectation.clone(),
+            devices: vec![first.clone(), second.clone()],
+        };
+        let bindings = bind_pack_hello(&context, &capability).unwrap();
+        assert_eq!(bindings.len(), 2);
+        assert_eq!(bindings[0].backend_target().process_index, Some(7));
+        assert_eq!(bindings[1].backend_target().process_index, Some(2));
+
+        let reordered = WorkerPackCapability {
+            expectation: expectation.clone(),
+            devices: vec![second.clone(), first.clone()],
+        };
+        assert!(bind_pack_hello(&context, &reordered).is_err());
+        let duplicate = WorkerPackCapability {
+            expectation: expectation.clone(),
+            devices: vec![first.clone(), first.clone()],
+        };
+        assert!(bind_pack_hello(&context, &duplicate).is_err());
+        let mut duplicate_index_second = second.clone();
+        duplicate_index_second.process_index = first.process_index;
+        let duplicate_index = WorkerPackCapability {
+            expectation: expectation.clone(),
+            devices: vec![first.clone(), duplicate_index_second],
+        };
+        assert!(bind_pack_hello(&context, &duplicate_index).is_err());
+        let oversized = WorkerPackCapability {
+            expectation: expectation.clone(),
+            devices: (0..=MAX_PACK_DEVICES)
+                .map(|index| device(&format!("native:pci:0000:{index:02x}:00.0"), index))
+                .collect(),
+        };
+        assert!(bind_pack_hello(&context, &oversized).is_err());
+        let malformed = WorkerPackCapability {
+            expectation,
+            devices: vec![device("NATIVE:PCI:0000:01:00.0", 0)],
+        };
+        assert!(bind_pack_hello(&context, &malformed).is_err());
+        drop(bindings);
+        drop(context);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn native_pci_identity_parser_is_canonical_and_bounded() {
+        assert_eq!(
+            parse_native_pci_location("native:pci:0000:01:00.0"),
+            Some((1, 0, 0))
+        );
+        assert_eq!(
+            parse_native_pci_location("native:0000:ff:1f.7"),
+            Some((255, 31, 7))
+        );
+        assert_eq!(
+            parse_native_pci_location("native:pci:00000000:01:00.0"),
+            Some((1, 0, 0))
+        );
+        for invalid in [
+            "pci:0000:01:00.0",
+            "native:pci:0001:01:00.0",
+            "native:pci:0000:100:00.0",
+            "native:pci:0000:01:20.0",
+            "native:pci:0000:01:00.8",
+            "native:pci:0000:01:00",
+            "native:pci:0000:01:00.0:extra",
+            "native:pci:0000:0A:00.0",
+        ] {
+            assert_eq!(parse_native_pci_location(invalid), None, "{invalid}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn vulkan_identity_catalog_handles_missing_and_opaque_provider_ids() {
+        let catalog_device = |identity: &str| VulkanDeviceIdentity {
+            normalized_display_name: "fixture gpu".to_owned(),
+            device_class: DeviceClass::DiscreteGpu,
+            vendor: GpuVendor::Nvidia,
+            stable_device_identity: identity.to_owned(),
+            driver_identity: "vulkan:10de:1:1:fixture".to_owned(),
+            claimed: false,
+        };
+        let drivers = PackDriverCatalog {
+            by_pci_location: BTreeMap::new(),
+        };
+
+        let mut missing_id_catalog = VulkanDeviceCatalog {
+            devices: vec![catalog_device("native:luid:0000000000000001")],
+        };
+        assert_eq!(
+            resolve_vulkan_provider_identity(
+                None,
+                "Fixture GPU",
+                DeviceClass::DiscreteGpu,
+                GpuVendor::Nvidia,
+                &drivers,
+                &mut missing_id_catalog,
+            )
+            .unwrap(),
+            (
+                "native:luid:0000000000000001".to_owned(),
+                "vulkan:10de:1:1:fixture".to_owned(),
+            )
+        );
+
+        let mut opaque_id_catalog = VulkanDeviceCatalog {
+            devices: vec![catalog_device(
+                "native:uuid:00112233445566778899aabbccddeeff",
+            )],
+        };
+        assert_eq!(
+            resolve_vulkan_provider_identity(
+                Some("opaque-provider-token"),
+                "Fixture GPU",
+                DeviceClass::DiscreteGpu,
+                GpuVendor::Nvidia,
+                &drivers,
+                &mut opaque_id_catalog,
+            )
+            .unwrap(),
+            (
+                "native:uuid:00112233445566778899aabbccddeeff".to_owned(),
+                "vulkan:10de:1:1:fixture".to_owned(),
+            )
+        );
+
+        let mut ambiguous_catalog = VulkanDeviceCatalog {
+            devices: vec![
+                catalog_device("native:luid:0000000000000001"),
+                catalog_device("native:luid:0000000000000002"),
+            ],
+        };
+        assert!(
+            resolve_vulkan_provider_identity(
+                Some("opaque-provider-token"),
+                "Fixture GPU",
+                DeviceClass::DiscreteGpu,
+                GpuVendor::Nvidia,
+                &drivers,
+                &mut ambiguous_catalog,
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn vulkan_identity_catalog_rejects_ambiguity_and_tracks_driver_changes() {
+        let device = |identity: &str, driver: &str| VulkanDeviceIdentity {
+            normalized_display_name: "fixture duplicate gpu".to_owned(),
+            device_class: DeviceClass::DiscreteGpu,
+            vendor: GpuVendor::Nvidia,
+            stable_device_identity: identity.to_owned(),
+            driver_identity: driver.to_owned(),
+            claimed: false,
+        };
+        let mut catalog = VulkanDeviceCatalog {
+            devices: vec![
+                device("native:luid:0000000000000001", "vulkan:10de:1:1:a"),
+                device("native:luid:0000000000000002", "vulkan:10de:1:1:b"),
+            ],
+        };
+        let ambiguity = catalog
+            .claim(
+                " Fixture   Duplicate GPU ",
+                DeviceClass::DiscreteGpu,
+                GpuVendor::Nvidia,
+            )
+            .unwrap_err();
+        assert!(ambiguity.to_string().contains("ambiguous"));
+        assert!(catalog.devices.iter().all(|device| !device.claimed));
+
+        let mut changed = VulkanDeviceCatalog {
+            devices: vec![device(
+                "native:luid:0000000000000001",
+                "vulkan:10de:1:2:changed",
+            )],
+        };
+        assert_eq!(
+            changed
+                .claim(
+                    "fixture duplicate gpu",
+                    DeviceClass::DiscreteGpu,
+                    GpuVendor::Nvidia,
+                )
+                .unwrap()
+                .1,
+            "vulkan:10de:1:2:changed"
+        );
+        let mut mismatch = VulkanDeviceCatalog {
+            devices: vec![device("native:luid:0000000000000001", "vulkan:10de:1:1:a")],
+        };
+        assert!(
+            mismatch
+                .claim(
+                    "fixture duplicate gpu",
+                    DeviceClass::IntegratedGpu,
+                    GpuVendor::Nvidia,
+                )
+                .is_err()
+        );
+    }
+
+    #[cfg(all(
+        windows,
+        feature = "inference-worker",
+        any(feature = "cuda-acceleration", feature = "vulkan-acceleration")
+    ))]
+    #[test]
+    #[ignore = "requires a qualified Windows GPU and the pinned provider toolchain"]
+    fn windows_provider_devices_have_authoritative_driver_identity() {
+        transcribe_cpp::init_backends_default().unwrap();
+        let expected_kind = if cfg!(feature = "cuda-acceleration") {
+            "cuda"
+        } else {
+            "vulkan"
+        };
+        let catalog = PackDriverCatalog::discover().unwrap();
+        let devices = transcribe_cpp::devices()
+            .into_iter()
+            .filter(|device| device.kind.eq_ignore_ascii_case(expected_kind))
+            .collect::<Vec<_>>();
+        assert!(!devices.is_empty());
+        #[cfg(feature = "vulkan-acceleration")]
+        let mut vulkan_catalog = VulkanDeviceCatalog::discover().unwrap();
+        for device in devices {
+            let (stable, driver) = if let Some(native_id) = device.device_id {
+                let stable = format!("native:{}", native_id.to_ascii_lowercase());
+                let driver = catalog.identity_for(&stable).unwrap();
+                (stable, driver)
+            } else {
+                #[cfg(feature = "vulkan-acceleration")]
+                {
+                    let class = match device.device_type {
+                        transcribe_cpp::DeviceType::Gpu => DeviceClass::DiscreteGpu,
+                        transcribe_cpp::DeviceType::Igpu => DeviceClass::IntegratedGpu,
+                        _ => panic!("provider returned a non-GPU Vulkan device"),
+                    };
+                    let normalized =
+                        format!("{} {}", device.name, device.description).to_ascii_lowercase();
+                    let vendor = if normalized.contains("nvidia") {
+                        GpuVendor::Nvidia
+                    } else if normalized.contains("amd") || normalized.contains("radeon") {
+                        GpuVendor::Amd
+                    } else if normalized.contains("intel") {
+                        GpuVendor::Intel
+                    } else {
+                        GpuVendor::Other
+                    };
+                    vulkan_catalog
+                        .claim(&device.description, class, vendor)
+                        .unwrap()
+                }
+                #[cfg(not(feature = "vulkan-acceleration"))]
+                panic!("CUDA provider omitted its stable identity");
+            };
+            assert!(
+                stable.starts_with("native:pci:")
+                    || stable.starts_with("native:luid:")
+                    || stable.starts_with("native:uuid:")
+            );
+            assert!(driver.starts_with("windows-display:") || driver.starts_with("vulkan:"));
+            assert!(driver.len() <= 128);
+        }
     }
 
     #[cfg(windows)]
@@ -7189,8 +10047,503 @@ mod tests {
             },
             memory_total_bytes: 8 * 1024 * 1024 * 1024,
             memory_available_bytes: 6 * 1024 * 1024 * 1024,
+            pack: None,
             process_index: index,
         }
+    }
+
+    fn verified_gpu_route(
+        backend: BackendKind,
+        identity: &str,
+        driver: &str,
+        pack_digest: char,
+    ) -> InferenceWorkerRoute {
+        let mut target = backend_target(backend, identity, Some(0));
+        target.driver_version = Some(driver.to_owned());
+        target.pack = Some(crate::backend_policy::BackendPackIdentity {
+            pack_id: format!("scribe-{}-windows-x64", backend.label()),
+            pack_version: "1.0.0".to_owned(),
+            pack_digest: pack_digest.to_string().repeat(64),
+            security_epoch: 1,
+            runtime_abi: crate::gpu_worker_pack::manifest::RUNTIME_ABI_VERSION,
+        });
+        InferenceWorkerRoute {
+            provider: match backend {
+                BackendKind::Cuda => WorkerProvider::Cuda,
+                BackendKind::Vulkan => WorkerProvider::Vulkan,
+                BackendKind::Metal => WorkerProvider::Metal,
+                BackendKind::Cpu => WorkerProvider::Cpu,
+            },
+            supervisor: InferenceWorkerSupervisor {
+                transport: ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+                    Arc::new(TestLauncher::new([])),
+                    short_deadlines(),
+                ),
+                next_correlation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            },
+            target: Some(target),
+            health_key: None,
+            consume_retry_bypass: false,
+        }
+    }
+
+    fn verified_gpu_catalog(routes: Vec<InferenceWorkerRoute>) -> VerifiedGpuRouteCatalog {
+        VerifiedGpuRouteCatalog {
+            device_set_digest: verified_gpu_device_set_digest(&routes),
+            routes: Arc::new(routes),
+            diagnostic: None,
+            discovery_fingerprint: "test-catalog".to_owned(),
+            provider_probe_incomplete: false,
+        }
+    }
+
+    #[test]
+    fn gpu_health_identity_binds_exact_pack_driver_device_model_and_device_set() {
+        let first = verified_gpu_route(
+            BackendKind::Cuda,
+            "native:pci:0000:01:00.0",
+            "windows-display:32.0.16.1088",
+            'a',
+        );
+        let key = route_health_key(&first, &"b".repeat(64)).unwrap();
+        assert_eq!(key.pack_digest, "a".repeat(64));
+        assert_eq!(key.model_digest, "b".repeat(64));
+        assert_eq!(key.driver_version, "windows-display:32.0.16.1088");
+        assert_eq!(key.stable_device_identity, "native:pci:0000:01:00.0");
+
+        let mut reordered = first.clone();
+        reordered.target.as_mut().unwrap().process_index = Some(7);
+        reordered.target.as_mut().unwrap().memory_available_bytes /= 2;
+        assert_eq!(
+            verified_gpu_device_set_digest(std::slice::from_ref(&first)),
+            verified_gpu_device_set_digest(std::slice::from_ref(&reordered)),
+            "enumeration index and transient available memory are not stable health witnesses"
+        );
+
+        let mut changed_driver = first.clone();
+        changed_driver.target.as_mut().unwrap().driver_version =
+            Some("windows-display:32.0.16.2000".to_owned());
+        assert_ne!(
+            verified_gpu_device_set_digest(std::slice::from_ref(&first)),
+            verified_gpu_device_set_digest(std::slice::from_ref(&changed_driver))
+        );
+        assert_ne!(
+            route_health_key(&first, &"b".repeat(64)),
+            route_health_key(&changed_driver, &"b".repeat(64))
+        );
+        assert_ne!(
+            route_health_key(&first, &"b".repeat(64)),
+            route_health_key(&first, &"c".repeat(64))
+        );
+    }
+
+    #[test]
+    fn quarantined_verified_route_needs_two_explicit_successful_idle_probes() {
+        let root = test_root("gpu-health-idle-probes");
+        let path = Arc::new(root.join("health.json"));
+        let route = verified_gpu_route(
+            BackendKind::Vulkan,
+            "native:pci:0000:01:00.0",
+            "windows-display:32.0.16.1088",
+            'a',
+        );
+        let catalog = verified_gpu_catalog(vec![route.clone()]);
+        let key = route_health_key(&route, &"b".repeat(64)).unwrap();
+        let health = GpuRouteHealth {
+            path: Arc::clone(&path),
+            witnesses: HealthWitnesses {
+                app_build: DESKTOP_BUILD_ID.to_owned(),
+                device_set_digest: catalog.device_set_digest.clone(),
+            },
+        };
+        let mut observed_route = route;
+        observed_route.health_key = Some(key.clone());
+        health.record_failure(&observed_route, FailureObservation::WorkerCrash);
+        assert!(matches!(
+            health.cache().decision(&key),
+            HealthDecision::Quarantined { .. }
+        ));
+
+        let blocked =
+            health_filtered_gpu_route_plan(catalog.clone(), &"b".repeat(64), Some(&path), false);
+        assert!(blocked.routes.is_empty());
+        assert!(
+            blocked
+                .diagnostic
+                .as_deref()
+                .is_some_and(|value| value.contains("quarantined"))
+        );
+
+        for expected_cleared in [false, true] {
+            assert!(health.grant_explicit_retry(&key));
+            let probe = health_filtered_gpu_route_plan(
+                catalog.clone(),
+                &"b".repeat(64),
+                Some(&path),
+                false,
+            );
+            assert_eq!(probe.routes.len(), 1);
+            assert!(
+                probe
+                    .health
+                    .as_ref()
+                    .unwrap()
+                    .consume_retry(&probe.routes[0])
+            );
+            probe
+                .health
+                .as_ref()
+                .unwrap()
+                .record_idle_probe_success(&probe.routes[0]);
+            assert_eq!(
+                health.cache().decision(&key) == HealthDecision::Available,
+                expected_cleared
+            );
+        }
+        assert_eq!(health.cache().decision(&key), HealthDecision::Available);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn invalid_health_state_allows_only_two_step_idle_probe_recovery() {
+        #[derive(Clone, Copy, Debug)]
+        enum InvalidFixture {
+            Corrupt,
+            OversizedUnreadable,
+            WitnessMismatch,
+        }
+
+        for fixture in [
+            InvalidFixture::Corrupt,
+            InvalidFixture::OversizedUnreadable,
+            InvalidFixture::WitnessMismatch,
+        ] {
+            let root = test_root(&format!("gpu-health-recovery-{fixture:?}"));
+            let path = Arc::new(root.join("health.json"));
+            let route = verified_gpu_route(
+                BackendKind::Vulkan,
+                "native:pci:0000:01:00.0",
+                "windows-display:32.0.16.1088",
+                'a',
+            );
+            let catalog = verified_gpu_catalog(vec![route.clone()]);
+            let artifact = missing_gguf_artifact();
+            let RuntimeArtifact::Gguf(model) = &artifact else {
+                unreachable!("fixture is GGUF")
+            };
+            let key = route_health_key(&route, &model.expected_sha256).unwrap();
+            let witnesses = HealthWitnesses {
+                app_build: DESKTOP_BUILD_ID.to_owned(),
+                device_set_digest: catalog.device_set_digest.clone(),
+            };
+
+            match fixture {
+                InvalidFixture::Corrupt => {
+                    std::fs::write(&*path, b"{not-canonical-health-state").unwrap();
+                }
+                InvalidFixture::OversizedUnreadable => {
+                    std::fs::write(&*path, vec![b'x'; 256 * 1024 + 1]).unwrap();
+                }
+                InvalidFixture::WitnessMismatch => {
+                    let mut stale = HealthCache::open(
+                        &*path,
+                        HealthWitnesses {
+                            app_build: "different-app-build".to_owned(),
+                            device_set_digest: catalog.device_set_digest.clone(),
+                        },
+                        &GPU_HEALTH_CLOCK,
+                    );
+                    stale
+                        .record_provider_failure(
+                            key.clone(),
+                            crate::gpu_worker_pack::health::FailureCode::WorkerCrash,
+                        )
+                        .unwrap();
+                }
+            }
+
+            let registry = InferenceWorkerRegistry {
+                routes: Arc::new(Vec::new()),
+                gpu_routes: Arc::new(Mutex::new(GpuRouteCatalogCache::default())),
+                gpu_health_path: Some(Arc::clone(&path)),
+                active_route: Arc::new(Mutex::new(None)),
+                route_execution: Arc::new(Mutex::new(())),
+                gpu_routes_for_testing: Some(catalog),
+            };
+
+            let inference = registry
+                .routes_for_preference(AccelerationPreference::Gpu, &artifact)
+                .unwrap();
+            assert!(inference.routes.is_empty());
+            assert_eq!(
+                HealthCache::open(&*path, witnesses.clone(), &GPU_HEALTH_CLOCK).decision(&key),
+                HealthDecision::InvalidOrUnprobed
+            );
+
+            let first_probe = registry
+                .routes_for_preference_with_idle_health(
+                    AccelerationPreference::Gpu,
+                    &artifact,
+                    true,
+                )
+                .unwrap();
+            assert_eq!(first_probe.routes.len(), 1);
+            first_probe
+                .health
+                .as_ref()
+                .unwrap()
+                .record_idle_probe_success(&first_probe.routes[0]);
+            assert_eq!(
+                HealthCache::open(&*path, witnesses.clone(), &GPU_HEALTH_CLOCK).decision(&key),
+                HealthDecision::InvalidOrUnprobed
+            );
+            assert!(
+                registry
+                    .routes_for_preference(AccelerationPreference::Gpu, &artifact)
+                    .unwrap()
+                    .routes
+                    .is_empty(),
+                "normal inference must remain blocked after the first idle probe"
+            );
+
+            let second_probe = registry
+                .routes_for_preference_with_idle_health(
+                    AccelerationPreference::Gpu,
+                    &artifact,
+                    true,
+                )
+                .unwrap();
+            assert_eq!(second_probe.routes.len(), 1);
+            second_probe
+                .health
+                .as_ref()
+                .unwrap()
+                .record_idle_probe_success(&second_probe.routes[0]);
+            assert_eq!(
+                HealthCache::open(&*path, witnesses, &GPU_HEALTH_CLOCK).decision(&key),
+                HealthDecision::Available
+            );
+            assert_eq!(
+                registry
+                    .routes_for_preference(AccelerationPreference::Gpu, &artifact)
+                    .unwrap()
+                    .routes
+                    .len(),
+                1,
+                "normal inference becomes eligible only after the second idle probe"
+            );
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn two_invalid_health_routes_recover_without_starvation_or_early_inference() {
+        let root = test_root("gpu-health-two-route-recovery");
+        let path = Arc::new(root.join("health.json"));
+        let first_identity = "native:pci:0000:01:00.0";
+        let second_identity = "native:pci:0000:02:00.0";
+        let first = verified_gpu_route(
+            BackendKind::Vulkan,
+            first_identity,
+            "windows-display:32.0.16.1088",
+            'a',
+        );
+        let second = verified_gpu_route(
+            BackendKind::Vulkan,
+            second_identity,
+            "windows-display:32.0.16.1088",
+            'b',
+        );
+        let catalog = verified_gpu_catalog(vec![first.clone(), second.clone()]);
+        let artifact = missing_gguf_artifact();
+        let RuntimeArtifact::Gguf(model) = &artifact else {
+            unreachable!("fixture is GGUF")
+        };
+        let first_key = route_health_key(&first, &model.expected_sha256).unwrap();
+        let second_key = route_health_key(&second, &model.expected_sha256).unwrap();
+        let witnesses = HealthWitnesses {
+            app_build: DESKTOP_BUILD_ID.to_owned(),
+            device_set_digest: catalog.device_set_digest.clone(),
+        };
+        std::fs::write(&*path, b"{corrupt-health-state").unwrap();
+
+        let registry = InferenceWorkerRegistry {
+            routes: Arc::new(Vec::new()),
+            gpu_routes: Arc::new(Mutex::new(GpuRouteCatalogCache::default())),
+            gpu_health_path: Some(Arc::clone(&path)),
+            active_route: Arc::new(Mutex::new(None)),
+            route_execution: Arc::new(Mutex::new(())),
+            gpu_routes_for_testing: Some(catalog),
+        };
+        let eligible_identities = || {
+            registry
+                .routes_for_preference(AccelerationPreference::Gpu, &artifact)
+                .unwrap()
+                .routes
+                .iter()
+                .map(|route| route.target.as_ref().unwrap().device_id.as_str().to_owned())
+                .collect::<Vec<_>>()
+        };
+
+        for (probe_number, expected_identity, eligible_before, eligible_after) in [
+            (
+                1,
+                first_identity,
+                Vec::<String>::new(),
+                Vec::<String>::new(),
+            ),
+            (
+                2,
+                first_identity,
+                Vec::new(),
+                vec![first_identity.to_owned()],
+            ),
+            (
+                3,
+                second_identity,
+                vec![first_identity.to_owned()],
+                vec![first_identity.to_owned()],
+            ),
+            (
+                4,
+                second_identity,
+                vec![first_identity.to_owned()],
+                vec![first_identity.to_owned(), second_identity.to_owned()],
+            ),
+        ] {
+            assert_eq!(eligible_identities(), eligible_before);
+            let probe = registry
+                .routes_for_preference_with_idle_health(
+                    AccelerationPreference::Gpu,
+                    &artifact,
+                    true,
+                )
+                .unwrap();
+            let selected_identity = probe.routes[0].target.as_ref().unwrap().device_id.as_str();
+            assert_eq!(
+                selected_identity, expected_identity,
+                "idle probe {probe_number}"
+            );
+            probe
+                .health
+                .as_ref()
+                .unwrap()
+                .record_idle_probe_success(&probe.routes[0]);
+            assert_eq!(eligible_identities(), eligible_after);
+        }
+
+        let cache = HealthCache::open(&*path, witnesses, &GPU_HEALTH_CLOCK);
+        assert_eq!(cache.decision(&first_key), HealthDecision::Available);
+        assert_eq!(cache.decision(&second_key), HealthDecision::Available);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn explicit_retry_is_exact_single_use_and_content_failures_do_not_quarantine() {
+        let root = test_root("gpu-health-explicit-retry");
+        let path = Arc::new(root.join("health.json"));
+        let route = verified_gpu_route(
+            BackendKind::Cuda,
+            "native:pci:0000:01:00.0",
+            "windows-display:32.0.16.1088",
+            'a',
+        );
+        let catalog = verified_gpu_catalog(vec![route.clone()]);
+        let key = route_health_key(&route, &"b".repeat(64)).unwrap();
+        let health = GpuRouteHealth {
+            path: Arc::clone(&path),
+            witnesses: HealthWitnesses {
+                app_build: DESKTOP_BUILD_ID.to_owned(),
+                device_set_digest: catalog.device_set_digest.clone(),
+            },
+        };
+        let mut observed_route = route;
+        observed_route.health_key = Some(key.clone());
+        for error in [
+            RuntimeError::InvalidAudio {
+                sample_rate_hz: 48_000,
+                channels: 2,
+            },
+            RuntimeError::ArtifactIntegrity {
+                path: PathBuf::from("private-model-path.gguf"),
+                message: "digest mismatch".to_owned(),
+            },
+            RuntimeError::Cancelled("cancelled".to_owned()),
+        ] {
+            health.record_failure(
+                &observed_route,
+                health_observation_for_runtime_error(&error, false, false),
+            );
+        }
+        health.record_failure(
+            &observed_route,
+            health_observation_for_runtime_error(
+                &RuntimeError::RetryableWorkerFailure("cancel transport".to_owned()),
+                true,
+                false,
+            ),
+        );
+        health.record_failure(
+            &observed_route,
+            health_observation_for_runtime_error(
+                &RuntimeError::RetryableWorkerFailure("after output".to_owned()),
+                false,
+                true,
+            ),
+        );
+        assert_eq!(health.cache().decision(&key), HealthDecision::Available);
+
+        health.record_failure(
+            &observed_route,
+            health_observation_for_runtime_error(
+                &RuntimeError::RetryableWorkerFailure("worker exited".to_owned()),
+                false,
+                false,
+            ),
+        );
+        let artifact = RuntimeArtifact::Gguf(RuntimeModel {
+            id: ModelId::new("health-retry-fixture"),
+            path: PathBuf::from("unused-health-retry-fixture.gguf"),
+            format: ArtifactFormat::Gguf,
+            expected_size_bytes: 1,
+            expected_sha256: "b".repeat(64),
+        });
+        let target = observed_route.target.as_ref().unwrap().clone();
+        let registry = InferenceWorkerRegistry {
+            routes: Arc::new(Vec::new()),
+            gpu_routes: Arc::new(Mutex::new(GpuRouteCatalogCache {
+                successful: Some(catalog.clone()),
+                failed: None,
+            })),
+            gpu_health_path: Some(Arc::clone(&path)),
+            active_route: Arc::new(Mutex::new(None)),
+            route_execution: Arc::new(Mutex::new(())),
+            gpu_routes_for_testing: None,
+        };
+        assert!(
+            registry
+                .grant_explicit_gpu_retry(&artifact, &target)
+                .unwrap()
+        );
+        let mut wrong_target = target;
+        wrong_target.driver_version = Some("windows-display:wrong".to_owned());
+        assert!(
+            !registry
+                .grant_explicit_gpu_retry(&artifact, &wrong_target)
+                .unwrap()
+        );
+        let plan = health_filtered_gpu_route_plan(catalog, &"b".repeat(64), Some(&path), false);
+        assert_eq!(plan.routes.len(), 1);
+        assert!(plan.routes[0].consume_retry_bypass);
+        assert!(plan.health.as_ref().unwrap().consume_retry(&plan.routes[0]));
+        assert!(!plan.health.as_ref().unwrap().consume_retry(&plan.routes[0]));
+
+        let persisted = std::fs::read_to_string(&*path).unwrap();
+        assert!(!persisted.contains("private-model-path"));
+        assert!(!persisted.contains("worker exited"));
+        assert!(!persisted.contains("cancel transport"));
+        assert!(!persisted.contains("after output"));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn diagnostics_with_typed_backend_selection() -> WireRuntimeDiagnostics {
@@ -7297,6 +10650,44 @@ mod tests {
             .unwrap();
         selection.fallback_targets = vec![selection.target.clone(); MAX_BACKEND_SELECTION_TARGETS];
         assert!(validate_wire_diagnostics(&too_many_targets).is_err());
+    }
+
+    #[test]
+    fn verified_pack_target_is_projected_into_typed_backend_diagnostics() {
+        let mut diagnostics = diagnostics_with_typed_backend_selection();
+        let observed = diagnostics
+            .resolved_acceleration
+            .selection
+            .as_mut()
+            .unwrap();
+        observed.target.driver_version = Some("windows-display:32.0.15.8088".to_owned());
+        let mut expected = observed.target.clone();
+        observed.target.process_index = None;
+        expected.pack = Some(crate::backend_policy::BackendPackIdentity {
+            pack_id: "scribe-cuda-windows-x64".to_owned(),
+            pack_version: "1.0.0".to_owned(),
+            pack_digest: "a".repeat(64),
+            security_epoch: 1,
+            runtime_abi: crate::gpu_worker_pack::manifest::RUNTIME_ABI_VERSION,
+        });
+        reconcile_verified_pack_target(&mut diagnostics.resolved_acceleration, expected.clone())
+            .unwrap();
+        assert_eq!(
+            diagnostics
+                .resolved_acceleration
+                .selection
+                .as_ref()
+                .unwrap()
+                .target,
+            expected
+        );
+
+        let mut changed_driver = expected;
+        changed_driver.driver_version = Some("windows-display:32.0.15.9000".to_owned());
+        assert!(
+            reconcile_verified_pack_target(&mut diagnostics.resolved_acceleration, changed_driver)
+                .is_err()
+        );
     }
 
     #[test]
@@ -7442,6 +10833,39 @@ mod tests {
     }
 
     #[test]
+    fn runtime_response_generation_binding_does_not_respawn_after_exit() {
+        let launcher = Arc::new(TestLauncher::new([
+            TestMode::RuntimeLoadThenExit,
+            TestMode::Normal,
+        ]));
+        let inference = InferenceWorkerSupervisor {
+            transport: ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+                launcher.clone(),
+                short_deadlines(),
+            ),
+            next_correlation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        };
+
+        let loaded = inference
+            .load(missing_gguf_artifact(), AccelerationPreference::Cpu)
+            .unwrap();
+
+        assert_eq!(loaded.detected_architecture, "test-runtime");
+        let wait_until = Instant::now() + Duration::from_millis(250);
+        while inference.transport.current_generation().unwrap().is_some()
+            && Instant::now() < wait_until
+        {
+            std::thread::yield_now();
+        }
+        assert_eq!(inference.transport.current_generation().unwrap(), None);
+        assert_eq!(
+            launcher.launches.load(Ordering::Acquire),
+            1,
+            "post-response reconciliation must not inspect or spawn a replacement generation"
+        );
+    }
+
+    #[test]
     fn onnx_gpu_rejection_happens_before_inference_child_spawn() {
         let root = test_root("gpu-before-spawn");
         let artifact = RuntimeArtifact::OnnxBundle(spec_with_roles(
@@ -7476,6 +10900,188 @@ mod tests {
         })
     }
 
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires a clean-built fixture-signed Vulkan pack, pinned GGUF/WAV fixtures, and a compatible physical GPU"]
+    fn verified_vulkan_fixture_pack_scif_model_hardware_smoke() {
+        let required_path = |name: &str| {
+            PathBuf::from(
+                std::env::var_os(name)
+                    .unwrap_or_else(|| panic!("set {name} to the exact fixture path")),
+            )
+        };
+        let required_hash = |name: &str| {
+            let value = std::env::var(name)
+                .unwrap_or_else(|_| panic!("set {name} to the exact lowercase SHA-256"));
+            assert!(
+                value.len() == 64
+                    && value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+                "{name} must be a canonical lowercase SHA-256"
+            );
+            value
+        };
+        let exact_file = |path: &Path, expected: &str| {
+            let bytes = std::fs::read(path).expect("fixture file must be readable");
+            assert_eq!(format!("{:x}", Sha256::digest(&bytes)), expected);
+            bytes.len() as u64
+        };
+
+        let pack_root = required_path("SCRIBE_GPU_FIXTURE_PACK_ROOT");
+        let model_path = required_path("SCRIBE_GPU_FIXTURE_MODEL");
+        let model_sha256 = required_hash("SCRIBE_GPU_FIXTURE_MODEL_SHA256");
+        let wav_path = required_path("SCRIBE_GPU_FIXTURE_WAV");
+        let wav_sha256 = required_hash("SCRIBE_GPU_FIXTURE_WAV_SHA256");
+        let expected_text = std::env::var("SCRIBE_GPU_FIXTURE_EXPECTED_TRANSCRIPT")
+            .expect("set SCRIBE_GPU_FIXTURE_EXPECTED_TRANSCRIPT to a known spoken phrase")
+            .to_ascii_lowercase();
+        assert!(!expected_text.trim().is_empty());
+        let model_size = exact_file(&model_path, &model_sha256);
+        exact_file(&wav_path, &wav_sha256);
+
+        let lease_owner = {
+            let (lease_owner, lease) =
+                crate::gpu_worker_pack::manifest::test_support::lease_existing_fixture(&pack_root)
+                    .expect("fixture pack must verify into an immutable retained lease");
+            let probe = InferenceWorkerSupervisor::for_pack_probe(Arc::new(lease));
+            let bindings = probe
+                .verified_pack_bindings()
+                .expect("Vulkan pack probe must complete its challenge-bound SCIF Hello");
+            probe.shutdown().unwrap();
+            drop(probe);
+            let expected_identity = std::env::var("SCRIBE_GPU_FIXTURE_STABLE_DEVICE_ID").ok();
+            let binding = bindings
+                .into_iter()
+                .find(|candidate| {
+                    let target = candidate.backend_target();
+                    target.backend == BackendKind::Vulkan
+                        && expected_identity.as_ref().map_or_else(
+                            || {
+                                target.vendor == GpuVendor::Nvidia
+                                    && target.device_class == DeviceClass::DiscreteGpu
+                            },
+                            |identity| target.device_id.as_str() == identity,
+                        )
+                })
+                .expect("fixture pack must advertise a Vulkan device");
+            let target = binding.backend_target();
+            assert!(
+                target
+                    .driver_version
+                    .as_ref()
+                    .is_some_and(|value| !value.is_empty())
+            );
+            assert!(target.memory_total_bytes > 0);
+            if let Some(expected_identity) = expected_identity {
+                assert_eq!(target.device_id.as_str(), expected_identity);
+            }
+            let gpu_route = InferenceWorkerRoute {
+                provider: WorkerProvider::Vulkan,
+                supervisor: InferenceWorkerSupervisor::for_pack_binding(binding),
+                target: Some(target.clone()),
+                health_key: None,
+                consume_retry_bypass: false,
+            };
+            let gpu_routes = Arc::new(vec![gpu_route]);
+            let cpu_launcher = Arc::new(TestLauncher::new([]));
+            let registry = InferenceWorkerRegistry {
+                routes: Arc::new(vec![InferenceWorkerRoute {
+                    provider: WorkerProvider::Cpu,
+                    supervisor: InferenceWorkerSupervisor {
+                        transport: ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+                            cpu_launcher.clone(),
+                            short_deadlines(),
+                        ),
+                        next_correlation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                    },
+                    target: Some(BackendTarget::cpu()),
+                    health_key: None,
+                    consume_retry_bypass: false,
+                }]),
+                gpu_routes: Arc::new(Mutex::new(GpuRouteCatalogCache::default())),
+                gpu_health_path: None,
+                active_route: Arc::new(Mutex::new(None)),
+                route_execution: Arc::new(Mutex::new(())),
+                gpu_routes_for_testing: Some(VerifiedGpuRouteCatalog {
+                    device_set_digest: verified_gpu_device_set_digest(&gpu_routes),
+                    routes: gpu_routes,
+                    diagnostic: Some("fixture-only hardware smoke".to_owned()),
+                    discovery_fingerprint: "fixture-hardware-smoke".to_owned(),
+                    provider_probe_incomplete: false,
+                }),
+            };
+            let artifact = RuntimeArtifact::Gguf(RuntimeModel {
+                id: ModelId::new("whisper_cpp_base_en"),
+                path: model_path,
+                format: ArtifactFormat::Gguf,
+                expected_size_bytes: model_size,
+                expected_sha256: model_sha256,
+            });
+            let loaded = registry
+                .load(artifact.clone(), AccelerationPreference::Gpu)
+                .expect("explicit GPU load must succeed through the verified Vulkan worker");
+            assert_eq!(
+                loaded
+                    .diagnostics
+                    .resolved_acceleration
+                    .selection
+                    .as_ref()
+                    .expect("GPU load must report typed selection")
+                    .target,
+                target
+            );
+            let audio = PreparedAudio::from_wav_path(wav_path).unwrap();
+            let cancellation = std::sync::atomic::AtomicU64::new(0);
+            let execution = registry
+                .transcribe(
+                    artifact,
+                    AccelerationPreference::Gpu,
+                    &audio,
+                    TranscriptionOptions::default(),
+                    0,
+                    &cancellation,
+                )
+                .expect("explicit GPU transcription must succeed through SCIF");
+            assert!(execution.diagnostics.warm_reused);
+            assert!(
+                execution
+                    .transcript
+                    .text
+                    .to_ascii_lowercase()
+                    .contains(&expected_text),
+                "Vulkan transcript did not contain the known fixture phrase: {:?}",
+                execution.transcript.text
+            );
+            assert_eq!(cpu_launcher.launches.load(Ordering::Acquire), 0);
+            println!(
+                "verified Vulkan SCIF smoke: device={} driver={} memory={} transcript_bytes={} warm_reused={}",
+                target.device_id.as_str(),
+                target.driver_version.as_deref().unwrap(),
+                target.memory_total_bytes,
+                execution.transcript.text.len(),
+                execution.diagnostics.warm_reused
+            );
+            registry.shutdown().unwrap();
+            lease_owner
+        };
+        let cleanup_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match std::fs::remove_dir_all(&lease_owner) {
+                Ok(()) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                Err(error)
+                    if (error.kind() == std::io::ErrorKind::PermissionDenied
+                        || error.raw_os_error() == Some(32))
+                        && Instant::now() < cleanup_deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                Err(error) => panic!("could not remove reaped fixture-pack lease: {error}"),
+            }
+        }
+    }
+
     #[test]
     fn cpu_only_registry_never_silently_serves_explicit_gpu() {
         let launcher = Arc::new(TestLauncher::new([TestMode::Normal]));
@@ -7495,6 +11101,339 @@ mod tests {
     }
 
     #[test]
+    fn auto_reports_pack_discovery_state_without_launching_a_gpu_probe() {
+        let launcher = Arc::new(TestLauncher::new([]));
+        let registry = InferenceWorkerRegistry::with_cpu_supervisor(InferenceWorkerSupervisor {
+            transport: ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+                launcher.clone(),
+                short_deadlines(),
+            ),
+            next_correlation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        });
+        let artifact = missing_gguf_artifact();
+        let plan = registry
+            .routes_for_preference(AccelerationPreference::Auto, &artifact)
+            .unwrap();
+        assert_eq!(plan.routes.len(), 1);
+        assert_eq!(plan.routes[0].provider, WorkerProvider::Cpu);
+        assert!(plan.diagnostic.is_some_and(|value| !value.is_empty()));
+        assert_eq!(launcher.launches.load(Ordering::Acquire), 0);
+        let cache = registry.gpu_routes.lock().unwrap();
+        assert!(cache.successful.is_none());
+        assert!(cache.failed.is_none());
+    }
+
+    #[test]
+    fn failed_gpu_probe_backoff_allows_same_fingerprint_recovery_and_warm_reuse() {
+        let now = Instant::now();
+        let mut cache = GpuRouteCatalogCache::default();
+        let mut failed = verified_gpu_catalog(Vec::new());
+        failed.diagnostic = Some("verified provider probe failed".to_owned());
+        cache.record_probe(failed.clone(), now);
+        assert!(cache.successful.is_none());
+        assert!(matches!(
+            cache.lookup("test-catalog", now),
+            GpuRouteCatalogLookup::Backoff(Some(message))
+                if message == "verified provider probe failed"
+        ));
+
+        assert!(!cache.grant_explicit_probe_retry("changed-catalog", now));
+        assert!(cache.grant_explicit_probe_retry("test-catalog", now));
+        assert!(
+            !cache.grant_explicit_probe_retry("test-catalog", now),
+            "an explicit provider reprobe grant is one-shot"
+        );
+        assert!(matches!(
+            cache.lookup("test-catalog", now),
+            GpuRouteCatalogLookup::Probe
+        ));
+
+        cache.record_probe(failed, now);
+        let later = now + GPU_PROVIDER_PROBE_BACKOFF;
+        assert!(matches!(
+            cache.lookup("test-catalog", later),
+            GpuRouteCatalogLookup::Probe
+        ));
+
+        let successful = verified_gpu_catalog(vec![verified_gpu_route(
+            BackendKind::Vulkan,
+            "native:pci:0000:01:00.0",
+            "windows-display:32.0.16.1088",
+            'a',
+        )]);
+        cache.record_probe(successful, later);
+        assert!(matches!(
+            cache.lookup("test-catalog", later + GPU_PROVIDER_PROBE_BACKOFF),
+            GpuRouteCatalogLookup::Successful(catalog) if catalog.routes.len() == 1
+        ));
+        assert!(matches!(
+            cache.lookup("changed-catalog", later),
+            GpuRouteCatalogLookup::Probe
+        ));
+    }
+
+    #[test]
+    fn failed_gpu_probe_backoff_starts_after_a_long_probe_completes() {
+        let probe_started_at = Instant::now();
+        let probe_completed_at =
+            probe_started_at + GPU_PROVIDER_PROBE_BACKOFF + Duration::from_secs(5);
+        let mut cache = GpuRouteCatalogCache::default();
+        let mut failed = verified_gpu_catalog(Vec::new());
+        failed.diagnostic = Some("slow verified provider probe failed".to_owned());
+
+        cache.record_probe(failed, probe_completed_at);
+
+        assert!(matches!(
+            cache.lookup("test-catalog", probe_completed_at),
+            GpuRouteCatalogLookup::Backoff(Some(message))
+                if message == "slow verified provider probe failed"
+        ));
+        assert!(matches!(
+            cache.lookup(
+                "test-catalog",
+                probe_completed_at + GPU_PROVIDER_PROBE_BACKOFF - Duration::from_millis(1),
+            ),
+            GpuRouteCatalogLookup::Backoff(_)
+        ));
+        assert!(matches!(
+            cache.lookup(
+                "test-catalog",
+                probe_completed_at + GPU_PROVIDER_PROBE_BACKOFF,
+            ),
+            GpuRouteCatalogLookup::Probe
+        ));
+    }
+
+    #[test]
+    fn mixed_gpu_probe_failure_retries_without_discarding_healthy_routes() {
+        let first_probe_completed_at = Instant::now();
+        let mut cache = GpuRouteCatalogCache::default();
+        let mut cuda_failed_vulkan_succeeded = verified_gpu_catalog(vec![verified_gpu_route(
+            BackendKind::Vulkan,
+            "native:pci:0000:01:00.0",
+            "windows-display:32.0.16.1088",
+            'a',
+        )]);
+        cuda_failed_vulkan_succeeded.provider_probe_incomplete = true;
+        cuda_failed_vulkan_succeeded.diagnostic =
+            Some("CUDA provider probe was rejected".to_owned());
+
+        cache.record_probe(
+            cuda_failed_vulkan_succeeded.clone(),
+            first_probe_completed_at,
+        );
+        assert!(matches!(
+            cache.lookup("test-catalog", first_probe_completed_at),
+            GpuRouteCatalogLookup::Successful(catalog)
+                if catalog.routes.len() == 1
+                    && catalog.routes[0].provider == WorkerProvider::Vulkan
+        ));
+        assert!(matches!(
+            cache.lookup("changed-catalog", first_probe_completed_at),
+            GpuRouteCatalogLookup::Probe
+        ));
+
+        let explicit_retry_at = first_probe_completed_at + Duration::from_secs(1);
+        assert!(cache.grant_explicit_probe_retry("test-catalog", explicit_retry_at));
+        assert!(!cache.grant_explicit_probe_retry("test-catalog", explicit_retry_at));
+        assert!(matches!(
+            cache.lookup("test-catalog", explicit_retry_at),
+            GpuRouteCatalogLookup::Probe
+        ));
+
+        let retry_completed_at = explicit_retry_at + Duration::from_secs(20);
+        cache.record_probe(cuda_failed_vulkan_succeeded, retry_completed_at);
+        assert!(matches!(
+            cache.lookup(
+                "test-catalog",
+                retry_completed_at + GPU_PROVIDER_PROBE_BACKOFF - Duration::from_millis(1),
+            ),
+            GpuRouteCatalogLookup::Successful(catalog)
+                if catalog.routes.len() == 1
+                    && catalog.routes[0].provider == WorkerProvider::Vulkan
+        ));
+        assert!(matches!(
+            cache.lookup(
+                "test-catalog",
+                retry_completed_at + GPU_PROVIDER_PROBE_BACKOFF,
+            ),
+            GpuRouteCatalogLookup::Probe
+        ));
+
+        let recovered = verified_gpu_catalog(vec![
+            verified_gpu_route(
+                BackendKind::Cuda,
+                "native:pci:0000:01:00.0",
+                "windows-display:32.0.16.1088",
+                'b',
+            ),
+            verified_gpu_route(
+                BackendKind::Vulkan,
+                "native:pci:0000:01:00.0",
+                "windows-display:32.0.16.1088",
+                'a',
+            ),
+        ]);
+        cache.record_probe(recovered, retry_completed_at + GPU_PROVIDER_PROBE_BACKOFF);
+        assert!(matches!(
+            cache.lookup(
+                "test-catalog",
+                retry_completed_at + GPU_PROVIDER_PROBE_BACKOFF * 2,
+            ),
+            GpuRouteCatalogLookup::Successful(catalog) if catalog.routes.len() == 2
+        ));
+    }
+
+    #[test]
+    fn provider_discovery_uses_one_budget_and_retires_a_hung_probe() {
+        let (hello_started_tx, hello_started_rx) = channel();
+        let (kill_started_tx, kill_started_rx) = channel();
+        let (reaped_tx, reaped_rx) = channel();
+        let first_launcher = Arc::new(
+            TestLauncher::new([TestMode::BlockedHello {
+                started: hello_started_tx,
+            }])
+            .with_process_events(kill_started_tx, reaped_tx),
+        );
+        let (second_started_tx, _second_started_rx) = channel();
+        let second_launcher = Arc::new(TestLauncher::new([TestMode::BlockedHello {
+            started: second_started_tx,
+        }]));
+        let supervisor = |launcher: Arc<TestLauncher>| InferenceWorkerSupervisor {
+            transport: ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+                launcher,
+                short_deadlines(),
+            ),
+            next_correlation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        };
+        let probes = vec![
+            PendingPackProbe {
+                pack_id: crate::gpu_worker_pack::manifest::StoreComponent::new(
+                    "scribe-cuda-windows-x64",
+                )
+                .unwrap(),
+                backend: PackBackend::Cuda,
+                supervisor: supervisor(Arc::clone(&first_launcher)),
+            },
+            PendingPackProbe {
+                pack_id: crate::gpu_worker_pack::manifest::StoreComponent::new(
+                    "scribe-vulkan-windows-x64",
+                )
+                .unwrap(),
+                backend: PackBackend::Vulkan,
+                supervisor: supervisor(Arc::clone(&second_launcher)),
+            },
+        ];
+        let budget = Duration::from_millis(80);
+        let started_at = Instant::now();
+
+        let registry = discover_pack_launch_bindings_with_budget(probes, Vec::new(), budget);
+
+        let elapsed = started_at.elapsed();
+        assert!(elapsed >= budget);
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "aggregate discovery exceeded its bounded cleanup allowance: {elapsed:?}"
+        );
+        hello_started_rx.try_recv().unwrap();
+        kill_started_rx
+            .recv_timeout(Duration::from_millis(100))
+            .unwrap();
+        reaped_rx.recv_timeout(Duration::from_millis(100)).unwrap();
+        assert_eq!(first_launcher.launches.load(Ordering::Acquire), 1);
+        assert_eq!(second_launcher.launches.load(Ordering::Acquire), 0);
+        let (bindings, diagnostics) = registry.into_parts();
+        assert!(bindings.is_empty());
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|diagnostic| {
+                    diagnostic.issue
+                        == crate::gpu_worker_pack::PackDiscoveryIssue::ProviderProbeRejected
+                })
+                .count(),
+            2,
+            "the timed-out active probe and skipped remaining probe are both diagnosed"
+        );
+    }
+
+    #[test]
+    fn active_route_ownership_retires_cpu_gpu_and_device_switches() {
+        let cpu_launcher = Arc::new(TestLauncher::new([TestMode::Normal, TestMode::Normal]));
+        let gpu_one_launcher = Arc::new(TestLauncher::new([TestMode::Normal]));
+        let gpu_two_launcher = Arc::new(TestLauncher::new([TestMode::Normal]));
+        let route = |provider: WorkerProvider,
+                     backend: BackendKind,
+                     identity: &str,
+                     launcher: Arc<TestLauncher>| InferenceWorkerRoute {
+            provider,
+            supervisor: InferenceWorkerSupervisor {
+                transport: ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+                    launcher,
+                    short_deadlines(),
+                ),
+                next_correlation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            },
+            target: Some(backend_target(backend, identity, Some(0))),
+            health_key: None,
+            consume_retry_bypass: false,
+        };
+        let cpu = route(
+            WorkerProvider::Cpu,
+            BackendKind::Cpu,
+            "cpu",
+            Arc::clone(&cpu_launcher),
+        );
+        let gpu_one = route(
+            WorkerProvider::Vulkan,
+            BackendKind::Vulkan,
+            "native:pci:0000:01:00.0",
+            Arc::clone(&gpu_one_launcher),
+        );
+        let gpu_two = route(
+            WorkerProvider::Vulkan,
+            BackendKind::Vulkan,
+            "native:pci:0000:02:00.0",
+            Arc::clone(&gpu_two_launcher),
+        );
+        let registry = InferenceWorkerRegistry::with_cpu_supervisor(cpu.supervisor.clone());
+
+        registry.prepare_route(&cpu).unwrap();
+        let cpu_generation = cpu.supervisor.transport.ensure_generation().unwrap();
+        registry.prepare_route(&gpu_one).unwrap();
+        assert_eq!(cpu.supervisor.transport.current_generation().unwrap(), None);
+        let gpu_generation = gpu_one.supervisor.transport.ensure_generation().unwrap();
+
+        registry.prepare_route(&gpu_one).unwrap();
+        assert_eq!(
+            gpu_one.supervisor.transport.ensure_generation().unwrap(),
+            gpu_generation,
+            "the same winning route keeps its warm worker during the idle window"
+        );
+        assert_eq!(gpu_one_launcher.launches.load(Ordering::Acquire), 1);
+
+        registry.prepare_route(&gpu_two).unwrap();
+        assert_eq!(
+            gpu_one.supervisor.transport.current_generation().unwrap(),
+            None
+        );
+        gpu_two.supervisor.transport.ensure_generation().unwrap();
+
+        registry.prepare_route(&cpu).unwrap();
+        assert_eq!(
+            gpu_two.supervisor.transport.current_generation().unwrap(),
+            None
+        );
+        assert_ne!(
+            cpu.supervisor.transport.ensure_generation().unwrap(),
+            cpu_generation,
+            "switching back to CPU starts a new sole owner"
+        );
+        assert_eq!(cpu_launcher.launches.load(Ordering::Acquire), 2);
+        registry.shutdown().unwrap();
+    }
+
+    #[test]
     fn registry_fallback_is_bounded_to_registered_pre_output_failures() {
         let first = Arc::new(TestLauncher::new([TestMode::CapabilityMismatch(
             CapabilityMismatch::Challenge,
@@ -7511,9 +11450,17 @@ mod tests {
                 ),
                 next_correlation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             },
+            target: Some(BackendTarget::cpu()),
+            health_key: None,
+            consume_retry_bypass: false,
         };
         let registry = InferenceWorkerRegistry {
             routes: Arc::new(vec![route(first.clone()), route(second.clone())]),
+            gpu_routes: Arc::new(Mutex::new(GpuRouteCatalogCache::default())),
+            gpu_health_path: None,
+            active_route: Arc::new(Mutex::new(None)),
+            route_execution: Arc::new(Mutex::new(())),
+            gpu_routes_for_testing: None,
         };
         assert!(
             registry
@@ -7522,6 +11469,95 @@ mod tests {
         );
         assert_eq!(first.launches.load(Ordering::Acquire), 1);
         assert_eq!(second.launches.load(Ordering::Acquire), 1);
+        assert_eq!(
+            registry.routes[0]
+                .supervisor
+                .transport
+                .current_generation()
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            registry.routes[1]
+                .supervisor
+                .transport
+                .current_generation()
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn explicit_gpu_fallback_advances_to_the_next_device_without_cpu() {
+        let cpu = Arc::new(TestLauncher::new([]));
+        let first = Arc::new(TestLauncher::new([TestMode::CapabilityMismatch(
+            CapabilityMismatch::Challenge,
+        )]));
+        let second = Arc::new(TestLauncher::new([TestMode::Normal]));
+        let route = |launcher: Arc<TestLauncher>, identity: &str| InferenceWorkerRoute {
+            provider: WorkerProvider::Vulkan,
+            supervisor: InferenceWorkerSupervisor {
+                transport: ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+                    launcher,
+                    short_deadlines(),
+                ),
+                next_correlation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            },
+            target: Some(backend_target(BackendKind::Vulkan, identity, Some(0))),
+            health_key: None,
+            consume_retry_bypass: false,
+        };
+        let gpu_routes = Arc::new(vec![
+            route(first.clone(), "native:pci:0000:01:00.0"),
+            route(second.clone(), "native:pci:0000:02:00.0"),
+        ]);
+        let registry = InferenceWorkerRegistry {
+            routes: Arc::new(vec![InferenceWorkerRoute {
+                provider: WorkerProvider::Cpu,
+                supervisor: InferenceWorkerSupervisor {
+                    transport: ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+                        cpu.clone(),
+                        short_deadlines(),
+                    ),
+                    next_correlation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                },
+                target: Some(BackendTarget::cpu()),
+                health_key: None,
+                consume_retry_bypass: false,
+            }]),
+            gpu_routes: Arc::new(Mutex::new(GpuRouteCatalogCache::default())),
+            gpu_health_path: None,
+            active_route: Arc::new(Mutex::new(None)),
+            route_execution: Arc::new(Mutex::new(())),
+            gpu_routes_for_testing: Some(VerifiedGpuRouteCatalog {
+                device_set_digest: verified_gpu_device_set_digest(&gpu_routes),
+                routes: gpu_routes,
+                diagnostic: None,
+                discovery_fingerprint: "test-catalog".to_owned(),
+                provider_probe_incomplete: false,
+            }),
+        };
+        assert!(
+            registry
+                .load(missing_gguf_artifact(), AccelerationPreference::Gpu)
+                .is_err()
+        );
+        assert_eq!(first.launches.load(Ordering::Acquire), 1);
+        assert_eq!(second.launches.load(Ordering::Acquire), 1);
+        assert_eq!(cpu.launches.load(Ordering::Acquire), 0);
+        for route in registry
+            .gpu_routes_for_testing
+            .as_ref()
+            .unwrap()
+            .routes
+            .iter()
+        {
+            assert_eq!(
+                route.supervisor.transport.current_generation().unwrap(),
+                None,
+                "every failed fallback route is retired"
+            );
+        }
     }
 
     #[test]
@@ -7607,6 +11643,9 @@ mod tests {
         state.current = Some(CurrentGeneration {
             generation: correlation.generation,
             process: process_trait,
+            expectation: expected_worker(WorkerRole::Inference),
+            pack_launch: None,
+            pack_bindings: Vec::new(),
         });
         state.active_request = Some(correlation);
         drop(state);
@@ -8089,6 +12128,7 @@ mod tests {
             mut stdin,
             mut stdout,
             process,
+            ..
         } = OsWorkerLauncher::for_executable(WorkerRole::Inference, executable)
             .launch()
             .expect("spawn hidden inference worker executable");
@@ -8119,6 +12159,7 @@ mod tests {
             mut stdin,
             mut stdout,
             process,
+            ..
         } = OsWorkerLauncher::for_executable(WorkerRole::Vad, executable)
             .launch()
             .expect("spawn hidden VAD worker executable");

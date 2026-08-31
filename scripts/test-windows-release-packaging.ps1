@@ -5,6 +5,7 @@ $repositoryRoot = [System.IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoo
 $releaseScript = Join-Path $PSScriptRoot "build-windows-release.ps1"
 $modelScript = Join-Path $PSScriptRoot "bundle-base-model.ps1"
 $packageVerifier = Join-Path $PSScriptRoot "verify-windows-release-package.ps1"
+$gpuReleasePolicyScript = Join-Path $PSScriptRoot "resolve-windows-gpu-release-policy.ps1"
 . (Join-Path $PSScriptRoot "windows-pe-imports.ps1")
 $source = Get-Content -LiteralPath $releaseScript -Raw
 $helpersStart = $source.IndexOf("function Get-NormalizedFullPath")
@@ -187,11 +188,152 @@ function Assert-VulkanSdkWorkflowContract([string]$Workflow) {
         throw 'Vulkan SDK acquisition must verify the pinned upstream installer instead of delegating trust to a mutable package-manager command.'
     }
 
+    $fetch = Get-WorkflowStepBlock `
+        $Workflow `
+        'Fetch locked Rust dependencies' `
+        'Prepare reviewed sherpa-onnx archive'
+    Assert-OrderedWorkflowTokens $fetch @(
+        'cargo fetch --locked',
+        'cargo fetch --locked --manifest-path tools/worker-pack-author/Cargo.toml'
+    ) 'locked root and worker-pack author dependency fetch'
+
+    $splitBuild = Get-WorkflowStepBlock $Workflow 'Check CPU-safe split production builds' 'Lint'
+    $expectedDesktopCheck = 'cargo check --locked --bin local-transcriber --features ui-harness'
+    $expectedWorkerCheck = 'cargo check --locked --bin scribe-inference-worker --features inference-worker'
+    if (-not $splitBuild.Contains($expectedDesktopCheck) -or
+        -not $splitBuild.Contains($expectedWorkerCheck) -or
+        $splitBuild.Contains('--all-features') -or
+        $splitBuild.Contains('cuda-acceleration') -or
+        $splitBuild.Contains('vulkan-acceleration')) {
+        throw 'Hosted Windows CI must compile the CPU-safe desktop and CPU inference worker as independent production feature sets.'
+    }
+
     $lint = Get-WorkflowStepBlock $Workflow 'Lint' 'Test'
     $test = Get-WorkflowStepBlock $Workflow 'Test' 'Download and verify pinned release inputs'
-    if (-not $lint.Contains('cargo clippy --locked --all-targets --all-features -- -D warnings') -or
-        -not $test.Contains('cargo test --locked --all-features')) {
-        throw 'Windows lint and test jobs must continue exercising all Cargo features after verified Vulkan SDK setup.'
+    $verifiedHostedFeatures = 'ui-harness,inference-worker,vulkan-acceleration'
+    if (-not $lint.Contains("cargo clippy --locked --all-targets --features $verifiedHostedFeatures -- -D warnings") -or
+        -not $test.Contains("cargo test --locked --all-targets --features $verifiedHostedFeatures") -or
+        $lint.Contains('--all-features') -or
+        $test.Contains('--all-features') -or
+        $lint.Contains('cuda-acceleration') -or
+        $test.Contains('cuda-acceleration')) {
+        throw 'Hosted Windows lint and test jobs must exercise the app, worker, and verified Vulkan feature set without claiming unavailable CUDA coverage.'
+    }
+}
+
+function Assert-GpuWorkerPackWorkflowContract([string]$Workflow) {
+    foreach ($required in @(
+        'default: false',
+        'SCRIBE_GPU_PACK_RELEASE_POLICY',
+        'resolve-windows-gpu-release-policy.ps1',
+        'gpu_pack_release_policy: ${{ steps.gpu-release-policy.outputs.release_policy }}',
+        'gpu_worker_packs_included: ${{ steps.gpu-release-policy.outputs.include_gpu_worker_packs }}',
+        'temporary_cpu_only_stage4',
+        'gpu_packs_required',
+        'Official GPU-capable publication omitted required CUDA or Vulkan worker packs.',
+        'report-windows-worker-pack-sizes.ps1',
+        'dist/gpu-pack-evidence'
+    )) {
+        if (-not $Workflow.Contains($required)) {
+            throw "Windows GPU worker-pack workflow lost required fail-closed control: $required"
+        }
+    }
+    foreach ($forbidden in @(
+        'include_gpu_worker_packs:',
+        'Build production-signed CUDA and Vulkan worker packs',
+        'SCRIBE_GPU_PACK_SIGNING_KEY_PKCS8_BASE64',
+        'SCRIBE_GPU_PACK_SIGNING_KEY_ID',
+        'GPU_PACK_PRIVATE_KEY_BASE64',
+        'artifacts\gpu-worker-packs\production',
+        '-WorkerPackRoot'
+    )) {
+        if ($Workflow.Contains($forbidden)) {
+            throw "Candidate-ref Windows release workflow must never receive signing authority or package production GPU packs: $forbidden"
+        }
+    }
+}
+
+function Assert-GpuReleasePolicyScriptContract([string]$Script, [string]$Root) {
+    $nonRelease = & $Script `
+        -EventName 'push' `
+        -Ref 'refs/heads/main' `
+        -Policy ''
+    if ($nonRelease.official_release -or
+        $nonRelease.include_gpu_worker_packs -or
+        $nonRelease.release_policy -cne 'unconfigured') {
+        throw 'Non-release builds must remain CPU-only without requiring repository release policy.'
+    }
+
+    Invoke-ExpectedFailure {
+        & $Script `
+            -EventName 'workflow_dispatch' `
+            -Ref 'refs/heads/main' `
+            -Policy '' `
+            -RequestedGpuPacks
+    } 'candidate-ref workflow never receives GPU pack signing authority'
+    Invoke-ExpectedFailure {
+        & $Script `
+            -EventName 'workflow_dispatch' `
+            -Ref 'refs/heads/untrusted-change' `
+            -Policy '' `
+            -RequestedGpuPacks
+    } 'candidate-ref workflow never receives GPU pack signing authority'
+
+    $temporaryOfficial = & $Script `
+        -EventName 'push' `
+        -Ref 'refs/tags/v0.1.0' `
+        -Policy 'temporary_cpu_only_stage4'
+    if (-not $temporaryOfficial.official_release -or
+        $temporaryOfficial.include_gpu_worker_packs -or
+        $temporaryOfficial.release_policy -cne 'temporary_cpu_only_stage4') {
+        throw 'Temporary Stage 4 official release policy must be explicit and CPU-only.'
+    }
+
+    Invoke-ExpectedFailure {
+        & $Script `
+            -EventName 'push' `
+            -Ref 'refs/tags/v0.1.0' `
+            -Policy 'gpu_packs_required'
+    } 'gpu_packs_required policy is not provisioned in this candidate-ref workflow'
+
+    Invoke-ExpectedFailure {
+        & $Script `
+            -EventName 'push' `
+            -Ref 'refs/tags/v0.1.0' `
+            -Policy ''
+    } 'Official Windows releases require SCRIBE_GPU_PACK_RELEASE_POLICY'
+    Invoke-ExpectedFailure {
+        & $Script `
+            -EventName 'workflow_dispatch' `
+            -Ref 'refs/heads/main' `
+            -Policy 'temporary_cpu_only_stage4' `
+            -RequestedGpuPacks `
+            -PublishRelease
+    } 'candidate-ref workflow never receives GPU pack signing authority'
+    Invoke-ExpectedFailure {
+        & $Script `
+            -EventName 'push' `
+            -Ref 'refs/heads/main' `
+            -Policy 'unknown-policy'
+    } 'unsupported value'
+
+    $githubOutput = Join-Path $Root 'gpu-release-policy-output.txt'
+    New-Item -ItemType File -Path $githubOutput | Out-Null
+    $null = & $Script `
+        -EventName 'workflow_dispatch' `
+        -Ref 'refs/heads/main' `
+        -Policy 'temporary_cpu_only_stage4' `
+        -PublishRelease `
+        -GitHubOutputPath $githubOutput
+    $output = Get-Content -LiteralPath $githubOutput -Raw
+    foreach ($required in @(
+        'official_release=true',
+        'release_policy=temporary_cpu_only_stage4',
+        'include_gpu_worker_packs=false'
+    )) {
+        if (-not $output.Contains($required)) {
+            throw "GPU release policy GitHub output lost $required"
+        }
     }
 }
 
@@ -388,6 +530,15 @@ try {
         $syntheticImportReport.DelayImports -cnotcontains "user32.dll") {
         throw "Synthetic PE fixture did not prove both normal and delay import parsing."
     }
+    $mixedCaseImports = Join-Path $testRoot "mixed-case-imports.exe"
+    Write-TestPe $mixedCaseImports 0x8664 "KeRnEl32.DlL" "UsEr32.DLL"
+    $mixedCaseImportReport = Assert-ReviewedWindowsPe $mixedCaseImports
+    if ($mixedCaseImportReport.NormalImports -cnotcontains "kernel32.dll" -or
+        $mixedCaseImportReport.DelayImports -cnotcontains "user32.dll") {
+        throw "Windows PE import comparison did not use ASCII case-insensitive identities."
+    }
+    Assert-AllowedPayloadFile "LOCAL-TRANSCRIBER.EXE"
+    Assert-AllowedPayloadFile "SCRIBE-INFERENCE-WORKER.EXE"
     Invoke-ExpectedFailure { Assert-Amd64Pe $x86 } "PE Machine mismatch"
     $consoleSubsystem = Join-Path $testRoot "console-subsystem.exe"
     Write-TestPe $consoleSubsystem 0x8664 "kernel32.dll" "user32.dll" 3
@@ -550,6 +701,71 @@ try {
         @([regex]::Matches($emptyAllowlistSource, 'Result := False;')).Count -ne 2) {
         throw 'Empty worker-pack installer allowlist must fail closed for files and directories.'
     }
+    $emptySizeReport = Join-Path $testRoot 'empty-worker-pack-size-report.json'
+    & (Join-Path $repositoryRoot 'scripts\report-windows-worker-pack-sizes.ps1') `
+        -CatalogPath (Join-Path $emptyPackBundle 'worker-pack-catalog.json') `
+        -OutputPath $emptySizeReport
+    $emptySizeReportJson = Get-Content -LiteralPath $emptySizeReport -Raw
+    $emptySizeEvidence = $emptySizeReportJson | ConvertFrom-Json
+    Assert-ExactObjectProperties $emptySizeEvidence @('schema_version', 'packs') 'Empty worker-pack size report'
+    if ($emptySizeEvidence.schema_version -ne 1 -or @($emptySizeEvidence.packs).Count -ne 0) {
+        throw 'CPU-only release must produce explicit empty GPU size evidence.'
+    }
+    if ($emptySizeReportJson -cnotmatch '"packs"\s*:\s*\[\s*\]') {
+        throw 'CPU-only release size evidence must serialize packs as an explicit empty array.'
+    }
+
+    $sizeReportFixtures = @(
+        [ordered]@{
+            pack_id = 'scribe-cuda-windows-x64'
+            pack_version = '1.0.0'
+            pack_digest = ('a' * 64)
+            backend = 'cuda'
+            installed_size_bytes = 101
+            compressed_size_bytes = 51
+            files = @('workers/packs/cuda/manifest.json', 'workers/packs/cuda/signature.json', 'workers/packs/cuda/worker.exe')
+        },
+        [ordered]@{
+            pack_id = 'scribe-vulkan-windows-x64'
+            pack_version = '1.0.0'
+            pack_digest = ('b' * 64)
+            backend = 'vulkan'
+            installed_size_bytes = 202
+            compressed_size_bytes = 102
+            files = @('workers/packs/vulkan/manifest.json', 'workers/packs/vulkan/signature.json', 'workers/packs/vulkan/worker.exe')
+        }
+    )
+    foreach ($packCount in @(1, 2)) {
+        $catalogPath = Join-Path $testRoot "worker-pack-size-catalog-$packCount.json"
+        $reportPath = Join-Path $testRoot "worker-pack-size-report-$packCount.json"
+        $catalogJson = [ordered]@{
+            schema_version = 1
+            packs = [object[]]@($sizeReportFixtures | Select-Object -First $packCount)
+        } | ConvertTo-Json -Depth 8
+        [System.IO.File]::WriteAllText(
+            $catalogPath,
+            $catalogJson,
+            [System.Text.UTF8Encoding]::new($false)
+        )
+        & (Join-Path $repositoryRoot 'scripts\report-windows-worker-pack-sizes.ps1') `
+            -CatalogPath $catalogPath `
+            -OutputPath $reportPath
+        $reportJson = Get-Content -LiteralPath $reportPath -Raw
+        $evidence = $reportJson | ConvertFrom-Json
+        Assert-ExactObjectProperties $evidence @('schema_version', 'packs') "$packCount-pack size report"
+        if ($evidence.schema_version -ne 1 -or @($evidence.packs).Count -ne $packCount -or
+            $reportJson -cnotmatch '"packs"\s*:\s*\[') {
+            throw "$packCount-pack size evidence did not preserve a deterministic JSON array."
+        }
+        for ($index = 0; $index -lt $packCount; $index++) {
+            if ($evidence.packs[$index].pack_id -cne $sizeReportFixtures[$index].pack_id -or
+                $evidence.packs[$index].installed_size_bytes -ne $sizeReportFixtures[$index].installed_size_bytes -or
+                $evidence.packs[$index].compressed_size_bytes -ne $sizeReportFixtures[$index].compressed_size_bytes -or
+                $evidence.packs[$index].file_count -ne 3) {
+                throw "$packCount-pack size evidence changed pack order or values."
+            }
+        }
+    }
 
     $targetBundle = Join-Path $repositoryRoot "target\scribe-release-probe-$PID"
     Invoke-ExpectedFailure {
@@ -644,6 +860,8 @@ try {
     $workflow = Get-Content -LiteralPath (Join-Path $repositoryRoot ".github\workflows\release.yml") -Raw
     Assert-ReleaseCargoFeatureContract $source
     Assert-VulkanSdkWorkflowContract $workflow
+    Assert-GpuWorkerPackWorkflowContract $workflow
+    Assert-GpuReleasePolicyScriptContract $gpuReleasePolicyScript $testRoot
     if ($workflow -notmatch "prepare-windows-release-inputs\.ps1" -or
         $workflow -notmatch "build-windows-release\.ps1" -or
         $workflow -notmatch "INNO_NUPKG_SHA256: a0dad33db33099d9cd2b89ac2d08b5d70c589b15118ced3b95f469f044f99950" -or

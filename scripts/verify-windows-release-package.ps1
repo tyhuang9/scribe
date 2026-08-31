@@ -187,7 +187,10 @@ function Assert-AllowedPayloadFile(
         $extension -in @('.pyd', '.py', '.pyc', '.onnx', '.ort')) {
         throw "Release payload contains a forbidden runtime, Python, runner, or loose ONNX artifact: $RelativePath"
     }
-    if ($extension -in @('.dll', '.exe') -and $RelativePath -cnotin $AllowedExecutablePaths) {
+    $allowedExecutable = @($AllowedExecutablePaths | Where-Object {
+        [string]::Equals($_, $RelativePath, [System.StringComparison]::OrdinalIgnoreCase)
+    })
+    if ($extension -in @('.dll', '.exe') -and $allowedExecutable.Count -eq 0) {
         throw "Release payload contains an unallowlisted executable or DLL: $RelativePath"
     }
 }
@@ -256,7 +259,7 @@ function Assert-ExactObjectProperties($Object, [string[]]$ExpectedNames, [string
 }
 
 function Get-ExpectedDirectories([string[]]$FilePaths) {
-    $directories = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+    $directories = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     foreach ($path in $FilePaths) {
         $segments = $path.Split('/')
         for ($index = 1; $index -lt $segments.Count; $index++) {
@@ -293,9 +296,8 @@ function Assert-ExactPayloadTree(
         }
     }
 
-    $expectedSorted = @($ExpectedPaths | Sort-Object)
-    if ($actualPaths.Count -ne $expectedSorted.Count -or
-        (Compare-Object -ReferenceObject $expectedSorted -DifferenceObject $actualPaths -CaseSensitive)) {
+    if ($actualPaths.Count -ne $ExpectedPaths.Count -or
+        -not $expectedCaseFolded.SetEquals($actualCaseFolded)) {
         throw "Release payload differs from its explicit inventory."
     }
 
@@ -303,8 +305,18 @@ function Assert-ExactPayloadTree(
         Get-RelativeBundlePath $Root $_.FullName
     } | Sort-Object)
     $expectedDirectories = @(Get-ExpectedDirectories $ExpectedPaths)
-    if ($actualDirectories.Count -ne $expectedDirectories.Count -or
-        (Compare-Object -ReferenceObject $expectedDirectories -DifferenceObject $actualDirectories -CaseSensitive)) {
+    $expectedDirectorySet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($path in $expectedDirectories) {
+        $null = $expectedDirectorySet.Add($path)
+    }
+    $actualDirectorySet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($path in $actualDirectories) {
+        if (-not $actualDirectorySet.Add($path)) {
+            throw "Release payload contains duplicate case-insensitive directories: $path"
+        }
+    }
+    if ($actualDirectories.Count -ne $expectedDirectorySet.Count -or
+        -not $expectedDirectorySet.SetEquals($actualDirectorySet)) {
         throw "Release payload contains directories outside its explicit allowlist."
     }
 }
@@ -480,10 +492,12 @@ function Assert-Bundle {
         $inventoryPaths.Add($entry.path)
         Assert-ExactFile (Join-Path $root ($entry.path -replace '/', '\')) $expectedSize $entry.sha256
     }
-    $expectedInventorySorted = @($expectedInventoryPaths | Sort-Object)
-    $actualInventorySorted = @($inventoryPaths | Sort-Object)
-    if ($actualInventorySorted.Count -ne $expectedInventorySorted.Count -or
-        (Compare-Object -ReferenceObject $expectedInventorySorted -DifferenceObject $actualInventorySorted -CaseSensitive)) {
+    $expectedInventoryCaseFolded = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($path in $expectedInventoryPaths) {
+        $null = $expectedInventoryCaseFolded.Add($path)
+    }
+    if ($inventoryPaths.Count -ne $expectedInventoryCaseFolded.Count -or
+        -not $expectedInventoryCaseFolded.SetEquals($inventoryCaseFolded)) {
         throw "Bundle inventory paths differ from the canonical self-contained payload allowlist."
     }
 
@@ -527,7 +541,10 @@ function Assert-SafePortableZip([string]$Path) {
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $archive = [System.IO.Compression.ZipFile]::OpenRead((Get-NormalizedPath $Path))
     try {
-        $expectedDirectories = @(Get-ExpectedDirectories $expectedPortablePayloadPaths)
+        $expectedDirectories = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($directory in @(Get-ExpectedDirectories $expectedPortablePayloadPaths)) {
+            $null = $expectedDirectories.Add($directory)
+        }
         $filePaths = [System.Collections.Generic.List[string]]::new()
         $entryIdentities = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
         foreach ($entry in $archive.Entries) {
@@ -547,7 +564,7 @@ function Assert-SafePortableZip([string]$Path) {
                 throw "Portable ZIP contains a symbolic link or reparse entry: $path"
             }
             if ($isDirectory) {
-                if ($path -cnotin $expectedDirectories) {
+                if (-not $expectedDirectories.Contains($path)) {
                     throw "Portable ZIP contains an unexpected directory entry: $path"
                 }
             }
@@ -556,10 +573,12 @@ function Assert-SafePortableZip([string]$Path) {
                 $filePaths.Add($path)
             }
         }
-        $actualFiles = @($filePaths | Sort-Object)
-        $expectedFiles = @($expectedPortablePayloadPaths | Sort-Object)
-        if ($actualFiles.Count -ne $expectedFiles.Count -or
-            (Compare-Object -ReferenceObject $expectedFiles -DifferenceObject $actualFiles -CaseSensitive)) {
+        $expectedFiles = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($expectedFile in $expectedPortablePayloadPaths) {
+            $null = $expectedFiles.Add($expectedFile)
+        }
+        if ($filePaths.Count -ne $expectedFiles.Count -or
+            -not $expectedFiles.SetEquals($filePaths)) {
             throw "Portable ZIP entries differ from the canonical self-contained payload allowlist."
         }
     }

@@ -20,11 +20,30 @@ jobs:
   build:
     name: Build and verify Windows installer
     runs-on: windows-latest
-    timeout-minutes: 60
+    timeout-minutes: 120
+    outputs:
+      gpu_pack_release_policy: ${{ steps.gpu-release-policy.outputs.release_policy }}
+      gpu_worker_packs_included: ${{ steps.gpu-release-policy.outputs.include_gpu_worker_packs }}
+      official_release: ${{ steps.gpu-release-policy.outputs.official_release }}
 
     steps:
       - name: Check out source
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Resolve official GPU worker-pack release policy
+        id: gpu-release-policy
+        shell: pwsh
+        env:
+          GPU_PACK_RELEASE_POLICY: ${{ vars.SCRIBE_GPU_PACK_RELEASE_POLICY }}
+          PUBLISH_RELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_release }}
+        run: |
+          $publishRelease = $env:PUBLISH_RELEASE -ceq 'true'
+          & .\scripts\resolve-windows-gpu-release-policy.ps1 `
+            -EventName $env:GITHUB_EVENT_NAME `
+            -Ref $env:GITHUB_REF `
+            -Policy $env:GPU_PACK_RELEASE_POLICY `
+            -PublishRelease:$publishRelease `
+            -GitHubOutputPath $env:GITHUB_OUTPUT
 
       - name: Test Windows release packaging contracts
         shell: pwsh
@@ -100,7 +119,10 @@ jobs:
           (Join-Path $sdkRoot 'Bin') >> $env:GITHUB_PATH
 
       - name: Fetch locked Rust dependencies
-        run: cargo fetch --locked
+        shell: pwsh
+        run: |
+          cargo fetch --locked
+          cargo fetch --locked --manifest-path tools/worker-pack-author/Cargo.toml
 
       - name: Prepare reviewed sherpa-onnx archive
         shell: pwsh
@@ -124,14 +146,31 @@ jobs:
           }
           "SHERPA_ONNX_ARCHIVE_DIR=$archiveDir" >> $env:GITHUB_ENV
 
+      - name: Test Windows GPU worker-pack contracts
+        shell: pwsh
+        run: |
+          & .\scripts\test-windows-gpu-worker-pack-tools.ps1 `
+            -CargoTargetDirectory target-gpu-pack-contract-tests
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      - name: Check CPU-safe split production builds
+        run: |
+          cargo check --locked --bin local-transcriber --features ui-harness
+          cargo check --locked --bin scribe-inference-worker --features inference-worker
+
       - name: Lint
-        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+        # Hosted PR runners receive the digest-pinned Vulkan SDK above, but do
+        # not carry the exact CUDA toolkit required by the release contract.
+        # CUDA production inputs are intentionally unprovisioned until their
+        # exact hashes and a separately protected signing workflow exist; do
+        # not make ordinary CI claim CUDA coverage by enabling a native
+        # feature it cannot satisfy.
+        run: cargo clippy --locked --all-targets --features ui-harness,inference-worker,vulkan-acceleration -- -D warnings
 
       - name: Test
-        run: cargo test --locked --all-features
+        run: cargo test --locked --all-targets --features ui-harness,inference-worker,vulkan-acceleration
 
       - name: Download and verify pinned release inputs
         shell: pwsh
@@ -147,6 +186,13 @@ jobs:
           & .\scripts\build-windows-release.ps1 `
             -ModelSource .ci-release-inputs\model\whisper-base.en-Q8_0.gguf `
             -BundlePath dist\portable
+
+      - name: Report bundled worker-pack sizes
+        shell: pwsh
+        run: |
+          & .\scripts\report-windows-worker-pack-sizes.ps1 `
+            -CatalogPath dist\portable\worker-pack-catalog.json `
+            -OutputPath dist\gpu-pack-evidence\worker-pack-sizes.json
 
       - name: Acquire digest-pinned Inno Setup
         shell: pwsh
@@ -257,7 +303,9 @@ jobs:
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: windows-installer-verification-logs
-          path: dist/installer-verification-logs
+          path: |
+            dist/installer-verification-logs
+            dist/gpu-pack-evidence
           if-no-files-found: warn
 
       - name: Upload Windows release assets
@@ -288,6 +336,32 @@ jobs:
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           ref: ${{ github.sha }}
+
+      - name: Revalidate official GPU worker-pack release policy
+        shell: pwsh
+        env:
+          GPU_PACK_RELEASE_POLICY: ${{ needs.build.outputs.gpu_pack_release_policy }}
+          GPU_WORKER_PACKS_INCLUDED: ${{ needs.build.outputs.gpu_worker_packs_included }}
+          OFFICIAL_RELEASE: ${{ needs.build.outputs.official_release }}
+        run: |
+          if ($env:OFFICIAL_RELEASE -cne 'true') {
+            throw 'Release publication requires an official release-policy decision from the build job.'
+          }
+          switch ($env:GPU_PACK_RELEASE_POLICY) {
+            'temporary_cpu_only_stage4' {
+              if ($env:GPU_WORKER_PACKS_INCLUDED -cne 'false') {
+                throw 'Temporary Stage 4 CPU-only publication unexpectedly contains GPU worker packs.'
+              }
+            }
+            'gpu_packs_required' {
+              if ($env:GPU_WORKER_PACKS_INCLUDED -cne 'true') {
+                throw 'Official GPU-capable publication omitted required CUDA or Vulkan worker packs.'
+              }
+            }
+            default {
+              throw 'Release publication received no reviewed GPU worker-pack policy.'
+            }
+          }
 
       - name: Resolve and validate release metadata
         id: release-metadata

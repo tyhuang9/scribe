@@ -1,9 +1,53 @@
 # Verified GPU worker-pack infrastructure
 
-Stage 3 establishes a dormant security and persistence boundary for future
-external GGUF GPU workers. It does not ship a production CUDA, Vulkan, or Metal
-worker, enable downloads, change `Auto`, or make a GPU provider discoverable.
-The production trust root and registry are intentionally empty.
+Stage 4 implements bundled Windows x64 CUDA and Vulkan GGUF worker packs behind
+the verified Stage 3 boundary. A pack becomes an explicit-GPU candidate only
+after signed catalog discovery, retained no-follow verification, a bounded
+provider probe, challenge-bound SCIF Hello reconciliation, and authoritative
+per-device Windows driver mapping. `Auto` remains deliberately default-denied
+to GPU until Stage 5 hardware qualification. The checked-in production trust
+root is still empty, so ordinary releases remain CPU-only and a requested
+nonempty GPU release fails closed until a separately reviewed public key and
+protected trusted signing workflow are provisioned. The candidate-ref release
+workflow never receives signing authority. Official releases additionally require the
+reviewed `SCRIBE_GPU_PACK_RELEASE_POLICY` repository variable. Its temporary
+Stage 4 value is `temporary_cpu_only_stage4`; once production trust is
+provisioned it may be changed to `gpu_packs_required` only with a separate
+trusted workflow that signs fixed verified unsigned artifacts and returns both
+packs for publication.
+
+## Current Stage 4 behavior
+
+- Windows x64 discovers at most eight immutable packs and at most sixteen
+  bounded devices per provider probe. It produces one opaque launch binding per
+  stable device identity and sorts CUDA before Vulkan, then stable identity.
+- Explicit `GPU` tries at most four verified GPU routes, advances only after a
+  pre-output provider/worker failure, and never falls back to CPU. Cancellation,
+  invalid input, model corruption, decode/content failure, and partial output
+  are never replayed.
+- The current process index is remapped from stable PCI, Windows LUID, or device
+  UUID identity on every actual start. Hello must agree with the
+  parent-observed backend, provider, vendor, class, identity, current index,
+  driver, and bounded memory snapshot.
+- CUDA uses the provider PCI identity plus the matching bounded Windows
+  SetupAPI driver version. Windows Vulkan drivers commonly omit
+  `VK_EXT_pci_bus_info`, so the verified Vulkan worker performs a second
+  extension-free loader query and correlates the provider enumeration to
+  `VkPhysicalDeviceIDProperties` in the same live process. It prefers the
+  Windows LUID, falls back to device UUID, and binds the Vulkan driver ID,
+  version, and driver UUID. Duplicate or unmatched facts fail closed. The
+  desktop never loads the Vulkan loader or provider. Missing stable device or
+  driver identity makes the candidate incompatible instead of producing an
+  unbound health key.
+- One registry-wide route owns the sole inference worker/model. CPU/GPU and
+  GPU-device switches retire the previous worker; failed fallback workers are
+  retired; only the winner retains the existing five-minute warm model.
+- Repeated explicit-GPU requests reuse the verified catalog while a cheap
+  signed-catalog generation plus SetupAPI device/driver fingerprint is
+  unchanged. A changed fingerprint retires the warm worker before re-probing.
+- GPU health uses the exact pack/runtime/OS/driver/device/model key described
+  below. `Auto` performs catalog diagnostics only and never launches a provider
+  probe.
 
 ## Signed envelope and digest
 
@@ -123,40 +167,109 @@ roots. It invokes the compiled production verifier before and after copying,
 stages the immutable layout, writes the bounded catalog, reports installed and
 compressed sizes, and generates the installer preflight allowlist. Every pack
 file is also included in the top-level bundle inventory, preserving portable
-and installer parity. The normal catalog is empty.
+and installer parity. The normal catalog is empty until production trust is
+provisioned. When a release includes packs, the same catalog is inside the
+portable payload and the installer copies that exact tree; CI emits a separate
+per-pack installed and compressed size report from the verified catalog.
 
-Repository tooling does not sign packs and contains no production private key.
-Publication must remain disabled until a persistent production public key is
-reviewed into the application and the matching private key is supplied only
-through an explicit external signing path or masked CI secret. Test keys are
-fixture-only and must never be promoted.
+Repository tooling contains no production private key. The candidate-ref
+workflow contains no production-key secret reference, accepts no GPU-pack
+dispatch request, and always creates the CPU-only portable/installer payload.
+Official publication fails when the reviewed repository policy is absent or
+unknown; the temporary Stage 4 policy is explicitly CPU-only, while
+`gpu_packs_required` remains unavailable until a separate protected trusted
+workflow can sign fixed verified unsigned artifacts. That signer must verify the
+approved source/revision and complete unsigned-artifact digests before receiving
+authority; candidate-ref scripts must not run with the key. The authoring tool
+still verifies that a supplied key's public half exactly matches the separately
+reviewed key embedded in `ProductionTrustRoot`. Because no production public key
+or trusted signer exists today, every nonempty production release fails closed.
+The deterministic seed and key ID used by tooling tests and local hardware smoke
+are fixture-only and cannot verify under production trust.
 
-## Stage 4 launch binding prerequisite
+## Windows Vulkan hardware evidence
 
-Stage 4 must add one typed launch descriptor that carries the verified pack
+On 2026-08-29, a clean fixture-only pack built from `10d4ec2` with the pinned
+Rust/MSVC/CMake contract and Vulkan SDK 1.4.357.0 completed the ignored
+challenge-bound SCIF/model smoke on an NVIDIA GeForce RTX 4080 SUPER. The pack
+was `scribe-vulkan-windows-x64` version `0.1.0-fixture7`, digest
+`563e1cf17db85bf02c40dda7d074e981c589931aa890f986446df70428aad62b`.
+It contained three files totaling 98,017,192 installed bytes; the worker payload
+was 98,016,256 bytes, and the same optimal ZIP method used by staging measured
+31,801,892 compressed bytes.
+
+The worker reported stable identity `native:0000:01:00.0`, bounded SetupAPI
+driver identity `windows-display:32.0.16.1088`, and 16,824,401,920 total-memory
+bytes. It transcribed the pinned `whisper-base.en-Q8_0.gguf`/JFK fixture through
+the verified explicit-GPU route, contained the expected `ask not` phrase,
+reported `warm_reused=true` on the second request, and launched no CPU worker.
+These numbers describe the fixture pack only; they are not CUDA sizes or a
+production installer measurement.
+
+The toolchain-selection repair was reverified from clean commit `94ba0ff` after
+the hosted Windows runner began preferring a Visual Studio 18 shell. The build
+accepted the shell only after locating the reviewed v143 compatibility
+component, then activated MSVC toolset `14.44.35207` and Windows SDK
+`10.0.26100.0` through `vcvarsall`. CMake reported compiler
+`19.44.35227.0` from the exact pinned directory and used the exact hashed
+`cl.exe`, `link.exe`, `lib.exe`, and `nmake.exe` payloads. The resulting
+fixture pack `0.1.0-fixture-toolchain2` had digest
+`edd7cc74481720c19c21decfa4676af8c7b2dfb32abb50e2c5ba9a56c88fd306`
+and the same 98,016,256-byte worker payload. It passed the ignored explicit-GPU
+SCIF/model smoke on the same RTX 4080 SUPER with stable device/driver identity,
+the expected `ask not` phrase, warm reuse, and zero CPU launches. This evidence
+verifies compiler-payload selection across Visual Studio shells; it does not
+replace remote CI, CUDA, production-signing, installer, or Auto qualification.
+
+CUDA was not built or run locally because CUDA Toolkit/nvcc 12.8.93 is absent.
+Fixture mode checks that exact developer-toolkit version. Production mode also
+requires a complete canonical CUDA Toolkit inventory with exact SHA-256 values;
+the checked-in inventory is intentionally empty, so same-version modified inputs
+cannot become production-trusted packs. Production signing and packaging remain
+intentionally unverified and fail closed because no reviewed production public
+key or protected trusted signer exists.
+Auto enablement, five-cold/twenty-warm performance qualification, driver/device
+loss qualification, and portable/installer hardware execution remain later
+release evidence rather than claims established by this smoke.
+
+The passing test used the following command shape with absolute local fixture
+paths and the recorded hashes above:
+
+```powershell
+$env:SCRIBE_GPU_FIXTURE_PACK_ROOT = '<fixture7-pack-root>'
+$env:SCRIBE_GPU_FIXTURE_MODEL = '<whisper-base.en-Q8_0.gguf>'
+$env:SCRIBE_GPU_FIXTURE_MODEL_SHA256 = '3b46ca40bccbf7609c68d88a36d96077a04ca7c87f2060ede06f129fac3e7652'
+$env:SCRIBE_GPU_FIXTURE_WAV = '<pinned-jfk.wav>'
+$env:SCRIBE_GPU_FIXTURE_WAV_SHA256 = '59dfb9a4acb36fe2a2affc14bacbee2920ff435cb13cc314a08c13f66ba7860e'
+$env:SCRIBE_GPU_FIXTURE_EXPECTED_TRANSCRIPT = 'ask not'
+$env:SCRIBE_GPU_FIXTURE_STABLE_DEVICE_ID = 'native:0000:01:00.0'
+cargo test --features inference-worker verified_vulkan_fixture_pack_scif_model_hardware_smoke -- --ignored --nocapture
+```
+
+## Stage 4 launch binding
+
+Stage 4 adds a typed launch descriptor that carries the verified pack
 ID/version/digest, backend/provider, runtime ABI, target OS/architecture, and
 stable device identity through `WorkerExecutableResolver`. The same facts must
 be challenge-bound into the worker `Hello` exchange and compared with the
 reverified executable and final process image before the worker can advertise a
-capability. This binding is required before any production trust root or catalog
-may be provisioned. Merely verifying a pack directory or adding a public key is
-not sufficient to make a provider discoverable or launchable.
+capability. Merely verifying a pack directory or adding a public key is not
+sufficient to make a provider discoverable or launchable.
 
 The compile-time seam is `ResolverHelloBindingBridge` followed by
 `VerifiedPackLaunchBinding::try_from_resolver_hello_bridge`. The opaque binding
 can be created only from an `Arc<VerifiedPackLease>` retained by the resolver,
 and only when its descriptor exactly agrees with the worker Hello pack ID,
 version, digest, runtime ABI, backend, and provider and the Hello supplies a
-canonical stable device identity. Stage 4 must retain that lease through exact
+canonical stable device identity. The Windows resolver retains that lease through exact
 worker/dependency handle launch and final image/Hello validation; it must never
 reconstruct launch authority from `VerifiedPack::root`. Production discovery
-must obtain those bindings from a concrete
+obtains those bindings from the concrete
 `discover_production_pack_launch_bindings` path and pass only them to
 `ProductionPackRegistry::from_launch_bindings`; it cannot insert a raw
-`VerifiedPack`. Stage 3 implements neither the bridge nor discovery path and
-constructs only `ProductionPackRegistry::empty()`.
+`VerifiedPack`.
 
-Windows is the first intended production target: its future resolver must keep
+Windows is the implemented Stage 4 target: its resolver keeps
 the verified directory/file lease alive through exact-image launch and the
 challenge-bound Hello check. Unix production remains fail closed. Before a
 Unix catalog or trust root can become nonempty, the resolver bridge must also
@@ -176,3 +289,37 @@ remain fail closed until an equivalent descriptor-relative execution primitive
 is implemented and tested. The architecture guard scopes this prohibition to
 the verified-pack provider launch function; unrelated process launches do not
 satisfy or trip the gate.
+
+## Build and verification commands
+
+`scripts/build-windows-gpu-worker-pack.ps1` builds one deterministic fixture or
+production pack from the pinned contract in
+`runtime-manifests/gpu-worker-toolchain-windows-x64.json`.
+`scripts/prepare-windows-gpu-worker-packs.ps1` is the production-only two-pack
+orchestrator used by the opt-in release job. It requires exact Rust 1.96.0,
+CMake 4.4.2, MSVC 14.44.35207 tool payloads, Windows SDK 10.0.26100.0, the
+reviewed Sherpa archive, Vulkan SDK 1.4.357.0, and CUDA Toolkit/nvcc 12.8.93.
+The mutable Visual Studio product-shell version is not the compiler identity:
+the build locates a shell containing the reviewed compatibility component,
+activates the exact toolset/SDK, verifies tool file versions and SHA-256s, and
+exports only the verified build environment. Missing or mismatched payloads
+fail with a specific gate; the scripts never download an unapproved SDK. Pack payload outputs use
+the ignored `artifacts/gpu-worker-packs` tree. Native Cargo targets must be
+fresh direct children of the validated short `LocalApplicationData\sgp` build
+root. Each build also receives a separate fresh physical `LOCALAPPDATA` child,
+so `transcribe-cpp-sys` never reads, replaces, or reuses the user's shared
+`tcs` junction namespace. If the dependency's first CMake configure encounters
+its known Windows junction bootstrap failure, the script validates the one
+build-local junction and its exact Cargo OUT_DIR, replaces only that fresh
+partial `out\build` directory with an isolated short junction, and retries
+once. This keeps CMake/MSBuild paths bounded in deep worktrees and prevents
+CUDA and Vulkan feature outputs from being confused.
+
+`scripts/test-windows-gpu-worker-pack-tools.ps1` exercises deterministic
+fixture authoring plus signature, key, tamper, unexpected-file/DLL, ADS,
+junction, and hardlink rejection. The Rust suites cover downgrade floors,
+catalog mismatch, challenge/ABI/pack/device identity mismatch, multi-device
+remapping, bounded fallback, quarantine privacy/timing, and no-replay rules.
+`scripts/test-windows-release-packaging.ps1` and
+`scripts/verify-windows-release-package.ps1` enforce exact catalog/inventory,
+installer allowlist, portable/installer parity, and hostile filesystem cases.

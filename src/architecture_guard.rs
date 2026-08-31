@@ -801,7 +801,7 @@ fn native_runtime_ownership_is_confined_to_exact_owner_paths() {
 }
 
 #[test]
-fn verified_worker_pack_stage_remains_fail_closed_and_provider_inert() {
+fn verified_worker_pack_stage_four_remains_trust_closed_and_auto_inert() {
     let desktop = include_str!("main.rs");
     let module = include_str!("gpu_worker_pack/mod.rs");
     let health = include_str!("gpu_worker_pack/health.rs");
@@ -823,8 +823,8 @@ fn verified_worker_pack_stage_remains_fail_closed_and_provider_inert() {
         .and_then(|source| source.split('}').next())
         .is_some_and(|body| body.contains("None"));
     for dormant_lint_reason in [
-        "provider-neutral qualification policy remains dormant until a production GPU provider ships",
-        "Stage 3 compiles the sealed verifier and store before Stage 4 provisions production trust or discovery",
+        "provider qualification policy remains dormant until Stage 5 enables GPU routes for Auto",
+        "Stage 4 retains verified-pack activation and rollback seams beyond bundled catalog discovery",
     ] {
         assert!(desktop.contains(dormant_lint_reason));
     }
@@ -864,6 +864,19 @@ fn verified_worker_pack_stage_remains_fail_closed_and_provider_inert() {
             "typed Stage 4 production provisioning gate lost {required:?}"
         );
     }
+    let production_worker = production_source(worker);
+    assert!(
+        production_worker.contains(
+            "fn resolver_unix_launch_authority(\n        &self,\n    ) -> Option<Arc<crate::gpu_worker_pack::UnixPackExecAuthority>>"
+        ),
+        "Stage 4 Unix pack binding must expose a fallible authority boundary"
+    );
+    assert!(
+        !production_worker.contains(
+            "unreachable!(\"production verified-pack launch is Windows-only in Stage 4\")"
+        ),
+        "unsupported Unix production pack binding must fail closed without a panic"
+    );
     for required in [
         "struct LaunchableWorker<'lease>",
         "_lease: &'lease VerifiedPackLease",
@@ -889,7 +902,8 @@ fn verified_worker_pack_stage_remains_fail_closed_and_provider_inert() {
         "ID/version/digest",
         "backend/provider",
         "stable device",
-        "before any production trust root or catalog",
+        "ProductionTrustRoot",
+        "reviewed public key",
     ] {
         assert!(
             documentation.contains(required),
@@ -906,6 +920,123 @@ fn verified_worker_pack_stage_remains_fail_closed_and_provider_inert() {
     assert!(module.contains("PackBackend::Cuda"));
     assert!(module.contains("PackBackend::Vulkan"));
     assert!(module.contains("PackBackend::Metal"));
+    for required in [
+        "fn discover_production_pack_launch_bindings(",
+        "InferenceWorkerSupervisor::for_pack_probe(lease)",
+        "verified_pack_bindings()",
+        "ProductionPackRegistry::from_launch_bindings(bindings)",
+        "preference == AccelerationPreference::Auto",
+        "Auto remains deliberately default-denied for Stage 4",
+        "routes: Arc::clone(&self.routes)",
+    ] {
+        assert!(
+            worker.contains(required),
+            "Stage 4 verified discovery/default-denied Auto contract lost {required:?}"
+        );
+    }
+    for required in [
+        "ash::Entry::load()",
+        "PhysicalDeviceIDProperties",
+        "PhysicalDeviceDriverProperties",
+        "native:luid:",
+        "native:uuid:",
+        "VulkanDeviceCatalog::discover",
+        "GPU provider device has no matching Vulkan LUID/UUID identity",
+    ] {
+        assert!(
+            worker.contains(required),
+            "worker-only Vulkan stable-identity contract lost {required:?}"
+        );
+    }
+}
+
+#[test]
+fn worker_pack_authoring_is_isolated_pinned_and_production_closed() {
+    let root_manifest = include_str!("../Cargo.toml");
+    let desktop = include_str!("main.rs");
+    let production_manifest = include_str!("gpu_worker_pack/manifest.rs");
+    let author_manifest = include_str!("../tools/worker-pack-author/Cargo.toml");
+    let author_lock = include_str!("../tools/worker-pack-author/Cargo.lock");
+    let author_entrypoint = include_str!("../tools/worker-pack-author/src/main.rs");
+    let authoring = include_str!("worker_pack_authoring.rs");
+    let build = include_str!("../scripts/build-windows-gpu-worker-pack.ps1");
+    let contract = include_str!("../runtime-manifests/gpu-worker-toolchain-windows-x64.json");
+
+    assert!(!root_manifest.contains("scribe-worker-pack-tool"));
+    assert!(!root_manifest.contains("pack-authoring"));
+    assert!(!desktop.contains("worker_pack_authoring"));
+    assert!(author_manifest.contains("publish = false"));
+    assert!(author_manifest.contains("path = \"src/main.rs\""));
+    assert!(author_lock.contains("name = \"scribe-worker-pack-tool\""));
+    for required in [
+        "check-production-key",
+        "--fixture-signing",
+        "SigningMode::Production",
+        "production_key_pair",
+        "TrustRoot::public_key(&ProductionTrustRoot, key_id)",
+        "Ed25519KeyPair::from_pkcs8",
+        "external production signing key does not match",
+        "no separately reviewed public key embedded",
+    ] {
+        assert!(
+            author_entrypoint.contains(required) || authoring.contains(required),
+            "isolated pack authoring lost {required:?}"
+        );
+    }
+    for forbidden in [
+        "BEGIN PRIVATE KEY",
+        "production_signing_seed",
+        "PRODUCTION_SEED",
+    ] {
+        assert!(!authoring.contains(forbidden));
+        assert!(!production_manifest.contains(forbidden));
+        assert!(!contract.contains(forbidden));
+    }
+    for required in [
+        "1.96.0",
+        "ac68faa20c58cbccd01ee7208bf3b6e93a7d7f96",
+        "transcribe_cpp_checksum",
+        "transcribe_cpp_sys_checksum",
+        "ash_checksum",
+        "39e9c3835d686b0a6084ab4234fcd1b07dbf6e4767dce60874b12356a25ecd4a",
+        "a94e021ef658dc7c788837341a13f6acea3baf3c",
+        "b7080b6f470bac96ef0afe56b25ae9b2f9f0ca82d10dad19bf3a2fc5ffd6cffc",
+        "1.4.357.0",
+        "f8c97ee2c8bfcd31da87b602622c6e742389f98a83693b504cf538de4c75d3fa",
+        "12.8.93",
+        "14.44.35207",
+        "MultiThreaded",
+        "/Brepro",
+    ] {
+        assert!(
+            contract.contains(required),
+            "toolchain contract lost {required:?}"
+        );
+    }
+    for required in [
+        "--locked",
+        "--offline",
+        "SCRIBE_BUILD_REVISION",
+        "SCRIBE_BUILDING_WORKER = '1'",
+        "SOURCE_DATE_EPOCH",
+        "check-production-key",
+        "windows-pe-imports.ps1",
+        "Copy-ReviewedGpuWorkerDependencyClosure",
+        "GPU pack contains an undeclared native dependency",
+        "Resolve-ShortCargoTargetDirectory",
+        "BuildEnvironment",
+        "Enable-ValidatedCmakeBuildJunction",
+        "one exact NTFS junction",
+    ] {
+        assert!(
+            build.contains(required),
+            "pack build gate lost {required:?}"
+        );
+    }
+    assert!(root_manifest.contains(
+        "vulkan-acceleration = [\"inference-worker\", \"transcribe-cpp/vulkan\", \"dep:ash\"]"
+    ));
+    assert!(root_manifest.contains("ash = { version = \"=0.37.3\", optional = true }"));
 }
 
 #[test]
@@ -951,6 +1082,7 @@ fn worker_pack_health_persistence_stays_bounded_and_content_free() {
 fn release_packaging_accepts_only_compiled_verified_declared_pack_roots() {
     let build = include_str!("../scripts/build-windows-release.ps1");
     let stage = include_str!("../scripts/stage-verified-worker-packs.ps1");
+    let release_policy = include_str!("../scripts/resolve-windows-gpu-release-policy.ps1");
     let installer = include_str!("../installer/scribe.iss");
     let workflow = include_str!("../.github/workflows/release.yml");
     for required in [
@@ -973,12 +1105,54 @@ fn release_packaging_accepts_only_compiled_verified_declared_pack_roots() {
     assert!(installer.contains("#include WorkerPackAllowlist"));
     assert!(installer.contains("IsGeneratedWorkerPackFile(RelativePath)"));
     assert!(workflow.contains("/DWorkerPackAllowlist=..\\dist\\worker-pack-allowlist.iss"));
+    for required in [
+        "default: false",
+        "SCRIBE_GPU_PACK_RELEASE_POLICY",
+        "resolve-windows-gpu-release-policy.ps1",
+        "temporary_cpu_only_stage4",
+        "gpu_packs_required",
+        "needs.build.outputs.gpu_worker_packs_included",
+        "report-windows-worker-pack-sizes.ps1",
+    ] {
+        assert!(
+            workflow.contains(required),
+            "Stage 4 release workflow lost {required:?}"
+        );
+    }
+    for forbidden in [
+        "include_gpu_worker_packs:",
+        "Build production-signed CUDA and Vulkan worker packs",
+        "SCRIBE_GPU_PACK_SIGNING_KEY_PKCS8_BASE64",
+        "SCRIBE_GPU_PACK_SIGNING_KEY_ID",
+        "GPU_PACK_PRIVATE_KEY_BASE64",
+        "artifacts\\gpu-worker-packs\\production",
+        "-WorkerPackRoot",
+    ] {
+        assert!(
+            !workflow.contains(forbidden),
+            "candidate-ref release workflow regained signing authority or production GPU-pack input {forbidden:?}"
+        );
+    }
+    for required in [
+        "Official Windows releases require SCRIBE_GPU_PACK_RELEASE_POLICY",
+        "temporary_cpu_only_stage4",
+        "gpu_packs_required",
+        "include_gpu_worker_packs",
+        "candidate-ref workflow never receives GPU pack signing authority",
+        "separately protected trusted signing workflow",
+    ] {
+        assert!(
+            release_policy.contains(required),
+            "GPU release policy gate lost {required:?}"
+        );
+    }
     assert!(!build.contains("--features vulkan-acceleration"));
 }
 
 #[test]
 fn worker_roles_use_private_pipes_and_protocol_only_stdout() {
     let sources = rust_sources();
+    let identity = include_str!("worker_identity.rs");
     let worker = sources
         .iter()
         .find(|(path, _)| path == Path::new("onnx_worker.rs"))
@@ -986,7 +1160,8 @@ fn worker_roles_use_private_pipes_and_protocol_only_stdout() {
         .expect("worker entrypoint exists");
 
     assert!(worker.contains("PROTOCOL_MAGIC: [u8; 4] = *b\"SCIF\""));
-    assert!(worker.contains("PROTOCOL_VERSION: u8 = 5"));
+    assert!(worker.contains("crate::worker_identity"));
+    assert!(identity.contains("PROTOCOL_VERSION: u8 = 5"));
     for bound_capability in [
         "challenge",
         "app_build",

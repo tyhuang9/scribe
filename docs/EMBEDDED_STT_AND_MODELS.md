@@ -32,12 +32,18 @@ Local GGUF imports are validated in place; Scribe neither copies nor deletes
 them. Legacy user configuration and artifact files are preserved, but production
 paths no longer recognize or execute them.
 
-Stage 3 adds dormant verified GPU worker-pack infrastructure without changing
-that production route. Signed packs have a canonical manifest and detached
-Ed25519 signature, exact payload inventory, immutable digest-addressed storage,
-security-epoch rollback floor, and private bounded health/quarantine state.
-The production trust root and registry are empty, normal packages contain an
-empty worker-pack catalog, and no CUDA/Vulkan/Metal pack is shipped or selected.
+Stage 4 adds verified Windows x64 CUDA/Vulkan GGUF worker discovery and
+explicit-GPU routing without changing the CPU-safe default. Signed packs have a
+canonical manifest and detached Ed25519 signature, exact payload inventory,
+immutable digest-addressed storage, challenge-bound per-device launch identity,
+security-epoch rollback floor, one-active-worker ownership, and private bounded
+health/quarantine state. Explicit GPU can fall back only across verified GPU
+routes before output and never to CPU. `Auto` remains CPU/default-denied to GPU.
+The checked-in production trust root is empty, so ordinary packages still
+contain an empty worker-pack catalog. The candidate-ref release workflow never
+receives signing authority; a nonempty release remains fail-closed until a
+production public key and a separately protected trusted signing workflow over
+fixed verified unsigned artifacts are provisioned.
 See [Verified GPU worker-pack infrastructure](GPU_WORKER_PACKS.md).
 
 ## How to read this record

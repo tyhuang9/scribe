@@ -268,8 +268,10 @@ function Assert-AllowedPayloadFile([string]$RelativePath) {
         $extension -in @('.pyd', '.py', '.pyc', '.onnx', '.ort')) {
         throw "Release payload contains a forbidden runtime, Python, runner, or loose ONNX artifact: $RelativePath"
     }
-    if ($extension -in @('.dll', '.exe') -and
-        $RelativePath -cnotin @('local-transcriber.exe', 'scribe-inference-worker.exe')) {
+    $allowedExecutable = @(@('local-transcriber.exe', 'scribe-inference-worker.exe') | Where-Object {
+        [string]::Equals($_, $RelativePath, [System.StringComparison]::OrdinalIgnoreCase)
+    })
+    if ($extension -in @('.dll', '.exe') -and $allowedExecutable.Count -eq 0) {
         throw "Release payload contains an unallowlisted executable or DLL: $RelativePath"
     }
 }
@@ -293,13 +295,12 @@ function Assert-ExactAllowlist([string]$Root, [string[]]$ExpectedPaths) {
             throw "Release payload contains duplicate case-insensitive paths: $path"
         }
     }
-    $expected = @($ExpectedPaths | Sort-Object)
-    if ($actual.Count -ne $expected.Count -or
-        (Compare-Object -ReferenceObject $expected -DifferenceObject $actual -CaseSensitive)) {
+    if ($actual.Count -ne $ExpectedPaths.Count -or
+        -not $expectedCaseFolded.SetEquals($actualCaseFolded)) {
         throw "Release bundle contains files outside the explicit allowlist."
     }
 
-    $expectedDirectories = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+    $expectedDirectories = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     foreach ($path in $ExpectedPaths) {
         $segments = $path.Split('/')
         for ($index = 1; $index -lt $segments.Count; $index++) {
@@ -309,9 +310,14 @@ function Assert-ExactAllowlist([string]$Root, [string[]]$ExpectedPaths) {
     $actualDirectories = @(Get-ChildItem -LiteralPath $Root -Recurse -Directory -Force | ForEach-Object {
         Get-RelativeBundlePath $Root $_.FullName
     } | Sort-Object)
-    $expectedDirectoryPaths = @($expectedDirectories | Sort-Object)
-    if ($actualDirectories.Count -ne $expectedDirectoryPaths.Count -or
-        (Compare-Object -ReferenceObject $expectedDirectoryPaths -DifferenceObject $actualDirectories -CaseSensitive)) {
+    $actualDirectorySet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($path in $actualDirectories) {
+        if (-not $actualDirectorySet.Add($path)) {
+            throw "Release bundle contains duplicate case-insensitive directories: $path"
+        }
+    }
+    if ($actualDirectories.Count -ne $expectedDirectories.Count -or
+        -not $expectedDirectories.SetEquals($actualDirectorySet)) {
         throw "Release bundle contains directories outside the explicit allowlist."
     }
 }
@@ -490,6 +496,11 @@ try {
         throw "Could not read the Scribe version from Cargo.toml."
     }
     $portableReadme = Join-Path $stagingBundle "README.txt"
+    $packContents = if ($packStage.PackCount -eq 0) {
+        "This Stage 4 package contains no GPU worker packs. CPU remains guaranteed, and explicit GPU returns a clear error. Non-empty pack publication remains fail-closed until a reviewed production public key and matching external CI signing secret are provisioned."
+    } else {
+        "This Stage 4 package contains $($packStage.PackCount) verified Windows x64 GPU worker pack(s) in immutable version-and-digest directories. Explicit GPU may use qualified CUDA/Vulkan routes; Auto remains default-denied to GPU until Stage 5 hardware qualification."
+    }
     $portableReadmeText = @(
         "Scribe $($versionMatch.Groups[1].Value) - Windows x64 self-contained package",
         "",
@@ -498,15 +509,15 @@ try {
         "Installer: the installer copies this exact portable payload into the per-user Scribe program directory and adds only its uninstaller pair.",
         "",
         "CONTENTS",
-        "The package contains the Scribe desktop, its dedicated CPU inference worker, the pinned English Base GGUF, its manifest, an empty verified worker-pack catalog, a hash inventory, this README, and reviewed license/provenance notices. Native transcribe.cpp, whisper.cpp, sherpa-onnx, and Silero VAD support are statically linked into the appropriate executable; there is no runtime folder, loose DLL, or loose ONNX model.",
-        "This Stage 3 release ships no CUDA, Vulkan, or Metal worker pack. Non-empty declared pack roots fail closed until a persistent production public key and matching external CI signing secret are provisioned.",
+        "The package contains the Scribe desktop, its dedicated CPU inference worker, the pinned English Base GGUF, its manifest, a verified worker-pack catalog, a hash inventory, this README, and reviewed license/provenance notices. Native transcribe.cpp, whisper.cpp, sherpa-onnx, and Silero VAD support are statically linked into the appropriate executable; there is no dynamic runtime download, loose ONNX model, or UI-loaded GPU provider.",
+        $packContents,
         "Moonshine ONNX weights are not packaged. When requested, Scribe downloads them separately as receipt-backed per-user app-data artifacts.",
         "",
         "MANUAL VERIFICATION",
         "1. Confirm the extracted tree contains no files beyond bundle-inventory.json and every exact path listed in its files array.",
         "2. For every listed file, compare its byte length and SHA-256 with bundle-inventory.json.",
         "3. Confirm bundled-model-manifest.json identifies whisper-base.en-Q8_0.gguf as 84,886,208 bytes with SHA-256 3b46ca40bccbf7609c68d88a36d96077a04ca7c87f2060ede06f129fac3e7652.",
-        "4. Confirm local-transcriber.exe is an AMD64 Windows GUI PE, scribe-inference-worker.exe is an AMD64 Windows console PE, and no additional EXE, DLL, .onnx, .ort, Python, venv, runner, or runtimes directory is present.",
+        "4. Confirm local-transcriber.exe is an AMD64 Windows GUI PE, the CPU and any pack worker executables are AMD64 Windows console PEs, every EXE/DLL is present at exactly one path in bundle-inventory.json, and each GPU pack EXE/DLL is additionally covered by worker-pack-catalog.json and its signed pack inventory; no loose .onnx, .ort, Python, venv, runner, or unlisted runtimes directory may be present.",
         "5. For an installer, compare every installed payload file and hash with the portable tree; only unins000.exe and unins000.dat may be additional files in the program directory.",
         "This release workflow does not claim Authenticode signing. Obtain artifacts from a trusted release channel and verify hashes before running them.",
         "",

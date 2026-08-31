@@ -33,6 +33,12 @@ mod config {
 )]
 #[path = "../embedded_runtime.rs"]
 mod embedded_runtime;
+#[allow(
+    dead_code,
+    reason = "the worker compiles shared verified-pack handshake contracts but never performs discovery"
+)]
+#[path = "../gpu_worker_pack/mod.rs"]
+mod gpu_worker_pack;
 #[path = "../inference_server.rs"]
 mod inference_server;
 #[allow(
@@ -75,6 +81,8 @@ mod support_assets;
 )]
 #[path = "../worker_contracts.rs"]
 mod worker_contracts;
+#[path = "../worker_identity.rs"]
+mod worker_identity;
 mod transcription {
     pub(crate) use crate::worker_contracts::*;
 }
