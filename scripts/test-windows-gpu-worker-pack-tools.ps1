@@ -65,11 +65,13 @@ if ($env:OS -ne 'Windows_NT') {
 
 $repositoryRoot = [System.IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $buildScript = Join-Path $PSScriptRoot 'build-windows-gpu-worker-pack.ps1'
+$cmakeBootstrapScript = Join-Path $PSScriptRoot 'windows-gpu-worker-cmake-bootstrap.ps1'
 $prepareScript = Join-Path $PSScriptRoot 'prepare-windows-gpu-worker-packs.ps1'
 $cudaInventoryScript = Join-Path $PSScriptRoot 'windows-cuda-sdk-inventory.ps1'
 $autoQualificationReportScript = Join-Path $PSScriptRoot 'report-windows-gpu-auto-qualification.ps1'
 foreach ($script in @(
     $buildScript,
+    $cmakeBootstrapScript,
     $prepareScript,
     $cudaInventoryScript,
     (Join-Path $PSScriptRoot 'report-windows-worker-pack-sizes.ps1'),
@@ -83,6 +85,30 @@ foreach ($script in @(
     ) | Out-Null
     Assert-True ($parseErrors.Count -eq 0) "GPU worker-pack script has PowerShell parse errors: $script"
 }
+. $cmakeBootstrapScript
+$legacyCmakeBootstrapFailure = @('transcribe-cpp-sys v0.1.3', 'The directory name is invalid. (os error 267)')
+if (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure $legacyCmakeBootstrapFailure)) { throw 'Existing os-error-267 CMake bootstrap signature regressed.' }
+if (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure @('transcribe-cpp-sys v0.1.3', 'Could not open file for write in copy operation'))) { throw 'Existing copy-operation CMake bootstrap signature regressed.' }
+$vulkanShortJunctionFailure = @(
+    'error: failed to run custom build command for `transcribe-cpp-sys v0.1.3 (C:\safe\crate)`',
+    'transcribe-cpp-sys: could not create short build junction C:\safe\tcs; building in OUT_DIR',
+    'vulkan-shaders-gen: warning: object directory is near the configured limit',
+    'CMAKE_OBJECT_PATH_MAX is in effect for this nested target',
+    "LINK : fatal error LNK1104: cannot open file 'CMakeFiles\cmTC_1a2B3c.dir\intermediate.manifest'"
+)
+if (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure $vulkanShortJunctionFailure)) { throw 'Observed Vulkan short-junction CMake signature was not classified.' }
+foreach ($malformedVulkanShortJunctionFailure in @(
+    @($vulkanShortJunctionFailure | Select-Object -Skip 1),
+    @($vulkanShortJunctionFailure[0], $vulkanShortJunctionFailure[1], $vulkanShortJunctionFailure[4], $vulkanShortJunctionFailure[2], $vulkanShortJunctionFailure[3]),
+    @($vulkanShortJunctionFailure[0], $vulkanShortJunctionFailure[1], $vulkanShortJunctionFailure[2], $vulkanShortJunctionFailure[3], 'LINK : fatal error LNK1104: cannot open file ''CMakeFiles\cmTC_xyz.dir\intermediate.manifest'''),
+    @('unrelated LNK1104')
+)) {
+    if (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure $malformedVulkanShortJunctionFailure) { throw 'Malformed Vulkan CMake signature was classified.' }
+}
+$overlongVulkanShortJunctionFailure = [System.Collections.Generic.List[object]]::new()
+foreach ($unused in 1..256) { $overlongVulkanShortJunctionFailure.Add('noise') }
+foreach ($line in $vulkanShortJunctionFailure) { $overlongVulkanShortJunctionFailure.Add($line) }
+if (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure $overlongVulkanShortJunctionFailure.ToArray()) { throw 'Overlong Vulkan CMake output was classified outside the bounded window.' }
 . $cudaInventoryScript
 $autoQualificationReport = Join-Path ([System.IO.Path]::GetTempPath()) "scribe-gpu-auto-qualification-$([guid]::NewGuid().ToString('N')).txt"
 try {

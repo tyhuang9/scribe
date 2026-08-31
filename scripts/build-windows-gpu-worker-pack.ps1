@@ -21,6 +21,7 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 . (Join-Path $PSScriptRoot 'windows-cuda-sdk-inventory.ps1')
+. (Join-Path $PSScriptRoot 'windows-gpu-worker-cmake-bootstrap.ps1')
 
 if ($ExportPinnedMsvcEnvironment -and -not $ToolchainCheckOnly) {
     throw 'Pinned MSVC environment export is only available with ToolchainCheckOnly.'
@@ -1298,11 +1299,7 @@ try {
     }
     catch {
         $failure = $_.Exception.Message
-        $isKnownShortPathBootstrap = $failure.Contains('transcribe-cpp-sys') -and (
-            $failure.Contains('The directory name is invalid. (os error 267)') -or
-            $failure.Contains('Could not open file for write in copy operation')
-        )
-        if (-not $isKnownShortPathBootstrap) {
+        if (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure @($failure))) {
             throw
         }
         Enable-ValidatedCmakeBuildJunction $shortBuild.BuildEnvironment $cargoTarget
