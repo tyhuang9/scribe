@@ -29,10 +29,10 @@ use worker_pack_authoring::{
 
 const HELP_TEXT: &str = "Scribe worker-pack authoring tool\n\
 commands:\n\
-  author --backend <cuda|vulkan|metal> [--target-os <windows|macos> --target-arch <x86_64|aarch64>] ...\n\
+  author --backend <cuda|vulkan|metal> [--target-os <windows|linux|macos> --target-arch <x86_64|aarch64>] ...\n\
   verify-fixture --pack-root <path>\n\
   check-production-key --key-id <id> --private-key <path>\n\
-Author targets: cuda or vulkan on windows/x86_64; metal on macos/aarch64 or macos/x86_64.\n\
+Author targets: cuda or vulkan on windows/x86_64 or linux/x86_64; metal on macos/aarch64 or macos/x86_64.\n\
 The target flags may be omitted only for legacy cuda/vulkan authoring, which defaults to windows/x86_64. Values are lowercase and case-sensitive.";
 
 fn main() {
@@ -285,6 +285,16 @@ mod tests {
     }
 
     #[test]
+    fn explicit_linux_gpu_targets_accept_x86_64() {
+        for backend in ["cuda", "vulkan"] {
+            let options = explicit_target_options(backend, "linux", "x86_64");
+            let request = author_request_from_options(&options).unwrap();
+            assert_eq!(request.target_os, "linux");
+            assert_eq!(request.target_arch, "x86_64");
+        }
+    }
+
+    #[test]
     fn cli_rejects_missing_or_incoherent_backend_targets() {
         let mut missing_target = fixture_options(&[]);
         missing_target.insert("--backend".to_owned(), OsString::from("metal"));
@@ -310,6 +320,8 @@ mod tests {
             ("vulkan", "macos", "x86_64"),
             ("metal", "macos", "arm64"),
             ("metal", "linux", "x86_64"),
+            ("cuda", "linux", "aarch64"),
+            ("vulkan", "linux", "arm64"),
             ("Metal", "macos", "aarch64"),
             ("metal", "MacOS", "aarch64"),
             ("metal", "macos", ""),
@@ -327,6 +339,7 @@ mod tests {
     #[test]
     fn help_enumerates_the_exact_authoring_contract() {
         assert!(HELP_TEXT.contains("cuda or vulkan on windows/x86_64"));
+        assert!(HELP_TEXT.contains("linux/x86_64"));
         assert!(HELP_TEXT.contains("metal on macos/aarch64 or macos/x86_64"));
         assert!(HELP_TEXT.contains("defaults to windows/x86_64"));
     }
