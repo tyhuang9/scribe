@@ -21,6 +21,7 @@ SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 IDENTIFIER_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._:-]{0,159}$")
 PACK_COMPONENT_PATTERN = re.compile(r"^[a-z0-9](?:[a-z0-9._-]{0,94}[a-z0-9])?$")
 PCI_ID_PATTERN = re.compile(r"^native:pci:[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$")
+ARTIFACT_COMPONENT_PATTERN = re.compile(r"^[a-z0-9](?:[a-z0-9._-]{0,94}[a-z0-9])?$")
 SUPPORTED_UBUNTU = {"22.04", "24.04"}
 SUPPORTED_FAILURES = {
     "none",
@@ -149,6 +150,53 @@ def file_sha256(path: pathlib.Path) -> str:
         while chunk := source.read(1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def artifact_path(value: Any, label: str) -> pathlib.PurePosixPath:
+    raw = json_string(value, label, 240)
+    if "\\" in raw or raw.startswith("/"):
+        fail(f"{label} must be a canonical relative POSIX path")
+    path = pathlib.PurePosixPath(raw)
+    if not path.parts or any(
+        part in {"", ".", ".."} or ARTIFACT_COMPONENT_PATTERN.fullmatch(part) is None
+        for part in path.parts
+    ):
+        fail(f"{label} must be a canonical relative POSIX path")
+    return path
+
+
+def validate_artifact_file(
+    artifact_root: pathlib.Path,
+    relative_value: Any,
+    expected_digest: str,
+    label: str,
+    artifact_paths: set[str],
+) -> None:
+    relative = artifact_path(relative_value, f"{label}.artifact_path")
+    folded = relative.as_posix().casefold()
+    if folded in artifact_paths:
+        fail("qualification evidence reuses or case-collides an artifact path")
+    artifact_paths.add(folded)
+    current = artifact_root
+    for index, component in enumerate(relative.parts):
+        current = current / component
+        try:
+            current_stat = current.lstat()
+        except OSError as error:
+            fail(f"could not inspect {label} artifact: {error}")
+        if stat.S_ISLNK(current_stat.st_mode):
+            fail(f"{label} artifact path contains a symbolic link")
+        if index + 1 < len(relative.parts):
+            if not stat.S_ISDIR(current_stat.st_mode):
+                fail(f"{label} artifact ancestor is not a directory")
+        elif not stat.S_ISREG(current_stat.st_mode):
+            fail(f"{label} artifact must be a regular file")
+    if current_stat.st_nlink != 1:
+        fail(f"{label} artifact must have exactly one link")
+    if current_stat.st_size == 0 or current_stat.st_size > MAX_INPUT_BYTES:
+        fail(f"{label} artifact is empty or oversized")
+    if file_sha256(current) != expected_digest:
+        fail(f"{label} artifact digest does not match the supplied file")
 
 
 def validate_pack(value: Any, label: str) -> None:
@@ -309,11 +357,14 @@ def validate_run(
     expected_sequence: int,
     target: str,
     artifact_digests: set[str],
+    artifact_paths: set[str],
+    artifact_root: pathlib.Path,
 ) -> dict[str, Any]:
     run = exact_keys(
         value,
         {
             "sequence",
+            "artifact_path",
             "artifact_sha256",
             "outcome",
             "failure_category",
@@ -331,6 +382,7 @@ def validate_run(
     if artifact in artifact_digests:
         fail("qualification evidence reuses an artifact digest")
     artifact_digests.add(artifact)
+    validate_artifact_file(artifact_root, run["artifact_path"], artifact, label, artifact_paths)
     outcome = json_string(run["outcome"], f"{label}.outcome", 16)
     if outcome not in {"success", "failure"}:
         fail(f"{label}.outcome is unsupported")
@@ -363,11 +415,14 @@ def validate_event(
     expected_event: str,
     identity: dict[str, Any],
     artifact_digests: set[str],
+    artifact_paths: set[str],
+    artifact_root: pathlib.Path,
 ) -> dict[str, Any]:
     event = exact_keys(
         value,
         {
             "event",
+            "artifact_path",
             "artifact_sha256",
             "result",
             "observed_failure_category",
@@ -387,6 +442,7 @@ def validate_event(
     if artifact in artifact_digests:
         fail("qualification evidence reuses an artifact digest")
     artifact_digests.add(artifact)
+    validate_artifact_file(artifact_root, event["artifact_path"], artifact, label, artifact_paths)
     if json_string(event["result"], f"{label}.result", 16) not in {"pass", "fail"}:
         fail(f"{label}.result is unsupported")
     category = json_string(
@@ -450,6 +506,7 @@ def validate_lane_evidence(
     expected: dict[str, Any],
     plan: dict[str, Any],
     index: int,
+    artifact_root: pathlib.Path,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     lane = exact_keys(value, {"identity", "run_sets", "lifecycle"}, f"evidence lane {index}")
     identity = validate_identity(lane["identity"], f"evidence lane {index}.identity")
@@ -459,6 +516,7 @@ def validate_lane_evidence(
         fail(f"evidence lane {index} does not match its reviewed evidence digest")
     run_sets = exact_keys(lane["run_sets"], {"cold", "warm"}, f"evidence lane {index}.run_sets")
     artifact_digests: set[str] = set()
+    artifact_paths: set[str] = set()
     parsed: dict[str, dict[str, list[dict[str, Any]]]] = {}
     for mode, expected_count in (("cold", plan["cold_runs"]), ("warm", plan["warm_runs"])):
         target_sets = exact_keys(run_sets[mode], {"cpu", "gpu"}, f"evidence lane {index}.{mode}")
@@ -468,13 +526,29 @@ def validate_lane_evidence(
             if type(raw_runs) is not list or len(raw_runs) != expected_count:
                 fail(f"evidence lane {index}.{mode}.{target} has the wrong run count")
             parsed[mode][target] = [
-                validate_run(run, f"evidence lane {index}.{mode}.{target}[{offset}]", offset + 1, target, artifact_digests)
+                validate_run(
+                    run,
+                    f"evidence lane {index}.{mode}.{target}[{offset}]",
+                    offset + 1,
+                    target,
+                    artifact_digests,
+                    artifact_paths,
+                    artifact_root,
+                )
                 for offset, run in enumerate(raw_runs)
             ]
     if type(lane["lifecycle"]) is not list or len(lane["lifecycle"]) != len(REQUIRED_EVENTS):
         fail(f"evidence lane {index}.lifecycle is incomplete")
     events = [
-        validate_event(event, f"evidence lane {index}.lifecycle[{offset}]", expected_event, identity, artifact_digests)
+        validate_event(
+            event,
+            f"evidence lane {index}.lifecycle[{offset}]",
+            expected_event,
+            identity,
+            artifact_digests,
+            artifact_paths,
+            artifact_root,
+        )
         for offset, (event, expected_event) in enumerate(zip(lane["lifecycle"], REQUIRED_EVENTS))
     ]
 
@@ -533,6 +607,7 @@ def decide(
     evidence: dict[str, Any],
     repository_root: pathlib.Path,
     allow_fixture: bool,
+    artifact_root: pathlib.Path | None,
 ) -> dict[str, Any]:
     required_lanes = validate_plan(plan, repository_root)
     exact_keys(
@@ -556,8 +631,18 @@ def decide(
         fail("qualification evidence.lanes must be an array")
     if len(evidence["lanes"]) != len(required_lanes):
         fail("qualification evidence does not cover every representative lane")
+    if required_lanes:
+        if artifact_root is None:
+            fail("nonempty qualification evidence requires --artifact-root")
+        try:
+            root_stat = artifact_root.lstat()
+        except OSError as error:
+            fail(f"could not inspect artifact root: {error}")
+        if stat.S_ISLNK(root_stat.st_mode) or not stat.S_ISDIR(root_stat.st_mode):
+            fail("artifact root must be a regular non-symlink directory")
+        artifact_root = artifact_root.resolve()
     summaries = [
-        validate_lane_evidence(lane, expected, plan, index)[1]
+        validate_lane_evidence(lane, expected, plan, index, artifact_root)[1]
         for index, (lane, expected) in enumerate(zip(evidence["lanes"], required_lanes))
     ]
     evidence_complete = bool(required_lanes) and len(summaries) == len(required_lanes)
@@ -589,6 +674,7 @@ def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--plan", required=True, type=pathlib.Path)
     parser.add_argument("--evidence", required=True, type=pathlib.Path)
+    parser.add_argument("--artifact-root", type=pathlib.Path)
     parser.add_argument("--output", type=pathlib.Path)
     parser.add_argument("--allow-fixture", action="store_true")
     parser.add_argument("--require-eligible", action="store_true")
@@ -620,7 +706,14 @@ def main() -> int:
     try:
         plan, plan_raw = load_canonical_json(arguments.plan, "qualification plan")
         evidence, _ = load_canonical_json(arguments.evidence, "qualification evidence")
-        decision = decide(plan, plan_raw, evidence, repository_root, arguments.allow_fixture)
+        decision = decide(
+            plan,
+            plan_raw,
+            evidence,
+            repository_root,
+            arguments.allow_fixture,
+            arguments.artifact_root,
+        )
         payload = canonical_bytes(decision)
         if arguments.output is not None:
             write_new_file(arguments.output, payload)

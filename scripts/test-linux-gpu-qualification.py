@@ -37,6 +37,7 @@ def metric_run(mode: str, target: str, sequence: int, gpu_warm_ms: int) -> dict[
     else:
         end_to_end_ms = 100 if target == "cpu" else gpu_warm_ms
     return {
+        "artifact_path": f"runs/{mode}/{target}/{sequence:02}.evidence",
         "artifact_sha256": digest(f"{mode}-{target}-{sequence}"),
         "backend_ms": end_to_end_ms - 10,
         "end_to_end_ms": end_to_end_ms,
@@ -94,6 +95,7 @@ def fixture_lane(gpu_warm_ms: int = 110) -> dict[str, Any]:
     lifecycle = [
         {
             "active_request_migrated": False,
+            "artifact_path": "events/device-loss.evidence",
             "artifact_sha256": digest("event-device-loss"),
             "driver_after": driver,
             "driver_before": driver,
@@ -107,6 +109,7 @@ def fixture_lane(gpu_warm_ms: int = 110) -> dict[str, Any]:
         },
         {
             "active_request_migrated": False,
+            "artifact_path": "events/driver-change.evidence",
             "artifact_sha256": digest("event-driver-change"),
             "driver_after": driver,
             "driver_before": "nvidia:570.26.00",
@@ -120,6 +123,7 @@ def fixture_lane(gpu_warm_ms: int = 110) -> dict[str, Any]:
         },
         {
             "active_request_migrated": False,
+            "artifact_path": "events/suspend-resume.evidence",
             "artifact_sha256": digest("event-suspend-resume"),
             "driver_after": driver,
             "driver_before": driver,
@@ -201,10 +205,33 @@ class QualificationFixtureTests(unittest.TestCase):
         allow_fixture: bool = True,
         require_eligible: bool = False,
         canonical: bool = True,
+        prepare_artifacts: bool = True,
     ) -> subprocess.CompletedProcess[str]:
         plan_path = self.write("plan.json", plan, canonical=canonical)
         evidence_path = self.write("evidence.json", evidence, canonical=canonical)
-        command = [sys.executable, str(TOOL_PATH), "--plan", str(plan_path), "--evidence", str(evidence_path)]
+        artifact_root = self.root / "artifacts"
+        if prepare_artifacts:
+            for lane in evidence["lanes"]:
+                for mode, target_sets in lane["run_sets"].items():
+                    for target, runs in target_sets.items():
+                        for run in runs:
+                            path = artifact_root / pathlib.PurePosixPath(run["artifact_path"])
+                            path.parent.mkdir(parents=True, exist_ok=True)
+                            path.write_bytes(f"{mode}-{target}-{run['sequence']}".encode("ascii"))
+                for event in lane["lifecycle"]:
+                    path = artifact_root / pathlib.PurePosixPath(event["artifact_path"])
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(f"event-{event['event'].replace('_', '-')}".encode("ascii"))
+        command = [
+            sys.executable,
+            str(TOOL_PATH),
+            "--plan",
+            str(plan_path),
+            "--evidence",
+            str(evidence_path),
+            "--artifact-root",
+            str(artifact_root),
+        ]
         if allow_fixture:
             command.append("--allow-fixture")
         if require_eligible:
@@ -344,6 +371,36 @@ class QualificationFixtureTests(unittest.TestCase):
         result = self.run_tool(plan, evidence)
         self.assertEqual(result.returncode, 1)
         self.assertIn("reviewed evidence digest", result.stderr)
+
+    def test_missing_and_tampered_source_artifacts_are_rejected(self) -> None:
+        plan, evidence = fixture_documents(fixture_lane())
+        missing = self.run_tool(plan, evidence, prepare_artifacts=False)
+        self.assertEqual(missing.returncode, 1)
+        self.assertIn("could not inspect", missing.stderr)
+        artifact_root = self.root / "artifacts"
+        complete = self.run_tool(plan, evidence)
+        self.assertEqual(complete.returncode, 0, complete.stderr)
+        (artifact_root / "runs/warm/gpu/01.evidence").write_bytes(b"tampered")
+        plan_path = self.write("plan.json", plan)
+        evidence_path = self.write("evidence.json", evidence)
+        tampered = subprocess.run(
+            [
+                sys.executable,
+                str(TOOL_PATH),
+                "--plan",
+                str(plan_path),
+                "--evidence",
+                str(evidence_path),
+                "--artifact-root",
+                str(artifact_root),
+                "--allow-fixture",
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(tampered.returncode, 1)
+        self.assertIn("digest does not match", tampered.stderr)
 
     def test_plan_and_identity_binding_mutations_are_rejected(self) -> None:
         plan, evidence = fixture_documents(fixture_lane())
