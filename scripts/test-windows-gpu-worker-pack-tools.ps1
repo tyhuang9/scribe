@@ -97,6 +97,16 @@ $vulkanShortJunctionFailure = @(
     "LINK : fatal error LNK1104: cannot open file 'CMakeFiles\cmTC_1a2B3c.dir\intermediate.manifest'"
 )
 if (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure $vulkanShortJunctionFailure)) { throw 'Observed Vulkan short-junction CMake signature was not classified.' }
+$interveningVulkanShortJunctionFailure = [System.Collections.Generic.List[object]]::new()
+$interveningVulkanShortJunctionFailure.Add($vulkanShortJunctionFailure[0])
+$interveningVulkanShortJunctionFailure.Add($vulkanShortJunctionFailure[1])
+foreach ($unused in 1..600) { $interveningVulkanShortJunctionFailure.Add('realistic CMake compile output') }
+$interveningVulkanShortJunctionFailure.Add($vulkanShortJunctionFailure[2])
+foreach ($unused in 1..600) { $interveningVulkanShortJunctionFailure.Add('realistic nested CMake output') }
+$interveningVulkanShortJunctionFailure.Add($vulkanShortJunctionFailure[3])
+foreach ($unused in 1..600) { $interveningVulkanShortJunctionFailure.Add('realistic CMake try-compile output') }
+$interveningVulkanShortJunctionFailure.Add($vulkanShortJunctionFailure[4])
+if (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure $interveningVulkanShortJunctionFailure.ToArray())) { throw 'Bounded Vulkan CMake classifier lost ordered markers amid realistic output.' }
 foreach ($malformedVulkanShortJunctionFailure in @(
     @($vulkanShortJunctionFailure | Select-Object -Skip 1),
     @($vulkanShortJunctionFailure[0], $vulkanShortJunctionFailure[1], $vulkanShortJunctionFailure[4], $vulkanShortJunctionFailure[2], $vulkanShortJunctionFailure[3]),
@@ -106,7 +116,7 @@ foreach ($malformedVulkanShortJunctionFailure in @(
     if (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure $malformedVulkanShortJunctionFailure) { throw 'Malformed Vulkan CMake signature was classified.' }
 }
 $overlongVulkanShortJunctionFailure = [System.Collections.Generic.List[object]]::new()
-foreach ($unused in 1..256) { $overlongVulkanShortJunctionFailure.Add('noise') }
+foreach ($unused in 1..2048) { $overlongVulkanShortJunctionFailure.Add('noise') }
 foreach ($line in $vulkanShortJunctionFailure) { $overlongVulkanShortJunctionFailure.Add($line) }
 if (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure $overlongVulkanShortJunctionFailure.ToArray()) { throw 'Overlong Vulkan CMake output was classified outside the bounded window.' }
 . $cudaInventoryScript
