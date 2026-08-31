@@ -373,6 +373,61 @@ try {
         -not [Linq.Enumerable]::SequenceEqual[byte]($publishedBytes, $bindingBytes)) {
         throw 'Validated pending evidence was not atomically published to the final path.'
     }
+
+    $expectedJson = [Text.UTF8Encoding]::new($false, $true).GetString($bindingBytes)
+    $verified = Read-ScribeVerifiedEvidenceReport $finalPath $expectedBoundDigest
+    if ($verified -isnot [ScribeEvidenceNative.BoundVerifiedEvidence] -or
+        $verified.Sha256 -cne $expectedBoundDigest -or
+        $verified.Utf8Json -cne $expectedJson -or
+        $verified.Identity -cnotmatch '^[0-9a-f]{8}:[0-9a-f]{16}$' -or
+        $verified.PSObject.Properties.Name -contains 'Bytes') {
+        throw 'Consumer verifier did not return the exact validated immutable evidence representation.'
+    }
+
+    $wrongDigest = if ($expectedBoundDigest[0] -ceq '0') {
+        '1' + $expectedBoundDigest.Substring(1)
+    }
+    else {
+        '0' + $expectedBoundDigest.Substring(1)
+    }
+    $wrongDigestFailure = $null
+    try { $null = Read-ScribeVerifiedEvidenceReport $finalPath $wrongDigest } catch { $wrongDigestFailure = $_.Exception }
+    if ($null -eq $wrongDigestFailure -or
+        $wrongDigestFailure.GetBaseException().Message -cne 'Published evidence SHA-256 does not match the independently supplied digest.') {
+        throw 'Consumer verifier did not reject the wrong caller-supplied digest at the digest boundary.'
+    }
+
+    foreach ($invalidDigest in @('a' * 63 -join '', 'A' * 64 -join '', "$('a' * 64 -join '') ")) {
+        $invalidDigestRejected = $false
+        try { $null = Read-ScribeVerifiedEvidenceReport $finalPath $invalidDigest } catch { $invalidDigestRejected = $true }
+        if (-not $invalidDigestRejected) { throw 'Consumer verifier accepted a noncanonical caller-supplied digest.' }
+    }
+
+    $publishedAlias = Join-Path $publicationRoot 'windows-vulkan-fixture-evidence-hardlink-alias.json'
+    New-Item -ItemType HardLink -Path $publishedAlias -Target $finalPath | Out-Null
+    $linkedVerified = Read-ScribeVerifiedEvidenceReport $finalPath $expectedBoundDigest
+    if ($linkedVerified.Utf8Json -cne $expectedJson -or $linkedVerified.Sha256 -cne $expectedBoundDigest) {
+        throw 'Consumer verifier treated link count as trust instead of verifying exact bound bytes.'
+    }
+    $tamperedBytes = [byte[]]$bindingBytes.Clone()
+    $tamperedBytes[0] = if ($tamperedBytes[0] -eq 0x7b) { 0x5b } else { 0x7b }
+    [IO.File]::WriteAllBytes($publishedAlias, $tamperedBytes)
+    if ((Get-Item -LiteralPath $finalPath).Length -ne $bindingBytes.Length) {
+        throw 'Hardlink tamper regression did not preserve the evidence byte length.'
+    }
+    Remove-Item -LiteralPath $publishedAlias -Force
+    if (Test-Path -LiteralPath $publishedAlias) {
+        throw 'Hardlink tamper regression did not remove the alias before consumer verification.'
+    }
+    $tamperFailure = $null
+    try { $null = Read-ScribeVerifiedEvidenceReport $finalPath $expectedBoundDigest } catch { $tamperFailure = $_.Exception }
+    if ($null -eq $tamperFailure -or
+        $tamperFailure.GetBaseException().Message -cne 'Published evidence SHA-256 does not match the independently supplied digest.') {
+        throw 'Consumer verifier did not reject same-length hardlink tampering at the digest boundary.'
+    }
+    if ($verified.Utf8Json -cne $expectedJson) {
+        throw 'Previously verified immutable evidence changed after the on-disk identity was mutated.'
+    }
 }
 finally {
     if (Test-Path -LiteralPath $publicationRoot) { Remove-Item -LiteralPath $publicationRoot -Recurse -Force }
@@ -562,6 +617,9 @@ foreach ($required in @('$operationFailure = $null', '$restoreFailure = $null', 
 foreach ($required in @('Get-FileHash -LiteralPath $model', 'Get-FileHash -LiteralPath $wav', 'Test-ScribeEvidenceActivationPath', 'Test-ScribeEvidenceWithin', 'New-ScribeEvidenceShortCargoTarget', 'Assert-ScribeEvidenceSingleLinkFile', 'Get-ScribeVulkanEvidenceActualSystem32', 'fsutil.exe', 'manifest.json', 'Fixture pack build identity is not bound', 'New-ScribeEvidenceFixturePackVersion $revision', 'Fixture-only untrusted Vulkan evidence', 'previousEvidenceEnvironment')) {
     if ($runner -notmatch [regex]::Escape($required)) { throw "Runner is missing required safety contract: $required" }
 }
+foreach ($required in @('Independent consumer-bound SHA-256 (capture this stdout value)', 'The on-disk evidence path is untrusted without that independently captured digest', 'Read-ScribeVerifiedEvidenceReport')) {
+    if ($runner -notmatch [regex]::Escape($required)) { throw "Runner is missing consumer-bound output guidance: $required" }
+}
 $compileAt = $runner.IndexOf("'--no-run'")
 $baselineAt = $runner.IndexOf('Get-ScribeVulkanEvidenceNvidiaBaseline')
 if ($compileAt -lt 0 -or $baselineAt -lt 0 -or $compileAt -ge $baselineAt) { throw 'Runner must precompile before NVIDIA baseline capture.' }
@@ -590,13 +648,35 @@ $preflight = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'windows-vulkan-e
 foreach ($required in @('GetSystemDirectory', 'nvidia-smi.exe', 'matching.Count -ne 1', '$utilization -gt 10', '$usedMib -gt ($totalMib / 4)', 'pci.bus_id')) {
     if ($preflight -notmatch [regex]::Escape($required)) { throw "Preflight is missing required source contract: $required" }
 }
-foreach ($required in @('CreateFileW', 'GetFileInformationByHandle', 'GetFileInformationByHandleEx', 'FileIdExtdDirectoryInfo', 'SetFileInformationByHandle', 'FileRenameInfo', 'FileDispositionInfo', 'ValidateOnlyUnnamedDataStream', 'ReadAllAndHash', 'RenameNoReplace', 'FileShareRead')) {
+foreach ($required in @('CreateFileW', 'GetFileInformationByHandle', 'GetFileInformationByHandleEx', 'FileIdExtdDirectoryInfo', 'SetFileInformationByHandle', 'FileRenameInfo', 'FileDispositionInfo', 'ValidateOnlyUnnamedDataStream', 'ReadAllAndHash', 'RenameNoReplace', 'FileShareRead', 'OpenPublished', 'ReadAllAndVerify', 'CryptographicOperations.FixedTimeEquals', 'new UTF8Encoding(false, true)', 'BoundVerifiedEvidence', 'Read-ScribeVerifiedEvidenceReport')) {
     if ($preflight -notmatch [regex]::Escape($required)) { throw "Handle-bound evidence publication is missing: $required" }
 }
 if ($preflight -match '\[IO\.File\]::Move\(' -or
     $preflight -match 'Get-FileHash\s+-LiteralPath\s+\$pending' -or
     $preflight -match 'Remove-Item\s+-LiteralPath\s+\$pending') {
     throw 'Evidence publication or cleanup reopened a validated pending path for mutation.'
+}
+$preflightTokens = $null
+$preflightParseErrors = $null
+$preflightAst = [Management.Automation.Language.Parser]::ParseInput($preflight, [ref]$preflightTokens, [ref]$preflightParseErrors)
+if ($preflightParseErrors.Count -ne 0) { throw 'Preflight source could not be parsed for consumer-bound verifier tests.' }
+$verifierFunction = $preflightAst.Find({
+    param($Ast)
+    $Ast -is [Management.Automation.Language.FunctionDefinitionAst] -and
+    $Ast.Name -ceq 'Read-ScribeVerifiedEvidenceReport'
+}, $true)
+if ($null -eq $verifierFunction) { throw 'Consumer-bound verifier function is missing.' }
+$verifierSource = $verifierFunction.Extent.Text
+$openPublishedAt = $verifierSource.IndexOf('::OpenPublished(')
+$readVerifiedAt = $verifierSource.IndexOf('.ReadAllAndVerify(')
+$schemaAt = $verifierSource.IndexOf('Assert-ScribeEvidenceReportJson $verified.Utf8Json')
+$returnAt = $verifierSource.IndexOf('return $verified')
+if ($openPublishedAt -lt 0 -or
+    $readVerifiedAt -le $openPublishedAt -or
+    $schemaAt -le $readVerifiedAt -or
+    $returnAt -le $schemaAt -or
+    $verifierSource.Substring($openPublishedAt) -match '\[IO\.File\]|Get-Content|Get-FileHash|ReadAllBytes|ReadAllText') {
+    throw 'Consumer verifier reopened the path or lost its one-bound-representation validation order.'
 }
 $workerSource = Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\src\onnx_worker.rs') -Raw
 $evidenceTestAt = $workerSource.IndexOf('fn windows_vulkan_fixture_evidence_captures_five_cold_and_twenty_warm_runs()')

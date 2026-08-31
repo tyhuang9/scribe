@@ -25,6 +25,20 @@ namespace ScribeEvidenceNative
         }
     }
 
+    public sealed class BoundVerifiedEvidence
+    {
+        public string Utf8Json { get; }
+        public string Sha256 { get; }
+        public string Identity { get; }
+
+        internal BoundVerifiedEvidence(string utf8Json, string sha256, string identity)
+        {
+            Utf8Json = utf8Json;
+            Sha256 = sha256;
+            Identity = identity;
+        }
+    }
+
     public sealed class BoundPendingFile : IDisposable
     {
         private const uint GenericRead = 0x80000000;
@@ -123,6 +137,7 @@ namespace ScribeEvidenceNative
         private readonly SafeFileHandle fileHandle;
         private readonly string directoryPath;
         private readonly int length;
+        private readonly bool mutationAllowed;
         private bool readComplete;
         private bool mutationComplete;
         private bool disposed;
@@ -136,13 +151,15 @@ namespace ScribeEvidenceNative
             SafeFileHandle fileHandle,
             string directoryPath,
             int length,
-            string identity)
+            string identity,
+            bool mutationAllowed)
         {
             this.parentHandle = parentHandle;
             this.directoryHandle = directoryHandle;
             this.fileHandle = fileHandle;
             this.directoryPath = directoryPath;
             this.length = length;
+            this.mutationAllowed = mutationAllowed;
             Identity = identity;
         }
 
@@ -154,12 +171,53 @@ namespace ScribeEvidenceNative
             bool allowMissing,
             bool allowEmpty)
         {
+            return OpenCore(
+                evidenceRoot,
+                pendingPath,
+                expectedLeaf,
+                maximumBytes,
+                allowMissing,
+                allowEmpty,
+                GenericRead | DeleteAccess,
+                true,
+                true);
+        }
+
+        public static BoundPendingFile OpenPublished(
+            string evidenceRoot,
+            string publishedPath,
+            string expectedLeaf,
+            int maximumBytes)
+        {
+            return OpenCore(
+                evidenceRoot,
+                publishedPath,
+                expectedLeaf,
+                maximumBytes,
+                false,
+                false,
+                GenericRead,
+                false,
+                false);
+        }
+
+        private static BoundPendingFile OpenCore(
+            string evidenceRoot,
+            string evidencePath,
+            string expectedLeaf,
+            int maximumBytes,
+            bool allowMissing,
+            bool allowEmpty,
+            uint desiredAccess,
+            bool requireSingleLink,
+            bool mutationAllowed)
+        {
             if (maximumBytes <= 0 || maximumBytes > 1024 * 1024)
                 throw new ArgumentOutOfRangeException(nameof(maximumBytes));
             ValidateLeaf(expectedLeaf, nameof(expectedLeaf));
 
             string root = NormalizeDirectory(evidenceRoot);
-            string pending = Path.GetFullPath(pendingPath);
+            string pending = Path.GetFullPath(evidencePath);
             string rootParent = NormalizeDirectory(Path.GetDirectoryName(root));
             string rootLeaf = Path.GetFileName(root);
             ValidateDirectoryLeaf(rootLeaf);
@@ -223,7 +281,7 @@ namespace ScribeEvidenceNative
 
                 file = CreateFileW(
                     pending,
-                    GenericRead | DeleteAccess,
+                    desiredAccess,
                     FileShareRead,
                     IntPtr.Zero,
                     OpenExisting,
@@ -242,7 +300,7 @@ namespace ScribeEvidenceNative
                 ByHandleFileInformation fileInfo = GetInformation(file, "inspect the pending evidence identity");
                 if ((fileInfo.FileAttributes & (FileAttributeDirectory | FileAttributeReparsePoint)) != 0)
                     throw new InvalidOperationException("Pending evidence must be a regular non-reparse file.");
-                if (fileInfo.NumberOfLinks != 1)
+                if (requireSingleLink && fileInfo.NumberOfLinks != 1)
                     throw new InvalidOperationException("Pending evidence must have exactly one hard link.");
 
                 ulong fileLength = ((ulong)fileInfo.FileSizeHigh << 32) | fileInfo.FileSizeLow;
@@ -263,7 +321,8 @@ namespace ScribeEvidenceNative
                     file,
                     root,
                     checked((int)fileLength),
-                    identity);
+                    identity,
+                    mutationAllowed);
                 parent = null;
                 directory = null;
                 file = null;
@@ -280,41 +339,41 @@ namespace ScribeEvidenceNative
         public BoundEvidenceRead ReadAllAndHash()
         {
             ThrowIfDisposedOrMutated();
-            if (readComplete) throw new InvalidOperationException("Pending evidence was already read.");
+            if (!mutationAllowed)
+                throw new InvalidOperationException("Published evidence must use the digest-bound verifier.");
+            byte[] bytes = ReadAllBoundBytes();
+            byte[] digest = ComputeSha256(bytes);
+            return new BoundEvidenceRead(bytes, FormatSha256(digest));
+        }
 
-            byte[] bytes = new byte[length];
-            byte[] buffer = new byte[Math.Min(ReadBufferBytes, Math.Max(length, 1))];
-            int total = 0;
-            while (total < length)
+        public BoundVerifiedEvidence ReadAllAndVerify(string expectedSha256)
+        {
+            ThrowIfDisposedOrMutated();
+            if (mutationAllowed)
+                throw new InvalidOperationException("Pending evidence cannot be consumed as published evidence.");
+
+            byte[] expectedDigest = ParseCanonicalSha256(expectedSha256);
+            byte[] bytes = ReadAllBoundBytes();
+            byte[] actualDigest = ComputeSha256(bytes);
+            if (!CryptographicOperations.FixedTimeEquals(actualDigest, expectedDigest))
+                throw new InvalidOperationException("Published evidence SHA-256 does not match the independently supplied digest.");
+
+            string utf8Json;
+            try
             {
-                uint requested = checked((uint)Math.Min(buffer.Length, length - total));
-                uint read;
-                if (!ReadFile(fileHandle, buffer, requested, out read, IntPtr.Zero))
-                    throw NativeError("read the bound pending evidence", Marshal.GetLastWin32Error());
-                if (read == 0)
-                    throw new InvalidOperationException("Pending evidence ended before its bound size.");
-                Buffer.BlockCopy(buffer, 0, bytes, total, checked((int)read));
-                total = checked(total + (int)read);
+                utf8Json = new UTF8Encoding(false, true).GetString(bytes);
             }
-
-            uint trailing;
-            if (!ReadFile(fileHandle, buffer, 1, out trailing, IntPtr.Zero))
-                throw NativeError("confirm the bound pending evidence length", Marshal.GetLastWin32Error());
-            if (trailing != 0)
-                throw new InvalidOperationException("Pending evidence grew after its identity was bound.");
-
-            string digest;
-            using (SHA256 sha256 = SHA256.Create())
+            catch (DecoderFallbackException exception)
             {
-                digest = BitConverter.ToString(sha256.ComputeHash(bytes)).Replace("-", string.Empty).ToLowerInvariant();
+                throw new InvalidOperationException("Published evidence is not strict UTF-8.", exception);
             }
-            readComplete = true;
-            return new BoundEvidenceRead(bytes, digest);
+            return new BoundVerifiedEvidence(utf8Json, FormatSha256(actualDigest), Identity);
         }
 
         public string GetFinalPath(string finalLeaf)
         {
             ThrowIfDisposedOrMutated();
+            ThrowIfMutationNotAllowed();
             ValidateLeaf(finalLeaf, nameof(finalLeaf));
             return Path.Combine(directoryPath, finalLeaf);
         }
@@ -322,6 +381,7 @@ namespace ScribeEvidenceNative
         public void RenameNoReplace(string finalLeaf)
         {
             ThrowIfDisposedOrMutated();
+            ThrowIfMutationNotAllowed();
             if (!readComplete)
                 throw new InvalidOperationException("Pending evidence must be read and hashed before publication.");
             ValidateLeaf(finalLeaf, nameof(finalLeaf));
@@ -361,6 +421,7 @@ namespace ScribeEvidenceNative
         public void Delete()
         {
             ThrowIfDisposedOrMutated();
+            ThrowIfMutationNotAllowed();
             IntPtr information = Marshal.AllocHGlobal(1);
             try
             {
@@ -397,6 +458,71 @@ namespace ScribeEvidenceNative
             string trimmed = full.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
             string trimmedRoot = root.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
             return string.Equals(trimmed, trimmedRoot, StringComparison.OrdinalIgnoreCase) ? root : trimmed;
+        }
+
+        private byte[] ReadAllBoundBytes()
+        {
+            if (readComplete) throw new InvalidOperationException("Bound evidence was already read.");
+
+            byte[] bytes = new byte[length];
+            byte[] buffer = new byte[Math.Min(ReadBufferBytes, Math.Max(length, 1))];
+            int total = 0;
+            while (total < length)
+            {
+                uint requested = checked((uint)Math.Min(buffer.Length, length - total));
+                uint read;
+                if (!ReadFile(fileHandle, buffer, requested, out read, IntPtr.Zero))
+                    throw NativeError("read the bound evidence", Marshal.GetLastWin32Error());
+                if (read == 0)
+                    throw new InvalidOperationException("Bound evidence ended before its bound size.");
+                Buffer.BlockCopy(buffer, 0, bytes, total, checked((int)read));
+                total = checked(total + (int)read);
+            }
+
+            uint trailing;
+            if (!ReadFile(fileHandle, buffer, 1, out trailing, IntPtr.Zero))
+                throw NativeError("confirm the bound evidence length", Marshal.GetLastWin32Error());
+            if (trailing != 0)
+                throw new InvalidOperationException("Bound evidence grew after its identity was opened.");
+
+            readComplete = true;
+            return bytes;
+        }
+
+        private static byte[] ComputeSha256(byte[] bytes)
+        {
+            using (SHA256 sha256 = SHA256.Create())
+            {
+                return sha256.ComputeHash(bytes);
+            }
+        }
+
+        private static string FormatSha256(byte[] digest)
+        {
+            return BitConverter.ToString(digest).Replace("-", string.Empty).ToLowerInvariant();
+        }
+
+        private static byte[] ParseCanonicalSha256(string digest)
+        {
+            if (digest == null || digest.Length != 64)
+                throw new ArgumentException("Expected evidence SHA-256 must be exactly 64 lowercase hexadecimal characters.", nameof(digest));
+            byte[] parsed = new byte[32];
+            for (int index = 0; index < parsed.Length; index++)
+            {
+                int high = ParseLowerHex(digest[index * 2]);
+                int low = ParseLowerHex(digest[index * 2 + 1]);
+                if (high < 0 || low < 0)
+                    throw new ArgumentException("Expected evidence SHA-256 must be exactly 64 lowercase hexadecimal characters.", nameof(digest));
+                parsed[index] = checked((byte)((high << 4) | low));
+            }
+            return parsed;
+        }
+
+        private static int ParseLowerHex(char value)
+        {
+            if (value >= '0' && value <= '9') return value - '0';
+            if (value >= 'a' && value <= 'f') return value - 'a' + 10;
+            return -1;
         }
 
         private static void ValidateLeaf(string leaf, string parameter)
@@ -579,6 +705,12 @@ namespace ScribeEvidenceNative
             if (mutationComplete) throw new InvalidOperationException("Pending evidence identity was already mutated.");
         }
 
+        private void ThrowIfMutationNotAllowed()
+        {
+            if (!mutationAllowed)
+                throw new InvalidOperationException("Published evidence bindings are read-only.");
+        }
+
         private static Win32Exception NativeError(string operation, int error)
         {
             return new Win32Exception(error, "Could not " + operation + ".");
@@ -721,10 +853,20 @@ function Assert-ScribeEvidenceReportBytes([byte[]]$Bytes) {
         throw 'Pending evidence report bytes violate the bounded file-size contract.'
     }
     try {
-        $report = [Text.UTF8Encoding]::new($false, $true).GetString($Bytes) | ConvertFrom-Json
+        $utf8Json = [Text.UTF8Encoding]::new($false, $true).GetString($Bytes)
     }
     catch {
-        throw 'Pending evidence report is not strict UTF-8 JSON.'
+        throw 'Pending evidence report is not strict UTF-8.'
+    }
+    Assert-ScribeEvidenceReportJson $utf8Json
+}
+
+function Assert-ScribeEvidenceReportJson([string]$Utf8Json) {
+    try {
+        $report = $Utf8Json | ConvertFrom-Json
+    }
+    catch {
+        throw 'Evidence report is not strict JSON.'
     }
     Assert-ScribeEvidenceExactProperties $report @(
         'schema_version', 'fixture_only', 'untrusted', 'auto_eligible',
@@ -783,6 +925,33 @@ function Assert-ScribeEvidenceReportBytes([byte[]]$Bytes) {
         Assert-ScribeEvidenceExactProperties $report.$backendName @('cold', 'warm') "Pending evidence $backendName"
         Assert-ScribeEvidenceRunSet $report.$backendName.cold 5 $true "Pending evidence $backendName cold"
         Assert-ScribeEvidenceRunSet $report.$backendName.warm 20 $false "Pending evidence $backendName warm"
+    }
+}
+
+function Read-ScribeVerifiedEvidenceReport([string]$EvidencePath, [string]$ExpectedSha256) {
+    if ($ExpectedSha256 -cnotmatch '^[0-9a-f]{64}$') {
+        throw 'Expected evidence SHA-256 must be exactly 64 lowercase hexadecimal characters.'
+    }
+    $fullPath = [IO.Path]::GetFullPath($EvidencePath)
+    $evidenceRoot = [IO.Path]::GetDirectoryName($fullPath)
+    $evidenceLeaf = [IO.Path]::GetFileName($fullPath)
+    if ([string]::IsNullOrEmpty($evidenceRoot) -or [string]::IsNullOrEmpty($evidenceLeaf)) {
+        throw 'Published evidence path must name one bounded file below an evidence root.'
+    }
+
+    $binding = [ScribeEvidenceNative.BoundPendingFile]::OpenPublished(
+        $evidenceRoot,
+        $fullPath,
+        $evidenceLeaf,
+        1MB
+    )
+    try {
+        $verified = $binding.ReadAllAndVerify($ExpectedSha256)
+        Assert-ScribeEvidenceReportJson $verified.Utf8Json
+        return $verified
+    }
+    finally {
+        if ($null -ne $binding) { $binding.Dispose() }
     }
 }
 

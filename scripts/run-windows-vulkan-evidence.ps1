@@ -413,4 +413,6 @@ $published = Complete-ScribeEvidencePendingReport `
     $finalEvidenceLeaf `
     $primaryFailure `
     $secondaryFailures.ToArray()
-Write-Output "Fixture-only untrusted Vulkan evidence: $($published.Path) ($($published.Digest))"
+Write-Output "Fixture-only untrusted Vulkan evidence path: $($published.Path)"
+Write-Output "Independent consumer-bound SHA-256 (capture this stdout value): $($published.Digest)"
+Write-Output 'The on-disk evidence path is untrusted without that independently captured digest; consume it only through Read-ScribeVerifiedEvidenceReport.'
