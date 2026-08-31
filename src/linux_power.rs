@@ -173,7 +173,14 @@ fn token_from_bytes(bytes: Vec<u8>) -> io::Result<String> {
         ));
     }
     let bytes = bytes.strip_suffix(b"\n").unwrap_or(&bytes);
-    if bytes.is_empty() || bytes.iter().any(|byte| !byte.is_ascii_graphic()) {
+    if bytes.is_empty()
+        || !bytes.first().is_some_and(u8::is_ascii_graphic)
+        || !bytes.last().is_some_and(u8::is_ascii_graphic)
+        || bytes
+            .iter()
+            .any(|byte| !byte.is_ascii_graphic() && *byte != b' ')
+        || bytes.windows(2).any(|pair| pair == b"  ")
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "malformed power fact",
@@ -294,6 +301,13 @@ mod tests {
             power_source_from_facts(&battery_fixture()),
             PowerSource::Battery
         );
+
+        let not_charging = FixtureFacts::default()
+            .with_attribute("AC", "type", b"Mains\n".to_vec())
+            .with_attribute("AC", "online", b"1\n".to_vec())
+            .with_attribute("BAT0", "type", b"Battery\n".to_vec())
+            .with_attribute("BAT0", "status", b"Not charging\n".to_vec());
+        assert_eq!(power_source_from_facts(&not_charging), PowerSource::Ac);
     }
 
     #[test]
@@ -382,12 +396,21 @@ mod tests {
         let malformed = FixtureFacts::default()
             .with_attribute("AC", "type", b"Mains\n".to_vec())
             .with_attribute("AC", "online", b"1\n\n".to_vec());
+        let malformed_spacing = FixtureFacts::default()
+            .with_attribute("AC", "type", b"Mains\n".to_vec())
+            .with_attribute("AC", "online", b"1\n".to_vec())
+            .with_attribute("BAT0", "type", b"Battery\n".to_vec())
+            .with_attribute("BAT0", "status", b"Not  charging\n".to_vec());
         let oversized = FixtureFacts::default()
             .with_attribute("AC", "type", vec![b'M'; MAX_ATTRIBUTE_BYTES + 1])
             .with_attribute("AC", "online", b"1\n".to_vec());
 
         assert_eq!(power_source_from_facts(&hostile_name), PowerSource::Unknown);
         assert_eq!(power_source_from_facts(&malformed), PowerSource::Unknown);
+        assert_eq!(
+            power_source_from_facts(&malformed_spacing),
+            PowerSource::Unknown
+        );
         assert_eq!(power_source_from_facts(&oversized), PowerSource::Unknown);
     }
 }
