@@ -59,6 +59,18 @@ fn main() -> io::Result<()> {
                 std::thread::sleep(Duration::from_secs(60));
             }
         }
+        "leader-exit" => {
+            let child = Command::new("/bin/sleep")
+                .arg("60")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()?;
+            println!("PIDS={},{}", std::process::id(), child.id());
+            io::stdout().flush()?;
+            let mut release = [0_u8; 1];
+            let _ = io::stdin().read(&mut release)?;
+        }
         _ => return Err(io::Error::new(io::ErrorKind::InvalidInput, "unknown mode")),
     }
     Ok(())

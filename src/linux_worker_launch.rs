@@ -11,7 +11,9 @@ use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::fs::MetadataExt;
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 
 pub(crate) const INSTALL_ROOT: &str = "/usr/lib/scribe";
 pub(crate) const WORKER_NAME: &str = "scribe-inference-worker";
@@ -29,6 +31,15 @@ const O_NONBLOCK: c_int = 0o4000;
 const F_DUPFD_CLOEXEC: c_int = 1030;
 const F_GETFL: c_int = 3;
 const F_SETFL: c_int = 4;
+const F_ADD_SEALS: c_int = 1033;
+const F_GET_SEALS: c_int = 1034;
+const F_SEAL_SEAL: c_int = 0x0001;
+const F_SEAL_SHRINK: c_int = 0x0002;
+const F_SEAL_GROW: c_int = 0x0004;
+const F_SEAL_WRITE: c_int = 0x0008;
+const REQUIRED_MEMFD_SEALS: c_int = F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE;
+const MFD_CLOEXEC: c_uint = 0x0001;
+const MFD_ALLOW_SEALING: c_uint = 0x0002;
 const AT_EMPTY_PATH: c_int = 0x1000;
 const PR_SET_PDEATHSIG: c_int = 1;
 const PR_SET_NO_NEW_PRIVS: c_int = 38;
@@ -41,6 +52,7 @@ const POLLIN: i16 = 0x001;
 const POLLHUP: i16 = 0x010;
 const POLLERR: i16 = 0x008;
 const SYS_EXECVEAT: c_long = 322;
+const SYS_MEMFD_CREATE: c_long = 319;
 const SYS_CLOSE_RANGE: c_long = 436;
 const SYS_OPENAT2: c_long = 437;
 const CHILD_FD_BASE: c_int = 64;
@@ -50,6 +62,8 @@ const LIVENESS_FD: c_int = 5;
 const ERROR_FD: c_int = 6;
 const ERROR_RECORD_LEN: usize = 8;
 const EXEC_HANDSHAKE_TIMEOUT_MS: c_int = 5_000;
+const GUARDIAN_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+const DROP_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
 #[repr(C)]
 struct OpenHow {
@@ -75,6 +89,7 @@ unsafe extern "C" {
     fn setpgid(pid: c_int, pgid: c_int) -> c_int;
     fn prctl(option: c_int, ...) -> c_int;
     fn fchdir(fd: c_int) -> c_int;
+    fn fchmod(fd: c_int, mode: c_uint) -> c_int;
     fn dup3(oldfd: c_int, newfd: c_int, flags: c_int) -> c_int;
     fn close(fd: c_int) -> c_int;
     fn read(fd: c_int, buffer: *mut c_void, count: usize) -> isize;
@@ -91,6 +106,8 @@ unsafe extern "C" {
 pub(crate) trait LinuxExecAuthority: Send + Sync {
     fn executable_fd(&self) -> RawFd;
     fn dependency_root_fd(&self) -> RawFd;
+    fn expected_executable_length(&self) -> u64;
+    fn expected_executable_sha256(&self) -> io::Result<[u8; 32]>;
     fn recheck(&self) -> io::Result<()>;
 }
 
@@ -226,6 +243,14 @@ impl LinuxExecAuthority for InstalledWorkerAuthority {
 
     fn dependency_root_fd(&self) -> RawFd {
         self.root.as_raw_fd()
+    }
+
+    fn expected_executable_length(&self) -> u64 {
+        self.executable_identity.length
+    }
+
+    fn expected_executable_sha256(&self) -> io::Result<[u8; 32]> {
+        Ok(self.expected_sha256)
     }
 
     fn recheck(&self) -> io::Result<()> {
@@ -374,19 +399,28 @@ pub(crate) struct LinuxSpawnedWorker {
 
 struct ProcessState {
     pid: c_int,
-    reaped: bool,
+    leader_reaped: bool,
+    process_group_cleaned: bool,
+}
+
+struct Guardian {
+    release: SyncSender<()>,
+    done: Receiver<()>,
+    join: Option<JoinHandle<()>>,
 }
 
 pub(crate) struct LinuxWorkerProcess {
     state: Mutex<ProcessState>,
     parent_control: Mutex<File>,
+    guardian: Mutex<Option<Guardian>>,
     _authority: Arc<dyn LinuxExecAuthority>,
 }
 
 impl LinuxWorkerProcess {
     pub(crate) fn is_running(&self) -> io::Result<bool> {
         let mut state = lock(&self.state)?;
-        if state.reaped {
+        if state.leader_reaped {
+            clean_process_group(&mut state)?;
             return Ok(false);
         }
         let mut status = 0;
@@ -395,12 +429,14 @@ impl LinuxWorkerProcess {
         if result == 0 {
             Ok(true)
         } else if result == state.pid {
-            state.reaped = true;
+            state.leader_reaped = true;
+            clean_process_group(&mut state)?;
             Ok(false)
         } else {
             let error = io::Error::last_os_error();
             if error.raw_os_error() == Some(ECHILD) {
-                state.reaped = true;
+                state.leader_reaped = true;
+                clean_process_group(&mut state)?;
                 Ok(false)
             } else {
                 Err(error)
@@ -414,23 +450,41 @@ impl LinuxWorkerProcess {
     }
 
     pub(crate) fn terminate(&self) -> io::Result<()> {
-        let state = lock(&self.state)?;
-        if state.reaped {
-            return Ok(());
-        }
-        // Negative pid targets the process group established before exec.
-        if unsafe { kill(-state.pid, SIGKILL) } == -1 {
-            let error = io::Error::last_os_error();
-            if error.raw_os_error() != Some(ESRCH) {
-                return Err(error);
-            }
-        }
-        Ok(())
+        let mut state = lock(&self.state)?;
+        clean_process_group(&mut state)
     }
 
     pub(crate) fn wait(&self) -> io::Result<()> {
         let mut state = lock(&self.state)?;
-        reap(&mut state)
+        reap_leader(&mut state)?;
+        clean_process_group(&mut state)
+    }
+}
+
+impl Drop for LinuxWorkerProcess {
+    fn drop(&mut self) {
+        let state = self
+            .state
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = clean_process_group(state);
+        let _ = reap_leader_bounded(state, DROP_REAP_TIMEOUT);
+
+        let guardian = self
+            .guardian
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(mut guardian) = guardian.take() {
+            let _ = guardian.release.send(());
+            if guardian
+                .done
+                .recv_timeout(GUARDIAN_SHUTDOWN_TIMEOUT)
+                .is_ok()
+                && let Some(join) = guardian.join.take()
+            {
+                let _ = join.join();
+            }
+        }
     }
 }
 
@@ -440,8 +494,23 @@ fn lock<T>(mutex: &Mutex<T>) -> io::Result<std::sync::MutexGuard<'_, T>> {
         .map_err(|_| invalid("Linux worker lock was poisoned"))
 }
 
-fn reap(state: &mut ProcessState) -> io::Result<()> {
-    if state.reaped {
+fn clean_process_group(state: &mut ProcessState) -> io::Result<()> {
+    if state.process_group_cleaned {
+        return Ok(());
+    }
+    // Negative pid targets the retained process group even after its leader was reaped.
+    if unsafe { kill(-state.pid, SIGKILL) } == -1 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(ESRCH) {
+            return Err(error);
+        }
+    }
+    state.process_group_cleaned = true;
+    Ok(())
+}
+
+fn reap_leader(state: &mut ProcessState) -> io::Result<()> {
+    if state.leader_reaped {
         return Ok(());
     }
     loop {
@@ -449,7 +518,7 @@ fn reap(state: &mut ProcessState) -> io::Result<()> {
         // SAFETY: pid names this object's child and status is writable.
         let result = unsafe { waitpid(state.pid, &mut status, 0) };
         if result == state.pid {
-            state.reaped = true;
+            state.leader_reaped = true;
             return Ok(());
         }
         let error = io::Error::last_os_error();
@@ -457,10 +526,42 @@ fn reap(state: &mut ProcessState) -> io::Result<()> {
             continue;
         }
         if error.raw_os_error() == Some(ECHILD) {
-            state.reaped = true;
+            state.leader_reaped = true;
             return Ok(());
         }
         return Err(error);
+    }
+}
+
+fn reap_leader_bounded(state: &mut ProcessState, timeout: std::time::Duration) -> io::Result<()> {
+    if state.leader_reaped {
+        return Ok(());
+    }
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let mut status = 0;
+        let result = unsafe { waitpid(state.pid, &mut status, WNOHANG) };
+        if result == state.pid {
+            state.leader_reaped = true;
+            return Ok(());
+        }
+        if result == -1 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(ECHILD) {
+                state.leader_reaped = true;
+                return Ok(());
+            }
+            if error.raw_os_error() != Some(EINTR) {
+                return Err(error);
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "Linux worker leader reap timed out during Drop",
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
     }
 }
 
@@ -485,8 +586,7 @@ pub(crate) fn launch_verified_worker(
         EXEC_HANDSHAKE_TIMEOUT_MS,
         0,
     )?;
-    authority.recheck()?;
-    prepared.fork_exec(authority)
+    launch_on_guardian(prepared, authority)
 }
 
 #[cfg(test)]
@@ -505,8 +605,111 @@ fn launch_verified_worker_inner(
         timeout_ms,
         child_test_action,
     )?;
-    authority.recheck()?;
-    prepared.fork_exec(authority)
+    launch_on_guardian(prepared, authority)
+}
+
+struct RawSpawnedWorker {
+    stdin: File,
+    stdout: File,
+    parent_control: File,
+    pid: c_int,
+}
+
+fn launch_on_guardian(
+    prepared: PreparedLaunch,
+    authority: Arc<dyn LinuxExecAuthority>,
+) -> io::Result<LinuxSpawnedWorker> {
+    let (result_tx, result_rx) = sync_channel(1);
+    let (release_tx, release_rx) = sync_channel(1);
+    let (done_tx, done_rx) = sync_channel(1);
+    let guardian_authority = Arc::clone(&authority);
+    let join = std::thread::Builder::new()
+        .name("scribe-linux-worker-guardian".to_owned())
+        .spawn(move || {
+            let result = guardian_authority
+                .recheck()
+                .and_then(|()| prepared.fork_exec());
+            let pid = result.as_ref().ok().map(|spawned| spawned.pid);
+            match result_tx.send(result) {
+                Ok(()) => {
+                    if let Some(pid) = pid {
+                        if release_rx.recv().is_err() {
+                            guardian_cleanup(pid, DROP_REAP_TIMEOUT);
+                        }
+                    }
+                }
+                Err(send_error) => {
+                    if let Ok(spawned) = send_error.0 {
+                        cleanup_failed_child(spawned.pid);
+                    }
+                }
+            }
+            let _ = done_tx.send(());
+        })
+        .map_err(|error| {
+            io::Error::other(format!("could not start Linux worker guardian: {error}"))
+        })?;
+
+    let raw = match result_rx.recv() {
+        Ok(Ok(spawned)) => spawned,
+        Ok(Err(error)) => {
+            let _ = done_rx.recv_timeout(GUARDIAN_SHUTDOWN_TIMEOUT);
+            let _ = join.join();
+            return Err(error);
+        }
+        Err(error) => {
+            let _ = join.join();
+            return Err(io::Error::other(format!(
+                "Linux worker guardian ended before publishing launch: {error}"
+            )));
+        }
+    };
+
+    Ok(LinuxSpawnedWorker {
+        stdin: raw.stdin,
+        stdout: raw.stdout,
+        process: LinuxWorkerProcess {
+            state: Mutex::new(ProcessState {
+                pid: raw.pid,
+                leader_reaped: false,
+                process_group_cleaned: false,
+            }),
+            parent_control: Mutex::new(raw.parent_control),
+            guardian: Mutex::new(Some(Guardian {
+                release: release_tx,
+                done: done_rx,
+                join: Some(join),
+            })),
+            _authority: authority,
+        },
+    })
+}
+
+fn guardian_cleanup(pid: c_int, timeout: std::time::Duration) {
+    unsafe {
+        kill(-pid, SIGKILL);
+        kill(pid, SIGKILL);
+    }
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let result = unsafe { waitpid(pid, std::ptr::null_mut(), WNOHANG) };
+        if result == pid {
+            return;
+        }
+        if result == -1 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(ECHILD) {
+                return;
+            }
+            if error.raw_os_error() != Some(EINTR) {
+                return;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
 }
 
 struct PreparedLaunch {
@@ -521,9 +724,7 @@ struct PreparedLaunch {
     executable: Fd,
     root: Fd,
     argv_storage: Vec<CString>,
-    argv: Vec<*const c_char>,
     environment_storage: Vec<CString>,
-    environment: Vec<*const c_char>,
     timeout_ms: c_int,
     #[cfg(test)]
     child_test_action: u32,
@@ -546,7 +747,8 @@ impl PreparedLaunch {
         let (error_read, error_write) = pipe_cloexec()?;
         set_nonblocking(error_read.raw())?;
 
-        let executable = duplicate_high(authority.executable_fd())?;
+        let sealed_executable = create_sealed_snapshot(authority)?;
+        let executable = duplicate_high(sealed_executable.as_raw_fd())?;
         let root = duplicate_high(authority.dependency_root_fd())?;
         let child_stdin = duplicate_high(child_stdin.raw())?;
         let child_stdout = duplicate_high(child_stdout.raw())?;
@@ -557,7 +759,6 @@ impl PreparedLaunch {
             CString::new(WORKER_NAME).expect("static worker name"),
             CString::new(worker_flag).map_err(|_| invalid("worker flag contains NUL"))?,
         ];
-        let argv = pointer_vector(&argv_storage);
         let mut fields = vec![
             "PATH=/usr/bin:/bin".to_owned(),
             "LANG=C.UTF-8".to_owned(),
@@ -572,7 +773,6 @@ impl PreparedLaunch {
             .into_iter()
             .map(|field| CString::new(field).map_err(|_| invalid("environment contains NUL")))
             .collect::<io::Result<Vec<_>>>()?;
-        let environment = pointer_vector(&environment_storage);
 
         Ok(Self {
             child_stdin,
@@ -586,18 +786,16 @@ impl PreparedLaunch {
             executable,
             root,
             argv_storage,
-            argv,
             environment_storage,
-            environment,
             timeout_ms,
             #[cfg(test)]
             child_test_action,
         })
     }
 
-    fn fork_exec(self, authority: Arc<dyn LinuxExecAuthority>) -> io::Result<LinuxSpawnedWorker> {
-        // Touch backing storage here so its lifetime is visibly tied to the fork call.
-        let _prepared_storage = (&self.argv_storage, &self.environment_storage);
+    fn fork_exec(self) -> io::Result<RawSpawnedWorker> {
+        let argv = pointer_vector(&self.argv_storage);
+        let environment = pointer_vector(&self.environment_storage);
         // SAFETY: all allocations and descriptors required by the child are prepared.
         let parent_pid = unsafe { getpid() };
         let pid = unsafe { fork() };
@@ -605,7 +803,7 @@ impl PreparedLaunch {
             return Err(io::Error::last_os_error());
         }
         if pid == 0 {
-            unsafe { self.child_exec(parent_pid) }
+            unsafe { self.child_exec(parent_pid, &argv, &environment) }
         }
 
         drop(self.child_stdin);
@@ -615,9 +813,11 @@ impl PreparedLaunch {
         drop(self.executable);
         drop(self.root);
 
-        if let Err(error) = wait_for_exec(self.error_read.raw(), self.timeout_ms) {
-            cleanup_failed_child(pid);
-            return Err(error);
+        if let Err(failure) = wait_for_exec(self.error_read.raw(), pid, self.timeout_ms) {
+            if !failure.child_reaped {
+                cleanup_failed_child(pid);
+            }
+            return Err(failure.error);
         }
         drop(self.error_read);
 
@@ -625,18 +825,20 @@ impl PreparedLaunch {
         let stdin = unsafe { File::from_raw_fd(self.parent_stdin.into_raw()) };
         let stdout = unsafe { File::from_raw_fd(self.parent_stdout.into_raw()) };
         let parent_control = unsafe { File::from_raw_fd(self.parent_liveness.into_raw()) };
-        Ok(LinuxSpawnedWorker {
+        Ok(RawSpawnedWorker {
             stdin,
             stdout,
-            process: LinuxWorkerProcess {
-                state: Mutex::new(ProcessState { pid, reaped: false }),
-                parent_control: Mutex::new(parent_control),
-                _authority: authority,
-            },
+            parent_control,
+            pid,
         })
     }
 
-    unsafe fn child_exec(&self, parent_pid: c_int) -> ! {
+    unsafe fn child_exec(
+        &self,
+        parent_pid: c_int,
+        argv: &[*const c_char],
+        environment: &[*const c_char],
+    ) -> ! {
         // SAFETY: this is the post-fork child. Every referenced descriptor and
         // pointer was prepared before fork and no other Rust code is invoked.
         unsafe {
@@ -654,6 +856,9 @@ impl PreparedLaunch {
                 if self.child_test_action == 2 {
                     let _ = poll(std::ptr::null_mut(), 0, -1);
                     child_fail(91);
+                }
+                if self.child_test_action == 3 {
+                    _exit(126);
                 }
             }
             if setpgid(0, 0) == -1 {
@@ -675,12 +880,16 @@ impl PreparedLaunch {
                 child_fail(12);
             }
             close(ROOT_FD);
+            #[cfg(test)]
+            if self.child_test_action == 4 {
+                close(EXEC_FD);
+            }
             syscall(
                 SYS_EXECVEAT,
                 EXEC_FD,
                 c"".as_ptr(),
-                self.argv.as_ptr(),
-                self.environment.as_ptr(),
+                argv.as_ptr(),
+                environment.as_ptr(),
                 AT_EMPTY_PATH,
             );
             child_fail(13)
@@ -722,12 +931,45 @@ unsafe fn child_fail(stage: u32) -> ! {
         let record = [
             stage[0], stage[1], stage[2], stage[3], errno[0], errno[1], errno[2], errno[3],
         ];
-        let _ = write(ERROR_FD, record.as_ptr().cast(), record.len());
+        let mut offset = 0;
+        while offset < record.len() {
+            let written = write(
+                ERROR_FD,
+                record[offset..].as_ptr().cast(),
+                record.len() - offset,
+            );
+            if written > 0 {
+                offset += written as usize;
+                continue;
+            }
+            if written == -1 && *__errno_location() == EINTR {
+                continue;
+            }
+            break;
+        }
         _exit(127)
     }
 }
 
-fn wait_for_exec(error_fd: RawFd, timeout_ms: c_int) -> io::Result<()> {
+struct ExecHandshakeFailure {
+    error: io::Error,
+    child_reaped: bool,
+}
+
+impl From<io::Error> for ExecHandshakeFailure {
+    fn from(error: io::Error) -> Self {
+        Self {
+            error,
+            child_reaped: false,
+        }
+    }
+}
+
+fn wait_for_exec(
+    error_fd: RawFd,
+    pid: c_int,
+    timeout_ms: c_int,
+) -> Result<(), ExecHandshakeFailure> {
     let deadline = std::time::Instant::now()
         .checked_add(std::time::Duration::from_millis(timeout_ms as u64))
         .ok_or_else(|| invalid("Linux worker exec timeout overflowed"))?;
@@ -739,7 +981,8 @@ fn wait_for_exec(error_fd: RawFd, timeout_ms: c_int) -> io::Result<()> {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "Linux worker exec handshake timed out",
-            ));
+            )
+            .into());
         }
         let poll_timeout = remaining.as_millis().clamp(1, c_int::MAX as u128) as c_int;
         let mut descriptor = PollFd {
@@ -753,14 +996,15 @@ fn wait_for_exec(error_fd: RawFd, timeout_ms: c_int) -> io::Result<()> {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "Linux worker exec handshake timed out",
-            ));
+            )
+            .into());
         }
         if result < 0 {
             let error = io::Error::last_os_error();
             if error.raw_os_error() == Some(EINTR) {
                 continue;
             }
-            return Err(error);
+            return Err(error.into());
         }
         // SAFETY: the destination slice is writable for its remaining length.
         let count = unsafe {
@@ -778,15 +1022,16 @@ fn wait_for_exec(error_fd: RawFd, timeout_ms: c_int) -> io::Result<()> {
                 return Err(io::Error::new(
                     io::ErrorKind::Other,
                     format!("Linux worker child setup failed at stage {stage} (errno {errno})"),
-                ));
+                )
+                .into());
             }
             continue;
         }
         if count == 0 {
             return if offset == 0 {
-                Ok(())
+                classify_zero_record_exec_eof(pid)
             } else {
-                Err(invalid("truncated Linux worker exec error record"))
+                Err(invalid("truncated Linux worker exec error record").into())
             };
         }
         let error = io::Error::last_os_error();
@@ -796,7 +1041,45 @@ fn wait_for_exec(error_fd: RawFd, timeout_ms: c_int) -> io::Result<()> {
         ) {
             continue;
         }
-        return Err(error);
+        return Err(error.into());
+    }
+}
+
+fn classify_zero_record_exec_eof(pid: c_int) -> Result<(), ExecHandshakeFailure> {
+    // Pipe closure precedes the final task-state transition during `_exit`.
+    // Give that transition a small, total bounded grace period before treating
+    // CLOEXEC EOF as successful exec.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(20);
+    loop {
+        let mut status = 0;
+        let result = unsafe { waitpid(pid, &mut status, WNOHANG) };
+        if result == pid {
+            return Err(ExecHandshakeFailure {
+                error: io::Error::other(format!(
+                    "Linux worker exited before publishing an exec error record (status {status})"
+                )),
+                child_reaped: true,
+            });
+        }
+        if result == -1 {
+            let error = io::Error::last_os_error();
+            return if error.raw_os_error() == Some(ECHILD) {
+                Err(ExecHandshakeFailure {
+                    error: io::Error::other(
+                        "Linux worker disappeared before publishing an exec error record",
+                    ),
+                    child_reaped: true,
+                })
+            } else if error.raw_os_error() == Some(EINTR) {
+                continue;
+            } else {
+                Err(error.into())
+            };
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
     }
 }
 
@@ -859,6 +1142,66 @@ fn duplicate_high(source: RawFd) -> io::Result<Fd> {
     }
 }
 
+fn create_sealed_snapshot(authority: &dyn LinuxExecAuthority) -> io::Result<File> {
+    let expected_length = authority.expected_executable_length();
+    let expected_digest = authority.expected_executable_sha256()?;
+    let source_raw = unsafe { fcntl(authority.executable_fd(), F_DUPFD_CLOEXEC, 3) };
+    if source_raw < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut source = unsafe { File::from_raw_fd(source_raw) };
+    source.seek(SeekFrom::Start(0))?;
+
+    let snapshot_raw = unsafe {
+        syscall(
+            SYS_MEMFD_CREATE,
+            c"scribe-inference-worker".as_ptr(),
+            MFD_CLOEXEC | MFD_ALLOW_SEALING,
+        )
+    };
+    if snapshot_raw < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut snapshot = unsafe { File::from_raw_fd(snapshot_raw as RawFd) };
+    let mut digest = Sha256::new();
+    let mut copied = 0_u64;
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let count = source.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        copied = copied
+            .checked_add(count as u64)
+            .ok_or_else(|| invalid("Linux worker snapshot length overflowed"))?;
+        if copied > expected_length {
+            return Err(invalid(
+                "Linux worker snapshot exceeded its admitted length",
+            ));
+        }
+        digest.update(&buffer[..count]);
+        snapshot.write_all(&buffer[..count])?;
+    }
+    if copied != expected_length || digest.finish() != expected_digest {
+        return Err(invalid(
+            "Linux worker changed while creating its sealed execution snapshot",
+        ));
+    }
+    if unsafe { fchmod(snapshot.as_raw_fd(), 0o500) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    if unsafe { fcntl(snapshot.as_raw_fd(), F_ADD_SEALS, REQUIRED_MEMFD_SEALS) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let seals = unsafe { fcntl(snapshot.as_raw_fd(), F_GET_SEALS) };
+    if seals < 0 || seals & REQUIRED_MEMFD_SEALS != REQUIRED_MEMFD_SEALS {
+        return Err(invalid(
+            "Linux worker execution snapshot is not fully sealed",
+        ));
+    }
+    Ok(snapshot)
+}
+
 fn set_nonblocking(fd: RawFd) -> io::Result<()> {
     let flags = unsafe { fcntl(fd, F_GETFL) };
     if flags < 0 || unsafe { fcntl(fd, F_SETFL, flags | O_NONBLOCK) } < 0 {
@@ -876,7 +1219,7 @@ fn pointer_vector(storage: &[CString]) -> Vec<*const c_char> {
         .collect()
 }
 
-fn parse_sha256(value: &str) -> io::Result<[u8; 32]> {
+pub(crate) fn parse_sha256(value: &str) -> io::Result<[u8; 32]> {
     if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(invalid("expected a 64-character SHA-256 digest"));
     }
@@ -1027,6 +1370,7 @@ fn invalid(message: impl Into<String>) -> io::Error {
 mod tests {
     use super::*;
     use std::io::{BufRead, BufReader};
+    use std::os::unix::fs::FileExt;
     use std::os::unix::fs::{PermissionsExt, symlink};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -1252,6 +1596,8 @@ mod tests {
         root: File,
         replacement: Option<File>,
         rechecks: AtomicUsize,
+        expected_length: u64,
+        expected_digest: [u8; 32],
     }
 
     impl LinuxExecAuthority for RawAuthority {
@@ -1261,6 +1607,14 @@ mod tests {
 
         fn dependency_root_fd(&self) -> RawFd {
             self.root.as_raw_fd()
+        }
+
+        fn expected_executable_length(&self) -> u64 {
+            self.expected_length
+        }
+
+        fn expected_executable_sha256(&self) -> io::Result<[u8; 32]> {
+            Ok(self.expected_digest)
         }
 
         fn recheck(&self) -> io::Result<()> {
@@ -1287,11 +1641,15 @@ mod tests {
     #[test]
     fn external_authority_fd_swap_cannot_redirect_prepared_exec_descriptor() {
         let fixture = Fixture::launcher();
+        let expected_length = std::fs::metadata(&fixture.worker).unwrap().len();
+        let expected_digest = parse_sha256(&fixture.digest).unwrap();
         let authority: Arc<dyn LinuxExecAuthority> = Arc::new(RawAuthority {
             executable: File::open(&fixture.worker).unwrap(),
             root: File::open(&fixture.root).unwrap(),
             replacement: Some(File::open("/bin/false").unwrap()),
             rechecks: AtomicUsize::new(0),
+            expected_length,
+            expected_digest,
         });
         let mut spawned = launch_verified_worker(
             authority,
@@ -1304,6 +1662,82 @@ mod tests {
         spawned.stdout.read_to_string(&mut output).unwrap();
         spawned.process.wait().unwrap();
         assert!(output.contains("ARGS=--scribe-inference-worker"));
+    }
+
+    #[test]
+    fn sealed_memfd_snapshot_rejects_writes_and_preserves_digest() {
+        let fixture = Fixture::launcher();
+        let authority = fixture.open().unwrap();
+        let mut snapshot = create_sealed_snapshot(&*authority).unwrap();
+        let seals = unsafe { fcntl(snapshot.as_raw_fd(), F_GET_SEALS) };
+        assert_eq!(seals & REQUIRED_MEMFD_SEALS, REQUIRED_MEMFD_SEALS);
+        assert!(snapshot.write_all(b"mutation").is_err());
+        assert_eq!(
+            sha256_file(&snapshot).unwrap(),
+            parse_sha256(&fixture.digest).unwrap()
+        );
+    }
+
+    #[test]
+    fn concurrent_source_mutation_rejects_or_executes_only_trusted_snapshot() {
+        let fixture = Fixture::launcher();
+        let expected_length = std::fs::metadata(&fixture.worker).unwrap().len();
+        let expected_digest = parse_sha256(&fixture.digest).unwrap();
+        let offset = expected_length - 1;
+        let original = {
+            let mut file = File::open(&fixture.worker).unwrap();
+            file.seek(SeekFrom::Start(offset)).unwrap();
+            let mut byte = [0_u8; 1];
+            file.read_exact(&mut byte).unwrap();
+            byte[0]
+        };
+        std::fs::set_permissions(&fixture.worker, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let writer_file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&fixture.worker)
+            .unwrap();
+        let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let writer_running = Arc::clone(&running);
+        let writer = std::thread::spawn(move || {
+            let changed = original ^ 0x5a;
+            while writer_running.load(Ordering::Acquire) {
+                writer_file.write_at(&[changed], offset).unwrap();
+                writer_file.write_at(&[original], offset).unwrap();
+            }
+            writer_file.write_at(&[original], offset).unwrap();
+        });
+        std::thread::sleep(Duration::from_millis(10));
+
+        let authority: Arc<dyn LinuxExecAuthority> = Arc::new(RawAuthority {
+            executable: File::open(&fixture.worker).unwrap(),
+            root: File::open(&fixture.root).unwrap(),
+            replacement: None,
+            rechecks: AtomicUsize::new(0),
+            expected_length,
+            expected_digest,
+        });
+        let launched = launch_verified_worker(
+            authority,
+            "--scribe-inference-worker",
+            &[("SCRIBE_PRIVATE_TEST_MODE".to_owned(), "inspect".to_owned())],
+        );
+        running.store(false, Ordering::Release);
+        writer.join().unwrap();
+        match launched {
+            Ok(mut spawned) => {
+                drop(spawned.stdin);
+                let mut output = String::new();
+                spawned.stdout.read_to_string(&mut output).unwrap();
+                spawned.process.wait().unwrap();
+                assert!(output.contains("ARGS=--scribe-inference-worker"));
+            }
+            Err(error) => assert!(
+                error
+                    .to_string()
+                    .contains("changed while creating its sealed execution snapshot"),
+                "unexpected mutation-race error: {error}"
+            ),
+        }
     }
 
     #[test]
@@ -1321,6 +1755,21 @@ mod tests {
         .expect("forced child failure");
         assert!(forced.to_string().contains("stage 90 (errno"));
 
+        let early_exit = launch_verified_worker_inner(
+            Arc::clone(&authority),
+            "--scribe-inference-worker",
+            &[],
+            500,
+            3,
+        )
+        .err()
+        .expect("zero-record child exit");
+        assert!(
+            early_exit
+                .to_string()
+                .contains("before publishing an exec error record")
+        );
+
         let started = Instant::now();
         let timeout =
             launch_verified_worker_inner(authority, "--scribe-inference-worker", &[], 150, 2)
@@ -1329,18 +1778,12 @@ mod tests {
         assert_eq!(timeout.kind(), io::ErrorKind::TimedOut);
         assert!(started.elapsed() < Duration::from_secs(2));
 
-        let directory_authority: Arc<dyn LinuxExecAuthority> = Arc::new(RawAuthority {
-            executable: File::open(&fixture.root).unwrap(),
-            root: File::open(&fixture.root).unwrap(),
-            replacement: None,
-            rechecks: AtomicUsize::new(0),
-        });
         let exec_error = launch_verified_worker_inner(
-            directory_authority,
+            fixture.open().unwrap(),
             "--scribe-inference-worker",
             &[],
             500,
-            0,
+            4,
         )
         .err()
         .expect("directory exec must fail");
@@ -1367,6 +1810,20 @@ mod tests {
     }
 
     #[test]
+    fn guardian_outlives_short_lived_launch_helper_thread() {
+        let fixture = Arc::new(Fixture::launcher());
+        let helper_fixture = Arc::clone(&fixture);
+        let spawned = std::thread::spawn(move || launch_fixture(&helper_fixture, "hang"))
+            .join()
+            .unwrap()
+            .unwrap();
+        assert!(spawned.process.is_running().unwrap());
+        spawned.process.terminate().unwrap();
+        spawned.process.wait().unwrap();
+        drop(fixture);
+    }
+
+    #[test]
     fn termination_targets_entire_worker_process_group() {
         let fixture = Fixture::launcher();
         let spawned = launch_fixture(&fixture, "process-group").unwrap();
@@ -1388,6 +1845,32 @@ mod tests {
                 "pid {pid} survived process-group termination"
             );
         }
+    }
+
+    #[test]
+    fn leader_exit_cleanup_kills_reported_descendant() {
+        let fixture = Fixture::launcher();
+        let spawned = launch_fixture(&fixture, "leader-exit").unwrap();
+        let mut reader = BufReader::new(spawned.stdout.try_clone().unwrap());
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let pids = line
+            .trim()
+            .strip_prefix("PIDS=")
+            .unwrap()
+            .split(',')
+            .map(|value| value.parse::<i32>().unwrap())
+            .collect::<Vec<_>>();
+        drop(spawned.stdin);
+        for _ in 0..100 {
+            if !spawned.process.is_running().unwrap() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!spawned.process.is_running().unwrap());
+        assert!(wait_until_not_running(pids[1]));
+        spawned.process.wait().unwrap();
     }
 
     fn wait_until_not_running(pid: c_int) -> bool {

@@ -184,6 +184,34 @@ mod launch_binding {
             self.dependency_root_fd().as_raw_fd()
         }
 
+        fn expected_executable_length(&self) -> u64 {
+            let worker = &self
+                .verified_pack_lease()
+                .verified_pack()
+                .worker_relative_path;
+            self.verified_pack_lease()
+                .copy_entries()
+                .iter()
+                .find(|entry| entry.path == *worker)
+                .expect("verified pack authority retains its worker inventory entry")
+                .size_bytes
+        }
+
+        fn expected_executable_sha256(&self) -> std::io::Result<[u8; 32]> {
+            let worker = &self
+                .verified_pack_lease()
+                .verified_pack()
+                .worker_relative_path;
+            let digest = &self
+                .verified_pack_lease()
+                .copy_entries()
+                .iter()
+                .find(|entry| entry.path == *worker)
+                .expect("verified pack authority retains its worker inventory entry")
+                .sha256;
+            crate::linux_worker_launch::parse_sha256(digest)
+        }
+
         fn recheck(&self) -> std::io::Result<()> {
             self.recheck().map_err(std::io::Error::other)
         }
