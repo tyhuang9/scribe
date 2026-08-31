@@ -4259,6 +4259,46 @@ impl ProcessWorkerSupervisor {
         }
     }
 
+    fn current_generation_has_active_model(&self, expected_identity: &str) -> Result<bool> {
+        let (process, matches_active_model) =
+            {
+                let state =
+                    self.inner.state.lock().map_err(|_| {
+                        anyhow!("process worker supervisor state lock was poisoned")
+                    })?;
+                let Some(current) = state.current.as_ref() else {
+                    return Ok(false);
+                };
+                (
+                    Arc::clone(&current.process),
+                    state.active_model.as_ref().is_some_and(
+                        |(loaded_generation, loaded_identity)| {
+                            *loaded_generation == current.generation
+                                && loaded_identity == expected_identity
+                        },
+                    ),
+                )
+            };
+        Ok(matches_active_model && process.is_running()?)
+    }
+
+    fn record_active_model(&self, generation: u64, identity: String) -> Result<()> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| anyhow!("process worker supervisor state lock was poisoned"))?;
+        if !state
+            .current
+            .as_ref()
+            .is_some_and(|current| current.generation == generation)
+        {
+            bail!("process worker generation changed before model residency was recorded");
+        }
+        state.active_model = Some((generation, identity));
+        Ok(())
+    }
+
     fn has_active_stream(&self) -> Result<bool> {
         Ok(self
             .inner
@@ -5903,6 +5943,27 @@ impl InferenceWorkerSupervisor {
             .unwrap_or(false)
     }
 
+    fn artifact_identity(
+        artifact: &RuntimeArtifact,
+        preference: AccelerationPreference,
+    ) -> Result<String, RuntimeError> {
+        let wire_artifact: WireRuntimeArtifact = artifact.clone().into();
+        wire_artifact_identity(&wire_artifact, preference).map_err(worker_unavailable)
+    }
+
+    fn has_loaded_artifact(
+        &self,
+        artifact: &RuntimeArtifact,
+        preference: AccelerationPreference,
+    ) -> bool {
+        let Ok(identity) = Self::artifact_identity(artifact, preference) else {
+            return false;
+        };
+        self.transport
+            .current_generation_has_active_model(&identity)
+            .unwrap_or(false)
+    }
+
     pub(crate) fn load(
         &self,
         artifact: RuntimeArtifact,
@@ -5916,12 +5977,15 @@ impl InferenceWorkerSupervisor {
             .transport
             .generation_context()
             .map_err(worker_unavailable)?;
+        let artifact: WireRuntimeArtifact = artifact.into();
+        let artifact_identity =
+            wire_artifact_identity(&artifact, preference).map_err(worker_unavailable)?;
         let correlation = self.next_id();
         let frame = control_frame(
             correlation,
             correlation,
             &Control::LoadRuntime {
-                artifact: artifact.into(),
+                artifact,
                 preference,
             },
         )
@@ -5943,6 +6007,9 @@ impl InferenceWorkerSupervisor {
                     &context.pack_bindings,
                     &mut execution.diagnostics.resolved_acceleration,
                 )?;
+                self.transport
+                    .record_active_model(context.generation, artifact_identity)
+                    .map_err(worker_unavailable)?;
                 Ok(execution)
             }
             Control::RuntimeFailed { error } => {
@@ -5984,6 +6051,9 @@ impl InferenceWorkerSupervisor {
             .generation_context()
             .map_err(worker_unavailable)?;
         let generation = context.generation;
+        let artifact: WireRuntimeArtifact = artifact.into();
+        let artifact_identity =
+            wire_artifact_identity(&artifact, preference).map_err(worker_unavailable)?;
         if cancelled() {
             let _ = self.transport.invalidate_generation(
                 generation,
@@ -6000,7 +6070,7 @@ impl InferenceWorkerSupervisor {
             session_id,
             begin_id,
             &Control::BeginBatch {
-                artifact: artifact.into(),
+                artifact,
                 preference,
                 options,
                 source_sample_rate: audio.source_sample_rate,
@@ -6021,7 +6091,10 @@ impl InferenceWorkerSupervisor {
             )
             .map_err(worker_unavailable)?
         {
-            Control::Ok => {}
+            Control::Ok => self
+                .transport
+                .record_active_model(generation, artifact_identity)
+                .map_err(worker_unavailable)?,
             Control::RuntimeFailed { error } => {
                 return Err(error.into_runtime_for_generation(&self.transport, generation));
             }
@@ -7510,13 +7583,17 @@ impl InferenceWorkerRegistry {
         Arc::ptr_eq(&left.transport.inner, &right.transport.inner)
     }
 
-    fn active_warm_auto_route(&self) -> Option<ActiveInferenceRoute> {
+    fn active_warm_auto_route(&self, artifact: &RuntimeArtifact) -> Option<ActiveInferenceRoute> {
         self.active_route
             .lock()
             .ok()?
             .as_ref()
             .filter(|active| active.identity.backend != BackendKind::Cpu)
-            .filter(|active| active.supervisor.has_live_generation())
+            .filter(|active| {
+                active
+                    .supervisor
+                    .has_loaded_artifact(artifact, AccelerationPreference::Gpu)
+            })
             .cloned()
     }
 
@@ -7530,6 +7607,7 @@ impl InferenceWorkerRegistry {
         &self,
         catalog: &VerifiedGpuRouteCatalog,
         route: &InferenceWorkerRoute,
+        artifact: &RuntimeArtifact,
     ) -> Result<(), RuntimeError> {
         if !route.provider.is_gpu() {
             return Ok(());
@@ -7544,7 +7622,9 @@ impl InferenceWorkerRegistry {
         let Some(active) = active.filter(|active| {
             active.identity == Self::route_identity(route)
                 && Self::same_supervisor(&active.supervisor, &route.supervisor)
-                && active.supervisor.has_live_generation()
+                && active
+                    .supervisor
+                    .has_loaded_artifact(artifact, AccelerationPreference::Gpu)
         }) else {
             self.clear_auto_live_admission();
             return Ok(());
@@ -7791,7 +7871,7 @@ impl InferenceWorkerRegistry {
             // starts work, so this short cache can never authorize a route.
             let selection_power_source = PowerSource::current();
             let lookup_at = Instant::now();
-            let active_warm_route = self.active_warm_auto_route();
+            let active_warm_route = self.active_warm_auto_route(artifact);
             let cached_catalog = {
                 let mut cached = self.auto_gpu_routes.lock().map_err(|_| {
                     RuntimeError::WorkerUnavailable(
@@ -7811,7 +7891,7 @@ impl InferenceWorkerRegistry {
                     routes: Arc::new(Vec::new()),
                     diagnostic,
                     device_set_digest: verified_gpu_device_set_digest(&[]),
-                    discovery_fingerprint,
+                    discovery_fingerprint: discovery_fingerprint.clone(),
                     provider_probe_incomplete: true,
                     skipped_targets: Vec::new(),
                 },
@@ -7819,7 +7899,7 @@ impl InferenceWorkerRegistry {
                     self.retire_active_worker()?;
                     let discovered = verified_gpu_route_catalog(
                         discover_production_pack_launch_bindings(discovery),
-                        discovery_fingerprint,
+                        discovery_fingerprint.clone(),
                     );
                     let probe_completed_at = Instant::now();
                     self.auto_gpu_routes
@@ -8131,7 +8211,7 @@ impl InferenceWorkerRegistry {
                 Ok(mut execution) => {
                     if preference == AccelerationPreference::Auto {
                         if let Some(catalog) = plan.auto_live_admission.as_ref() {
-                            self.retain_auto_live_admission(catalog, route)?;
+                            self.retain_auto_live_admission(catalog, route, &artifact)?;
                         }
                         Self::project_auto_route_diagnostics(
                             &mut execution.diagnostics,
@@ -8305,7 +8385,7 @@ impl InferenceWorkerRegistry {
                 Ok(mut execution) => {
                     if preference == AccelerationPreference::Auto {
                         if let Some(catalog) = plan.auto_live_admission.as_ref() {
-                            self.retain_auto_live_admission(catalog, route)?;
+                            self.retain_auto_live_admission(catalog, route, &artifact)?;
                         }
                         Self::project_auto_route_diagnostics(
                             &mut execution.diagnostics,
@@ -8488,7 +8568,7 @@ impl InferenceWorkerRegistry {
                 Ok(()) => {
                     if preference == AccelerationPreference::Auto {
                         if let Some(catalog) = plan.auto_live_admission.as_ref() {
-                            self.retain_auto_live_admission(catalog, route)?;
+                            self.retain_auto_live_admission(catalog, route, &artifact)?;
                         }
                     }
                     if let Some(health) = &plan.health {
@@ -13422,6 +13502,16 @@ mod tests {
 
     #[test]
     fn auto_warm_reuse_tolerates_lower_post_load_memory_only_for_exact_live_supervisor() {
+        let root = test_root("auto-warm-model-residency");
+        let model_path = root.join("model.gguf");
+        std::fs::write(&model_path, b"g").unwrap();
+        let artifact = RuntimeArtifact::Gguf(RuntimeModel {
+            id: ModelId::new("auto-warm-model-residency"),
+            path: model_path,
+            format: ArtifactFormat::Gguf,
+            expected_size_bytes: 1,
+            expected_sha256: format!("{:x}", Sha256::digest(b"g")),
+        });
         let launcher = Arc::new(TestLauncher::new([TestMode::Normal]));
         let mut route = verified_gpu_route(
             BackendKind::Cuda,
@@ -13430,11 +13520,19 @@ mod tests {
             'a',
         );
         route.supervisor = inference_supervisor_with_launcher(Arc::clone(&launcher));
-        route
+        let generation = route
             .supervisor
             .transport
             .ensure_generation()
             .expect("test worker generation starts");
+        let artifact_identity =
+            InferenceWorkerSupervisor::artifact_identity(&artifact, AccelerationPreference::Gpu)
+                .unwrap();
+        route
+            .supervisor
+            .transport
+            .record_active_model(generation, artifact_identity)
+            .unwrap();
         let active = ActiveInferenceRoute {
             identity: InferenceWorkerRegistry::route_identity(&route),
             supervisor: route.supervisor.clone(),
@@ -13468,19 +13566,28 @@ mod tests {
             GpuRouteCatalogLookup::Successful(_)
         ));
         assert!(
-            route.supervisor.has_live_generation(),
+            route
+                .supervisor
+                .has_loaded_artifact(&artifact, AccelerationPreference::Gpu),
             "expired partial-probe recovery must not retire the healthy warm winner"
         );
 
-        route.supervisor.retire().expect("test worker retires");
-        let retired_active = route.supervisor.has_live_generation().then_some(&active);
-        assert!(retired_active.is_none());
-        // Cold or retired routes cannot reuse the prior Hello snapshot,
-        // including its pre-load available-memory observation.
+        route.supervisor.unload().expect("test model unloads");
+        assert!(
+            route.supervisor.has_live_generation(),
+            "unload deliberately keeps the worker process alive"
+        );
+        let unloaded_active = route
+            .supervisor
+            .has_loaded_artifact(&artifact, AccelerationPreference::Gpu)
+            .then_some(&active);
+        assert!(unloaded_active.is_none());
+        // An unloaded model is cold even while its worker process remains
+        // alive, so it cannot reuse the prior available-memory observation.
         assert!(matches!(
             cache.auto_live_admission_lookup(
                 &fingerprint,
-                retired_active,
+                unloaded_active,
                 PowerSource::Ac,
                 now + GPU_PROVIDER_PROBE_BACKOFF + Duration::from_millis(1),
             ),
@@ -13488,6 +13595,8 @@ mod tests {
         ));
         assert!(cache.successful().is_none());
         assert_eq!(launcher.launches.load(Ordering::Acquire), 1);
+        route.supervisor.retire().expect("test worker retires");
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
