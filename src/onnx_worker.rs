@@ -10332,6 +10332,7 @@ mod tests {
             pcm_kind: bool,
         },
         RuntimeFailureOnLoad(RuntimeError),
+        RuntimeLoad,
         RuntimeLoadThenExit,
         VadNormal,
         VadCrashOnWindow,
@@ -10734,6 +10735,35 @@ mod tests {
                         error: WireRuntimeError::from_runtime(&error),
                     },
                 );
+            }
+            TestMode::RuntimeLoad => {
+                let (session_id, request_id, control) = read_parent_control(&mut input);
+                let Control::LoadRuntime { preference, .. } = control else {
+                    panic!("expected runtime load request");
+                };
+                respond(
+                    &mut output,
+                    session_id,
+                    request_id,
+                    Control::RuntimeLoaded {
+                        execution: WireRuntimeLoadExecution {
+                            diagnostics: WireRuntimeDiagnostics {
+                                resolved_acceleration: ResolvedAcceleration {
+                                    requested: preference,
+                                    resolved: ComputeDevice::Cpu,
+                                    diagnostic: None,
+                                    selection: None,
+                                },
+                                runtime_location: PathBuf::from("test-worker-runtime"),
+                                warm_reused: false,
+                                model_load_duration_ms: 1,
+                            },
+                            detected_architecture: "test-runtime".to_owned(),
+                            capabilities: RuntimeCapabilities::default(),
+                        },
+                    },
+                );
+                run_normal_worker(&mut input, &mut output);
             }
             TestMode::RuntimeLoadThenExit => {
                 let (session_id, request_id, control) = read_parent_control(&mut input);
@@ -11264,6 +11294,7 @@ mod tests {
         let mut wrong_device = capability;
         wrong_device.devices[0].stable_device_identity = "native:pci:0000:02:00.0".to_owned();
         assert!(bind_pack_hello(&context, &wrong_device).is_err());
+        drop(binding);
         drop(bindings);
         drop(context);
         std::fs::remove_dir_all(root).unwrap();
@@ -11979,7 +12010,10 @@ mod tests {
         let mut target = backend_target(backend, identity, Some(0));
         target.driver_version = Some(driver.to_owned());
         target.pack = Some(crate::backend_policy::BackendPackIdentity {
-            pack_id: format!("scribe-{}-windows-x64", backend.label()),
+            pack_id: format!(
+                "scribe-{}-windows-x64",
+                backend.label().to_ascii_lowercase()
+            ),
             pack_version: "1.0.0".to_owned(),
             pack_digest: pack_digest.to_string().repeat(64),
             security_epoch: 1,
@@ -12071,7 +12105,7 @@ mod tests {
             string(vendor),
             string(device_class),
             target.memory_total_bytes,
-            target.memory_available_bytes,
+            target.memory_available_bytes.max(1),
             string(target.driver_version.as_deref().expect("fixture driver")),
             string(evidence_id),
         );
@@ -13190,7 +13224,7 @@ mod tests {
         let gpu_launcher = Arc::new(TestLauncher::new([TestMode::RuntimeFailureOnLoad(
             RuntimeError::OutOfMemory("fixture GPU allocation failed".to_owned()),
         )]));
-        let cpu_launcher = Arc::new(TestLauncher::new([TestMode::RuntimeLoadThenExit]));
+        let cpu_launcher = Arc::new(TestLauncher::new([TestMode::RuntimeLoad]));
         let mut gpu_route = verified_gpu_route(
             BackendKind::Cuda,
             "native:pci:0000:01:00.0",
@@ -13216,8 +13250,9 @@ mod tests {
             .record_probe(catalog.clone(), Instant::now());
         registry.gpu_routes_for_testing = Some(catalog);
 
+        let artifact = gguf_artifact_fixture("auto-cpu-fallback-after-oom");
         let execution = registry
-            .load(missing_gguf_artifact(), AccelerationPreference::Auto)
+            .load(artifact.artifact.clone(), AccelerationPreference::Auto)
             .expect("Auto must retain its guaranteed CPU fallback after a pre-output GPU OOM");
 
         assert_eq!(gpu_launcher.launches.load(Ordering::Acquire), 1);
@@ -13272,7 +13307,7 @@ mod tests {
         let _reset = ResetDeviceEpochRejection;
 
         let auto_gpu_launcher = Arc::new(TestLauncher::new([TestMode::Normal]));
-        let auto_cpu_launcher = Arc::new(TestLauncher::new([TestMode::RuntimeLoadThenExit]));
+        let auto_cpu_launcher = Arc::new(TestLauncher::new([TestMode::RuntimeLoad]));
         let mut auto_gpu_route = verified_gpu_route(
             BackendKind::Metal,
             "native:registry:metal-0",
@@ -13286,8 +13321,9 @@ mod tests {
         );
         auto_registry.gpu_routes_for_testing = Some(verified_gpu_catalog(vec![auto_gpu_route]));
 
+        let artifact = gguf_artifact_fixture("auto-rollback-fallback");
         let execution = auto_registry
-            .load(missing_gguf_artifact(), AccelerationPreference::Auto)
+            .load(artifact.artifact.clone(), AccelerationPreference::Auto)
             .expect("Auto must skip a request-bound rollback rejection and use CPU");
         assert_eq!(auto_gpu_launcher.launches.load(Ordering::Acquire), 0);
         assert_eq!(auto_cpu_launcher.launches.load(Ordering::Acquire), 1);
@@ -13374,7 +13410,7 @@ mod tests {
             let gpu_launcher = Arc::new(TestLauncher::new([TestMode::RuntimeFailureOnLoad(
                 runtime_error,
             )]));
-            let cpu_launcher = Arc::new(TestLauncher::new([TestMode::RuntimeLoadThenExit]));
+            let cpu_launcher = Arc::new(TestLauncher::new([TestMode::RuntimeLoad]));
             let mut gpu_route = verified_gpu_route(
                 BackendKind::Vulkan,
                 "native:pci:0000:01:00.0",
@@ -13387,8 +13423,10 @@ mod tests {
             );
             registry.gpu_routes_for_testing = Some(verified_gpu_catalog(vec![gpu_route]));
 
+            let artifact =
+                gguf_artifact_fixture(&format!("auto-provider-failure-{expected_category:?}"));
             let execution = registry
-                .load(missing_gguf_artifact(), AccelerationPreference::Auto)
+                .load(artifact.artifact.clone(), AccelerationPreference::Auto)
                 .expect("a typed pre-output provider failure must retain Auto's CPU fallback");
 
             assert_eq!(gpu_launcher.launches.load(Ordering::Acquire), 1);
@@ -13410,7 +13448,7 @@ mod tests {
         let first_launcher = Arc::new(TestLauncher::new([TestMode::RuntimeFailureOnLoad(
             RuntimeError::OutOfMemory("fixture GPU allocation failed".to_owned()),
         )]));
-        let second_launcher = Arc::new(TestLauncher::new([TestMode::RuntimeLoadThenExit]));
+        let second_launcher = Arc::new(TestLauncher::new([TestMode::RuntimeLoad]));
         let cpu_launcher = Arc::new(TestLauncher::new([]));
         let mut first = verified_gpu_route(
             BackendKind::Cuda,
@@ -13446,8 +13484,9 @@ mod tests {
             inference_supervisor_with_launcher(Arc::clone(&cpu_launcher)),
         );
         registry.gpu_routes_for_testing = Some(catalog);
+        let artifact = gguf_artifact_fixture("auto-second-gpu-fallback");
         let execution = registry
-            .load(missing_gguf_artifact(), AccelerationPreference::Auto)
+            .load(artifact.artifact.clone(), AccelerationPreference::Auto)
             .expect("the second qualified GPU route should win after a pre-output OOM");
 
         assert_eq!(first_launcher.launches.load(Ordering::Acquire), 1);
@@ -13702,6 +13741,7 @@ mod tests {
             'a',
         );
         let target = route.target.as_mut().unwrap();
+        target.provider_id = ProviderIdentity::new("transcribe-cpp-ggml-cuda");
         target.memory_available_bytes = 0;
         let model_digest = "b".repeat(64);
         let policy = fixture_auto_policy(target, &model_digest, "low-vram-backoff-fixture-v1");
@@ -13760,7 +13800,9 @@ mod tests {
             "windows-display:32.0.16.1088",
             'a',
         );
-        let target = route.target.as_ref().unwrap();
+        let mut route = route;
+        let target = route.target.as_mut().unwrap();
+        target.provider_id = ProviderIdentity::new("transcribe-cpp-ggml-cuda");
         let model_digest = "b".repeat(64);
         let policy = fixture_auto_policy(target, &model_digest, "power-backoff-fixture-v1");
         let qualified = auto_qualified_gpu_route_catalog_with_admission(
