@@ -44,7 +44,7 @@ pub(crate) fn acceleration_diagnostics(
     {
         "A GPU is temporarily quarantined".to_owned()
     } else {
-        "No GPU quarantine is active".to_owned()
+        "No quarantine reported".to_owned()
     };
     let fallback_status = if !selection.fallback_history.is_empty() {
         "A bounded fallback was used".to_owned()
@@ -394,5 +394,16 @@ mod tests {
         ] {
             assert!(!visible.contains(private_value), "leaked {private_value}");
         }
+
+        let mut without_reported_quarantine = resolved.clone();
+        without_reported_quarantine
+            .selection
+            .as_mut()
+            .unwrap()
+            .skipped_targets
+            .clear();
+        let view = acceleration_diagnostics(Some(&without_reported_quarantine), false)
+            .expect("selection without a reported quarantine projects");
+        assert_eq!(view.quarantine_status, "No quarantine reported");
     }
 }

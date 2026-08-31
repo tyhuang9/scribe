@@ -6870,12 +6870,12 @@ mod tests {
             "Studio GPU",
             "scribe-gpu · 1.2.3",
             "Plugged in",
-            "CUDA (Office GPU) failed: out of memory; next: Vulkan (Studio GPU)",
+            "• CUDA (Office GPU) failed: out of memory; next: Vulkan (Studio GPU)",
             "Retry GPU",
         ] {
             assert!(
                 names.iter().any(|name| name == visible),
-                "missing {visible}"
+                "missing {visible}; rendered names: {names:?}"
             );
         }
         let retry = named_node_bounds(&output, "Retry GPU");
