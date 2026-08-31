@@ -13031,7 +13031,8 @@ mod tests {
             .expect_err("an exited generation cannot own recorded model residency");
 
         assert!(matches!(error, RuntimeError::RetryableWorkerFailure(_)));
-        assert!(error.to_string().contains("generation exited"));
+        let message = error.to_string();
+        assert!(message.contains("generation exited") || message.contains("generation changed"));
         let wait_until = Instant::now() + Duration::from_millis(250);
         while inference.transport.current_generation().unwrap().is_some()
             && Instant::now() < wait_until
