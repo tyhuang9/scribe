@@ -2707,6 +2707,7 @@ pub struct LocalTranscriberApp {
     raw_transcript: String,
     status_message: String,
     transcribe_notice: Option<TranscribeNotice>,
+    gpu_retry_status: Option<TranscribeNotice>,
     latest_acceleration: Option<ModelAccelerationState>,
     acceleration_generation: u64,
     next_gpu_retry_nonce: u64,
@@ -2945,6 +2946,7 @@ impl LocalTranscriberApp {
             raw_transcript: String::new(),
             status_message,
             transcribe_notice: None,
+            gpu_retry_status: None,
             latest_acceleration: None,
             acceleration_generation: 0,
             next_gpu_retry_nonce: 0,
@@ -6313,6 +6315,9 @@ impl LocalTranscriberApp {
                             {
                                 self.status = TranscriptionStatus::Idle;
                                 self.status_message = "GPU retry could not be completed".to_owned();
+                                self.gpu_retry_status = Some(TranscribeNotice::failure(
+                                    "GPU retry could not be completed. The previous selection remains active.",
+                                ));
                                 self.transcribe_notice = Some(TranscribeNotice::failure(
                                     "GPU retry could not be completed. The previous selection remains active.",
                                 ));
@@ -6324,12 +6329,17 @@ impl LocalTranscriberApp {
                             );
                             self.status = TranscriptionStatus::Idle;
                             self.status_message = "GPU retry completed".to_owned();
+                            self.gpu_retry_status =
+                                Some(TranscribeNotice::information("GPU retry completed."));
                             self.transcribe_notice =
                                 Some(TranscribeNotice::information("GPU retry completed."));
                         }
                         Err(_) => {
                             self.status = TranscriptionStatus::Idle;
                             self.status_message = "GPU retry could not be completed".to_owned();
+                            self.gpu_retry_status = Some(TranscribeNotice::failure(
+                                "GPU retry could not be completed. The previous selection remains active.",
+                            ));
                             self.transcribe_notice = Some(TranscribeNotice::failure(
                                 "GPU retry could not be completed. The previous selection remains active.",
                             ));
@@ -9700,6 +9710,7 @@ impl eframe::App for LocalTranscriberApp {
 impl LocalTranscriberApp {
     fn invalidate_acceleration_state(&mut self) {
         self.acceleration_generation = self.acceleration_generation.wrapping_add(1);
+        self.gpu_retry_status = None;
         self.latest_acceleration = None;
         self.active_gpu_retry = None;
     }
@@ -9717,6 +9728,7 @@ impl LocalTranscriberApp {
         model_id: &ModelId,
         resolved: crate::transcription::ResolvedAcceleration,
     ) {
+        self.gpu_retry_status = None;
         let retry_target = resolved
             .selection
             .as_ref()
@@ -9760,6 +9772,11 @@ impl LocalTranscriberApp {
                     Some(&latest.resolved),
                     latest.retry_target.is_some() && self.active_gpu_retry.is_none(),
                 )
+                .map(|mut view| {
+                    view.retry_gpu_in_flight = self.active_gpu_retry.is_some();
+                    view.retry_gpu_status = self.gpu_retry_status.clone();
+                    view
+                })
             })
             .flatten()
     }
@@ -9796,6 +9813,7 @@ impl LocalTranscriberApp {
         }
         let nonce = self.next_gpu_retry_nonce();
         let generation = self.acceleration_generation;
+        self.gpu_retry_status = None;
         self.active_gpu_retry = Some(GpuRetryOperation {
             nonce,
             generation,
@@ -20323,6 +20341,7 @@ mod layout_tests {
             raw_transcript: String::new(),
             status_message: "Ready".to_owned(),
             transcribe_notice: None,
+            gpu_retry_status: None,
             latest_acceleration: None,
             acceleration_generation: 0,
             next_gpu_retry_nonce: 0,

@@ -1,6 +1,6 @@
 //! Thin mappings between the live application runtime and backend-neutral screens.
 
-use crate::backend_policy::{BackendSelectionReason, BackendSkipReason};
+use crate::backend_policy::{BackendFailureCategory, BackendSelectionReason, BackendSkipReason};
 use crate::models::TranscriptionStatus;
 use crate::transcription::ResolvedAcceleration;
 
@@ -11,8 +11,9 @@ use super::state::{
 
 #[cfg(test)]
 use crate::backend_policy::{
-    BackendKind, BackendPackIdentity, BackendSelection, BackendTarget, DeviceClass, DeviceIdentity,
-    GpuVendor, PowerPolicyDecision, PowerSource, ProviderIdentity, SkippedBackend,
+    BackendFallback, BackendKind, BackendPackIdentity, BackendSelection, BackendTarget,
+    DeviceClass, DeviceIdentity, GpuVendor, PowerPolicyDecision, PowerSource, ProviderIdentity,
+    SkippedBackend,
 };
 
 /// Projects private runtime selection into labels safe for the settings UI.
@@ -54,6 +55,26 @@ pub(crate) fn acceleration_diagnostics(
     } else {
         "No fallback was needed".to_owned()
     };
+    let fallback_details = selection
+        .fallback_history
+        .iter()
+        .enumerate()
+        .map(|(index, fallback)| {
+            let next = selection
+                .fallback_history
+                .get(index + 1)
+                .map(|next| &next.target)
+                .unwrap_or(target);
+            format!(
+                "{} ({}) failed: {}; next: {} ({})",
+                fallback.target.backend.label(),
+                fallback.target.display_name,
+                fallback_category_label(fallback.category),
+                next.backend.label(),
+                next.display_name,
+            )
+        })
+        .collect::<Vec<_>>();
     let pack = target.pack.as_ref();
     Some(AccelerationDiagnosticsView {
         selected_backend: target.backend.label().to_owned(),
@@ -63,11 +84,33 @@ pub(crate) fn acceleration_diagnostics(
         pack_id: pack.map(|pack| pack.pack_id.clone()),
         pack_version: pack.map(|pack| pack.pack_version.clone()),
         driver: target.driver_version.clone(),
+        power_source: power_source_label(selection.power_source).to_owned(),
         power_policy: selection.power_policy.label().to_owned(),
         quarantine_status,
         fallback_status,
+        fallback_details,
         retry_gpu_available,
+        retry_gpu_in_flight: false,
+        retry_gpu_status: None,
     })
+}
+
+fn power_source_label(source: crate::backend_policy::PowerSource) -> &'static str {
+    match source {
+        crate::backend_policy::PowerSource::Ac => "Plugged in",
+        crate::backend_policy::PowerSource::Battery => "Battery",
+        crate::backend_policy::PowerSource::Unknown => "Unknown",
+    }
+}
+
+fn fallback_category_label(category: BackendFailureCategory) -> &'static str {
+    match category {
+        BackendFailureCategory::BackendUnavailable => "backend unavailable",
+        BackendFailureCategory::InitializationFailed => "initialization failed",
+        BackendFailureCategory::OutOfMemory => "out of memory",
+        BackendFailureCategory::DeviceLost => "device lost",
+        BackendFailureCategory::WorkerFailed => "worker failed",
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -301,7 +344,14 @@ mod tests {
             power_policy: PowerPolicyDecision::Unrestricted,
             qualification_policy_version: 2,
             fallback_targets: Vec::new(),
-            fallback_history: Vec::new(),
+            fallback_history: vec![BackendFallback {
+                target: BackendTarget {
+                    backend: BackendKind::Cuda,
+                    display_name: "Office GPU".into(),
+                    ..target.clone()
+                },
+                category: BackendFailureCategory::OutOfMemory,
+            }],
             skipped_targets: vec![SkippedBackend {
                 target: BackendTarget {
                     display_name: "Office GPU".into(),
@@ -325,6 +375,11 @@ mod tests {
         assert_eq!(view.pack_id.as_deref(), Some("scribe-gpu"));
         assert_eq!(view.pack_version.as_deref(), Some("1.2.3"));
         assert_eq!(view.driver.as_deref(), Some("32.0.16.1088"));
+        assert_eq!(view.power_source, "Plugged in");
+        assert_eq!(
+            view.fallback_details,
+            ["CUDA (Office GPU) failed: out of memory; next: Vulkan (Studio GPU)"]
+        );
         assert!(
             view.skipped_reasons
                 .iter()

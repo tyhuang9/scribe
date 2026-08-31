@@ -238,10 +238,16 @@ impl Fixture {
                 pack_id: Some("scribe-gpu".into()),
                 pack_version: Some("1.2.3".into()),
                 driver: Some("32.0.16.1088".into()),
+                power_source: "Plugged in".into(),
                 power_policy: "All qualified devices allowed".into(),
                 quarantine_status: "A GPU is temporarily quarantined".into(),
-                fallback_status: "No fallback was needed".into(),
+                fallback_status: "A bounded fallback was used".into(),
+                fallback_details: vec![
+                    "CUDA (Office GPU) failed: out of memory; next: Vulkan (Studio GPU)".into(),
+                ],
                 retry_gpu_available: true,
+                retry_gpu_in_flight: false,
+                retry_gpu_status: None,
             }),
             ..Default::default()
         };
@@ -6820,6 +6826,8 @@ mod tests {
             "Vulkan",
             "Studio GPU",
             "scribe-gpu · 1.2.3",
+            "Plugged in",
+            "CUDA (Office GPU) failed: out of memory; next: Vulkan (Studio GPU)",
             "Retry GPU",
         ] {
             assert!(
@@ -6845,13 +6853,13 @@ mod tests {
             .acceleration_diagnostics
             .as_mut()
             .expect("diagnostics fixture")
-            .retry_gpu_available = false;
+            .retry_gpu_in_flight = true;
 
         let (output, action) =
             render_with_input(&ctx, &mut data, &mut page, 960.0, 680.0, Vec::new());
         assert_eq!(action, ScreenAction::None);
-        let retry_id = named_node_id(&output, "Retry GPU");
-        let retry = node_matching(&output, |node| node.name() == Some("Retry GPU"));
+        let retry_id = named_node_id(&output, "Retrying…");
+        let retry = node_matching(&output, |node| node.name() == Some("Retrying…"));
         assert!(retry.is_disabled());
 
         let (_, action) = render_with_input(
@@ -6869,5 +6877,56 @@ mod tests {
             )],
         );
         assert_eq!(action, ScreenAction::None);
+
+        let diagnostics = data
+            .settings
+            .acceleration_diagnostics
+            .as_mut()
+            .expect("diagnostics fixture");
+        diagnostics.retry_gpu_in_flight = false;
+        diagnostics.retry_gpu_available = false;
+        let (output, action) =
+            render_with_input(&ctx, &mut data, &mut page, 960.0, 680.0, Vec::new());
+        assert_eq!(action, ScreenAction::None);
+        let retry = node_matching(&output, |node| node.name() == Some("Retry GPU"));
+        assert!(retry.is_disabled());
+
+        let mut status_data = Fixture::TranscribeReady.data();
+        status_data
+            .settings
+            .acceleration_diagnostics
+            .as_mut()
+            .expect("diagnostics fixture")
+            .retry_gpu_status = Some(TranscribeNotice::failure(
+            "GPU retry could not be completed. The previous selection remains active.",
+        ));
+        let mut status_page = Fixture::TranscribeReady.page();
+        let status_output = render_with_input(
+            &ctx,
+            &mut status_data,
+            &mut status_page,
+            960.0,
+            680.0,
+            Vec::new(),
+        )
+        .0;
+        assert!(node_names(&status_output).iter().any(|name| {
+            name == "GPU retry could not be completed. The previous selection remains active."
+        }));
+    }
+
+    #[test]
+    fn gpu_diagnostics_fit_a_narrow_phone_width() {
+        let output = render(Fixture::TranscribeReady, 375.0, 800.0);
+        for name in [
+            "GPU diagnostics",
+            "Selected device",
+            "Power source",
+            "Retry GPU",
+        ] {
+            let bounds = named_node_bounds(&output, name);
+            assert!(bounds.x0 >= 0.0, "{name} starts outside the viewport");
+            assert!(bounds.x1 <= 375.0, "{name} extends beyond the viewport");
+        }
     }
 }

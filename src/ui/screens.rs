@@ -7051,6 +7051,9 @@ fn acceleration_diagnostics_panel(
                     ui.label(RichText::new("Selection").color(colors.muted_text));
                     ui.label(&diagnostics.selection_reason);
                     ui.end_row();
+                    ui.label(RichText::new("Power source").color(colors.muted_text));
+                    ui.label(&diagnostics.power_source);
+                    ui.end_row();
                     ui.label(RichText::new("Power policy").color(colors.muted_text));
                     ui.label(&diagnostics.power_policy);
                     ui.end_row();
@@ -7080,21 +7083,55 @@ fn acceleration_diagnostics_panel(
                     ui.label(format!("• {reason}"));
                 }
             }
-            ui.add_space(8.0);
-            let retry = ui.add_enabled(
-                diagnostics.retry_gpu_available,
-                egui::Button::new("Retry GPU").min_size(Vec2::new(120.0, 44.0)),
+            if !diagnostics.fallback_details.is_empty() {
+                ui.add_space(6.0);
+                ui.label(RichText::new("Fallback details").color(colors.muted_text));
+                for detail in &diagnostics.fallback_details {
+                    ui.label(format!("• {detail}"));
+                }
+            }
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(
+                    "Retry GPU retries the last GPU target only; it does not change your model or CPU setting.",
+                )
+                .small()
+                .color(colors.muted_text),
             );
-            if !diagnostics.retry_gpu_available {
+            ui.add_space(8.0);
+            let retry_label = if diagnostics.retry_gpu_in_flight {
+                "Retrying…"
+            } else {
+                "Retry GPU"
+            };
+            let retry = ui.add_enabled(
+                diagnostics.retry_gpu_available && !diagnostics.retry_gpu_in_flight,
+                egui::Button::new(retry_label).min_size(Vec2::new(120.0, 44.0)),
+            );
+            if diagnostics.retry_gpu_in_flight || !diagnostics.retry_gpu_available {
                 ui.ctx().accesskit_node_builder(retry.id, |builder| {
                     builder.set_disabled();
-                    builder.set_description(
-                        "GPU retry is unavailable for the current acceleration selection.",
-                    );
+                    builder.set_description(if diagnostics.retry_gpu_in_flight {
+                        "GPU retry is in progress."
+                    } else {
+                        "GPU retry is unavailable for the current acceleration selection."
+                    });
                 });
             }
             if retry.clicked() {
                 *action = ScreenAction::RetryGpu;
+            }
+            if let Some(status) = diagnostics.retry_gpu_status.as_ref() {
+                let color = if status.tone == TranscribeNoticeTone::Error {
+                    colors.error_text
+                } else {
+                    colors.muted_text
+                };
+                let response = ui.label(RichText::new(&status.message).color(color));
+                ui.ctx().accesskit_node_builder(response.id, |builder| {
+                    builder.set_live(egui::accesskit::Live::Polite);
+                    builder.set_live_atomic();
+                });
             }
         });
 }
@@ -7608,6 +7645,9 @@ fn advanced_settings_panel(
             });
         });
     });
+    if let Some(diagnostics) = settings.acceleration_diagnostics.as_ref() {
+        acceleration_diagnostics_panel(ui, diagnostics, action);
+    }
 }
 
 struct OptionalRetentionSetting<'a> {

@@ -98,10 +98,14 @@ pub(crate) struct AccelerationDiagnosticsView {
     pub pack_id: Option<String>,
     pub pack_version: Option<String>,
     pub driver: Option<String>,
+    pub power_source: String,
     pub power_policy: String,
     pub quarantine_status: String,
     pub fallback_status: String,
+    pub fallback_details: Vec<String>,
     pub retry_gpu_available: bool,
+    pub retry_gpu_in_flight: bool,
+    pub retry_gpu_status: Option<TranscribeNotice>,
 }
 
 impl TranscribeNotice {
