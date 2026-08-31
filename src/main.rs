@@ -43,6 +43,17 @@ mod hotkey;
 mod huggingface_catalog;
 mod installations;
 mod installed_manifest;
+#[cfg(any(
+    all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"),
+    test
+))]
+#[allow(
+    dead_code,
+    reason = "the desktop compiles Linux worker-local GPU routing only for contract tests"
+)]
+mod linux_gpu;
+#[cfg(test)]
+mod linux_gpu_architecture_guard;
 #[allow(
     dead_code,
     reason = "Stage 7 records a fail-closed Linux GPU platform contract before worker routing exists"

@@ -9,7 +9,10 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'runtime-manifests/linux-worker-install-contract-x86_64.json'
+      - 'runtime-manifests/gpu-auto-qualification-linux-x86_64.json'
+      - 'docs/LINUX_GPU_ROUTING.md'
       - 'scripts/linux-worker-launch-fixture.rs'
+      - 'scripts/linux-gpu-typecheck/**'
       - 'scripts/test-linux-worker-launch.sh'
       - 'src/**'
       - 'vendor/sherpa-onnx-sys/**'
@@ -21,7 +24,10 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'runtime-manifests/linux-worker-install-contract-x86_64.json'
+      - 'runtime-manifests/gpu-auto-qualification-linux-x86_64.json'
+      - 'docs/LINUX_GPU_ROUTING.md'
       - 'scripts/linux-worker-launch-fixture.rs'
+      - 'scripts/linux-gpu-typecheck/**'
       - 'scripts/test-linux-worker-launch.sh'
       - 'src/**'
       - 'vendor/sherpa-onnx-sys/**'
@@ -54,3 +60,13 @@ jobs:
           cargo check --locked --bin scribe-inference-worker --features inference-worker
       - name: Test descriptor-bound Linux worker launch
         run: ./scripts/test-linux-worker-launch.sh
+      - name: Type-check the feature-enabled Linux Vulkan identity branch
+        env:
+          CARGO_TARGET_DIR: target/linux-gpu-typecheck
+          RUSTFLAGS: -Dwarnings
+        run: cargo check --locked --manifest-path scripts/linux-gpu-typecheck/Cargo.toml --features vulkan-acceleration
+      - name: Type-check the feature-enabled Linux CUDA identity branch
+        env:
+          CARGO_TARGET_DIR: target/linux-gpu-typecheck
+          RUSTFLAGS: -Dwarnings
+        run: cargo check --locked --manifest-path scripts/linux-gpu-typecheck/Cargo.toml --features cuda-acceleration

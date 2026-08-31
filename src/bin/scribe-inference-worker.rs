@@ -48,6 +48,9 @@ mod gpu_worker_pack;
 #[path = "../inference_server.rs"]
 mod inference_server;
 #[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
+#[path = "../linux_gpu.rs"]
+mod linux_gpu;
+#[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
 #[allow(
     dead_code,
     reason = "the worker shares Linux entrypoint contracts but never launches another worker"

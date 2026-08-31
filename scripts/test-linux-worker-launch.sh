@@ -35,3 +35,20 @@ rustc --edition=2024 --test \
   cd "$repo_root"
   "$test_root/linux-worker-architecture-tests"
 )
+
+rustc --edition=2024 --test \
+  "$repo_root/src/linux_gpu.rs" \
+  -D warnings -A dead-code \
+  -o "$test_root/linux-gpu-routing-tests"
+
+"$test_root/linux-gpu-routing-tests" --test-threads=1
+
+rustc --edition=2024 --test \
+  "$repo_root/src/linux_gpu_architecture_guard.rs" \
+  -D warnings \
+  -o "$test_root/linux-gpu-architecture-tests"
+
+(
+  cd "$repo_root"
+  "$test_root/linux-gpu-architecture-tests"
+)

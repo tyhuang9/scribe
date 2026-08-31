@@ -1,0 +1,14 @@
+[package]
+name = "scribe-linux-gpu-typecheck"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[features]
+cuda-acceleration = []
+vulkan-acceleration = ["dep:ash"]
+
+[dependencies]
+ash = { version = "=0.37.3", optional = true }
+
+[workspace]

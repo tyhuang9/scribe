@@ -1674,13 +1674,6 @@ fn worker_pack_capability(role: WorkerRole) -> Result<Option<WorkerPackCapabilit
         WorkerProvider::Cpu => bail!("CPU is not a GPU worker-pack backend"),
     };
     let expected_device_id = std::env::var(PACK_DEVICE_ID_ENV).ok();
-    let driver_catalog = PackDriverCatalog::discover()
-        .context("could not obtain authoritative GPU driver identity")?;
-    #[cfg(all(windows, feature = "vulkan-acceleration"))]
-    let mut vulkan_catalog = (expectation.backend == WorkerProvider::Vulkan)
-        .then(VulkanDeviceCatalog::discover)
-        .transpose()
-        .context("could not obtain Vulkan LUID/UUID identity")?;
     let provider_devices = transcribe_cpp::devices()
         .into_iter()
         .filter(|device| device.kind.trim().eq_ignore_ascii_case(expected_kind))
@@ -1688,6 +1681,121 @@ fn worker_pack_capability(role: WorkerRole) -> Result<Option<WorkerPackCapabilit
     if provider_devices.len() > MAX_PACK_DEVICES {
         bail!("compiled GPU provider exceeded the bounded device-list limit");
     }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
+    if matches!(
+        expectation.backend,
+        WorkerProvider::Cuda | WorkerProvider::Vulkan
+    ) {
+        use crate::linux_gpu::{
+            KernelLinuxGpuFactSource, LinuxGpuBackend, LinuxGpuVendor, ProviderLinuxGpuDevice,
+            route_provider_devices,
+        };
+
+        let backend = match expectation.backend {
+            WorkerProvider::Cuda => LinuxGpuBackend::Cuda,
+            WorkerProvider::Vulkan => LinuxGpuBackend::Vulkan,
+            WorkerProvider::Cpu | WorkerProvider::Metal => unreachable!("matched above"),
+        };
+        let provider = provider_devices
+            .iter()
+            .map(|device| {
+                let process_index = device.index.ok_or_else(|| {
+                    anyhow!("Linux GPU provider device has no live process index")
+                })?;
+                let display_name = [&device.description, &device.name]
+                    .into_iter()
+                    .map(|value| value.trim())
+                    .find(|value| !value.is_empty() && value.is_ascii())
+                    .ok_or_else(|| {
+                        anyhow!("Linux GPU provider device has no bounded display name")
+                    })?;
+                let normalized =
+                    format!("{} {}", device.name, device.description).to_ascii_lowercase();
+                let vendor = match backend {
+                    LinuxGpuBackend::Cuda => LinuxGpuVendor::Nvidia,
+                    LinuxGpuBackend::Vulkan if normalized.contains("nvidia") => {
+                        LinuxGpuVendor::Nvidia
+                    }
+                    LinuxGpuBackend::Vulkan
+                        if normalized.contains("amd") || normalized.contains("radeon") =>
+                    {
+                        LinuxGpuVendor::Amd
+                    }
+                    LinuxGpuBackend::Vulkan if normalized.contains("intel") => {
+                        LinuxGpuVendor::Intel
+                    }
+                    LinuxGpuBackend::Vulkan => LinuxGpuVendor::Other,
+                };
+                Ok(ProviderLinuxGpuDevice {
+                    process_index,
+                    native_identity_or_alias: device.device_id.clone(),
+                    display_name: display_name.to_owned(),
+                    vendor,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let routed = route_provider_devices(&KernelLinuxGpuFactSource, backend, &provider)
+            .map_err(anyhow::Error::msg)
+            .context("could not bind Linux GPU provider devices to kernel PCI identity")?;
+        let routed = routed
+            .into_iter()
+            .map(|device| (device.process_index, device))
+            .collect::<BTreeMap<_, _>>();
+        let devices = provider_devices
+            .into_iter()
+            .map(|device| {
+                let process_index = device.index.ok_or_else(|| {
+                    anyhow!("Linux GPU provider device has no live process index")
+                })?;
+                let routed = routed
+                    .get(&process_index)
+                    .ok_or_else(|| anyhow!("Linux GPU provider process index was not remapped"))?;
+                let display_name = [&device.description, &device.name]
+                    .into_iter()
+                    .map(|value| value.trim())
+                    .find(|value| !value.is_empty() && value.is_ascii())
+                    .ok_or_else(|| {
+                        anyhow!("Linux GPU provider device has no bounded display name")
+                    })?
+                    .to_owned();
+                let device_class = match device.device_type {
+                    DeviceType::Gpu => DeviceClass::DiscreteGpu,
+                    DeviceType::Igpu => DeviceClass::IntegratedGpu,
+                    DeviceType::Unknown | DeviceType::Cpu | DeviceType::Accel => {
+                        bail!("Linux GPU provider returned an incomplete or non-GPU device class")
+                    }
+                };
+                let vendor = match routed.vendor {
+                    LinuxGpuVendor::Nvidia => GpuVendor::Nvidia,
+                    LinuxGpuVendor::Amd => GpuVendor::Amd,
+                    LinuxGpuVendor::Intel => GpuVendor::Intel,
+                    LinuxGpuVendor::Other => GpuVendor::Other,
+                };
+                Ok(WorkerPackDeviceCapability {
+                    stable_device_identity: routed.stable_device_identity.clone(),
+                    process_index,
+                    display_name,
+                    driver_version: Some(routed.driver_identity.clone()),
+                    device_class,
+                    vendor,
+                    memory_total_bytes: device.memory_total,
+                    memory_available_bytes: device.memory_free.min(device.memory_total),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        return finish_worker_pack_capability(expectation, expected_device_id, devices);
+    }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
+    if expectation.backend == WorkerProvider::Metal {
+        bail!("Metal GPU worker pack requires macOS Metal acceleration");
+    }
+    let driver_catalog = PackDriverCatalog::discover()
+        .context("could not obtain authoritative GPU driver identity")?;
+    #[cfg(all(windows, feature = "vulkan-acceleration"))]
+    let mut vulkan_catalog = (expectation.backend == WorkerProvider::Vulkan)
+        .then(VulkanDeviceCatalog::discover)
+        .transpose()
+        .context("could not obtain Vulkan LUID/UUID identity")?;
     #[cfg(all(target_os = "macos", feature = "metal-acceleration"))]
     if expectation.backend == WorkerProvider::Metal {
         let provider = provider_devices
