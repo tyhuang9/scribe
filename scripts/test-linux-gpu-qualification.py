@@ -50,6 +50,11 @@ def metric_run(
         end_to_end_ms = 100 if target == "cpu" else gpu_warm_ms
     acquisition = identity["acquisition"]
     worker = identity["cpu_baseline"] if target == "cpu" else identity["gpu_worker"]
+    worker_generation = (
+        f"{acquisition['batch_id']}:{identity['lane_id']}:{mode}:{target}:{sequence:02}"
+        if mode == "cold"
+        else f"{acquisition['batch_id']}:{identity['lane_id']}:warm:{target}"
+    )
     record = {
         "acquisition_batch_id": acquisition["batch_id"],
         "backend_ms": end_to_end_ms - 10,
@@ -57,17 +62,13 @@ def metric_run(
         "execution": {
             "backend": "cpu" if target == "cpu" else identity["backend"],
             "device_memory_kind": "none" if target == "cpu" else identity["device"]["memory_model"],
-            "hello_sha256": digest(f"hello-{mode}-{target}-{sequence}"),
+            "hello_sha256": digest(f"hello-{worker_generation}"),
             "protocol_version": worker["protocol_version"],
             "provider_id": worker["provider_id"],
             "runtime_abi": worker["runtime_abi"],
             "stable_device_id": "cpu:host" if target == "cpu" else identity["device"]["stable_device_id"],
             "worker_build_id": worker["worker_build_id"],
-            "worker_generation": (
-                f"{acquisition['batch_id']}:{mode}:{target}:{sequence:02}"
-                if mode == "cold"
-                else f"{acquisition['batch_id']}:warm:{target}"
-            ),
+            "worker_generation": worker_generation,
             "worker_sha256": worker["worker_sha256"],
         },
         "failure_category": "none",
@@ -279,6 +280,22 @@ def refresh_lane_artifact_digests(lane: dict[str, Any]) -> None:
         event["artifact_sha256"] = hashlib.sha256(
             envelope_bytes("linux_gpu_qualification_lifecycle_artifact", record)
         ).hexdigest()
+
+
+def align_worker_generations(lane: dict[str, Any], *, preserve_hellos: bool = False) -> None:
+    acquisition = lane["identity"]["acquisition"]
+    lane_id = lane["identity"]["lane_id"]
+    for mode, target_sets in lane["run_sets"].items():
+        for target, runs in target_sets.items():
+            for run in runs:
+                generation = (
+                    f"{acquisition['batch_id']}:{lane_id}:{mode}:{target}:{run['sequence']:02}"
+                    if mode == "cold"
+                    else f"{acquisition['batch_id']}:{lane_id}:warm:{target}"
+                )
+                run["execution"]["worker_generation"] = generation
+                if not preserve_hellos:
+                    run["execution"]["hello_sha256"] = digest(f"hello-{generation}")
 
 
 def fixture_documents_for_lanes(
@@ -519,6 +536,7 @@ class QualificationFixtureTests(unittest.TestCase):
                 for event in lane["lifecycle"]:
                     event["driver_after"] = current_driver
                     event["driver_before"] = prior_driver if event["event"] == "driver_change" else current_driver
+                align_worker_generations(lane)
                 plan, evidence = fixture_documents(lane)
                 decision = self.parse_success(self.run_tool(plan, evidence))
                 self.assertTrue(decision["qualification_passed"])
@@ -600,10 +618,76 @@ class QualificationFixtureTests(unittest.TestCase):
                 result = self.run_tool(plan, evidence)
                 self.assertEqual(result.returncode, 1, result.stdout)
 
+    def test_hello_attestations_are_scoped_to_worker_generations(self) -> None:
+        valid = fixture_lane()
+        warm_gpu = valid["run_sets"]["warm"]["gpu"]
+        self.assertEqual(len({run["execution"]["worker_generation"] for run in warm_gpu}), 1)
+        self.assertEqual(len({run["execution"]["hello_sha256"] for run in warm_gpu}), 1)
+        cold_gpu = valid["run_sets"]["cold"]["gpu"]
+        self.assertEqual(len({run["execution"]["worker_generation"] for run in cold_gpu}), 5)
+        self.assertEqual(len({run["execution"]["hello_sha256"] for run in cold_gpu}), 5)
+
+        changed_warm = fixture_lane()
+        changed_warm["run_sets"]["warm"]["gpu"][1]["execution"]["hello_sha256"] = digest(
+            "new-hello-for-retained-generation"
+        )
+        warm_plan, warm_evidence = fixture_documents(changed_warm)
+        warm_result = self.run_tool(warm_plan, warm_evidence)
+        self.assertEqual(warm_result.returncode, 1)
+        self.assertIn("multiple Hello", warm_result.stderr)
+
+        reused_cold = fixture_lane()
+        reused_cold["run_sets"]["cold"]["gpu"][1]["execution"]["hello_sha256"] = reused_cold[
+            "run_sets"
+        ]["cold"]["gpu"][0]["execution"]["hello_sha256"]
+        cold_plan, cold_evidence = fixture_documents(reused_cold)
+        cold_result = self.run_tool(cold_plan, cold_evidence)
+        self.assertEqual(cold_result.returncode, 1)
+        self.assertIn("distinct worker generations", cold_result.stderr)
+
+    def test_version_parser_matches_linux_runtime_contract(self) -> None:
+        for glibc in ("2.35", "2.39.0"):
+            self.assertTrue(
+                qualification.runtime_version_at_least(glibc, (2, 35), kernel_release=False)
+            )
+        for kernel in ("5.15.0-1092-azure", "6.8", "6.8.0-1030-nvidia-64k"):
+            self.assertTrue(
+                qualification.runtime_version_at_least(kernel, (5, 15), kernel_release=True)
+            )
+        for glibc in (
+            "2.34",
+            "2.35.not-a-version",
+            "2.35 ",
+            "2.35-1",
+            "65536.35",
+            "2.35.0.1",
+        ):
+            self.assertFalse(
+                qualification.runtime_version_at_least(glibc, (2, 35), kernel_release=False),
+                glibc,
+            )
+        for kernel in (
+            "5.14",
+            "5.15.not-a-version",
+            "5.15.0-",
+            "5.15.0-generic/evil",
+            "5.15.0-azure evil",
+            "5.15.0-générique",
+            "5.15.0-rc1",
+            "5.15.0-generic",
+            "5.15.0.1",
+            f"5.15.0-{'1' + 'a' * 64}",
+        ):
+            self.assertFalse(
+                qualification.runtime_version_at_least(kernel, (5, 15), kernel_release=True),
+                kernel,
+            )
+
     def test_cross_lane_artifact_and_attestation_reuse_is_rejected(self) -> None:
         first = fixture_lane()
         second = fixture_lane()
         second["identity"]["lane_id"] = "fixture-ubuntu-22.04-nvidia-cuda-second"
+        align_worker_generations(second)
         plan, evidence = fixture_documents_for_lanes([first, second])
         result = self.run_tool(plan, evidence)
         self.assertEqual(result.returncode, 1)
@@ -619,6 +703,7 @@ class QualificationFixtureTests(unittest.TestCase):
         old_lane_id = second["identity"]["lane_id"]
         new_lane_id = f"{old_lane_id}-second"
         second["identity"]["lane_id"] = new_lane_id
+        align_worker_generations(second)
         second["acquisition_artifact_path"] = second["acquisition_artifact_path"].replace(
             old_lane_id, new_lane_id, 1
         )
@@ -639,6 +724,7 @@ class QualificationFixtureTests(unittest.TestCase):
         old_lane_id = second["identity"]["lane_id"]
         new_lane_id = f"{old_lane_id}-second"
         second["identity"]["lane_id"] = new_lane_id
+        align_worker_generations(second, preserve_hellos=True)
         second["acquisition_artifact_path"] = second["acquisition_artifact_path"].replace(
             old_lane_id, new_lane_id, 1
         )

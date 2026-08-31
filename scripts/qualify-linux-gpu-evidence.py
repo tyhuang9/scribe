@@ -27,7 +27,6 @@ IDENTIFIER_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._:-]{0,159}$")
 PACK_COMPONENT_PATTERN = re.compile(r"^[a-z0-9](?:[a-z0-9._-]{0,94}[a-z0-9])?$")
 PCI_ID_PATTERN = re.compile(r"^native:pci:[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$")
 ARTIFACT_COMPONENT_PATTERN = re.compile(r"^[a-z0-9](?:[a-z0-9._-]{0,94}[a-z0-9])?$")
-VERSION_PATTERN = re.compile(r"^([0-9]+)\.([0-9]+)(?:\.[0-9]+)*(?:[-+._][a-z0-9.-]+)?$")
 DRIVER_IDENTITY_PATTERN = re.compile(r"^linux:[a-z0-9._-]+:[a-z0-9:._-]+$")
 CUDA_DRIVER_PATTERN = re.compile(r"^linux:nvidia:([0-9]+)\.([0-9]+)(?:\.[0-9]+)*$")
 SUPPORTED_UBUNTU = {"22.04", "24.04"}
@@ -112,6 +111,45 @@ def pack_component(value: Any, label: str) -> str:
     if PACK_COMPONENT_PATTERN.fullmatch(result) is None:
         fail(f"{label} is not a canonical pack component")
     return result
+
+
+def runtime_version_at_least(
+    value: str,
+    minimum: tuple[int, int],
+    *,
+    kernel_release: bool,
+) -> bool:
+    if not value or len(value) > 96 or not value.isascii():
+        return False
+    if "-" in value:
+        numeric, suffix = value.split("-", 1)
+        if (
+            not kernel_release
+            or not suffix
+            or len(suffix) > 64
+            or not suffix[0].isascii()
+            or not suffix[0].isdigit()
+            or any(
+                not character.isascii()
+                or not (character.isalnum() or character in "._+-")
+                for character in suffix
+            )
+        ):
+            return False
+    else:
+        numeric = value
+    parts = numeric.split(".")
+    if len(parts) not in {2, 3}:
+        return False
+    parsed: list[int] = []
+    for part in parts:
+        if not part or not part.isascii() or not part.isdigit():
+            return False
+        number = int(part)
+        if number > 65535:
+            return False
+        parsed.append(number)
+    return (parsed[0], parsed[1]) >= minimum
 
 
 def canonical_bytes(value: Any) -> bytes:
@@ -320,7 +358,8 @@ def validate_execution(
     identity: dict[str, Any],
     mode: str,
     sequence: int,
-    attestation_digests: set[str],
+    generation_hellos: dict[str, str],
+    hello_generations: dict[str, str],
 ) -> dict[str, Any]:
     execution = exact_keys(
         value,
@@ -343,9 +382,9 @@ def validate_execution(
     expected_stable_id = "cpu:host" if target == "cpu" else identity["device"]["stable_device_id"]
     expected_memory_kind = "none" if target == "cpu" else identity["device"]["memory_model"]
     expected_generation = (
-        f"{identity['acquisition']['batch_id']}:{mode}:{target}:{sequence:02}"
+        f"{identity['acquisition']['batch_id']}:{identity['lane_id']}:{mode}:{target}:{sequence:02}"
         if mode == "cold"
-        else f"{identity['acquisition']['batch_id']}:warm:{target}"
+        else f"{identity['acquisition']['batch_id']}:{identity['lane_id']}:warm:{target}"
     )
     expected_values = {
         "backend": expected_backend,
@@ -367,9 +406,17 @@ def validate_execution(
         if observed != expected:
             fail(f"{label}.{field} does not match the admitted execution target")
     hello = sha256_value(execution["hello_sha256"], f"{label}.hello_sha256")
-    if hello in attestation_digests:
-        fail("qualification evidence reuses a worker Hello attestation")
-    attestation_digests.add(hello)
+    generation = execution["worker_generation"]
+    prior_hello = generation_hellos.get(generation)
+    if prior_hello is not None:
+        if prior_hello != hello:
+            fail("one retained worker generation reported multiple Hello attestations")
+    else:
+        prior_generation = hello_generations.get(hello)
+        if prior_generation is not None:
+            fail("distinct worker generations reused one Hello attestation")
+        generation_hellos[generation] = hello
+        hello_generations[hello] = generation
     return execution
 
 
@@ -529,13 +576,11 @@ def validate_identity(value: Any, label: str) -> dict[str, Any]:
         fail(f"{label}.ubuntu_version is outside the reviewed Ubuntu lanes")
     if json_string(identity["target_arch"], f"{label}.target_arch", 16) != "x86_64":
         fail(f"{label}.target_arch must be x86_64")
-    kernel_version = json_string(identity["kernel_version"], f"{label}.kernel_version", 128)
-    kernel_match = VERSION_PATTERN.fullmatch(kernel_version)
-    if kernel_match is None or (int(kernel_match.group(1)), int(kernel_match.group(2))) < (5, 15):
+    kernel_version = json_string(identity["kernel_version"], f"{label}.kernel_version", 96)
+    if not runtime_version_at_least(kernel_version, (5, 15), kernel_release=True):
         fail(f"{label}.kernel_version is outside the reviewed Linux runtime contract")
-    glibc_version = json_string(identity["glibc_version"], f"{label}.glibc_version", 64)
-    glibc_match = VERSION_PATTERN.fullmatch(glibc_version)
-    if glibc_match is None or (int(glibc_match.group(1)), int(glibc_match.group(2))) < (2, 35):
+    glibc_version = json_string(identity["glibc_version"], f"{label}.glibc_version", 96)
+    if not runtime_version_at_least(glibc_version, (2, 35), kernel_release=False):
         fail(f"{label}.glibc_version is outside the reviewed Linux runtime contract")
     backend = json_string(identity["backend"], f"{label}.backend", 16)
     provider = identifier(identity["provider_id"], f"{label}.provider_id")
@@ -790,7 +835,8 @@ def validate_run(
     artifact_paths: set[str],
     artifact_root: pathlib.Path,
     artifact_budget: dict[str, int],
-    attestation_digests: set[str],
+    generation_hellos: dict[str, str],
+    hello_generations: dict[str, str],
     descriptor_bound: bool,
 ) -> dict[str, Any]:
     run = exact_keys(
@@ -855,7 +901,8 @@ def validate_run(
         identity,
         mode,
         expected_sequence,
-        attestation_digests,
+        generation_hellos,
+        hello_generations,
     )
     outcome = json_string(run["outcome"], f"{label}.outcome", 16)
     if outcome not in {"success", "failure"}:
@@ -1069,7 +1116,8 @@ def validate_lane_evidence(
     artifact_digests: set[str],
     artifact_paths: set[str],
     artifact_budget: dict[str, int],
-    attestation_digests: set[str],
+    generation_hellos: dict[str, str],
+    hello_generations: dict[str, str],
     descriptor_bound: bool,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     lane = exact_keys(
@@ -1127,7 +1175,8 @@ def validate_lane_evidence(
                     artifact_paths,
                     artifact_root,
                     artifact_budget,
-                    attestation_digests,
+                    generation_hellos,
+                    hello_generations,
                     descriptor_bound,
                 )
                 for offset, run in enumerate(raw_runs)
@@ -1252,7 +1301,8 @@ def decide(
         artifact_root = artifact_root.resolve()
     artifact_digests: set[str] = set()
     artifact_paths: set[str] = set()
-    attestation_digests: set[str] = set()
+    generation_hellos: dict[str, str] = {}
+    hello_generations: dict[str, str] = {}
     artifact_budget = {"count": 0, "bytes": 0}
     descriptor_bound = not fixture_only
     summaries = [
@@ -1265,7 +1315,8 @@ def decide(
             artifact_digests,
             artifact_paths,
             artifact_budget,
-            attestation_digests,
+            generation_hellos,
+            hello_generations,
             descriptor_bound,
         )[1]
         for index, (lane, expected) in enumerate(zip(evidence["lanes"], required_lanes))
