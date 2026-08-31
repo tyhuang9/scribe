@@ -5,6 +5,8 @@ on:
     paths:
       - '.github/workflows/linux-release-packaging.yml'
       - '.gitattributes'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
       - 'build.rs'
       - 'runtime-manifests/linux-release-package-x86_64.json'
       - 'runtime-manifests/gpu-auto-qualification-linux-x86_64.json'
@@ -26,6 +28,8 @@ on:
     paths:
       - '.github/workflows/linux-release-packaging.yml'
       - '.gitattributes'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
       - 'build.rs'
       - 'runtime-manifests/linux-release-package-x86_64.json'
       - 'runtime-manifests/gpu-auto-qualification-linux-x86_64.json'
