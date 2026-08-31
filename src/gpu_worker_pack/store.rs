@@ -2570,8 +2570,12 @@ fn move_file(source: &Path, destination: &Path, replace: bool) -> io::Result<()>
 }
 
 fn lock_file(file: &File) -> Result<(), PackStoreError> {
-    const MAX_ATTEMPTS: usize = 40;
-    const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(2);
+    // Native writes and directory flushes can exceed the old 80 ms window on
+    // loaded or power-throttled systems. Keep contention bounded below the
+    // two-second caller contract while allowing a normal in-flight mutation
+    // to finish instead of surfacing a spurious persistence failure.
+    const MAX_ATTEMPTS: usize = 100;
+    const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(5);
 
     for attempt in 0..MAX_ATTEMPTS {
         match try_lock_file(file) {
