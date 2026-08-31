@@ -228,6 +228,24 @@ impl BackendTarget {
         }
     }
 
+    /// Compares only the stable runtime binding. Display and live resource
+    /// facts may change without widening an exact retry to another target.
+    pub(crate) fn has_same_runtime_identity(&self, other: &Self) -> bool {
+        self.backend == other.backend
+            && self.provider_id == other.provider_id
+            && self.device_id == other.device_id
+            && self.driver_version == other.driver_version
+            && self.pack == other.pack
+    }
+
+    pub(crate) fn is_gpu(&self) -> bool {
+        self.backend.is_gpu()
+    }
+
+    pub(crate) fn kind_label(&self) -> &'static str {
+        self.backend.label()
+    }
+
     fn is_structurally_valid(&self) -> bool {
         if self.backend.is_gpu() {
             self.device_class.is_gpu()
@@ -458,6 +476,17 @@ pub(crate) enum BackendSelectionReason {
     AutoCpuFallback,
 }
 
+impl BackendSelectionReason {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::RequestedCpu => "CPU was requested",
+            Self::RequestedGpu => "GPU was requested",
+            Self::AutoPriority => "Auto selected the highest-priority GPU",
+            Self::AutoCpuFallback => "Auto selected the CPU fallback",
+        }
+    }
+}
+
 /// Power constraint applied while resolving the request.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -466,6 +495,17 @@ pub(crate) enum PowerPolicyDecision {
     Unrestricted,
     BatteryEfficientGpuOnly,
     UnknownConservativeGpuOnly,
+}
+
+impl PowerPolicyDecision {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::NotApplied => "Power policy not applied",
+            Self::Unrestricted => "All qualified devices allowed",
+            Self::BatteryEfficientGpuOnly => "Battery mode allows efficient GPUs only",
+            Self::UnknownConservativeGpuOnly => "Unknown power state allows integrated GPUs only",
+        }
+    }
 }
 
 /// Typed reason an otherwise discovered target was not eligible.
@@ -482,6 +522,23 @@ pub(crate) enum BackendSkipReason {
     UnknownPowerSource,
     NotAutoQualified,
     FallbackBound,
+}
+
+impl BackendSkipReason {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::PlatformUnsupported => "unsupported on this platform",
+            Self::StructurallyInvalid => "device information was incomplete",
+            Self::Unaddressable => "device could not be addressed safely",
+            Self::Incompatible => "incompatible with this runtime",
+            Self::Unhealthy => "health check is pending",
+            Self::Quarantined => "temporarily quarantined after a failure",
+            Self::BatteryPolicy => "disabled by battery policy",
+            Self::UnknownPowerSource => "disabled because the power state is unknown",
+            Self::NotAutoQualified => "not qualified for Auto",
+            Self::FallbackBound => "outside the bounded fallback limit",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1393,6 +1450,18 @@ mod tests {
             Some(
                 "Auto selected CPU because the power source could not be verified, so discrete or unclassified GPUs are disabled."
             )
+        );
+    }
+
+    #[test]
+    fn diagnostics_label_unknown_power_policy_and_skip_reason() {
+        assert_eq!(
+            PowerPolicyDecision::UnknownConservativeGpuOnly.label(),
+            "Unknown power state allows integrated GPUs only"
+        );
+        assert_eq!(
+            BackendSkipReason::UnknownPowerSource.label(),
+            "disabled because the power state is unknown"
         );
     }
 

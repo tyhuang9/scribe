@@ -5988,13 +5988,6 @@ impl InferenceWorkerSupervisor {
             .max(1)
     }
 
-    #[cfg(test)]
-    fn has_live_generation(&self) -> bool {
-        self.transport
-            .current_generation_is_running()
-            .unwrap_or(false)
-    }
-
     fn artifact_identity(
         artifact: &RuntimeArtifact,
         preference: AccelerationPreference,
@@ -6013,6 +6006,13 @@ impl InferenceWorkerSupervisor {
         };
         self.transport
             .current_generation_has_active_model(&identity)
+            .unwrap_or(false)
+    }
+
+    #[cfg(test)]
+    fn has_live_generation(&self) -> bool {
+        self.transport
+            .current_generation_is_running()
             .unwrap_or(false)
     }
 
@@ -6620,13 +6620,54 @@ impl GpuRouteCatalogCache {
     }
 
     fn grant_explicit_probe_retry(&mut self, discovery_fingerprint: &str, now: Instant) -> bool {
-        let Some(failed) = self.failed.as_mut().filter(|failed| {
+        if let Some(failed) = self.failed.as_mut().filter(|failed| {
             failed.discovery_fingerprint == discovery_fingerprint && failed.explicit_retry_available
-        }) else {
+        }) {
+            failed.explicit_retry_available = false;
+            failed.retry_not_before = now;
+            self.successful = None;
+            return true;
+        }
+        // An exact retry may be requested after a successful catalog was
+        // invalidated by a runtime failure. Convert that current-fingerprint
+        // catalog into a one-shot reprobe grant without widening the target
+        // authority or allowing a stale catalog to be reused.
+        if self.successful.as_ref().is_some_and(|catalog| {
+            !catalog.routes.is_empty() && catalog.discovery_fingerprint == discovery_fingerprint
+        }) {
+            self.successful = None;
+            self.failed = Some(FailedGpuProbe {
+                discovery_fingerprint: discovery_fingerprint.to_owned(),
+                retry_not_before: now,
+                diagnostic: None,
+                explicit_retry_available: false,
+            });
+            return true;
+        }
+        false
+    }
+
+    fn seed_explicit_probe_retry(&mut self, discovery_fingerprint: &str, now: Instant) -> bool {
+        if self.failed.as_ref().is_some_and(|failed| {
+            failed.discovery_fingerprint == discovery_fingerprint && failed.explicit_retry_available
+        }) {
+            return true;
+        }
+        if self.successful.as_ref().is_some_and(|catalog| {
+            !catalog.routes.is_empty() && catalog.discovery_fingerprint == discovery_fingerprint
+        }) {
             return false;
-        };
-        failed.explicit_retry_available = false;
-        failed.retry_not_before = now;
+        }
+        // A runtime failure can invalidate the successful catalog before the
+        // next explicit action observes it. Seed only the current fingerprint
+        // so Retry GPU cannot revive stale provider/device facts.
+        self.successful = None;
+        self.failed = Some(FailedGpuProbe {
+            discovery_fingerprint: discovery_fingerprint.to_owned(),
+            retry_not_before: now,
+            diagnostic: None,
+            explicit_retry_available: false,
+        });
         true
     }
 
@@ -8113,6 +8154,7 @@ impl InferenceWorkerRegistry {
         let key = catalog.routes.iter().find_map(|route| {
             let candidate = route.target.as_ref()?;
             (candidate.backend == target.backend
+                && candidate.provider_id == target.provider_id
                 && candidate.device_id == target.device_id
                 && candidate.driver_version == target.driver_version
                 && candidate.pack == target.pack)
@@ -8137,6 +8179,131 @@ impl InferenceWorkerRegistry {
             })?
             .grant_explicit_probe_retry(&fingerprint, Instant::now());
         Ok(granted)
+    }
+
+    /// Re-probes the current provider catalog, then loads only the exact
+    /// backend/device/driver/pack target retained by the application. This is
+    /// intentionally separate from normal preference resolution so an
+    /// explicit retry cannot widen into another GPU or CPU fallback.
+    pub(crate) fn retry_gpu(
+        &self,
+        artifact: RuntimeArtifact,
+        target: &BackendTarget,
+    ) -> Result<RuntimeLoadExecution, RuntimeError> {
+        let RuntimeArtifact::Gguf(_) = &artifact else {
+            return Err(RuntimeError::OnnxUnavailable(
+                "GPU retry is available only for GGUF artifacts".to_owned(),
+            ));
+        };
+        let _route_execution = self.lock_route_execution()?;
+
+        #[cfg(test)]
+        let fixture_catalog = self.gpu_routes_for_testing.is_some();
+        #[cfg(not(test))]
+        let fixture_catalog = false;
+        if !fixture_catalog {
+            let discovery = crate::gpu_worker_pack::discover_production_pack_leases();
+            let fingerprint = explicit_gpu_discovery_fingerprint(&discovery);
+            let now = Instant::now();
+            let seeded = self
+                .gpu_routes
+                .lock()
+                .map_err(|_| {
+                    RuntimeError::WorkerUnavailable("GPU worker registry lock poisoned".to_owned())
+                })?
+                .grant_explicit_probe_retry(&fingerprint, now);
+            if !seeded {
+                // Runtime invalidation clears the catalog. Re-arm exactly the
+                // current fingerprint so the provider reprobe remains
+                // explicit and one-shot.
+                let seeded = self
+                    .gpu_routes
+                    .lock()
+                    .map_err(|_| {
+                        RuntimeError::WorkerUnavailable(
+                            "GPU worker registry lock poisoned".to_owned(),
+                        )
+                    })?
+                    .seed_explicit_probe_retry(&fingerprint, now);
+                if !seeded {
+                    return Err(Self::no_route_error(AccelerationPreference::Gpu));
+                }
+            }
+            let _ = self.routes_for_preference(AccelerationPreference::Gpu, &artifact)?;
+            let _ = self.grant_explicit_gpu_retry(&artifact, target)?;
+        }
+
+        let plan = self.routes_for_preference(AccelerationPreference::Gpu, &artifact)?;
+        let route = plan.routes.iter().find(|route| {
+            route.target.as_ref().is_some_and(|candidate| {
+                candidate.backend == target.backend
+                    && candidate.provider_id == target.provider_id
+                    && candidate.device_id == target.device_id
+                    && candidate.driver_version == target.driver_version
+                    && candidate.pack == target.pack
+            })
+        });
+        let Some(route) = route else {
+            return Err(RuntimeError::WorkerUnavailable(
+                "the requested GPU retry target is no longer available".to_owned(),
+            ));
+        };
+        if plan
+            .health
+            .as_ref()
+            .is_some_and(|health| !health.consume_retry(route))
+        {
+            return Err(RuntimeError::WorkerUnavailable(
+                "the requested GPU retry target is not authorized for retry".to_owned(),
+            ));
+        }
+        self.prepare_route(route).map_err(|error| match error {
+            RoutePreparationError::Fatal(error) => error,
+            RoutePreparationError::DeviceRollbackAuthority(error) => {
+                RuntimeError::WorkerUnavailable(format!(
+                    "{error}; CPU fallback is forbidden for explicit GPU"
+                ))
+            }
+        })?;
+        match route.supervisor.load(artifact, AccelerationPreference::Gpu) {
+            Ok(mut execution) => {
+                if execution
+                    .diagnostics
+                    .resolved_acceleration
+                    .selection
+                    .is_none()
+                {
+                    execution.diagnostics.resolved_acceleration.selection =
+                        Some(BackendSelection {
+                            requested: AccelerationPreference::Gpu,
+                            reason: BackendSelectionReason::RequestedGpu,
+                            target: target.clone(),
+                            power_source: PowerSource::current(),
+                            power_policy: PowerPolicyDecision::NotApplied,
+                            qualification_policy_version: AUTO_QUALIFICATION_POLICY_VERSION,
+                            fallback_targets: Vec::new(),
+                            fallback_history: Vec::new(),
+                            skipped_targets: plan.skipped_targets.clone(),
+                        });
+                }
+                append_pack_diagnostic(
+                    &mut execution.diagnostics.resolved_acceleration,
+                    plan.diagnostic.as_deref(),
+                );
+                Ok(execution)
+            }
+            Err(error) => {
+                if let Some(health) = &plan.health {
+                    health.record_failure(
+                        route,
+                        health_observation_for_runtime_error(&error, false, false),
+                    );
+                }
+                self.invalidate_gpu_catalog_after_runtime_failure(route)?;
+                self.retire_failed_route(route)?;
+                Err(error)
+            }
+        }
     }
 
     fn no_route_error(preference: AccelerationPreference) -> RuntimeError {
@@ -12988,6 +13155,147 @@ mod tests {
         }
     }
 
+    fn explicit_retry_registry(
+        gpu_launcher: Arc<TestLauncher>,
+        cpu_launcher: Arc<TestLauncher>,
+    ) -> (InferenceWorkerRegistry, BackendTarget) {
+        let mut route = verified_gpu_route(
+            BackendKind::Vulkan,
+            "native:pci:0000:01:00.0",
+            "windows-display:32.0.16.1088",
+            'a',
+        );
+        let target = route.target.clone().expect("fixture GPU target");
+        route.supervisor = inference_supervisor_with_launcher(gpu_launcher);
+        let mut registry = InferenceWorkerRegistry::with_cpu_supervisor(
+            inference_supervisor_with_launcher(cpu_launcher),
+        );
+        registry.gpu_routes_for_testing = Some(verified_gpu_catalog(vec![route]));
+        (registry, target)
+    }
+
+    #[test]
+    fn explicit_gpu_retry_loads_only_the_exact_target_without_cpu_fallback() {
+        let gpu_launcher = Arc::new(TestLauncher::new([TestMode::RuntimeLoad]));
+        let cpu_launcher = Arc::new(TestLauncher::new([]));
+        let (registry, target) =
+            explicit_retry_registry(Arc::clone(&gpu_launcher), Arc::clone(&cpu_launcher));
+
+        let artifact = gguf_artifact_fixture("explicit-gpu-retry-success");
+        let execution = registry
+            .retry_gpu(artifact.artifact.clone(), &target)
+            .expect("exact GPU retry should load the retained target");
+        let selection = execution
+            .diagnostics
+            .resolved_acceleration
+            .selection
+            .expect("exact retry should publish a typed selection");
+        assert_eq!(selection.target, target);
+        assert_eq!(selection.requested, AccelerationPreference::Gpu);
+        assert_eq!(selection.power_policy, PowerPolicyDecision::NotApplied);
+        assert_eq!(gpu_launcher.launches.load(Ordering::Acquire), 1);
+        assert_eq!(cpu_launcher.launches.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn explicit_gpu_retry_rejects_a_disappeared_or_changed_target_before_launch() {
+        for change in ["device", "pack"] {
+            let gpu_launcher = Arc::new(TestLauncher::new([]));
+            let cpu_launcher = Arc::new(TestLauncher::new([]));
+            let (registry, mut target) =
+                explicit_retry_registry(Arc::clone(&gpu_launcher), Arc::clone(&cpu_launcher));
+            if change == "device" {
+                target.device_id = DeviceIdentity::new("native:pci:0000:02:00.0");
+            } else {
+                target.pack.as_mut().expect("fixture pack").pack_version = "2.0.0".to_owned();
+            }
+
+            let error = registry
+                .retry_gpu(missing_gguf_artifact(), &target)
+                .expect_err("changed exact target must be denied");
+            assert!(error.to_string().contains("no longer available"));
+            assert_eq!(gpu_launcher.launches.load(Ordering::Acquire), 0);
+            assert_eq!(cpu_launcher.launches.load(Ordering::Acquire), 0);
+        }
+    }
+
+    #[test]
+    fn explicit_gpu_retry_allows_an_available_health_target_without_bypass() {
+        let root = test_root("gpu-explicit-retry-available");
+        let health_path = Arc::new(root.join("health.json"));
+        let artifact = gguf_artifact_fixture("gpu-explicit-retry-available");
+        let gpu_launcher = Arc::new(TestLauncher::new([TestMode::RuntimeLoad]));
+        let cpu_launcher = Arc::new(TestLauncher::new([]));
+        let (mut registry, target) =
+            explicit_retry_registry(Arc::clone(&gpu_launcher), Arc::clone(&cpu_launcher));
+        registry.gpu_health_path = Some(Arc::clone(&health_path));
+
+        registry
+            .retry_gpu(artifact.artifact.clone(), &target)
+            .expect("an available health target does not require a quarantine bypass");
+        assert_eq!(gpu_launcher.launches.load(Ordering::Acquire), 1);
+        assert_eq!(cpu_launcher.launches.load(Ordering::Acquire), 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn explicit_gpu_retry_failure_invalidates_both_route_catalogs() {
+        let gpu_launcher = Arc::new(TestLauncher::new([TestMode::RuntimeFailureOnLoad(
+            RuntimeError::BackendUnavailable("fixture GPU disappeared".to_owned()),
+        )]));
+        let cpu_launcher = Arc::new(TestLauncher::new([]));
+        let (registry, target) =
+            explicit_retry_registry(Arc::clone(&gpu_launcher), Arc::clone(&cpu_launcher));
+        let catalog = registry
+            .gpu_routes_for_testing
+            .clone()
+            .expect("fixture catalog");
+        for cache in [&registry.gpu_routes, &registry.auto_gpu_routes] {
+            cache
+                .lock()
+                .unwrap()
+                .record_probe(catalog.clone(), Instant::now());
+        }
+
+        let artifact = gguf_artifact_fixture("explicit-gpu-retry-failure");
+        let error = registry
+            .retry_gpu(artifact.artifact.clone(), &target)
+            .expect_err("fixture runtime failure should be returned");
+        assert!(matches!(error, RuntimeError::BackendUnavailable(_)));
+        assert!(registry.gpu_routes.lock().unwrap().successful.is_none());
+        assert!(
+            registry
+                .auto_gpu_routes
+                .lock()
+                .unwrap()
+                .successful
+                .is_none()
+        );
+        assert_eq!(cpu_launcher.launches.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn registry_rejects_onnx_gpu_retry_before_launch() {
+        let root = test_root("gpu-retry-onnx");
+        let artifact = RuntimeArtifact::OnnxBundle(spec_with_roles(
+            &root,
+            OnnxModelFamily::NemoCtc,
+            NEMO_CTC_ROLES,
+        ));
+        let gpu_launcher = Arc::new(TestLauncher::new([]));
+        let cpu_launcher = Arc::new(TestLauncher::new([]));
+        let (registry, target) =
+            explicit_retry_registry(Arc::clone(&gpu_launcher), Arc::clone(&cpu_launcher));
+
+        let error = registry
+            .retry_gpu(artifact, &target)
+            .expect_err("ONNX must remain CPU-only");
+        assert!(matches!(error, RuntimeError::OnnxUnavailable(_)));
+        assert_eq!(gpu_launcher.launches.load(Ordering::Acquire), 0);
+        assert_eq!(cpu_launcher.launches.load(Ordering::Acquire), 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[cfg(windows)]
     #[test]
     #[ignore = "requires a clean-built fixture-signed Vulkan pack, pinned GGUF/WAV fixtures, and a compatible physical GPU"]
@@ -14346,9 +14654,10 @@ mod tests {
             route_execution: Arc::new(Mutex::new(())),
             gpu_routes_for_testing: None,
         };
+        let artifact = gguf_artifact_fixture("cpu-fallback-routes-retired");
         assert!(
             registry
-                .load(missing_gguf_artifact(), AccelerationPreference::Cpu)
+                .load(artifact.artifact.clone(), AccelerationPreference::Cpu)
                 .is_err()
         );
         assert_eq!(first.launches.load(Ordering::Acquire), 1);
@@ -14425,9 +14734,10 @@ mod tests {
                 skipped_targets: Vec::new(),
             }),
         };
+        let artifact = gguf_artifact_fixture("gpu-fallback-routes-retired");
         assert!(
             registry
-                .load(missing_gguf_artifact(), AccelerationPreference::Gpu)
+                .load(artifact.artifact.clone(), AccelerationPreference::Gpu)
                 .is_err()
         );
         assert_eq!(first.launches.load(Ordering::Acquire), 1);

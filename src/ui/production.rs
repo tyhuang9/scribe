@@ -1,11 +1,117 @@
 //! Thin mappings between the live application runtime and backend-neutral screens.
 
+use crate::backend_policy::{BackendFailureCategory, BackendSelectionReason, BackendSkipReason};
 use crate::models::TranscriptionStatus;
+use crate::transcription::ResolvedAcceleration;
 
 use super::state::{
-    MicrophonePermission, RecordingMode, SettingsSaveState, TranscribeNotice, TranscriptionPhase,
-    TranscriptionState,
+    AccelerationDiagnosticsView, MicrophonePermission, RecordingMode, SettingsSaveState,
+    TranscribeNotice, TranscriptionPhase, TranscriptionState,
 };
+
+#[cfg(test)]
+use crate::backend_policy::{
+    BackendFallback, BackendKind, BackendPackIdentity, BackendSelection, BackendTarget,
+    DeviceClass, DeviceIdentity, GpuVendor, PowerPolicyDecision, PowerSource, ProviderIdentity,
+    SkippedBackend,
+};
+
+/// Projects private runtime selection into labels safe for the settings UI.
+/// The projection deliberately omits stable identities, digests, paths, and
+/// native error details.
+pub(crate) fn acceleration_diagnostics(
+    resolved: Option<&ResolvedAcceleration>,
+    retry_gpu_available: bool,
+) -> Option<AccelerationDiagnosticsView> {
+    let selection = resolved?.selection.as_ref()?;
+    let target = &selection.target;
+    let skipped_reasons = selection
+        .skipped_targets
+        .iter()
+        .map(|skipped| {
+            format!(
+                "{} ({}) — {}",
+                skipped.target.kind_label(),
+                skipped.target.display_name,
+                skipped.reason.label()
+            )
+        })
+        .collect::<Vec<_>>();
+    let quarantine_status = if selection
+        .skipped_targets
+        .iter()
+        .any(|skipped| skipped.reason == BackendSkipReason::Quarantined)
+    {
+        "A GPU is temporarily quarantined".to_owned()
+    } else {
+        "No quarantine reported".to_owned()
+    };
+    let fallback_status = if !selection.fallback_history.is_empty() {
+        "A bounded fallback was used".to_owned()
+    } else if selection.reason == BackendSelectionReason::AutoCpuFallback {
+        "CPU fallback is active".to_owned()
+    } else if !selection.fallback_targets.is_empty() {
+        "A bounded fallback is available".to_owned()
+    } else {
+        "No fallback was needed".to_owned()
+    };
+    let fallback_details = selection
+        .fallback_history
+        .iter()
+        .enumerate()
+        .map(|(index, fallback)| {
+            let next = selection
+                .fallback_history
+                .get(index + 1)
+                .map(|next| &next.target)
+                .unwrap_or(target);
+            format!(
+                "{} ({}) failed: {}; next: {} ({})",
+                fallback.target.kind_label(),
+                fallback.target.display_name,
+                fallback_category_label(fallback.category),
+                next.kind_label(),
+                next.display_name,
+            )
+        })
+        .collect::<Vec<_>>();
+    let pack = target.pack.as_ref();
+    Some(AccelerationDiagnosticsView {
+        selected_backend: target.kind_label().to_owned(),
+        selected_device: target.display_name.clone(),
+        selection_reason: selection.reason.label().to_owned(),
+        skipped_reasons,
+        pack_id: pack.map(|pack| pack.pack_id.clone()),
+        pack_version: pack.map(|pack| pack.pack_version.clone()),
+        driver: target.driver_version.clone(),
+        power_source: power_source_label(selection.power_source).to_owned(),
+        power_policy: selection.power_policy.label().to_owned(),
+        quarantine_status,
+        fallback_status,
+        fallback_details,
+        retry_gpu_available,
+        retry_gpu_in_flight: false,
+        retry_gpu_status: None,
+    })
+}
+
+fn power_source_label(source: crate::backend_policy::PowerSource) -> &'static str {
+    match source {
+        crate::backend_policy::PowerSource::Ac => "Plugged in",
+        crate::backend_policy::PowerSource::Battery => "Battery",
+        crate::backend_policy::PowerSource::Unknown => "Unknown",
+    }
+}
+
+fn fallback_category_label(category: BackendFailureCategory) -> &'static str {
+    match category {
+        BackendFailureCategory::BackendUnavailable => "backend unavailable",
+        BackendFailureCategory::InitializationFailed => "initialization failed",
+        BackendFailureCategory::OutOfMemory => "out of memory",
+        BackendFailureCategory::DeviceLost => "device lost",
+        BackendFailureCategory::WorkerFailed => "worker failed",
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ModelReadiness {
@@ -207,5 +313,97 @@ mod tests {
         assert_eq!(state.phase, TranscriptionPhase::Ready);
         assert!(state.notice.is_none());
         assert_eq!(state.committed_transcript, "Keep this text");
+    }
+
+    #[test]
+    fn acceleration_diagnostics_projects_labels_without_private_runtime_identity() {
+        let target = BackendTarget {
+            backend: BackendKind::Vulkan,
+            provider_id: ProviderIdentity::new("provider-stable-secret"),
+            driver_version: Some("32.0.16.1088".into()),
+            device_id: DeviceIdentity::new("stable-device-secret"),
+            display_name: "Studio GPU".into(),
+            vendor: GpuVendor::Amd,
+            device_class: DeviceClass::DiscreteGpu,
+            memory_total_bytes: 8 * 1024 * 1024 * 1024,
+            memory_available_bytes: 7 * 1024 * 1024 * 1024,
+            pack: Some(BackendPackIdentity {
+                pack_id: "scribe-gpu".into(),
+                pack_version: "1.2.3".into(),
+                pack_digest: "pack-digest-secret".into(),
+                security_epoch: 7,
+                runtime_abi: 4,
+            }),
+            process_index: Some(3),
+        };
+        let selection = BackendSelection {
+            requested: crate::transcription::AccelerationPreference::Gpu,
+            target: target.clone(),
+            reason: BackendSelectionReason::RequestedGpu,
+            power_source: PowerSource::Ac,
+            power_policy: PowerPolicyDecision::Unrestricted,
+            qualification_policy_version: 2,
+            fallback_targets: Vec::new(),
+            fallback_history: vec![BackendFallback {
+                target: BackendTarget {
+                    backend: BackendKind::Cuda,
+                    display_name: "Office GPU".into(),
+                    ..target.clone()
+                },
+                category: BackendFailureCategory::OutOfMemory,
+            }],
+            skipped_targets: vec![SkippedBackend {
+                target: BackendTarget {
+                    display_name: "Office GPU".into(),
+                    ..target.clone()
+                },
+                reason: BackendSkipReason::Quarantined,
+            }],
+        };
+        let resolved = ResolvedAcceleration {
+            requested: crate::transcription::AccelerationPreference::Gpu,
+            resolved: crate::transcription::ComputeDevice::Gpu {
+                name: "Studio GPU".into(),
+            },
+            diagnostic: Some("raw native error must stay private".into()),
+            selection: Some(selection),
+        };
+
+        let view = acceleration_diagnostics(Some(&resolved), true).expect("selection projects");
+        assert_eq!(view.selected_backend, "Vulkan");
+        assert_eq!(view.selected_device, "Studio GPU");
+        assert_eq!(view.pack_id.as_deref(), Some("scribe-gpu"));
+        assert_eq!(view.pack_version.as_deref(), Some("1.2.3"));
+        assert_eq!(view.driver.as_deref(), Some("32.0.16.1088"));
+        assert_eq!(view.power_source, "Plugged in");
+        assert_eq!(
+            view.fallback_details,
+            ["CUDA (Office GPU) failed: out of memory; next: Vulkan (Studio GPU)"]
+        );
+        assert!(
+            view.skipped_reasons
+                .iter()
+                .any(|reason| reason.contains("temporarily quarantined"))
+        );
+        let visible = format!("{view:?}");
+        for private_value in [
+            "provider-stable-secret",
+            "stable-device-secret",
+            "pack-digest-secret",
+            "raw native error",
+        ] {
+            assert!(!visible.contains(private_value), "leaked {private_value}");
+        }
+
+        let mut without_reported_quarantine = resolved.clone();
+        without_reported_quarantine
+            .selection
+            .as_mut()
+            .unwrap()
+            .skipped_targets
+            .clear();
+        let view = acceleration_diagnostics(Some(&without_reported_quarantine), false)
+            .expect("selection without a reported quarantine projects");
+        assert_eq!(view.quarantine_status, "No quarantine reported");
     }
 }

@@ -23,12 +23,13 @@ use super::{
     screens::{RecordingSettingsView, ScreenAction, ScreenView, render_screen, show_route_scroll},
     shell::{AppPage, SidebarModelView, show_navigation},
     state::{
-        ComparisonPhase, ModelCapabilities, ModelCardKey, ModelComparisonState, ModelDialog,
-        ModelDownloadState, ModelLanguageFilter, ModelManagementState, ModelSizeTier,
-        ModelSpeedTier, ModelViewModel, RemoteCatalogActionKind, RemoteCatalogActionView,
-        RemoteCatalogEntryView, RemoteCatalogStatusKind, RemoteCatalogStatusView,
-        RemoteCatalogVariantView, RemoteCatalogView, ResolvedTheme, SettingsTab, TranscribeNotice,
-        TranscriptionPhase, TranscriptionState, UiRoute,
+        AccelerationDiagnosticsView, ComparisonPhase, ModelCapabilities, ModelCardKey,
+        ModelComparisonState, ModelDialog, ModelDownloadState, ModelLanguageFilter,
+        ModelManagementState, ModelSizeTier, ModelSpeedTier, ModelViewModel,
+        RemoteCatalogActionKind, RemoteCatalogActionView, RemoteCatalogEntryView,
+        RemoteCatalogStatusKind, RemoteCatalogStatusView, RemoteCatalogVariantView,
+        RemoteCatalogView, ResolvedTheme, SettingsTab, TranscribeNotice, TranscriptionPhase,
+        TranscriptionState, UiRoute,
     },
     theme_palette,
 };
@@ -227,6 +228,27 @@ impl Fixture {
             voice_detection_mode: SpeechDetectionMode::ManualThreshold,
             input_threshold_dbfs: -42.0,
             input_level_percent: 68,
+            acceleration_diagnostics: Some(AccelerationDiagnosticsView {
+                selected_backend: "Vulkan".into(),
+                selected_device: "Studio GPU".into(),
+                selection_reason: "GPU was requested".into(),
+                skipped_reasons: vec![
+                    "CUDA (Office GPU) — temporarily quarantined after a failure".into(),
+                ],
+                pack_id: Some("scribe-gpu".into()),
+                pack_version: Some("1.2.3".into()),
+                driver: Some("32.0.16.1088".into()),
+                power_source: "Plugged in".into(),
+                power_policy: "All qualified devices allowed".into(),
+                quarantine_status: "A GPU is temporarily quarantined".into(),
+                fallback_status: "A bounded fallback was used".into(),
+                fallback_details: vec![
+                    "CUDA (Office GPU) failed: out of memory; next: Vulkan (Studio GPU)".into(),
+                ],
+                retry_gpu_available: true,
+                retry_gpu_in_flight: false,
+                retry_gpu_status: None,
+            }),
             ..Default::default()
         };
         let route = match self {
@@ -1200,6 +1222,7 @@ fn apply_action(data: &mut FixtureData, page: &mut AppPage, action: ScreenAction
         }
         ScreenAction::OpenAudioSettings => *page = AppPage::General,
         ScreenAction::RetryMicrophone => data.transcription.phase = TranscriptionPhase::Listening,
+        ScreenAction::RetryGpu => {}
         ScreenAction::ClearTranscript => data.transcription.committed_transcript.clear(),
         ScreenAction::CopyTranscript => {}
         ScreenAction::ToggleComparison => data.comparison.expanded = !data.comparison.expanded,
@@ -1571,6 +1594,27 @@ mod tests {
         )
     }
 
+    fn render_advanced_diagnostics(width: f32, height: f32) -> egui::FullOutput {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_harness_style(&ctx, false);
+        let mut data = Fixture::SettingsRecording.data();
+        data.route = UiRoute::Settings(SettingsTab::Advanced);
+        let mut page = Fixture::SettingsRecording.page();
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::Vec2::new(width, height),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                let _ = show_harness(ctx, &mut data, &mut page);
+            },
+        )
+    }
+
     fn render_with_input(
         ctx: &egui::Context,
         data: &mut FixtureData,
@@ -1789,6 +1833,24 @@ mod tests {
                         && node.is_live_atomic()
                 })
         );
+    }
+
+    fn assert_focus_ring_at(output: &egui::FullOutput, name: &str) {
+        let bounds = named_node_bounds(output, name);
+        let center = egui::pos2(
+            ((bounds.x0 + bounds.x1) / 2.0) as f32,
+            ((bounds.y0 + bounds.y1) / 2.0) as f32,
+        );
+        for width in [3.0, 1.0] {
+            assert!(
+                output.shapes.iter().any(|shape| matches!(
+                    shape.shape,
+                    egui::epaint::Shape::Rect(rect)
+                        if rect.stroke.width == width && rect.rect.contains(center)
+                )),
+                "missing {width}px focus ring around {name}"
+            );
+        }
     }
 
     fn assert_near(actual: f64, expected: f64, label: &str) {
@@ -6833,5 +6895,288 @@ mod tests {
         );
         assert_eq!(Fixture::parse("demo/audio"), Some(Fixture::DemoAudio));
         assert_eq!(Fixture::parse("debug"), None);
+    }
+
+    #[test]
+    fn gpu_diagnostics_fixture_exposes_safe_labels_and_retry_action() {
+        let output = render_advanced_diagnostics(960.0, 680.0);
+        let names = node_names(&output);
+        assert_eq!(
+            node_matching(&output, |node| node.name() == Some("GPU diagnostics")).role(),
+            egui::accesskit::Role::Heading
+        );
+        for visible in [
+            "GPU diagnostics",
+            "Selected backend",
+            "Vulkan",
+            "Studio GPU",
+            "scribe-gpu · 1.2.3",
+            "Plugged in",
+            "• CUDA (Office GPU) failed: out of memory; next: Vulkan (Studio GPU)",
+            "Retry GPU",
+        ] {
+            assert!(
+                names.iter().any(|name| name == visible),
+                "missing {visible}; rendered names: {names:?}"
+            );
+        }
+        let retry = named_node_bounds(&output, "Retry GPU");
+        assert!(retry.width() >= 44.0 && retry.height() >= 44.0);
+        for private_value in ["provider-stable-secret", "pack-digest-secret"] {
+            assert!(!names.iter().any(|name| name.contains(private_value)));
+        }
+    }
+
+    #[test]
+    fn gpu_retry_is_disabled_while_in_flight_and_not_actionable_without_target() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::SettingsRecording.data();
+        data.route = UiRoute::Settings(SettingsTab::Advanced);
+        let mut page = Fixture::SettingsRecording.page();
+        data.settings
+            .acceleration_diagnostics
+            .as_mut()
+            .expect("diagnostics fixture")
+            .retry_gpu_in_flight = true;
+
+        let (output, action) =
+            render_with_input(&ctx, &mut data, &mut page, 960.0, 680.0, Vec::new());
+        assert_eq!(action, ScreenAction::None);
+        let retry_id = named_node_id(&output, "Retrying…");
+        let retry = node_matching(&output, |node| node.name() == Some("Retrying…"));
+        assert!(retry.is_disabled());
+        let in_flight_status_id = named_node_id(&output, "Retrying GPU…");
+        assert_polite_atomic_notice(&output, "Retrying GPU…");
+
+        let (_, action) = render_with_input(
+            &ctx,
+            &mut data,
+            &mut page,
+            960.0,
+            680.0,
+            vec![egui::Event::AccessKitActionRequest(
+                egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Default,
+                    target: retry_id,
+                    data: None,
+                },
+            )],
+        );
+        assert_eq!(action, ScreenAction::None);
+
+        let diagnostics = data
+            .settings
+            .acceleration_diagnostics
+            .as_mut()
+            .expect("diagnostics fixture");
+        diagnostics.retry_gpu_in_flight = false;
+        diagnostics.retry_gpu_available = false;
+        let (output, action) =
+            render_with_input(&ctx, &mut data, &mut page, 960.0, 680.0, Vec::new());
+        assert_eq!(action, ScreenAction::None);
+        let retry = node_matching(&output, |node| node.name() == Some("Retry GPU"));
+        assert!(retry.is_disabled());
+
+        let mut status_data = Fixture::SettingsRecording.data();
+        status_data.route = UiRoute::Settings(SettingsTab::Advanced);
+        status_data
+            .settings
+            .acceleration_diagnostics
+            .as_mut()
+            .expect("diagnostics fixture")
+            .retry_gpu_status = Some(TranscribeNotice::information("GPU retry completed."));
+        let mut status_page = Fixture::SettingsRecording.page();
+        let completed_output = render_with_input(
+            &ctx,
+            &mut status_data,
+            &mut status_page,
+            960.0,
+            680.0,
+            Vec::new(),
+        )
+        .0;
+        assert!(
+            node_names(&completed_output)
+                .iter()
+                .any(|name| name == "GPU retry completed.")
+        );
+        assert_polite_atomic_notice(&completed_output, "GPU retry completed.");
+
+        let completed_status_id = named_node_id(&completed_output, "GPU retry completed.");
+        assert_eq!(in_flight_status_id, completed_status_id);
+        let status_message =
+            "GPU retry could not be completed. The previous selection remains active.";
+        status_data
+            .settings
+            .acceleration_diagnostics
+            .as_mut()
+            .expect("diagnostics fixture")
+            .retry_gpu_status = Some(TranscribeNotice::failure(status_message));
+        let status_output = render_with_input(
+            &ctx,
+            &mut status_data,
+            &mut status_page,
+            960.0,
+            680.0,
+            Vec::new(),
+        )
+        .0;
+        assert!(
+            node_names(&status_output)
+                .iter()
+                .any(|name| name == status_message)
+        );
+        assert_polite_atomic_notice(&status_output, status_message);
+        assert_eq!(
+            completed_status_id,
+            named_node_id(&status_output, status_message)
+        );
+    }
+
+    #[test]
+    fn gpu_retry_exposes_the_recording_lock_to_accessibility_clients() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::SettingsRecording.data();
+        data.transcription.phase = TranscriptionPhase::Listening;
+        let mut page = Fixture::SettingsRecording.page();
+
+        let (output, action) =
+            render_with_input(&ctx, &mut data, &mut page, 960.0, 680.0, Vec::new());
+        assert_eq!(action, ScreenAction::None);
+        let retry_id = named_node_id(&output, "Retry GPU");
+        let retry = node_matching(&output, |node| node.name() == Some("Retry GPU"));
+        assert!(retry.is_disabled());
+        assert_eq!(
+            retry.description(),
+            Some("Finish recording before retrying GPU.")
+        );
+
+        let (_, action) = render_with_input(
+            &ctx,
+            &mut data,
+            &mut page,
+            960.0,
+            680.0,
+            vec![egui::Event::AccessKitActionRequest(
+                egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Default,
+                    target: retry_id,
+                    data: None,
+                },
+            )],
+        );
+        assert_eq!(action, ScreenAction::None);
+    }
+
+    #[test]
+    fn gpu_retry_is_accesskit_and_keyboard_activated() {
+        let width = 960.0;
+        let height = 680.0;
+
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::SettingsRecording.data();
+        data.route = UiRoute::Settings(SettingsTab::Advanced);
+        let mut page = Fixture::SettingsRecording.page();
+        let initial = render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
+        let retry_id = named_node_id(&initial, "Retry GPU");
+        let (focused, focus_action) = render_with_input(
+            &ctx,
+            &mut data,
+            &mut page,
+            width,
+            height,
+            vec![egui::Event::AccessKitActionRequest(
+                egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Focus,
+                    target: retry_id,
+                    data: None,
+                },
+            )],
+        );
+        assert_eq!(focus_action, ScreenAction::None);
+        assert_eq!(focused_node(&focused).name(), Some("Retry GPU"));
+        assert_focus_ring_at(&focused, "Retry GPU");
+        assert_eq!(
+            render_with_input(
+                &ctx,
+                &mut data,
+                &mut page,
+                width,
+                height,
+                vec![egui::Event::AccessKitActionRequest(
+                    egui::accesskit::ActionRequest {
+                        action: egui::accesskit::Action::Default,
+                        target: retry_id,
+                        data: None,
+                    },
+                )],
+            )
+            .1,
+            ScreenAction::RetryGpu
+        );
+
+        for key in [egui::Key::Enter, egui::Key::Space] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            configure_accessible_style(&ctx);
+            let mut data = Fixture::SettingsRecording.data();
+            data.route = UiRoute::Settings(SettingsTab::Advanced);
+            let mut page = Fixture::SettingsRecording.page();
+            let initial =
+                render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
+            let retry_id = named_node_id(&initial, "Retry GPU");
+            assert_eq!(
+                render_with_input(
+                    &ctx,
+                    &mut data,
+                    &mut page,
+                    width,
+                    height,
+                    vec![egui::Event::AccessKitActionRequest(
+                        egui::accesskit::ActionRequest {
+                            action: egui::accesskit::Action::Focus,
+                            target: retry_id,
+                            data: None,
+                        },
+                    )],
+                )
+                .1,
+                ScreenAction::None
+            );
+            assert_eq!(
+                render_with_input(
+                    &ctx,
+                    &mut data,
+                    &mut page,
+                    width,
+                    height,
+                    vec![page_event(key)],
+                )
+                .1,
+                ScreenAction::RetryGpu,
+                "{key:?} should activate Retry GPU"
+            );
+        }
+    }
+
+    #[test]
+    fn gpu_diagnostics_fit_a_narrow_phone_width() {
+        let output = render_advanced_diagnostics(375.0, 800.0);
+        for name in [
+            "GPU diagnostics",
+            "Selected device",
+            "Power source",
+            "Retry GPU",
+        ] {
+            let bounds = named_node_bounds(&output, name);
+            assert!(bounds.x0 >= 0.0, "{name} starts outside the viewport");
+            assert!(bounds.x1 <= 375.0, "{name} extends beyond the viewport");
+        }
     }
 }
