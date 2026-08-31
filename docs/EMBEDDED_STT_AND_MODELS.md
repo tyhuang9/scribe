@@ -24,9 +24,10 @@ model objects or recognizers.
 
 There is no Python runtime, localhost service, dynamic runtime package,
 GGML/DLL route, or CLI fallback in the production inference path. The normal
-catalog has five Experimental entries and zero Supported entries:
+catalog has seven Experimental entries and zero Supported entries:
 `whisper_cpp_tiny_en`, `whisper_cpp_base_en`, `whisper_cpp_small_en`,
-`whisper_cpp_medium_en`, and receipt-backed `moonshine-tiny-en-int8-onnx`.
+`whisper_cpp_medium_en`, and receipt-backed `moonshine-tiny-en-int8-onnx` and
+`moonshine-base-en-int8-onnx` and `parakeet-tdt-06b-v2-en-int8-onnx` bundles.
 Local GGUF imports are validated in place; Scribe neither copies nor deletes
 them. Legacy user configuration and artifact files are preserved, but production
 paths no longer recognize or execute them.
@@ -181,7 +182,7 @@ The desktop shell may compile for Linux/macOS, but that is separate from a verif
 
 ### Normalized catalog
 
-`src/model_catalog.rs` remains the checked-in normalized catalog used for managed installs. It exposes five Experimental entries: four transcribe.cpp artifacts and one exact receipt-backed `moonshine-tiny-en-int8-onnx` directory bundle. Fresh profiles select the stable `whisper_cpp_base_en` ID, whose exact `handy-computer` Q8_0 GGUF pin is packaged beside the Windows x64 executable. `src/huggingface_catalog.rs` supplies backend-owned dynamic discovery/cache using existing `ureq`; the Models page asynchronously renders its trusted, cache-aware model cards without direct frontend HTTP or URL construction.
+`src/model_catalog.rs` remains the checked-in normalized catalog used for managed installs. It exposes seven Experimental entries: four transcribe.cpp artifacts and three exact receipt-backed ONNX directory bundles. Fresh profiles select the stable `whisper_cpp_base_en` ID, whose exact `handy-computer` Q8_0 GGUF pin is packaged beside the Windows x64 executable. `src/huggingface_catalog.rs` supplies backend-owned dynamic discovery/cache using existing `ureq`; the Models page asynchronously renders its trusted, cache-aware model cards without direct frontend HTTP or URL construction.
 
 | ID | File format and file | Exact size | Current compatibility |
 | --- | --- | ---: | --- |
@@ -190,8 +191,10 @@ The desktop shell may compile for Linux/macOS, but that is separate from a verif
 | `whisper_cpp_small_en` | GGML `ggml-small.en.bin` | 487,614,201 bytes | Experimental |
 | `whisper_cpp_medium_en` | GGML `ggml-medium.en.bin` | 1,533,774,781 bytes | Experimental |
 | `moonshine-tiny-en-int8-onnx` | Receipt-backed Moonshine ONNX bundle with exact per-file pins | 44,256,550 bytes aggregate | Experimental; CPU only; final text only |
+| `moonshine-base-en-int8-onnx` | Receipt-backed converted five-file Moonshine Base INT8 bundle; source and converter revisions are unrecorded | 286,930,831 bytes aggregate, including pinned MIT / Useful Sensors 2024 license file | Experimental; CPU only; English final text only; fixture verified only |
+| `parakeet-tdt-06b-v2-en-int8-onnx` | Receipt-backed Parakeet TDT 0.6B v2 ONNX bundle with exact per-file pins | 661,190,513 bytes aggregate (~631 MiB) | Experimental; CPU only; English final/batch text only; fixture verified only |
 
-Each single-file artifact has a checked-in SHA-256. Moonshine instead uses a typed receipt covering the exact pinned file tree and never invents a GGUF-style aggregate hash. All five entries are English, batch/final-text capable, CPU-only, and explicitly not native-streaming. The catalog exposes zero `Supported` models.
+Each single-file artifact has a checked-in SHA-256. The ONNX bundles instead use typed receipts covering their exact pinned file trees and never invent GGUF-style aggregate hashes. All seven entries are English, batch/final-text capable, CPU-only, and explicitly not native-streaming. The catalog exposes zero `Supported` models. Moonshine Base's only completed physical gate is Windows/Sherpa 1.13.5 child load/health/silence, normalized known-WAV equality, and unload/reload in 140.40 seconds total; that diagnostic duration is not a latency measurement. Cancellation, supervisor restart recovery, latency, resource use, accelerators, and non-Windows behavior remain unverified. Parakeet retains CC-BY-4.0 attribution to NVIDIA Corporation, [legal URL](https://creativecommons.org/licenses/by/4.0/legalcode), and the conversion notice that it is a sherpa-onnx int8 conversion rather than the unmodified NVIDIA checkpoint; its source and converter revisions are unrecorded. Its RAM, speed, latency, and other resource use are not measured.
 
 ### Legacy inventory
 
@@ -220,9 +223,9 @@ Each single-file artifact has a checked-in SHA-256. Moonshine instead uses a typ
 
 **Models behavior:** Installed and Available are default-open, session-persistent disclosure sections above a floating comparison dock. Search and the language filter operate on the local snapshot; a non-empty search temporarily exposes both result groups without changing their saved disclosure state. One fixed-height card renderer covers installed, available, downloading, failed, legacy, and imported states, with whole-card primary actions plus explicit Cancel, Details, and Remove controls. The included Base GGUF is deletable even when active or last: Scribe unloads it, stages only the exact manifest-defined executable sibling after rejecting links/reparse points and unsafe ancestors, durably records `excluded_bundled_model_ids` plus a deterministic replacement (or no selection), and then commits deletion. The exclusion survives updates; an update-restored copy is kept out of discovery and safely removed before loading. Explicit Install clears the exclusion only after verifying a restored bundled copy or completing the normal verified managed download. Cards show friendly description/language/capability/size and only catalog-authored speed or accuracy; unknown ratings say `Not rated`. Repository, revision, filename, hash, publisher, quantization, and variant details stay out of the main card while remaining preserved for validation and receipts. Accessible status text reports result counts and local-import lifecycle changes. Before each pinned model download, Scribe checks the destination volume for remaining bytes plus a 1 GiB safety headroom; an insufficient or unverifiable volume disables the card action and the installer rechecks before network I/O. A later revision for the same repository/file is marked Update available and installs as a new source-pinned artifact; the known-good version remains intact until the user explicitly switches to the validated new model. Dynamic results remain Experimental; no trusted remote model is claimed as Supported.
 
-**Normal-path boundary:** `TranscriptionService::model_descriptors()` exposes the five runtime-neutral Experimental entries to Models and Playground. Installed GGUF files and a currently verified Moonshine receipt-backed bundle are self-contained runtime-ready artifacts; neither creates a managed runtime-package record.
+**Normal-path boundary:** `TranscriptionService::model_descriptors()` exposes the seven runtime-neutral Experimental entries to Models and Playground. Installed GGUF files and currently verified Moonshine or Parakeet receipt-backed bundles are self-contained runtime-ready artifacts; neither creates a managed runtime-package record.
 
-**Real Moonshine subprocess smoke:** build the Scribe executable, then run the ignored `transcription::tests::diagnostic_real_hugging_face_bundle_install_load_and_decode` test with `SCRIBE_ONNX_BUNDLE_TEST=1`, `SCRIBE_ONNX_WORKER_EXE` set to that executable, a dedicated `SCRIBE_ONNX_BUNDLE_STORAGE_DIR`, and the digest-pinned WAV/transcript variables documented in `docs/MANUAL_TEST_MATRIX.md`. The diagnostic performs stage, real child Hello/load/health/silence smoke, known spoken-WAV decode, unload/reload, and activation.
+**Real Moonshine subprocess smoke:** build the Scribe executable, then run the ignored `transcription::tests::diagnostic_real_hugging_face_bundle_install_load_and_decode` test with `SCRIBE_ONNX_BUNDLE_TEST=1`, `SCRIBE_ONNX_BUNDLE_MODEL_ID`, `SCRIBE_ONNX_WORKER_EXE` set to that executable, a dedicated `SCRIBE_ONNX_BUNDLE_STORAGE_DIR`, and `SCRIBE_ONNX_BUNDLE_WAV`. The versioned fixture resource, selected by the private bundle ID, fixes the artifact revision, WAV size/SHA-256, and normalized expected transcript before decode. The diagnostic performs stage, real child Hello/load/health/silence smoke, known spoken-WAV decode, unload/reload, and activation.
 
 ## Migration inventory
 
@@ -278,7 +281,7 @@ The following headings must remain in this document through implementation. Thei
 | 12 | Install, resume, verify, validate, update, rollback, and remove flows | The default and selected typed GGUF variants download/resume/verify/validate/activate without a runtime package. Their model and installed manifest share rollback/commit/startup reconciliation. Revision updates install separately and do not overwrite the previous known-good source in place. User-selected local GGUF files are fingerprinted, smoke-validated, rechecked, and referenced externally; Remove leaves the source untouched. |
 | 13 | Installed manifest format | Implemented for normalized, typed remote, and local imported GGUF installers: schema v4, explicit source provenance and verification level, source and observed file facts, safe-runtime evidence, resolved acceleration, runtime-reported architecture/capabilities, smoke timings, and verification timestamp. Imported receipts are stored only in Scribe-owned storage. |
 | 14 | Security and trust decisions | Current controls and remaining decisions recorded above. |
-| 15 | Supported, upstream-compatible, experimental, incompatible, and gated model handling | Zero Supported; five Experimental, including one receipt-backed Moonshine bundle; legacy entries are migration-only. |
+| 15 | Supported, upstream-compatible, experimental, incompatible, and gated model handling | Zero Supported; seven Experimental, including two Moonshine and one Parakeet receipt-backed bundles; legacy entries are migration-only. |
 | 16 | Automated tests and exact commands to run them | Baseline and safe-adapter results are recorded below; catalog/installer commands remain to be added. |
 | 17 | Manual platform tests completed | None newly completed by this documentation slice. |
 | 18 | Before/after cold and warm latency measurements | Instrumentation exists; no new comparable measurement is recorded here. |
@@ -323,4 +326,4 @@ The tested model fixture was `handy-computer/whisper-tiny.en-gguf` at revision `
 
 Scribe now has a process-isolated safe `transcribe-cpp` 0.1.3 GGUF route with retained model/session lifecycle, bounded-worker routing, cancellation, explicit option/acceleration errors, and disposable install-smoke evidence. The persistent STT child also directly owns validated sherpa-onnx and legacy GGML compatibility state; the separate VAD child has its own role and process. The desktop process constructs no native model/session/recognizer or FFI state. Its installer does not stage a runtime archive for GGUF and atomically persists an installed-model provenance record with observed architecture and capabilities. Trusted backend discovery/cache, strict variant resolution, destination-volume preflight, and Rust-native Models-page catalog cards can now install, validate, activate, use, update, and remove typed dynamic GGUF variants. Users can also validate and reference an external local GGUF without Scribe copying or deleting it; its locally observed fingerprint is kept distinct from trusted remote provenance. macOS/Linux packages, richer dynamic-card operation state, and legacy-process retirement remain incomplete.
 
-No statement in this record promotes those planned capabilities, the five Experimental models, or platform packaging to Supported status without the required evidence.
+No statement in this record promotes those planned capabilities, the seven Experimental models, or platform packaging to Supported status without the required evidence.

@@ -1672,7 +1672,8 @@ mod tests {
         node_matching(output, |node| {
             node.role() == egui::accesskit::Role::Button
                 && node.name().is_some_and(|name| {
-                    name.starts_with("Choose active model:") || name == "Add a model"
+                    name.starts_with("Choose active model:")
+                        || name == "Active model: No model selected. Choose model"
                 })
         })
         .bounds()
@@ -2166,7 +2167,8 @@ mod tests {
         assert_eq!(no_model_action, ScreenAction::None);
         let card = quick_model_card_bounds(&no_model_output);
         let select = node_matching(&no_model_output, |node| {
-            node.role() == egui::accesskit::Role::Button && node.name() == Some("Add a model")
+            node.role() == egui::accesskit::Role::Button
+                && node.name() == Some("Active model: No model selected. Choose model")
         });
         let select_bounds = select.bounds().expect("Select should expose bounds");
         assert!(!select.is_disabled());
@@ -2183,9 +2185,9 @@ mod tests {
                 &mut no_model_page,
                 width,
                 height,
-                "Add a model",
+                "Active model: No model selected. Choose model",
             ),
-            ScreenAction::AddModel,
+            ScreenAction::None,
         );
 
         let mut ready_data = Fixture::TranscribeReady.data();
@@ -2212,6 +2214,46 @@ mod tests {
             disabled_change.description(),
             Some("Model selection is unavailable while recording.")
         );
+    }
+
+    #[test]
+    fn no_model_picker_manage_models_action_surrenders_selector_focus() {
+        let (width, height) = (1180.0, 815.0);
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let selector_name = "Active model: No model selected. Choose model";
+        let mut data = Fixture::TranscribeNoModel.data();
+        let mut page = Fixture::TranscribeNoModel.page();
+
+        assert_eq!(
+            click_named_control(&ctx, &mut data, &mut page, width, height, selector_name,),
+            ScreenAction::None,
+        );
+        let picker = render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
+        let selector_id = named_node_id(&picker, selector_name);
+        let manage_id = named_node_id(&picker, "Manage models…");
+        let (after_manage, action) = render_with_input(
+            &ctx,
+            &mut data,
+            &mut page,
+            width,
+            height,
+            vec![egui::Event::AccessKitActionRequest(
+                egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Default,
+                    target: manage_id,
+                    data: None,
+                },
+            )],
+        );
+        assert_eq!(action, ScreenAction::OpenModelSettings);
+        let focused = after_manage
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .map(|update| update.focus);
+        assert_ne!(focused, Some(selector_id));
     }
 
     #[test]

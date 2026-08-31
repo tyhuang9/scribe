@@ -433,6 +433,10 @@ impl RollingPreviewHandle {
         self.session.invalidate();
     }
 
+    pub(crate) fn has_emitted_partial(&self) -> bool {
+        self.session.has_emitted_partial()
+    }
+
     pub(crate) fn is_finished(&self) -> bool {
         self.session.is_finished()
     }
@@ -2147,9 +2151,221 @@ mod tests {
     use crate::runtime_artifact::{OnnxFileRole, OnnxModelFamily};
     use crate::runtime_router::NativeRuntimeDiagnostics;
     use sha2::{Digest, Sha256};
+    use std::collections::BTreeSet;
     use std::io::Cursor;
 
     const MAX_DIAGNOSTIC_ONNX_WAV_BYTES: u64 = 256 * 1024 * 1024;
+    const COMPATIBILITY_FIXTURES_BYTES: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/resources/onnx-model-compatibility-fixtures-v1.json"
+    ));
+
+    #[derive(Clone, Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct CompatibilityFixtureCatalog {
+        schema_version: u16,
+        fixtures: Vec<CompatibilityFixture>,
+    }
+
+    #[derive(Clone, Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct CompatibilityFixture {
+        model_id: String,
+        artifact: FixtureArtifactProvenance,
+        wav: FixtureWav,
+        transcript: FixtureTranscript,
+    }
+
+    #[derive(Clone, Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct FixtureArtifactProvenance {
+        repository: String,
+        revision: String,
+    }
+
+    #[derive(Clone, Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct FixtureWav {
+        repository: String,
+        revision: String,
+        path: String,
+        size_bytes: u64,
+        sha256: String,
+    }
+
+    #[derive(Clone, Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct FixtureTranscript {
+        repository: String,
+        revision: String,
+        source_path: String,
+        output_path: Option<String>,
+        text: String,
+        normalized_text: String,
+    }
+
+    fn parse_compatibility_fixture_catalog(
+        bytes: &[u8],
+    ) -> Result<CompatibilityFixtureCatalog, String> {
+        let catalog = serde_json::from_slice(bytes)
+            .map_err(|error| format!("invalid ONNX compatibility fixture catalog: {error}"))?;
+        validate_compatibility_fixture_catalog(&catalog)?;
+        Ok(catalog)
+    }
+
+    fn validate_compatibility_fixture_catalog(
+        catalog: &CompatibilityFixtureCatalog,
+    ) -> Result<(), String> {
+        if catalog.schema_version != 1 {
+            return Err(format!(
+                "unsupported ONNX compatibility fixture schema {}",
+                catalog.schema_version
+            ));
+        }
+        if catalog.fixtures.is_empty() {
+            return Err("ONNX compatibility fixture catalog is empty".to_owned());
+        }
+        let mut model_ids = BTreeSet::new();
+        for fixture in &catalog.fixtures {
+            if !model_ids.insert(fixture.model_id.as_str()) {
+                return Err(format!(
+                    "ONNX compatibility fixture catalog repeats model id {}",
+                    fixture.model_id
+                ));
+            }
+            validate_fixture_repository(&fixture.artifact.repository, "artifact repository")?;
+            validate_fixture_revision(&fixture.artifact.revision, "artifact revision")?;
+            validate_fixture_repository(&fixture.wav.repository, "WAV repository")?;
+            validate_fixture_revision(&fixture.wav.revision, "WAV revision")?;
+            validate_fixture_path(&fixture.wav.path, "WAV path")?;
+            if fixture.wav.size_bytes == 0 {
+                return Err(format!(
+                    "ONNX compatibility fixture {} has an empty WAV",
+                    fixture.model_id
+                ));
+            }
+            validate_fixture_sha256(&fixture.wav.sha256, "WAV SHA-256")?;
+            validate_fixture_repository(&fixture.transcript.repository, "transcript repository")?;
+            validate_fixture_revision(&fixture.transcript.revision, "transcript revision")?;
+            validate_fixture_path(&fixture.transcript.source_path, "transcript source path")?;
+            if let Some(output_path) = &fixture.transcript.output_path {
+                validate_fixture_path(output_path, "transcript output path")?;
+            }
+            if fixture.transcript.text.trim().is_empty()
+                || fixture.transcript.normalized_text.is_empty()
+                || normalize_fixture_transcript(&fixture.transcript.text)
+                    != fixture.transcript.normalized_text
+            {
+                return Err(format!(
+                    "ONNX compatibility fixture {} has an invalid normalized transcript",
+                    fixture.model_id
+                ));
+            }
+            let manifest = crate::onnx_model_bundles::bundle_manifest(&fixture.model_id)
+                .filter(|manifest| {
+                    manifest.availability
+                        == crate::onnx_model_bundles::BundleAvailability::Available
+                })
+                .ok_or_else(|| {
+                    format!(
+                        "ONNX compatibility fixture {} has no available private bundle",
+                        fixture.model_id
+                    )
+                })?;
+            if fixture.artifact.repository != manifest.repository
+                || fixture.artifact.revision != manifest.revision
+            {
+                return Err(format!(
+                    "ONNX compatibility fixture {} does not match its private bundle revision",
+                    fixture.model_id
+                ));
+            }
+            if fixture.wav.repository != fixture.artifact.repository
+                || fixture.wav.revision != fixture.artifact.revision
+            {
+                return Err(format!(
+                    "ONNX compatibility fixture {} WAV does not match its artifact provenance",
+                    fixture.model_id
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_fixture_repository(value: &str, label: &str) -> Result<(), String> {
+        let mut parts = value.split('/');
+        let safe_part = |part: &str| {
+            !part.is_empty()
+                && part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+                && part != "."
+                && part != ".."
+        };
+        if parts.next().is_some_and(safe_part)
+            && parts.next().is_some_and(safe_part)
+            && parts.next().is_none()
+        {
+            Ok(())
+        } else {
+            Err(format!("ONNX compatibility fixture {label} is unsafe"))
+        }
+    }
+
+    fn validate_fixture_revision(value: &str, label: &str) -> Result<(), String> {
+        if value.len() == 40
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            Ok(())
+        } else {
+            Err(format!(
+                "ONNX compatibility fixture {label} must be a full lowercase Git commit"
+            ))
+        }
+    }
+
+    fn validate_fixture_sha256(value: &str, label: &str) -> Result<(), String> {
+        if value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            Ok(())
+        } else {
+            Err(format!(
+                "ONNX compatibility fixture {label} must be 64 lowercase hexadecimal characters"
+            ))
+        }
+    }
+
+    fn validate_fixture_path(value: &str, label: &str) -> Result<(), String> {
+        let safe = !value.is_empty()
+            && !Path::new(value).is_absolute()
+            && !value.contains('\\')
+            && !value.contains('%')
+            && !value.contains('\0')
+            && value
+                .split('/')
+                .all(|part| !part.is_empty() && part != "." && part != "..");
+        if safe {
+            Ok(())
+        } else {
+            Err(format!("ONNX compatibility fixture {label} is unsafe"))
+        }
+    }
+
+    fn compatibility_fixture_for_model_id<'catalog>(
+        catalog: &'catalog CompatibilityFixtureCatalog,
+        model_id: &str,
+    ) -> Result<&'catalog CompatibilityFixture, String> {
+        catalog
+            .fixtures
+            .iter()
+            .find(|fixture| fixture.model_id == model_id)
+            .ok_or_else(|| format!("no ONNX compatibility fixture is pinned for {model_id}"))
+    }
 
     fn prepared_audio() -> Arc<PreparedAudio> {
         Arc::new(PreparedAudio {
@@ -2179,6 +2395,7 @@ mod tests {
 
     fn decode_digest_pinned_diagnostic_wav_with_hook(
         path: &Path,
+        expected_size_bytes: u64,
         expected_sha256: &str,
         after_verified_read: impl FnOnce(),
     ) -> Result<PreparedAudio> {
@@ -2192,6 +2409,11 @@ mod tests {
         let bytes =
             crate::installations::read_regular_file_no_follow(path, MAX_DIAGNOSTIC_ONNX_WAV_BYTES)?;
         anyhow::ensure!(!bytes.is_empty(), "diagnostic WAV fixture is empty");
+        anyhow::ensure!(
+            u64::try_from(bytes.len()).ok() == Some(expected_size_bytes),
+            "diagnostic WAV fixture size mismatch: expected {expected_size_bytes}, got {}",
+            bytes.len()
+        );
         let actual_sha256 = format!("{:x}", Sha256::digest(&bytes));
         anyhow::ensure!(
             actual_sha256 == expected_sha256,
@@ -2240,15 +2462,20 @@ mod tests {
         let expected_sha256 = format!("{:x}", Sha256::digest(&original));
         let moved = root.join("verified-original.wav");
 
-        let audio = decode_digest_pinned_diagnostic_wav_with_hook(&path, &expected_sha256, {
-            let path = path.clone();
-            let moved = moved.clone();
-            let replacement = replacement.clone();
-            move || {
-                fs::rename(&path, &moved).unwrap();
-                fs::write(&path, replacement).unwrap();
-            }
-        })
+        let audio = decode_digest_pinned_diagnostic_wav_with_hook(
+            &path,
+            original.len() as u64,
+            &expected_sha256,
+            {
+                let path = path.clone();
+                let moved = moved.clone();
+                let replacement = replacement.clone();
+                move || {
+                    fs::rename(&path, &moved).unwrap();
+                    fs::write(&path, replacement).unwrap();
+                }
+            },
+        )
         .unwrap();
 
         assert!(audio.samples[0] > 0.0);
@@ -2256,9 +2483,186 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    // Developer diagnostic only. It is deliberately non-promotional and
-    // cannot support a compatibility claim unless a canonical WAV digest and
-    // normalized transcript later become versioned repository evidence.
+    #[test]
+    fn diagnostic_wav_decode_rejects_a_size_mismatch_before_decoding() {
+        let root = std::env::temp_dir().join(format!(
+            "scribe-diagnostic-wav-size-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("fixture.wav");
+        let bytes = diagnostic_wav_bytes(&[i16::MAX / 2, i16::MAX / 4]);
+        fs::write(&path, &bytes).unwrap();
+        let error = decode_digest_pinned_diagnostic_wav_with_hook(
+            &path,
+            bytes.len() as u64 + 1,
+            &format!("{:x}", Sha256::digest(&bytes)),
+            || {},
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("size mismatch"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn versioned_compatibility_fixtures_bind_private_bundle_and_speech_evidence() {
+        let catalog = parse_compatibility_fixture_catalog(COMPATIBILITY_FIXTURES_BYTES).unwrap();
+        assert_eq!(catalog.fixtures.len(), 2);
+
+        let moonshine =
+            compatibility_fixture_for_model_id(&catalog, "moonshine-base-en-int8-onnx").unwrap();
+        assert_eq!(
+            moonshine.artifact.repository,
+            "csukuangfj/sherpa-onnx-moonshine-base-en-int8"
+        );
+        assert_eq!(
+            moonshine.artifact.revision,
+            "052b0798ad1bf046a140fdd4efcd9426530fa3f5"
+        );
+        assert_eq!(moonshine.wav.path, "test_wavs/0.wav");
+        assert_eq!(moonshine.wav.size_bytes, 212_044);
+        assert_eq!(
+            moonshine.wav.sha256,
+            "6bc58a4efdf20daac252b6b1502632601a71efe0308f6757dc1eda34891a7e4f"
+        );
+        assert_eq!(moonshine.transcript.source_path, "test_wavs/trans.txt");
+        assert_eq!(moonshine.transcript.output_path, None);
+        assert_eq!(
+            moonshine.transcript.text,
+            "AFTER EARLY NIGHTFALL THE YELLOW LAMPS WOULD LIGHT UP HERE AND THERE THE SQUALID QUARTER OF THE BROTHELS"
+        );
+        assert_eq!(
+            moonshine.transcript.normalized_text,
+            "after early nightfall the yellow lamps would light up here and there the squalid quarter of the brothels"
+        );
+
+        let parakeet =
+            compatibility_fixture_for_model_id(&catalog, "parakeet-tdt-06b-v2-en-int8-onnx")
+                .unwrap();
+        assert_eq!(
+            parakeet.artifact.repository,
+            "csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8"
+        );
+        assert_eq!(
+            parakeet.artifact.revision,
+            "1ab9323565ddb038682214b292f588070a538ce2"
+        );
+        assert_eq!(parakeet.wav.path, "test_wavs/0.wav");
+        assert_eq!(parakeet.wav.size_bytes, 237_964);
+        assert_eq!(
+            parakeet.wav.sha256,
+            "5fceacff0315d49cb59fcc505bcecf1ed5f2f35c2897b1e65a59f30e5d922150"
+        );
+        assert_eq!(parakeet.transcript.repository, "k2-fsa/sherpa");
+        assert_eq!(
+            parakeet.transcript.revision,
+            "6e00e3b0fc4aba9bc7c49366720e7c1f2e485f65"
+        );
+        assert_eq!(
+            parakeet.transcript.source_path,
+            "docs/source/onnx/pretrained_models/offline-transducer/nemo/parakeet-tdt-0.6b-v2.rst"
+        );
+        assert_eq!(
+            parakeet.transcript.output_path.as_deref(),
+            Some(
+                "docs/source/onnx/pretrained_models/offline-transducer/code-nemo/sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8.txt"
+            )
+        );
+        assert_eq!(
+            parakeet.transcript.text,
+            " Well, I don't wish to see it any more, observed Phebe, turning away her eyes. It is certainly very like the old portrait."
+        );
+        assert_eq!(
+            parakeet.transcript.normalized_text,
+            "well i don t wish to see it any more observed phebe turning away her eyes it is certainly very like the old portrait"
+        );
+    }
+
+    #[test]
+    fn compatibility_fixture_parser_rejects_untrusted_or_mismatched_evidence() {
+        let unknown_field = br#"{"schema_version":1,"fixtures":[],"unexpected":true}"#;
+        assert!(
+            parse_compatibility_fixture_catalog(unknown_field)
+                .unwrap_err()
+                .contains("unknown field")
+        );
+
+        let catalog = parse_compatibility_fixture_catalog(COMPATIBILITY_FIXTURES_BYTES).unwrap();
+        let mut duplicate = catalog.clone();
+        duplicate.fixtures.push(duplicate.fixtures[0].clone());
+        assert!(
+            validate_compatibility_fixture_catalog(&duplicate)
+                .unwrap_err()
+                .contains("repeats model id")
+        );
+
+        let mut unknown_bundle = catalog.clone();
+        unknown_bundle.fixtures[0].model_id = "unknown-private-bundle".to_owned();
+        assert!(
+            validate_compatibility_fixture_catalog(&unknown_bundle)
+                .unwrap_err()
+                .contains("no available private bundle")
+        );
+
+        let mut invalid_digest = catalog.clone();
+        invalid_digest.fixtures[0].wav.sha256 = "A".repeat(64);
+        assert!(
+            validate_compatibility_fixture_catalog(&invalid_digest)
+                .unwrap_err()
+                .contains("WAV SHA-256")
+        );
+
+        let mut empty_wav = catalog.clone();
+        empty_wav.fixtures[0].wav.size_bytes = 0;
+        assert!(
+            validate_compatibility_fixture_catalog(&empty_wav)
+                .unwrap_err()
+                .contains("empty WAV")
+        );
+
+        let mut invalid_revision = catalog.clone();
+        invalid_revision.fixtures[0].artifact.revision = "main".to_owned();
+        assert!(
+            validate_compatibility_fixture_catalog(&invalid_revision)
+                .unwrap_err()
+                .contains("artifact revision")
+        );
+
+        let mut mismatched_manifest = catalog.clone();
+        mismatched_manifest.fixtures[0].artifact.revision = "0".repeat(40);
+        assert!(
+            validate_compatibility_fixture_catalog(&mismatched_manifest)
+                .unwrap_err()
+                .contains("does not match its private bundle revision")
+        );
+
+        let mut invalid_transcript = catalog;
+        invalid_transcript.fixtures[1].transcript.normalized_text = "different words".to_owned();
+        assert!(
+            validate_compatibility_fixture_catalog(&invalid_transcript)
+                .unwrap_err()
+                .contains("invalid normalized transcript")
+        );
+    }
+
+    #[test]
+    fn compatibility_fixture_normalization_is_exact_and_non_lossy_about_token_boundaries() {
+        let catalog = parse_compatibility_fixture_catalog(COMPATIBILITY_FIXTURES_BYTES).unwrap();
+        for fixture in &catalog.fixtures {
+            assert_eq!(
+                normalize_fixture_transcript(&fixture.transcript.text),
+                fixture.transcript.normalized_text
+            );
+        }
+        assert_eq!(normalize_fixture_transcript("I don't wish"), "i don t wish");
+    }
+
+    // Developer diagnostic only. It runs only against the versioned private
+    // fixture evidence below and cannot make a public compatibility claim.
     #[test]
     #[ignore = "non-promotional diagnostic: downloads an exact pinned Hugging Face bundle and requires a digest-pinned spoken WAV fixture"]
     fn diagnostic_real_hugging_face_bundle_install_load_and_decode() {
@@ -2266,7 +2670,7 @@ mod tests {
             return;
         }
         let model_id = std::env::var("SCRIBE_ONNX_BUNDLE_MODEL_ID")
-            .unwrap_or_else(|_| "moonshine-tiny-en-int8-onnx".to_owned());
+            .expect("set SCRIBE_ONNX_BUNDLE_MODEL_ID to a private bundle with pinned fixtures");
         let storage = PathBuf::from(
             std::env::var_os("SCRIBE_ONNX_BUNDLE_STORAGE_DIR")
                 .expect("set SCRIBE_ONNX_BUNDLE_STORAGE_DIR to a dedicated test directory"),
@@ -2275,10 +2679,6 @@ mod tests {
             std::env::var_os("SCRIBE_ONNX_BUNDLE_WAV")
                 .expect("set SCRIBE_ONNX_BUNDLE_WAV to a known spoken PCM WAV"),
         );
-        let expected_wav_sha256 = std::env::var("SCRIBE_ONNX_BUNDLE_WAV_SHA256")
-            .expect("set SCRIBE_ONNX_BUNDLE_WAV_SHA256 to the exact lowercase WAV SHA-256");
-        let expected_text = std::env::var("SCRIBE_ONNX_BUNDLE_EXPECTED_TRANSCRIPT")
-            .expect("set SCRIBE_ONNX_BUNDLE_EXPECTED_TRANSCRIPT to the required spoken text");
         let worker_executable = PathBuf::from(
             std::env::var_os("SCRIBE_ONNX_WORKER_EXE")
                 .expect("set SCRIBE_ONNX_WORKER_EXE to a separately built Scribe executable"),
@@ -2287,16 +2687,21 @@ mod tests {
             worker_executable.is_file(),
             "SCRIBE_ONNX_WORKER_EXE must name an existing Scribe executable"
         );
-        assert!(
-            !normalize_fixture_transcript(&expected_text).is_empty(),
-            "the required expected transcript must contain letters or numbers"
-        );
+        let fixture_catalog = parse_compatibility_fixture_catalog(COMPATIBILITY_FIXTURES_BYTES)
+            .expect("versioned ONNX compatibility fixtures must be valid");
+        let fixture = compatibility_fixture_for_model_id(&fixture_catalog, &model_id)
+            .expect("selected private ONNX bundle must have versioned compatibility fixtures");
         let cancellation = InstallCancellation::default();
         let audio = Arc::new(
-            decode_digest_pinned_diagnostic_wav_with_hook(&audio_path, &expected_wav_sha256, || {})
-                .expect(
-                    "the configured WAV fixture must match its digest and decode from exact bytes",
-                ),
+            decode_digest_pinned_diagnostic_wav_with_hook(
+                &audio_path,
+                fixture.wav.size_bytes,
+                &fixture.wav.sha256,
+                || {},
+            )
+            .expect(
+                "the configured WAV fixture must match its pinned size, digest, and exact bytes",
+            ),
         );
         fs::create_dir_all(&storage).unwrap();
         let staged = crate::onnx_model_bundles::stage_onnx_bundle_install(
@@ -2334,8 +2739,8 @@ mod tests {
             }
         };
         let actual = normalize_fixture_transcript(&execution.transcript.text);
-        let expected = normalize_fixture_transcript(&expected_text);
-        if actual != expected {
+        let expected = &fixture.transcript.normalized_text;
+        if actual.as_str() != expected.as_str() {
             let _ = verified.discard();
             panic!(
                 "fixture transcript must equal the required normalized expected text before activation: expected {expected:?}, got {actual:?}"
@@ -2568,11 +2973,21 @@ mod tests {
         let service = TranscriptionService::new(AppConfig::default());
         let descriptors = service.model_descriptors();
 
-        assert_eq!(descriptors.len(), 5);
+        assert_eq!(descriptors.len(), 7);
         assert!(
             descriptors
                 .iter()
                 .any(|descriptor| descriptor.id.as_str() == "moonshine-tiny-en-int8-onnx")
+        );
+        assert!(
+            descriptors
+                .iter()
+                .any(|descriptor| descriptor.id.as_str() == "moonshine-base-en-int8-onnx")
+        );
+        assert!(
+            descriptors
+                .iter()
+                .any(|descriptor| descriptor.id.as_str() == "parakeet-tdt-06b-v2-en-int8-onnx")
         );
         for descriptor in descriptors {
             assert!(matches!(
