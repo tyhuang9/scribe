@@ -76,6 +76,8 @@ mod model_catalog;
 mod onnx_worker;
 #[path = "../prepared_audio.rs"]
 mod prepared_audio;
+#[path = "../receipt_bundle_catalog.rs"]
+mod receipt_bundle_catalog;
 #[path = "../runtime_artifact.rs"]
 mod runtime_artifact;
 #[allow(
