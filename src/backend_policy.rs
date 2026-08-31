@@ -481,6 +481,7 @@ impl PowerPolicyDecision {
             Self::NotApplied => "Power policy not applied",
             Self::Unrestricted => "All qualified devices allowed",
             Self::BatteryEfficientGpuOnly => "Battery mode allows efficient GPUs only",
+            Self::UnknownConservativeGpuOnly => "Unknown power state allows integrated GPUs only",
         }
     }
 }
@@ -511,6 +512,7 @@ impl BackendSkipReason {
             Self::Unhealthy => "health check is pending",
             Self::Quarantined => "temporarily quarantined after a failure",
             Self::BatteryPolicy => "disabled by battery policy",
+            Self::UnknownPowerSource => "disabled because the power state is unknown",
             Self::NotAutoQualified => "not qualified for Auto",
             Self::FallbackBound => "outside the bounded fallback limit",
         }
@@ -1426,6 +1428,18 @@ mod tests {
             Some(
                 "Auto selected CPU because the power source could not be verified, so discrete or unclassified GPUs are disabled."
             )
+        );
+    }
+
+    #[test]
+    fn diagnostics_label_unknown_power_policy_and_skip_reason() {
+        assert_eq!(
+            PowerPolicyDecision::UnknownConservativeGpuOnly.label(),
+            "Unknown power state allows integrated GPUs only"
+        );
+        assert_eq!(
+            BackendSkipReason::UnknownPowerSource.label(),
+            "disabled because the power state is unknown"
         );
     }
 
