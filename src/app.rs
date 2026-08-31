@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -18,8 +19,8 @@ use eframe::egui::{
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 use crate::audio::{
-    self, CaptureCancellation, CaptureCompletion, CaptureError, CaptureIntent, CaptureMetrics,
-    CaptureOptions, CaptureStopReason, LevelSnapshot, RecordingSession,
+    self, CaptureCompletion, CaptureError, CaptureIntent, CaptureMetrics, CaptureOptions,
+    CaptureStopReason, LevelSnapshot, RecordingSession,
     SpeechDetectionMode as CaptureSpeechDetectionMode, VadOptions,
 };
 use crate::benchmark::{
@@ -57,6 +58,10 @@ use crate::model_catalog::{ArtifactFormat, BUNDLED_BASE_MODEL_ID};
 use crate::models::{
     ModelArtifactOrigin, ModelInstallStatus, ModelRuntimeStatus, SttModelInfo, TranscriptionStatus,
     format_bytes,
+};
+use crate::onnx_model_bundles::{
+    OWNERSHIP_WITNESS_SOURCE, OnnxBundleRemoval, OnnxOwnershipLease, VerifiedOnnxRemovalCandidate,
+    authorize_onnx_bundle_removal, reconcile_onnx_bundle_removal, stage_onnx_bundle_removal,
 };
 use crate::overlay::{
     self, CapturedTarget, OverlayController, OverlayDiagnostic, OverlayMode as NativeOverlayMode,
@@ -104,6 +109,7 @@ const PREVIEW_FINISH_GRACE: Duration = Duration::from_secs(2);
 const PREVIEW_CANCEL_ACK_WARNING: Duration = Duration::from_secs(2);
 const LOCAL_GGUF_IMPORT_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
 const ONNX_BUNDLE_INSTALL_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
+const ARTIFACT_INSTALL_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
 const MAX_CONCURRENT_MODEL_TRANSFERS: usize = 3;
 const REMOTE_CATALOG_VISIBLE_LIMIT: usize = 100;
 const RETRY_RELEASE_ATTEMPTS: usize = 4;
@@ -130,6 +136,7 @@ fn capture_options_from_config(config: &AppConfig) -> CaptureOptions {
         vad_enabled: true,
         endpointing_enabled: config.recording.vad_enabled
             && config.recording.hotkey_mode == HotkeyMode::Toggle,
+        short_speech_rescue: false,
         vad: VadOptions::new(
             Duration::from_millis(config.recording.speech_confirmation_ms.into()),
             Duration::from_millis(config.recording.internal_pause_ms.into()),
@@ -464,6 +471,35 @@ enum RecordingSource {
     Playground,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AudioOwner {
+    Capture,
+    MicrophoneTest,
+    HistoryPlayback,
+    Conflict,
+}
+
+fn select_audio_owner(
+    capture: bool,
+    microphone_test: bool,
+    history_playback: bool,
+) -> Option<AudioOwner> {
+    let owners = [
+        (capture, AudioOwner::Capture),
+        (microphone_test, AudioOwner::MicrophoneTest),
+        (history_playback, AudioOwner::HistoryPlayback),
+    ];
+    let mut active = owners
+        .into_iter()
+        .filter_map(|(active, owner)| active.then_some(owner));
+    let owner = active.next()?;
+    if active.next().is_some() {
+        Some(AudioOwner::Conflict)
+    } else {
+        Some(owner)
+    }
+}
+
 impl RecordingSource {
     fn purpose(self) -> SessionPurpose {
         match self {
@@ -504,15 +540,16 @@ struct PendingRecording {
     max_duration_seconds: u32,
     latency: LatencyTrace,
     capture_diagnostics: CaptureDiagnosticContext,
-    cancellation: CaptureCancellation,
 }
 
 enum AbandonedCaptureCleanup {
     AwaitingCapture {
         session_id: SessionId,
+        capture_id: audio::CaptureId,
     },
     Draining {
         session_id: SessionId,
+        capture_id: Option<audio::CaptureId>,
         session: RecordingSession,
     },
 }
@@ -520,7 +557,16 @@ enum AbandonedCaptureCleanup {
 impl AbandonedCaptureCleanup {
     fn session_id(&self) -> SessionId {
         match self {
-            Self::AwaitingCapture { session_id } | Self::Draining { session_id, .. } => *session_id,
+            Self::AwaitingCapture { session_id, .. } | Self::Draining { session_id, .. } => {
+                *session_id
+            }
+        }
+    }
+
+    fn capture_id(&self) -> Option<audio::CaptureId> {
+        match self {
+            Self::AwaitingCapture { capture_id, .. } => Some(*capture_id),
+            Self::Draining { capture_id, .. } => *capture_id,
         }
     }
 }
@@ -532,7 +578,6 @@ enum MicrophoneTest {
     Starting {
         request_id: u64,
         stop_requested: bool,
-        cancellation: CaptureCancellation,
     },
     Active {
         session: RecordingSession,
@@ -686,6 +731,10 @@ struct LatencyTrace {
     activation_at: Instant,
     trigger_observation: TriggerObservation,
     overlay_visible_at: Option<Instant>,
+    capture_worker_started_at: Option<Instant>,
+    stream_play_requested_at: Option<Instant>,
+    stream_play_returned_at: Option<Instant>,
+    first_native_callback_at: Option<Instant>,
     recorder_started_at: Option<Instant>,
     first_meter_update_at: Option<Instant>,
     model_load_started_at: Option<Instant>,
@@ -693,6 +742,9 @@ struct LatencyTrace {
     first_partial_at: Option<Instant>,
     stop_requested_at: Option<Instant>,
     capture_finalized_at: Option<Instant>,
+    stream_dropped_at: Option<Instant>,
+    final_audio_ready_at: Option<Instant>,
+    preview_drained_at: Option<Instant>,
     transcription_dispatched_at: Option<Instant>,
     transcription_job_completed_at: Option<Instant>,
     final_text_ready_at: Option<Instant>,
@@ -721,6 +773,10 @@ impl LatencyTrace {
             activation_at,
             trigger_observation,
             overlay_visible_at: None,
+            capture_worker_started_at: None,
+            stream_play_requested_at: None,
+            stream_play_returned_at: None,
+            first_native_callback_at: None,
             recorder_started_at: None,
             first_meter_update_at: None,
             model_load_started_at: None,
@@ -728,6 +784,9 @@ impl LatencyTrace {
             first_partial_at: None,
             stop_requested_at: None,
             capture_finalized_at: None,
+            stream_dropped_at: None,
+            final_audio_ready_at: None,
+            preview_drained_at: None,
             transcription_dispatched_at: None,
             transcription_job_completed_at: None,
             final_text_ready_at: None,
@@ -794,6 +853,19 @@ impl LatencyTrace {
         self.maximum_input_rms = Some(metrics.maximum_input_rms);
         self.maximum_input_peak = Some(metrics.maximum_input_peak);
         self.manual_threshold_crossed = Some(metrics.manual_threshold_crossed);
+        if metrics.timing == audio::CaptureTimingMetrics::default() {
+            return;
+        }
+        let observed_at = |elapsed| self.activation_at.checked_add(elapsed);
+        self.capture_worker_started_at = observed_at(metrics.timing.hotkey_to_worker);
+        self.stream_play_requested_at = observed_at(metrics.timing.stream_play_requested);
+        self.stream_play_returned_at = observed_at(metrics.timing.stream_play_returned);
+        self.first_native_callback_at = metrics.timing.first_native_callback.and_then(observed_at);
+        self.stop_requested_at = self
+            .stop_requested_at
+            .or_else(|| metrics.timing.release.and_then(observed_at));
+        self.stream_dropped_at = observed_at(metrics.timing.stream_dropped);
+        self.final_audio_ready_at = observed_at(metrics.timing.final_audio_ready);
     }
 
     fn diagnostic_snapshot(
@@ -887,6 +959,23 @@ impl LatencyTrace {
         {
             lines.push(format!("{trigger_label} to overlay visible: {duration}"));
         }
+        if let Some(duration) =
+            duration_between(Some(self.activation_at), self.capture_worker_started_at)
+        {
+            lines.push(format!("Native callback to capture worker: {duration}"));
+        }
+        if let Some(duration) =
+            duration_between(self.stream_play_requested_at, self.stream_play_returned_at)
+        {
+            lines.push(format!("Microphone stream play: {duration}"));
+        }
+        if let Some(duration) =
+            duration_between(Some(self.activation_at), self.first_native_callback_at)
+        {
+            lines.push(format!(
+                "Native callback to first audio callback: {duration}"
+            ));
+        }
         if let Some(duration) = duration_between(Some(self.activation_at), self.recorder_started_at)
         {
             lines.push(format!("{trigger_label} to recorder ready: {duration}"));
@@ -905,6 +994,24 @@ impl LatencyTrace {
         if let Some(duration) = duration_between(self.stop_requested_at, self.capture_finalized_at)
         {
             lines.push(format!("Stop to audio finalized: {duration}"));
+        }
+        if let Some(duration) = duration_between(self.stop_requested_at, self.stream_dropped_at) {
+            lines.push(format!("Stop to microphone stream dropped: {duration}"));
+        }
+        if let Some(duration) = duration_between(self.stream_dropped_at, self.final_audio_ready_at)
+        {
+            lines.push(format!("Stream dropped to final audio ready: {duration}"));
+        }
+        if let Some(duration) = duration_between(self.final_audio_ready_at, self.preview_drained_at)
+        {
+            lines.push(format!("Final audio ready to preview drained: {duration}"));
+        }
+        if let Some(duration) =
+            duration_between(self.preview_drained_at, self.transcription_dispatched_at)
+        {
+            lines.push(format!(
+                "Preview drained to final request dispatch: {duration}"
+            ));
         }
         if let Some(duration) = duration_between(
             self.transcription_dispatched_at,
@@ -982,6 +1089,16 @@ fn live_overlay_owns_announcements(
 
 fn rolling_preview_enabled(source: RecordingSource, mode: StreamingMode) -> bool {
     source == RecordingSource::Transcribe && mode != StreamingMode::FinalOnly
+}
+
+fn short_speech_rescue_enabled(
+    source: RecordingSource,
+    trigger_observation: TriggerObservation,
+    hotkey_mode: HotkeyMode,
+) -> bool {
+    source == RecordingSource::Transcribe
+        && trigger_observation == TriggerObservation::HotkeyPoll
+        && hotkey_mode == HotkeyMode::HoldToTalk
 }
 
 fn native_overlay_position(position: OverlayPosition) -> NativeOverlayPosition {
@@ -1245,6 +1362,7 @@ enum PlaygroundAction {
 }
 
 enum AppEvent {
+    #[allow(dead_code)]
     OnnxBundleInstallProgress {
         job_id: u64,
         model_id: String,
@@ -1255,7 +1373,7 @@ enum AppEvent {
         model_id: String,
         paused: bool,
         recovery_required: bool,
-        result: Result<InstallSmoke, String>,
+        result: Result<CommittedOnnxBundleInstall, String>,
     },
     CaptureReady {
         session_id: SessionId,
@@ -1347,7 +1465,7 @@ enum AppEvent {
     VerifiedInstallPrepared {
         job_id: u64,
         model_id: String,
-        prepared: Box<PreparedVerifiedInstall>,
+        prepared: Box<PreparedArtifactInstall>,
     },
     VerifiedInstallDone {
         job_id: u64,
@@ -1402,11 +1520,95 @@ struct VerifiedInstallResult {
 }
 
 #[derive(Debug)]
+struct CommittedOnnxBundleInstall {
+    smoke: InstallSmoke,
+    ownership: OnnxOwnershipLease,
+}
+
+#[derive(Debug)]
+enum StagedModelRemoval {
+    Generic(ManagedRemoval),
+    Onnx(OnnxBundleRemoval),
+}
+
+impl StagedModelRemoval {
+    fn removed_files(&self) -> bool {
+        match self {
+            Self::Generic(removal) => removal.removed_files(),
+            Self::Onnx(removal) => removal.removed_files(),
+        }
+    }
+
+    fn prepare_config_commit(
+        &mut self,
+        expected_config_fingerprint: String,
+    ) -> Result<(), InstallError> {
+        match self {
+            Self::Generic(removal) => removal.prepare_config_commit(expected_config_fingerprint),
+            Self::Onnx(removal) => removal.prepare_config_commit(expected_config_fingerprint),
+        }
+    }
+
+    fn persist_artifact_config(
+        &self,
+        expected_artifact_fingerprint: &str,
+        config: &config::AppConfig,
+    ) -> Result<(), InstallError> {
+        match self {
+            Self::Generic(_) => config::save_artifact_config(config, expected_artifact_fingerprint)
+                .map_err(|error| InstallError::Failed(error.to_string())),
+            Self::Onnx(removal) => {
+                removal.persist_artifact_config(expected_artifact_fingerprint, config)
+            }
+        }
+    }
+
+    fn commit(
+        self,
+        expected_pending_fingerprint: &str,
+        final_config: &config::AppConfig,
+    ) -> Result<(), InstallError> {
+        match self {
+            Self::Generic(removal) => removal.commit(),
+            Self::Onnx(removal) => removal.commit(expected_pending_fingerprint, final_config),
+        }
+    }
+
+    fn rollback(self) -> Result<(), InstallError> {
+        match self {
+            Self::Generic(removal) => removal.rollback(),
+            Self::Onnx(removal) => removal.rollback(),
+        }
+    }
+}
+
+#[derive(Debug)]
 struct PreparedVerifiedInstall {
     model_id: ModelId,
     model: crate::installations::DownloadedArtifact,
     manifest_source: installed_manifest::ArtifactSource,
     remote_install_request: Option<TrustedRemoteInstallRequest>,
+}
+
+#[derive(Debug)]
+enum PreparedArtifactInstall {
+    Gguf(Box<PreparedVerifiedInstall>),
+    Onnx(Box<crate::onnx_model_bundles::StagedOnnxBundle>),
+    #[cfg(test)]
+    PanickingTestFinalizer(PanickingFinalizerTestFault),
+    #[cfg(test)]
+    WaitingTestFinalizer(Receiver<()>),
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+enum PanickingFinalizerTestFault {
+    JournalCreation {
+        journal_path: PathBuf,
+        model_target: PathBuf,
+    },
+    ModelActivation(Box<crate::installations::DownloadedArtifact>),
+    DirectoryActivation(crate::installations::StagedRuntime),
 }
 
 /// A local source has been fully re-hashed and exercised by the isolated
@@ -1497,6 +1699,28 @@ fn send_install_progress(
     });
 }
 
+fn catch_install_worker_panic<T>(
+    phase: &str,
+    panic_safety: InstallWorkerPanicSafety,
+    work: impl FnOnce() -> Result<T, InstallJobFailure>,
+) -> Result<T, InstallJobFailure> {
+    catch_unwind(AssertUnwindSafe(work)).unwrap_or_else(|_| {
+        let message = format!("{phase} worker stopped unexpectedly.");
+        Err(match panic_safety {
+            InstallWorkerPanicSafety::RetrySafe => InstallJobFailure::normal(message),
+            InstallWorkerPanicSafety::RecoveryRequired => {
+                InstallJobFailure::recovery_required(message)
+            }
+        })
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InstallWorkerPanicSafety {
+    RetrySafe,
+    RecoveryRequired,
+}
+
 fn send_verified_install_result(
     tx: &AppEventSink,
     job_id: u64,
@@ -1527,7 +1751,7 @@ fn send_verified_install_preparation(
     tx: &AppEventSink,
     job_id: u64,
     model_id: String,
-    result: Result<PreparedVerifiedInstall, InstallJobFailure>,
+    result: Result<PreparedArtifactInstall, InstallJobFailure>,
 ) {
     match result {
         Ok(prepared) => {
@@ -1613,7 +1837,12 @@ struct TrustedRemoteInstallRequest {
 #[derive(Clone, Debug)]
 enum VerifiedInstallSource {
     NormalizedCatalog,
+    NormalizedOnnxBundle(managed_downloads::OnnxBundleDownloadAdmission),
     TrustedRemote(TrustedRemoteInstallRequest),
+    #[cfg(test)]
+    PanickingTestTransfer,
+    #[cfg(test)]
+    WaitingTestTransfer(Receiver<()>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1652,7 +1881,46 @@ struct ArtifactInstallJob {
     download_config: Option<AppConfig>,
     target_identity: Option<crate::disk_space::CanonicalTargetIdentity>,
     reservation: Option<ArtifactDiskReservation>,
-    prepared: Option<PreparedVerifiedInstall>,
+    prepared: Option<PreparedArtifactInstall>,
+    worker: Option<ArtifactInstallWorker>,
+}
+
+#[derive(Debug)]
+struct ArtifactInstallWorker {
+    completion: Receiver<()>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl ArtifactInstallWorker {
+    fn reap_completed(&mut self) {
+        if matches!(
+            self.completion.try_recv(),
+            Ok(()) | Err(crossbeam_channel::TryRecvError::Disconnected)
+        ) {
+            let _ = self.worker.take().map(thread::JoinHandle::join);
+        }
+    }
+
+    fn wait_until(&mut self, deadline: Instant) -> bool {
+        let completed = if let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+            matches!(
+                self.completion.recv_timeout(remaining),
+                Ok(()) | Err(crossbeam_channel::RecvTimeoutError::Disconnected)
+            )
+        } else {
+            matches!(
+                self.completion.try_recv(),
+                Ok(()) | Err(crossbeam_channel::TryRecvError::Disconnected)
+            )
+        };
+        if !completed {
+            self.worker.take();
+            return false;
+        }
+        self.worker
+            .take()
+            .is_none_or(|worker| worker.join().is_ok())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1670,9 +1938,10 @@ struct ArtifactDiskReservation {
     kind: ArtifactDiskReservationKind,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum ArtifactDiskReservationKind {
     ModelArtifact,
+    OnnxBundle { non_transfer_bytes: u64 },
 }
 
 #[derive(Debug)]
@@ -1690,7 +1959,7 @@ struct ArtifactFinalizerLaunch {
     job_id: u64,
     model_id: String,
     cancellation: InstallCancellation,
-    prepared: PreparedVerifiedInstall,
+    prepared: PreparedArtifactInstall,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1774,10 +2043,6 @@ impl ArtifactInstallCoordinator {
         self.jobs.get(model_id)
     }
 
-    fn values(&self) -> impl Iterator<Item = &(u64, InstallCancellation)> {
-        self.jobs.values().map(|job| &job.handle)
-    }
-
     /// Test-only compatibility for fixtures that seed a correlated job.
     #[cfg(test)]
     fn insert(
@@ -1797,6 +2062,7 @@ impl ArtifactInstallCoordinator {
                 target_identity: None,
                 reservation: None,
                 prepared: None,
+                worker: None,
             },
         );
         previous.map(|job| job.handle)
@@ -1808,6 +2074,47 @@ impl ArtifactInstallCoordinator {
         admission: managed_downloads::ModelDownloadAdmission,
         config: AppConfig,
         source: VerifiedInstallSource,
+    ) -> Result<u64, String> {
+        self.admit_with_reservation_kind(
+            model_id,
+            admission,
+            config,
+            source,
+            ArtifactDiskReservationKind::ModelArtifact,
+        )
+    }
+
+    fn admit_onnx(
+        &mut self,
+        model_id: String,
+        admission: managed_downloads::OnnxBundleDownloadAdmission,
+        config: AppConfig,
+    ) -> Result<u64, String> {
+        let non_transfer_bytes = admission
+            .disk
+            .additional_bytes
+            .saturating_sub(admission.download_bytes);
+        let common_admission = managed_downloads::ModelDownloadAdmission {
+            target: admission.target.clone(),
+            target_identity: admission.target_identity.clone(),
+            disk: admission.disk.clone(),
+        };
+        self.admit_with_reservation_kind(
+            model_id,
+            common_admission,
+            config,
+            VerifiedInstallSource::NormalizedOnnxBundle(admission),
+            ArtifactDiskReservationKind::OnnxBundle { non_transfer_bytes },
+        )
+    }
+
+    fn admit_with_reservation_kind(
+        &mut self,
+        model_id: String,
+        admission: managed_downloads::ModelDownloadAdmission,
+        config: AppConfig,
+        source: VerifiedInstallSource,
+        reservation_kind: ArtifactDiskReservationKind,
     ) -> Result<u64, String> {
         if self.recovery_frozen {
             return Err(
@@ -1861,9 +2168,10 @@ impl ArtifactInstallCoordinator {
                 reservation: Some(ArtifactDiskReservation {
                     volume: admission.disk.volume,
                     remaining_bytes: admission.disk.additional_bytes,
-                    kind: ArtifactDiskReservationKind::ModelArtifact,
+                    kind: reservation_kind,
                 }),
                 prepared: None,
+                worker: None,
             },
         );
         self.transfer_queue.push_back(model_id);
@@ -1908,6 +2216,22 @@ impl ArtifactInstallCoordinator {
         launches
     }
 
+    fn register_worker(
+        &mut self,
+        model_id: &str,
+        job_id: u64,
+        worker: ArtifactInstallWorker,
+    ) -> bool {
+        let Some(job) = self.jobs.get_mut(model_id) else {
+            return false;
+        };
+        if job.handle.0 != job_id || job.worker.is_some() {
+            return false;
+        }
+        job.worker = Some(worker);
+        true
+    }
+
     fn update_download_reservation(
         &mut self,
         model_id: &str,
@@ -1930,7 +2254,13 @@ impl ArtifactInstallCoordinator {
         let Some(reservation) = reservation else {
             return false;
         };
-        let remaining_bytes = remaining_bytes.min(reservation.remaining_bytes);
+        let remaining_bytes = match &reservation.kind {
+            ArtifactDiskReservationKind::ModelArtifact => remaining_bytes,
+            ArtifactDiskReservationKind::OnnxBundle { non_transfer_bytes } => {
+                non_transfer_bytes.saturating_add(remaining_bytes)
+            }
+        }
+        .min(reservation.remaining_bytes);
         let released = reservation.remaining_bytes - remaining_bytes;
         reservation.remaining_bytes = remaining_bytes;
         let mut remove_volume = false;
@@ -2097,7 +2427,7 @@ impl ArtifactInstallCoordinator {
         &mut self,
         model_id: &str,
         job_id: u64,
-        prepared: PreparedVerifiedInstall,
+        prepared: PreparedArtifactInstall,
     ) -> bool {
         let Some(job) = self.jobs.get_mut(model_id) else {
             return false;
@@ -2107,6 +2437,10 @@ impl ArtifactInstallCoordinator {
         }
         self.active_transfers = self.active_transfers.saturating_sub(1);
         let reservation = job.reservation.take();
+        if let Some(mut worker) = job.worker.take() {
+            worker.reap_completed();
+            debug_assert!(worker.worker.is_none());
+        }
         job.download_activity = None;
         job.phase = ArtifactInstallPhase::WaitingForFinalizer;
         job.prepared = Some(prepared);
@@ -2148,11 +2482,18 @@ impl ArtifactInstallCoordinator {
         if job.handle.0 != job_id {
             return false;
         }
+        let mut job = self
+            .jobs
+            .remove(model_id)
+            .expect("correlated install job disappeared before finish");
         let was_transfer = job.phase == ArtifactInstallPhase::Transferring;
         let was_finalizer = job.phase == ArtifactInstallPhase::Finalizing;
-        let target = job.target_identity.clone();
-        let reservation = job.reservation.clone();
-        self.jobs.remove(model_id);
+        let target = job.target_identity.take();
+        let reservation = job.reservation.take();
+        if let Some(mut worker) = job.worker.take() {
+            worker.reap_completed();
+            debug_assert!(worker.worker.is_none());
+        }
         self.transfer_queue.retain(|queued| queued != model_id);
         self.finalizer_queue.retain(|queued| queued != model_id);
         if was_transfer {
@@ -2168,6 +2509,21 @@ impl ArtifactInstallCoordinator {
             self.release_reservation(reservation);
         }
         true
+    }
+
+    fn cancel_and_wait_until(&mut self, deadline: Instant) -> bool {
+        for job in self.jobs.values() {
+            job.handle.1.cancel();
+        }
+        let mut completed = true;
+        for job in self.jobs.values_mut() {
+            if let Some(worker) = job.worker.as_mut()
+                && !worker.wait_until(deadline)
+            {
+                completed = false;
+            }
+        }
+        completed
     }
 
     fn cancel(&mut self, model_id: &str) -> ArtifactCancellationOutcome {
@@ -2236,7 +2592,7 @@ enum RemoteModelCardAction {
 fn prepare_verified_install(
     request: VerifiedInstallPreparationRequest,
     progress: &dyn Fn(InstallProgress),
-) -> Result<PreparedVerifiedInstall, InstallJobFailure> {
+) -> Result<PreparedArtifactInstall, InstallJobFailure> {
     let VerifiedInstallPreparationRequest {
         config,
         model_id,
@@ -2258,6 +2614,21 @@ fn prepare_verified_install(
                 .map_err(|error| error.to_string())?;
             (model, source, None)
         }
+        VerifiedInstallSource::NormalizedOnnxBundle(admission) => {
+            let staged = managed_downloads::prepare_onnx_bundle(
+                &admission,
+                &expected_target_identity,
+                &cancellation,
+                progress,
+            )
+            .map_err(InstallJobFailure::from)?;
+            if cancellation.is_cancelled() {
+                return Err(InstallJobFailure::normal(
+                    "Installation cancelled. Exact ONNX partials were retained for Resume.",
+                ));
+            }
+            return Ok(PreparedArtifactInstall::Onnx(Box::new(staged)));
+        }
         VerifiedInstallSource::TrustedRemote(request) => {
             let model = managed_downloads::prepare_trusted_gguf_model(
                 &config,
@@ -2276,6 +2647,17 @@ fn prepare_verified_install(
             );
             (model, source, Some(request))
         }
+        #[cfg(test)]
+        VerifiedInstallSource::PanickingTestTransfer => {
+            panic!("sensitive injected transfer panic payload")
+        }
+        #[cfg(test)]
+        VerifiedInstallSource::WaitingTestTransfer(release) => {
+            let _ = release.recv();
+            return Err(InstallJobFailure::normal(
+                "Test transfer worker released.".to_owned(),
+            ));
+        }
     };
     if cancellation.is_cancelled() {
         return Err(InstallJobFailure::normal(
@@ -2283,12 +2665,14 @@ fn prepare_verified_install(
         ));
     }
 
-    Ok(PreparedVerifiedInstall {
-        model_id,
-        model,
-        manifest_source,
-        remote_install_request,
-    })
+    Ok(PreparedArtifactInstall::Gguf(Box::new(
+        PreparedVerifiedInstall {
+            model_id,
+            model,
+            manifest_source,
+            remote_install_request,
+        },
+    )))
 }
 
 fn run_verified_install_finalizer(
@@ -2451,6 +2835,32 @@ fn run_verified_install_finalizer(
         remote_install,
     })
 }
+
+fn run_onnx_bundle_finalizer(
+    service: TranscriptionService,
+    cancellation: InstallCancellation,
+    staged: crate::onnx_model_bundles::StagedOnnxBundle,
+) -> Result<CommittedOnnxBundleInstall, InstallJobFailure> {
+    if cancellation.is_cancelled() {
+        return Err(InstallJobFailure::normal(
+            "Installation cancelled while waiting for verification. Exact ONNX partials were retained for Resume.",
+        ));
+    }
+    let verified = service
+        .verify_onnx_bundle_for_installation(staged, &cancellation)
+        .map_err(|error| InstallJobFailure::normal(error.to_string()))?;
+    if cancellation.is_cancelled() {
+        return Err(InstallJobFailure::normal(
+            "Installation cancelled after smoke testing; no ONNX bundle was activated.",
+        ));
+    }
+    let smoke = verified.smoke().clone();
+    let ownership = verified
+        .activate()
+        .and_then(|activated| activated.commit())
+        .map_err(InstallJobFailure::from)?;
+    Ok(CommittedOnnxBundleInstall { smoke, ownership })
+}
 fn validate_local_gguf_import(
     source_path: PathBuf,
     model_storage_dir: PathBuf,
@@ -2600,6 +3010,40 @@ fn supports_managed_uninstall(model: &SttModelInfo, install_status: &ModelInstal
         && install_status.is_runnable()
 }
 
+fn onnx_ownership_witness(candidate: &VerifiedOnnxRemovalCandidate) -> config::ManagedModelInstall {
+    let mut witness = config::ManagedModelInstall::app_managed(
+        candidate.target_root().to_path_buf(),
+        OWNERSHIP_WITNESS_SOURCE,
+    );
+    witness.sha256 = Some(candidate.receipt_sha256().to_owned());
+    witness
+}
+
+fn onnx_ownership_witness_matches(
+    config: &AppConfig,
+    candidate: &VerifiedOnnxRemovalCandidate,
+) -> bool {
+    config
+        .general
+        .managed_models
+        .get(candidate.model_id())
+        .is_some_and(|witness| {
+            witness.path == candidate.target_root()
+                && witness.source.as_deref() == Some(OWNERSHIP_WITNESS_SOURCE)
+                && witness
+                    .sha256
+                    .as_deref()
+                    .is_some_and(|sha256| sha256.eq_ignore_ascii_case(candidate.receipt_sha256()))
+        })
+}
+
+fn generate_onnx_removal_nonce() -> Result<String, String> {
+    let mut bytes = [0_u8; 32];
+    getrandom::fill(&mut bytes)
+        .map_err(|error| format!("Could not create a secure ONNX removal transaction: {error}"))?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
 fn cleanup_excluded_bundled_model(config: &AppConfig) -> Result<bool, InstallError> {
     cleanup_excluded_bundled_model_at(config, config::bundled_model_path())
 }
@@ -2667,6 +3111,7 @@ pub struct LocalTranscriberApp {
     #[cfg(test)]
     comparison_output_replacement_count: usize,
     model_management: ModelManagementState,
+    pending_onnx_removal: Option<VerifiedOnnxRemovalCandidate>,
     models_route_focus_pending: bool,
     status: TranscriptionStatus,
     transcript: String,
@@ -2762,6 +3207,11 @@ pub struct LocalTranscriberApp {
     overlay_diagnostic: Option<OverlayDiagnostic>,
     overlay_first_presented_at: HashMap<SessionId, Instant>,
     hotkey_service: HotkeyService,
+    capture_controller: audio::control::CaptureController,
+    pending_direct_capture: Option<audio::control::CaptureTicket>,
+    capture_control_id: Option<audio::CaptureId>,
+    microphone_test_control_id: Option<audio::CaptureId>,
+    history_playback_lease: Option<audio::control::AudioOwnerLease>,
     tray_service: Option<TrayService>,
     last_tray_state: Option<TrayUiState>,
     window_hidden_to_tray: bool,
@@ -2844,6 +3294,13 @@ impl LocalTranscriberApp {
         let settings_store = config_path
             .clone()
             .map(|path| SettingsStore::new(path, SETTINGS_SAVE_DEBOUNCE));
+        let capture_controller = audio::control::CaptureController::new()
+            .expect("audio control thread should start during application initialization");
+        let hotkey_service = HotkeyService::new(
+            &config.recording.hotkey,
+            &cc.egui_ctx,
+            capture_controller.handle(),
+        );
         let mut app = Self {
             hotkey_input: config.recording.hotkey.clone(),
             model_search: String::new(),
@@ -2880,7 +3337,12 @@ impl LocalTranscriberApp {
             playground_reference_transcript: String::new(),
             playground_reference_user_edited: false,
             playground_ranking_mode: RankingMode::Balanced,
-            hotkey_service: HotkeyService::new(&config.recording.hotkey, &cc.egui_ctx),
+            hotkey_service,
+            capture_controller,
+            pending_direct_capture: None,
+            capture_control_id: None,
+            microphone_test_control_id: None,
+            history_playback_lease: None,
             config,
             config_path,
             settings_store,
@@ -2901,6 +3363,7 @@ impl LocalTranscriberApp {
             #[cfg(test)]
             comparison_output_replacement_count: 0,
             model_management: ModelManagementState::default(),
+            pending_onnx_removal: None,
             models_route_focus_pending: false,
             status: TranscriptionStatus::Idle,
             transcript: String::new(),
@@ -2971,6 +3434,20 @@ impl LocalTranscriberApp {
         }
         app.capture_download_diagnostic_warning();
 
+        let onnx_removal_storage = config::onnx_bundle_storage_dir(&app.config);
+        let onnx_removal_storage_identity = fs::canonicalize(&onnx_removal_storage)
+            .unwrap_or_else(|_| onnx_removal_storage.clone());
+        let mut onnx_removal_model_ids = config::configured_models(&app.config)
+            .into_iter()
+            .filter_map(|model| {
+                crate::model_catalog::normalized_receipt_backed_bundle_id(&ModelId::new(&model.id))
+                    .filter(|bundle_id| *bundle_id == model.id)
+                    .map(str::to_owned)
+            })
+            .collect::<Vec<_>>();
+        onnx_removal_model_ids.extend(app.config.general.pending_onnx_removals.keys().cloned());
+        onnx_removal_model_ids.sort();
+        onnx_removal_model_ids.dedup();
         let allowed_model_targets = config::configured_models(&app.config)
             .into_iter()
             .filter(|model| {
@@ -3026,14 +3503,77 @@ impl LocalTranscriberApp {
                     reconcile_managed_removal(target, std::slice::from_ref(target), fingerprint)?;
                 }
                 let removal_roots = vec![config::model_storage_dir(&app.config)];
-                discover_managed_removal_targets(&removal_roots).and_then(|discovered| {
-                    let mut allowed_targets = allowed_removal_targets.clone();
-                    allowed_targets.extend(discovered);
-                    allowed_targets.sort();
-                    allowed_targets.dedup();
-                    allowed_targets.iter().try_for_each(|target| {
-                        reconcile_managed_removal(target, &allowed_targets, fingerprint).map(|_| ())
+                let discovered = discover_managed_removal_targets(&removal_roots)?;
+                let mut onnx_recovery_model_ids = onnx_removal_model_ids.clone();
+                let mut generic_discovered = Vec::new();
+                for target in discovered {
+                    if target.starts_with(&onnx_removal_storage)
+                        || target.starts_with(&onnx_removal_storage_identity)
+                    {
+                        let model_id = target
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .ok_or_else(|| {
+                                InstallError::RecoveryRequired(format!(
+                                    "ONNX removal journal target has no stable UTF-8 model id: {}",
+                                    target.display()
+                                ))
+                            })?;
+                        let expected = crate::onnx_model_bundles::bundle_target_root(
+                            &onnx_removal_storage_identity,
+                            model_id,
+                        )
+                        .map_err(|error| {
+                            InstallError::RecoveryRequired(format!(
+                                "ONNX removal journal target has an invalid model id at {}: {error}",
+                                target.display()
+                            ))
+                        })?;
+                        if target != expected {
+                            return Err(InstallError::RecoveryRequired(format!(
+                                "ONNX removal journal does not bind a direct catalog storage child: {}",
+                                target.display()
+                            )));
+                        }
+                        onnx_recovery_model_ids.push(model_id.to_owned());
+                    } else {
+                        generic_discovered.push(target);
+                    }
+                }
+                onnx_recovery_model_ids.sort();
+                onnx_recovery_model_ids.dedup();
+                let mut recovery_fingerprint = fingerprint.to_string();
+                for model_id in &onnx_recovery_model_ids {
+                    if let Some(recovered_config) = reconcile_onnx_bundle_removal(
+                        &onnx_removal_storage,
+                        model_id,
+                        &recovery_fingerprint,
+                    )? {
+                        app.config = recovered_config;
+                        recovery_fingerprint =
+                            config::settings::artifact_config_fingerprint(&app.config).map_err(
+                                |error| {
+                                    InstallError::RecoveryRequired(format!(
+                                        "could not fingerprint durable settings after ONNX removal recovery: {error}"
+                                    ))
+                                },
+                            )?;
+                    }
+                }
+                let mut allowed_targets = allowed_removal_targets
+                    .iter()
+                    .filter(|target| {
+                        !target.starts_with(&onnx_removal_storage)
+                            && !target.starts_with(&onnx_removal_storage_identity)
                     })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                allowed_targets.extend(generic_discovered);
+                allowed_targets.sort();
+                allowed_targets.dedup();
+                allowed_targets.iter().try_for_each(|target| {
+                    reconcile_managed_removal(target, &allowed_targets, &recovery_fingerprint)
+                        .map(|_| ())
                 })
             });
         if let Err(error) = removal_recovery {
@@ -3042,6 +3582,14 @@ impl LocalTranscriberApp {
             app.status_message = message.clone();
             app.artifact_recovery_error = Some(message);
         }
+        let durable_artifact_fingerprint = config::settings::artifact_config_fingerprint(
+            &app.config,
+        )
+        .map_err(|error| {
+            InstallError::RecoveryRequired(format!(
+                "could not fingerprint durable settings after artifact removal recovery: {error}"
+            ))
+        });
         let activation_recovery = durable_artifact_fingerprint.and_then(|fingerprint| {
             reconcile_activation_journal(
                 &activation_journal_path(),
@@ -3109,6 +3657,7 @@ impl LocalTranscriberApp {
 
         app.rebuild_model_inventory_projection();
         app.request_history_page(false);
+        app.sync_capture_controller_hotkey();
 
         app
     }
@@ -3450,11 +3999,15 @@ impl LocalTranscriberApp {
             );
         }
         if let Some(pending) = self.pending_recording.take() {
-            pending.cancellation.cancel();
-            self.abandoned_capture_cleanups
-                .push(AbandonedCaptureCleanup::AwaitingCapture {
-                    session_id: pending.session_id,
-                });
+            if let Some(capture_id) = self.capture_control_id.take() {
+                let _ = self.capture_controller.handle().abort(capture_id);
+                let _ = self.capture_controller.handle().release(capture_id.0);
+                self.abandoned_capture_cleanups
+                    .push(AbandonedCaptureCleanup::AwaitingCapture {
+                        session_id: pending.session_id,
+                        capture_id,
+                    });
+            }
             self.record_session_diagnostic(
                 pending.session_id,
                 &pending.latency,
@@ -3476,8 +4029,15 @@ impl LocalTranscriberApp {
         );
         self.retire_captured_target(active.session_id);
         let _ = self.overlay_controller.hide(active.session_id);
+        let capture_id = self.capture_control_id.take();
+        if let Some(capture_id) = capture_id {
+            let _ = self.capture_controller.handle().abort(capture_id);
+        }
         if let Err(err) = active.session.stop_and_discard(Duration::from_secs(2)) {
             eprintln!("failed to stop and discard active recording: {err:#}");
+        }
+        if let Some(capture_id) = capture_id {
+            let _ = self.capture_controller.handle().release(capture_id.0);
         }
     }
 
@@ -3560,15 +4120,70 @@ impl LocalTranscriberApp {
             || !self.abandoned_capture_cleanups.is_empty()
     }
 
+    fn audio_owner(&self) -> Option<AudioOwner> {
+        select_audio_owner(
+            self.capture_is_active(),
+            self.microphone_test_is_active(),
+            self.playing_history_id.is_some() || self.history_playback_stopping,
+        )
+    }
+
+    fn controller_capture_id(&self) -> Option<audio::CaptureId> {
+        self.capture_control_id.or_else(|| {
+            self.capture_controller
+                .handle()
+                .owner_id(audio::control::AudioOwnerKind::Capture)
+                .map(audio::CaptureId)
+        })
+    }
+
+    fn sync_capture_controller_hotkey(&self) {
+        let model_ready = self.selected_model().is_some_and(|model| {
+            runtime_status_for_model(&self.config, &model) == ModelRuntimeStatus::Ready
+        });
+        let enabled = !self.quit_requested
+            && !self.capturing_hotkey
+            && self.armed_history_repaste.is_none()
+            && self.deferred_recording_start.is_none()
+            && self.artifact_recovery_error.is_none()
+            && self.artifact_installations.is_empty()
+            && self.audio_owner().is_none()
+            && model_ready;
+        let mode = match self.config.recording.hotkey_mode {
+            HotkeyMode::HoldToTalk => audio::control::CaptureHotkeyMode::HoldToTalk,
+            HotkeyMode::Toggle => audio::control::CaptureHotkeyMode::Toggle,
+        };
+        let mut options = capture_options_from_config(&self.config);
+        options.short_speech_rescue = self.config.recording.hotkey_mode == HotkeyMode::HoldToTalk;
+        let _ = self.capture_controller.handle().reconfigure_hotkey(
+            enabled,
+            mode,
+            self.config.recording.max_recording_seconds,
+            self.config.recording.audio_input_device_name.clone(),
+            options,
+        );
+    }
+
     fn poll_abandoned_capture_cleanups(&mut self) {
         let mut index = 0;
         while index < self.abandoned_capture_cleanups.len() {
             let finished = match &self.abandoned_capture_cleanups[index] {
-                AbandonedCaptureCleanup::AwaitingCapture { .. } => false,
+                AbandonedCaptureCleanup::AwaitingCapture { capture_id, .. } => {
+                    self.capture_controller
+                        .handle()
+                        .owner_id(audio::control::AudioOwnerKind::Capture)
+                        != Some(capture_id.0)
+                }
                 AbandonedCaptureCleanup::Draining { session, .. } => session.try_finish().is_some(),
             };
             if finished {
-                self.abandoned_capture_cleanups.remove(index);
+                let cleanup = self.abandoned_capture_cleanups.remove(index);
+                if let Some(capture_id) = cleanup.capture_id() {
+                    let _ = self.capture_controller.handle().release(capture_id.0);
+                    if self.capture_control_id == Some(capture_id) {
+                        self.capture_control_id = None;
+                    }
+                }
             } else {
                 index += 1;
             }
@@ -3580,6 +4195,11 @@ impl LocalTranscriberApp {
         session_id: SessionId,
         result: Result<RecordingSession, CaptureError>,
     ) {
+        let capture_id = self
+            .abandoned_capture_cleanups
+            .iter()
+            .find(|cleanup| cleanup.session_id() == session_id)
+            .and_then(AbandonedCaptureCleanup::capture_id);
         self.abandoned_capture_cleanups
             .retain(|cleanup| cleanup.session_id() != session_id);
         if let Ok(session) = result {
@@ -3587,6 +4207,7 @@ impl LocalTranscriberApp {
             self.abandoned_capture_cleanups
                 .push(AbandonedCaptureCleanup::Draining {
                     session_id,
+                    capture_id,
                     session,
                 });
         }
@@ -3624,17 +4245,6 @@ impl LocalTranscriberApp {
         !matches!(self.microphone_test, MicrophoneTest::Idle)
     }
 
-    fn passive_microphone_monitor_needed(&self) -> bool {
-        !self.quit_requested
-            && !self.window_hidden_to_tray
-            && self.current_tab == Tab::General
-            && self.settings_tab == SettingsTab::Recording
-            && !self.capture_is_active()
-            && self.deferred_recording_start.is_none()
-            && self.deferred_history_playback.is_none()
-            && self.playing_history_id.is_none()
-    }
-
     fn current_sensitivity_level_sample(&self) -> (LevelSnapshot, Option<u64>, bool) {
         if let Some(active) = self.active_recording.as_ref() {
             return (
@@ -3654,29 +4264,14 @@ impl LocalTranscriberApp {
     }
 
     fn ensure_microphone_monitor(&mut self) {
-        if !self.passive_microphone_monitor_needed()
-            || self.microphone_test_is_active()
-            || self.microphone_monitor_retry_required
-        {
+        if self.microphone_test_is_active() || self.microphone_monitor_retry_required {
             return;
         }
         self.start_microphone_test();
     }
 
-    fn sync_passive_microphone_monitor(&mut self) {
-        if self.passive_microphone_monitor_needed() {
-            self.ensure_microphone_monitor();
-        } else {
-            self.suspend_microphone_monitor();
-        }
-    }
-
     fn start_microphone_test(&mut self) {
-        if self.quit_requested
-            || self.microphone_test_is_active()
-            || self.capture_is_active()
-            || self.playing_history_id.is_some()
-        {
+        if self.quit_requested || self.microphone_test_is_active() || self.audio_owner().is_some() {
             return;
         }
 
@@ -3688,42 +4283,53 @@ impl LocalTranscriberApp {
         let max_duration_seconds = config::MAX_RECORDING_SECONDS;
         self.microphone_test_sequence = self.microphone_test_sequence.wrapping_add(1);
         let request_id = self.microphone_test_sequence;
-        let cancellation = CaptureCancellation::new();
+        let ticket = match self.capture_controller.handle().start_capture(
+            audio::control::AudioOwnerKind::MicrophoneTest,
+            Instant::now(),
+            max_duration_seconds,
+            input_device_name,
+            options,
+        ) {
+            Ok(ticket) => ticket,
+            Err(error) => {
+                self.microphone_test_error = Some(error.to_string());
+                self.microphone_monitor_retry_required = true;
+                self.status_message = format!("Microphone monitoring unavailable: {error}");
+                return;
+            }
+        };
         self.microphone_test = MicrophoneTest::Starting {
             request_id,
             stop_requested: false,
-            cancellation: cancellation.clone(),
         };
+        self.microphone_test_control_id = Some(ticket.capture_id);
         self.microphone_test_error = None;
         self.microphone_monitor_retry_required = false;
-        let tx = self.tx.clone();
-        thread::spawn(move || {
-            let result = audio::start_recording(
-                max_duration_seconds,
-                input_device_name,
-                options,
-                None,
-                cancellation,
-            );
-            let _ = tx.send(AppEvent::MicrophoneTestReady { request_id, result });
-        });
     }
 
     fn stop_microphone_test(&mut self) {
         self.microphone_test = match std::mem::take(&mut self.microphone_test) {
-            MicrophoneTest::Starting {
-                request_id,
-                cancellation,
-                ..
-            } => {
-                cancellation.cancel();
+            MicrophoneTest::Starting { request_id, .. } => {
+                if let Some(id) = self
+                    .capture_controller
+                    .handle()
+                    .owner_id(audio::control::AudioOwnerKind::MicrophoneTest)
+                {
+                    let _ = self.capture_controller.handle().stop(audio::CaptureId(id));
+                }
                 MicrophoneTest::Starting {
                     request_id,
                     stop_requested: true,
-                    cancellation,
                 }
             }
             MicrophoneTest::Active { session } => {
+                if let Some(id) = self
+                    .capture_controller
+                    .handle()
+                    .owner_id(audio::control::AudioOwnerKind::MicrophoneTest)
+                {
+                    let _ = self.capture_controller.handle().stop(audio::CaptureId(id));
+                }
                 session.stop();
                 MicrophoneTest::Stopping { session }
             }
@@ -3742,6 +4348,9 @@ impl LocalTranscriberApp {
             .session()
             .and_then(RecordingSession::try_finish);
         if let Some(result) = completion {
+            if let Some(capture_id) = self.microphone_test_control_id.take() {
+                let _ = self.capture_controller.handle().release(capture_id.0);
+            }
             self.microphone_test = MicrophoneTest::Idle;
             self.microphone_level_envelope.reset_source();
             self.microphone_test_error = result.err().map(|error| error.to_string());
@@ -3924,9 +4533,15 @@ impl LocalTranscriberApp {
         if let Some(pending) = self.pending_recording.take()
             && pending.session_id == session_id
         {
-            pending.cancellation.cancel();
-            self.abandoned_capture_cleanups
-                .push(AbandonedCaptureCleanup::AwaitingCapture { session_id });
+            if let Some(capture_id) = self.capture_control_id.take() {
+                let _ = self.capture_controller.handle().abort(capture_id);
+                let _ = self.capture_controller.handle().release(capture_id.0);
+                self.abandoned_capture_cleanups
+                    .push(AbandonedCaptureCleanup::AwaitingCapture {
+                        session_id,
+                        capture_id,
+                    });
+            }
             self.record_session_diagnostic(
                 session_id,
                 &pending.latency,
@@ -3942,10 +4557,15 @@ impl LocalTranscriberApp {
                 DiagnosticSessionOutcome::Cancelled,
                 None,
             );
-            active.session.stop();
+            let capture_id = self.controller_capture_id();
+            if let Some(capture_id) = capture_id {
+                let _ = self.capture_controller.handle().abort(capture_id);
+            }
+            active.session.abort();
             self.abandoned_capture_cleanups
                 .push(AbandonedCaptureCleanup::Draining {
                     session_id,
+                    capture_id,
                     session: active.session,
                 });
         } else {
@@ -4409,30 +5029,41 @@ impl LocalTranscriberApp {
         // A recording request has priority over retained-audio playback that was waiting
         // for the same monitor teardown. Never allow the two deferred audio owners to coexist.
         self.deferred_history_playback = None;
-        if self.microphone_test_is_active() {
-            if self.deferred_recording_start.is_none() {
-                self.deferred_recording_start = Some(DeferredRecordingStart {
-                    source,
-                    activation_at,
-                    trigger_observation,
-                });
-                self.stop_microphone_test();
-                self.status_message = "Preparing microphone".to_owned();
+        match self.audio_owner() {
+            Some(AudioOwner::MicrophoneTest) => {
+                if self.deferred_recording_start.is_none() {
+                    self.deferred_recording_start = Some(DeferredRecordingStart {
+                        source,
+                        activation_at,
+                        trigger_observation,
+                    });
+                    self.stop_microphone_test();
+                    self.status_message = "Preparing microphone".to_owned();
+                    if source == RecordingSource::Transcribe {
+                        self.transcribe_notice =
+                            Some(TranscribeNotice::information("Preparing microphone…"));
+                    }
+                }
+                return;
+            }
+            Some(AudioOwner::HistoryPlayback) => {
+                self.status_message =
+                    "Stop retained-audio playback before starting dictation".to_owned();
                 if source == RecordingSource::Transcribe {
                     self.transcribe_notice =
-                        Some(TranscribeNotice::information("Preparing microphone…"));
+                        Some(TranscribeNotice::failure(self.status_message.clone()));
                 }
+                return;
             }
-            return;
-        }
-        if self.playing_history_id.is_some() {
-            self.status_message =
-                "Stop retained-audio playback before starting dictation".to_owned();
-            if source == RecordingSource::Transcribe {
-                self.transcribe_notice =
-                    Some(TranscribeNotice::failure(self.status_message.clone()));
+            Some(AudioOwner::Capture) => return,
+            Some(AudioOwner::Conflict) => {
+                self.status = TranscriptionStatus::Error;
+                self.status_message =
+                    "Audio ownership conflict detected; wait for active audio work to stop."
+                        .to_owned();
+                return;
             }
-            return;
+            None => {}
         }
         if let Some(message) = self.artifact_recovery_error.as_ref() {
             self.status = TranscriptionStatus::Error;
@@ -4456,9 +5087,6 @@ impl LocalTranscriberApp {
                     TranscribeRecoveryAction::OpenModelSettings,
                 ));
             }
-            return;
-        }
-        if self.capture_is_active() {
             return;
         }
         if source == RecordingSource::Playground
@@ -4533,12 +5161,82 @@ impl LocalTranscriberApp {
         } else {
             NativeOverlayMode::Off
         };
-        self.begin_overlay_session(session_id, overlay_mode, captured_target);
-
         let max_duration_seconds = self.config.recording.max_recording_seconds;
         let input_device_name = self.config.recording.audio_input_device_name.clone();
-        let capture_options = capture_options_from_config(&self.config);
-        let mut preview_publisher = None;
+        let mut capture_options = capture_options_from_config(&self.config);
+        capture_options.short_speech_rescue = short_speech_rescue_enabled(
+            source,
+            trigger_observation,
+            self.config.recording.hotkey_mode,
+        );
+        let ticket = if source == RecordingSource::Transcribe
+            && trigger_observation == TriggerObservation::HotkeyPoll
+        {
+            self.pending_direct_capture.take()
+        } else {
+            None
+        };
+        let ticket = match ticket {
+            Some(ticket) => {
+                if self
+                    .capture_controller
+                    .handle()
+                    .adopt_hotkey_capture(&ticket)
+                    .is_err()
+                {
+                    self.capture_controller
+                        .handle()
+                        .terminate_capture(ticket.capture_id);
+                    let _ = self.session_coordinator.cancel_active();
+                    if let Some(target) = captured_target.as_ref() {
+                        crate::overlay::platform::release_captured_target(target);
+                    }
+                    return;
+                }
+                ticket
+            }
+            None => match self.capture_controller.handle().start_capture(
+                audio::control::AudioOwnerKind::Capture,
+                activation_at,
+                max_duration_seconds,
+                input_device_name,
+                capture_options,
+            ) {
+                Ok(ticket) => ticket,
+                Err(error) => {
+                    let _ = self.session_coordinator.cancel_active();
+                    if let Some(target) = captured_target.as_ref() {
+                        crate::overlay::platform::release_captured_target(target);
+                    }
+                    self.status = TranscriptionStatus::Error;
+                    self.status_message = format!("Could not start microphone: {error}");
+                    return;
+                }
+            },
+        };
+        self.capture_control_id = Some(ticket.capture_id);
+        let preview_slot = ticket.preview_slot.clone();
+        let capture_diagnostics = latency
+            .capture_diagnostics
+            .as_ref()
+            .cloned()
+            .unwrap_or_default();
+        self.pending_recording = Some(PendingRecording {
+            session_id,
+            source,
+            stop_requested: false,
+            max_duration_seconds,
+            latency,
+            capture_diagnostics,
+        });
+        self.status = TranscriptionStatus::Listening;
+        self.status_message = "Preparing microphone".to_owned();
+
+        // Urgent capture dispatch deliberately precedes overlay presentation,
+        // model warm-up, and rolling-preview construction. The late-binding
+        // publisher slot lets those privacy-safe resources catch up without
+        // delaying stream startup.
+        self.begin_overlay_session(session_id, overlay_mode, captured_target);
         let mut preview_status = None;
         if rolling_preview_enabled(source, self.config.streaming.mode)
             && let Some(model) = preload_model.as_ref()
@@ -4555,7 +5253,7 @@ impl LocalTranscriberApp {
                     model.local_path.clone(),
                 ) {
                     Ok((publisher, handle)) => {
-                        preview_publisher = Some(publisher);
+                        let _ = preview_slot.install(publisher);
                         self.rolling_preview = Some(handle);
                         let _ = self
                             .overlay_controller
@@ -4577,40 +5275,13 @@ impl LocalTranscriberApp {
                 }
             }
         }
-        let cancellation = CaptureCancellation::new();
-        let capture_diagnostics = latency
-            .capture_diagnostics
-            .as_ref()
-            .cloned()
-            .unwrap_or_default();
-        self.pending_recording = Some(PendingRecording {
-            session_id,
-            source,
-            stop_requested: false,
-            max_duration_seconds,
-            latency,
-            capture_diagnostics,
-            cancellation: cancellation.clone(),
-        });
-        self.status = TranscriptionStatus::Listening;
-        self.status_message =
-            preview_status.unwrap_or_else(|| "Preparing microphone and local model".to_owned());
+        if let Some(preview_status) = preview_status {
+            self.status_message = preview_status;
+        }
 
         if let Some(model) = preload_model {
             self.start_model_preload(session_id, model);
         }
-
-        let tx = self.tx.clone();
-        thread::spawn(move || {
-            let result = audio::start_recording(
-                max_duration_seconds,
-                input_device_name,
-                capture_options,
-                preview_publisher,
-                cancellation,
-            );
-            let _ = tx.send(AppEvent::CaptureReady { session_id, result });
-        });
     }
 
     fn start_model_preload(&mut self, session_id: SessionId, model: SttModelInfo) {
@@ -4676,11 +5347,15 @@ impl LocalTranscriberApp {
             self.fail_history_context(context, "Dictation was superseded");
         }
         if let Some(pending) = self.pending_recording.take() {
-            pending.cancellation.cancel();
-            self.abandoned_capture_cleanups
-                .push(AbandonedCaptureCleanup::AwaitingCapture {
-                    session_id: pending.session_id,
-                });
+            if let Some(capture_id) = self.capture_control_id.take() {
+                let _ = self.capture_controller.handle().stop(capture_id);
+                let _ = self.capture_controller.handle().release(capture_id.0);
+                self.abandoned_capture_cleanups
+                    .push(AbandonedCaptureCleanup::AwaitingCapture {
+                        session_id: pending.session_id,
+                        capture_id,
+                    });
+            }
             self.record_session_diagnostic(
                 pending.session_id,
                 &pending.latency,
@@ -4837,7 +5512,10 @@ impl LocalTranscriberApp {
                             .to_owned();
                 }
             }
-            PreviewDrainAction::FinishCapture(capture) => self.finish_capture(*capture),
+            PreviewDrainAction::FinishCapture(mut capture) => {
+                capture.latency.preview_drained_at = Some(Instant::now());
+                self.finish_capture(*capture);
+            }
             PreviewDrainAction::ReapAfterFailure => {}
             PreviewDrainAction::Fail {
                 session_id,
@@ -4971,9 +5649,20 @@ impl LocalTranscriberApp {
             self.status_message = "Recording cancelled".to_owned();
             return;
         }
-        if let Some(pending) = self.pending_recording.as_mut()
-            && !pending.stop_requested
-        {
+        let pending_capture_id = self
+            .pending_recording
+            .as_ref()
+            .and_then(|_| self.controller_capture_id());
+        if let Some(pending) = self.pending_recording.as_mut() {
+            // Direct hotkey dispatch may already have requested this Stop. The
+            // controller call is intentionally idempotent so UI/tray paths
+            // always target the same capture ID as the urgent path.
+            if let Some(capture_id) = pending_capture_id {
+                let _ = self.capture_controller.handle().stop(capture_id);
+            }
+            if pending.stop_requested {
+                return;
+            }
             let _ = self
                 .session_coordinator
                 .request_stop(pending.session_id, StopReason::Explicit);
@@ -4982,12 +5671,16 @@ impl LocalTranscriberApp {
             self.status_message = "Cancelling microphone startup".to_owned();
             return;
         }
+        let active_capture_id = self.controller_capture_id();
         if let Some(active) = self.active_recording.as_mut()
             && !active.stop_requested
         {
             let _ = self
                 .session_coordinator
                 .request_stop(active.session_id, StopReason::Explicit);
+            if let Some(capture_id) = active_capture_id {
+                let _ = self.capture_controller.handle().stop(capture_id);
+            }
             active.session.stop();
             active.stop_requested = true;
             active.latency.stop_requested_at = Some(Instant::now());
@@ -5024,11 +5717,21 @@ impl LocalTranscriberApp {
         });
 
         if let Some((source, session_id, result)) = finished {
+            if let Some(capture_id) = self.controller_capture_id()
+                && self
+                    .capture_controller
+                    .handle()
+                    .release(capture_id.0)
+                    .is_ok()
+                && self.capture_control_id == Some(capture_id)
+            {
+                self.capture_control_id = None;
+            }
             let active = self
                 .active_recording
                 .take()
                 .expect("finished recording should still be active");
-            let capture = FinishedCapture {
+            let mut capture = FinishedCapture {
                 session_id,
                 source,
                 result,
@@ -5037,14 +5740,38 @@ impl LocalTranscriberApp {
                 latency: active.latency,
                 capture_diagnostics: active.capture_diagnostics,
             };
+            let skip_terminal_preview = self
+                .rolling_preview
+                .as_ref()
+                .filter(|preview| preview.identity().session_id == session_id)
+                .is_some_and(|preview| {
+                    !preview.has_emitted_partial()
+                        || capture
+                            .result
+                            .as_ref()
+                            .ok()
+                            .and_then(|completion| completion.audio.as_ref())
+                            .is_none_or(|audio| {
+                                audio.duration_ms()
+                                    < u128::from(crate::streaming::DECODE_INTERVAL_MS)
+                            })
+                });
+            if skip_terminal_preview && let Some(preview) = self.rolling_preview.as_ref() {
+                preview.invalidate();
+            }
             if self.has_preview_for_session(session_id) {
                 let scheduled = self.begin_preview_drain(
                     session_id,
                     PreviewDrainAction::FinishCapture(Box::new(capture)),
                 );
                 debug_assert!(scheduled);
-                self.status_message = "Finalizing live preview before the full pass".to_owned();
+                self.status_message = if skip_terminal_preview {
+                    "Finalizing recording before the full pass".to_owned()
+                } else {
+                    "Finalizing live preview before the full pass".to_owned()
+                };
             } else {
+                capture.latency.preview_drained_at = Some(Instant::now());
                 self.finish_capture(capture);
             }
         }
@@ -5119,6 +5846,22 @@ impl LocalTranscriberApp {
                     }
                 }
             }
+            Err(CaptureError::Discarded) => {
+                capture.latency.capture_finalized_at = Some(Instant::now());
+                self.record_session_diagnostic(
+                    session_id,
+                    &capture.latency,
+                    DiagnosticSessionOutcome::Cancelled,
+                    None,
+                );
+                self.latest_latency =
+                    self.merged_overlay_latency(session_id, Some(capture.latency));
+                let _ = self.session_coordinator.cancel_active();
+                self.retire_captured_target(session_id);
+                let _ = self.overlay_controller.hide(session_id);
+                self.status = TranscriptionStatus::Idle;
+                self.status_message = "Recording cancelled".to_owned();
+            }
             Err(error) => {
                 capture.latency.capture_finalized_at = Some(Instant::now());
                 self.record_session_diagnostic(
@@ -5135,27 +5878,220 @@ impl LocalTranscriberApp {
     }
 
     fn poll_hotkey(&mut self) {
+        // Reconcile current app eligibility/config before adopting any ticket
+        // that the urgent callback issued while the UI thread was delayed.
+        self.sync_capture_controller_hotkey();
         for observed in self.hotkey_service.poll_events() {
-            if observed.event == HotkeyEvent::Pressed
-                && self.consume_armed_history_repaste(observed.observed_at)
-            {
-                continue;
+            self.process_hotkey_observation(observed);
+        }
+    }
+
+    fn process_hotkey_observation(&mut self, observed: crate::hotkey::ObservedHotkeyEvent) {
+        self.process_hotkey_observation_with(observed, |app, observed_at| {
+            app.consume_armed_history_repaste(observed_at)
+        });
+    }
+
+    fn process_hotkey_observation_with(
+        &mut self,
+        observed: crate::hotkey::ObservedHotkeyEvent,
+        consume_armed_repaste: impl FnOnce(&mut Self, Instant) -> bool,
+    ) {
+        let direct_start_id = match &observed.direct_dispatch {
+            audio::control::HotkeyDispatch::Start(ticket) => Some(ticket.capture_id),
+            audio::control::HotkeyDispatch::Stop { .. } | audio::control::HotkeyDispatch::None => {
+                None
             }
-            match hotkey_recording_action(
-                self.config.recording.hotkey_mode,
-                observed.event,
-                self.recording_source(),
-            ) {
-                Some(HotkeyRecordingAction::StartTranscribe) => self.start_recording_at(
-                    RecordingSource::Transcribe,
-                    observed.observed_at,
-                    TriggerObservation::HotkeyPoll,
-                ),
-                Some(HotkeyRecordingAction::Stop) => self.stop_recording(),
-                Some(HotkeyRecordingAction::Toggle) => {
-                    self.toggle_recording_at(observed.observed_at, TriggerObservation::HotkeyPoll)
+        };
+        if observed.event == HotkeyEvent::Pressed && self.armed_history_repaste.is_some() {
+            if let Some(capture_id) = direct_start_id {
+                self.capture_controller
+                    .handle()
+                    .terminate_capture(capture_id);
+            }
+            if consume_armed_repaste(self, observed.observed_at) {
+                return;
+            }
+        }
+        match observed.direct_dispatch {
+            audio::control::HotkeyDispatch::Start(ticket) => {
+                self.pending_direct_capture = Some(ticket);
+            }
+            audio::control::HotkeyDispatch::Stop { capture_id } => {
+                let _ = capture_id;
+            }
+            audio::control::HotkeyDispatch::None => return,
+        }
+        match hotkey_recording_action(
+            self.config.recording.hotkey_mode,
+            observed.event,
+            self.recording_source(),
+        ) {
+            Some(HotkeyRecordingAction::StartTranscribe) => self.start_recording_at(
+                RecordingSource::Transcribe,
+                observed.observed_at,
+                TriggerObservation::HotkeyPoll,
+            ),
+            Some(HotkeyRecordingAction::Stop) => self.stop_recording(),
+            Some(HotkeyRecordingAction::Toggle) => {
+                self.toggle_recording_at(observed.observed_at, TriggerObservation::HotkeyPoll)
+            }
+            None => {}
+        }
+        if let Some(ticket) = self.pending_direct_capture.take() {
+            self.capture_controller
+                .handle()
+                .terminate_capture(ticket.capture_id);
+        }
+    }
+
+    fn poll_capture_controller(&mut self) {
+        for event in self.capture_controller.poll_events() {
+            match event {
+                audio::control::CaptureLifecycleEvent::Ready {
+                    capture_id,
+                    owner: audio::control::AudioOwnerKind::Capture,
+                    session,
+                } => {
+                    if self.capture_control_id == Some(capture_id)
+                        && let Some(session_id) = self
+                            .pending_recording
+                            .as_ref()
+                            .map(|pending| pending.session_id)
+                    {
+                        let _ = self.tx.send(AppEvent::CaptureReady {
+                            session_id,
+                            result: Ok(session),
+                        });
+                    } else {
+                        session.abort();
+                        let _ = self.capture_controller.handle().abort(capture_id);
+                        let _ = self.capture_controller.handle().release(capture_id.0);
+                    }
                 }
-                None => {}
+                audio::control::CaptureLifecycleEvent::Ready {
+                    capture_id,
+                    owner: audio::control::AudioOwnerKind::MicrophoneTest,
+                    session,
+                } => {
+                    if self.microphone_test_control_id == Some(capture_id)
+                        && let MicrophoneTest::Starting { request_id, .. } = self.microphone_test
+                    {
+                        let _ = self.tx.send(AppEvent::MicrophoneTestReady {
+                            request_id,
+                            result: Ok(session),
+                        });
+                    } else {
+                        session.abort();
+                        let _ = self.capture_controller.handle().abort(capture_id);
+                        let _ = self.capture_controller.handle().release(capture_id.0);
+                    }
+                }
+                audio::control::CaptureLifecycleEvent::Failed {
+                    capture_id,
+                    owner: audio::control::AudioOwnerKind::Capture,
+                    error,
+                } => {
+                    if self
+                        .abandoned_capture_cleanups
+                        .iter()
+                        .any(|cleanup| cleanup.capture_id() == Some(capture_id))
+                    {
+                        self.abandoned_capture_cleanups
+                            .retain(|cleanup| cleanup.capture_id() != Some(capture_id));
+                        if self.capture_control_id == Some(capture_id) {
+                            self.capture_control_id = None;
+                        }
+                        continue;
+                    }
+                    if self.capture_control_id == Some(capture_id)
+                        && self.pending_recording.as_ref().is_some_and(|pending| {
+                            pending.stop_requested
+                                && matches!(error, CaptureError::StartupCancelled)
+                        })
+                    {
+                        let pending = self
+                            .pending_recording
+                            .take()
+                            .expect("cancelled pending capture should still exist");
+                        self.capture_control_id = None;
+                        self.record_session_diagnostic(
+                            pending.session_id,
+                            &pending.latency,
+                            DiagnosticSessionOutcome::Cancelled,
+                            None,
+                        );
+                        let _ = self.session_coordinator.cancel_active();
+                        self.retire_captured_target(pending.session_id);
+                        let _ = self.overlay_controller.hide(pending.session_id);
+                        self.status = TranscriptionStatus::Idle;
+                        self.status_message = "Recording cancelled".to_owned();
+                    } else if self.capture_control_id == Some(capture_id)
+                        && let Some(session_id) = self
+                            .pending_recording
+                            .as_ref()
+                            .map(|pending| pending.session_id)
+                    {
+                        let _ = self.tx.send(AppEvent::CaptureReady {
+                            session_id,
+                            result: Err(error),
+                        });
+                        self.capture_control_id = None;
+                    }
+                }
+                audio::control::CaptureLifecycleEvent::Failed {
+                    capture_id,
+                    owner: audio::control::AudioOwnerKind::MicrophoneTest,
+                    error,
+                } => {
+                    if self.microphone_test_control_id == Some(capture_id)
+                        && let MicrophoneTest::Starting { request_id, .. } = self.microphone_test
+                    {
+                        let _ = self.tx.send(AppEvent::MicrophoneTestReady {
+                            request_id,
+                            result: Err(error),
+                        });
+                        self.microphone_test_control_id = None;
+                    }
+                }
+                audio::control::CaptureLifecycleEvent::Ready {
+                    capture_id,
+                    session,
+                    ..
+                } => {
+                    session.abort();
+                    let _ = self.capture_controller.handle().abort(capture_id);
+                    let _ = self.capture_controller.handle().release(capture_id.0);
+                }
+                audio::control::CaptureLifecycleEvent::Starting { capture_id, owner } => {
+                    let _ = (capture_id, owner);
+                }
+                audio::control::CaptureLifecycleEvent::StopRequested { capture_id }
+                | audio::control::CaptureLifecycleEvent::Aborted { capture_id } => {
+                    let _ = capture_id;
+                }
+                audio::control::CaptureLifecycleEvent::Reconfigured { revision } => {
+                    let _ = revision;
+                }
+                audio::control::CaptureLifecycleEvent::Released { capture_id, owner } => {
+                    match owner {
+                        audio::control::AudioOwnerKind::Capture => {
+                            self.abandoned_capture_cleanups
+                                .retain(|cleanup| cleanup.capture_id() != Some(capture_id));
+                            if self.capture_control_id == Some(capture_id) {
+                                self.capture_control_id = None;
+                            }
+                        }
+                        audio::control::AudioOwnerKind::MicrophoneTest => {
+                            if self.microphone_test_control_id == Some(capture_id) {
+                                self.microphone_test_control_id = None;
+                            }
+                        }
+                        audio::control::AudioOwnerKind::Playback => {}
+                    }
+                }
+                audio::control::CaptureLifecycleEvent::Failed { .. }
+                | audio::control::CaptureLifecycleEvent::Shutdown => {}
             }
         }
     }
@@ -5363,6 +6299,7 @@ impl LocalTranscriberApp {
                     text,
                     expires_at: Instant::now() + Duration::from_secs(30),
                 });
+                self.sync_capture_controller_hotkey();
                 self.status_message = format!(
                     "Paste armed for history entry {id}. Focus the destination and press {} within 30 seconds.",
                     self.config.recording.hotkey
@@ -5385,19 +6322,42 @@ impl LocalTranscriberApp {
                 );
             }
             HistoryPageAction::Play(history_id) => {
-                if self.capture_is_active() || self.deferred_recording_start.is_some() {
-                    self.status_message = "Stop recording before playing retained audio".to_owned();
-                    return;
+                match self.audio_owner() {
+                    Some(AudioOwner::Capture | AudioOwner::Conflict) => {
+                        self.status_message =
+                            "Stop recording before playing retained audio".to_owned();
+                        return;
+                    }
+                    None if self.deferred_recording_start.is_some() => {
+                        self.status_message =
+                            "Stop recording before playing retained audio".to_owned();
+                        return;
+                    }
+                    Some(AudioOwner::MicrophoneTest) => {
+                        self.deferred_history_playback = Some(history_id);
+                        self.stop_microphone_test();
+                        self.status_message = "Preparing audio playback".to_owned();
+                        return;
+                    }
+                    Some(AudioOwner::HistoryPlayback) => return,
+                    None => {}
                 }
-                if self.microphone_test_is_active() {
-                    self.deferred_history_playback = Some(history_id);
-                    self.stop_microphone_test();
-                    self.status_message = "Preparing audio playback".to_owned();
-                    return;
-                }
+                let lease = match self
+                    .capture_controller
+                    .handle()
+                    .reserve_owner(audio::control::AudioOwnerKind::Playback)
+                {
+                    Ok(lease) => lease,
+                    Err(error) => {
+                        self.status_message = format!("Audio is busy: {error}");
+                        return;
+                    }
+                };
                 let Some(store) = self.history_store.clone() else {
+                    let _ = self.capture_controller.handle().release(lease.id);
                     return;
                 };
+                self.history_playback_lease = Some(lease);
                 self.playing_history_id = Some(history_id);
                 self.history_playback_stopping = false;
                 let tx = self.tx.clone();
@@ -5424,6 +6384,9 @@ impl LocalTranscriberApp {
                     self.playing_history_id = None;
                     self.history_playback_stopping = false;
                     self.status_message = "Native history playback is unavailable".to_owned();
+                }
+                if self.playing_history_id.is_none() {
+                    self.release_history_playback_lease();
                 }
             }
             HistoryPageAction::Retry(history_id) => {
@@ -5714,6 +6677,7 @@ impl LocalTranscriberApp {
                         self.playing_history_id = None;
                     }
                     self.history_playback_stopping = false;
+                    self.release_history_playback_lease();
                     self.status_message = "History playback finished".to_owned();
                 }
                 PlaybackEvent::Stopped { history_id } => {
@@ -5721,6 +6685,7 @@ impl LocalTranscriberApp {
                         self.playing_history_id = None;
                     }
                     self.history_playback_stopping = false;
+                    self.release_history_playback_lease();
                     self.status_message = "History playback stopped".to_owned();
                 }
                 PlaybackEvent::Failed { history_id, error } => {
@@ -5728,10 +6693,18 @@ impl LocalTranscriberApp {
                         self.playing_history_id = None;
                     }
                     self.history_playback_stopping = false;
+                    self.release_history_playback_lease();
                     self.status = TranscriptionStatus::Error;
                     self.status_message = format!("History playback failed: {error}");
                 }
             }
+        }
+    }
+
+    fn release_history_playback_lease(&mut self) {
+        if let Some(lease) = self.history_playback_lease.take() {
+            debug_assert_eq!(lease.owner, audio::control::AudioOwnerKind::Playback);
+            let _ = self.capture_controller.handle().release(lease.id);
         }
     }
 
@@ -5928,14 +6901,20 @@ impl LocalTranscriberApp {
                     recovery_required,
                     result,
                 } => {
-                    if self
+                    let unified_job = self.artifact_installations.get(&model_id).is_some_and(
+                        |(active_job, _)| {
+                            *active_job == job_id
+                                && self.artifact_installations.phase_for_model(&model_id)
+                                    == Some(ArtifactInstallPhase::Finalizing)
+                        },
+                    );
+                    let legacy_job = self
                         .onnx_bundle_install
                         .as_ref()
-                        .is_none_or(|job| !job.matches(job_id, &model_id))
-                    {
+                        .is_some_and(|job| job.matches(job_id, &model_id));
+                    if !unified_job && !legacy_job {
                         continue;
                     }
-                    self.onnx_download_activity = None;
                     self.remote_catalog.invalidate_local_models();
                     let (downloaded_bytes, total_bytes) = self
                         .model_downloads
@@ -5947,7 +6926,8 @@ impl LocalTranscriberApp {
                     // replacement job because it is rejected above.
                     let discard_source = self.take_requested_partial_discard(&model_id, job_id);
                     match result {
-                        Ok(smoke) => {
+                        Ok(committed) => {
+                            let CommittedOnnxBundleInstall { smoke, ownership } = committed;
                             self.record_download_diagnostic(
                                 &model_id,
                                 job_id,
@@ -5960,22 +6940,32 @@ impl LocalTranscriberApp {
                                 },
                             );
                             self.model_downloads
-                                .insert(model_id, ModelInstallStatus::Installed);
+                                .insert(model_id.clone(), ModelInstallStatus::Installed);
                             self.remote_catalog.invalidate_local_models();
-                            self.status = TranscriptionStatus::Idle;
-                            self.status_message = format!(
-                                "ONNX model installed and smoke-tested (health {} ms, load {} ms, decode {} ms, reload {} ms, CPU).",
-                                smoke.health_duration_ms,
-                                smoke.load_duration_ms,
-                                smoke.decode_duration_ms,
-                                smoke.reload_duration_ms,
-                            );
+                            match self.persist_onnx_ownership_witness(&ownership) {
+                                Ok(()) => {
+                                    self.status = TranscriptionStatus::Idle;
+                                    self.status_message = format!(
+                                        "ONNX model installed and smoke-tested (health {} ms, load {} ms, decode {} ms, reload {} ms, CPU).",
+                                        smoke.health_duration_ms,
+                                        smoke.load_duration_ms,
+                                        smoke.decode_duration_ms,
+                                        smoke.reload_duration_ms,
+                                    );
+                                }
+                                Err(error) => {
+                                    self.status = TranscriptionStatus::Error;
+                                    self.status_message = format!(
+                                        "The ONNX model was installed and smoke-tested, but Scribe could not persist its removal ownership witness: {error}. The bundle will not be removable until exact verification and settings persistence succeed."
+                                    );
+                                }
+                            }
                             self.rebuild_local_models_after_committed_change();
                         }
                         Err(message) => {
                             if recovery_required {
                                 self.artifact_recovery_error = Some(message.clone());
-                                self.freeze_artifact_installs_for_recovery(None);
+                                self.freeze_artifact_installs_for_recovery(Some(job_id));
                             }
                             if paused {
                                 if discard_source.is_none() {
@@ -6054,11 +7044,11 @@ impl LocalTranscriberApp {
                             }
                         }
                     }
-                    // Keep the ONNX job's admission slot until correlated
-                    // cancel-and-discard cleanup has finished. The worker has
-                    // acknowledged termination, but a replacement install
-                    // must not race the synchronous partial deletion above.
-                    if let Some(mut job) = self.onnx_bundle_install.take() {
+                    // Keep target ownership until correlated discard cleanup
+                    // finishes; a replacement install must not race deletion.
+                    if unified_job {
+                        self.finish_artifact_install(&model_id, job_id);
+                    } else if let Some(mut job) = self.onnx_bundle_install.take() {
                         job.reap_completed();
                     }
                 }
@@ -6068,7 +7058,6 @@ impl LocalTranscriberApp {
                         MicrophoneTest::Starting {
                             request_id: expected,
                             stop_requested,
-                            cancellation: _,
                         } if expected == request_id => match result {
                             Ok(session)
                                 if stop_requested
@@ -6111,7 +7100,10 @@ impl LocalTranscriberApp {
                         continue;
                     }
                     if self.session_coordinator.active_session_id() != Some(session_id) {
-                        pending.cancellation.cancel();
+                        if let Some(capture_id) = self.capture_control_id.take() {
+                            let _ = self.capture_controller.handle().abort(capture_id);
+                            let _ = self.capture_controller.handle().release(capture_id.0);
+                        }
                         self.handle_abandoned_capture_result(session_id, result);
                         continue;
                     }
@@ -6119,9 +7111,11 @@ impl LocalTranscriberApp {
                         Ok(session) => {
                             if let Err(err) = self.session_coordinator.capture_started(session_id) {
                                 session.stop();
+                                let capture_id = self.capture_control_id.take();
                                 self.abandoned_capture_cleanups.push(
                                     AbandonedCaptureCleanup::Draining {
                                         session_id,
+                                        capture_id,
                                         session,
                                     },
                                 );
@@ -6346,6 +7340,7 @@ impl LocalTranscriberApp {
                     if self.history_playback_stopping {
                         self.playing_history_id = None;
                         self.history_playback_stopping = false;
+                        self.release_history_playback_lease();
                         self.status_message = "History playback stopped".to_owned();
                         continue;
                     }
@@ -6380,6 +7375,9 @@ impl LocalTranscriberApp {
                                 Some(format!("Could not load history audio: {error}"));
                             self.request_history_page(false);
                         }
+                    }
+                    if self.playing_history_id.is_none() {
+                        self.release_history_playback_lease();
                     }
                 }
                 AppEvent::HistoryOutputRecorded { result } => match result {
@@ -7157,8 +8155,23 @@ impl LocalTranscriberApp {
                         self.finish_artifact_install(&model_id, job_id);
                         continue;
                     }
+                    #[cfg(test)]
+                    let persistence = if self.config_path.is_none() {
+                        Ok(())
+                    } else {
+                        config::settings::artifact_config_fingerprint(&previous_config)
+                            .and_then(|prior_fingerprint| {
+                                config::save_artifact_config(&self.config, &prior_fingerprint)
+                            })
+                            .map_err(|error| error.to_string())
+                    };
+                    #[cfg(not(test))]
                     let persistence =
-                        config::save_config(&self.config).map_err(|error| error.to_string());
+                        config::settings::artifact_config_fingerprint(&previous_config)
+                            .and_then(|prior_fingerprint| {
+                                config::save_artifact_config(&self.config, &prior_fingerprint)
+                            })
+                            .map_err(|error| error.to_string());
                     if let Err(message) = persistence {
                         let message = format!(
                             "Could not confirm the verified installation settings commit: {message}. Artifacts and the activation journal were retained unchanged; restart Scribe to reconcile against the durable settings fingerprint."
@@ -7931,6 +8944,13 @@ impl LocalTranscriberApp {
             return;
         }
         self.capturing_hotkey = true;
+        self.sync_capture_controller_hotkey();
+        self.hotkey_service.discard_pending_events();
+        if let Some(ticket) = self.pending_direct_capture.take() {
+            self.capture_controller
+                .handle()
+                .terminate_capture(ticket.capture_id);
+        }
         self.status_message = "Press the new hotkey combination. Press Escape or the recording shortcut card again to cancel.".to_owned();
         self.transcribe_notice = Some(TranscribeNotice::information(
             "Press the new shortcut now. Press Escape or activate the shortcut control again to cancel.",
@@ -7938,6 +8958,7 @@ impl LocalTranscriberApp {
     }
 
     fn cancel_hotkey_capture(&mut self) {
+        self.hotkey_service.discard_pending_events();
         self.capturing_hotkey = false;
         self.hotkey_input = self.config.recording.hotkey.clone();
         self.status_message = "Hotkey capture cancelled.".to_owned();
@@ -8172,10 +9193,14 @@ impl LocalTranscriberApp {
         let persistence = if self.config_path.is_none() {
             Ok(())
         } else {
-            config::save_config(&self.config)
+            config::settings::artifact_config_fingerprint(&previous).and_then(|prior_fingerprint| {
+                config::save_artifact_config(&self.config, &prior_fingerprint)
+            })
         };
         #[cfg(not(test))]
-        let persistence = config::save_config(&self.config);
+        let persistence = config::settings::artifact_config_fingerprint(&previous).and_then(
+            |prior_fingerprint| config::save_artifact_config(&self.config, &prior_fingerprint),
+        );
         if let Err(error) = persistence {
             self.config = previous;
             self.status = TranscriptionStatus::Error;
@@ -8215,25 +9240,7 @@ impl LocalTranscriberApp {
         );
         match managed_downloads::normalized_onnx_bundle_admission(&self.config, &model_id) {
             Ok(Some(admission)) => {
-                if self.onnx_bundle_install.is_some() {
-                    self.fail_model_install(
-                        &model.id,
-                        "An ONNX model installation is already active.".to_owned(),
-                    );
-                    return;
-                }
-                if !self.artifact_installations.is_empty() {
-                    self.fail_model_install(
-                        &model.id,
-                        "Wait for active model downloads and verification to finish before installing an ONNX bundle."
-                            .to_owned(),
-                    );
-                    return;
-                }
-                let job_id = INSTALL_JOB_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-                let cancellation = InstallCancellation::default();
                 self.discard_partial_after_install.remove(&model.id);
-                self.onnx_download_activity = None;
                 self.model_downloads.insert(
                     model.id.clone(),
                     ModelInstallStatus::Downloading {
@@ -8242,8 +9249,26 @@ impl LocalTranscriberApp {
                         bytes_per_second: None,
                     },
                 );
+                self.update_model_download_progress_projection(&model.id);
                 self.status = TranscriptionStatus::Idle;
                 self.status_message = format!("Downloading {}...", model.name);
+                let job_id = match self.artifact_installations.admit_onnx(
+                    model.id.clone(),
+                    admission,
+                    self.config.clone(),
+                ) {
+                    Ok(job_id) => job_id,
+                    Err(message) => {
+                        self.fail_model_install(&model.id, message);
+                        return;
+                    }
+                };
+                self.artifact_installations.initialize_download_diagnostic(
+                    &model.id,
+                    job_id,
+                    retained_bytes,
+                    expected_total_bytes,
+                );
                 self.record_download_diagnostic(
                     &model.id,
                     job_id,
@@ -8253,89 +9278,9 @@ impl LocalTranscriberApp {
                         DownloadDiagnosticEvent::admission(run, job, artifact, source, total)
                     },
                 );
-                let tx = self.tx.clone();
-                let service = self.current_transcription_service();
-                let event_model_id = model.id.clone();
-                let thread_cancellation = cancellation.clone();
-                let (completion_tx, completion) = bounded(1);
-                let worker = thread::Builder::new()
-                    .name("scribe-onnx-bundle-install".to_owned())
-                    .spawn(move || {
-                        let progress = |progress| {
-                            let _ = tx.send(AppEvent::OnnxBundleInstallProgress {
-                                job_id,
-                                model_id: event_model_id.clone(),
-                                progress,
-                            });
-                        };
-                        let result: Result<InstallSmoke, (String, bool)> =
-                            managed_downloads::prepare_onnx_bundle(
-                                &admission,
-                                &thread_cancellation,
-                                &progress,
-                            )
-                            .map_err(|error| {
-                                let recovery_required = error.requires_recovery();
-                                (error.to_string(), recovery_required)
-                            })
-                            .and_then(|staged| {
-                                service
-                                    .verify_onnx_bundle_for_installation(
-                                        staged,
-                                        &thread_cancellation,
-                                    )
-                                    .map_err(|error| (error.to_string(), false))
-                            })
-                            .and_then(|verified| {
-                                let smoke = verified.smoke().clone();
-                                verified
-                                    .activate()
-                                    .and_then(|activated| activated.commit())
-                                    .map_err(|error| {
-                                        let recovery_required = error.requires_recovery();
-                                        (error.to_string(), recovery_required)
-                                    })?;
-                                Ok(smoke)
-                            });
-                        let recovery_required = result
-                            .as_ref()
-                            .err()
-                            .is_some_and(|(_, recovery_required)| *recovery_required);
-                        // Only a failed operation observes pause. Once activation
-                        // commits, a late cancellation signal cannot relabel the
-                        // successful installation as paused.
-                        let paused = result.is_err()
-                            && !recovery_required
-                            && thread_cancellation.is_cancelled();
-                        let result = result.map_err(|(message, _)| message);
-                        // Signal before the unbounded terminal event so the UI
-                        // can reap the worker without racing its final return.
-                        let _ = completion_tx.send(());
-                        let _ = tx.send(AppEvent::OnnxBundleInstallFinished {
-                            job_id,
-                            model_id: event_model_id,
-                            paused,
-                            recovery_required,
-                            result,
-                        });
-                    });
-                match worker {
-                    Ok(worker) => {
-                        self.onnx_bundle_install = Some(OnnxBundleInstallJob {
-                            job_id,
-                            model_id: model.id.clone(),
-                            cancellation,
-                            completion,
-                            worker: Some(worker),
-                        });
-                        self.update_model_download_progress_projection(&model.id);
-                    }
-                    Err(error) => {
-                        self.fail_model_install(
-                            &model.id,
-                            format!("Could not start ONNX bundle installation: {error}"),
-                        );
-                    }
+                self.launch_ready_artifact_transfers();
+                if let Some(status) = self.artifact_installations.aggregate_status() {
+                    self.status_message = status;
                 }
                 return;
             }
@@ -8522,23 +9467,56 @@ impl LocalTranscriberApp {
         for launch in launches {
             self.update_model_download_progress_projection(&launch.model_id);
             let tx = self.tx.clone();
-            thread::spawn(move || {
-                let model_id = ModelId::new(launch.model_id.clone());
-                let progress = |progress| {
-                    send_install_progress(&tx, launch.job_id, &launch.model_id, progress)
-                };
-                let result = prepare_verified_install(
-                    VerifiedInstallPreparationRequest {
-                        config: launch.config,
-                        model_id,
-                        cancellation: launch.cancellation,
-                        source: launch.source,
-                        expected_target_identity: launch.expected_target_identity,
-                    },
-                    &progress,
-                );
-                send_verified_install_preparation(&tx, launch.job_id, launch.model_id, result);
-            });
+            let registered_model_id = launch.model_id.clone();
+            let registered_job_id = launch.job_id;
+            let (completion_tx, completion) = bounded(1);
+            let worker = thread::Builder::new()
+                .name("scribe-model-transfer".to_owned())
+                .spawn(move || {
+                    let model_id = ModelId::new(launch.model_id.clone());
+                    let progress = |progress| {
+                        send_install_progress(&tx, launch.job_id, &launch.model_id, progress)
+                    };
+                    let result = catch_install_worker_panic(
+                        "Model transfer",
+                        InstallWorkerPanicSafety::RetrySafe,
+                        || {
+                            prepare_verified_install(
+                                VerifiedInstallPreparationRequest {
+                                    config: launch.config,
+                                    model_id,
+                                    cancellation: launch.cancellation,
+                                    source: launch.source,
+                                    expected_target_identity: launch.expected_target_identity,
+                                },
+                                &progress,
+                            )
+                        },
+                    );
+                    let _ = completion_tx.send(());
+                    send_verified_install_preparation(&tx, launch.job_id, launch.model_id, result);
+                });
+            match worker {
+                Ok(worker) => {
+                    let registered = self.artifact_installations.register_worker(
+                        &registered_model_id,
+                        registered_job_id,
+                        ArtifactInstallWorker {
+                            completion,
+                            worker: Some(worker),
+                        },
+                    );
+                    debug_assert!(registered);
+                }
+                Err(error) => send_verified_install_preparation(
+                    &self.tx,
+                    registered_job_id,
+                    registered_model_id,
+                    Err(InstallJobFailure::normal(format!(
+                        "Could not start model transfer worker: {error}"
+                    ))),
+                ),
+            }
         }
     }
 
@@ -8554,18 +9532,129 @@ impl LocalTranscriberApp {
         let tx = self.tx.clone();
         let config = self.config.clone();
         let service = self.transcription_service.with_config(config.clone());
-        thread::spawn(move || {
-            let progress =
-                |progress| send_install_progress(&tx, launch.job_id, &launch.model_id, progress);
-            let result = run_verified_install_finalizer(
-                config,
-                service,
-                launch.cancellation,
-                launch.prepared,
-                &progress,
-            );
-            send_verified_install_result(&tx, launch.job_id, launch.model_id, result);
-        });
+        let registered_model_id = launch.model_id.clone();
+        let registered_job_id = launch.job_id;
+        let (completion_tx, completion) = bounded(1);
+        let worker = thread::Builder::new()
+            .name("scribe-model-finalizer".to_owned())
+            .spawn(move || match launch.prepared {
+                PreparedArtifactInstall::Gguf(prepared) => {
+                    let progress = |progress| {
+                        send_install_progress(&tx, launch.job_id, &launch.model_id, progress)
+                    };
+                    let result = catch_install_worker_panic(
+                        "Model finalization",
+                        InstallWorkerPanicSafety::RecoveryRequired,
+                        || {
+                            run_verified_install_finalizer(
+                                config,
+                                service,
+                                launch.cancellation,
+                                *prepared,
+                                &progress,
+                            )
+                        },
+                    );
+                    let _ = completion_tx.send(());
+                    send_verified_install_result(&tx, launch.job_id, launch.model_id, result);
+                }
+                PreparedArtifactInstall::Onnx(staged) => {
+                    let cancellation = launch.cancellation;
+                    let result = catch_install_worker_panic(
+                        "Model finalization",
+                        InstallWorkerPanicSafety::RecoveryRequired,
+                        || run_onnx_bundle_finalizer(service, cancellation.clone(), *staged),
+                    );
+                    let recovery_required = result
+                        .as_ref()
+                        .err()
+                        .is_some_and(|failure| failure.recovery_required);
+                    let paused =
+                        result.is_err() && !recovery_required && cancellation.is_cancelled();
+                    let result = result.map_err(|failure| failure.message);
+                    let _ = completion_tx.send(());
+                    let _ = tx.send(AppEvent::OnnxBundleInstallFinished {
+                        job_id: launch.job_id,
+                        model_id: launch.model_id,
+                        paused,
+                        recovery_required,
+                        result,
+                    });
+                }
+                #[cfg(test)]
+                PreparedArtifactInstall::PanickingTestFinalizer(fault) => {
+                    let result = catch_install_worker_panic(
+                        "Model finalization",
+                        InstallWorkerPanicSafety::RecoveryRequired,
+                        || -> Result<VerifiedInstallResult, InstallJobFailure> {
+                            match fault {
+                                PanickingFinalizerTestFault::JournalCreation {
+                                    journal_path,
+                                    model_target,
+                                } => {
+                                    let _journal = ActivationJournal::begin(
+                                        journal_path,
+                                        model_target,
+                                        "0".repeat(64),
+                                    )
+                                    .map_err(InstallJobFailure::from)?;
+                                    panic!(
+                                        "sensitive injected panic after activation journal creation"
+                                    );
+                                }
+                                PanickingFinalizerTestFault::ModelActivation(model) => {
+                                    let _activated =
+                                        model.activate().map_err(InstallJobFailure::from)?;
+                                    panic!("sensitive injected panic after model activation");
+                                }
+                                PanickingFinalizerTestFault::DirectoryActivation(staged) => {
+                                    let _activated =
+                                        staged.activate().map_err(InstallJobFailure::from)?;
+                                    panic!("sensitive injected panic after directory activation");
+                                }
+                            }
+                        },
+                    );
+                    let _ = completion_tx.send(());
+                    send_verified_install_result(&tx, launch.job_id, launch.model_id, result);
+                }
+                #[cfg(test)]
+                PreparedArtifactInstall::WaitingTestFinalizer(release) => {
+                    let result = catch_install_worker_panic(
+                        "Model finalization",
+                        InstallWorkerPanicSafety::RecoveryRequired,
+                        || {
+                            let _ = release.recv();
+                            Err(InstallJobFailure::normal(
+                                "Test finalizer worker released.".to_owned(),
+                            ))
+                        },
+                    );
+                    let _ = completion_tx.send(());
+                    send_verified_install_result(&tx, launch.job_id, launch.model_id, result);
+                }
+            });
+        match worker {
+            Ok(worker) => {
+                let registered = self.artifact_installations.register_worker(
+                    &registered_model_id,
+                    registered_job_id,
+                    ArtifactInstallWorker {
+                        completion,
+                        worker: Some(worker),
+                    },
+                );
+                debug_assert!(registered);
+            }
+            Err(error) => send_verified_install_result(
+                &self.tx,
+                registered_job_id,
+                registered_model_id,
+                Err(InstallJobFailure::normal(format!(
+                    "Could not start model finalizer worker: {error}"
+                ))),
+            ),
+        }
     }
 
     fn finish_artifact_install(&mut self, model_id: &str, job_id: u64) {
@@ -8996,7 +10085,20 @@ impl LocalTranscriberApp {
             &config::model_storage_dir(&self.config),
             &imported.model_id,
         );
-        if let Err(error) = config::save_config(&self.config) {
+        let prior_artifact_fingerprint =
+            match config::settings::artifact_config_fingerprint(&previous_config) {
+                Ok(fingerprint) => fingerprint,
+                Err(error) => {
+                    self.config = previous_config;
+                    self.status = TranscriptionStatus::Error;
+                    self.set_local_gguf_import_message(format!(
+                        "Could not prepare the local import settings transaction: {error}."
+                    ));
+                    return;
+                }
+            };
+        if let Err(error) = config::save_artifact_config(&self.config, &prior_artifact_fingerprint)
+        {
             self.config = previous_config;
             self.status = TranscriptionStatus::Error;
             self.set_local_gguf_import_message(format!(
@@ -9007,8 +10109,12 @@ impl LocalTranscriberApp {
         if let Err(error) =
             installed_manifest::persist_manifest_at(&imported.manifest, &receipt_path)
         {
+            let installed_artifact_fingerprint =
+                config::settings::artifact_config_fingerprint(&self.config);
             self.config = previous_config;
-            let config_rollback = config::save_config(&self.config).err();
+            let config_rollback = installed_artifact_fingerprint
+                .and_then(|fingerprint| config::save_artifact_config(&self.config, &fingerprint))
+                .err();
             let message = format!(
                 "Could not persist the local import receipt after saving settings: {error}.{}",
                 config_rollback
@@ -9039,10 +10145,149 @@ impl LocalTranscriberApp {
         ));
     }
 
+    fn verified_onnx_removal_candidate_for_model(
+        &self,
+        model: &SttModelInfo,
+    ) -> Result<Option<OnnxOwnershipLease>, String> {
+        if !matches!(
+            crate::model_catalog::normalized_install_artifact(&ModelId::new(&model.id)),
+            Some(crate::model_catalog::NormalizedInstallArtifact::ReceiptBackedBundle { .. })
+        ) {
+            return Ok(None);
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = model;
+            return Err(
+                "Receipt-backed ONNX removal is unavailable on this platform because Scribe cannot establish a stable deletion capability."
+                    .to_owned(),
+            );
+        }
+        #[cfg(windows)]
+        {
+            let expected_target =
+                config::onnx_bundle_target_root(&self.config, &ModelId::new(&model.id))
+                    .ok_or_else(|| {
+                        "The ONNX model does not have an exact catalog-derived removal target."
+                            .to_owned()
+                    })?;
+            if model.local_path.as_deref() != Some(expected_target.as_path()) {
+                return Err(
+                    "The ONNX model path is not Scribe's exact catalog-derived bundle location; no files were authorized for removal."
+                        .to_owned(),
+                );
+            }
+            let ownership = authorize_onnx_bundle_removal(
+                &config::onnx_bundle_storage_dir(&self.config),
+                &model.id,
+            )
+            .map_err(|error| {
+                format!("The ONNX bundle receipt or file tree failed removal verification: {error}")
+            })?
+            .ok_or_else(|| {
+                "The ONNX bundle is no longer present at its exact managed location.".to_owned()
+            })?;
+            let candidate = ownership.candidate();
+            if candidate.model_id() != model.id || candidate.target_root() != expected_target {
+                return Err(
+                    "The ONNX bundle receipt did not authorize the exact catalog target; no files were removed."
+                        .to_owned(),
+                );
+            }
+            Ok(Some(ownership))
+        }
+    }
+
+    fn persist_onnx_ownership_witness(
+        &mut self,
+        ownership: &OnnxOwnershipLease,
+    ) -> Result<(), String> {
+        let candidate = ownership.candidate();
+        let expected_target =
+            config::onnx_bundle_target_root(&self.config, &ModelId::new(candidate.model_id()))
+                .ok_or_else(|| {
+                    "ONNX ownership evidence did not identify a current catalog bundle.".to_owned()
+                })?;
+        if candidate.target_root() != expected_target {
+            return Err(
+                "ONNX ownership evidence did not bind the exact catalog target.".to_owned(),
+            );
+        }
+        let expected_fingerprint = config::settings::artifact_config_fingerprint(&self.config)
+            .map_err(|error| {
+                format!("Could not fingerprint the current ONNX artifact settings: {error}")
+            })?;
+        if let Some(durable_fingerprint) = ownership
+            .durable_artifact_fingerprint()
+            .map_err(|error| error.to_string())?
+            && durable_fingerprint != expected_fingerprint
+        {
+            return Err(
+                "Durable model artifact settings changed in another process; refresh model state and retry."
+                    .to_owned(),
+            );
+        }
+        if onnx_ownership_witness_matches(&self.config, candidate) {
+            return Ok(());
+        }
+
+        let previous = self.config.clone();
+        self.config.general.managed_models.insert(
+            candidate.model_id().to_owned(),
+            onnx_ownership_witness(candidate),
+        );
+        config::normalize_config(&mut self.config);
+        if !onnx_ownership_witness_matches(&self.config, candidate) {
+            self.config = previous;
+            return Err(
+                "ONNX ownership evidence was rejected by managed-path normalization.".to_owned(),
+            );
+        }
+        let persistence = ownership.persist_artifact_config(&expected_fingerprint, &self.config);
+        if let Err(error) = persistence {
+            self.config = previous;
+            return Err(format!(
+                "Could not persist the exact ONNX ownership witness: {error}"
+            ));
+        }
+        if let Some(store) = self.settings_store.as_mut() {
+            store.mark_current_persisted();
+        }
+        self.transcription_service = self.transcription_service.with_config(self.config.clone());
+        self.remote_catalog.invalidate_local_models();
+        Ok(())
+    }
+
+    fn authorize_model_removal(&mut self, model: &SttModelInfo) -> bool {
+        self.pending_onnx_removal = None;
+        let ownership = match self.verified_onnx_removal_candidate_for_model(model) {
+            Ok(Some(ownership)) => ownership,
+            Ok(None) => return true,
+            Err(message) => {
+                self.status = TranscriptionStatus::Error;
+                self.status_message = message;
+                return false;
+            }
+        };
+        if let Err(message) = self.persist_onnx_ownership_witness(&ownership) {
+            self.status = TranscriptionStatus::Error;
+            self.status_message = format!(
+                "The ONNX bundle was verified, but removal could not be authorized: {message}"
+            );
+            return false;
+        }
+        self.pending_onnx_removal = Some(ownership.into_candidate());
+        true
+    }
+
     /// Returns true after removal settings are durably committed. Cleanup can
     /// still require recovery after that point, so callers must not undo the
     /// newly persisted active-model selection on a committed removal.
-    fn uninstall_model(&mut self, model: &SttModelInfo) -> bool {
+    fn uninstall_model(
+        &mut self,
+        model: &SttModelInfo,
+        authorized_onnx_removal: Option<&VerifiedOnnxRemovalCandidate>,
+    ) -> bool {
         let bundled_target = if model.id == BUNDLED_BASE_MODEL_ID
             && model.artifact_origin == ModelArtifactOrigin::Bundled
         {
@@ -9063,6 +10308,33 @@ impl LocalTranscriberApp {
             self.status_message = reason;
             return false;
         }
+        let receipt_backed = matches!(
+            crate::model_catalog::normalized_install_artifact(&ModelId::new(&model.id)),
+            Some(crate::model_catalog::NormalizedInstallArtifact::ReceiptBackedBundle { .. })
+        );
+        let onnx_candidate = if receipt_backed {
+            let Some(candidate) = authorized_onnx_removal else {
+                self.status = TranscriptionStatus::Error;
+                self.status_message = "The ONNX removal confirmation no longer has its exact receipt authorization; reopen it before removing any files."
+                    .to_owned();
+                return false;
+            };
+            let expected_target =
+                config::onnx_bundle_target_root(&self.config, &ModelId::new(&model.id));
+            if candidate.model_id() != model.id
+                || expected_target.as_deref() != Some(candidate.target_root())
+                || model.local_path.as_deref() != Some(candidate.target_root())
+                || !onnx_ownership_witness_matches(&self.config, candidate)
+            {
+                self.status = TranscriptionStatus::Error;
+                self.status_message = "The ONNX bundle or its durable ownership witness changed after confirmation opened; no files were removed. Reopen the confirmation to verify it again."
+                    .to_owned();
+                return false;
+            }
+            Some(candidate)
+        } else {
+            None
+        };
         if let Err(error) = self.transcription_service.unload_runtime() {
             self.status_message = format!("Could not unload the selected model: {error}");
             return false;
@@ -9070,19 +10342,20 @@ impl LocalTranscriberApp {
         let replacement = (self.config.general.selected_default_model == model.id)
             .then(|| self.active_model_removal_replacement(&model.id))
             .flatten();
-        let static_managed_target = self
-            .config
-            .general
-            .managed_models
-            .get(&model.id)
-            .map(|install| install.path.clone())
-            .filter(|path| {
-                config::downloaded_model_path(&self.config, model).as_ref() == Some(path)
+        let static_managed_target = onnx_candidate
+            .is_none()
+            .then(|| {
+                self.config
+                    .general
+                    .managed_models
+                    .get(&model.id)
+                    .map(|install| install.path.clone())
+                    .filter(|path| {
+                        config::downloaded_model_path(&self.config, model).as_ref() == Some(path)
+                    })
+                    .filter(|path| is_app_managed_model_path(&self.config, path))
             })
-            .filter(|path| is_app_managed_model_path(&self.config, path));
-        let onnx_bundle_target =
-            config::onnx_bundle_target_root(&self.config, &ModelId::new(&model.id))
-                .filter(|path| is_app_managed_model_path(&self.config, path));
+            .flatten();
         // Each trusted remote artifact owns an opaque leaf directory. Staging
         // that directory removes the generated provenance manifest together
         // with the model, without affecting another variant in the same Hub
@@ -9106,7 +10379,6 @@ impl LocalTranscriberApp {
         let managed_target = bundled_target
             .clone()
             .or(static_managed_target)
-            .or(onnx_bundle_target)
             .or(remote_managed_target)
             .or(imported_receipt_target);
         let prior_fingerprint = match config::settings::artifact_config_fingerprint(&self.config) {
@@ -9118,44 +10390,113 @@ impl LocalTranscriberApp {
                 return false;
             }
         };
-        let mut staged_removal = match managed_target.as_ref() {
-            Some(target) => {
-                let staged = if removing_bundled {
-                    ManagedRemoval::stage_exact_regular_file(
-                        target,
-                        bundled_target
-                            .as_ref()
-                            .expect("bundled target was established"),
-                        prior_fingerprint,
-                    )
-                } else {
-                    ManagedRemoval::stage(target, std::slice::from_ref(target), prior_fingerprint)
-                };
-                match staged {
-                    Ok(removal) => Some(removal),
-                    Err(error) => {
-                        if error.requires_recovery() {
-                            self.artifact_recovery_error = Some(error.to_string());
-                        }
-                        self.status = TranscriptionStatus::Error;
-                        self.status_message = format!("Could not stage model removal: {error}");
-                        return false;
-                    }
-                }
-            }
-            None => None,
-        };
-        let removed_files = staged_removal
-            .as_ref()
-            .is_some_and(ManagedRemoval::removed_files);
         let previous_config = self.config.clone();
-        self.model_downloads.remove(&model.id);
+        let mut next_config = self.config.clone();
         apply_removed_model_config(
-            &mut self.config,
+            &mut next_config,
             &model.id,
             replacement.as_ref(),
             removing_bundled,
         );
+        let transaction_nonce = if let Some(candidate) = onnx_candidate.as_ref() {
+            if next_config
+                .general
+                .pending_onnx_removals
+                .contains_key(&model.id)
+            {
+                self.status = TranscriptionStatus::Error;
+                self.status_message = format!(
+                    "An earlier ONNX removal transaction for {} still requires recovery; restart Scribe before retrying.",
+                    model.name
+                );
+                return false;
+            }
+            let nonce = match generate_onnx_removal_nonce() {
+                Ok(nonce) => nonce,
+                Err(error) => {
+                    self.status = TranscriptionStatus::Error;
+                    self.status_message = error;
+                    return false;
+                }
+            };
+            next_config.general.pending_onnx_removals.insert(
+                model.id.clone(),
+                config::PendingOnnxRemoval {
+                    target: candidate.target_root().to_path_buf(),
+                    receipt_sha256: candidate.receipt_sha256().to_owned(),
+                    transaction_nonce: nonce.clone(),
+                },
+            );
+            Some(nonce)
+        } else {
+            None
+        };
+        let mut final_config = next_config.clone();
+        if transaction_nonce.is_some() {
+            final_config.general.pending_onnx_removals.remove(&model.id);
+        }
+        let expected_fingerprint = match config::settings::artifact_config_fingerprint(&next_config)
+        {
+            Ok(fingerprint) => fingerprint,
+            Err(error) => {
+                self.status = TranscriptionStatus::Error;
+                self.status_message =
+                    format!("Could not prepare removed-model settings witness: {error}");
+                return false;
+            }
+        };
+        let staged = if let Some(candidate) = onnx_candidate {
+            stage_onnx_bundle_removal(
+                &config::onnx_bundle_storage_dir(&self.config),
+                &model.id,
+                candidate.receipt_sha256(),
+                prior_fingerprint.clone(),
+                expected_fingerprint.clone(),
+                transaction_nonce
+                    .clone()
+                    .expect("ONNX removal candidate must have a transaction nonce"),
+            )
+            .map(StagedModelRemoval::Onnx)
+            .map(Some)
+        } else {
+            match managed_target.as_ref() {
+                Some(target) => {
+                    let staged = if removing_bundled {
+                        ManagedRemoval::stage_exact_regular_file(
+                            target,
+                            bundled_target
+                                .as_ref()
+                                .expect("bundled target was established"),
+                            prior_fingerprint.clone(),
+                        )
+                    } else {
+                        ManagedRemoval::stage(
+                            target,
+                            std::slice::from_ref(target),
+                            prior_fingerprint.clone(),
+                        )
+                    };
+                    staged.map(StagedModelRemoval::Generic).map(Some)
+                }
+                None => Ok(None),
+            }
+        };
+        let mut staged_removal = match staged {
+            Ok(removal) => removal,
+            Err(error) => {
+                if error.requires_recovery() {
+                    self.artifact_recovery_error = Some(error.to_string());
+                }
+                self.status = TranscriptionStatus::Error;
+                self.status_message = format!("Could not stage model removal: {error}");
+                return false;
+            }
+        };
+        let removed_files = staged_removal
+            .as_ref()
+            .is_some_and(StagedModelRemoval::removed_files);
+        self.config = next_config;
+        self.model_downloads.remove(&model.id);
         let removal_preparation = config::settings::artifact_config_fingerprint(&self.config)
             .map_err(|error| error.to_string())
             .and_then(|fingerprint| {
@@ -9186,10 +10527,24 @@ impl LocalTranscriberApp {
         let persistence = if self.config_path.is_none() {
             Ok(())
         } else {
-            config::save_config(&self.config)
+            staged_removal.as_ref().map_or_else(
+                || config::save_artifact_config(&self.config, &prior_fingerprint),
+                |removal| {
+                    removal
+                        .persist_artifact_config(&prior_fingerprint, &self.config)
+                        .map_err(anyhow::Error::msg)
+                },
+            )
         };
         #[cfg(not(test))]
-        let persistence = config::save_config(&self.config);
+        let persistence = staged_removal.as_ref().map_or_else(
+            || config::save_artifact_config(&self.config, &prior_fingerprint),
+            |removal| {
+                removal
+                    .persist_artifact_config(&prior_fingerprint, &self.config)
+                    .map_err(anyhow::Error::msg)
+            },
+        );
         if let Err(error) = persistence {
             self.config = previous_config;
             let message = if removing_bundled {
@@ -9235,7 +10590,11 @@ impl LocalTranscriberApp {
             return false;
         }
         self.remote_catalog.invalidate_local_models();
-        let cleanup = staged_removal.and_then(|removal| removal.commit().err());
+        let cleanup = staged_removal
+            .and_then(|removal| removal.commit(&expected_fingerprint, &final_config).err());
+        if cleanup.is_none() {
+            self.config = final_config;
+        }
         if let Some(store) = self.settings_store.as_mut() {
             store.mark_current_persisted();
         }
@@ -9369,18 +10728,29 @@ impl LocalTranscriberApp {
     }
 
     fn cancel_installations_for_shutdown(&mut self) {
-        for (_, cancellation) in self.artifact_installations.values() {
-            cancellation.cancel();
+        let deadline = Instant::now() + ARTIFACT_INSTALL_SHUTDOWN_TIMEOUT;
+        if !self.artifact_installations.cancel_and_wait_until(deadline) {
+            eprintln!(
+                "model installation workers exceeded the shutdown deadline; detaching cancelled workers"
+            );
         }
         if let Some(mut job) = self.onnx_bundle_install.take()
-            && !job.cancel_and_wait(ONNX_BUNDLE_INSTALL_SHUTDOWN_TIMEOUT)
+            && !job.cancel_and_wait(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(ONNX_BUNDLE_INSTALL_SHUTDOWN_TIMEOUT),
+            )
         {
             eprintln!(
                 "ONNX bundle installation exceeded the shutdown deadline; detaching cancelled worker"
             );
         }
         if let Some(mut job) = self.local_gguf_import.take()
-            && !job.cancel_and_wait(LOCAL_GGUF_IMPORT_SHUTDOWN_TIMEOUT)
+            && !job.cancel_and_wait(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(LOCAL_GGUF_IMPORT_SHUTDOWN_TIMEOUT),
+            )
         {
             eprintln!(
                 "local GGUF import exceeded the shutdown deadline; detaching cancelled worker"
@@ -9424,6 +10794,7 @@ impl eframe::App for LocalTranscriberApp {
         if !self.capturing_hotkey {
             self.poll_hotkey();
         }
+        self.poll_capture_controller();
         self.poll_rolling_preview();
         self.poll_preview_drain();
         self.poll_recording();
@@ -9440,6 +10811,7 @@ impl eframe::App for LocalTranscriberApp {
         self.apply_deferred_history_retention_if_idle();
         self.poll_settings_save();
         self.sync_tray_state();
+        self.sync_capture_controller_hotkey();
 
         self.sync_overlay_state();
         let overlay_session_id = self.overlay_controller.state().session_id;
@@ -9516,7 +10888,6 @@ impl eframe::App for LocalTranscriberApp {
             paint_theme_change_status(ctx, &message);
         }
         self.sync_settings_playground_route();
-        self.sync_passive_microphone_monitor();
         egui::CentralPanel::default()
             .frame(content_panel_frame(ctx))
             .show(ctx, |ui| match self.current_tab {
@@ -9541,8 +10912,6 @@ impl eframe::App for LocalTranscriberApp {
                 Tab::About => unreachable!("about navigation is routed to Settings"),
                 Tab::Debug => unreachable!("debug navigation is routed to Settings"),
             });
-
-        self.sync_passive_microphone_monitor();
 
         let repaint_delay = self.next_repaint_delay();
         if self.window_hidden_to_tray
@@ -10914,6 +12283,10 @@ impl LocalTranscriberApp {
             crate::model_catalog::normalized_install_artifact(&ModelId::new(&model.id)),
             Some(crate::model_catalog::NormalizedInstallArtifact::ReceiptBackedBundle { .. })
         );
+        let exact_receipt_backed_target = receipt_backed
+            && config::onnx_bundle_target_root(&self.config, &ModelId::new(&model.id))
+                .as_ref()
+                .is_some_and(|target| model.local_path.as_ref() == Some(target));
         let installed = manageable && (!bundled || install_status.is_runnable());
         let custom = model.local_path.is_some()
             && !self.config.general.managed_models.contains_key(&model.id)
@@ -10923,6 +12296,7 @@ impl LocalTranscriberApp {
                 .managed_remote_models
                 .contains_key(&model.id)
             && !imported_gguf
+            && !exact_receipt_backed_target
             && !bundled;
         let onnx_install_active = self
             .onnx_bundle_install
@@ -11138,7 +12512,9 @@ impl LocalTranscriberApp {
             removal_supported: (bundled && model.id == BUNDLED_BASE_MODEL_ID && installed)
                 || (!bundled
                     && !custom
-                    && (imported_gguf || supports_managed_uninstall(model, &install_status))),
+                    && (imported_gguf
+                        || (supports_managed_uninstall(model, &install_status)
+                            && (!receipt_backed || exact_receipt_backed_target)))),
             partial_cleanup_available,
             partial_cleanup_enabled: partial_cleanup_available && has_partial && !mutation_blocked,
             partial_cleanup_disabled_reason: if partial_cleanup_available {
@@ -11235,14 +12611,20 @@ impl LocalTranscriberApp {
                 }
             }
             ScreenAction::RequestModelRemoval(id) => {
-                let active = self.config.general.selected_default_model == id;
-                let bundled = config::configured_models(&self.config)
+                self.pending_onnx_removal = None;
+                let Some(model) = config::configured_models(&self.config)
                     .into_iter()
                     .find(|model| model.id == id)
-                    .is_some_and(|model| {
-                        model.id == BUNDLED_BASE_MODEL_ID
-                            && model.artifact_origin == ModelArtifactOrigin::Bundled
-                    });
+                else {
+                    self.status = TranscriptionStatus::Error;
+                    self.status_message =
+                        "The requested model is no longer configured; no removal was authorized."
+                            .to_owned();
+                    return;
+                };
+                let active = self.config.general.selected_default_model == id;
+                let bundled = model.id == BUNDLED_BASE_MODEL_ID
+                    && model.artifact_origin == ModelArtifactOrigin::Bundled;
                 let replacement_required = active && !bundled;
                 let replacement = active
                     .then(|| self.active_model_removal_replacement(&id))
@@ -11250,6 +12632,8 @@ impl LocalTranscriberApp {
                 if replacement_required && replacement.is_none() {
                     self.status_message =
                         "Install another ready model before removing the active model.".to_owned();
+                } else if !self.authorize_model_removal(&model) {
+                    self.model_management.removal_replacement = None;
                 } else {
                     self.model_management.restore_remove_focus = matches!(
                         &self.model_management.expanded_model_card,
@@ -11268,6 +12652,7 @@ impl LocalTranscriberApp {
             ScreenAction::CloseModelDialog => match self.model_management.dialog.take() {
                 Some(ModelDialog::Add) => self.model_management.restore_add_focus = true,
                 Some(ModelDialog::Remove(id)) => {
+                    self.pending_onnx_removal = None;
                     self.model_management.restore_remove_focus = Some(id);
                     self.model_management.removal_replacement = None;
                 }
@@ -11389,6 +12774,7 @@ impl LocalTranscriberApp {
                 }
             }
             ScreenAction::ConfirmModelRemoval(id) => {
+                let authorized_onnx_removal = self.pending_onnx_removal.take();
                 self.model_management.dialog = None;
                 self.model_management.restore_remove_focus = None;
                 self.model_management.restore_after_removal_focus = false;
@@ -11425,7 +12811,8 @@ impl LocalTranscriberApp {
                     .into_iter()
                     .find(|model| model.id == id)
                 {
-                    let removal_committed = self.uninstall_model(&model);
+                    let removal_committed =
+                        self.uninstall_model(&model, authorized_onnx_removal.as_ref());
                     if removal_committed {
                         if self.model_management.expanded_model_card.as_ref()
                             == Some(&ModelCardKey::Local(id.clone()))
@@ -11629,7 +13016,7 @@ impl LocalTranscriberApp {
                     .into_iter()
                     .find(|model| model.id == model_id.as_str())
                 {
-                    self.uninstall_model(&model);
+                    self.uninstall_model(&model, None);
                 }
             }
         }
@@ -11663,11 +13050,31 @@ impl LocalTranscriberApp {
                     RemotePartialProbeSource::Normalized(model_id.clone()),
                 ),
             );
-            cancellation.cancel();
-            self.project_pending_partial_discard(model_id.as_str());
-            self.status_message =
-                "Cancelling download; retained partial bytes will be discarded after it exits."
-                    .to_owned();
+            match self.artifact_installations.cancel(model_id.as_str()) {
+                ArtifactCancellationOutcome::SignalledTransfer { .. } => {
+                    cancellation.cancel();
+                    self.project_pending_partial_discard(model_id.as_str());
+                    self.status_message = "Cancelling download; retained partial bytes will be discarded after it exits."
+                        .to_owned();
+                }
+                ArtifactCancellationOutcome::SettledBeforeFinalizer { .. } => {
+                    let source = self
+                        .take_requested_partial_discard(model_id.as_str(), job_id)
+                        .expect("correlated partial-discard intent disappeared");
+                    let result = self.discard_partial_source(&source);
+                    self.finish_partial_discard(model_id.as_str(), result);
+                    self.launch_ready_artifact_transfers();
+                    self.launch_next_artifact_finalizer();
+                }
+                ArtifactCancellationOutcome::FinalizerAlreadyActive { .. } => {
+                    self.discard_partial_after_install.remove(model_id.as_str());
+                    self.status_message = "Verification and activation have started; partials cannot be discarded safely until it finishes."
+                        .to_owned();
+                }
+                ArtifactCancellationOutcome::Missing => {
+                    self.discard_partial_after_install.remove(model_id.as_str());
+                }
+            }
             return;
         }
         if let Some(reason) = self.artifact_mutation_block_reason() {
@@ -11700,13 +13107,33 @@ impl LocalTranscriberApp {
         if let Some((job_id, cancellation)) = self.artifact_installations.get(&model_id).cloned() {
             self.discard_partial_after_install.insert(
                 model_id.clone(),
-                (job_id, RemotePartialProbeSource::Trusted(artifact)),
+                (job_id, RemotePartialProbeSource::Trusted(artifact.clone())),
             );
-            cancellation.cancel();
-            self.project_pending_partial_discard(&model_id);
-            self.status_message =
-                "Cancelling download; retained partial bytes will be discarded after it exits."
-                    .to_owned();
+            match self.artifact_installations.cancel(&model_id) {
+                ArtifactCancellationOutcome::SignalledTransfer { .. } => {
+                    cancellation.cancel();
+                    self.project_pending_partial_discard(&model_id);
+                    self.status_message = "Cancelling download; retained partial bytes will be discarded after it exits."
+                        .to_owned();
+                }
+                ArtifactCancellationOutcome::SettledBeforeFinalizer { .. } => {
+                    let source = self
+                        .take_requested_partial_discard(&model_id, job_id)
+                        .expect("correlated partial-discard intent disappeared");
+                    let result = self.discard_partial_source(&source);
+                    self.finish_partial_discard(&model_id, result);
+                    self.launch_ready_artifact_transfers();
+                    self.launch_next_artifact_finalizer();
+                }
+                ArtifactCancellationOutcome::FinalizerAlreadyActive { .. } => {
+                    self.discard_partial_after_install.remove(&model_id);
+                    self.status_message = "Verification and activation have started; partials cannot be discarded safely until it finishes."
+                        .to_owned();
+                }
+                ArtifactCancellationOutcome::Missing => {
+                    self.discard_partial_after_install.remove(&model_id);
+                }
+            }
             return;
         }
         if let Some(reason) = self.artifact_mutation_block_reason() {
@@ -12547,12 +13974,11 @@ impl LocalTranscriberApp {
             }
             ScreenAction::OpenAudioSettings => self.open_system_audio_settings(),
             ScreenAction::ChangeShortcut => {
-                self.capturing_hotkey = !self.capturing_hotkey;
-                self.status_message = if self.capturing_hotkey {
-                    "Press the new hotkey combination. Press Capture again to cancel.".to_owned()
+                if self.capturing_hotkey {
+                    self.cancel_hotkey_capture();
                 } else {
-                    "Hotkey capture cancelled.".to_owned()
-                };
+                    self.start_hotkey_capture();
+                }
             }
             ScreenAction::SetAutoInsertTranscript(value) => {
                 self.config.output.auto_insert_transcript = value;
@@ -15181,6 +16607,150 @@ mod layout_tests {
     }
 
     #[test]
+    fn short_speech_rescue_is_limited_to_explicit_hold_hotkey_dictation() {
+        assert!(short_speech_rescue_enabled(
+            RecordingSource::Transcribe,
+            TriggerObservation::HotkeyPoll,
+            HotkeyMode::HoldToTalk,
+        ));
+        assert!(!short_speech_rescue_enabled(
+            RecordingSource::Transcribe,
+            TriggerObservation::AppAction,
+            HotkeyMode::HoldToTalk,
+        ));
+        assert!(!short_speech_rescue_enabled(
+            RecordingSource::Transcribe,
+            TriggerObservation::HotkeyPoll,
+            HotkeyMode::Toggle,
+        ));
+        assert!(!short_speech_rescue_enabled(
+            RecordingSource::Playground,
+            TriggerObservation::HotkeyPoll,
+            HotkeyMode::HoldToTalk,
+        ));
+    }
+
+    #[test]
+    fn armed_repaste_consumption_terminates_its_queued_direct_start() {
+        let mut app = test_app();
+        let (ticket, cancelled_rx, retire_tx, accepted_audio) =
+            install_delayed_direct_hotkey_ticket(&mut app);
+        let capture_id = ticket.capture_id;
+        app.apply_history_action(HistoryPageAction::ArmRepaste {
+            id: 42,
+            text: "paste once".to_owned(),
+        });
+        cancelled_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        app.process_hotkey_observation_with(
+            crate::hotkey::ObservedHotkeyEvent {
+                event: HotkeyEvent::Pressed,
+                observed_at: Instant::now(),
+                direct_dispatch: audio::control::HotkeyDispatch::Start(ticket),
+            },
+            |app, _| {
+                app.armed_history_repaste = None;
+                true
+            },
+        );
+
+        assert!(app.pending_direct_capture.is_none());
+        assert!(app.pending_recording.is_none());
+        assert_eq!(app.capture_control_id, None);
+        assert_eq!(
+            app.capture_controller
+                .handle()
+                .owner_id(audio::control::AudioOwnerKind::Capture),
+            Some(capture_id.0)
+        );
+        assert!(!accepted_audio.load(Ordering::Acquire));
+
+        retire_delayed_direct_hotkey_ticket(&mut app, retire_tx);
+        assert_eq!(
+            app.capture_controller
+                .handle()
+                .owner_id(audio::control::AudioOwnerKind::Capture),
+            None
+        );
+        assert!(!accepted_audio.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn stale_direct_start_cannot_be_adopted_after_eligibility_is_disabled() {
+        let mut app = test_app();
+        let (ticket, cancelled_rx, retire_tx, accepted_audio) =
+            install_delayed_direct_hotkey_ticket(&mut app);
+        app.capturing_hotkey = true;
+        app.sync_capture_controller_hotkey();
+        cancelled_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        app.capturing_hotkey = false;
+
+        app.process_hotkey_observation(crate::hotkey::ObservedHotkeyEvent {
+            event: HotkeyEvent::Pressed,
+            observed_at: Instant::now(),
+            direct_dispatch: audio::control::HotkeyDispatch::Start(ticket),
+        });
+
+        assert!(app.pending_direct_capture.is_none());
+        assert!(app.pending_recording.is_none());
+        assert!(app.active_recording.is_none());
+        assert_eq!(app.capture_control_id, None);
+        assert_eq!(app.session_coordinator.active_session_id(), None);
+        assert!(!accepted_audio.load(Ordering::Acquire));
+
+        retire_delayed_direct_hotkey_ticket(&mut app, retire_tx);
+        let playback = app
+            .capture_controller
+            .handle()
+            .reserve_owner(audio::control::AudioOwnerKind::Playback)
+            .unwrap();
+        app.capture_controller
+            .handle()
+            .release(playback.id)
+            .unwrap();
+        assert!(!accepted_audio.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn entering_shortcut_capture_revokes_direct_start_before_accepting_old_shortcut() {
+        let mut app = test_app();
+        let (_ticket, cancelled_rx, retire_tx, accepted_audio) =
+            install_delayed_direct_hotkey_ticket(&mut app);
+
+        app.start_hotkey_capture();
+        cancelled_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        assert!(app.capturing_hotkey);
+        assert!(matches!(
+            app.capture_controller
+                .handle()
+                .dispatch_hotkey(true, Instant::now()),
+            audio::control::HotkeyDispatch::None
+        ));
+        assert!(app.pending_direct_capture.is_none());
+        assert!(app.pending_recording.is_none());
+        assert!(!accepted_audio.load(Ordering::Acquire));
+
+        retire_delayed_direct_hotkey_ticket(&mut app, retire_tx);
+        assert!(
+            app.capture_controller
+                .handle()
+                .owner_id(audio::control::AudioOwnerKind::Capture)
+                .is_none()
+        );
+        let playback = app
+            .capture_controller
+            .handle()
+            .reserve_owner(audio::control::AudioOwnerKind::Playback)
+            .unwrap();
+        app.capture_controller
+            .handle()
+            .release(playback.id)
+            .unwrap();
+        assert!(!accepted_audio.load(Ordering::Acquire));
+    }
+
+    #[test]
     fn hold_to_talk_starts_on_press_and_stops_on_release() {
         assert_eq!(
             hotkey_recording_action(HotkeyMode::HoldToTalk, HotkeyEvent::Pressed, None),
@@ -15223,6 +16793,7 @@ mod layout_tests {
     #[test]
     fn explicit_stop_during_pending_capture_is_preserved() {
         let mut app = test_app();
+        let capture_id = install_cancellable_capture(&mut app);
         let session_id = app
             .session_coordinator
             .begin(SessionPurpose::Dictation)
@@ -15234,7 +16805,6 @@ mod layout_tests {
             max_duration_seconds: 30,
             latency: LatencyTrace::started_at(Instant::now(), TriggerObservation::HotkeyPoll),
             capture_diagnostics: CaptureDiagnosticContext::default(),
-            cancellation: CaptureCancellation::new(),
         });
 
         app.stop_recording();
@@ -15247,16 +16817,74 @@ mod layout_tests {
             Some(StopReason::Explicit)
         );
         assert_eq!(app.status_message, "Cancelling microphone startup");
+        let failed = (0..100).find_map(|_| {
+            let event = app
+                .capture_controller
+                .poll_events()
+                .into_iter()
+                .find(|event| {
+                    matches!(
+                        event,
+                        audio::control::CaptureLifecycleEvent::Failed {
+                            capture_id: failed_id,
+                            error: CaptureError::StartupCancelled,
+                            ..
+                        } if *failed_id == capture_id
+                    )
+                });
+            if event.is_none() {
+                thread::sleep(Duration::from_millis(1));
+            }
+            event
+        });
+        assert!(
+            failed.is_some(),
+            "pending Stop must cancel the controller capture"
+        );
+    }
+
+    #[test]
+    fn expected_startup_cancellation_returns_to_idle_without_failure_ui() {
+        let mut app = test_app();
+        install_cancellable_capture(&mut app);
+        let session_id = app
+            .session_coordinator
+            .begin(SessionPurpose::Dictation)
+            .unwrap();
+        app.pending_recording = Some(PendingRecording {
+            session_id,
+            source: RecordingSource::Transcribe,
+            stop_requested: false,
+            max_duration_seconds: 30,
+            latency: LatencyTrace::started_at(Instant::now(), TriggerObservation::HotkeyPoll),
+            capture_diagnostics: CaptureDiagnosticContext::default(),
+        });
+
+        app.stop_recording();
+        for _ in 0..100 {
+            app.poll_capture_controller();
+            if app.pending_recording.is_none() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        assert!(app.pending_recording.is_none());
+        assert_eq!(app.capture_control_id, None);
+        assert_eq!(app.status, TranscriptionStatus::Idle);
+        assert_eq!(app.status_message, "Recording cancelled");
+        assert!(app.pending_output.is_none());
+        assert!(app.history_requests.is_empty());
     }
 
     #[test]
     fn abandon_pending_capture_is_session_correlated_and_cancels_startup() {
         let mut app = test_app();
+        install_cancellable_capture(&mut app);
         let session_id = app
             .session_coordinator
             .begin(SessionPurpose::Dictation)
             .unwrap();
-        let cancellation = CaptureCancellation::new();
         app.pending_recording = Some(PendingRecording {
             session_id,
             source: RecordingSource::Transcribe,
@@ -15264,19 +16892,139 @@ mod layout_tests {
             max_duration_seconds: 30,
             latency: LatencyTrace::started_at(Instant::now(), TriggerObservation::AppAction),
             capture_diagnostics: CaptureDiagnosticContext::default(),
-            cancellation: cancellation.clone(),
         });
         app.abandon_recording(SessionId(session_id.0 + 1));
-        assert!(!cancellation.is_cancelled());
+        assert_eq!(
+            app.capture_controller.handle().owner(),
+            Some(audio::control::AudioOwnerKind::Capture)
+        );
         app.abandon_recording(session_id);
-        assert!(cancellation.is_cancelled());
         assert!(app.pending_recording.is_none());
         assert_eq!(app.status_message, "Recording discarded.");
         assert_eq!(app.session_coordinator.active_session_id(), None);
         assert!(matches!(
             app.abandoned_capture_cleanups.as_slice(),
-            [AbandonedCaptureCleanup::AwaitingCapture { session_id: cleanup_id }] if *cleanup_id == session_id
+            [AbandonedCaptureCleanup::AwaitingCapture { session_id: cleanup_id, .. }] if *cleanup_id == session_id
         ));
+        for _ in 0..100 {
+            app.poll_capture_controller();
+            app.poll_abandoned_capture_cleanups();
+            if app.abandoned_capture_cleanups.is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(app.abandoned_capture_cleanups.is_empty());
+        assert!(!app.capture_is_active());
+        assert_eq!(app.capture_control_id, None);
+    }
+
+    #[test]
+    fn abandoned_capture_returning_a_session_retires_after_controller_release() {
+        let mut app = test_app();
+        let (entered_tx, entered_rx) = unbounded();
+        let (continue_tx, continue_rx) = unbounded();
+        app.capture_controller = audio::control::CaptureController::with_start_capture_for_test(
+            Arc::new(move |_, _| {
+                entered_tx.send(()).unwrap();
+                continue_rx.recv().unwrap();
+                Ok(RecordingSession::simulated(
+                    None,
+                    CaptureStopReason::Explicit,
+                ))
+            }),
+        )
+        .unwrap();
+        let ticket = app
+            .capture_controller
+            .handle()
+            .start_capture(
+                audio::control::AudioOwnerKind::Capture,
+                Instant::now(),
+                30,
+                None,
+                audio::CaptureOptions::default(),
+            )
+            .unwrap();
+        app.capture_control_id = Some(ticket.capture_id);
+        let session_id = app
+            .session_coordinator
+            .begin(SessionPurpose::Dictation)
+            .unwrap();
+        app.pending_recording = Some(PendingRecording {
+            session_id,
+            source: RecordingSource::Transcribe,
+            stop_requested: false,
+            max_duration_seconds: 30,
+            latency: LatencyTrace::started_at(Instant::now(), TriggerObservation::AppAction),
+            capture_diagnostics: CaptureDiagnosticContext::default(),
+        });
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        app.abandon_recording(session_id);
+        continue_tx.send(()).unwrap();
+        for _ in 0..200 {
+            app.poll_capture_controller();
+            app.poll_abandoned_capture_cleanups();
+            if app.abandoned_capture_cleanups.is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        assert!(app.abandoned_capture_cleanups.is_empty());
+        assert!(!app.capture_is_active());
+        assert_eq!(app.capture_control_id, None);
+        assert!(app.pending_output.is_none());
+    }
+
+    #[test]
+    fn panicking_capture_start_retires_pending_app_state() {
+        let mut app = test_app();
+        app.capture_controller =
+            audio::control::CaptureController::with_start_capture_for_test(Arc::new(|_, _| {
+                panic!("injected app start panic")
+            }))
+            .unwrap();
+        let ticket = app
+            .capture_controller
+            .handle()
+            .start_capture(
+                audio::control::AudioOwnerKind::Capture,
+                Instant::now(),
+                30,
+                None,
+                audio::CaptureOptions::default(),
+            )
+            .unwrap();
+        app.capture_control_id = Some(ticket.capture_id);
+        let session_id = app
+            .session_coordinator
+            .begin(SessionPurpose::Dictation)
+            .unwrap();
+        app.pending_recording = Some(PendingRecording {
+            session_id,
+            source: RecordingSource::Transcribe,
+            stop_requested: false,
+            max_duration_seconds: 30,
+            latency: LatencyTrace::started_at(Instant::now(), TriggerObservation::AppAction),
+            capture_diagnostics: CaptureDiagnosticContext::default(),
+        });
+
+        for _ in 0..100 {
+            app.poll_capture_controller();
+            app.poll_events();
+            if app.pending_recording.is_none() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        assert!(app.pending_recording.is_none());
+        assert_eq!(app.capture_control_id, None);
+        assert!(app.capture_controller.handle().owner().is_none());
+        assert_eq!(app.status, TranscriptionStatus::Error);
+        assert!(app.status_message.contains("worker panicked"));
     }
 
     #[test]
@@ -15288,7 +17036,6 @@ mod layout_tests {
             SessionPurpose::Dictation,
             std::iter::empty(),
         );
-        let cancellation = CaptureCancellation::new();
         app.pending_recording = Some(PendingRecording {
             session_id,
             source: RecordingSource::Transcribe,
@@ -15296,12 +17043,10 @@ mod layout_tests {
             max_duration_seconds: 30,
             latency: LatencyTrace::started_at(Instant::now(), TriggerObservation::AppAction),
             capture_diagnostics: CaptureDiagnosticContext::default(),
-            cancellation: cancellation.clone(),
         });
 
         app.abandon_recording(session_id);
 
-        assert!(!cancellation.is_cancelled());
         assert!(app.pending_recording.is_some());
         assert_eq!(
             app.session_coordinator.phase(),
@@ -15324,7 +17069,6 @@ mod layout_tests {
             max_duration_seconds: 30,
             latency: LatencyTrace::started_at(Instant::now(), TriggerObservation::AppAction),
             capture_diagnostics: CaptureDiagnosticContext::default(),
-            cancellation: CaptureCancellation::new(),
         });
         app.abandon_recording(session_id);
         app.tx
@@ -15504,7 +17248,6 @@ mod layout_tests {
             max_duration_seconds: 30,
             latency: LatencyTrace::started_at(Instant::now(), TriggerObservation::HotkeyPoll),
             capture_diagnostics: CaptureDiagnosticContext::default(),
-            cancellation: CaptureCancellation::new(),
         });
 
         app.stop_recording();
@@ -15575,7 +17318,6 @@ mod layout_tests {
             max_duration_seconds: 30,
             latency: LatencyTrace::started_at(Instant::now(), TriggerObservation::HotkeyPoll),
             capture_diagnostics: CaptureDiagnosticContext::default(),
-            cancellation: CaptureCancellation::new(),
         });
 
         app.tx
@@ -15628,7 +17370,6 @@ mod layout_tests {
                 max_duration_seconds: 30,
                 latency: LatencyTrace::started_at(Instant::now(), TriggerObservation::HotkeyPoll),
                 capture_diagnostics: CaptureDiagnosticContext::default(),
-                cancellation: CaptureCancellation::new(),
             });
             app.tx
                 .send(AppEvent::CaptureReady {
@@ -15816,142 +17557,42 @@ mod layout_tests {
         app.microphone_test = MicrophoneTest::Starting {
             request_id,
             stop_requested: false,
-            cancellation: CaptureCancellation::new(),
         };
     }
 
-    fn assert_fake_monitor_stops(mut app: LocalTranscriberApp) {
-        set_fake_starting_monitor(&mut app, 41);
-        app.sync_passive_microphone_monitor();
-        assert!(matches!(
-            app.microphone_test,
-            MicrophoneTest::Starting {
-                request_id: 41,
-                stop_requested: true,
-                ..
-            }
-        ));
+    #[test]
+    fn idle_recording_settings_construct_no_microphone_session() {
+        let app = passive_monitor_test_app();
+
+        assert!(matches!(app.microphone_test, MicrophoneTest::Idle));
+        assert!(app.pending_recording.is_none());
+        assert!(app.active_recording.is_none());
+        assert_eq!(app.audio_owner(), None);
     }
 
     #[test]
-    fn passive_monitor_predicate_requires_visible_recording_settings_without_an_owner() {
-        let mut app = passive_monitor_test_app();
-        assert!(app.passive_microphone_monitor_needed());
-
-        app.current_tab = Tab::Models;
-        assert!(!app.passive_microphone_monitor_needed());
-        app.current_tab = Tab::General;
-        app.settings_tab = SettingsTab::Recording;
-        assert!(app.passive_microphone_monitor_needed());
-        app.settings_tab = SettingsTab::Recording;
-        app.window_hidden_to_tray = true;
-        assert!(!app.passive_microphone_monitor_needed());
-        app.window_hidden_to_tray = false;
-        app.quit_requested = true;
-        assert!(!app.passive_microphone_monitor_needed());
-        app.quit_requested = false;
-        app.deferred_recording_start = Some(DeferredRecordingStart {
-            source: RecordingSource::Transcribe,
-            activation_at: Instant::now(),
-            trigger_observation: TriggerObservation::AppAction,
-        });
-        assert!(!app.passive_microphone_monitor_needed());
-        app.deferred_recording_start = None;
-        app.deferred_history_playback = Some(7);
-        assert!(!app.passive_microphone_monitor_needed());
-        app.deferred_history_playback = None;
-        app.playing_history_id = Some(7);
-        assert!(!app.passive_microphone_monitor_needed());
-        app.playing_history_id = None;
-
-        app.pending_recording = Some(PendingRecording {
-            session_id: SessionId(70),
-            source: RecordingSource::Transcribe,
-            stop_requested: false,
-            max_duration_seconds: 30,
-            latency: LatencyTrace::started_at(Instant::now(), TriggerObservation::AppAction),
-            capture_diagnostics: CaptureDiagnosticContext::default(),
-            cancellation: CaptureCancellation::new(),
-        });
-        assert!(!app.passive_microphone_monitor_needed());
-        app.pending_recording = None;
-        app.active_recording = Some(ActiveRecording {
-            session_id: SessionId(71),
-            session: RecordingSession::simulated(None, CaptureStopReason::Explicit),
-            source: RecordingSource::Transcribe,
-            stop_requested: false,
-            started_at: Instant::now(),
-            max_duration_seconds: 30,
-            latency: LatencyTrace::started_at(Instant::now(), TriggerObservation::AppAction),
-            capture_diagnostics: CaptureDiagnosticContext::default(),
-        });
-        assert!(!app.passive_microphone_monitor_needed());
+    fn audio_owner_selection_fails_closed_on_overlap() {
+        assert_eq!(select_audio_owner(false, false, false), None);
+        assert_eq!(
+            select_audio_owner(true, false, false),
+            Some(AudioOwner::Capture)
+        );
+        assert_eq!(
+            select_audio_owner(false, true, false),
+            Some(AudioOwner::MicrophoneTest)
+        );
+        assert_eq!(
+            select_audio_owner(false, false, true),
+            Some(AudioOwner::HistoryPlayback)
+        );
+        assert_eq!(
+            select_audio_owner(true, true, false),
+            Some(AudioOwner::Conflict)
+        );
     }
 
     #[test]
-    fn passive_monitor_sync_is_idempotent_and_never_duplicates_starting_sessions() {
-        let mut app = passive_monitor_test_app();
-        set_fake_starting_monitor(&mut app, 17);
-
-        app.sync_passive_microphone_monitor();
-        app.sync_passive_microphone_monitor();
-
-        assert_eq!(app.microphone_test_sequence, 17);
-        assert!(matches!(
-            app.microphone_test,
-            MicrophoneTest::Starting {
-                request_id: 17,
-                stop_requested: false,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn passive_monitor_tears_down_for_every_competing_owner_and_visibility_exit() {
-        let mut route_exit = passive_monitor_test_app();
-        route_exit.settings_tab = SettingsTab::Advanced;
-        assert_fake_monitor_stops(route_exit);
-
-        let mut hidden = passive_monitor_test_app();
-        hidden.window_hidden_to_tray = true;
-        assert_fake_monitor_stops(hidden);
-
-        let mut quitting = passive_monitor_test_app();
-        quitting.quit_requested = true;
-        assert_fake_monitor_stops(quitting);
-
-        let mut deferred_capture = passive_monitor_test_app();
-        deferred_capture.deferred_recording_start = Some(DeferredRecordingStart {
-            source: RecordingSource::Transcribe,
-            activation_at: Instant::now(),
-            trigger_observation: TriggerObservation::AppAction,
-        });
-        assert_fake_monitor_stops(deferred_capture);
-
-        let mut deferred_playback = passive_monitor_test_app();
-        deferred_playback.deferred_history_playback = Some(7);
-        assert_fake_monitor_stops(deferred_playback);
-
-        let mut playback = passive_monitor_test_app();
-        playback.playing_history_id = Some(7);
-        assert_fake_monitor_stops(playback);
-
-        let mut capture = passive_monitor_test_app();
-        capture.pending_recording = Some(PendingRecording {
-            session_id: SessionId(72),
-            source: RecordingSource::Transcribe,
-            stop_requested: false,
-            max_duration_seconds: 30,
-            latency: LatencyTrace::started_at(Instant::now(), TriggerObservation::AppAction),
-            capture_diagnostics: CaptureDiagnosticContext::default(),
-            cancellation: CaptureCancellation::new(),
-        });
-        assert_fake_monitor_stops(capture);
-    }
-
-    #[test]
-    fn passive_monitor_repaints_at_twenty_hz_only_while_its_session_exists() {
+    fn explicit_microphone_test_repaints_at_twenty_hz_only_while_its_session_exists() {
         let mut app = passive_monitor_test_app();
         let now = Instant::now();
         app.microphone_level_envelope
@@ -15970,7 +17611,6 @@ mod layout_tests {
             max_duration_seconds: 30,
             latency: LatencyTrace::started_at(Instant::now(), TriggerObservation::AppAction),
             capture_diagnostics: CaptureDiagnosticContext::default(),
-            cancellation: CaptureCancellation::new(),
         });
         assert_eq!(app.next_repaint_delay(), METER_REPAINT_DELAY);
     }
@@ -15981,7 +17621,6 @@ mod layout_tests {
         app.microphone_test = MicrophoneTest::Starting {
             request_id: 2,
             stop_requested: false,
-            cancellation: CaptureCancellation::new(),
         };
         app.tx
             .send(AppEvent::MicrophoneTestReady {
@@ -16012,7 +17651,6 @@ mod layout_tests {
         app.microphone_test = MicrophoneTest::Starting {
             request_id: 1,
             stop_requested: false,
-            cancellation: CaptureCancellation::new(),
         };
         app.tx
             .send(AppEvent::MicrophoneTestReady {
@@ -16051,37 +17689,135 @@ mod layout_tests {
         assert_eq!(app.status_message, "Preparing audio playback");
     }
 
+    fn start_blocked_controller_microphone_test(
+        app: &mut LocalTranscriberApp,
+    ) -> (audio::CaptureId, Sender<()>) {
+        let (entered_tx, entered_rx) = bounded(1);
+        let (retire_tx, retire_rx) = bounded(1);
+        app.capture_controller = audio::control::CaptureController::with_start_capture_for_test(
+            Arc::new(move |request, cancellation| {
+                if request.owner != audio::control::AudioOwnerKind::MicrophoneTest {
+                    return Ok(RecordingSession::simulated(
+                        None,
+                        CaptureStopReason::Explicit,
+                    ));
+                }
+                entered_tx.send(request.capture_id).unwrap();
+                while !cancellation.is_cancelled() {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                retire_rx.recv().unwrap();
+                Err(CaptureError::StartupCancelled)
+            }),
+        )
+        .unwrap();
+        app.start_microphone_test();
+        let capture_id = entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        (capture_id, retire_tx)
+    }
+
+    fn retire_blocked_controller_microphone_test(
+        app: &mut LocalTranscriberApp,
+        retire_tx: Sender<()>,
+    ) {
+        retire_tx.send(()).unwrap();
+        for _ in 0..200 {
+            app.poll_capture_controller();
+            app.poll_events();
+            app.poll_microphone_test();
+            if matches!(app.microphone_test, MicrophoneTest::Idle)
+                && app.microphone_test_control_id.is_none()
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     #[test]
-    fn cancelled_monitor_startup_keeps_audio_owners_excluded_until_confirmation() {
+    fn controller_cancelled_monitor_startup_defers_dictation_until_owner_retirement() {
         let mut app = test_app();
-        let cancellation = CaptureCancellation::new();
-        app.microphone_test = MicrophoneTest::Starting {
-            request_id: 12,
-            stop_requested: false,
-            cancellation: cancellation.clone(),
-        };
+        let (capture_id, retire_tx) = start_blocked_controller_microphone_test(&mut app);
 
         app.stop_microphone_test();
-        assert!(cancellation.is_cancelled());
-        app.apply_history_action(HistoryPageAction::Play(7));
-        assert_eq!(app.deferred_history_playback, Some(7));
         app.start_recording(RecordingSource::Transcribe);
-        assert!(app.deferred_recording_start.is_some());
-        assert!(app.deferred_history_playback.is_none());
-        assert!(app.pending_recording.is_none());
-        assert!(app.active_recording.is_none());
 
-        app.stop_recording();
-        app.tx
-            .send(AppEvent::MicrophoneTestReady {
-                request_id: 12,
-                result: Err(CaptureError::StartupCancelled),
-            })
-            .unwrap();
-        app.poll_events();
+        assert!(app.deferred_recording_start.is_some());
+        assert!(app.pending_recording.is_none());
+        assert_eq!(
+            app.capture_controller
+                .handle()
+                .owner_id(audio::control::AudioOwnerKind::MicrophoneTest),
+            Some(capture_id.0)
+        );
+
+        retire_blocked_controller_microphone_test(&mut app, retire_tx);
 
         assert!(matches!(app.microphone_test, MicrophoneTest::Idle));
         assert!(app.microphone_test_error.is_none());
+        assert!(!app.microphone_monitor_retry_required);
+        assert!(app.deferred_recording_start.is_none());
+        assert!(app.pending_recording.is_some());
+        assert_eq!(
+            app.capture_controller
+                .handle()
+                .owner_id(audio::control::AudioOwnerKind::MicrophoneTest),
+            None
+        );
+        assert_eq!(
+            app.capture_controller
+                .handle()
+                .owner_id(audio::control::AudioOwnerKind::Capture),
+            app.capture_control_id.map(|id| id.0)
+        );
+    }
+
+    #[test]
+    fn controller_cancelled_monitor_startup_defers_playback_until_owner_retirement() {
+        let mut app = test_app();
+        let history_root = std::env::temp_dir().join(format!(
+            "scribe-monitor-playback-{}-{}",
+            std::process::id(),
+            NEXT_TEST_SESSION.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&history_root);
+        app.history_store =
+            Some(HistoryStore::open(&history_root, HistoryRetentionPolicy::default()).unwrap());
+        let (capture_id, retire_tx) = start_blocked_controller_microphone_test(&mut app);
+
+        app.stop_microphone_test();
+        app.apply_history_action(HistoryPageAction::Play(7));
+
+        assert_eq!(app.deferred_history_playback, Some(7));
+        assert!(app.playing_history_id.is_none());
+        assert_eq!(
+            app.capture_controller
+                .handle()
+                .owner_id(audio::control::AudioOwnerKind::MicrophoneTest),
+            Some(capture_id.0)
+        );
+
+        retire_blocked_controller_microphone_test(&mut app, retire_tx);
+
+        assert!(matches!(app.microphone_test, MicrophoneTest::Idle));
+        assert!(app.microphone_test_error.is_none());
+        assert!(!app.microphone_monitor_retry_required);
+        assert!(app.deferred_history_playback.is_none());
+        assert_eq!(app.playing_history_id, Some(7));
+        assert_eq!(
+            app.capture_controller
+                .handle()
+                .owner_id(audio::control::AudioOwnerKind::MicrophoneTest),
+            None
+        );
+        assert_eq!(
+            app.capture_controller
+                .handle()
+                .owner_id(audio::control::AudioOwnerKind::Playback),
+            app.history_playback_lease.as_ref().map(|lease| lease.id)
+        );
+        drop(app);
+        let _ = std::fs::remove_dir_all(history_root);
     }
 
     #[test]
@@ -16160,7 +17896,6 @@ mod layout_tests {
         app.microphone_test = MicrophoneTest::Starting {
             request_id: 3,
             stop_requested: false,
-            cancellation: CaptureCancellation::new(),
         };
         app.tx
             .send(AppEvent::MicrophoneTestReady {
@@ -16309,7 +18044,6 @@ mod layout_tests {
             max_duration_seconds: 30,
             latency: LatencyTrace::started_at(Instant::now(), TriggerObservation::AppAction),
             capture_diagnostics: CaptureDiagnosticContext::from_config(&app.config),
-            cancellation: CaptureCancellation::new(),
         });
 
         app.apply_settings_screen_action(ScreenAction::SetInputThresholdDbfs(-24));
@@ -16347,7 +18081,6 @@ mod layout_tests {
             max_duration_seconds: 30,
             latency: LatencyTrace::started_at(Instant::now(), TriggerObservation::AppAction),
             capture_diagnostics: CaptureDiagnosticContext::from_config(&app.config),
-            cancellation: CaptureCancellation::new(),
         });
         app.config.recording.speech_detection_mode = SpeechDetectionMode::ManualThreshold;
         app.config.recording.input_threshold_dbfs = -24.0;
@@ -16466,7 +18199,6 @@ mod layout_tests {
                 max_duration_seconds: 30,
                 latency: LatencyTrace::started_at(Instant::now(), TriggerObservation::HotkeyPoll),
                 capture_diagnostics: CaptureDiagnosticContext::default(),
-                cancellation: CaptureCancellation::new(),
             });
             let preload_event = AppEvent::ModelPreloadFinished {
                 session_id,
@@ -16507,6 +18239,10 @@ mod layout_tests {
             activation_at: base,
             trigger_observation: TriggerObservation::AppAction,
             overlay_visible_at: None,
+            capture_worker_started_at: Some(base + Duration::from_millis(2)),
+            stream_play_requested_at: Some(base + Duration::from_millis(4)),
+            stream_play_returned_at: Some(base + Duration::from_millis(6)),
+            first_native_callback_at: Some(base + Duration::from_millis(8)),
             recorder_started_at: Some(base + Duration::from_millis(10)),
             first_meter_update_at: Some(base + Duration::from_millis(15)),
             model_load_started_at: Some(base + Duration::from_millis(20)),
@@ -16514,6 +18250,9 @@ mod layout_tests {
             first_partial_at: None,
             stop_requested_at: Some(base + Duration::from_millis(100)),
             capture_finalized_at: Some(base + Duration::from_millis(140)),
+            stream_dropped_at: Some(base + Duration::from_millis(120)),
+            final_audio_ready_at: Some(base + Duration::from_millis(135)),
+            preview_drained_at: Some(base + Duration::from_millis(145)),
             transcription_dispatched_at: Some(base + Duration::from_millis(150)),
             transcription_job_completed_at: Some(base + Duration::from_millis(650)),
             final_text_ready_at: Some(base + Duration::from_millis(650)),
@@ -16539,10 +18278,17 @@ mod layout_tests {
         assert_eq!(
             trace.summary_lines(),
             vec![
+                "Native callback to capture worker: 2 ms",
+                "Microphone stream play: 2 ms",
+                "Native callback to first audio callback: 8 ms",
                 "App action to recorder ready: 10 ms",
                 "App action to first meter update: 15 ms",
                 "Model load: 50 ms",
                 "Stop to audio finalized: 40 ms",
+                "Stop to microphone stream dropped: 20 ms",
+                "Stream dropped to final audio ready: 15 ms",
+                "Final audio ready to preview drained: 10 ms",
+                "Preview drained to final request dispatch: 5 ms",
                 "Transcription job: 500 ms",
                 "Stop to final text: 550 ms",
                 "STT done to UI update: 10 ms",
@@ -16579,6 +18325,7 @@ mod layout_tests {
             manual_threshold_crossed: false,
             dropped_samples: 0,
             stream_restarts: 0,
+            timing: audio::CaptureTimingMetrics::default(),
         });
 
         let snapshot =
@@ -16617,6 +18364,10 @@ mod layout_tests {
             activation_at: base,
             trigger_observation: TriggerObservation::HotkeyPoll,
             overlay_visible_at: None,
+            capture_worker_started_at: None,
+            stream_play_requested_at: None,
+            stream_play_returned_at: None,
+            first_native_callback_at: None,
             recorder_started_at: Some(base + Duration::from_millis(10)),
             first_meter_update_at: None,
             model_load_started_at: None,
@@ -16624,6 +18375,9 @@ mod layout_tests {
             first_partial_at: None,
             stop_requested_at: Some(base + Duration::from_millis(100)),
             capture_finalized_at: Some(base + Duration::from_millis(140)),
+            stream_dropped_at: None,
+            final_audio_ready_at: None,
+            preview_drained_at: None,
             transcription_dispatched_at: Some(base + Duration::from_millis(150)),
             transcription_job_completed_at: Some(base + Duration::from_millis(650)),
             final_text_ready_at: None,
@@ -18004,6 +19758,7 @@ mod layout_tests {
                     manual_threshold_crossed: false,
                     dropped_samples: 0,
                     stream_restarts: 0,
+                    timing: audio::CaptureTimingMetrics::default(),
                 },
             }),
             stop_requested: true,
@@ -18605,7 +20360,7 @@ mod layout_tests {
         model.artifact_origin = ModelArtifactOrigin::Bundled;
         model.install_status = ModelInstallStatus::Installed;
 
-        assert!(!app.uninstall_model(&model));
+        assert!(!app.uninstall_model(&model, None));
         assert!(path.is_file());
         assert_eq!(serde_json::to_value(&app.config).unwrap(), before);
         assert!(app.status_message.contains("did not match"));
@@ -19717,6 +21472,91 @@ mod layout_tests {
         }
     }
 
+    fn install_cancellable_capture(app: &mut LocalTranscriberApp) -> audio::CaptureId {
+        app.capture_controller = audio::control::CaptureController::with_start_capture_for_test(
+            Arc::new(|_request, cancellation| {
+                while !cancellation.is_cancelled() {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(CaptureError::StartupCancelled)
+            }),
+        )
+        .unwrap();
+        let ticket = app
+            .capture_controller
+            .handle()
+            .start_capture(
+                audio::control::AudioOwnerKind::Capture,
+                Instant::now(),
+                30,
+                None,
+                audio::CaptureOptions::default(),
+            )
+            .unwrap();
+        app.capture_control_id = Some(ticket.capture_id);
+        ticket.capture_id
+    }
+
+    fn install_delayed_direct_hotkey_ticket(
+        app: &mut LocalTranscriberApp,
+    ) -> (
+        audio::control::CaptureTicket,
+        Receiver<()>,
+        Sender<()>,
+        Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let (entered_tx, entered_rx) = bounded(1);
+        let (cancelled_tx, cancelled_rx) = bounded(1);
+        let (retire_tx, retire_rx) = bounded(1);
+        let accepted_audio = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_accepted_audio = Arc::clone(&accepted_audio);
+        app.capture_controller = audio::control::CaptureController::with_start_capture_for_test(
+            Arc::new(move |_request, cancellation| {
+                entered_tx.send(()).unwrap();
+                while !cancellation.is_cancelled() {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                cancelled_tx.send(()).unwrap();
+                retire_rx.recv().unwrap();
+                if !cancellation.is_cancelled() {
+                    worker_accepted_audio.store(true, Ordering::Release);
+                    return Ok(RecordingSession::simulated(
+                        None,
+                        CaptureStopReason::Explicit,
+                    ));
+                }
+                Err(CaptureError::StartupCancelled)
+            }),
+        )
+        .unwrap();
+        app.sync_capture_controller_hotkey();
+        let audio::control::HotkeyDispatch::Start(ticket) = app
+            .capture_controller
+            .handle()
+            .dispatch_hotkey(true, Instant::now())
+        else {
+            panic!("eligible hotkey should issue a direct Start ticket");
+        };
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        (ticket, cancelled_rx, retire_tx, accepted_audio)
+    }
+
+    fn retire_delayed_direct_hotkey_ticket(app: &mut LocalTranscriberApp, retire_tx: Sender<()>) {
+        retire_tx.send(()).unwrap();
+        for _ in 0..200 {
+            app.poll_capture_controller();
+            if app
+                .capture_controller
+                .handle()
+                .owner_id(audio::control::AudioOwnerKind::Capture)
+                .is_none()
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     fn test_app() -> LocalTranscriberApp {
         let mut config = AppConfig::default();
         // Keep Playground event tests independent from whichever legacy model
@@ -19744,6 +21584,12 @@ mod layout_tests {
 
         let transcription_service = TranscriptionService::new(config.clone());
         let playground_cards = cards_from_config(&config, &transcription_service);
+        let capture_controller = audio::control::CaptureController::new().unwrap();
+        let hotkey_service = HotkeyService::new(
+            &config.recording.hotkey,
+            &egui::Context::default(),
+            capture_controller.handle(),
+        );
         let mut app = LocalTranscriberApp {
             hotkey_input: config.recording.hotkey.clone(),
             model_search: String::new(),
@@ -19779,7 +21625,12 @@ mod layout_tests {
             playground_reference_transcript: String::new(),
             playground_reference_user_edited: false,
             playground_ranking_mode: RankingMode::Balanced,
-            hotkey_service: HotkeyService::new(&config.recording.hotkey, &egui::Context::default()),
+            hotkey_service,
+            capture_controller,
+            pending_direct_capture: None,
+            capture_control_id: None,
+            microphone_test_control_id: None,
+            history_playback_lease: None,
             config,
             config_path: None,
             settings_store: None,
@@ -19798,6 +21649,7 @@ mod layout_tests {
             comparison_wer_compute_count: 0,
             comparison_output_replacement_count: 0,
             model_management: ModelManagementState::default(),
+            pending_onnx_removal: None,
             models_route_focus_pending: false,
             status: TranscriptionStatus::Idle,
             transcript: String::new(),
@@ -22560,10 +24412,37 @@ mod layout_tests {
         }
     }
 
-    fn coordinator_prepared(model_id: &str) -> PreparedVerifiedInstall {
+    fn coordinator_onnx_admission(
+        model_id: &str,
+        target_name: &str,
+        volume: &str,
+        available_bytes: u64,
+        download_bytes: u64,
+        non_transfer_bytes: u64,
+    ) -> managed_downloads::OnnxBundleDownloadAdmission {
+        let storage_root = std::env::temp_dir().join("scribe-coordinator-onnx-storage");
+        let target = std::env::temp_dir().join(target_name);
+        let additional_bytes = download_bytes.saturating_add(non_transfer_bytes);
+        managed_downloads::OnnxBundleDownloadAdmission {
+            bundle_id: model_id.to_owned(),
+            storage_root,
+            target_identity: crate::disk_space::canonical_target_identity(&target).unwrap(),
+            target,
+            download_bytes,
+            disk: crate::disk_space::DiskSpacePreflight {
+                volume: volume.to_owned(),
+                available_bytes,
+                additional_bytes,
+                required_bytes: additional_bytes
+                    .saturating_add(crate::disk_space::SAFETY_HEADROOM_BYTES),
+            },
+        }
+    }
+
+    fn coordinator_prepared(model_id: &str) -> PreparedArtifactInstall {
         let model_id = ModelId::new(model_id);
         let destination = std::env::temp_dir().join("fixture.gguf");
-        PreparedVerifiedInstall {
+        PreparedArtifactInstall::Gguf(Box::new(PreparedVerifiedInstall {
             model: crate::installations::DownloadedArtifact {
                 id: model_id.as_str().to_owned(),
                 path: PathBuf::from("fixture.gguf.partial"),
@@ -22576,7 +24455,7 @@ mod layout_tests {
             manifest_source: installed_manifest::ArtifactSource::normalized(&model_id).unwrap(),
             model_id,
             remote_install_request: None,
-        }
+        }))
     }
     #[test]
     fn installation_failures_preserve_recovery_required_classification() {
@@ -23439,6 +25318,157 @@ mod layout_tests {
     }
 
     #[test]
+    fn artifact_coordinator_mixed_gguf_and_onnx_transfers_share_the_three_slot_fifo() {
+        let mut coordinator = ArtifactInstallCoordinator::default();
+        let available = crate::disk_space::SAFETY_HEADROOM_BYTES + 10_000;
+        coordinator
+            .admit(
+                "gguf-0".to_owned(),
+                coordinator_admission("mixed-0.gguf", "mixed-volume", available, 100),
+                AppConfig::default(),
+                VerifiedInstallSource::NormalizedCatalog,
+            )
+            .unwrap();
+        coordinator
+            .admit_onnx(
+                "onnx-1".to_owned(),
+                coordinator_onnx_admission(
+                    "onnx-1",
+                    "mixed-1-onnx",
+                    "mixed-volume",
+                    available,
+                    100,
+                    200,
+                ),
+                AppConfig::default(),
+            )
+            .unwrap();
+        coordinator
+            .admit(
+                "gguf-2".to_owned(),
+                coordinator_admission("mixed-2.gguf", "mixed-volume", available, 100),
+                AppConfig::default(),
+                VerifiedInstallSource::NormalizedCatalog,
+            )
+            .unwrap();
+        coordinator
+            .admit_onnx(
+                "onnx-3".to_owned(),
+                coordinator_onnx_admission(
+                    "onnx-3",
+                    "mixed-3-onnx",
+                    "mixed-volume",
+                    available,
+                    100,
+                    200,
+                ),
+                AppConfig::default(),
+            )
+            .unwrap();
+
+        let first = coordinator.take_ready_transfers();
+        assert_eq!(
+            first
+                .iter()
+                .map(|launch| launch.model_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["gguf-0", "onnx-1", "gguf-2"]
+        );
+        assert!(matches!(
+            first[1].source,
+            VerifiedInstallSource::NormalizedOnnxBundle(_)
+        ));
+        assert_eq!(
+            coordinator.get_job("onnx-3").unwrap().phase,
+            ArtifactInstallPhase::QueuedTransfer
+        );
+
+        assert!(coordinator.finish("gguf-0", first[0].job_id));
+        let next = coordinator.take_ready_transfers();
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].model_id, "onnx-3");
+    }
+
+    #[test]
+    fn artifact_coordinator_onnx_reservation_keeps_staging_floor_during_transfer() {
+        let mut coordinator = ArtifactInstallCoordinator::default();
+        let available = crate::disk_space::SAFETY_HEADROOM_BYTES + 400;
+        let job_id = coordinator
+            .admit_onnx(
+                "onnx-reservation".to_owned(),
+                coordinator_onnx_admission(
+                    "onnx-reservation",
+                    "onnx-reservation-target",
+                    "onnx-volume",
+                    available,
+                    100,
+                    200,
+                ),
+                AppConfig::default(),
+            )
+            .unwrap();
+        coordinator.take_ready_transfers();
+
+        assert!(coordinator.update_download_reservation("onnx-reservation", job_id, 40));
+        assert_eq!(
+            coordinator.reserved_by_volume.get("onnx-volume"),
+            Some(&240)
+        );
+        assert!(
+            coordinator
+                .admit(
+                    "blocked-gguf".to_owned(),
+                    coordinator_admission("blocked-by-onnx.gguf", "onnx-volume", available, 161,),
+                    AppConfig::default(),
+                    VerifiedInstallSource::NormalizedCatalog,
+                )
+                .unwrap_err()
+                .contains("active downloads")
+        );
+        coordinator
+            .admit(
+                "admitted-gguf".to_owned(),
+                coordinator_admission("admitted-after-onnx.gguf", "onnx-volume", available, 160),
+                AppConfig::default(),
+                VerifiedInstallSource::NormalizedCatalog,
+            )
+            .unwrap();
+        assert_eq!(
+            coordinator.reserved_by_volume.get("onnx-volume"),
+            Some(&400)
+        );
+    }
+
+    #[test]
+    fn artifact_coordinator_cancelled_onnx_rejects_late_progress() {
+        let mut coordinator = ArtifactInstallCoordinator::default();
+        let available = crate::disk_space::SAFETY_HEADROOM_BYTES + 1_000;
+        let job_id = coordinator
+            .admit_onnx(
+                "cancelled-onnx".to_owned(),
+                coordinator_onnx_admission(
+                    "cancelled-onnx",
+                    "cancelled-onnx-target",
+                    "cancelled-onnx-volume",
+                    available,
+                    100,
+                    200,
+                ),
+                AppConfig::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            coordinator.cancel("cancelled-onnx"),
+            ArtifactCancellationOutcome::SettledBeforeFinalizer { job_id }
+        );
+        assert!(!coordinator.contains_key("cancelled-onnx"));
+        assert!(!coordinator.accepts_progress("cancelled-onnx", job_id));
+        assert!(!coordinator.update_download_reservation("cancelled-onnx", job_id, 1));
+        assert!(coordinator.target_owners.is_empty());
+        assert!(coordinator.reserved_by_volume.is_empty());
+    }
+
+    #[test]
     fn correlated_activity_survives_byte_updates_and_rejects_stale_jobs() {
         let mut coordinator = ArtifactInstallCoordinator::default();
         let job_id = coordinator
@@ -23743,6 +25773,45 @@ mod layout_tests {
     }
 
     #[test]
+    fn artifact_coordinator_shutdown_uses_one_deadline_for_all_workers() {
+        let mut coordinator = ArtifactInstallCoordinator::default();
+        let first_cancellation = InstallCancellation::default();
+        let second_cancellation = InstallCancellation::default();
+        coordinator.insert(
+            "shutdown-first".to_owned(),
+            (81, first_cancellation.clone()),
+        );
+        coordinator.insert(
+            "shutdown-second".to_owned(),
+            (82, second_cancellation.clone()),
+        );
+        let (_first_tx, first_completion) = bounded::<()>(1);
+        let (_second_tx, second_completion) = bounded::<()>(1);
+        assert!(coordinator.register_worker(
+            "shutdown-first",
+            81,
+            ArtifactInstallWorker {
+                completion: first_completion,
+                worker: None,
+            },
+        ));
+        assert!(coordinator.register_worker(
+            "shutdown-second",
+            82,
+            ArtifactInstallWorker {
+                completion: second_completion,
+                worker: None,
+            },
+        ));
+
+        let started = Instant::now();
+        assert!(!coordinator.cancel_and_wait_until(started + Duration::from_millis(10)));
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert!(first_cancellation.is_cancelled());
+        assert!(second_cancellation.is_cancelled());
+    }
+
+    #[test]
     fn admitted_transfer_launches_can_overlap_in_real_worker_threads() {
         use std::sync::Barrier;
         use std::sync::atomic::AtomicUsize;
@@ -23792,6 +25861,275 @@ mod layout_tests {
             coordinator.get_job("overlap-3").unwrap().phase,
             ArtifactInstallPhase::QueuedTransfer
         );
+    }
+
+    #[test]
+    fn panicking_transfer_releases_resources_and_advances_the_fifo() {
+        let mut app = test_app();
+        let available = crate::disk_space::SAFETY_HEADROOM_BYTES + 1_000;
+        let mut releases = Vec::new();
+        let mut panicking_target = None;
+        for index in 0..4 {
+            let admission = coordinator_admission(
+                &format!("panic-transfer-{index}.gguf"),
+                &format!("panic-transfer-volume-{index}"),
+                available,
+                100,
+            );
+            if index == 0 {
+                panicking_target = Some(admission.target_identity.clone());
+            }
+            let source = if index == 0 {
+                VerifiedInstallSource::PanickingTestTransfer
+            } else {
+                let (release, wait) = bounded(1);
+                releases.push(release);
+                VerifiedInstallSource::WaitingTestTransfer(wait)
+            };
+            app.artifact_installations
+                .admit(
+                    format!("panic-transfer-{index}"),
+                    admission,
+                    AppConfig::default(),
+                    source,
+                )
+                .unwrap();
+        }
+
+        app.launch_ready_artifact_transfers();
+        assert_eq!(app.artifact_installations.active_transfers, 3);
+        assert_eq!(
+            app.artifact_installations
+                .get_job("panic-transfer-3")
+                .unwrap()
+                .phase,
+            ArtifactInstallPhase::QueuedTransfer
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            app.poll_events();
+            if !app.artifact_installations.contains_key("panic-transfer-0")
+                && app
+                    .artifact_installations
+                    .phase_for_model("panic-transfer-3")
+                    == Some(ArtifactInstallPhase::Transferring)
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        assert!(!app.artifact_installations.contains_key("panic-transfer-0"));
+        assert!(!app.artifact_installations.recovery_is_frozen());
+        assert_eq!(app.artifact_installations.active_transfers, 3);
+        assert!(
+            !app.artifact_installations
+                .reserved_by_volume
+                .contains_key("panic-transfer-volume-0")
+        );
+        assert!(
+            !app.artifact_installations
+                .target_owners
+                .contains_key(&panicking_target.unwrap())
+        );
+        assert_eq!(app.artifact_installations.target_owners.len(), 3);
+        assert!(
+            app.status_message
+                .contains("Model transfer worker stopped unexpectedly.")
+        );
+        assert!(!app.status_message.contains("sensitive injected"));
+
+        for release in releases {
+            release.send(()).unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline && !app.artifact_installations.is_empty() {
+            app.poll_events();
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(app.artifact_installations.is_empty());
+        assert_eq!(app.artifact_installations.active_transfers, 0);
+        assert!(app.artifact_installations.reserved_by_volume.is_empty());
+        assert!(app.artifact_installations.target_owners.is_empty());
+    }
+
+    fn run_panicking_finalizer_fault(
+        model_id: &str,
+        fault: PanickingFinalizerTestFault,
+    ) -> LocalTranscriberApp {
+        let mut app = test_app();
+        let available = crate::disk_space::SAFETY_HEADROOM_BYTES + 1_000;
+        let first_admission = coordinator_admission(
+            &format!("{model_id}.gguf"),
+            &format!("{model_id}-volume"),
+            available,
+            100,
+        );
+        let first_job = app
+            .artifact_installations
+            .admit(
+                model_id.to_owned(),
+                first_admission,
+                AppConfig::default(),
+                VerifiedInstallSource::NormalizedCatalog,
+            )
+            .unwrap();
+        let sibling_id = format!("{model_id}-sibling");
+        let second_admission = coordinator_admission(
+            &format!("{sibling_id}.gguf"),
+            &format!("{sibling_id}-volume"),
+            available,
+            100,
+        );
+        let second_job = app
+            .artifact_installations
+            .admit(
+                sibling_id.clone(),
+                second_admission,
+                AppConfig::default(),
+                VerifiedInstallSource::NormalizedCatalog,
+            )
+            .unwrap();
+        let launches = app.artifact_installations.take_ready_transfers();
+        assert_eq!(launches.len(), 2);
+        assert!(app.artifact_installations.mark_prepared(
+            model_id,
+            first_job,
+            PreparedArtifactInstall::PanickingTestFinalizer(fault),
+        ));
+        let (release, wait) = bounded(1);
+        assert!(app.artifact_installations.mark_prepared(
+            &sibling_id,
+            second_job,
+            PreparedArtifactInstall::WaitingTestFinalizer(wait),
+        ));
+        assert!(app.artifact_installations.reserved_by_volume.is_empty());
+
+        app.launch_next_artifact_finalizer();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline && !app.artifact_installations.is_empty() {
+            app.poll_events();
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        assert!(app.artifact_installations.is_empty());
+        assert!(app.artifact_installations.recovery_is_frozen());
+        assert_eq!(app.artifact_installations.active_finalizer, None);
+        assert!(app.artifact_installations.target_owners.is_empty());
+        assert!(app.artifact_installations.reserved_by_volume.is_empty());
+        assert!(release.send(()).is_err());
+        assert!(
+            app.status_message
+                .contains("Model finalization worker stopped unexpectedly.")
+        );
+        assert!(!app.status_message.contains("sensitive injected"));
+        assert_eq!(
+            app.artifact_recovery_error.as_deref(),
+            Some("Model finalization worker stopped unexpectedly.")
+        );
+        assert_eq!(
+            app.install_admission_block_reason().as_deref(),
+            Some("Model finalization worker stopped unexpectedly.")
+        );
+        let rejected = app.artifact_installations.admit(
+            format!("{model_id}-rejected"),
+            coordinator_admission(
+                &format!("{model_id}-rejected.gguf"),
+                &format!("{model_id}-rejected-volume"),
+                available,
+                100,
+            ),
+            AppConfig::default(),
+            VerifiedInstallSource::NormalizedCatalog,
+        );
+        assert!(rejected.unwrap_err().contains("recovery is required"));
+        app
+    }
+
+    #[test]
+    fn panic_after_journal_creation_freezes_artifact_mutation_and_admission() {
+        let root = std::env::temp_dir().join(format!(
+            "scribe-finalizer-journal-panic-{}-{}",
+            std::process::id(),
+            NEXT_TEST_SESSION.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let journal_path = root.join("activation-journal.json");
+        let model_target = root.join("model.gguf");
+
+        let app = run_panicking_finalizer_fault(
+            "panic-after-journal",
+            PanickingFinalizerTestFault::JournalCreation {
+                journal_path: journal_path.clone(),
+                model_target,
+            },
+        );
+
+        assert!(journal_path.exists());
+        assert!(app.artifact_mutation_block_reason().is_some());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn panic_after_model_activation_freezes_artifact_mutation_and_admission() {
+        let root = std::env::temp_dir().join(format!(
+            "scribe-finalizer-model-panic-{}-{}",
+            std::process::id(),
+            NEXT_TEST_SESSION.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let staged = root.join("model.gguf.partial");
+        let destination = root.join("model.gguf");
+        let bytes = b"panic after exact model activation";
+        fs::write(&staged, bytes).unwrap();
+        let model = crate::installations::DownloadedArtifact {
+            id: "panic-after-model".to_owned(),
+            path: staged.clone(),
+            destination: destination.clone(),
+            size_bytes: bytes.len() as u64,
+            sha256: format!("{:x}", Sha256::digest(bytes)),
+            target_identity: crate::disk_space::canonical_target_identity(&destination).unwrap(),
+        };
+
+        let app = run_panicking_finalizer_fault(
+            "panic-after-model",
+            PanickingFinalizerTestFault::ModelActivation(Box::new(model)),
+        );
+
+        assert!(!staged.exists());
+        assert_eq!(fs::read(&destination).unwrap(), bytes);
+        assert!(app.artifact_mutation_block_reason().is_some());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn panic_after_directory_activation_freezes_artifact_mutation_and_admission() {
+        let root = std::env::temp_dir().join(format!(
+            "scribe-finalizer-directory-panic-{}-{}",
+            std::process::id(),
+            NEXT_TEST_SESSION.fetch_add(1, Ordering::Relaxed)
+        ));
+        let staged = root.join("runtime.staging");
+        let target = root.join("runtime");
+        fs::create_dir_all(&staged).unwrap();
+        fs::write(staged.join("model.onnx"), b"activated runtime").unwrap();
+
+        let app = run_panicking_finalizer_fault(
+            "panic-after-directory",
+            PanickingFinalizerTestFault::DirectoryActivation(crate::installations::StagedRuntime {
+                root: staged.clone(),
+                target_root: target.clone(),
+            }),
+        );
+
+        assert!(!staged.exists());
+        assert_eq!(
+            fs::read(target.join("model.onnx")).unwrap(),
+            b"activated runtime"
+        );
+        assert!(app.artifact_mutation_block_reason().is_some());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -25123,14 +27461,32 @@ mod layout_tests {
     }
 
     #[test]
-    fn active_onnx_bundle_job_projects_downloading_progress_and_cancel() {
+    fn coordinated_onnx_bundle_job_projects_downloading_progress_and_cancel() {
         let mut app = test_app();
         let model_id = "moonshine-tiny-en-int8-onnx".to_owned();
-        app.onnx_bundle_install = Some(test_onnx_bundle_install_job(
-            41,
-            model_id.clone(),
-            InstallCancellation::default(),
-        ));
+        let available = crate::disk_space::SAFETY_HEADROOM_BYTES + 100_000_000;
+        app.artifact_installations
+            .admit_onnx(
+                model_id.clone(),
+                coordinator_onnx_admission(
+                    &model_id,
+                    "projected-onnx-target",
+                    "projected-onnx-volume",
+                    available,
+                    44_256_550,
+                    44_256_550,
+                ),
+                app.config.clone(),
+            )
+            .unwrap();
+        let launches = app.artifact_installations.take_ready_transfers();
+        assert_eq!(launches.len(), 1);
+        app.artifact_installations.initialize_download_diagnostic(
+            &model_id,
+            launches[0].job_id,
+            17,
+            Some(44_256_550),
+        );
         app.model_downloads.insert(
             model_id.clone(),
             ModelInstallStatus::Downloading {
@@ -25152,33 +27508,226 @@ mod layout_tests {
     }
 
     #[test]
-    fn onnx_install_is_mutually_exclusive_with_other_artifact_mutations() {
+    fn mixed_onnx_and_gguf_installs_allow_more_downloads_but_block_other_mutations() {
+        let mut app = test_app();
+        let available = crate::disk_space::SAFETY_HEADROOM_BYTES + 100_000_000;
+        app.artifact_installations
+            .admit(
+                "whisper_cpp_tiny_en".to_owned(),
+                coordinator_admission("mixed-active.gguf", "mixed-mutation-volume", available, 100),
+                app.config.clone(),
+                VerifiedInstallSource::NormalizedCatalog,
+            )
+            .unwrap();
+        app.artifact_installations
+            .admit_onnx(
+                "moonshine-tiny-en-int8-onnx".to_owned(),
+                coordinator_onnx_admission(
+                    "moonshine-tiny-en-int8-onnx",
+                    "mixed-active-onnx",
+                    "mixed-mutation-volume",
+                    available,
+                    1_000,
+                    2_000,
+                ),
+                app.config.clone(),
+            )
+            .unwrap();
+
+        assert!(app.install_admission_block_reason().is_none());
+        assert!(app.artifact_mutation_block_reason().is_some());
+        assert!(
+            app.artifact_installations
+                .contains_key("whisper_cpp_tiny_en")
+        );
+        assert!(
+            app.artifact_installations
+                .contains_key("moonshine-tiny-en-int8-onnx")
+        );
+    }
+
+    #[test]
+    fn committed_onnx_install_persists_exact_ownership_witness() {
+        let root = partial_cleanup_test_root("onnx-install-ownership-witness");
+        let _ = fs::remove_dir_all(&root);
+        let mut app = test_app();
+        app.config.general.model_storage_dir = root.clone();
+        config::normalize_config(&mut app.config);
         let model_id = "moonshine-tiny-en-int8-onnx".to_owned();
-        let mut active_onnx = test_app();
-        active_onnx.onnx_bundle_install = Some(test_onnx_bundle_install_job(
-            43,
+        let target = config::onnx_bundle_target_root(&app.config, &ModelId::new(&model_id))
+            .expect("known ONNX bundle target");
+        let receipt_sha256 = "ab".repeat(32);
+        app.onnx_bundle_install = Some(test_onnx_bundle_install_job(
+            70,
             model_id.clone(),
             InstallCancellation::default(),
         ));
-        assert!(active_onnx.artifact_mutation_block_reason().is_some());
-        assert!(active_onnx.install_admission_block_reason().is_some());
 
-        let mut active_gguf = test_app();
-        active_gguf.artifact_installations.insert(
-            "whisper_cpp_tiny_en".to_owned(),
-            (44, InstallCancellation::default()),
+        app.tx
+            .send(AppEvent::OnnxBundleInstallFinished {
+                job_id: 70,
+                model_id: model_id.clone(),
+                paused: false,
+                recovery_required: false,
+                result: Ok(CommittedOnnxBundleInstall {
+                    smoke: test_install_smoke(),
+                    ownership: OnnxOwnershipLease::for_test(
+                        VerifiedOnnxRemovalCandidate::for_test(
+                            model_id.clone(),
+                            target.clone(),
+                            receipt_sha256.clone(),
+                        ),
+                    ),
+                }),
+            })
+            .unwrap();
+        app.poll_events();
+
+        let witness = app
+            .config
+            .general
+            .managed_models
+            .get(&model_id)
+            .expect("successful install must persist ownership");
+        assert_eq!(witness.path, target);
+        assert_eq!(witness.source.as_deref(), Some(OWNERSHIP_WITNESS_SOURCE));
+        assert_eq!(witness.sha256.as_deref(), Some(receipt_sha256.as_str()));
+        assert!(matches!(app.status, TranscriptionStatus::Idle));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn onnx_ownership_persistence_rejects_stale_durable_artifact_settings() {
+        let root = partial_cleanup_test_root("onnx-ownership-stale-durable-settings");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let config_path = root.join("config.json");
+        let mut app = test_app();
+        app.config.general.model_storage_dir = root.join("models");
+        config::normalize_config(&mut app.config);
+        config::settings::save_to_path(&config_path, &app.config).unwrap();
+        app.config_path = Some(config_path.clone());
+
+        let model_id = "moonshine-tiny-en-int8-onnx".to_owned();
+        let target = config::onnx_bundle_target_root(&app.config, &ModelId::new(&model_id))
+            .expect("known ONNX bundle target");
+        let mut concurrent = app.config.clone();
+        concurrent
+            .general
+            .excluded_bundled_model_ids
+            .push(BUNDLED_BASE_MODEL_ID.to_owned());
+        config::normalize_config(&mut concurrent);
+        let original_fingerprint =
+            config::settings::artifact_config_fingerprint(&app.config).unwrap();
+        config::settings::save_artifacts_to_path(&config_path, &original_fingerprint, &concurrent)
+            .unwrap();
+        let ownership = OnnxOwnershipLease::for_test_with_settings(
+            VerifiedOnnxRemovalCandidate::for_test(model_id.clone(), target, "ab".repeat(32)),
+            &config_path,
+        )
+        .unwrap();
+
+        let error = app.persist_onnx_ownership_witness(&ownership).unwrap_err();
+
+        assert!(error.contains("changed in another process"));
+        assert!(!app.config.general.managed_models.contains_key(&model_id));
+        drop(ownership);
+        let durable = config::settings::load_from_path(&config_path).unwrap();
+        assert_eq!(
+            durable.general.excluded_bundled_model_ids,
+            concurrent.general.excluded_bundled_model_ids,
+            "stale ownership persistence must not overwrite concurrent artifact settings"
         );
-        let moonshine = config::configured_models(&active_gguf.config)
-            .into_iter()
-            .find(|model| model.id == model_id)
-            .expect("Moonshine is part of the normalized catalog");
-        active_gguf.start_verified_model_download(&moonshine);
-        assert!(active_gguf.onnx_bundle_install.is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn malformed_onnx_receipt_cannot_open_removal_confirmation() {
+        let root = partial_cleanup_test_root("onnx-removal-malformed-receipt");
+        let _ = fs::remove_dir_all(&root);
+        let mut app = test_app();
+        app.config.general.model_storage_dir = root.clone();
+        config::normalize_config(&mut app.config);
+        let model_id = "moonshine-tiny-en-int8-onnx".to_owned();
+        let target = config::onnx_bundle_target_root(&app.config, &ModelId::new(&model_id))
+            .expect("known ONNX bundle target");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("install-receipt.json"), b"not valid json").unwrap();
+
+        app.apply_model_management_action(ScreenAction::RequestModelRemoval(model_id.clone()));
+
+        assert!(app.model_management.dialog.is_none());
+        assert!(!app.config.general.managed_models.contains_key(&model_id));
         assert!(
-            active_gguf
-                .status_message
-                .contains("Wait for active model downloads")
+            target.is_dir(),
+            "authorization failure must not mutate files"
         );
+        assert!(matches!(app.status, TranscriptionStatus::Error));
+        assert!(app.status_message.contains("failed removal verification"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn onnx_removal_confirmation_fails_closed_without_stable_capabilities() {
+        let root = partial_cleanup_test_root("onnx-removal-platform-fail-closed");
+        let _ = fs::remove_dir_all(&root);
+        let mut app = test_app();
+        app.config.general.model_storage_dir = root.clone();
+        config::normalize_config(&mut app.config);
+        let model_id = "moonshine-tiny-en-int8-onnx".to_owned();
+        let target = config::onnx_bundle_target_root(&app.config, &ModelId::new(&model_id))
+            .expect("known ONNX bundle target");
+        fs::create_dir_all(&target).unwrap();
+
+        app.apply_model_management_action(ScreenAction::RequestModelRemoval(model_id));
+
+        assert!(app.model_management.dialog.is_none());
+        assert!(target.is_dir());
+        assert!(app.status_message.contains("unavailable on this platform"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stale_onnx_confirmation_cannot_authorize_a_changed_witness() {
+        let root = partial_cleanup_test_root("onnx-removal-stale-confirmation");
+        let _ = fs::remove_dir_all(&root);
+        let mut app = test_app();
+        app.config.general.model_storage_dir = root.clone();
+        config::normalize_config(&mut app.config);
+        let model_id = "moonshine-tiny-en-int8-onnx".to_owned();
+        let target = config::onnx_bundle_target_root(&app.config, &ModelId::new(&model_id))
+            .expect("known ONNX bundle target");
+        fs::create_dir_all(&target).unwrap();
+        let authorized = VerifiedOnnxRemovalCandidate::for_test(
+            model_id.clone(),
+            target.clone(),
+            "ab".repeat(32),
+        );
+        app.config
+            .general
+            .managed_models
+            .insert(model_id.clone(), onnx_ownership_witness(&authorized));
+        config::normalize_config(&mut app.config);
+        app.pending_onnx_removal = Some(authorized);
+        app.model_management.dialog = Some(ModelDialog::Remove(model_id.clone()));
+        app.config
+            .general
+            .managed_models
+            .get_mut(&model_id)
+            .unwrap()
+            .sha256 = Some("cd".repeat(32));
+
+        app.apply_model_management_action(ScreenAction::ConfirmModelRemoval(model_id));
+
+        assert!(target.is_dir());
+        assert!(app.pending_onnx_removal.is_none());
+        assert!(
+            app.status_message
+                .contains("changed after confirmation opened")
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

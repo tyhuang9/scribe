@@ -2834,6 +2834,24 @@ impl SileroVadWorkerSupervisor {
         )
     }
 
+    pub(crate) fn start_session_with_cancellation(
+        &self,
+        session_id: u64,
+        request_id: u64,
+        threshold: VadThreshold,
+        cancelled: &AtomicBool,
+    ) -> Result<()> {
+        let generation = self.transport.ensure_generation()?;
+        self.start_session_on_generation(
+            generation,
+            session_id,
+            request_id,
+            threshold,
+            self.deadlines.acquisition,
+            Some(cancelled),
+        )
+    }
+
     fn start_session_on_generation(
         &self,
         generation: u64,
@@ -2920,11 +2938,22 @@ impl SileroVadWorkerSupervisor {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn compute(
         &self,
         session_id: u64,
         request_id: u64,
         samples: &[f32],
+    ) -> Result<SileroVadDecision> {
+        self.compute_with_cancellation(session_id, request_id, samples, None)
+    }
+
+    pub(crate) fn compute_with_cancellation(
+        &self,
+        session_id: u64,
+        request_id: u64,
+        samples: &[f32],
+        cancelled: Option<&AtomicBool>,
     ) -> Result<SileroVadDecision> {
         if samples.len() != WINDOW_SAMPLES {
             bail!("Silero VAD input must contain exactly {WINDOW_SAMPLES} samples");
@@ -2941,13 +2970,16 @@ impl SileroVadWorkerSupervisor {
                 body: pcm,
             },
         ];
-        let response = match self.transport.active_round_trip_with_timeout(
-            generation,
-            session_id,
-            request_id,
-            &frames,
-            self.deadlines.operation,
-        ) {
+        let response = match self
+            .transport
+            .active_round_trip_with_timeout_and_cancellation(
+                generation,
+                session_id,
+                request_id,
+                &frames,
+                self.deadlines.operation,
+                cancelled,
+            ) {
             Ok(response) => response,
             Err(error) => {
                 self.retire_failed_session(stream, "Silero VAD compute transport failed")?;
