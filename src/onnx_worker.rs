@@ -4284,6 +4284,24 @@ impl ProcessWorkerSupervisor {
     }
 
     fn record_active_model(&self, generation: u64, identity: String) -> Result<()> {
+        let process = {
+            let state = self
+                .inner
+                .state
+                .lock()
+                .map_err(|_| anyhow!("process worker supervisor state lock was poisoned"))?;
+            let Some(current) = state
+                .current
+                .as_ref()
+                .filter(|current| current.generation == generation)
+            else {
+                bail!("process worker generation changed before model residency was recorded");
+            };
+            Arc::clone(&current.process)
+        };
+        if !process.is_running()? {
+            bail!("process worker generation exited before model residency was recorded");
+        }
         let mut state = self
             .inner
             .state
@@ -12852,11 +12870,14 @@ mod tests {
             next_correlation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
 
-        let loaded = inference
-            .load(missing_gguf_artifact(), AccelerationPreference::Cpu)
-            .unwrap();
+        let artifact = gguf_artifact_fixture("runtime-response-generation-binding");
+        let error = inference
+            .load(artifact.artifact.clone(), AccelerationPreference::Cpu)
+            .expect_err("an exited generation cannot own recorded model residency");
 
-        assert_eq!(loaded.detected_architecture, "test-runtime");
+        assert!(matches!(error, RuntimeError::RetryableWorkerFailure(_)));
+        let message = error.to_string();
+        assert!(message.contains("generation exited") || message.contains("generation changed"));
         let wait_until = Instant::now() + Duration::from_millis(250);
         while inference.transport.current_generation().unwrap().is_some()
             && Instant::now() < wait_until
@@ -12904,6 +12925,33 @@ mod tests {
             expected_size_bytes: 1,
             expected_sha256: "0".repeat(64),
         })
+    }
+
+    struct GgufArtifactFixture {
+        root: PathBuf,
+        artifact: RuntimeArtifact,
+    }
+
+    impl Drop for GgufArtifactFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn gguf_artifact_fixture(label: &str) -> GgufArtifactFixture {
+        let root = test_root(label);
+        let path = root.join("model.gguf");
+        std::fs::write(&path, b"g").unwrap();
+        GgufArtifactFixture {
+            root,
+            artifact: RuntimeArtifact::Gguf(RuntimeModel {
+                id: ModelId::new(label),
+                path,
+                format: ArtifactFormat::Gguf,
+                expected_size_bytes: 1,
+                expected_sha256: format!("{:x}", Sha256::digest(b"g")),
+            }),
+        }
     }
 
     #[cfg(windows)]
