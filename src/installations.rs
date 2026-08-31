@@ -3305,10 +3305,6 @@ fn download_pinned_artifact_with_target_and_policy_and_reader_spawner(
             downloaded = 0;
         }
 
-        let started_at = Instant::now();
-        let mut last_progress = started_at;
-        let mut last_byte_at = started_at;
-        let mut stalled = false;
         emit_progress_activity(
             progress,
             InstallStage::Downloading,
@@ -3319,6 +3315,14 @@ fn download_pinned_artifact_with_target_and_policy_and_reader_spawner(
         );
         let attempt_start_bytes = downloaded;
         let reader_events = pending_reader.start();
+        // Inactivity belongs to the live reader, not response validation,
+        // file setup, progress callbacks, or scheduler delay before the
+        // reader is released. Starting these clocks earlier can spend the
+        // reconnect budget before the first read is even allowed to run.
+        let started_at = Instant::now();
+        let mut last_progress = started_at;
+        let mut last_byte_at = started_at;
+        let mut stalled = false;
         let retry_cause = loop {
             if cancellation.is_cancelled() {
                 file.sync_all().map_err(|error| {
@@ -5498,8 +5502,11 @@ mod tests {
     fn fast_retry_policy() -> DownloadRetryPolicy {
         DownloadRetryPolicy {
             read_poll_interval: Duration::from_millis(1),
-            stalled_after: Duration::from_millis(1),
-            reconnect_after: Duration::from_millis(20),
+            // Tests that are not specifically exercising inactivity must not
+            // turn normal scheduler delay on a busy CI host into a reconnect.
+            // The dedicated stall test overrides both thresholds below.
+            stalled_after: Duration::from_secs(2),
+            reconnect_after: Duration::from_secs(5),
             retry_backoffs: [Duration::ZERO; 3],
             cancellation_poll_interval: Duration::from_millis(1),
         }
@@ -5540,12 +5547,13 @@ mod tests {
         let bytes = b"complete artifact";
         let prefix = 5;
         let spec = artifact(&root, bytes);
-        let mut first_actions = vec![ReadAction::Bytes(bytes[..prefix].to_vec())];
-        first_actions.extend([
-            ReadAction::ErrorAfter(Duration::from_millis(2), io::ErrorKind::TimedOut),
-            ReadAction::ErrorAfter(Duration::from_millis(2), io::ErrorKind::WouldBlock),
-            ReadAction::ErrorAfter(Duration::from_millis(2), io::ErrorKind::TimedOut),
-        ]);
+        let first_actions = vec![
+            ReadAction::Bytes(bytes[..prefix].to_vec()),
+            // Keep the reader inactive beyond the reconnect threshold. The
+            // margin is intentionally large enough that ordinary hosted-CI
+            // scheduling cannot consume the next attempt's entire budget.
+            ReadAction::ErrorAfter(Duration::from_secs(1), io::ErrorKind::TimedOut),
+        ];
         let source = ScriptedHttp::new([
             ScriptedAttempt::Response {
                 status: 200,
@@ -5566,7 +5574,8 @@ mod tests {
         ]);
         let updates = Mutex::new(Vec::new());
         let mut policy = fast_retry_policy();
-        policy.reconnect_after = Duration::from_millis(5);
+        policy.stalled_after = Duration::from_millis(50);
+        policy.reconnect_after = Duration::from_millis(250);
 
         let candidate = download_pinned_artifact_with_policy(
             &source,

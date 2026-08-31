@@ -845,7 +845,7 @@ fn selector_row(
                 name,
             );
             let action_name = if no_model {
-                "Add a model".to_owned()
+                "Active model: No model selected. Choose model".to_owned()
             } else {
                 format!("Choose active model: {name}")
             };
@@ -864,14 +864,7 @@ fn selector_row(
                     input.key_pressed(egui::Key::Enter) || input.key_pressed(egui::Key::Space)
                 });
             if response.enabled() && (response.clicked() || model_keyboard_activated) {
-                action = if no_model {
-                    ScreenAction::AddModel
-                } else {
-                    ScreenAction::None
-                };
-                if !no_model {
-                    ui.memory_mut(|memory| memory.toggle_popup(picker_id));
-                }
+                ui.memory_mut(|memory| memory.toggle_popup(picker_id));
             }
             let picker_open = ui.memory(|memory| memory.is_popup_open(picker_id));
             ui.ctx().accesskit_node_builder(response.id, |builder| {
@@ -897,7 +890,6 @@ fn selector_row(
                     .on_hover_cursor(egui::CursorIcon::PointingHand);
             }
             if response.enabled()
-                && !no_model
                 && let Some(picker_action) = show_ready_model_picker(
                     ui,
                     picker_id,
@@ -8148,7 +8140,7 @@ fn settings_help_affordance(
         egui::Id::new("settings-help-state"),
         &format!("{accessible_name} information"),
         description,
-        "?",
+        PopupAffordanceVisual::Circle("?"),
     );
 }
 
@@ -8165,8 +8157,13 @@ fn model_download_error_affordance(
         egui::Id::new("model-download-error-state"),
         accessible_name,
         description,
-        icon_glyph(Icon::Warning),
+        PopupAffordanceVisual::Bare(icon_glyph(Icon::Warning)),
     )
+}
+
+enum PopupAffordanceVisual<'a> {
+    Circle(&'a str),
+    Bare(&'a str),
 }
 
 fn popup_affordance(
@@ -8176,7 +8173,7 @@ fn popup_affordance(
     state_id: egui::Id,
     accessible_name: &str,
     description: &str,
-    glyph: &str,
+    visual: PopupAffordanceVisual<'_>,
 ) -> egui::Response {
     const HOVER_DELAY_SECONDS: f64 = 0.3;
     let (rect, _) = ui.allocate_exact_size(Vec2::splat(44.0), Sense::hover());
@@ -8268,16 +8265,23 @@ fn popup_affordance(
     }
     let expanded = state.active == Some(response.id);
     let colors = ui_palette(ui);
-    let visual = egui::Rect::from_center_size(rect.center(), Vec2::splat(20.0));
-    ui.painter()
-        .circle_filled(visual.center(), 10.0, colors.panel_bg);
-    ui.painter().circle_stroke(
-        visual.center(),
-        10.0,
-        Stroke::new(1.0, colors.border_strong),
-    );
+    let visual_center = rect.center();
+    let (glyph, draw_circle) = match visual {
+        PopupAffordanceVisual::Circle(glyph) => (glyph, true),
+        PopupAffordanceVisual::Bare(glyph) => (glyph, false),
+    };
+    if draw_circle {
+        let visual = egui::Rect::from_center_size(rect.center(), Vec2::splat(20.0));
+        ui.painter()
+            .circle_filled(visual.center(), 10.0, colors.panel_bg);
+        ui.painter().circle_stroke(
+            visual.center(),
+            10.0,
+            Stroke::new(1.0, colors.border_strong),
+        );
+    }
     ui.painter().text(
-        visual.center(),
+        visual_center,
         Align2::CENTER_CENTER,
         glyph,
         egui::FontId::proportional(14.0),
@@ -9951,6 +9955,39 @@ mod tests {
             warning.description(),
             Some("TLS certificate validation failed.")
         );
+    }
+
+    #[test]
+    fn download_warning_glyph_has_no_circle_in_light_or_dark_theme() {
+        for dark_mode in [false, true] {
+            let ctx = egui::Context::default();
+            ctx.set_visuals(crate::ui::theme::ThemePalette::visuals(dark_mode));
+            ctx.enable_accesskit();
+            crate::ui::controls::configure_accessible_style(&ctx);
+            let output = ctx.run(Default::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let _ = model_download_error_affordance(
+                        ui,
+                        ModelCardKey::Local("warning-glyph".into()),
+                        "Show download error for Warning glyph",
+                        "The download failed.",
+                    );
+                });
+            });
+            assert!(
+                !output
+                    .shapes
+                    .iter()
+                    .any(|clipped| matches!(&clipped.shape, egui::epaint::Shape::Circle(_))),
+                "warning glyph should not paint a circle in {dark_mode:?} mode"
+            );
+            let warning = named_role_bounds(
+                &output,
+                "Show download error for Warning glyph",
+                egui::accesskit::Role::Button,
+            );
+            assert!(warning.width() >= 44.0 && warning.height() >= 44.0);
+        }
     }
 
     #[test]
@@ -11867,6 +11904,149 @@ mod tests {
                     .any(|(_, node)| node.name() == Some("Broken model"))
             );
         }
+    }
+
+    #[test]
+    fn no_active_model_selector_opens_ready_picker_from_click_and_keyboard() {
+        let state = TranscriptionState {
+            phase: TranscriptionPhase::NoModel,
+            hotkey: "Ctrl+Space".into(),
+            ..Default::default()
+        };
+        let models = vec![
+            ModelViewModel {
+                id: "base.en".into(),
+                display_name: "Whisper Base".into(),
+                installed: true,
+                ready: true,
+                ..Default::default()
+            },
+            ModelViewModel {
+                id: "broken.en".into(),
+                display_name: "Broken model".into(),
+                installed: true,
+                ready: false,
+                ..Default::default()
+            },
+        ];
+
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        crate::ui::controls::configure_accessible_style(&ctx);
+        let (initial, action) = render_selector_with_events(&ctx, &state, &models, 900.0, vec![]);
+        assert_eq!(action, ScreenAction::None);
+        let card = named_role_bounds(
+            &initial,
+            "Active model: No model selected. Choose model",
+            egui::accesskit::Role::Button,
+        );
+        let point = accesskit_rect_center(card);
+
+        let (_, press_action) = render_selector_with_events(
+            &ctx,
+            &state,
+            &models,
+            900.0,
+            vec![
+                egui::Event::PointerMoved(point),
+                primary_pointer_event(point, true),
+            ],
+        );
+        assert_eq!(press_action, ScreenAction::None);
+        let (clicked, click_action) = render_selector_with_events(
+            &ctx,
+            &state,
+            &models,
+            900.0,
+            vec![
+                egui::Event::PointerMoved(point),
+                primary_pointer_event(point, false),
+            ],
+        );
+        assert_eq!(click_action, ScreenAction::None);
+        assert!(button_expanded(
+            &clicked,
+            "Active model: No model selected. Choose model"
+        ));
+        assert!(
+            clicked
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .is_some_and(|update| {
+                    update.nodes.iter().any(|(_, node)| {
+                        node.name() == Some("Select Whisper Base")
+                            && node.role() == egui::accesskit::Role::Button
+                    }) && update.nodes.iter().any(|(_, node)| {
+                        node.name() == Some("Manage models…")
+                            && node.role() == egui::accesskit::Role::Button
+                    }) && !update
+                        .nodes
+                        .iter()
+                        .any(|(_, node)| node.name() == Some("Broken model"))
+                })
+        );
+
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        crate::ui::controls::configure_accessible_style(&ctx);
+        let (opened, key_action) = render_selector_with_key(
+            &ctx,
+            &state,
+            &models,
+            egui::Id::new("selected-model-action"),
+            egui::Key::Enter,
+            false,
+        );
+        assert_eq!(key_action, ScreenAction::None);
+        assert!(button_expanded(
+            &opened,
+            "Active model: No model selected. Choose model"
+        ));
+    }
+
+    #[test]
+    fn no_active_model_selector_shows_empty_picker_with_manage_models() {
+        let state = TranscriptionState {
+            phase: TranscriptionPhase::NoModel,
+            hotkey: "Ctrl+Space".into(),
+            ..Default::default()
+        };
+        let models = vec![ModelViewModel {
+            id: "broken.en".into(),
+            display_name: "Broken model".into(),
+            installed: true,
+            ready: false,
+            ..Default::default()
+        }];
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        crate::ui::controls::configure_accessible_style(&ctx);
+        let (output, action) = render_selector_with_key(
+            &ctx,
+            &state,
+            &models,
+            egui::Id::new("selected-model-action"),
+            egui::Key::Space,
+            false,
+        );
+        assert_eq!(action, ScreenAction::None);
+        assert!(button_expanded(
+            &output,
+            "Active model: No model selected. Choose model"
+        ));
+        let update = output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .expect("empty ready picker should expose AccessKit");
+        assert!(update.nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::StaticText
+                && node.name() == Some("No installed models are ready to use.")
+        }));
+        assert!(update.nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::Button && node.name() == Some("Manage models…")
+        }));
     }
 
     #[test]
