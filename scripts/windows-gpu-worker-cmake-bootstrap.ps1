@@ -18,7 +18,7 @@ function Test-ScribeGpuWorkerKnownCmakeBootstrapFailure([object[]]$Output) {
     }
 
     $crateLine = [regex]::new('^error: failed to run custom build command for `transcribe-cpp-sys v0\.1\.3(?: .*)?$', [Text.RegularExpressions.RegexOptions]::CultureInvariant)
-    $junctionLine = [regex]::new('^.*transcribe-cpp-sys: could not create short build junction .+; building in OUT_DIR\s*$', [Text.RegularExpressions.RegexOptions]::CultureInvariant)
+    $junctionLine = [regex]::new('^.*transcribe-cpp-sys: could not create short build junction .+; building in OUT_DIR \(may exceed Windows MAX_PATH in deep checkouts\)\s*$', [Text.RegularExpressions.RegexOptions]::CultureInvariant)
     $warningSourceLine = [regex]::new('^.*vulkan-shaders-gen.*$', [Text.RegularExpressions.RegexOptions]::CultureInvariant)
     $objectPathLine = [regex]::new('^.*CMAKE_OBJECT_PATH_MAX.*$', [Text.RegularExpressions.RegexOptions]::CultureInvariant)
     $linkLine = [regex]::new('^.*(?:LINK|link) : fatal error LNK1104: cannot open file ''CMakeFiles\\cmTC_[0-9A-Fa-f]+\.dir\\intermediate\.manifest''\s*$', [Text.RegularExpressions.RegexOptions]::CultureInvariant)

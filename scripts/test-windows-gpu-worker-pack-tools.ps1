@@ -91,12 +91,12 @@ if (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure $legacyCmakeBootstrapFa
 if (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure @('transcribe-cpp-sys v0.1.3', 'Could not open file for write in copy operation'))) { throw 'Existing copy-operation CMake bootstrap signature regressed.' }
 $vulkanShortJunctionFailure = @(
     'error: failed to run custom build command for `transcribe-cpp-sys v0.1.3 (C:\safe\crate)`',
-    'transcribe-cpp-sys: could not create short build junction C:\safe\tcs; building in OUT_DIR',
+    'transcribe-cpp-sys: could not create short build junction C:\safe\tcs; building in OUT_DIR (may exceed Windows MAX_PATH in deep checkouts)',
     'vulkan-shaders-gen: warning: object directory is near the configured limit',
     'CMAKE_OBJECT_PATH_MAX is in effect for this nested target',
     "LINK : fatal error LNK1104: cannot open file 'CMakeFiles\cmTC_1a2B3c.dir\intermediate.manifest'"
 )
-if (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure $vulkanShortJunctionFailure)) { throw 'Observed Vulkan short-junction CMake signature was not classified.' }
+if (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure $vulkanShortJunctionFailure)) { throw 'Sanitized observed Vulkan short-junction CMake excerpt was not classified.' }
 $interveningVulkanShortJunctionFailure = [System.Collections.Generic.List[object]]::new()
 $interveningVulkanShortJunctionFailure.Add($vulkanShortJunctionFailure[0])
 $interveningVulkanShortJunctionFailure.Add($vulkanShortJunctionFailure[1])
@@ -110,6 +110,7 @@ if (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure $interveningVulkanShort
 foreach ($malformedVulkanShortJunctionFailure in @(
     @($vulkanShortJunctionFailure | Select-Object -Skip 1),
     @($vulkanShortJunctionFailure[0], $vulkanShortJunctionFailure[1], $vulkanShortJunctionFailure[4], $vulkanShortJunctionFailure[2], $vulkanShortJunctionFailure[3]),
+    @($vulkanShortJunctionFailure[0], 'transcribe-cpp-sys: could not create short build junction C:\safe\tcs; building in OUT_DIR (unexpected suffix)', $vulkanShortJunctionFailure[2], $vulkanShortJunctionFailure[3], $vulkanShortJunctionFailure[4]),
     @($vulkanShortJunctionFailure[0], $vulkanShortJunctionFailure[1], $vulkanShortJunctionFailure[2], $vulkanShortJunctionFailure[3], 'LINK : fatal error LNK1104: cannot open file ''CMakeFiles\cmTC_xyz.dir\intermediate.manifest'''),
     @('unrelated LNK1104')
 )) {
