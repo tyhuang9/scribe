@@ -23,6 +23,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 
+use crate::backend_policy::BackendTarget;
 use crate::config::{self, AppConfig};
 use crate::installations::InstallCancellation;
 use crate::model_catalog::{
@@ -475,6 +476,11 @@ enum RuntimeCommand {
         preference: AccelerationPreference,
         reply: SyncSender<Result<RuntimeLoadExecution, RuntimeError>>,
     },
+    RetryGpu {
+        artifact: RuntimeArtifact,
+        target: BackendTarget,
+        reply: SyncSender<Result<RuntimeLoadExecution, RuntimeError>>,
+    },
     Health {
         artifact: RuntimeArtifact,
         preference: AccelerationPreference,
@@ -664,6 +670,25 @@ impl RuntimeWorker {
             .map_err(|error| RuntimeError::WorkerUnavailable(error.to_string()))?
     }
 
+    fn retry_gpu(
+        &self,
+        artifact: impl Into<RuntimeArtifact>,
+        target: BackendTarget,
+    ) -> Result<RuntimeLoadExecution, RuntimeError> {
+        let (reply, response) = sync_channel(1);
+        self.inner
+            .commands
+            .send(RuntimeCommand::RetryGpu {
+                artifact: artifact.into(),
+                target,
+                reply,
+            })
+            .map_err(|error| RuntimeError::WorkerUnavailable(error.to_string()))?;
+        response
+            .recv()
+            .map_err(|error| RuntimeError::WorkerUnavailable(error.to_string()))?
+    }
+
     fn unload(&self) -> Result<(), RuntimeError> {
         let (reply, response) = sync_channel(1);
         self.inner
@@ -813,6 +838,17 @@ fn runtime_worker_loop(router: RuntimeRouter, commands: Receiver<RuntimeCommand>
                 let _ = reply.send(result);
                 (succeeded, request_activity)
             }
+            Ok(RuntimeCommand::RetryGpu {
+                artifact,
+                target: _,
+                reply,
+            }) => {
+                let request_activity = activity.acquire_request().ok();
+                let result = router.load(artifact, AccelerationPreference::Gpu);
+                let succeeded = result.is_ok();
+                let _ = reply.send(result);
+                (succeeded, request_activity)
+            }
             Ok(RuntimeCommand::Health {
                 artifact,
                 preference,
@@ -912,6 +948,16 @@ fn inference_worker_dispatch_loop(
                 reply,
             }) => {
                 let result = inference.load(artifact, preference);
+                let succeeded = result.is_ok();
+                let _ = reply.send(result);
+                succeeded
+            }
+            Ok(RuntimeCommand::RetryGpu {
+                artifact,
+                target,
+                reply,
+            }) => {
+                let result = inference.retry_gpu(artifact, &target);
                 let succeeded = result.is_ok();
                 let _ = reply.send(result);
                 succeeded
@@ -1314,6 +1360,34 @@ impl TranscriptionService {
                 runtime_model,
                 self.config.performance.acceleration_preference,
             )
+            .map_err(|error| anyhow!(error))?;
+        Ok(ModelLoadOutcome {
+            model_id: model_id.clone(),
+            resolved_acceleration: execution.diagnostics.resolved_acceleration,
+            model_load_duration_ms: execution.diagnostics.model_load_duration_ms,
+            warm_model_reused: execution.diagnostics.warm_reused,
+        })
+    }
+
+    /// Re-resolves the current configured GGUF artifact before asking the
+    /// registry to perform its bounded provider reprobe and exact-target
+    /// retry. ONNX remains CPU-only and cannot enter this path.
+    pub(crate) fn retry_gpu(
+        &self,
+        model_id: &ModelId,
+        target: &BackendTarget,
+    ) -> Result<ModelLoadOutcome> {
+        if config::installed_onnx_bundle_root(&self.config, model_id).is_some() {
+            return Err(anyhow!("GPU retry is unavailable for ONNX models"));
+        }
+        let model = self.resolve_model(model_id, None)?;
+        let runtime_model = self.resolve_runtime_model(model)?;
+        if runtime_model.format != ArtifactFormat::Gguf {
+            return Err(anyhow!("GPU retry is available only for GGUF artifacts"));
+        }
+        let execution = self
+            .worker
+            .retry_gpu(runtime_model, target.clone())
             .map_err(|error| anyhow!(error))?;
         Ok(ModelLoadOutcome {
             model_id: model_id.clone(),
@@ -3141,6 +3215,11 @@ mod tests {
                     RuntimeCommand::Load { reply, .. } => {
                         reply.send(Ok(test_load_execution())).unwrap()
                     }
+                    RuntimeCommand::RetryGpu { reply, .. } => reply
+                        .send(Err(RuntimeError::WorkerUnavailable(
+                            "GPU retry is not part of this fixture".to_owned(),
+                        )))
+                        .unwrap(),
                     RuntimeCommand::Transcribe { reply, .. } => reply
                         .send(Err(RuntimeError::Engine(
                             "deterministic service decode failure".to_owned(),
@@ -3188,6 +3267,11 @@ mod tests {
         let worker = simulated_runtime_worker(move |receiver| {
             while let Ok(command) = receiver.recv() {
                 match command {
+                    RuntimeCommand::RetryGpu { reply, .. } => reply
+                        .send(Err(RuntimeError::WorkerUnavailable(
+                            "GPU retry is not part of this fixture".to_owned(),
+                        )))
+                        .unwrap(),
                     RuntimeCommand::Health { reply, .. } => reply
                         .send(Err(RuntimeError::Engine(
                             "deterministic service health failure".to_owned(),

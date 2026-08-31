@@ -22,6 +22,7 @@ use crate::audio::{
     CaptureOptions, CaptureStopReason, LevelSnapshot, RecordingSession,
     SpeechDetectionMode as CaptureSpeechDetectionMode, VadOptions,
 };
+use crate::backend_policy::BackendTarget;
 use crate::benchmark::{
     self, BenchmarkMetric, BenchmarkModelInput, BenchmarkModelResult, RankingMode,
 };
@@ -80,8 +81,8 @@ use crate::ui::{
     RemoteCatalogEntryView, RemoteCatalogFilters, RemoteCatalogSort, RemoteCatalogStatusKind,
     RemoteCatalogStatusView, RemoteCatalogVariantView, RemoteCatalogView, ResolvedTheme,
     ScreenAction, ScreenView, SettingsTab, SidebarModelView, ThemePalette, TranscribeNotice,
-    TranscribeRecoveryAction, UiRoute, configure_accessible_style, history_page,
-    minimum_primary_target_height, recording_mode, render_screen,
+    TranscribeRecoveryAction, UiRoute, acceleration_diagnostics, configure_accessible_style,
+    history_page, minimum_primary_target_height, recording_mode, render_screen,
     request_models_route_heading_focus, scroll_focused_control_into_view, settings_save_state,
     show_navigation, show_route_scroll, theme_palette, transcription_state, ui_palette,
 };
@@ -673,6 +674,13 @@ struct PendingPreviewDrain {
 struct PlaygroundRunState {
     pending_requests: HashMap<RequestId, String>,
     _audio: Arc<PreparedAudio>,
+}
+
+#[derive(Clone, Debug)]
+struct ModelAccelerationState {
+    model_id: ModelId,
+    resolved: crate::transcription::ResolvedAcceleration,
+    retry_target: Option<BackendTarget>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1269,6 +1277,7 @@ enum AppEvent {
         session_id: SessionId,
         model_id: ModelId,
         load_duration_ms: u128,
+        resolved_acceleration: crate::transcription::ResolvedAcceleration,
     },
     ModelPreloadFailed {
         session_id: SessionId,
@@ -1281,6 +1290,10 @@ enum AppEvent {
         request_id: RequestId,
         result: Box<TranscriptionOutcome>,
         latency: Option<LatencyTrace>,
+    },
+    GpuRetryFinished {
+        model_id: ModelId,
+        result: Result<crate::transcription::ModelLoadOutcome, String>,
     },
     PlaygroundModelStarted {
         session_id: SessionId,
@@ -2673,6 +2686,7 @@ pub struct LocalTranscriberApp {
     raw_transcript: String,
     status_message: String,
     transcribe_notice: Option<TranscribeNotice>,
+    latest_acceleration: Option<ModelAccelerationState>,
     theme_announcement: Option<String>,
     hotkey_input: String,
     model_search: String,
@@ -2907,6 +2921,7 @@ impl LocalTranscriberApp {
             raw_transcript: String::new(),
             status_message,
             transcribe_notice: None,
+            latest_acceleration: None,
             theme_announcement: None,
             active_recording: None,
             pending_recording: None,
@@ -4641,6 +4656,7 @@ impl LocalTranscriberApp {
                         session_id,
                         model_id,
                         load_duration_ms: outcome.model_load_duration_ms,
+                        resolved_acceleration: outcome.resolved_acceleration,
                     });
                 }
                 Err(err) => {
@@ -6169,6 +6185,7 @@ impl LocalTranscriberApp {
                     session_id,
                     model_id,
                     load_duration_ms,
+                    resolved_acceleration,
                 } => {
                     if self
                         .session_coordinator
@@ -6177,6 +6194,7 @@ impl LocalTranscriberApp {
                     {
                         continue;
                     }
+                    self.update_latest_acceleration(&model_id, resolved_acceleration);
                     if let Some(active) = self.active_recording.as_mut()
                         && active.session_id == session_id
                     {
@@ -6227,6 +6245,30 @@ impl LocalTranscriberApp {
                         self.status_message = format!(
                             "Preparing microphone. Model warm-up was unavailable; final transcription will retry safely: {message}"
                         );
+                    }
+                }
+                AppEvent::GpuRetryFinished { model_id, result } => {
+                    if self.config.general.selected_default_model != model_id.as_str() {
+                        continue;
+                    }
+                    match result {
+                        Ok(outcome) => {
+                            self.update_latest_acceleration(
+                                &model_id,
+                                outcome.resolved_acceleration,
+                            );
+                            self.status = TranscriptionStatus::Idle;
+                            self.status_message = "GPU retry completed".to_owned();
+                            self.transcribe_notice =
+                                Some(TranscribeNotice::information("GPU retry completed."));
+                        }
+                        Err(_) => {
+                            self.status = TranscriptionStatus::Idle;
+                            self.status_message = "GPU retry could not be completed".to_owned();
+                            self.transcribe_notice = Some(TranscribeNotice::failure(
+                                "GPU retry could not be completed. The previous selection remains active.",
+                            ));
+                        }
                     }
                 }
                 AppEvent::HistoryCompletionObserved {
@@ -6503,6 +6545,19 @@ impl LocalTranscriberApp {
                         let _ = self.session_coordinator.fail(session_id);
                         self.cleanup_after_job(source, session_id, request_id);
                         continue;
+                    }
+                    if source == RecordingSource::Transcribe {
+                        self.update_latest_acceleration(
+                            &result.model_id,
+                            result.resolved_acceleration.clone().unwrap_or_else(|| {
+                                crate::transcription::ResolvedAcceleration {
+                                    requested: self.config.performance.acceleration_preference,
+                                    resolved: crate::transcription::ComputeDevice::Cpu,
+                                    diagnostic: None,
+                                    selection: None,
+                                }
+                            }),
+                        );
                     }
 
                     let result_model_id = ModelId::new(result.model_id.as_str());
@@ -9574,6 +9629,86 @@ impl eframe::App for LocalTranscriberApp {
 }
 
 impl LocalTranscriberApp {
+    fn update_latest_acceleration(
+        &mut self,
+        model_id: &ModelId,
+        resolved: crate::transcription::ResolvedAcceleration,
+    ) {
+        let retry_target = resolved
+            .selection
+            .as_ref()
+            .and_then(|selection| {
+                selection
+                    .target
+                    .backend
+                    .is_gpu()
+                    .then(|| selection.target.clone())
+            })
+            .or_else(|| {
+                resolved.selection.as_ref().and_then(|selection| {
+                    selection
+                        .fallback_history
+                        .iter()
+                        .rev()
+                        .find(|fallback| fallback.target.backend.is_gpu())
+                        .map(|fallback| fallback.target.clone())
+                })
+            });
+        self.latest_acceleration = Some(ModelAccelerationState {
+            model_id: model_id.clone(),
+            resolved,
+            retry_target,
+        });
+    }
+
+    fn acceleration_diagnostics_view(&self) -> Option<crate::ui::AccelerationDiagnosticsView> {
+        let latest = self.latest_acceleration.as_ref()?;
+        let selected_model = ModelId::new(&self.config.general.selected_default_model);
+        (latest.model_id == selected_model
+            && latest.resolved.requested == self.config.performance.acceleration_preference)
+            .then(|| {
+                acceleration_diagnostics(Some(&latest.resolved), latest.retry_target.is_some())
+            })
+            .flatten()
+    }
+
+    fn retry_gpu(&mut self) {
+        let Some(latest) = self.latest_acceleration.as_ref() else {
+            self.transcribe_notice = Some(TranscribeNotice::failure(
+                "GPU retry is unavailable until a model has reported its selection.",
+            ));
+            return;
+        };
+        let Some(target) = latest.retry_target.clone() else {
+            self.transcribe_notice = Some(TranscribeNotice::failure(
+                "GPU retry is unavailable for the current model selection.",
+            ));
+            return;
+        };
+        let model_id = ModelId::new(&self.config.general.selected_default_model);
+        if latest.model_id != model_id {
+            self.transcribe_notice = Some(TranscribeNotice::failure(
+                "GPU retry is unavailable for the current model selection.",
+            ));
+            return;
+        }
+        self.status = TranscriptionStatus::Transcribing;
+        self.status_message = "Retrying GPU".to_owned();
+        self.transcribe_notice = Some(TranscribeNotice::information("Retrying GPU…"));
+        let service = self.current_transcription_service();
+        let tx = self.tx.clone();
+        let model_id_for_thread = model_id.clone();
+        thread::spawn(move || {
+            let result = service
+                .retry_gpu(&model_id_for_thread, &target)
+                .map_err(|error| error.to_string());
+            let _ = tx.send(AppEvent::GpuRetryFinished {
+                model_id: model_id_for_thread,
+                result,
+            });
+        });
+    }
+
     fn ui_transcribe(&mut self, ui: &mut Ui) {
         let models = self.transcribe_screen_models();
         let quick_models = Arc::clone(&self.remote_catalog.local_models);
@@ -9636,6 +9771,7 @@ impl LocalTranscriberApp {
                 self.effective_status() == TranscriptionStatus::Error
                     && self.status_message.starts_with("Failed to save settings:"),
             ),
+            acceleration_diagnostics: self.acceleration_diagnostics_view(),
             ..Default::default()
         };
         let action = render_screen(
@@ -9726,6 +9862,7 @@ impl LocalTranscriberApp {
                 self.transcribe_notice = None;
                 self.start_recording(RecordingSource::Transcribe)
             }
+            ScreenAction::RetryGpu => self.retry_gpu(),
             ScreenAction::StopRecording => self.stop_recording(),
             ScreenAction::AbandonRecording => {
                 if let Some(session_id) = self.session_coordinator.active_session_id() {
@@ -12426,6 +12563,7 @@ impl LocalTranscriberApp {
                 self.effective_status() == TranscriptionStatus::Error
                     && self.status_message.starts_with("Failed to save settings:"),
             ),
+            acceleration_diagnostics: self.acceleration_diagnostics_view(),
         };
         let comparison = Default::default();
         let action = render_screen(
@@ -12545,6 +12683,7 @@ impl LocalTranscriberApp {
                 self.microphone_monitor_retry_required = false;
                 self.ensure_microphone_monitor();
             }
+            ScreenAction::RetryGpu => self.retry_gpu(),
             ScreenAction::OpenAudioSettings => self.open_system_audio_settings(),
             ScreenAction::ChangeShortcut => {
                 self.capturing_hotkey = !self.capturing_hotkey;
@@ -16472,6 +16611,12 @@ mod layout_tests {
                 session_id,
                 model_id,
                 load_duration_ms: 7,
+                resolved_acceleration: crate::transcription::ResolvedAcceleration {
+                    requested: AccelerationPreference::Auto,
+                    resolved: crate::transcription::ComputeDevice::Cpu,
+                    diagnostic: None,
+                    selection: None,
+                },
             };
             let capture_event = AppEvent::CaptureReady {
                 session_id,
@@ -16792,6 +16937,12 @@ mod layout_tests {
                 session_id: SessionId(session_id.0 + 1),
                 model_id: model_id.clone(),
                 load_duration_ms: 1,
+                resolved_acceleration: crate::transcription::ResolvedAcceleration {
+                    requested: AccelerationPreference::Auto,
+                    resolved: crate::transcription::ComputeDevice::Cpu,
+                    diagnostic: None,
+                    selection: None,
+                },
             })
             .unwrap();
         app.tx
@@ -16799,6 +16950,12 @@ mod layout_tests {
                 session_id,
                 model_id,
                 load_duration_ms: 2,
+                resolved_acceleration: crate::transcription::ResolvedAcceleration {
+                    requested: AccelerationPreference::Auto,
+                    resolved: crate::transcription::ComputeDevice::Cpu,
+                    diagnostic: None,
+                    selection: None,
+                },
             })
             .unwrap();
 
@@ -19805,6 +19962,7 @@ mod layout_tests {
             raw_transcript: String::new(),
             status_message: "Ready".to_owned(),
             transcribe_notice: None,
+            latest_acceleration: None,
             theme_announcement: None,
             active_recording: None,
             pending_recording: None,

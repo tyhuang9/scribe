@@ -84,6 +84,26 @@ pub(crate) struct TranscribeNotice {
     pub recovery_action: Option<TranscribeRecoveryAction>,
 }
 
+/// Privacy-safe projection of one model-bound acceleration decision.
+///
+/// This view intentionally contains display labels only. Stable device
+/// identities, pack digests, paths, and native error text never cross into
+/// the UI contract.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AccelerationDiagnosticsView {
+    pub selected_backend: String,
+    pub selected_device: String,
+    pub selection_reason: String,
+    pub skipped_reasons: Vec<String>,
+    pub pack_id: Option<String>,
+    pub pack_version: Option<String>,
+    pub driver: Option<String>,
+    pub power_policy: String,
+    pub quarantine_status: String,
+    pub fallback_status: String,
+    pub retry_gpu_available: bool,
+}
+
 impl TranscribeNotice {
     pub(crate) fn information(message: impl Into<String>) -> Self {
         Self {

@@ -23,12 +23,13 @@ use super::{
     screens::{RecordingSettingsView, ScreenAction, ScreenView, render_screen, show_route_scroll},
     shell::{AppPage, SidebarModelView, show_navigation},
     state::{
-        ComparisonPhase, ModelCapabilities, ModelCardKey, ModelComparisonState, ModelDialog,
-        ModelDownloadState, ModelLanguageFilter, ModelManagementState, ModelSizeTier,
-        ModelSpeedTier, ModelViewModel, RemoteCatalogActionKind, RemoteCatalogActionView,
-        RemoteCatalogEntryView, RemoteCatalogStatusKind, RemoteCatalogStatusView,
-        RemoteCatalogVariantView, RemoteCatalogView, ResolvedTheme, SettingsTab, TranscribeNotice,
-        TranscriptionPhase, TranscriptionState, UiRoute,
+        AccelerationDiagnosticsView, ComparisonPhase, ModelCapabilities, ModelCardKey,
+        ModelComparisonState, ModelDialog, ModelDownloadState, ModelLanguageFilter,
+        ModelManagementState, ModelSizeTier, ModelSpeedTier, ModelViewModel,
+        RemoteCatalogActionKind, RemoteCatalogActionView, RemoteCatalogEntryView,
+        RemoteCatalogStatusKind, RemoteCatalogStatusView, RemoteCatalogVariantView,
+        RemoteCatalogView, ResolvedTheme, SettingsTab, TranscribeNotice, TranscriptionPhase,
+        TranscriptionState, UiRoute,
     },
     theme_palette,
 };
@@ -227,6 +228,21 @@ impl Fixture {
             voice_detection_mode: SpeechDetectionMode::ManualThreshold,
             input_threshold_dbfs: -42.0,
             input_level_percent: 68,
+            acceleration_diagnostics: Some(AccelerationDiagnosticsView {
+                selected_backend: "Vulkan".into(),
+                selected_device: "Studio GPU".into(),
+                selection_reason: "GPU was requested".into(),
+                skipped_reasons: vec![
+                    "CUDA (Office GPU) — temporarily quarantined after a failure".into(),
+                ],
+                pack_id: Some("scribe-gpu".into()),
+                pack_version: Some("1.2.3".into()),
+                driver: Some("32.0.16.1088".into()),
+                power_policy: "All qualified devices allowed".into(),
+                quarantine_status: "A GPU is temporarily quarantined".into(),
+                fallback_status: "No fallback was needed".into(),
+                retry_gpu_available: true,
+            }),
             ..Default::default()
         };
         let route = match self {
@@ -1200,6 +1216,7 @@ fn apply_action(data: &mut FixtureData, page: &mut AppPage, action: ScreenAction
         }
         ScreenAction::OpenAudioSettings => *page = AppPage::General,
         ScreenAction::RetryMicrophone => data.transcription.phase = TranscriptionPhase::Listening,
+        ScreenAction::RetryGpu => {}
         ScreenAction::ClearTranscript => data.transcription.committed_transcript.clear(),
         ScreenAction::CopyTranscript => {}
         ScreenAction::ToggleComparison => data.comparison.expanded = !data.comparison.expanded,
@@ -6791,5 +6808,29 @@ mod tests {
         );
         assert_eq!(Fixture::parse("demo/audio"), Some(Fixture::DemoAudio));
         assert_eq!(Fixture::parse("debug"), None);
+    }
+
+    #[test]
+    fn gpu_diagnostics_fixture_exposes_safe_labels_and_retry_action() {
+        let output = render(Fixture::TranscribeReady, 960.0, 680.0);
+        let names = node_names(&output);
+        for visible in [
+            "GPU diagnostics",
+            "Selected backend",
+            "Vulkan",
+            "Studio GPU",
+            "scribe-gpu · 1.2.3",
+            "Retry GPU",
+        ] {
+            assert!(
+                names.iter().any(|name| name == visible),
+                "missing {visible}"
+            );
+        }
+        let retry = named_node_bounds(&output, "Retry GPU");
+        assert!(retry.width() >= 44.0 && retry.height() >= 44.0);
+        for private_value in ["provider-stable-secret", "pack-digest-secret"] {
+            assert!(!names.iter().any(|name| name.contains(private_value)));
+        }
     }
 }

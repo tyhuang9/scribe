@@ -26,13 +26,13 @@ use super::{
         ReadyModelPickerAction, close_ready_model_picker_and_restore_focus, show_ready_model_picker,
     },
     state::{
-        ComparisonPhase, ComparisonResultPhase, ModelCardKey, ModelComparisonState, ModelDialog,
-        ModelDownloadState, ModelLanguageFilter, ModelManagementState, ModelSpeedTier,
-        ModelViewModel, RecordingMode, RemoteCatalogActionKind, RemoteCatalogActionView,
-        RemoteCatalogEntryView, RemoteCatalogStatusKind, RemoteCatalogVariantView,
-        RemoteCatalogView, ResolvedTheme, SettingsSaveState, SettingsTab, TranscribeNotice,
-        TranscribeNoticeTone, TranscribeRecoveryAction, TranscriptionPhase, TranscriptionState,
-        UiRoute,
+        AccelerationDiagnosticsView, ComparisonPhase, ComparisonResultPhase, ModelCardKey,
+        ModelComparisonState, ModelDialog, ModelDownloadState, ModelLanguageFilter,
+        ModelManagementState, ModelSpeedTier, ModelViewModel, RecordingMode,
+        RemoteCatalogActionKind, RemoteCatalogActionView, RemoteCatalogEntryView,
+        RemoteCatalogStatusKind, RemoteCatalogVariantView, RemoteCatalogView, ResolvedTheme,
+        SettingsSaveState, SettingsTab, TranscribeNotice, TranscribeNoticeTone,
+        TranscribeRecoveryAction, TranscriptionPhase, TranscriptionState, UiRoute,
     },
     ui_palette,
 };
@@ -409,6 +409,7 @@ pub(crate) struct RecordingSettingsView {
     pub streaming_label: String,
     pub acceleration_label: String,
     pub gpu_available: bool,
+    pub acceleration_diagnostics: Option<AccelerationDiagnosticsView>,
     pub overlay_position_label: String,
     pub debug_mode: bool,
     pub focus_playground_open: bool,
@@ -460,6 +461,7 @@ impl Default for RecordingSettingsView {
             streaming_label: "Auto".into(),
             acceleration_label: "Auto".into(),
             gpu_available: false,
+            acceleration_diagnostics: None,
             overlay_position_label: "Bottom".into(),
             debug_mode: false,
             focus_playground_open: false,
@@ -567,6 +569,7 @@ pub(crate) enum ScreenAction {
     SetPostRollMs(u32),
     SetStreamingMode(String),
     SetAcceleration(String),
+    RetryGpu,
     SetOverlayPosition(String),
     SetDebugMode(bool),
     OpenDeveloperPlayground,
@@ -7012,8 +7015,88 @@ fn recording_settings_panel(
             if acceleration != settings.acceleration_label {
                 *action = ScreenAction::SetAcceleration(acceleration);
             }
+
+            if let Some(diagnostics) = settings.acceleration_diagnostics.as_ref() {
+                acceleration_diagnostics_panel(ui, diagnostics, action);
+            }
         });
     });
+}
+
+fn acceleration_diagnostics_panel(
+    ui: &mut egui::Ui,
+    diagnostics: &AccelerationDiagnosticsView,
+    action: &mut ScreenAction,
+) {
+    let colors = ui_palette(ui);
+    ui.add_space(8.0);
+    Frame::group(ui.style())
+        .fill(colors.panel_bg)
+        .stroke(Stroke::new(1.0, colors.border))
+        .rounding(Rounding::same(5.0))
+        .inner_margin(Margin::symmetric(12.0, 10.0))
+        .show(ui, |ui| {
+            ui.label(RichText::new("GPU diagnostics").strong());
+            ui.add_space(4.0);
+            egui::Grid::new("acceleration-diagnostics-grid")
+                .num_columns(2)
+                .spacing(Vec2::new(12.0, 4.0))
+                .show(ui, |ui| {
+                    ui.label(RichText::new("Selected backend").color(colors.muted_text));
+                    ui.label(&diagnostics.selected_backend);
+                    ui.end_row();
+                    ui.label(RichText::new("Selected device").color(colors.muted_text));
+                    ui.label(&diagnostics.selected_device);
+                    ui.end_row();
+                    ui.label(RichText::new("Selection").color(colors.muted_text));
+                    ui.label(&diagnostics.selection_reason);
+                    ui.end_row();
+                    ui.label(RichText::new("Power policy").color(colors.muted_text));
+                    ui.label(&diagnostics.power_policy);
+                    ui.end_row();
+                    ui.label(RichText::new("Quarantine").color(colors.muted_text));
+                    ui.label(&diagnostics.quarantine_status);
+                    ui.end_row();
+                    ui.label(RichText::new("Fallback").color(colors.muted_text));
+                    ui.label(&diagnostics.fallback_status);
+                    ui.end_row();
+                    if let Some(pack_id) = diagnostics.pack_id.as_deref()
+                        && let Some(pack_version) = diagnostics.pack_version.as_deref()
+                    {
+                        ui.label(RichText::new("Worker pack").color(colors.muted_text));
+                        ui.label(format!("{pack_id} · {pack_version}"));
+                        ui.end_row();
+                    }
+                    if let Some(driver) = diagnostics.driver.as_deref() {
+                        ui.label(RichText::new("Driver").color(colors.muted_text));
+                        ui.label(driver);
+                        ui.end_row();
+                    }
+                });
+            if !diagnostics.skipped_reasons.is_empty() {
+                ui.add_space(6.0);
+                ui.label(RichText::new("Skipped devices").color(colors.muted_text));
+                for reason in &diagnostics.skipped_reasons {
+                    ui.label(format!("• {reason}"));
+                }
+            }
+            ui.add_space(8.0);
+            let retry = ui.add_enabled(
+                diagnostics.retry_gpu_available,
+                egui::Button::new("Retry GPU").min_size(Vec2::new(120.0, 44.0)),
+            );
+            if !diagnostics.retry_gpu_available {
+                ui.ctx().accesskit_node_builder(retry.id, |builder| {
+                    builder.set_disabled();
+                    builder.set_description(
+                        "GPU retry is unavailable for the current acceleration selection.",
+                    );
+                });
+            }
+            if retry.clicked() {
+                *action = ScreenAction::RetryGpu;
+            }
+        });
 }
 
 fn voice_detection_settings_section(
