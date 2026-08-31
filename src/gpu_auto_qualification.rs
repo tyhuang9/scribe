@@ -23,6 +23,14 @@ const WINDOWS_X64_OS: &str = "windows";
 const WINDOWS_X64_ARCH: &str = "x86_64";
 const EMBEDDED_WINDOWS_X64_MANIFEST: &str =
     include_str!("../runtime-manifests/gpu-auto-qualification-windows-x64.json");
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const EMBEDDED_CURRENT_MANIFEST: &str =
+    include_str!("../runtime-manifests/gpu-auto-qualification-macos-aarch64.json");
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+const EMBEDDED_CURRENT_MANIFEST: &str =
+    include_str!("../runtime-manifests/gpu-auto-qualification-macos-x86_64.json");
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+const EMBEDDED_CURRENT_MANIFEST: &str = EMBEDDED_WINDOWS_X64_MANIFEST;
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub(crate) enum AutoQualificationError {
@@ -32,7 +40,7 @@ pub(crate) enum AutoQualificationError {
     UnsupportedSchema,
     #[error("GPU Auto qualification manifest must use default_deny mode")]
     UnsafeMode,
-    #[error("GPU Auto qualification manifest must target Windows x64")]
+    #[error("GPU Auto qualification manifest targets an unsupported platform")]
     UnsupportedPlatform,
     #[error("GPU Auto qualification manifest contains an invalid entry: {0}")]
     InvalidEntry(&'static str),
@@ -182,6 +190,28 @@ pub(crate) struct AutoQualificationPolicy {
 }
 
 impl AutoQualificationPolicy {
+    pub(crate) fn embedded_current_platform() -> Result<&'static Self, String> {
+        #[cfg(any(
+            all(target_os = "windows", target_arch = "x86_64"),
+            all(target_os = "macos", target_arch = "aarch64"),
+            all(target_os = "macos", target_arch = "x86_64")
+        ))]
+        {
+            static POLICY: OnceLock<Result<AutoQualificationPolicy, AutoQualificationError>> =
+                OnceLock::new();
+            POLICY
+                .get_or_init(|| Self::from_canonical_json(EMBEDDED_CURRENT_MANIFEST))
+                .as_ref()
+                .map_err(ToString::to_string)
+        }
+        #[cfg(not(any(
+            all(target_os = "windows", target_arch = "x86_64"),
+            all(target_os = "macos", target_arch = "aarch64"),
+            all(target_os = "macos", target_arch = "x86_64")
+        )))]
+        Err(AutoQualificationError::UnsupportedPlatform.to_string())
+    }
+
     pub(crate) fn embedded_windows_x64() -> Result<&'static Self, String> {
         static POLICY: OnceLock<Result<AutoQualificationPolicy, AutoQualificationError>> =
             OnceLock::new();
@@ -332,12 +362,12 @@ impl AutoQualificationPolicy {
         if document.mode != QualificationMode::DefaultDeny {
             return Err(AutoQualificationError::UnsafeMode);
         }
-        if document.target_os != WINDOWS_X64_OS || document.target_arch != WINDOWS_X64_ARCH {
+        if !supported_platform(&document.target_os, &document.target_arch) {
             return Err(AutoQualificationError::UnsupportedPlatform);
         }
         let mut prior = None;
         for entry in &document.entries {
-            validate_entry(entry)?;
+            validate_entry(entry, &document.target_os)?;
             let key = serde_json::to_string(entry)
                 .map_err(|error| AutoQualificationError::Parse(error.to_string()))?;
             if prior
@@ -374,7 +404,10 @@ fn entry_matches_pack(
         && entry.model_digest == model_digest
 }
 
-fn validate_entry(entry: &QualificationEntry) -> Result<(), AutoQualificationError> {
+fn validate_entry(
+    entry: &QualificationEntry,
+    target_os: &str,
+) -> Result<(), AutoQualificationError> {
     if !is_store_component(&entry.pack.pack_id) || !is_store_component(&entry.pack.pack_version) {
         return Err(AutoQualificationError::InvalidEntry("pack identity"));
     }
@@ -386,7 +419,7 @@ fn validate_entry(entry: &QualificationEntry) -> Result<(), AutoQualificationErr
             "pack security epoch or runtime ABI",
         ));
     }
-    if !windows_backend_binding_is_valid(entry)
+    if !platform_backend_binding_is_valid(entry, target_os)
         || !matches!(
             entry.device_class,
             DeviceClass::DiscreteGpu | DeviceClass::IntegratedGpu | DeviceClass::UnifiedGpu
@@ -419,19 +452,33 @@ fn validate_entry(entry: &QualificationEntry) -> Result<(), AutoQualificationErr
     Ok(())
 }
 
-fn windows_backend_binding_is_valid(entry: &QualificationEntry) -> bool {
-    match entry.backend {
-        BackendKind::Cuda => {
+fn supported_platform(target_os: &str, target_arch: &str) -> bool {
+    matches!(
+        (target_os, target_arch),
+        ("windows", "x86_64") | ("macos", "aarch64") | ("macos", "x86_64")
+    )
+}
+
+fn platform_backend_binding_is_valid(entry: &QualificationEntry, target_os: &str) -> bool {
+    match (target_os, entry.backend) {
+        ("windows", BackendKind::Cuda) => {
             entry.provider_id == "transcribe-cpp-ggml-cuda" && entry.vendor == GpuVendor::Nvidia
         }
-        BackendKind::Vulkan => {
+        ("windows", BackendKind::Vulkan) => {
             entry.provider_id == "transcribe-cpp-ggml-vulkan"
                 && matches!(
                     entry.vendor,
                     GpuVendor::Nvidia | GpuVendor::Amd | GpuVendor::Intel
                 )
         }
-        BackendKind::Cpu | BackendKind::Metal => false,
+        ("macos", BackendKind::Metal) => {
+            entry.provider_id == "transcribe-cpp-ggml-metal"
+                && matches!(
+                    entry.vendor,
+                    GpuVendor::Apple | GpuVendor::Amd | GpuVendor::Intel
+                )
+        }
+        _ => false,
     }
 }
 
@@ -920,6 +967,58 @@ mod tests {
                 ),
                 Err(AutoQualificationError::InvalidEntry("target binding"))
             );
+        }
+    }
+
+    #[test]
+    fn macos_entries_accept_only_metal_with_supported_hardware_vendors() {
+        for (vendor, class) in [
+            (GpuVendor::Apple, DeviceClass::UnifiedGpu),
+            (GpuVendor::Intel, DeviceClass::IntegratedGpu),
+            (GpuVendor::Amd, DeviceClass::DiscreteGpu),
+        ] {
+            let mut document = fixture_document();
+            document.target_os = "macos".to_owned();
+            document.target_arch = "aarch64".to_owned();
+            let entry = &mut document.entries[0];
+            entry.pack.pack_id = "scribe-metal-macos-aarch64".to_owned();
+            entry.backend = BackendKind::Metal;
+            entry.provider_id = "transcribe-cpp-ggml-metal".to_owned();
+            entry.vendor = vendor;
+            entry.device_class = class;
+            entry.driver = DriverConstraint::Exact {
+                value: "macos-build:23f79".to_owned(),
+            };
+            assert!(
+                AutoQualificationPolicy::from_fixture_json(
+                    &serde_json::to_string(&document).unwrap()
+                )
+                .is_ok()
+            );
+        }
+
+        let mut invalid = fixture_document();
+        invalid.target_os = "macos".to_owned();
+        invalid.target_arch = "x86_64".to_owned();
+        invalid.entries[0].backend = BackendKind::Vulkan;
+        assert_eq!(
+            AutoQualificationPolicy::from_fixture_json(&serde_json::to_string(&invalid).unwrap()),
+            Err(AutoQualificationError::InvalidEntry("target binding"))
+        );
+    }
+
+    #[test]
+    fn current_platform_manifest_is_canonical_and_default_deny() {
+        #[cfg(any(
+            all(target_os = "windows", target_arch = "x86_64"),
+            all(target_os = "macos", target_arch = "aarch64"),
+            all(target_os = "macos", target_arch = "x86_64")
+        ))]
+        {
+            let policy = AutoQualificationPolicy::embedded_current_platform().unwrap();
+            assert_eq!(policy.document.target_os, std::env::consts::OS);
+            assert_eq!(policy.document.target_arch, std::env::consts::ARCH);
+            assert!(policy.document.entries.is_empty());
         }
     }
 

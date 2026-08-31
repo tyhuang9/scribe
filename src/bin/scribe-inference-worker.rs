@@ -34,6 +34,10 @@ mod config {
 #[path = "../embedded_runtime.rs"]
 mod embedded_runtime;
 #[path = "../gpu_auto_qualification.rs"]
+#[allow(
+    dead_code,
+    reason = "the worker consumes qualification-bound wire types but never selects a release policy"
+)]
 mod gpu_auto_qualification;
 #[allow(
     dead_code,
@@ -43,6 +47,15 @@ mod gpu_auto_qualification;
 mod gpu_worker_pack;
 #[path = "../inference_server.rs"]
 mod inference_server;
+#[cfg(any(all(target_os = "macos", feature = "metal-acceleration"), test))]
+#[path = "../macos_gpu.rs"]
+mod macos_gpu;
+#[cfg(any(target_os = "macos", test))]
+#[path = "../macos_power.rs"]
+mod macos_power;
+#[cfg(any(target_os = "macos", test))]
+#[path = "../macos_worker_launch.rs"]
+mod macos_worker_launch;
 #[allow(
     dead_code,
     reason = "the dedicated worker validates only the shared catalog subset needed by an admitted request"

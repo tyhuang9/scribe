@@ -3,6 +3,9 @@
     windows_subsystem = "windows"
 )]
 
+#[cfg(feature = "metal-acceleration")]
+compile_error!("metal-acceleration is worker-only and must not be linked into the desktop");
+
 mod app;
 mod audio;
 #[allow(
@@ -40,6 +43,24 @@ mod hotkey;
 mod huggingface_catalog;
 mod installations;
 mod installed_manifest;
+#[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "host-side tests compile worker-only Metal identity logic without linking Metal"
+)]
+mod macos_gpu;
+#[cfg(any(target_os = "macos", test))]
+#[allow(
+    dead_code,
+    reason = "the desktop uses only the IOKit/sysctl macOS witness path"
+)]
+mod macos_power;
+#[cfg(any(target_os = "macos", test))]
+#[allow(
+    dead_code,
+    reason = "host-side tests compile the macOS launcher without invoking posix_spawn"
+)]
+mod macos_worker_launch;
 mod managed_downloads;
 mod model_catalog;
 mod models;

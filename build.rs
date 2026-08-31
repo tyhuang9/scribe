@@ -1,6 +1,5 @@
 use std::fs;
-#[cfg(all(windows, feature = "vulkan-acceleration"))]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use sha2::{Digest, Sha256};
@@ -8,13 +7,18 @@ use sha2::{Digest, Sha256};
 const SILERO_VAD_ASSET: &str = "resources/silero-vad/silero_vad.int8.onnx";
 const SILERO_VAD_SIZE: usize = 212_860;
 const SILERO_VAD_SHA256: &str = "c36d490aff5ab924ca6c7aeec4d8f6bd3d22db6fa17611b9c5b17eae58ac3a20";
+const MACOS_KEYCHAIN_NAMESPACE_MANIFEST: &str =
+    "runtime-manifests/gpu-keychain-namespace-macos-release.json";
 
 fn main() {
+    reject_multiple_gpu_features();
     emit_build_revision();
+    embed_gpu_pack_release_authority();
     emit_bundled_worker_trust_anchor();
     require_windows_static_crt();
     #[cfg(all(windows, feature = "vulkan-acceleration"))]
     prepare_windows_vulkan_import_library();
+    prepare_macos_native_shims();
     verify_silero_vad_asset();
 
     println!("cargo:rerun-if-changed=native/sherpa_vad_shim.cc");
@@ -33,6 +37,183 @@ fn main() {
     if matches!(target_os.as_str(), "linux" | "android") {
         println!("cargo:rustc-link-lib=dl");
     }
+}
+
+fn canonical_macos_keychain_access_group(value: &str) -> bool {
+    let (team_id, suffix) = value.split_at_checked(10).unwrap_or(("", ""));
+    suffix == ".com.scribe.local-transcriber"
+        && team_id
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+}
+
+fn reviewed_macos_keychain_access_group() -> String {
+    const PREFIX: &str = r#"{"schema_version":1,"keychain_access_group":""#;
+    const SUFFIX: &str = r#""}"#;
+    const REVIEWED_NAME: &str = "SCRIBE_REVIEWED_MACOS_GPU_ROLLBACK_KEYCHAIN_ACCESS_GROUP";
+
+    println!("cargo:rerun-if-changed={MACOS_KEYCHAIN_NAMESPACE_MANIFEST}");
+    let source = fs::read_to_string(MACOS_KEYCHAIN_NAMESPACE_MANIFEST).unwrap_or_else(|error| {
+        panic!("could not read the reviewed macOS Keychain namespace manifest: {error}")
+    });
+    let canonical = source.strip_suffix('\n').unwrap_or(&source);
+    assert!(
+        !canonical.ends_with('\r') && !canonical.contains('\n'),
+        "reviewed macOS Keychain namespace manifest must be canonical single-line JSON"
+    );
+    let group = canonical
+        .strip_prefix(PREFIX)
+        .and_then(|value| value.strip_suffix(SUFFIX))
+        .expect("reviewed macOS Keychain namespace manifest has an invalid schema or encoding");
+    assert!(
+        group.is_empty() || canonical_macos_keychain_access_group(group),
+        "reviewed macOS Keychain namespace must be empty or the exact Scribe access group"
+    );
+    println!("cargo:rustc-env={REVIEWED_NAME}={group}");
+    group.to_owned()
+}
+
+fn validated_macos_keychain_access_group(reviewed_group: &str) -> Option<String> {
+    const NAME: &str = "SCRIBE_MACOS_GPU_ROLLBACK_KEYCHAIN_ACCESS_GROUP";
+    println!("cargo:rerun-if-env-changed={NAME}");
+    let value = std::env::var(NAME).ok().filter(|value| !value.is_empty())?;
+    assert!(
+        canonical_macos_keychain_access_group(&value),
+        "{NAME} must match TEAMID.com.scribe.local-transcriber with a 10-character uppercase alphanumeric Team ID"
+    );
+    assert!(
+        !reviewed_group.is_empty() && value == reviewed_group,
+        "{NAME} must exactly match the non-empty source-reviewed macOS Keychain namespace"
+    );
+    println!("cargo:rustc-env={NAME}={value}");
+    Some(value)
+}
+
+fn embed_gpu_pack_release_authority() {
+    const DEFAULT_AUTHORITY: &str = "runtime-manifests/gpu-pack-release-authority-macos-empty.json";
+    const MAX_AUTHORITY_BYTES: usize = 512 * 1024;
+
+    println!("cargo:rerun-if-env-changed=SCRIBE_GPU_PACK_RELEASE_AUTHORITY");
+    println!("cargo:rerun-if-changed={DEFAULT_AUTHORITY}");
+    let source = std::env::var_os("SCRIBE_GPU_PACK_RELEASE_AUTHORITY")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_AUTHORITY));
+    if source.as_path() != Path::new(DEFAULT_AUTHORITY) {
+        println!("cargo:rerun-if-changed={}", source.display());
+    }
+    let mut bytes = fs::read(&source).unwrap_or_else(|error| {
+        panic!(
+            "could not read the GPU pack release authority {}: {error}",
+            source.display()
+        )
+    });
+    assert!(
+        !bytes.is_empty() && bytes.len() <= MAX_AUTHORITY_BYTES,
+        "GPU pack release authority is empty or exceeds its build-time bound"
+    );
+    if bytes.last() == Some(&b'\n') {
+        bytes.pop();
+    }
+    assert!(
+        !bytes.is_empty() && bytes.last() != Some(&b'\r') && std::str::from_utf8(&bytes).is_ok(),
+        "GPU pack release authority must be canonical UTF-8 JSON with at most one trailing LF"
+    );
+    let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").expect("Cargo must set OUT_DIR"));
+    fs::write(
+        out_dir.join("scribe_gpu_pack_release_authority.json"),
+        bytes,
+    )
+    .expect("could not embed the GPU pack release authority");
+}
+
+fn reject_multiple_gpu_features() {
+    let enabled = [
+        (
+            "cuda-acceleration",
+            std::env::var_os("CARGO_FEATURE_CUDA_ACCELERATION").is_some(),
+        ),
+        (
+            "vulkan-acceleration",
+            std::env::var_os("CARGO_FEATURE_VULKAN_ACCELERATION").is_some(),
+        ),
+        (
+            "metal-acceleration",
+            std::env::var_os("CARGO_FEATURE_METAL_ACCELERATION").is_some(),
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(name, enabled)| enabled.then_some(name))
+    .collect::<Vec<_>>();
+    assert!(
+        enabled.len() <= 1,
+        "GPU acceleration features are mutually exclusive: {}",
+        enabled.join(", ")
+    );
+}
+
+fn prepare_macos_native_shims() {
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let metal_enabled = std::env::var_os("CARGO_FEATURE_METAL_ACCELERATION").is_some();
+    let building_worker = std::env::var("SCRIBE_BUILDING_WORKER").ok();
+    let reviewed_keychain_access_group = reviewed_macos_keychain_access_group();
+    let _keychain_access_group =
+        validated_macos_keychain_access_group(&reviewed_keychain_access_group);
+    println!("cargo:rustc-check-cfg=cfg(scribe_macos_keychain_authority)");
+    assert!(
+        !metal_enabled || target_os == "macos",
+        "metal-acceleration requires a macOS target"
+    );
+    assert!(
+        !metal_enabled || building_worker.as_deref() == Some("1"),
+        "metal-acceleration may be linked only into the dedicated worker build"
+    );
+    if target_os != "macos" {
+        return;
+    }
+
+    println!("cargo:rerun-if-changed=native/scribe_macos_power_shim.h");
+    println!("cargo:rerun-if-changed=native/scribe_macos_power_shim.c");
+    let deployment_target = std::env::var("MACOSX_DEPLOYMENT_TARGET")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "13.0".to_owned());
+    cc::Build::new()
+        .file("native/scribe_macos_power_shim.c")
+        .include("native")
+        .flag(format!("-mmacosx-version-min={deployment_target}"))
+        .warnings(true)
+        .compile("scribe_macos_power_shim");
+    println!("cargo:rustc-link-lib=framework=CoreFoundation");
+    println!("cargo:rustc-link-lib=framework=IOKit");
+    println!("cargo:rustc-link-arg=-mmacosx-version-min={deployment_target}");
+
+    if building_worker.as_deref() != Some("1") {
+        println!("cargo:rerun-if-changed=native/scribe_macos_keychain_epoch.h");
+        println!("cargo:rerun-if-changed=native/scribe_macos_keychain_epoch.c");
+        cc::Build::new()
+            .file("native/scribe_macos_keychain_epoch.c")
+            .include("native")
+            .flag(format!("-mmacosx-version-min={deployment_target}"))
+            .warnings(true)
+            .compile("scribe_macos_keychain_epoch");
+        println!("cargo:rustc-cfg=scribe_macos_keychain_authority");
+        println!("cargo:rustc-link-lib=framework=Security");
+    }
+
+    if !metal_enabled {
+        return;
+    }
+    println!("cargo:rerun-if-changed=native/scribe_macos_gpu_shim.h");
+    println!("cargo:rerun-if-changed=native/scribe_macos_gpu_shim.m");
+    cc::Build::new()
+        .file("native/scribe_macos_gpu_shim.m")
+        .include("native")
+        .flag("-fobjc-arc")
+        .flag(format!("-mmacosx-version-min={deployment_target}"))
+        .warnings(true)
+        .compile("scribe_macos_gpu_shim");
+    println!("cargo:rustc-link-lib=framework=Metal");
+    println!("cargo:rustc-link-lib=framework=Foundation");
 }
 
 fn emit_bundled_worker_trust_anchor() {

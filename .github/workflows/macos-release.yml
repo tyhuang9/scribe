@@ -1,0 +1,122 @@
+name: Validate macOS release package
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/macos-release.yml'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'build.rs'
+      - 'installer/macos/**'
+      - 'native/**'
+      - 'runtime-manifests/gpu-*-macos-*.json'
+      - 'scripts/*macos*'
+      - 'src/**'
+      - 'tools/worker-pack-author/**'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/macos-release.yml'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'build.rs'
+      - 'installer/macos/**'
+      - 'native/**'
+      - 'runtime-manifests/gpu-*-macos-*.json'
+      - 'scripts/*macos*'
+      - 'src/**'
+      - 'tools/worker-pack-author/**'
+  workflow_dispatch:
+    inputs:
+      notarize:
+        description: Run the protected official signing and notarization lane.
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  structural:
+    name: macOS ${{ matrix.arch }} structural package validation
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-intel
+            arch: x86_64
+          - runner: macos-14
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e # 1.96.0 branch reviewed 2026-08-27
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - name: Prepare reviewed sherpa-onnx archives
+        run: |
+          archive_dir="$RUNNER_TEMP/scribe-sherpa-onnx"
+          bash scripts/prepare-macos-release-inputs.sh --output-directory "$archive_dir"
+          echo "SHERPA_ONNX_ARCHIVE_DIR=$archive_dir" >> "$GITHUB_ENV"
+      - name: Validate canonical packaging inputs
+        run: bash scripts/test-macos-release-packaging.sh
+      - name: Run macOS runtime and worker-pack authoring tests
+        env:
+          SCRIBE_BUILD_REVISION: stage6-macos-ci
+        run: |
+          cargo test --locked macos_ -- --nocapture
+          cargo test --locked directional_digest_handshake_binds_parent_anchor_without_child_compile_time_comparison -- --nocapture
+          cargo test --manifest-path tools/worker-pack-author/Cargo.toml --locked
+      - name: Build ad hoc signed universal structural package
+        run: |
+          bash scripts/build-macos-release.sh --output-directory dist-macos --pack-version 0.1.0 --signing-mode adhoc
+          SCRIBE_MACOS_TEST_BUNDLE="$PWD/dist-macos/Scribe.app" bash scripts/test-macos-release-packaging.sh
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: macos-${{ matrix.arch }}-structural-evidence
+          path: dist-macos/Scribe-macos-universal.zip
+          if-no-files-found: error
+
+  official-sign-notarize:
+    name: Protected official macOS signing and notarization
+    if: github.event_name == 'workflow_dispatch' && inputs.notarize == true && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    needs: structural
+    runs-on: macos-14
+    environment: macos-release
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e # 1.96.0 branch reviewed 2026-08-27
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - name: Prepare reviewed sherpa-onnx archives
+        run: |
+          archive_dir="$RUNNER_TEMP/scribe-sherpa-onnx"
+          bash scripts/prepare-macos-release-inputs.sh --output-directory "$archive_dir"
+          echo "SHERPA_ONNX_ARCHIVE_DIR=$archive_dir" >> "$GITHUB_ENV"
+      - name: Import protected signing material into the ephemeral keychain
+        env:
+          SCRIBE_MACOS_SIGNING_IDENTITY: ${{ secrets.SCRIBE_MACOS_SIGNING_IDENTITY }}
+          SCRIBE_MACOS_NOTARY_PROFILE: ${{ secrets.SCRIBE_MACOS_NOTARY_PROFILE }}
+        run: |
+          test -n "$SCRIBE_MACOS_SIGNING_IDENTITY"
+          test -n "$SCRIBE_MACOS_NOTARY_PROFILE"
+          security find-identity -v -p codesigning | grep -F -- "$SCRIBE_MACOS_SIGNING_IDENTITY" >/dev/null
+          xcrun notarytool history --keychain-profile "$SCRIBE_MACOS_NOTARY_PROFILE" >/dev/null
+      - name: Build protected CPU-only package pending Metal authoring trust provisioning
+        env:
+          SCRIBE_MACOS_SIGNING_IDENTITY: ${{ secrets.SCRIBE_MACOS_SIGNING_IDENTITY }}
+          SCRIBE_MACOS_GPU_RELEASE_SECURITY_EPOCH: '0'
+        run: bash scripts/build-macos-release.sh --output-directory dist-macos --pack-version 0.1.0 --signing-mode developer-id
+      - name: Notarize and staple protected package
+        env:
+          SCRIBE_MACOS_SIGNING_IDENTITY: ${{ secrets.SCRIBE_MACOS_SIGNING_IDENTITY }}
+          SCRIBE_MACOS_NOTARY_PROFILE: ${{ secrets.SCRIBE_MACOS_NOTARY_PROFILE }}
+        run: bash scripts/sign-notarize-macos-release.sh --app dist-macos/Scribe.app --archive-output dist-macos/Scribe-macos-universal.zip
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: macos-notarized-universal-package
+          path: dist-macos/Scribe-macos-universal.zip
+          if-no-files-found: error

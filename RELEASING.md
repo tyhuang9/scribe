@@ -172,3 +172,43 @@ until a real code-signing identity and secret-management process are approved.
   checks above before a maintainer deletes that specific tag and reruns.
 - **Pages does not deploy:** confirm Pages is set to GitHub Actions and that the
   documentation change has reached `main`.
+
+## macOS Metal release packaging
+
+macOS 13 is the minimum supported OS for the release bundle. Build the universal
+application with the default deny-empty Metal catalog for a local structural
+validation run:
+
+```bash
+bash scripts/build-macos-release.sh \
+  --output-directory dist-macos \
+  --pack-version 0.1.0 \
+  --signing-mode adhoc
+bash scripts/verify-macos-release-package.sh --app dist-macos/Scribe.app
+bash scripts/test-macos-release-packaging.sh
+```
+
+This is not a notarized or hardware-qualified release. It uses ad hoc signing
+only to exercise the app layout, universal Mach-O, entitlements, catalog, and
+hostile-filesystem checks. It must not be distributed.
+
+An official protected macOS job requires the Developer-ID identity and
+notarytool keychain profile via `SCRIBE_MACOS_SIGNING_IDENTITY` and
+`SCRIBE_MACOS_NOTARY_PROFILE`. If it is authorized to include Metal packs it
+also requires `SCRIBE_PACK_SIGNING_PRIVATE_KEY_PATH` and
+`SCRIBE_PACK_SIGNING_KEY_ID`; their values are never passed on the command line
+or written to artifacts. First build the per-architecture standalone packs,
+then assemble the app, and run:
+
+```bash
+bash scripts/sign-notarize-macos-release.sh \
+  --app dist-macos/Scribe.app \
+  --archive-output dist-macos/Scribe-macos-universal.zip
+```
+
+Do not use `codesign --deep`. A Metal pack manifest is generated from the final
+Developer-ID-signed worker bytes and must be signed by a separately reviewed
+Ed25519 production key matching the desktop trust root. There is no provisioned
+production key or qualification evidence in this repository, so an ordinary
+release must retain the canonical empty catalog and Auto remains CPU-only.
+No macOS artifact is added to the existing Windows release publication contract.

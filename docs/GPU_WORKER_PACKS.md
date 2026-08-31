@@ -296,26 +296,139 @@ obtains those bindings from the concrete
 `ProductionPackRegistry::from_launch_bindings`; it cannot insert a raw
 `VerifiedPack`.
 
-Windows is the implemented Stage 4 target: its resolver keeps
-the verified directory/file lease alive through exact-image launch and the
-challenge-bound Hello check. Unix production remains fail closed. Before a
-Unix catalog or trust root can become nonempty, the resolver bridge must also
-produce an opaque `UnixPackExecAuthority` containing an already-open executable
-FD, an anchored dependency-root directory FD, and the exact same
-`Arc<VerifiedPackLease>` from which both descriptors were opened. The future
-`open_unix_pack_exec_authority_from_verified_pack_lease` constructor must live
-on the provider resolver path, open both descriptors relative to that lease,
-and be the only production constructor; independently opened FDs cannot be
-combined with a lease after the fact. The opaque binding checks lease identity,
-and the launch path must consume those authorities through
-`execveat`/`fexecve`-equivalent execution and retain the dependency-root and
-lease authorities through Hello validation. `PathBuf`,
-`Arc<VerifiedPackLease>`, and `Command::spawn` are not Unix execution authority
-and cannot satisfy the provisioning guard. Unsupported Unix variants must
-remain fail closed until an equivalent descriptor-relative execution primitive
-is implemented and tested. The architecture guard scopes this prohibition to
-the verified-pack provider launch function; unrelated process launches do not
-satisfy or trip the gate.
+Windows and macOS are implemented Stage 4 targets. Their resolvers retain the
+verified directory/file lease through exact-image launch and the
+challenge-bound Hello check. macOS uses the opaque descriptor-bound
+`UnixPackExecAuthority` and `posix_spawn` `/dev/fd` bridge; catalog paths are
+not process-creation authority. Production macOS nevertheless remains
+fail-closed today because its trust root and Auto qualification manifests are
+empty/default-deny. Linux remains fail-closed until an equivalent descriptor
+relative execution primitive is implemented and tested. `PathBuf`,
+`Arc<VerifiedPackLease>`, and `Command::spawn` are not Unix pack-execution
+authority and cannot satisfy that provisioning guard. The architecture guard
+scopes this prohibition to the verified-pack provider launch function;
+unrelated process launches do not satisfy or trip the gate.
+
+## Stage 6 macOS Metal packaging contract
+
+macOS packages use a universal `Scribe.app`, with universal desktop and CPU
+worker Mach-O files in `Contents/MacOS`. The CPU worker remains the only
+default path. Metal is available for an explicit GPU request only when a
+verified installed Metal pack is declared by
+`Contents/Resources/worker-pack-catalog.json` and stored exactly at:
+
+```text
+Contents/Resources/workers/packs/<pack-id>/<version>/<digest>/
+```
+
+Each standalone Metal worker is built per architecture from the corresponding
+pinned `runtime-manifests/gpu-worker-toolchain-macos-*.json` contract. It is
+Developer-ID signed with hardened runtime and timestamp before its inventory is
+hashed and before its canonical Ed25519 pack manifest is authored. The release
+assembler never creates signing keys, accepts secret values as arguments, or
+uses `codesign --deep`. It signs the universal CPU worker and desktop binaries,
+then the outer application; the dedicated protected release step verifies,
+notarizes, staples, and verifies again.
+
+Stage 6 macOS Metal packs have a deliberately narrower payload contract than
+the general signed-pack format: the signed payload inventory must contain
+exactly one regular executable, the declared worker path. The manifest and
+detached signature remain the only two control files outside that signed
+payload. Any dylib, framework, resource, helper, or second executable rejects
+the pack before launch authority or a GPU route is constructed. Multi-file
+macOS packs are deferred until descriptor-bound dependency loading or
+ownership-enforced filesystem immutability is separately designed and reviewed.
+
+Metal framework linkage is confined to the per-architecture Metal worker. The
+desktop and universal CPU worker use only an IOKit power-source shim plus the
+`kern.osversion` witness and must have no Metal load command. Stable
+`MTLDevice.registryID` discovery/remapping occurs inside the verified Metal
+worker and reaches the parent only through the challenge-bound capability
+Hello. Release verification checks these Mach-O linkage boundaries with both
+`otool -L` and `otool -l`.
+
+On Windows, before a bundled verified lease can become a route, discovery loads
+the private per-platform/backend/pack security-epoch high-water ledger under the
+same anchored lock and atomic durable-replace discipline as activation state.
+On macOS, the data-protection Keychain release floor is authoritative and the
+app-data ledger is advisory only; deleting application data cannot reset the
+device floor. The same epoch is accepted, a higher epoch advances the relevant
+authority, and a lower epoch, corrupt state, or unavailable authority fails GPU
+admission closed. A catalog cache never bypasses this check. CPU routing remains
+available, and an empty production trust result does not mutate Windows ledger
+state.
+
+The signed desktop is the non-resettable release authority for bundled macOS
+packs. Both universal slices embed identical canonical schema-v2 authority bytes
+that bind the application version and build revision, SCIF protocol, exact
+catalog SHA-256, the outer `release_security_epoch`, the exact Keychain access
+group, pack identity/digest/security epoch, runtime ABI, backend/provider,
+target, worker path, sizes, and complete inventory. The installed catalog must
+match that authority before verification, cache lookup, or device-local
+Keychain admission. Deleting or recreating app-data state therefore cannot
+admit an older catalog.
+
+The checked-in authority is the canonical default-deny document: schema version
+2, the SHA-256 of the exact compact empty catalog bytes, release epoch `0`, an
+empty Keychain group, and no entries. Epoch zero is permitted only for that
+empty CPU-only release. Every nonempty Metal catalog requires an explicitly set
+positive canonical `SCRIBE_MACOS_GPU_RELEASE_SECURITY_EPOCH`; the release
+builder passes that same value to every pack author's `--security-epoch` and
+writes it as the outer release epoch. A positive epoch may intentionally carry
+an empty catalog to revoke prior GPU capability, but it remains a protected
+release. The device-local Keychain floor is append-only; no packaging or runtime
+path resets, deletes, or lowers it. Release epochs are canonical exact JSON
+integers from `0` through `9007199254740991`, avoiding loss of precision in the
+packaging toolchain. Runtime admission also requires every authority entry to
+carry the outer release epoch.
+
+A protected release (a positive epoch or any Metal catalog) requires
+Developer-ID signing, a regular non-symlink distribution provisioning profile,
+and `SCRIBE_MACOS_GPU_ROLLBACK_KEYCHAIN_ACCESS_GROUP` matching exactly the
+non-empty value in the source-reviewed
+`runtime-manifests/gpu-keychain-namespace-macos-release.json`. That manifest is
+empty by default, so protected releases fail closed until a separate security
+review pins the production Team ID and access group. The profile's application
+identifier and sole `keychain-access-groups` value must both equal that exact
+group, and its team identifier must equal the group's Team ID. The builder
+generates protected application, team, and Keychain entitlements from the
+checked-in template, embeds the profile before the final signing pass, and
+verifies both the desktop executable and outer app. CPU and Metal workers must
+not carry the desktop Keychain group. The package verifier rechecks the
+authority/catalog binding, reviewed namespace, effective entitlements, profile
+authorization, and profile-aware exact inventory.
+
+Discovery checks the device floor before publishing a verified route, including
+cached discovery. Because provider probing can take several seconds, the parent
+checks the embedded release identity and Keychain floor again immediately before
+making a GPU route active. That final check is the request activation boundary:
+Auto skips a rejected GPU and reaches CPU, explicit GPU reports a clear error,
+and a transcription already active when a newer release advances the floor is
+allowed to finish rather than being migrated.
+
+The hosted pull-request lane is deliberately credential-free and builds only
+the epoch-zero empty catalog. The protected official lane is also CPU-only at
+epoch zero today because the production Metal trust root and provisioning inputs
+have not been provisioned. Before enabling a positive-epoch release, the
+protected environment must supply the reviewed Developer-ID identity, stable
+group, authorized profile path, positive release epoch, and (for Metal) the
+reviewed pack-signing key material. These inputs are requirements for a future
+protected run, not evidence that production Metal trust exists now.
+
+The production authoring CLI must accept `--backend metal --target-os macos
+--target-arch <aarch64|x86_64>` and bind those facts in its signed manifest.
+Until that reviewed CLI extension and a persistent production trust root exist,
+the build fails closed for non-empty packs and produces the canonical empty
+catalog. The checked-in macOS Auto manifests are both canonical zero-entry
+`default_deny` documents. No runtime calibration occurs: Auto remains CPU-only
+until a separately reviewed release qualification provides five cold runs,
+twenty warm runs, parity/reliability evidence, and GPU end-to-end p95 no more
+than 110% of the matching CPU p95. ONNX and Sherpa remain CPU-only.
+
+The release builder signs the universal CPU worker before hashing it, then
+embeds that final SHA-256 into both desktop slices. It verifies that the final
+package still contains that digest and the runtime's challenge-bound CPU-worker
+handshake checks the same parent expectation before output is accepted.
 
 ## Build and verification commands
 

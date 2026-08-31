@@ -784,6 +784,8 @@ fn compiled_worker_provider(role: WorkerRole) -> WorkerProvider {
         WorkerProvider::Cuda
     } else if cfg!(feature = "vulkan-acceleration") {
         WorkerProvider::Vulkan
+    } else if cfg!(feature = "metal-acceleration") {
+        WorkerProvider::Metal
     } else {
         WorkerProvider::Cpu
     }
@@ -1477,10 +1479,39 @@ fn normalize_gpu_display_name(value: &str) -> Option<String> {
     .then(|| normalized.to_ascii_lowercase())
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+struct PackDriverCatalog {
+    os_build_witness: String,
+}
+
+#[cfg(target_os = "macos")]
+impl PackDriverCatalog {
+    fn discover() -> Result<Self> {
+        let os_build_witness = crate::macos_power::os_build_witness()
+            .context("could not obtain the macOS Metal runtime witness")?;
+        Ok(Self { os_build_witness })
+    }
+
+    #[cfg(any(feature = "inference-worker", test))]
+    fn identity_for(&self, stable_device_identity: &str) -> Result<String> {
+        if !stable_device_identity.starts_with("metal-registry:") {
+            bail!("Metal registry identity is not canonical");
+        }
+        Ok(self.os_build_witness.clone())
+    }
+
+    fn fingerprint(&self) -> String {
+        let mut digest = Sha256::new();
+        update_health_digest(&mut digest, "macos-parent-os-build-v1");
+        update_health_digest(&mut digest, &self.os_build_witness);
+        format!("{:x}", digest.finalize())
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 struct PackDriverCatalog;
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 impl PackDriverCatalog {
     fn discover() -> Result<Self> {
         bail!("Stage 4 GPU worker packs require Windows driver metadata")
@@ -1556,6 +1587,49 @@ fn worker_pack_capability(role: WorkerRole) -> Result<Option<WorkerPackCapabilit
         .collect::<Vec<_>>();
     if provider_devices.len() > MAX_PACK_DEVICES {
         bail!("compiled GPU provider exceeded the bounded device-list limit");
+    }
+    #[cfg(all(target_os = "macos", feature = "metal-acceleration"))]
+    if expectation.backend == WorkerProvider::Metal {
+        let provider = provider_devices
+            .iter()
+            .map(|device| {
+                let process_index = device
+                    .index
+                    .ok_or_else(|| anyhow!("Metal provider device has no live process index"))?;
+                let display_name = [&device.description, &device.name]
+                    .into_iter()
+                    .map(|value| value.trim())
+                    .find(|value| !value.is_empty() && value.is_ascii())
+                    .ok_or_else(|| anyhow!("Metal provider device has no bounded display name"))?;
+                Ok(crate::macos_gpu::ProviderMetalDevice {
+                    process_index,
+                    display_name: display_name.to_owned(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let metal = crate::macos_gpu::discover_devices()
+            .context("could not obtain MTLDevice registry identities")?;
+        let devices = crate::macos_gpu::remap_provider_devices(&provider, &metal)?
+            .into_iter()
+            .map(|device| {
+                Ok(WorkerPackDeviceCapability {
+                    stable_device_identity: device.metal.stable_identity.clone(),
+                    process_index: device.process_index,
+                    display_name: device.metal.display_name,
+                    driver_version: Some(
+                        driver_catalog.identity_for(&device.metal.stable_identity)?,
+                    ),
+                    device_class: device.metal.device_class,
+                    vendor: device.metal.vendor,
+                    memory_total_bytes: device.metal.memory_total_bytes,
+                    memory_available_bytes: device.metal.memory_available_bytes,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        return finish_worker_pack_capability(expectation, expected_device_id, devices);
+    }
+    if expectation.backend == WorkerProvider::Metal {
+        bail!("Metal GPU worker pack requires macOS Metal acceleration");
     }
     let mut devices = Vec::with_capacity(provider_devices.len());
     for device in provider_devices {
@@ -1635,6 +1709,15 @@ fn worker_pack_capability(role: WorkerRole) -> Result<Option<WorkerPackCapabilit
             memory_available_bytes: device.memory_free.min(device.memory_total),
         });
     }
+    finish_worker_pack_capability(expectation, expected_device_id, devices)
+}
+
+#[cfg(feature = "inference-worker")]
+fn finish_worker_pack_capability(
+    expectation: WorkerPackExpectation,
+    expected_device_id: Option<String>,
+    devices: Vec<WorkerPackDeviceCapability>,
+) -> Result<Option<WorkerPackCapability>> {
     // Validate before the parent-selected stable ID narrows the list. A
     // duplicate index in another provider device must not be hidden by that
     // filter and later make an index-only remap ambiguous.
@@ -2291,6 +2374,42 @@ struct PackLaunchContext {
     lease: Arc<VerifiedPackLease>,
     expectation: WorkerPackExpectation,
     expected_device: Option<BackendTarget>,
+    #[cfg(unix)]
+    unix_exec_authority: Arc<crate::gpu_worker_pack::UnixPackExecAuthority>,
+}
+
+#[cfg(test)]
+impl PackLaunchContext {
+    fn fixture(lease: Arc<VerifiedPackLease>, expected_device: Option<BackendTarget>) -> Self {
+        #[cfg(unix)]
+        let unix_exec_authority = {
+            use std::os::unix::fs::OpenOptionsExt;
+
+            let executable_fd = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(lease.worker_path())
+                .expect("fixture worker must open without following links");
+            let dependency_root_fd = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(&lease.verified_pack().root)
+                .expect("fixture pack root must open without following links");
+            Arc::new(crate::gpu_worker_pack::UnixPackExecAuthority::fixture(
+                Arc::clone(&lease),
+                executable_fd,
+                dependency_root_fd,
+            ))
+        };
+
+        Self {
+            expectation: pack_expectation(&lease),
+            lease,
+            expected_device,
+            #[cfg(unix)]
+            unix_exec_authority,
+        }
+    }
 }
 
 struct BoundPackHelloBridge<'a> {
@@ -2308,7 +2427,7 @@ impl ResolverHelloBindingBridge for BoundPackHelloBridge<'_> {
     fn resolver_unix_launch_authority(
         &self,
     ) -> Option<Arc<crate::gpu_worker_pack::UnixPackExecAuthority>> {
-        None
+        Some(Arc::clone(&self.context.unix_exec_authority))
     }
 
     fn hello_pack_id(&self) -> &str {
@@ -2638,7 +2757,19 @@ impl WorkerExecutableResolver for VerifiedPackWorkerExecutableResolver {
         }) {
             bail!("verified GPU launch binding no longer matches its retained pack");
         }
-        resolve_verified_pack_executable(lease, Some(expected_device))
+        let executable = resolve_verified_pack_executable(lease, Some(expected_device))?;
+        #[cfg(unix)]
+        {
+            let mut executable = executable;
+            if let Some(context) = executable.pack_launch.as_mut() {
+                // Preserve the exact descriptor authority that launched the probe
+                // and survived challenge-bound Hello validation.
+                context.unix_exec_authority = self.binding.unix_exec_authority_arc();
+            }
+            return Ok(executable);
+        }
+        #[cfg(not(unix))]
+        Ok(executable)
     }
 }
 
@@ -2702,10 +2833,16 @@ fn resolve_verified_pack_executable(
         .file_name()
         .ok_or_else(|| anyhow!("GPU worker pack executable has no filename"))?;
     let mut executable = verify_worker_executable(worker_path, root, name, expected_sha256)?;
+    #[cfg(unix)]
+    let unix_exec_authority =
+        crate::gpu_worker_pack::UnixPackExecAuthority::from_verified_pack_lease(Arc::clone(&lease))
+            .context("could not retain verified Unix pack launch authority")?;
     executable.pack_launch = Some(PackLaunchContext {
         expectation: pack_expectation(&lease),
         lease,
         expected_device,
+        #[cfg(unix)]
+        unix_exec_authority,
     });
     Ok(executable)
 }
@@ -2844,6 +2981,21 @@ impl WorkerLauncher for OsWorkerLauncher {
             WorkerRole::Inference => INFERENCE_WORKER_FLAG,
             WorkerRole::Vad => VAD_WORKER_FLAG,
         };
+        #[cfg(target_os = "macos")]
+        if let Some(pack) = executable.pack_launch.as_ref() {
+            let launched = crate::macos_worker_launch::launch_verified_worker(
+                &pack.unix_exec_authority,
+                worker_flag,
+                &worker_pack_environment_bindings(pack),
+            )?;
+            return Ok(SpawnedWorker {
+                stdin: Box::new(launched.stdin),
+                stdout: Box::new(launched.stdout),
+                process: Arc::new(launched.process),
+                expectation,
+                pack_launch: executable.pack_launch,
+            });
+        }
         let mut command = Command::new(&executable.path);
         command
             .arg(worker_flag)
@@ -2948,28 +3100,65 @@ fn configure_worker_environment(command: &mut Command) {
 }
 
 fn configure_worker_pack_environment(command: &mut Command, context: &PackLaunchContext) {
+    for (name, value) in worker_pack_environment_bindings(context) {
+        command.env(name, value);
+    }
+}
+
+fn worker_pack_environment_bindings(context: &PackLaunchContext) -> Vec<(String, String)> {
     let pack = &context.expectation;
-    command
-        .env(PACK_ID_ENV, &pack.pack_id)
-        .env(PACK_VERSION_ENV, &pack.pack_version)
-        .env(PACK_DIGEST_ENV, &pack.pack_digest)
-        .env(PACK_SECURITY_EPOCH_ENV, pack.security_epoch.to_string())
-        .env(PACK_RUNTIME_ABI_ENV, pack.runtime_abi.to_string())
-        .env(
-            PACK_BACKEND_ENV,
+    let mut bindings = vec![
+        (PACK_ID_ENV.to_owned(), pack.pack_id.clone()),
+        (PACK_VERSION_ENV.to_owned(), pack.pack_version.clone()),
+        (PACK_DIGEST_ENV.to_owned(), pack.pack_digest.clone()),
+        (
+            PACK_SECURITY_EPOCH_ENV.to_owned(),
+            pack.security_epoch.to_string(),
+        ),
+        (
+            PACK_RUNTIME_ABI_ENV.to_owned(),
+            pack.runtime_abi.to_string(),
+        ),
+        (
+            PACK_BACKEND_ENV.to_owned(),
             match pack.backend {
                 WorkerProvider::Cuda => "cuda",
                 WorkerProvider::Vulkan => "vulkan",
                 WorkerProvider::Metal => "metal",
                 WorkerProvider::Cpu => "cpu",
-            },
-        )
-        .env(PACK_PROVIDER_ENV, &pack.provider);
+            }
+            .to_owned(),
+        ),
+        (PACK_PROVIDER_ENV.to_owned(), pack.provider.clone()),
+    ];
     if let Some(device) = &context.expected_device {
-        command.env(PACK_DEVICE_ID_ENV, device.device_id.as_str());
+        bindings.push((
+            PACK_DEVICE_ID_ENV.to_owned(),
+            device.device_id.as_str().to_owned(),
+        ));
         if let Some(driver) = &device.driver_version {
-            command.env(PACK_DRIVER_ID_ENV, driver);
+            bindings.push((PACK_DRIVER_ID_ENV.to_owned(), driver.clone()));
         }
+    }
+    bindings
+}
+
+#[cfg(target_os = "macos")]
+impl WorkerProcess for crate::macos_worker_launch::MacWorkerProcess {
+    fn is_running(&self) -> Result<bool> {
+        self.is_running()
+    }
+
+    fn request_cooperative_cancel(&self) -> Result<bool> {
+        self.request_cooperative_cancel()
+    }
+
+    fn terminate(&self) -> Result<()> {
+        self.terminate()
+    }
+
+    fn wait(&self) -> Result<()> {
+        self.wait()
     }
 }
 
@@ -5710,6 +5899,12 @@ struct InferenceWorkerRoute {
     auto_evidence_id: Option<String>,
 }
 
+#[derive(Debug)]
+enum RoutePreparationError {
+    DeviceRollbackAuthority(RuntimeError),
+    Fatal(RuntimeError),
+}
+
 #[derive(Clone)]
 struct InferenceWorkerRoutePlan {
     routes: Arc<Vec<InferenceWorkerRoute>>,
@@ -6307,6 +6502,9 @@ fn verified_gpu_route_catalog(
         };
         key(left).cmp(&key(right))
     });
+    #[cfg(target_os = "macos")]
+    let device_set_digest = verified_gpu_device_set_digest(&routes);
+    #[cfg(not(target_os = "macos"))]
     let device_set_digest = physical_gpu_device_set_digest();
     let mut diagnostic = crate::gpu_worker_pack::diagnostic_summary(&diagnostics);
     if routes.len() > 4 {
@@ -6726,25 +6924,104 @@ impl InferenceWorkerRegistry {
         Ok(())
     }
 
-    fn prepare_route(&self, route: &InferenceWorkerRoute) -> Result<(), RuntimeError> {
+    fn retire_gpu_workers_after_authority_rejection(
+        &self,
+        route: &InferenceWorkerRoute,
+    ) -> Result<(), RuntimeError> {
+        let active_gpu = {
+            let mut active = self.active_route.lock().map_err(|_| {
+                RuntimeError::WorkerUnavailable("active inference route lock poisoned".to_owned())
+            })?;
+            active
+                .as_ref()
+                .is_some_and(|current| current.identity.backend != BackendKind::Cpu)
+                .then(|| active.take())
+                .flatten()
+        };
+        let route_retirement = route.supervisor.retire();
+        let active_retirement = if active_gpu
+            .as_ref()
+            .is_some_and(|active| !Self::same_supervisor(&active.supervisor, &route.supervisor))
+        {
+            active_gpu
+                .as_ref()
+                .expect("checked active GPU route")
+                .supervisor
+                .retire()
+        } else {
+            Ok(())
+        };
+        route_retirement.and(active_retirement)
+    }
+
+    fn revalidate_route_activation(
+        &self,
+        route: &InferenceWorkerRoute,
+    ) -> Result<(), RoutePreparationError> {
+        if !route.provider.is_gpu() {
+            return Ok(());
+        }
+        let target_security_epoch = route
+            .target
+            .as_ref()
+            .and_then(|target| target.pack.as_ref())
+            .map(|pack| pack.security_epoch);
+        if crate::gpu_worker_pack::revalidate_production_device_epoch(target_security_epoch).is_ok()
+        {
+            return Ok(());
+        }
+        if self
+            .retire_gpu_workers_after_authority_rejection(route)
+            .is_err()
+        {
+            return Err(RoutePreparationError::Fatal(
+                RuntimeError::WorkerUnavailable(
+                    "GPU route rejected by the device-local release rollback authority; worker retirement was incomplete"
+                        .to_owned(),
+                ),
+            ));
+        }
+        Err(RoutePreparationError::DeviceRollbackAuthority(
+            RuntimeError::WorkerUnavailable(
+                "GPU route rejected by the device-local release rollback authority".to_owned(),
+            ),
+        ))
+    }
+
+    fn prepare_route(&self, route: &InferenceWorkerRoute) -> Result<(), RoutePreparationError> {
         let identity = Self::route_identity(route);
         let prior = {
             let mut active = self.active_route.lock().map_err(|_| {
-                RuntimeError::WorkerUnavailable("active inference route lock poisoned".to_owned())
+                RoutePreparationError::Fatal(RuntimeError::WorkerUnavailable(
+                    "active inference route lock poisoned".to_owned(),
+                ))
             })?;
             if active.as_ref().is_some_and(|current| {
                 current.identity == identity
                     && Self::same_supervisor(&current.supervisor, &route.supervisor)
             }) {
+                drop(active);
+                // Warm-route reuse is still a new request and must recheck the
+                // device authority immediately before use.
+                self.revalidate_route_activation(route)?;
                 return Ok(());
             }
             active.take()
         };
         if let Some(prior) = prior {
-            prior.supervisor.retire()?;
+            prior
+                .supervisor
+                .retire()
+                .map_err(RoutePreparationError::Fatal)?;
         }
+        // Discovery, cache lookup, and retiring a prior route can take time.
+        // Recheck directly before publication. An epoch advanced after this
+        // boundary belongs to the next request; active work is never migrated.
+        self.revalidate_route_activation(route)?;
         *self.active_route.lock().map_err(|_| {
-            RuntimeError::WorkerUnavailable("active inference route lock poisoned".to_owned())
+            RoutePreparationError::Fatal(RuntimeError::WorkerUnavailable(
+                "active inference route lock poisoned".to_owned(),
+            ))
         })? = Some(ActiveInferenceRoute {
             identity,
             supervisor: route.supervisor.clone(),
@@ -6815,7 +7092,7 @@ impl InferenceWorkerRegistry {
                 reserve_auto_cpu_fallback(&mut plan, &self.routes);
                 return Ok(plan);
             }
-            let policy = match AutoQualificationPolicy::embedded_windows_x64() {
+            let policy = match AutoQualificationPolicy::embedded_current_platform() {
                 Ok(policy) => policy,
                 Err(error) => {
                     return Ok(InferenceWorkerRoutePlan {
@@ -7128,7 +7405,23 @@ impl InferenceWorkerRegistry {
                 continue;
             }
             attempted = true;
-            self.prepare_route(route)?;
+            match self.prepare_route(route) {
+                Ok(()) => {}
+                Err(RoutePreparationError::DeviceRollbackAuthority(error)) => {
+                    self.invalidate_gpu_catalog_after_runtime_failure(route)?;
+                    let error = if preference == AccelerationPreference::Gpu {
+                        RuntimeError::WorkerUnavailable(format!(
+                            "{error}; CPU fallback is forbidden for explicit GPU"
+                        ))
+                    } else {
+                        RuntimeError::RetryableWorkerFailure(error.to_string())
+                    };
+                    record_backend_fallback(&mut fallback_history, route, &error);
+                    last_retryable = Some(error);
+                    continue;
+                }
+                Err(RoutePreparationError::Fatal(error)) => return Err(error),
+            }
             match route.supervisor.load(
                 artifact.clone(),
                 Self::worker_preference_for_route(route, preference),
@@ -7264,7 +7557,23 @@ impl InferenceWorkerRegistry {
                 continue;
             }
             attempted = true;
-            self.prepare_route(route)?;
+            match self.prepare_route(route) {
+                Ok(()) => {}
+                Err(RoutePreparationError::DeviceRollbackAuthority(error)) => {
+                    self.invalidate_gpu_catalog_after_runtime_failure(route)?;
+                    let error = if preference == AccelerationPreference::Gpu {
+                        RuntimeError::WorkerUnavailable(format!(
+                            "{error}; CPU fallback is forbidden for explicit GPU"
+                        ))
+                    } else {
+                        RuntimeError::RetryableWorkerFailure(error.to_string())
+                    };
+                    record_backend_fallback(&mut fallback_history, route, &error);
+                    last_retryable = Some(error);
+                    continue;
+                }
+                Err(RoutePreparationError::Fatal(error)) => return Err(error),
+            }
             match route.supervisor.transcribe(
                 artifact.clone(),
                 Self::worker_preference_for_route(route, preference),
@@ -7422,7 +7731,21 @@ impl InferenceWorkerRegistry {
                 continue;
             }
             attempted = true;
-            self.prepare_route(route)?;
+            match self.prepare_route(route) {
+                Ok(()) => {}
+                Err(RoutePreparationError::DeviceRollbackAuthority(error)) => {
+                    self.invalidate_gpu_catalog_after_runtime_failure(route)?;
+                    last_retryable = Some(if preference == AccelerationPreference::Gpu {
+                        RuntimeError::WorkerUnavailable(format!(
+                            "{error}; CPU fallback is forbidden for explicit GPU"
+                        ))
+                    } else {
+                        RuntimeError::RetryableWorkerFailure(error.to_string())
+                    });
+                    continue;
+                }
+                Err(RoutePreparationError::Fatal(error)) => return Err(error),
+            }
             match route.supervisor.health(
                 artifact.clone(),
                 Self::worker_preference_for_route(route, preference),
@@ -10008,11 +10331,7 @@ mod tests {
         let mut expected = backend_target(BackendKind::Vulkan, "native:pci:0000:01:00.0", Some(9));
         expected.vendor = GpuVendor::Nvidia;
         expected.driver_version = Some("fixture-driver-1".to_owned());
-        let context = PackLaunchContext {
-            lease,
-            expectation: expectation.clone(),
-            expected_device: Some(expected.clone()),
-        };
+        let context = PackLaunchContext::fixture(lease, Some(expected.clone()));
         let capability = WorkerPackCapability {
             expectation,
             devices: vec![WorkerPackDeviceCapability {
@@ -10061,15 +10380,10 @@ mod tests {
         let root = crate::gpu_worker_pack::manifest::test_support::temp_root("pack-index-env");
         let (_, lease) = crate::gpu_worker_pack::manifest::test_support::leased_fixture(&root);
         let lease = Arc::new(lease);
-        let expectation = pack_expectation(&lease);
         let mut expected =
             backend_target(BackendKind::Vulkan, "native:luid:0000000000000001", Some(7));
         expected.driver_version = Some("vulkan:10de:1:1:fixture".to_owned());
-        let context = PackLaunchContext {
-            lease,
-            expectation,
-            expected_device: Some(expected),
-        };
+        let context = PackLaunchContext::fixture(lease, Some(expected));
         let mut command = Command::new("scribe-inference-worker.exe");
 
         configure_worker_pack_environment(&mut command, &context);
@@ -10178,11 +10492,7 @@ mod tests {
         let (_, lease) = crate::gpu_worker_pack::manifest::test_support::leased_fixture(&root);
         let lease = Arc::new(lease);
         let expectation = pack_expectation(&lease);
-        let context = PackLaunchContext {
-            lease,
-            expectation: expectation.clone(),
-            expected_device: None,
-        };
+        let context = PackLaunchContext::fixture(lease, None);
         let device = |identity: &str, index: usize| WorkerPackDeviceCapability {
             stable_device_identity: identity.to_owned(),
             process_index: index,
@@ -12021,6 +12331,104 @@ mod tests {
                 GpuRouteCatalogLookup::Probe
             ));
         }
+    }
+
+    #[test]
+    fn request_bound_device_epoch_rejection_keeps_auto_safe_and_explicit_gpu_strict() {
+        struct ResetDeviceEpochRejection;
+        impl Drop for ResetDeviceEpochRejection {
+            fn drop(&mut self) {
+                crate::gpu_worker_pack::set_test_device_epoch_rejected(false);
+            }
+        }
+
+        crate::gpu_worker_pack::set_test_device_epoch_rejected(true);
+        let _reset = ResetDeviceEpochRejection;
+
+        let auto_gpu_launcher = Arc::new(TestLauncher::new([TestMode::Normal]));
+        let auto_cpu_launcher = Arc::new(TestLauncher::new([TestMode::RuntimeLoadThenExit]));
+        let mut auto_gpu_route = verified_gpu_route(
+            BackendKind::Metal,
+            "native:registry:metal-0",
+            "macos:metal",
+            'a',
+        );
+        auto_gpu_route.supervisor =
+            inference_supervisor_with_launcher(Arc::clone(&auto_gpu_launcher));
+        let mut auto_registry = InferenceWorkerRegistry::with_cpu_supervisor(
+            inference_supervisor_with_launcher(Arc::clone(&auto_cpu_launcher)),
+        );
+        auto_registry.gpu_routes_for_testing = Some(verified_gpu_catalog(vec![auto_gpu_route]));
+
+        let execution = auto_registry
+            .load(missing_gguf_artifact(), AccelerationPreference::Auto)
+            .expect("Auto must skip a request-bound rollback rejection and use CPU");
+        assert_eq!(auto_gpu_launcher.launches.load(Ordering::Acquire), 0);
+        assert_eq!(auto_cpu_launcher.launches.load(Ordering::Acquire), 1);
+        let selection = execution
+            .diagnostics
+            .resolved_acceleration
+            .selection
+            .expect("Auto rollback fallback must retain typed diagnostics");
+        assert_eq!(selection.target.backend, BackendKind::Cpu);
+        assert_eq!(selection.fallback_history.len(), 1);
+
+        let explicit_gpu_launcher = Arc::new(TestLauncher::new([TestMode::Normal]));
+        let explicit_cpu_launcher = Arc::new(TestLauncher::new([TestMode::Normal]));
+        let mut explicit_gpu_route = verified_gpu_route(
+            BackendKind::Metal,
+            "native:registry:metal-0",
+            "macos:metal",
+            'b',
+        );
+        explicit_gpu_route.supervisor =
+            inference_supervisor_with_launcher(Arc::clone(&explicit_gpu_launcher));
+        let mut explicit_registry = InferenceWorkerRegistry::with_cpu_supervisor(
+            inference_supervisor_with_launcher(Arc::clone(&explicit_cpu_launcher)),
+        );
+        explicit_registry.gpu_routes_for_testing =
+            Some(verified_gpu_catalog(vec![explicit_gpu_route]));
+
+        let error = explicit_registry
+            .load(missing_gguf_artifact(), AccelerationPreference::Gpu)
+            .expect_err("explicit GPU must never use CPU after rollback rejection")
+            .to_string();
+        assert!(error.contains("device-local release rollback authority"));
+        assert!(error.contains("CPU fallback is forbidden"));
+        assert_eq!(explicit_gpu_launcher.launches.load(Ordering::Acquire), 0);
+        assert_eq!(explicit_cpu_launcher.launches.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn warm_gpu_route_rechecks_device_epoch_before_reuse() {
+        struct ResetDeviceEpochRejection;
+        impl Drop for ResetDeviceEpochRejection {
+            fn drop(&mut self) {
+                crate::gpu_worker_pack::set_test_device_epoch_rejected(false);
+            }
+        }
+
+        let route = verified_gpu_route(
+            BackendKind::Metal,
+            "native:registry:metal-0",
+            "macos:metal",
+            'c',
+        );
+        let registry =
+            InferenceWorkerRegistry::with_cpu_supervisor(InferenceWorkerSupervisor::unstarted());
+        registry.prepare_route(&route).unwrap();
+        assert!(registry.active_route.lock().unwrap().is_some());
+
+        crate::gpu_worker_pack::set_test_device_epoch_rejected(true);
+        let _reset = ResetDeviceEpochRejection;
+        assert!(matches!(
+            registry.prepare_route(&route),
+            Err(RoutePreparationError::DeviceRollbackAuthority(_))
+        ));
+        assert!(
+            registry.active_route.lock().unwrap().is_none(),
+            "rollback denial must retire the already-warm GPU route"
+        );
     }
 
     #[test]

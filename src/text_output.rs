@@ -649,6 +649,14 @@ fn clipboard_ownership_token_required() -> bool {
     cfg!(target_os = "windows")
 }
 
+#[cfg(not(target_os = "windows"))]
+fn system_clipboard_has_any_format() -> Option<bool> {
+    // arboard does not expose a portable way to distinguish a genuinely empty
+    // clipboard from an unsupported native format. Treat the state as unknown
+    // so clipboard restoration remains fail closed.
+    None
+}
+
 struct SystemClipboard {
     clipboard: Clipboard,
 }

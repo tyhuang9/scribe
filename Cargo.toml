@@ -8,6 +8,7 @@ ui-harness = []
 inference-worker = ["dep:transcribe-cpp"]
 cuda-acceleration = ["inference-worker", "transcribe-cpp/cuda"]
 vulkan-acceleration = ["inference-worker", "transcribe-cpp/vulkan", "dep:ash"]
+metal-acceleration = ["inference-worker", "transcribe-cpp/metal"]
 
 [dependencies]
 anyhow = "1"

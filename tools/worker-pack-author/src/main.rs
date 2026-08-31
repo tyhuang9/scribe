@@ -1,5 +1,3 @@
-#![cfg(not(test))]
-
 //! Private build-time manifest and signing tool for verified worker packs.
 
 use std::collections::BTreeMap;
@@ -25,9 +23,17 @@ mod worker_identity;
 mod worker_pack_authoring;
 
 use worker_pack_authoring::{
-    AuthorRequest, AuthoringBackend, SigningMode, author_pack, check_production_signing_key,
-    verify_fixture_pack,
+    AUTHOR_TARGET_CONTRACT, AuthorRequest, AuthoringBackend, SigningMode, author_pack,
+    check_production_signing_key, validate_authoring_target, verify_fixture_pack,
 };
+
+const HELP_TEXT: &str = "Scribe worker-pack authoring tool\n\
+commands:\n\
+  author --backend <cuda|vulkan|metal> [--target-os <windows|macos> --target-arch <x86_64|aarch64>] ...\n\
+  verify-fixture --pack-root <path>\n\
+  check-production-key --key-id <id> --private-key <path>\n\
+Author targets: cuda or vulkan on windows/x86_64; metal on macos/aarch64 or macos/x86_64.\n\
+The target flags may be omitted only for legacy cuda/vulkan authoring, which defaults to windows/x86_64. Values are lowercase and case-sensitive.";
 
 fn main() {
     if let Err(error) = run() {
@@ -38,10 +44,18 @@ fn main() {
 
 fn run() -> Result<()> {
     let mut arguments = std::env::args_os().skip(1);
-    let command = arguments
-        .next()
-        .ok_or_else(|| anyhow!("expected author, verify-fixture, or check-production-key"))?;
-    let options = parse_options(arguments.collect())?;
+    let command = arguments.next().ok_or_else(|| {
+        anyhow!("expected author, verify-fixture, check-production-key, or --help\n{HELP_TEXT}")
+    })?;
+    let remaining = arguments.collect::<Vec<_>>();
+    if matches!(command.to_str(), Some("--help" | "help")) {
+        if !remaining.is_empty() {
+            bail!("help does not accept options\n{HELP_TEXT}");
+        }
+        println!("{HELP_TEXT}");
+        return Ok(());
+    }
+    let options = parse_options(remaining)?;
     match command.to_str() {
         Some("author") => run_author(&options),
         Some("verify-fixture") => {
@@ -60,45 +74,83 @@ fn run() -> Result<()> {
             println!("production signing key matches embedded trust");
             Ok(())
         }
-        _ => bail!("expected author, verify-fixture, or check-production-key"),
+        _ => bail!("expected author, verify-fixture, check-production-key, or --help\n{HELP_TEXT}"),
     }
 }
 
 fn run_author(options: &BTreeMap<String, OsString>) -> Result<()> {
+    let request = author_request_from_options(options)?;
+    println!("{}", serde_json::to_string(&author_pack(&request)?)?);
+    Ok(())
+}
+
+fn author_request_from_options(options: &BTreeMap<String, OsString>) -> Result<AuthorRequest> {
     let fixture = options.contains_key("--fixture-signing");
+    let has_target_option =
+        options.contains_key("--target-os") || options.contains_key("--target-arch");
     if fixture {
-        require_exact_options(
-            options,
-            &[
-                "--backend",
-                "--fixture-signing",
-                "--pack-id",
-                "--pack-root",
-                "--pack-version",
-                "--provider",
-                "--security-epoch",
-                "--worker-path",
-            ],
-        )?;
+        let mut expected = vec![
+            "--backend",
+            "--fixture-signing",
+            "--pack-id",
+            "--pack-root",
+            "--pack-version",
+            "--provider",
+            "--security-epoch",
+        ];
+        if has_target_option {
+            expected.extend(["--target-arch", "--target-os"]);
+        }
+        expected.push("--worker-path");
+        require_exact_options(options, &expected).map_err(|_| {
+            anyhow!("author command has unknown or missing options; {AUTHOR_TARGET_CONTRACT}")
+        })?;
     } else {
-        require_exact_options(
-            options,
-            &[
-                "--backend",
-                "--key-id",
-                "--pack-id",
-                "--pack-root",
-                "--pack-version",
-                "--private-key",
-                "--provider",
-                "--security-epoch",
-                "--worker-path",
-            ],
-        )?;
+        let mut expected = vec![
+            "--backend",
+            "--key-id",
+            "--pack-id",
+            "--pack-root",
+            "--pack-version",
+            "--private-key",
+            "--provider",
+            "--security-epoch",
+        ];
+        if has_target_option {
+            expected.extend(["--target-arch", "--target-os"]);
+        }
+        expected.push("--worker-path");
+        require_exact_options(options, &expected).map_err(|_| {
+            anyhow!("author command has unknown or missing options; {AUTHOR_TARGET_CONTRACT}")
+        })?;
     }
     let backend_value = required_utf8(options, "--backend")?;
-    let backend = AuthoringBackend::parse(backend_value)
-        .ok_or_else(|| anyhow!("backend must be cuda or vulkan"))?;
+    let backend = AuthoringBackend::parse(backend_value).ok_or_else(|| {
+        anyhow!("backend must be cuda, vulkan, or metal; {AUTHOR_TARGET_CONTRACT}")
+    })?;
+    let (target_os, target_arch) = match (options.get("--target-os"), options.get("--target-arch"))
+    {
+        (None, None) if matches!(backend, AuthoringBackend::Cuda | AuthoringBackend::Vulkan) => {
+            ("windows".to_owned(), "x86_64".to_owned())
+        }
+        (None, None) => bail!(
+            "metal authoring requires --target-os and --target-arch; {AUTHOR_TARGET_CONTRACT}"
+        ),
+        (Some(target_os), Some(target_arch)) => (
+            target_os
+                .to_str()
+                .ok_or_else(|| anyhow!("option --target-os must be UTF-8"))?
+                .to_owned(),
+            target_arch
+                .to_str()
+                .ok_or_else(|| anyhow!("option --target-arch must be UTF-8"))?
+                .to_owned(),
+        ),
+        _ => bail!(
+            "--target-os and --target-arch must be supplied together; {AUTHOR_TARGET_CONTRACT}"
+        ),
+    };
+    validate_authoring_target(backend, &target_os, &target_arch)?;
     let security_epoch = required_utf8(options, "--security-epoch")?
         .parse::<u64>()
         .map_err(|_| anyhow!("security epoch must be a canonical unsigned integer"))?;
@@ -110,18 +162,18 @@ fn run_author(options: &BTreeMap<String, OsString>) -> Result<()> {
             private_key_path: PathBuf::from(required(options, "--private-key")?),
         }
     };
-    let request = AuthorRequest {
+    Ok(AuthorRequest {
         pack_root: PathBuf::from(required(options, "--pack-root")?),
         pack_id: required_utf8(options, "--pack-id")?.to_owned(),
         pack_version: required_utf8(options, "--pack-version")?.to_owned(),
         security_epoch,
         backend,
         provider: required_utf8(options, "--provider")?.to_owned(),
+        target_os,
+        target_arch,
         worker_path: required_utf8(options, "--worker-path")?.to_owned(),
         signing,
-    };
-    println!("{}", serde_json::to_string(&author_pack(&request)?)?);
-    Ok(())
+    })
 }
 
 fn parse_options(arguments: Vec<OsString>) -> Result<BTreeMap<String, OsString>> {
@@ -171,4 +223,111 @@ fn require_exact_options(options: &BTreeMap<String, OsString>, expected: &[&str]
         bail!("command has unknown or missing options");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture_options(extra: &[&str]) -> BTreeMap<String, OsString> {
+        let mut arguments = vec![
+            "--backend",
+            "vulkan",
+            "--fixture-signing",
+            "--pack-id",
+            "test-pack",
+            "--pack-root",
+            "test-root",
+            "--pack-version",
+            "1.0.0",
+            "--provider",
+            "transcribe-cpp-ggml-vulkan",
+            "--security-epoch",
+            "1",
+            "--worker-path",
+            "bin/worker",
+        ];
+        arguments.extend_from_slice(extra);
+        parse_options(arguments.into_iter().map(OsString::from).collect()).unwrap()
+    }
+
+    fn explicit_target_options(
+        backend: &str,
+        target_os: &str,
+        target_arch: &str,
+    ) -> BTreeMap<String, OsString> {
+        let mut options =
+            fixture_options(&["--target-os", target_os, "--target-arch", target_arch]);
+        options.insert("--backend".to_owned(), OsString::from(backend));
+        options
+    }
+
+    #[test]
+    fn legacy_windows_cuda_and_vulkan_default_to_x86_64() {
+        for backend in ["cuda", "vulkan"] {
+            let mut options = fixture_options(&[]);
+            options.insert("--backend".to_owned(), OsString::from(backend));
+            let request = author_request_from_options(&options).unwrap();
+            assert_eq!(request.target_os, "windows");
+            assert_eq!(request.target_arch, "x86_64");
+        }
+    }
+
+    #[test]
+    fn explicit_macos_metal_targets_accept_both_production_architectures() {
+        for arch in ["aarch64", "x86_64"] {
+            let options = explicit_target_options("metal", "macos", arch);
+            let request = author_request_from_options(&options).unwrap();
+            assert_eq!(request.backend, AuthoringBackend::Metal);
+            assert_eq!(request.target_os, "macos");
+            assert_eq!(request.target_arch, arch);
+        }
+    }
+
+    #[test]
+    fn cli_rejects_missing_or_incoherent_backend_targets() {
+        let mut missing_target = fixture_options(&[]);
+        missing_target.insert("--backend".to_owned(), OsString::from("metal"));
+        assert!(
+            author_request_from_options(&missing_target)
+                .unwrap_err()
+                .to_string()
+                .contains(AUTHOR_TARGET_CONTRACT)
+        );
+
+        let mut one_target = fixture_options(&["--target-os", "macos"]);
+        one_target.insert("--backend".to_owned(), OsString::from("metal"));
+        assert!(
+            author_request_from_options(&one_target)
+                .unwrap_err()
+                .to_string()
+                .contains(AUTHOR_TARGET_CONTRACT)
+        );
+
+        for (backend, target_os, target_arch) in [
+            ("metal", "windows", "x86_64"),
+            ("cuda", "macos", "aarch64"),
+            ("vulkan", "macos", "x86_64"),
+            ("metal", "macos", "arm64"),
+            ("metal", "linux", "x86_64"),
+            ("Metal", "macos", "aarch64"),
+            ("metal", "MacOS", "aarch64"),
+            ("metal", "macos", ""),
+        ] {
+            let options = explicit_target_options(backend, target_os, target_arch);
+            assert!(
+                author_request_from_options(&options)
+                    .unwrap_err()
+                    .to_string()
+                    .contains(AUTHOR_TARGET_CONTRACT)
+            );
+        }
+    }
+
+    #[test]
+    fn help_enumerates_the_exact_authoring_contract() {
+        assert!(HELP_TEXT.contains("cuda or vulkan on windows/x86_64"));
+        assert!(HELP_TEXT.contains("metal on macos/aarch64 or macos/x86_64"));
+        assert!(HELP_TEXT.contains("defaults to windows/x86_64"));
+    }
 }

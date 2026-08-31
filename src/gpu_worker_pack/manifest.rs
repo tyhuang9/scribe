@@ -233,6 +233,17 @@ impl VerifiedPackLease {
         reject_named_streams(&display_path)?;
         Ok(file)
     }
+
+    #[cfg(unix)]
+    pub(crate) fn open_dependency_root(&self) -> Result<File, PackVerificationError> {
+        self.recheck()?;
+        self.root
+            .handles
+            .last()
+            .expect("verified pack root retains its digest directory")
+            .try_clone()
+            .map_err(PackVerificationError::Io)
+    }
 }
 
 /// Borrowed launch authority. Its lifetime prevents the retained pack lease
@@ -291,7 +302,15 @@ impl PinnedPackRoot {
                 self.handles.last().expect("digest handle").as_raw_fd()
             ));
         }
-        #[cfg(all(unix, not(target_os = "linux")))]
+        #[cfg(target_os = "macos")]
+        {
+            // macOS exposes /dev/fd entries for the descriptor itself but does
+            // not support traversing children below that path. All reads and
+            // exact-tree inspection remain descriptor-relative; this path is
+            // used only for diagnostics and test-hook labels.
+            return self.path.clone();
+        }
+        #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
         {
             return PathBuf::from(format!(
                 "/dev/fd/{}",
@@ -448,7 +467,7 @@ impl<'a> PackVerifier<'a> {
 
         let manifest: PackManifest = parse_canonical_json(&manifest_bytes, "manifest")?;
         self.validate_manifest(&manifest)?;
-        verify_exact_tree(root, &manifest.payload)?;
+        verify_exact_tree(root, pinned, &manifest.payload)?;
         let mut retained_files = verify_payload(root, pinned, &manifest.payload)?;
         retained_files.push(manifest_file);
         retained_files.push(signature_file);
@@ -756,13 +775,11 @@ pub(crate) fn validate_root(root: &Path) -> Result<(), PackVerificationError> {
     Ok(())
 }
 
-fn verify_exact_tree(root: &Path, inventory: &[PayloadEntry]) -> Result<(), PackVerificationError> {
+fn exact_tree_expectations(inventory: &[PayloadEntry]) -> (BTreeSet<&str>, BTreeSet<String>) {
     let expected = inventory
         .iter()
         .map(|entry| entry.path.as_str())
         .collect::<BTreeSet<_>>();
-    let mut observed = BTreeSet::new();
-    let mut observed_casefolded = BTreeSet::new();
     let mut expected_directories = BTreeSet::new();
     for entry in inventory {
         let mut parent = Path::new(&entry.path).parent();
@@ -774,6 +791,37 @@ fn verify_exact_tree(root: &Path, inventory: &[PayloadEntry]) -> Result<(), Pack
             parent = path.parent();
         }
     }
+    (expected, expected_directories)
+}
+
+fn exact_tree_observation_matches(
+    expected: &BTreeSet<&str>,
+    observed: &BTreeSet<String>,
+) -> Result<(), PackVerificationError> {
+    let reserved = BTreeSet::from([MANIFEST_NAME.to_owned(), SIGNATURE_NAME.to_owned()]);
+    let payload_observed = observed
+        .difference(&reserved)
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    if &payload_observed != expected || !reserved.iter().all(|name| observed.contains(name)) {
+        return Err(PackVerificationError::TreeMismatch);
+    }
+    Ok(())
+}
+
+fn verify_exact_tree(
+    root: &Path,
+    _pinned: Option<&PinnedPackRoot>,
+    inventory: &[PayloadEntry],
+) -> Result<(), PackVerificationError> {
+    #[cfg(target_os = "macos")]
+    if let Some(pinned) = _pinned {
+        return verify_exact_tree_macos(pinned, inventory);
+    }
+
+    let (expected, expected_directories) = exact_tree_expectations(inventory);
+    let mut observed = BTreeSet::new();
+    let mut observed_casefolded = BTreeSet::new();
     let mut pending = vec![(root.to_path_buf(), 0_usize)];
     while let Some((directory, depth)) = pending.pop() {
         if depth > MAX_DEPTH {
@@ -816,15 +864,246 @@ fn verify_exact_tree(root: &Path, inventory: &[PayloadEntry]) -> Result<(), Pack
             }
         }
     }
-    let reserved = BTreeSet::from([MANIFEST_NAME.to_owned(), SIGNATURE_NAME.to_owned()]);
-    let payload_observed = observed
-        .difference(&reserved)
-        .map(String::as_str)
-        .collect::<BTreeSet<_>>();
-    if payload_observed != expected || !reserved.iter().all(|name| observed.contains(name)) {
-        return Err(PackVerificationError::TreeMismatch);
+    exact_tree_observation_matches(&expected, &observed)
+}
+
+#[cfg(target_os = "macos")]
+struct MacosDirectoryStream(*mut libc::DIR);
+
+#[cfg(target_os = "macos")]
+impl MacosDirectoryStream {
+    fn close(mut self) -> Result<(), PackVerificationError> {
+        let stream = std::mem::replace(&mut self.0, std::ptr::null_mut());
+        if unsafe { libc::closedir(stream) } != 0 {
+            return Err(PackVerificationError::Io(io::Error::last_os_error()));
+        }
+        Ok(())
     }
-    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for MacosDirectoryStream {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                libc::closedir(self.0);
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_directory_names(
+    directory: &File,
+    maximum_entries: usize,
+) -> Result<Vec<String>, PackVerificationError> {
+    use std::os::unix::io::AsRawFd;
+
+    let expected = macos_descriptor_stat(directory.as_raw_fd())?;
+    let duplicated = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            b".\0".as_ptr().cast(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if duplicated < 0 {
+        return Err(PackVerificationError::Io(io::Error::last_os_error()));
+    }
+    let reopened = match macos_descriptor_stat(duplicated) {
+        Ok(stat) => stat,
+        Err(error) => {
+            unsafe {
+                libc::close(duplicated);
+            }
+            return Err(error);
+        }
+    };
+    if reopened.st_mode & libc::S_IFMT != libc::S_IFDIR
+        || reopened.st_dev != expected.st_dev
+        || reopened.st_ino != expected.st_ino
+    {
+        unsafe {
+            libc::close(duplicated);
+        }
+        return Err(PackVerificationError::PackStoreAncestorChanged(
+            PathBuf::from("descriptor-relative directory"),
+        ));
+    }
+    let raw_stream = unsafe { libc::fdopendir(duplicated) };
+    if raw_stream.is_null() {
+        let error = io::Error::last_os_error();
+        unsafe {
+            libc::close(duplicated);
+        }
+        return Err(PackVerificationError::Io(error));
+    }
+    let stream = MacosDirectoryStream(raw_stream);
+    let mut names = Vec::new();
+    loop {
+        unsafe {
+            *libc::__error() = 0;
+        }
+        let entry = unsafe { libc::readdir(stream.0) };
+        if entry.is_null() {
+            let error_number = unsafe { *libc::__error() };
+            if error_number != 0 {
+                return Err(PackVerificationError::Io(io::Error::from_raw_os_error(
+                    error_number,
+                )));
+            }
+            break;
+        }
+        let bytes = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+        if bytes == b"." || bytes == b".." {
+            continue;
+        }
+        let name = std::str::from_utf8(bytes)
+            .map_err(|_| PackVerificationError::UnsafePath("non-UTF-8 pack entry".to_owned()))?;
+        if name.is_empty() {
+            return Err(PackVerificationError::UnsafePath(
+                "empty pack entry".to_owned(),
+            ));
+        }
+        names.push(name.to_owned());
+        if names.len() > maximum_entries {
+            return Err(PackVerificationError::InvalidFileCount);
+        }
+    }
+    stream.close()?;
+    names.sort_unstable();
+    Ok(names)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_descriptor_stat(descriptor: libc::c_int) -> Result<libc::stat, PackVerificationError> {
+    use std::mem::MaybeUninit;
+
+    let mut stat = MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(descriptor, stat.as_mut_ptr()) } != 0 {
+        return Err(PackVerificationError::Io(io::Error::last_os_error()));
+    }
+    Ok(unsafe { stat.assume_init() })
+}
+
+#[cfg(target_os = "macos")]
+fn macos_entry_stat(directory: &File, name: &str) -> Result<libc::stat, PackVerificationError> {
+    use std::mem::MaybeUninit;
+    use std::os::unix::io::AsRawFd;
+
+    let name = CString::new(name)
+        .map_err(|_| PackVerificationError::UnsafePath("NUL in pack entry".to_owned()))?;
+    let mut stat = MaybeUninit::<libc::stat>::uninit();
+    if unsafe {
+        libc::fstatat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(PackVerificationError::Io(io::Error::last_os_error()));
+    }
+    Ok(unsafe { stat.assume_init() })
+}
+
+#[cfg(target_os = "macos")]
+fn macos_open_child_directory(
+    parent: &File,
+    name: &str,
+    observed: &libc::stat,
+    display_path: &Path,
+) -> Result<File, PackVerificationError> {
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+
+    let name = CString::new(name)
+        .map_err(|_| PackVerificationError::UnsafePath("NUL in pack entry".to_owned()))?;
+    let descriptor = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if descriptor < 0 {
+        return Err(PackVerificationError::Io(io::Error::last_os_error()));
+    }
+    let directory = unsafe { File::from_raw_fd(descriptor) };
+    let opened = macos_descriptor_stat(directory.as_raw_fd())?;
+    if opened.st_mode & libc::S_IFMT != libc::S_IFDIR
+        || opened.st_dev != observed.st_dev
+        || opened.st_ino != observed.st_ino
+    {
+        return Err(PackVerificationError::NonRegularEntry(
+            display_path.to_path_buf(),
+        ));
+    }
+    Ok(directory)
+}
+
+#[cfg(target_os = "macos")]
+fn verify_exact_tree_macos(
+    pinned: &PinnedPackRoot,
+    inventory: &[PayloadEntry],
+) -> Result<(), PackVerificationError> {
+    let (expected, expected_directories) = exact_tree_expectations(inventory);
+    let mut observed = BTreeSet::new();
+    let mut observed_casefolded = BTreeSet::new();
+    let maximum_directory_entries = inventory
+        .len()
+        .checked_add(2)
+        .and_then(|count| count.checked_add(expected_directories.len()))
+        .ok_or(PackVerificationError::InvalidFileCount)?;
+    let root = pinned
+        .handles
+        .last()
+        .expect("verified pack root retains its digest directory")
+        .try_clone()
+        .map_err(PackVerificationError::Io)?;
+    let mut pending = vec![(root, String::new(), 0_usize)];
+
+    while let Some((directory, prefix, depth)) = pending.pop() {
+        if depth > MAX_DEPTH {
+            return Err(PackVerificationError::UnsafePath(prefix));
+        }
+        for name in macos_directory_names(&directory, maximum_directory_entries)? {
+            let relative = if prefix.is_empty() {
+                name.clone()
+            } else {
+                format!("{prefix}/{name}")
+            };
+            let reserved_root_entry =
+                prefix.is_empty() && matches!(name.as_str(), MANIFEST_NAME | SIGNATURE_NAME);
+            if !reserved_root_entry {
+                validate_relative_path(&relative)?;
+            }
+            if !observed_casefolded.insert(relative.to_ascii_lowercase()) {
+                return Err(PackVerificationError::CaseCollision);
+            }
+            let display_path = pinned.path.join(&relative);
+            let stat = macos_entry_stat(&directory, &name)?;
+            match stat.st_mode & libc::S_IFMT {
+                libc::S_IFDIR => {
+                    if !expected_directories.contains(&relative) {
+                        return Err(PackVerificationError::TreeMismatch);
+                    }
+                    let child =
+                        macos_open_child_directory(&directory, &name, &stat, &display_path)?;
+                    pending.push((child, relative, depth + 1));
+                }
+                libc::S_IFREG => {
+                    observed.insert(relative);
+                    if observed.len() > MAX_FILES + 2 {
+                        return Err(PackVerificationError::InvalidFileCount);
+                    }
+                }
+                _ => return Err(PackVerificationError::NonRegularEntry(display_path)),
+            }
+        }
+    }
+
+    exact_tree_observation_matches(&expected, &observed)
 }
 
 fn verify_payload(
@@ -1358,6 +1637,8 @@ pub(crate) enum PackVerificationError {
     BackendMismatch,
     #[error("worker-pack worker path is absent from the inventory")]
     WorkerMissing,
+    #[error("worker-pack worker file is not executable")]
+    WorkerNotExecutable,
     #[error("verified worker-pack descriptor changed before launch")]
     DescriptorChanged,
     #[error("worker-pack immutable-store ancestor is unsafe: {0}")]
@@ -1591,32 +1872,31 @@ mod tests {
         for (label, target_name, growth) in [
             ("grow-manifest", MANIFEST_NAME, MAX_MANIFEST_BYTES + 1),
             ("grow-signature", SIGNATURE_NAME, MAX_SIGNATURE_BYTES + 1),
-            ("grow-payload", "worker.exe", 14),
+            ("grow-payload", "bin/worker.exe", 14),
         ] {
             let root = temp_root(label);
             let (verifier, _) = fixture(&root);
-            let mutation_succeeded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let attempted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let writer_start = std::sync::Arc::new(std::sync::Barrier::new(2));
             let writer_finished = std::sync::Arc::new(std::sync::Barrier::new(2));
-            let mutation_result = std::sync::Arc::clone(&mutation_succeeded);
             let writer_start_thread = std::sync::Arc::clone(&writer_start);
             let writer_finished_thread = std::sync::Arc::clone(&writer_finished);
             let target = root.join(target_name);
+            assert!(target.is_file(), "mutation fixture target must exist");
             let writer = std::thread::spawn(move || {
                 writer_start_thread.wait();
                 let result = OpenOptions::new()
                     .append(true)
                     .open(target)
                     .and_then(|file| file.set_len(growth));
-                mutation_result.store(result.is_ok(), std::sync::atomic::Ordering::SeqCst);
                 writer_finished_thread.wait();
+                result
             });
             let attempted_result = std::sync::Arc::clone(&attempted);
             let hook_start = std::sync::Arc::clone(&writer_start);
             let hook_finished = std::sync::Arc::clone(&writer_finished);
             set_pack_read_hook(Some(Box::new(move |path| {
-                if path.file_name().and_then(|name| name.to_str()) == Some(target_name)
+                if path.ends_with(target_name)
                     && !attempted_result.swap(true, std::sync::atomic::Ordering::SeqCst)
                 {
                     hook_start.wait();
@@ -1625,21 +1905,25 @@ mod tests {
             })));
             let result = verifier.verify(&root);
             set_pack_read_hook(None);
-            writer.join().unwrap();
+            let mutation = writer.join().unwrap();
             assert!(attempted.load(std::sync::atomic::Ordering::SeqCst));
-            if mutation_succeeded.load(std::sync::atomic::Ordering::SeqCst) {
-                assert!(matches!(
+            match mutation {
+                Ok(()) => assert!(matches!(
                     result,
                     Err(PackVerificationError::EnvelopeTooLarge)
                         | Err(PackVerificationError::SizeMismatch(_))
-                ));
-            } else {
-                // Windows intentionally denies mutation while the verified
-                // no-share-write handle is retained.
-                #[cfg(windows)]
-                assert!(result.is_ok());
-                #[cfg(not(windows))]
-                panic!("concurrent mutation was unexpectedly denied: {result:?}");
+                )),
+                Err(error) => {
+                    assert_ne!(
+                        error.kind(),
+                        io::ErrorKind::NotFound,
+                        "the mutation fixture must name the file being verified"
+                    );
+                    assert!(
+                        result.is_ok(),
+                        "verification must remain valid when the OS denies mutation ({error}): {result:?}"
+                    );
+                }
             }
             fs::remove_dir_all(root).unwrap();
         }
@@ -1666,6 +1950,131 @@ mod tests {
                 Err(PackVerificationError::PayloadDigestMismatch(_))
             ));
         }
+        drop(verified);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pinned_macos_tree_rejects_an_unexpected_descriptor_relative_file() {
+        let root = temp_root("macos-pinned-extra");
+        let (verifier, verified) = leased_fixture(&root);
+        fs::write(
+            verified.verified_pack().root.join("unexpected.dylib"),
+            b"unsigned auxiliary payload",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            verifier.launchable_worker(&verified),
+            Err(PackVerificationError::TreeMismatch)
+        ));
+        fs::remove_file(verified.verified_pack().root.join("unexpected.dylib")).unwrap();
+        fs::write(
+            verified.verified_pack().root.join("bin/unexpected.dylib"),
+            b"unsigned nested auxiliary payload",
+        )
+        .unwrap();
+        assert!(matches!(
+            verifier.launchable_worker(&verified),
+            Err(PackVerificationError::TreeMismatch)
+        ));
+        fs::remove_file(verified.verified_pack().root.join("bin/unexpected.dylib")).unwrap();
+        fs::write(
+            verified
+                .verified_pack()
+                .root
+                .join(format!("bin/{MANIFEST_NAME}")),
+            b"nested envelope name",
+        )
+        .unwrap();
+        assert!(matches!(
+            verifier.launchable_worker(&verified),
+            Err(PackVerificationError::UnsafePath(path))
+                if path == format!("bin/{MANIFEST_NAME}")
+        ));
+
+        drop(verified);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pinned_macos_tree_walk_is_repeatable_and_concurrent() {
+        let root = temp_root("macos-pinned-repeat");
+        let (_, verified) = leased_fixture(&root);
+        let verified = std::sync::Arc::new(verified);
+        let inventory = std::sync::Arc::new(base_manifest().payload);
+
+        verify_exact_tree_macos(&verified.root, &inventory).unwrap();
+        verify_exact_tree_macos(&verified.root, &inventory).unwrap();
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let verified = std::sync::Arc::clone(&verified);
+            let inventory = std::sync::Arc::clone(&inventory);
+            let barrier = std::sync::Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                verify_exact_tree_macos(&verified.root, &inventory)
+            }));
+        }
+        barrier.wait();
+        for worker in workers {
+            worker.join().unwrap().unwrap();
+        }
+
+        drop(verified);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pinned_macos_directory_collection_is_structurally_bounded() {
+        let root = temp_root("macos-pinned-bound");
+        let (_, verified) = leased_fixture(&root);
+        for index in 0..5 {
+            fs::write(
+                verified.verified_pack().root.join(format!("extra-{index}")),
+                b"unexpected",
+            )
+            .unwrap();
+        }
+        let directory = verified
+            .root
+            .handles
+            .last()
+            .expect("verified pack root retains its digest directory");
+        assert!(matches!(
+            macos_directory_names(directory, 4),
+            Err(PackVerificationError::InvalidFileCount)
+        ));
+
+        drop(verified);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pinned_macos_tree_walk_stays_bound_to_the_retained_directory() {
+        let root = temp_root("macos-pinned-rename");
+        let (_, verified) = leased_fixture(&root);
+        let original_path = verified.verified_pack().root.clone();
+        let moved_path = root.join("moved-pinned-pack");
+        fs::rename(&original_path, &moved_path).unwrap();
+        fs::write(
+            moved_path.join("unexpected.dylib"),
+            b"descriptor-bound extra",
+        )
+        .unwrap();
+
+        write_signed(&original_path, base_manifest());
+        assert!(matches!(
+            verify_exact_tree_macos(&verified.root, &base_manifest().payload),
+            Err(PackVerificationError::TreeMismatch)
+        ));
+
         drop(verified);
         fs::remove_dir_all(root).unwrap();
     }

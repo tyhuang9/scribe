@@ -22,6 +22,5 @@ libc = "0.2"
 [[bin]]
 name = "scribe-worker-pack-tool"
 path = "src/main.rs"
-test = false
 
 [workspace]

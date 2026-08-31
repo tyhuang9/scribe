@@ -1,10 +1,11 @@
 //! Verified GPU worker-pack infrastructure.
 //!
-//! Stage 4 discovers verified Windows x64 packs and turns only challenge-bound
+//! Stage 4/6 discovers verified Windows and macOS packs and turns only challenge-bound
 //! resolver/Hello results into explicit-GPU candidates. Production trust is
 //! deliberately empty until a separate public-key review is complete, and
 //! Auto remains default-denied to every GPU pack.
 
+mod device_release_epoch;
 pub(crate) mod health;
 pub(crate) mod manifest;
 pub(crate) mod store;
@@ -13,14 +14,21 @@ use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(any(
+    all(windows, target_arch = "x86_64"),
+    all(
+        target_os = "macos",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    )
+))]
 use std::sync::{Mutex, OnceLock};
 
-use serde::Deserialize;
-#[cfg(all(windows, target_arch = "x86_64"))]
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-// Stage 4 consumes the bridge re-export from the concrete Windows resolver.
+const MAX_RELEASE_SECURITY_EPOCH: u64 = 9_007_199_254_740_991;
+
+// Platform resolvers consume the bridge through this stable re-export.
 #[cfg(unix)]
 pub(crate) use launch_binding::UnixPackExecAuthority;
 #[allow(unused_imports)]
@@ -76,6 +84,41 @@ mod launch_binding {
 
     #[cfg(unix)]
     impl UnixPackExecAuthority {
+        pub(crate) fn from_verified_pack_lease(
+            verified_pack_lease: Arc<VerifiedPackLease>,
+        ) -> Result<Arc<Self>, super::manifest::PackVerificationError> {
+            use std::io::{Seek, SeekFrom};
+            use std::os::unix::fs::PermissionsExt;
+
+            verified_pack_lease.recheck()?;
+            let worker_path = &verified_pack_lease.verified_pack().worker_relative_path;
+            let entry = verified_pack_lease
+                .copy_entries()
+                .iter()
+                .find(|entry| entry.path == *worker_path)
+                .ok_or(super::manifest::PackVerificationError::WorkerMissing)?;
+            let mut executable_fd = verified_pack_lease.open_copy_file(entry)?;
+            if executable_fd.metadata()?.permissions().mode() & 0o111 == 0 {
+                return Err(super::manifest::PackVerificationError::WorkerNotExecutable);
+            }
+            let digest = super::manifest::hash_exact_length(
+                &mut executable_fd,
+                entry.size_bytes,
+                &entry.path,
+            )?;
+            if digest != entry.sha256 {
+                return Err(super::manifest::PackVerificationError::DigestMismatch);
+            }
+            executable_fd.seek(SeekFrom::Start(0))?;
+            let dependency_root_fd = verified_pack_lease.open_dependency_root()?;
+            verified_pack_lease.recheck()?;
+            Ok(Arc::new(Self {
+                verified_pack_lease,
+                executable_fd,
+                dependency_root_fd,
+            }))
+        }
+
         pub(crate) fn executable_fd(&self) -> &File {
             &self.executable_fd
         }
@@ -88,8 +131,28 @@ mod launch_binding {
             &self.verified_pack_lease
         }
 
+        pub(crate) fn recheck(&self) -> Result<(), super::manifest::PackVerificationError> {
+            use std::io::Seek;
+            let lease = self.verified_pack_lease();
+            lease.recheck()?;
+            let worker_path = &lease.verified_pack().worker_relative_path;
+            let entry = lease
+                .copy_entries()
+                .iter()
+                .find(|entry| entry.path == *worker_path)
+                .ok_or(super::manifest::PackVerificationError::WorkerMissing)?;
+            let mut executable = self.executable_fd.try_clone()?;
+            executable.rewind()?;
+            let digest =
+                super::manifest::hash_exact_length(&mut executable, entry.size_bytes, &entry.path)?;
+            if digest != entry.sha256 {
+                return Err(super::manifest::PackVerificationError::DigestMismatch);
+            }
+            lease.recheck()
+        }
+
         #[cfg(test)]
-        fn fixture(
+        pub(crate) fn fixture(
             verified_pack_lease: Arc<VerifiedPackLease>,
             executable_fd: File,
             dependency_root_fd: File,
@@ -245,6 +308,11 @@ mod launch_binding {
         pub(crate) fn unix_exec_authority(&self) -> &UnixPackExecAuthority {
             &self.unix_exec_authority
         }
+
+        #[cfg(unix)]
+        pub(crate) fn unix_exec_authority_arc(&self) -> Arc<UnixPackExecAuthority> {
+            Arc::clone(&self.unix_exec_authority)
+        }
     }
 }
 
@@ -310,6 +378,9 @@ pub(crate) enum PackDiscoveryIssue {
     PackRootRejected,
     SignatureOrInventoryRejected,
     CatalogInventoryMismatch,
+    SecurityEpochStateRejected,
+    DeviceRollbackAuthorityRejected,
+    ReleaseAuthorityRejected,
     NotAutoQualified,
     ProviderProbeRejected,
     DriverVersionUnavailable,
@@ -371,6 +442,15 @@ impl PackDiscoveryDiagnostic {
             PackDiscoveryIssue::CatalogInventoryMismatch => {
                 format!("{subject} does not match its catalog entry")
             }
+            PackDiscoveryIssue::SecurityEpochStateRejected => {
+                format!("{subject} security epoch state was rejected")
+            }
+            PackDiscoveryIssue::DeviceRollbackAuthorityRejected => {
+                format!("{subject} device rollback authority was rejected")
+            }
+            PackDiscoveryIssue::ReleaseAuthorityRejected => {
+                format!("{subject} does not match the signed release authority")
+            }
             PackDiscoveryIssue::NotAutoQualified => {
                 format!("{subject} is verified but not qualified for Auto")
             }
@@ -406,14 +486,14 @@ pub(crate) fn diagnostic_summary(diagnostics: &[PackDiscoveryDiagnostic]) -> Str
         .join("; ")
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PackCatalog {
     schema_version: u16,
     packs: Vec<PackCatalogEntry>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PackCatalogEntry {
     pack_id: manifest::StoreComponent,
@@ -432,16 +512,223 @@ struct PackCatalogEntry {
     files: Vec<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PackReleaseAuthority {
+    schema_version: u16,
+    catalog_sha256: String,
+    release_security_epoch: u64,
+    keychain_access_group: String,
+    entries: Vec<PackReleaseAuthorityEntry>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ValidatedReleaseAuthority {
+    release_security_epoch: u64,
+    keychain_access_group: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PackReleaseAuthorityEntry {
+    app_version: String,
+    build_revision: String,
+    app_protocol_version: u16,
+    pack_id: manifest::StoreComponent,
+    pack_version: manifest::StoreComponent,
+    pack_digest: String,
+    security_epoch: u64,
+    runtime_abi_version: u16,
+    backend: manifest::PackBackend,
+    provider: String,
+    target_os: String,
+    target_arch: String,
+    worker_relative_path: String,
+    root: String,
+    installed_size_bytes: u64,
+    compressed_size_bytes: u64,
+    files: Vec<String>,
+}
+
+impl PackReleaseAuthorityEntry {
+    fn matches_catalog_entry(&self, entry: &PackCatalogEntry) -> bool {
+        self.app_version == env!("CARGO_PKG_VERSION")
+            && self.build_revision == env!("SCRIBE_BUILD_REVISION")
+            && self.app_protocol_version == manifest::APP_PROTOCOL_VERSION
+            && self.pack_id == entry.pack_id
+            && self.pack_version == entry.pack_version
+            && self.pack_digest == entry.pack_digest
+            && self.security_epoch == entry.security_epoch
+            && self.runtime_abi_version == entry.runtime_abi_version
+            && self.backend == entry.backend
+            && self.provider == entry.provider
+            && self.target_os == entry.target_os
+            && self.target_arch == entry.target_arch
+            && self.worker_relative_path == entry.worker_relative_path
+            && self.root == entry.root
+            && self.installed_size_bytes == entry.installed_size_bytes
+            && self.compressed_size_bytes == entry.compressed_size_bytes
+            && self.files == entry.files
+    }
+}
+
+const EMBEDDED_PACK_RELEASE_AUTHORITY: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/scribe_gpu_pack_release_authority.json"
+));
+
+fn validated_release_authority(
+    catalog_bytes: &[u8],
+    authority_bytes: &[u8],
+) -> Option<ValidatedReleaseAuthority> {
+    let authority = validated_release_authority_document(authority_bytes)?;
+    if !manifest::is_canonical_sha256(&authority.catalog_sha256)
+        || format!("{:x}", Sha256::digest(catalog_bytes)) != authority.catalog_sha256
+    {
+        return None;
+    }
+    let Ok(catalog) = serde_json::from_slice::<PackCatalog>(catalog_bytes) else {
+        return None;
+    };
+    if catalog.schema_version != 1
+        || catalog.packs.len() != authority.entries.len()
+        || !catalog
+            .packs
+            .iter()
+            .zip(&authority.entries)
+            .all(|(catalog, authority)| authority.matches_catalog_entry(catalog))
+    {
+        return None;
+    }
+    Some(ValidatedReleaseAuthority {
+        release_security_epoch: authority.release_security_epoch,
+        keychain_access_group: authority.keychain_access_group,
+    })
+}
+
+fn validated_release_authority_document(authority_bytes: &[u8]) -> Option<PackReleaseAuthority> {
+    let authority = serde_json::from_slice::<PackReleaseAuthority>(authority_bytes).ok()?;
+    if authority.schema_version != 2
+        || authority.entries.len() > MAX_PRODUCTION_PACKS
+        || serde_json::to_vec(&authority).ok().as_deref() != Some(authority_bytes)
+        || authority.release_security_epoch > MAX_RELEASE_SECURITY_EPOCH
+        || !authority
+            .entries
+            .iter()
+            .all(|entry| entry.security_epoch == authority.release_security_epoch)
+        || (authority.release_security_epoch == 0
+            && (!authority.entries.is_empty() || !authority.keychain_access_group.is_empty()))
+        || (authority.release_security_epoch > 0
+            && !canonical_keychain_access_group(&authority.keychain_access_group))
+    {
+        return None;
+    }
+    Some(authority)
+}
+
+fn catalog_matches_release_authority(catalog_bytes: &[u8], authority_bytes: &[u8]) -> bool {
+    validated_release_authority(catalog_bytes, authority_bytes).is_some()
+}
+
+fn canonical_keychain_access_group(group: &str) -> bool {
+    let Some((team_id, suffix)) = group.split_at_checked(10) else {
+        return false;
+    };
+    suffix == ".com.scribe.local-transcriber"
+        && team_id
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+}
+
+fn release_epoch_identity_matches(
+    authority: &ValidatedReleaseAuthority,
+    target_security_epoch: u64,
+    compiled_group: &str,
+    reviewed_group: &str,
+) -> bool {
+    authority.release_security_epoch > 0
+        && authority.release_security_epoch <= MAX_RELEASE_SECURITY_EPOCH
+        && target_security_epoch == authority.release_security_epoch
+        && compiled_group == authority.keychain_access_group
+        && reviewed_group == authority.keychain_access_group
+        && canonical_keychain_access_group(compiled_group)
+}
+
+/// Rechecks the non-resettable macOS release floor at the final request
+/// activation boundary. A higher epoch observed after this succeeds belongs to
+/// a later request; an already active transcription is never migrated.
+#[cfg(all(target_os = "macos", not(test)))]
+pub(crate) fn revalidate_production_device_epoch(
+    target_security_epoch: Option<u64>,
+) -> Result<(), ()> {
+    let target_security_epoch = target_security_epoch.ok_or(())?;
+    let authority = validated_release_authority_document(EMBEDDED_PACK_RELEASE_AUTHORITY)
+        .map(|authority| ValidatedReleaseAuthority {
+            release_security_epoch: authority.release_security_epoch,
+            keychain_access_group: authority.keychain_access_group,
+        })
+        .ok_or(())?;
+    let compiled_group =
+        option_env!("SCRIBE_MACOS_GPU_ROLLBACK_KEYCHAIN_ACCESS_GROUP").unwrap_or("");
+    let reviewed_group =
+        option_env!("SCRIBE_REVIEWED_MACOS_GPU_ROLLBACK_KEYCHAIN_ACCESS_GROUP").unwrap_or("");
+    if !release_epoch_identity_matches(
+        &authority,
+        target_security_epoch,
+        compiled_group,
+        reviewed_group,
+    ) {
+        return Err(());
+    }
+    device_release_epoch::admit(authority.release_security_epoch).map_err(|_| ())
+}
+
+#[cfg(all(not(target_os = "macos"), not(test)))]
+pub(crate) fn revalidate_production_device_epoch(
+    _target_security_epoch: Option<u64>,
+) -> Result<(), ()> {
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_DEVICE_EPOCH_REJECTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn revalidate_production_device_epoch(
+    _target_security_epoch: Option<u64>,
+) -> Result<(), ()> {
+    TEST_DEVICE_EPOCH_REJECTED.with(|rejected| (!rejected.get()).then_some(()).ok_or(()))
+}
+
+#[cfg(test)]
+pub(crate) fn set_test_device_epoch_rejected(rejected: bool) {
+    TEST_DEVICE_EPOCH_REJECTED.with(|value| value.set(rejected));
+}
+
 /// Verifies the bounded installed catalog and returns retained pack leases plus
 /// categorical, path-free diagnostics for every skipped entry.
 /// It never loads a provider or creates launch authority. A malformed catalog,
 /// absent production trust key, or incompatible pack projects to no GPU route.
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(any(
+    all(windows, target_arch = "x86_64"),
+    all(
+        target_os = "macos",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    )
+))]
 pub(crate) fn discover_production_pack_leases() -> PackLeaseDiscovery {
     discover_pack_leases_from_current_install()
 }
 
-#[cfg(not(all(windows, target_arch = "x86_64")))]
+#[cfg(not(any(
+    all(windows, target_arch = "x86_64"),
+    all(
+        target_os = "macos",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    )
+)))]
 pub(crate) fn discover_production_pack_leases() -> PackLeaseDiscovery {
     PackLeaseDiscovery {
         leases: Vec::new(),
@@ -452,7 +739,13 @@ pub(crate) fn discover_production_pack_leases() -> PackLeaseDiscovery {
     }
 }
 
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(any(
+    all(windows, target_arch = "x86_64"),
+    all(
+        target_os = "macos",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    )
+))]
 fn discover_pack_leases_from_current_install() -> PackLeaseDiscovery {
     let Ok(executable) = std::env::current_exe() else {
         return PackLeaseDiscovery {
@@ -463,7 +756,7 @@ fn discover_pack_leases_from_current_install() -> PackLeaseDiscovery {
             catalog_generation: None,
         };
     };
-    let Some(install_root) = executable.parent() else {
+    let Some(install_root) = production_resource_root_from_executable(&executable) else {
         return PackLeaseDiscovery {
             leases: Vec::new(),
             diagnostics: vec![PackDiscoveryDiagnostic::catalog(
@@ -472,10 +765,39 @@ fn discover_pack_leases_from_current_install() -> PackLeaseDiscovery {
             catalog_generation: None,
         };
     };
-    discover_pack_leases_from_install_root(install_root)
+    discover_pack_leases_from_install_root(&install_root)
 }
 
-#[cfg(all(windows, target_arch = "x86_64"))]
+fn production_resource_root_from_executable(executable: &Path) -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        executable.parent().map(Path::to_path_buf)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos_resource_root_from_executable(executable)
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let _ = executable;
+        None
+    }
+}
+
+fn macos_resource_root_from_executable(executable: &Path) -> Option<PathBuf> {
+    let macos = executable.parent()?;
+    let contents = macos.parent()?;
+    (macos.file_name()? == "MacOS" && contents.file_name()? == "Contents")
+        .then(|| contents.join("Resources"))
+}
+
+#[cfg(any(
+    all(windows, target_arch = "x86_64"),
+    all(
+        target_os = "macos",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    )
+))]
 fn discover_pack_leases_from_install_root(install_root: &Path) -> PackLeaseDiscovery {
     let catalog_path = install_root.join(PACK_CATALOG_NAME);
     let catalog = match read_bounded_catalog(&catalog_path, install_root) {
@@ -499,12 +821,29 @@ fn discover_pack_leases_from_install_root(install_root: &Path) -> PackLeaseDisco
             };
         }
     };
+    #[cfg(target_os = "macos")]
+    let release_authority =
+        match validated_release_authority(&catalog.bytes, EMBEDDED_PACK_RELEASE_AUTHORITY) {
+            Some(authority) => authority,
+            None => {
+                return PackLeaseDiscovery {
+                    leases: Vec::new(),
+                    diagnostics: vec![PackDiscoveryDiagnostic::catalog(
+                        PackDiscoveryIssue::ReleaseAuthorityRejected,
+                    )],
+                    catalog_generation: Some(catalog.fingerprint.generation_id()),
+                };
+            }
+        };
     let cache =
         PRODUCTION_DISCOVERY_CACHE.get_or_init(|| Mutex::new(CatalogDiscoveryCache::default()));
     if let Ok(cache) = cache.lock()
         && let Some(discovery) = cache.lookup(&catalog.fingerprint)
     {
-        return discovery;
+        #[cfg(target_os = "macos")]
+        return enforce_production_discovery_epochs(discovery, &release_authority);
+        #[cfg(windows)]
+        return enforce_production_discovery_epochs(discovery);
     }
     let fingerprint = catalog.fingerprint;
     let generation = fingerprint.generation_id();
@@ -512,26 +851,191 @@ fn discover_pack_leases_from_install_root(install_root: &Path) -> PackLeaseDisco
     if let Ok(mut cache) = cache.lock() {
         cache.replace(fingerprint, discovery.clone());
     }
+    #[cfg(target_os = "macos")]
+    return enforce_production_discovery_epochs(discovery, &release_authority);
+    #[cfg(windows)]
+    enforce_production_discovery_epochs(discovery)
+}
+
+#[cfg(any(
+    all(windows, target_arch = "x86_64"),
+    all(
+        target_os = "macos",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    )
+))]
+#[cfg(windows)]
+fn enforce_production_discovery_epochs(discovery: PackLeaseDiscovery) -> PackLeaseDiscovery {
+    let Ok(directories) = crate::config::project_dirs() else {
+        return reject_discovery_epoch_state(discovery);
+    };
+    enforce_discovery_epochs_at(
+        discovery,
+        directories
+            .data_local_dir()
+            .join("gpu-worker-pack-discovery-state"),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn enforce_production_discovery_epochs(
+    discovery: PackLeaseDiscovery,
+    authority: &ValidatedReleaseAuthority,
+) -> PackLeaseDiscovery {
+    let compiled_group =
+        option_env!("SCRIBE_MACOS_GPU_ROLLBACK_KEYCHAIN_ACCESS_GROUP").unwrap_or("");
+    let reviewed_group =
+        option_env!("SCRIBE_REVIEWED_MACOS_GPU_ROLLBACK_KEYCHAIN_ACCESS_GROUP").unwrap_or("");
+    if authority.release_security_epoch == 0 {
+        return discovery;
+    }
+    if !release_epoch_identity_matches(
+        authority,
+        authority.release_security_epoch,
+        compiled_group,
+        reviewed_group,
+    ) || device_release_epoch::admit(authority.release_security_epoch).is_err()
+    {
+        return reject_device_rollback_authority(discovery);
+    }
+
+    if let Ok(directories) = crate::config::project_dirs() {
+        let _ = admit_local_discovery_ledger(
+            &discovery,
+            directories
+                .data_local_dir()
+                .join("gpu-worker-pack-discovery-state"),
+        );
+    }
     discovery
 }
 
-#[cfg(all(windows, target_arch = "x86_64"))]
+fn enforce_discovery_epochs_at(
+    discovery: PackLeaseDiscovery,
+    state_root: PathBuf,
+) -> PackLeaseDiscovery {
+    if discovery.leases.is_empty() {
+        return discovery;
+    }
+    let ledger = store::DiscoveryEpochLedger::new(state_root);
+    let packs = discovery
+        .leases
+        .iter()
+        .map(|lease| lease.verified_pack())
+        .collect::<Vec<_>>();
+    if ledger.admit(&packs).is_ok() {
+        return discovery;
+    }
+    reject_discovery_epoch_state(discovery)
+}
+
+fn admit_local_discovery_ledger(
+    discovery: &PackLeaseDiscovery,
+    state_root: PathBuf,
+) -> Result<(), store::PackStoreError> {
+    if discovery.leases.is_empty() {
+        return Ok(());
+    }
+    let ledger = store::DiscoveryEpochLedger::new(state_root);
+    let packs = discovery
+        .leases
+        .iter()
+        .map(|lease| lease.verified_pack())
+        .collect::<Vec<_>>();
+    ledger.admit(&packs)
+}
+
+fn reject_discovery_epoch_state(mut discovery: PackLeaseDiscovery) -> PackLeaseDiscovery {
+    discovery
+        .diagnostics
+        .extend(discovery.leases.iter().map(|lease| {
+            let pack = lease.verified_pack();
+            PackDiscoveryDiagnostic::pack(
+                PackDiscoveryIssue::SecurityEpochStateRejected,
+                &pack.pack_id,
+                pack.backend,
+            )
+        }));
+    discovery.leases.clear();
+    discovery
+}
+
+fn reject_device_rollback_authority(mut discovery: PackLeaseDiscovery) -> PackLeaseDiscovery {
+    if discovery.leases.is_empty() {
+        discovery.diagnostics.push(PackDiscoveryDiagnostic::catalog(
+            PackDiscoveryIssue::DeviceRollbackAuthorityRejected,
+        ));
+    } else {
+        discovery
+            .diagnostics
+            .extend(discovery.leases.iter().map(|lease| {
+                let pack = lease.verified_pack();
+                PackDiscoveryDiagnostic::pack(
+                    PackDiscoveryIssue::DeviceRollbackAuthorityRejected,
+                    &pack.pack_id,
+                    pack.backend,
+                )
+            }));
+    }
+    discovery.leases.clear();
+    discovery
+}
+
+#[cfg(test)]
+fn enforce_device_epoch_with_store(
+    discovery: PackLeaseDiscovery,
+    authority: &ValidatedReleaseAuthority,
+    compiled_group: &str,
+    reviewed_group: &str,
+    store: &mut impl device_release_epoch::MarkerStore,
+    local_ledger: impl FnOnce(&PackLeaseDiscovery) -> Result<(), ()>,
+) -> PackLeaseDiscovery {
+    if authority.release_security_epoch == 0 {
+        return discovery;
+    }
+    if !release_epoch_identity_matches(
+        authority,
+        authority.release_security_epoch,
+        compiled_group,
+        reviewed_group,
+    ) || device_release_epoch::admit_with_store(authority.release_security_epoch, store).is_err()
+    {
+        return reject_device_rollback_authority(discovery);
+    }
+    let _ = local_ledger(&discovery);
+    discovery
+}
+
+#[cfg(any(
+    all(windows, target_arch = "x86_64"),
+    all(
+        target_os = "macos",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    )
+))]
 fn verify_catalog_entries(
     install_root: &Path,
     bytes: &[u8],
     catalog_generation: String,
 ) -> PackLeaseDiscovery {
+    #[cfg(windows)]
+    let allowed = &[manifest::PackBackend::Cuda, manifest::PackBackend::Vulkan][..];
+    #[cfg(target_os = "macos")]
+    let allowed = &[manifest::PackBackend::Metal][..];
     let verifier = manifest::PackVerifier::new(
         &manifest::ProductionTrustRoot,
-        manifest::Compatibility::current(&[
-            manifest::PackBackend::Cuda,
-            manifest::PackBackend::Vulkan,
-        ]),
+        manifest::Compatibility::current(allowed),
     );
     verify_catalog_entries_with_verifier(install_root, bytes, catalog_generation, &verifier)
 }
 
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(any(
+    all(windows, target_arch = "x86_64"),
+    all(
+        target_os = "macos",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    )
+))]
 fn verify_catalog_entries_with_verifier(
     install_root: &Path,
     bytes: &[u8],
@@ -560,8 +1064,8 @@ fn verify_catalog_entries_with_verifier(
     let mut leases = Vec::new();
     let mut diagnostics = Vec::new();
     for entry in catalog.packs {
-        if entry.target_os != "windows"
-            || entry.target_arch != "x86_64"
+        if entry.target_os != std::env::consts::OS
+            || entry.target_arch != std::env::consts::ARCH
             || entry.runtime_abi_version != manifest::RUNTIME_ABI_VERSION
             || entry.installed_size_bytes == 0
             || entry.compressed_size_bytes == 0
@@ -609,6 +1113,17 @@ fn verify_catalog_entries_with_verifier(
             ));
             continue;
         };
+        #[cfg(target_os = "macos")]
+        if entry.backend == manifest::PackBackend::Metal
+            && !single_executable_signed_payload(&lease)
+        {
+            diagnostics.push(PackDiscoveryDiagnostic::pack(
+                PackDiscoveryIssue::SignatureOrInventoryRejected,
+                &entry.pack_id,
+                entry.backend,
+            ));
+            continue;
+        }
         let observed = lease.verified_pack();
         let mut expected_files = lease
             .copy_entries()
@@ -649,43 +1164,105 @@ fn verify_catalog_entries_with_verifier(
     }
 }
 
-#[cfg(all(windows, target_arch = "x86_64"))]
+/// Stage 6 macOS packs deliberately carry no auxiliary payload. Retained
+/// executable authority is sufficient for the one signed worker, while
+/// descriptor-bound dependency loading remains a separately deferred design.
+fn single_executable_signed_payload(lease: &manifest::VerifiedPackLease) -> bool {
+    let worker = lease.verified_pack().worker_relative_path.as_str();
+    let mut payload = lease.copy_entries().iter().filter(|entry| {
+        entry.path != manifest::MANIFEST_NAME && entry.path != manifest::SIGNATURE_NAME
+    });
+    payload.next().is_some_and(|entry| entry.path == worker) && payload.next().is_none()
+}
+
+#[cfg(any(
+    all(windows, target_arch = "x86_64"),
+    all(
+        target_os = "macos",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    )
+))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct CatalogFingerprint {
     install_root: PathBuf,
+    #[cfg(windows)]
     volume_serial_number: u32,
+    #[cfg(windows)]
     file_index: u64,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
     content_sha256: [u8; 32],
 }
 
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(any(
+    all(windows, target_arch = "x86_64"),
+    all(
+        target_os = "macos",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    )
+))]
 impl CatalogFingerprint {
     fn generation_id(&self) -> String {
-        format!(
-            "{:08x}{:016x}{}",
-            self.volume_serial_number,
-            self.file_index,
-            self.content_sha256
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>()
-        )
+        #[cfg(windows)]
+        {
+            format!(
+                "{:08x}{:016x}{}",
+                self.volume_serial_number,
+                self.file_index,
+                self.content_sha256
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            )
+        }
+        #[cfg(unix)]
+        {
+            format!(
+                "{:016x}{:016x}{}",
+                self.device,
+                self.inode,
+                self.content_sha256
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            )
+        }
     }
 }
 
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(any(
+    all(windows, target_arch = "x86_64"),
+    all(
+        target_os = "macos",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    )
+))]
 struct CatalogSnapshot {
     bytes: Vec<u8>,
     fingerprint: CatalogFingerprint,
 }
 
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(any(
+    all(windows, target_arch = "x86_64"),
+    all(
+        target_os = "macos",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    )
+))]
 #[derive(Default)]
 struct CatalogDiscoveryCache {
     entry: Option<(CatalogFingerprint, PackLeaseDiscovery)>,
 }
 
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(any(
+    all(windows, target_arch = "x86_64"),
+    all(
+        target_os = "macos",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    )
+))]
 impl CatalogDiscoveryCache {
     fn lookup(&self, fingerprint: &CatalogFingerprint) -> Option<PackLeaseDiscovery> {
         self.entry
@@ -699,10 +1276,22 @@ impl CatalogDiscoveryCache {
     }
 }
 
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(any(
+    all(windows, target_arch = "x86_64"),
+    all(
+        target_os = "macos",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    )
+))]
 static PRODUCTION_DISCOVERY_CACHE: OnceLock<Mutex<CatalogDiscoveryCache>> = OnceLock::new();
 
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(any(
+    all(windows, target_arch = "x86_64"),
+    all(
+        target_os = "macos",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    )
+))]
 #[derive(Debug)]
 enum CatalogReadFailure {
     Unavailable,
@@ -770,6 +1359,50 @@ fn read_bounded_catalog(
     })
 }
 
+#[cfg(all(
+    target_os = "macos",
+    any(target_arch = "aarch64", target_arch = "x86_64")
+))]
+fn read_bounded_catalog(
+    path: &Path,
+    install_root: &Path,
+) -> Result<CatalogSnapshot, CatalogReadFailure> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let file = options.open(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            CatalogReadFailure::Unavailable
+        } else {
+            CatalogReadFailure::Rejected
+        }
+    })?;
+    let metadata = file.metadata().map_err(|_| CatalogReadFailure::Rejected)?;
+    if !metadata.is_file() || metadata.nlink() != 1 || metadata.len() > MAX_PACK_CATALOG_BYTES {
+        return Err(CatalogReadFailure::Rejected);
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    File::take(file, MAX_PACK_CATALOG_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| CatalogReadFailure::Rejected)?;
+    if bytes.len() as u64 > MAX_PACK_CATALOG_BYTES {
+        return Err(CatalogReadFailure::Rejected);
+    }
+    let content_sha256: [u8; 32] = Sha256::digest(&bytes).into();
+    Ok(CatalogSnapshot {
+        bytes,
+        fingerprint: CatalogFingerprint {
+            install_root: install_root.to_path_buf(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            content_sha256,
+        },
+    })
+}
+
 /// Private packaging entrypoint. Stage 4's empty production trust root means a
 /// non-empty release pack declaration always fails until key provisioning is
 /// deliberately completed in a later stage.
@@ -812,6 +1445,7 @@ pub(crate) fn maybe_run_pack_verifier() -> Option<i32> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::sync::Arc;
 
     use super::manifest::PackBackend;
@@ -819,7 +1453,97 @@ mod tests {
     use super::{PackDiscoveryDiagnostic, PackDiscoveryIssue};
     use super::{ResolverHelloBindingBridge, VerifiedPackLaunchBinding};
 
-    #[cfg(windows)]
+    #[derive(Default)]
+    struct FixtureDeviceStore {
+        markers: Vec<super::device_release_epoch::EpochMarker>,
+        scans: usize,
+    }
+
+    impl super::device_release_epoch::MarkerStore for FixtureDeviceStore {
+        fn scan(
+            &mut self,
+        ) -> Result<
+            Vec<super::device_release_epoch::EpochMarker>,
+            super::device_release_epoch::AdmissionError,
+        > {
+            self.scans += 1;
+            Ok(self.markers.clone())
+        }
+
+        fn append(
+            &mut self,
+            marker: &super::device_release_epoch::EpochMarker,
+        ) -> Result<(), super::device_release_epoch::AdmissionError> {
+            if !self.markers.contains(marker) {
+                self.markers.push(marker.clone());
+            }
+            Ok(())
+        }
+    }
+
+    fn release_authority(epoch: u64) -> super::ValidatedReleaseAuthority {
+        super::ValidatedReleaseAuthority {
+            release_security_epoch: epoch,
+            keychain_access_group: "ABCDE12345.com.scribe.local-transcriber".to_owned(),
+        }
+    }
+
+    #[test]
+    fn keychain_access_group_is_bound_to_the_reviewed_app_namespace() {
+        assert!(super::canonical_keychain_access_group(
+            "ABCDE12345.com.scribe.local-transcriber"
+        ));
+        for rejected in [
+            "",
+            "abcde12345.com.scribe.local-transcriber",
+            "ABCDE1234.com.scribe.local-transcriber",
+            "ABCDE12345.com.scribe.other",
+            "ABCDE12345.*",
+        ] {
+            assert!(
+                !super::canonical_keychain_access_group(rejected),
+                "unexpected Keychain namespace accepted: {rejected}"
+            );
+        }
+
+        let authority = release_authority(1);
+        assert!(super::release_epoch_identity_matches(
+            &authority,
+            1,
+            "ABCDE12345.com.scribe.local-transcriber",
+            "ABCDE12345.com.scribe.local-transcriber",
+        ));
+        assert!(!super::release_epoch_identity_matches(
+            &authority,
+            1,
+            "ABCDE12345.com.scribe.local-transcriber",
+            "OTHER12345.com.scribe.local-transcriber",
+        ));
+    }
+
+    #[test]
+    fn macos_bundle_executable_maps_to_resources_catalog_root() {
+        let executable = std::path::Path::new("/Applications/Scribe.app/Contents/MacOS/Scribe");
+        assert_eq!(
+            super::macos_resource_root_from_executable(executable),
+            Some(std::path::PathBuf::from(
+                "/Applications/Scribe.app/Contents/Resources"
+            ))
+        );
+        assert!(
+            super::macos_resource_root_from_executable(std::path::Path::new(
+                "/Applications/Scribe.app/contents/MacOS/Scribe"
+            ))
+            .is_none()
+        );
+        assert!(
+            super::macos_resource_root_from_executable(std::path::Path::new(
+                "/usr/local/bin/Scribe"
+            ))
+            .is_none()
+        );
+    }
+
     fn fixture_catalog_bytes(lease: &VerifiedPackLease, files: Vec<String>) -> Vec<u8> {
         let pack = lease.verified_pack();
         let relative_root = format!(
@@ -848,6 +1572,198 @@ mod tests {
             }]
         }))
         .unwrap()
+    }
+
+    fn authority_bytes_for_catalog(catalog_bytes: &[u8]) -> Vec<u8> {
+        use sha2::{Digest, Sha256};
+
+        let catalog: super::PackCatalog = serde_json::from_slice(catalog_bytes).unwrap();
+        let release_security_epoch = catalog
+            .packs
+            .first()
+            .map(|entry| entry.security_epoch)
+            .unwrap_or(1);
+        assert!(
+            catalog
+                .packs
+                .iter()
+                .all(|entry| entry.security_epoch == release_security_epoch),
+            "release authority fixtures require one release-wide security epoch"
+        );
+        let entries = catalog
+            .packs
+            .into_iter()
+            .map(|entry| super::PackReleaseAuthorityEntry {
+                app_version: env!("CARGO_PKG_VERSION").to_owned(),
+                build_revision: env!("SCRIBE_BUILD_REVISION").to_owned(),
+                app_protocol_version: super::manifest::APP_PROTOCOL_VERSION,
+                pack_id: entry.pack_id,
+                pack_version: entry.pack_version,
+                pack_digest: entry.pack_digest,
+                security_epoch: entry.security_epoch,
+                runtime_abi_version: entry.runtime_abi_version,
+                backend: entry.backend,
+                provider: entry.provider,
+                target_os: entry.target_os,
+                target_arch: entry.target_arch,
+                worker_relative_path: entry.worker_relative_path,
+                root: entry.root,
+                installed_size_bytes: entry.installed_size_bytes,
+                compressed_size_bytes: entry.compressed_size_bytes,
+                files: entry.files,
+            })
+            .collect();
+        serde_json::to_vec(&super::PackReleaseAuthority {
+            schema_version: 2,
+            catalog_sha256: format!("{:x}", Sha256::digest(catalog_bytes)),
+            release_security_epoch,
+            keychain_access_group: "ABCDE12345.com.scribe.local-transcriber".to_owned(),
+            entries,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn embedded_empty_release_authority_is_canonical_exact_and_default_deny() {
+        let empty_catalog = br#"{"schema_version":1,"packs":[]}"#;
+        assert_eq!(
+            serde_json::to_vec(
+                &serde_json::from_slice::<super::PackReleaseAuthority>(
+                    super::EMBEDDED_PACK_RELEASE_AUTHORITY
+                )
+                .unwrap()
+            )
+            .unwrap(),
+            super::EMBEDDED_PACK_RELEASE_AUTHORITY
+        );
+        assert!(super::catalog_matches_release_authority(
+            empty_catalog,
+            super::EMBEDDED_PACK_RELEASE_AUTHORITY
+        ));
+
+        let state = super::manifest::test_support::temp_root("empty-authority-no-state")
+            .join("discovery-state");
+        let discovery = super::PackLeaseDiscovery {
+            leases: Vec::new(),
+            diagnostics: Vec::new(),
+            catalog_generation: Some("empty-authority".to_owned()),
+        };
+        assert!(
+            super::enforce_discovery_epochs_at(discovery, state.clone())
+                .leases
+                .is_empty()
+        );
+        assert!(
+            !state.exists(),
+            "empty authority must not create epoch state"
+        );
+    }
+
+    #[test]
+    fn release_authority_requires_exact_build_pack_target_and_inventory_binding() {
+        let root = super::manifest::test_support::temp_root("release-authority-binding");
+        let (_, lease) = super::manifest::test_support::leased_fixture(&root);
+        let pack = lease.verified_pack();
+        let relative_root = format!(
+            "workers/packs/{}/{}/{}",
+            pack.pack_id.as_str(),
+            pack.pack_version.as_str(),
+            pack.pack_digest
+        );
+        let mut files = lease
+            .copy_entries()
+            .iter()
+            .map(|entry| format!("{relative_root}/{}", entry.path))
+            .collect::<Vec<_>>();
+        files.sort();
+        let catalog = fixture_catalog_bytes(&lease, files);
+        let exact = authority_bytes_for_catalog(&catalog);
+        assert!(super::catalog_matches_release_authority(&catalog, &exact));
+
+        for field in [
+            "pack_digest",
+            "security_epoch",
+            "runtime_abi_version",
+            "provider",
+            "target_os",
+            "target_arch",
+            "files",
+            "build_revision",
+            "app_version",
+            "app_protocol_version",
+            "release_security_epoch",
+            "keychain_access_group",
+        ] {
+            let mut authority: super::PackReleaseAuthority =
+                serde_json::from_slice(&exact).unwrap();
+            let entry = &mut authority.entries[0];
+            match field {
+                "pack_digest" => entry.pack_digest = "0".repeat(64),
+                "security_epoch" => entry.security_epoch = 99,
+                "runtime_abi_version" => entry.runtime_abi_version = 99,
+                "provider" => entry.provider = "wrong-provider".to_owned(),
+                "target_os" => entry.target_os = "wrong-target_os".to_owned(),
+                "target_arch" => entry.target_arch = "wrong-target_arch".to_owned(),
+                "files" => entry.files = vec!["replacement.dylib".to_owned()],
+                "build_revision" => entry.build_revision = "wrong-build_revision".to_owned(),
+                "app_version" => entry.app_version = "wrong-app_version".to_owned(),
+                "app_protocol_version" => entry.app_protocol_version = 99,
+                "release_security_epoch" | "keychain_access_group" => {}
+                _ => unreachable!(),
+            }
+            if field == "release_security_epoch" {
+                authority.release_security_epoch = 0;
+            } else if field == "keychain_access_group" {
+                authority.keychain_access_group = "not canonical".to_owned();
+            }
+            let tampered = serde_json::to_vec(&authority).unwrap();
+            assert!(
+                !super::catalog_matches_release_authority(&catalog, &tampered),
+                "authority mismatch in {field} was accepted"
+            );
+        }
+
+        let mut whitespace_tamper = exact.clone();
+        whitespace_tamper.push(b'\n');
+        assert!(
+            !super::catalog_matches_release_authority(&catalog, &whitespace_tamper),
+            "noncanonical authority bytes were accepted"
+        );
+
+        let mut unsafe_epoch: super::PackReleaseAuthority = serde_json::from_slice(&exact).unwrap();
+        unsafe_epoch.release_security_epoch = super::MAX_RELEASE_SECURITY_EPOCH + 1;
+        for entry in &mut unsafe_epoch.entries {
+            entry.security_epoch = unsafe_epoch.release_security_epoch;
+        }
+        assert!(
+            super::validated_release_authority_document(
+                &serde_json::to_vec(&unsafe_epoch).unwrap()
+            )
+            .is_none(),
+            "epochs above the exact JSON integer range were accepted"
+        );
+
+        let empty_catalog = br#"{"schema_version":1,"packs":[]}"#;
+        let mut empty_positive: super::PackReleaseAuthority =
+            serde_json::from_slice(&authority_bytes_for_catalog(empty_catalog)).unwrap();
+        empty_positive.entries.clear();
+        assert!(super::catalog_matches_release_authority(
+            empty_catalog,
+            &serde_json::to_vec(&empty_positive).unwrap()
+        ));
+        empty_positive.release_security_epoch = 0;
+        empty_positive.keychain_access_group.clear();
+        assert!(super::catalog_matches_release_authority(
+            empty_catalog,
+            &serde_json::to_vec(&empty_positive).unwrap()
+        ));
+        empty_positive.keychain_access_group = "ABCDE12345.com.scribe.local-transcriber".to_owned();
+        assert!(!super::catalog_matches_release_authority(
+            empty_catalog,
+            &serde_json::to_vec(&empty_positive).unwrap()
+        ));
+        drop(lease);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     struct FixtureBridge {
@@ -968,6 +1884,341 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn stage_six_single_worker_payload_gate_rejects_auxiliary_files_and_replacement() {
+        use sha2::{Digest, Sha256};
+
+        let valid_root = super::manifest::test_support::temp_root("single-worker-payload");
+        let (_, valid) = super::manifest::test_support::leased_fixture(&valid_root);
+        assert!(super::single_executable_signed_payload(&valid));
+
+        let source_root = super::manifest::test_support::temp_root("auxiliary-payload-source");
+        let source = source_root.join("pack");
+        std::fs::create_dir_all(source.join("lib")).unwrap();
+        std::fs::write(source.join("lib/replaceable.dylib"), b"signed auxiliary").unwrap();
+        let mut manifest = super::manifest::test_support::base_manifest();
+        manifest.payload.push(super::manifest::PayloadEntry {
+            path: "lib/replaceable.dylib".to_owned(),
+            size_bytes: b"signed auxiliary".len() as u64,
+            sha256: format!("{:x}", Sha256::digest(b"signed auxiliary")),
+        });
+        manifest
+            .payload
+            .sort_by(|left, right| left.path.cmp(&right.path));
+        super::manifest::test_support::write_signed(&source, manifest);
+        let (owner, auxiliary) =
+            super::manifest::test_support::lease_existing_fixture(&source).unwrap();
+        assert!(!super::single_executable_signed_payload(&auxiliary));
+
+        let auxiliary_path = auxiliary.verified_pack().root.join("lib/replaceable.dylib");
+        if std::fs::remove_file(&auxiliary_path).is_ok() {
+            std::fs::write(&auxiliary_path, b"replacement auxiliary").unwrap();
+        }
+        assert!(
+            !super::single_executable_signed_payload(&auxiliary),
+            "a retained lease with any auxiliary inventory is rejected before route construction"
+        );
+
+        drop(valid);
+        std::fs::remove_dir_all(valid_root).unwrap();
+        drop(auxiliary);
+        std::fs::remove_dir_all(owner).unwrap();
+        std::fs::remove_dir_all(source_root).unwrap();
+    }
+
+    #[test]
+    fn cached_discovery_is_readmitted_against_persistent_epoch_state() {
+        fn lease_at_epoch(
+            label: &str,
+            epoch: u64,
+        ) -> (
+            std::path::PathBuf,
+            std::path::PathBuf,
+            Arc<VerifiedPackLease>,
+        ) {
+            let source_root = super::manifest::test_support::temp_root(label);
+            let source = source_root.join("pack");
+            let mut manifest = super::manifest::test_support::base_manifest();
+            manifest.security_epoch = epoch;
+            super::manifest::test_support::write_signed(&source, manifest);
+            let (owner, lease) =
+                super::manifest::test_support::lease_existing_fixture(&source).unwrap();
+            (source_root, owner, Arc::new(lease))
+        }
+
+        let state_parent = super::manifest::test_support::temp_root("catalog-epoch-state");
+        let state = state_parent.join("private");
+        let (high_source, high_owner, high) = lease_at_epoch("catalog-epoch-high", 3);
+        let high_discovery = super::PackLeaseDiscovery {
+            leases: vec![Arc::clone(&high)],
+            diagnostics: Vec::new(),
+            catalog_generation: Some("high-cache-entry".to_owned()),
+        };
+        assert_eq!(
+            super::enforce_discovery_epochs_at(high_discovery.clone(), state.clone())
+                .leases
+                .len(),
+            1
+        );
+        assert_eq!(
+            super::enforce_discovery_epochs_at(high_discovery, state.clone())
+                .leases
+                .len(),
+            1,
+            "a cached same-epoch lease remains admissible"
+        );
+
+        let (low_source, low_owner, low) = lease_at_epoch("catalog-epoch-low", 2);
+        let rejected = super::enforce_discovery_epochs_at(
+            super::PackLeaseDiscovery {
+                leases: vec![Arc::clone(&low)],
+                diagnostics: Vec::new(),
+                catalog_generation: Some("rolled-back-cache-entry".to_owned()),
+            },
+            state,
+        );
+        assert!(rejected.leases.is_empty());
+        assert_eq!(
+            rejected.diagnostics[0].issue,
+            PackDiscoveryIssue::SecurityEpochStateRejected
+        );
+
+        drop(high);
+        drop(low);
+        for root in [high_source, high_owner, low_source, low_owner, state_parent] {
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn fresh_and_cached_discovery_fail_closed_quickly_on_epoch_lock_contention() {
+        let pack_root = super::manifest::test_support::temp_root("discovery-contention-pack");
+        let (_, lease) = super::manifest::test_support::leased_fixture(&pack_root);
+        let discovery = super::PackLeaseDiscovery {
+            leases: vec![Arc::new(lease)],
+            diagnostics: Vec::new(),
+            catalog_generation: Some("contended-catalog".to_owned()),
+        };
+        let state_parent = super::manifest::test_support::temp_root("discovery-contention-state");
+        let state = state_parent.join("private");
+        let held =
+            super::store::exclusive_file_lock(&state.join(super::store::DISCOVERY_EPOCH_LOCK_NAME))
+                .unwrap();
+
+        for admission in ["fresh", "cached"] {
+            let started = std::time::Instant::now();
+            let rejected = super::enforce_discovery_epochs_at(discovery.clone(), state.clone());
+            assert!(rejected.leases.is_empty(), "{admission} admission escaped");
+            assert_eq!(
+                rejected.diagnostics[0].issue,
+                PackDiscoveryIssue::SecurityEpochStateRejected
+            );
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(2),
+                "{admission} discovery lock contention was not bounded"
+            );
+        }
+        assert!(
+            !state.join("discovery-security-epochs.json").exists(),
+            "contended discovery mutated epoch state"
+        );
+
+        drop(held);
+        drop(discovery);
+        std::fs::remove_dir_all(pack_root).unwrap();
+        std::fs::remove_dir_all(state_parent).unwrap();
+    }
+
+    #[test]
+    fn exact_release_authority_survives_whole_ledger_directory_deletion() {
+        fn catalog_for_lease(lease: &VerifiedPackLease) -> Vec<u8> {
+            let pack = lease.verified_pack();
+            let relative_root = format!(
+                "workers/packs/{}/{}/{}",
+                pack.pack_id.as_str(),
+                pack.pack_version.as_str(),
+                pack.pack_digest
+            );
+            let mut files = lease
+                .copy_entries()
+                .iter()
+                .map(|entry| format!("{relative_root}/{}", entry.path))
+                .collect::<Vec<_>>();
+            files.sort();
+            fixture_catalog_bytes(lease, files)
+        }
+
+        fn lease_at_epoch(
+            label: &str,
+            epoch: u64,
+        ) -> (std::path::PathBuf, std::path::PathBuf, VerifiedPackLease) {
+            let root = super::manifest::test_support::temp_root(label);
+            let source = root.join("pack");
+            let mut manifest = super::manifest::test_support::base_manifest();
+            manifest.security_epoch = epoch;
+            super::manifest::test_support::write_signed(&source, manifest);
+            let (owner, lease) =
+                super::manifest::test_support::lease_existing_fixture(&source).unwrap();
+            (root, owner, lease)
+        }
+
+        let state_parent = super::manifest::test_support::temp_root("authority-delete-state");
+        let state = state_parent.join("dedicated-ledger");
+        let (high_root, high_owner, high) = lease_at_epoch("authority-high-pack", 3);
+        let high_catalog = catalog_for_lease(&high);
+        let embedded_authority = authority_bytes_for_catalog(&high_catalog);
+        assert!(super::catalog_matches_release_authority(
+            &high_catalog,
+            &embedded_authority
+        ));
+        super::store::DiscoveryEpochLedger::new(&state)
+            .admit(&[high.verified_pack()])
+            .unwrap();
+        std::fs::remove_dir_all(&state).unwrap();
+
+        let (low_root, low_owner, low) = lease_at_epoch("authority-low-pack", 2);
+        let low_catalog = catalog_for_lease(&low);
+        assert!(
+            !super::catalog_matches_release_authority(&low_catalog, &embedded_authority),
+            "deleting the whole ledger must not authorize an older signed pack"
+        );
+        assert!(
+            !state.exists(),
+            "release-authority rejection must happen before ledger admission"
+        );
+
+        drop(high);
+        drop(low);
+        for root in [high_root, high_owner, low_root, low_owner, state_parent] {
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn deleted_app_data_cannot_reset_device_release_floor() {
+        let mut device = FixtureDeviceStore::default();
+        super::device_release_epoch::admit_with_store(8, &mut device).unwrap();
+
+        let root = super::manifest::test_support::temp_root("device-floor-old-app");
+        let (_, lease) = super::manifest::test_support::leased_fixture(&root);
+        let discovery = super::PackLeaseDiscovery {
+            leases: vec![Arc::new(lease)],
+            diagnostics: Vec::new(),
+            catalog_generation: Some("matching-old-signed-authority".to_owned()),
+        };
+        let local_ledger_called = Cell::new(false);
+        let rejected = super::enforce_device_epoch_with_store(
+            discovery,
+            &release_authority(7),
+            "ABCDE12345.com.scribe.local-transcriber",
+            "ABCDE12345.com.scribe.local-transcriber",
+            &mut device,
+            |_| {
+                local_ledger_called.set(true);
+                Ok(())
+            },
+        );
+        assert!(rejected.leases.is_empty());
+        assert_eq!(
+            rejected.diagnostics[0].issue,
+            PackDiscoveryIssue::DeviceRollbackAuthorityRejected
+        );
+        assert!(
+            !local_ledger_called.get(),
+            "device denial must precede the deleted app-data ledger"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cached_discovery_rechecks_device_authority_and_local_ledger_is_advisory() {
+        let root = super::manifest::test_support::temp_root("device-floor-cached");
+        let (_, lease) = super::manifest::test_support::leased_fixture(&root);
+        let discovery = super::PackLeaseDiscovery {
+            leases: vec![Arc::new(lease)],
+            diagnostics: Vec::new(),
+            catalog_generation: Some("cached-authority".to_owned()),
+        };
+        let mut device = FixtureDeviceStore::default();
+        for _ in ["fresh", "cached"] {
+            let admitted = super::enforce_device_epoch_with_store(
+                discovery.clone(),
+                &release_authority(5),
+                "ABCDE12345.com.scribe.local-transcriber",
+                "ABCDE12345.com.scribe.local-transcriber",
+                &mut device,
+                |_| Err(()),
+            );
+            assert_eq!(
+                admitted.leases.len(),
+                1,
+                "a failed app-data ledger must not override the device authority"
+            );
+        }
+        assert_eq!(device.scans, 4, "fresh and cached paths each scan twice");
+        drop(discovery);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn positive_empty_catalog_revocation_raises_release_floor() {
+        let empty = super::PackLeaseDiscovery {
+            leases: Vec::new(),
+            diagnostics: Vec::new(),
+            catalog_generation: Some("empty-revocation".to_owned()),
+        };
+        let mut device = FixtureDeviceStore::default();
+        let admitted = super::enforce_device_epoch_with_store(
+            empty.clone(),
+            &release_authority(12),
+            "ABCDE12345.com.scribe.local-transcriber",
+            "ABCDE12345.com.scribe.local-transcriber",
+            &mut device,
+            |_| Ok(()),
+        );
+        assert!(admitted.diagnostics.is_empty());
+        let rejected = super::enforce_device_epoch_with_store(
+            empty,
+            &release_authority(11),
+            "ABCDE12345.com.scribe.local-transcriber",
+            "ABCDE12345.com.scribe.local-transcriber",
+            &mut device,
+            |_| Ok(()),
+        );
+        assert_eq!(
+            rejected.diagnostics[0].issue,
+            PackDiscoveryIssue::DeviceRollbackAuthorityRejected
+        );
+    }
+
+    #[test]
+    fn positive_epoch_requires_exact_compiled_keychain_group() {
+        let discovery = super::PackLeaseDiscovery {
+            leases: Vec::new(),
+            diagnostics: Vec::new(),
+            catalog_generation: Some("group-mismatch".to_owned()),
+        };
+        for compiled in ["", "ABCDE12345.com.scribe.other"] {
+            let mut device = FixtureDeviceStore::default();
+            let rejected = super::enforce_device_epoch_with_store(
+                discovery.clone(),
+                &release_authority(1),
+                compiled,
+                "ABCDE12345.com.scribe.local-transcriber",
+                &mut device,
+                |_| Ok(()),
+            );
+            assert_eq!(
+                rejected.diagnostics[0].issue,
+                PackDiscoveryIssue::DeviceRollbackAuthorityRejected
+            );
+            assert_eq!(
+                device.scans, 0,
+                "namespace mismatch must not touch Keychain"
+            );
+        }
     }
 
     #[test]
