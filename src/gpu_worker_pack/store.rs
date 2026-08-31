@@ -2779,6 +2779,9 @@ mod tests {
     }
 
     fn restore_pack_id_directory(link: &Path, external: &Path) {
+        #[cfg(unix)]
+        fs::remove_file(link).unwrap();
+        #[cfg(windows)]
         fs::remove_dir(link).unwrap();
         fs::rename(external, link).unwrap();
     }
