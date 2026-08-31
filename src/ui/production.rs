@@ -31,7 +31,7 @@ pub(crate) fn acceleration_diagnostics(
         .map(|skipped| {
             format!(
                 "{} ({}) — {}",
-                skipped.target.backend.label(),
+                skipped.target.kind_label(),
                 skipped.target.display_name,
                 skipped.reason.label()
             )
@@ -67,17 +67,17 @@ pub(crate) fn acceleration_diagnostics(
                 .unwrap_or(target);
             format!(
                 "{} ({}) failed: {}; next: {} ({})",
-                fallback.target.backend.label(),
+                fallback.target.kind_label(),
                 fallback.target.display_name,
                 fallback_category_label(fallback.category),
-                next.backend.label(),
+                next.kind_label(),
                 next.display_name,
             )
         })
         .collect::<Vec<_>>();
     let pack = target.pack.as_ref();
     Some(AccelerationDiagnosticsView {
-        selected_backend: target.backend.label().to_owned(),
+        selected_backend: target.kind_label().to_owned(),
         selected_device: target.display_name.clone(),
         selection_reason: selection.reason.label().to_owned(),
         skipped_reasons,

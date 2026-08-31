@@ -693,11 +693,7 @@ struct GpuRetryOperation {
 }
 
 fn same_backend_target_identity(left: &BackendTarget, right: &BackendTarget) -> bool {
-    left.backend == right.backend
-        && left.provider_id == right.provider_id
-        && left.device_id == right.device_id
-        && left.driver_version == right.driver_version
-        && left.pack == right.pack
+    left.has_same_runtime_identity(right)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -9737,7 +9733,7 @@ impl LocalTranscriberApp {
                     .fallback_history
                     .iter()
                     .rev()
-                    .find(|fallback| fallback.target.backend.is_gpu())
+                    .find(|fallback| fallback.target.is_gpu())
                     .map(|fallback| fallback.target.clone())
             })
             .or_else(|| {
@@ -9746,7 +9742,7 @@ impl LocalTranscriberApp {
                         .skipped_targets
                         .iter()
                         .find(|skipped| {
-                            skipped.target.backend.is_gpu()
+                            skipped.target.is_gpu()
                                 && matches!(
                                     skipped.reason,
                                     crate::backend_policy::BackendSkipReason::Quarantined
@@ -20063,6 +20059,8 @@ mod layout_tests {
         });
 
         mutate(&mut app, &operation);
+        let expected_acceleration = app.latest_acceleration.clone();
+        let retry_was_active_before_event = app.active_gpu_retry.is_some();
         let (nonce, generation, model_id, preference, target) = event_mutate(&operation);
         app.tx
             .send(test_gpu_retry_event(
@@ -20079,13 +20077,11 @@ mod layout_tests {
                 .map(|notice| notice.message.as_str()),
             Some("sentinel notice")
         );
+        assert_eq!(app.latest_acceleration, expected_acceleration);
         assert_eq!(
-            app.latest_acceleration
-                .as_ref()
-                .map(|state| &state.resolved),
-            Some(&diagnostic)
+            app.active_gpu_retry.is_some(),
+            retry_was_active_before_event && !clears_active_retry
         );
-        assert_eq!(app.active_gpu_retry.is_some(), !clears_active_retry);
     }
 
     #[test]

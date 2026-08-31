@@ -228,6 +228,24 @@ impl BackendTarget {
         }
     }
 
+    /// Compares only the stable runtime binding. Display and live resource
+    /// facts may change without widening an exact retry to another target.
+    pub(crate) fn has_same_runtime_identity(&self, other: &Self) -> bool {
+        self.backend == other.backend
+            && self.provider_id == other.provider_id
+            && self.device_id == other.device_id
+            && self.driver_version == other.driver_version
+            && self.pack == other.pack
+    }
+
+    pub(crate) fn is_gpu(&self) -> bool {
+        self.backend.is_gpu()
+    }
+
+    pub(crate) fn kind_label(&self) -> &'static str {
+        self.backend.label()
+    }
+
     fn is_structurally_valid(&self) -> bool {
         if self.backend.is_gpu() {
             self.device_class.is_gpu()
