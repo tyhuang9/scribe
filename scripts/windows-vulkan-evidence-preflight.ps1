@@ -1,5 +1,26 @@
 Set-StrictMode -Version Latest
 
+if (-not ('ScribeEvidenceNative.SystemDirectory' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+namespace ScribeEvidenceNative {
+  public static class SystemDirectory {
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern uint GetSystemDirectory(StringBuilder buffer, uint size);
+  }
+}
+'@
+}
+
+function Get-ScribeVulkanEvidenceActualSystem32 {
+    $buffer = [Text.StringBuilder]::new(32768)
+    $length = [ScribeEvidenceNative.SystemDirectory]::GetSystemDirectory($buffer, [uint32]$buffer.Capacity)
+    if ($length -eq 0 -or $length -ge $buffer.Capacity) { throw 'GetSystemDirectoryW did not return a bounded System32 path.' }
+    return $buffer.ToString()
+}
+
 function ConvertTo-ScribeVulkanEvidencePci([string]$Value) {
     if ([string]::IsNullOrWhiteSpace($Value)) {
         throw 'NVIDIA PCI identity is missing.'

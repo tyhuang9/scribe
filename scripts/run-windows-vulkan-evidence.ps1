@@ -101,10 +101,9 @@ function Assert-ScribeEvidenceFile([string]$Path, [string]$Label, [UInt64]$MaxBy
     return $full
 }
 
-function Assert-ScribeEvidenceSingleLinkFile([string]$Path, [string]$Label, [UInt64]$MaxBytes) {
+function Assert-ScribeEvidenceSingleLinkFile([string]$Path, [string]$Label, [UInt64]$MaxBytes, [string]$FsutilPath) {
     $full = Assert-ScribeEvidenceFile $Path $Label $MaxBytes
-    $fsutil = (Get-Command fsutil.exe -ErrorAction Stop).Source
-    $links = @(& $fsutil hardlink list $full)
+    $links = @(& $FsutilPath hardlink list $full)
     if ($LASTEXITCODE -ne 0 -or $links.Count -ne 1) { throw "$Label must have exactly one hard link." }
     return $full
 }
@@ -124,9 +123,10 @@ foreach ($name in (Get-ChildItem Env: | Select-Object -ExpandProperty Name)) {
 }
 
 $repositoryRoot = (Get-Item -LiteralPath (Join-Path $PSScriptRoot '..') -Force).FullName.TrimEnd([char[]]@('\', '/'))
-$systemRoot = $env:SystemRoot
-if ([string]::IsNullOrWhiteSpace($systemRoot)) { throw 'SystemRoot is unavailable.' }
-$trustedNvidiaSmi = Assert-ScribeVulkanEvidenceTrustedNvidiaSmi (Join-Path $systemRoot 'System32\nvidia-smi.exe')
+$actualSystem32 = Get-ScribeVulkanEvidenceActualSystem32
+Assert-ScribeEvidenceNoReparse $actualSystem32
+$trustedNvidiaSmi = Assert-ScribeVulkanEvidenceTrustedNvidiaSmi (Join-Path $actualSystem32 'nvidia-smi.exe')
+$trustedFsutil = Assert-ScribeVulkanEvidenceTrustedNvidiaSmi (Join-Path $actualSystem32 'fsutil.exe')
 $autoManifest = Join-Path $repositoryRoot 'runtime-manifests\gpu-auto-qualification-windows-x64.json'
 $expectedAuto = [Text.Encoding]::UTF8.GetBytes("{`"schema_version`":2,`"mode`":`"default_deny`",`"target_os`":`"windows`",`"target_arch`":`"x86_64`",`"entries`":[]}`n")
 $beforeAuto = [IO.File]::ReadAllBytes($autoManifest)
@@ -180,11 +180,16 @@ try {
     $cpuBundle = Join-Path $workRoot 'cpu-worker-bundle'
     New-Item -ItemType Directory -Path $cpuBundle | Out-Null
     Copy-Item -LiteralPath (Join-Path $env:CARGO_TARGET_DIR 'release\scribe-inference-worker.exe') -Destination (Join-Path $cpuBundle 'scribe-inference-worker.exe')
-    $cpuWorker = Assert-ScribeEvidenceSingleLinkFile (Join-Path $cpuBundle 'scribe-inference-worker.exe') 'Materialized CPU worker' (512MB)
+    $cpuWorker = Assert-ScribeEvidenceSingleLinkFile (Join-Path $cpuBundle 'scribe-inference-worker.exe') 'Materialized CPU worker' (512MB) $trustedFsutil
     $packRoot = Join-Path $workRoot 'fixture-vulkan-pack'
     $packVersion = "fixture-evidence-$($revision.Substring(0, 12))-$([guid]::NewGuid().ToString('N').Substring(0, 12))"
     & (Join-Path $PSScriptRoot 'build-windows-gpu-worker-pack.ps1') -Backend Vulkan -PackVersion $packVersion -OutputDirectory $packRoot -SigningMode Fixture -NativeArchiveDirectory $nativeArchive
     if ($LASTEXITCODE -ne 0) { throw 'Fresh fixture-signed Vulkan pack build failed.' }
+    $packManifest = Get-Content -LiteralPath (Join-Path $packRoot 'manifest.json') -Raw | ConvertFrom-Json
+    if ([string]$packManifest.app_build -cnotmatch ("#" + [regex]::Escape($revision) + '$') -or
+        [string]$packManifest.worker_build -cnotmatch ("#" + [regex]::Escape($revision) + '$')) {
+        throw 'Fixture pack build identity is not bound to the runner-captured source revision.'
+    }
     $evidenceOutput = Join-Path $evidenceRoot 'windows-vulkan-fixture-evidence.json'
     foreach ($forbiddenRoot in @($repositoryRoot, (Join-Path $repositoryRoot 'runtime-manifests'), $packRoot)) {
         if (Test-ScribeEvidenceWithin $evidenceOutput $forbiddenRoot) {

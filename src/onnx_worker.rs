@@ -13311,7 +13311,7 @@ mod tests {
         wav_sha256: String,
         expected_phrase: String,
         expected_stable_device: String,
-        nvidia_baseline: Option<VulkanEvidenceNvidiaBaseline>,
+        nvidia_baseline: VulkanEvidenceNvidiaBaseline,
         output: PathBuf,
     }
 
@@ -13387,8 +13387,7 @@ mod tests {
         model_sha256: String,
         wav_sha256: String,
         gpu: VulkanEvidenceGpu,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        nvidia_baseline: Option<VulkanEvidenceNvidiaBaseline>,
+        nvidia_baseline: VulkanEvidenceNvidiaBaseline,
         cold_runs_per_backend: usize,
         warm_runs_per_backend: usize,
         cpu: VulkanEvidenceBackendRuns,
@@ -13650,16 +13649,15 @@ mod tests {
             )?),
             expected_stable_device: std::env::var("SCRIBE_VULKAN_EVIDENCE_EXPECTED_STABLE_DEVICE")
                 .map_err(|_| anyhow!("set SCRIBE_VULKAN_EVIDENCE_EXPECTED_STABLE_DEVICE"))?,
-            nvidia_baseline: std::env::var("SCRIBE_VULKAN_EVIDENCE_NVIDIA_BASELINE_JSON")
-                .ok()
-                .map(|value| {
-                    if value.len() > 1024 {
-                        bail!("NVIDIA baseline metadata exceeds the bounded harness contract")
-                    }
-                    serde_json::from_str(&value)
-                        .context("NVIDIA baseline metadata is not canonical evidence JSON")
-                })
-                .transpose()?,
+            nvidia_baseline: {
+                let value = std::env::var("SCRIBE_VULKAN_EVIDENCE_NVIDIA_BASELINE_JSON")
+                    .map_err(|_| anyhow!("set SCRIBE_VULKAN_EVIDENCE_NVIDIA_BASELINE_JSON"))?;
+                if value.len() > 1024 {
+                    bail!("NVIDIA baseline metadata exceeds the bounded harness contract")
+                }
+                serde_json::from_str(&value)
+                    .context("NVIDIA baseline metadata is not canonical evidence JSON")?
+            },
             output: output_parent.join(output_name),
         };
         if inputs.expected_phrase.is_empty() || inputs.expected_phrase.len() > 256 {
@@ -13679,16 +13677,15 @@ mod tests {
         {
             bail!("expected stable device must be a canonical lowercase native PCI identity")
         }
-        if let Some(baseline) = &inputs.nvidia_baseline {
-            if !is_bounded_evidence_metadata(&baseline.product, 256)
-                || !is_bounded_evidence_metadata(&baseline.driver, 128)
-                || baseline.memory_total_bytes == 0
-                || baseline.memory_used_bytes > baseline.memory_total_bytes
-                || baseline.gpu_utilization_percent > 10
-                || baseline.memory_used_bytes > baseline.memory_total_bytes / 4
-            {
-                bail!("NVIDIA baseline metadata is noncanonical or fails the idle preflight")
-            }
+        let baseline = &inputs.nvidia_baseline;
+        if !is_bounded_evidence_metadata(&baseline.product, 256)
+            || !is_bounded_evidence_metadata(&baseline.driver, 128)
+            || baseline.memory_total_bytes == 0
+            || baseline.memory_used_bytes > baseline.memory_total_bytes
+            || baseline.gpu_utilization_percent > 10
+            || baseline.memory_used_bytes > baseline.memory_total_bytes / 4
+        {
+            bail!("NVIDIA baseline metadata is noncanonical or fails the idle preflight")
         }
         let repository = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .canonicalize()
@@ -13806,7 +13803,13 @@ mod tests {
                 driver: "windows-display:fixture".to_owned(),
                 memory_total_bytes: 1,
             },
-            nvidia_baseline: None,
+            nvidia_baseline: VulkanEvidenceNvidiaBaseline {
+                product: "NVIDIA fixture".to_owned(),
+                driver: "fixture".to_owned(),
+                memory_total_bytes: 1,
+                memory_used_bytes: 0,
+                gpu_utilization_percent: 0,
+            },
             cold_runs_per_backend: VULKAN_EVIDENCE_COLD_RUNS,
             warm_runs_per_backend: VULKAN_EVIDENCE_WARM_RUNS,
             cpu: VulkanEvidenceBackendRuns {
