@@ -1,8 +1,12 @@
 //! Source-level guard for the Linux-only descriptor-bound worker boundary.
 
+fn normalized(source: &str) -> String {
+    source.replace("\r\n", "\n")
+}
+
 #[test]
 fn linux_launcher_is_exactly_scoped_and_has_no_path_spawn_fallback() {
-    let launcher = include_str!("linux_worker_launch.rs");
+    let launcher = normalized(include_str!("linux_worker_launch.rs"));
     assert!(launcher.contains(
         "#![cfg(all(target_os = \"linux\", target_arch = \"x86_64\", target_env = \"gnu\"))]"
     ));
@@ -61,7 +65,7 @@ fn linux_launcher_is_exactly_scoped_and_has_no_path_spawn_fallback() {
 
 #[test]
 fn launcher_retains_creator_guardian_and_cleans_the_process_group_after_leader_exit() {
-    let launcher = include_str!("linux_worker_launch.rs");
+    let launcher = normalized(include_str!("linux_worker_launch.rs"));
     for required in [
         "struct Guardian {",
         "name(\"scribe-linux-worker-guardian\".to_owned())",
@@ -99,7 +103,7 @@ fn launcher_retains_creator_guardian_and_cleans_the_process_group_after_leader_e
 
 #[test]
 fn leader_exit_is_observed_before_group_cleanup_and_final_reap() {
-    let launcher = include_str!("linux_worker_launch.rs");
+    let launcher = normalized(include_str!("linux_worker_launch.rs"));
     let running = launcher
         .split("pub(crate) fn is_running")
         .nth(1)
@@ -145,8 +149,8 @@ fn leader_exit_is_observed_before_group_cleanup_and_final_reap() {
 
 #[test]
 fn linux_worker_hashes_and_closes_the_exact_sealed_image_fd_for_hello() {
-    let launcher = include_str!("linux_worker_launch.rs");
-    let supervisor = include_str!("onnx_worker.rs");
+    let launcher = normalized(include_str!("linux_worker_launch.rs"));
+    let supervisor = normalized(include_str!("onnx_worker.rs"));
     assert!(
         launcher.contains(
             "pub(crate) const EXECUTABLE_FD_ENV: &str = \"SCRIBE_PRIVATE_EXECUTABLE_FD\""
@@ -198,14 +202,14 @@ fn linux_worker_hashes_and_closes_the_exact_sealed_image_fd_for_hello() {
                 .unwrap()
     );
 
-    let fixture = include_str!("../scripts/linux-worker-launch-fixture.rs");
+    let fixture = normalized(include_str!("../scripts/linux-worker-launch-fixture.rs"));
     assert!(fixture.contains("inherited_image_sha256(3)?"));
     assert!(launcher.contains("IMAGE_SHA256={}"));
 }
 
 #[test]
 fn sealed_snapshot_and_error_pipe_are_kernel_bounded() {
-    let launcher = include_str!("linux_worker_launch.rs");
+    let launcher = normalized(include_str!("linux_worker_launch.rs"));
     let snapshot = launcher
         .split("fn create_sealed_snapshot(")
         .nth(1)
@@ -258,7 +262,7 @@ fn sealed_snapshot_and_error_pipe_are_kernel_bounded() {
 
 #[test]
 fn linux_launcher_workflow_uses_reviewed_immutable_actions() {
-    let workflow = include_str!("../.github/workflows/linux-worker-launch.yml");
+    let workflow = normalized(include_str!("../.github/workflows/linux-worker-launch.yml"));
     assert!(
         workflow.contains("actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0")
     );
@@ -276,13 +280,15 @@ fn linux_launcher_workflow_uses_reviewed_immutable_actions() {
 
 #[test]
 fn manifest_preserves_fhs_paths_and_excludes_desktop_from_authority() {
-    let manifest = include_str!("../runtime-manifests/linux-worker-install-contract-x86_64.json");
-    let build = include_str!("../build.rs");
+    let manifest = normalized(include_str!(
+        "../runtime-manifests/linux-worker-install-contract-x86_64.json"
+    ));
+    let build = normalized(include_str!("../build.rs"));
     assert_eq!(
         manifest.trim_end(),
         "{\"schema_version\":1,\"target\":\"x86_64-unknown-linux-gnu\",\"desktop_path\":\"/usr/bin/local-transcriber\",\"authority_root\":\"/usr/lib/scribe\",\"worker_relative_path\":\"scribe-inference-worker\",\"future_pack_root\":\"workers/packs\"}"
     );
-    let launcher = include_str!("linux_worker_launch.rs");
+    let launcher = normalized(include_str!("linux_worker_launch.rs"));
     let production = launcher
         .split("pub(crate) fn open_production")
         .nth(1)
@@ -305,10 +311,10 @@ fn manifest_preserves_fhs_paths_and_excludes_desktop_from_authority() {
 
 #[test]
 fn desktop_and_worker_route_only_linux_inference_authority_to_execveat() {
-    let main = include_str!("main.rs");
-    let worker_entrypoint = include_str!("bin/scribe-inference-worker.rs");
-    let supervisor = include_str!("onnx_worker.rs");
-    let packs = include_str!("gpu_worker_pack/mod.rs");
+    let main = normalized(include_str!("main.rs"));
+    let worker_entrypoint = normalized(include_str!("bin/scribe-inference-worker.rs"));
+    let supervisor = normalized(include_str!("onnx_worker.rs"));
+    let packs = normalized(include_str!("gpu_worker_pack/mod.rs"));
 
     let exact_cfg = "all(target_os = \"linux\", target_arch = \"x86_64\", target_env = \"gnu\")";
     assert!(main.contains(exact_cfg));
