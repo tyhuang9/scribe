@@ -73,6 +73,12 @@ if command -v cargo >/dev/null; then
   "$tool" author --backend vulkan --target-os linux --target-arch x86_64 --pack-root "$fixture_pack" \
     --pack-id scribe-vulkan-linux-x64 --pack-version 0.1.0-fixture --security-epoch 1 \
     --provider transcribe-cpp-ggml-vulkan --worker-path bin/scribe-inference-worker --fixture-signing >/dev/null
+  first_size="$(bash "$repo_root/scripts/report-linux-worker-pack-sizes.sh" --fixture-pack "$fixture_pack" --tool "$tool")"
+  second_size="$(bash "$repo_root/scripts/report-linux-worker-pack-sizes.sh" --fixture-pack "$fixture_pack" --tool "$tool")"
+  [[ "$first_size" == "$second_size" && "$first_size" == *'"verification":"fixture-only"'* ]] || { echo 'fixture pack size reporting is not deterministic or clearly test-only.' >&2; exit 1; }
+  if bash "$repo_root/scripts/report-linux-worker-pack-sizes.sh" --production-pack "$fixture_pack" --tool "$tool" >/dev/null 2>&1; then
+    echo 'production size reporting accepted fixture trust.' >&2; exit 1
+  fi
   if SOURCE_DATE_EPOCH="$epoch" bash "$repo_root/scripts/build-linux-release-package.sh" --desktop "$desktop" --cpu-worker "$worker" --output "$test_root/untrusted.deb" --version 0.1.0 --gpu-pack "$fixture_pack" >"$test_root/untrusted.out" 2>"$test_root/untrusted.err"; then
     echo 'production assembly accepted a fixture-signed Linux GPU pack.' >&2; exit 1
   fi

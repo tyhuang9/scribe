@@ -189,6 +189,16 @@ idle probes atomically replace that state and restore availability.
 
 ## Packaging and key provisioning
 
+Linux x86_64 uses the same Rust manifest verifier and immutable `PackStore` as
+the other platforms. `scripts/build-linux-release-package.sh` accepts prebuilt
+CPU executables and optional pre-signed pack roots, but the production Linux
+trust root is empty. Consequently CPU-only `.deb` assembly succeeds with an
+exact empty catalog while every nonempty CUDA/Vulkan input fails before
+publication. Fixture keys are confined to author/verifier tests and explicitly
+labeled size evidence. The package verifier requires the canonical FHS tree,
+exact inventory, desktop-to-CPU-worker digest binding, and an empty immutable
+pack directory. See `docs/LINUX_RELEASE_PACKAGING.md`.
+
 `scripts/stage-verified-worker-packs.ps1` accepts only prebuilt, pre-signed pack
 roots. It invokes the compiled production verifier before and after copying,
 stages the immutable layout, writes the bounded catalog, reports installed and
