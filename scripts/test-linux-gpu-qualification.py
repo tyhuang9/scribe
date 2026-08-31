@@ -278,6 +278,12 @@ class QualificationFixtureTests(unittest.TestCase):
         self.assertTrue(lane["checks"]["performance_passed"])
         self.assertEqual(lane["metrics"]["warm"]["cpu"]["end_to_end_ms"], {"p50": 100, "p95": 100})
         self.assertEqual(lane["metrics"]["warm"]["gpu"]["end_to_end_ms"], {"p50": 110, "p95": 110})
+        self.assertEqual(lane["metrics"]["cold"]["cpu"]["end_to_end_ms"], {"p50": 203, "p95": 205})
+        self.assertEqual(lane["metrics"]["cold"]["gpu"]["end_to_end_ms"], {"p50": 183, "p95": 185})
+        self.assertEqual(
+            lane["metrics"]["warm"]["cpu"]["peak_process_memory_bytes"],
+            {"p50": 600_010_240, "p95": 600_019_456},
+        )
         self.assertEqual(lane["metrics"]["warm"]["cpu"]["peak_vram_bytes"], {"p50": 0, "p95": 0})
         self.assertGreater(lane["metrics"]["warm"]["gpu"]["peak_vram_bytes"]["p95"], 0)
 
