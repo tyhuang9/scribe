@@ -24,8 +24,8 @@ function Test-ScribeGpuWorkerKnownCmakeBootstrapFailure([object[]]$Output) {
     $linkLine = [regex]::new('^.*(?:LINK|link) : fatal error LNK1104: cannot open file ''CMakeFiles\\cmTC_[0-9A-Fa-f]+\.dir\\intermediate\.manifest''\s*$', [Text.RegularExpressions.RegexOptions]::CultureInvariant)
     $state = 0
     foreach ($line in $lines) {
-        if ($state -eq 0 -and $crateLine.IsMatch($line)) { $state = 1; continue }
-        if ($state -eq 1 -and $junctionLine.IsMatch($line)) { $state = 2; continue }
+        if ($state -eq 0 -and $junctionLine.IsMatch($line)) { $state = 1; continue }
+        if ($state -eq 1 -and $crateLine.IsMatch($line)) { $state = 2; continue }
         if ($state -eq 2 -and $warningSourceLine.IsMatch($line)) {
             $state = if ($objectPathLine.IsMatch($line)) { 4 } else { 3 }
             continue
