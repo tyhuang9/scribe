@@ -1,0 +1,43 @@
+name: Test Linux GPU qualification evidence
+
+on:
+  push:
+    paths:
+      - '.github/workflows/linux-gpu-qualification.yml'
+      - '.gitattributes'
+      - 'runtime-manifests/gpu-auto-qualification-linux-x86_64.json'
+      - 'runtime-manifests/gpu-runtime-linux-x86_64.json'
+      - 'runtime-manifests/gpu-worker-toolchain-linux-x86_64.json'
+      - 'runtime-manifests/linux-gpu-qualification-plan-x86_64.json'
+      - 'runtime-manifests/linux-gpu-qualification-production-authority.json'
+      - 'scripts/qualify-linux-gpu-evidence.py'
+      - 'scripts/test-linux-gpu-qualification.py'
+      - 'docs/LINUX_GPU_QUALIFICATION.md'
+  pull_request:
+    paths:
+      - '.github/workflows/linux-gpu-qualification.yml'
+      - '.gitattributes'
+      - 'runtime-manifests/gpu-auto-qualification-linux-x86_64.json'
+      - 'runtime-manifests/gpu-runtime-linux-x86_64.json'
+      - 'runtime-manifests/gpu-worker-toolchain-linux-x86_64.json'
+      - 'runtime-manifests/linux-gpu-qualification-plan-x86_64.json'
+      - 'runtime-manifests/linux-gpu-qualification-production-authority.json'
+      - 'scripts/qualify-linux-gpu-evidence.py'
+      - 'scripts/test-linux-gpu-qualification.py'
+      - 'docs/LINUX_GPU_QUALIFICATION.md'
+
+permissions:
+  contents: read
+
+jobs:
+  evidence:
+    strategy:
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - name: Validate fixture-only evidence, deterministic math, and default-deny state
+        run: python3 scripts/test-linux-gpu-qualification.py
