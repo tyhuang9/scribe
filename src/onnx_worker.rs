@@ -8217,7 +8217,7 @@ impl InferenceWorkerRegistry {
                             reason: BackendSelectionReason::RequestedGpu,
                             target: target.clone(),
                             power_source: PowerSource::current(),
-                            power_policy: PowerPolicyDecision::Unrestricted,
+                            power_policy: PowerPolicyDecision::NotApplied,
                             qualification_policy_version: AUTO_QUALIFICATION_POLICY_VERSION,
                             fallback_targets: Vec::new(),
                             fallback_history: Vec::new(),
@@ -10437,6 +10437,7 @@ mod tests {
             pcm_kind: bool,
         },
         RuntimeFailureOnLoad(RuntimeError),
+        RuntimeLoad,
         RuntimeLoadThenExit,
         VadNormal,
         VadCrashOnWindow,
@@ -10839,6 +10840,35 @@ mod tests {
                         error: WireRuntimeError::from_runtime(&error),
                     },
                 );
+            }
+            TestMode::RuntimeLoad => {
+                let (session_id, request_id, control) = read_parent_control(&mut input);
+                let Control::LoadRuntime { preference, .. } = control else {
+                    panic!("expected runtime load request");
+                };
+                respond(
+                    &mut output,
+                    session_id,
+                    request_id,
+                    Control::RuntimeLoaded {
+                        execution: WireRuntimeLoadExecution {
+                            diagnostics: WireRuntimeDiagnostics {
+                                resolved_acceleration: ResolvedAcceleration {
+                                    requested: preference,
+                                    resolved: ComputeDevice::Cpu,
+                                    diagnostic: None,
+                                    selection: None,
+                                },
+                                runtime_location: PathBuf::from("test-worker-runtime"),
+                                warm_reused: false,
+                                model_load_duration_ms: 1,
+                            },
+                            detected_architecture: "test-runtime".to_owned(),
+                            capabilities: RuntimeCapabilities::default(),
+                        },
+                    },
+                );
+                run_normal_worker(&mut input, &mut output);
             }
             TestMode::RuntimeLoadThenExit => {
                 let (session_id, request_id, control) = read_parent_control(&mut input);
@@ -12971,8 +13001,9 @@ mod tests {
             next_correlation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
 
+        let artifact = gguf_artifact_fixture("runtime-response-generation-binding");
         let loaded = inference
-            .load(missing_gguf_artifact(), AccelerationPreference::Cpu)
+            .load(artifact.artifact.clone(), AccelerationPreference::Cpu)
             .unwrap();
 
         assert_eq!(loaded.detected_architecture, "test-runtime");
@@ -13025,6 +13056,33 @@ mod tests {
         })
     }
 
+    struct GgufArtifactFixture {
+        root: PathBuf,
+        artifact: RuntimeArtifact,
+    }
+
+    impl Drop for GgufArtifactFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn gguf_artifact_fixture(label: &str) -> GgufArtifactFixture {
+        let root = test_root(label);
+        let path = root.join("model.gguf");
+        std::fs::write(&path, b"g").unwrap();
+        GgufArtifactFixture {
+            root,
+            artifact: RuntimeArtifact::Gguf(RuntimeModel {
+                id: ModelId::new(label),
+                path,
+                format: ArtifactFormat::Gguf,
+                expected_size_bytes: 1,
+                expected_sha256: format!("{:x}", Sha256::digest(b"g")),
+            }),
+        }
+    }
+
     fn explicit_retry_registry(
         gpu_launcher: Arc<TestLauncher>,
         cpu_launcher: Arc<TestLauncher>,
@@ -13046,13 +13104,14 @@ mod tests {
 
     #[test]
     fn explicit_gpu_retry_loads_only_the_exact_target_without_cpu_fallback() {
-        let gpu_launcher = Arc::new(TestLauncher::new([TestMode::RuntimeLoadThenExit]));
+        let gpu_launcher = Arc::new(TestLauncher::new([TestMode::RuntimeLoad]));
         let cpu_launcher = Arc::new(TestLauncher::new([]));
         let (registry, target) =
             explicit_retry_registry(Arc::clone(&gpu_launcher), Arc::clone(&cpu_launcher));
 
+        let artifact = gguf_artifact_fixture("explicit-gpu-retry-success");
         let execution = registry
-            .retry_gpu(missing_gguf_artifact(), &target)
+            .retry_gpu(artifact.artifact.clone(), &target)
             .expect("exact GPU retry should load the retained target");
         let selection = execution
             .diagnostics
@@ -13061,6 +13120,7 @@ mod tests {
             .expect("exact retry should publish a typed selection");
         assert_eq!(selection.target, target);
         assert_eq!(selection.requested, AccelerationPreference::Gpu);
+        assert_eq!(selection.power_policy, PowerPolicyDecision::NotApplied);
         assert_eq!(gpu_launcher.launches.load(Ordering::Acquire), 1);
         assert_eq!(cpu_launcher.launches.load(Ordering::Acquire), 0);
     }
@@ -13088,20 +13148,20 @@ mod tests {
     }
 
     #[test]
-    fn explicit_gpu_retry_denies_a_target_without_a_health_grant() {
-        let root = test_root("gpu-explicit-retry-denied");
+    fn explicit_gpu_retry_allows_an_available_health_target_without_bypass() {
+        let root = test_root("gpu-explicit-retry-available");
         let health_path = Arc::new(root.join("health.json"));
-        let gpu_launcher = Arc::new(TestLauncher::new([]));
+        let artifact = gguf_artifact_fixture("gpu-explicit-retry-available");
+        let gpu_launcher = Arc::new(TestLauncher::new([TestMode::RuntimeLoad]));
         let cpu_launcher = Arc::new(TestLauncher::new([]));
         let (mut registry, target) =
             explicit_retry_registry(Arc::clone(&gpu_launcher), Arc::clone(&cpu_launcher));
         registry.gpu_health_path = Some(Arc::clone(&health_path));
 
-        let error = registry
-            .retry_gpu(missing_gguf_artifact(), &target)
-            .expect_err("an available target has no explicit retry grant");
-        assert!(error.to_string().contains("not authorized"));
-        assert_eq!(gpu_launcher.launches.load(Ordering::Acquire), 0);
+        registry
+            .retry_gpu(artifact.artifact.clone(), &target)
+            .expect("an available health target does not require a quarantine bypass");
+        assert_eq!(gpu_launcher.launches.load(Ordering::Acquire), 1);
         assert_eq!(cpu_launcher.launches.load(Ordering::Acquire), 0);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -13125,8 +13185,9 @@ mod tests {
                 .record_probe(catalog.clone(), Instant::now());
         }
 
+        let artifact = gguf_artifact_fixture("explicit-gpu-retry-failure");
         let error = registry
-            .retry_gpu(missing_gguf_artifact(), &target)
+            .retry_gpu(artifact.artifact.clone(), &target)
             .expect_err("fixture runtime failure should be returned");
         assert!(matches!(error, RuntimeError::BackendUnavailable(_)));
         assert!(registry.gpu_routes.lock().unwrap().successful.is_none());
@@ -13399,7 +13460,7 @@ mod tests {
         let gpu_launcher = Arc::new(TestLauncher::new([TestMode::RuntimeFailureOnLoad(
             RuntimeError::OutOfMemory("fixture GPU allocation failed".to_owned()),
         )]));
-        let cpu_launcher = Arc::new(TestLauncher::new([TestMode::RuntimeLoadThenExit]));
+        let cpu_launcher = Arc::new(TestLauncher::new([TestMode::RuntimeLoad]));
         let mut gpu_route = verified_gpu_route(
             BackendKind::Cuda,
             "native:pci:0000:01:00.0",
@@ -13425,8 +13486,9 @@ mod tests {
             .record_probe(catalog.clone(), Instant::now());
         registry.gpu_routes_for_testing = Some(catalog);
 
+        let artifact = gguf_artifact_fixture("auto-cpu-fallback-after-oom");
         let execution = registry
-            .load(missing_gguf_artifact(), AccelerationPreference::Auto)
+            .load(artifact.artifact.clone(), AccelerationPreference::Auto)
             .expect("Auto must retain its guaranteed CPU fallback after a pre-output GPU OOM");
 
         assert_eq!(gpu_launcher.launches.load(Ordering::Acquire), 1);
@@ -13481,7 +13543,7 @@ mod tests {
         let _reset = ResetDeviceEpochRejection;
 
         let auto_gpu_launcher = Arc::new(TestLauncher::new([TestMode::Normal]));
-        let auto_cpu_launcher = Arc::new(TestLauncher::new([TestMode::RuntimeLoadThenExit]));
+        let auto_cpu_launcher = Arc::new(TestLauncher::new([TestMode::RuntimeLoad]));
         let mut auto_gpu_route = verified_gpu_route(
             BackendKind::Metal,
             "native:registry:metal-0",
@@ -13495,8 +13557,9 @@ mod tests {
         );
         auto_registry.gpu_routes_for_testing = Some(verified_gpu_catalog(vec![auto_gpu_route]));
 
+        let artifact = gguf_artifact_fixture("auto-rollback-fallback");
         let execution = auto_registry
-            .load(missing_gguf_artifact(), AccelerationPreference::Auto)
+            .load(artifact.artifact.clone(), AccelerationPreference::Auto)
             .expect("Auto must skip a request-bound rollback rejection and use CPU");
         assert_eq!(auto_gpu_launcher.launches.load(Ordering::Acquire), 0);
         assert_eq!(auto_cpu_launcher.launches.load(Ordering::Acquire), 1);
@@ -13583,7 +13646,7 @@ mod tests {
             let gpu_launcher = Arc::new(TestLauncher::new([TestMode::RuntimeFailureOnLoad(
                 runtime_error,
             )]));
-            let cpu_launcher = Arc::new(TestLauncher::new([TestMode::RuntimeLoadThenExit]));
+            let cpu_launcher = Arc::new(TestLauncher::new([TestMode::RuntimeLoad]));
             let mut gpu_route = verified_gpu_route(
                 BackendKind::Vulkan,
                 "native:pci:0000:01:00.0",
@@ -13596,8 +13659,10 @@ mod tests {
             );
             registry.gpu_routes_for_testing = Some(verified_gpu_catalog(vec![gpu_route]));
 
+            let artifact =
+                gguf_artifact_fixture(&format!("auto-provider-failure-{expected_category:?}"));
             let execution = registry
-                .load(missing_gguf_artifact(), AccelerationPreference::Auto)
+                .load(artifact.artifact.clone(), AccelerationPreference::Auto)
                 .expect("a typed pre-output provider failure must retain Auto's CPU fallback");
 
             assert_eq!(gpu_launcher.launches.load(Ordering::Acquire), 1);
@@ -13619,7 +13684,7 @@ mod tests {
         let first_launcher = Arc::new(TestLauncher::new([TestMode::RuntimeFailureOnLoad(
             RuntimeError::OutOfMemory("fixture GPU allocation failed".to_owned()),
         )]));
-        let second_launcher = Arc::new(TestLauncher::new([TestMode::RuntimeLoadThenExit]));
+        let second_launcher = Arc::new(TestLauncher::new([TestMode::RuntimeLoad]));
         let cpu_launcher = Arc::new(TestLauncher::new([]));
         let mut first = verified_gpu_route(
             BackendKind::Cuda,
@@ -13655,8 +13720,9 @@ mod tests {
             inference_supervisor_with_launcher(Arc::clone(&cpu_launcher)),
         );
         registry.gpu_routes_for_testing = Some(catalog);
+        let artifact = gguf_artifact_fixture("auto-second-gpu-fallback");
         let execution = registry
-            .load(missing_gguf_artifact(), AccelerationPreference::Auto)
+            .load(artifact.artifact.clone(), AccelerationPreference::Auto)
             .expect("the second qualified GPU route should win after a pre-output OOM");
 
         assert_eq!(first_launcher.launches.load(Ordering::Acquire), 1);
@@ -14513,9 +14579,10 @@ mod tests {
             route_execution: Arc::new(Mutex::new(())),
             gpu_routes_for_testing: None,
         };
+        let artifact = gguf_artifact_fixture("cpu-fallback-routes-retired");
         assert!(
             registry
-                .load(missing_gguf_artifact(), AccelerationPreference::Cpu)
+                .load(artifact.artifact.clone(), AccelerationPreference::Cpu)
                 .is_err()
         );
         assert_eq!(first.launches.load(Ordering::Acquire), 1);
@@ -14592,9 +14659,10 @@ mod tests {
                 skipped_targets: Vec::new(),
             }),
         };
+        let artifact = gguf_artifact_fixture("gpu-fallback-routes-retired");
         assert!(
             registry
-                .load(missing_gguf_artifact(), AccelerationPreference::Gpu)
+                .load(artifact.artifact.clone(), AccelerationPreference::Gpu)
                 .is_err()
         );
         assert_eq!(first.launches.load(Ordering::Acquire), 1);
