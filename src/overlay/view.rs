@@ -1,7 +1,4 @@
-use std::{
-    cell::Cell,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::{cell::Cell, time::Duration};
 
 use eframe::egui::{self, Color32, RichText, Sense, Stroke, ViewportClass};
 use unicode_segmentation::UnicodeSegmentation;
@@ -41,7 +38,6 @@ const LIVE_WAVEFORM_SIZE: f32 = 30.0;
 const MAX_PREVIEW_GRAPHEMES: usize = 512;
 const MAX_MESSAGE_GRAPHEMES: usize = 256;
 const LIVE_PREVIEW_ROWS: usize = 1;
-const PROGRESS_GLYPHS: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OverlayAction {
@@ -236,22 +232,15 @@ pub(super) fn is_cancellable(state: &OverlayViewState) -> bool {
 /// Screen readers use `status_text` without the decorative glyph.
 pub(super) fn phase_status_label_with_motion(
     phase: OverlayPhase,
-    progress_animation_enabled: bool,
+    _progress_animation_enabled: bool,
 ) -> String {
     if !phase.is_progressing() {
         return phase.status_text().to_owned();
     }
-    let glyph = if progress_animation_enabled
-        && crate::system_preferences::client_area_animations_enabled()
-    {
-        let elapsed = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
-        PROGRESS_GLYPHS[(elapsed / 125) as usize % PROGRESS_GLYPHS.len()]
-    } else {
-        "○"
-    };
+    // The rasterizer supplies a smooth opacity pulse to this fixed-size mark.
+    // Keeping the glyph stable prevents the stepped-width spinner from
+    // nudging status text or changing the native accessibility semantics.
+    let glyph = "○";
     format!("{glyph} {}", phase.status_text())
 }
 
