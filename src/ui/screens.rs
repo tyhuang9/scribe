@@ -7036,7 +7036,10 @@ fn acceleration_diagnostics_panel(
         .rounding(Rounding::same(5.0))
         .inner_margin(Margin::symmetric(12.0, 10.0))
         .show(ui, |ui| {
-            ui.label(RichText::new("GPU diagnostics").strong());
+            let heading = ui.label(RichText::new("GPU diagnostics").strong());
+            ui.ctx().accesskit_node_builder(heading.id, |builder| {
+                builder.set_role(egui::accesskit::Role::Heading);
+            });
             ui.add_space(4.0);
             egui::Grid::new("acceleration-diagnostics-grid")
                 .num_columns(2)
@@ -7121,18 +7124,31 @@ fn acceleration_diagnostics_panel(
             if retry.clicked() {
                 *action = ScreenAction::RetryGpu;
             }
-            if let Some(status) = diagnostics.retry_gpu_status.as_ref() {
-                let color = if status.tone == TranscribeNoticeTone::Error {
-                    colors.error_text
-                } else {
-                    colors.muted_text
-                };
-                let response = ui.label(RichText::new(&status.message).color(color));
-                ui.ctx().accesskit_node_builder(response.id, |builder| {
-                    builder.set_live(egui::accesskit::Live::Polite);
-                    builder.set_live_atomic();
-                });
-            }
+            let retry_status = if diagnostics.retry_gpu_in_flight {
+                "Retrying GPU…"
+            } else {
+                diagnostics
+                    .retry_gpu_status
+                    .as_ref()
+                    .map(|status| status.message.as_str())
+                    .unwrap_or_default()
+            };
+            let retry_status_color = if diagnostics
+                .retry_gpu_status
+                .as_ref()
+                .is_some_and(|status| status.tone == TranscribeNoticeTone::Error)
+            {
+                colors.error_text
+            } else {
+                colors.muted_text
+            };
+            let status = ui.label(RichText::new(retry_status).color(retry_status_color));
+            ui.ctx().accesskit_node_builder(status.id, |builder| {
+                builder.set_role(egui::accesskit::Role::Status);
+                builder.set_name(retry_status);
+                builder.set_live(egui::accesskit::Live::Polite);
+                builder.set_live_atomic();
+            });
         });
 }
 

@@ -6841,6 +6841,10 @@ mod tests {
     fn gpu_diagnostics_fixture_exposes_safe_labels_and_retry_action() {
         let output = render_advanced_diagnostics(960.0, 680.0);
         let names = node_names(&output);
+        assert_eq!(
+            node_matching(&output, |node| node.name() == Some("GPU diagnostics")).role(),
+            egui::accesskit::Role::Heading
+        );
         for visible in [
             "GPU diagnostics",
             "Selected backend",
@@ -6883,6 +6887,8 @@ mod tests {
         let retry_id = named_node_id(&output, "Retrying…");
         let retry = node_matching(&output, |node| node.name() == Some("Retrying…"));
         assert!(retry.is_disabled());
+        let in_flight_status_id = named_node_id(&output, "Retrying GPU…");
+        assert_polite_atomic_notice(&output, "Retrying GPU…");
 
         let (_, action) = render_with_input(
             &ctx,
@@ -6920,10 +6926,34 @@ mod tests {
             .acceleration_diagnostics
             .as_mut()
             .expect("diagnostics fixture")
-            .retry_gpu_status = Some(TranscribeNotice::failure(
-            "GPU retry could not be completed. The previous selection remains active.",
-        ));
+            .retry_gpu_status = Some(TranscribeNotice::information("GPU retry completed."));
         let mut status_page = Fixture::SettingsRecording.page();
+        let completed_output = render_with_input(
+            &ctx,
+            &mut status_data,
+            &mut status_page,
+            960.0,
+            680.0,
+            Vec::new(),
+        )
+        .0;
+        assert!(
+            node_names(&completed_output)
+                .iter()
+                .any(|name| name == "GPU retry completed.")
+        );
+        assert_polite_atomic_notice(&completed_output, "GPU retry completed.");
+
+        let completed_status_id = named_node_id(&completed_output, "GPU retry completed.");
+        assert_eq!(in_flight_status_id, completed_status_id);
+        let status_message =
+            "GPU retry could not be completed. The previous selection remains active.";
+        status_data
+            .settings
+            .acceleration_diagnostics
+            .as_mut()
+            .expect("diagnostics fixture")
+            .retry_gpu_status = Some(TranscribeNotice::failure(status_message));
         let status_output = render_with_input(
             &ctx,
             &mut status_data,
@@ -6933,9 +6963,110 @@ mod tests {
             Vec::new(),
         )
         .0;
-        assert!(node_names(&status_output).iter().any(|name| {
-            name == "GPU retry could not be completed. The previous selection remains active."
-        }));
+        assert!(
+            node_names(&status_output)
+                .iter()
+                .any(|name| name == status_message)
+        );
+        assert_polite_atomic_notice(&status_output, status_message);
+        assert_eq!(
+            completed_status_id,
+            named_node_id(&status_output, status_message)
+        );
+    }
+
+    #[test]
+    fn gpu_retry_is_accesskit_and_keyboard_activated() {
+        let width = 960.0;
+        let height = 680.0;
+
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::SettingsRecording.data();
+        data.route = UiRoute::Settings(SettingsTab::Advanced);
+        let mut page = Fixture::SettingsRecording.page();
+        let initial = render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
+        let retry_id = named_node_id(&initial, "Retry GPU");
+        assert_eq!(
+            render_with_input(
+                &ctx,
+                &mut data,
+                &mut page,
+                width,
+                height,
+                vec![egui::Event::AccessKitActionRequest(
+                    egui::accesskit::ActionRequest {
+                        action: egui::accesskit::Action::Focus,
+                        target: retry_id,
+                        data: None,
+                    },
+                )],
+            )
+            .1,
+            ScreenAction::None
+        );
+        assert_eq!(
+            render_with_input(
+                &ctx,
+                &mut data,
+                &mut page,
+                width,
+                height,
+                vec![egui::Event::AccessKitActionRequest(
+                    egui::accesskit::ActionRequest {
+                        action: egui::accesskit::Action::Default,
+                        target: retry_id,
+                        data: None,
+                    },
+                )],
+            )
+            .1,
+            ScreenAction::RetryGpu
+        );
+
+        for key in [egui::Key::Enter, egui::Key::Space] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            configure_accessible_style(&ctx);
+            let mut data = Fixture::SettingsRecording.data();
+            data.route = UiRoute::Settings(SettingsTab::Advanced);
+            let mut page = Fixture::SettingsRecording.page();
+            let initial =
+                render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
+            let retry_id = named_node_id(&initial, "Retry GPU");
+            assert_eq!(
+                render_with_input(
+                    &ctx,
+                    &mut data,
+                    &mut page,
+                    width,
+                    height,
+                    vec![egui::Event::AccessKitActionRequest(
+                        egui::accesskit::ActionRequest {
+                            action: egui::accesskit::Action::Focus,
+                            target: retry_id,
+                            data: None,
+                        },
+                    )],
+                )
+                .1,
+                ScreenAction::None
+            );
+            assert_eq!(
+                render_with_input(
+                    &ctx,
+                    &mut data,
+                    &mut page,
+                    width,
+                    height,
+                    vec![page_event(key)],
+                )
+                .1,
+                ScreenAction::RetryGpu,
+                "{key:?} should activate Retry GPU"
+            );
+        }
     }
 
     #[test]
