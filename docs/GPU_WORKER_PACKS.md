@@ -62,12 +62,16 @@ ID/version/digest, security epoch, runtime ABI, and the requested GGUF digest
 with an entry. Only matching packs may be probed. After the challenge-bound
 Hello, it performs a second exact comparison of vendor, device class, and
 driver identity while enforcing the entry's minimum total-memory and minimum
-available-memory thresholds. Available memory is a live bounded Hello fact:
+available-memory thresholds. `minimum_available_memory_bytes` is a
+cold/provider-start admission threshold checked against a fresh bounded Hello:
 zero means unavailable and a value above total is rejected. Its successful
 admission catalog may be reused only while the exact same live warm worker owns
-the route; cold, changed, or retired routes normally obtain a fresh Hello. A
-short in-memory CPU-only denial backoff throttles repeated low/unknown-memory or
-power-policy denials, and a changed power fact bypasses it. It is deliberately
+the route. Warm reuse deliberately does not compare post-load free memory,
+because the admitted model itself consumes it. Every cold, changed, or retired
+GPU route requires a fresh Hello before Auto can attempt it. Runtime OOM,
+device-loss, and private-protocol failures invalidate and retire the route.
+A short in-memory CPU-only denial backoff throttles repeated low/unknown-memory
+or power-policy denials, and a changed power fact bypasses it. It is deliberately
 excluded from stable device identity and warm-state fingerprints. The worker
 applies the AC/battery policy after qualification; unknown power is conservative and admits
 only integrated or unified GPUs. CPU is appended as Auto's final fallback.

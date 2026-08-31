@@ -13421,7 +13421,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_route_cache_keeps_live_warm_owner_after_partial_probe_backoff_expires() {
+    fn auto_warm_reuse_tolerates_lower_post_load_memory_only_for_exact_live_supervisor() {
         let launcher = Arc::new(TestLauncher::new([TestMode::Normal]));
         let mut route = verified_gpu_route(
             BackendKind::Cuda,
@@ -13440,6 +13440,11 @@ mod tests {
             supervisor: route.supervisor.clone(),
         };
         let mut catalog = verified_gpu_catalog(vec![route.clone()]);
+        let admitted_available_memory = catalog.routes[0]
+            .target
+            .as_ref()
+            .unwrap()
+            .memory_available_bytes;
         catalog.provider_probe_incomplete = true;
         let fingerprint = catalog.discovery_fingerprint.clone();
         let now = Instant::now();
@@ -13448,6 +13453,11 @@ mod tests {
         cache.record_auto_live_admission_probe(&catalog, now);
         assert!(cache.successful().is_none());
         cache.retain_auto_live_admission(&catalog, &active);
+        // The active model has consumed most of the memory observed by its
+        // cold/provider-start Hello. That lower post-load fact is intentionally
+        // not an admission input for this exact live supervisor.
+        route.target.as_mut().unwrap().memory_available_bytes = 1;
+        assert!(route.target.as_ref().unwrap().memory_available_bytes < admitted_available_memory);
         assert!(matches!(
             cache.auto_live_admission_lookup(
                 &fingerprint,
@@ -13462,19 +13472,21 @@ mod tests {
             "expired partial-probe recovery must not retire the healthy warm winner"
         );
 
-        // No active warm owner means a cold request must obtain a fresh Hello;
-        // the available-memory observation is not a durable route attribute.
+        route.supervisor.retire().expect("test worker retires");
+        let retired_active = route.supervisor.has_live_generation().then_some(&active);
+        assert!(retired_active.is_none());
+        // Cold or retired routes cannot reuse the prior Hello snapshot,
+        // including its pre-load available-memory observation.
         assert!(matches!(
             cache.auto_live_admission_lookup(
                 &fingerprint,
-                None,
+                retired_active,
                 PowerSource::Ac,
                 now + GPU_PROVIDER_PROBE_BACKOFF + Duration::from_millis(1),
             ),
             GpuRouteCatalogLookup::Probe
         ));
         assert!(cache.successful().is_none());
-        route.supervisor.retire().expect("test worker retires");
         assert_eq!(launcher.launches.load(Ordering::Acquire), 1);
     }
 
