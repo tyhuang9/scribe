@@ -47,6 +47,11 @@ pub struct GeneralSettings {
     pub playground_selected_models: Vec<String>,
     pub playground_model_order: Vec<String>,
     pub managed_models: HashMap<String, ManagedModelInstall>,
+    /// Durable authority for one in-flight receipt-backed ONNX removal. The
+    /// record remains until exact filesystem deletion and journal cleanup
+    /// finish, so recovery never treats a self-authored journal as authority.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub pending_onnx_removals: HashMap<String, PendingOnnxRemoval>,
     pub managed_remote_models: HashMap<String, ManagedRemoteModelInstall>,
     pub imported_gguf_models: HashMap<String, ImportedGgufModelInstall>,
     pub model_storage_dir: PathBuf,
@@ -55,6 +60,13 @@ pub struct GeneralSettings {
     pub close_to_tray: bool,
     #[serde(flatten)]
     pub unknown: UnknownFields,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PendingOnnxRemoval {
+    pub target: PathBuf,
+    pub receipt_sha256: String,
+    pub transaction_nonce: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -259,6 +271,7 @@ impl Default for GeneralSettings {
             playground_selected_models: vec![BUNDLED_BASE_MODEL_ID.to_owned()],
             playground_model_order: default_playground_model_order(),
             managed_models: HashMap::new(),
+            pending_onnx_removals: HashMap::new(),
             managed_remote_models: HashMap::new(),
             imported_gguf_models: HashMap::new(),
             model_storage_dir: default_model_storage_dir(),

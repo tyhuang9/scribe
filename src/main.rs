@@ -39,6 +39,7 @@ mod installed_manifest;
 mod managed_downloads;
 mod model_catalog;
 mod models;
+mod receipt_bundle_catalog;
 // This delivery unit intentionally exposes only private service hooks; a later
 // coordinator branch may call its install APIs without widening product types.
 mod onnx_model_bundles;
