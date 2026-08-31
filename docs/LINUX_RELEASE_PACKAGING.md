@@ -28,12 +28,17 @@ reporting consumes the package verifier's machine-readable result and rejects
 a stale sidecar. Pack-size reporting first invokes either fixture-only or
 production Rust verification and labels the trust mode.
 
-`verify-linux-release-package.sh` inspects the data archive before extraction,
-rejects unsafe names, duplicates, links, nonregular entries, non-root ownership,
-and unsafe archive modes without normalizing them during extraction. It then
-checks ELF identity, the exact inventory, deterministic regular-file byte sum,
-modes, sizes, hashes, FHS paths, empty pack tree, canonical catalog, reviewed
-release contract, and CPU-worker anchor. This makes the
+`verify-linux-release-package.sh` independently parses the outer `ar` archive,
+requires exactly the three ordered Debian members, and bounds both compressed
+members and their XZ expansion before any tar processing. It requires the exact
+control field set and the independently authorized five-file CPU payload, then
+rejects unsafe names, duplicates, case collisions, links, nonregular entries,
+non-root ownership, and unsafe archive modes without normalizing them during
+extraction. It also checks ELF identity, the exact inventory, deterministic
+regular-file byte sum, modes, sizes, hashes, FHS paths, empty pack tree,
+canonical catalog, reviewed release contract, and CPU-worker anchor. Extending
+the payload for GPU packs requires separate authenticated release authority;
+the unsigned inventory cannot authorize additional files. This makes the
 installed CPU worker compatible with the descriptor-bound `openat2` plus
 sealed-`memfd` launcher while leaving no mutable path fallback.
 
