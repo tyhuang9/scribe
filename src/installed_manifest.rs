@@ -355,6 +355,7 @@ mod tests {
                 requested: AccelerationPreference::Cpu,
                 resolved: ComputeDevice::Cpu,
                 diagnostic: None,
+                selection: None,
             },
             detected_architecture: "whisper".to_owned(),
             capabilities: crate::transcription::RuntimeCapabilities {

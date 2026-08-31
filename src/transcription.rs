@@ -125,6 +125,10 @@ pub struct ResolvedAcceleration {
     pub resolved: ComputeDevice,
     /// Explains an automatic fallback or other material resolution decision.
     pub diagnostic: Option<String>,
+    /// Typed GGUF selection details. Older receipts and CPU-only runtimes omit
+    /// this field and continue to deserialize without migration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) selection: Option<crate::backend_policy::BackendSelection>,
 }
 
 /// A runtime-neutral reference to a configured model catalog entry.
@@ -3412,6 +3416,7 @@ mod tests {
                     requested: AccelerationPreference::Cpu,
                     resolved: ComputeDevice::Cpu,
                     diagnostic: None,
+                    selection: None,
                 },
                 runtime_location: PathBuf::from("<test-inference-child>"),
                 warm_reused: false,
