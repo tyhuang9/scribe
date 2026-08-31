@@ -45,8 +45,10 @@ CPU and GPU worker generations with fresh model state. All twenty warm pairs
 reuse one worker generation per target after exactly one unmeasured priming
 run. Session IDs, pair IDs, order, reset/priming state, machine, batch, worker
 generation, worker identity, and challenge-bound Hello digest are validated for
-every record. This prevents unrelated or intentionally slow CPU results from
-being substituted as a favorable baseline.
+every record. A retained warm worker generation must reuse one Hello, while
+each fresh cold generation and every distinct worker generation has a distinct
+Hello. This prevents unrelated or intentionally slow CPU results from being
+substituted as a favorable baseline.
 
 Every run contains a contiguous sequence number, source-artifact path and
 digest, outcome, categorized failure, end-to-end time, backend time, peak
@@ -68,6 +70,11 @@ more than 64 lanes, more than 4096 artifacts, more than 512 MiB of artifacts,
 and digest mismatches. Non-fixture evaluation is Linux-only and opens each path
 component relative to retained directory descriptors with `O_NOFOLLOW`; it
 checks the file identity before and after its bounded read.
+
+Plans, evidence, checked-in contracts, the Auto manifest, and the production
+authority are also read and hashed through retained file descriptors. The
+validator checks regular-file identity and metadata before and after the
+bounded read, rejects links, and never reopens the path to consume the bytes.
 
 The three lifecycle records supply independently hashed source artifacts and
 bind the before/after driver, stable device, observed failure category,
@@ -152,11 +159,14 @@ python3 scripts/qualify-linux-gpu-evidence.py \
   --require-eligible
 ```
 
-The output parent must already exist and the output path must not. Publication
-uses an exclusive temporary file, fsync, and an atomic same-directory hardlink
-that cannot replace a concurrently created destination. A decision is
-non-authoritative review evidence: runtime activation still requires a later
-change that adds the exact one-to-one Auto projections and separately reviewed
-GPU pack trust. Production
+The output parent must already exist, be owner-controlled and not group/other
+writable, and the absolute output path must not exist. Production publication
+is Linux-only. It traverses the output directory with retained `O_NOFOLLOW`
+descriptors, writes and fsyncs an anonymous `O_TMPFILE`, publishes it with the
+no-replace `linkat(AT_EMPTY_PATH)` primitive, verifies the published inode
+against the retained file descriptor, and fsyncs the directory. Fixture output
+uses a portable non-authoritative path. A decision is non-authoritative review
+evidence: runtime activation still requires a later change that adds the exact
+one-to-one Auto projections and separately reviewed GPU pack trust. Production
 Linux trust, catalogs, and Auto remain NO-GO until real hardware evidence and
 the release-signing prerequisites are available.

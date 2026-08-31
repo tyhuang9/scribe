@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
+import errno
 import hashlib
 import json
 import os
@@ -11,6 +13,7 @@ import pathlib
 import re
 import stat
 import sys
+import tempfile
 from collections import Counter
 from typing import Any
 
@@ -169,22 +172,63 @@ def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
-def load_canonical_json(path: pathlib.Path, label: str) -> tuple[dict[str, Any], bytes]:
-    try:
-        file_stat = path.lstat()
-    except OSError as error:
-        fail(f"could not inspect {label}: {error}")
-    if stat.S_ISLNK(file_stat.st_mode) or not stat.S_ISREG(file_stat.st_mode):
+def read_stable_regular_file(path: pathlib.Path, label: str) -> bytes:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_BINARY", 0)
+    if sys.platform == "linux":
+        flags |= os.O_NOFOLLOW
+    elif path.is_symlink():
         fail(f"{label} must be a regular non-symlink file")
-    if file_stat.st_nlink != 1:
+    descriptor = -1
+    try:
+        descriptor = os.open(path, flags)
+        before = os.fstat(descriptor)
+    except OSError as error:
+        if descriptor >= 0:
+            os.close(descriptor)
+        fail(f"could not descriptor-open {label}: {error}")
+    if not stat.S_ISREG(before.st_mode):
+        os.close(descriptor)
+        fail(f"{label} must be a regular non-symlink file")
+    if before.st_nlink != 1:
+        os.close(descriptor)
         fail(f"{label} must have exactly one link")
-    if file_stat.st_size == 0 or file_stat.st_size > MAX_INPUT_BYTES:
+    if before.st_size == 0 or before.st_size > MAX_INPUT_BYTES:
+        os.close(descriptor)
         fail(f"{label} is empty or oversized")
     try:
-        raw = path.read_bytes()
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(descriptor, min(1024 * 1024, MAX_INPUT_BYTES - total + 1))
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > MAX_INPUT_BYTES:
+                fail(f"{label} is oversized")
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+    except OSError as error:
+        fail(f"could not descriptor-read {label}: {error}")
+    finally:
+        os.close(descriptor)
+    stable_identity = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns) == (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+    )
+    stable_linux_metadata = sys.platform != "linux" or after.st_ctime_ns == before.st_ctime_ns
+    if not stable_identity or not stable_linux_metadata or total != after.st_size:
+        fail(f"{label} changed during descriptor-bound acquisition")
+    return b"".join(chunks)
+
+
+def load_canonical_json(path: pathlib.Path, label: str) -> tuple[dict[str, Any], bytes]:
+    try:
+        raw = read_stable_regular_file(path, label)
         text = raw.decode("utf-8")
         document = json.loads(text, object_pairs_hook=reject_duplicate_keys)
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
         fail(f"could not parse {label}: {error}")
     if type(document) is not dict:
         fail(f"{label} must contain a JSON object")
@@ -194,11 +238,7 @@ def load_canonical_json(path: pathlib.Path, label: str) -> tuple[dict[str, Any],
 
 
 def file_sha256(path: pathlib.Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as source:
-        while chunk := source.read(1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
+    return hashlib.sha256(read_stable_regular_file(path, str(path))).hexdigest()
 
 
 def artifact_path(value: Any, label: str) -> pathlib.PurePosixPath:
@@ -680,7 +720,9 @@ def validate_identity(value: Any, label: str) -> dict[str, Any]:
     return identity
 
 
-def validate_plan(plan: dict[str, Any], repository_root: pathlib.Path) -> list[dict[str, Any]]:
+def validate_plan(
+    plan: dict[str, Any], repository_root: pathlib.Path
+) -> tuple[list[dict[str, Any]], dict[str, bytes]]:
     exact_keys(
         plan,
         {
@@ -719,11 +761,14 @@ def validate_plan(plan: dict[str, Any], repository_root: pathlib.Path) -> list[d
     if plan["required_events"] != REQUIRED_EVENTS:
         fail("qualification plan required events are not canonical and complete")
     bindings = exact_keys(plan["contract_bindings"], set(CONTRACT_PATHS), "qualification plan.contract_bindings")
+    contract_files: dict[str, bytes] = {}
     for field, relative_path in CONTRACT_PATHS.items():
         expected = sha256_value(bindings[field], f"qualification plan.contract_bindings.{field}")
-        actual = file_sha256(repository_root / relative_path)
+        raw = read_stable_regular_file(repository_root / relative_path, f"checked-in {field}")
+        actual = hashlib.sha256(raw).hexdigest()
         if expected != actual:
             fail(f"qualification plan {field} does not bind the checked-in contract")
+        contract_files[field] = raw
     if type(plan["required_lanes"]) is not list:
         fail("qualification plan.required_lanes must be an array")
     if len(plan["required_lanes"]) > MAX_LANES:
@@ -743,7 +788,7 @@ def validate_plan(plan: dict[str, Any], repository_root: pathlib.Path) -> list[d
             fail("qualification plan reuses one evidence digest for multiple lanes")
         evidence_digests.add(digest)
         required_lanes.append(entry)
-    return required_lanes
+    return required_lanes, contract_files
 
 
 def load_production_authority(repository_root: pathlib.Path) -> tuple[set[str], str]:
@@ -784,12 +829,10 @@ def load_production_authority(repository_root: pathlib.Path) -> tuple[set[str], 
     return approved, hashlib.sha256(raw).hexdigest()
 
 
-def load_auto_manifest_entries(repository_root: pathlib.Path) -> list[dict[str, Any]]:
-    path = repository_root / CONTRACT_PATHS["auto_manifest_sha256"]
+def load_auto_manifest_entries(raw: bytes) -> list[dict[str, Any]]:
     try:
-        raw = path.read_bytes()
         document = json.loads(raw.decode("utf-8"), object_pairs_hook=reject_duplicate_keys)
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
         fail(f"could not parse the Linux Auto manifest: {error}")
     manifest = exact_keys(
         document,
@@ -1259,9 +1302,9 @@ def decide(
     allow_fixture: bool,
     artifact_root: pathlib.Path | None,
 ) -> dict[str, Any]:
-    required_lanes = validate_plan(plan, repository_root)
+    required_lanes, contract_files = validate_plan(plan, repository_root)
     approved_plans, production_authority_digest = load_production_authority(repository_root)
-    auto_manifest_entries = load_auto_manifest_entries(repository_root)
+    auto_manifest_entries = load_auto_manifest_entries(contract_files["auto_manifest_sha256"])
     exact_keys(
         evidence,
         {"schema_version", "kind", "fixture_only", "plan_sha256", "lanes"},
@@ -1388,20 +1431,19 @@ def parse_arguments() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def write_new_file(path: pathlib.Path, payload: bytes) -> None:
-    if not path.name or path.name in {".", ".."}:
-        fail("output path is invalid")
+def write_fixture_file(path: pathlib.Path, payload: bytes) -> None:
     try:
         parent = path.parent.resolve(strict=True)
-        parent_stat = parent.lstat()
     except OSError as error:
         fail(f"output parent must already exist: {error}")
-    if stat.S_ISLNK(parent_stat.st_mode) or not stat.S_ISDIR(parent_stat.st_mode):
-        fail("output parent must be a regular non-symlink directory")
+    if not parent.is_dir():
+        fail("output parent must be a directory")
     destination = parent / path.name
-    temporary = parent / f".{path.name}.{os.getpid()}.tmp"
+    descriptor = -1
+    temporary = ""
     try:
-        with temporary.open("xb") as output:
+        descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=parent)
+        with os.fdopen(descriptor, "wb", closefd=False) as output:
             output.write(payload)
             output.flush()
             os.fsync(output.fileno())
@@ -1409,17 +1451,104 @@ def write_new_file(path: pathlib.Path, payload: bytes) -> None:
             os.link(temporary, destination)
         except FileExistsError:
             fail("output path already exists")
-        if sys.platform == "linux":
-            directory_descriptor = os.open(parent, os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY)
-            try:
-                os.fsync(directory_descriptor)
-            finally:
-                os.close(directory_descriptor)
+    except OSError as error:
+        fail(f"could not publish fixture decision: {error}")
     finally:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
+        if descriptor >= 0:
+            os.close(descriptor)
+        if temporary:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+
+
+def open_trusted_output_directory(path: pathlib.Path) -> int:
+    if sys.platform != "linux":
+        fail("production decision publication is supported only on Linux")
+    if not path.is_absolute():
+        fail("production output path must be absolute")
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+    current = os.open("/", flags)
+    try:
+        for component in path.parts[1:]:
+            if component in {"", ".", ".."}:
+                fail("production output path must not contain relative components")
+            following = os.open(component, flags, dir_fd=current)
+            os.close(current)
+            current = following
+        directory_stat = os.fstat(current)
+        if directory_stat.st_uid not in {0, os.geteuid()} or directory_stat.st_mode & 0o022:
+            fail("production output directory must be owner-controlled and not group/other writable")
+        return current
+    except (OSError, EvidenceError) as error:
+        os.close(current)
+        if isinstance(error, EvidenceError):
+            raise
+        fail(f"could not descriptor-open the production output directory: {error}")
+
+
+def write_production_file(path: pathlib.Path, payload: bytes) -> None:
+    parent_descriptor = open_trusted_output_directory(path.parent)
+    temporary_descriptor = -1
+    try:
+        flags = os.O_WRONLY | os.O_CLOEXEC | os.O_TMPFILE
+        temporary_descriptor = os.open(".", flags, 0o600, dir_fd=parent_descriptor)
+        offset = 0
+        while offset < len(payload):
+            offset += os.write(temporary_descriptor, payload[offset:])
+        os.fchmod(temporary_descriptor, 0o644)
+        os.fsync(temporary_descriptor)
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        linkat = libc.linkat
+        linkat.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+        linkat.restype = ctypes.c_int
+        result = linkat(
+            temporary_descriptor,
+            b"",
+            parent_descriptor,
+            os.fsencode(path.name),
+            0x1000,  # AT_EMPTY_PATH
+        )
+        if result != 0:
+            error_number = ctypes.get_errno()
+            if error_number == errno.EEXIST:
+                fail("output path already exists")
+            fail(f"could not atomically publish the production decision: {os.strerror(error_number)}")
+
+        source_stat = os.fstat(temporary_descriptor)
+        destination_stat = os.stat(path.name, dir_fd=parent_descriptor, follow_symlinks=False)
+        if (
+            source_stat.st_dev,
+            source_stat.st_ino,
+            source_stat.st_size,
+            stat.S_IMODE(source_stat.st_mode),
+            source_stat.st_nlink,
+        ) != (
+            destination_stat.st_dev,
+            destination_stat.st_ino,
+            destination_stat.st_size,
+            stat.S_IMODE(destination_stat.st_mode),
+            destination_stat.st_nlink,
+        ) or source_stat.st_nlink != 1 or source_stat.st_size != len(payload):
+            fail("published production decision identity does not match its retained descriptor")
+        os.fsync(parent_descriptor)
+    except OSError as error:
+        fail(f"could not publish the production decision: {error}")
+    finally:
+        if temporary_descriptor >= 0:
+            os.close(temporary_descriptor)
+        os.close(parent_descriptor)
+
+
+def write_new_file(path: pathlib.Path, payload: bytes, *, production: bool) -> None:
+    if not path.name or path.name in {".", ".."} or "\x00" in path.name:
+        fail("output path is invalid")
+    if production:
+        write_production_file(path, payload)
+    else:
+        write_fixture_file(path, payload)
 
 
 def main() -> int:
@@ -1438,7 +1567,7 @@ def main() -> int:
         )
         payload = canonical_bytes(decision)
         if arguments.output is not None:
-            write_new_file(arguments.output, payload)
+            write_new_file(arguments.output, payload, production=not decision["fixture_only"])
         sys.stdout.buffer.write(payload)
         if arguments.require_eligible and not decision["auto_eligible"]:
             return 2

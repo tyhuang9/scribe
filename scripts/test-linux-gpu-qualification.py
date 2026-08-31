@@ -920,11 +920,71 @@ class QualificationFixtureTests(unittest.TestCase):
 
     def test_decision_output_publication_never_replaces_an_existing_file(self) -> None:
         output = self.root / "decision.json"
-        qualification.write_new_file(output, b"first\n")
+        qualification.write_new_file(output, b"first\n", production=False)
         self.assertEqual(output.read_bytes(), b"first\n")
         with self.assertRaises(qualification.EvidenceError):
-            qualification.write_new_file(output, b"second\n")
+            qualification.write_new_file(output, b"second\n", production=False)
         self.assertEqual(output.read_bytes(), b"first\n")
+
+    @unittest.skipUnless(sys.platform == "linux", "production decision publication is Linux-only")
+    def test_production_decision_publication_is_descriptor_bound_and_no_replace(self) -> None:
+        parent = self.root / "trusted-output"
+        parent.mkdir(mode=0o700)
+        output = parent / "decision.json"
+        qualification.write_new_file(output, b"first\n", production=True)
+        self.assertEqual(output.read_bytes(), b"first\n")
+        with self.assertRaisesRegex(qualification.EvidenceError, "already exists"):
+            qualification.write_new_file(output, b"second\n", production=True)
+        self.assertEqual(output.read_bytes(), b"first\n")
+
+        victim = parent / "victim.json"
+        victim.write_bytes(b"victim\n")
+        linked_output = parent / "linked-decision.json"
+        linked_output.symlink_to(victim)
+        with self.assertRaisesRegex(qualification.EvidenceError, "already exists"):
+            qualification.write_new_file(linked_output, b"replacement\n", production=True)
+        self.assertEqual(victim.read_bytes(), b"victim\n")
+
+        real_parent = self.root / "real-output"
+        real_parent.mkdir(mode=0o700)
+        linked_parent = self.root / "linked-output"
+        linked_parent.symlink_to(real_parent, target_is_directory=True)
+        with self.assertRaisesRegex(qualification.EvidenceError, "descriptor-open"):
+            qualification.write_new_file(linked_parent / "decision.json", b"linked\n", production=True)
+        with self.assertRaisesRegex(qualification.EvidenceError, "relative components"):
+            qualification.write_new_file(
+                parent / ".." / parent.name / "escaped.json",
+                b"escaped\n",
+                production=True,
+            )
+        permissive_parent = self.root / "permissive-output"
+        permissive_parent.mkdir(mode=0o700)
+        permissive_parent.chmod(0o777)
+        with self.assertRaisesRegex(qualification.EvidenceError, "owner-controlled"):
+            qualification.write_new_file(
+                permissive_parent / "decision.json",
+                b"permissive\n",
+                production=True,
+            )
+
+    def test_canonical_input_symlink_is_rejected(self) -> None:
+        document = self.root / "document.json"
+        document.write_bytes(qualification.canonical_bytes({"kind": "fixture"}))
+        linked = self.root / "document-link.json"
+        try:
+            linked.symlink_to(document)
+        except OSError as error:
+            self.skipTest(f"symbolic links are unavailable: {error}")
+        with self.assertRaisesRegex(qualification.EvidenceError, "non-symlink|descriptor-open"):
+            qualification.load_canonical_json(linked, "linked input")
+
+        hardlink = self.root / "document-hardlink.json"
+        try:
+            hardlink.hardlink_to(document)
+        except OSError as error:
+            self.skipTest(f"hard links are unavailable: {error}")
+        with self.assertRaisesRegex(qualification.EvidenceError, "exactly one link"):
+            qualification.load_canonical_json(document, "hard-linked input")
 
     @unittest.skipUnless(sys.platform == "linux", "descriptor-bound evidence IO is Linux-only")
     def test_production_artifact_reader_is_descriptor_bound(self) -> None:
