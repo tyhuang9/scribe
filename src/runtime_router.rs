@@ -18,7 +18,7 @@ use std::time::Instant;
 use sha2::{Digest, Sha256};
 use transcribe_cpp::CancelToken;
 
-use crate::embedded_runtime::EmbeddedRuntime;
+use crate::embedded_runtime::{EmbeddedRuntime, EmbeddedRuntimeError};
 use crate::model_catalog::{
     ArtifactFormat, RuntimeRequirement, RuntimeVersion, runtime_model_manifest,
 };
@@ -70,6 +70,21 @@ fn embedded_runtime_location() -> PathBuf {
     PathBuf::from(format!(
         "<statically linked transcribe-cpp {TRANSCRIBE_CPP_VERSION}>"
     ))
+}
+
+fn map_embedded_runtime_error(error: anyhow::Error) -> RuntimeError {
+    let message = format!("{error:#}");
+    match error.downcast_ref::<EmbeddedRuntimeError>() {
+        Some(EmbeddedRuntimeError::OutOfMemory(_)) => RuntimeError::OutOfMemory(message),
+        Some(EmbeddedRuntimeError::RuntimeInitializationFailed(_)) => {
+            RuntimeError::BackendInitializationFailed(message)
+        }
+        Some(EmbeddedRuntimeError::BackendUnavailable(_)) => {
+            RuntimeError::BackendUnavailable(message)
+        }
+        Some(EmbeddedRuntimeError::Cancelled) => RuntimeError::Cancelled(message),
+        _ => RuntimeError::Engine(message),
+    }
 }
 
 #[cfg(test)]
@@ -342,8 +357,7 @@ impl RuntimeRouter {
     pub(crate) fn unload_all(&self) -> Result<(), RuntimeError> {
         let mut state = self.inner.lock().map_err(|_| RuntimeError::Poisoned)?;
         let result = if let Some(runtime) = state.embedded.as_mut() {
-            SpeechEngine::unload(runtime)
-                .map_err(|error| RuntimeError::Engine(format!("{error:#}")))
+            SpeechEngine::unload(runtime).map_err(map_embedded_runtime_error)
         } else {
             Ok(())
         };
@@ -417,8 +431,7 @@ impl RouterState {
             });
         if !reusable {
             if let Some(runtime) = self.embedded.as_mut() {
-                SpeechEngine::unload(runtime)
-                    .map_err(|error| RuntimeError::Engine(format!("{error:#}")))?;
+                SpeechEngine::unload(runtime).map_err(map_embedded_runtime_error)?;
             }
             self.discard_embedded_runtime(&cancellation);
             self.embedded = Some(EmbeddedRuntime::new(model.path.clone(), preference));
@@ -471,7 +484,7 @@ impl RouterState {
             Ok(loaded) => loaded,
             Err(error) => {
                 self.discard_embedded_runtime(&cancellation);
-                return Err(RuntimeError::Engine(format!("{error:#}")));
+                return Err(map_embedded_runtime_error(error));
             }
         };
         Ok(RuntimeLoadExecution {
@@ -508,7 +521,7 @@ impl RouterState {
         };
         if let Err(error) = load_result {
             self.discard_embedded_runtime(&cancellation_token);
-            return Err(RuntimeError::Engine(format!("{error:#}")));
+            return Err(map_embedded_runtime_error(error));
         }
         let model_load_duration_ms = if warm_reused {
             0
@@ -537,7 +550,7 @@ impl RouterState {
             Ok(transcript) => transcript,
             Err(error) => {
                 self.discard_embedded_runtime(&cancellation_token);
-                return Err(RuntimeError::Engine(format!("{error:#}")));
+                return Err(map_embedded_runtime_error(error));
             }
         };
         Ok(RuntimeExecution {
@@ -630,6 +643,35 @@ mod tests {
             Some(RuntimeKind::TranscribeCpp)
         );
         assert_eq!(runtime_kind_for_model(&ModelId::new("retired-model")), None);
+    }
+
+    #[test]
+    fn embedded_provider_failures_preserve_retryable_runtime_categories() {
+        assert!(matches!(
+            map_embedded_runtime_error(anyhow::Error::new(EmbeddedRuntimeError::OutOfMemory(
+                "fixture allocation failure".to_owned()
+            ))),
+            RuntimeError::OutOfMemory(message) if message.contains("fixture allocation failure")
+        ));
+        assert!(matches!(
+            map_embedded_runtime_error(anyhow::Error::new(
+                EmbeddedRuntimeError::BackendUnavailable("fixture device loss".to_owned())
+            )),
+            RuntimeError::BackendUnavailable(message) if message.contains("fixture device loss")
+        ));
+        assert!(matches!(
+            map_embedded_runtime_error(anyhow::Error::new(
+                EmbeddedRuntimeError::RuntimeInitializationFailed(
+                    "fixture initialization failure".to_owned()
+                )
+            )),
+            RuntimeError::BackendInitializationFailed(message)
+                if message.contains("fixture initialization failure")
+        ));
+        assert!(matches!(
+            map_embedded_runtime_error(anyhow::Error::new(EmbeddedRuntimeError::Cancelled)),
+            RuntimeError::Cancelled(_)
+        ));
     }
 
     #[test]

@@ -32,13 +32,18 @@ Local GGUF imports are validated in place; Scribe neither copies nor deletes
 them. Legacy user configuration and artifact files are preserved, but production
 paths no longer recognize or execute them.
 
-Stage 4 adds verified Windows x64 CUDA/Vulkan GGUF worker discovery and
-explicit-GPU routing without changing the CPU-safe default. Signed packs have a
+Stages 4 and 5 add verified Windows x64 CUDA/Vulkan GGUF worker discovery,
+strict explicit-GPU routing, and release-evidence-gated Auto routing without
+changing the CPU-safe default. Signed packs have a
 canonical manifest and detached Ed25519 signature, exact payload inventory,
 immutable digest-addressed storage, challenge-bound per-device launch identity,
 security-epoch rollback floor, one-active-worker ownership, and private bounded
 health/quarantine state. Explicit GPU can fall back only across verified GPU
-routes before output and never to CPU. `Auto` remains CPU/default-denied to GPU.
+routes before output and never to CPU. `Auto` exact-matches a canonical embedded
+qualification entry before provider probing and rechecks device/driver facts
+after Hello; battery and health policy apply afterward, with CPU reserved as the
+final bounded fallback. The production qualification manifest has zero entries,
+so current Auto remains CPU/default-denied to GPU and launches no GPU probe.
 The checked-in production trust root is empty, so ordinary packages still
 contain an empty worker-pack catalog. The candidate-ref release workflow never
 receives signing authority; a nonempty release remains fail-closed until a

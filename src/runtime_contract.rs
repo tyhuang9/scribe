@@ -51,6 +51,12 @@ pub(crate) enum RuntimeError {
     Callback(String),
     #[error("native speech engine failed: {0}")]
     Engine(String),
+    #[error("GPU provider initialization failed: {0}")]
+    BackendInitializationFailed(String),
+    #[error("GPU provider is unavailable or lost its device: {0}")]
+    BackendUnavailable(String),
+    #[error("GPU provider ran out of memory: {0}")]
+    OutOfMemory(String),
     #[error("GGUF artifact integrity check failed for {path}: {message}")]
     ArtifactIntegrity { path: PathBuf, message: String },
     #[error("native speech runtime lock was poisoned")]

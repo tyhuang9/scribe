@@ -16,8 +16,15 @@ use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 
-use crate::backend_policy::{BackendKind, BackendSelection, BackendTarget, DeviceClass, GpuVendor};
+use crate::backend_policy::{
+    BackendFailureCategory, BackendFallback, BackendKind, BackendSelection, BackendSelectionReason,
+    BackendSkipReason, BackendTarget, DeviceClass, GpuVendor, PowerPolicyDecision, PowerSource,
+    SkippedBackend,
+};
 use crate::config;
+use crate::gpu_auto_qualification::{
+    AUTO_QUALIFICATION_POLICY_VERSION, AutoQualificationPolicy, QualificationDecision,
+};
 use crate::gpu_worker_pack::health::{
     FailureObservation, HealthCache, HealthDecision, HealthKey, HealthWitnesses, SystemClock,
 };
@@ -1954,6 +1961,9 @@ enum WireRuntimeErrorCode {
     Inference,
     Callback,
     Engine,
+    BackendInitializationFailed,
+    BackendUnavailable,
+    OutOfMemory,
     Poisoned,
     UnsupportedModel,
     WorkerUnavailable,
@@ -1991,6 +2001,11 @@ impl WireRuntimeError {
             RuntimeError::Inference(_) => WireRuntimeErrorCode::Inference,
             RuntimeError::Callback(_) => WireRuntimeErrorCode::Callback,
             RuntimeError::Engine(_) => WireRuntimeErrorCode::Engine,
+            RuntimeError::BackendInitializationFailed(_) => {
+                WireRuntimeErrorCode::BackendInitializationFailed
+            }
+            RuntimeError::BackendUnavailable(_) => WireRuntimeErrorCode::BackendUnavailable,
+            RuntimeError::OutOfMemory(_) => WireRuntimeErrorCode::OutOfMemory,
             RuntimeError::ArtifactIntegrity { .. } => WireRuntimeErrorCode::ArtifactIntegrity,
             RuntimeError::Poisoned => WireRuntimeErrorCode::Poisoned,
             RuntimeError::UnsupportedModel(_) => WireRuntimeErrorCode::UnsupportedModel,
@@ -2003,6 +2018,9 @@ impl WireRuntimeError {
             RuntimeError::ArtifactIntegrity { .. } => WireFailureCategory::Artifact,
             RuntimeError::InvalidAudio { .. } => WireFailureCategory::InvalidInput,
             RuntimeError::Inference(_) | RuntimeError::Engine(_) => WireFailureCategory::Decode,
+            RuntimeError::BackendInitializationFailed(_)
+            | RuntimeError::BackendUnavailable(_)
+            | RuntimeError::OutOfMemory(_) => WireFailureCategory::Provider,
             RuntimeError::Callback(_) => WireFailureCategory::Callback,
             RuntimeError::Poisoned
             | RuntimeError::WorkerUnavailable(_)
@@ -2012,7 +2030,13 @@ impl WireRuntimeError {
             }
             RuntimeError::Cancelled(_) => WireFailureCategory::Cancellation,
         };
-        let retry = if matches!(error, RuntimeError::RetryableWorkerFailure(_)) {
+        let retry = if matches!(
+            error,
+            RuntimeError::RetryableWorkerFailure(_)
+                | RuntimeError::BackendInitializationFailed(_)
+                | RuntimeError::BackendUnavailable(_)
+                | RuntimeError::OutOfMemory(_)
+        ) {
             WireRetryDisposition::NextProviderBeforeOutput
         } else {
             WireRetryDisposition::Never
@@ -2054,6 +2078,13 @@ impl WireRuntimeError {
                 channels: self.channels.unwrap_or_default(),
             },
             WireRuntimeErrorCode::Engine => RuntimeError::Engine(self.message),
+            WireRuntimeErrorCode::BackendInitializationFailed => {
+                RuntimeError::BackendInitializationFailed(self.message)
+            }
+            WireRuntimeErrorCode::BackendUnavailable => {
+                RuntimeError::BackendUnavailable(self.message)
+            }
+            WireRuntimeErrorCode::OutOfMemory => RuntimeError::OutOfMemory(self.message),
             WireRuntimeErrorCode::ArtifactIntegrity => RuntimeError::ArtifactIntegrity {
                 path: self
                     .artifact_path
@@ -5676,6 +5707,7 @@ struct InferenceWorkerRoute {
     target: Option<BackendTarget>,
     health_key: Option<HealthKey>,
     consume_retry_bypass: bool,
+    auto_evidence_id: Option<String>,
 }
 
 #[derive(Clone)]
@@ -5683,6 +5715,8 @@ struct InferenceWorkerRoutePlan {
     routes: Arc<Vec<InferenceWorkerRoute>>,
     diagnostic: Option<String>,
     health: Option<GpuRouteHealth>,
+    selection_power_source: Option<PowerSource>,
+    skipped_targets: Vec<SkippedBackend>,
 }
 
 #[derive(Clone)]
@@ -5692,9 +5726,11 @@ struct VerifiedGpuRouteCatalog {
     device_set_digest: String,
     discovery_fingerprint: String,
     provider_probe_incomplete: bool,
+    skipped_targets: Vec<SkippedBackend>,
 }
 
 const GPU_PROVIDER_PROBE_BACKOFF: Duration = Duration::from_secs(15);
+const MAX_INFERENCE_ROUTE_ATTEMPTS: usize = 4;
 
 #[derive(Clone)]
 struct FailedGpuProbe {
@@ -5770,6 +5806,11 @@ impl GpuRouteCatalogCache {
     fn successful(&self) -> Option<&VerifiedGpuRouteCatalog> {
         self.successful.as_ref()
     }
+
+    fn invalidate_after_runtime_failure(&mut self) {
+        self.successful = None;
+        self.failed = None;
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -5843,6 +5884,9 @@ impl GpuRouteHealth {
 pub(crate) struct InferenceWorkerRegistry {
     routes: Arc<Vec<InferenceWorkerRoute>>,
     gpu_routes: Arc<Mutex<GpuRouteCatalogCache>>,
+    /// Auto has an independent cache so a prior explicit GPU probe cannot
+    /// widen its pre-probe qualification allowlist.
+    auto_gpu_routes: Arc<Mutex<GpuRouteCatalogCache>>,
     gpu_health_path: Option<Arc<PathBuf>>,
     active_route: Arc<Mutex<Option<ActiveInferenceRoute>>>,
     route_execution: Arc<Mutex<()>>,
@@ -5935,6 +5979,85 @@ fn discover_production_pack_launch_bindings(
     )
 }
 
+/// Filters immutable pack metadata before constructing a probe supervisor. A
+/// non-matching pack is never loaded merely to find out whether it would be
+/// fast enough: release evidence, not machine calibration, is authoritative.
+fn auto_qualified_pack_discovery(
+    discovery: crate::gpu_worker_pack::PackLeaseDiscovery,
+    policy: &AutoQualificationPolicy,
+    model_digest: &str,
+) -> crate::gpu_worker_pack::PackLeaseDiscovery {
+    use crate::gpu_worker_pack::{PackDiscoveryDiagnostic, PackDiscoveryIssue};
+
+    let mut leases = Vec::new();
+    let mut diagnostics = discovery.diagnostics;
+    for lease in discovery.leases {
+        let pack = lease.verified_pack();
+        let backend = match pack.backend {
+            PackBackend::Cuda => BackendKind::Cuda,
+            PackBackend::Vulkan => BackendKind::Vulkan,
+            PackBackend::Metal => BackendKind::Metal,
+        };
+        let identity = crate::backend_policy::BackendPackIdentity {
+            pack_id: pack.pack_id.as_str().to_owned(),
+            pack_version: pack.pack_version.as_str().to_owned(),
+            pack_digest: pack.pack_digest.clone(),
+            security_epoch: pack.security_epoch,
+            runtime_abi: pack.runtime_abi_version,
+        };
+        let provider = crate::backend_policy::ProviderIdentity::new(pack.provider.clone());
+        if policy
+            .qualify_pack(backend, &provider, &identity, model_digest)
+            .is_approved()
+        {
+            leases.push(lease);
+        } else {
+            diagnostics.push(PackDiscoveryDiagnostic::pack(
+                PackDiscoveryIssue::NotAutoQualified,
+                &pack.pack_id,
+                pack.backend,
+            ));
+        }
+    }
+    crate::gpu_worker_pack::PackLeaseDiscovery {
+        leases,
+        diagnostics,
+        catalog_generation: discovery.catalog_generation,
+    }
+}
+
+fn auto_gpu_discovery_fingerprint(
+    discovery: &crate::gpu_worker_pack::PackLeaseDiscovery,
+    policy: &AutoQualificationPolicy,
+    model_digest: &str,
+) -> String {
+    let mut digest = Sha256::new();
+    update_health_digest(&mut digest, "auto-qualification-v1");
+    update_health_digest(&mut digest, &policy.policy_version().to_string());
+    update_health_digest(&mut digest, &policy.manifest_digest());
+    update_health_digest(&mut digest, model_digest);
+    update_health_digest(
+        &mut digest,
+        discovery
+            .catalog_generation
+            .as_deref()
+            .unwrap_or("catalog-unavailable"),
+    );
+    for lease in &discovery.leases {
+        let pack = lease.verified_pack();
+        update_health_digest(&mut digest, pack.pack_id.as_str());
+        update_health_digest(&mut digest, pack.pack_version.as_str());
+        update_health_digest(&mut digest, &pack.pack_digest);
+        digest.update(pack.security_epoch.to_le_bytes());
+        digest.update(pack.runtime_abi_version.to_le_bytes());
+        update_health_digest(&mut digest, &pack.provider);
+    }
+    // The adapter fingerprint makes cached target facts stale after a driver
+    // or enumerated-device change without ever loading a GPU provider.
+    update_health_digest(&mut digest, &explicit_gpu_discovery_fingerprint(discovery));
+    format!("{:x}", digest.finalize())
+}
+
 fn append_pack_diagnostic(resolved: &mut ResolvedAcceleration, diagnostic: Option<&str>) {
     let Some(diagnostic) = diagnostic.filter(|value| !value.is_empty()) else {
         return;
@@ -5994,6 +6117,20 @@ fn verified_gpu_device_set_digest(routes: &[InferenceWorkerRoute]) -> String {
     format!("{:x}", digest.finalize())
 }
 
+/// Health invalidation follows the physical adapter/driver set, not the
+/// current preference, qualification subset, or power-policy subset. Sharing
+/// this witness between explicit GPU and Auto prevents a normal mode or AC /
+/// battery transition from making otherwise valid health records look corrupt.
+fn physical_gpu_device_set_digest() -> String {
+    let adapter_fingerprint = PackDriverCatalog::discover()
+        .map(|catalog| catalog.fingerprint())
+        .unwrap_or_else(|_| "adapter-metadata-unavailable".to_owned());
+    let mut digest = Sha256::new();
+    update_health_digest(&mut digest, "physical-gpu-device-set-v1");
+    update_health_digest(&mut digest, &adapter_fingerprint);
+    format!("{:x}", digest.finalize())
+}
+
 fn route_health_key(route: &InferenceWorkerRoute, model_digest: &str) -> Option<HealthKey> {
     let target = route.target.as_ref()?;
     let pack = target.pack.as_ref()?;
@@ -6044,12 +6181,51 @@ fn health_observation_for_runtime_error(
         RuntimeError::Inference(_) | RuntimeError::Callback(_) | RuntimeError::Engine(_) => {
             FailureObservation::DecodeContent
         }
+        RuntimeError::BackendInitializationFailed(_) => FailureObservation::ProviderInitialization,
+        RuntimeError::BackendUnavailable(_) => FailureObservation::DeviceLost,
+        RuntimeError::OutOfMemory(_) => FailureObservation::OutOfMemory,
         RuntimeError::Cancelled(_) => FailureObservation::Cancellation,
         RuntimeError::RetryableWorkerFailure(_) | RuntimeError::Poisoned => {
             FailureObservation::WorkerCrash
         }
         RuntimeError::WorkerUnavailable(_) => FailureObservation::Protocol,
     }
+}
+
+fn backend_failure_category(error: &RuntimeError) -> Option<BackendFailureCategory> {
+    match error {
+        RuntimeError::BackendInitializationFailed(_) => {
+            Some(BackendFailureCategory::InitializationFailed)
+        }
+        RuntimeError::BackendUnavailable(_) => Some(BackendFailureCategory::DeviceLost),
+        RuntimeError::OutOfMemory(_) => Some(BackendFailureCategory::OutOfMemory),
+        RuntimeError::WorkerUnavailable(_) => Some(BackendFailureCategory::BackendUnavailable),
+        RuntimeError::RetryableWorkerFailure(_) | RuntimeError::Poisoned => {
+            Some(BackendFailureCategory::WorkerFailed)
+        }
+        RuntimeError::InvalidAudio { .. }
+        | RuntimeError::Inference(_)
+        | RuntimeError::Callback(_)
+        | RuntimeError::Engine(_)
+        | RuntimeError::ArtifactIntegrity { .. }
+        | RuntimeError::UnsupportedModel(_)
+        | RuntimeError::Cancelled(_)
+        | RuntimeError::OnnxUnavailable(_) => None,
+    }
+}
+
+fn record_backend_fallback(
+    history: &mut Vec<BackendFallback>,
+    route: &InferenceWorkerRoute,
+    error: &RuntimeError,
+) {
+    let Some(target) = route.target.clone() else {
+        return;
+    };
+    let Some(category) = backend_failure_category(error) else {
+        return;
+    };
+    history.push(BackendFallback { target, category });
 }
 
 fn explicit_gpu_discovery_fingerprint(
@@ -6111,6 +6287,7 @@ fn verified_gpu_route_catalog(
                 target: Some(target),
                 health_key: None,
                 consume_retry_bypass: false,
+                auto_evidence_id: None,
             }
         })
         .filter(|route| route.provider.is_gpu())
@@ -6130,7 +6307,7 @@ fn verified_gpu_route_catalog(
         };
         key(left).cmp(&key(right))
     });
-    let device_set_digest = verified_gpu_device_set_digest(&routes);
+    let device_set_digest = physical_gpu_device_set_digest();
     let mut diagnostic = crate::gpu_worker_pack::diagnostic_summary(&diagnostics);
     if routes.len() > 4 {
         let skipped = routes.len() - 4;
@@ -6147,7 +6324,142 @@ fn verified_gpu_route_catalog(
         device_set_digest,
         discovery_fingerprint,
         provider_probe_incomplete,
+        skipped_targets: Vec::new(),
     }
+}
+
+fn auto_qualified_gpu_route_catalog(
+    mut catalog: VerifiedGpuRouteCatalog,
+    policy: &AutoQualificationPolicy,
+    model_digest: &str,
+    power_source: PowerSource,
+) -> VerifiedGpuRouteCatalog {
+    let mut qualified_routes = Vec::with_capacity(catalog.routes.len());
+    let mut qualification_denied = 0_usize;
+    let mut battery_denied = 0_usize;
+    let mut qualification_diagnostic = None;
+    for route in catalog.routes.iter() {
+        let Some(target) = route.target.as_ref() else {
+            qualification_denied = qualification_denied.saturating_add(1);
+            continue;
+        };
+        let qualification = policy.qualify_target(target, model_digest);
+        match qualification {
+            QualificationDecision::Approved { evidence_id } => {
+                let mut qualified = route.clone();
+                qualified.auto_evidence_id = Some(evidence_id);
+                qualified_routes.push(qualified);
+            }
+            denied @ QualificationDecision::Denied(_) => {
+                qualification_denied = qualification_denied.saturating_add(1);
+                qualification_diagnostic.get_or_insert_with(|| denied.diagnostic());
+                catalog.skipped_targets.push(SkippedBackend {
+                    target: target.clone(),
+                    reason: BackendSkipReason::NotAutoQualified,
+                });
+            }
+        }
+    }
+    let mut routes = Vec::with_capacity(qualified_routes.len());
+    for route in qualified_routes {
+        let battery_eligible = power_source != PowerSource::Battery
+            || route
+                .target
+                .as_ref()
+                .is_some_and(|target| target.device_class.is_battery_eligible_gpu());
+        if battery_eligible {
+            routes.push(route);
+        } else {
+            battery_denied = battery_denied.saturating_add(1);
+            if let Some(target) = route.target.clone() {
+                catalog.skipped_targets.push(SkippedBackend {
+                    target,
+                    reason: BackendSkipReason::BatteryPolicy,
+                });
+            }
+        }
+    }
+    catalog.routes = Arc::new(routes);
+    if qualification_denied != 0 {
+        append_route_plan_diagnostic(
+            &mut catalog.diagnostic,
+            &format!(
+                "{qualification_denied} probed GPU route(s) did not match Auto qualification evidence{}",
+                qualification_diagnostic
+                    .as_deref()
+                    .map(|detail| format!(": {detail}"))
+                    .unwrap_or_default()
+            ),
+        );
+    }
+    if battery_denied != 0 {
+        append_route_plan_diagnostic(
+            &mut catalog.diagnostic,
+            &format!(
+                "{battery_denied} discrete or unclassified GPU route(s) were excluded on battery"
+            ),
+        );
+    }
+    catalog
+}
+
+fn auto_gpu_route_plan(
+    cpu_routes: Arc<Vec<InferenceWorkerRoute>>,
+    catalog: VerifiedGpuRouteCatalog,
+    policy: &AutoQualificationPolicy,
+    model_digest: &str,
+    health_path: Option<&Arc<PathBuf>>,
+    allow_unprobed_idle_health: bool,
+) -> InferenceWorkerRoutePlan {
+    let selection_power_source = PowerSource::current();
+    let catalog =
+        auto_qualified_gpu_route_catalog(catalog, policy, model_digest, selection_power_source);
+    let mut plan = health_filtered_gpu_route_plan(
+        catalog,
+        model_digest,
+        health_path,
+        allow_unprobed_idle_health,
+    );
+    plan.selection_power_source = Some(selection_power_source);
+    reserve_auto_cpu_fallback(&mut plan, &cpu_routes);
+    plan
+}
+
+fn reserve_auto_cpu_fallback(
+    plan: &mut InferenceWorkerRoutePlan,
+    cpu_routes: &Arc<Vec<InferenceWorkerRoute>>,
+) {
+    let mut routes = Vec::with_capacity(plan.routes.len() + cpu_routes.len());
+    let max_gpu_routes =
+        MAX_INFERENCE_ROUTE_ATTEMPTS.saturating_sub(usize::from(!cpu_routes.is_empty()));
+    if plan.routes.len() > max_gpu_routes {
+        plan.skipped_targets.extend(
+            plan.routes
+                .iter()
+                .skip(max_gpu_routes)
+                .filter_map(|route| route.target.clone())
+                .map(|target| SkippedBackend {
+                    target,
+                    reason: BackendSkipReason::FallbackBound,
+                }),
+        );
+        append_route_plan_diagnostic(
+            &mut plan.diagnostic,
+            &format!(
+                "{} additional qualified GPU route(s) were skipped to reserve Auto's guaranteed CPU fallback",
+                plan.routes.len() - max_gpu_routes
+            ),
+        );
+    }
+    routes.extend(plan.routes.iter().take(max_gpu_routes).cloned());
+    routes.extend(cpu_routes.iter().cloned());
+    if plan.routes.is_empty() {
+        append_route_plan_diagnostic(
+            &mut plan.diagnostic,
+            "Auto selected the guaranteed CPU fallback",
+        );
+    }
+    plan.routes = Arc::new(routes);
 }
 
 fn health_filtered_gpu_route_plan(
@@ -6161,10 +6473,19 @@ fn health_filtered_gpu_route_plan(
             routes: catalog.routes,
             diagnostic: catalog.diagnostic,
             health: None,
+            selection_power_source: None,
+            skipped_targets: catalog.skipped_targets,
         };
     }
     let Some(path) = health_path else {
         let mut diagnostic = catalog.diagnostic;
+        let mut skipped_targets = catalog.skipped_targets;
+        skipped_targets.extend(catalog.routes.iter().filter_map(|route| {
+            route.target.clone().map(|target| SkippedBackend {
+                target,
+                reason: BackendSkipReason::Unhealthy,
+            })
+        }));
         append_route_plan_diagnostic(
             &mut diagnostic,
             "private GPU health state is unavailable; verified GPU routes were denied",
@@ -6173,6 +6494,8 @@ fn health_filtered_gpu_route_plan(
             routes: Arc::new(Vec::new()),
             diagnostic,
             health: None,
+            selection_power_source: None,
+            skipped_targets,
         };
     };
     let health = GpuRouteHealth {
@@ -6187,8 +6510,15 @@ fn health_filtered_gpu_route_plan(
     let mut routes = Vec::with_capacity(catalog.routes.len());
     let mut quarantined = 0_usize;
     let mut awaiting_probe = 0_usize;
+    let mut skipped_targets = catalog.skipped_targets;
     for base in catalog.routes.iter() {
         let Some(key) = route_health_key(base, model_digest) else {
+            if let Some(target) = base.target.clone() {
+                skipped_targets.push(SkippedBackend {
+                    target,
+                    reason: BackendSkipReason::Unaddressable,
+                });
+            }
             append_route_plan_diagnostic(
                 &mut diagnostic,
                 "a verified GPU route lacked a complete bounded health identity",
@@ -6205,11 +6535,22 @@ fn health_filtered_gpu_route_plan(
             }
             HealthDecision::Quarantined { .. } => {
                 quarantined = quarantined.saturating_add(1);
+                if let Some(target) = route.target.clone() {
+                    skipped_targets.push(SkippedBackend {
+                        target,
+                        reason: BackendSkipReason::Quarantined,
+                    });
+                }
             }
             HealthDecision::InvalidOrUnprobed => {
                 awaiting_probe = awaiting_probe.saturating_add(1);
                 if allow_unprobed_idle_health {
                     recovery_routes.push(route);
+                } else if let Some(target) = route.target.clone() {
+                    skipped_targets.push(SkippedBackend {
+                        target,
+                        reason: BackendSkipReason::Unhealthy,
+                    });
                 }
             }
         }
@@ -6236,6 +6577,8 @@ fn health_filtered_gpu_route_plan(
         routes: Arc::new(routes),
         diagnostic,
         health: Some(health),
+        selection_power_source: None,
+        skipped_targets,
     }
 }
 
@@ -6244,6 +6587,30 @@ impl InferenceWorkerRegistry {
         self.route_execution.lock().map_err(|_| {
             RuntimeError::WorkerUnavailable("inference route execution lock poisoned".to_owned())
         })
+    }
+
+    fn invalidate_gpu_catalog_after_runtime_failure(
+        &self,
+        route: &InferenceWorkerRoute,
+    ) -> Result<(), RuntimeError> {
+        if !route.provider.is_gpu() {
+            return Ok(());
+        }
+        // Auto and explicit GPU keep separate admission caches, but both bind
+        // the same physical pack/device facts. A runtime or Hello mismatch in
+        // either mode makes both catalogs stale, especially when a device at
+        // the same PCI location receives a new LUID/UUID.
+        for cache in [&self.auto_gpu_routes, &self.gpu_routes] {
+            cache
+                .lock()
+                .map_err(|_| {
+                    RuntimeError::WorkerUnavailable(
+                        "GPU worker registry lock poisoned during invalidation".to_owned(),
+                    )
+                })?
+                .invalidate_after_runtime_failure();
+        }
+        Ok(())
     }
 
     pub(crate) fn for_current_build() -> Self {
@@ -6255,8 +6622,10 @@ impl InferenceWorkerRegistry {
                 target: Some(BackendTarget::cpu()),
                 health_key: None,
                 consume_retry_bypass: false,
+                auto_evidence_id: None,
             }]),
             gpu_routes: Arc::new(Mutex::new(GpuRouteCatalogCache::default())),
+            auto_gpu_routes: Arc::new(Mutex::new(GpuRouteCatalogCache::default())),
             gpu_health_path: config::project_dirs().ok().map(|directories| {
                 Arc::new(
                     directories
@@ -6283,8 +6652,10 @@ impl InferenceWorkerRegistry {
                 target: Some(BackendTarget::cpu()),
                 health_key: None,
                 consume_retry_bypass: false,
+                auto_evidence_id: None,
             }]),
             gpu_routes: Arc::new(Mutex::new(GpuRouteCatalogCache::default())),
+            auto_gpu_routes: Arc::new(Mutex::new(GpuRouteCatalogCache::default())),
             gpu_health_path: config::project_dirs().ok().map(|directories| {
                 Arc::new(
                     directories
@@ -6308,8 +6679,10 @@ impl InferenceWorkerRegistry {
                 target: Some(BackendTarget::cpu()),
                 health_key: None,
                 consume_retry_bypass: false,
+                auto_evidence_id: None,
             }]),
             gpu_routes: Arc::new(Mutex::new(GpuRouteCatalogCache::default())),
+            auto_gpu_routes: Arc::new(Mutex::new(GpuRouteCatalogCache::default())),
             gpu_health_path: None,
             active_route: Arc::new(Mutex::new(None)),
             route_execution: Arc::new(Mutex::new(())),
@@ -6413,17 +6786,118 @@ impl InferenceWorkerRegistry {
                 routes: Arc::clone(&self.routes),
                 diagnostic: None,
                 health: None,
+                selection_power_source: None,
+                skipped_targets: Vec::new(),
             });
         }
         if preference == AccelerationPreference::Auto {
-            // Auto remains deliberately default-denied for Stage 4. It does
-            // not launch a provider merely to calibrate or probe the machine.
-            let discovery = crate::gpu_worker_pack::discover_production_pack_leases();
-            return Ok(InferenceWorkerRoutePlan {
-                routes: Arc::clone(&self.routes),
-                diagnostic: Some(discovery.diagnostic_summary()),
-                health: None,
-            });
+            let RuntimeArtifact::Gguf(model) = artifact else {
+                return Ok(InferenceWorkerRoutePlan {
+                    routes: Arc::clone(&self.routes),
+                    diagnostic: Some(
+                        "Auto GPU qualification applies only to verified GGUF worker packs; Auto selected CPU"
+                            .to_owned(),
+                    ),
+                    health: None,
+                    selection_power_source: None,
+                    skipped_targets: Vec::new(),
+                });
+            };
+            #[cfg(test)]
+            if let Some(catalog) = self.gpu_routes_for_testing.as_ref() {
+                let mut plan = InferenceWorkerRoutePlan {
+                    routes: Arc::clone(&catalog.routes),
+                    diagnostic: catalog.diagnostic.clone(),
+                    health: None,
+                    selection_power_source: Some(PowerSource::Ac),
+                    skipped_targets: catalog.skipped_targets.clone(),
+                };
+                reserve_auto_cpu_fallback(&mut plan, &self.routes);
+                return Ok(plan);
+            }
+            let policy = match AutoQualificationPolicy::embedded_windows_x64() {
+                Ok(policy) => policy,
+                Err(error) => {
+                    return Ok(InferenceWorkerRoutePlan {
+                        routes: Arc::clone(&self.routes),
+                        diagnostic: Some(format!(
+                            "Auto GPU qualification manifest was rejected; Auto selected CPU: {error}"
+                        )),
+                        health: None,
+                        selection_power_source: None,
+                        skipped_targets: Vec::new(),
+                    });
+                }
+            };
+            // Filter verified pack descriptors before creating any provider
+            // probe. The checked-in production policy has zero entries, so
+            // ordinary releases take this CPU path without loading a GPU DLL.
+            let discovery = auto_qualified_pack_discovery(
+                crate::gpu_worker_pack::discover_production_pack_leases(),
+                policy,
+                &model.expected_sha256,
+            );
+            if discovery.leases.is_empty() {
+                let mut diagnostic = discovery.diagnostic_summary();
+                if !diagnostic.is_empty() {
+                    diagnostic.push_str("; ");
+                }
+                diagnostic.push_str("Auto selected the guaranteed CPU fallback");
+                return Ok(InferenceWorkerRoutePlan {
+                    routes: Arc::clone(&self.routes),
+                    diagnostic: Some(diagnostic.chars().take(MAX_DIAGNOSTIC_BYTES).collect()),
+                    health: None,
+                    selection_power_source: None,
+                    skipped_targets: Vec::new(),
+                });
+            }
+            let discovery_fingerprint =
+                auto_gpu_discovery_fingerprint(&discovery, policy, &model.expected_sha256);
+            let lookup_at = Instant::now();
+            let cached_catalog = {
+                let cached = self.auto_gpu_routes.lock().map_err(|_| {
+                    RuntimeError::WorkerUnavailable(
+                        "Auto GPU worker registry lock poisoned".to_owned(),
+                    )
+                })?;
+                cached.lookup(&discovery_fingerprint, lookup_at)
+            };
+            let catalog = match cached_catalog {
+                GpuRouteCatalogLookup::Successful(cached) => cached,
+                GpuRouteCatalogLookup::Backoff(diagnostic) => VerifiedGpuRouteCatalog {
+                    routes: Arc::new(Vec::new()),
+                    diagnostic,
+                    device_set_digest: verified_gpu_device_set_digest(&[]),
+                    discovery_fingerprint,
+                    provider_probe_incomplete: true,
+                    skipped_targets: Vec::new(),
+                },
+                GpuRouteCatalogLookup::Probe => {
+                    self.retire_active_worker()?;
+                    let discovered = verified_gpu_route_catalog(
+                        discover_production_pack_launch_bindings(discovery),
+                        discovery_fingerprint,
+                    );
+                    let probe_completed_at = Instant::now();
+                    self.auto_gpu_routes
+                        .lock()
+                        .map_err(|_| {
+                            RuntimeError::WorkerUnavailable(
+                                "Auto GPU worker registry lock poisoned".to_owned(),
+                            )
+                        })?
+                        .record_probe(discovered.clone(), probe_completed_at);
+                    discovered
+                }
+            };
+            return Ok(auto_gpu_route_plan(
+                Arc::clone(&self.routes),
+                catalog,
+                policy,
+                &model.expected_sha256,
+                self.gpu_health_path.as_ref(),
+                allow_unprobed_idle_health,
+            ));
         }
         let RuntimeArtifact::Gguf(model) = artifact else {
             return Ok(InferenceWorkerRoutePlan {
@@ -6432,6 +6906,8 @@ impl InferenceWorkerRegistry {
                     "verified GPU worker packs support only pinned GGUF artifacts".to_owned(),
                 ),
                 health: None,
+                selection_power_source: None,
+                skipped_targets: Vec::new(),
             });
         };
 
@@ -6449,6 +6925,8 @@ impl InferenceWorkerRegistry {
                 routes: Arc::clone(&catalog.routes),
                 diagnostic: catalog.diagnostic.clone(),
                 health: None,
+                selection_power_source: None,
+                skipped_targets: catalog.skipped_targets.clone(),
             });
         }
 
@@ -6473,6 +6951,7 @@ impl InferenceWorkerRegistry {
                 device_set_digest: verified_gpu_device_set_digest(&[]),
                 discovery_fingerprint,
                 provider_probe_incomplete: true,
+                skipped_targets: Vec::new(),
             },
             GpuRouteCatalogLookup::Probe => {
                 self.retire_active_worker()?;
@@ -6570,6 +7049,58 @@ impl InferenceWorkerRegistry {
         })
     }
 
+    fn worker_preference_for_route(
+        route: &InferenceWorkerRoute,
+        requested: AccelerationPreference,
+    ) -> AccelerationPreference {
+        // The parent has already made a strict Auto decision from verified
+        // pack, target, power, and health facts. The selected GPU worker must
+        // receive `Gpu` so its local generic policy cannot replace that
+        // parent-authorized target with its CPU fallback.
+        if requested == AccelerationPreference::Auto && route.provider.is_gpu() {
+            AccelerationPreference::Gpu
+        } else {
+            requested
+        }
+    }
+
+    fn project_auto_route_diagnostics(
+        diagnostics: &mut NativeRuntimeDiagnostics,
+        route: &InferenceWorkerRoute,
+        power_source: PowerSource,
+        fallback_targets: Vec<BackendTarget>,
+        fallback_history: &[BackendFallback],
+        skipped_targets: &[SkippedBackend],
+    ) {
+        let target = route.target.clone().unwrap_or_else(BackendTarget::cpu);
+        diagnostics.resolved_acceleration.requested = AccelerationPreference::Auto;
+        diagnostics.resolved_acceleration.selection = Some(BackendSelection {
+            requested: AccelerationPreference::Auto,
+            reason: if target.backend == BackendKind::Cpu {
+                BackendSelectionReason::AutoCpuFallback
+            } else {
+                BackendSelectionReason::AutoPriority
+            },
+            target,
+            power_source,
+            power_policy: match power_source {
+                PowerSource::Battery => PowerPolicyDecision::BatteryEfficientGpuOnly,
+                PowerSource::Ac | PowerSource::Unknown => PowerPolicyDecision::Unrestricted,
+            },
+            qualification_policy_version: AUTO_QUALIFICATION_POLICY_VERSION,
+            fallback_targets,
+            fallback_history: fallback_history.to_vec(),
+            skipped_targets: skipped_targets.to_vec(),
+        });
+        if let Some(evidence_id) = route.auto_evidence_id.as_deref() {
+            let evidence = format!("Auto qualification selected release evidence {evidence_id}");
+            append_pack_diagnostic(
+                &mut diagnostics.resolved_acceleration,
+                Some(evidence.as_str()),
+            );
+        }
+    }
+
     pub(crate) fn load(
         &self,
         artifact: RuntimeArtifact,
@@ -6577,12 +7108,18 @@ impl InferenceWorkerRegistry {
     ) -> Result<RuntimeLoadExecution, RuntimeError> {
         let _route_execution = self.lock_route_execution()?;
         let mut last_retryable = None;
+        let mut fallback_history = Vec::new();
         let mut attempted = false;
         let plan = self.routes_for_preference(preference, &artifact)?;
         if plan.routes.is_empty() {
             self.retire_active_worker()?;
         }
-        for route in plan.routes.iter().take(4) {
+        for (route_index, route) in plan
+            .routes
+            .iter()
+            .take(MAX_INFERENCE_ROUTE_ATTEMPTS)
+            .enumerate()
+        {
             if plan
                 .health
                 .as_ref()
@@ -6592,8 +7129,26 @@ impl InferenceWorkerRegistry {
             }
             attempted = true;
             self.prepare_route(route)?;
-            match route.supervisor.load(artifact.clone(), preference) {
+            match route.supervisor.load(
+                artifact.clone(),
+                Self::worker_preference_for_route(route, preference),
+            ) {
                 Ok(mut execution) => {
+                    if preference == AccelerationPreference::Auto {
+                        Self::project_auto_route_diagnostics(
+                            &mut execution.diagnostics,
+                            route,
+                            plan.selection_power_source
+                                .unwrap_or_else(PowerSource::current),
+                            plan.routes
+                                .iter()
+                                .skip(route_index + 1)
+                                .filter_map(|candidate| candidate.target.clone())
+                                .collect(),
+                            &fallback_history,
+                            &plan.skipped_targets,
+                        );
+                    }
                     if matches!(artifact, RuntimeArtifact::Gguf(_)) {
                         append_pack_diagnostic(
                             &mut execution.diagnostics.resolved_acceleration,
@@ -6609,8 +7164,46 @@ impl InferenceWorkerRegistry {
                             health_observation_for_runtime_error(&error, false, false),
                         );
                     }
+                    record_backend_fallback(&mut fallback_history, route, &error);
+                    self.invalidate_gpu_catalog_after_runtime_failure(route)?;
                     self.retire_failed_route(route)?;
                     last_retryable = Some(error);
+                }
+                Err(
+                    error @ (RuntimeError::BackendInitializationFailed(_)
+                    | RuntimeError::BackendUnavailable(_)
+                    | RuntimeError::OutOfMemory(_)),
+                ) if preference != AccelerationPreference::Cpu && route.provider.is_gpu() => {
+                    if let Some(health) = &plan.health {
+                        health.record_failure(
+                            route,
+                            health_observation_for_runtime_error(&error, false, false),
+                        );
+                    }
+                    record_backend_fallback(&mut fallback_history, route, &error);
+                    self.invalidate_gpu_catalog_after_runtime_failure(route)?;
+                    self.retire_failed_route(route)?;
+                    last_retryable = Some(error);
+                }
+                // This is still before load can publish any output.  An Auto
+                // GPU route that fails its private worker protocol must not
+                // turn a CPU-safe request into a hard failure; record the
+                // protocol failure, retire the worker, and continue to the
+                // next bounded candidate (ultimately CPU). Explicit GPU
+                // keeps its strict no-CPU-fallback behavior below.
+                Err(error @ RuntimeError::WorkerUnavailable(_))
+                    if preference != AccelerationPreference::Cpu && route.provider.is_gpu() =>
+                {
+                    if let Some(health) = &plan.health {
+                        health.record_failure(
+                            route,
+                            health_observation_for_runtime_error(&error, false, false),
+                        );
+                    }
+                    record_backend_fallback(&mut fallback_history, route, &error);
+                    self.invalidate_gpu_catalog_after_runtime_failure(route)?;
+                    self.retire_failed_route(route)?;
+                    last_retryable = Some(RuntimeError::RetryableWorkerFailure(error.to_string()));
                 }
                 Err(error) => {
                     if let Some(health) = &plan.health {
@@ -6651,12 +7244,18 @@ impl InferenceWorkerRegistry {
     ) -> Result<RuntimeExecution, RuntimeError> {
         let _route_execution = self.lock_route_execution()?;
         let mut last_retryable = None;
+        let mut fallback_history = Vec::new();
         let mut attempted = false;
         let plan = self.routes_for_preference(preference, &artifact)?;
         if plan.routes.is_empty() {
             self.retire_active_worker()?;
         }
-        for route in plan.routes.iter().take(4) {
+        for (route_index, route) in plan
+            .routes
+            .iter()
+            .take(MAX_INFERENCE_ROUTE_ATTEMPTS)
+            .enumerate()
+        {
             if plan
                 .health
                 .as_ref()
@@ -6668,13 +7267,28 @@ impl InferenceWorkerRegistry {
             self.prepare_route(route)?;
             match route.supervisor.transcribe(
                 artifact.clone(),
-                preference,
+                Self::worker_preference_for_route(route, preference),
                 audio,
                 options.clone(),
                 cancellation_snapshot,
                 cancellation_generation,
             ) {
                 Ok(mut execution) => {
+                    if preference == AccelerationPreference::Auto {
+                        Self::project_auto_route_diagnostics(
+                            &mut execution.diagnostics,
+                            route,
+                            plan.selection_power_source
+                                .unwrap_or_else(PowerSource::current),
+                            plan.routes
+                                .iter()
+                                .skip(route_index + 1)
+                                .filter_map(|candidate| candidate.target.clone())
+                                .collect(),
+                            &fallback_history,
+                            &plan.skipped_targets,
+                        );
+                    }
                     if matches!(artifact, RuntimeArtifact::Gguf(_)) {
                         append_pack_diagnostic(
                             &mut execution.diagnostics.resolved_acceleration,
@@ -6692,13 +7306,63 @@ impl InferenceWorkerRegistry {
                             health_observation_for_runtime_error(&error, cancelled, false),
                         );
                     }
+                    self.invalidate_gpu_catalog_after_runtime_failure(route)?;
                     self.retire_failed_route(route)?;
                     if cancelled {
                         return Err(RuntimeError::Cancelled(
                             "transcription request was cancelled before output".to_owned(),
                         ));
                     }
+                    record_backend_fallback(&mut fallback_history, route, &error);
                     last_retryable = Some(error);
+                }
+                Err(
+                    error @ (RuntimeError::BackendInitializationFailed(_)
+                    | RuntimeError::BackendUnavailable(_)
+                    | RuntimeError::OutOfMemory(_)),
+                ) if preference != AccelerationPreference::Cpu && route.provider.is_gpu() => {
+                    let cancelled =
+                        cancellation_generation.load(Ordering::Acquire) != cancellation_snapshot;
+                    if let Some(health) = &plan.health {
+                        health.record_failure(
+                            route,
+                            health_observation_for_runtime_error(&error, cancelled, false),
+                        );
+                    }
+                    self.invalidate_gpu_catalog_after_runtime_failure(route)?;
+                    self.retire_failed_route(route)?;
+                    if cancelled {
+                        return Err(RuntimeError::Cancelled(
+                            "transcription request was cancelled before output".to_owned(),
+                        ));
+                    }
+                    record_backend_fallback(&mut fallback_history, route, &error);
+                    last_retryable = Some(error);
+                }
+                // Transcription has not returned a result at this point, so
+                // the worker protocol failure is pre-output. Auto may safely
+                // try its next qualified route; cancellation remains a hard
+                // stop and explicit GPU remains strict.
+                Err(error @ RuntimeError::WorkerUnavailable(_))
+                    if preference != AccelerationPreference::Cpu && route.provider.is_gpu() =>
+                {
+                    let cancelled =
+                        cancellation_generation.load(Ordering::Acquire) != cancellation_snapshot;
+                    if let Some(health) = &plan.health {
+                        health.record_failure(
+                            route,
+                            health_observation_for_runtime_error(&error, cancelled, false),
+                        );
+                    }
+                    self.invalidate_gpu_catalog_after_runtime_failure(route)?;
+                    self.retire_failed_route(route)?;
+                    if cancelled {
+                        return Err(RuntimeError::Cancelled(
+                            "transcription request was cancelled before output".to_owned(),
+                        ));
+                    }
+                    record_backend_fallback(&mut fallback_history, route, &error);
+                    last_retryable = Some(RuntimeError::RetryableWorkerFailure(error.to_string()));
                 }
                 Err(error) => {
                     let cancelled =
@@ -6749,7 +7413,7 @@ impl InferenceWorkerRegistry {
         if plan.routes.is_empty() {
             self.retire_active_worker()?;
         }
-        for route in plan.routes.iter().take(4) {
+        for route in plan.routes.iter().take(MAX_INFERENCE_ROUTE_ATTEMPTS) {
             if plan
                 .health
                 .as_ref()
@@ -6759,7 +7423,10 @@ impl InferenceWorkerRegistry {
             }
             attempted = true;
             self.prepare_route(route)?;
-            match route.supervisor.health(artifact.clone(), preference) {
+            match route.supervisor.health(
+                artifact.clone(),
+                Self::worker_preference_for_route(route, preference),
+            ) {
                 Ok(()) => {
                     if let Some(health) = &plan.health {
                         health.record_idle_probe_success(route);
@@ -6773,8 +7440,35 @@ impl InferenceWorkerRegistry {
                             health_observation_for_runtime_error(&error, false, false),
                         );
                     }
+                    self.invalidate_gpu_catalog_after_runtime_failure(route)?;
                     self.retire_failed_route(route)?;
                     last_retryable = Some(error);
+                }
+                Err(
+                    error @ (RuntimeError::BackendInitializationFailed(_)
+                    | RuntimeError::BackendUnavailable(_)
+                    | RuntimeError::OutOfMemory(_)),
+                ) if preference != AccelerationPreference::Cpu && route.provider.is_gpu() => {
+                    if let Some(health) = &plan.health {
+                        health.record_failure(
+                            route,
+                            health_observation_for_runtime_error(&error, false, false),
+                        );
+                    }
+                    self.invalidate_gpu_catalog_after_runtime_failure(route)?;
+                    self.retire_failed_route(route)?;
+                    last_retryable = Some(error);
+                }
+                Err(error @ RuntimeError::WorkerUnavailable(_)) if route.provider.is_gpu() => {
+                    if let Some(health) = &plan.health {
+                        health.record_failure(
+                            route,
+                            health_observation_for_runtime_error(&error, false, false),
+                        );
+                    }
+                    self.invalidate_gpu_catalog_after_runtime_failure(route)?;
+                    self.retire_failed_route(route)?;
+                    last_retryable = Some(RuntimeError::RetryableWorkerFailure(error.to_string()));
                 }
                 Err(error) => {
                     if let Some(health) = &plan.health {
@@ -6841,6 +7535,13 @@ impl InferenceWorkerRegistry {
             route.supervisor.shutdown()?;
         }
         if let Ok(routes) = self.gpu_routes.lock()
+            && let Some(routes) = routes.successful()
+        {
+            for route in routes.routes.iter() {
+                route.supervisor.shutdown()?;
+            }
+        }
+        if let Ok(routes) = self.auto_gpu_routes.lock()
             && let Some(routes) = routes.successful()
         {
             for route in routes.routes.iter() {
@@ -8427,6 +9128,7 @@ mod tests {
         InvalidResponse {
             pcm_kind: bool,
         },
+        RuntimeFailureOnLoad(RuntimeError),
         RuntimeLoadThenExit,
         VadNormal,
         VadCrashOnWindow,
@@ -8817,6 +9519,18 @@ mod tests {
                     control_frame(session_id, request_id, &Control::Health).unwrap()
                 };
                 write_frame(&mut output, &frame).unwrap();
+            }
+            TestMode::RuntimeFailureOnLoad(error) => {
+                let (session_id, request_id, control) = read_parent_control(&mut input);
+                assert!(matches!(control, Control::LoadRuntime { .. }));
+                respond(
+                    &mut output,
+                    session_id,
+                    request_id,
+                    Control::RuntimeFailed {
+                        error: WireRuntimeError::from_runtime(&error),
+                    },
+                );
             }
             TestMode::RuntimeLoadThenExit => {
                 let (session_id, request_id, control) = read_parent_control(&mut input);
@@ -10084,6 +10798,19 @@ mod tests {
             target: Some(target),
             health_key: None,
             consume_retry_bypass: false,
+            auto_evidence_id: None,
+        }
+    }
+
+    fn inference_supervisor_with_launcher(
+        launcher: Arc<TestLauncher>,
+    ) -> InferenceWorkerSupervisor {
+        InferenceWorkerSupervisor {
+            transport: ProcessWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+                launcher,
+                short_deadlines(),
+            ),
+            next_correlation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -10094,7 +10821,56 @@ mod tests {
             diagnostic: None,
             discovery_fingerprint: "test-catalog".to_owned(),
             provider_probe_incomplete: false,
+            skipped_targets: Vec::new(),
         }
+    }
+
+    fn fixture_auto_policy(
+        target: &BackendTarget,
+        model_digest: &str,
+        evidence_id: &str,
+    ) -> AutoQualificationPolicy {
+        let pack = target.pack.as_ref().expect("fixture target pack identity");
+        let backend = match target.backend {
+            BackendKind::Cuda => "cuda",
+            BackendKind::Vulkan => "vulkan",
+            BackendKind::Metal => "metal",
+            BackendKind::Cpu => "cpu",
+        };
+        let vendor = match target.vendor {
+            GpuVendor::Nvidia => "nvidia",
+            GpuVendor::Amd => "amd",
+            GpuVendor::Intel => "intel",
+            GpuVendor::Apple => "apple",
+            GpuVendor::Other => "other",
+            GpuVendor::Unknown => "unknown",
+        };
+        let device_class = match target.device_class {
+            DeviceClass::DiscreteGpu => "discrete_gpu",
+            DeviceClass::IntegratedGpu => "integrated_gpu",
+            DeviceClass::UnifiedGpu => "unified_gpu",
+            DeviceClass::Cpu => "cpu",
+            DeviceClass::Accelerator => "accelerator",
+            DeviceClass::Unknown => "unknown",
+        };
+        let string = |value: &str| serde_json::to_string(value).unwrap();
+        let manifest = format!(
+            "{{\"schema_version\":1,\"mode\":\"default_deny\",\"target_os\":\"windows\",\"target_arch\":\"x86_64\",\"entries\":[{{\"pack\":{{\"pack_id\":{},\"pack_version\":{},\"pack_digest\":{},\"security_epoch\":{},\"runtime_abi\":{}}},\"model_digest\":{},\"backend\":{},\"provider_id\":{},\"vendor\":{},\"device_class\":{},\"minimum_total_memory_bytes\":{},\"driver\":{{\"kind\":\"exact\",\"value\":{}}},\"evidence\":{{\"id\":{},\"cold_runs\":5,\"warm_runs\":20,\"gpu_p95_ms\":110,\"cpu_p95_ms\":100,\"correctness_verified\":true,\"reliability_verified\":true,\"cold_evidence_sha256\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"warm_evidence_sha256\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"transcript_parity_evidence_sha256\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"}}}}]}}",
+            string(&pack.pack_id),
+            string(&pack.pack_version),
+            string(&pack.pack_digest),
+            pack.security_epoch,
+            pack.runtime_abi,
+            string(model_digest),
+            string(backend),
+            string(target.provider_id.as_str()),
+            string(vendor),
+            string(device_class),
+            target.memory_total_bytes,
+            string(target.driver_version.as_deref().expect("fixture driver")),
+            string(evidence_id),
+        );
+        AutoQualificationPolicy::from_fixture_json(&manifest).unwrap()
     }
 
     #[test]
@@ -10265,6 +11041,7 @@ mod tests {
             let registry = InferenceWorkerRegistry {
                 routes: Arc::new(Vec::new()),
                 gpu_routes: Arc::new(Mutex::new(GpuRouteCatalogCache::default())),
+                auto_gpu_routes: Arc::new(Mutex::new(GpuRouteCatalogCache::default())),
                 gpu_health_path: Some(Arc::clone(&path)),
                 active_route: Arc::new(Mutex::new(None)),
                 route_execution: Arc::new(Mutex::new(())),
@@ -10370,6 +11147,7 @@ mod tests {
         let registry = InferenceWorkerRegistry {
             routes: Arc::new(Vec::new()),
             gpu_routes: Arc::new(Mutex::new(GpuRouteCatalogCache::default())),
+            auto_gpu_routes: Arc::new(Mutex::new(GpuRouteCatalogCache::default())),
             gpu_health_path: Some(Arc::clone(&path)),
             active_route: Arc::new(Mutex::new(None)),
             route_execution: Arc::new(Mutex::new(())),
@@ -10515,6 +11293,7 @@ mod tests {
                 successful: Some(catalog.clone()),
                 failed: None,
             })),
+            auto_gpu_routes: Arc::new(Mutex::new(GpuRouteCatalogCache::default())),
             gpu_health_path: Some(Arc::clone(&path)),
             active_route: Arc::new(Mutex::new(None)),
             route_execution: Arc::new(Mutex::new(())),
@@ -10725,6 +11504,45 @@ mod tests {
                 channels: 2
             }
         ));
+
+        for (runtime, code) in [
+            (
+                RuntimeError::BackendInitializationFailed(
+                    "fixture initialization failure".to_owned(),
+                ),
+                WireRuntimeErrorCode::BackendInitializationFailed,
+            ),
+            (
+                RuntimeError::BackendUnavailable("fixture device loss".to_owned()),
+                WireRuntimeErrorCode::BackendUnavailable,
+            ),
+            (
+                RuntimeError::OutOfMemory("fixture allocation failure".to_owned()),
+                WireRuntimeErrorCode::OutOfMemory,
+            ),
+        ] {
+            let wire = WireRuntimeError::from_runtime(&runtime);
+            assert_eq!(wire.code, code);
+            assert_eq!(wire.category, WireFailureCategory::Provider);
+            assert_eq!(wire.retry, WireRetryDisposition::NextProviderBeforeOutput);
+            assert!(matches!(
+                (code, wire.into_runtime()),
+                (
+                    WireRuntimeErrorCode::BackendInitializationFailed,
+                    RuntimeError::BackendInitializationFailed(_)
+                ) | (
+                    WireRuntimeErrorCode::BackendUnavailable,
+                    RuntimeError::BackendUnavailable(_)
+                ) | (
+                    WireRuntimeErrorCode::OutOfMemory,
+                    RuntimeError::OutOfMemory(_)
+                )
+            ));
+        }
+        let content_failure = WireRuntimeError::from_runtime(&RuntimeError::Engine(
+            "fixture content failure".to_owned(),
+        ));
+        assert_eq!(content_failure.retry, WireRetryDisposition::Never);
 
         let artifact_path = PathBuf::from("models").join("fixture.gguf");
         let integrity = WireRuntimeError::from_runtime(&RuntimeError::ArtifactIntegrity {
@@ -10982,6 +11800,7 @@ mod tests {
                 target: Some(target.clone()),
                 health_key: None,
                 consume_retry_bypass: false,
+                auto_evidence_id: None,
             };
             let gpu_routes = Arc::new(vec![gpu_route]);
             let cpu_launcher = Arc::new(TestLauncher::new([]));
@@ -10998,8 +11817,10 @@ mod tests {
                     target: Some(BackendTarget::cpu()),
                     health_key: None,
                     consume_retry_bypass: false,
+                    auto_evidence_id: None,
                 }]),
                 gpu_routes: Arc::new(Mutex::new(GpuRouteCatalogCache::default())),
+                auto_gpu_routes: Arc::new(Mutex::new(GpuRouteCatalogCache::default())),
                 gpu_health_path: None,
                 active_route: Arc::new(Mutex::new(None)),
                 route_execution: Arc::new(Mutex::new(())),
@@ -11009,6 +11830,7 @@ mod tests {
                     diagnostic: Some("fixture-only hardware smoke".to_owned()),
                     discovery_fingerprint: "fixture-hardware-smoke".to_owned(),
                     provider_probe_incomplete: false,
+                    skipped_targets: Vec::new(),
                 }),
             };
             let artifact = RuntimeArtifact::Gguf(RuntimeModel {
@@ -11121,6 +11943,346 @@ mod tests {
         let cache = registry.gpu_routes.lock().unwrap();
         assert!(cache.successful.is_none());
         assert!(cache.failed.is_none());
+        drop(cache);
+        let auto_cache = registry.auto_gpu_routes.lock().unwrap();
+        assert!(auto_cache.successful.is_none());
+        assert!(auto_cache.failed.is_none());
+    }
+
+    #[test]
+    fn auto_gpu_oom_falls_back_to_cpu_and_invalidates_the_cached_binding() {
+        let gpu_launcher = Arc::new(TestLauncher::new([TestMode::RuntimeFailureOnLoad(
+            RuntimeError::OutOfMemory("fixture GPU allocation failed".to_owned()),
+        )]));
+        let cpu_launcher = Arc::new(TestLauncher::new([TestMode::RuntimeLoadThenExit]));
+        let mut gpu_route = verified_gpu_route(
+            BackendKind::Cuda,
+            "native:pci:0000:01:00.0",
+            "windows-display:32.0.16.1088",
+            'a',
+        );
+        gpu_route.supervisor = inference_supervisor_with_launcher(Arc::clone(&gpu_launcher));
+        gpu_route.auto_evidence_id = Some("failed-cuda-evidence".to_owned());
+        let catalog = verified_gpu_catalog(vec![gpu_route]);
+
+        let mut registry = InferenceWorkerRegistry::with_cpu_supervisor(
+            inference_supervisor_with_launcher(Arc::clone(&cpu_launcher)),
+        );
+        registry
+            .auto_gpu_routes
+            .lock()
+            .unwrap()
+            .record_probe(catalog.clone(), Instant::now());
+        registry
+            .gpu_routes
+            .lock()
+            .unwrap()
+            .record_probe(catalog.clone(), Instant::now());
+        registry.gpu_routes_for_testing = Some(catalog);
+
+        let execution = registry
+            .load(missing_gguf_artifact(), AccelerationPreference::Auto)
+            .expect("Auto must retain its guaranteed CPU fallback after a pre-output GPU OOM");
+
+        assert_eq!(gpu_launcher.launches.load(Ordering::Acquire), 1);
+        assert_eq!(cpu_launcher.launches.load(Ordering::Acquire), 1);
+        let selection = execution
+            .diagnostics
+            .resolved_acceleration
+            .selection
+            .as_ref()
+            .expect("Auto CPU fallback must retain typed selection diagnostics");
+        assert_eq!(selection.target.backend, BackendKind::Cpu);
+        assert_eq!(selection.reason, BackendSelectionReason::AutoCpuFallback);
+        assert_eq!(selection.fallback_history.len(), 1);
+        assert_eq!(
+            selection.fallback_history[0].category,
+            BackendFailureCategory::OutOfMemory
+        );
+        assert_eq!(
+            selection.fallback_history[0].target.backend,
+            BackendKind::Cuda
+        );
+        assert!(
+            !execution
+                .diagnostics
+                .resolved_acceleration
+                .diagnostic
+                .as_deref()
+                .unwrap_or_default()
+                .contains("failed-cuda-evidence")
+        );
+        for cache in [&registry.auto_gpu_routes, &registry.gpu_routes] {
+            let cache = cache.lock().unwrap();
+            assert!(cache.successful.is_none());
+            assert!(cache.failed.is_none());
+            assert!(matches!(
+                cache.lookup("test-catalog", Instant::now()),
+                GpuRouteCatalogLookup::Probe
+            ));
+        }
+    }
+
+    #[test]
+    fn auto_gpu_initialization_and_device_loss_failures_use_typed_cpu_fallback() {
+        for (runtime_error, expected_category) in [
+            (
+                RuntimeError::BackendInitializationFailed(
+                    "fixture GPU initialization failed".to_owned(),
+                ),
+                BackendFailureCategory::InitializationFailed,
+            ),
+            (
+                RuntimeError::BackendUnavailable("fixture GPU device was lost".to_owned()),
+                BackendFailureCategory::DeviceLost,
+            ),
+        ] {
+            let gpu_launcher = Arc::new(TestLauncher::new([TestMode::RuntimeFailureOnLoad(
+                runtime_error,
+            )]));
+            let cpu_launcher = Arc::new(TestLauncher::new([TestMode::RuntimeLoadThenExit]));
+            let mut gpu_route = verified_gpu_route(
+                BackendKind::Vulkan,
+                "native:pci:0000:01:00.0",
+                "windows-display:32.0.16.1088",
+                'a',
+            );
+            gpu_route.supervisor = inference_supervisor_with_launcher(Arc::clone(&gpu_launcher));
+            let mut registry = InferenceWorkerRegistry::with_cpu_supervisor(
+                inference_supervisor_with_launcher(Arc::clone(&cpu_launcher)),
+            );
+            registry.gpu_routes_for_testing = Some(verified_gpu_catalog(vec![gpu_route]));
+
+            let execution = registry
+                .load(missing_gguf_artifact(), AccelerationPreference::Auto)
+                .expect("a typed pre-output provider failure must retain Auto's CPU fallback");
+
+            assert_eq!(gpu_launcher.launches.load(Ordering::Acquire), 1);
+            assert_eq!(cpu_launcher.launches.load(Ordering::Acquire), 1);
+            let selection = execution
+                .diagnostics
+                .resolved_acceleration
+                .selection
+                .as_ref()
+                .expect("provider fallback must retain typed diagnostics");
+            assert_eq!(selection.target.backend, BackendKind::Cpu);
+            assert_eq!(selection.fallback_history.len(), 1);
+            assert_eq!(selection.fallback_history[0].category, expected_category);
+        }
+    }
+
+    #[test]
+    fn auto_diagnostics_use_the_actual_winning_gpu_evidence_and_fallback_history() {
+        let first_launcher = Arc::new(TestLauncher::new([TestMode::RuntimeFailureOnLoad(
+            RuntimeError::OutOfMemory("fixture GPU allocation failed".to_owned()),
+        )]));
+        let second_launcher = Arc::new(TestLauncher::new([TestMode::RuntimeLoadThenExit]));
+        let cpu_launcher = Arc::new(TestLauncher::new([]));
+        let mut first = verified_gpu_route(
+            BackendKind::Cuda,
+            "native:pci:0000:01:00.0",
+            "windows-display:32.0.16.1088",
+            'a',
+        );
+        first.supervisor = inference_supervisor_with_launcher(Arc::clone(&first_launcher));
+        first.auto_evidence_id = Some("failed-cuda-evidence".to_owned());
+        let mut second = verified_gpu_route(
+            BackendKind::Vulkan,
+            "native:pci:0000:02:00.0",
+            "windows-display:32.0.16.1088",
+            'b',
+        );
+        second.supervisor = inference_supervisor_with_launcher(Arc::clone(&second_launcher));
+        second.auto_evidence_id = Some("winning-vulkan-evidence".to_owned());
+        let skipped_target = verified_gpu_route(
+            BackendKind::Vulkan,
+            "native:pci:0000:03:00.0",
+            "windows-display:32.0.16.1088",
+            'c',
+        )
+        .target
+        .unwrap();
+        let mut catalog = verified_gpu_catalog(vec![first, second]);
+        catalog.skipped_targets.push(SkippedBackend {
+            target: skipped_target,
+            reason: BackendSkipReason::Quarantined,
+        });
+
+        let mut registry = InferenceWorkerRegistry::with_cpu_supervisor(
+            inference_supervisor_with_launcher(Arc::clone(&cpu_launcher)),
+        );
+        registry.gpu_routes_for_testing = Some(catalog);
+        let execution = registry
+            .load(missing_gguf_artifact(), AccelerationPreference::Auto)
+            .expect("the second qualified GPU route should win after a pre-output OOM");
+
+        assert_eq!(first_launcher.launches.load(Ordering::Acquire), 1);
+        assert_eq!(second_launcher.launches.load(Ordering::Acquire), 1);
+        assert_eq!(cpu_launcher.launches.load(Ordering::Acquire), 0);
+        let selection = execution
+            .diagnostics
+            .resolved_acceleration
+            .selection
+            .as_ref()
+            .expect("winning GPU route must retain typed Auto diagnostics");
+        assert_eq!(selection.target.backend, BackendKind::Vulkan);
+        assert_eq!(selection.reason, BackendSelectionReason::AutoPriority);
+        assert_eq!(selection.fallback_history.len(), 1);
+        assert_eq!(
+            selection.fallback_history[0].category,
+            BackendFailureCategory::OutOfMemory
+        );
+        assert_eq!(selection.skipped_targets.len(), 1);
+        assert_eq!(
+            selection.skipped_targets[0].reason,
+            BackendSkipReason::Quarantined
+        );
+        let diagnostic = execution
+            .diagnostics
+            .resolved_acceleration
+            .diagnostic
+            .as_deref()
+            .unwrap_or_default();
+        assert!(diagnostic.contains("winning-vulkan-evidence"));
+        assert!(!diagnostic.contains("failed-cuda-evidence"));
+    }
+
+    #[test]
+    fn power_filtering_does_not_change_the_physical_device_health_witness() {
+        let mut route = verified_gpu_route(
+            BackendKind::Cuda,
+            "native:pci:0000:01:00.0",
+            "windows-display:32.0.16.1088",
+            'a',
+        );
+        let target = route.target.as_mut().unwrap();
+        target.provider_id = ProviderIdentity::new("transcribe-cpp-ggml-cuda");
+        target.vendor = GpuVendor::Nvidia;
+        target.device_class = DeviceClass::DiscreteGpu;
+        target.pack.as_mut().unwrap().pack_id = "scribe-cuda-windows-x64".to_owned();
+        let model_digest = "b".repeat(64);
+        let policy = fixture_auto_policy(target, &model_digest, "power-witness-fixture-v1");
+        let catalog = verified_gpu_catalog(vec![route]);
+
+        let ac = auto_qualified_gpu_route_catalog(
+            catalog.clone(),
+            &policy,
+            &model_digest,
+            PowerSource::Ac,
+        );
+        let battery =
+            auto_qualified_gpu_route_catalog(catalog, &policy, &model_digest, PowerSource::Battery);
+
+        assert_eq!(ac.routes.len(), 1);
+        assert!(battery.routes.is_empty());
+        assert_eq!(
+            ac.device_set_digest, battery.device_set_digest,
+            "power-policy filtering must not invalidate health for an unchanged physical device set"
+        );
+    }
+
+    #[test]
+    fn auto_diagnostics_preserve_the_selection_time_power_source() {
+        let route = verified_gpu_route(
+            BackendKind::Cuda,
+            "native:pci:0000:01:00.0",
+            "windows-display:32.0.16.1088",
+            'a',
+        );
+        let mut diagnostics: NativeRuntimeDiagnostics =
+            diagnostics_with_typed_backend_selection().into();
+
+        InferenceWorkerRegistry::project_auto_route_diagnostics(
+            &mut diagnostics,
+            &route,
+            PowerSource::Battery,
+            Vec::new(),
+            &[],
+            &[],
+        );
+
+        let selection = diagnostics
+            .resolved_acceleration
+            .selection
+            .expect("typed Auto selection");
+        assert_eq!(selection.requested, AccelerationPreference::Auto);
+        assert_eq!(selection.reason, BackendSelectionReason::AutoPriority);
+        assert_eq!(selection.power_source, PowerSource::Battery);
+        assert_eq!(
+            selection.power_policy,
+            PowerPolicyDecision::BatteryEfficientGpuOnly
+        );
+        assert_eq!(
+            selection.qualification_policy_version,
+            AUTO_QUALIFICATION_POLICY_VERSION
+        );
+    }
+
+    #[test]
+    fn auto_reserves_one_of_four_bounded_attempts_for_cpu() {
+        let gpu_routes = (0..4)
+            .map(|index| {
+                verified_gpu_route(
+                    BackendKind::Vulkan,
+                    &format!("native:pci:0000:0{}:00.0", index + 1),
+                    "windows-display:32.0.16.1088",
+                    char::from(b'a' + index as u8),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut cpu = verified_gpu_route(
+            BackendKind::Vulkan,
+            "native:pci:0000:05:00.0",
+            "windows-display:32.0.16.1088",
+            'e',
+        );
+        cpu.provider = WorkerProvider::Cpu;
+        cpu.target = Some(BackendTarget::cpu());
+        let cpu_routes = Arc::new(vec![cpu]);
+        let mut plan = InferenceWorkerRoutePlan {
+            routes: Arc::new(gpu_routes),
+            diagnostic: None,
+            health: None,
+            selection_power_source: Some(PowerSource::Ac),
+            skipped_targets: Vec::new(),
+        };
+
+        reserve_auto_cpu_fallback(&mut plan, &cpu_routes);
+
+        assert_eq!(plan.routes.len(), MAX_INFERENCE_ROUTE_ATTEMPTS);
+        assert!(plan.routes[..3].iter().all(|route| route.provider.is_gpu()));
+        assert_eq!(plan.routes[3].provider, WorkerProvider::Cpu);
+        assert!(plan.diagnostic.as_deref().is_some_and(|diagnostic| {
+            diagnostic.contains("reserve Auto's guaranteed CPU fallback")
+        }));
+    }
+
+    #[test]
+    fn auto_qualification_prefilters_verified_packs_before_provider_probe() {
+        let root = crate::gpu_worker_pack::manifest::test_support::temp_root(
+            "auto-qualification-preprobe",
+        );
+        let (_verifier, lease) =
+            crate::gpu_worker_pack::manifest::test_support::leased_fixture(&root);
+        let pack_id = lease.verified_pack().pack_id.clone();
+        let discovery = crate::gpu_worker_pack::PackLeaseDiscovery {
+            leases: vec![Arc::new(lease)],
+            diagnostics: Vec::new(),
+            catalog_generation: Some("fixture-generation".to_owned()),
+        };
+        let policy = AutoQualificationPolicy::embedded_windows_x64().unwrap();
+        let filtered = auto_qualified_pack_discovery(discovery, policy, &"b".repeat(64));
+        assert!(filtered.leases.is_empty());
+        assert_eq!(
+            filtered.diagnostics,
+            vec![crate::gpu_worker_pack::PackDiscoveryDiagnostic::pack(
+                crate::gpu_worker_pack::PackDiscoveryIssue::NotAutoQualified,
+                &pack_id,
+                PackBackend::Vulkan,
+            )]
+        );
+        drop(filtered);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -11168,6 +12330,32 @@ mod tests {
         ));
         assert!(matches!(
             cache.lookup("changed-catalog", later),
+            GpuRouteCatalogLookup::Probe
+        ));
+    }
+
+    #[test]
+    fn runtime_binding_failure_invalidates_a_successful_catalog_and_forces_reprobe() {
+        let now = Instant::now();
+        let mut cache = GpuRouteCatalogCache::default();
+        let catalog = verified_gpu_catalog(vec![verified_gpu_route(
+            BackendKind::Vulkan,
+            "native:pci:0000:01:00.0",
+            "windows-display:32.0.16.1088",
+            'a',
+        )]);
+        cache.record_probe(catalog, now);
+        assert!(matches!(
+            cache.lookup("test-catalog", now),
+            GpuRouteCatalogLookup::Successful(_)
+        ));
+
+        cache.invalidate_after_runtime_failure();
+
+        assert!(cache.successful.is_none());
+        assert!(cache.failed.is_none());
+        assert!(matches!(
+            cache.lookup("test-catalog", now),
             GpuRouteCatalogLookup::Probe
         ));
     }
@@ -11377,6 +12565,7 @@ mod tests {
             target: Some(backend_target(backend, identity, Some(0))),
             health_key: None,
             consume_retry_bypass: false,
+            auto_evidence_id: None,
         };
         let cpu = route(
             WorkerProvider::Cpu,
@@ -11453,10 +12642,12 @@ mod tests {
             target: Some(BackendTarget::cpu()),
             health_key: None,
             consume_retry_bypass: false,
+            auto_evidence_id: None,
         };
         let registry = InferenceWorkerRegistry {
             routes: Arc::new(vec![route(first.clone()), route(second.clone())]),
             gpu_routes: Arc::new(Mutex::new(GpuRouteCatalogCache::default())),
+            auto_gpu_routes: Arc::new(Mutex::new(GpuRouteCatalogCache::default())),
             gpu_health_path: None,
             active_route: Arc::new(Mutex::new(None)),
             route_execution: Arc::new(Mutex::new(())),
@@ -11506,6 +12697,7 @@ mod tests {
             target: Some(backend_target(BackendKind::Vulkan, identity, Some(0))),
             health_key: None,
             consume_retry_bypass: false,
+            auto_evidence_id: None,
         };
         let gpu_routes = Arc::new(vec![
             route(first.clone(), "native:pci:0000:01:00.0"),
@@ -11524,8 +12716,10 @@ mod tests {
                 target: Some(BackendTarget::cpu()),
                 health_key: None,
                 consume_retry_bypass: false,
+                auto_evidence_id: None,
             }]),
             gpu_routes: Arc::new(Mutex::new(GpuRouteCatalogCache::default())),
+            auto_gpu_routes: Arc::new(Mutex::new(GpuRouteCatalogCache::default())),
             gpu_health_path: None,
             active_route: Arc::new(Mutex::new(None)),
             route_execution: Arc::new(Mutex::new(())),
@@ -11535,6 +12729,7 @@ mod tests {
                 diagnostic: None,
                 discovery_fingerprint: "test-catalog".to_owned(),
                 provider_probe_incomplete: false,
+                skipped_targets: Vec::new(),
             }),
         };
         assert!(

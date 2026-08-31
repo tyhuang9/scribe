@@ -73,7 +73,7 @@ impl DeviceClass {
         )
     }
 
-    fn is_battery_eligible_gpu(self) -> bool {
+    pub(crate) fn is_battery_eligible_gpu(self) -> bool {
         matches!(self, Self::IntegratedGpu | Self::UnifiedGpu)
     }
 }
@@ -476,6 +476,7 @@ pub(crate) enum BackendSkipReason {
     Quarantined,
     BatteryPolicy,
     NotAutoQualified,
+    FallbackBound,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -511,9 +512,9 @@ pub(crate) struct BackendSelection {
     pub(crate) power_source: PowerSource,
     pub(crate) power_policy: PowerPolicyDecision,
     pub(crate) qualification_policy_version: u16,
-    /// Remaining eligible targets in deterministic retry order. Stage 1 does
-    /// not execute these fallbacks; the list is the contract for later worker
-    /// supervision without silently widening strict-GPU semantics.
+    /// Remaining eligible targets in deterministic retry order. Worker
+    /// supervision consumes this bounded list without silently widening
+    /// strict-GPU semantics.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) fallback_targets: Vec<BackendTarget>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
