@@ -19,7 +19,13 @@ created with a fixed descriptor set, a private process group, parent-death
 signal, `no_new_privs`, descriptor-rooted working directory, `close_range`, and
 `execveat(AT_EMPTY_PATH)`. A CLOEXEC error pipe makes setup and exec failures
 bounded and observable. The parent retains the authority through the worker
-Hello lifetime and terminates/reaps the whole process group on failure.
+Hello lifetime. An internal creator/guardian thread performs `fork` and remains
+alive for the worker lifetime so `PR_SET_PDEATHSIG` is not tied to the bounded
+supervisor's short-lived launch helper. The process wrapper terminates/reaps the
+whole process group on failure, including after the group leader exits. The
+actual execution descriptor is a private `memfd_create` snapshot whose length
+and SHA-256 are verified during copying and which is sealed against writes,
+growth, shrinkage, and further seal changes before `fork`.
 
 Future GPU packs retain their reserved FHS location under
 `/usr/lib/scribe/workers/packs/<id>/<version>/<digest>/`, but this delivery does
@@ -34,3 +40,8 @@ Run the isolated verification suite on Linux without Cargo:
 
 The suite intentionally uses `rustc` directly because the reviewed Linux
 Sherpa archive is not yet present. CI runs it on Ubuntu 22.04 and 24.04.
+
+Full Linux Cargo type-checking and package smoke evidence remain activation work
+until that reviewed Sherpa archive exists. PR 7D must also publish the
+root-private package tree atomically; sealed execution snapshots close the
+launch-time mutable-inode race but do not make partial package publication safe.

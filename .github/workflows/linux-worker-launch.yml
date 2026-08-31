@@ -4,7 +4,10 @@ on:
   push:
     paths:
       - '.github/workflows/linux-worker-launch.yml'
+      - '.gitattributes'
       - 'build.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
       - 'runtime-manifests/linux-worker-install-contract-x86_64.json'
       - 'scripts/linux-worker-launch-fixture.rs'
       - 'scripts/test-linux-worker-launch.sh'
@@ -17,7 +20,10 @@ on:
   pull_request:
     paths:
       - '.github/workflows/linux-worker-launch.yml'
+      - '.gitattributes'
       - 'build.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
       - 'runtime-manifests/linux-worker-install-contract-x86_64.json'
       - 'scripts/linux-worker-launch-fixture.rs'
       - 'scripts/test-linux-worker-launch.sh'
@@ -38,7 +44,9 @@ jobs:
         os: [ubuntu-22.04, ubuntu-24.04]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e # 1.96.0 branch reviewed 2026-08-27
       - name: Test descriptor-bound Linux worker launch
         run: ./scripts/test-linux-worker-launch.sh

@@ -14,8 +14,12 @@ fn linux_launcher_is_exactly_scoped_and_has_no_path_spawn_fallback() {
         "const RESOLVE_BENEATH: u64 = 0x08",
         "RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS",
         "const SYS_EXECVEAT: c_long = 322",
+        "const SYS_MEMFD_CREATE: c_long = 319",
         "const SYS_CLOSE_RANGE: c_long = 436",
         "const SYS_OPENAT2: c_long = 437",
+        "MFD_CLOEXEC | MFD_ALLOW_SEALING",
+        "F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE",
+        "let sealed_executable = create_sealed_snapshot(authority)?",
         "AT_EMPTY_PATH",
         "PR_SET_PDEATHSIG",
         "PR_SET_NO_NEW_PRIVS",
@@ -26,6 +30,8 @@ fn linux_launcher_is_exactly_scoped_and_has_no_path_spawn_fallback() {
         "SYS_EXECVEAT",
         "Linux worker exec handshake timed out",
         "cleanup_failed_child(pid)",
+        "classify_zero_record_exec_eof(pid)",
+        "waitpid(pid, &mut status, WNOHANG)",
     ] {
         assert!(
             launcher.contains(required),
@@ -45,6 +51,113 @@ fn linux_launcher_is_exactly_scoped_and_has_no_path_spawn_fallback() {
         assert!(
             !production.contains(forbidden),
             "production Linux launcher contains forbidden fallback: {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn launcher_retains_creator_guardian_and_cleans_the_process_group_after_leader_exit() {
+    let launcher = include_str!("linux_worker_launch.rs");
+    for required in [
+        "struct Guardian {",
+        "name(\"scribe-linux-worker-guardian\".to_owned())",
+        ".and_then(|()| prepared.fork_exec())",
+        "release_rx.recv().is_err()",
+        "recv_timeout(GUARDIAN_SHUTDOWN_TIMEOUT)",
+        "leader_reaped: bool",
+        "process_group_cleaned: bool",
+        "clean_process_group(&mut state)?",
+        "kill(-state.pid, SIGKILL)",
+        "guardian_outlives_short_lived_launch_helper_thread",
+        "leader_exit_cleanup_kills_reported_descendant",
+        "parent_death_signal_kills_worker_after_launcher_parent_exits",
+    ] {
+        assert!(
+            launcher.contains(required),
+            "missing Linux lifecycle invariant: {required}"
+        );
+    }
+
+    let launch = launcher
+        .split("fn launch_on_guardian(")
+        .nth(1)
+        .unwrap()
+        .split("fn guardian_cleanup")
+        .next()
+        .unwrap();
+    assert!(launch.find(".spawn(move ||").unwrap() < launch.find("prepared.fork_exec()").unwrap());
+    assert!(
+        launch.find("prepared.fork_exec()").unwrap() < launch.find("release_rx.recv()").unwrap()
+    );
+}
+
+#[test]
+fn sealed_snapshot_and_error_pipe_are_kernel_bounded() {
+    let launcher = include_str!("linux_worker_launch.rs");
+    let snapshot = launcher
+        .split("fn create_sealed_snapshot(")
+        .nth(1)
+        .unwrap()
+        .split("fn set_nonblocking")
+        .next()
+        .unwrap();
+    for required in [
+        "SYS_MEMFD_CREATE",
+        "MFD_CLOEXEC | MFD_ALLOW_SEALING",
+        "expected_executable_length()",
+        "expected_executable_sha256()?",
+        "F_ADD_SEALS, REQUIRED_MEMFD_SEALS",
+        "F_GET_SEALS",
+    ] {
+        assert!(
+            snapshot.contains(required),
+            "missing sealed snapshot invariant: {required}"
+        );
+    }
+    assert!(!snapshot.contains("MFD_EXEC"));
+    assert!(!snapshot.contains("MFD_NOEXEC_SEAL"));
+
+    let child_failure = launcher
+        .split("unsafe fn child_fail(")
+        .nth(1)
+        .unwrap()
+        .split("fn wait_for_exec")
+        .next()
+        .unwrap();
+    assert!(child_failure.contains("while offset < record.len()"));
+    assert!(child_failure.contains("offset += written as usize"));
+    assert!(child_failure.contains("*__errno_location() == EINTR"));
+
+    let error_pipe = launcher
+        .split("fn wait_for_exec(")
+        .nth(1)
+        .unwrap()
+        .split("fn cleanup_failed_child")
+        .next()
+        .unwrap();
+    assert!(error_pipe.contains("classify_zero_record_exec_eof(pid)"));
+    assert!(error_pipe.contains("waitpid(pid, &mut status, WNOHANG)"));
+    assert!(launcher.contains("sealed_memfd_snapshot_rejects_writes_and_preserves_digest"));
+    assert!(
+        launcher.contains("concurrent_source_mutation_rejects_or_executes_only_trusted_snapshot")
+    );
+    assert!(launcher.contains("zero-record child exit"));
+}
+
+#[test]
+fn linux_launcher_workflow_uses_reviewed_immutable_actions() {
+    let workflow = include_str!("../.github/workflows/linux-worker-launch.yml");
+    assert!(
+        workflow.contains("actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0")
+    );
+    assert!(workflow.contains("persist-credentials: false"));
+    assert!(workflow.contains(
+        "dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e # 1.96.0 branch reviewed 2026-08-27"
+    ));
+    for path in ["'.gitattributes'", "'Cargo.toml'", "'Cargo.lock'"] {
+        assert!(
+            workflow.contains(path),
+            "missing workflow path trigger: {path}"
         );
     }
 }
