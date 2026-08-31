@@ -13,7 +13,7 @@ expected = {"schema_version":1,"target":"x86_64-unknown-linux-gnu","package_form
 if document != expected or raw != (json.dumps(expected, separators=(",", ":")) + "\n").encode():
     raise SystemExit("Linux release package contract is not canonical default-deny")
 PY
-[[ "$(cat "$repo_root/runtime-manifests/gpu-auto-qualification-linux-x86_64.json")" == '{"schema_version":1,"mode":"default_deny","target_os":"linux","target_arch":"x86_64","entries":[]}' ]] || { echo 'Linux Auto qualification must remain canonical and empty.' >&2; exit 1; }
+[[ "$(cat "$repo_root/runtime-manifests/gpu-auto-qualification-linux-x86_64.json")" == '{"schema_version":2,"mode":"default_deny","target_os":"linux","target_arch":"x86_64","entries":[]}' ]] || { echo 'Linux Auto qualification must remain canonical and empty.' >&2; exit 1; }
 
 test_root="$(mktemp -d "${TMPDIR:-/tmp}/scribe-linux-package-test.XXXXXX")"
 trap 'status=$?; rm -rf -- "$test_root"; exit "$status"' EXIT

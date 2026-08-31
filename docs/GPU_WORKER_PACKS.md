@@ -63,9 +63,11 @@ with an entry. Only matching packs may be probed. After the challenge-bound
 Hello, it performs a second exact comparison of vendor, device class, and
 driver identity while enforcing the entry's minimum total-memory and minimum
 available-memory thresholds. Available memory is a live bounded Hello fact:
-zero means unavailable, a value above total is rejected, and a stale successful
-probe is never reused as Auto admission evidence. It is deliberately excluded
-from stable device identity and warm-state fingerprints. The worker applies the
+zero means unavailable and a value above total is rejected. Its successful
+admission catalog may be reused only while the exact same live warm worker owns
+the route; cold, changed, or retired routes must obtain a fresh Hello. It is
+deliberately excluded from stable device identity and warm-state fingerprints.
+The worker applies the
 AC/battery policy after qualification; unknown power is conservative and admits
 only integrated or unified GPUs. CPU is appended as Auto's final fallback.
 Explicit `GPU` deliberately bypasses the Auto evidence and available-memory

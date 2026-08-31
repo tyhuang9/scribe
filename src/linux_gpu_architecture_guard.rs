@@ -109,7 +109,7 @@ fn linux_auto_qualification_remains_canonical_default_deny() {
     ));
     assert_eq!(
         manifest,
-        "{\"schema_version\":1,\"mode\":\"default_deny\",\"target_os\":\"linux\",\"target_arch\":\"x86_64\",\"entries\":[]}\n"
+        "{\"schema_version\":2,\"mode\":\"default_deny\",\"target_os\":\"linux\",\"target_arch\":\"x86_64\",\"entries\":[]}\n"
     );
 }
 

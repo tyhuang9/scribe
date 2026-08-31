@@ -17,8 +17,8 @@ use crate::backend_policy::{
     BackendKind, BackendPackIdentity, BackendTarget, DeviceClass, GpuVendor, ProviderIdentity,
 };
 
-pub(crate) const AUTO_QUALIFICATION_POLICY_VERSION: u16 = 2;
-const QUALIFICATION_SCHEMA_VERSION: u16 = 1;
+pub(crate) const AUTO_QUALIFICATION_POLICY_VERSION: u16 = 3;
+const QUALIFICATION_SCHEMA_VERSION: u16 = 2;
 const WINDOWS_X64_OS: &str = "windows";
 const WINDOWS_X64_ARCH: &str = "x86_64";
 const LINUX_X64_OS: &str = "linux";
@@ -1209,6 +1209,15 @@ mod tests {
             AutoQualificationPolicy::from_fixture_json("{\"schema_version\":1}"),
             Err(AutoQualificationError::Parse(_))
         ));
+        let mut old_schema = fixture_document();
+        old_schema.schema_version = QUALIFICATION_SCHEMA_VERSION - 1;
+        assert_eq!(
+            AutoQualificationPolicy::from_fixture_json(
+                &serde_json::to_string(&old_schema).unwrap()
+            ),
+            Err(AutoQualificationError::UnsupportedSchema),
+            "pre-available-memory qualification entries must fail closed"
+        );
         for (backend, vendor, device_class) in [
             (
                 BackendKind::Cpu,
@@ -1234,7 +1243,7 @@ mod tests {
         }
         assert!(matches!(
             AutoQualificationPolicy::from_fixture_json(
-                "{\"schema_version\":1,\"mode\":\"default_deny\",\"target_os\":\"windows\",\"target_arch\":\"x86_64\",\"entries\":[],\"unexpected\":true}"
+                "{\"schema_version\":2,\"mode\":\"default_deny\",\"target_os\":\"windows\",\"target_arch\":\"x86_64\",\"entries\":[],\"unexpected\":true}"
             ),
             Err(AutoQualificationError::Parse(_))
         ));

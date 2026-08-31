@@ -24,6 +24,7 @@ MAX_LANES = 64
 MAX_ARTIFACTS = 4096
 MAX_CUMULATIVE_ARTIFACT_BYTES = 512 * 1024 * 1024
 MIN_GPU_MEMORY_BYTES = 256 * 1024 * 1024
+AUTO_QUALIFICATION_SCHEMA_VERSION = 2
 MIN_GPU_PEAK_MEMORY_BYTES = 16 * 1024 * 1024
 ZERO_SHA256 = "0" * 64
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
@@ -662,6 +663,7 @@ def validate_identity(value: Any, label: str) -> dict[str, Any]:
             "memory_model",
             "total_memory_bytes",
             "qualified_minimum_total_memory_bytes",
+            "qualified_minimum_available_memory_bytes",
         },
         f"{label}.device",
     )
@@ -687,6 +689,14 @@ def validate_identity(value: Any, label: str) -> dict[str, Any]:
     )
     if qualified_minimum > total_memory:
         fail(f"{label}.device qualified memory exceeds the observed total")
+    qualified_available_minimum = json_integer(
+        device["qualified_minimum_available_memory_bytes"],
+        f"{label}.device.qualified_minimum_available_memory_bytes",
+        MIN_GPU_MEMORY_BYTES,
+        qualified_minimum,
+    )
+    if qualified_available_minimum > qualified_minimum:
+        fail(f"{label}.device qualified available memory exceeds the qualified total")
     memory_model = json_string(device["memory_model"], f"{label}.device.memory_model", 32)
     expected_memory_model = "dedicated_vram" if device_class == "discrete_gpu" else "shared_host_memory"
     if memory_model != expected_memory_model:
@@ -851,7 +861,13 @@ def load_auto_manifest_entries(raw: bytes) -> list[dict[str, Any]]:
         "Linux Auto manifest",
     )
     if (
-        json_integer(manifest["schema_version"], "Linux Auto manifest.schema_version", 1, 1) != 1
+        json_integer(
+            manifest["schema_version"],
+            "Linux Auto manifest.schema_version",
+            AUTO_QUALIFICATION_SCHEMA_VERSION,
+            AUTO_QUALIFICATION_SCHEMA_VERSION,
+        )
+        != AUTO_QUALIFICATION_SCHEMA_VERSION
         or json_string(manifest["mode"], "Linux Auto manifest.mode") != "default_deny"
         or json_string(manifest["target_os"], "Linux Auto manifest.target_os") != "linux"
         or json_string(manifest["target_arch"], "Linux Auto manifest.target_arch") != "x86_64"
@@ -860,22 +876,104 @@ def load_auto_manifest_entries(raw: bytes) -> list[dict[str, Any]]:
     if type(manifest["entries"]) is not list:
         fail("Linux Auto manifest.entries must be an array")
     for index, entry in enumerate(manifest["entries"]):
-        exact_keys(
-            entry,
-            {
-                "pack",
-                "model_digest",
-                "backend",
-                "provider_id",
-                "vendor",
-                "device_class",
-                "minimum_total_memory_bytes",
-                "driver",
-                "evidence",
-            },
-            f"Linux Auto manifest entry {index}",
-        )
+        validate_auto_manifest_entry(entry, f"Linux Auto manifest entry {index}")
     return manifest["entries"]
+
+
+def validate_auto_manifest_entry(value: Any, label: str) -> None:
+    """Reject any Linux entry the embedded Rust Auto policy would reject."""
+    entry = exact_keys(
+        value,
+        {
+            "pack",
+            "model_digest",
+            "backend",
+            "provider_id",
+            "vendor",
+            "device_class",
+            "minimum_total_memory_bytes",
+            "minimum_available_memory_bytes",
+            "driver",
+            "evidence",
+        },
+        label,
+    )
+    validate_pack(entry["pack"], f"{label}.pack")
+    sha256_value(entry["model_digest"], f"{label}.model_digest")
+    backend = json_string(entry["backend"], f"{label}.backend", 16)
+    provider = identifier(entry["provider_id"], f"{label}.provider_id")
+    vendor = json_string(entry["vendor"], f"{label}.vendor", 16)
+    device_class = json_string(entry["device_class"], f"{label}.device_class", 32)
+    if device_class not in {"discrete_gpu", "integrated_gpu", "unified_gpu"}:
+        fail(f"{label}.device_class is unsupported")
+    valid_binding = (
+        backend == "cuda" and provider == "transcribe-cpp-ggml-cuda" and vendor == "nvidia"
+    ) or (
+        backend == "vulkan"
+        and provider == "transcribe-cpp-ggml-vulkan"
+        and vendor in {"nvidia", "amd", "intel"}
+    )
+    if not valid_binding:
+        fail(f"{label} has an invalid backend, provider, and vendor binding")
+    if entry["pack"]["pack_id"] != f"scribe-{backend}-linux-x64":
+        fail(f"{label}.pack.pack_id does not match the backend")
+    minimum_total = json_integer(
+        entry["minimum_total_memory_bytes"],
+        f"{label}.minimum_total_memory_bytes",
+        1,
+    )
+    json_integer(
+        entry["minimum_available_memory_bytes"],
+        f"{label}.minimum_available_memory_bytes",
+        1,
+        minimum_total,
+    )
+    driver = exact_keys(entry["driver"], {"kind", "value"}, f"{label}.driver")
+    if json_string(driver["kind"], f"{label}.driver.kind", 16) != "exact":
+        fail(f"{label}.driver.kind must be exact")
+    driver_value = json_string(driver["value"], f"{label}.driver.value", 128)
+    if DRIVER_IDENTITY_PATTERN.fullmatch(driver_value) is None:
+        fail(f"{label}.driver.value is not a canonical Linux runtime driver identity")
+    driver_prefixes = {
+        "nvidia": ("linux:nvidia:",),
+        "amd": ("linux:amdgpu:",),
+        "intel": ("linux:i915:", "linux:xe:"),
+    }
+    if not driver_value.startswith(driver_prefixes[vendor]):
+        fail(f"{label}.driver.value does not match the GPU vendor")
+    evidence = exact_keys(
+        entry["evidence"],
+        {
+            "id",
+            "cold_runs",
+            "warm_runs",
+            "gpu_p95_ms",
+            "cpu_p95_ms",
+            "correctness_verified",
+            "reliability_verified",
+            "cold_evidence_sha256",
+            "warm_evidence_sha256",
+            "transcript_parity_evidence_sha256",
+        },
+        f"{label}.evidence",
+    )
+    identifier(evidence["id"], f"{label}.evidence.id")
+    json_integer(evidence["cold_runs"], f"{label}.evidence.cold_runs", 5, (1 << 16) - 1)
+    json_integer(evidence["warm_runs"], f"{label}.evidence.warm_runs", 20, (1 << 16) - 1)
+    gpu_p95 = json_integer(evidence["gpu_p95_ms"], f"{label}.evidence.gpu_p95_ms", 1)
+    cpu_p95 = json_integer(evidence["cpu_p95_ms"], f"{label}.evidence.cpu_p95_ms", 1)
+    if not json_boolean(evidence["correctness_verified"], f"{label}.evidence.correctness_verified"):
+        fail(f"{label}.evidence correctness must be verified")
+    if not json_boolean(evidence["reliability_verified"], f"{label}.evidence.reliability_verified"):
+        fail(f"{label}.evidence reliability must be verified")
+    sha256_value(evidence["cold_evidence_sha256"], f"{label}.evidence.cold_evidence_sha256")
+    sha256_value(evidence["warm_evidence_sha256"], f"{label}.evidence.warm_evidence_sha256")
+    sha256_value(
+        evidence["transcript_parity_evidence_sha256"],
+        f"{label}.evidence.transcript_parity_evidence_sha256",
+    )
+    if gpu_p95 * 100 > cpu_p95 * 110:
+        fail(f"{label}.evidence violates the Auto p95 performance threshold")
 
 
 def validate_run(
@@ -1135,6 +1233,9 @@ def auto_entry_projection(
         "vendor": identity["device"]["vendor"],
         "device_class": identity["device"]["device_class"],
         "minimum_total_memory_bytes": identity["device"]["qualified_minimum_total_memory_bytes"],
+        "minimum_available_memory_bytes": identity["device"][
+            "qualified_minimum_available_memory_bytes"
+        ],
         "driver": identity["driver"],
         "evidence": {
             "id": identity["lane_id"],

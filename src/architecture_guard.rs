@@ -1182,7 +1182,7 @@ fn verified_worker_pack_stage_five_keeps_auto_evidence_bound_and_trust_closed() 
     assert!(qualification.contains("fn qualify_target"));
     let qualification_value: serde_json::Value = serde_json::from_str(qualification_manifest)
         .expect("Auto qualification manifest is valid JSON");
-    assert_eq!(qualification_value["schema_version"], 1);
+    assert_eq!(qualification_value["schema_version"], 2);
     assert_eq!(qualification_value["mode"], "default_deny");
     assert_eq!(qualification_value["target_os"], "windows");
     assert_eq!(qualification_value["target_arch"], "x86_64");

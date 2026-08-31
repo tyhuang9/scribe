@@ -52,7 +52,9 @@ impl LinuxPowerFactSource for SysfsPowerFactSource {
     }
 
     fn read_attribute(&self, supply_name: &str, attribute: &str) -> io::Result<Vec<u8>> {
-        if !is_safe_supply_name(supply_name) || !matches!(attribute, "type" | "online" | "status") {
+        if !is_safe_supply_name(supply_name)
+            || !matches!(attribute, "type" | "online" | "status" | "scope")
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "invalid power-supply attribute request",
@@ -85,7 +87,7 @@ fn power_source_from_facts(source: &impl LinuxPowerFactSource) -> PowerSource {
     }
 
     let mut mains_online = false;
-    let mut battery_discharging = false;
+    let mut system_battery_discharging = false;
     for name in names {
         let Ok(kind) = read_token(source, &name, "type") else {
             return PowerSource::Unknown;
@@ -102,11 +104,21 @@ fn power_source_from_facts(source: &impl LinuxPowerFactSource) -> PowerSource {
                 }
             }
             "Battery" => {
+                // `scope=Device` identifies a peripheral battery (for
+                // example a wireless keyboard), not the system power source.
+                // Older kernels may not expose scope; in that case retain the
+                // conservative historical interpretation as a system battery.
+                match read_optional_token(source, &name, "scope") {
+                    Ok(Some(scope)) if scope == "Device" => continue,
+                    Ok(Some(scope)) if scope == "System" => {}
+                    Ok(None) => {}
+                    Ok(Some(_)) | Err(_) => return PowerSource::Unknown,
+                }
                 let Ok(status) = read_token(source, &name, "status") else {
                     return PowerSource::Unknown;
                 };
                 match status.as_str() {
-                    "Discharging" => battery_discharging = true,
+                    "Discharging" => system_battery_discharging = true,
                     "Charging" | "Full" | "Not charging" | "Unknown" => {}
                     _ => return PowerSource::Unknown,
                 }
@@ -116,9 +128,14 @@ fn power_source_from_facts(source: &impl LinuxPowerFactSource) -> PowerSource {
         }
     }
 
-    if mains_online {
+    if mains_online && system_battery_discharging {
+        // Simultaneous online mains and a system battery actively discharging
+        // is an inconsistent transition or hostile fact set. Do not let it
+        // authorize a battery-ineligible Auto GPU.
+        PowerSource::Unknown
+    } else if mains_online {
         PowerSource::Ac
-    } else if battery_discharging {
+    } else if system_battery_discharging {
         PowerSource::Battery
     } else {
         // A disconnected mains supply plus a non-discharging battery is not
@@ -133,6 +150,22 @@ fn read_token(
     attribute: &str,
 ) -> io::Result<String> {
     let bytes = source.read_attribute(supply_name, attribute)?;
+    token_from_bytes(bytes)
+}
+
+fn read_optional_token(
+    source: &impl LinuxPowerFactSource,
+    supply_name: &str,
+    attribute: &str,
+) -> io::Result<Option<String>> {
+    match source.read_attribute(supply_name, attribute) {
+        Ok(bytes) => token_from_bytes(bytes).map(Some),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn token_from_bytes(bytes: Vec<u8>) -> io::Result<String> {
     if bytes.is_empty() || bytes.len() > MAX_ATTRIBUTE_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -264,6 +297,54 @@ mod tests {
     }
 
     #[test]
+    fn ignores_device_scope_batteries_and_rejects_conflicting_system_facts() {
+        let ac_with_peripheral = FixtureFacts::default()
+            .with_attribute("AC", "type", b"Mains\n".to_vec())
+            .with_attribute("AC", "online", b"1\n".to_vec())
+            .with_attribute("hidpp_battery_0", "type", b"Battery\n".to_vec())
+            .with_attribute("hidpp_battery_0", "scope", b"Device\n".to_vec())
+            .with_attribute("hidpp_battery_0", "status", b"Discharging\n".to_vec());
+        let peripheral_only = FixtureFacts::default()
+            .with_attribute("AC", "type", b"Mains\n".to_vec())
+            .with_attribute("AC", "online", b"0\n".to_vec())
+            .with_attribute("hidpp_battery_0", "type", b"Battery\n".to_vec())
+            .with_attribute("hidpp_battery_0", "scope", b"Device\n".to_vec())
+            .with_attribute("hidpp_battery_0", "status", b"Discharging\n".to_vec());
+        let conflicting_system = FixtureFacts::default()
+            .with_attribute("AC", "type", b"Mains\n".to_vec())
+            .with_attribute("AC", "online", b"1\n".to_vec())
+            .with_attribute("BAT0", "type", b"Battery\n".to_vec())
+            .with_attribute("BAT0", "scope", b"System\n".to_vec())
+            .with_attribute("BAT0", "status", b"Discharging\n".to_vec());
+        let device_and_system = FixtureFacts::default()
+            .with_attribute("AC", "type", b"Mains\n".to_vec())
+            .with_attribute("AC", "online", b"0\n".to_vec())
+            .with_attribute("hidpp_battery_0", "type", b"Battery\n".to_vec())
+            .with_attribute("hidpp_battery_0", "scope", b"Device\n".to_vec())
+            .with_attribute("hidpp_battery_0", "status", b"Discharging\n".to_vec())
+            .with_attribute("BAT0", "type", b"Battery\n".to_vec())
+            .with_attribute("BAT0", "scope", b"System\n".to_vec())
+            .with_attribute("BAT0", "status", b"Discharging\n".to_vec());
+
+        assert_eq!(
+            power_source_from_facts(&ac_with_peripheral),
+            PowerSource::Ac
+        );
+        assert_eq!(
+            power_source_from_facts(&peripheral_only),
+            PowerSource::Unknown
+        );
+        assert_eq!(
+            power_source_from_facts(&conflicting_system),
+            PowerSource::Unknown
+        );
+        assert_eq!(
+            power_source_from_facts(&device_and_system),
+            PowerSource::Battery
+        );
+    }
+
+    #[test]
     fn ambiguous_and_unreadable_facts_are_unknown() {
         let ambiguous = FixtureFacts::default()
             .with_attribute("AC", "type", b"Mains\n".to_vec())
@@ -277,11 +358,18 @@ mod tests {
             names_error: true,
             ..FixtureFacts::default()
         };
+        let unreadable_scope = FixtureFacts::default()
+            .with_attribute("BAT0", "type", b"Battery\n".to_vec())
+            .with_error("BAT0", "scope", io::ErrorKind::PermissionDenied);
 
         assert_eq!(power_source_from_facts(&ambiguous), PowerSource::Unknown);
         assert_eq!(power_source_from_facts(&unreadable), PowerSource::Unknown);
         assert_eq!(
             power_source_from_facts(&list_unreadable),
+            PowerSource::Unknown
+        );
+        assert_eq!(
+            power_source_from_facts(&unreadable_scope),
             PowerSource::Unknown
         );
     }

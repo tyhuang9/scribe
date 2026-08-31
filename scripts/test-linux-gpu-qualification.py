@@ -22,7 +22,7 @@ SCRIPT_ROOT = pathlib.Path(__file__).resolve().parent
 REPOSITORY_ROOT = SCRIPT_ROOT.parent
 TOOL_PATH = SCRIPT_ROOT / "qualify-linux-gpu-evidence.py"
 AUTO_MANIFEST = REPOSITORY_ROOT / "runtime-manifests/gpu-auto-qualification-linux-x86_64.json"
-EXPECTED_AUTO_BYTES = b'{"schema_version":1,"mode":"default_deny","target_os":"linux","target_arch":"x86_64","entries":[]}\n'
+EXPECTED_AUTO_BYTES = b'{"schema_version":2,"mode":"default_deny","target_os":"linux","target_arch":"x86_64","entries":[]}\n'
 PRODUCTION_AUTHORITY = REPOSITORY_ROOT / "runtime-manifests/linux-gpu-qualification-production-authority.json"
 EXPECTED_AUTHORITY_BYTES = b'{"approved_plan_sha256":[],"kind":"linux_gpu_qualification_production_authority","schema_version":1}\n'
 
@@ -152,6 +152,7 @@ def fixture_lane(gpu_warm_ms: int = 110) -> dict[str, Any]:
         "device": {
             "device_class": "discrete_gpu",
             "memory_model": "dedicated_vram",
+            "qualified_minimum_available_memory_bytes": 4_000_000_000,
             "qualified_minimum_total_memory_bytes": 8_000_000_000,
             "stable_device_id": stable_id,
             "total_memory_bytes": 12_884_901_888,
@@ -481,6 +482,73 @@ class QualificationFixtureTests(unittest.TestCase):
         self.assertEqual(lane["metrics"]["warm"]["cpu"]["peak_vram_bytes"], {"p50": 0, "p95": 0})
         self.assertGreater(lane["metrics"]["warm"]["gpu"]["peak_vram_bytes"]["p95"], 0)
 
+    def test_linux_auto_manifest_contract_projects_and_requires_available_memory(self) -> None:
+        identity = fixture_lane()["identity"]
+        entry = {
+            "pack": identity["pack"],
+            "model_digest": identity["model"]["model_digest"],
+            "backend": identity["backend"],
+            "provider_id": identity["provider_id"],
+            "vendor": identity["device"]["vendor"],
+            "device_class": identity["device"]["device_class"],
+            "minimum_total_memory_bytes": identity["device"][
+                "qualified_minimum_total_memory_bytes"
+            ],
+            "minimum_available_memory_bytes": identity["device"][
+                "qualified_minimum_available_memory_bytes"
+            ],
+            "driver": identity["driver"],
+            "evidence": {
+                "id": identity["lane_id"],
+                "cold_runs": 5,
+                "warm_runs": 20,
+                "gpu_p95_ms": 110,
+                "cpu_p95_ms": 100,
+                "correctness_verified": True,
+                "reliability_verified": True,
+                "cold_evidence_sha256": digest("cold"),
+                "warm_evidence_sha256": digest("warm"),
+                "transcript_parity_evidence_sha256": digest("transcript"),
+            },
+        }
+        document = {
+            "schema_version": qualification.AUTO_QUALIFICATION_SCHEMA_VERSION,
+            "mode": "default_deny",
+            "target_os": "linux",
+            "target_arch": "x86_64",
+            "entries": [entry],
+        }
+        self.assertEqual(
+            qualification.load_auto_manifest_entries(
+                json.dumps(document, separators=(",", ":")).encode("ascii")
+            ),
+            [entry],
+        )
+        for label, mutation in (
+            (
+                "missing available minimum",
+                lambda value: value.pop("minimum_available_memory_bytes"),
+            ),
+            (
+                "zero available minimum",
+                lambda value: value.__setitem__("minimum_available_memory_bytes", 0),
+            ),
+            (
+                "available minimum exceeds total",
+                lambda value: value.__setitem__(
+                    "minimum_available_memory_bytes",
+                    value["minimum_total_memory_bytes"] + 1,
+                ),
+            ),
+        ):
+            with self.subTest(label=label):
+                invalid = copy.deepcopy(document)
+                mutation(invalid["entries"][0])
+                with self.assertRaises(qualification.EvidenceError):
+                    qualification.load_auto_manifest_entries(
+                        json.dumps(invalid, separators=(",", ":")).encode("ascii")
+                    )
+
     def test_fixture_requires_explicit_test_mode_and_cannot_satisfy_release_gate(self) -> None:
         plan, evidence = fixture_documents(fixture_lane())
         rejected = self.run_tool(plan, evidence, allow_fixture=False)
@@ -567,6 +635,7 @@ class QualificationFixtureTests(unittest.TestCase):
         cases.append(("zero-vram", zero_vram))
         minimal_gpu = fixture_lane()
         minimal_gpu["identity"]["device"]["total_memory_bytes"] = 1
+        minimal_gpu["identity"]["device"]["qualified_minimum_available_memory_bytes"] = 1
         minimal_gpu["identity"]["device"]["qualified_minimum_total_memory_bytes"] = 1
         cases.append(("minimal-gpu", minimal_gpu))
         mislabeled = fixture_lane()

@@ -191,7 +191,7 @@ Assert-JsonInteger $manifest.schema_version 'GPU Auto qualification schema_versi
 foreach ($field in @('mode', 'target_os', 'target_arch')) {
     Assert-JsonString $manifest[$field] "GPU Auto qualification $field"
 }
-Assert-Condition ($manifest.schema_version -eq 1) 'GPU Auto qualification schema_version must be 1.'
+Assert-Condition ($manifest.schema_version -eq 2) 'GPU Auto qualification schema_version must be 2.'
 Assert-Condition ($manifest.mode -ceq 'default_deny') 'GPU Auto qualification mode must be default_deny.'
 Assert-Condition ($manifest.target_os -ceq 'windows' -and $manifest.target_arch -ceq 'x86_64') 'GPU Auto qualification manifest must target Windows x64.'
 Assert-Condition ($manifest.entries -is [System.Array]) 'GPU Auto qualification entries must be an array.'

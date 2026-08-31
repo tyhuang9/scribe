@@ -4243,6 +4243,21 @@ impl ProcessWorkerSupervisor {
             .map(|current| current.generation))
     }
 
+    fn current_generation_is_running(&self) -> Result<bool> {
+        let process = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| anyhow!("process worker supervisor state lock was poisoned"))?
+            .current
+            .as_ref()
+            .map(|current| Arc::clone(&current.process));
+        match process {
+            Some(process) => process.is_running(),
+            None => Ok(false),
+        }
+    }
+
     fn has_active_stream(&self) -> Result<bool> {
         Ok(self
             .inner
@@ -5881,6 +5896,12 @@ impl InferenceWorkerSupervisor {
             .max(1)
     }
 
+    fn has_live_generation(&self) -> bool {
+        self.transport
+            .current_generation_is_running()
+            .unwrap_or(false)
+    }
+
     pub(crate) fn load(
         &self,
         artifact: RuntimeArtifact,
@@ -6244,6 +6265,10 @@ struct InferenceWorkerRoutePlan {
     health: Option<GpuRouteHealth>,
     selection_power_source: Option<PowerSource>,
     skipped_targets: Vec<SkippedBackend>,
+    // This owns a fresh Hello result only for the lifetime of the current
+    // request. It may be retained after the matching route becomes the live
+    // warm owner, but never becomes a stable device or health identity.
+    auto_live_admission: Option<VerifiedGpuRouteCatalog>,
 }
 
 #[derive(Clone)]
@@ -6281,9 +6306,13 @@ enum GpuRouteCatalogLookup {
 
 impl GpuRouteCatalogCache {
     fn lookup(&self, discovery_fingerprint: &str, now: Instant) -> GpuRouteCatalogLookup {
-        let successful = self.successful.as_ref().filter(|catalog| {
-            !catalog.routes.is_empty() && catalog.discovery_fingerprint == discovery_fingerprint
-        });
+        let successful = self
+            .successful
+            .as_ref()
+            .filter(|catalog| {
+                !catalog.routes.is_empty() && catalog.discovery_fingerprint == discovery_fingerprint
+            })
+            .cloned();
         if let Some(failed) = self
             .failed
             .as_ref()
@@ -6294,7 +6323,7 @@ impl GpuRouteCatalogCache {
             }
             return successful.map_or_else(
                 || GpuRouteCatalogLookup::Backoff(failed.diagnostic.clone()),
-                |catalog| GpuRouteCatalogLookup::Successful(catalog.clone()),
+                GpuRouteCatalogLookup::Successful,
             );
         }
         if let Some(catalog) = successful {
@@ -6319,21 +6348,53 @@ impl GpuRouteCatalogCache {
         }
     }
 
-    /// Available memory is a live resource-admission fact, not a stable
-    /// device identity. Auto therefore retains only a short failed-probe
-    /// backoff and must re-run its bounded Hello probe before using a GPU.
-    fn auto_live_admission_backoff(
-        &self,
+    /// A successful Auto catalog is valid only while it names the exact
+    /// already-running warm owner. A stable route identity and supervisor
+    /// pointer bind that temporary reuse; available memory is never used as
+    /// an identity, fingerprint, or persisted value.
+    fn auto_live_admission_lookup(
+        &mut self,
         discovery_fingerprint: &str,
+        active: Option<&ActiveInferenceRoute>,
         now: Instant,
-    ) -> Option<Option<String>> {
-        self.failed
+    ) -> GpuRouteCatalogLookup {
+        let successful = self
+            .successful
             .as_ref()
-            .filter(|failed| {
-                failed.discovery_fingerprint == discovery_fingerprint
-                    && now < failed.retry_not_before
+            .filter(|catalog| {
+                !catalog.routes.is_empty()
+                    && catalog.discovery_fingerprint == discovery_fingerprint
+                    && active.is_some_and(|active| {
+                        catalog.routes.iter().any(|route| {
+                            InferenceWorkerRegistry::route_identity(route) == active.identity
+                                && InferenceWorkerRegistry::same_supervisor(
+                                    &route.supervisor,
+                                    &active.supervisor,
+                                )
+                        })
+                    })
             })
-            .map(|failed| failed.diagnostic.clone())
+            .cloned();
+        if successful.is_none() {
+            self.successful = None;
+        }
+        if let Some(failed) = self
+            .failed
+            .as_ref()
+            .filter(|failed| failed.discovery_fingerprint == discovery_fingerprint)
+        {
+            if now >= failed.retry_not_before {
+                return GpuRouteCatalogLookup::Probe;
+            }
+            return successful.map_or_else(
+                || GpuRouteCatalogLookup::Backoff(failed.diagnostic.clone()),
+                GpuRouteCatalogLookup::Successful,
+            );
+        }
+        successful.map_or(
+            GpuRouteCatalogLookup::Probe,
+            GpuRouteCatalogLookup::Successful,
+        )
     }
 
     fn record_auto_live_admission_probe(
@@ -6348,10 +6409,29 @@ impl GpuRouteCatalogCache {
             diagnostic: catalog.diagnostic.clone(),
             explicit_retry_available: false,
         });
-        // Do not retain a successful Auto route snapshot: it contains the
-        // volatile available-memory observation that must be re-admitted on
-        // the next Auto request.
+        // A fresh probe is not yet a warm owner. Keep no successful snapshot
+        // until `retain_auto_live_admission` verifies the exact active route.
         self.successful = None;
+    }
+
+    fn retain_auto_live_admission(
+        &mut self,
+        catalog: &VerifiedGpuRouteCatalog,
+        active: &ActiveInferenceRoute,
+    ) {
+        if !catalog.routes.is_empty()
+            && catalog.routes.iter().any(|route| {
+                InferenceWorkerRegistry::route_identity(route) == active.identity
+                    && InferenceWorkerRegistry::same_supervisor(
+                        &route.supervisor,
+                        &active.supervisor,
+                    )
+            })
+        {
+            self.successful = Some(catalog.clone());
+        } else {
+            self.successful = None;
+        }
     }
 
     fn grant_explicit_probe_retry(&mut self, discovery_fingerprint: &str, now: Instant) -> bool {
@@ -6996,6 +7076,7 @@ fn auto_gpu_route_plan(
     let selection_power_source = PowerSource::current();
     let catalog =
         auto_qualified_gpu_route_catalog(catalog, policy, model_digest, selection_power_source);
+    let auto_live_admission = (!catalog.routes.is_empty()).then(|| catalog.clone());
     let mut plan = health_filtered_gpu_route_plan(
         catalog,
         model_digest,
@@ -7003,8 +7084,41 @@ fn auto_gpu_route_plan(
         allow_unprobed_idle_health,
     );
     plan.selection_power_source = Some(selection_power_source);
+    plan.auto_live_admission = auto_live_admission;
     reserve_auto_cpu_fallback(&mut plan, &cpu_routes);
     plan
+}
+
+fn auto_route_is_power_eligible(route: &InferenceWorkerRoute, power_source: PowerSource) -> bool {
+    power_source == PowerSource::Ac
+        || !route.provider.is_gpu()
+        || route
+            .target
+            .as_ref()
+            .is_some_and(|target| target.device_class.is_battery_eligible_gpu())
+}
+
+fn auto_power_skip_reason(power_source: PowerSource) -> BackendSkipReason {
+    match power_source {
+        PowerSource::Battery => BackendSkipReason::BatteryPolicy,
+        PowerSource::Unknown => BackendSkipReason::UnknownPowerSource,
+        PowerSource::Ac => unreachable!("AC allows every qualified Auto GPU route"),
+    }
+}
+
+fn auto_pre_execution_power_source(selection_power_source: Option<PowerSource>) -> PowerSource {
+    // Tests provide the selection observation as a deterministic fact seam.
+    // Production always obtains a fresh operating-system fact directly before
+    // a discrete/unclassified Auto GPU can execute.
+    #[cfg(test)]
+    {
+        selection_power_source.unwrap_or_else(PowerSource::current)
+    }
+    #[cfg(not(test))]
+    {
+        let _ = selection_power_source;
+        PowerSource::current()
+    }
 }
 
 fn reserve_auto_cpu_fallback(
@@ -7057,6 +7171,7 @@ fn health_filtered_gpu_route_plan(
             health: None,
             selection_power_source: None,
             skipped_targets: catalog.skipped_targets,
+            auto_live_admission: None,
         };
     }
     let Some(path) = health_path else {
@@ -7078,6 +7193,7 @@ fn health_filtered_gpu_route_plan(
             health: None,
             selection_power_source: None,
             skipped_targets,
+            auto_live_admission: None,
         };
     };
     let health = GpuRouteHealth {
@@ -7161,6 +7277,7 @@ fn health_filtered_gpu_route_plan(
         health: Some(health),
         selection_power_source: None,
         skipped_targets,
+        auto_live_admission: None,
     }
 }
 
@@ -7294,6 +7411,54 @@ impl InferenceWorkerRegistry {
         Arc::ptr_eq(&left.transport.inner, &right.transport.inner)
     }
 
+    fn active_warm_auto_route(&self) -> Option<ActiveInferenceRoute> {
+        self.active_route
+            .lock()
+            .ok()?
+            .as_ref()
+            .filter(|active| active.identity.backend != BackendKind::Cpu)
+            .filter(|active| active.supervisor.has_live_generation())
+            .cloned()
+    }
+
+    fn clear_auto_live_admission(&self) {
+        if let Ok(mut cache) = self.auto_gpu_routes.lock() {
+            cache.successful = None;
+        }
+    }
+
+    fn retain_auto_live_admission(
+        &self,
+        catalog: &VerifiedGpuRouteCatalog,
+        route: &InferenceWorkerRoute,
+    ) -> Result<(), RuntimeError> {
+        if !route.provider.is_gpu() {
+            return Ok(());
+        }
+        let active = self
+            .active_route
+            .lock()
+            .map_err(|_| {
+                RuntimeError::WorkerUnavailable("active inference route lock poisoned".to_owned())
+            })?
+            .clone();
+        let Some(active) = active.filter(|active| {
+            active.identity == Self::route_identity(route)
+                && Self::same_supervisor(&active.supervisor, &route.supervisor)
+                && active.supervisor.has_live_generation()
+        }) else {
+            self.clear_auto_live_admission();
+            return Ok(());
+        };
+        self.auto_gpu_routes
+            .lock()
+            .map_err(|_| {
+                RuntimeError::WorkerUnavailable("Auto GPU worker registry lock poisoned".to_owned())
+            })?
+            .retain_auto_live_admission(catalog, &active);
+        Ok(())
+    }
+
     fn retire_active_worker(&self) -> Result<(), RuntimeError> {
         let active = self
             .active_route
@@ -7302,6 +7467,7 @@ impl InferenceWorkerRegistry {
                 RuntimeError::WorkerUnavailable("active inference route lock poisoned".to_owned())
             })?
             .take();
+        self.clear_auto_live_admission();
         if let Some(active) = active {
             active.supervisor.retire()?;
         }
@@ -7323,6 +7489,7 @@ impl InferenceWorkerRegistry {
                 .flatten()
         };
         let route_retirement = route.supervisor.retire();
+        self.clear_auto_live_admission();
         let active_retirement = if active_gpu
             .as_ref()
             .is_some_and(|active| !Self::same_supervisor(&active.supervisor, &route.supervisor))
@@ -7398,6 +7565,7 @@ impl InferenceWorkerRegistry {
                 .retire()
                 .map_err(RoutePreparationError::Fatal)?;
         }
+        self.clear_auto_live_admission();
         // Discovery, cache lookup, and retiring a prior route can take time.
         // Recheck directly before publication. An epoch advanced after this
         // boundary belongs to the next request; active work is never migrated.
@@ -7449,6 +7617,7 @@ impl InferenceWorkerRegistry {
                 health: None,
                 selection_power_source: None,
                 skipped_targets: Vec::new(),
+                auto_live_admission: None,
             });
         }
         if preference == AccelerationPreference::Auto {
@@ -7462,6 +7631,7 @@ impl InferenceWorkerRegistry {
                     health: None,
                     selection_power_source: None,
                     skipped_targets: Vec::new(),
+                    auto_live_admission: None,
                 });
             };
             #[cfg(test)]
@@ -7472,6 +7642,7 @@ impl InferenceWorkerRegistry {
                     health: None,
                     selection_power_source: Some(PowerSource::Ac),
                     skipped_targets: catalog.skipped_targets.clone(),
+                    auto_live_admission: None,
                 };
                 reserve_auto_cpu_fallback(&mut plan, &self.routes);
                 return Ok(plan);
@@ -7487,6 +7658,7 @@ impl InferenceWorkerRegistry {
                         health: None,
                         selection_power_source: None,
                         skipped_targets: Vec::new(),
+                        auto_live_admission: None,
                     });
                 }
             };
@@ -7510,21 +7682,28 @@ impl InferenceWorkerRegistry {
                     health: None,
                     selection_power_source: None,
                     skipped_targets: Vec::new(),
+                    auto_live_admission: None,
                 });
             }
             let discovery_fingerprint =
                 auto_gpu_discovery_fingerprint(&discovery, policy, &model.expected_sha256);
             let lookup_at = Instant::now();
-            let live_admission_backoff = {
-                let cached = self.auto_gpu_routes.lock().map_err(|_| {
+            let active_warm_route = self.active_warm_auto_route();
+            let cached_catalog = {
+                let mut cached = self.auto_gpu_routes.lock().map_err(|_| {
                     RuntimeError::WorkerUnavailable(
                         "Auto GPU worker registry lock poisoned".to_owned(),
                     )
                 })?;
-                cached.auto_live_admission_backoff(&discovery_fingerprint, lookup_at)
+                cached.auto_live_admission_lookup(
+                    &discovery_fingerprint,
+                    active_warm_route.as_ref(),
+                    lookup_at,
+                )
             };
-            let catalog = match live_admission_backoff {
-                Some(diagnostic) => VerifiedGpuRouteCatalog {
+            let catalog = match cached_catalog {
+                GpuRouteCatalogLookup::Successful(cached) => cached,
+                GpuRouteCatalogLookup::Backoff(diagnostic) => VerifiedGpuRouteCatalog {
                     routes: Arc::new(Vec::new()),
                     diagnostic,
                     device_set_digest: verified_gpu_device_set_digest(&[]),
@@ -7532,7 +7711,7 @@ impl InferenceWorkerRegistry {
                     provider_probe_incomplete: true,
                     skipped_targets: Vec::new(),
                 },
-                None => {
+                GpuRouteCatalogLookup::Probe => {
                     self.retire_active_worker()?;
                     let discovered = verified_gpu_route_catalog(
                         discover_production_pack_launch_bindings(discovery),
@@ -7568,6 +7747,7 @@ impl InferenceWorkerRegistry {
                 health: None,
                 selection_power_source: None,
                 skipped_targets: Vec::new(),
+                auto_live_admission: None,
             });
         };
 
@@ -7587,6 +7767,7 @@ impl InferenceWorkerRegistry {
                 health: None,
                 selection_power_source: None,
                 skipped_targets: catalog.skipped_targets.clone(),
+                auto_live_admission: None,
             });
         }
 
@@ -7772,6 +7953,8 @@ impl InferenceWorkerRegistry {
         let mut fallback_history = Vec::new();
         let mut attempted = false;
         let plan = self.routes_for_preference(preference, &artifact)?;
+        let mut execution_skipped_targets = plan.skipped_targets.clone();
+        let mut execution_power_source = plan.selection_power_source;
         if plan.routes.is_empty() {
             self.retire_active_worker()?;
         }
@@ -7787,6 +7970,20 @@ impl InferenceWorkerRegistry {
                 .is_some_and(|health| !health.consume_retry(route))
             {
                 continue;
+            }
+            if preference == AccelerationPreference::Auto && route.provider.is_gpu() {
+                let power_source = auto_pre_execution_power_source(plan.selection_power_source);
+                if !auto_route_is_power_eligible(route, power_source) {
+                    if let Some(target) = route.target.clone() {
+                        execution_skipped_targets.push(SkippedBackend {
+                            target,
+                            reason: auto_power_skip_reason(power_source),
+                        });
+                    }
+                    execution_power_source = Some(power_source);
+                    continue;
+                }
+                execution_power_source = Some(power_source);
             }
             attempted = true;
             match self.prepare_route(route) {
@@ -7812,18 +8009,20 @@ impl InferenceWorkerRegistry {
             ) {
                 Ok(mut execution) => {
                     if preference == AccelerationPreference::Auto {
+                        if let Some(catalog) = plan.auto_live_admission.as_ref() {
+                            self.retain_auto_live_admission(catalog, route)?;
+                        }
                         Self::project_auto_route_diagnostics(
                             &mut execution.diagnostics,
                             route,
-                            plan.selection_power_source
-                                .unwrap_or_else(PowerSource::current),
+                            execution_power_source.unwrap_or_else(PowerSource::current),
                             plan.routes
                                 .iter()
                                 .skip(route_index + 1)
                                 .filter_map(|candidate| candidate.target.clone())
                                 .collect(),
                             &fallback_history,
-                            &plan.skipped_targets,
+                            &execution_skipped_targets,
                         );
                     }
                     if matches!(artifact, RuntimeArtifact::Gguf(_)) {
@@ -7924,6 +8123,8 @@ impl InferenceWorkerRegistry {
         let mut fallback_history = Vec::new();
         let mut attempted = false;
         let plan = self.routes_for_preference(preference, &artifact)?;
+        let mut execution_skipped_targets = plan.skipped_targets.clone();
+        let mut execution_power_source = plan.selection_power_source;
         if plan.routes.is_empty() {
             self.retire_active_worker()?;
         }
@@ -7939,6 +8140,20 @@ impl InferenceWorkerRegistry {
                 .is_some_and(|health| !health.consume_retry(route))
             {
                 continue;
+            }
+            if preference == AccelerationPreference::Auto && route.provider.is_gpu() {
+                let power_source = auto_pre_execution_power_source(plan.selection_power_source);
+                if !auto_route_is_power_eligible(route, power_source) {
+                    if let Some(target) = route.target.clone() {
+                        execution_skipped_targets.push(SkippedBackend {
+                            target,
+                            reason: auto_power_skip_reason(power_source),
+                        });
+                    }
+                    execution_power_source = Some(power_source);
+                    continue;
+                }
+                execution_power_source = Some(power_source);
             }
             attempted = true;
             match self.prepare_route(route) {
@@ -7968,18 +8183,20 @@ impl InferenceWorkerRegistry {
             ) {
                 Ok(mut execution) => {
                     if preference == AccelerationPreference::Auto {
+                        if let Some(catalog) = plan.auto_live_admission.as_ref() {
+                            self.retain_auto_live_admission(catalog, route)?;
+                        }
                         Self::project_auto_route_diagnostics(
                             &mut execution.diagnostics,
                             route,
-                            plan.selection_power_source
-                                .unwrap_or_else(PowerSource::current),
+                            execution_power_source.unwrap_or_else(PowerSource::current),
                             plan.routes
                                 .iter()
                                 .skip(route_index + 1)
                                 .filter_map(|candidate| candidate.target.clone())
                                 .collect(),
                             &fallback_history,
-                            &plan.skipped_targets,
+                            &execution_skipped_targets,
                         );
                     }
                     if matches!(artifact, RuntimeArtifact::Gguf(_)) {
@@ -8114,6 +8331,19 @@ impl InferenceWorkerRegistry {
             {
                 continue;
             }
+            // Re-read the operating-system power fact immediately before a
+            // battery-ineligible Auto GPU can begin work. If it changed since
+            // selection, leave the current worker untouched and use the
+            // bounded remaining candidates instead.
+            if preference == AccelerationPreference::Auto
+                && route.provider.is_gpu()
+                && !auto_route_is_power_eligible(
+                    route,
+                    auto_pre_execution_power_source(plan.selection_power_source),
+                )
+            {
+                continue;
+            }
             attempted = true;
             match self.prepare_route(route) {
                 Ok(()) => {}
@@ -8135,6 +8365,11 @@ impl InferenceWorkerRegistry {
                 Self::worker_preference_for_route(route, preference),
             ) {
                 Ok(()) => {
+                    if preference == AccelerationPreference::Auto {
+                        if let Some(catalog) = plan.auto_live_admission.as_ref() {
+                            self.retain_auto_live_admission(catalog, route)?;
+                        }
+                    }
                     if let Some(health) = &plan.health {
                         health.record_idle_probe_success(route);
                     }
@@ -11559,7 +11794,7 @@ mod tests {
         };
         let string = |value: &str| serde_json::to_string(value).unwrap();
         let manifest = format!(
-            "{{\"schema_version\":1,\"mode\":\"default_deny\",\"target_os\":\"windows\",\"target_arch\":\"x86_64\",\"entries\":[{{\"pack\":{{\"pack_id\":{},\"pack_version\":{},\"pack_digest\":{},\"security_epoch\":{},\"runtime_abi\":{}}},\"model_digest\":{},\"backend\":{},\"provider_id\":{},\"vendor\":{},\"device_class\":{},\"minimum_total_memory_bytes\":{},\"minimum_available_memory_bytes\":{},\"driver\":{{\"kind\":\"exact\",\"value\":{}}},\"evidence\":{{\"id\":{},\"cold_runs\":5,\"warm_runs\":20,\"gpu_p95_ms\":110,\"cpu_p95_ms\":100,\"correctness_verified\":true,\"reliability_verified\":true,\"cold_evidence_sha256\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"warm_evidence_sha256\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"transcript_parity_evidence_sha256\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"}}}}]}}",
+            "{{\"schema_version\":2,\"mode\":\"default_deny\",\"target_os\":\"windows\",\"target_arch\":\"x86_64\",\"entries\":[{{\"pack\":{{\"pack_id\":{},\"pack_version\":{},\"pack_digest\":{},\"security_epoch\":{},\"runtime_abi\":{}}},\"model_digest\":{},\"backend\":{},\"provider_id\":{},\"vendor\":{},\"device_class\":{},\"minimum_total_memory_bytes\":{},\"minimum_available_memory_bytes\":{},\"driver\":{{\"kind\":\"exact\",\"value\":{}}},\"evidence\":{{\"id\":{},\"cold_runs\":5,\"warm_runs\":20,\"gpu_p95_ms\":110,\"cpu_p95_ms\":100,\"correctness_verified\":true,\"reliability_verified\":true,\"cold_evidence_sha256\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"warm_evidence_sha256\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"transcript_parity_evidence_sha256\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"}}}}]}}",
             string(&pack.pack_id),
             string(&pack.pack_version),
             string(&pack.pack_digest),
@@ -13003,6 +13238,7 @@ mod tests {
             health: None,
             selection_power_source: Some(PowerSource::Unknown),
             skipped_targets: unknown.skipped_targets.clone(),
+            auto_live_admission: None,
         };
         reserve_auto_cpu_fallback(&mut fallback_plan, &Arc::new(vec![cpu]));
         assert_eq!(fallback_plan.routes.len(), 1);
@@ -13049,6 +13285,7 @@ mod tests {
             health: None,
             selection_power_source: Some(PowerSource::Unknown),
             skipped_targets: catalog.skipped_targets,
+            auto_live_admission: None,
         };
 
         reserve_auto_cpu_fallback(&mut plan, &Arc::new(vec![cpu]));
@@ -13062,29 +13299,77 @@ mod tests {
     }
 
     #[test]
-    fn auto_route_cache_never_reuses_a_successful_available_memory_snapshot() {
+    fn auto_route_cache_reuses_only_the_matching_live_warm_owner() {
+        let launcher = Arc::new(TestLauncher::new([TestMode::Normal]));
+        let mut route = verified_gpu_route(
+            BackendKind::Cuda,
+            "native:pci:0000:01:00.0",
+            "windows-display:32.0.16.1088",
+            'a',
+        );
+        route.supervisor = inference_supervisor_with_launcher(Arc::clone(&launcher));
+        route
+            .supervisor
+            .transport
+            .ensure_generation()
+            .expect("test worker generation starts");
+        let active = ActiveInferenceRoute {
+            identity: InferenceWorkerRegistry::route_identity(&route),
+            supervisor: route.supervisor.clone(),
+        };
+        let catalog = verified_gpu_catalog(vec![route.clone()]);
+        let fingerprint = catalog.discovery_fingerprint.clone();
+        let now = Instant::now();
+        let mut cache = GpuRouteCatalogCache::default();
+
+        cache.record_auto_live_admission_probe(&catalog, now);
+        assert!(cache.successful().is_none());
+        cache.retain_auto_live_admission(&catalog, &active);
+        assert!(matches!(
+            cache.auto_live_admission_lookup(&fingerprint, Some(&active), now),
+            GpuRouteCatalogLookup::Successful(_)
+        ));
+
+        // No active warm owner means a cold request must obtain a fresh Hello;
+        // the available-memory observation is not a durable route attribute.
+        assert!(matches!(
+            cache.auto_live_admission_lookup(&fingerprint, None, now),
+            GpuRouteCatalogLookup::Probe
+        ));
+        assert!(cache.successful().is_none());
+        route.supervisor.retire().expect("test worker retires");
+        assert_eq!(launcher.launches.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn auto_power_recheck_blocks_ac_selected_discrete_route_after_battery_transition() {
         let route = verified_gpu_route(
             BackendKind::Cuda,
             "native:pci:0000:01:00.0",
             "windows-display:32.0.16.1088",
             'a',
         );
-        let catalog = verified_gpu_catalog(vec![route]);
-        let fingerprint = catalog.discovery_fingerprint.clone();
-        let now = Instant::now();
-        let mut cache = GpuRouteCatalogCache::default();
-
-        cache.record_auto_live_admission_probe(&catalog, now);
-
-        assert!(cache.successful().is_none());
-        assert!(
-            cache
-                .auto_live_admission_backoff(&fingerprint, now)
-                .is_none()
+        assert!(auto_route_is_power_eligible(&route, PowerSource::Ac));
+        assert!(!auto_route_is_power_eligible(&route, PowerSource::Battery));
+        assert!(!auto_route_is_power_eligible(&route, PowerSource::Unknown));
+        assert_eq!(
+            auto_power_skip_reason(PowerSource::Battery),
+            BackendSkipReason::BatteryPolicy
         );
-        assert!(matches!(
-            cache.lookup(&fingerprint, now),
-            GpuRouteCatalogLookup::Probe
+        assert_eq!(
+            auto_power_skip_reason(PowerSource::Unknown),
+            BackendSkipReason::UnknownPowerSource
+        );
+
+        let mut integrated = route.clone();
+        integrated.target.as_mut().unwrap().device_class = DeviceClass::IntegratedGpu;
+        assert!(auto_route_is_power_eligible(
+            &integrated,
+            PowerSource::Battery
+        ));
+        assert!(auto_route_is_power_eligible(
+            &integrated,
+            PowerSource::Unknown
         ));
     }
 
@@ -13152,6 +13437,7 @@ mod tests {
             health: None,
             selection_power_source: Some(PowerSource::Ac),
             skipped_targets: Vec::new(),
+            auto_live_admission: None,
         };
 
         reserve_auto_cpu_fallback(&mut plan, &cpu_routes);
