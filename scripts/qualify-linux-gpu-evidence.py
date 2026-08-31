@@ -183,26 +183,31 @@ def validate_artifact_file(
     label: str,
     artifact_paths: set[str],
     artifact_budget: dict[str, int],
+    descriptor_bound: bool,
 ) -> bytes:
     relative = artifact_path(relative_value, f"{label}.artifact_path")
     folded = relative.as_posix().casefold()
     if folded in artifact_paths:
         fail("qualification evidence reuses or case-collides an artifact path")
     artifact_paths.add(folded)
-    current = artifact_root
-    for index, component in enumerate(relative.parts):
-        current = current / component
-        try:
-            current_stat = current.lstat()
-        except OSError as error:
-            fail(f"could not inspect {label} artifact: {error}")
-        if stat.S_ISLNK(current_stat.st_mode):
-            fail(f"{label} artifact path contains a symbolic link")
-        if index + 1 < len(relative.parts):
-            if not stat.S_ISDIR(current_stat.st_mode):
-                fail(f"{label} artifact ancestor is not a directory")
-        elif not stat.S_ISREG(current_stat.st_mode):
-            fail(f"{label} artifact must be a regular file")
+    if descriptor_bound:
+        raw, current_stat = read_descriptor_bound_artifact(artifact_root, relative, label)
+    else:
+        current = artifact_root
+        for index, component in enumerate(relative.parts):
+            current = current / component
+            try:
+                current_stat = current.lstat()
+            except OSError as error:
+                fail(f"could not inspect {label} artifact: {error}")
+            if stat.S_ISLNK(current_stat.st_mode):
+                fail(f"{label} artifact path contains a symbolic link")
+            if index + 1 < len(relative.parts):
+                if not stat.S_ISDIR(current_stat.st_mode):
+                    fail(f"{label} artifact ancestor is not a directory")
+            elif not stat.S_ISREG(current_stat.st_mode):
+                fail(f"{label} artifact must be a regular file")
+        raw = current.read_bytes()
     if current_stat.st_nlink != 1:
         fail(f"{label} artifact must have exactly one link")
     if current_stat.st_size == 0 or current_stat.st_size > MAX_INPUT_BYTES:
@@ -213,10 +218,64 @@ def validate_artifact_file(
         fail("qualification evidence exceeds the global artifact-count bound")
     if artifact_budget["bytes"] > MAX_CUMULATIVE_ARTIFACT_BYTES:
         fail("qualification evidence exceeds the cumulative artifact-byte bound")
-    raw = current.read_bytes()
     if hashlib.sha256(raw).hexdigest() != expected_digest:
         fail(f"{label} artifact digest does not match the supplied file")
     return raw
+
+
+def read_descriptor_bound_artifact(
+    artifact_root: pathlib.Path,
+    relative: pathlib.PurePosixPath,
+    label: str,
+) -> tuple[bytes, os.stat_result]:
+    if sys.platform != "linux":
+        fail("production artifact evaluation is supported only on Linux")
+    directory_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+    file_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    descriptors: list[int] = []
+    try:
+        descriptors.append(os.open(artifact_root, directory_flags))
+        for component in relative.parts[:-1]:
+            descriptors.append(os.open(component, directory_flags, dir_fd=descriptors[-1]))
+        file_descriptor = os.open(relative.parts[-1], file_flags, dir_fd=descriptors[-1])
+        descriptors.append(file_descriptor)
+        file_stat = os.fstat(file_descriptor)
+        if not stat.S_ISREG(file_stat.st_mode):
+            fail(f"{label} artifact must be a regular file")
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(file_descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > MAX_INPUT_BYTES:
+                fail(f"{label} artifact is oversized")
+            chunks.append(chunk)
+        after = os.fstat(file_descriptor)
+        if (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        ) != (
+            file_stat.st_dev,
+            file_stat.st_ino,
+            file_stat.st_size,
+            file_stat.st_mtime_ns,
+            file_stat.st_ctime_ns,
+        ):
+            fail(f"{label} artifact changed during descriptor-bound acquisition")
+        return b"".join(chunks), after
+    except OSError as error:
+        fail(f"could not descriptor-open {label} artifact: {error}")
+    finally:
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
 
 
 def validate_artifact_envelope(
@@ -228,6 +287,7 @@ def validate_artifact_envelope(
     label: str,
     artifact_paths: set[str],
     artifact_budget: dict[str, int],
+    descriptor_bound: bool,
 ) -> None:
     raw = validate_artifact_file(
         artifact_root,
@@ -236,6 +296,7 @@ def validate_artifact_envelope(
         label,
         artifact_paths,
         artifact_budget,
+        descriptor_bound,
     )
     try:
         envelope = json.loads(raw.decode("utf-8"), object_pairs_hook=reject_duplicate_keys)
@@ -678,6 +739,46 @@ def load_production_authority(repository_root: pathlib.Path) -> tuple[set[str], 
     return approved, hashlib.sha256(raw).hexdigest()
 
 
+def load_auto_manifest_entries(repository_root: pathlib.Path) -> list[dict[str, Any]]:
+    path = repository_root / CONTRACT_PATHS["auto_manifest_sha256"]
+    try:
+        raw = path.read_bytes()
+        document = json.loads(raw.decode("utf-8"), object_pairs_hook=reject_duplicate_keys)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        fail(f"could not parse the Linux Auto manifest: {error}")
+    manifest = exact_keys(
+        document,
+        {"schema_version", "mode", "target_os", "target_arch", "entries"},
+        "Linux Auto manifest",
+    )
+    if (
+        json_integer(manifest["schema_version"], "Linux Auto manifest.schema_version", 1, 1) != 1
+        or json_string(manifest["mode"], "Linux Auto manifest.mode") != "default_deny"
+        or json_string(manifest["target_os"], "Linux Auto manifest.target_os") != "linux"
+        or json_string(manifest["target_arch"], "Linux Auto manifest.target_arch") != "x86_64"
+    ):
+        fail("Linux Auto manifest platform or policy is unsupported")
+    if type(manifest["entries"]) is not list:
+        fail("Linux Auto manifest.entries must be an array")
+    for index, entry in enumerate(manifest["entries"]):
+        exact_keys(
+            entry,
+            {
+                "pack",
+                "model_digest",
+                "backend",
+                "provider_id",
+                "vendor",
+                "device_class",
+                "minimum_total_memory_bytes",
+                "driver",
+                "evidence",
+            },
+            f"Linux Auto manifest entry {index}",
+        )
+    return manifest["entries"]
+
+
 def validate_run(
     value: Any,
     label: str,
@@ -690,6 +791,7 @@ def validate_run(
     artifact_root: pathlib.Path,
     artifact_budget: dict[str, int],
     attestation_digests: set[str],
+    descriptor_bound: bool,
 ) -> dict[str, Any]:
     run = exact_keys(
         value,
@@ -800,6 +902,7 @@ def validate_run(
         label,
         artifact_paths,
         artifact_budget,
+        descriptor_bound,
     )
     return run
 
@@ -813,6 +916,7 @@ def validate_event(
     artifact_paths: set[str],
     artifact_root: pathlib.Path,
     artifact_budget: dict[str, int],
+    descriptor_bound: bool,
 ) -> dict[str, Any]:
     event = exact_keys(
         value,
@@ -876,6 +980,7 @@ def validate_event(
         label,
         artifact_paths,
         artifact_budget,
+        descriptor_bound,
     )
     return event
 
@@ -908,6 +1013,53 @@ def metric_summary(runs: list[dict[str, Any]]) -> dict[str, Any]:
     return result
 
 
+def auto_entry_projection(
+    identity: dict[str, Any],
+    run_sets: dict[str, Any],
+    parsed: dict[str, dict[str, list[dict[str, Any]]]],
+) -> dict[str, Any]:
+    cold_transcripts = {
+        target: [run["transcript_sha256"] for run in parsed["cold"][target]]
+        for target in ("cpu", "gpu")
+    }
+    warm_transcripts = {
+        target: [run["transcript_sha256"] for run in parsed["warm"][target]]
+        for target in ("cpu", "gpu")
+    }
+    return {
+        "pack": identity["pack"],
+        "model_digest": identity["model"]["model_digest"],
+        "backend": identity["backend"],
+        "provider_id": identity["provider_id"],
+        "vendor": identity["device"]["vendor"],
+        "device_class": identity["device"]["device_class"],
+        "minimum_total_memory_bytes": identity["device"]["qualified_minimum_total_memory_bytes"],
+        "driver": identity["driver"],
+        "evidence": {
+            "id": identity["lane_id"],
+            "cold_runs": len(parsed["cold"]["cpu"]),
+            "warm_runs": len(parsed["warm"]["cpu"]),
+            "gpu_p95_ms": nearest_rank(
+                [run["end_to_end_ms"] for run in parsed["warm"]["gpu"]], 95
+            ),
+            "cpu_p95_ms": nearest_rank(
+                [run["end_to_end_ms"] for run in parsed["warm"]["cpu"]], 95
+            ),
+            "correctness_verified": True,
+            "reliability_verified": True,
+            "cold_evidence_sha256": canonical_digest(run_sets["cold"]),
+            "warm_evidence_sha256": canonical_digest(run_sets["warm"]),
+            "transcript_parity_evidence_sha256": canonical_digest(
+                {
+                    "expected": identity["workload"]["expected_transcript_sha256"],
+                    "cold": cold_transcripts,
+                    "warm": warm_transcripts,
+                }
+            ),
+        },
+    }
+
+
 def validate_lane_evidence(
     value: Any,
     expected: dict[str, Any],
@@ -918,6 +1070,7 @@ def validate_lane_evidence(
     artifact_paths: set[str],
     artifact_budget: dict[str, int],
     attestation_digests: set[str],
+    descriptor_bound: bool,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     lane = exact_keys(
         value,
@@ -952,6 +1105,7 @@ def validate_lane_evidence(
         f"evidence lane {index}.acquisition",
         artifact_paths,
         artifact_budget,
+        descriptor_bound,
     )
     parsed: dict[str, dict[str, list[dict[str, Any]]]] = {}
     for mode, expected_count in (("cold", plan["cold_runs"]), ("warm", plan["warm_runs"])):
@@ -974,6 +1128,7 @@ def validate_lane_evidence(
                     artifact_root,
                     artifact_budget,
                     attestation_digests,
+                    descriptor_bound,
                 )
                 for offset, run in enumerate(raw_runs)
             ]
@@ -989,6 +1144,7 @@ def validate_lane_evidence(
             artifact_paths,
             artifact_root,
             artifact_budget,
+            descriptor_bound,
         )
         for offset, (event, expected_event) in enumerate(zip(lane["lifecycle"], REQUIRED_EVENTS))
     ]
@@ -1041,6 +1197,7 @@ def validate_lane_evidence(
         },
         "qualification_passed": passed,
         "reasons": reasons,
+        "auto_entry_projection": auto_entry_projection(identity, run_sets, parsed) if passed else None,
     }
     return lane, summary
 
@@ -1055,6 +1212,7 @@ def decide(
 ) -> dict[str, Any]:
     required_lanes = validate_plan(plan, repository_root)
     approved_plans, production_authority_digest = load_production_authority(repository_root)
+    auto_manifest_entries = load_auto_manifest_entries(repository_root)
     exact_keys(
         evidence,
         {"schema_version", "kind", "fixture_only", "plan_sha256", "lanes"},
@@ -1074,6 +1232,8 @@ def decide(
         fail("qualification evidence does not bind the exact reviewed plan")
     if not fixture_only and plan_digest not in approved_plans:
         fail("qualification plan is not approved by the protected production authority")
+    if not fixture_only and sys.platform != "linux":
+        fail("production qualification evaluation is supported only on Linux")
     if type(evidence["lanes"]) is not list:
         fail("qualification evidence.lanes must be an array")
     if len(evidence["lanes"]) > MAX_LANES:
@@ -1094,6 +1254,7 @@ def decide(
     artifact_paths: set[str] = set()
     attestation_digests: set[str] = set()
     artifact_budget = {"count": 0, "bytes": 0}
+    descriptor_bound = not fixture_only
     summaries = [
         validate_lane_evidence(
             lane,
@@ -1105,18 +1266,36 @@ def decide(
             artifact_paths,
             artifact_budget,
             attestation_digests,
+            descriptor_bound,
         )[1]
         for index, (lane, expected) in enumerate(zip(evidence["lanes"], required_lanes))
     ]
     evidence_complete = bool(required_lanes) and len(summaries) == len(required_lanes)
     qualification_passed = evidence_complete and all(summary["qualification_passed"] for summary in summaries)
-    auto_eligible = qualification_passed and not fixture_only
+    projections = [
+        summary["auto_entry_projection"]
+        for summary in summaries
+        if summary["auto_entry_projection"] is not None
+    ]
+    projection_keys = [json.dumps(value, sort_keys=True, separators=(",", ":")) for value in projections]
+    manifest_keys = [
+        json.dumps(value, sort_keys=True, separators=(",", ":")) for value in auto_manifest_entries
+    ]
+    activation_manifest_complete = (
+        qualification_passed
+        and bool(projection_keys)
+        and len(set(projection_keys)) == len(projection_keys)
+        and sorted(projection_keys) == sorted(manifest_keys)
+    )
+    auto_eligible = qualification_passed and activation_manifest_complete and not fixture_only
     if fixture_only:
         reason = "fixture_only_never_auto_eligible"
     elif not evidence_complete:
         reason = "no_complete_representative_evidence"
     elif not qualification_passed:
         reason = "one_or_more_representative_lanes_failed"
+    elif not activation_manifest_complete:
+        reason = "exact_one_to_one_auto_projection_missing"
     else:
         reason = "complete_release_evidence_passed"
     return {
@@ -1129,6 +1308,7 @@ def decide(
         "fixture_only": fixture_only,
         "artifact_count": artifact_budget["count"],
         "artifact_bytes": artifact_budget["bytes"],
+        "activation_manifest_complete": activation_manifest_complete,
         "lanes": summaries,
         "plan_sha256": plan_digest,
         "production_authority_sha256": production_authority_digest,
@@ -1148,17 +1328,32 @@ def parse_arguments() -> argparse.Namespace:
 
 
 def write_new_file(path: pathlib.Path, payload: bytes) -> None:
-    path = path.resolve()
-    if path.exists() or path.is_symlink():
-        fail("output path already exists")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    if not path.name or path.name in {".", ".."}:
+        fail("output path is invalid")
+    try:
+        parent = path.parent.resolve(strict=True)
+        parent_stat = parent.lstat()
+    except OSError as error:
+        fail(f"output parent must already exist: {error}")
+    if stat.S_ISLNK(parent_stat.st_mode) or not stat.S_ISDIR(parent_stat.st_mode):
+        fail("output parent must be a regular non-symlink directory")
+    destination = parent / path.name
+    temporary = parent / f".{path.name}.{os.getpid()}.tmp"
     try:
         with temporary.open("xb") as output:
             output.write(payload)
             output.flush()
             os.fsync(output.fileno())
-        os.replace(temporary, path)
+        try:
+            os.link(temporary, destination)
+        except FileExistsError:
+            fail("output path already exists")
+        if sys.platform == "linux":
+            directory_descriptor = os.open(parent, os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY)
+            try:
+                os.fsync(directory_descriptor)
+            finally:
+                os.close(directory_descriptor)
     finally:
         try:
             temporary.unlink()

@@ -444,6 +444,7 @@ class QualificationFixtureTests(unittest.TestCase):
         self.assertTrue(first_decision["evidence_complete"])
         self.assertTrue(first_decision["qualification_passed"])
         self.assertFalse(first_decision["auto_eligible"])
+        self.assertFalse(first_decision["activation_manifest_complete"])
         self.assertEqual(first_decision["decision_reason"], "fixture_only_never_auto_eligible")
         lane = first_decision["lanes"][0]
         self.assertTrue(lane["checks"]["performance_passed"])
@@ -554,6 +555,11 @@ class QualificationFixtureTests(unittest.TestCase):
         execution["stable_device_id"] = "cpu:host"
         execution["device_memory_kind"] = "none"
         cases.append(("mislabeled-cpu", mislabeled))
+        wrong_baseline = fixture_lane()
+        wrong_baseline["run_sets"]["cold"]["cpu"][0]["execution"]["worker_sha256"] = digest(
+            "unrelated-slow-cpu-worker"
+        )
+        cases.append(("unrelated-cpu-baseline", wrong_baseline))
         for label, lane in cases:
             with self.subTest(label=label):
                 plan, evidence = fixture_documents(lane)
@@ -580,6 +586,12 @@ class QualificationFixtureTests(unittest.TestCase):
         wrong_order = fixture_lane()
         wrong_order["run_sets"]["cold"]["cpu"][0]["pair_order"] = "gpu_then_cpu"
         cases.append(("pair-order", wrong_order))
+        wrong_session = fixture_lane()
+        wrong_session["run_sets"]["cold"]["gpu"][0]["session_id"] = "unpaired-session"
+        cases.append(("pair-session", wrong_session))
+        wrong_controls = fixture_lane()
+        wrong_controls["identity"]["acquisition"]["controls"]["cpu_governor"] = "powersave"
+        cases.append(("environment-controls", wrong_controls))
         for label, lane in cases:
             with self.subTest(label=label):
                 plan, evidence = fixture_documents(lane)
@@ -598,6 +610,14 @@ class QualificationFixtureTests(unittest.TestCase):
             or "artifact digest" in result.stderr
             or "Hello attestation" in result.stderr
         )
+
+    def test_representative_lane_count_is_bounded_before_entry_processing(self) -> None:
+        plan, evidence = fixture_documents()
+        plan["required_lanes"] = [{} for _ in range(qualification.MAX_LANES + 1)]
+        evidence["plan_sha256"] = qualification.canonical_digest(plan)
+        result = self.run_tool(plan, evidence)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("lane bound", result.stderr)
 
     def test_correctness_reliability_and_lifecycle_failures_are_reported(self) -> None:
         cases: list[tuple[str, Any, set[str]]] = []
@@ -760,6 +780,36 @@ class QualificationFixtureTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 1)
         self.assertIn("duplicate field", result.stderr)
+
+    def test_decision_output_publication_never_replaces_an_existing_file(self) -> None:
+        output = self.root / "decision.json"
+        qualification.write_new_file(output, b"first\n")
+        self.assertEqual(output.read_bytes(), b"first\n")
+        with self.assertRaises(qualification.EvidenceError):
+            qualification.write_new_file(output, b"second\n")
+        self.assertEqual(output.read_bytes(), b"first\n")
+
+    @unittest.skipUnless(sys.platform == "linux", "descriptor-bound evidence IO is Linux-only")
+    def test_production_artifact_reader_is_descriptor_bound(self) -> None:
+        root = self.root / "descriptor-artifacts"
+        nested = root / "lane/runs"
+        nested.mkdir(parents=True)
+        artifact = nested / "record.json"
+        artifact.write_bytes(b"descriptor-bound\n")
+        raw, observed = qualification.read_descriptor_bound_artifact(
+            root,
+            pathlib.PurePosixPath("lane/runs/record.json"),
+            "fixture descriptor",
+        )
+        self.assertEqual(raw, b"descriptor-bound\n")
+        self.assertEqual(observed.st_size, len(raw))
+        (root / "link").symlink_to(nested, target_is_directory=True)
+        with self.assertRaises(qualification.EvidenceError):
+            qualification.read_descriptor_bound_artifact(
+                root,
+                pathlib.PurePosixPath("link/record.json"),
+                "symlink descriptor",
+            )
 
 
 if __name__ == "__main__":
