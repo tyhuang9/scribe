@@ -2431,23 +2431,28 @@ fn move_file(source: &Path, destination: &Path, replace: bool) -> io::Result<()>
     Ok(())
 }
 
+const FILE_LOCK_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_millis(750);
+const FILE_LOCK_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(5);
+
 fn lock_file(file: &File) -> Result<(), PackStoreError> {
     // Native writes and directory flushes can exceed the old 80 ms window on
-    // loaded or power-throttled systems. Keep contention bounded below the
-    // two-second caller contract while allowing a normal in-flight mutation
-    // to finish instead of surfacing a spurious persistence failure.
-    const MAX_ATTEMPTS: usize = 100;
-    const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(5);
-
-    for attempt in 0..MAX_ATTEMPTS {
+    // loaded or power-throttled systems. Use a monotonic deadline rather than
+    // an attempt count because short sleeps can overshoot substantially on
+    // throttled hosts. This keeps contention below the two-second caller
+    // contract while allowing a normal in-flight mutation to finish.
+    let deadline = std::time::Instant::now() + FILE_LOCK_RETRY_BUDGET;
+    loop {
         match try_lock_file(file) {
-            Err(PackStoreError::LockContended) if attempt + 1 < MAX_ATTEMPTS => {
-                std::thread::sleep(RETRY_DELAY);
+            Err(PackStoreError::LockContended) => {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err(PackStoreError::LockContended);
+                }
+                std::thread::sleep(FILE_LOCK_RETRY_DELAY.min(remaining));
             }
             result => return result,
         }
     }
-    Err(PackStoreError::LockContended)
 }
 
 #[cfg(unix)]
@@ -2695,6 +2700,7 @@ mod tests {
 
     #[test]
     fn discovery_epoch_ledger_lock_contention_is_bounded_and_does_not_mutate_state() {
+        assert!(FILE_LOCK_RETRY_BUDGET < std::time::Duration::from_secs(2));
         let root = temp_root("discovery-epoch-lock-contention");
         let state = root.join("state");
         let held = exclusive_file_lock(&state.join(DISCOVERY_EPOCH_LOCK_NAME)).unwrap();
@@ -3408,6 +3414,7 @@ mod tests {
 
     #[test]
     fn state_lock_and_mutation_share_one_anchored_parent() {
+        assert!(FILE_LOCK_RETRY_BUDGET < std::time::Duration::from_secs(2));
         let (root, workers, state, verifier, _) = store_fixture("state-ancestor-swap");
         let store = PackStore::new(&workers, &state, &verifier);
         let lock = store.acquire_lock().unwrap();
