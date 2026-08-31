@@ -7036,6 +7036,43 @@ mod tests {
     }
 
     #[test]
+    fn gpu_retry_exposes_the_recording_lock_to_accessibility_clients() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::SettingsRecording.data();
+        data.transcription.phase = TranscriptionPhase::Listening;
+        let mut page = Fixture::SettingsRecording.page();
+
+        let (output, action) =
+            render_with_input(&ctx, &mut data, &mut page, 960.0, 680.0, Vec::new());
+        assert_eq!(action, ScreenAction::None);
+        let retry_id = named_node_id(&output, "Retry GPU");
+        let retry = node_matching(&output, |node| node.name() == Some("Retry GPU"));
+        assert!(retry.is_disabled());
+        assert_eq!(
+            retry.description(),
+            Some("Finish recording before retrying GPU.")
+        );
+
+        let (_, action) = render_with_input(
+            &ctx,
+            &mut data,
+            &mut page,
+            960.0,
+            680.0,
+            vec![egui::Event::AccessKitActionRequest(
+                egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Default,
+                    target: retry_id,
+                    data: None,
+                },
+            )],
+        );
+        assert_eq!(action, ScreenAction::None);
+    }
+
+    #[test]
     fn gpu_retry_is_accesskit_and_keyboard_activated() {
         let width = 960.0;
         let height = 680.0;

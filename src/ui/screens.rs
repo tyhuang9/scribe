@@ -7103,11 +7103,13 @@ fn acceleration_diagnostics_panel(
                 diagnostics.retry_gpu_available && !diagnostics.retry_gpu_in_flight,
                 egui::Button::new(retry_label).min_size(Vec2::new(120.0, 44.0)),
             );
-            if diagnostics.retry_gpu_in_flight || !diagnostics.retry_gpu_available {
+            if !retry.enabled() {
                 ui.ctx().accesskit_node_builder(retry.id, |builder| {
                     builder.set_disabled();
                     builder.set_description(if diagnostics.retry_gpu_in_flight {
                         "GPU retry is in progress."
+                    } else if diagnostics.retry_gpu_available {
+                        "Finish recording before retrying GPU."
                     } else {
                         "GPU retry is unavailable for the current acceleration selection."
                     });
