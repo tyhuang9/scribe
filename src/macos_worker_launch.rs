@@ -72,6 +72,7 @@ mod platform {
 
     const PARENT_LIVENESS_ENV: &str = "SCRIBE_PRIVATE_PARENT_LIVENESS";
     const PARENT_CONTROL_CANCEL: u8 = b'C';
+    const DROP_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
     unsafe extern "C" {
         fn posix_spawn_file_actions_addchdir_np(
@@ -186,10 +187,10 @@ mod platform {
 
     impl Drop for MacWorkerProcess {
         fn drop(&mut self) {
-            let mut state = match self.state.lock() {
-                Ok(state) => state,
-                Err(poisoned) => poisoned.into_inner(),
-            };
+            let state = self
+                .state
+                .get_mut()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if state.reaped {
                 return;
             }
@@ -198,27 +199,34 @@ mod platform {
             // group also stops backend subprocesses, while the direct signal
             // ensures the child itself is terminated if group setup was lost.
             // Drop cannot report cleanup errors, so every operation is best
-            // effort and the blocking wait is used only for our own child.
+            // effort and reap polling is bounded to avoid wedging shutdown.
             unsafe {
                 libc::killpg(state.pid, libc::SIGKILL);
                 libc::kill(state.pid, libc::SIGKILL);
             }
+            let deadline = std::time::Instant::now() + DROP_REAP_TIMEOUT;
             loop {
                 let mut status = 0;
                 // SAFETY: state.pid is the child owned by this process object.
-                let result = unsafe { libc::waitpid(state.pid, &mut status, 0) };
+                let result = unsafe { libc::waitpid(state.pid, &mut status, libc::WNOHANG) };
                 if result == state.pid {
                     state.reaped = true;
                     return;
                 }
-                let error = std::io::Error::last_os_error();
-                if error.kind() == std::io::ErrorKind::Interrupted {
-                    continue;
+                if result == -1 {
+                    let error = std::io::Error::last_os_error();
+                    if error.kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    if error.raw_os_error() == Some(libc::ECHILD) {
+                        state.reaped = true;
+                    }
+                    return;
                 }
-                if error.raw_os_error() == Some(libc::ECHILD) {
-                    state.reaped = true;
+                if std::time::Instant::now() >= deadline {
+                    return;
                 }
-                return;
+                std::thread::sleep(std::time::Duration::from_millis(5));
             }
         }
     }
