@@ -13020,6 +13020,144 @@ mod tests {
         })
     }
 
+    fn explicit_retry_registry(
+        gpu_launcher: Arc<TestLauncher>,
+        cpu_launcher: Arc<TestLauncher>,
+    ) -> (InferenceWorkerRegistry, BackendTarget) {
+        let mut route = verified_gpu_route(
+            BackendKind::Vulkan,
+            "native:pci:0000:01:00.0",
+            "windows-display:32.0.16.1088",
+            'a',
+        );
+        let target = route.target.clone().expect("fixture GPU target");
+        route.supervisor = inference_supervisor_with_launcher(gpu_launcher);
+        let mut registry = InferenceWorkerRegistry::with_cpu_supervisor(
+            inference_supervisor_with_launcher(cpu_launcher),
+        );
+        registry.gpu_routes_for_testing = Some(verified_gpu_catalog(vec![route]));
+        (registry, target)
+    }
+
+    #[test]
+    fn explicit_gpu_retry_loads_only_the_exact_target_without_cpu_fallback() {
+        let gpu_launcher = Arc::new(TestLauncher::new([TestMode::RuntimeLoadThenExit]));
+        let cpu_launcher = Arc::new(TestLauncher::new([]));
+        let (registry, target) =
+            explicit_retry_registry(Arc::clone(&gpu_launcher), Arc::clone(&cpu_launcher));
+
+        let execution = registry
+            .retry_gpu(missing_gguf_artifact(), &target)
+            .expect("exact GPU retry should load the retained target");
+        let selection = execution
+            .diagnostics
+            .resolved_acceleration
+            .selection
+            .expect("exact retry should publish a typed selection");
+        assert_eq!(selection.target, target);
+        assert_eq!(selection.requested, AccelerationPreference::Gpu);
+        assert_eq!(gpu_launcher.launches.load(Ordering::Acquire), 1);
+        assert_eq!(cpu_launcher.launches.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn explicit_gpu_retry_rejects_a_disappeared_or_changed_target_before_launch() {
+        for change in ["device", "pack"] {
+            let gpu_launcher = Arc::new(TestLauncher::new([]));
+            let cpu_launcher = Arc::new(TestLauncher::new([]));
+            let (registry, mut target) =
+                explicit_retry_registry(Arc::clone(&gpu_launcher), Arc::clone(&cpu_launcher));
+            if change == "device" {
+                target.device_id = DeviceIdentity::new("native:pci:0000:02:00.0");
+            } else {
+                target.pack.as_mut().expect("fixture pack").pack_version = "2.0.0".to_owned();
+            }
+
+            let error = registry
+                .retry_gpu(missing_gguf_artifact(), &target)
+                .expect_err("changed exact target must be denied");
+            assert!(error.to_string().contains("no longer available"));
+            assert_eq!(gpu_launcher.launches.load(Ordering::Acquire), 0);
+            assert_eq!(cpu_launcher.launches.load(Ordering::Acquire), 0);
+        }
+    }
+
+    #[test]
+    fn explicit_gpu_retry_denies_a_target_without_a_health_grant() {
+        let root = test_root("gpu-explicit-retry-denied");
+        let health_path = Arc::new(root.join("health.json"));
+        let gpu_launcher = Arc::new(TestLauncher::new([]));
+        let cpu_launcher = Arc::new(TestLauncher::new([]));
+        let (mut registry, target) =
+            explicit_retry_registry(Arc::clone(&gpu_launcher), Arc::clone(&cpu_launcher));
+        registry.gpu_health_path = Some(Arc::clone(&health_path));
+
+        let error = registry
+            .retry_gpu(missing_gguf_artifact(), &target)
+            .expect_err("an available target has no explicit retry grant");
+        assert!(error.to_string().contains("not authorized"));
+        assert_eq!(gpu_launcher.launches.load(Ordering::Acquire), 0);
+        assert_eq!(cpu_launcher.launches.load(Ordering::Acquire), 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn explicit_gpu_retry_failure_invalidates_both_route_catalogs() {
+        let gpu_launcher = Arc::new(TestLauncher::new([TestMode::RuntimeFailureOnLoad(
+            RuntimeError::BackendUnavailable("fixture GPU disappeared".to_owned()),
+        )]));
+        let cpu_launcher = Arc::new(TestLauncher::new([]));
+        let (registry, target) =
+            explicit_retry_registry(Arc::clone(&gpu_launcher), Arc::clone(&cpu_launcher));
+        let catalog = registry
+            .gpu_routes_for_testing
+            .clone()
+            .expect("fixture catalog");
+        for cache in [&registry.gpu_routes, &registry.auto_gpu_routes] {
+            cache
+                .lock()
+                .unwrap()
+                .record_probe(catalog.clone(), Instant::now());
+        }
+
+        let error = registry
+            .retry_gpu(missing_gguf_artifact(), &target)
+            .expect_err("fixture runtime failure should be returned");
+        assert!(matches!(error, RuntimeError::BackendUnavailable(_)));
+        assert!(registry.gpu_routes.lock().unwrap().successful.is_none());
+        assert!(
+            registry
+                .auto_gpu_routes
+                .lock()
+                .unwrap()
+                .successful
+                .is_none()
+        );
+        assert_eq!(cpu_launcher.launches.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn registry_rejects_onnx_gpu_retry_before_launch() {
+        let root = test_root("gpu-retry-onnx");
+        let artifact = RuntimeArtifact::OnnxBundle(spec_with_roles(
+            &root,
+            OnnxModelFamily::NemoCtc,
+            NEMO_CTC_ROLES,
+        ));
+        let gpu_launcher = Arc::new(TestLauncher::new([]));
+        let cpu_launcher = Arc::new(TestLauncher::new([]));
+        let (registry, target) =
+            explicit_retry_registry(Arc::clone(&gpu_launcher), Arc::clone(&cpu_launcher));
+
+        let error = registry
+            .retry_gpu(artifact, &target)
+            .expect_err("ONNX must remain CPU-only");
+        assert!(matches!(error, RuntimeError::OnnxUnavailable(_)));
+        assert_eq!(gpu_launcher.launches.load(Ordering::Acquire), 0);
+        assert_eq!(cpu_launcher.launches.load(Ordering::Acquire), 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[cfg(windows)]
     #[test]
     #[ignore = "requires a clean-built fixture-signed Vulkan pack, pinned GGUF/WAV fixtures, and a compatible physical GPU"]

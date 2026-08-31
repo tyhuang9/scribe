@@ -6833,4 +6833,41 @@ mod tests {
             assert!(!names.iter().any(|name| name.contains(private_value)));
         }
     }
+
+    #[test]
+    fn gpu_retry_is_disabled_while_in_flight_and_not_actionable_without_target() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::TranscribeReady.data();
+        let mut page = Fixture::TranscribeReady.page();
+        data.settings
+            .acceleration_diagnostics
+            .as_mut()
+            .expect("diagnostics fixture")
+            .retry_gpu_available = false;
+
+        let (output, action) =
+            render_with_input(&ctx, &mut data, &mut page, 960.0, 680.0, Vec::new());
+        assert_eq!(action, ScreenAction::None);
+        let retry_id = named_node_id(&output, "Retry GPU");
+        let retry = node_matching(&output, |node| node.name() == Some("Retry GPU"));
+        assert!(retry.is_disabled());
+
+        let (_, action) = render_with_input(
+            &ctx,
+            &mut data,
+            &mut page,
+            960.0,
+            680.0,
+            vec![egui::Event::AccessKitActionRequest(
+                egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Default,
+                    target: retry_id,
+                    data: None,
+                },
+            )],
+        );
+        assert_eq!(action, ScreenAction::None);
+    }
 }

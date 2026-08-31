@@ -844,8 +844,11 @@ fn runtime_worker_loop(router: RuntimeRouter, commands: Receiver<RuntimeCommand>
                 reply,
             }) => {
                 let request_activity = activity.acquire_request().ok();
-                let result = router.load(artifact, AccelerationPreference::Gpu);
-                let succeeded = result.is_ok();
+                let _ = artifact;
+                let result = Err(RuntimeError::WorkerUnavailable(
+                    "exact GPU retry is unsupported by the in-process test runtime".to_owned(),
+                ));
+                let succeeded = false;
                 let _ = reply.send(result);
                 (succeeded, request_activity)
             }
