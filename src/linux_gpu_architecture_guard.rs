@@ -117,13 +117,14 @@ fn linux_auto_qualification_remains_canonical_default_deny() {
 fn linux_gpu_ci_runs_on_both_supported_ubuntu_lanes() {
     let workflow = normalized(include_str!("../.github/workflows/linux-worker-launch.yml"));
     assert!(workflow.contains("os: [ubuntu-22.04, ubuntu-24.04]"));
+    let all_source_changes_trigger_ci = workflow.contains("'src/**'");
     for path in [
         "'src/linux_gpu.rs'",
         "'src/linux_gpu_architecture_guard.rs'",
         "'docs/LINUX_GPU_ROUTING.md'",
     ] {
         assert!(
-            workflow.contains(path),
+            workflow.contains(path) || (all_source_changes_trigger_ci && path.starts_with("'src/")),
             "missing workflow path trigger: {path}"
         );
     }
