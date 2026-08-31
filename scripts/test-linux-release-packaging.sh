@@ -4,7 +4,7 @@ IFS=$'\n\t'
 trap 'status=$?; echo "Linux release packaging contract check failed at line $LINENO (exit $status)." >&2; exit "$status"' ERR
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
-for command in cc dpkg-deb python3; do command -v "$command" >/dev/null || { echo "$command is required." >&2; exit 1; }; done
+for command in ar cc dpkg-deb python3 xz; do command -v "$command" >/dev/null || { echo "$command is required." >&2; exit 1; }; done
 for script in build-linux-release-package.sh verify-linux-release-package.sh report-linux-worker-pack-sizes.sh linux-release-package-common.sh; do bash -n "$repo_root/scripts/$script"; done
 python3 - "$repo_root/runtime-manifests/linux-release-package-x86_64.json" <<'PY'
 import json, pathlib, sys
@@ -29,6 +29,22 @@ static const char packaged_worker_anchor[] = "$worker_sha";
 int main(void) { return puts(packaged_worker_anchor) < 0; }
 C
 cc -Os -Wl,--build-id=none -o "$desktop" "$test_root/desktop.c"
+source "$repo_root/scripts/linux-release-package-common.sh"
+python3 - "$desktop" <<'PY'
+import pathlib, sys
+if pathlib.Path(sys.argv[1]).read_bytes()[7] != 0:
+    raise SystemExit("compiler fixture did not provide System V ELF OSABI 0")
+PY
+cp "$desktop" "$test_root/linux-osabi"
+cp "$desktop" "$test_root/invalid-osabi"
+python3 - "$test_root/linux-osabi" "$test_root/invalid-osabi" <<'PY'
+import pathlib, sys
+for name, osabi in ((sys.argv[1], 3), (sys.argv[2], 9)):
+    path = pathlib.Path(name); data = bytearray(path.read_bytes()); data[7] = osabi; path.write_bytes(data)
+PY
+linux_require_x86_64_elf "$desktop" 'System V OSABI fixture'
+linux_require_x86_64_elf "$test_root/linux-osabi" 'Linux OSABI fixture'
+if linux_require_x86_64_elf "$test_root/invalid-osabi" 'invalid OSABI fixture' >/dev/null 2>&1; then echo 'ELF validator accepted an unsupported OSABI.' >&2; exit 1; fi
 if [[ -n "${SCRIBE_BUILD_REVISION:-}" ]]; then
   revision="$SCRIBE_BUILD_REVISION"
 elif revision="$(git -C "$repo_root" rev-parse --verify HEAD 2>/dev/null)"; then
@@ -76,11 +92,18 @@ ln -s "$test_root/first.deb" "$test_root/package-link.deb"
 if bash "$repo_root/scripts/verify-linux-release-package.sh" --package "$test_root/package-link.deb" >/dev/null 2>&1; then echo 'release verifier accepted a symlink package argument.' >&2; exit 1; fi
 if bash "$repo_root/scripts/report-linux-worker-pack-sizes.sh" --package "$test_root/package-link.deb" >/dev/null 2>&1; then echo 'size reporter accepted a symlink package argument.' >&2; exit 1; fi
 cp "$test_root/first.deb.sizes.json" "$test_root/first.deb.sizes.backup"
-python3 - "$test_root/first.deb.sizes.json" <<'PY'
+for sidecar_attack in stale-installed bool-schema float-compressed; do
+  cp "$test_root/first.deb.sizes.backup" "$test_root/first.deb.sizes.json"
+  python3 - "$test_root/first.deb.sizes.json" "$sidecar_attack" <<'PY'
 import json, pathlib, sys
-path = pathlib.Path(sys.argv[1]); value = json.loads(path.read_bytes()); value["installed_size_bytes"] += 1; path.write_text(json.dumps(value, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+path = pathlib.Path(sys.argv[1]); value = json.loads(path.read_bytes())
+if sys.argv[2] == "stale-installed": value["installed_size_bytes"] += 1
+elif sys.argv[2] == "bool-schema": value["schema_version"] = True
+elif sys.argv[2] == "float-compressed": value["compressed_size_bytes"] = float(value["compressed_size_bytes"])
+path.write_text(json.dumps(value, sort_keys=True, separators=(",", ":")), encoding="utf-8")
 PY
-if bash "$repo_root/scripts/report-linux-worker-pack-sizes.sh" --package "$test_root/first.deb" >/dev/null 2>&1; then echo 'size reporter accepted a stale installed-size sidecar.' >&2; exit 1; fi
+  if bash "$repo_root/scripts/report-linux-worker-pack-sizes.sh" --package "$test_root/first.deb" >/dev/null 2>&1; then echo "size reporter accepted $sidecar_attack sidecar." >&2; exit 1; fi
+done
 mv "$test_root/first.deb.sizes.backup" "$test_root/first.deb.sizes.json"
 if SOURCE_DATE_EPOCH="$epoch" SCRIBE_BUILD_REVISION="$revision" bash "$repo_root/scripts/build-linux-release-package.sh" --desktop "$desktop" --cpu-worker "$worker" --output "$test_root/first.deb" --version 0.1.0 >/dev/null 2>&1; then
   echo 'release builder overwrote an existing package.' >&2; exit 1
@@ -97,6 +120,16 @@ attack_package() {
     echo "release verifier accepted $name attack package." >&2; exit 1
   fi
 }
+refresh_inventory_modes() {
+  python3 - "$1" <<'PY'
+import json, pathlib, stat, sys
+root = pathlib.Path(sys.argv[1]); inventory = root / "usr/lib/scribe/linux-release-inventory.json"
+document = json.loads(inventory.read_bytes())
+for entry in document["entries"]:
+    entry["mode"] = f"{stat.S_IMODE((root / entry['path']).stat().st_mode):04o}"
+inventory.write_text(json.dumps(document, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+PY
+}
 tamper_worker() { printf 'tampered\n' >>"$1/usr/lib/scribe/scribe-inference-worker"; }
 add_unexpected() { printf 'unexpected\n' >"$1/usr/lib/scribe/unexpected"; }
 add_unexpected_directory() { mkdir "$1/usr/lib/scribe/unexpected-directory"; }
@@ -108,6 +141,8 @@ make_authority_world_writable() { chmod 0777 "$1/usr/lib/scribe"; }
 make_pack_root_group_writable() { chmod 0775 "$1/usr/lib/scribe/workers/packs"; }
 replace_desktop_with_text() { printf 'not an ELF\n' >"$1/usr/bin/local-transcriber"; chmod 0755 "$1/usr/bin/local-transcriber"; }
 replace_worker_with_wrong_arch() { cp "$test_root/wrong-arch" "$1/usr/lib/scribe/scribe-inference-worker"; chmod 0755 "$1/usr/lib/scribe/scribe-inference-worker"; }
+make_desktop_group_writable_with_consistent_inventory() { chmod 0775 "$1/usr/bin/local-transcriber"; refresh_inventory_modes "$1"; }
+make_catalog_group_writable_with_consistent_inventory() { chmod 0664 "$1/usr/lib/scribe/worker-pack-catalog.json"; refresh_inventory_modes "$1"; }
 attack_package tampered-worker tamper_worker
 attack_package unexpected-file add_unexpected
 attack_package unexpected-directory add_unexpected_directory
@@ -119,6 +154,18 @@ attack_package world-writable-authority make_authority_world_writable
 attack_package group-writable-pack-root make_pack_root_group_writable
 attack_package non-elf-desktop replace_desktop_with_text
 attack_package wrong-arch-worker replace_worker_with_wrong_arch
+attack_package consistent-inventory-executable-mode make_desktop_group_writable_with_consistent_inventory
+attack_package consistent-inventory-metadata-mode make_catalog_group_writable_with_consistent_inventory
+
+control_attack_root="$test_root/control-mode-components"; mkdir "$control_attack_root"
+(cd "$control_attack_root" && ar x "$test_root/first.deb")
+mkdir "$control_attack_root/control-root"
+tar -xf "$control_attack_root/control.tar.xz" -C "$control_attack_root/control-root"
+chmod 0664 "$control_attack_root/control-root/control"
+tar -C "$control_attack_root/control-root" --create --xz --no-recursion --owner=0 --group=0 --numeric-owner --mtime="@$epoch" -f "$control_attack_root/control.tar.xz" ./ ./control
+(cd "$control_attack_root" && ar rcD "$test_root/control-mode.deb" debian-binary control.tar.xz data.tar.xz)
+chmod 0644 "$test_root/control-mode.deb"
+if bash "$repo_root/scripts/verify-linux-release-package.sh" --package "$test_root/control-mode.deb" >/dev/null 2>&1; then echo 'release verifier accepted non-0644 DEBIAN/control.' >&2; exit 1; fi
 
 if command -v cargo >/dev/null; then
   export SCRIBE_BUILD_REVISION="$revision"

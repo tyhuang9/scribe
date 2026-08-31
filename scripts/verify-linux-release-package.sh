@@ -30,6 +30,9 @@ if tar --numeric-owner -tvf "$temp_root/control.tar" | awk '$2 != "0/0" || (subs
   echo 'package control archive contains unsafe ownership or entry types.' >&2
   exit 1
 fi
+mkdir "$temp_root/control-root"
+tar -xf "$temp_root/control.tar" -C "$temp_root/control-root" --no-same-owner --same-permissions
+[[ "$(stat -c %a -- "$temp_root/control-root")" == 755 && "$(stat -c %a -- "$temp_root/control-root/control")" == 644 ]] || { echo 'package control archive modes are not canonical.' >&2; exit 1; }
 dpkg-deb --fsys-tarfile "$package" >"$temp_root/data.tar"
 tar -tf "$temp_root/data.tar" >"$temp_root/names"
 [[ -z "$(LC_ALL=C sort "$temp_root/names" | uniq -d)" ]] || { echo 'package contains duplicate archive names.' >&2; exit 1; }
@@ -66,9 +69,13 @@ while IFS= read -r directory; do [[ "$(stat -c %a -- "$root/$directory")" == 755
 for path in "$root/usr/bin/local-transcriber" "$authority/scribe-inference-worker" "$authority/worker-pack-catalog.json" "$authority/linux-release-package.json" "$inventory"; do
   [[ -f "$path" && ! -L "$path" && "$(stat -c %h -- "$path")" == 1 ]] || { echo "required package file is missing or unsafe: $path" >&2; exit 1; }
 done
+[[ "$(stat -c %a -- "$root/usr/bin/local-transcriber")" == 755 ]] || { echo 'packaged desktop mode is not 0755.' >&2; exit 1; }
+[[ "$(stat -c %a -- "$authority/scribe-inference-worker")" == 755 ]] || { echo 'packaged CPU worker mode is not 0755.' >&2; exit 1; }
+for metadata in "$authority/worker-pack-catalog.json" "$authority/linux-release-package.json" "$inventory"; do
+  [[ "$(stat -c %a -- "$metadata")" == 644 ]] || { echo "packaged metadata mode is not 0644: $metadata" >&2; exit 1; }
+done
 linux_require_x86_64_elf "$root/usr/bin/local-transcriber" 'packaged desktop'
 linux_require_x86_64_elf "$authority/scribe-inference-worker" 'packaged CPU worker'
-[[ "$(stat -c %a -- "$inventory")" == 644 ]] || { echo 'release inventory mode is not 0644.' >&2; exit 1; }
 cmp -s "$authority/linux-release-package.json" "$repo_root/runtime-manifests/linux-release-package-x86_64.json" || { echo 'package release contract differs from the reviewed manifest.' >&2; exit 1; }
 [[ "$(cat "$authority/worker-pack-catalog.json")" == '{"schema_version":1,"packs":[]}' ]] || { echo 'production Linux pack catalog must remain canonical and empty.' >&2; exit 1; }
 [[ -z "$(find "$authority/workers/packs" -mindepth 1 -print -quit)" ]] || { echo 'production Linux package contains an untrusted GPU pack.' >&2; exit 1; }

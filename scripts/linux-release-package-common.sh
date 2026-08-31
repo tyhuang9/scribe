@@ -16,7 +16,7 @@ valid = (
     len(header) == 24
     and header[:4] == b"\x7fELF"
     and header[4:7] == b"\x02\x01\x01"
-    and header[7] == 0
+    and header[7] in (0, 3)
     and struct.unpack_from("<H", header, 16)[0] in (2, 3)
     and struct.unpack_from("<H", header, 18)[0] == 62
     and struct.unpack_from("<I", header, 20)[0] == 1

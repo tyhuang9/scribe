@@ -16,7 +16,8 @@ if raw != canonical:
     raise SystemExit("package size report is not canonical JSON")
 verified = json.loads(sys.argv[2])
 expected = {"schema_version", "target", "package_format", "installed_size_bytes", "compressed_size_bytes", "packs"}
-if set(document) != expected or document["schema_version"] != 1 or document["target"] != "x86_64-unknown-linux-gnu" or document["package_format"] != "deb" or document["compressed_size_bytes"] != verified["compressed_size_bytes"] or document["installed_size_bytes"] != verified["installed_size_bytes"] or not isinstance(document["installed_size_bytes"], int) or isinstance(document["installed_size_bytes"], bool) or document["installed_size_bytes"] < 0 or document["packs"] != [] or verified["packs"] != []:
+is_nonnegative_integer = lambda value: type(value) is int and value >= 0
+if set(document) != expected or type(document["schema_version"]) is not int or document["schema_version"] != 1 or document["target"] != "x86_64-unknown-linux-gnu" or document["package_format"] != "deb" or not is_nonnegative_integer(document["compressed_size_bytes"]) or not is_nonnegative_integer(document["installed_size_bytes"]) or document["compressed_size_bytes"] != verified["compressed_size_bytes"] or document["installed_size_bytes"] != verified["installed_size_bytes"] or document["packs"] != [] or verified["packs"] != []:
     raise SystemExit("package size report is inconsistent")
 print(raw.decode())
 PY
