@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Seek, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -689,27 +689,74 @@ impl Drop for OsFileLock {
 
 #[derive(Debug)]
 struct BundleDiskReservation {
-    _requested_bytes: u64,
+    remaining_bytes: u64,
     reservation_root: PathBuf,
     entry_path: PathBuf,
+    entry_file: Option<File>,
     entry_lock: Option<OsFileLock>,
 }
 
-impl Drop for BundleDiskReservation {
-    fn drop(&mut self) {
+impl BundleDiskReservation {
+    fn consume_allocated_bytes(&mut self, allocated_bytes: u64) -> Result<(), InstallError> {
+        let remaining_bytes = self.remaining_bytes.checked_sub(allocated_bytes).ok_or_else(|| {
+            failed(format!(
+                "ONNX bundle reservation accounting attempted to consume {allocated_bytes} bytes from a {}-byte reservation",
+                self.remaining_bytes
+            ))
+        })?;
+        let _ledger = OsFileLock::acquire(&self.reservation_root.join("ledger.lock"), true)?;
+        let entry_file = self.entry_file.as_mut().ok_or_else(|| {
+            failed("ONNX bundle reservation was already released before allocation completed")
+        })?;
+        entry_file.set_len(0).map_err(|error| {
+            failed(format!(
+                "could not truncate ONNX bundle reservation {}: {error}",
+                self.entry_path.display()
+            ))
+        })?;
+        entry_file.rewind().map_err(|error| {
+            failed(format!(
+                "could not rewind ONNX bundle reservation {}: {error}",
+                self.entry_path.display()
+            ))
+        })?;
+        writeln!(entry_file, "{remaining_bytes}").map_err(|error| {
+            failed(format!(
+                "could not update ONNX bundle reservation {}: {error}",
+                self.entry_path.display()
+            ))
+        })?;
+        entry_file.flush().map_err(|error| {
+            failed(format!(
+                "could not flush ONNX bundle reservation {}: {error}",
+                self.entry_path.display()
+            ))
+        })?;
+        entry_file.sync_all().map_err(|error| {
+            failed(format!(
+                "could not sync ONNX bundle reservation {}: {error}",
+                self.entry_path.display()
+            ))
+        })?;
+        self.remaining_bytes = remaining_bytes;
+        Ok(())
+    }
+
+    fn release_with_ledger_wait(&mut self, wait: bool) -> Result<(), InstallError> {
+        if self.entry_lock.is_none() {
+            return Ok(());
+        }
         let ledger_path = self.reservation_root.join("ledger.lock");
-        let Ok(_ledger) = OsFileLock::acquire(&ledger_path, false) else {
-            // Unlock the entry but leave both paths for the next ledger owner
-            // to prune. Release never mutates a live ledger without owning it.
-            self.entry_lock.take();
-            return;
-        };
+        let _ledger = OsFileLock::acquire(&ledger_path, wait)?;
+        self.entry_file.take();
         match fs::remove_file(&self.entry_path) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(_) => {
-                self.entry_lock.take();
-                return;
+            Err(error) => {
+                return Err(failed(format!(
+                    "could not release ONNX bundle reservation {}: {error}",
+                    self.entry_path.display()
+                )));
             }
         }
         self.entry_lock.take();
@@ -719,6 +766,16 @@ impl Drop for BundleDiskReservation {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(_) => {}
         }
+        self.remaining_bytes = 0;
+        Ok(())
+    }
+}
+
+impl Drop for BundleDiskReservation {
+    fn drop(&mut self) {
+        // When the ledger is contended, releasing the held entry lock makes
+        // this entry stale so the next ledger owner can prune it safely.
+        let _ = self.release_with_ledger_wait(false);
     }
 }
 
@@ -916,9 +973,10 @@ fn acquire_bundle_disk_reservation_with_control_root(
     let lock_path = path.with_extension("lock");
     let entry_lock = OsFileLock::acquire(&lock_path, false)?;
     Ok(BundleDiskReservation {
-        _requested_bytes: requested_bytes,
+        remaining_bytes: requested_bytes,
         reservation_root,
         entry_path: path,
+        entry_file: Some(file),
         entry_lock: Some(entry_lock),
     })
 }
@@ -999,7 +1057,6 @@ pub(crate) struct StagedOnnxBundle {
     spec: OnnxModelSpec,
     retain_previous: bool,
     target_guard: BundleTargetGuard,
-    disk_reservation: BundleDiskReservation,
 }
 
 impl StagedOnnxBundle {
@@ -1083,7 +1140,6 @@ impl VerifiedStagedOnnxBundle {
             replacement,
             retain_previous: staged.retain_previous,
             target_guard: staged.target_guard,
-            disk_reservation: staged.disk_reservation,
         })
     }
 
@@ -1099,7 +1155,6 @@ pub(crate) struct ActivatedOnnxBundle {
     replacement: DirectoryReplacement,
     retain_previous: bool,
     target_guard: BundleTargetGuard,
-    disk_reservation: BundleDiskReservation,
 }
 
 impl ActivatedOnnxBundle {
@@ -1107,13 +1162,11 @@ impl ActivatedOnnxBundle {
         let Self {
             replacement,
             target_guard,
-            disk_reservation,
             retain_previous,
             ..
         } = self;
         replacement.commit_with_previous_policy(retain_previous)?;
         drop(target_guard);
-        drop(disk_reservation);
         Ok(())
     }
 }
@@ -1289,6 +1342,18 @@ pub(crate) fn bundle_disk_space_preflight(
     disk_space::preflight_download_destination(&target, additional).map_err(InstallError::Failed)
 }
 
+pub(crate) fn bundle_download_size_bytes(model_id: &str) -> Result<u64, InstallError> {
+    bundle_manifest(model_id)
+        .ok_or_else(|| failed(format!("unknown internal ONNX bundle {model_id}")))?
+        .files
+        .iter()
+        .try_fold(0_u64, |total, file| {
+            total
+                .checked_add(file.size_bytes)
+                .ok_or_else(|| failed("ONNX bundle download-size total overflowed"))
+        })
+}
+
 fn bundle_required_install_bytes(
     manifest: &OnnxBundleManifest,
     required_download_bytes: impl IntoIterator<Item = u64>,
@@ -1331,6 +1396,46 @@ fn inspect_bundle_artifacts(
         .collect()
 }
 
+struct ReservedBundleInspection {
+    target_guard: BundleTargetGuard,
+    inspections: Vec<(CanonicalTargetIdentity, PinnedArtifactInspectionPlan)>,
+    disk_reservation: BundleDiskReservation,
+}
+
+fn inspect_and_reserve_bundle_with_hook(
+    manifest: &OnnxBundleManifest,
+    artifacts: &[PinnedArtifact],
+    target_root: &Path,
+    cancellation: &InstallCancellation,
+    after_inspection: impl FnOnce(u64),
+) -> Result<ReservedBundleInspection, InstallError> {
+    // Lock ordering is target guard -> artifact inspection -> volume ledger.
+    // Discard and recovery take only the target guard, so no actor can mutate
+    // partials between the inspection snapshot and its matching reservation.
+    let target_guard = acquire_bundle_target(target_root)?;
+    recover_onnx_bundle_installation_locked(target_root)?;
+    let inspections = inspect_bundle_artifacts(artifacts, cancellation)?;
+    let required_bytes = bundle_required_install_bytes(
+        manifest,
+        inspections
+            .iter()
+            .map(|(_, inspection)| inspection.required_download_bytes()),
+    )?;
+    after_inspection(required_bytes);
+    if cancellation.is_cancelled() {
+        return Err(InstallError::Cancelled {
+            partial_path: target_root.to_path_buf(),
+            downloaded_bytes: 0,
+        });
+    }
+    let disk_reservation = acquire_bundle_disk_reservation(target_root, required_bytes)?;
+    Ok(ReservedBundleInspection {
+        target_guard,
+        inspections,
+        disk_reservation,
+    })
+}
+
 /// The sole production entry point that may contact Hugging Face for an ONNX
 /// bundle. Catalog reads, installed receipt reads, startup resolution, and
 /// rollback validation are all local-only operations.
@@ -1350,22 +1455,17 @@ pub(crate) fn stage_onnx_bundle_install(
         .ok_or_else(|| failed(format!("unknown internal ONNX bundle {model_id}")))?;
     let target_root = bundle_target_root(storage_root, model_id)?;
     let artifacts = pinned_files(storage_root, manifest)?;
-    let inspections = inspect_bundle_artifacts(&artifacts, cancellation)?;
-    let required_bytes = bundle_required_install_bytes(
+    let ReservedBundleInspection {
+        target_guard,
+        inspections,
+        mut disk_reservation,
+    } = inspect_and_reserve_bundle_with_hook(
         manifest,
-        inspections
-            .iter()
-            .map(|(_, inspection)| inspection.required_download_bytes()),
+        &artifacts,
+        &target_root,
+        cancellation,
+        |_| {},
     )?;
-    if cancellation.is_cancelled() {
-        return Err(InstallError::Cancelled {
-            partial_path: storage_root.to_path_buf(),
-            downloaded_bytes: 0,
-        });
-    }
-    let target_guard = acquire_bundle_target(&target_root)?;
-    recover_onnx_bundle_installation_locked(&target_root)?;
-    let disk_reservation = acquire_bundle_disk_reservation(&target_root, required_bytes)?;
     let total_download_bytes = artifacts.iter().try_fold(0_u64, |total, artifact| {
         total
             .checked_add(artifact.size_bytes)
@@ -1376,6 +1476,7 @@ pub(crate) fn stage_onnx_bundle_install(
     for ((artifact, file), (identity, inspection)) in
         artifacts.iter().zip(&manifest.files).zip(inspections)
     {
+        let reserved_download_bytes = inspection.required_download_bytes();
         let base = completed_before;
         let aggregate_progress = |event: InstallProgress| {
             progress(InstallProgress {
@@ -1395,6 +1496,7 @@ pub(crate) fn stage_onnx_bundle_install(
         )?;
         let destination = downloaded.destination.clone();
         downloaded.activate()?.commit()?;
+        disk_reservation.consume_allocated_bytes(reserved_download_bytes)?;
         assembly_files.push(BundleAssemblyFile {
             source_path: destination,
             install_path: file.path.clone(),
@@ -1432,13 +1534,16 @@ pub(crate) fn stage_onnx_bundle_install(
             "fresh ONNX bundle receipt did not match its embedded manifest authority",
         ));
     }
+    // Every future allocation covered by the ledger now exists on disk. Free
+    // space reflects those bytes directly, so retaining the reservation while
+    // this bundle waits for serialized verification would double-count it.
+    disk_reservation.release_with_ledger_wait(true)?;
     Ok(StagedOnnxBundle {
         staged,
         receipt,
         spec,
         retain_previous,
         target_guard,
-        disk_reservation,
     })
 }
 
@@ -1451,6 +1556,9 @@ pub(crate) fn discard_onnx_bundle_partials(
     let target_root = bundle_target_root(storage_root, model_id)?;
     let _target_guard = acquire_bundle_target(&target_root)?;
     let mut discarded = 0_u64;
+    if crate::installations::discard_file_bundle_staging(&target_root)? {
+        discarded += 1;
+    }
     for artifact in pinned_files(storage_root, manifest)? {
         if discard_pinned_artifact_partial(&artifact)? {
             discarded += 1;
@@ -2332,6 +2440,70 @@ mod tests {
     }
 
     #[test]
+    fn discard_cannot_invalidate_the_locked_inspection_reservation_epoch() {
+        let root = unique_root("inspection-reservation-guard");
+        fs::create_dir_all(&root).unwrap();
+        let model_id = "moonshine-tiny-en-int8-onnx";
+        let manifest = bundle_manifest(model_id).unwrap();
+        let artifacts = pinned_files(&root, manifest).unwrap();
+        let first = &artifacts[0];
+        fs::create_dir_all(first.destination.parent().unwrap()).unwrap();
+        let mut partial_name = first.destination.file_name().unwrap().to_os_string();
+        partial_name.push(".partial");
+        let partial = first.destination.with_file_name(partial_name);
+        fs::write(&partial, b"retained").unwrap();
+        let target = bundle_target_root(&root, model_id).unwrap();
+        let expected_required = bundle_required_install_bytes(
+            manifest,
+            artifacts.iter().enumerate().map(|(index, artifact)| {
+                if index == 0 {
+                    artifact.size_bytes - 8
+                } else {
+                    artifact.size_bytes
+                }
+            }),
+        )
+        .unwrap();
+        let mut observed_required = None;
+
+        let ReservedBundleInspection {
+            target_guard,
+            inspections,
+            disk_reservation: reservation,
+        } = inspect_and_reserve_bundle_with_hook(
+            manifest,
+            &artifacts,
+            &target,
+            &InstallCancellation::default(),
+            |required_bytes| {
+                observed_required = Some(required_bytes);
+                let actor_root = root.clone();
+                let discard =
+                    thread::spawn(move || discard_onnx_bundle_partials(model_id, &actor_root))
+                        .join()
+                        .unwrap();
+                assert!(discard.is_err());
+                assert!(partial.exists());
+            },
+        )
+        .unwrap();
+
+        assert_eq!(observed_required, Some(expected_required));
+        assert_eq!(reservation.remaining_bytes, expected_required);
+        assert_eq!(
+            inspections[0].1.required_download_bytes(),
+            first.size_bytes - 8
+        );
+        assert!(partial.exists());
+
+        drop(reservation);
+        drop(target_guard);
+        assert_eq!(discard_onnx_bundle_partials(model_id, &root).unwrap(), 1);
+        assert!(!partial.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn pre_cancelled_bundle_stage_creates_no_storage_or_coordination_state() {
         let root = unique_root("stage-pre-cancel");
         let cancellation = InstallCancellation::default();
@@ -2368,7 +2540,7 @@ mod tests {
     }
 
     #[test]
-    fn cancellation_during_bundle_cache_inspection_precedes_locks_and_reservations() {
+    fn cancellation_during_locked_bundle_cache_inspection_releases_the_target_guard() {
         let root = unique_root("stage-inspection-cancel");
         let manifest = bundle_manifest("moonshine-tiny-en-int8-onnx").unwrap();
         let artifacts = pinned_files(&root, manifest).unwrap();
@@ -2387,7 +2559,8 @@ mod tests {
 
         assert!(error.is_cancelled());
         assert!(!target.exists());
-        assert!(!target.parent().unwrap().join(LOCK_DIRECTORY_NAME).exists());
+        let reacquired = acquire_bundle_target(&target).unwrap();
+        drop(reacquired);
         assert!(!cached.destination.with_extension("ort.partial").exists());
         fs::remove_dir_all(root).unwrap();
     }
@@ -2642,8 +2815,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(first.reservation_root, second.reservation_root);
-        assert_eq!(first._requested_bytes, 7);
-        assert_eq!(second._requested_bytes, 11);
+        assert_eq!(first.remaining_bytes, 7);
+        assert_eq!(second.remaining_bytes, 11);
         assert_eq!(fs::read_to_string(&first.entry_path).unwrap().trim(), "7");
         assert_eq!(fs::read_to_string(&second.entry_path).unwrap().trim(), "11");
         let exact =
@@ -2672,6 +2845,75 @@ mod tests {
         assert_eq!(count(), 1);
         drop(second);
         assert_eq!(count(), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn consumed_disk_reduces_live_reservations_without_allowing_overcommit() {
+        const CONSUMED_BYTES: u64 = 16 * 1024 * 1024;
+        const ADMISSION_SLACK: u64 = 2 * 1024 * 1024;
+        const WRITE_CHUNK_BYTES: usize = 64 * 1024;
+
+        let root = unique_root("reservation-consumption");
+        let control = root.join("control");
+        let first_storage = root.join("first-storage");
+        let second_storage = root.join("second-storage");
+        fs::create_dir_all(&first_storage).unwrap();
+        fs::create_dir_all(&second_storage).unwrap();
+        let first_target = first_storage.join("model");
+        let second_target = second_storage.join("other-model");
+        let mut first = acquire_bundle_disk_reservation_with_control_root(
+            &control,
+            &first_target,
+            CONSUMED_BYTES,
+        )
+        .unwrap();
+
+        let allocated_path = first_storage.join("consumed.bin");
+        let mut allocated = File::create(&allocated_path).unwrap();
+        let chunk = [0xa5_u8; WRITE_CHUNK_BYTES];
+        for _ in 0..(CONSUMED_BYTES / WRITE_CHUNK_BYTES as u64) {
+            allocated.write_all(&chunk).unwrap();
+        }
+        allocated.sync_all().unwrap();
+        drop(allocated);
+
+        let available_after_allocation =
+            disk_space::preflight_download_destination(&second_target, 0)
+                .unwrap()
+                .available_bytes;
+        let second_request = available_after_allocation
+            .checked_sub(disk_space::SAFETY_HEADROOM_BYTES + ADMISSION_SLACK)
+            .expect("test volume needs enough free space for the safety floor and slack");
+
+        let stale_error = acquire_bundle_disk_reservation_with_control_root(
+            &control,
+            &second_target,
+            second_request,
+        )
+        .unwrap_err();
+        assert!(stale_error.to_string().contains("insufficient unreserved"));
+
+        first.consume_allocated_bytes(CONSUMED_BYTES).unwrap();
+        assert_eq!(first.remaining_bytes, 0);
+        assert_eq!(fs::read_to_string(&first.entry_path).unwrap().trim(), "0");
+        let second = acquire_bundle_disk_reservation_with_control_root(
+            &control,
+            &second_target,
+            second_request,
+        )
+        .unwrap();
+
+        let overcommit = acquire_bundle_disk_reservation_with_control_root(
+            &control,
+            &root.join("third-storage").join("third-model"),
+            ADMISSION_SLACK + 1,
+        )
+        .unwrap_err();
+        assert!(overcommit.to_string().contains("insufficient unreserved"));
+
+        drop(second);
+        drop(first);
         fs::remove_dir_all(root).unwrap();
     }
 
