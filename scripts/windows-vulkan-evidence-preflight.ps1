@@ -4,11 +4,14 @@ Set-StrictMode -Version Latest
 if (-not ('ScribeEvidenceNative.BoundPendingFile' -as [type])) {
     Add-Type -TypeDefinition @'
 using System;
+using System.Collections.Generic;
 using System.ComponentModel;
+using System.Globalization;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
 using Microsoft.Win32.SafeHandles;
 
 namespace ScribeEvidenceNative
@@ -39,8 +42,213 @@ namespace ScribeEvidenceNative
         }
     }
 
+    public static class StrictEvidenceJson
+    {
+        private static readonly string[] RootProperties = new string[]
+        {
+            "schema_version", "fixture_only", "untrusted", "auto_eligible",
+            "source_revision", "pack", "model_sha256", "wav_sha256", "gpu",
+            "nvidia_baseline", "cold_runs_per_backend", "warm_runs_per_backend",
+            "cpu", "vulkan", "expected_phrase_present_every_run",
+            "normalized_transcript_parity", "same_device_internally_verified"
+        };
+        private static readonly string[] PackProperties = new string[]
+        {
+            "id", "version", "digest", "security_epoch", "runtime_abi"
+        };
+        private static readonly string[] GpuProperties = new string[]
+        {
+            "backend", "provider", "vendor", "device_class", "driver", "memory_total_bytes"
+        };
+        private static readonly string[] BaselineProperties = new string[]
+        {
+            "product", "driver", "memory_total_bytes", "memory_used_bytes", "gpu_utilization_percent"
+        };
+        private static readonly string[] BackendProperties = new string[] { "cold", "warm" };
+        private static readonly string[] RunSetProperties = new string[]
+        {
+            "end_to_end", "end_to_end_ms", "backend_processing",
+            "backend_processing_ms", "model_load", "model_load_ms"
+        };
+        private static readonly string[] StatisticsProperties = new string[] { "p50_ms", "p95_ms" };
+
+        public static void Validate(string utf8Json)
+        {
+            if (utf8Json == null) throw SchemaError();
+            JsonDocumentOptions options = new JsonDocumentOptions
+            {
+                AllowTrailingCommas = false,
+                CommentHandling = JsonCommentHandling.Disallow,
+                MaxDepth = 64
+            };
+            using (JsonDocument document = JsonDocument.Parse(utf8Json, options))
+            {
+                JsonElement root = document.RootElement;
+                ValidateNoDuplicateProperties(root);
+                ValidateRoot(root);
+            }
+        }
+
+        private static void ValidateRoot(JsonElement root)
+        {
+            RequireExactObject(root, RootProperties);
+            RequireUnsignedInteger(root.GetProperty("schema_version"));
+            RequireBoolean(root.GetProperty("fixture_only"));
+            RequireBoolean(root.GetProperty("untrusted"));
+            RequireBoolean(root.GetProperty("auto_eligible"));
+            RequireString(root.GetProperty("source_revision"));
+            ValidatePack(root.GetProperty("pack"));
+            RequireString(root.GetProperty("model_sha256"));
+            RequireString(root.GetProperty("wav_sha256"));
+            ValidateGpu(root.GetProperty("gpu"));
+            ValidateBaseline(root.GetProperty("nvidia_baseline"));
+            RequireUnsignedInteger(root.GetProperty("cold_runs_per_backend"));
+            RequireUnsignedInteger(root.GetProperty("warm_runs_per_backend"));
+            ValidateBackend(root.GetProperty("cpu"));
+            ValidateBackend(root.GetProperty("vulkan"));
+            RequireBoolean(root.GetProperty("expected_phrase_present_every_run"));
+            RequireBoolean(root.GetProperty("normalized_transcript_parity"));
+            RequireBoolean(root.GetProperty("same_device_internally_verified"));
+        }
+
+        private static void ValidatePack(JsonElement value)
+        {
+            RequireExactObject(value, PackProperties);
+            RequireString(value.GetProperty("id"));
+            RequireString(value.GetProperty("version"));
+            RequireString(value.GetProperty("digest"));
+            RequireUnsignedInteger(value.GetProperty("security_epoch"));
+            RequireUnsignedInteger(value.GetProperty("runtime_abi"));
+        }
+
+        private static void ValidateGpu(JsonElement value)
+        {
+            RequireExactObject(value, GpuProperties);
+            RequireString(value.GetProperty("backend"));
+            RequireString(value.GetProperty("provider"));
+            RequireString(value.GetProperty("vendor"));
+            RequireString(value.GetProperty("device_class"));
+            RequireString(value.GetProperty("driver"));
+            RequireUnsignedInteger(value.GetProperty("memory_total_bytes"));
+        }
+
+        private static void ValidateBaseline(JsonElement value)
+        {
+            RequireExactObject(value, BaselineProperties);
+            RequireString(value.GetProperty("product"));
+            RequireString(value.GetProperty("driver"));
+            RequireUnsignedInteger(value.GetProperty("memory_total_bytes"));
+            RequireUnsignedInteger(value.GetProperty("memory_used_bytes"));
+            RequireUnsignedInteger(value.GetProperty("gpu_utilization_percent"));
+        }
+
+        private static void ValidateBackend(JsonElement value)
+        {
+            RequireExactObject(value, BackendProperties);
+            ValidateRunSet(value.GetProperty("cold"), true);
+            ValidateRunSet(value.GetProperty("warm"), false);
+        }
+
+        private static void ValidateRunSet(JsonElement value, bool cold)
+        {
+            RequireExactObject(value, RunSetProperties);
+            ValidateStatistics(value.GetProperty("end_to_end"));
+            ValidateUnsignedIntegerArray(value.GetProperty("end_to_end_ms"));
+            ValidateStatistics(value.GetProperty("backend_processing"));
+            ValidateUnsignedIntegerArray(value.GetProperty("backend_processing_ms"));
+            if (cold)
+            {
+                ValidateStatistics(value.GetProperty("model_load"));
+                ValidateUnsignedIntegerArray(value.GetProperty("model_load_ms"));
+            }
+            else
+            {
+                RequireKind(value.GetProperty("model_load"), JsonValueKind.Null);
+                RequireKind(value.GetProperty("model_load_ms"), JsonValueKind.Null);
+            }
+        }
+
+        private static void ValidateStatistics(JsonElement value)
+        {
+            RequireExactObject(value, StatisticsProperties);
+            RequireUnsignedInteger(value.GetProperty("p50_ms"));
+            RequireUnsignedInteger(value.GetProperty("p95_ms"));
+        }
+
+        private static void ValidateUnsignedIntegerArray(JsonElement value)
+        {
+            RequireKind(value, JsonValueKind.Array);
+            foreach (JsonElement item in value.EnumerateArray()) RequireUnsignedInteger(item);
+        }
+
+        private static void ValidateNoDuplicateProperties(JsonElement value)
+        {
+            if (value.ValueKind == JsonValueKind.Object)
+            {
+                HashSet<string> names = new HashSet<string>(StringComparer.Ordinal);
+                foreach (JsonProperty property in value.EnumerateObject())
+                {
+                    if (!names.Add(property.Name)) throw SchemaError();
+                    ValidateNoDuplicateProperties(property.Value);
+                }
+            }
+            else if (value.ValueKind == JsonValueKind.Array)
+            {
+                foreach (JsonElement item in value.EnumerateArray()) ValidateNoDuplicateProperties(item);
+            }
+        }
+
+        private static void RequireExactObject(JsonElement value, string[] propertyNames)
+        {
+            RequireKind(value, JsonValueKind.Object);
+            HashSet<string> remaining = new HashSet<string>(propertyNames, StringComparer.Ordinal);
+            foreach (JsonProperty property in value.EnumerateObject())
+            {
+                if (!remaining.Remove(property.Name)) throw SchemaError();
+            }
+            if (remaining.Count != 0) throw SchemaError();
+        }
+
+        private static void RequireString(JsonElement value)
+        {
+            RequireKind(value, JsonValueKind.String);
+        }
+
+        private static void RequireBoolean(JsonElement value)
+        {
+            if (value.ValueKind != JsonValueKind.True && value.ValueKind != JsonValueKind.False)
+                throw SchemaError();
+        }
+
+        private static void RequireUnsignedInteger(JsonElement value)
+        {
+            RequireKind(value, JsonValueKind.Number);
+            string raw = value.GetRawText();
+            if (raw.Length == 0) throw SchemaError();
+            if (raw.Length > 1 && (raw[0] < '1' || raw[0] > '9')) throw SchemaError();
+            for (int index = raw.Length == 1 ? 0 : 1; index < raw.Length; index++)
+            {
+                if (raw[index] < '0' || raw[index] > '9') throw SchemaError();
+            }
+            ulong parsed;
+            if (!UInt64.TryParse(raw, NumberStyles.None, CultureInfo.InvariantCulture, out parsed))
+                throw SchemaError();
+        }
+
+        private static void RequireKind(JsonElement value, JsonValueKind kind)
+        {
+            if (value.ValueKind != kind) throw SchemaError();
+        }
+
+        private static InvalidOperationException SchemaError()
+        {
+            return new InvalidOperationException("Evidence report violates the strict JSON schema.");
+        }
+    }
+
     public sealed class BoundPendingFile : IDisposable
     {
+        public const int ConsumerApiVersion = 2;
         private const uint GenericRead = 0x80000000;
         private const uint DeleteAccess = 0x00010000;
         private const uint FileListDirectory = 0x00000001;
@@ -720,6 +928,29 @@ namespace ScribeEvidenceNative
 '@
 }
 
+& {
+    $nativeEvidenceType = 'ScribeEvidenceNative.BoundPendingFile' -as [type]
+    $verifiedEvidenceType = 'ScribeEvidenceNative.BoundVerifiedEvidence' -as [type]
+    $strictJsonType = 'ScribeEvidenceNative.StrictEvidenceJson' -as [type]
+    $publicStatic = [Reflection.BindingFlags]::Public -bor [Reflection.BindingFlags]::Static
+    $publicInstance = [Reflection.BindingFlags]::Public -bor [Reflection.BindingFlags]::Instance
+    $versionField = if ($null -eq $nativeEvidenceType) { $null } else { $nativeEvidenceType.GetField('ConsumerApiVersion', $publicStatic) }
+    $version = if ($null -eq $versionField -or -not $versionField.IsLiteral) { $null } else { $versionField.GetRawConstantValue() }
+    $staticNativeMethods = if ($null -eq $nativeEvidenceType) { @() } else { @($nativeEvidenceType.GetMethods($publicStatic) | ForEach-Object { $_.Name }) }
+    $instanceNativeMethods = if ($null -eq $nativeEvidenceType) { @() } else { @($nativeEvidenceType.GetMethods($publicInstance) | ForEach-Object { $_.Name }) }
+    $strictJsonMethods = if ($null -eq $strictJsonType) { @() } else { @($strictJsonType.GetMethods($publicStatic) | ForEach-Object { $_.Name }) }
+    $hasOpenPublished = $staticNativeMethods -ccontains 'OpenPublished'
+    $hasReadAllAndVerify = $instanceNativeMethods -ccontains 'ReadAllAndVerify'
+    $hasStrictValidate = $strictJsonMethods -ccontains 'Validate'
+    if ($version -ne 2 -or
+        $null -eq $verifiedEvidenceType -or
+        -not $hasOpenPublished -or
+        -not $hasReadAllAndVerify -or
+        -not $hasStrictValidate) {
+        throw 'Restart PowerShell/session: incompatible native evidence type is already loaded.'
+    }
+}
+
 function Assert-ScribeEvidenceNoReparse([string]$Path) {
     $current = [IO.Path]::GetFullPath($Path).TrimEnd([char[]]@('\', '/'))
     while (-not (Test-Path -LiteralPath $current)) {
@@ -862,6 +1093,12 @@ function Assert-ScribeEvidenceReportBytes([byte[]]$Bytes) {
 }
 
 function Assert-ScribeEvidenceReportJson([string]$Utf8Json) {
+    try {
+        [ScribeEvidenceNative.StrictEvidenceJson]::Validate($Utf8Json)
+    }
+    catch {
+        throw 'Evidence report violates the strict JSON schema.'
+    }
     try {
         $report = $Utf8Json | ConvertFrom-Json
     }

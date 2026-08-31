@@ -1,5 +1,40 @@
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+$preflightPath = (Resolve-Path (Join-Path $PSScriptRoot 'windows-vulkan-evidence-preflight.ps1')).Path
+$previousIncompatibleTypeTestPath = $env:SCRIBE_EVIDENCE_INCOMPATIBLE_TYPE_TEST_PATH
+$incompatibleTypeHarness = @'
+$ErrorActionPreference = 'Stop'
+Add-Type -TypeDefinition @"
+namespace ScribeEvidenceNative
+{
+    public sealed class BoundPendingFile { }
+}
+"@
+$failure = $null
+try {
+    . $env:SCRIBE_EVIDENCE_INCOMPATIBLE_TYPE_TEST_PATH
+}
+catch {
+    $failure = $_.Exception.GetBaseException().Message
+}
+if ($failure -cne 'Restart PowerShell/session: incompatible native evidence type is already loaded.') {
+    throw "Incompatible native evidence type did not fail clearly at load time: $failure"
+}
+Write-Output 'incompatible native evidence type rejected'
+'@
+try {
+    $env:SCRIBE_EVIDENCE_INCOMPATIBLE_TYPE_TEST_PATH = $preflightPath
+    $encodedHarness = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($incompatibleTypeHarness))
+    $incompatibleTypeOutput = @(& (Join-Path $PSHOME 'pwsh.exe') -NoProfile -EncodedCommand $encodedHarness)
+    if ($LASTEXITCODE -ne 0 -or
+        $incompatibleTypeOutput.Count -ne 1 -or
+        $incompatibleTypeOutput[0] -cne 'incompatible native evidence type rejected') {
+        throw 'Fresh child PowerShell did not reject an incompatible native evidence type deterministically.'
+    }
+}
+finally {
+    $env:SCRIBE_EVIDENCE_INCOMPATIBLE_TYPE_TEST_PATH = $previousIncompatibleTypeTestPath
+}
 . (Join-Path $PSScriptRoot 'windows-vulkan-evidence-preflight.ps1')
 
 if ((ConvertTo-ScribeVulkanEvidencePci 'native:0000:01:00.0') -cne '0000:01:00.0') { throw 'Native PCI parsing regressed.' }
@@ -384,6 +419,40 @@ try {
         throw 'Consumer verifier did not return the exact validated immutable evidence representation.'
     }
 
+    $strictSchemaCases = [ordered]@{
+        comment = "/* fixture comment */$expectedJson"
+        'trailing-comma' = $expectedJson.Substring(0, $expectedJson.Length - 1) + ',}'
+        'duplicate-key' = '{"schema_version":1,' + $expectedJson.Substring(1)
+        'nested-duplicate-key' = $expectedJson.Replace('"pack":{"id":"fixture",', '"pack":{"id":"fixture","id":"fixture",')
+        'string-boolean' = $expectedJson.Replace('"fixture_only":true', '"fixture_only":"true"')
+        'string-count' = $expectedJson.Replace('"cold_runs_per_backend":5', '"cold_runs_per_backend":"5"')
+        'fractional-integer' = $expectedJson.Replace('"security_epoch":1', '"security_epoch":1.0')
+        'exponent-integer' = $expectedJson.Replace('"runtime_abi":1', '"runtime_abi":1e0')
+    }
+    foreach ($strictSchemaCase in $strictSchemaCases.GetEnumerator()) {
+        if ([string]$strictSchemaCase.Value -ceq $expectedJson) {
+            throw "Strict-schema regression fixture did not mutate the valid JSON: $($strictSchemaCase.Key)"
+        }
+        $strictLeaf = "windows-vulkan-fixture-evidence-strict-$($strictSchemaCase.Key).json"
+        $strictPath = Join-Path $publicationRoot $strictLeaf
+        $strictBytes = [Text.UTF8Encoding]::new($false).GetBytes([string]$strictSchemaCase.Value)
+        $strictDigest = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($strictBytes)).ToLowerInvariant()
+        [IO.File]::WriteAllBytes($strictPath, $strictBytes)
+        $strictFailure = $null
+        try {
+            $null = Read-ScribeVerifiedEvidenceReport $strictPath $strictDigest
+        }
+        catch {
+            $strictFailure = $_.Exception.GetBaseException().Message
+        }
+        finally {
+            Remove-Item -LiteralPath $strictPath -Force -ErrorAction SilentlyContinue
+        }
+        if ($strictFailure -cne 'Evidence report violates the strict JSON schema.') {
+            throw "Full consumer verifier did not reject $($strictSchemaCase.Key) at the strict-schema boundary."
+        }
+    }
+
     $wrongDigest = if ($expectedBoundDigest[0] -ceq '0') {
         '1' + $expectedBoundDigest.Substring(1)
     }
@@ -648,7 +717,7 @@ $preflight = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'windows-vulkan-e
 foreach ($required in @('GetSystemDirectory', 'nvidia-smi.exe', 'matching.Count -ne 1', '$utilization -gt 10', '$usedMib -gt ($totalMib / 4)', 'pci.bus_id')) {
     if ($preflight -notmatch [regex]::Escape($required)) { throw "Preflight is missing required source contract: $required" }
 }
-foreach ($required in @('CreateFileW', 'GetFileInformationByHandle', 'GetFileInformationByHandleEx', 'FileIdExtdDirectoryInfo', 'SetFileInformationByHandle', 'FileRenameInfo', 'FileDispositionInfo', 'ValidateOnlyUnnamedDataStream', 'ReadAllAndHash', 'RenameNoReplace', 'FileShareRead', 'OpenPublished', 'ReadAllAndVerify', 'CryptographicOperations.FixedTimeEquals', 'new UTF8Encoding(false, true)', 'BoundVerifiedEvidence', 'Read-ScribeVerifiedEvidenceReport')) {
+foreach ($required in @('CreateFileW', 'GetFileInformationByHandle', 'GetFileInformationByHandleEx', 'FileIdExtdDirectoryInfo', 'SetFileInformationByHandle', 'FileRenameInfo', 'FileDispositionInfo', 'ValidateOnlyUnnamedDataStream', 'ReadAllAndHash', 'RenameNoReplace', 'FileShareRead', 'OpenPublished', 'ReadAllAndVerify', 'CryptographicOperations.FixedTimeEquals', 'new UTF8Encoding(false, true)', 'BoundVerifiedEvidence', 'Read-ScribeVerifiedEvidenceReport', 'System.Text.Json', 'JsonDocument.Parse', 'AllowTrailingCommas = false', 'CommentHandling = JsonCommentHandling.Disallow', 'StringComparer.Ordinal', 'GetRawText()', 'NumberStyles.None', 'ConsumerApiVersion = 2', 'Restart PowerShell/session: incompatible native evidence type is already loaded.')) {
     if ($preflight -notmatch [regex]::Escape($required)) { throw "Handle-bound evidence publication is missing: $required" }
 }
 if ($preflight -match '\[IO\.File\]::Move\(' -or
@@ -666,6 +735,18 @@ $verifierFunction = $preflightAst.Find({
     $Ast.Name -ceq 'Read-ScribeVerifiedEvidenceReport'
 }, $true)
 if ($null -eq $verifierFunction) { throw 'Consumer-bound verifier function is missing.' }
+$strictSchemaFunction = $preflightAst.Find({
+    param($Ast)
+    $Ast -is [Management.Automation.Language.FunctionDefinitionAst] -and
+    $Ast.Name -ceq 'Assert-ScribeEvidenceReportJson'
+}, $true)
+if ($null -eq $strictSchemaFunction) { throw 'Strict evidence schema function is missing.' }
+$strictSchemaSource = $strictSchemaFunction.Extent.Text
+$strictNativeAt = $strictSchemaSource.IndexOf('[ScribeEvidenceNative.StrictEvidenceJson]::Validate($Utf8Json)')
+$convertFromJsonAt = $strictSchemaSource.IndexOf('$Utf8Json | ConvertFrom-Json')
+if ($strictNativeAt -lt 0 -or $convertFromJsonAt -le $strictNativeAt) {
+    throw 'Strict native JSON validation must precede PowerShell semantic materialization.'
+}
 $verifierSource = $verifierFunction.Extent.Text
 $openPublishedAt = $verifierSource.IndexOf('::OpenPublished(')
 $readVerifiedAt = $verifierSource.IndexOf('.ReadAllAndVerify(')
