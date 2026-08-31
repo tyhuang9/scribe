@@ -289,7 +289,7 @@ const TRANSCRIBE_CPP_VERSION: RuntimeVersion = RuntimeVersion {
     patch: 1,
 };
 
-const GGUF_BATCH_ENGLISH_CAPABILITIES: ModelCapabilities = ModelCapabilities {
+const BATCH_ENGLISH_CAPABILITIES: ModelCapabilities = ModelCapabilities {
     batch_transcription: true,
     native_streaming: false,
     cancellation: true,
@@ -299,13 +299,18 @@ const GGUF_BATCH_ENGLISH_CAPABILITIES: ModelCapabilities = ModelCapabilities {
     confidence_scores: false,
     custom_vocabulary: false,
     cpu: true,
+    gpu: false,
+};
+
+const GGUF_BATCH_ENGLISH_CAPABILITIES: ModelCapabilities = ModelCapabilities {
     gpu: cfg!(feature = "vulkan-acceleration"),
+    ..BATCH_ENGLISH_CAPABILITIES
 };
 
 const MOONSHINE_TINY_CAPABILITIES: ModelCapabilities = ModelCapabilities {
     timestamps: false,
     gpu: false,
-    ..GGUF_BATCH_ENGLISH_CAPABILITIES
+    ..BATCH_ENGLISH_CAPABILITIES
 };
 
 const MOONSHINE_BASE_CAPABILITIES: ModelCapabilities = ModelCapabilities {
