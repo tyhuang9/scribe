@@ -66,6 +66,7 @@ for build in first:077 second:022 third:002; do
     --desktop "$desktop" --cpu-worker "$worker" --output "$test_root/$name.deb" --version 0.1.0 >/dev/null)
   bash "$repo_root/scripts/verify-linux-release-package.sh" --package "$test_root/$name.deb" >/dev/null
   bash "$repo_root/scripts/report-linux-worker-pack-sizes.sh" --package "$test_root/$name.deb" >/dev/null
+  [[ "$(stat -c %a "$test_root/$name.deb")" == 644 && "$(stat -c %a "$test_root/$name.deb.sizes.json")" == 644 ]] || { echo 'release artifact modes are not normalized to 0644.' >&2; exit 1; }
 done
 cmp -s "$test_root/first.deb" "$test_root/second.deb" || { echo 'identical release inputs did not produce an identical .deb.' >&2; exit 1; }
 cmp -s "$test_root/first.deb" "$test_root/third.deb" || { echo 'caller umask changed the assembled .deb.' >&2; exit 1; }

@@ -129,6 +129,7 @@ find "$package_root" -exec touch --no-dereference --date="@$source_date_epoch" -
 temporary_deb="$(mktemp "$output_parent/.scribe-linux-release.XXXXXX.deb")"
 rm -f -- "$temporary_deb"
 SOURCE_DATE_EPOCH="$source_date_epoch" dpkg-deb --root-owner-group --build -Zxz -z9 --uniform-compression "$package_root" "$temporary_deb" >/dev/null
+chmod 0644 "$temporary_deb"
 mv --no-clobber -- "$temporary_deb" "$output"
 [[ ! -e "$temporary_deb" ]] || { echo 'release output appeared before atomic publication; refusing to overwrite it.' >&2; exit 1; }
 package_bytes="$(stat -c %s -- "$output")"
@@ -138,6 +139,7 @@ import json, pathlib, sys
 document = {"schema_version": 1, "target": "x86_64-unknown-linux-gnu", "package_format": "deb", "installed_size_bytes": int(sys.argv[2]), "compressed_size_bytes": int(sys.argv[3]), "packs": []}
 pathlib.Path(sys.argv[1]).write_text(json.dumps(document, sort_keys=True, separators=(",", ":")), encoding="utf-8")
 PY
+chmod 0644 "$temporary_report"
 mv --no-clobber -- "$temporary_report" "$output.sizes.json"
 [[ ! -e "$temporary_report" ]] || { echo 'size report output appeared before atomic publication; refusing to overwrite it.' >&2; exit 1; }
 echo "$output"
