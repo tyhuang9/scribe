@@ -191,6 +191,45 @@ foreach ($name in $toolchainEnvironmentNames) {
         Value = if ($null -eq $value) { $null } else { [string]$value.Value }
     }
 }
+$exportedPinnedEnvironment = @(& $buildScript `
+    -Backend Vulkan `
+    -PackVersion '0.1.0-fixture' `
+    -OutputDirectory $toolchainOutput `
+    -SigningMode Fixture `
+    -ToolchainCheckOnly `
+    -ExportPinnedMsvcEnvironment)
+Assert-True ($LASTEXITCODE -eq 0 -and $exportedPinnedEnvironment.Count -eq 1) 'Pinned MSVC environment export did not return one validated document.'
+try {
+    $exportedPinnedEnvironment = [string]$exportedPinnedEnvironment[0] | ConvertFrom-Json
+}
+catch {
+    throw 'Pinned MSVC environment export was not canonical JSON.'
+}
+Assert-True ($exportedPinnedEnvironment.schema_version -eq 1) 'Pinned MSVC environment export has an unexpected schema.'
+$exportedNames = @($exportedPinnedEnvironment.environment.PSObject.Properties.Name | Sort-Object)
+$expectedExportedNames = @(
+    'Path', 'INCLUDE', 'LIB', 'LIBPATH', 'VCINSTALLDIR',
+    'VCToolsInstallDir', 'VCToolsVersion', 'VSINSTALLDIR',
+    'WindowsSdkDir', 'WindowsSDKVersion', 'WindowsSdkBinPath',
+    'WindowsSdkVerBinPath', 'UniversalCRTSdkDir', 'UCRTVersion',
+    'Platform', 'VSCMD_ARG_HOST_ARCH', 'VSCMD_ARG_TGT_ARCH',
+    'VSCMD_ARG_VCVARS_VER', 'VSCMD_ARG_winsdk', 'CC', 'CXX', 'AR',
+    'CC_x86_64_pc_windows_msvc', 'CXX_x86_64_pc_windows_msvc',
+    'AR_x86_64_pc_windows_msvc', 'CMAKE_C_COMPILER',
+    'CMAKE_CXX_COMPILER', 'CMAKE_LINKER', 'CMAKE_AR',
+    'CMAKE_MAKE_PROGRAM', 'CMAKE_GENERATOR',
+    'CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER'
+) | Sort-Object
+Assert-True `
+    ($exportedNames.Count -eq $expectedExportedNames.Count -and
+    -not (Compare-Object -ReferenceObject $expectedExportedNames -DifferenceObject $exportedNames -CaseSensitive)) `
+    'Pinned MSVC environment export has an unexpected field set.'
+foreach ($name in $toolchainEnvironmentNames) {
+    $before = $toolchainEnvironmentBefore[$name]
+    $after = Get-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue
+    Assert-True (($null -ne $after) -eq $before.Exists) "Pinned MSVC export changed whether process environment variable $name exists."
+    if ($before.Exists) { Assert-True ([string]$after.Value -ceq [string]$before.Value) "Pinned MSVC export changed process environment variable $name." }
+}
 & $buildScript `
     -Backend Vulkan `
     -PackVersion '0.1.0-fixture' `

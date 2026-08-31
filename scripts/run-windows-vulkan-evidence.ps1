@@ -95,6 +95,58 @@ function Invoke-ScribeEvidence([string]$Exe, [string[]]$Arguments, [string]$Fail
     if ($LASTEXITCODE -ne 0) { throw $Failure }
 }
 
+function Get-ScribeEvidencePinnedMsvcEnvironment([string]$Builder, [string]$NativeArchive, [string]$UnusedOutput) {
+    try {
+        $output = @(& $Builder -Backend Vulkan -PackVersion 'fixture-toolchain-check' -OutputDirectory $UnusedOutput -SigningMode Fixture -NativeArchiveDirectory $NativeArchive -ToolchainCheckOnly -ExportPinnedMsvcEnvironment)
+    }
+    catch {
+        throw 'Could not obtain the validated pinned MSVC environment.'
+    }
+    if ($LASTEXITCODE -ne 0 -or $output.Count -ne 1) { throw 'Could not obtain the validated pinned MSVC environment.' }
+    try {
+        $export = [string]$output[0] | ConvertFrom-Json
+        $expectedNames = @(
+            'Path', 'INCLUDE', 'LIB', 'LIBPATH', 'VCINSTALLDIR',
+            'VCToolsInstallDir', 'VCToolsVersion', 'VSINSTALLDIR',
+            'WindowsSdkDir', 'WindowsSDKVersion', 'WindowsSdkBinPath',
+            'WindowsSdkVerBinPath', 'UniversalCRTSdkDir', 'UCRTVersion',
+            'Platform', 'VSCMD_ARG_HOST_ARCH', 'VSCMD_ARG_TGT_ARCH',
+            'VSCMD_ARG_VCVARS_VER', 'VSCMD_ARG_winsdk', 'CC', 'CXX', 'AR',
+            'CC_x86_64_pc_windows_msvc', 'CXX_x86_64_pc_windows_msvc',
+            'AR_x86_64_pc_windows_msvc', 'CMAKE_C_COMPILER',
+            'CMAKE_CXX_COMPILER', 'CMAKE_LINKER', 'CMAKE_AR',
+            'CMAKE_MAKE_PROGRAM', 'CMAKE_GENERATOR',
+            'CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER'
+        )
+        $actualNames = @($export.environment.PSObject.Properties.Name | Sort-Object)
+        $requiredNames = @($expectedNames | Sort-Object)
+        if ($export.schema_version -ne 1 -or
+            $actualNames.Count -ne $requiredNames.Count -or
+            (Compare-Object -ReferenceObject $requiredNames -DifferenceObject $actualNames -CaseSensitive)) {
+            throw 'invalid'
+        }
+        $environment = [ordered]@{}
+        foreach ($name in $expectedNames) {
+            $environment[$name] = [string]$export.environment.$name
+        }
+        return $environment
+    }
+    catch {
+        throw 'Pinned MSVC environment export was malformed.'
+    }
+}
+
+function Invoke-ScribeEvidenceWithPinnedMsvcEnvironment([System.Collections.IDictionary]$Environment, [scriptblock]$Operation) {
+    $previous = $null
+    try {
+        $previous = Set-ScribeEvidenceProcessEnvironment $Environment
+        & $Operation
+    }
+    finally {
+        if ($null -ne $previous) { Restore-ScribeEvidenceProcessEnvironment $previous }
+    }
+}
+
 function Enable-ScribeEvidenceCmakeBootstrap([string]$CargoTarget, [string]$BuildEnvironment) {
     $cargoTargetItem = Get-ScribeEvidencePhysicalDirectory $CargoTarget 'CMake bootstrap Cargo target'
     $buildEnvironmentItem = Get-ScribeEvidencePhysicalDirectory $BuildEnvironment 'CMake bootstrap build environment'
@@ -218,6 +270,8 @@ $previousTarget = $env:CARGO_TARGET_DIR
 $previousLocalAppData = $env:LOCALAPPDATA
 $previousWorkerDigest = $env:SCRIBE_BUNDLED_WORKER_SHA256
 $previousBuildingWorker = $env:SCRIBE_BUILDING_WORKER
+$packBuilder = Join-Path $PSScriptRoot 'build-windows-gpu-worker-pack.ps1'
+$pinnedMsvcEnvironment = Get-ScribeEvidencePinnedMsvcEnvironment $packBuilder $nativeArchive (Join-Path $workRoot 'unused-pinned-toolchain-export')
 $evidenceEnvironmentNames = @(
     'SCRIBE_VULKAN_EVIDENCE_PACK_ROOT',
     'SCRIBE_VULKAN_EVIDENCE_CPU_WORKER',
@@ -239,9 +293,15 @@ try {
     $cpuBuildEnvironment = New-ScribeEvidenceShortCargoTarget 'cpu-env'
     New-Item -ItemType Directory -Path $cpuBuildEnvironment | Out-Null
     $env:LOCALAPPDATA = $cpuBuildEnvironment
-    Set-ScribeEvidenceWorkerBuildMode $true
-    Invoke-ScribeEvidenceCargoWithCmakeRetry @('build', '--locked', '--offline', '--release', '--bin', 'scribe-inference-worker', '--features', 'inference-worker', '--manifest-path', (Join-Path $repositoryRoot 'Cargo.toml')) 'Fresh isolated CPU worker build failed.' $env:CARGO_TARGET_DIR $cpuBuildEnvironment
-    Set-ScribeEvidenceWorkerBuildMode $false
+    Invoke-ScribeEvidenceWithPinnedMsvcEnvironment $pinnedMsvcEnvironment {
+        Set-ScribeEvidenceWorkerBuildMode $true
+        try {
+            Invoke-ScribeEvidenceCargoWithCmakeRetry @('build', '--locked', '--offline', '--release', '--bin', 'scribe-inference-worker', '--features', 'inference-worker', '--manifest-path', (Join-Path $repositoryRoot 'Cargo.toml')) 'Fresh isolated CPU worker build failed.' $env:CARGO_TARGET_DIR $cpuBuildEnvironment
+        }
+        finally {
+            Set-ScribeEvidenceWorkerBuildMode $false
+        }
+    }
     $env:LOCALAPPDATA = $previousLocalAppData
     $cpuBundle = Join-Path $workRoot 'cpu-worker-bundle'
     New-Item -ItemType Directory -Path $cpuBundle | Out-Null
@@ -249,7 +309,7 @@ try {
     $cpuWorker = Assert-ScribeEvidenceSingleLinkFile (Join-Path $cpuBundle 'scribe-inference-worker.exe') 'Materialized CPU worker' (512MB) $trustedFsutil
     $packRoot = Join-Path $workRoot 'fixture-vulkan-pack'
     $packVersion = "fixture-evidence-$($revision.Substring(0, 12))-$([guid]::NewGuid().ToString('N').Substring(0, 12))"
-    & (Join-Path $PSScriptRoot 'build-windows-gpu-worker-pack.ps1') -Backend Vulkan -PackVersion $packVersion -OutputDirectory $packRoot -SigningMode Fixture -NativeArchiveDirectory $nativeArchive
+    & $packBuilder -Backend Vulkan -PackVersion $packVersion -OutputDirectory $packRoot -SigningMode Fixture -NativeArchiveDirectory $nativeArchive
     if ($LASTEXITCODE -ne 0) { throw 'Fresh fixture-signed Vulkan pack build failed.' }
     $packManifest = Get-Content -LiteralPath (Join-Path $packRoot 'manifest.json') -Raw | ConvertFrom-Json
     if ([string]$packManifest.app_build -cnotmatch ("#" + [regex]::Escape($revision) + '$') -or
@@ -266,8 +326,10 @@ try {
     $harnessBuildEnvironment = New-ScribeEvidenceShortCargoTarget 'harness-env'
     New-Item -ItemType Directory -Path $harnessBuildEnvironment | Out-Null
     $env:LOCALAPPDATA = $harnessBuildEnvironment
-    Set-ScribeEvidenceWorkerBuildMode $false
-    Invoke-ScribeEvidenceCargoWithCmakeRetry @('test', '--locked', '--offline', '--features', 'inference-worker', 'onnx_worker::tests::windows_vulkan_fixture_evidence_captures_five_cold_and_twenty_warm_runs', '--no-run') 'Vulkan evidence test precompilation failed.' $env:CARGO_TARGET_DIR $harnessBuildEnvironment
+    Invoke-ScribeEvidenceWithPinnedMsvcEnvironment $pinnedMsvcEnvironment {
+        Set-ScribeEvidenceWorkerBuildMode $false
+        Invoke-ScribeEvidenceCargoWithCmakeRetry @('test', '--locked', '--offline', '--features', 'inference-worker', 'onnx_worker::tests::windows_vulkan_fixture_evidence_captures_five_cold_and_twenty_warm_runs', '--no-run') 'Vulkan evidence test precompilation failed.' $env:CARGO_TARGET_DIR $harnessBuildEnvironment
+    }
     $baseline = Get-ScribeVulkanEvidenceNvidiaBaseline $ExpectedStableDevice $trustedNvidiaSmi
     $env:SCRIBE_VULKAN_EVIDENCE_PACK_ROOT = $packRoot
     $env:SCRIBE_VULKAN_EVIDENCE_CPU_WORKER = $cpuWorker
@@ -279,8 +341,10 @@ try {
     $env:SCRIBE_VULKAN_EVIDENCE_EXPECTED_STABLE_DEVICE = $ExpectedStableDevice
     $env:SCRIBE_VULKAN_EVIDENCE_OUTPUT = $evidenceOutput
     $env:SCRIBE_VULKAN_EVIDENCE_NVIDIA_BASELINE_JSON = $baseline | ConvertTo-Json -Compress
-    Set-ScribeEvidenceWorkerBuildMode $false
-    Invoke-ScribeEvidence $cargo @('test', '--locked', '--offline', '--features', 'inference-worker', 'onnx_worker::tests::windows_vulkan_fixture_evidence_captures_five_cold_and_twenty_warm_runs', '--', '--ignored', '--exact', '--test-threads=1') 'The exact Vulkan evidence test failed.'
+    Invoke-ScribeEvidenceWithPinnedMsvcEnvironment $pinnedMsvcEnvironment {
+        Set-ScribeEvidenceWorkerBuildMode $false
+        Invoke-ScribeEvidence $cargo @('test', '--locked', '--offline', '--features', 'inference-worker', 'onnx_worker::tests::windows_vulkan_fixture_evidence_captures_five_cold_and_twenty_warm_runs', '--', '--ignored', '--exact', '--test-threads=1') 'The exact Vulkan evidence test failed.'
+    }
 }
 finally {
     $env:SCRIBE_BUILD_REVISION = $previousRevision

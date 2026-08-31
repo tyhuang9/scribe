@@ -52,6 +52,45 @@ function Set-ScribeEvidenceWorkerBuildMode([bool]$BuildingWorker) {
     }
 }
 
+function Set-ScribeEvidenceProcessEnvironment([System.Collections.IDictionary]$Environment) {
+    $previous = [System.Collections.Generic.List[psobject]]::new()
+    try {
+        foreach ($entry in $Environment.GetEnumerator()) {
+            $name = [string]$entry.Key
+            $value = [string]$entry.Value
+            if ($name -cnotmatch '^[A-Za-z_][A-Za-z0-9_]*$' -or
+                [string]::IsNullOrWhiteSpace($value) -or
+                $value.Length -gt 32767 -or
+                $value.IndexOfAny([char[]]@("`r", "`n", [char]0)) -ge 0) {
+                throw 'Pinned toolchain environment export is invalid.'
+            }
+            $current = Get-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue
+            $previous.Add([pscustomobject]@{
+                    Name = $name
+                    Exists = $null -ne $current
+                    Value = if ($null -eq $current) { $null } else { [string]$current.Value }
+                })
+            [Environment]::SetEnvironmentVariable($name, $value, [EnvironmentVariableTarget]::Process)
+        }
+        return ,$previous.ToArray()
+    }
+    catch {
+        Restore-ScribeEvidenceProcessEnvironment $previous.ToArray()
+        throw
+    }
+}
+
+function Restore-ScribeEvidenceProcessEnvironment([psobject[]]$Previous) {
+    foreach ($entry in @($Previous)) {
+        if ($entry.Exists) {
+            [Environment]::SetEnvironmentVariable([string]$entry.Name, [string]$entry.Value, [EnvironmentVariableTarget]::Process)
+        }
+        else {
+            Remove-Item -LiteralPath "Env:$($entry.Name)" -ErrorAction SilentlyContinue
+        }
+    }
+}
+
 if (-not ('ScribeEvidenceNative.SystemDirectory' -as [type])) {
     Add-Type -TypeDefinition @'
 using System;

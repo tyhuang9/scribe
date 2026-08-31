@@ -14,12 +14,17 @@ param(
     [string]$ToolchainManifestPath,
     [string]$NativeArchiveDirectory,
     [string]$CargoTargetDirectory,
-    [switch]$ToolchainCheckOnly
+    [switch]$ToolchainCheckOnly,
+    [switch]$ExportPinnedMsvcEnvironment
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 . (Join-Path $PSScriptRoot 'windows-cuda-sdk-inventory.ps1')
+
+if ($ExportPinnedMsvcEnvironment -and -not $ToolchainCheckOnly) {
+    throw 'Pinned MSVC environment export is only available with ToolchainCheckOnly.'
+}
 
 if (-not $ToolchainCheckOnly -and
     $SigningMode -eq 'Production' -and
@@ -1178,7 +1183,15 @@ if ($ToolchainCheckOnly) {
     try {
         $toolchainEnvironmentState = Set-PinnedMsvcBuildEnvironment $msvcToolchain
         Assert-ActivePinnedMsvcEnvironment $msvcToolchain
-        Write-Output "$Backend worker-pack toolchain matches the pinned contract."
+        if ($ExportPinnedMsvcEnvironment) {
+            [pscustomobject]@{
+                schema_version = 1
+                environment = $msvcToolchain.BuildEnvironment
+            } | ConvertTo-Json -Depth 4 -Compress | Write-Output
+        }
+        else {
+            Write-Output "$Backend worker-pack toolchain matches the pinned contract."
+        }
     }
     finally {
         if ($null -ne $toolchainEnvironmentState) {
