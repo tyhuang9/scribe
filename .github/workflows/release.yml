@@ -228,7 +228,10 @@ jobs:
           if ($isccHash -cne $env:INNO_ISCC_SHA256) {
             throw "Unexpected Inno Setup compiler SHA-256 before use: $isccHash"
           }
-          & $iscc "/DAppVersion=$env:APP_VERSION" installer\scribe.iss
+          & $iscc `
+            "/DAppVersion=$env:APP_VERSION" `
+            "/DWorkerPackAllowlist=..\dist\worker-pack-allowlist.iss" `
+            installer\scribe.iss
           if ($LASTEXITCODE -ne 0) { throw "Inno Setup compilation failed with exit code $LASTEXITCODE" }
           $generated = @(Get-ChildItem -Path dist -Filter "Scribe-Setup-$env:APP_VERSION.exe" -File)
           if ($generated.Count -ne 1) { throw "Expected exactly one versioned installer; found $($generated.Count)" }

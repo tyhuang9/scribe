@@ -45,14 +45,14 @@ pub(crate) const PROTOCOL_MAGIC: [u8; 4] = *b"SCIF";
 pub(crate) const PROTOCOL_VERSION: u8 = 5;
 pub(crate) const INFERENCE_WORKER_FLAG: &str = "--scribe-inference-worker";
 pub(crate) const VAD_WORKER_FLAG: &str = "--scribe-vad-worker";
-const WORKER_ABI_VERSION: u16 = 1;
-const DESKTOP_BUILD_ID: &str = concat!(
+pub(crate) const WORKER_ABI_VERSION: u16 = 1;
+pub(crate) const DESKTOP_BUILD_ID: &str = concat!(
     "local-transcriber@",
     env!("CARGO_PKG_VERSION"),
     "#",
     env!("SCRIBE_BUILD_REVISION")
 );
-const INFERENCE_WORKER_BUILD_ID: &str = concat!(
+pub(crate) const INFERENCE_WORKER_BUILD_ID: &str = concat!(
     "scribe-inference-worker@",
     env!("CARGO_PKG_VERSION"),
     "#",
@@ -233,7 +233,7 @@ pub(crate) struct ValidatedOnnxModel {
 impl ValidatedOnnxModel {
     #[allow(
         dead_code,
-        reason = "native recognizer implementations consume role paths in later stacked stages"
+        reason = "the validated-path accessor remains available to the isolated worker fixture boundary"
     )]
     pub(crate) fn path(&self, role: OnnxFileRole) -> Result<String> {
         let path = self
@@ -1585,7 +1585,7 @@ fn verify_worker_executable(
 
 #[allow(
     dead_code,
-    reason = "desktop exact-path launch becomes active in later stacked integration stages"
+    reason = "the desktop keeps the hardened resolver compiled while production routing remains CPU-only"
 )]
 fn resolve_adjacent_inference_worker(current_executable: &Path) -> Result<PathBuf> {
     let current = std::fs::canonicalize(current_executable)
@@ -3945,7 +3945,7 @@ pub(crate) fn maybe_run_vad_worker() -> Option<i32> {
 /// compiling ASR recognizer/server code into the UI executable.
 #[allow(
     dead_code,
-    reason = "test and provider factories are consumed by later stacked integration stages"
+    reason = "the shared worker module exposes this only to the dedicated inference-server binary"
 )]
 pub(crate) fn run_inference_worker_with_factory<F: WorkerRecognizerFactory>(factory: &F) -> i32 {
     let args = std::env::args_os().skip(1).collect::<Vec<_>>();
@@ -4363,7 +4363,7 @@ impl InferenceWorkerRegistry {
 
     #[allow(
         dead_code,
-        reason = "the strict CPU registry constructor is consumed by later desktop integration stages"
+        reason = "the explicit CPU-only registry constructor remains a fail-closed integration seam"
     )]
     pub(crate) fn cpu_only() -> Self {
         Self {
@@ -7054,7 +7054,8 @@ mod tests {
             Err(_) => {
                 // Windows holds a non-delete/non-write-sharing handle through
                 // process creation, so replacement itself must fail.
-                assert!(cfg!(windows));
+                #[cfg(not(windows))]
+                panic!("worker replacement was unexpectedly denied");
             }
         }
         drop(verified);

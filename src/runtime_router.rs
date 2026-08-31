@@ -222,15 +222,27 @@ impl RuntimeRouter {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "the test-compiled full router retains its production adapter query surface"
+    )]
     pub(crate) fn handles_model_id(model_id: &ModelId) -> bool {
         runtime_kind_for_model(model_id).is_some()
     }
 
+    #[allow(
+        dead_code,
+        reason = "the test-compiled full router retains its production capability query surface"
+    )]
     pub(crate) fn capabilities_for_model(model_id: &ModelId) -> Option<RuntimeCapabilities> {
         runtime_kind_for_model(model_id)
             .map(|RuntimeKind::TranscribeCpp| static_runtime_capabilities())
     }
 
+    #[allow(
+        dead_code,
+        reason = "the test-compiled full router retains its embedded-runtime capability query"
+    )]
     pub(crate) fn embedded_runtime_capabilities() -> RuntimeCapabilities {
         static_runtime_capabilities()
     }
@@ -594,6 +606,10 @@ fn sha256_file(path: &Path) -> io::Result<String> {
     Ok(format!("{:x}", digest.finalize()))
 }
 
+#[allow(
+    dead_code,
+    reason = "the test-compiled full router retains the production static capability builder"
+)]
 fn static_runtime_capabilities() -> RuntimeCapabilities {
     RuntimeCapabilities {
         cancellation: true,

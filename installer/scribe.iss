@@ -6,6 +6,9 @@
 #ifndef AppVersion
   #define AppVersion "0.1.0"
 #endif
+#ifndef WorkerPackAllowlist
+  #define WorkerPackAllowlist "worker-pack-allowlist.empty.iss"
+#endif
 
 [Setup]
 AppId={code:ResolveAppId}
@@ -91,7 +94,7 @@ const
   FileFlagOpenReparsePoint = $00200000;
   FileFlagBackupSemantics = $02000000;
   FindStreamInfoStandard = 0;
-  MaxBoundHandles = 32;
+  MaxBoundHandles = 2048;
   { Keep this tied to StableAppIdGuid. Inno Setup writes current-user
     installations under this identity, independent of the chosen app folder. }
   ScribeUninstallRegKey =
@@ -101,9 +104,9 @@ const
   DriveFixed = 3;
 
 var
-  BoundHandles: array[0..31] of THandle;
-  BoundHandlePaths: array[0..31] of String;
-  BoundHandleReleaseBeforeInnoReplacement: array[0..31] of Boolean;
+  BoundHandles: array[0..2047] of THandle;
+  BoundHandlePaths: array[0..2047] of String;
+  BoundHandleReleaseBeforeInnoReplacement: array[0..2047] of Boolean;
   BoundHandleCount: Integer;
   TestPauseRequested: Boolean;
   TestContainerRoot: String;
@@ -734,9 +737,12 @@ begin
   Result := True;
 end;
 
+#include WorkerPackAllowlist
+
 function IsAllowedExistingDirectory(RelativePath: String): Boolean;
 begin
-  Result := SameStr(RelativePath, 'licenses');
+  Result := SameStr(RelativePath, 'licenses') or
+    IsGeneratedWorkerPackDirectory(RelativePath);
 end;
 
 function IsAllowedExistingFile(RelativePath: String): Boolean;
@@ -744,6 +750,7 @@ begin
   Result :=
     SameStr(RelativePath, 'bundle-inventory.json') or
     SameStr(RelativePath, 'bundled-model-manifest.json') or
+    SameStr(RelativePath, 'worker-pack-catalog.json') or
     SameStr(RelativePath, 'local-transcriber.exe') or
     SameStr(RelativePath, 'scribe-inference-worker.exe') or
     SameStr(RelativePath, 'README.txt') or
@@ -760,7 +767,8 @@ begin
     SameStr(RelativePath, 'licenses\whisper.cpp-MIT.txt') or
     SameStr(RelativePath, 'licenses\whisper.cpp-PROVENANCE.md') or
     SameStr(RelativePath, 'unins000.exe') or
-    SameStr(RelativePath, 'unins000.dat');
+    SameStr(RelativePath, 'unins000.dat') or
+    IsGeneratedWorkerPackFile(RelativePath);
 end;
 
 function IsInnoUninstallerArtifact(RelativePath: String): Boolean;

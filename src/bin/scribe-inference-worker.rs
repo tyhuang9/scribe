@@ -9,6 +9,10 @@
 //! This binary is the only production target that includes GGUF and ASR ONNX
 //! execution code. The desktop retains its existing same-executable VAD role.
 
+#[allow(
+    dead_code,
+    reason = "the dedicated worker consumes only the shared policy subset needed by its runtime adapter"
+)]
 #[path = "../backend_policy.rs"]
 mod backend_policy;
 mod config {
@@ -23,12 +27,24 @@ mod config {
             .ok_or_else(|| anyhow!("could not resolve Scribe application directories"))
     }
 }
+#[allow(
+    dead_code,
+    reason = "the dedicated worker consumes only the shared embedded-runtime subset needed by inference"
+)]
 #[path = "../embedded_runtime.rs"]
 mod embedded_runtime;
 #[path = "../inference_server.rs"]
 mod inference_server;
+#[allow(
+    dead_code,
+    reason = "the dedicated worker validates only the shared catalog subset needed by an admitted request"
+)]
 #[path = "../model_catalog.rs"]
 mod model_catalog;
+#[allow(
+    dead_code,
+    reason = "the dedicated process excludes desktop-side supervisor paths from its shared worker module"
+)]
 #[path = "../onnx_worker.rs"]
 mod onnx_worker;
 #[path = "../prepared_audio.rs"]
@@ -37,14 +53,26 @@ mod prepared_audio;
 mod receipt_bundle_catalog;
 #[path = "../runtime_artifact.rs"]
 mod runtime_artifact;
+#[allow(
+    dead_code,
+    reason = "the dedicated worker consumes only the shared runtime-contract subset needed by inference"
+)]
 #[path = "../runtime_contract.rs"]
 mod runtime_contract;
+#[allow(
+    dead_code,
+    reason = "the dedicated worker consumes only the shared router subset needed by inference"
+)]
 #[path = "../runtime_router.rs"]
 mod runtime_router;
 #[path = "../silero_vad_native.rs"]
 mod silero_vad_native;
 #[path = "../support_assets.rs"]
 mod support_assets;
+#[allow(
+    dead_code,
+    reason = "the dedicated worker consumes only the wire-facing subset of shared worker contracts"
+)]
 #[path = "../worker_contracts.rs"]
 mod worker_contracts;
 mod transcription {

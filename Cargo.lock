@@ -2587,6 +2587,7 @@ dependencies = [
  "libc",
  "png 0.18.1",
  "raw-window-handle 0.6.2",
+ "ring",
  "rusqlite",
  "serde",
  "serde_json",

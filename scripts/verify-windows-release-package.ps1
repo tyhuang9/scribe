@@ -30,7 +30,7 @@ $legalFiles = @(
     [pscustomobject]@{ Source = "resources/silero-vad/LICENSE"; Destination = "licenses/Silero-VAD-MIT.txt" },
     [pscustomobject]@{ Source = "resources/silero-vad/PROVENANCE.md"; Destination = "licenses/Silero-VAD-PROVENANCE.md" }
 )
-$expectedInventoryPaths = @(
+$baseExpectedInventoryPaths = @(
     "bundled-model-manifest.json",
     "licenses/Apache-2.0.txt",
     "licenses/OpenAI-Whisper-MIT.txt",
@@ -46,9 +46,12 @@ $expectedInventoryPaths = @(
     "local-transcriber.exe",
     "README.txt",
     "scribe-inference-worker.exe",
+    "worker-pack-catalog.json",
     "whisper-base.en-Q8_0.gguf"
 )
-$expectedPortablePayloadPaths = @($expectedInventoryPaths) + @("bundle-inventory.json")
+$script:expectedInventoryPaths = @($baseExpectedInventoryPaths)
+$script:expectedPortablePayloadPaths = @($script:expectedInventoryPaths) + @("bundle-inventory.json")
+$script:allowedPackExecutablePaths = @()
 
 function Get-NormalizedPath([string]$Path) {
     $full = [System.IO.Path]::GetFullPath($Path)
@@ -306,6 +309,100 @@ function Assert-ExactPayloadTree(
     }
 }
 
+function Get-DeclaredWorkerPackFiles([string]$Root) {
+    $catalogPath = Join-Path $Root 'worker-pack-catalog.json'
+    $null = Assert-RegularFile $catalogPath
+    try {
+        $catalog = Get-Content -LiteralPath $catalogPath -Raw | ConvertFrom-Json
+    }
+    catch {
+        throw "Worker-pack catalog is not valid JSON: $($_.Exception.Message)"
+    }
+    Assert-ExactObjectProperties $catalog @('schema_version', 'packs') 'Worker-pack catalog'
+    if ($catalog.schema_version -ne 1) {
+        throw 'Worker-pack catalog has an unsupported schema.'
+    }
+    $packs = @($catalog.packs)
+    if ($packs.Count -gt 8) {
+        throw 'Worker-pack catalog exceeds its release bound.'
+    }
+    $files = [System.Collections.Generic.List[string]]::new()
+    $identities = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($pack in $packs) {
+        Assert-ExactObjectProperties $pack @(
+            'pack_id', 'pack_version', 'pack_digest', 'security_epoch',
+            'runtime_abi_version', 'backend', 'provider', 'target_os',
+            'target_arch', 'worker_relative_path', 'root',
+            'installed_size_bytes', 'compressed_size_bytes', 'files'
+        ) 'Worker-pack catalog entry'
+        foreach ($identityField in @('pack_id', 'pack_version', 'provider')) {
+            if ($pack.$identityField -isnot [string] -or
+                [string]$pack.$identityField -cnotmatch '^[A-Za-z0-9._:-]{1,96}$') {
+                throw "Worker-pack catalog has an invalid $identityField."
+            }
+        }
+        if ($pack.pack_digest -isnot [string] -or
+            [string]$pack.pack_digest -cnotmatch '^[0-9a-f]{64}$') {
+            throw 'Worker-pack catalog has a non-canonical digest.'
+        }
+        $expectedRoot = "workers/packs/$($pack.pack_id)/$($pack.pack_version)/$($pack.pack_digest)"
+        if ([string]$pack.root -cne $expectedRoot) {
+            throw 'Worker-pack catalog root does not match the immutable layout.'
+        }
+        Assert-SafeRelativePayloadPath $expectedRoot
+        $packFiles = @($pack.files)
+        if ($packFiles.Count -lt 3 -or $packFiles.Count -gt 258) {
+            throw 'Worker-pack catalog file count is outside its release bound.'
+        }
+        $packInstalledSize = [int64]0
+        foreach ($file in $packFiles) {
+            if ($file -isnot [string]) {
+                throw 'Worker-pack catalog paths must be strings.'
+            }
+            Assert-SafeRelativePayloadPath $file
+            if (-not $file.StartsWith($expectedRoot + '/', [System.StringComparison]::Ordinal)) {
+                throw "Worker-pack catalog file escapes its immutable root: $file"
+            }
+            if (-not $identities.Add($file)) {
+                throw "Worker-pack catalog contains a duplicate case-insensitive path: $file"
+            }
+            $item = Assert-RegularFile (Join-Path $Root ($file -replace '/', '\'))
+            $packInstalledSize += [int64]$item.Length
+            $files.Add($file)
+        }
+        if ([int64]$pack.installed_size_bytes -ne $packInstalledSize -or
+            [int64]$pack.compressed_size_bytes -lt 0) {
+            throw 'Worker-pack catalog size evidence is invalid.'
+        }
+        $packRoot = Join-Path $Root ($expectedRoot -replace '/', '\')
+        $verification = Invoke-NativeProcess (Join-Path $Root 'local-transcriber.exe') @(
+            '--scribe-verify-worker-pack', $packRoot
+        )
+        if ($verification.ExitCode -ne 0) {
+            throw "Bundled worker pack failed compiled verification: $($verification.Stderr.Trim())"
+        }
+        try {
+            $descriptor = $verification.Stdout | ConvertFrom-Json
+        }
+        catch {
+            throw "Bundled worker-pack verifier returned invalid JSON: $($_.Exception.Message)"
+        }
+        foreach ($field in @(
+            'pack_id', 'pack_version', 'pack_digest', 'security_epoch',
+            'runtime_abi_version', 'backend', 'provider', 'target_os',
+            'target_arch', 'worker_relative_path'
+        )) {
+            if ([string]$descriptor.$field -cne [string]$pack.$field) {
+                throw "Bundled worker-pack descriptor differs at '$field'."
+            }
+        }
+    }
+    if ($files.Count -gt 1024 -or @(Get-ExpectedDirectories $files.ToArray()).Count -gt 900) {
+        throw 'Worker-pack catalog exceeds the installer handle bound.'
+    }
+    return $files.ToArray()
+}
+
 function Assert-Bundle {
     param(
         [Parameter(Mandatory = $true)]
@@ -328,7 +425,13 @@ function Assert-Bundle {
         }
     }
 
-    $allowedExecutables = @("local-transcriber.exe", "scribe-inference-worker.exe") + @($normalizedAllowedAdditionalFiles | Where-Object {
+    $declaredPackFiles = @(Get-DeclaredWorkerPackFiles $root)
+    $script:expectedInventoryPaths = @($baseExpectedInventoryPaths) + $declaredPackFiles
+    $script:expectedPortablePayloadPaths = @($script:expectedInventoryPaths) + @('bundle-inventory.json')
+    $script:allowedPackExecutablePaths = @($declaredPackFiles | Where-Object {
+        [System.IO.Path]::GetExtension($_) -in @('.exe', '.dll')
+    })
+    $allowedExecutables = @("local-transcriber.exe", "scribe-inference-worker.exe") + $script:allowedPackExecutablePaths + @($normalizedAllowedAdditionalFiles | Where-Object {
         [System.IO.Path]::GetExtension($_).Equals('.exe', [System.StringComparison]::OrdinalIgnoreCase)
     })
     $expectedPayloadPaths = @($expectedPortablePayloadPaths) + $normalizedAllowedAdditionalFiles
@@ -449,7 +552,7 @@ function Assert-SafePortableZip([string]$Path) {
                 }
             }
             else {
-                Assert-AllowedPayloadFile $path
+                Assert-AllowedPayloadFile $path (@('local-transcriber.exe', 'scribe-inference-worker.exe') + $script:allowedPackExecutablePaths)
                 $filePaths.Add($path)
             }
         }

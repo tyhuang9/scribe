@@ -228,7 +228,10 @@ function Assert-InnoCompilerWorkflowContract([string]$Workflow) {
         '$isccFile.Length -ne [int64]$env:INNO_ISCC_SIZE',
         'Get-FileHash -Algorithm SHA256 -LiteralPath $iscc',
         '$isccHash -cne $env:INNO_ISCC_SHA256',
-        '& $iscc "/DAppVersion=$env:APP_VERSION" installer\scribe.iss'
+        '& $iscc',
+        '"/DAppVersion=$env:APP_VERSION"',
+        '"/DWorkerPackAllowlist=..\dist\worker-pack-allowlist.iss"',
+        'installer\scribe.iss'
     ) 'Inno compiler pre-invocation verification'
     if ($acquire -match 'VersionInfo\.ProductVersion' -or $build -match 'VersionInfo\.ProductVersion') {
         throw 'Inno compiler verification must use pinned bytes instead of unreliable PE version fields.'
@@ -524,6 +527,29 @@ try {
     Invoke-ExpectedFailure {
         Assert-ExactFile $inventoryFile $inventoryItem.Length $inventoryHash
     } "SHA-256 mismatch"
+
+    $emptyPackBundle = Join-Path $testRoot 'empty-pack-bundle'
+    New-Item -ItemType Directory -Path $emptyPackBundle | Out-Null
+    $emptyPackAllowlist = Join-Path $testRoot 'empty-pack-allowlist.iss'
+    $emptyPackStage = @(& (Join-Path $repositoryRoot 'scripts\stage-verified-worker-packs.ps1') `
+        -BundleRoot $emptyPackBundle `
+        -VerifierExecutable (Join-Path $testRoot 'unused-verifier.exe') `
+        -InstallerAllowlistPath $emptyPackAllowlist)
+    if ($emptyPackStage.Count -ne 1 -or $emptyPackStage[0].PackCount -ne 0 -or
+        @($emptyPackStage[0].PackFiles).Count -ne 0) {
+        throw 'Empty worker-pack staging did not produce one empty bounded result.'
+    }
+    $emptyCatalog = Get-Content -LiteralPath (Join-Path $emptyPackBundle 'worker-pack-catalog.json') -Raw | ConvertFrom-Json
+    Assert-ExactObjectProperties $emptyCatalog @('schema_version', 'packs') 'Empty worker-pack catalog'
+    if ($emptyCatalog.schema_version -ne 1 -or @($emptyCatalog.packs).Count -ne 0) {
+        throw 'Normal release worker-pack catalog must be schema-valid and empty.'
+    }
+    $emptyAllowlistSource = Get-Content -LiteralPath $emptyPackAllowlist -Raw
+    if ($emptyAllowlistSource -notmatch 'IsGeneratedWorkerPackDirectory' -or
+        $emptyAllowlistSource -notmatch 'IsGeneratedWorkerPackFile' -or
+        @([regex]::Matches($emptyAllowlistSource, 'Result := False;')).Count -ne 2) {
+        throw 'Empty worker-pack installer allowlist must fail closed for files and directories.'
+    }
 
     $targetBundle = Join-Path $repositoryRoot "target\scribe-release-probe-$PID"
     Invoke-ExpectedFailure {
@@ -891,7 +917,12 @@ Set-StrictMode -Version Latest
     $acquireStepAnchor = '      - name: Acquire digest-pinned Inno Setup'
     $buildStepAnchor = '      - name: Build and normalize Windows installer'
     $compilerHashLine = '          $isccHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $iscc).Hash.ToLowerInvariant()'
-    $compilerInvocationLine = '          & $iscc "/DAppVersion=$env:APP_VERSION" installer\scribe.iss'
+    $compilerInvocationLine = @'
+          & $iscc `
+            "/DAppVersion=$env:APP_VERSION" `
+            "/DWorkerPackAllowlist=..\dist\worker-pack-allowlist.iss" `
+            installer\scribe.iss
+'@
     foreach ($mutation in @(
         @{
             Name = 'missing installer wait'
@@ -955,6 +986,9 @@ Set-StrictMode -Version Latest
         $installer -notmatch 'function QueryExistingAttributes' -or
         $installer -notmatch 'function BindDirectory' -or
         $installer -notmatch 'function BindFileForUpdate' -or
+        $installer -notmatch '#include WorkerPackAllowlist' -or
+        $installer -notmatch 'IsGeneratedWorkerPackDirectory' -or
+        $installer -notmatch 'IsGeneratedWorkerPackFile' -or
         $installer -notmatch 'FindFirstFileW' -or
         $installer -notmatch 'FindNextFileW' -or
         $installer -notmatch 'FindFirstStreamW' -or
@@ -1008,8 +1042,8 @@ Set-StrictMode -Version Latest
         $prepareEnd -le $prepareStart -or
         $installer -notmatch 'procedure ReleaseBoundHandles' -or
         $installer -notmatch 'procedure ReleaseInnoUninstallerHandles' -or
-        $installer -notmatch 'BoundHandles: array\[0\.\.31\] of THandle' -or
-        $installer -notmatch 'BoundHandleReleaseBeforeInnoReplacement: array\[0\.\.31\] of Boolean' -or
+        $installer -notmatch 'BoundHandles: array\[0\.\.2047\] of THandle' -or
+        $installer -notmatch 'BoundHandleReleaseBeforeInnoReplacement: array\[0\.\.2047\] of Boolean' -or
         $installer -notmatch 'RetainBoundHandle\(\s*IdentityHandle' -or
         $installer -notmatch 'RetainBoundHandle\(DirectoryHandle' -or
         $lifecycleSource -notmatch 'if CurStep = ssPostInstall then\s+ReleaseBoundHandles\(\)' -or
@@ -1184,6 +1218,13 @@ Set-StrictMode -Version Latest
             "scribe-inference-worker.exe" { Write-TestPe $path 0x8664 "kernel32.dll" "user32.dll" 3 }
             "whisper-base.en-Q8_0.gguf" { [System.IO.File]::WriteAllBytes($path, $fixtureModelBytes) }
             "bundled-model-manifest.json" { Copy-Item -LiteralPath $fixtureManifestSource -Destination $path }
+            "worker-pack-catalog.json" {
+                [System.IO.File]::WriteAllText(
+                    $path,
+                    '{"schema_version":1,"packs":[]}',
+                    [System.Text.UTF8Encoding]::new($false)
+                )
+            }
             default {
                 [System.IO.File]::WriteAllText(
                     $path,
@@ -1218,6 +1259,54 @@ Set-StrictMode -Version Latest
         -ExpectedModelManifest $fixtureModelManifest `
         -ExpectedModelManifestPath $fixtureManifestSource `
         -ExpectedLegalFiles @()
+
+    $catalogFixturePath = Join-Path $verificationBundle 'worker-pack-catalog.json'
+    $validEmptyCatalogBytes = [System.IO.File]::ReadAllBytes($catalogFixturePath)
+    try {
+        [System.IO.File]::WriteAllText(
+            $catalogFixturePath,
+            '{"schema_version":1,"packs":[],"unknown":true}',
+            [System.Text.UTF8Encoding]::new($false)
+        )
+        Invoke-ExpectedFailure { Get-DeclaredWorkerPackFiles $verificationBundle } 'unexpected or missing'
+
+        $tooManyPacks = [ordered]@{ schema_version = 1; packs = @(1..9 | ForEach-Object { [ordered]@{} }) }
+        [System.IO.File]::WriteAllText(
+            $catalogFixturePath,
+            ($tooManyPacks | ConvertTo-Json -Depth 4),
+            [System.Text.UTF8Encoding]::new($false)
+        )
+        Invoke-ExpectedFailure { Get-DeclaredWorkerPackFiles $verificationBundle } 'release bound'
+
+        $traversalPack = [ordered]@{
+            schema_version = 1
+            packs = @([ordered]@{
+                pack_id = 'fixture-vulkan'
+                pack_version = '1.0.0'
+                pack_digest = ('a' * 64)
+                security_epoch = 1
+                runtime_abi_version = 1
+                backend = 'vulkan'
+                provider = 'fixture-vulkan'
+                target_os = 'windows'
+                target_arch = 'x86_64'
+                worker_relative_path = 'bin/worker.exe'
+                root = '../escape'
+                installed_size_bytes = 0
+                compressed_size_bytes = 0
+                files = @('one', 'two', 'three')
+            })
+        }
+        [System.IO.File]::WriteAllText(
+            $catalogFixturePath,
+            ($traversalPack | ConvertTo-Json -Depth 6),
+            [System.Text.UTF8Encoding]::new($false)
+        )
+        Invoke-ExpectedFailure { Get-DeclaredWorkerPackFiles $verificationBundle } 'immutable layout'
+    }
+    finally {
+        [System.IO.File]::WriteAllBytes($catalogFixturePath, $validEmptyCatalogBytes)
+    }
 
     foreach ($forbiddenPath in @(
         "RUNTIMES/whisper/whisper.dll",

@@ -33,6 +33,10 @@ use crate::transcription::{
 };
 
 /// Exact safe-wrapper/native release compiled into this Scribe build.
+#[allow(
+    dead_code,
+    reason = "the test-only embedded-runtime module retains the pinned version contract"
+)]
 pub(crate) const TRANSCRIBE_CPP_VERSION: &str = "0.1.3";
 
 static BACKENDS: OnceLock<std::result::Result<(), String>> = OnceLock::new();

@@ -32,6 +32,14 @@ Local GGUF imports are validated in place; Scribe neither copies nor deletes
 them. Legacy user configuration and artifact files are preserved, but production
 paths no longer recognize or execute them.
 
+Stage 3 adds dormant verified GPU worker-pack infrastructure without changing
+that production route. Signed packs have a canonical manifest and detached
+Ed25519 signature, exact payload inventory, immutable digest-addressed storage,
+security-epoch rollback floor, and private bounded health/quarantine state.
+The production trust root and registry are empty, normal packages contain an
+empty worker-pack catalog, and no CUDA/Vulkan/Metal pack is shipped or selected.
+See [Verified GPU worker-pack infrastructure](GPU_WORKER_PACKS.md).
+
 ## How to read this record
 
 - **Current fact** is supported by the checked-out source, a checked-in manifest, or a supplied command result.

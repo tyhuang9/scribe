@@ -23,7 +23,10 @@ $env:SHERPA_ONNX_ARCHIVE_DIR = $archiveDir
   -ModelSource .release-inputs\model\whisper-base.en-Q8_0.gguf `
   -BundlePath dist\portable
 $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches.Groups[1].Value
-& "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DAppVersion=$version" installer\scribe.iss
+& "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" `
+  "/DAppVersion=$version" `
+  "/DWorkerPackAllowlist=..\dist\worker-pack-allowlist.iss" `
+  installer\scribe.iss
 Copy-Item "dist\Scribe-Setup-$version.exe" dist\Scribe-Setup.exe -Force
 .\scripts\verify-windows-release-package.ps1 -BundlePath dist\portable -InstallerPath dist\Scribe-Setup.exe
 ```
@@ -34,6 +37,16 @@ normalized release asset is `dist\Scribe-Setup.exe`. Do not distribute a bare
 include the complete staged payload, with both executables adjacent.
 The scripts download the exact pinned runtime/model sources and verify their
 sizes and SHA-256 values before they are staged.
+
+Every Stage 3 package contains `worker-pack-catalog.json` with an empty `packs`
+array. No CUDA, Vulkan, or Metal production pack is shipped. The release builder
+accepts future prebuilt, pre-signed roots through `-WorkerPackRoot`, but it runs
+the compiled production verifier before and after staging each root into
+`workers/packs/<pack-id>/<version>/<digest>/`. Because no production pack public
+key is provisioned yet, every non-empty declaration currently fails closed.
+Signing is not performed by repository scripts. Future private signing material
+must come from an explicitly configured external path or masked CI secret, must
+never be printed, and must match a separately reviewed persistent public key.
 
 ## Publish a version from a tag
 
@@ -147,6 +160,10 @@ until a real code-signing identity and secret-management process are approved.
   size, and SHA-256 mismatch before retrying.
 - **Installer payload verification fails:** rebuild the staged `dist\portable`
   directory; the installer must include every item from `bundle-inventory.json`.
+- **A declared GPU worker pack is rejected:** do not bypass verification or add
+  a fixture key to production. Confirm the pack was externally signed by a
+  provisioned production key, then review its canonical manifest, detached
+  signature, target/build compatibility, and complete payload inventory.
 - **Manual publication is skipped:** rerun from the repository default branch
   and explicitly enable `publish_release`; disabled dispatches only validate.
 - **Tag or release already exists:** do not overwrite it. Confirm the existing

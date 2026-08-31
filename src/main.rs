@@ -7,7 +7,7 @@ mod app;
 mod audio;
 #[allow(
     dead_code,
-    reason = "provider integrations consume the complete policy surface in later stacked stages"
+    reason = "provider-neutral qualification policy remains dormant until a production GPU provider ships"
 )]
 mod backend_policy;
 mod benchmark;
@@ -24,6 +24,11 @@ mod disk_space;
     reason = "test builds compile the full embedded-runtime surface before later provider integrations"
 )]
 mod embedded_runtime;
+#[allow(
+    dead_code,
+    reason = "Stage 3 compiles the sealed verifier and store before Stage 4 provisions production trust or discovery"
+)]
+mod gpu_worker_pack;
 mod history;
 mod history_playback;
 mod hotkey;
@@ -83,6 +88,9 @@ fn main() -> eframe::Result<()> {
     if let Err(error) = onnx_worker::harden_windows_dll_search() {
         eprintln!("Scribe could not harden native library loading: {error:#}");
         std::process::exit(1);
+    }
+    if let Some(exit_code) = gpu_worker_pack::maybe_run_pack_verifier() {
+        std::process::exit(exit_code);
     }
     if let Some(exit_code) = onnx_worker::maybe_run_vad_worker() {
         std::process::exit(exit_code);

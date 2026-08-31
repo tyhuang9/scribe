@@ -198,6 +198,84 @@ fn production_source_for(_path: &Path, source: &str) -> String {
     production_source(source)
 }
 
+fn named_function_bodies(source: &str, name: &str) -> Vec<String> {
+    let needle = format!("fn {name}");
+    let mask = rust_code_mask(source);
+    let mut bodies = Vec::new();
+    for (start, _) in source.match_indices(&needle) {
+        if !mask[start] {
+            continue;
+        }
+        let Some(relative_open) = source[start..].find('{') else {
+            continue;
+        };
+        let open = start + relative_open;
+        let mut depth = 1_i32;
+        let mut cursor = open + 1;
+        while cursor < source.len() && depth != 0 {
+            if mask[cursor] {
+                match source.as_bytes()[cursor] {
+                    b'{' => depth += 1,
+                    b'}' => depth -= 1,
+                    _ => {}
+                }
+            }
+            cursor += 1;
+        }
+        if depth == 0 {
+            bodies.push(source[open + 1..cursor - 1].to_owned());
+        }
+    }
+    bodies
+}
+
+fn production_pack_provisioning_allowed(
+    registry_body: &str,
+    worker: &str,
+    trust_root_is_empty: bool,
+    unix_target: bool,
+) -> bool {
+    let registry_is_empty = registry_body.contains("ProductionPackRegistry::empty()")
+        && !registry_body.contains("from_launch_bindings");
+    let registry_routes_concrete_bridge = registry_body
+        .contains("crate::onnx_worker::discover_production_pack_launch_bindings")
+        && registry_body.contains("ProductionPackRegistry::from_launch_bindings");
+    let concrete_resolver_hello_flow = worker
+        .contains("fn discover_production_pack_launch_bindings(")
+        && worker.contains("impl ResolverHelloBindingBridge for")
+        && worker.contains("fn resolver_verified_pack_lease(&self) -> Arc<VerifiedPackLease>")
+        && worker.contains("fn launch_worker_from_verified_pack_lease(")
+        && worker.contains("VerifiedPackLaunchBinding::try_from_resolver_hello_bridge")
+        && worker.contains("trait WorkerExecutableResolver")
+        && worker.contains("Hello");
+    let unix_launch_bodies =
+        named_function_bodies(worker, "launch_worker_from_verified_pack_lease").join("\n");
+    let unix_authority_constructor = named_function_bodies(
+        worker,
+        "open_unix_pack_exec_authority_from_verified_pack_lease",
+    )
+    .join("\n");
+    let unix_fd_launch_flow = !unix_target
+        || (worker.contains("UnixPackExecAuthority")
+            && worker.contains("resolver_unix_launch_authority")
+            && worker.contains("executable_fd")
+            && worker.contains("dependency_root_fd")
+            && worker.contains(
+                "fn open_unix_pack_exec_authority_from_verified_pack_lease(lease: &VerifiedPackLease)",
+            )
+            && unix_authority_constructor.contains("openat")
+            && (unix_launch_bodies.contains("execveat")
+                || unix_launch_bodies.contains("fexecve"))
+            && !unix_launch_bodies.contains("Command::spawn")
+            && !unix_launch_bodies.contains("Command::new"));
+    (registry_is_empty && trust_root_is_empty)
+        || (!registry_is_empty
+            && !trust_root_is_empty
+            && registry_routes_concrete_bridge
+            && concrete_resolver_hello_flow
+            && unix_fd_launch_flow)
+}
+
 #[test]
 fn cfg_test_stripping_preserves_later_production_for_lf_and_crlf() {
     let fixture = r###"fn before() { let _ = "}"; }
@@ -223,6 +301,78 @@ fn after() { let _ = "production-after"; }
         assert!(!production.contains("fn hidden()"));
         assert!(!production.contains("hidden_field"));
     }
+}
+
+#[test]
+fn stage_four_guard_rejects_dead_binding_declarations() {
+    let populated_registry = r#"{
+        ProductionPackRegistry::from_launch_bindings(
+            crate::onnx_worker::discover_production_pack_launch_bindings()
+        )
+    "#;
+    let dead_declarations = r#"
+        struct VerifiedPackLaunchBinding;
+        trait WorkerExecutableResolver {}
+        struct Hello;
+    "#;
+    assert!(!production_pack_provisioning_allowed(
+        populated_registry,
+        dead_declarations,
+        false,
+        false,
+    ));
+
+    let concrete_flow = r#"
+        trait WorkerExecutableResolver {}
+        struct Hello;
+        struct VerifiedPackLease;
+        struct Arc<T>(T);
+        impl ResolverHelloBindingBridge for ConcreteResolverHelloBridge {}
+        fn resolver_verified_pack_lease(&self) -> Arc<VerifiedPackLease> {}
+        fn launch_worker_from_verified_pack_lease(lease: Arc<VerifiedPackLease>) {}
+        fn discover_production_pack_launch_bindings() {
+            VerifiedPackLaunchBinding::try_from_resolver_hello_bridge(&bridge);
+        }
+    "#;
+    assert!(production_pack_provisioning_allowed(
+        populated_registry,
+        concrete_flow,
+        false,
+        false,
+    ));
+    let raw_path_spawn_flow = format!(
+        "{concrete_flow}\nfn launch_worker_from_verified_pack_lease(path: PathBuf, lease: Arc<VerifiedPackLease>) {{ Command::new(path).spawn(); }}"
+    );
+    assert!(!production_pack_provisioning_allowed(
+        populated_registry,
+        &raw_path_spawn_flow,
+        false,
+        true,
+    ));
+    let unix_fd_flow = format!(
+        "{concrete_flow}\nstruct UnixPackExecAuthority {{ executable_fd: OwnedFd, dependency_root_fd: OwnedFd }}\nfn resolver_unix_launch_authority() -> UnixPackExecAuthority {{}}\nfn open_unix_pack_exec_authority_from_verified_pack_lease(lease: &VerifiedPackLease) {{ openat(lease, executable_fd); }}\nfn launch_worker_from_verified_pack_lease() {{ execveat(executable_fd, dependency_root_fd); }}"
+    );
+    assert!(production_pack_provisioning_allowed(
+        populated_registry,
+        &unix_fd_flow,
+        false,
+        true,
+    ));
+    let unrelated_command = format!(
+        "{unix_fd_flow}\nfn unrelated_test_or_cpu_helper() {{ Command::new(\"helper\").spawn(); }}"
+    );
+    assert!(production_pack_provisioning_allowed(
+        populated_registry,
+        &unrelated_command,
+        false,
+        true,
+    ));
+    assert!(production_pack_provisioning_allowed(
+        "{ ProductionPackRegistry::empty() ",
+        "",
+        true,
+        true,
+    ));
 }
 
 #[test]
@@ -648,6 +798,182 @@ fn native_runtime_ownership_is_confined_to_exact_owner_paths() {
     assert!(dedicated.contains("mod inference_server;"));
     assert!(dedicated.contains("inference_server::run()"));
     assert!(!dedicated.contains("maybe_run_vad_worker"));
+}
+
+#[test]
+fn verified_worker_pack_stage_remains_fail_closed_and_provider_inert() {
+    let desktop = include_str!("main.rs");
+    let module = include_str!("gpu_worker_pack/mod.rs");
+    let health = include_str!("gpu_worker_pack/health.rs");
+    let manifest = include_str!("gpu_worker_pack/manifest.rs");
+    let store = include_str!("gpu_worker_pack/store.rs");
+    let worker = include_str!("onnx_worker.rs");
+    let documentation = include_str!("../docs/GPU_WORKER_PACKS.md");
+    let production_manifest = production_source(manifest);
+    let registry_body = module
+        .split("pub(crate) fn production_registry() -> ProductionPackRegistry")
+        .nth(1)
+        .and_then(|source| source.split('}').next())
+        .expect("production registry function remains structurally visible");
+    assert!(production_manifest.contains("struct ProductionTrustRoot"));
+    assert!(production_manifest.contains("fn public_key(&self, _key_id: &str) -> Option<&[u8]>"));
+    let trust_root_is_empty = production_manifest
+        .split("impl TrustRoot for ProductionTrustRoot")
+        .nth(1)
+        .and_then(|source| source.split('}').next())
+        .is_some_and(|body| body.contains("None"));
+    for dormant_lint_reason in [
+        "provider-neutral qualification policy remains dormant until a production GPU provider ships",
+        "Stage 3 compiles the sealed verifier and store before Stage 4 provisions production trust or discovery",
+    ] {
+        assert!(desktop.contains(dormant_lint_reason));
+    }
+    assert!(registry_body.contains("ProductionPackRegistry::empty()"));
+    assert!(trust_root_is_empty);
+    for source in [desktop, module, health, manifest, store] {
+        assert!(
+            !source.contains("#![allow"),
+            "Stage 3 lint exceptions must remain module-scoped, never crate-wide"
+        );
+    }
+    for required in [
+        "trait ResolverHelloBindingBridge",
+        "struct VerifiedPackLaunchBinding",
+        "resolver_verified_pack_lease(&self) -> Arc<VerifiedPackLease>",
+        "verified_pack_lease: Arc<VerifiedPackLease>",
+        "pub(crate) fn verified_pack_lease(&self) -> &VerifiedPackLease",
+        "bindings: Vec<VerifiedPackLaunchBinding>",
+        "from_launch_bindings(bindings: Vec<VerifiedPackLaunchBinding>)",
+        "try_from_resolver_hello_bridge",
+        "bridge.hello_pack_id() == pack.pack_id.as_str()",
+        "bridge.hello_pack_version() == pack.pack_version.as_str()",
+        "bridge.hello_pack_digest() == pack.pack_digest",
+        "bridge.hello_runtime_abi() == pack.runtime_abi_version",
+        "bridge.hello_backend() == pack.backend",
+        "bridge.hello_provider() == pack.provider",
+        "hello_stable_device_identity",
+        "struct UnixPackExecAuthority",
+        "resolver_unix_launch_authority",
+        "verified_pack_lease: Arc<VerifiedPackLease>",
+        "Arc::ptr_eq",
+        "executable_fd",
+        "dependency_root_fd",
+    ] {
+        assert!(
+            module.contains(required),
+            "typed Stage 4 production provisioning gate lost {required:?}"
+        );
+    }
+    for required in [
+        "struct LaunchableWorker<'lease>",
+        "_lease: &'lease VerifiedPackLease",
+    ] {
+        assert!(
+            production_manifest.contains(required),
+            "verified-pack lease launch gate lost {required:?}"
+        );
+    }
+    assert!(
+        production_pack_provisioning_allowed(
+            registry_body,
+            worker,
+            trust_root_is_empty,
+            cfg!(unix),
+        ),
+        "production pack trust/catalog cannot be provisioned before production discovery consumes concrete typed bindings created by WorkerExecutableResolver and Hello validation"
+    );
+    for required in [
+        "Stage 4",
+        "WorkerExecutableResolver",
+        "Hello",
+        "ID/version/digest",
+        "backend/provider",
+        "stable device",
+        "before any production trust root or catalog",
+    ] {
+        assert!(
+            documentation.contains(required),
+            "Stage 4 pack-launch binding documentation lost {required}"
+        );
+    }
+    for forbidden in ["Ed25519KeyPair", "private_key", "signing_seed"] {
+        assert!(
+            !production_manifest.contains(forbidden),
+            "production pack verifier contains signing material/API marker {forbidden}"
+        );
+    }
+    assert!(module.contains("--scribe-verify-worker-pack"));
+    assert!(module.contains("PackBackend::Cuda"));
+    assert!(module.contains("PackBackend::Vulkan"));
+    assert!(module.contains("PackBackend::Metal"));
+}
+
+#[test]
+fn worker_pack_health_persistence_stays_bounded_and_content_free() {
+    let source = include_str!("gpu_worker_pack/health.rs");
+    let production = source
+        .split("#[cfg(test)]")
+        .next()
+        .expect("health cache has a production section");
+    for required in [
+        "pack_digest",
+        "runtime_abi",
+        "os_arch",
+        "driver_version",
+        "stable_device_identity",
+        "model_digest",
+        "app_build",
+        "device_set_digest",
+        "FIRST_QUARANTINE_SECONDS: u64 = 15 * 60",
+        "SECOND_QUARANTINE_SECONDS: u64 = 6 * 60 * 60",
+        "THIRD_QUARANTINE_SECONDS: u64 = 7 * 24 * 60 * 60",
+    ] {
+        assert!(
+            production.contains(required),
+            "health contract lost {required}"
+        );
+    }
+    for forbidden in [
+        "audio_path",
+        "transcript",
+        "raw_error",
+        "diagnostic_text",
+        "error_message",
+    ] {
+        assert!(
+            !production.contains(forbidden),
+            "health cache production schema regained forbidden content: {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn release_packaging_accepts_only_compiled_verified_declared_pack_roots() {
+    let build = include_str!("../scripts/build-windows-release.ps1");
+    let stage = include_str!("../scripts/stage-verified-worker-packs.ps1");
+    let installer = include_str!("../installer/scribe.iss");
+    let workflow = include_str!("../.github/workflows/release.yml");
+    for required in [
+        "WorkerPackRoot",
+        "stage-verified-worker-packs.ps1",
+        "worker-pack-catalog.json",
+        "PackFiles",
+    ] {
+        assert!(
+            build.contains(required),
+            "release pack integration lost {required}"
+        );
+    }
+    assert!(stage.matches("Invoke-PackVerifier $verifier").count() >= 2);
+    assert!(stage.contains("workers/packs/"));
+    assert!(stage.contains("PackRoot.Count -gt 8"));
+    assert!(stage.contains("allPackFiles.Count -gt 1024"));
+    assert!(!stage.contains("Ed25519KeyPair"));
+    assert!(!stage.contains("SIGNING_KEY"));
+    assert!(installer.contains("#include WorkerPackAllowlist"));
+    assert!(installer.contains("IsGeneratedWorkerPackFile(RelativePath)"));
+    assert!(workflow.contains("/DWorkerPackAllowlist=..\\dist\\worker-pack-allowlist.iss"));
+    assert!(!build.contains("--features vulkan-acceleration"));
 }
 
 #[test]
@@ -1769,7 +2095,7 @@ fn windows_release_bundles_the_exact_offline_base_model_with_attribution() {
         "installer enumeration must fail closed on start and continuation errors"
     );
     assert!(
-        installer.contains("BoundHandles: array[0..31] of THandle")
+        installer.contains("BoundHandles: array[0..2047] of THandle")
             && installer.contains("procedure ReleaseBoundHandles()")
             && lifecycle_source.contains("if CurStep = ssPostInstall then")
             && lifecycle_source.contains("procedure DeinitializeSetup();")

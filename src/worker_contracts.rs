@@ -133,6 +133,10 @@ pub struct RuntimeCapabilities {
     pub supported_languages: Vec<String>,
 }
 
+#[allow(
+    dead_code,
+    reason = "the worker contract retains the engine seam for isolated worker implementations"
+)]
 pub trait SpeechEngine: Send {
     fn load(&mut self) -> Result<()>;
     fn capabilities(&self) -> RuntimeCapabilities;
