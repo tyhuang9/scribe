@@ -25,25 +25,26 @@ foreach ($invalidPackVersionInput in @(
     if ($accepted) { throw 'Noncanonical fixture pack version input was accepted.' }
 }
 $knownCmakeFailure = @(
-    'error: failed to run custom build command for `transcribe-cpp-sys v0.1.3 (C:\\safe\\crate)`',
+    'error: failed to run custom build command for `transcribe-cpp-sys v0.1.3`',
     '  Error: failed to execute command: cmake -S C:\\safe\\source',
     '  The directory name is invalid. (os error 267)'
 )
-if (-not (Test-ScribeEvidenceKnownCmakeBootstrapFailure $knownCmakeFailure)) { throw 'Known bounded CMake failure was not classified.' }
+if (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure $knownCmakeFailure)) { throw 'Known bounded CMake failure was not classified.' }
 foreach ($malformedCmakeFailure in @(
     @('transcribe-cpp-sys v0.1.3', 'failed to execute command:', 'The directory name is invalid. (os error 267)'),
-    @('error: failed to run custom build command for `transcribe-cpp-sys v0.1.4 (C:\\safe\\crate)`', '  Error: failed to execute command: cmake', '  The directory name is invalid. (os error 267)'),
-    @('error: failed to run custom build command for `transcribe-cpp-sys v0.1.3 (C:\\safe\\crate)`', '  Error: failed to execute command: cmake', '  access denied'),
-    @('  The directory name is invalid. (os error 267)', '  Error: failed to execute command: cmake', 'error: failed to run custom build command for `transcribe-cpp-sys v0.1.3 (C:\\safe\\crate)`')
+    @('error: failed to run custom build command for `transcribe-cpp-sys v0.1.4`', '  Error: failed to execute command: cmake', '  The directory name is invalid. (os error 267)'),
+    @('error: failed to run custom build command for `transcribe-cpp-sys v0.1.3`', '  Error: failed to execute command: cmake', '  access denied'),
+    @('  The directory name is invalid. (os error 267)', '  Error: failed to execute command: cmake', 'error: failed to run custom build command for `transcribe-cpp-sys v0.1.3`'),
+    @('error: failed to run custom build command for `transcribe-cpp-sys v0.1.3', '  Error: failed to execute command: cmake', '  The directory name is invalid. (os error 267)')
 )) {
-    if (Test-ScribeEvidenceKnownCmakeBootstrapFailure $malformedCmakeFailure) { throw 'Malformed CMake failure was classified.' }
+    if (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure $malformedCmakeFailure) { throw 'Malformed CMake failure was classified.' }
 }
-$sanitizedClassifierResult = Test-ScribeEvidenceKnownCmakeBootstrapFailure @('secret-token', 'unrelated failure')
+$sanitizedClassifierResult = Test-ScribeGpuWorkerKnownCmakeBootstrapFailure @('secret-token', 'unrelated failure')
 if ($sanitizedClassifierResult -isnot [bool] -or $sanitizedClassifierResult) { throw 'CMake classifier exposed or accepted unrelated output.' }
 $overlongCmakeFailure = [System.Collections.Generic.List[object]]::new()
-foreach ($unused in 1..64) { $overlongCmakeFailure.Add('noise') }
+foreach ($unused in 1..2048) { $overlongCmakeFailure.Add('noise') }
 foreach ($line in $knownCmakeFailure) { $overlongCmakeFailure.Add($line) }
-if (Test-ScribeEvidenceKnownCmakeBootstrapFailure -Output $overlongCmakeFailure.ToArray()) { throw 'Unbounded CMake output was classified outside the bounded window.' }
+if (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure -Output $overlongCmakeFailure.ToArray()) { throw 'Unbounded CMake output was classified outside the bounded window.' }
 $previousTestWorkerDigest = $env:SCRIBE_BUNDLED_WORKER_SHA256
 $previousTestBuildingWorker = $env:SCRIBE_BUILDING_WORKER
 try {
@@ -89,7 +90,253 @@ try {
 finally {
     if (Test-Path -LiteralPath $topologyRoot) { Remove-Item -LiteralPath $topologyRoot -Recurse -Force }
 }
+$publicationRoot = Join-Path ([IO.Path]::GetTempPath()) ("scribe-evidence-publication-$([guid]::NewGuid().ToString('N'))")
+try {
+    New-Item -ItemType Directory -Path $publicationRoot | Out-Null
+    $finalLeaf = 'windows-vulkan-fixture-evidence.json'
+    $finalPath = Join-Path $publicationRoot $finalLeaf
+    $testFsutil = Join-Path (Get-ScribeVulkanEvidenceActualSystem32) 'fsutil.exe'
+
+    $partialLeaf = 'windows-vulkan-fixture-evidence.pending-partial.json'
+    $partialPath = Join-Path $publicationRoot $partialLeaf
+    [IO.File]::WriteAllText($partialPath, '{')
+    $writeFailure = [InvalidOperationException]::new('forced evidence write failure')
+    try {
+        $null = Complete-ScribeEvidencePendingReport $partialPath $finalPath $publicationRoot $partialLeaf $finalLeaf $testFsutil $writeFailure @()
+        throw 'Forced evidence write failure unexpectedly published.'
+    }
+    catch {
+        if ($_.Exception.Message -cne 'forced evidence write failure') { throw }
+    }
+    if ((Test-Path -LiteralPath $partialPath) -or (Test-Path -LiteralPath $finalPath)) {
+        throw 'Forced evidence write failure left a pending or final artifact.'
+    }
+
+    $guardLeaf = 'windows-vulkan-fixture-evidence.pending-guard.json'
+    $guardPath = Join-Path $publicationRoot $guardLeaf
+    [IO.File]::WriteAllText($guardPath, '{}')
+    $guardFailure = [InvalidOperationException]::new('forced final Auto guard failure')
+    try {
+        $null = Complete-ScribeEvidencePendingReport $guardPath $finalPath $publicationRoot $guardLeaf $finalLeaf $testFsutil $null @($guardFailure)
+        throw 'Forced final guard failure unexpectedly published.'
+    }
+    catch {
+        if ($_.Exception.Message -cne 'forced final Auto guard failure') { throw }
+    }
+    if ((Test-Path -LiteralPath $guardPath) -or (Test-Path -LiteralPath $finalPath)) {
+        throw 'Forced final guard failure left a pending or final artifact.'
+    }
+
+    $cleanupLeaf = 'windows-vulkan-fixture-evidence.pending-cleanup.json'
+    $cleanupPath = Join-Path $publicationRoot $cleanupLeaf
+    New-Item -ItemType Directory -Path $cleanupPath | Out-Null
+    $primaryFailure = [InvalidOperationException]::new('forced primary harness failure')
+    $observedPrimary = $null
+    try {
+        $null = Complete-ScribeEvidencePendingReport $cleanupPath $finalPath $publicationRoot $cleanupLeaf $finalLeaf $testFsutil $primaryFailure @()
+    }
+    catch {
+        $observedPrimary = $_.Exception
+    }
+    if ($null -eq $observedPrimary -or
+        $observedPrimary.Message -cne 'forced primary harness failure' -or
+        $observedPrimary.Data.Count -eq 0 -or
+        (Test-Path -LiteralPath $finalPath)) {
+        throw 'Pending cleanup failure masked the primary failure or published final evidence.'
+    }
+    Remove-Item -LiteralPath $cleanupPath -Force
+
+    $statistics = [ordered]@{ p50_ms = 1; p95_ms = 1 }
+    $coldRunSet = [ordered]@{
+        end_to_end = $statistics
+        end_to_end_ms = @(1, 1, 1, 1, 1)
+        backend_processing = $statistics
+        backend_processing_ms = @(1, 1, 1, 1, 1)
+        model_load = $statistics
+        model_load_ms = @(1, 1, 1, 1, 1)
+    }
+    $warmRunSet = [ordered]@{
+        end_to_end = $statistics
+        end_to_end_ms = @(1) * 20
+        backend_processing = $statistics
+        backend_processing_ms = @(1) * 20
+        model_load = $null
+        model_load_ms = $null
+    }
+    $validReport = [ordered]@{
+        schema_version = 1
+        fixture_only = $true
+        untrusted = $true
+        auto_eligible = $false
+        source_revision = 'a' * 40 -join ''
+        pack = [ordered]@{ id = 'fixture'; version = 'fixture'; digest = 'b' * 64 -join ''; security_epoch = 1; runtime_abi = 1 }
+        model_sha256 = 'c' * 64 -join ''
+        wav_sha256 = 'd' * 64 -join ''
+        gpu = [ordered]@{ backend = 'vulkan'; provider = 'transcribe-cpp-ggml-vulkan'; vendor = 'nvidia'; device_class = 'discrete_gpu'; driver = 'fixture'; memory_total_bytes = 1 }
+        nvidia_baseline = [ordered]@{ product = 'fixture'; driver = 'fixture'; memory_total_bytes = 1; memory_used_bytes = 0; gpu_utilization_percent = 0 }
+        cold_runs_per_backend = 5
+        warm_runs_per_backend = 20
+        cpu = [ordered]@{ cold = $coldRunSet; warm = $warmRunSet }
+        vulkan = [ordered]@{ cold = $coldRunSet; warm = $warmRunSet }
+        expected_phrase_present_every_run = $true
+        normalized_transcript_parity = $true
+        same_device_internally_verified = $true
+    }
+    $successLeaf = 'windows-vulkan-fixture-evidence.pending-success.json'
+    $successPath = Join-Path $publicationRoot $successLeaf
+    [IO.File]::WriteAllText($successPath, ($validReport | ConvertTo-Json -Depth 10 -Compress), [Text.UTF8Encoding]::new($false))
+    $published = Complete-ScribeEvidencePendingReport $successPath $finalPath $publicationRoot $successLeaf $finalLeaf $testFsutil $null @()
+    if ((Test-Path -LiteralPath $successPath) -or
+        -not (Test-Path -LiteralPath $finalPath -PathType Leaf) -or
+        [string]$published.Path -cne $finalPath -or
+        [string]$published.Digest -cnotmatch '^[0-9a-f]{64}$') {
+        throw 'Validated pending evidence was not atomically published to the final path.'
+    }
+}
+finally {
+    if (Test-Path -LiteralPath $publicationRoot) { Remove-Item -LiteralPath $publicationRoot -Recurse -Force }
+}
 $runner = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'run-windows-vulkan-evidence.ps1') -Raw
+$runnerTokens = $null
+$runnerParseErrors = $null
+$runnerAst = [Management.Automation.Language.Parser]::ParseInput($runner, [ref]$runnerTokens, [ref]$runnerParseErrors)
+if ($runnerParseErrors.Count -ne 0) { throw 'Runner source could not be parsed for retry-path tests.' }
+$runnerRetryFunction = $runnerAst.Find({
+    param($Ast)
+    $Ast -is [Management.Automation.Language.FunctionDefinitionAst] -and
+    $Ast.Name -ceq 'Invoke-ScribeEvidenceCargoWithCmakeRetry'
+}, $true)
+if ($null -eq $runnerRetryFunction) { throw 'Runner lost its Cargo retry function.' }
+$runnerRetryHarness = Join-Path ([IO.Path]::GetTempPath()) ("scribe-evidence-runner-retry-$([guid]::NewGuid().ToString('N')).ps1")
+try {
+    $runnerRetryHarnessTail = @'
+$cargo = Join-Path $PSHOME 'pwsh.exe'
+$script:BootstrapCount = 0
+function Enable-ScribeEvidenceCmakeBootstrap([string]$CargoTarget, [string]$BuildEnvironment) {
+    $script:BootstrapCount++
+}
+function ConvertTo-TestEncodedCommand([string]$Command) {
+    return [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($Command))
+}
+function Invoke-TestRunnerFailure([string]$Command) {
+    $script:BootstrapCount = 0
+    $message = $null
+    try {
+        Invoke-ScribeEvidenceCargoWithCmakeRetry @('-NoProfile', '-EncodedCommand', (ConvertTo-TestEncodedCommand $Command)) 'runner case failed.' 'unused-target' 'unused-environment'
+    }
+    catch {
+        $message = $_.Exception.Message
+    }
+    if ($message -cne 'runner case failed.' -or $script:BootstrapCount -ne 0) {
+        throw 'Runner retried or leaked diagnostics for an ineligible failure.'
+    }
+}
+
+$state = Join-Path ([IO.Path]::GetTempPath()) ("scribe-evidence-retry-state-$([guid]::NewGuid().ToString('N'))")
+$previousState = $env:SCRIBE_EVIDENCE_RETRY_TEST_STATE
+try {
+    $env:SCRIBE_EVIDENCE_RETRY_TEST_STATE = $state
+    $highVolumeSplitRetry = @"
+`$state = `$env:SCRIBE_EVIDENCE_RETRY_TEST_STATE
+if (Test-Path -LiteralPath `$state) { exit 0 }
+[IO.File]::WriteAllText(`$state, 'first')
+[Console]::Out.WriteLine('transcribe-cpp-sys: could not create short build junction C:\safe\tcs; building in OUT_DIR (may exceed Windows MAX_PATH in deep checkouts)')
+[Console]::Out.WriteLine('error: failed to run custom build command for ``transcribe-cpp-sys v0.1.3``')
+1..900 | ForEach-Object { [Console]::Out.WriteLine('bounded stdout noise') }
+[Console]::Error.WriteLine('vulkan-shaders-gen: warning: object directory is near the configured limit')
+1..900 | ForEach-Object { [Console]::Error.WriteLine('bounded stderr noise') }
+[Console]::Error.WriteLine('CMAKE_OBJECT_PATH_MAX is in effect for this nested target')
+[Console]::Error.WriteLine("LINK : fatal error LNK1104: cannot open file 'CMakeFiles\cmTC_1a2B3c.dir\intermediate.manifest'")
+exit 17
+"@
+    Invoke-ScribeEvidenceCargoWithCmakeRetry @('-NoProfile', '-EncodedCommand', (ConvertTo-TestEncodedCommand $highVolumeSplitRetry)) 'high-volume retry failed.' 'unused-target' 'unused-environment'
+    if ($script:BootstrapCount -ne 1 -or -not (Test-Path -LiteralPath $state)) {
+        throw 'Runner did not perform exactly one eligible high-volume split-stream retry.'
+    }
+
+    foreach ($malformed in @(
+        @"
+[Console]::Out.WriteLine('error: failed to run custom build command for ``transcribe-cpp-sys v0.1.3``')
+[Console]::Error.WriteLine('The directory name is invalid. (os error 267)')
+exit 19
+"@,
+        @"
+[Console]::Out.WriteLine('The directory name is invalid. (os error 267)')
+[Console]::Error.WriteLine('Error: failed to execute command: cmake')
+[Console]::Error.WriteLine('error: failed to run custom build command for ``transcribe-cpp-sys v0.1.3``')
+exit 20
+"@,
+        @"
+[Console]::Out.WriteLine('error: failed to run custom build command for ``transcribe-cpp-sys v0.1.3')
+[Console]::Error.WriteLine('Error: failed to execute command: cmake')
+[Console]::Error.WriteLine('The directory name is invalid. (os error 267)')
+exit 21
+"@,
+        @"
+[Console]::Out.WriteLine('error: failed to run custom build command for ``transcribe-cpp-sys v0.1.3``')
+[Console]::Error.WriteLine('Error: failed to execute command: cmake')
+[Console]::Error.WriteLine('access denied')
+exit 22
+"@
+    )) {
+        Invoke-TestRunnerFailure $malformed
+    }
+
+    $overflow = @"
+[Console]::Out.WriteLine('error: failed to run custom build command for ``transcribe-cpp-sys v0.1.3``')
+[Console]::Error.WriteLine('Error: failed to execute command: cmake')
+[Console]::Error.WriteLine('The directory name is invalid. (os error 267)')
+[Console]::Error.Write('x' * 1025)
+exit 23
+"@
+    Invoke-TestRunnerFailure $overflow
+
+    Remove-Item -LiteralPath $state -Force
+    $alwaysFail = @"
+`$state = `$env:SCRIBE_EVIDENCE_RETRY_TEST_STATE
+[IO.File]::AppendAllText(`$state, 'x')
+[Console]::Out.WriteLine('error: failed to run custom build command for ``transcribe-cpp-sys v0.1.3``')
+[Console]::Error.WriteLine('Error: failed to execute command: cmake')
+[Console]::Error.WriteLine('The directory name is invalid. (os error 267)')
+exit 29
+"@
+    $script:BootstrapCount = 0
+    $retryFailure = $null
+    try {
+        Invoke-ScribeEvidenceCargoWithCmakeRetry @('-NoProfile', '-EncodedCommand', (ConvertTo-TestEncodedCommand $alwaysFail)) 'bounded retry failed.' 'unused-target' 'unused-environment'
+    }
+    catch {
+        $retryFailure = $_.Exception.Message
+    }
+    if ($retryFailure -cne 'bounded retry failed. after validated CMake bootstrap retry.' -or
+        $script:BootstrapCount -ne 1 -or
+        [IO.File]::ReadAllText($state).Length -ne 2) {
+        throw 'Runner exceeded or lost its exact one-retry contract.'
+    }
+}
+finally {
+    $env:SCRIBE_EVIDENCE_RETRY_TEST_STATE = $previousState
+    Remove-Item -LiteralPath $state -Force -ErrorAction SilentlyContinue
+}
+Write-Output 'runner retry harness passed'
+'@
+    [IO.File]::WriteAllText(
+        $runnerRetryHarness,
+        @(
+            (Get-Content -LiteralPath (Join-Path $PSScriptRoot 'windows-gpu-worker-cmake-bootstrap.ps1') -Raw),
+            $runnerRetryFunction.Extent.Text,
+            $runnerRetryHarnessTail
+        ) -join "`r`n`r`n",
+        [Text.UTF8Encoding]::new($false)
+    )
+    $runnerRetryOutput = @(& (Join-Path $PSHOME 'pwsh.exe') -NoProfile -File $runnerRetryHarness)
+    if ($LASTEXITCODE -ne 0 -or $runnerRetryOutput.Count -ne 1 -or $runnerRetryOutput[0] -cne 'runner retry harness passed') {
+        throw 'Runner bounded CMake retry harness failed.'
+    }
+}
+finally {
+    Remove-Item -LiteralPath $runnerRetryHarness -Force -ErrorAction SilentlyContinue
+}
 foreach ($required in @('--locked', '--offline', '-SigningMode Fixture', '--ignored', '--exact', '--test-threads=1', '--no-run', 'Invoke-ScribeEvidenceCargoWithCmakeRetry', 'Enable-ScribeEvidenceCmakeBootstrap', 'Assert-ScribeEvidenceNoReparseDescendants', 'Get-ScribeEvidencePinnedMsvcEnvironment', 'Invoke-ScribeEvidenceWithPinnedMsvcEnvironment', '-ToolchainCheckOnly -ExportPinnedMsvcEnvironment', 'Set-ScribeEvidenceWorkerBuildMode $true', 'Set-ScribeEvidenceWorkerBuildMode $false', 'previousWorkerDigest', 'previousBuildingWorker', 'transcribe-cpp-sys-[0-9a-f]{16}', 'onnx_worker::tests::windows_vulkan_fixture_evidence_captures_five_cold_and_twenty_warm_runs', 'gpu-auto-qualification-windows-x64.json', 'Production signing/release input is forbidden', 'Resolve-ScribeEvidenceFreshDirectory', 'Evidence output may not be under source')) {
     if ($runner -notmatch [regex]::Escape($required)) { throw "Runner is missing required source contract: $required" }
 }

@@ -72,24 +72,6 @@ function New-ScribeEvidenceShortCargoTarget([string]$Label) {
     return $target
 }
 
-function Assert-ScribeEvidenceFile([string]$Path, [string]$Label, [UInt64]$MaxBytes) {
-    $full = Resolve-ScribeEvidencePath $Path
-    Assert-ScribeEvidenceNoReparse $full
-    if (-not (Test-Path -LiteralPath $full -PathType Leaf)) { throw "$Label is missing." }
-    $item = Get-Item -LiteralPath $full -Force
-    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or $item.Length -eq 0 -or $item.Length -gt $MaxBytes) {
-        throw "$Label is not a bounded regular non-reparse file."
-    }
-    return $full
-}
-
-function Assert-ScribeEvidenceSingleLinkFile([string]$Path, [string]$Label, [UInt64]$MaxBytes, [string]$FsutilPath) {
-    $full = Assert-ScribeEvidenceFile $Path $Label $MaxBytes
-    $links = @(& $FsutilPath hardlink list $full)
-    if ($LASTEXITCODE -ne 0 -or $links.Count -ne 1) { throw "$Label must have exactly one hard link." }
-    return $full
-}
-
 function Invoke-ScribeEvidence([string]$Exe, [string[]]$Arguments, [string]$Failure) {
     & $Exe @Arguments
     if ($LASTEXITCODE -ne 0) { throw $Failure }
@@ -212,14 +194,23 @@ function Enable-ScribeEvidenceCmakeBootstrap([string]$CargoTarget, [string]$Buil
 }
 
 function Invoke-ScribeEvidenceCargoWithCmakeRetry([string[]]$Arguments, [string]$Failure, [string]$CargoTarget, [string]$BuildEnvironment) {
-    $first = & $cargo @Arguments 2>&1
-    if ($LASTEXITCODE -eq 0) { return }
-    if (-not (Test-ScribeEvidenceKnownCmakeBootstrapFailure $first)) {
-        throw $Failure
+    try {
+        $null = Invoke-ScribeGpuWorkerBoundedNativeProcess $cargo $Arguments $Failure
+        return
+    }
+    catch {
+        $diagnostic = @(Get-ScribeGpuWorkerNativeProcessRetryDiagnostic $_.Exception)
+        if (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure $diagnostic)) {
+            throw $Failure
+        }
     }
     Enable-ScribeEvidenceCmakeBootstrap $CargoTarget $BuildEnvironment
-    & $cargo @Arguments
-    if ($LASTEXITCODE -ne 0) { throw "$Failure after validated CMake bootstrap retry." }
+    try {
+        $null = Invoke-ScribeGpuWorkerBoundedNativeProcess $cargo $Arguments "$Failure after validated CMake bootstrap retry."
+    }
+    catch {
+        throw "$Failure after validated CMake bootstrap retry."
+    }
 }
 
 if (-not $IsWindows) { throw 'Windows Vulkan evidence capture is Windows x64 only.' }
@@ -254,6 +245,12 @@ New-Item -ItemType Directory -Path $evidenceRoot | Out-Null
 Assert-ScribeEvidenceNoReparse $evidenceRoot
 $workRoot = Join-Path $evidenceRoot 'fixture-work'
 New-Item -ItemType Directory -Path $workRoot | Out-Null
+$finalEvidenceLeaf = 'windows-vulkan-fixture-evidence.json'
+$pendingEvidenceLeaf = "windows-vulkan-fixture-evidence.pending-$([guid]::NewGuid().ToString('N')).json"
+$evidenceOutput = Join-Path $evidenceRoot $finalEvidenceLeaf
+$pendingEvidenceOutput = Join-Path $evidenceRoot $pendingEvidenceLeaf
+$null = Assert-ScribeEvidenceDirectChildPath $evidenceOutput $evidenceRoot $finalEvidenceLeaf 'Final evidence report'
+$null = Assert-ScribeEvidenceDirectChildPath $pendingEvidenceOutput $evidenceRoot $pendingEvidenceLeaf 'Pending evidence report'
 
 $git = (Get-Command git.exe -ErrorAction Stop).Source
 $cargo = (Get-Command cargo.exe -ErrorAction Stop).Source
@@ -286,6 +283,8 @@ $evidenceEnvironmentNames = @(
 )
 $previousEvidenceEnvironment = @{}
 foreach ($name in $evidenceEnvironmentNames) { $previousEvidenceEnvironment[$name] = [Environment]::GetEnvironmentVariable($name) }
+$primaryFailure = $null
+$secondaryFailures = [System.Collections.Generic.List[System.Exception]]::new()
 try {
     $env:SCRIBE_BUILD_REVISION = $revision
     $env:SHERPA_ONNX_ARCHIVE_DIR = $nativeArchive
@@ -316,9 +315,9 @@ try {
         [string]$packManifest.worker_build -cnotmatch ("#" + [regex]::Escape($revision) + '$')) {
         throw 'Fixture pack build identity is not bound to the runner-captured source revision.'
     }
-    $evidenceOutput = Join-Path $evidenceRoot 'windows-vulkan-fixture-evidence.json'
     foreach ($forbiddenRoot in @($repositoryRoot, (Join-Path $repositoryRoot 'runtime-manifests'), $packRoot)) {
-        if (Test-ScribeEvidenceWithin $evidenceOutput $forbiddenRoot) {
+        if ((Test-ScribeEvidenceWithin $evidenceOutput $forbiddenRoot) -or
+            (Test-ScribeEvidenceWithin $pendingEvidenceOutput $forbiddenRoot)) {
             throw 'Evidence output may not be under source, runtime-manifest, catalog, activation, or pack roots.'
         }
     }
@@ -339,27 +338,59 @@ try {
     $env:SCRIBE_VULKAN_EVIDENCE_WAV_SHA256 = $WavSha256
     $env:SCRIBE_VULKAN_EVIDENCE_EXPECTED_PHRASE = $ExpectedPhrase
     $env:SCRIBE_VULKAN_EVIDENCE_EXPECTED_STABLE_DEVICE = $ExpectedStableDevice
-    $env:SCRIBE_VULKAN_EVIDENCE_OUTPUT = $evidenceOutput
+    $env:SCRIBE_VULKAN_EVIDENCE_OUTPUT = $pendingEvidenceOutput
     $env:SCRIBE_VULKAN_EVIDENCE_NVIDIA_BASELINE_JSON = $baseline | ConvertTo-Json -Compress
     Invoke-ScribeEvidenceWithPinnedMsvcEnvironment $pinnedMsvcEnvironment {
         Set-ScribeEvidenceWorkerBuildMode $false
         Invoke-ScribeEvidence $cargo @('test', '--locked', '--offline', '--features', 'inference-worker', 'onnx_worker::tests::windows_vulkan_fixture_evidence_captures_five_cold_and_twenty_warm_runs', '--', '--ignored', '--exact', '--test-threads=1') 'The exact Vulkan evidence test failed.'
     }
 }
-finally {
-    $env:SCRIBE_BUILD_REVISION = $previousRevision
-    $env:SHERPA_ONNX_ARCHIVE_DIR = $previousArchive
-    $env:CARGO_TARGET_DIR = $previousTarget
-    $env:LOCALAPPDATA = $previousLocalAppData
-    $env:SCRIBE_BUNDLED_WORKER_SHA256 = $previousWorkerDigest
-    $env:SCRIBE_BUILDING_WORKER = $previousBuildingWorker
-    foreach ($name in $evidenceEnvironmentNames) {
-        if ($null -eq $previousEvidenceEnvironment[$name]) { Remove-Item "Env:$name" -ErrorAction SilentlyContinue }
-        else { Set-Item "Env:$name" $previousEvidenceEnvironment[$name] }
-    }
-    $afterAuto = [IO.File]::ReadAllBytes($autoManifest)
-    if (-not [Linq.Enumerable]::SequenceEqual[byte]($afterAuto, $expectedAuto)) { throw 'Windows Auto manifest changed during fixture-only evidence capture.' }
+catch {
+    $primaryFailure = $_.Exception
 }
-$report = Assert-ScribeEvidenceFile (Join-Path $evidenceRoot 'windows-vulkan-fixture-evidence.json') 'Evidence report' (1MB)
-$reportDigest = (Get-FileHash -LiteralPath $report -Algorithm SHA256).Hash.ToLowerInvariant()
-Write-Output "Fixture-only untrusted Vulkan evidence: $report ($reportDigest)"
+finally {
+    $restoreEnvironment = [ordered]@{
+        SCRIBE_BUILD_REVISION = $previousRevision
+        SHERPA_ONNX_ARCHIVE_DIR = $previousArchive
+        CARGO_TARGET_DIR = $previousTarget
+        LOCALAPPDATA = $previousLocalAppData
+        SCRIBE_BUNDLED_WORKER_SHA256 = $previousWorkerDigest
+        SCRIBE_BUILDING_WORKER = $previousBuildingWorker
+    }
+    foreach ($entry in $restoreEnvironment.GetEnumerator()) {
+        try {
+            [Environment]::SetEnvironmentVariable([string]$entry.Key, $entry.Value, [EnvironmentVariableTarget]::Process)
+        }
+        catch {
+            $secondaryFailures.Add([InvalidOperationException]::new("Could not restore the $($entry.Key) process environment variable.", $_.Exception))
+        }
+    }
+    foreach ($name in $evidenceEnvironmentNames) {
+        try {
+            [Environment]::SetEnvironmentVariable($name, $previousEvidenceEnvironment[$name], [EnvironmentVariableTarget]::Process)
+        }
+        catch {
+            $secondaryFailures.Add([InvalidOperationException]::new("Could not restore a fixture evidence process environment variable.", $_.Exception))
+        }
+    }
+    try {
+        $afterAuto = [IO.File]::ReadAllBytes($autoManifest)
+        if (-not [Linq.Enumerable]::SequenceEqual[byte]($afterAuto, $beforeAuto) -or
+            -not [Linq.Enumerable]::SequenceEqual[byte]($afterAuto, $expectedAuto)) {
+            throw 'Windows Auto manifest changed during fixture-only evidence capture.'
+        }
+    }
+    catch {
+        $secondaryFailures.Add($_.Exception)
+    }
+}
+$published = Complete-ScribeEvidencePendingReport `
+    $pendingEvidenceOutput `
+    $evidenceOutput `
+    $evidenceRoot `
+    $pendingEvidenceLeaf `
+    $finalEvidenceLeaf `
+    $trustedFsutil `
+    $primaryFailure `
+    $secondaryFailures.ToArray()
+Write-Output "Fixture-only untrusted Vulkan evidence: $($published.Path) ($($published.Digest))"

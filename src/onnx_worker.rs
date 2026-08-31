@@ -13565,6 +13565,15 @@ mod tests {
         output: &Path,
         report: &VulkanEvidenceReport,
     ) -> Result<()> {
+        write_vulkan_evidence_create_new_with(output, |file| {
+            serde_json::to_writer(file, report).context("serialize metadata-only evidence")
+        })
+    }
+
+    fn write_vulkan_evidence_create_new_with(
+        output: &Path,
+        write_report: impl FnOnce(&std::fs::File) -> Result<()>,
+    ) -> Result<()> {
         let parent = output
             .parent()
             .ok_or_else(|| anyhow!("evidence output has no parent directory"))?;
@@ -13582,9 +13591,18 @@ mod tests {
             .create_new(true)
             .open(output)
             .context("create evidence output")?;
-        serde_json::to_writer(&file, report).context("serialize metadata-only evidence")?;
+        write_report(&file)?;
         file.sync_all().context("sync evidence output")?;
         Ok(())
+    }
+
+    fn write_vulkan_evidence_after_cleanup(
+        output: &Path,
+        report: &VulkanEvidenceReport,
+        cleanup: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        cleanup().context("clean up fixture evidence resources before staging report")?;
+        write_vulkan_evidence_create_new(output, report)
     }
 
     fn assert_vulkan_evidence_regular_file(
@@ -13835,6 +13853,32 @@ mod tests {
         assert!(!text.contains("stable_device"));
         assert!(!text.contains("public fixture phrase"));
         assert!(write_vulkan_evidence_create_new(&output, &report).is_err());
+
+        let final_output = root.join("final-evidence.json");
+        let cleanup_failed_output = root.join("cleanup-failed.pending.json");
+        let cleanup_error =
+            write_vulkan_evidence_after_cleanup(&cleanup_failed_output, &report, || {
+                Err(anyhow!("forced cleanup failure"))
+            })
+            .unwrap_err();
+        assert!(cleanup_error.to_string().contains("before staging report"));
+        assert!(!cleanup_failed_output.exists());
+        assert!(!final_output.exists());
+
+        let partial_output = root.join("partial-write.pending.json");
+        let partial_error = write_vulkan_evidence_create_new_with(&partial_output, |mut file| {
+            file.write_all(b"{")
+                .context("write forced partial evidence")?;
+            bail!("forced evidence write failure")
+        })
+        .unwrap_err();
+        assert!(
+            partial_error
+                .to_string()
+                .contains("forced evidence write failure")
+        );
+        assert_eq!(std::fs::read(&partial_output).unwrap(), b"{");
+        assert!(!final_output.exists());
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -14362,24 +14406,25 @@ mod tests {
             normalized_transcript_parity: true,
             same_device_internally_verified: true,
         };
-        write_vulkan_evidence_create_new(&inputs.output, &report)
-            .expect("write a new bounded metadata-only evidence artifact");
         drop(binding);
-        let cleanup_deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            match std::fs::remove_dir_all(&lease_owner) {
-                Ok(()) => break,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
-                Err(error)
-                    if (error.kind() == std::io::ErrorKind::PermissionDenied
-                        || error.raw_os_error() == Some(32))
-                        && Instant::now() < cleanup_deadline =>
-                {
-                    std::thread::sleep(Duration::from_millis(25));
+        write_vulkan_evidence_after_cleanup(&inputs.output, &report, || {
+            let cleanup_deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match std::fs::remove_dir_all(&lease_owner) {
+                    Ok(()) => return Ok(()),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                    Err(error)
+                        if (error.kind() == std::io::ErrorKind::PermissionDenied
+                            || error.raw_os_error() == Some(32))
+                            && Instant::now() < cleanup_deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(25));
+                    }
+                    Err(error) => return Err(error).context("remove reaped fixture-pack lease"),
                 }
-                Err(error) => panic!("could not remove reaped fixture-pack lease: {error}"),
             }
-        }
+        })
+        .expect("clean up the fixture lease and stage a bounded metadata-only evidence artifact");
     }
 
     #[test]

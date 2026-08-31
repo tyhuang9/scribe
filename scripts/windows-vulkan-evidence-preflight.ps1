@@ -1,4 +1,5 @@
 Set-StrictMode -Version Latest
+. (Join-Path $PSScriptRoot 'windows-gpu-worker-cmake-bootstrap.ps1')
 
 function Assert-ScribeEvidenceNoReparse([string]$Path) {
     $current = [IO.Path]::GetFullPath($Path).TrimEnd([char[]]@('\', '/'))
@@ -25,6 +26,273 @@ function Get-ScribeEvidencePhysicalDirectory([string]$Path, [string]$Label) {
         throw "$Label must be a physical non-reparse directory."
     }
     return $item
+}
+
+function Assert-ScribeEvidenceFile([string]$Path, [string]$Label, [UInt64]$MaxBytes) {
+    $full = [IO.Path]::GetFullPath($Path).TrimEnd([char[]]@('\', '/'))
+    Assert-ScribeEvidenceNoReparse $full
+    if (-not (Test-Path -LiteralPath $full -PathType Leaf)) { throw "$Label is missing." }
+    $item = Get-Item -LiteralPath $full -Force
+    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or $item.Length -eq 0 -or $item.Length -gt $MaxBytes) {
+        throw "$Label is not a bounded regular non-reparse file."
+    }
+    return $full
+}
+
+function Assert-ScribeEvidenceSingleLinkFile([string]$Path, [string]$Label, [UInt64]$MaxBytes, [string]$FsutilPath) {
+    $full = Assert-ScribeEvidenceFile $Path $Label $MaxBytes
+    $links = @(& $FsutilPath hardlink list $full)
+    if ($LASTEXITCODE -ne 0 -or $links.Count -ne 1) { throw "$Label must have exactly one hard link." }
+    return $full
+}
+
+function Assert-ScribeEvidenceExactProperties([psobject]$Value, [string[]]$Names, [string]$Label) {
+    if ($null -eq $Value) { throw "$Label is missing." }
+    $actual = @($Value.PSObject.Properties.Name | Sort-Object)
+    $expected = @($Names | Sort-Object)
+    if ($actual.Count -ne $expected.Count -or
+        (Compare-Object -ReferenceObject $expected -DifferenceObject $actual -CaseSensitive)) {
+        throw "$Label has unknown or missing fields."
+    }
+}
+
+function Assert-ScribeEvidenceDirectChildPath(
+    [string]$Path,
+    [string]$Root,
+    [string]$ExpectedLeaf,
+    [string]$Label
+) {
+    if ($ExpectedLeaf -cnotmatch '^[a-z0-9][a-z0-9._-]{0,127}\.json$') {
+        throw "$Label has an unsafe expected leaf."
+    }
+    $rootItem = Get-ScribeEvidencePhysicalDirectory $Root "$Label root"
+    $canonicalRoot = $rootItem.FullName.TrimEnd([char[]]@('\', '/'))
+    $full = [IO.Path]::GetFullPath($Path).TrimEnd([char[]]@('\', '/'))
+    if ((Split-Path -Leaf $full) -cne $ExpectedLeaf -or
+        (Split-Path -Parent $full).TrimEnd([char[]]@('\', '/')) -cne $canonicalRoot) {
+        throw "$Label must be the exact direct child of its evidence root."
+    }
+    Assert-ScribeEvidenceNoReparse $full
+    return $full
+}
+
+function Assert-ScribeEvidenceNoAlternateDataStreams([string]$Path, [string]$Label) {
+    $streams = @(Get-Item -LiteralPath $Path -Stream * -ErrorAction Stop)
+    if ($streams.Count -ne 1 -or [string]$streams[0].Stream -cne ':$DATA') {
+        throw "$Label must not contain alternate data streams."
+    }
+}
+
+function Assert-ScribeEvidenceUnsignedInteger([object]$Value, [string]$Label) {
+    $text = [Convert]::ToString($Value, [Globalization.CultureInfo]::InvariantCulture)
+    [UInt64]$parsed = 0
+    if ($text -cnotmatch '^[0-9]+$' -or
+        -not [UInt64]::TryParse($text, [Globalization.NumberStyles]::None, [Globalization.CultureInfo]::InvariantCulture, [ref]$parsed)) {
+        throw "$Label must be an unsigned bounded integer."
+    }
+}
+
+function Assert-ScribeEvidenceMetadataString([object]$Value, [int]$MaximumLength, [string]$Label) {
+    $text = [string]$Value
+    if ([string]::IsNullOrWhiteSpace($text) -or
+        $text.Length -gt $MaximumLength -or
+        $text.IndexOfAny([char[]]@('\', '/', "`r", "`n", [char]0)) -ge 0 -or
+        $text.ToCharArray().Where({ [int]$_ -lt 0x20 -or [int]$_ -gt 0x7e }).Count -ne 0) {
+        throw "$Label is not bounded printable metadata."
+    }
+}
+
+function Assert-ScribeEvidenceRunSet([psobject]$Value, [int]$ExpectedCount, [bool]$Cold, [string]$Label) {
+    Assert-ScribeEvidenceExactProperties $Value @(
+        'end_to_end', 'end_to_end_ms', 'backend_processing',
+        'backend_processing_ms', 'model_load', 'model_load_ms'
+    ) $Label
+    foreach ($statisticsName in @('end_to_end', 'backend_processing')) {
+        Assert-ScribeEvidenceExactProperties $Value.$statisticsName @('p50_ms', 'p95_ms') "$Label $statisticsName"
+        Assert-ScribeEvidenceUnsignedInteger $Value.$statisticsName.p50_ms "$Label $statisticsName p50_ms"
+        Assert-ScribeEvidenceUnsignedInteger $Value.$statisticsName.p95_ms "$Label $statisticsName p95_ms"
+    }
+    foreach ($samplesName in @('end_to_end_ms', 'backend_processing_ms')) {
+        if (@($Value.$samplesName).Count -ne $ExpectedCount) {
+            throw "$Label $samplesName has an unexpected sample count."
+        }
+        foreach ($sample in @($Value.$samplesName)) {
+            Assert-ScribeEvidenceUnsignedInteger $sample "$Label $samplesName sample"
+        }
+    }
+    if ($Cold) {
+        Assert-ScribeEvidenceExactProperties $Value.model_load @('p50_ms', 'p95_ms') "$Label model_load"
+        if (@($Value.model_load_ms).Count -ne $ExpectedCount) {
+            throw "$Label model_load_ms has an unexpected sample count."
+        }
+        Assert-ScribeEvidenceUnsignedInteger $Value.model_load.p50_ms "$Label model_load p50_ms"
+        Assert-ScribeEvidenceUnsignedInteger $Value.model_load.p95_ms "$Label model_load p95_ms"
+        foreach ($sample in @($Value.model_load_ms)) {
+            Assert-ScribeEvidenceUnsignedInteger $sample "$Label model_load_ms sample"
+        }
+    }
+    elseif ($null -ne $Value.model_load -or $null -ne $Value.model_load_ms) {
+        throw "$Label contains unexpected warm-run model-load evidence."
+    }
+}
+
+function Assert-ScribeEvidencePendingReport(
+    [string]$PendingPath,
+    [string]$EvidenceRoot,
+    [string]$PendingLeaf,
+    [string]$FsutilPath
+) {
+    $pending = Assert-ScribeEvidenceDirectChildPath $PendingPath $EvidenceRoot $PendingLeaf 'Pending evidence report'
+    $pending = Assert-ScribeEvidenceSingleLinkFile $pending 'Pending evidence report' (1MB) $FsutilPath
+    Assert-ScribeEvidenceNoAlternateDataStreams $pending 'Pending evidence report'
+    try {
+        $report = [IO.File]::ReadAllText($pending, [Text.UTF8Encoding]::new($false, $true)) | ConvertFrom-Json
+    }
+    catch {
+        throw 'Pending evidence report is not strict UTF-8 JSON.'
+    }
+    Assert-ScribeEvidenceExactProperties $report @(
+        'schema_version', 'fixture_only', 'untrusted', 'auto_eligible',
+        'source_revision', 'pack', 'model_sha256', 'wav_sha256', 'gpu',
+        'nvidia_baseline', 'cold_runs_per_backend', 'warm_runs_per_backend',
+        'cpu', 'vulkan', 'expected_phrase_present_every_run',
+        'normalized_transcript_parity', 'same_device_internally_verified'
+    ) 'Pending evidence report'
+    if ($report.schema_version -ne 1 -or
+        $report.fixture_only -ne $true -or
+        $report.untrusted -ne $true -or
+        $report.auto_eligible -ne $false -or
+        [string]$report.source_revision -cnotmatch '^[0-9a-f]{40}$' -or
+        [string]$report.model_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        [string]$report.wav_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        $report.cold_runs_per_backend -ne 5 -or
+        $report.warm_runs_per_backend -ne 20 -or
+        $report.expected_phrase_present_every_run -ne $true -or
+        $report.normalized_transcript_parity -ne $true -or
+        $report.same_device_internally_verified -ne $true) {
+        throw 'Pending evidence report violates the fixture-only metadata contract.'
+    }
+    Assert-ScribeEvidenceExactProperties $report.pack @('id', 'version', 'digest', 'security_epoch', 'runtime_abi') 'Pending evidence pack'
+    Assert-ScribeEvidenceExactProperties $report.gpu @('backend', 'provider', 'vendor', 'device_class', 'driver', 'memory_total_bytes') 'Pending evidence GPU'
+    Assert-ScribeEvidenceExactProperties $report.nvidia_baseline @('product', 'driver', 'memory_total_bytes', 'memory_used_bytes', 'gpu_utilization_percent') 'Pending evidence NVIDIA baseline'
+    Assert-ScribeEvidenceMetadataString $report.pack.id 128 'Pending evidence pack id'
+    Assert-ScribeEvidenceMetadataString $report.pack.version 128 'Pending evidence pack version'
+    if ([string]$report.pack.digest -cnotmatch '^[0-9a-f]{64}$') { throw 'Pending evidence pack digest is not canonical.' }
+    Assert-ScribeEvidenceUnsignedInteger $report.pack.security_epoch 'Pending evidence pack security epoch'
+    Assert-ScribeEvidenceUnsignedInteger $report.pack.runtime_abi 'Pending evidence pack runtime ABI'
+    if ([string]$report.gpu.backend -cne 'vulkan' -or
+        [string]$report.gpu.provider -cne 'transcribe-cpp-ggml-vulkan' -or
+        [string]$report.gpu.vendor -cne 'nvidia' -or
+        [string]$report.gpu.device_class -cne 'discrete_gpu') {
+        throw 'Pending evidence GPU identity is outside the exact fixture contract.'
+    }
+    Assert-ScribeEvidenceMetadataString $report.gpu.driver 128 'Pending evidence GPU driver'
+    Assert-ScribeEvidenceUnsignedInteger $report.gpu.memory_total_bytes 'Pending evidence GPU memory'
+    Assert-ScribeEvidenceMetadataString $report.nvidia_baseline.product 256 'Pending evidence NVIDIA product'
+    Assert-ScribeEvidenceMetadataString $report.nvidia_baseline.driver 128 'Pending evidence NVIDIA driver'
+    Assert-ScribeEvidenceUnsignedInteger $report.nvidia_baseline.memory_total_bytes 'Pending evidence NVIDIA total memory'
+    Assert-ScribeEvidenceUnsignedInteger $report.nvidia_baseline.memory_used_bytes 'Pending evidence NVIDIA used memory'
+    Assert-ScribeEvidenceUnsignedInteger $report.nvidia_baseline.gpu_utilization_percent 'Pending evidence NVIDIA utilization'
+    [UInt64]$gpuMemory = $report.gpu.memory_total_bytes
+    [UInt64]$baselineTotal = $report.nvidia_baseline.memory_total_bytes
+    [UInt64]$baselineUsed = $report.nvidia_baseline.memory_used_bytes
+    [UInt64]$baselineUtilization = $report.nvidia_baseline.gpu_utilization_percent
+    if ($gpuMemory -eq 0 -or
+        $baselineTotal -eq 0 -or
+        $baselineUsed -gt $baselineTotal -or
+        $baselineUtilization -gt 10 -or
+        $baselineUsed -gt ($baselineTotal / 4)) {
+        throw 'Pending evidence NVIDIA metadata violates the bounded idle fixture contract.'
+    }
+    foreach ($backendName in @('cpu', 'vulkan')) {
+        Assert-ScribeEvidenceExactProperties $report.$backendName @('cold', 'warm') "Pending evidence $backendName"
+        Assert-ScribeEvidenceRunSet $report.$backendName.cold 5 $true "Pending evidence $backendName cold"
+        Assert-ScribeEvidenceRunSet $report.$backendName.warm 20 $false "Pending evidence $backendName warm"
+    }
+    return $pending
+}
+
+function Remove-ScribeEvidencePendingReport(
+    [string]$PendingPath,
+    [string]$EvidenceRoot,
+    [string]$PendingLeaf
+) {
+    $pending = Assert-ScribeEvidenceDirectChildPath $PendingPath $EvidenceRoot $PendingLeaf 'Pending evidence cleanup'
+    $item = Get-Item -LiteralPath $pending -Force -ErrorAction SilentlyContinue
+    if ($null -eq $item) { return }
+    if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw 'Pending evidence cleanup refused a non-file or reparse artifact.'
+    }
+    Remove-Item -LiteralPath $pending -Force
+    if (Test-Path -LiteralPath $pending) { throw 'Pending evidence cleanup did not remove the artifact.' }
+}
+
+function Add-ScribeEvidenceSecondaryFailures([System.Exception]$Primary, [System.Exception[]]$Secondary) {
+    for ($index = 0; $index -lt @($Secondary).Count; $index++) {
+        $Primary.Data["ScribeEvidenceSecondaryFailure$index"] = @($Secondary)[$index].Message
+    }
+}
+
+function Complete-ScribeEvidencePendingReport(
+    [string]$PendingPath,
+    [string]$FinalPath,
+    [string]$EvidenceRoot,
+    [string]$PendingLeaf,
+    [string]$FinalLeaf,
+    [string]$FsutilPath,
+    [System.Exception]$PrimaryFailure,
+    [System.Exception[]]$SecondaryFailures
+) {
+    $failures = [System.Collections.Generic.List[System.Exception]]::new()
+    foreach ($failure in @($SecondaryFailures)) {
+        if ($null -ne $failure) { $failures.Add($failure) }
+    }
+    if ($null -ne $PrimaryFailure -or $failures.Count -gt 0) {
+        try {
+            Remove-ScribeEvidencePendingReport $PendingPath $EvidenceRoot $PendingLeaf
+        }
+        catch {
+            $failures.Add($_.Exception)
+        }
+        if ($null -ne $PrimaryFailure) {
+            Add-ScribeEvidenceSecondaryFailures $PrimaryFailure $failures.ToArray()
+            throw $PrimaryFailure
+        }
+        $cleanupPrimary = $failures[0]
+        Add-ScribeEvidenceSecondaryFailures $cleanupPrimary @($failures.ToArray() | Select-Object -Skip 1)
+        throw $cleanupPrimary
+    }
+
+    try {
+        $pending = Assert-ScribeEvidencePendingReport $PendingPath $EvidenceRoot $PendingLeaf $FsutilPath
+        $final = Assert-ScribeEvidenceDirectChildPath $FinalPath $EvidenceRoot $FinalLeaf 'Final evidence report'
+        if ($null -ne (Get-Item -LiteralPath $final -Force -ErrorAction SilentlyContinue) -or
+            (Test-Path -LiteralPath $final)) {
+            throw 'Final evidence report destination must be fresh.'
+        }
+        $digest = (Get-FileHash -LiteralPath $pending -Algorithm SHA256).Hash.ToLowerInvariant()
+        # Revalidate mutable source/destination topology immediately before the
+        # only publication operation. File.Move is an atomic same-directory rename.
+        $pending = Assert-ScribeEvidencePendingReport $PendingPath $EvidenceRoot $PendingLeaf $FsutilPath
+        $final = Assert-ScribeEvidenceDirectChildPath $FinalPath $EvidenceRoot $FinalLeaf 'Final evidence report'
+        if ($null -ne (Get-Item -LiteralPath $final -Force -ErrorAction SilentlyContinue) -or
+            (Test-Path -LiteralPath $final)) {
+            throw 'Final evidence report destination changed before publication.'
+        }
+        $result = [pscustomobject]@{ Path = $final; Digest = $digest }
+        [IO.File]::Move($pending, $final, $false)
+        return $result
+    }
+    catch {
+        $publishFailure = $_.Exception
+        try {
+            Remove-ScribeEvidencePendingReport $PendingPath $EvidenceRoot $PendingLeaf
+        }
+        catch {
+            Add-ScribeEvidenceSecondaryFailures $publishFailure @($_.Exception)
+        }
+        throw $publishFailure
+    }
 }
 
 function Assert-ScribeEvidenceNoReparseDescendants([string]$Path) {
@@ -165,27 +433,6 @@ function Assert-ScribeVulkanEvidenceTrustedNvidiaSmi([string]$Path) {
         throw 'Required trusted nvidia-smi.exe must be a regular non-reparse file.'
     }
     return $item.FullName
-}
-
-function Test-ScribeEvidenceKnownCmakeBootstrapFailure([object[]]$Output) {
-    $lines = [System.Collections.Generic.List[string]]::new()
-    foreach ($entry in @($Output)) {
-        if ($lines.Count -ge 64) { break }
-        $line = [string]$entry
-        if ($line.Length -gt 1024) { $line = $line.Substring(0, 1024) }
-        $lines.Add($line)
-    }
-
-    $crateLine = [regex]::new('^error: failed to run custom build command for `transcribe-cpp-sys v0\.1\.3(?: .*)?$', [Text.RegularExpressions.RegexOptions]::CultureInvariant)
-    $commandLine = [regex]::new('^\s*Error: failed to execute command: .+$', [Text.RegularExpressions.RegexOptions]::CultureInvariant)
-    $osErrorLine = [regex]::new('^\s*The directory name is invalid\. \(os error 267\)\s*$', [Text.RegularExpressions.RegexOptions]::CultureInvariant)
-    $state = 0
-    foreach ($line in $lines) {
-        if ($state -eq 0 -and $crateLine.IsMatch($line)) { $state = 1; continue }
-        if ($state -eq 1 -and $commandLine.IsMatch($line)) { $state = 2; continue }
-        if ($state -eq 2 -and $osErrorLine.IsMatch($line)) { return $true }
-    }
-    return $false
 }
 
 function Get-ScribeVulkanEvidenceNvidiaBaseline([string]$ExpectedStableDevice, [string]$NvidiaSmiPath) {
