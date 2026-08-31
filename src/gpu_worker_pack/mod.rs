@@ -24,13 +24,6 @@ use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
-#[cfg(any(
-    all(windows, target_arch = "x86_64"),
-    all(
-        target_os = "macos",
-        any(target_arch = "aarch64", target_arch = "x86_64")
-    )
-))]
 use sha2::{Digest, Sha256};
 
 const MAX_RELEASE_SECURITY_EPOCH: u64 = 9_007_199_254_740_991;
