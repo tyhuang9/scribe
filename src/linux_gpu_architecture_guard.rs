@@ -156,7 +156,13 @@ fn linux_gpu_typecheck_is_source_only_locked_and_pinned() {
         harness,
         "#![allow(dead_code)]\n\n#[path = \"../../../src/linux_gpu.rs\"]\nmod linux_gpu;\n"
     );
-    for forbidden in ["sherpa", "transcribe", "build.rs", "cc =", "git ="] {
+    for forbidden in [
+        concat!("sher", "pa"),
+        "transcribe",
+        "build.rs",
+        "cc =",
+        "git =",
+    ] {
         assert!(
             !manifest.contains(forbidden),
             "type-check manifest contains forbidden dependency: {forbidden}"
