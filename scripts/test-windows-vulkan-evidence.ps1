@@ -453,6 +453,54 @@ try {
         }
     }
 
+    $escapedLfCases = @(
+        [pscustomobject]@{
+            Name = 'source-revision'
+            Needle = '"source_revision":"' + [string]$validReport.source_revision + '"'
+            ExpectedFailure = 'Pending evidence report violates the fixture-only metadata contract.'
+        },
+        [pscustomobject]@{
+            Name = 'model-sha256'
+            Needle = '"model_sha256":"' + [string]$validReport.model_sha256 + '"'
+            ExpectedFailure = 'Pending evidence report violates the fixture-only metadata contract.'
+        },
+        [pscustomobject]@{
+            Name = 'wav-sha256'
+            Needle = '"wav_sha256":"' + [string]$validReport.wav_sha256 + '"'
+            ExpectedFailure = 'Pending evidence report violates the fixture-only metadata contract.'
+        },
+        [pscustomobject]@{
+            Name = 'pack-digest'
+            Needle = '"digest":"' + [string]$validReport.pack.digest + '"'
+            ExpectedFailure = 'Pending evidence pack digest is not canonical.'
+        }
+    )
+    foreach ($escapedLfCase in $escapedLfCases) {
+        $escapedLfReplacement = $escapedLfCase.Needle.Substring(0, $escapedLfCase.Needle.Length - 1) + '\n"'
+        $escapedLfJson = $expectedJson.Replace($escapedLfCase.Needle, $escapedLfReplacement)
+        if ($escapedLfJson -ceq $expectedJson -or -not $escapedLfJson.Contains('\n')) {
+            throw "Escaped-LF regression fixture did not mutate the valid JSON: $($escapedLfCase.Name)"
+        }
+        $escapedLfLeaf = "windows-vulkan-fixture-evidence-lf-$($escapedLfCase.Name).json"
+        $escapedLfPath = Join-Path $publicationRoot $escapedLfLeaf
+        $escapedLfBytes = [Text.UTF8Encoding]::new($false).GetBytes($escapedLfJson)
+        $escapedLfDigest = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($escapedLfBytes)).ToLowerInvariant()
+        [IO.File]::WriteAllBytes($escapedLfPath, $escapedLfBytes)
+        $escapedLfFailure = $null
+        try {
+            $null = Read-ScribeVerifiedEvidenceReport $escapedLfPath $escapedLfDigest
+        }
+        catch {
+            $escapedLfFailure = $_.Exception.GetBaseException().Message
+        }
+        finally {
+            Remove-Item -LiteralPath $escapedLfPath -Force -ErrorAction SilentlyContinue
+        }
+        if ($escapedLfFailure -cne $escapedLfCase.ExpectedFailure) {
+            throw "Full consumer verifier did not reject escaped final LF in $($escapedLfCase.Name) at its canonical metadata boundary."
+        }
+    }
+
     $wrongDigest = if ($expectedBoundDigest[0] -ceq '0') {
         '1' + $expectedBoundDigest.Substring(1)
     }
@@ -466,7 +514,7 @@ try {
         throw 'Consumer verifier did not reject the wrong caller-supplied digest at the digest boundary.'
     }
 
-    foreach ($invalidDigest in @('a' * 63 -join '', 'A' * 64 -join '', "$('a' * 64 -join '') ")) {
+    foreach ($invalidDigest in @('a' * 63 -join '', 'A' * 64 -join '', "$('a' * 64 -join '') ", "$('a' * 64 -join '')`n")) {
         $invalidDigestRejected = $false
         try { $null = Read-ScribeVerifiedEvidenceReport $finalPath $invalidDigest } catch { $invalidDigestRejected = $true }
         if (-not $invalidDigestRejected) { throw 'Consumer verifier accepted a noncanonical caller-supplied digest.' }
@@ -717,7 +765,7 @@ $preflight = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'windows-vulkan-e
 foreach ($required in @('GetSystemDirectory', 'nvidia-smi.exe', 'matching.Count -ne 1', '$utilization -gt 10', '$usedMib -gt ($totalMib / 4)', 'pci.bus_id')) {
     if ($preflight -notmatch [regex]::Escape($required)) { throw "Preflight is missing required source contract: $required" }
 }
-foreach ($required in @('CreateFileW', 'GetFileInformationByHandle', 'GetFileInformationByHandleEx', 'FileIdExtdDirectoryInfo', 'SetFileInformationByHandle', 'FileRenameInfo', 'FileDispositionInfo', 'ValidateOnlyUnnamedDataStream', 'ReadAllAndHash', 'RenameNoReplace', 'FileShareRead', 'OpenPublished', 'ReadAllAndVerify', 'CryptographicOperations.FixedTimeEquals', 'new UTF8Encoding(false, true)', 'BoundVerifiedEvidence', 'Read-ScribeVerifiedEvidenceReport', 'System.Text.Json', 'JsonDocument.Parse', 'AllowTrailingCommas = false', 'CommentHandling = JsonCommentHandling.Disallow', 'StringComparer.Ordinal', 'GetRawText()', 'NumberStyles.None', 'ConsumerApiVersion = 2', 'Restart PowerShell/session: incompatible native evidence type is already loaded.')) {
+foreach ($required in @('CreateFileW', 'GetFileInformationByHandle', 'GetFileInformationByHandleEx', 'FileIdExtdDirectoryInfo', 'SetFileInformationByHandle', 'FileRenameInfo', 'FileDispositionInfo', 'ValidateOnlyUnnamedDataStream', 'ReadAllAndHash', 'RenameNoReplace', 'FileShareRead', 'OpenPublished', 'ReadAllAndVerify', 'CryptographicOperations.FixedTimeEquals', 'new UTF8Encoding(false, true)', 'BoundVerifiedEvidence', 'Read-ScribeVerifiedEvidenceReport', 'System.Text.Json', 'JsonDocument.Parse', 'AllowTrailingCommas = false', 'CommentHandling = JsonCommentHandling.Disallow', 'StringComparer.Ordinal', 'GetRawText()', 'NumberStyles.None', 'ConsumerApiVersion = 2', 'Restart PowerShell/session: incompatible native evidence type is already loaded.', '\A[0-9a-f]{40}\z', '\A[0-9a-f]{64}\z')) {
     if ($preflight -notmatch [regex]::Escape($required)) { throw "Handle-bound evidence publication is missing: $required" }
 }
 if ($preflight -match '\[IO\.File\]::Move\(' -or

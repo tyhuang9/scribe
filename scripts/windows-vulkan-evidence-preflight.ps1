@@ -1116,9 +1116,9 @@ function Assert-ScribeEvidenceReportJson([string]$Utf8Json) {
         $report.fixture_only -ne $true -or
         $report.untrusted -ne $true -or
         $report.auto_eligible -ne $false -or
-        [string]$report.source_revision -cnotmatch '^[0-9a-f]{40}$' -or
-        [string]$report.model_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
-        [string]$report.wav_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        [string]$report.source_revision -cnotmatch '\A[0-9a-f]{40}\z' -or
+        [string]$report.model_sha256 -cnotmatch '\A[0-9a-f]{64}\z' -or
+        [string]$report.wav_sha256 -cnotmatch '\A[0-9a-f]{64}\z' -or
         $report.cold_runs_per_backend -ne 5 -or
         $report.warm_runs_per_backend -ne 20 -or
         $report.expected_phrase_present_every_run -ne $true -or
@@ -1131,7 +1131,7 @@ function Assert-ScribeEvidenceReportJson([string]$Utf8Json) {
     Assert-ScribeEvidenceExactProperties $report.nvidia_baseline @('product', 'driver', 'memory_total_bytes', 'memory_used_bytes', 'gpu_utilization_percent') 'Pending evidence NVIDIA baseline'
     Assert-ScribeEvidenceMetadataString $report.pack.id 128 'Pending evidence pack id'
     Assert-ScribeEvidenceMetadataString $report.pack.version 128 'Pending evidence pack version'
-    if ([string]$report.pack.digest -cnotmatch '^[0-9a-f]{64}$') { throw 'Pending evidence pack digest is not canonical.' }
+    if ([string]$report.pack.digest -cnotmatch '\A[0-9a-f]{64}\z') { throw 'Pending evidence pack digest is not canonical.' }
     Assert-ScribeEvidenceUnsignedInteger $report.pack.security_epoch 'Pending evidence pack security epoch'
     Assert-ScribeEvidenceUnsignedInteger $report.pack.runtime_abi 'Pending evidence pack runtime ABI'
     if ([string]$report.gpu.backend -cne 'vulkan' -or
@@ -1166,7 +1166,7 @@ function Assert-ScribeEvidenceReportJson([string]$Utf8Json) {
 }
 
 function Read-ScribeVerifiedEvidenceReport([string]$EvidencePath, [string]$ExpectedSha256) {
-    if ($ExpectedSha256 -cnotmatch '^[0-9a-f]{64}$') {
+    if ($ExpectedSha256 -cnotmatch '\A[0-9a-f]{64}\z') {
         throw 'Expected evidence SHA-256 must be exactly 64 lowercase hexadecimal characters.'
     }
     $fullPath = [IO.Path]::GetFullPath($EvidencePath)
