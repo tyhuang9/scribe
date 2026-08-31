@@ -246,6 +246,10 @@ impl BackendTarget {
 }
 
 /// Current usability of one discovered backend target.
+#[allow(
+    dead_code,
+    reason = "provider and health integrations construct every state in later stacked stages"
+)]
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) enum CandidateAvailability {
     Available,
