@@ -200,7 +200,7 @@ mod tests {
         assert_eq!(
             LINUX_AUTO_QUALIFICATION_MANIFEST,
             concat!(
-                r#"{"schema_version":1,"mode":"default_deny","target_os":"linux","target_arch":"x86_64","entries":[]}"#,
+                r#"{"schema_version":2,"mode":"default_deny","target_os":"linux","target_arch":"x86_64","entries":[]}"#,
                 "\n"
             )
         );

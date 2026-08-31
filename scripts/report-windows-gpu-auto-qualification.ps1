@@ -55,7 +55,7 @@ function Test-DriverValue([string]$Value) {
 function Assert-Entry([hashtable]$Entry) {
     Assert-ExactKeys $Entry @(
         'pack', 'model_digest', 'backend', 'provider_id', 'vendor', 'device_class',
-        'minimum_total_memory_bytes', 'driver', 'evidence'
+        'minimum_total_memory_bytes', 'minimum_available_memory_bytes', 'driver', 'evidence'
     ) 'qualification entry'
     Assert-Condition ($Entry.pack -is [hashtable]) 'Qualification pack binding must be an object.'
     Assert-ExactKeys $Entry.pack @(
@@ -85,6 +85,9 @@ function Assert-Entry([hashtable]$Entry) {
     ) 'Qualification backend, provider, and vendor binding is invalid.'
     Assert-JsonInteger $Entry.minimum_total_memory_bytes 'Qualification minimum_total_memory_bytes'
     Assert-Condition ($Entry.minimum_total_memory_bytes -gt 0) 'Qualification minimum total memory must be positive.'
+    Assert-JsonInteger $Entry.minimum_available_memory_bytes 'Qualification minimum_available_memory_bytes'
+    Assert-Condition ($Entry.minimum_available_memory_bytes -gt 0) 'Qualification minimum available memory must be positive.'
+    Assert-Condition ($Entry.minimum_available_memory_bytes -le $Entry.minimum_total_memory_bytes) 'Qualification minimum available memory must not exceed total memory.'
     Assert-Condition ($Entry.driver -is [hashtable]) 'Qualification driver constraint must be an object.'
     Assert-ExactKeys $Entry.driver @('kind', 'value') 'qualification driver constraint'
     Assert-JsonString $Entry.driver.kind 'Qualification driver constraint kind'
@@ -138,6 +141,7 @@ function ConvertTo-CanonicalQualificationJson([hashtable]$Manifest) {
                 vendor = $entry.vendor
                 device_class = $entry.device_class
                 minimum_total_memory_bytes = $entry.minimum_total_memory_bytes
+                minimum_available_memory_bytes = $entry.minimum_available_memory_bytes
                 driver = [ordered]@{
                     kind = $entry.driver.kind
                     value = $entry.driver.value
@@ -187,7 +191,7 @@ Assert-JsonInteger $manifest.schema_version 'GPU Auto qualification schema_versi
 foreach ($field in @('mode', 'target_os', 'target_arch')) {
     Assert-JsonString $manifest[$field] "GPU Auto qualification $field"
 }
-Assert-Condition ($manifest.schema_version -eq 1) 'GPU Auto qualification schema_version must be 1.'
+Assert-Condition ($manifest.schema_version -eq 2) 'GPU Auto qualification schema_version must be 2.'
 Assert-Condition ($manifest.mode -ceq 'default_deny') 'GPU Auto qualification mode must be default_deny.'
 Assert-Condition ($manifest.target_os -ceq 'windows' -and $manifest.target_arch -ceq 'x86_64') 'GPU Auto qualification manifest must target Windows x64.'
 Assert-Condition ($manifest.entries -is [System.Array]) 'GPU Auto qualification entries must be an array.'
@@ -219,9 +223,10 @@ if ($canonicalEntries.Count -eq 0) {
 else {
     foreach ($entry in @($manifest.entries)) {
         $lines.Add((
-            'entry: backend={0} pack={1}@{2} digest={3} model={4} evidence={5} cold={6} warm={7} gpu_p95_ms={8} cpu_p95_ms={9}' -f `
+            'entry: backend={0} pack={1}@{2} digest={3} model={4} evidence={5} minimum_total_memory_bytes={6} minimum_available_memory_bytes={7} cold={8} warm={9} gpu_p95_ms={10} cpu_p95_ms={11}' -f `
             $entry.backend, $entry.pack.pack_id, $entry.pack.pack_version, $entry.pack.pack_digest,
-            $entry.model_digest, $entry.evidence.id, $entry.evidence.cold_runs, $entry.evidence.warm_runs,
+            $entry.model_digest, $entry.evidence.id, $entry.minimum_total_memory_bytes,
+            $entry.minimum_available_memory_bytes, $entry.evidence.cold_runs, $entry.evidence.warm_runs,
             $entry.evidence.gpu_p95_ms, $entry.evidence.cpu_p95_ms
         ))
     }

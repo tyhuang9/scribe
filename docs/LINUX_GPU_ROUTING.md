@@ -5,6 +5,16 @@ worker. The desktop does not link CUDA, Vulkan, or their discovery libraries.
 Linux production pack discovery, release trust, activation, packaging, and
 `Auto` eligibility remain disabled in this delivery unit.
 
+When a future approved Linux Auto pack is present, desktop admission reads only
+bounded kernel facts from `/sys/class/power_supply`. A confirmed online `Mains`
+supply is AC; a confirmed discharging **system** battery is battery. Peripheral
+`Battery` supplies marked `scope=Device` are ignored. Simultaneous online mains
+and a discharging system battery, or absent, unreadable, oversized, malformed,
+or otherwise ambiguous facts are `Unknown`. Unknown is fail-closed for discrete
+and unclassified GPUs while integrated and unified GPUs remain eligible for
+their separate signed qualification checks. No command,
+environment override, telemetry, or calibration is used.
+
 Every device that reaches the worker Hello is identified as
 `native:pci:dddd:bb:dd.f`, using lowercase fixed-width PCI domain, bus, device,
 and function fields. Nonzero PCI domains are preserved. A provider registry

@@ -59,6 +59,12 @@ mod linux_gpu_architecture_guard;
     reason = "Stage 7 records a fail-closed Linux GPU platform contract before worker routing exists"
 )]
 mod linux_gpu_runtime;
+#[cfg(any(target_os = "linux", test))]
+#[allow(
+    dead_code,
+    reason = "Linux Auto admission reads bounded power facts through a private test seam"
+)]
+mod linux_power;
 #[cfg(test)]
 mod linux_worker_architecture_guard;
 #[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]

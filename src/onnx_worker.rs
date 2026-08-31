@@ -24,6 +24,7 @@ use crate::backend_policy::{
 use crate::config;
 use crate::gpu_auto_qualification::{
     AUTO_QUALIFICATION_POLICY_VERSION, AutoQualificationPolicy, QualificationDecision,
+    QualificationDenial,
 };
 use crate::gpu_worker_pack::health::{
     FailureObservation, HealthCache, HealthDecision, HealthKey, HealthWitnesses, SystemClock,
@@ -2713,6 +2714,13 @@ fn bind_pack_hello(
     if capability.devices.is_empty() || capability.devices.len() > MAX_PACK_DEVICES {
         bail!("GPU worker Hello device list is empty or oversized");
     }
+    if capability
+        .devices
+        .iter()
+        .any(|device| device.memory_available_bytes > device.memory_total_bytes)
+    {
+        bail!("GPU worker Hello reported available memory above total memory");
+    }
     let mut prior = None;
     let mut process_indexes = Vec::with_capacity(capability.devices.len());
     for device in &capability.devices {
@@ -4234,6 +4242,80 @@ impl ProcessWorkerSupervisor {
             .current
             .as_ref()
             .map(|current| current.generation))
+    }
+
+    #[cfg(test)]
+    fn current_generation_is_running(&self) -> Result<bool> {
+        let process = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| anyhow!("process worker supervisor state lock was poisoned"))?
+            .current
+            .as_ref()
+            .map(|current| Arc::clone(&current.process));
+        match process {
+            Some(process) => process.is_running(),
+            None => Ok(false),
+        }
+    }
+
+    fn current_generation_has_active_model(&self, expected_identity: &str) -> Result<bool> {
+        let (process, matches_active_model) =
+            {
+                let state =
+                    self.inner.state.lock().map_err(|_| {
+                        anyhow!("process worker supervisor state lock was poisoned")
+                    })?;
+                let Some(current) = state.current.as_ref() else {
+                    return Ok(false);
+                };
+                (
+                    Arc::clone(&current.process),
+                    state.active_model.as_ref().is_some_and(
+                        |(loaded_generation, loaded_identity)| {
+                            *loaded_generation == current.generation
+                                && loaded_identity == expected_identity
+                        },
+                    ),
+                )
+            };
+        Ok(matches_active_model && process.is_running()?)
+    }
+
+    fn record_active_model(&self, generation: u64, identity: String) -> Result<()> {
+        let process = {
+            let state = self
+                .inner
+                .state
+                .lock()
+                .map_err(|_| anyhow!("process worker supervisor state lock was poisoned"))?;
+            let Some(current) = state
+                .current
+                .as_ref()
+                .filter(|current| current.generation == generation)
+            else {
+                bail!("process worker generation changed before model residency was recorded");
+            };
+            Arc::clone(&current.process)
+        };
+        if !process.is_running()? {
+            bail!("process worker generation exited before model residency was recorded");
+        }
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| anyhow!("process worker supervisor state lock was poisoned"))?;
+        if state
+            .current
+            .as_ref()
+            .is_none_or(|current| current.generation != generation)
+        {
+            bail!("process worker generation changed before model residency was recorded");
+        }
+        state.active_model = Some((generation, identity));
+        Ok(())
     }
 
     fn has_active_stream(&self) -> Result<bool> {
@@ -5906,6 +5988,34 @@ impl InferenceWorkerSupervisor {
             .max(1)
     }
 
+    #[cfg(test)]
+    fn has_live_generation(&self) -> bool {
+        self.transport
+            .current_generation_is_running()
+            .unwrap_or(false)
+    }
+
+    fn artifact_identity(
+        artifact: &RuntimeArtifact,
+        preference: AccelerationPreference,
+    ) -> Result<String, RuntimeError> {
+        let wire_artifact: WireRuntimeArtifact = artifact.clone().into();
+        wire_artifact_identity(&wire_artifact, preference).map_err(worker_unavailable)
+    }
+
+    fn has_loaded_artifact(
+        &self,
+        artifact: &RuntimeArtifact,
+        preference: AccelerationPreference,
+    ) -> bool {
+        let Ok(identity) = Self::artifact_identity(artifact, preference) else {
+            return false;
+        };
+        self.transport
+            .current_generation_has_active_model(&identity)
+            .unwrap_or(false)
+    }
+
     pub(crate) fn load(
         &self,
         artifact: RuntimeArtifact,
@@ -5919,12 +6029,15 @@ impl InferenceWorkerSupervisor {
             .transport
             .generation_context()
             .map_err(worker_unavailable)?;
+        let artifact: WireRuntimeArtifact = artifact.into();
+        let artifact_identity =
+            wire_artifact_identity(&artifact, preference).map_err(worker_unavailable)?;
         let correlation = self.next_id();
         let frame = control_frame(
             correlation,
             correlation,
             &Control::LoadRuntime {
-                artifact: artifact.into(),
+                artifact,
                 preference,
             },
         )
@@ -5946,6 +6059,9 @@ impl InferenceWorkerSupervisor {
                     &context.pack_bindings,
                     &mut execution.diagnostics.resolved_acceleration,
                 )?;
+                self.transport
+                    .record_active_model(context.generation, artifact_identity)
+                    .map_err(worker_unavailable)?;
                 Ok(execution)
             }
             Control::RuntimeFailed { error } => {
@@ -5987,6 +6103,9 @@ impl InferenceWorkerSupervisor {
             .generation_context()
             .map_err(worker_unavailable)?;
         let generation = context.generation;
+        let artifact: WireRuntimeArtifact = artifact.into();
+        let artifact_identity =
+            wire_artifact_identity(&artifact, preference).map_err(worker_unavailable)?;
         if cancelled() {
             let _ = self.transport.invalidate_generation(
                 generation,
@@ -6003,7 +6122,7 @@ impl InferenceWorkerSupervisor {
             session_id,
             begin_id,
             &Control::BeginBatch {
-                artifact: artifact.into(),
+                artifact,
                 preference,
                 options,
                 source_sample_rate: audio.source_sample_rate,
@@ -6024,7 +6143,10 @@ impl InferenceWorkerSupervisor {
             )
             .map_err(worker_unavailable)?
         {
-            Control::Ok => {}
+            Control::Ok => self
+                .transport
+                .record_active_model(generation, artifact_identity)
+                .map_err(worker_unavailable)?,
             Control::RuntimeFailed { error } => {
                 return Err(error.into_runtime_for_generation(&self.transport, generation));
             }
@@ -6277,6 +6399,10 @@ struct InferenceWorkerRoutePlan {
     health: Option<GpuRouteHealth>,
     selection_power_source: Option<PowerSource>,
     skipped_targets: Vec<SkippedBackend>,
+    // This owns a fresh Hello result only for the lifetime of the current
+    // request. It may be retained after the matching route becomes the live
+    // warm owner, but never becomes a stable device or health identity.
+    auto_live_admission: Option<VerifiedGpuRouteCatalog>,
 }
 
 #[derive(Clone)]
@@ -6290,6 +6416,10 @@ struct VerifiedGpuRouteCatalog {
 }
 
 const GPU_PROVIDER_PROBE_BACKOFF: Duration = Duration::from_secs(15);
+// Available memory is a live admission fact. Keep a denial only long enough
+// to prevent repeated CPU requests from restarting provider processes, never
+// as a durable route or device identity.
+const AUTO_VOLATILE_ADMISSION_BACKOFF: Duration = Duration::from_secs(5);
 const MAX_INFERENCE_ROUTE_ATTEMPTS: usize = 4;
 
 #[derive(Clone)]
@@ -6300,10 +6430,26 @@ struct FailedGpuProbe {
     explicit_retry_available: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AutoAdmissionWitness {
+    power_source: PowerSource,
+    available_memory_denied: bool,
+    power_policy_denied: bool,
+}
+
+#[derive(Clone)]
+struct AutoAdmissionBackoff {
+    discovery_fingerprint: String,
+    witness: AutoAdmissionWitness,
+    retry_not_before: Instant,
+    diagnostic: Option<String>,
+}
+
 #[derive(Default)]
 struct GpuRouteCatalogCache {
     successful: Option<VerifiedGpuRouteCatalog>,
     failed: Option<FailedGpuProbe>,
+    auto_admission_backoff: Option<AutoAdmissionBackoff>,
 }
 
 enum GpuRouteCatalogLookup {
@@ -6314,9 +6460,13 @@ enum GpuRouteCatalogLookup {
 
 impl GpuRouteCatalogCache {
     fn lookup(&self, discovery_fingerprint: &str, now: Instant) -> GpuRouteCatalogLookup {
-        let successful = self.successful.as_ref().filter(|catalog| {
-            !catalog.routes.is_empty() && catalog.discovery_fingerprint == discovery_fingerprint
-        });
+        let successful = self
+            .successful
+            .as_ref()
+            .filter(|catalog| {
+                !catalog.routes.is_empty() && catalog.discovery_fingerprint == discovery_fingerprint
+            })
+            .cloned();
         if let Some(failed) = self
             .failed
             .as_ref()
@@ -6327,7 +6477,7 @@ impl GpuRouteCatalogCache {
             }
             return successful.map_or_else(
                 || GpuRouteCatalogLookup::Backoff(failed.diagnostic.clone()),
-                |catalog| GpuRouteCatalogLookup::Successful(catalog.clone()),
+                GpuRouteCatalogLookup::Successful,
             );
         }
         if let Some(catalog) = successful {
@@ -6352,6 +6502,123 @@ impl GpuRouteCatalogCache {
         }
     }
 
+    /// A successful Auto catalog is valid only while it names the exact
+    /// already-running warm owner. A stable route identity and supervisor
+    /// pointer bind that temporary reuse; available memory is never used as
+    /// an identity, fingerprint, or persisted value.
+    fn auto_live_admission_lookup(
+        &mut self,
+        discovery_fingerprint: &str,
+        active: Option<&ActiveInferenceRoute>,
+        power_source: PowerSource,
+        now: Instant,
+    ) -> GpuRouteCatalogLookup {
+        let successful = self
+            .successful
+            .as_ref()
+            .filter(|catalog| {
+                !catalog.routes.is_empty()
+                    && catalog.discovery_fingerprint == discovery_fingerprint
+                    && active.is_some_and(|active| {
+                        catalog.routes.iter().any(|route| {
+                            InferenceWorkerRegistry::route_identity(route) == active.identity
+                                && InferenceWorkerRegistry::same_supervisor(
+                                    &route.supervisor,
+                                    &active.supervisor,
+                                )
+                        })
+                    })
+            })
+            .cloned();
+        if successful.is_none() {
+            self.successful = None;
+        }
+        // Never retire or reprobe the exact live warm winner merely because a
+        // different provider's partial probe backoff elapsed. That retry is
+        // deferred until the winner changes or retires.
+        if let Some(successful) = successful {
+            return GpuRouteCatalogLookup::Successful(successful);
+        }
+        if let Some(backoff) = self.auto_admission_backoff.clone() {
+            if backoff.discovery_fingerprint != discovery_fingerprint
+                || backoff.witness.power_source != power_source
+            {
+                // A pack/model discovery or power-fact transition invalidates
+                // this volatile denial witness and reopens bounded Hello.
+                self.auto_admission_backoff = None;
+            } else if now < backoff.retry_not_before {
+                return GpuRouteCatalogLookup::Backoff(backoff.diagnostic.clone());
+            } else {
+                self.auto_admission_backoff = None;
+            }
+        }
+        if let Some(failed) = self
+            .failed
+            .as_ref()
+            .filter(|failed| failed.discovery_fingerprint == discovery_fingerprint)
+        {
+            if now >= failed.retry_not_before {
+                return GpuRouteCatalogLookup::Probe;
+            }
+            return GpuRouteCatalogLookup::Backoff(failed.diagnostic.clone());
+        }
+        GpuRouteCatalogLookup::Probe
+    }
+
+    fn record_auto_live_admission_probe(
+        &mut self,
+        catalog: &VerifiedGpuRouteCatalog,
+        now: Instant,
+    ) {
+        let retry_required = catalog.routes.is_empty() || catalog.provider_probe_incomplete;
+        self.failed = retry_required.then(|| FailedGpuProbe {
+            discovery_fingerprint: catalog.discovery_fingerprint.clone(),
+            retry_not_before: now + GPU_PROVIDER_PROBE_BACKOFF,
+            diagnostic: catalog.diagnostic.clone(),
+            explicit_retry_available: false,
+        });
+        // A fresh probe is not yet a warm owner. Keep no successful snapshot
+        // until `retain_auto_live_admission` verifies the exact active route.
+        self.successful = None;
+        self.auto_admission_backoff = None;
+    }
+
+    fn record_auto_admission_backoff(
+        &mut self,
+        discovery_fingerprint: &str,
+        witness: AutoAdmissionWitness,
+        diagnostic: Option<String>,
+        now: Instant,
+    ) {
+        self.auto_admission_backoff = Some(AutoAdmissionBackoff {
+            discovery_fingerprint: discovery_fingerprint.to_owned(),
+            witness,
+            retry_not_before: now + AUTO_VOLATILE_ADMISSION_BACKOFF,
+            diagnostic,
+        });
+    }
+
+    fn retain_auto_live_admission(
+        &mut self,
+        catalog: &VerifiedGpuRouteCatalog,
+        active: &ActiveInferenceRoute,
+    ) {
+        if !catalog.routes.is_empty()
+            && catalog.routes.iter().any(|route| {
+                InferenceWorkerRegistry::route_identity(route) == active.identity
+                    && InferenceWorkerRegistry::same_supervisor(
+                        &route.supervisor,
+                        &active.supervisor,
+                    )
+            })
+        {
+            self.successful = Some(catalog.clone());
+            self.auto_admission_backoff = None;
+        } else {
+            self.successful = None;
+        }
+    }
+
     fn grant_explicit_probe_retry(&mut self, discovery_fingerprint: &str, now: Instant) -> bool {
         let Some(failed) = self.failed.as_mut().filter(|failed| {
             failed.discovery_fingerprint == discovery_fingerprint && failed.explicit_retry_available
@@ -6370,6 +6637,7 @@ impl GpuRouteCatalogCache {
     fn invalidate_after_runtime_failure(&mut self) {
         self.successful = None;
         self.failed = None;
+        self.auto_admission_backoff = None;
     }
 }
 
@@ -6592,7 +6860,7 @@ fn auto_gpu_discovery_fingerprint(
     model_digest: &str,
 ) -> String {
     let mut digest = Sha256::new();
-    update_health_digest(&mut digest, "auto-qualification-v1");
+    update_health_digest(&mut digest, "auto-qualification-v2");
     update_health_digest(&mut digest, &policy.policy_version().to_string());
     update_health_digest(&mut digest, &policy.manifest_digest());
     update_health_digest(&mut digest, model_digest);
@@ -6891,15 +7159,23 @@ fn verified_gpu_route_catalog(
     }
 }
 
-fn auto_qualified_gpu_route_catalog(
+struct AutoQualifiedGpuRouteCatalog {
+    catalog: VerifiedGpuRouteCatalog,
+    volatile_admission_witness: Option<AutoAdmissionWitness>,
+}
+
+fn auto_qualified_gpu_route_catalog_with_admission(
     mut catalog: VerifiedGpuRouteCatalog,
     policy: &AutoQualificationPolicy,
     model_digest: &str,
     power_source: PowerSource,
-) -> VerifiedGpuRouteCatalog {
+) -> AutoQualifiedGpuRouteCatalog {
     let mut qualified_routes = Vec::with_capacity(catalog.routes.len());
     let mut qualification_denied = 0_usize;
+    let mut available_memory_denied = 0_usize;
+    let mut nonvolatile_qualification_denied = 0_usize;
     let mut battery_denied = 0_usize;
+    let mut unknown_power_denied = 0_usize;
     let mut qualification_diagnostic = None;
     for route in catalog.routes.iter() {
         let Some(target) = route.target.as_ref() else {
@@ -6913,8 +7189,18 @@ fn auto_qualified_gpu_route_catalog(
                 qualified.auto_evidence_id = Some(evidence_id);
                 qualified_routes.push(qualified);
             }
-            denied @ QualificationDecision::Denied(_) => {
+            denied @ QualificationDecision::Denied(reason) => {
                 qualification_denied = qualification_denied.saturating_add(1);
+                if matches!(
+                    reason,
+                    QualificationDenial::InvalidAvailableMemory
+                        | QualificationDenial::InsufficientAvailableMemory
+                ) {
+                    available_memory_denied = available_memory_denied.saturating_add(1);
+                } else {
+                    nonvolatile_qualification_denied =
+                        nonvolatile_qualification_denied.saturating_add(1);
+                }
                 qualification_diagnostic.get_or_insert_with(|| denied.diagnostic());
                 catalog.skipped_targets.push(SkippedBackend {
                     target: target.clone(),
@@ -6925,23 +7211,41 @@ fn auto_qualified_gpu_route_catalog(
     }
     let mut routes = Vec::with_capacity(qualified_routes.len());
     for route in qualified_routes {
-        let battery_eligible = power_source != PowerSource::Battery
+        let power_eligible = power_source == PowerSource::Ac
             || route
                 .target
                 .as_ref()
                 .is_some_and(|target| target.device_class.is_battery_eligible_gpu());
-        if battery_eligible {
+        if power_eligible {
             routes.push(route);
         } else {
-            battery_denied = battery_denied.saturating_add(1);
+            if power_source == PowerSource::Battery {
+                battery_denied = battery_denied.saturating_add(1);
+            } else {
+                unknown_power_denied = unknown_power_denied.saturating_add(1);
+            }
             if let Some(target) = route.target.clone() {
                 catalog.skipped_targets.push(SkippedBackend {
                     target,
-                    reason: BackendSkipReason::BatteryPolicy,
+                    reason: if power_source == PowerSource::Battery {
+                        BackendSkipReason::BatteryPolicy
+                    } else {
+                        BackendSkipReason::UnknownPowerSource
+                    },
                 });
             }
         }
     }
+    let power_policy_denied = battery_denied.saturating_add(unknown_power_denied);
+    let volatile_admission_witness = (!catalog.routes.is_empty()
+        && routes.is_empty()
+        && nonvolatile_qualification_denied == 0
+        && (available_memory_denied != 0 || power_policy_denied != 0))
+        .then_some(AutoAdmissionWitness {
+            power_source,
+            available_memory_denied: available_memory_denied != 0,
+            power_policy_denied: power_policy_denied != 0,
+        });
     catalog.routes = Arc::new(routes);
     if qualification_denied != 0 {
         append_route_plan_diagnostic(
@@ -6963,7 +7267,29 @@ fn auto_qualified_gpu_route_catalog(
             ),
         );
     }
-    catalog
+    if unknown_power_denied != 0 {
+        append_route_plan_diagnostic(
+            &mut catalog.diagnostic,
+            &format!(
+                "{unknown_power_denied} discrete or unclassified GPU route(s) were excluded because the power source is unknown"
+            ),
+        );
+    }
+    AutoQualifiedGpuRouteCatalog {
+        catalog,
+        volatile_admission_witness,
+    }
+}
+
+#[cfg(test)]
+fn auto_qualified_gpu_route_catalog(
+    catalog: VerifiedGpuRouteCatalog,
+    policy: &AutoQualificationPolicy,
+    model_digest: &str,
+    power_source: PowerSource,
+) -> VerifiedGpuRouteCatalog {
+    auto_qualified_gpu_route_catalog_with_admission(catalog, policy, model_digest, power_source)
+        .catalog
 }
 
 fn auto_gpu_route_plan(
@@ -6973,10 +7299,16 @@ fn auto_gpu_route_plan(
     model_digest: &str,
     health_path: Option<&Arc<PathBuf>>,
     allow_unprobed_idle_health: bool,
-) -> InferenceWorkerRoutePlan {
-    let selection_power_source = PowerSource::current();
-    let catalog =
-        auto_qualified_gpu_route_catalog(catalog, policy, model_digest, selection_power_source);
+    selection_power_source: PowerSource,
+) -> (InferenceWorkerRoutePlan, Option<AutoAdmissionWitness>) {
+    let qualified = auto_qualified_gpu_route_catalog_with_admission(
+        catalog,
+        policy,
+        model_digest,
+        selection_power_source,
+    );
+    let catalog = qualified.catalog;
+    let auto_live_admission = (!catalog.routes.is_empty()).then(|| catalog.clone());
     let mut plan = health_filtered_gpu_route_plan(
         catalog,
         model_digest,
@@ -6984,8 +7316,41 @@ fn auto_gpu_route_plan(
         allow_unprobed_idle_health,
     );
     plan.selection_power_source = Some(selection_power_source);
+    plan.auto_live_admission = auto_live_admission;
     reserve_auto_cpu_fallback(&mut plan, &cpu_routes);
-    plan
+    (plan, qualified.volatile_admission_witness)
+}
+
+fn auto_route_is_power_eligible(route: &InferenceWorkerRoute, power_source: PowerSource) -> bool {
+    power_source == PowerSource::Ac
+        || !route.provider.is_gpu()
+        || route
+            .target
+            .as_ref()
+            .is_some_and(|target| target.device_class.is_battery_eligible_gpu())
+}
+
+fn auto_power_skip_reason(power_source: PowerSource) -> BackendSkipReason {
+    match power_source {
+        PowerSource::Battery => BackendSkipReason::BatteryPolicy,
+        PowerSource::Unknown => BackendSkipReason::UnknownPowerSource,
+        PowerSource::Ac => unreachable!("AC allows every qualified Auto GPU route"),
+    }
+}
+
+fn auto_pre_execution_power_source(selection_power_source: Option<PowerSource>) -> PowerSource {
+    // Tests provide the selection observation as a deterministic fact seam.
+    // Production always obtains a fresh operating-system fact directly before
+    // a discrete/unclassified Auto GPU can execute.
+    #[cfg(test)]
+    {
+        selection_power_source.unwrap_or_else(PowerSource::current)
+    }
+    #[cfg(not(test))]
+    {
+        let _ = selection_power_source;
+        PowerSource::current()
+    }
 }
 
 fn reserve_auto_cpu_fallback(
@@ -7038,6 +7403,7 @@ fn health_filtered_gpu_route_plan(
             health: None,
             selection_power_source: None,
             skipped_targets: catalog.skipped_targets,
+            auto_live_admission: None,
         };
     }
     let Some(path) = health_path else {
@@ -7059,6 +7425,7 @@ fn health_filtered_gpu_route_plan(
             health: None,
             selection_power_source: None,
             skipped_targets,
+            auto_live_admission: None,
         };
     };
     let health = GpuRouteHealth {
@@ -7142,6 +7509,7 @@ fn health_filtered_gpu_route_plan(
         health: Some(health),
         selection_power_source: None,
         skipped_targets,
+        auto_live_admission: None,
     }
 }
 
@@ -7275,6 +7643,61 @@ impl InferenceWorkerRegistry {
         Arc::ptr_eq(&left.transport.inner, &right.transport.inner)
     }
 
+    fn active_warm_auto_route(&self, artifact: &RuntimeArtifact) -> Option<ActiveInferenceRoute> {
+        self.active_route
+            .lock()
+            .ok()?
+            .as_ref()
+            .filter(|active| active.identity.backend != BackendKind::Cpu)
+            .filter(|active| {
+                active
+                    .supervisor
+                    .has_loaded_artifact(artifact, AccelerationPreference::Gpu)
+            })
+            .cloned()
+    }
+
+    fn clear_auto_live_admission(&self) {
+        if let Ok(mut cache) = self.auto_gpu_routes.lock() {
+            cache.successful = None;
+        }
+    }
+
+    fn retain_auto_live_admission(
+        &self,
+        catalog: &VerifiedGpuRouteCatalog,
+        route: &InferenceWorkerRoute,
+        artifact: &RuntimeArtifact,
+    ) -> Result<(), RuntimeError> {
+        if !route.provider.is_gpu() {
+            return Ok(());
+        }
+        let active = self
+            .active_route
+            .lock()
+            .map_err(|_| {
+                RuntimeError::WorkerUnavailable("active inference route lock poisoned".to_owned())
+            })?
+            .clone();
+        let Some(active) = active.filter(|active| {
+            active.identity == Self::route_identity(route)
+                && Self::same_supervisor(&active.supervisor, &route.supervisor)
+                && active
+                    .supervisor
+                    .has_loaded_artifact(artifact, AccelerationPreference::Gpu)
+        }) else {
+            self.clear_auto_live_admission();
+            return Ok(());
+        };
+        self.auto_gpu_routes
+            .lock()
+            .map_err(|_| {
+                RuntimeError::WorkerUnavailable("Auto GPU worker registry lock poisoned".to_owned())
+            })?
+            .retain_auto_live_admission(catalog, &active);
+        Ok(())
+    }
+
     fn retire_active_worker(&self) -> Result<(), RuntimeError> {
         let active = self
             .active_route
@@ -7283,6 +7706,7 @@ impl InferenceWorkerRegistry {
                 RuntimeError::WorkerUnavailable("active inference route lock poisoned".to_owned())
             })?
             .take();
+        self.clear_auto_live_admission();
         if let Some(active) = active {
             active.supervisor.retire()?;
         }
@@ -7304,6 +7728,7 @@ impl InferenceWorkerRegistry {
                 .flatten()
         };
         let route_retirement = route.supervisor.retire();
+        self.clear_auto_live_admission();
         let active_retirement = if active_gpu
             .as_ref()
             .is_some_and(|active| !Self::same_supervisor(&active.supervisor, &route.supervisor))
@@ -7379,6 +7804,7 @@ impl InferenceWorkerRegistry {
                 .retire()
                 .map_err(RoutePreparationError::Fatal)?;
         }
+        self.clear_auto_live_admission();
         // Discovery, cache lookup, and retiring a prior route can take time.
         // Recheck directly before publication. An epoch advanced after this
         // boundary belongs to the next request; active work is never migrated.
@@ -7430,6 +7856,7 @@ impl InferenceWorkerRegistry {
                 health: None,
                 selection_power_source: None,
                 skipped_targets: Vec::new(),
+                auto_live_admission: None,
             });
         }
         if preference == AccelerationPreference::Auto {
@@ -7443,6 +7870,7 @@ impl InferenceWorkerRegistry {
                     health: None,
                     selection_power_source: None,
                     skipped_targets: Vec::new(),
+                    auto_live_admission: None,
                 });
             };
             #[cfg(test)]
@@ -7453,6 +7881,7 @@ impl InferenceWorkerRegistry {
                     health: None,
                     selection_power_source: Some(PowerSource::Ac),
                     skipped_targets: catalog.skipped_targets.clone(),
+                    auto_live_admission: None,
                 };
                 reserve_auto_cpu_fallback(&mut plan, &self.routes);
                 return Ok(plan);
@@ -7468,6 +7897,7 @@ impl InferenceWorkerRegistry {
                         health: None,
                         selection_power_source: None,
                         skipped_targets: Vec::new(),
+                        auto_live_admission: None,
                     });
                 }
             };
@@ -7491,18 +7921,29 @@ impl InferenceWorkerRegistry {
                     health: None,
                     selection_power_source: None,
                     skipped_targets: Vec::new(),
+                    auto_live_admission: None,
                 });
             }
             let discovery_fingerprint =
                 auto_gpu_discovery_fingerprint(&discovery, policy, &model.expected_sha256);
+            // This selection-time fact is also the volatile admission witness.
+            // Execution obtains a fresh fact again immediately before a GPU
+            // starts work, so this short cache can never authorize a route.
+            let selection_power_source = PowerSource::current();
             let lookup_at = Instant::now();
+            let active_warm_route = self.active_warm_auto_route(artifact);
             let cached_catalog = {
-                let cached = self.auto_gpu_routes.lock().map_err(|_| {
+                let mut cached = self.auto_gpu_routes.lock().map_err(|_| {
                     RuntimeError::WorkerUnavailable(
                         "Auto GPU worker registry lock poisoned".to_owned(),
                     )
                 })?;
-                cached.lookup(&discovery_fingerprint, lookup_at)
+                cached.auto_live_admission_lookup(
+                    &discovery_fingerprint,
+                    active_warm_route.as_ref(),
+                    selection_power_source,
+                    lookup_at,
+                )
             };
             let catalog = match cached_catalog {
                 GpuRouteCatalogLookup::Successful(cached) => cached,
@@ -7510,7 +7951,7 @@ impl InferenceWorkerRegistry {
                     routes: Arc::new(Vec::new()),
                     diagnostic,
                     device_set_digest: verified_gpu_device_set_digest(&[]),
-                    discovery_fingerprint,
+                    discovery_fingerprint: discovery_fingerprint.clone(),
                     provider_probe_incomplete: true,
                     skipped_targets: Vec::new(),
                 },
@@ -7518,7 +7959,7 @@ impl InferenceWorkerRegistry {
                     self.retire_active_worker()?;
                     let discovered = verified_gpu_route_catalog(
                         discover_production_pack_launch_bindings(discovery),
-                        discovery_fingerprint,
+                        discovery_fingerprint.clone(),
                     );
                     let probe_completed_at = Instant::now();
                     self.auto_gpu_routes
@@ -7528,18 +7969,35 @@ impl InferenceWorkerRegistry {
                                 "Auto GPU worker registry lock poisoned".to_owned(),
                             )
                         })?
-                        .record_probe(discovered.clone(), probe_completed_at);
+                        .record_auto_live_admission_probe(&discovered, probe_completed_at);
                     discovered
                 }
             };
-            return Ok(auto_gpu_route_plan(
+            let (plan, volatile_admission_witness) = auto_gpu_route_plan(
                 Arc::clone(&self.routes),
                 catalog,
                 policy,
                 &model.expected_sha256,
                 self.gpu_health_path.as_ref(),
                 allow_unprobed_idle_health,
-            ));
+                selection_power_source,
+            );
+            if let Some(witness) = volatile_admission_witness {
+                self.auto_gpu_routes
+                    .lock()
+                    .map_err(|_| {
+                        RuntimeError::WorkerUnavailable(
+                            "Auto GPU worker registry lock poisoned".to_owned(),
+                        )
+                    })?
+                    .record_auto_admission_backoff(
+                        &discovery_fingerprint,
+                        witness,
+                        plan.diagnostic.clone(),
+                        Instant::now(),
+                    );
+            }
+            return Ok(plan);
         }
         let RuntimeArtifact::Gguf(model) = artifact else {
             return Ok(InferenceWorkerRoutePlan {
@@ -7550,6 +8008,7 @@ impl InferenceWorkerRegistry {
                 health: None,
                 selection_power_source: None,
                 skipped_targets: Vec::new(),
+                auto_live_admission: None,
             });
         };
 
@@ -7569,6 +8028,7 @@ impl InferenceWorkerRegistry {
                 health: None,
                 selection_power_source: None,
                 skipped_targets: catalog.skipped_targets.clone(),
+                auto_live_admission: None,
             });
         }
 
@@ -7727,7 +8187,8 @@ impl InferenceWorkerRegistry {
             power_source,
             power_policy: match power_source {
                 PowerSource::Battery => PowerPolicyDecision::BatteryEfficientGpuOnly,
-                PowerSource::Ac | PowerSource::Unknown => PowerPolicyDecision::Unrestricted,
+                PowerSource::Unknown => PowerPolicyDecision::UnknownConservativeGpuOnly,
+                PowerSource::Ac => PowerPolicyDecision::Unrestricted,
             },
             qualification_policy_version: AUTO_QUALIFICATION_POLICY_VERSION,
             fallback_targets,
@@ -7753,6 +8214,8 @@ impl InferenceWorkerRegistry {
         let mut fallback_history = Vec::new();
         let mut attempted = false;
         let plan = self.routes_for_preference(preference, &artifact)?;
+        let mut execution_skipped_targets = plan.skipped_targets.clone();
+        let mut execution_power_source = plan.selection_power_source;
         if plan.routes.is_empty() {
             self.retire_active_worker()?;
         }
@@ -7768,6 +8231,20 @@ impl InferenceWorkerRegistry {
                 .is_some_and(|health| !health.consume_retry(route))
             {
                 continue;
+            }
+            if preference == AccelerationPreference::Auto && route.provider.is_gpu() {
+                let power_source = auto_pre_execution_power_source(plan.selection_power_source);
+                if !auto_route_is_power_eligible(route, power_source) {
+                    if let Some(target) = route.target.clone() {
+                        execution_skipped_targets.push(SkippedBackend {
+                            target,
+                            reason: auto_power_skip_reason(power_source),
+                        });
+                    }
+                    execution_power_source = Some(power_source);
+                    continue;
+                }
+                execution_power_source = Some(power_source);
             }
             attempted = true;
             match self.prepare_route(route) {
@@ -7793,18 +8270,20 @@ impl InferenceWorkerRegistry {
             ) {
                 Ok(mut execution) => {
                     if preference == AccelerationPreference::Auto {
+                        if let Some(catalog) = plan.auto_live_admission.as_ref() {
+                            self.retain_auto_live_admission(catalog, route, &artifact)?;
+                        }
                         Self::project_auto_route_diagnostics(
                             &mut execution.diagnostics,
                             route,
-                            plan.selection_power_source
-                                .unwrap_or_else(PowerSource::current),
+                            execution_power_source.unwrap_or_else(PowerSource::current),
                             plan.routes
                                 .iter()
                                 .skip(route_index + 1)
                                 .filter_map(|candidate| candidate.target.clone())
                                 .collect(),
                             &fallback_history,
-                            &plan.skipped_targets,
+                            &execution_skipped_targets,
                         );
                     }
                     if matches!(artifact, RuntimeArtifact::Gguf(_)) {
@@ -7905,6 +8384,8 @@ impl InferenceWorkerRegistry {
         let mut fallback_history = Vec::new();
         let mut attempted = false;
         let plan = self.routes_for_preference(preference, &artifact)?;
+        let mut execution_skipped_targets = plan.skipped_targets.clone();
+        let mut execution_power_source = plan.selection_power_source;
         if plan.routes.is_empty() {
             self.retire_active_worker()?;
         }
@@ -7920,6 +8401,20 @@ impl InferenceWorkerRegistry {
                 .is_some_and(|health| !health.consume_retry(route))
             {
                 continue;
+            }
+            if preference == AccelerationPreference::Auto && route.provider.is_gpu() {
+                let power_source = auto_pre_execution_power_source(plan.selection_power_source);
+                if !auto_route_is_power_eligible(route, power_source) {
+                    if let Some(target) = route.target.clone() {
+                        execution_skipped_targets.push(SkippedBackend {
+                            target,
+                            reason: auto_power_skip_reason(power_source),
+                        });
+                    }
+                    execution_power_source = Some(power_source);
+                    continue;
+                }
+                execution_power_source = Some(power_source);
             }
             attempted = true;
             match self.prepare_route(route) {
@@ -7949,18 +8444,20 @@ impl InferenceWorkerRegistry {
             ) {
                 Ok(mut execution) => {
                     if preference == AccelerationPreference::Auto {
+                        if let Some(catalog) = plan.auto_live_admission.as_ref() {
+                            self.retain_auto_live_admission(catalog, route, &artifact)?;
+                        }
                         Self::project_auto_route_diagnostics(
                             &mut execution.diagnostics,
                             route,
-                            plan.selection_power_source
-                                .unwrap_or_else(PowerSource::current),
+                            execution_power_source.unwrap_or_else(PowerSource::current),
                             plan.routes
                                 .iter()
                                 .skip(route_index + 1)
                                 .filter_map(|candidate| candidate.target.clone())
                                 .collect(),
                             &fallback_history,
-                            &plan.skipped_targets,
+                            &execution_skipped_targets,
                         );
                     }
                     if matches!(artifact, RuntimeArtifact::Gguf(_)) {
@@ -8095,6 +8592,19 @@ impl InferenceWorkerRegistry {
             {
                 continue;
             }
+            // Re-read the operating-system power fact immediately before a
+            // battery-ineligible Auto GPU can begin work. If it changed since
+            // selection, leave the current worker untouched and use the
+            // bounded remaining candidates instead.
+            if preference == AccelerationPreference::Auto
+                && route.provider.is_gpu()
+                && !auto_route_is_power_eligible(
+                    route,
+                    auto_pre_execution_power_source(plan.selection_power_source),
+                )
+            {
+                continue;
+            }
             attempted = true;
             match self.prepare_route(route) {
                 Ok(()) => {}
@@ -8116,6 +8626,11 @@ impl InferenceWorkerRegistry {
                 Self::worker_preference_for_route(route, preference),
             ) {
                 Ok(()) => {
+                    if preference == AccelerationPreference::Auto
+                        && let Some(catalog) = plan.auto_live_admission.as_ref()
+                    {
+                        self.retain_auto_live_admission(catalog, route, &artifact)?;
+                    }
                     if let Some(health) = &plan.health {
                         health.record_idle_probe_success(route);
                     }
@@ -9817,6 +10332,7 @@ mod tests {
             pcm_kind: bool,
         },
         RuntimeFailureOnLoad(RuntimeError),
+        RuntimeLoad,
         RuntimeLoadThenExit,
         VadNormal,
         VadCrashOnWindow,
@@ -10219,6 +10735,35 @@ mod tests {
                         error: WireRuntimeError::from_runtime(&error),
                     },
                 );
+            }
+            TestMode::RuntimeLoad => {
+                let (session_id, request_id, control) = read_parent_control(&mut input);
+                let Control::LoadRuntime { preference, .. } = control else {
+                    panic!("expected runtime load request");
+                };
+                respond(
+                    &mut output,
+                    session_id,
+                    request_id,
+                    Control::RuntimeLoaded {
+                        execution: WireRuntimeLoadExecution {
+                            diagnostics: WireRuntimeDiagnostics {
+                                resolved_acceleration: ResolvedAcceleration {
+                                    requested: preference,
+                                    resolved: ComputeDevice::Cpu,
+                                    diagnostic: None,
+                                    selection: None,
+                                },
+                                runtime_location: PathBuf::from("test-worker-runtime"),
+                                warm_reused: false,
+                                model_load_duration_ms: 1,
+                            },
+                            detected_architecture: "test-runtime".to_owned(),
+                            capabilities: RuntimeCapabilities::default(),
+                        },
+                    },
+                );
+                run_normal_worker(&mut input, &mut output);
             }
             TestMode::RuntimeLoadThenExit => {
                 let (session_id, request_id, control) = read_parent_control(&mut input);
@@ -10732,9 +11277,24 @@ mod tests {
         let mut changed_driver = capability.clone();
         changed_driver.devices[0].driver_version = Some("fixture-driver-2".to_owned());
         assert!(bind_pack_hello(&context, &changed_driver).is_err());
+        let mut unknown_available_memory = capability.clone();
+        unknown_available_memory.devices[0].memory_available_bytes = 0;
+        let binding = bind_pack_hello(&context, &unknown_available_memory)
+            .expect("explicit GPU may attempt a valid Hello with unknown available memory");
+        assert_eq!(binding[0].backend_target().memory_available_bytes, 0);
+        let mut impossible_available_memory = capability.clone();
+        impossible_available_memory.devices[0].memory_available_bytes =
+            impossible_available_memory.devices[0].memory_total_bytes + 1;
+        assert!(
+            bind_pack_hello(&context, &impossible_available_memory)
+                .unwrap_err()
+                .to_string()
+                .contains("available memory above total memory")
+        );
         let mut wrong_device = capability;
         wrong_device.devices[0].stable_device_identity = "native:pci:0000:02:00.0".to_owned();
         assert!(bind_pack_hello(&context, &wrong_device).is_err());
+        drop(binding);
         drop(bindings);
         drop(context);
         std::fs::remove_dir_all(root).unwrap();
@@ -11450,7 +12010,10 @@ mod tests {
         let mut target = backend_target(backend, identity, Some(0));
         target.driver_version = Some(driver.to_owned());
         target.pack = Some(crate::backend_policy::BackendPackIdentity {
-            pack_id: format!("scribe-{}-windows-x64", backend.label()),
+            pack_id: format!(
+                "scribe-{}-windows-x64",
+                backend.label().to_ascii_lowercase()
+            ),
             pack_version: "1.0.0".to_owned(),
             pack_digest: pack_digest.to_string().repeat(64),
             security_epoch: 1,
@@ -11530,7 +12093,7 @@ mod tests {
         };
         let string = |value: &str| serde_json::to_string(value).unwrap();
         let manifest = format!(
-            "{{\"schema_version\":1,\"mode\":\"default_deny\",\"target_os\":\"windows\",\"target_arch\":\"x86_64\",\"entries\":[{{\"pack\":{{\"pack_id\":{},\"pack_version\":{},\"pack_digest\":{},\"security_epoch\":{},\"runtime_abi\":{}}},\"model_digest\":{},\"backend\":{},\"provider_id\":{},\"vendor\":{},\"device_class\":{},\"minimum_total_memory_bytes\":{},\"driver\":{{\"kind\":\"exact\",\"value\":{}}},\"evidence\":{{\"id\":{},\"cold_runs\":5,\"warm_runs\":20,\"gpu_p95_ms\":110,\"cpu_p95_ms\":100,\"correctness_verified\":true,\"reliability_verified\":true,\"cold_evidence_sha256\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"warm_evidence_sha256\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"transcript_parity_evidence_sha256\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"}}}}]}}",
+            "{{\"schema_version\":2,\"mode\":\"default_deny\",\"target_os\":\"windows\",\"target_arch\":\"x86_64\",\"entries\":[{{\"pack\":{{\"pack_id\":{},\"pack_version\":{},\"pack_digest\":{},\"security_epoch\":{},\"runtime_abi\":{}}},\"model_digest\":{},\"backend\":{},\"provider_id\":{},\"vendor\":{},\"device_class\":{},\"minimum_total_memory_bytes\":{},\"minimum_available_memory_bytes\":{},\"driver\":{{\"kind\":\"exact\",\"value\":{}}},\"evidence\":{{\"id\":{},\"cold_runs\":5,\"warm_runs\":20,\"gpu_p95_ms\":110,\"cpu_p95_ms\":100,\"correctness_verified\":true,\"reliability_verified\":true,\"cold_evidence_sha256\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"warm_evidence_sha256\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"transcript_parity_evidence_sha256\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"}}}}]}}",
             string(&pack.pack_id),
             string(&pack.pack_version),
             string(&pack.pack_digest),
@@ -11542,6 +12105,7 @@ mod tests {
             string(vendor),
             string(device_class),
             target.memory_total_bytes,
+            target.memory_available_bytes.max(1),
             string(target.driver_version.as_deref().expect("fixture driver")),
             string(evidence_id),
         );
@@ -11967,6 +12531,7 @@ mod tests {
             gpu_routes: Arc::new(Mutex::new(GpuRouteCatalogCache {
                 successful: Some(catalog.clone()),
                 failed: None,
+                auto_admission_backoff: None,
             })),
             auto_gpu_routes: Arc::new(Mutex::new(GpuRouteCatalogCache::default())),
             gpu_health_path: Some(Arc::clone(&path)),
@@ -12339,11 +12904,14 @@ mod tests {
             next_correlation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
 
-        let loaded = inference
-            .load(missing_gguf_artifact(), AccelerationPreference::Cpu)
-            .unwrap();
+        let artifact = gguf_artifact_fixture("runtime-response-generation-binding");
+        let error = inference
+            .load(artifact.artifact.clone(), AccelerationPreference::Cpu)
+            .expect_err("an exited generation cannot own recorded model residency");
 
-        assert_eq!(loaded.detected_architecture, "test-runtime");
+        assert!(matches!(error, RuntimeError::RetryableWorkerFailure(_)));
+        let message = error.to_string();
+        assert!(message.contains("generation exited") || message.contains("generation changed"));
         let wait_until = Instant::now() + Duration::from_millis(250);
         while inference.transport.current_generation().unwrap().is_some()
             && Instant::now() < wait_until
@@ -12391,6 +12959,33 @@ mod tests {
             expected_size_bytes: 1,
             expected_sha256: "0".repeat(64),
         })
+    }
+
+    struct GgufArtifactFixture {
+        root: PathBuf,
+        artifact: RuntimeArtifact,
+    }
+
+    impl Drop for GgufArtifactFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn gguf_artifact_fixture(label: &str) -> GgufArtifactFixture {
+        let root = test_root(label);
+        let path = root.join("model.gguf");
+        std::fs::write(&path, b"g").unwrap();
+        GgufArtifactFixture {
+            root,
+            artifact: RuntimeArtifact::Gguf(RuntimeModel {
+                id: ModelId::new(label),
+                path,
+                format: ArtifactFormat::Gguf,
+                expected_size_bytes: 1,
+                expected_sha256: format!("{:x}", Sha256::digest(b"g")),
+            }),
+        }
     }
 
     #[cfg(windows)]
@@ -12629,7 +13224,7 @@ mod tests {
         let gpu_launcher = Arc::new(TestLauncher::new([TestMode::RuntimeFailureOnLoad(
             RuntimeError::OutOfMemory("fixture GPU allocation failed".to_owned()),
         )]));
-        let cpu_launcher = Arc::new(TestLauncher::new([TestMode::RuntimeLoadThenExit]));
+        let cpu_launcher = Arc::new(TestLauncher::new([TestMode::RuntimeLoad]));
         let mut gpu_route = verified_gpu_route(
             BackendKind::Cuda,
             "native:pci:0000:01:00.0",
@@ -12655,8 +13250,9 @@ mod tests {
             .record_probe(catalog.clone(), Instant::now());
         registry.gpu_routes_for_testing = Some(catalog);
 
+        let artifact = gguf_artifact_fixture("auto-cpu-fallback-after-oom");
         let execution = registry
-            .load(missing_gguf_artifact(), AccelerationPreference::Auto)
+            .load(artifact.artifact.clone(), AccelerationPreference::Auto)
             .expect("Auto must retain its guaranteed CPU fallback after a pre-output GPU OOM");
 
         assert_eq!(gpu_launcher.launches.load(Ordering::Acquire), 1);
@@ -12711,7 +13307,7 @@ mod tests {
         let _reset = ResetDeviceEpochRejection;
 
         let auto_gpu_launcher = Arc::new(TestLauncher::new([TestMode::Normal]));
-        let auto_cpu_launcher = Arc::new(TestLauncher::new([TestMode::RuntimeLoadThenExit]));
+        let auto_cpu_launcher = Arc::new(TestLauncher::new([TestMode::RuntimeLoad]));
         let mut auto_gpu_route = verified_gpu_route(
             BackendKind::Metal,
             "native:registry:metal-0",
@@ -12725,8 +13321,9 @@ mod tests {
         );
         auto_registry.gpu_routes_for_testing = Some(verified_gpu_catalog(vec![auto_gpu_route]));
 
+        let artifact = gguf_artifact_fixture("auto-rollback-fallback");
         let execution = auto_registry
-            .load(missing_gguf_artifact(), AccelerationPreference::Auto)
+            .load(artifact.artifact.clone(), AccelerationPreference::Auto)
             .expect("Auto must skip a request-bound rollback rejection and use CPU");
         assert_eq!(auto_gpu_launcher.launches.load(Ordering::Acquire), 0);
         assert_eq!(auto_cpu_launcher.launches.load(Ordering::Acquire), 1);
@@ -12813,7 +13410,7 @@ mod tests {
             let gpu_launcher = Arc::new(TestLauncher::new([TestMode::RuntimeFailureOnLoad(
                 runtime_error,
             )]));
-            let cpu_launcher = Arc::new(TestLauncher::new([TestMode::RuntimeLoadThenExit]));
+            let cpu_launcher = Arc::new(TestLauncher::new([TestMode::RuntimeLoad]));
             let mut gpu_route = verified_gpu_route(
                 BackendKind::Vulkan,
                 "native:pci:0000:01:00.0",
@@ -12826,8 +13423,10 @@ mod tests {
             );
             registry.gpu_routes_for_testing = Some(verified_gpu_catalog(vec![gpu_route]));
 
+            let artifact =
+                gguf_artifact_fixture(&format!("auto-provider-failure-{expected_category:?}"));
             let execution = registry
-                .load(missing_gguf_artifact(), AccelerationPreference::Auto)
+                .load(artifact.artifact.clone(), AccelerationPreference::Auto)
                 .expect("a typed pre-output provider failure must retain Auto's CPU fallback");
 
             assert_eq!(gpu_launcher.launches.load(Ordering::Acquire), 1);
@@ -12849,7 +13448,7 @@ mod tests {
         let first_launcher = Arc::new(TestLauncher::new([TestMode::RuntimeFailureOnLoad(
             RuntimeError::OutOfMemory("fixture GPU allocation failed".to_owned()),
         )]));
-        let second_launcher = Arc::new(TestLauncher::new([TestMode::RuntimeLoadThenExit]));
+        let second_launcher = Arc::new(TestLauncher::new([TestMode::RuntimeLoad]));
         let cpu_launcher = Arc::new(TestLauncher::new([]));
         let mut first = verified_gpu_route(
             BackendKind::Cuda,
@@ -12885,8 +13484,9 @@ mod tests {
             inference_supervisor_with_launcher(Arc::clone(&cpu_launcher)),
         );
         registry.gpu_routes_for_testing = Some(catalog);
+        let artifact = gguf_artifact_fixture("auto-second-gpu-fallback");
         let execution = registry
-            .load(missing_gguf_artifact(), AccelerationPreference::Auto)
+            .load(artifact.artifact.clone(), AccelerationPreference::Auto)
             .expect("the second qualified GPU route should win after a pre-output OOM");
 
         assert_eq!(first_launcher.launches.load(Ordering::Acquire), 1);
@@ -12935,7 +13535,7 @@ mod tests {
         target.pack.as_mut().unwrap().pack_id = "scribe-cuda-windows-x64".to_owned();
         let model_digest = "b".repeat(64);
         let policy = fixture_auto_policy(target, &model_digest, "power-witness-fixture-v1");
-        let catalog = verified_gpu_catalog(vec![route]);
+        let catalog = verified_gpu_catalog(vec![route.clone()]);
 
         let ac = auto_qualified_gpu_route_catalog(
             catalog.clone(),
@@ -12945,13 +13545,332 @@ mod tests {
         );
         let battery =
             auto_qualified_gpu_route_catalog(catalog, &policy, &model_digest, PowerSource::Battery);
+        let unknown = auto_qualified_gpu_route_catalog(
+            verified_gpu_catalog(vec![route]),
+            &policy,
+            &model_digest,
+            PowerSource::Unknown,
+        );
 
         assert_eq!(ac.routes.len(), 1);
         assert!(battery.routes.is_empty());
+        assert!(unknown.routes.is_empty());
+        assert!(unknown.skipped_targets.iter().any(|skipped| {
+            skipped.reason == BackendSkipReason::UnknownPowerSource
+                && skipped.target.device_class == DeviceClass::DiscreteGpu
+        }));
+        let mut cpu = verified_gpu_route(
+            BackendKind::Vulkan,
+            "native:pci:0000:03:00.0",
+            "windows-display:32.0.16.1088",
+            'c',
+        );
+        cpu.provider = WorkerProvider::Cpu;
+        cpu.target = Some(BackendTarget::cpu());
+        let mut fallback_plan = InferenceWorkerRoutePlan {
+            routes: Arc::clone(&unknown.routes),
+            diagnostic: unknown.diagnostic.clone(),
+            health: None,
+            selection_power_source: Some(PowerSource::Unknown),
+            skipped_targets: unknown.skipped_targets.clone(),
+            auto_live_admission: None,
+        };
+        reserve_auto_cpu_fallback(&mut fallback_plan, &Arc::new(vec![cpu]));
+        assert_eq!(fallback_plan.routes.len(), 1);
+        assert_eq!(fallback_plan.routes[0].provider, WorkerProvider::Cpu);
         assert_eq!(
             ac.device_set_digest, battery.device_set_digest,
             "power-policy filtering must not invalidate health for an unchanged physical device set"
         );
+        assert_eq!(ac.device_set_digest, unknown.device_set_digest);
+    }
+
+    #[test]
+    fn unknown_power_keeps_an_integrated_auto_route_and_cpu_fallback_is_reserved() {
+        let mut integrated = verified_gpu_route(
+            BackendKind::Cuda,
+            "native:pci:0000:01:00.0",
+            "windows-display:32.0.16.1088",
+            'a',
+        );
+        let target = integrated.target.as_mut().unwrap();
+        target.provider_id = ProviderIdentity::new("transcribe-cpp-ggml-cuda");
+        target.vendor = GpuVendor::Nvidia;
+        target.device_class = DeviceClass::IntegratedGpu;
+        target.pack.as_mut().unwrap().pack_id = "scribe-cuda-windows-x64".to_owned();
+        let model_digest = "b".repeat(64);
+        let policy = fixture_auto_policy(target, &model_digest, "unknown-power-integrated-v1");
+        let catalog = auto_qualified_gpu_route_catalog(
+            verified_gpu_catalog(vec![integrated]),
+            &policy,
+            &model_digest,
+            PowerSource::Unknown,
+        );
+        let mut cpu = verified_gpu_route(
+            BackendKind::Vulkan,
+            "native:pci:0000:02:00.0",
+            "windows-display:32.0.16.1088",
+            'b',
+        );
+        cpu.provider = WorkerProvider::Cpu;
+        cpu.target = Some(BackendTarget::cpu());
+        let mut plan = InferenceWorkerRoutePlan {
+            routes: catalog.routes,
+            diagnostic: catalog.diagnostic,
+            health: None,
+            selection_power_source: Some(PowerSource::Unknown),
+            skipped_targets: catalog.skipped_targets,
+            auto_live_admission: None,
+        };
+
+        reserve_auto_cpu_fallback(&mut plan, &Arc::new(vec![cpu]));
+
+        assert_eq!(plan.routes.len(), 2);
+        assert_eq!(
+            plan.routes[0].target.as_ref().unwrap().device_class,
+            DeviceClass::IntegratedGpu
+        );
+        assert_eq!(plan.routes[1].provider, WorkerProvider::Cpu);
+    }
+
+    #[test]
+    fn auto_warm_reuse_tolerates_lower_post_load_memory_only_for_exact_live_supervisor() {
+        let root = test_root("auto-warm-model-residency");
+        let model_path = root.join("model.gguf");
+        std::fs::write(&model_path, b"g").unwrap();
+        let artifact = RuntimeArtifact::Gguf(RuntimeModel {
+            id: ModelId::new("auto-warm-model-residency"),
+            path: model_path,
+            format: ArtifactFormat::Gguf,
+            expected_size_bytes: 1,
+            expected_sha256: format!("{:x}", Sha256::digest(b"g")),
+        });
+        let launcher = Arc::new(TestLauncher::new([TestMode::Normal]));
+        let mut route = verified_gpu_route(
+            BackendKind::Cuda,
+            "native:pci:0000:01:00.0",
+            "windows-display:32.0.16.1088",
+            'a',
+        );
+        route.supervisor = inference_supervisor_with_launcher(Arc::clone(&launcher));
+        let generation = route
+            .supervisor
+            .transport
+            .ensure_generation()
+            .expect("test worker generation starts");
+        let artifact_identity =
+            InferenceWorkerSupervisor::artifact_identity(&artifact, AccelerationPreference::Gpu)
+                .unwrap();
+        route
+            .supervisor
+            .transport
+            .record_active_model(generation, artifact_identity)
+            .unwrap();
+        let active = ActiveInferenceRoute {
+            identity: InferenceWorkerRegistry::route_identity(&route),
+            supervisor: route.supervisor.clone(),
+        };
+        let mut catalog = verified_gpu_catalog(vec![route.clone()]);
+        let admitted_available_memory = catalog.routes[0]
+            .target
+            .as_ref()
+            .unwrap()
+            .memory_available_bytes;
+        catalog.provider_probe_incomplete = true;
+        let fingerprint = catalog.discovery_fingerprint.clone();
+        let now = Instant::now();
+        let mut cache = GpuRouteCatalogCache::default();
+
+        cache.record_auto_live_admission_probe(&catalog, now);
+        assert!(cache.successful().is_none());
+        cache.retain_auto_live_admission(&catalog, &active);
+        // The active model has consumed most of the memory observed by its
+        // cold/provider-start Hello. That lower post-load fact is intentionally
+        // not an admission input for this exact live supervisor.
+        route.target.as_mut().unwrap().memory_available_bytes = 1;
+        assert!(route.target.as_ref().unwrap().memory_available_bytes < admitted_available_memory);
+        assert!(matches!(
+            cache.auto_live_admission_lookup(
+                &fingerprint,
+                Some(&active),
+                PowerSource::Ac,
+                now + GPU_PROVIDER_PROBE_BACKOFF + Duration::from_millis(1),
+            ),
+            GpuRouteCatalogLookup::Successful(_)
+        ));
+        assert!(
+            route
+                .supervisor
+                .has_loaded_artifact(&artifact, AccelerationPreference::Gpu),
+            "expired partial-probe recovery must not retire the healthy warm winner"
+        );
+
+        route.supervisor.unload().expect("test model unloads");
+        assert!(
+            route.supervisor.has_live_generation(),
+            "unload deliberately keeps the worker process alive"
+        );
+        let unloaded_active = route
+            .supervisor
+            .has_loaded_artifact(&artifact, AccelerationPreference::Gpu)
+            .then_some(&active);
+        assert!(unloaded_active.is_none());
+        // An unloaded model is cold even while its worker process remains
+        // alive, so it cannot reuse the prior available-memory observation.
+        assert!(matches!(
+            cache.auto_live_admission_lookup(
+                &fingerprint,
+                unloaded_active,
+                PowerSource::Ac,
+                now + GPU_PROVIDER_PROBE_BACKOFF + Duration::from_millis(1),
+            ),
+            GpuRouteCatalogLookup::Probe
+        ));
+        assert!(cache.successful().is_none());
+        assert_eq!(launcher.launches.load(Ordering::Acquire), 1);
+        route.supervisor.retire().expect("test worker retires");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn auto_low_vram_admission_backoff_uses_cpu_without_a_probe_storm() {
+        let mut route = verified_gpu_route(
+            BackendKind::Cuda,
+            "native:pci:0000:01:00.0",
+            "windows-display:32.0.16.1088",
+            'a',
+        );
+        let target = route.target.as_mut().unwrap();
+        target.provider_id = ProviderIdentity::new("transcribe-cpp-ggml-cuda");
+        target.memory_available_bytes = 0;
+        let model_digest = "b".repeat(64);
+        let policy = fixture_auto_policy(target, &model_digest, "low-vram-backoff-fixture-v1");
+        let qualified = auto_qualified_gpu_route_catalog_with_admission(
+            verified_gpu_catalog(vec![route]),
+            &policy,
+            &model_digest,
+            PowerSource::Ac,
+        );
+        assert!(qualified.catalog.routes.is_empty());
+        assert_eq!(
+            qualified.volatile_admission_witness,
+            Some(AutoAdmissionWitness {
+                power_source: PowerSource::Ac,
+                available_memory_denied: true,
+                power_policy_denied: false,
+            })
+        );
+        let fingerprint = qualified.catalog.discovery_fingerprint.clone();
+        let witness = qualified.volatile_admission_witness.unwrap();
+        let now = Instant::now();
+        let mut cache = GpuRouteCatalogCache::default();
+        cache.record_auto_admission_backoff(
+            &fingerprint,
+            witness,
+            Some("available memory is below the qualified Auto minimum".to_owned()),
+            now,
+        );
+
+        for request in 0..3 {
+            assert!(
+                matches!(
+                    cache.auto_live_admission_lookup(&fingerprint, None, PowerSource::Ac, now),
+                    GpuRouteCatalogLookup::Backoff(Some(message))
+                        if message.contains("available memory")
+                ),
+                "CPU request {request} must use the bounded admission denial rather than start provider Hello"
+            );
+        }
+        assert!(matches!(
+            cache.auto_live_admission_lookup(
+                &fingerprint,
+                None,
+                PowerSource::Ac,
+                now + AUTO_VOLATILE_ADMISSION_BACKOFF,
+            ),
+            GpuRouteCatalogLookup::Probe
+        ));
+    }
+
+    #[test]
+    fn auto_power_change_bypasses_the_volatile_admission_backoff() {
+        let route = verified_gpu_route(
+            BackendKind::Cuda,
+            "native:pci:0000:01:00.0",
+            "windows-display:32.0.16.1088",
+            'a',
+        );
+        let mut route = route;
+        let target = route.target.as_mut().unwrap();
+        target.provider_id = ProviderIdentity::new("transcribe-cpp-ggml-cuda");
+        let model_digest = "b".repeat(64);
+        let policy = fixture_auto_policy(target, &model_digest, "power-backoff-fixture-v1");
+        let qualified = auto_qualified_gpu_route_catalog_with_admission(
+            verified_gpu_catalog(vec![route]),
+            &policy,
+            &model_digest,
+            PowerSource::Battery,
+        );
+        assert!(qualified.catalog.routes.is_empty());
+        assert_eq!(
+            qualified.volatile_admission_witness,
+            Some(AutoAdmissionWitness {
+                power_source: PowerSource::Battery,
+                available_memory_denied: false,
+                power_policy_denied: true,
+            })
+        );
+        let fingerprint = qualified.catalog.discovery_fingerprint.clone();
+        let witness = qualified.volatile_admission_witness.unwrap();
+        let now = Instant::now();
+        let mut cache = GpuRouteCatalogCache::default();
+        cache.record_auto_admission_backoff(
+            &fingerprint,
+            witness,
+            Some("Auto GPU route is unavailable on battery".to_owned()),
+            now,
+        );
+        assert!(matches!(
+            cache.auto_live_admission_lookup(&fingerprint, None, PowerSource::Battery, now),
+            GpuRouteCatalogLookup::Backoff(_)
+        ));
+        assert!(matches!(
+            cache.auto_live_admission_lookup(&fingerprint, None, PowerSource::Ac, now),
+            GpuRouteCatalogLookup::Probe
+        ));
+        assert!(cache.auto_admission_backoff.is_none());
+    }
+
+    #[test]
+    fn auto_power_recheck_blocks_ac_selected_discrete_route_after_battery_transition() {
+        let route = verified_gpu_route(
+            BackendKind::Cuda,
+            "native:pci:0000:01:00.0",
+            "windows-display:32.0.16.1088",
+            'a',
+        );
+        assert!(auto_route_is_power_eligible(&route, PowerSource::Ac));
+        assert!(!auto_route_is_power_eligible(&route, PowerSource::Battery));
+        assert!(!auto_route_is_power_eligible(&route, PowerSource::Unknown));
+        assert_eq!(
+            auto_power_skip_reason(PowerSource::Battery),
+            BackendSkipReason::BatteryPolicy
+        );
+        assert_eq!(
+            auto_power_skip_reason(PowerSource::Unknown),
+            BackendSkipReason::UnknownPowerSource
+        );
+
+        let mut integrated = route.clone();
+        integrated.target.as_mut().unwrap().device_class = DeviceClass::IntegratedGpu;
+        assert!(auto_route_is_power_eligible(
+            &integrated,
+            PowerSource::Battery
+        ));
+        assert!(auto_route_is_power_eligible(
+            &integrated,
+            PowerSource::Unknown
+        ));
     }
 
     #[test]
@@ -13018,6 +13937,7 @@ mod tests {
             health: None,
             selection_power_source: Some(PowerSource::Ac),
             skipped_targets: Vec::new(),
+            auto_live_admission: None,
         };
 
         reserve_auto_cpu_fallback(&mut plan, &cpu_routes);

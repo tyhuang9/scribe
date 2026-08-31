@@ -17,8 +17,8 @@ use crate::backend_policy::{
     BackendKind, BackendPackIdentity, BackendTarget, DeviceClass, GpuVendor, ProviderIdentity,
 };
 
-pub(crate) const AUTO_QUALIFICATION_POLICY_VERSION: u16 = 1;
-const QUALIFICATION_SCHEMA_VERSION: u16 = 1;
+pub(crate) const AUTO_QUALIFICATION_POLICY_VERSION: u16 = 3;
+const QUALIFICATION_SCHEMA_VERSION: u16 = 2;
 const WINDOWS_X64_OS: &str = "windows";
 const WINDOWS_X64_ARCH: &str = "x86_64";
 const LINUX_X64_OS: &str = "linux";
@@ -63,7 +63,9 @@ pub(crate) enum QualificationDenial {
     NoMatchingTargetEvidence,
     MissingTargetPackIdentity,
     MissingDriverIdentity,
+    InvalidAvailableMemory,
     InsufficientMemory,
+    InsufficientAvailableMemory,
 }
 
 impl QualificationDenial {
@@ -84,7 +86,13 @@ impl QualificationDenial {
             Self::MissingDriverIdentity => {
                 "GPU worker did not provide a driver identity required by Auto qualification"
             }
+            Self::InvalidAvailableMemory => {
+                "GPU worker reported available memory greater than total memory"
+            }
             Self::InsufficientMemory => "GPU total memory is below the qualified Auto minimum",
+            Self::InsufficientAvailableMemory => {
+                "GPU available memory is unknown or below the qualified Auto minimum"
+            }
         }
     }
 }
@@ -136,6 +144,7 @@ struct QualificationEntry {
     vendor: GpuVendor,
     device_class: DeviceClass,
     minimum_total_memory_bytes: u64,
+    minimum_available_memory_bytes: u64,
     driver: DriverConstraint,
     evidence: QualificationEvidence,
 }
@@ -343,16 +352,26 @@ impl AutoQualificationPolicy {
         let Some(driver) = target.driver_version.as_deref() else {
             return QualificationDecision::Denied(QualificationDenial::MissingDriverIdentity);
         };
+        if target.memory_available_bytes > target.memory_total_bytes {
+            return QualificationDecision::Denied(QualificationDenial::InvalidAvailableMemory);
+        }
         if pack_matches
             .iter()
             .all(|entry| target.memory_total_bytes < entry.minimum_total_memory_bytes)
         {
             return QualificationDecision::Denied(QualificationDenial::InsufficientMemory);
         }
+        if pack_matches
+            .iter()
+            .all(|entry| target.memory_available_bytes < entry.minimum_available_memory_bytes)
+        {
+            return QualificationDecision::Denied(QualificationDenial::InsufficientAvailableMemory);
+        }
         let Some(entry) = pack_matches.into_iter().find(|entry| {
             entry.vendor == target.vendor
                 && entry.device_class == target.device_class
                 && target.memory_total_bytes >= entry.minimum_total_memory_bytes
+                && target.memory_available_bytes >= entry.minimum_available_memory_bytes
                 && entry.driver.matches(driver)
         }) else {
             return QualificationDecision::Denied(QualificationDenial::NoMatchingTargetEvidence);
@@ -444,6 +463,8 @@ fn validate_entry(
         )
         || !is_identifier(&entry.provider_id, 128)
         || entry.minimum_total_memory_bytes == 0
+        || entry.minimum_available_memory_bytes == 0
+        || entry.minimum_available_memory_bytes > entry.minimum_total_memory_bytes
         || !is_driver_value(entry.driver.value())
     {
         return Err(AutoQualificationError::InvalidEntry("target binding"));
@@ -565,6 +586,7 @@ mod tests {
             vendor: GpuVendor::Nvidia,
             device_class: DeviceClass::DiscreteGpu,
             minimum_total_memory_bytes: 8 * 1024 * 1024 * 1024,
+            minimum_available_memory_bytes: 4 * 1024 * 1024 * 1024,
             driver: DriverConstraint::Exact {
                 value: "windows-display:32.0.16.1088".to_owned(),
             },
@@ -805,7 +827,7 @@ mod tests {
     }
 
     #[test]
-    fn target_gate_requires_pack_driver_vendor_class_and_total_memory_but_not_free_memory() {
+    fn target_gate_requires_pack_driver_vendor_class_and_live_total_and_available_memory() {
         let policy = fixture_policy();
         let approve = |target: &BackendTarget| {
             policy.qualify_target_on_platform(
@@ -818,10 +840,24 @@ mod tests {
 
         let mut target = fixture_target();
         target.memory_available_bytes = 0;
-        assert!(matches!(
+        assert_eq!(
             approve(&target),
-            QualificationDecision::Approved { .. }
-        ));
+            QualificationDecision::Denied(QualificationDenial::InsufficientAvailableMemory)
+        );
+
+        target = fixture_target();
+        target.memory_available_bytes = 4 * 1024 * 1024 * 1024 - 1;
+        assert_eq!(
+            approve(&target),
+            QualificationDecision::Denied(QualificationDenial::InsufficientAvailableMemory)
+        );
+
+        target = fixture_target();
+        target.memory_available_bytes = target.memory_total_bytes + 1;
+        assert_eq!(
+            approve(&target),
+            QualificationDecision::Denied(QualificationDenial::InvalidAvailableMemory)
+        );
 
         target.pack = None;
         assert_eq!(
@@ -908,6 +944,18 @@ mod tests {
             ));
         }
 
+        let mut missing_available_memory_floor = serde_json::to_value(fixture_document()).unwrap();
+        missing_available_memory_floor["entries"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("minimum_available_memory_bytes");
+        assert!(matches!(
+            AutoQualificationPolicy::from_fixture_json(
+                &serde_json::to_string(&missing_available_memory_floor).unwrap()
+            ),
+            Err(AutoQualificationError::Parse(_))
+        ));
+
         for (field, invalid) in [
             ("cold_runs", serde_json::json!("5")),
             ("warm_runs", serde_json::json!(20.0)),
@@ -985,6 +1033,26 @@ mod tests {
             |entry: &mut QualificationEntry| entry.vendor = GpuVendor::Amd,
             |entry: &mut QualificationEntry| entry.backend = BackendKind::Metal,
         ] {
+            let mut document = fixture_document();
+            mutation(&mut document.entries[0]);
+            assert_eq!(
+                AutoQualificationPolicy::from_fixture_json(
+                    &serde_json::to_string(&document).unwrap()
+                ),
+                Err(AutoQualificationError::InvalidEntry("target binding"))
+            );
+        }
+    }
+
+    #[test]
+    fn entries_require_a_positive_available_memory_floor_not_above_total_memory() {
+        let mutations: [fn(&mut QualificationEntry); 2] = [
+            |entry: &mut QualificationEntry| entry.minimum_available_memory_bytes = 0,
+            |entry: &mut QualificationEntry| {
+                entry.minimum_available_memory_bytes = entry.minimum_total_memory_bytes + 1
+            },
+        ];
+        for mutation in mutations {
             let mut document = fixture_document();
             mutation(&mut document.entries[0]);
             assert_eq!(
@@ -1141,6 +1209,15 @@ mod tests {
             AutoQualificationPolicy::from_fixture_json("{\"schema_version\":1}"),
             Err(AutoQualificationError::Parse(_))
         ));
+        let mut old_schema = fixture_document();
+        old_schema.schema_version = QUALIFICATION_SCHEMA_VERSION - 1;
+        assert_eq!(
+            AutoQualificationPolicy::from_fixture_json(
+                &serde_json::to_string(&old_schema).unwrap()
+            ),
+            Err(AutoQualificationError::UnsupportedSchema),
+            "pre-available-memory qualification entries must fail closed"
+        );
         for (backend, vendor, device_class) in [
             (
                 BackendKind::Cpu,
@@ -1166,7 +1243,7 @@ mod tests {
         }
         assert!(matches!(
             AutoQualificationPolicy::from_fixture_json(
-                "{\"schema_version\":1,\"mode\":\"default_deny\",\"target_os\":\"windows\",\"target_arch\":\"x86_64\",\"entries\":[],\"unexpected\":true}"
+                "{\"schema_version\":2,\"mode\":\"default_deny\",\"target_os\":\"windows\",\"target_arch\":\"x86_64\",\"entries\":[],\"unexpected\":true}"
             ),
             Err(AutoQualificationError::Parse(_))
         ));

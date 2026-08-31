@@ -5,9 +5,10 @@
 //! tests deterministic and lets future worker packs provide the same facts
 //! without exposing provider-specific handles above the worker boundary.
 //!
-//! Device-memory observations are diagnostic facts only. Model-aware memory
-//! admission is intentionally deferred until model requirements and qualified
-//! provider packs are available; this policy does not claim to preflight VRAM.
+//! Total memory is a stable target fact. Available memory is volatile and is
+//! deliberately excluded from target identity and warm-state fingerprints;
+//! the verified Auto qualification policy consumes it only as fresh,
+//! evidence-bound admission input.
 
 use std::cmp::Ordering;
 
@@ -198,7 +199,9 @@ pub(crate) struct BackendTarget {
     pub(crate) vendor: GpuVendor,
     pub(crate) device_class: DeviceClass,
     pub(crate) memory_total_bytes: u64,
-    /// Live telemetry only; not used for admission or warm invalidation.
+    /// Live resource fact. Signed Auto qualification may admit it against an
+    /// evidence-bound threshold, but it never enters a stable identity or
+    /// warm-state fingerprint.
     pub(crate) memory_available_bytes: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) pack: Option<BackendPackIdentity>,
@@ -462,6 +465,7 @@ pub(crate) enum PowerPolicyDecision {
     NotApplied,
     Unrestricted,
     BatteryEfficientGpuOnly,
+    UnknownConservativeGpuOnly,
 }
 
 /// Typed reason an otherwise discovered target was not eligible.
@@ -475,6 +479,7 @@ pub(crate) enum BackendSkipReason {
     Unhealthy,
     Quarantined,
     BatteryPolicy,
+    UnknownPowerSource,
     NotAutoQualified,
     FallbackBound,
 }
@@ -541,6 +546,11 @@ impl BackendSelection {
                 "Auto selected CPU because discrete or unclassified GPUs are disabled on battery."
                     .to_owned(),
             )
+        } else if skipped.contains(&BackendSkipReason::UnknownPowerSource) {
+            Some(
+                "Auto selected CPU because the power source could not be verified, so discrete or unclassified GPUs are disabled."
+                    .to_owned(),
+            )
         } else if skipped.contains(&BackendSkipReason::NotAutoQualified) {
             Some(
                 "Auto selected CPU because available GPU backends are not qualified for automatic use."
@@ -588,6 +598,9 @@ pub(crate) fn select_backend(
     let power_policy = match requested {
         AccelerationPreference::Auto if snapshot.power_source == PowerSource::Battery => {
             PowerPolicyDecision::BatteryEfficientGpuOnly
+        }
+        AccelerationPreference::Auto if snapshot.power_source == PowerSource::Unknown => {
+            PowerPolicyDecision::UnknownConservativeGpuOnly
         }
         AccelerationPreference::Auto => PowerPolicyDecision::Unrestricted,
         AccelerationPreference::Cpu | AccelerationPreference::Gpu => {
@@ -715,10 +728,18 @@ fn candidate_skip_reason(
         return availability;
     }
     if requested == AccelerationPreference::Auto && candidate.target.backend.is_gpu() {
-        if power_policy == PowerPolicyDecision::BatteryEfficientGpuOnly
-            && !candidate.target.device_class.is_battery_eligible_gpu()
+        if !candidate.target.device_class.is_battery_eligible_gpu()
+            && matches!(
+                power_policy,
+                PowerPolicyDecision::BatteryEfficientGpuOnly
+                    | PowerPolicyDecision::UnknownConservativeGpuOnly
+            )
         {
-            return Some(BackendSkipReason::BatteryPolicy);
+            return Some(if snapshot.power_source == PowerSource::Battery {
+                BackendSkipReason::BatteryPolicy
+            } else {
+                BackendSkipReason::UnknownPowerSource
+            });
         }
         if !snapshot
             .qualification_policy
@@ -849,11 +870,13 @@ fn current_power_source() -> PowerSource {
     crate::macos_power::power_source()
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(target_os = "linux")]
 fn current_power_source() -> PowerSource {
-    // Platform-native probes arrive with their qualified backend packs. An
-    // unknown source is deliberately unrestricted rather than guessing that a
-    // desktop or a charging laptop is on battery.
+    crate::linux_power::power_source()
+}
+
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+fn current_power_source() -> PowerSource {
     PowerSource::Unknown
 }
 
@@ -1278,6 +1301,123 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error, BackendSelectionError::NoGpuTarget);
+    }
+
+    #[test]
+    fn auto_unknown_power_denies_discrete_gpu_but_keeps_integrated_and_unified_gpu_eligible() {
+        for operating_system in [
+            OperatingSystem::Windows,
+            OperatingSystem::MacOs,
+            OperatingSystem::Linux,
+        ] {
+            let backend = if operating_system == OperatingSystem::MacOs {
+                BackendKind::Metal
+            } else {
+                BackendKind::Vulkan
+            };
+            let vendor = if operating_system == OperatingSystem::MacOs {
+                GpuVendor::Apple
+            } else {
+                GpuVendor::Intel
+            };
+            let selected = select_backend(
+                AccelerationPreference::Auto,
+                &snapshot(
+                    operating_system,
+                    PowerSource::Unknown,
+                    vec![
+                        cpu(),
+                        candidate(target(
+                            backend,
+                            vendor,
+                            DeviceClass::DiscreteGpu,
+                            "discrete",
+                            0,
+                        )),
+                        candidate(target(
+                            backend,
+                            vendor,
+                            DeviceClass::IntegratedGpu,
+                            "integrated",
+                            1,
+                        )),
+                        candidate(target(
+                            backend,
+                            vendor,
+                            DeviceClass::UnifiedGpu,
+                            "unified",
+                            2,
+                        )),
+                    ],
+                ),
+            )
+            .unwrap();
+
+            assert_ne!(selected.target.device_class, DeviceClass::DiscreteGpu);
+            assert_eq!(
+                selected.power_policy,
+                PowerPolicyDecision::UnknownConservativeGpuOnly
+            );
+            assert!(selected.skipped_targets.iter().any(|skipped| {
+                skipped.target.device_class == DeviceClass::DiscreteGpu
+                    && skipped.reason == BackendSkipReason::UnknownPowerSource
+            }));
+        }
+    }
+
+    #[test]
+    fn auto_unknown_power_uses_cpu_fallback_when_only_discrete_gpu_is_available() {
+        let selected = select_backend(
+            AccelerationPreference::Auto,
+            &snapshot(
+                OperatingSystem::Linux,
+                PowerSource::Unknown,
+                vec![
+                    cpu(),
+                    candidate(target(
+                        BackendKind::Vulkan,
+                        GpuVendor::Amd,
+                        DeviceClass::DiscreteGpu,
+                        "discrete",
+                        0,
+                    )),
+                ],
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(selected.target.backend, BackendKind::Cpu);
+        assert_eq!(selected.reason, BackendSelectionReason::AutoCpuFallback);
+        assert_eq!(
+            selected.auto_cpu_diagnostic().as_deref(),
+            Some(
+                "Auto selected CPU because the power source could not be verified, so discrete or unclassified GPUs are disabled."
+            )
+        );
+    }
+
+    #[test]
+    fn explicit_gpu_allows_unknown_available_memory_without_cpu_fallback() {
+        let mut gpu = target(
+            BackendKind::Vulkan,
+            GpuVendor::Amd,
+            DeviceClass::DiscreteGpu,
+            "amd-gpu",
+            1,
+        );
+        gpu.memory_available_bytes = 0;
+        let selected = select_backend(
+            AccelerationPreference::Gpu,
+            &default_deny_snapshot(
+                OperatingSystem::Linux,
+                PowerSource::Unknown,
+                vec![cpu(), candidate(gpu)],
+            ),
+        )
+        .unwrap();
+
+        assert!(selected.target.backend.is_gpu());
+        assert!(selected.fallback_targets.is_empty());
     }
 
     #[test]

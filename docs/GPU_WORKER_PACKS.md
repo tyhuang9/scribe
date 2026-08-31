@@ -61,12 +61,24 @@ Before a provider is loaded, Auto compares a verified pack's backend, provider,
 ID/version/digest, security epoch, runtime ABI, and the requested GGUF digest
 with an entry. Only matching packs may be probed. After the challenge-bound
 Hello, it performs a second exact comparison of vendor, device class, and
-driver identity while enforcing the entry's minimum total-memory threshold.
-Free VRAM is live diagnostics only and is
-not qualification input. The worker then applies the existing battery policy
-and private health quarantine before deterministic CUDA → Vulkan ordering; CPU
-is appended as Auto's final fallback. Explicit `GPU` deliberately bypasses this
-Auto evidence gate and never falls back to CPU.
+driver identity while enforcing the entry's minimum total-memory and minimum
+available-memory thresholds. `minimum_available_memory_bytes` is a
+cold/provider-start admission threshold checked against a fresh bounded Hello:
+zero means unavailable and a value above total is rejected. Its successful
+admission catalog may be reused only while the exact same live warm worker owns
+the route. Warm reuse deliberately does not compare post-load free memory,
+because the admitted model itself consumes it. Every cold, changed, or retired
+GPU route requires a fresh Hello before Auto can attempt it. Runtime OOM,
+device-loss, and private-protocol failures invalidate and retire the route.
+A short in-memory CPU-only denial backoff throttles repeated low/unknown-memory
+or power-policy denials, and a changed power fact bypasses it. It is deliberately
+excluded from stable device identity and warm-state fingerprints. The worker
+applies the AC/battery policy after qualification; unknown power is conservative and admits
+only integrated or unified GPUs. CPU is appended as Auto's final fallback.
+Explicit `GPU` deliberately bypasses the Auto evidence and available-memory
+thresholds: it may attempt a verified GPU with low or unknown available memory,
+but it never falls back to CPU and returns a GPU-only error if no GPU route can
+run.
 
 Every future entry must carry immutable evidence ID and SHA-256 digests for
 cold, warm, and transcript-parity evidence, at least five cold and twenty warm

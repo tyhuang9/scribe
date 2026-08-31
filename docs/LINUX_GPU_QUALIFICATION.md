@@ -116,9 +116,11 @@ failing bundle produces a canonical ineligible decision. Structurally invalid,
 unbound, missing, or altered evidence is rejected.
 
 For every passing lane the tool derives the exact current runtime Auto entry:
-pack, model, backend, provider, vendor, class, qualified minimum memory, exact
-driver, run counts, recomputed warm p95 values, and cold/warm/parity evidence
-digests. Auto eligibility additionally requires an exact one-to-one set match
+pack, model, backend, provider, vendor, class, separate qualified minimum total
+and available-memory thresholds, exact driver, run counts, recomputed warm p95
+values, and cold/warm/parity evidence digests. The projected entry must conform
+to Auto qualification manifest schema 2. Auto eligibility additionally requires
+an exact one-to-one set match
 between those projections and the checked-in Linux Auto manifest—no missing,
 duplicate, or extra entry. The manifest is empty in this stage, so
 `activation_manifest_complete` remains false.
