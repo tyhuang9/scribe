@@ -5,7 +5,8 @@ Auto eligibility. It does not add a GPU pack, trust key, discovery entry, or
 Auto allowlist entry. The checked-in release plan has no representative lanes,
 the checked-in evidence document has no results, and
 `gpu-auto-qualification-linux-x86_64.json` remains the exact canonical empty
-default-deny manifest.
+default-deny manifest. The independent checked-in production authority also
+contains no approved plan digest.
 
 Ordinary pull-request CI validates only synthetic fixtures. It never runs a
 performance threshold against shared runners and never represents fixture
@@ -78,6 +79,15 @@ representative lane, exact complete coverage, and every lane passing
 performance, correctness, reliability, and lifecycle checks. A valid but
 failing bundle produces a canonical ineligible decision. Structurally invalid,
 unbound, missing, or altered evidence is rejected.
+
+Candidate input cannot promote itself by changing `fixture_only`. Every
+non-fixture plan digest must already appear in the fixed checked-in production
+authority loaded by the tool; the candidate cannot supply an alternate
+authority path. Fixture approval is never accepted by this boundary. The
+authority is empty in this stage, so real evaluation is deliberately
+impossible. Provisioning one protected approval digest is separate activation
+work requiring review of the exact plan, acquisition provenance, and resulting
+Auto projection.
 
 ## Release workflow
 

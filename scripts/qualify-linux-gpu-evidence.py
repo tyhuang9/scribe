@@ -48,6 +48,7 @@ CONTRACT_PATHS = {
     "runtime_contract_sha256": "runtime-manifests/gpu-runtime-linux-x86_64.json",
     "toolchain_contract_sha256": "runtime-manifests/gpu-worker-toolchain-linux-x86_64.json",
 }
+PRODUCTION_AUTHORITY_PATH = "runtime-manifests/linux-gpu-qualification-production-authority.json"
 
 
 class EvidenceError(ValueError):
@@ -368,6 +369,44 @@ def validate_plan(plan: dict[str, Any], repository_root: pathlib.Path) -> list[d
     return required_lanes
 
 
+def load_production_authority(repository_root: pathlib.Path) -> tuple[set[str], str]:
+    authority, raw = load_canonical_json(
+        repository_root / PRODUCTION_AUTHORITY_PATH,
+        "Linux GPU qualification production authority",
+    )
+    exact_keys(
+        authority,
+        {"schema_version", "kind", "approved_plan_sha256"},
+        "Linux GPU qualification production authority",
+    )
+    if json_integer(
+        authority["schema_version"],
+        "Linux GPU qualification production authority.schema_version",
+        1,
+        1,
+    ) != 1:
+        fail("Linux GPU qualification production authority schema is unsupported")
+    if json_string(
+        authority["kind"], "Linux GPU qualification production authority.kind"
+    ) != "linux_gpu_qualification_production_authority":
+        fail("Linux GPU qualification production authority kind is unsupported")
+    values = authority["approved_plan_sha256"]
+    if type(values) is not list:
+        fail("Linux GPU qualification production authority approvals must be an array")
+    approved: set[str] = set()
+    previous = ""
+    for index, value in enumerate(values):
+        digest = sha256_value(
+            value,
+            f"Linux GPU qualification production authority approval {index}",
+        )
+        if digest <= previous:
+            fail("Linux GPU qualification production approvals must be strictly sorted and unique")
+        previous = digest
+        approved.add(digest)
+    return approved, hashlib.sha256(raw).hexdigest()
+
+
 def validate_run(
     value: Any,
     label: str,
@@ -630,6 +669,7 @@ def decide(
     artifact_root: pathlib.Path | None,
 ) -> dict[str, Any]:
     required_lanes = validate_plan(plan, repository_root)
+    approved_plans, production_authority_digest = load_production_authority(repository_root)
     exact_keys(
         evidence,
         {"schema_version", "kind", "fixture_only", "plan_sha256", "lanes"},
@@ -647,6 +687,8 @@ def decide(
     plan_digest = hashlib.sha256(plan_raw).hexdigest()
     if sha256_value(evidence["plan_sha256"], "qualification evidence.plan_sha256") != plan_digest:
         fail("qualification evidence does not bind the exact reviewed plan")
+    if not fixture_only and plan_digest not in approved_plans:
+        fail("qualification plan is not approved by the protected production authority")
     if type(evidence["lanes"]) is not list:
         fail("qualification evidence.lanes must be an array")
     if len(evidence["lanes"]) != len(required_lanes):
@@ -686,6 +728,7 @@ def decide(
         "fixture_only": fixture_only,
         "lanes": summaries,
         "plan_sha256": plan_digest,
+        "production_authority_sha256": production_authority_digest,
         "qualification_passed": qualification_passed,
     }
 

@@ -20,6 +20,8 @@ REPOSITORY_ROOT = SCRIPT_ROOT.parent
 TOOL_PATH = SCRIPT_ROOT / "qualify-linux-gpu-evidence.py"
 AUTO_MANIFEST = REPOSITORY_ROOT / "runtime-manifests/gpu-auto-qualification-linux-x86_64.json"
 EXPECTED_AUTO_BYTES = b'{"schema_version":1,"mode":"default_deny","target_os":"linux","target_arch":"x86_64","entries":[]}\n'
+PRODUCTION_AUTHORITY = REPOSITORY_ROOT / "runtime-manifests/linux-gpu-qualification-production-authority.json"
+EXPECTED_AUTHORITY_BYTES = b'{"approved_plan_sha256":[],"kind":"linux_gpu_qualification_production_authority","schema_version":1}\n'
 
 spec = importlib.util.spec_from_file_location("linux_gpu_qualification", TOOL_PATH)
 assert spec is not None and spec.loader is not None
@@ -244,23 +246,18 @@ class QualificationFixtureTests(unittest.TestCase):
 
     def test_checked_in_state_is_canonical_default_deny(self) -> None:
         self.assertEqual(AUTO_MANIFEST.read_bytes(), EXPECTED_AUTO_BYTES)
-        result = subprocess.run(
-            [
-                sys.executable,
-                str(TOOL_PATH),
-                "--plan",
-                str(REPOSITORY_ROOT / "runtime-manifests/linux-gpu-qualification-plan-x86_64.json"),
-                "--evidence",
-                str(REPOSITORY_ROOT / "runtime-manifests/linux-gpu-qualification-evidence-empty.json"),
-            ],
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-        decision = self.parse_success(result)
-        self.assertFalse(decision["auto_eligible"])
-        self.assertFalse(decision["evidence_complete"])
-        self.assertEqual(decision["lanes"], [])
+        self.assertEqual(PRODUCTION_AUTHORITY.read_bytes(), EXPECTED_AUTHORITY_BYTES)
+        authority = json.loads(PRODUCTION_AUTHORITY.read_bytes())
+        self.assertEqual(authority["approved_plan_sha256"], [])
+
+    def test_fixture_cannot_be_promoted_by_relabeling_and_rehashing(self) -> None:
+        plan, evidence = fixture_documents(fixture_lane())
+        plan["fixture_only"] = False
+        evidence["fixture_only"] = False
+        evidence["plan_sha256"] = qualification.canonical_digest(plan)
+        result = self.run_tool(plan, evidence, allow_fixture=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("protected production authority", result.stderr)
 
     def test_complete_boundary_fixture_is_deterministic_but_never_eligible(self) -> None:
         plan, evidence = fixture_documents(fixture_lane(110))
