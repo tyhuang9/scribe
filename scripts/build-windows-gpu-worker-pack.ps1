@@ -324,7 +324,7 @@ function ConvertFrom-VsWhereInstallationPaths([string]$Output, [string]$Componen
         throw "Visual Studio locator output for $ComponentId is oversized."
     }
     $paths = [System.Collections.Generic.List[string]]::new()
-    foreach ($line in @($Output -split "`r?`n")) {
+    foreach ($line in @($Output -split '\r?\n')) {
         if ([string]::IsNullOrWhiteSpace($line)) {
             continue
         }
@@ -460,7 +460,7 @@ function ConvertFrom-VcVarsEnvironmentOutput([string]$Output) {
     $environment = [System.Collections.Generic.Dictionary[string, string]]::new(
         [System.StringComparer]::OrdinalIgnoreCase
     )
-    foreach ($line in @($Output -split "`r?`n")) {
+    foreach ($line in @($Output -split '\r?\n')) {
         if ([string]::IsNullOrWhiteSpace($line) -or $line.StartsWith('=')) {
             continue
         }
@@ -931,7 +931,7 @@ function Assert-BaseToolchain($Contract, [string]$RepositoryRoot) {
     }
     $rustup = Get-CommandPath 'rustup.exe' 'rustup is required to verify the pinned Windows target.'
     $installedTargets = (Invoke-NativeProcess $rustup @('target', 'list', '--installed') 'Could not inspect installed Rust targets.').Stdout
-    if (-not @($installedTargets -split "`r?`n").Contains([string]$Contract.target_triple)) {
+    if (-not @($installedTargets -split '\r?\n').Contains([string]$Contract.target_triple)) {
         throw "Pinned Rust target $($Contract.target_triple) is not installed."
     }
 

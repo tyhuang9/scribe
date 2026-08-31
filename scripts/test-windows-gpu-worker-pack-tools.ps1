@@ -110,10 +110,19 @@ foreach ($index in 1..157) {
     $capturedVulkanShortJunctionFailure.Add($line)
 }
 if (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure $capturedVulkanShortJunctionFailure.ToArray())) { throw 'Sanitized 157-line observed Vulkan CMake ordering was not classified.' }
+$capturedVulkanShortJunctionCrlf = $capturedVulkanShortJunctionFailure -join "`r`n"
+$capturedVulkanShortJunctionLf = $capturedVulkanShortJunctionFailure -join "`n"
+if (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure $capturedVulkanShortJunctionCrlf) -or
+    -not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure $capturedVulkanShortJunctionLf)) {
+    throw 'Single-string CRLF/LF Vulkan CMake diagnostics were not classified.'
+}
 $reverseCapturedVulkanShortJunctionFailure = [System.Collections.Generic.List[object]]::new($capturedVulkanShortJunctionFailure)
 $reverseCapturedVulkanShortJunctionFailure[3] = $vulkanShortJunctionFailure[1]
 $reverseCapturedVulkanShortJunctionFailure[4] = $vulkanShortJunctionFailure[0]
-if (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure $reverseCapturedVulkanShortJunctionFailure.ToArray()) { throw 'Reverse observed Vulkan CMake ordering was classified.' }
+if (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure ($reverseCapturedVulkanShortJunctionFailure -join "`r`n")) { throw 'Reverse observed Vulkan CMake ordering was classified.' }
+$missingCapturedVulkanShortJunctionFailure = [System.Collections.Generic.List[object]]::new($capturedVulkanShortJunctionFailure)
+$missingCapturedVulkanShortJunctionFailure[80] = 'sanitized Cargo/CMake diagnostic output'
+if (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure ($missingCapturedVulkanShortJunctionFailure -join "`n")) { throw 'Missing observed Vulkan CMake marker was classified.' }
 $interveningVulkanShortJunctionFailure = [System.Collections.Generic.List[object]]::new()
 $interveningVulkanShortJunctionFailure.Add($vulkanShortJunctionFailure[0])
 $interveningVulkanShortJunctionFailure.Add($vulkanShortJunctionFailure[1])

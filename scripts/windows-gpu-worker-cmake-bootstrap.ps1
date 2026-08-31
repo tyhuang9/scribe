@@ -3,7 +3,7 @@ Set-StrictMode -Version Latest
 function Test-ScribeGpuWorkerKnownCmakeBootstrapFailure([object[]]$Output) {
     $lines = [System.Collections.Generic.List[string]]::new()
     foreach ($entry in @($Output)) {
-        foreach ($line in ([string]$entry -split "`r?`n")) {
+        foreach ($line in ([string]$entry -split '\r?\n')) {
             if ($lines.Count -ge 2048) { break }
             $lines.Add($(if ($line.Length -gt 1024) { $line.Substring(0, 1024) } else { $line }))
         }
