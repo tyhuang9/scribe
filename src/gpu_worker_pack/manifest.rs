@@ -1530,7 +1530,10 @@ fn open_directory_no_follow(path: &Path) -> Result<File, PackVerificationError> 
 fn same_directory_identity(handle: &File, path: &Path) -> Result<bool, PackVerificationError> {
     use std::os::unix::fs::MetadataExt;
     let held = handle.metadata().map_err(PackVerificationError::Io)?;
-    let observed = fs::symlink_metadata(path).map_err(PackVerificationError::Io)?;
+    let observed = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(_) => return Ok(false),
+    };
     Ok(observed.is_dir()
         && !observed.file_type().is_symlink()
         && held.dev() == observed.dev()
@@ -1673,7 +1676,10 @@ pub(crate) mod test_support {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!(
+        let temporary_directory = std::env::temp_dir();
+        #[cfg(target_os = "macos")]
+        let temporary_directory = temporary_directory.canonicalize().unwrap();
+        let root = temporary_directory.join(format!(
             "scribe-pack-{label}-{}-{nonce}",
             std::process::id()
         ));

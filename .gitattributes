@@ -9,4 +9,6 @@ runtime-manifests/gpu-worker-toolchain-macos-x86_64.json text eol=lf
 runtime-manifests/gpu-keychain-namespace-macos-release.json text eol=lf
 runtime-manifests/gpu-pack-release-authority-macos-empty.json text eol=lf
 runtime-manifests/linux-worker-install-contract-x86_64.json text eol=lf
+runtime-manifests/linux-release-package-x86_64.json text eol=lf
 *.sh text eol=lf
+scripts/inspect-linux-deb.py text eol=lf

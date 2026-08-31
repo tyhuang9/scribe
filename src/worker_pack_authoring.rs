@@ -52,7 +52,7 @@ impl AuthoringBackend {
     }
 }
 
-pub(crate) const AUTHOR_TARGET_CONTRACT: &str = "allowed authoring targets are cuda or vulkan on windows/x86_64, or metal on macos/aarch64 or macos/x86_64; backend, OS, and architecture values are lowercase and case-sensitive";
+pub(crate) const AUTHOR_TARGET_CONTRACT: &str = "allowed authoring targets are cuda or vulkan on windows/x86_64 or linux/x86_64, or metal on macos/aarch64 or macos/x86_64; backend, OS, and architecture values are lowercase and case-sensitive";
 
 #[derive(Clone, Debug)]
 pub(crate) enum SigningMode {
@@ -281,7 +281,7 @@ pub(crate) fn validate_authoring_target(
         (backend, target_os, target_arch),
         (
             AuthoringBackend::Cuda | AuthoringBackend::Vulkan,
-            "windows",
+            "windows" | "linux",
             "x86_64"
         ) | (AuthoringBackend::Metal, "macos", "aarch64" | "x86_64")
     );
@@ -520,6 +520,22 @@ mod tests {
                 "bin/scribe-inference-worker.exe",
             ),
             (
+                "linux-cuda",
+                AuthoringBackend::Cuda,
+                "transcribe-cpp-ggml-cuda",
+                "linux",
+                "x86_64",
+                "bin/scribe-inference-worker",
+            ),
+            (
+                "linux-vulkan",
+                AuthoringBackend::Vulkan,
+                "transcribe-cpp-ggml-vulkan",
+                "linux",
+                "x86_64",
+                "bin/scribe-inference-worker",
+            ),
+            (
                 "macos-metal-arm",
                 AuthoringBackend::Metal,
                 "transcribe-cpp-metal",
@@ -537,6 +553,9 @@ mod tests {
             ),
         ] {
             let root = temp_root(label);
+            if !root.join(worker_path).exists() {
+                fs::write(root.join(worker_path), b"worker").unwrap();
+            }
             let mut request = fixture_request(&root);
             request.backend = backend;
             request.provider = provider.to_owned();
@@ -566,7 +585,8 @@ mod tests {
             ("vulkan-macos", AuthoringBackend::Vulkan, "macos", "x86_64"),
             ("windows-arm", AuthoringBackend::Cuda, "windows", "aarch64"),
             ("macos-armv7", AuthoringBackend::Metal, "macos", "armv7"),
-            ("linux", AuthoringBackend::Metal, "linux", "x86_64"),
+            ("linux-metal", AuthoringBackend::Metal, "linux", "x86_64"),
+            ("linux-arm", AuthoringBackend::Cuda, "linux", "aarch64"),
             ("case-os", AuthoringBackend::Metal, "MacOS", "aarch64"),
             ("case-arch", AuthoringBackend::Metal, "macos", "AARCH64"),
             ("empty-os", AuthoringBackend::Metal, "", "aarch64"),

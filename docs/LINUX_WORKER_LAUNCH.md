@@ -39,6 +39,12 @@ the memfd earlier and surface a generic OS error. Every denial fails closed,
 does not fall back to the mutable source inode, and does not require newer
 `MFD_EXEC` support, preserving compatibility with kernel 5.15.
 
+The deterministic Debian package described in
+`docs/LINUX_RELEASE_PACKAGING.md` now publishes this CPU worker path with its
+exact SHA-256 embedded in the desktop and an exact installed-file inventory.
+Package verification rejects partial trees, links, mode changes, unexpected
+files, and worker-anchor mismatches before installation evidence is accepted.
+
 Future GPU packs retain their reserved FHS location under
 `/usr/lib/scribe/workers/packs/<id>/<version>/<digest>/`, but this delivery does
 not enable Linux GPU discovery, add release trust keys, or make GPU `Auto`
@@ -53,7 +59,7 @@ Run the isolated verification suite on Linux without Cargo:
 The suite intentionally uses `rustc` directly because the reviewed Linux
 Sherpa archive is not yet present. CI runs it on Ubuntu 22.04 and 24.04.
 
-Full Linux Cargo type-checking and package smoke evidence remain activation work
-until that reviewed Sherpa archive exists. PR 7D must also publish the
-root-private package tree atomically; sealed execution snapshots close the
-launch-time mutable-inode race but do not make partial package publication safe.
+Full Linux application Cargo builds and real inference smoke remain activation
+work until the reviewed Sherpa archive exists. Stage 7D verifies deterministic
+package assembly with synthetic executables; it does not claim a production
+transcription run.

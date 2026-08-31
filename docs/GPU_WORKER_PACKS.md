@@ -116,6 +116,14 @@ The complete ancestor chain and verified payload handles remain alive. Windows o
 reject reparse points and omit delete sharing so an ancestor or payload cannot
 be renamed out from under verification. Unix opens use `openat` with
 `O_DIRECTORY|O_NOFOLLOW` for ancestors and handle-relative payload access.
+Linux directory enumeration opens an independent `.` descriptor relative to
+the retained directory descriptor. Darwin instead duplicates the already
+validated retained descriptor with `F_DUPFD_CLOEXEC`; because that duplicate
+shares the open-file-description offset, Darwin scans are process-serialized
+and call `rewinddir` before each scan. Both paths pass only the disposable
+descriptor to `fdopendir`, verify its directory identity, and classify each
+name with `fstatat(AT_SYMLINK_NOFOLLOW)`; neither treats `/proc/self/fd` or
+`/dev/fd` as a portable directory namespace.
 Directory identities are checked again before the lease is returned and before
 launch handoff; unsupported platforms fail closed.
 
@@ -188,6 +196,16 @@ explicitly invalid/unprobed for GPU while CPU remains eligible. Two successful
 idle probes atomically replace that state and restore availability.
 
 ## Packaging and key provisioning
+
+Linux x86_64 uses the same Rust manifest verifier and immutable `PackStore` as
+the other platforms. `scripts/build-linux-release-package.sh` accepts prebuilt
+CPU executables and optional pre-signed pack roots, but the production Linux
+trust root is empty. Consequently CPU-only `.deb` assembly succeeds with an
+exact empty catalog while every nonempty CUDA/Vulkan input fails before
+publication. Fixture keys are confined to author/verifier tests and explicitly
+labeled size evidence. The package verifier requires the canonical FHS tree,
+exact inventory, desktop-to-CPU-worker digest binding, and an empty immutable
+pack directory. See `docs/LINUX_RELEASE_PACKAGING.md`.
 
 `scripts/stage-verified-worker-packs.ps1` accepts only prebuilt, pre-signed pack
 roots. It invokes the compiled production verifier before and after copying,

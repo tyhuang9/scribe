@@ -12,6 +12,12 @@ use anyhow::{Result, anyhow, bail};
 )]
 #[path = "../../../src/gpu_worker_pack/manifest.rs"]
 mod manifest;
+#[allow(
+    dead_code,
+    reason = "the release tool exposes only bounded store operations needed during packaging"
+)]
+#[path = "../../../src/gpu_worker_pack/store.rs"]
+mod store;
 mod onnx_worker {
     pub(crate) use crate::worker_identity::{
         DESKTOP_BUILD_ID, INFERENCE_WORKER_BUILD_ID, PROTOCOL_VERSION, WORKER_ABI_VERSION,
@@ -22,6 +28,8 @@ mod worker_identity;
 #[path = "../../../src/worker_pack_authoring.rs"]
 mod worker_pack_authoring;
 
+use manifest::{Compatibility, PackBackend, PackVerifier, ProductionTrustRoot};
+use store::PackStore;
 use worker_pack_authoring::{
     AUTHOR_TARGET_CONTRACT, AuthorRequest, AuthoringBackend, SigningMode, author_pack,
     check_production_signing_key, validate_authoring_target, verify_fixture_pack,
@@ -29,10 +37,12 @@ use worker_pack_authoring::{
 
 const HELP_TEXT: &str = "Scribe worker-pack authoring tool\n\
 commands:\n\
-  author --backend <cuda|vulkan|metal> [--target-os <windows|macos> --target-arch <x86_64|aarch64>] ...\n\
+  author --backend <cuda|vulkan|metal> [--target-os <windows|linux|macos> --target-arch <x86_64|aarch64>] ...\n\
   verify-fixture --pack-root <path>\n\
+  verify-production-linux --pack-root <path>\n\
+  install-production-linux --pack-root <path> --packs-root <path> --state-root <path>\n\
   check-production-key --key-id <id> --private-key <path>\n\
-Author targets: cuda or vulkan on windows/x86_64; metal on macos/aarch64 or macos/x86_64.\n\
+Author targets: cuda or vulkan on windows/x86_64 or linux/x86_64; metal on macos/aarch64 or macos/x86_64.\n\
 The target flags may be omitted only for legacy cuda/vulkan authoring, which defaults to windows/x86_64. Values are lowercase and case-sensitive.";
 
 fn main() {
@@ -44,9 +54,9 @@ fn main() {
 
 fn run() -> Result<()> {
     let mut arguments = std::env::args_os().skip(1);
-    let command = arguments.next().ok_or_else(|| {
-        anyhow!("expected author, verify-fixture, check-production-key, or --help\n{HELP_TEXT}")
-    })?;
+    let command = arguments
+        .next()
+        .ok_or_else(|| anyhow!("expected a documented command or --help\n{HELP_TEXT}"))?;
     let remaining = arguments.collect::<Vec<_>>();
     if matches!(command.to_str(), Some("--help" | "help")) {
         if !remaining.is_empty() {
@@ -65,6 +75,24 @@ fn run() -> Result<()> {
             println!("{}", serde_json::to_string(&descriptor)?);
             Ok(())
         }
+        Some("verify-production-linux") => {
+            require_exact_options(&options, &["--pack-root"])?;
+            let verifier = linux_production_verifier();
+            let verified = verifier.verify(&PathBuf::from(required(&options, "--pack-root")?))?;
+            println!("{}", serde_json::to_string(&verified)?);
+            Ok(())
+        }
+        Some("install-production-linux") => {
+            require_exact_options(&options, &["--pack-root", "--packs-root", "--state-root"])?;
+            let verifier = linux_production_verifier();
+            let packs_root = PathBuf::from(required(&options, "--packs-root")?);
+            let state_root = PathBuf::from(required(&options, "--state-root")?);
+            let store = PackStore::new(&packs_root, &state_root, &verifier);
+            let installed =
+                store.stage_and_install(&PathBuf::from(required(&options, "--pack-root")?))?;
+            println!("{}", serde_json::to_string(&installed)?);
+            Ok(())
+        }
         Some("check-production-key") => {
             require_exact_options(&options, &["--key-id", "--private-key"])?;
             check_production_signing_key(
@@ -74,8 +102,22 @@ fn run() -> Result<()> {
             println!("production signing key matches embedded trust");
             Ok(())
         }
-        _ => bail!("expected author, verify-fixture, check-production-key, or --help\n{HELP_TEXT}"),
+        _ => bail!("expected a documented command or --help\n{HELP_TEXT}"),
     }
+}
+
+fn linux_production_verifier() -> PackVerifier<'static> {
+    static ALLOWED_BACKENDS: [PackBackend; 2] = [PackBackend::Cuda, PackBackend::Vulkan];
+    PackVerifier::new(
+        &ProductionTrustRoot,
+        Compatibility {
+            app_build: worker_identity::DESKTOP_BUILD_ID,
+            worker_build: worker_identity::INFERENCE_WORKER_BUILD_ID,
+            target_os: "linux",
+            target_arch: "x86_64",
+            allowed_backends: &ALLOWED_BACKENDS,
+        },
+    )
 }
 
 fn run_author(options: &BTreeMap<String, OsString>) -> Result<()> {
@@ -285,6 +327,16 @@ mod tests {
     }
 
     #[test]
+    fn explicit_linux_gpu_targets_accept_x86_64() {
+        for backend in ["cuda", "vulkan"] {
+            let options = explicit_target_options(backend, "linux", "x86_64");
+            let request = author_request_from_options(&options).unwrap();
+            assert_eq!(request.target_os, "linux");
+            assert_eq!(request.target_arch, "x86_64");
+        }
+    }
+
+    #[test]
     fn cli_rejects_missing_or_incoherent_backend_targets() {
         let mut missing_target = fixture_options(&[]);
         missing_target.insert("--backend".to_owned(), OsString::from("metal"));
@@ -310,6 +362,8 @@ mod tests {
             ("vulkan", "macos", "x86_64"),
             ("metal", "macos", "arm64"),
             ("metal", "linux", "x86_64"),
+            ("cuda", "linux", "aarch64"),
+            ("vulkan", "linux", "arm64"),
             ("Metal", "macos", "aarch64"),
             ("metal", "MacOS", "aarch64"),
             ("metal", "macos", ""),
@@ -327,7 +381,37 @@ mod tests {
     #[test]
     fn help_enumerates_the_exact_authoring_contract() {
         assert!(HELP_TEXT.contains("cuda or vulkan on windows/x86_64"));
+        assert!(HELP_TEXT.contains("linux/x86_64"));
         assert!(HELP_TEXT.contains("metal on macos/aarch64 or macos/x86_64"));
         assert!(HELP_TEXT.contains("defaults to windows/x86_64"));
+        assert!(HELP_TEXT.contains("verify-production-linux"));
+        assert!(HELP_TEXT.contains("install-production-linux"));
+    }
+
+    #[test]
+    fn linux_production_verifier_has_no_fixture_trust() {
+        let root = std::env::temp_dir().join(format!(
+            "scribe-linux-production-trust-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        std::fs::write(root.join("bin/scribe-inference-worker"), b"worker").unwrap();
+        let request = AuthorRequest {
+            pack_root: root.clone(),
+            pack_id: "scribe-vulkan-linux-x64".to_owned(),
+            pack_version: "1.0.0-fixture".to_owned(),
+            security_epoch: 1,
+            backend: AuthoringBackend::Vulkan,
+            provider: "transcribe-cpp-ggml-vulkan".to_owned(),
+            target_os: "linux".to_owned(),
+            target_arch: "x86_64".to_owned(),
+            worker_path: "bin/scribe-inference-worker".to_owned(),
+            signing: SigningMode::Fixture,
+        };
+        author_pack(&request).unwrap();
+        let error = linux_production_verifier().verify(&root).unwrap_err();
+        assert!(matches!(error, manifest::PackVerificationError::UnknownKey));
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -1,12 +1,16 @@
 use std::collections::BTreeMap;
-use std::fs::{self, File, OpenOptions};
+#[cfg(any(windows, test))]
+use std::fs::OpenOptions;
+use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::ffi::CStr;
 #[cfg(unix)]
 use std::ffi::CString;
 #[cfg(unix)]
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
 
 use getrandom::fill;
 use serde::{Deserialize, Serialize};
@@ -124,10 +128,42 @@ struct AnchoredDirectory {
     chain: Vec<File>,
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct UnixDirectoryStream(*mut libc::DIR);
+
+#[cfg(target_os = "macos")]
+static MACOS_ANCHORED_DIRECTORY_SCAN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl UnixDirectoryStream {
+    fn close(mut self) -> io::Result<()> {
+        let stream = std::mem::replace(&mut self.0, std::ptr::null_mut());
+        if unsafe { libc::closedir(stream) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl Drop for UnixDirectoryStream {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { libc::closedir(self.0) };
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct DirectoryIdentity {
     volume: u64,
     file: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AnchoredEntryKind {
+    Directory,
+    File,
 }
 
 impl AnchoredDirectory {
@@ -221,17 +257,6 @@ impl AnchoredDirectory {
 
     fn identity(&self) -> Result<DirectoryIdentity, PackStoreError> {
         directory_identity(self.leaf())
-    }
-
-    fn verification_path(&self) -> PathBuf {
-        #[cfg(target_os = "linux")]
-        return PathBuf::from(format!("/proc/self/fd/{}", self.leaf().as_raw_fd()));
-        #[cfg(all(unix, not(target_os = "linux")))]
-        return PathBuf::from(format!("/dev/fd/{}", self.leaf().as_raw_fd()));
-        #[cfg(windows)]
-        return self.path.clone();
-        #[cfg(not(any(unix, windows)))]
-        self.path.clone()
     }
 }
 
@@ -509,12 +534,7 @@ impl<'a> PackStore<'a> {
                 }
             }
         }
-        for entry in fs::read_dir(lock.root().verification_path())? {
-            let name = entry?
-                .file_name()
-                .to_str()
-                .ok_or(PackStoreError::CorruptState("state entry name"))?
-                .to_owned();
+        for name in anchored_child_names(lock.root())? {
             if name.starts_with('.') && name.contains(".tmp-") {
                 lock.remove_temporary(&name)?;
             }
@@ -1157,35 +1177,25 @@ fn create_file_at(
 
 fn make_payload_readonly_anchored(root: &AnchoredDirectory) -> Result<(), PackStoreError> {
     root.recheck()?;
-    for entry in fs::read_dir(root.verification_path())? {
-        let entry = entry?;
-        let name = entry
-            .file_name()
-            .to_str()
-            .ok_or(PackStoreError::CorruptState("staging entry name"))?
-            .to_owned();
-        validate_anchor_name(&name)?;
-        let metadata = fs::symlink_metadata(entry.path())?;
-        if is_link_or_reparse(&metadata) {
-            return Err(PackStoreError::UnsafeFilesystemEntry(entry.path()));
-        }
-        if metadata.is_dir() {
-            let child = root.open_child(&name, false)?;
-            make_payload_readonly_anchored(&child)?;
-        } else if metadata.is_file() {
-            let file = open_regular_file_at(root, &name)?;
-            let metadata = file.metadata()?;
-            if !metadata.is_file()
-                || is_link_or_reparse(&metadata)
-                || !regular_file_has_single_link(&file, &metadata)?
-            {
-                return Err(PackStoreError::UnsafeFilesystemEntry(root.path.join(&name)));
+    for (name, kind) in anchored_entries(root)? {
+        match kind {
+            AnchoredEntryKind::Directory => {
+                let child = root.open_child(&name, false)?;
+                make_payload_readonly_anchored(&child)?;
             }
-            let mut permissions = metadata.permissions();
-            permissions.set_readonly(true);
-            file.set_permissions(permissions)?;
-        } else {
-            return Err(PackStoreError::UnsafeFilesystemEntry(entry.path()));
+            AnchoredEntryKind::File => {
+                let file = open_regular_file_at(root, &name)?;
+                let metadata = file.metadata()?;
+                if !metadata.is_file()
+                    || is_link_or_reparse(&metadata)
+                    || !regular_file_has_single_link(&file, &metadata)?
+                {
+                    return Err(PackStoreError::UnsafeFilesystemEntry(root.path.join(&name)));
+                }
+                let mut permissions = metadata.permissions();
+                permissions.set_readonly(true);
+                file.set_permissions(permissions)?;
+            }
         }
     }
     root.recheck()?;
@@ -1276,26 +1286,14 @@ fn remove_staging_tree_anchored(staging: &AnchoredDirectory) -> Result<(), PackS
 }
 
 fn remove_anchored_contents(directory: &AnchoredDirectory) -> Result<(), PackStoreError> {
-    for entry in fs::read_dir(directory.verification_path())? {
-        let entry = entry?;
-        let name = entry
-            .file_name()
-            .to_str()
-            .ok_or(PackStoreError::CorruptState("staging entry name"))?
-            .to_owned();
-        validate_anchor_name(&name)?;
-        let metadata = entry.metadata()?;
-        if is_link_or_reparse(&metadata) {
-            return Err(PackStoreError::UnsafeFilesystemEntry(entry.path()));
-        }
-        if metadata.is_dir() {
-            let child = directory.open_child(&name, true)?;
-            remove_anchored_contents(&child)?;
-            remove_anchored_directory(&child)?;
-        } else if metadata.is_file() {
-            remove_anchored_file(directory, &name)?;
-        } else {
-            return Err(PackStoreError::UnsafeFilesystemEntry(entry.path()));
+    for (name, kind) in anchored_entries(directory)? {
+        match kind {
+            AnchoredEntryKind::Directory => {
+                let child = directory.open_child(&name, true)?;
+                remove_anchored_contents(&child)?;
+                remove_anchored_directory(&child)?;
+            }
+            AnchoredEntryKind::File => remove_anchored_file(directory, &name)?,
         }
     }
     Ok(())
@@ -1820,19 +1818,159 @@ fn same_anchored_directory(_handle: &File, _path: &Path) -> Result<bool, PackSto
 }
 
 fn anchored_child_names(directory: &AnchoredDirectory) -> Result<Vec<String>, PackStoreError> {
+    Ok(anchored_entries(directory)?
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn anchored_entries(
+    directory: &AnchoredDirectory,
+) -> Result<Vec<(String, AnchoredEntryKind)>, PackStoreError> {
+    #[cfg(target_os = "macos")]
+    let _scan_guard = MACOS_ANCHORED_DIRECTORY_SCAN_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     directory.recheck()?;
-    fs::read_dir(directory.verification_path())?
-        .map(|entry| {
-            let entry = entry?;
-            let name = entry
-                .file_name()
-                .to_str()
-                .ok_or(PackStoreError::CorruptState("anchored child name"))?
-                .to_owned();
-            validate_anchor_name(&name)?;
-            Ok(name)
-        })
-        .collect()
+
+    #[cfg(target_os = "linux")]
+    let descriptor = unsafe {
+        libc::openat(
+            directory.leaf().as_raw_fd(),
+            c".".as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    // Darwin's directory descriptor cannot be portably reopened through
+    // `openat(dirfd, ".", ...)`. Duplicate the retained authority instead.
+    // The duplicate shares its open-file-description offset, so the process-
+    // wide lock above and the `rewinddir` below must cover the complete scan.
+    #[cfg(target_os = "macos")]
+    let descriptor = unsafe { libc::fcntl(directory.leaf().as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+    if descriptor < 0 {
+        return Err(PackStoreError::Io(io::Error::last_os_error()));
+    }
+    let reopened = unsafe { File::from_raw_fd(descriptor) };
+    if directory_identity(&reopened)? != directory.identity()? {
+        return Err(PackStoreError::UnsafeFilesystemEntry(
+            directory.path.clone(),
+        ));
+    }
+    let descriptor = reopened.into_raw_fd();
+    let stream = unsafe { libc::fdopendir(descriptor) };
+    if stream.is_null() {
+        let error = io::Error::last_os_error();
+        unsafe { libc::close(descriptor) };
+        return Err(PackStoreError::Io(error));
+    }
+    let stream = UnixDirectoryStream(stream);
+    #[cfg(target_os = "macos")]
+    unsafe {
+        libc::rewinddir(stream.0);
+    }
+
+    let mut entries = Vec::new();
+    loop {
+        unsafe { *unix_errno_location() = 0 };
+        let entry = unsafe { libc::readdir(stream.0) };
+        if entry.is_null() {
+            let error = unsafe { *unix_errno_location() };
+            if error != 0 {
+                return Err(PackStoreError::Io(io::Error::from_raw_os_error(error)));
+            }
+            break;
+        }
+        let raw_name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+        let name = raw_name
+            .to_str()
+            .map_err(|_| PackStoreError::CorruptState("anchored child name"))?;
+        if matches!(name, "." | "..") {
+            continue;
+        }
+        validate_anchor_name(name)?;
+        let kind = anchored_entry_kind(directory, name)?;
+        entries.push((name.to_owned(), kind));
+    }
+    stream.close()?;
+    directory.recheck()?;
+    Ok(entries)
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn unix_errno_location() -> *mut libc::c_int {
+    unsafe { libc::__errno_location() }
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn unix_errno_location() -> *mut libc::c_int {
+    unsafe { libc::__error() }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn anchored_entry_kind(
+    directory: &AnchoredDirectory,
+    name: &str,
+) -> Result<AnchoredEntryKind, PackStoreError> {
+    let raw_name = CString::new(name).expect("validated anchor name");
+    let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe {
+        libc::fstatat(
+            directory.leaf().as_raw_fd(),
+            raw_name.as_ptr(),
+            metadata.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(PackStoreError::Io(io::Error::last_os_error()));
+    }
+    let mode = unsafe { metadata.assume_init() }.st_mode;
+    match mode & libc::S_IFMT {
+        libc::S_IFDIR => Ok(AnchoredEntryKind::Directory),
+        libc::S_IFREG => Ok(AnchoredEntryKind::File),
+        _ => Err(PackStoreError::UnsafeFilesystemEntry(
+            directory.path.join(name),
+        )),
+    }
+}
+
+#[cfg(windows)]
+fn anchored_entries(
+    directory: &AnchoredDirectory,
+) -> Result<Vec<(String, AnchoredEntryKind)>, PackStoreError> {
+    directory.recheck()?;
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(&directory.path)? {
+        let entry = entry?;
+        let name = entry
+            .file_name()
+            .to_str()
+            .ok_or(PackStoreError::CorruptState("anchored child name"))?
+            .to_owned();
+        validate_anchor_name(&name)?;
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if is_link_or_reparse(&metadata) {
+            return Err(PackStoreError::UnsafeFilesystemEntry(entry.path()));
+        }
+        let kind = if metadata.is_dir() {
+            AnchoredEntryKind::Directory
+        } else if metadata.is_file() {
+            AnchoredEntryKind::File
+        } else {
+            return Err(PackStoreError::UnsafeFilesystemEntry(entry.path()));
+        };
+        entries.push((name, kind));
+    }
+    directory.recheck()?;
+    Ok(entries)
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+fn anchored_entries(
+    _directory: &AnchoredDirectory,
+) -> Result<Vec<(String, AnchoredEntryKind)>, PackStoreError> {
+    Err(PackStoreError::UnsupportedAnchoredFilesystem)
 }
 
 pub(super) fn read_canonical_state<T>(path: &Path) -> Result<T, PackStoreError>
@@ -2596,6 +2734,8 @@ pub(crate) enum PackStoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::cell::Cell;
     use std::sync::Arc;
 
     fn current_descriptor(store: &PackStore<'_>) -> Option<VerifiedPack> {
@@ -2721,10 +2861,8 @@ mod tests {
         drop(held);
         fs::remove_dir_all(root).unwrap();
     }
-    use crate::gpu_worker_pack::manifest::test_support::{
-        base_manifest, fixture, temp_root, write_signed,
-    };
-    use crate::gpu_worker_pack::manifest::{Compatibility, PackBackend};
+    use super::super::manifest::test_support::{base_manifest, fixture, temp_root, write_signed};
+    use super::super::manifest::{Compatibility, PackBackend};
 
     fn store_fixture(
         label: &str,
@@ -2789,6 +2927,9 @@ mod tests {
     }
 
     fn restore_pack_id_directory(link: &Path, external: &Path) {
+        #[cfg(unix)]
+        fs::remove_file(link).unwrap();
+        #[cfg(windows)]
         fs::remove_dir(link).unwrap();
         fs::rename(external, link).unwrap();
     }
@@ -2817,6 +2958,93 @@ mod tests {
         fs::remove_file(link).unwrap();
         #[cfg(windows)]
         fs::remove_dir(link).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn rename_open_directory_or_reject(source: &Path, destination: &Path) -> bool {
+        use std::os::unix::fs::MetadataExt;
+
+        let before = fs::symlink_metadata(source).unwrap();
+        assert!(before.is_dir() && !before.file_type().is_symlink());
+        match fs::rename(source, destination) {
+            Ok(()) => true,
+            Err(error) if error.raw_os_error() == Some(libc::EPERM) => {
+                let after = fs::symlink_metadata(source).unwrap();
+                assert!(after.is_dir() && !after.file_type().is_symlink());
+                assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
+                assert!(!destination.exists());
+                false
+            }
+            Err(error) => panic!("open-directory rename failed with an unexpected error: {error}"),
+        }
+    }
+
+    #[test]
+    fn anchored_directory_enumeration_does_not_depend_on_descriptor_paths() {
+        let root = temp_root("descriptor-directory-enumeration");
+        let authority = root.join("authority");
+        fs::create_dir(&authority).unwrap();
+        fs::create_dir(authority.join("child")).unwrap();
+        fs::write(authority.join("payload.bin"), b"payload").unwrap();
+        let anchored = AnchoredDirectory::open_root(&authority).unwrap();
+
+        let mut entries = anchored_entries(&anchored).unwrap();
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(
+            entries,
+            vec![
+                ("child".to_owned(), AnchoredEntryKind::Directory),
+                ("payload.bin".to_owned(), AnchoredEntryKind::File),
+            ]
+        );
+
+        let mut repeated = anchored_entries(&anchored).unwrap();
+        repeated.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(repeated, entries);
+
+        drop(anchored);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn anchored_directory_enumeration_serializes_and_rewinds_shared_offsets() {
+        const THREADS: usize = 8;
+        const SCANS_PER_THREAD: usize = 32;
+
+        let root = temp_root("descriptor-directory-concurrent-enumeration");
+        let authority = root.join("authority");
+        fs::create_dir(&authority).unwrap();
+        fs::create_dir(authority.join("child")).unwrap();
+        fs::write(authority.join("payload.bin"), b"payload").unwrap();
+        let anchored = Arc::new(AnchoredDirectory::open_root(&authority).unwrap());
+        let barrier = Arc::new(std::sync::Barrier::new(THREADS));
+        let expected = vec![
+            ("child".to_owned(), AnchoredEntryKind::Directory),
+            ("payload.bin".to_owned(), AnchoredEntryKind::File),
+        ];
+
+        let threads = (0..THREADS)
+            .map(|_| {
+                let anchored = Arc::clone(&anchored);
+                let barrier = Arc::clone(&barrier);
+                let expected = expected.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    for _ in 0..SCANS_PER_THREAD {
+                        let mut entries = anchored_entries(&anchored).unwrap();
+                        entries.sort_by(|left, right| left.0.cmp(&right.0));
+                        assert_eq!(entries, expected);
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+
+        drop(anchored);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -3293,7 +3521,12 @@ mod tests {
         }
         #[cfg(unix)]
         {
-            fs::rename(&pack_id, &moved).unwrap();
+            if !rename_open_directory_or_reject(&pack_id, &moved) {
+                verifier.launchable_worker(&lease).unwrap();
+                drop(lease);
+                fs::remove_dir_all(root).unwrap();
+                return;
+            }
             let decoy = root.join("decoy-pack-id");
             fs::create_dir(&decoy).unwrap();
             let sentinel = decoy.join("sentinel.txt");
@@ -3338,6 +3571,8 @@ mod tests {
         let sentinel = external.join("sentinel.txt");
         fs::write(&sentinel, b"must remain untouched").unwrap();
         let moved = root.join("moved-version");
+        #[cfg(unix)]
+        let swapped = Cell::new(false);
 
         let result = store.stage_and_install_inner(
             &root.join("source"),
@@ -3347,8 +3582,10 @@ mod tests {
                 assert!(fs::rename(version, &moved).is_err());
                 #[cfg(unix)]
                 {
-                    fs::rename(version, &moved).unwrap();
-                    std::os::unix::fs::symlink(&external, version).unwrap();
+                    if rename_open_directory_or_reject(version, &moved) {
+                        std::os::unix::fs::symlink(&external, version).unwrap();
+                        swapped.set(true);
+                    }
                 }
             },
             |_| {},
@@ -3357,11 +3594,11 @@ mod tests {
         #[cfg(windows)]
         assert!(result.is_ok());
         #[cfg(unix)]
-        assert!(result.is_err());
+        assert_eq!(result.is_err(), swapped.get());
         assert_eq!(fs::read(&sentinel).unwrap(), b"must remain untouched");
         assert_eq!(fs::read_dir(&external).unwrap().count(), 1);
         #[cfg(unix)]
-        {
+        if swapped.get() {
             let version = workers.join("packs").join("scribe-vulkan").join("1.2.3");
             fs::remove_file(version).unwrap();
         }
@@ -3377,6 +3614,8 @@ mod tests {
         let sentinel = external.join("sentinel.txt");
         fs::write(&sentinel, b"must remain untouched").unwrap();
         let moved = root.join("moved-staging");
+        #[cfg(unix)]
+        let swapped = Cell::new(false);
 
         let result = store.stage_and_install_inner(
             &root.join("source"),
@@ -3387,8 +3626,10 @@ mod tests {
                 assert!(fs::rename(staging, &moved).is_err());
                 #[cfg(unix)]
                 {
-                    fs::rename(staging, &moved).unwrap();
-                    std::os::unix::fs::symlink(&external, staging).unwrap();
+                    if rename_open_directory_or_reject(staging, &moved) {
+                        std::os::unix::fs::symlink(&external, staging).unwrap();
+                        swapped.set(true);
+                    }
                 }
             },
         );
@@ -3396,11 +3637,11 @@ mod tests {
         #[cfg(windows)]
         assert!(result.is_ok());
         #[cfg(unix)]
-        assert!(result.is_err());
+        assert_eq!(result.is_err(), swapped.get());
         assert_eq!(fs::read(&sentinel).unwrap(), b"must remain untouched");
         assert_eq!(fs::read_dir(&external).unwrap().count(), 1);
         #[cfg(unix)]
-        {
+        if swapped.get() {
             let version = workers.join("packs").join("scribe-vulkan").join("1.2.3");
             for entry in fs::read_dir(&version).unwrap() {
                 let entry = entry.unwrap();
@@ -3429,6 +3670,8 @@ mod tests {
             contention_started.elapsed() < std::time::Duration::from_secs(2),
             "state authority lock contention was not bounded"
         );
+        #[cfg(unix)]
+        let swapped = Cell::new(false);
 
         #[cfg(windows)]
         {
@@ -3439,16 +3682,22 @@ mod tests {
         }
         #[cfg(unix)]
         {
-            fs::rename(&state, &moved).unwrap();
-            fs::create_dir(&state).unwrap();
-            let sentinel = state.join("sentinel.txt");
-            fs::write(&sentinel, b"must remain untouched").unwrap();
-            assert!(
+            if rename_open_directory_or_reject(&state, &moved) {
+                swapped.set(true);
+                fs::create_dir(&state).unwrap();
+                let sentinel = state.join("sentinel.txt");
+                fs::write(&sentinel, b"must remain untouched").unwrap();
+                assert!(
+                    lock.write(&store.epoch_path(), &EpochState::empty())
+                        .is_err()
+                );
+                assert_eq!(fs::read(&sentinel).unwrap(), b"must remain untouched");
+                assert!(!state.join("security-epochs.json").exists());
+            } else {
                 lock.write(&store.epoch_path(), &EpochState::empty())
-                    .is_err()
-            );
-            assert_eq!(fs::read(&sentinel).unwrap(), b"must remain untouched");
-            assert!(!state.join("security-epochs.json").exists());
+                    .unwrap();
+                assert!(store.epoch_path().is_file());
+            }
         }
         drop(lock);
         let second = exclusive_file_lock(&second_lock_path).unwrap();
@@ -3457,10 +3706,12 @@ mod tests {
             .unwrap();
         drop(second);
         #[cfg(unix)]
-        assert_eq!(
-            fs::read(state.join("sentinel.txt")).unwrap(),
-            b"must remain untouched"
-        );
+        if swapped.get() {
+            assert_eq!(
+                fs::read(state.join("sentinel.txt")).unwrap(),
+                b"must remain untouched"
+            );
+        }
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -3536,6 +3787,8 @@ mod tests {
         fs::create_dir(&external).unwrap();
         let sentinel = external.join("sentinel.txt");
         fs::write(&sentinel, b"outside remains unchanged").unwrap();
+        #[cfg(unix)]
+        let swapped = Cell::new(false);
         let result = store.stage_and_install_inner(
             &source,
             |source| {
@@ -3543,8 +3796,10 @@ mod tests {
                 assert!(fs::rename(source, &moved).is_err());
                 #[cfg(unix)]
                 {
-                    fs::rename(source, &moved).unwrap();
-                    std::os::unix::fs::symlink(&external, source).unwrap();
+                    if rename_open_directory_or_reject(source, &moved) {
+                        std::os::unix::fs::symlink(&external, source).unwrap();
+                        swapped.set(true);
+                    }
                 }
             },
             |_| {},
@@ -3554,11 +3809,11 @@ mod tests {
         #[cfg(windows)]
         assert!(result.is_ok());
         #[cfg(unix)]
-        assert!(result.is_err());
+        assert_eq!(result.is_err(), swapped.get());
         assert_eq!(fs::read(&sentinel).unwrap(), b"outside remains unchanged");
         assert_eq!(fs::read_dir(&external).unwrap().count(), 1);
         #[cfg(unix)]
-        {
+        if swapped.get() {
             fs::remove_file(&source).unwrap();
             fs::rename(&moved, &source).unwrap();
         }
