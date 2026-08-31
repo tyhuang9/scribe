@@ -33,22 +33,68 @@ def digest(label: str) -> str:
     return hashlib.sha256(label.encode("ascii")).hexdigest()
 
 
-def metric_run(mode: str, target: str, sequence: int, gpu_warm_ms: int) -> dict[str, Any]:
+def envelope_bytes(kind: str, record: dict[str, Any]) -> bytes:
+    return qualification.canonical_bytes({"kind": kind, "record": record, "schema_version": 1})
+
+
+def metric_run(
+    mode: str,
+    target: str,
+    sequence: int,
+    gpu_warm_ms: int,
+    identity: dict[str, Any],
+) -> dict[str, Any]:
     if mode == "cold":
         end_to_end_ms = 200 + sequence if target == "cpu" else 180 + sequence
     else:
         end_to_end_ms = 100 if target == "cpu" else gpu_warm_ms
-    return {
-        "artifact_path": f"runs/{mode}/{target}/{sequence:02}.evidence",
-        "artifact_sha256": digest(f"{mode}-{target}-{sequence}"),
+    acquisition = identity["acquisition"]
+    worker = identity["cpu_baseline"] if target == "cpu" else identity["gpu_worker"]
+    record = {
+        "acquisition_batch_id": acquisition["batch_id"],
         "backend_ms": end_to_end_ms - 10,
         "end_to_end_ms": end_to_end_ms,
+        "execution": {
+            "backend": "cpu" if target == "cpu" else identity["backend"],
+            "device_memory_kind": "none" if target == "cpu" else identity["device"]["memory_model"],
+            "hello_sha256": digest(f"hello-{mode}-{target}-{sequence}"),
+            "protocol_version": worker["protocol_version"],
+            "provider_id": worker["provider_id"],
+            "runtime_abi": worker["runtime_abi"],
+            "stable_device_id": "cpu:host" if target == "cpu" else identity["device"]["stable_device_id"],
+            "worker_build_id": worker["worker_build_id"],
+            "worker_generation": (
+                f"{acquisition['batch_id']}:{mode}:{target}:{sequence:02}"
+                if mode == "cold"
+                else f"{acquisition['batch_id']}:warm:{target}"
+            ),
+            "worker_sha256": worker["worker_sha256"],
+        },
         "failure_category": "none",
+        "machine_id_sha256": acquisition["machine_id_sha256"],
         "outcome": "success",
+        "pair_id": f"{acquisition['batch_id']}:{mode}:{sequence:02}",
+        "pair_order": "cpu_then_gpu" if sequence % 2 else "gpu_then_cpu",
         "peak_process_memory_bytes": 600_000_000 + sequence * 1024,
+        "peak_shared_device_memory_bytes": 0,
         "peak_vram_bytes": 0 if target == "cpu" else 800_000_000 + sequence * 2048,
+        "priming_runs": 0 if mode == "cold" else 1,
+        "reset_state": "fresh_process_fresh_model" if mode == "cold" else "same_process_primed_model",
         "sequence": sequence,
+        "session_id": (
+            f"{acquisition['batch_id']}:{mode}:{sequence:02}:session"
+            if mode == "cold"
+            else f"{acquisition['batch_id']}:warm:session"
+        ),
         "transcript_sha256": digest("expected-transcript"),
+    }
+    path = f"{identity['lane_id']}/runs/{mode}/{target}/{sequence:02}.evidence"
+    return {
+        "artifact_path": path,
+        "artifact_sha256": hashlib.sha256(
+            envelope_bytes("linux_gpu_qualification_run_artifact", record)
+        ).hexdigest(),
+        **record,
     }
 
 
@@ -57,14 +103,66 @@ def fixture_lane(gpu_warm_ms: int = 110) -> dict[str, Any]:
     stable_id = "native:pci:0000:01:00.0"
     identity = {
         "backend": "cuda",
+        "acquisition": {
+            "batch_id": "fixture-batch-001",
+            "controls": {
+                "background_load_policy": "isolated",
+                "cpu_governor": "performance",
+                "gpu_power_profile": "fixed_maximum_performance",
+                "power_source": "ac",
+                "thermal_policy": "no_throttling_observed",
+            },
+            "host": {
+                "cpu_arch": "x86_64",
+                "cpu_model_sha256": digest("cpu-model"),
+                "logical_cpus": 16,
+                "numa_nodes": 1,
+                "physical_cores": 8,
+                "total_memory_bytes": 32_000_000_000,
+            },
+            "machine_id_sha256": digest("machine"),
+            "ordering": {
+                "scheme": "paired_alternating_cpu_first_v1",
+                "warm_priming_runs": 1,
+            },
+            "protocol": {
+                "harness_sha256": digest("qualification-harness"),
+                "protocol_id": "scribe-linux-gpu-qualification",
+                "protocol_version": 1,
+            },
+            "threading": {
+                "cpu_affinity_sha256": digest("cpu-affinity"),
+                "cpu_worker_threads": 8,
+                "gpu_affinity_sha256": digest("gpu-affinity"),
+                "gpu_worker_threads": 4,
+            },
+        },
+        "cpu_baseline": {
+            "backend": "cpu",
+            "protocol_version": 5,
+            "provider_id": "scribe-inference-worker-cpu",
+            "runtime_abi": 1,
+            "worker_build_id": "scribe-inference-worker@0.1.0#fixture-cpu",
+            "worker_sha256": digest("cpu-worker"),
+        },
         "device": {
             "device_class": "discrete_gpu",
+            "memory_model": "dedicated_vram",
+            "qualified_minimum_total_memory_bytes": 8_000_000_000,
             "stable_device_id": stable_id,
             "total_memory_bytes": 12_884_901_888,
             "vendor": "nvidia",
         },
         "driver": {"kind": "exact", "value": driver},
         "glibc_version": "2.35",
+        "gpu_worker": {
+            "backend": "cuda",
+            "protocol_version": 5,
+            "provider_id": "transcribe-cpp-ggml-cuda",
+            "runtime_abi": 1,
+            "worker_build_id": "scribe-inference-worker@0.1.0#fixture-cuda",
+            "worker_sha256": digest("gpu-worker"),
+        },
         "kernel_version": "5.15.0-213-generic",
         "lane_id": "fixture-ubuntu-22.04-nvidia-cuda",
         "model": {"model_digest": digest("model"), "model_id": "whisper-base-en-q8_0"},
@@ -87,18 +185,17 @@ def fixture_lane(gpu_warm_ms: int = 110) -> dict[str, Any]:
     run_sets = {
         mode: {
             target: [
-                metric_run(mode, target, sequence, gpu_warm_ms)
+                metric_run(mode, target, sequence, gpu_warm_ms, identity)
                 for sequence in range(1, (5 if mode == "cold" else 20) + 1)
             ]
             for target in ("cpu", "gpu")
         }
         for mode in ("cold", "warm")
     }
-    lifecycle = [
+    lifecycle_records = [
         {
             "active_request_migrated": False,
             "artifact_path": "events/device-loss.evidence",
-            "artifact_sha256": digest("event-device-loss"),
             "driver_after": driver,
             "driver_before": driver,
             "event": "device_loss",
@@ -112,7 +209,6 @@ def fixture_lane(gpu_warm_ms: int = 110) -> dict[str, Any]:
         {
             "active_request_migrated": False,
             "artifact_path": "events/driver-change.evidence",
-            "artifact_sha256": digest("event-driver-change"),
             "driver_after": driver,
             "driver_before": "linux:nvidia:570.26.00",
             "event": "driver_change",
@@ -126,7 +222,6 @@ def fixture_lane(gpu_warm_ms: int = 110) -> dict[str, Any]:
         {
             "active_request_migrated": False,
             "artifact_path": "events/suspend-resume.evidence",
-            "artifact_sha256": digest("event-suspend-resume"),
             "driver_after": driver,
             "driver_before": driver,
             "event": "suspend_resume",
@@ -138,11 +233,60 @@ def fixture_lane(gpu_warm_ms: int = 110) -> dict[str, Any]:
             "stable_device_id_after": stable_id,
         },
     ]
-    return {"identity": identity, "lifecycle": lifecycle, "run_sets": run_sets}
+    lifecycle = []
+    for value in lifecycle_records:
+        value["artifact_path"] = f"{identity['lane_id']}/{value['artifact_path']}"
+        record = {key: item for key, item in value.items() if key != "artifact_path"}
+        lifecycle.append(
+            {
+                "artifact_path": value["artifact_path"],
+                "artifact_sha256": hashlib.sha256(
+                    envelope_bytes("linux_gpu_qualification_lifecycle_artifact", record)
+                ).hexdigest(),
+                **record,
+            }
+        )
+    acquisition_path = f"{identity['lane_id']}/acquisition.evidence"
+    acquisition_sha256 = hashlib.sha256(
+        envelope_bytes("linux_gpu_qualification_acquisition_artifact", identity["acquisition"])
+    ).hexdigest()
+    return {
+        "acquisition_artifact_path": acquisition_path,
+        "acquisition_artifact_sha256": acquisition_sha256,
+        "identity": identity,
+        "lifecycle": lifecycle,
+        "run_sets": run_sets,
+    }
 
 
-def fixture_documents(lane: dict[str, Any] | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
-    lanes = [] if lane is None else [lane]
+def refresh_lane_artifact_digests(lane: dict[str, Any]) -> None:
+    lane["acquisition_artifact_sha256"] = hashlib.sha256(
+        envelope_bytes("linux_gpu_qualification_acquisition_artifact", lane["identity"]["acquisition"])
+    ).hexdigest()
+    for target_sets in lane["run_sets"].values():
+        for runs in target_sets.values():
+            for run in runs:
+                record = {
+                    key: value for key, value in run.items() if key not in {"artifact_path", "artifact_sha256"}
+                }
+                run["artifact_sha256"] = hashlib.sha256(
+                    envelope_bytes("linux_gpu_qualification_run_artifact", record)
+                ).hexdigest()
+    for event in lane["lifecycle"]:
+        record = {
+            key: value for key, value in event.items() if key not in {"artifact_path", "artifact_sha256"}
+        }
+        event["artifact_sha256"] = hashlib.sha256(
+            envelope_bytes("linux_gpu_qualification_lifecycle_artifact", record)
+        ).hexdigest()
+
+
+def fixture_documents_for_lanes(
+    lanes: list[dict[str, Any]],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    lanes.sort(key=lambda value: value["identity"]["lane_id"])
+    for value in lanes:
+        refresh_lane_artifact_digests(value)
     bindings = {
         field: qualification.file_sha256(REPOSITORY_ROOT / relative)
         for field, relative in qualification.CONTRACT_PATHS.items()
@@ -173,7 +317,13 @@ def fixture_documents(lane: dict[str, Any] | None = None) -> tuple[dict[str, Any
     return plan, evidence
 
 
+def fixture_documents(lane: dict[str, Any] | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
+    return fixture_documents_for_lanes([] if lane is None else [lane])
+
+
 def bind_documents(plan: dict[str, Any], evidence: dict[str, Any]) -> None:
+    for lane in evidence["lanes"]:
+        refresh_lane_artifact_digests(lane)
     plan["required_lanes"] = [
         {"evidence_sha256": qualification.canonical_digest(lane), "identity": lane["identity"]}
         for lane in evidence["lanes"]
@@ -214,16 +364,40 @@ class QualificationFixtureTests(unittest.TestCase):
         artifact_root = self.root / "artifacts"
         if prepare_artifacts:
             for lane in evidence["lanes"]:
+                acquisition_path = artifact_root / pathlib.PurePosixPath(
+                    lane["acquisition_artifact_path"]
+                )
+                acquisition_path.parent.mkdir(parents=True, exist_ok=True)
+                acquisition_path.write_bytes(
+                    envelope_bytes(
+                        "linux_gpu_qualification_acquisition_artifact",
+                        lane["identity"]["acquisition"],
+                    )
+                )
                 for mode, target_sets in lane["run_sets"].items():
                     for target, runs in target_sets.items():
                         for run in runs:
                             path = artifact_root / pathlib.PurePosixPath(run["artifact_path"])
                             path.parent.mkdir(parents=True, exist_ok=True)
-                            path.write_bytes(f"{mode}-{target}-{run['sequence']}".encode("ascii"))
+                            record = {
+                                key: value
+                                for key, value in run.items()
+                                if key not in {"artifact_path", "artifact_sha256"}
+                            }
+                            path.write_bytes(
+                                envelope_bytes("linux_gpu_qualification_run_artifact", record)
+                            )
                 for event in lane["lifecycle"]:
                     path = artifact_root / pathlib.PurePosixPath(event["artifact_path"])
                     path.parent.mkdir(parents=True, exist_ok=True)
-                    path.write_bytes(f"event-{event['event'].replace('_', '-')}".encode("ascii"))
+                    record = {
+                        key: value
+                        for key, value in event.items()
+                        if key not in {"artifact_path", "artifact_sha256"}
+                    }
+                    path.write_bytes(
+                        envelope_bytes("linux_gpu_qualification_lifecycle_artifact", record)
+                    )
         command = [
             sys.executable,
             str(TOOL_PATH),
@@ -320,6 +494,11 @@ class QualificationFixtureTests(unittest.TestCase):
                 lane = fixture_lane()
                 lane["identity"]["backend"] = "vulkan"
                 lane["identity"]["provider_id"] = "transcribe-cpp-ggml-vulkan"
+                lane["identity"]["gpu_worker"]["backend"] = "vulkan"
+                lane["identity"]["gpu_worker"]["provider_id"] = "transcribe-cpp-ggml-vulkan"
+                lane["identity"]["gpu_worker"]["worker_build_id"] = (
+                    "scribe-inference-worker@0.1.0#fixture-vulkan"
+                )
                 lane["identity"]["ubuntu_version"] = "24.04"
                 lane["identity"]["kernel_version"] = "6.8.0-85-generic"
                 lane["identity"]["glibc_version"] = "2.39"
@@ -327,6 +506,13 @@ class QualificationFixtureTests(unittest.TestCase):
                 lane["identity"]["device"]["vendor"] = vendor
                 lane["identity"]["driver"]["value"] = current_driver
                 lane["identity"]["pack"]["pack_id"] = "scribe-vulkan-linux-x64"
+                for mode in lane["run_sets"].values():
+                    for run in mode["gpu"]:
+                        run["execution"]["backend"] = "vulkan"
+                        run["execution"]["provider_id"] = "transcribe-cpp-ggml-vulkan"
+                        run["execution"]["worker_build_id"] = (
+                            "scribe-inference-worker@0.1.0#fixture-vulkan"
+                        )
                 for event in lane["lifecycle"]:
                     event["driver_after"] = current_driver
                     event["driver_before"] = prior_driver if event["event"] == "driver_change" else current_driver
@@ -334,6 +520,84 @@ class QualificationFixtureTests(unittest.TestCase):
                 decision = self.parse_success(self.run_tool(plan, evidence))
                 self.assertTrue(decision["qualification_passed"])
                 self.assertFalse(decision["auto_eligible"])
+
+    def test_integrated_and_unified_memory_are_explicitly_represented(self) -> None:
+        for device_class in ("integrated_gpu", "unified_gpu"):
+            with self.subTest(device_class=device_class):
+                lane = fixture_lane()
+                lane["identity"]["device"]["device_class"] = device_class
+                lane["identity"]["device"]["memory_model"] = "shared_host_memory"
+                for mode in lane["run_sets"].values():
+                    for run in mode["gpu"]:
+                        run["execution"]["device_memory_kind"] = "shared_host_memory"
+                        run["peak_shared_device_memory_bytes"] = run["peak_vram_bytes"]
+                        run["peak_vram_bytes"] = 0
+                plan, evidence = fixture_documents(lane)
+                decision = self.parse_success(self.run_tool(plan, evidence))
+                self.assertTrue(decision["qualification_passed"])
+
+    def test_fake_gpu_and_mislabeled_execution_attestations_are_rejected(self) -> None:
+        cases: list[tuple[str, dict[str, Any]]] = []
+        zero_vram = fixture_lane()
+        zero_vram["run_sets"]["warm"]["gpu"][0]["peak_vram_bytes"] = 0
+        cases.append(("zero-vram", zero_vram))
+        minimal_gpu = fixture_lane()
+        minimal_gpu["identity"]["device"]["total_memory_bytes"] = 1
+        minimal_gpu["identity"]["device"]["qualified_minimum_total_memory_bytes"] = 1
+        cases.append(("minimal-gpu", minimal_gpu))
+        mislabeled = fixture_lane()
+        execution = mislabeled["run_sets"]["warm"]["gpu"][0]["execution"]
+        execution["backend"] = "cpu"
+        execution["provider_id"] = mislabeled["identity"]["cpu_baseline"]["provider_id"]
+        execution["worker_build_id"] = mislabeled["identity"]["cpu_baseline"]["worker_build_id"]
+        execution["worker_sha256"] = mislabeled["identity"]["cpu_baseline"]["worker_sha256"]
+        execution["stable_device_id"] = "cpu:host"
+        execution["device_memory_kind"] = "none"
+        cases.append(("mislabeled-cpu", mislabeled))
+        for label, lane in cases:
+            with self.subTest(label=label):
+                plan, evidence = fixture_documents(lane)
+                result = self.run_tool(plan, evidence)
+                self.assertEqual(result.returncode, 1, result.stdout)
+
+    def test_cross_machine_batch_and_protocol_violations_are_rejected(self) -> None:
+        cases: list[tuple[str, dict[str, Any]]] = []
+        wrong_machine = fixture_lane()
+        wrong_machine["run_sets"]["cold"]["gpu"][0]["machine_id_sha256"] = digest("other-machine")
+        cases.append(("cross-machine", wrong_machine))
+        wrong_batch = fixture_lane()
+        wrong_batch["run_sets"]["warm"]["cpu"][0]["acquisition_batch_id"] = "other-batch"
+        cases.append(("cross-batch", wrong_batch))
+        wrong_priming = fixture_lane()
+        wrong_priming["run_sets"]["warm"]["gpu"][0]["priming_runs"] = 0
+        cases.append(("warm-priming", wrong_priming))
+        wrong_generation = fixture_lane()
+        wrong_generation["run_sets"]["warm"]["gpu"][1]["execution"]["worker_generation"] += ":new"
+        cases.append(("warm-generation", wrong_generation))
+        wrong_reset = fixture_lane()
+        wrong_reset["run_sets"]["cold"]["cpu"][0]["reset_state"] = "same_process_primed_model"
+        cases.append(("cold-reset", wrong_reset))
+        wrong_order = fixture_lane()
+        wrong_order["run_sets"]["cold"]["cpu"][0]["pair_order"] = "gpu_then_cpu"
+        cases.append(("pair-order", wrong_order))
+        for label, lane in cases:
+            with self.subTest(label=label):
+                plan, evidence = fixture_documents(lane)
+                result = self.run_tool(plan, evidence)
+                self.assertEqual(result.returncode, 1, result.stdout)
+
+    def test_cross_lane_artifact_and_attestation_reuse_is_rejected(self) -> None:
+        first = fixture_lane()
+        second = fixture_lane()
+        second["identity"]["lane_id"] = "fixture-ubuntu-22.04-nvidia-cuda-second"
+        plan, evidence = fixture_documents_for_lanes([first, second])
+        result = self.run_tool(plan, evidence)
+        self.assertEqual(result.returncode, 1)
+        self.assertTrue(
+            "artifact path" in result.stderr
+            or "artifact digest" in result.stderr
+            or "Hello attestation" in result.stderr
+        )
 
     def test_correctness_reliability_and_lifecycle_failures_are_reported(self) -> None:
         cases: list[tuple[str, Any, set[str]]] = []
@@ -389,7 +653,7 @@ class QualificationFixtureTests(unittest.TestCase):
         bind_documents(boolean_metric_plan, boolean_metric)
         cases.append(("boolean-metric", boolean_metric_plan, boolean_metric))
         reused_plan, reused = copy.deepcopy(plan), copy.deepcopy(evidence)
-        reused["lanes"][0]["run_sets"]["warm"]["gpu"][1]["artifact_sha256"] = reused["lanes"][0]["run_sets"]["warm"]["gpu"][0]["artifact_sha256"]
+        reused["lanes"][0]["run_sets"]["warm"]["gpu"][1]["artifact_path"] = reused["lanes"][0]["run_sets"]["warm"]["gpu"][0]["artifact_path"]
         bind_documents(reused_plan, reused)
         cases.append(("reused-artifact", reused_plan, reused))
         extra_plan, extra = copy.deepcopy(plan), copy.deepcopy(evidence)
@@ -434,7 +698,8 @@ class QualificationFixtureTests(unittest.TestCase):
         artifact_root = self.root / "artifacts"
         complete = self.run_tool(plan, evidence)
         self.assertEqual(complete.returncode, 0, complete.stderr)
-        (artifact_root / "runs/warm/gpu/01.evidence").write_bytes(b"tampered")
+        lane_path = evidence["lanes"][0]["identity"]["lane_id"]
+        (artifact_root / lane_path / "runs/warm/gpu/01.evidence").write_bytes(b"tampered")
         plan_path = self.write("plan.json", plan)
         evidence_path = self.write("evidence.json", evidence)
         tampered = subprocess.run(
