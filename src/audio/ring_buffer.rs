@@ -102,6 +102,10 @@ impl Consumer {
             _not_sync: PhantomData,
         })
     }
+
+    pub(super) fn clear(&mut self) {
+        while self.pop().is_some() {}
+    }
 }
 
 #[cfg(test)]

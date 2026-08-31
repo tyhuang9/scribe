@@ -117,7 +117,10 @@ fn rust_code_mask(source: &str) -> Vec<bool> {
 
 fn production_source(source: &str) -> String {
     const TEST_ATTR: &str = "#[cfg(test)]";
-    let mut retained = source.to_owned();
+    // Architecture assertions inspect checked-out source rather than the Rust
+    // token stream. Normalize platform checkout endings so a Windows CRLF
+    // worktree has exactly the same guard semantics as an LF worktree.
+    let mut retained = source.replace("\r\n", "\n").replace('\r', "\n");
     loop {
         let mask = rust_code_mask(&retained);
         let Some(start) = retained
@@ -288,8 +291,10 @@ struct Boundary {
 }
 fn after() { let _ = "production-after"; }
 "###;
-    for source in [fixture.to_owned(), fixture.replace('\n', "\r\n")] {
-        let production = production_source(&source);
+    let lf_production = production_source(fixture);
+    let crlf_production = production_source(&fixture.replace('\n', "\r\n"));
+    assert_eq!(crlf_production, lf_production);
+    for production in [lf_production, crlf_production] {
         assert!(production.contains("fn before()"));
         assert!(production.contains("fn after()"));
         assert!(production.contains("after: u8"));
@@ -1486,7 +1491,10 @@ fn route_shell_has_no_synthetic_models_scroll_surface() {
     assert!(app.contains("show_route_scroll(ui, UiRoute::Models"));
     assert!(app.contains("show_route_scroll(ui, UiRoute::History"));
     assert!(app.contains("SettingsTab::About"));
-    assert!(app.contains("passive_microphone_monitor_needed"));
+    assert!(
+        !app.contains("sync_passive_microphone_monitor"),
+        "route rendering must not acquire the microphone while idle"
+    );
     assert!(
         !app.contains("page-scroll"),
         "legacy pages must not reintroduce an inner route scroll area"

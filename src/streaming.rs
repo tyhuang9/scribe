@@ -21,6 +21,8 @@ pub const MAX_COMPARISON_CONTEXT_WORDS: usize = 60;
 
 const FRAMES_PER_MILLISECOND: u64 = PREPARED_SAMPLE_RATE as u64 / 1_000;
 const MAX_WINDOW_FRAMES: u64 = ROLLING_WINDOW_MS * FRAMES_PER_MILLISECOND;
+const MIN_TERMINAL_PREVIEW_FRAMES: usize =
+    DECODE_INTERVAL_MS as usize * PREPARED_SAMPLE_RATE as usize / 1_000;
 const OVERLAP_FRAMES: u64 = BOUNDARY_OVERLAP_MS * FRAMES_PER_MILLISECOND;
 const HORIZON_FRAMES: u64 = STABILITY_HORIZON_MS * FRAMES_PER_MILLISECOND;
 const DROP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -54,6 +56,7 @@ pub(crate) struct PreviewAudioPublisher {
     next_sequence: Arc<AtomicU64>,
     mailbox: ReplaceLatestMailbox<PreviewSnapshot>,
     valid: Arc<AtomicBool>,
+    partial_emitted: Arc<AtomicBool>,
 }
 
 impl PreviewAudioPublisher {
@@ -61,12 +64,14 @@ impl PreviewAudioPublisher {
         identity: StreamIdentity,
         mailbox: ReplaceLatestMailbox<PreviewSnapshot>,
         valid: Arc<AtomicBool>,
+        partial_emitted: Arc<AtomicBool>,
     ) -> Self {
         Self {
             identity,
             next_sequence: Arc::new(AtomicU64::new(1)),
             mailbox,
             valid,
+            partial_emitted,
         }
     }
 
@@ -86,6 +91,12 @@ impl PreviewAudioPublisher {
         window_start_frame: u64,
         samples: Vec<f32>,
     ) -> Result<bool, SnapshotError> {
+        if samples.len() < MIN_TERMINAL_PREVIEW_FRAMES
+            || !self.partial_emitted.load(Ordering::Acquire)
+        {
+            self.invalidate();
+            return Ok(false);
+        }
         self.publish(window_start_frame, samples, true)
     }
 
@@ -419,6 +430,7 @@ pub struct RollingPreviewSession<E> {
     worker: Option<JoinHandle<()>>,
     cancel_active: Option<Box<dyn FnOnce() + Send + 'static>>,
     valid: Arc<AtomicBool>,
+    partial_emitted: Arc<AtomicBool>,
 }
 
 impl<E: Send + 'static> RollingPreviewSession<E> {
@@ -441,6 +453,8 @@ impl<E: Send + 'static> RollingPreviewSession<E> {
         let worker_updates = updates.clone();
         let valid = Arc::new(AtomicBool::new(true));
         let worker_valid = Arc::clone(&valid);
+        let partial_emitted = Arc::new(AtomicBool::new(false));
+        let worker_partial_emitted = Arc::clone(&partial_emitted);
         let worker = thread::Builder::new()
             .name("scribe-rolling-preview".to_owned())
             .spawn(move || {
@@ -448,7 +462,12 @@ impl<E: Send + 'static> RollingPreviewSession<E> {
                     let snapshot = active.finish();
                     let identity = snapshot.identity.clone();
                     let event = match decode(snapshot) {
-                        Ok(update) => PreviewEvent::Update { identity, update },
+                        Ok(update) => {
+                            if !update.committed.is_empty() || !update.tentative.is_empty() {
+                                worker_partial_emitted.store(true, Ordering::Release);
+                            }
+                            PreviewEvent::Update { identity, update }
+                        }
                         Err(error) => PreviewEvent::Error { identity, error },
                     };
                     // A slow presentation consumer must not stall decoding or retain an obsolete
@@ -464,6 +483,7 @@ impl<E: Send + 'static> RollingPreviewSession<E> {
             worker: Some(worker),
             cancel_active: Some(Box::new(cancel_active)),
             valid,
+            partial_emitted,
         })
     }
 
@@ -488,6 +508,7 @@ impl<E: Send + 'static> RollingPreviewSession<E> {
             },
             self.mailbox.clone(),
             Arc::clone(&self.valid),
+            Arc::clone(&self.partial_emitted),
         )
     }
 
@@ -509,6 +530,10 @@ impl<E: Send + 'static> RollingPreviewSession<E> {
             return None;
         }
         self.updates.try_claim().map(ActiveMailboxItem::finish)
+    }
+
+    pub(crate) fn has_emitted_partial(&self) -> bool {
+        self.partial_emitted.load(Ordering::Acquire)
     }
 
     /// Reports whether the named preview worker has exited without waiting.
@@ -1125,24 +1150,40 @@ mod tests {
     }
 
     #[test]
-    fn terminal_tail_decodes_once_while_invalidation_drops_pending_decode_and_output() {
+    fn terminal_tail_requires_a_partial_and_preview_minimum() {
         let graceful_calls = Arc::new(AtomicU64::new(0));
         let worker_calls = Arc::clone(&graceful_calls);
         let mut graceful = RollingPreviewSession::<()>::new(move |_| {
             worker_calls.fetch_add(1, Ordering::Relaxed);
-            Ok(StreamUpdate::default())
+            Ok(StreamUpdate {
+                tentative: "partial".to_owned(),
+                ..StreamUpdate::default()
+            })
         })
         .unwrap();
         let publisher =
             graceful.audio_publisher(SessionId(7), RequestId(11), ModelId::new("preview-model"));
         assert!(
             publisher
-                .publish_terminal_window(0, vec![0.1; 512])
+                .publish_window(0, vec![0.1; MIN_TERMINAL_PREVIEW_FRAMES])
+                .unwrap()
+        );
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !graceful.has_emitted_partial() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(graceful.has_emitted_partial());
+        assert!(
+            publisher
+                .publish_terminal_window(
+                    MIN_TERMINAL_PREVIEW_FRAMES as u64,
+                    vec![0.1; MIN_TERMINAL_PREVIEW_FRAMES],
+                )
                 .unwrap()
         );
         graceful.close();
         assert!(graceful.stop_and_join(Duration::from_secs(1)));
-        assert_eq!(graceful_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(graceful_calls.load(Ordering::Relaxed), 2);
         assert!(matches!(
             graceful.try_next(),
             Some(PreviewEvent::Update { .. })
@@ -1169,11 +1210,10 @@ mod tests {
         assert!(publisher.publish_window(0, vec![0.1; 512]).unwrap());
         started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         assert!(
-            publisher
-                .publish_terminal_window(512, vec![0.1; 512])
+            !publisher
+                .publish_terminal_window(512, vec![0.1; MIN_TERMINAL_PREVIEW_FRAMES])
                 .unwrap()
         );
-        publisher.invalidate();
         {
             let (lock, wake) = &*release;
             *lock.lock().unwrap() = true;
@@ -1186,6 +1226,38 @@ mod tests {
             "the pending terminal tail must not start a later heavy decode"
         );
         assert!(invalidated.try_next().is_none());
+    }
+
+    #[test]
+    fn terminal_tail_below_preview_minimum_is_not_scheduled_after_a_partial() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let worker_calls = Arc::clone(&calls);
+        let mut session = RollingPreviewSession::<()>::new(move |_| {
+            worker_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(StreamUpdate {
+                committed: "ready".to_owned(),
+                ..StreamUpdate::default()
+            })
+        })
+        .unwrap();
+        let publisher =
+            session.audio_publisher(SessionId(9), RequestId(13), ModelId::new("preview-model"));
+        assert!(
+            publisher
+                .publish_window(0, vec![0.1; MIN_TERMINAL_PREVIEW_FRAMES])
+                .unwrap()
+        );
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !session.has_emitted_partial() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            !publisher
+                .publish_terminal_window(0, vec![0.1; MIN_TERMINAL_PREVIEW_FRAMES - 1])
+                .unwrap()
+        );
+        assert!(session.stop_and_join(Duration::from_secs(1)));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
 
     #[test]
