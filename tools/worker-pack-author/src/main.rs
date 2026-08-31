@@ -54,9 +54,9 @@ fn main() {
 
 fn run() -> Result<()> {
     let mut arguments = std::env::args_os().skip(1);
-    let command = arguments.next().ok_or_else(|| {
-        anyhow!("expected author, verify-fixture, check-production-key, or --help\n{HELP_TEXT}")
-    })?;
+    let command = arguments
+        .next()
+        .ok_or_else(|| anyhow!("expected a documented command or --help\n{HELP_TEXT}"))?;
     let remaining = arguments.collect::<Vec<_>>();
     if matches!(command.to_str(), Some("--help" | "help")) {
         if !remaining.is_empty() {
@@ -102,7 +102,7 @@ fn run() -> Result<()> {
             println!("production signing key matches embedded trust");
             Ok(())
         }
-        _ => bail!("expected author, verify-fixture, check-production-key, or --help\n{HELP_TEXT}"),
+        _ => bail!("expected a documented command or --help\n{HELP_TEXT}"),
     }
 }
 

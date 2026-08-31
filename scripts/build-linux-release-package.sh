@@ -43,7 +43,16 @@ build_revision="${SCRIBE_BUILD_REVISION:-$(git -C "$repo_root" rev-parse --verif
 [[ "$build_revision" =~ ^[0-9a-f]{40}$ ]] || { echo 'SCRIBE_BUILD_REVISION must be a full lowercase Git commit.' >&2; exit 2; }
 
 temp_root="$(mktemp -d "${TMPDIR:-/tmp}/scribe-linux-release.XXXXXX")"
-trap 'status=$?; rm -rf -- "$temp_root"; if ((status)); then echo "Linux release package assembly failed (exit $status)." >&2; fi; exit "$status"' EXIT
+temporary_deb=''; temporary_report=''
+cleanup() {
+  local status=$?
+  rm -rf -- "$temp_root"
+  [[ -z "$temporary_deb" ]] || rm -f -- "$temporary_deb"
+  [[ -z "$temporary_report" ]] || rm -f -- "$temporary_report"
+  if ((status)); then echo "Linux release package assembly failed (exit $status)." >&2; fi
+  exit "$status"
+}
+trap cleanup EXIT
 package_root="$temp_root/root"; authority_root="$package_root/usr/lib/scribe"; packs_root="$authority_root/workers"
 mkdir -p -- "$package_root/DEBIAN" "$package_root/usr/bin" "$packs_root/packs" "$temp_root/pack-state"
 install -m 0755 -- "$desktop" "$package_root/usr/bin/local-transcriber"
@@ -103,13 +112,18 @@ Description: Scribe local transcription desktop and verified inference workers
 EOF
 
 find "$package_root" -exec touch --no-dereference --date="@$source_date_epoch" -- {} +
-temporary_deb="$temp_root/scribe.deb"
+temporary_deb="$(mktemp "$output_parent/.scribe-linux-release.XXXXXX.deb")"
+rm -f -- "$temporary_deb"
 SOURCE_DATE_EPOCH="$source_date_epoch" dpkg-deb --root-owner-group --build -Zxz -z9 --uniform-compression "$package_root" "$temporary_deb" >/dev/null
-mv -- "$temporary_deb" "$output"
+mv --no-clobber -- "$temporary_deb" "$output"
+[[ ! -e "$temporary_deb" ]] || { echo 'release output appeared before atomic publication; refusing to overwrite it.' >&2; exit 1; }
 package_bytes="$(stat -c %s -- "$output")"
-python3 - "$output.sizes.json" "$installed_bytes" "$package_bytes" <<'PY'
+temporary_report="$(mktemp "$output_parent/.scribe-linux-release-size.XXXXXX.json")"
+python3 - "$temporary_report" "$installed_bytes" "$package_bytes" <<'PY'
 import json, pathlib, sys
 document = {"schema_version": 1, "target": "x86_64-unknown-linux-gnu", "package_format": "deb", "installed_size_bytes": int(sys.argv[2]), "compressed_size_bytes": int(sys.argv[3]), "packs": []}
 pathlib.Path(sys.argv[1]).write_text(json.dumps(document, sort_keys=True, separators=(",", ":")), encoding="utf-8")
 PY
+mv --no-clobber -- "$temporary_report" "$output.sizes.json"
+[[ ! -e "$temporary_report" ]] || { echo 'size report output appeared before atomic publication; refusing to overwrite it.' >&2; exit 1; }
 echo "$output"

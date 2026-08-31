@@ -6,6 +6,8 @@ trap 'status=$?; echo "Linux release package verification failed at line $LINENO
 [[ "${1:-}" == --package && -n "${2:-}" && $# == 2 ]] || { echo 'usage: verify-linux-release-package.sh --package <path.deb>' >&2; exit 2; }
 package="$(realpath -e -- "$2")"
 [[ -f "$package" && ! -L "$package" ]] || { echo 'package must be a regular non-symlink file.' >&2; exit 1; }
+[[ "$(stat -c %h -- "$package")" == 1 ]] || { echo 'package must not be hardlinked.' >&2; exit 1; }
+[[ "$(stat -c %s -- "$package")" -le 4294967296 ]] || { echo 'compressed package exceeds the 4 GiB bound.' >&2; exit 1; }
 for command in dpkg-deb python3 sha256sum stat tar; do command -v "$command" >/dev/null || { echo "$command is required." >&2; exit 1; }; done
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 temp_root="$(mktemp -d "${TMPDIR:-/tmp}/scribe-linux-verify.XXXXXX")"
@@ -26,6 +28,10 @@ if tar -tvf "$temp_root/data.tar" | awk 'substr($1,1,1) != "d" && substr($1,1,1)
 fi
 if tar --numeric-owner -tvf "$temp_root/data.tar" | awk '$2 != "0/0" { found=1 } END { exit(found ? 0 : 1) }'; then
   echo 'package data archive contains a non-root owner or group.' >&2
+  exit 1
+fi
+if tar --numeric-owner -tvf "$temp_root/data.tar" | awk 'substr($1,1,1) == "-" { if ($3 > 2147483648) found=1; total += $3 } END { if (total > 4294967296) found=1; exit(found ? 0 : 1) }'; then
+  echo 'package data archive exceeds file or aggregate size bounds.' >&2
   exit 1
 fi
 mkdir "$temp_root/root"
