@@ -11,6 +11,8 @@ const MACOS_KEYCHAIN_NAMESPACE_MANIFEST: &str =
     "runtime-manifests/gpu-keychain-namespace-macos-release.json";
 const LINUX_WORKER_INSTALL_CONTRACT: &str =
     "runtime-manifests/linux-worker-install-contract-x86_64.json";
+const LINUX_RELEASE_PACKAGE_CONTRACT: &str =
+    "runtime-manifests/linux-release-package-x86_64.json";
 
 fn main() {
     reject_multiple_gpu_features();
@@ -22,6 +24,7 @@ fn main() {
     prepare_windows_vulkan_import_library();
     prepare_macos_native_shims();
     verify_linux_worker_install_contract();
+    verify_linux_release_package_contract();
     verify_silero_vad_asset();
 
     println!("cargo:rerun-if-changed=native/sherpa_vad_shim.cc");
@@ -40,6 +43,20 @@ fn main() {
     if matches!(target_os.as_str(), "linux" | "android") {
         println!("cargo:rustc-link-lib=dl");
     }
+}
+
+fn verify_linux_release_package_contract() {
+    const EXPECTED: &str = concat!(
+        r#"{"schema_version":1,"target":"x86_64-unknown-linux-gnu","package_format":"deb","package_name":"scribe","desktop_path":"usr/bin/local-transcriber","authority_root":"usr/lib/scribe","cpu_worker_path":"usr/lib/scribe/scribe-inference-worker","pack_root":"usr/lib/scribe/workers/packs","catalog_path":"usr/lib/scribe/worker-pack-catalog.json","inventory_path":"usr/lib/scribe/linux-release-inventory.json","production_trust":"empty","gpu_packs":[]}"#,
+        "\n"
+    );
+    println!("cargo:rerun-if-changed={LINUX_RELEASE_PACKAGE_CONTRACT}");
+    let contract = fs::read_to_string(LINUX_RELEASE_PACKAGE_CONTRACT)
+        .expect("could not read the Linux release package contract");
+    assert_eq!(
+        contract, EXPECTED,
+        "Linux release package contract must remain canonical and production-default-deny"
+    );
 }
 
 fn verify_linux_worker_install_contract() {

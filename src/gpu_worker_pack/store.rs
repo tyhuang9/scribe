@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
+#[cfg(any(windows, test))]
+use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 
