@@ -306,6 +306,32 @@ class QualificationFixtureTests(unittest.TestCase):
         self.assertFalse(cold_decision["qualification_passed"])
         self.assertEqual(cold_decision["lanes"][0]["reasons"], ["gpu_p95_exceeds_cpu_boundary"])
 
+    def test_vulkan_vendor_and_second_ubuntu_lane_identities_are_supported(self) -> None:
+        drivers = {
+            "amd": ("linux:amdgpu:6.8.0", "linux:amdgpu:6.7.0"),
+            "intel": ("linux:i915:6.8.0", "linux:i915:6.7.0"),
+            "nvidia": ("linux:nvidia:570.86.15:vulkan", "linux:nvidia:570.26.00:vulkan"),
+        }
+        for vendor, (current_driver, prior_driver) in drivers.items():
+            with self.subTest(vendor=vendor):
+                lane = fixture_lane()
+                lane["identity"]["backend"] = "vulkan"
+                lane["identity"]["provider_id"] = "transcribe-cpp-ggml-vulkan"
+                lane["identity"]["ubuntu_version"] = "24.04"
+                lane["identity"]["kernel_version"] = "6.8.0-85-generic"
+                lane["identity"]["glibc_version"] = "2.39"
+                lane["identity"]["lane_id"] = f"fixture-ubuntu-24.04-{vendor}-vulkan"
+                lane["identity"]["device"]["vendor"] = vendor
+                lane["identity"]["driver"]["value"] = current_driver
+                lane["identity"]["pack"]["pack_id"] = "scribe-vulkan-linux-x64"
+                for event in lane["lifecycle"]:
+                    event["driver_after"] = current_driver
+                    event["driver_before"] = prior_driver if event["event"] == "driver_change" else current_driver
+                plan, evidence = fixture_documents(lane)
+                decision = self.parse_success(self.run_tool(plan, evidence))
+                self.assertTrue(decision["qualification_passed"])
+                self.assertFalse(decision["auto_eligible"])
+
     def test_correctness_reliability_and_lifecycle_failures_are_reported(self) -> None:
         cases: list[tuple[str, Any, set[str]]] = []
         mismatch = fixture_lane()
@@ -367,6 +393,23 @@ class QualificationFixtureTests(unittest.TestCase):
         extra["lanes"][0]["unexpected"] = "field"
         bind_documents(extra_plan, extra)
         cases.append(("unknown-field", extra_plan, extra))
+        for label, identity_field, value in (
+            ("old-kernel", "kernel_version", "5.14.0"),
+            ("old-glibc", "glibc_version", "2.34"),
+        ):
+            invalid_lane = fixture_lane()
+            invalid_lane["identity"][identity_field] = value
+            invalid_plan, invalid_evidence = fixture_documents(invalid_lane)
+            cases.append((label, invalid_plan, invalid_evidence))
+        old_driver_lane = fixture_lane()
+        old_driver_lane["identity"]["driver"]["value"] = "linux:nvidia:570.25"
+        for event in old_driver_lane["lifecycle"]:
+            event["driver_after"] = "linux:nvidia:570.25"
+            event["driver_before"] = (
+                "linux:nvidia:570.24" if event["event"] == "driver_change" else "linux:nvidia:570.25"
+            )
+        old_driver_plan, old_driver_evidence = fixture_documents(old_driver_lane)
+        cases.append(("old-cuda-driver", old_driver_plan, old_driver_evidence))
         for label, case_plan, case_evidence in cases:
             with self.subTest(label=label):
                 result = self.run_tool(case_plan, case_evidence)
