@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
-    [string]$CargoTargetDirectory
+    [string]$CargoTargetDirectory,
+    [switch]$CmakeRetryDiagnosticsOnly
 )
 
 $ErrorActionPreference = 'Stop'
@@ -184,6 +185,119 @@ $overlongVulkanShortJunctionFailure = [System.Collections.Generic.List[object]]:
 foreach ($unused in 1..2048) { $overlongVulkanShortJunctionFailure.Add('noise') }
 foreach ($line in $vulkanShortJunctionFailure) { $overlongVulkanShortJunctionFailure.Add($line) }
 if (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure $overlongVulkanShortJunctionFailure.ToArray()) { throw 'Overlong Vulkan CMake output was classified outside the bounded window.' }
+$builderTokens = $null
+$builderParseErrors = $null
+$builderAst = [System.Management.Automation.Language.Parser]::ParseFile(
+    $buildScript,
+    [ref]$builderTokens,
+    [ref]$builderParseErrors
+)
+Assert-True ($builderParseErrors.Count -eq 0) 'Builder source could not be parsed for native-process retry diagnostics.'
+$nativeProcessFailureType = $builderAst.Find({
+    param($Ast)
+    $Ast -is [System.Management.Automation.Language.TypeDefinitionAst] -and
+    $Ast.Name -ceq 'ScribeGpuWorkerNativeProcessFailure'
+}, $true)
+$nativeProcessCaptureType = $builderAst.Find({
+    param($Ast)
+    $Ast -is [System.Management.Automation.Language.TypeDefinitionAst] -and
+    $Ast.Name -ceq 'ScribeGpuWorkerNativeProcessStreamCapture'
+}, $true)
+$nativeProcessFunction = $builderAst.Find({
+    param($Ast)
+    $Ast -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+    $Ast.Name -ceq 'Invoke-NativeProcess'
+}, $true)
+$retryDiagnosticFunction = $builderAst.Find({
+    param($Ast)
+    $Ast -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+    $Ast.Name -ceq 'Get-NativeProcessRetryDiagnostic'
+}, $true)
+Assert-True ($null -ne $nativeProcessFailureType -and $null -ne $nativeProcessCaptureType) 'Builder lost the bounded native-process failure capture types.'
+Assert-True ($null -ne $nativeProcessFunction -and $null -ne $retryDiagnosticFunction) 'Builder lost the native-process retry diagnostic functions.'
+$nativeProcessHarness = Join-Path ([System.IO.Path]::GetTempPath()) "scribe-native-process-retry-$([guid]::NewGuid().ToString('N')).ps1"
+try {
+    $nativeProcessHarnessTail = @'
+$splitFixtureCommand = @"
+[Console]::Out.WriteLine('transcribe-cpp-sys: could not create short build junction C:\safe\tcs; building in OUT_DIR (may exceed Windows MAX_PATH in deep checkouts)')
+[Console]::Out.WriteLine('error: failed to run custom build command for ``transcribe-cpp-sys v0.1.3``')
+[Console]::Error.WriteLine('vulkan-shaders-gen: warning: object directory is near the configured limit')
+[Console]::Error.WriteLine('CMAKE_OBJECT_PATH_MAX is in effect for this nested target')
+[Console]::Error.WriteLine("LINK : fatal error LNK1104: cannot open file 'CMakeFiles\cmTC_1a2B3c.dir\intermediate.manifest'")
+exit 17
+"@
+$splitFailure = $null
+try {
+    $null = Invoke-NativeProcess (Join-Path $PSHOME 'pwsh.exe') @('-NoProfile', '-Command', $splitFixtureCommand) 'Split-stream fixture failed.'
+}
+catch {
+    $splitFailure = $_.Exception
+}
+if ($null -eq $splitFailure) { throw 'Split-stream native process fixture unexpectedly succeeded.' }
+$ordinaryResult = Invoke-NativeProcess (Join-Path $PSHOME 'pwsh.exe') @('-NoProfile', '-Command', "[Console]::Out.WriteLine('ordinary stdout'); [Console]::Error.WriteLine('ordinary stderr')") 'Ordinary fixture failed.'
+$ordinaryFailureMessage = $null
+try {
+    $null = Invoke-NativeProcess (Join-Path $PSHOME 'pwsh.exe') @('-NoProfile', '-Command', "[Console]::Error.WriteLine('ordinary failure detail'); exit 19") 'Ordinary failure fixture failed.'
+}
+catch {
+    $ordinaryFailureMessage = $_.Exception.Message
+}
+$oversizedFailure = $null
+try {
+    $null = Invoke-NativeProcess (Join-Path $PSHOME 'pwsh.exe') @('-NoProfile', '-Command', '1..1025 | ForEach-Object { [Console]::Out.WriteLine(''bounded diagnostic noise'') }; exit 23') 'Oversized fixture failed.'
+}
+catch {
+    $oversizedFailure = $_.Exception
+}
+[pscustomobject]@{
+    SplitFailureType = $splitFailure.GetType().FullName
+    SplitMessage = $splitFailure.Message
+    SplitStdout = $splitFailure.Stdout
+    SplitStderr = $splitFailure.Stderr
+    SplitStdoutClassified = Test-ScribeGpuWorkerKnownCmakeBootstrapFailure @($splitFailure.Stdout)
+    SplitStderrClassified = Test-ScribeGpuWorkerKnownCmakeBootstrapFailure @($splitFailure.Stderr)
+    SplitCombinedClassified = Test-ScribeGpuWorkerKnownCmakeBootstrapFailure @(Get-NativeProcessRetryDiagnostic $splitFailure)
+    OrdinaryStdout = $ordinaryResult.Stdout
+    OrdinaryStderr = $ordinaryResult.Stderr
+    OrdinaryFailureMessage = $ordinaryFailureMessage
+    OversizedFailureMessage = $oversizedFailure.Message
+    OversizedClassified = Test-ScribeGpuWorkerKnownCmakeBootstrapFailure @(Get-NativeProcessRetryDiagnostic $oversizedFailure)
+} | ConvertTo-Json -Compress
+'@
+    [System.IO.File]::WriteAllText(
+        $nativeProcessHarness,
+        @(
+            (Get-Content -LiteralPath $cmakeBootstrapScript -Raw),
+            $nativeProcessFailureType.Extent.Text,
+            $nativeProcessCaptureType.Extent.Text,
+            $nativeProcessFunction.Extent.Text,
+            $retryDiagnosticFunction.Extent.Text,
+            $nativeProcessHarnessTail
+        ) -join "`r`n`r`n",
+        [System.Text.UTF8Encoding]::new($false)
+    )
+    $nativeProcessHarnessResult = Invoke-NativeProcess `
+        (Join-Path $PSHOME 'pwsh.exe') `
+        @('-NoProfile', '-File', $nativeProcessHarness)
+    Assert-True ([string]::IsNullOrWhiteSpace($nativeProcessHarnessResult.Stderr)) "Native-process retry harness emitted stderr: $($nativeProcessHarnessResult.Stderr)"
+    $nativeProcessResult = $nativeProcessHarnessResult.Stdout | ConvertFrom-Json
+    Assert-True ($nativeProcessResult.SplitFailureType -ceq 'ScribeGpuWorkerNativeProcessFailure') 'Split-stream failure did not retain the structured native-process failure.'
+    Assert-True ($nativeProcessResult.SplitMessage.Contains('Split-stream fixture failed. Exit code 17.')) 'Split-stream failure lost its clear sanitized message.'
+    Assert-True ($nativeProcessResult.SplitStdout.Contains($vulkanShortJunctionFailure[0]) -and $nativeProcessResult.SplitStdout.Contains($vulkanShortJunctionFailure[1])) 'Split-stream failure did not retain the bounded raw stdout diagnostic.'
+    Assert-True ($nativeProcessResult.SplitStderr.Contains($vulkanShortJunctionFailure[2]) -and $nativeProcessResult.SplitStderr.Contains($vulkanShortJunctionFailure[4])) 'Split-stream failure did not retain the bounded raw stderr diagnostic.'
+    Assert-True (-not $nativeProcessResult.SplitStdoutClassified -and -not $nativeProcessResult.SplitStderrClassified -and $nativeProcessResult.SplitCombinedClassified) 'Split-stream Vulkan retry did not require the deterministic bounded stdout-then-stderr combination.'
+    Assert-True ($nativeProcessResult.OrdinaryStdout -ceq 'ordinary stdout' -and $nativeProcessResult.OrdinaryStderr -ceq 'ordinary stderr') 'Ordinary Invoke-NativeProcess success callers lost separate stdout/stderr behavior.'
+    Assert-True ($nativeProcessResult.OrdinaryFailureMessage.Contains('Ordinary failure fixture failed. Exit code 19. ordinary failure detail')) 'Ordinary Invoke-NativeProcess failure callers lost the expected failure detail.'
+    Assert-True ($nativeProcessResult.OversizedFailureMessage.Contains('Child process output exceeded the bounded in-memory diagnostic capture')) 'Oversized native-process diagnostics were not rejected before retry classification.'
+    Assert-True (-not $nativeProcessResult.OversizedClassified) 'Oversized native-process diagnostics were eligible for CMake bootstrap retry classification.'
+}
+finally {
+    Remove-Item -LiteralPath $nativeProcessHarness -Force -ErrorAction SilentlyContinue
+}
+if ($CmakeRetryDiagnosticsOnly) {
+    Write-Output 'Windows GPU worker-pack CMake retry diagnostic tests passed.'
+    return
+}
 $topologyRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("scribe-pack-cmake-topology-$([guid]::NewGuid().ToString('N'))")
 try {
     $buildDirectory = Join-Path $topologyRoot 'cargo\release\build\transcribe-cpp-sys-0123456789abcdef\out\build'

@@ -23,6 +23,67 @@ Set-StrictMode -Version Latest
 . (Join-Path $PSScriptRoot 'windows-cuda-sdk-inventory.ps1')
 . (Join-Path $PSScriptRoot 'windows-gpu-worker-cmake-bootstrap.ps1')
 
+class ScribeGpuWorkerNativeProcessFailure : System.Exception {
+    [int]$ExitCode
+    [string]$Stdout
+    [string]$Stderr
+    [bool]$CaptureExceeded
+
+    ScribeGpuWorkerNativeProcessFailure(
+        [string]$Message,
+        [int]$ExitCode,
+        [string]$Stdout,
+        [string]$Stderr,
+        [bool]$CaptureExceeded
+    ) : base($Message) {
+        $this.ExitCode = $ExitCode
+        $this.Stdout = $Stdout
+        $this.Stderr = $Stderr
+        $this.CaptureExceeded = $CaptureExceeded
+    }
+}
+
+class ScribeGpuWorkerNativeProcessStreamCapture {
+    [System.Text.StringBuilder]$Text = [System.Text.StringBuilder]::new()
+    [int]$LineCount = 0
+    [int]$MaximumLines
+    [int]$MaximumLineLength
+    [int]$MaximumCharacters
+    [bool]$Exceeded = $false
+
+    ScribeGpuWorkerNativeProcessStreamCapture(
+        [int]$MaximumLines,
+        [int]$MaximumLineLength,
+        [int]$MaximumCharacters
+    ) {
+        $this.MaximumLines = $MaximumLines
+        $this.MaximumLineLength = $MaximumLineLength
+        $this.MaximumCharacters = $MaximumCharacters
+    }
+
+    [void]Add([string]$Line) {
+        if ($null -eq $Line -or $this.Exceeded) {
+            return
+        }
+        $separatorLength = if ($this.Text.Length -gt 0) { 1 } else { 0 }
+        if ($this.LineCount -ge $this.MaximumLines -or
+            $Line.Length -gt $this.MaximumLineLength -or
+            ($this.Text.Length + $separatorLength + $Line.Length) -gt $this.MaximumCharacters) {
+            $this.Exceeded = $true
+            return
+        }
+        if ($separatorLength -ne 0) {
+            $null = $this.Text.Append("`n")
+        }
+        $null = $this.Text.Append($Line)
+        $this.LineCount++
+    }
+
+    [string]GetText() {
+        return $this.Text.ToString()
+    }
+}
+
 if ($ExportPinnedMsvcEnvironment -and -not $ToolchainCheckOnly) {
     throw 'Pinned MSVC environment export is only available with ToolchainCheckOnly.'
 }
@@ -146,6 +207,12 @@ function Invoke-NativeProcess(
     [string[]]$Arguments,
     [string]$FailureMessage
 ) {
+    # Keep each child stream within the classifier's 2,048-line/1,024-character
+    # window when the two streams are deterministically combined below. The
+    # capture is in memory only and an overflow is never eligible for retry.
+    $maximumStreamLines = 1024
+    $maximumStreamLineLength = 1024
+    $maximumStreamCharacters = 1048576
     $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
     $startInfo.FileName = $Executable
     $startInfo.UseShellExecute = $false
@@ -157,21 +224,89 @@ function Invoke-NativeProcess(
     }
     $process = [System.Diagnostics.Process]::new()
     $process.StartInfo = $startInfo
+    $stdoutCapture = [ScribeGpuWorkerNativeProcessStreamCapture]::new(
+        $maximumStreamLines,
+        $maximumStreamLineLength,
+        $maximumStreamCharacters
+    )
+    $stderrCapture = [ScribeGpuWorkerNativeProcessStreamCapture]::new(
+        $maximumStreamLines,
+        $maximumStreamLineLength,
+        $maximumStreamCharacters
+    )
     try {
         if (-not $process.Start()) {
             throw $FailureMessage
         }
-        $stdout = $process.StandardOutput.ReadToEndAsync()
-        $stderr = $process.StandardError.ReadToEndAsync()
+        # Read both streams concurrently, but consume completed reads on this
+        # script thread. Process event callbacks have no PowerShell runspace.
+        $stdoutRead = $process.StandardOutput.ReadLineAsync()
+        $stderrRead = $process.StandardError.ReadLineAsync()
+        $stdoutComplete = $false
+        $stderrComplete = $false
+        while (-not ($stdoutComplete -and $stderrComplete)) {
+            $pendingReads = [System.Collections.Generic.List[System.Threading.Tasks.Task]]::new()
+            if (-not $stdoutComplete) {
+                $pendingReads.Add($stdoutRead)
+            }
+            if (-not $stderrComplete) {
+                $pendingReads.Add($stderrRead)
+            }
+            [System.Threading.Tasks.Task]::WaitAny($pendingReads.ToArray()) | Out-Null
+            if (-not $stdoutComplete -and $stdoutRead.IsCompleted) {
+                $stdoutLine = $stdoutRead.GetAwaiter().GetResult()
+                if ($null -eq $stdoutLine) {
+                    $stdoutComplete = $true
+                }
+                else {
+                    $stdoutCapture.Add($stdoutLine)
+                    $stdoutRead = $process.StandardOutput.ReadLineAsync()
+                }
+            }
+            if (-not $stderrComplete -and $stderrRead.IsCompleted) {
+                $stderrLine = $stderrRead.GetAwaiter().GetResult()
+                if ($null -eq $stderrLine) {
+                    $stderrComplete = $true
+                }
+                else {
+                    $stderrCapture.Add($stderrLine)
+                    $stderrRead = $process.StandardError.ReadLineAsync()
+                }
+            }
+        }
         $process.WaitForExit()
-        $output = $stdout.GetAwaiter().GetResult()
-        $errorOutput = $stderr.GetAwaiter().GetResult()
+        $output = $stdoutCapture.GetText()
+        $errorOutput = $stderrCapture.GetText()
+        $captureExceeded = $stdoutCapture.Exceeded -or $stderrCapture.Exceeded
+        if ($captureExceeded) {
+            throw [ScribeGpuWorkerNativeProcessFailure]::new(
+                "$FailureMessage Child process output exceeded the bounded in-memory diagnostic capture.",
+                $process.ExitCode,
+                $output,
+                $errorOutput,
+                $true
+            )
+        }
         if ($process.ExitCode -ne 0) {
             $detail = $errorOutput.Trim()
             if (-not $detail) {
                 $detail = $output.Trim()
             }
-            throw "$FailureMessage Exit code $($process.ExitCode). $detail"
+            $detail = [regex]::Replace($detail, '[\x00-\x1F\x7F]+', ' ').Trim()
+            if ($detail.Length -gt 512) {
+                $detail = $detail.Substring(0, 512) + '...'
+            }
+            $message = "$FailureMessage Exit code $($process.ExitCode)."
+            if ($detail) {
+                $message += " $detail"
+            }
+            throw [ScribeGpuWorkerNativeProcessFailure]::new(
+                $message,
+                $process.ExitCode,
+                $output,
+                $errorOutput,
+                $false
+            )
         }
         return [pscustomobject]@{
             Stdout = $output
@@ -181,6 +316,16 @@ function Invoke-NativeProcess(
     finally {
         $process.Dispose()
     }
+}
+
+function Get-NativeProcessRetryDiagnostic([System.Exception]$Failure) {
+    if ($Failure -isnot [ScribeGpuWorkerNativeProcessFailure] -or
+        $Failure.CaptureExceeded) {
+        return @()
+    }
+    # Stream event arrival is not a stable ordering contract. Preserve the raw
+    # bounded streams and combine them in this fixed order for classification.
+    return @($Failure.Stdout, $Failure.Stderr)
 }
 
 function Enable-ValidatedCmakeBuildJunction(
@@ -1329,8 +1474,8 @@ try {
         $null = Invoke-NativeProcess $cargo $workerBuildArguments "$Backend inference worker build failed."
     }
     catch {
-        $failure = $_.Exception.Message
-        if (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure @($failure))) {
+        $diagnostic = Get-NativeProcessRetryDiagnostic $_.Exception
+        if (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure $diagnostic)) {
             throw
         }
         Enable-ValidatedCmakeBuildJunction $shortBuild.BuildEnvironment $cargoTarget
