@@ -10602,6 +10602,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::assertions_on_constants,
+        reason = "the constant assertion documents the platform-specific write-sharing branch without making non-Windows builds fail at compile time"
+    )]
     fn worker_identity_rejects_hardlinks_and_detects_replacement() {
         let root = test_root("worker-file-identity");
         let worker = root.join(format!("worker{}", std::env::consts::EXE_SUFFIX));
