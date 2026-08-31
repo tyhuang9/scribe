@@ -35,8 +35,23 @@ mode="$1"; pack_root="$(realpath -e -- "$2")"; tool="$(realpath -e -- "$4")"
 if [[ "$mode" == --fixture-pack ]]; then verification=verify-fixture; else verification=verify-production-linux; fi
 "$tool" "$verification" --pack-root "$pack_root" >/dev/null
 if find "$pack_root" -mindepth 1 ! -type d ! -type f -print -quit | grep . >/dev/null; then echo 'pack size report rejects links and nonregular entries.' >&2; exit 1; fi
+if python3 - "$pack_root" <<'PY'
+import os, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+for directory, directories, files in os.walk(root):
+    relative = pathlib.Path(directory).relative_to(root)
+    for name in directories + files:
+        parts = (*relative.parts, name)
+        if any(part.startswith("-") for part in parts):
+            raise SystemExit(0)
+raise SystemExit(1)
+PY
+then
+  echo 'pack size report rejects path components beginning with a dash.' >&2
+  exit 1
+fi
 installed="$(find "$pack_root" -type f -printf '%s\n' | awk '{ total += $1 } END { print total + 0 }')"
-compressed="$(cd "$pack_root" && LC_ALL=C find . -type f -printf '%P\n' | LC_ALL=C sort | tar --create --files-from=- --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner --format=gnu | gzip -n -9 | wc -c)"
+compressed="$(cd "$pack_root" && LC_ALL=C find . -type f -printf '%P\0' | LC_ALL=C sort -z | env -u TAR_OPTIONS tar --create --null --verbatim-files-from --files-from=- --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner --format=gnu | env -u GZIP gzip -n -9 | wc -c)"
 python3 - "$pack_root/pack-manifest.json" "$installed" "$compressed" "$mode" <<'PY'
 import json, pathlib, sys
 manifest = json.loads(pathlib.Path(sys.argv[1]).read_bytes())

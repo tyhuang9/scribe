@@ -130,6 +130,30 @@ for entry in document["entries"]:
 inventory.write_text(json.dumps(document, sort_keys=True, separators=(",", ":")), encoding="utf-8")
 PY
 }
+add_file_with_consistent_inventory() {
+  local root="$1" relative="$2" source="$3"
+  install -m 0755 "$source" "$root/$relative"
+  python3 - "$root" "$relative" <<'PY'
+import hashlib, json, pathlib, stat, sys
+root = pathlib.Path(sys.argv[1]); relative = sys.argv[2]
+inventory = root / "usr/lib/scribe/linux-release-inventory.json"
+document = json.loads(inventory.read_bytes())
+path = root / relative
+document["entries"].append({
+    "path": relative,
+    "mode": f"{stat.S_IMODE(path.stat().st_mode):04o}",
+    "size_bytes": path.stat().st_size,
+    "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+})
+document["entries"].sort(key=lambda entry: entry["path"])
+inventory.write_text(json.dumps(document, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+installed = sum(path.stat().st_size for path in (root / "usr").rglob("*") if path.is_file())
+control = root / "DEBIAN/control"
+lines = control.read_text(encoding="utf-8").splitlines()
+lines = [f"Installed-Size: {(installed + 1023) // 1024}" if line.startswith("Installed-Size: ") else line for line in lines]
+control.write_text("\n".join(lines) + "\n", encoding="utf-8")
+PY
+}
 tamper_worker() { printf 'tampered\n' >>"$1/usr/lib/scribe/scribe-inference-worker"; }
 add_unexpected() { printf 'unexpected\n' >"$1/usr/lib/scribe/unexpected"; }
 add_unexpected_directory() { mkdir "$1/usr/lib/scribe/unexpected-directory"; }
@@ -143,6 +167,10 @@ replace_desktop_with_text() { printf 'not an ELF\n' >"$1/usr/bin/local-transcrib
 replace_worker_with_wrong_arch() { cp "$test_root/wrong-arch" "$1/usr/lib/scribe/scribe-inference-worker"; chmod 0755 "$1/usr/lib/scribe/scribe-inference-worker"; }
 make_desktop_group_writable_with_consistent_inventory() { chmod 0775 "$1/usr/bin/local-transcriber"; refresh_inventory_modes "$1"; }
 make_catalog_group_writable_with_consistent_inventory() { chmod 0664 "$1/usr/lib/scribe/worker-pack-catalog.json"; refresh_inventory_modes "$1"; }
+make_inventory_schema_boolean() { python3 -c 'import json,pathlib,sys; p=pathlib.Path(sys.argv[1])/"usr/lib/scribe/linux-release-inventory.json"; d=json.loads(p.read_bytes()); d["schema_version"]=True; p.write_text(json.dumps(d,sort_keys=True,separators=(",",":")),encoding="utf-8")' "$1"; }
+add_replaces_control_field() { printf 'Replaces: unsafe-package\n' >>"$1/DEBIAN/control"; }
+add_consistent_extra_executable() { add_file_with_consistent_inventory "$1" usr/bin/extra-tool "$worker"; }
+add_consistent_case_collision() { add_file_with_consistent_inventory "$1" usr/bin/Local-Transcriber "$desktop"; }
 attack_package tampered-worker tamper_worker
 attack_package unexpected-file add_unexpected
 attack_package unexpected-directory add_unexpected_directory
@@ -156,6 +184,10 @@ attack_package non-elf-desktop replace_desktop_with_text
 attack_package wrong-arch-worker replace_worker_with_wrong_arch
 attack_package consistent-inventory-executable-mode make_desktop_group_writable_with_consistent_inventory
 attack_package consistent-inventory-metadata-mode make_catalog_group_writable_with_consistent_inventory
+attack_package boolean-inventory-schema make_inventory_schema_boolean
+attack_package relationship-control-field add_replaces_control_field
+attack_package consistent-inventory-extra-executable add_consistent_extra_executable
+attack_package consistent-inventory-case-collision add_consistent_case_collision
 
 control_attack_root="$test_root/control-mode-components"; mkdir "$control_attack_root"
 (cd "$control_attack_root" && ar x "$test_root/first.deb")
@@ -166,6 +198,68 @@ tar -C "$control_attack_root/control-root" --create --xz --no-recursion --owner=
 (cd "$control_attack_root" && ar rcD "$test_root/control-mode.deb" debian-binary control.tar.xz data.tar.xz)
 chmod 0644 "$test_root/control-mode.deb"
 if bash "$repo_root/scripts/verify-linux-release-package.sh" --package "$test_root/control-mode.deb" >/dev/null 2>&1; then echo 'release verifier accepted non-0644 DEBIAN/control.' >&2; exit 1; fi
+
+python3 - "$test_root/first.deb" "$test_root" "$epoch" <<'PY'
+import lzma, pathlib, sys
+
+source = pathlib.Path(sys.argv[1]); root = pathlib.Path(sys.argv[2]); epoch = int(sys.argv[3])
+raw = source.read_bytes()
+if not raw.startswith(b"!<arch>\n"):
+    raise SystemExit("fixture package is not ar")
+offset = 8
+members = []
+while offset < len(raw):
+    header = raw[offset:offset + 60]
+    if len(header) != 60:
+        raise SystemExit("fixture package has a truncated ar header")
+    size = int(header[48:58].decode("ascii").strip())
+    name = header[:16].decode("ascii").rstrip(" ")
+    offset += 60
+    payload = raw[offset:offset + size]
+    offset += size + (size % 2)
+    members.append((name, payload))
+if [name for name, _ in members] != ["debian-binary", "control.tar.xz", "data.tar.xz"]:
+    raise SystemExit("fixture package ar members are unexpected")
+
+def header(name, size):
+    return (
+        name.encode("ascii").ljust(16, b" ")
+        + str(epoch).encode("ascii").ljust(12, b" ")
+        + b"0     0     100644  "
+        + str(size).encode("ascii").ljust(10, b" ")
+        + b"`\n"
+    )
+
+def write(name, entries, bad_padding=False, trailing=b""):
+    output = bytearray(b"!<arch>\n")
+    for index, (member_name, payload) in enumerate(entries):
+        output.extend(header(member_name, len(payload)))
+        output.extend(payload)
+        if len(payload) % 2:
+            output.extend(b"X" if bad_padding and index == 1 else b"\n")
+    output.extend(trailing)
+    path = root / f"outer-{name}.deb"
+    path.write_bytes(output)
+    path.chmod(0o644)
+
+debian, control, data = members
+write("duplicate", [debian, control, control, data])
+write("wrong-order", [debian, data, control])
+write("unexpected", [debian, control, ("extra", b"x"), data])
+write("long-name-extension", [debian, control, ("//", b"x"), data])
+write("trailing", members, trailing=b"x")
+write("wrong-version", [("debian-binary", b"2.1\n"), control, data])
+odd_payload = control[1] if len(control[1]) % 2 else control[1] + b"x"
+odd_control = (control[0], odd_payload)
+write("bad-padding", [debian, odd_control, data], bad_padding=True)
+control_bomb = lzma.compress(b"0" * (2 * 1024 * 1024 + 1), format=lzma.FORMAT_XZ)
+write("control-decompression-bound", [debian, ("control.tar.xz", control_bomb), data])
+PY
+for outer_attack in duplicate wrong-order unexpected long-name-extension trailing wrong-version bad-padding control-decompression-bound; do
+  if bash "$repo_root/scripts/verify-linux-release-package.sh" --package "$test_root/outer-$outer_attack.deb" >/dev/null 2>&1; then
+    echo "release verifier accepted $outer_attack outer archive attack." >&2; exit 1
+  fi
+done
 
 if command -v cargo >/dev/null; then
   export SCRIBE_BUILD_REVISION="$revision"
@@ -182,6 +276,17 @@ if command -v cargo >/dev/null; then
   if bash "$repo_root/scripts/report-linux-worker-pack-sizes.sh" --production-pack "$fixture_pack" --tool "$tool" >/dev/null 2>&1; then
     echo 'production size reporting accepted fixture trust.' >&2; exit 1
   fi
+  fixture_option_pack="$test_root/fixture-option-pack"; mkdir -p "$fixture_option_pack/bin"
+  install -m 0755 "$worker" "$fixture_option_pack/bin/scribe-inference-worker"
+  printf 'option injection fixture\n' >"$fixture_option_pack/--checkpoint=1"
+  printf 'option injection fixture\n' >"$fixture_option_pack/--checkpoint-action=exec=touch marker"
+  "$tool" author --backend vulkan --target-os linux --target-arch x86_64 --pack-root "$fixture_option_pack" \
+    --pack-id scribe-vulkan-linux-options --pack-version 0.1.0-fixture --security-epoch 1 \
+    --provider transcribe-cpp-ggml-vulkan --worker-path bin/scribe-inference-worker --fixture-signing >/dev/null
+  if (cd "$fixture_option_pack" && bash "$repo_root/scripts/report-linux-worker-pack-sizes.sh" --fixture-pack "$fixture_option_pack" --tool "$tool" >/dev/null 2>&1); then
+    echo 'size reporter accepted option-like fixture pack paths.' >&2; exit 1
+  fi
+  [[ ! -e "$fixture_option_pack/marker" ]] || { echo 'size reporter executed a tar option injected through a pack filename.' >&2; exit 1; }
   ln -s "$fixture_pack" "$test_root/fixture-pack-link"
   ln -s "$tool" "$test_root/tool-link"
   if bash "$repo_root/scripts/report-linux-worker-pack-sizes.sh" --fixture-pack "$test_root/fixture-pack-link" --tool "$tool" >/dev/null 2>&1; then echo 'size reporter accepted a symlink pack-root argument.' >&2; exit 1; fi
