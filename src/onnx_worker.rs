@@ -24,6 +24,7 @@ use crate::backend_policy::{
 use crate::config;
 use crate::gpu_auto_qualification::{
     AUTO_QUALIFICATION_POLICY_VERSION, AutoQualificationPolicy, QualificationDecision,
+    QualificationDenial,
 };
 use crate::gpu_worker_pack::health::{
     FailureObservation, HealthCache, HealthDecision, HealthKey, HealthWitnesses, SystemClock,
@@ -6282,6 +6283,10 @@ struct VerifiedGpuRouteCatalog {
 }
 
 const GPU_PROVIDER_PROBE_BACKOFF: Duration = Duration::from_secs(15);
+// Available memory is a live admission fact. Keep a denial only long enough
+// to prevent repeated CPU requests from restarting provider processes, never
+// as a durable route or device identity.
+const AUTO_VOLATILE_ADMISSION_BACKOFF: Duration = Duration::from_secs(5);
 const MAX_INFERENCE_ROUTE_ATTEMPTS: usize = 4;
 
 #[derive(Clone)]
@@ -6292,10 +6297,26 @@ struct FailedGpuProbe {
     explicit_retry_available: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AutoAdmissionWitness {
+    power_source: PowerSource,
+    available_memory_denied: bool,
+    power_policy_denied: bool,
+}
+
+#[derive(Clone)]
+struct AutoAdmissionBackoff {
+    discovery_fingerprint: String,
+    witness: AutoAdmissionWitness,
+    retry_not_before: Instant,
+    diagnostic: Option<String>,
+}
+
 #[derive(Default)]
 struct GpuRouteCatalogCache {
     successful: Option<VerifiedGpuRouteCatalog>,
     failed: Option<FailedGpuProbe>,
+    auto_admission_backoff: Option<AutoAdmissionBackoff>,
 }
 
 enum GpuRouteCatalogLookup {
@@ -6356,6 +6377,7 @@ impl GpuRouteCatalogCache {
         &mut self,
         discovery_fingerprint: &str,
         active: Option<&ActiveInferenceRoute>,
+        power_source: PowerSource,
         now: Instant,
     ) -> GpuRouteCatalogLookup {
         let successful = self
@@ -6378,6 +6400,25 @@ impl GpuRouteCatalogCache {
         if successful.is_none() {
             self.successful = None;
         }
+        // Never retire or reprobe the exact live warm winner merely because a
+        // different provider's partial probe backoff elapsed. That retry is
+        // deferred until the winner changes or retires.
+        if let Some(successful) = successful {
+            return GpuRouteCatalogLookup::Successful(successful);
+        }
+        if let Some(backoff) = self.auto_admission_backoff.clone() {
+            if backoff.discovery_fingerprint != discovery_fingerprint
+                || backoff.witness.power_source != power_source
+            {
+                // A pack/model discovery or power-fact transition invalidates
+                // this volatile denial witness and reopens bounded Hello.
+                self.auto_admission_backoff = None;
+            } else if now < backoff.retry_not_before {
+                return GpuRouteCatalogLookup::Backoff(backoff.diagnostic.clone());
+            } else {
+                self.auto_admission_backoff = None;
+            }
+        }
         if let Some(failed) = self
             .failed
             .as_ref()
@@ -6386,15 +6427,9 @@ impl GpuRouteCatalogCache {
             if now >= failed.retry_not_before {
                 return GpuRouteCatalogLookup::Probe;
             }
-            return successful.map_or_else(
-                || GpuRouteCatalogLookup::Backoff(failed.diagnostic.clone()),
-                GpuRouteCatalogLookup::Successful,
-            );
+            return GpuRouteCatalogLookup::Backoff(failed.diagnostic.clone());
         }
-        successful.map_or(
-            GpuRouteCatalogLookup::Probe,
-            GpuRouteCatalogLookup::Successful,
-        )
+        GpuRouteCatalogLookup::Probe
     }
 
     fn record_auto_live_admission_probe(
@@ -6412,6 +6447,22 @@ impl GpuRouteCatalogCache {
         // A fresh probe is not yet a warm owner. Keep no successful snapshot
         // until `retain_auto_live_admission` verifies the exact active route.
         self.successful = None;
+        self.auto_admission_backoff = None;
+    }
+
+    fn record_auto_admission_backoff(
+        &mut self,
+        discovery_fingerprint: &str,
+        witness: AutoAdmissionWitness,
+        diagnostic: Option<String>,
+        now: Instant,
+    ) {
+        self.auto_admission_backoff = Some(AutoAdmissionBackoff {
+            discovery_fingerprint: discovery_fingerprint.to_owned(),
+            witness,
+            retry_not_before: now + AUTO_VOLATILE_ADMISSION_BACKOFF,
+            diagnostic,
+        });
     }
 
     fn retain_auto_live_admission(
@@ -6429,6 +6480,7 @@ impl GpuRouteCatalogCache {
             })
         {
             self.successful = Some(catalog.clone());
+            self.auto_admission_backoff = None;
         } else {
             self.successful = None;
         }
@@ -6452,6 +6504,7 @@ impl GpuRouteCatalogCache {
     fn invalidate_after_runtime_failure(&mut self) {
         self.successful = None;
         self.failed = None;
+        self.auto_admission_backoff = None;
     }
 }
 
@@ -6973,14 +7026,21 @@ fn verified_gpu_route_catalog(
     }
 }
 
-fn auto_qualified_gpu_route_catalog(
+struct AutoQualifiedGpuRouteCatalog {
+    catalog: VerifiedGpuRouteCatalog,
+    volatile_admission_witness: Option<AutoAdmissionWitness>,
+}
+
+fn auto_qualified_gpu_route_catalog_with_admission(
     mut catalog: VerifiedGpuRouteCatalog,
     policy: &AutoQualificationPolicy,
     model_digest: &str,
     power_source: PowerSource,
-) -> VerifiedGpuRouteCatalog {
+) -> AutoQualifiedGpuRouteCatalog {
     let mut qualified_routes = Vec::with_capacity(catalog.routes.len());
     let mut qualification_denied = 0_usize;
+    let mut available_memory_denied = 0_usize;
+    let mut nonvolatile_qualification_denied = 0_usize;
     let mut battery_denied = 0_usize;
     let mut unknown_power_denied = 0_usize;
     let mut qualification_diagnostic = None;
@@ -6996,8 +7056,18 @@ fn auto_qualified_gpu_route_catalog(
                 qualified.auto_evidence_id = Some(evidence_id);
                 qualified_routes.push(qualified);
             }
-            denied @ QualificationDecision::Denied(_) => {
+            denied @ QualificationDecision::Denied(reason) => {
                 qualification_denied = qualification_denied.saturating_add(1);
+                if matches!(
+                    reason,
+                    QualificationDenial::InvalidAvailableMemory
+                        | QualificationDenial::InsufficientAvailableMemory
+                ) {
+                    available_memory_denied = available_memory_denied.saturating_add(1);
+                } else {
+                    nonvolatile_qualification_denied =
+                        nonvolatile_qualification_denied.saturating_add(1);
+                }
                 qualification_diagnostic.get_or_insert_with(|| denied.diagnostic());
                 catalog.skipped_targets.push(SkippedBackend {
                     target: target.clone(),
@@ -7033,6 +7103,16 @@ fn auto_qualified_gpu_route_catalog(
             }
         }
     }
+    let power_policy_denied = battery_denied.saturating_add(unknown_power_denied);
+    let volatile_admission_witness = (!catalog.routes.is_empty()
+        && routes.is_empty()
+        && nonvolatile_qualification_denied == 0
+        && (available_memory_denied != 0 || power_policy_denied != 0))
+        .then_some(AutoAdmissionWitness {
+            power_source,
+            available_memory_denied: available_memory_denied != 0,
+            power_policy_denied: power_policy_denied != 0,
+        });
     catalog.routes = Arc::new(routes);
     if qualification_denied != 0 {
         append_route_plan_diagnostic(
@@ -7062,7 +7142,21 @@ fn auto_qualified_gpu_route_catalog(
             ),
         );
     }
-    catalog
+    AutoQualifiedGpuRouteCatalog {
+        catalog,
+        volatile_admission_witness,
+    }
+}
+
+#[cfg(test)]
+fn auto_qualified_gpu_route_catalog(
+    catalog: VerifiedGpuRouteCatalog,
+    policy: &AutoQualificationPolicy,
+    model_digest: &str,
+    power_source: PowerSource,
+) -> VerifiedGpuRouteCatalog {
+    auto_qualified_gpu_route_catalog_with_admission(catalog, policy, model_digest, power_source)
+        .catalog
 }
 
 fn auto_gpu_route_plan(
@@ -7072,10 +7166,15 @@ fn auto_gpu_route_plan(
     model_digest: &str,
     health_path: Option<&Arc<PathBuf>>,
     allow_unprobed_idle_health: bool,
-) -> InferenceWorkerRoutePlan {
-    let selection_power_source = PowerSource::current();
-    let catalog =
-        auto_qualified_gpu_route_catalog(catalog, policy, model_digest, selection_power_source);
+    selection_power_source: PowerSource,
+) -> (InferenceWorkerRoutePlan, Option<AutoAdmissionWitness>) {
+    let qualified = auto_qualified_gpu_route_catalog_with_admission(
+        catalog,
+        policy,
+        model_digest,
+        selection_power_source,
+    );
+    let catalog = qualified.catalog;
     let auto_live_admission = (!catalog.routes.is_empty()).then(|| catalog.clone());
     let mut plan = health_filtered_gpu_route_plan(
         catalog,
@@ -7086,7 +7185,7 @@ fn auto_gpu_route_plan(
     plan.selection_power_source = Some(selection_power_source);
     plan.auto_live_admission = auto_live_admission;
     reserve_auto_cpu_fallback(&mut plan, &cpu_routes);
-    plan
+    (plan, qualified.volatile_admission_witness)
 }
 
 fn auto_route_is_power_eligible(route: &InferenceWorkerRoute, power_source: PowerSource) -> bool {
@@ -7687,6 +7786,10 @@ impl InferenceWorkerRegistry {
             }
             let discovery_fingerprint =
                 auto_gpu_discovery_fingerprint(&discovery, policy, &model.expected_sha256);
+            // This selection-time fact is also the volatile admission witness.
+            // Execution obtains a fresh fact again immediately before a GPU
+            // starts work, so this short cache can never authorize a route.
+            let selection_power_source = PowerSource::current();
             let lookup_at = Instant::now();
             let active_warm_route = self.active_warm_auto_route();
             let cached_catalog = {
@@ -7698,6 +7801,7 @@ impl InferenceWorkerRegistry {
                 cached.auto_live_admission_lookup(
                     &discovery_fingerprint,
                     active_warm_route.as_ref(),
+                    selection_power_source,
                     lookup_at,
                 )
             };
@@ -7729,14 +7833,31 @@ impl InferenceWorkerRegistry {
                     discovered
                 }
             };
-            return Ok(auto_gpu_route_plan(
+            let (plan, volatile_admission_witness) = auto_gpu_route_plan(
                 Arc::clone(&self.routes),
                 catalog,
                 policy,
                 &model.expected_sha256,
                 self.gpu_health_path.as_ref(),
                 allow_unprobed_idle_health,
-            ));
+                selection_power_source,
+            );
+            if let Some(witness) = volatile_admission_witness {
+                self.auto_gpu_routes
+                    .lock()
+                    .map_err(|_| {
+                        RuntimeError::WorkerUnavailable(
+                            "Auto GPU worker registry lock poisoned".to_owned(),
+                        )
+                    })?
+                    .record_auto_admission_backoff(
+                        &discovery_fingerprint,
+                        witness,
+                        plan.diagnostic.clone(),
+                        Instant::now(),
+                    );
+            }
+            return Ok(plan);
         }
         let RuntimeArtifact::Gguf(model) = artifact else {
             return Ok(InferenceWorkerRoutePlan {
@@ -12232,6 +12353,7 @@ mod tests {
             gpu_routes: Arc::new(Mutex::new(GpuRouteCatalogCache {
                 successful: Some(catalog.clone()),
                 failed: None,
+                auto_admission_backoff: None,
             })),
             auto_gpu_routes: Arc::new(Mutex::new(GpuRouteCatalogCache::default())),
             gpu_health_path: Some(Arc::clone(&path)),
@@ -13299,7 +13421,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_route_cache_reuses_only_the_matching_live_warm_owner() {
+    fn auto_route_cache_keeps_live_warm_owner_after_partial_probe_backoff_expires() {
         let launcher = Arc::new(TestLauncher::new([TestMode::Normal]));
         let mut route = verified_gpu_route(
             BackendKind::Cuda,
@@ -13317,7 +13439,8 @@ mod tests {
             identity: InferenceWorkerRegistry::route_identity(&route),
             supervisor: route.supervisor.clone(),
         };
-        let catalog = verified_gpu_catalog(vec![route.clone()]);
+        let mut catalog = verified_gpu_catalog(vec![route.clone()]);
+        catalog.provider_probe_incomplete = true;
         let fingerprint = catalog.discovery_fingerprint.clone();
         let now = Instant::now();
         let mut cache = GpuRouteCatalogCache::default();
@@ -13326,19 +13449,139 @@ mod tests {
         assert!(cache.successful().is_none());
         cache.retain_auto_live_admission(&catalog, &active);
         assert!(matches!(
-            cache.auto_live_admission_lookup(&fingerprint, Some(&active), now),
+            cache.auto_live_admission_lookup(
+                &fingerprint,
+                Some(&active),
+                PowerSource::Ac,
+                now + GPU_PROVIDER_PROBE_BACKOFF + Duration::from_millis(1),
+            ),
             GpuRouteCatalogLookup::Successful(_)
         ));
+        assert!(
+            route.supervisor.has_live_generation(),
+            "expired partial-probe recovery must not retire the healthy warm winner"
+        );
 
         // No active warm owner means a cold request must obtain a fresh Hello;
         // the available-memory observation is not a durable route attribute.
         assert!(matches!(
-            cache.auto_live_admission_lookup(&fingerprint, None, now),
+            cache.auto_live_admission_lookup(
+                &fingerprint,
+                None,
+                PowerSource::Ac,
+                now + GPU_PROVIDER_PROBE_BACKOFF + Duration::from_millis(1),
+            ),
             GpuRouteCatalogLookup::Probe
         ));
         assert!(cache.successful().is_none());
         route.supervisor.retire().expect("test worker retires");
         assert_eq!(launcher.launches.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn auto_low_vram_admission_backoff_uses_cpu_without_a_probe_storm() {
+        let mut route = verified_gpu_route(
+            BackendKind::Cuda,
+            "native:pci:0000:01:00.0",
+            "windows-display:32.0.16.1088",
+            'a',
+        );
+        let target = route.target.as_mut().unwrap();
+        target.memory_available_bytes = 0;
+        let model_digest = "b".repeat(64);
+        let policy = fixture_auto_policy(target, &model_digest, "low-vram-backoff-fixture-v1");
+        let qualified = auto_qualified_gpu_route_catalog_with_admission(
+            verified_gpu_catalog(vec![route]),
+            &policy,
+            &model_digest,
+            PowerSource::Ac,
+        );
+        assert!(qualified.catalog.routes.is_empty());
+        assert_eq!(
+            qualified.volatile_admission_witness,
+            Some(AutoAdmissionWitness {
+                power_source: PowerSource::Ac,
+                available_memory_denied: true,
+                power_policy_denied: false,
+            })
+        );
+        let fingerprint = qualified.catalog.discovery_fingerprint.clone();
+        let witness = qualified.volatile_admission_witness.unwrap();
+        let now = Instant::now();
+        let mut cache = GpuRouteCatalogCache::default();
+        cache.record_auto_admission_backoff(
+            &fingerprint,
+            witness,
+            Some("available memory is below the qualified Auto minimum".to_owned()),
+            now,
+        );
+
+        for request in 0..3 {
+            assert!(
+                matches!(
+                    cache.auto_live_admission_lookup(&fingerprint, None, PowerSource::Ac, now),
+                    GpuRouteCatalogLookup::Backoff(Some(message))
+                        if message.contains("available memory")
+                ),
+                "CPU request {request} must use the bounded admission denial rather than start provider Hello"
+            );
+        }
+        assert!(matches!(
+            cache.auto_live_admission_lookup(
+                &fingerprint,
+                None,
+                PowerSource::Ac,
+                now + AUTO_VOLATILE_ADMISSION_BACKOFF,
+            ),
+            GpuRouteCatalogLookup::Probe
+        ));
+    }
+
+    #[test]
+    fn auto_power_change_bypasses_the_volatile_admission_backoff() {
+        let route = verified_gpu_route(
+            BackendKind::Cuda,
+            "native:pci:0000:01:00.0",
+            "windows-display:32.0.16.1088",
+            'a',
+        );
+        let target = route.target.as_ref().unwrap();
+        let model_digest = "b".repeat(64);
+        let policy = fixture_auto_policy(target, &model_digest, "power-backoff-fixture-v1");
+        let qualified = auto_qualified_gpu_route_catalog_with_admission(
+            verified_gpu_catalog(vec![route]),
+            &policy,
+            &model_digest,
+            PowerSource::Battery,
+        );
+        assert!(qualified.catalog.routes.is_empty());
+        assert_eq!(
+            qualified.volatile_admission_witness,
+            Some(AutoAdmissionWitness {
+                power_source: PowerSource::Battery,
+                available_memory_denied: false,
+                power_policy_denied: true,
+            })
+        );
+        let fingerprint = qualified.catalog.discovery_fingerprint.clone();
+        let witness = qualified.volatile_admission_witness.unwrap();
+        let now = Instant::now();
+        let mut cache = GpuRouteCatalogCache::default();
+        cache.record_auto_admission_backoff(
+            &fingerprint,
+            witness,
+            Some("Auto GPU route is unavailable on battery".to_owned()),
+            now,
+        );
+        assert!(matches!(
+            cache.auto_live_admission_lookup(&fingerprint, None, PowerSource::Battery, now),
+            GpuRouteCatalogLookup::Backoff(_)
+        ));
+        assert!(matches!(
+            cache.auto_live_admission_lookup(&fingerprint, None, PowerSource::Ac, now),
+            GpuRouteCatalogLookup::Probe
+        ));
+        assert!(cache.auto_admission_backoff.is_none());
     }
 
     #[test]
