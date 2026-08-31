@@ -50,6 +50,9 @@ mod inference_server;
 #[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
 #[path = "../linux_gpu.rs"]
 mod linux_gpu;
+#[cfg(target_os = "linux")]
+#[path = "../linux_power.rs"]
+mod linux_power;
 #[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
 #[allow(
     dead_code,
