@@ -95,14 +95,12 @@ try {
     New-Item -ItemType Directory -Path $publicationRoot | Out-Null
     $finalLeaf = 'windows-vulkan-fixture-evidence.json'
     $finalPath = Join-Path $publicationRoot $finalLeaf
-    $testFsutil = Join-Path (Get-ScribeVulkanEvidenceActualSystem32) 'fsutil.exe'
-
     $partialLeaf = 'windows-vulkan-fixture-evidence.pending-partial.json'
     $partialPath = Join-Path $publicationRoot $partialLeaf
     [IO.File]::WriteAllText($partialPath, '{')
     $writeFailure = [InvalidOperationException]::new('forced evidence write failure')
     try {
-        $null = Complete-ScribeEvidencePendingReport $partialPath $finalPath $publicationRoot $partialLeaf $finalLeaf $testFsutil $writeFailure @()
+        $null = Complete-ScribeEvidencePendingReport $partialPath $finalPath $publicationRoot $partialLeaf $finalLeaf $writeFailure @()
         throw 'Forced evidence write failure unexpectedly published.'
     }
     catch {
@@ -112,12 +110,57 @@ try {
         throw 'Forced evidence write failure left a pending or final artifact.'
     }
 
+    $invalidLeaf = 'windows-vulkan-fixture-evidence.pending-invalid.json'
+    $invalidPath = Join-Path $publicationRoot $invalidLeaf
+    [IO.File]::WriteAllText($invalidPath, '{')
+    $invalidFailure = $null
+    try {
+        $null = Complete-ScribeEvidencePendingReport $invalidPath $finalPath $publicationRoot $invalidLeaf $finalLeaf $null @()
+    }
+    catch {
+        $invalidFailure = $_.Exception
+    }
+    if ($null -eq $invalidFailure -or
+        (Test-Path -LiteralPath $invalidPath) -or
+        (Test-Path -LiteralPath $finalPath)) {
+        throw 'Invalid partial evidence was published or retained after validation failure.'
+    }
+
+    $topologyTarget = Join-Path $publicationRoot 'handle-topology-target'
+    New-Item -ItemType Directory -Path $topologyTarget | Out-Null
+    $topologyLeaf = 'windows-vulkan-fixture-evidence.pending-topology.json'
+    [IO.File]::WriteAllText((Join-Path $topologyTarget $topologyLeaf), '{}')
+    $topologyJunction = Join-Path (Split-Path -Parent $publicationRoot) ("scribe-evidence-publication-junction-$([guid]::NewGuid().ToString('N'))")
+    try {
+        New-Item -ItemType Junction -Path $topologyJunction -Target $topologyTarget | Out-Null
+        $topologyRejected = $false
+        try {
+            $topologyBinding = [ScribeEvidenceNative.BoundPendingFile]::Open(
+                $topologyJunction,
+                (Join-Path $topologyJunction $topologyLeaf),
+                $topologyLeaf,
+                1MB,
+                $false,
+                $false
+            )
+            $topologyBinding.Dispose()
+        }
+        catch {
+            $topologyRejected = $true
+        }
+        if (-not $topologyRejected) { throw 'Handle publication accepted a reparse evidence root.' }
+    }
+    finally {
+        Remove-Item -LiteralPath $topologyJunction -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $topologyTarget -Recurse -Force
+    }
+
     $guardLeaf = 'windows-vulkan-fixture-evidence.pending-guard.json'
     $guardPath = Join-Path $publicationRoot $guardLeaf
     [IO.File]::WriteAllText($guardPath, '{}')
     $guardFailure = [InvalidOperationException]::new('forced final Auto guard failure')
     try {
-        $null = Complete-ScribeEvidencePendingReport $guardPath $finalPath $publicationRoot $guardLeaf $finalLeaf $testFsutil $null @($guardFailure)
+        $null = Complete-ScribeEvidencePendingReport $guardPath $finalPath $publicationRoot $guardLeaf $finalLeaf $null @($guardFailure)
         throw 'Forced final guard failure unexpectedly published.'
     }
     catch {
@@ -133,7 +176,7 @@ try {
     $primaryFailure = [InvalidOperationException]::new('forced primary harness failure')
     $observedPrimary = $null
     try {
-        $null = Complete-ScribeEvidencePendingReport $cleanupPath $finalPath $publicationRoot $cleanupLeaf $finalLeaf $testFsutil $primaryFailure @()
+        $null = Complete-ScribeEvidencePendingReport $cleanupPath $finalPath $publicationRoot $cleanupLeaf $finalLeaf $primaryFailure @()
     }
     catch {
         $observedPrimary = $_.Exception
@@ -145,6 +188,51 @@ try {
         throw 'Pending cleanup failure masked the primary failure or published final evidence.'
     }
     Remove-Item -LiteralPath $cleanupPath -Force
+
+    $hardlinkLeaf = 'windows-vulkan-fixture-evidence.pending-hardlink.json'
+    $hardlinkPath = Join-Path $publicationRoot $hardlinkLeaf
+    $hardlinkAlias = Join-Path $publicationRoot 'windows-vulkan-fixture-evidence.pending-hardlink-alias.json'
+    [IO.File]::WriteAllText($hardlinkPath, '{}')
+    New-Item -ItemType HardLink -Path $hardlinkAlias -Target $hardlinkPath | Out-Null
+    $hardlinkPrimary = [InvalidOperationException]::new('forced hardlink cleanup primary failure')
+    $observedHardlinkPrimary = $null
+    try {
+        $null = Complete-ScribeEvidencePendingReport $hardlinkPath $finalPath $publicationRoot $hardlinkLeaf $finalLeaf $hardlinkPrimary @()
+    }
+    catch {
+        $observedHardlinkPrimary = $_.Exception
+    }
+    if ($null -eq $observedHardlinkPrimary -or
+        $observedHardlinkPrimary.Message -cne 'forced hardlink cleanup primary failure' -or
+        $observedHardlinkPrimary.Data.Count -eq 0 -or
+        -not (Test-Path -LiteralPath $hardlinkPath -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $hardlinkAlias -PathType Leaf) -or
+        (Test-Path -LiteralPath $finalPath)) {
+        throw 'Hardlinked pending cleanup did not fail closed while preserving the primary failure.'
+    }
+    Remove-Item -LiteralPath $hardlinkAlias -Force
+    Remove-Item -LiteralPath $hardlinkPath -Force
+
+    $adsLeaf = 'windows-vulkan-fixture-evidence.pending-ads.json'
+    $adsPath = Join-Path $publicationRoot $adsLeaf
+    [IO.File]::WriteAllText($adsPath, '{}')
+    [IO.File]::WriteAllText("$adsPath`:forbidden", 'x')
+    $adsPrimary = [InvalidOperationException]::new('forced ADS cleanup primary failure')
+    $observedAdsPrimary = $null
+    try {
+        $null = Complete-ScribeEvidencePendingReport $adsPath $finalPath $publicationRoot $adsLeaf $finalLeaf $adsPrimary @()
+    }
+    catch {
+        $observedAdsPrimary = $_.Exception
+    }
+    if ($null -eq $observedAdsPrimary -or
+        $observedAdsPrimary.Message -cne 'forced ADS cleanup primary failure' -or
+        $observedAdsPrimary.Data.Count -eq 0 -or
+        -not (Test-Path -LiteralPath $adsPath -PathType Leaf) -or
+        (Test-Path -LiteralPath $finalPath)) {
+        throw 'ADS-bearing pending cleanup did not fail closed while preserving the primary failure.'
+    }
+    Remove-Item -LiteralPath $adsPath -Force
 
     $statistics = [ordered]@{ p50_ms = 1; p95_ms = 1 }
     $coldRunSet = [ordered]@{
@@ -182,14 +270,107 @@ try {
         normalized_transcript_parity = $true
         same_device_internally_verified = $true
     }
+
+    $bindingLeaf = 'windows-vulkan-fixture-evidence.pending-binding.json'
+    $bindingPath = Join-Path $publicationRoot $bindingLeaf
+    $bindingSwapPath = Join-Path $publicationRoot 'windows-vulkan-fixture-evidence.pending-binding-swap.json'
+    $bindingBytes = [Text.UTF8Encoding]::new($false).GetBytes(($validReport | ConvertTo-Json -Depth 10 -Compress))
+    [IO.File]::WriteAllBytes($bindingPath, $bindingBytes)
+    $mismatchedLeafRejected = $false
+    try {
+        $mismatchedBinding = [ScribeEvidenceNative.BoundPendingFile]::Open(
+            $publicationRoot,
+            $bindingPath,
+            'windows-vulkan-fixture-evidence.pending-different.json',
+            1MB,
+            $false,
+            $false
+        )
+        $mismatchedBinding.Dispose()
+    }
+    catch {
+        $mismatchedLeafRejected = $true
+    }
+    if (-not $mismatchedLeafRejected) { throw 'Handle publication accepted a mismatched pending leaf identity.' }
+    $binding = [ScribeEvidenceNative.BoundPendingFile]::Open(
+        $publicationRoot,
+        $bindingPath,
+        $bindingLeaf,
+        1MB,
+        $false,
+        $false
+    )
+    try {
+        $moveBlocked = $false
+        try { [IO.File]::Move($bindingPath, $bindingSwapPath) } catch { $moveBlocked = $true }
+        if (-not $moveBlocked) {
+            [IO.File]::Move($bindingSwapPath, $bindingPath)
+            throw 'Bound pending evidence identity remained replaceable.'
+        }
+        $writeBlocked = $false
+        try {
+            $writeAttempt = [IO.File]::Open($bindingPath, [IO.FileMode]::Open, [IO.FileAccess]::Write, [IO.FileShare]::None)
+            $writeAttempt.Dispose()
+        }
+        catch {
+            $writeBlocked = $true
+        }
+        if (-not $writeBlocked) { throw 'Bound pending evidence identity remained writable.' }
+
+        $rootMoveTarget = "$publicationRoot-moved"
+        $rootMoveSucceeded = $false
+        try {
+            [IO.Directory]::Move($publicationRoot, $rootMoveTarget)
+            $rootMoveSucceeded = $true
+        }
+        catch {}
+        if ($rootMoveSucceeded) {
+            [IO.Directory]::Move($rootMoveTarget, $publicationRoot)
+            throw 'Bound pending evidence did not stabilize its directory topology.'
+        }
+
+        $boundRead = $binding.ReadAllAndHash()
+        $expectedBoundDigest = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bindingBytes)).ToLowerInvariant()
+        if ($boundRead.Sha256 -cne $expectedBoundDigest -or
+            -not [Linq.Enumerable]::SequenceEqual[byte]($boundRead.Bytes, $bindingBytes) -or
+            $binding.Identity -cnotmatch '^[0-9a-f]{8}:[0-9a-f]{16}$') {
+            throw 'Bound evidence read did not describe the exact locked identity and bytes.'
+        }
+    }
+    finally {
+        $binding.Dispose()
+    }
+    Remove-ScribeEvidencePendingReport $bindingPath $publicationRoot $bindingLeaf
+
+    $collisionLeaf = 'windows-vulkan-fixture-evidence.pending-collision.json'
+    $collisionPath = Join-Path $publicationRoot $collisionLeaf
+    [IO.File]::WriteAllBytes($collisionPath, $bindingBytes)
+    [IO.File]::WriteAllText($finalPath, 'destination-sentinel')
+    $collisionFailure = $null
+    try {
+        $null = Complete-ScribeEvidencePendingReport $collisionPath $finalPath $publicationRoot $collisionLeaf $finalLeaf $null @()
+    }
+    catch {
+        $collisionFailure = $_.Exception
+    }
+    if ($null -eq $collisionFailure -or
+        (Test-Path -LiteralPath $collisionPath) -or
+        [IO.File]::ReadAllText($finalPath) -cne 'destination-sentinel') {
+        throw 'Handle publication replaced an existing final destination or retained its pending source.'
+    }
+    Remove-Item -LiteralPath $finalPath -Force
+
     $successLeaf = 'windows-vulkan-fixture-evidence.pending-success.json'
     $successPath = Join-Path $publicationRoot $successLeaf
-    [IO.File]::WriteAllText($successPath, ($validReport | ConvertTo-Json -Depth 10 -Compress), [Text.UTF8Encoding]::new($false))
-    $published = Complete-ScribeEvidencePendingReport $successPath $finalPath $publicationRoot $successLeaf $finalLeaf $testFsutil $null @()
+    [IO.File]::WriteAllBytes($successPath, $bindingBytes)
+    $published = Complete-ScribeEvidencePendingReport $successPath $finalPath $publicationRoot $successLeaf $finalLeaf $null @()
+    $publishedBytes = [IO.File]::ReadAllBytes($finalPath)
     if ((Test-Path -LiteralPath $successPath) -or
         -not (Test-Path -LiteralPath $finalPath -PathType Leaf) -or
         [string]$published.Path -cne $finalPath -or
-        [string]$published.Digest -cnotmatch '^[0-9a-f]{64}$') {
+        [string]$published.Digest -cne $expectedBoundDigest -or
+        [string]$published.Identity -cnotmatch '^[0-9a-f]{8}:[0-9a-f]{16}$' -or
+        -not [Linq.Enumerable]::SequenceEqual[byte]($publishedBytes, $bindingBytes)) {
         throw 'Validated pending evidence was not atomically published to the final path.'
     }
 }
@@ -207,6 +388,41 @@ $runnerRetryFunction = $runnerAst.Find({
     $Ast.Name -ceq 'Invoke-ScribeEvidenceCargoWithCmakeRetry'
 }, $true)
 if ($null -eq $runnerRetryFunction) { throw 'Runner lost its Cargo retry function.' }
+$runnerPinnedEnvironmentFunction = $runnerAst.Find({
+    param($Ast)
+    $Ast -is [Management.Automation.Language.FunctionDefinitionAst] -and
+    $Ast.Name -ceq 'Invoke-ScribeEvidenceWithPinnedMsvcEnvironment'
+}, $true)
+if ($null -eq $runnerPinnedEnvironmentFunction) { throw 'Runner lost its pinned-environment function.' }
+. ([scriptblock]::Create($runnerPinnedEnvironmentFunction.Extent.Text))
+$originalRestoreFunction = (Get-Command Restore-ScribeEvidenceProcessEnvironment -CommandType Function).ScriptBlock
+$previousRestoreFailureTest = $env:SCRIBE_EVIDENCE_RESTORE_FAILURE_TEST
+try {
+    $env:SCRIBE_EVIDENCE_RESTORE_FAILURE_TEST = 'ambient'
+    Set-Item -LiteralPath Function:Restore-ScribeEvidenceProcessEnvironment -Value {
+        param([psobject[]]$Previous)
+        throw 'forced pinned restore failure'
+    }
+    $observedOperationFailure = $null
+    try {
+        Invoke-ScribeEvidenceWithPinnedMsvcEnvironment `
+            ([ordered]@{ SCRIBE_EVIDENCE_RESTORE_FAILURE_TEST = 'pinned' }) `
+            { throw 'forced pinned operation failure' }
+    }
+    catch {
+        $observedOperationFailure = $_.Exception
+    }
+    if ($null -eq $observedOperationFailure -or
+        $observedOperationFailure.Message -cne 'forced pinned operation failure' -or
+        $observedOperationFailure.Data.Count -eq 0 -or
+        @($observedOperationFailure.Data.Values) -cnotcontains 'forced pinned restore failure') {
+        throw 'Pinned environment restoration masked the wrapped operation failure.'
+    }
+}
+finally {
+    Set-Item -LiteralPath Function:Restore-ScribeEvidenceProcessEnvironment -Value $originalRestoreFunction
+    $env:SCRIBE_EVIDENCE_RESTORE_FAILURE_TEST = $previousRestoreFailureTest
+}
 $runnerRetryHarness = Join-Path ([IO.Path]::GetTempPath()) ("scribe-evidence-runner-retry-$([guid]::NewGuid().ToString('N')).ps1")
 try {
     $runnerRetryHarnessTail = @'
@@ -340,8 +556,8 @@ finally {
 foreach ($required in @('--locked', '--offline', '-SigningMode Fixture', '--ignored', '--exact', '--test-threads=1', '--no-run', 'Invoke-ScribeEvidenceCargoWithCmakeRetry', 'Enable-ScribeEvidenceCmakeBootstrap', 'Assert-ScribeEvidenceNoReparseDescendants', 'Get-ScribeEvidencePinnedMsvcEnvironment', 'Invoke-ScribeEvidenceWithPinnedMsvcEnvironment', '-ToolchainCheckOnly -ExportPinnedMsvcEnvironment', 'Set-ScribeEvidenceWorkerBuildMode $true', 'Set-ScribeEvidenceWorkerBuildMode $false', 'previousWorkerDigest', 'previousBuildingWorker', 'transcribe-cpp-sys-[0-9a-f]{16}', 'onnx_worker::tests::windows_vulkan_fixture_evidence_captures_five_cold_and_twenty_warm_runs', 'gpu-auto-qualification-windows-x64.json', 'Production signing/release input is forbidden', 'Resolve-ScribeEvidenceFreshDirectory', 'Evidence output may not be under source')) {
     if ($runner -notmatch [regex]::Escape($required)) { throw "Runner is missing required source contract: $required" }
 }
-if ($runner -notmatch 'finally\s*\{\s*if \(\$null -ne \$previous\) \{ Restore-ScribeEvidenceProcessEnvironment \$previous \}') {
-    throw 'Pinned toolchain scope does not restore the ambient environment.'
+foreach ($required in @('$operationFailure = $null', '$restoreFailure = $null', 'Add-ScribeEvidenceSecondaryFailures $operationFailure @($restoreFailure)', 'if ($null -ne $restoreFailure) { throw $restoreFailure }')) {
+    if ($runner -notmatch [regex]::Escape($required)) { throw "Pinned toolchain failure provenance is missing: $required" }
 }
 foreach ($required in @('Get-FileHash -LiteralPath $model', 'Get-FileHash -LiteralPath $wav', 'Test-ScribeEvidenceActivationPath', 'Test-ScribeEvidenceWithin', 'New-ScribeEvidenceShortCargoTarget', 'Assert-ScribeEvidenceSingleLinkFile', 'Get-ScribeVulkanEvidenceActualSystem32', 'fsutil.exe', 'manifest.json', 'Fixture pack build identity is not bound', 'New-ScribeEvidenceFixturePackVersion $revision', 'Fixture-only untrusted Vulkan evidence', 'previousEvidenceEnvironment')) {
     if ($runner -notmatch [regex]::Escape($required)) { throw "Runner is missing required safety contract: $required" }
@@ -350,9 +566,11 @@ $compileAt = $runner.IndexOf("'--no-run'")
 $baselineAt = $runner.IndexOf('Get-ScribeVulkanEvidenceNvidiaBaseline')
 if ($compileAt -lt 0 -or $baselineAt -lt 0 -or $compileAt -ge $baselineAt) { throw 'Runner must precompile before NVIDIA baseline capture.' }
 $cpuBuildAt = $runner.IndexOf("Invoke-ScribeEvidenceCargoWithCmakeRetry @('build'")
+if ($cpuBuildAt -lt 0) { throw 'Runner lost the CPU worker build invocation.' }
 $workerModeAt = $runner.IndexOf('Set-ScribeEvidenceWorkerBuildMode $true')
 $harnessModeAt = $runner.IndexOf('Set-ScribeEvidenceWorkerBuildMode $false', $cpuBuildAt)
 $ignoredTestAt = $runner.IndexOf("Invoke-ScribeEvidence `$cargo @('test'")
+if ($ignoredTestAt -lt 0) { throw 'Runner lost the ignored Vulkan evidence test invocation.' }
 $executionModeAt = $runner.LastIndexOf('Set-ScribeEvidenceWorkerBuildMode $false', $ignoredTestAt)
 $pinnedCpuAt = $runner.LastIndexOf('Invoke-ScribeEvidenceWithPinnedMsvcEnvironment $pinnedMsvcEnvironment', $cpuBuildAt)
 $packBuildAt = $runner.IndexOf('& $packBuilder -Backend Vulkan -PackVersion $packVersion')
@@ -371,5 +589,22 @@ if ($runner -match '\$detail\s*=\s*\(\$first\s*\|\s*Out-String\)|throw\s+"\$Fail
 $preflight = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'windows-vulkan-evidence-preflight.ps1') -Raw
 foreach ($required in @('GetSystemDirectory', 'nvidia-smi.exe', 'matching.Count -ne 1', '$utilization -gt 10', '$usedMib -gt ($totalMib / 4)', 'pci.bus_id')) {
     if ($preflight -notmatch [regex]::Escape($required)) { throw "Preflight is missing required source contract: $required" }
+}
+foreach ($required in @('CreateFileW', 'GetFileInformationByHandle', 'GetFileInformationByHandleEx', 'FileIdExtdDirectoryInfo', 'SetFileInformationByHandle', 'FileRenameInfo', 'FileDispositionInfo', 'ValidateOnlyUnnamedDataStream', 'ReadAllAndHash', 'RenameNoReplace', 'FileShareRead')) {
+    if ($preflight -notmatch [regex]::Escape($required)) { throw "Handle-bound evidence publication is missing: $required" }
+}
+if ($preflight -match '\[IO\.File\]::Move\(' -or
+    $preflight -match 'Get-FileHash\s+-LiteralPath\s+\$pending' -or
+    $preflight -match 'Remove-Item\s+-LiteralPath\s+\$pending') {
+    throw 'Evidence publication or cleanup reopened a validated pending path for mutation.'
+}
+$workerSource = Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\src\onnx_worker.rs') -Raw
+$evidenceTestAt = $workerSource.IndexOf('fn windows_vulkan_fixture_evidence_captures_five_cold_and_twenty_warm_runs()')
+$probeShutdownAt = if ($evidenceTestAt -lt 0) { -1 } else { $workerSource.IndexOf('probe.shutdown().expect("fixture pack probe shutdown");', $evidenceTestAt) }
+$probeDropAt = if ($probeShutdownAt -lt 0) { -1 } else { $workerSource.IndexOf('drop(probe);', $probeShutdownAt) }
+$leaseCleanupAt = if ($probeDropAt -lt 0) { -1 } else { $workerSource.IndexOf('write_vulkan_evidence_after_cleanup(&inputs.output', $probeDropAt) }
+if ($evidenceTestAt -lt 0 -or $probeShutdownAt -lt $evidenceTestAt -or
+    $probeDropAt -le $probeShutdownAt -or $leaseCleanupAt -le $probeDropAt) {
+    throw 'Vulkan evidence test must drop the probe handles before fallible lease cleanup.'
 }
 Write-Output 'Windows Vulkan fixture-evidence script contracts passed.'

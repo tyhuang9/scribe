@@ -1,6 +1,593 @@
 Set-StrictMode -Version Latest
 . (Join-Path $PSScriptRoot 'windows-gpu-worker-cmake-bootstrap.ps1')
 
+if (-not ('ScribeEvidenceNative.BoundPendingFile' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Security.Cryptography;
+using System.Text;
+using Microsoft.Win32.SafeHandles;
+
+namespace ScribeEvidenceNative
+{
+    public sealed class BoundEvidenceRead
+    {
+        public byte[] Bytes { get; }
+        public string Sha256 { get; }
+
+        internal BoundEvidenceRead(byte[] bytes, string sha256)
+        {
+            Bytes = bytes;
+            Sha256 = sha256;
+        }
+    }
+
+    public sealed class BoundPendingFile : IDisposable
+    {
+        private const uint GenericRead = 0x80000000;
+        private const uint DeleteAccess = 0x00010000;
+        private const uint FileListDirectory = 0x00000001;
+        private const uint FileReadAttributes = 0x00000080;
+        private const uint FileShareRead = 0x00000001;
+        private const uint FileShareAll = 0x00000007;
+        private const uint OpenExisting = 3;
+        private const uint FileAttributeDirectory = 0x00000010;
+        private const uint FileAttributeReparsePoint = 0x00000400;
+        private const uint FileFlagBackupSemantics = 0x02000000;
+        private const uint FileFlagOpenReparsePoint = 0x00200000;
+        private const uint FileFlagSequentialScan = 0x08000000;
+        private const int ErrorFileNotFound = 2;
+        private const int ErrorPathNotFound = 3;
+        private const int ErrorNoMoreFiles = 18;
+        private const int FileRenameInfo = 3;
+        private const int FileDispositionInfo = 4;
+        private const int FileStreamInfo = 7;
+        private const int FileIdInfo = 18;
+        private const int FileIdExtdDirectoryInfo = 19;
+        private const int StreamInfoBufferBytes = 64 * 1024;
+        private const int StreamInfoHeaderBytes = 24;
+        private const int DirectoryInfoBufferBytes = 64 * 1024;
+        private const int DirectoryInfoHeaderBytes = 88;
+        private const int MaximumDirectoryEntries = 4096;
+        private const int ReadBufferBytes = 64 * 1024;
+        private const int MaximumNativePathCharacters = 1024;
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct NativeFileTime
+        {
+            internal uint Low;
+            internal uint High;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct ByHandleFileInformation
+        {
+            internal uint FileAttributes;
+            internal NativeFileTime CreationTime;
+            internal NativeFileTime LastAccessTime;
+            internal NativeFileTime LastWriteTime;
+            internal uint VolumeSerialNumber;
+            internal uint FileSizeHigh;
+            internal uint FileSizeLow;
+            internal uint NumberOfLinks;
+            internal uint FileIndexHigh;
+            internal uint FileIndexLow;
+        }
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern SafeFileHandle CreateFileW(
+            string fileName,
+            uint desiredAccess,
+            uint shareMode,
+            IntPtr securityAttributes,
+            uint creationDisposition,
+            uint flagsAndAttributes,
+            IntPtr templateFile);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GetFileInformationByHandle(
+            SafeFileHandle file,
+            out ByHandleFileInformation information);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GetFileInformationByHandleEx(
+            SafeFileHandle file,
+            int informationClass,
+            IntPtr information,
+            uint bufferSize);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool ReadFile(
+            SafeFileHandle file,
+            byte[] buffer,
+            uint bytesToRead,
+            out uint bytesRead,
+            IntPtr overlapped);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool SetFileInformationByHandle(
+            SafeFileHandle file,
+            int informationClass,
+            IntPtr information,
+            uint bufferSize);
+
+        private readonly SafeFileHandle parentHandle;
+        private readonly SafeFileHandle directoryHandle;
+        private readonly SafeFileHandle fileHandle;
+        private readonly string directoryPath;
+        private readonly int length;
+        private bool readComplete;
+        private bool mutationComplete;
+        private bool disposed;
+
+        public string Identity { get; }
+        public long Length { get { return length; } }
+
+        private BoundPendingFile(
+            SafeFileHandle parentHandle,
+            SafeFileHandle directoryHandle,
+            SafeFileHandle fileHandle,
+            string directoryPath,
+            int length,
+            string identity)
+        {
+            this.parentHandle = parentHandle;
+            this.directoryHandle = directoryHandle;
+            this.fileHandle = fileHandle;
+            this.directoryPath = directoryPath;
+            this.length = length;
+            Identity = identity;
+        }
+
+        public static BoundPendingFile Open(
+            string evidenceRoot,
+            string pendingPath,
+            string expectedLeaf,
+            int maximumBytes,
+            bool allowMissing,
+            bool allowEmpty)
+        {
+            if (maximumBytes <= 0 || maximumBytes > 1024 * 1024)
+                throw new ArgumentOutOfRangeException(nameof(maximumBytes));
+            ValidateLeaf(expectedLeaf, nameof(expectedLeaf));
+
+            string root = NormalizeDirectory(evidenceRoot);
+            string pending = Path.GetFullPath(pendingPath);
+            string rootParent = NormalizeDirectory(Path.GetDirectoryName(root));
+            string rootLeaf = Path.GetFileName(root);
+            ValidateDirectoryLeaf(rootLeaf);
+            if (root.Length > MaximumNativePathCharacters || pending.Length > MaximumNativePathCharacters)
+                throw new PathTooLongException("Evidence publication paths exceed their native bound.");
+            if (!string.Equals(Path.GetFileName(pending), expectedLeaf, StringComparison.Ordinal) ||
+                !string.Equals(NormalizeDirectory(Path.GetDirectoryName(pending)), root, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException("Pending evidence must be the exact direct child of its evidence root.");
+            }
+
+            SafeFileHandle parent = CreateFileW(
+                rootParent,
+                FileListDirectory | FileReadAttributes,
+                FileShareAll,
+                IntPtr.Zero,
+                OpenExisting,
+                FileFlagBackupSemantics | FileFlagOpenReparsePoint,
+                IntPtr.Zero);
+            if (parent.IsInvalid)
+            {
+                int error = Marshal.GetLastWin32Error();
+                parent.Dispose();
+                throw NativeError("lock the physical evidence-directory parent", error);
+            }
+
+            SafeFileHandle directory = null;
+            SafeFileHandle file = null;
+            try
+            {
+                ByHandleFileInformation parentInfo = GetInformation(parent, "inspect the evidence-directory parent");
+                if ((parentInfo.FileAttributes & FileAttributeDirectory) == 0 ||
+                    (parentInfo.FileAttributes & FileAttributeReparsePoint) != 0)
+                {
+                    throw new InvalidOperationException("Evidence-directory parent must be a physical non-reparse directory.");
+                }
+
+                directory = CreateFileW(
+                    root,
+                    FileListDirectory | FileReadAttributes,
+                    FileShareAll,
+                    IntPtr.Zero,
+                    OpenExisting,
+                    FileFlagBackupSemantics | FileFlagOpenReparsePoint,
+                    IntPtr.Zero);
+                if (directory.IsInvalid)
+                {
+                    int error = Marshal.GetLastWin32Error();
+                    directory.Dispose();
+                    directory = null;
+                    throw NativeError("open the physical evidence directory", error);
+                }
+
+                ByHandleFileInformation directoryInfo = GetInformation(directory, "inspect the evidence directory");
+                if ((directoryInfo.FileAttributes & FileAttributeDirectory) == 0 ||
+                    (directoryInfo.FileAttributes & FileAttributeReparsePoint) != 0)
+                {
+                    throw new InvalidOperationException("Evidence root must be a physical non-reparse directory.");
+                }
+                ValidateDirectoryMembership(parent, directory, rootLeaf);
+
+                file = CreateFileW(
+                    pending,
+                    GenericRead | DeleteAccess,
+                    FileShareRead,
+                    IntPtr.Zero,
+                    OpenExisting,
+                    FileFlagOpenReparsePoint | FileFlagSequentialScan,
+                    IntPtr.Zero);
+                if (file.IsInvalid)
+                {
+                    int error = Marshal.GetLastWin32Error();
+                    file.Dispose();
+                    file = null;
+                    if (allowMissing && (error == ErrorFileNotFound || error == ErrorPathNotFound))
+                        return null;
+                    throw NativeError("open the pending evidence without write/delete sharing", error);
+                }
+
+                ByHandleFileInformation fileInfo = GetInformation(file, "inspect the pending evidence identity");
+                if ((fileInfo.FileAttributes & (FileAttributeDirectory | FileAttributeReparsePoint)) != 0)
+                    throw new InvalidOperationException("Pending evidence must be a regular non-reparse file.");
+                if (fileInfo.NumberOfLinks != 1)
+                    throw new InvalidOperationException("Pending evidence must have exactly one hard link.");
+
+                ulong fileLength = ((ulong)fileInfo.FileSizeHigh << 32) | fileInfo.FileSizeLow;
+                if (fileLength > (ulong)maximumBytes || (!allowEmpty && fileLength == 0))
+                    throw new InvalidOperationException("Pending evidence is outside the bounded file-size contract.");
+                ValidateDirectoryMembership(directory, file, expectedLeaf);
+                ValidateOnlyUnnamedDataStream(file, fileLength);
+
+                string identity = string.Format(
+                    System.Globalization.CultureInfo.InvariantCulture,
+                    "{0:x8}:{1:x8}{2:x8}",
+                    fileInfo.VolumeSerialNumber,
+                    fileInfo.FileIndexHigh,
+                    fileInfo.FileIndexLow);
+                BoundPendingFile result = new BoundPendingFile(
+                    parent,
+                    directory,
+                    file,
+                    root,
+                    checked((int)fileLength),
+                    identity);
+                parent = null;
+                directory = null;
+                file = null;
+                return result;
+            }
+            finally
+            {
+                if (file != null) file.Dispose();
+                if (directory != null) directory.Dispose();
+                if (parent != null) parent.Dispose();
+            }
+        }
+
+        public BoundEvidenceRead ReadAllAndHash()
+        {
+            ThrowIfDisposedOrMutated();
+            if (readComplete) throw new InvalidOperationException("Pending evidence was already read.");
+
+            byte[] bytes = new byte[length];
+            byte[] buffer = new byte[Math.Min(ReadBufferBytes, Math.Max(length, 1))];
+            int total = 0;
+            while (total < length)
+            {
+                uint requested = checked((uint)Math.Min(buffer.Length, length - total));
+                uint read;
+                if (!ReadFile(fileHandle, buffer, requested, out read, IntPtr.Zero))
+                    throw NativeError("read the bound pending evidence", Marshal.GetLastWin32Error());
+                if (read == 0)
+                    throw new InvalidOperationException("Pending evidence ended before its bound size.");
+                Buffer.BlockCopy(buffer, 0, bytes, total, checked((int)read));
+                total = checked(total + (int)read);
+            }
+
+            uint trailing;
+            if (!ReadFile(fileHandle, buffer, 1, out trailing, IntPtr.Zero))
+                throw NativeError("confirm the bound pending evidence length", Marshal.GetLastWin32Error());
+            if (trailing != 0)
+                throw new InvalidOperationException("Pending evidence grew after its identity was bound.");
+
+            string digest;
+            using (SHA256 sha256 = SHA256.Create())
+            {
+                digest = BitConverter.ToString(sha256.ComputeHash(bytes)).Replace("-", string.Empty).ToLowerInvariant();
+            }
+            readComplete = true;
+            return new BoundEvidenceRead(bytes, digest);
+        }
+
+        public string GetFinalPath(string finalLeaf)
+        {
+            ThrowIfDisposedOrMutated();
+            ValidateLeaf(finalLeaf, nameof(finalLeaf));
+            return Path.Combine(directoryPath, finalLeaf);
+        }
+
+        public void RenameNoReplace(string finalLeaf)
+        {
+            ThrowIfDisposedOrMutated();
+            if (!readComplete)
+                throw new InvalidOperationException("Pending evidence must be read and hashed before publication.");
+            ValidateLeaf(finalLeaf, nameof(finalLeaf));
+
+            string finalPath = Path.Combine(directoryPath, finalLeaf);
+            if (finalPath.Length > MaximumNativePathCharacters)
+                throw new PathTooLongException("Final evidence path exceeds its native bound.");
+            byte[] name = Encoding.Unicode.GetBytes(finalPath + "\0");
+            int rootOffset = IntPtr.Size == 8 ? 8 : 4;
+            int nameLengthOffset = checked(rootOffset + IntPtr.Size);
+            int nameOffset = checked(nameLengthOffset + sizeof(uint));
+            int minimumStructureBytes = IntPtr.Size == 8 ? 24 : 16;
+            int bufferBytes = checked(minimumStructureBytes + name.Length);
+            IntPtr information = Marshal.AllocHGlobal(bufferBytes);
+            try
+            {
+                for (int index = 0; index < bufferBytes; index++) Marshal.WriteByte(information, index, 0);
+                Marshal.WriteIntPtr(information, rootOffset, IntPtr.Zero);
+                Marshal.WriteInt32(information, nameLengthOffset, name.Length - sizeof(char));
+                Marshal.Copy(name, 0, IntPtr.Add(information, nameOffset), name.Length);
+                if (!SetFileInformationByHandle(
+                    fileHandle,
+                    FileRenameInfo,
+                    information,
+                    checked((uint)bufferBytes)))
+                {
+                    throw NativeError("atomically publish the pending evidence without replacement", Marshal.GetLastWin32Error());
+                }
+                mutationComplete = true;
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(information);
+            }
+        }
+
+        public void Delete()
+        {
+            ThrowIfDisposedOrMutated();
+            IntPtr information = Marshal.AllocHGlobal(1);
+            try
+            {
+                Marshal.WriteByte(information, 1);
+                if (!SetFileInformationByHandle(
+                    fileHandle,
+                    FileDispositionInfo,
+                    information,
+                    1))
+                {
+                    throw NativeError("delete the validated pending evidence identity", Marshal.GetLastWin32Error());
+                }
+                mutationComplete = true;
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(information);
+            }
+        }
+
+        public void Dispose()
+        {
+            if (disposed) return;
+            disposed = true;
+            fileHandle.Dispose();
+            directoryHandle.Dispose();
+            parentHandle.Dispose();
+        }
+
+        private static string NormalizeDirectory(string path)
+        {
+            string full = Path.GetFullPath(path);
+            string root = Path.GetPathRoot(full);
+            string trimmed = full.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            string trimmedRoot = root.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            return string.Equals(trimmed, trimmedRoot, StringComparison.OrdinalIgnoreCase) ? root : trimmed;
+        }
+
+        private static void ValidateLeaf(string leaf, string parameter)
+        {
+            if (string.IsNullOrEmpty(leaf) || leaf.Length > 128 || !leaf.EndsWith(".json", StringComparison.Ordinal) ||
+                !IsAsciiAlphaNumeric(leaf[0]))
+                throw new ArgumentException("Evidence leaf is not a bounded canonical JSON name.", parameter);
+            foreach (char character in leaf)
+            {
+                if (!IsAsciiAlphaNumeric(character) && character != '.' && character != '_' && character != '-')
+                    throw new ArgumentException("Evidence leaf is not a bounded canonical JSON name.", parameter);
+            }
+        }
+
+        private static void ValidateDirectoryLeaf(string leaf)
+        {
+            if (string.IsNullOrEmpty(leaf) || leaf.Length > 96 || !IsAsciiAlphaNumericIgnoreCase(leaf[0]))
+                throw new InvalidOperationException("Evidence root leaf is not bounded and canonical.");
+            foreach (char character in leaf)
+            {
+                if (!IsAsciiAlphaNumericIgnoreCase(character) && character != '.' && character != '_' && character != '-')
+                    throw new InvalidOperationException("Evidence root leaf is not bounded and canonical.");
+            }
+        }
+
+        private static bool IsAsciiAlphaNumeric(char character)
+        {
+            return (character >= 'a' && character <= 'z') || (character >= '0' && character <= '9');
+        }
+
+        private static bool IsAsciiAlphaNumericIgnoreCase(char character)
+        {
+            return IsAsciiAlphaNumeric(character) || (character >= 'A' && character <= 'Z');
+        }
+
+        private static ByHandleFileInformation GetInformation(SafeFileHandle handle, string operation)
+        {
+            ByHandleFileInformation information;
+            if (!GetFileInformationByHandle(handle, out information))
+                throw NativeError(operation, Marshal.GetLastWin32Error());
+            return information;
+        }
+
+        private static void ValidateOnlyUnnamedDataStream(SafeFileHandle handle, ulong expectedLength)
+        {
+            IntPtr buffer = Marshal.AllocHGlobal(StreamInfoBufferBytes);
+            try
+            {
+                if (!GetFileInformationByHandleEx(
+                    handle,
+                    FileStreamInfo,
+                    buffer,
+                    StreamInfoBufferBytes))
+                {
+                    throw NativeError("enumerate bounded pending evidence streams", Marshal.GetLastWin32Error());
+                }
+
+                int offset = 0;
+                int count = 0;
+                while (true)
+                {
+                    if (offset < 0 || offset > StreamInfoBufferBytes - StreamInfoHeaderBytes)
+                        throw new InvalidOperationException("Pending evidence stream metadata is malformed.");
+                    uint nextOffset = unchecked((uint)Marshal.ReadInt32(buffer, offset));
+                    uint nameBytes = unchecked((uint)Marshal.ReadInt32(buffer, offset + 4));
+                    long streamSize = Marshal.ReadInt64(buffer, offset + 8);
+                    if ((nameBytes & 1) != 0 || nameBytes > StreamInfoBufferBytes - offset - StreamInfoHeaderBytes)
+                        throw new InvalidOperationException("Pending evidence stream metadata exceeds its bounded buffer.");
+                    string streamName = Marshal.PtrToStringUni(
+                        IntPtr.Add(buffer, offset + StreamInfoHeaderBytes),
+                        checked((int)(nameBytes / 2)));
+                    count = checked(count + 1);
+                    if (count != 1 || !string.Equals(streamName, "::$DATA", StringComparison.Ordinal) ||
+                        streamSize < 0 || (ulong)streamSize != expectedLength)
+                    {
+                        throw new InvalidOperationException("Pending evidence must contain only its unnamed data stream.");
+                    }
+                    if (nextOffset == 0) break;
+                    if (nextOffset < StreamInfoHeaderBytes + nameBytes || nextOffset > StreamInfoBufferBytes - offset)
+                        throw new InvalidOperationException("Pending evidence stream metadata has an invalid next offset.");
+                    offset = checked(offset + (int)nextOffset);
+                }
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(buffer);
+            }
+        }
+
+        private static void ValidateDirectoryMembership(
+            SafeFileHandle directory,
+            SafeFileHandle file,
+            string expectedLeaf)
+        {
+            byte[] expectedIdentity = GetFileId(file);
+            IntPtr buffer = Marshal.AllocHGlobal(DirectoryInfoBufferBytes);
+            try
+            {
+                int entryCount = 0;
+                while (true)
+                {
+                    if (!GetFileInformationByHandleEx(
+                        directory,
+                        FileIdExtdDirectoryInfo,
+                        buffer,
+                        DirectoryInfoBufferBytes))
+                    {
+                        int error = Marshal.GetLastWin32Error();
+                        if (error == ErrorNoMoreFiles) break;
+                        throw NativeError("enumerate the bound evidence directory", error);
+                    }
+
+                    int offset = 0;
+                    while (true)
+                    {
+                        if (offset < 0 || offset > DirectoryInfoBufferBytes - DirectoryInfoHeaderBytes)
+                            throw new InvalidOperationException("Evidence directory metadata is malformed.");
+                        uint nextOffset = unchecked((uint)Marshal.ReadInt32(buffer, offset));
+                        uint nameBytes = unchecked((uint)Marshal.ReadInt32(buffer, offset + 60));
+                        if ((nameBytes & 1) != 0 ||
+                            nameBytes > DirectoryInfoBufferBytes - offset - DirectoryInfoHeaderBytes)
+                        {
+                            throw new InvalidOperationException("Evidence directory metadata exceeds its bounded buffer.");
+                        }
+
+                        entryCount = checked(entryCount + 1);
+                        if (entryCount > MaximumDirectoryEntries)
+                            throw new InvalidOperationException("Evidence directory exceeds its bounded entry contract.");
+                        string name = Marshal.PtrToStringUni(
+                            IntPtr.Add(buffer, offset + DirectoryInfoHeaderBytes),
+                            checked((int)(nameBytes / 2)));
+                        if (string.Equals(name, expectedLeaf, StringComparison.Ordinal))
+                        {
+                            for (int index = 0; index < expectedIdentity.Length; index++)
+                            {
+                                if (Marshal.ReadByte(buffer, offset + 72 + index) != expectedIdentity[index])
+                                    throw new InvalidOperationException("Pending evidence path does not name the bound file identity.");
+                            }
+                            return;
+                        }
+
+                        if (nextOffset == 0) break;
+                        if (nextOffset < DirectoryInfoHeaderBytes + nameBytes ||
+                            nextOffset > DirectoryInfoBufferBytes - offset)
+                        {
+                            throw new InvalidOperationException("Evidence directory metadata has an invalid next offset.");
+                        }
+                        offset = checked(offset + (int)nextOffset);
+                    }
+                }
+                throw new InvalidOperationException("Pending evidence is not the exact direct child of the bound evidence directory.");
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(buffer);
+            }
+        }
+
+        private static byte[] GetFileId(SafeFileHandle file)
+        {
+            const int FileIdInfoBytes = 24;
+            IntPtr information = Marshal.AllocHGlobal(FileIdInfoBytes);
+            try
+            {
+                if (!GetFileInformationByHandleEx(file, FileIdInfo, information, FileIdInfoBytes))
+                    throw NativeError("read the pending evidence file identity", Marshal.GetLastWin32Error());
+                byte[] identity = new byte[16];
+                Marshal.Copy(IntPtr.Add(information, 8), identity, 0, identity.Length);
+                return identity;
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(information);
+            }
+        }
+
+        private void ThrowIfDisposedOrMutated()
+        {
+            if (disposed) throw new ObjectDisposedException(nameof(BoundPendingFile));
+            if (mutationComplete) throw new InvalidOperationException("Pending evidence identity was already mutated.");
+        }
+
+        private static Win32Exception NativeError(string operation, int error)
+        {
+            return new Win32Exception(error, "Could not " + operation + ".");
+        }
+    }
+}
+'@
+}
+
 function Assert-ScribeEvidenceNoReparse([string]$Path) {
     $current = [IO.Path]::GetFullPath($Path).TrimEnd([char[]]@('\', '/'))
     while (-not (Test-Path -LiteralPath $current)) {
@@ -76,13 +663,6 @@ function Assert-ScribeEvidenceDirectChildPath(
     return $full
 }
 
-function Assert-ScribeEvidenceNoAlternateDataStreams([string]$Path, [string]$Label) {
-    $streams = @(Get-Item -LiteralPath $Path -Stream * -ErrorAction Stop)
-    if ($streams.Count -ne 1 -or [string]$streams[0].Stream -cne ':$DATA') {
-        throw "$Label must not contain alternate data streams."
-    }
-}
-
 function Assert-ScribeEvidenceUnsignedInteger([object]$Value, [string]$Label) {
     $text = [Convert]::ToString($Value, [Globalization.CultureInfo]::InvariantCulture)
     [UInt64]$parsed = 0
@@ -136,17 +716,12 @@ function Assert-ScribeEvidenceRunSet([psobject]$Value, [int]$ExpectedCount, [boo
     }
 }
 
-function Assert-ScribeEvidencePendingReport(
-    [string]$PendingPath,
-    [string]$EvidenceRoot,
-    [string]$PendingLeaf,
-    [string]$FsutilPath
-) {
-    $pending = Assert-ScribeEvidenceDirectChildPath $PendingPath $EvidenceRoot $PendingLeaf 'Pending evidence report'
-    $pending = Assert-ScribeEvidenceSingleLinkFile $pending 'Pending evidence report' (1MB) $FsutilPath
-    Assert-ScribeEvidenceNoAlternateDataStreams $pending 'Pending evidence report'
+function Assert-ScribeEvidenceReportBytes([byte[]]$Bytes) {
+    if ($null -eq $Bytes -or $Bytes.Length -eq 0 -or $Bytes.Length -gt 1MB) {
+        throw 'Pending evidence report bytes violate the bounded file-size contract.'
+    }
     try {
-        $report = [IO.File]::ReadAllText($pending, [Text.UTF8Encoding]::new($false, $true)) | ConvertFrom-Json
+        $report = [Text.UTF8Encoding]::new($false, $true).GetString($Bytes) | ConvertFrom-Json
     }
     catch {
         throw 'Pending evidence report is not strict UTF-8 JSON.'
@@ -209,7 +784,6 @@ function Assert-ScribeEvidencePendingReport(
         Assert-ScribeEvidenceRunSet $report.$backendName.cold 5 $true "Pending evidence $backendName cold"
         Assert-ScribeEvidenceRunSet $report.$backendName.warm 20 $false "Pending evidence $backendName warm"
     }
-    return $pending
 }
 
 function Remove-ScribeEvidencePendingReport(
@@ -217,14 +791,21 @@ function Remove-ScribeEvidencePendingReport(
     [string]$EvidenceRoot,
     [string]$PendingLeaf
 ) {
-    $pending = Assert-ScribeEvidenceDirectChildPath $PendingPath $EvidenceRoot $PendingLeaf 'Pending evidence cleanup'
-    $item = Get-Item -LiteralPath $pending -Force -ErrorAction SilentlyContinue
-    if ($null -eq $item) { return }
-    if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-        throw 'Pending evidence cleanup refused a non-file or reparse artifact.'
+    $binding = [ScribeEvidenceNative.BoundPendingFile]::Open(
+        $EvidenceRoot,
+        $PendingPath,
+        $PendingLeaf,
+        1MB,
+        $true,
+        $true
+    )
+    if ($null -eq $binding) { return }
+    try {
+        $binding.Delete()
     }
-    Remove-Item -LiteralPath $pending -Force
-    if (Test-Path -LiteralPath $pending) { throw 'Pending evidence cleanup did not remove the artifact.' }
+    finally {
+        $binding.Dispose()
+    }
 }
 
 function Add-ScribeEvidenceSecondaryFailures([System.Exception]$Primary, [System.Exception[]]$Secondary) {
@@ -239,7 +820,6 @@ function Complete-ScribeEvidencePendingReport(
     [string]$EvidenceRoot,
     [string]$PendingLeaf,
     [string]$FinalLeaf,
-    [string]$FsutilPath,
     [System.Exception]$PrimaryFailure,
     [System.Exception[]]$SecondaryFailures
 ) {
@@ -264,24 +844,35 @@ function Complete-ScribeEvidencePendingReport(
     }
 
     try {
-        $pending = Assert-ScribeEvidencePendingReport $PendingPath $EvidenceRoot $PendingLeaf $FsutilPath
-        $final = Assert-ScribeEvidenceDirectChildPath $FinalPath $EvidenceRoot $FinalLeaf 'Final evidence report'
-        if ($null -ne (Get-Item -LiteralPath $final -Force -ErrorAction SilentlyContinue) -or
-            (Test-Path -LiteralPath $final)) {
-            throw 'Final evidence report destination must be fresh.'
+        $binding = [ScribeEvidenceNative.BoundPendingFile]::Open(
+            $EvidenceRoot,
+            $PendingPath,
+            $PendingLeaf,
+            1MB,
+            $false,
+            $false
+        )
+        try {
+            $read = $binding.ReadAllAndHash()
+            Assert-ScribeEvidenceReportBytes $read.Bytes
+            $final = $binding.GetFinalPath($FinalLeaf)
+            if (-not [string]::Equals(
+                [IO.Path]::GetFullPath($FinalPath),
+                $final,
+                [StringComparison]::OrdinalIgnoreCase
+            )) {
+                throw 'Final evidence path does not match the bound evidence directory and leaf.'
+            }
+            $result = [pscustomobject]@{ Path = $final; Digest = $read.Sha256; Identity = $binding.Identity }
+            # This non-replacing handle operation is deliberately the final
+            # fallible publication step. The exact bytes hashed above remain
+            # locked against write/delete sharing until the handle is closed.
+            $binding.RenameNoReplace($FinalLeaf)
+            return $result
         }
-        $digest = (Get-FileHash -LiteralPath $pending -Algorithm SHA256).Hash.ToLowerInvariant()
-        # Revalidate mutable source/destination topology immediately before the
-        # only publication operation. File.Move is an atomic same-directory rename.
-        $pending = Assert-ScribeEvidencePendingReport $PendingPath $EvidenceRoot $PendingLeaf $FsutilPath
-        $final = Assert-ScribeEvidenceDirectChildPath $FinalPath $EvidenceRoot $FinalLeaf 'Final evidence report'
-        if ($null -ne (Get-Item -LiteralPath $final -Force -ErrorAction SilentlyContinue) -or
-            (Test-Path -LiteralPath $final)) {
-            throw 'Final evidence report destination changed before publication.'
+        finally {
+            if ($null -ne $binding) { $binding.Dispose() }
         }
-        $result = [pscustomobject]@{ Path = $final; Digest = $digest }
-        [IO.File]::Move($pending, $final, $false)
-        return $result
     }
     catch {
         $publishFailure = $_.Exception

@@ -120,13 +120,34 @@ function Get-ScribeEvidencePinnedMsvcEnvironment([string]$Builder, [string]$Nati
 
 function Invoke-ScribeEvidenceWithPinnedMsvcEnvironment([System.Collections.IDictionary]$Environment, [scriptblock]$Operation) {
     $previous = $null
+    $operationFailure = $null
+    $restoreFailure = $null
     try {
-        $previous = Set-ScribeEvidenceProcessEnvironment $Environment
-        & $Operation
+        try {
+            $previous = Set-ScribeEvidenceProcessEnvironment $Environment
+            & $Operation
+        }
+        catch {
+            $operationFailure = $_.Exception
+        }
     }
     finally {
-        if ($null -ne $previous) { Restore-ScribeEvidenceProcessEnvironment $previous }
+        if ($null -ne $previous) {
+            try {
+                Restore-ScribeEvidenceProcessEnvironment $previous
+            }
+            catch {
+                $restoreFailure = $_.Exception
+            }
+        }
     }
+    if ($null -ne $operationFailure) {
+        if ($null -ne $restoreFailure) {
+            Add-ScribeEvidenceSecondaryFailures $operationFailure @($restoreFailure)
+        }
+        throw $operationFailure
+    }
+    if ($null -ne $restoreFailure) { throw $restoreFailure }
 }
 
 function Enable-ScribeEvidenceCmakeBootstrap([string]$CargoTarget, [string]$BuildEnvironment) {
@@ -390,7 +411,6 @@ $published = Complete-ScribeEvidencePendingReport `
     $evidenceRoot `
     $pendingEvidenceLeaf `
     $finalEvidenceLeaf `
-    $trustedFsutil `
     $primaryFailure `
     $secondaryFailures.ToArray()
 Write-Output "Fixture-only untrusted Vulkan evidence: $($published.Path) ($($published.Digest))"

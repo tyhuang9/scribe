@@ -14272,6 +14272,7 @@ mod tests {
             .verified_pack_bindings()
             .expect("fixture pack must complete challenge-bound SCIF Hello");
         probe.shutdown().expect("fixture pack probe shutdown");
+        drop(probe);
         let matching_bindings = bindings
             .into_iter()
             .filter(|candidate| {
