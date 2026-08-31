@@ -32,13 +32,20 @@ function ConvertTo-ScribeVulkanEvidenceUInt64([string]$Value, [string]$Label) {
     }
 }
 
-function Get-ScribeVulkanEvidenceNvidiaBaseline([string]$ExpectedStableDevice) {
-    $nvidiaSmi = Get-Command 'nvidia-smi.exe' -ErrorAction SilentlyContinue
-    if ($null -eq $nvidiaSmi) {
-        return $null
+function Assert-ScribeVulkanEvidenceTrustedNvidiaSmi([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw 'Required trusted nvidia-smi.exe is missing from System32.'
     }
+    $item = Get-Item -LiteralPath $Path -Force
+    if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw 'Required trusted nvidia-smi.exe must be a regular non-reparse file.'
+    }
+    return $item.FullName
+}
+
+function Get-ScribeVulkanEvidenceNvidiaBaseline([string]$ExpectedStableDevice, [string]$NvidiaSmiPath) {
     $query = 'pci.bus_id,name,driver_version,memory.total,memory.used,utilization.gpu'
-    $rows = @(& $nvidiaSmi.Source "--query-gpu=$query" '--format=csv,noheader,nounits')
+    $rows = @(& $NvidiaSmiPath "--query-gpu=$query" '--format=csv,noheader,nounits')
     if ($LASTEXITCODE -ne 0) {
         throw 'nvidia-smi failed during Vulkan evidence preflight.'
     }
