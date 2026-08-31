@@ -90,9 +90,11 @@ struct LinuxGpuFact {
     // This alias is intentionally private and this type intentionally does not
     // implement Debug. It may exist only while reconciling one CUDA Hello.
     nvidia_physical_uuid_alias: Option<String>,
+    cuda_runtime_uuid_witness: Option<String>,
+    vulkan_pci_witness: Option<VulkanPciDriverFact>,
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
+#[derive(Clone, Eq, PartialEq)]
 struct VulkanPciDriverFact {
     vendor: LinuxGpuVendor,
     identity: String,
@@ -162,6 +164,14 @@ fn resolve_snapshot(
                 return Err("Linux NVIDIA physical GPU alias is ambiguous".to_owned());
             }
         }
+        if let Some(uuid) = &fact.cuda_runtime_uuid_witness {
+            if !is_canonical_nvidia_physical_uuid(uuid) {
+                return Err("Linux CUDA runtime UUID witness is malformed".to_owned());
+            }
+        }
+        if let Some(vulkan) = &fact.vulkan_pci_witness {
+            validate_driver_identity(&vulkan.identity)?;
+        }
     }
 
     let mut process_indexes = BTreeSet::new();
@@ -220,6 +230,36 @@ fn resolve_snapshot(
         if provider.vendor != LinuxGpuVendor::Other && provider.vendor != fact.vendor {
             return Err("Linux GPU provider vendor conflicts with kernel PCI metadata".to_owned());
         }
+        let driver_identity = match backend {
+            LinuxGpuBackend::Cuda => {
+                let physical = fact.nvidia_physical_uuid_alias.as_deref().ok_or_else(|| {
+                    "Linux CUDA PCI function has no physical NVIDIA UUID fact".to_owned()
+                })?;
+                let runtime = fact.cuda_runtime_uuid_witness.as_deref().ok_or_else(|| {
+                    "Linux CUDA PCI function has no current CUDA UUID witness".to_owned()
+                })?;
+                if runtime != physical {
+                    return Err(
+                        "Linux CUDA device is logical, MIG-partitioned, or conflicts with the physical GPU UUID"
+                            .to_owned(),
+                    );
+                }
+                fact.driver_identity.clone()
+            }
+            LinuxGpuBackend::Vulkan => {
+                let vulkan = fact.vulkan_pci_witness.as_ref().ok_or_else(|| {
+                    "Linux Vulkan provider PCI function has no exact Vulkan witness".to_owned()
+                })?;
+                if vulkan.vendor != fact.vendor {
+                    return Err(
+                        "Linux Vulkan PCI vendor conflicts with kernel PCI metadata".to_owned()
+                    );
+                }
+                let identity = format!("{}:{}", fact.driver_identity, vulkan.identity);
+                validate_driver_identity(&identity)?;
+                identity
+            }
+        };
         if !stable_addresses.insert(address) {
             return Err(
                 "Linux GPU provider maps multiple logical devices to one physical PCI function"
@@ -229,7 +269,7 @@ fn resolve_snapshot(
         resolved.push(ResolvedLinuxGpuDevice {
             process_index: provider.process_index,
             stable_device_identity: address.canonical(),
-            driver_identity: fact.driver_identity.clone(),
+            driver_identity,
             vendor: fact.vendor,
         });
     }
@@ -303,6 +343,9 @@ fn kernel_snapshot(backend: LinuxGpuBackend) -> Result<LinuxGpuFactSnapshot, Str
     let vulkan_driver_identities = (backend == LinuxGpuBackend::Vulkan)
         .then(vulkan_pci_driver_identities)
         .transpose()?;
+    let cuda_runtime_identities = (backend == LinuxGpuBackend::Cuda)
+        .then(cuda_pci_uuid_identities)
+        .transpose()?;
     let mut devices = Vec::new();
     for entry in entries {
         let name = entry
@@ -352,32 +395,24 @@ fn kernel_snapshot(backend: LinuxGpuBackend) -> Result<LinuxGpuFactSnapshot, Str
         } else {
             format!("kernel-{kernel_release}")
         };
-        let mut driver_identity = format!("linux:{driver}:{version}");
+        let driver_identity = format!("linux:{driver}:{version}");
         let nvidia_physical_uuid_alias = if vendor == LinuxGpuVendor::Nvidia {
             nvidia_uuid_for(address)?
         } else {
             None
         };
-        if backend == LinuxGpuBackend::Vulkan {
-            let vulkan_identity = vulkan_driver_identities
-                .as_ref()
-                .expect("Vulkan catalog exists for the selected backend")
-                .get(&address)
-                .ok_or_else(|| {
-                    "Linux Vulkan PCI function has no exact Vulkan identity".to_owned()
-                })?;
-            if vulkan_identity.vendor != vendor {
-                return Err("Linux Vulkan PCI vendor conflicts with kernel PCI metadata".to_owned());
-            }
-            driver_identity.push(':');
-            driver_identity.push_str(&vulkan_identity.identity);
-        }
         validate_driver_identity(&driver_identity)?;
         devices.push(LinuxGpuFact {
             address,
             vendor,
             driver_identity,
             nvidia_physical_uuid_alias,
+            cuda_runtime_uuid_witness: cuda_runtime_identities
+                .as_ref()
+                .and_then(|identities| identities.get(&address).cloned()),
+            vulkan_pci_witness: vulkan_driver_identities
+                .as_ref()
+                .and_then(|identities| identities.get(&address).cloned()),
         });
     }
     if devices.is_empty() {
@@ -459,6 +494,169 @@ fn nvidia_uuid_for(address: PciAddress) -> Result<Option<String>, String> {
     target_os = "linux",
     target_arch = "x86_64",
     target_env = "gnu",
+    feature = "cuda-acceleration"
+))]
+fn cuda_pci_uuid_identities() -> Result<BTreeMap<PciAddress, String>, String> {
+    use std::ffi::{CStr, c_char, c_int, c_uint, c_void};
+
+    const RTLD_NOW: c_int = 2;
+    const MAX_CUDA_DRIVER_DEVICES: c_int = 64;
+
+    unsafe extern "C" {
+        fn dlopen(filename: *const c_char, flags: c_int) -> *mut c_void;
+        fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+        fn dlclose(handle: *mut c_void) -> c_int;
+    }
+
+    struct DriverLibrary(*mut c_void);
+    impl Drop for DriverLibrary {
+        fn drop(&mut self) {
+            // SAFETY: the handle is non-null and owned only by this guard.
+            unsafe {
+                dlclose(self.0);
+            }
+        }
+    }
+
+    unsafe fn symbol(handle: *mut c_void, name: &CStr) -> Result<*mut c_void, String> {
+        // SAFETY: handle is a live dlopen handle and name is NUL terminated.
+        let function = unsafe { dlsym(handle, name.as_ptr()) };
+        if function.is_null() {
+            return Err("Linux CUDA driver omitted a required identity symbol".to_owned());
+        }
+        Ok(function)
+    }
+
+    type CuDevice = c_int;
+    #[repr(C)]
+    struct CuUuid {
+        bytes: [u8; 16],
+    }
+    type CuInit = unsafe extern "C" fn(c_uint) -> c_int;
+    type CuDeviceGetCount = unsafe extern "C" fn(*mut c_int) -> c_int;
+    type CuDeviceGet = unsafe extern "C" fn(*mut CuDevice, c_int) -> c_int;
+    type CuDeviceGetPciBusId = unsafe extern "C" fn(*mut c_char, c_int, CuDevice) -> c_int;
+    type CuDeviceGetUuid = unsafe extern "C" fn(*mut CuUuid, CuDevice) -> c_int;
+
+    // The CUDA worker already depends on the system NVIDIA driver. Loading its
+    // fixed SONAME avoids an additional runtime dependency and the launcher's
+    // private environment prevents host library-path overrides.
+    // SAFETY: the literal is NUL terminated and flags request immediate local binding.
+    let handle = unsafe { dlopen(c"libcuda.so.1".as_ptr(), RTLD_NOW) };
+    if handle.is_null() {
+        return Err("Linux CUDA driver library is unavailable for physical identity".to_owned());
+    }
+    let library = DriverLibrary(handle);
+    // SAFETY: each exact CUDA Driver API symbol is converted to its published ABI.
+    let cu_init: CuInit = unsafe { std::mem::transmute(symbol(library.0, c"cuInit")?) };
+    // SAFETY: same as above.
+    let cu_device_get_count: CuDeviceGetCount =
+        unsafe { std::mem::transmute(symbol(library.0, c"cuDeviceGetCount")?) };
+    // SAFETY: same as above.
+    let cu_device_get: CuDeviceGet =
+        unsafe { std::mem::transmute(symbol(library.0, c"cuDeviceGet")?) };
+    // SAFETY: same as above.
+    let cu_device_get_pci_bus_id: CuDeviceGetPciBusId =
+        unsafe { std::mem::transmute(symbol(library.0, c"cuDeviceGetPCIBusId")?) };
+    // CUDA 12.8 and the qualified R570 driver expose the v2 UUID API whose
+    // value distinguishes a MIG compute instance from its physical GPU.
+    // SAFETY: same as above.
+    let cu_device_get_uuid: CuDeviceGetUuid =
+        unsafe { std::mem::transmute(symbol(library.0, c"cuDeviceGetUuid_v2")?) };
+
+    // SAFETY: all calls use initialized outputs and the published driver ABI.
+    if unsafe { cu_init(0) } != 0 {
+        return Err("Linux CUDA driver initialization failed during identity routing".to_owned());
+    }
+    let mut count = 0;
+    // SAFETY: count is a valid writable pointer.
+    if unsafe { cu_device_get_count(&mut count) } != 0
+        || count <= 0
+        || count > MAX_CUDA_DRIVER_DEVICES
+    {
+        return Err("Linux CUDA driver device list is empty or oversized".to_owned());
+    }
+    let mut identities = BTreeMap::new();
+    for ordinal in 0..count {
+        let mut device = 0;
+        // SAFETY: device is writable and ordinal is within the reported count.
+        if unsafe { cu_device_get(&mut device, ordinal) } != 0 {
+            return Err("Linux CUDA driver device enumeration changed".to_owned());
+        }
+        let mut bus_id = [0_i8; 32];
+        // SAFETY: bus_id is a writable fixed buffer with the supplied byte length.
+        if unsafe { cu_device_get_pci_bus_id(bus_id.as_mut_ptr(), bus_id.len() as c_int, device) }
+            != 0
+        {
+            return Err("Linux CUDA driver omitted PCI identity".to_owned());
+        }
+        // SAFETY: the zero-initialized buffer stays terminated even if the API
+        // writes its maximum documented 13-byte PCI identifier.
+        let bus_id = unsafe { CStr::from_ptr(bus_id.as_ptr()) }
+            .to_str()
+            .ok()
+            .and_then(PciAddress::parse)
+            .ok_or_else(|| "Linux CUDA driver returned malformed PCI identity".to_owned())?;
+        let mut uuid = CuUuid { bytes: [0; 16] };
+        // SAFETY: uuid is a correctly sized writable CUuuid structure.
+        if unsafe { cu_device_get_uuid(&mut uuid, device) } != 0 {
+            return Err("Linux CUDA driver omitted device UUID identity".to_owned());
+        }
+        let uuid = format_cuda_uuid(uuid.bytes);
+        if identities.insert(bus_id, uuid).is_some() {
+            return Err(
+                "Linux CUDA driver maps multiple logical devices to one PCI function".to_owned(),
+            );
+        }
+    }
+    Ok(identities)
+}
+
+#[cfg(any(
+    all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_env = "gnu",
+        feature = "cuda-acceleration"
+    ),
+    test
+))]
+fn format_cuda_uuid(bytes: [u8; 16]) -> String {
+    format!(
+        "gpu-{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        bytes[4],
+        bytes[5],
+        bytes[6],
+        bytes[7],
+        bytes[8],
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15]
+    )
+}
+
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_env = "gnu",
+    not(feature = "cuda-acceleration")
+))]
+fn cuda_pci_uuid_identities() -> Result<BTreeMap<PciAddress, String>, String> {
+    Err("Linux CUDA worker was built without CUDA acceleration".to_owned())
+}
+
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_env = "gnu",
     feature = "vulkan-acceleration"
 ))]
 fn vulkan_pci_driver_identities() -> Result<BTreeMap<PciAddress, VulkanPciDriverFact>, String> {
@@ -495,8 +693,13 @@ fn vulkan_pci_driver_identities() -> Result<BTreeMap<PciAddress, VulkanPciDriver
     let mut result = BTreeMap::new();
     for device in physical {
         // SAFETY: device belongs to the live instance.
-        let extensions = unsafe { instance.0.enumerate_device_extension_properties(device) }
-            .map_err(|_| "could not enumerate Linux Vulkan device extensions".to_owned())?;
+        let Ok(extensions) = (unsafe { instance.0.enumerate_device_extension_properties(device) })
+        else {
+            // A device that cannot furnish extension facts cannot witness a
+            // provider claim. Keep evaluating other physical devices; an
+            // exact claim for this one will fail later as missing.
+            continue;
+        };
         let supports_pci = extensions.iter().any(|extension| {
             // SAFETY: Vulkan provides a terminated extension name array.
             let name = unsafe { std::ffi::CStr::from_ptr(extension.extension_name.as_ptr()) };
@@ -522,10 +725,10 @@ fn vulkan_pci_driver_identities() -> Result<BTreeMap<PciAddress, VulkanPciDriver
             || pci.pci_device > 0x1f
             || pci.pci_function > 7
         {
-            return Err("Linux Vulkan returned an invalid PCI function".to_owned());
+            continue;
         }
         if id.driver_uuid.iter().all(|byte| *byte == 0) {
-            return Err("Linux Vulkan omitted bounded driver UUID identity".to_owned());
+            continue;
         }
         let address = PciAddress {
             domain: pci.pci_domain as u16,
@@ -584,8 +787,17 @@ mod tests {
     }
 
     fn fact(value: &str, vendor: LinuxGpuVendor, uuid: Option<&str>) -> LinuxGpuFact {
+        let address = address(value);
+        let physical_uuid = (vendor == LinuxGpuVendor::Nvidia).then(|| {
+            uuid.map(str::to_owned).unwrap_or_else(|| {
+                format!(
+                    "gpu-00000000-0000-0000-0000-{:04x}{:02x}{:02x}{:x}000",
+                    address.domain, address.bus, address.device, address.function
+                )
+            })
+        });
         LinuxGpuFact {
-            address: address(value),
+            address,
             vendor,
             driver_identity: match vendor {
                 LinuxGpuVendor::Nvidia => "linux:nvidia:570.26".to_owned(),
@@ -593,7 +805,12 @@ mod tests {
                 LinuxGpuVendor::Intel => "linux:i915:kernel-6.8.0-52-generic".to_owned(),
                 LinuxGpuVendor::Other => "linux:other:kernel-6.8.0-52-generic".to_owned(),
             },
-            nvidia_physical_uuid_alias: uuid.map(str::to_owned),
+            nvidia_physical_uuid_alias: physical_uuid.clone(),
+            cuda_runtime_uuid_witness: physical_uuid,
+            vulkan_pci_witness: Some(VulkanPciDriverFact {
+                vendor,
+                identity: "vk-0000-00000000-00000001-00000000000000000000000000000001".to_owned(),
+            }),
         }
     }
 
@@ -729,6 +946,22 @@ mod tests {
     }
 
     #[test]
+    fn bdf_presented_single_mig_slice_fails_physical_uuid_proof() {
+        let mut mig = fact("0000:01:00.0", LinuxGpuVendor::Nvidia, None);
+        let physical = mig.nvidia_physical_uuid_alias.clone().unwrap();
+        mig.cuda_runtime_uuid_witness = Some("gpu-ffffffff-ffff-ffff-ffff-ffffffffffff".to_owned());
+        let source = FakeSource::stable(LinuxGpuFactSnapshot { devices: vec![mig] });
+        let error = route_provider_devices(
+            &source,
+            LinuxGpuBackend::Cuda,
+            &[provider(0, "0000:01:00.0", LinuxGpuVendor::Nvidia)],
+        )
+        .unwrap_err();
+        assert!(error.contains("logical, MIG-partitioned"));
+        assert!(!error.contains(&physical));
+    }
+
+    #[test]
     fn duplicate_and_ambiguous_mappings_fail_closed() {
         let uuid = "gpu-12345678-1234-5678-9abc-1234567890ab";
         for snapshot in [
@@ -848,6 +1081,57 @@ mod tests {
     }
 
     #[test]
+    fn unrelated_non_vulkan_display_controller_does_not_poison_claimed_bdf() {
+        let selected = fact("0000:0a:00.0", LinuxGpuVendor::Amd, None);
+        let mut unrelated = fact("0000:0b:00.0", LinuxGpuVendor::Other, None);
+        unrelated.vulkan_pci_witness = None;
+        let source = FakeSource::stable(LinuxGpuFactSnapshot {
+            devices: vec![unrelated, selected],
+        });
+        let resolved = route_provider_devices(
+            &source,
+            LinuxGpuBackend::Vulkan,
+            &[provider(6, "0000:0a:00.0", LinuxGpuVendor::Amd)],
+        )
+        .unwrap();
+        assert_eq!(
+            resolved[0].stable_device_identity,
+            "native:pci:0000:0a:00.0"
+        );
+    }
+
+    #[test]
+    fn claimed_vulkan_bdf_requires_matching_witness_and_vendor() {
+        let mut missing = fact("0000:0a:00.0", LinuxGpuVendor::Amd, None);
+        missing.vulkan_pci_witness = None;
+        let source = FakeSource::stable(LinuxGpuFactSnapshot {
+            devices: vec![missing],
+        });
+        assert!(
+            route_provider_devices(
+                &source,
+                LinuxGpuBackend::Vulkan,
+                &[provider(6, "0000:0a:00.0", LinuxGpuVendor::Amd)],
+            )
+            .is_err()
+        );
+
+        let mut conflict = fact("0000:0a:00.0", LinuxGpuVendor::Amd, None);
+        conflict.vulkan_pci_witness.as_mut().unwrap().vendor = LinuxGpuVendor::Nvidia;
+        let source = FakeSource::stable(LinuxGpuFactSnapshot {
+            devices: vec![conflict],
+        });
+        assert!(
+            route_provider_devices(
+                &source,
+                LinuxGpuBackend::Vulkan,
+                &[provider(6, "0000:0a:00.0", LinuxGpuVendor::Amd)],
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn malformed_uuid_and_driver_evidence_fail_closed() {
         assert_eq!(LinuxGpuVendor::Intel, LinuxGpuVendor::Intel);
         for invalid in [
@@ -867,6 +1151,13 @@ mod tests {
                 &[provider(0, "0000:01:00.0", LinuxGpuVendor::Nvidia)],
             )
             .is_err()
+        );
+        assert_eq!(
+            format_cuda_uuid([
+                0x12, 0x34, 0x56, 0x78, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0x12, 0x34, 0x56, 0x78,
+                0x90, 0xab,
+            ]),
+            "gpu-12345678-1234-5678-9abc-1234567890ab"
         );
     }
 }
