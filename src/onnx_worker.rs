@@ -4244,6 +4244,7 @@ impl ProcessWorkerSupervisor {
             .map(|current| current.generation))
     }
 
+    #[cfg(test)]
     fn current_generation_is_running(&self) -> Result<bool> {
         let process = self
             .inner
@@ -4288,10 +4289,10 @@ impl ProcessWorkerSupervisor {
             .state
             .lock()
             .map_err(|_| anyhow!("process worker supervisor state lock was poisoned"))?;
-        if !state
+        if state
             .current
             .as_ref()
-            .is_some_and(|current| current.generation == generation)
+            .is_none_or(|current| current.generation != generation)
         {
             bail!("process worker generation changed before model residency was recorded");
         }
@@ -5937,6 +5938,7 @@ impl InferenceWorkerSupervisor {
             .max(1)
     }
 
+    #[cfg(test)]
     fn has_live_generation(&self) -> bool {
         self.transport
             .current_generation_is_running()
@@ -8566,10 +8568,10 @@ impl InferenceWorkerRegistry {
                 Self::worker_preference_for_route(route, preference),
             ) {
                 Ok(()) => {
-                    if preference == AccelerationPreference::Auto {
-                        if let Some(catalog) = plan.auto_live_admission.as_ref() {
-                            self.retain_auto_live_admission(catalog, route, &artifact)?;
-                        }
+                    if preference == AccelerationPreference::Auto
+                        && let Some(catalog) = plan.auto_live_admission.as_ref()
+                    {
+                        self.retain_auto_live_admission(catalog, route, &artifact)?;
                     }
                     if let Some(health) = &plan.health {
                         health.record_idle_probe_success(route);
