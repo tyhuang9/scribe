@@ -1278,6 +1278,14 @@ def decide(
         if summary["auto_entry_projection"] is not None
     ]
     projection_keys = [json.dumps(value, sort_keys=True, separators=(",", ":")) for value in projections]
+    coverage_keys = [
+        json.dumps(
+            {key: value for key, value in projection.items() if key != "evidence"},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        for projection in projections
+    ]
     manifest_keys = [
         json.dumps(value, sort_keys=True, separators=(",", ":")) for value in auto_manifest_entries
     ]
@@ -1285,6 +1293,7 @@ def decide(
         qualification_passed
         and bool(projection_keys)
         and len(set(projection_keys)) == len(projection_keys)
+        and len(set(coverage_keys)) == len(coverage_keys)
         and sorted(projection_keys) == sorted(manifest_keys)
     )
     auto_eligible = qualification_passed and activation_manifest_complete and not fixture_only
@@ -1309,6 +1318,7 @@ def decide(
         "artifact_count": artifact_budget["count"],
         "artifact_bytes": artifact_budget["bytes"],
         "activation_manifest_complete": activation_manifest_complete,
+        "activation_projection_count": len(projections),
         "lanes": summaries,
         "plan_sha256": plan_digest,
         "production_authority_sha256": production_authority_digest,

@@ -445,6 +445,8 @@ class QualificationFixtureTests(unittest.TestCase):
         self.assertTrue(first_decision["qualification_passed"])
         self.assertFalse(first_decision["auto_eligible"])
         self.assertFalse(first_decision["activation_manifest_complete"])
+        self.assertEqual(first_decision["activation_projection_count"], 1)
+        self.assertIsNotNone(first_decision["lanes"][0]["auto_entry_projection"])
         self.assertEqual(first_decision["decision_reason"], "fixture_only_never_auto_eligible")
         lane = first_decision["lanes"][0]
         self.assertTrue(lane["checks"]["performance_passed"])
