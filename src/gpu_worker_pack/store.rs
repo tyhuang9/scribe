@@ -2711,10 +2711,8 @@ mod tests {
         drop(held);
         fs::remove_dir_all(root).unwrap();
     }
-    use crate::gpu_worker_pack::manifest::test_support::{
-        base_manifest, fixture, temp_root, write_signed,
-    };
-    use crate::gpu_worker_pack::manifest::{Compatibility, PackBackend};
+    use super::super::manifest::test_support::{base_manifest, fixture, temp_root, write_signed};
+    use super::super::manifest::{Compatibility, PackBackend};
 
     fn store_fixture(
         label: &str,
