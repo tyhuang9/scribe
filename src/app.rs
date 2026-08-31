@@ -7289,7 +7289,7 @@ impl LocalTranscriberApp {
                         && self.config.performance.acceleration_preference == preference
                         && same_backend_target_identity(&operation.target, &target);
                     if !current {
-                        self.active_gpu_retry = None;
+                        self.cancel_active_gpu_retry_busy_state();
                         continue;
                     }
                     self.active_gpu_retry = None;
@@ -11073,11 +11073,25 @@ impl eframe::App for LocalTranscriberApp {
 }
 
 impl LocalTranscriberApp {
+    fn cancel_active_gpu_retry_busy_state(&mut self) {
+        let cancelled = self.active_gpu_retry.take().is_some();
+        if cancelled
+            && self.status == TranscriptionStatus::Transcribing
+            && self.status_message == "Retrying GPU"
+        {
+            self.status = TranscriptionStatus::Idle;
+            self.status_message = "GPU retry cancelled".to_owned();
+            self.transcribe_notice = Some(TranscribeNotice::information(
+                "GPU retry was cancelled because the acceleration state changed.",
+            ));
+        }
+    }
+
     fn invalidate_acceleration_state(&mut self) {
         self.acceleration_generation = self.acceleration_generation.wrapping_add(1);
         self.gpu_retry_status = None;
         self.latest_acceleration = None;
-        self.active_gpu_retry = None;
+        self.cancel_active_gpu_retry_busy_state();
     }
 
     fn next_gpu_retry_nonce(&mut self) -> u64 {
@@ -22003,6 +22017,43 @@ mod layout_tests {
             },
             false,
         );
+    }
+
+    #[test]
+    fn acceleration_invalidation_clears_gpu_retry_busy_state() {
+        let mut app = test_app();
+        let operation = test_gpu_retry_operation(&mut app);
+        app.status = TranscriptionStatus::Transcribing;
+        app.status_message = "Retrying GPU".to_owned();
+        app.transcribe_notice = Some(TranscribeNotice::information("Retrying GPU…"));
+
+        app.invalidate_acceleration_state();
+
+        assert!(app.active_gpu_retry.is_none());
+        assert_eq!(app.status, TranscriptionStatus::Idle);
+        assert_eq!(app.status_message, "GPU retry cancelled");
+        assert_eq!(
+            app.transcribe_notice
+                .as_ref()
+                .map(|notice| notice.message.as_str()),
+            Some("GPU retry was cancelled because the acceleration state changed.")
+        );
+        let cancelled_notice = app.transcribe_notice.clone();
+
+        app.tx
+            .send(test_gpu_retry_event(
+                operation.nonce,
+                operation.generation,
+                operation.model_id,
+                operation.preference,
+                operation.target,
+            ))
+            .unwrap();
+        app.poll_events();
+
+        assert_eq!(app.status, TranscriptionStatus::Idle);
+        assert_eq!(app.status_message, "GPU retry cancelled");
+        assert_eq!(app.transcribe_notice, cancelled_notice);
     }
 
     fn install_cancellable_capture(app: &mut LocalTranscriberApp) -> audio::CaptureId {
