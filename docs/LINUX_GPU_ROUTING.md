@@ -22,14 +22,20 @@ changes fail the Hello instead of producing a stale selection.
 CUDA devices may present either canonical PCI identity or one bounded physical
 `GPU-...` UUID. A UUID is reconciled privately against the NVIDIA proc fact for
 one validated sysfs PCI function. It is not returned in Hello, persisted, or
-included in diagnostics. MIG identities and multiple logical devices resolving
-to one PCI function are rejected.
+included in diagnostics. The worker also loads the fixed CUDA driver SONAME and
+requires the current CUDA device UUID for that PCI function to equal the
+physical proc UUID. This rejects a single MIG slice even when the provider
+presents only its shared physical BDF. MIG identities, missing physical proof,
+and multiple logical devices resolving to one PCI function are rejected.
 
 Vulkan devices must present canonical PCI identity. The Vulkan worker also
-requires `VK_EXT_pci_bus_info` for the exact physical device and binds a bounded
-Vulkan driver UUID/version witness to the sysfs driver witness. Missing,
-ambiguous, conflicting, duplicate, or changing mappings fail closed. There is
-no name-only, UUID-only, or ordinal fallback.
+requires `VK_EXT_pci_bus_info` for the exact provider-claimed physical device
+and binds a bounded Vulkan driver UUID/version witness to the sysfs driver
+witness. A driver-bound display controller that is absent from the chosen
+Vulkan ICD remains a kernel fact but does not invalidate an unrelated exact
+provider mapping. Missing, ambiguous, conflicting, duplicate, or changing
+claimed mappings fail closed. There is no name-only, UUID-only, or ordinal
+fallback.
 
 Run the dependency-light Linux suite with:
 
@@ -38,6 +44,8 @@ Run the dependency-light Linux suite with:
 ```
 
 The suite exercises routing with injectable fake fact sources and runs source
-guards on Ubuntu 22.04 and 24.04. Real CUDA/Vulkan worker and package smoke
-evidence remains PR 7D scope because the reviewed Linux Sherpa archive and
-signed pack payloads are not present yet.
+guards on Ubuntu 22.04 and 24.04. A separate locked, source-only type-check crate
+compiles both real Linux feature branches, including the pinned `ash` Vulkan
+API, without linking or downloading Sherpa or other native payloads. Real
+CUDA/Vulkan worker and package smoke evidence remains PR 7D scope because the
+reviewed Linux Sherpa archive and signed pack payloads are not present yet.

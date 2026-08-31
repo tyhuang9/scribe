@@ -13,6 +13,8 @@ fn linux_gpu_identity_is_pci_only_fixed_root_and_bounded() {
         "Path::new(\"/proc/driver/nvidia/gpus\")",
         "Path::new(\"/proc/sys/kernel/osrelease\")",
         "Path::new(\"/sys/module\")",
+        "dlopen(c\"libcuda.so.1\".as_ptr(), RTLD_NOW)",
+        "c\"cuDeviceGetUuid_v2\"",
         "MAX_GPU_FACTS",
         "MAX_PROVIDER_DEVICES",
         "MAX_DRIVER_IDENTITY_BYTES",
@@ -54,6 +56,7 @@ fn provider_indexes_are_volatile_and_uuid_aliases_never_leave_routing() {
         "process_indexes.insert(provider.process_index)",
         "stable_addresses.insert(address)",
         "Linux CUDA MIG identities are not physical GPU identities",
+        "Linux CUDA device is logical, MIG-partitioned, or conflicts with the physical GPU UUID",
         "Linux Vulkan provider omitted canonical PCI identity",
         "Linux GPU provider maps multiple logical devices to one physical PCI function",
         "nvidia_physical_uuid_alias: Option<String>",
@@ -129,4 +132,34 @@ fn linux_gpu_ci_runs_on_both_supported_ubuntu_lanes() {
     assert!(script.contains("linux-gpu-routing-tests"));
     assert!(script.contains("src/linux_gpu_architecture_guard.rs"));
     assert!(script.contains("linux-gpu-architecture-tests"));
+    assert!(workflow.contains("scripts/linux-gpu-typecheck/Cargo.toml"));
+    assert!(workflow.contains("--features vulkan-acceleration"));
+    assert!(workflow.contains("--features cuda-acceleration"));
+    assert!(workflow.contains("RUSTFLAGS: -Dwarnings"));
+    assert!(workflow.contains("CARGO_TARGET_DIR: target/linux-gpu-typecheck"));
+}
+
+#[test]
+fn linux_gpu_typecheck_is_source_only_locked_and_pinned() {
+    let manifest = normalized(include_str!("../scripts/linux-gpu-typecheck/Cargo.toml"));
+    let lock = normalized(include_str!("../scripts/linux-gpu-typecheck/Cargo.lock"));
+    let harness = normalized(include_str!("../scripts/linux-gpu-typecheck/src/lib.rs"));
+    assert!(manifest.contains("ash = { version = \"=0.37.3\", optional = true }"));
+    assert!(manifest.contains("cuda-acceleration = []"));
+    assert!(manifest.contains("vulkan-acceleration = [\"dep:ash\"]"));
+    assert!(manifest.contains("[workspace]"));
+    assert!(lock.contains("version = \"0.37.3+1.3.251\""));
+    assert!(lock.contains(
+        "checksum = \"39e9c3835d686b0a6084ab4234fcd1b07dbf6e4767dce60874b12356a25ecd4a\""
+    ));
+    assert_eq!(
+        harness,
+        "#![allow(dead_code)]\n\n#[path = \"../../../src/linux_gpu.rs\"]\nmod linux_gpu;\n"
+    );
+    for forbidden in ["sherpa", "transcribe", "build.rs", "cc =", "git ="] {
+        assert!(
+            !manifest.contains(forbidden),
+            "type-check manifest contains forbidden dependency: {forbidden}"
+        );
+    }
 }

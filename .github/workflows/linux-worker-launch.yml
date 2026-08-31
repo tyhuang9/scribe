@@ -12,6 +12,7 @@ on:
       - 'runtime-manifests/gpu-auto-qualification-linux-x86_64.json'
       - 'docs/LINUX_GPU_ROUTING.md'
       - 'scripts/linux-worker-launch-fixture.rs'
+      - 'scripts/linux-gpu-typecheck/**'
       - 'scripts/test-linux-worker-launch.sh'
       - 'src/linux_gpu.rs'
       - 'src/linux_gpu_architecture_guard.rs'
@@ -32,6 +33,7 @@ on:
       - 'runtime-manifests/gpu-auto-qualification-linux-x86_64.json'
       - 'docs/LINUX_GPU_ROUTING.md'
       - 'scripts/linux-worker-launch-fixture.rs'
+      - 'scripts/linux-gpu-typecheck/**'
       - 'scripts/test-linux-worker-launch.sh'
       - 'src/linux_gpu.rs'
       - 'src/linux_gpu_architecture_guard.rs'
@@ -58,3 +60,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e # 1.96.0 branch reviewed 2026-08-27
       - name: Test descriptor-bound Linux worker launch
         run: ./scripts/test-linux-worker-launch.sh
+      - name: Type-check the feature-enabled Linux Vulkan identity branch
+        env:
+          CARGO_TARGET_DIR: target/linux-gpu-typecheck
+          RUSTFLAGS: -Dwarnings
+        run: cargo check --locked --manifest-path scripts/linux-gpu-typecheck/Cargo.toml --features vulkan-acceleration
+      - name: Type-check the feature-enabled Linux CUDA identity branch
+        env:
+          CARGO_TARGET_DIR: target/linux-gpu-typecheck
+          RUSTFLAGS: -Dwarnings
+        run: cargo check --locked --manifest-path scripts/linux-gpu-typecheck/Cargo.toml --features cuda-acceleration
