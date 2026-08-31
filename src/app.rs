@@ -6624,14 +6624,14 @@ impl LocalTranscriberApp {
                     if source == RecordingSource::Transcribe {
                         self.update_latest_acceleration(
                             &result.model_id,
-                            result.resolved_acceleration.clone().unwrap_or_else(|| {
+                            result.resolved_acceleration.clone().unwrap_or(
                                 crate::transcription::ResolvedAcceleration {
                                     requested: self.config.performance.acceleration_preference,
                                     resolved: crate::transcription::ComputeDevice::Cpu,
                                     diagnostic: None,
                                     selection: None,
-                                }
-                            }),
+                                },
+                            ),
                         );
                     }
 

@@ -8205,7 +8205,12 @@ impl InferenceWorkerRegistry {
         })?;
         match route.supervisor.load(artifact, AccelerationPreference::Gpu) {
             Ok(mut execution) => {
-                if matches!(execution.diagnostics.resolved_acceleration.selection, None) {
+                if execution
+                    .diagnostics
+                    .resolved_acceleration
+                    .selection
+                    .is_none()
+                {
                     execution.diagnostics.resolved_acceleration.selection =
                         Some(BackendSelection {
                             requested: AccelerationPreference::Gpu,
