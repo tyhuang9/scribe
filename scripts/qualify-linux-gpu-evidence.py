@@ -22,6 +22,9 @@ IDENTIFIER_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._:-]{0,159}$")
 PACK_COMPONENT_PATTERN = re.compile(r"^[a-z0-9](?:[a-z0-9._-]{0,94}[a-z0-9])?$")
 PCI_ID_PATTERN = re.compile(r"^native:pci:[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$")
 ARTIFACT_COMPONENT_PATTERN = re.compile(r"^[a-z0-9](?:[a-z0-9._-]{0,94}[a-z0-9])?$")
+VERSION_PATTERN = re.compile(r"^([0-9]+)\.([0-9]+)(?:\.[0-9]+)*(?:[-+._][a-z0-9.-]+)?$")
+DRIVER_IDENTITY_PATTERN = re.compile(r"^linux:[a-z0-9._-]+:[a-z0-9:._-]+$")
+CUDA_DRIVER_PATTERN = re.compile(r"^linux:nvidia:([0-9]+)\.([0-9]+)(?:\.[0-9]+)*$")
 SUPPORTED_UBUNTU = {"22.04", "24.04"}
 SUPPORTED_FAILURES = {
     "none",
@@ -129,6 +132,8 @@ def load_canonical_json(path: pathlib.Path, label: str) -> tuple[dict[str, Any],
         fail(f"could not inspect {label}: {error}")
     if stat.S_ISLNK(file_stat.st_mode) or not stat.S_ISREG(file_stat.st_mode):
         fail(f"{label} must be a regular non-symlink file")
+    if file_stat.st_nlink != 1:
+        fail(f"{label} must have exactly one link")
     if file_stat.st_size == 0 or file_stat.st_size > MAX_INPUT_BYTES:
         fail(f"{label} is empty or oversized")
     try:
@@ -237,8 +242,14 @@ def validate_identity(value: Any, label: str) -> dict[str, Any]:
         fail(f"{label}.ubuntu_version is outside the reviewed Ubuntu lanes")
     if json_string(identity["target_arch"], f"{label}.target_arch", 16) != "x86_64":
         fail(f"{label}.target_arch must be x86_64")
-    json_string(identity["kernel_version"], f"{label}.kernel_version", 128)
-    json_string(identity["glibc_version"], f"{label}.glibc_version", 64)
+    kernel_version = json_string(identity["kernel_version"], f"{label}.kernel_version", 128)
+    kernel_match = VERSION_PATTERN.fullmatch(kernel_version)
+    if kernel_match is None or (int(kernel_match.group(1)), int(kernel_match.group(2))) < (5, 15):
+        fail(f"{label}.kernel_version is outside the reviewed Linux runtime contract")
+    glibc_version = json_string(identity["glibc_version"], f"{label}.glibc_version", 64)
+    glibc_match = VERSION_PATTERN.fullmatch(glibc_version)
+    if glibc_match is None or (int(glibc_match.group(1)), int(glibc_match.group(2))) < (2, 35):
+        fail(f"{label}.glibc_version is outside the reviewed Linux runtime contract")
     backend = json_string(identity["backend"], f"{label}.backend", 16)
     provider = identifier(identity["provider_id"], f"{label}.provider_id")
     validate_pack(identity["pack"], f"{label}.pack")
@@ -274,7 +285,9 @@ def validate_identity(value: Any, label: str) -> dict[str, Any]:
     driver = exact_keys(identity["driver"], {"kind", "value"}, f"{label}.driver")
     if json_string(driver["kind"], f"{label}.driver.kind", 16) != "exact":
         fail(f"{label}.driver.kind must be exact")
-    json_string(driver["value"], f"{label}.driver.value", 128)
+    driver_value = json_string(driver["value"], f"{label}.driver.value", 128)
+    if DRIVER_IDENTITY_PATTERN.fullmatch(driver_value) is None:
+        fail(f"{label}.driver.value is not a canonical Linux runtime driver identity")
     valid_binding = (
         backend == "cuda" and provider == "transcribe-cpp-ggml-cuda" and vendor == "nvidia"
     ) or (
@@ -284,6 +297,10 @@ def validate_identity(value: Any, label: str) -> dict[str, Any]:
     )
     if not valid_binding:
         fail(f"{label} has an invalid backend, provider, and vendor binding")
+    if backend == "cuda":
+        cuda_driver = CUDA_DRIVER_PATTERN.fullmatch(driver_value)
+        if cuda_driver is None or (int(cuda_driver.group(1)), int(cuda_driver.group(2))) < (570, 26):
+            fail(f"{label}.driver.value is below the reviewed CUDA driver minimum")
     return identity
 
 
@@ -567,9 +584,12 @@ def validate_lane_evidence(
         and event["recovered_next_request"]
         for event in events
     )
-    gpu_p95 = nearest_rank([run["end_to_end_ms"] for run in parsed["warm"]["gpu"] if run["outcome"] == "success"], 95) if all_successful else 0
-    cpu_p95 = nearest_rank([run["end_to_end_ms"] for run in parsed["warm"]["cpu"] if run["outcome"] == "success"], 95) if all_successful else 0
-    performance_passed = all_successful and gpu_p95 * 100 <= cpu_p95 * plan["maximum_gpu_p95_cpu_percent"]
+    performance_passed = all_successful and all(
+        nearest_rank([run["end_to_end_ms"] for run in parsed[mode]["gpu"]], 95) * 100
+        <= nearest_rank([run["end_to_end_ms"] for run in parsed[mode]["cpu"]], 95)
+        * plan["maximum_gpu_p95_cpu_percent"]
+        for mode in ("cold", "warm")
+    )
     reasons: list[str] = []
     if not correctness_equivalent:
         reasons.append("correctness_not_equivalent")

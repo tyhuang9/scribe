@@ -62,9 +62,9 @@ and p95 for:
 - peak VRAM bytes.
 
 No floating-point arithmetic is used for percentile selection or the
-performance boundary. The GPU candidate passes performance only when its warm
-end-to-end p95 multiplied by 100 is at most the CPU p95 multiplied by 110.
-The boundary is inclusive.
+performance boundary. For both cold and warm run sets, the GPU candidate passes
+performance only when its end-to-end p95 multiplied by 100 is at most the CPU
+p95 multiplied by 110. The boundary is inclusive.
 
 Correctness is equivalent only when all fifty run records succeed and every
 transcript digest equals the plan's expected transcript digest. Reliability is

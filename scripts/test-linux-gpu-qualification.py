@@ -51,7 +51,7 @@ def metric_run(mode: str, target: str, sequence: int, gpu_warm_ms: int) -> dict[
 
 
 def fixture_lane(gpu_warm_ms: int = 110) -> dict[str, Any]:
-    driver = "nvidia:570.86.15"
+    driver = "linux:nvidia:570.86.15"
     stable_id = "native:pci:0000:01:00.0"
     identity = {
         "backend": "cuda",
@@ -112,7 +112,7 @@ def fixture_lane(gpu_warm_ms: int = 110) -> dict[str, Any]:
             "artifact_path": "events/driver-change.evidence",
             "artifact_sha256": digest("event-driver-change"),
             "driver_after": driver,
-            "driver_before": "nvidia:570.26.00",
+            "driver_before": "linux:nvidia:570.26.00",
             "event": "driver_change",
             "observed_failure_category": "none",
             "partial_output_replayed": False,
@@ -297,6 +297,14 @@ class QualificationFixtureTests(unittest.TestCase):
         self.assertFalse(decision["qualification_passed"])
         self.assertFalse(decision["auto_eligible"])
         self.assertEqual(lane["reasons"], ["gpu_p95_exceeds_cpu_boundary"])
+        cold_lane = fixture_lane()
+        for run in cold_lane["run_sets"]["cold"]["gpu"]:
+            run["end_to_end_ms"] = 500
+            run["backend_ms"] = 490
+        cold_plan, cold_evidence = fixture_documents(cold_lane)
+        cold_decision = self.parse_success(self.run_tool(cold_plan, cold_evidence))
+        self.assertFalse(cold_decision["qualification_passed"])
+        self.assertEqual(cold_decision["lanes"][0]["reasons"], ["gpu_p95_exceeds_cpu_boundary"])
 
     def test_correctness_reliability_and_lifecycle_failures_are_reported(self) -> None:
         cases: list[tuple[str, Any, set[str]]] = []
@@ -417,7 +425,7 @@ class QualificationFixtureTests(unittest.TestCase):
         self.assertEqual(hash_result.returncode, 1)
         self.assertIn("exact reviewed plan", hash_result.stderr)
         identity_mutation = copy.deepcopy(evidence)
-        identity_mutation["lanes"][0]["identity"]["driver"]["value"] = "nvidia:999.0"
+        identity_mutation["lanes"][0]["identity"]["driver"]["value"] = "linux:nvidia:999.0"
         identity_result = self.run_tool(plan, identity_mutation)
         self.assertEqual(identity_result.returncode, 1)
         self.assertIn("identity does not match", identity_result.stderr)
