@@ -29,6 +29,20 @@ $overlongCmakeFailure = [System.Collections.Generic.List[object]]::new()
 foreach ($unused in 1..64) { $overlongCmakeFailure.Add('noise') }
 foreach ($line in $knownCmakeFailure) { $overlongCmakeFailure.Add($line) }
 if (Test-ScribeEvidenceKnownCmakeBootstrapFailure -Output $overlongCmakeFailure.ToArray()) { throw 'Unbounded CMake output was classified outside the bounded window.' }
+$previousTestWorkerDigest = $env:SCRIBE_BUNDLED_WORKER_SHA256
+$previousTestBuildingWorker = $env:SCRIBE_BUILDING_WORKER
+try {
+    $env:SCRIBE_BUNDLED_WORKER_SHA256 = 'a' * 64 -join ''
+    $env:SCRIBE_BUILDING_WORKER = 'ambient'
+    Set-ScribeEvidenceWorkerBuildMode $true
+    if ($env:SCRIBE_BUILDING_WORKER -cne '1' -or $null -ne $env:SCRIBE_BUNDLED_WORKER_SHA256) { throw 'Worker build mode did not clear the desktop digest.' }
+    Set-ScribeEvidenceWorkerBuildMode $false
+    if ($null -ne $env:SCRIBE_BUILDING_WORKER -or $null -ne $env:SCRIBE_BUNDLED_WORKER_SHA256) { throw 'Harness mode retained worker-build state.' }
+}
+finally {
+    $env:SCRIBE_BUNDLED_WORKER_SHA256 = $previousTestWorkerDigest
+    $env:SCRIBE_BUILDING_WORKER = $previousTestBuildingWorker
+}
 $topologyRoot = Join-Path ([IO.Path]::GetTempPath()) ("scribe-evidence-topology-$([guid]::NewGuid().ToString('N'))")
 try {
     $buildDirectory = Join-Path $topologyRoot 'cargo\\debug\\build\\transcribe-cpp-sys-0123456789abcdef\\out\\build'
@@ -50,7 +64,7 @@ finally {
     if (Test-Path -LiteralPath $topologyRoot) { Remove-Item -LiteralPath $topologyRoot -Recurse -Force }
 }
 $runner = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'run-windows-vulkan-evidence.ps1') -Raw
-foreach ($required in @('--locked', '--offline', '-SigningMode Fixture', '--ignored', '--exact', '--test-threads=1', '--no-run', 'Invoke-ScribeEvidenceCargoWithCmakeRetry', 'Enable-ScribeEvidenceCmakeBootstrap', 'Assert-ScribeEvidenceNoReparseDescendants', 'transcribe-cpp-sys-[0-9a-f]{16}', 'onnx_worker::tests::windows_vulkan_fixture_evidence_captures_five_cold_and_twenty_warm_runs', 'gpu-auto-qualification-windows-x64.json', 'Production signing/release input is forbidden', 'Resolve-ScribeEvidenceFreshDirectory', 'Evidence output may not be under source')) {
+foreach ($required in @('--locked', '--offline', '-SigningMode Fixture', '--ignored', '--exact', '--test-threads=1', '--no-run', 'Invoke-ScribeEvidenceCargoWithCmakeRetry', 'Enable-ScribeEvidenceCmakeBootstrap', 'Assert-ScribeEvidenceNoReparseDescendants', 'Set-ScribeEvidenceWorkerBuildMode $true', 'Set-ScribeEvidenceWorkerBuildMode $false', 'previousWorkerDigest', 'previousBuildingWorker', 'transcribe-cpp-sys-[0-9a-f]{16}', 'onnx_worker::tests::windows_vulkan_fixture_evidence_captures_five_cold_and_twenty_warm_runs', 'gpu-auto-qualification-windows-x64.json', 'Production signing/release input is forbidden', 'Resolve-ScribeEvidenceFreshDirectory', 'Evidence output may not be under source')) {
     if ($runner -notmatch [regex]::Escape($required)) { throw "Runner is missing required source contract: $required" }
 }
 foreach ($required in @('Get-FileHash -LiteralPath $model', 'Get-FileHash -LiteralPath $wav', 'Test-ScribeEvidenceActivationPath', 'Test-ScribeEvidenceWithin', 'New-ScribeEvidenceShortCargoTarget', 'Assert-ScribeEvidenceSingleLinkFile', 'Get-ScribeVulkanEvidenceActualSystem32', 'fsutil.exe', 'manifest.json', 'Fixture pack build identity is not bound', 'fixture-evidence-$($revision.Substring(0, 12))-$([guid]::NewGuid()', 'Fixture-only untrusted Vulkan evidence', 'previousEvidenceEnvironment')) {
@@ -59,6 +73,16 @@ foreach ($required in @('Get-FileHash -LiteralPath $model', 'Get-FileHash -Liter
 $compileAt = $runner.IndexOf("'--no-run'")
 $baselineAt = $runner.IndexOf('Get-ScribeVulkanEvidenceNvidiaBaseline')
 if ($compileAt -lt 0 -or $baselineAt -lt 0 -or $compileAt -ge $baselineAt) { throw 'Runner must precompile before NVIDIA baseline capture.' }
+$cpuBuildAt = $runner.IndexOf("Invoke-ScribeEvidenceCargoWithCmakeRetry @('build'")
+$workerModeAt = $runner.IndexOf('Set-ScribeEvidenceWorkerBuildMode $true')
+$harnessModeAt = $runner.IndexOf('Set-ScribeEvidenceWorkerBuildMode $false', $cpuBuildAt)
+$ignoredTestAt = $runner.IndexOf("Invoke-ScribeEvidence `$cargo @('test'")
+$executionModeAt = $runner.LastIndexOf('Set-ScribeEvidenceWorkerBuildMode $false', $ignoredTestAt)
+if ($workerModeAt -lt 0 -or $cpuBuildAt -lt 0 -or $workerModeAt -ge $cpuBuildAt -or
+    $harnessModeAt -lt $cpuBuildAt -or $harnessModeAt -ge $compileAt -or
+    $executionModeAt -lt $compileAt -or $executionModeAt -ge $ignoredTestAt) {
+    throw 'Runner worker-build mode is not isolated to the CPU worker build.'
+}
 if ($runner -match 'SigningMode Production|ProductionPrivateKeyPath|ProductionKeyId') { throw 'Fixture runner references a production signing input.' }
 if ($runner -match '\$detail\s*=\s*\(\$first\s*\|\s*Out-String\)|throw\s+"\$Failure\s+\$detail"') { throw 'Runner can throw raw Cargo child output.' }
 $preflight = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'windows-vulkan-evidence-preflight.ps1') -Raw

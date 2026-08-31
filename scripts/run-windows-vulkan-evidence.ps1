@@ -216,6 +216,8 @@ $previousRevision = $env:SCRIBE_BUILD_REVISION
 $previousArchive = $env:SHERPA_ONNX_ARCHIVE_DIR
 $previousTarget = $env:CARGO_TARGET_DIR
 $previousLocalAppData = $env:LOCALAPPDATA
+$previousWorkerDigest = $env:SCRIBE_BUNDLED_WORKER_SHA256
+$previousBuildingWorker = $env:SCRIBE_BUILDING_WORKER
 $evidenceEnvironmentNames = @(
     'SCRIBE_VULKAN_EVIDENCE_PACK_ROOT',
     'SCRIBE_VULKAN_EVIDENCE_CPU_WORKER',
@@ -237,7 +239,9 @@ try {
     $cpuBuildEnvironment = New-ScribeEvidenceShortCargoTarget 'cpu-env'
     New-Item -ItemType Directory -Path $cpuBuildEnvironment | Out-Null
     $env:LOCALAPPDATA = $cpuBuildEnvironment
+    Set-ScribeEvidenceWorkerBuildMode $true
     Invoke-ScribeEvidenceCargoWithCmakeRetry @('build', '--locked', '--offline', '--release', '--bin', 'scribe-inference-worker', '--features', 'inference-worker', '--manifest-path', (Join-Path $repositoryRoot 'Cargo.toml')) 'Fresh isolated CPU worker build failed.' $env:CARGO_TARGET_DIR $cpuBuildEnvironment
+    Set-ScribeEvidenceWorkerBuildMode $false
     $env:LOCALAPPDATA = $previousLocalAppData
     $cpuBundle = Join-Path $workRoot 'cpu-worker-bundle'
     New-Item -ItemType Directory -Path $cpuBundle | Out-Null
@@ -262,6 +266,7 @@ try {
     $harnessBuildEnvironment = New-ScribeEvidenceShortCargoTarget 'harness-env'
     New-Item -ItemType Directory -Path $harnessBuildEnvironment | Out-Null
     $env:LOCALAPPDATA = $harnessBuildEnvironment
+    Set-ScribeEvidenceWorkerBuildMode $false
     Invoke-ScribeEvidenceCargoWithCmakeRetry @('test', '--locked', '--offline', '--features', 'inference-worker', 'onnx_worker::tests::windows_vulkan_fixture_evidence_captures_five_cold_and_twenty_warm_runs', '--no-run') 'Vulkan evidence test precompilation failed.' $env:CARGO_TARGET_DIR $harnessBuildEnvironment
     $baseline = Get-ScribeVulkanEvidenceNvidiaBaseline $ExpectedStableDevice $trustedNvidiaSmi
     $env:SCRIBE_VULKAN_EVIDENCE_PACK_ROOT = $packRoot
@@ -274,6 +279,7 @@ try {
     $env:SCRIBE_VULKAN_EVIDENCE_EXPECTED_STABLE_DEVICE = $ExpectedStableDevice
     $env:SCRIBE_VULKAN_EVIDENCE_OUTPUT = $evidenceOutput
     $env:SCRIBE_VULKAN_EVIDENCE_NVIDIA_BASELINE_JSON = $baseline | ConvertTo-Json -Compress
+    Set-ScribeEvidenceWorkerBuildMode $false
     Invoke-ScribeEvidence $cargo @('test', '--locked', '--offline', '--features', 'inference-worker', 'onnx_worker::tests::windows_vulkan_fixture_evidence_captures_five_cold_and_twenty_warm_runs', '--', '--ignored', '--exact', '--test-threads=1') 'The exact Vulkan evidence test failed.'
 }
 finally {
@@ -281,6 +287,8 @@ finally {
     $env:SHERPA_ONNX_ARCHIVE_DIR = $previousArchive
     $env:CARGO_TARGET_DIR = $previousTarget
     $env:LOCALAPPDATA = $previousLocalAppData
+    $env:SCRIBE_BUNDLED_WORKER_SHA256 = $previousWorkerDigest
+    $env:SCRIBE_BUILDING_WORKER = $previousBuildingWorker
     foreach ($name in $evidenceEnvironmentNames) {
         if ($null -eq $previousEvidenceEnvironment[$name]) { Remove-Item "Env:$name" -ErrorAction SilentlyContinue }
         else { Set-Item "Env:$name" $previousEvidenceEnvironment[$name] }

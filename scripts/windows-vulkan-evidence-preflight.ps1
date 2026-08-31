@@ -42,6 +42,16 @@ function Assert-ScribeEvidenceNoReparseDescendants([string]$Path) {
     }
 }
 
+function Set-ScribeEvidenceWorkerBuildMode([bool]$BuildingWorker) {
+    $env:SCRIBE_BUNDLED_WORKER_SHA256 = $null
+    if ($BuildingWorker) {
+        $env:SCRIBE_BUILDING_WORKER = '1'
+    }
+    else {
+        $env:SCRIBE_BUILDING_WORKER = $null
+    }
+}
+
 if (-not ('ScribeEvidenceNative.SystemDirectory' -as [type])) {
     Add-Type -TypeDefinition @'
 using System;
