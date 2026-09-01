@@ -754,6 +754,22 @@ try {
         'C:', '\', '/', 'CMake Warning in'
     )
     Assert-True (@($fixtureRejectedRetry.Warnings | Where-Object { $_.StartsWith('ScribeFixtureCmakeRetryAssessmentV1 ', [StringComparison]::Ordinal) }).Count -eq 1) 'Fixture retry rejection did not emit exactly one fixture assessment warning.'
+    $lowercaseFixtureRejectedRetry = Invoke-WorkerBuildRetryHarness ($builderCanonicalFailure -join "`r`n") $false $builderWrongRetryTarget $builderRetryEnvironment 'fixture'
+    Assert-True ($lowercaseFixtureRejectedRetry.NativeInvocations -eq 1 -and
+        $lowercaseFixtureRejectedRetry.JunctionInvocations -eq 0 -and
+        $null -ne $lowercaseFixtureRejectedRetry.Failure -and
+        $lowercaseFixtureRejectedRetry.Failure.Data.Contains('ScribeFixtureCmakeRetryAssessmentV1')) 'Lowercase fixture retry rejection did not attach fixture diagnostic metadata.'
+    $lowercaseFixtureRecord = [string]$lowercaseFixtureRejectedRetry.Failure.Data['ScribeFixtureCmakeRetryAssessmentV1']
+    Assert-ScribeFixtureCmakeRetryAssessmentJson $lowercaseFixtureRecord
+    Assert-True (@($lowercaseFixtureRejectedRetry.Warnings | Where-Object { $_.StartsWith('ScribeFixtureCmakeRetryAssessmentV1 ', [StringComparison]::Ordinal) }).Count -eq 1) 'Lowercase fixture retry rejection did not emit exactly one fixture assessment warning.'
+    foreach ($productionSigningMode in @('Production', 'production')) {
+        $productionVariantRetry = Invoke-WorkerBuildRetryHarness ($builderCanonicalFailure -join "`r`n") $false $builderWrongRetryTarget $builderRetryEnvironment $productionSigningMode
+        Assert-True ($productionVariantRetry.NativeInvocations -eq 1 -and
+            $productionVariantRetry.JunctionInvocations -eq 0 -and
+            $null -ne $productionVariantRetry.Failure -and
+            -not $productionVariantRetry.Failure.Data.Contains('ScribeFixtureCmakeRetryAssessmentV1') -and
+            @($productionVariantRetry.Warnings | Where-Object { $_.StartsWith('ScribeFixtureCmakeRetryAssessmentV1 ', [StringComparison]::Ordinal) }).Count -eq 0) "Production signing mode variant $productionSigningMode did not remain fixture-assessment isolated."
+    }
     $wrongEnvironmentRetry = Invoke-WorkerBuildRetryHarness ($builderCanonicalFailure -join "`r`n") $false $builderRetryTarget $builderWrongRetryEnvironment
     Assert-True ($wrongEnvironmentRetry.NativeInvocations -eq 1 -and
         $wrongEnvironmentRetry.JunctionInvocations -eq 0 -and

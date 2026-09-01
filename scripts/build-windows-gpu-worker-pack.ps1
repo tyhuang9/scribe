@@ -1310,7 +1310,7 @@ try {
             -Output $diagnostic `
             -CargoTarget $cargoTarget `
             -BuildEnvironment $shortBuild.BuildEnvironment
-        if ($SigningMode -ceq 'Fixture') {
+        if ($SigningMode -eq 'Fixture') {
             $fixtureAssessmentJson = '{"schema_version":1,"assessment_status":"unavailable","failure_kind":"not_evaluated","exit_code":null,"capture_overflow":null,"retry_eligible":false,"diagnostic_order":"not_evaluated","stdout":null,"stderr":null,"combined":null,"topology_rejection_stage":"not_evaluated"}'
             try {
                 $fixtureAssessment = Get-ScribeGpuWorkerCmakeRetryAssessment `
