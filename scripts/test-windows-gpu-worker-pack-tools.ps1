@@ -51,6 +51,76 @@ function Assert-True([bool]$Condition, [string]$Message) {
     }
 }
 
+function Assert-ScribeFixtureCmakeRetryAssessmentJson([string]$Json) {
+    $assessment = $Json | ConvertFrom-Json
+    $rootProperties = @(
+        'schema_version', 'assessment_status', 'failure_kind', 'exit_code',
+        'capture_overflow', 'retry_eligible', 'diagnostic_order', 'stdout',
+        'stderr', 'combined', 'topology_rejection_stage'
+    ) | Sort-Object
+    Assert-True ((@($assessment.PSObject.Properties.Name | Sort-Object) -join ',') -ceq ($rootProperties -join ',')) 'Fixture retry assessment JSON root schema changed.'
+    Assert-True ($assessment.schema_version -is [long] -and $assessment.schema_version -eq 1) 'Fixture retry assessment schema version is not a bounded integer.'
+    Assert-True ($assessment.assessment_status -cin @('evaluated', 'not_evaluated', 'unavailable')) 'Fixture retry assessment status is not an allowlisted enum.'
+    Assert-True ($assessment.failure_kind -cin @('native_process_failure', 'native_process_capture_overflow', 'not_native_process_failure', 'not_evaluated')) 'Fixture retry assessment failure kind is not an allowlisted enum.'
+    Assert-True ($null -eq $assessment.exit_code -or ($assessment.exit_code -is [long] -and $assessment.exit_code -ge [int]::MinValue -and $assessment.exit_code -le [int]::MaxValue)) 'Fixture retry assessment exit code is not a bounded integer or null.'
+    Assert-True ($null -eq $assessment.capture_overflow -or $assessment.capture_overflow -is [bool]) 'Fixture retry assessment capture overflow is not a Boolean or null.'
+    Assert-True ($assessment.retry_eligible -is [bool]) 'Fixture retry assessment retry eligibility is not a Boolean.'
+    Assert-True ($assessment.diagnostic_order -cin @('stdout_then_stderr', 'not_evaluated')) 'Fixture retry assessment diagnostic order is not an allowlisted enum.'
+    Assert-True ($assessment.topology_rejection_stage -cin @('accepted', 'not_required', 'not_evaluated', 'invalid_input', 'cargo_target_not_physical', 'build_environment_not_physical', 'out_directory_not_physical', 'out_directory_mismatch', 'tcs_root_not_physical', 'tcs_root_mismatch', 'tcs_entry_count_invalid', 'tcs_entry_not_junction', 'tcs_leaf_invalid', 'junction_target_not_physical', 'junction_target_mismatch', 'observer_failure')) 'Fixture retry assessment topology stage is not an allowlisted enum.'
+    $markerProperties = @('line_count')
+    foreach ($marker in @('crate', 'command', 'os_error', 'copy_failure', 'junction', 'warning_source', 'object_path', 'successful_object_path', 'link', 'successful_link')) {
+        $markerProperties += @("${marker}_count", "${marker}_first", "${marker}_last")
+    }
+    foreach ($streamName in @('stdout', 'stderr', 'combined')) {
+        $stream = $assessment.$streamName
+        if ($null -eq $stream) { continue }
+        Assert-True ((@($stream.PSObject.Properties.Name | Sort-Object) -join ',') -ceq (@($markerProperties | Sort-Object) -join ',')) "Fixture retry assessment $streamName schema changed."
+        foreach ($property in $markerProperties) {
+            $value = $stream.$property
+            if ($property -eq 'line_count' -or $property.EndsWith('_count')) {
+                Assert-True ($value -is [long] -and $value -ge 0 -and $value -le 2048) "Fixture retry assessment $streamName $property is not a bounded count."
+            }
+            else {
+                Assert-True ($null -eq $value -or ($value -is [long] -and $value -ge 1 -and $value -le 2048)) "Fixture retry assessment $streamName $property is not a bounded position or null."
+            }
+        }
+    }
+}
+
+function Assert-ScribeFixtureCmakeRetryAssessmentDoesNotContain([string]$Json, [string[]]$SensitiveValues) {
+    foreach ($sensitiveValue in $SensitiveValues) {
+        if ([string]::IsNullOrEmpty($sensitiveValue)) { continue }
+        $jsonEscaped = ($sensitiveValue | ConvertTo-Json -Compress).Trim('"')
+        Assert-True (-not $Json.Contains($sensitiveValue)) 'Fixture retry assessment JSON exposed a raw sensitive value.'
+        Assert-True (-not $Json.Contains($jsonEscaped)) 'Fixture retry assessment JSON exposed a JSON-escaped sensitive value.'
+    }
+}
+
+function Copy-ScribeFixtureCmakeRetryAssessmentForTest([object]$Assessment) {
+    $copy = [ordered]@{}
+    foreach ($property in $Assessment.PSObject.Properties) {
+        $value = $property.Value
+        if ($property.Name -cin @('stdout', 'stderr', 'combined') -and $null -ne $value) {
+            $streamCopy = [ordered]@{}
+            foreach ($streamProperty in $value.PSObject.Properties) {
+                $streamCopy[$streamProperty.Name] = $streamProperty.Value
+            }
+            $value = [pscustomobject]$streamCopy
+        }
+        $copy[$property.Name] = $value
+    }
+    return [pscustomobject]$copy
+}
+
+function Assert-ScribeFixtureCmakeRetryAssessmentUnavailable([object]$Assessment, [string[]]$SensitiveValues) {
+    $expected = '{"schema_version":1,"assessment_status":"unavailable","failure_kind":"not_evaluated","exit_code":null,"capture_overflow":null,"retry_eligible":false,"diagnostic_order":"not_evaluated","stdout":null,"stderr":null,"combined":null,"topology_rejection_stage":"not_evaluated"}'
+    $json = ConvertTo-ScribeGpuWorkerFixtureCmakeRetryAssessmentJson $Assessment
+    Assert-True ($json -ceq $expected) 'Malformed fixture retry assessment did not fail closed to the canonical unavailable document.'
+    Assert-True ($json.Length -le 16384) 'Canonical unavailable fixture retry assessment exceeded its size bound.'
+    Assert-ScribeFixtureCmakeRetryAssessmentJson $json
+    Assert-ScribeFixtureCmakeRetryAssessmentDoesNotContain $json $SensitiveValues
+}
+
 function New-FixturePayload([string]$Root) {
     $bin = Join-Path $Root 'bin'
     New-Item -ItemType Directory -Path $bin | Out-Null
@@ -436,6 +506,189 @@ try {
             -BuildEnvironment $invalidTopology[1])) "Canonical diagnostic with $($invalidTopology[2]) was classified."
     }
 
+    $canonicalFailure = [ScribeGpuWorkerNativeProcessFailure]::new(
+        'SENTINEL-EXCEPTION C:\assessment-secret\crate-token', 17,
+        ($canonicalCargoTargetFailure -join "`n"), '', $false
+    )
+    $canonicalRetryEligible = Test-ScribeGpuWorkerKnownCmakeBootstrapFailure `
+        -Output @(Get-ScribeGpuWorkerNativeProcessRetryDiagnostic $canonicalFailure) `
+        -CargoTarget $canonicalClassifierRoot `
+        -BuildEnvironment $canonicalBuildEnvironment
+    $canonicalAssessment = Get-ScribeGpuWorkerCmakeRetryAssessment `
+        $canonicalFailure $canonicalRetryEligible $canonicalClassifierRoot $canonicalBuildEnvironment
+    $expectedAssessmentProperties = @(
+        'schema_version', 'assessment_status', 'failure_kind', 'exit_code',
+        'capture_overflow', 'retry_eligible', 'diagnostic_order', 'stdout',
+        'stderr', 'combined', 'topology_rejection_stage'
+    ) | Sort-Object
+    Assert-True ((@($canonicalAssessment.PSObject.Properties.Name | Sort-Object) -join ',') -ceq ($expectedAssessmentProperties -join ',')) 'CMake retry assessment schema changed.'
+    Assert-True ($canonicalAssessment.schema_version -eq 1 -and
+        $canonicalAssessment.assessment_status -ceq 'evaluated' -and
+        $canonicalAssessment.failure_kind -ceq 'native_process_failure' -and
+        $canonicalAssessment.exit_code -eq 17 -and
+        -not $canonicalAssessment.capture_overflow -and
+        $canonicalAssessment.retry_eligible -and
+        $canonicalAssessment.diagnostic_order -ceq 'stdout_then_stderr' -and
+        $canonicalAssessment.topology_rejection_stage -ceq 'accepted') 'Accepted CMake retry assessment did not report the fixed diagnostic metadata.'
+    Assert-True ($canonicalAssessment.stdout.line_count -eq 4 -and
+        $canonicalAssessment.stderr.line_count -eq 0 -and
+        $canonicalAssessment.combined.crate_count -eq 1 -and
+        $canonicalAssessment.combined.crate_first -eq 1 -and
+        $canonicalAssessment.combined.successful_link_last -eq 4) 'CMake retry assessment lost bounded marker positions.'
+    $assessmentJson = ConvertTo-ScribeGpuWorkerFixtureCmakeRetryAssessmentJson $canonicalAssessment
+    Assert-True ($assessmentJson.Length -le 16384) 'CMake retry assessment JSON exceeded its maximum size.'
+    Assert-ScribeFixtureCmakeRetryAssessmentJson $assessmentJson
+    Assert-ScribeFixtureCmakeRetryAssessmentDoesNotContain $assessmentJson @(
+        'SENTINEL-EXCEPTION C:\assessment-secret\crate-token',
+        $canonicalClassifierRoot,
+        $canonicalClassifierRoot.Replace('\', '/'),
+        $canonicalCrateHash,
+        $canonicalShortOutToken,
+        'C:', '\', '/', 'CMake Warning in'
+    )
+
+    $malformedAssessmentSentinels = @(
+        'SENTINEL-MALFORMED-ASSESSMENT',
+        'C:\malformed-assessment\private',
+        '0123456789abcdef',
+        'fedcba9876543210',
+        'C:', '\', '/'
+    )
+    $malformedAssessments = [System.Collections.Generic.List[object]]::new()
+    $malformedAssessments.Add('SENTINEL-MALFORMED-ASSESSMENT C:\malformed-assessment\private')
+    $malformed = Copy-ScribeFixtureCmakeRetryAssessmentForTest $canonicalAssessment
+    $malformed.PSObject.Properties.Remove('schema_version')
+    $malformedAssessments.Add($malformed)
+    foreach ($schemaVersion in @('1', [long]1, 2)) {
+        $malformed = Copy-ScribeFixtureCmakeRetryAssessmentForTest $canonicalAssessment
+        $malformed.schema_version = $schemaVersion
+        $malformedAssessments.Add($malformed)
+    }
+    $malformed = Copy-ScribeFixtureCmakeRetryAssessmentForTest $canonicalAssessment
+    $malformed.retry_eligible = 'true'
+    $malformedAssessments.Add($malformed)
+    $malformed = Copy-ScribeFixtureCmakeRetryAssessmentForTest $canonicalAssessment
+    $malformed | Add-Member -NotePropertyName unexpected_root -NotePropertyValue 'SENTINEL-MALFORMED-ASSESSMENT C:\malformed-assessment\private'
+    $malformedAssessments.Add($malformed)
+    $malformed = Copy-ScribeFixtureCmakeRetryAssessmentForTest $canonicalAssessment
+    $malformed.stdout = 'SENTINEL-MALFORMED-ASSESSMENT C:\malformed-assessment\private'
+    $malformedAssessments.Add($malformed)
+    $malformed = Copy-ScribeFixtureCmakeRetryAssessmentForTest $canonicalAssessment
+    $malformed.stdout | Add-Member -NotePropertyName unexpected_stream -NotePropertyValue 'SENTINEL-MALFORMED-ASSESSMENT C:\malformed-assessment\private'
+    $malformedAssessments.Add($malformed)
+    foreach ($countValue in @([long]0, -1, 2049)) {
+        $malformed = Copy-ScribeFixtureCmakeRetryAssessmentForTest $canonicalAssessment
+        $malformed.stdout.line_count = $countValue
+        $malformedAssessments.Add($malformed)
+    }
+    $malformed = Copy-ScribeFixtureCmakeRetryAssessmentForTest $canonicalAssessment
+    $malformed.stdout.crate_count = [long]1
+    $malformedAssessments.Add($malformed)
+    foreach ($positionValue in @([long]1, 0, 2049)) {
+        $malformed = Copy-ScribeFixtureCmakeRetryAssessmentForTest $canonicalAssessment
+        $malformed.stdout.crate_first = $positionValue
+        $malformedAssessments.Add($malformed)
+    }
+    foreach ($malformedAssessment in $malformedAssessments) {
+        Assert-ScribeFixtureCmakeRetryAssessmentUnavailable $malformedAssessment $malformedAssessmentSentinels
+    }
+
+    $nonNativeAssessment = Get-ScribeGpuWorkerCmakeRetryAssessment ([InvalidOperationException]::new('SENTINEL-NON-NATIVE')) $false $canonicalClassifierRoot $canonicalBuildEnvironment
+    $overflowAssessment = Get-ScribeGpuWorkerCmakeRetryAssessment ([ScribeGpuWorkerNativeProcessFailure]::new('SENTINEL-OVERFLOW', 23, 'SENTINEL', '', $true)) $false $canonicalClassifierRoot $canonicalBuildEnvironment
+    $overlongAssessment = Get-ScribeGpuWorkerCmakeRetryAssessment ([ScribeGpuWorkerNativeProcessFailure]::new('SENTINEL-OVERLONG', 29, ('x' * 1025), '', $false)) $false $canonicalClassifierRoot $canonicalBuildEnvironment
+    Assert-True ($nonNativeAssessment.assessment_status -ceq 'not_evaluated' -and
+        $nonNativeAssessment.failure_kind -ceq 'not_native_process_failure' -and
+        $overflowAssessment.assessment_status -ceq 'not_evaluated' -and
+        $overflowAssessment.failure_kind -ceq 'native_process_capture_overflow' -and
+        $overlongAssessment.assessment_status -ceq 'not_evaluated') 'Invalid, overflow, or overlong retry evidence was assessed.'
+    foreach ($json in @(
+        (ConvertTo-ScribeGpuWorkerFixtureCmakeRetryAssessmentJson $nonNativeAssessment),
+        (ConvertTo-ScribeGpuWorkerFixtureCmakeRetryAssessmentJson $overflowAssessment),
+        (ConvertTo-ScribeGpuWorkerFixtureCmakeRetryAssessmentJson $overlongAssessment)
+    )) {
+        Assert-ScribeFixtureCmakeRetryAssessmentJson $json
+        Assert-ScribeFixtureCmakeRetryAssessmentDoesNotContain $json @('SENTINEL', 'C:', '\', '/')
+    }
+
+    $splitAssessmentCases = @(
+        [pscustomobject]@{ Stdout = ($legacyOsError267CmakeBootstrapFailure -join "`n"); Stderr = ''; Expected = $true },
+        [pscustomobject]@{ Stdout = ''; Stderr = ($legacyOsError267CmakeBootstrapFailure -join "`n"); Expected = $true },
+        [pscustomobject]@{ Stdout = ($vulkanShortJunctionFailure[0..1] -join "`n"); Stderr = ($vulkanShortJunctionFailure[2..4] -join "`n"); Expected = $true },
+        [pscustomobject]@{ Stdout = ($vulkanShortJunctionFailure[2..4] -join "`n"); Stderr = ($vulkanShortJunctionFailure[0..1] -join "`n"); Expected = $false }
+    )
+    foreach ($case in $splitAssessmentCases) {
+        $failure = [ScribeGpuWorkerNativeProcessFailure]::new('SENTINEL-SPLIT', 17, $case.Stdout, $case.Stderr, $false)
+        $eligible = Test-ScribeGpuWorkerKnownCmakeBootstrapFailure @(Get-ScribeGpuWorkerNativeProcessRetryDiagnostic $failure)
+        $assessment = Get-ScribeGpuWorkerCmakeRetryAssessment $failure $eligible $canonicalClassifierRoot $canonicalBuildEnvironment
+        Assert-True ($eligible -eq $case.Expected -and $assessment.retry_eligible -eq $eligible -and
+            $assessment.diagnostic_order -ceq 'stdout_then_stderr') 'CMake retry assessment did not preserve deterministic stream ordering.'
+    }
+
+    $topologyStages = @(
+        @('relative-cargo-target', $canonicalBuildEnvironment, $canonicalCrateHash, 'invalid_input'),
+        @((Join-Path $canonicalFixtureRoot 'missing-cargo-target'), $canonicalBuildEnvironment, $canonicalCrateHash, 'cargo_target_not_physical'),
+        @($canonicalClassifierRoot, (Join-Path $canonicalFixtureRoot 'missing-build-environment'), $canonicalCrateHash, 'build_environment_not_physical'),
+        @($canonicalClassifierRoot, $canonicalBuildEnvironment, $canonicalCrateHash, 'accepted'),
+        @($otherCanonicalClassifierRoot, $canonicalBuildEnvironment, $canonicalCrateHash, 'out_directory_not_physical'),
+        @($canonicalClassifierRoot, $emptyBuildEnvironment, $canonicalCrateHash, 'tcs_root_not_physical'),
+        @($reparseCanonicalClassifierRoot, $reparseBuildEnvironment, '0123456789abcdef', 'out_directory_not_physical'),
+        @($substitutionTarget, $substitutionEnvironment, '0123456789abcdef', 'junction_target_mismatch'),
+        @($multipleTarget, $multipleEnvironment, '0123456789abcdef', 'tcs_entry_count_invalid'),
+        @($wrongTypeTarget, $wrongTypeEnvironment, '0123456789abcdef', 'tcs_entry_not_junction'),
+        @($noncanonicalLeafTarget, $noncanonicalLeafEnvironment, '0123456789abcdef', 'tcs_leaf_invalid'),
+        @($shortLeafTarget, $shortLeafEnvironment, '0123456789abcdef', 'tcs_leaf_invalid'),
+        @($longLeafTarget, $longLeafEnvironment, '0123456789abcdef', 'tcs_leaf_invalid'),
+        @($wrongOutTarget, $wrongOutEnvironment, '0123456789abcdef', 'junction_target_mismatch'),
+        @($reparseTcsTarget, $reparseTcsEnvironment, '0123456789abcdef', 'tcs_root_not_physical')
+    )
+    foreach ($topologyStage in $topologyStages) {
+        $observedTopologyStage = Get-ScribeGpuWorkerCmakeRetryTopologyObservation $topologyStage[0] $topologyStage[1] $topologyStage[2]
+        Assert-True ($observedTopologyStage -ceq $topologyStage[3]) "CMake retry topology observer stage changed: expected $($topologyStage[3]), observed $observedTopologyStage."
+    }
+    function Invoke-TestTopologyObserverFailure([string]$CargoTarget, [string]$BuildEnvironment, [string]$CrateHash) {
+        function Get-ChildItem { throw 'synthetic observer failure' }
+        return Get-ScribeGpuWorkerCmakeRetryTopologyObservation $CargoTarget $BuildEnvironment $CrateHash
+    }
+    Assert-True ((Invoke-TestTopologyObserverFailure $canonicalClassifierRoot $canonicalBuildEnvironment $canonicalCrateHash) -ceq 'observer_failure') 'CMake retry topology observer did not fail closed.'
+    $originalGetPhysicalDirectory = ${function:Get-ScribeGpuWorkerPhysicalDirectory}
+    function Invoke-TestTopologyPhysicalDirectoryStage(
+        [ValidateSet('out_directory_mismatch', 'tcs_root_mismatch', 'junction_target_not_physical')]
+        [string]$ExpectedStage,
+        [string]$CargoTarget,
+        [string]$BuildEnvironment,
+        [string]$CrateHash,
+        [string]$MismatchFullName,
+        [scriptblock]$OriginalGetPhysicalDirectory
+    ) {
+        function Get-ScribeGpuWorkerPhysicalDirectory([string]$Path, [string]$Label) {
+            if ($ExpectedStage -ceq 'out_directory_mismatch' -and $Label -ceq 'Retry assessment transcribe-cpp OUT_DIR') {
+                return [pscustomobject]@{ FullName = $MismatchFullName }
+            }
+            if ($ExpectedStage -ceq 'tcs_root_mismatch' -and $Label -ceq 'Retry assessment tcs inventory') {
+                return [pscustomobject]@{ FullName = $MismatchFullName }
+            }
+            if ($ExpectedStage -ceq 'junction_target_not_physical' -and $Label -ceq 'Retry assessment junction target') {
+                throw 'synthetic non-physical junction target'
+            }
+            return & $OriginalGetPhysicalDirectory $Path $Label
+        }
+        return Get-ScribeGpuWorkerCmakeRetryTopologyObservation $CargoTarget $BuildEnvironment $CrateHash
+    }
+    foreach ($mockedTopologyStage in @(
+        @('out_directory_mismatch', (Join-Path $canonicalFixtureRoot 'observer-out-mismatch')),
+        @('tcs_root_mismatch', (Join-Path $canonicalFixtureRoot 'observer-tcs-mismatch')),
+        @('junction_target_not_physical', '')
+    )) {
+        $observedTopologyStage = Invoke-TestTopologyPhysicalDirectoryStage `
+            $mockedTopologyStage[0] $canonicalClassifierRoot $canonicalBuildEnvironment $canonicalCrateHash `
+            $mockedTopologyStage[1] $originalGetPhysicalDirectory
+        Assert-True ($observedTopologyStage -ceq $mockedTopologyStage[0]) "CMake retry topology observer stage changed: expected $($mockedTopologyStage[0]), observed $observedTopologyStage."
+    }
+    Assert-True (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure `
+        -Output $canonicalCargoTargetFailure `
+        -CargoTarget $canonicalClassifierRoot `
+        -BuildEnvironment $canonicalBuildEnvironment) 'Diagnostic-only topology stage tests changed authoritative retry classification.'
+
     $overlongCanonicalCargoTargetFailure = [Collections.Generic.List[object]]::new()
     foreach ($unused in 1..2048) { $overlongCanonicalCargoTargetFailure.Add('noise') }
     foreach ($line in $canonicalCargoTargetFailure) { $overlongCanonicalCargoTargetFailure.Add($line) }
@@ -498,11 +751,13 @@ function Invoke-WorkerBuildRetryHarness(
     [string]$Diagnostic,
     [bool]$FailRetry,
     [string]$CargoTarget,
-    [string]$BuildEnvironment
+    [string]$BuildEnvironment,
+    [string]$HarnessSigningMode = 'Production'
 ) {
     $state = [pscustomobject]@{
         NativeInvocations = 0
         JunctionInvocations = 0
+        Warnings = [System.Collections.Generic.List[string]]::new()
     }
     function Invoke-NativeProcess(
         [string]$Executable,
@@ -530,10 +785,14 @@ function Invoke-WorkerBuildRetryHarness(
     function Enable-ValidatedCmakeBuildJunction([string]$BuildEnvironment, [string]$CargoTarget) {
         $state.JunctionInvocations += 1
     }
+    function Write-Warning([string]$Message) {
+        $state.Warnings.Add($Message)
+    }
 
     $cargo = 'synthetic-cargo.exe'
     $workerBuildArguments = @('build')
     $Backend = 'Vulkan'
+    $SigningMode = $HarnessSigningMode
     $shortBuild = [pscustomobject]@{ BuildEnvironment = $BuildEnvironment }
     $cargoTarget = $CargoTarget
     $failure = $null
@@ -552,6 +811,7 @@ function Invoke-WorkerBuildRetryHarness(
         NativeInvocations = $state.NativeInvocations
         JunctionInvocations = $state.JunctionInvocations
         Failure = $failure
+        Warnings = $state.Warnings.ToArray()
     }
 }
 
@@ -568,10 +828,15 @@ try {
     New-Item -ItemType Directory -Path $builderWrongRetryTarget | Out-Null
     New-Item -ItemType Directory -Path $builderWrongRetryEnvironment | Out-Null
     $builderCanonicalFailure = @(New-TestCanonicalCargoTargetFailure $builderRetryTarget $builderRetryCrateHash)
+    Assert-True (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure `
+        -Output $builderCanonicalFailure `
+        -CargoTarget $builderRetryTarget `
+        -BuildEnvironment $builderRetryEnvironment) 'Builder retry fixture no longer satisfies the unchanged classifier.'
     $acceptedRetrySuccess = Invoke-WorkerBuildRetryHarness ($builderCanonicalFailure -join "`r`n") $false $builderRetryTarget $builderRetryEnvironment
     Assert-True ($acceptedRetrySuccess.NativeInvocations -eq 2 -and
         $acceptedRetrySuccess.JunctionInvocations -eq 1 -and
         $null -eq $acceptedRetrySuccess.Failure) 'Accepted canonical Cargo-target signature did not invoke exactly one isolated retry.'
+    Assert-True (@($acceptedRetrySuccess.Warnings | Where-Object { $_.StartsWith('ScribeFixtureCmakeRetryAssessmentV1 ', [StringComparison]::Ordinal) }).Count -eq 0) 'Production retry success emitted a fixture assessment warning.'
     $acceptedRetryFailure = Invoke-WorkerBuildRetryHarness ($builderCanonicalFailure -join "`n") $true $builderRetryTarget $builderRetryEnvironment
     Assert-True ($acceptedRetryFailure.NativeInvocations -eq 2 -and
         $acceptedRetryFailure.JunctionInvocations -eq 1 -and
@@ -581,6 +846,42 @@ try {
     Assert-True ($rejectedRetry.NativeInvocations -eq 1 -and
         $rejectedRetry.JunctionInvocations -eq 0 -and
         $null -ne $rejectedRetry.Failure) 'A wrong-target canonical signature invoked the isolated retry.'
+    Assert-True (-not $rejectedRetry.Failure.Data.Contains('ScribeFixtureCmakeRetryAssessmentV1')) 'Production retry rejection attached fixture-only diagnostic metadata.'
+    Assert-True (@($rejectedRetry.Warnings | Where-Object { $_.StartsWith('ScribeFixtureCmakeRetryAssessmentV1 ', [StringComparison]::Ordinal) }).Count -eq 0) 'Production retry rejection emitted a fixture assessment warning.'
+    $fixtureRejectedRetry = Invoke-WorkerBuildRetryHarness ($builderCanonicalFailure -join "`r`n") $false $builderWrongRetryTarget $builderRetryEnvironment 'Fixture'
+    Assert-True ($fixtureRejectedRetry.NativeInvocations -eq 1 -and
+        $fixtureRejectedRetry.JunctionInvocations -eq 0 -and
+        $null -ne $fixtureRejectedRetry.Failure -and
+        $fixtureRejectedRetry.Failure.Data.Contains('ScribeFixtureCmakeRetryAssessmentV1')) 'Fixture retry rejection did not attach its diagnostic-only metadata.'
+    $fixtureRejectedRecord = [string]$fixtureRejectedRetry.Failure.Data['ScribeFixtureCmakeRetryAssessmentV1']
+    Assert-True ($fixtureRejectedRecord.Length -le 16384) 'Fixture retry metadata exceeded its maximum size.'
+    Assert-ScribeFixtureCmakeRetryAssessmentJson $fixtureRejectedRecord
+    $fixtureRejectedAssessment = $fixtureRejectedRecord | ConvertFrom-Json
+    Assert-True ($fixtureRejectedAssessment.retry_eligible -eq $false) 'Fixture retry metadata did not preserve the authoritative rejected retry state.'
+    Assert-ScribeFixtureCmakeRetryAssessmentDoesNotContain $fixtureRejectedRecord @(
+        $builderRetryTarget,
+        $builderRetryTarget.Replace('\', '/'),
+        $builderRetryCrateHash,
+        $builderRetryShortOutToken,
+        'C:', '\', '/', 'CMake Warning in'
+    )
+    Assert-True (@($fixtureRejectedRetry.Warnings | Where-Object { $_.StartsWith('ScribeFixtureCmakeRetryAssessmentV1 ', [StringComparison]::Ordinal) }).Count -eq 1) 'Fixture retry rejection did not emit exactly one fixture assessment warning.'
+    $lowercaseFixtureRejectedRetry = Invoke-WorkerBuildRetryHarness ($builderCanonicalFailure -join "`r`n") $false $builderWrongRetryTarget $builderRetryEnvironment 'fixture'
+    Assert-True ($lowercaseFixtureRejectedRetry.NativeInvocations -eq 1 -and
+        $lowercaseFixtureRejectedRetry.JunctionInvocations -eq 0 -and
+        $null -ne $lowercaseFixtureRejectedRetry.Failure -and
+        $lowercaseFixtureRejectedRetry.Failure.Data.Contains('ScribeFixtureCmakeRetryAssessmentV1')) 'Lowercase fixture retry rejection did not attach fixture diagnostic metadata.'
+    $lowercaseFixtureRecord = [string]$lowercaseFixtureRejectedRetry.Failure.Data['ScribeFixtureCmakeRetryAssessmentV1']
+    Assert-ScribeFixtureCmakeRetryAssessmentJson $lowercaseFixtureRecord
+    Assert-True (@($lowercaseFixtureRejectedRetry.Warnings | Where-Object { $_.StartsWith('ScribeFixtureCmakeRetryAssessmentV1 ', [StringComparison]::Ordinal) }).Count -eq 1) 'Lowercase fixture retry rejection did not emit exactly one fixture assessment warning.'
+    foreach ($productionSigningMode in @('Production', 'production')) {
+        $productionVariantRetry = Invoke-WorkerBuildRetryHarness ($builderCanonicalFailure -join "`r`n") $false $builderWrongRetryTarget $builderRetryEnvironment $productionSigningMode
+        Assert-True ($productionVariantRetry.NativeInvocations -eq 1 -and
+            $productionVariantRetry.JunctionInvocations -eq 0 -and
+            $null -ne $productionVariantRetry.Failure -and
+            -not $productionVariantRetry.Failure.Data.Contains('ScribeFixtureCmakeRetryAssessmentV1') -and
+            @($productionVariantRetry.Warnings | Where-Object { $_.StartsWith('ScribeFixtureCmakeRetryAssessmentV1 ', [StringComparison]::Ordinal) }).Count -eq 0) "Production signing mode variant $productionSigningMode did not remain fixture-assessment isolated."
+    }
     $wrongEnvironmentRetry = Invoke-WorkerBuildRetryHarness ($builderCanonicalFailure -join "`r`n") $false $builderRetryTarget $builderWrongRetryEnvironment
     Assert-True ($wrongEnvironmentRetry.NativeInvocations -eq 1 -and
         $wrongEnvironmentRetry.JunctionInvocations -eq 0 -and

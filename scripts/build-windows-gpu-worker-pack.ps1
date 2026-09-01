@@ -1306,10 +1306,27 @@ try {
     }
     catch {
         $diagnostic = Get-NativeProcessRetryDiagnostic $_.Exception
-        if (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure `
+        $retryEligible = Test-ScribeGpuWorkerKnownCmakeBootstrapFailure `
             -Output $diagnostic `
             -CargoTarget $cargoTarget `
-            -BuildEnvironment $shortBuild.BuildEnvironment)) {
+            -BuildEnvironment $shortBuild.BuildEnvironment
+        if ($SigningMode -eq 'Fixture') {
+            $fixtureAssessmentJson = '{"schema_version":1,"assessment_status":"unavailable","failure_kind":"not_evaluated","exit_code":null,"capture_overflow":null,"retry_eligible":false,"diagnostic_order":"not_evaluated","stdout":null,"stderr":null,"combined":null,"topology_rejection_stage":"not_evaluated"}'
+            try {
+                $fixtureAssessment = Get-ScribeGpuWorkerCmakeRetryAssessment `
+                    $_.Exception `
+                    $retryEligible `
+                    $cargoTarget `
+                    $shortBuild.BuildEnvironment
+                $fixtureAssessmentJson = ConvertTo-ScribeGpuWorkerFixtureCmakeRetryAssessmentJson $fixtureAssessment
+            }
+            catch { }
+            try { $_.Exception.Data['ScribeFixtureCmakeRetryAssessmentV1'] = $fixtureAssessmentJson }
+            catch { }
+            try { Write-Warning "ScribeFixtureCmakeRetryAssessmentV1 $fixtureAssessmentJson" }
+            catch { }
+        }
+        if (-not $retryEligible) {
             throw
         }
         Enable-ValidatedCmakeBuildJunction $shortBuild.BuildEnvironment $cargoTarget
