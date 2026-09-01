@@ -13476,7 +13476,9 @@ mod tests {
             (Err(error), Ok(())) => Err(error),
             (Ok(_), Err(shutdown)) => Err(shutdown),
             (Err(error), Err(shutdown)) => {
-                Err(error.context(format!("evidence worker cleanup also failed: {shutdown:#}")))
+                let combined =
+                    format!("{error:#}; evidence worker cleanup also failed: {shutdown:#}");
+                Err(error.context(combined))
             }
         }
     }
@@ -13765,14 +13767,15 @@ mod tests {
                 .join("report.json")
         ));
         assert!(vulkan_evidence_millis(u128::MAX, "test").is_err());
-        assert!(
-            combine_vulkan_evidence_operation_and_shutdown::<u8>(
-                Err(anyhow!("operation failed")),
-                Err(anyhow!("shutdown failed"))
-            )
-            .unwrap_err()
-            .to_string()
-            .contains("operation failed")
+        let combined_error = combine_vulkan_evidence_operation_and_shutdown::<u8>(
+            Err(anyhow!("operation failed")),
+            Err(anyhow!("shutdown failed")),
+        )
+        .unwrap_err()
+        .to_string();
+        assert_eq!(
+            combined_error,
+            "operation failed; evidence worker cleanup also failed: shutdown failed"
         );
     }
 
