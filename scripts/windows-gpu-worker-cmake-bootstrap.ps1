@@ -151,10 +151,13 @@ function Get-ScribeGpuWorkerBoundedDiagnosticLines([object[]]$Output) {
 
 function Test-ScribeGpuWorkerCanonicalCargoTargetWarningSource(
     [string]$Line,
-    [string]$CargoTarget
+    [string]$CargoTarget,
+    [string]$BuildEnvironment
 ) {
     if ([string]::IsNullOrWhiteSpace($CargoTarget) -or
-        -not [IO.Path]::IsPathFullyQualified($CargoTarget)) {
+        -not [IO.Path]::IsPathFullyQualified($CargoTarget) -or
+        [string]::IsNullOrWhiteSpace($BuildEnvironment) -or
+        -not [IO.Path]::IsPathFullyQualified($BuildEnvironment)) {
         return $false
     }
     $warningSource = [regex]::new(
@@ -165,7 +168,9 @@ function Test-ScribeGpuWorkerCanonicalCargoTargetWarningSource(
 
     try {
         $cargoTargetItem = Get-ScribeGpuWorkerPhysicalDirectory $CargoTarget 'The retry classifier Cargo target'
+        $buildEnvironmentItem = Get-ScribeGpuWorkerPhysicalDirectory $BuildEnvironment 'The retry classifier build environment'
         $canonicalCargoTarget = $cargoTargetItem.FullName.TrimEnd([char[]]@('\', '/'))
+        $canonicalBuildEnvironment = $buildEnvironmentItem.FullName.TrimEnd([char[]]@('\', '/'))
         $sourceText = $warningSource.Groups['source'].Value.Replace('/', '\')
         if (-not [IO.Path]::IsPathFullyQualified($sourceText)) { return $false }
         $canonicalSource = [IO.Path]::GetFullPath($sourceText).TrimEnd([char[]]@('\', '/'))
@@ -174,10 +179,37 @@ function Test-ScribeGpuWorkerCanonicalCargoTargetWarningSource(
             return $false
         }
         $relativeSource = [IO.Path]::GetRelativePath($canonicalCargoTarget, $canonicalSource).Replace('\', '/')
-        if ($relativeSource -cnotmatch '^release/build/transcribe-cpp-sys-[0-9a-f]{16}/out/build/e/src/vulkan-shaders-gen-build/CMakeFiles/CMakeScratch/TryCompile-[A-Za-z0-9][A-Za-z0-9_-]{0,63}/CMakeLists\.txt$') {
+        $relativeSourceMatch = [regex]::Match(
+            $relativeSource,
+            '^release/build/transcribe-cpp-sys-(?<crateHash>[0-9a-f]{16})/out/build/e/src/vulkan-shaders-gen-build/CMakeFiles/CMakeScratch/TryCompile-[A-Za-z0-9][A-Za-z0-9_-]{0,63}/CMakeLists\.txt$',
+            [Text.RegularExpressions.RegexOptions]::CultureInvariant
+        )
+        if (-not $relativeSourceMatch.Success) {
             return $false
         }
-        Assert-ScribeGpuWorkerNoReparse $canonicalSource
+        $crateHash = $relativeSourceMatch.Groups['crateHash'].Value
+        $outDirectory = Join-Path $canonicalCargoTarget "release\build\transcribe-cpp-sys-$crateHash\out"
+        $outItem = Get-ScribeGpuWorkerPhysicalDirectory $outDirectory 'The retry classifier transcribe-cpp OUT_DIR'
+        if (-not (Test-ScribeGpuWorkerPathWithin $outItem.FullName $canonicalCargoTarget) -or
+            [IO.Path]::GetRelativePath($canonicalCargoTarget, $outItem.FullName).Replace('\', '/') -cne "release/build/transcribe-cpp-sys-$crateHash/out") {
+            return $false
+        }
+
+        $tcsRoot = Join-Path $canonicalBuildEnvironment 'tcs'
+        $tcsItem = Get-ScribeGpuWorkerPhysicalDirectory $tcsRoot 'The retry classifier tcs inventory'
+        if ((Split-Path -Parent $tcsItem.FullName) -cne $canonicalBuildEnvironment) { return $false }
+        $entries = @(Get-ChildItem -LiteralPath $tcsItem.FullName -Force)
+        if ($entries.Count -ne 1) { return $false }
+        $shortOut = $entries[0]
+        if (-not $shortOut.PSIsContainer -or
+            ($shortOut.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0 -or
+            $shortOut.LinkType -cne 'Junction' -or
+            @($shortOut.Target).Count -ne 1 -or
+            $shortOut.Name -cne $crateHash -or
+            (Split-Path -Parent $shortOut.FullName) -cne $tcsItem.FullName -or
+            (Get-ScribeGpuWorkerPhysicalDirectory ([string]@($shortOut.Target)[0]) 'The retry classifier transcribe-cpp OUT_DIR').FullName -cne $outItem.FullName) {
+            return $false
+        }
         return $true
     }
     catch {
@@ -187,7 +219,8 @@ function Test-ScribeGpuWorkerCanonicalCargoTargetWarningSource(
 
 function Test-ScribeGpuWorkerKnownCmakeBootstrapFailure(
     [object[]]$Output,
-    [string]$CargoTarget
+    [string]$CargoTarget,
+    [string]$BuildEnvironment
 ) {
     $bounded = Get-ScribeGpuWorkerBoundedDiagnosticLines $Output
     if ($bounded.Exceeded) { return $false }
@@ -224,7 +257,8 @@ function Test-ScribeGpuWorkerKnownCmakeBootstrapFailure(
     }
 
     # A successful transcribe-cpp short OUT_DIR junction is silent. Accept its
-    # warning source only when it is bound to the caller's exact Cargo target.
+    # warning source only when it is bound to the caller's exact active Cargo
+    # target and isolated short-build topology.
     # Reject this signature if the bounded diagnostic contains any fallback
     # warning: that case is accepted only by the separately ordered signature
     # above, where the warning must precede the crate failure.
@@ -238,7 +272,7 @@ function Test-ScribeGpuWorkerKnownCmakeBootstrapFailure(
             continue
         }
         if ($successfulJunctionState -eq 1 -and
-            (Test-ScribeGpuWorkerCanonicalCargoTargetWarningSource $line $CargoTarget)) {
+            (Test-ScribeGpuWorkerCanonicalCargoTargetWarningSource $line $CargoTarget $BuildEnvironment)) {
             $successfulJunctionState = 2
             continue
         }

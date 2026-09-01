@@ -102,6 +102,24 @@ function New-TestCanonicalCargoTargetFailure(
     )
 }
 
+function New-TestCanonicalRetryTopology(
+    [string]$CargoTarget,
+    [string]$BuildEnvironment,
+    [string]$CrateHash = '0123456789abcdef'
+) {
+    $out = Join-Path $CargoTarget "release\build\transcribe-cpp-sys-$CrateHash\out"
+    $tcs = Join-Path $BuildEnvironment 'tcs'
+    New-Item -ItemType Directory -Path $out -Force | Out-Null
+    New-Item -ItemType Directory -Path $tcs -Force | Out-Null
+    $link = Join-Path $tcs $CrateHash
+    New-Item -ItemType Junction -Path $link -Target $out | Out-Null
+    return [pscustomobject]@{
+        Out = (Get-Item -LiteralPath $out -Force).FullName
+        Link = (Get-Item -LiteralPath $link -Force).FullName
+        Tcs = (Get-Item -LiteralPath $tcs -Force).FullName
+    }
+}
+
 $legacyOsError267CmakeBootstrapFailure = @(
     'error: failed to run custom build command for `transcribe-cpp-sys v0.1.3`',
     '  Error: failed to execute command: cmake -S C:\safe\source',
@@ -214,20 +232,74 @@ foreach ($diagnostic in @(
         throw 'A free-standing tcs warning source was classified without a Cargo target.'
     }
 }
-$canonicalClassifierRoot = Join-Path ([IO.Path]::GetTempPath()) "scribe-canonical-retry-$([guid]::NewGuid().ToString('N'))"
-$otherCanonicalClassifierRoot = Join-Path ([IO.Path]::GetTempPath()) "scribe-canonical-retry-other-$([guid]::NewGuid().ToString('N'))"
-$reparseCanonicalClassifierRoot = Join-Path ([IO.Path]::GetTempPath()) "scribe-canonical-retry-reparse-$([guid]::NewGuid().ToString('N'))"
-$reparseCanonicalClassifierOutside = Join-Path ([IO.Path]::GetTempPath()) "scribe-canonical-retry-outside-$([guid]::NewGuid().ToString('N'))"
+$canonicalFixtureRoot = Join-Path ([IO.Path]::GetTempPath()) "scribe-canonical-retry-$([guid]::NewGuid().ToString('N'))"
 try {
-    foreach ($root in @(
-        $canonicalClassifierRoot,
-        $otherCanonicalClassifierRoot,
-        $reparseCanonicalClassifierRoot,
-        $reparseCanonicalClassifierOutside
-    )) {
-        New-Item -ItemType Directory -Path $root | Out-Null
-    }
+    New-Item -ItemType Directory -Path $canonicalFixtureRoot | Out-Null
+    $canonicalClassifierRoot = Join-Path $canonicalFixtureRoot 'valid-target'
+    $canonicalBuildEnvironment = Join-Path $canonicalFixtureRoot 'valid-environment'
+    $validTopology = New-TestCanonicalRetryTopology $canonicalClassifierRoot $canonicalBuildEnvironment
     $canonicalCargoTargetFailure = @(New-TestCanonicalCargoTargetFailure $canonicalClassifierRoot)
+    $ephemeralWarningSource = Join-Path $validTopology.Out 'build\e\src\vulkan-shaders-gen-build\CMakeFiles\CMakeScratch\TryCompile-Ab12Cd\CMakeLists.txt'
+    Assert-True (-not (Test-Path -LiteralPath $ephemeralWarningSource)) 'Canonical retry fixture unexpectedly depends on an ephemeral CMakeLists file.'
+
+    $otherCanonicalClassifierRoot = Join-Path $canonicalFixtureRoot 'other-target'
+    $emptyBuildEnvironment = Join-Path $canonicalFixtureRoot 'empty-environment'
+    New-Item -ItemType Directory -Path $otherCanonicalClassifierRoot | Out-Null
+    New-Item -ItemType Directory -Path $emptyBuildEnvironment | Out-Null
+
+    $reparseCanonicalClassifierRoot = Join-Path $canonicalFixtureRoot 'reparse-target'
+    $reparseCanonicalClassifierOutside = Join-Path $canonicalFixtureRoot 'reparse-outside'
+    $reparseBuildEnvironment = Join-Path $canonicalFixtureRoot 'reparse-environment'
+    New-Item -ItemType Directory -Path $reparseCanonicalClassifierRoot | Out-Null
+    New-Item -ItemType Directory -Path $reparseCanonicalClassifierOutside | Out-Null
+    New-Item -ItemType Junction -Path (Join-Path $reparseCanonicalClassifierRoot 'release') -Target $reparseCanonicalClassifierOutside | Out-Null
+    $null = New-TestCanonicalRetryTopology $reparseCanonicalClassifierRoot $reparseBuildEnvironment
+
+    $substitutionTarget = Join-Path $canonicalFixtureRoot 'substitution-target'
+    $substitutionEnvironment = Join-Path $canonicalFixtureRoot 'substitution-environment'
+    $substitutionTopology = New-TestCanonicalRetryTopology $substitutionTarget $substitutionEnvironment
+    $substitutionOutside = Join-Path $canonicalFixtureRoot 'substitution-outside'
+    New-Item -ItemType Directory -Path $substitutionOutside | Out-Null
+    Remove-Item -LiteralPath $substitutionTopology.Link -Force
+    New-Item -ItemType Junction -Path $substitutionTopology.Link -Target $substitutionOutside | Out-Null
+
+    $multipleTarget = Join-Path $canonicalFixtureRoot 'multiple-target'
+    $multipleEnvironment = Join-Path $canonicalFixtureRoot 'multiple-environment'
+    $multipleTopology = New-TestCanonicalRetryTopology $multipleTarget $multipleEnvironment
+    New-Item -ItemType Junction -Path (Join-Path $multipleTopology.Tcs 'aaaaaaaaaaaaaaaa') -Target $multipleTopology.Out | Out-Null
+
+    $wrongTypeTarget = Join-Path $canonicalFixtureRoot 'wrong-type-target'
+    $wrongTypeEnvironment = Join-Path $canonicalFixtureRoot 'wrong-type-environment'
+    $wrongTypeOut = Join-Path $wrongTypeTarget 'release\build\transcribe-cpp-sys-0123456789abcdef\out'
+    New-Item -ItemType Directory -Path $wrongTypeOut -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $wrongTypeEnvironment 'tcs\0123456789abcdef') -Force | Out-Null
+
+    $wrongLeafTarget = Join-Path $canonicalFixtureRoot 'wrong-leaf-target'
+    $wrongLeafEnvironment = Join-Path $canonicalFixtureRoot 'wrong-leaf-environment'
+    $wrongLeafOut = Join-Path $wrongLeafTarget 'release\build\transcribe-cpp-sys-0123456789abcdef\out'
+    New-Item -ItemType Directory -Path $wrongLeafOut -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $wrongLeafEnvironment 'tcs') -Force | Out-Null
+    New-Item -ItemType Junction -Path (Join-Path $wrongLeafEnvironment 'tcs\aaaaaaaaaaaaaaaa') -Target $wrongLeafOut | Out-Null
+
+    $wrongOutTarget = Join-Path $canonicalFixtureRoot 'wrong-out-target'
+    $wrongOutEnvironment = Join-Path $canonicalFixtureRoot 'wrong-out-environment'
+    $wrongExpectedOut = Join-Path $wrongOutTarget 'release\build\transcribe-cpp-sys-0123456789abcdef\out'
+    $wrongActualOut = Join-Path $canonicalFixtureRoot 'wrong-actual-out'
+    New-Item -ItemType Directory -Path $wrongExpectedOut -Force | Out-Null
+    New-Item -ItemType Directory -Path $wrongActualOut | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $wrongOutEnvironment 'tcs') -Force | Out-Null
+    New-Item -ItemType Junction -Path (Join-Path $wrongOutEnvironment 'tcs\0123456789abcdef') -Target $wrongActualOut | Out-Null
+
+    $reparseTcsTarget = Join-Path $canonicalFixtureRoot 'reparse-tcs-target'
+    $reparseTcsEnvironment = Join-Path $canonicalFixtureRoot 'reparse-tcs-environment'
+    $reparseTcsOutside = Join-Path $canonicalFixtureRoot 'reparse-tcs-outside'
+    $reparseTcsOut = Join-Path $reparseTcsTarget 'release\build\transcribe-cpp-sys-0123456789abcdef\out'
+    New-Item -ItemType Directory -Path $reparseTcsOut -Force | Out-Null
+    New-Item -ItemType Directory -Path $reparseTcsEnvironment | Out-Null
+    New-Item -ItemType Directory -Path $reparseTcsOutside | Out-Null
+    New-Item -ItemType Junction -Path (Join-Path $reparseTcsEnvironment 'tcs') -Target $reparseTcsOutside | Out-Null
+    New-Item -ItemType Junction -Path (Join-Path $reparseTcsOutside '0123456789abcdef') -Target $reparseTcsOut | Out-Null
+
     $capturedCanonicalCargoTargetFailure = [Collections.Generic.List[object]]::new()
     foreach ($index in 1..157) {
         $line = switch ($index) {
@@ -246,13 +318,18 @@ try {
         Assert-True (
             Test-ScribeGpuWorkerKnownCmakeBootstrapFailure `
                 -Output $diagnostic `
-                -CargoTarget $canonicalClassifierRoot
+                -CargoTarget $canonicalClassifierRoot `
+                -BuildEnvironment $canonicalBuildEnvironment
         ) 'Full captured-order canonical Cargo-target CMake diagnostic was not classified.'
     }
-    foreach ($cargoTarget in @($canonicalClassifierRoot, $otherCanonicalClassifierRoot)) {
+    foreach ($topology in @(
+        @($canonicalClassifierRoot, $canonicalBuildEnvironment),
+        @($otherCanonicalClassifierRoot, $emptyBuildEnvironment)
+    )) {
         Assert-True (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure `
             -Output $unboundTcsSuccessfulJunctionFailure `
-            -CargoTarget $cargoTarget)) 'A free-standing tcs warning source was classified with an unrelated Cargo target.'
+            -CargoTarget $topology[0] `
+            -BuildEnvironment $topology[1])) 'A free-standing tcs warning source was classified with unrelated active roots.'
     }
 
     $reorderedCanonicalCargoTargetFailure = [Collections.Generic.List[object]]::new($capturedCanonicalCargoTargetFailure)
@@ -260,17 +337,24 @@ try {
     $reorderedCanonicalCargoTargetFailure[80] = $canonicalCargoTargetFailure[1]
     Assert-True (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure `
         -Output ($reorderedCanonicalCargoTargetFailure -join "`r`n") `
-        -CargoTarget $canonicalClassifierRoot)) 'Reordered canonical Cargo-target diagnostic was classified.'
+        -CargoTarget $canonicalClassifierRoot `
+        -BuildEnvironment $canonicalBuildEnvironment)) 'Reordered canonical Cargo-target diagnostic was classified.'
 
     foreach ($missingIndex in @(0, 1, 2, 3)) {
         $missingStep = @($canonicalCargoTargetFailure | Where-Object { $_ -cne $canonicalCargoTargetFailure[$missingIndex] })
         Assert-True (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure `
             -Output ($missingStep -join "`n") `
-            -CargoTarget $canonicalClassifierRoot)) "Canonical Cargo-target diagnostic missing step $missingIndex was classified."
+            -CargoTarget $canonicalClassifierRoot `
+            -BuildEnvironment $canonicalBuildEnvironment)) "Canonical Cargo-target diagnostic missing step $missingIndex was classified."
     }
     Assert-True (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure `
         -Output $canonicalCargoTargetFailure `
-        -CargoTarget $otherCanonicalClassifierRoot)) 'A canonical warning from a different Cargo target was classified.'
+        -CargoTarget $otherCanonicalClassifierRoot `
+        -BuildEnvironment $canonicalBuildEnvironment)) 'A canonical warning from a different Cargo target was classified.'
+    Assert-True (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure `
+        -Output $canonicalCargoTargetFailure `
+        -CargoTarget $canonicalClassifierRoot `
+        -BuildEnvironment $emptyBuildEnvironment)) 'A canonical warning with a missing tcs inventory was classified.'
     Assert-True (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure `
         -Output $canonicalCargoTargetFailure)) 'A canonical Cargo-target warning was classified without its target identity.'
     $traversalWarningSource = "$($canonicalClassifierRoot.Replace('\', '/'))/release/build/../build/transcribe-cpp-sys-0123456789abcdef/out/build/e/src/vulkan-shaders-gen-build/CMakeFiles/CMakeScratch/TryCompile-Ab12Cd/CMakeLists.txt"
@@ -294,31 +378,36 @@ try {
     )) {
         Assert-True (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure `
             -Output ($malformedCanonicalCargoTargetFailure -join "`r`n") `
-            -CargoTarget $canonicalClassifierRoot)) 'Malformed canonical Cargo-target signature was classified.'
+            -CargoTarget $canonicalClassifierRoot `
+            -BuildEnvironment $canonicalBuildEnvironment)) 'Malformed canonical Cargo-target signature was classified.'
     }
 
-    New-Item -ItemType Junction -Path (Join-Path $reparseCanonicalClassifierRoot 'release') -Target $reparseCanonicalClassifierOutside | Out-Null
-    $reparseCanonicalCargoTargetFailure = @(New-TestCanonicalCargoTargetFailure $reparseCanonicalClassifierRoot)
-    Assert-True (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure `
-        -Output $reparseCanonicalCargoTargetFailure `
-        -CargoTarget $reparseCanonicalClassifierRoot)) 'A canonical Cargo-target warning through a reparse point was classified.'
+    foreach ($invalidTopology in @(
+        @($reparseCanonicalClassifierRoot, $reparseBuildEnvironment, 'reparse OUT_DIR'),
+        @($substitutionTarget, $substitutionEnvironment, 'substituted junction target'),
+        @($multipleTarget, $multipleEnvironment, 'multiple tcs inventory'),
+        @($wrongTypeTarget, $wrongTypeEnvironment, 'wrong-type tcs entry'),
+        @($wrongLeafTarget, $wrongLeafEnvironment, 'wrong-hash tcs leaf'),
+        @($wrongOutTarget, $wrongOutEnvironment, 'wrong OUT_DIR junction target'),
+        @($reparseTcsTarget, $reparseTcsEnvironment, 'reparse tcs inventory')
+    )) {
+        $invalidTopologyDiagnostic = @(New-TestCanonicalCargoTargetFailure $invalidTopology[0])
+        Assert-True (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure `
+            -Output $invalidTopologyDiagnostic `
+            -CargoTarget $invalidTopology[0] `
+            -BuildEnvironment $invalidTopology[1])) "Canonical diagnostic with $($invalidTopology[2]) was classified."
+    }
 
     $overlongCanonicalCargoTargetFailure = [Collections.Generic.List[object]]::new()
     foreach ($unused in 1..2048) { $overlongCanonicalCargoTargetFailure.Add('noise') }
     foreach ($line in $canonicalCargoTargetFailure) { $overlongCanonicalCargoTargetFailure.Add($line) }
     Assert-True (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure `
         -Output $overlongCanonicalCargoTargetFailure.ToArray() `
-        -CargoTarget $canonicalClassifierRoot)) 'Overlong canonical Cargo-target output was classified.'
+        -CargoTarget $canonicalClassifierRoot `
+        -BuildEnvironment $canonicalBuildEnvironment)) 'Overlong canonical Cargo-target output was classified.'
 }
 finally {
-    foreach ($root in @(
-        $canonicalClassifierRoot,
-        $otherCanonicalClassifierRoot,
-        $reparseCanonicalClassifierRoot,
-        $reparseCanonicalClassifierOutside
-    )) {
-        Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
-    }
+    Remove-Item -LiteralPath $canonicalFixtureRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
 $builderTokens = $null
 $builderParseErrors = $null
@@ -367,7 +456,12 @@ $workerBuildRetryStatement = $workerBuildRetryStatements[0]
 Assert-True ($workerBuildRetryStatement.Extent.Text -cnotmatch 'while\s*\(') 'Worker-build retry wrapper became an unbounded retry loop.'
 Assert-True (-not $workerBuildRetryStatement.Extent.Text.Contains($captureOverflowOptIn)) 'Worker-build retry path gained diagnostic capture overflow tolerance.'
 
-function Invoke-WorkerBuildRetryHarness([string]$Diagnostic, [bool]$FailRetry, [string]$CargoTarget) {
+function Invoke-WorkerBuildRetryHarness(
+    [string]$Diagnostic,
+    [bool]$FailRetry,
+    [string]$CargoTarget,
+    [string]$BuildEnvironment
+) {
     $state = [pscustomobject]@{
         NativeInvocations = 0
         JunctionInvocations = 0
@@ -402,7 +496,7 @@ function Invoke-WorkerBuildRetryHarness([string]$Diagnostic, [bool]$FailRetry, [
     $cargo = 'synthetic-cargo.exe'
     $workerBuildArguments = @('build')
     $Backend = 'Vulkan'
-    $shortBuild = [pscustomobject]@{ BuildEnvironment = 'C:\safe\env' }
+    $shortBuild = [pscustomobject]@{ BuildEnvironment = $BuildEnvironment }
     $cargoTarget = $CargoTarget
     $failure = $null
     $previousWarningPreference = $WarningPreference
@@ -423,33 +517,41 @@ function Invoke-WorkerBuildRetryHarness([string]$Diagnostic, [bool]$FailRetry, [
     }
 }
 
-$builderRetryTarget = Join-Path ([IO.Path]::GetTempPath()) "scribe-builder-retry-$([guid]::NewGuid().ToString('N'))"
-$builderWrongRetryTarget = Join-Path ([IO.Path]::GetTempPath()) "scribe-builder-wrong-retry-$([guid]::NewGuid().ToString('N'))"
+$builderRetryRoot = Join-Path ([IO.Path]::GetTempPath()) "scribe-builder-retry-$([guid]::NewGuid().ToString('N'))"
 try {
-    New-Item -ItemType Directory -Path $builderRetryTarget | Out-Null
+    New-Item -ItemType Directory -Path $builderRetryRoot | Out-Null
+    $builderRetryTarget = Join-Path $builderRetryRoot 'target'
+    $builderRetryEnvironment = Join-Path $builderRetryRoot 'environment'
+    $builderWrongRetryTarget = Join-Path $builderRetryRoot 'wrong-target'
+    $builderWrongRetryEnvironment = Join-Path $builderRetryRoot 'wrong-environment'
+    $null = New-TestCanonicalRetryTopology $builderRetryTarget $builderRetryEnvironment
     New-Item -ItemType Directory -Path $builderWrongRetryTarget | Out-Null
+    New-Item -ItemType Directory -Path $builderWrongRetryEnvironment | Out-Null
     $builderCanonicalFailure = @(New-TestCanonicalCargoTargetFailure $builderRetryTarget)
-    $acceptedRetrySuccess = Invoke-WorkerBuildRetryHarness ($builderCanonicalFailure -join "`r`n") $false $builderRetryTarget
+    $acceptedRetrySuccess = Invoke-WorkerBuildRetryHarness ($builderCanonicalFailure -join "`r`n") $false $builderRetryTarget $builderRetryEnvironment
     Assert-True ($acceptedRetrySuccess.NativeInvocations -eq 2 -and
         $acceptedRetrySuccess.JunctionInvocations -eq 1 -and
         $null -eq $acceptedRetrySuccess.Failure) 'Accepted canonical Cargo-target signature did not invoke exactly one isolated retry.'
-    $acceptedRetryFailure = Invoke-WorkerBuildRetryHarness ($builderCanonicalFailure -join "`n") $true $builderRetryTarget
+    $acceptedRetryFailure = Invoke-WorkerBuildRetryHarness ($builderCanonicalFailure -join "`n") $true $builderRetryTarget $builderRetryEnvironment
     Assert-True ($acceptedRetryFailure.NativeInvocations -eq 2 -and
         $acceptedRetryFailure.JunctionInvocations -eq 1 -and
         $null -ne $acceptedRetryFailure.Failure -and
         $acceptedRetryFailure.Failure.Message -ceq 'synthetic retry failure') 'A failed isolated canonical retry was retried again or lost its failure.'
-    $rejectedRetry = Invoke-WorkerBuildRetryHarness ($builderCanonicalFailure -join "`r`n") $false $builderWrongRetryTarget
+    $rejectedRetry = Invoke-WorkerBuildRetryHarness ($builderCanonicalFailure -join "`r`n") $false $builderWrongRetryTarget $builderRetryEnvironment
     Assert-True ($rejectedRetry.NativeInvocations -eq 1 -and
         $rejectedRetry.JunctionInvocations -eq 0 -and
         $null -ne $rejectedRetry.Failure) 'A wrong-target canonical signature invoked the isolated retry.'
-    $unboundTcsRetry = Invoke-WorkerBuildRetryHarness ($unboundTcsSuccessfulJunctionFailure -join "`r`n") $false $builderRetryTarget
+    $wrongEnvironmentRetry = Invoke-WorkerBuildRetryHarness ($builderCanonicalFailure -join "`r`n") $false $builderRetryTarget $builderWrongRetryEnvironment
+    Assert-True ($wrongEnvironmentRetry.NativeInvocations -eq 1 -and
+        $wrongEnvironmentRetry.JunctionInvocations -eq 0 -and
+        $null -ne $wrongEnvironmentRetry.Failure) 'A canonical signature with the wrong build environment invoked the isolated retry.'
+    $unboundTcsRetry = Invoke-WorkerBuildRetryHarness ($unboundTcsSuccessfulJunctionFailure -join "`r`n") $false $builderRetryTarget $builderRetryEnvironment
     Assert-True ($unboundTcsRetry.NativeInvocations -eq 1 -and
         $unboundTcsRetry.JunctionInvocations -eq 0 -and
         $null -ne $unboundTcsRetry.Failure) 'A free-standing tcs warning source invoked the isolated retry.'
 }
 finally {
-    Remove-Item -LiteralPath $builderRetryTarget -Recurse -Force -ErrorAction SilentlyContinue
-    Remove-Item -LiteralPath $builderWrongRetryTarget -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $builderRetryRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
 $nativeProcessHarness = Join-Path ([System.IO.Path]::GetTempPath()) "scribe-native-process-retry-$([guid]::NewGuid().ToString('N')).ps1"
 try {

@@ -560,6 +560,37 @@ $runnerRetryFunction = $runnerAst.Find({
     $Ast.Name -ceq 'Invoke-ScribeEvidenceCargoWithCmakeRetry'
 }, $true)
 if ($null -eq $runnerRetryFunction) { throw 'Runner lost its Cargo retry function.' }
+$runnerBootstrapFunction = $runnerAst.Find({
+    param($Ast)
+    $Ast -is [Management.Automation.Language.FunctionDefinitionAst] -and
+    $Ast.Name -ceq 'Enable-ScribeEvidenceCmakeBootstrap'
+}, $true)
+if ($null -eq $runnerBootstrapFunction) { throw 'Runner lost its CMake bootstrap function.' }
+$runnerWithinFunction = $runnerAst.Find({
+    param($Ast)
+    $Ast -is [Management.Automation.Language.FunctionDefinitionAst] -and
+    $Ast.Name -ceq 'Test-ScribeEvidenceWithin'
+}, $true)
+if ($null -eq $runnerWithinFunction) { throw 'Runner lost its path-containment function.' }
+$bootstrapSource = $runnerBootstrapFunction.Extent.Text
+$bootstrapMutationChecks = @(
+    '$currentEntries = @(Get-ChildItem -LiteralPath $currentTcs.FullName -Force)',
+    '$currentOutLink = Get-Item -LiteralPath $outLink.FullName -Force',
+    '$currentOutLink.LinkType -cne ''Junction''',
+    '(Split-Path -Parent $currentOutLink.FullName) -cne $currentTcs.FullName',
+    '(Get-ScribeEvidencePhysicalDirectory ([string]@($currentOutLink.Target)[0]) ''CMake bootstrap out target'').FullName -cne $outItem.FullName',
+    '$currentBuild = Get-ScribeEvidencePhysicalDirectory $build ''CMake bootstrap build directory''',
+    'Assert-ScribeEvidenceNoReparseDescendants $currentBuild.FullName',
+    'Remove-Item -LiteralPath $build -Recurse -Force'
+)
+$previousBootstrapCheckIndex = -1
+foreach ($bootstrapMutationCheck in $bootstrapMutationChecks) {
+    $bootstrapCheckIndex = $bootstrapSource.IndexOf($bootstrapMutationCheck, [StringComparison]::Ordinal)
+    if ($bootstrapCheckIndex -le $previousBootstrapCheckIndex) {
+        throw "Runner CMake bootstrap lost ordered immediate pre-mutation proof: $bootstrapMutationCheck"
+    }
+    $previousBootstrapCheckIndex = $bootstrapCheckIndex
+}
 $runnerPinnedEnvironmentFunction = $runnerAst.Find({
     param($Ast)
     $Ast -is [Management.Automation.Language.FunctionDefinitionAst] -and
@@ -595,6 +626,112 @@ finally {
     Set-Item -LiteralPath Function:Restore-ScribeEvidenceProcessEnvironment -Value $originalRestoreFunction
     $env:SCRIBE_EVIDENCE_RESTORE_FAILURE_TEST = $previousRestoreFailureTest
 }
+. ([scriptblock]::Create($runnerWithinFunction.Extent.Text))
+. ([scriptblock]::Create($runnerBootstrapFunction.Extent.Text))
+$bootstrapRoot = Join-Path ([IO.Path]::GetTempPath()) ("scribe-evidence-bootstrap-$([guid]::NewGuid().ToString('N'))")
+$originalPhysicalDirectoryFunction = (Get-Command Get-ScribeEvidencePhysicalDirectory -CommandType Function).ScriptBlock
+try {
+    New-Item -ItemType Directory -Path $bootstrapRoot | Out-Null
+
+    $validCargoTarget = Join-Path $bootstrapRoot 'valid-target'
+    $validBuildEnvironment = Join-Path $bootstrapRoot 'valid-environment'
+    $validOut = Join-Path $validCargoTarget 'release\build\transcribe-cpp-sys-0123456789abcdef\out'
+    $validBuild = Join-Path $validOut 'build'
+    $validMarker = Join-Path $validBuild 'preserve-until-validated.txt'
+    $validTcs = Join-Path $validBuildEnvironment 'tcs'
+    New-Item -ItemType Directory -Path $validBuild -Force | Out-Null
+    New-Item -ItemType Directory -Path $validTcs -Force | Out-Null
+    [IO.File]::WriteAllText($validMarker, 'validated')
+    New-Item -ItemType Junction -Path (Join-Path $validTcs '0123456789abcdef') -Target $validOut | Out-Null
+    Enable-ScribeEvidenceCmakeBootstrap $validCargoTarget $validBuildEnvironment
+    $validBuildLink = Get-Item -LiteralPath $validBuild -Force
+    $validNative = (Get-Item -LiteralPath (Join-Path $validBuildEnvironment 'native') -Force).FullName
+    if (($validBuildLink.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0 -or
+        $validBuildLink.LinkType -cne 'Junction' -or
+        @($validBuildLink.Target).Count -ne 1 -or
+        (Get-Item -LiteralPath ([string]@($validBuildLink.Target)[0]) -Force).FullName -cne $validNative) {
+        throw 'Runner CMake bootstrap did not replace a validated physical build directory with the isolated junction.'
+    }
+
+    $substitutedCargoTarget = Join-Path $bootstrapRoot 'substituted-target'
+    $substitutedBuildEnvironment = Join-Path $bootstrapRoot 'substituted-environment'
+    $substitutedOut = Join-Path $substitutedCargoTarget 'release\build\transcribe-cpp-sys-1123456789abcdef\out'
+    $substitutedBuild = Join-Path $substitutedOut 'build'
+    $substitutedMarker = Join-Path $substitutedBuild 'must-survive.txt'
+    $substitutedTcs = Join-Path $substitutedBuildEnvironment 'tcs'
+    $outsideOut = Join-Path $bootstrapRoot 'outside-out'
+    New-Item -ItemType Directory -Path $substitutedBuild -Force | Out-Null
+    New-Item -ItemType Directory -Path $substitutedTcs -Force | Out-Null
+    New-Item -ItemType Directory -Path $outsideOut | Out-Null
+    [IO.File]::WriteAllText($substitutedMarker, 'preserve')
+    New-Item -ItemType Junction -Path (Join-Path $substitutedTcs '1123456789abcdef') -Target $outsideOut | Out-Null
+    $substitutionFailure = $null
+    try { Enable-ScribeEvidenceCmakeBootstrap $substitutedCargoTarget $substitutedBuildEnvironment } catch { $substitutionFailure = $_.Exception }
+    if ($null -eq $substitutionFailure -or -not (Test-Path -LiteralPath $substitutedMarker)) {
+        throw 'Runner CMake bootstrap did not reject substituted topology before deleting the physical build directory.'
+    }
+
+    $multipleCargoTarget = Join-Path $bootstrapRoot 'multiple-target'
+    $multipleBuildEnvironment = Join-Path $bootstrapRoot 'multiple-environment'
+    $multipleOut = Join-Path $multipleCargoTarget 'release\build\transcribe-cpp-sys-2123456789abcdef\out'
+    $multipleBuild = Join-Path $multipleOut 'build'
+    $multipleMarker = Join-Path $multipleBuild 'must-survive.txt'
+    $multipleTcs = Join-Path $multipleBuildEnvironment 'tcs'
+    New-Item -ItemType Directory -Path $multipleBuild -Force | Out-Null
+    New-Item -ItemType Directory -Path $multipleTcs -Force | Out-Null
+    [IO.File]::WriteAllText($multipleMarker, 'preserve')
+    New-Item -ItemType Junction -Path (Join-Path $multipleTcs '2123456789abcdef') -Target $multipleOut | Out-Null
+    New-Item -ItemType Junction -Path (Join-Path $multipleTcs '3123456789abcdef') -Target $multipleOut | Out-Null
+    $multipleFailure = $null
+    try { Enable-ScribeEvidenceCmakeBootstrap $multipleCargoTarget $multipleBuildEnvironment } catch { $multipleFailure = $_.Exception }
+    if ($null -eq $multipleFailure -or -not (Test-Path -LiteralPath $multipleMarker)) {
+        throw 'Runner CMake bootstrap did not reject multiple tcs entries before deleting the physical build directory.'
+    }
+
+    $changingCargoTarget = Join-Path $bootstrapRoot 'changing-target'
+    $changingBuildEnvironment = Join-Path $bootstrapRoot 'changing-environment'
+    $changingOut = Join-Path $changingCargoTarget 'release\build\transcribe-cpp-sys-4123456789abcdef\out'
+    $changingBuild = Join-Path $changingOut 'build'
+    $changingMarker = Join-Path $changingBuild 'must-survive.txt'
+    $changingTcs = Join-Path $changingBuildEnvironment 'tcs'
+    $changingLink = Join-Path $changingTcs '4123456789abcdef'
+    $changingOutside = Join-Path $bootstrapRoot 'changing-outside'
+    New-Item -ItemType Directory -Path $changingBuild -Force | Out-Null
+    New-Item -ItemType Directory -Path $changingTcs -Force | Out-Null
+    New-Item -ItemType Directory -Path $changingOutside | Out-Null
+    [IO.File]::WriteAllText($changingMarker, 'preserve')
+    New-Item -ItemType Junction -Path $changingLink -Target $changingOut | Out-Null
+    $script:BootstrapOriginalPhysicalDirectory = $originalPhysicalDirectoryFunction
+    $script:BootstrapChangingTcs = (Get-Item -LiteralPath $changingTcs -Force).FullName
+    $script:BootstrapChangingLink = (Get-Item -LiteralPath $changingLink -Force).FullName
+    $script:BootstrapChangingOutside = (Get-Item -LiteralPath $changingOutside -Force).FullName
+    $script:BootstrapTcsValidationCount = 0
+    Set-Item -LiteralPath Function:Get-ScribeEvidencePhysicalDirectory -Value {
+        param([string]$Path, [string]$Label)
+        $result = & $script:BootstrapOriginalPhysicalDirectory $Path $Label
+        if ($Label -ceq 'CMake bootstrap tcs inventory' -and
+            $result.FullName -ceq $script:BootstrapChangingTcs) {
+            $script:BootstrapTcsValidationCount++
+            if ($script:BootstrapTcsValidationCount -eq 2) {
+                Remove-Item -LiteralPath $script:BootstrapChangingLink -Force
+                New-Item -ItemType Junction -Path $script:BootstrapChangingLink -Target $script:BootstrapChangingOutside | Out-Null
+            }
+        }
+        return $result
+    }
+    $changingFailure = $null
+    try { Enable-ScribeEvidenceCmakeBootstrap $changingCargoTarget $changingBuildEnvironment } catch { $changingFailure = $_.Exception }
+    finally { Set-Item -LiteralPath Function:Get-ScribeEvidencePhysicalDirectory -Value $originalPhysicalDirectoryFunction }
+    if ($null -eq $changingFailure -or
+        $script:BootstrapTcsValidationCount -ne 2 -or
+        -not (Test-Path -LiteralPath $changingMarker)) {
+        throw 'Runner CMake bootstrap did not reject a deterministic topology substitution immediately before mutation.'
+    }
+}
+finally {
+    Set-Item -LiteralPath Function:Get-ScribeEvidencePhysicalDirectory -Value $originalPhysicalDirectoryFunction
+    Remove-Item -LiteralPath $bootstrapRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
 $runnerRetryHarness = Join-Path ([IO.Path]::GetTempPath()) ("scribe-evidence-runner-retry-$([guid]::NewGuid().ToString('N')).ps1")
 try {
     $runnerRetryHarnessTail = @'
@@ -606,11 +743,11 @@ function Enable-ScribeEvidenceCmakeBootstrap([string]$CargoTarget, [string]$Buil
 function ConvertTo-TestEncodedCommand([string]$Command) {
     return [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($Command))
 }
-function Invoke-TestRunnerFailure([string]$Command, [string]$CargoTarget) {
+function Invoke-TestRunnerFailure([string]$Command, [string]$CargoTarget, [string]$BuildEnvironment) {
     $script:BootstrapCount = 0
     $message = $null
     try {
-        Invoke-ScribeEvidenceCargoWithCmakeRetry @('-NoProfile', '-EncodedCommand', (ConvertTo-TestEncodedCommand $Command)) 'runner case failed.' $CargoTarget 'unused-environment'
+        Invoke-ScribeEvidenceCargoWithCmakeRetry @('-NoProfile', '-EncodedCommand', (ConvertTo-TestEncodedCommand $Command)) 'runner case failed.' $CargoTarget $BuildEnvironment
     }
     catch {
         $message = $_.Exception.Message
@@ -621,13 +758,23 @@ function Invoke-TestRunnerFailure([string]$Command, [string]$CargoTarget) {
 }
 
 $state = Join-Path ([IO.Path]::GetTempPath()) ("scribe-evidence-retry-state-$([guid]::NewGuid().ToString('N'))")
-$cargoTarget = Join-Path ([IO.Path]::GetTempPath()) ("scribe-evidence-retry-target-$([guid]::NewGuid().ToString('N'))")
-$wrongCargoTarget = Join-Path ([IO.Path]::GetTempPath()) ("scribe-evidence-retry-wrong-target-$([guid]::NewGuid().ToString('N'))")
+$retryRoot = Join-Path ([IO.Path]::GetTempPath()) ("scribe-evidence-retry-$([guid]::NewGuid().ToString('N'))")
 $previousState = $env:SCRIBE_EVIDENCE_RETRY_TEST_STATE
 try {
-    New-Item -ItemType Directory -Path $cargoTarget | Out-Null
+    New-Item -ItemType Directory -Path $retryRoot | Out-Null
+    $cargoTarget = Join-Path $retryRoot 'target'
+    $buildEnvironment = Join-Path $retryRoot 'environment'
+    $wrongCargoTarget = Join-Path $retryRoot 'wrong-target'
+    $wrongBuildEnvironment = Join-Path $retryRoot 'wrong-environment'
+    $out = Join-Path $cargoTarget 'release\build\transcribe-cpp-sys-0123456789abcdef\out'
+    $tcs = Join-Path $buildEnvironment 'tcs'
+    New-Item -ItemType Directory -Path $out -Force | Out-Null
+    New-Item -ItemType Directory -Path $tcs -Force | Out-Null
+    New-Item -ItemType Junction -Path (Join-Path $tcs '0123456789abcdef') -Target $out | Out-Null
     New-Item -ItemType Directory -Path $wrongCargoTarget | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $wrongBuildEnvironment 'tcs') -Force | Out-Null
     $canonicalWarningSource = Join-Path $cargoTarget 'release\build\transcribe-cpp-sys-0123456789abcdef\out\build\e\src\vulkan-shaders-gen-build\CMakeFiles\CMakeScratch\TryCompile-Ab12Cd\CMakeLists.txt'
+    if (Test-Path -LiteralPath $canonicalWarningSource) { throw 'Runner retry fixture unexpectedly depends on an ephemeral CMakeLists file.' }
     $canonicalWarningSource = $canonicalWarningSource.Replace('\', '/')
     $env:SCRIBE_EVIDENCE_RETRY_TEST_STATE = $state
     $highVolumeSplitRetry = @"
@@ -642,7 +789,7 @@ if (Test-Path -LiteralPath `$state) { exit 0 }
 [Console]::Error.WriteLine("LINK : fatal error LNK1104: cannot open file 'CMakeFiles\cmTC_1a2B3c.dir\intermediate.manifest'")
 exit 17
 "@
-    Invoke-ScribeEvidenceCargoWithCmakeRetry @('-NoProfile', '-EncodedCommand', (ConvertTo-TestEncodedCommand $highVolumeSplitRetry)) 'high-volume retry failed.' $cargoTarget 'unused-environment'
+    Invoke-ScribeEvidenceCargoWithCmakeRetry @('-NoProfile', '-EncodedCommand', (ConvertTo-TestEncodedCommand $highVolumeSplitRetry)) 'high-volume retry failed.' $cargoTarget $buildEnvironment
     if ($script:BootstrapCount -ne 1 -or -not (Test-Path -LiteralPath $state)) {
         throw 'Runner did not perform exactly one eligible high-volume split-stream retry.'
     }
@@ -672,7 +819,7 @@ exit 21
 exit 22
 "@
     )) {
-        Invoke-TestRunnerFailure $malformed $cargoTarget
+        Invoke-TestRunnerFailure $malformed $cargoTarget $buildEnvironment
     }
 
     $wrongTargetCanonical = @"
@@ -682,7 +829,8 @@ exit 22
 [Console]::Error.WriteLine("LINK : fatal error LNK1104: cannot open file 'CMakeFiles\cmTC_1a2B3c.dir\intermediate.manifest'")
 exit 18
 "@
-    Invoke-TestRunnerFailure $wrongTargetCanonical $wrongCargoTarget
+    Invoke-TestRunnerFailure $wrongTargetCanonical $wrongCargoTarget $buildEnvironment
+    Invoke-TestRunnerFailure $wrongTargetCanonical $cargoTarget $wrongBuildEnvironment
 
     $overflow = @"
 [Console]::Out.WriteLine('error: failed to run custom build command for ``transcribe-cpp-sys v0.1.3``')
@@ -691,7 +839,7 @@ exit 18
 [Console]::Error.Write('x' * 1025)
 exit 23
 "@
-    Invoke-TestRunnerFailure $overflow $cargoTarget
+    Invoke-TestRunnerFailure $overflow $cargoTarget $buildEnvironment
 
     Remove-Item -LiteralPath $state -Force
     $alwaysFail = @"
@@ -705,7 +853,7 @@ exit 29
     $script:BootstrapCount = 0
     $retryFailure = $null
     try {
-        Invoke-ScribeEvidenceCargoWithCmakeRetry @('-NoProfile', '-EncodedCommand', (ConvertTo-TestEncodedCommand $alwaysFail)) 'bounded retry failed.' $cargoTarget 'unused-environment'
+        Invoke-ScribeEvidenceCargoWithCmakeRetry @('-NoProfile', '-EncodedCommand', (ConvertTo-TestEncodedCommand $alwaysFail)) 'bounded retry failed.' $cargoTarget $buildEnvironment
     }
     catch {
         $retryFailure = $_.Exception.Message
@@ -719,8 +867,7 @@ exit 29
 finally {
     $env:SCRIBE_EVIDENCE_RETRY_TEST_STATE = $previousState
     Remove-Item -LiteralPath $state -Force -ErrorAction SilentlyContinue
-    Remove-Item -LiteralPath $cargoTarget -Recurse -Force -ErrorAction SilentlyContinue
-    Remove-Item -LiteralPath $wrongCargoTarget -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $retryRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
 Write-Output 'runner retry harness passed'
 '@

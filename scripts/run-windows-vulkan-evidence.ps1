@@ -193,12 +193,22 @@ function Enable-ScribeEvidenceCmakeBootstrap([string]$CargoTarget, [string]$Buil
             -not (Test-ScribeEvidenceWithin $currentOut.FullName $canonicalCargoTarget)) {
             throw 'CMake bootstrap topology changed before mutation.'
         }
+        $currentEntries = @(Get-ChildItem -LiteralPath $currentTcs.FullName -Force)
+        if ($currentEntries.Count -ne 1 -or
+            -not [string]::Equals($currentEntries[0].FullName, $outLink.FullName, [StringComparison]::OrdinalIgnoreCase)) {
+            throw 'CMake bootstrap out inventory changed before mutation.'
+        }
         $currentOutLink = Get-Item -LiteralPath $outLink.FullName -Force
-        if (($currentOutLink.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0 -or @($currentOutLink.Target).Count -ne 1 -or (Get-Item -LiteralPath @($currentOutLink.Target)[0] -Force).FullName -cne $outItem.FullName) {
+        if (($currentOutLink.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0 -or
+            -not $currentOutLink.PSIsContainer -or
+            $currentOutLink.LinkType -cne 'Junction' -or
+            @($currentOutLink.Target).Count -ne 1 -or
+            (Split-Path -Parent $currentOutLink.FullName) -cne $currentTcs.FullName -or
+            (Get-ScribeEvidencePhysicalDirectory ([string]@($currentOutLink.Target)[0]) 'CMake bootstrap out target').FullName -cne $outItem.FullName) {
             throw 'CMake bootstrap out junction changed before mutation.'
         }
-        $currentBuild = Get-Item -LiteralPath $build -Force
-        if (($currentBuild.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or -not $currentBuild.PSIsContainer -or (Split-Path -Parent $currentBuild.FullName) -cne $outItem.FullName) {
+        $currentBuild = Get-ScribeEvidencePhysicalDirectory $build 'CMake bootstrap build directory'
+        if ((Split-Path -Parent $currentBuild.FullName) -cne $outItem.FullName) {
             throw 'CMake bootstrap build topology changed before mutation.'
         }
         Assert-ScribeEvidenceNoReparseDescendants $currentBuild.FullName
@@ -221,7 +231,10 @@ function Invoke-ScribeEvidenceCargoWithCmakeRetry([string[]]$Arguments, [string]
     }
     catch {
         $diagnostic = @(Get-ScribeGpuWorkerNativeProcessRetryDiagnostic $_.Exception)
-        if (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure -Output $diagnostic -CargoTarget $CargoTarget)) {
+        if (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure `
+            -Output $diagnostic `
+            -CargoTarget $CargoTarget `
+            -BuildEnvironment $BuildEnvironment)) {
             throw $Failure
         }
     }
