@@ -220,7 +220,8 @@ function Test-ScribeGpuWorkerCanonicalCargoTargetWarningSource(
 function Test-ScribeGpuWorkerKnownCmakeBootstrapFailure(
     [object[]]$Output,
     [string]$CargoTarget,
-    [string]$BuildEnvironment
+    [string]$BuildEnvironment,
+    [switch]$AllowSuccessfulJunctionMixedSeparatorLink
 ) {
     $bounded = Get-ScribeGpuWorkerBoundedDiagnosticLines $Output
     if ($bounded.Exceeded) { return $false }
@@ -253,7 +254,11 @@ function Test-ScribeGpuWorkerKnownCmakeBootstrapFailure(
             continue
         }
         if ($state -eq 3 -and $objectPathLine.IsMatch($line)) { $state = 4; continue }
-        if ($state -eq 4 -and $linkLine.IsMatch($line)) { return $true }
+        if ($state -eq 4 -and
+            ($linkLine.IsMatch($line) -or
+             ($AllowSuccessfulJunctionMixedSeparatorLink -and $successfulJunctionLinkLine.IsMatch($line)))) {
+            return $true
+        }
     }
 
     # A successful transcribe-cpp short OUT_DIR junction is silent. Accept its
