@@ -290,6 +290,20 @@ try {
     New-Item -ItemType Directory -Path (Join-Path $noncanonicalLeafEnvironment 'tcs') -Force | Out-Null
     New-Item -ItemType Junction -Path (Join-Path $noncanonicalLeafEnvironment 'tcs\A8206A5E1A40DF03') -Target $noncanonicalLeafOut | Out-Null
 
+    $shortLeafTarget = Join-Path $canonicalFixtureRoot 'short-leaf-target'
+    $shortLeafEnvironment = Join-Path $canonicalFixtureRoot 'short-leaf-environment'
+    $shortLeafOut = Join-Path $shortLeafTarget 'release\build\transcribe-cpp-sys-0123456789abcdef\out'
+    New-Item -ItemType Directory -Path $shortLeafOut -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $shortLeafEnvironment 'tcs') -Force | Out-Null
+    New-Item -ItemType Junction -Path (Join-Path $shortLeafEnvironment 'tcs\a8206a5e1a40df0') -Target $shortLeafOut | Out-Null
+
+    $longLeafTarget = Join-Path $canonicalFixtureRoot 'long-leaf-target'
+    $longLeafEnvironment = Join-Path $canonicalFixtureRoot 'long-leaf-environment'
+    $longLeafOut = Join-Path $longLeafTarget 'release\build\transcribe-cpp-sys-0123456789abcdef\out'
+    New-Item -ItemType Directory -Path $longLeafOut -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $longLeafEnvironment 'tcs') -Force | Out-Null
+    New-Item -ItemType Junction -Path (Join-Path $longLeafEnvironment 'tcs\a8206a5e1a40df030') -Target $longLeafOut | Out-Null
+
     $wrongOutTarget = Join-Path $canonicalFixtureRoot 'wrong-out-target'
     $wrongOutEnvironment = Join-Path $canonicalFixtureRoot 'wrong-out-environment'
     $wrongExpectedOut = Join-Path $wrongOutTarget 'release\build\transcribe-cpp-sys-0123456789abcdef\out'
@@ -406,6 +420,8 @@ try {
         @($multipleTarget, $multipleEnvironment, 'multiple tcs inventory'),
         @($wrongTypeTarget, $wrongTypeEnvironment, 'wrong-type tcs entry'),
         @($noncanonicalLeafTarget, $noncanonicalLeafEnvironment, 'noncanonical tcs leaf'),
+        @($shortLeafTarget, $shortLeafEnvironment, '15-character lowercase-hex tcs leaf'),
+        @($longLeafTarget, $longLeafEnvironment, '17-character lowercase-hex tcs leaf'),
         @($wrongOutTarget, $wrongOutEnvironment, 'wrong OUT_DIR junction target'),
         @($reparseTcsTarget, $reparseTcsEnvironment, 'reparse tcs inventory')
     )) {
