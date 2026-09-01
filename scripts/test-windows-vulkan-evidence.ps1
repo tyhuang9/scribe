@@ -786,7 +786,7 @@ if (Test-Path -LiteralPath `$state) { exit 0 }
 [Console]::Error.WriteLine('CMake Warning in ${canonicalWarningSource}:')
 1..900 | ForEach-Object { [Console]::Error.WriteLine('bounded stderr noise') }
 [Console]::Error.WriteLine('  characters (see CMAKE_OBJECT_PATH_MAX). Object file')
-[Console]::Error.WriteLine("LINK : fatal error LNK1104: cannot open file 'CMakeFiles\cmTC_1a2B3c.dir\intermediate.manifest'")
+[Console]::Error.WriteLine("LINK : fatal error LNK1104: cannot open file 'CMakeFiles\cmTC_1a2B3c.dir/intermediate.manifest'")
 exit 17
 "@
     Invoke-ScribeEvidenceCargoWithCmakeRetry @('-NoProfile', '-EncodedCommand', (ConvertTo-TestEncodedCommand $highVolumeSplitRetry)) 'high-volume retry failed.' $cargoTarget $buildEnvironment
@@ -826,7 +826,7 @@ exit 22
 [Console]::Out.WriteLine('error: failed to run custom build command for ``transcribe-cpp-sys v0.1.3``')
 [Console]::Error.WriteLine('CMake Warning in ${canonicalWarningSource}:')
 [Console]::Error.WriteLine('  characters (see CMAKE_OBJECT_PATH_MAX). Object file')
-[Console]::Error.WriteLine("LINK : fatal error LNK1104: cannot open file 'CMakeFiles\cmTC_1a2B3c.dir\intermediate.manifest'")
+[Console]::Error.WriteLine("LINK : fatal error LNK1104: cannot open file 'CMakeFiles\cmTC_1a2B3c.dir/intermediate.manifest'")
 exit 18
 "@
     Invoke-TestRunnerFailure $wrongTargetCanonical $wrongCargoTarget $buildEnvironment

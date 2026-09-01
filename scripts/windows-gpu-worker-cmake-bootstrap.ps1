@@ -243,7 +243,7 @@ function Test-ScribeGpuWorkerKnownCmakeBootstrapFailure(
     $objectPathLine = [regex]::new('^.*CMAKE_OBJECT_PATH_MAX.*$', [Text.RegularExpressions.RegexOptions]::CultureInvariant)
     $successfulJunctionObjectPathLine = [regex]::new('^\s*characters \(see CMAKE_OBJECT_PATH_MAX\)\.\s+Object file\s*$', [Text.RegularExpressions.RegexOptions]::CultureInvariant)
     $linkLine = [regex]::new('^.*(?:LINK|link) : fatal error LNK1104: cannot open file ''CMakeFiles\\cmTC_[0-9A-Fa-f]+\.dir\\intermediate\.manifest''\s*$', [Text.RegularExpressions.RegexOptions]::CultureInvariant)
-    $successfulJunctionLinkLine = [regex]::new('^\s*LINK : fatal error LNK1104: cannot open file ''CMakeFiles\\cmTC_[0-9A-Fa-f]{1,64}\.dir\\intermediate\.manifest''\s*$', [Text.RegularExpressions.RegexOptions]::CultureInvariant)
+    $successfulJunctionLinkLine = [regex]::new('^\s*LINK : fatal error LNK1104: cannot open file ''CMakeFiles\\cmTC_[0-9A-Fa-f]{1,64}\.dir/intermediate\.manifest''\s*$', [Text.RegularExpressions.RegexOptions]::CultureInvariant)
     $state = 0
     foreach ($line in $lines) {
         if ($state -eq 0 -and $junctionLine.IsMatch($line)) { $state = 1; continue }

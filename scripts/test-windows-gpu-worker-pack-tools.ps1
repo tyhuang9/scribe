@@ -98,7 +98,7 @@ function New-TestCanonicalCargoTargetFailure(
         'error: failed to run custom build command for `transcribe-cpp-sys v0.1.3`',
         "CMake Warning in $($source.Replace('\', '/')):",
         '  characters (see CMAKE_OBJECT_PATH_MAX). Object file',
-        "LINK : fatal error LNK1104: cannot open file 'CMakeFiles\cmTC_1a2B3c.dir\intermediate.manifest'"
+        "LINK : fatal error LNK1104: cannot open file 'CMakeFiles\cmTC_1a2B3c.dir/intermediate.manifest'"
     )
 }
 
@@ -224,7 +224,7 @@ $unboundTcsSuccessfulJunctionFailure = @(
     'error: failed to run custom build command for `transcribe-cpp-sys v0.1.3`',
     'CMake Warning in C:/safe/env/tcs/0123456789abcdef/build/e/src/vulkan-shaders-gen-build/CMakeFiles/CMakeScratch/TryCompile-Ab12Cd/CMakeLists.txt:',
     '  characters (see CMAKE_OBJECT_PATH_MAX). Object file',
-    "LINK : fatal error LNK1104: cannot open file 'CMakeFiles\cmTC_1a2B3c.dir\intermediate.manifest'"
+    "LINK : fatal error LNK1104: cannot open file 'CMakeFiles\cmTC_1a2B3c.dir/intermediate.manifest'"
 )
 foreach ($diagnostic in @(
     ($unboundTcsSuccessfulJunctionFailure -join "`r`n"),
@@ -403,9 +403,13 @@ try {
         @($canonicalCargoTargetFailure[0], $canonicalCargoTargetFailure[1], '  characters (see CMAKE_NINJA_FORCE_RESPONSE_FILE). Object file', $canonicalCargoTargetFailure[3]),
         @($canonicalCargoTargetFailure[0], $canonicalCargoTargetFailure[1], 'unrelated note mentioning CMAKE_OBJECT_PATH_MAX', $canonicalCargoTargetFailure[3]),
         @($canonicalCargoTargetFailure[0], $canonicalCargoTargetFailure[1], $canonicalCargoTargetFailure[2], "LINK : fatal error LNK1104: cannot open file 'unrelated.manifest'"),
-        @($canonicalCargoTargetFailure[0], $canonicalCargoTargetFailure[1], $canonicalCargoTargetFailure[2], "LINK : fatal error LNK1104: cannot open file 'CMakeFiles\cmTC_1a2B3c.dir\intermediate.pdb'"),
-        @($canonicalCargoTargetFailure[0], $canonicalCargoTargetFailure[1], $canonicalCargoTargetFailure[2], "link : fatal error LNK1104: cannot open file 'CMakeFiles\cmTC_1a2B3c.dir\intermediate.manifest'"),
-        @($canonicalCargoTargetFailure[0], $canonicalCargoTargetFailure[1], $canonicalCargoTargetFailure[2], "unexpected prefix LINK : fatal error LNK1104: cannot open file 'CMakeFiles\cmTC_1a2B3c.dir\intermediate.manifest'"),
+        @($canonicalCargoTargetFailure[0], $canonicalCargoTargetFailure[1], $canonicalCargoTargetFailure[2], "LINK : fatal error LNK1104: cannot open file 'CMakeFiles\cmTC_1a2B3c.dir/intermediate.pdb'"),
+        @($canonicalCargoTargetFailure[0], $canonicalCargoTargetFailure[1], $canonicalCargoTargetFailure[2], "LINK : fatal error LNK1104: cannot open file 'CMakeFiles\cmTC_1a2B3c.dir\intermediate.manifest'"),
+        @($canonicalCargoTargetFailure[0], $canonicalCargoTargetFailure[1], $canonicalCargoTargetFailure[2], "LINK : fatal error LNK1104: cannot open file 'CMakeFiles/cmTC_1a2B3c.dir/intermediate.manifest'"),
+        @($canonicalCargoTargetFailure[0], $canonicalCargoTargetFailure[1], $canonicalCargoTargetFailure[2], "LINK : fatal error LNK1104: cannot open file 'CMakeFiles\cmTC_1a2B3c.dir/../intermediate.manifest'"),
+        @($canonicalCargoTargetFailure[0], $canonicalCargoTargetFailure[1], $canonicalCargoTargetFailure[2], "LINK : fatal error LNK1104: cannot open file 'CMakeFiles\cmTC_$('a' * 65).dir/intermediate.manifest'"),
+        @($canonicalCargoTargetFailure[0], $canonicalCargoTargetFailure[1], $canonicalCargoTargetFailure[2], "link : fatal error LNK1104: cannot open file 'CMakeFiles\cmTC_1a2B3c.dir/intermediate.manifest'"),
+        @($canonicalCargoTargetFailure[0], $canonicalCargoTargetFailure[1], $canonicalCargoTargetFailure[2], "unexpected prefix LINK : fatal error LNK1104: cannot open file 'CMakeFiles\cmTC_1a2B3c.dir/intermediate.manifest'"),
         @($canonicalCargoTargetFailure[0], $vulkanShortJunctionFailure[0], $canonicalCargoTargetFailure[1], $canonicalCargoTargetFailure[2], $canonicalCargoTargetFailure[3])
     )) {
         Assert-True (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure `
