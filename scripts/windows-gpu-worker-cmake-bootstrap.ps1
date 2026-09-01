@@ -215,7 +215,8 @@ function Test-ScribeGpuWorkerKnownCmakeBootstrapFailure([object[]]$Output) {
 function Invoke-ScribeGpuWorkerBoundedNativeProcess(
     [string]$Executable,
     [string[]]$Arguments,
-    [string]$FailureMessage
+    [string]$FailureMessage,
+    [switch]$AllowDiagnosticCaptureOverflowOnSuccessWithUnusedOutput
 ) {
     # Each stream is independently bounded. Both pipes continue to be drained
     # after overflow so a noisy child cannot deadlock while exiting.
@@ -287,6 +288,15 @@ function Invoke-ScribeGpuWorkerBoundedNativeProcess(
         $errorOutput = $stderrCapture.GetText()
         $captureExceeded = $stdoutCapture.Exceeded -or $stderrCapture.Exceeded
         if ($captureExceeded) {
+            if ($process.ExitCode -eq 0 -and $AllowDiagnosticCaptureOverflowOnSuccessWithUnusedOutput) {
+                # This opt-in is only for callers that treat exit code zero as
+                # authoritative and intentionally discard both output streams.
+                # Never expose a truncated prefix as if it were complete output.
+                return [pscustomobject]@{
+                    Stdout = ''
+                    Stderr = ''
+                }
+            }
             throw [ScribeGpuWorkerNativeProcessFailure]::new(
                 "$FailureMessage Child process output exceeded the bounded in-memory diagnostic capture.",
                 $process.ExitCode,

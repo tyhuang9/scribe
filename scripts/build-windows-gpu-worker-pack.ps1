@@ -144,9 +144,14 @@ function Resolve-ShortCargoTargetDirectory(
 function Invoke-NativeProcess(
     [string]$Executable,
     [string[]]$Arguments,
-    [string]$FailureMessage
+    [string]$FailureMessage,
+    [switch]$AllowDiagnosticCaptureOverflowOnSuccessWithUnusedOutput
 ) {
-    return Invoke-ScribeGpuWorkerBoundedNativeProcess $Executable $Arguments $FailureMessage
+    return Invoke-ScribeGpuWorkerBoundedNativeProcess `
+        $Executable `
+        $Arguments `
+        $FailureMessage `
+        -AllowDiagnosticCaptureOverflowOnSuccessWithUnusedOutput:$AllowDiagnosticCaptureOverflowOnSuccessWithUnusedOutput
 }
 
 function Get-NativeProcessRetryDiagnostic([System.Exception]$Failure) {
@@ -1277,7 +1282,8 @@ try {
         'build', '--locked', '--offline', '--release',
         '--bin', 'scribe-worker-pack-tool',
         '--manifest-path', $authoringManifestPath
-    ) 'Worker-pack authoring tool build failed.'
+    ) 'Worker-pack authoring tool build failed.' `
+        -AllowDiagnosticCaptureOverflowOnSuccessWithUnusedOutput
     $authoringTool = Join-Path $cargoTarget 'release\scribe-worker-pack-tool.exe'
     $null = Assert-RegularNonReparseFile $authoringTool 'Worker-pack authoring tool'
 

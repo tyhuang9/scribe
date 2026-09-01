@@ -274,6 +274,23 @@ $retryDiagnosticFunction = $builderAst.Find({
     $Ast.Name -ceq 'Get-NativeProcessRetryDiagnostic'
 }, $true)
 Assert-True ($null -ne $nativeProcessFunction -and $null -ne $retryDiagnosticFunction) 'Builder lost the native-process retry diagnostic functions.'
+$captureOverflowOptIn = 'AllowDiagnosticCaptureOverflowOnSuccessWithUnusedOutput'
+$captureOverflowOptInCalls = @($builderAst.FindAll({
+    param($Ast)
+    if ($Ast -isnot [System.Management.Automation.Language.CommandAst] -or
+        $Ast.GetCommandName() -cne 'Invoke-NativeProcess') {
+        return $false
+    }
+    return @($Ast.CommandElements | Where-Object {
+        $_ -is [System.Management.Automation.Language.CommandParameterAst] -and
+        $_.ParameterName -ceq $captureOverflowOptIn
+    }).Count -eq 1
+}, $true))
+Assert-True ($captureOverflowOptInCalls.Count -eq 1) 'Diagnostic capture overflow opt-in must annotate exactly one native-process invocation.'
+Assert-True (
+    $captureOverflowOptInCalls[0].Extent.Text.Contains("'--bin', 'scribe-worker-pack-tool'") -and
+    $captureOverflowOptInCalls[0].Extent.Text.Contains("'Worker-pack authoring tool build failed.'")
+) 'Diagnostic capture overflow opt-in escaped the unused-output worker-pack authoring-tool cargo build.'
 $workerBuildRetryStatements = @($builderAst.FindAll({
     param($Ast)
     $Ast -is [System.Management.Automation.Language.TryStatementAst] -and
@@ -283,6 +300,7 @@ $workerBuildRetryStatements = @($builderAst.FindAll({
 Assert-True ($workerBuildRetryStatements.Count -ge 1) 'Builder lost the validated worker-build retry wrapper.'
 $workerBuildRetryStatement = $workerBuildRetryStatements[0]
 Assert-True ($workerBuildRetryStatement.Extent.Text -cnotmatch 'while\s*\(') 'Worker-build retry wrapper became an unbounded retry loop.'
+Assert-True (-not $workerBuildRetryStatement.Extent.Text.Contains($captureOverflowOptIn)) 'Worker-build retry path gained diagnostic capture overflow tolerance.'
 
 function Invoke-WorkerBuildRetryHarness([string]$Diagnostic, [bool]$FailRetry) {
     $state = [pscustomobject]@{
@@ -441,6 +459,30 @@ try {
 catch {
     $earlyMarkersOverflowFailure = $_.Exception
 }
+$successfulOverflowCommand = "1..1025 | ForEach-Object { [Console]::Out.WriteLine('successful diagnostic noise') }; exit 0"
+$defaultSuccessfulOverflowFailure = $null
+try {
+    $null = Invoke-NativeProcess (Join-Path $PSHOME 'pwsh.exe') @('-NoProfile', '-Command', $successfulOverflowCommand) 'Default successful-overflow fixture failed.'
+}
+catch {
+    $defaultSuccessfulOverflowFailure = $_.Exception
+}
+$annotatedSuccessfulOverflow = Invoke-NativeProcess `
+    (Join-Path $PSHOME 'pwsh.exe') `
+    @('-NoProfile', '-Command', $successfulOverflowCommand) `
+    'Annotated successful-overflow fixture failed.' `
+    -AllowDiagnosticCaptureOverflowOnSuccessWithUnusedOutput
+$annotatedFailedOverflow = $null
+try {
+    $null = Invoke-NativeProcess `
+        (Join-Path $PSHOME 'pwsh.exe') `
+        @('-NoProfile', '-Command', "1..1025 | ForEach-Object { [Console]::Error.WriteLine('sensitive failed diagnostic noise') }; exit 47") `
+        'Annotated failed-overflow fixture failed.' `
+        -AllowDiagnosticCaptureOverflowOnSuccessWithUnusedOutput
+}
+catch {
+    $annotatedFailedOverflow = $_.Exception
+}
 [pscustomobject]@{
     SplitFailureType = $splitFailure.GetType().FullName
     SplitMessage = $splitFailure.Message
@@ -461,6 +503,15 @@ catch {
     HighVolumeClassified = Test-ScribeGpuWorkerKnownCmakeBootstrapFailure @(Get-NativeProcessRetryDiagnostic $highVolumeFailure)
     EarlyMarkersOverflowExceeded = $earlyMarkersOverflowFailure.CaptureExceeded
     EarlyMarkersOverflowClassified = Test-ScribeGpuWorkerKnownCmakeBootstrapFailure @(Get-NativeProcessRetryDiagnostic $earlyMarkersOverflowFailure)
+    DefaultSuccessfulOverflowExceeded = $defaultSuccessfulOverflowFailure.CaptureExceeded
+    DefaultSuccessfulOverflowClassified = Test-ScribeGpuWorkerKnownCmakeBootstrapFailure @(Get-NativeProcessRetryDiagnostic $defaultSuccessfulOverflowFailure)
+    AnnotatedSuccessfulOverflowReturned = $null -ne $annotatedSuccessfulOverflow
+    AnnotatedSuccessfulOverflowStdout = $annotatedSuccessfulOverflow.Stdout
+    AnnotatedSuccessfulOverflowStderr = $annotatedSuccessfulOverflow.Stderr
+    AnnotatedFailedOverflowExceeded = $annotatedFailedOverflow.CaptureExceeded
+    AnnotatedFailedOverflowExitCode = $annotatedFailedOverflow.ExitCode
+    AnnotatedFailedOverflowMessage = $annotatedFailedOverflow.Message
+    AnnotatedFailedOverflowClassified = Test-ScribeGpuWorkerKnownCmakeBootstrapFailure @(Get-NativeProcessRetryDiagnostic $annotatedFailedOverflow)
 } | ConvertTo-Json -Compress
 '@
     [System.IO.File]::WriteAllText(
@@ -491,6 +542,16 @@ catch {
     Assert-True ($nativeProcessResult.CharacterBudgetExceeded -and -not $nativeProcessResult.CharacterBudgetClassified) 'The per-stream character budget was not enforced as a non-retryable overflow.'
     Assert-True $nativeProcessResult.HighVolumeClassified 'High-volume split-stream output was not drained and classified deterministically.'
     Assert-True ($nativeProcessResult.EarlyMarkersOverflowExceeded -and -not $nativeProcessResult.EarlyMarkersOverflowClassified) 'Valid early markers remained retryable after a later capture overflow.'
+    Assert-True ($nativeProcessResult.DefaultSuccessfulOverflowExceeded -and -not $nativeProcessResult.DefaultSuccessfulOverflowClassified) 'An ordinary successful child escaped fail-closed diagnostic capture overflow handling.'
+    Assert-True ($nativeProcessResult.AnnotatedSuccessfulOverflowReturned -and
+        [string]::IsNullOrEmpty($nativeProcessResult.AnnotatedSuccessfulOverflowStdout) -and
+        [string]::IsNullOrEmpty($nativeProcessResult.AnnotatedSuccessfulOverflowStderr)) 'The annotated unused-output success did not tolerate overflow without exposing truncated output.'
+    Assert-True ($nativeProcessResult.AnnotatedFailedOverflowExceeded -and
+        $nativeProcessResult.AnnotatedFailedOverflowExitCode -eq 47 -and
+        $nativeProcessResult.AnnotatedFailedOverflowMessage.Contains('Child process output exceeded the bounded in-memory diagnostic capture') -and
+        $nativeProcessResult.AnnotatedFailedOverflowMessage.Length -le 256 -and
+        -not $nativeProcessResult.AnnotatedFailedOverflowMessage.Contains('sensitive failed diagnostic noise') -and
+        -not $nativeProcessResult.AnnotatedFailedOverflowClassified) 'Annotated nonzero overflow was not a bounded, sanitized, retry-ineligible failure.'
 }
 finally {
     Remove-Item -LiteralPath $nativeProcessHarness -Force -ErrorAction SilentlyContinue
