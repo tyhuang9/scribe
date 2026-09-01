@@ -168,8 +168,11 @@ function Test-ScribeGpuWorkerKnownCmakeBootstrapFailure([object[]]$Output) {
 
     $junctionLine = [regex]::new('^.*transcribe-cpp-sys: could not create short build junction .+; building in OUT_DIR \(may exceed Windows MAX_PATH in deep checkouts\)\s*$', [Text.RegularExpressions.RegexOptions]::CultureInvariant)
     $warningSourceLine = [regex]::new('^.*vulkan-shaders-gen.*$', [Text.RegularExpressions.RegexOptions]::CultureInvariant)
+    $successfulJunctionWarningSourceLine = [regex]::new('^\s*CMake Warning in [A-Za-z]:[\\/].*[\\/]tcs[\\/][0-9A-Fa-f]{16}[\\/]build[\\/]e[\\/]src[\\/]vulkan-shaders-gen-build[\\/]CMakeFiles[\\/]CMakeScratch[\\/]TryCompile-[A-Za-z0-9_-]+[\\/]CMakeLists\.txt:\s*$', [Text.RegularExpressions.RegexOptions]::CultureInvariant)
     $objectPathLine = [regex]::new('^.*CMAKE_OBJECT_PATH_MAX.*$', [Text.RegularExpressions.RegexOptions]::CultureInvariant)
+    $successfulJunctionObjectPathLine = [regex]::new('^\s*characters \(see CMAKE_OBJECT_PATH_MAX\)\.\s+Object file\s*$', [Text.RegularExpressions.RegexOptions]::CultureInvariant)
     $linkLine = [regex]::new('^.*(?:LINK|link) : fatal error LNK1104: cannot open file ''CMakeFiles\\cmTC_[0-9A-Fa-f]+\.dir\\intermediate\.manifest''\s*$', [Text.RegularExpressions.RegexOptions]::CultureInvariant)
+    $successfulJunctionLinkLine = [regex]::new('^\s*LINK : fatal error LNK1104: cannot open file ''CMakeFiles\\cmTC_[0-9A-Fa-f]+\.dir\\intermediate\.manifest''\s*$', [Text.RegularExpressions.RegexOptions]::CultureInvariant)
     $state = 0
     foreach ($line in $lines) {
         if ($state -eq 0 -and $junctionLine.IsMatch($line)) { $state = 1; continue }
@@ -180,6 +183,31 @@ function Test-ScribeGpuWorkerKnownCmakeBootstrapFailure([object[]]$Output) {
         }
         if ($state -eq 3 -and $objectPathLine.IsMatch($line)) { $state = 4; continue }
         if ($state -eq 4 -and $linkLine.IsMatch($line)) { return $true }
+    }
+
+    # A successful transcribe-cpp short OUT_DIR junction is silent. Its use is
+    # evidenced by the exact tcs/<hash>/build/e nested CMake warning source.
+    # Reject this signature if the bounded diagnostic contains any fallback
+    # warning: that case is accepted only by the separately ordered signature
+    # above, where the warning must precede the crate failure.
+    foreach ($line in $lines) {
+        if ($junctionLine.IsMatch($line)) { return $false }
+    }
+    $successfulJunctionState = 0
+    foreach ($line in $lines) {
+        if ($successfulJunctionState -eq 0 -and $crateLine.IsMatch($line)) {
+            $successfulJunctionState = 1
+            continue
+        }
+        if ($successfulJunctionState -eq 1 -and $successfulJunctionWarningSourceLine.IsMatch($line)) {
+            $successfulJunctionState = 2
+            continue
+        }
+        if ($successfulJunctionState -eq 2 -and $successfulJunctionObjectPathLine.IsMatch($line)) {
+            $successfulJunctionState = 3
+            continue
+        }
+        if ($successfulJunctionState -eq 3 -and $successfulJunctionLinkLine.IsMatch($line)) { return $true }
     }
     return $false
 }

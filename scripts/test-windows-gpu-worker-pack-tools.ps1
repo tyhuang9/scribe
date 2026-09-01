@@ -185,6 +185,76 @@ $overlongVulkanShortJunctionFailure = [System.Collections.Generic.List[object]]:
 foreach ($unused in 1..2048) { $overlongVulkanShortJunctionFailure.Add('noise') }
 foreach ($line in $vulkanShortJunctionFailure) { $overlongVulkanShortJunctionFailure.Add($line) }
 if (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure $overlongVulkanShortJunctionFailure.ToArray()) { throw 'Overlong Vulkan CMake output was classified outside the bounded window.' }
+$vulkanSuccessfulJunctionFailure = @(
+    'error: failed to run custom build command for `transcribe-cpp-sys v0.1.3`',
+    'CMake Warning in C:/safe/env/tcs/0123456789abcdef/build/e/src/vulkan-shaders-gen-build/CMakeFiles/CMakeScratch/TryCompile-Ab12Cd/CMakeLists.txt:',
+    '  characters (see CMAKE_OBJECT_PATH_MAX). Object file',
+    "LINK : fatal error LNK1104: cannot open file 'CMakeFiles\cmTC_1a2B3c.dir\intermediate.manifest'"
+)
+$capturedVulkanSuccessfulJunctionFailure = [System.Collections.Generic.List[object]]::new()
+foreach ($index in 1..157) {
+    $line = switch ($index) {
+        4 { $vulkanSuccessfulJunctionFailure[0] }
+        62 { $vulkanSuccessfulJunctionFailure[1] }
+        81 { $vulkanSuccessfulJunctionFailure[2] }
+        129 { $vulkanSuccessfulJunctionFailure[3] }
+        default { 'sanitized successful-junction Cargo/CMake diagnostic output' }
+    }
+    $capturedVulkanSuccessfulJunctionFailure.Add($line)
+}
+foreach ($diagnostic in @(
+    ($capturedVulkanSuccessfulJunctionFailure -join "`r`n"),
+    ($capturedVulkanSuccessfulJunctionFailure -join "`n")
+)) {
+    if (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure $diagnostic)) {
+        throw 'Full captured-order successful-junction Vulkan CMake diagnostic was not classified.'
+    }
+}
+$reorderedVulkanSuccessfulJunctionFailure = [System.Collections.Generic.List[object]]::new($capturedVulkanSuccessfulJunctionFailure)
+$reorderedVulkanSuccessfulJunctionFailure[61] = $vulkanSuccessfulJunctionFailure[2]
+$reorderedVulkanSuccessfulJunctionFailure[80] = $vulkanSuccessfulJunctionFailure[1]
+if (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure ($reorderedVulkanSuccessfulJunctionFailure -join "`r`n")) {
+    throw 'Reordered successful-junction Vulkan CMake diagnostic was classified.'
+}
+foreach ($missingIndex in @(0, 1, 2, 3)) {
+    $missingStep = @($vulkanSuccessfulJunctionFailure | Where-Object { $_ -cne $vulkanSuccessfulJunctionFailure[$missingIndex] })
+    if (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure ($missingStep -join "`n")) {
+        throw "Successful-junction Vulkan CMake diagnostic missing step $missingIndex was classified."
+    }
+}
+foreach ($malformedVulkanSuccessfulJunctionFailure in @(
+    @('error: failed to run custom build command for `transcribe-cpp-sys v0.1.4`', $vulkanSuccessfulJunctionFailure[1], $vulkanSuccessfulJunctionFailure[2], $vulkanSuccessfulJunctionFailure[3]),
+    @($vulkanSuccessfulJunctionFailure[0], 'CMake Warning in C:\safe\env\tcs\0123456789abcdef\build\e\src\cuda-shaders-gen-build\CMakeFiles\CMakeScratch\TryCompile-Ab12Cd\CMakeLists.txt:', $vulkanSuccessfulJunctionFailure[2], $vulkanSuccessfulJunctionFailure[3]),
+    @($vulkanSuccessfulJunctionFailure[0], 'CMake Warning in C:\safe\env\cache\0123456789abcdef\build\e\src\vulkan-shaders-gen-build\CMakeFiles\CMakeScratch\TryCompile-Ab12Cd\CMakeLists.txt:', $vulkanSuccessfulJunctionFailure[2], $vulkanSuccessfulJunctionFailure[3]),
+    @($vulkanSuccessfulJunctionFailure[0], 'CMake Warning in C:\safe\env\tcs\0123456789abcde\build\e\src\vulkan-shaders-gen-build\CMakeFiles\CMakeScratch\TryCompile-Ab12Cd\CMakeLists.txt:', $vulkanSuccessfulJunctionFailure[2], $vulkanSuccessfulJunctionFailure[3]),
+    @($vulkanSuccessfulJunctionFailure[0], $vulkanSuccessfulJunctionFailure[1], '  characters (see CMAKE_NINJA_FORCE_RESPONSE_FILE). Object file', $vulkanSuccessfulJunctionFailure[3]),
+    @($vulkanSuccessfulJunctionFailure[0], $vulkanSuccessfulJunctionFailure[1], 'unrelated note mentioning CMAKE_OBJECT_PATH_MAX', $vulkanSuccessfulJunctionFailure[3]),
+    @($vulkanSuccessfulJunctionFailure[0], $vulkanSuccessfulJunctionFailure[1], $vulkanSuccessfulJunctionFailure[2], "LINK : fatal error LNK1104: cannot open file 'CMakeFiles\cmTC_xyz.dir\intermediate.manifest'"),
+    @($vulkanSuccessfulJunctionFailure[0], $vulkanSuccessfulJunctionFailure[1], $vulkanSuccessfulJunctionFailure[2], "LINK : fatal error LNK1104: cannot open file 'CMakeFiles\cmTC_1a2B3c.dir\intermediate.pdb'"),
+    @($vulkanSuccessfulJunctionFailure[0], $vulkanSuccessfulJunctionFailure[1], $vulkanSuccessfulJunctionFailure[2], "link : fatal error LNK1104: cannot open file 'CMakeFiles\cmTC_1a2B3c.dir\intermediate.manifest'"),
+    @($vulkanSuccessfulJunctionFailure[0], $vulkanSuccessfulJunctionFailure[1], $vulkanSuccessfulJunctionFailure[2], "unexpected prefix LINK : fatal error LNK1104: cannot open file 'CMakeFiles\cmTC_1a2B3c.dir\intermediate.manifest'"),
+    @($vulkanSuccessfulJunctionFailure[0], $vulkanShortJunctionFailure[0], $vulkanSuccessfulJunctionFailure[1], $vulkanSuccessfulJunctionFailure[2], $vulkanSuccessfulJunctionFailure[3])
+)) {
+    if (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure ($malformedVulkanSuccessfulJunctionFailure -join "`r`n")) {
+        throw 'Malformed successful-junction Vulkan CMake signature was classified.'
+    }
+}
+$overlongSuccessfulJunctionFailure = [System.Collections.Generic.List[object]]::new()
+foreach ($unused in 1..2048) { $overlongSuccessfulJunctionFailure.Add('noise') }
+foreach ($line in $vulkanSuccessfulJunctionFailure) { $overlongSuccessfulJunctionFailure.Add($line) }
+if (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure $overlongSuccessfulJunctionFailure.ToArray()) {
+    throw 'Successful-junction Vulkan CMake output was classified outside the bounded window.'
+}
+$overlongLineSuccessfulJunctionFailure = @(
+    ('x' * 1025),
+    $vulkanSuccessfulJunctionFailure[0],
+    $vulkanSuccessfulJunctionFailure[1],
+    $vulkanSuccessfulJunctionFailure[2],
+    $vulkanSuccessfulJunctionFailure[3]
+)
+if (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure $overlongLineSuccessfulJunctionFailure) {
+    throw 'Successful-junction Vulkan CMake output with an overlong line was classified.'
+}
 $builderTokens = $null
 $builderParseErrors = $null
 $builderAst = [System.Management.Automation.Language.Parser]::ParseFile(
@@ -204,6 +274,92 @@ $retryDiagnosticFunction = $builderAst.Find({
     $Ast.Name -ceq 'Get-NativeProcessRetryDiagnostic'
 }, $true)
 Assert-True ($null -ne $nativeProcessFunction -and $null -ne $retryDiagnosticFunction) 'Builder lost the native-process retry diagnostic functions.'
+$workerBuildRetryStatements = @($builderAst.FindAll({
+    param($Ast)
+    $Ast -is [System.Management.Automation.Language.TryStatementAst] -and
+    $Ast.Extent.Text.Contains('Test-ScribeGpuWorkerKnownCmakeBootstrapFailure') -and
+    $Ast.Extent.Text.Contains('Enable-ValidatedCmakeBuildJunction')
+}, $true) | Sort-Object { $_.Extent.Text.Length })
+Assert-True ($workerBuildRetryStatements.Count -ge 1) 'Builder lost the validated worker-build retry wrapper.'
+$workerBuildRetryStatement = $workerBuildRetryStatements[0]
+Assert-True ($workerBuildRetryStatement.Extent.Text -cnotmatch 'while\s*\(') 'Worker-build retry wrapper became an unbounded retry loop.'
+
+function Invoke-WorkerBuildRetryHarness([string]$Diagnostic, [bool]$FailRetry) {
+    $state = [pscustomobject]@{
+        NativeInvocations = 0
+        JunctionInvocations = 0
+    }
+    function Invoke-NativeProcess(
+        [string]$Executable,
+        [string[]]$Arguments,
+        [string]$FailureMessage
+    ) {
+        $state.NativeInvocations += 1
+        if ($state.NativeInvocations -eq 1) {
+            throw [ScribeGpuWorkerNativeProcessFailure]::new(
+                'synthetic initial worker build failure',
+                17,
+                $Diagnostic,
+                '',
+                $false
+            )
+        }
+        if ($FailRetry) {
+            throw [System.InvalidOperationException]::new('synthetic retry failure')
+        }
+        return [pscustomobject]@{ Stdout = ''; Stderr = '' }
+    }
+    function Get-NativeProcessRetryDiagnostic([System.Exception]$Failure) {
+        return @(Get-ScribeGpuWorkerNativeProcessRetryDiagnostic $Failure)
+    }
+    function Enable-ValidatedCmakeBuildJunction([string]$BuildEnvironment, [string]$CargoTarget) {
+        $state.JunctionInvocations += 1
+    }
+
+    $cargo = 'synthetic-cargo.exe'
+    $workerBuildArguments = @('build')
+    $Backend = 'Vulkan'
+    $shortBuild = [pscustomobject]@{ BuildEnvironment = 'C:\safe\env' }
+    $cargoTarget = 'C:\safe\target'
+    $failure = $null
+    $previousWarningPreference = $WarningPreference
+    try {
+        $WarningPreference = 'SilentlyContinue'
+        & ([scriptblock]::Create($workerBuildRetryStatement.Extent.Text))
+    }
+    catch {
+        $failure = $_.Exception
+    }
+    finally {
+        $WarningPreference = $previousWarningPreference
+    }
+    return [pscustomobject]@{
+        NativeInvocations = $state.NativeInvocations
+        JunctionInvocations = $state.JunctionInvocations
+        Failure = $failure
+    }
+}
+
+$acceptedRetrySuccess = Invoke-WorkerBuildRetryHarness ($capturedVulkanSuccessfulJunctionFailure -join "`r`n") $false
+Assert-True ($acceptedRetrySuccess.NativeInvocations -eq 2 -and
+    $acceptedRetrySuccess.JunctionInvocations -eq 1 -and
+    $null -eq $acceptedRetrySuccess.Failure) 'Accepted successful-junction signature did not invoke exactly one isolated retry.'
+$acceptedRetryFailure = Invoke-WorkerBuildRetryHarness ($capturedVulkanSuccessfulJunctionFailure -join "`n") $true
+Assert-True ($acceptedRetryFailure.NativeInvocations -eq 2 -and
+    $acceptedRetryFailure.JunctionInvocations -eq 1 -and
+    $null -ne $acceptedRetryFailure.Failure -and
+    $acceptedRetryFailure.Failure.Message -ceq 'synthetic retry failure') 'A failed isolated retry was retried again or lost its failure.'
+$rejectedRetry = Invoke-WorkerBuildRetryHarness (
+    @(
+        $vulkanSuccessfulJunctionFailure[0],
+        $vulkanSuccessfulJunctionFailure[1],
+        $vulkanSuccessfulJunctionFailure[2],
+        "LINK : fatal error LNK1104: cannot open file 'CMakeFiles\cmTC_1a2B3c.dir\unrelated.manifest'"
+    ) -join "`r`n"
+) $false
+Assert-True ($rejectedRetry.NativeInvocations -eq 1 -and
+    $rejectedRetry.JunctionInvocations -eq 0 -and
+    $null -ne $rejectedRetry.Failure) 'Rejected successful-junction signature invoked the isolated retry.'
 $nativeProcessHarness = Join-Path ([System.IO.Path]::GetTempPath()) "scribe-native-process-retry-$([guid]::NewGuid().ToString('N')).ps1"
 try {
     $nativeProcessHarnessTail = @'
