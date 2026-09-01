@@ -200,75 +200,19 @@ $overlongVulkanShortJunctionFailure = [System.Collections.Generic.List[object]]:
 foreach ($unused in 1..2048) { $overlongVulkanShortJunctionFailure.Add('noise') }
 foreach ($line in $vulkanShortJunctionFailure) { $overlongVulkanShortJunctionFailure.Add($line) }
 if (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure $overlongVulkanShortJunctionFailure.ToArray()) { throw 'Overlong Vulkan CMake output was classified outside the bounded window.' }
-$vulkanSuccessfulJunctionFailure = @(
+$unboundTcsSuccessfulJunctionFailure = @(
     'error: failed to run custom build command for `transcribe-cpp-sys v0.1.3`',
     'CMake Warning in C:/safe/env/tcs/0123456789abcdef/build/e/src/vulkan-shaders-gen-build/CMakeFiles/CMakeScratch/TryCompile-Ab12Cd/CMakeLists.txt:',
     '  characters (see CMAKE_OBJECT_PATH_MAX). Object file',
     "LINK : fatal error LNK1104: cannot open file 'CMakeFiles\cmTC_1a2B3c.dir\intermediate.manifest'"
 )
-$capturedVulkanSuccessfulJunctionFailure = [System.Collections.Generic.List[object]]::new()
-foreach ($index in 1..157) {
-    $line = switch ($index) {
-        4 { $vulkanSuccessfulJunctionFailure[0] }
-        62 { $vulkanSuccessfulJunctionFailure[1] }
-        81 { $vulkanSuccessfulJunctionFailure[2] }
-        129 { $vulkanSuccessfulJunctionFailure[3] }
-        default { 'sanitized successful-junction Cargo/CMake diagnostic output' }
-    }
-    $capturedVulkanSuccessfulJunctionFailure.Add($line)
-}
 foreach ($diagnostic in @(
-    ($capturedVulkanSuccessfulJunctionFailure -join "`r`n"),
-    ($capturedVulkanSuccessfulJunctionFailure -join "`n")
+    ($unboundTcsSuccessfulJunctionFailure -join "`r`n"),
+    ($unboundTcsSuccessfulJunctionFailure -join "`n")
 )) {
-    if (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure $diagnostic)) {
-        throw 'Full captured-order successful-junction Vulkan CMake diagnostic was not classified.'
+    if (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure $diagnostic) {
+        throw 'A free-standing tcs warning source was classified without a Cargo target.'
     }
-}
-$reorderedVulkanSuccessfulJunctionFailure = [System.Collections.Generic.List[object]]::new($capturedVulkanSuccessfulJunctionFailure)
-$reorderedVulkanSuccessfulJunctionFailure[61] = $vulkanSuccessfulJunctionFailure[2]
-$reorderedVulkanSuccessfulJunctionFailure[80] = $vulkanSuccessfulJunctionFailure[1]
-if (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure ($reorderedVulkanSuccessfulJunctionFailure -join "`r`n")) {
-    throw 'Reordered successful-junction Vulkan CMake diagnostic was classified.'
-}
-foreach ($missingIndex in @(0, 1, 2, 3)) {
-    $missingStep = @($vulkanSuccessfulJunctionFailure | Where-Object { $_ -cne $vulkanSuccessfulJunctionFailure[$missingIndex] })
-    if (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure ($missingStep -join "`n")) {
-        throw "Successful-junction Vulkan CMake diagnostic missing step $missingIndex was classified."
-    }
-}
-foreach ($malformedVulkanSuccessfulJunctionFailure in @(
-    @('error: failed to run custom build command for `transcribe-cpp-sys v0.1.4`', $vulkanSuccessfulJunctionFailure[1], $vulkanSuccessfulJunctionFailure[2], $vulkanSuccessfulJunctionFailure[3]),
-    @($vulkanSuccessfulJunctionFailure[0], 'CMake Warning in C:\safe\env\tcs\0123456789abcdef\build\e\src\cuda-shaders-gen-build\CMakeFiles\CMakeScratch\TryCompile-Ab12Cd\CMakeLists.txt:', $vulkanSuccessfulJunctionFailure[2], $vulkanSuccessfulJunctionFailure[3]),
-    @($vulkanSuccessfulJunctionFailure[0], 'CMake Warning in C:\safe\env\cache\0123456789abcdef\build\e\src\vulkan-shaders-gen-build\CMakeFiles\CMakeScratch\TryCompile-Ab12Cd\CMakeLists.txt:', $vulkanSuccessfulJunctionFailure[2], $vulkanSuccessfulJunctionFailure[3]),
-    @($vulkanSuccessfulJunctionFailure[0], 'CMake Warning in C:\safe\env\tcs\0123456789abcde\build\e\src\vulkan-shaders-gen-build\CMakeFiles\CMakeScratch\TryCompile-Ab12Cd\CMakeLists.txt:', $vulkanSuccessfulJunctionFailure[2], $vulkanSuccessfulJunctionFailure[3]),
-    @($vulkanSuccessfulJunctionFailure[0], $vulkanSuccessfulJunctionFailure[1], '  characters (see CMAKE_NINJA_FORCE_RESPONSE_FILE). Object file', $vulkanSuccessfulJunctionFailure[3]),
-    @($vulkanSuccessfulJunctionFailure[0], $vulkanSuccessfulJunctionFailure[1], 'unrelated note mentioning CMAKE_OBJECT_PATH_MAX', $vulkanSuccessfulJunctionFailure[3]),
-    @($vulkanSuccessfulJunctionFailure[0], $vulkanSuccessfulJunctionFailure[1], $vulkanSuccessfulJunctionFailure[2], "LINK : fatal error LNK1104: cannot open file 'CMakeFiles\cmTC_xyz.dir\intermediate.manifest'"),
-    @($vulkanSuccessfulJunctionFailure[0], $vulkanSuccessfulJunctionFailure[1], $vulkanSuccessfulJunctionFailure[2], "LINK : fatal error LNK1104: cannot open file 'CMakeFiles\cmTC_1a2B3c.dir\intermediate.pdb'"),
-    @($vulkanSuccessfulJunctionFailure[0], $vulkanSuccessfulJunctionFailure[1], $vulkanSuccessfulJunctionFailure[2], "link : fatal error LNK1104: cannot open file 'CMakeFiles\cmTC_1a2B3c.dir\intermediate.manifest'"),
-    @($vulkanSuccessfulJunctionFailure[0], $vulkanSuccessfulJunctionFailure[1], $vulkanSuccessfulJunctionFailure[2], "unexpected prefix LINK : fatal error LNK1104: cannot open file 'CMakeFiles\cmTC_1a2B3c.dir\intermediate.manifest'"),
-    @($vulkanSuccessfulJunctionFailure[0], $vulkanShortJunctionFailure[0], $vulkanSuccessfulJunctionFailure[1], $vulkanSuccessfulJunctionFailure[2], $vulkanSuccessfulJunctionFailure[3])
-)) {
-    if (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure ($malformedVulkanSuccessfulJunctionFailure -join "`r`n")) {
-        throw 'Malformed successful-junction Vulkan CMake signature was classified.'
-    }
-}
-$overlongSuccessfulJunctionFailure = [System.Collections.Generic.List[object]]::new()
-foreach ($unused in 1..2048) { $overlongSuccessfulJunctionFailure.Add('noise') }
-foreach ($line in $vulkanSuccessfulJunctionFailure) { $overlongSuccessfulJunctionFailure.Add($line) }
-if (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure $overlongSuccessfulJunctionFailure.ToArray()) {
-    throw 'Successful-junction Vulkan CMake output was classified outside the bounded window.'
-}
-$overlongLineSuccessfulJunctionFailure = @(
-    ('x' * 1025),
-    $vulkanSuccessfulJunctionFailure[0],
-    $vulkanSuccessfulJunctionFailure[1],
-    $vulkanSuccessfulJunctionFailure[2],
-    $vulkanSuccessfulJunctionFailure[3]
-)
-if (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure $overlongLineSuccessfulJunctionFailure) {
-    throw 'Successful-junction Vulkan CMake output with an overlong line was classified.'
 }
 $canonicalClassifierRoot = Join-Path ([IO.Path]::GetTempPath()) "scribe-canonical-retry-$([guid]::NewGuid().ToString('N'))"
 $otherCanonicalClassifierRoot = Join-Path ([IO.Path]::GetTempPath()) "scribe-canonical-retry-other-$([guid]::NewGuid().ToString('N'))"
@@ -305,6 +249,11 @@ try {
                 -CargoTarget $canonicalClassifierRoot
         ) 'Full captured-order canonical Cargo-target CMake diagnostic was not classified.'
     }
+    foreach ($cargoTarget in @($canonicalClassifierRoot, $otherCanonicalClassifierRoot)) {
+        Assert-True (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure `
+            -Output $unboundTcsSuccessfulJunctionFailure `
+            -CargoTarget $cargoTarget)) 'A free-standing tcs warning source was classified with an unrelated Cargo target.'
+    }
 
     $reorderedCanonicalCargoTargetFailure = [Collections.Generic.List[object]]::new($capturedCanonicalCargoTargetFailure)
     $reorderedCanonicalCargoTargetFailure[61] = $canonicalCargoTargetFailure[2]
@@ -326,6 +275,7 @@ try {
         -Output $canonicalCargoTargetFailure)) 'A canonical Cargo-target warning was classified without its target identity.'
     $traversalWarningSource = "$($canonicalClassifierRoot.Replace('\', '/'))/release/build/../build/transcribe-cpp-sys-0123456789abcdef/out/build/e/src/vulkan-shaders-gen-build/CMakeFiles/CMakeScratch/TryCompile-Ab12Cd/CMakeLists.txt"
     foreach ($malformedCanonicalCargoTargetFailure in @(
+        @('error: failed to run custom build command for `transcribe-cpp-sys v0.1.4`', $canonicalCargoTargetFailure[1], $canonicalCargoTargetFailure[2], $canonicalCargoTargetFailure[3]),
         @(New-TestCanonicalCargoTargetFailure $canonicalClassifierRoot '0123456789abcde'),
         @(New-TestCanonicalCargoTargetFailure $canonicalClassifierRoot '0123456789abcdef' 'TryCompile-' ),
         @(New-TestCanonicalCargoTargetFailure $canonicalClassifierRoot '0123456789abcdef' ('TryCompile-' + ('a' * 65))),
@@ -334,7 +284,12 @@ try {
         @($canonicalCargoTargetFailure[0], "CMake Warning in ${traversalWarningSource}:", $canonicalCargoTargetFailure[2], $canonicalCargoTargetFailure[3]),
         @($canonicalCargoTargetFailure[0], $canonicalCargoTargetFailure[1].Replace('transcribe-cpp-sys-', 'other-sys-'), $canonicalCargoTargetFailure[2], $canonicalCargoTargetFailure[3]),
         @($canonicalCargoTargetFailure[0], $canonicalCargoTargetFailure[1].Replace('vulkan-shaders-gen-build', 'cuda-shaders-gen-build'), $canonicalCargoTargetFailure[2], $canonicalCargoTargetFailure[3]),
+        @($canonicalCargoTargetFailure[0], $canonicalCargoTargetFailure[1], '  characters (see CMAKE_NINJA_FORCE_RESPONSE_FILE). Object file', $canonicalCargoTargetFailure[3]),
+        @($canonicalCargoTargetFailure[0], $canonicalCargoTargetFailure[1], 'unrelated note mentioning CMAKE_OBJECT_PATH_MAX', $canonicalCargoTargetFailure[3]),
         @($canonicalCargoTargetFailure[0], $canonicalCargoTargetFailure[1], $canonicalCargoTargetFailure[2], "LINK : fatal error LNK1104: cannot open file 'unrelated.manifest'"),
+        @($canonicalCargoTargetFailure[0], $canonicalCargoTargetFailure[1], $canonicalCargoTargetFailure[2], "LINK : fatal error LNK1104: cannot open file 'CMakeFiles\cmTC_1a2B3c.dir\intermediate.pdb'"),
+        @($canonicalCargoTargetFailure[0], $canonicalCargoTargetFailure[1], $canonicalCargoTargetFailure[2], "link : fatal error LNK1104: cannot open file 'CMakeFiles\cmTC_1a2B3c.dir\intermediate.manifest'"),
+        @($canonicalCargoTargetFailure[0], $canonicalCargoTargetFailure[1], $canonicalCargoTargetFailure[2], "unexpected prefix LINK : fatal error LNK1104: cannot open file 'CMakeFiles\cmTC_1a2B3c.dir\intermediate.manifest'"),
         @($canonicalCargoTargetFailure[0], $vulkanShortJunctionFailure[0], $canonicalCargoTargetFailure[1], $canonicalCargoTargetFailure[2], $canonicalCargoTargetFailure[3])
     )) {
         Assert-True (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure `
@@ -487,6 +442,10 @@ try {
     Assert-True ($rejectedRetry.NativeInvocations -eq 1 -and
         $rejectedRetry.JunctionInvocations -eq 0 -and
         $null -ne $rejectedRetry.Failure) 'A wrong-target canonical signature invoked the isolated retry.'
+    $unboundTcsRetry = Invoke-WorkerBuildRetryHarness ($unboundTcsSuccessfulJunctionFailure -join "`r`n") $false $builderRetryTarget
+    Assert-True ($unboundTcsRetry.NativeInvocations -eq 1 -and
+        $unboundTcsRetry.JunctionInvocations -eq 0 -and
+        $null -ne $unboundTcsRetry.Failure) 'A free-standing tcs warning source invoked the isolated retry.'
 }
 finally {
     Remove-Item -LiteralPath $builderRetryTarget -Recurse -Force -ErrorAction SilentlyContinue

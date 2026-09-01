@@ -207,7 +207,6 @@ function Test-ScribeGpuWorkerKnownCmakeBootstrapFailure(
 
     $junctionLine = [regex]::new('^.*transcribe-cpp-sys: could not create short build junction .+; building in OUT_DIR \(may exceed Windows MAX_PATH in deep checkouts\)\s*$', [Text.RegularExpressions.RegexOptions]::CultureInvariant)
     $warningSourceLine = [regex]::new('^.*vulkan-shaders-gen.*$', [Text.RegularExpressions.RegexOptions]::CultureInvariant)
-    $successfulJunctionWarningSourceLine = [regex]::new('^\s*CMake Warning in [A-Za-z]:[\\/].*[\\/]tcs[\\/][0-9A-Fa-f]{16}[\\/]build[\\/]e[\\/]src[\\/]vulkan-shaders-gen-build[\\/]CMakeFiles[\\/]CMakeScratch[\\/]TryCompile-[A-Za-z0-9_-]+[\\/]CMakeLists\.txt:\s*$', [Text.RegularExpressions.RegexOptions]::CultureInvariant)
     $objectPathLine = [regex]::new('^.*CMAKE_OBJECT_PATH_MAX.*$', [Text.RegularExpressions.RegexOptions]::CultureInvariant)
     $successfulJunctionObjectPathLine = [regex]::new('^\s*characters \(see CMAKE_OBJECT_PATH_MAX\)\.\s+Object file\s*$', [Text.RegularExpressions.RegexOptions]::CultureInvariant)
     $linkLine = [regex]::new('^.*(?:LINK|link) : fatal error LNK1104: cannot open file ''CMakeFiles\\cmTC_[0-9A-Fa-f]+\.dir\\intermediate\.manifest''\s*$', [Text.RegularExpressions.RegexOptions]::CultureInvariant)
@@ -224,8 +223,8 @@ function Test-ScribeGpuWorkerKnownCmakeBootstrapFailure(
         if ($state -eq 4 -and $linkLine.IsMatch($line)) { return $true }
     }
 
-    # A successful transcribe-cpp short OUT_DIR junction is silent. Its use is
-    # evidenced by the exact tcs/<hash>/build/e nested CMake warning source.
+    # A successful transcribe-cpp short OUT_DIR junction is silent. Accept its
+    # warning source only when it is bound to the caller's exact Cargo target.
     # Reject this signature if the bounded diagnostic contains any fallback
     # warning: that case is accepted only by the separately ordered signature
     # above, where the warning must precede the crate failure.
@@ -239,8 +238,7 @@ function Test-ScribeGpuWorkerKnownCmakeBootstrapFailure(
             continue
         }
         if ($successfulJunctionState -eq 1 -and
-            ($successfulJunctionWarningSourceLine.IsMatch($line) -or
-                (Test-ScribeGpuWorkerCanonicalCargoTargetWarningSource $line $CargoTarget))) {
+            (Test-ScribeGpuWorkerCanonicalCargoTargetWarningSource $line $CargoTarget)) {
             $successfulJunctionState = 2
             continue
         }
