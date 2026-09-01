@@ -290,6 +290,65 @@ $overlongVulkanShortJunctionFailure = [System.Collections.Generic.List[object]]:
 foreach ($unused in 1..2048) { $overlongVulkanShortJunctionFailure.Add('noise') }
 foreach ($line in $vulkanShortJunctionFailure) { $overlongVulkanShortJunctionFailure.Add($line) }
 if (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure $overlongVulkanShortJunctionFailure.ToArray()) { throw 'Overlong Vulkan CMake output was classified outside the bounded window.' }
+$fixtureMixedSeparatorLinkLine = "LINK : fatal error LNK1104: cannot open file 'CMakeFiles\cmTC_1a2B3c.dir/intermediate.manifest'"
+$capturedFixtureMixedSeparatorFailure = [System.Collections.Generic.List[object]]::new()
+foreach ($index in 1..428) {
+    $line = switch ($index) {
+        190 { $vulkanShortJunctionFailure[0] }
+        191 { $vulkanShortJunctionFailure[1] }
+        206 { $vulkanShortJunctionFailure[0] }
+        320 { $vulkanShortJunctionFailure[2] }
+        352 { $vulkanShortJunctionFailure[3] }
+        366 { $vulkanShortJunctionFailure[3] }
+        400 { $fixtureMixedSeparatorLinkLine }
+        default { 'sanitized fixture Cargo/CMake diagnostic output' }
+    }
+    $capturedFixtureMixedSeparatorFailure.Add($line)
+}
+foreach ($diagnostic in @(
+    ($capturedFixtureMixedSeparatorFailure -join "`r`n"),
+    ($capturedFixtureMixedSeparatorFailure -join "`n")
+)) {
+    Assert-True (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure -Output $diagnostic)) 'The fixture mixed-separator signature was accepted without its explicit opt-in.'
+    Assert-True (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure -Output $diagnostic -AllowSuccessfulJunctionMixedSeparatorLink:$false)) 'The fixture mixed-separator signature was accepted with its opt-in disabled.'
+    Assert-True (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure -Output $diagnostic -AllowSuccessfulJunctionMixedSeparatorLink) 'The full 428-line fixture mixed-separator signature was not accepted with its explicit opt-in.'
+}
+$missingFirstFixtureJunction = [System.Collections.Generic.List[object]]::new($capturedFixtureMixedSeparatorFailure)
+$missingFirstFixtureJunction[189] = 'sanitized fixture Cargo/CMake diagnostic output'
+Assert-True (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure -Output ($missingFirstFixtureJunction -join "`r`n") -AllowSuccessfulJunctionMixedSeparatorLink)) 'The fixture mixed-separator signature was accepted after its first junction marker was removed.'
+$reorderedFixtureMixedSeparatorFailure = [System.Collections.Generic.List[object]]::new($capturedFixtureMixedSeparatorFailure)
+$reorderedFixtureMixedSeparatorFailure[189] = $vulkanShortJunctionFailure[1]
+$reorderedFixtureMixedSeparatorFailure[190] = $vulkanShortJunctionFailure[0]
+Assert-True (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure -Output ($reorderedFixtureMixedSeparatorFailure -join "`n") -AllowSuccessfulJunctionMixedSeparatorLink)) 'The reordered fixture mixed-separator signature was classified.'
+foreach ($missingIndex in @(189, 190, 319, 399)) {
+    $missingFixtureMixedSeparatorMarker = [System.Collections.Generic.List[object]]::new($capturedFixtureMixedSeparatorFailure)
+    $missingFixtureMixedSeparatorMarker[$missingIndex] = 'sanitized fixture Cargo/CMake diagnostic output'
+    Assert-True (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure -Output ($missingFixtureMixedSeparatorMarker -join "`n") -AllowSuccessfulJunctionMixedSeparatorLink)) "Fixture mixed-separator signature missing marker $($missingIndex + 1) was classified."
+}
+$missingFixtureMixedSeparatorObjectMarkers = [System.Collections.Generic.List[object]]::new($capturedFixtureMixedSeparatorFailure)
+$missingFixtureMixedSeparatorObjectMarkers[351] = 'sanitized fixture Cargo/CMake diagnostic output'
+$missingFixtureMixedSeparatorObjectMarkers[365] = 'sanitized fixture Cargo/CMake diagnostic output'
+Assert-True (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure -Output ($missingFixtureMixedSeparatorObjectMarkers -join "`n") -AllowSuccessfulJunctionMixedSeparatorLink)) 'The fixture mixed-separator signature was accepted after both object-path markers were removed.'
+foreach ($malformedFixtureMixedSeparatorLink in @(
+    $fixtureMixedSeparatorLinkLine.ToLowerInvariant(),
+    "unexpected prefix $fixtureMixedSeparatorLinkLine",
+    "$fixtureMixedSeparatorLinkLine unexpected suffix",
+    "LINK : fatal error LNK1104: cannot open file 'CMakeFiles/cmTC_1a2B3c.dir/intermediate.manifest'",
+    "LINK : fatal error LNK1104: cannot open file 'CMakeFiles\cmTC_1a2B3c.dir/../intermediate.manifest'",
+    "LINK : fatal error LNK1104: cannot open file 'CMakeFiles\cmTC_xyz.dir/intermediate.manifest'",
+    "LINK : fatal error LNK1104: cannot open file 'CMakeFiles\cmTC_$('a' * 65).dir/intermediate.manifest'",
+    "LINK : fatal error LNK1104: cannot open file 'CMakeFiles\cmTC_1a2B3c.dir/intermediate.pdb'"
+)) {
+    $malformedFixtureMixedSeparatorFailure = [System.Collections.Generic.List[object]]::new($capturedFixtureMixedSeparatorFailure)
+    $malformedFixtureMixedSeparatorFailure[399] = $malformedFixtureMixedSeparatorLink
+    Assert-True (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure -Output ($malformedFixtureMixedSeparatorFailure -join "`r`n") -AllowSuccessfulJunctionMixedSeparatorLink)) 'A malformed fixture mixed-separator terminal was classified.'
+}
+$maximumBoundedFixtureMixedSeparatorFailure = [System.Collections.Generic.List[object]]::new($capturedFixtureMixedSeparatorFailure)
+foreach ($unused in 1..1620) { $maximumBoundedFixtureMixedSeparatorFailure.Add('bounded fixture Cargo/CMake diagnostic output') }
+Assert-True (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure -Output $maximumBoundedFixtureMixedSeparatorFailure.ToArray() -AllowSuccessfulJunctionMixedSeparatorLink) 'The 2048-line fixture mixed-separator signature was not classified.'
+$overflowFixtureMixedSeparatorFailure = [System.Collections.Generic.List[object]]::new($maximumBoundedFixtureMixedSeparatorFailure)
+$overflowFixtureMixedSeparatorFailure.Add('overflow fixture Cargo/CMake diagnostic output')
+Assert-True (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure -Output $overflowFixtureMixedSeparatorFailure.ToArray() -AllowSuccessfulJunctionMixedSeparatorLink)) 'The over-limit fixture mixed-separator signature was classified.'
 $unboundTcsSuccessfulJunctionFailure = @(
     'error: failed to run custom build command for `transcribe-cpp-sys v0.1.3`',
     'CMake Warning in C:/safe/env/tcs/0123456789abcdef/build/e/src/vulkan-shaders-gen-build/CMakeFiles/CMakeScratch/TryCompile-Ab12Cd/CMakeLists.txt:',
@@ -746,6 +805,40 @@ Assert-True ($workerBuildRetryStatements.Count -ge 1) 'Builder lost the validate
 $workerBuildRetryStatement = $workerBuildRetryStatements[0]
 Assert-True ($workerBuildRetryStatement.Extent.Text -cnotmatch 'while\s*\(') 'Worker-build retry wrapper became an unbounded retry loop.'
 Assert-True (-not $workerBuildRetryStatement.Extent.Text.Contains($captureOverflowOptIn)) 'Worker-build retry path gained diagnostic capture overflow tolerance.'
+$mixedSeparatorRetryOptIn = 'AllowSuccessfulJunctionMixedSeparatorLink'
+$builderMixedSeparatorRetryCalls = @($builderAst.FindAll({
+    param($Ast)
+    if ($Ast -isnot [System.Management.Automation.Language.CommandAst] -or
+        $Ast.GetCommandName() -cne 'Test-ScribeGpuWorkerKnownCmakeBootstrapFailure') {
+        return $false
+    }
+    return @($Ast.CommandElements | Where-Object {
+        $_ -is [System.Management.Automation.Language.CommandParameterAst] -and
+        $_.ParameterName -ceq $mixedSeparatorRetryOptIn
+    }).Count -eq 1
+}, $true))
+Assert-True ($builderMixedSeparatorRetryCalls.Count -eq 1) 'Only the worker-pack builder may opt into the fixture mixed-separator retry terminal.'
+Assert-True ($builderMixedSeparatorRetryCalls[0].Extent.Text.Contains('-AllowSuccessfulJunctionMixedSeparatorLink:($SigningMode -eq ''Fixture'')')) 'The builder mixed-separator retry opt-in escaped validated Fixture signing mode.'
+$vulkanEvidenceTokens = $null
+$vulkanEvidenceParseErrors = $null
+$vulkanEvidenceAst = [System.Management.Automation.Language.Parser]::ParseFile(
+    (Join-Path $PSScriptRoot 'run-windows-vulkan-evidence.ps1'),
+    [ref]$vulkanEvidenceTokens,
+    [ref]$vulkanEvidenceParseErrors
+)
+Assert-True ($vulkanEvidenceParseErrors.Count -eq 0) 'Vulkan evidence runner source could not be parsed for retry opt-in isolation.'
+$vulkanEvidenceMixedSeparatorRetryCalls = @($vulkanEvidenceAst.FindAll({
+    param($Ast)
+    if ($Ast -isnot [System.Management.Automation.Language.CommandAst] -or
+        $Ast.GetCommandName() -cne 'Test-ScribeGpuWorkerKnownCmakeBootstrapFailure') {
+        return $false
+    }
+    return @($Ast.CommandElements | Where-Object {
+        $_ -is [System.Management.Automation.Language.CommandParameterAst] -and
+        $_.ParameterName -ceq $mixedSeparatorRetryOptIn
+    }).Count -gt 0
+}, $true))
+Assert-True ($vulkanEvidenceMixedSeparatorRetryCalls.Count -eq 0) 'The Vulkan evidence runner must not opt into the fixture mixed-separator retry terminal.'
 
 function Invoke-WorkerBuildRetryHarness(
     [string]$Diagnostic,
@@ -832,6 +925,35 @@ try {
         -Output $builderCanonicalFailure `
         -CargoTarget $builderRetryTarget `
         -BuildEnvironment $builderRetryEnvironment) 'Builder retry fixture no longer satisfies the unchanged classifier.'
+    $fixtureMixedSeparatorCrlf = $capturedFixtureMixedSeparatorFailure -join "`r`n"
+    $fixtureMixedSeparatorLf = $capturedFixtureMixedSeparatorFailure -join "`n"
+    foreach ($fixtureMode in @('Fixture', 'fixture')) {
+        $fixtureMixedSeparatorRetry = Invoke-WorkerBuildRetryHarness `
+            $(if ($fixtureMode -ceq 'Fixture') { $fixtureMixedSeparatorCrlf } else { $fixtureMixedSeparatorLf }) `
+            $false $builderRetryTarget $builderRetryEnvironment $fixtureMode
+        Assert-True ($fixtureMixedSeparatorRetry.NativeInvocations -eq 2 -and
+            $fixtureMixedSeparatorRetry.JunctionInvocations -eq 1 -and
+            $null -eq $fixtureMixedSeparatorRetry.Failure) "Fixture signing mode variant $fixtureMode did not invoke exactly one mixed-separator retry."
+    }
+    $fixtureMixedSeparatorRetryFailure = Invoke-WorkerBuildRetryHarness $fixtureMixedSeparatorLf $true $builderRetryTarget $builderRetryEnvironment 'Fixture'
+    Assert-True ($fixtureMixedSeparatorRetryFailure.NativeInvocations -eq 2 -and
+        $fixtureMixedSeparatorRetryFailure.JunctionInvocations -eq 1 -and
+        $null -ne $fixtureMixedSeparatorRetryFailure.Failure -and
+        $fixtureMixedSeparatorRetryFailure.Failure.Message -ceq 'synthetic retry failure') 'A failed fixture mixed-separator retry made a third attempt or lost its failure.'
+    $defaultMixedSeparatorRetry = Invoke-WorkerBuildRetryHarness $fixtureMixedSeparatorCrlf $false $builderRetryTarget $builderRetryEnvironment
+    Assert-True ($defaultMixedSeparatorRetry.NativeInvocations -eq 1 -and
+        $defaultMixedSeparatorRetry.JunctionInvocations -eq 0 -and
+        $null -ne $defaultMixedSeparatorRetry.Failure) 'Default production signing accepted the fixture mixed-separator retry terminal.'
+    foreach ($productionMode in @('Production', 'production')) {
+        $productionMixedSeparatorRetry = Invoke-WorkerBuildRetryHarness $fixtureMixedSeparatorCrlf $false $builderRetryTarget $builderRetryEnvironment $productionMode
+        Assert-True ($productionMixedSeparatorRetry.NativeInvocations -eq 1 -and
+            $productionMixedSeparatorRetry.JunctionInvocations -eq 0 -and
+            $null -ne $productionMixedSeparatorRetry.Failure) "Production signing mode variant $productionMode accepted the fixture mixed-separator retry terminal."
+    }
+    $missingFirstFixtureJunctionRetry = Invoke-WorkerBuildRetryHarness ($missingFirstFixtureJunction -join "`r`n") $false $builderRetryTarget $builderRetryEnvironment 'Fixture'
+    Assert-True ($missingFirstFixtureJunctionRetry.NativeInvocations -eq 1 -and
+        $missingFirstFixtureJunctionRetry.JunctionInvocations -eq 0 -and
+        $null -ne $missingFirstFixtureJunctionRetry.Failure) 'A fixture mixed-separator diagnostic with only its second junction marker invoked retry.'
     $acceptedRetrySuccess = Invoke-WorkerBuildRetryHarness ($builderCanonicalFailure -join "`r`n") $false $builderRetryTarget $builderRetryEnvironment
     Assert-True ($acceptedRetrySuccess.NativeInvocations -eq 2 -and
         $acceptedRetrySuccess.JunctionInvocations -eq 1 -and
@@ -890,6 +1012,36 @@ try {
     Assert-True ($unboundTcsRetry.NativeInvocations -eq 1 -and
         $unboundTcsRetry.JunctionInvocations -eq 0 -and
         $null -ne $unboundTcsRetry.Failure) 'A free-standing tcs warning source invoked the isolated retry.'
+    foreach ($invalidFixtureRetry in @(
+        @($builderWrongRetryTarget, $builderRetryEnvironment, 'wrong target'),
+        @($builderRetryTarget, $builderWrongRetryEnvironment, 'wrong environment')
+    )) {
+        $retry = Invoke-WorkerBuildRetryHarness ($builderCanonicalFailure -join "`r`n") $false $invalidFixtureRetry[0] $invalidFixtureRetry[1] 'Fixture'
+        Assert-True ($retry.NativeInvocations -eq 1 -and
+            $retry.JunctionInvocations -eq 0 -and
+            $null -ne $retry.Failure) "Fixture mixed-separator retry with $($invalidFixtureRetry[2]) reached topology mutation."
+    }
+    $substitutedFixtureTarget = Join-Path $builderRetryRoot 'substituted-target'
+    $substitutedFixtureEnvironment = Join-Path $builderRetryRoot 'substituted-environment'
+    $substitutedFixtureTopology = New-TestCanonicalRetryTopology $substitutedFixtureTarget $substitutedFixtureEnvironment
+    $substitutedFixtureOutside = Join-Path $builderRetryRoot 'substituted-outside'
+    New-Item -ItemType Directory -Path $substitutedFixtureOutside | Out-Null
+    Remove-Item -LiteralPath $substitutedFixtureTopology.Link -Force
+    New-Item -ItemType Junction -Path $substitutedFixtureTopology.Link -Target $substitutedFixtureOutside | Out-Null
+    $multipleFixtureTarget = Join-Path $builderRetryRoot 'multiple-target'
+    $multipleFixtureEnvironment = Join-Path $builderRetryRoot 'multiple-environment'
+    $multipleFixtureTopology = New-TestCanonicalRetryTopology $multipleFixtureTarget $multipleFixtureEnvironment
+    New-Item -ItemType Junction -Path (Join-Path $multipleFixtureTopology.Tcs 'aaaaaaaaaaaaaaaa') -Target $multipleFixtureTopology.Out | Out-Null
+    foreach ($invalidFixtureTopologyRetry in @(
+        @($substitutedFixtureTarget, $substitutedFixtureEnvironment, 'substituted junction target'),
+        @($multipleFixtureTarget, $multipleFixtureEnvironment, 'multiple tcs inventory')
+    )) {
+        $diagnostic = New-TestCanonicalCargoTargetFailure $invalidFixtureTopologyRetry[0]
+        $retry = Invoke-WorkerBuildRetryHarness ($diagnostic -join "`r`n") $false $invalidFixtureTopologyRetry[0] $invalidFixtureTopologyRetry[1] 'Fixture'
+        Assert-True ($retry.NativeInvocations -eq 1 -and
+            $retry.JunctionInvocations -eq 0 -and
+            $null -ne $retry.Failure) "Fixture mixed-separator retry with $($invalidFixtureTopologyRetry[2]) reached topology mutation."
+    }
 }
 finally {
     Remove-Item -LiteralPath $builderRetryRoot -Recurse -Force -ErrorAction SilentlyContinue
