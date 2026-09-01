@@ -13296,6 +13296,595 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    const VULKAN_EVIDENCE_COLD_RUNS: usize = 5;
+    const VULKAN_EVIDENCE_WARM_RUNS: usize = 20;
+    const VULKAN_EVIDENCE_MAX_MODEL_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+    const VULKAN_EVIDENCE_MAX_WAV_BYTES: u64 = 256 * 1024 * 1024;
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct VulkanEvidenceInputs {
+        pack_root: PathBuf,
+        cpu_worker: PathBuf,
+        model: PathBuf,
+        model_sha256: String,
+        wav: PathBuf,
+        wav_sha256: String,
+        expected_phrase: String,
+        expected_stable_device: String,
+        nvidia_baseline: VulkanEvidenceNvidiaBaseline,
+        output: PathBuf,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct VulkanEvidenceStatistics {
+        p50_ms: u64,
+        p95_ms: u64,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct VulkanEvidenceRunSet {
+        end_to_end_ms: Vec<u64>,
+        end_to_end: VulkanEvidenceStatistics,
+        backend_processing_ms: Vec<u64>,
+        backend_processing: VulkanEvidenceStatistics,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        model_load_ms: Option<Vec<u64>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        model_load: Option<VulkanEvidenceStatistics>,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct VulkanEvidenceBackendRuns {
+        cold: VulkanEvidenceRunSet,
+        warm: VulkanEvidenceRunSet,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct VulkanEvidencePack {
+        id: String,
+        version: String,
+        digest: String,
+        security_epoch: u64,
+        runtime_abi: u16,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct VulkanEvidenceGpu {
+        backend: String,
+        provider: String,
+        vendor: String,
+        device_class: String,
+        driver: String,
+        memory_total_bytes: u64,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct VulkanEvidenceNvidiaBaseline {
+        product: String,
+        driver: String,
+        memory_total_bytes: u64,
+        memory_used_bytes: u64,
+        gpu_utilization_percent: u8,
+    }
+
+    /// Deliberately metadata-only. In particular, this type has no device ID,
+    /// transcript, audio/model path, or child-process output field.
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct VulkanEvidenceReport {
+        schema_version: u16,
+        fixture_only: bool,
+        untrusted: bool,
+        auto_eligible: bool,
+        source_revision: String,
+        pack: VulkanEvidencePack,
+        model_sha256: String,
+        wav_sha256: String,
+        gpu: VulkanEvidenceGpu,
+        nvidia_baseline: VulkanEvidenceNvidiaBaseline,
+        cold_runs_per_backend: usize,
+        warm_runs_per_backend: usize,
+        cpu: VulkanEvidenceBackendRuns,
+        vulkan: VulkanEvidenceBackendRuns,
+        expected_phrase_present_every_run: bool,
+        normalized_transcript_parity: bool,
+        same_device_internally_verified: bool,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct VulkanEvidenceObservation {
+        normalized_transcript: String,
+        end_to_end_ms: u64,
+        backend_processing_ms: u64,
+        model_load_ms: u64,
+        warm_reused: bool,
+    }
+
+    fn canonical_vulkan_evidence_sha256(value: &str) -> Result<String> {
+        if value.len() != 64
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            bail!("evidence SHA-256 must be lowercase canonical hexadecimal")
+        }
+        Ok(value.to_owned())
+    }
+
+    fn normalize_vulkan_evidence_transcript(value: &str) -> String {
+        value
+            .chars()
+            .map(|character| {
+                if character.is_alphanumeric() {
+                    character.to_ascii_lowercase()
+                } else {
+                    ' '
+                }
+            })
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn is_bounded_evidence_metadata(value: &str, max_bytes: usize) -> bool {
+        !value.is_empty()
+            && value.len() <= max_bytes
+            && value.bytes().all(|byte| (0x20..=0x7e).contains(&byte))
+            && !value.contains(['\\', '/'])
+    }
+
+    fn is_safe_vulkan_evidence_output_name(name: &std::ffi::OsStr) -> bool {
+        let Some(name) = name.to_str() else {
+            return false;
+        };
+        name.len() <= 128
+            && name.ends_with(".json")
+            && !name.starts_with(['.', '-'])
+            && name.bytes().all(|byte| {
+                byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || matches!(byte, b'.' | b'_' | b'-')
+            })
+    }
+
+    fn vulkan_evidence_millis(value: u128, label: &str) -> Result<u64> {
+        u64::try_from(value).with_context(|| format!("{label} exceeds the evidence timing range"))
+    }
+
+    fn with_vulkan_evidence_registry<T>(
+        registry: InferenceWorkerRegistry,
+        operation: impl FnOnce(&InferenceWorkerRegistry) -> Result<T>,
+    ) -> Result<T> {
+        let operation_result = operation(&registry);
+        let shutdown_result = registry.shutdown().map_err(anyhow::Error::from);
+        combine_vulkan_evidence_operation_and_shutdown(operation_result, shutdown_result)
+    }
+
+    fn combine_vulkan_evidence_operation_and_shutdown<T>(
+        operation_result: Result<T>,
+        shutdown_result: Result<()>,
+    ) -> Result<T> {
+        match (operation_result, shutdown_result) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(_), Err(shutdown)) => Err(shutdown),
+            (Err(error), Err(shutdown)) => {
+                let combined =
+                    format!("{error:#}; evidence worker cleanup also failed: {shutdown:#}");
+                Err(error.context(combined))
+            }
+        }
+    }
+
+    fn require_exactly_one_vulkan_evidence_binding<T>(mut bindings: Vec<T>) -> Result<T> {
+        if bindings.len() != 1 {
+            bail!("fixture pack must advertise exactly one expected Vulkan target")
+        }
+        Ok(bindings
+            .pop()
+            .expect("checked exact matching binding count"))
+    }
+
+    fn is_vulkan_evidence_activation_path(path: &Path) -> bool {
+        let components = path
+            .components()
+            .filter_map(|component| match component {
+                Component::Normal(value) => value.to_str(),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        components.windows(2).any(|pair| {
+            pair[0].eq_ignore_ascii_case("workers") && pair[1].eq_ignore_ascii_case("packs")
+        })
+    }
+
+    fn vulkan_evidence_statistics(values: &[u64]) -> Result<VulkanEvidenceStatistics> {
+        if values.is_empty() || values.len() > VULKAN_EVIDENCE_WARM_RUNS {
+            bail!("evidence timing count is outside the bounded harness contract")
+        }
+        let mut sorted = values.to_vec();
+        sorted.sort_unstable();
+        let percentile = |numerator: usize| {
+            let rank = (sorted.len() * numerator).div_ceil(100).saturating_sub(1);
+            sorted[rank]
+        };
+        Ok(VulkanEvidenceStatistics {
+            p50_ms: percentile(50),
+            p95_ms: percentile(95),
+        })
+    }
+
+    fn vulkan_evidence_run_set(
+        observations: &[VulkanEvidenceObservation],
+        cold: bool,
+    ) -> Result<VulkanEvidenceRunSet> {
+        let expected = if cold {
+            VULKAN_EVIDENCE_COLD_RUNS
+        } else {
+            VULKAN_EVIDENCE_WARM_RUNS
+        };
+        if observations.len() != expected {
+            bail!("evidence run count must be exactly {expected}")
+        }
+        if observations.iter().any(|run| run.warm_reused == cold) {
+            bail!("evidence run violated its cold/warm generation contract")
+        }
+        let end_to_end_ms = observations
+            .iter()
+            .map(|run| run.end_to_end_ms)
+            .collect::<Vec<_>>();
+        let backend_processing_ms = observations
+            .iter()
+            .map(|run| run.backend_processing_ms)
+            .collect::<Vec<_>>();
+        let model_load_ms = cold.then(|| {
+            observations
+                .iter()
+                .map(|run| run.model_load_ms)
+                .collect::<Vec<_>>()
+        });
+        Ok(VulkanEvidenceRunSet {
+            end_to_end: vulkan_evidence_statistics(&end_to_end_ms)?,
+            end_to_end_ms,
+            backend_processing: vulkan_evidence_statistics(&backend_processing_ms)?,
+            backend_processing_ms,
+            model_load: model_load_ms
+                .as_deref()
+                .map(vulkan_evidence_statistics)
+                .transpose()?,
+            model_load_ms,
+        })
+    }
+
+    fn write_vulkan_evidence_create_new(
+        output: &Path,
+        report: &VulkanEvidenceReport,
+    ) -> Result<()> {
+        write_vulkan_evidence_create_new_with(output, |file| {
+            serde_json::to_writer(file, report).context("serialize metadata-only evidence")
+        })
+    }
+
+    fn write_vulkan_evidence_create_new_with(
+        output: &Path,
+        write_report: impl FnOnce(&std::fs::File) -> Result<()>,
+    ) -> Result<()> {
+        let parent = output
+            .parent()
+            .ok_or_else(|| anyhow!("evidence output has no parent directory"))?;
+        let parent_metadata = std::fs::symlink_metadata(parent)
+            .context("evidence output parent must already exist")?;
+        if !parent_metadata.is_dir() || metadata_is_link_or_reparse(&parent_metadata) {
+            bail!("evidence output parent must be a physical non-reparse directory")
+        }
+        reject_link_components(parent)?;
+        if output.exists() || std::fs::symlink_metadata(output).is_ok() {
+            bail!("evidence output must be a new path")
+        }
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(output)
+            .context("create evidence output")?;
+        write_report(&file)?;
+        file.sync_all().context("sync evidence output")?;
+        Ok(())
+    }
+
+    fn write_vulkan_evidence_after_cleanup(
+        output: &Path,
+        report: &VulkanEvidenceReport,
+        cleanup: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        cleanup().context("clean up fixture evidence resources before staging report")?;
+        write_vulkan_evidence_create_new(output, report)
+    }
+
+    fn assert_vulkan_evidence_regular_file(
+        path: &Path,
+        label: &str,
+        max_bytes: u64,
+    ) -> Result<u64> {
+        if !path.is_absolute() {
+            bail!("{label} must be an absolute path")
+        }
+        reject_link_components(path)?;
+        let metadata =
+            std::fs::symlink_metadata(path).with_context(|| format!("{label} must exist"))?;
+        if !metadata.is_file() || metadata_is_link_or_reparse(&metadata) || metadata.len() == 0 {
+            bail!("{label} must be a nonempty regular non-reparse file")
+        }
+        if metadata.len() > max_bytes {
+            bail!("{label} exceeds the bounded evidence input limit")
+        }
+        Ok(metadata.len())
+    }
+
+    #[cfg(windows)]
+    fn vulkan_evidence_inputs_from_environment() -> Result<VulkanEvidenceInputs> {
+        let required_path = |name: &str| -> Result<PathBuf> {
+            std::env::var_os(name)
+                .map(PathBuf::from)
+                .ok_or_else(|| anyhow!("set {name} to an absolute fixture path"))
+        };
+        let required_value = |name: &str| -> Result<String> {
+            std::env::var(name).map_err(|_| anyhow!("set {name}"))
+        };
+        let pack_root = required_path("SCRIBE_VULKAN_EVIDENCE_PACK_ROOT")?;
+        let output = required_path("SCRIBE_VULKAN_EVIDENCE_OUTPUT")?;
+        if !pack_root.is_absolute() || !output.is_absolute() {
+            bail!("fixture pack and evidence output must be absolute paths")
+        }
+        let output_parent = output
+            .parent()
+            .ok_or_else(|| anyhow!("evidence output has no parent directory"))?
+            .canonicalize()
+            .context("canonicalize evidence output parent")?;
+        let output_name = output
+            .file_name()
+            .filter(|name| is_safe_vulkan_evidence_output_name(name))
+            .ok_or_else(|| anyhow!("evidence output must name a file"))?;
+        let inputs = VulkanEvidenceInputs {
+            pack_root: pack_root
+                .canonicalize()
+                .context("canonicalize fixture pack root")?,
+            cpu_worker: required_path("SCRIBE_VULKAN_EVIDENCE_CPU_WORKER")?,
+            model: required_path("SCRIBE_VULKAN_EVIDENCE_MODEL")?,
+            model_sha256: canonical_vulkan_evidence_sha256(&required_value(
+                "SCRIBE_VULKAN_EVIDENCE_MODEL_SHA256",
+            )?)?,
+            wav: required_path("SCRIBE_VULKAN_EVIDENCE_WAV")?,
+            wav_sha256: canonical_vulkan_evidence_sha256(&required_value(
+                "SCRIBE_VULKAN_EVIDENCE_WAV_SHA256",
+            )?)?,
+            expected_phrase: normalize_vulkan_evidence_transcript(&required_value(
+                "SCRIBE_VULKAN_EVIDENCE_EXPECTED_PHRASE",
+            )?),
+            expected_stable_device: std::env::var("SCRIBE_VULKAN_EVIDENCE_EXPECTED_STABLE_DEVICE")
+                .map_err(|_| anyhow!("set SCRIBE_VULKAN_EVIDENCE_EXPECTED_STABLE_DEVICE"))?,
+            nvidia_baseline: {
+                let value = std::env::var("SCRIBE_VULKAN_EVIDENCE_NVIDIA_BASELINE_JSON")
+                    .map_err(|_| anyhow!("set SCRIBE_VULKAN_EVIDENCE_NVIDIA_BASELINE_JSON"))?;
+                if value.len() > 1024 {
+                    bail!("NVIDIA baseline metadata exceeds the bounded harness contract")
+                }
+                serde_json::from_str(&value)
+                    .context("NVIDIA baseline metadata is not canonical evidence JSON")?
+            },
+            output: output_parent.join(output_name),
+        };
+        if inputs.expected_phrase.is_empty() || inputs.expected_phrase.len() > 256 {
+            bail!("expected fixture phrase must normalize to 1..=256 bytes")
+        }
+        let stable_device = inputs.expected_stable_device.as_bytes();
+        if stable_device.len() != 19
+            || !stable_device.starts_with(b"native:")
+            || stable_device[11] != b':'
+            || stable_device[14] != b':'
+            || stable_device[17] != b'.'
+            || ![7, 8, 9, 10, 12, 13, 15, 16].iter().all(|index| {
+                stable_device[*index].is_ascii_hexdigit()
+                    && !stable_device[*index].is_ascii_uppercase()
+            })
+            || !matches!(stable_device[18], b'0'..=b'7')
+        {
+            bail!("expected stable device must be a canonical lowercase native PCI identity")
+        }
+        let baseline = &inputs.nvidia_baseline;
+        if !is_bounded_evidence_metadata(&baseline.product, 256)
+            || !is_bounded_evidence_metadata(&baseline.driver, 128)
+            || baseline.memory_total_bytes == 0
+            || baseline.memory_used_bytes > baseline.memory_total_bytes
+            || baseline.gpu_utilization_percent > 10
+            || baseline.memory_used_bytes > baseline.memory_total_bytes / 4
+        {
+            bail!("NVIDIA baseline metadata is noncanonical or fails the idle preflight")
+        }
+        let repository = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .canonicalize()
+            .context("canonicalize repository root")?;
+        let runtime_manifests = repository.join("runtime-manifests");
+        if inputs.output.starts_with(&repository)
+            || inputs.output.starts_with(&runtime_manifests)
+            || inputs.output.starts_with(&inputs.pack_root)
+            || is_vulkan_evidence_activation_path(&inputs.output)
+            || inputs.pack_root.starts_with(&repository)
+            || inputs.pack_root.starts_with(&runtime_manifests)
+        {
+            bail!(
+                "evidence output/fixture pack must remain outside source, runtime-manifest, catalog, and pack roots"
+            )
+        }
+        assert_vulkan_evidence_regular_file(&inputs.cpu_worker, "CPU worker", 512 * 1024 * 1024)?;
+        assert_vulkan_evidence_regular_file(
+            &inputs.model,
+            "GGUF model",
+            VULKAN_EVIDENCE_MAX_MODEL_BYTES,
+        )?;
+        assert_vulkan_evidence_regular_file(
+            &inputs.wav,
+            "WAV fixture",
+            VULKAN_EVIDENCE_MAX_WAV_BYTES,
+        )?;
+        if sha256_file(&inputs.model)? != inputs.model_sha256
+            || sha256_file(&inputs.wav)? != inputs.wav_sha256
+        {
+            bail!("fixture file digest mismatch")
+        }
+        Ok(inputs)
+    }
+
+    #[test]
+    fn vulkan_evidence_statistics_are_deterministic_and_bounded() {
+        let samples = [9, 1, 5, 3, 7];
+        assert_eq!(
+            vulkan_evidence_statistics(&samples).unwrap(),
+            VulkanEvidenceStatistics {
+                p50_ms: 5,
+                p95_ms: 9,
+            }
+        );
+        assert!(vulkan_evidence_statistics(&[]).is_err());
+        assert!(vulkan_evidence_statistics(&[1; VULKAN_EVIDENCE_WARM_RUNS + 1]).is_err());
+        assert!(canonical_vulkan_evidence_sha256(&"A".repeat(64)).is_err());
+        assert!(require_exactly_one_vulkan_evidence_binding::<u8>(Vec::new()).is_err());
+        assert!(require_exactly_one_vulkan_evidence_binding(vec![1, 2]).is_err());
+        assert_eq!(
+            require_exactly_one_vulkan_evidence_binding(vec![1]).unwrap(),
+            1
+        );
+        assert!(is_vulkan_evidence_activation_path(
+            &PathBuf::from("evidence")
+                .join("workers")
+                .join("packs")
+                .join("report.json")
+        ));
+        assert!(vulkan_evidence_millis(u128::MAX, "test").is_err());
+        let combined_error = combine_vulkan_evidence_operation_and_shutdown::<u8>(
+            Err(anyhow!("operation failed")),
+            Err(anyhow!("shutdown failed")),
+        )
+        .unwrap_err()
+        .to_string();
+        assert_eq!(
+            combined_error,
+            "operation failed; evidence worker cleanup also failed: shutdown failed"
+        );
+    }
+
+    #[test]
+    fn vulkan_evidence_report_is_metadata_only_and_create_new() {
+        let cold = vec![
+            VulkanEvidenceObservation {
+                normalized_transcript: "public fixture phrase".to_owned(),
+                end_to_end_ms: 10,
+                backend_processing_ms: 9,
+                model_load_ms: 1,
+                warm_reused: false,
+            };
+            VULKAN_EVIDENCE_COLD_RUNS
+        ];
+        let warm = vec![
+            VulkanEvidenceObservation {
+                normalized_transcript: "public fixture phrase".to_owned(),
+                end_to_end_ms: 8,
+                backend_processing_ms: 7,
+                model_load_ms: 0,
+                warm_reused: true,
+            };
+            VULKAN_EVIDENCE_WARM_RUNS
+        ];
+        let report = VulkanEvidenceReport {
+            schema_version: 1,
+            fixture_only: true,
+            untrusted: true,
+            auto_eligible: false,
+            source_revision: "f".repeat(40),
+            pack: VulkanEvidencePack {
+                id: "scribe-vulkan-windows-x64".to_owned(),
+                version: "fixture-evidence".to_owned(),
+                digest: "a".repeat(64),
+                security_epoch: 1,
+                runtime_abi: 1,
+            },
+            model_sha256: "b".repeat(64),
+            wav_sha256: "c".repeat(64),
+            gpu: VulkanEvidenceGpu {
+                backend: "vulkan".to_owned(),
+                provider: "transcribe-cpp-ggml-vulkan".to_owned(),
+                vendor: "nvidia".to_owned(),
+                device_class: "discrete_gpu".to_owned(),
+                driver: "windows-display:fixture".to_owned(),
+                memory_total_bytes: 1,
+            },
+            nvidia_baseline: VulkanEvidenceNvidiaBaseline {
+                product: "NVIDIA fixture".to_owned(),
+                driver: "fixture".to_owned(),
+                memory_total_bytes: 1,
+                memory_used_bytes: 0,
+                gpu_utilization_percent: 0,
+            },
+            cold_runs_per_backend: VULKAN_EVIDENCE_COLD_RUNS,
+            warm_runs_per_backend: VULKAN_EVIDENCE_WARM_RUNS,
+            cpu: VulkanEvidenceBackendRuns {
+                cold: vulkan_evidence_run_set(&cold, true).unwrap(),
+                warm: vulkan_evidence_run_set(&warm, false).unwrap(),
+            },
+            vulkan: VulkanEvidenceBackendRuns {
+                cold: vulkan_evidence_run_set(&cold, true).unwrap(),
+                warm: vulkan_evidence_run_set(&warm, false).unwrap(),
+            },
+            expected_phrase_present_every_run: true,
+            normalized_transcript_parity: true,
+            same_device_internally_verified: true,
+        };
+        let root = test_root("vulkan-evidence-report");
+        let output = root.join("evidence.json");
+        write_vulkan_evidence_create_new(&output, &report).unwrap();
+        let bytes = std::fs::read(&output).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains("\"fixture_only\":true"));
+        assert!(text.contains("\"untrusted\":true"));
+        assert!(text.contains("\"auto_eligible\":false"));
+        assert!(!text.contains("stable_device"));
+        assert!(!text.contains("public fixture phrase"));
+        assert!(write_vulkan_evidence_create_new(&output, &report).is_err());
+
+        let final_output = root.join("final-evidence.json");
+        let cleanup_failed_output = root.join("cleanup-failed.pending.json");
+        let cleanup_error =
+            write_vulkan_evidence_after_cleanup(&cleanup_failed_output, &report, || {
+                Err(anyhow!("forced cleanup failure"))
+            })
+            .unwrap_err();
+        assert!(cleanup_error.to_string().contains("before staging report"));
+        assert!(!cleanup_failed_output.exists());
+        assert!(!final_output.exists());
+
+        let partial_output = root.join("partial-write.pending.json");
+        let partial_error = write_vulkan_evidence_create_new_with(&partial_output, |mut file| {
+            file.write_all(b"{")
+                .context("write forced partial evidence")?;
+            bail!("forced evidence write failure")
+        })
+        .unwrap_err();
+        assert!(
+            partial_error
+                .to_string()
+                .contains("forced evidence write failure")
+        );
+        assert_eq!(std::fs::read(&partial_output).unwrap(), b"{");
+        assert!(!final_output.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[cfg(windows)]
     #[test]
     #[ignore = "requires a clean-built fixture-signed Vulkan pack, pinned GGUF/WAV fixtures, and a compatible physical GPU"]
@@ -13480,6 +14069,366 @@ mod tests {
                 Err(error) => panic!("could not remove reaped fixture-pack lease: {error}"),
             }
         }
+    }
+
+    #[cfg(windows)]
+    fn vulkan_evidence_gpu_registry(binding: VerifiedPackLaunchBinding) -> InferenceWorkerRegistry {
+        let target = binding.backend_target();
+        assert_eq!(
+            target.backend,
+            BackendKind::Vulkan,
+            "evidence accepts Vulkan only"
+        );
+        let route = InferenceWorkerRoute {
+            provider: WorkerProvider::Vulkan,
+            supervisor: InferenceWorkerSupervisor::for_pack_binding(binding),
+            target: Some(target),
+            health_key: None,
+            consume_retry_bypass: false,
+            auto_evidence_id: None,
+        };
+        let gpu_routes = Arc::new(vec![route]);
+        InferenceWorkerRegistry {
+            // Deliberately empty: explicit GPU must fail rather than route to CPU.
+            routes: Arc::new(Vec::new()),
+            gpu_routes: Arc::new(Mutex::new(GpuRouteCatalogCache::default())),
+            auto_gpu_routes: Arc::new(Mutex::new(GpuRouteCatalogCache::default())),
+            gpu_health_path: None,
+            active_route: Arc::new(Mutex::new(None)),
+            route_execution: Arc::new(Mutex::new(())),
+            gpu_routes_for_testing: Some(VerifiedGpuRouteCatalog {
+                device_set_digest: verified_gpu_device_set_digest(&gpu_routes),
+                routes: gpu_routes,
+                diagnostic: Some("fixture-only Vulkan evidence capture".to_owned()),
+                discovery_fingerprint: "fixture-vulkan-evidence".to_owned(),
+                provider_probe_incomplete: false,
+                skipped_targets: Vec::new(),
+            }),
+        }
+    }
+
+    #[cfg(windows)]
+    fn vulkan_evidence_cpu_registry(cpu_worker: PathBuf) -> InferenceWorkerRegistry {
+        InferenceWorkerRegistry::with_cpu_supervisor(
+            InferenceWorkerSupervisor::unstarted_for_executable(cpu_worker),
+        )
+    }
+
+    #[cfg(windows)]
+    fn run_vulkan_evidence_observation(
+        registry: &InferenceWorkerRegistry,
+        artifact: RuntimeArtifact,
+        preference: AccelerationPreference,
+        audio: &PreparedAudio,
+        expected_gpu_target: Option<&BackendTarget>,
+    ) -> Result<VulkanEvidenceObservation> {
+        let cancellation = std::sync::atomic::AtomicU64::new(0);
+        let started = Instant::now();
+        let execution = registry
+            .transcribe(
+                artifact,
+                preference,
+                audio,
+                TranscriptionOptions::default(),
+                0,
+                &cancellation,
+            )
+            .map_err(anyhow::Error::from)?;
+        match expected_gpu_target {
+            Some(expected) => {
+                let observed = execution
+                    .diagnostics
+                    .resolved_acceleration
+                    .selection
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("explicit Vulkan execution omitted its selection"))?;
+                if observed.target != *expected || observed.target.backend != BackendKind::Vulkan {
+                    bail!(
+                        "explicit Vulkan execution changed the internally verified device binding"
+                    )
+                }
+            }
+            None => {
+                if execution.diagnostics.resolved_acceleration.resolved != ComputeDevice::Cpu
+                    || execution
+                        .diagnostics
+                        .resolved_acceleration
+                        .selection
+                        .is_some()
+                {
+                    bail!("CPU comparator was not served by the explicit CPU worker")
+                }
+            }
+        }
+        Ok(VulkanEvidenceObservation {
+            normalized_transcript: normalize_vulkan_evidence_transcript(&execution.transcript.text),
+            end_to_end_ms: vulkan_evidence_millis(started.elapsed().as_millis(), "end-to-end")?,
+            backend_processing_ms: vulkan_evidence_millis(
+                execution.processing_duration_ms,
+                "backend processing",
+            )?,
+            model_load_ms: vulkan_evidence_millis(
+                execution.diagnostics.model_load_duration_ms,
+                "model load",
+            )?,
+            warm_reused: execution.diagnostics.warm_reused,
+        })
+    }
+
+    #[cfg(windows)]
+    fn collect_vulkan_evidence_cold_runs(
+        create_registry: impl Fn() -> InferenceWorkerRegistry,
+        artifact: &RuntimeArtifact,
+        preference: AccelerationPreference,
+        audio: &PreparedAudio,
+        expected_gpu_target: Option<&BackendTarget>,
+    ) -> Result<Vec<VulkanEvidenceObservation>> {
+        let mut runs = Vec::with_capacity(VULKAN_EVIDENCE_COLD_RUNS);
+        for _ in 0..VULKAN_EVIDENCE_COLD_RUNS {
+            let observation = with_vulkan_evidence_registry(create_registry(), |registry| {
+                run_vulkan_evidence_observation(
+                    registry,
+                    artifact.clone(),
+                    preference,
+                    audio,
+                    expected_gpu_target,
+                )
+            })?;
+            if observation.warm_reused || observation.model_load_ms == 0 {
+                bail!("cold evidence run did not use a fresh worker/model generation")
+            }
+            runs.push(observation);
+        }
+        Ok(runs)
+    }
+
+    #[cfg(windows)]
+    fn collect_vulkan_evidence_warm_runs(
+        registry: &InferenceWorkerRegistry,
+        artifact: &RuntimeArtifact,
+        preference: AccelerationPreference,
+        audio: &PreparedAudio,
+        expected_gpu_target: Option<&BackendTarget>,
+    ) -> Result<Vec<VulkanEvidenceObservation>> {
+        let priming = run_vulkan_evidence_observation(
+            registry,
+            artifact.clone(),
+            preference,
+            audio,
+            expected_gpu_target,
+        )?;
+        if priming.warm_reused || priming.model_load_ms == 0 {
+            bail!("warm evidence priming did not create a fresh worker/model generation")
+        }
+        let mut runs = Vec::with_capacity(VULKAN_EVIDENCE_WARM_RUNS);
+        for _ in 0..VULKAN_EVIDENCE_WARM_RUNS {
+            let observation = run_vulkan_evidence_observation(
+                registry,
+                artifact.clone(),
+                preference,
+                audio,
+                expected_gpu_target,
+            )?;
+            if !observation.warm_reused || observation.model_load_ms != 0 {
+                bail!("measured warm evidence run did not reuse the primed model")
+            }
+            runs.push(observation);
+        }
+        Ok(runs)
+    }
+
+    #[cfg(windows)]
+    fn assert_vulkan_evidence_transcripts(
+        cpu: &[VulkanEvidenceObservation],
+        gpu: &[VulkanEvidenceObservation],
+        expected_phrase: &str,
+    ) -> Result<()> {
+        if cpu.len() != gpu.len() || cpu.is_empty() {
+            bail!("CPU and Vulkan evidence runs are not comparable")
+        }
+        for (cpu_run, gpu_run) in cpu.iter().zip(gpu) {
+            if !cpu_run.normalized_transcript.contains(expected_phrase)
+                || !gpu_run.normalized_transcript.contains(expected_phrase)
+            {
+                bail!("fixture phrase was absent from a measured transcript")
+            }
+            if cpu_run.normalized_transcript != gpu_run.normalized_transcript {
+                bail!("CPU and Vulkan normalized transcripts diverged")
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires freshly built fixture-signed Vulkan and isolated CPU workers plus pinned GGUF/WAV; metadata-only evidence only"]
+    fn windows_vulkan_fixture_evidence_captures_five_cold_and_twenty_warm_runs() {
+        let inputs = vulkan_evidence_inputs_from_environment()
+            .expect("Vulkan evidence harness input contract must hold");
+        let (lease_owner, lease) =
+            crate::gpu_worker_pack::manifest::test_support::lease_existing_fixture(
+                &inputs.pack_root,
+            )
+            .expect("fixture pack must verify under fixture-only trust");
+        let probe = InferenceWorkerSupervisor::for_pack_probe(Arc::new(lease));
+        let bindings = probe
+            .verified_pack_bindings()
+            .expect("fixture pack must complete challenge-bound SCIF Hello");
+        probe.shutdown().expect("fixture pack probe shutdown");
+        drop(probe);
+        let matching_bindings = bindings
+            .into_iter()
+            .filter(|candidate| {
+                let target = candidate.backend_target();
+                target.backend == BackendKind::Vulkan
+                    && target.provider_id.as_str() == "transcribe-cpp-ggml-vulkan"
+                    && candidate.stable_device_identity() == inputs.expected_stable_device
+            })
+            .collect::<Vec<_>>();
+        let binding = require_exactly_one_vulkan_evidence_binding(matching_bindings)
+            .expect("fixture pack must advertise exactly one expected Vulkan target");
+        let target = binding.backend_target();
+        assert_eq!(target.backend, BackendKind::Vulkan);
+        assert_eq!(target.provider_id.as_str(), "transcribe-cpp-ggml-vulkan");
+        assert!(
+            target
+                .driver_version
+                .as_ref()
+                .is_some_and(|value| !value.is_empty())
+        );
+        assert!(target.memory_total_bytes > 0);
+        let artifact = RuntimeArtifact::Gguf(RuntimeModel {
+            id: ModelId::new("whisper_cpp_base_en"),
+            path: inputs.model.clone(),
+            format: ArtifactFormat::Gguf,
+            expected_size_bytes: assert_vulkan_evidence_regular_file(
+                &inputs.model,
+                "GGUF model",
+                VULKAN_EVIDENCE_MAX_MODEL_BYTES,
+            )
+            .unwrap(),
+            expected_sha256: inputs.model_sha256.clone(),
+        });
+        let audio = PreparedAudio::from_wav_path(&inputs.wav).expect("read verified WAV fixture");
+
+        let cpu_cold = collect_vulkan_evidence_cold_runs(
+            || vulkan_evidence_cpu_registry(inputs.cpu_worker.clone()),
+            &artifact,
+            AccelerationPreference::Cpu,
+            &audio,
+            None,
+        )
+        .expect("CPU cold evidence");
+        let gpu_cold = collect_vulkan_evidence_cold_runs(
+            || vulkan_evidence_gpu_registry(binding.clone()),
+            &artifact,
+            AccelerationPreference::Gpu,
+            &audio,
+            Some(&target),
+        )
+        .expect("Vulkan cold evidence");
+        let cpu_warm = with_vulkan_evidence_registry(
+            vulkan_evidence_cpu_registry(inputs.cpu_worker.clone()),
+            |registry| {
+                collect_vulkan_evidence_warm_runs(
+                    registry,
+                    &artifact,
+                    AccelerationPreference::Cpu,
+                    &audio,
+                    None,
+                )
+            },
+        )
+        .expect("CPU warm evidence");
+        let gpu_warm = with_vulkan_evidence_registry(
+            vulkan_evidence_gpu_registry(binding.clone()),
+            |registry| {
+                collect_vulkan_evidence_warm_runs(
+                    registry,
+                    &artifact,
+                    AccelerationPreference::Gpu,
+                    &audio,
+                    Some(&target),
+                )
+            },
+        )
+        .expect("Vulkan warm evidence");
+
+        assert_vulkan_evidence_transcripts(&cpu_cold, &gpu_cold, &inputs.expected_phrase)
+            .expect("cold transcript parity");
+        assert_vulkan_evidence_transcripts(&cpu_warm, &gpu_warm, &inputs.expected_phrase)
+            .expect("warm transcript parity");
+        let pack = target.pack.as_ref().expect("Vulkan target pack identity");
+        let source_revision = env!("SCRIBE_BUILD_REVISION");
+        assert!(
+            source_revision.len() == 40
+                && source_revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+        );
+        let report = VulkanEvidenceReport {
+            schema_version: 1,
+            fixture_only: true,
+            untrusted: true,
+            auto_eligible: false,
+            source_revision: source_revision.to_ascii_lowercase(),
+            pack: VulkanEvidencePack {
+                id: pack.pack_id.clone(),
+                version: pack.pack_version.clone(),
+                digest: canonical_vulkan_evidence_sha256(&pack.pack_digest).unwrap(),
+                security_epoch: pack.security_epoch,
+                runtime_abi: pack.runtime_abi,
+            },
+            model_sha256: inputs.model_sha256,
+            wav_sha256: inputs.wav_sha256,
+            gpu: VulkanEvidenceGpu {
+                backend: "vulkan".to_owned(),
+                provider: target.provider_id.as_str().to_owned(),
+                vendor: serde_json::to_value(target.vendor)
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_owned(),
+                device_class: serde_json::to_value(target.device_class)
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_owned(),
+                driver: target.driver_version.clone().expect("checked driver"),
+                memory_total_bytes: target.memory_total_bytes,
+            },
+            nvidia_baseline: inputs.nvidia_baseline,
+            cold_runs_per_backend: VULKAN_EVIDENCE_COLD_RUNS,
+            warm_runs_per_backend: VULKAN_EVIDENCE_WARM_RUNS,
+            cpu: VulkanEvidenceBackendRuns {
+                cold: vulkan_evidence_run_set(&cpu_cold, true).unwrap(),
+                warm: vulkan_evidence_run_set(&cpu_warm, false).unwrap(),
+            },
+            vulkan: VulkanEvidenceBackendRuns {
+                cold: vulkan_evidence_run_set(&gpu_cold, true).unwrap(),
+                warm: vulkan_evidence_run_set(&gpu_warm, false).unwrap(),
+            },
+            expected_phrase_present_every_run: true,
+            normalized_transcript_parity: true,
+            same_device_internally_verified: true,
+        };
+        drop(binding);
+        write_vulkan_evidence_after_cleanup(&inputs.output, &report, || {
+            let cleanup_deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match std::fs::remove_dir_all(&lease_owner) {
+                    Ok(()) => return Ok(()),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                    Err(error)
+                        if (error.kind() == std::io::ErrorKind::PermissionDenied
+                            || error.raw_os_error() == Some(32))
+                            && Instant::now() < cleanup_deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(25));
+                    }
+                    Err(error) => return Err(error).context("remove reaped fixture-pack lease"),
+                }
+            }
+        })
+        .expect("clean up the fixture lease and stage a bounded metadata-only evidence artifact");
     }
 
     #[test]

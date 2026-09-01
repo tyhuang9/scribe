@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
-    [string]$CargoTargetDirectory
+    [string]$CargoTargetDirectory,
+    [switch]$CmakeRetryDiagnosticsOnly
 )
 
 $ErrorActionPreference = 'Stop'
@@ -65,11 +66,13 @@ if ($env:OS -ne 'Windows_NT') {
 
 $repositoryRoot = [System.IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $buildScript = Join-Path $PSScriptRoot 'build-windows-gpu-worker-pack.ps1'
+$cmakeBootstrapScript = Join-Path $PSScriptRoot 'windows-gpu-worker-cmake-bootstrap.ps1'
 $prepareScript = Join-Path $PSScriptRoot 'prepare-windows-gpu-worker-packs.ps1'
 $cudaInventoryScript = Join-Path $PSScriptRoot 'windows-cuda-sdk-inventory.ps1'
 $autoQualificationReportScript = Join-Path $PSScriptRoot 'report-windows-gpu-auto-qualification.ps1'
 foreach ($script in @(
     $buildScript,
+    $cmakeBootstrapScript,
     $prepareScript,
     $cudaInventoryScript,
     (Join-Path $PSScriptRoot 'report-windows-worker-pack-sizes.ps1'),
@@ -83,6 +86,721 @@ foreach ($script in @(
     ) | Out-Null
     Assert-True ($parseErrors.Count -eq 0) "GPU worker-pack script has PowerShell parse errors: $script"
 }
+. $cmakeBootstrapScript
+function New-TestCanonicalCargoTargetFailure(
+    [string]$CargoTarget,
+    [string]$CrateHash = '0123456789abcdef',
+    [string]$TryCompileLeaf = 'TryCompile-Ab12Cd',
+    [string]$Configuration = 'release'
+) {
+    $source = Join-Path $CargoTarget "$Configuration\build\transcribe-cpp-sys-$CrateHash\out\build\e\src\vulkan-shaders-gen-build\CMakeFiles\CMakeScratch\$TryCompileLeaf\CMakeLists.txt"
+    return @(
+        'error: failed to run custom build command for `transcribe-cpp-sys v0.1.3`',
+        "CMake Warning in $($source.Replace('\', '/')):",
+        '  characters (see CMAKE_OBJECT_PATH_MAX). Object file',
+        "LINK : fatal error LNK1104: cannot open file 'CMakeFiles\cmTC_1a2B3c.dir/intermediate.manifest'"
+    )
+}
+
+function New-TestCanonicalRetryTopology(
+    [string]$CargoTarget,
+    [string]$BuildEnvironment,
+    [string]$CrateHash = '0123456789abcdef',
+    [string]$ShortOutToken = ''
+) {
+    if ([string]::IsNullOrEmpty($ShortOutToken)) { $ShortOutToken = $CrateHash }
+    $out = Join-Path $CargoTarget "release\build\transcribe-cpp-sys-$CrateHash\out"
+    $tcs = Join-Path $BuildEnvironment 'tcs'
+    New-Item -ItemType Directory -Path $out -Force | Out-Null
+    New-Item -ItemType Directory -Path $tcs -Force | Out-Null
+    $link = Join-Path $tcs $ShortOutToken
+    New-Item -ItemType Junction -Path $link -Target $out | Out-Null
+    return [pscustomobject]@{
+        Out = (Get-Item -LiteralPath $out -Force).FullName
+        Link = (Get-Item -LiteralPath $link -Force).FullName
+        Tcs = (Get-Item -LiteralPath $tcs -Force).FullName
+    }
+}
+
+$legacyOsError267CmakeBootstrapFailure = @(
+    'error: failed to run custom build command for `transcribe-cpp-sys v0.1.3`',
+    '  Error: failed to execute command: cmake -S C:\safe\source',
+    '  The directory name is invalid. (os error 267)'
+)
+$legacyCopyCmakeBootstrapFailure = @(
+    'error: failed to run custom build command for `transcribe-cpp-sys v0.1.3`',
+    '  Error: Could not open file for write in copy operation'
+)
+foreach ($diagnostic in @(
+    ($legacyOsError267CmakeBootstrapFailure -join "`r`n"),
+    ($legacyOsError267CmakeBootstrapFailure -join "`n"),
+    ($legacyCopyCmakeBootstrapFailure -join "`r`n"),
+    ($legacyCopyCmakeBootstrapFailure -join "`n")
+)) {
+    if (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure $diagnostic)) { throw 'Exact legacy CMake bootstrap signature regressed.' }
+}
+foreach ($malformedLegacyCmakeBootstrapFailure in @(
+    @('error: failed to run custom build command for `transcribe-cpp-sys v0.1.4`', $legacyOsError267CmakeBootstrapFailure[1], $legacyOsError267CmakeBootstrapFailure[2]),
+    @($legacyOsError267CmakeBootstrapFailure[1], $legacyOsError267CmakeBootstrapFailure[0], $legacyOsError267CmakeBootstrapFailure[2]),
+    @($legacyOsError267CmakeBootstrapFailure[0], '  Error: failed to execute command:', $legacyOsError267CmakeBootstrapFailure[2]),
+    @('unrelated transcribe-cpp-sys', 'The directory name is invalid. (os error 267)'),
+    @($legacyCopyCmakeBootstrapFailure[0], '  Could not open file for write in copy operation unexpectedly')
+)) {
+    if (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure ($malformedLegacyCmakeBootstrapFailure -join "`r`n")) { throw 'Malformed legacy CMake bootstrap signature was classified.' }
+}
+$vulkanShortJunctionFailure = @(
+    'transcribe-cpp-sys: could not create short build junction C:\safe\tcs; building in OUT_DIR (may exceed Windows MAX_PATH in deep checkouts)',
+    'error: failed to run custom build command for `transcribe-cpp-sys v0.1.3`',
+    'vulkan-shaders-gen: warning: object directory is near the configured limit',
+    'CMAKE_OBJECT_PATH_MAX is in effect for this nested target',
+    "LINK : fatal error LNK1104: cannot open file 'CMakeFiles\cmTC_1a2B3c.dir\intermediate.manifest'"
+)
+if (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure $vulkanShortJunctionFailure)) { throw 'Sanitized observed Vulkan short-junction CMake excerpt was not classified.' }
+$capturedVulkanShortJunctionFailure = [System.Collections.Generic.List[object]]::new()
+foreach ($index in 1..157) {
+    $line = switch ($index) {
+        4 { $vulkanShortJunctionFailure[0] }
+        5 { $vulkanShortJunctionFailure[1] }
+        62 { $vulkanShortJunctionFailure[2] }
+        81 { $vulkanShortJunctionFailure[3] }
+        129 { $vulkanShortJunctionFailure[4] }
+        default { 'sanitized Cargo/CMake diagnostic output' }
+    }
+    $capturedVulkanShortJunctionFailure.Add($line)
+}
+if (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure $capturedVulkanShortJunctionFailure.ToArray())) { throw 'Sanitized 157-line observed Vulkan CMake ordering was not classified.' }
+$wrappedProcessStartInfoVulkanFailure = [System.Collections.Generic.List[object]]::new()
+foreach ($index in 1..153) {
+    $line = switch ($index) {
+        1 { $vulkanShortJunctionFailure[0] }
+        2 { $vulkanShortJunctionFailure[1] }
+        58 { $vulkanShortJunctionFailure[2] }
+        77 { $vulkanShortJunctionFailure[3] }
+        125 { $vulkanShortJunctionFailure[4] }
+        default { 'sanitized ProcessStartInfo Cargo/CMake diagnostic output' }
+    }
+    $wrappedProcessStartInfoVulkanFailure.Add($line)
+}
+$wrappedProcessStartInfoVulkanFailure = $wrappedProcessStartInfoVulkanFailure -join "`r`n"
+if (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure $wrappedProcessStartInfoVulkanFailure)) { throw 'Single-string 153-line ProcessStartInfo Vulkan CMake diagnostic was not classified.' }
+$capturedVulkanShortJunctionCrlf = $capturedVulkanShortJunctionFailure -join "`r`n"
+$capturedVulkanShortJunctionLf = $capturedVulkanShortJunctionFailure -join "`n"
+if (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure $capturedVulkanShortJunctionCrlf) -or
+    -not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure $capturedVulkanShortJunctionLf)) {
+    throw 'Single-string CRLF/LF Vulkan CMake diagnostics were not classified.'
+}
+$reverseCapturedVulkanShortJunctionFailure = [System.Collections.Generic.List[object]]::new($capturedVulkanShortJunctionFailure)
+$reverseCapturedVulkanShortJunctionFailure[3] = $vulkanShortJunctionFailure[1]
+$reverseCapturedVulkanShortJunctionFailure[4] = $vulkanShortJunctionFailure[0]
+if (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure ($reverseCapturedVulkanShortJunctionFailure -join "`r`n")) { throw 'Reverse observed Vulkan CMake ordering was classified.' }
+$missingCapturedVulkanShortJunctionFailure = [System.Collections.Generic.List[object]]::new($capturedVulkanShortJunctionFailure)
+$missingCapturedVulkanShortJunctionFailure[80] = 'sanitized Cargo/CMake diagnostic output'
+if (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure ($missingCapturedVulkanShortJunctionFailure -join "`n")) { throw 'Missing observed Vulkan CMake marker was classified.' }
+$interveningVulkanShortJunctionFailure = [System.Collections.Generic.List[object]]::new()
+$interveningVulkanShortJunctionFailure.Add($vulkanShortJunctionFailure[0])
+$interveningVulkanShortJunctionFailure.Add($vulkanShortJunctionFailure[1])
+foreach ($unused in 1..600) { $interveningVulkanShortJunctionFailure.Add('realistic CMake compile output') }
+$interveningVulkanShortJunctionFailure.Add($vulkanShortJunctionFailure[2])
+foreach ($unused in 1..600) { $interveningVulkanShortJunctionFailure.Add('realistic nested CMake output') }
+$interveningVulkanShortJunctionFailure.Add($vulkanShortJunctionFailure[3])
+foreach ($unused in 1..600) { $interveningVulkanShortJunctionFailure.Add('realistic CMake try-compile output') }
+$interveningVulkanShortJunctionFailure.Add($vulkanShortJunctionFailure[4])
+if (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure $interveningVulkanShortJunctionFailure.ToArray())) { throw 'Bounded Vulkan CMake classifier lost ordered markers amid realistic output.' }
+foreach ($malformedVulkanShortJunctionFailure in @(
+    @($vulkanShortJunctionFailure | Select-Object -Skip 1),
+    @($vulkanShortJunctionFailure[1], $vulkanShortJunctionFailure[0], $vulkanShortJunctionFailure[4], $vulkanShortJunctionFailure[2], $vulkanShortJunctionFailure[3]),
+    @($vulkanShortJunctionFailure[0], 'error: failed to run custom build command for `transcribe-cpp-sys v0.1.3', $vulkanShortJunctionFailure[2], $vulkanShortJunctionFailure[3], $vulkanShortJunctionFailure[4]),
+    @('transcribe-cpp-sys: could not create short build junction C:\safe\tcs; building in OUT_DIR (unexpected suffix)', $vulkanShortJunctionFailure[1], $vulkanShortJunctionFailure[2], $vulkanShortJunctionFailure[3], $vulkanShortJunctionFailure[4]),
+    @($vulkanShortJunctionFailure[0], $vulkanShortJunctionFailure[1], $vulkanShortJunctionFailure[2], $vulkanShortJunctionFailure[3], 'LINK : fatal error LNK1104: cannot open file ''CMakeFiles\cmTC_xyz.dir\intermediate.manifest'''),
+    @('unrelated LNK1104')
+)) {
+    if (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure $malformedVulkanShortJunctionFailure) { throw 'Malformed Vulkan CMake signature was classified.' }
+}
+$overlongVulkanShortJunctionFailure = [System.Collections.Generic.List[object]]::new()
+foreach ($unused in 1..2048) { $overlongVulkanShortJunctionFailure.Add('noise') }
+foreach ($line in $vulkanShortJunctionFailure) { $overlongVulkanShortJunctionFailure.Add($line) }
+if (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure $overlongVulkanShortJunctionFailure.ToArray()) { throw 'Overlong Vulkan CMake output was classified outside the bounded window.' }
+$unboundTcsSuccessfulJunctionFailure = @(
+    'error: failed to run custom build command for `transcribe-cpp-sys v0.1.3`',
+    'CMake Warning in C:/safe/env/tcs/0123456789abcdef/build/e/src/vulkan-shaders-gen-build/CMakeFiles/CMakeScratch/TryCompile-Ab12Cd/CMakeLists.txt:',
+    '  characters (see CMAKE_OBJECT_PATH_MAX). Object file',
+    "LINK : fatal error LNK1104: cannot open file 'CMakeFiles\cmTC_1a2B3c.dir/intermediate.manifest'"
+)
+foreach ($diagnostic in @(
+    ($unboundTcsSuccessfulJunctionFailure -join "`r`n"),
+    ($unboundTcsSuccessfulJunctionFailure -join "`n")
+)) {
+    if (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure $diagnostic) {
+        throw 'A free-standing tcs warning source was classified without a Cargo target.'
+    }
+}
+$canonicalFixtureRoot = Join-Path ([IO.Path]::GetTempPath()) "scribe-canonical-retry-$([guid]::NewGuid().ToString('N'))"
+try {
+    New-Item -ItemType Directory -Path $canonicalFixtureRoot | Out-Null
+    $canonicalClassifierRoot = Join-Path $canonicalFixtureRoot 'valid-target'
+    $canonicalBuildEnvironment = Join-Path $canonicalFixtureRoot 'valid-environment'
+    $canonicalCrateHash = 'ea4e9b75a8d2a9db'
+    $canonicalShortOutToken = 'a8206a5e1a40df03'
+    $validTopology = New-TestCanonicalRetryTopology $canonicalClassifierRoot $canonicalBuildEnvironment $canonicalCrateHash $canonicalShortOutToken
+    $canonicalCargoTargetFailure = @(New-TestCanonicalCargoTargetFailure $canonicalClassifierRoot $canonicalCrateHash)
+    $ephemeralWarningSource = Join-Path $validTopology.Out 'build\e\src\vulkan-shaders-gen-build\CMakeFiles\CMakeScratch\TryCompile-Ab12Cd\CMakeLists.txt'
+    Assert-True (-not (Test-Path -LiteralPath $ephemeralWarningSource)) 'Canonical retry fixture unexpectedly depends on an ephemeral CMakeLists file.'
+
+    $otherCanonicalClassifierRoot = Join-Path $canonicalFixtureRoot 'other-target'
+    $emptyBuildEnvironment = Join-Path $canonicalFixtureRoot 'empty-environment'
+    New-Item -ItemType Directory -Path $otherCanonicalClassifierRoot | Out-Null
+    New-Item -ItemType Directory -Path $emptyBuildEnvironment | Out-Null
+
+    $sameTokenTarget = Join-Path $canonicalFixtureRoot 'same-token-target'
+    $sameTokenEnvironment = Join-Path $canonicalFixtureRoot 'same-token-environment'
+    $null = New-TestCanonicalRetryTopology $sameTokenTarget $sameTokenEnvironment
+    $sameTokenFailure = @(New-TestCanonicalCargoTargetFailure $sameTokenTarget)
+
+    $reparseCanonicalClassifierRoot = Join-Path $canonicalFixtureRoot 'reparse-target'
+    $reparseCanonicalClassifierOutside = Join-Path $canonicalFixtureRoot 'reparse-outside'
+    $reparseBuildEnvironment = Join-Path $canonicalFixtureRoot 'reparse-environment'
+    New-Item -ItemType Directory -Path $reparseCanonicalClassifierRoot | Out-Null
+    New-Item -ItemType Directory -Path $reparseCanonicalClassifierOutside | Out-Null
+    New-Item -ItemType Junction -Path (Join-Path $reparseCanonicalClassifierRoot 'release') -Target $reparseCanonicalClassifierOutside | Out-Null
+    $null = New-TestCanonicalRetryTopology $reparseCanonicalClassifierRoot $reparseBuildEnvironment
+
+    $substitutionTarget = Join-Path $canonicalFixtureRoot 'substitution-target'
+    $substitutionEnvironment = Join-Path $canonicalFixtureRoot 'substitution-environment'
+    $substitutionTopology = New-TestCanonicalRetryTopology $substitutionTarget $substitutionEnvironment
+    $substitutionOutside = Join-Path $canonicalFixtureRoot 'substitution-outside'
+    New-Item -ItemType Directory -Path $substitutionOutside | Out-Null
+    Remove-Item -LiteralPath $substitutionTopology.Link -Force
+    New-Item -ItemType Junction -Path $substitutionTopology.Link -Target $substitutionOutside | Out-Null
+
+    $multipleTarget = Join-Path $canonicalFixtureRoot 'multiple-target'
+    $multipleEnvironment = Join-Path $canonicalFixtureRoot 'multiple-environment'
+    $multipleTopology = New-TestCanonicalRetryTopology $multipleTarget $multipleEnvironment
+    New-Item -ItemType Junction -Path (Join-Path $multipleTopology.Tcs 'aaaaaaaaaaaaaaaa') -Target $multipleTopology.Out | Out-Null
+
+    $wrongTypeTarget = Join-Path $canonicalFixtureRoot 'wrong-type-target'
+    $wrongTypeEnvironment = Join-Path $canonicalFixtureRoot 'wrong-type-environment'
+    $wrongTypeOut = Join-Path $wrongTypeTarget 'release\build\transcribe-cpp-sys-0123456789abcdef\out'
+    New-Item -ItemType Directory -Path $wrongTypeOut -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $wrongTypeEnvironment 'tcs\0123456789abcdef') -Force | Out-Null
+
+    $noncanonicalLeafTarget = Join-Path $canonicalFixtureRoot 'noncanonical-leaf-target'
+    $noncanonicalLeafEnvironment = Join-Path $canonicalFixtureRoot 'noncanonical-leaf-environment'
+    $noncanonicalLeafOut = Join-Path $noncanonicalLeafTarget 'release\build\transcribe-cpp-sys-0123456789abcdef\out'
+    New-Item -ItemType Directory -Path $noncanonicalLeafOut -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $noncanonicalLeafEnvironment 'tcs') -Force | Out-Null
+    New-Item -ItemType Junction -Path (Join-Path $noncanonicalLeafEnvironment 'tcs\A8206A5E1A40DF03') -Target $noncanonicalLeafOut | Out-Null
+
+    $shortLeafTarget = Join-Path $canonicalFixtureRoot 'short-leaf-target'
+    $shortLeafEnvironment = Join-Path $canonicalFixtureRoot 'short-leaf-environment'
+    $shortLeafOut = Join-Path $shortLeafTarget 'release\build\transcribe-cpp-sys-0123456789abcdef\out'
+    New-Item -ItemType Directory -Path $shortLeafOut -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $shortLeafEnvironment 'tcs') -Force | Out-Null
+    New-Item -ItemType Junction -Path (Join-Path $shortLeafEnvironment 'tcs\a8206a5e1a40df0') -Target $shortLeafOut | Out-Null
+
+    $longLeafTarget = Join-Path $canonicalFixtureRoot 'long-leaf-target'
+    $longLeafEnvironment = Join-Path $canonicalFixtureRoot 'long-leaf-environment'
+    $longLeafOut = Join-Path $longLeafTarget 'release\build\transcribe-cpp-sys-0123456789abcdef\out'
+    New-Item -ItemType Directory -Path $longLeafOut -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $longLeafEnvironment 'tcs') -Force | Out-Null
+    New-Item -ItemType Junction -Path (Join-Path $longLeafEnvironment 'tcs\a8206a5e1a40df030') -Target $longLeafOut | Out-Null
+
+    $wrongOutTarget = Join-Path $canonicalFixtureRoot 'wrong-out-target'
+    $wrongOutEnvironment = Join-Path $canonicalFixtureRoot 'wrong-out-environment'
+    $wrongExpectedOut = Join-Path $wrongOutTarget 'release\build\transcribe-cpp-sys-0123456789abcdef\out'
+    $wrongActualOut = Join-Path $canonicalFixtureRoot 'wrong-actual-out'
+    New-Item -ItemType Directory -Path $wrongExpectedOut -Force | Out-Null
+    New-Item -ItemType Directory -Path $wrongActualOut | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $wrongOutEnvironment 'tcs') -Force | Out-Null
+    New-Item -ItemType Junction -Path (Join-Path $wrongOutEnvironment 'tcs\0123456789abcdef') -Target $wrongActualOut | Out-Null
+
+    $reparseTcsTarget = Join-Path $canonicalFixtureRoot 'reparse-tcs-target'
+    $reparseTcsEnvironment = Join-Path $canonicalFixtureRoot 'reparse-tcs-environment'
+    $reparseTcsOutside = Join-Path $canonicalFixtureRoot 'reparse-tcs-outside'
+    $reparseTcsOut = Join-Path $reparseTcsTarget 'release\build\transcribe-cpp-sys-0123456789abcdef\out'
+    New-Item -ItemType Directory -Path $reparseTcsOut -Force | Out-Null
+    New-Item -ItemType Directory -Path $reparseTcsEnvironment | Out-Null
+    New-Item -ItemType Directory -Path $reparseTcsOutside | Out-Null
+    New-Item -ItemType Junction -Path (Join-Path $reparseTcsEnvironment 'tcs') -Target $reparseTcsOutside | Out-Null
+    New-Item -ItemType Junction -Path (Join-Path $reparseTcsOutside '0123456789abcdef') -Target $reparseTcsOut | Out-Null
+
+    $capturedCanonicalCargoTargetFailure = [Collections.Generic.List[object]]::new()
+    foreach ($index in 1..157) {
+        $line = switch ($index) {
+            4 { $canonicalCargoTargetFailure[0] }
+            62 { $canonicalCargoTargetFailure[1] }
+            81 { $canonicalCargoTargetFailure[2] }
+            129 { $canonicalCargoTargetFailure[3] }
+            default { 'sanitized canonical-target Cargo/CMake diagnostic output' }
+        }
+        $capturedCanonicalCargoTargetFailure.Add($line)
+    }
+    foreach ($diagnostic in @(
+        ($capturedCanonicalCargoTargetFailure -join "`r`n"),
+        ($capturedCanonicalCargoTargetFailure -join "`n")
+    )) {
+        Assert-True (
+            Test-ScribeGpuWorkerKnownCmakeBootstrapFailure `
+                -Output $diagnostic `
+                -CargoTarget $canonicalClassifierRoot `
+                -BuildEnvironment $canonicalBuildEnvironment
+        ) 'Full captured-order canonical Cargo-target CMake diagnostic was not classified.'
+    }
+    foreach ($diagnostic in @(
+        ($sameTokenFailure -join "`r`n"),
+        ($sameTokenFailure -join "`n")
+    )) {
+        Assert-True (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure `
+            -Output $diagnostic `
+            -CargoTarget $sameTokenTarget `
+            -BuildEnvironment $sameTokenEnvironment) 'Same-token canonical Cargo-target CMake diagnostic was not classified.'
+    }
+    foreach ($topology in @(
+        @($canonicalClassifierRoot, $canonicalBuildEnvironment),
+        @($otherCanonicalClassifierRoot, $emptyBuildEnvironment)
+    )) {
+        Assert-True (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure `
+            -Output $unboundTcsSuccessfulJunctionFailure `
+            -CargoTarget $topology[0] `
+            -BuildEnvironment $topology[1])) 'A free-standing tcs warning source was classified with unrelated active roots.'
+    }
+
+    $reorderedCanonicalCargoTargetFailure = [Collections.Generic.List[object]]::new($capturedCanonicalCargoTargetFailure)
+    $reorderedCanonicalCargoTargetFailure[61] = $canonicalCargoTargetFailure[2]
+    $reorderedCanonicalCargoTargetFailure[80] = $canonicalCargoTargetFailure[1]
+    Assert-True (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure `
+        -Output ($reorderedCanonicalCargoTargetFailure -join "`r`n") `
+        -CargoTarget $canonicalClassifierRoot `
+        -BuildEnvironment $canonicalBuildEnvironment)) 'Reordered canonical Cargo-target diagnostic was classified.'
+
+    foreach ($missingIndex in @(0, 1, 2, 3)) {
+        $missingStep = @($canonicalCargoTargetFailure | Where-Object { $_ -cne $canonicalCargoTargetFailure[$missingIndex] })
+        Assert-True (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure `
+            -Output ($missingStep -join "`n") `
+            -CargoTarget $canonicalClassifierRoot `
+            -BuildEnvironment $canonicalBuildEnvironment)) "Canonical Cargo-target diagnostic missing step $missingIndex was classified."
+    }
+    Assert-True (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure `
+        -Output $canonicalCargoTargetFailure `
+        -CargoTarget $otherCanonicalClassifierRoot `
+        -BuildEnvironment $canonicalBuildEnvironment)) 'A canonical warning from a different Cargo target was classified.'
+    Assert-True (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure `
+        -Output $canonicalCargoTargetFailure `
+        -CargoTarget $canonicalClassifierRoot `
+        -BuildEnvironment $emptyBuildEnvironment)) 'A canonical warning with a missing tcs inventory was classified.'
+    Assert-True (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure `
+        -Output $canonicalCargoTargetFailure)) 'A canonical Cargo-target warning was classified without its target identity.'
+    $traversalWarningSource = "$($canonicalClassifierRoot.Replace('\', '/'))/release/build/../build/transcribe-cpp-sys-0123456789abcdef/out/build/e/src/vulkan-shaders-gen-build/CMakeFiles/CMakeScratch/TryCompile-Ab12Cd/CMakeLists.txt"
+    foreach ($malformedCanonicalCargoTargetFailure in @(
+        @('error: failed to run custom build command for `transcribe-cpp-sys v0.1.4`', $canonicalCargoTargetFailure[1], $canonicalCargoTargetFailure[2], $canonicalCargoTargetFailure[3]),
+        @(New-TestCanonicalCargoTargetFailure $canonicalClassifierRoot '0123456789abcde'),
+        @(New-TestCanonicalCargoTargetFailure $canonicalClassifierRoot '0123456789abcdef' 'TryCompile-' ),
+        @(New-TestCanonicalCargoTargetFailure $canonicalClassifierRoot '0123456789abcdef' ('TryCompile-' + ('a' * 65))),
+        @(New-TestCanonicalCargoTargetFailure $canonicalClassifierRoot '0123456789abcdef' 'TryCompile-Ab12Cd' 'debug'),
+        @($canonicalCargoTargetFailure[0], 'CMake Warning in release/build/transcribe-cpp-sys-0123456789abcdef/out/build/e/src/vulkan-shaders-gen-build/CMakeFiles/CMakeScratch/TryCompile-Ab12Cd/CMakeLists.txt:', $canonicalCargoTargetFailure[2], $canonicalCargoTargetFailure[3]),
+        @($canonicalCargoTargetFailure[0], "CMake Warning in ${traversalWarningSource}:", $canonicalCargoTargetFailure[2], $canonicalCargoTargetFailure[3]),
+        @($canonicalCargoTargetFailure[0], $canonicalCargoTargetFailure[1].Replace('transcribe-cpp-sys-', 'other-sys-'), $canonicalCargoTargetFailure[2], $canonicalCargoTargetFailure[3]),
+        @($canonicalCargoTargetFailure[0], $canonicalCargoTargetFailure[1].Replace('vulkan-shaders-gen-build', 'cuda-shaders-gen-build'), $canonicalCargoTargetFailure[2], $canonicalCargoTargetFailure[3]),
+        @($canonicalCargoTargetFailure[0], $canonicalCargoTargetFailure[1], '  characters (see CMAKE_NINJA_FORCE_RESPONSE_FILE). Object file', $canonicalCargoTargetFailure[3]),
+        @($canonicalCargoTargetFailure[0], $canonicalCargoTargetFailure[1], 'unrelated note mentioning CMAKE_OBJECT_PATH_MAX', $canonicalCargoTargetFailure[3]),
+        @($canonicalCargoTargetFailure[0], $canonicalCargoTargetFailure[1], $canonicalCargoTargetFailure[2], "LINK : fatal error LNK1104: cannot open file 'unrelated.manifest'"),
+        @($canonicalCargoTargetFailure[0], $canonicalCargoTargetFailure[1], $canonicalCargoTargetFailure[2], "LINK : fatal error LNK1104: cannot open file 'CMakeFiles\cmTC_1a2B3c.dir/intermediate.pdb'"),
+        @($canonicalCargoTargetFailure[0], $canonicalCargoTargetFailure[1], $canonicalCargoTargetFailure[2], "LINK : fatal error LNK1104: cannot open file 'CMakeFiles\cmTC_1a2B3c.dir\intermediate.manifest'"),
+        @($canonicalCargoTargetFailure[0], $canonicalCargoTargetFailure[1], $canonicalCargoTargetFailure[2], "LINK : fatal error LNK1104: cannot open file 'CMakeFiles/cmTC_1a2B3c.dir/intermediate.manifest'"),
+        @($canonicalCargoTargetFailure[0], $canonicalCargoTargetFailure[1], $canonicalCargoTargetFailure[2], "LINK : fatal error LNK1104: cannot open file 'CMakeFiles\cmTC_1a2B3c.dir/../intermediate.manifest'"),
+        @($canonicalCargoTargetFailure[0], $canonicalCargoTargetFailure[1], $canonicalCargoTargetFailure[2], "LINK : fatal error LNK1104: cannot open file 'CMakeFiles\cmTC_$('a' * 65).dir/intermediate.manifest'"),
+        @($canonicalCargoTargetFailure[0], $canonicalCargoTargetFailure[1], $canonicalCargoTargetFailure[2], "link : fatal error LNK1104: cannot open file 'CMakeFiles\cmTC_1a2B3c.dir/intermediate.manifest'"),
+        @($canonicalCargoTargetFailure[0], $canonicalCargoTargetFailure[1], $canonicalCargoTargetFailure[2], "unexpected prefix LINK : fatal error LNK1104: cannot open file 'CMakeFiles\cmTC_1a2B3c.dir/intermediate.manifest'"),
+        @($canonicalCargoTargetFailure[0], $vulkanShortJunctionFailure[0], $canonicalCargoTargetFailure[1], $canonicalCargoTargetFailure[2], $canonicalCargoTargetFailure[3])
+    )) {
+        Assert-True (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure `
+            -Output ($malformedCanonicalCargoTargetFailure -join "`r`n") `
+            -CargoTarget $canonicalClassifierRoot `
+            -BuildEnvironment $canonicalBuildEnvironment)) 'Malformed canonical Cargo-target signature was classified.'
+    }
+
+    foreach ($invalidTopology in @(
+        @($reparseCanonicalClassifierRoot, $reparseBuildEnvironment, 'reparse OUT_DIR'),
+        @($substitutionTarget, $substitutionEnvironment, 'substituted junction target'),
+        @($multipleTarget, $multipleEnvironment, 'multiple tcs inventory'),
+        @($wrongTypeTarget, $wrongTypeEnvironment, 'wrong-type tcs entry'),
+        @($noncanonicalLeafTarget, $noncanonicalLeafEnvironment, 'noncanonical tcs leaf'),
+        @($shortLeafTarget, $shortLeafEnvironment, '15-character lowercase-hex tcs leaf'),
+        @($longLeafTarget, $longLeafEnvironment, '17-character lowercase-hex tcs leaf'),
+        @($wrongOutTarget, $wrongOutEnvironment, 'wrong OUT_DIR junction target'),
+        @($reparseTcsTarget, $reparseTcsEnvironment, 'reparse tcs inventory')
+    )) {
+        $invalidTopologyDiagnostic = @(New-TestCanonicalCargoTargetFailure $invalidTopology[0])
+        Assert-True (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure `
+            -Output $invalidTopologyDiagnostic `
+            -CargoTarget $invalidTopology[0] `
+            -BuildEnvironment $invalidTopology[1])) "Canonical diagnostic with $($invalidTopology[2]) was classified."
+    }
+
+    $overlongCanonicalCargoTargetFailure = [Collections.Generic.List[object]]::new()
+    foreach ($unused in 1..2048) { $overlongCanonicalCargoTargetFailure.Add('noise') }
+    foreach ($line in $canonicalCargoTargetFailure) { $overlongCanonicalCargoTargetFailure.Add($line) }
+    Assert-True (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure `
+        -Output $overlongCanonicalCargoTargetFailure.ToArray() `
+        -CargoTarget $canonicalClassifierRoot `
+        -BuildEnvironment $canonicalBuildEnvironment)) 'Overlong canonical Cargo-target output was classified.'
+}
+finally {
+    Remove-Item -LiteralPath $canonicalFixtureRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
+$builderTokens = $null
+$builderParseErrors = $null
+$builderAst = [System.Management.Automation.Language.Parser]::ParseFile(
+    $buildScript,
+    [ref]$builderTokens,
+    [ref]$builderParseErrors
+)
+Assert-True ($builderParseErrors.Count -eq 0) 'Builder source could not be parsed for native-process retry diagnostics.'
+$nativeProcessFunction = $builderAst.Find({
+    param($Ast)
+    $Ast -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+    $Ast.Name -ceq 'Invoke-NativeProcess'
+}, $true)
+$retryDiagnosticFunction = $builderAst.Find({
+    param($Ast)
+    $Ast -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+    $Ast.Name -ceq 'Get-NativeProcessRetryDiagnostic'
+}, $true)
+Assert-True ($null -ne $nativeProcessFunction -and $null -ne $retryDiagnosticFunction) 'Builder lost the native-process retry diagnostic functions.'
+$captureOverflowOptIn = 'AllowDiagnosticCaptureOverflowOnSuccessWithUnusedOutput'
+$captureOverflowOptInCalls = @($builderAst.FindAll({
+    param($Ast)
+    if ($Ast -isnot [System.Management.Automation.Language.CommandAst] -or
+        $Ast.GetCommandName() -cne 'Invoke-NativeProcess') {
+        return $false
+    }
+    return @($Ast.CommandElements | Where-Object {
+        $_ -is [System.Management.Automation.Language.CommandParameterAst] -and
+        $_.ParameterName -ceq $captureOverflowOptIn
+    }).Count -eq 1
+}, $true))
+Assert-True ($captureOverflowOptInCalls.Count -eq 1) 'Diagnostic capture overflow opt-in must annotate exactly one native-process invocation.'
+Assert-True (
+    $captureOverflowOptInCalls[0].Extent.Text.Contains("'--bin', 'scribe-worker-pack-tool'") -and
+    $captureOverflowOptInCalls[0].Extent.Text.Contains("'Worker-pack authoring tool build failed.'")
+) 'Diagnostic capture overflow opt-in escaped the unused-output worker-pack authoring-tool cargo build.'
+$workerBuildRetryStatements = @($builderAst.FindAll({
+    param($Ast)
+    $Ast -is [System.Management.Automation.Language.TryStatementAst] -and
+    $Ast.Extent.Text.Contains('Test-ScribeGpuWorkerKnownCmakeBootstrapFailure') -and
+    $Ast.Extent.Text.Contains('Enable-ValidatedCmakeBuildJunction')
+}, $true) | Sort-Object { $_.Extent.Text.Length })
+Assert-True ($workerBuildRetryStatements.Count -ge 1) 'Builder lost the validated worker-build retry wrapper.'
+$workerBuildRetryStatement = $workerBuildRetryStatements[0]
+Assert-True ($workerBuildRetryStatement.Extent.Text -cnotmatch 'while\s*\(') 'Worker-build retry wrapper became an unbounded retry loop.'
+Assert-True (-not $workerBuildRetryStatement.Extent.Text.Contains($captureOverflowOptIn)) 'Worker-build retry path gained diagnostic capture overflow tolerance.'
+
+function Invoke-WorkerBuildRetryHarness(
+    [string]$Diagnostic,
+    [bool]$FailRetry,
+    [string]$CargoTarget,
+    [string]$BuildEnvironment
+) {
+    $state = [pscustomobject]@{
+        NativeInvocations = 0
+        JunctionInvocations = 0
+    }
+    function Invoke-NativeProcess(
+        [string]$Executable,
+        [string[]]$Arguments,
+        [string]$FailureMessage
+    ) {
+        $state.NativeInvocations += 1
+        if ($state.NativeInvocations -eq 1) {
+            throw [ScribeGpuWorkerNativeProcessFailure]::new(
+                'synthetic initial worker build failure',
+                17,
+                $Diagnostic,
+                '',
+                $false
+            )
+        }
+        if ($FailRetry) {
+            throw [System.InvalidOperationException]::new('synthetic retry failure')
+        }
+        return [pscustomobject]@{ Stdout = ''; Stderr = '' }
+    }
+    function Get-NativeProcessRetryDiagnostic([System.Exception]$Failure) {
+        return @(Get-ScribeGpuWorkerNativeProcessRetryDiagnostic $Failure)
+    }
+    function Enable-ValidatedCmakeBuildJunction([string]$BuildEnvironment, [string]$CargoTarget) {
+        $state.JunctionInvocations += 1
+    }
+
+    $cargo = 'synthetic-cargo.exe'
+    $workerBuildArguments = @('build')
+    $Backend = 'Vulkan'
+    $shortBuild = [pscustomobject]@{ BuildEnvironment = $BuildEnvironment }
+    $cargoTarget = $CargoTarget
+    $failure = $null
+    $previousWarningPreference = $WarningPreference
+    try {
+        $WarningPreference = 'SilentlyContinue'
+        & ([scriptblock]::Create($workerBuildRetryStatement.Extent.Text))
+    }
+    catch {
+        $failure = $_.Exception
+    }
+    finally {
+        $WarningPreference = $previousWarningPreference
+    }
+    return [pscustomobject]@{
+        NativeInvocations = $state.NativeInvocations
+        JunctionInvocations = $state.JunctionInvocations
+        Failure = $failure
+    }
+}
+
+$builderRetryRoot = Join-Path ([IO.Path]::GetTempPath()) "scribe-builder-retry-$([guid]::NewGuid().ToString('N'))"
+try {
+    New-Item -ItemType Directory -Path $builderRetryRoot | Out-Null
+    $builderRetryTarget = Join-Path $builderRetryRoot 'target'
+    $builderRetryEnvironment = Join-Path $builderRetryRoot 'environment'
+    $builderWrongRetryTarget = Join-Path $builderRetryRoot 'wrong-target'
+    $builderWrongRetryEnvironment = Join-Path $builderRetryRoot 'wrong-environment'
+    $builderRetryCrateHash = 'ea4e9b75a8d2a9db'
+    $builderRetryShortOutToken = 'a8206a5e1a40df03'
+    $null = New-TestCanonicalRetryTopology $builderRetryTarget $builderRetryEnvironment $builderRetryCrateHash $builderRetryShortOutToken
+    New-Item -ItemType Directory -Path $builderWrongRetryTarget | Out-Null
+    New-Item -ItemType Directory -Path $builderWrongRetryEnvironment | Out-Null
+    $builderCanonicalFailure = @(New-TestCanonicalCargoTargetFailure $builderRetryTarget $builderRetryCrateHash)
+    $acceptedRetrySuccess = Invoke-WorkerBuildRetryHarness ($builderCanonicalFailure -join "`r`n") $false $builderRetryTarget $builderRetryEnvironment
+    Assert-True ($acceptedRetrySuccess.NativeInvocations -eq 2 -and
+        $acceptedRetrySuccess.JunctionInvocations -eq 1 -and
+        $null -eq $acceptedRetrySuccess.Failure) 'Accepted canonical Cargo-target signature did not invoke exactly one isolated retry.'
+    $acceptedRetryFailure = Invoke-WorkerBuildRetryHarness ($builderCanonicalFailure -join "`n") $true $builderRetryTarget $builderRetryEnvironment
+    Assert-True ($acceptedRetryFailure.NativeInvocations -eq 2 -and
+        $acceptedRetryFailure.JunctionInvocations -eq 1 -and
+        $null -ne $acceptedRetryFailure.Failure -and
+        $acceptedRetryFailure.Failure.Message -ceq 'synthetic retry failure') 'A failed isolated canonical retry was retried again or lost its failure.'
+    $rejectedRetry = Invoke-WorkerBuildRetryHarness ($builderCanonicalFailure -join "`r`n") $false $builderWrongRetryTarget $builderRetryEnvironment
+    Assert-True ($rejectedRetry.NativeInvocations -eq 1 -and
+        $rejectedRetry.JunctionInvocations -eq 0 -and
+        $null -ne $rejectedRetry.Failure) 'A wrong-target canonical signature invoked the isolated retry.'
+    $wrongEnvironmentRetry = Invoke-WorkerBuildRetryHarness ($builderCanonicalFailure -join "`r`n") $false $builderRetryTarget $builderWrongRetryEnvironment
+    Assert-True ($wrongEnvironmentRetry.NativeInvocations -eq 1 -and
+        $wrongEnvironmentRetry.JunctionInvocations -eq 0 -and
+        $null -ne $wrongEnvironmentRetry.Failure) 'A canonical signature with the wrong build environment invoked the isolated retry.'
+    $unboundTcsRetry = Invoke-WorkerBuildRetryHarness ($unboundTcsSuccessfulJunctionFailure -join "`r`n") $false $builderRetryTarget $builderRetryEnvironment
+    Assert-True ($unboundTcsRetry.NativeInvocations -eq 1 -and
+        $unboundTcsRetry.JunctionInvocations -eq 0 -and
+        $null -ne $unboundTcsRetry.Failure) 'A free-standing tcs warning source invoked the isolated retry.'
+}
+finally {
+    Remove-Item -LiteralPath $builderRetryRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
+$nativeProcessHarness = Join-Path ([System.IO.Path]::GetTempPath()) "scribe-native-process-retry-$([guid]::NewGuid().ToString('N')).ps1"
+try {
+    $nativeProcessHarnessTail = @'
+$splitFixtureCommand = @"
+[Console]::Out.WriteLine('transcribe-cpp-sys: could not create short build junction C:\safe\tcs; building in OUT_DIR (may exceed Windows MAX_PATH in deep checkouts)')
+[Console]::Out.WriteLine('error: failed to run custom build command for ``transcribe-cpp-sys v0.1.3``')
+[Console]::Error.WriteLine('vulkan-shaders-gen: warning: object directory is near the configured limit')
+[Console]::Error.WriteLine('CMAKE_OBJECT_PATH_MAX is in effect for this nested target')
+[Console]::Error.WriteLine("LINK : fatal error LNK1104: cannot open file 'CMakeFiles\cmTC_1a2B3c.dir\intermediate.manifest'")
+exit 17
+"@
+$splitFailure = $null
+try {
+    $null = Invoke-NativeProcess (Join-Path $PSHOME 'pwsh.exe') @('-NoProfile', '-Command', $splitFixtureCommand) 'Split-stream fixture failed.'
+}
+catch {
+    $splitFailure = $_.Exception
+}
+if ($null -eq $splitFailure) { throw 'Split-stream native process fixture unexpectedly succeeded.' }
+$ordinaryResult = Invoke-NativeProcess (Join-Path $PSHOME 'pwsh.exe') @('-NoProfile', '-Command', "[Console]::Out.WriteLine('ordinary stdout'); [Console]::Error.WriteLine('ordinary stderr')") 'Ordinary fixture failed.'
+$ordinaryFailureMessage = $null
+try {
+    $null = Invoke-NativeProcess (Join-Path $PSHOME 'pwsh.exe') @('-NoProfile', '-Command', "[Console]::Error.WriteLine('ordinary failure detail'); exit 19") 'Ordinary failure fixture failed.'
+}
+catch {
+    $ordinaryFailureMessage = $_.Exception.Message
+}
+$oversizedFailure = $null
+try {
+    $null = Invoke-NativeProcess (Join-Path $PSHOME 'pwsh.exe') @('-NoProfile', '-Command', '1..1025 | ForEach-Object { [Console]::Out.WriteLine(''bounded diagnostic noise'') }; exit 23') 'Oversized fixture failed.'
+}
+catch {
+    $oversizedFailure = $_.Exception
+}
+$unterminatedFailure = $null
+try {
+    $null = Invoke-NativeProcess (Join-Path $PSHOME 'pwsh.exe') @('-NoProfile', '-Command', '[Console]::Out.Write(''x'' * 1025); exit 29') 'Unterminated fixture failed.'
+}
+catch {
+    $unterminatedFailure = $_.Exception
+}
+$characterBudgetFailure = $null
+try {
+    $null = Invoke-NativeProcess (Join-Path $PSHOME 'pwsh.exe') @('-NoProfile', '-Command', '$chunk = (''x'' * 1023) + [Environment]::NewLine; 1..1024 | ForEach-Object { [Console]::Out.Write($chunk) }; [Console]::Out.Write(''y''); exit 31') 'Character-budget fixture failed.'
+}
+catch {
+    $characterBudgetFailure = $_.Exception
+}
+$highVolumeCommand = @"
+[Console]::Out.WriteLine('transcribe-cpp-sys: could not create short build junction C:\safe\tcs; building in OUT_DIR (may exceed Windows MAX_PATH in deep checkouts)')
+[Console]::Out.WriteLine('error: failed to run custom build command for ``transcribe-cpp-sys v0.1.3``')
+1..900 | ForEach-Object { [Console]::Out.WriteLine('bounded stdout noise') }
+[Console]::Error.WriteLine('vulkan-shaders-gen: warning: object directory is near the configured limit')
+1..900 | ForEach-Object { [Console]::Error.WriteLine('bounded stderr noise') }
+[Console]::Error.WriteLine('CMAKE_OBJECT_PATH_MAX is in effect for this nested target')
+[Console]::Error.WriteLine("LINK : fatal error LNK1104: cannot open file 'CMakeFiles\cmTC_1a2B3c.dir\intermediate.manifest'")
+exit 37
+"@
+$highVolumeFailure = $null
+try {
+    $null = Invoke-NativeProcess (Join-Path $PSHOME 'pwsh.exe') @('-NoProfile', '-Command', $highVolumeCommand) 'High-volume split-stream fixture failed.'
+}
+catch {
+    $highVolumeFailure = $_.Exception
+}
+$earlyMarkersOverflowCommand = @"
+[Console]::Out.WriteLine('transcribe-cpp-sys: could not create short build junction C:\safe\tcs; building in OUT_DIR (may exceed Windows MAX_PATH in deep checkouts)')
+[Console]::Out.WriteLine('error: failed to run custom build command for ``transcribe-cpp-sys v0.1.3``')
+[Console]::Error.WriteLine('vulkan-shaders-gen: warning: object directory is near the configured limit')
+[Console]::Error.WriteLine('CMAKE_OBJECT_PATH_MAX is in effect for this nested target')
+[Console]::Error.WriteLine("LINK : fatal error LNK1104: cannot open file 'CMakeFiles\cmTC_1a2B3c.dir\intermediate.manifest'")
+[Console]::Error.Write('z' * 1025)
+exit 41
+"@
+$earlyMarkersOverflowFailure = $null
+try {
+    $null = Invoke-NativeProcess (Join-Path $PSHOME 'pwsh.exe') @('-NoProfile', '-Command', $earlyMarkersOverflowCommand) 'Early-marker overflow fixture failed.'
+}
+catch {
+    $earlyMarkersOverflowFailure = $_.Exception
+}
+$successfulOverflowCommand = "1..1025 | ForEach-Object { [Console]::Out.WriteLine('successful diagnostic noise') }; exit 0"
+$defaultSuccessfulOverflowFailure = $null
+try {
+    $null = Invoke-NativeProcess (Join-Path $PSHOME 'pwsh.exe') @('-NoProfile', '-Command', $successfulOverflowCommand) 'Default successful-overflow fixture failed.'
+}
+catch {
+    $defaultSuccessfulOverflowFailure = $_.Exception
+}
+$annotatedSuccessfulOverflow = Invoke-NativeProcess `
+    (Join-Path $PSHOME 'pwsh.exe') `
+    @('-NoProfile', '-Command', $successfulOverflowCommand) `
+    'Annotated successful-overflow fixture failed.' `
+    -AllowDiagnosticCaptureOverflowOnSuccessWithUnusedOutput
+$annotatedFailedOverflow = $null
+try {
+    $null = Invoke-NativeProcess `
+        (Join-Path $PSHOME 'pwsh.exe') `
+        @('-NoProfile', '-Command', "1..1025 | ForEach-Object { [Console]::Error.WriteLine('sensitive failed diagnostic noise') }; exit 47") `
+        'Annotated failed-overflow fixture failed.' `
+        -AllowDiagnosticCaptureOverflowOnSuccessWithUnusedOutput
+}
+catch {
+    $annotatedFailedOverflow = $_.Exception
+}
+[pscustomobject]@{
+    SplitFailureType = $splitFailure.GetType().FullName
+    SplitMessage = $splitFailure.Message
+    SplitStdout = $splitFailure.Stdout
+    SplitStderr = $splitFailure.Stderr
+    SplitStdoutClassified = Test-ScribeGpuWorkerKnownCmakeBootstrapFailure @($splitFailure.Stdout)
+    SplitStderrClassified = Test-ScribeGpuWorkerKnownCmakeBootstrapFailure @($splitFailure.Stderr)
+    SplitCombinedClassified = Test-ScribeGpuWorkerKnownCmakeBootstrapFailure @(Get-NativeProcessRetryDiagnostic $splitFailure)
+    OrdinaryStdout = $ordinaryResult.Stdout
+    OrdinaryStderr = $ordinaryResult.Stderr
+    OrdinaryFailureMessage = $ordinaryFailureMessage
+    OversizedFailureMessage = $oversizedFailure.Message
+    OversizedClassified = Test-ScribeGpuWorkerKnownCmakeBootstrapFailure @(Get-NativeProcessRetryDiagnostic $oversizedFailure)
+    UnterminatedExceeded = $unterminatedFailure.CaptureExceeded
+    UnterminatedClassified = Test-ScribeGpuWorkerKnownCmakeBootstrapFailure @(Get-NativeProcessRetryDiagnostic $unterminatedFailure)
+    CharacterBudgetExceeded = $characterBudgetFailure.CaptureExceeded
+    CharacterBudgetClassified = Test-ScribeGpuWorkerKnownCmakeBootstrapFailure @(Get-NativeProcessRetryDiagnostic $characterBudgetFailure)
+    HighVolumeClassified = Test-ScribeGpuWorkerKnownCmakeBootstrapFailure @(Get-NativeProcessRetryDiagnostic $highVolumeFailure)
+    EarlyMarkersOverflowExceeded = $earlyMarkersOverflowFailure.CaptureExceeded
+    EarlyMarkersOverflowClassified = Test-ScribeGpuWorkerKnownCmakeBootstrapFailure @(Get-NativeProcessRetryDiagnostic $earlyMarkersOverflowFailure)
+    DefaultSuccessfulOverflowExceeded = $defaultSuccessfulOverflowFailure.CaptureExceeded
+    DefaultSuccessfulOverflowClassified = Test-ScribeGpuWorkerKnownCmakeBootstrapFailure @(Get-NativeProcessRetryDiagnostic $defaultSuccessfulOverflowFailure)
+    AnnotatedSuccessfulOverflowReturned = $null -ne $annotatedSuccessfulOverflow
+    AnnotatedSuccessfulOverflowStdout = $annotatedSuccessfulOverflow.Stdout
+    AnnotatedSuccessfulOverflowStderr = $annotatedSuccessfulOverflow.Stderr
+    AnnotatedFailedOverflowExceeded = $annotatedFailedOverflow.CaptureExceeded
+    AnnotatedFailedOverflowExitCode = $annotatedFailedOverflow.ExitCode
+    AnnotatedFailedOverflowMessage = $annotatedFailedOverflow.Message
+    AnnotatedFailedOverflowClassified = Test-ScribeGpuWorkerKnownCmakeBootstrapFailure @(Get-NativeProcessRetryDiagnostic $annotatedFailedOverflow)
+} | ConvertTo-Json -Compress
+'@
+    [System.IO.File]::WriteAllText(
+        $nativeProcessHarness,
+        @(
+            (Get-Content -LiteralPath $cmakeBootstrapScript -Raw),
+            $nativeProcessFunction.Extent.Text,
+            $retryDiagnosticFunction.Extent.Text,
+            $nativeProcessHarnessTail
+        ) -join "`r`n`r`n",
+        [System.Text.UTF8Encoding]::new($false)
+    )
+    $nativeProcessHarnessResult = Invoke-NativeProcess `
+        (Join-Path $PSHOME 'pwsh.exe') `
+        @('-NoProfile', '-File', $nativeProcessHarness)
+    Assert-True ([string]::IsNullOrWhiteSpace($nativeProcessHarnessResult.Stderr)) "Native-process retry harness emitted stderr: $($nativeProcessHarnessResult.Stderr)"
+    $nativeProcessResult = $nativeProcessHarnessResult.Stdout | ConvertFrom-Json
+    Assert-True ($nativeProcessResult.SplitFailureType -ceq 'ScribeGpuWorkerNativeProcessFailure') 'Split-stream failure did not retain the structured native-process failure.'
+    Assert-True ($nativeProcessResult.SplitMessage.Contains('Split-stream fixture failed. Exit code 17.')) 'Split-stream failure lost its clear sanitized message.'
+    Assert-True ($nativeProcessResult.SplitStdout.Contains($vulkanShortJunctionFailure[0]) -and $nativeProcessResult.SplitStdout.Contains($vulkanShortJunctionFailure[1])) 'Split-stream failure did not retain the bounded raw stdout diagnostic.'
+    Assert-True ($nativeProcessResult.SplitStderr.Contains($vulkanShortJunctionFailure[2]) -and $nativeProcessResult.SplitStderr.Contains($vulkanShortJunctionFailure[4])) 'Split-stream failure did not retain the bounded raw stderr diagnostic.'
+    Assert-True (-not $nativeProcessResult.SplitStdoutClassified -and -not $nativeProcessResult.SplitStderrClassified -and $nativeProcessResult.SplitCombinedClassified) 'Split-stream Vulkan retry did not require the deterministic bounded stdout-then-stderr combination.'
+    Assert-True ($nativeProcessResult.OrdinaryStdout -ceq 'ordinary stdout' -and $nativeProcessResult.OrdinaryStderr -ceq 'ordinary stderr') 'Ordinary Invoke-NativeProcess success callers lost separate stdout/stderr behavior.'
+    Assert-True ($nativeProcessResult.OrdinaryFailureMessage.Contains('Ordinary failure fixture failed. Exit code 19. ordinary failure detail')) 'Ordinary Invoke-NativeProcess failure callers lost the expected failure detail.'
+    Assert-True ($nativeProcessResult.OversizedFailureMessage.Contains('Child process output exceeded the bounded in-memory diagnostic capture')) 'Oversized native-process diagnostics were not rejected before retry classification.'
+    Assert-True (-not $nativeProcessResult.OversizedClassified) 'Oversized native-process diagnostics were eligible for CMake bootstrap retry classification.'
+    Assert-True ($nativeProcessResult.UnterminatedExceeded -and -not $nativeProcessResult.UnterminatedClassified) 'An overlong unterminated line was not a typed non-retryable overflow.'
+    Assert-True ($nativeProcessResult.CharacterBudgetExceeded -and -not $nativeProcessResult.CharacterBudgetClassified) 'The per-stream character budget was not enforced as a non-retryable overflow.'
+    Assert-True $nativeProcessResult.HighVolumeClassified 'High-volume split-stream output was not drained and classified deterministically.'
+    Assert-True ($nativeProcessResult.EarlyMarkersOverflowExceeded -and -not $nativeProcessResult.EarlyMarkersOverflowClassified) 'Valid early markers remained retryable after a later capture overflow.'
+    Assert-True ($nativeProcessResult.DefaultSuccessfulOverflowExceeded -and -not $nativeProcessResult.DefaultSuccessfulOverflowClassified) 'An ordinary successful child escaped fail-closed diagnostic capture overflow handling.'
+    Assert-True ($nativeProcessResult.AnnotatedSuccessfulOverflowReturned -and
+        [string]::IsNullOrEmpty($nativeProcessResult.AnnotatedSuccessfulOverflowStdout) -and
+        [string]::IsNullOrEmpty($nativeProcessResult.AnnotatedSuccessfulOverflowStderr)) 'The annotated unused-output success did not tolerate overflow without exposing truncated output.'
+    Assert-True ($nativeProcessResult.AnnotatedFailedOverflowExceeded -and
+        $nativeProcessResult.AnnotatedFailedOverflowExitCode -eq 47 -and
+        $nativeProcessResult.AnnotatedFailedOverflowMessage.Contains('Child process output exceeded the bounded in-memory diagnostic capture') -and
+        $nativeProcessResult.AnnotatedFailedOverflowMessage.Length -le 256 -and
+        -not $nativeProcessResult.AnnotatedFailedOverflowMessage.Contains('sensitive failed diagnostic noise') -and
+        -not $nativeProcessResult.AnnotatedFailedOverflowClassified) 'Annotated nonzero overflow was not a bounded, sanitized, retry-ineligible failure.'
+}
+finally {
+    Remove-Item -LiteralPath $nativeProcessHarness -Force -ErrorAction SilentlyContinue
+}
+if ($CmakeRetryDiagnosticsOnly) {
+    Write-Output 'Windows GPU worker-pack CMake retry diagnostic tests passed.'
+    return
+}
+$topologyRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("scribe-pack-cmake-topology-$([guid]::NewGuid().ToString('N'))")
+try {
+    $buildDirectory = Join-Path $topologyRoot 'cargo\release\build\transcribe-cpp-sys-0123456789abcdef\out\build'
+    $outsideDirectory = Join-Path $topologyRoot 'outside'
+    New-Item -ItemType Directory -Path $buildDirectory -Force | Out-Null
+    New-Item -ItemType Directory -Path $outsideDirectory -Force | Out-Null
+    $sentinel = Join-Path $outsideDirectory 'must-not-delete.txt'
+    [System.IO.File]::WriteAllText($sentinel, 'sentinel')
+    New-Item -ItemType Junction -Path (Join-Path $buildDirectory 'escaped') -Target $outsideDirectory | Out-Null
+    $rejected = $false
+    try { Assert-ScribeGpuWorkerNoReparseDescendants $buildDirectory } catch { $rejected = $true }
+    Assert-True $rejected 'CMake bootstrap deletion topology accepted a descendant junction.'
+    Assert-True (Test-Path -LiteralPath $sentinel -PathType Leaf) 'CMake bootstrap topology validation deleted outside-scope data.'
+    $regularFileRejected = $false
+    try { $null = Get-ScribeGpuWorkerPhysicalDirectory $sentinel 'test file' } catch { $regularFileRejected = $true }
+    Assert-True $regularFileRejected 'CMake bootstrap topology accepted a regular file as a directory.'
+}
+finally {
+    if (Test-Path -LiteralPath $topologyRoot) { Remove-Item -LiteralPath $topologyRoot -Recurse -Force }
+}
+$buildSource = Get-Content -LiteralPath $buildScript -Raw
+$deletionGuardAt = $buildSource.IndexOf('Assert-ScribeGpuWorkerNoReparseDescendants $currentBuild.FullName')
+$inventoryGuardAt = $buildSource.IndexOf('$currentEntries = @(Get-ChildItem -LiteralPath $currentTcs.FullName -Force)')
+$deletionAt = $buildSource.IndexOf('Remove-Item -LiteralPath $buildDirectory -Recurse -Force')
+Assert-True ($deletionGuardAt -ge 0 -and $deletionGuardAt -lt $deletionAt) 'Builder deletion is not guarded by descendant reparse validation.'
+Assert-True ($inventoryGuardAt -ge 0 -and $inventoryGuardAt -lt $deletionAt) 'Builder deletion is not guarded by current OUT_DIR inventory validation.'
 . $cudaInventoryScript
 $autoQualificationReport = Join-Path ([System.IO.Path]::GetTempPath()) "scribe-gpu-auto-qualification-$([guid]::NewGuid().ToString('N')).txt"
 try {
@@ -190,6 +908,46 @@ foreach ($name in $toolchainEnvironmentNames) {
         Exists = $null -ne $value
         Value = if ($null -eq $value) { $null } else { [string]$value.Value }
     }
+}
+$exportedPinnedEnvironment = @(& $buildScript `
+    -Backend Vulkan `
+    -PackVersion '0.1.0-fixture' `
+    -OutputDirectory $toolchainOutput `
+    -SigningMode Fixture `
+    -ToolchainCheckOnly `
+    -ExportPinnedMsvcEnvironment)
+$toolchainExportSucceeded = $?
+Assert-True ($toolchainExportSucceeded -and $exportedPinnedEnvironment.Count -eq 1) 'Pinned MSVC environment export did not return one validated document.'
+try {
+    $exportedPinnedEnvironment = [string]$exportedPinnedEnvironment[0] | ConvertFrom-Json
+}
+catch {
+    throw 'Pinned MSVC environment export was not canonical JSON.'
+}
+Assert-True ($exportedPinnedEnvironment.schema_version -eq 1) 'Pinned MSVC environment export has an unexpected schema.'
+$exportedNames = @($exportedPinnedEnvironment.environment.PSObject.Properties.Name | Sort-Object)
+$expectedExportedNames = @(
+    'Path', 'INCLUDE', 'LIB', 'LIBPATH', 'VCINSTALLDIR',
+    'VCToolsInstallDir', 'VCToolsVersion', 'VSINSTALLDIR',
+    'WindowsSdkDir', 'WindowsSDKVersion', 'WindowsSdkBinPath',
+    'WindowsSdkVerBinPath', 'UniversalCRTSdkDir', 'UCRTVersion',
+    'Platform', 'VSCMD_ARG_HOST_ARCH', 'VSCMD_ARG_TGT_ARCH',
+    'VSCMD_ARG_VCVARS_VER', 'VSCMD_ARG_winsdk', 'CC', 'CXX', 'AR',
+    'CC_x86_64_pc_windows_msvc', 'CXX_x86_64_pc_windows_msvc',
+    'AR_x86_64_pc_windows_msvc', 'CMAKE_C_COMPILER',
+    'CMAKE_CXX_COMPILER', 'CMAKE_LINKER', 'CMAKE_AR',
+    'CMAKE_MAKE_PROGRAM', 'CMAKE_GENERATOR',
+    'CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER'
+) | Sort-Object
+Assert-True `
+    ($exportedNames.Count -eq $expectedExportedNames.Count -and
+    -not (Compare-Object -ReferenceObject $expectedExportedNames -DifferenceObject $exportedNames -CaseSensitive)) `
+    'Pinned MSVC environment export has an unexpected field set.'
+foreach ($name in $toolchainEnvironmentNames) {
+    $before = $toolchainEnvironmentBefore[$name]
+    $after = Get-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue
+    Assert-True (($null -ne $after) -eq $before.Exists) "Pinned MSVC export changed whether process environment variable $name exists."
+    if ($before.Exists) { Assert-True ([string]$after.Value -ceq [string]$before.Value) "Pinned MSVC export changed process environment variable $name." }
 }
 & $buildScript `
     -Backend Vulkan `

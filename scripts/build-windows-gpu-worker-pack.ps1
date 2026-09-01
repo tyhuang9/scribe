@@ -14,12 +14,18 @@ param(
     [string]$ToolchainManifestPath,
     [string]$NativeArchiveDirectory,
     [string]$CargoTargetDirectory,
-    [switch]$ToolchainCheckOnly
+    [switch]$ToolchainCheckOnly,
+    [switch]$ExportPinnedMsvcEnvironment
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 . (Join-Path $PSScriptRoot 'windows-cuda-sdk-inventory.ps1')
+. (Join-Path $PSScriptRoot 'windows-gpu-worker-cmake-bootstrap.ps1')
+
+if ($ExportPinnedMsvcEnvironment -and -not $ToolchainCheckOnly) {
+    throw 'Pinned MSVC environment export is only available with ToolchainCheckOnly.'
+}
 
 if (-not $ToolchainCheckOnly -and
     $SigningMode -eq 'Production' -and
@@ -138,52 +144,32 @@ function Resolve-ShortCargoTargetDirectory(
 function Invoke-NativeProcess(
     [string]$Executable,
     [string[]]$Arguments,
-    [string]$FailureMessage
+    [string]$FailureMessage,
+    [switch]$AllowDiagnosticCaptureOverflowOnSuccessWithUnusedOutput
 ) {
-    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
-    $startInfo.FileName = $Executable
-    $startInfo.UseShellExecute = $false
-    $startInfo.CreateNoWindow = $true
-    $startInfo.RedirectStandardOutput = $true
-    $startInfo.RedirectStandardError = $true
-    foreach ($argument in $Arguments) {
-        $startInfo.ArgumentList.Add($argument)
-    }
-    $process = [System.Diagnostics.Process]::new()
-    $process.StartInfo = $startInfo
-    try {
-        if (-not $process.Start()) {
-            throw $FailureMessage
-        }
-        $stdout = $process.StandardOutput.ReadToEndAsync()
-        $stderr = $process.StandardError.ReadToEndAsync()
-        $process.WaitForExit()
-        $output = $stdout.GetAwaiter().GetResult()
-        $errorOutput = $stderr.GetAwaiter().GetResult()
-        if ($process.ExitCode -ne 0) {
-            $detail = $errorOutput.Trim()
-            if (-not $detail) {
-                $detail = $output.Trim()
-            }
-            throw "$FailureMessage Exit code $($process.ExitCode). $detail"
-        }
-        return [pscustomobject]@{
-            Stdout = $output
-            Stderr = $errorOutput
-        }
-    }
-    finally {
-        $process.Dispose()
-    }
+    return Invoke-ScribeGpuWorkerBoundedNativeProcess `
+        $Executable `
+        $Arguments `
+        $FailureMessage `
+        -AllowDiagnosticCaptureOverflowOnSuccessWithUnusedOutput:$AllowDiagnosticCaptureOverflowOnSuccessWithUnusedOutput
+}
+
+function Get-NativeProcessRetryDiagnostic([System.Exception]$Failure) {
+    return @(Get-ScribeGpuWorkerNativeProcessRetryDiagnostic $Failure)
 }
 
 function Enable-ValidatedCmakeBuildJunction(
     [string]$BuildEnvironment,
     [string]$CargoTarget
 ) {
-    $tcsRoot = Join-Path $BuildEnvironment 'tcs'
-    if (-not (Test-Path -LiteralPath $tcsRoot -PathType Container)) {
-        throw 'The isolated transcribe-cpp native-build junction root was not created.'
+    $cargoTargetItem = Get-ScribeGpuWorkerPhysicalDirectory $CargoTarget 'The exact fresh Cargo target'
+    $buildEnvironmentItem = Get-ScribeGpuWorkerPhysicalDirectory $BuildEnvironment 'The isolated native build environment'
+    $canonicalCargoTarget = $cargoTargetItem.FullName.TrimEnd([char[]]@('\', '/'))
+    $canonicalBuildEnvironment = $buildEnvironmentItem.FullName.TrimEnd([char[]]@('\', '/'))
+    $tcsRoot = Join-Path $canonicalBuildEnvironment 'tcs'
+    $tcsItem = Get-ScribeGpuWorkerPhysicalDirectory $tcsRoot 'The isolated transcribe-cpp native-build junction root'
+    if ((Split-Path -Parent $tcsItem.FullName) -cne $canonicalBuildEnvironment) {
+        throw 'The isolated transcribe-cpp native-build junction root escaped the exact build environment.'
     }
     $entries = @(Get-ChildItem -LiteralPath $tcsRoot -Force)
     if ($entries.Count -ne 1) {
@@ -196,17 +182,16 @@ function Enable-ValidatedCmakeBuildJunction(
         @($shortOut.Target).Count -ne 1) {
         throw 'The transcribe-cpp short OUT_DIR is not one exact NTFS junction.'
     }
-    $outDirectory = Get-NormalizedFullPath ([string]@($shortOut.Target)[0])
-    $relativeOut = [System.IO.Path]::GetRelativePath($CargoTarget, $outDirectory).Replace('\', '/')
+    $outDirectory = (Get-Item -LiteralPath ([string]@($shortOut.Target)[0]) -Force).FullName
+    $relativeOut = [System.IO.Path]::GetRelativePath($canonicalCargoTarget, $outDirectory).Replace('\', '/')
     if ($relativeOut -cnotmatch '^release/build/transcribe-cpp-sys-[0-9a-f]{16}/out$') {
         throw 'The transcribe-cpp short OUT_DIR junction escaped the exact fresh Cargo target.'
     }
-    $outItem = Get-Item -LiteralPath $outDirectory -Force
-    if (-not $outItem.PSIsContainer -or
-        ($outItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
-        throw 'The transcribe-cpp OUT_DIR target is not a physical directory.'
+    $outItem = Get-ScribeGpuWorkerPhysicalDirectory $outDirectory 'The transcribe-cpp OUT_DIR target'
+    if (-not (Test-ScribeGpuWorkerPathWithin $outItem.FullName $canonicalCargoTarget)) {
+        throw 'The transcribe-cpp OUT_DIR target escaped the exact fresh Cargo target.'
     }
-    $buildDirectory = Join-Path $outDirectory 'build'
+    $buildDirectory = Join-Path $outItem.FullName 'build'
     if (Test-Path -LiteralPath $buildDirectory) {
         $buildItem = Get-Item -LiteralPath $buildDirectory -Force
         if (-not $buildItem.PSIsContainer -or
@@ -218,18 +203,45 @@ function Enable-ValidatedCmakeBuildJunction(
             )) {
             throw 'Refusing to replace an unexpected transcribe-cpp native build path.'
         }
+        # Revalidate all mutable topology immediately before this only permitted deletion.
+        $currentCargoTarget = Get-ScribeGpuWorkerPhysicalDirectory $CargoTarget 'The exact fresh Cargo target'
+        $currentBuildEnvironment = Get-ScribeGpuWorkerPhysicalDirectory $BuildEnvironment 'The isolated native build environment'
+        $currentTcs = Get-ScribeGpuWorkerPhysicalDirectory $tcsRoot 'The isolated transcribe-cpp native-build junction root'
+        $currentOut = Get-ScribeGpuWorkerPhysicalDirectory $outItem.FullName 'The transcribe-cpp OUT_DIR target'
+        if ($currentCargoTarget.FullName -cne $canonicalCargoTarget -or
+            $currentBuildEnvironment.FullName -cne $canonicalBuildEnvironment -or
+            (Split-Path -Parent $currentTcs.FullName) -cne $canonicalBuildEnvironment -or
+            $currentOut.FullName -cne $outItem.FullName -or
+            -not (Test-ScribeGpuWorkerPathWithin $currentOut.FullName $canonicalCargoTarget)) {
+            throw 'The transcribe-cpp CMake bootstrap topology changed before mutation.'
+        }
+        $currentEntries = @(Get-ChildItem -LiteralPath $currentTcs.FullName -Force)
+        if ($currentEntries.Count -ne 1 -or
+            -not [string]::Equals($currentEntries[0].FullName, $shortOut.FullName, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw 'The transcribe-cpp OUT_DIR inventory changed before mutation.'
+        }
+        $currentShortOut = Get-Item -LiteralPath $shortOut.FullName -Force
+        if (($currentShortOut.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0 -or
+            -not $currentShortOut.PSIsContainer -or
+            $currentShortOut.LinkType -cne 'Junction' -or
+            @($currentShortOut.Target).Count -ne 1 -or
+            (Split-Path -Parent $currentShortOut.FullName) -cne $currentTcs.FullName -or
+            (Get-ScribeGpuWorkerPhysicalDirectory ([string]@($currentShortOut.Target)[0]) 'The transcribe-cpp OUT_DIR target').FullName -cne $outItem.FullName) {
+            throw 'The transcribe-cpp OUT_DIR junction changed before mutation.'
+        }
+        $currentBuild = Get-ScribeGpuWorkerPhysicalDirectory $buildDirectory 'The transcribe-cpp native build directory'
+        if ((Split-Path -Parent $currentBuild.FullName) -cne $outItem.FullName) {
+            throw 'The transcribe-cpp native build topology changed before mutation.'
+        }
+        Assert-ScribeGpuWorkerNoReparseDescendants $currentBuild.FullName
         Remove-Item -LiteralPath $buildDirectory -Recurse -Force
     }
-    $nativeBuild = Join-Path $BuildEnvironment 'native'
+    $nativeBuild = Join-Path $canonicalBuildEnvironment 'native'
     if (Test-Path -LiteralPath $nativeBuild) {
         throw 'The isolated short native build directory was unexpectedly preexisting.'
     }
     New-Item -ItemType Directory -Path $nativeBuild | Out-Null
-    $nativeItem = Get-Item -LiteralPath $nativeBuild -Force
-    if (-not $nativeItem.PSIsContainer -or
-        ($nativeItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
-        throw 'The isolated short native build directory is not physical.'
-    }
+    $nativeItem = Get-ScribeGpuWorkerPhysicalDirectory $nativeBuild 'The isolated short native build directory'
     New-Item -ItemType Junction -Path $buildDirectory -Target $nativeBuild | Out-Null
     $junction = Get-Item -LiteralPath $buildDirectory -Force
     if (-not $junction.PSIsContainer -or
@@ -237,8 +249,8 @@ function Enable-ValidatedCmakeBuildJunction(
         $junction.LinkType -cne 'Junction' -or
         @($junction.Target).Count -ne 1 -or
         -not [string]::Equals(
-            (Get-NormalizedFullPath ([string]@($junction.Target)[0])),
-            $nativeBuild,
+            (Get-ScribeGpuWorkerPhysicalDirectory ([string]@($junction.Target)[0]) 'The isolated short native build directory').FullName,
+            $nativeItem.FullName,
             [System.StringComparison]::OrdinalIgnoreCase
         )) {
         throw 'Could not verify the isolated transcribe-cpp native build junction.'
@@ -318,7 +330,7 @@ function ConvertFrom-VsWhereInstallationPaths([string]$Output, [string]$Componen
         throw "Visual Studio locator output for $ComponentId is oversized."
     }
     $paths = [System.Collections.Generic.List[string]]::new()
-    foreach ($line in @($Output -split "`r?`n")) {
+    foreach ($line in @($Output -split '\r?\n')) {
         if ([string]::IsNullOrWhiteSpace($line)) {
             continue
         }
@@ -454,7 +466,7 @@ function ConvertFrom-VcVarsEnvironmentOutput([string]$Output) {
     $environment = [System.Collections.Generic.Dictionary[string, string]]::new(
         [System.StringComparer]::OrdinalIgnoreCase
     )
-    foreach ($line in @($Output -split "`r?`n")) {
+    foreach ($line in @($Output -split '\r?\n')) {
         if ([string]::IsNullOrWhiteSpace($line) -or $line.StartsWith('=')) {
             continue
         }
@@ -925,7 +937,7 @@ function Assert-BaseToolchain($Contract, [string]$RepositoryRoot) {
     }
     $rustup = Get-CommandPath 'rustup.exe' 'rustup is required to verify the pinned Windows target.'
     $installedTargets = (Invoke-NativeProcess $rustup @('target', 'list', '--installed') 'Could not inspect installed Rust targets.').Stdout
-    if (-not @($installedTargets -split "`r?`n").Contains([string]$Contract.target_triple)) {
+    if (-not @($installedTargets -split '\r?\n').Contains([string]$Contract.target_triple)) {
         throw "Pinned Rust target $($Contract.target_triple) is not installed."
     }
 
@@ -1178,7 +1190,15 @@ if ($ToolchainCheckOnly) {
     try {
         $toolchainEnvironmentState = Set-PinnedMsvcBuildEnvironment $msvcToolchain
         Assert-ActivePinnedMsvcEnvironment $msvcToolchain
-        Write-Output "$Backend worker-pack toolchain matches the pinned contract."
+        if ($ExportPinnedMsvcEnvironment) {
+            [pscustomobject]@{
+                schema_version = 1
+                environment = $msvcToolchain.BuildEnvironment
+            } | ConvertTo-Json -Depth 4 -Compress | Write-Output
+        }
+        else {
+            Write-Output "$Backend worker-pack toolchain matches the pinned contract."
+        }
     }
     finally {
         if ($null -ne $toolchainEnvironmentState) {
@@ -1262,7 +1282,8 @@ try {
         'build', '--locked', '--offline', '--release',
         '--bin', 'scribe-worker-pack-tool',
         '--manifest-path', $authoringManifestPath
-    ) 'Worker-pack authoring tool build failed.'
+    ) 'Worker-pack authoring tool build failed.' `
+        -AllowDiagnosticCaptureOverflowOnSuccessWithUnusedOutput
     $authoringTool = Join-Path $cargoTarget 'release\scribe-worker-pack-tool.exe'
     $null = Assert-RegularNonReparseFile $authoringTool 'Worker-pack authoring tool'
 
@@ -1284,12 +1305,11 @@ try {
         $null = Invoke-NativeProcess $cargo $workerBuildArguments "$Backend inference worker build failed."
     }
     catch {
-        $failure = $_.Exception.Message
-        $isKnownShortPathBootstrap = $failure.Contains('transcribe-cpp-sys') -and (
-            $failure.Contains('The directory name is invalid. (os error 267)') -or
-            $failure.Contains('Could not open file for write in copy operation')
-        )
-        if (-not $isKnownShortPathBootstrap) {
+        $diagnostic = Get-NativeProcessRetryDiagnostic $_.Exception
+        if (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure `
+            -Output $diagnostic `
+            -CargoTarget $cargoTarget `
+            -BuildEnvironment $shortBuild.BuildEnvironment)) {
             throw
         }
         Enable-ValidatedCmakeBuildJunction $shortBuild.BuildEnvironment $cargoTarget
