@@ -96,6 +96,31 @@ function Assert-ScribeFixtureCmakeRetryAssessmentDoesNotContain([string]$Json, [
     }
 }
 
+function Copy-ScribeFixtureCmakeRetryAssessmentForTest([object]$Assessment) {
+    $copy = [ordered]@{}
+    foreach ($property in $Assessment.PSObject.Properties) {
+        $value = $property.Value
+        if ($property.Name -cin @('stdout', 'stderr', 'combined') -and $null -ne $value) {
+            $streamCopy = [ordered]@{}
+            foreach ($streamProperty in $value.PSObject.Properties) {
+                $streamCopy[$streamProperty.Name] = $streamProperty.Value
+            }
+            $value = [pscustomobject]$streamCopy
+        }
+        $copy[$property.Name] = $value
+    }
+    return [pscustomobject]$copy
+}
+
+function Assert-ScribeFixtureCmakeRetryAssessmentUnavailable([object]$Assessment, [string[]]$SensitiveValues) {
+    $expected = '{"schema_version":1,"assessment_status":"unavailable","failure_kind":"not_evaluated","exit_code":null,"capture_overflow":null,"retry_eligible":false,"diagnostic_order":"not_evaluated","stdout":null,"stderr":null,"combined":null,"topology_rejection_stage":"not_evaluated"}'
+    $json = ConvertTo-ScribeGpuWorkerFixtureCmakeRetryAssessmentJson $Assessment
+    Assert-True ($json -ceq $expected) 'Malformed fixture retry assessment did not fail closed to the canonical unavailable document.'
+    Assert-True ($json.Length -le 16384) 'Canonical unavailable fixture retry assessment exceeded its size bound.'
+    Assert-ScribeFixtureCmakeRetryAssessmentJson $json
+    Assert-ScribeFixtureCmakeRetryAssessmentDoesNotContain $json $SensitiveValues
+}
+
 function New-FixturePayload([string]$Root) {
     $bin = Join-Path $Root 'bin'
     New-Item -ItemType Directory -Path $bin | Out-Null
@@ -522,6 +547,52 @@ try {
         'C:', '\', '/', 'CMake Warning in'
     )
 
+    $malformedAssessmentSentinels = @(
+        'SENTINEL-MALFORMED-ASSESSMENT',
+        'C:\malformed-assessment\private',
+        '0123456789abcdef',
+        'fedcba9876543210',
+        'C:', '\', '/'
+    )
+    $malformedAssessments = [System.Collections.Generic.List[object]]::new()
+    $malformedAssessments.Add('SENTINEL-MALFORMED-ASSESSMENT C:\malformed-assessment\private')
+    $malformed = Copy-ScribeFixtureCmakeRetryAssessmentForTest $canonicalAssessment
+    $malformed.PSObject.Properties.Remove('schema_version')
+    $malformedAssessments.Add($malformed)
+    foreach ($schemaVersion in @('1', [long]1, 2)) {
+        $malformed = Copy-ScribeFixtureCmakeRetryAssessmentForTest $canonicalAssessment
+        $malformed.schema_version = $schemaVersion
+        $malformedAssessments.Add($malformed)
+    }
+    $malformed = Copy-ScribeFixtureCmakeRetryAssessmentForTest $canonicalAssessment
+    $malformed.retry_eligible = 'true'
+    $malformedAssessments.Add($malformed)
+    $malformed = Copy-ScribeFixtureCmakeRetryAssessmentForTest $canonicalAssessment
+    $malformed | Add-Member -NotePropertyName unexpected_root -NotePropertyValue 'SENTINEL-MALFORMED-ASSESSMENT C:\malformed-assessment\private'
+    $malformedAssessments.Add($malformed)
+    $malformed = Copy-ScribeFixtureCmakeRetryAssessmentForTest $canonicalAssessment
+    $malformed.stdout = 'SENTINEL-MALFORMED-ASSESSMENT C:\malformed-assessment\private'
+    $malformedAssessments.Add($malformed)
+    $malformed = Copy-ScribeFixtureCmakeRetryAssessmentForTest $canonicalAssessment
+    $malformed.stdout | Add-Member -NotePropertyName unexpected_stream -NotePropertyValue 'SENTINEL-MALFORMED-ASSESSMENT C:\malformed-assessment\private'
+    $malformedAssessments.Add($malformed)
+    foreach ($countValue in @([long]0, -1, 2049)) {
+        $malformed = Copy-ScribeFixtureCmakeRetryAssessmentForTest $canonicalAssessment
+        $malformed.stdout.line_count = $countValue
+        $malformedAssessments.Add($malformed)
+    }
+    $malformed = Copy-ScribeFixtureCmakeRetryAssessmentForTest $canonicalAssessment
+    $malformed.stdout.crate_count = [long]1
+    $malformedAssessments.Add($malformed)
+    foreach ($positionValue in @([long]1, 0, 2049)) {
+        $malformed = Copy-ScribeFixtureCmakeRetryAssessmentForTest $canonicalAssessment
+        $malformed.stdout.crate_first = $positionValue
+        $malformedAssessments.Add($malformed)
+    }
+    foreach ($malformedAssessment in $malformedAssessments) {
+        Assert-ScribeFixtureCmakeRetryAssessmentUnavailable $malformedAssessment $malformedAssessmentSentinels
+    }
+
     $nonNativeAssessment = Get-ScribeGpuWorkerCmakeRetryAssessment ([InvalidOperationException]::new('SENTINEL-NON-NATIVE')) $false $canonicalClassifierRoot $canonicalBuildEnvironment
     $overflowAssessment = Get-ScribeGpuWorkerCmakeRetryAssessment ([ScribeGpuWorkerNativeProcessFailure]::new('SENTINEL-OVERFLOW', 23, 'SENTINEL', '', $true)) $false $canonicalClassifierRoot $canonicalBuildEnvironment
     $overlongAssessment = Get-ScribeGpuWorkerCmakeRetryAssessment ([ScribeGpuWorkerNativeProcessFailure]::new('SENTINEL-OVERLONG', 29, ('x' * 1025), '', $false)) $false $canonicalClassifierRoot $canonicalBuildEnvironment
@@ -554,6 +625,9 @@ try {
     }
 
     $topologyStages = @(
+        @('relative-cargo-target', $canonicalBuildEnvironment, $canonicalCrateHash, 'invalid_input'),
+        @((Join-Path $canonicalFixtureRoot 'missing-cargo-target'), $canonicalBuildEnvironment, $canonicalCrateHash, 'cargo_target_not_physical'),
+        @($canonicalClassifierRoot, (Join-Path $canonicalFixtureRoot 'missing-build-environment'), $canonicalCrateHash, 'build_environment_not_physical'),
         @($canonicalClassifierRoot, $canonicalBuildEnvironment, $canonicalCrateHash, 'accepted'),
         @($otherCanonicalClassifierRoot, $canonicalBuildEnvironment, $canonicalCrateHash, 'out_directory_not_physical'),
         @($canonicalClassifierRoot, $emptyBuildEnvironment, $canonicalCrateHash, 'tcs_root_not_physical'),
@@ -576,6 +650,44 @@ try {
         return Get-ScribeGpuWorkerCmakeRetryTopologyObservation $CargoTarget $BuildEnvironment $CrateHash
     }
     Assert-True ((Invoke-TestTopologyObserverFailure $canonicalClassifierRoot $canonicalBuildEnvironment $canonicalCrateHash) -ceq 'observer_failure') 'CMake retry topology observer did not fail closed.'
+    $originalGetPhysicalDirectory = ${function:Get-ScribeGpuWorkerPhysicalDirectory}
+    function Invoke-TestTopologyPhysicalDirectoryStage(
+        [ValidateSet('out_directory_mismatch', 'tcs_root_mismatch', 'junction_target_not_physical')]
+        [string]$ExpectedStage,
+        [string]$CargoTarget,
+        [string]$BuildEnvironment,
+        [string]$CrateHash,
+        [string]$MismatchFullName,
+        [scriptblock]$OriginalGetPhysicalDirectory
+    ) {
+        function Get-ScribeGpuWorkerPhysicalDirectory([string]$Path, [string]$Label) {
+            if ($ExpectedStage -ceq 'out_directory_mismatch' -and $Label -ceq 'Retry assessment transcribe-cpp OUT_DIR') {
+                return [pscustomobject]@{ FullName = $MismatchFullName }
+            }
+            if ($ExpectedStage -ceq 'tcs_root_mismatch' -and $Label -ceq 'Retry assessment tcs inventory') {
+                return [pscustomobject]@{ FullName = $MismatchFullName }
+            }
+            if ($ExpectedStage -ceq 'junction_target_not_physical' -and $Label -ceq 'Retry assessment junction target') {
+                throw 'synthetic non-physical junction target'
+            }
+            return & $OriginalGetPhysicalDirectory $Path $Label
+        }
+        return Get-ScribeGpuWorkerCmakeRetryTopologyObservation $CargoTarget $BuildEnvironment $CrateHash
+    }
+    foreach ($mockedTopologyStage in @(
+        @('out_directory_mismatch', (Join-Path $canonicalFixtureRoot 'observer-out-mismatch')),
+        @('tcs_root_mismatch', (Join-Path $canonicalFixtureRoot 'observer-tcs-mismatch')),
+        @('junction_target_not_physical', '')
+    )) {
+        $observedTopologyStage = Invoke-TestTopologyPhysicalDirectoryStage `
+            $mockedTopologyStage[0] $canonicalClassifierRoot $canonicalBuildEnvironment $canonicalCrateHash `
+            $mockedTopologyStage[1] $originalGetPhysicalDirectory
+        Assert-True ($observedTopologyStage -ceq $mockedTopologyStage[0]) "CMake retry topology observer stage changed: expected $($mockedTopologyStage[0]), observed $observedTopologyStage."
+    }
+    Assert-True (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure `
+        -Output $canonicalCargoTargetFailure `
+        -CargoTarget $canonicalClassifierRoot `
+        -BuildEnvironment $canonicalBuildEnvironment) 'Diagnostic-only topology stage tests changed authoritative retry classification.'
 
     $overlongCanonicalCargoTargetFailure = [Collections.Generic.List[object]]::new()
     foreach ($unused in 1..2048) { $overlongCanonicalCargoTargetFailure.Add('noise') }
