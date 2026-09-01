@@ -916,7 +916,8 @@ $exportedPinnedEnvironment = @(& $buildScript `
     -SigningMode Fixture `
     -ToolchainCheckOnly `
     -ExportPinnedMsvcEnvironment)
-Assert-True ($LASTEXITCODE -eq 0 -and $exportedPinnedEnvironment.Count -eq 1) 'Pinned MSVC environment export did not return one validated document.'
+$toolchainExportSucceeded = $?
+Assert-True ($toolchainExportSucceeded -and $exportedPinnedEnvironment.Count -eq 1) 'Pinned MSVC environment export did not return one validated document.'
 try {
     $exportedPinnedEnvironment = [string]$exportedPinnedEnvironment[0] | ConvertFrom-Json
 }
