@@ -606,11 +606,11 @@ function Enable-ScribeEvidenceCmakeBootstrap([string]$CargoTarget, [string]$Buil
 function ConvertTo-TestEncodedCommand([string]$Command) {
     return [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($Command))
 }
-function Invoke-TestRunnerFailure([string]$Command) {
+function Invoke-TestRunnerFailure([string]$Command, [string]$CargoTarget) {
     $script:BootstrapCount = 0
     $message = $null
     try {
-        Invoke-ScribeEvidenceCargoWithCmakeRetry @('-NoProfile', '-EncodedCommand', (ConvertTo-TestEncodedCommand $Command)) 'runner case failed.' 'unused-target' 'unused-environment'
+        Invoke-ScribeEvidenceCargoWithCmakeRetry @('-NoProfile', '-EncodedCommand', (ConvertTo-TestEncodedCommand $Command)) 'runner case failed.' $CargoTarget 'unused-environment'
     }
     catch {
         $message = $_.Exception.Message
@@ -621,23 +621,28 @@ function Invoke-TestRunnerFailure([string]$Command) {
 }
 
 $state = Join-Path ([IO.Path]::GetTempPath()) ("scribe-evidence-retry-state-$([guid]::NewGuid().ToString('N'))")
+$cargoTarget = Join-Path ([IO.Path]::GetTempPath()) ("scribe-evidence-retry-target-$([guid]::NewGuid().ToString('N'))")
+$wrongCargoTarget = Join-Path ([IO.Path]::GetTempPath()) ("scribe-evidence-retry-wrong-target-$([guid]::NewGuid().ToString('N'))")
 $previousState = $env:SCRIBE_EVIDENCE_RETRY_TEST_STATE
 try {
+    New-Item -ItemType Directory -Path $cargoTarget | Out-Null
+    New-Item -ItemType Directory -Path $wrongCargoTarget | Out-Null
+    $canonicalWarningSource = Join-Path $cargoTarget 'release\build\transcribe-cpp-sys-0123456789abcdef\out\build\e\src\vulkan-shaders-gen-build\CMakeFiles\CMakeScratch\TryCompile-Ab12Cd\CMakeLists.txt'
+    $canonicalWarningSource = $canonicalWarningSource.Replace('\', '/')
     $env:SCRIBE_EVIDENCE_RETRY_TEST_STATE = $state
     $highVolumeSplitRetry = @"
 `$state = `$env:SCRIBE_EVIDENCE_RETRY_TEST_STATE
 if (Test-Path -LiteralPath `$state) { exit 0 }
 [IO.File]::WriteAllText(`$state, 'first')
-[Console]::Out.WriteLine('transcribe-cpp-sys: could not create short build junction C:\safe\tcs; building in OUT_DIR (may exceed Windows MAX_PATH in deep checkouts)')
 [Console]::Out.WriteLine('error: failed to run custom build command for ``transcribe-cpp-sys v0.1.3``')
 1..900 | ForEach-Object { [Console]::Out.WriteLine('bounded stdout noise') }
-[Console]::Error.WriteLine('vulkan-shaders-gen: warning: object directory is near the configured limit')
+[Console]::Error.WriteLine('CMake Warning in ${canonicalWarningSource}:')
 1..900 | ForEach-Object { [Console]::Error.WriteLine('bounded stderr noise') }
-[Console]::Error.WriteLine('CMAKE_OBJECT_PATH_MAX is in effect for this nested target')
+[Console]::Error.WriteLine('  characters (see CMAKE_OBJECT_PATH_MAX). Object file')
 [Console]::Error.WriteLine("LINK : fatal error LNK1104: cannot open file 'CMakeFiles\cmTC_1a2B3c.dir\intermediate.manifest'")
 exit 17
 "@
-    Invoke-ScribeEvidenceCargoWithCmakeRetry @('-NoProfile', '-EncodedCommand', (ConvertTo-TestEncodedCommand $highVolumeSplitRetry)) 'high-volume retry failed.' 'unused-target' 'unused-environment'
+    Invoke-ScribeEvidenceCargoWithCmakeRetry @('-NoProfile', '-EncodedCommand', (ConvertTo-TestEncodedCommand $highVolumeSplitRetry)) 'high-volume retry failed.' $cargoTarget 'unused-environment'
     if ($script:BootstrapCount -ne 1 -or -not (Test-Path -LiteralPath $state)) {
         throw 'Runner did not perform exactly one eligible high-volume split-stream retry.'
     }
@@ -667,8 +672,17 @@ exit 21
 exit 22
 "@
     )) {
-        Invoke-TestRunnerFailure $malformed
+        Invoke-TestRunnerFailure $malformed $cargoTarget
     }
+
+    $wrongTargetCanonical = @"
+[Console]::Out.WriteLine('error: failed to run custom build command for ``transcribe-cpp-sys v0.1.3``')
+[Console]::Error.WriteLine('CMake Warning in ${canonicalWarningSource}:')
+[Console]::Error.WriteLine('  characters (see CMAKE_OBJECT_PATH_MAX). Object file')
+[Console]::Error.WriteLine("LINK : fatal error LNK1104: cannot open file 'CMakeFiles\cmTC_1a2B3c.dir\intermediate.manifest'")
+exit 18
+"@
+    Invoke-TestRunnerFailure $wrongTargetCanonical $wrongCargoTarget
 
     $overflow = @"
 [Console]::Out.WriteLine('error: failed to run custom build command for ``transcribe-cpp-sys v0.1.3``')
@@ -677,7 +691,7 @@ exit 22
 [Console]::Error.Write('x' * 1025)
 exit 23
 "@
-    Invoke-TestRunnerFailure $overflow
+    Invoke-TestRunnerFailure $overflow $cargoTarget
 
     Remove-Item -LiteralPath $state -Force
     $alwaysFail = @"
@@ -691,7 +705,7 @@ exit 29
     $script:BootstrapCount = 0
     $retryFailure = $null
     try {
-        Invoke-ScribeEvidenceCargoWithCmakeRetry @('-NoProfile', '-EncodedCommand', (ConvertTo-TestEncodedCommand $alwaysFail)) 'bounded retry failed.' 'unused-target' 'unused-environment'
+        Invoke-ScribeEvidenceCargoWithCmakeRetry @('-NoProfile', '-EncodedCommand', (ConvertTo-TestEncodedCommand $alwaysFail)) 'bounded retry failed.' $cargoTarget 'unused-environment'
     }
     catch {
         $retryFailure = $_.Exception.Message
@@ -705,6 +719,8 @@ exit 29
 finally {
     $env:SCRIBE_EVIDENCE_RETRY_TEST_STATE = $previousState
     Remove-Item -LiteralPath $state -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $cargoTarget -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $wrongCargoTarget -Recurse -Force -ErrorAction SilentlyContinue
 }
 Write-Output 'runner retry harness passed'
 '@

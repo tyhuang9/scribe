@@ -149,7 +149,46 @@ function Get-ScribeGpuWorkerBoundedDiagnosticLines([object[]]$Output) {
     }
 }
 
-function Test-ScribeGpuWorkerKnownCmakeBootstrapFailure([object[]]$Output) {
+function Test-ScribeGpuWorkerCanonicalCargoTargetWarningSource(
+    [string]$Line,
+    [string]$CargoTarget
+) {
+    if ([string]::IsNullOrWhiteSpace($CargoTarget) -or
+        -not [IO.Path]::IsPathFullyQualified($CargoTarget)) {
+        return $false
+    }
+    $warningSource = [regex]::new(
+        '^\s*CMake Warning in (?<source>[A-Za-z]:[\\/][^:\r\n]{1,768}):\s*$',
+        [Text.RegularExpressions.RegexOptions]::CultureInvariant
+    ).Match($Line)
+    if (-not $warningSource.Success) { return $false }
+
+    try {
+        $cargoTargetItem = Get-ScribeGpuWorkerPhysicalDirectory $CargoTarget 'The retry classifier Cargo target'
+        $canonicalCargoTarget = $cargoTargetItem.FullName.TrimEnd([char[]]@('\', '/'))
+        $sourceText = $warningSource.Groups['source'].Value.Replace('/', '\')
+        if (-not [IO.Path]::IsPathFullyQualified($sourceText)) { return $false }
+        $canonicalSource = [IO.Path]::GetFullPath($sourceText).TrimEnd([char[]]@('\', '/'))
+        if (-not [string]::Equals($sourceText, $canonicalSource, [StringComparison]::OrdinalIgnoreCase) -or
+            -not (Test-ScribeGpuWorkerPathWithin $canonicalSource $canonicalCargoTarget)) {
+            return $false
+        }
+        $relativeSource = [IO.Path]::GetRelativePath($canonicalCargoTarget, $canonicalSource).Replace('\', '/')
+        if ($relativeSource -cnotmatch '^release/build/transcribe-cpp-sys-[0-9a-f]{16}/out/build/e/src/vulkan-shaders-gen-build/CMakeFiles/CMakeScratch/TryCompile-[A-Za-z0-9][A-Za-z0-9_-]{0,63}/CMakeLists\.txt$') {
+            return $false
+        }
+        Assert-ScribeGpuWorkerNoReparse $canonicalSource
+        return $true
+    }
+    catch {
+        return $false
+    }
+}
+
+function Test-ScribeGpuWorkerKnownCmakeBootstrapFailure(
+    [object[]]$Output,
+    [string]$CargoTarget
+) {
     $bounded = Get-ScribeGpuWorkerBoundedDiagnosticLines $Output
     if ($bounded.Exceeded) { return $false }
     $lines = @($bounded.Lines)
@@ -172,7 +211,7 @@ function Test-ScribeGpuWorkerKnownCmakeBootstrapFailure([object[]]$Output) {
     $objectPathLine = [regex]::new('^.*CMAKE_OBJECT_PATH_MAX.*$', [Text.RegularExpressions.RegexOptions]::CultureInvariant)
     $successfulJunctionObjectPathLine = [regex]::new('^\s*characters \(see CMAKE_OBJECT_PATH_MAX\)\.\s+Object file\s*$', [Text.RegularExpressions.RegexOptions]::CultureInvariant)
     $linkLine = [regex]::new('^.*(?:LINK|link) : fatal error LNK1104: cannot open file ''CMakeFiles\\cmTC_[0-9A-Fa-f]+\.dir\\intermediate\.manifest''\s*$', [Text.RegularExpressions.RegexOptions]::CultureInvariant)
-    $successfulJunctionLinkLine = [regex]::new('^\s*LINK : fatal error LNK1104: cannot open file ''CMakeFiles\\cmTC_[0-9A-Fa-f]+\.dir\\intermediate\.manifest''\s*$', [Text.RegularExpressions.RegexOptions]::CultureInvariant)
+    $successfulJunctionLinkLine = [regex]::new('^\s*LINK : fatal error LNK1104: cannot open file ''CMakeFiles\\cmTC_[0-9A-Fa-f]{1,64}\.dir\\intermediate\.manifest''\s*$', [Text.RegularExpressions.RegexOptions]::CultureInvariant)
     $state = 0
     foreach ($line in $lines) {
         if ($state -eq 0 -and $junctionLine.IsMatch($line)) { $state = 1; continue }
@@ -199,7 +238,9 @@ function Test-ScribeGpuWorkerKnownCmakeBootstrapFailure([object[]]$Output) {
             $successfulJunctionState = 1
             continue
         }
-        if ($successfulJunctionState -eq 1 -and $successfulJunctionWarningSourceLine.IsMatch($line)) {
+        if ($successfulJunctionState -eq 1 -and
+            ($successfulJunctionWarningSourceLine.IsMatch($line) -or
+                (Test-ScribeGpuWorkerCanonicalCargoTargetWarningSource $line $CargoTarget))) {
             $successfulJunctionState = 2
             continue
         }

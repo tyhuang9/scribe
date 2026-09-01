@@ -221,7 +221,7 @@ function Invoke-ScribeEvidenceCargoWithCmakeRetry([string[]]$Arguments, [string]
     }
     catch {
         $diagnostic = @(Get-ScribeGpuWorkerNativeProcessRetryDiagnostic $_.Exception)
-        if (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure $diagnostic)) {
+        if (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure -Output $diagnostic -CargoTarget $CargoTarget)) {
             throw $Failure
         }
     }

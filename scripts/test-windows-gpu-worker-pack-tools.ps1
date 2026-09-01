@@ -87,6 +87,21 @@ foreach ($script in @(
     Assert-True ($parseErrors.Count -eq 0) "GPU worker-pack script has PowerShell parse errors: $script"
 }
 . $cmakeBootstrapScript
+function New-TestCanonicalCargoTargetFailure(
+    [string]$CargoTarget,
+    [string]$CrateHash = '0123456789abcdef',
+    [string]$TryCompileLeaf = 'TryCompile-Ab12Cd',
+    [string]$Configuration = 'release'
+) {
+    $source = Join-Path $CargoTarget "$Configuration\build\transcribe-cpp-sys-$CrateHash\out\build\e\src\vulkan-shaders-gen-build\CMakeFiles\CMakeScratch\$TryCompileLeaf\CMakeLists.txt"
+    return @(
+        'error: failed to run custom build command for `transcribe-cpp-sys v0.1.3`',
+        "CMake Warning in $($source.Replace('\', '/')):",
+        '  characters (see CMAKE_OBJECT_PATH_MAX). Object file',
+        "LINK : fatal error LNK1104: cannot open file 'CMakeFiles\cmTC_1a2B3c.dir\intermediate.manifest'"
+    )
+}
+
 $legacyOsError267CmakeBootstrapFailure = @(
     'error: failed to run custom build command for `transcribe-cpp-sys v0.1.3`',
     '  Error: failed to execute command: cmake -S C:\safe\source',
@@ -255,6 +270,101 @@ $overlongLineSuccessfulJunctionFailure = @(
 if (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure $overlongLineSuccessfulJunctionFailure) {
     throw 'Successful-junction Vulkan CMake output with an overlong line was classified.'
 }
+$canonicalClassifierRoot = Join-Path ([IO.Path]::GetTempPath()) "scribe-canonical-retry-$([guid]::NewGuid().ToString('N'))"
+$otherCanonicalClassifierRoot = Join-Path ([IO.Path]::GetTempPath()) "scribe-canonical-retry-other-$([guid]::NewGuid().ToString('N'))"
+$reparseCanonicalClassifierRoot = Join-Path ([IO.Path]::GetTempPath()) "scribe-canonical-retry-reparse-$([guid]::NewGuid().ToString('N'))"
+$reparseCanonicalClassifierOutside = Join-Path ([IO.Path]::GetTempPath()) "scribe-canonical-retry-outside-$([guid]::NewGuid().ToString('N'))"
+try {
+    foreach ($root in @(
+        $canonicalClassifierRoot,
+        $otherCanonicalClassifierRoot,
+        $reparseCanonicalClassifierRoot,
+        $reparseCanonicalClassifierOutside
+    )) {
+        New-Item -ItemType Directory -Path $root | Out-Null
+    }
+    $canonicalCargoTargetFailure = @(New-TestCanonicalCargoTargetFailure $canonicalClassifierRoot)
+    $capturedCanonicalCargoTargetFailure = [Collections.Generic.List[object]]::new()
+    foreach ($index in 1..157) {
+        $line = switch ($index) {
+            4 { $canonicalCargoTargetFailure[0] }
+            62 { $canonicalCargoTargetFailure[1] }
+            81 { $canonicalCargoTargetFailure[2] }
+            129 { $canonicalCargoTargetFailure[3] }
+            default { 'sanitized canonical-target Cargo/CMake diagnostic output' }
+        }
+        $capturedCanonicalCargoTargetFailure.Add($line)
+    }
+    foreach ($diagnostic in @(
+        ($capturedCanonicalCargoTargetFailure -join "`r`n"),
+        ($capturedCanonicalCargoTargetFailure -join "`n")
+    )) {
+        Assert-True (
+            Test-ScribeGpuWorkerKnownCmakeBootstrapFailure `
+                -Output $diagnostic `
+                -CargoTarget $canonicalClassifierRoot
+        ) 'Full captured-order canonical Cargo-target CMake diagnostic was not classified.'
+    }
+
+    $reorderedCanonicalCargoTargetFailure = [Collections.Generic.List[object]]::new($capturedCanonicalCargoTargetFailure)
+    $reorderedCanonicalCargoTargetFailure[61] = $canonicalCargoTargetFailure[2]
+    $reorderedCanonicalCargoTargetFailure[80] = $canonicalCargoTargetFailure[1]
+    Assert-True (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure `
+        -Output ($reorderedCanonicalCargoTargetFailure -join "`r`n") `
+        -CargoTarget $canonicalClassifierRoot)) 'Reordered canonical Cargo-target diagnostic was classified.'
+
+    foreach ($missingIndex in @(0, 1, 2, 3)) {
+        $missingStep = @($canonicalCargoTargetFailure | Where-Object { $_ -cne $canonicalCargoTargetFailure[$missingIndex] })
+        Assert-True (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure `
+            -Output ($missingStep -join "`n") `
+            -CargoTarget $canonicalClassifierRoot)) "Canonical Cargo-target diagnostic missing step $missingIndex was classified."
+    }
+    Assert-True (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure `
+        -Output $canonicalCargoTargetFailure `
+        -CargoTarget $otherCanonicalClassifierRoot)) 'A canonical warning from a different Cargo target was classified.'
+    Assert-True (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure `
+        -Output $canonicalCargoTargetFailure)) 'A canonical Cargo-target warning was classified without its target identity.'
+    $traversalWarningSource = "$($canonicalClassifierRoot.Replace('\', '/'))/release/build/../build/transcribe-cpp-sys-0123456789abcdef/out/build/e/src/vulkan-shaders-gen-build/CMakeFiles/CMakeScratch/TryCompile-Ab12Cd/CMakeLists.txt"
+    foreach ($malformedCanonicalCargoTargetFailure in @(
+        @(New-TestCanonicalCargoTargetFailure $canonicalClassifierRoot '0123456789abcde'),
+        @(New-TestCanonicalCargoTargetFailure $canonicalClassifierRoot '0123456789abcdef' 'TryCompile-' ),
+        @(New-TestCanonicalCargoTargetFailure $canonicalClassifierRoot '0123456789abcdef' ('TryCompile-' + ('a' * 65))),
+        @(New-TestCanonicalCargoTargetFailure $canonicalClassifierRoot '0123456789abcdef' 'TryCompile-Ab12Cd' 'debug'),
+        @($canonicalCargoTargetFailure[0], 'CMake Warning in release/build/transcribe-cpp-sys-0123456789abcdef/out/build/e/src/vulkan-shaders-gen-build/CMakeFiles/CMakeScratch/TryCompile-Ab12Cd/CMakeLists.txt:', $canonicalCargoTargetFailure[2], $canonicalCargoTargetFailure[3]),
+        @($canonicalCargoTargetFailure[0], "CMake Warning in ${traversalWarningSource}:", $canonicalCargoTargetFailure[2], $canonicalCargoTargetFailure[3]),
+        @($canonicalCargoTargetFailure[0], $canonicalCargoTargetFailure[1].Replace('transcribe-cpp-sys-', 'other-sys-'), $canonicalCargoTargetFailure[2], $canonicalCargoTargetFailure[3]),
+        @($canonicalCargoTargetFailure[0], $canonicalCargoTargetFailure[1].Replace('vulkan-shaders-gen-build', 'cuda-shaders-gen-build'), $canonicalCargoTargetFailure[2], $canonicalCargoTargetFailure[3]),
+        @($canonicalCargoTargetFailure[0], $canonicalCargoTargetFailure[1], $canonicalCargoTargetFailure[2], "LINK : fatal error LNK1104: cannot open file 'unrelated.manifest'"),
+        @($canonicalCargoTargetFailure[0], $vulkanShortJunctionFailure[0], $canonicalCargoTargetFailure[1], $canonicalCargoTargetFailure[2], $canonicalCargoTargetFailure[3])
+    )) {
+        Assert-True (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure `
+            -Output ($malformedCanonicalCargoTargetFailure -join "`r`n") `
+            -CargoTarget $canonicalClassifierRoot)) 'Malformed canonical Cargo-target signature was classified.'
+    }
+
+    New-Item -ItemType Junction -Path (Join-Path $reparseCanonicalClassifierRoot 'release') -Target $reparseCanonicalClassifierOutside | Out-Null
+    $reparseCanonicalCargoTargetFailure = @(New-TestCanonicalCargoTargetFailure $reparseCanonicalClassifierRoot)
+    Assert-True (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure `
+        -Output $reparseCanonicalCargoTargetFailure `
+        -CargoTarget $reparseCanonicalClassifierRoot)) 'A canonical Cargo-target warning through a reparse point was classified.'
+
+    $overlongCanonicalCargoTargetFailure = [Collections.Generic.List[object]]::new()
+    foreach ($unused in 1..2048) { $overlongCanonicalCargoTargetFailure.Add('noise') }
+    foreach ($line in $canonicalCargoTargetFailure) { $overlongCanonicalCargoTargetFailure.Add($line) }
+    Assert-True (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure `
+        -Output $overlongCanonicalCargoTargetFailure.ToArray() `
+        -CargoTarget $canonicalClassifierRoot)) 'Overlong canonical Cargo-target output was classified.'
+}
+finally {
+    foreach ($root in @(
+        $canonicalClassifierRoot,
+        $otherCanonicalClassifierRoot,
+        $reparseCanonicalClassifierRoot,
+        $reparseCanonicalClassifierOutside
+    )) {
+        Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
 $builderTokens = $null
 $builderParseErrors = $null
 $builderAst = [System.Management.Automation.Language.Parser]::ParseFile(
@@ -302,7 +412,7 @@ $workerBuildRetryStatement = $workerBuildRetryStatements[0]
 Assert-True ($workerBuildRetryStatement.Extent.Text -cnotmatch 'while\s*\(') 'Worker-build retry wrapper became an unbounded retry loop.'
 Assert-True (-not $workerBuildRetryStatement.Extent.Text.Contains($captureOverflowOptIn)) 'Worker-build retry path gained diagnostic capture overflow tolerance.'
 
-function Invoke-WorkerBuildRetryHarness([string]$Diagnostic, [bool]$FailRetry) {
+function Invoke-WorkerBuildRetryHarness([string]$Diagnostic, [bool]$FailRetry, [string]$CargoTarget) {
     $state = [pscustomobject]@{
         NativeInvocations = 0
         JunctionInvocations = 0
@@ -338,7 +448,7 @@ function Invoke-WorkerBuildRetryHarness([string]$Diagnostic, [bool]$FailRetry) {
     $workerBuildArguments = @('build')
     $Backend = 'Vulkan'
     $shortBuild = [pscustomobject]@{ BuildEnvironment = 'C:\safe\env' }
-    $cargoTarget = 'C:\safe\target'
+    $cargoTarget = $CargoTarget
     $failure = $null
     $previousWarningPreference = $WarningPreference
     try {
@@ -358,26 +468,30 @@ function Invoke-WorkerBuildRetryHarness([string]$Diagnostic, [bool]$FailRetry) {
     }
 }
 
-$acceptedRetrySuccess = Invoke-WorkerBuildRetryHarness ($capturedVulkanSuccessfulJunctionFailure -join "`r`n") $false
-Assert-True ($acceptedRetrySuccess.NativeInvocations -eq 2 -and
-    $acceptedRetrySuccess.JunctionInvocations -eq 1 -and
-    $null -eq $acceptedRetrySuccess.Failure) 'Accepted successful-junction signature did not invoke exactly one isolated retry.'
-$acceptedRetryFailure = Invoke-WorkerBuildRetryHarness ($capturedVulkanSuccessfulJunctionFailure -join "`n") $true
-Assert-True ($acceptedRetryFailure.NativeInvocations -eq 2 -and
-    $acceptedRetryFailure.JunctionInvocations -eq 1 -and
-    $null -ne $acceptedRetryFailure.Failure -and
-    $acceptedRetryFailure.Failure.Message -ceq 'synthetic retry failure') 'A failed isolated retry was retried again or lost its failure.'
-$rejectedRetry = Invoke-WorkerBuildRetryHarness (
-    @(
-        $vulkanSuccessfulJunctionFailure[0],
-        $vulkanSuccessfulJunctionFailure[1],
-        $vulkanSuccessfulJunctionFailure[2],
-        "LINK : fatal error LNK1104: cannot open file 'CMakeFiles\cmTC_1a2B3c.dir\unrelated.manifest'"
-    ) -join "`r`n"
-) $false
-Assert-True ($rejectedRetry.NativeInvocations -eq 1 -and
-    $rejectedRetry.JunctionInvocations -eq 0 -and
-    $null -ne $rejectedRetry.Failure) 'Rejected successful-junction signature invoked the isolated retry.'
+$builderRetryTarget = Join-Path ([IO.Path]::GetTempPath()) "scribe-builder-retry-$([guid]::NewGuid().ToString('N'))"
+$builderWrongRetryTarget = Join-Path ([IO.Path]::GetTempPath()) "scribe-builder-wrong-retry-$([guid]::NewGuid().ToString('N'))"
+try {
+    New-Item -ItemType Directory -Path $builderRetryTarget | Out-Null
+    New-Item -ItemType Directory -Path $builderWrongRetryTarget | Out-Null
+    $builderCanonicalFailure = @(New-TestCanonicalCargoTargetFailure $builderRetryTarget)
+    $acceptedRetrySuccess = Invoke-WorkerBuildRetryHarness ($builderCanonicalFailure -join "`r`n") $false $builderRetryTarget
+    Assert-True ($acceptedRetrySuccess.NativeInvocations -eq 2 -and
+        $acceptedRetrySuccess.JunctionInvocations -eq 1 -and
+        $null -eq $acceptedRetrySuccess.Failure) 'Accepted canonical Cargo-target signature did not invoke exactly one isolated retry.'
+    $acceptedRetryFailure = Invoke-WorkerBuildRetryHarness ($builderCanonicalFailure -join "`n") $true $builderRetryTarget
+    Assert-True ($acceptedRetryFailure.NativeInvocations -eq 2 -and
+        $acceptedRetryFailure.JunctionInvocations -eq 1 -and
+        $null -ne $acceptedRetryFailure.Failure -and
+        $acceptedRetryFailure.Failure.Message -ceq 'synthetic retry failure') 'A failed isolated canonical retry was retried again or lost its failure.'
+    $rejectedRetry = Invoke-WorkerBuildRetryHarness ($builderCanonicalFailure -join "`r`n") $false $builderWrongRetryTarget
+    Assert-True ($rejectedRetry.NativeInvocations -eq 1 -and
+        $rejectedRetry.JunctionInvocations -eq 0 -and
+        $null -ne $rejectedRetry.Failure) 'A wrong-target canonical signature invoked the isolated retry.'
+}
+finally {
+    Remove-Item -LiteralPath $builderRetryTarget -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $builderWrongRetryTarget -Recurse -Force -ErrorAction SilentlyContinue
+}
 $nativeProcessHarness = Join-Path ([System.IO.Path]::GetTempPath()) "scribe-native-process-retry-$([guid]::NewGuid().ToString('N')).ps1"
 try {
     $nativeProcessHarnessTail = @'

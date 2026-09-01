@@ -1306,7 +1306,7 @@ try {
     }
     catch {
         $diagnostic = Get-NativeProcessRetryDiagnostic $_.Exception
-        if (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure $diagnostic)) {
+        if (-not (Test-ScribeGpuWorkerKnownCmakeBootstrapFailure -Output $diagnostic -CargoTarget $cargoTarget)) {
             throw
         }
         Enable-ValidatedCmakeBuildJunction $shortBuild.BuildEnvironment $cargoTarget
