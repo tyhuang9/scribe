@@ -205,7 +205,7 @@ function Test-ScribeGpuWorkerCanonicalCargoTargetWarningSource(
             ($shortOut.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0 -or
             $shortOut.LinkType -cne 'Junction' -or
             @($shortOut.Target).Count -ne 1 -or
-            $shortOut.Name -cne $crateHash -or
+            -not [regex]::IsMatch($shortOut.Name, '^[0-9a-f]{16}$', [Text.RegularExpressions.RegexOptions]::CultureInvariant) -or
             (Split-Path -Parent $shortOut.FullName) -cne $tcsItem.FullName -or
             (Get-ScribeGpuWorkerPhysicalDirectory ([string]@($shortOut.Target)[0]) 'The retry classifier transcribe-cpp OUT_DIR').FullName -cne $outItem.FullName) {
             return $false
