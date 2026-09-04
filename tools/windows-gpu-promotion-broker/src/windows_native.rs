@@ -3,7 +3,7 @@ use std::fmt::{Display, Formatter};
 use std::mem::{size_of, zeroed};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicIsize, Ordering};
 
 use anyhow::{Context, Result, anyhow, bail};
 use windows_sys::Win32::Foundation::{
@@ -77,7 +77,6 @@ const PIPE_SDDL: &str = concat!(
 
 static SERVICE_STOP_EVENT: AtomicIsize = AtomicIsize::new(0);
 static SERVICE_STATUS_HANDLE_VALUE: AtomicIsize = AtomicIsize::new(0);
-static SERVICE_STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ClientTransportError {
@@ -162,6 +161,8 @@ pub fn request_promotion(
 }
 
 pub fn run_service_dispatcher() -> Result<()> {
+    let stop_event = OwnedHandle::new(unsafe { CreateEventW(null(), 1, 0, null()) })?;
+    SERVICE_STOP_EVENT.store(stop_event.raw() as isize, Ordering::Release);
     let mut service_name = wide(SERVICE_NAME);
     let entries = [
         SERVICE_TABLE_ENTRYW {
@@ -173,11 +174,15 @@ pub fn run_service_dispatcher() -> Result<()> {
             lpServiceProc: None,
         },
     ];
-    if unsafe { StartServiceCtrlDispatcherW(entries.as_ptr()) } == 0 {
-        return Err(std::io::Error::last_os_error())
-            .context("could not connect the broker service to SCM");
+    let started = unsafe { StartServiceCtrlDispatcherW(entries.as_ptr()) };
+    let dispatch_error = (started == 0).then(std::io::Error::last_os_error);
+    SERVICE_STOP_EVENT.store(0, Ordering::Release);
+    drop(stop_event);
+    if let Some(error) = dispatch_error {
+        Err(error).context("could not connect the broker service to SCM")
+    } else {
+        Ok(())
     }
-    Ok(())
 }
 
 unsafe extern "system" fn service_main(argument_count: u32, _arguments: *mut *mut u16) {
@@ -196,7 +201,6 @@ fn service_main_inner(argument_count: u32) {
         return;
     }
     SERVICE_STATUS_HANDLE_VALUE.store(status_handle as isize, Ordering::Release);
-    SERVICE_STOP_REQUESTED.store(false, Ordering::Release);
     report_status(SERVICE_START_PENDING, 0, 1, 5_000);
 
     let result = run_service(argument_count);
@@ -213,7 +217,6 @@ unsafe extern "system" fn service_control_handler(
 ) -> u32 {
     let _ = catch_unwind(AssertUnwindSafe(|| match control {
         SERVICE_CONTROL_STOP | SERVICE_CONTROL_SHUTDOWN => {
-            SERVICE_STOP_REQUESTED.store(true, Ordering::Release);
             report_status(SERVICE_STOP_PENDING, 0, 1, 5_000);
             let stop_event = SERVICE_STOP_EVENT.load(Ordering::Acquire) as HANDLE;
             if !stop_event.is_null() {
@@ -234,31 +237,22 @@ fn run_service(argument_count: u32) -> Result<()> {
     }
     harden_dll_search()?;
     authenticate_service_process()?;
-    let stop_event = OwnedHandle::new(unsafe { CreateEventW(null(), 1, 0, null()) })?;
-    SERVICE_STOP_EVENT.store(stop_event.raw() as isize, Ordering::Release);
-    if SERVICE_STOP_REQUESTED.load(Ordering::Acquire) {
-        unsafe {
-            SetEvent(stop_event.raw());
-        }
+    let stop_event = SERVICE_STOP_EVENT.load(Ordering::Acquire) as HANDLE;
+    if stop_event.is_null() {
+        bail!("broker service stop event is unavailable");
     }
 
-    let result = (|| -> Result<()> {
-        let pipe = create_server_pipe()?;
-        if unsafe { WaitForSingleObject(stop_event.raw(), 0) } == WAIT_OBJECT_0 {
-            return Ok(());
-        }
-        report_status(
-            SERVICE_RUNNING,
-            SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN,
-            0,
-            0,
-        );
-        serve_loop(pipe, stop_event.raw())
-    })();
-
-    SERVICE_STOP_EVENT.store(0, Ordering::Release);
-    drop(stop_event);
-    result
+    let pipe = create_server_pipe()?;
+    if unsafe { WaitForSingleObject(stop_event, 0) } == WAIT_OBJECT_0 {
+        return Ok(());
+    }
+    report_status(
+        SERVICE_RUNNING,
+        SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN,
+        0,
+        0,
+    );
+    serve_loop(pipe, stop_event)
 }
 
 fn report_stopped(exit_code: u32) {
@@ -888,6 +882,27 @@ mod tests {
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         );
+    }
+
+    #[test]
+    fn dispatcher_owns_stop_event_for_the_complete_callback_lifetime() {
+        let source = include_str!("windows_native.rs");
+        let start = source.find("pub fn run_service_dispatcher(").unwrap();
+        let end = source[start..]
+            .find("\nunsafe extern \"system\" fn service_main")
+            .unwrap()
+            + start;
+        let dispatcher = &source[start..end];
+        let create = dispatcher.find("CreateEventW").unwrap();
+        let dispatch = dispatcher.find("StartServiceCtrlDispatcherW").unwrap();
+        let clear = dispatcher.rfind("SERVICE_STOP_EVENT.store(0").unwrap();
+        let close = dispatcher.rfind("drop(stop_event)").unwrap();
+        assert!(create < dispatch && dispatch < clear && clear < close);
+
+        let service_start = source.find("fn run_service(argument_count").unwrap();
+        let service_end =
+            source[service_start..].find("\nfn report_stopped").unwrap() + service_start;
+        assert!(!source[service_start..service_end].contains("CreateEventW"));
     }
 
     #[test]
