@@ -1390,11 +1390,11 @@ function New-EphemeralStandardAccount {
     Assert-True (-not ($administrators | Where-Object { $_.SID.Value -ceq $sid.Value })) 'Ephemeral account unexpectedly belongs to Administrators.'
     $standardUsersSid = [Security.Principal.SecurityIdentifier]::new('S-1-5-32-545')
     $users = @(Get-LocalGroupMember -SID $standardUsersSid)
-    if (($users | Where-Object { $_.SID.Value -ceq $sid.Value }).Count -eq 0) {
+    if (@($users | Where-Object { $_.SID.Value -ceq $sid.Value }).Count -eq 0) {
         Add-LocalGroupMember -SID $standardUsersSid -Member $sid
         $users = @(Get-LocalGroupMember -SID $standardUsersSid)
     }
-    Assert-True (($users | Where-Object { $_.SID.Value -ceq $sid.Value }).Count -eq 1) 'Ephemeral account is not an exact member of the standard Users group.'
+    Assert-True (@($users | Where-Object { $_.SID.Value -ceq $sid.Value }).Count -eq 1) 'Ephemeral account is not an exact member of the standard Users group.'
     Assert-NoEphemeralProfileRegistration -Sid $sid
     return $script:ownedEphemeralAccount
 }

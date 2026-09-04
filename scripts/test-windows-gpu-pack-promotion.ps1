@@ -379,6 +379,7 @@ try {
         Assert-True ($transportHarness.Contains($required)) "Broker harness lost ephemeral-client identity control: $required"
     }
     Assert-True (-not $transportHarness.Contains('Remove-LocalUser -Name')) 'Broker harness deletes an ephemeral account by mutable name.'
+    Assert-True ([regex]::Matches($transportHarness, [regex]::Escape("@(`$users | Where-Object { `$_.SID.Value -ceq `$sid.Value }).Count")).Count -eq 2) 'Broker harness membership counts are not both StrictMode-safe exact-SID arrays.'
     foreach ($forbidden in @(
         'ConvertFrom-SecureString',
         'SecureStringToBSTR',
