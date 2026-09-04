@@ -76,21 +76,42 @@ fn release_client_has_no_key_ledger_endpoint_or_fixture_flags() {
 
 #[test]
 fn release_client_artifact_contains_no_fixture_authority_identity() {
-    let binary = std::fs::read(env!("CARGO_BIN_EXE_scribe-windows-gpu-promotion-client")).unwrap();
-    for forbidden in [
-        b"fixture-ed25519-v1".as_slice(),
-        b"fixture-promotion-ledger.jsonl".as_slice(),
-        b"fixture signing authority".as_slice(),
-        b"handoff_root".as_slice(),
-        b"output_root".as_slice(),
-        b"stage_name".as_slice(),
-        b"output_name".as_slice(),
+    for path in [
+        env!("CARGO_BIN_EXE_scribe-windows-gpu-promotion-client"),
+        env!("CARGO_BIN_EXE_scribe-windows-gpu-promotion-service"),
     ] {
-        assert!(
-            !binary
-                .windows(forbidden.len())
-                .any(|window| window == forbidden),
-            "release client contains fixture authority material"
-        );
+        let binary = std::fs::read(path).unwrap();
+        for forbidden in [
+            b"fixture-ed25519-v1".as_slice(),
+            b"fixture-promotion-ledger.jsonl".as_slice(),
+            b"fixture signing authority".as_slice(),
+            b"handoff_root".as_slice(),
+            b"output_root".as_slice(),
+            b"stage_name".as_slice(),
+            b"output_name".as_slice(),
+            b"--broker-endpoint".as_slice(),
+            b"--console".as_slice(),
+            b"--install".as_slice(),
+            b"--private-key".as_slice(),
+            b"--ledger-root".as_slice(),
+        ] {
+            assert!(
+                !binary
+                    .windows(forbidden.len())
+                    .any(|window| window == forbidden),
+                "release broker artifact contains authority or override material"
+            );
+        }
     }
+}
+
+#[test]
+fn release_service_has_no_console_execution_mode() {
+    let result = Command::new(env!("CARGO_BIN_EXE_scribe-windows-gpu-promotion-service"))
+        .arg("--console")
+        .output()
+        .unwrap();
+    assert_eq!(result.status.code(), Some(78));
+    assert!(result.stdout.is_empty());
+    assert!(result.stderr.is_empty());
 }

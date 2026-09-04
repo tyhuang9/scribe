@@ -1,9 +1,10 @@
 //! Wire contract for a separately privileged Windows GPU pack promotion broker.
 //!
-//! Release builds contain intent and invocation validation only. They cannot
-//! access a key, ledger, broker endpoint, or output. The filesystem, ledger,
-//! and signing state machine below is compiled exclusively into unit tests as
-//! a hostile-input contract proof; it is not production authority.
+//! Release builds contain intent validation and a fixed authenticated Windows
+//! transport to a no-authority service. They cannot access a key, ledger,
+//! caller-selected endpoint, handoff, or output. The filesystem, ledger, and
+//! signing state machine below is compiled exclusively into unit tests as a
+//! hostile-input contract proof; it is not production authority.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
@@ -12,6 +13,21 @@ use std::path::{Path, PathBuf};
 use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+mod protocol;
+
+pub use protocol::{
+    BrokerOutcomeV1, BrokerRequestV1, BrokerResponseV1, NotProvisionedCode, PIPE_ENDPOINT,
+    SERVICE_NAME, SERVICE_SID,
+};
+
+#[cfg(windows)]
+mod windows_native;
+
+#[cfg(windows)]
+pub use windows_native::{
+    ClientTransportError, harden_dll_search, request_promotion, run_service_dispatcher,
+};
 
 pub const COMMAND: &str = "promote-windows-pack-set";
 pub const PROMOTION_POLICY_NAMESPACE: &str = "scribe-windows-gpu-production-v1";
