@@ -7,8 +7,8 @@ use std::sync::atomic::{AtomicIsize, Ordering};
 
 use anyhow::{Context, Result, anyhow, bail};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_IO_PENDING, ERROR_MORE_DATA, ERROR_PIPE_BUSY,
-    ERROR_PIPE_CONNECTED, ERROR_SEM_TIMEOUT, ERROR_SUCCESS, GetLastError, HANDLE,
+    CloseHandle, ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_IO_PENDING, ERROR_MORE_DATA,
+    ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, ERROR_SEM_TIMEOUT, ERROR_SUCCESS, GetLastError, HANDLE,
     HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, LocalFree, SetHandleInformation, WAIT_OBJECT_0,
     WAIT_TIMEOUT,
 };
@@ -123,7 +123,7 @@ pub fn request_promotion(
     let pipe_name = wide(PIPE_ENDPOINT);
 
     if unsafe { WaitNamedPipeW(pipe_name.as_ptr(), CONNECT_TIMEOUT_MS) } == 0 {
-        return Err(classify_unavailable());
+        return Err(classify_connection_error(unsafe { GetLastError() }));
     }
     let pipe = unsafe {
         CreateFileW(
@@ -139,7 +139,10 @@ pub fn request_promotion(
             null_mut(),
         )
     };
-    let pipe = OwnedHandle::new(pipe).map_err(|_| classify_unavailable())?;
+    if pipe.is_null() || pipe == INVALID_HANDLE_VALUE {
+        return Err(classify_connection_error(unsafe { GetLastError() }));
+    }
+    let pipe = OwnedHandle(pipe);
     protect_handle(pipe.raw()).map_err(|_| ClientTransportError::Io)?;
 
     let server =
@@ -831,12 +834,13 @@ fn random_nonce() -> Result<String> {
     Ok(crate::encode_hex(&nonce))
 }
 
-fn classify_unavailable() -> ClientTransportError {
-    match unsafe { GetLastError() } {
+fn classify_connection_error(error: u32) -> ClientTransportError {
+    match error {
         ERROR_FILE_NOT_FOUND | ERROR_PIPE_BUSY | ERROR_SEM_TIMEOUT => {
             ClientTransportError::Unavailable
         }
-        _ => ClientTransportError::Unavailable,
+        ERROR_ACCESS_DENIED => ClientTransportError::Authentication,
+        _ => ClientTransportError::Io,
     }
 }
 
@@ -881,6 +885,24 @@ mod tests {
             nonce
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        );
+    }
+
+    #[test]
+    fn connection_errors_distinguish_absence_identity_and_io_failures() {
+        for error in [ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY, ERROR_SEM_TIMEOUT] {
+            assert_eq!(
+                classify_connection_error(error),
+                ClientTransportError::Unavailable
+            );
+        }
+        assert_eq!(
+            classify_connection_error(ERROR_ACCESS_DENIED),
+            ClientTransportError::Authentication
+        );
+        assert_eq!(
+            classify_connection_error(u32::MAX),
+            ClientTransportError::Io
         );
     }
 
