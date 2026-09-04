@@ -8,9 +8,10 @@ use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
 use anyhow::{Context, Result, anyhow, bail};
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_ACCESS_DENIED, ERROR_CALL_NOT_IMPLEMENTED, ERROR_FILE_NOT_FOUND,
-    ERROR_INVALID_HANDLE, ERROR_IO_PENDING, ERROR_MORE_DATA, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED,
-    ERROR_SEM_TIMEOUT, ERROR_SUCCESS, GetLastError, HANDLE, HANDLE_FLAG_INHERIT,
-    INVALID_HANDLE_VALUE, LocalFree, SetHandleInformation, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    ERROR_INVALID_HANDLE, ERROR_IO_PENDING, ERROR_MORE_DATA, ERROR_NO_MORE_ITEMS, ERROR_PIPE_BUSY,
+    ERROR_PIPE_CONNECTED, ERROR_SEM_TIMEOUT, ERROR_SUCCESS, GetLastError, HANDLE,
+    HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, LocalFree, SetHandleInformation, WAIT_OBJECT_0,
+    WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
@@ -43,7 +44,7 @@ use windows_sys::Win32::System::Pipes::{
 };
 use windows_sys::Win32::System::Registry::{
     HKEY, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_64KEY, REG_DWORD, REG_SZ, RegCloseKey,
-    RegOpenKeyExW, RegQueryInfoKeyW, RegQueryValueExW,
+    RegEnumValueW, RegOpenKeyExW, RegQueryInfoKeyW, RegQueryValueExW,
 };
 use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
 use windows_sys::Win32::System::Services::{
@@ -513,6 +514,61 @@ fn require_exact_policy_shape(key: HKEY) -> Result<()> {
     };
     if status != ERROR_SUCCESS || subkeys != 0 || values != 2 {
         bail!("broker client authorization policy shape is noncanonical");
+    }
+
+    // Registry lookup is case-insensitive, so querying only the canonical
+    // names would accept differently-cased aliases. Enumerate the exact two
+    // names first and compare their UTF-16 spelling ordinally.
+    let mut actual_names = Vec::with_capacity(2);
+    for index in 0..2 {
+        let mut name = [0_u16; AUTHORIZED_CLIENT_SID_VALUE.len() + 1];
+        let mut length = name.len() as u32;
+        let status = unsafe {
+            RegEnumValueW(
+                key,
+                index,
+                name.as_mut_ptr(),
+                &mut length,
+                null(),
+                null_mut(),
+                null_mut(),
+                null_mut(),
+            )
+        };
+        if status != ERROR_SUCCESS || length == 0 || length as usize >= name.len() {
+            bail!("broker client authorization policy value names are noncanonical");
+        }
+        actual_names.push(name[..length as usize].to_vec());
+    }
+    let mut terminal_name = [0_u16; AUTHORIZED_CLIENT_SID_VALUE.len() + 1];
+    let mut terminal_length = terminal_name.len() as u32;
+    if unsafe {
+        RegEnumValueW(
+            key,
+            2,
+            terminal_name.as_mut_ptr(),
+            &mut terminal_length,
+            null(),
+            null_mut(),
+            null_mut(),
+            null_mut(),
+        )
+    } != ERROR_NO_MORE_ITEMS
+    {
+        bail!("broker client authorization policy value inventory changed during enumeration");
+    }
+    actual_names.sort_unstable();
+    let mut expected_names = [
+        AUTHORIZATION_SCHEMA_VALUE
+            .encode_utf16()
+            .collect::<Vec<_>>(),
+        AUTHORIZED_CLIENT_SID_VALUE
+            .encode_utf16()
+            .collect::<Vec<_>>(),
+    ];
+    expected_names.sort_unstable();
+    if actual_names.as_slice() != expected_names.as_slice() {
+        bail!("broker client authorization policy value names are noncanonical");
     }
     Ok(())
 }

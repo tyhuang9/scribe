@@ -243,6 +243,8 @@ try {
     $brokerNativeProduction = $brokerNative.Split('#[cfg(test)]', 2)[0]
     Assert-True ($brokerNativeProduction.Contains('SOFTWARE\Scribe\GpuPromotionBroker\v1\Authorization')) 'Broker lost its fixed machine-wide client policy path.'
     Assert-True ($brokerNativeProduction.Contains('KEY_READ | KEY_WOW64_64KEY')) 'Broker no longer opens only the fixed 64-bit policy view for read.'
+    Assert-True ($brokerNativeProduction.Contains('RegEnumValueW')) 'Broker does not enumerate exact policy value names before case-insensitive lookup.'
+    Assert-True ($brokerNativeProduction.Contains('actual_names.as_slice() != expected_names.as_slice()')) 'Broker does not compare policy value-name spelling ordinally.'
     Assert-True ($brokerNativeProduction.Contains('require_user_sid(token.raw(), authorized_client_sid)')) 'Broker does not require exact client TokenUser equality.'
     Assert-True (-not $brokerNativeProduction.Contains(';;;AU)')) 'Broker pipe regained Authenticated Users admission.'
     $provisioner = Get-Content -LiteralPath (Join-Path $repositoryRoot 'scripts\provision-windows-gpu-broker-client-policy.ps1') -Raw
@@ -258,6 +260,18 @@ try {
     Assert-True ($provisioner.Contains('SymbolicLinkValue')) 'Client policy provisioner does not identify registry link keys.'
     Assert-True ($provisioner.Contains('$mutationMask = [uint32]0x500d0026')) 'Client policy provisioner no longer rejects ancestor mutation authority.'
     Assert-True ($provisioner.Contains('ProvisioningState')) 'Client policy provisioner lacks an incomplete-policy marker.'
+    Assert-True ($provisioner.Contains('[string]$InvocationNonce')) 'Client policy provisioner does not bind success to a caller nonce.'
+    Assert-True ($provisioner.Contains('REG_CREATED_NEW_KEY')) 'Client policy provisioner does not distinguish exact create-new dispositions.'
+    Assert-True ($provisioner.Contains('created_ancestors = @($createdAncestorPaths)')) 'Client policy provisioner does not report its exact newly created ancestors.'
+    Assert-True ($provisioner.Contains('scribe-windows-gpu-broker-client-policy-provisioning-success-v1')) 'Client policy provisioner lacks a versioned success-record kind.'
+    Assert-True ($provisioner.Contains('RestorePrivilegeScope : IDisposable')) 'Client policy provisioner does not scope SeRestorePrivilege lifetime.'
+    Assert-True ($provisioner.Contains('AdjustTokenPrivilegesAndCapturePrevious')) 'Client policy provisioner does not capture the prior TOKEN_PRIVILEGES state.'
+    Assert-True ($provisioner.Contains('RestoreTokenPrivileges')) 'Client policy provisioner does not restore the captured TOKEN_PRIVILEGES state.'
+    Assert-True ($provisioner.Contains('private bool restorationComplete;')) 'Client policy provisioner does not distinguish restored state from released token ownership.'
+    Assert-True ($provisioner.Contains('public static void RestoreOrFailFast(RestorePrivilegeScope scope)')) 'Client policy provisioner lacks its mandatory outer restoration boundary.'
+    Assert-True ($provisioner.Contains('Environment.FailFast(')) 'Client policy provisioner can return after persistent privilege restoration failure.'
+    Assert-True (-not $provisioner.Contains('PrivilegeRestoreFailureEvidencePath')) 'Client policy provisioner exposes the test-only privilege failure path.'
+    Assert-True (-not $provisioner.Contains('restoreFailuresRemaining')) 'Client policy provisioner exposes deterministic test failure injection.'
     Assert-True ($provisioner.Contains('RegistryView]::Registry64')) 'Client policy provisioner does not pin the 64-bit registry view.'
     Assert-True (-not $provisioner.Contains('[string]$AccountName')) 'Client policy provisioner accepts an account name.'
     $bornProtected = $provisioner.LastIndexOf('Assert-PolicySecurity -Key $key', [StringComparison]::Ordinal)
@@ -266,11 +280,62 @@ try {
     $ancestorValidation = $provisioner.IndexOf('foreach ($ancestorPath in $policyAncestors)', [StringComparison]::Ordinal)
     $leafCreation = $provisioner.IndexOf('$status = [Scribe.GpuBroker.RegistryNative]::CreateProtectedKey(', [StringComparison]::Ordinal)
     Assert-True ($ancestorValidation -ge 0 -and $ancestorValidation -lt $leafCreation) 'Client policy provisioner creates the leaf before validating and protecting its ancestor chain.'
+    $privilegeEnable = $provisioner.IndexOf('$restorePrivilegeScope = [Scribe.GpuBroker.RegistryNative]::EnableRestorePrivilege()', [StringComparison]::Ordinal)
+    $privilegeRestoreBeforeCommit = $provisioner.IndexOf('$restorePrivilegeScope.Dispose()', $privilegeEnable, [StringComparison]::Ordinal)
+    $policyCommit = $provisioner.IndexOf('$key.DeleteValue($provisioningValue', [StringComparison]::Ordinal)
+    $privilegeRestore = $provisioner.LastIndexOf('[Scribe.GpuBroker.RegistryNative]::RestoreOrFailFast($restorePrivilegeScope)', [StringComparison]::Ordinal)
+    $successEmission = $provisioner.LastIndexOf('$successRecord | ConvertTo-Json', [StringComparison]::Ordinal)
+    Assert-True ($privilegeEnable -ge 0 -and $privilegeEnable -lt $ancestorValidation -and $ancestorValidation -lt $privilegeRestoreBeforeCommit -and $privilegeRestoreBeforeCommit -lt $policyCommit) 'Client policy provisioner can commit policy before restoring its exact privilege scope.'
+    Assert-True ($privilegeRestore -gt $policyCommit -and $privilegeRestore -lt $successEmission) 'Client policy provisioner lacks retry-or-terminate restoration before success output.'
+    $restoreScopeStart = $provisioner.IndexOf('public sealed class RestorePrivilegeScope : IDisposable', [StringComparison]::Ordinal)
+    $restoreScopeEnd = $provisioner.IndexOf('public static void RestoreOrFailFast(RestorePrivilegeScope scope)', $restoreScopeStart, [StringComparison]::Ordinal)
+    Assert-True ($restoreScopeStart -ge 0 -and $restoreScopeEnd -gt $restoreScopeStart) 'Client policy provisioner lost its bounded restoration scope implementation.'
+    $restoreScope = $provisioner.Substring($restoreScopeStart, $restoreScopeEnd - $restoreScopeStart)
+    $nativeRestore = $restoreScope.IndexOf('if (!RestoreTokenPrivileges(', [StringComparison]::Ordinal)
+    $restoredState = $restoreScope.IndexOf('restorationComplete = true;', [StringComparison]::Ordinal)
+    $closeToken = $restoreScope.IndexOf('if (!CloseHandle(token))', [StringComparison]::Ordinal)
+    $releaseToken = $restoreScope.IndexOf('token = IntPtr.Zero;', [StringComparison]::Ordinal)
+    $releasePrevious = $restoreScope.IndexOf('previousState = default(TokenPrivileges);', [StringComparison]::Ordinal)
+    Assert-True ($nativeRestore -ge 0 -and $nativeRestore -lt $restoredState -and $restoredState -lt $closeToken -and $closeToken -lt $releaseToken -and $releaseToken -lt $releasePrevious) 'Client policy provisioner can discard token or prior-state ownership before exact restore and successful close.'
     $transportHarness = Get-Content -LiteralPath (Join-Path $repositoryRoot 'scripts\test-windows-gpu-broker-transport.ps1') -Raw
     Assert-True ($transportHarness.Contains('Assert-OwnedPolicyState -State $state')) 'Broker harness cleanup does not revalidate exact ownership state.'
     Assert-True ($transportHarness.Contains('SecurityFingerprint')) 'Broker harness cleanup does not pin the policy security descriptor.'
     Assert-True ($transportHarness.Contains('CleanupTamper')) 'Broker harness lacks an adversarial same-name cleanup test.'
     Assert-True ($transportHarness.Contains('if ($result.ExitCode -eq 0)')) 'Broker harness claims policy ownership without successful provisioning.'
+    Assert-True ($transportHarness.Contains('New-ProvisioningInvocationNonce')) 'Broker harness does not generate a fresh provisioning correlation nonce.'
+    Assert-True ($transportHarness.Contains('Read-ProvisioningSuccessRecord')) 'Broker harness does not validate the provisioner success record.'
+    Assert-True ($transportHarness.Contains('$script:ownedPolicyAncestors = @($ownedPolicyAncestors) + @($createdByInvocation)')) 'Broker harness does not derive ancestor ownership solely from the validated success record.'
+    Assert-True (-not $transportHarness.Contains('initiallyMissingPolicyAncestors')) 'Broker harness infers ancestor ownership from an initial missing-path snapshot.'
+    Assert-True ($transportHarness.Contains('NtDeleteKey(SafeRegistryHandle keyHandle)')) 'Broker harness cleanup is not bound to an exact live registry handle.'
+    Assert-True ($transportHarness.Contains('RegRenameKey(')) 'Broker harness lacks an exact registry-object boundary-swap test.'
+    Assert-True ($transportHarness.Contains('KEY_WRITE | DELETE | KEY_QUERY_VALUE | KEY_WOW64_64KEY')) 'Broker harness boundary rename lacks retained parent/leaf mutation rights.'
+    Assert-True ($transportHarness.Contains('DELETE | READ_CONTROL | KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS | KEY_WOW64_64KEY')) 'Broker harness cleanup does not open the exact no-follow key with delete and validation rights.'
+    Assert-True (-not $transportHarness.Contains('.DeleteSubKey(')) 'Broker harness cleanup regained path-based registry deletion.'
+    Assert-True ($transportHarness.Contains('PrivilegeRestoreRetryModel')) 'Broker harness lacks deterministic test-only privilege restoration injection.'
+    Assert-True ($transportHarness.Contains('marker=incomplete;restore_attempts=3;token_owned=true;previous_state=37')) 'Broker harness does not prove persistent restoration failure retains fail-closed state until process termination.'
+    Assert-True ($transportHarness.Contains('Object.ReferenceEquals(provisioningOriginal, provisioningPropagated)')) 'Broker harness does not prove a successful outer retry preserves the original provisioning exception.'
+    Assert-True (-not $transportHarness.Contains('PrivilegeRestoreFailureEvidencePath')) 'Broker harness persistent-failure fixture exposes an arbitrary evidence path.'
+    Assert-True ($transportHarness.Contains('Console.Out.Flush();')) 'Broker harness does not flush in-band persistent-failure evidence before FailFast.'
+    Assert-True ($transportHarness.Contains('-MaximumCapturedOutputCharacters 16384')) 'Broker harness retains unbounded child FailFast diagnostics.'
+    $boundCleanupStart = $transportHarness.IndexOf('function Remove-RegistryKeyByValidatedHandle', [StringComparison]::Ordinal)
+    $boundCleanupEnd = $transportHarness.IndexOf('function Remove-OwnedPolicy', $boundCleanupStart, [StringComparison]::Ordinal)
+    Assert-True ($boundCleanupStart -ge 0 -and $boundCleanupEnd -gt $boundCleanupStart) 'Broker harness lost its bounded exact-handle cleanup helper.'
+    $boundCleanup = $transportHarness.Substring($boundCleanupStart, $boundCleanupEnd - $boundCleanupStart)
+    $boundValidation = $boundCleanup.IndexOf('& $Validate $key', [StringComparison]::Ordinal)
+    $boundaryHook = $boundCleanup.IndexOf('& $BeforeDelete', [StringComparison]::Ordinal)
+    $boundDeletion = $boundCleanup.IndexOf('DeleteExactKey($handle)', [StringComparison]::Ordinal)
+    Assert-True ($boundValidation -ge 0 -and $boundValidation -lt $boundaryHook -and $boundaryHook -lt $boundDeletion) 'Broker harness does not validate, exercise the boundary hook, and then delete through the same still-live handle.'
+    $removePolicyStart = $transportHarness.IndexOf('function Remove-OwnedPolicy(', [StringComparison]::Ordinal)
+    $removePolicyEnd = $transportHarness.IndexOf('function Remove-OwnedPolicyAncestors', $removePolicyStart, [StringComparison]::Ordinal)
+    Assert-True ($removePolicyStart -ge 0 -and $removePolicyEnd -gt $removePolicyStart) 'Broker harness lost its bounded policy cleanup function.'
+    $removePolicy = $transportHarness.Substring($removePolicyStart, $removePolicyEnd - $removePolicyStart)
+    $exactDeleteCall = $removePolicy.IndexOf('Remove-RegistryKeyByValidatedHandle', [StringComparison]::Ordinal)
+    $dropOwnership = $removePolicy.IndexOf('$script:ownedPolicyState = $null', [StringComparison]::Ordinal)
+    $postDeleteObservation = $removePolicy.IndexOf('Test-Path -LiteralPath $policyRegistryPath', [StringComparison]::Ordinal)
+    Assert-True ($exactDeleteCall -ge 0 -and $exactDeleteCall -lt $dropOwnership -and $dropOwnership -lt $postDeleteObservation) 'Broker harness retains policy ownership across a post-delete path observation.'
+    Assert-True ($transportHarness.Contains('$script:ownedPolicyAncestors = @($ownedPolicyAncestors | Where-Object { $_ -cne $path })')) 'Broker harness retains a successfully deleted ancestor until later cleanup completes.'
+    Assert-True ($transportHarness.Contains('boundary-swap policy')) 'Broker harness lacks deterministic post-delete replacement coverage.'
+    Assert-True ($transportHarness.Contains("Assert-True (`$null -eq `$ownedPolicyState) 'Policy cleanup retained authority after its exact NtDeleteKey succeeded.'")) 'Broker harness does not prove ownership is dropped at the delete boundary.'
     Assert-True (-not $transportHarness.Contains('if (Test-Path -LiteralPath $policyRegistryPath) { $script:createdPolicy = $true }')) 'Broker harness derives destructive ownership from path existence.'
     Assert-True ((Get-Content -LiteralPath (Join-Path $repositoryRoot 'tools\windows-gpu-promotion-broker\src\fixture.rs') -Raw).Contains('consumes_canonical_handoff_generated_by_powershell_and_worker_pack_author')) 'Broker proof does not consume the PowerShell/worker-pack-author interoperability fixture.'
 

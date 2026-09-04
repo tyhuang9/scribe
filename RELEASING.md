@@ -139,7 +139,10 @@ On a disposable elevated host, the create-new provisioner accepts an explicit
 canonical `S-1-5-21` account SID (RID 1000 or greater), never an account name:
 
 ```powershell
-pwsh -NoProfile -File .\scripts\provision-windows-gpu-broker-client-policy.ps1 -AuthorizedClientSid 'S-1-5-21-...-1000'
+$nonceBytes = [byte[]]::new(32)
+[Security.Cryptography.RandomNumberGenerator]::Fill($nonceBytes)
+$nonce = [Convert]::ToHexString($nonceBytes).ToLowerInvariant()
+pwsh -NoProfile -File .\scripts\provision-windows-gpu-broker-client-policy.ps1 -AuthorizedClientSid 'S-1-5-21-...-1000' -InvocationNonce $nonce
 ```
 
 It refuses broad, built-in, reserved, NetworkService/other service principals,
@@ -149,8 +152,25 @@ is supplied atomically at key creation and verified before the first value
 write, so inherited writers have no pre-lockdown handle window. Every fixed
 64-bit ancestor is opened without following registry links and refused if an
 untrusted principal can mutate it; missing Scribe-specific ancestors are born
-with the same protected descriptor. Policy provisioning does not provision a
-key, trust root, ledger, signer, pack intake/publication, or activation.
+with the same protected descriptor. The sole success output is a versioned JSON
+record bound to the caller's
+lowercase 32-byte correlation nonce. It reports only fixed ancestors whose
+create call returned `REG_CREATED_NEW_KEY`; the nonce is not secret or
+authorization material. Test automation validates that exact record before it
+claims cleanup ownership, then validates and deletes through the same no-follow
+`DELETE` handle with `NtDeleteKey` so path replacement cannot retarget cleanup.
+The provisioner captures the exact prior `SeRestorePrivilege` token state and
+restores it before removing the incomplete commit marker. The scope retains its
+token and captured state after any restore or handle-close failure. Its outer
+`finally` boundary retries a failed restoration and terminates the process with
+`Environment.FailFast` if the retry also fails, so dot-sourced use cannot return
+to a long-lived elevated host with uncertain privilege state. A successful
+retry preserves the original provisioning exception, and success output occurs
+only after restoration and token closure succeed. Test cleanup relinquishes each policy/ancestor ownership
+entry immediately after its exact delete succeeds and before checking whether a
+same-name path has reappeared.
+Policy provisioning does not provision a key, trust root, ledger, signer, pack
+intake/publication, or activation.
 Production service installation is not part of the application installer, the
 `SCRIBE_WINDOWS_GPU_PRODUCTION_BROKER_PROVISIONED` gate remains closed, and an
 endpoint or policy path supplied by CLI/environment is never accepted. The

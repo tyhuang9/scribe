@@ -1610,6 +1610,7 @@ fn windows_gpu_pack_promotion_keeps_candidate_and_signing_authority_separate() {
         r"SOFTWARE\Scribe\GpuPromotionBroker\v1\Authorization",
         "KEY_READ | KEY_WOW64_64KEY",
         "RegQueryInfoKeyW",
+        "RegEnumValueW",
         "RegQueryValueExW",
         "SchemaVersion",
         "AuthorizedClientSid",
@@ -1701,6 +1702,17 @@ fn windows_gpu_pack_promotion_keeps_candidate_and_signing_authority_separate() {
         "SecurityFingerprint",
         "CleanupTamper",
         "if ($result.ExitCode -eq 0)",
+        "New-ProvisioningInvocationNonce",
+        "Read-ProvisioningSuccessRecord",
+        "$script:ownedPolicyAncestors = @($ownedPolicyAncestors) + @($createdByInvocation)",
+        "NtDeleteKey(SafeRegistryHandle keyHandle)",
+        "RegRenameKey(",
+        "KEY_WRITE | DELETE | KEY_QUERY_VALUE | KEY_WOW64_64KEY",
+        "DELETE | READ_CONTROL | KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS | KEY_WOW64_64KEY",
+        "Noncanonical policy value name",
+        "boundary-swap policy",
+        "Policy cleanup retained authority after its exact NtDeleteKey succeeded.",
+        "$script:ownedPolicyAncestors = @($ownedPolicyAncestors | Where-Object { $_ -cne $path })",
         "Remove-OwnedPolicy",
     ] {
         assert!(
@@ -1710,6 +1722,7 @@ fn windows_gpu_pack_promotion_keeps_candidate_and_signing_authority_separate() {
     }
     for required in [
         "[string]$AuthorizedClientSid",
+        "[string]$InvocationNonce",
         r"SOFTWARE\Scribe\GpuPromotionBroker\v1\Authorization",
         "RegistryView]::Registry64",
         "RegCreateKeyExW",
@@ -1725,6 +1738,15 @@ fn windows_gpu_pack_promotion_keeps_candidate_and_signing_authority_separate() {
         "RegistryRights]::FullControl",
         "RegistryRights]::ReadKey",
         "ProvisioningState",
+        "REG_CREATED_NEW_KEY",
+        "created_ancestors = @($createdAncestorPaths)",
+        "scribe-windows-gpu-broker-client-policy-provisioning-success-v1",
+        "RestorePrivilegeScope : IDisposable",
+        "AdjustTokenPrivilegesAndCapturePrevious",
+        "RestoreTokenPrivileges",
+        "private bool restorationComplete;",
+        "public static void RestoreOrFailFast(RestorePrivilegeScope scope)",
+        "Environment.FailFast(",
         "Removing the marker is the only commit point",
         "Assert-Policy -Key $key -ExpectProvisioningMarker $false",
         "S-1-5-20",
@@ -1767,17 +1789,147 @@ fn windows_gpu_pack_promotion_keeps_candidate_and_signing_authority_separate() {
         ancestor_validation < leaf_creation,
         "broker policy ancestor chain must be secured before leaf creation"
     );
+    let privilege_enable = client_policy_provisioner
+        .find(
+            "$restorePrivilegeScope = [Scribe.GpuBroker.RegistryNative]::EnableRestorePrivilege()",
+        )
+        .expect("provisioner enables restore privilege through a scoped token");
+    let privilege_restore_before_commit = client_policy_provisioner[privilege_enable..]
+        .find("$restorePrivilegeScope.Dispose()")
+        .map(|offset| privilege_enable + offset)
+        .expect("provisioner restores privilege before committing policy");
+    let policy_commit = client_policy_provisioner
+        .find("$key.DeleteValue($provisioningValue")
+        .expect("provisioner removes its incomplete marker at commit");
+    let privilege_restore = client_policy_provisioner
+        .rfind("[Scribe.GpuBroker.RegistryNative]::RestoreOrFailFast($restorePrivilegeScope)")
+        .expect("provisioner retries restoration or terminates at its outer boundary");
+    let success_emission = client_policy_provisioner
+        .rfind("$successRecord | ConvertTo-Json")
+        .expect("provisioner emits its success record");
+    assert!(
+        privilege_enable < ancestor_validation
+            && ancestor_validation < privilege_restore_before_commit
+            && privilege_restore_before_commit < policy_commit
+            && policy_commit < privilege_restore
+            && privilege_restore < success_emission,
+        "broker policy provisioning must restore privileges before policy commit and success output"
+    );
+    let restore_scope_start = client_policy_provisioner
+        .find("public sealed class RestorePrivilegeScope : IDisposable")
+        .expect("provisioner defines its restoration scope");
+    let restore_scope_end = client_policy_provisioner[restore_scope_start..]
+        .find("public static void RestoreOrFailFast(RestorePrivilegeScope scope)")
+        .map(|offset| restore_scope_start + offset)
+        .expect("provisioner bounds its restoration scope implementation");
+    let restore_scope = &client_policy_provisioner[restore_scope_start..restore_scope_end];
+    let native_restore = restore_scope
+        .find("if (!RestoreTokenPrivileges(")
+        .expect("restoration scope invokes the native exact-state restore");
+    let restored_state = restore_scope
+        .find("restorationComplete = true;")
+        .expect("restoration scope records exact restoration");
+    let close_token = restore_scope
+        .find("if (!CloseHandle(token))")
+        .expect("restoration scope closes its owned token");
+    let release_token = restore_scope
+        .find("token = IntPtr.Zero;")
+        .expect("restoration scope eventually relinquishes token ownership");
+    let release_previous = restore_scope
+        .find("previousState = default(TokenPrivileges);")
+        .expect("restoration scope eventually clears captured state");
+    assert!(
+        native_restore < restored_state
+            && restored_state < close_token
+            && close_token < release_token
+            && release_token < release_previous,
+        "broker policy provisioning must retain token and prior state until restore and close succeed"
+    );
+    for forbidden in [
+        "PrivilegeRestoreFailureEvidencePath",
+        "restoreFailuresRemaining",
+    ] {
+        assert!(
+            !client_policy_provisioner.contains(forbidden),
+            "production policy provisioner exposes test failure hook {forbidden:?}"
+        );
+    }
+    for required in [
+        "PrivilegeRestoreRetryModel",
+        "marker=incomplete;restore_attempts=3;token_owned=true;previous_state=37",
+        "Object.ReferenceEquals(provisioningOriginal, provisioningPropagated)",
+        "Console.Out.Flush();",
+        "-MaximumCapturedOutputCharacters 16384",
+    ] {
+        assert!(
+            transport_test.contains(required),
+            "SCM harness lost privilege retry proof {required:?}"
+        );
+    }
+    assert!(
+        !transport_test.contains("PrivilegeRestoreFailureEvidencePath"),
+        "SCM harness persistent-failure fixture exposes an arbitrary evidence path"
+    );
     assert!(
         !transport_test.contains(
             "if (Test-Path -LiteralPath $policyRegistryPath) { $script:createdPolicy = $true }"
         ),
         "SCM harness must not infer destructive policy ownership from path existence"
     );
+    assert!(
+        !transport_test.contains("initiallyMissingPolicyAncestors"),
+        "SCM harness must not infer ancestor ownership from a missing-path snapshot"
+    );
+    assert!(
+        !transport_test.contains(".DeleteSubKey("),
+        "SCM harness cleanup must not use path-based registry deletion"
+    );
+    let bound_cleanup_start = transport_test
+        .find("function Remove-RegistryKeyByValidatedHandle")
+        .expect("SCM harness defines exact-handle registry cleanup");
+    let bound_cleanup_end = transport_test[bound_cleanup_start..]
+        .find("function Remove-OwnedPolicy")
+        .map(|offset| bound_cleanup_start + offset)
+        .expect("SCM harness exact-handle cleanup has a bounded source region");
+    let bound_cleanup = &transport_test[bound_cleanup_start..bound_cleanup_end];
+    let bound_validation = bound_cleanup
+        .find("& $Validate $key")
+        .expect("SCM harness validates the opened registry object");
+    let boundary_hook = bound_cleanup
+        .find("& $BeforeDelete")
+        .expect("SCM harness supports a deterministic pre-delete boundary test");
+    let bound_deletion = bound_cleanup
+        .find("DeleteExactKey($handle)")
+        .expect("SCM harness deletes through the opened registry handle");
+    assert!(
+        bound_validation < boundary_hook && boundary_hook < bound_deletion,
+        "SCM harness must validate, exercise the boundary, and delete through the same live handle"
+    );
+    let remove_policy_start = transport_test
+        .find("function Remove-OwnedPolicy(")
+        .expect("SCM harness defines policy cleanup");
+    let remove_policy_end = transport_test[remove_policy_start..]
+        .find("function Remove-OwnedPolicyAncestors")
+        .map(|offset| remove_policy_start + offset)
+        .expect("SCM harness policy cleanup has a bounded source region");
+    let remove_policy = &transport_test[remove_policy_start..remove_policy_end];
+    let exact_delete_call = remove_policy
+        .find("Remove-RegistryKeyByValidatedHandle")
+        .expect("SCM harness invokes exact-handle policy deletion");
+    let drop_ownership = remove_policy
+        .find("$script:ownedPolicyState = $null")
+        .expect("SCM harness drops deleted policy ownership");
+    let post_delete_observation = remove_policy
+        .find("Test-Path -LiteralPath $policyRegistryPath")
+        .expect("SCM harness observes the fixed path after deletion");
+    assert!(
+        exact_delete_call < drop_ownership && drop_ownership < post_delete_observation,
+        "SCM harness must drop ownership before observing a post-delete replacement"
+    );
     for forbidden in [
         "[string]$AccountName",
         "LookupAccountName",
         "Convert-NameToSid",
-        "Env:",
         "HKEY_CURRENT_USER",
     ] {
         assert!(
@@ -1785,6 +1937,12 @@ fn windows_gpu_pack_promotion_keeps_candidate_and_signing_authority_separate() {
             "broker client-policy provisioner gained override or account-name input {forbidden:?}"
         );
     }
+    assert!(
+        !client_policy_provisioner
+            .to_ascii_lowercase()
+            .contains("env:"),
+        "broker client-policy provisioner gained a case-insensitive environment override"
+    );
     for required in [
         "RECEIPT_DOMAIN",
         "LEDGER_DOMAIN",

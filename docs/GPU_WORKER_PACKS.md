@@ -312,7 +312,9 @@ the fixed Registry64 policy at
 DWORD `SchemaVersion=1` and a canonical `AuthorizedClientSid`. The key must be
 SYSTEM-owned, inheritance-protected, have no subkeys or extra values, and have
 exactly SYSTEM/Administrators full-control plus service-SID read ACEs. The SID
-is snapshotted for the service lifetime, so registry mutation requires restart
+loader enumerates both value names and compares their exact ordinal UTF-16
+spelling before using the registry's case-insensitive query API. The SID is
+snapshotted for the service lifetime, so registry mutation requires restart
 and cannot broaden the running process. A valid orphan SID locks clients out.
 
 The first-instance local-only message pipe contains exactly service-SID
@@ -337,6 +339,30 @@ and atomically protects each missing Scribe-specific ancestor before descending.
 This prevents an ambient writer from replacing the final key after its DACL is
 verified. This conservative policy intentionally excludes non-account and
 service principals; changing it requires review.
+
+The provisioner requires a caller-generated lowercase 32-byte hexadecimal
+correlation nonce. After the leaf commits, its only stdout is a versioned JSON
+success record containing that nonce, the exact requested SID and policy path,
+and only ancestors whose `RegCreateKeyExW` call returned
+`REG_CREATED_NEW_KEY`. The nonce is correlation data, not a secret or authority.
+The native privilege scope captures the exact prior `TOKEN_PRIVILEGES` entry for
+`SeRestorePrivilege` and restores it before removing the incomplete commit
+marker. It retains the token and captured state after either a restore or
+handle-close failure. The outer `finally` boundary retries once and calls
+`Environment.FailFast` if that retry also fails, preventing a dot-sourced or
+standalone invocation from returning with uncertain privilege state. A
+successful retry preserves the original provisioning exception. Success output
+occurs only after restoration and token closure.
+The elevated harness accepts cleanup ownership only from that exact validated
+record. It opens each cleanup target without following registry links, requests
+`DELETE` plus validation rights, validates through that handle, and calls
+handle-bound `NtDeleteKey` before disposing it. It never deletes the policy or
+owned ancestors by path after a separate validation. Each ownership entry is
+removed immediately when its exact delete succeeds, before any same-name path
+observation or subsequent cleanup attempt. An elevated boundary test renames
+the validated leaf and provisions a fixed-path replacement before deletion,
+then proves the retained handle deletes the renamed original and spares the
+replacement.
 
 The same workspace proves the broker state machine with test-only authority:
 deny-unknown-fields canonical schemas, exact

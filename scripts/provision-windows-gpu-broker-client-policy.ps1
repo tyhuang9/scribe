@@ -2,7 +2,11 @@
 param(
     [Parameter(Mandatory)]
     [ValidateNotNullOrEmpty()]
-    [string]$AuthorizedClientSid
+    [string]$AuthorizedClientSid,
+
+    [Parameter(Mandatory)]
+    [ValidatePattern('^[0-9a-f]{64}$')]
+    [string]$InvocationNonce
 )
 
 $ErrorActionPreference = 'Stop'
@@ -21,6 +25,8 @@ $administratorsSid = 'S-1-5-32-544'
 $schemaValue = 'SchemaVersion'
 $clientSidValue = 'AuthorizedClientSid'
 $provisioningValue = 'ProvisioningState'
+$successRecordKind = 'scribe-windows-gpu-broker-client-policy-provisioning-success-v1'
+$createdAncestorPaths = [Collections.Generic.List[string]]::new()
 
 function Assert-True([bool]$Condition, [string]$Message) {
     if (-not $Condition) { throw $Message }
@@ -52,6 +58,11 @@ function Assert-DedicatedAccountSid([string]$Value) {
         $serviceSid
     )
     Assert-True ($Value -cnotin $dangerous) 'AuthorizedClientSid identifies a broad or service principal.'
+}
+
+function Assert-InvocationNonce([string]$Value) {
+    Assert-True ($Value.Length -eq 64) 'InvocationNonce must be exactly 32 bytes of lowercase hexadecimal correlation data.'
+    Assert-True ([regex]::IsMatch($Value, '\A[0-9a-f]{64}\z', [Text.RegularExpressions.RegexOptions]::CultureInvariant)) 'InvocationNonce is noncanonical.'
 }
 
 function Assert-PolicySecurity([Microsoft.Win32.RegistryKey]$Key) {
@@ -134,6 +145,7 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
     throw 'Windows GPU broker client policy provisioning requires elevation.'
 }
 Assert-DedicatedAccountSid -Value $AuthorizedClientSid
+Assert-InvocationNonce -Value $InvocationNonce
 
 if (-not ('Scribe.GpuBroker.RegistryNative' -as [type])) {
     Add-Type -TypeDefinition @'
@@ -144,10 +156,10 @@ using Microsoft.Win32.SafeHandles;
 
 namespace Scribe.GpuBroker {
     public static class RegistryNative {
+        public const int REG_CREATED_NEW_KEY = 1;
         private const uint TOKEN_ADJUST_PRIVILEGES = 0x20;
         private const uint TOKEN_QUERY = 0x8;
         private const uint SE_PRIVILEGE_ENABLED = 0x2;
-        private const int ERROR_NOT_ALL_ASSIGNED = 1300;
         private const int ERROR_FILE_NOT_FOUND = 2;
         private const int SDDL_REVISION_1 = 1;
         private const int REG_OPTION_OPEN_LINK = 8;
@@ -158,10 +170,10 @@ namespace Scribe.GpuBroker {
         private static readonly IntPtr HKEY_LOCAL_MACHINE = new IntPtr(-2147483646);
 
         [StructLayout(LayoutKind.Sequential)]
-        private struct Luid { internal uint LowPart; internal int HighPart; }
+        internal struct Luid { internal uint LowPart; internal int HighPart; }
 
         [StructLayout(LayoutKind.Sequential)]
-        private struct TokenPrivileges {
+        internal struct TokenPrivileges {
             internal uint PrivilegeCount;
             internal Luid Luid;
             internal uint Attributes;
@@ -195,8 +207,17 @@ namespace Scribe.GpuBroker {
             string name,
             out Luid luid);
 
-        [DllImport("advapi32.dll", SetLastError = true)]
-        private static extern bool AdjustTokenPrivileges(
+        [DllImport("advapi32.dll", EntryPoint = "AdjustTokenPrivileges", SetLastError = true)]
+        private static extern bool AdjustTokenPrivilegesAndCapturePrevious(
+            IntPtr token,
+            bool disableAllPrivileges,
+            ref TokenPrivileges newState,
+            uint bufferLength,
+            out TokenPrivileges previousState,
+            out uint returnLength);
+
+        [DllImport("advapi32.dll", EntryPoint = "AdjustTokenPrivileges", SetLastError = true)]
+        private static extern bool RestoreTokenPrivileges(
             IntPtr token,
             bool disableAllPrivileges,
             ref TokenPrivileges newState,
@@ -236,7 +257,7 @@ namespace Scribe.GpuBroker {
 
         [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         private static extern int RegQueryValueExW(
-            IntPtr hKey,
+            SafeRegistryHandle hKey,
             string lpValueName,
             IntPtr reserved,
             out int type,
@@ -293,7 +314,7 @@ namespace Scribe.GpuBroker {
             int type;
             int size = 0;
             int query = RegQueryValueExW(
-                result.DangerousGetHandle(),
+                result,
                 "SymbolicLinkValue",
                 IntPtr.Zero,
                 out type,
@@ -303,7 +324,83 @@ namespace Scribe.GpuBroker {
             return 0;
         }
 
-        public static void EnableRestorePrivilege() {
+        public sealed class RestorePrivilegeScope : IDisposable {
+            private IntPtr token;
+            private TokenPrivileges previousState;
+            private bool restorationComplete;
+
+            internal RestorePrivilegeScope(IntPtr token, TokenPrivileges previousState) {
+                this.token = token;
+                this.previousState = previousState;
+            }
+
+            public void Dispose() {
+                if (token == IntPtr.Zero)
+                    return;
+
+                if (!restorationComplete) {
+                    if (previousState.PrivilegeCount != 0) {
+                        SetLastError(0);
+                        if (!RestoreTokenPrivileges(
+                            token,
+                            false,
+                            ref previousState,
+                            0,
+                            IntPtr.Zero,
+                            IntPtr.Zero))
+                            throw new Win32Exception(
+                                Marshal.GetLastWin32Error(),
+                                "Could not restore the caller's SeRestorePrivilege state.");
+                        int error = Marshal.GetLastWin32Error();
+                        if (error != 0)
+                            throw new Win32Exception(
+                                error,
+                                "Could not restore the caller's SeRestorePrivilege state.");
+                    }
+                    restorationComplete = true;
+                }
+
+                // Retain both the token and captured prior state if close
+                // fails. A later outer-boundary attempt can retry the close
+                // without repeating an already successful restoration.
+                if (!CloseHandle(token))
+                    throw new Win32Exception(
+                        Marshal.GetLastWin32Error(),
+                        "Could not close the caller's SeRestorePrivilege token.");
+
+                // Ownership is relinquished only after exact restoration (or
+                // a captured no-op) and successful handle closure.
+                token = IntPtr.Zero;
+                previousState = default(TokenPrivileges);
+            }
+        }
+
+        public static void RestoreOrFailFast(RestorePrivilegeScope scope) {
+            if (scope == null)
+                throw new ArgumentNullException("scope");
+            Exception firstFailure;
+            try {
+                scope.Dispose();
+                return;
+            }
+            catch (Exception error) {
+                firstFailure = error;
+            }
+
+            try {
+                // Every outer-boundary failure receives at least one retry.
+                // Returning to a long-lived host with the scope still live is
+                // forbidden because SeRestorePrivilege may remain enabled.
+                scope.Dispose();
+            }
+            catch (Exception retryFailure) {
+                Environment.FailFast(
+                    "Could not restore the caller's SeRestorePrivilege state after retry.",
+                    new AggregateException(firstFailure, retryFailure));
+            }
+        }
+
+        public static RestorePrivilegeScope EnableRestorePrivilege() {
             IntPtr token;
             if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, out token))
                 throw new Win32Exception(Marshal.GetLastWin32Error());
@@ -316,21 +413,40 @@ namespace Scribe.GpuBroker {
                     Luid = luid,
                     Attributes = SE_PRIVILEGE_ENABLED
                 };
+                TokenPrivileges previousState;
+                uint returnLength;
                 SetLastError(0);
-                if (!AdjustTokenPrivileges(token, false, ref privileges, 0, IntPtr.Zero, IntPtr.Zero))
+                if (!AdjustTokenPrivilegesAndCapturePrevious(
+                    token,
+                    false,
+                    ref privileges,
+                    (uint)Marshal.SizeOf(typeof(TokenPrivileges)),
+                    out previousState,
+                    out returnLength))
                     throw new Win32Exception(Marshal.GetLastWin32Error());
                 int error = Marshal.GetLastWin32Error();
-                if (error == ERROR_NOT_ALL_ASSIGNED)
-                    throw new Win32Exception(error);
+                RestorePrivilegeScope scope = new RestorePrivilegeScope(token, previousState);
+                token = IntPtr.Zero;
+                if (error != 0 || returnLength > Marshal.SizeOf(typeof(TokenPrivileges))) {
+                    Exception activationFailure = new Win32Exception(error != 0 ? error : 87);
+                    RestoreOrFailFast(scope);
+                    throw activationFailure;
+                }
+                return scope;
             }
-            finally { CloseHandle(token); }
+            finally {
+                if (token != IntPtr.Zero)
+                    CloseHandle(token);
+            }
         }
     }
 }
 '@
 }
 
-[Scribe.GpuBroker.RegistryNative]::EnableRestorePrivilege()
+$restorePrivilegeScope = [Scribe.GpuBroker.RegistryNative]::EnableRestorePrivilege()
+$successRecord = $null
+try {
 $policySddl = "O:SYD:P(A;;KA;;;SY)(A;;KA;;;BA)(A;;KR;;;$serviceSid)"
 $rootHandle = $null
 $rootIsLink = $false
@@ -374,13 +490,19 @@ foreach ($ancestorPath in $policyAncestors) {
         [ref]$ancestorHandle,
         [ref]$ancestorDisposition
     )
-    Assert-True ($createStatus -eq 0 -and $ancestorDisposition -eq 1) "Could not create authorization policy ancestor $ancestorPath safely (Win32 $createStatus)."
+    if ($createStatus -ne 0 -or $ancestorDisposition -ne [Scribe.GpuBroker.RegistryNative]::REG_CREATED_NEW_KEY) {
+        if ($null -ne $ancestorHandle) { $ancestorHandle.Dispose() }
+        throw "Could not create authorization policy ancestor $ancestorPath safely (Win32 $createStatus, disposition $ancestorDisposition)."
+    }
     try {
         $ancestorKey = [Microsoft.Win32.RegistryKey]::FromHandle($ancestorHandle, [Microsoft.Win32.RegistryView]::Registry64)
         try { Assert-PolicySecurity -Key $ancestorKey }
         finally { $ancestorKey.Dispose() }
     }
     finally { $ancestorHandle.Dispose() }
+    # Only this exact RegCreateKeyExW result is authoritative for cleanup
+    # ownership. The success record is emitted only after the leaf commits.
+    [void]$createdAncestorPaths.Add($ancestorPath)
 }
 
 $keyHandle = $null
@@ -405,8 +527,11 @@ $status = [Scribe.GpuBroker.RegistryNative]::CreateProtectedKey(
     [ref]$keyHandle,
     [ref]$disposition
 )
-if ($status -ne 0) { throw "Could not create the fixed authorization policy (Win32 $status)." }
-if ($disposition -ne 1) {
+if ($status -ne 0) {
+    if ($null -ne $keyHandle) { $keyHandle.Dispose() }
+    throw "Could not create the fixed authorization policy (Win32 $status)."
+}
+if ($disposition -ne [Scribe.GpuBroker.RegistryNative]::REG_CREATED_NEW_KEY) {
     $keyHandle.Dispose()
     throw 'Refusing to modify a pre-existing Windows GPU broker client policy.'
 }
@@ -424,13 +549,24 @@ try {
     $key.Flush()
     Assert-Policy -Key $key -ExpectProvisioningMarker $true
 
+    # Restore the caller token before the commit point. If restoration fails,
+    # the incomplete marker remains and the service rejects this policy.
+    $restorePrivilegeScope.Dispose()
+
     # Removing the marker is the only commit point. Before it, every service
     # startup rejects the extra value even if provisioning was interrupted.
     $key.DeleteValue($provisioningValue, $true)
     $key.Flush()
     Assert-Policy -Key $key -ExpectProvisioningMarker $false
     $committed = $true
-    Write-Output "Provisioned protected Windows GPU broker client policy for $AuthorizedClientSid. Restart the broker service to load it."
+    $successRecord = [ordered]@{
+        schema_version = 1
+        kind = $successRecordKind
+        invocation_nonce = $InvocationNonce
+        authorized_client_sid = $AuthorizedClientSid
+        policy_path = $policyPath
+        created_ancestors = @($createdAncestorPaths)
+    }
 }
 catch {
     if ($null -ne $key -and -not $committed) {
@@ -446,3 +582,15 @@ finally {
     if ($null -ne $key) { $key.Dispose() }
     if ($null -ne $keyHandle) { $keyHandle.Dispose() }
 }
+}
+finally {
+    # This also runs when the script is dot-sourced into a long-lived elevated
+    # host. Restore the exact TOKEN_PRIVILEGES state captured before enabling
+    # SeRestorePrivilege; a restore failure makes the invocation fail.
+    [Scribe.GpuBroker.RegistryNative]::RestoreOrFailFast($restorePrivilegeScope)
+}
+
+Assert-True ($null -ne $successRecord) 'Provisioning completed without a success record.'
+# Stdout is emitted only after the privilege state has been restored, and is
+# one nonce-bound record so automation can reject stale/interleaved output.
+$successRecord | ConvertTo-Json -Compress -Depth 3 | Write-Output

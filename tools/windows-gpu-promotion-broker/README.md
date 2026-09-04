@@ -52,7 +52,10 @@ handoff or output paths.
 An elevated administrator can create the absent policy once with:
 
 ```powershell
-pwsh -NoProfile -File .\scripts\provision-windows-gpu-broker-client-policy.ps1 -AuthorizedClientSid 'S-1-5-21-...-1000'
+$nonceBytes = [byte[]]::new(32)
+[Security.Cryptography.RandomNumberGenerator]::Fill($nonceBytes)
+$nonce = [Convert]::ToHexString($nonceBytes).ToLowerInvariant()
+pwsh -NoProfile -File .\scripts\provision-windows-gpu-broker-client-policy.ps1 -AuthorizedClientSid 'S-1-5-21-...-1000' -InvocationNonce $nonce
 ```
 
 The provisioner accepts a SID, never an account name, and conservatively
@@ -64,7 +67,19 @@ creation, verifies that protection before its first value write, retains an
 incomplete marker until values verify, and refuses any pre-existing policy. It
 also opens the fixed 64-bit ancestor chain without following registry links,
 refuses ancestors writable by untrusted principals, and atomically protects any
-missing Scribe-specific ancestor before creating the leaf.
+missing Scribe-specific ancestor before creating the leaf. On success it writes
+one JSON record bound to the supplied correlation nonce and lists only ancestors
+for which that invocation received `REG_CREATED_NEW_KEY`.
+The native helper captures the caller token's exact prior `SeRestorePrivilege`
+state and restores it before removing the incomplete commit marker. Restore or
+handle-close failure retains the token and captured state for the outer
+`finally` boundary to retry. A persistent retry failure terminates through
+`Environment.FailFast` rather than returning to a long-lived host with uncertain
+privilege state; a successful retry preserves the original provisioning error.
+Success JSON is emitted only after restoration and token closure succeed.
+The nonce is not a credential. Automation must verify the record's version,
+nonce, SID, fixed policy path, and ordered ancestor inventory before claiming
+test cleanup ownership.
 
 The hostile-input copier, fixture Ed25519 authority, chained replay/epoch
 ledger, signed receipt, recovery state machine, authorizer, and atomic publisher
@@ -92,7 +107,15 @@ Policy provisioning alone does not provision production authority. Production
 promotion must stay disabled until those controls are implemented and
 independently reviewed. The elevated repository harness temporarily installs
 the zero-authority service and policy, proves invalid-policy and wrong-SID
-denial plus snapshot behavior, and performs identity-safe cleanup. Neither
+denial plus snapshot behavior, and performs identity-safe cleanup. The harness
+validates and deletes each owned registry object through one
+no-follow handle opened with `DELETE`; handle-bound `NtDeleteKey` prevents a
+same-name replacement from redirecting cleanup after validation. Ownership is
+dropped immediately after each successful deletion, before observing the path
+again, so a replacement cannot be deleted by a later cleanup retry. The
+elevated adversarial test renames the validated object, creates a replacement at
+the fixed path, and proves the retained handle deletes only the renamed original.
+Neither
 release binary contains installation, policy provisioning, or console-mode
 behavior. Run the crate proof on Windows with:
 
