@@ -89,6 +89,7 @@ use crate::ui::{
     minimum_primary_target_height, recording_mode, render_screen,
     request_models_route_heading_focus, scroll_focused_control_into_view, settings_save_state,
     show_navigation, show_route_scroll, theme_palette, transcription_state, ui_palette,
+    update_focus_visible_state,
 };
 
 #[cfg(test)]
@@ -4667,8 +4668,13 @@ impl LocalTranscriberApp {
         self.status_message = message.clone();
         if transcribe_session {
             self.transcribe_notice = Some(if message.starts_with("Microphone failed:") {
+                let detail = message
+                    .strip_prefix("Microphone failed:")
+                    .map(str::trim)
+                    .filter(|detail| !detail.is_empty())
+                    .unwrap_or("Microphone access failed.");
                 TranscribeNotice::error(
-                    "Scribe couldn’t access your microphone.",
+                    format!("Scribe couldn’t access your microphone — {detail}"),
                     TranscribeRecoveryAction::RetryMicrophone,
                 )
             } else {
@@ -4767,6 +4773,21 @@ impl LocalTranscriberApp {
         self.status_message = format!("{}. {}", pending.completion_message, output_message);
         self.latest_latency = self.merged_overlay_latency(pending.session_id, pending.latency);
         let _ = self.session_coordinator.complete(pending.session_id);
+        let output_notice = match &result {
+            text_output::TextOutputResult::Inserted => None,
+            text_output::TextOutputResult::Failed(_)
+            | text_output::TextOutputResult::NotInserted(_) => {
+                Some(TranscribeNotice::failure(output_message.clone()))
+            }
+            text_output::TextOutputResult::CopiedOnly(_)
+            | text_output::TextOutputResult::InsertedClipboardRestoreSkipped
+            | text_output::TextOutputResult::InsertedClipboardRestoreFailed(_) => {
+                Some(TranscribeNotice::information(output_message.clone()))
+            }
+        };
+        if let Some(notice) = output_notice {
+            self.transcribe_notice = Some(notice);
+        }
         if let text_output::TextOutputResult::Failed(message) = &result {
             self.status = TranscriptionStatus::Error;
             self.finish_overlay_error(pending.session_id, message);
@@ -5471,6 +5492,7 @@ impl LocalTranscriberApp {
                 self.retire_captured_target(session_id);
                 self.status = TranscriptionStatus::Error;
                 self.status_message = message.to_owned();
+                self.transcribe_notice = Some(TranscribeNotice::failure(message));
                 self.finish_overlay_error(session_id, message);
             }
             return;
@@ -10782,6 +10804,7 @@ impl eframe::App for LocalTranscriberApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        update_focus_visible_state(ctx);
         // Consume only focus requests carried into this frame. Navigation may
         // queue a new request below, which intentionally waits for the next
         // frame so the Models route and its accessibility tree are stable.
@@ -18856,6 +18879,91 @@ mod layout_tests {
     }
 
     #[test]
+    fn every_dictation_output_overlay_error_has_correlated_transcribe_page_detail() {
+        for (index, result, expected_notice) in [
+            (
+                0,
+                text_output::TextOutputResult::Failed("clipboard unavailable".to_owned()),
+                TranscribeNotice::failure("Transcript output failed: clipboard unavailable"),
+            ),
+            (
+                1,
+                text_output::TextOutputResult::CopiedOnly(text_output::CopyOnlyReason::PasteFailed),
+                TranscribeNotice::information(
+                    "Transcript copied; the paste command failed without retrying",
+                ),
+            ),
+            (
+                2,
+                text_output::TextOutputResult::NotInserted(
+                    text_output::NotInsertedReason::ClipboardChanged,
+                ),
+                TranscribeNotice::failure(
+                    "Transcript was not pasted because another app changed the clipboard; the final text remains in Scribe",
+                ),
+            ),
+            (
+                3,
+                text_output::TextOutputResult::InsertedClipboardRestoreSkipped,
+                TranscribeNotice::information(
+                    "Transcript inserted; Scribe left newer clipboard contents unchanged instead of restoring the previous clipboard",
+                ),
+            ),
+            (
+                4,
+                text_output::TextOutputResult::InsertedClipboardRestoreFailed(
+                    "restore unavailable".to_owned(),
+                ),
+                TranscribeNotice::information(
+                    "Transcript inserted, but Scribe could not restore the previous clipboard: restore unavailable",
+                ),
+            ),
+        ] {
+            let mut app = test_app();
+            let session_id = SessionId(140 + index);
+            let request_id = RequestId(150 + index);
+            let model_id = ModelId::new("whisper_cpp_base_en");
+            seed_test_request(
+                &mut app,
+                RecordingSource::Transcribe,
+                session_id,
+                request_id,
+                model_id.as_str(),
+            );
+            app.session_coordinator
+                .complete_request(session_id, request_id, &model_id)
+                .unwrap();
+            app.session_coordinator.begin_output(session_id).unwrap();
+            app.overlay_controller
+                .begin_session(session_id, NativeOverlayMode::Live);
+            app.pending_output = Some(PendingOutput {
+                session_id,
+                history_id: None,
+                transcript: "once".to_owned(),
+                completion_message: "Complete".to_owned(),
+                config: app.config.clone(),
+                latency: None,
+            });
+
+            app.poll_pending_output_with(|_, _, _| result);
+
+            let overlay_error = app
+                .overlay_controller
+                .state()
+                .error
+                .as_ref()
+                .expect("non-success output remains visible in the overlay");
+            assert_eq!(app.transcribe_notice, Some(expected_notice.clone()));
+            assert!(
+                expected_notice.message.contains(&overlay_error.message),
+                "page detail must correlate with overlay error: page={:?}, overlay={:?}",
+                expected_notice.message,
+                overlay_error.message,
+            );
+        }
+    }
+
+    #[test]
     fn armed_history_repaste_is_consumed_exactly_once() {
         use std::cell::Cell;
 
@@ -19811,6 +19919,19 @@ mod layout_tests {
             app.status_message
                 .contains("final transcription and paste were cancelled")
         );
+        assert_eq!(
+            app.transcribe_notice,
+            Some(TranscribeNotice::failure(app.status_message.clone()))
+        );
+        assert_eq!(
+            app.overlay_controller
+                .state()
+                .error
+                .as_ref()
+                .expect("timeout remains visible in the overlay")
+                .message,
+            app.transcribe_notice.as_ref().unwrap().message
+        );
 
         {
             let (lock, wake) = &*release;
@@ -19887,6 +20008,19 @@ mod layout_tests {
 
         assert_eq!(app.status, TranscriptionStatus::Error);
         assert_eq!(app.status_message, "runtime stopped");
+        assert_eq!(
+            app.transcribe_notice,
+            Some(TranscribeNotice::failure("runtime stopped"))
+        );
+        assert_eq!(
+            app.overlay_controller
+                .state()
+                .error
+                .as_ref()
+                .expect("transcription failure remains visible in the overlay")
+                .message,
+            "runtime stopped"
+        );
         assert_eq!(app.session_coordinator.active_session_id(), None);
     }
 
@@ -24128,7 +24262,7 @@ mod layout_tests {
         assert_eq!(
             app.transcribe_notice,
             Some(TranscribeNotice::error(
-                "Scribe couldn’t access your microphone.",
+                "Scribe couldn’t access your microphone — device unavailable",
                 TranscribeRecoveryAction::RetryMicrophone,
             ))
         );

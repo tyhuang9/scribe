@@ -1105,16 +1105,14 @@ fn transcribe_status_notice(state: &TranscriptionState) -> Option<TranscribeNoti
         )),
         _ => None,
     };
-    if phase_error.is_some() {
-        return phase_error;
-    }
-
-    if state
-        .notice
-        .as_ref()
-        .is_some_and(|notice| notice.tone == TranscribeNoticeTone::Error)
-    {
-        return state.notice.clone();
+    if let Some(phase_error) = phase_error {
+        if let Some(notice) = state.notice.as_ref()
+            && notice.tone == TranscribeNoticeTone::Error
+            && notice.recovery_action == phase_error.recovery_action
+        {
+            return Some(notice.clone());
+        }
+        return Some(phase_error);
     }
 
     match state.phase {
@@ -1194,18 +1192,23 @@ fn transcribe_status_row(ui: &mut egui::Ui, state: &TranscriptionState) -> Scree
                         builder.clear_name();
                     });
                     if let Some(recovery_action) = notice.recovery_action {
-                        let (label, recovery_screen_action) = match recovery_action {
-                            TranscribeRecoveryAction::AddModel => {
-                                ("Add model", ScreenAction::AddModel)
-                            }
-                            TranscribeRecoveryAction::OpenModelSettings => {
-                                ("Manage models", ScreenAction::OpenModelSettings)
-                            }
-                            TranscribeRecoveryAction::RetryMicrophone => {
-                                ("Try again", ScreenAction::RetryMicrophone)
-                            }
-                        };
-                        if button(
+                        let (label, accessible_label, recovery_screen_action) =
+                            match recovery_action {
+                                TranscribeRecoveryAction::AddModel => {
+                                    ("Add model", "Add model", ScreenAction::AddModel)
+                                }
+                                TranscribeRecoveryAction::OpenModelSettings => (
+                                    "Manage models",
+                                    "Manage models",
+                                    ScreenAction::OpenModelSettings,
+                                ),
+                                TranscribeRecoveryAction::RetryMicrophone => (
+                                    "Try again",
+                                    "Try microphone access again",
+                                    ScreenAction::RetryMicrophone,
+                                ),
+                            };
+                        let recovery = button(
                             ui,
                             label,
                             if is_error {
@@ -1213,9 +1216,11 @@ fn transcribe_status_row(ui: &mut egui::Ui, state: &TranscriptionState) -> Scree
                             } else {
                                 ButtonTone::Secondary
                             },
-                        )
-                        .clicked()
-                        {
+                        );
+                        recovery.widget_info(|| {
+                            egui::WidgetInfo::labeled(egui::WidgetType::Button, accessible_label)
+                        });
+                        if recovery.clicked() {
                             action = recovery_screen_action;
                         }
                     }
@@ -11679,8 +11684,8 @@ mod tests {
             ..Default::default()
         };
         let notice = transcribe_status_notice(&loading_error).unwrap();
-        assert_eq!(notice.tone, TranscribeNoticeTone::Error);
-        assert_eq!(notice.message, "Clipboard unavailable.");
+        assert_eq!(notice.tone, TranscribeNoticeTone::Information);
+        assert_eq!(notice.message, "Loading speech model…");
 
         let microphone = TranscriptionState {
             phase: TranscriptionPhase::MicrophoneError,
@@ -11693,6 +11698,64 @@ mod tests {
             notice.recovery_action,
             Some(TranscribeRecoveryAction::RetryMicrophone)
         );
+
+        let microphone_detail = TranscriptionState {
+            phase: TranscriptionPhase::MicrophoneError,
+            notice: Some(TranscribeNotice::error(
+                "Scribe couldn’t access your microphone. Device unavailable.",
+                TranscribeRecoveryAction::RetryMicrophone,
+            )),
+            ..Default::default()
+        };
+        let notice = transcribe_status_notice(&microphone_detail).unwrap();
+        assert_eq!(
+            notice.message,
+            "Scribe couldn’t access your microphone. Device unavailable."
+        );
+        assert_eq!(
+            notice.recovery_action,
+            Some(TranscribeRecoveryAction::RetryMicrophone)
+        );
+
+        let model_detail = TranscriptionState {
+            phase: TranscriptionPhase::ModelError,
+            notice: Some(TranscribeNotice::error(
+                "Model file base.en.bin is corrupted.",
+                TranscribeRecoveryAction::OpenModelSettings,
+            )),
+            ..Default::default()
+        };
+        assert_eq!(
+            transcribe_status_notice(&model_detail).unwrap().message,
+            "Model file base.en.bin is corrupted."
+        );
+
+        for (phase, expected_message, expected_recovery) in [
+            (
+                TranscriptionPhase::NoModel,
+                "Add a speech model to start transcribing.",
+                TranscribeRecoveryAction::AddModel,
+            ),
+            (
+                TranscriptionPhase::MicrophoneError,
+                "Scribe couldn’t access your microphone.",
+                TranscribeRecoveryAction::RetryMicrophone,
+            ),
+            (
+                TranscriptionPhase::ModelError,
+                "The selected speech model could not be loaded.",
+                TranscribeRecoveryAction::OpenModelSettings,
+            ),
+        ] {
+            let stale = TranscriptionState {
+                phase,
+                notice: Some(TranscribeNotice::failure("A stale clipboard error.")),
+                ..Default::default()
+            };
+            let notice = transcribe_status_notice(&stale).unwrap();
+            assert_eq!(notice.message, expected_message);
+            assert_eq!(notice.recovery_action, Some(expected_recovery));
+        }
     }
 
     #[test]
@@ -13106,7 +13169,8 @@ mod tests {
         let recovery = nodes
             .iter()
             .find(|(_, node)| {
-                node.role() == egui::accesskit::Role::Button && node.name() == Some("Try again")
+                node.role() == egui::accesskit::Role::Button
+                    && node.name() == Some("Try microphone access again")
             })
             .unwrap();
         assert!(accesskit_descends_from(nodes, alert.0, recovery.0));
@@ -13115,7 +13179,10 @@ mod tests {
                 .iter()
                 .filter(|(_, node)| node.role() == egui::accesskit::Role::Button)
                 .filter(|(_, node)| {
-                    matches!(node.name(), Some("Try again") | Some("Open audio settings"))
+                    matches!(
+                        node.name(),
+                        Some("Try microphone access again") | Some("Open audio settings")
+                    )
                 })
                 .count(),
             1

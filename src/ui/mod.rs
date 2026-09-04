@@ -9,7 +9,9 @@ mod shell;
 mod state;
 mod theme;
 
-pub(crate) use controls::{configure_accessible_style, minimum_primary_target_height};
+pub(crate) use controls::{
+    configure_accessible_style, minimum_primary_target_height, update_focus_visible_state,
+};
 pub(crate) use model_picker::ReadyModelPickerAction;
 pub(crate) use pages::{HistoryPageAction, HistoryPageState, about_page, history_page};
 pub(crate) use production::{
