@@ -17,8 +17,8 @@ use sha2::{Digest, Sha256};
 mod protocol;
 
 pub use protocol::{
-    BrokerOutcomeV1, BrokerRequestV1, BrokerResponseV1, NotProvisionedCode, PIPE_ENDPOINT,
-    SERVICE_NAME, SERVICE_SID,
+    BrokerAckV1, BrokerOutcomeV1, BrokerRequestV1, BrokerResponseV1, NotProvisionedCode,
+    PIPE_ENDPOINT, SERVICE_NAME, SERVICE_SID,
 };
 
 #[cfg(windows)]

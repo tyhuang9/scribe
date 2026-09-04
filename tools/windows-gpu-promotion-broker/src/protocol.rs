@@ -12,12 +12,16 @@ pub(crate) const FRAME_MAGIC: [u8; 8] = *b"SGPBIPC1";
 pub(crate) const PROTOCOL_VERSION: u16 = 1;
 pub(crate) const REQUEST_KIND: u16 = 1;
 pub(crate) const RESPONSE_KIND: u16 = 2;
+pub(crate) const ACK_KIND: u16 = 3;
 pub(crate) const FRAME_HEADER_LEN: usize = 16;
 pub(crate) const MAX_REQUEST_PAYLOAD: usize = 16 * 1024;
 pub(crate) const MAX_RESPONSE_PAYLOAD: usize = 2 * 1024;
+pub(crate) const MAX_ACK_PAYLOAD: usize = 1024;
 pub(crate) const MAX_REQUEST_FRAME: usize = FRAME_HEADER_LEN + MAX_REQUEST_PAYLOAD;
 pub(crate) const MAX_RESPONSE_FRAME: usize = FRAME_HEADER_LEN + MAX_RESPONSE_PAYLOAD;
+pub(crate) const MAX_ACK_FRAME: usize = FRAME_HEADER_LEN + MAX_ACK_PAYLOAD;
 const REQUEST_DOMAIN: &[u8] = b"scribe-windows-gpu-promotion-request-v1\0";
+const RESPONSE_DOMAIN: &[u8] = b"scribe-windows-gpu-promotion-response-v1\0";
 const NONCE_HEX_LEN: usize = 64;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -144,6 +148,13 @@ impl BrokerResponseV1 {
         Ok(serde_json::to_vec(self)?)
     }
 
+    pub fn sha256(&self, request: &BrokerRequestV1) -> Result<String> {
+        let mut hasher = Sha256::new();
+        hasher.update(RESPONSE_DOMAIN);
+        hasher.update(self.canonical_json(request)?);
+        Ok(encode_hex(&hasher.finalize()))
+    }
+
     pub(crate) fn from_canonical_json(payload: &[u8], request: &BrokerRequestV1) -> Result<Self> {
         let response: Self = serde_json::from_slice(payload)?;
         response.validate_for(request)?;
@@ -151,6 +162,70 @@ impl BrokerResponseV1 {
             bail!("broker response JSON is noncanonical");
         }
         Ok(response)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrokerAckV1 {
+    pub schema_version: u16,
+    pub client_nonce: String,
+    pub request_sha256: String,
+    pub response_sha256: String,
+}
+
+impl BrokerAckV1 {
+    pub fn for_response(request: &BrokerRequestV1, response: &BrokerResponseV1) -> Result<Self> {
+        let ack = Self {
+            schema_version: 1,
+            client_nonce: request.client_nonce.clone(),
+            request_sha256: request.sha256()?,
+            response_sha256: response.sha256(request)?,
+        };
+        ack.validate_for(request, response)?;
+        Ok(ack)
+    }
+
+    pub fn validate_for(
+        &self,
+        request: &BrokerRequestV1,
+        response: &BrokerResponseV1,
+    ) -> Result<()> {
+        if self.schema_version != 1 {
+            bail!("unsupported broker acknowledgement contract");
+        }
+        validate_nonce(&self.client_nonce)?;
+        validate_sha256(&self.request_sha256)?;
+        validate_sha256(&self.response_sha256)?;
+        if self.client_nonce != request.client_nonce
+            || self.request_sha256 != request.sha256()?
+            || self.response_sha256 != response.sha256(request)?
+        {
+            bail!("broker acknowledgement is not bound to the response");
+        }
+        Ok(())
+    }
+
+    pub fn canonical_json(
+        &self,
+        request: &BrokerRequestV1,
+        response: &BrokerResponseV1,
+    ) -> Result<Vec<u8>> {
+        self.validate_for(request, response)?;
+        Ok(serde_json::to_vec(self)?)
+    }
+
+    pub(crate) fn from_canonical_json(
+        payload: &[u8],
+        request: &BrokerRequestV1,
+        response: &BrokerResponseV1,
+    ) -> Result<Self> {
+        let ack: Self = serde_json::from_slice(payload)?;
+        ack.validate_for(request, response)?;
+        if ack.canonical_json(request, response)? != payload {
+            bail!("broker acknowledgement JSON is noncanonical");
+        }
+        Ok(ack)
     }
 }
 
@@ -184,6 +259,30 @@ pub(crate) fn decode_response_frame(
     BrokerResponseV1::from_canonical_json(
         decode_frame(frame, RESPONSE_KIND, MAX_RESPONSE_PAYLOAD)?,
         request,
+    )
+}
+
+pub(crate) fn encode_ack_frame(
+    ack: &BrokerAckV1,
+    request: &BrokerRequestV1,
+    response: &BrokerResponseV1,
+) -> Result<Vec<u8>> {
+    encode_frame(
+        ACK_KIND,
+        &ack.canonical_json(request, response)?,
+        MAX_ACK_PAYLOAD,
+    )
+}
+
+pub(crate) fn decode_ack_frame(
+    frame: &[u8],
+    request: &BrokerRequestV1,
+    response: &BrokerResponseV1,
+) -> Result<BrokerAckV1> {
+    BrokerAckV1::from_canonical_json(
+        decode_frame(frame, ACK_KIND, MAX_ACK_PAYLOAD)?,
+        request,
+        response,
     )
 }
 
@@ -278,6 +377,12 @@ mod tests {
             decode_response_frame(&response_frame, &request).unwrap(),
             response
         );
+        let ack = BrokerAckV1::for_response(&request, &response).unwrap();
+        let ack_frame = encode_ack_frame(&ack, &request, &response).unwrap();
+        assert_eq!(
+            decode_ack_frame(&ack_frame, &request, &response).unwrap(),
+            ack
+        );
         assert!(matches!(
             response.outcome,
             BrokerOutcomeV1::NotProvisioned {
@@ -287,11 +392,14 @@ mod tests {
     }
 
     #[test]
-    fn canonical_request_and_response_match_the_powershell_golden_vector() {
+    fn canonical_request_response_and_ack_match_the_powershell_golden_vector() {
         const REQUEST_JSON: &str = r#"{"schema_version":1,"command":"promote-windows-pack-set","client_nonce":"1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a","promotion_intent_sha256":"bf7b4002065dcc87c6d7abd70899c76a23c880c82e1869c4ba2bdbf39dcebe3c","intent":{"schema_version":1,"policy_namespace":"scribe-windows-gpu-production-v1","source_repository":"owner/repo","source_ref":"refs/heads/main","source_revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","workflow_ref":"owner/repo/.github/workflows/windows-gpu-pack-promotion.yml@refs/heads/main","workflow_source_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","run_id":"123","run_attempt":"1","artifact_id":"456","artifact_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","handoff_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","release_set_digest":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","toolchain_manifest_sha256":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","pack_version":"0.1.0","minimum_security_epoch":1,"require_unused_release_set":true}}"#;
         const REQUEST_SHA256: &str =
             "3925971f64ffaf94450d30373183cf912a01a8948a1a8d892831627329568083";
         const RESPONSE_JSON: &str = r#"{"schema_version":1,"client_nonce":"1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a","promotion_intent_sha256":"bf7b4002065dcc87c6d7abd70899c76a23c880c82e1869c4ba2bdbf39dcebe3c","request_sha256":"3925971f64ffaf94450d30373183cf912a01a8948a1a8d892831627329568083","outcome":{"status":"not_provisioned","code":"production_authority_not_provisioned"}}"#;
+        const RESPONSE_SHA256: &str =
+            "7d4774c4ad2c0f59d57079e33d3729863a2a679739845f21b4a023207b580143";
+        const ACK_JSON: &str = r#"{"schema_version":1,"client_nonce":"1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a","request_sha256":"3925971f64ffaf94450d30373183cf912a01a8948a1a8d892831627329568083","response_sha256":"7d4774c4ad2c0f59d57079e33d3729863a2a679739845f21b4a023207b580143"}"#;
 
         let request = request();
         assert_eq!(request.canonical_json().unwrap(), REQUEST_JSON.as_bytes());
@@ -300,6 +408,12 @@ mod tests {
         assert_eq!(
             response.canonical_json(&request).unwrap(),
             RESPONSE_JSON.as_bytes()
+        );
+        assert_eq!(response.sha256(&request).unwrap(), RESPONSE_SHA256);
+        let ack = BrokerAckV1::for_response(&request, &response).unwrap();
+        assert_eq!(
+            ack.canonical_json(&request, &response).unwrap(),
+            ACK_JSON.as_bytes()
         );
     }
 
@@ -403,6 +517,33 @@ mod tests {
     }
 
     #[test]
+    fn acknowledgement_rejects_unknown_noncanonical_and_cross_response_bindings() {
+        let request = request();
+        let response = BrokerResponseV1::not_provisioned(&request).unwrap();
+        let ack = BrokerAckV1::for_response(&request, &response).unwrap();
+        let mut value = serde_json::to_value(&ack).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("diagnostic".to_owned(), "forbidden".into());
+        assert!(
+            BrokerAckV1::from_canonical_json(
+                &serde_json::to_vec(&value).unwrap(),
+                &request,
+                &response,
+            )
+            .is_err()
+        );
+
+        let mut other_request = request.clone();
+        other_request.client_nonce = "2b".repeat(32);
+        let other_response = BrokerResponseV1::not_provisioned(&other_request).unwrap();
+        assert!(ack.validate_for(&other_request, &other_response).is_err());
+        let pretty = serde_json::to_vec_pretty(&ack).unwrap();
+        assert!(BrokerAckV1::from_canonical_json(&pretty, &request, &response).is_err());
+    }
+
+    #[test]
     fn frames_enforce_payload_bounds_before_parsing() {
         let mut request_frame = Vec::with_capacity(FRAME_HEADER_LEN + MAX_REQUEST_PAYLOAD + 1);
         request_frame.extend_from_slice(&FRAME_MAGIC);
@@ -411,5 +552,15 @@ mod tests {
         request_frame.extend_from_slice(&((MAX_REQUEST_PAYLOAD + 1) as u32).to_le_bytes());
         request_frame.resize(FRAME_HEADER_LEN + MAX_REQUEST_PAYLOAD + 1, b'x');
         assert!(decode_request_frame(&request_frame).is_err());
+
+        let mut ack_frame = Vec::with_capacity(FRAME_HEADER_LEN + MAX_ACK_PAYLOAD + 1);
+        ack_frame.extend_from_slice(&FRAME_MAGIC);
+        ack_frame.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
+        ack_frame.extend_from_slice(&ACK_KIND.to_le_bytes());
+        ack_frame.extend_from_slice(&((MAX_ACK_PAYLOAD + 1) as u32).to_le_bytes());
+        ack_frame.resize(FRAME_HEADER_LEN + MAX_ACK_PAYLOAD + 1, b'x');
+        let request = request();
+        let response = BrokerResponseV1::not_provisioned(&request).unwrap();
+        assert!(decode_ack_frame(&ack_frame, &request, &response).is_err());
     }
 }

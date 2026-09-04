@@ -309,8 +309,9 @@ token contains the exact service SID as an enabled and restricting SID under
 restricted LocalService. It uses a protected explicit DACL, a first-instance
 local-only message pipe whose original handle remains open across clients and
 timeouts, identification-only client impersonation, and always reverts before
-sending its sole valid outcome: correlated `NotProvisioned`. Only the exact
-service SID has server authority in the pipe DACL.
+sending its sole valid outcome: correlated `NotProvisioned`. The service waits
+for a bounded acknowledgement bound to the request and exact response before it
+disconnects. Only the exact service SID has server authority in the pipe DACL.
 Authenticated local users are admitted at this stage only because the service
 has no key, state, pack, or publication authority. A dedicated client principal
 and durable authorization policy are a hard prerequisite for granting any

@@ -66,6 +66,17 @@ function Get-BrokerService {
     return Get-Service -Name $serviceName -ErrorAction SilentlyContinue
 }
 
+function Assert-OwnedBrokerService([string]$ExpectedPath) {
+    $config = Get-CimInstance -ClassName Win32_Service -Filter "Name='$serviceName'"
+    Assert-True ($null -ne $config) 'Temporary service configuration is unavailable.'
+    Assert-True ($config.StartName -ceq 'NT AUTHORITY\LocalService') 'Service account is not LocalService.'
+    Assert-True ($config.ServiceType -ceq 'Own Process') 'Service is not configured as an own-process service.'
+    Assert-True ([IO.Path]::GetFullPath($config.PathName.Trim('"')) -ceq [IO.Path]::GetFullPath($ExpectedPath)) 'SCM service path no longer matches the protected freshly built binary; refusing destructive cleanup.'
+    $queriedSidType = Invoke-Sc -Arguments @('qsidtype', $serviceName)
+    Assert-True ($queriedSidType.Stdout.Contains('SERVICE_SID_TYPE: RESTRICTED', [StringComparison]::Ordinal)) 'SCM no longer reports the restricted service SID type; refusing destructive cleanup.'
+    return $config
+}
+
 function Wait-ServiceAbsent([int]$TimeoutSeconds) {
     $timer = [Diagnostics.Stopwatch]::StartNew()
     while ($timer.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
@@ -103,6 +114,10 @@ try {
     $goldenMaterial = [Text.Encoding]::UTF8.GetBytes("scribe-windows-gpu-promotion-request-v1`0$goldenRequest")
     $goldenDigest = ([BitConverter]::ToString([Security.Cryptography.SHA256]::HashData($goldenMaterial))).Replace('-', '').ToLowerInvariant()
     Assert-True ($goldenDigest -ceq '3925971f64ffaf94450d30373183cf912a01a8948a1a8d892831627329568083') 'PowerShell and Rust disagree on the canonical broker request digest.'
+    $goldenResponse = '{"schema_version":1,"client_nonce":"1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a","promotion_intent_sha256":"bf7b4002065dcc87c6d7abd70899c76a23c880c82e1869c4ba2bdbf39dcebe3c","request_sha256":"3925971f64ffaf94450d30373183cf912a01a8948a1a8d892831627329568083","outcome":{"status":"not_provisioned","code":"production_authority_not_provisioned"}}'
+    $goldenResponseMaterial = [Text.Encoding]::UTF8.GetBytes("scribe-windows-gpu-promotion-response-v1`0$goldenResponse")
+    $goldenResponseDigest = ([BitConverter]::ToString([Security.Cryptography.SHA256]::HashData($goldenResponseMaterial))).Replace('-', '').ToLowerInvariant()
+    Assert-True ($goldenResponseDigest -ceq '7d4774c4ad2c0f59d57079e33d3729863a2a679739845f21b4a023207b580143') 'PowerShell and Rust disagree on the canonical broker response digest.'
 
     if (Get-BrokerService) {
         throw "Refusing to modify the pre-existing fixed-name service $serviceName."
@@ -213,13 +228,7 @@ try {
 
     $sidType = Invoke-Sc -Arguments @('sidtype', $serviceName, 'restricted') -AllowFailure
     Assert-True ($sidType.ExitCode -eq 0) "Failed to configure the restricted service SID: $($sidType.Stderr)"
-    $config = Get-CimInstance -ClassName Win32_Service -Filter "Name='$serviceName'"
-    Assert-True ($null -ne $config) 'Temporary service configuration is unavailable.'
-    Assert-True ($config.StartName -ceq 'NT AUTHORITY\LocalService') 'Service account is not LocalService.'
-    Assert-True ($config.ServiceType -ceq 'Own Process') 'Service is not configured as an own-process service.'
-    Assert-True ([IO.Path]::GetFullPath($config.PathName.Trim('"')) -ceq [IO.Path]::GetFullPath($serviceForScm)) 'SCM service path does not match the protected freshly built binary.'
-    $queriedSidType = Invoke-Sc -Arguments @('qsidtype', $serviceName)
-    Assert-True ($queriedSidType.Stdout.Contains('SERVICE_SID_TYPE: RESTRICTED', [StringComparison]::Ordinal)) 'SCM did not retain the restricted service SID type.'
+    [void](Assert-OwnedBrokerService -ExpectedPath $serviceForScm)
 
     $start = Invoke-Sc -Arguments @('start', $serviceName) -AllowFailure
     Assert-True ($start.ExitCode -eq 0) "SCM rejected the first service start: $($start.Stderr)"
@@ -233,9 +242,10 @@ try {
     )
     try {
         $stalled.Connect(5000)
+        [void](Assert-OwnedBrokerService -ExpectedPath $serviceForScm)
         $stop = Invoke-Sc -Arguments @('stop', $serviceName) -AllowFailure
         Assert-True ($stop.ExitCode -eq 0) "SCM rejected the bounded-stop request: $($stop.Stderr)"
-        (Get-Service -Name $serviceName).WaitForStatus([System.ServiceProcess.ServiceControllerStatus]::Stopped, [TimeSpan]::FromSeconds(10))
+        (Get-Service -Name $serviceName).WaitForStatus([System.ServiceProcess.ServiceControllerStatus]::Stopped, [TimeSpan]::FromSeconds(4))
     }
     finally { $stalled.Dispose() }
 
@@ -250,6 +260,7 @@ try {
     Assert-True (-not (Test-Path -LiteralPath $handoff)) 'No-authority service touched the handoff path.'
     Assert-True (-not (Test-Path -LiteralPath $output)) 'No-authority service touched the output path.'
 
+    [void](Assert-OwnedBrokerService -ExpectedPath $serviceForScm)
     $stop = Invoke-Sc -Arguments @('stop', $serviceName) -AllowFailure
     Assert-True ($stop.ExitCode -eq 0) "SCM rejected the final stop request: $($stop.Stderr)"
     (Get-Service -Name $serviceName).WaitForStatus([System.ServiceProcess.ServiceControllerStatus]::Stopped, [TimeSpan]::FromSeconds(10))
@@ -258,10 +269,15 @@ try {
 finally {
     if ($createdService) {
         $existing = Get-BrokerService
-        if ($null -ne $existing -and $existing.Status -ne [System.ServiceProcess.ServiceControllerStatus]::Stopped) {
-            Invoke-Sc -Arguments @('stop', $serviceName) -AllowFailure | Out-Null
+        if ($null -ne $existing) {
+            [void](Assert-OwnedBrokerService -ExpectedPath $serviceForScm)
+            if ($existing.Status -ne [System.ServiceProcess.ServiceControllerStatus]::Stopped) {
+                Invoke-Sc -Arguments @('stop', $serviceName) -AllowFailure | Out-Null
+                (Get-Service -Name $serviceName).WaitForStatus([System.ServiceProcess.ServiceControllerStatus]::Stopped, [TimeSpan]::FromSeconds(10))
+            }
+            [void](Assert-OwnedBrokerService -ExpectedPath $serviceForScm)
+            Invoke-Sc -Arguments @('delete', $serviceName) -AllowFailure | Out-Null
         }
-        Invoke-Sc -Arguments @('delete', $serviceName) -AllowFailure | Out-Null
         Wait-ServiceAbsent -TimeoutSeconds 10
     }
     if ($null -ne $machineTarget) {

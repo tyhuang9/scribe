@@ -35,8 +35,11 @@ explicit DACL. Authenticated Users receive only the individual data and
 attribute rights needed for a client connection, never generic write or pipe
 instance creation. The service currently accepts no authority: a canonical,
 path-free request can receive only a correlated typed `NotProvisioned`
-response. The client maps that result, or an absent service, to exit code 78.
-Neither process opens the handoff or output paths.
+response. After validating that response, the client sends a bounded
+request-and-response-correlated acknowledgement before the service disconnects.
+The client maps the authenticated result, or an absent service, to distinct
+fixed diagnostics with exit code 78. Neither process opens the handoff or
+output paths.
 
 The hostile-input copier, fixture Ed25519 authority, chained replay/epoch
 ledger, signed receipt, recovery state machine, authorizer, and atomic publisher

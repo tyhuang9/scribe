@@ -122,7 +122,9 @@ DACL whose server authority belongs only to that service SID, retains its first
 pipe handle across clients and timeouts, identifies the client at
 `SecurityIdentification`, and can return only a correlated `NotProvisioned`
 result. The client authenticates the server process and service token before
-writing. Neither side serializes or accesses the local handoff/output paths.
+writing, validates that result, and returns a correlated bounded acknowledgement
+before the service disconnects. Neither side serializes or accesses the local
+handoff/output paths.
 Authenticated local users are admitted at the pipe in this zero-authority
 stage; a dedicated provisioned client principal and durable authorization
 policy are mandatory before the service can receive signing authority.

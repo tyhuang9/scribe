@@ -1549,8 +1549,11 @@ fn windows_gpu_pack_promotion_keeps_candidate_and_signing_authority_separate() {
         "MAX_RESPONSE_PAYLOAD",
         "BrokerRequestV1",
         "BrokerResponseV1",
+        "BrokerAckV1",
         "ProductionAuthorityNotProvisioned",
         "scribe-windows-gpu-promotion-request-v1",
+        "scribe-windows-gpu-promotion-response-v1",
+        "MAX_ACK_PAYLOAD",
         "from_canonical_json",
         "#[serde(deny_unknown_fields)]",
     ] {
@@ -1594,7 +1597,10 @@ fn windows_gpu_pack_promotion_keeps_candidate_and_signing_authority_separate() {
         "D:P",
         ";;;AU)",
         "CancelIoEx",
+        "encode_ack_frame",
+        "decode_ack_frame",
         "StartServiceCtrlDispatcherW",
+        "ERROR_CALL_NOT_IMPLEMENTED",
         "SERVICE_WIN32_OWN_PROCESS",
     ] {
         assert!(
@@ -1632,12 +1638,15 @@ fn windows_gpu_pack_promotion_keeps_candidate_and_signing_authority_separate() {
         "SetAccessRuleProtection",
         "S-1-5-32-544",
         "ReadAndExecute",
+        "refusing destructive cleanup",
+        "FromSeconds(4)",
         "WaitForConnectionAsync",
         "The client sent request bytes before authenticating the service",
         "same-name user-process pipe server as rejected authentication",
         "fixed authenticated NotProvisioned diagnostic",
         "did not remain running after the authenticated round trip",
         "3925971f64ffaf94450d30373183cf912a01a8948a1a8d892831627329568083",
+        "7d4774c4ad2c0f59d57079e33d3729863a2a679739845f21b4a023207b580143",
         "RequireScmIntegration",
         "WaitForStatus",
     ] {

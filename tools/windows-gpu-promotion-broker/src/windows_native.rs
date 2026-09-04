@@ -7,10 +7,10 @@ use std::sync::atomic::{AtomicIsize, Ordering};
 
 use anyhow::{Context, Result, anyhow, bail};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_IO_PENDING, ERROR_MORE_DATA,
-    ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, ERROR_SEM_TIMEOUT, ERROR_SUCCESS, GetLastError, HANDLE,
-    HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, LocalFree, SetHandleInformation, WAIT_OBJECT_0,
-    WAIT_TIMEOUT,
+    CloseHandle, ERROR_ACCESS_DENIED, ERROR_CALL_NOT_IMPLEMENTED, ERROR_FILE_NOT_FOUND,
+    ERROR_INVALID_HANDLE, ERROR_IO_PENDING, ERROR_MORE_DATA, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED,
+    ERROR_SEM_TIMEOUT, ERROR_SUCCESS, GetLastError, HANDLE, HANDLE_FLAG_INHERIT,
+    INVALID_HANDLE_VALUE, LocalFree, SetHandleInformation, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, ConvertStringSidToSidW, SDDL_REVISION_1,
@@ -53,10 +53,11 @@ use windows_sys::Win32::System::Threading::{
 };
 
 use crate::protocol::{
-    MAX_REQUEST_FRAME, MAX_RESPONSE_FRAME, PIPE_ENDPOINT, SERVICE_NAME, SERVICE_SID,
-    decode_request_frame, decode_response_frame, encode_request_frame, encode_response_frame,
+    MAX_ACK_FRAME, MAX_REQUEST_FRAME, MAX_RESPONSE_FRAME, PIPE_ENDPOINT, SERVICE_NAME, SERVICE_SID,
+    decode_ack_frame, decode_request_frame, decode_response_frame, encode_ack_frame,
+    encode_request_frame, encode_response_frame,
 };
-use crate::{BrokerRequestV1, BrokerResponseV1, PromotionIntent};
+use crate::{BrokerAckV1, BrokerRequestV1, BrokerResponseV1, PromotionIntent};
 
 const CONNECT_TIMEOUT_MS: u32 = 2_000;
 const IO_TIMEOUT_MS: u32 = 5_000;
@@ -159,7 +160,16 @@ pub fn request_promotion(
             _ => ClientTransportError::Io,
         })?;
     revalidate_server(pipe.raw(), &server).map_err(|_| ClientTransportError::Authentication)?;
-    decode_response_frame(&response_frame, &request).map_err(|_| ClientTransportError::Protocol)
+    let response = decode_response_frame(&response_frame, &request)
+        .map_err(|_| ClientTransportError::Protocol)?;
+    let ack = BrokerAckV1::for_response(&request, &response)
+        .map_err(|_| ClientTransportError::Protocol)?;
+    let ack_frame =
+        encode_ack_frame(&ack, &request, &response).map_err(|_| ClientTransportError::Protocol)?;
+    write_message(pipe.raw(), &ack_frame, None, IO_TIMEOUT_MS)
+        .map_err(|_| ClientTransportError::Io)?;
+    revalidate_server(pipe.raw(), &server).map_err(|_| ClientTransportError::Authentication)?;
+    Ok(response)
 }
 
 pub fn run_service_dispatcher() -> Result<()> {
@@ -191,6 +201,7 @@ unsafe extern "system" fn service_main(argument_count: u32, _arguments: *mut *mu
     let result = catch_unwind(AssertUnwindSafe(|| service_main_inner(argument_count)));
     if result.is_err() {
         report_stopped(1);
+        SERVICE_STATUS_HANDLE_VALUE.store(0, Ordering::Release);
     }
 }
 
@@ -203,7 +214,11 @@ fn service_main_inner(argument_count: u32) {
         return;
     }
     SERVICE_STATUS_HANDLE_VALUE.store(status_handle as isize, Ordering::Release);
-    report_status(SERVICE_START_PENDING, 0, 1, 5_000);
+    if report_status(SERVICE_START_PENDING, 0, 1, 5_000).is_err() {
+        report_stopped(1);
+        SERVICE_STATUS_HANDLE_VALUE.store(0, Ordering::Release);
+        return;
+    }
 
     let result = run_service(argument_count);
 
@@ -217,20 +232,28 @@ unsafe extern "system" fn service_control_handler(
     _event_data: *mut c_void,
     _context: *mut c_void,
 ) -> u32 {
-    let _ = catch_unwind(AssertUnwindSafe(|| match control {
+    match catch_unwind(AssertUnwindSafe(|| match control {
         SERVICE_CONTROL_STOP | SERVICE_CONTROL_SHUTDOWN => {
-            report_status(SERVICE_STOP_PENDING, 0, 1, 5_000);
+            let status_error = report_status_raw(SERVICE_STOP_PENDING, 0, 1, 5_000, 0);
+            if status_error != ERROR_SUCCESS {
+                return status_error;
+            }
             let stop_event = SERVICE_STOP_EVENT.load(Ordering::Acquire) as HANDLE;
-            if !stop_event.is_null() {
-                unsafe {
-                    SetEvent(stop_event);
-                }
+            if stop_event.is_null() {
+                return ERROR_INVALID_HANDLE;
+            }
+            if unsafe { SetEvent(stop_event) } == 0 {
+                unsafe { GetLastError() }
+            } else {
+                ERROR_SUCCESS
             }
         }
-        SERVICE_CONTROL_INTERROGATE => {}
-        _ => {}
-    }));
-    ERROR_SUCCESS
+        SERVICE_CONTROL_INTERROGATE => ERROR_SUCCESS,
+        _ => ERROR_CALL_NOT_IMPLEMENTED,
+    })) {
+        Ok(result) => result,
+        Err(_) => ERROR_SERVICE_SPECIFIC_ERROR_CODE,
+    }
 }
 
 fn run_service(argument_count: u32) -> Result<()> {
@@ -253,28 +276,34 @@ fn run_service(argument_count: u32) -> Result<()> {
         SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN,
         0,
         0,
-    );
+    )?;
     serve_loop(pipe, stop_event)
 }
 
 fn report_stopped(exit_code: u32) {
-    report_status_with_exit(SERVICE_STOPPED, 0, 0, 0, exit_code);
+    let _ = report_status_raw(SERVICE_STOPPED, 0, 0, 0, exit_code);
 }
 
-fn report_status(state: u32, accepted: u32, checkpoint: u32, wait_hint: u32) {
-    report_status_with_exit(state, accepted, checkpoint, wait_hint, 0);
+fn report_status(state: u32, accepted: u32, checkpoint: u32, wait_hint: u32) -> Result<()> {
+    let error = report_status_raw(state, accepted, checkpoint, wait_hint, 0);
+    if error == ERROR_SUCCESS {
+        Ok(())
+    } else {
+        Err(std::io::Error::from_raw_os_error(error as i32))
+            .context("could not report broker service status")
+    }
 }
 
-fn report_status_with_exit(
+fn report_status_raw(
     state: u32,
     accepted: u32,
     checkpoint: u32,
     wait_hint: u32,
     exit_code: u32,
-) {
+) -> u32 {
     let handle = SERVICE_STATUS_HANDLE_VALUE.load(Ordering::Acquire) as SERVICE_STATUS_HANDLE;
     if handle.is_null() {
-        return;
+        return ERROR_INVALID_HANDLE;
     }
     let status = SERVICE_STATUS {
         dwServiceType: SERVICE_WIN32_OWN_PROCESS,
@@ -289,8 +318,10 @@ fn report_status_with_exit(
         dwCheckPoint: checkpoint,
         dwWaitHint: wait_hint,
     };
-    unsafe {
-        SetServiceStatus(handle, &status);
+    if unsafe { SetServiceStatus(handle, &status) } == 0 {
+        unsafe { GetLastError() }
+    } else {
+        ERROR_SUCCESS
     }
 }
 
@@ -326,7 +357,11 @@ fn serve_connection(pipe: HANDLE, stop_event: HANDLE) -> Result<()> {
     };
     let response = BrokerResponseV1::not_provisioned(&request)?;
     let response_frame = encode_response_frame(&response, &request)?;
-    let _ = write_message(pipe, &response_frame, Some(stop_event), IO_TIMEOUT_MS);
+    write_message(pipe, &response_frame, Some(stop_event), IO_TIMEOUT_MS)
+        .map_err(|_| anyhow!("broker response write failed"))?;
+    let ack_frame = read_message(pipe, MAX_ACK_FRAME, Some(stop_event), IO_TIMEOUT_MS)
+        .map_err(|_| anyhow!("broker response acknowledgement failed"))?;
+    decode_ack_frame(&ack_frame, &request, &response)?;
     Ok(())
 }
 
@@ -942,7 +977,18 @@ mod tests {
         let respond = connection
             .find("BrokerResponseV1::not_provisioned")
             .unwrap();
-        assert!(authenticate < decode && decode < respond);
+        let write_response = connection
+            .find("write_message(pipe, &response_frame")
+            .unwrap();
+        let read_ack = connection.find("read_message(pipe, MAX_ACK_FRAME").unwrap();
+        let validate_ack = connection.find("decode_ack_frame").unwrap();
+        assert!(
+            authenticate < decode
+                && decode < respond
+                && respond < write_response
+                && write_response < read_ack
+                && read_ack < validate_ack
+        );
 
         let authenticate_start = source.find("fn authenticate_client(").unwrap();
         let authenticate_end = source[authenticate_start..]
@@ -959,5 +1005,33 @@ mod tests {
             + guard_start;
         let guard = &source[guard_start..guard_end];
         assert_eq!(guard.matches("std::process::abort();").count(), 2);
+    }
+
+    #[test]
+    fn client_acknowledges_only_after_validating_the_correlated_response() {
+        let source = include_str!("windows_native.rs");
+        let start = source.find("pub fn request_promotion(").unwrap();
+        let end = source[start..]
+            .find("\npub fn run_service_dispatcher(")
+            .unwrap()
+            + start;
+        let client = &source[start..end];
+        let decode = client.find("decode_response_frame").unwrap();
+        let construct_ack = client.find("BrokerAckV1::for_response").unwrap();
+        let write_ack = client.find("write_message(pipe.raw(), &ack_frame").unwrap();
+        assert!(decode < construct_ack && construct_ack < write_ack);
+    }
+
+    #[test]
+    fn service_control_errors_are_not_silently_reported_as_success() {
+        let source = include_str!("windows_native.rs");
+        let start = source
+            .find("unsafe extern \"system\" fn service_control_handler")
+            .unwrap();
+        let end = source[start..].find("\nfn run_service(").unwrap() + start;
+        let handler = &source[start..end];
+        assert!(handler.contains("report_status_raw"));
+        assert!(handler.contains("if unsafe { SetEvent(stop_event) } == 0"));
+        assert!(handler.contains("ERROR_CALL_NOT_IMPLEMENTED"));
     }
 }
