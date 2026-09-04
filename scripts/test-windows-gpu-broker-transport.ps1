@@ -2,7 +2,19 @@ param(
     [switch]$RequireScmIntegration,
 
     [Parameter(DontShow)]
-    [switch]$RunPersistentPrivilegeRestoreFailFastFixture
+    [switch]$RunPersistentPrivilegeRestoreFailFastFixture,
+
+    [Parameter(DontShow)]
+    [switch]$RunEphemeralIdentityProbe,
+
+    [Parameter(DontShow)]
+    [switch]$RunEphemeralFullControlProbe,
+
+    [Parameter(DontShow)]
+    [switch]$RunEphemeralStalledProbe,
+
+    [Parameter(DontShow)]
+    [string]$ExpectedEphemeralSid
 )
 
 $ErrorActionPreference = 'Stop'
@@ -25,6 +37,9 @@ $cleanupFailures = [Collections.Generic.List[object]]::new()
 $safeToRemoveMachineTarget = $false
 $ownedPolicyState = $null
 $ownedPolicyAncestors = @()
+$ownedEphemeralAccount = $null
+$ephemeralPassword = $null
+$activeCredentialProcess = $null
 $policyAncestorPaths = @(
     'SOFTWARE\Scribe',
     'SOFTWARE\Scribe\GpuPromotionBroker',
@@ -33,6 +48,91 @@ $policyAncestorPaths = @(
 
 function Assert-True([bool]$Condition, [string]$Message) {
     if (-not $Condition) { throw $Message }
+}
+
+function Assert-EphemeralProbeIdentity([string]$ExpectedSid) {
+    Assert-True (-not [string]::IsNullOrWhiteSpace($ExpectedSid)) 'Credential probe requires its exact expected SID.'
+    Assert-True ($ExpectedSid -cmatch '^S-1-5-21-(?:[0-9]{1,10}-){3}[0-9]{1,10}$') 'Credential probe expected SID is not a machine-account SID.'
+    $canonicalExpected = [Security.Principal.SecurityIdentifier]::new($ExpectedSid)
+    Assert-True ($canonicalExpected.Value -ceq $ExpectedSid) 'Credential probe expected SID is noncanonical.'
+    $expectedRid = [uint64]($ExpectedSid.Substring($ExpectedSid.LastIndexOf('-') + 1))
+    Assert-True ($expectedRid -ge 1000) 'Credential probe expected SID has a reserved RID.'
+    $current = [Security.Principal.WindowsIdentity]::GetCurrent()
+    try {
+        Assert-True ($null -ne $current.User -and $current.User.Value -ceq $ExpectedSid) 'Credential probe did not run with the exact ephemeral TokenUser SID.'
+        $currentPrincipal = [Security.Principal.WindowsPrincipal]::new($current)
+        Assert-True (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) 'Credential probe unexpectedly has administrator membership.'
+    }
+    finally { $current.Dispose() }
+}
+
+$ephemeralProbeCount = @(
+    $RunEphemeralIdentityProbe,
+    $RunEphemeralFullControlProbe,
+    $RunEphemeralStalledProbe
+).Where({ $_ }).Count
+if ($ephemeralProbeCount -gt 1) { throw 'Only one fixed ephemeral credential probe may run.' }
+if ($ephemeralProbeCount -eq 1) {
+    Assert-EphemeralProbeIdentity -ExpectedSid $ExpectedEphemeralSid
+    if ($RunEphemeralIdentityProbe) {
+        [Console]::Out.WriteLine('ephemeral-identity-ok')
+        [Console]::Out.Flush()
+        return
+    }
+
+    if ($RunEphemeralFullControlProbe) {
+        $probe = [IO.Pipes.NamedPipeClientStream]::new(
+            '.',
+            $pipeName,
+            [IO.Pipes.PipeAccessRights]::FullControl,
+            [IO.Pipes.PipeOptions]::Asynchronous,
+            [Security.Principal.TokenImpersonationLevel]::Identification,
+            [IO.HandleInheritability]::None
+        )
+        try {
+            $denied = $false
+            try { $probe.Connect(2000) }
+            catch [UnauthorizedAccessException] { $denied = $true }
+            Assert-True $denied 'Ephemeral client received authority beyond the fixed production access mask.'
+        }
+        finally { $probe.Dispose() }
+        [Console]::Out.WriteLine('ephemeral-full-control-denied')
+        [Console]::Out.Flush()
+        return
+    }
+
+    $exactRights = [IO.Pipes.PipeAccessRights](
+        [uint32][IO.Pipes.PipeAccessRights]::ReadData -bor
+        [uint32][IO.Pipes.PipeAccessRights]::WriteData -bor
+        [uint32][IO.Pipes.PipeAccessRights]::ReadAttributes -bor
+        [uint32][IO.Pipes.PipeAccessRights]::WriteAttributes -bor
+        [uint32][IO.Pipes.PipeAccessRights]::Synchronize
+    )
+    Assert-True ([uint32]$exactRights -eq 0x00100183) 'Ephemeral stalled probe no longer requests the production client access mask.'
+    $probe = [IO.Pipes.NamedPipeClientStream]::new(
+        '.',
+        $pipeName,
+        $exactRights,
+        [IO.Pipes.PipeOptions]::Asynchronous,
+        [Security.Principal.TokenImpersonationLevel]::Identification,
+        [IO.HandleInheritability]::None
+    )
+    try {
+        $probe.Connect(5000)
+        [Console]::Out.WriteLine('ephemeral-stalled-ready')
+        [Console]::Out.Flush()
+        try {
+            $read = $probe.ReadByte()
+            Assert-True ($read -eq -1) 'Stalled credential probe received unexpected broker bytes.'
+        }
+        catch [IO.IOException] {
+            # SCM stop may close the pipe with either EOF or a broken-pipe error.
+        }
+    }
+    finally { $probe.Dispose() }
+    [Console]::Out.WriteLine('ephemeral-stalled-disconnected')
+    [Console]::Out.Flush()
+    return
 }
 
 if (-not ('Scribe.GpuBroker.RegistryCleanupNative' -as [type])) {
@@ -491,6 +591,24 @@ namespace Scribe.GpuBroker {
                         captured.Append(buffer, 0, Math.Min(remaining, count));
                 }
                 return captured.ToString();
+            });
+        }
+
+        public static Task<string> ReadLineBoundedAsync(StreamReader reader, int maximumCharacters) {
+            if (reader == null)
+                throw new ArgumentNullException("reader");
+            if (maximumCharacters < 1)
+                throw new ArgumentOutOfRangeException("maximumCharacters");
+            return Task.Run(() => {
+                StringBuilder captured = new StringBuilder(Math.Min(maximumCharacters, 256));
+                while (true) {
+                    int value = reader.Read();
+                    if (value == -1 || value == '\n')
+                        return captured.ToString().TrimEnd('\r');
+                    if (captured.Length == maximumCharacters)
+                        throw new InvalidDataException("Child-process readiness line exceeded its fixed bound.");
+                    captured.Append((char)value);
+                }
             });
         }
 
@@ -1169,6 +1287,254 @@ function New-ProtectedPolicy([string]$Sid) {
     return $result
 }
 
+function New-EphemeralPassword {
+    $password = [Security.SecureString]::new()
+    $random = [byte[]]::new(48)
+    try {
+        [Security.Cryptography.RandomNumberGenerator]::Fill($random)
+        foreach ($character in @([char]'A', [char]'a', [char]'7', [char]'!')) {
+            $password.AppendChar($character)
+        }
+        $alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!#$%&*+-=?@^_'
+        foreach ($value in $random) {
+            $password.AppendChar($alphabet[[int]$value % $alphabet.Length])
+        }
+        $password.MakeReadOnly()
+        return $password
+    }
+    catch {
+        $password.Dispose()
+        throw
+    }
+    finally { [Array]::Clear($random, 0, $random.Length) }
+}
+
+function New-CryptographicHex([int]$ByteCount) {
+    $bytes = [byte[]]::new($ByteCount)
+    try {
+        [Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
+        return [Convert]::ToHexString($bytes).ToLowerInvariant()
+    }
+    finally { [Array]::Clear($bytes, 0, $bytes.Length) }
+}
+
+function Assert-CanonicalEphemeralSid([string]$Sid, [string]$Name) {
+    Assert-True ($Sid -cmatch '^S-1-5-21-(?:[0-9]{1,10}-){3}[0-9]{1,10}$') 'Ephemeral account SID is not a canonical machine-account SID.'
+    $sidObject = [Security.Principal.SecurityIdentifier]::new($Sid)
+    Assert-True ($sidObject.Value -ceq $Sid) 'Ephemeral account SID does not round-trip canonically.'
+    $rid = [uint64]($Sid.Substring($Sid.LastIndexOf('-') + 1))
+    Assert-True ($rid -ge 1000) 'Ephemeral account RID is reserved.'
+    $translated = $sidObject.Translate([Security.Principal.NTAccount]).Value
+    Assert-True ($translated.Equals("$env:COMPUTERNAME\$Name", [StringComparison]::OrdinalIgnoreCase)) 'Ephemeral SID does not resolve to the exact new local machine account.'
+    return $sidObject
+}
+
+function Get-ExactLocalUserBySid([Security.Principal.SecurityIdentifier]$Sid) {
+    return @(Get-LocalUser -SID $Sid -ErrorAction SilentlyContinue)
+}
+
+function Assert-OwnedEphemeralAccount([object]$State, [object]$ExpectedEnabled = $null) {
+    Assert-True ($null -ne $State) 'Ephemeral account ownership is unavailable.'
+    $bySid = @(Get-ExactLocalUserBySid -Sid $State.Sid)
+    Assert-True ($bySid.Count -eq 1) 'Owned ephemeral SID no longer resolves to exactly one local account.'
+    $account = $bySid[0]
+    Assert-True ($account.SID.Value -ceq $State.Sid.Value) 'Owned ephemeral account SID changed.'
+    Assert-True ($account.Name -ceq $State.Name) 'Owned ephemeral account name changed.'
+    Assert-True ($account.Description -ceq $State.Marker) 'Owned ephemeral account marker changed.'
+    Assert-True ($null -ne $account.AccountExpires -and $account.AccountExpires.ToUniversalTime().Ticks -eq $State.AccountExpiresUtcTicks) 'Owned ephemeral account expiry changed.'
+    if ($null -ne $ExpectedEnabled) {
+        Assert-True ($account.Enabled -eq [bool]$ExpectedEnabled) 'Owned ephemeral account enabled state changed unexpectedly.'
+    }
+
+    $byName = @(Get-LocalUser -Name $State.Name -ErrorAction SilentlyContinue)
+    Assert-True ($byName.Count -eq 1 -and $byName[0].SID.Value -ceq $State.Sid.Value) 'Owned ephemeral name no longer resolves to the exact SID.'
+    return $account
+}
+
+function Assert-NoEphemeralProfileRegistration([Security.Principal.SecurityIdentifier]$Sid) {
+    $value = $Sid.Value
+    Assert-True (-not (Test-Path -LiteralPath "Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$value")) 'Credentialed fixture registered a persistent user profile.'
+    Assert-True (-not (Test-Path -LiteralPath "Registry::HKEY_USERS\$value")) 'Credentialed fixture loaded a user registry hive.'
+    Assert-True (-not (Test-Path -LiteralPath "Registry::HKEY_USERS\${value}_Classes")) 'Credentialed fixture loaded a user classes hive.'
+}
+
+function New-EphemeralStandardAccount {
+    Assert-True ($null -eq $script:ownedEphemeralAccount) 'Ephemeral account ownership already exists.'
+    Assert-True ($null -eq $script:ephemeralPassword) 'Ephemeral credential material already exists.'
+    $name = $null
+    do {
+        $name = 'scbgpu' + (New-CryptographicHex -ByteCount 6)
+    } while ($null -ne (Get-LocalUser -Name $name -ErrorAction SilentlyContinue))
+    $marker = 'ScribeGpuBrokerTransport:' + (New-CryptographicHex -ByteCount 16)
+    $expires = [DateTime]::Now.AddHours(1)
+    $script:ephemeralPassword = New-EphemeralPassword
+    $created = New-LocalUser `
+        -Name $name `
+        -Password $script:ephemeralPassword `
+        -Description $marker `
+        -AccountExpires $expires `
+        -UserMayNotChangePassword `
+        -Disabled
+    $script:ownedEphemeralAccount = [pscustomobject]@{
+        Name = $name
+        Sid = $(if ($null -eq $created) { $null } else { $created.SID })
+        Marker = $marker
+        AccountExpiresUtcTicks = $(if ($null -eq $created -or $null -eq $created.AccountExpires) { 0 } else { $created.AccountExpires.ToUniversalTime().Ticks })
+    }
+    Assert-True ($null -ne $script:ownedEphemeralAccount.Sid) 'Windows did not return the created ephemeral account SID.'
+    $sid = Assert-CanonicalEphemeralSid -Sid $script:ownedEphemeralAccount.Sid.Value -Name $script:ownedEphemeralAccount.Name
+    $verified = Assert-OwnedEphemeralAccount -State $script:ownedEphemeralAccount -ExpectedEnabled $false
+    Assert-True ($verified.AccountExpires -gt [DateTime]::Now -and $verified.AccountExpires -le [DateTime]::Now.AddMinutes(65)) 'Ephemeral account expiry is not bounded to the test job.'
+    $administrators = @(Get-LocalGroupMember -SID ([Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')))
+    Assert-True (-not ($administrators | Where-Object { $_.SID.Value -ceq $sid.Value })) 'Ephemeral account unexpectedly belongs to Administrators.'
+    $standardUsersSid = [Security.Principal.SecurityIdentifier]::new('S-1-5-32-545')
+    $users = @(Get-LocalGroupMember -SID $standardUsersSid)
+    if (($users | Where-Object { $_.SID.Value -ceq $sid.Value }).Count -eq 0) {
+        Add-LocalGroupMember -SID $standardUsersSid -Member $sid
+        $users = @(Get-LocalGroupMember -SID $standardUsersSid)
+    }
+    Assert-True (($users | Where-Object { $_.SID.Value -ceq $sid.Value }).Count -eq 1) 'Ephemeral account is not an exact member of the standard Users group.'
+    Assert-NoEphemeralProfileRegistration -Sid $sid
+    return $script:ownedEphemeralAccount
+}
+
+function Remove-OwnedEphemeralAccount {
+    $state = $script:ownedEphemeralAccount
+    if ($null -eq $state) { return }
+    Assert-True ($null -eq $script:activeCredentialProcess) 'Refusing account cleanup while its exact credentialed process may still be active.'
+    $account = Assert-OwnedEphemeralAccount -State $state
+    if ($account.Enabled) { Disable-LocalUser -SID $state.Sid }
+    [void](Assert-OwnedEphemeralAccount -State $state -ExpectedEnabled $false)
+    Remove-LocalUser -SID $state.Sid
+    $deletedSid = $state.Sid
+    $deletedName = $state.Name
+    $script:ownedEphemeralAccount = $null
+    Assert-True (@(Get-ExactLocalUserBySid -Sid $deletedSid).Count -eq 0) 'Deleted ephemeral SID still resolves to a local account.'
+    Assert-True (@(Get-LocalUser -Name $deletedName -ErrorAction SilentlyContinue).Count -eq 0) 'Deleted ephemeral account name was replaced during cleanup.'
+}
+
+function New-EphemeralProcessStartInfo([string]$FilePath, [string[]]$Arguments) {
+    Assert-True ($null -ne $script:ownedEphemeralAccount -and $null -ne $script:ephemeralPassword) 'Ephemeral process launch lacks exact account ownership or credential material.'
+    $start = [Diagnostics.ProcessStartInfo]::new()
+    $start.FileName = $FilePath
+    $start.UseShellExecute = $false
+    $start.RedirectStandardOutput = $true
+    $start.RedirectStandardError = $true
+    $start.CreateNoWindow = $true
+    $start.WorkingDirectory = [IO.Path]::GetFullPath($machineTarget)
+    $start.UserName = $script:ownedEphemeralAccount.Name
+    $start.Domain = $env:COMPUTERNAME
+    $start.Password = $script:ephemeralPassword
+    $start.LoadUserProfile = $false
+    $start.Environment.Clear()
+    $start.Environment['SystemRoot'] = $env:SystemRoot
+    $start.Environment['WINDIR'] = $env:WINDIR
+    $start.Environment['COMSPEC'] = Join-Path $env:SystemRoot 'System32\cmd.exe'
+    $start.Environment['TEMP'] = $machineTarget
+    $start.Environment['TMP'] = $machineTarget
+    foreach ($argument in $Arguments) { $start.ArgumentList.Add($argument) }
+    return $start
+}
+
+function Start-EphemeralProcess([string]$FilePath, [string[]]$Arguments) {
+    Assert-True ($null -eq $script:activeCredentialProcess) 'A prior credentialed process is still active.'
+    $start = New-EphemeralProcessStartInfo -FilePath $FilePath -Arguments $Arguments
+    $process = [Diagnostics.Process]::Start($start)
+    if ($null -eq $process) { throw "Failed to start credentialed $FilePath." }
+    $script:activeCredentialProcess = $process
+    return $process
+}
+
+function Release-ExitedEphemeralProcess([Diagnostics.Process]$Process) {
+    Assert-True ([object]::ReferenceEquals($script:activeCredentialProcess, $Process)) 'Credentialed process ownership changed before release.'
+    Assert-True $Process.HasExited 'Refusing to release credentialed process ownership before exit is positively confirmed.'
+    $Process.Dispose()
+    $script:activeCredentialProcess = $null
+}
+
+function Complete-EphemeralProcess(
+    [Diagnostics.Process]$Process,
+    [ValidateRange(1, 3600)][int]$TimeoutSeconds,
+    [ValidateRange(1, 1048576)][int]$MaximumCapturedOutputCharacters,
+    [switch]$AllowFailure
+) {
+    Assert-True ([object]::ReferenceEquals($script:activeCredentialProcess, $Process)) 'Credentialed process ownership changed before completion.'
+    try {
+        $stdoutTask = [Scribe.GpuBroker.PrivilegeRestoreRetryModel]::ReadToEndBoundedAsync($Process.StandardOutput, $MaximumCapturedOutputCharacters)
+        $stderrTask = [Scribe.GpuBroker.PrivilegeRestoreRetryModel]::ReadToEndBoundedAsync($Process.StandardError, $MaximumCapturedOutputCharacters)
+        if (-not $Process.WaitForExit($TimeoutSeconds * 1000)) {
+            $Process.Kill($true)
+            Assert-True ($Process.WaitForExit(10000)) 'Credentialed process termination remained uncertain after kill.'
+            throw 'Credentialed process did not exit within its fixed timeout.'
+        }
+        $result = [pscustomobject]@{
+            ExitCode = $Process.ExitCode
+            Stdout = $stdoutTask.GetAwaiter().GetResult()
+            Stderr = $stderrTask.GetAwaiter().GetResult()
+        }
+    }
+    finally {
+        if ([object]::ReferenceEquals($script:activeCredentialProcess, $Process) -and $Process.HasExited) {
+            Release-ExitedEphemeralProcess -Process $Process
+        }
+    }
+    if (-not $AllowFailure -and $result.ExitCode -ne 0) {
+        throw "Credentialed process failed with exit $($result.ExitCode): $($result.Stderr)"
+    }
+    return $result
+}
+
+function Invoke-EphemeralProcess {
+    param(
+        [Parameter(Mandatory)][string]$FilePath,
+        [string[]]$Arguments = @(),
+        [ValidateRange(1, 3600)][int]$TimeoutSeconds = 30,
+        [ValidateRange(1, 1048576)][int]$MaximumCapturedOutputCharacters = 65536,
+        [switch]$AllowFailure
+    )
+    $process = Start-EphemeralProcess -FilePath $FilePath -Arguments $Arguments
+    return Complete-EphemeralProcess `
+        -Process $process `
+        -TimeoutSeconds $TimeoutSeconds `
+        -MaximumCapturedOutputCharacters $MaximumCapturedOutputCharacters `
+        -AllowFailure:$AllowFailure
+}
+
+function Test-EphemeralProcessOwnershipBoundary {
+    Assert-True ($null -eq $script:activeCredentialProcess) 'Credentialed process ownership fixture started with an active process.'
+    $start = [Diagnostics.ProcessStartInfo]::new()
+    $start.FileName = (Get-Process -Id $PID).Path
+    $start.UseShellExecute = $false
+    $start.CreateNoWindow = $true
+    $start.ArgumentList.Add('-NoProfile')
+    $start.ArgumentList.Add('-NonInteractive')
+    $start.ArgumentList.Add('-Command')
+    $start.ArgumentList.Add('[Threading.Thread]::Sleep(30000)')
+    $process = [Diagnostics.Process]::Start($start)
+    if ($null -eq $process) { throw 'Could not start the credential-process ownership fixture.' }
+    $script:activeCredentialProcess = $process
+    try {
+        $releaseFailure = $null
+        try { Release-ExitedEphemeralProcess -Process $process }
+        catch { $releaseFailure = $_.Exception }
+        Assert-True ($null -ne $releaseFailure -and $releaseFailure.Message -ceq 'Refusing to release credentialed process ownership before exit is positively confirmed.') 'Live credential-process ownership release did not fail closed.'
+        Assert-True ([object]::ReferenceEquals($script:activeCredentialProcess, $process)) 'Failed credential-process release discarded exact ownership.'
+        $process.Kill($true)
+        Assert-True ($process.WaitForExit(5000)) 'Credential-process ownership fixture did not exit after kill.'
+        Release-ExitedEphemeralProcess -Process $process
+        Assert-True ($null -eq $script:activeCredentialProcess) 'Confirmed credential-process exit retained stale ownership.'
+    }
+    finally {
+        if ([object]::ReferenceEquals($script:activeCredentialProcess, $process)) {
+            if (-not $process.HasExited) {
+                $process.Kill($true)
+                Assert-True ($process.WaitForExit(5000)) 'Credential-process ownership fixture cleanup could not confirm exit.'
+            }
+            Release-ExitedEphemeralProcess -Process $process
+        }
+    }
+}
+
 function New-WeakPolicy([string]$Sid) {
     $result = New-ProtectedPolicy -Sid $Sid
     Assert-True ($result.ExitCode -eq 0) "Could not provision the weak-DACL fixture: $($result.Stderr)"
@@ -1304,6 +1670,7 @@ function New-ValidClientArguments([string]$HandoffRoot, [string]$OutputRoot) {
 }
 
 try {
+    Test-EphemeralProcessOwnershipBoundary
     $goldenRequest = '{"schema_version":1,"command":"promote-windows-pack-set","client_nonce":"1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a","promotion_intent_sha256":"bf7b4002065dcc87c6d7abd70899c76a23c880c82e1869c4ba2bdbf39dcebe3c","intent":{"schema_version":1,"policy_namespace":"scribe-windows-gpu-production-v1","source_repository":"owner/repo","source_ref":"refs/heads/main","source_revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","workflow_ref":"owner/repo/.github/workflows/windows-gpu-pack-promotion.yml@refs/heads/main","workflow_source_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","run_id":"123","run_attempt":"1","artifact_id":"456","artifact_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","handoff_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","release_set_digest":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","toolchain_manifest_sha256":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","pack_version":"0.1.0","minimum_security_epoch":1,"require_unused_release_set":true}}'
     $goldenMaterial = [Text.Encoding]::UTF8.GetBytes("scribe-windows-gpu-promotion-request-v1`0$goldenRequest")
     $goldenDigest = ([BitConverter]::ToString([Security.Cryptography.SHA256]::HashData($goldenMaterial))).Replace('-', '').ToLowerInvariant()
@@ -1363,9 +1730,13 @@ try {
     }
     finally { $squatter.Dispose() }
 
-    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-    $principal = [Security.Principal.WindowsPrincipal]::new($identity)
-    $isElevated = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    $runnerIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    try {
+        $runnerSid = $runnerIdentity.User.Value
+        $principal = [Security.Principal.WindowsPrincipal]::new($runnerIdentity)
+        $isElevated = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    }
+    finally { $runnerIdentity.Dispose() }
     if (-not $isElevated) {
         if ($RequireScmIntegration) { throw 'Restricted-service integration requires an elevated disposable Windows host.' }
         Write-Output 'Restricted-service integration skipped: current process is not elevated.'
@@ -1376,8 +1747,17 @@ try {
     if (Test-Path -LiteralPath $policyRegistryPath) {
         throw 'Refusing to modify a pre-existing fixed Windows GPU broker client policy.'
     }
-    Test-RestorePrivilegeRestoration -InitiallyEnabled $false -Sid $identity.User.Value
-    Test-RestorePrivilegeRestoration -InitiallyEnabled $true -Sid $identity.User.Value
+    $ephemeralAccount = New-EphemeralStandardAccount
+    $ephemeralSid = $ephemeralAccount.Sid.Value
+    Assert-True ($runnerSid -cne $ephemeralSid) 'Elevated runner SID cannot be the valid broker client SID.'
+    $postCreateFailure = [InvalidOperationException]::new('expected-post-create-pre-enable-failure')
+    $observedPostCreateFailure = $null
+    try { throw $postCreateFailure }
+    catch { $observedPostCreateFailure = $_.Exception }
+    Assert-True ([object]::ReferenceEquals($postCreateFailure, $observedPostCreateFailure)) 'Post-create/pre-enable failure boundary replaced the original failure.'
+    [void](Assert-OwnedEphemeralAccount -State $ephemeralAccount -ExpectedEnabled $false)
+    Test-RestorePrivilegeRestoration -InitiallyEnabled $false -Sid $ephemeralSid
+    Test-RestorePrivilegeRestoration -InitiallyEnabled $true -Sid $ephemeralSid
     Assert-True (-not (Test-Path -LiteralPath $policyRegistryPath)) 'Privilege restoration fixtures left an authorization policy behind.'
     foreach ($rejectedSid in @('BUILTIN\Users', 'S-1-5-11', 'S-1-5-20', $serviceSid, 'S-1-5-21-1-2-3-500')) {
         $rejectedProvision = New-ProtectedPolicy -Sid $rejectedSid
@@ -1399,7 +1779,8 @@ try {
     foreach ($entry in @(
         @('S-1-5-18', [Security.AccessControl.FileSystemRights]::FullControl),
         @('S-1-5-32-544', [Security.AccessControl.FileSystemRights]::FullControl),
-        @($serviceSid, [Security.AccessControl.FileSystemRights]::ReadAndExecute)
+        @($serviceSid, [Security.AccessControl.FileSystemRights]::ReadAndExecute),
+        @($ephemeralSid, [Security.AccessControl.FileSystemRights]::ReadAndExecute)
     )) {
         $identitySid = [Security.Principal.SecurityIdentifier]::new([string]$entry[0])
         $accessRule = [Security.AccessControl.FileSystemAccessRule]::new($identitySid, $entry[1], $inheritance, $propagation, $allow)
@@ -1409,19 +1790,56 @@ try {
     $verifiedAcl = Get-Acl -LiteralPath $machineTarget
     Assert-True $verifiedAcl.AreAccessRulesProtected 'SCM test staging inherited an ambient writable DACL.'
     $verifiedRules = @($verifiedAcl.GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier]))
-    $allowedSids = @('S-1-5-18', 'S-1-5-32-544', $serviceSid)
-    Assert-True ($verifiedRules.Count -eq 3) 'SCM test staging contains an unexpected access rule.'
+    $allowedSids = @('S-1-5-18', 'S-1-5-32-544', $serviceSid, $ephemeralSid)
+    Assert-True ($verifiedRules.Count -eq 4) 'SCM test staging contains an unexpected access rule.'
     Assert-True (-not ($verifiedRules | Where-Object { $_.AccessControlType -ne $allow -or $_.IdentityReference.Value -notin $allowedSids })) 'SCM test staging contains unexpected identity or deny rules.'
+    foreach ($expectedSid in $allowedSids) {
+        $matchingRules = @($verifiedRules | Where-Object { $_.IdentityReference.Value -ceq $expectedSid })
+        Assert-True ($matchingRules.Count -eq 1) "SCM test staging does not contain one exact rule for $expectedSid."
+        $expectedRights = if ($expectedSid -ceq 'S-1-5-18' -or $expectedSid -ceq 'S-1-5-32-544') {
+            [Security.AccessControl.FileSystemRights]::FullControl
+        }
+        else { [Security.AccessControl.FileSystemRights]::ReadAndExecute }
+        Assert-True ([uint32]$matchingRules[0].FileSystemRights -eq [uint32]$expectedRights) "SCM test staging rights changed for $expectedSid."
+        Assert-True ($matchingRules[0].InheritanceFlags -eq $inheritance -and $matchingRules[0].PropagationFlags -eq $propagation) "SCM test staging inheritance changed for $expectedSid."
+    }
     $serviceRules = @($verifiedRules | Where-Object { $_.IdentityReference.Value -ceq $serviceSid })
     Assert-True ($serviceRules.Count -eq 1) 'SCM test staging does not have one exact service-SID access rule.'
     Assert-True (($serviceRules[0].FileSystemRights -band [Security.AccessControl.FileSystemRights]::Write) -eq 0) 'The test service SID can modify its staged binary.'
     Assert-True (($serviceRules[0].FileSystemRights -band [Security.AccessControl.FileSystemRights]::ReadAndExecute) -eq [Security.AccessControl.FileSystemRights]::ReadAndExecute) 'The test service SID cannot read and execute its staged binary.'
+    $clientRules = @($verifiedRules | Where-Object { $_.IdentityReference.Value -ceq $ephemeralSid })
+    Assert-True ($clientRules.Count -eq 1) 'SCM test staging does not have one exact ephemeral-client access rule.'
+    Assert-True (($clientRules[0].FileSystemRights -band [Security.AccessControl.FileSystemRights]::Write) -eq 0) 'The ephemeral client can modify protected staging.'
+    Assert-True (($clientRules[0].FileSystemRights -band [Security.AccessControl.FileSystemRights]::ReadAndExecute) -eq [Security.AccessControl.FileSystemRights]::ReadAndExecute) 'The ephemeral client cannot read and execute protected staging.'
     $serviceForScm = Join-Path $machineTarget 'scribe-windows-gpu-promotion-service.exe'
+    $clientForCredential = Join-Path $machineTarget 'scribe-windows-gpu-promotion-client.exe'
+    $harnessForCredential = Join-Path $machineTarget 'test-windows-gpu-broker-transport.ps1'
     Copy-Item -LiteralPath $builtService -Destination $serviceForScm
+    Copy-Item -LiteralPath $client -Destination $clientForCredential
+    Copy-Item -LiteralPath $PSCommandPath -Destination $harnessForCredential
     Assert-True (Test-Path -LiteralPath $serviceForScm -PathType Leaf) 'Protected SCM service staging failed.'
-    $stagedItem = Get-Item -LiteralPath $serviceForScm -Force
-    Assert-True (($stagedItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) 'Protected SCM service staging produced a reparse point.'
+    foreach ($stagedPath in @($serviceForScm, $clientForCredential, $harnessForCredential)) {
+        $stagedItem = Get-Item -LiteralPath $stagedPath -Force
+        Assert-True (($stagedItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) 'Protected staging produced a reparse point.'
+    }
     Assert-True ((Get-FileHash -Algorithm SHA256 -LiteralPath $serviceForScm).Hash -ceq (Get-FileHash -Algorithm SHA256 -LiteralPath $builtService).Hash) 'Protected SCM service staging changed the built service bytes.'
+    Assert-True ((Get-FileHash -Algorithm SHA256 -LiteralPath $clientForCredential).Hash -ceq (Get-FileHash -Algorithm SHA256 -LiteralPath $client).Hash) 'Protected client staging changed the real client bytes.'
+    Assert-True ((Get-FileHash -Algorithm SHA256 -LiteralPath $harnessForCredential).Hash -ceq (Get-FileHash -Algorithm SHA256 -LiteralPath $PSCommandPath).Hash) 'Protected harness staging changed the fixed probe bytes.'
+    Enable-LocalUser -SID $ephemeralAccount.Sid
+    $enabledAccount = Assert-OwnedEphemeralAccount -State $ephemeralAccount -ExpectedEnabled $true
+    Assert-True $enabledAccount.Enabled 'Ephemeral account did not become enabled after protected staging completed.'
+    Assert-NoEphemeralProfileRegistration -Sid $ephemeralAccount.Sid
+    $probePowerShell = (Get-Process -Id $PID).Path
+    $identityProbe = Invoke-EphemeralProcess -FilePath $probePowerShell -Arguments @(
+        '-NoProfile',
+        '-NonInteractive',
+        '-File', $harnessForCredential,
+        '-ExpectedEphemeralSid', $ephemeralSid,
+        '-RunEphemeralIdentityProbe'
+    )
+    Assert-True ($identityProbe.Stdout.Trim() -ceq 'ephemeral-identity-ok') 'Primary-token identity probe did not return its exact success marker.'
+    Assert-True ($identityProbe.Stderr.Length -eq 0) 'Primary-token identity probe emitted unexpected diagnostics.'
+    Assert-NoEphemeralProfileRegistration -Sid $ephemeralAccount.Sid
 
     $shownSid = Invoke-Sc -Arguments @('showsid', $serviceName)
     Assert-True ($shownSid.Stdout.Contains($serviceSid, [StringComparison]::Ordinal)) 'Windows derived an unexpected fixed service SID.'
@@ -1446,14 +1864,14 @@ try {
     Assert-True (-not (Test-Path -LiteralPath $handoff)) 'Missing-policy startup touched the handoff path.'
     Assert-True (-not (Test-Path -LiteralPath $output)) 'Missing-policy startup touched the output path.'
 
-    New-WeakPolicy -Sid $identity.User.Value
+    New-WeakPolicy -Sid $ephemeralSid
     Assert-RejectedServiceStartup -Label 'Weak broad-read policy DACL' -Client $client -ClientArguments $arguments
     Remove-OwnedPolicy
 
-    $provisioned = New-ProtectedPolicy -Sid $identity.User.Value
+    $provisioned = New-ProtectedPolicy -Sid $ephemeralSid
     Assert-True ($provisioned.ExitCode -eq 0) "Protected policy provisioning failed: $($provisioned.Stderr)"
     Assert-ExactPolicyAcl
-    $duplicateProvision = New-ProtectedPolicy -Sid $identity.User.Value
+    $duplicateProvision = New-ProtectedPolicy -Sid $ephemeralSid
     Assert-True ($duplicateProvision.ExitCode -ne 0) 'Provisioner modified a pre-existing policy.'
 
     # A failed provision never establishes ownership, and cleanup must also
@@ -1502,7 +1920,7 @@ try {
             $boundaryState.RenameSucceeded = $true
             try {
                 $boundaryState.InvocationResult = Invoke-ProtectedPolicyProvisioner `
-                    -Sid $identity.User.Value `
+                    -Sid $ephemeralSid `
                     -InvocationNonce $boundaryState.InvocationNonce
             }
             catch { $boundaryState.InvocationError = $_ }
@@ -1521,12 +1939,12 @@ try {
     Assert-True ($boundaryState.InvocationResult.ExitCode -eq 0) "Could not create the boundary-swap policy: $($boundaryState.InvocationResult.Stderr)"
     $replacementAncestors = @(Read-ProvisioningSuccessRecord `
         -Result $boundaryState.InvocationResult `
-        -Sid $identity.User.Value `
+        -Sid $ephemeralSid `
         -InvocationNonce $boundaryState.InvocationNonce)
     Assert-True $boundarySwapDetected 'Policy cleanup did not detect a same-path object created before exact handle-bound deletion.'
     Assert-True (Test-Path -LiteralPath $policyRegistryPath) 'Handle-bound cleanup targeted the boundary-swap replacement.'
     Assert-True (-not (Test-Path -LiteralPath $boundaryRenamedPath)) 'Handle-bound cleanup did not delete the original renamed registry object.'
-    Set-OwnedPolicyState -Values (New-ExpectedPolicyValues -Sid $identity.User.Value) -RequireCanonicalAcl $true
+    Set-OwnedPolicyState -Values (New-ExpectedPolicyValues -Sid $ephemeralSid) -RequireCanonicalAcl $true
     $script:ownedPolicyAncestors = @($ownedPolicyAncestors) + @($replacementAncestors)
     Assert-OwnedPolicyState -State $ownedPolicyState
 
@@ -1534,19 +1952,19 @@ try {
     Assert-RejectedServiceStartup -Label 'Extra policy value' -Client $client -ClientArguments $arguments
     Remove-OwnedPolicy
 
-    $provisioned = New-ProtectedPolicy -Sid $identity.User.Value
+    $provisioned = New-ProtectedPolicy -Sid $ephemeralSid
     Assert-True ($provisioned.ExitCode -eq 0) 'Could not reprovision the noncanonical-value-name fixture.'
-    Replace-PolicyValueSpelling -ExistingName 'AuthorizedClientSid' -ReplacementName 'authorizedclientsid' -Value $identity.User.Value -Kind ([Microsoft.Win32.RegistryValueKind]::String)
+    Replace-PolicyValueSpelling -ExistingName 'AuthorizedClientSid' -ReplacementName 'authorizedclientsid' -Value $ephemeralSid -Kind ([Microsoft.Win32.RegistryValueKind]::String)
     Assert-RejectedServiceStartup -Label 'Noncanonical policy value name' -Client $client -ClientArguments $arguments
     Remove-OwnedPolicy
 
-    $provisioned = New-ProtectedPolicy -Sid $identity.User.Value
+    $provisioned = New-ProtectedPolicy -Sid $ephemeralSid
     Assert-True ($provisioned.ExitCode -eq 0) 'Could not reprovision the malformed-schema fixture.'
     Set-PolicyValue -Name 'SchemaVersion' -Value '1' -Kind ([Microsoft.Win32.RegistryValueKind]::String)
     Assert-RejectedServiceStartup -Label 'Malformed policy schema' -Client $client -ClientArguments $arguments
     Remove-OwnedPolicy
 
-    $provisioned = New-ProtectedPolicy -Sid $identity.User.Value
+    $provisioned = New-ProtectedPolicy -Sid $ephemeralSid
     Assert-True ($provisioned.ExitCode -eq 0) 'Could not reprovision the malformed-policy fixture.'
     Set-PolicyValue -Name 'AuthorizedClientSid' -Value 'S-1-5-11' -Kind ([Microsoft.Win32.RegistryValueKind]::String)
     Assert-RejectedServiceStartup -Label 'Broad malformed policy SID' -Client $client -ClientArguments $arguments
@@ -1569,62 +1987,64 @@ try {
     (Get-Service -Name $serviceName).WaitForStatus([System.ServiceProcess.ServiceControllerStatus]::Stopped, [TimeSpan]::FromSeconds(10))
     Remove-OwnedPolicy
 
-    $provisioned = New-ProtectedPolicy -Sid $identity.User.Value
-    Assert-True ($provisioned.ExitCode -eq 0) 'Could not provision the current TokenUser SID.'
+    $provisioned = New-ProtectedPolicy -Sid $ephemeralSid
+    Assert-True ($provisioned.ExitCode -eq 0) 'Could not provision the ephemeral TokenUser SID.'
     Assert-ExactPolicyAcl
     $start = Invoke-Sc -Arguments @('start', $serviceName) -AllowFailure
-    Assert-True ($start.ExitCode -eq 0) "SCM rejected the current-user policy: $($start.Stderr)"
+    Assert-True ($start.ExitCode -eq 0) "SCM rejected the ephemeral-client policy: $($start.Stderr)"
     (Get-Service -Name $serviceName).WaitForStatus([System.ServiceProcess.ServiceControllerStatus]::Running, [TimeSpan]::FromSeconds(10))
 
-    $overbroad = [IO.Pipes.NamedPipeClientStream]::new(
-        '.',
-        $pipeName,
-        [IO.Pipes.PipeAccessRights]::FullControl,
-        [IO.Pipes.PipeOptions]::Asynchronous,
-        [Security.Principal.TokenImpersonationLevel]::Identification,
-        [IO.HandleInheritability]::None
+    $fullControlProbe = Invoke-EphemeralProcess -FilePath $probePowerShell -Arguments @(
+        '-NoProfile',
+        '-NonInteractive',
+        '-File', $harnessForCredential,
+        '-ExpectedEphemeralSid', $ephemeralSid,
+        '-RunEphemeralFullControlProbe'
     )
-    try {
-        $overbroadDenied = $false
-        try { $overbroad.Connect(2000) }
-        catch [UnauthorizedAccessException] { $overbroadDenied = $true }
-        Assert-True $overbroadDenied 'Client received generic write, pipe-instance, or ACL authority beyond 0x00100183.'
-    }
-    finally { $overbroad.Dispose() }
+    Assert-True ($fullControlProbe.Stdout.Trim() -ceq 'ephemeral-full-control-denied') 'FullControl denial was not established under the exact ephemeral identity.'
+    Assert-True ($fullControlProbe.Stderr.Length -eq 0) 'FullControl credential probe emitted unexpected diagnostics.'
 
-    $stalledClientRights = [IO.Pipes.PipeAccessRights](
-        [uint32][IO.Pipes.PipeAccessRights]::ReadData -bor
-        [uint32][IO.Pipes.PipeAccessRights]::WriteData -bor
-        [uint32][IO.Pipes.PipeAccessRights]::ReadAttributes -bor
-        [uint32][IO.Pipes.PipeAccessRights]::WriteAttributes -bor
-        [uint32][IO.Pipes.PipeAccessRights]::Synchronize
-    )
-    Assert-True ([uint32]$stalledClientRights -eq 0x00100183) 'The stalled-client probe no longer requests the production client access mask.'
-    $stalled = [IO.Pipes.NamedPipeClientStream]::new(
-        '.',
-        $pipeName,
-        $stalledClientRights,
-        [IO.Pipes.PipeOptions]::Asynchronous,
-        [Security.Principal.TokenImpersonationLevel]::Identification,
-        [IO.HandleInheritability]::None
+    $stalledProcess = Start-EphemeralProcess -FilePath $probePowerShell -Arguments @(
+        '-NoProfile',
+        '-NonInteractive',
+        '-File', $harnessForCredential,
+        '-ExpectedEphemeralSid', $ephemeralSid,
+        '-RunEphemeralStalledProbe'
     )
     try {
-        $stopProof = [Diagnostics.Stopwatch]::StartNew()
-        $stalled.Connect(5000)
+        $stalledErrorTask = [Scribe.GpuBroker.PrivilegeRestoreRetryModel]::ReadToEndBoundedAsync($stalledProcess.StandardError, 16384)
+        $readinessTask = [Scribe.GpuBroker.PrivilegeRestoreRetryModel]::ReadLineBoundedAsync($stalledProcess.StandardOutput, 128)
+        Assert-True ($readinessTask.Wait(8000)) 'Ephemeral stalled probe did not report readiness within its fixed timeout.'
+        Assert-True ($readinessTask.GetAwaiter().GetResult() -ceq 'ephemeral-stalled-ready') 'Ephemeral stalled probe did not establish exact-mask readiness.'
+        Assert-True (-not $stalledProcess.HasExited) 'Ephemeral stalled probe exited before SCM cancellation began.'
         [void](Assert-OwnedBrokerService -ExpectedPath $serviceForScm)
+        $stopProof = [Diagnostics.Stopwatch]::StartNew()
         $stop = Invoke-Sc -Arguments @('stop', $serviceName) -AllowFailure
         Assert-True ($stop.ExitCode -eq 0) "SCM rejected the bounded-stop request: $($stop.Stderr)"
         (Get-Service -Name $serviceName).WaitForStatus([System.ServiceProcess.ServiceControllerStatus]::Stopped, [TimeSpan]::FromSeconds(4))
         $stopProof.Stop()
         Assert-True ($stopProof.Elapsed.TotalMilliseconds -lt 4500) 'SCM stop did not cancel the stalled broker read materially before its five-second natural timeout.'
+        $stalledRemainderTask = [Scribe.GpuBroker.PrivilegeRestoreRetryModel]::ReadToEndBoundedAsync($stalledProcess.StandardOutput, 16384)
+        Assert-True ($stalledProcess.WaitForExit(10000)) 'Ephemeral stalled probe did not exit after SCM closed its pipe.'
+        Assert-True ($stalledProcess.ExitCode -eq 0) "Ephemeral stalled probe failed: $($stalledErrorTask.GetAwaiter().GetResult())"
+        Assert-True ($stalledRemainderTask.GetAwaiter().GetResult().Trim() -ceq 'ephemeral-stalled-disconnected') 'Ephemeral stalled probe did not confirm pipe disconnection.'
+        Assert-True ($stalledErrorTask.GetAwaiter().GetResult().Length -eq 0) 'Ephemeral stalled probe emitted unexpected diagnostics.'
     }
-    finally { $stalled.Dispose() }
+    finally {
+        if ([object]::ReferenceEquals($script:activeCredentialProcess, $stalledProcess)) {
+            if (-not $stalledProcess.HasExited) {
+                $stalledProcess.Kill($true)
+                Assert-True ($stalledProcess.WaitForExit(10000)) 'Stalled credential probe termination remained uncertain after kill.'
+            }
+            Release-ExitedEphemeralProcess -Process $stalledProcess
+        }
+    }
 
     $start = Invoke-Sc -Arguments @('start', $serviceName) -AllowFailure
     Assert-True ($start.ExitCode -eq 0) "SCM rejected the second service start: $($start.Stderr)"
     (Get-Service -Name $serviceName).WaitForStatus([System.ServiceProcess.ServiceControllerStatus]::Running, [TimeSpan]::FromSeconds(10))
     Set-PolicyValue -Name 'AuthorizedClientSid' -Value $orphanSid -Kind ([Microsoft.Win32.RegistryValueKind]::String)
-    $roundTrip = Invoke-Process -FilePath $client -Arguments $arguments -TimeoutSeconds 20 -AllowFailure
+    $roundTrip = Invoke-EphemeralProcess -FilePath $clientForCredential -Arguments $arguments -TimeoutSeconds 20 -AllowFailure
     Assert-True ($roundTrip.ExitCode -eq 78) 'Authenticated service response did not map to NotProvisioned.'
     Assert-True ($roundTrip.Stdout.Length -eq 0) 'Broker client wrote protocol data to stdout.'
     Assert-True ($roundTrip.Stderr.Trim() -ceq 'Protected Windows GPU promotion broker authenticated; production authority is not provisioned, and no filesystem, ledger, or signing authority was accessed.') 'Broker client did not emit its fixed authenticated NotProvisioned diagnostic.'
@@ -1640,7 +2060,7 @@ try {
     $start = Invoke-Sc -Arguments @('start', $serviceName) -AllowFailure
     Assert-True ($start.ExitCode -eq 0) 'SCM rejected restart with the mutated, syntactically valid orphan SID.'
     (Get-Service -Name $serviceName).WaitForStatus([System.ServiceProcess.ServiceControllerStatus]::Running, [TimeSpan]::FromSeconds(10))
-    $afterRestart = Invoke-Process -FilePath $client -Arguments $arguments -TimeoutSeconds 20 -AllowFailure
+    $afterRestart = Invoke-EphemeralProcess -FilePath $clientForCredential -Arguments $arguments -TimeoutSeconds 20 -AllowFailure
     Assert-True ($afterRestart.ExitCode -eq 74) 'Service restart did not load the mutated authorization SID.'
     Assert-True ((Get-Service -Name $serviceName).Status -eq [System.ServiceProcess.ServiceControllerStatus]::Running) 'Restarted orphan-policy service was not healthy after denial.'
     [void](Assert-OwnedBrokerService -ExpectedPath $serviceForScm)
@@ -1649,10 +2069,49 @@ try {
     (Get-Service -Name $serviceName).WaitForStatus([System.ServiceProcess.ServiceControllerStatus]::Stopped, [TimeSpan]::FromSeconds(10))
     Remove-OwnedPolicy
     Test-PartialAncestorCleanupOwnershipBoundary
+    Set-LocalUser -SID $ephemeralAccount.Sid -Description 'foreign-cleanup-marker'
+    $accountCleanupFailure = $null
+    try { Remove-OwnedEphemeralAccount }
+    catch { $accountCleanupFailure = $_.Exception }
+    Assert-True ($null -ne $accountCleanupFailure -and $accountCleanupFailure.Message -ceq 'Owned ephemeral account marker changed.') 'Ephemeral account cleanup did not fail specifically on the changed ownership marker.'
+    Assert-True (@(Get-ExactLocalUserBySid -Sid $ephemeralAccount.Sid).Count -eq 1) 'Rejected account cleanup removed the exact owned SID.'
+    Assert-True ($null -ne $ownedEphemeralAccount) 'Rejected account cleanup discarded SID-bound ownership.'
+    Set-LocalUser -SID $ephemeralAccount.Sid -Description $ephemeralAccount.Marker
+    [void](Assert-OwnedEphemeralAccount -State $ephemeralAccount -ExpectedEnabled $true)
+    Assert-NoEphemeralProfileRegistration -Sid $ephemeralAccount.Sid
     Write-Output 'Windows GPU broker transport contract tests passed.'
 }
 catch { $primaryFailure = $_ }
 finally {
+    try {
+        if ($null -ne $activeCredentialProcess) {
+            if (-not $activeCredentialProcess.HasExited) {
+                $activeCredentialProcess.Kill($true)
+                Assert-True ($activeCredentialProcess.WaitForExit(10000)) 'Credentialed process cleanup could not confirm exit after kill.'
+            }
+            Release-ExitedEphemeralProcess -Process $activeCredentialProcess
+        }
+    }
+    catch { [void]$cleanupFailures.Add($_) }
+
+    try {
+        if ($null -ne $ownedEphemeralAccount) {
+            Assert-NoEphemeralProfileRegistration -Sid $ownedEphemeralAccount.Sid
+        }
+    }
+    catch { [void]$cleanupFailures.Add($_) }
+
+    try { Remove-OwnedEphemeralAccount }
+    catch { [void]$cleanupFailures.Add($_) }
+
+    try {
+        if ($null -ne $ephemeralPassword) {
+            $ephemeralPassword.Dispose()
+            $script:ephemeralPassword = $null
+        }
+    }
+    catch { [void]$cleanupFailures.Add($_) }
+
     try {
         if ($null -ne $ownedPolicyState) { Remove-OwnedPolicy }
     }

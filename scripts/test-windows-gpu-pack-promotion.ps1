@@ -337,6 +337,99 @@ try {
     Assert-True ($transportHarness.Contains('boundary-swap policy')) 'Broker harness lacks deterministic post-delete replacement coverage.'
     Assert-True ($transportHarness.Contains("Assert-True (`$null -eq `$ownedPolicyState) 'Policy cleanup retained authority after its exact NtDeleteKey succeeded.'")) 'Broker harness does not prove ownership is dropped at the delete boundary.'
     Assert-True (-not $transportHarness.Contains('if (Test-Path -LiteralPath $policyRegistryPath) { $script:createdPolicy = $true }')) 'Broker harness derives destructive ownership from path existence.'
+    Assert-True (-not $transportHarness.Contains('-Sid $identity.User.Value')) 'Broker harness reuses the reserved elevated runner as a valid client SID.'
+    Assert-True (-not $transportHarness.Contains('New-ProtectedPolicy -Sid $runnerSid')) 'Broker harness provisions a valid policy for the elevated runner SID.'
+    foreach ($required in @(
+        '$ephemeralAccount = New-EphemeralStandardAccount',
+        "-Sid `$ephemeralSid",
+        "@(`$ephemeralSid, [Security.AccessControl.FileSystemRights]::ReadAndExecute)",
+        '$clientForCredential = Join-Path $machineTarget',
+        '$harnessForCredential = Join-Path $machineTarget',
+        'Get-FileHash -Algorithm SHA256 -LiteralPath $clientForCredential',
+        'Get-FileHash -Algorithm SHA256 -LiteralPath $harnessForCredential',
+        'Invoke-EphemeralProcess -FilePath $clientForCredential',
+        '$start.UserName = $script:ownedEphemeralAccount.Name',
+        '$start.Domain = $env:COMPUTERNAME',
+        '$start.Password = $script:ephemeralPassword',
+        '$start.LoadUserProfile = $false',
+        '$start.WorkingDirectory = [IO.Path]::GetFullPath($machineTarget)',
+        '$start.Environment.Clear()',
+        '-RunEphemeralIdentityProbe',
+        '-RunEphemeralFullControlProbe',
+        '-RunEphemeralStalledProbe',
+        '$current.User.Value -ceq $ExpectedSid',
+        '$expectedRid -ge 1000',
+        'Add-LocalGroupMember -SID $standardUsersSid -Member $sid',
+        'ephemeral-stalled-ready',
+        'Assert-True (-not $stalledProcess.HasExited)',
+        'Disable-LocalUser -SID $state.Sid',
+        'Remove-LocalUser -SID $state.Sid',
+        '$script:ownedEphemeralAccount = $null',
+        'Assert-NoEphemeralProfileRegistration',
+        'foreign-cleanup-marker',
+        'expected-post-create-pre-enable-failure',
+        'Test-EphemeralProcessOwnershipBoundary',
+        'Refusing to release credentialed process ownership before exit is positively confirmed.',
+        'Failed credential-process release discarded exact ownership.',
+        'Credentialed process termination remained uncertain after kill.'
+        'Refusing account cleanup while its exact credentialed process may still be active.'
+    )) {
+        Assert-True ($transportHarness.Contains($required)) "Broker harness lost ephemeral-client identity control: $required"
+    }
+    Assert-True (-not $transportHarness.Contains('Remove-LocalUser -Name')) 'Broker harness deletes an ephemeral account by mutable name.'
+    foreach ($forbidden in @(
+        'ConvertFrom-SecureString',
+        'SecureStringToBSTR',
+        'PasswordInClearText',
+        'RunImpersonated',
+        'ArgumentList.Add($script:ephemeralPassword',
+        "Environment['PASSWORD']",
+        'Write-Output $script:ephemeralPassword',
+        'WriteAllText($script:ephemeralPassword'
+    )) {
+        Assert-True (-not $transportHarness.Contains($forbidden)) "Broker harness exposes or weakens ephemeral credential handling: $forbidden"
+    }
+    $nonElevatedReturn = $transportHarness.IndexOf("if (-not `$isElevated)", [StringComparison]::Ordinal)
+    $accountCreation = $transportHarness.IndexOf('$ephemeralAccount = New-EphemeralStandardAccount', [StringComparison]::Ordinal)
+    Assert-True ($nonElevatedReturn -ge 0 -and $nonElevatedReturn -lt $accountCreation) 'Broker harness creates local credential state before preserving its non-elevated return path.'
+    $probeDispatch = $transportHarness.IndexOf('if ($ephemeralProbeCount -eq 1)', [StringComparison]::Ordinal)
+    $firstAddType = $transportHarness.IndexOf("if (-not ('Scribe.GpuBroker.RegistryCleanupNative' -as [type]))", [StringComparison]::Ordinal)
+    Assert-True ($probeDispatch -ge 0 -and $probeDispatch -lt $firstAddType) 'Fixed credential probes are not dispatched before the elevated main harness and embedded helpers.'
+    $newAccountStart = $transportHarness.IndexOf('function New-EphemeralStandardAccount', [StringComparison]::Ordinal)
+    $newAccountEnd = $transportHarness.IndexOf('function Remove-OwnedEphemeralAccount', $newAccountStart, [StringComparison]::Ordinal)
+    Assert-True ($newAccountStart -ge 0 -and $newAccountEnd -gt $newAccountStart) 'Broker harness lost its bounded ephemeral-account creation helper.'
+    $newAccount = $transportHarness.Substring($newAccountStart, $newAccountEnd - $newAccountStart)
+    $accountCreated = $newAccount.IndexOf('$created = New-LocalUser', [StringComparison]::Ordinal)
+    $accountOwnership = $newAccount.IndexOf('$script:ownedEphemeralAccount = [pscustomobject]@{', [StringComparison]::Ordinal)
+    $accountSidValidation = $newAccount.IndexOf('$sid = Assert-CanonicalEphemeralSid', [StringComparison]::Ordinal)
+    Assert-True ($accountCreated -ge 0 -and $accountCreated -lt $accountOwnership -and $accountOwnership -lt $accountSidValidation) 'Broker harness does not bind raw SID ownership immediately after account creation and before canonical validation.'
+    $removeAccountStart = $transportHarness.IndexOf('function Remove-OwnedEphemeralAccount', [StringComparison]::Ordinal)
+    $removeAccountEnd = $transportHarness.IndexOf('function New-EphemeralProcessStartInfo', $removeAccountStart, [StringComparison]::Ordinal)
+    Assert-True ($removeAccountStart -ge 0 -and $removeAccountEnd -gt $removeAccountStart) 'Broker harness lost its bounded SID-owned account cleanup helper.'
+    $removeAccount = $transportHarness.Substring($removeAccountStart, $removeAccountEnd - $removeAccountStart)
+    $exactAccountValidation = $removeAccount.IndexOf('Assert-OwnedEphemeralAccount -State $state', [StringComparison]::Ordinal)
+    $disableAccount = $removeAccount.IndexOf('Disable-LocalUser -SID $state.Sid', [StringComparison]::Ordinal)
+    $deleteAccount = $removeAccount.IndexOf('Remove-LocalUser -SID $state.Sid', [StringComparison]::Ordinal)
+    $dropAccountOwnership = $removeAccount.IndexOf('$script:ownedEphemeralAccount = $null', [StringComparison]::Ordinal)
+    $verifySidAbsent = $removeAccount.IndexOf('Get-ExactLocalUserBySid -Sid $deletedSid', [StringComparison]::Ordinal)
+    Assert-True ($exactAccountValidation -ge 0 -and $exactAccountValidation -lt $disableAccount -and $disableAccount -lt $deleteAccount -and $deleteAccount -lt $dropAccountOwnership -and $dropAccountOwnership -lt $verifySidAbsent) 'Broker harness does not validate, disable, delete by exact SID, drop ownership, then verify absence in order.'
+    $completeProcessStart = $transportHarness.IndexOf('function Complete-EphemeralProcess(', [StringComparison]::Ordinal)
+    $completeProcessEnd = $transportHarness.IndexOf('function Invoke-EphemeralProcess', $completeProcessStart, [StringComparison]::Ordinal)
+    Assert-True ($completeProcessStart -ge 0 -and $completeProcessEnd -gt $completeProcessStart) 'Broker harness lost its bounded credential-process completion helper.'
+    $completeProcess = $transportHarness.Substring($completeProcessStart, $completeProcessEnd - $completeProcessStart)
+    $completionExitProof = $completeProcess.IndexOf('$Process.HasExited', [StringComparison]::Ordinal)
+    $completionRelease = $completeProcess.IndexOf('Release-ExitedEphemeralProcess -Process $Process', [StringComparison]::Ordinal)
+    Assert-True ($completionExitProof -ge 0 -and $completionExitProof -lt $completionRelease) 'Credential-process completion can relinquish ownership without a positive exit observation.'
+    Assert-True (-not $completeProcess.Contains('$script:activeCredentialProcess = $null')) 'Credential-process completion directly discards ownership across uncertain termination.'
+    $outerCleanupStart = $transportHarness.LastIndexOf("finally {", [StringComparison]::Ordinal)
+    $outerCleanup = $transportHarness.Substring($outerCleanupStart)
+    $killCredentialChild = $outerCleanup.IndexOf('$activeCredentialProcess.Kill($true)', [StringComparison]::Ordinal)
+    $confirmCredentialChildExit = $outerCleanup.IndexOf('$activeCredentialProcess.WaitForExit(10000)', [StringComparison]::Ordinal)
+    $releaseCredentialChild = $outerCleanup.IndexOf('Release-ExitedEphemeralProcess -Process $activeCredentialProcess', [StringComparison]::Ordinal)
+    $removeCredentialAccount = $outerCleanup.IndexOf('Remove-OwnedEphemeralAccount', [StringComparison]::Ordinal)
+    $disposeCredential = $outerCleanup.IndexOf('$ephemeralPassword.Dispose()', [StringComparison]::Ordinal)
+    $removeCredentialPolicy = $outerCleanup.IndexOf('if ($null -ne $ownedPolicyState) { Remove-OwnedPolicy }', [StringComparison]::Ordinal)
+    Assert-True ($killCredentialChild -ge 0 -and $killCredentialChild -lt $confirmCredentialChildExit -and $confirmCredentialChildExit -lt $releaseCredentialChild -and $releaseCredentialChild -lt $removeCredentialAccount -and $removeCredentialAccount -lt $disposeCredential -and $disposeCredential -lt $removeCredentialPolicy) 'Broker harness does not confirm credentialed child exit before release, remove its exact account, dispose credential material, then clean orphaned policy state.'
     Assert-True ((Get-Content -LiteralPath (Join-Path $repositoryRoot 'tools\windows-gpu-promotion-broker\src\fixture.rs') -Raw).Contains('consumes_canonical_handoff_generated_by_powershell_and_worker_pack_author')) 'Broker proof does not consume the PowerShell/worker-pack-author interoperability fixture.'
 
     if (-not [string]::IsNullOrWhiteSpace($InteropFixtureDirectory)) {

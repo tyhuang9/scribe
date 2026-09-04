@@ -106,8 +106,18 @@ traffic; that migration is deferred with the production broker itself.
 Policy provisioning alone does not provision production authority. Production
 promotion must stay disabled until those controls are implemented and
 independently reviewed. The elevated repository harness temporarily installs
-the zero-authority service and policy, proves invalid-policy and wrong-SID
-denial plus snapshot behavior, and performs identity-safe cleanup. The harness
+the zero-authority service and policy. It creates one disabled, one-hour local
+standard account with an in-memory cryptographic `SecureString`, stages
+exact-hash client and fixed-probe copies beneath a protected machine directory,
+then enables the account and launches those copies with its primary credentials,
+`LoadUserProfile=false`, and a cleared minimal environment. The policy and
+staging ACL bind only that account's canonical machine SID (RID 1000 or
+greater); the elevated runner remains a wrong-identity fixture. The harness
+proves invalid-policy and wrong-SID denial, exact access-mask and snapshot
+behavior, and performs identity-safe cleanup without creating a profile or
+persisting credential material. Account cleanup validates its exact SID, name,
+unique marker, and expiry, disables it, deletes only by SID, and drops ownership
+immediately after confirmed deletion. The harness
 validates and deletes each owned registry object through one
 no-follow handle opened with `DELETE`; handle-bound `NtDeleteKey` prevents a
 same-name replacement from redirecting cleanup after validation. Ownership is

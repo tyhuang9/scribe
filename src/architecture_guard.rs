@@ -1675,7 +1675,7 @@ fn windows_gpu_pack_promotion_keeps_candidate_and_signing_authority_separate() {
         "FromSeconds(4)",
         "$stopProof = [Diagnostics.Stopwatch]::StartNew()",
         "$stopProof.Elapsed.TotalMilliseconds -lt 4500",
-        "$stalledClientRights -eq 0x00100183",
+        "$exactRights -eq 0x00100183",
         "[IO.Pipes.PipeAccessRights]::Synchronize",
         "WaitForConnectionAsync",
         "The client sent request bytes before authenticating the service",
@@ -1714,12 +1714,74 @@ fn windows_gpu_pack_promotion_keeps_candidate_and_signing_authority_separate() {
         "Policy cleanup retained authority after its exact NtDeleteKey succeeded.",
         "$script:ownedPolicyAncestors = @($ownedPolicyAncestors | Where-Object { $_ -cne $path })",
         "Remove-OwnedPolicy",
+        "$ephemeralAccount = New-EphemeralStandardAccount",
+        "$script:ownedEphemeralAccount = [pscustomobject]@{",
+        "-Sid $ephemeralSid",
+        "@($ephemeralSid, [Security.AccessControl.FileSystemRights]::ReadAndExecute)",
+        "$clientForCredential = Join-Path $machineTarget",
+        "$harnessForCredential = Join-Path $machineTarget",
+        "Get-FileHash -Algorithm SHA256 -LiteralPath $clientForCredential",
+        "Get-FileHash -Algorithm SHA256 -LiteralPath $harnessForCredential",
+        "Invoke-EphemeralProcess -FilePath $clientForCredential",
+        "$start.UserName = $script:ownedEphemeralAccount.Name",
+        "$start.Domain = $env:COMPUTERNAME",
+        "$start.Password = $script:ephemeralPassword",
+        "$start.LoadUserProfile = $false",
+        "$start.WorkingDirectory = [IO.Path]::GetFullPath($machineTarget)",
+        "$start.Environment.Clear()",
+        "RunEphemeralIdentityProbe",
+        "RunEphemeralFullControlProbe",
+        "RunEphemeralStalledProbe",
+        "$current.User.Value -ceq $ExpectedSid",
+        "$expectedRid -ge 1000",
+        "Add-LocalGroupMember -SID $standardUsersSid -Member $sid",
+        "Assert-True (-not $stalledProcess.HasExited)",
+        "Disable-LocalUser -SID $state.Sid",
+        "Remove-LocalUser -SID $state.Sid",
+        "$script:ownedEphemeralAccount = $null",
+        "Assert-NoEphemeralProfileRegistration",
+        "foreign-cleanup-marker",
+        "expected-post-create-pre-enable-failure",
+        "Test-EphemeralProcessOwnershipBoundary",
+        "Release-ExitedEphemeralProcess",
+        "Refusing to release credentialed process ownership before exit is positively confirmed.",
+        "Failed credential-process release discarded exact ownership.",
+        "Credentialed process termination remained uncertain after kill.",
+        "Refusing account cleanup while its exact credentialed process may still be active.",
     ] {
         assert!(
             transport_test.contains(required),
             "SCM transport harness lost {required:?}"
         );
     }
+    for forbidden in [
+        "-Sid $identity.User.Value",
+        "New-ProtectedPolicy -Sid $runnerSid",
+        "Remove-LocalUser -Name",
+        "ConvertFrom-SecureString",
+        "SecureStringToBSTR",
+        "PasswordInClearText",
+        "RunImpersonated",
+        "ArgumentList.Add($script:ephemeralPassword",
+        "Environment['PASSWORD']",
+        "Write-Output $script:ephemeralPassword",
+        "WriteAllText($script:ephemeralPassword",
+    ] {
+        assert!(
+            !transport_test.contains(forbidden),
+            "SCM transport harness gained forbidden credential behavior {forbidden:?}"
+        );
+    }
+    let non_elevated_return = transport_test
+        .find("if (-not $isElevated)")
+        .expect("SCM transport harness keeps its non-elevated return");
+    let ephemeral_account_creation = transport_test
+        .find("$ephemeralAccount = New-EphemeralStandardAccount")
+        .expect("SCM transport harness creates its ephemeral account");
+    assert!(
+        non_elevated_return < ephemeral_account_creation,
+        "SCM transport harness creates persistent account state before its non-elevated return"
+    );
     for required in [
         "[string]$AuthorizedClientSid",
         "[string]$InvocationNonce",
