@@ -1644,6 +1644,8 @@ fn windows_gpu_pack_promotion_keeps_candidate_and_signing_authority_separate() {
         "FromSeconds(4)",
         "$stopProof = [Diagnostics.Stopwatch]::StartNew()",
         "$stopProof.Elapsed.TotalMilliseconds -lt 4500",
+        "$stalledClientRights -eq 0x00100183",
+        "[IO.Pipes.PipeAccessRights]::Synchronize",
         "WaitForConnectionAsync",
         "The client sent request bytes before authenticating the service",
         "same-name user-process pipe server as rejected authentication",

@@ -245,12 +245,21 @@ try {
     $start = Invoke-Sc -Arguments @('start', $serviceName) -AllowFailure
     Assert-True ($start.ExitCode -eq 0) "SCM rejected the first service start: $($start.Stderr)"
     (Get-Service -Name $serviceName).WaitForStatus([System.ServiceProcess.ServiceControllerStatus]::Running, [TimeSpan]::FromSeconds(10))
+    $stalledClientRights = [IO.Pipes.PipeAccessRights](
+        [uint32][IO.Pipes.PipeAccessRights]::ReadData -bor
+        [uint32][IO.Pipes.PipeAccessRights]::WriteData -bor
+        [uint32][IO.Pipes.PipeAccessRights]::ReadAttributes -bor
+        [uint32][IO.Pipes.PipeAccessRights]::WriteAttributes -bor
+        [uint32][IO.Pipes.PipeAccessRights]::Synchronize
+    )
+    Assert-True ([uint32]$stalledClientRights -eq 0x00100183) 'The stalled-client probe no longer requests the production client access mask.'
     $stalled = [IO.Pipes.NamedPipeClientStream]::new(
         '.',
         $pipeName,
-        [IO.Pipes.PipeDirection]::InOut,
+        $stalledClientRights,
         [IO.Pipes.PipeOptions]::Asynchronous,
-        [Security.Principal.TokenImpersonationLevel]::Identification
+        [Security.Principal.TokenImpersonationLevel]::Identification,
+        [IO.HandleInheritability]::None
     )
     try {
         $stopProof = [Diagnostics.Stopwatch]::StartNew()
