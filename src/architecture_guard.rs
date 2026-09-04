@@ -1414,6 +1414,9 @@ fn windows_gpu_pack_promotion_keeps_candidate_and_signing_authority_separate() {
     let broker_client = include_str!("../tools/windows-gpu-promotion-broker/src/main.rs");
     let broker_contract = include_str!("../tools/windows-gpu-promotion-broker/src/lib.rs");
     let broker_protocol = include_str!("../tools/windows-gpu-promotion-broker/src/protocol.rs");
+    let (broker_protocol_production, _) = broker_protocol
+        .split_once("#[cfg(test)]")
+        .expect("broker protocol must keep tests behind a production boundary");
     let broker_native = include_str!("../tools/windows-gpu-promotion-broker/src/windows_native.rs");
     let broker_service = include_str!(
         "../tools/windows-gpu-promotion-broker/src/bin/scribe-windows-gpu-promotion-service.rs"
@@ -1570,7 +1573,7 @@ fn windows_gpu_pack_promotion_keeps_candidate_and_signing_authority_separate() {
         "ledger_root",
     ] {
         assert!(
-            !broker_protocol.contains(forbidden),
+            !broker_protocol_production.contains(forbidden),
             "broker wire contract gained local path or authority field {forbidden:?}"
         );
     }
@@ -1636,6 +1639,9 @@ fn windows_gpu_pack_promotion_keeps_candidate_and_signing_authority_separate() {
         "restricted",
         "$sidTypeMatches.Count -eq 1",
         "Groups['value'].Value -ceq 'RESTRICTED'",
+        "$primaryFailure",
+        "$cleanupFailures",
+        "$safeToRemoveMachineTarget",
         "NT AUTHORITY\\LocalService",
         "SetAccessRuleProtection",
         "S-1-5-32-544",

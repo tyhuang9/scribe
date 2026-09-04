@@ -14,6 +14,9 @@ $targetRoot = Join-Path ([IO.Path]::GetTempPath()) "scribe-gpu-broker-transport-
 $previousCargoTarget = [Environment]::GetEnvironmentVariable('CARGO_TARGET_DIR', 'Process')
 $createdService = $false
 $machineTarget = $null
+$primaryFailure = $null
+$cleanupFailures = [Collections.Generic.List[object]]::new()
+$safeToRemoveMachineTarget = $false
 
 function Assert-True([bool]$Condition, [string]$Message) {
     if (-not $Condition) { throw $Message }
@@ -290,36 +293,63 @@ try {
     (Get-Service -Name $serviceName).WaitForStatus([System.ServiceProcess.ServiceControllerStatus]::Stopped, [TimeSpan]::FromSeconds(10))
     Write-Output 'Windows GPU broker transport contract tests passed.'
 }
+catch { $primaryFailure = $_ }
 finally {
-    if ($createdService) {
-        $existing = Get-BrokerService
-        if ($null -ne $existing) {
-            [void](Assert-OwnedBrokerService -ExpectedPath $serviceForScm)
-            if ($existing.Status -ne [System.ServiceProcess.ServiceControllerStatus]::Stopped) {
-                Invoke-Sc -Arguments @('stop', $serviceName) -AllowFailure | Out-Null
-                (Get-Service -Name $serviceName).WaitForStatus([System.ServiceProcess.ServiceControllerStatus]::Stopped, [TimeSpan]::FromSeconds(10))
+    try {
+        if ($createdService) {
+            $existing = Get-BrokerService
+            if ($null -ne $existing) {
+                [void](Assert-OwnedBrokerService -ExpectedPath $serviceForScm)
+                if ($existing.Status -ne [System.ServiceProcess.ServiceControllerStatus]::Stopped) {
+                    $cleanupStop = Invoke-Sc -Arguments @('stop', $serviceName) -AllowFailure
+                    Assert-True ($cleanupStop.ExitCode -eq 0) "SCM rejected cleanup stop: $($cleanupStop.Stderr)"
+                    (Get-Service -Name $serviceName).WaitForStatus([System.ServiceProcess.ServiceControllerStatus]::Stopped, [TimeSpan]::FromSeconds(10))
+                }
+                [void](Assert-OwnedBrokerService -ExpectedPath $serviceForScm)
+                $cleanupDelete = Invoke-Sc -Arguments @('delete', $serviceName) -AllowFailure
+                Assert-True ($cleanupDelete.ExitCode -eq 0) "SCM rejected cleanup delete: $($cleanupDelete.Stderr)"
             }
-            [void](Assert-OwnedBrokerService -ExpectedPath $serviceForScm)
-            Invoke-Sc -Arguments @('delete', $serviceName) -AllowFailure | Out-Null
+            Wait-ServiceAbsent -TimeoutSeconds 10
         }
-        Wait-ServiceAbsent -TimeoutSeconds 10
+        $safeToRemoveMachineTarget = $true
     }
-    if ($null -ne $machineTarget) {
-        $resolvedCommonAppData = [IO.Path]::GetFullPath([Environment]::GetFolderPath([Environment+SpecialFolder]::CommonApplicationData)).TrimEnd('\') + '\'
-        $resolvedMachineTarget = [IO.Path]::GetFullPath($machineTarget)
-        if ($resolvedMachineTarget.StartsWith($resolvedCommonAppData, [StringComparison]::OrdinalIgnoreCase) -and
-            [IO.Path]::GetFileName($resolvedMachineTarget).StartsWith('scribe-gpu-broker-transport-', [StringComparison]::Ordinal)) {
-            $machineItem = Get-Item -LiteralPath $resolvedMachineTarget -Force -ErrorAction SilentlyContinue
-            if ($null -ne $machineItem -and ($machineItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) {
-                Remove-Item -LiteralPath $resolvedMachineTarget -Recurse -Force -ErrorAction SilentlyContinue
+    catch { [void]$cleanupFailures.Add($_) }
+
+    try {
+        if ($safeToRemoveMachineTarget -and $null -ne $machineTarget) {
+            $resolvedCommonAppData = [IO.Path]::GetFullPath([Environment]::GetFolderPath([Environment+SpecialFolder]::CommonApplicationData)).TrimEnd('\') + '\'
+            $resolvedMachineTarget = [IO.Path]::GetFullPath($machineTarget)
+            if ($resolvedMachineTarget.StartsWith($resolvedCommonAppData, [StringComparison]::OrdinalIgnoreCase) -and
+                [IO.Path]::GetFileName($resolvedMachineTarget).StartsWith('scribe-gpu-broker-transport-', [StringComparison]::Ordinal)) {
+                $machineItem = Get-Item -LiteralPath $resolvedMachineTarget -Force -ErrorAction SilentlyContinue
+                if ($null -ne $machineItem -and ($machineItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) {
+                    Remove-Item -LiteralPath $resolvedMachineTarget -Recurse -Force -ErrorAction SilentlyContinue
+                }
             }
         }
     }
-    [Environment]::SetEnvironmentVariable('CARGO_TARGET_DIR', $previousCargoTarget, 'Process')
-    $resolvedTemp = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\') + '\'
-    $resolvedTarget = [IO.Path]::GetFullPath($targetRoot)
-    if ($resolvedTarget.StartsWith($resolvedTemp, [StringComparison]::OrdinalIgnoreCase) -and
-        [IO.Path]::GetFileName($resolvedTarget).StartsWith('scribe-gpu-broker-transport-', [StringComparison]::Ordinal)) {
-        Remove-Item -LiteralPath $resolvedTarget -Recurse -Force -ErrorAction SilentlyContinue
+    catch { [void]$cleanupFailures.Add($_) }
+
+    try { [Environment]::SetEnvironmentVariable('CARGO_TARGET_DIR', $previousCargoTarget, 'Process') }
+    catch { [void]$cleanupFailures.Add($_) }
+
+    try {
+        $resolvedTemp = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\') + '\'
+        $resolvedTarget = [IO.Path]::GetFullPath($targetRoot)
+        if ($resolvedTarget.StartsWith($resolvedTemp, [StringComparison]::OrdinalIgnoreCase) -and
+            [IO.Path]::GetFileName($resolvedTarget).StartsWith('scribe-gpu-broker-transport-', [StringComparison]::Ordinal)) {
+            Remove-Item -LiteralPath $resolvedTarget -Recurse -Force -ErrorAction SilentlyContinue
+        }
     }
+    catch { [void]$cleanupFailures.Add($_) }
+}
+
+if ($null -ne $primaryFailure) {
+    foreach ($cleanupFailure in $cleanupFailures) {
+        Write-Warning "Non-destructive broker test cleanup was incomplete: $($cleanupFailure.Exception.Message)"
+    }
+    throw $primaryFailure
+}
+if ($cleanupFailures.Count -gt 0) {
+    throw $cleanupFailures[0]
 }
