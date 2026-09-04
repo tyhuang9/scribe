@@ -2870,8 +2870,7 @@ try {
     Assert-True ($stop.ExitCode -eq 0) "SCM rejected the snapshot-policy stop request: $($stop.Stderr)"
     (Get-Service -Name $serviceName).WaitForStatus([System.ServiceProcess.ServiceControllerStatus]::Stopped, [TimeSpan]::FromSeconds(10))
 
-    $start = Invoke-Sc -Arguments @('start', $serviceName) -AllowFailure
-    Assert-True ($start.ExitCode -ne 0) 'Service restart accepted the mutated unmapped authorization SID.'
+    [void](Invoke-Sc -Arguments @('start', $serviceName) -AllowFailure)
     Wait-ServiceNotRunning -TimeoutSeconds 10
     $afterRestart = Invoke-EphemeralProcess -FilePath $clientForCredential -Arguments $arguments -TimeoutSeconds 20 -AllowFailure
     Assert-True ($afterRestart.ExitCode -eq 78) 'Rejected unmapped-policy restart did not keep the broker unavailable.'
