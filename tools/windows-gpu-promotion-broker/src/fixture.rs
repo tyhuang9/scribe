@@ -770,6 +770,7 @@ fn validate_manifest(manifest: &PackManifest, request: &PromotionRequest) -> Res
         || manifest.target_arch != "x86_64"
         || manifest.pack_version != request.pack_version
         || manifest.security_epoch < request.minimum_security_epoch
+        || manifest.worker_path != "bin/scribe-inference-worker.exe"
         || manifest.payload.is_empty()
         || manifest.payload.len() > MAX_FILES
     {
@@ -782,7 +783,12 @@ fn validate_manifest(manifest: &PackManifest, request: &PromotionRequest) -> Res
         Backend::Cuda => "transcribe-cpp-ggml-cuda",
         Backend::Vulkan => "transcribe-cpp-ggml-vulkan",
     };
-    if manifest.provider != expected_provider
+    let expected_pack_id = match manifest.backend {
+        Backend::Cuda => "scribe-cuda-windows-x64",
+        Backend::Vulkan => "scribe-vulkan-windows-x64",
+    };
+    if manifest.pack_id != expected_pack_id
+        || manifest.provider != expected_provider
         || manifest.app_build != format!("local-transcriber@0.1.0#{}", request.source_revision)
         || manifest.worker_build
             != format!("scribe-inference-worker@0.1.0#{}", request.source_revision)
@@ -1919,7 +1925,7 @@ mod tests {
         };
         let mut manifest = PackManifest {
             schema_version: 1,
-            pack_id: format!("windows-x86_64-{backend_name}"),
+            pack_id: format!("scribe-{backend_name}-windows-x64"),
             pack_version: "0.1.0".to_owned(),
             pack_digest: "0".repeat(64),
             security_epoch: epoch,
