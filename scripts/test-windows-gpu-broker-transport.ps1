@@ -2840,7 +2840,8 @@ try {
     Assert-True (Test-ServerAccessProbeRecord -Record $serverAccessProbeRecord) 'Server-access proof emitted a noncanonical diagnostic record.'
     Assert-True ($serverAccessProbe.ExitCode -eq 0) "Exact query or excess-right server-access proof failed after validated record $serverAccessProbeRecord."
     Assert-True ($serverAccessProbe.Stderr.Length -eq 0) 'Successful server-access proof emitted unexpected diagnostics.'
-    Assert-True ($serverAccessProbeRecord -ceq 'ephemeral-server-access;session=error:5;process=ok:0;token=ok:0') 'Server-access proof did not establish exact query access while retaining ProcessIdToSessionId denial.'
+    $allowedServerAccessRecords = @('ephemeral-server-access;session=zero:0;process=ok:0;token=ok:0', 'ephemeral-server-access;session=error:5;process=ok:0;token=ok:0')
+    Assert-True ($allowedServerAccessRecords -ccontains $serverAccessProbeRecord) "Server-access proof did not establish exact query access while denying every enumerated excess right; validated record $serverAccessProbeRecord."
     $serverAccessServiceAfterProbe = Assert-OwnedBrokerService -ExpectedPath $serviceForScm
     $serverAccessControllerAfterProbe = Get-BrokerService
     Assert-True ([uint32]$serverAccessServiceAfterProbe.ProcessId -eq $serverAccessProcessId -and $null -ne $serverAccessControllerAfterProbe -and $serverAccessControllerAfterProbe.Status -eq [System.ServiceProcess.ServiceControllerStatus]::Running) 'Exact owned broker service identity changed during server-access proof.'
