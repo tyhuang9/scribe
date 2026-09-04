@@ -1458,6 +1458,7 @@ fn windows_gpu_pack_promotion_keeps_candidate_and_signing_authority_separate() {
         "scribe-gpu-pack-signer-ephemeral",
         "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
         "digest-mismatch: error",
+        "cargo fetch --locked --manifest-path tools/worker-pack-author/Cargo.toml",
         "steps.upload.outputs.artifact-id",
         "steps.upload.outputs.artifact-digest",
         "SCRIBE_WINDOWS_GPU_TRUSTED_SIGNER_SHA256",

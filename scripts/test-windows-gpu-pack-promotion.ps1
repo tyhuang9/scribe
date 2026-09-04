@@ -200,6 +200,7 @@ try {
     Assert-True ($workflow.Contains('environment: windows-gpu-pack-signing')) 'Protected environment gate is missing.'
     Assert-True ($workflow.Contains('steps.upload.outputs.artifact-digest')) 'Unsigned artifact digest is not bound across jobs.'
     Assert-True ($workflow.Contains('steps.upload.outputs.artifact-id')) 'Unsigned artifact ID is not bound across jobs.'
+    Assert-True ($workflow.Contains('cargo fetch --locked --manifest-path tools/worker-pack-author/Cargo.toml')) 'Clean hosted runners do not fetch the locked worker-pack tool dependencies before offline testing.'
     Assert-True ($workflow.Contains('github.event.repository.default_branch')) 'Production dispatch is not restricted to the default branch.'
     Assert-True ($protected.Contains('SCRIBE_WINDOWS_GPU_TRUSTED_SIGNER_SHA256')) 'Protected signer digest is not independently configured.'
     Assert-True ($protected.Contains('actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c')) 'Protected artifact download is not pinned to the reviewed v8.0.1 action.'
