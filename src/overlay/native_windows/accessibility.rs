@@ -713,7 +713,7 @@ mod tests {
         assert_eq!(elapsed.name(), Some("Elapsed time 01:05"));
         assert_eq!(
             elapsed.bounds(),
-            Some(Rect::new(90.0, 24.625, 150.0, 53.375))
+            Some(Rect::new(95.0, 24.625, 155.0, 53.375))
         );
         assert!(tree.nodes.iter().all(|(_, node)| node.live().is_none()));
     }

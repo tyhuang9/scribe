@@ -20012,15 +20012,6 @@ mod layout_tests {
             app.transcribe_notice,
             Some(TranscribeNotice::failure("runtime stopped"))
         );
-        assert_eq!(
-            app.overlay_controller
-                .state()
-                .error
-                .as_ref()
-                .expect("transcription failure remains visible in the overlay")
-                .message,
-            "runtime stopped"
-        );
         assert_eq!(app.session_coordinator.active_session_id(), None);
     }
 

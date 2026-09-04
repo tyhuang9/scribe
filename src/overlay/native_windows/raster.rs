@@ -2184,12 +2184,13 @@ mod tests {
     }
 
     #[test]
-    fn compact_shell_ignores_audio_and_transcript_but_visibly_replaces_timer_on_error() {
+    fn compact_shell_uses_audio_but_ignores_transcript_and_replaces_timer_on_error() {
         let normal = state(OverlayMode::Minimal);
-        let mut changed_hidden_state = normal.clone();
-        changed_hidden_state.audio_level = OverlayAudioLevel::new(0.0, 1.0);
-        changed_hidden_state.transcript.committed = "must stay out of compact".to_owned();
-        changed_hidden_state.transcript.tentative = "including estimates".to_owned();
+        let mut changed_transcript = normal.clone();
+        changed_transcript.transcript.committed = "must stay out of compact".to_owned();
+        changed_transcript.transcript.tentative = "including estimates".to_owned();
+        let mut changed_audio = normal.clone();
+        changed_audio.audio_level = OverlayAudioLevel::new(0.0, 1.0);
         let mut failed = normal.clone();
         failed.phase = OverlayPhase::Error;
         failed.error = Some(super::super::super::controller::OverlayError {
@@ -2205,13 +2206,25 @@ mod tests {
                 normal,
                 rasterizer
                     .render_display(
-                        &changed_hidden_state,
+                        &changed_transcript,
                         true,
                         MINIMAL_WIDTH as i32,
                         LIVE_HEIGHT as i32,
                     )
                     .unwrap(),
-                "compact must not paint the old input meter or transcript content"
+                "compact must not paint transcript content"
+            );
+            assert_ne!(
+                normal,
+                rasterizer
+                    .render_display(
+                        &changed_audio,
+                        true,
+                        MINIMAL_WIDTH as i32,
+                        LIVE_HEIGHT as i32,
+                    )
+                    .unwrap(),
+                "compact must paint microphone activity while listening"
             );
             assert_ne!(
                 normal,
