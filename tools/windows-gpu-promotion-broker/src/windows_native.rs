@@ -3,7 +3,7 @@ use std::fmt::{Display, Formatter};
 use std::mem::{size_of, zeroed};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
 
 use anyhow::{Context, Result, anyhow, bail};
 use windows_sys::Win32::Foundation::{
@@ -77,6 +77,7 @@ const PIPE_SDDL: &str = concat!(
 
 static SERVICE_STOP_EVENT: AtomicIsize = AtomicIsize::new(0);
 static SERVICE_STATUS_HANDLE_VALUE: AtomicIsize = AtomicIsize::new(0);
+static SERVICE_CONTROL_STATUS_ERROR: AtomicU32 = AtomicU32::new(ERROR_SUCCESS);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ClientTransportError {
@@ -168,7 +169,6 @@ pub fn request_promotion(
         encode_ack_frame(&ack, &request, &response).map_err(|_| ClientTransportError::Protocol)?;
     write_message(pipe.raw(), &ack_frame, None, IO_TIMEOUT_MS)
         .map_err(|_| ClientTransportError::Io)?;
-    revalidate_server(pipe.raw(), &server).map_err(|_| ClientTransportError::Authentication)?;
     Ok(response)
 }
 
@@ -206,6 +206,7 @@ unsafe extern "system" fn service_main(argument_count: u32, _arguments: *mut *mu
 }
 
 fn service_main_inner(argument_count: u32) {
+    SERVICE_CONTROL_STATUS_ERROR.store(ERROR_SUCCESS, Ordering::Release);
     let service_name = wide(SERVICE_NAME);
     let status_handle = unsafe {
         RegisterServiceCtrlHandlerExW(service_name.as_ptr(), Some(service_control_handler), null())
@@ -221,8 +222,16 @@ fn service_main_inner(argument_count: u32) {
     }
 
     let result = run_service(argument_count);
+    let control_status_error = SERVICE_CONTROL_STATUS_ERROR.swap(ERROR_SUCCESS, Ordering::AcqRel);
+    let exit_code = if control_status_error != ERROR_SUCCESS {
+        control_status_error
+    } else if result.is_ok() {
+        0
+    } else {
+        1
+    };
 
-    report_stopped(if result.is_ok() { 0 } else { 1 });
+    report_stopped(exit_code);
     SERVICE_STATUS_HANDLE_VALUE.store(0, Ordering::Release);
 }
 
@@ -234,19 +243,26 @@ unsafe extern "system" fn service_control_handler(
 ) -> u32 {
     match catch_unwind(AssertUnwindSafe(|| match control {
         SERVICE_CONTROL_STOP | SERVICE_CONTROL_SHUTDOWN => {
+            // Signaling the accepted stop is authoritative. A failed STOP_PENDING
+            // update must not strand the service; preserve its error for the
+            // checked terminal STOPPED update instead.
             let status_error = report_status_raw(SERVICE_STOP_PENDING, 0, 1, 5_000, 0);
             if status_error != ERROR_SUCCESS {
-                return status_error;
+                let _ = SERVICE_CONTROL_STATUS_ERROR.compare_exchange(
+                    ERROR_SUCCESS,
+                    status_error,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
             }
             let stop_event = SERVICE_STOP_EVENT.load(Ordering::Acquire) as HANDLE;
             if stop_event.is_null() {
-                return ERROR_INVALID_HANDLE;
+                std::process::abort();
             }
             if unsafe { SetEvent(stop_event) } == 0 {
-                unsafe { GetLastError() }
-            } else {
-                ERROR_SUCCESS
+                std::process::abort();
             }
+            ERROR_SUCCESS
         }
         SERVICE_CONTROL_INTERROGATE => ERROR_SUCCESS,
         _ => ERROR_CALL_NOT_IMPLEMENTED,
@@ -281,7 +297,9 @@ fn run_service(argument_count: u32) -> Result<()> {
 }
 
 fn report_stopped(exit_code: u32) {
-    let _ = report_status_raw(SERVICE_STOPPED, 0, 0, 0, exit_code);
+    if report_status_raw(SERVICE_STOPPED, 0, 0, 0, exit_code) != ERROR_SUCCESS {
+        std::process::abort();
+    }
 }
 
 fn report_status(state: u32, accepted: u32, checkpoint: u32, wait_hint: u32) -> Result<()> {
@@ -1019,11 +1037,14 @@ mod tests {
         let decode = client.find("decode_response_frame").unwrap();
         let construct_ack = client.find("BrokerAckV1::for_response").unwrap();
         let write_ack = client.find("write_message(pipe.raw(), &ack_frame").unwrap();
+        let authenticate_response = client.find("revalidate_server").unwrap();
+        assert_eq!(client.matches("revalidate_server").count(), 1);
+        assert!(authenticate_response < decode);
         assert!(decode < construct_ack && construct_ack < write_ack);
     }
 
     #[test]
-    fn service_control_errors_are_not_silently_reported_as_success() {
+    fn service_controls_signal_or_terminate_and_preserve_status_failures() {
         let source = include_str!("windows_native.rs");
         let start = source
             .find("unsafe extern \"system\" fn service_control_handler")
@@ -1032,6 +1053,38 @@ mod tests {
         let handler = &source[start..end];
         assert!(handler.contains("report_status_raw"));
         assert!(handler.contains("if unsafe { SetEvent(stop_event) } == 0"));
+        assert!(handler.contains("SERVICE_CONTROL_STATUS_ERROR.compare_exchange"));
+        assert_eq!(handler.matches("std::process::abort();").count(), 2);
         assert!(handler.contains("ERROR_CALL_NOT_IMPLEMENTED"));
+    }
+
+    #[test]
+    fn accepted_stop_is_signaled_even_when_stop_pending_cannot_be_reported() {
+        let source = include_str!("windows_native.rs");
+        let start = source
+            .find("unsafe extern \"system\" fn service_control_handler")
+            .unwrap();
+        let end = source[start..].find("\nfn run_service(").unwrap() + start;
+        let handler = &source[start..end];
+        let report_pending = handler
+            .find("report_status_raw(SERVICE_STOP_PENDING")
+            .unwrap();
+        let signal = handler.find("SetEvent(stop_event)").unwrap();
+        assert!(report_pending < signal);
+        assert!(handler.contains("ERROR_SUCCESS"));
+
+        let report_start = source.find("fn report_stopped(").unwrap();
+        let report_end = source[report_start..].find("\nfn report_status(").unwrap() + report_start;
+        let report_stopped = &source[report_start..report_end];
+        assert!(report_stopped.contains("std::process::abort();"));
+
+        let service_main_start = source.find("fn service_main_inner(").unwrap();
+        let service_main_end = source[service_main_start..]
+            .find("\nunsafe extern \"system\" fn service_control_handler")
+            .unwrap()
+            + service_main_start;
+        let service_main = &source[service_main_start..service_main_end];
+        assert!(service_main.contains("SERVICE_CONTROL_STATUS_ERROR.swap"));
+        assert!(service_main.contains("report_stopped(exit_code)"));
     }
 }

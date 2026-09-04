@@ -1640,6 +1640,8 @@ fn windows_gpu_pack_promotion_keeps_candidate_and_signing_authority_separate() {
         "ReadAndExecute",
         "refusing destructive cleanup",
         "FromSeconds(4)",
+        "$stopProof = [Diagnostics.Stopwatch]::StartNew()",
+        "$stopProof.Elapsed.TotalMilliseconds -lt 4500",
         "WaitForConnectionAsync",
         "The client sent request bytes before authenticating the service",
         "same-name user-process pipe server as rejected authentication",

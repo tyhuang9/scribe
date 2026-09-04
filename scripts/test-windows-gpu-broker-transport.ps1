@@ -241,11 +241,14 @@ try {
         [Security.Principal.TokenImpersonationLevel]::Identification
     )
     try {
+        $stopProof = [Diagnostics.Stopwatch]::StartNew()
         $stalled.Connect(5000)
         [void](Assert-OwnedBrokerService -ExpectedPath $serviceForScm)
         $stop = Invoke-Sc -Arguments @('stop', $serviceName) -AllowFailure
         Assert-True ($stop.ExitCode -eq 0) "SCM rejected the bounded-stop request: $($stop.Stderr)"
         (Get-Service -Name $serviceName).WaitForStatus([System.ServiceProcess.ServiceControllerStatus]::Stopped, [TimeSpan]::FromSeconds(4))
+        $stopProof.Stop()
+        Assert-True ($stopProof.Elapsed.TotalMilliseconds -lt 4500) 'SCM stop did not cancel the stalled broker read materially before its five-second natural timeout.'
     }
     finally { $stalled.Dispose() }
 
