@@ -342,6 +342,10 @@ finally {
         }
     }
     catch { [void]$cleanupFailures.Add($_) }
+
+    if ($null -eq $primaryFailure -and $cleanupFailures.Count -gt 0) {
+        throw $cleanupFailures[0]
+    }
 }
 
 if ($null -ne $primaryFailure) {
@@ -349,7 +353,4 @@ if ($null -ne $primaryFailure) {
         Write-Warning "Non-destructive broker test cleanup was incomplete: $($cleanupFailure.Exception.Message)"
     }
     throw $primaryFailure
-}
-if ($cleanupFailures.Count -gt 0) {
-    throw $cleanupFailures[0]
 }
