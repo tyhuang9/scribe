@@ -226,7 +226,11 @@ try {
     Assert-True (-not $protected.Contains('--private-key')) 'Protected broker client accepts a raw key path.'
     Assert-True (-not $protected.Contains('--ledger-root')) 'Ephemeral runner configures durable broker state.'
     Assert-True (-not $protected.Contains('--broker-endpoint')) 'Ephemeral runner can redirect broker authority.'
-    Assert-True ((Get-Content -LiteralPath (Join-Path $repositoryRoot 'tools\windows-gpu-promotion-broker\src\lib.rs') -Raw).Contains('self.workflow_source_sha != self.source_revision')) 'Broker contract does not bind workflow source to default-branch pack source.'
+    $brokerContract = Get-Content -LiteralPath (Join-Path $repositoryRoot 'tools\windows-gpu-promotion-broker\src\lib.rs') -Raw
+    Assert-True ($brokerContract.Contains('pub struct PromotionIntent')) 'Broker contract lost its path-free promotion intent.'
+    Assert-True ($brokerContract.Contains('pub struct ClientInvocation')) 'Broker contract lost its process-local invocation wrapper.'
+    Assert-True ($brokerContract.Contains('self.workflow_source_sha != self.source_revision')) 'Broker intent does not bind workflow source to default-branch pack source.'
+    Assert-True ($brokerContract.Contains('scribe-windows-gpu-promotion-intent-v1')) 'Broker intent digest is not domain separated.'
     Assert-True ((Get-Content -LiteralPath (Join-Path $repositoryRoot 'tools\windows-gpu-promotion-broker\src\fixture.rs') -Raw).Contains('consumes_canonical_handoff_generated_by_powershell_and_worker_pack_author')) 'Broker proof does not consume the PowerShell/worker-pack-author interoperability fixture.'
 
     if (-not [string]::IsNullOrWhiteSpace($InteropFixtureDirectory)) {
@@ -242,10 +246,9 @@ try {
         $interopCuda = New-PreparedPack $tool (Join-Path $interopHandoffRoot 'cuda') 'Cuda'
         $interopVulkan = New-PreparedPack $tool (Join-Path $interopHandoffRoot 'vulkan') 'Vulkan'
         $interopHandoff = Write-Handoff $interopHandoffRoot $interopCuda $interopVulkan $revision $toolchainDigest
-        $interopRequest = [ordered]@{
+        $interopIntent = [ordered]@{
             schema_version = 1
-            handoff_root = $interopHandoffRoot
-            output_root = (Join-Path $interopPublication 'interop-release')
+            policy_namespace = 'scribe-windows-gpu-production-v1'
             source_repository = 'tyhuang9/scribe'
             source_ref = 'refs/heads/main'
             source_revision = $revision
@@ -263,8 +266,8 @@ try {
             require_unused_release_set = $true
         }
         [IO.File]::WriteAllText(
-            (Join-Path $interopFixture 'promotion-request.json'),
-            ($interopRequest | ConvertTo-Json -Depth 8 -Compress),
+            (Join-Path $interopFixture 'promotion-intent.json'),
+            ($interopIntent | ConvertTo-Json -Depth 8 -Compress),
             [Text.UTF8Encoding]::new($false)
         )
     }

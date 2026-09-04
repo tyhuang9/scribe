@@ -60,6 +60,18 @@ returns an artifact ID and digest; the digest-pinned download action validates
 the transfer before the protected boundary, and the future privileged broker
 must bind both values as part of its authorization context.
 
+The serializable authority message is a canonical, path-free
+`PromotionIntent`. It includes the fixed `scribe-windows-gpu-production-v1`
+policy namespace and the complete provenance, artifact, digest, pack-version,
+minimum-security-epoch, and mandatory replay-rejection policy. Its identity is
+the domain-separated SHA-256 of those exact canonical bytes. Intake and local
+publication paths remain only in a non-serializable client invocation wrapper;
+changing either path cannot change replay identity. The legacy `--handoff-root`
+and `--output-root` flags remain accepted, but neither value may cross the
+future authority boundary. In the fixture, `--output-root` is only a local
+publication parent and the broker derives both `.staging-<release-set-digest>`
+and `<release-set-digest>` itself.
+
 The protected job requires approval through the
 `windows-gpu-pack-signing` environment and a fresh
 `scribe-gpu-pack-signer-ephemeral` runner using Actions Runner 2.327.1 or later
@@ -81,8 +93,8 @@ resulting artifact is not activated or included in the normal release
 automatically.
 
 The independently locked `tools/windows-gpu-promotion-broker` workspace defines
-the exact request schema and a test-only hostile-input state-machine proof. Its
-fixture implementation uses retained no-write/delete file handles, no-follow
+the exact intent/invocation schema and a test-only hostile-input state-machine
+proof. Its fixture implementation uses retained no-write/delete file handles, no-follow
 final opens, exact bounded inventories, a domain-separated signed receipt, a
 hash-chained reserve/ready/published ledger, and write-through atomic pair
 publication. The fixture seed and ledger code are compiled only under
@@ -90,6 +102,14 @@ publication. The fixture seed and ledger code are compiled only under
 provide a stable handle-relative traversal API through Rust's standard library;
 because this proof cannot establish service ACLs or full NT handle-relative
 traversal, it is not production authority.
+
+The fixture receipt and ledger are schema/domain v2. Receipts embed the complete
+path-free intent plus its recomputed intent digest; ledger transitions bind only
+that digest and the validated release-set digest, with staging/output names
+derived during use and recovery. This test-only ledger is initialized fresh. A
+real v2 broker migration must preserve all earlier used-release reservations and
+security-epoch high-water marks; no production migration is implemented in this
+stage.
 
 The checked-in client intentionally attempts no IPC. Connecting it to a fixed,
 authenticated service/HSM endpoint and provisioning that service are separate

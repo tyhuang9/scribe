@@ -271,6 +271,16 @@ artifact ID and digest; the digest-pinned `download-artifact` action validates
 that artifact in the protected job, and both values are also passed through the
 unprivileged client as approval inputs for the future privileged broker.
 
+The serializable broker input is the canonical path-free `PromotionIntent`.
+It carries the fixed `scribe-windows-gpu-production-v1` policy namespace and
+the complete provenance, artifact, digest, version, epoch, and replay-policy
+fields. A domain-separated SHA-256 identifies those exact canonical bytes.
+Local handoff/publication paths live only in a non-serializable
+`ClientInvocation`; identical intent metadata produces identical bytes and
+digest regardless of those paths. The fixture treats `--output-root` only as a
+local publication parent and derives `.staging-<release-set-digest>` and
+`<release-set-digest>` without accepting a caller-selected output name.
+
 The protected job has no source checkout, compiler, repository script, or raw
 private-key secret. It requires the `windows-gpu-pack-signing` environment and
 an ephemeral `scribe-gpu-pack-signer-ephemeral` runner containing a separately
@@ -282,8 +292,9 @@ denies direct leaf write/delete from client hashing through child exit. This
 narrows one replacement window; it does not provide a no-follow leaf open, pin
 ancestor handles, prove the installation DACL, or constrain future loader
 dependencies, so it does not close the complete hash-to-exec path. The client
-accepts only the canonical promotion request; it has no key, ledger/state path,
-configurable authority endpoint, or fixture flag.
+accepts only the canonical promotion intent plus process-local invocation
+paths; it has no key, ledger/state path, configurable authority endpoint, or
+fixture flag.
 
 A separately privileged Windows service or remote HSM broker—not the ephemeral
 runner identity—must own the production key and independently durable replay
@@ -297,6 +308,14 @@ only after both copies validate, a domain-separated signed receipt, a chained
 reserve/ready/published ledger, fault recovery, replay rejection, and
 write-through atomic publication. The fixture seed and ledger implementation
 are behind `cfg(test)` and do not compile into the normal client.
+
+The receipt and ledger deliberately moved to incompatible v2 schemas/domains.
+Every receipt embeds the complete path-free intent and its recomputed digest;
+the ledger stores the intent digest but no staging/output name or local path.
+Recovery revalidates the lowercase release-set digest and derives both names.
+The fixture ledger starts fresh because it is test-only. A production v2
+migration must retain all v1 used-release reservations and security-epoch
+high-water marks, and remains deferred until the privileged broker exists.
 
 This test proof still uses path-based enumeration before retained final opens;
 it does not prove full NT handle-relative traversal, service ACL enforcement,
