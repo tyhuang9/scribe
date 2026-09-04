@@ -9,6 +9,81 @@ const PRIMARY_TARGET_HEIGHT: f32 = 44.0;
 const COMPACT_BUTTON_HEIGHT: f32 = 32.0;
 const KEYCAP_HORIZONTAL_PADDING: f32 = 7.0;
 const KEYCAP_VERTICAL_PADDING: f32 = 7.0;
+const FOCUS_VISIBLE_STATE_ID: &str = "focus-visible-state";
+
+#[derive(Clone, Copy, Debug)]
+struct FocusVisibleState {
+    visible: bool,
+    focus_at_frame_start: Option<egui::Id>,
+    pointer_pressed: bool,
+}
+
+/// Tracks whether keyboard focus should be visually emphasized this frame.
+///
+/// egui retains semantic focus while a native viewport is inactive. Keeping
+/// the ring hidden until keyboard/accessibility input or a real focus change
+/// prevents retained pointer focus from looking newly selected on activation.
+pub(crate) fn update_focus_visible_state(ctx: &egui::Context) {
+    let state_id = egui::Id::new(FOCUS_VISIBLE_STATE_ID);
+    let focus_at_frame_start = ctx.memory(|memory| memory.focused());
+    let previous = ctx.data(|data| data.get_temp::<FocusVisibleState>(state_id));
+    let mut state = previous.unwrap_or(FocusVisibleState {
+        visible: true,
+        focus_at_frame_start,
+        pointer_pressed: false,
+    });
+
+    if state.focus_at_frame_start != focus_at_frame_start && !state.pointer_pressed {
+        state.visible = true;
+    }
+    state.focus_at_frame_start = focus_at_frame_start;
+    state.pointer_pressed = false;
+
+    let (keyboard_or_accessibility, pointer_pressed, reactivated) = ctx.input(|input| {
+        let mut keyboard_or_accessibility = false;
+        let mut pointer_pressed = false;
+        let mut reactivated = false;
+        for event in &input.events {
+            match event {
+                egui::Event::Key { pressed: true, .. } | egui::Event::Text(_) => {
+                    keyboard_or_accessibility = true
+                }
+                egui::Event::AccessKitActionRequest(request)
+                    if request.action == egui::accesskit::Action::Focus =>
+                {
+                    keyboard_or_accessibility = true;
+                }
+                egui::Event::PointerButton { pressed: true, .. } => pointer_pressed = true,
+                egui::Event::WindowFocused(true) => reactivated = true,
+                _ => {}
+            }
+        }
+        (keyboard_or_accessibility, pointer_pressed, reactivated)
+    });
+
+    if keyboard_or_accessibility {
+        state.visible = true;
+    } else if pointer_pressed {
+        state.visible = false;
+        state.pointer_pressed = true;
+    } else if reactivated {
+        state.visible = false;
+    }
+
+    ctx.data_mut(|data| data.insert_temp(state_id, state));
+}
+
+fn focus_ring_visible(ctx: &egui::Context) -> bool {
+    let state =
+        ctx.data(|data| data.get_temp::<FocusVisibleState>(egui::Id::new(FOCUS_VISIBLE_STATE_ID)));
+    state
+        .map(|state| {
+            state.visible
+                || (!state.pointer_pressed
+                    && ctx.memory(|memory| memory.focused()) != state.focus_at_frame_start)
+        })
+        .unwrap_or(true)
+}
 
 pub(crate) fn minimum_primary_target_height() -> f32 {
     PRIMARY_TARGET_HEIGHT
@@ -100,7 +175,7 @@ pub(crate) fn button(
 }
 
 pub(crate) fn focus_tooltip(ui: &Ui, response: &Response, text: &str) {
-    if response.has_focus() {
+    if response.has_focus() && focus_ring_visible(ui.ctx()) {
         egui::show_tooltip_for(
             ui.ctx(),
             response.id.with("focus-tooltip"),
@@ -113,7 +188,7 @@ pub(crate) fn focus_tooltip(ui: &Ui, response: &Response, text: &str) {
 }
 
 pub(crate) fn paint_focus_ring(ui: &Ui, response: &Response, rounding: Rounding) {
-    if response.has_focus() {
+    if response.has_focus() && focus_ring_visible(ui.ctx()) {
         let contrast_color = if ui.visuals().dark_mode {
             egui::Color32::WHITE
         } else {
@@ -321,7 +396,7 @@ pub(crate) fn search_field(
         builder.set_name(accessible_name);
         builder.set_description(description);
     });
-    if input.has_focus() {
+    if input.has_focus() && focus_ring_visible(ui.ctx()) {
         ui.painter().rect_stroke(
             surface_rect.shrink(1.0),
             Rounding::same(5.0),
@@ -558,6 +633,205 @@ mod tests {
                 egui::epaint::Shape::Rect(rect) if rect.stroke.width == 1.0
             )));
         }
+    }
+
+    #[test]
+    fn retained_focus_does_not_show_a_ring_when_the_viewport_reactivates() {
+        let ctx = egui::Context::default();
+        let retained_id = egui::Id::new("retained-pointer-focus");
+        let _ = ctx.run(
+            egui::RawInput {
+                focused: true,
+                ..Default::default()
+            },
+            |ctx| {
+                update_focus_visible_state(ctx);
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let (rect, _) = ui.allocate_exact_size(Vec2::new(44.0, 44.0), Sense::hover());
+                    ui.interact(rect, retained_id, Sense::click())
+                        .request_focus();
+                });
+            },
+        );
+        assert_eq!(ctx.memory(|memory| memory.focused()), Some(retained_id));
+
+        let mut retained_focus = false;
+        let output = ctx.run(
+            egui::RawInput {
+                focused: true,
+                events: vec![egui::Event::WindowFocused(true)],
+                ..Default::default()
+            },
+            |ctx| {
+                update_focus_visible_state(ctx);
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let (rect, _) = ui.allocate_exact_size(Vec2::new(44.0, 44.0), Sense::hover());
+                    let response = ui.interact(rect, retained_id, Sense::click());
+                    retained_focus = response.has_focus();
+                    paint_focus_ring(ui, &response, Rounding::same(5.0));
+                });
+            },
+        );
+
+        assert!(retained_focus);
+        assert!(!output.shapes.iter().any(|shape| matches!(
+            shape.shape,
+            egui::epaint::Shape::Rect(rect) if rect.stroke.width == 3.0
+        )));
+    }
+
+    #[test]
+    fn pointer_interaction_hides_focus_ring_without_clearing_semantic_focus() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::PointerButton {
+                    pos: egui::Pos2::ZERO,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::default(),
+                }],
+                ..Default::default()
+            },
+            update_focus_visible_state,
+        );
+
+        assert!(!focus_ring_visible(&ctx));
+        let mut retained_focus = false;
+        let _ = ctx.run(
+            egui::RawInput {
+                focused: true,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let (_, response) =
+                        ui.allocate_exact_size(Vec2::new(44.0, 44.0), Sense::click());
+                    response.request_focus();
+                    retained_focus = response.has_focus();
+                });
+            },
+        );
+        assert!(retained_focus);
+    }
+
+    #[test]
+    fn non_pointer_focus_change_restores_a_visible_ring() {
+        let ctx = egui::Context::default();
+        let first_id = egui::Id::new("pointer-focused-control");
+        let second_id = egui::Id::new("programmatically-focused-control");
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::PointerButton {
+                    pos: egui::Pos2::ZERO,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::default(),
+                }],
+                ..Default::default()
+            },
+            |ctx| {
+                update_focus_visible_state(ctx);
+                ctx.memory_mut(|memory| memory.request_focus(first_id));
+            },
+        );
+        let _ = ctx.run(Default::default(), update_focus_visible_state);
+
+        let output = ctx.run(Default::default(), |ctx| {
+            update_focus_visible_state(ctx);
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let (rect, _) = ui.allocate_exact_size(Vec2::new(44.0, 44.0), Sense::hover());
+                ctx.memory_mut(|memory| memory.request_focus(second_id));
+                let response = ui.interact(rect, second_id, Sense::click());
+                paint_focus_ring(ui, &response, Rounding::same(5.0));
+            });
+        });
+
+        assert_eq!(ctx.memory(|memory| memory.focused()), Some(second_id));
+        assert!(output.shapes.iter().any(|shape| matches!(
+            shape.shape,
+            egui::epaint::Shape::Rect(rect) if rect.stroke.width == 3.0
+        )));
+    }
+
+    #[test]
+    fn accesskit_action_restores_focus_ring_visibility_during_activation() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::WindowFocused(true)],
+                ..Default::default()
+            },
+            update_focus_visible_state,
+        );
+        assert!(!focus_ring_visible(&ctx));
+
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![
+                    egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
+                        action: egui::accesskit::Action::Focus,
+                        target: egui::accesskit::NodeId(1),
+                        data: None,
+                    }),
+                    egui::Event::WindowFocused(true),
+                ],
+                ..Default::default()
+            },
+            update_focus_visible_state,
+        );
+
+        assert!(focus_ring_visible(&ctx));
+    }
+
+    #[test]
+    fn keyboard_interaction_restores_focus_ring_visibility() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::PointerButton {
+                    pos: egui::Pos2::ZERO,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::default(),
+                }],
+                ..Default::default()
+            },
+            update_focus_visible_state,
+        );
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Tab,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::default(),
+                }],
+                ..Default::default()
+            },
+            update_focus_visible_state,
+        );
+
+        assert!(focus_ring_visible(&ctx));
+        let output = ctx.run(
+            egui::RawInput {
+                focused: true,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let (_, response) =
+                        ui.allocate_exact_size(Vec2::new(44.0, 44.0), Sense::click());
+                    response.request_focus();
+                    paint_focus_ring(ui, &response, Rounding::same(5.0));
+                });
+            },
+        );
+        assert!(output.shapes.iter().any(|shape| matches!(
+            shape.shape,
+            egui::epaint::Shape::Rect(rect) if rect.stroke.width == 3.0
+        )));
     }
 
     #[test]

@@ -25,6 +25,7 @@ use super::{
         platform::OverlayWindowBounds,
         view::{
             CONTROL_SIZE, DARK_OVERLAY_MUTED_TEXT, LIVE_HEIGHT, LIVE_WIDTH, MINIMAL_WIDTH,
+            compact_phase_status_label, level_meter_half_heights, level_meter_is_active,
             phase_status_label_with_motion, status_mark_glyph,
         },
     },
@@ -654,11 +655,7 @@ fn draw_live_brand_mark(
     layout: &DisplayLayout,
     colors: NativeColors,
 ) -> Result<(), RasterError> {
-    if state.mode == OverlayMode::Live
-        && state.progress_animation_enabled
-        && (state.phase == OverlayPhase::Listening
-            || (state.phase == OverlayPhase::Finalizing && state.audio_level.peak > 0.01))
-    {
+    if level_meter_is_active(state) {
         return draw_level_mark(canvas, state, layout, colors);
     }
     let scale = layout.scale;
@@ -683,10 +680,11 @@ fn draw_level_mark(
     let scale = layout.scale;
     let center_x = layout.recording_mark.center_x();
     let center_y = layout.recording_mark.center_y();
-    let rms = state.audio_level.rms.clamp(0.0, 1.0);
-    let peak = state.audio_level.peak.clamp(rms, 1.0);
-    for (offset, level) in [(-7.0, rms), (0.0, peak), (7.0, rms)] {
-        let half_height = (3.0 + level * 8.0) * scale;
+    for (offset, half_height) in super::super::view::LEVEL_METER_BAR_OFFSETS
+        .into_iter()
+        .zip(level_meter_half_heights(state.audio_level))
+    {
+        let half_height = half_height * scale;
         canvas.draw_line(
             center_x + offset * scale,
             center_y - half_height,
@@ -706,23 +704,16 @@ fn draw_live_elapsed(
     colors: NativeColors,
 ) -> Result<(), RasterError> {
     let scale = layout.scale;
-    let elapsed = if state.phase == OverlayPhase::Listening {
-        state
-            .elapsed
-            .map(format_elapsed)
-            .unwrap_or_else(|| "00:00".to_owned())
-    } else {
-        format!(
-            "Recorded {}",
-            state
-                .elapsed
-                .map(format_elapsed)
-                .unwrap_or_else(|| "00:00".to_owned())
-        )
-    };
-    canvas.draw_text_centered_in_rect(
+    // The adjacent Live preview already carries lifecycle copy such as
+    // "Transcribing…". Keep this fixed timer slot concise in every phase so
+    // it stays centered without clipping into the mark or divider.
+    let elapsed = state
+        .elapsed
+        .map(format_elapsed)
+        .unwrap_or_else(|| "00:00".to_owned());
+    canvas.draw_centered_text_in_rect(
         &elapsed,
-        layout.elapsed.x0,
+        layout.elapsed.center_x(),
         layout.elapsed.width(),
         layout.elapsed,
         13.0 * scale,
@@ -829,13 +820,13 @@ fn draw_compact_status(
         )
     } else {
         (
-            phase_status_label_with_motion(state.phase, state.progress_animation_enabled),
+            compact_phase_status_label(state.phase).to_owned(),
             phase_status_color(state, colors),
         )
     };
-    canvas.draw_text_centered_in_rect(
+    canvas.draw_centered_text_in_rect(
         &label,
-        status_bounds.x0,
+        status_bounds.center_x(),
         status_bounds.width(),
         status_bounds,
         13.0 * scale,
@@ -1181,10 +1172,10 @@ impl<'a> Canvas<'a> {
         style: TextStyle,
         color: Argb,
     ) -> Result<(), RasterError> {
-        let measured = self.measure_text(text, font_size, style)?;
-        self.draw_text_centered_in_rect(
+        let measured = self.measure_text(text, font_size, style)?.min(width);
+        self.draw_text_vertically_centered_in_rect(
             text,
-            center_x - measured.min(width) / 2.0,
+            center_x - measured / 2.0,
             width,
             rect,
             font_size,
@@ -1192,6 +1183,21 @@ impl<'a> Canvas<'a> {
             color,
         )?;
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_text_vertically_centered_in_rect(
+        &mut self,
+        text: &str,
+        x: f32,
+        width: f32,
+        rect: super::layout::PhysicalRect,
+        font_size: f32,
+        style: TextStyle,
+        color: Argb,
+    ) -> Result<f32, RasterError> {
+        let y = rect.center_y() - self.rasterizer.baseline_ink_center_y(font_size, style)?;
+        self.draw_text(text, x, y, width, rect.height(), font_size, style, color)
     }
 
     /// The cancel control has independent hit-target geometry and intentionally
@@ -1221,24 +1227,6 @@ impl<'a> Canvas<'a> {
             color,
         )?;
         Ok(())
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn draw_text_centered_in_rect(
-        &mut self,
-        text: &str,
-        x: f32,
-        width: f32,
-        rect: super::layout::PhysicalRect,
-        font_size: f32,
-        style: TextStyle,
-        color: Argb,
-    ) -> Result<f32, RasterError> {
-        // Font/style/scale baseline metrics are bounded and reused by the
-        // rasterizer, avoiding text-dependent allocation or transcript
-        // retention on every meter repaint.
-        let y = rect.center_y() - self.rasterizer.baseline_ink_center_y(font_size, style)?;
-        self.draw_text(text, x, y, width, rect.height(), font_size, style, color)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1372,7 +1360,7 @@ impl<'a> Canvas<'a> {
             if cursor >= right {
                 break;
             }
-            let measured = self.draw_text_centered_in_rect(
+            let measured = self.draw_text_vertically_centered_in_rect(
                 &section.text,
                 cursor,
                 right - cursor,
@@ -2055,6 +2043,10 @@ mod tests {
     }
 
     impl InkBounds {
+        fn center_x(&self) -> f32 {
+            (self.x0 + self.x1 + 1) as f32 / 2.0
+        }
+
         fn center_y(&self) -> f32 {
             (self.y0 + self.y1 + 1) as f32 / 2.0
         }
@@ -2117,6 +2109,20 @@ mod tests {
         ink
     }
 
+    fn assert_component_is_horizontally_centered(
+        component: &str,
+        ink: InkBounds,
+        rect: PhysicalRect,
+        tolerance: f32,
+    ) {
+        assert!(
+            (ink.center_x() - rect.center_x()).abs() <= tolerance,
+            "{component} ink center {} drifted from horizontal center {}: {ink:?}",
+            ink.center_x(),
+            rect.center_x(),
+        );
+    }
+
     fn assert_no_adjacent_ink_overlap(components: &[(&str, InkBounds)]) {
         for (index, (name, bounds)) in components.iter().enumerate() {
             for (other_name, other_bounds) in components.iter().skip(index + 1) {
@@ -2158,12 +2164,13 @@ mod tests {
     }
 
     #[test]
-    fn compact_shell_ignores_audio_and_transcript_but_visibly_replaces_timer_on_error() {
+    fn compact_shell_uses_audio_but_ignores_transcript_and_replaces_timer_on_error() {
         let normal = state(OverlayMode::Minimal);
-        let mut changed_hidden_state = normal.clone();
-        changed_hidden_state.audio_level = OverlayAudioLevel::new(0.0, 1.0);
-        changed_hidden_state.transcript.committed = "must stay out of compact".to_owned();
-        changed_hidden_state.transcript.tentative = "including estimates".to_owned();
+        let mut changed_transcript = normal.clone();
+        changed_transcript.transcript.committed = "must stay out of compact".to_owned();
+        changed_transcript.transcript.tentative = "including estimates".to_owned();
+        let mut changed_audio = normal.clone();
+        changed_audio.audio_level = OverlayAudioLevel::new(0.0, 1.0);
         let mut failed = normal.clone();
         failed.phase = OverlayPhase::Error;
         failed.error = Some(super::super::super::controller::OverlayError {
@@ -2179,13 +2186,25 @@ mod tests {
                 normal,
                 rasterizer
                     .render_display(
-                        &changed_hidden_state,
+                        &changed_transcript,
                         true,
                         MINIMAL_WIDTH as i32,
                         LIVE_HEIGHT as i32,
                     )
                     .unwrap(),
-                "compact must not paint the old input meter or transcript content"
+                "compact must not paint transcript content"
+            );
+            assert_ne!(
+                normal,
+                rasterizer
+                    .render_display(
+                        &changed_audio,
+                        true,
+                        MINIMAL_WIDTH as i32,
+                        LIVE_HEIGHT as i32,
+                    )
+                    .unwrap(),
+                "compact must paint microphone activity while listening"
             );
             assert_ne!(
                 normal,
@@ -2303,6 +2322,12 @@ mod tests {
                                     2.5,
                                     true,
                                 );
+                                assert_component_is_horizontally_centered(
+                                    "elapsed time",
+                                    elapsed,
+                                    layout.elapsed,
+                                    1.5 * layout.scale,
+                                );
                                 let divider_frame = isolated_component_frame(
                                     rasterizer,
                                     &state,
@@ -2371,6 +2396,12 @@ mod tests {
                                     2.5,
                                     true,
                                 );
+                                assert_component_is_horizontally_centered(
+                                    "compact elapsed time",
+                                    status,
+                                    layout.elapsed,
+                                    1.5 * layout.scale,
+                                );
                                 assert_no_adjacent_ink_overlap(&[
                                     ("compact Scribe brand mark", brand),
                                     ("compact elapsed time", status),
@@ -2378,6 +2409,130 @@ mod tests {
                             }
                         }
                     }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn compact_lifecycle_text_fits_and_is_horizontally_centered_at_supported_dpis() {
+        with_rasterizer(|rasterizer| {
+            for dpi in [96, 120, 144, 192] {
+                let bounds = production_bounds(OverlayMode::Minimal, dpi);
+                let layout = DisplayLayout::from_bounds(OverlayMode::Minimal, bounds)
+                    .expect("production compact layout");
+                for phase in [
+                    OverlayPhase::Preparing,
+                    OverlayPhase::Finalizing,
+                    OverlayPhase::Processing,
+                    OverlayPhase::Pasting,
+                    OverlayPhase::Success,
+                ] {
+                    let label = compact_phase_status_label(phase);
+                    let mut scratch = LayeredFrame::transparent(bounds.width, bounds.height)
+                        .expect("measurement frame");
+                    let mut canvas =
+                        Canvas::new(rasterizer, &mut scratch.pixels, bounds.width, bounds.height)
+                            .expect("measurement canvas");
+                    let measured = canvas
+                        .measure_text(label, 13.0 * layout.scale, TextStyle::Regular)
+                        .expect("measure compact lifecycle text");
+                    assert!(
+                        measured <= layout.lifecycle_status.width(),
+                        "{phase:?} label {label:?} measured {measured}px but only {}px is available at {dpi} DPI",
+                        layout.lifecycle_status.width(),
+                    );
+                    drop(canvas);
+
+                    for dark_mode in [false, true] {
+                        let state = OverlayViewState {
+                            mode: OverlayMode::Minimal,
+                            phase,
+                            progress_animation_enabled: false,
+                            ..OverlayViewState::default()
+                        };
+                        let frame = isolated_component_frame(
+                            rasterizer,
+                            &state,
+                            &layout,
+                            dark_mode,
+                            IsolatedComponent::CompactStatus,
+                        );
+                        let ink = assert_component_is_contained_and_centered(
+                            "compact lifecycle status",
+                            &frame,
+                            layout.lifecycle_status,
+                            layout.content_center_y,
+                            2.5,
+                            true,
+                        );
+                        assert_component_is_horizontally_centered(
+                            "compact lifecycle status",
+                            ink,
+                            layout.lifecycle_status,
+                            1.5 * layout.scale,
+                        );
+                        assert_eq!(layout.lifecycle_status.center_x(), layout.root.center_x());
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn live_elapsed_text_stays_short_and_centered_through_every_visible_phase() {
+        with_rasterizer(|rasterizer| {
+            for dpi in [96, 120, 144, 192] {
+                let bounds = production_bounds(OverlayMode::Live, dpi);
+                let layout = DisplayLayout::from_bounds(OverlayMode::Live, bounds)
+                    .expect("production live layout");
+                let label = format_elapsed(Duration::from_secs(12));
+                let mut scratch = LayeredFrame::transparent(bounds.width, bounds.height)
+                    .expect("measurement frame");
+                let mut canvas =
+                    Canvas::new(rasterizer, &mut scratch.pixels, bounds.width, bounds.height)
+                        .expect("measurement canvas");
+                let measured = canvas
+                    .measure_text(&label, 13.0 * layout.scale, TextStyle::Regular)
+                    .expect("measure live elapsed text");
+                assert!(measured <= layout.elapsed.width());
+                drop(canvas);
+
+                for phase in [
+                    OverlayPhase::Listening,
+                    OverlayPhase::Finalizing,
+                    OverlayPhase::Processing,
+                    OverlayPhase::Pasting,
+                    OverlayPhase::Success,
+                ] {
+                    let state = OverlayViewState {
+                        mode: OverlayMode::Live,
+                        phase,
+                        elapsed: Some(Duration::from_secs(12)),
+                        progress_animation_enabled: false,
+                        ..OverlayViewState::default()
+                    };
+                    let frame = isolated_component_frame(
+                        rasterizer,
+                        &state,
+                        &layout,
+                        true,
+                        IsolatedComponent::Elapsed,
+                    );
+                    let ink = assert_component_is_contained_and_centered(
+                        "live elapsed time",
+                        &frame,
+                        layout.elapsed,
+                        layout.content_center_y,
+                        2.5,
+                        true,
+                    );
+                    assert_component_is_horizontally_centered(
+                        "live elapsed time",
+                        ink,
+                        layout.elapsed,
+                        1.5 * layout.scale,
+                    );
                 }
             }
         });
@@ -3201,69 +3356,75 @@ mod tests {
     }
 
     #[test]
-    fn live_brand_mark_reflects_audio_levels_with_fixed_bounds() {
-        let mut quiet = state(OverlayMode::Live);
-        quiet.progress_animation_enabled = true;
-        quiet.audio_level = OverlayAudioLevel::new(0.0, 0.0);
-        let mut loud = quiet.clone();
-        loud.audio_level = OverlayAudioLevel::new(1.0, 1.0);
+    fn listening_brand_mark_reflects_audio_levels_in_live_and_compact_modes() {
         with_rasterizer(|rasterizer| {
-            assert_ne!(
-                rasterizer.render_display(&quiet, true, 600, 62).unwrap(),
-                rasterizer.render_display(&loud, true, 600, 62).unwrap()
-            );
+            for (mode, width) in [(OverlayMode::Live, 600), (OverlayMode::Minimal, 200)] {
+                let mut quiet = state(mode);
+                quiet.progress_animation_enabled = true;
+                quiet.audio_level = OverlayAudioLevel::new(0.0, 0.0);
+                let mut loud = quiet.clone();
+                loud.audio_level = OverlayAudioLevel::new(1.0, 1.0);
+                assert_ne!(
+                    rasterizer.render_display(&quiet, true, width, 62).unwrap(),
+                    rasterizer.render_display(&loud, true, width, 62).unwrap(),
+                    "{mode:?} must expose live microphone level changes"
+                );
+            }
         });
     }
 
     #[test]
     fn production_meter_ink_is_centered_inside_the_30px_mark_at_every_supported_dpi() {
         with_rasterizer(|rasterizer| {
-            for dpi in [96, 120, 144, 192] {
-                let bounds = production_bounds(OverlayMode::Live, dpi);
-                let layout = DisplayLayout::from_bounds(OverlayMode::Live, bounds)
-                    .expect("production live layout");
-                assert!(
-                    (layout.recording_mark.width() - 30.0 * layout.scale).abs() <= f32::EPSILON,
-                    "the production mark must retain its fixed 30px logical width at {dpi} DPI"
-                );
-
-                for dark_mode in [false, true] {
-                    let mut quiet = state(OverlayMode::Live);
-                    quiet.progress_animation_enabled = true;
-                    quiet.audio_level = OverlayAudioLevel::new(0.0, 0.0);
-                    let mut loud = quiet.clone();
-                    loud.audio_level = OverlayAudioLevel::new(1.0, 1.0);
-
-                    let quiet_frame = isolated_component_frame(
-                        rasterizer,
-                        &quiet,
-                        &layout,
-                        dark_mode,
-                        IsolatedComponent::BrandMark,
-                    );
-                    let loud_frame = isolated_component_frame(
-                        rasterizer,
-                        &loud,
-                        &layout,
-                        dark_mode,
-                        IsolatedComponent::BrandMark,
-                    );
-                    assert_ne!(
-                        quiet_frame, loud_frame,
-                        "meter-enabled quiet and loud marks must differ at {dpi} DPI (dark_mode={dark_mode})"
+            for (mode, mark_width) in [(OverlayMode::Live, 30.0), (OverlayMode::Minimal, 30.0)] {
+                for dpi in [96, 120, 144, 192] {
+                    let bounds = production_bounds(mode, dpi);
+                    let layout = DisplayLayout::from_bounds(mode, bounds)
+                        .expect("production overlay layout");
+                    assert!(
+                        (layout.recording_mark.width() - mark_width * layout.scale).abs()
+                            <= f32::EPSILON,
+                        "the production mark must retain its fixed 30px logical width at {dpi} DPI"
                     );
 
-                    for (level, frame) in [("quiet", &quiet_frame), ("loud", &loud_frame)] {
-                        assert_component_is_contained_and_centered(
-                            &format!(
-                                "{level} production meter at {dpi} DPI (dark_mode={dark_mode})"
-                            ),
-                            frame,
-                            layout.recording_mark,
-                            layout.content_center_y,
-                            0.5,
-                            true,
+                    for dark_mode in [false, true] {
+                        let mut quiet = state(mode);
+                        quiet.progress_animation_enabled = true;
+                        quiet.audio_level = OverlayAudioLevel::new(0.0, 0.0);
+                        let mut loud = quiet.clone();
+                        loud.audio_level = OverlayAudioLevel::new(1.0, 1.0);
+
+                        let quiet_frame = isolated_component_frame(
+                            rasterizer,
+                            &quiet,
+                            &layout,
+                            dark_mode,
+                            IsolatedComponent::BrandMark,
                         );
+                        let loud_frame = isolated_component_frame(
+                            rasterizer,
+                            &loud,
+                            &layout,
+                            dark_mode,
+                            IsolatedComponent::BrandMark,
+                        );
+                        assert_ne!(
+                            quiet_frame, loud_frame,
+                            "meter-enabled quiet and loud marks must differ at {dpi} DPI (dark_mode={dark_mode})"
+                        );
+
+                        for (level, frame) in [("quiet", &quiet_frame), ("loud", &loud_frame)] {
+                            assert_component_is_contained_and_centered(
+                                &format!(
+                                    "{level} {mode:?} production meter at {dpi} DPI (dark_mode={dark_mode})"
+                                ),
+                                frame,
+                                layout.recording_mark,
+                                layout.content_center_y,
+                                0.5,
+                                true,
+                            );
+                        }
                     }
                 }
             }

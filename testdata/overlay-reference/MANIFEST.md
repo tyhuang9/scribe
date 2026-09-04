@@ -29,22 +29,24 @@ same-state design QA.
   status after recording ends.
 
 The immutable reference corpus uses the bundled Phosphor `WAVEFORM` glyph as a
-static/reduced-motion Listening mark. Production Live Listening uses a separate
-fixed-bounds level meter, covered by dedicated renderer tests rather than these
-static screenshot fixtures. Elapsed time and transcript use one regular Segoe UI face and the same
-restrained light-gray token. Transcript display stays left-aligned while the
-full line fits. Once it overflows, the visible window follows the newest
+static/reduced-motion Listening mark. Production Live and Compact Listening use
+a separate fixed-bounds, five-bar microphone activity meter, covered by
+dedicated renderer tests rather than these static screenshot fixtures. Elapsed
+time and transcript use one regular Segoe UI face and the same restrained
+light-gray token. Transcript display stays left-aligned while the full line
+fits. Once it overflows, the visible window follows the newest
 Unicode-grapheme-safe suffix, keeps its right edge fixed, and does not add an
 ellipsis. The full committed and tentative text remains intact in state and
 accessibility wording even though the selected reference calls for one
 continuous visual style.
 
 At 96, 120, 144, and 192 DPI, the brand, elapsed text ink, divider, transcript
-ink, and Compact brand/timer elements are measured from one physical centerline.
-The raster and UI Automation trees consume the same physical rectangles. The
-separate cancel window remains a 44 logical-pixel target, shares the display's
-physical center, and uses the reference-specific 16 logical-pixel right inset
-in both Live and Compact modes.
+ink, and Compact brand/timer elements are measured from one physical
+centerline. The Compact timer and lifecycle label are also horizontally
+centered on the 200-point capsule. The raster and UI Automation trees consume
+the same physical rectangles. The separate cancel window remains a 44
+logical-pixel target, shares the display's physical center, and uses the
+reference-specific 16 logical-pixel right inset in both Live and Compact modes.
 
 The dark capsule uses a neutral translucent surface compensated for the native
 shadow stack. Over the reference backdrop (approximately RGB 240/240/245), an
@@ -73,9 +75,9 @@ long enough to exercise tail-follow behavior.
 | `live-error` | 600 x 62 | Live, retryable preview error with recorded-time context | light, dark | 96 |
 
 The suffix is the DPI. Every `.bgra` file contains exactly
-`physical_width x physical_height x 4` bytes. `SHA256SUMS` records every frame,
-and normal tests both verify the checksums and compare every committed byte to
-a fresh render.
+`physical_width x physical_height x 4` bytes. `SHA256SUMS` records every frame.
+Normal tests verify those committed bytes and compare their alpha geometry to a
+fresh render.
 
 ## Reproduction and approval
 
@@ -97,6 +99,15 @@ review history live in `design-qa-evidence/overlay-native/` and
 be pixel-identical across arbitrary desktop backgrounds; they lock the
 approved renderer that satisfies the reference composition and measured
 contract.
+
+The 2026-09-03 alignment revision was generated outside the repository by the
+Windows verification runner from source `747ba98` (run `33833090897`). Its
+light/dark Live, empty-preview, no-preview, error, lifecycle, and Compact states
+were visually reviewed together. The accepted frames preserve clean,
+left-aligned transcript flow while centering the timer and Compact lifecycle
+copy. Only the 38 frames with intentional alpha-geometry changes were promoted;
+the eight independent cancel-control frames retained their prior geometry and
+bytes. `SHA256SUMS` records the resulting mixed corpus.
 
 The tracked approval artifacts make the review reproducible without the
 temporary attachment path:

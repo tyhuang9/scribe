@@ -54,7 +54,7 @@ use super::{
     platform::{CapturedTarget, OverlayPosition, OverlayWindowBounds, overlay_window_bounds},
     view::{
         OverlayDiagnostic, OverlayViewportOutput, control_window_bounds, is_cancellable,
-        window_spec,
+        level_meter_is_active, window_spec,
     },
 };
 use crate::transcription::SessionId;
@@ -223,13 +223,21 @@ impl OverlaySnapshot {
     }
 
     fn display_render_key(&self, animation_frame: u8) -> DisplayRenderKey {
+        let (rms_bucket, peak_bucket) = if level_meter_is_active(&self.state) {
+            (
+                quantized_level(self.state.audio_level.rms),
+                quantized_level(self.state.audio_level.peak),
+            )
+        } else {
+            (0, 0)
+        };
         DisplayRenderKey {
             mode: self.state.mode,
             phase: self.state.phase,
             transcript_revision: self.state.transcript.revision,
             content: OverlayRenderContent::from(&self.state),
-            rms_bucket: quantized_level(self.state.audio_level.rms),
-            peak_bucket: quantized_level(self.state.audio_level.peak),
+            rms_bucket,
+            peak_bucket,
             elapsed_second: self.state.elapsed.map_or(0, |elapsed| elapsed.as_secs()),
             dark_mode: self.dark_mode,
             dpi: self.dpi,
@@ -2356,6 +2364,25 @@ mod tests {
         level_changed.state.audio_level.rms = 1.0;
         assert_ne!(display_baseline, level_changed.display_render_key(2));
         assert_eq!(control_baseline, level_changed.control_render_key());
+
+        for (phase, progress_animation_enabled) in [
+            (super::super::controller::OverlayPhase::Listening, false),
+            (super::super::controller::OverlayPhase::Finalizing, true),
+        ] {
+            let mut static_meter = snapshot.clone();
+            static_meter.state.phase = phase;
+            static_meter.state.progress_animation_enabled = progress_animation_enabled;
+            static_meter.state.audio_level.rms = 0.0;
+            static_meter.state.audio_level.peak = 0.0;
+            let static_key = static_meter.display_render_key(0);
+            static_meter.state.audio_level.rms = 1.0;
+            static_meter.state.audio_level.peak = 1.0;
+            assert_eq!(
+                static_key,
+                static_meter.display_render_key(0),
+                "inactive or reduced-motion meter levels must not resubmit identical pixels"
+            );
+        }
 
         let mut theme_changed = snapshot.clone();
         theme_changed.dark_mode = false;

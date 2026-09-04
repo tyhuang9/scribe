@@ -338,6 +338,54 @@ mod tests {
     }
 
     #[test]
+    fn timer_and_compact_lifecycle_accessibility_bounds_stay_centered_at_supported_dpis() {
+        for (mode, phases) in [
+            (
+                OverlayMode::Live,
+                [OverlayPhase::Listening, OverlayPhase::Processing],
+            ),
+            (
+                OverlayMode::Minimal,
+                [OverlayPhase::Listening, OverlayPhase::Processing],
+            ),
+        ] {
+            for dpi in [96, 120, 144, 192] {
+                let bounds = production_bounds(mode, dpi);
+                let layout = DisplayLayout::from_bounds(mode, bounds).expect("display layout");
+                for phase in phases {
+                    let state = OverlayViewState {
+                        mode,
+                        phase,
+                        elapsed: Some(std::time::Duration::from_secs(12)),
+                        ..OverlayViewState::default()
+                    };
+                    let tree = display_tree(&state, true, Some(bounds));
+                    let elapsed = tree
+                        .nodes
+                        .iter()
+                        .find(|(id, _)| *id == DISPLAY_ELAPSED_ID)
+                        .map(|(_, node)| node)
+                        .expect("elapsed node");
+                    let expected =
+                        if mode == OverlayMode::Minimal && phase != OverlayPhase::Listening {
+                            layout.lifecycle_status
+                        } else {
+                            layout.elapsed
+                        };
+                    assert_eq!(elapsed.bounds(), Some(accesskit_rect(expected)));
+                    if mode == OverlayMode::Minimal {
+                        assert_eq!(expected.center_x(), layout.root.center_x());
+                    }
+                    assert!(
+                        (expected.center_y() - layout.content_center_y).abs() <= 0.5,
+                        "{mode:?} {phase:?} text drifted at {dpi} DPI"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn hidden_trees_expose_no_live_region_or_cancel_button() {
         for role in [WindowRole::Display, WindowRole::Control] {
             let tree = hidden_tree(role);
@@ -665,7 +713,7 @@ mod tests {
         assert_eq!(elapsed.name(), Some("Elapsed time 01:05"));
         assert_eq!(
             elapsed.bounds(),
-            Some(Rect::new(90.0, 24.625, 150.0, 53.375))
+            Some(Rect::new(95.0, 24.625, 155.0, 53.375))
         );
         assert!(tree.nodes.iter().all(|(_, node)| node.live().is_none()));
     }

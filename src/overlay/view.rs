@@ -4,7 +4,8 @@ use eframe::egui::{self, Color32, RichText, Sense, Stroke, ViewportClass};
 use unicode_segmentation::UnicodeSegmentation;
 
 use super::controller::{
-    OverlayMode, OverlayPhase, OverlayPresentation, OverlayRecovery, OverlayViewState,
+    OverlayAudioLevel, OverlayMode, OverlayPhase, OverlayPresentation, OverlayRecovery,
+    OverlayViewState,
 };
 use super::platform::{
     CapturedTarget, OverlayHardeningProfile, OverlayPosition, OverlayWindowBounds,
@@ -35,6 +36,7 @@ const CAPSULE_VERTICAL_INSET: f32 = 8.0;
 const CAPSULE_SHADOW_BLUR: f32 = 6.0;
 const CAPSULE_SHADOW_OFFSET_Y: f32 = 2.0;
 const LIVE_WAVEFORM_SIZE: f32 = 30.0;
+pub(super) const LEVEL_METER_BAR_OFFSETS: [f32; 5] = [-8.0, -4.0, 0.0, 4.0, 8.0];
 const MAX_PREVIEW_GRAPHEMES: usize = 512;
 const MAX_MESSAGE_GRAPHEMES: usize = 256;
 const LIVE_PREVIEW_ROWS: usize = 1;
@@ -242,6 +244,16 @@ pub(super) fn phase_status_label_with_motion(
     // nudging status text or changing the native accessibility semantics.
     let glyph = "○";
     format!("{glyph} {}", phase.status_text())
+}
+
+/// Compact lifecycle copy must fit the control-free center slot at every
+/// supported DPI. Full status text remains available to accessibility APIs.
+pub(super) fn compact_phase_status_label(phase: OverlayPhase) -> &'static str {
+    match phase {
+        OverlayPhase::Preparing => "Starting…",
+        OverlayPhase::Finalizing => "Finishing…",
+        _ => phase.status_text(),
+    }
 }
 
 pub(super) fn control_window_bounds(
@@ -519,7 +531,7 @@ fn render_compact_status_row(ui: &mut egui::Ui, state: &OverlayViewState, colors
             )
         } else {
             (
-                phase_status_label_with_motion(state.phase, state.progress_animation_enabled),
+                compact_phase_status_label(state.phase).to_owned(),
                 phase_status_color(state.phase, colors),
             )
         };
@@ -628,13 +640,50 @@ fn render_brand_mark(ui: &mut egui::Ui, state: &OverlayViewState, colors: Overla
         builder.set_name(accessible_name);
         builder.set_description(accessible_description);
     });
-    ui.painter().text(
-        rect.center(),
-        egui::Align2::CENTER_CENTER,
-        status_mark_glyph(state),
-        egui::FontId::proportional(27.0),
-        status_mark_color(state, colors),
-    );
+    if level_meter_is_active(state) {
+        let center = rect.center();
+        for (offset, half_height) in LEVEL_METER_BAR_OFFSETS
+            .into_iter()
+            .zip(level_meter_half_heights(state.audio_level))
+        {
+            ui.painter().line_segment(
+                [
+                    egui::pos2(center.x + offset, center.y - half_height),
+                    egui::pos2(center.x + offset, center.y + half_height),
+                ],
+                Stroke::new(2.0, status_mark_color(state, colors)),
+            );
+        }
+    } else {
+        ui.painter().text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            status_mark_glyph(state),
+            egui::FontId::proportional(27.0),
+            status_mark_color(state, colors),
+        );
+    }
+}
+
+/// The microphone meter is a fixed five-bar mark so it remains legible in
+/// both overlay widths. The values are symmetric around the peak bar, which
+/// makes quiet-to-loud changes visible without moving the mark's footprint.
+pub(super) fn level_meter_half_heights(level: OverlayAudioLevel) -> [f32; 5] {
+    let rms = level.rms.clamp(0.0, 1.0);
+    let peak = level.peak.clamp(rms, 1.0);
+    let outer = rms;
+    let inner = (rms * 0.55 + peak * 0.45).clamp(0.0, 1.0);
+    [
+        3.0 + outer * 6.0,
+        3.0 + inner * 7.0,
+        3.0 + peak * 9.0,
+        3.0 + inner * 7.0,
+        3.0 + outer * 6.0,
+    ]
+}
+
+pub(super) fn level_meter_is_active(state: &OverlayViewState) -> bool {
+    state.progress_animation_enabled && state.phase == OverlayPhase::Listening
 }
 
 pub(super) fn status_mark_glyph(state: &OverlayViewState) -> &'static str {
@@ -1023,6 +1072,88 @@ mod tests {
             phase_status_label_with_motion(OverlayPhase::Processing, false),
             "○ Transcribing…"
         );
+        assert_eq!(
+            compact_phase_status_label(OverlayPhase::Preparing),
+            "Starting…"
+        );
+        assert_eq!(
+            compact_phase_status_label(OverlayPhase::Finalizing),
+            "Finishing…"
+        );
+        assert_eq!(
+            compact_phase_status_label(OverlayPhase::Processing),
+            "Transcribing…"
+        );
+    }
+
+    #[test]
+    fn five_bar_meter_is_level_responsive_in_live_and_compact_listening_states() {
+        let quiet = level_meter_half_heights(OverlayAudioLevel::new(0.0, 0.0));
+        let loud = level_meter_half_heights(OverlayAudioLevel::new(1.0, 1.0));
+        assert_eq!(quiet[0], quiet[4]);
+        assert_eq!(quiet[1], quiet[3]);
+        assert_eq!(loud[0], loud[4]);
+        assert_eq!(loud[1], loud[3]);
+        assert!(loud[2] > quiet[2]);
+        assert!(loud[2] <= LIVE_WAVEFORM_SIZE / 2.0 - 1.0);
+
+        for mode in [OverlayMode::Live, OverlayMode::Minimal] {
+            let mut listening = OverlayViewState {
+                mode,
+                phase: OverlayPhase::Listening,
+                progress_animation_enabled: true,
+                ..OverlayViewState::default()
+            };
+            assert!(level_meter_is_active(&listening));
+            listening.progress_animation_enabled = false;
+            assert!(
+                !level_meter_is_active(&listening),
+                "{mode:?} must preserve the reduced-motion static mark"
+            );
+            listening.progress_animation_enabled = true;
+            listening.phase = OverlayPhase::Finalizing;
+            listening.audio_level = OverlayAudioLevel::new(1.0, 1.0);
+            assert!(
+                !level_meter_is_active(&listening),
+                "{mode:?} must stop showing microphone activity after capture"
+            );
+        }
+    }
+
+    #[test]
+    fn egui_fallback_renders_distinct_quiet_and_loud_meter_shapes_in_both_modes() {
+        for (mode, size) in [
+            (OverlayMode::Live, egui::vec2(LIVE_WIDTH, LIVE_HEIGHT)),
+            (
+                OverlayMode::Minimal,
+                egui::vec2(MINIMAL_WIDTH, MINIMAL_HEIGHT),
+            ),
+        ] {
+            let render = |audio_level| {
+                let context = egui::Context::default();
+                let state = OverlayViewState {
+                    mode,
+                    phase: OverlayPhase::Listening,
+                    progress_animation_enabled: true,
+                    audio_level,
+                    ..OverlayViewState::default()
+                };
+                context
+                    .run(
+                        egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                            ..Default::default()
+                        },
+                        |context| render_overlay(context, &state),
+                    )
+                    .shapes
+            };
+            assert_ne!(
+                render(OverlayAudioLevel::new(0.0, 0.0)),
+                render(OverlayAudioLevel::new(1.0, 1.0)),
+                "{mode:?} egui fallback must paint the live meter"
+            );
+        }
     }
 
     #[test]
