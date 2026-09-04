@@ -70,7 +70,6 @@ const CLIENT_PIPE_ACCESS: u32 =
     FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES | SYNCHRONIZE;
 const PIPE_SDDL: &str = concat!(
     "D:P",
-    "(A;;GA;;;LS)",
     "(A;;GA;;;S-1-5-80-3848011089-2849881844-525567724-3342831801-3217684137)",
     "(A;;0x00100183;;;AU)"
 );
@@ -295,16 +294,12 @@ fn report_status_with_exit(
     }
 }
 
-fn serve_loop(mut pipe: OwnedHandle, stop_event: HANDLE) -> Result<()> {
+fn serve_loop(pipe: OwnedHandle, stop_event: HANDLE) -> Result<()> {
     loop {
         match connect_pipe(pipe.raw(), stop_event, IO_TIMEOUT_MS) {
             Ok(()) => {}
             Err(NativeIoError::Stopped) => return Ok(()),
-            Err(NativeIoError::TimedOut) => {
-                drop(pipe);
-                pipe = create_server_pipe()?;
-                continue;
-            }
+            Err(NativeIoError::TimedOut) => continue,
             Err(_) => return Err(anyhow!("broker pipe connect failed")),
         }
 
@@ -315,8 +310,6 @@ fn serve_loop(mut pipe: OwnedHandle, stop_event: HANDLE) -> Result<()> {
         if unsafe { WaitForSingleObject(stop_event, 0) } == WAIT_OBJECT_0 {
             return Ok(());
         }
-        drop(pipe);
-        pipe = create_server_pipe()?;
     }
 }
 
@@ -871,7 +864,7 @@ mod tests {
         assert_eq!(CLIENT_PIPE_ACCESS & WRITE_DAC, 0);
         assert_eq!(CLIENT_PIPE_ACCESS & WRITE_OWNER, 0);
         assert!(PIPE_SDDL.contains(";;;AU)"));
-        for forbidden in [";;;BA)", ";;;WD)", ";;;AN)"] {
+        for forbidden in [";;;LS)", ";;;BA)", ";;;WD)", ";;;AN)"] {
             assert!(!PIPE_SDDL.contains(forbidden));
         }
         LocalAllocation::security_descriptor(PIPE_SDDL).unwrap();
@@ -925,6 +918,17 @@ mod tests {
         let service_end =
             source[service_start..].find("\nfn report_stopped").unwrap() + service_start;
         assert!(!source[service_start..service_end].contains("CreateEventW"));
+    }
+
+    #[test]
+    fn first_pipe_handle_is_retained_across_clients_and_timeouts() {
+        let source = include_str!("windows_native.rs");
+        let start = source.find("fn serve_loop(").unwrap();
+        let end = source[start..].find("\nfn serve_connection(").unwrap() + start;
+        let serve_loop = &source[start..end];
+        assert!(!serve_loop.contains("create_server_pipe"));
+        assert!(!serve_loop.contains("drop(pipe)"));
+        assert!(serve_loop.contains("Err(NativeIoError::TimedOut) => continue"));
     }
 
     #[test]
