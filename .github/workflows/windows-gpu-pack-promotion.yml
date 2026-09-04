@@ -9,6 +9,7 @@ on:
       - 'scripts/build-windows-gpu-worker-pack.ps1'
       - 'src/worker_pack_authoring.rs'
       - 'tools/worker-pack-author/**'
+      - 'tools/windows-gpu-promotion-broker/**'
   push:
     branches: [main]
     paths:
@@ -18,6 +19,7 @@ on:
       - 'scripts/build-windows-gpu-worker-pack.ps1'
       - 'src/worker_pack_authoring.rs'
       - 'tools/worker-pack-author/**'
+      - 'tools/windows-gpu-promotion-broker/**'
   workflow_dispatch:
     inputs:
       promote:
@@ -44,10 +46,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e # 1.96.0 branch reviewed 2026-08-27
       - name: Fetch locked worker-pack tool dependencies
         shell: pwsh
-        run: cargo fetch --locked --manifest-path tools/worker-pack-author/Cargo.toml
+        run: |
+          cargo fetch --locked --manifest-path tools/worker-pack-author/Cargo.toml
+          cargo fetch --locked --manifest-path tools/windows-gpu-promotion-broker/Cargo.toml
       - name: Test unsigned handoff and fixture-only atomic promotion
         shell: pwsh
-        run: pwsh -NoProfile -File .\scripts\test-windows-gpu-pack-promotion.ps1
+        run: |
+          pwsh -NoProfile -File .\scripts\test-windows-gpu-pack-promotion.ps1
+          cargo test --locked --offline --manifest-path tools/windows-gpu-promotion-broker/Cargo.toml -- --test-threads=1
 
   prepare-unsigned:
     name: Prepare unsigned CUDA and Vulkan handoff
@@ -143,12 +149,12 @@ jobs:
           artifact-ids: ${{ needs.prepare-unsigned.outputs.artifact_id }}
           digest-mismatch: error
           path: ${{ runner.temp }}/scribe-windows-gpu-handoff
-      - name: Invoke independently installed protected signer
+      - name: Invoke independently installed unprivileged broker client
         shell: pwsh
         env:
-          TRUSTED_SIGNER_PATH: ${{ vars.SCRIBE_WINDOWS_GPU_TRUSTED_SIGNER_PATH }}
-          TRUSTED_SIGNER_SHA256: ${{ vars.SCRIBE_WINDOWS_GPU_TRUSTED_SIGNER_SHA256 }}
-          PRODUCTION_TRUST_PROVISIONED: ${{ vars.SCRIBE_WINDOWS_GPU_PRODUCTION_TRUST_PROVISIONED }}
+          TRUSTED_CLIENT_PATH: ${{ vars.SCRIBE_WINDOWS_GPU_TRUSTED_CLIENT_PATH }}
+          TRUSTED_CLIENT_SHA256: ${{ vars.SCRIBE_WINDOWS_GPU_TRUSTED_CLIENT_SHA256 }}
+          PRODUCTION_BROKER_PROVISIONED: ${{ vars.SCRIBE_WINDOWS_GPU_PRODUCTION_BROKER_PROVISIONED }}
           ARTIFACT_ID: ${{ needs.prepare-unsigned.outputs.artifact_id }}
           ARTIFACT_DIGEST: ${{ needs.prepare-unsigned.outputs.artifact_digest }}
           HANDOFF_SHA256: ${{ needs.prepare-unsigned.outputs.handoff_sha256 }}
@@ -157,18 +163,48 @@ jobs:
           TOOLCHAIN_MANIFEST_SHA256: ${{ needs.prepare-unsigned.outputs.toolchain_manifest_sha256 }}
           PACK_VERSION: ${{ needs.prepare-unsigned.outputs.pack_version }}
         run: |
-          if ($env:PRODUCTION_TRUST_PROVISIONED -cne 'true') { throw 'Production trust root and protected signer are not provisioned; no signing authority was consumed.' }
-          if ([string]::IsNullOrWhiteSpace($env:TRUSTED_SIGNER_PATH) -or $env:TRUSTED_SIGNER_SHA256 -cnotmatch '^[0-9a-f]{64}$') { throw 'Protected trusted signer identity is not provisioned.' }
-          $signer = [IO.Path]::GetFullPath($env:TRUSTED_SIGNER_PATH)
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version Latest
+          if ($env:PRODUCTION_BROKER_PROVISIONED -cne 'true') { throw 'Separately privileged production broker and trust root are not provisioned; no filesystem, ledger, or signing authority was accessed.' }
+          if ([string]::IsNullOrWhiteSpace($env:TRUSTED_CLIENT_PATH) -or $env:TRUSTED_CLIENT_SHA256 -cnotmatch '^[0-9a-f]{64}$') { throw 'Protected broker client identity is not provisioned.' }
+          $client = [IO.Path]::GetFullPath($env:TRUSTED_CLIENT_PATH)
           $workspace = [IO.Path]::GetFullPath($env:GITHUB_WORKSPACE).TrimEnd('\')
           $runnerTemp = [IO.Path]::GetFullPath($env:RUNNER_TEMP).TrimEnd('\')
-          if ($signer.StartsWith("$workspace\", [StringComparison]::OrdinalIgnoreCase) -or $signer.StartsWith("$runnerTemp\", [StringComparison]::OrdinalIgnoreCase)) { throw 'Trusted signer must not come from the checkout, handoff, or runner temporary directory.' }
-          $item = Get-Item -LiteralPath $signer -Force
-          if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'Trusted signer is not a regular non-reparse file.' }
-          if ((Get-FileHash -Algorithm SHA256 -LiteralPath $signer).Hash.ToLowerInvariant() -cne $env:TRUSTED_SIGNER_SHA256) { throw 'Trusted signer digest does not match protected configuration.' }
-          $output = Join-Path $env:RUNNER_TEMP 'scribe-windows-gpu-promoted'
-          & $signer promote-windows-pack-set --handoff-root (Join-Path $env:RUNNER_TEMP 'scribe-windows-gpu-handoff') --output-root $output --source-repository $env:GITHUB_REPOSITORY --source-ref $env:GITHUB_REF --source-revision $env:SOURCE_REVISION --workflow-ref $env:GITHUB_WORKFLOW_REF --workflow-source-sha $env:GITHUB_SHA --run-id $env:GITHUB_RUN_ID --run-attempt $env:GITHUB_RUN_ATTEMPT --artifact-id $env:ARTIFACT_ID --artifact-digest $env:ARTIFACT_DIGEST --handoff-sha256 $env:HANDOFF_SHA256 --release-set-digest $env:RELEASE_SET_DIGEST --toolchain-manifest-sha256 $env:TOOLCHAIN_MANIFEST_SHA256 --pack-version $env:PACK_VERSION --minimum-security-epoch 1 --require-unused-release-set
-          if ($LASTEXITCODE -ne 0) { throw 'Protected signer rejected the unsigned handoff.' }
+          if ($client.StartsWith("$workspace\", [StringComparison]::OrdinalIgnoreCase) -or $client.StartsWith("$runnerTemp\", [StringComparison]::OrdinalIgnoreCase)) { throw 'Trusted broker client must not come from the checkout, handoff, or runner temporary directory.' }
+          $item = Get-Item -LiteralPath $client -Force
+          if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'Trusted broker client is not a regular non-reparse file.' }
+          # This retained leaf handle denies direct writes/deletion after hashing. It does not
+          # provide no-follow open semantics or pin path ancestors; the broker gate stays closed
+          # until installation DACL, ancestor, loader, and service/HSM controls are reviewed.
+          $clientLock = [IO.FileStream]::new($client, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+          try {
+            $sha256 = [Security.Cryptography.SHA256]::Create()
+            try { $actualClientSha256 = ([BitConverter]::ToString($sha256.ComputeHash($clientLock))).Replace('-', '').ToLowerInvariant() }
+            finally { $sha256.Dispose() }
+            if ($actualClientSha256 -cne $env:TRUSTED_CLIENT_SHA256) { throw 'Trusted broker client digest does not match protected configuration.' }
+            $clientLock.Position = 0
+            $output = Join-Path $env:RUNNER_TEMP 'scribe-windows-gpu-promoted'
+            $arguments = @(
+              'promote-windows-pack-set', '--handoff-root', (Join-Path $env:RUNNER_TEMP 'scribe-windows-gpu-handoff'), '--output-root', $output,
+              '--source-repository', $env:GITHUB_REPOSITORY, '--source-ref', $env:GITHUB_REF, '--source-revision', $env:SOURCE_REVISION,
+              '--workflow-ref', $env:GITHUB_WORKFLOW_REF, '--workflow-source-sha', $env:GITHUB_SHA, '--run-id', $env:GITHUB_RUN_ID,
+              '--run-attempt', $env:GITHUB_RUN_ATTEMPT, '--artifact-id', $env:ARTIFACT_ID, '--artifact-digest', $env:ARTIFACT_DIGEST,
+              '--handoff-sha256', $env:HANDOFF_SHA256, '--release-set-digest', $env:RELEASE_SET_DIGEST,
+              '--toolchain-manifest-sha256', $env:TOOLCHAIN_MANIFEST_SHA256, '--pack-version', $env:PACK_VERSION,
+              '--minimum-security-epoch', '1', '--require-unused-release-set'
+            )
+            $processInfo = [Diagnostics.ProcessStartInfo]::new()
+            $processInfo.FileName = $client
+            $processInfo.UseShellExecute = $false
+            $processInfo.WorkingDirectory = [IO.Path]::GetDirectoryName($client)
+            foreach ($argument in $arguments) { $processInfo.ArgumentList.Add([string]$argument) }
+            $process = [Diagnostics.Process]::Start($processInfo)
+            if ($null -eq $process) { throw 'Protected broker client process did not start.' }
+            try { $process.WaitForExit(); $clientExitCode = $process.ExitCode }
+            finally { $process.Dispose() }
+            if ($clientExitCode -ne 0) { throw 'Protected broker rejected the unsigned handoff.' }
+          }
+          finally { $clientLock.Dispose() }
           if (-not (Test-Path -LiteralPath (Join-Path $output 'protected-promotion-receipt.json') -PathType Leaf)) { throw 'Protected signer did not produce its signed promotion receipt.' }
       - name: Upload non-activated protected signed set
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0

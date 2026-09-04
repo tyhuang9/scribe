@@ -57,30 +57,54 @@ one-day handoff artifact. The handoff binds repository/ref/source SHA, workflow
 ref, run ID and attempt, pack version, pinned toolchain-manifest SHA-256, both
 manifest and pack digests, and a release-set digest. GitHub's artifact upload
 returns an artifact ID and digest; the digest-pinned download action validates
-the transfer before the protected boundary, and the independent signer receives
-both values as part of its authorization context.
+the transfer before the protected boundary, and the future privileged broker
+must bind both values as part of its authorization context.
 
 The protected job requires approval through the
 `windows-gpu-pack-signing` environment and a fresh
 `scribe-gpu-pack-signer-ephemeral` runner using Actions Runner 2.327.1 or later
 (required by the pinned Node 24 artifact action). It performs no checkout or
 compile, runs no repository script, and receives no raw private key. The
-independently installed signer executable must match the digest in protected
-environment configuration, copy hostile input into signer-owned storage through
-no-follow handles, enforce the approved toolchain/version/security epoch, reject
-replay with its own durable release-set ledger, sign and verify both packs, and
-publish only the complete CUDA+Vulkan pair plus a protected receipt. The
+independently installed executable is an unprivileged broker client, not a
+signer. Its digest is pinned in protected environment configuration and the
+workflow holds a read-only, no-write/delete handle from hashing through child
+exit. This narrows direct leaf-file replacement only: the standard .NET open
+does not provide `FILE_FLAG_OPEN_REPARSE_POINT`, pin ancestor handles, prove the
+installation DACL, or constrain future loader dependencies. The client has no
+key, ledger, state path, configurable broker endpoint, or fixture mode. A
+separately privileged Windows service or remote HSM broker must copy hostile
+input into broker-owned storage, enforce the approved toolchain, version, and
+security epoch, reject replay with independently durable state, sign and verify
+both packs, and publish only
+the complete CUDA+Vulkan pair plus a protected receipt. The
 resulting artifact is not activated or included in the normal release
 automatically.
 
-This path is currently a NO-GO: `ProductionTrustRoot`, the protected signer,
-its persistent epoch/replay authority, and the CUDA production inventory are
-not provisioned. The protected job checks that state and stops before invoking
-the signer, so a failed run cannot consume signer authority. Validate only the
-fixture contract locally with:
+The independently locked `tools/windows-gpu-promotion-broker` workspace defines
+the exact request schema and a test-only hostile-input state-machine proof. Its
+fixture implementation uses retained no-write/delete file handles, no-follow
+final opens, exact bounded inventories, a domain-separated signed receipt, a
+hash-chained reserve/ready/published ledger, and write-through atomic pair
+publication. The fixture seed and ledger code are compiled only under
+`cfg(test)` and are absent from the normal client artifact. Windows does not
+provide a stable handle-relative traversal API through Rust's standard library;
+because this proof cannot establish service ACLs or full NT handle-relative
+traversal, it is not production authority.
+
+The checked-in client intentionally attempts no IPC. Connecting it to a fixed,
+authenticated service/HSM endpoint and provisioning that service are separate
+security-reviewed release work; an endpoint supplied by CLI or environment is
+not accepted.
+
+This path is currently a NO-GO: `ProductionTrustRoot`, the privileged broker or
+HSM, its independently durable epoch/replay authority, and the CUDA production
+inventory are not provisioned. The protected job checks that state and stops
+before invoking the client, so a failed run cannot access broker or signing
+authority. Validate only the fixture contracts locally with:
 
 ```powershell
 pwsh -NoProfile -File .\scripts\test-windows-gpu-pack-promotion.ps1
+cargo test --locked --offline --manifest-path tools/windows-gpu-promotion-broker/Cargo.toml -- --test-threads=1
 ```
 
 Windows GPU Auto activation also requires the independent offline evidence

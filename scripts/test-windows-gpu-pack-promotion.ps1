@@ -1,6 +1,8 @@
 [CmdletBinding()]
 param(
-    [string]$CargoTargetDirectory
+    [string]$CargoTargetDirectory,
+    [string]$InteropFixtureDirectory,
+    [string]$InteropPublicationDirectory
 )
 
 $ErrorActionPreference = 'Stop'
@@ -76,6 +78,9 @@ $testRoot = Join-Path ([IO.Path]::GetTempPath()) "scribe-pack-promotion-$([guid]
 $previousTarget = $env:CARGO_TARGET_DIR
 $previousRevision = $env:SCRIBE_BUILD_REVISION
 try {
+    if ([string]::IsNullOrWhiteSpace($InteropFixtureDirectory) -ne [string]::IsNullOrWhiteSpace($InteropPublicationDirectory)) {
+        throw 'Interoperability fixture and publication directories must be supplied together.'
+    }
     $env:CARGO_TARGET_DIR = $target
     $env:SCRIBE_BUILD_REVISION = $revision
     cargo build --locked --offline --manifest-path (Join-Path $repositoryRoot 'tools\worker-pack-author\Cargo.toml')
@@ -201,17 +206,68 @@ try {
     Assert-True ($workflow.Contains('steps.upload.outputs.artifact-digest')) 'Unsigned artifact digest is not bound across jobs.'
     Assert-True ($workflow.Contains('steps.upload.outputs.artifact-id')) 'Unsigned artifact ID is not bound across jobs.'
     Assert-True ($workflow.Contains('cargo fetch --locked --manifest-path tools/worker-pack-author/Cargo.toml')) 'Clean hosted runners do not fetch the locked worker-pack tool dependencies before offline testing.'
+    Assert-True ($workflow.Contains('cargo fetch --locked --manifest-path tools/windows-gpu-promotion-broker/Cargo.toml')) 'Clean hosted runners do not fetch the independently locked broker-contract dependencies.'
+    Assert-True ($workflow.Contains('cargo test --locked --offline --manifest-path tools/windows-gpu-promotion-broker/Cargo.toml')) 'Hosted contract validation does not exercise the locked offline broker state-machine proof.'
     Assert-True ($workflow.Contains('github.event.repository.default_branch')) 'Production dispatch is not restricted to the default branch.'
-    Assert-True ($protected.Contains('SCRIBE_WINDOWS_GPU_TRUSTED_SIGNER_SHA256')) 'Protected signer digest is not independently configured.'
+    Assert-True ($protected.Contains('SCRIBE_WINDOWS_GPU_TRUSTED_CLIENT_SHA256')) 'Protected broker-client digest is not independently configured.'
+    Assert-True ($protected.Contains('SCRIBE_WINDOWS_GPU_PRODUCTION_BROKER_PROVISIONED')) 'Separately privileged broker provisioning gate is missing.'
     Assert-True ($protected.Contains('actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c')) 'Protected artifact download is not pinned to the reviewed v8.0.1 action.'
     Assert-True ($protected.Contains('digest-mismatch: error')) 'Protected artifact download does not fail closed on a digest mismatch.'
     Assert-True ($protected.Contains('--require-unused-release-set')) 'Trusted signer interface does not require replay rejection.'
-    Assert-True ($protected.Contains('no signing authority was consumed')) 'Unprovisioned production path does not fail before signer invocation.'
+    Assert-True ($protected.Contains('no filesystem, ledger, or signing authority was accessed')) 'Unprovisioned production path does not fail before client invocation.'
+    Assert-True ($protected.Contains('[IO.FileShare]::Read')) 'Protected workflow does not retain a no-write/delete client handle.'
+    Assert-True ($protected.Contains('provide no-follow open semantics or pin path ancestors')) 'Protected workflow overstates its leaf handle authority.'
+    Assert-True ($protected.Contains('$processInfo.ArgumentList.Add')) 'Protected workflow does not use the structured child-process argument API.'
     Assert-True ($protected.Contains('scribe-gpu-pack-signer-ephemeral')) 'Protected signer runner is not required to be ephemeral.'
     Assert-True (-not $protected.Contains('actions/checkout@')) 'Protected signing job checks out candidate source.'
     Assert-True (-not $protected.Contains('cargo ')) 'Protected signing job compiles candidate source.'
     Assert-True (-not $protected.Contains('promote-windows-gpu-worker-packs.ps1')) 'Protected job runs a repository-owned promotion script.'
     Assert-True (-not $workflow.Contains('secrets.')) 'Promotion workflow exposes raw private-key secrets to repository jobs.'
+    Assert-True (-not $protected.Contains('--private-key')) 'Protected broker client accepts a raw key path.'
+    Assert-True (-not $protected.Contains('--ledger-root')) 'Ephemeral runner configures durable broker state.'
+    Assert-True (-not $protected.Contains('--broker-endpoint')) 'Ephemeral runner can redirect broker authority.'
+    Assert-True ((Get-Content -LiteralPath (Join-Path $repositoryRoot 'tools\windows-gpu-promotion-broker\src\lib.rs') -Raw).Contains('self.workflow_source_sha != self.source_revision')) 'Broker contract does not bind workflow source to default-branch pack source.'
+    Assert-True ((Get-Content -LiteralPath (Join-Path $repositoryRoot 'tools\windows-gpu-promotion-broker\src\fixture.rs') -Raw).Contains('consumes_canonical_handoff_generated_by_powershell_and_worker_pack_author')) 'Broker proof does not consume the PowerShell/worker-pack-author interoperability fixture.'
+
+    if (-not [string]::IsNullOrWhiteSpace($InteropFixtureDirectory)) {
+        $interopFixture = [IO.Path]::GetFullPath($InteropFixtureDirectory)
+        $interopPublication = [IO.Path]::GetFullPath($InteropPublicationDirectory)
+        if (Test-Path -LiteralPath $interopFixture) { throw 'Interoperability fixture directory must be fresh.' }
+        if (Test-Path -LiteralPath $interopPublication) { throw 'Interoperability publication directory must be fresh.' }
+        if (-not (Test-Path -LiteralPath (Split-Path -Parent $interopFixture) -PathType Container)) { throw 'Interoperability fixture parent is missing.' }
+        New-Item -ItemType Directory -Path $interopFixture | Out-Null
+        New-Item -ItemType Directory -Path $interopPublication | Out-Null
+        $interopHandoffRoot = Join-Path $interopFixture 'handoff'
+        New-Item -ItemType Directory -Path $interopHandoffRoot | Out-Null
+        $interopCuda = New-PreparedPack $tool (Join-Path $interopHandoffRoot 'cuda') 'Cuda'
+        $interopVulkan = New-PreparedPack $tool (Join-Path $interopHandoffRoot 'vulkan') 'Vulkan'
+        $interopHandoff = Write-Handoff $interopHandoffRoot $interopCuda $interopVulkan $revision $toolchainDigest
+        $interopRequest = [ordered]@{
+            schema_version = 1
+            handoff_root = $interopHandoffRoot
+            output_root = (Join-Path $interopPublication 'interop-release')
+            source_repository = 'tyhuang9/scribe'
+            source_ref = 'refs/heads/main'
+            source_revision = $revision
+            workflow_ref = 'tyhuang9/scribe/.github/workflows/windows-gpu-pack-promotion.yml@refs/heads/main'
+            workflow_source_sha = $revision
+            run_id = '1001'
+            run_attempt = '1'
+            artifact_id = '2002'
+            artifact_digest = $artifactDigest
+            handoff_sha256 = $interopHandoff.Sha256
+            release_set_digest = $interopHandoff.ReleaseSetDigest
+            toolchain_manifest_sha256 = $toolchainDigest
+            pack_version = '0.1.0-promotion-fixture'
+            minimum_security_epoch = [uint64]1
+            require_unused_release_set = $true
+        }
+        [IO.File]::WriteAllText(
+            (Join-Path $interopFixture 'promotion-request.json'),
+            ($interopRequest | ConvertTo-Json -Depth 8 -Compress),
+            [Text.UTF8Encoding]::new($false)
+        )
+    }
 }
 finally {
     $env:CARGO_TARGET_DIR = $previousTarget
