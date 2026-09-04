@@ -1687,7 +1687,7 @@ fn windows_gpu_pack_promotion_keeps_candidate_and_signing_authority_separate() {
         "WaitForStatus",
         "Refusing to modify a pre-existing fixed Windows GPU broker client policy",
         "Missing policy",
-        "Weak inherited policy",
+        "Weak broad-read policy DACL",
         "Extra policy value",
         "Malformed policy schema",
         "Broad malformed policy SID",
@@ -1697,6 +1697,10 @@ fn windows_gpu_pack_promotion_keeps_candidate_and_signing_authority_separate() {
         "Service restart did not load the mutated authorization SID",
         "PipeAccessRights]::FullControl",
         "Assert-ExactPolicyAcl",
+        "Assert-OwnedPolicyState -State $state",
+        "SecurityFingerprint",
+        "CleanupTamper",
+        "if ($result.ExitCode -eq 0)",
         "Remove-OwnedPolicy",
     ] {
         assert!(
@@ -1709,9 +1713,15 @@ fn windows_gpu_pack_promotion_keeps_candidate_and_signing_authority_separate() {
         r"SOFTWARE\Scribe\GpuPromotionBroker\v1\Authorization",
         "RegistryView]::Registry64",
         "RegCreateKeyExW",
+        "CreateProtectedKey",
+        "ref SecurityAttributes securityAttributes",
+        "SecurityDescriptor = descriptor",
+        "O:SYD:P(A;;KA;;;SY)(A;;KA;;;BA)(A;;KR;;;",
+        "OpenExistingKeyNoFollow",
+        "REG_OPTION_OPEN_LINK",
+        "SymbolicLinkValue",
+        "$mutationMask = [uint32]0x500d0026",
         "Refusing to modify a pre-existing Windows GPU broker client policy",
-        "SetAccessRuleProtection($true, $false)",
-        "SetOwner([Security.Principal.SecurityIdentifier]::new($systemSid))",
         "RegistryRights]::FullControl",
         "RegistryRights]::ReadKey",
         "ProvisioningState",
@@ -1725,6 +1735,44 @@ fn windows_gpu_pack_promotion_keeps_candidate_and_signing_authority_separate() {
             "broker client-policy provisioner lost {required:?}"
         );
     }
+    let born_protected = client_policy_provisioner
+        .rfind("Assert-PolicySecurity -Key $key")
+        .expect("provisioner verifies create-time policy security");
+    let first_value_write = client_policy_provisioner
+        .find("$key.SetValue($provisioningValue")
+        .expect("provisioner writes its incomplete marker");
+    assert!(
+        born_protected < first_value_write,
+        "broker policy must be born protected before its first value write"
+    );
+    let create_method_start = client_policy_provisioner
+        .find("public static int CreateProtectedKey(")
+        .expect("provisioner defines its native create helper");
+    let create_method_end = client_policy_provisioner[create_method_start..]
+        .find("public static int OpenExistingKeyNoFollow(")
+        .map(|offset| create_method_start + offset)
+        .expect("native create helper has a bounded source region");
+    assert!(
+        client_policy_provisioner[create_method_start..create_method_end]
+            .contains("ref securityAttributes"),
+        "native policy creation must pass non-null security attributes"
+    );
+    let ancestor_validation = client_policy_provisioner
+        .find("foreach ($ancestorPath in $policyAncestors)")
+        .expect("provisioner validates the fixed ancestor chain");
+    let leaf_creation = client_policy_provisioner
+        .find("$status = [Scribe.GpuBroker.RegistryNative]::CreateProtectedKey(")
+        .expect("provisioner creates the authorization leaf");
+    assert!(
+        ancestor_validation < leaf_creation,
+        "broker policy ancestor chain must be secured before leaf creation"
+    );
+    assert!(
+        !transport_test.contains(
+            "if (Test-Path -LiteralPath $policyRegistryPath) { $script:createdPolicy = $true }"
+        ),
+        "SCM harness must not infer destructive policy ownership from path existence"
+    );
     for forbidden in [
         "[string]$AccountName",
         "LookupAccountName",

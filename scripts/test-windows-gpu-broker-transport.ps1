@@ -20,7 +20,14 @@ $machineTarget = $null
 $primaryFailure = $null
 $cleanupFailures = [Collections.Generic.List[object]]::new()
 $safeToRemoveMachineTarget = $false
-$createdPolicy = $false
+$ownedPolicyState = $null
+$initiallyMissingPolicyAncestors = @()
+$ownedPolicyAncestors = @()
+$policyAncestorPaths = @(
+    'SOFTWARE\Scribe',
+    'SOFTWARE\Scribe\GpuPromotionBroker',
+    'SOFTWARE\Scribe\GpuPromotionBroker\v1'
+)
 
 function Assert-True([bool]$Condition, [string]$Message) {
     if (-not $Condition) { throw $Message }
@@ -112,47 +119,146 @@ function Wait-ServiceNotRunning([int]$TimeoutSeconds) {
     throw "Service $serviceName remained active after a rejected startup."
 }
 
-function Remove-OwnedPolicy {
-    if (-not $createdPolicy) { return }
+function Get-PolicySecurityFingerprint([Microsoft.Win32.RegistryKey]$Key) {
+    $security = $Key.GetAccessControl([Security.AccessControl.AccessControlSections]'Access, Owner')
+    return [Convert]::ToBase64String($security.GetSecurityDescriptorBinaryForm())
+}
+
+function New-ExpectedPolicyValues([string]$Sid) {
+    return [ordered]@{
+        'AuthorizedClientSid' = [pscustomobject]@{ Kind = [Microsoft.Win32.RegistryValueKind]::String; Value = $Sid }
+        'SchemaVersion' = [pscustomobject]@{ Kind = [Microsoft.Win32.RegistryValueKind]::DWord; Value = [uint32]1 }
+    }
+}
+
+function Assert-OwnedPolicyState([object]$State) {
+    Assert-True ($null -ne $State) 'Policy ownership state is unavailable.'
     Assert-True ($policyRegistryPath -ceq 'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Scribe\GpuPromotionBroker\v1\Authorization') 'Policy cleanup target changed.'
     $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
     try {
         $key = $base.OpenSubKey($policyPath, $false)
-        if ($null -ne $key) {
-            try { Assert-True ($key.SubKeyCount -eq 0) 'Refusing to recursively remove a policy containing subkeys.' }
-            finally { $key.Dispose() }
-            $base.DeleteSubKey($policyPath, $false)
-        }
-    }
-    finally { $base.Dispose() }
-    $script:createdPolicy = $false
-}
-
-function New-ProtectedPolicy([string]$Sid) {
-    $powerShell = (Get-Process -Id $PID).Path
-    $result = Invoke-Process -FilePath $powerShell -Arguments @('-NoProfile', '-File', $provisioner, '-AuthorizedClientSid', $Sid) -TimeoutSeconds 30 -AllowFailure
-    if (Test-Path -LiteralPath $policyRegistryPath) { $script:createdPolicy = $true }
-    return $result
-}
-
-function New-WeakPolicy([string]$Sid) {
-    $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
-    try {
-        $key = $base.CreateSubKey($policyPath, $true)
-        if ($null -eq $key) { throw 'Could not create weak authorization policy fixture.' }
-        $script:createdPolicy = $true
+        Assert-True ($null -ne $key) 'Owned authorization policy disappeared; refusing cleanup.'
         try {
-            $key.SetValue('SchemaVersion', 1, [Microsoft.Win32.RegistryValueKind]::DWord)
-            $key.SetValue('AuthorizedClientSid', $Sid, [Microsoft.Win32.RegistryValueKind]::String)
-            $key.Flush()
+            Assert-True ($key.SubKeyCount -eq 0) 'Refusing to remove a policy containing subkeys.'
+            $actualNames = @($key.GetValueNames() | Sort-Object -CaseSensitive)
+            $expectedNames = @($State.Values.Keys | Sort-Object -CaseSensitive)
+            Assert-True ($actualNames.Count -eq $expectedNames.Count) 'Policy value inventory changed; refusing cleanup.'
+            for ($index = 0; $index -lt $expectedNames.Count; $index++) {
+                Assert-True ($actualNames[$index] -ceq $expectedNames[$index]) 'Policy value inventory changed; refusing cleanup.'
+                $name = $expectedNames[$index]
+                $expected = $State.Values[$name]
+                Assert-True ($key.GetValueKind($name) -eq $expected.Kind) "Policy value type changed for $name; refusing cleanup."
+                $actual = $key.GetValue($name)
+                if ($expected.Kind -eq [Microsoft.Win32.RegistryValueKind]::DWord) {
+                    Assert-True ([uint32]$actual -eq [uint32]$expected.Value) "Policy value changed for $name; refusing cleanup."
+                }
+                else {
+                    Assert-True ([string]$actual -ceq [string]$expected.Value) "Policy value changed for $name; refusing cleanup."
+                }
+            }
+            Assert-True ((Get-PolicySecurityFingerprint -Key $key) -ceq $State.SecurityFingerprint) 'Policy security descriptor changed; refusing cleanup.'
+            if ($State.RequireCanonicalAcl) { Assert-ExactPolicyAclForKey -Key $key }
         }
         finally { $key.Dispose() }
     }
     finally { $base.Dispose() }
 }
 
+function Remove-OwnedPolicy {
+    if ($null -eq $ownedPolicyState) { return }
+    $state = $ownedPolicyState
+    Assert-OwnedPolicyState -State $state
+    $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
+    try { $base.DeleteSubKey($policyPath, $false) }
+    finally { $base.Dispose() }
+    Assert-True (-not (Test-Path -LiteralPath $policyRegistryPath)) 'Owned authorization policy remained after cleanup.'
+    $script:ownedPolicyState = $null
+}
+
+function Remove-OwnedPolicyAncestors {
+    if ($ownedPolicyAncestors.Count -eq 0) { return }
+    Assert-True (@($ownedPolicyAncestors | Where-Object { $_ -cnotin $policyAncestorPaths }).Count -eq 0) 'Policy ancestor cleanup target changed.'
+    $paths = @($ownedPolicyAncestors)
+    [array]::Reverse($paths)
+    $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
+    try {
+        foreach ($path in $paths) {
+            $key = $base.OpenSubKey($path, $false)
+            Assert-True ($null -ne $key) "Owned policy ancestor $path disappeared; refusing cleanup."
+            try {
+                Assert-True ($key.SubKeyCount -eq 0 -and $key.ValueCount -eq 0) "Owned policy ancestor $path is no longer empty; refusing cleanup."
+                Assert-ExactPolicyAclForKey -Key $key
+            }
+            finally { $key.Dispose() }
+            $base.DeleteSubKey($path, $false)
+        }
+    }
+    finally { $base.Dispose() }
+    $script:ownedPolicyAncestors = @()
+}
+
+function Set-OwnedPolicyState([System.Collections.IDictionary]$Values, [bool]$RequireCanonicalAcl) {
+    $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
+    try {
+        $key = $base.OpenSubKey($policyPath, $false)
+        Assert-True ($null -ne $key) 'Successfully provisioned authorization policy is unavailable.'
+        try {
+            $state = [pscustomobject]@{
+                Values = $Values
+                RequireCanonicalAcl = $RequireCanonicalAcl
+                SecurityFingerprint = Get-PolicySecurityFingerprint -Key $key
+            }
+            if ($RequireCanonicalAcl) { Assert-ExactPolicyAclForKey -Key $key }
+        }
+        finally { $key.Dispose() }
+    }
+    finally { $base.Dispose() }
+    Assert-OwnedPolicyState -State $state
+    $script:ownedPolicyState = $state
+}
+
+function New-ProtectedPolicy([string]$Sid) {
+    $powerShell = (Get-Process -Id $PID).Path
+    $result = Invoke-Process -FilePath $powerShell -Arguments @('-NoProfile', '-File', $provisioner, '-AuthorizedClientSid', $Sid) -TimeoutSeconds 30 -AllowFailure
+    if ($result.ExitCode -eq 0) {
+        Assert-True ($null -eq $ownedPolicyState) 'Provisioner succeeded while another policy was owned by the harness.'
+        Set-OwnedPolicyState -Values (New-ExpectedPolicyValues -Sid $Sid) -RequireCanonicalAcl $true
+        if ($ownedPolicyAncestors.Count -eq 0) {
+            $script:ownedPolicyAncestors = @($initiallyMissingPolicyAncestors)
+        }
+    }
+    return $result
+}
+
+function New-WeakPolicy([string]$Sid) {
+    $result = New-ProtectedPolicy -Sid $Sid
+    Assert-True ($result.ExitCode -eq 0) "Could not provision the weak-DACL fixture: $($result.Stderr)"
+    Assert-OwnedPolicyState -State $ownedPolicyState
+    $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
+    try {
+        $key = $base.OpenSubKey($policyPath, $true)
+        Assert-True ($null -ne $key) 'Owned authorization policy disappeared before weak-DACL setup.'
+        try {
+            $security = $key.GetAccessControl([Security.AccessControl.AccessControlSections]'Access, Owner')
+            $broadRead = [Security.AccessControl.RegistryAccessRule]::new(
+                [Security.Principal.SecurityIdentifier]::new('S-1-5-11'),
+                [Security.AccessControl.RegistryRights]::ReadKey,
+                [Security.AccessControl.InheritanceFlags]::None,
+                [Security.AccessControl.PropagationFlags]::None,
+                [Security.AccessControl.AccessControlType]::Allow
+            )
+            [void]$security.AddAccessRule($broadRead)
+            $key.SetAccessControl($security)
+        }
+        finally { $key.Dispose() }
+    }
+    finally { $base.Dispose() }
+    Set-OwnedPolicyState -Values (New-ExpectedPolicyValues -Sid $Sid) -RequireCanonicalAcl $false
+}
+
 function Set-PolicyValue([string]$Name, [object]$Value, [Microsoft.Win32.RegistryValueKind]$Kind) {
-    Assert-True $createdPolicy 'Refusing to mutate a policy not created by this harness.'
+    Assert-True ($null -ne $ownedPolicyState) 'Refusing to mutate a policy not created by this harness.'
+    Assert-OwnedPolicyState -State $ownedPolicyState
     $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
     try {
         $key = $base.OpenSubKey($policyPath, $true)
@@ -161,10 +267,14 @@ function Set-PolicyValue([string]$Name, [object]$Value, [Microsoft.Win32.Registr
         finally { $key.Dispose() }
     }
     finally { $base.Dispose() }
+    $values = [ordered]@{}
+    foreach ($existingName in $ownedPolicyState.Values.Keys) { $values[$existingName] = $ownedPolicyState.Values[$existingName] }
+    $values[$Name] = [pscustomobject]@{ Kind = $Kind; Value = $Value }
+    Set-OwnedPolicyState -Values $values -RequireCanonicalAcl $ownedPolicyState.RequireCanonicalAcl
 }
 
-function Assert-ExactPolicyAcl {
-    $acl = Get-Acl -LiteralPath $policyRegistryPath
+function Assert-ExactPolicyAclForKey([Microsoft.Win32.RegistryKey]$Key) {
+    $acl = $Key.GetAccessControl([Security.AccessControl.AccessControlSections]'Access, Owner')
     Assert-True $acl.AreAccessRulesProtected 'Authorization policy DACL is not protected.'
     Assert-True ($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -ceq 'S-1-5-18') 'Authorization policy owner is not SYSTEM.'
     $rules = @($acl.GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier]))
@@ -181,6 +291,17 @@ function Assert-ExactPolicyAcl {
         [void]$expected.Remove($rule.IdentityReference.Value)
     }
     Assert-True ($expected.Count -eq 0) 'Authorization policy is missing a required SID.'
+}
+
+function Assert-ExactPolicyAcl {
+    $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
+    try {
+        $key = $base.OpenSubKey($policyPath, $false)
+        Assert-True ($null -ne $key) 'Authorization policy is unavailable.'
+        try { Assert-ExactPolicyAclForKey -Key $key }
+        finally { $key.Dispose() }
+    }
+    finally { $base.Dispose() }
 }
 
 function Assert-RejectedServiceStartup([string]$Label, [string]$Client, [string[]]$ClientArguments) {
@@ -285,10 +406,22 @@ try {
     if (Test-Path -LiteralPath $policyRegistryPath) {
         throw 'Refusing to modify a pre-existing fixed Windows GPU broker client policy.'
     }
+    $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
+    try {
+        $missing = [Collections.Generic.List[string]]::new()
+        foreach ($path in $policyAncestorPaths) {
+            $ancestor = $base.OpenSubKey($path, $false)
+            if ($null -eq $ancestor) { [void]$missing.Add($path) }
+            else { $ancestor.Dispose() }
+        }
+        $initiallyMissingPolicyAncestors = @($missing)
+    }
+    finally { $base.Dispose() }
     foreach ($rejectedSid in @('BUILTIN\Users', 'S-1-5-11', 'S-1-5-20', $serviceSid, 'S-1-5-21-1-2-3-500')) {
         $rejectedProvision = New-ProtectedPolicy -Sid $rejectedSid
         Assert-True ($rejectedProvision.ExitCode -ne 0) "Provisioner accepted dangerous client identity $rejectedSid."
         Assert-True (-not (Test-Path -LiteralPath $policyRegistryPath)) 'Rejected provisioning created a policy key.'
+        Assert-True ($null -eq $ownedPolicyState) 'Rejected provisioning established destructive policy ownership.'
     }
 
     $commonAppData = [Environment]::GetFolderPath([Environment+SpecialFolder]::CommonApplicationData)
@@ -352,7 +485,7 @@ try {
     Assert-True (-not (Test-Path -LiteralPath $output)) 'Missing-policy startup touched the output path.'
 
     New-WeakPolicy -Sid $identity.User.Value
-    Assert-RejectedServiceStartup -Label 'Weak inherited policy' -Client $client -ClientArguments $arguments
+    Assert-RejectedServiceStartup -Label 'Weak broad-read policy DACL' -Client $client -ClientArguments $arguments
     Remove-OwnedPolicy
 
     $provisioned = New-ProtectedPolicy -Sid $identity.User.Value
@@ -360,6 +493,31 @@ try {
     Assert-ExactPolicyAcl
     $duplicateProvision = New-ProtectedPolicy -Sid $identity.User.Value
     Assert-True ($duplicateProvision.ExitCode -ne 0) 'Provisioner modified a pre-existing policy.'
+
+    # A failed provision never establishes ownership, and cleanup must also
+    # refuse an owned key whose exact fixture state changed unexpectedly.
+    $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
+    try {
+        $key = $base.OpenSubKey($policyPath, $true)
+        Assert-True ($null -ne $key) 'Owned policy disappeared before adversarial cleanup proof.'
+        try { $key.SetValue('CleanupTamper', 'foreign', [Microsoft.Win32.RegistryValueKind]::String); $key.Flush() }
+        finally { $key.Dispose() }
+    }
+    finally { $base.Dispose() }
+    $cleanupRejected = $false
+    try { Remove-OwnedPolicy }
+    catch { $cleanupRejected = $true }
+    Assert-True $cleanupRejected 'Policy cleanup accepted a changed same-name key.'
+    Assert-True (Test-Path -LiteralPath $policyRegistryPath) 'Policy cleanup deleted a changed same-name key.'
+    $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
+    try {
+        $key = $base.OpenSubKey($policyPath, $true)
+        Assert-True ($null -ne $key) 'Changed policy disappeared during adversarial cleanup proof.'
+        try { $key.DeleteValue('CleanupTamper', $true); $key.Flush() }
+        finally { $key.Dispose() }
+    }
+    finally { $base.Dispose() }
+    Assert-OwnedPolicyState -State $ownedPolicyState
 
     Set-PolicyValue -Name 'UnexpectedValue' -Value 'forbidden' -Kind ([Microsoft.Win32.RegistryValueKind]::String)
     Assert-RejectedServiceStartup -Label 'Extra policy value' -Client $client -ClientArguments $arguments
@@ -477,8 +635,11 @@ try {
 catch { $primaryFailure = $_ }
 finally {
     try {
-        if ($createdPolicy) { Remove-OwnedPolicy }
+        if ($null -ne $ownedPolicyState) { Remove-OwnedPolicy }
     }
+    catch { [void]$cleanupFailures.Add($_) }
+
+    try { Remove-OwnedPolicyAncestors }
     catch { [void]$cleanupFailures.Add($_) }
 
     try {

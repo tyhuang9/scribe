@@ -59,8 +59,12 @@ The provisioner accepts a SID, never an account name, and conservatively
 accepts only canonical `S-1-5-21` account SIDs with RID 1000 or greater. This
 rejects broad/built-in identities, SYSTEM, LocalService, NetworkService, all
 service SID forms, and the broker service SID. It creates rather than updates,
-retains an incomplete marker until values and security verify, and refuses any
-pre-existing policy.
+supplies the final SYSTEM-owned protected descriptor atomically with key
+creation, verifies that protection before its first value write, retains an
+incomplete marker until values verify, and refuses any pre-existing policy. It
+also opens the fixed 64-bit ancestor chain without following registry links,
+refuses ancestors writable by untrusted principals, and atomically protects any
+missing Scribe-specific ancestor before creating the leaf.
 
 The hostile-input copier, fixture Ed25519 authority, chained replay/epoch
 ledger, signed receipt, recovery state machine, authorizer, and atomic publisher

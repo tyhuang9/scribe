@@ -144,7 +144,12 @@ pwsh -NoProfile -File .\scripts\provision-windows-gpu-broker-client-policy.ps1 -
 
 It refuses broad, built-in, reserved, NetworkService/other service principals,
 the broker service SID, or any pre-existing policy and leaves interrupted work
-unusable via an incomplete marker. Policy provisioning does not provision a
+unusable via an incomplete marker. The final SYSTEM-owned protected descriptor
+is supplied atomically at key creation and verified before the first value
+write, so inherited writers have no pre-lockdown handle window. Every fixed
+64-bit ancestor is opened without following registry links and refused if an
+untrusted principal can mutate it; missing Scribe-specific ancestors are born
+with the same protected descriptor. Policy provisioning does not provision a
 key, trust root, ledger, signer, pack intake/publication, or activation.
 Production service installation is not part of the application installer, the
 `SCRIBE_WINDOWS_GPU_PRODUCTION_BROKER_PROVISIONED` gate remains closed, and an

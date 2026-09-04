@@ -328,9 +328,15 @@ The elevated create-new provisioner accepts only an explicit canonical
 `S-1-5-21` account SID with RID 1000 or greater. It rejects account names,
 broad/built-in identities, SYSTEM, LocalService, NetworkService, service SID
 forms including the broker SID, and any pre-existing policy. An incomplete
-marker keeps interrupted setup unusable until values, SYSTEM ownership, and the
-exact protected ACE inventory verify. This conservative policy intentionally
-excludes non-account and service principals; changing it requires review.
+marker keeps interrupted setup unusable. The key is born with its final
+SYSTEM-owned protected ACE inventory through non-null creation security
+attributes, which are verified before the first value write; there is no
+inherited-DACL lockdown window. The provisioner opens every fixed 64-bit path
+ancestor without following registry links, refuses unsafe existing ancestors,
+and atomically protects each missing Scribe-specific ancestor before descending.
+This prevents an ambient writer from replacing the final key after its DACL is
+verified. This conservative policy intentionally excludes non-account and
+service principals; changing it requires review.
 
 The same workspace proves the broker state machine with test-only authority:
 deny-unknown-fields canonical schemas, exact

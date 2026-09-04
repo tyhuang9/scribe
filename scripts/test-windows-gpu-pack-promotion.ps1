@@ -247,10 +247,31 @@ try {
     Assert-True (-not $brokerNativeProduction.Contains(';;;AU)')) 'Broker pipe regained Authenticated Users admission.'
     $provisioner = Get-Content -LiteralPath (Join-Path $repositoryRoot 'scripts\provision-windows-gpu-broker-client-policy.ps1') -Raw
     Assert-True ($provisioner.Contains('RegCreateKeyExW')) 'Client policy provisioner is not create-new.'
-    Assert-True ($provisioner.Contains('SetAccessRuleProtection($true, $false)')) 'Client policy provisioner does not protect its DACL.'
+    $createMethodStart = $provisioner.IndexOf('public static int CreateProtectedKey(', [StringComparison]::Ordinal)
+    $createMethodEnd = $provisioner.IndexOf('public static int OpenExistingKeyNoFollow(', $createMethodStart, [StringComparison]::Ordinal)
+    Assert-True ($createMethodStart -ge 0 -and $createMethodEnd -gt $createMethodStart) 'Client policy provisioner lost its bounded native create helper.'
+    $createMethod = $provisioner.Substring($createMethodStart, $createMethodEnd - $createMethodStart)
+    Assert-True ($createMethod.Contains('ref securityAttributes')) 'Client policy provisioner does not pass non-null creation security attributes.'
+    Assert-True ($provisioner.Contains('O:SYD:P(A;;KA;;;SY)(A;;KA;;;BA)(A;;KR;;;')) 'Client policy provisioner does not create the final SYSTEM-owned protected DACL atomically.'
+    Assert-True ($provisioner.Contains('OpenExistingKeyNoFollow')) 'Client policy provisioner follows registry links in the fixed ancestor chain.'
+    Assert-True ($provisioner.Contains('REG_OPTION_OPEN_LINK')) 'Client policy provisioner does not inspect registry links themselves.'
+    Assert-True ($provisioner.Contains('SymbolicLinkValue')) 'Client policy provisioner does not identify registry link keys.'
+    Assert-True ($provisioner.Contains('$mutationMask = [uint32]0x500d0026')) 'Client policy provisioner no longer rejects ancestor mutation authority.'
     Assert-True ($provisioner.Contains('ProvisioningState')) 'Client policy provisioner lacks an incomplete-policy marker.'
     Assert-True ($provisioner.Contains('RegistryView]::Registry64')) 'Client policy provisioner does not pin the 64-bit registry view.'
     Assert-True (-not $provisioner.Contains('[string]$AccountName')) 'Client policy provisioner accepts an account name.'
+    $bornProtected = $provisioner.LastIndexOf('Assert-PolicySecurity -Key $key', [StringComparison]::Ordinal)
+    $firstValueWrite = $provisioner.IndexOf('$key.SetValue($provisioningValue', [StringComparison]::Ordinal)
+    Assert-True ($bornProtected -ge 0 -and $bornProtected -lt $firstValueWrite) 'Client policy provisioner writes values before verifying create-time protection.'
+    $ancestorValidation = $provisioner.IndexOf('foreach ($ancestorPath in $policyAncestors)', [StringComparison]::Ordinal)
+    $leafCreation = $provisioner.IndexOf('$status = [Scribe.GpuBroker.RegistryNative]::CreateProtectedKey(', [StringComparison]::Ordinal)
+    Assert-True ($ancestorValidation -ge 0 -and $ancestorValidation -lt $leafCreation) 'Client policy provisioner creates the leaf before validating and protecting its ancestor chain.'
+    $transportHarness = Get-Content -LiteralPath (Join-Path $repositoryRoot 'scripts\test-windows-gpu-broker-transport.ps1') -Raw
+    Assert-True ($transportHarness.Contains('Assert-OwnedPolicyState -State $state')) 'Broker harness cleanup does not revalidate exact ownership state.'
+    Assert-True ($transportHarness.Contains('SecurityFingerprint')) 'Broker harness cleanup does not pin the policy security descriptor.'
+    Assert-True ($transportHarness.Contains('CleanupTamper')) 'Broker harness lacks an adversarial same-name cleanup test.'
+    Assert-True ($transportHarness.Contains('if ($result.ExitCode -eq 0)')) 'Broker harness claims policy ownership without successful provisioning.'
+    Assert-True (-not $transportHarness.Contains('if (Test-Path -LiteralPath $policyRegistryPath) { $script:createdPolicy = $true }')) 'Broker harness derives destructive ownership from path existence.'
     Assert-True ((Get-Content -LiteralPath (Join-Path $repositoryRoot 'tools\windows-gpu-promotion-broker\src\fixture.rs') -Raw).Contains('consumes_canonical_handoff_generated_by_powershell_and_worker_pack_author')) 'Broker proof does not consume the PowerShell/worker-pack-author interoperability fixture.'
 
     if (-not [string]::IsNullOrWhiteSpace($InteropFixtureDirectory)) {
