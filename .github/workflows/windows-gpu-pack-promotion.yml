@@ -1,0 +1,179 @@
+name: Promote Windows GPU worker packs
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/windows-gpu-pack-promotion.yml'
+      - 'scripts/promote-windows-gpu-worker-packs.ps1'
+      - 'scripts/test-windows-gpu-pack-promotion.ps1'
+      - 'scripts/build-windows-gpu-worker-pack.ps1'
+      - 'src/worker_pack_authoring.rs'
+      - 'tools/worker-pack-author/**'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/windows-gpu-pack-promotion.yml'
+      - 'scripts/promote-windows-gpu-worker-packs.ps1'
+      - 'scripts/test-windows-gpu-pack-promotion.ps1'
+      - 'scripts/build-windows-gpu-worker-pack.ps1'
+      - 'src/worker_pack_authoring.rs'
+      - 'tools/worker-pack-author/**'
+  workflow_dispatch:
+    inputs:
+      promote:
+        description: Prepare an unsigned CUDA+Vulkan set and request protected promotion.
+        required: true
+        type: boolean
+        default: false
+      pack_version:
+        description: Canonical immutable worker-pack version.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  contract:
+    name: Validate unprivileged promotion contract
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e # 1.96.0 branch reviewed 2026-08-27
+      - name: Fetch locked worker-pack tool dependencies
+        shell: pwsh
+        run: cargo fetch --locked --manifest-path tools/worker-pack-author/Cargo.toml
+      - name: Test unsigned handoff and fixture-only atomic promotion
+        shell: pwsh
+        run: pwsh -NoProfile -File .\scripts\test-windows-gpu-pack-promotion.ps1
+
+  prepare-unsigned:
+    name: Prepare unsigned CUDA and Vulkan handoff
+    if: github.event_name == 'workflow_dispatch' && inputs.promote == true && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    needs: contract
+    runs-on: [self-hosted, Windows, X64, scribe-gpu-pack-builder]
+    timeout-minutes: 180
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      artifact_digest: ${{ steps.upload.outputs.artifact-digest }}
+      handoff_sha256: ${{ steps.handoff.outputs.handoff_sha256 }}
+      release_set_digest: ${{ steps.handoff.outputs.release_set_digest }}
+      toolchain_manifest_sha256: ${{ steps.handoff.outputs.toolchain_manifest_sha256 }}
+      pack_version: ${{ steps.handoff.outputs.pack_version }}
+      source_revision: ${{ steps.identity.outputs.source_revision }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - name: Bind exact reviewed default-branch source
+        id: identity
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF -cne "refs/heads/$env:GITHUB_DEFAULT_BRANCH") { throw 'Unsigned handoff must originate from the default branch.' }
+          $revision = (git rev-parse --verify HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $revision -cne $env:GITHUB_SHA -or $revision -cnotmatch '^[0-9a-f]{40}$') { throw 'Checkout revision does not match the workflow source revision.' }
+          "source_revision=$revision" >> $env:GITHUB_OUTPUT
+        env:
+          GITHUB_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      - name: Build exact unsigned release candidates
+        id: build
+        shell: pwsh
+        env:
+          PACK_VERSION: ${{ inputs.pack_version }}
+        run: |
+          if ($env:PACK_VERSION -cnotmatch '^[a-z0-9](?:[a-z0-9._-]{0,94}[a-z0-9])?$') { throw 'Pack version is not a canonical immutable store component.' }
+          $root = Join-Path $env:RUNNER_TEMP 'scribe-windows-gpu-unsigned'
+          if (Test-Path -LiteralPath $root) { throw 'Unsigned handoff root must be fresh.' }
+          New-Item -ItemType Directory -Path $root | Out-Null
+          $cuda = & .\scripts\build-windows-gpu-worker-pack.ps1 -Backend Cuda -PackVersion $env:PACK_VERSION -OutputDirectory (Join-Path $root 'cuda') -SigningMode Prepared
+          $vulkan = & .\scripts\build-windows-gpu-worker-pack.ps1 -Backend Vulkan -PackVersion $env:PACK_VERSION -OutputDirectory (Join-Path $root 'vulkan') -SigningMode Prepared
+          $cuda | ConvertTo-Json -Depth 6 -Compress | Set-Content -LiteralPath (Join-Path $env:RUNNER_TEMP 'cuda-descriptor.json') -Encoding utf8NoBOM
+          $vulkan | ConvertTo-Json -Depth 6 -Compress | Set-Content -LiteralPath (Join-Path $env:RUNNER_TEMP 'vulkan-descriptor.json') -Encoding utf8NoBOM
+          "handoff_root=$root" >> $env:GITHUB_OUTPUT
+      - name: Create canonical source and release-set handoff
+        id: handoff
+        shell: pwsh
+        env:
+          HANDOFF_ROOT: ${{ steps.build.outputs.handoff_root }}
+          SOURCE_REVISION: ${{ steps.identity.outputs.source_revision }}
+          PACK_VERSION: ${{ inputs.pack_version }}
+        run: |
+          $cuda = Get-Content -LiteralPath (Join-Path $env:RUNNER_TEMP 'cuda-descriptor.json') -Raw | ConvertFrom-Json
+          $vulkan = Get-Content -LiteralPath (Join-Path $env:RUNNER_TEMP 'vulkan-descriptor.json') -Raw | ConvertFrom-Json
+          if ($cuda.SourceRevision -cne $env:SOURCE_REVISION -or $vulkan.SourceRevision -cne $env:SOURCE_REVISION -or $cuda.ToolchainManifestSha256 -cne $vulkan.ToolchainManifestSha256) { throw 'Prepared packs do not share the exact source and toolchain contract.' }
+          $packs = @(
+            [ordered]@{ backend = 'cuda'; pack_root = 'cuda'; pack_id = $cuda.PackId; pack_version = $cuda.PackVersion; pack_digest = $cuda.PackDigest; security_epoch = [uint64]$cuda.SecurityEpoch; provider = $cuda.Provider; manifest_sha256 = $cuda.ManifestSha256 },
+            [ordered]@{ backend = 'vulkan'; pack_root = 'vulkan'; pack_id = $vulkan.PackId; pack_version = $vulkan.PackVersion; pack_digest = $vulkan.PackDigest; security_epoch = [uint64]$vulkan.SecurityEpoch; provider = $vulkan.Provider; manifest_sha256 = $vulkan.ManifestSha256 }
+          )
+          $material = [ordered]@{ schema_version = 1; source_repository = $env:GITHUB_REPOSITORY; source_ref = $env:GITHUB_REF; source_revision = $env:SOURCE_REVISION; workflow_ref = $env:GITHUB_WORKFLOW_REF; run_id = $env:GITHUB_RUN_ID; run_attempt = $env:GITHUB_RUN_ATTEMPT; pack_version = $env:PACK_VERSION; toolchain_manifest_sha256 = $cuda.ToolchainManifestSha256; packs = $packs }
+          $materialJson = $material | ConvertTo-Json -Depth 8 -Compress
+          $bytes = [Text.Encoding]::UTF8.GetBytes("scribe-windows-gpu-release-set-v1`0$materialJson")
+          $releaseSetDigest = ([BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($bytes))).Replace('-', '').ToLowerInvariant()
+          $handoff = [ordered]@{} + $material
+          $handoff.release_set_digest = $releaseSetDigest
+          $handoffPath = Join-Path $env:HANDOFF_ROOT 'windows-gpu-pack-handoff.json'
+          [IO.File]::WriteAllText($handoffPath, ($handoff | ConvertTo-Json -Depth 8 -Compress), [Text.UTF8Encoding]::new($false))
+          $handoffSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $handoffPath).Hash.ToLowerInvariant()
+          "handoff_sha256=$handoffSha256" >> $env:GITHUB_OUTPUT
+          "release_set_digest=$releaseSetDigest" >> $env:GITHUB_OUTPUT
+          "toolchain_manifest_sha256=$($cuda.ToolchainManifestSha256)" >> $env:GITHUB_OUTPUT
+          "pack_version=$env:PACK_VERSION" >> $env:GITHUB_OUTPUT
+      - name: Upload exact unsigned handoff
+        id: upload
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: windows-gpu-unsigned-${{ github.run_id }}
+          path: ${{ steps.build.outputs.handoff_root }}
+          if-no-files-found: error
+          retention-days: 1
+
+  protected-promote:
+    name: Independently sign and atomically promote pack set
+    if: github.event_name == 'workflow_dispatch' && inputs.promote == true && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    needs: prepare-unsigned
+    runs-on: [self-hosted, Windows, X64, scribe-gpu-pack-signer-ephemeral]
+    environment: windows-gpu-pack-signing
+    timeout-minutes: 30
+    steps:
+      - name: Download the exact uploaded handoff
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.prepare-unsigned.outputs.artifact_id }}
+          digest-mismatch: error
+          path: ${{ runner.temp }}/scribe-windows-gpu-handoff
+      - name: Invoke independently installed protected signer
+        shell: pwsh
+        env:
+          TRUSTED_SIGNER_PATH: ${{ vars.SCRIBE_WINDOWS_GPU_TRUSTED_SIGNER_PATH }}
+          TRUSTED_SIGNER_SHA256: ${{ vars.SCRIBE_WINDOWS_GPU_TRUSTED_SIGNER_SHA256 }}
+          PRODUCTION_TRUST_PROVISIONED: ${{ vars.SCRIBE_WINDOWS_GPU_PRODUCTION_TRUST_PROVISIONED }}
+          ARTIFACT_ID: ${{ needs.prepare-unsigned.outputs.artifact_id }}
+          ARTIFACT_DIGEST: ${{ needs.prepare-unsigned.outputs.artifact_digest }}
+          HANDOFF_SHA256: ${{ needs.prepare-unsigned.outputs.handoff_sha256 }}
+          RELEASE_SET_DIGEST: ${{ needs.prepare-unsigned.outputs.release_set_digest }}
+          SOURCE_REVISION: ${{ needs.prepare-unsigned.outputs.source_revision }}
+          TOOLCHAIN_MANIFEST_SHA256: ${{ needs.prepare-unsigned.outputs.toolchain_manifest_sha256 }}
+          PACK_VERSION: ${{ needs.prepare-unsigned.outputs.pack_version }}
+        run: |
+          if ($env:PRODUCTION_TRUST_PROVISIONED -cne 'true') { throw 'Production trust root and protected signer are not provisioned; no signing authority was consumed.' }
+          if ([string]::IsNullOrWhiteSpace($env:TRUSTED_SIGNER_PATH) -or $env:TRUSTED_SIGNER_SHA256 -cnotmatch '^[0-9a-f]{64}$') { throw 'Protected trusted signer identity is not provisioned.' }
+          $signer = [IO.Path]::GetFullPath($env:TRUSTED_SIGNER_PATH)
+          $workspace = [IO.Path]::GetFullPath($env:GITHUB_WORKSPACE).TrimEnd('\')
+          $runnerTemp = [IO.Path]::GetFullPath($env:RUNNER_TEMP).TrimEnd('\')
+          if ($signer.StartsWith("$workspace\", [StringComparison]::OrdinalIgnoreCase) -or $signer.StartsWith("$runnerTemp\", [StringComparison]::OrdinalIgnoreCase)) { throw 'Trusted signer must not come from the checkout, handoff, or runner temporary directory.' }
+          $item = Get-Item -LiteralPath $signer -Force
+          if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'Trusted signer is not a regular non-reparse file.' }
+          if ((Get-FileHash -Algorithm SHA256 -LiteralPath $signer).Hash.ToLowerInvariant() -cne $env:TRUSTED_SIGNER_SHA256) { throw 'Trusted signer digest does not match protected configuration.' }
+          $output = Join-Path $env:RUNNER_TEMP 'scribe-windows-gpu-promoted'
+          & $signer promote-windows-pack-set --handoff-root (Join-Path $env:RUNNER_TEMP 'scribe-windows-gpu-handoff') --output-root $output --source-repository $env:GITHUB_REPOSITORY --source-ref $env:GITHUB_REF --source-revision $env:SOURCE_REVISION --workflow-ref $env:GITHUB_WORKFLOW_REF --workflow-source-sha $env:GITHUB_SHA --run-id $env:GITHUB_RUN_ID --run-attempt $env:GITHUB_RUN_ATTEMPT --artifact-id $env:ARTIFACT_ID --artifact-digest $env:ARTIFACT_DIGEST --handoff-sha256 $env:HANDOFF_SHA256 --release-set-digest $env:RELEASE_SET_DIGEST --toolchain-manifest-sha256 $env:TOOLCHAIN_MANIFEST_SHA256 --pack-version $env:PACK_VERSION --minimum-security-epoch 1 --require-unused-release-set
+          if ($LASTEXITCODE -ne 0) { throw 'Protected signer rejected the unsigned handoff.' }
+          if (-not (Test-Path -LiteralPath (Join-Path $output 'protected-promotion-receipt.json') -PathType Leaf)) { throw 'Protected signer did not produce its signed promotion receipt.' }
+      - name: Upload non-activated protected signed set
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: windows-gpu-signed-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/scribe-windows-gpu-promoted
+          if-no-files-found: error
+          retention-days: 1

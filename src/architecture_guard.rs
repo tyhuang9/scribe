@@ -1403,6 +1403,91 @@ fn release_packaging_accepts_only_compiled_verified_declared_pack_roots() {
 }
 
 #[test]
+fn windows_gpu_pack_promotion_keeps_candidate_and_signing_authority_separate() {
+    let authoring = include_str!("worker_pack_authoring.rs");
+    let tool = include_str!("../tools/worker-pack-author/src/main.rs");
+    let build = include_str!("../scripts/build-windows-gpu-worker-pack.ps1");
+    let promote = include_str!("../scripts/promote-windows-gpu-worker-packs.ps1");
+    let contract_test = include_str!("../scripts/test-windows-gpu-pack-promotion.ps1");
+    let workflow = include_str!("../.github/workflows/windows-gpu-pack-promotion.yml");
+    let protected = workflow
+        .split("  protected-promote:")
+        .nth(1)
+        .expect("protected promotion job exists");
+
+    for required in [
+        "prepare-pack",
+        "inspect-prepared-pack",
+        "sign-prepared-pack",
+        "--expected-manifest-sha256",
+        "--expected-pack-digest",
+    ] {
+        assert!(
+            tool.contains(required) || authoring.contains(required),
+            "prepared-pack authoring contract lost {required:?}"
+        );
+    }
+    for required in [
+        "'Prepared'",
+        "ManifestSha256",
+        "ToolchainManifestSha256",
+        "SigningKeyId = if ($SigningMode -eq 'Prepared') { $null }",
+    ] {
+        assert!(build.contains(required), "unsigned build lost {required:?}");
+    }
+    for required in [
+        "ExpectedRepository",
+        "ExpectedSourceRevision",
+        "ExpectedRunAttempt",
+        "ExpectedArtifactDigest",
+        "ExpectedHandoffSha256",
+        "ExpectedReleaseSetDigest",
+        "ExpectedToolchainManifestSha256",
+        "ExpectedPackVersion",
+        "MinimumSecurityEpoch",
+        "fixture-only",
+        "repository script never receives production signing authority",
+    ] {
+        assert!(
+            promote.contains(required),
+            "fixture promotion boundary lost {required:?}"
+        );
+    }
+    for required in [
+        "environment: windows-gpu-pack-signing",
+        "scribe-gpu-pack-signer-ephemeral",
+        "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
+        "digest-mismatch: error",
+        "cargo fetch --locked --manifest-path tools/worker-pack-author/Cargo.toml",
+        "steps.upload.outputs.artifact-id",
+        "steps.upload.outputs.artifact-digest",
+        "SCRIBE_WINDOWS_GPU_TRUSTED_SIGNER_SHA256",
+        "SCRIBE_WINDOWS_GPU_PRODUCTION_TRUST_PROVISIONED",
+        "--require-unused-release-set",
+        "--workflow-source-sha",
+        "Production trust root and protected signer are not provisioned; no signing authority was consumed.",
+    ] {
+        assert!(
+            workflow.contains(required),
+            "protected workflow lost {required:?}"
+        );
+    }
+    for forbidden in [
+        "actions/checkout@",
+        "cargo ",
+        "promote-windows-gpu-worker-packs.ps1",
+        "secrets.",
+        "private-key",
+    ] {
+        assert!(
+            !protected.contains(forbidden),
+            "protected job regained candidate code or raw signing authority {forbidden:?}"
+        );
+    }
+    assert!(contract_test.contains("Windows GPU pack promotion contract tests passed."));
+}
+
+#[test]
 fn worker_roles_use_private_pipes_and_protocol_only_stdout() {
     let sources = rust_sources();
     let identity = include_str!("worker_identity.rs");

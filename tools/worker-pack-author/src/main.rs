@@ -31,13 +31,17 @@ mod worker_pack_authoring;
 use manifest::{Compatibility, PackBackend, PackVerifier, ProductionTrustRoot};
 use store::PackStore;
 use worker_pack_authoring::{
-    AUTHOR_TARGET_CONTRACT, AuthorRequest, AuthoringBackend, SigningMode, author_pack,
-    check_production_signing_key, validate_authoring_target, verify_fixture_pack,
+    AUTHOR_TARGET_CONTRACT, AuthorRequest, AuthoringBackend, PrepareRequest, SigningMode,
+    author_pack, check_production_signing_key, inspect_prepared_pack, prepare_pack,
+    sign_prepared_pack, validate_authoring_target, verify_fixture_pack,
 };
 
 const HELP_TEXT: &str = "Scribe worker-pack authoring tool\n\
 commands:\n\
   author --backend <cuda|vulkan|metal> [--target-os <windows|linux|macos> --target-arch <x86_64|aarch64>] ...\n\
+  prepare-pack --backend <cuda|vulkan|metal> --pack-root <path> ...\n\
+  inspect-prepared-pack --pack-root <path>\n\
+  sign-prepared-pack --pack-root <path> --expected-manifest-sha256 <sha256> --expected-pack-digest <sha256> (--fixture-signing | --key-id <id> --private-key <path>)\n\
   verify-fixture --pack-root <path>\n\
   verify-production-linux --pack-root <path>\n\
   install-production-linux --pack-root <path> --packs-root <path> --state-root <path>\n\
@@ -68,6 +72,15 @@ fn run() -> Result<()> {
     let options = parse_options(remaining)?;
     match command.to_str() {
         Some("author") => run_author(&options),
+        Some("prepare-pack") => run_prepare_pack(&options),
+        Some("inspect-prepared-pack") => {
+            require_exact_options(&options, &["--pack-root"])?;
+            let descriptor =
+                inspect_prepared_pack(&PathBuf::from(required(&options, "--pack-root")?))?;
+            println!("{}", serde_json::to_string(&descriptor)?);
+            Ok(())
+        }
+        Some("sign-prepared-pack") => run_sign_prepared_pack(&options),
         Some("verify-fixture") => {
             require_exact_options(&options, &["--pack-root"])?;
             let descriptor =
@@ -124,6 +137,84 @@ fn run_author(options: &BTreeMap<String, OsString>) -> Result<()> {
     let request = author_request_from_options(options)?;
     println!("{}", serde_json::to_string(&author_pack(&request)?)?);
     Ok(())
+}
+
+fn run_prepare_pack(options: &BTreeMap<String, OsString>) -> Result<()> {
+    let request = prepare_request_from_options(options)?;
+    println!("{}", serde_json::to_string(&prepare_pack(&request)?)?);
+    Ok(())
+}
+
+fn run_sign_prepared_pack(options: &BTreeMap<String, OsString>) -> Result<()> {
+    let signing = if options.contains_key("--fixture-signing") {
+        require_exact_options(
+            options,
+            &[
+                "--expected-manifest-sha256",
+                "--expected-pack-digest",
+                "--fixture-signing",
+                "--pack-root",
+            ],
+        )?;
+        SigningMode::Fixture
+    } else {
+        require_exact_options(
+            options,
+            &[
+                "--expected-manifest-sha256",
+                "--expected-pack-digest",
+                "--key-id",
+                "--pack-root",
+                "--private-key",
+            ],
+        )?;
+        SigningMode::Production {
+            key_id: required_utf8(options, "--key-id")?.to_owned(),
+            private_key_path: PathBuf::from(required(options, "--private-key")?),
+        }
+    };
+    let descriptor = sign_prepared_pack(
+        &PathBuf::from(required(options, "--pack-root")?),
+        &signing,
+        required_utf8(options, "--expected-manifest-sha256")?,
+        required_utf8(options, "--expected-pack-digest")?,
+    )?;
+    println!("{}", serde_json::to_string(&descriptor)?);
+    Ok(())
+}
+
+fn prepare_request_from_options(options: &BTreeMap<String, OsString>) -> Result<PrepareRequest> {
+    let has_target_option =
+        options.contains_key("--target-os") || options.contains_key("--target-arch");
+    let mut expected = vec![
+        "--backend",
+        "--pack-id",
+        "--pack-root",
+        "--pack-version",
+        "--provider",
+        "--security-epoch",
+    ];
+    if has_target_option {
+        expected.extend(["--target-arch", "--target-os"]);
+    }
+    expected.push("--worker-path");
+    require_exact_options(options, &expected).map_err(|_| {
+        anyhow!("prepare-pack command has unknown or missing options; {AUTHOR_TARGET_CONTRACT}")
+    })?;
+    let mut author_options = options.clone();
+    author_options.insert("--fixture-signing".to_owned(), OsString::new());
+    let request = author_request_from_options(&author_options)?;
+    Ok(PrepareRequest {
+        pack_root: request.pack_root,
+        pack_id: request.pack_id,
+        pack_version: request.pack_version,
+        security_epoch: request.security_epoch,
+        backend: request.backend,
+        provider: request.provider,
+        target_os: request.target_os,
+        target_arch: request.target_arch,
+        worker_path: request.worker_path,
+    })
 }
 
 fn author_request_from_options(options: &BTreeMap<String, OsString>) -> Result<AuthorRequest> {
@@ -376,6 +467,27 @@ mod tests {
                     .contains(AUTHOR_TARGET_CONTRACT)
             );
         }
+    }
+
+    #[test]
+    fn prepare_pack_rejects_signing_options() {
+        let fixture = fixture_options(&[]);
+        let error = prepare_request_from_options(&fixture)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("prepare-pack command has unknown or missing options"));
+
+        let mut production = fixture;
+        production.remove("--fixture-signing");
+        production.insert("--key-id".to_owned(), OsString::from("production-key"));
+        production.insert(
+            "--private-key".to_owned(),
+            OsString::from("production-key.pk8"),
+        );
+        let error = prepare_request_from_options(&production)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("prepare-pack command has unknown or missing options"));
     }
 
     #[test]

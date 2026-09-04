@@ -260,6 +260,32 @@ or trusted signer exists today, every nonempty production release fails closed.
 The deterministic seed and key ID used by tooling tests and local hardware smoke
 are fixture-only and cannot verify under production trust.
 
+The separate `windows-gpu-pack-promotion.yml` contract divides this future
+authority into three boundaries. An unprivileged, manually dispatched
+default-branch job builds one unsigned CUDA pack and one unsigned Vulkan pack,
+then uploads a one-day handoff artifact. Its canonical metadata binds the exact
+repository, ref, source SHA, workflow ref, run ID and attempt, pack version,
+toolchain-manifest SHA-256, ordered CUDA/Vulkan manifest and pack digests, and a
+domain-separated release-set digest. `actions/upload-artifact` exposes the
+artifact ID and digest; the digest-pinned `download-artifact` action validates
+that artifact in the protected job, and both values are also passed to the
+independent signer as approval inputs.
+
+The protected job has no source checkout, compiler, repository script, or raw
+private-key secret. It requires the `windows-gpu-pack-signing` environment and
+an ephemeral `scribe-gpu-pack-signer-ephemeral` runner containing a separately
+installed signer whose executable digest comes from protected environment
+configuration. The runner must use Actions Runner 2.327.1 or later because the
+pinned artifact download action runs on Node 24 and treats a digest mismatch as
+a fatal error. That signer must treat the handoff only as hostile data, copy it
+through no-follow handles into fresh signer-owned storage, revalidate the exact
+ASCII-only inventory and all caller-approved digests, enforce its own
+non-resettable security-epoch floor and one-use release-set ledger, sign both
+packs, and publish the pair atomically with a protected receipt. Production
+trust remains unprovisioned, so the job fails before invoking that signer and
+before consuming replay/epoch authority. The repository fixture promoter tests
+the interface and atomic two-pack behavior only; it refuses production mode.
+
 ## Windows Vulkan hardware evidence
 
 On 2026-08-29, a clean fixture-only pack built from `10d4ec2` with the pinned
@@ -478,11 +504,19 @@ handshake checks the same parent expectation before output is accepted.
 
 ## Build and verification commands
 
-`scripts/build-windows-gpu-worker-pack.ps1` builds one deterministic fixture or
-production pack from the pinned contract in
+`scripts/build-windows-gpu-worker-pack.ps1` builds one deterministic fixture,
+prepared unsigned candidate, or legacy one-shot pack from the pinned contract in
 `runtime-manifests/gpu-worker-toolchain-windows-x64.json`.
-`scripts/prepare-windows-gpu-worker-packs.ps1` is the production-only two-pack
-orchestrator used by the opt-in release job. It requires exact Rust 1.96.0,
+The protected promotion path uses `-SigningMode Prepared`; the build emits a
+canonical manifest plus its manifest SHA-256 and pack digest, but no signature.
+The author tool's `sign-prepared-pack` command requires both approved digests
+and rejects payload, metadata, or digest changes before it loads a key. That
+command exists for isolated tooling tests and independently reviewed signer
+construction; the protected workflow never compiles or runs it from the source
+checkout. `scripts/promote-windows-gpu-worker-packs.ps1` is fixture-only and
+refuses production authority.
+
+The Windows pack build requires exact Rust 1.96.0,
 CMake 4.4.2, MSVC 14.44.35207 tool payloads, Windows SDK 10.0.26100.0, the
 reviewed Sherpa archive, Vulkan SDK 1.4.357.0, and CUDA Toolkit/nvcc 12.8.93.
 The mutable Visual Studio product-shell version is not the compiler identity:
@@ -509,6 +543,10 @@ remapping, bounded fallback, quarantine privacy/timing, and no-replay rules.
 `scripts/test-windows-release-packaging.ps1` and
 `scripts/verify-windows-release-package.ps1` enforce exact catalog/inventory,
 installer allowlist, portable/installer parity, and hostile filesystem cases.
+`scripts/test-windows-gpu-pack-promotion.ps1` additionally exercises canonical
+unsigned handoff parsing, explicit manifest/pack digest approval, tamper and
+provenance rejection, paired atomic fixture publication, and the production
+authority isolation of the protected workflow.
 
 ## Stage 7 Linux GPU contract
 
