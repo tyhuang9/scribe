@@ -501,6 +501,17 @@ mod intent_tests {
     }
 
     #[test]
+    fn canonical_intent_bytes_and_domain_digest_match_the_powershell_golden_vector() {
+        const GOLDEN_JSON: &str = r#"{"schema_version":1,"policy_namespace":"scribe-windows-gpu-production-v1","source_repository":"tyhuang9/scribe","source_ref":"refs/heads/main","source_revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","workflow_ref":"tyhuang9/scribe/.github/workflows/windows-gpu-pack-promotion.yml@refs/heads/main","workflow_source_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","run_id":"1001","run_attempt":"1","artifact_id":"2002","artifact_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","handoff_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","release_set_digest":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","toolchain_manifest_sha256":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","pack_version":"0.1.0-promotion-fixture","minimum_security_epoch":1,"require_unused_release_set":true}"#;
+        const GOLDEN_SHA256: &str =
+            "475757a8bc0a8672fad3864bc14261ae8aa84d1fe91d27093e925ca2138ab508";
+
+        let intent: PromotionIntent = serde_json::from_slice(GOLDEN_JSON.as_bytes()).unwrap();
+        assert_eq!(intent.canonical_json().unwrap(), GOLDEN_JSON.as_bytes());
+        assert_eq!(intent.sha256().unwrap(), GOLDEN_SHA256);
+    }
+
+    #[test]
     fn default_branch_workflow_source_must_equal_the_pack_source_revision() {
         let mut arguments = valid_args();
         let index = arguments

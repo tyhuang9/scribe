@@ -1812,6 +1812,97 @@ mod tests {
     use std::thread;
     use tempfile::TempDir;
 
+    const LEGACY_REQUEST_DOMAIN: &[u8] = b"scribe-windows-gpu-promotion-request-v1\0";
+    const LEGACY_RECEIPT_DOMAIN: &[u8] = b"scribe-windows-gpu-promotion-receipt-v1\0";
+    const LEGACY_LEDGER_DOMAIN: &[u8] = b"scribe-windows-gpu-promotion-ledger-record-v1\0";
+
+    #[derive(Serialize)]
+    struct LegacyPromotionRequest {
+        schema_version: u16,
+        handoff_root: String,
+        output_root: String,
+        source_repository: String,
+        source_ref: String,
+        source_revision: String,
+        workflow_ref: String,
+        workflow_source_sha: String,
+        run_id: String,
+        run_attempt: String,
+        artifact_id: String,
+        artifact_digest: String,
+        handoff_sha256: String,
+        release_set_digest: String,
+        toolchain_manifest_sha256: String,
+        pack_version: String,
+        minimum_security_epoch: u64,
+        require_unused_release_set: bool,
+    }
+
+    #[derive(Serialize)]
+    struct LegacyReceiptStatement {
+        schema_version: u16,
+        authority: String,
+        request_sha256: String,
+        source_repository: String,
+        source_ref: String,
+        source_revision: String,
+        workflow_ref: String,
+        workflow_source_sha: String,
+        run_id: String,
+        run_attempt: String,
+        artifact_id: String,
+        artifact_digest: String,
+        handoff_sha256: String,
+        release_set_digest: String,
+        toolchain_manifest_sha256: String,
+        pack_version: String,
+        packs: Vec<PackReceipt>,
+    }
+
+    #[derive(Serialize)]
+    struct LegacySignedReceipt {
+        schema_version: u16,
+        statement: LegacyReceiptStatement,
+        key_id: String,
+        signature_hex: String,
+    }
+
+    #[derive(Serialize)]
+    struct LegacyLedgerRecord {
+        schema_version: u16,
+        sequence: u64,
+        previous_record_sha256: String,
+        kind: LedgerKind,
+        release_set_digest: Option<String>,
+        request_sha256: Option<String>,
+        stage_name: Option<String>,
+        output_name: Option<String>,
+        epochs: Vec<EpochBinding>,
+        record_sha256: String,
+    }
+
+    #[derive(Serialize)]
+    struct LegacyLedgerMaterial<'a> {
+        schema_version: u16,
+        sequence: u64,
+        previous_record_sha256: &'a str,
+        kind: &'a LedgerKind,
+        release_set_digest: &'a Option<String>,
+        request_sha256: &'a Option<String>,
+        stage_name: &'a Option<String>,
+        output_name: &'a Option<String>,
+        epochs: &'a [EpochBinding],
+    }
+
+    struct LegacyLedgerTransition {
+        kind: LedgerKind,
+        release_set_digest: Option<String>,
+        request_sha256: Option<String>,
+        stage_name: Option<String>,
+        output_name: Option<String>,
+        epochs: Vec<EpochBinding>,
+    }
+
     struct Fixture {
         _temp: TempDir,
         broker: FixtureBroker,
@@ -2038,6 +2129,68 @@ mod tests {
         invocation.intent.workflow_ref = handoff.workflow_ref;
         invocation.intent.release_set_digest = handoff.release_set_digest;
         invocation.intent.handoff_sha256 = encode_hex(&Sha256::digest(&bytes));
+    }
+
+    fn legacy_request(invocation: &ClientInvocation) -> LegacyPromotionRequest {
+        let intent = &invocation.intent;
+        LegacyPromotionRequest {
+            schema_version: 1,
+            handoff_root: invocation.handoff_root.to_string_lossy().into_owned(),
+            output_root: invocation
+                .output_root
+                .join(&intent.release_set_digest)
+                .to_string_lossy()
+                .into_owned(),
+            source_repository: intent.source_repository.clone(),
+            source_ref: intent.source_ref.clone(),
+            source_revision: intent.source_revision.clone(),
+            workflow_ref: intent.workflow_ref.clone(),
+            workflow_source_sha: intent.workflow_source_sha.clone(),
+            run_id: intent.run_id.clone(),
+            run_attempt: intent.run_attempt.clone(),
+            artifact_id: intent.artifact_id.clone(),
+            artifact_digest: intent.artifact_digest.clone(),
+            handoff_sha256: intent.handoff_sha256.clone(),
+            release_set_digest: intent.release_set_digest.clone(),
+            toolchain_manifest_sha256: intent.toolchain_manifest_sha256.clone(),
+            pack_version: intent.pack_version.clone(),
+            minimum_security_epoch: intent.minimum_security_epoch,
+            require_unused_release_set: intent.require_unused_release_set,
+        }
+    }
+
+    fn legacy_ledger_record(
+        sequence: u64,
+        previous_record_sha256: &str,
+        transition: LegacyLedgerTransition,
+    ) -> LegacyLedgerRecord {
+        let material = LegacyLedgerMaterial {
+            schema_version: 1,
+            sequence,
+            previous_record_sha256,
+            kind: &transition.kind,
+            release_set_digest: &transition.release_set_digest,
+            request_sha256: &transition.request_sha256,
+            stage_name: &transition.stage_name,
+            output_name: &transition.output_name,
+            epochs: &transition.epochs,
+        };
+        let record_sha256 = hash_domain(
+            LEGACY_LEDGER_DOMAIN,
+            &serde_json::to_vec(&material).unwrap(),
+        );
+        LegacyLedgerRecord {
+            schema_version: 1,
+            sequence,
+            previous_record_sha256: previous_record_sha256.to_owned(),
+            kind: transition.kind,
+            release_set_digest: transition.release_set_digest,
+            request_sha256: transition.request_sha256,
+            stage_name: transition.stage_name,
+            output_name: transition.output_name,
+            epochs: transition.epochs,
+            record_sha256,
+        }
     }
 
     #[test]
@@ -2424,10 +2577,130 @@ mod tests {
     }
 
     #[test]
-    fn v1_or_mixed_domain_receipts_and_ledgers_are_rejected() {
-        const OLD_RECEIPT_DOMAIN: &[u8] = b"scribe-windows-gpu-promotion-receipt-v1\0";
-        const OLD_LEDGER_DOMAIN: &[u8] = b"scribe-windows-gpu-promotion-ledger-record-v1\0";
+    fn genuine_legacy_v1_flattened_receipt_is_rejected_by_v2_verification() {
+        let fixture = Fixture::new(1);
+        fixture
+            .broker
+            .promote(&fixture.request, FaultPoint::None)
+            .unwrap();
+        let receipt_path = fixture.output().join(RECEIPT_NAME);
+        let current: SignedReceipt =
+            serde_json::from_slice(&fs::read(&receipt_path).unwrap()).unwrap();
+        let request = legacy_request(&fixture.request);
+        let request_sha256 = hash_domain(
+            LEGACY_REQUEST_DOMAIN,
+            &serde_json::to_vec(&request).unwrap(),
+        );
+        let intent = &fixture.request.intent;
+        let statement = LegacyReceiptStatement {
+            schema_version: 1,
+            authority: "fixture-only".to_owned(),
+            request_sha256,
+            source_repository: intent.source_repository.clone(),
+            source_ref: intent.source_ref.clone(),
+            source_revision: intent.source_revision.clone(),
+            workflow_ref: intent.workflow_ref.clone(),
+            workflow_source_sha: intent.workflow_source_sha.clone(),
+            run_id: intent.run_id.clone(),
+            run_attempt: intent.run_attempt.clone(),
+            artifact_id: intent.artifact_id.clone(),
+            artifact_digest: intent.artifact_digest.clone(),
+            handoff_sha256: intent.handoff_sha256.clone(),
+            release_set_digest: intent.release_set_digest.clone(),
+            toolchain_manifest_sha256: intent.toolchain_manifest_sha256.clone(),
+            pack_version: intent.pack_version.clone(),
+            packs: current.statement.packs,
+        };
+        let statement_bytes = serde_json::to_vec(&statement).unwrap();
+        let mut signed = LEGACY_RECEIPT_DOMAIN.to_vec();
+        signed.extend_from_slice(&statement_bytes);
+        let key_pair = fixture_key_pair().unwrap();
+        let signature = key_pair.sign(&signed);
+        UnparsedPublicKey::new(&ED25519, key_pair.public_key().as_ref())
+            .verify(&signed, signature.as_ref())
+            .unwrap();
+        let legacy = LegacySignedReceipt {
+            schema_version: 1,
+            statement,
+            key_id: FIXTURE_KEY_ID.to_owned(),
+            signature_hex: encode_hex(signature.as_ref()),
+        };
+        let legacy_bytes = serde_json::to_vec(&legacy).unwrap();
+        let legacy_text = std::str::from_utf8(&legacy_bytes).unwrap();
+        assert!(legacy_text.contains("\"request_sha256\""));
+        assert!(!legacy_text.contains("promotion_intent_sha256"));
+        fs::write(&receipt_path, legacy_bytes).unwrap();
 
+        assert!(
+            verify_published_set(
+                &fixture.output(),
+                &fixture.request.intent,
+                key_pair.public_key().as_ref(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn genuine_legacy_v1_named_path_ledger_is_rejected_by_v2_loader() {
+        let fixture = Fixture::new(1);
+        let genesis = legacy_ledger_record(
+            0,
+            &"0".repeat(64),
+            LegacyLedgerTransition {
+                kind: LedgerKind::Genesis,
+                release_set_digest: None,
+                request_sha256: None,
+                stage_name: None,
+                output_name: None,
+                epochs: Vec::new(),
+            },
+        );
+        let release_set_digest = fixture.request.intent.release_set_digest.clone();
+        let request_sha256 = hash_domain(
+            LEGACY_REQUEST_DOMAIN,
+            &serde_json::to_vec(&legacy_request(&fixture.request)).unwrap(),
+        );
+        let reserved = legacy_ledger_record(
+            1,
+            &genesis.record_sha256,
+            LegacyLedgerTransition {
+                kind: LedgerKind::Reserved,
+                release_set_digest: Some(release_set_digest.clone()),
+                request_sha256: Some(request_sha256),
+                stage_name: Some(format!(".staging-{release_set_digest}")),
+                output_name: Some("legacy-release".to_owned()),
+                epochs: vec![
+                    EpochBinding {
+                        backend: Backend::Cuda,
+                        pack_id: "scribe-cuda-windows-x64".to_owned(),
+                        security_epoch: 1,
+                    },
+                    EpochBinding {
+                        backend: Backend::Vulkan,
+                        pack_id: "scribe-vulkan-windows-x64".to_owned(),
+                        security_epoch: 1,
+                    },
+                ],
+            },
+        );
+        assert_eq!(reserved.previous_record_sha256, genesis.record_sha256);
+        let mut legacy_bytes = serde_json::to_vec(&genesis).unwrap();
+        legacy_bytes.push(b'\n');
+        legacy_bytes.extend_from_slice(&serde_json::to_vec(&reserved).unwrap());
+        legacy_bytes.push(b'\n');
+        let legacy_text = std::str::from_utf8(&legacy_bytes).unwrap();
+        for field in ["request_sha256", "stage_name", "output_name"] {
+            assert!(legacy_text.contains(&format!("\"{field}\"")));
+        }
+        fs::write(fixture.broker.ledger_path(), legacy_bytes).unwrap();
+
+        let mut ledger = open_existing_ledger(&fixture.broker.ledger_path()).unwrap();
+        assert!(load_ledger(&mut ledger).is_err());
+    }
+
+    #[test]
+    fn v1_or_mixed_domain_receipts_and_ledgers_are_rejected() {
         for old_schema in [true, false] {
             let fixture = Fixture::new(1);
             fixture
@@ -2444,7 +2717,7 @@ mod tests {
             let mut signed = if old_schema {
                 RECEIPT_DOMAIN.to_vec()
             } else {
-                OLD_RECEIPT_DOMAIN.to_vec()
+                LEGACY_RECEIPT_DOMAIN.to_vec()
             };
             signed.extend_from_slice(&statement);
             receipt.signature_hex = encode_hex(fixture_key_pair().unwrap().sign(&signed).as_ref());
@@ -2479,7 +2752,7 @@ mod tests {
                 if old_schema {
                     LEDGER_DOMAIN
                 } else {
-                    OLD_LEDGER_DOMAIN
+                    LEGACY_LEDGER_DOMAIN
                 },
                 &serde_json::to_vec(&material).unwrap(),
             );

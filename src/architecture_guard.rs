@@ -1526,6 +1526,7 @@ fn windows_gpu_pack_promotion_keeps_candidate_and_signing_authority_separate() {
         "self.workflow_source_sha != self.source_revision",
         "validate_positive_decimal(&minimum_security_epoch_text, 20)",
         "minimum_security_epoch_requires_canonical_positive_u64_decimal",
+        "canonical_intent_bytes_and_domain_digest_match_the_powershell_golden_vector",
     ] {
         assert!(
             broker_contract.contains(required),
@@ -1559,6 +1560,8 @@ fn windows_gpu_pack_promotion_keeps_candidate_and_signing_authority_separate() {
         "post_reservation_failure_burns_replay_and_advances_epoch_high_water",
         "receipt_ledger_and_publication_names_are_path_free_and_intent_bound",
         "receipt_rejects_a_valid_signature_over_an_incorrect_intent_digest",
+        "genuine_legacy_v1_flattened_receipt_is_rejected_by_v2_verification",
+        "genuine_legacy_v1_named_path_ledger_is_rejected_by_v2_loader",
         "consumes_canonical_handoff_generated_by_powershell_and_worker_pack_author",
     ] {
         assert!(
