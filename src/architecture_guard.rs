@@ -1426,6 +1426,8 @@ fn windows_gpu_pack_promotion_keeps_candidate_and_signing_authority_separate() {
     );
     let broker_fixture = include_str!("../tools/windows-gpu-promotion-broker/src/fixture.rs");
     let transport_test = include_str!("../scripts/test-windows-gpu-broker-transport.ps1");
+    let client_policy_provisioner =
+        include_str!("../scripts/provision-windows-gpu-broker-client-policy.ps1");
     let protected = workflow
         .split("  protected-promote:")
         .nth(1)
@@ -1481,7 +1483,10 @@ fn windows_gpu_pack_promotion_keeps_candidate_and_signing_authority_separate() {
         "steps.upload.outputs.artifact-id",
         "steps.upload.outputs.artifact-digest",
         "SCRIBE_WINDOWS_GPU_TRUSTED_CLIENT_SHA256",
+        "SCRIBE_WINDOWS_GPU_AUTHORIZED_CLIENT_SID",
         "SCRIBE_WINDOWS_GPU_PRODUCTION_BROKER_PROVISIONED",
+        "[Security.Principal.WindowsIdentity]::GetCurrent().User.Value",
+        "$currentClientSid -cne $configuredClientSid.Value",
         "--require-unused-release-set",
         "--workflow-source-sha",
         "no filesystem, ledger, or signing authority was accessed",
@@ -1599,9 +1604,22 @@ fn windows_gpu_pack_promotion_keeps_candidate_and_signing_authority_separate() {
         "RevertToSelf",
         "revert_or_abort",
         "SecurityIdentification",
-        "S-1-5-11",
+        "TokenUser",
+        "require_user_sid(token.raw(), authorized_client_sid)",
+        r"SOFTWARE\Scribe\GpuPromotionBroker\v1\Authorization",
+        "KEY_READ | KEY_WOW64_64KEY",
+        "RegQueryInfoKeyW",
+        "RegQueryValueExW",
+        "SchemaVersion",
+        "AuthorizedClientSid",
+        "GetSecurityInfo",
+        "SE_DACL_PROTECTED",
+        "KEY_ALL_ACCESS_MASK",
+        "KEY_READ_MASK",
+        "load_authorization_policy()?",
+        "create_server_pipe(&policy)?",
+        "0x00100183",
         "D:P",
-        ";;;AU)",
         "CancelIoEx",
         "encode_ack_frame",
         "decode_ack_frame",
@@ -1615,6 +1633,8 @@ fn windows_gpu_pack_promotion_keeps_candidate_and_signing_authority_separate() {
         );
     }
     for forbidden in [
+        ";;;AU)",
+        ";;;BU)",
         ";;;LS)",
         ";;;BA)",
         ";;;WD)",
@@ -1664,10 +1684,56 @@ fn windows_gpu_pack_promotion_keeps_candidate_and_signing_authority_separate() {
         "7d4774c4ad2c0f59d57079e33d3729863a2a679739845f21b4a023207b580143",
         "RequireScmIntegration",
         "WaitForStatus",
+        "Refusing to modify a pre-existing fixed Windows GPU broker client policy",
+        "Missing policy",
+        "Weak inherited policy",
+        "Extra policy value",
+        "Malformed policy schema",
+        "Broad malformed policy SID",
+        "Wrong TokenUser SID",
+        "orphan-SID",
+        "Set-PolicyValue -Name 'AuthorizedClientSid' -Value $orphanSid",
+        "Service restart did not load the mutated authorization SID",
+        "PipeAccessRights]::FullControl",
+        "Assert-ExactPolicyAcl",
+        "Remove-OwnedPolicy",
     ] {
         assert!(
             transport_test.contains(required),
             "SCM transport harness lost {required:?}"
+        );
+    }
+    for required in [
+        "[string]$AuthorizedClientSid",
+        r"SOFTWARE\Scribe\GpuPromotionBroker\v1\Authorization",
+        "RegistryView]::Registry64",
+        "RegCreateKeyExW",
+        "Refusing to modify a pre-existing Windows GPU broker client policy",
+        "SetAccessRuleProtection($true, $false)",
+        "SetOwner([Security.Principal.SecurityIdentifier]::new($systemSid))",
+        "RegistryRights]::FullControl",
+        "RegistryRights]::ReadKey",
+        "ProvisioningState",
+        "Removing the marker is the only commit point",
+        "Assert-Policy -Key $key -ExpectProvisioningMarker $false",
+        "S-1-5-20",
+        "$serviceSid",
+    ] {
+        assert!(
+            client_policy_provisioner.contains(required),
+            "broker client-policy provisioner lost {required:?}"
+        );
+    }
+    for forbidden in [
+        "[string]$AccountName",
+        "LookupAccountName",
+        "Convert-NameToSid",
+        "Env:",
+        "HKEY_CURRENT_USER",
+    ] {
+        assert!(
+            !client_policy_provisioner.contains(forbidden),
+            "broker client-policy provisioner gained override or account-name input {forbidden:?}"
         );
     }
     for required in [

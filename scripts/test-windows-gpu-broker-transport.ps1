@@ -8,8 +8,11 @@ Set-StrictMode -Version Latest
 $serviceName = 'ScribeGpuPromotionBroker'
 $pipeName = 'ScribeGpuPromotionBroker.v1'
 $serviceSid = 'S-1-5-80-3848011089-2849881844-525567724-3342831801-3217684137'
+$policyPath = 'SOFTWARE\Scribe\GpuPromotionBroker\v1\Authorization'
+$policyRegistryPath = 'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Scribe\GpuPromotionBroker\v1\Authorization'
 $repositoryRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $manifest = Join-Path $repositoryRoot 'tools\windows-gpu-promotion-broker\Cargo.toml'
+$provisioner = Join-Path $repositoryRoot 'scripts\provision-windows-gpu-broker-client-policy.ps1'
 $targetRoot = Join-Path ([IO.Path]::GetTempPath()) "scribe-gpu-broker-transport-$([guid]::NewGuid().ToString('N'))"
 $previousCargoTarget = [Environment]::GetEnvironmentVariable('CARGO_TARGET_DIR', 'Process')
 $createdService = $false
@@ -17,6 +20,7 @@ $machineTarget = $null
 $primaryFailure = $null
 $cleanupFailures = [Collections.Generic.List[object]]::new()
 $safeToRemoveMachineTarget = $false
+$createdPolicy = $false
 
 function Assert-True([bool]$Condition, [string]$Message) {
     if (-not $Condition) { throw $Message }
@@ -96,6 +100,95 @@ function Wait-ServiceAbsent([int]$TimeoutSeconds) {
         Start-Sleep -Milliseconds 100
     }
     throw "Service $serviceName was not deleted within $TimeoutSeconds seconds."
+}
+
+function Wait-ServiceNotRunning([int]$TimeoutSeconds) {
+    $timer = [Diagnostics.Stopwatch]::StartNew()
+    while ($timer.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
+        $service = Get-BrokerService
+        if ($null -eq $service -or $service.Status -eq [System.ServiceProcess.ServiceControllerStatus]::Stopped) { return }
+        Start-Sleep -Milliseconds 100
+    }
+    throw "Service $serviceName remained active after a rejected startup."
+}
+
+function Remove-OwnedPolicy {
+    if (-not $createdPolicy) { return }
+    Assert-True ($policyRegistryPath -ceq 'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Scribe\GpuPromotionBroker\v1\Authorization') 'Policy cleanup target changed.'
+    $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
+    try {
+        $key = $base.OpenSubKey($policyPath, $false)
+        if ($null -ne $key) {
+            try { Assert-True ($key.SubKeyCount -eq 0) 'Refusing to recursively remove a policy containing subkeys.' }
+            finally { $key.Dispose() }
+            $base.DeleteSubKey($policyPath, $false)
+        }
+    }
+    finally { $base.Dispose() }
+    $script:createdPolicy = $false
+}
+
+function New-ProtectedPolicy([string]$Sid) {
+    $powerShell = (Get-Process -Id $PID).Path
+    $result = Invoke-Process -FilePath $powerShell -Arguments @('-NoProfile', '-File', $provisioner, '-AuthorizedClientSid', $Sid) -TimeoutSeconds 30 -AllowFailure
+    if (Test-Path -LiteralPath $policyRegistryPath) { $script:createdPolicy = $true }
+    return $result
+}
+
+function New-WeakPolicy([string]$Sid) {
+    $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
+    try {
+        $key = $base.CreateSubKey($policyPath, $true)
+        if ($null -eq $key) { throw 'Could not create weak authorization policy fixture.' }
+        $script:createdPolicy = $true
+        try {
+            $key.SetValue('SchemaVersion', 1, [Microsoft.Win32.RegistryValueKind]::DWord)
+            $key.SetValue('AuthorizedClientSid', $Sid, [Microsoft.Win32.RegistryValueKind]::String)
+            $key.Flush()
+        }
+        finally { $key.Dispose() }
+    }
+    finally { $base.Dispose() }
+}
+
+function Set-PolicyValue([string]$Name, [object]$Value, [Microsoft.Win32.RegistryValueKind]$Kind) {
+    Assert-True $createdPolicy 'Refusing to mutate a policy not created by this harness.'
+    $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
+    try {
+        $key = $base.OpenSubKey($policyPath, $true)
+        if ($null -eq $key) { throw 'Owned authorization policy disappeared.' }
+        try { $key.SetValue($Name, $Value, $Kind); $key.Flush() }
+        finally { $key.Dispose() }
+    }
+    finally { $base.Dispose() }
+}
+
+function Assert-ExactPolicyAcl {
+    $acl = Get-Acl -LiteralPath $policyRegistryPath
+    Assert-True $acl.AreAccessRulesProtected 'Authorization policy DACL is not protected.'
+    Assert-True ($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -ceq 'S-1-5-18') 'Authorization policy owner is not SYSTEM.'
+    $rules = @($acl.GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier]))
+    Assert-True ($rules.Count -eq 3) 'Authorization policy does not have exactly three ACEs.'
+    $expected = @{
+        'S-1-5-18' = [uint32][Security.AccessControl.RegistryRights]::FullControl
+        'S-1-5-32-544' = [uint32][Security.AccessControl.RegistryRights]::FullControl
+        $serviceSid = [uint32][Security.AccessControl.RegistryRights]::ReadKey
+    }
+    foreach ($rule in $rules) {
+        Assert-True ($expected.ContainsKey($rule.IdentityReference.Value)) 'Authorization policy contains an unexpected SID.'
+        Assert-True (-not $rule.IsInherited -and $rule.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow) 'Authorization policy contains inherited or deny access.'
+        Assert-True ([uint32]$rule.RegistryRights -eq $expected[$rule.IdentityReference.Value]) 'Authorization policy ACE mask is noncanonical.'
+        [void]$expected.Remove($rule.IdentityReference.Value)
+    }
+    Assert-True ($expected.Count -eq 0) 'Authorization policy is missing a required SID.'
+}
+
+function Assert-RejectedServiceStartup([string]$Label, [string]$Client, [string[]]$ClientArguments) {
+    [void](Invoke-Sc -Arguments @('start', $serviceName) -AllowFailure)
+    Wait-ServiceNotRunning -TimeoutSeconds 10
+    $probe = Invoke-Process -FilePath $Client -Arguments $ClientArguments -TimeoutSeconds 20 -AllowFailure
+    Assert-True ($probe.ExitCode -eq 78) "$Label did not leave the fixed pipe unavailable."
+    Assert-True ($probe.Stderr.Contains('broker is unavailable', [StringComparison]::Ordinal)) "$Label exposed a pipe after rejected startup."
 }
 
 function New-ValidClientArguments([string]$HandoffRoot, [string]$OutputRoot) {
@@ -189,6 +282,15 @@ try {
         return
     }
 
+    if (Test-Path -LiteralPath $policyRegistryPath) {
+        throw 'Refusing to modify a pre-existing fixed Windows GPU broker client policy.'
+    }
+    foreach ($rejectedSid in @('BUILTIN\Users', 'S-1-5-11', 'S-1-5-20', $serviceSid, 'S-1-5-21-1-2-3-500')) {
+        $rejectedProvision = New-ProtectedPolicy -Sid $rejectedSid
+        Assert-True ($rejectedProvision.ExitCode -ne 0) "Provisioner accepted dangerous client identity $rejectedSid."
+        Assert-True (-not (Test-Path -LiteralPath $policyRegistryPath)) 'Rejected provisioning created a policy key.'
+    }
+
     $commonAppData = [Environment]::GetFolderPath([Environment+SpecialFolder]::CommonApplicationData)
     Assert-True (-not [string]::IsNullOrWhiteSpace($commonAppData)) 'Windows did not provide the machine-wide application-data root.'
     $machineTarget = Join-Path $commonAppData "scribe-gpu-broker-transport-$([guid]::NewGuid().ToString('N'))"
@@ -245,9 +347,76 @@ try {
     Assert-True ($sidType.ExitCode -eq 0) "Failed to configure the restricted service SID: $($sidType.Stderr)"
     [void](Assert-OwnedBrokerService -ExpectedPath $serviceForScm)
 
+    Assert-RejectedServiceStartup -Label 'Missing policy' -Client $client -ClientArguments $arguments
+    Assert-True (-not (Test-Path -LiteralPath $handoff)) 'Missing-policy startup touched the handoff path.'
+    Assert-True (-not (Test-Path -LiteralPath $output)) 'Missing-policy startup touched the output path.'
+
+    New-WeakPolicy -Sid $identity.User.Value
+    Assert-RejectedServiceStartup -Label 'Weak inherited policy' -Client $client -ClientArguments $arguments
+    Remove-OwnedPolicy
+
+    $provisioned = New-ProtectedPolicy -Sid $identity.User.Value
+    Assert-True ($provisioned.ExitCode -eq 0) "Protected policy provisioning failed: $($provisioned.Stderr)"
+    Assert-ExactPolicyAcl
+    $duplicateProvision = New-ProtectedPolicy -Sid $identity.User.Value
+    Assert-True ($duplicateProvision.ExitCode -ne 0) 'Provisioner modified a pre-existing policy.'
+
+    Set-PolicyValue -Name 'UnexpectedValue' -Value 'forbidden' -Kind ([Microsoft.Win32.RegistryValueKind]::String)
+    Assert-RejectedServiceStartup -Label 'Extra policy value' -Client $client -ClientArguments $arguments
+    Remove-OwnedPolicy
+
+    $provisioned = New-ProtectedPolicy -Sid $identity.User.Value
+    Assert-True ($provisioned.ExitCode -eq 0) 'Could not reprovision the malformed-schema fixture.'
+    Set-PolicyValue -Name 'SchemaVersion' -Value '1' -Kind ([Microsoft.Win32.RegistryValueKind]::String)
+    Assert-RejectedServiceStartup -Label 'Malformed policy schema' -Client $client -ClientArguments $arguments
+    Remove-OwnedPolicy
+
+    $provisioned = New-ProtectedPolicy -Sid $identity.User.Value
+    Assert-True ($provisioned.ExitCode -eq 0) 'Could not reprovision the malformed-policy fixture.'
+    Set-PolicyValue -Name 'AuthorizedClientSid' -Value 'S-1-5-11' -Kind ([Microsoft.Win32.RegistryValueKind]::String)
+    Assert-RejectedServiceStartup -Label 'Broad malformed policy SID' -Client $client -ClientArguments $arguments
+    Remove-OwnedPolicy
+
+    $orphanSid = 'S-1-5-21-4294967290-4294967291-4294967292-4294967293'
+    $provisioned = New-ProtectedPolicy -Sid $orphanSid
+    Assert-True ($provisioned.ExitCode -eq 0) 'Could not provision the orphan-SID denial fixture.'
+    Assert-ExactPolicyAcl
     $start = Invoke-Sc -Arguments @('start', $serviceName) -AllowFailure
-    Assert-True ($start.ExitCode -eq 0) "SCM rejected the first service start: $($start.Stderr)"
+    Assert-True ($start.ExitCode -eq 0) "SCM rejected the syntactically valid orphan-SID policy: $($start.Stderr)"
     (Get-Service -Name $serviceName).WaitForStatus([System.ServiceProcess.ServiceControllerStatus]::Running, [TimeSpan]::FromSeconds(10))
+    $wrongIdentity = Invoke-Process -FilePath $client -Arguments $arguments -TimeoutSeconds 20 -AllowFailure
+    Assert-True ($wrongIdentity.ExitCode -eq 74) 'Wrong TokenUser SID did not fail closed without a response.'
+    Assert-True ($wrongIdentity.Stderr.Contains('transport was rejected', [StringComparison]::Ordinal)) 'Wrong TokenUser SID did not emit the rejected-transport diagnostic.'
+    Assert-True ((Get-Service -Name $serviceName).Status -eq [System.ServiceProcess.ServiceControllerStatus]::Running) 'Orphan SID denial stopped the healthy service.'
+    [void](Assert-OwnedBrokerService -ExpectedPath $serviceForScm)
+    $stop = Invoke-Sc -Arguments @('stop', $serviceName) -AllowFailure
+    Assert-True ($stop.ExitCode -eq 0) 'SCM rejected the orphan-policy stop request.'
+    (Get-Service -Name $serviceName).WaitForStatus([System.ServiceProcess.ServiceControllerStatus]::Stopped, [TimeSpan]::FromSeconds(10))
+    Remove-OwnedPolicy
+
+    $provisioned = New-ProtectedPolicy -Sid $identity.User.Value
+    Assert-True ($provisioned.ExitCode -eq 0) 'Could not provision the current TokenUser SID.'
+    Assert-ExactPolicyAcl
+    $start = Invoke-Sc -Arguments @('start', $serviceName) -AllowFailure
+    Assert-True ($start.ExitCode -eq 0) "SCM rejected the current-user policy: $($start.Stderr)"
+    (Get-Service -Name $serviceName).WaitForStatus([System.ServiceProcess.ServiceControllerStatus]::Running, [TimeSpan]::FromSeconds(10))
+
+    $overbroad = [IO.Pipes.NamedPipeClientStream]::new(
+        '.',
+        $pipeName,
+        [IO.Pipes.PipeAccessRights]::FullControl,
+        [IO.Pipes.PipeOptions]::Asynchronous,
+        [Security.Principal.TokenImpersonationLevel]::Identification,
+        [IO.HandleInheritability]::None
+    )
+    try {
+        $overbroadDenied = $false
+        try { $overbroad.Connect(2000) }
+        catch [UnauthorizedAccessException] { $overbroadDenied = $true }
+        Assert-True $overbroadDenied 'Client received generic write, pipe-instance, or ACL authority beyond 0x00100183.'
+    }
+    finally { $overbroad.Dispose() }
+
     $stalledClientRights = [IO.Pipes.PipeAccessRights](
         [uint32][IO.Pipes.PipeAccessRights]::ReadData -bor
         [uint32][IO.Pipes.PipeAccessRights]::WriteData -bor
@@ -279,6 +448,7 @@ try {
     $start = Invoke-Sc -Arguments @('start', $serviceName) -AllowFailure
     Assert-True ($start.ExitCode -eq 0) "SCM rejected the second service start: $($start.Stderr)"
     (Get-Service -Name $serviceName).WaitForStatus([System.ServiceProcess.ServiceControllerStatus]::Running, [TimeSpan]::FromSeconds(10))
+    Set-PolicyValue -Name 'AuthorizedClientSid' -Value $orphanSid -Kind ([Microsoft.Win32.RegistryValueKind]::String)
     $roundTrip = Invoke-Process -FilePath $client -Arguments $arguments -TimeoutSeconds 20 -AllowFailure
     Assert-True ($roundTrip.ExitCode -eq 78) 'Authenticated service response did not map to NotProvisioned.'
     Assert-True ($roundTrip.Stdout.Length -eq 0) 'Broker client wrote protocol data to stdout.'
@@ -289,12 +459,28 @@ try {
 
     [void](Assert-OwnedBrokerService -ExpectedPath $serviceForScm)
     $stop = Invoke-Sc -Arguments @('stop', $serviceName) -AllowFailure
+    Assert-True ($stop.ExitCode -eq 0) "SCM rejected the snapshot-policy stop request: $($stop.Stderr)"
+    (Get-Service -Name $serviceName).WaitForStatus([System.ServiceProcess.ServiceControllerStatus]::Stopped, [TimeSpan]::FromSeconds(10))
+
+    $start = Invoke-Sc -Arguments @('start', $serviceName) -AllowFailure
+    Assert-True ($start.ExitCode -eq 0) 'SCM rejected restart with the mutated, syntactically valid orphan SID.'
+    (Get-Service -Name $serviceName).WaitForStatus([System.ServiceProcess.ServiceControllerStatus]::Running, [TimeSpan]::FromSeconds(10))
+    $afterRestart = Invoke-Process -FilePath $client -Arguments $arguments -TimeoutSeconds 20 -AllowFailure
+    Assert-True ($afterRestart.ExitCode -eq 74) 'Service restart did not load the mutated authorization SID.'
+    Assert-True ((Get-Service -Name $serviceName).Status -eq [System.ServiceProcess.ServiceControllerStatus]::Running) 'Restarted orphan-policy service was not healthy after denial.'
+    [void](Assert-OwnedBrokerService -ExpectedPath $serviceForScm)
+    $stop = Invoke-Sc -Arguments @('stop', $serviceName) -AllowFailure
     Assert-True ($stop.ExitCode -eq 0) "SCM rejected the final stop request: $($stop.Stderr)"
     (Get-Service -Name $serviceName).WaitForStatus([System.ServiceProcess.ServiceControllerStatus]::Stopped, [TimeSpan]::FromSeconds(10))
     Write-Output 'Windows GPU broker transport contract tests passed.'
 }
 catch { $primaryFailure = $_ }
 finally {
+    try {
+        if ($createdPolicy) { Remove-OwnedPolicy }
+    }
+    catch { [void]$cleanupFailures.Add($_) }
+
     try {
         if ($createdService) {
             $existing = Get-BrokerService

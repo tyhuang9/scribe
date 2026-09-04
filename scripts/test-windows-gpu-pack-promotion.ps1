@@ -212,6 +212,12 @@ try {
     Assert-True ($workflow.Contains('github.event.repository.default_branch')) 'Production dispatch is not restricted to the default branch.'
     Assert-True ($protected.Contains('SCRIBE_WINDOWS_GPU_TRUSTED_CLIENT_SHA256')) 'Protected broker-client digest is not independently configured.'
     Assert-True ($protected.Contains('SCRIBE_WINDOWS_GPU_PRODUCTION_BROKER_PROVISIONED')) 'Separately privileged broker provisioning gate is missing.'
+    Assert-True ($protected.Contains('SCRIBE_WINDOWS_GPU_AUTHORIZED_CLIENT_SID')) 'Protected workflow client SID variable is missing.'
+    Assert-True ($protected.Contains('[Security.Principal.WindowsIdentity]::GetCurrent().User.Value')) 'Protected runner does not inspect its exact TokenUser SID.'
+    Assert-True ($protected.Contains('$currentClientSid -cne $configuredClientSid.Value')) 'Protected runner does not compare exact configured and current client SIDs.'
+    $identityCheck = $protected.IndexOf('$currentClientSid -cne $configuredClientSid.Value', [StringComparison]::Ordinal)
+    $brokerGate = $protected.IndexOf('$env:PRODUCTION_BROKER_PROVISIONED -cne', [StringComparison]::Ordinal)
+    Assert-True ($identityCheck -ge 0 -and $identityCheck -lt $brokerGate) 'Protected runner identity preflight does not precede the closed broker gate.'
     Assert-True ($protected.Contains('actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c')) 'Protected artifact download is not pinned to the reviewed v8.0.1 action.'
     Assert-True ($protected.Contains('digest-mismatch: error')) 'Protected artifact download does not fail closed on a digest mismatch.'
     Assert-True ($protected.Contains('--require-unused-release-set')) 'Trusted signer interface does not require replay rejection.'
@@ -232,6 +238,18 @@ try {
     Assert-True ($brokerContract.Contains('pub struct ClientInvocation')) 'Broker contract lost its process-local invocation wrapper.'
     Assert-True ($brokerContract.Contains('self.workflow_source_sha != self.source_revision')) 'Broker intent does not bind workflow source to default-branch pack source.'
     Assert-True ($brokerContract.Contains('scribe-windows-gpu-promotion-intent-v1')) 'Broker intent digest is not domain separated.'
+    $brokerNative = Get-Content -LiteralPath (Join-Path $repositoryRoot 'tools\windows-gpu-promotion-broker\src\windows_native.rs') -Raw
+    $brokerNativeProduction = $brokerNative.Split('#[cfg(test)]', 2)[0]
+    Assert-True ($brokerNativeProduction.Contains('SOFTWARE\Scribe\GpuPromotionBroker\v1\Authorization')) 'Broker lost its fixed machine-wide client policy path.'
+    Assert-True ($brokerNativeProduction.Contains('KEY_READ | KEY_WOW64_64KEY')) 'Broker no longer opens only the fixed 64-bit policy view for read.'
+    Assert-True ($brokerNativeProduction.Contains('require_user_sid(token.raw(), authorized_client_sid)')) 'Broker does not require exact client TokenUser equality.'
+    Assert-True (-not $brokerNativeProduction.Contains(';;;AU)')) 'Broker pipe regained Authenticated Users admission.'
+    $provisioner = Get-Content -LiteralPath (Join-Path $repositoryRoot 'scripts\provision-windows-gpu-broker-client-policy.ps1') -Raw
+    Assert-True ($provisioner.Contains('RegCreateKeyExW')) 'Client policy provisioner is not create-new.'
+    Assert-True ($provisioner.Contains('SetAccessRuleProtection($true, $false)')) 'Client policy provisioner does not protect its DACL.'
+    Assert-True ($provisioner.Contains('ProvisioningState')) 'Client policy provisioner lacks an incomplete-policy marker.'
+    Assert-True ($provisioner.Contains('RegistryView]::Registry64')) 'Client policy provisioner does not pin the 64-bit registry view.'
+    Assert-True (-not $provisioner.Contains('[string]$AccountName')) 'Client policy provisioner accepts an account name.'
     Assert-True ((Get-Content -LiteralPath (Join-Path $repositoryRoot 'tools\windows-gpu-promotion-broker\src\fixture.rs') -Raw).Contains('consumes_canonical_handoff_generated_by_powershell_and_worker_pack_author')) 'Broker proof does not consume the PowerShell/worker-pack-author interoperability fixture.'
 
     if (-not [string]::IsNullOrWhiteSpace($InteropFixtureDirectory)) {
