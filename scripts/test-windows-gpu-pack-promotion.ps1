@@ -12,6 +12,21 @@ function Assert-True([bool]$Condition, [string]$Message) {
     if (-not $Condition) { throw $Message }
 }
 
+function Get-NormalizedSourceRegionSha256(
+    [string]$Source,
+    [string]$StartMarker,
+    [string]$EndMarker
+) {
+    $normalized = $Source.Replace("`r`n", "`n").Replace("`r", "`n")
+    Assert-True ([regex]::Matches($normalized, [regex]::Escape($StartMarker)).Count -eq 1) 'Pinned source-region start marker is not unique.'
+    $start = $normalized.IndexOf($StartMarker, [StringComparison]::Ordinal)
+    $end = $normalized.IndexOf($EndMarker, $start + $StartMarker.Length, [StringComparison]::Ordinal)
+    Assert-True ($start -ge 0 -and $end -gt $start) 'Pinned source-region boundaries are missing or reversed.'
+    $region = $normalized.Substring($start, $end - $start).Trim()
+    $bytes = [Text.Encoding]::UTF8.GetBytes($region)
+    return ([BitConverter]::ToString([Security.Cryptography.SHA256]::HashData($bytes))).Replace('-', '').ToLowerInvariant()
+}
+
 function Invoke-Tool([string]$Tool, [string[]]$Arguments, [switch]$AllowFailure) {
     $output = @(& $Tool @Arguments 2>&1)
     $exitCode = $LASTEXITCODE
@@ -356,6 +371,25 @@ try {
     $releasePrevious = $restoreScope.IndexOf('previousState = default(TokenPrivileges);', [StringComparison]::Ordinal)
     Assert-True ($nativeRestore -ge 0 -and $nativeRestore -lt $restoredState -and $restoredState -lt $closeToken -and $closeToken -lt $releaseToken -and $releaseToken -lt $releasePrevious) 'Client policy provisioner can discard token or prior-state ownership before exact restore and successful close.'
     $transportHarness = Get-Content -LiteralPath (Join-Path $repositoryRoot 'scripts\test-windows-gpu-broker-transport.ps1') -Raw
+    $authenticatedCallAssignment = '$roundTrip = Invoke-EphemeralProcess -FilePath $clientForCredential -Arguments $arguments -TimeoutSeconds 20 -AllowFailure'
+    $classifierDigest = Get-NormalizedSourceRegionSha256 `
+        -Source $transportHarness `
+        -StartMarker 'function Get-SanitizedClientDiagnosticCategory' `
+        -EndMarker 'function Test-SanitizedClientDiagnosticCategoryContract'
+    Assert-True ($classifierDigest -ceq '0b230793315ddbeea87e493a75b8ca9249a57d2e6f643d45324e2df7fc269dd5') 'Sanitized diagnostic helpers changed; review their exact output behavior before updating the pinned digest.'
+    $authenticatedRegionDigest = Get-NormalizedSourceRegionSha256 `
+        -Source $transportHarness `
+        -StartMarker $authenticatedCallAssignment `
+        -EndMarker '[void](Assert-OwnedBrokerService -ExpectedPath $serviceForScm)'
+    Assert-True ($authenticatedRegionDigest -ceq 'c0e91770374481e3f056854fc75c92bbc8fc379a4f81aba045524279381c4504') 'Authenticated real-client region changed; review every captured-output use before updating the pinned digest.'
+    $preBlockAliasMutation = $transportHarness.Replace(
+        $authenticatedCallAssignment,
+        $authenticatedCallAssignment + "`r`n    `$roundTripAlias = `$roundTrip`r`n    throw `$roundTripAlias.PSObject.Properties['Stderr'].Value"
+    )
+    Assert-True ((Get-NormalizedSourceRegionSha256 `
+        -Source $preBlockAliasMutation `
+        -StartMarker $authenticatedCallAssignment `
+        -EndMarker '[void](Assert-OwnedBrokerService -ExpectedPath $serviceForScm)') -cne $authenticatedRegionDigest) 'Pinned authenticated region did not detect a pre-block indirect Stderr leak.'
     Assert-True ($transportHarness.Contains('Assert-OwnedPolicyState -State $state')) 'Broker harness cleanup does not revalidate exact ownership state.'
     Assert-True ($transportHarness.Contains('SecurityFingerprint')) 'Broker harness cleanup does not pin the policy security descriptor.'
     Assert-True ($transportHarness.Contains('CleanupTamper')) 'Broker harness lacks an adversarial same-name cleanup test.'
@@ -468,6 +502,10 @@ try {
     $availabilityTestCall = $transportHarness.LastIndexOf('Test-FixturePathSetAvailabilityContract', [StringComparison]::Ordinal)
     $availabilityTestNonElevatedReturn = $transportHarness.IndexOf("if (-not `$isElevated)", [StringComparison]::Ordinal)
     Assert-True ($availabilityTestStart -ge 0 -and $availabilityTestStart -lt $availabilityTestCall -and $availabilityTestCall -lt $availabilityTestNonElevatedReturn) 'Broker harness does not run deterministic three-path collision coverage before its non-elevated return.'
+    $diagnosticContractStart = $transportHarness.IndexOf('function Test-SanitizedClientDiagnosticCategoryContract', [StringComparison]::Ordinal)
+    $diagnosticContractCall = $transportHarness.LastIndexOf('Test-SanitizedClientDiagnosticCategoryContract', [StringComparison]::Ordinal)
+    Assert-True ($diagnosticContractStart -ge 0 -and $diagnosticContractStart -lt $diagnosticContractCall -and $diagnosticContractCall -lt $availabilityTestNonElevatedReturn) 'Broker harness does not run sanitized client-diagnostic mapping tests before its non-elevated return.'
+    Assert-True ($transportHarness.Contains('Sanitized failure record retained untrusted diagnostic content.')) 'Broker harness lost its behavioral raw-diagnostic non-disclosure test.'
     $directCredentialCall = 'Invoke-EphemeralProcess -FilePath $clientForCredential'
     Assert-True ([regex]::Matches($transportHarness, [regex]::Escape($directCredentialCall)).Count -eq 2) 'Broker harness must retain exactly two direct authenticated real-client calls.'
     $firstCredentialCall = $transportHarness.IndexOf($directCredentialCall, [StringComparison]::Ordinal)

@@ -2064,6 +2064,102 @@ function Assert-RejectedServiceStartup([string]$Label, [string]$Client, [string[
     Assert-True ($probe.Stderr.Contains('broker is unavailable', [StringComparison]::Ordinal)) "$Label exposed a pipe after rejected startup."
 }
 
+function Get-SanitizedClientDiagnosticCategory([AllowNull()][string]$StandardError) {
+    $normalized = if ($null -eq $StandardError) { '' } else { $StandardError.Trim() }
+    if ($normalized.Equals('Protected Windows GPU promotion broker authenticated; production authority is not provisioned, and no filesystem, ledger, or signing authority was accessed.', [StringComparison]::Ordinal)) {
+        return 'authenticated_not_provisioned'
+    }
+    if ($normalized.Equals('Protected Windows GPU promotion broker is unavailable and production authority is not provisioned; no filesystem, ledger, or signing authority was accessed.', [StringComparison]::Ordinal)) {
+        return 'unavailable'
+    }
+    if ($normalized.Equals('Protected Windows GPU promotion intent was rejected.', [StringComparison]::Ordinal)) {
+        return 'intent_rejected'
+    }
+    if ($normalized.Equals('Protected Windows GPU promotion transport was rejected.', [StringComparison]::Ordinal)) {
+        return 'transport_rejected'
+    }
+    if ($normalized.Equals('Protected Windows GPU promotion client initialization failed.', [StringComparison]::Ordinal)) {
+        return 'client_initialization_failed'
+    }
+    return 'unexpected'
+}
+
+function Get-SanitizedClientFailureDiagnostic(
+    [int]$ExitCode,
+    [AllowNull()][string]$StandardOutput,
+    [AllowNull()][string]$StandardError,
+    [AllowNull()][string]$ServiceStatus
+) {
+    $allowedServiceStatuses = @(
+        'Stopped',
+        'StartPending',
+        'StopPending',
+        'Running',
+        'ContinuePending',
+        'PausePending',
+        'Paused',
+        'absent',
+        'query_failed'
+    )
+    $sanitizedServiceStatus = if ($allowedServiceStatuses -ccontains $ServiceStatus) { $ServiceStatus } else { 'unknown' }
+    $stderrCategory = Get-SanitizedClientDiagnosticCategory -StandardError $StandardError
+    $stdoutLength = if ($null -eq $StandardOutput) { 0 } else { $StandardOutput.Length }
+    $stderrLength = if ($null -eq $StandardError) { 0 } else { $StandardError.Length }
+    return "Authenticated service response did not map to NotProvisioned. exit_code=$ExitCode; stderr_category=$stderrCategory; stdout_utf16_length=$stdoutLength; stderr_utf16_length=$stderrLength; broker_service_status=$sanitizedServiceStatus"
+}
+
+function Test-SanitizedClientDiagnosticCategoryContract {
+    $fixedDiagnostics = [ordered]@{
+        'Protected Windows GPU promotion broker authenticated; production authority is not provisioned, and no filesystem, ledger, or signing authority was accessed.' = 'authenticated_not_provisioned'
+        'Protected Windows GPU promotion broker is unavailable and production authority is not provisioned; no filesystem, ledger, or signing authority was accessed.' = 'unavailable'
+        'Protected Windows GPU promotion intent was rejected.' = 'intent_rejected'
+        'Protected Windows GPU promotion transport was rejected.' = 'transport_rejected'
+        'Protected Windows GPU promotion client initialization failed.' = 'client_initialization_failed'
+    }
+    $clientMainSource = Get-Content -LiteralPath (Join-Path $repositoryRoot 'tools\windows-gpu-promotion-broker\src\main.rs') -Raw
+    foreach ($entry in $fixedDiagnostics.GetEnumerator()) {
+        Assert-True ([regex]::Matches($clientMainSource, [regex]::Escape($entry.Key)).Count -eq 1) 'Sanitized diagnostic classifier is not bound to exactly one production client diagnostic.'
+        $exactCategory = Get-SanitizedClientDiagnosticCategory -StandardError $entry.Key
+        Assert-True ($exactCategory -ceq $entry.Value) 'Sanitized diagnostic classifier rejected an exact fixed production diagnostic.'
+        $trimmedCategory = Get-SanitizedClientDiagnosticCategory -StandardError (" `r`n" + $entry.Key + "`t ")
+        Assert-True ($trimmedCategory -ceq $entry.Value) 'Sanitized diagnostic classifier changed its edge-whitespace trimming policy.'
+        Assert-True (-not $exactCategory.Contains('Protected Windows GPU promotion', [StringComparison]::Ordinal)) 'Sanitized diagnostic category retained raw production diagnostic text.'
+    }
+
+    $authenticatedDiagnostic = [string]$fixedDiagnostics.Keys[0]
+    $unavailableDiagnostic = [string]$fixedDiagnostics.Keys[1]
+    $unexpectedCases = @(
+        [pscustomobject]@{ Name = 'null'; Value = $null },
+        [pscustomobject]@{ Name = 'empty'; Value = '' },
+        [pscustomobject]@{ Name = 'whitespace'; Value = " `r`n`t" },
+        [pscustomobject]@{ Name = 'near match'; Value = $authenticatedDiagnostic + 'x' },
+        [pscustomobject]@{ Name = 'case change'; Value = $authenticatedDiagnostic.ToUpperInvariant() },
+        [pscustomobject]@{ Name = 'concatenated diagnostics'; Value = $authenticatedDiagnostic + $unavailableDiagnostic },
+        [pscustomobject]@{ Name = 'multiline content'; Value = $authenticatedDiagnostic + "`r`nuntrusted-extra-line" },
+        [pscustomobject]@{ Name = 'unknown raw sentinel'; Value = 'raw-sensitive-diagnostic-sentinel' }
+    )
+    foreach ($case in $unexpectedCases) {
+        $category = Get-SanitizedClientDiagnosticCategory -StandardError $case.Value
+        Assert-True ($category -ceq 'unexpected') "Sanitized diagnostic classifier accepted $($case.Name)."
+        Assert-True (-not $category.Contains('raw-sensitive-diagnostic-sentinel', [StringComparison]::Ordinal)) 'Unexpected diagnostic category retained raw text.'
+    }
+
+    $rawStdout = 'stdout-sensitive-sentinel'
+    $rawStderr = 'raw-sensitive-diagnostic-sentinel'
+    $failureDiagnostic = Get-SanitizedClientFailureDiagnostic `
+        -ExitCode 74 `
+        -StandardOutput $rawStdout `
+        -StandardError $rawStderr `
+        -ServiceStatus 'service-status-sensitive-sentinel'
+    $expectedFailureDiagnostic = "Authenticated service response did not map to NotProvisioned. exit_code=74; stderr_category=unexpected; stdout_utf16_length=$($rawStdout.Length); stderr_utf16_length=$($rawStderr.Length); broker_service_status=unknown"
+    Assert-True ($failureDiagnostic -ceq $expectedFailureDiagnostic) 'Unexpected client output did not produce the exact sanitized failure record.'
+    foreach ($rawValue in @($rawStdout, $rawStderr, 'service-status-sensitive-sentinel')) {
+        Assert-True (-not $failureDiagnostic.Contains($rawValue, [StringComparison]::Ordinal)) 'Sanitized failure record retained untrusted diagnostic content.'
+    }
+    $nullDiagnostic = Get-SanitizedClientFailureDiagnostic -ExitCode 1 -StandardOutput $null -StandardError $null -ServiceStatus $null
+    Assert-True ($nullDiagnostic -ceq 'Authenticated service response did not map to NotProvisioned. exit_code=1; stderr_category=unexpected; stdout_utf16_length=0; stderr_utf16_length=0; broker_service_status=unknown') 'Null client output did not produce the exact sanitized failure record.'
+}
+
 function New-ValidClientArguments([string]$HandoffRoot, [string]$OutputRoot) {
     return @(
         'promote-windows-pack-set',
@@ -2092,6 +2188,7 @@ try {
     Test-EphemeralProcessOwnershipBoundary
     Test-CredentialCommandLineContract
     Test-FixturePathSetAvailabilityContract
+    Test-SanitizedClientDiagnosticCategoryContract
     $goldenRequest = '{"schema_version":1,"command":"promote-windows-pack-set","client_nonce":"1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a","promotion_intent_sha256":"bf7b4002065dcc87c6d7abd70899c76a23c880c82e1869c4ba2bdbf39dcebe3c","intent":{"schema_version":1,"policy_namespace":"scribe-windows-gpu-production-v1","source_repository":"owner/repo","source_ref":"refs/heads/main","source_revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","workflow_ref":"owner/repo/.github/workflows/windows-gpu-pack-promotion.yml@refs/heads/main","workflow_source_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","run_id":"123","run_attempt":"1","artifact_id":"456","artifact_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","handoff_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","release_set_digest":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","toolchain_manifest_sha256":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","pack_version":"0.1.0","minimum_security_epoch":1,"require_unused_release_set":true}}'
     $goldenMaterial = [Text.Encoding]::UTF8.GetBytes("scribe-windows-gpu-promotion-request-v1`0$goldenRequest")
     $goldenDigest = ([BitConverter]::ToString([Security.Cryptography.SHA256]::HashData($goldenMaterial))).Replace('-', '').ToLowerInvariant()
@@ -2515,7 +2612,18 @@ try {
     (Get-Service -Name $serviceName).WaitForStatus([System.ServiceProcess.ServiceControllerStatus]::Running, [TimeSpan]::FromSeconds(10))
     Set-PolicyValue -Name 'AuthorizedClientSid' -Value $orphanSid -Kind ([Microsoft.Win32.RegistryValueKind]::String)
     $roundTrip = Invoke-EphemeralProcess -FilePath $clientForCredential -Arguments $arguments -TimeoutSeconds 20 -AllowFailure
-    Assert-True ($roundTrip.ExitCode -eq 78) 'Authenticated service response did not map to NotProvisioned.'
+    if ($roundTrip.ExitCode -ne 78) {
+        try {
+            $diagnosticService = Get-BrokerService
+            $diagnosticServiceStatus = if ($null -eq $diagnosticService) { 'absent' } else { $diagnosticService.Status.ToString() }
+        }
+        catch { $diagnosticServiceStatus = 'query_failed' }
+        throw (Get-SanitizedClientFailureDiagnostic `
+            -ExitCode ([int]$roundTrip.ExitCode) `
+            -StandardOutput $roundTrip.Stdout `
+            -StandardError $roundTrip.Stderr `
+            -ServiceStatus $diagnosticServiceStatus)
+    }
     Assert-True ($roundTrip.Stdout.Length -eq 0) 'Broker client wrote protocol data to stdout.'
     Assert-True ($roundTrip.Stderr.Trim() -ceq 'Protected Windows GPU promotion broker authenticated; production authority is not provisioned, and no filesystem, ledger, or signing authority was accessed.') 'Broker client did not emit its fixed authenticated NotProvisioned diagnostic.'
     Assert-True ((Get-Service -Name $serviceName).Status -eq [System.ServiceProcess.ServiceControllerStatus]::Running) 'Broker service did not remain running after the authenticated round trip.'
