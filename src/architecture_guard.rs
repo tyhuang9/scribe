@@ -1741,6 +1741,62 @@ fn windows_gpu_pack_promotion_keeps_candidate_and_signing_authority_separate() {
         "$start.LoadUserProfile = $false",
         "$start.WorkingDirectory = [IO.Path]::GetFullPath($machineTarget)",
         "$start.Environment.Clear()",
+        "$candidateToken = New-CryptographicHex -ByteCount 16",
+        "$pathToken = $fixturePaths.Token",
+        "$machineTarget = $fixturePaths.MachineTarget",
+        "$handoff = $fixturePaths.Handoff",
+        "$output = $fixturePaths.Output",
+        "-cmatch '^[0-9a-f]{32}$'",
+        "-cmatch '^s[0-9a-f]{32}$'",
+        r#"$leaf -cmatch "^$Prefix[0-9a-f]{32}$""#,
+        "$serviceForScm = Join-Path $machineTarget 's.exe'",
+        "$clientForCredential = Join-Path $machineTarget 'c.exe'",
+        "$harnessForCredential = Join-Path $machineTarget 'p.ps1'",
+        "Get-ValidatedNoTouchPath -DriveRoot $DriveRoot -Prefix 'h' -Token $candidateToken",
+        "Get-ValidatedNoTouchPath -DriveRoot $DriveRoot -Prefix 'o' -Token $candidateToken",
+        "Assert-NoTouchPathsRemainAbsent -HandoffRoot $handoff -OutputRoot $output",
+        "$DriveRoot -cmatch '^[A-Z]:\\\\$'",
+        "[IO.Path]::IsPathFullyQualified($candidate)",
+        "[IO.Path]::GetFullPath($candidate) -ceq $candidate",
+        "[IO.Path]::GetPathRoot($candidate) -ceq $DriveRoot",
+        "[IO.Path]::GetDirectoryName($candidate) -ceq $DriveRoot",
+        "[IO.Path]::GetFileName($candidate) -ceq $leaf",
+        "[IO.Path]::IsPathFullyQualified($env:SystemRoot)",
+        "Windows system directory is noncanonical.",
+        "[IO.Path]::IsPathFullyQualified($CommonAppData)",
+        "Machine-wide application-data root is noncanonical.",
+        "$HandoffRoot -cne $OutputRoot",
+        "Could not select an absent three-path credentialed fixture set after $maximumAttempts attempts.",
+        "The no-touch handoff path appeared and will be left untouched.",
+        "The no-touch output path appeared and will be left untouched.",
+        "$safeToRemoveMachineTarget = $null -ne $ownedMachineTarget",
+        "Refusing protected staging cleanup while a credentialed process may still be active.",
+        "Refusing protected staging cleanup while the exact broker service still exists.",
+        "Refusing protected staging cleanup outside its exact CommonApplicationData parent.",
+        "Refusing protected staging cleanup through a reparse point.",
+        "Refusing protected staging cleanup containing an unexpected entry.",
+        "public static class CredentialCommandLine",
+        "CreateProcessWithLogonMaximumUtf16Units = 1024",
+        "ReservedUtf16Units = 64",
+        "MaximumUtf16UnitsIncludingNull = 960",
+        "Credentialed command-line bound lost its fixed 64-unit reserve below the native 1024-unit ceiling.",
+        "Render(fileName, arguments).Length + 1",
+        "Char.IsWhiteSpace(value)",
+        "commandLine.Append('\\\\', checked(backslashes * 2 + 1))",
+        "commandLine.Append('\\\\', checked(backslashes * 2))",
+        "Executable path is not canonical for credentialed launch.",
+        "Credentialed launch arguments cannot contain null.",
+        "Credentialed launch arguments cannot contain NUL.",
+        "function Test-CredentialCommandLineContract",
+        "surrogate pair",
+        "non-ASCII whitespace",
+        "backslashes before quote",
+        "quoted trailing backslash",
+        "requires 961 UTF-16 units including NUL; limit is 960.",
+        "$acceptedLength -eq 960",
+        "$maximumShapeLength -le 960",
+        "$maximumArguments = New-ValidClientArguments",
+        "Credentialed command-line preflight failure started or adopted a process.",
         "RunEphemeralIdentityProbe",
         "RunEphemeralFullControlProbe",
         "RunEphemeralStalledProbe",
@@ -1778,6 +1834,20 @@ fn windows_gpu_pack_promotion_keeps_candidate_and_signing_authority_separate() {
         "Environment['PASSWORD']",
         "Write-Output $script:ephemeralPassword",
         "WriteAllText($script:ephemeralPassword",
+        ".Arguments =",
+        "UseShellExecute = $true",
+        "Start-Process",
+        "CreateProcessAsUser",
+        "CreateProcessWithToken",
+        " -EncodedCommand",
+        "cmd.exe /c",
+        "Environment['ARGUMENTS']",
+        "Environment['ARGS']",
+        "Environment['COMMAND_LINE']",
+        "ConvertTo-ResponseFile",
+        "Write-ResponseFile",
+        "Remove-Item -LiteralPath $handoff",
+        "Remove-Item -LiteralPath $output",
     ] {
         assert!(
             !transport_test.contains(forbidden),
@@ -1797,6 +1867,218 @@ fn windows_gpu_pack_promotion_keeps_candidate_and_signing_authority_separate() {
         constructor_normalization_start < constructor_normalization_call
             && constructor_normalization_call < non_elevated_return,
         "SCM transport harness must run constructor normalization before its non-elevated return"
+    );
+    let command_line_contract_start = transport_test
+        .find("function Test-CredentialCommandLineContract")
+        .expect("SCM transport harness defines its credentialed command-line contract");
+    let command_line_contract_call = transport_test
+        .rfind("Test-CredentialCommandLineContract")
+        .expect("SCM transport harness invokes its credentialed command-line contract");
+    assert!(
+        command_line_contract_start < command_line_contract_call
+            && command_line_contract_call < non_elevated_return,
+        "SCM transport harness must run credentialed command-line checks before its non-elevated return"
+    );
+    let credential_start_begin = transport_test
+        .find("function Start-EphemeralProcess")
+        .expect("SCM transport harness defines its bounded credentialed process start helper");
+    let credential_start_end = transport_test[credential_start_begin..]
+        .find("function Test-CredentialCommandLineContract")
+        .map(|offset| credential_start_begin + offset)
+        .expect("SCM transport harness bounds its credentialed process start helper");
+    let credential_start = &transport_test[credential_start_begin..credential_start_end];
+    let immutable_arguments = credential_start
+        .find("[string[]]$Arguments.Clone()")
+        .expect("credentialed launch clones its argument array");
+    let length_preflight = credential_start
+        .find("CredentialCommandLine]::ValidateLength($FilePath, $immutableArguments)")
+        .expect("credentialed launch preflights its immutable arguments");
+    let structured_arguments = credential_start
+        .find("New-EphemeralProcessStartInfo -FilePath $FilePath -Arguments $immutableArguments")
+        .expect(
+            "credentialed launch passes the preflighted arguments to ArgumentList construction",
+        );
+    let process_start = credential_start
+        .find("[Diagnostics.Process]::Start($start)")
+        .expect("credentialed launch starts through ProcessStartInfo");
+    let process_ownership = credential_start
+        .find("$script:activeCredentialProcess = $process")
+        .expect("credentialed launch establishes exact process ownership");
+    assert!(
+        immutable_arguments < length_preflight
+            && length_preflight < structured_arguments
+            && structured_arguments < process_start
+            && process_start < process_ownership,
+        "credentialed launch must clone, preflight, populate ArgumentList, start, and then establish ownership in order"
+    );
+    let credential_start_info_begin = transport_test
+        .find("function New-EphemeralProcessStartInfo")
+        .expect("SCM transport harness defines its credentialed ProcessStartInfo builder");
+    let credential_start_info_end = transport_test[credential_start_info_begin..]
+        .find("function Start-EphemeralProcess")
+        .map(|offset| credential_start_info_begin + offset)
+        .expect("SCM transport harness bounds its credentialed ProcessStartInfo builder");
+    let credential_start_info =
+        &transport_test[credential_start_info_begin..credential_start_info_end];
+    assert!(
+        credential_start_info
+            .contains("foreach ($argument in $Arguments) { $start.ArgumentList.Add($argument) }"),
+        "credentialed ProcessStartInfo must populate ArgumentList from the preflighted immutable argument copy"
+    );
+    assert_eq!(
+        transport_test
+            .matches("$candidateToken = New-CryptographicHex -ByteCount 16")
+            .count(),
+        1,
+        "SCM transport harness must generate one 128-bit token per attempted three-path fixture set"
+    );
+    let no_touch_builder_start = transport_test
+        .find("function Get-ValidatedNoTouchPath")
+        .expect("SCM transport harness defines its bounded no-touch path validator");
+    let no_touch_builder_end = transport_test[no_touch_builder_start..]
+        .find("function Assert-NoTouchPathsRemainAbsent")
+        .map(|offset| no_touch_builder_start + offset)
+        .expect("SCM transport harness bounds its no-touch path validator");
+    let no_touch_builder = &transport_test[no_touch_builder_start..no_touch_builder_end];
+    assert!(
+        !no_touch_builder.contains("New-Item")
+            && !no_touch_builder.contains("Remove-Item")
+            && !no_touch_builder.contains("Set-Acl"),
+        "no-touch path validation must not create, reserve, adopt, delete, or change ACLs on a drive-root path"
+    );
+    assert!(
+        !transport_test.contains("New-Item -ItemType Directory -Path $handoff")
+            && !transport_test.contains("New-Item -ItemType Directory -Path $output"),
+        "SCM transport harness must not reserve a no-touch client path"
+    );
+    assert!(
+        !transport_test.contains("Set-Acl -LiteralPath $handoff")
+            && !transport_test.contains("Set-Acl -LiteralPath $output")
+            && !transport_test.contains("Set-Acl -LiteralPath $systemVolumeRoot"),
+        "SCM transport harness must not mutate a no-touch path or drive-root ACL"
+    );
+    let path_set_selector_start = transport_test
+        .find("function Select-AvailableFixturePathSet")
+        .expect("SCM transport harness defines its bounded three-path collision selector");
+    let path_set_selector_end = transport_test[path_set_selector_start..]
+        .find("function Test-FixturePathSetAvailabilityContract")
+        .map(|offset| path_set_selector_start + offset)
+        .expect("SCM transport harness bounds its three-path collision selector");
+    let path_set_selector = &transport_test[path_set_selector_start..path_set_selector_end];
+    for required in [
+        "$maximumAttempts = 8",
+        "$attempt -lt $maximumAttempts",
+        "$candidateToken = New-CryptographicHex -ByteCount 16",
+        "-Token $candidateToken",
+        "Test-Path -LiteralPath $candidateMachineTarget",
+        "Test-Path -LiteralPath $candidateHandoff",
+        "Test-Path -LiteralPath $candidateOutput",
+        "$candidateSetAvailable = Test-FixturePathSetAvailable",
+        "if (-not $candidateSetAvailable) { continue }",
+        "Token = $candidateToken",
+        "MachineTarget = $candidateMachineTarget",
+        "Handoff = $candidateHandoff",
+        "Output = $candidateOutput",
+        "after $maximumAttempts attempts.",
+    ] {
+        assert!(
+            path_set_selector.contains(required),
+            "SCM transport harness collision selector lost {required:?}"
+        );
+    }
+    assert_eq!(
+        path_set_selector.matches("-Token $candidateToken").count(),
+        3,
+        "every attempted staging/handoff/output path must derive from the same candidate token"
+    );
+    assert!(
+        !path_set_selector.contains("New-Item")
+            && !path_set_selector.contains("Remove-Item")
+            && !path_set_selector.contains("Set-Acl"),
+        "three-path collision selection must not mutate, reserve, adopt, or delete a candidate path"
+    );
+    let availability_test_start = transport_test
+        .find("function Test-FixturePathSetAvailabilityContract")
+        .expect("SCM transport harness defines deterministic three-path collision coverage");
+    let availability_test_call = transport_test
+        .rfind("Test-FixturePathSetAvailabilityContract")
+        .expect("SCM transport harness invokes deterministic three-path collision coverage");
+    assert!(
+        availability_test_start < availability_test_call
+            && availability_test_call < non_elevated_return,
+        "SCM transport harness must run deterministic collision coverage before its non-elevated return"
+    );
+    let direct_credential_call = "Invoke-EphemeralProcess -FilePath $clientForCredential";
+    assert_eq!(
+        transport_test.matches(direct_credential_call).count(),
+        2,
+        "SCM transport harness must retain exactly two direct authenticated real-client calls"
+    );
+    let first_credential_call = transport_test
+        .find(direct_credential_call)
+        .expect("SCM transport harness performs its first authenticated real-client call");
+    let second_credential_call = transport_test
+        [first_credential_call + direct_credential_call.len()..]
+        .find(direct_credential_call)
+        .map(|offset| first_credential_call + direct_credential_call.len() + offset)
+        .expect("SCM transport harness performs its second authenticated real-client call");
+    let no_touch_assertion =
+        "Assert-NoTouchPathsRemainAbsent -HandoffRoot $handoff -OutputRoot $output";
+    let first_credential_status = transport_test[first_credential_call..]
+        .find("Broker service did not remain running after the authenticated round trip.")
+        .map(|offset| first_credential_call + offset)
+        .expect("first authenticated call retains its service-status postcondition");
+    let first_credential_absent = transport_test[first_credential_status..]
+        .find(no_touch_assertion)
+        .map(|offset| first_credential_status + offset)
+        .expect("first authenticated call retains its post-call no-touch assertion");
+    let first_credential_stop = transport_test[first_credential_absent..]
+        .find("[void](Assert-OwnedBrokerService -ExpectedPath $serviceForScm)")
+        .map(|offset| first_credential_absent + offset)
+        .expect("first authenticated call retains its service-stop boundary");
+    assert!(
+        first_credential_call < first_credential_status
+            && first_credential_status < first_credential_absent
+            && first_credential_absent < first_credential_stop
+            && first_credential_stop < second_credential_call,
+        "first authenticated call must assert no-touch paths after result/status postconditions and before service-stop work"
+    );
+    assert_eq!(
+        transport_test[first_credential_call..second_credential_call]
+            .matches(no_touch_assertion)
+            .count(),
+        1,
+        "first authenticated call region must contain exactly one post-call no-touch assertion"
+    );
+    let second_credential_status = transport_test[second_credential_call..]
+        .find("Restarted orphan-policy service was not healthy after denial.")
+        .map(|offset| second_credential_call + offset)
+        .expect("second authenticated call retains its service-status postcondition");
+    let second_credential_absent = transport_test[second_credential_status..]
+        .find(no_touch_assertion)
+        .map(|offset| second_credential_status + offset)
+        .expect("second authenticated call retains its post-call no-touch assertion");
+    let second_credential_stop = transport_test[second_credential_absent..]
+        .find("[void](Assert-OwnedBrokerService -ExpectedPath $serviceForScm)")
+        .map(|offset| second_credential_absent + offset)
+        .expect("second authenticated call retains its service-stop boundary");
+    assert!(
+        second_credential_call < second_credential_status
+            && second_credential_status < second_credential_absent
+            && second_credential_absent < second_credential_stop,
+        "second authenticated call must assert no-touch paths after result/status postconditions and before service-stop work"
+    );
+    assert_eq!(
+        transport_test[second_credential_call..second_credential_stop]
+            .matches(no_touch_assertion)
+            .count(),
+        1,
+        "second authenticated call region must contain exactly one post-call no-touch assertion"
+    );
+    assert_eq!(
+        transport_test.matches(no_touch_assertion).count(),
+        4,
+        "SCM transport harness must retain initial, two authenticated post-call, and final cleanup no-touch assertions"
     );
     let ephemeral_account_creation = transport_test
         .find("$ephemeralAccount = New-EphemeralStandardAccount")

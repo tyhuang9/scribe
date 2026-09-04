@@ -32,9 +32,12 @@ $targetRoot = Join-Path ([IO.Path]::GetTempPath()) "scribe-gpu-broker-transport-
 $previousCargoTarget = [Environment]::GetEnvironmentVariable('CARGO_TARGET_DIR', 'Process')
 $createdService = $false
 $machineTarget = $null
+$handoff = $null
+$output = $null
 $primaryFailure = $null
 $cleanupFailures = [Collections.Generic.List[object]]::new()
 $safeToRemoveMachineTarget = $false
+$ownedMachineTarget = $null
 $ownedPolicyState = $null
 $ownedPolicyAncestors = @()
 $ownedEphemeralAccount = $null
@@ -695,6 +698,106 @@ namespace Scribe.GpuBroker {
 '@
 }
 
+if (-not ('Scribe.GpuBroker.CredentialCommandLine' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Text;
+
+namespace Scribe.GpuBroker {
+    // ProcessStartInfo uses this Windows quoting algorithm when ArgumentList is
+    // converted for CreateProcessWithLogonW. This test-only renderer is used
+    // solely to validate the native UTF-16 command-line bound; its output is
+    // never executed.
+    public static class CredentialCommandLine {
+        public const int CreateProcessWithLogonMaximumUtf16Units = 1024;
+        public const int ReservedUtf16Units = 64;
+        public const int MaximumUtf16UnitsIncludingNull = 960;
+
+        public static string Render(string fileName, string[] arguments) {
+            if (fileName == null)
+                throw new ArgumentNullException("fileName");
+            if (arguments == null)
+                throw new ArgumentNullException("arguments");
+            string trimmedFileName = fileName.Trim();
+            if (trimmedFileName.Length == 0 ||
+                !String.Equals(fileName, trimmedFileName, StringComparison.Ordinal) ||
+                fileName.IndexOf('\0') >= 0 ||
+                fileName.IndexOf('"') >= 0)
+                throw new ArgumentException("Executable path is not canonical for credentialed launch.", "fileName");
+
+            StringBuilder commandLine = new StringBuilder();
+            commandLine.Append('"');
+            commandLine.Append(fileName);
+            commandLine.Append('"');
+            foreach (string argument in arguments) {
+                if (argument == null)
+                    throw new ArgumentException("Credentialed launch arguments cannot contain null.", "arguments");
+                if (argument.IndexOf('\0') >= 0)
+                    throw new ArgumentException("Credentialed launch arguments cannot contain NUL.", "arguments");
+                commandLine.Append(' ');
+                AppendArgument(commandLine, argument);
+            }
+            return commandLine.ToString();
+        }
+
+        public static int GetUtf16LengthIncludingNull(string fileName, string[] arguments) {
+            return checked(Render(fileName, arguments).Length + 1);
+        }
+
+        public static int ValidateLength(string fileName, string[] arguments) {
+            int length = GetUtf16LengthIncludingNull(fileName, arguments);
+            if (length > MaximumUtf16UnitsIncludingNull)
+                throw new InvalidOperationException(
+                    "Credentialed command line requires " + length +
+                    " UTF-16 units including NUL; limit is " +
+                    MaximumUtf16UnitsIncludingNull + ".");
+            return length;
+        }
+
+        private static void AppendArgument(StringBuilder commandLine, string argument) {
+            bool needsQuotes = argument.Length == 0;
+            if (!needsQuotes) {
+                foreach (char value in argument) {
+                    if (Char.IsWhiteSpace(value) || value == '"') {
+                        needsQuotes = true;
+                        break;
+                    }
+                }
+            }
+            if (!needsQuotes) {
+                commandLine.Append(argument);
+                return;
+            }
+
+            commandLine.Append('"');
+            int index = 0;
+            while (index < argument.Length) {
+                int backslashes = 0;
+                while (index < argument.Length && argument[index] == '\\') {
+                    index++;
+                    backslashes++;
+                }
+                if (index == argument.Length) {
+                    commandLine.Append('\\', checked(backslashes * 2));
+                    break;
+                }
+                if (argument[index] == '"') {
+                    commandLine.Append('\\', checked(backslashes * 2 + 1));
+                    commandLine.Append('"');
+                }
+                else {
+                    commandLine.Append('\\', backslashes);
+                    commandLine.Append(argument[index]);
+                }
+                index++;
+            }
+            commandLine.Append('"');
+        }
+    }
+}
+'@
+}
+
 function Invoke-Process {
     param(
         [Parameter(Mandatory)][string]$FilePath,
@@ -1318,6 +1421,79 @@ function New-CryptographicHex([int]$ByteCount) {
     finally { [Array]::Clear($bytes, 0, $bytes.Length) }
 }
 
+function Get-ValidatedNoTouchPath([string]$DriveRoot, [string]$Prefix, [string]$Token) {
+    Assert-True ($DriveRoot -cmatch '^[A-Z]:\\$') 'No-touch path root is not an exact canonical local drive root.'
+    Assert-True ([IO.Path]::GetFullPath($DriveRoot) -ceq $DriveRoot) 'No-touch path root did not round-trip canonically.'
+    Assert-True ($Prefix -ceq 'h' -or $Prefix -ceq 'o') 'No-touch path prefix is not fixed.'
+    Assert-True ($Token -cmatch '^[0-9a-f]{32}$') 'No-touch path token is not canonical lowercase 128-bit hexadecimal.'
+    $leaf = $Prefix + $Token
+    Assert-True ($leaf -cmatch "^$Prefix[0-9a-f]{32}$") 'No-touch path leaf is noncanonical.'
+    $candidate = $DriveRoot + $leaf
+    Assert-True ([IO.Path]::IsPathFullyQualified($candidate)) 'No-touch path is not fully qualified.'
+    Assert-True ([IO.Path]::GetFullPath($candidate) -ceq $candidate) 'No-touch path did not round-trip canonically.'
+    Assert-True ([IO.Path]::GetPathRoot($candidate) -ceq $DriveRoot) 'No-touch path escaped its exact system-volume root.'
+    Assert-True ([IO.Path]::GetDirectoryName($candidate) -ceq $DriveRoot) 'No-touch path is not a direct drive-root child.'
+    Assert-True ([IO.Path]::GetFileName($candidate) -ceq $leaf) 'No-touch path leaf changed after canonicalization.'
+    return $candidate
+}
+
+function Get-ValidatedMachineTargetPath([string]$CommonAppData, [string]$Token) {
+    Assert-True (-not [string]::IsNullOrWhiteSpace($CommonAppData)) 'Windows did not provide the machine-wide application-data root.'
+    Assert-True ([IO.Path]::IsPathFullyQualified($CommonAppData)) 'Machine-wide application-data root is not fully qualified.'
+    $resolvedCommonAppData = [IO.Path]::GetFullPath($CommonAppData).TrimEnd('\')
+    Assert-True ($resolvedCommonAppData.Equals($CommonAppData.TrimEnd('\'), [StringComparison]::OrdinalIgnoreCase)) 'Machine-wide application-data root is noncanonical.'
+    Assert-True ($Token -cmatch '^[0-9a-f]{32}$') 'SCM test staging token is not canonical lowercase 128-bit hexadecimal.'
+    $leaf = 's' + $Token
+    Assert-True ($leaf -cmatch '^s[0-9a-f]{32}$') 'SCM test staging leaf is noncanonical.'
+    $candidate = [IO.Path]::GetFullPath((Join-Path $resolvedCommonAppData $leaf))
+    Assert-True ([IO.Path]::GetDirectoryName($candidate).Equals($resolvedCommonAppData, [StringComparison]::OrdinalIgnoreCase)) 'SCM test staging is not a direct CommonApplicationData child.'
+    Assert-True ([IO.Path]::GetFileName($candidate) -ceq $leaf) 'SCM test staging basename changed during canonicalization.'
+    return $candidate
+}
+
+function Test-FixturePathSetAvailable([bool]$StagingExists, [bool]$HandoffExists, [bool]$OutputExists) {
+    return -not ($StagingExists -or $HandoffExists -or $OutputExists)
+}
+
+function Select-AvailableFixturePathSet([string]$CommonAppData, [string]$DriveRoot) {
+    $maximumAttempts = 8
+    for ($attempt = 0; $attempt -lt $maximumAttempts; $attempt++) {
+        $candidateToken = New-CryptographicHex -ByteCount 16
+        Assert-True ($candidateToken -cmatch '^[0-9a-f]{32}$') 'Credentialed fixture path token is not canonical lowercase 128-bit hexadecimal.'
+        $candidateMachineTarget = Get-ValidatedMachineTargetPath -CommonAppData $CommonAppData -Token $candidateToken
+        $candidateHandoff = Get-ValidatedNoTouchPath -DriveRoot $DriveRoot -Prefix 'h' -Token $candidateToken
+        $candidateOutput = Get-ValidatedNoTouchPath -DriveRoot $DriveRoot -Prefix 'o' -Token $candidateToken
+        $stagingExists = Test-Path -LiteralPath $candidateMachineTarget
+        $handoffExists = Test-Path -LiteralPath $candidateHandoff
+        $outputExists = Test-Path -LiteralPath $candidateOutput
+        $candidateSetAvailable = Test-FixturePathSetAvailable -StagingExists $stagingExists -HandoffExists $handoffExists -OutputExists $outputExists
+        if (-not $candidateSetAvailable) { continue }
+        return [pscustomobject]@{
+            Token = $candidateToken
+            MachineTarget = $candidateMachineTarget
+            Handoff = $candidateHandoff
+            Output = $candidateOutput
+        }
+    }
+    throw "Could not select an absent three-path credentialed fixture set after $maximumAttempts attempts."
+}
+
+function Test-FixturePathSetAvailabilityContract {
+    Assert-True (Test-FixturePathSetAvailable -StagingExists $false -HandoffExists $false -OutputExists $false) 'All-absent fixture path set was rejected.'
+    for ($mask = 1; $mask -lt 8; $mask++) {
+        $stagingExists = ($mask -band 1) -ne 0
+        $handoffExists = ($mask -band 2) -ne 0
+        $outputExists = ($mask -band 4) -ne 0
+        Assert-True (-not (Test-FixturePathSetAvailable -StagingExists $stagingExists -HandoffExists $handoffExists -OutputExists $outputExists)) 'Fixture path collision classifier accepted an occupied candidate set.'
+    }
+}
+
+function Assert-NoTouchPathsRemainAbsent([string]$HandoffRoot, [string]$OutputRoot) {
+    Assert-True ($HandoffRoot -cne $OutputRoot) 'No-touch handoff and output paths are not distinct.'
+    Assert-True (-not (Test-Path -LiteralPath $HandoffRoot)) 'The no-touch handoff path appeared and will be left untouched.'
+    Assert-True (-not (Test-Path -LiteralPath $OutputRoot)) 'The no-touch output path appeared and will be left untouched.'
+}
+
 function Assert-CanonicalEphemeralSid([string]$Sid, [string]$Name) {
     Assert-True ($Sid -cmatch '^S-1-5-21-(?:[0-9]{1,10}-){3}[0-9]{1,10}$') 'Ephemeral account SID is not a canonical machine-account SID.'
     $sidObject = [Security.Principal.SecurityIdentifier]::new($Sid)
@@ -1439,11 +1615,89 @@ function New-EphemeralProcessStartInfo([string]$FilePath, [string[]]$Arguments) 
 
 function Start-EphemeralProcess([string]$FilePath, [string[]]$Arguments) {
     Assert-True ($null -eq $script:activeCredentialProcess) 'A prior credentialed process is still active.'
-    $start = New-EphemeralProcessStartInfo -FilePath $FilePath -Arguments $Arguments
+    $immutableArguments = if ($null -eq $Arguments) { [string[]]@() } else { [string[]]$Arguments.Clone() }
+    $commandLineLength = [Scribe.GpuBroker.CredentialCommandLine]::ValidateLength($FilePath, $immutableArguments)
+    Write-Verbose "Credentialed command-line UTF-16 length is $commandLineLength/960 including NUL."
+    $start = New-EphemeralProcessStartInfo -FilePath $FilePath -Arguments $immutableArguments
     $process = [Diagnostics.Process]::Start($start)
     if ($null -eq $process) { throw "Failed to start credentialed $FilePath." }
     $script:activeCredentialProcess = $process
     return $process
+}
+
+function Test-CredentialCommandLineContract {
+    Assert-True ([Scribe.GpuBroker.CredentialCommandLine]::MaximumUtf16UnitsIncludingNull -eq [Scribe.GpuBroker.CredentialCommandLine]::CreateProcessWithLogonMaximumUtf16Units - [Scribe.GpuBroker.CredentialCommandLine]::ReservedUtf16Units) 'Credentialed command-line bound lost its fixed 64-unit reserve below the native 1024-unit ceiling.'
+    $fileName = 'C:\x.exe'
+    $quote = [string][char]34
+    $slash = [string][char]92
+    $quotedFileName = $quote + $fileName + $quote
+    $surrogatePair = [char]::ConvertFromUtf32(0x1f600)
+    Assert-True ($surrogatePair.Length -eq 2) 'Credentialed command-line surrogate-pair fixture is not two UTF-16 units.'
+    $nonAsciiWhitespace = [string][char]0x00a0
+    $backslashesBeforeQuote = 'a' + ($slash * 2) + $quote + 'b'
+    $trailingBackslash = 'a b' + $slash
+    $cases = @(
+        [pscustomobject]@{ Name = 'empty'; Argument = ''; Expected = $quotedFileName + ' ' + $quote + $quote },
+        [pscustomobject]@{ Name = 'simple'; Argument = 'alpha'; Expected = $quotedFileName + ' alpha' },
+        [pscustomobject]@{ Name = 'surrogate pair'; Argument = $surrogatePair; Expected = $quotedFileName + ' ' + $surrogatePair },
+        [pscustomobject]@{ Name = 'ASCII whitespace'; Argument = 'two words'; Expected = $quotedFileName + ' ' + $quote + 'two words' + $quote },
+        [pscustomobject]@{ Name = 'non-ASCII whitespace'; Argument = 'a' + $nonAsciiWhitespace + 'b'; Expected = $quotedFileName + ' ' + $quote + 'a' + $nonAsciiWhitespace + 'b' + $quote },
+        [pscustomobject]@{ Name = 'backslashes before quote'; Argument = $backslashesBeforeQuote; Expected = $quotedFileName + ' ' + $quote + 'a' + ($slash * 5) + $quote + 'b' + $quote },
+        [pscustomobject]@{ Name = 'quoted trailing backslash'; Argument = $trailingBackslash; Expected = $quotedFileName + ' ' + $quote + 'a b' + ($slash * 2) + $quote }
+    )
+    foreach ($case in $cases) {
+        $rendered = [Scribe.GpuBroker.CredentialCommandLine]::Render($fileName, [string[]]@($case.Argument))
+        Assert-True ($rendered -ceq $case.Expected) "Credentialed command-line renderer changed for $($case.Name)."
+        Assert-True ([Scribe.GpuBroker.CredentialCommandLine]::GetUtf16LengthIncludingNull($fileName, [string[]]@($case.Argument)) -eq $rendered.Length + 1) "Credentialed command-line UTF-16 count changed for $($case.Name)."
+    }
+    $multipleRendered = [Scribe.GpuBroker.CredentialCommandLine]::Render($fileName, [string[]]@('alpha', 'two words', ''))
+    Assert-True ($multipleRendered -ceq ($quotedFileName + ' alpha ' + $quote + 'two words' + $quote + ' ' + $quote + $quote)) 'Credentialed command-line renderer did not preserve one separator per argument.'
+
+    $nullArgumentArray = [string[]]::new(1)
+    foreach ($rejected in @(
+        [pscustomobject]@{ Name = 'empty filename'; FileName = ''; Arguments = [string[]]@() },
+        [pscustomobject]@{ Name = 'whitespace-only filename'; FileName = ' '; Arguments = [string[]]@() },
+        [pscustomobject]@{ Name = 'leading filename whitespace'; FileName = ' C:\x.exe'; Arguments = [string[]]@() },
+        [pscustomobject]@{ Name = 'trailing filename whitespace'; FileName = 'C:\x.exe '; Arguments = [string[]]@() },
+        [pscustomobject]@{ Name = 'prequoted filename'; FileName = '"C:\x.exe"'; Arguments = [string[]]@() },
+        [pscustomobject]@{ Name = 'filename NUL'; FileName = "C:\x`0.exe"; Arguments = [string[]]@() },
+        [pscustomobject]@{ Name = 'null argument array'; FileName = $fileName; Arguments = $null },
+        [pscustomobject]@{ Name = 'null argument'; FileName = $fileName; Arguments = $nullArgumentArray },
+        [pscustomobject]@{ Name = 'argument NUL'; FileName = $fileName; Arguments = [string[]]@("a`0b") }
+    )) {
+        $failure = $null
+        try { [void][Scribe.GpuBroker.CredentialCommandLine]::Render($rejected.FileName, $rejected.Arguments) }
+        catch { $failure = $_.Exception }
+        Assert-True ($null -ne $failure) "Credentialed command-line renderer accepted invalid $($rejected.Name) input."
+    }
+
+    $oneCharacterLength = [Scribe.GpuBroker.CredentialCommandLine]::GetUtf16LengthIncludingNull($fileName, [string[]]@('a'))
+    $acceptedWidth = 1 + 960 - $oneCharacterLength
+    Assert-True ($acceptedWidth -gt 0) 'Credentialed command-line exact-bound fixture is invalid.'
+    $acceptedArgument = [string]::new([char]'a', $acceptedWidth)
+    $acceptedLength = [Scribe.GpuBroker.CredentialCommandLine]::ValidateLength($fileName, [string[]]@($acceptedArgument))
+    Assert-True ($acceptedLength -eq 960) 'Credentialed command-line preflight rejected or miscounted the exact 960-unit boundary.'
+    $rejectedLengthFailure = $null
+    try { [void][Scribe.GpuBroker.CredentialCommandLine]::ValidateLength($fileName, [string[]]@([string]::new([char]'a', $acceptedWidth + 1))) }
+    catch { $rejectedLengthFailure = $_.Exception }
+    Assert-True ($null -ne $rejectedLengthFailure -and $rejectedLengthFailure.Message.Contains('requires 961 UTF-16 units including NUL; limit is 960.', [StringComparison]::Ordinal)) 'Credentialed command-line preflight did not reject the exact 961-unit boundary.'
+
+    $maximumToken = 'f' * 32
+    $maximumClient = "C:\ProgramData\s$maximumToken\c.exe"
+    $maximumArguments = New-ValidClientArguments -HandoffRoot "C:\h$maximumToken" -OutputRoot "C:\o$maximumToken"
+    $maximumShapeLength = [Scribe.GpuBroker.CredentialCommandLine]::ValidateLength($maximumClient, [string[]]$maximumArguments)
+    Assert-True ($maximumShapeLength -le 960) 'Fixed maximum credentialed real-client path shapes exceed the reserved command-line budget.'
+
+    Assert-True ($null -eq $script:activeCredentialProcess) 'Credentialed preflight failure fixture started with active process ownership.'
+    $currentExecutable = (Get-Process -Id $PID).Path
+    $currentOneCharacterLength = [Scribe.GpuBroker.CredentialCommandLine]::GetUtf16LengthIncludingNull($currentExecutable, [string[]]@('a'))
+    $preflightRejectedWidth = 1 + 961 - $currentOneCharacterLength
+    Assert-True ($preflightRejectedWidth -gt 0) 'Credentialed launch preflight fixture cannot reach its exact failure boundary.'
+    $launchFailure = $null
+    try { [void](Start-EphemeralProcess -FilePath $currentExecutable -Arguments ([string[]]@([string]::new([char]'a', $preflightRejectedWidth)))) }
+    catch { $launchFailure = $_.Exception }
+    Assert-True ($null -ne $launchFailure -and $launchFailure.Message.Contains('requires 961 UTF-16 units including NUL; limit is 960.', [StringComparison]::Ordinal)) 'Credentialed launch did not fail at the command-line preflight boundary.'
+    Assert-True ($null -eq $script:activeCredentialProcess) 'Credentialed command-line preflight failure started or adopted a process.'
 }
 
 function Release-ExitedEphemeralProcess([Diagnostics.Process]$Process) {
@@ -1836,6 +2090,8 @@ function New-ValidClientArguments([string]$HandoffRoot, [string]$OutputRoot) {
 try {
     Test-StandardSoftwareCreatorOwnerInheritanceTemplateContract
     Test-EphemeralProcessOwnershipBoundary
+    Test-CredentialCommandLineContract
+    Test-FixturePathSetAvailabilityContract
     $goldenRequest = '{"schema_version":1,"command":"promote-windows-pack-set","client_nonce":"1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a","promotion_intent_sha256":"bf7b4002065dcc87c6d7abd70899c76a23c880c82e1869c4ba2bdbf39dcebe3c","intent":{"schema_version":1,"policy_namespace":"scribe-windows-gpu-production-v1","source_repository":"owner/repo","source_ref":"refs/heads/main","source_revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","workflow_ref":"owner/repo/.github/workflows/windows-gpu-pack-promotion.yml@refs/heads/main","workflow_source_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","run_id":"123","run_attempt":"1","artifact_id":"456","artifact_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","handoff_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","release_set_digest":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","toolchain_manifest_sha256":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","pack_version":"0.1.0","minimum_security_epoch":1,"require_unused_release_set":true}}'
     $goldenMaterial = [Text.Encoding]::UTF8.GetBytes("scribe-windows-gpu-promotion-request-v1`0$goldenRequest")
     $goldenDigest = ([BitConverter]::ToString([Security.Cryptography.SHA256]::HashData($goldenMaterial))).Replace('-', '').ToLowerInvariant()
@@ -1854,6 +2110,21 @@ try {
         throw "Refusing to modify the pre-existing fixed-name service $serviceName."
     }
 
+    Assert-True ([IO.Path]::IsPathFullyQualified($env:SystemRoot)) 'Windows system directory is not fully qualified.'
+    $systemDirectory = [IO.Path]::GetFullPath($env:SystemRoot).TrimEnd('\')
+    Assert-True ($systemDirectory.Equals($env:SystemRoot.TrimEnd('\'), [StringComparison]::OrdinalIgnoreCase)) 'Windows system directory is noncanonical.'
+    $systemRootCandidate = [IO.Path]::GetPathRoot($systemDirectory)
+    Assert-True ($systemRootCandidate -match '^[A-Za-z]:\\$') 'Windows system directory is not on a local drive root.'
+    $systemVolumeRoot = ([char]::ToUpperInvariant($systemRootCandidate[0])).ToString() + ':\'
+    Assert-True ([IO.Path]::GetFullPath($systemVolumeRoot) -ceq $systemVolumeRoot) 'Windows system-volume root is noncanonical.'
+    $commonAppData = [Environment]::GetFolderPath([Environment+SpecialFolder]::CommonApplicationData)
+    $fixturePaths = Select-AvailableFixturePathSet -CommonAppData $commonAppData -DriveRoot $systemVolumeRoot
+    $pathToken = $fixturePaths.Token
+    $machineTarget = $fixturePaths.MachineTarget
+    $handoff = $fixturePaths.Handoff
+    $output = $fixturePaths.Output
+    Assert-NoTouchPathsRemainAbsent -HandoffRoot $handoff -OutputRoot $output
+
     New-Item -ItemType Directory -Path $targetRoot | Out-Null
     $env:CARGO_TARGET_DIR = Join-Path $targetRoot 'cargo-target'
     Invoke-Process -FilePath 'cargo' -Arguments @('build', '--release', '--locked', '--offline', '--manifest-path', $manifest, '--bins') | Out-Null
@@ -1862,8 +2133,6 @@ try {
     Assert-True (Test-Path -LiteralPath $client -PathType Leaf) 'Release broker client was not built.'
     Assert-True (Test-Path -LiteralPath $builtService -PathType Leaf) 'Release broker service was not built.'
 
-    $handoff = Join-Path $targetRoot 'untrusted-handoff-must-not-exist'
-    $output = Join-Path $targetRoot 'publication-must-not-exist'
     $arguments = New-ValidClientArguments -HandoffRoot $handoff -OutputRoot $output
 
     $missing = Invoke-Process -FilePath $client -Arguments $arguments -TimeoutSeconds 20 -AllowFailure
@@ -1958,10 +2227,13 @@ try {
         Assert-True ($null -eq $ownedPolicyState) 'Rejected provisioning established destructive policy ownership.'
     }
 
-    $commonAppData = [Environment]::GetFolderPath([Environment+SpecialFolder]::CommonApplicationData)
-    Assert-True (-not [string]::IsNullOrWhiteSpace($commonAppData)) 'Windows did not provide the machine-wide application-data root.'
-    $machineTarget = Join-Path $commonAppData "scribe-gpu-broker-transport-$([guid]::NewGuid().ToString('N'))"
-    New-Item -ItemType Directory -Path $machineTarget | Out-Null
+    $validatedMachineTarget = Get-ValidatedMachineTargetPath -CommonAppData $commonAppData -Token $pathToken
+    Assert-True ($validatedMachineTarget.Equals($machineTarget, [StringComparison]::OrdinalIgnoreCase)) 'Selected SCM test staging path changed before creation.'
+    Assert-True (-not (Test-Path -LiteralPath $machineTarget)) 'Refusing to adopt a pre-existing SCM test staging path.'
+    $createdMachineTarget = New-Item -ItemType Directory -Path $machineTarget
+    Assert-True ($createdMachineTarget.FullName.Equals($machineTarget, [StringComparison]::OrdinalIgnoreCase)) 'Windows created an unexpected SCM test staging path.'
+    Assert-True (($createdMachineTarget.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) 'SCM test staging directory is a reparse point.'
+    $ownedMachineTarget = $machineTarget
     $machineAcl = Get-Acl -LiteralPath $machineTarget
     $machineAcl.SetAccessRuleProtection($true, $false)
     foreach ($rule in @($machineAcl.Access)) { [void]$machineAcl.RemoveAccessRuleSpecific($rule) }
@@ -2007,9 +2279,9 @@ try {
     Assert-True ($clientRules.Count -eq 1) 'SCM test staging does not have one exact ephemeral-client access rule.'
     Assert-True (($clientRules[0].FileSystemRights -band [Security.AccessControl.FileSystemRights]::Write) -eq 0) 'The ephemeral client can modify protected staging.'
     Assert-True (($clientRules[0].FileSystemRights -band [Security.AccessControl.FileSystemRights]::ReadAndExecute) -eq [Security.AccessControl.FileSystemRights]::ReadAndExecute) 'The ephemeral client cannot read and execute protected staging.'
-    $serviceForScm = Join-Path $machineTarget 'scribe-windows-gpu-promotion-service.exe'
-    $clientForCredential = Join-Path $machineTarget 'scribe-windows-gpu-promotion-client.exe'
-    $harnessForCredential = Join-Path $machineTarget 'test-windows-gpu-broker-transport.ps1'
+    $serviceForScm = Join-Path $machineTarget 's.exe'
+    $clientForCredential = Join-Path $machineTarget 'c.exe'
+    $harnessForCredential = Join-Path $machineTarget 'p.ps1'
     Copy-Item -LiteralPath $builtService -Destination $serviceForScm
     Copy-Item -LiteralPath $client -Destination $clientForCredential
     Copy-Item -LiteralPath $PSCommandPath -Destination $harnessForCredential
@@ -2021,6 +2293,8 @@ try {
     Assert-True ((Get-FileHash -Algorithm SHA256 -LiteralPath $serviceForScm).Hash -ceq (Get-FileHash -Algorithm SHA256 -LiteralPath $builtService).Hash) 'Protected SCM service staging changed the built service bytes.'
     Assert-True ((Get-FileHash -Algorithm SHA256 -LiteralPath $clientForCredential).Hash -ceq (Get-FileHash -Algorithm SHA256 -LiteralPath $client).Hash) 'Protected client staging changed the real client bytes.'
     Assert-True ((Get-FileHash -Algorithm SHA256 -LiteralPath $harnessForCredential).Hash -ceq (Get-FileHash -Algorithm SHA256 -LiteralPath $PSCommandPath).Hash) 'Protected harness staging changed the fixed probe bytes.'
+    $realClientCommandLineLength = [Scribe.GpuBroker.CredentialCommandLine]::ValidateLength($clientForCredential, [string[]]$arguments)
+    Write-Verbose "Credentialed real-client command-line UTF-16 length is $realClientCommandLineLength/960 including NUL."
     Enable-LocalUser -SID $ephemeralAccount.Sid
     $enabledAccount = Assert-OwnedEphemeralAccount -State $ephemeralAccount -ExpectedEnabled $true
     Assert-True $enabledAccount.Enabled 'Ephemeral account did not become enabled after protected staging completed.'
@@ -2245,8 +2519,7 @@ try {
     Assert-True ($roundTrip.Stdout.Length -eq 0) 'Broker client wrote protocol data to stdout.'
     Assert-True ($roundTrip.Stderr.Trim() -ceq 'Protected Windows GPU promotion broker authenticated; production authority is not provisioned, and no filesystem, ledger, or signing authority was accessed.') 'Broker client did not emit its fixed authenticated NotProvisioned diagnostic.'
     Assert-True ((Get-Service -Name $serviceName).Status -eq [System.ServiceProcess.ServiceControllerStatus]::Running) 'Broker service did not remain running after the authenticated round trip.'
-    Assert-True (-not (Test-Path -LiteralPath $handoff)) 'No-authority service touched the handoff path.'
-    Assert-True (-not (Test-Path -LiteralPath $output)) 'No-authority service touched the output path.'
+    Assert-NoTouchPathsRemainAbsent -HandoffRoot $handoff -OutputRoot $output
 
     [void](Assert-OwnedBrokerService -ExpectedPath $serviceForScm)
     $stop = Invoke-Sc -Arguments @('stop', $serviceName) -AllowFailure
@@ -2259,6 +2532,7 @@ try {
     $afterRestart = Invoke-EphemeralProcess -FilePath $clientForCredential -Arguments $arguments -TimeoutSeconds 20 -AllowFailure
     Assert-True ($afterRestart.ExitCode -eq 74) 'Service restart did not load the mutated authorization SID.'
     Assert-True ((Get-Service -Name $serviceName).Status -eq [System.ServiceProcess.ServiceControllerStatus]::Running) 'Restarted orphan-policy service was not healthy after denial.'
+    Assert-NoTouchPathsRemainAbsent -HandoffRoot $handoff -OutputRoot $output
     [void](Assert-OwnedBrokerService -ExpectedPath $serviceForScm)
     $stop = Invoke-Sc -Arguments @('stop', $serviceName) -AllowFailure
     Assert-True ($stop.ExitCode -eq 0) "SCM rejected the final stop request: $($stop.Stderr)"
@@ -2332,21 +2606,43 @@ finally {
             }
             Wait-ServiceAbsent -TimeoutSeconds 10
         }
-        $safeToRemoveMachineTarget = $true
+        Assert-True ($null -eq $activeCredentialProcess) 'Refusing protected staging cleanup while a credentialed process may still be active.'
+        Assert-True ($null -eq (Get-BrokerService)) 'Refusing protected staging cleanup while the exact broker service still exists.'
+        $safeToRemoveMachineTarget = $null -ne $ownedMachineTarget
     }
     catch { [void]$cleanupFailures.Add($_) }
 
     try {
-        if ($safeToRemoveMachineTarget -and $null -ne $machineTarget) {
-            $resolvedCommonAppData = [IO.Path]::GetFullPath([Environment]::GetFolderPath([Environment+SpecialFolder]::CommonApplicationData)).TrimEnd('\') + '\'
+        if ($safeToRemoveMachineTarget -and $null -ne $machineTarget -and $null -ne $ownedMachineTarget) {
+            $resolvedCommonAppData = [IO.Path]::GetFullPath([Environment]::GetFolderPath([Environment+SpecialFolder]::CommonApplicationData)).TrimEnd('\')
             $resolvedMachineTarget = [IO.Path]::GetFullPath($machineTarget)
-            if ($resolvedMachineTarget.StartsWith($resolvedCommonAppData, [StringComparison]::OrdinalIgnoreCase) -and
-                [IO.Path]::GetFileName($resolvedMachineTarget).StartsWith('scribe-gpu-broker-transport-', [StringComparison]::Ordinal)) {
-                $machineItem = Get-Item -LiteralPath $resolvedMachineTarget -Force -ErrorAction SilentlyContinue
-                if ($null -ne $machineItem -and ($machineItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) {
-                    Remove-Item -LiteralPath $resolvedMachineTarget -Recurse -Force -ErrorAction SilentlyContinue
+            Assert-True ($resolvedMachineTarget.Equals($ownedMachineTarget, [StringComparison]::OrdinalIgnoreCase)) 'Refusing protected staging cleanup after ownership path changed.'
+            Assert-True ([IO.Path]::GetDirectoryName($resolvedMachineTarget).Equals($resolvedCommonAppData, [StringComparison]::OrdinalIgnoreCase)) 'Refusing protected staging cleanup outside its exact CommonApplicationData parent.'
+            Assert-True ([IO.Path]::GetFileName($resolvedMachineTarget) -cmatch '^s[0-9a-f]{32}$') 'Refusing protected staging cleanup for a noncanonical basename.'
+            $machineItem = Get-Item -LiteralPath $resolvedMachineTarget -Force -ErrorAction SilentlyContinue
+            if ($null -ne $machineItem) {
+                Assert-True (($machineItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) 'Refusing protected staging cleanup through a reparse point.'
+                $expectedStagingSources = @{
+                    's.exe' = $builtService
+                    'c.exe' = $client
+                    'p.ps1' = $PSCommandPath
                 }
+                foreach ($entry in @(Get-ChildItem -LiteralPath $resolvedMachineTarget -Force)) {
+                    Assert-True (@('s.exe', 'c.exe', 'p.ps1') -ccontains $entry.Name) 'Refusing protected staging cleanup containing an unexpected entry.'
+                    Assert-True (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0 -and -not $entry.PSIsContainer) 'Refusing protected staging cleanup containing a link or directory.'
+                    Assert-True ((Get-FileHash -Algorithm SHA256 -LiteralPath $entry.FullName).Hash -ceq (Get-FileHash -Algorithm SHA256 -LiteralPath $expectedStagingSources[$entry.Name]).Hash) 'Refusing protected staging cleanup after a staged file changed.'
+                }
+                Remove-Item -LiteralPath $resolvedMachineTarget -Recurse -Force
+                Assert-True (-not (Test-Path -LiteralPath $resolvedMachineTarget)) 'Protected staging remained after exact cleanup.'
+                $ownedMachineTarget = $null
             }
+        }
+    }
+    catch { [void]$cleanupFailures.Add($_) }
+
+    try {
+        if ($null -ne $handoff -and $null -ne $output) {
+            Assert-NoTouchPathsRemainAbsent -HandoffRoot $handoff -OutputRoot $output
         }
     }
     catch { [void]$cleanupFailures.Add($_) }

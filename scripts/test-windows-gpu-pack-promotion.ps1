@@ -387,6 +387,103 @@ try {
     )) {
         Assert-True ($transportHarness.Contains($requiredConstructorNormalization)) "Broker harness lost FileSystemAccessRule constructor-normalization contract $requiredConstructorNormalization."
     }
+    $commandLineContractStart = $transportHarness.IndexOf('function Test-CredentialCommandLineContract', [StringComparison]::Ordinal)
+    $commandLineContractCall = $transportHarness.LastIndexOf('Test-CredentialCommandLineContract', [StringComparison]::Ordinal)
+    $commandLineContractNonElevatedReturn = $transportHarness.IndexOf("if (-not `$isElevated)", [StringComparison]::Ordinal)
+    Assert-True ($commandLineContractStart -ge 0 -and $commandLineContractStart -lt $commandLineContractCall -and $commandLineContractCall -lt $commandLineContractNonElevatedReturn) 'Broker harness does not run its pure credentialed command-line contract before the non-elevated return.'
+    foreach ($requiredCommandLineContract in @(
+        'public static class CredentialCommandLine',
+        'CreateProcessWithLogonMaximumUtf16Units = 1024',
+        'ReservedUtf16Units = 64',
+        'MaximumUtf16UnitsIncludingNull = 960',
+        'Credentialed command-line bound lost its fixed 64-unit reserve below the native 1024-unit ceiling.',
+        'Render(fileName, arguments).Length + 1',
+        'Char.IsWhiteSpace(value)',
+        "commandLine.Append('\\', checked(backslashes * 2 + 1))",
+        "commandLine.Append('\\', checked(backslashes * 2))",
+        'Executable path is not canonical for credentialed launch.',
+        'Credentialed launch arguments cannot contain null.',
+        'Credentialed launch arguments cannot contain NUL.',
+        'surrogate pair',
+        'non-ASCII whitespace',
+        'backslashes before quote',
+        'quoted trailing backslash',
+        'requires 961 UTF-16 units including NUL; limit is 960.',
+        '$acceptedLength -eq 960',
+        '$maximumShapeLength -le 960',
+        '$maximumArguments = New-ValidClientArguments',
+        '$null -eq $script:activeCredentialProcess',
+        'Credentialed command-line preflight failure started or adopted a process.'
+    )) {
+        Assert-True ($transportHarness.Contains($requiredCommandLineContract)) "Broker harness lost credentialed command-line contract $requiredCommandLineContract."
+    }
+    $credentialStartFunctionStart = $transportHarness.IndexOf('function Start-EphemeralProcess', [StringComparison]::Ordinal)
+    $credentialStartFunctionEnd = $transportHarness.IndexOf('function Test-CredentialCommandLineContract', $credentialStartFunctionStart, [StringComparison]::Ordinal)
+    Assert-True ($credentialStartFunctionStart -ge 0 -and $credentialStartFunctionEnd -gt $credentialStartFunctionStart) 'Broker harness lost its bounded credentialed process start helper.'
+    $credentialStartFunction = $transportHarness.Substring($credentialStartFunctionStart, $credentialStartFunctionEnd - $credentialStartFunctionStart)
+    $immutableArgumentCopy = $credentialStartFunction.IndexOf('[string[]]$Arguments.Clone()', [StringComparison]::Ordinal)
+    $credentialLengthPreflight = $credentialStartFunction.IndexOf('CredentialCommandLine]::ValidateLength($FilePath, $immutableArguments)', [StringComparison]::Ordinal)
+    $credentialStructuredArguments = $credentialStartFunction.IndexOf('New-EphemeralProcessStartInfo -FilePath $FilePath -Arguments $immutableArguments', [StringComparison]::Ordinal)
+    $credentialProcessStart = $credentialStartFunction.IndexOf('[Diagnostics.Process]::Start($start)', [StringComparison]::Ordinal)
+    $credentialProcessOwnership = $credentialStartFunction.IndexOf('$script:activeCredentialProcess = $process', [StringComparison]::Ordinal)
+    Assert-True ($immutableArgumentCopy -ge 0 -and $immutableArgumentCopy -lt $credentialLengthPreflight -and $credentialLengthPreflight -lt $credentialStructuredArguments -and $credentialStructuredArguments -lt $credentialProcessStart -and $credentialProcessStart -lt $credentialProcessOwnership) 'Credentialed launch does not clone, preflight, populate ArgumentList, start, and then establish exact process ownership in order.'
+    $credentialStartInfoStart = $transportHarness.IndexOf('function New-EphemeralProcessStartInfo', [StringComparison]::Ordinal)
+    $credentialStartInfoEnd = $transportHarness.IndexOf('function Start-EphemeralProcess', $credentialStartInfoStart, [StringComparison]::Ordinal)
+    Assert-True ($credentialStartInfoStart -ge 0 -and $credentialStartInfoEnd -gt $credentialStartInfoStart) 'Broker harness lost its bounded credentialed ProcessStartInfo builder.'
+    $credentialStartInfo = $transportHarness.Substring($credentialStartInfoStart, $credentialStartInfoEnd - $credentialStartInfoStart)
+    Assert-True ($credentialStartInfo.Contains('foreach ($argument in $Arguments) { $start.ArgumentList.Add($argument) }')) 'Credentialed ProcessStartInfo does not populate structured ArgumentList from the preflighted immutable copy.'
+    Assert-True ([regex]::Matches($transportHarness, [regex]::Escape('$candidateToken = New-CryptographicHex -ByteCount 16')).Count -eq 1) 'Broker harness must generate one 128-bit token per attempted three-path fixture set.'
+    $noTouchBuilderStart = $transportHarness.IndexOf('function Get-ValidatedNoTouchPath', [StringComparison]::Ordinal)
+    $noTouchBuilderEnd = $transportHarness.IndexOf('function Assert-NoTouchPathsRemainAbsent', $noTouchBuilderStart, [StringComparison]::Ordinal)
+    Assert-True ($noTouchBuilderStart -ge 0 -and $noTouchBuilderEnd -gt $noTouchBuilderStart) 'Broker harness lost its bounded no-touch path validator.'
+    $noTouchBuilder = $transportHarness.Substring($noTouchBuilderStart, $noTouchBuilderEnd - $noTouchBuilderStart)
+    Assert-True (-not $noTouchBuilder.Contains('New-Item') -and -not $noTouchBuilder.Contains('Remove-Item') -and -not $noTouchBuilder.Contains('Set-Acl')) 'No-touch path validation creates, reserves, adopts, deletes, or changes ACLs on a drive-root path.'
+    Assert-True (-not $transportHarness.Contains('New-Item -ItemType Directory -Path $handoff') -and -not $transportHarness.Contains('New-Item -ItemType Directory -Path $output')) 'Broker harness reserves a no-touch client path.'
+    Assert-True (-not $transportHarness.Contains('Set-Acl -LiteralPath $handoff') -and -not $transportHarness.Contains('Set-Acl -LiteralPath $output') -and -not $transportHarness.Contains('Set-Acl -LiteralPath $systemVolumeRoot')) 'Broker harness mutates a no-touch path or drive-root ACL.'
+    $pathSetSelectorStart = $transportHarness.IndexOf('function Select-AvailableFixturePathSet', [StringComparison]::Ordinal)
+    $pathSetSelectorEnd = $transportHarness.IndexOf('function Test-FixturePathSetAvailabilityContract', $pathSetSelectorStart, [StringComparison]::Ordinal)
+    Assert-True ($pathSetSelectorStart -ge 0 -and $pathSetSelectorEnd -gt $pathSetSelectorStart) 'Broker harness lost its bounded three-path collision selector.'
+    $pathSetSelector = $transportHarness.Substring($pathSetSelectorStart, $pathSetSelectorEnd - $pathSetSelectorStart)
+    foreach ($requiredSelectorContract in @(
+        '$maximumAttempts = 8',
+        '$attempt -lt $maximumAttempts',
+        '$candidateToken = New-CryptographicHex -ByteCount 16',
+        '-Token $candidateToken',
+        'Test-Path -LiteralPath $candidateMachineTarget',
+        'Test-Path -LiteralPath $candidateHandoff',
+        'Test-Path -LiteralPath $candidateOutput',
+        '$candidateSetAvailable = Test-FixturePathSetAvailable',
+        'if (-not $candidateSetAvailable) { continue }',
+        'Token = $candidateToken',
+        'MachineTarget = $candidateMachineTarget',
+        'Handoff = $candidateHandoff',
+        'Output = $candidateOutput',
+        'after $maximumAttempts attempts.'
+    )) {
+        Assert-True ($pathSetSelector.Contains($requiredSelectorContract)) "Broker harness lost bounded collision-selection contract $requiredSelectorContract."
+    }
+    Assert-True ([regex]::Matches($pathSetSelector, [regex]::Escape('-Token $candidateToken')).Count -eq 3) 'Every attempted staging/handoff/output path must derive from the same single candidate token.'
+    Assert-True (-not $pathSetSelector.Contains('New-Item') -and -not $pathSetSelector.Contains('Remove-Item') -and -not $pathSetSelector.Contains('Set-Acl')) 'Three-path collision selection mutates, reserves, adopts, or deletes a candidate path.'
+    $availabilityTestStart = $transportHarness.IndexOf('function Test-FixturePathSetAvailabilityContract', [StringComparison]::Ordinal)
+    $availabilityTestCall = $transportHarness.LastIndexOf('Test-FixturePathSetAvailabilityContract', [StringComparison]::Ordinal)
+    $availabilityTestNonElevatedReturn = $transportHarness.IndexOf("if (-not `$isElevated)", [StringComparison]::Ordinal)
+    Assert-True ($availabilityTestStart -ge 0 -and $availabilityTestStart -lt $availabilityTestCall -and $availabilityTestCall -lt $availabilityTestNonElevatedReturn) 'Broker harness does not run deterministic three-path collision coverage before its non-elevated return.'
+    $directCredentialCall = 'Invoke-EphemeralProcess -FilePath $clientForCredential'
+    Assert-True ([regex]::Matches($transportHarness, [regex]::Escape($directCredentialCall)).Count -eq 2) 'Broker harness must retain exactly two direct authenticated real-client calls.'
+    $firstCredentialCall = $transportHarness.IndexOf($directCredentialCall, [StringComparison]::Ordinal)
+    $secondCredentialCall = $transportHarness.IndexOf($directCredentialCall, $firstCredentialCall + $directCredentialCall.Length, [StringComparison]::Ordinal)
+    $noTouchAssertion = 'Assert-NoTouchPathsRemainAbsent -HandoffRoot $handoff -OutputRoot $output'
+    $firstCredentialStatus = $transportHarness.IndexOf('Broker service did not remain running after the authenticated round trip.', $firstCredentialCall, [StringComparison]::Ordinal)
+    $firstCredentialAbsent = $transportHarness.IndexOf($noTouchAssertion, $firstCredentialStatus, [StringComparison]::Ordinal)
+    $firstCredentialStop = $transportHarness.IndexOf('[void](Assert-OwnedBrokerService -ExpectedPath $serviceForScm)', $firstCredentialAbsent, [StringComparison]::Ordinal)
+    Assert-True ($firstCredentialCall -ge 0 -and $firstCredentialCall -lt $firstCredentialStatus -and $firstCredentialStatus -lt $firstCredentialAbsent -and $firstCredentialAbsent -lt $firstCredentialStop -and $firstCredentialStop -lt $secondCredentialCall) 'First authenticated real-client call does not assert no-touch paths after result/status postconditions and before service stop work.'
+    Assert-True ([regex]::Matches($transportHarness.Substring($firstCredentialCall, $secondCredentialCall - $firstCredentialCall), [regex]::Escape($noTouchAssertion)).Count -eq 1) 'First authenticated real-client region must contain exactly one post-call no-touch assertion.'
+    $secondCredentialStatus = $transportHarness.IndexOf('Restarted orphan-policy service was not healthy after denial.', $secondCredentialCall, [StringComparison]::Ordinal)
+    $secondCredentialAbsent = $transportHarness.IndexOf($noTouchAssertion, $secondCredentialStatus, [StringComparison]::Ordinal)
+    $secondCredentialStop = $transportHarness.IndexOf('[void](Assert-OwnedBrokerService -ExpectedPath $serviceForScm)', $secondCredentialAbsent, [StringComparison]::Ordinal)
+    Assert-True ($secondCredentialCall -lt $secondCredentialStatus -and $secondCredentialStatus -lt $secondCredentialAbsent -and $secondCredentialAbsent -lt $secondCredentialStop) 'Second authenticated real-client call does not assert no-touch paths after result/status postconditions and before service stop work.'
+    Assert-True ([regex]::Matches($transportHarness.Substring($secondCredentialCall, $secondCredentialStop - $secondCredentialCall), [regex]::Escape($noTouchAssertion)).Count -eq 1) 'Second authenticated real-client region must contain exactly one post-call no-touch assertion.'
+    Assert-True ([regex]::Matches($transportHarness, [regex]::Escape($noTouchAssertion)).Count -eq 4) 'Broker harness must retain initial, two authenticated post-call, and final cleanup no-touch assertions.'
     Assert-True (-not $transportHarness.Contains('.DeleteSubKey(')) 'Broker harness cleanup regained path-based registry deletion.'
     Assert-True ($transportHarness.Contains('PrivilegeRestoreRetryModel')) 'Broker harness lacks deterministic test-only privilege restoration injection.'
     Assert-True ($transportHarness.Contains('marker=incomplete;restore_attempts=3;token_owned=true;previous_state=37')) 'Broker harness does not prove persistent restoration failure retains fail-closed state until process termination.'
@@ -431,6 +528,40 @@ try {
         '$start.LoadUserProfile = $false',
         '$start.WorkingDirectory = [IO.Path]::GetFullPath($machineTarget)',
         '$start.Environment.Clear()',
+        '$candidateToken = New-CryptographicHex -ByteCount 16',
+        '$pathToken = $fixturePaths.Token',
+        '$machineTarget = $fixturePaths.MachineTarget',
+        '$handoff = $fixturePaths.Handoff',
+        '$output = $fixturePaths.Output',
+        "-cmatch '^[0-9a-f]{32}$'",
+        "-cmatch '^s[0-9a-f]{32}$'",
+        '$leaf -cmatch "^$Prefix[0-9a-f]{32}$"',
+        "`$serviceForScm = Join-Path `$machineTarget 's.exe'",
+        "`$clientForCredential = Join-Path `$machineTarget 'c.exe'",
+        "`$harnessForCredential = Join-Path `$machineTarget 'p.ps1'",
+        'Get-ValidatedNoTouchPath -DriveRoot $DriveRoot -Prefix ''h'' -Token $candidateToken',
+        'Get-ValidatedNoTouchPath -DriveRoot $DriveRoot -Prefix ''o'' -Token $candidateToken',
+        'Assert-NoTouchPathsRemainAbsent -HandoffRoot $handoff -OutputRoot $output',
+        '$DriveRoot -cmatch ''^[A-Z]:\\$''',
+        '[IO.Path]::IsPathFullyQualified($candidate)',
+        '[IO.Path]::GetFullPath($candidate) -ceq $candidate',
+        '[IO.Path]::GetPathRoot($candidate) -ceq $DriveRoot',
+        '[IO.Path]::GetDirectoryName($candidate) -ceq $DriveRoot',
+        '[IO.Path]::GetFileName($candidate) -ceq $leaf',
+        '[IO.Path]::IsPathFullyQualified($env:SystemRoot)',
+        'Windows system directory is noncanonical.',
+        '[IO.Path]::IsPathFullyQualified($CommonAppData)',
+        'Machine-wide application-data root is noncanonical.',
+        '$HandoffRoot -cne $OutputRoot',
+        'Could not select an absent three-path credentialed fixture set after $maximumAttempts attempts.',
+        'The no-touch handoff path appeared and will be left untouched.',
+        'The no-touch output path appeared and will be left untouched.',
+        '$safeToRemoveMachineTarget = $null -ne $ownedMachineTarget',
+        'Refusing protected staging cleanup while a credentialed process may still be active.',
+        'Refusing protected staging cleanup while the exact broker service still exists.',
+        'Refusing protected staging cleanup outside its exact CommonApplicationData parent.',
+        'Refusing protected staging cleanup through a reparse point.',
+        'Refusing protected staging cleanup containing an unexpected entry.',
         '-RunEphemeralIdentityProbe',
         '-RunEphemeralFullControlProbe',
         '-RunEphemeralStalledProbe',
@@ -465,10 +596,24 @@ try {
         'ArgumentList.Add($script:ephemeralPassword',
         "Environment['PASSWORD']",
         'Write-Output $script:ephemeralPassword',
-        'WriteAllText($script:ephemeralPassword'
+        'WriteAllText($script:ephemeralPassword',
+        '.Arguments =',
+        'UseShellExecute = $true',
+        'Start-Process',
+        'CreateProcessAsUser',
+        'CreateProcessWithToken',
+        ' -EncodedCommand',
+        'cmd.exe /c',
+        "Environment['ARGUMENTS']",
+        "Environment['ARGS']",
+        "Environment['COMMAND_LINE']",
+        'ConvertTo-ResponseFile',
+        'Write-ResponseFile'
     )) {
         Assert-True (-not $transportHarness.Contains($forbidden)) "Broker harness exposes or weakens ephemeral credential handling: $forbidden"
     }
+    Assert-True (-not $transportHarness.Contains('Remove-Item -LiteralPath $handoff')) 'Broker harness may delete its no-touch handoff path.'
+    Assert-True (-not $transportHarness.Contains('Remove-Item -LiteralPath $output')) 'Broker harness may delete its no-touch output path.'
     $nonElevatedReturn = $transportHarness.IndexOf("if (-not `$isElevated)", [StringComparison]::Ordinal)
     $accountCreation = $transportHarness.IndexOf('$ephemeralAccount = New-EphemeralStandardAccount', [StringComparison]::Ordinal)
     Assert-True ($nonElevatedReturn -ge 0 -and $nonElevatedReturn -lt $accountCreation) 'Broker harness creates local credential state before preserving its non-elevated return path.'
