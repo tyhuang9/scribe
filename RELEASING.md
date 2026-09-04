@@ -44,9 +44,44 @@ accepts future prebuilt, pre-signed roots through `-WorkerPackRoot`, but it runs
 the compiled production verifier before and after staging each root into
 `workers/packs/<pack-id>/<version>/<digest>/`. Because no production pack public
 key is provisioned yet, every non-empty declaration currently fails closed.
-Signing is not performed by repository scripts. Future private signing material
-must come from an explicitly configured external path or masked CI secret, must
-never be printed, and must match a separately reviewed persistent public key.
+Signing is not performed by repository release scripts. Future private signing
+material must remain inside a separately reviewed signer or HSM, must never be
+passed to source-checkout code, and must match a separately reviewed persistent
+public key.
+
+`Promote Windows GPU worker packs` is the fail-closed contract for that future
+path. Run it manually from the default branch with `promote` enabled and a
+canonical pack version. The unprivileged builder produces exactly one prepared
+CUDA pack and one prepared Vulkan pack with no signatures, then uploads a
+one-day handoff artifact. The handoff binds repository/ref/source SHA, workflow
+ref, run ID and attempt, pack version, pinned toolchain-manifest SHA-256, both
+manifest and pack digests, and a release-set digest. GitHub's artifact upload
+returns an artifact ID and digest; the digest-pinned download action validates
+the transfer before the protected boundary, and the independent signer receives
+both values as part of its authorization context.
+
+The protected job requires approval through the
+`windows-gpu-pack-signing` environment and a fresh
+`scribe-gpu-pack-signer-ephemeral` runner using Actions Runner 2.327.1 or later
+(required by the pinned Node 24 artifact action). It performs no checkout or
+compile, runs no repository script, and receives no raw private key. The
+independently installed signer executable must match the digest in protected
+environment configuration, copy hostile input into signer-owned storage through
+no-follow handles, enforce the approved toolchain/version/security epoch, reject
+replay with its own durable release-set ledger, sign and verify both packs, and
+publish only the complete CUDA+Vulkan pair plus a protected receipt. The
+resulting artifact is not activated or included in the normal release
+automatically.
+
+This path is currently a NO-GO: `ProductionTrustRoot`, the protected signer,
+its persistent epoch/replay authority, and the CUDA production inventory are
+not provisioned. The protected job checks that state and stops before invoking
+the signer, so a failed run cannot consume signer authority. Validate only the
+fixture contract locally with:
+
+```powershell
+pwsh -NoProfile -File .\scripts\test-windows-gpu-pack-promotion.ps1
+```
 
 Windows GPU Auto activation also requires the independent offline evidence
 gate documented in `docs/WINDOWS_GPU_QUALIFICATION.md`. The checked-in plan has

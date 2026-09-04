@@ -7,7 +7,7 @@ param(
     [string]$PackVersion,
     [Parameter(Mandatory = $true)]
     [string]$OutputDirectory,
-    [ValidateSet('Production', 'Fixture')]
+    [ValidateSet('Production', 'Prepared', 'Fixture')]
     [string]$SigningMode = 'Production',
     [string]$ProductionPrivateKeyPath,
     [string]$ProductionKeyId,
@@ -1017,7 +1017,7 @@ function Resolve-CudaSdk($Contract, [string]$BuildSigningMode) {
         @($Contract.cuda.required_files) +
         @($Contract.cuda.packaged_runtime_imports | ForEach-Object { "bin/$_" })
     )
-    if ($BuildSigningMode -ceq 'Production') {
+    if ($BuildSigningMode -cne 'Fixture') {
         $null = ConvertTo-AuthenticatedCudaInventory `
             @($Contract.cuda.production_inventory) `
             $requiredAuthenticatedPaths
@@ -1038,7 +1038,7 @@ function Resolve-CudaSdk($Contract, [string]$BuildSigningMode) {
         $path = Join-Path $root (([string]$required).Replace('/', '\'))
         $null = Assert-RegularNonReparseFile $path "Pinned CUDA Toolkit file $required"
     }
-    if ($BuildSigningMode -ceq 'Production') {
+    if ($BuildSigningMode -cne 'Fixture') {
         Assert-AuthenticatedCudaSdkInventory `
             $root `
             @($Contract.cuda.production_inventory) `
@@ -1350,7 +1350,7 @@ try {
 
     $packId = "scribe-$backendName-windows-x64"
     $authorArguments = @(
-        'author',
+        $(if ($SigningMode -eq 'Prepared') { 'prepare-pack' } else { 'author' }),
         '--backend', $backendName,
         '--pack-id', $packId,
         '--pack-root', $stagingRoot,
@@ -1361,7 +1361,7 @@ try {
     )
     if ($SigningMode -eq 'Fixture') {
         $authorArguments += '--fixture-signing'
-    } else {
+    } elseif ($SigningMode -eq 'Production') {
         $authorArguments += @(
             '--key-id', $ProductionKeyId,
             '--private-key', (Get-NormalizedFullPath $ProductionPrivateKeyPath)
@@ -1374,7 +1374,12 @@ try {
     catch {
         throw "Worker-pack authoring returned invalid JSON: $($_.Exception.Message)"
     }
-    Assert-ExactProperties $descriptor @('pack_id', 'pack_version', 'pack_digest', 'key_id', 'payload_files', 'installed_payload_bytes') 'Authored worker-pack descriptor'
+    $expectedDescriptorProperties = if ($SigningMode -eq 'Prepared') {
+        @('schema_version', 'pack_id', 'pack_version', 'pack_digest', 'security_epoch', 'backend', 'provider', 'target_os', 'target_arch', 'manifest_sha256', 'payload_files', 'installed_payload_bytes')
+    } else {
+        @('pack_id', 'pack_version', 'pack_digest', 'key_id', 'payload_files', 'installed_payload_bytes')
+    }
+    Assert-ExactProperties $descriptor $expectedDescriptorProperties 'Authored worker-pack descriptor'
     if ($descriptor.pack_id -cne $packId -or
         $descriptor.pack_version -cne $PackVersion -or
         [string]$descriptor.pack_digest -cnotmatch '^[0-9a-f]{64}$') {
@@ -1388,10 +1393,14 @@ try {
         PackId = [string]$descriptor.pack_id
         PackVersion = [string]$descriptor.pack_version
         PackDigest = [string]$descriptor.pack_digest
-        SigningKeyId = [string]$descriptor.key_id
+        SecurityEpoch = if ($SigningMode -eq 'Prepared') { [uint64]$descriptor.security_epoch } else { [uint64]1 }
+        Provider = if ($SigningMode -eq 'Prepared') { [string]$descriptor.provider } else { [string]$providerContract.provider }
+        SigningKeyId = if ($SigningMode -eq 'Prepared') { $null } else { [string]$descriptor.key_id }
+        ManifestSha256 = if ($SigningMode -eq 'Prepared') { [string]$descriptor.manifest_sha256 } else { $null }
         PayloadFiles = [int]$descriptor.payload_files
         InstalledPayloadBytes = [int64]$descriptor.installed_payload_bytes
         SourceRevision = $revision
+        ToolchainManifestSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $contractPath).Hash.ToLowerInvariant()
     }
 }
 finally {

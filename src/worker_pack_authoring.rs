@@ -12,14 +12,15 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, bail};
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::manifest::{
     APP_PROTOCOL_VERSION, Compatibility, EMBEDDED_MINIMUM_SECURITY_EPOCH, MANIFEST_NAME,
-    MAX_FILE_BYTES, MAX_FILES, PACK_SCHEMA_VERSION, PackBackend, PackManifest, PackVerifier,
-    PayloadEntry, ProductionTrustRoot, RUNTIME_ABI_VERSION, SIGNATURE_NAME, StoreComponent,
-    TrustRoot, compute_pack_digest, hash_exact_length, is_link_or_reparse, open_regular_no_follow,
-    reject_hardlink, reject_named_streams, validate_build_identity, validate_identifier,
-    validate_inventory, validate_relative_path, validate_root,
+    MAX_FILE_BYTES, MAX_FILES, MAX_MANIFEST_BYTES, PACK_SCHEMA_VERSION, PackBackend, PackManifest,
+    PackVerifier, PayloadEntry, ProductionTrustRoot, RUNTIME_ABI_VERSION, SIGNATURE_NAME,
+    StoreComponent, TrustRoot, compute_pack_digest, hash_exact_length, is_link_or_reparse,
+    open_regular_no_follow, reject_hardlink, reject_named_streams, validate_build_identity,
+    validate_identifier, validate_inventory, validate_relative_path, validate_root,
 };
 
 pub(crate) const FIXTURE_KEY_ID: &str = "fixture-ed25519-v1";
@@ -50,6 +51,14 @@ impl AuthoringBackend {
             Self::Metal => PackBackend::Metal,
         }
     }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Cuda => "cuda",
+            Self::Vulkan => "vulkan",
+            Self::Metal => "metal",
+        }
+    }
 }
 
 pub(crate) const AUTHOR_TARGET_CONTRACT: &str = "allowed authoring targets are cuda or vulkan on windows/x86_64 or linux/x86_64, or metal on macos/aarch64 or macos/x86_64; backend, OS, and architecture values are lowercase and case-sensitive";
@@ -75,6 +84,35 @@ pub(crate) struct AuthorRequest {
     pub(crate) target_arch: String,
     pub(crate) worker_path: String,
     pub(crate) signing: SigningMode,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PrepareRequest {
+    pub(crate) pack_root: PathBuf,
+    pub(crate) pack_id: String,
+    pub(crate) pack_version: String,
+    pub(crate) security_epoch: u64,
+    pub(crate) backend: AuthoringBackend,
+    pub(crate) provider: String,
+    pub(crate) target_os: String,
+    pub(crate) target_arch: String,
+    pub(crate) worker_path: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct PreparedPack {
+    pub(crate) schema_version: u16,
+    pub(crate) pack_id: String,
+    pub(crate) pack_version: String,
+    pub(crate) pack_digest: String,
+    pub(crate) security_epoch: u64,
+    pub(crate) backend: String,
+    pub(crate) provider: String,
+    pub(crate) target_os: String,
+    pub(crate) target_arch: String,
+    pub(crate) manifest_sha256: String,
+    pub(crate) payload_files: usize,
+    pub(crate) installed_payload_bytes: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -112,88 +150,114 @@ pub(crate) fn check_production_signing_key(key_id: &str, private_key_path: &Path
 }
 
 pub(crate) fn author_pack(request: &AuthorRequest) -> Result<AuthoredPack> {
-    validate_authoring_target(request.backend, &request.target_os, &request.target_arch)?;
-    if request.security_epoch < EMBEDDED_MINIMUM_SECURITY_EPOCH {
-        bail!(
-            "security epoch {} is below the embedded minimum {}",
-            request.security_epoch,
-            EMBEDDED_MINIMUM_SECURITY_EPOCH
-        );
-    }
-    let pack_id = StoreComponent::new(request.pack_id.clone())
-        .ok_or_else(|| anyhow!("pack ID is not a canonical store component"))?;
-    let pack_version = StoreComponent::new(request.pack_version.clone())
-        .ok_or_else(|| anyhow!("pack version is not a canonical store component"))?;
-    validate_identifier(&request.provider, "provider")?;
-    validate_relative_path(&request.worker_path)?;
-    validate_build_identity(crate::worker_identity::DESKTOP_BUILD_ID, "app build")?;
-    validate_build_identity(
-        crate::worker_identity::INFERENCE_WORKER_BUILD_ID,
-        "worker build",
-    )?;
-
-    let (key_id, key_pair) = match &request.signing {
-        SigningMode::Fixture => (
-            FIXTURE_KEY_ID.to_owned(),
-            Ed25519KeyPair::from_seed_unchecked(&FIXTURE_SEED)
-                .map_err(|_| anyhow!("fixture signing key is invalid"))?,
-        ),
-        SigningMode::Production {
-            key_id,
-            private_key_path,
-        } => (
-            key_id.clone(),
-            production_key_pair(key_id, private_key_path)?,
-        ),
-    };
-
-    let payload = inventory_payload(&request.pack_root)?;
-    if !payload
-        .iter()
-        .any(|entry| entry.path == request.worker_path)
+    // Preserve the legacy one-shot command for fixture and non-Windows callers,
+    // but never materialize an unsigned production manifest until the key has
+    // already been matched to the embedded trust root.
+    if let SigningMode::Production {
+        key_id,
+        private_key_path,
+    } = &request.signing
     {
-        bail!("declared worker path is absent from the payload inventory");
+        check_production_signing_key(key_id, private_key_path)?;
     }
-    let installed_payload_bytes = payload.iter().try_fold(0_u64, |total, entry| {
-        total
-            .checked_add(entry.size_bytes)
-            .ok_or_else(|| anyhow!("payload byte count overflowed"))
-    })?;
-    let mut manifest = PackManifest {
-        schema_version: PACK_SCHEMA_VERSION,
-        pack_id,
-        pack_version,
-        pack_digest: "0".repeat(64),
+    let prepared_request = PrepareRequest {
+        pack_root: request.pack_root.clone(),
+        pack_id: request.pack_id.clone(),
+        pack_version: request.pack_version.clone(),
         security_epoch: request.security_epoch,
-        app_protocol_version: APP_PROTOCOL_VERSION,
-        worker_protocol_version: APP_PROTOCOL_VERSION,
-        runtime_abi_version: RUNTIME_ABI_VERSION,
-        app_build: crate::worker_identity::DESKTOP_BUILD_ID.to_owned(),
-        worker_build: crate::worker_identity::INFERENCE_WORKER_BUILD_ID.to_owned(),
-        backend: request.backend.manifest_backend(),
+        backend: request.backend,
         provider: request.provider.clone(),
         target_os: request.target_os.clone(),
         target_arch: request.target_arch.clone(),
         worker_path: request.worker_path.clone(),
-        payload,
     };
-    manifest.pack_digest = compute_pack_digest(&manifest)?;
+    let prepared = prepare_pack(&prepared_request)?;
+    sign_prepared_pack(
+        &request.pack_root,
+        &request.signing,
+        &prepared.manifest_sha256,
+        &prepared.pack_digest,
+    )
+    .inspect_err(|_| {
+        let _ = fs::remove_file(request.pack_root.join(MANIFEST_NAME));
+    })
+}
+
+pub(crate) fn prepare_pack(request: &PrepareRequest) -> Result<PreparedPack> {
+    let manifest = manifest_for_request(request)?;
     let manifest_bytes = serde_json::to_vec(&manifest)?;
+    write_new_envelope(&request.pack_root.join(MANIFEST_NAME), &manifest_bytes)
+        .context("could not create canonical prepared worker-pack manifest")?;
+    inspect_prepared_pack(&request.pack_root).inspect_err(|_| {
+        let _ = fs::remove_file(request.pack_root.join(MANIFEST_NAME));
+    })
+}
+
+pub(crate) fn inspect_prepared_pack(root: &Path) -> Result<PreparedPack> {
+    validate_root(root)?;
+    if root.join(SIGNATURE_NAME).exists() {
+        bail!("prepared pack must not contain a signature envelope");
+    }
+    let (manifest, manifest_bytes) = manifest_from_root(root, "prepared")?;
+    validate_prepared_manifest(&manifest)?;
+    let payload = inventory_payload(root, true)?;
+    if payload != manifest.payload {
+        bail!("prepared pack payload does not match its canonical manifest");
+    }
+    if !payload
+        .iter()
+        .any(|entry| entry.path == manifest.worker_path)
+    {
+        bail!("declared worker path is absent from the payload inventory");
+    }
+    let installed_payload_bytes = installed_payload_bytes(&payload)?;
+    Ok(PreparedPack {
+        schema_version: 1,
+        pack_id: manifest.pack_id.as_str().to_owned(),
+        pack_version: manifest.pack_version.as_str().to_owned(),
+        pack_digest: manifest.pack_digest,
+        security_epoch: manifest.security_epoch,
+        backend: backend_from_manifest(manifest.backend).as_str().to_owned(),
+        provider: manifest.provider,
+        target_os: manifest.target_os,
+        target_arch: manifest.target_arch,
+        manifest_sha256: encode_hex(&Sha256::digest(&manifest_bytes)),
+        payload_files: payload.len(),
+        installed_payload_bytes,
+    })
+}
+
+pub(crate) fn sign_prepared_pack(
+    root: &Path,
+    signing: &SigningMode,
+    expected_manifest_sha256: &str,
+    expected_pack_digest: &str,
+) -> Result<AuthoredPack> {
+    if !is_canonical_sha256(expected_manifest_sha256) || !is_canonical_sha256(expected_pack_digest)
+    {
+        bail!("caller-approved prepared-pack digests must be canonical SHA-256 values");
+    }
+    let prepared = inspect_prepared_pack(root)?;
+    if prepared.manifest_sha256 != expected_manifest_sha256
+        || prepared.pack_digest != expected_pack_digest
+    {
+        bail!("prepared pack does not match the caller-approved manifest and pack digests");
+    }
+    let (manifest, manifest_bytes) = manifest_from_root(root, "prepared")?;
+    if encode_hex(&Sha256::digest(&manifest_bytes)) != expected_manifest_sha256
+        || manifest.pack_digest != expected_pack_digest
+    {
+        bail!("prepared pack changed after validation and before signing");
+    }
+    let (key_id, key_pair) = signing_key_pair(signing)?;
     let signature = DetachedSignature {
         schema_version: PACK_SCHEMA_VERSION,
         key_id: key_id.clone(),
         signature_hex: encode_hex(key_pair.sign(&manifest_bytes).as_ref()),
     };
-    let signature_bytes = serde_json::to_vec(&signature)?;
-
-    let manifest_path = request.pack_root.join(MANIFEST_NAME);
-    let signature_path = request.pack_root.join(SIGNATURE_NAME);
-    write_new_envelope(&manifest_path, &manifest_bytes)
-        .context("could not create canonical worker-pack manifest")?;
-    if let Err(error) = write_new_envelope(&signature_path, &signature_bytes) {
-        let _ = fs::remove_file(&manifest_path);
-        return Err(error).context("could not create canonical worker-pack signature");
-    }
+    let signature_path = root.join(SIGNATURE_NAME);
+    write_new_envelope(&signature_path, &serde_json::to_vec(&signature)?)
+        .context("could not create canonical worker-pack signature")?;
 
     let trust = ExactTrustRoot {
         key_id: key_id.clone(),
@@ -205,33 +269,37 @@ pub(crate) fn author_pack(request: &AuthorRequest) -> Result<AuthoredPack> {
         Compatibility {
             app_build: crate::worker_identity::DESKTOP_BUILD_ID,
             worker_build: crate::worker_identity::INFERENCE_WORKER_BUILD_ID,
-            target_os: &request.target_os,
-            target_arch: &request.target_arch,
+            target_os: &manifest.target_os,
+            target_arch: &manifest.target_arch,
             allowed_backends: &allowed_backends,
         },
     );
-    let verified = verifier.verify(&request.pack_root).inspect_err(|_| {
+    let verified = verifier.verify(root).inspect_err(|_| {
         let _ = fs::remove_file(&signature_path);
-        let _ = fs::remove_file(&manifest_path);
     })?;
-    if verified.pack_digest != manifest.pack_digest {
+    if verified.pack_digest != prepared.pack_digest {
         let _ = fs::remove_file(&signature_path);
-        let _ = fs::remove_file(&manifest_path);
-        bail!("authored pack digest changed during self-verification");
+        bail!("signed pack digest changed during self-verification");
     }
-
     Ok(AuthoredPack {
-        pack_id: request.pack_id.clone(),
-        pack_version: request.pack_version.clone(),
-        pack_digest: manifest.pack_digest,
+        pack_id: prepared.pack_id,
+        pack_version: prepared.pack_version,
+        pack_digest: prepared.pack_digest,
         key_id,
-        payload_files: manifest.payload.len(),
-        installed_payload_bytes,
+        payload_files: prepared.payload_files,
+        installed_payload_bytes: prepared.installed_payload_bytes,
     })
 }
 
+fn is_canonical_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 pub(crate) fn verify_fixture_pack(root: &Path) -> Result<AuthoredPack> {
-    let manifest = manifest_from_root(root)?;
+    let (manifest, _) = manifest_from_root(root, "fixture")?;
     let backend = match manifest.backend {
         PackBackend::Cuda => AuthoringBackend::Cuda,
         PackBackend::Vulkan => AuthoringBackend::Vulkan,
@@ -291,6 +359,128 @@ pub(crate) fn validate_authoring_target(
     Ok(())
 }
 
+fn manifest_for_request(request: &PrepareRequest) -> Result<PackManifest> {
+    validate_authoring_target(request.backend, &request.target_os, &request.target_arch)?;
+    if request.security_epoch < EMBEDDED_MINIMUM_SECURITY_EPOCH {
+        bail!(
+            "security epoch {} is below the embedded minimum {}",
+            request.security_epoch,
+            EMBEDDED_MINIMUM_SECURITY_EPOCH
+        );
+    }
+    let pack_id = StoreComponent::new(request.pack_id.clone())
+        .ok_or_else(|| anyhow!("pack ID is not a canonical store component"))?;
+    let pack_version = StoreComponent::new(request.pack_version.clone())
+        .ok_or_else(|| anyhow!("pack version is not a canonical store component"))?;
+    validate_identifier(&request.provider, "provider")?;
+    validate_relative_path(&request.worker_path)?;
+    if !request.worker_path.is_ascii() {
+        bail!("prepared pack worker path must be ASCII");
+    }
+    validate_build_identity(crate::worker_identity::DESKTOP_BUILD_ID, "app build")?;
+    validate_build_identity(
+        crate::worker_identity::INFERENCE_WORKER_BUILD_ID,
+        "worker build",
+    )?;
+    let payload = inventory_payload(&request.pack_root, false)?;
+    if !payload
+        .iter()
+        .any(|entry| entry.path == request.worker_path)
+    {
+        bail!("declared worker path is absent from the payload inventory");
+    }
+    let mut manifest = PackManifest {
+        schema_version: PACK_SCHEMA_VERSION,
+        pack_id,
+        pack_version,
+        pack_digest: "0".repeat(64),
+        security_epoch: request.security_epoch,
+        app_protocol_version: APP_PROTOCOL_VERSION,
+        worker_protocol_version: APP_PROTOCOL_VERSION,
+        runtime_abi_version: RUNTIME_ABI_VERSION,
+        app_build: crate::worker_identity::DESKTOP_BUILD_ID.to_owned(),
+        worker_build: crate::worker_identity::INFERENCE_WORKER_BUILD_ID.to_owned(),
+        backend: request.backend.manifest_backend(),
+        provider: request.provider.clone(),
+        target_os: request.target_os.clone(),
+        target_arch: request.target_arch.clone(),
+        worker_path: request.worker_path.clone(),
+        payload,
+    };
+    manifest.pack_digest = compute_pack_digest(&manifest)?;
+    Ok(manifest)
+}
+
+fn validate_prepared_manifest(manifest: &PackManifest) -> Result<()> {
+    let backend = backend_from_manifest(manifest.backend);
+    validate_authoring_target(backend, &manifest.target_os, &manifest.target_arch)?;
+    if manifest.schema_version != PACK_SCHEMA_VERSION
+        || manifest.app_protocol_version != APP_PROTOCOL_VERSION
+        || manifest.worker_protocol_version != APP_PROTOCOL_VERSION
+        || manifest.runtime_abi_version != RUNTIME_ABI_VERSION
+    {
+        bail!("prepared pack has an incompatible schema, protocol, or runtime ABI");
+    }
+    if manifest.security_epoch < EMBEDDED_MINIMUM_SECURITY_EPOCH {
+        bail!("prepared pack security epoch is below the embedded minimum");
+    }
+    if !manifest.pack_id.is_canonical() || !manifest.pack_version.is_canonical() {
+        bail!("prepared pack has a noncanonical store identity");
+    }
+    validate_identifier(&manifest.provider, "provider")?;
+    validate_relative_path(&manifest.worker_path)?;
+    validate_build_identity(&manifest.app_build, "app build")?;
+    validate_build_identity(&manifest.worker_build, "worker build")?;
+    if manifest.app_build != crate::worker_identity::DESKTOP_BUILD_ID
+        || manifest.worker_build != crate::worker_identity::INFERENCE_WORKER_BUILD_ID
+    {
+        bail!("prepared pack build identity does not match this signing tool");
+    }
+    validate_inventory(&manifest.payload)?;
+    if !manifest.worker_path.is_ascii()
+        || manifest.payload.iter().any(|entry| !entry.path.is_ascii())
+    {
+        bail!("prepared pack paths must be ASCII for Windows ordinal case safety");
+    }
+    if compute_pack_digest(manifest)? != manifest.pack_digest {
+        bail!("prepared pack digest does not match its canonical manifest");
+    }
+    Ok(())
+}
+
+fn backend_from_manifest(backend: PackBackend) -> AuthoringBackend {
+    match backend {
+        PackBackend::Cuda => AuthoringBackend::Cuda,
+        PackBackend::Vulkan => AuthoringBackend::Vulkan,
+        PackBackend::Metal => AuthoringBackend::Metal,
+    }
+}
+
+fn signing_key_pair(signing: &SigningMode) -> Result<(String, Ed25519KeyPair)> {
+    match signing {
+        SigningMode::Fixture => Ok((
+            FIXTURE_KEY_ID.to_owned(),
+            Ed25519KeyPair::from_seed_unchecked(&FIXTURE_SEED)
+                .map_err(|_| anyhow!("fixture signing key is invalid"))?,
+        )),
+        SigningMode::Production {
+            key_id,
+            private_key_path,
+        } => Ok((
+            key_id.clone(),
+            production_key_pair(key_id, private_key_path)?,
+        )),
+    }
+}
+
+fn installed_payload_bytes(payload: &[PayloadEntry]) -> Result<u64> {
+    payload.iter().try_fold(0_u64, |total, entry| {
+        total
+            .checked_add(entry.size_bytes)
+            .ok_or_else(|| anyhow!("payload byte count overflowed"))
+    })
+}
+
 fn production_key_pair(key_id: &str, private_key_path: &Path) -> Result<Ed25519KeyPair> {
     validate_identifier(key_id, "signature key ID")?;
     let embedded = TrustRoot::public_key(&ProductionTrustRoot, key_id).ok_or_else(|| {
@@ -329,9 +519,11 @@ fn read_bounded_private_key(path: &Path) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn inventory_payload(root: &Path) -> Result<Vec<PayloadEntry>> {
+fn inventory_payload(root: &Path, prepared_manifest_allowed: bool) -> Result<Vec<PayloadEntry>> {
     validate_root(root)?;
-    if root.join(MANIFEST_NAME).exists() || root.join(SIGNATURE_NAME).exists() {
+    if (!prepared_manifest_allowed && root.join(MANIFEST_NAME).exists())
+        || root.join(SIGNATURE_NAME).exists()
+    {
         bail!("pack root already contains a manifest or signature envelope");
     }
     let mut pending = vec![(root.to_path_buf(), 0_usize)];
@@ -362,7 +554,14 @@ fn inventory_payload(root: &Path) -> Result<Vec<PayloadEntry>> {
                 })
                 .collect::<Result<Vec<_>>>()?
                 .join("/");
-            validate_relative_path(&relative)?;
+            if !relative.is_ascii() {
+                bail!("prepared pack payload paths must be ASCII");
+            }
+            let is_prepared_manifest =
+                prepared_manifest_allowed && directory == root && relative == MANIFEST_NAME;
+            if !is_prepared_manifest {
+                validate_relative_path(&relative)?;
+            }
             if !casefolded.insert(relative.to_ascii_lowercase()) {
                 bail!("pack payload contains a case-insensitive path collision");
             }
@@ -380,9 +579,6 @@ fn inventory_payload(root: &Path) -> Result<Vec<PayloadEntry>> {
                     path.display()
                 );
             }
-            if payload.len() >= MAX_FILES {
-                bail!("pack payload exceeds the maximum file count");
-            }
             if metadata.len() > MAX_FILE_BYTES {
                 bail!("pack payload file exceeds the maximum size: {relative}");
             }
@@ -392,6 +588,12 @@ fn inventory_payload(root: &Path) -> Result<Vec<PayloadEntry>> {
             reject_named_streams(&path)?;
             if opened_metadata.len() != metadata.len() {
                 bail!("pack payload changed while it was inventoried: {relative}");
+            }
+            if is_prepared_manifest {
+                continue;
+            }
+            if payload.len() >= MAX_FILES {
+                bail!("pack payload exceeds the maximum file count");
             }
             payload.push(PayloadEntry {
                 path: relative.clone(),
@@ -405,13 +607,30 @@ fn inventory_payload(root: &Path) -> Result<Vec<PayloadEntry>> {
     Ok(payload)
 }
 
-fn manifest_from_root(root: &Path) -> Result<PackManifest> {
-    let bytes = fs::read(root.join(MANIFEST_NAME)).context("could not read fixture manifest")?;
+fn manifest_from_root(root: &Path, label: &str) -> Result<(PackManifest, Vec<u8>)> {
+    let path = root.join(MANIFEST_NAME);
+    let file = open_regular_no_follow(&path)
+        .with_context(|| format!("could not open {label} manifest"))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("could not inspect {label} manifest"))?;
+    reject_hardlink(&file, &metadata, &path)?;
+    reject_named_streams(&path)?;
+    if metadata.len() == 0 || metadata.len() > MAX_MANIFEST_BYTES {
+        bail!("{label} manifest size is outside the accepted bound");
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_MANIFEST_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("could not read {label} manifest"))?;
+    if bytes.len() as u64 != metadata.len() {
+        bail!("{label} manifest changed while it was read");
+    }
     let manifest: PackManifest = serde_json::from_slice(&bytes)?;
     if serde_json::to_vec(&manifest)? != bytes {
-        bail!("fixture manifest is not canonical JSON");
+        bail!("{label} manifest is not canonical JSON");
     }
-    Ok(manifest)
+    Ok((manifest, bytes))
 }
 
 fn write_new_envelope(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -483,6 +702,154 @@ mod tests {
         assert_eq!(verify_fixture_pack(&first).unwrap(), authored_first);
         fs::remove_dir_all(first).unwrap();
         fs::remove_dir_all(second).unwrap();
+    }
+
+    #[test]
+    fn prepared_pack_binds_canonical_manifest_and_payload_before_signing() {
+        let root = temp_root("prepared-signing");
+        let request = fixture_request(&root);
+        let prepared_request = PrepareRequest {
+            pack_root: request.pack_root.clone(),
+            pack_id: request.pack_id,
+            pack_version: request.pack_version,
+            security_epoch: request.security_epoch,
+            backend: request.backend,
+            provider: request.provider,
+            target_os: request.target_os,
+            target_arch: request.target_arch,
+            worker_path: request.worker_path,
+        };
+        let prepared = prepare_pack(&prepared_request).unwrap();
+        assert!(root.join(MANIFEST_NAME).is_file());
+        assert!(!root.join(SIGNATURE_NAME).exists());
+        assert_eq!(inspect_prepared_pack(&root).unwrap(), prepared);
+
+        let wrong_digest = "0".repeat(64);
+        let error = sign_prepared_pack(
+            &root,
+            &SigningMode::Fixture,
+            &wrong_digest,
+            &prepared.pack_digest,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("caller-approved manifest and pack digests"));
+        assert!(!root.join(SIGNATURE_NAME).exists());
+
+        let error = sign_prepared_pack(
+            &root,
+            &SigningMode::Fixture,
+            &prepared.manifest_sha256,
+            &wrong_digest,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("caller-approved manifest and pack digests"));
+        assert!(!root.join(SIGNATURE_NAME).exists());
+
+        let authored = sign_prepared_pack(
+            &root,
+            &SigningMode::Fixture,
+            &prepared.manifest_sha256,
+            &prepared.pack_digest,
+        )
+        .unwrap();
+        assert_eq!(authored.pack_digest, prepared.pack_digest);
+        assert_eq!(verify_fixture_pack(&root).unwrap(), authored);
+        let duplicate = sign_prepared_pack(
+            &root,
+            &SigningMode::Fixture,
+            &prepared.manifest_sha256,
+            &prepared.pack_digest,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(duplicate.contains("must not contain a signature envelope"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn prepared_pack_rejects_payload_changes_without_writing_a_signature() {
+        let root = temp_root("prepared-tamper");
+        let request = fixture_request(&root);
+        let prepared_request = PrepareRequest {
+            pack_root: request.pack_root.clone(),
+            pack_id: request.pack_id,
+            pack_version: request.pack_version,
+            security_epoch: request.security_epoch,
+            backend: request.backend,
+            provider: request.provider,
+            target_os: request.target_os,
+            target_arch: request.target_arch,
+            worker_path: request.worker_path,
+        };
+        let prepared = prepare_pack(&prepared_request).unwrap();
+        fs::write(root.join("bin/scribe-inference-worker.exe"), b"tampered").unwrap();
+        let error = sign_prepared_pack(
+            &root,
+            &SigningMode::Fixture,
+            &prepared.manifest_sha256,
+            &prepared.pack_digest,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("payload does not match"));
+        assert!(!root.join(SIGNATURE_NAME).exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn prepared_pack_rejects_non_ascii_payload_names() {
+        let root = temp_root("prepared-unicode");
+        fs::write(root.join("bin/providér.dll"), b"provider").unwrap();
+        let request = fixture_request(&root);
+        let prepared_request = PrepareRequest {
+            pack_root: request.pack_root,
+            pack_id: request.pack_id,
+            pack_version: request.pack_version,
+            security_epoch: request.security_epoch,
+            backend: request.backend,
+            provider: request.provider,
+            target_os: request.target_os,
+            target_arch: request.target_arch,
+            worker_path: request.worker_path,
+        };
+        let error = prepare_pack(&prepared_request).unwrap_err().to_string();
+        assert!(error.contains("payload paths must be ASCII"));
+        assert!(!root.join(MANIFEST_NAME).exists());
+        assert!(!root.join(SIGNATURE_NAME).exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn prepared_pack_accepts_the_maximum_payload_file_count() {
+        let root = temp_root("prepared-max-files");
+        for index in 1..MAX_FILES {
+            fs::write(
+                root.join("bin").join(format!("payload-{index:03}.dll")),
+                b"x",
+            )
+            .unwrap();
+        }
+        let request = fixture_request(&root);
+        let prepared_request = PrepareRequest {
+            pack_root: request.pack_root,
+            pack_id: request.pack_id,
+            pack_version: request.pack_version,
+            security_epoch: request.security_epoch,
+            backend: request.backend,
+            provider: request.provider,
+            target_os: request.target_os,
+            target_arch: request.target_arch,
+            worker_path: request.worker_path,
+        };
+        let prepared = prepare_pack(&prepared_request).unwrap();
+        assert_eq!(prepared.payload_files, MAX_FILES);
+        assert_eq!(
+            inspect_prepared_pack(&root).unwrap().payload_files,
+            MAX_FILES
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -563,7 +930,7 @@ mod tests {
             request.target_arch = target_arch.to_owned();
             request.worker_path = worker_path.to_owned();
             let authored = author_pack(&request).unwrap();
-            let manifest = manifest_from_root(&root).unwrap();
+            let (manifest, _) = manifest_from_root(&root, "fixture").unwrap();
             assert_eq!(manifest.backend, backend.manifest_backend());
             assert_eq!(manifest.target_os, target_os);
             assert_eq!(manifest.target_arch, target_arch);
