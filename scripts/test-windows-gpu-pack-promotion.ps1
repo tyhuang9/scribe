@@ -368,6 +368,8 @@ try {
         'Assert-NoEphemeralProfileRegistration',
         'foreign-cleanup-marker',
         'expected-post-create-pre-enable-failure',
+        "`$marker = 'ScribeGpu:' + (New-CryptographicHex -ByteCount 16)",
+        'Assert-True ($marker.Length -le 48)',
         'Test-EphemeralProcessOwnershipBoundary',
         'Refusing to release credentialed process ownership before exit is positively confirmed.',
         'Failed credential-process release discarded exact ownership.',

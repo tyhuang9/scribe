@@ -1365,7 +1365,8 @@ function New-EphemeralStandardAccount {
     do {
         $name = 'scbgpu' + (New-CryptographicHex -ByteCount 6)
     } while ($null -ne (Get-LocalUser -Name $name -ErrorAction SilentlyContinue))
-    $marker = 'ScribeGpuBrokerTransport:' + (New-CryptographicHex -ByteCount 16)
+    $marker = 'ScribeGpu:' + (New-CryptographicHex -ByteCount 16)
+    Assert-True ($marker.Length -le 48) 'Ephemeral account ownership marker exceeds the local-account description limit.'
     $expires = [DateTime]::Now.AddHours(1)
     $script:ephemeralPassword = New-EphemeralPassword
     $created = New-LocalUser `
