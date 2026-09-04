@@ -122,6 +122,7 @@ try {
 
     $missing = Invoke-Process -FilePath $client -Arguments $arguments -TimeoutSeconds 20 -AllowFailure
     Assert-True ($missing.ExitCode -eq 78) 'An absent broker did not map to the fail-closed unprovisioned exit.'
+    Assert-True ($missing.Stderr.Trim() -ceq 'Protected Windows GPU promotion broker is unavailable and production authority is not provisioned; no filesystem, ledger, or signing authority was accessed.') 'An absent broker did not emit its fixed unavailable diagnostic.'
     Assert-True (-not (Test-Path -LiteralPath $handoff)) 'Absent-service handling touched the handoff path.'
     Assert-True (-not (Test-Path -LiteralPath $output)) 'Absent-service handling touched the output path.'
 
@@ -244,7 +245,8 @@ try {
     $roundTrip = Invoke-Process -FilePath $client -Arguments $arguments -TimeoutSeconds 20 -AllowFailure
     Assert-True ($roundTrip.ExitCode -eq 78) 'Authenticated service response did not map to NotProvisioned.'
     Assert-True ($roundTrip.Stdout.Length -eq 0) 'Broker client wrote protocol data to stdout.'
-    Assert-True ($roundTrip.Stderr.Contains('not provisioned', [StringComparison]::OrdinalIgnoreCase)) 'Broker client did not emit its fixed NotProvisioned diagnostic.'
+    Assert-True ($roundTrip.Stderr.Trim() -ceq 'Protected Windows GPU promotion broker authenticated; production authority is not provisioned, and no filesystem, ledger, or signing authority was accessed.') 'Broker client did not emit its fixed authenticated NotProvisioned diagnostic.'
+    Assert-True ((Get-Service -Name $serviceName).Status -eq [System.ServiceProcess.ServiceControllerStatus]::Running) 'Broker service did not remain running after the authenticated round trip.'
     Assert-True (-not (Test-Path -LiteralPath $handoff)) 'No-authority service touched the handoff path.'
     Assert-True (-not (Test-Path -LiteralPath $output)) 'No-authority service touched the output path.'
 

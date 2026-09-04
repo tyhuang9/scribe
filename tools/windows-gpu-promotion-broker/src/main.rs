@@ -6,6 +6,12 @@
 //! service can return only a typed `NotProvisioned` response.
 
 use scribe_windows_gpu_promotion_broker::ClientInvocation;
+#[cfg(windows)]
+use scribe_windows_gpu_promotion_broker::{BrokerOutcomeV1, NotProvisionedCode};
+
+const UNAVAILABLE_DIAGNOSTIC: &str = "Protected Windows GPU promotion broker is unavailable and production authority is not provisioned; no filesystem, ledger, or signing authority was accessed.";
+#[cfg(windows)]
+const AUTHENTICATED_NOT_PROVISIONED_DIAGNOSTIC: &str = "Protected Windows GPU promotion broker authenticated; production authority is not provisioned, and no filesystem, ledger, or signing authority was accessed.";
 
 fn main() {
     #[cfg(windows)]
@@ -24,10 +30,16 @@ fn main() {
 
     #[cfg(windows)]
     match scribe_windows_gpu_promotion_broker::request_promotion(&invocation.intent) {
-        Ok(_) | Err(scribe_windows_gpu_promotion_broker::ClientTransportError::Unavailable) => {
-            eprintln!(
-                "Protected Windows GPU promotion broker is not provisioned; no filesystem, ledger, or signing authority was accessed."
-            );
+        Ok(response) => {
+            match response.outcome {
+                BrokerOutcomeV1::NotProvisioned {
+                    code: NotProvisionedCode::ProductionAuthorityNotProvisioned,
+                } => eprintln!("{AUTHENTICATED_NOT_PROVISIONED_DIAGNOSTIC}"),
+            }
+            std::process::exit(78);
+        }
+        Err(scribe_windows_gpu_promotion_broker::ClientTransportError::Unavailable) => {
+            eprintln!("{UNAVAILABLE_DIAGNOSTIC}");
             std::process::exit(78);
         }
         Err(_) => {
@@ -39,9 +51,7 @@ fn main() {
     #[cfg(not(windows))]
     {
         let _ = invocation;
-        eprintln!(
-            "Protected Windows GPU promotion broker is not provisioned; no filesystem, ledger, or signing authority was accessed."
-        );
+        eprintln!("{UNAVAILABLE_DIAGNOSTIC}");
         std::process::exit(78);
     }
 }

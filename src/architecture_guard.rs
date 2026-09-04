@@ -1618,6 +1618,12 @@ fn windows_gpu_pack_promotion_keeps_candidate_and_signing_authority_separate() {
     }
     assert!(broker_service.contains("run_service_dispatcher"));
     assert!(!broker_service.contains("std::env::args"));
+    assert!(
+        broker_client.contains("broker authenticated; production authority is not provisioned")
+    );
+    assert!(
+        broker_client.contains("broker is unavailable and production authority is not provisioned")
+    );
     for required in [
         "Refusing to modify the pre-existing fixed-name service",
         "sidtype",
@@ -1629,6 +1635,8 @@ fn windows_gpu_pack_promotion_keeps_candidate_and_signing_authority_separate() {
         "WaitForConnectionAsync",
         "The client sent request bytes before authenticating the service",
         "same-name user-process pipe server as rejected authentication",
+        "fixed authenticated NotProvisioned diagnostic",
+        "did not remain running after the authenticated round trip",
         "3925971f64ffaf94450d30373183cf912a01a8948a1a8d892831627329568083",
         "RequireScmIntegration",
         "WaitForStatus",

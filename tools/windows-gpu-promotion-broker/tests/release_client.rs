@@ -46,6 +46,8 @@ fn release_client_fails_before_touching_untrusted_paths_or_authority() {
     assert_eq!(result.status.code(), Some(78));
     assert!(result.stdout.is_empty());
     let diagnostic = String::from_utf8(result.stderr).unwrap();
+    assert!(diagnostic.contains("broker is unavailable"));
+    assert!(!diagnostic.contains("broker authenticated"));
     assert!(!diagnostic.contains(handoff.to_string_lossy().as_ref()));
     assert!(!diagnostic.contains(output.to_string_lossy().as_ref()));
     assert!(!handoff.exists());
