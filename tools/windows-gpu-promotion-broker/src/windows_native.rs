@@ -13,13 +13,16 @@ use windows_sys::Win32::Foundation::{
     INVALID_HANDLE_VALUE, LocalFree, SetHandleInformation, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Authorization::{
-    ConvertStringSecurityDescriptorToSecurityDescriptorW, ConvertStringSidToSidW, SDDL_REVISION_1,
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+    ConvertStringSidToSidW, GetSecurityInfo, SDDL_REVISION_1, SE_REGISTRY_KEY,
 };
 use windows_sys::Win32::Security::Cryptography::{
     BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom,
 };
 use windows_sys::Win32::Security::{
-    EqualSid, GetTokenInformation, IsTokenRestricted, PSECURITY_DESCRIPTOR, PSID, RevertToSelf,
+    ACCESS_ALLOWED_ACE, ACL, DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetLengthSid,
+    GetSecurityDescriptorControl, GetTokenInformation, IsTokenRestricted, IsValidSid,
+    OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, RevertToSelf, SE_DACL_PROTECTED,
     SECURITY_ATTRIBUTES, SecurityIdentification, TOKEN_GROUPS, TOKEN_QUERY, TOKEN_USER,
     TokenGroups, TokenImpersonationLevel, TokenRestrictedSids, TokenUser,
 };
@@ -37,6 +40,10 @@ use windows_sys::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeServerProcessId,
     ImpersonateNamedPipeClient, PIPE_READMODE_MESSAGE, PIPE_REJECT_REMOTE_CLIENTS,
     PIPE_TYPE_MESSAGE, PIPE_WAIT, SetNamedPipeHandleState, WaitNamedPipeW,
+};
+use windows_sys::Win32::System::Registry::{
+    HKEY, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_64KEY, REG_DWORD, REG_SZ, RegCloseKey,
+    RegOpenKeyExW, RegQueryInfoKeyW, RegQueryValueExW,
 };
 use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
 use windows_sys::Win32::System::Services::{
@@ -63,17 +70,20 @@ const CONNECT_TIMEOUT_MS: u32 = 2_000;
 const IO_TIMEOUT_MS: u32 = 5_000;
 const ERROR_SERVICE_SPECIFIC_ERROR_CODE: u32 = 1_066;
 const LOCAL_SERVICE_SID: &str = "S-1-5-19";
-const AUTHENTICATED_USERS_SID: &str = "S-1-5-11";
-const ANONYMOUS_SID: &str = "S-1-5-7";
+const SYSTEM_SID: &str = "S-1-5-18";
+const ADMINISTRATORS_SID: &str = "S-1-5-32-544";
+const AUTHORIZATION_POLICY_PATH: &str = r"SOFTWARE\Scribe\GpuPromotionBroker\v1\Authorization";
+const AUTHORIZATION_SCHEMA_VALUE: &str = "SchemaVersion";
+const AUTHORIZED_CLIENT_SID_VALUE: &str = "AuthorizedClientSid";
+const AUTHORIZATION_SCHEMA_VERSION: u32 = 1;
+const KEY_ALL_ACCESS_MASK: u32 = 0x000f_003f;
+const KEY_READ_MASK: u32 = 0x0002_0019;
+const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+const ACL_REVISION: u8 = 2;
 const GROUP_ENABLED: u32 = 4;
 const GROUP_USE_FOR_DENY_ONLY: u32 = 16;
 const CLIENT_PIPE_ACCESS: u32 =
     FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES | SYNCHRONIZE;
-const PIPE_SDDL: &str = concat!(
-    "D:P",
-    "(A;;GA;;;S-1-5-80-3848011089-2849881844-525567724-3342831801-3217684137)",
-    "(A;;0x00100183;;;AU)"
-);
 
 static SERVICE_STOP_EVENT: AtomicIsize = AtomicIsize::new(0);
 static SERVICE_STATUS_HANDLE_VALUE: AtomicIsize = AtomicIsize::new(0);
@@ -283,7 +293,8 @@ fn run_service(argument_count: u32) -> Result<()> {
         bail!("broker service stop event is unavailable");
     }
 
-    let pipe = create_server_pipe()?;
+    let policy = load_authorization_policy()?;
+    let pipe = create_server_pipe(&policy)?;
     if unsafe { WaitForSingleObject(stop_event, 0) } == WAIT_OBJECT_0 {
         return Ok(());
     }
@@ -293,7 +304,7 @@ fn run_service(argument_count: u32) -> Result<()> {
         0,
         0,
     )?;
-    serve_loop(pipe, stop_event)
+    serve_loop(pipe, stop_event, &policy)
 }
 
 fn report_stopped(exit_code: u32) {
@@ -343,7 +354,7 @@ fn report_status_raw(
     }
 }
 
-fn serve_loop(pipe: OwnedHandle, stop_event: HANDLE) -> Result<()> {
+fn serve_loop(pipe: OwnedHandle, stop_event: HANDLE, policy: &AuthorizationPolicy) -> Result<()> {
     loop {
         match connect_pipe(pipe.raw(), stop_event, IO_TIMEOUT_MS) {
             Ok(()) => {}
@@ -352,7 +363,7 @@ fn serve_loop(pipe: OwnedHandle, stop_event: HANDLE) -> Result<()> {
             Err(_) => return Err(anyhow!("broker pipe connect failed")),
         }
 
-        let _ = serve_connection(pipe.raw(), stop_event);
+        let _ = serve_connection(pipe.raw(), stop_event, policy);
         unsafe {
             DisconnectNamedPipe(pipe.raw());
         }
@@ -362,13 +373,13 @@ fn serve_loop(pipe: OwnedHandle, stop_event: HANDLE) -> Result<()> {
     }
 }
 
-fn serve_connection(pipe: HANDLE, stop_event: HANDLE) -> Result<()> {
+fn serve_connection(pipe: HANDLE, stop_event: HANDLE, policy: &AuthorizationPolicy) -> Result<()> {
     let frame = match read_message(pipe, MAX_REQUEST_FRAME, Some(stop_event), IO_TIMEOUT_MS) {
         Ok(frame) => frame,
         Err(_) => return Ok(()),
     };
 
-    authenticate_client(pipe)?;
+    authenticate_client(pipe, &policy.authorized_client_sid)?;
     let request = match decode_request_frame(&frame) {
         Ok(request) => request,
         Err(_) => return Ok(()),
@@ -383,8 +394,9 @@ fn serve_connection(pipe: HANDLE, stop_event: HANDLE) -> Result<()> {
     Ok(())
 }
 
-fn create_server_pipe() -> Result<OwnedHandle> {
-    let descriptor = LocalAllocation::security_descriptor(PIPE_SDDL)?;
+fn create_server_pipe(policy: &AuthorizationPolicy) -> Result<OwnedHandle> {
+    let pipe_sddl = policy.pipe_sddl();
+    let descriptor = LocalAllocation::security_descriptor(&pipe_sddl)?;
     let security = SECURITY_ATTRIBUTES {
         nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
         lpSecurityDescriptor: descriptor.as_ptr(),
@@ -406,6 +418,269 @@ fn create_server_pipe() -> Result<OwnedHandle> {
     let pipe = OwnedHandle::new(handle).context("could not create fixed broker pipe")?;
     protect_handle(pipe.raw())?;
     Ok(pipe)
+}
+
+#[derive(Debug)]
+struct AuthorizationPolicy {
+    authorized_client_sid: String,
+}
+
+impl AuthorizationPolicy {
+    fn pipe_sddl(&self) -> String {
+        format!(
+            "D:P(A;;GA;;;{SERVICE_SID})(A;;0x{CLIENT_PIPE_ACCESS:08x};;;{})",
+            self.authorized_client_sid
+        )
+    }
+}
+
+fn load_authorization_policy() -> Result<AuthorizationPolicy> {
+    let path = wide(AUTHORIZATION_POLICY_PATH);
+    let mut key: HKEY = null_mut();
+    let status = unsafe {
+        RegOpenKeyExW(
+            HKEY_LOCAL_MACHINE,
+            path.as_ptr(),
+            0,
+            KEY_READ | KEY_WOW64_64KEY,
+            &mut key,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        bail!("broker client authorization policy is unavailable");
+    }
+    let key = RegistryHandle::new(key)?;
+    require_exact_policy_shape(key.raw())?;
+    require_exact_policy_security(key.raw())?;
+
+    let schema = query_registry_value(key.raw(), AUTHORIZATION_SCHEMA_VALUE, REG_DWORD, 4)?;
+    if schema.as_slice() != AUTHORIZATION_SCHEMA_VERSION.to_le_bytes() {
+        bail!("broker client authorization policy schema is noncanonical");
+    }
+    let sid_bytes = query_registry_value(key.raw(), AUTHORIZED_CLIENT_SID_VALUE, REG_SZ, 184)?;
+    if sid_bytes.len() < 4 || sid_bytes.len() % 2 != 0 {
+        bail!("broker authorized client SID value is noncanonical");
+    }
+    let sid_words = sid_bytes
+        .chunks_exact(2)
+        .map(|word| u16::from_le_bytes([word[0], word[1]]))
+        .collect::<Vec<_>>();
+    if sid_words.last() != Some(&0) || sid_words[..sid_words.len() - 1].contains(&0) {
+        bail!("broker authorized client SID value is noncanonical");
+    }
+    let authorized_client_sid = String::from_utf16(&sid_words[..sid_words.len() - 1])
+        .context("broker authorized client SID is not valid UTF-16")?;
+    validate_authorized_client_sid(&authorized_client_sid)?;
+
+    // Read both values again after all structural and security checks. An
+    // administrator can replace policy only for a future service lifetime;
+    // a racing mutation must not produce a mixed snapshot.
+    if query_registry_value(key.raw(), AUTHORIZATION_SCHEMA_VALUE, REG_DWORD, 4)? != schema
+        || query_registry_value(key.raw(), AUTHORIZED_CLIENT_SID_VALUE, REG_SZ, 184)? != sid_bytes
+    {
+        bail!("broker client authorization policy changed during startup");
+    }
+    Ok(AuthorizationPolicy {
+        authorized_client_sid,
+    })
+}
+
+fn require_exact_policy_shape(key: HKEY) -> Result<()> {
+    let mut subkeys = 0;
+    let mut values = 0;
+    let status = unsafe {
+        RegQueryInfoKeyW(
+            key,
+            null_mut(),
+            null_mut(),
+            null(),
+            &mut subkeys,
+            null_mut(),
+            null_mut(),
+            &mut values,
+            null_mut(),
+            null_mut(),
+            null_mut(),
+            null_mut(),
+        )
+    };
+    if status != ERROR_SUCCESS || subkeys != 0 || values != 2 {
+        bail!("broker client authorization policy shape is noncanonical");
+    }
+    Ok(())
+}
+
+fn query_registry_value(
+    key: HKEY,
+    name: &str,
+    expected_type: u32,
+    maximum_bytes: u32,
+) -> Result<Vec<u8>> {
+    let name = wide(name);
+    let mut value_type = 0;
+    let mut length = 0;
+    let status = unsafe {
+        RegQueryValueExW(
+            key,
+            name.as_ptr(),
+            null(),
+            &mut value_type,
+            null_mut(),
+            &mut length,
+        )
+    };
+    if status != ERROR_SUCCESS
+        || value_type != expected_type
+        || length == 0
+        || length > maximum_bytes
+    {
+        bail!("broker client authorization policy value is noncanonical");
+    }
+    let mut value = vec![0_u8; length as usize];
+    let mut read_length = length;
+    let status = unsafe {
+        RegQueryValueExW(
+            key,
+            name.as_ptr(),
+            null(),
+            &mut value_type,
+            value.as_mut_ptr(),
+            &mut read_length,
+        )
+    };
+    if status != ERROR_SUCCESS || value_type != expected_type || read_length != length {
+        bail!("broker client authorization policy changed while being read");
+    }
+    Ok(value)
+}
+
+fn require_exact_policy_security(key: HKEY) -> Result<()> {
+    let mut owner: PSID = null_mut();
+    let mut dacl: *mut ACL = null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
+    let status = unsafe {
+        GetSecurityInfo(
+            key,
+            SE_REGISTRY_KEY,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &mut owner,
+            null_mut(),
+            &mut dacl,
+            null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != ERROR_SUCCESS || descriptor.is_null() {
+        bail!("broker client authorization policy security is unreadable");
+    }
+    let descriptor = LocalAllocation(descriptor.cast());
+    let system = LocalAllocation::sid(SYSTEM_SID)?;
+    if owner.is_null() || unsafe { EqualSid(owner, system.as_sid()) } == 0 {
+        bail!("broker client authorization policy owner is not SYSTEM");
+    }
+    let mut control = 0;
+    let mut revision = 0;
+    if unsafe { GetSecurityDescriptorControl(descriptor.as_ptr(), &mut control, &mut revision) }
+        == 0
+        || control & SE_DACL_PROTECTED == 0
+    {
+        bail!("broker client authorization policy DACL is not protected");
+    }
+    if dacl.is_null()
+        || unsafe { (*dacl).AclRevision } != ACL_REVISION
+        || unsafe { (*dacl).AceCount } != 3
+    {
+        bail!("broker client authorization policy ACE inventory is noncanonical");
+    }
+
+    let expected = [
+        (SYSTEM_SID, KEY_ALL_ACCESS_MASK),
+        (ADMINISTRATORS_SID, KEY_ALL_ACCESS_MASK),
+        (SERVICE_SID, KEY_READ_MASK),
+    ];
+    let mut matched = [false; 3];
+    for index in 0..3 {
+        let mut raw_ace = null_mut();
+        if unsafe { GetAce(dacl, index, &mut raw_ace) } == 0 || raw_ace.is_null() {
+            bail!("broker client authorization policy ACE is unreadable");
+        }
+        let ace = unsafe { &*(raw_ace.cast::<ACCESS_ALLOWED_ACE>()) };
+        if ace.Header.AceType != ACCESS_ALLOWED_ACE_TYPE || ace.Header.AceFlags != 0 {
+            bail!("broker client authorization policy ACE type is noncanonical");
+        }
+        let sid: PSID = (&ace.SidStart as *const u32).cast_mut().cast();
+        if unsafe { IsValidSid(sid) } == 0 {
+            bail!("broker client authorization policy ACE SID is invalid");
+        }
+        let expected_ace_size = size_of::<ACCESS_ALLOWED_ACE>() - size_of::<u32>()
+            + unsafe { GetLengthSid(sid) } as usize;
+        if ace.Header.AceSize as usize != expected_ace_size {
+            bail!("broker client authorization policy ACE size is noncanonical");
+        }
+        let mut found = None;
+        for (position, (expected_sid, expected_mask)) in expected.iter().enumerate() {
+            let expected_sid = LocalAllocation::sid(expected_sid)?;
+            if unsafe { EqualSid(sid, expected_sid.as_sid()) } != 0 {
+                if ace.Mask != *expected_mask || matched[position] {
+                    bail!("broker client authorization policy ACE rights are noncanonical");
+                }
+                found = Some(position);
+                break;
+            }
+        }
+        let position = found
+            .ok_or_else(|| anyhow!("broker client authorization policy contains an extra ACE"))?;
+        matched[position] = true;
+    }
+    if matched.iter().any(|present| !present) {
+        bail!("broker client authorization policy is missing a required ACE");
+    }
+    Ok(())
+}
+
+fn validate_authorized_client_sid(value: &str) -> Result<()> {
+    let sid = LocalAllocation::sid(value)?;
+    let canonical = sid.to_string()?;
+    if canonical != value {
+        bail!("broker authorized client SID is noncanonical");
+    }
+    let components = value.split('-').collect::<Vec<_>>();
+    let rid = components
+        .get(7)
+        .and_then(|component| component.parse::<u32>().ok());
+    if components.len() != 8
+        || components[..4] != ["S", "1", "5", "21"]
+        || components[4..]
+            .iter()
+            .any(|component| component.parse::<u32>().is_err())
+        || rid.is_none_or(|rid| rid < 1_000)
+    {
+        bail!("broker authorized client SID is not a dedicated account SID");
+    }
+    Ok(())
+}
+
+struct RegistryHandle(HKEY);
+
+impl RegistryHandle {
+    fn new(handle: HKEY) -> Result<Self> {
+        if handle.is_null() {
+            bail!("invalid broker authorization policy handle");
+        }
+        Ok(Self(handle))
+    }
+
+    fn raw(&self) -> HKEY {
+        self.0
+    }
+}
+
+impl Drop for RegistryHandle {
+    fn drop(&mut self) {
+        unsafe {
+            RegCloseKey(self.0);
+        }
+    }
 }
 
 fn authenticate_service_process() -> Result<()> {
@@ -456,7 +731,7 @@ fn pipe_server_process_id(pipe: HANDLE) -> Result<u32> {
     Ok(process_id)
 }
 
-fn authenticate_client(pipe: HANDLE) -> Result<()> {
+fn authenticate_client(pipe: HANDLE, authorized_client_sid: &str) -> Result<()> {
     if unsafe { ImpersonateNamedPipeClient(pipe) } == 0 {
         bail!("could not identify broker pipe client");
     }
@@ -467,8 +742,7 @@ fn authenticate_client(pipe: HANDLE) -> Result<()> {
     }
     let token = OwnedHandle::new(token)?;
     require_impersonation_level(token.raw())?;
-    reject_user_sid(token.raw(), ANONYMOUS_SID)?;
-    require_enabled_group_sid(token.raw(), AUTHENTICATED_USERS_SID)?;
+    require_user_sid(token.raw(), authorized_client_sid)?;
     drop(token);
     impersonation.revert_or_abort();
     Ok(())
@@ -528,16 +802,6 @@ fn require_user_sid(token: HANDLE, expected: &str) -> Result<()> {
     let expected = LocalAllocation::sid(expected)?;
     if unsafe { EqualSid(user.User.Sid, expected.as_sid()) } == 0 {
         bail!("broker token user does not match");
-    }
-    Ok(())
-}
-
-fn reject_user_sid(token: HANDLE, rejected: &str) -> Result<()> {
-    let information = token_information(token, TokenUser)?;
-    let user = unsafe { &*(information.as_ptr().cast::<TOKEN_USER>()) };
-    let rejected = LocalAllocation::sid(rejected)?;
-    if unsafe { EqualSid(user.User.Sid, rejected.as_sid()) } != 0 {
-        bail!("anonymous broker client is forbidden");
     }
     Ok(())
 }
@@ -643,6 +907,22 @@ impl LocalAllocation {
                 .context("could not construct broker pipe security descriptor");
         }
         Ok(Self(descriptor))
+    }
+
+    fn to_string(&self) -> Result<String> {
+        let mut value = null_mut();
+        if unsafe { ConvertSidToStringSidW(self.as_sid(), &mut value) } == 0 || value.is_null() {
+            return Err(std::io::Error::last_os_error())
+                .context("could not canonicalize broker SID");
+        }
+        let value = Self(value.cast());
+        let pointer = value.0.cast::<u16>();
+        let mut length = 0;
+        while unsafe { *pointer.add(length) } != 0 {
+            length += 1;
+        }
+        String::from_utf16(unsafe { std::slice::from_raw_parts(pointer, length) })
+            .context("canonical broker SID is not valid UTF-16")
     }
 
     fn as_sid(&self) -> PSID {
@@ -909,18 +1189,60 @@ mod tests {
     }
 
     #[test]
-    fn authenticated_user_pipe_rights_exclude_instance_and_acl_authority() {
+    fn dedicated_client_pipe_rights_exclude_instance_and_acl_authority() {
         const FILE_APPEND_DATA: u32 = 4;
         const WRITE_DAC: u32 = 0x0004_0000;
         const WRITE_OWNER: u32 = 0x0008_0000;
+        let policy = AuthorizationPolicy {
+            authorized_client_sid: "S-1-5-21-1-2-3-1000".to_owned(),
+        };
+        let pipe_sddl = policy.pipe_sddl();
         assert_eq!(CLIENT_PIPE_ACCESS & FILE_APPEND_DATA, 0);
         assert_eq!(CLIENT_PIPE_ACCESS & WRITE_DAC, 0);
         assert_eq!(CLIENT_PIPE_ACCESS & WRITE_OWNER, 0);
-        assert!(PIPE_SDDL.contains(";;;AU)"));
-        for forbidden in [";;;LS)", ";;;BA)", ";;;WD)", ";;;AN)"] {
-            assert!(!PIPE_SDDL.contains(forbidden));
+        assert!(pipe_sddl.contains("0x00100183;;;S-1-5-21-1-2-3-1000)"));
+        assert!(pipe_sddl.contains(&format!("GA;;;{SERVICE_SID})")));
+        for forbidden in [";;;AU)", ";;;BU)", ";;;BA)", ";;;WD)", ";;;AN)"] {
+            assert!(!pipe_sddl.contains(forbidden));
         }
-        LocalAllocation::security_descriptor(PIPE_SDDL).unwrap();
+        LocalAllocation::security_descriptor(&pipe_sddl).unwrap();
+    }
+
+    #[test]
+    fn authorization_policy_accepts_only_canonical_dedicated_account_sids() {
+        validate_authorized_client_sid("S-1-5-21-1-2-3-1000").unwrap();
+        for forbidden in [
+            "S-1-1-0",
+            "S-1-5-7",
+            "S-1-5-11",
+            "S-1-5-18",
+            "S-1-5-19",
+            "S-1-5-20",
+            "S-1-5-32-544",
+            "S-1-5-32-545",
+            SERVICE_SID,
+            "S-1-5-21-1-2-3-500",
+            "s-1-5-21-1-2-3-1000",
+        ] {
+            assert!(
+                validate_authorized_client_sid(forbidden).is_err(),
+                "accepted dangerous or noncanonical SID {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn service_snapshots_policy_before_first_pipe_creation() {
+        let source = include_str!("windows_native.rs");
+        let start = source.find("fn run_service(argument_count").unwrap();
+        let end = source[start..].find("\nfn report_stopped").unwrap() + start;
+        let service = &source[start..end];
+        let load = service.find("load_authorization_policy()?").unwrap();
+        let pipe = service.find("create_server_pipe(&policy)?").unwrap();
+        let serve = service
+            .find("serve_loop(pipe, stop_event, &policy)")
+            .unwrap();
+        assert!(load < pipe && pipe < serve);
     }
 
     #[test]
@@ -990,7 +1312,9 @@ mod tests {
         let start = source.find("fn serve_connection(").unwrap();
         let end = source[start..].find("\nfn create_server_pipe(").unwrap() + start;
         let connection = &source[start..end];
-        let authenticate = connection.find("authenticate_client(pipe)?").unwrap();
+        let authenticate = connection
+            .find("authenticate_client(pipe, &policy.authorized_client_sid)?")
+            .unwrap();
         let decode = connection.find("decode_request_frame(&frame)").unwrap();
         let respond = connection
             .find("BrokerResponseV1::not_provisioned")
