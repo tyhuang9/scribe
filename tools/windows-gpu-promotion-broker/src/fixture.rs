@@ -555,21 +555,29 @@ impl FixtureBroker {
 
     fn resolve_roots(&self, request: &PromotionRequest) -> Result<(PathBuf, PathBuf, String)> {
         let handoff_root = PathBuf::from(&request.handoff_root);
-        let output_root = PathBuf::from(&request.output_root);
+        let requested_output_root = PathBuf::from(&request.output_root);
         let handoff_parent = fs::canonicalize(&self.handoff_parent)?;
         let actual_handoff = fs::canonicalize(&handoff_root)?;
         if actual_handoff.parent() != Some(handoff_parent.as_path()) {
             bail!("handoff is outside the fixture broker intake root");
         }
-        let output_name = output_root
+        let output_name = requested_output_root
             .file_name()
             .and_then(OsStr::to_str)
             .ok_or_else(|| anyhow!("output name is not canonical UTF-8"))?
             .to_owned();
         validate_store_component(&output_name)?;
-        if output_root.parent() != Some(self.publication_parent.as_path()) {
+        let requested_output_parent = requested_output_root
+            .parent()
+            .ok_or_else(|| anyhow!("output has no existing publication parent"))?;
+        let approved_publication_parent = fs::canonicalize(&self.publication_parent)
+            .context("fixture broker publication root is unavailable")?;
+        let actual_output_parent = fs::canonicalize(requested_output_parent)
+            .context("requested publication parent is unavailable")?;
+        if actual_output_parent != approved_publication_parent {
             bail!("output is outside the fixture broker publication root");
         }
+        let output_root = approved_publication_parent.join(&output_name);
         Ok((actual_handoff, output_root, output_name))
     }
 }
@@ -2562,6 +2570,32 @@ mod tests {
             );
             assert!(!fixture.output().exists());
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn equivalent_windows_publication_parent_spelling_resolves_to_canonical_root() {
+        let mut fixture = Fixture::new(1);
+        let canonical_parent = fs::canonicalize(&fixture.publication_parent).unwrap();
+        assert_ne!(canonical_parent, fixture.publication_parent);
+        let output_name = Path::new(&fixture.request.output_root)
+            .file_name()
+            .unwrap()
+            .to_owned();
+        fixture.request.output_root = canonical_parent
+            .join(&output_name)
+            .to_string_lossy()
+            .into_owned();
+
+        let (_, resolved_output, resolved_name) =
+            fixture.broker.resolve_roots(&fixture.request).unwrap();
+        assert_eq!(resolved_output, canonical_parent.join(&output_name));
+        assert_eq!(resolved_name, output_name.to_string_lossy());
+        fixture
+            .broker
+            .promote(&fixture.request, FaultPoint::None)
+            .unwrap();
+        assert!(resolved_output.exists());
     }
 
     #[cfg(windows)]
