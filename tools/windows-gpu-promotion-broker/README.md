@@ -67,7 +67,17 @@ creation, verifies that protection before its first value write, retains an
 incomplete marker until values verify, and refuses any pre-existing policy. It
 also opens the fixed 64-bit ancestor chain without following registry links,
 refuses ancestors writable by untrusted principals, and atomically protects any
-missing Scribe-specific ancestor before creating the leaf. On success it writes
+missing Scribe-specific ancestor before creating the leaf. It enumerates the
+complete raw DACL rather than projected `RegistryAccessRule` entries. A
+non-qualified or non-Allow/Deny ACE fails closed; denies are non-granting and
+inspected raw Allow ACEs without mutation bits remain acceptable. Every mutating
+raw Allow requires an exact trusted SID except for at most one standard
+explicit, non-callback `CommonAce` on exact case-sensitive `SOFTWARE`: AceType
+and qualifier AccessAllowed, SID `S-1-3-0`, mask `0x000f003f`, AceFlags exactly
+ContainerInherit, and no opaque bytes. It does not rewrite the root ACL.
+Descendants, path/case variants, inherited, callback, object, or duplicate
+template ACEs, actual account SIDs, and altered mask or flags still fail the
+normal untrusted-mutation check. On success it writes
 one JSON record bound to the supplied correlation nonce and lists only ancestors
 for which that invocation received `REG_CREATED_NEW_KEY`.
 The native helper captures the caller token's exact prior `SeRestorePrivilege`

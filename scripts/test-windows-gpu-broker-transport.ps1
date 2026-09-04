@@ -1536,6 +1536,169 @@ function Test-EphemeralProcessOwnershipBoundary {
     }
 }
 
+function Test-StandardSoftwareCreatorOwnerInheritanceTemplateContract {
+    $parseTokens = $null
+    $parseErrors = $null
+    $provisionerAst = [Management.Automation.Language.Parser]::ParseFile(
+        $provisioner,
+        [ref]$parseTokens,
+        [ref]$parseErrors
+    )
+    Assert-True ($parseErrors.Count -eq 0) 'Client policy provisioner could not be parsed for its exact CREATOR OWNER predicate test.'
+    $rawClassifierNames = @(
+        'Test-StandardSoftwareCreatorOwnerInheritanceTemplate',
+        'Test-SafePolicyAncestorAcl'
+    )
+    $rawClassifierDefinitions = @($provisionerAst.FindAll({
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -cin $rawClassifierNames
+    }, $true))
+    Assert-True ($rawClassifierDefinitions.Count -eq 2) 'Client policy provisioner must contain exactly one definition of each raw ancestor-DACL classifier function.'
+    foreach ($classifierName in $rawClassifierNames) {
+        Assert-True (@($rawClassifierDefinitions | Where-Object { $_.Name -ceq $classifierName }).Count -eq 1) "Client policy provisioner does not contain exactly one $classifierName definition."
+    }
+    $predicateSource = ($rawClassifierDefinitions | Where-Object { $_.Name -ceq $rawClassifierNames[0] }).Extent.Text
+    $aclClassifierSource = ($rawClassifierDefinitions | Where-Object { $_.Name -ceq $rawClassifierNames[1] }).Extent.Text
+
+    & {
+        param([string]$ExactPredicateSource, [string]$ExactAclClassifierSource)
+        . ([scriptblock]::Create($ExactPredicateSource))
+        . ([scriptblock]::Create($ExactAclClassifierSource))
+
+        $creatorOwner = [Security.Principal.SecurityIdentifier]::new('S-1-3-0')
+        $authenticatedUsers = [Security.Principal.SecurityIdentifier]::new('S-1-5-11')
+        $accountSid = [Security.Principal.SecurityIdentifier]::new('S-1-5-21-1-2-3-1000')
+        $system = [Security.Principal.SecurityIdentifier]::new('S-1-5-18')
+        $fullControl = [int][Security.AccessControl.RegistryRights]::FullControl
+        $readKey = [int][Security.AccessControl.RegistryRights]::ReadKey
+        $containerInherit = [Security.AccessControl.AceFlags]::ContainerInherit
+        $containerAndObjectInherit = [Security.AccessControl.AceFlags](
+            [uint32][Security.AccessControl.AceFlags]::ContainerInherit -bor
+            [uint32][Security.AccessControl.AceFlags]::ObjectInherit
+        )
+        $containerAndInherited = [Security.AccessControl.AceFlags](
+            [uint32][Security.AccessControl.AceFlags]::ContainerInherit -bor
+            [uint32][Security.AccessControl.AceFlags]::Inherited
+        )
+        $allow = [Security.AccessControl.AceQualifier]::AccessAllowed
+        $deny = [Security.AccessControl.AceQualifier]::AccessDenied
+        Assert-True ([uint32]$fullControl -eq 0x000f003f) 'RegistryRights.FullControl no longer maps to the pinned registry access mask.'
+
+        function New-CommonAce(
+            [Security.Principal.SecurityIdentifier]$Sid = $creatorOwner,
+            [int]$AccessMask = $fullControl,
+            [Security.AccessControl.AceFlags]$Flags = $containerInherit,
+            [Security.AccessControl.AceQualifier]$Qualifier = $allow,
+            [bool]$IsCallback = $false,
+            [byte[]]$Opaque = $null
+        ) {
+            return [Security.AccessControl.CommonAce]::new($Flags, $Qualifier, $AccessMask, $Sid, $IsCallback, $Opaque)
+        }
+
+        function New-ObjectAce(
+            [Security.Principal.SecurityIdentifier]$Sid,
+            [int]$AccessMask,
+            [Security.AccessControl.AceFlags]$Flags,
+            [Security.AccessControl.AceQualifier]$Qualifier = $allow,
+            [bool]$IsCallback = $false,
+            [byte[]]$Opaque = $null
+        ) {
+            return [Security.AccessControl.ObjectAce]::new(
+                $Flags,
+                $Qualifier,
+                $AccessMask,
+                $Sid,
+                [Security.AccessControl.ObjectAceFlags]::None,
+                [Guid]::Empty,
+                [Guid]::Empty,
+                $IsCallback,
+                $Opaque
+            )
+        }
+
+        function New-RawAcl([Security.AccessControl.GenericAce[]]$Aces) {
+            $acl = [Security.AccessControl.RawAcl]::new(2, $Aces.Count)
+            for ($index = 0; $index -lt $Aces.Count; $index++) { $acl.InsertAce($index, $Aces[$index]) }
+            Write-Output -NoEnumerate $acl
+        }
+
+        function Test-RawAcl([Security.AccessControl.GenericAce[]]$Aces, [string]$Path = 'SOFTWARE') {
+            return Test-SafePolicyAncestorAcl `
+                -Acl (New-RawAcl -Aces $Aces) `
+                -Path $Path `
+                -TrustedOwners @('S-1-5-18', 'S-1-5-32-544', 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464') `
+                -MutationMask ([uint32]0x500d0026)
+        }
+
+        $canonical = New-CommonAce
+        Assert-True ($canonical.AceType -eq [Security.AccessControl.AceType]::AccessAllowed -and -not $canonical.IsCallback) 'Canonical CREATOR OWNER fixture is not an explicit non-callback AccessAllowed CommonAce.'
+        Assert-True (Test-StandardSoftwareCreatorOwnerInheritanceTemplate -Ace $canonical -Path 'SOFTWARE') 'Exact raw HKLM\SOFTWARE CREATOR OWNER inheritance template was rejected.'
+        Assert-True (Test-RawAcl -Aces @($canonical)) 'Exact raw HKLM\SOFTWARE CREATOR OWNER DACL fixture was rejected.'
+
+        $predicateRejections = @(
+            [pscustomobject]@{ Label = 'descendant path'; Path = 'SOFTWARE\Scribe'; Ace = $canonical },
+            [pscustomobject]@{ Label = 'case-variant path'; Path = 'software'; Ace = $canonical },
+            [pscustomobject]@{ Label = 'trailing-separator path'; Path = 'SOFTWARE\'; Ace = $canonical },
+            [pscustomobject]@{ Label = 'Authenticated Users SID'; Path = 'SOFTWARE'; Ace = (New-CommonAce -Sid $authenticatedUsers) },
+            [pscustomobject]@{ Label = 'account SID'; Path = 'SOFTWARE'; Ace = (New-CommonAce -Sid $accountSid) },
+            [pscustomobject]@{ Label = 'deny ACE'; Path = 'SOFTWARE'; Ace = (New-CommonAce -Qualifier $deny) },
+            [pscustomobject]@{ Label = 'callback ACE'; Path = 'SOFTWARE'; Ace = (New-CommonAce -IsCallback $true -Opaque ([byte[]](1, 2, 3, 4))) },
+            [pscustomobject]@{ Label = 'inherited ACE'; Path = 'SOFTWARE'; Ace = (New-CommonAce -Flags $containerAndInherited) },
+            [pscustomobject]@{ Label = 'reduced rights'; Path = 'SOFTWARE'; Ace = (New-CommonAce -AccessMask $readKey) },
+            [pscustomobject]@{ Label = 'altered rights'; Path = 'SOFTWARE'; Ace = (New-CommonAce -AccessMask ([int]([uint32]$fullControl -bxor 1u))) },
+            [pscustomobject]@{ Label = 'no inheritance'; Path = 'SOFTWARE'; Ace = (New-CommonAce -Flags ([Security.AccessControl.AceFlags]::None)) },
+            [pscustomobject]@{ Label = 'extra inheritance'; Path = 'SOFTWARE'; Ace = (New-CommonAce -Flags $containerAndObjectInherit) },
+            [pscustomobject]@{ Label = 'inherit-only propagation'; Path = 'SOFTWARE'; Ace = (New-CommonAce -Flags ([Security.AccessControl.AceFlags]([uint32]$containerInherit -bor [uint32][Security.AccessControl.AceFlags]::InheritOnly))) },
+            [pscustomobject]@{ Label = 'no-propagate inheritance'; Path = 'SOFTWARE'; Ace = (New-CommonAce -Flags ([Security.AccessControl.AceFlags]([uint32]$containerInherit -bor [uint32][Security.AccessControl.AceFlags]::NoPropagateInherit))) },
+            [pscustomobject]@{ Label = 'object ACE'; Path = 'SOFTWARE'; Ace = (New-ObjectAce -Sid $creatorOwner -AccessMask $fullControl -Flags $containerInherit) }
+        )
+        foreach ($rejection in $predicateRejections) {
+            Assert-True (-not (Test-StandardSoftwareCreatorOwnerInheritanceTemplate -Ace $rejection.Ace -Path $rejection.Path)) "Raw CREATOR OWNER predicate accepted its $($rejection.Label) rejection fixture."
+        }
+
+        $callbackFull = New-CommonAce -IsCallback $true -Opaque ([byte[]](1, 2, 3, 4))
+        $inheritedCallbackFull = New-CommonAce -Flags $containerAndInherited -IsCallback $true -Opaque ([byte[]](1, 2, 3, 4))
+        $objectFull = New-ObjectAce -Sid $authenticatedUsers -AccessMask $fullControl -Flags ([Security.AccessControl.AceFlags]::None)
+        $inheritedObjectFull = New-ObjectAce -Sid $authenticatedUsers -AccessMask $fullControl -Flags ([Security.AccessControl.AceFlags]::Inherited)
+        $unknownBytes = [byte[]](0x14, 0x00, 0x08, 0x00, 1, 2, 3, 4)
+        $unknownAce = [Security.AccessControl.GenericAce]::CreateFromBinaryForm($unknownBytes, 0)
+        Assert-True ($unknownAce -is [Security.AccessControl.CustomAce]) 'Unknown raw-ACE fixture did not deserialize as CustomAce.'
+        $alteredMaskAce = New-CommonAce -AccessMask ([int]([uint32]$fullControl -bxor 1u))
+        $unsafeAcls = @(
+            [pscustomobject]@{ Label = 'duplicate canonical template'; Aces = @($canonical, (New-CommonAce)); Path = 'SOFTWARE' },
+            [pscustomobject]@{ Label = 'callback template with opaque bytes'; Aces = @($callbackFull); Path = 'SOFTWARE' },
+            [pscustomobject]@{ Label = 'untrusted full-control object ACE'; Aces = @($objectFull); Path = 'SOFTWARE' },
+            [pscustomobject]@{ Label = 'inherited full-control object ACE'; Aces = @($inheritedObjectFull); Path = 'SOFTWARE' },
+            [pscustomobject]@{ Label = 'inherited full-control callback ACE'; Aces = @($inheritedCallbackFull); Path = 'SOFTWARE' },
+            [pscustomobject]@{ Label = 'untrusted full-control CommonAce'; Aces = @((New-CommonAce -Sid $authenticatedUsers -Flags ([Security.AccessControl.AceFlags]::None))); Path = 'SOFTWARE' },
+            [pscustomobject]@{ Label = 'inherited CREATOR OWNER CommonAce'; Aces = @((New-CommonAce -Flags $containerAndInherited)); Path = 'SOFTWARE' },
+            [pscustomobject]@{ Label = 'altered CREATOR OWNER mask'; Aces = @($alteredMaskAce); Path = 'SOFTWARE' },
+            [pscustomobject]@{ Label = 'altered CREATOR OWNER flags'; Aces = @((New-CommonAce -Flags $containerAndObjectInherit)); Path = 'SOFTWARE' },
+            [pscustomobject]@{ Label = 'CREATOR OWNER descendant'; Aces = @($canonical); Path = 'SOFTWARE\Scribe' },
+            [pscustomobject]@{ Label = 'mutating audit ACE'; Aces = @((New-CommonAce -Sid $authenticatedUsers -Flags ([Security.AccessControl.AceFlags]::SuccessfulAccess) -Qualifier ([Security.AccessControl.AceQualifier]::SystemAudit))); Path = 'SOFTWARE' },
+            [pscustomobject]@{ Label = 'unknown custom ACE'; Aces = @($unknownAce); Path = 'SOFTWARE' }
+        )
+        foreach ($unsafeAcl in $unsafeAcls) {
+            Assert-True (-not (Test-RawAcl -Aces $unsafeAcl.Aces -Path $unsafeAcl.Path)) "Raw ancestor-DACL classifier accepted its $($unsafeAcl.Label) rejection fixture."
+        }
+
+        $safeAcls = @(
+            [pscustomobject]@{ Label = 'trusted non-callback CommonAce mutation'; Aces = @((New-CommonAce -Sid $system -Flags ([Security.AccessControl.AceFlags]::None))) },
+            [pscustomobject]@{ Label = 'trusted callback mutation'; Aces = @((New-CommonAce -Sid $system -Flags ([Security.AccessControl.AceFlags]::None) -IsCallback $true -Opaque ([byte[]](1, 2, 3, 4)))) },
+            [pscustomobject]@{ Label = 'trusted object mutation'; Aces = @((New-ObjectAce -Sid $system -AccessMask $fullControl -Flags ([Security.AccessControl.AceFlags]::None))) },
+            [pscustomobject]@{ Label = 'untrusted CommonAce read-only access'; Aces = @((New-CommonAce -Sid $authenticatedUsers -AccessMask $readKey -Flags ([Security.AccessControl.AceFlags]::None))) },
+            [pscustomobject]@{ Label = 'untrusted callback read-only access'; Aces = @((New-CommonAce -Sid $authenticatedUsers -AccessMask $readKey -Flags ([Security.AccessControl.AceFlags]::None) -IsCallback $true -Opaque ([byte[]](1, 2, 3, 4)))) },
+            [pscustomobject]@{ Label = 'untrusted object read-only access'; Aces = @((New-ObjectAce -Sid $authenticatedUsers -AccessMask $readKey -Flags ([Security.AccessControl.AceFlags]::None))) },
+            [pscustomobject]@{ Label = 'untrusted CommonAce deny'; Aces = @((New-CommonAce -Sid $authenticatedUsers -Flags ([Security.AccessControl.AceFlags]::None) -Qualifier $deny)) },
+            [pscustomobject]@{ Label = 'untrusted object deny'; Aces = @((New-ObjectAce -Sid $authenticatedUsers -AccessMask $fullControl -Flags ([Security.AccessControl.AceFlags]::None) -Qualifier $deny)) }
+        )
+        foreach ($safeAcl in $safeAcls) {
+            Assert-True (Test-RawAcl -Aces $safeAcl.Aces) "Raw ancestor-DACL classifier rejected its safe $($safeAcl.Label) fixture."
+        }
+    } $predicateSource $aclClassifierSource
+}
+
 function New-WeakPolicy([string]$Sid) {
     $result = New-ProtectedPolicy -Sid $Sid
     Assert-True ($result.ExitCode -eq 0) "Could not provision the weak-DACL fixture: $($result.Stderr)"
@@ -1671,6 +1834,7 @@ function New-ValidClientArguments([string]$HandoffRoot, [string]$OutputRoot) {
 }
 
 try {
+    Test-StandardSoftwareCreatorOwnerInheritanceTemplateContract
     Test-EphemeralProcessOwnershipBoundary
     $goldenRequest = '{"schema_version":1,"command":"promote-windows-pack-set","client_nonce":"1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a","promotion_intent_sha256":"bf7b4002065dcc87c6d7abd70899c76a23c880c82e1869c4ba2bdbf39dcebe3c","intent":{"schema_version":1,"policy_namespace":"scribe-windows-gpu-production-v1","source_repository":"owner/repo","source_ref":"refs/heads/main","source_revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","workflow_ref":"owner/repo/.github/workflows/windows-gpu-pack-promotion.yml@refs/heads/main","workflow_source_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","run_id":"123","run_attempt":"1","artifact_id":"456","artifact_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","handoff_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","release_set_digest":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","toolchain_manifest_sha256":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","pack_version":"0.1.0","minimum_security_epoch":1,"require_unused_release_set":true}}'
     $goldenMaterial = [Text.Encoding]::UTF8.GetBytes("scribe-windows-gpu-promotion-request-v1`0$goldenRequest")

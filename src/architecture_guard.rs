@@ -1819,6 +1819,107 @@ fn windows_gpu_pack_promotion_keeps_candidate_and_signing_authority_separate() {
             "broker client-policy provisioner lost {required:?}"
         );
     }
+    let creator_owner_predicate_name = "Test-StandardSoftwareCreatorOwnerInheritanceTemplate";
+    assert_eq!(
+        client_policy_provisioner
+            .matches(creator_owner_predicate_name)
+            .count(),
+        2,
+        "broker client-policy provisioner must define and call its CREATOR OWNER predicate exactly once"
+    );
+    let creator_owner_predicate_start = client_policy_provisioner
+        .find("function Test-StandardSoftwareCreatorOwnerInheritanceTemplate(")
+        .expect("provisioner defines its exact CREATOR OWNER predicate");
+    let raw_acl_classifier_name = "Test-SafePolicyAncestorAcl";
+    assert_eq!(
+        client_policy_provisioner
+            .matches(raw_acl_classifier_name)
+            .count(),
+        2,
+        "broker client-policy provisioner must define and call its raw DACL classifier exactly once"
+    );
+    let raw_acl_classifier_start = client_policy_provisioner[creator_owner_predicate_start..]
+        .find("function Test-SafePolicyAncestorAcl(")
+        .map(|offset| creator_owner_predicate_start + offset)
+        .expect("raw CREATOR OWNER predicate has a bounded source region");
+    let creator_owner_predicate =
+        &client_policy_provisioner[creator_owner_predicate_start..raw_acl_classifier_start];
+    for required in [
+        "$Path -ceq 'SOFTWARE'",
+        "$Ace -is [Security.AccessControl.CommonAce]",
+        "-not $Ace.IsCallback",
+        "$Ace.AceType -eq [Security.AccessControl.AceType]::AccessAllowed",
+        "$Ace.AceQualifier -eq [Security.AccessControl.AceQualifier]::AccessAllowed",
+        "$Ace.AceFlags -eq [Security.AccessControl.AceFlags]::ContainerInherit",
+        "[uint32]$Ace.AccessMask -eq [uint32]0x000f003f",
+        "$Ace.SecurityIdentifier.Value -ceq 'S-1-3-0'",
+        "$Ace.OpaqueLength -eq 0",
+    ] {
+        assert!(
+            creator_owner_predicate.contains(required),
+            "CREATOR OWNER predicate lost exact comparison {required:?}"
+        );
+    }
+    let safe_ancestor_start = client_policy_provisioner[raw_acl_classifier_start..]
+        .find("function Assert-SafePolicyAncestor(")
+        .map(|offset| raw_acl_classifier_start + offset)
+        .expect("raw ancestor-DACL classifier has a bounded source region");
+    let raw_acl_classifier =
+        &client_policy_provisioner[raw_acl_classifier_start..safe_ancestor_start];
+    for required in [
+        "$null -eq $Acl",
+        "$creatorOwnerTemplateCount -gt 1",
+        "Test-StandardSoftwareCreatorOwnerInheritanceTemplate -Ace $ace -Path $Path",
+        "$ace -isnot [Security.AccessControl.QualifiedAce]",
+        "$ace.AceQualifier -eq [Security.AccessControl.AceQualifier]::AccessDenied",
+        "$ace.AceQualifier -ne [Security.AccessControl.AceQualifier]::AccessAllowed",
+        "([uint32]$ace.AccessMask -band $MutationMask) -eq 0",
+        "$TrustedOwners -cnotcontains $ace.SecurityIdentifier.Value",
+    ] {
+        assert!(
+            raw_acl_classifier.contains(required),
+            "raw ancestor-DACL classifier lost guard {required:?}"
+        );
+    }
+    for forbidden in [
+        "SetAccessControl",
+        "SetAccessRule",
+        "AddAccessRule",
+        "RemoveAccessRule",
+        "SetValue",
+        "DeleteValue",
+        "CreateSubKey",
+        "RegCreateKey",
+        "RegDeleteKey",
+        "RegSetValue",
+        "NtDeleteKey",
+    ] {
+        assert!(
+            !creator_owner_predicate.contains(forbidden),
+            "CREATOR OWNER predicate gained forbidden mutation API {forbidden:?}"
+        );
+        assert!(
+            !raw_acl_classifier.contains(forbidden),
+            "raw ancestor-DACL classifier gained forbidden mutation API {forbidden:?}"
+        );
+    }
+    let safe_ancestor_end = client_policy_provisioner[safe_ancestor_start..]
+        .find("function Assert-Policy(")
+        .map(|offset| safe_ancestor_start + offset)
+        .expect("ancestor validator has a bounded source region");
+    let safe_ancestor = &client_policy_provisioner[safe_ancestor_start..safe_ancestor_end];
+    assert!(
+        safe_ancestor.contains("[Security.AccessControl.RawSecurityDescriptor]::new($security.GetSecurityDescriptorBinaryForm(), 0)"),
+        "ancestor validator no longer obtains the complete raw DACL"
+    );
+    assert!(
+        safe_ancestor.contains("Test-SafePolicyAncestorAcl -Acl $raw.DiscretionaryAcl -Path $Path -TrustedOwners $trustedOwners -MutationMask $mutationMask"),
+        "ancestor validator no longer classifies the complete raw DACL at its sole trust decision"
+    );
+    assert!(
+        !safe_ancestor.contains("GetAccessRules("),
+        "ancestor validator regressed to projected RegistryAccessRules that can omit raw ACE types"
+    );
     let born_protected = client_policy_provisioner
         .rfind("Assert-PolicySecurity -Key $key")
         .expect("provisioner verifies create-time policy security");

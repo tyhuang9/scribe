@@ -152,7 +152,18 @@ is supplied atomically at key creation and verified before the first value
 write, so inherited writers have no pre-lockdown handle window. Every fixed
 64-bit ancestor is opened without following registry links and refused if an
 untrusted principal can mutate it; missing Scribe-specific ancestors are born
-with the same protected descriptor. The sole success output is a versioned JSON
+with the same protected descriptor. Ancestor validation enumerates the complete
+raw DACL rather than projected `RegistryAccessRule` entries: non-qualified and
+non-Allow/Deny ACEs fail closed, denies remain non-granting, and raw Allow ACEs
+with no mutation bits remain acceptable. Every mutating raw Allow requires an
+exact trusted SID except for at most one standard explicit, non-callback
+`CommonAce` on the exact case-sensitive `SOFTWARE` root: AceType and qualifier
+AccessAllowed, SID `S-1-3-0`, mask `0x000f003f`, AceFlags exactly
+ContainerInherit, and no opaque bytes. It does not rewrite that root ACL. The
+exception does not apply to descendants, case/path variants, inherited,
+callback, object, or duplicate template ACEs, actual account principals, or any
+altered mask or flags; untrusted mutating forms still fail closed.
+The sole success output is a versioned JSON
 record bound to the caller's
 lowercase 32-byte correlation nonce. It reports only fixed ancestors whose
 create call returned `REG_CREATED_NEW_KEY`; the nonce is not secret or

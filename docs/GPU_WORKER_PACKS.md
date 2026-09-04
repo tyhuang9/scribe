@@ -336,6 +336,17 @@ attributes, which are verified before the first value write; there is no
 inherited-DACL lockdown window. The provisioner opens every fixed 64-bit path
 ancestor without following registry links, refuses unsafe existing ancestors,
 and atomically protects each missing Scribe-specific ancestor before descending.
+It enumerates the complete raw DACL rather than projected
+`RegistryAccessRule` entries. Non-qualified and non-Allow/Deny ACEs fail closed;
+denies remain non-granting and inspected raw Allow ACEs without mutation bits
+remain acceptable. Every mutating raw Allow requires an exact trusted SID except
+for at most one standard explicit, non-callback `CommonAce` on exact
+case-sensitive `SOFTWARE`: AceType and qualifier AccessAllowed, SID `S-1-3-0`,
+mask `0x000f003f`, AceFlags exactly ContainerInherit, and no opaque bytes. The
+classifier does not write or normalize the root ACL, and it does not exempt a
+descendant, path/case variant, inherited, callback, object, or duplicate
+template ACE, actual account SID, or changed mask or flags from the ordinary
+untrusted-mutation check.
 This prevents an ambient writer from replacing the final key after its DACL is
 verified. This conservative policy intentionally excludes non-account and
 service principals; changing it requires review.

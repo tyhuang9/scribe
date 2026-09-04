@@ -89,6 +89,47 @@ function Assert-PolicySecurity([Microsoft.Win32.RegistryKey]$Key) {
     Assert-True ($expectedRules.Count -eq 0) 'Authorization policy is missing a required principal.'
 }
 
+function Test-StandardSoftwareCreatorOwnerInheritanceTemplate(
+    [Security.AccessControl.GenericAce]$Ace,
+    [string]$Path
+) {
+    return (
+        $Path -ceq 'SOFTWARE' -and
+        $Ace -is [Security.AccessControl.CommonAce] -and
+        -not $Ace.IsCallback -and
+        $Ace.AceType -eq [Security.AccessControl.AceType]::AccessAllowed -and
+        $Ace.AceQualifier -eq [Security.AccessControl.AceQualifier]::AccessAllowed -and
+        $Ace.AceFlags -eq [Security.AccessControl.AceFlags]::ContainerInherit -and
+        [uint32]$Ace.AccessMask -eq [uint32]0x000f003f -and
+        $Ace.SecurityIdentifier.Value -ceq 'S-1-3-0' -and
+        $Ace.OpaqueLength -eq 0
+    )
+}
+
+function Test-SafePolicyAncestorAcl(
+    [Security.AccessControl.RawAcl]$Acl,
+    [string]$Path,
+    [string[]]$TrustedOwners,
+    [uint32]$MutationMask
+) {
+    if ($null -eq $Acl) { return $false }
+    $creatorOwnerTemplateCount = 0
+    for ($index = 0; $index -lt $Acl.Count; $index++) {
+        $ace = $Acl[$index]
+        if (Test-StandardSoftwareCreatorOwnerInheritanceTemplate -Ace $ace -Path $Path) {
+            $creatorOwnerTemplateCount++
+            if ($creatorOwnerTemplateCount -gt 1) { return $false }
+            continue
+        }
+        if ($ace -isnot [Security.AccessControl.QualifiedAce]) { return $false }
+        if ($ace.AceQualifier -eq [Security.AccessControl.AceQualifier]::AccessDenied) { continue }
+        if ($ace.AceQualifier -ne [Security.AccessControl.AceQualifier]::AccessAllowed) { return $false }
+        if (([uint32]$ace.AccessMask -band $MutationMask) -eq 0) { continue }
+        if ($TrustedOwners -cnotcontains $ace.SecurityIdentifier.Value) { return $false }
+    }
+    return $true
+}
+
 function Assert-SafePolicyAncestor([Microsoft.Win32.RegistryKey]$Key, [string]$Path) {
     $security = $Key.GetAccessControl([Security.AccessControl.AccessControlSections]'Access, Owner')
     $owner = $security.GetOwner([Security.Principal.SecurityIdentifier]).Value
@@ -101,13 +142,7 @@ function Assert-SafePolicyAncestor([Microsoft.Win32.RegistryKey]$Key, [string]$P
     $raw = [Security.AccessControl.RawSecurityDescriptor]::new($security.GetSecurityDescriptorBinaryForm(), 0)
     Assert-True ($null -ne $raw.DiscretionaryAcl) "Authorization policy ancestor $Path has a null DACL."
     $mutationMask = [uint32]0x500d0026 # generic write/all plus set/create/link/delete/DACL/owner
-    $rules = @($security.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))
-    foreach ($rule in $rules) {
-        if ($rule.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow -and
-            (([uint32]$rule.RegistryRights -band $mutationMask) -ne 0)) {
-            Assert-True ($rule.IdentityReference.Value -cin $trustedOwners) "Authorization policy ancestor $Path grants mutation rights to an untrusted principal."
-        }
-    }
+    Assert-True (Test-SafePolicyAncestorAcl -Acl $raw.DiscretionaryAcl -Path $Path -TrustedOwners $trustedOwners -MutationMask $mutationMask) "Authorization policy ancestor $Path contains an unsafe raw DACL entry."
 }
 
 function Assert-Policy([Microsoft.Win32.RegistryKey]$Key, [bool]$ExpectProvisioningMarker) {

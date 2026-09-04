@@ -259,6 +259,64 @@ try {
     Assert-True ($provisioner.Contains('REG_OPTION_OPEN_LINK')) 'Client policy provisioner does not inspect registry links themselves.'
     Assert-True ($provisioner.Contains('SymbolicLinkValue')) 'Client policy provisioner does not identify registry link keys.'
     Assert-True ($provisioner.Contains('$mutationMask = [uint32]0x500d0026')) 'Client policy provisioner no longer rejects ancestor mutation authority.'
+    $creatorOwnerPredicateName = 'Test-StandardSoftwareCreatorOwnerInheritanceTemplate'
+    Assert-True (($provisioner.Split($creatorOwnerPredicateName, [StringSplitOptions]::None).Count - 1) -eq 2) 'Client policy provisioner must define and call its CREATOR OWNER predicate exactly once.'
+    $creatorOwnerPredicateStart = $provisioner.IndexOf("function $creatorOwnerPredicateName(", [StringComparison]::Ordinal)
+    $rawAclClassifierName = 'Test-SafePolicyAncestorAcl'
+    Assert-True (($provisioner.Split($rawAclClassifierName, [StringSplitOptions]::None).Count - 1) -eq 2) 'Client policy provisioner must define and call its raw ancestor-DACL classifier exactly once.'
+    $rawAclClassifierStart = $provisioner.IndexOf("function $rawAclClassifierName(", $creatorOwnerPredicateStart, [StringComparison]::Ordinal)
+    Assert-True ($creatorOwnerPredicateStart -ge 0 -and $rawAclClassifierStart -gt $creatorOwnerPredicateStart) 'Client policy provisioner lost its bounded raw CREATOR OWNER predicate.'
+    $creatorOwnerPredicate = $provisioner.Substring($creatorOwnerPredicateStart, $rawAclClassifierStart - $creatorOwnerPredicateStart)
+    foreach ($requiredPredicateComparison in @(
+        "`$Path -ceq 'SOFTWARE'",
+        '$Ace -is [Security.AccessControl.CommonAce]',
+        '-not $Ace.IsCallback',
+        '$Ace.AceType -eq [Security.AccessControl.AceType]::AccessAllowed',
+        '$Ace.AceQualifier -eq [Security.AccessControl.AceQualifier]::AccessAllowed',
+        '$Ace.AceFlags -eq [Security.AccessControl.AceFlags]::ContainerInherit',
+        '[uint32]$Ace.AccessMask -eq [uint32]0x000f003f',
+        "`$Ace.SecurityIdentifier.Value -ceq 'S-1-3-0'",
+        '$Ace.OpaqueLength -eq 0'
+    )) {
+        Assert-True ($creatorOwnerPredicate.Contains($requiredPredicateComparison)) "Client policy CREATOR OWNER predicate lost exact comparison $requiredPredicateComparison."
+    }
+    $ancestorValidationStart = $provisioner.IndexOf('function Assert-SafePolicyAncestor(', $rawAclClassifierStart, [StringComparison]::Ordinal)
+    Assert-True ($ancestorValidationStart -gt $rawAclClassifierStart) 'Client policy provisioner lost its bounded raw ancestor-DACL classifier.'
+    $rawAclClassifier = $provisioner.Substring($rawAclClassifierStart, $ancestorValidationStart - $rawAclClassifierStart)
+    foreach ($requiredRawClassifierGuard in @(
+        '$null -eq $Acl',
+        '$creatorOwnerTemplateCount -gt 1',
+        'Test-StandardSoftwareCreatorOwnerInheritanceTemplate -Ace $ace -Path $Path',
+        '$ace -isnot [Security.AccessControl.QualifiedAce]',
+        '$ace.AceQualifier -eq [Security.AccessControl.AceQualifier]::AccessDenied',
+        '$ace.AceQualifier -ne [Security.AccessControl.AceQualifier]::AccessAllowed',
+        '([uint32]$ace.AccessMask -band $MutationMask) -eq 0',
+        '$TrustedOwners -cnotcontains $ace.SecurityIdentifier.Value'
+    )) {
+        Assert-True ($rawAclClassifier.Contains($requiredRawClassifierGuard)) "Client policy raw ancestor-DACL classifier lost guard $requiredRawClassifierGuard."
+    }
+    foreach ($forbiddenPredicateMutation in @(
+        'SetAccessControl',
+        'SetAccessRule',
+        'AddAccessRule',
+        'RemoveAccessRule',
+        'SetValue',
+        'DeleteValue',
+        'CreateSubKey',
+        'RegCreateKey',
+        'RegDeleteKey',
+        'RegSetValue',
+        'NtDeleteKey'
+    )) {
+        Assert-True (-not $creatorOwnerPredicate.Contains($forbiddenPredicateMutation)) "Client policy CREATOR OWNER predicate gained forbidden mutation API $forbiddenPredicateMutation."
+        Assert-True (-not $rawAclClassifier.Contains($forbiddenPredicateMutation)) "Client policy raw ancestor-DACL classifier gained forbidden mutation API $forbiddenPredicateMutation."
+    }
+    $ancestorValidationEnd = $provisioner.IndexOf('function Assert-Policy(', $ancestorValidationStart, [StringComparison]::Ordinal)
+    Assert-True ($ancestorValidationEnd -gt $ancestorValidationStart) 'Client policy provisioner lost its bounded ancestor validator.'
+    $ancestorValidationBody = $provisioner.Substring($ancestorValidationStart, $ancestorValidationEnd - $ancestorValidationStart)
+    Assert-True ($ancestorValidationBody.Contains('[Security.AccessControl.RawSecurityDescriptor]::new($security.GetSecurityDescriptorBinaryForm(), 0)')) 'Ancestor validation no longer obtains the complete raw DACL.'
+    Assert-True ($ancestorValidationBody.Contains('Test-SafePolicyAncestorAcl -Acl $raw.DiscretionaryAcl -Path $Path -TrustedOwners $trustedOwners -MutationMask $mutationMask')) 'Ancestor validation no longer classifies the complete raw DACL at its sole trust decision.'
+    Assert-True (-not $ancestorValidationBody.Contains('GetAccessRules(')) 'Ancestor validation regressed to projected RegistryAccessRules that can omit raw ACE types.'
     Assert-True ($provisioner.Contains('ProvisioningState')) 'Client policy provisioner lacks an incomplete-policy marker.'
     Assert-True ($provisioner.Contains('[string]$InvocationNonce')) 'Client policy provisioner does not bind success to a caller nonce.'
     Assert-True ($provisioner.Contains('REG_CREATED_NEW_KEY')) 'Client policy provisioner does not distinguish exact create-new dispositions.'
