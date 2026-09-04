@@ -306,16 +306,31 @@ and security-epoch authority. The independently locked
 bounded, mutually authenticated named-pipe transport and an SCM-only
 no-authority service stub. The service refuses to create its pipe unless its
 token contains the exact service SID as an enabled and restricting SID under
-restricted LocalService. It uses a protected explicit DACL, a first-instance
-local-only message pipe whose original handle remains open across clients and
-timeouts, identification-only client impersonation, and always reverts before
-sending its sole valid outcome: correlated `NotProvisioned`. The service waits
-for a bounded acknowledgement bound to the request and exact response before it
-disconnects. Only the exact service SID has server authority in the pipe DACL.
-Authenticated local users are admitted at this stage only because the service
-has no key, state, pack, or publication authority. A dedicated client principal
-and durable authorization policy are a hard prerequisite for granting any
-authority later.
+restricted LocalService. Before its first pipe creation it loads and verifies
+the fixed Registry64 policy at
+`HKLM\SOFTWARE\Scribe\GpuPromotionBroker\v1\Authorization`, containing only
+DWORD `SchemaVersion=1` and a canonical `AuthorizedClientSid`. The key must be
+SYSTEM-owned, inheritance-protected, have no subkeys or extra values, and have
+exactly SYSTEM/Administrators full-control plus service-SID read ACEs. The SID
+is snapshotted for the service lifetime, so registry mutation requires restart
+and cannot broaden the running process. A valid orphan SID locks clients out.
+
+The first-instance local-only message pipe contains exactly service-SID
+generic-all and configured-client mask `0x00100183`; AU, WD, BU, BA, AN,
+generic write, pipe-instance creation, DACL writes, and owner writes are absent.
+After a bounded read, identification-only impersonation compares exact
+`TokenUser`, not group membership or elevation, and checked reversion completes
+before decode or reply. A mismatch receives no response. An authorized request
+can receive only correlated `NotProvisioned`, followed by a bounded
+request/response-bound acknowledgement. Neither side touches supplied paths.
+
+The elevated create-new provisioner accepts only an explicit canonical
+`S-1-5-21` account SID with RID 1000 or greater. It rejects account names,
+broad/built-in identities, SYSTEM, LocalService, NetworkService, service SID
+forms including the broker SID, and any pre-existing policy. An incomplete
+marker keeps interrupted setup unusable until values, SYSTEM ownership, and the
+exact protected ACE inventory verify. This conservative policy intentionally
+excludes non-account and service principals; changing it requires review.
 
 The same workspace proves the broker state machine with test-only authority:
 deny-unknown-fields canonical schemas, exact
@@ -335,11 +350,13 @@ The fixture ledger starts fresh because it is test-only. A production v2
 migration must retain all v1 used-release reservations and security-epoch
 high-water marks, and remains deferred until the privileged broker exists.
 
-The transport does not install the service in production and its earliest-main
+The transport and policy provisioner do not install the service in production,
+and its earliest-main
 DLL hardening cannot prove import-time lookup or immutable installation
 ancestors. The test promotion proof still uses path-based enumeration before
-retained final opens; it does not prove full NT handle-relative traversal, a
-dedicated workflow principal, non-resettable state, HSM integration, or the
+retained final opens; it does not prove full NT handle-relative traversal,
+immutable client image/ancestor enforcement, non-resettable state, HSM
+integration, or the
 client installation/ancestor policy. Production therefore remains
 unprovisioned and the protected job fails before invoking the client or touching
 filesystem, ledger, or signing authority. `ProductionTrustRoot`, production

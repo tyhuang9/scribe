@@ -78,6 +78,7 @@ flowchart LR
 - [Run Scribe from source](https://tyhuang9.github.io/scribe/install-and-run/)
 - [Development guide](https://tyhuang9.github.io/scribe/development/)
 - [Technical overview](docs/TECHNICAL_OVERVIEW.md)
+- [Windows GPU worker packs and protected broker status](docs/GPU_WORKER_PACKS.md)
 - [Current project status](https://tyhuang9.github.io/scribe/project-status/)
 
 The technical overview and implementation records describe model validation, runtime boundaries, release packaging, architecture checks, and outstanding verification work.

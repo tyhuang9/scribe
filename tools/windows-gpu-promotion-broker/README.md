@@ -22,24 +22,45 @@ invocation in memory and contacts only the fixed
 `\\.\pipe\ScribeGpuPromotionBroker.v1` endpoint. It authenticates the server as
 the session-zero, restricted LocalService process carrying the exact
 `ScribeGpuPromotionBroker` service SID before writing any request bytes. The
-client opens the pipe with identification-only security quality of service, and
-the service impersonates only long enough to identify a non-anonymous member of
-Authenticated Users. The service always reverts before replying. There is no
-caller-configurable endpoint or service identity.
+client opens the pipe with identification-only security quality of service.
+After the bounded read, the service impersonates only long enough to compare
+the client's exact `TokenUser` SID with its startup policy snapshot. Group
+membership and elevation do not authorize a client. Checked reversion completes
+before decoding or replying. There is no caller-configurable endpoint or
+service identity.
 
 The corresponding `scribe-windows-gpu-promotion-service` binary runs only
 through the Windows Service Control Manager. It refuses to create the pipe
-unless its own token is the expected restricted LocalService token. The pipe is
-local-only, first-instance-only, message-mode, bounded, and protected by an
-explicit DACL. Authenticated Users receive only the individual data and
-attribute rights needed for a client connection, never generic write or pipe
-instance creation. The service currently accepts no authority: a canonical,
-path-free request can receive only a correlated typed `NotProvisioned`
-response. After validating that response, the client sends a bounded
-request-and-response-correlated acknowledgement before the service disconnects.
-The client maps the authenticated result, or an absent service, to distinct
-fixed diagnostics with exit code 78. Neither process opens the handoff or
-output paths.
+unless its own token is the expected restricted LocalService token and a fixed
+64-bit `HKLM\SOFTWARE\Scribe\GpuPromotionBroker\v1\Authorization` policy
+fully verifies. The policy contains exactly DWORD `SchemaVersion=1` and a
+canonical `AuthorizedClientSid`, no subkeys or extra values, SYSTEM ownership,
+and a protected noninheriting DACL with exactly SYSTEM/Administrators full
+control plus service-SID read. The service snapshots the SID for its lifetime;
+registry mutation requires restart and never broadens a running instance. A
+valid orphan SID can lock every client out.
+
+The local-only, first-instance-only, message-mode, bounded pipe DACL contains
+exactly service-SID generic-all and the configured client SID with mask
+`0x00100183`. The client never receives generic write,
+`FILE_CREATE_PIPE_INSTANCE`, `WRITE_DAC`, or `WRITE_OWNER`. An authorized
+canonical path-free request can receive only a correlated typed
+`NotProvisioned` response. After validating it, the client sends a bounded
+request-and-response-correlated acknowledgement. Neither process opens the
+handoff or output paths.
+
+An elevated administrator can create the absent policy once with:
+
+```powershell
+pwsh -NoProfile -File .\scripts\provision-windows-gpu-broker-client-policy.ps1 -AuthorizedClientSid 'S-1-5-21-...-1000'
+```
+
+The provisioner accepts a SID, never an account name, and conservatively
+accepts only canonical `S-1-5-21` account SIDs with RID 1000 or greater. This
+rejects broad/built-in identities, SYSTEM, LocalService, NetworkService, all
+service SID forms, and the broker service SID. It creates rather than updates,
+retains an incomplete marker until values and security verify, and refuses any
+pre-existing policy.
 
 The hostile-input copier, fixture Ed25519 authority, chained replay/epoch
 ledger, signed receipt, recovery state machine, authorizer, and atomic publisher
@@ -48,8 +69,7 @@ deployable production authority. In particular, the tests do not establish:
 
 - production service installation, immutable binary/ancestor ACLs, and update
   policy;
-- authorization of one dedicated workflow/client principal (this stage proves
-  Windows identity only and admits any local Authenticated Users token);
+- durable production service/client installation and update lifecycle;
 - no-follow opening and retained ancestor authority for the workflow client
   executable (the workflow retains only a standard .NET leaf stream);
 - DLL/loader policy for a future nontrivial broker client;
@@ -64,11 +84,13 @@ fresh because it is test-only. A production migration must preserve every v1
 used-release reservation and security-epoch high-water mark before accepting v2
 traffic; that migration is deferred with the production broker itself.
 
-Production promotion must stay disabled until those controls are implemented
-and independently reviewed. The repository-level harness temporarily installs
-the zero-authority service on an isolated Windows test host; neither release
-binary contains installation or console-mode behavior. Run the crate proof on
-Windows with:
+Policy provisioning alone does not provision production authority. Production
+promotion must stay disabled until those controls are implemented and
+independently reviewed. The elevated repository harness temporarily installs
+the zero-authority service and policy, proves invalid-policy and wrong-SID
+denial plus snapshot behavior, and performs identity-safe cleanup. Neither
+release binary contains installation, policy provisioning, or console-mode
+behavior. Run the crate proof on Windows with:
 
 ```powershell
 cargo test --locked --offline -- --test-threads=1

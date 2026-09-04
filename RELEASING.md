@@ -117,19 +117,41 @@ stage.
 
 The checked-in service transport is deliberately authority-free. The service
 refuses to listen unless SCM starts it as restricted LocalService with the exact
-service SID, creates one local-only message pipe with an explicit protected
-DACL whose server authority belongs only to that service SID, retains its first
-pipe handle across clients and timeouts, identifies the client at
-`SecurityIdentification`, and can return only a correlated `NotProvisioned`
-result. The client authenticates the server process and service token before
-writing, validates that result, and returns a correlated bounded acknowledgement
-before the service disconnects. Neither side serializes or accesses the local
-handoff/output paths.
-Authenticated local users are admitted at the pipe in this zero-authority
-stage; a dedicated provisioned client principal and durable authorization
-policy are mandatory before the service can receive signing authority.
-Production service installation is not part of the application installer yet,
-and an endpoint supplied by CLI or environment is never accepted.
+service SID. Before creating its first pipe it verifies and snapshots the fixed
+Registry64 policy at
+`HKLM\SOFTWARE\Scribe\GpuPromotionBroker\v1\Authorization`. That protected,
+SYSTEM-owned key contains exactly DWORD `SchemaVersion=1` and one canonical
+dedicated-account `AuthorizedClientSid`; its only ACEs are SYSTEM and
+Administrators full control plus service-SID read. The pipe DACL contains
+exactly service-SID generic-all and configured-client `0x00100183`.
+
+After a bounded request read, the service impersonates at
+`SecurityIdentification`, compares exact `TokenUser`, and reverts before decode
+or reply. Group membership and elevation do not authorize. It retains its first
+pipe handle across clients and timeouts and can return only correlated
+`NotProvisioned`. The client authenticates the server process and service token
+before writing, validates that result, and returns a correlated bounded
+acknowledgement before disconnect. Neither side serializes or accesses the
+handoff/output paths. Policy mutation applies only after service restart; a
+valid orphan SID can lock out all clients but cannot widen access.
+
+On a disposable elevated host, the create-new provisioner accepts an explicit
+canonical `S-1-5-21` account SID (RID 1000 or greater), never an account name:
+
+```powershell
+pwsh -NoProfile -File .\scripts\provision-windows-gpu-broker-client-policy.ps1 -AuthorizedClientSid 'S-1-5-21-...-1000'
+```
+
+It refuses broad, built-in, reserved, NetworkService/other service principals,
+the broker service SID, or any pre-existing policy and leaves interrupted work
+unusable via an incomplete marker. Policy provisioning does not provision a
+key, trust root, ledger, signer, pack intake/publication, or activation.
+Production service installation is not part of the application installer, the
+`SCRIBE_WINDOWS_GPU_PRODUCTION_BROKER_PROVISIONED` gate remains closed, and an
+endpoint or policy path supplied by CLI/environment is never accepted. The
+protected runner separately compares its current SID with
+`SCRIBE_WINDOWS_GPU_AUTHORIZED_CLIENT_SID`, but the service policy remains the
+authorization authority.
 
 This path is currently a NO-GO: `ProductionTrustRoot`, the privileged broker or
 HSM, its independently durable epoch/replay authority, and the CUDA production
